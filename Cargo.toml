@@ -1,0 +1,8 @@
+[package]
+name = "project_watt_cubed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+raylib = "6.0"
+glam = "0.30"
