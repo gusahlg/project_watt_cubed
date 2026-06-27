@@ -6,11 +6,15 @@
 //! - [`world`] — voxels, chunks, terrain generation, collision, and rendering.
 //! - [`player`] — player state and the camera derived from it.
 //! - [`input`] — keyboard movement and mouse look.
+//! - [`console`] — the in-game console / chat line and its text input.
+//! - [`command`] — parsing and dispatch for console commands.
 //! - [`math`] — geometry shared across systems (the [`Aabb`](math::Aabb) and
 //!   [`Bounded`](math::Bounded) trait).
 //! - [`render`] — the [`Render`](render::Render) trait for drawable things.
 //! - [`macros`] — declarative macros that generate repetitive code.
 pub mod app;
+pub mod command;
+pub mod console;
 pub mod input;
 pub mod macros;
 pub mod math;
