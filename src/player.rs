@@ -49,15 +49,14 @@ impl Player {
         )
     }
 
-    /// View direction flattened onto the XZ plane, for ground movement.
-    pub fn forward_flat(&self) -> Vector3 {
-        Vector3::new(self.yaw.cos(), 0.0, self.yaw.sin()).normalize()
-    }
-
-    /// The rightward direction on the XZ plane (forward rotated 90°).
-    pub fn right_flat(&self) -> Vector3 {
-        let f = self.forward_flat();
-        Vector3::new(-f.z, 0.0, f.x)
+    /// The forward and right basis vectors on the XZ plane, used for ground
+    /// movement. Returned together because they share one `sin`/`cos` of the yaw,
+    /// and both come out unit length already (no normalize needed).
+    pub fn movement_basis(&self) -> (Vector3, Vector3) {
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+        let forward = Vector3::new(cos_yaw, 0.0, sin_yaw);
+        let right = Vector3::new(-sin_yaw, 0.0, cos_yaw);
+        (forward, right)
     }
 
     /// Build the raylib camera that looks out from the player's eye.

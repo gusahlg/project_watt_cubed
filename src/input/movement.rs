@@ -32,7 +32,7 @@ pub struct MoveInput {
 
 impl MoveInput {
     /// Sample the keyboard into a `MoveInput` for this frame.
-    pub fn sample(rl: &RaylibHandle) -> Self {
+    pub fn from_input(rl: &RaylibHandle) -> Self {
         Self {
             forward_back: AxisZ::sample(rl),
             left_right: AxisX::sample(rl),
@@ -46,36 +46,45 @@ impl MoveInput {
 /// Advance the player by one frame: build a movement delta from input + physics,
 /// then apply it with per-axis collision resolution.
 pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: f32) {
+    // Toggling fly clears vertical velocity so you neither keep falling into the
+    // new mode nor launch when you leave it.
     if input.toggle_fly {
         player.fly = !player.fly;
         player.velocity_y = 0.0;
     }
 
-    // Horizontal movement is relative to where the player is facing. The axis
-    // signums collapse the direction enums into a single weighted sum.
-    let forward = player.forward_flat();
-    let right = player.right_flat();
-    let mut horizontal =
-        forward.scale(input.forward_back.signum()) + right.scale(input.left_right.signum());
-    // Normalize so moving diagonally isn't faster than moving straight.
-    if horizontal.length() > 0.0 {
-        horizontal = horizontal.normalize();
+    let mut delta = Vector3::zero();
+
+    // Horizontal movement is shared by both modes, but only worth computing when
+    // a key is actually held — otherwise we'd run the yaw trig, a normalize, and
+    // a scale every frame just to add a zero vector.
+    if input.forward_back.is_active() || input.left_right.is_active() {
+        let (forward, right) = player.movement_basis();
+        let mut direction =
+            forward.scale(input.forward_back.signum()) + right.scale(input.left_right.signum());
+
+        // `forward` and `right` are already unit length, so a single axis needs
+        // no normalize. Only a diagonal (both axes active) would otherwise move
+        // sqrt(2) too fast, so that's the only case we pay for the sqrt.
+        if input.forward_back.is_active() && input.left_right.is_active() {
+            direction = direction.normalize();
+        }
+
+        let speed = if player.fly { FLY_SPEED } else { WALK_SPEED };
+        delta = direction.scale(speed * dt);
     }
 
-    let speed = if player.fly { FLY_SPEED } else { WALK_SPEED };
-    let mut delta = horizontal.scale(speed * dt);
-
+    // Vertical movement is mode-specific, so each branch only runs its own work:
+    // flying skips gravity and jumping entirely; walking skips the fly controls.
     if player.fly {
-        // Free vertical movement, no gravity.
-        delta.y += input.up_down.signum() * speed * dt;
-        player.velocity_y = 0.0;
+        delta.y = input.up_down.signum() * FLY_SPEED * dt;
     } else {
-        // Integrate gravity, and jump only when grounded.
+        // Apply the jump before deriving delta.y so it takes effect this frame.
         if input.jump && player.on_ground {
             player.velocity_y = JUMP_SPEED;
         }
         player.velocity_y -= GRAVITY * dt;
-        delta.y += player.velocity_y * dt;
+        delta.y = player.velocity_y * dt;
     }
 
     move_with_collision(player, world, delta);
@@ -87,19 +96,17 @@ fn move_with_collision(player: &mut Player, world: &World, delta: Vector3) {
     let start = player.position;
     let mut pos = start;
 
-    // X axis.
     pos.x += delta.x;
     if world.collides(&Aabb::new(pos, PLAYER_HALF)) {
         pos.x = start.x;
     }
 
-    // Z axis.
     pos.z += delta.z;
     if world.collides(&Aabb::new(pos, PLAYER_HALF)) {
         pos.z = start.z;
     }
 
-    // Y axis: landing on something while moving down means we're grounded.
+    // Landing on something while moving down means we're grounded.
     player.on_ground = false;
     pos.y += delta.y;
     if world.collides(&Aabb::new(pos, PLAYER_HALF)) {

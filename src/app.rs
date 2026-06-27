@@ -8,11 +8,10 @@ use crate::player::Player;
 use crate::render::Render;
 use crate::world::World;
 
-const WINDOW_WIDTH: i32 = 1280;
-const WINDOW_HEIGHT: i32 = 720;
-const TARGET_FPS: u32 = 120;
-const HELP: &str =
-    "WASD move  |  mouse look  |  Space jump  |  F fly  |  Tab free cursor  |  Esc quit";
+const STARTING_WINDOW_WIDTH: i32 = 1280;
+const STARTING_WINDOW_HEIGHT: i32 = 720;
+const TARGET_FPS: u32 = 100;
+const HELP_TEXT: &str = "WASD move  |  mouse look  |  Space jump  |  F fly  |  Tab free cursor  |  Esc quit";
 
 /// The whole game: window handle, world, player, and transient UI state.
 pub struct App {
@@ -29,7 +28,7 @@ impl App {
     /// Open the window and build the initial game state.
     pub fn new() -> Self {
         let (mut rl, thread) = raylib::init()
-            .size(WINDOW_WIDTH, WINDOW_HEIGHT)
+            .size(STARTING_WINDOW_WIDTH, STARTING_WINDOW_HEIGHT)
             .title("voxel prototype")
             .build();
 
@@ -38,7 +37,7 @@ impl App {
 
         let world = World::generate();
         // Spawn above the terrain so the player falls and lands on the surface.
-        let player = Player::new(Vector3::new(8.0, 10000.0, 8.0));
+        let player = Player::new(Vector3::new(8.0, 40.0, 8.0));
 
         Self {
             rl,
@@ -71,7 +70,7 @@ impl App {
             look::update(&mut self.player, &self.rl);
         }
 
-        let input = movement::MoveInput::sample(&self.rl);
+        let input = movement::MoveInput::from_input(&self.rl);
         movement::update_player(&mut self.player, &self.world, &input, dt);
     }
 
@@ -96,7 +95,7 @@ impl App {
             self.world.render(&mut d3);
         }
 
-        d.draw_text(HELP, 10, 10, 20, Color::DARKGRAY);
+        d.draw_text(HELP_TEXT, 10, 10, 20, Color::DARKGRAY);
         d.draw_fps(10, 40);
     }
 }

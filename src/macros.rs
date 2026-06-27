@@ -45,6 +45,11 @@ macro_rules! axis {
                     $name::None => 0.0,
                 }
             }
+
+            /// Whether a direction is being held this frame (not `None`).
+            pub fn is_active(&self) -> bool {
+                !matches!(self, $name::None)
+            }
         }
     };
 }
