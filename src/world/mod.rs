@@ -3,9 +3,8 @@
 //! to draw the visible surface.
 pub mod chunk;
 pub mod generation;
+pub mod mesh;
 pub mod voxel;
-
-use std::collections::HashMap;
 
 use raylib::prelude::*;
 
@@ -20,25 +19,64 @@ pub const WORLD_CHUNKS_X: i32 = 4;
 pub const WORLD_CHUNKS_Z: i32 = 4;
 
 /// The collection of generated chunks plus the queries the rest of the game needs.
+///
+/// Chunks live in a flat `Vec` indexed directly by chunk coordinate rather than a
+/// `HashMap`: the grid is a known, fixed size, so an index is a single multiply
+/// instead of a hash. That matters because [`is_solid`](Self::is_solid) is on the
+/// per-frame collision hot path and is hammered again while meshing.
 pub struct World {
-    chunks: HashMap<(i32, i32), Chunk>,
+    chunks: Vec<Chunk>,
+    /// GPU-resident geometry, built once by [`build_meshes`](Self::build_meshes).
+    /// World-space positions are baked into the vertices, so every model is drawn
+    /// at the origin. Usually one model per chunk (more only if a chunk overflows
+    /// a u16 index buffer).
+    meshes: Vec<Model>,
 }
 
 impl World {
-    /// Generate the default world (a grid of [`SineHills`] chunks).
+    /// Generate the default world (a grid of [`SineHills`] chunks). This builds the
+    /// voxel data only; call [`build_meshes`](Self::build_meshes) once a window
+    /// exists to upload the renderable geometry to the GPU.
     pub fn generate() -> Self {
         Self::with_generator(&SineHills::default())
     }
 
     /// Generate a square grid of chunks using any [`TerrainGenerator`].
     pub fn with_generator<G: TerrainGenerator>(generator: &G) -> Self {
-        let mut chunks = HashMap::new();
+        let mut chunks = Vec::with_capacity((WORLD_CHUNKS_X * WORLD_CHUNKS_Z) as usize);
+        // Pushed in (cx outer, cz inner) order so the index matches `chunk_index`.
         for cx in 0..WORLD_CHUNKS_X {
             for cz in 0..WORLD_CHUNKS_Z {
-                chunks.insert((cx, cz), Chunk::new(cx, cz, generator));
+                chunks.push(Chunk::new(cx, cz, generator));
             }
         }
-        Self { chunks }
+        Self {
+            chunks,
+            meshes: Vec::new(),
+        }
+    }
+
+    /// Build (or rebuild) the GPU meshes for every chunk. Requires a live window,
+    /// so it is kept separate from [`generate`](Self::generate) to keep the world's
+    /// voxel logic testable without a GPU.
+    pub fn build_meshes(&mut self, rl: &mut RaylibHandle, thread: &RaylibThread) {
+        let mut meshes = Vec::new();
+        // Read chunks by index so `&self` stays free to pass into the mesher for
+        // cross-chunk neighbour culling; `self.meshes` is untouched until assigned.
+        for i in 0..self.chunks.len() {
+            let chunk = &self.chunks[i];
+            meshes.append(&mut mesh::build_chunk_models(chunk, self, rl, thread));
+        }
+        self.meshes = meshes;
+    }
+
+    /// Flat index of a chunk coordinate, or `None` if it is outside the grid.
+    fn chunk_index(cx: i32, cz: i32) -> Option<usize> {
+        if cx < 0 || cx >= WORLD_CHUNKS_X || cz < 0 || cz >= WORLD_CHUNKS_Z {
+            None
+        } else {
+            Some((cx * WORLD_CHUNKS_Z + cz) as usize)
+        }
     }
 
     /// Look up the voxel at an absolute world voxel coordinate. Anything outside
@@ -50,11 +88,13 @@ impl World {
 
         let cx = x.div_euclid(CHUNK_WIDTH as i32);
         let cz = z.div_euclid(CHUNK_DEPTH as i32);
-        let lx = x.rem_euclid(CHUNK_WIDTH as i32) as usize;
-        let lz = z.rem_euclid(CHUNK_DEPTH as i32) as usize;
 
-        match self.chunks.get(&(cx, cz)) {
-            Some(chunk) => chunk.get_local(lx, y as usize, lz),
+        match Self::chunk_index(cx, cz) {
+            Some(i) => {
+                let lx = x.rem_euclid(CHUNK_WIDTH as i32) as usize;
+                let lz = z.rem_euclid(CHUNK_DEPTH as i32) as usize;
+                self.chunks[i].get_local(lx, y as usize, lz)
+            }
             None => Voxel::Air,
         }
     }
@@ -68,47 +108,14 @@ impl World {
     pub fn collides(&self, aabb: &Aabb) -> bool {
         aabb.voxel_cells().any(|(x, y, z)| self.is_solid(x, y, z))
     }
-
-    /// A voxel surrounded by solid neighbours on all six sides is never visible, so
-    /// it can be skipped when drawing.
-    fn is_enclosed(&self, x: i32, y: i32, z: i32) -> bool {
-        self.is_solid(x + 1, y, z)
-            && self.is_solid(x - 1, y, z)
-            && self.is_solid(x, y + 1, z)
-            && self.is_solid(x, y - 1, z)
-            && self.is_solid(x, y, z + 1)
-            && self.is_solid(x, y, z - 1)
-    }
 }
 
 impl Render for World {
-    /// Draw every solid voxel that has at least one exposed face. Fully buried
-    /// voxels are culled so chunk interiors cost nothing to render.
+    /// Draw the prebuilt chunk meshes. All per-voxel work happened once at load;
+    /// a frame is now just one `draw_model` per chunk mesh.
     fn render<D: RaylibDraw3D>(&self, d: &mut D) {
-        for chunk in self.chunks.values() {
-            for ly in 0..CHUNK_HEIGHT {
-                for lz in 0..CHUNK_DEPTH {
-                    for lx in 0..CHUNK_WIDTH {
-                        let voxel = chunk.get_local(lx, ly, lz);
-                        if !voxel.is_solid() {
-                            continue;
-                        }
-
-                        let wx = chunk.cx * CHUNK_WIDTH as i32 + lx as i32;
-                        let wy = ly as i32;
-                        let wz = chunk.cz * CHUNK_DEPTH as i32 + lz as i32;
-
-                        if self.is_enclosed(wx, wy, wz) {
-                            continue;
-                        }
-
-                        // Voxel cube spans [w, w+1], so its centre is offset by half.
-                        let center =
-                            Vector3::new(wx as f32 + 0.5, wy as f32 + 0.5, wz as f32 + 0.5);
-                        d.draw_cube(center, 1.0, 1.0, 1.0, voxel.color());
-                    }
-                }
-            }
+        for model in &self.meshes {
+            d.draw_model(model, Vector3::zero(), 1.0, Color::WHITE);
         }
     }
 }

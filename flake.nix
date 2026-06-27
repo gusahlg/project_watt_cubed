@@ -23,6 +23,11 @@
           libxext
           libxkbcommon
           wayland
+          # Wayland/EGL backend deps: client protocols, optional window
+          # decorations, and libglvnd's libEGL for the GL context.
+          wayland-protocols
+          libdecor
+          libglvnd
         ];
 
         nativeBuildInputs = with pkgs; [
@@ -30,6 +35,8 @@
           pkg-config
           # bindgen (used by raylib-sys) needs libclang at build time
           llvmPackages.libclang
+          # GLFW's Wayland backend generates protocol headers at build time.
+          wayland-scanner
         ];
 
         libraryPath = pkgs.lib.makeLibraryPath runtimeLibs;

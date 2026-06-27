@@ -10,18 +10,23 @@ use crate::world::World;
 
 const STARTING_WINDOW_WIDTH: i32 = 1280;
 const STARTING_WINDOW_HEIGHT: i32 = 720;
+// Currently not in use for testing purposes
 const TARGET_FPS: u32 = 100;
 const HELP_TEXT: &str = "WASD move  |  mouse look  |  Space jump  |  F fly  |  Tab free cursor  |  Esc quit";
 
 /// The whole game: window handle, world, player, and transient UI state.
+///
+/// Field order is also drop order: `world` owns the GPU chunk models, which must
+/// be freed (`UnloadModel`) while the GL context is still alive, so it is declared
+/// before `rl` (whose drop closes the window).
 pub struct App {
-    rl: RaylibHandle,
-    thread: RaylibThread,
     world: World,
     player: Player,
     /// When locked the mouse drives the camera; when unlocked the cursor moves
     /// freely around the window.
     mouse_locked: bool,
+    rl: RaylibHandle,
+    thread: RaylibThread,
 }
 
 impl App {
@@ -32,19 +37,23 @@ impl App {
             .title("voxel prototype")
             .build();
 
-        rl.set_target_fps(TARGET_FPS);
+        // Temporary diasable
+        // rl.set_target_fps(TARGET_FPS);
         rl.disable_cursor();
 
-        let world = World::generate();
+        // Generate the voxel data, then upload the chunk geometry to the GPU once.
+        let mut world = World::generate();
+        world.build_meshes(&mut rl, &thread);
+
         // Spawn above the terrain so the player falls and lands on the surface.
         let player = Player::new(Vector3::new(8.0, 40.0, 8.0));
 
         Self {
-            rl,
-            thread,
             world,
             player,
             mouse_locked: true,
+            rl,
+            thread,
         }
     }
 

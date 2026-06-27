@@ -4,5 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-raylib = "6.0"
+# GLFW_BUILD_WAYLAND compiles raylib's bundled GLFW with BOTH the Wayland/EGL and
+# the default X11 backends. GLFW then dlopens the platform libs and auto-selects
+# at runtime (Wayland when WAYLAND_DISPLAY is set, X11 otherwise), so one binary
+# runs on both session types. This sidesteps the Xwayland->GLX path, which is
+# unreliable with the NVIDIA driver. (The separate `wayland` feature is avoided on
+# purpose: it would link an *external* system GLFW instead of the bundled one.)
+raylib = { version = "6.0", features = ["GLFW_BUILD_WAYLAND"] }
 glam = "0.30"
+
+# Maximum-performance release build: aggressive inlining across the whole
+# dependency graph (fat LTO), a single codegen unit so the optimizer sees
+# everything at once, and stripped symbols. Run the game with `cargo run
+# --release` (or `nix run`) — debug builds are many times slower.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
