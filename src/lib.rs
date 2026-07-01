@@ -15,6 +15,7 @@
 //! - [`command`] — parsing and dispatch for console commands.
 //! - [`menu`] — the start menu and mod menu screens.
 //! - [`mods`] — the runtime-toggleable mod system and the default inventory mod.
+//! - [`net`] — multiplayer: the authoritative server and the client connection.
 //! - [`save`] — saving and loading worlds.
 //! - [`sim`] — the fixed-timestep simulation seam (thermal/electrical, inert for now).
 //! - [`math`] — geometry shared across systems (the [`Aabb`](math::Aabb) and
@@ -32,6 +33,7 @@ pub mod macros;
 pub mod math;
 pub mod menu;
 pub mod mods;
+pub mod net;
 pub mod player;
 pub mod render;
 pub mod save;

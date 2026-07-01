@@ -5,13 +5,17 @@
 //! Field order is drop order: `game` owns the GPU chunk models, which must be freed
 //! while the GL context is still alive, so it is declared before `rl` (whose drop
 //! closes the window).
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use raylib::prelude::*;
 
+use crate::console::shadowed;
 use crate::game::{Game, Signal};
-use crate::menu::{MainChoice, MainMenu, ModMenu};
+use crate::menu::{FormResult, HostInfo, HostMenu, JoinInfo, JoinMenu, MainChoice, MainMenu, ModMenu};
 use crate::mods::Mods;
+use crate::net::client::Connection;
+use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
 use crate::save;
 use crate::world::World;
@@ -25,6 +29,8 @@ enum Screen {
     Menu,
     Playing,
     Mods,
+    Host,
+    Join,
 }
 
 /// The whole program: window, the installed mods (persist across worlds), the
@@ -34,9 +40,16 @@ pub struct App {
     game: Option<Game>,
     menu: MainMenu,
     mod_menu: ModMenu,
+    host_menu: HostMenu,
+    join_menu: JoinMenu,
     /// Installed mods and their on/off state; shared with the game while playing.
     mods: Mods,
     screen: Screen,
+    /// The integrated server when hosting, kept alive for the session so friends can
+    /// stay connected; stopping it frees the port for a later host.
+    host: Option<ServerHandle>,
+    /// A one-line status/error shown under the start menu (e.g. a failed connect).
+    status: Option<String>,
     rl: RaylibHandle,
     thread: RaylibThread,
 }
@@ -57,8 +70,12 @@ impl App {
             game: None,
             menu: MainMenu::new(),
             mod_menu: ModMenu::new(),
+            host_menu: HostMenu::new(),
+            join_menu: JoinMenu::new(),
             mods: Mods::with_defaults(),
             screen: Screen::Menu,
+            host: None,
+            status: None,
             rl,
             thread,
         }
@@ -77,6 +94,14 @@ impl App {
                     self.update_mods();
                     false
                 }
+                Screen::Host => {
+                    self.update_host();
+                    false
+                }
+                Screen::Join => {
+                    self.update_join();
+                    false
+                }
             };
             if quit {
                 break;
@@ -90,14 +115,85 @@ impl App {
     /// Start-menu logic. Returns `true` to quit the program.
     fn update_menu(&mut self) -> bool {
         if let Some(choice) = self.menu.update(&self.rl) {
+            self.status = None;
             match choice {
                 MainChoice::NewWorld => self.start_new_world(),
                 MainChoice::Load(name) => self.load_world(&name),
+                MainChoice::Host => self.screen = Screen::Host,
+                MainChoice::Join => self.screen = Screen::Join,
                 MainChoice::Mods => self.screen = Screen::Mods,
                 MainChoice::Quit => return true,
             }
         }
         false
+    }
+
+    /// Host screen: fill in the form, then start an integrated server and connect to
+    /// it locally. Esc returns to the menu.
+    fn update_host(&mut self) {
+        match self.host_menu.update(&mut self.rl) {
+            FormResult::Submit(info) => self.start_host(info),
+            FormResult::Cancel => self.screen = Screen::Menu,
+            FormResult::Editing => {}
+        }
+    }
+
+    /// Join screen: fill in the address/port/password, then connect. Esc returns.
+    fn update_join(&mut self) {
+        match self.join_menu.update(&mut self.rl) {
+            FormResult::Submit(info) => self.start_join(info),
+            FormResult::Cancel => self.screen = Screen::Menu,
+            FormResult::Editing => {}
+        }
+    }
+
+    /// Spin up a fresh integrated server and join it on loopback. Any previous host
+    /// is stopped first so its port is free to reuse.
+    fn start_host(&mut self, info: HostInfo) {
+        if let Some(previous) = self.host.take() {
+            previous.stop();
+            thread::sleep(Duration::from_millis(150));
+        }
+        let seed = fresh_seed();
+        let config = Config { password: info.password.clone(), seed };
+        match server::spawn(info.port, config) {
+            Ok(handle) => {
+                let port = handle.addr().port();
+                self.host = Some(handle);
+                // Connect our own client to the server we just started.
+                match Connection::connect("127.0.0.1", port, &info.name, &info.password) {
+                    Ok(conn) => self.enter_net_game(conn),
+                    Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
+                }
+            }
+            Err(e) => self.fail_to_menu(format!("could not host on port {}: {e}", info.port)),
+        }
+    }
+
+    /// Connect to a remote server and enter its world.
+    fn start_join(&mut self, info: JoinInfo) {
+        match Connection::connect(&info.host, info.port, &info.name, &info.password) {
+            Ok(conn) => self.enter_net_game(conn),
+            Err(e) => self.fail_to_menu(format!("could not join: {e}")),
+        }
+    }
+
+    /// Build the local world from the server's seed and spawn, then enter play with
+    /// the connection attached.
+    fn enter_net_game(&mut self, conn: Connection) {
+        let world = World::new(conn.seed());
+        let player = Player::new(conn.spawn());
+        // A networked world is a live mirror, not a save — start from clean defaults.
+        self.mods = Mods::with_defaults();
+        let game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
+        self.enter_game(game);
+    }
+
+    /// Report a connection/host failure and return to the menu.
+    fn fail_to_menu(&mut self, message: String) {
+        self.status = Some(message);
+        self.menu.refresh();
+        self.screen = Screen::Menu;
     }
 
     /// Create a fresh world with a time-seeded generator and enter it.
@@ -151,8 +247,12 @@ impl App {
     }
 
     /// Save the open world, if any (best-effort — a failed save shouldn't crash).
+    /// Networked worlds are server mirrors, not local saves, so they're never written.
     fn autosave(&mut self) {
         if let Some(game) = &self.game {
+            if game.is_multiplayer() {
+                return;
+            }
             let _ = save::save(game.save_name(), game.world(), game.player(), &self.mods);
         }
     }
@@ -169,11 +269,27 @@ impl App {
                 let (w, h) = (self.rl.get_screen_width(), self.rl.get_screen_height());
                 let mut d = self.rl.begin_drawing(&self.thread);
                 self.menu.draw(&mut d, w, h);
+                // A connect/host error from the last attempt, in red under the list.
+                if let Some(status) = &self.status {
+                    let fs = 20;
+                    let sx = (w - d.measure_text(status, fs)) / 2;
+                    shadowed(&mut d, status, sx, h - 70, fs, Color::SALMON);
+                }
             }
             Screen::Mods => {
                 let (w, h) = (self.rl.get_screen_width(), self.rl.get_screen_height());
                 let mut d = self.rl.begin_drawing(&self.thread);
                 self.mod_menu.draw(&mut d, &self.mods, w, h);
+            }
+            Screen::Host => {
+                let (w, h) = (self.rl.get_screen_width(), self.rl.get_screen_height());
+                let mut d = self.rl.begin_drawing(&self.thread);
+                self.host_menu.draw(&mut d, w, h);
+            }
+            Screen::Join => {
+                let (w, h) = (self.rl.get_screen_width(), self.rl.get_screen_height());
+                let mut d = self.rl.begin_drawing(&self.thread);
+                self.join_menu.draw(&mut d, w, h);
             }
         }
     }

@@ -138,8 +138,10 @@ fn parse_edit(world: &mut World, args: &str) {
     world.set_block(x, y, z, id);
 }
 
-/// Describe a block compactly by composition, using portable element names.
-fn block_spec(world: &World, id: BlockId) -> String {
+/// Describe a block compactly by composition, using portable element names. Shared
+/// with the network layer, which sends edits in exactly this portable form so ids
+/// never have to agree between machines.
+pub(crate) fn block_spec(world: &World, id: BlockId) -> String {
     if id == AIR {
         return "air".to_string();
     }
@@ -163,7 +165,8 @@ fn block_spec(world: &World, id: BlockId) -> String {
 }
 
 /// Rebuild a block from a spec, registering it into the world's palette as needed.
-fn parse_block(world: &mut World, spec: &str) -> BlockId {
+/// The inverse of [`block_spec`]; shared with the network layer.
+pub(crate) fn parse_block(world: &mut World, spec: &str) -> BlockId {
     if spec == "air" {
         return AIR;
     }
