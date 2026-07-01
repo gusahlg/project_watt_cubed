@@ -137,8 +137,8 @@ pub fn build_chunk_models(
     for ly in 0..CHUNK_HEIGHT {
         for lz in 0..CHUNK_DEPTH {
             for lx in 0..CHUNK_WIDTH {
-                let voxel = chunk.get_local(lx, ly, lz);
-                if !voxel.is_solid() {
+                let block = chunk.get_local(lx, ly, lz);
+                if !world.registry().is_solid(block) {
                     continue;
                 }
 
@@ -148,7 +148,7 @@ pub fn build_chunk_models(
                 // World-space positions are baked straight into the vertices, so
                 // every chunk's model is simply drawn at the origin.
                 let base = [wx as f32, wy as f32, wz as f32];
-                let color = voxel.color();
+                let color = world.registry().color(block);
 
                 for face in &FACES {
                     let nx = wx + face.neighbour[0];

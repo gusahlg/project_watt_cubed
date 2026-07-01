@@ -1,7 +1,12 @@
 //! chunk.rs stores a fixed-size column of voxels. It owns no generation logic of
 //! its own — it asks a [`TerrainGenerator`] to fill itself.
+//!
+//! A cell is a [`BlockId`] — a compact index into the world's
+//! [`BlockRegistry`](crate::block::BlockRegistry), not a block itself — so the
+//! storage stays 2 bytes per voxel while the blocks they name can be arbitrarily
+//! rich.
+use crate::block::registry::{AIR, BlockId};
 use crate::world::generation::TerrainGenerator;
-use crate::world::voxel::Voxel;
 
 pub const CHUNK_WIDTH: usize = 16; // along world X
 pub const CHUNK_HEIGHT: usize = 64; // along world Y
@@ -13,7 +18,7 @@ pub struct Chunk {
     pub cx: i32,
     /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_DEPTH + local z).
     pub cz: i32,
-    voxels: Vec<Voxel>,
+    voxels: Vec<BlockId>,
 }
 
 impl Chunk {
@@ -22,23 +27,38 @@ impl Chunk {
         let mut chunk = Self {
             cx,
             cz,
-            voxels: vec![Voxel::Air; CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH],
+            voxels: vec![AIR; CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH],
         };
         chunk.generate(generator);
         chunk
     }
 
-    fn index(x: usize, y: usize, z: usize) -> usize {
+    /// Flat array index of a chunk-local coordinate.
+    pub const fn index(x: usize, y: usize, z: usize) -> usize {
         x + z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH
     }
 
+    /// The chunk-local coordinate a flat index maps back to (inverse of [`index`]).
+    pub const fn local_of(index: usize) -> (usize, usize, usize) {
+        let x = index % CHUNK_WIDTH;
+        let z = (index / CHUNK_WIDTH) % CHUNK_DEPTH;
+        let y = index / (CHUNK_WIDTH * CHUNK_DEPTH);
+        (x, y, z)
+    }
+
     /// Read a voxel using chunk-local coordinates.
-    pub fn get_local(&self, x: usize, y: usize, z: usize) -> Voxel {
+    pub fn get_local(&self, x: usize, y: usize, z: usize) -> BlockId {
         self.voxels[Self::index(x, y, z)]
     }
 
-    fn set_local(&mut self, x: usize, y: usize, z: usize, v: Voxel) {
+    /// Write a voxel using chunk-local coordinates.
+    pub fn set_local(&mut self, x: usize, y: usize, z: usize, v: BlockId) {
         self.voxels[Self::index(x, y, z)] = v;
+    }
+
+    /// Overwrite a voxel by flat index — used to replay saved/broken-block edits.
+    pub fn set_index(&mut self, index: usize, v: BlockId) {
+        self.voxels[index] = v;
     }
 
     fn generate<G: TerrainGenerator>(&mut self, generator: &G) {
@@ -49,7 +69,7 @@ impl Chunk {
                 let height = generator.height(wx, wz);
 
                 for ly in 0..CHUNK_HEIGHT {
-                    let v = generator.voxel_at(wx, ly as i32, wz, height);
+                    let v = generator.block_at(wx, ly as i32, wz, height);
                     self.set_local(lx, ly, lz, v);
                 }
             }

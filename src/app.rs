@@ -1,166 +1,181 @@
-//! app.rs ties the systems together: it owns the window, world, and player, and
-//! runs the update/draw loop. Keeping this state in one struct keeps `main` tiny
-//! and makes the per-frame flow easy to follow.
+//! app.rs owns the window and the top-level state machine: the start menu, an
+//! in-world [`Game`], and the mod menu. It routes each frame to the active screen,
+//! creates and loads worlds, and autosaves when leaving one.
+//!
+//! Field order is drop order: `game` owns the GPU chunk models, which must be freed
+//! while the GL context is still alive, so it is declared before `rl` (whose drop
+//! closes the window).
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use raylib::prelude::*;
 
-use crate::command;
-use crate::console::{self, Console};
-use crate::input::{look, movement};
+use crate::game::{Game, Signal};
+use crate::menu::{MainChoice, MainMenu, ModMenu};
+use crate::mods::Mods;
 use crate::player::Player;
-use crate::render::Render;
+use crate::save;
 use crate::world::World;
 
 const STARTING_WINDOW_WIDTH: i32 = 1280;
 const STARTING_WINDOW_HEIGHT: i32 = 720;
-// Currently not in use for testing purposes
-const TARGET_FPS: u32 = 100;
-const HELP_TEXT: &str =
-    "WASD move  |  mouse look  |  Space jump  |  F fly  |  Tab free cursor  |  T command  |  Esc quit";
+const TARGET_FPS: u32 = 60;
 
-/// The whole game: window handle, world, player, and transient UI state.
-///
-/// Field order is also drop order: `world` owns the GPU chunk models, which must
-/// be freed (`UnloadModel`) while the GL context is still alive, so it is declared
-/// before `rl` (whose drop closes the window).
+/// Which top-level screen is active.
+enum Screen {
+    Menu,
+    Playing,
+    Mods,
+}
+
+/// The whole program: window, the installed mods (persist across worlds), the
+/// menus, and the current world if one is open.
 pub struct App {
-    world: World,
-    player: Player,
-    /// The in-game console / chat line; swallows game input while it's open.
-    console: Console,
-    /// When locked the mouse drives the camera; when unlocked the cursor moves
-    /// freely around the window.
-    mouse_locked: bool,
+    /// The live world, if the player is in one. Owns GPU models — drops before `rl`.
+    game: Option<Game>,
+    menu: MainMenu,
+    mod_menu: ModMenu,
+    /// Installed mods and their on/off state; shared with the game while playing.
+    mods: Mods,
+    screen: Screen,
     rl: RaylibHandle,
     thread: RaylibThread,
 }
 
 impl App {
-    /// Open the window and build the initial game state.
+    /// Open the window and start at the menu.
     pub fn new() -> Self {
         let (mut rl, thread) = raylib::init()
             .size(STARTING_WINDOW_WIDTH, STARTING_WINDOW_HEIGHT)
-            .title("voxel prototype")
+            .title("Project Watt Cubed")
             .build();
 
-        // Temporary diasable
-        // rl.set_target_fps(TARGET_FPS);
-        rl.disable_cursor();
-        // We manage quitting ourselves so Esc can close the console instead of
-        // always exiting the game (see `update`).
+        rl.set_target_fps(TARGET_FPS);
+        // We manage quitting ourselves so Esc can back out of screens.
         rl.set_exit_key(None);
 
-        // Generate the voxel data, then upload the chunk geometry to the GPU once.
-        let mut world = World::generate();
-        world.build_meshes(&mut rl, &thread);
-
-        // Spawn above the terrain so the player falls and lands on the surface.
-        let player = Player::new(Vector3::new(8.0, 40.0, 8.0));
-
         Self {
-            world,
-            player,
-            console: Console::new(),
-            mouse_locked: true,
+            game: None,
+            menu: MainMenu::new(),
+            mod_menu: ModMenu::new(),
+            mods: Mods::with_defaults(),
+            screen: Screen::Menu,
             rl,
             thread,
         }
     }
 
-    /// Run the game until the window is closed or the player quits.
+    /// Run until the window closes or the player quits from the menu.
     pub fn run(mut self) {
         while !self.rl.window_should_close() {
-            if self.update() {
+            let quit = match self.screen {
+                Screen::Menu => self.update_menu(),
+                Screen::Playing => {
+                    self.update_playing();
+                    false
+                }
+                Screen::Mods => {
+                    self.update_mods();
+                    false
+                }
+            };
+            if quit {
                 break;
             }
             self.draw();
         }
+        // Persist the open world on the way out.
+        self.autosave();
     }
 
-    /// Advance one frame of simulation from input. Returns `true` to quit.
-    fn update(&mut self) -> bool {
-        // Delta time keeps movement speed consistent regardless of frame rate.
-        let dt = self.rl.get_frame_time();
-
-        // While the console is open it captures all typing; the world is frozen so
-        // movement keys land in the input box instead of moving the player.
-        if self.console.is_open() {
-            if let Some(line) = self.console.handle_input(&mut self.rl) {
-                self.console.print(format!("> {line}"));
-                for out in command::execute(&line, &mut self.player) {
-                    self.console.print(out);
-                }
+    /// Start-menu logic. Returns `true` to quit the program.
+    fn update_menu(&mut self) -> bool {
+        if let Some(choice) = self.menu.update(&self.rl) {
+            match choice {
+                MainChoice::NewWorld => self.start_new_world(),
+                MainChoice::Load(name) => self.load_world(&name),
+                MainChoice::Mods => self.screen = Screen::Mods,
+                MainChoice::Quit => return true,
             }
-            return false;
         }
-
-        // Esc quits when the console is closed (it closes the console when open,
-        // handled above).
-        if self.rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-            return true;
-        }
-
-        // Open the console with `T`, or `/` to start a command straight away.
-        let slash = self.rl.is_key_pressed(KeyboardKey::KEY_SLASH);
-        if slash || self.rl.is_key_pressed(KeyboardKey::KEY_T) {
-            self.console.open(slash);
-            // Drop the keystroke that opened it so it doesn't appear in the input.
-            while self.rl.get_char_pressed().is_some() {}
-            return false;
-        }
-
-        if self.rl.is_key_pressed(KeyboardKey::KEY_TAB) {
-            self.toggle_mouse();
-        }
-
-        // Only steer the camera with the mouse while it's locked.
-        if self.mouse_locked {
-            look::update(&mut self.player, &self.rl);
-        }
-
-        let input = movement::MoveInput::from_input(&self.rl);
-        movement::update_player(&mut self.player, &self.world, &input, dt);
         false
     }
 
-    fn toggle_mouse(&mut self) {
-        self.mouse_locked = !self.mouse_locked;
-        if self.mouse_locked {
-            self.rl.disable_cursor();
-        } else {
-            self.rl.enable_cursor();
+    /// Create a fresh world with a time-seeded generator and enter it.
+    fn start_new_world(&mut self) {
+        let seed = fresh_seed();
+        let world = World::new(seed);
+        let player = spawn_player(&world);
+        let name = save::next_new_name();
+
+        // A new world starts from a clean default mod set (empty inventory, etc.).
+        self.mods = Mods::with_defaults();
+        self.enter_game(Game::new(world, player, name));
+    }
+
+    /// Load an existing save and enter it. Stays on the menu if loading fails.
+    fn load_world(&mut self, name: &str) {
+        self.mods = Mods::with_defaults();
+        match save::load(name, &mut self.mods) {
+            Ok((world, player)) => self.enter_game(Game::new(world, player, name.to_string())),
+            Err(_) => {}
         }
     }
 
-    /// Render the world and the HUD.
-    fn draw(&mut self) {
-        let camera = self.player.camera();
+    /// Install a freshly built game as the active screen.
+    fn enter_game(&mut self, mut game: Game) {
+        game.on_enter(&mut self.rl);
+        self.game = Some(game);
+        self.screen = Screen::Playing;
+    }
 
-        // Build the coordinate readout and centre it before borrowing `rl` for
-        // drawing (`measure_text`/screen size need the handle).
-        let p = self.player.position;
-        let coord_text = format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z);
-        let coord_fs = 26;
-        let screen_w = self.rl.get_screen_width();
-        let screen_h = self.rl.get_screen_height();
-        let coord_x = (screen_w - self.rl.measure_text(&coord_text, coord_fs)) / 2;
-
-        let mut d = self.rl.begin_drawing(&self.thread);
-        d.clear_background(Color::SKYBLUE);
-
-        {
-            let mut d3 = d.begin_mode3D(camera);
-            self.world.render(&mut d3);
+    /// In-world logic; leaves to the menu (autosaving) when the game signals it.
+    fn update_playing(&mut self) {
+        let signal = match &mut self.game {
+            Some(game) => game.update(&mut self.rl, &self.thread, &mut self.mods),
+            None => Signal::ExitToMenu,
+        };
+        if let Signal::ExitToMenu = signal {
+            self.autosave();
+            self.rl.enable_cursor();
+            self.game = None;
+            self.menu.refresh();
+            self.screen = Screen::Menu;
         }
+    }
 
-        // Coordinate HUD, centred at the top of the screen.
-        console::shadowed(&mut d, &coord_text, coord_x, 12, coord_fs, Color::WHITE);
+    /// Mod-menu logic; Esc returns to the start menu.
+    fn update_mods(&mut self) {
+        if self.mod_menu.update(&self.rl, &mut self.mods) {
+            self.screen = Screen::Menu;
+        }
+    }
 
-        // FPS and controls in the top-left; the console owns the bottom strip.
-        d.draw_fps(10, 12);
-        console::shadowed(&mut d, HELP_TEXT, 10, 40, 18, Color::RAYWHITE);
+    /// Save the open world, if any (best-effort — a failed save shouldn't crash).
+    fn autosave(&mut self) {
+        if let Some(game) = &self.game {
+            let _ = save::save(game.save_name(), game.world(), game.player(), &self.mods);
+        }
+    }
 
-        // Console / chat overlay on top of everything.
-        self.console.draw(&mut d, screen_w, screen_h);
+    /// Draw the active screen.
+    fn draw(&mut self) {
+        match self.screen {
+            Screen::Playing => {
+                if let Some(game) = &mut self.game {
+                    game.draw(&mut self.rl, &self.thread, &self.mods);
+                }
+            }
+            Screen::Menu => {
+                let (w, h) = (self.rl.get_screen_width(), self.rl.get_screen_height());
+                let mut d = self.rl.begin_drawing(&self.thread);
+                self.menu.draw(&mut d, w, h);
+            }
+            Screen::Mods => {
+                let (w, h) = (self.rl.get_screen_width(), self.rl.get_screen_height());
+                let mut d = self.rl.begin_drawing(&self.thread);
+                self.mod_menu.draw(&mut d, &self.mods, w, h);
+            }
+        }
     }
 }
 
@@ -168,4 +183,19 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A world seed from the wall clock, so each new world differs.
+fn fresh_seed() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(1)
+}
+
+/// Spawn the player just above the surface at the world origin, so they drop and
+/// land on solid ground.
+fn spawn_player(world: &World) -> Player {
+    let surface = world.surface_y(0, 0);
+    Player::new(Vector3::new(0.5, surface as f32 + 3.0, 0.5))
 }
