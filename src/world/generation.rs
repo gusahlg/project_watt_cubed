@@ -44,7 +44,10 @@ pub trait TerrainGenerator {
 
 /// Rolling hills built from layered sine waves — deterministic and dependency-free.
 /// A `seed` shifts the wave phases so each world looks different while staying fully
-/// reproducible from that one number.
+/// reproducible from that one number. `Clone` because generation jobs run on
+/// worker threads (see [`pipeline`](super::pipeline)): each job carries its own
+/// copy of this handful of plain numbers and ids.
+#[derive(Clone)]
 pub struct SineHills {
     /// Average terrain height that the waves oscillate around.
     pub base: f32,

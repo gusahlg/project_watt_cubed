@@ -103,7 +103,8 @@ pub fn load(name: &str, mods: &mut Mods) -> io::Result<(World, Player)> {
             parse_edit(&mut world, rest);
         } else if let Some(rest) = line.strip_prefix("mod ") {
             let (mod_name, data) = rest.split_once(' ').unwrap_or((rest, ""));
-            mods.load_state(mod_name, data, &world);
+            // Mutable: restoring crafted blocks re-registers them by name.
+            mods.load_state(mod_name, data, &mut world);
         }
     }
 

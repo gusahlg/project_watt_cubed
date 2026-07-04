@@ -60,6 +60,22 @@ pub struct App {
     status: Option<String>,
     /// Graphics settings, persisted in `saves/settings.cfg`.
     settings: Settings,
+    /// Headless-ish benchmark mode (`WATT_BENCH=<seconds>`): auto-enters a
+    /// world, rotates the camera, prints one stats line, exits.
+    bench: Option<Bench>,
+}
+
+/// State for the `WATT_BENCH` frame-rate benchmark.
+struct Bench {
+    /// Measurement length in seconds (after warmup).
+    duration: f32,
+    /// Seconds of warmup left before sampling starts (world streaming in).
+    warmup: f32,
+    /// Elapsed measured time.
+    elapsed: f32,
+    /// Per-frame durations, for avg and percentile stats.
+    samples: Vec<f32>,
+    started: bool,
 }
 
 impl App {
@@ -76,6 +92,13 @@ impl App {
             host: None,
             status: None,
             settings: Settings::load(),
+            bench: std::env::var("WATT_BENCH").ok().map(|v| Bench {
+                duration: v.parse().unwrap_or(10.0),
+                warmup: 3.0,
+                elapsed: 0.0,
+                samples: Vec::with_capacity(1 << 17),
+                started: false,
+            }),
         }
     }
 
@@ -103,6 +126,10 @@ impl App {
         if eng.should_close() {
             self.settings.save();
             self.autosave();
+            return false;
+        }
+
+        if self.bench.is_some() && !self.bench_frame(eng) {
             return false;
         }
 
@@ -136,6 +163,55 @@ impl App {
         }
         self.draw(eng);
         true
+    }
+
+    /// Drive one benchmark frame: enter a world on the first frame, spin the
+    /// camera, sample frame times, and print the stats line when done.
+    /// Returns `false` when the benchmark is finished and the app should exit.
+    fn bench_frame(&mut self, eng: &mut Engine) -> bool {
+        let dt = eng.frame_time();
+        let bench = self.bench.as_mut().expect("bench_frame without bench");
+
+        if !bench.started {
+            bench.started = true;
+            // Uncapped and unsynced, or the bench measures the throttle.
+            self.settings.vsync = false;
+            self.settings.max_fps = 0;
+            self.settings.apply(eng);
+            self.start_new_world(eng);
+            return true;
+        }
+        let Some(game) = &mut self.game else {
+            return true;
+        };
+        // A slow spin sweeps the frustum across the terrain like a player would.
+        game.player_mut().yaw += 0.4 * dt;
+
+        if bench.warmup > 0.0 {
+            bench.warmup -= dt;
+            return true;
+        }
+        bench.elapsed += dt;
+        if dt > 0.0 {
+            bench.samples.push(dt);
+        }
+        if bench.elapsed < bench.duration {
+            return true;
+        }
+
+        let frames = bench.samples.len();
+        let total: f32 = bench.samples.iter().sum();
+        let avg_ms = total / frames.max(1) as f32 * 1000.0;
+        let avg_fps = frames as f32 / total.max(f32::EPSILON);
+        let mut sorted = bench.samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // p1 fps = the fps of the 99th-percentile (slowest 1%) frame time.
+        let p99_dt = sorted[(frames.saturating_sub(1)) * 99 / 100];
+        println!(
+            "BENCH frames={frames} avg_fps={avg_fps:.0} p1_fps={:.0} avg_ms={avg_ms:.3}",
+            1.0 / p99_dt.max(f32::EPSILON)
+        );
+        false
     }
 
     /// Start-menu logic. Returns `true` to quit the program.

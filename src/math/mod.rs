@@ -23,6 +23,15 @@ impl Aabb {
         self.center + self.half
     }
 
+    /// Whether this box overlaps another (strictly — merely touching faces do
+    /// not count, so a block placed flush against the player is fine).
+    pub fn intersects(&self, other: &Aabb) -> bool {
+        let d = self.center - other.center;
+        d.x.abs() < self.half.x + other.half.x
+            && d.y.abs() < self.half.y + other.half.y
+            && d.z.abs() < self.half.z + other.half.z
+    }
+
     /// Every integer voxel cell this box overlaps. A voxel `(x, y, z)` occupies
     /// the unit cube `[x, x+1)` on each axis, so the overlapped cells run from the
     /// floor of the box minimum to the floor of its maximum.

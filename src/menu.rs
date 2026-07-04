@@ -69,15 +69,16 @@ impl MainMenu {
     }
 
     /// Handle a frame of input, returning a choice when the player presses Enter.
+    /// Also accepts vim-style j/k/l for down/up/select.
     pub fn update(&mut self, eng: &Engine) -> Option<MainChoice> {
         let count = self.item_count();
-        if eng.is_key_pressed(Key::Down) {
+        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
             self.selected = (self.selected + 1) % count;
         }
-        if eng.is_key_pressed(Key::Up) {
+        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
             self.selected = (self.selected + count - 1) % count;
         }
-        if eng.is_key_pressed(Key::Enter) {
+        if eng.is_key_pressed(Key::Enter) || eng.is_key_pressed(Key::L) {
             return Some(self.choice_at(self.selected));
         }
         None
@@ -123,7 +124,7 @@ impl MainMenu {
             shadowed(f, &text, x, start_y + line_h * i as i32, fs, color);
         }
 
-        let hint = "Up/Down select   Enter choose";
+        let hint = "Up/Down or j/k select   Enter or l choose";
         let hint_fs = 18;
         let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
         shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
@@ -147,20 +148,25 @@ impl ModMenu {
     }
 
     /// Handle input; returns `true` when the player wants to go back.
+    /// Also accepts vim-style j/k/l/h for down/up/toggle/back.
     pub fn update(&mut self, eng: &Engine, mods: &mut Mods) -> bool {
         let count = mods.len().max(1);
-        if eng.is_key_pressed(Key::Down) {
+        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
             self.selected = (self.selected + 1) % count;
         }
-        if eng.is_key_pressed(Key::Up) {
+        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
             self.selected = (self.selected + count - 1) % count;
         }
-        if (eng.is_key_pressed(Key::Enter) || eng.is_key_pressed(Key::Space))
+        if (eng.is_key_pressed(Key::Enter)
+            || eng.is_key_pressed(Key::Space)
+            || eng.is_key_pressed(Key::L))
             && self.selected < mods.len()
         {
             mods.toggle(self.selected);
         }
-        eng.is_key_pressed(Key::Escape) || eng.is_key_pressed(Key::Backspace)
+        eng.is_key_pressed(Key::Escape)
+            || eng.is_key_pressed(Key::Backspace)
+            || eng.is_key_pressed(Key::H)
     }
 
     /// Draw the list of mods with their on/off state and descriptions.
@@ -198,7 +204,7 @@ impl ModMenu {
             );
         }
 
-        let hint = "Up/Down select   Enter toggle   Esc back";
+        let hint = "Up/Down or j/k select   Enter/l toggle   Esc/h back";
         let hint_fs = 18;
         let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
         shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
@@ -238,26 +244,28 @@ impl SettingsMenu {
     }
 
     /// Handle input; returns `true` when the player wants to go back (Esc
-    /// anywhere, or Enter on the Back row). Left/Right cycle the selected value
-    /// down/up; Enter also cycles up.
+    /// anywhere, or Enter — or l — on the Back row). Left/Right cycle the
+    /// selected value down/up; Enter also cycles up. Also accepts vim-style
+    /// j/k for down/up and h/l as aliases of Left/Right.
     pub fn update(&mut self, eng: &Engine, s: &mut crate::settings::Settings) -> bool {
         if eng.is_key_pressed(Key::Escape) {
             return true;
         }
-        if eng.is_key_pressed(Key::Down) {
+        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
             self.selected = (self.selected + 1) % SETTINGS_ROWS;
         }
-        if eng.is_key_pressed(Key::Up) {
+        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
             self.selected = (self.selected + SETTINGS_ROWS - 1) % SETTINGS_ROWS;
         }
         let enter = eng.is_key_pressed(Key::Enter);
-        if enter && self.selected == SETTINGS_ROW_BACK {
+        let l = eng.is_key_pressed(Key::L);
+        if (enter || l) && self.selected == SETTINGS_ROW_BACK {
             return true;
         }
-        if eng.is_key_pressed(Key::Left) {
+        if eng.is_key_pressed(Key::Left) || eng.is_key_pressed(Key::H) {
             self.cycle(s, -1);
         }
-        if eng.is_key_pressed(Key::Right) || enter {
+        if eng.is_key_pressed(Key::Right) || l || enter {
             self.cycle(s, 1);
         }
         false
@@ -318,7 +326,7 @@ impl SettingsMenu {
             shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
         }
 
-        let hint = "Up/Down select | Left/Right change | Esc back";
+        let hint = "Up/Down or j/k select | Left/Right or h/l change | Esc back";
         let hint_fs = 18;
         let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
         shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);

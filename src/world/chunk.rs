@@ -12,7 +12,10 @@ pub const CHUNK_WIDTH: usize = 16; // along world X
 pub const CHUNK_HEIGHT: usize = 64; // along world Y
 pub const CHUNK_DEPTH: usize = 16; // along world Z
 
-/// A region of the world holding its own flat array of voxels.
+/// A region of the world holding its own flat array of voxels. `Clone` copies
+/// the ~32 KiB voxel array — used to snapshot a chunk for a worker-thread mesh
+/// job (see [`pipeline`](super::pipeline)), never on a per-frame hot path.
+#[derive(Clone)]
 pub struct Chunk {
     /// Chunk coordinate on the X axis (world X = cx * CHUNK_WIDTH + local x).
     pub cx: i32,

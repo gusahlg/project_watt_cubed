@@ -11,11 +11,14 @@
 //! - [`derive`] — composition → solidity, colour, core properties, specials.
 //! - [`reaction`] — emergent properties from element combinations.
 //! - [`registry`] — the [`BlockRegistry`], hot/cold split, and the crafting API.
+//! - [`crafting`] — canonicalised natural-tier crafting on top of the registry.
 pub mod composition;
+pub mod crafting;
 pub mod derive;
 pub mod element;
 pub mod reaction;
 pub mod registry;
+pub mod texture;
 
 pub use composition::{Composition, Mix, MixError};
 pub use element::{CoreProperties, Element, ElementId, ElementRegistry, SpecialKind, SpecialProperty};

@@ -9,8 +9,10 @@ use crate::world::World;
 pub struct RayHit {
     /// The solid block that was hit.
     pub block: (i32, i32, i32),
-    /// The empty cell just before it along the ray — where a placed block would go.
-    pub before: (i32, i32, i32),
+    /// The last cell the ray passed through *before* the hit block — where a
+    /// placed block would go. If the ray starts inside a solid block, this is
+    /// the start cell itself.
+    pub previous: (i32, i32, i32),
 }
 
 /// March a ray from `origin` along `dir` up to `reach` world units and return the
@@ -31,7 +33,7 @@ pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<Ray
     if world.is_solid(x, y, z) {
         return Some(RayHit {
             block: (x, y, z),
-            before: (x, y, z),
+            previous: (x, y, z),
         });
     }
 
@@ -62,7 +64,7 @@ pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<Ray
 
     let mut t = 0.0;
     while t <= reach {
-        let before = (x, y, z);
+        let previous = (x, y, z);
         if t_max_x <= t_max_y && t_max_x <= t_max_z {
             x += step_x;
             t = t_max_x;
@@ -82,7 +84,7 @@ pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<Ray
         if world.is_solid(x, y, z) {
             return Some(RayHit {
                 block: (x, y, z),
-                before,
+                previous,
             });
         }
     }
@@ -102,7 +104,20 @@ mod tests {
             .expect("a downward ray should hit the terrain");
         assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
         // The cell just above the hit block is the empty one the ray last passed.
-        assert_eq!(hit.before.1, hit.block.1 + 1);
+        assert_eq!(hit.previous.1, hit.block.1 + 1);
+    }
+
+    #[test]
+    fn previous_is_the_cell_above_when_looking_down() {
+        let world = World::generate();
+        let origin = Vec3::new(8.5, 40.0, 8.5);
+        let hit = raycast(&world, origin, Vec3::new(0.0, -1.0, 0.0), 60.0)
+            .expect("a downward ray should hit the terrain");
+        // Straight down: `previous` is exactly the cell above the hit block, and
+        // it is empty (a placed block would fit there).
+        let (bx, by, bz) = hit.block;
+        assert_eq!(hit.previous, (bx, by + 1, bz));
+        assert!(!world.is_solid(bx, by + 1, bz));
     }
 
     #[test]

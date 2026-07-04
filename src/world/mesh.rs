@@ -8,17 +8,20 @@
 //!   faces shared between two solid voxels never exist, so there is no overdraw.
 //! - Adjacent exposed faces of the same block are merged into maximal
 //!   rectangles (per face direction), cutting vertex counts by an order of
-//!   magnitude on rolling terrain. Merging is lossless because faces are
-//!   flat-coloured quads: two faces merge only when their final vertex colour
-//!   is identical (same [`BlockId`], and shade is constant per direction).
-//! - Per-face directional shading is baked into the vertex colours, which fakes
-//!   cheap lighting without needing lit shaders (the engine is unlit).
+//!   magnitude on rolling terrain. Merging is lossless because two faces merge
+//!   only on identical [`BlockId`] (== texture layer, and shade is constant per
+//!   direction), and UVs are the face plane's world coordinates: a quad
+//!   spanning k blocks gets a uv extent of k, so REPEAT sampling tiles the
+//!   16x16 block texture once per block across the merged span.
+//! - Per-face directional shading is baked into the vertex colour multiplier,
+//!   which fakes cheap lighting without needing lit shaders (the engine is
+//!   unlit); `color.a` carries the block-texture-array layer, i.e. the block id.
 //! - Neighbour culling never touches the world's chunk map: the four bordering
 //!   chunks are resolved once per build and everything else is flat-array reads.
 //!
 //! Building is pure CPU (`&Chunk` in, [`MeshData`] out) so it runs headless in
 //! tests; the caller uploads the result via `Engine::upload_mesh`.
-use voxel_engine::{Color, MeshData, Vertex};
+use voxel_engine::{MeshData, Vertex};
 
 use super::chunk::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
 use crate::block::registry::{AIR, BlockId};
@@ -31,6 +34,88 @@ pub struct Neighbours<'a> {
     pub pos_x: Option<&'a Chunk>,
     pub neg_z: Option<&'a Chunk>,
     pub pos_z: Option<&'a Chunk>,
+}
+
+/// A chunk border the sweep can read across. The discriminant doubles as the
+/// plane index in [`BorderPlanes`].
+#[derive(Clone, Copy)]
+pub enum Side {
+    NegX = 0,
+    PosX = 1,
+    NegZ = 2,
+    PosZ = 3,
+}
+
+/// How the mesher reads the voxel just across a chunk border. Implemented for
+/// [`Neighbours`] (sync path: borrow the four loaded chunks) and
+/// [`BorderPlanes`] (worker path: owned copies of just the facing planes), so
+/// both share the sweep and emit code in [`build_chunk_mesh_with`].
+pub trait NeighbourRead {
+    /// The block across `side` at height `y` and in-plane coordinate `u`
+    /// (Z for the X sides, X for the Z sides). A missing neighbour reads as air.
+    fn across(&self, side: Side, y: usize, u: usize) -> BlockId;
+}
+
+impl NeighbourRead for Neighbours<'_> {
+    fn across(&self, side: Side, y: usize, u: usize) -> BlockId {
+        match side {
+            Side::NegX => self.neg_x.map_or(AIR, |c| c.get_local(CHUNK_WIDTH - 1, y, u)),
+            Side::PosX => self.pos_x.map_or(AIR, |c| c.get_local(0, y, u)),
+            Side::NegZ => self.neg_z.map_or(AIR, |c| c.get_local(u, y, CHUNK_DEPTH - 1)),
+            Side::PosZ => self.pos_z.map_or(AIR, |c| c.get_local(u, y, 0)),
+        }
+    }
+}
+
+/// Width of a border plane's in-plane horizontal axis. Both horizontal axes
+/// are 16, so one constant serves the X and Z sides alike.
+const PLANE_W: usize = CHUNK_WIDTH;
+const _: () = assert!(CHUNK_WIDTH == CHUNK_DEPTH, "border planes assume square chunks");
+
+/// The four neighbour facing planes copied out for a worker-thread mesh build:
+/// each is [`PLANE_W`] x [`CHUNK_HEIGHT`] voxels indexed `[u + y * PLANE_W]`,
+/// `None` when the neighbour has no data (reads as air, like a missing
+/// [`Neighbours`] entry). ~1 KiB per plane, owned, so a mesh job borrows
+/// nothing from the live chunk map.
+pub struct BorderPlanes {
+    planes: [Option<Box<[BlockId]>>; 4],
+}
+
+impl BorderPlanes {
+    /// Copy the facing plane out of each present neighbour: the neg-X
+    /// neighbour's `x == 15` plane, the pos-X neighbour's `x == 0` plane, and
+    /// likewise for Z.
+    pub fn capture(n: &Neighbours) -> Self {
+        fn plane(
+            chunk: Option<&Chunk>,
+            read: impl Fn(&Chunk, usize, usize) -> BlockId,
+        ) -> Option<Box<[BlockId]>> {
+            let chunk = chunk?;
+            let mut out = Vec::with_capacity(PLANE_W * CHUNK_HEIGHT);
+            for y in 0..CHUNK_HEIGHT {
+                for u in 0..PLANE_W {
+                    out.push(read(chunk, y, u));
+                }
+            }
+            Some(out.into_boxed_slice())
+        }
+        Self {
+            planes: [
+                plane(n.neg_x, |c, y, z| c.get_local(CHUNK_WIDTH - 1, y, z)),
+                plane(n.pos_x, |c, y, z| c.get_local(0, y, z)),
+                plane(n.neg_z, |c, y, x| c.get_local(x, y, CHUNK_DEPTH - 1)),
+                plane(n.pos_z, |c, y, x| c.get_local(x, y, 0)),
+            ],
+        }
+    }
+}
+
+impl NeighbourRead for BorderPlanes {
+    fn across(&self, side: Side, y: usize, u: usize) -> BlockId {
+        self.planes[side as usize]
+            .as_deref()
+            .map_or(AIR, |plane| plane[u + y * PLANE_W])
+    }
 }
 
 /// One face direction of the greedy sweep. Each direction slices the chunk
@@ -130,8 +215,9 @@ const MASK_CAP: usize =
 
 /// Build one chunk's greedy mesh into `out` (cleared first — pass the world's
 /// reusable scratch to avoid per-chunk allocations; `upload_mesh` copies out of
-/// it). `solid` and `colors` are the registry's hot tables snapshotted as plain
-/// slices indexed by [`BlockId`], so the per-voxel loops never leave L1.
+/// it). `solid` is the registry's hot solidity table snapshotted as a plain
+/// slice indexed by [`BlockId`], so the per-voxel loops never leave L1. Colour
+/// comes from the block texture array: `color.a` = block id = texture layer.
 ///
 /// World-space positions are baked straight into the vertices, so every
 /// chunk's mesh is drawn at the origin.
@@ -139,7 +225,19 @@ pub fn build_chunk_mesh(
     chunk: &Chunk,
     neighbours: &Neighbours,
     solid: &[bool],
-    colors: &[Color],
+    out: &mut MeshData,
+) {
+    build_chunk_mesh_with(chunk, neighbours, solid, out);
+}
+
+/// The generic core behind [`build_chunk_mesh`]: an identical sweep and emit
+/// for the synchronous path (`&Neighbours`, borrowing live chunks) and the
+/// worker path ([`BorderPlanes`], owning copies of just the facing planes) —
+/// only the read across a chunk border differs, via [`NeighbourRead`].
+pub fn build_chunk_mesh_with<N: NeighbourRead>(
+    chunk: &Chunk,
+    neighbours: &N,
+    solid: &[bool],
     out: &mut MeshData,
 ) {
     out.clear();
@@ -164,15 +262,15 @@ pub fn build_chunk_mesh(
         };
         let stride = AXIS_STRIDE[dir.n_axis] * dir.step as isize;
         // The slice whose neighbour test would step outside this chunk's array;
-        // there the neighbour is the prefetched bordering chunk (X/Z) or the
-        // world floor/ceiling (Y), which always reads as air.
+        // there the neighbour is read across the border via `NeighbourRead`
+        // (X/Z) or is the world floor/ceiling (Y), which always reads as air.
         let edge_n = if dir.step > 0 { AXIS_MAX[dir.n_axis] - 1 } else { 0 };
-        let (edge_chunk, edge_wrap) = match (dir.n_axis, dir.step > 0) {
-            (0, true) => (neighbours.pos_x, 0),
-            (0, false) => (neighbours.neg_x, CHUNK_WIDTH - 1),
-            (2, true) => (neighbours.pos_z, 0),
-            (2, false) => (neighbours.neg_z, CHUNK_DEPTH - 1),
-            _ => (None, 0),
+        let edge_side = match (dir.n_axis, dir.step > 0) {
+            (0, true) => Some(Side::PosX),
+            (0, false) => Some(Side::NegX),
+            (2, true) => Some(Side::PosZ),
+            (2, false) => Some(Side::NegZ),
+            _ => None,
         };
 
         for n in 0..n_count {
@@ -191,10 +289,14 @@ pub fn build_chunk_mesh(
                     let mut cell = AIR;
                     if solid[id.0 as usize] {
                         let covered = if at_edge {
-                            match edge_chunk {
-                                Some(other) => {
-                                    c[dir.n_axis] = edge_wrap;
-                                    solid[other.get_local(c[0], c[1], c[2]).0 as usize]
+                            match edge_side {
+                                // For X/Z sides the plane coords are V (always
+                                // Y here) and U (the other horizontal axis),
+                                // matching `NeighbourRead::across`.
+                                Some(side) => {
+                                    let id =
+                                        neighbours.across(side, c[dir.v_axis], c[dir.u_axis]);
+                                    solid[id.0 as usize]
                                 }
                                 None => false, // beyond the world: air
                             }
@@ -239,7 +341,7 @@ pub fn build_chunk_mesh(
                         let row = (v0 + dv) * u_count;
                         mask[u0 + row..u0 + w + row].fill(AIR);
                     }
-                    emit_rect(out, dir, base, n, u0, v0, w, h, shade(colors[id.0 as usize], dir.shade));
+                    emit_rect(out, dir, base, n, u0, v0, w, h, id);
                 }
             }
         }
@@ -248,6 +350,12 @@ pub fn build_chunk_mesh(
 
 /// Append one merged rectangle: 4 vertices and 6 indices, corners scaled from
 /// the direction's unit-quad table by the rectangle's U/V extents.
+///
+/// UV = the two varying world coordinates of the face's plane (+Y/-Y: (x,z);
+/// +X/-X: (z,y); +Z/-Z: (x,y)) — exactly `(pos[u_axis], pos[v_axis])` — so a
+/// rect spanning k blocks spans k uv units and REPEAT shows one texture
+/// repetition per block. Colour rgb = the direction's shade as a gray
+/// multiplier; colour a = the block id, i.e. the texture-array layer.
 #[allow(clippy::too_many_arguments)]
 fn emit_rect(
     out: &mut MeshData,
@@ -258,8 +366,11 @@ fn emit_rect(
     v0: usize,
     w: usize,
     h: usize,
-    color: [u8; 4],
+    id: BlockId,
 ) {
+    debug_assert!(id.0 < 256, "block texture layers are u8 for now");
+    let shade = (255.0 * dir.shade) as u8;
+
     let mut origin = [0.0f32; 3]; // world position of the rect's minimum block corner
     origin[dir.n_axis] = (base[dir.n_axis] + n as i32) as f32;
     origin[dir.u_axis] = (base[dir.u_axis] + u0 as i32) as f32;
@@ -271,21 +382,15 @@ fn emit_rect(
         pos[dir.n_axis] = origin[dir.n_axis] + corner[0];
         pos[dir.u_axis] = origin[dir.u_axis] + corner[1] * w as f32;
         pos[dir.v_axis] = origin[dir.v_axis] + corner[2] * h as f32;
-        out.vertices.push(Vertex { pos, color });
+        out.vertices.push(Vertex::textured(
+            pos,
+            [pos[dir.u_axis], pos[dir.v_axis]],
+            [shade, shade, shade],
+            id.0 as u8,
+        ));
     }
     out.indices
         .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
-}
-
-/// Multiply a colour's RGB by `factor`, keeping alpha. Used to bake per-face
-/// directional shading into vertex colours.
-fn shade(c: Color, factor: f32) -> [u8; 4] {
-    [
-        (c.r as f32 * factor) as u8,
-        (c.g as f32 * factor) as u8,
-        (c.b as f32 * factor) as u8,
-        c.a,
-    ]
 }
 
 #[cfg(test)]
@@ -310,19 +415,12 @@ mod tests {
         }
     }
 
-    /// Two distinct solid test blocks with different colours.
+    /// Two distinct solid test blocks (distinct ids = distinct texture layers).
     const STONE: BlockId = BlockId(1);
     const DIRT: BlockId = BlockId(2);
 
-    fn tables() -> (Vec<bool>, Vec<Color>) {
-        (
-            vec![false, true, true],
-            vec![
-                Color::new(0, 0, 0, 0),
-                Color::new(128, 128, 128, 255),
-                Color::new(150, 108, 74, 255),
-            ],
-        )
+    fn solid_table() -> Vec<bool> {
+        vec![false, true, true]
     }
 
     fn empty_chunk() -> Chunk {
@@ -337,9 +435,9 @@ mod tests {
     };
 
     fn build(chunk: &Chunk) -> MeshData {
-        let (solid, colors) = tables();
+        let solid = solid_table();
         let mut out = MeshData::default();
-        build_chunk_mesh(chunk, &NO_NEIGHBOURS, &solid, &colors, &mut out);
+        build_chunk_mesh(chunk, &NO_NEIGHBOURS, &solid, &mut out);
         out
     }
 
@@ -415,7 +513,7 @@ mod tests {
             }
         }
         let data = build(&chunk);
-        let (solid, _) = tables();
+        let solid = solid_table();
 
         // One merged 3x3 top face at y=1 — 4 vertices / 6 indices for that direction.
         assert_eq!(quads_in_y_plane(&data, 1.0), 1, "top of the slab is one quad");
@@ -424,6 +522,25 @@ mod tests {
         let reference = culled_face_area(&chunk, &solid);
         assert_eq!(reference, 30);
         assert_eq!(total_area(&data), reference as f32);
+
+        // The merged top quad carries full-brightness shade, STONE's layer,
+        // and world-coordinate uvs spanning the full 3-block extent so REPEAT
+        // tiles the texture once per block.
+        let top = data
+            .vertices
+            .chunks_exact(4)
+            .find(|q| q.iter().all(|v| v.pos[1] == 1.0))
+            .expect("top quad exists");
+        for v in top {
+            assert_eq!(v.color, [255, 255, 255, STONE.0 as u8], "(shade, layer)");
+            assert_eq!(v.uv, [v.pos[0], v.pos[2]], "+Y uv = world (x, z)");
+        }
+        let span = |axis: usize| {
+            let lo = top.iter().map(|v| v.uv[axis]).fold(f32::INFINITY, f32::min);
+            let hi = top.iter().map(|v| v.uv[axis]).fold(f32::NEG_INFINITY, f32::max);
+            hi - lo
+        };
+        assert_eq!((span(0), span(1)), (3.0, 3.0), "uv extent == blocks spanned");
     }
 
     #[test]
@@ -437,7 +554,7 @@ mod tests {
             }
         }
         let data = build(&chunk);
-        let (solid, _) = tables();
+        let solid = solid_table();
 
         // Every face is isolated, so quad count equals face area exactly.
         let areas = quad_areas(&data);
@@ -452,14 +569,28 @@ mod tests {
         chunk.set_local(0, 0, 0, STONE);
         chunk.set_local(1, 0, 0, DIRT);
         let data = build(&chunk);
-        let (solid, _) = tables();
+        let solid = solid_table();
 
         // Adjacent tops of different blocks stay two quads.
-        assert_eq!(quads_in_y_plane(&data, 1.0), 2, "different colours never merge");
+        assert_eq!(quads_in_y_plane(&data, 1.0), 2, "different blocks never merge");
         // The shared vertical face is culled on both sides: 5 exposed faces each.
         let reference = culled_face_area(&chunk, &solid);
         assert_eq!(reference, 10);
         assert_eq!(total_area(&data), reference as f32);
+
+        // Same shade on both tops; only the texture layer distinguishes them.
+        let tops: Vec<_> = data
+            .vertices
+            .chunks_exact(4)
+            .filter(|q| q.iter().all(|v| v.pos[1] == 1.0))
+            .collect();
+        let mut layers: Vec<u8> = tops.iter().map(|q| q[0].color[3]).collect();
+        layers.sort_unstable();
+        assert_eq!(layers, vec![STONE.0 as u8, DIRT.0 as u8]);
+        assert!(
+            tops.iter().all(|q| q.iter().all(|v| v.color[..3] == [255, 255, 255])),
+            "top shade is identical across blocks"
+        );
     }
 
     #[test]
@@ -499,7 +630,33 @@ mod tests {
         assert_eq!(data.vertices.len(), unclamped.vertices.len());
         for (a, b) in data.vertices.iter().zip(unclamped.vertices.iter()) {
             assert_eq!(a.pos, b.pos);
+            assert_eq!(a.uv, b.uv);
             assert_eq!(a.color, b.color);
+        }
+    }
+
+    #[test]
+    fn face_uvs_are_the_planes_world_coords_per_direction() {
+        // A single cube away from the origin: every face's uv must equal the
+        // two varying world coordinates of its plane. Faces are identified by
+        // their baked shade byte, which is unique per direction.
+        let mut chunk = empty_chunk();
+        chunk.set_local(2, 3, 4, STONE);
+        let data = build(&chunk);
+        assert_eq!(data.vertices.len(), 24, "six 1x1 faces");
+
+        for q in data.vertices.chunks_exact(4) {
+            let shade = q[0].color[0];
+            for v in q {
+                assert_eq!(v.color[3], STONE.0 as u8, "layer = block id");
+                assert_eq!([v.color[0], v.color[1], v.color[2]], [shade; 3], "gray shade");
+                match shade {
+                    255 | 127 => assert_eq!(v.uv, [v.pos[0], v.pos[2]], "+Y/-Y: (x, z)"),
+                    204 | 178 => assert_eq!(v.uv, [v.pos[2], v.pos[1]], "+X/-X: (z, y)"),
+                    216 | 165 => assert_eq!(v.uv, [v.pos[0], v.pos[1]], "+Z/-Z: (x, y)"),
+                    other => panic!("unexpected shade byte {other}"),
+                }
+            }
         }
     }
 
@@ -513,12 +670,12 @@ mod tests {
         let mut other = Chunk::new(1, 0, &EmptyGen);
         other.set_local(0, 0, 0, STONE);
 
-        let (solid, colors) = tables();
+        let solid = solid_table();
         let mut alone = MeshData::default();
-        build_chunk_mesh(&chunk, &NO_NEIGHBOURS, &solid, &colors, &mut alone);
+        build_chunk_mesh(&chunk, &NO_NEIGHBOURS, &solid, &mut alone);
         let with_neighbour = Neighbours { pos_x: Some(&other), ..NO_NEIGHBOURS };
         let mut culled = MeshData::default();
-        build_chunk_mesh(&chunk, &with_neighbour, &solid, &colors, &mut culled);
+        build_chunk_mesh(&chunk, &with_neighbour, &solid, &mut culled);
 
         assert_eq!(total_area(&alone), 6.0, "isolated cube shows all six faces");
         assert_eq!(total_area(&culled), 5.0, "the face against the neighbour is culled");

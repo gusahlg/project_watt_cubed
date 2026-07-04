@@ -10,6 +10,7 @@ use crate::command;
 use crate::console::{self, Console};
 use crate::input::{look, movement};
 use crate::interact;
+use crate::math::{Aabb, Bounded};
 use crate::mods::{ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
@@ -21,7 +22,7 @@ use crate::world::World;
 
 /// How far the player can reach to break a block, in world units.
 const REACH: f32 = 6.0;
-const HELP_TEXT: &str = "WASD move | mouse look | Space jump | F fly | LMB break | I inventory | Tab cursor | T chat/cmd | Esc menu";
+const HELP_TEXT: &str = "WASD move | mouse look | Space jump | F fly | LMB break | I inventory | C craft | Tab cursor | T chat/cmd | Esc menu";
 /// Half-extents of another player's drawn body — matches the collision box in
 /// [`player`](crate::player::PLAYER_HALF).
 const PEER_HALF: Vec3 = Vec3::new(0.3, 0.9, 0.3);
@@ -88,6 +89,9 @@ impl Game {
     }
     pub fn player(&self) -> &Player {
         &self.player
+    }
+    pub fn player_mut(&mut self) -> &mut Player {
+        &mut self.player
     }
 
     /// Capture the cursor when (re)entering play.
@@ -168,16 +172,19 @@ impl Game {
         }
 
         // Mods run once per frame here — never inside the voxel loop.
-        {
+        let placements = {
             let mut ctx = ModContext {
                 player: &mut self.player,
                 world: &mut self.world,
                 screen_w: eng.screen_width(),
                 screen_h: eng.screen_height(),
                 capturing_text: false,
+                placements: Vec::new(),
             };
             mods.update(eng, &mut ctx);
-        }
+            ctx.placements
+        };
+        self.apply_placements(placements);
 
         // Load/mesh/unload chunks around the player, then step physics.
         self.world.stream(self.player.position, eng);
@@ -258,6 +265,33 @@ impl Game {
         // locally above for a responsive feel; the server is still authoritative.
         if let Some(net) = &mut self.net {
             net.send_edit(x, y, z, "air".to_string());
+        }
+    }
+
+    /// Apply the block placements mods queued this frame. A placement lands only
+    /// in an air cell that doesn't overlap the player. Well-behaved mods (the
+    /// crafting mod) ran this exact check before queueing — and before spending a
+    /// block on it — so within one frame the two always agree; re-checking here is
+    /// a cheap invariant against a mod that queues without validating.
+    fn apply_placements(&mut self, placements: Vec<(i32, i32, i32, crate::block::BlockId)>) {
+        for (x, y, z, id) in placements {
+            if self.world.block_at(x, y, z) != AIR {
+                continue;
+            }
+            let cell = Aabb::new(
+                Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5),
+                Vec3::splat(0.5),
+            );
+            if cell.intersects(&self.player.aabb()) {
+                continue;
+            }
+            self.world.set_block(x, y, z, id);
+            // Tell the server in the same portable spec form saves use; it
+            // validates and relays, exactly like breaking does with "air".
+            if let Some(net) = &mut self.net {
+                let spec = save::block_spec(&self.world, id);
+                net.send_edit(x, y, z, spec);
+            }
         }
     }
 
