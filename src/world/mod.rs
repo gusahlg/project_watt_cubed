@@ -252,15 +252,20 @@ impl World {
         // this frame, so vertices never reference a layer that isn't there.
         // Covers the initial upload too (0 tracked -> N on the first stream).
         self.refresh_textures(eng);
-        // Land worker results before the scans below, so freshly generated
-        // chunks count as data this frame and finished meshes draw this frame.
-        self.drain_results(eng);
         let center_chunk = (
             (center.x.floor() as i32).div_euclid(CHUNK_WIDTH as i32),
             (center.z.floor() as i32).div_euclid(CHUNK_DEPTH as i32),
         );
-        if center_chunk != self.center {
-            self.center = center_chunk;
+        // Adopt the real centre BEFORE draining: after a radius change or
+        // world reset the stored centre is a far-away sentinel, and draining
+        // against it would discard every landed result - even in-range ones -
+        // only to regenerate them moments later.
+        let full_pass = center_chunk != self.center;
+        self.center = center_chunk;
+        // Land worker results before the scans below, so freshly generated
+        // chunks count as data this frame and finished meshes draw this frame.
+        self.drain_results(eng);
+        if full_pass {
             self.unload_far(center_chunk, eng);
             self.request_region_data(center_chunk);
             self.pending_fresh = true;
@@ -564,6 +569,10 @@ impl World {
             })
             .filter(|&coord| self.neighbours_have_data(coord))
             .filter(|coord| !self.in_flight.contains(coord))
+            // Dirty chunks are the sync remesh path's job; queueing them here
+            // too would double-mesh them (identical result, wasted snapshot,
+            // worker build, and upload-budget slot).
+            .filter(|coord| !self.dirty.contains(coord))
             .collect();
         pending.sort_by_key(|&(cx, cz)| (cx - center.0).abs().max((cz - center.1).abs()));
 

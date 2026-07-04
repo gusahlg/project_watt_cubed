@@ -179,6 +179,7 @@ impl Game {
                 screen_w: eng.screen_width(),
                 screen_h: eng.screen_height(),
                 capturing_text: false,
+                mouse_locked: self.mouse_locked,
                 placements: Vec::new(),
             };
             mods.update(eng, &mut ctx);
@@ -275,6 +276,9 @@ impl Game {
     /// a cheap invariant against a mod that queues without validating.
     fn apply_placements(&mut self, placements: Vec<(i32, i32, i32, crate::block::BlockId)>) {
         for (x, y, z, id) in placements {
+            if !(0..crate::world::chunk::CHUNK_HEIGHT as i32).contains(&y) {
+                continue;
+            }
             if self.world.block_at(x, y, z) != AIR {
                 continue;
             }

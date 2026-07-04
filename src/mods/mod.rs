@@ -137,6 +137,9 @@ pub struct ModContext<'a> {
     pub screen_h: i32,
     /// True while the console or a menu is capturing keys, so mods leave input alone.
     pub capturing_text: bool,
+    /// Whether the mouse is captured for aiming — world-affecting clicks
+    /// (breaking, placing) must only fire while it is.
+    pub mouse_locked: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
     /// drains these after `mods.update` and applies each only if the cell is air
     /// and doesn't overlap the player — mods that spend resources on a placement
@@ -160,6 +163,11 @@ pub trait Mod {
     fn on_enable(&mut self) {}
     /// Called when the mod is switched off.
     fn on_disable(&mut self) {}
+
+    /// Clear per-world state (inventory contents, crafted blocks, open
+    /// panels) when entering a different world. Enable/disable choices are
+    /// NOT touched — those persist across worlds.
+    fn reset(&mut self) {}
 
     /// Per-frame logic while enabled. Runs after movement, before rendering.
     fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
@@ -226,6 +234,14 @@ impl Mods {
             entry.module.on_enable();
         }
         self.entries.push(entry);
+    }
+
+    /// Reset every mod's per-world state (entering a new/loaded/networked
+    /// world) while keeping the player's enable/disable choices.
+    pub fn reset_state(&mut self) {
+        for entry in &mut self.entries {
+            entry.module.reset();
+        }
     }
 
     /// Run every enabled mod's per-frame logic.

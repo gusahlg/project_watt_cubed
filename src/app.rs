@@ -124,7 +124,9 @@ impl App {
         // OS close button: save and go. Settings save too — the player may be
         // mid-edit on the Settings screen.
         if eng.should_close() {
-            self.settings.save();
+            if self.bench.is_none() {
+                self.settings.save();
+            }
             self.autosave();
             return false;
         }
@@ -157,7 +159,9 @@ impl App {
             }
         };
         if quit {
-            self.settings.save();
+            if self.bench.is_none() {
+                self.settings.save();
+            }
             self.autosave();
             return false;
         }
@@ -298,8 +302,9 @@ impl App {
     fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection) {
         let world = World::new(conn.seed());
         let player = Player::new(conn.spawn());
-        // A networked world is a live mirror, not a save — start from clean defaults.
-        self.mods = Mods::with_defaults();
+        // A networked world is a live mirror, not a save — per-world mod state
+        // starts clean, but the player's enable/disable choices persist.
+        self.mods.reset_state();
         let game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
         self.enter_game(eng, game);
     }
@@ -318,14 +323,15 @@ impl App {
         let player = spawn_player(&world);
         let name = save::next_new_name();
 
-        // A new world starts from a clean default mod set (empty inventory, etc.).
-        self.mods = Mods::with_defaults();
+        // A new world starts from a clean default mod set (empty inventory, etc.);
+        // the mod menu's enable/disable choices persist.
+        self.mods.reset_state();
         self.enter_game(eng, Game::new(world, player, name));
     }
 
     /// Load an existing save and enter it. Stays on the menu if loading fails.
     fn load_world(&mut self, eng: &mut Engine, name: &str) {
-        self.mods = Mods::with_defaults();
+        self.mods.reset_state();
         match save::load(name, &mut self.mods) {
             Ok((world, player)) => {
                 self.enter_game(eng, Game::new(world, player, name.to_string()))

@@ -93,6 +93,21 @@ impl BlockRegistry {
     }
 
     /// How many distinct blocks are registered.
+    /// Hard cap on distinct block types: the mesher stores the texture-array
+    /// layer as a u8 (vertex color alpha), and it also bounds what remote
+    /// network specs can make a client's palette (and texture memory) grow to.
+    pub const MAX_BLOCK_TYPES: usize = 256;
+
+    /// Whether the palette can still take a NEW composition.
+    pub fn at_capacity(&self) -> bool {
+        self.blocks.len() >= Self::MAX_BLOCK_TYPES
+    }
+
+    /// The already-registered block for this composition, if any (no growth).
+    pub fn lookup(&self, composition: &Composition) -> Option<BlockId> {
+        self.dedup.get(&CompKey::of(composition, self.blocks.len())).copied()
+    }
+
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }

@@ -172,25 +172,36 @@ pub(crate) fn parse_block(world: &mut World, spec: &str) -> BlockId {
         return AIR;
     }
     if let Some(rest) = spec.strip_prefix("natural:") {
-        let ids: Vec<_> = rest
-            .split(',')
-            .filter_map(|n| world.registry().elements().id_by_name(n))
-            .collect();
-        return if ids.is_empty() {
-            AIR
-        } else {
-            world.registry_mut().natural(&ids)
-        };
+        // Strict: ANY unknown element rejects the whole spec — registering a
+        // subset would mint a different block than the sender meant. Palette
+        // growth from remote specs is capped inside craft_natural.
+        let mut ids = Vec::new();
+        for name in rest.split(',') {
+            match world.registry().elements().id_by_name(name) {
+                Some(id) => ids.push(id),
+                None => return AIR,
+            }
+        }
+        return crate::block::crafting::craft_natural(world.registry_mut(), &ids)
+            .unwrap_or(AIR);
     }
     if let Some(rest) = spec.strip_prefix("mixture:") {
-        let parts: Vec<_> = rest
-            .split(';')
-            .filter_map(|entry| {
-                let (name, pct) = entry.split_once('=')?;
-                let id = world.registry().elements().id_by_name(name)?;
-                Some((id, pct.parse::<u8>().ok()?))
-            })
-            .collect();
+        let mut parts = Vec::new();
+        for entry in rest.split(';') {
+            let Some((name, pct)) = entry.split_once('=') else { return AIR };
+            let Some(id) = world.registry().elements().id_by_name(name) else { return AIR };
+            let Ok(pct) = pct.parse::<u8>() else { return AIR };
+            parts.push((id, pct));
+        }
+        let Ok(composition) = crate::block::Composition::mixture(&parts) else {
+            return AIR;
+        };
+        if let Some(existing) = world.registry().lookup(&composition) {
+            return existing;
+        }
+        if world.registry().at_capacity() {
+            return AIR;
+        }
         return world.registry_mut().mixture(&parts).unwrap_or(AIR);
     }
     AIR

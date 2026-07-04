@@ -91,6 +91,14 @@ impl Mod for InventoryMod {
         self.refresh_rows(ctx.world);
     }
 
+    fn reset(&mut self) {
+        self.stash.borrow_mut().clear();
+        self.visible = false;
+        self.rows.clear();
+        // Force a rebuild against the cleared stash on the next update.
+        self.seen_rev = u64::MAX;
+    }
+
     fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
         // A broken block hands back its elements — each becomes one held unit.
         self.stash.borrow_mut().add(elements);

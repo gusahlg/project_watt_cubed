@@ -142,11 +142,15 @@ impl CraftingMod {
         if self.selected.is_empty() {
             return;
         }
+        // Resolve the block first: a full palette refuses NEW compositions,
+        // and a refused craft must not consume anything.
+        let Some(id) = craft_natural(ctx.world.registry_mut(), &self.selected) else {
+            return;
+        };
         // All-or-nothing: nothing is consumed unless every pick is in stock.
         if !self.stash.borrow_mut().consume(&self.selected) {
             return;
         }
-        let id = craft_natural(ctx.world.registry_mut(), &self.selected);
         match self.crafted.iter_mut().find(|c| c.id == id) {
             Some(entry) => entry.count += 1,
             None => self.crafted.push(Crafted {
@@ -168,7 +172,7 @@ impl CraftingMod {
     /// state — so a placement that costs a block always lands, and a rejected
     /// aim costs nothing.
     fn try_place(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        if !eng.is_mouse_button_pressed(MouseButton::Right) {
+        if !eng.is_mouse_button_pressed(MouseButton::Right) || !ctx.mouse_locked {
             return;
         }
         let Some(equipped) = self.equipped else { return };
@@ -184,6 +188,11 @@ impl CraftingMod {
             return;
         };
         let (x, y, z) = hit.previous;
+        // block_at reads out-of-range cells as air but set_block refuses to
+        // write them — a placement there would silently eat the block.
+        if !(0..crate::world::chunk::CHUNK_HEIGHT as i32).contains(&y) {
+            return;
+        }
         if ctx.world.block_at(x, y, z) != AIR || cell_aabb(x, y, z).intersects(&ctx.player.aabb()) {
             return;
         }
@@ -203,6 +212,14 @@ fn cell_aabb(x: i32, y: i32, z: i32) -> Aabb {
 impl Mod for CraftingMod {
     fn name(&self) -> &str {
         "Crafting"
+    }
+
+    fn reset(&mut self) {
+        self.open = false;
+        self.cursor = 0;
+        self.selected.clear();
+        self.crafted.clear();
+        self.equipped = None;
     }
 
     fn description(&self) -> &str {
@@ -308,7 +325,9 @@ impl Mod for CraftingMod {
                 continue;
             }
             // Re-craft to get this session's id for the same composition.
-            let id = craft_natural(world.registry_mut(), &ids);
+            let Some(id) = craft_natural(world.registry_mut(), &ids) else {
+                continue;
+            };
             let at = match self.crafted.iter().position(|c| c.id == id) {
                 Some(at) => {
                     self.crafted[at].count += count;
