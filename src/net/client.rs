@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use raylib::prelude::*;
+use voxel_engine::Vec3;
 
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION};
@@ -30,7 +30,7 @@ const HEARTBEAT: Duration = Duration::from_secs(1);
 /// Another player as this client last heard about them — enough to draw them.
 pub struct RemotePlayer {
     pub name: String,
-    pub pos: Vector3,
+    pub pos: Vec3,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -53,12 +53,12 @@ pub struct Connection {
     inbox: Receiver<ServerMessage>,
     player_id: u32,
     seed: i64,
-    spawn: Vector3,
+    spawn: Vec3,
     peers: HashMap<u32, RemotePlayer>,
     alive: bool,
     // Throttling state for outbound moves.
     last_move: Instant,
-    last_sent: Option<(Vector3, f32, f32)>,
+    last_sent: Option<(Vec3, f32, f32)>,
 }
 
 impl Connection {
@@ -85,8 +85,11 @@ impl Connection {
         write(&stream, &hello).map_err(|e| format!("send failed: {e}"))?;
 
         stream.set_read_timeout(Some(CONNECT_TIMEOUT)).ok();
-        let mut reader = stream.try_clone().map_err(|e| e.to_string())?;
-        let frame = protocol::read_frame(&mut reader).map_err(|e| format!("no reply: {e}"))?;
+        // Buffered so a frame costs one buffered read, not two syscalls; the scratch
+        // Vec is reused across frames so the reader loop never allocates per frame.
+        let mut reader = io::BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut frame = Vec::new();
+        protocol::read_frame(&mut reader, &mut frame).map_err(|e| format!("no reply: {e}"))?;
         let (player_id, seed, spawn) = match ServerMessage::decode(&frame) {
             Some(ServerMessage::Welcome { player_id, seed, spawn }) => (player_id, seed, spawn),
             Some(ServerMessage::Reject { reason }) => return Err(reason),
@@ -97,7 +100,7 @@ impl Connection {
         stream.set_read_timeout(None).ok();
         let (tx, inbox) = mpsc::channel();
         thread::spawn(move || {
-            while let Ok(frame) = protocol::read_frame(&mut reader) {
+            while protocol::read_frame(&mut reader, &mut frame).is_ok() {
                 match ServerMessage::decode(&frame) {
                     Some(msg) => {
                         if tx.send(msg).is_err() {
@@ -127,7 +130,7 @@ impl Connection {
         self.seed
     }
     /// Where the server placed this player.
-    pub fn spawn(&self) -> Vector3 {
+    pub fn spawn(&self) -> Vec3 {
         self.spawn
     }
     /// This player's server-assigned id.
@@ -179,7 +182,7 @@ impl Connection {
             ServerMessage::PeerJoined { id, name } => {
                 self.peers.entry(id).or_insert(RemotePlayer {
                     name,
-                    pos: Vector3::zero(),
+                    pos: Vec3::ZERO,
                     yaw: 0.0,
                     pitch: 0.0,
                 });
@@ -205,7 +208,7 @@ impl Connection {
 
     /// Report the local player's state, throttled and heartbeat. Cheap to call every
     /// frame; it only actually sends on the movement cadence or the heartbeat.
-    pub fn send_move(&mut self, pos: Vector3, yaw: f32, pitch: f32) {
+    pub fn send_move(&mut self, pos: Vec3, yaw: f32, pitch: f32) {
         if !self.alive {
             return;
         }

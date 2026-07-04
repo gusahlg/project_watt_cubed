@@ -1,7 +1,7 @@
 //! interact.rs turns where the player looks into which block they act on: a voxel
 //! ray-march from the eye along the view direction, returning the first solid block
 //! within reach. Breaking and (later) placing are built on this one query.
-use raylib::prelude::*;
+use voxel_engine::Vec3;
 
 use crate::world::World;
 
@@ -16,12 +16,12 @@ pub struct RayHit {
 /// March a ray from `origin` along `dir` up to `reach` world units and return the
 /// first solid block, using Amanatides–Woo grid traversal (each iteration crosses
 /// exactly one voxel face, so nothing is skipped or double-visited).
-pub fn raycast(world: &World, origin: Vector3, dir: Vector3, reach: f32) -> Option<RayHit> {
+pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<RayHit> {
     let len = dir.length();
     if len == 0.0 {
         return None;
     }
-    let dir = dir.scale(1.0 / len);
+    let dir = dir * (1.0 / len);
 
     let (mut x, mut y, mut z) = (
         origin.x.floor() as i32,
@@ -97,8 +97,8 @@ mod tests {
     fn looking_down_hits_the_ground() {
         let world = World::generate();
         // Start high above a known column and look straight down.
-        let origin = Vector3::new(8.5, 40.0, 8.5);
-        let hit = raycast(&world, origin, Vector3::new(0.0, -1.0, 0.0), 60.0)
+        let origin = Vec3::new(8.5, 40.0, 8.5);
+        let hit = raycast(&world, origin, Vec3::new(0.0, -1.0, 0.0), 60.0)
             .expect("a downward ray should hit the terrain");
         assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
         // The cell just above the hit block is the empty one the ray last passed.
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn ray_into_open_sky_misses() {
         let world = World::generate();
-        let origin = Vector3::new(8.5, 40.0, 8.5);
-        assert!(raycast(&world, origin, Vector3::new(0.0, 1.0, 0.0), 20.0).is_none());
+        let origin = Vec3::new(8.5, 40.0, 8.5);
+        assert!(raycast(&world, origin, Vec3::new(0.0, 1.0, 0.0), 20.0).is_none());
     }
 }

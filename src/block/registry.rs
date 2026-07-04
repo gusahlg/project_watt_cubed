@@ -10,7 +10,7 @@
 //! inspection, crafting, and the future simulation touch.
 use std::collections::HashMap;
 
-use raylib::prelude::*;
+use voxel_engine::Color;
 
 use crate::block::composition::{Composition, MixError};
 use crate::block::derive;

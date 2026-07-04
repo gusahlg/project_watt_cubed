@@ -1,25 +1,25 @@
 //! Geometry helpers shared across the game.
-use raylib::prelude::*;
+use voxel_engine::Vec3;
 
 /// An axis-aligned bounding box defined by a centre point and half-extents.
 #[derive(Clone, Copy, Debug)]
 pub struct Aabb {
-    pub center: Vector3,
-    pub half: Vector3,
+    pub center: Vec3,
+    pub half: Vec3,
 }
 
 impl Aabb {
-    pub fn new(center: Vector3, half: Vector3) -> Self {
+    pub fn new(center: Vec3, half: Vec3) -> Self {
         Self { center, half }
     }
 
     /// The lower corner (centre minus half-extents).
-    pub fn min(&self) -> Vector3 {
+    pub fn min(&self) -> Vec3 {
         self.center - self.half
     }
 
     /// The upper corner (centre plus half-extents).
-    pub fn max(&self) -> Vector3 {
+    pub fn max(&self) -> Vec3 {
         self.center + self.half
     }
 

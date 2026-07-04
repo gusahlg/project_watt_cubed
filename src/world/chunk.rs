@@ -19,6 +19,12 @@ pub struct Chunk {
     /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_DEPTH + local z).
     pub cz: i32,
     voxels: Vec<BlockId>,
+    /// Highest Y that holds a non-air voxel (`-1` if the chunk is all air), so
+    /// the mesher can stop iterating where the terrain ends instead of sweeping
+    /// to the world ceiling. Maintained on every write; removing the topmost
+    /// block leaves it stale-high on purpose — that only costs a few empty
+    /// iterations, whereas recomputing the true maximum would cost a scan.
+    max_solid_y: i32,
 }
 
 impl Chunk {
@@ -28,6 +34,7 @@ impl Chunk {
             cx,
             cz,
             voxels: vec![AIR; CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH],
+            max_solid_y: -1,
         };
         chunk.generate(generator);
         chunk
@@ -47,18 +54,38 @@ impl Chunk {
     }
 
     /// Read a voxel using chunk-local coordinates.
+    #[inline]
     pub fn get_local(&self, x: usize, y: usize, z: usize) -> BlockId {
         self.voxels[Self::index(x, y, z)]
     }
 
+    /// The whole voxel array, for the mesher's direct flat-index reads.
+    #[inline]
+    pub fn voxels(&self) -> &[BlockId] {
+        &self.voxels
+    }
+
+    /// Highest Y holding a non-air voxel, or `-1` for an all-air chunk. May read
+    /// stale-high after the topmost block was removed (see the field docs).
+    #[inline]
+    pub fn max_solid_y(&self) -> i32 {
+        self.max_solid_y
+    }
+
     /// Write a voxel using chunk-local coordinates.
     pub fn set_local(&mut self, x: usize, y: usize, z: usize, v: BlockId) {
-        self.voxels[Self::index(x, y, z)] = v;
+        self.set_index(Self::index(x, y, z), v);
     }
 
     /// Overwrite a voxel by flat index — used to replay saved/broken-block edits.
     pub fn set_index(&mut self, index: usize, v: BlockId) {
         self.voxels[index] = v;
+        if v != AIR {
+            let y = (index / (CHUNK_WIDTH * CHUNK_DEPTH)) as i32;
+            if y > self.max_solid_y {
+                self.max_solid_y = y;
+            }
+        }
     }
 
     fn generate<G: TerrainGenerator>(&mut self, generator: &G) {

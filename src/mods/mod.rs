@@ -10,7 +10,7 @@
 //! matter and only what it draws where it wouldn't.
 pub mod inventory;
 
-use raylib::prelude::*;
+use voxel_engine::{Engine, Frame};
 
 use crate::block::ElementId;
 use crate::player::Player;
@@ -45,8 +45,8 @@ pub trait Mod {
     fn on_disable(&mut self) {}
 
     /// Per-frame logic while enabled. Runs after movement, before rendering.
-    fn update(&mut self, rl: &RaylibHandle, ctx: &mut ModContext) {
-        let _ = (rl, ctx);
+    fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
+        let _ = (eng, ctx);
     }
 
     /// A block was broken into these elements. The event the inventory mod listens
@@ -56,8 +56,8 @@ pub trait Mod {
     }
 
     /// Draw this mod's HUD while enabled, over the world and under the console.
-    fn draw(&self, d: &mut RaylibDrawHandle, screen_w: i32, screen_h: i32) {
-        let _ = (d, screen_w, screen_h);
+    fn draw(&mut self, f: &mut Frame, screen_w: i32, screen_h: i32) {
+        let _ = (f, screen_w, screen_h);
     }
 
     /// Serialise persistent state to a single line for the save file, or `None` if
@@ -107,10 +107,10 @@ impl Mods {
     }
 
     /// Run every enabled mod's per-frame logic.
-    pub fn update(&mut self, rl: &RaylibHandle, ctx: &mut ModContext) {
+    pub fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
         for entry in &mut self.entries {
             if entry.enabled {
-                entry.module.update(rl, ctx);
+                entry.module.update(eng, ctx);
             }
         }
     }
@@ -125,10 +125,10 @@ impl Mods {
     }
 
     /// Draw every enabled mod's HUD.
-    pub fn draw(&self, d: &mut RaylibDrawHandle, screen_w: i32, screen_h: i32) {
-        for entry in &self.entries {
+    pub fn draw(&mut self, f: &mut Frame, screen_w: i32, screen_h: i32) {
+        for entry in &mut self.entries {
             if entry.enabled {
-                entry.module.draw(d, screen_w, screen_h);
+                entry.module.draw(f, screen_w, screen_h);
             }
         }
     }

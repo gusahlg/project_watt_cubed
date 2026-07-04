@@ -5,7 +5,7 @@
 //! [`command`](crate::command). The console keeps a small scrollback `log`, so it
 //! doubles as the seed for a future chat box — swap the command dispatch for a
 //! network send and the UI is already here.
-use raylib::prelude::*;
+use voxel_engine::{Color, Engine, Frame, Key};
 
 /// Longest input line we accept.
 const MAX_INPUT: usize = 128;
@@ -63,22 +63,22 @@ impl Console {
     /// Process this frame's text input. Returns the submitted line when the user
     /// presses Enter (trimmed and non-empty), otherwise `None`. Esc closes the
     /// console.
-    pub fn handle_input(&mut self, rl: &mut RaylibHandle) -> Option<String> {
+    pub fn handle_input(&mut self, eng: &Engine) -> Option<String> {
         // `get_char_pressed` already accounts for keyboard layout and shift state.
-        while let Some(c) = rl.get_char_pressed() {
+        while let Some(c) = eng.get_char_pressed() {
             if self.input.len() < MAX_INPUT && !c.is_control() {
                 self.input.push(c);
             }
         }
 
-        if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) {
+        if eng.is_key_pressed(Key::Backspace) {
             self.input.pop();
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+        if eng.is_key_pressed(Key::Escape) {
             self.close();
             return None;
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+        if eng.is_key_pressed(Key::Enter) {
             let line = std::mem::take(&mut self.input).trim().to_string();
             self.close();
             if !line.is_empty() {
@@ -90,7 +90,7 @@ impl Console {
 
     /// Draw the scrollback log (always, when non-empty) and, while open, the input
     /// line. Kept at the bottom of the screen, chat-style.
-    pub fn draw<D: RaylibDraw>(&self, d: &mut D, screen_w: i32, screen_h: i32) {
+    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
         let fs = 20;
         let line_h = fs + 4;
         let input_y = screen_h - line_h - 10;
@@ -98,14 +98,14 @@ impl Console {
         // Recent log lines stacked upward, just above the input line.
         for (i, line) in self.log.iter().rev().take(LOG_LINES).enumerate() {
             let y = input_y - line_h * (i as i32 + 1) - 6;
-            shadowed(d, line, 12, y, fs, Color::RAYWHITE);
+            shadowed(f, line, 12, y, fs, Color::RAYWHITE);
         }
 
         if self.active {
-            d.draw_rectangle(8, input_y - 4, screen_w - 16, line_h + 6, Color::new(0, 0, 0, 150));
+            f.draw_rect(8, input_y - 4, screen_w - 16, line_h + 6, Color::new(0, 0, 0, 150));
             // A trailing underscore stands in for a text cursor.
             let text = format!("> {}_", self.input);
-            shadowed(d, &text, 12, input_y, fs, Color::YELLOW);
+            shadowed(f, &text, 12, input_y, fs, Color::YELLOW);
         }
     }
 }
@@ -117,7 +117,7 @@ impl Default for Console {
 }
 
 /// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
-pub fn shadowed<D: RaylibDraw>(d: &mut D, text: &str, x: i32, y: i32, fs: i32, color: Color) {
-    d.draw_text(text, x + 1, y + 1, fs, Color::new(0, 0, 0, 180));
-    d.draw_text(text, x, y, fs, color);
+pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
+    f.draw_text(text, x + 1, y + 1, font_size, Color::new(0, 0, 0, 180));
+    f.draw_text(text, x, y, font_size, color);
 }

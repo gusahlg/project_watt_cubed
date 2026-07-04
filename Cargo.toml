@@ -4,14 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# GLFW_BUILD_WAYLAND compiles raylib's bundled GLFW with BOTH the Wayland/EGL and
-# the default X11 backends. GLFW then dlopens the platform libs and auto-selects
-# at runtime (Wayland when WAYLAND_DISPLAY is set, X11 otherwise), so one binary
-# runs on both session types. This sidesteps the Xwayland->GLX path, which is
-# unreliable with the NVIDIA driver. (The separate `wayland` feature is avoided on
-# purpose: it would link an *external* system GLFW instead of the bundled one.)
-raylib = { version = "6.0", features = ["GLFW_BUILD_WAYLAND"] }
-glam = "0.30"
+# Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
+# types (glam Vec2/Vec3) and Color the game uses, so it is the only dependency.
+voxel_engine = { path = "../voxel-engine" }
 
 # Maximum-performance release build: aggressive inlining across the whole
 # dependency graph (fat LTO), a single codegen unit so the optimizer sees

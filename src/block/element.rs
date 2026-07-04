@@ -7,7 +7,7 @@
 //! The registry is built once at startup and read-only afterwards. Element records
 //! are cold data — the per-voxel render/collision path never touches them; it only
 //! reads the precomputed arrays on the [`BlockRegistry`](crate::block::BlockRegistry).
-use raylib::prelude::*;
+use voxel_engine::Color;
 
 use crate::macros::elements;
 

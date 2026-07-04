@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use raylib::prelude::*;
+use voxel_engine::Vec3;
 
 use crate::block::{AIR, BlockId, Composition};
 use crate::mods::Mods;
@@ -94,7 +94,7 @@ pub fn load(name: &str, mods: &mut Mods) -> io::Result<(World, Player)> {
         .find_map(|l| l.strip_prefix("seed ").and_then(|s| s.trim().parse::<i64>().ok()))
         .unwrap_or(crate::world::DEFAULT_SEED);
     let mut world = World::new(seed);
-    let mut player = Player::new(Vector3::zero());
+    let mut player = Player::new(Vec3::ZERO);
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("player ") {
@@ -114,7 +114,7 @@ pub fn load(name: &str, mods: &mut Mods) -> io::Result<(World, Player)> {
 fn parse_player(player: &mut Player, args: &str) {
     let f: Vec<f32> = args.split_whitespace().filter_map(|v| v.parse().ok()).collect();
     if f.len() == 6 {
-        player.position = Vector3::new(f[0], f[1], f[2]);
+        player.position = Vec3::new(f[0], f[1], f[2]);
         player.yaw = f[3];
         player.pitch = f[4];
         player.fly = f[5] != 0.0;
@@ -213,7 +213,7 @@ mod tests {
             .unwrap();
         world.set_block(bx, by, bz, AIR);
 
-        let mut player = Player::new(Vector3::new(1.0, 2.0, 3.0));
+        let mut player = Player::new(Vec3::new(1.0, 2.0, 3.0));
         player.yaw = 0.5;
         player.pitch = -0.25;
         let mut mods = Mods::with_defaults();
@@ -222,7 +222,7 @@ mod tests {
         let (loaded_world, loaded_player) = load(name, &mut mods).unwrap();
 
         assert_eq!(loaded_world.seed(), 4242);
-        assert_eq!(loaded_player.position, Vector3::new(1.0, 2.0, 3.0));
+        assert_eq!(loaded_player.position, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(loaded_player.yaw, 0.5);
         assert_eq!(loaded_world.block_at(bx, by, bz), AIR, "broken block stays broken");
 

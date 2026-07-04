@@ -9,7 +9,7 @@
 //! specs) is length-prefixed and bounded by the caps in the [parent module](super).
 use std::io::{self, Read, Write};
 
-use raylib::prelude::*;
+use voxel_engine::Vec3;
 
 use super::MAX_FRAME;
 
@@ -19,7 +19,7 @@ pub enum ClientMessage {
     /// First frame after connecting: identify and authenticate.
     Hello { protocol: u32, name: String, password: String },
     /// The client's own player state this tick (client simulates its own player).
-    Move { pos: Vector3, yaw: f32, pitch: f32 },
+    Move { pos: Vec3, yaw: f32, pitch: f32 },
     /// The client changed a block, described by portable spec (see [`save`](crate::save)).
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line on the given [`channel`](super::chat).
@@ -31,7 +31,7 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// Join accepted: the assigned id, the world seed to generate from, and where
     /// to spawn.
-    Welcome { player_id: u32, seed: i64, spawn: Vector3 },
+    Welcome { player_id: u32, seed: i64, spawn: Vec3 },
     /// Join refused (bad password, version mismatch, server full); the stream closes.
     Reject { reason: String },
     /// The full current edit overlay, sent once right after [`Welcome`](Self::Welcome).
@@ -41,7 +41,7 @@ pub enum ServerMessage {
     /// Another player disconnected.
     PeerLeft { id: u32 },
     /// Another player moved.
-    PeerMove { id: u32, pos: Vector3, yaw: f32, pitch: f32 },
+    PeerMove { id: u32, pos: Vec3, yaw: f32, pitch: f32 },
     /// A block changed somewhere in the world (from a peer or the server).
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line to display.
@@ -234,27 +234,29 @@ impl ServerMessage {
 
 /// Write a length-prefixed frame: a `u32` big-endian length followed by `payload`.
 /// Refuses to emit an over-cap frame so both ends share one hard size bound.
+/// Deliberately does not flush: on a raw `TcpStream` flush is a no-op anyway, and
+/// the server's buffered writer flushes once per drained batch, not per message.
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
     }
     w.write_all(&(payload.len() as u32).to_be_bytes())?;
-    w.write_all(payload)?;
-    w.flush()
+    w.write_all(payload)
 }
 
-/// Read one length-prefixed frame. Rejects a length past [`MAX_FRAME`] before
-/// allocating, so a malicious header can't trigger a huge or endless read.
-pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+/// Read one length-prefixed frame into `buf`, a caller-owned scratch buffer that
+/// reader loops reuse so steady-state traffic never allocates per frame. Rejects a
+/// length past [`MAX_FRAME`] before growing the buffer, so a malicious header can't
+/// trigger a huge or endless read. On error `buf`'s contents are unspecified.
+pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
     let len = u32::from_be_bytes(len_bytes) as usize;
     if len > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
+    buf.resize(len, 0);
+    r.read_exact(buf)
 }
 
 /// A minimal big-endian byte writer for the codec above.
@@ -282,7 +284,7 @@ impl Writer {
     fn f32(&mut self, v: f32) {
         self.0.extend_from_slice(&v.to_bits().to_be_bytes());
     }
-    fn vec3(&mut self, v: Vector3) {
+    fn vec3(&mut self, v: Vec3) {
         self.f32(v.x);
         self.f32(v.y);
         self.f32(v.z);
@@ -329,8 +331,8 @@ impl<'a> Reader<'a> {
     fn f32(&mut self) -> Option<f32> {
         Some(f32::from_bits(u32::from_be_bytes(self.take(4)?.try_into().ok()?)))
     }
-    fn vec3(&mut self) -> Option<Vector3> {
-        Some(Vector3::new(self.f32()?, self.f32()?, self.f32()?))
+    fn vec3(&mut self) -> Option<Vec3> {
+        Some(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
     }
     fn str(&mut self) -> Option<String> {
         let len = u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize;
@@ -354,7 +356,7 @@ mod tests {
                 password: "hunter2".into(),
             },
             ClientMessage::Move {
-                pos: Vector3::new(1.5, -2.0, 3.25),
+                pos: Vec3::new(1.5, -2.0, 3.25),
                 yaw: 0.5,
                 pitch: -0.25,
             },
@@ -372,7 +374,7 @@ mod tests {
             ServerMessage::Welcome {
                 player_id: 42,
                 seed: -9_999,
-                spawn: Vector3::new(0.5, 40.0, 0.5),
+                spawn: Vec3::new(0.5, 40.0, 0.5),
             },
             ServerMessage::Reject { reason: "bad password".into() },
             ServerMessage::Snapshot {
@@ -385,7 +387,7 @@ mod tests {
             ServerMessage::PeerLeft { id: 3 },
             ServerMessage::PeerMove {
                 id: 3,
-                pos: Vector3::new(9.0, 8.0, 7.0),
+                pos: Vec3::new(9.0, 8.0, 7.0),
                 yaw: 1.0,
                 pitch: 0.1,
             },
@@ -416,7 +418,8 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &payload).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
-        let read = read_frame(&mut cursor).unwrap();
+        let mut read = Vec::new();
+        read_frame(&mut cursor, &mut read).unwrap();
         assert_eq!(ServerMessage::decode(&read), Some(ServerMessage::PeerLeft { id: 7 }));
     }
 
@@ -429,6 +432,7 @@ mod tests {
         // A header claiming a huge body is rejected before the body is read.
         let mut hostile = ((MAX_FRAME as u32) + 1).to_be_bytes().to_vec();
         hostile.push(0);
-        assert!(read_frame(&mut std::io::Cursor::new(hostile)).is_err());
+        let mut scratch = Vec::new();
+        assert!(read_frame(&mut std::io::Cursor::new(hostile), &mut scratch).is_err());
     }
 }

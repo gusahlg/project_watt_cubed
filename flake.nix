@@ -1,93 +1,87 @@
 {
-  description = "project_watt_cubed — a raylib + glam voxel project";
+  description = "project_watt_cubed — a voxel game on the voxel_engine Vulkan renderer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # The renderer lives in a sibling checkout. A relative path input works for
+    # the local-checkout workflow (nix run in this repo); switch it to a git URL
+    # if this flake ever needs to be fetched from a registry.
+    voxel-engine = {
+      url = "path:../voxel-engine";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, voxel-engine }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # Native libraries raylib needs to build (cmake/bindgen) and to run
-        # (OpenGL + the X11 stack pulled in by GLFW).
+        # Runtime libraries: the Vulkan loader (ash dlopens libvulkan.so.1) and
+        # the windowing libs winit dlopens (Wayland when WAYLAND_DISPLAY is set,
+        # X11 otherwise). No OpenGL, no cmake, no bindgen — the engine is pure
+        # Rust over the Vulkan loader.
         runtimeLibs = with pkgs; [
-          libGL
-          libx11
-          libxcursor
-          libxrandr
-          libxinerama
-          libxi
-          libxext
+          vulkan-loader
           libxkbcommon
           wayland
-          # Wayland/EGL backend deps: client protocols, optional window
-          # decorations, and libglvnd's libEGL for the GL context.
-          wayland-protocols
-          libdecor
-          libglvnd
-        ];
-
-        nativeBuildInputs = with pkgs; [
-          cmake
-          pkg-config
-          # bindgen (used by raylib-sys) needs libclang at build time
-          llvmPackages.libclang
-          # GLFW's Wayland backend generates protocol headers at build time.
-          wayland-scanner
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXrandr
+          xorg.libXi
         ];
 
         libraryPath = pkgs.lib.makeLibraryPath runtimeLibs;
 
-        # bindgen (used by raylib-sys) drives libclang directly, which on NixOS
-        # has no idea where glibc / gcc / clang headers live — so it can't find
-        # <math.h> etc. Feed it the cc-wrapper's own cflags plus clang's builtin
-        # header dir.
-        bindgenClangArgs =
-          (builtins.readFile "${pkgs.stdenv.cc}/nix-support/libc-cflags")
-          + " " + (builtins.readFile "${pkgs.stdenv.cc}/nix-support/cc-cflags")
-          + " -idirafter ${pkgs.llvmPackages.libclang.lib}/lib/clang/"
-          + (pkgs.lib.versions.major pkgs.llvmPackages.libclang.version)
-          + "/include";
+        # Shader compiler for voxel_engine's build.rs. The engine falls back to
+        # its checked-in SPIR-V when slangc is missing, so this is best-effort.
+        slang = pkgs.lib.optionals (pkgs ? shader-slang) [ pkgs.shader-slang ];
+
+        # buildRustPackage needs the engine's source next to the game's, at the
+        # same relative path Cargo.toml uses (../voxel-engine).
+        combinedSrc = pkgs.runCommand "source" { } ''
+          mkdir -p $out
+          cp -r ${self} $out/game
+          cp -r ${voxel-engine} $out/voxel-engine
+        '';
       in
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "project_watt_cubed";
           version = "0.1.0";
-          src = ./.;
+
+          src = combinedSrc;
+          sourceRoot = "source/game";
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          inherit nativeBuildInputs;
-          buildInputs = runtimeLibs;
+          nativeBuildInputs = slang;
 
-          # bindgen needs to find libclang and the system headers
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          BINDGEN_EXTRA_CLANG_ARGS = bindgenClangArgs;
-
-          # raylib-sys builds raylib via cmake; let it use the system toolchain.
-          # Wrap the binary so it can find GL/X11 at runtime.
+          # Wrap the binary so it can dlopen the Vulkan loader and windowing
+          # libs at runtime.
           postFixup = ''
             patchelf --set-rpath "${libraryPath}" $out/bin/project_watt_cubed || true
+            patchelf --set-rpath "${libraryPath}" $out/bin/watt_server || true
           '';
 
           meta.mainProgram = "project_watt_cubed";
         };
 
         devShells.default = pkgs.mkShell {
-          inherit nativeBuildInputs;
-          buildInputs = with pkgs; [ rustc cargo rustfmt clippy ] ++ runtimeLibs;
+          buildInputs = with pkgs; [ rustc cargo rustfmt clippy ]
+            ++ runtimeLibs
+            ++ slang
+            ++ [ pkgs.vulkan-validation-layers pkgs.vulkan-tools ];
 
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          BINDGEN_EXTRA_CLANG_ARGS = bindgenClangArgs;
-
-          # So `cargo run` can dlopen libGL / X11 / wayland at runtime.
+          # So `cargo run` can dlopen vulkan/wayland/x11 at runtime, and the
+          # validation layer is discoverable in debug builds.
           LD_LIBRARY_PATH = libraryPath;
+          VK_LAYER_PATH =
+            "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
 
           shellHook = ''
-            echo "project_watt_cubed dev shell — run 'cargo run'"
+            echo "project_watt_cubed dev shell — run 'cargo run --release'"
           '';
         };
       });

@@ -22,15 +22,15 @@
 //! and reach-validated against the sender's own reported position before it is
 //! recorded.
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use raylib::prelude::*;
+use voxel_engine::Vec3;
 
 use crate::block::registry::BlockRegistry;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
@@ -55,6 +55,8 @@ const RATE_LIMIT: u32 = 300;
 /// A position update is only sent to players within this many world units of the
 /// mover — nobody past render distance needs it.
 const INTEREST_RADIUS: f32 = 160.0;
+/// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
+const INTEREST_RADIUS_SQ: f32 = INTEREST_RADIUS * INTEREST_RADIUS;
 /// A client may edit a block at most this far from its own reported eye position;
 /// farther edits are rejected as bogus. A little past the client's reach constant.
 const EDIT_REACH: f32 = 8.0;
@@ -84,7 +86,7 @@ struct Ctx {
 /// One connected player as the server tracks them.
 struct PlayerHandle {
     name: String,
-    pos: Vector3,
+    pos: Vec3,
     yaw: f32,
     pitch: f32,
     /// Outbound queue drained by this client's writer thread.
@@ -186,10 +188,13 @@ fn accept_loop(listener: TcpListener, shared: Arc<Mutex<State>>, ctx: Arc<Ctx>, 
 /// its messages until it disconnects, tidying up on the way out.
 fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>, ctx: Arc<Ctx>) -> io::Result<()> {
     // The first frame must be a valid, authenticated Hello within the handshake window.
+    // Buffered reads (one buffered read per frame, not two syscalls) plus a scratch
+    // Vec reused for every frame this client ever sends — no per-frame allocation.
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let mut reader = stream.try_clone()?;
-    let hello = protocol::read_frame(&mut reader)?;
-    let name = match ClientMessage::decode(&hello) {
+    let mut reader = io::BufReader::new(stream.try_clone()?);
+    let mut frame = Vec::new();
+    protocol::read_frame(&mut reader, &mut frame)?;
+    let name = match ClientMessage::decode(&frame) {
         Some(ClientMessage::Hello { protocol, name, password }) => {
             if protocol != PROTOCOL_VERSION {
                 reject(&stream, "protocol version mismatch");
@@ -210,11 +215,28 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     // Authenticated: switch to the idle timeout and wire up the writer.
     stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
     let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-    let mut writer_stream = stream.try_clone()?;
+    let writer_stream = stream.try_clone()?;
     let writer = thread::spawn(move || {
-        for frame in rx.iter() {
-            if protocol::write_frame(&mut writer_stream, &frame).is_err() {
-                break;
+        // Buffered, flushed once per drained batch: block for the first frame, then
+        // opportunistically drain whatever else queued up before paying one flush —
+        // a burst of broadcasts costs one syscall instead of one per message.
+        let mut w = io::BufWriter::new(writer_stream);
+        while let Ok(frame) = rx.recv() {
+            if protocol::write_frame(&mut w, &frame).is_err() {
+                return;
+            }
+            loop {
+                match rx.try_recv() {
+                    Ok(frame) => {
+                        if protocol::write_frame(&mut w, &frame).is_err() {
+                            return;
+                        }
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
+            }
+            if w.flush().is_err() {
+                return;
             }
         }
     });
@@ -223,7 +245,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     // one locked scope so the id, spawn, and roster it sees are all consistent.
     let id;
     let spawn;
-    let existing: Vec<(u32, String, Vector3, f32, f32)>;
+    let existing: Vec<(u32, String, Vec3, f32, f32)>;
     let snapshot: Vec<(i32, i32, i32, String)>;
     {
         let mut state = shared.lock().unwrap();
@@ -277,10 +299,9 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     let mut window = Instant::now();
     let mut count: u32 = 0;
     loop {
-        let frame = match protocol::read_frame(&mut reader) {
-            Ok(f) => f,
-            Err(_) => break, // EOF, timeout, or a malformed length: the client is gone.
-        };
+        if protocol::read_frame(&mut reader, &mut frame).is_err() {
+            break; // EOF, timeout, or a malformed length: the client is gone.
+        }
 
         if window.elapsed() >= Duration::from_secs(1) {
             window = Instant::now();
@@ -316,7 +337,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
 }
 
 /// Apply a validated position update and fan it out to interested players only.
-fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vector3, yaw: f32, pitch: f32) {
+fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vec3, yaw: f32, pitch: f32) {
     // Ignore non-finite coordinates outright (a NaN would poison distance checks).
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
         return;
@@ -330,7 +351,8 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vector3, yaw: f32, pitch: f
     let frame: Arc<[u8]> = ServerMessage::PeerMove { id, pos, yaw, pitch }.encode().into();
     let mut slow = Vec::new();
     for (&pid, h) in &state.players {
-        if pid == id || h.pos.distance(pos) > INTEREST_RADIUS {
+        // Squared-distance compare: this runs per listener per move, so skip the sqrt.
+        if pid == id || h.pos.distance_squared(pos) > INTEREST_RADIUS_SQ {
             continue;
         }
         if h.out.try_send(frame.clone()).is_err() {
@@ -350,7 +372,7 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &s
     // Reach check against the editor's own reported position — no reaching across
     // the map.
     let Some(h) = state.players.get(&id) else { return };
-    let target = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+    let target = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
     if h.pos.distance(target) > EDIT_REACH {
         return;
     }
@@ -427,12 +449,12 @@ fn reject(stream: &TcpStream, reason: &str) {
 
 /// A spawn point just above the origin surface, scattered a little per id so players
 /// don't stack on the exact same block.
-fn spawn_point(generator: &SineHills, id: u32) -> Vector3 {
+fn spawn_point(generator: &SineHills, id: u32) -> Vec3 {
     // A cheap deterministic scatter on a small grid around origin.
     let x = (id % 8) as i32 - 3;
     let z = ((id / 8) % 8) as i32 - 3;
     let surface = generator.height(x, z);
-    Vector3::new(x as f32 + 0.5, surface as f32 + 3.0, z as f32 + 0.5)
+    Vec3::new(x as f32 + 0.5, surface as f32 + 3.0, z as f32 + 0.5)
 }
 
 /// Current player count.
@@ -499,7 +521,7 @@ mod tests {
             1u32,
             PlayerHandle {
                 name: "p".into(),
-                pos: Vector3::new(8.5, 20.0, 8.5),
+                pos: Vec3::new(8.5, 20.0, 8.5),
                 yaw: 0.0,
                 pitch: 0.0,
                 out,

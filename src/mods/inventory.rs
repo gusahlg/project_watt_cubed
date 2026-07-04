@@ -5,7 +5,7 @@
 //! plus a minimal on-screen view of it. It fills as you break blocks into their
 //! elements, holds up to a (soft, upgradeable) capacity, and can be switched off in
 //! the mod menu, at which point the inventory is once again inaccessible.
-use raylib::prelude::*;
+use voxel_engine::{Color, Engine, Frame, Key};
 
 use crate::block::ElementId;
 use crate::console::shadowed;
@@ -31,6 +31,11 @@ pub struct InventoryMod {
     capacity: usize,
     /// Whether the list is currently drawn (toggled with `I`).
     visible: bool,
+    /// Cached, pre-formatted "  {count}x {name}" rows for drawing, grouped by
+    /// element in first-seen order. Rebuilt lazily instead of every frame.
+    rows: Vec<String>,
+    /// Set whenever `items` changes, telling `draw` to rebuild `rows`.
+    dirty: bool,
 }
 
 impl InventoryMod {
@@ -39,6 +44,8 @@ impl InventoryMod {
             items: Vec::new(),
             capacity: START_CAPACITY,
             visible: true,
+            rows: Vec::new(),
+            dirty: false,
         }
     }
 
@@ -48,6 +55,7 @@ impl InventoryMod {
             return false;
         }
         self.items.push(Item { element, name });
+        self.dirty = true;
         true
     }
 
@@ -56,8 +64,9 @@ impl InventoryMod {
         self.capacity += extra;
     }
 
-    /// Group the flat list into `(name, count)` by element in first-seen order.
-    fn grouped(&self) -> Vec<(&str, usize)> {
+    /// Rebuild the cached rows: group the flat list into `count x name` lines by
+    /// element in first-seen order.
+    fn rebuild_rows(&mut self) {
         let mut groups: Vec<(ElementId, &str, usize)> = Vec::new();
         for item in &self.items {
             match groups.iter_mut().find(|(e, _, _)| *e == item.element) {
@@ -65,7 +74,11 @@ impl InventoryMod {
                 None => groups.push((item.element, item.name.as_ref(), 1)),
             }
         }
-        groups.into_iter().map(|(_, name, count)| (name, count)).collect()
+        self.rows = groups
+            .into_iter()
+            .map(|(_, name, count)| format!("  {count}x {name}"))
+            .collect();
+        self.dirty = false;
     }
 }
 
@@ -84,9 +97,9 @@ impl Mod for InventoryMod {
         "The bare-list inventory and a simple view of it (press I to toggle)."
     }
 
-    fn update(&mut self, rl: &RaylibHandle, ctx: &mut ModContext) {
+    fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
         // `I` shows/hides the list, but not while something else is capturing keys.
-        if !ctx.capturing_text && rl.is_key_pressed(KeyboardKey::KEY_I) {
+        if !ctx.capturing_text && eng.is_key_pressed(Key::I) {
             self.visible = !self.visible;
         }
     }
@@ -100,30 +113,31 @@ impl Mod for InventoryMod {
         }
     }
 
-    fn draw(&self, d: &mut RaylibDrawHandle, screen_w: i32, _screen_h: i32) {
+    fn draw(&mut self, f: &mut Frame, screen_w: i32, _screen_h: i32) {
         if !self.visible {
             return;
         }
+        if self.dirty {
+            self.rebuild_rows();
+        }
 
-        let groups = self.grouped();
         let fs = 18;
         let line_h = fs + 4;
         let x = screen_w - 230;
         let mut y = 90;
 
         let header = format!("Inventory  {}/{}", self.items.len(), self.capacity);
-        shadowed(d, &header, x, y, fs, Color::GOLD);
+        shadowed(f, &header, x, y, fs, Color::GOLD);
         y += line_h + 2;
 
-        if groups.is_empty() {
-            shadowed(d, "  (empty) break blocks", x, y, fs, Color::RAYWHITE);
+        if self.rows.is_empty() {
+            shadowed(f, "  (empty) break blocks", x, y, fs, Color::RAYWHITE);
             return;
         }
 
         // Cap the visible rows so a full inventory doesn't run off-screen.
-        for (name, count) in groups.iter().take(14) {
-            let label = format!("  {count}x {name}");
-            shadowed(d, &label, x, y, fs, Color::RAYWHITE);
+        for row in self.rows.iter().take(14) {
+            shadowed(f, row, x, y, fs, Color::RAYWHITE);
             y += line_h;
         }
     }
@@ -138,6 +152,7 @@ impl Mod for InventoryMod {
     fn load_state(&mut self, data: &str, world: &World) {
         let registry = world.registry().elements();
         self.items.clear();
+        self.dirty = true;
         for name in data.split(',').filter(|s| !s.is_empty()) {
             if let Some(id) = registry.id_by_name(name) {
                 self.add(id, name.into());

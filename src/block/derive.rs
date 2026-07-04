@@ -5,7 +5,7 @@
 //!
 //! Derivation runs once per distinct block at registration, never per voxel, so it
 //! favours clarity over raw speed — the hot path reads the precomputed results.
-use raylib::prelude::*;
+use voxel_engine::Color;
 
 use crate::block::composition::Composition;
 use crate::block::element::{CoreProperties, ElementRegistry, SpecialKind};

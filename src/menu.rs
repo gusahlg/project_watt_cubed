@@ -1,9 +1,10 @@
-//! The out-of-game screens: the start menu (new / load / host / join / mods / quit),
-//! the mod menu (toggle installed mods), and the host/join forms. All are simple
-//! keyboard-driven — Up/Down to move, Enter to choose — kept deliberately plain so
-//! the menus are easy to restyle or replace (a menu is exactly the kind of thing a
-//! mod might take over).
-use raylib::prelude::*;
+//! The out-of-game screens: the start menu (new / load / host / join / mods /
+//! settings / quit), the mod menu (toggle installed mods), the settings menu
+//! (graphics options), and the host/join forms. All are simple keyboard-driven —
+//! Up/Down to move, Enter to choose — kept deliberately plain so the menus are
+//! easy to restyle or replace (a menu is exactly the kind of thing a mod might
+//! take over).
+use voxel_engine::{Color, Engine, Frame, Key};
 
 use crate::console::shadowed;
 use crate::mods::Mods;
@@ -17,6 +18,7 @@ pub enum MainChoice {
     Host,
     Join,
     Mods,
+    Settings,
     Quit,
 }
 
@@ -41,9 +43,9 @@ impl MainMenu {
         self.selected = self.selected.min(max);
     }
 
-    /// Total selectable rows: New World, one per save, Host, Join, Mods, Quit.
+    /// Total selectable rows: New World, one per save, Host, Join, Mods, Settings, Quit.
     fn item_count(&self) -> usize {
-        self.saves.len() + 5
+        self.saves.len() + 6
     }
 
     /// Resolve the current selection index into a concrete choice.
@@ -59,39 +61,41 @@ impl MainMenu {
             MainChoice::Join
         } else if index == saves + 3 {
             MainChoice::Mods
+        } else if index == saves + 4 {
+            MainChoice::Settings
         } else {
             MainChoice::Quit
         }
     }
 
     /// Handle a frame of input, returning a choice when the player presses Enter.
-    pub fn update(&mut self, rl: &RaylibHandle) -> Option<MainChoice> {
+    pub fn update(&mut self, eng: &Engine) -> Option<MainChoice> {
         let count = self.item_count();
-        if rl.is_key_pressed(KeyboardKey::KEY_DOWN) {
+        if eng.is_key_pressed(Key::Down) {
             self.selected = (self.selected + 1) % count;
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_UP) {
+        if eng.is_key_pressed(Key::Up) {
             self.selected = (self.selected + count - 1) % count;
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+        if eng.is_key_pressed(Key::Enter) {
             return Some(self.choice_at(self.selected));
         }
         None
     }
 
     /// Draw the title and menu list.
-    pub fn draw(&self, d: &mut RaylibDrawHandle, screen_w: i32, screen_h: i32) {
-        d.clear_background(Color::new(18, 20, 28, 255));
+    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
+        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
 
         let title = "PROJECT WATT CUBED";
         let title_fs = 48;
-        let tx = (screen_w - d.measure_text(title, title_fs)) / 2;
-        shadowed(d, title, tx, screen_h / 6, title_fs, Color::GOLD);
+        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
+        shadowed(f, title, tx, screen_h / 6, title_fs, Color::GOLD);
 
         let subtitle = "an infinite voxel world of elements";
         let sub_fs = 20;
-        let sx = (screen_w - d.measure_text(subtitle, sub_fs)) / 2;
-        shadowed(d, subtitle, sx, screen_h / 6 + title_fs + 8, sub_fs, Color::GRAY);
+        let sx = (screen_w - f.measure_text(subtitle, sub_fs)) / 2;
+        shadowed(f, subtitle, sx, screen_h / 6 + title_fs + 8, sub_fs, Color::GRAY);
 
         // Build the labels in the same order as `choice_at`.
         let mut labels = vec!["New World".to_string()];
@@ -101,6 +105,7 @@ impl MainMenu {
         labels.push("Host Server".to_string());
         labels.push("Join Server".to_string());
         labels.push("Mods".to_string());
+        labels.push("Settings".to_string());
         labels.push("Quit".to_string());
 
         let fs = 28;
@@ -114,14 +119,14 @@ impl MainMenu {
                 format!("  {label}")
             };
             let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            let x = (screen_w - d.measure_text(&text, fs)) / 2;
-            shadowed(d, &text, x, start_y + line_h * i as i32, fs, color);
+            let x = (screen_w - f.measure_text(&text, fs)) / 2;
+            shadowed(f, &text, x, start_y + line_h * i as i32, fs, color);
         }
 
         let hint = "Up/Down select   Enter choose";
         let hint_fs = 18;
-        let hx = (screen_w - d.measure_text(hint, hint_fs)) / 2;
-        shadowed(d, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
+        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
+        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
     }
 }
 
@@ -142,31 +147,30 @@ impl ModMenu {
     }
 
     /// Handle input; returns `true` when the player wants to go back.
-    pub fn update(&mut self, rl: &RaylibHandle, mods: &mut Mods) -> bool {
+    pub fn update(&mut self, eng: &Engine, mods: &mut Mods) -> bool {
         let count = mods.len().max(1);
-        if rl.is_key_pressed(KeyboardKey::KEY_DOWN) {
+        if eng.is_key_pressed(Key::Down) {
             self.selected = (self.selected + 1) % count;
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_UP) {
+        if eng.is_key_pressed(Key::Up) {
             self.selected = (self.selected + count - 1) % count;
         }
-        if (rl.is_key_pressed(KeyboardKey::KEY_ENTER) || rl.is_key_pressed(KeyboardKey::KEY_SPACE))
+        if (eng.is_key_pressed(Key::Enter) || eng.is_key_pressed(Key::Space))
             && self.selected < mods.len()
         {
             mods.toggle(self.selected);
         }
-        rl.is_key_pressed(KeyboardKey::KEY_ESCAPE)
-            || rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE)
+        eng.is_key_pressed(Key::Escape) || eng.is_key_pressed(Key::Backspace)
     }
 
     /// Draw the list of mods with their on/off state and descriptions.
-    pub fn draw(&self, d: &mut RaylibDrawHandle, mods: &Mods, screen_w: i32, screen_h: i32) {
-        d.clear_background(Color::new(18, 20, 28, 255));
+    pub fn draw(&self, f: &mut Frame, mods: &Mods, screen_w: i32, screen_h: i32) {
+        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
 
         let title = "MODS";
         let title_fs = 40;
-        let tx = (screen_w - d.measure_text(title, title_fs)) / 2;
-        shadowed(d, title, tx, screen_h / 8, title_fs, Color::GOLD);
+        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
+        shadowed(f, title, tx, screen_h / 8, title_fs, Color::GOLD);
 
         let fs = 26;
         let line_h = fs + 20;
@@ -174,7 +178,7 @@ impl ModMenu {
         let x = screen_w / 2 - 260;
 
         if mods.is_empty() {
-            shadowed(d, "  (no mods installed)", x, start_y, fs, Color::GRAY);
+            shadowed(f, "  (no mods installed)", x, start_y, fs, Color::GRAY);
         }
 
         for i in 0..mods.len() {
@@ -182,10 +186,10 @@ impl ModMenu {
             let mark = if mods.is_enabled(i) { "[x]" } else { "[ ]" };
             let row = format!("{} {} {}", if selected { ">" } else { " " }, mark, mods.name(i));
             let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            shadowed(d, &row, x, start_y + line_h * i as i32, fs, color);
+            shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
             // Description under each row, dimmer.
             shadowed(
-                d,
+                f,
                 mods.description(i),
                 x + 40,
                 start_y + line_h * i as i32 + fs + 2,
@@ -196,12 +200,132 @@ impl ModMenu {
 
         let hint = "Up/Down select   Enter toggle   Esc back";
         let hint_fs = 18;
-        let hx = (screen_w - d.measure_text(hint, hint_fs)) / 2;
-        shadowed(d, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
+        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
+        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
     }
 }
 
 impl Default for ModMenu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Rows in the settings menu, top to bottom: Fullscreen, VSync, MSAA, Max FPS,
+/// Render Distance, FOV, Back.
+const SETTINGS_ROWS: usize = 7;
+/// Index of the Back row.
+const SETTINGS_ROW_BACK: usize = SETTINGS_ROWS - 1;
+
+/// Step to the adjacent entry in `values`, wrapping at both ends. A current value
+/// not in the list (e.g. a hand-edited config) snaps to the first entry first.
+fn cycle_list(values: &[u32], current: u32, dir: i32) -> u32 {
+    let i = values.iter().position(|&v| v == current).unwrap_or(0) as i32;
+    let n = values.len() as i32;
+    values[(i + dir).rem_euclid(n) as usize]
+}
+
+/// The settings menu: graphics options cycled in place. Mutates the passed
+/// [`Settings`](crate::settings::Settings) directly; the caller applies and
+/// persists them.
+pub struct SettingsMenu {
+    selected: usize,
+}
+
+impl SettingsMenu {
+    pub fn new() -> Self {
+        Self { selected: 0 }
+    }
+
+    /// Handle input; returns `true` when the player wants to go back (Esc
+    /// anywhere, or Enter on the Back row). Left/Right cycle the selected value
+    /// down/up; Enter also cycles up.
+    pub fn update(&mut self, eng: &Engine, s: &mut crate::settings::Settings) -> bool {
+        if eng.is_key_pressed(Key::Escape) {
+            return true;
+        }
+        if eng.is_key_pressed(Key::Down) {
+            self.selected = (self.selected + 1) % SETTINGS_ROWS;
+        }
+        if eng.is_key_pressed(Key::Up) {
+            self.selected = (self.selected + SETTINGS_ROWS - 1) % SETTINGS_ROWS;
+        }
+        let enter = eng.is_key_pressed(Key::Enter);
+        if enter && self.selected == SETTINGS_ROW_BACK {
+            return true;
+        }
+        if eng.is_key_pressed(Key::Left) {
+            self.cycle(s, -1);
+        }
+        if eng.is_key_pressed(Key::Right) || enter {
+            self.cycle(s, 1);
+        }
+        false
+    }
+
+    /// Apply one Left/Right (or Enter) step to the selected row's value, wrapping.
+    fn cycle(&self, s: &mut crate::settings::Settings, dir: i32) {
+        match self.selected {
+            0 => s.fullscreen = !s.fullscreen,
+            1 => s.vsync = !s.vsync,
+            2 => s.msaa = cycle_list(&[1, 2, 4, 8], s.msaa, dir),
+            3 => s.max_fps = cycle_list(&[0, 30, 60, 120, 144, 240], s.max_fps, dir),
+            4 => {
+                let v = s.render_distance.clamp(3, 10) + dir;
+                s.render_distance = if v > 10 { 3 } else if v < 3 { 10 } else { v };
+            }
+            5 => {
+                let v = s.fov.clamp(50.0, 110.0) + dir as f32 * 5.0;
+                s.fov = if v > 110.0 { 50.0 } else if v < 50.0 { 110.0 } else { v };
+            }
+            _ => {}
+        }
+    }
+
+    /// Draw the settings rows with their current values.
+    pub fn draw(&self, f: &mut Frame, s: &crate::settings::Settings, screen_w: i32, screen_h: i32) {
+        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
+
+        let title = "SETTINGS";
+        let title_fs = 40;
+        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
+        shadowed(f, title, tx, screen_h / 8, title_fs, Color::GOLD);
+
+        let on_off = |on: bool| if on { "On" } else { "Off" };
+        let max_fps = if s.max_fps == 0 {
+            "Uncapped".to_string()
+        } else {
+            s.max_fps.to_string()
+        };
+        let labels = [
+            format!("Fullscreen: {}", on_off(s.fullscreen)),
+            format!("VSync: {}", on_off(s.vsync)),
+            format!("MSAA: {}x", s.msaa),
+            format!("Max FPS: {max_fps}"),
+            format!("Render Distance: {}", s.render_distance),
+            format!("FOV: {}", s.fov),
+            "Back".to_string(),
+        ];
+
+        let fs = 26;
+        let line_h = fs + 20;
+        let start_y = screen_h / 4 + 20;
+        let x = screen_w / 2 - 260;
+        for (i, label) in labels.iter().enumerate() {
+            let selected = i == self.selected;
+            let row = format!("{} {label}", if selected { ">" } else { " " });
+            let color = if selected { Color::RAYWHITE } else { Color::GRAY };
+            shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
+        }
+
+        let hint = "Up/Down select | Left/Right change | Esc back";
+        let hint_fs = 18;
+        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
+        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
+    }
+}
+
+impl Default for SettingsMenu {
     fn default() -> Self {
         Self::new()
     }
@@ -246,24 +370,24 @@ impl Form {
     }
 
     /// Process a frame. Returns `Some(true)` on submit, `Some(false)` on cancel.
-    fn update(&mut self, rl: &mut RaylibHandle) -> Option<bool> {
+    fn update(&mut self, eng: &Engine) -> Option<bool> {
         let n = self.fields.len();
-        if rl.is_key_pressed(KeyboardKey::KEY_DOWN) || rl.is_key_pressed(KeyboardKey::KEY_TAB) {
+        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::Tab) {
             self.selected = (self.selected + 1) % n;
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_UP) {
+        if eng.is_key_pressed(Key::Up) {
             self.selected = (self.selected + n - 1) % n;
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+        if eng.is_key_pressed(Key::Enter) {
             return Some(true);
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+        if eng.is_key_pressed(Key::Escape) {
             return Some(false);
         }
-        if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) {
+        if eng.is_key_pressed(Key::Backspace) {
             self.fields[self.selected].value.pop();
         }
-        while let Some(c) = rl.get_char_pressed() {
+        while let Some(c) = eng.get_char_pressed() {
             let field = &mut self.fields[self.selected];
             if !c.is_control() && field.value.len() < field.max {
                 field.value.push(c);
@@ -277,12 +401,12 @@ impl Form {
     }
 
     /// Draw the form's title, its fields (the selected one highlighted), and a hint.
-    fn draw(&self, d: &mut RaylibDrawHandle, title: &str, hint: &str, screen_w: i32, screen_h: i32) {
-        d.clear_background(Color::new(18, 20, 28, 255));
+    fn draw(&self, f: &mut Frame, title: &str, hint: &str, screen_w: i32, screen_h: i32) {
+        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
 
         let title_fs = 40;
-        let tx = (screen_w - d.measure_text(title, title_fs)) / 2;
-        shadowed(d, title, tx, screen_h / 6, title_fs, Color::GOLD);
+        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
+        shadowed(f, title, tx, screen_h / 6, title_fs, Color::GOLD);
 
         let fs = 26;
         let line_h = fs + 22;
@@ -298,12 +422,12 @@ impl Form {
             let caret = if selected { "_" } else { "" };
             let row = format!("{} {}: {}{}", if selected { ">" } else { " " }, field.label, shown, caret);
             let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            shadowed(d, &row, x, start_y + line_h * i as i32, fs, color);
+            shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
         }
 
         let hint_fs = 18;
-        let hx = (screen_w - d.measure_text(hint, hint_fs)) / 2;
-        shadowed(d, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
+        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
+        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
     }
 }
 
@@ -330,8 +454,8 @@ impl HostMenu {
 
     /// Returns `Some(info)` to start hosting, `None` while editing. Cancelling (Esc)
     /// is reported through the returned [`Option`] being `None` with `cancelled`.
-    pub fn update(&mut self, rl: &mut RaylibHandle) -> FormResult<HostInfo> {
-        match self.form.update(rl) {
+    pub fn update(&mut self, eng: &Engine) -> FormResult<HostInfo> {
+        match self.form.update(eng) {
             Some(true) => FormResult::Submit(HostInfo {
                 port: parse_port(self.form.value(0)),
                 password: self.form.value(1).to_string(),
@@ -342,9 +466,9 @@ impl HostMenu {
         }
     }
 
-    pub fn draw(&self, d: &mut RaylibDrawHandle, screen_w: i32, screen_h: i32) {
+    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
         self.form.draw(
-            d,
+            f,
             "HOST SERVER",
             "Up/Down field   type to edit   Enter start   Esc back",
             screen_w,
@@ -376,8 +500,8 @@ impl JoinMenu {
         }
     }
 
-    pub fn update(&mut self, rl: &mut RaylibHandle) -> FormResult<JoinInfo> {
-        match self.form.update(rl) {
+    pub fn update(&mut self, eng: &Engine) -> FormResult<JoinInfo> {
+        match self.form.update(eng) {
             Some(true) => FormResult::Submit(JoinInfo {
                 host: self.form.value(0).trim().to_string(),
                 port: parse_port(self.form.value(1)),
@@ -389,9 +513,9 @@ impl JoinMenu {
         }
     }
 
-    pub fn draw(&self, d: &mut RaylibDrawHandle, screen_w: i32, screen_h: i32) {
+    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
         self.form.draw(
-            d,
+            f,
             "JOIN SERVER",
             "Up/Down field   type to edit   Enter connect   Esc back",
             screen_w,

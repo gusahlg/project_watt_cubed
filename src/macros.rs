@@ -8,15 +8,15 @@
 //! - [`axis!`] — a keyboard-driven movement axis (positive / negative / none),
 //!   so adding a new control axis doesn't repeat the same `if`-ladder.
 //!
-//! Both macros use fully-qualified `::raylib::...` paths so they expand
+//! Both macros use fully-qualified `::voxel_engine::...` paths so they expand
 //! correctly regardless of what the call site has imported.
 
 /// Define a tri-state movement axis bound to two keys.
 ///
 /// ```ignore
-/// axis!(#[derive(Clone, Copy)] AxisX { Right = KEY_D, Left = KEY_A });
-/// let dir = AxisX::sample(&rl); // Right / Left / None
-/// let s = dir.signum();         // +1.0 / -1.0 / 0.0
+/// axis!(#[derive(Clone, Copy)] AxisX { Right = D, Left = A });
+/// let dir = AxisX::sample(&eng); // Right / Left / None
+/// let s = dir.signum();          // +1.0 / -1.0 / 0.0
 /// ```
 macro_rules! axis {
     ($(#[$meta:meta])* $name:ident { $pos:ident = $pkey:ident, $neg:ident = $nkey:ident }) => {
@@ -29,10 +29,10 @@ macro_rules! axis {
 
         impl $name {
             /// Read this axis from the current keyboard state.
-            pub fn sample(rl: &::raylib::prelude::RaylibHandle) -> Self {
-                if rl.is_key_down(::raylib::prelude::KeyboardKey::$pkey) {
+            pub fn sample(eng: &::voxel_engine::Engine) -> Self {
+                if eng.is_key_down(::voxel_engine::Key::$pkey) {
                     $name::$pos
-                } else if rl.is_key_down(::raylib::prelude::KeyboardKey::$nkey) {
+                } else if eng.is_key_down(::voxel_engine::Key::$nkey) {
                     $name::$neg
                 } else {
                     $name::None
@@ -108,7 +108,7 @@ macro_rules! elements {
                 $(
                     $crate::block::element::Element {
                         name: stringify!($variant).into(),
-                        color: ::raylib::prelude::Color::new($r, $g, $b, 255),
+                        color: ::voxel_engine::Color::new($r, $g, $b, 255),
                         core: $crate::block::element::CoreProperties {
                             $($core)* ,
                             ..Default::default()

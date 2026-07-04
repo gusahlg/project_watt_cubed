@@ -43,17 +43,32 @@ rate-limited, and every edit is bounds- and reach-validated server-side, so a cl
 can't reach across the map or flood the server. Traffic is **not** encrypted — host
 behind a VPN or trusted network if you need confidentiality on the wire.
 
+## Graphics
+
+Rendering runs on [voxel_engine](../voxel-engine), our own Vulkan 1.3 renderer
+(pure Rust over `ash` + `winit` — no C build step). Expect greedy-meshed
+chunks, frustum culling, reversed-Z depth, and uncapped frame rates by default.
+
+Graphics are tunable at runtime from **Settings** on the start menu or the
+`/gfx` console command in game (`/gfx fullscreen on`, `/gfx vsync off`,
+`/gfx msaa 4`, `/gfx fps 144`, `/gfx renderdist 8`, `/gfx fov 90`). Settings
+persist in `saves/settings.cfg`.
+
 ## Running on NixOS
 
-This project depends on `raylib`, which builds native C code and needs OpenGL +
-X11 libraries at runtime. The included `flake.nix` wires all of that up.
+The included `flake.nix` wires up the Vulkan loader and windowing libraries.
+It expects the `voxel-engine` repo checked out as a sibling directory
+(`../voxel-engine`).
 
 ```sh
 # Drop into a dev shell with the Rust toolchain and native deps, then run:
 nix develop
-cargo run
+cargo run --release
 
 # Or build/run the packaged binary directly:
 nix run
 nix build   # produces ./result/bin/project_watt_cubed
 ```
+
+On macOS, install MoltenVK and the Vulkan loader once (`brew install
+molten-vk vulkan-loader`) and use plain `cargo run --release`.
