@@ -226,9 +226,12 @@ const SETTINGS_ROW_BACK: usize = SETTINGS_ROWS - 1;
 /// Step to the adjacent entry in `values`, wrapping at both ends. A current value
 /// not in the list (e.g. a hand-edited config) snaps to the first entry first.
 fn cycle_list(values: &[u32], current: u32, dir: i32) -> u32 {
-    let i = values.iter().position(|&v| v == current).unwrap_or(0) as i32;
-    let n = values.len() as i32;
-    values[(i + dir).rem_euclid(n) as usize]
+    match values.iter().position(|&v| v == current) {
+        Some(i) => values[(i as i32 + dir).rem_euclid(values.len() as i32) as usize],
+        // Off-list (e.g. a /gfx or hand-edited value): snap to the first
+        // entry without stepping, so Left can never jump 25% -> 200%.
+        None => values[0],
+    }
 }
 
 /// The settings menu: graphics options cycled in place. Mutates the passed
@@ -289,7 +292,7 @@ impl SettingsMenu {
             6 => {
                 // Percent steps; the engine clamps to 25%..200%.
                 let pct = cycle_list(
-                    &[50, 75, 100, 125, 150, 200],
+                    &[25, 50, 75, 100, 125, 150, 200],
                     (s.render_scale * 100.0).round() as u32,
                     dir,
                 );

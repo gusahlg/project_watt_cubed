@@ -378,7 +378,9 @@ impl World {
                     self.accept_chunk(coord, chunk);
                 }
                 pipeline::Done::Mesh { coord, rev, data } => {
-                    self.in_flight.remove(&coord);
+                    // NOT removed from in_flight yet: the coord stays claimed
+                    // until its budgeted upload resolves, so the fresh scan
+                    // can't re-enqueue a duplicate build meanwhile.
                     self.accept_mesh(coord, rev, data);
                 }
             }
@@ -393,6 +395,7 @@ impl World {
             let Some((coord, rev, data)) = self.upload_queue.pop_front() else {
                 break;
             };
+            self.in_flight.remove(&coord);
             if !self.mesh_result_applies(coord, rev) {
                 self.pending_fresh = true; // went stale while queued: rescan
                 continue;
@@ -436,6 +439,7 @@ impl World {
         if self.mesh_result_applies(coord, rev) {
             self.upload_queue.push_back((coord, rev, data));
         } else {
+            self.in_flight.remove(&coord);
             self.pending_fresh = true;
         }
     }
@@ -521,6 +525,24 @@ impl World {
         for cx in (center.0 - rh)..=(center.0 + rh) {
             for cz in (center.2 - rh)..=(center.2 + rh) {
                 for cy in (center.1 - rv)..=(center.1 + rv) {
+                    self.ensure_data((cx, cy, cz));
+                }
+            }
+        }
+    }
+
+    /// Synchronously generate the small box of chunks around a position, so
+    /// the first physics steps after entering a world land on real terrain.
+    /// World::new only pre-generates around the ORIGIN; a save (or server
+    /// spawn) can restore the player anywhere, and the async pipeline needs a
+    /// few frames to catch up — during which collision would read the void as
+    /// air and embed the player in late-arriving ground. Uniform fast paths
+    /// make this box cheap (sky/deep-rock chunks are proven uniform).
+    pub fn prepare_around(&mut self, pos: Vec3) {
+        let c = Self::chunk_of(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+        for cx in (c.0 - 1)..=(c.0 + 1) {
+            for cz in (c.2 - 1)..=(c.2 + 1) {
+                for cy in (c.1 - 2)..=(c.1 + 1) {
                     self.ensure_data((cx, cy, cz));
                 }
             }
@@ -791,26 +813,29 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             self.dirty.insert(coord);
             self.pending_fresh = true;
-            // A block on a chunk face also changes that neighbour's exposed faces.
-            let (cx, cy, cz) = coord;
-            if lx == 0 {
-                self.mark_dirty((cx - 1, cy, cz));
-            }
-            if lx == CHUNK_SIZE - 1 {
-                self.mark_dirty((cx + 1, cy, cz));
-            }
-            if ly == 0 {
-                self.mark_dirty((cx, cy - 1, cz));
-            }
-            if ly == CHUNK_SIZE - 1 {
-                self.mark_dirty((cx, cy + 1, cz));
-            }
-            if lz == 0 {
-                self.mark_dirty((cx, cy, cz - 1));
-            }
-            if lz == CHUNK_SIZE - 1 {
-                self.mark_dirty((cx, cy, cz + 1));
-            }
+        }
+        // A block on a chunk face also changes that neighbour's exposed
+        // faces — even when the edited chunk itself has no data (a remote
+        // edit landing in an unloaded chunk must still invalidate a loaded,
+        // still-drawn neighbour, or its culled border face becomes a hole).
+        let (cx, cy, cz) = coord;
+        if lx == 0 {
+            self.mark_dirty((cx - 1, cy, cz));
+        }
+        if lx == CHUNK_SIZE - 1 {
+            self.mark_dirty((cx + 1, cy, cz));
+        }
+        if ly == 0 {
+            self.mark_dirty((cx, cy - 1, cz));
+        }
+        if ly == CHUNK_SIZE - 1 {
+            self.mark_dirty((cx, cy + 1, cz));
+        }
+        if lz == 0 {
+            self.mark_dirty((cx, cy, cz - 1));
+        }
+        if lz == CHUNK_SIZE - 1 {
+            self.mark_dirty((cx, cy, cz + 1));
         }
         previous
     }

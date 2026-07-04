@@ -344,6 +344,10 @@ impl App {
     /// Install a freshly built game as the active screen.
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
         game.world_mut().set_view_radius(self.settings.render_distance);
+        // Saves and servers can place the player far from the pre-generated
+        // origin; make the ground under them real before physics runs.
+        let pos = game.player().position;
+        game.world_mut().prepare_around(pos);
         game.on_enter(eng);
         self.game = Some(game);
         self.screen = Screen::Playing;
