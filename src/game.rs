@@ -109,13 +109,23 @@ impl Game {
         mods: &mut Mods,
         settings: &mut Settings,
     ) -> Signal {
-        let dt = eng.frame_time();
+        // Clamp dt so a stall (window minimized, world load hitch) becomes one
+        // slightly-long step instead of a single giant physics step that would
+        // tunnel the player through terrain.
+        let dt = eng.frame_time().min(0.1);
 
         // Drain the server first so edits and chat keep flowing even while the
         // console is open or the player stands still.
         if self.apply_net_events() {
             self.console.print("* disconnected from server".to_string());
             return Signal::ExitToMenu;
+        }
+
+        // Report our own state to the server every frame — this doubles as the
+        // keepalive heartbeat, so it must run even while the console is open
+        // (otherwise the server's idle timeout kicks a chatting player).
+        if let Some(net) = &mut self.net {
+            net.send_move(self.player.position, self.player.yaw, self.player.pitch);
         }
 
         // While the console is open it captures all typing; the world is frozen
@@ -167,11 +177,6 @@ impl Game {
                 capturing_text: false,
             };
             mods.update(eng, &mut ctx);
-        }
-
-        // Report our own state to the server (throttled + heartbeat inside).
-        if let Some(net) = &mut self.net {
-            net.send_move(self.player.position, self.player.yaw, self.player.pitch);
         }
 
         // Load/mesh/unload chunks around the player, then step physics.

@@ -98,11 +98,13 @@ impl Settings {
     }
 
     /// Push the current values to the engine. Cheap to call every frame: the
-    /// engine ignores values that didn't change.
-    pub fn apply(&self, eng: &mut Engine) {
+    /// engine ignores values that didn't change. MSAA is written back with
+    /// the hardware-clamped value so menus and `/gfx` show what actually
+    /// applied (e.g. 8x requested, 4x supported).
+    pub fn apply(&mut self, eng: &mut Engine) {
         eng.set_fullscreen(self.fullscreen);
         eng.set_vsync(self.vsync);
-        eng.set_msaa(self.msaa);
+        self.msaa = eng.set_msaa(self.msaa);
         eng.set_target_fps(self.max_fps);
     }
 }

@@ -98,8 +98,10 @@ impl App {
     /// One engine frame: update the active screen, then draw it.
     /// Returning `false` stops the engine (after autosaving any open world).
     fn frame(&mut self, eng: &mut Engine) -> bool {
-        // OS close button: save and go.
+        // OS close button: save and go. Settings save too — the player may be
+        // mid-edit on the Settings screen.
         if eng.should_close() {
+            self.settings.save();
             self.autosave();
             return false;
         }
@@ -128,6 +130,7 @@ impl App {
             }
         };
         if quit {
+            self.settings.save();
             self.autosave();
             return false;
         }

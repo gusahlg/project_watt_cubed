@@ -61,8 +61,10 @@ const INTEREST_RADIUS_SQ: f32 = INTEREST_RADIUS * INTEREST_RADIUS;
 /// farther edits are rejected as bogus. A little past the client's reach constant.
 const EDIT_REACH: f32 = 8.0;
 /// Edits are streamed to a joining client in batches this size, so a very built-up
-/// world's snapshot never overflows a single frame's size cap.
-const SNAPSHOT_BATCH: usize = 512;
+/// world's snapshot never overflows a single frame's size cap. Derived from the
+/// worst case per edit — 12 bytes x/y/z + 2-byte length prefix + [`MAX_SPEC`]
+/// spec bytes — with headroom for the frame header.
+const SNAPSHOT_BATCH: usize = (crate::net::MAX_FRAME - 64) / (12 + 2 + MAX_SPEC);
 /// Average terrain height the generator oscillates around — matches the client's
 /// [`World`](crate::world::World::new) so server spawn heights land on real ground.
 const TERRAIN_BASE: f32 = 20.0;
@@ -216,27 +218,34 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
     let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let writer_stream = stream.try_clone()?;
+    let writer_shutdown = stream.try_clone()?;
     let writer = thread::spawn(move || {
         // Buffered, flushed once per drained batch: block for the first frame, then
         // opportunistically drain whatever else queued up before paying one flush —
         // a burst of broadcasts costs one syscall instead of one per message.
+        //
+        // Any write error shuts the socket down so the reader thread unblocks
+        // and the player is cleaned up, instead of silently ghosting them.
         let mut w = io::BufWriter::new(writer_stream);
+        let fail = |s: &TcpStream| {
+            let _ = s.shutdown(Shutdown::Both);
+        };
         while let Ok(frame) = rx.recv() {
             if protocol::write_frame(&mut w, &frame).is_err() {
-                return;
+                return fail(&writer_shutdown);
             }
             loop {
                 match rx.try_recv() {
                     Ok(frame) => {
                         if protocol::write_frame(&mut w, &frame).is_err() {
-                            return;
+                            return fail(&writer_shutdown);
                         }
                     }
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
             }
             if w.flush().is_err() {
-                return;
+                return fail(&writer_shutdown);
             }
         }
     });
@@ -284,13 +293,19 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     println!("[+] {name} joined as #{id} from {addr} ({} online)", online(&shared));
 
     // Bootstrap the newcomer: who they are, the world edits, and who else is here.
-    send(&out, &ServerMessage::Welcome { player_id: id, seed: ctx.seed, spawn });
+    // These sends BLOCK (we're on this client's own handler thread): a built-up
+    // world or big roster can exceed the outbound queue, and dropping bootstrap
+    // frames would ghost the join.
+    send_blocking(&out, &ServerMessage::Welcome { player_id: id, seed: ctx.seed, spawn });
     for batch in snapshot.chunks(SNAPSHOT_BATCH) {
-        send(&out, &ServerMessage::Snapshot { edits: batch.to_vec() });
+        send_blocking(&out, &ServerMessage::Snapshot { edits: batch.to_vec() });
     }
     for (pid, pname, ppos, pyaw, ppitch) in existing {
-        send(&out, &ServerMessage::PeerJoined { id: pid, name: pname });
-        send(&out, &ServerMessage::PeerMove { id: pid, pos: ppos, yaw: pyaw, pitch: ppitch });
+        send_blocking(&out, &ServerMessage::PeerJoined { id: pid, name: pname });
+        send_blocking(
+            &out,
+            &ServerMessage::PeerMove { id: pid, pos: ppos, yaw: pyaw, pitch: ppitch },
+        );
     }
     // Announce the newcomer to everyone already connected.
     broadcast_all(&shared, &ServerMessage::PeerJoined { id, name: name.clone() }, Some(id));
@@ -438,6 +453,13 @@ fn kick_slow(state: &State, ids: &[u32]) {
 fn send(out: &SyncSender<Arc<[u8]>>, msg: &ServerMessage) {
     let frame: Arc<[u8]> = msg.encode().into();
     let _ = out.try_send(frame);
+}
+
+/// Queue one message, waiting for space. Only safe on the receiving client's
+/// own handler thread (used for the join bootstrap, which must not drop frames).
+fn send_blocking(out: &SyncSender<Arc<[u8]>>, msg: &ServerMessage) {
+    let frame: Arc<[u8]> = msg.encode().into();
+    let _ = out.send(frame);
 }
 
 /// Reply with a rejection and let the socket close.

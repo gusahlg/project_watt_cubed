@@ -105,6 +105,9 @@ pub struct World {
     /// a scan finishes with nothing left, set again by anything that could
     /// create work (centre/radius change, edits, new chunk data).
     pending_fresh: bool,
+    /// Set when the render distance shrank; the next stream frees meshes
+    /// beyond the new radius instead of leaving them drawn until movement.
+    radius_shrunk: bool,
     /// Reusable CPU-side mesh scratch; `upload_mesh` copies out of it, so one
     /// buffer serves every chunk build without per-chunk allocations.
     scratch: MeshData,
@@ -130,6 +133,7 @@ impl World {
             center: (i32::MIN, i32::MIN),
             view_radius: DEFAULT_VIEW_RADIUS,
             pending_fresh: true,
+            radius_shrunk: false,
             scratch: MeshData::default(),
             solid_table: Vec::new(),
             color_table: Vec::new(),
@@ -175,11 +179,16 @@ impl World {
     pub fn set_view_radius(&mut self, radius: i32) {
         let radius = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
         if radius != self.view_radius {
+            let shrunk = radius < self.view_radius;
             self.view_radius = radius;
             // Invalidate the centre so the next stream reruns the full
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = (i32::MIN, i32::MIN);
             self.pending_fresh = true;
+            // On shrink, meshes between the new radius and the (also shrunk)
+            // unload ring would otherwise stay drawn until the player moves;
+            // flag them so the next stream frees them immediately.
+            self.radius_shrunk = shrunk;
         }
     }
 
@@ -200,6 +209,20 @@ impl World {
             self.unload_far(center_chunk, eng);
             self.ensure_region_data(center_chunk);
             self.pending_fresh = true;
+        }
+        if self.radius_shrunk {
+            self.radius_shrunk = false;
+            // Meshes between the new view radius and the unload ring survive
+            // unload_far's hysteresis; free them now (data stays loaded).
+            for (&(cx, cz), loaded) in self.chunks.iter_mut() {
+                let ring = (cx - center_chunk.0).abs().max((cz - center_chunk.1).abs());
+                if ring > self.view_radius && loaded.meshed {
+                    loaded.meshed = false;
+                    if let Some(handle) = loaded.mesh.take() {
+                        eng.free_mesh(handle);
+                    }
+                }
+            }
         }
         self.build_meshes(center_chunk, eng);
     }
@@ -294,7 +317,12 @@ impl World {
             dirty.sort_by_key(|&(cx, cz)| (cx - center.0).abs().max((cz - center.1).abs()));
             for coord in dirty.into_iter().take(DIRTY_BUDGET) {
                 self.dirty.remove(&coord);
-                if self.chunks.contains_key(&coord) && self.neighbours_have_data(coord) {
+                // No neighbour-data gate here: an edited chunk must remesh even
+                // when a far neighbour has no data (the mesher reads missing
+                // neighbours as air, exactly like the original world lookup).
+                // Gating would leave a stale mesh with a hole at the border in
+                // margin chunks whose outer neighbour never loads.
+                if self.chunks.contains_key(&coord) {
                     self.mesh_chunk(coord, eng);
                 }
             }
