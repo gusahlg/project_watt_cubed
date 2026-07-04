@@ -218,8 +218,8 @@ impl Default for ModMenu {
 }
 
 /// Rows in the settings menu, top to bottom: Fullscreen, VSync, MSAA, Max FPS,
-/// Render Distance, FOV, Back.
-const SETTINGS_ROWS: usize = 7;
+/// Render Distance, FOV, Render Scale, Back.
+const SETTINGS_ROWS: usize = 8;
 /// Index of the Back row.
 const SETTINGS_ROW_BACK: usize = SETTINGS_ROWS - 1;
 
@@ -286,6 +286,15 @@ impl SettingsMenu {
                 let v = s.fov.clamp(50.0, 110.0) + dir as f32 * 5.0;
                 s.fov = if v > 110.0 { 50.0 } else if v < 50.0 { 110.0 } else { v };
             }
+            6 => {
+                // Percent steps; the engine clamps to 25%..200%.
+                let pct = cycle_list(
+                    &[50, 75, 100, 125, 150, 200],
+                    (s.render_scale * 100.0).round() as u32,
+                    dir,
+                );
+                s.render_scale = pct as f32 / 100.0;
+            }
             _ => {}
         }
     }
@@ -312,6 +321,7 @@ impl SettingsMenu {
             format!("Max FPS: {max_fps}"),
             format!("Render Distance: {}", s.render_distance),
             format!("FOV: {}", s.fov),
+            format!("Render Scale: {:.0}%", s.render_scale * 100.0),
             "Back".to_string(),
         ];
 

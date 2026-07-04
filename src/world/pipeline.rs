@@ -33,12 +33,13 @@ use super::mesh::{self, BorderPlanes};
 use crate::block::registry::BlockId;
 
 /// Everything a mesh job needs, copied out of the world at enqueue time
-/// (~33 KiB: the chunk's voxels plus up to four 1 KiB border planes) so the
-/// worker shares no state with the live chunk map.
+/// (at most ~7 KiB: a dense chunk's 4 KiB cells plus up to six 0.5 KiB border
+/// planes — a uniform chunk's clone is just its enum) so the worker shares no
+/// state with the live chunk map.
 pub struct ChunkSnapshot {
-    /// A clone of the chunk: voxels, `max_solid_y`, and its coords.
+    /// A clone of the chunk: its storage (uniform id or dense cells) and coords.
     pub chunk: Chunk,
-    /// The four neighbour facing planes; a missing one reads as air.
+    /// The six neighbour facing planes; a missing one reads as air.
     pub borders: BorderPlanes,
     /// The solidity table, shared by refcount. Palette growth swaps the
     /// world's `Arc` for a new one while in-flight jobs keep the old — that is
@@ -159,7 +160,7 @@ fn run(job: Job) -> Done {
             generator,
             edits,
         } => {
-            let mut chunk = Chunk::new(coord.0, coord.1, &generator);
+            let mut chunk = Chunk::new(coord.0, coord.1, coord.2, &generator);
             for (index, id) in edits {
                 chunk.set_index(index, id);
             }
@@ -192,12 +193,12 @@ mod tests {
     #[test]
     fn worker_generation_matches_the_sync_path() {
         let generator = generator(42);
-        let coord = (3, -2);
+        let coord = (3, 1, -2); // a ground chunk: y 16..=31 crosses the surface
         let edits = vec![
-            (Chunk::index(1, 19, 2), AIR),        // dig a hole
-            (Chunk::index(5, 50, 5), BlockId(1)), // place high: raises max_solid_y
+            (Chunk::index(1, 3, 2), AIR),         // dig a hole
+            (Chunk::index(5, 14, 5), BlockId(1)), // place high in the chunk
         ];
-        let mut expected = Chunk::new(coord.0, coord.1, &generator);
+        let mut expected = Chunk::new(coord.0, coord.1, coord.2, &generator);
         for &(index, id) in &edits {
             expected.set_index(index, id);
         }
@@ -216,22 +217,26 @@ mod tests {
             panic!("expected a chunk result");
         };
         assert_eq!(got, coord);
-        assert_eq!(chunk.voxels(), expected.voxels(), "voxel-identical to sync");
-        assert_eq!(chunk.max_solid_y(), expected.max_solid_y());
+        assert_eq!(chunk.data(), expected.data(), "voxel-identical to sync");
     }
 
     #[test]
     fn worker_meshing_matches_the_sync_mesher() {
         let registry = BlockRegistry::with_builtins();
         let generator = SineHills::new(&registry, 20.0, 5);
-        let chunk = Chunk::new(0, 0, &generator);
-        let (nx, px) = (Chunk::new(-1, 0, &generator), Chunk::new(1, 0, &generator));
-        let (nz, pz) = (Chunk::new(0, -1, &generator), Chunk::new(0, 1, &generator));
+        // The chunk holding the surface at the origin, with all six neighbours
+        // (below: solid ground, above: sky, sides: more surface).
+        let chunk = Chunk::new(0, 1, 0, &generator);
+        let (nx, px) = (Chunk::new(-1, 1, 0, &generator), Chunk::new(1, 1, 0, &generator));
+        let (nz, pz) = (Chunk::new(0, 1, -1, &generator), Chunk::new(0, 1, 1, &generator));
+        let (ny, py) = (Chunk::new(0, 0, 0, &generator), Chunk::new(0, 2, 0, &generator));
         let neighbours = Neighbours {
             neg_x: Some(&nx),
             pos_x: Some(&px),
             neg_z: Some(&nz),
             pos_z: Some(&pz),
+            neg_y: Some(&ny),
+            pos_y: Some(&py),
         };
         let solid: Arc<Vec<bool>> = Arc::new(
             (0..registry.block_count())
@@ -242,7 +247,14 @@ mod tests {
         let mut expected = MeshData::default();
         mesh::build_chunk_mesh(&chunk, &neighbours, &solid, &mut expected);
         // The neighbours must actually matter, or equality proves nothing.
-        let alone = Neighbours { neg_x: None, pos_x: None, neg_z: None, pos_z: None };
+        let alone = Neighbours {
+            neg_x: None,
+            pos_x: None,
+            neg_z: None,
+            pos_z: None,
+            neg_y: None,
+            pos_y: None,
+        };
         let mut unculled = MeshData::default();
         mesh::build_chunk_mesh(&chunk, &alone, &solid, &mut unculled);
         assert_ne!(unculled.indices.len(), expected.indices.len(), "border culling engaged");
@@ -253,7 +265,7 @@ mod tests {
             solid: Arc::clone(&solid),
         };
         let workers = Workers::spawn(1);
-        assert!(workers.submit(Job::Mesh { coord: (0, 0), rev: 7, snapshot }));
+        assert!(workers.submit(Job::Mesh { coord: (0, 1, 0), rev: 7, snapshot }));
         let done = workers
             .results
             .recv_timeout(Duration::from_secs(10))
@@ -261,7 +273,7 @@ mod tests {
         let Done::Mesh { coord, rev, data } = done else {
             panic!("expected a mesh result");
         };
-        assert_eq!((coord, rev), ((0, 0), 7));
+        assert_eq!((coord, rev), ((0, 1, 0), 7));
         assert_eq!(data.indices, expected.indices);
         assert_eq!(data.vertices.len(), expected.vertices.len());
         for (a, b) in data.vertices.iter().zip(expected.vertices.iter()) {
@@ -279,7 +291,7 @@ mod tests {
             let workers = Workers::spawn(2);
             for i in 0..6 {
                 workers.submit(Job::Generate {
-                    coord: (i, i),
+                    coord: (i, 0, i),
                     generator: generator.clone(),
                     edits: Vec::new(),
                 });

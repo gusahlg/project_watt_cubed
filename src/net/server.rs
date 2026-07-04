@@ -35,7 +35,6 @@ use voxel_engine::Vec3;
 use crate::block::registry::BlockRegistry;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat};
-use crate::world::chunk::CHUNK_HEIGHT;
 use crate::world::generation::{SineHills, TerrainGenerator};
 
 /// Largest concurrent roster. A hard bound so a flood of connects can't spawn
@@ -380,7 +379,8 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vec3, yaw: f32, pitch: f32)
 /// Validate and record a block edit, then broadcast it to every other player so all
 /// overlays stay in agreement.
 fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &str) {
-    if spec.len() > MAX_SPEC || y < 0 || y >= CHUNK_HEIGHT as i32 {
+    // Y is unbounded now (infinite world height/depth); reach is the real gate.
+    if spec.len() > MAX_SPEC {
         return;
     }
     let mut state = shared.lock().unwrap();

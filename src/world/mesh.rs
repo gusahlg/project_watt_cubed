@@ -16,24 +16,30 @@
 //! - Per-face directional shading is baked into the vertex colour multiplier,
 //!   which fakes cheap lighting without needing lit shaders (the engine is
 //!   unlit); `color.a` carries the block-texture-array layer, i.e. the block id.
-//! - Neighbour culling never touches the world's chunk map: the four bordering
+//! - Neighbour culling never touches the world's chunk map: the six bordering
 //!   chunks are resolved once per build and everything else is flat-array reads.
+//! - [`ChunkData::Uniform`] fast paths: a uniform non-solid chunk is empty
+//!   without any scanning, and a uniform solid chunk only sweeps its six
+//!   border slices (its interior can never expose a face) — so the deep-rock
+//!   and sky bulk of an infinite-Y world meshes in effectively zero time.
 //!
 //! Building is pure CPU (`&Chunk` in, [`MeshData`] out) so it runs headless in
 //! tests; the caller uploads the result via `Engine::upload_mesh`.
 use voxel_engine::{MeshData, Vertex};
 
-use super::chunk::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
+use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 use crate::block::registry::{AIR, BlockId};
 
-/// The four orthogonal neighbours of a chunk, prefetched by the caller so the
+/// The six orthogonal neighbours of a chunk, prefetched by the caller so the
 /// mesher can cull border faces without hashmap lookups. A missing neighbour
-/// reads as air (in practice the world only meshes once all four have data).
+/// reads as air (in practice the world only meshes once all six have data).
 pub struct Neighbours<'a> {
     pub neg_x: Option<&'a Chunk>,
     pub pos_x: Option<&'a Chunk>,
     pub neg_z: Option<&'a Chunk>,
     pub pos_z: Option<&'a Chunk>,
+    pub neg_y: Option<&'a Chunk>,
+    pub pos_y: Option<&'a Chunk>,
 }
 
 /// A chunk border the sweep can read across. The discriminant doubles as the
@@ -44,77 +50,84 @@ pub enum Side {
     PosX = 1,
     NegZ = 2,
     PosZ = 3,
+    NegY = 4,
+    PosY = 5,
 }
 
 /// How the mesher reads the voxel just across a chunk border. Implemented for
-/// [`Neighbours`] (sync path: borrow the four loaded chunks) and
+/// [`Neighbours`] (sync path: borrow the six loaded chunks) and
 /// [`BorderPlanes`] (worker path: owned copies of just the facing planes), so
 /// both share the sweep and emit code in [`build_chunk_mesh_with`].
 pub trait NeighbourRead {
-    /// The block across `side` at height `y` and in-plane coordinate `u`
-    /// (Z for the X sides, X for the Z sides). A missing neighbour reads as air.
-    fn across(&self, side: Side, y: usize, u: usize) -> BlockId;
+    /// The block across `side` at in-plane coordinates `(u, v)`, given in the
+    /// face direction's (U, V) axis order: (z, y) for the X sides, (x, y) for
+    /// the Z sides, (x, z) for the Y sides. A missing neighbour reads as air.
+    fn across(&self, side: Side, u: usize, v: usize) -> BlockId;
 }
 
 impl NeighbourRead for Neighbours<'_> {
-    fn across(&self, side: Side, y: usize, u: usize) -> BlockId {
+    fn across(&self, side: Side, u: usize, v: usize) -> BlockId {
+        const EDGE: usize = CHUNK_SIZE - 1;
         match side {
-            Side::NegX => self.neg_x.map_or(AIR, |c| c.get_local(CHUNK_WIDTH - 1, y, u)),
-            Side::PosX => self.pos_x.map_or(AIR, |c| c.get_local(0, y, u)),
-            Side::NegZ => self.neg_z.map_or(AIR, |c| c.get_local(u, y, CHUNK_DEPTH - 1)),
-            Side::PosZ => self.pos_z.map_or(AIR, |c| c.get_local(u, y, 0)),
+            Side::NegX => self.neg_x.map_or(AIR, |c| c.get_local(EDGE, v, u)),
+            Side::PosX => self.pos_x.map_or(AIR, |c| c.get_local(0, v, u)),
+            Side::NegZ => self.neg_z.map_or(AIR, |c| c.get_local(u, v, EDGE)),
+            Side::PosZ => self.pos_z.map_or(AIR, |c| c.get_local(u, v, 0)),
+            Side::NegY => self.neg_y.map_or(AIR, |c| c.get_local(u, EDGE, v)),
+            Side::PosY => self.pos_y.map_or(AIR, |c| c.get_local(u, 0, v)),
         }
     }
 }
 
-/// Width of a border plane's in-plane horizontal axis. Both horizontal axes
-/// are 16, so one constant serves the X and Z sides alike.
-const PLANE_W: usize = CHUNK_WIDTH;
-const _: () = assert!(CHUNK_WIDTH == CHUNK_DEPTH, "border planes assume square chunks");
+/// Cells in one border plane: 16 x 16, indexed `[u + v * 16]`.
+const PLANE_CELLS: usize = CHUNK_SIZE * CHUNK_SIZE;
 
-/// The four neighbour facing planes copied out for a worker-thread mesh build:
-/// each is [`PLANE_W`] x [`CHUNK_HEIGHT`] voxels indexed `[u + y * PLANE_W]`,
-/// `None` when the neighbour has no data (reads as air, like a missing
-/// [`Neighbours`] entry). ~1 KiB per plane, owned, so a mesh job borrows
+/// The six neighbour facing planes copied out for a worker-thread mesh build:
+/// each is [`PLANE_CELLS`] voxels in [`NeighbourRead::across`]'s `(u, v)`
+/// order, `None` when the neighbour has no data (reads as air, like a missing
+/// [`Neighbours`] entry). ~0.5 KiB per plane, owned, so a mesh job borrows
 /// nothing from the live chunk map.
 pub struct BorderPlanes {
-    planes: [Option<Box<[BlockId]>>; 4],
+    planes: [Option<Box<[BlockId]>>; 6],
 }
 
 impl BorderPlanes {
     /// Copy the facing plane out of each present neighbour: the neg-X
     /// neighbour's `x == 15` plane, the pos-X neighbour's `x == 0` plane, and
-    /// likewise for Z.
+    /// likewise for Z and Y.
     pub fn capture(n: &Neighbours) -> Self {
         fn plane(
             chunk: Option<&Chunk>,
             read: impl Fn(&Chunk, usize, usize) -> BlockId,
         ) -> Option<Box<[BlockId]>> {
             let chunk = chunk?;
-            let mut out = Vec::with_capacity(PLANE_W * CHUNK_HEIGHT);
-            for y in 0..CHUNK_HEIGHT {
-                for u in 0..PLANE_W {
-                    out.push(read(chunk, y, u));
+            let mut out = Vec::with_capacity(PLANE_CELLS);
+            for v in 0..CHUNK_SIZE {
+                for u in 0..CHUNK_SIZE {
+                    out.push(read(chunk, u, v));
                 }
             }
             Some(out.into_boxed_slice())
         }
+        const EDGE: usize = CHUNK_SIZE - 1;
         Self {
             planes: [
-                plane(n.neg_x, |c, y, z| c.get_local(CHUNK_WIDTH - 1, y, z)),
-                plane(n.pos_x, |c, y, z| c.get_local(0, y, z)),
-                plane(n.neg_z, |c, y, x| c.get_local(x, y, CHUNK_DEPTH - 1)),
-                plane(n.pos_z, |c, y, x| c.get_local(x, y, 0)),
+                plane(n.neg_x, |c, u, v| c.get_local(EDGE, v, u)),
+                plane(n.pos_x, |c, u, v| c.get_local(0, v, u)),
+                plane(n.neg_z, |c, u, v| c.get_local(u, v, EDGE)),
+                plane(n.pos_z, |c, u, v| c.get_local(u, v, 0)),
+                plane(n.neg_y, |c, u, v| c.get_local(u, EDGE, v)),
+                plane(n.pos_y, |c, u, v| c.get_local(u, 0, v)),
             ],
         }
     }
 }
 
 impl NeighbourRead for BorderPlanes {
-    fn across(&self, side: Side, y: usize, u: usize) -> BlockId {
+    fn across(&self, side: Side, u: usize, v: usize) -> BlockId {
         self.planes[side as usize]
             .as_deref()
-            .map_or(AIR, |plane| plane[u + y * PLANE_W])
+            .map_or(AIR, |plane| plane[u + v * CHUNK_SIZE])
     }
 }
 
@@ -129,6 +142,8 @@ struct Dir {
     n_axis: usize,
     u_axis: usize,
     v_axis: usize,
+    /// The chunk border this direction's edge slice reads across.
+    side: Side,
     /// Quad corners as (normal, u, v) components, each 0 or 1: the normal
     /// component picks the face plane, the U/V components are scaled by the
     /// merged rectangle's extents. Wound counter-clockwise seen from *outside*
@@ -148,6 +163,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 0,
         u_axis: 2,
         v_axis: 1,
+        side: Side::PosX,
         corners: [[1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0]],
         shade: 0.80,
     },
@@ -157,6 +173,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 0,
         u_axis: 2,
         v_axis: 1,
+        side: Side::NegX,
         corners: [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],
         shade: 0.70,
     },
@@ -166,6 +183,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 1,
         u_axis: 0,
         v_axis: 2,
+        side: Side::PosY,
         corners: [[1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
         shade: 1.00,
     },
@@ -175,6 +193,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 1,
         u_axis: 0,
         v_axis: 2,
+        side: Side::NegY,
         corners: [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]],
         shade: 0.50,
     },
@@ -184,6 +203,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 2,
         u_axis: 0,
         v_axis: 1,
+        side: Side::PosZ,
         corners: [[1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
         shade: 0.85,
     },
@@ -193,25 +213,40 @@ const DIRS: [Dir; 6] = [
         n_axis: 2,
         u_axis: 0,
         v_axis: 1,
+        side: Side::NegZ,
         corners: [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0]],
         shade: 0.65,
     },
 ];
 
-/// Physical voxel-array extent along each world axis, for bounds checks.
-const AXIS_MAX: [usize; 3] = [CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH];
-
 /// Flat-index delta for a one-voxel step along each world axis
-/// (invariant: `Chunk::index` is `x + z*WIDTH + y*WIDTH*DEPTH`).
-const AXIS_STRIDE: [isize; 3] = [
-    1,
-    (CHUNK_WIDTH * CHUNK_DEPTH) as isize,
-    CHUNK_WIDTH as isize,
-];
+/// (invariant: [`Chunk::index`] is `x + z*16 + y*256`).
+const AXIS_STRIDE: [isize; 3] = [1, (CHUNK_SIZE * CHUNK_SIZE) as isize, CHUNK_SIZE as isize];
 
-/// Largest slice the sweep ever scans: 16 wide by 64 tall (X/Z directions).
-const MASK_CAP: usize =
-    (if CHUNK_WIDTH > CHUNK_DEPTH { CHUNK_WIDTH } else { CHUNK_DEPTH }) * CHUNK_HEIGHT;
+/// One slice of the sweep: 16 x 16 cells.
+const MASK_CAP: usize = CHUNK_SIZE * CHUNK_SIZE;
+
+/// How the sweep reads this chunk's own cells — monomorphized so the dense
+/// path keeps its direct flat-array reads and the uniform path is a constant.
+trait CellRead {
+    fn get(&self, index: usize) -> BlockId;
+}
+
+struct DenseCells<'a>(&'a [u8; CHUNK_VOLUME]);
+impl CellRead for DenseCells<'_> {
+    #[inline(always)]
+    fn get(&self, index: usize) -> BlockId {
+        BlockId(self.0[index] as u16)
+    }
+}
+
+struct UniformCells(BlockId);
+impl CellRead for UniformCells {
+    #[inline(always)]
+    fn get(&self, _index: usize) -> BlockId {
+        self.0
+    }
+}
 
 /// Build one chunk's greedy mesh into `out` (cleared first — pass the world's
 /// reusable scratch to avoid per-chunk allocations; `upload_mesh` copies out of
@@ -241,73 +276,76 @@ pub fn build_chunk_mesh_with<N: NeighbourRead>(
     out: &mut MeshData,
 ) {
     out.clear();
-    let max_y = chunk.max_solid_y();
-    if max_y < 0 {
-        return; // all air
+    let base = [
+        chunk.cx * CHUNK_SIZE as i32,
+        chunk.cy * CHUNK_SIZE as i32,
+        chunk.cz * CHUNK_SIZE as i32,
+    ];
+    match chunk.data() {
+        ChunkData::Uniform(id) => {
+            if !solid[id.0 as usize] {
+                return; // uniform air (or other non-solid): empty, no scan
+            }
+            // Uniform solid: interior faces are impossible, so only the six
+            // border slices are swept. With six fully-solid neighbour planes
+            // every mask comes up empty and the mesh stays empty.
+            sweep(&UniformCells(*id), true, neighbours, solid, base, out);
+        }
+        ChunkData::Dense(cells) => {
+            sweep(&DenseCells(cells), false, neighbours, solid, base, out);
+        }
     }
-    // Invariant: every voxel above `max_y` is air, so no direction can expose a
-    // face there — Y-spanning loops stop at `y_count` instead of CHUNK_HEIGHT.
-    let y_count = max_y as usize + 1;
-    let voxels = chunk.voxels();
-    let base = [chunk.cx * CHUNK_WIDTH as i32, 0, chunk.cz * CHUNK_DEPTH as i32];
+}
 
+/// The greedy sweep over all six directions. `edge_only` restricts each
+/// direction to its border slice (the uniform-solid fast path); the emitted
+/// geometry is identical to a full sweep because a uniform chunk's interior
+/// slices can never contain an exposed face.
+fn sweep<C: CellRead, N: NeighbourRead>(
+    cells: &C,
+    edge_only: bool,
+    neighbours: &N,
+    solid: &[bool],
+    base: [i32; 3],
+    out: &mut MeshData,
+) {
     let mut mask: [BlockId; MASK_CAP] = [AIR; MASK_CAP];
 
     for dir in &DIRS {
-        // Slice geometry: N is the normal axis; the mask covers the U x V plane.
-        let (n_count, u_count, v_count) = match dir.n_axis {
-            0 => (CHUNK_WIDTH, CHUNK_DEPTH, y_count),
-            1 => (y_count, CHUNK_WIDTH, CHUNK_DEPTH),
-            _ => (CHUNK_DEPTH, CHUNK_WIDTH, y_count),
-        };
         let stride = AXIS_STRIDE[dir.n_axis] * dir.step as isize;
-        // The slice whose neighbour test would step outside this chunk's array;
-        // there the neighbour is read across the border via `NeighbourRead`
-        // (X/Z) or is the world floor/ceiling (Y), which always reads as air.
-        let edge_n = if dir.step > 0 { AXIS_MAX[dir.n_axis] - 1 } else { 0 };
-        let edge_side = match (dir.n_axis, dir.step > 0) {
-            (0, true) => Some(Side::PosX),
-            (0, false) => Some(Side::NegX),
-            (2, true) => Some(Side::PosZ),
-            (2, false) => Some(Side::NegZ),
-            _ => None,
-        };
+        // The slice whose neighbour test would step outside this chunk's
+        // array; there the neighbour is read across the border.
+        let edge_n = if dir.step > 0 { CHUNK_SIZE - 1 } else { 0 };
 
-        for n in 0..n_count {
+        for n in 0..CHUNK_SIZE {
             let at_edge = n == edge_n;
+            if edge_only && !at_edge {
+                continue;
+            }
 
             // Phase 1: mask of exposed faces in this slice, keyed by BlockId.
             let mut any = false;
-            for v in 0..v_count {
-                for u in 0..u_count {
+            for v in 0..CHUNK_SIZE {
+                for u in 0..CHUNK_SIZE {
                     let mut c = [0usize; 3];
                     c[dir.n_axis] = n;
                     c[dir.u_axis] = u;
                     c[dir.v_axis] = v;
                     let idx = Chunk::index(c[0], c[1], c[2]);
-                    let id = voxels[idx];
+                    let id = cells.get(idx);
                     let mut cell = AIR;
                     if solid[id.0 as usize] {
                         let covered = if at_edge {
-                            match edge_side {
-                                // For X/Z sides the plane coords are V (always
-                                // Y here) and U (the other horizontal axis),
-                                // matching `NeighbourRead::across`.
-                                Some(side) => {
-                                    let id =
-                                        neighbours.across(side, c[dir.v_axis], c[dir.u_axis]);
-                                    solid[id.0 as usize]
-                                }
-                                None => false, // beyond the world: air
-                            }
+                            let across = neighbours.across(dir.side, u, v);
+                            solid[across.0 as usize]
                         } else {
-                            solid[voxels[(idx as isize + stride) as usize].0 as usize]
+                            solid[cells.get((idx as isize + stride) as usize).0 as usize]
                         };
                         if !covered {
                             cell = id;
                         }
                     }
-                    mask[u + v * u_count] = cell;
+                    mask[u + v * CHUNK_SIZE] = cell;
                     any |= cell != AIR;
                 }
             }
@@ -317,19 +355,19 @@ pub fn build_chunk_mesh_with<N: NeighbourRead>(
 
             // Phase 2: greedy rectangles — grow along U while the run matches,
             // then along V while the whole row matches, clear, emit.
-            for v0 in 0..v_count {
-                for u0 in 0..u_count {
-                    let id = mask[u0 + v0 * u_count];
+            for v0 in 0..CHUNK_SIZE {
+                for u0 in 0..CHUNK_SIZE {
+                    let id = mask[u0 + v0 * CHUNK_SIZE];
                     if id == AIR {
                         continue;
                     }
                     let mut w = 1;
-                    while u0 + w < u_count && mask[u0 + w + v0 * u_count] == id {
+                    while u0 + w < CHUNK_SIZE && mask[u0 + w + v0 * CHUNK_SIZE] == id {
                         w += 1;
                     }
                     let mut h = 1;
-                    'grow: while v0 + h < v_count {
-                        let row = (v0 + h) * u_count;
+                    'grow: while v0 + h < CHUNK_SIZE {
+                        let row = (v0 + h) * CHUNK_SIZE;
                         for k in 0..w {
                             if mask[u0 + k + row] != id {
                                 break 'grow;
@@ -338,7 +376,7 @@ pub fn build_chunk_mesh_with<N: NeighbourRead>(
                         h += 1;
                     }
                     for dv in 0..h {
-                        let row = (v0 + dv) * u_count;
+                        let row = (v0 + dv) * CHUNK_SIZE;
                         mask[u0 + row..u0 + w + row].fill(AIR);
                     }
                     emit_rect(out, dir, base, n, u0, v0, w, h, id);
@@ -415,6 +453,23 @@ mod tests {
         }
     }
 
+    /// Everything-solid generator: chunks anywhere come out uniform STONE.
+    struct SolidGen;
+    impl TerrainGenerator for SolidGen {
+        fn height(&self, _wx: i32, _wz: i32) -> i32 {
+            i32::MAX
+        }
+        fn surface(&self) -> BlockId {
+            STONE
+        }
+        fn subsoil(&self) -> BlockId {
+            STONE
+        }
+        fn deep(&self) -> BlockId {
+            STONE
+        }
+    }
+
     /// Two distinct solid test blocks (distinct ids = distinct texture layers).
     const STONE: BlockId = BlockId(1);
     const DIRT: BlockId = BlockId(2);
@@ -424,7 +479,7 @@ mod tests {
     }
 
     fn empty_chunk() -> Chunk {
-        Chunk::new(0, 0, &EmptyGen)
+        Chunk::new(0, 0, 0, &EmptyGen)
     }
 
     const NO_NEIGHBOURS: Neighbours = Neighbours {
@@ -432,6 +487,8 @@ mod tests {
         pos_x: None,
         neg_z: None,
         pos_z: None,
+        neg_y: None,
+        pos_y: None,
     };
 
     fn build(chunk: &Chunk) -> MeshData {
@@ -442,21 +499,20 @@ mod tests {
     }
 
     /// Reference: exposed-face count from a plain per-voxel culled sweep over
-    /// the full chunk height, using the same solidity rules as the mesher.
+    /// the whole cube, using the same solidity rules as the mesher.
     /// Greedy merging must preserve total face area exactly.
     fn culled_face_area(chunk: &Chunk, solid: &[bool]) -> usize {
         let solid_at = |x: i32, y: i32, z: i32| -> bool {
-            if x < 0 || x >= CHUNK_WIDTH as i32 || y < 0 || y >= CHUNK_HEIGHT as i32 || z < 0
-                || z >= CHUNK_DEPTH as i32
-            {
+            let range = 0..CHUNK_SIZE as i32;
+            if !range.contains(&x) || !range.contains(&y) || !range.contains(&z) {
                 return false; // no neighbours in these tests: outside is air
             }
             solid[chunk.get_local(x as usize, y as usize, z as usize).0 as usize]
         };
         let mut area = 0;
-        for y in 0..CHUNK_HEIGHT as i32 {
-            for z in 0..CHUNK_DEPTH as i32 {
-                for x in 0..CHUNK_WIDTH as i32 {
+        for y in 0..CHUNK_SIZE as i32 {
+            for z in 0..CHUNK_SIZE as i32 {
+                for x in 0..CHUNK_SIZE as i32 {
                     if !solid_at(x, y, z) {
                         continue;
                     }
@@ -546,8 +602,8 @@ mod tests {
     #[test]
     fn checkerboard_never_merges() {
         let mut chunk = empty_chunk();
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_DEPTH {
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
                 if (x + z) % 2 == 0 {
                     chunk.set_local(x, 0, z, STONE);
                 }
@@ -594,45 +650,55 @@ mod tests {
     }
 
     #[test]
-    fn height_clamp_stops_at_max_solid_y_and_changes_nothing() {
-        let build_terraced = |chunk: &mut Chunk| {
-            // Terraced terrain topping out at y = 16 + 3 = 19.
-            for x in 0..4 {
-                for z in 0..4 {
-                    for y in 0..=(16 + x) {
-                        chunk.set_local(x, y, z, STONE);
-                    }
-                }
-            }
-        };
-        let mut clamped = empty_chunk();
-        build_terraced(&mut clamped);
-        assert_eq!(clamped.max_solid_y(), 19);
-        let data = build(&clamped);
+    fn uniform_air_meshes_empty() {
+        let chunk = empty_chunk();
+        assert_eq!(chunk.uniform(), Some(AIR), "generated sky chunk is uniform");
+        let data = build(&chunk);
+        assert!(data.vertices.is_empty() && data.indices.is_empty());
+    }
 
-        // Nothing above the top face plane of the highest block.
-        let top = clamped.max_solid_y() as f32 + 1.0;
-        assert!(
-            data.vertices.iter().all(|v| v.pos[1] <= top),
-            "no geometry above max_solid_y + 1"
-        );
+    #[test]
+    fn uniform_solid_fast_path_matches_a_dense_fill() {
+        // The edge-slice-only sweep is purely a shortcut: a uniform stone cube
+        // and a dense chunk holding identical cells must mesh byte-identically.
+        let uniform = Chunk::new(0, 0, 0, &SolidGen);
+        assert_eq!(uniform.uniform(), Some(STONE));
 
-        // A stale-high max_solid_y (place a block at the ceiling, remove it)
-        // must produce byte-identical output — the clamp is purely a shortcut.
-        let mut stale = empty_chunk();
-        build_terraced(&mut stale);
-        stale.set_local(0, CHUNK_HEIGHT - 1, 0, STONE);
-        stale.set_local(0, CHUNK_HEIGHT - 1, 0, AIR);
-        assert_eq!(stale.max_solid_y(), CHUNK_HEIGHT as i32 - 1, "stale-high kept");
-        let unclamped = build(&stale);
+        let mut dense = Chunk::new(0, 0, 0, &SolidGen);
+        dense.set_local(0, 0, 0, DIRT); // promote...
+        dense.set_local(0, 0, 0, STONE); // ...and restore the same cells
+        assert!(dense.uniform().is_none(), "promotion kept dense storage");
 
-        assert_eq!(data.indices, unclamped.indices);
-        assert_eq!(data.vertices.len(), unclamped.vertices.len());
-        for (a, b) in data.vertices.iter().zip(unclamped.vertices.iter()) {
-            assert_eq!(a.pos, b.pos);
-            assert_eq!(a.uv, b.uv);
-            assert_eq!(a.color, b.color);
+        let (a, b) = (build(&uniform), build(&dense));
+        assert_eq!(total_area(&a), (6 * CHUNK_SIZE * CHUNK_SIZE) as f32, "6 full faces");
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.vertices.len(), b.vertices.len());
+        for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+            assert_eq!((va.pos, va.uv, va.color), (vb.pos, vb.uv, vb.color));
         }
+    }
+
+    #[test]
+    fn uniform_solid_boxed_in_by_solid_neighbours_meshes_empty() {
+        let chunk = Chunk::new(0, 0, 0, &SolidGen);
+        let nx = Chunk::new(-1, 0, 0, &SolidGen);
+        let px = Chunk::new(1, 0, 0, &SolidGen);
+        let nz = Chunk::new(0, 0, -1, &SolidGen);
+        let pz = Chunk::new(0, 0, 1, &SolidGen);
+        let ny = Chunk::new(0, -1, 0, &SolidGen);
+        let py = Chunk::new(0, 1, 0, &SolidGen);
+        let neighbours = Neighbours {
+            neg_x: Some(&nx),
+            pos_x: Some(&px),
+            neg_z: Some(&nz),
+            pos_z: Some(&pz),
+            neg_y: Some(&ny),
+            pos_y: Some(&py),
+        };
+        let solid = solid_table();
+        let mut out = MeshData::default();
+        build_chunk_mesh(&chunk, &neighbours, &solid, &mut out);
+        assert!(out.vertices.is_empty(), "deep rock boxed in by rock draws nothing");
     }
 
     #[test]
@@ -666,8 +732,8 @@ mod tests {
         // neighbour's -X border: the shared face must vanish only when the
         // neighbour is supplied.
         let mut chunk = empty_chunk();
-        chunk.set_local(CHUNK_WIDTH - 1, 0, 0, STONE);
-        let mut other = Chunk::new(1, 0, &EmptyGen);
+        chunk.set_local(CHUNK_SIZE - 1, 0, 0, STONE);
+        let mut other = Chunk::new(1, 0, 0, &EmptyGen);
         other.set_local(0, 0, 0, STONE);
 
         let solid = solid_table();
@@ -679,5 +745,25 @@ mod tests {
 
         assert_eq!(total_area(&alone), 6.0, "isolated cube shows all six faces");
         assert_eq!(total_area(&culled), 5.0, "the face against the neighbour is culled");
+    }
+
+    #[test]
+    fn vertical_border_faces_cull_against_the_chunk_above() {
+        // Cube chunks join in Y too: a block on the top border, hidden by a
+        // block at the bottom of the chunk above.
+        let mut chunk = empty_chunk();
+        chunk.set_local(4, CHUNK_SIZE - 1, 4, STONE);
+        let mut above = Chunk::new(0, 1, 0, &EmptyGen);
+        above.set_local(4, 0, 4, STONE);
+
+        let solid = solid_table();
+        let mut alone = MeshData::default();
+        build_chunk_mesh(&chunk, &NO_NEIGHBOURS, &solid, &mut alone);
+        let with_above = Neighbours { pos_y: Some(&above), ..NO_NEIGHBOURS };
+        let mut culled = MeshData::default();
+        build_chunk_mesh(&chunk, &with_above, &solid, &mut culled);
+
+        assert_eq!(total_area(&alone), 6.0);
+        assert_eq!(total_area(&culled), 5.0, "the top face is culled by the chunk above");
     }
 }

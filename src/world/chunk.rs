@@ -1,78 +1,98 @@
-//! chunk.rs stores a fixed-size column of voxels. It owns no generation logic of
+//! chunk.rs stores one 16x16x16 cube of voxels. It owns no generation logic of
 //! its own — it asks a [`TerrainGenerator`] to fill itself.
 //!
 //! A cell is a [`BlockId`] — a compact index into the world's
-//! [`BlockRegistry`](crate::block::BlockRegistry), not a block itself — so the
-//! storage stays 2 bytes per voxel while the blocks they name can be arbitrarily
-//! rich.
-use crate::block::registry::{AIR, BlockId};
+//! [`BlockRegistry`](crate::block::BlockRegistry), not a block itself. Storage
+//! is the memory backbone of the infinite-Y world: most chunks are all air or
+//! all stone, so [`ChunkData::Uniform`] stores those as one id (~a dozen bytes)
+//! instead of a 4 KiB array. Dense cells are `u8` — safe because the palette is
+//! hard-capped at 256 block types ([`BlockRegistry::MAX_BLOCK_TYPES`]).
+use crate::block::registry::BlockId;
 use crate::world::generation::TerrainGenerator;
 
-pub const CHUNK_WIDTH: usize = 16; // along world X
-pub const CHUNK_HEIGHT: usize = 64; // along world Y
-pub const CHUNK_DEPTH: usize = 16; // along world Z
+/// Chunk edge length along every world axis (chunks are cubes).
+pub const CHUNK_SIZE: usize = 16;
+/// Cells per chunk.
+pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
-/// A region of the world holding its own flat array of voxels. `Clone` copies
-/// the ~32 KiB voxel array — used to snapshot a chunk for a worker-thread mesh
-/// job (see [`pipeline`](super::pipeline)), never on a per-frame hot path.
+/// A chunk's voxel storage: one id for a uniform chunk, or a dense cube of
+/// `u8` cells (block ids — the palette never exceeds 256). `Uniform` is what
+/// makes an infinite-Y world affordable: sky and deep rock cost no array.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ChunkData {
+    /// Every cell is this block.
+    Uniform(BlockId),
+    /// One `u8` block id per cell, flat-indexed by [`Chunk::index`].
+    Dense(Box<[u8; CHUNK_VOLUME]>),
+}
+
+/// A 16-cube region of the world. `Clone` copies at most the 4 KiB dense array
+/// (uniform chunks clone for free) — used to snapshot a chunk for a
+/// worker-thread mesh job (see [`pipeline`](super::pipeline)), never on a
+/// per-frame hot path.
 #[derive(Clone)]
 pub struct Chunk {
-    /// Chunk coordinate on the X axis (world X = cx * CHUNK_WIDTH + local x).
+    /// Chunk coordinate on the X axis (world X = cx * CHUNK_SIZE + local x).
     pub cx: i32,
-    /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_DEPTH + local z).
+    /// Chunk coordinate on the Y axis (world Y = cy * CHUNK_SIZE + local y).
+    pub cy: i32,
+    /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_SIZE + local z).
     pub cz: i32,
-    voxels: Vec<BlockId>,
-    /// Highest Y that holds a non-air voxel (`-1` if the chunk is all air), so
-    /// the mesher can stop iterating where the terrain ends instead of sweeping
-    /// to the world ceiling. Maintained on every write; removing the topmost
-    /// block leaves it stale-high on purpose — that only costs a few empty
-    /// iterations, whereas recomputing the true maximum would cost a scan.
-    max_solid_y: i32,
+    data: ChunkData,
 }
 
 impl Chunk {
     /// Create a chunk at the given chunk coordinate and fill it using `generator`.
-    pub fn new<G: TerrainGenerator>(cx: i32, cz: i32, generator: &G) -> Self {
-        let mut chunk = Self {
+    pub fn new<G: TerrainGenerator>(cx: i32, cy: i32, cz: i32, generator: &G) -> Self {
+        Self {
             cx,
+            cy,
             cz,
-            voxels: vec![AIR; CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH],
-            max_solid_y: -1,
-        };
-        chunk.generate(generator);
-        chunk
+            data: generator.generate(cx, cy, cz),
+        }
     }
 
-    /// Flat array index of a chunk-local coordinate.
+    /// Flat array index of a chunk-local coordinate: `x + z*16 + y*256`.
     pub const fn index(x: usize, y: usize, z: usize) -> usize {
-        x + z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH
+        x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE
     }
 
     /// The chunk-local coordinate a flat index maps back to (inverse of [`index`]).
     pub const fn local_of(index: usize) -> (usize, usize, usize) {
-        let x = index % CHUNK_WIDTH;
-        let z = (index / CHUNK_WIDTH) % CHUNK_DEPTH;
-        let y = index / (CHUNK_WIDTH * CHUNK_DEPTH);
+        let x = index % CHUNK_SIZE;
+        let z = (index / CHUNK_SIZE) % CHUNK_SIZE;
+        let y = index / (CHUNK_SIZE * CHUNK_SIZE);
         (x, y, z)
+    }
+
+    /// The raw storage, for the mesher's uniform fast paths and flat reads.
+    #[inline]
+    pub fn data(&self) -> &ChunkData {
+        &self.data
+    }
+
+    /// The single block filling this chunk, if it is uniform.
+    #[inline]
+    pub fn uniform(&self) -> Option<BlockId> {
+        match self.data {
+            ChunkData::Uniform(id) => Some(id),
+            ChunkData::Dense(_) => None,
+        }
+    }
+
+    /// Read a voxel by flat index.
+    #[inline]
+    pub fn get_index(&self, index: usize) -> BlockId {
+        match &self.data {
+            ChunkData::Uniform(id) => *id,
+            ChunkData::Dense(cells) => BlockId(cells[index] as u16),
+        }
     }
 
     /// Read a voxel using chunk-local coordinates.
     #[inline]
     pub fn get_local(&self, x: usize, y: usize, z: usize) -> BlockId {
-        self.voxels[Self::index(x, y, z)]
-    }
-
-    /// The whole voxel array, for the mesher's direct flat-index reads.
-    #[inline]
-    pub fn voxels(&self) -> &[BlockId] {
-        &self.voxels
-    }
-
-    /// Highest Y holding a non-air voxel, or `-1` for an all-air chunk. May read
-    /// stale-high after the topmost block was removed (see the field docs).
-    #[inline]
-    pub fn max_solid_y(&self) -> i32 {
-        self.max_solid_y
+        self.get_index(Self::index(x, y, z))
     }
 
     /// Write a voxel using chunk-local coordinates.
@@ -80,29 +100,99 @@ impl Chunk {
         self.set_index(Self::index(x, y, z), v);
     }
 
-    /// Overwrite a voxel by flat index — used to replay saved/broken-block edits.
+    /// Overwrite a voxel by flat index — used to replay saved/broken-block
+    /// edits. The first write that differs from a uniform chunk's block
+    /// promotes it to dense storage; a matching write stays uniform for free.
     pub fn set_index(&mut self, index: usize, v: BlockId) {
-        self.voxels[index] = v;
-        if v != AIR {
-            let y = (index / (CHUNK_WIDTH * CHUNK_DEPTH)) as i32;
-            if y > self.max_solid_y {
-                self.max_solid_y = y;
+        debug_assert!(v.0 < 256, "dense cells are u8: palette must stay under 256");
+        match &mut self.data {
+            ChunkData::Uniform(id) => {
+                if *id == v {
+                    return;
+                }
+                let mut cells = Box::new([id.0 as u8; CHUNK_VOLUME]);
+                cells[index] = v.0 as u8;
+                self.data = ChunkData::Dense(cells);
             }
+            ChunkData::Dense(cells) => cells[index] = v.0 as u8,
         }
     }
+}
 
-    fn generate<G: TerrainGenerator>(&mut self, generator: &G) {
-        for lx in 0..CHUNK_WIDTH {
-            for lz in 0..CHUNK_DEPTH {
-                let wx = self.cx * CHUNK_WIDTH as i32 + lx as i32;
-                let wz = self.cz * CHUNK_DEPTH as i32 + lz as i32;
-                let height = generator.height(wx, wz);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::registry::{AIR, BlockRegistry};
+    use crate::world::generation::SineHills;
 
-                for ly in 0..CHUNK_HEIGHT {
-                    let v = generator.block_at(wx, ly as i32, wz, height);
-                    self.set_local(lx, ly, lz, v);
-                }
-            }
+    /// The generator plus the registry-resolved ids its terrain is made of.
+    fn hills(seed: i64) -> (SineHills, BlockId, BlockId) {
+        let registry = BlockRegistry::with_builtins();
+        let stone = registry.id_by_name("Stone").unwrap();
+        let dirt = registry.id_by_name("Dirt").unwrap();
+        (SineHills::new(&registry, 20.0, seed), stone, dirt)
+    }
+
+    #[test]
+    fn index_and_local_of_are_inverses() {
+        for index in [0, 1, 255, 256, 4095] {
+            let (x, y, z) = Chunk::local_of(index);
+            assert_eq!(Chunk::index(x, y, z), index);
         }
+        assert_eq!(Chunk::index(1, 2, 3), 1 + 3 * 16 + 2 * 256, "x + z*16 + y*256");
+    }
+
+    #[test]
+    fn get_set_roundtrip_on_dense() {
+        let (g, _, dirt) = hills(7);
+        let mut chunk = Chunk::new(0, 0, 0, &g); // ground chunk: dense
+        assert!(chunk.uniform().is_none(), "surface chunks hold mixed cells");
+        chunk.set_local(3, 4, 5, dirt);
+        assert_eq!(chunk.get_local(3, 4, 5), dirt);
+        chunk.set_local(3, 4, 5, AIR);
+        assert_eq!(chunk.get_local(3, 4, 5), AIR);
+    }
+
+    #[test]
+    fn uniform_promotes_to_dense_on_first_differing_write() {
+        let (g, stone, _) = hills(7);
+        let mut chunk = Chunk::new(0, -10, 0, &g); // deep rock: uniform stone
+        assert_eq!(chunk.uniform(), Some(stone));
+
+        // Writing the same block keeps the cheap representation.
+        chunk.set_local(0, 0, 0, stone);
+        assert_eq!(chunk.uniform(), Some(stone), "matching write stays uniform");
+
+        // The first differing write promotes, preserving every other cell.
+        chunk.set_local(8, 8, 8, AIR);
+        assert!(chunk.uniform().is_none(), "differing write goes dense");
+        assert_eq!(chunk.get_local(8, 8, 8), AIR);
+        assert_eq!(chunk.get_local(0, 0, 0), stone);
+        assert_eq!(chunk.get_local(15, 15, 15), stone);
+    }
+
+    #[test]
+    fn generated_sky_chunk_is_uniform_air() {
+        let (g, _, _) = hills(7);
+        // Above the terrain (h <= 31) and below the island band (y >= 64).
+        let sky = Chunk::new(0, 3, 0, &g);
+        assert_eq!(sky.uniform(), Some(AIR), "sky chunk stores one id, not 4 KiB");
+        // The uniform representation really is tiny: the enum is pointer-sized
+        // plus a tag, nowhere near CHUNK_VOLUME bytes.
+        assert!(std::mem::size_of::<ChunkData>() <= 16);
+    }
+
+    #[test]
+    fn edit_replay_on_uniform_chunk_promotes_correctly() {
+        let (g, stone, dirt) = hills(7);
+        let mut chunk = Chunk::new(2, 3, 2, &g); // uniform air sky chunk
+        assert_eq!(chunk.uniform(), Some(AIR));
+        // Replaying an edit overlay (flat index -> id) like the world does.
+        for (index, id) in [(Chunk::index(1, 2, 3), stone), (Chunk::index(0, 0, 0), dirt)] {
+            chunk.set_index(index, id);
+        }
+        assert_eq!(chunk.get_local(1, 2, 3), stone);
+        assert_eq!(chunk.get_local(0, 0, 0), dirt);
+        assert_eq!(chunk.get_local(5, 5, 5), AIR, "untouched cells keep the old fill");
     }
 }

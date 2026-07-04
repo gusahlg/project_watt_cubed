@@ -112,6 +112,7 @@ impl App {
             target_fps: app.settings.max_fps,
             vsync: app.settings.vsync,
             msaa: app.settings.msaa,
+            render_scale: app.settings.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
         };

@@ -188,11 +188,6 @@ impl CraftingMod {
             return;
         };
         let (x, y, z) = hit.previous;
-        // block_at reads out-of-range cells as air but set_block refuses to
-        // write them — a placement there would silently eat the block.
-        if !(0..crate::world::chunk::CHUNK_HEIGHT as i32).contains(&y) {
-            return;
-        }
         if ctx.world.block_at(x, y, z) != AIR || cell_aabb(x, y, z).intersects(&ctx.player.aabb()) {
             return;
         }

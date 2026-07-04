@@ -1,13 +1,18 @@
-//! The world owns the block palette and an *infinite*, streamed field of chunks:
-//! it keeps the chunks near the player loaded (generated and meshed), discards
-//! distant ones, and answers what block is at a position, whether a box collides
-//! with terrain, and how to draw the visible surface.
+//! The world owns the block palette and an *infinite*, streamed field of
+//! chunks — infinite along all three axes: 16-cube chunks stack upward through
+//! the flying-island band and downward through bottomless stone. It keeps the
+//! chunks near the player loaded (generated and meshed), discards distant
+//! ones, and answers what block is at a position, whether a box collides with
+//! terrain, and how to draw the visible surface.
 //!
 //! Two design choices serve the "optimisation ahead of readability" mandate:
 //! chunks live in a `HashMap` behind a tiny multiplicative hasher (the default
 //! SipHash is far too slow for a per-frame collision hot path), and player edits
 //! live in a compact overlay so a chunk can be regenerated identically after it
-//! streams out and back in.
+//! streams out and back in. The third is inherited from the storage layer:
+//! most of the 3D streaming volume is uniform air or stone
+//! ([`ChunkData::Uniform`](chunk::ChunkData)), which costs no voxel array and
+//! — for air — no mesh job at all.
 //!
 //! Heavy chunk work is off the render thread: generation and fresh meshing run
 //! on a small worker pool (see [`pipeline`]), while *edited* chunks keep a
@@ -26,22 +31,25 @@ use voxel_engine::{Engine, Frame3D, MeshData, MeshHandle, Vec3};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 use crate::math::Aabb;
 use crate::render::Render;
-use chunk::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
+use chunk::{CHUNK_SIZE, Chunk};
 use generation::{SineHills, TerrainGenerator};
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
 /// The range a runtime render-distance change is clamped to.
 const VIEW_RADIUS_RANGE: std::ops::RangeInclusive<i32> = 3..=10;
-/// One extra ring of *data* (not meshed) so edge chunks can cull faces against
-/// their neighbours without re-meshing when those neighbours later load.
+/// One extra shell of *data* (not meshed) in all three axes so edge chunks can
+/// cull faces against their neighbours without re-meshing when those
+/// neighbours later load.
 const DATA_MARGIN: i32 = 1;
-/// How far past the view radius chunks survive before they are freed, so
-/// walking back and forth across the boundary doesn't thrash.
+/// How far past the view radius chunks survive horizontally before they are
+/// freed, so walking back and forth across the boundary doesn't thrash.
 const UNLOAD_MARGIN: i32 = 3;
+/// The vertical unload hysteresis (vertical radii are smaller, so is this).
+const UNLOAD_MARGIN_V: i32 = 2;
 /// How many fresh-chunk *mesh jobs* may be handed to the worker pool per
-/// stream. Bounds the enqueue-time snapshot cost (~33 KiB copy each) and keeps
-/// the queue from flooding when a world is entered.
+/// stream. Bounds the enqueue-time snapshot cost (a few KiB copy each) and
+/// keeps the queue from flooding when a world is entered.
 const MESH_ENQUEUE_BUDGET: usize = 8;
 /// How many finished worker meshes may be uploaded to the GPU per stream —
 /// the upload is the only part of the async path the render thread still pays.
@@ -53,8 +61,12 @@ const DIRTY_BUDGET: usize = 8;
 /// The seed a default (`generate`) world uses when none is chosen.
 pub const DEFAULT_SEED: i64 = 1;
 
-/// A chunk coordinate: `(cx, cz)` where world X = `cx * CHUNK_WIDTH + local x`.
-type Coord = (i32, i32);
+/// A chunk coordinate: `(cx, cy, cz)` where world X = `cx * CHUNK_SIZE +
+/// local x`, and likewise for Y and Z.
+type Coord = (i32, i32, i32);
+
+/// The "no centre yet" sentinel that forces the next stream to run a full pass.
+const NO_CENTER: Coord = (i32::MIN, i32::MIN, i32::MIN);
 
 /// Fast identity-ish hasher for the small integer keys the chunk/edit maps use.
 /// The keys are already well-distributed grid coordinates, so a couple of
@@ -85,7 +97,8 @@ type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 /// A loaded chunk: its voxel data plus the GPU mesh built from it. `meshed`
 /// distinguishes a chunk that only has data (a margin chunk, or one awaiting its
 /// turn in the mesh budget) from one ready to draw; a meshed all-air chunk has
-/// `meshed == true` with `mesh == None`.
+/// `meshed == true` with `mesh == None` (uniform-air chunks are *born* that
+/// way, skipping the worker round-trip entirely).
 struct Loaded {
     chunk: Chunk,
     mesh: Option<MeshHandle>,
@@ -107,7 +120,8 @@ pub struct World {
     generator: SineHills,
     chunks: FastMap<Coord, Loaded>,
     /// Player edits, grouped by chunk so regenerating a chunk can replay just its
-    /// own. Inner key is the flat voxel index within the chunk.
+    /// own. Inner key is the flat voxel index within the chunk. (Saves store
+    /// absolute coordinates; only this in-memory keying is per-chunk.)
     edits: FastMap<Coord, FastMap<usize, BlockId>>,
     /// Chunks whose mesh is stale (an edit changed them) and must rebuild,
     /// nearest first, ahead of any fresh meshing.
@@ -116,6 +130,8 @@ pub struct World {
     /// crossing a chunk boundary. Invalidated to force a full pass.
     center: Coord,
     /// Runtime render distance in chunk rings (clamped to [`VIEW_RADIUS_RANGE`]).
+    /// The vertical streaming radius is derived from it — see
+    /// [`vertical_radius`](Self::vertical_radius).
     view_radius: i32,
     /// Whether a fresh-mesh scan might still find unmeshed chunks. Cleared when
     /// a scan finishes with nothing left, set again by anything that could
@@ -170,7 +186,7 @@ impl World {
             chunks: FastMap::default(),
             edits: FastMap::default(),
             dirty: FastSet::default(),
-            center: (i32::MIN, i32::MIN),
+            center: NO_CENTER,
             view_radius: DEFAULT_VIEW_RADIUS,
             pending_fresh: true,
             radius_shrunk: false,
@@ -182,7 +198,10 @@ impl World {
             done_scratch: Vec::new(),
             textures_built: 0,
         };
-        world.ensure_region_data((0, 0));
+        // Centre the pre-generated box on the origin's surface chunk, the
+        // spawn point's own layer.
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        world.ensure_region_data((0, cy, 0));
         world
     }
 
@@ -217,6 +236,13 @@ impl World {
         self.view_radius
     }
 
+    /// Vertical streaming radius in chunk layers: half the horizontal view
+    /// radius, clamped to 2..=5 — interesting terrain is mostly lateral, so
+    /// the streamed volume stays a flat box rather than a cube.
+    fn vertical_radius(&self) -> i32 {
+        (self.view_radius / 2).clamp(2, 5)
+    }
+
     /// Change the render distance (clamped to 3..=10). Marks streaming dirty so
     /// the next [`stream`](Self::stream) unloads past the new radius or resumes
     /// meshing out to it.
@@ -227,7 +253,7 @@ impl World {
             self.view_radius = radius;
             // Invalidate the centre so the next stream reruns the full
             // unload/ensure/scan pass even though the player hasn't moved.
-            self.center = (i32::MIN, i32::MIN);
+            self.center = NO_CENTER;
             self.pending_fresh = true;
             // On shrink, meshes between the new radius and the (also shrunk)
             // unload ring would otherwise stay drawn until the player moves;
@@ -252,9 +278,11 @@ impl World {
         // this frame, so vertices never reference a layer that isn't there.
         // Covers the initial upload too (0 tracked -> N on the first stream).
         self.refresh_textures(eng);
+        let s = CHUNK_SIZE as i32;
         let center_chunk = (
-            (center.x.floor() as i32).div_euclid(CHUNK_WIDTH as i32),
-            (center.z.floor() as i32).div_euclid(CHUNK_DEPTH as i32),
+            (center.x.floor() as i32).div_euclid(s),
+            (center.y.floor() as i32).div_euclid(s),
+            (center.z.floor() as i32).div_euclid(s),
         );
         // Adopt the real centre BEFORE draining: after a radius change or
         // world reset the stored centre is a far-away sentinel, and draining
@@ -274,11 +302,13 @@ impl World {
             self.radius_shrunk = false;
             // Meshes between the new view radius and the unload ring survive
             // unload_far's hysteresis; free them now (data stays loaded).
-            for (&(cx, cz), loaded) in self.chunks.iter_mut() {
-                let ring = (cx - center_chunk.0).abs().max((cz - center_chunk.1).abs());
-                if ring > self.view_radius && loaded.meshed {
-                    loaded.meshed = false;
+            // Chunks that are `meshed` with no handle (all-air) stay as they
+            // are — there is nothing to free and nothing drawn.
+            let (rh, rv) = (self.view_radius as i64, self.vertical_radius() as i64);
+            for (&coord, loaded) in self.chunks.iter_mut() {
+                if Self::ring(coord, center_chunk) > rh || Self::updown(coord, center_chunk) > rv {
                     if let Some(handle) = loaded.mesh.take() {
+                        loaded.meshed = false;
                         eng.free_mesh(handle);
                     }
                 }
@@ -316,7 +346,7 @@ impl World {
         // coord gets generated or meshed twice, never wrongly.
         self.in_flight.clear();
         self.upload_queue.clear();
-        self.center = (i32::MIN, i32::MIN);
+        self.center = NO_CENTER;
         self.pending_fresh = true;
     }
 
@@ -380,32 +410,23 @@ impl World {
     }
 
     /// A worker finished generating `coord`. Discard it if the world moved on
-    /// (outside the data radius) or the coord already has data (the centre
-    /// safety floor generated it synchronously); otherwise replay the edit
-    /// overlay once more — idempotent over the worker's own replay, and it
-    /// catches edits that arrived while the job flew — and insert it as fresh
-    /// mesh work.
-    fn accept_chunk(&mut self, coord: Coord, mut chunk: Chunk) {
-        if Self::ring(coord, self.center) > (self.view_radius + DATA_MARGIN) as i64
+    /// (outside the data box) or the coord already has data (the centre
+    /// safety floor generated it synchronously); otherwise insert it via
+    /// [`store_chunk`](Self::store_chunk), which replays the edit overlay once
+    /// more — idempotent over the worker's own replay, and it catches edits
+    /// that arrived while the job flew.
+    fn accept_chunk(&mut self, coord: Coord, chunk: Chunk) {
+        let (rh, rv) = (
+            (self.view_radius + DATA_MARGIN) as i64,
+            (self.vertical_radius() + DATA_MARGIN) as i64,
+        );
+        if Self::ring(coord, self.center) > rh
+            || Self::updown(coord, self.center) > rv
             || self.chunks.contains_key(&coord)
         {
             return;
         }
-        if let Some(edits) = self.edits.get(&coord) {
-            for (&index, &id) in edits {
-                chunk.set_index(index, id);
-            }
-        }
-        self.chunks.insert(
-            coord,
-            Loaded {
-                chunk,
-                mesh: None,
-                meshed: false,
-                rev: 0,
-            },
-        );
-        self.pending_fresh = true;
+        self.store_chunk(coord, chunk);
     }
 
     /// A worker finished meshing `coord` at `rev`. Queue it for a budgeted
@@ -425,36 +446,53 @@ impl World {
     /// lands *and* again at upload time — it can go stale in between.
     fn mesh_result_applies(&self, coord: Coord, rev: u32) -> bool {
         Self::ring(coord, self.center) <= self.view_radius as i64
+            && Self::updown(coord, self.center) <= self.vertical_radius() as i64
             && self.chunks.get(&coord).is_some_and(|l| l.rev == rev)
     }
 
-    /// Chebyshev ring distance between two chunk coords, widened to i64 so the
-    /// invalidated-centre sentinel (`i32::MIN`) can never overflow a subtract.
+    /// Horizontal Chebyshev ring distance between two chunk coords, widened to
+    /// i64 so the invalidated-centre sentinel (`i32::MIN`) can never overflow
+    /// a subtract.
     fn ring(a: Coord, b: Coord) -> i64 {
-        (a.0 as i64 - b.0 as i64).abs().max((a.1 as i64 - b.1 as i64).abs())
+        (a.0 as i64 - b.0 as i64).abs().max((a.2 as i64 - b.2 as i64).abs())
     }
 
-    /// Queue generation jobs for every missing chunk in the data radius,
-    /// nearest first — enqueue order is the pool's priority order. Safety
-    /// floor: the centre chunk (under the player) generates synchronously via
+    /// Vertical (chunk-layer) distance between two chunk coords.
+    fn updown(a: Coord, b: Coord) -> i64 {
+        (a.1 as i64 - b.1 as i64).abs()
+    }
+
+    /// Streaming priority: 3D Chebyshev with the vertical axis weighted
+    /// double, so the lateral terrain around the player streams in before the
+    /// sky above it.
+    fn order(a: Coord, b: Coord) -> i64 {
+        Self::ring(a, b).max(2 * Self::updown(a, b))
+    }
+
+    /// Queue generation jobs for every missing chunk in the data box, nearest
+    /// first — enqueue order is the pool's priority order. Safety floor: the
+    /// centre chunk (the one holding the player) generates synchronously via
     /// [`ensure_data`](Self::ensure_data), so collision there never reads air
     /// while a job flies.
     fn request_region_data(&mut self, center: Coord) {
         self.ensure_data(center);
-        let radius = self.view_radius + DATA_MARGIN;
+        let rh = self.view_radius + DATA_MARGIN;
+        let rv = self.vertical_radius() + DATA_MARGIN;
         let mut missing: Vec<Coord> = Vec::new();
-        for cx in (center.0 - radius)..=(center.0 + radius) {
-            for cz in (center.1 - radius)..=(center.1 + radius) {
-                let coord = (cx, cz);
-                if !self.chunks.contains_key(&coord) && !self.in_flight.contains(&coord) {
-                    missing.push(coord);
+        for cx in (center.0 - rh)..=(center.0 + rh) {
+            for cz in (center.2 - rh)..=(center.2 + rh) {
+                for cy in (center.1 - rv)..=(center.1 + rv) {
+                    let coord = (cx, cy, cz);
+                    if !self.chunks.contains_key(&coord) && !self.in_flight.contains(&coord) {
+                        missing.push(coord);
+                    }
                 }
             }
         }
         if missing.is_empty() {
             return;
         }
-        missing.sort_by_key(|&coord| Self::ring(coord, center));
+        missing.sort_by_key(|&coord| Self::order(coord, center));
         let workers = self
             .workers
             .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()));
@@ -475,13 +513,16 @@ impl World {
         }
     }
 
-    /// Ensure every chunk within the data radius of `center` exists (voxel data
+    /// Ensure every chunk within the data box of `center` exists (voxel data
     /// only). Cheap and GPU-free, so it also seeds headless queries.
     fn ensure_region_data(&mut self, center: Coord) {
-        let radius = self.view_radius + DATA_MARGIN;
-        for cx in (center.0 - radius)..=(center.0 + radius) {
-            for cz in (center.1 - radius)..=(center.1 + radius) {
-                self.ensure_data((cx, cz));
+        let rh = self.view_radius + DATA_MARGIN;
+        let rv = self.vertical_radius() + DATA_MARGIN;
+        for cx in (center.0 - rh)..=(center.0 + rh) {
+            for cz in (center.2 - rh)..=(center.2 + rh) {
+                for cy in (center.1 - rv)..=(center.1 + rv) {
+                    self.ensure_data((cx, cy, cz));
+                }
             }
         }
     }
@@ -491,35 +532,46 @@ impl World {
         if self.chunks.contains_key(&coord) {
             return;
         }
-        let mut chunk = Chunk::new(coord.0, coord.1, &self.generator);
+        let chunk = Chunk::new(coord.0, coord.1, coord.2, &self.generator);
+        self.store_chunk(coord, chunk);
+    }
+
+    /// Insert freshly generated data: replay the edit overlay, then register
+    /// the chunk. A uniform-air chunk (after replay) can never produce
+    /// geometry, so it is born `meshed` with no mesh — no worker job, no
+    /// upload, nothing drawn.
+    fn store_chunk(&mut self, coord: Coord, mut chunk: Chunk) {
         if let Some(edits) = self.edits.get(&coord) {
             for (&index, &id) in edits {
                 chunk.set_index(index, id);
             }
         }
+        let meshed = chunk.uniform() == Some(AIR);
         self.chunks.insert(
             coord,
             Loaded {
                 chunk,
                 mesh: None,
-                meshed: false,
+                meshed,
                 rev: 0,
             },
         );
-        // New data means new mesh work next scan.
+        // New data means new mesh work next scan (its neighbours may have
+        // been waiting on this chunk even when it is itself uniform air).
         self.pending_fresh = true;
     }
 
-    /// Free chunks past the unload radius, releasing their GPU meshes.
+    /// Free chunks past the unload box, releasing their GPU meshes.
     fn unload_far(&mut self, center: Coord, eng: &mut Engine) {
-        let radius = self.view_radius + UNLOAD_MARGIN;
+        let rh = (self.view_radius + UNLOAD_MARGIN) as i64;
+        let rv = (self.vertical_radius() + UNLOAD_MARGIN_V) as i64;
         // Collect-then-remove instead of `retain`: freeing needs `&mut eng`,
         // which can't be borrowed inside a retain closure over `self.chunks`.
         let far: Vec<Coord> = self
             .chunks
             .keys()
             .copied()
-            .filter(|&(cx, cz)| (cx - center.0).abs() > radius || (cz - center.1).abs() > radius)
+            .filter(|&coord| Self::ring(coord, center) > rh || Self::updown(coord, center) > rv)
             .collect();
         for coord in far {
             if let Some(loaded) = self.chunks.remove(&coord)
@@ -533,12 +585,12 @@ impl World {
     /// Remesh edited chunks (nearest first, budgeted, synchronously — an edit
     /// must be visible the same frame), then hand up to [`MESH_ENQUEUE_BUDGET`]
     /// fresh chunks to the worker pool, nearest first. A fresh chunk is only
-    /// snapshotted once its four orthogonal neighbours have data, so border
+    /// snapshotted once its six orthogonal neighbours have data, so border
     /// faces are culled correctly the first time.
     fn build_meshes(&mut self, center: Coord, eng: &mut Engine) {
         if !self.dirty.is_empty() {
             let mut dirty: Vec<Coord> = self.dirty.iter().copied().collect();
-            dirty.sort_by_key(|&(cx, cz)| (cx - center.0).abs().max((cz - center.1).abs()));
+            dirty.sort_by_key(|&coord| Self::order(coord, center));
             for coord in dirty.into_iter().take(DIRTY_BUDGET) {
                 self.dirty.remove(&coord);
                 // No neighbour-data gate here: an edited chunk must remesh even
@@ -558,14 +610,14 @@ impl World {
         if !self.pending_fresh {
             return;
         }
+        let (rh, rv) = (self.view_radius as i64, self.vertical_radius() as i64);
         let mut pending: Vec<Coord> = self
             .chunks
             .iter()
             .filter(|(_, loaded)| !loaded.meshed)
             .map(|(&coord, _)| coord)
-            .filter(|&(cx, cz)| {
-                (cx - center.0).abs() <= self.view_radius
-                    && (cz - center.1).abs() <= self.view_radius
+            .filter(|&coord| {
+                Self::ring(coord, center) <= rh && Self::updown(coord, center) <= rv
             })
             .filter(|&coord| self.neighbours_have_data(coord))
             .filter(|coord| !self.in_flight.contains(coord))
@@ -574,7 +626,7 @@ impl World {
             // worker build, and upload-budget slot).
             .filter(|coord| !self.dirty.contains(coord))
             .collect();
-        pending.sort_by_key(|&(cx, cz)| (cx - center.0).abs().max((cz - center.1).abs()));
+        pending.sort_by_key(|&coord| Self::order(coord, center));
 
         if pending.len() <= MESH_ENQUEUE_BUDGET {
             // Every candidate below gets enqueued, so the scan has nothing
@@ -600,18 +652,14 @@ impl World {
         }
     }
 
-    /// Copy everything a worker mesh job needs for `coord`: the chunk's voxels
-    /// (~32 KiB), the four neighbour border planes, and the shared solidity
-    /// table. Returns the rev the snapshot represents. Runs on the main thread
-    /// at enqueue time — cheap at [`MESH_ENQUEUE_BUDGET`] per frame.
+    /// Copy everything a worker mesh job needs for `coord`: the chunk's
+    /// storage (a dense chunk's 4 KiB cells; a uniform chunk clones for free),
+    /// the six neighbour border planes, and the shared solidity table. Returns
+    /// the rev the snapshot represents. Runs on the main thread at enqueue
+    /// time — cheap at [`MESH_ENQUEUE_BUDGET`] per frame.
     fn snapshot(&self, coord: Coord) -> (u32, pipeline::ChunkSnapshot) {
         let loaded = &self.chunks[&coord];
-        let neighbours = mesh::Neighbours {
-            neg_x: self.chunks.get(&(coord.0 - 1, coord.1)).map(|l| &l.chunk),
-            pos_x: self.chunks.get(&(coord.0 + 1, coord.1)).map(|l| &l.chunk),
-            neg_z: self.chunks.get(&(coord.0, coord.1 - 1)).map(|l| &l.chunk),
-            pos_z: self.chunks.get(&(coord.0, coord.1 + 1)).map(|l| &l.chunk),
-        };
+        let neighbours = self.neighbours(coord);
         (
             loaded.rev,
             pipeline::ChunkSnapshot {
@@ -622,13 +670,27 @@ impl World {
         )
     }
 
-    /// Whether the four orthogonal neighbours of a chunk have voxel data loaded.
-    fn neighbours_have_data(&self, coord: Coord) -> bool {
-        let (cx, cz) = coord;
-        self.chunks.contains_key(&(cx - 1, cz))
-            && self.chunks.contains_key(&(cx + 1, cz))
-            && self.chunks.contains_key(&(cx, cz - 1))
-            && self.chunks.contains_key(&(cx, cz + 1))
+    /// Borrow the six orthogonal neighbours' chunks for a mesh build.
+    fn neighbours(&self, (cx, cy, cz): Coord) -> mesh::Neighbours<'_> {
+        let get = |c: Coord| self.chunks.get(&c).map(|l| &l.chunk);
+        mesh::Neighbours {
+            neg_x: get((cx - 1, cy, cz)),
+            pos_x: get((cx + 1, cy, cz)),
+            neg_z: get((cx, cy, cz - 1)),
+            pos_z: get((cx, cy, cz + 1)),
+            neg_y: get((cx, cy - 1, cz)),
+            pos_y: get((cx, cy + 1, cz)),
+        }
+    }
+
+    /// Whether the six orthogonal neighbours of a chunk have voxel data loaded.
+    fn neighbours_have_data(&self, (cx, cy, cz): Coord) -> bool {
+        self.chunks.contains_key(&(cx - 1, cy, cz))
+            && self.chunks.contains_key(&(cx + 1, cy, cz))
+            && self.chunks.contains_key(&(cx, cy, cz - 1))
+            && self.chunks.contains_key(&(cx, cy, cz + 1))
+            && self.chunks.contains_key(&(cx, cy - 1, cz))
+            && self.chunks.contains_key(&(cx, cy + 1, cz))
     }
 
     /// Build (or rebuild) one chunk's GPU mesh and mark it drawable, freeing any
@@ -640,12 +702,7 @@ impl World {
         let mut scratch = std::mem::take(&mut self.scratch);
         {
             let loaded = &self.chunks[&coord];
-            let neighbours = mesh::Neighbours {
-                neg_x: self.chunks.get(&(coord.0 - 1, coord.1)).map(|l| &l.chunk),
-                pos_x: self.chunks.get(&(coord.0 + 1, coord.1)).map(|l| &l.chunk),
-                neg_z: self.chunks.get(&(coord.0, coord.1 - 1)).map(|l| &l.chunk),
-                pos_z: self.chunks.get(&(coord.0, coord.1 + 1)).map(|l| &l.chunk),
-            };
+            let neighbours = self.neighbours(coord);
             mesh::build_chunk_mesh(&loaded.chunk, &neighbours, &self.solid_table, &mut scratch);
         }
         let handle = eng.upload_mesh(&scratch); // None when the chunk is all air
@@ -689,18 +746,18 @@ impl World {
         }
     }
 
-    /// Look up the block id at an absolute world voxel coordinate. Anything outside
-    /// the loaded region (or above/below the world) reads as [`AIR`].
+    /// Look up the block id at an absolute world voxel coordinate. Anything
+    /// outside the loaded region reads as [`AIR`] — Y is unbounded, so there
+    /// is no world floor or ceiling anymore.
     pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
-        if y < 0 || y >= CHUNK_HEIGHT as i32 {
-            return AIR;
-        }
-        let coord = Self::chunk_of(x, z);
-        match self.chunks.get(&coord) {
+        match self.chunks.get(&Self::chunk_of(x, y, z)) {
             Some(loaded) => {
-                let lx = x.rem_euclid(CHUNK_WIDTH as i32) as usize;
-                let lz = z.rem_euclid(CHUNK_DEPTH as i32) as usize;
-                loaded.chunk.get_local(lx, y as usize, lz)
+                let s = CHUNK_SIZE as i32;
+                loaded.chunk.get_local(
+                    x.rem_euclid(s) as usize,
+                    y.rem_euclid(s) as usize,
+                    z.rem_euclid(s) as usize,
+                )
             }
             None => AIR,
         }
@@ -717,13 +774,11 @@ impl World {
     /// chunk — and any neighbour across a shared face — for remeshing. Returns the
     /// block that was there.
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, id: BlockId) -> BlockId {
-        if y < 0 || y >= CHUNK_HEIGHT as i32 {
-            return AIR;
-        }
-        let coord = Self::chunk_of(x, z);
-        let lx = x.rem_euclid(CHUNK_WIDTH as i32) as usize;
-        let lz = z.rem_euclid(CHUNK_DEPTH as i32) as usize;
-        let ly = y as usize;
+        let coord = Self::chunk_of(x, y, z);
+        let s = CHUNK_SIZE as i32;
+        let lx = x.rem_euclid(s) as usize;
+        let ly = y.rem_euclid(s) as usize;
+        let lz = z.rem_euclid(s) as usize;
         let index = Chunk::index(lx, ly, lz);
 
         let previous = self.block_at(x, y, z);
@@ -736,18 +791,25 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             self.dirty.insert(coord);
             self.pending_fresh = true;
-            // A block on a chunk edge also changes the neighbour's exposed faces.
+            // A block on a chunk face also changes that neighbour's exposed faces.
+            let (cx, cy, cz) = coord;
             if lx == 0 {
-                self.mark_dirty((coord.0 - 1, coord.1));
+                self.mark_dirty((cx - 1, cy, cz));
             }
-            if lx == CHUNK_WIDTH - 1 {
-                self.mark_dirty((coord.0 + 1, coord.1));
+            if lx == CHUNK_SIZE - 1 {
+                self.mark_dirty((cx + 1, cy, cz));
+            }
+            if ly == 0 {
+                self.mark_dirty((cx, cy - 1, cz));
+            }
+            if ly == CHUNK_SIZE - 1 {
+                self.mark_dirty((cx, cy + 1, cz));
             }
             if lz == 0 {
-                self.mark_dirty((coord.0, coord.1 - 1));
+                self.mark_dirty((cx, cy, cz - 1));
             }
-            if lz == CHUNK_DEPTH - 1 {
-                self.mark_dirty((coord.0, coord.1 + 1));
+            if lz == CHUNK_SIZE - 1 {
+                self.mark_dirty((cx, cy, cz + 1));
             }
         }
         previous
@@ -770,7 +832,8 @@ impl World {
     /// Collision test: does the given box overlap any solid voxel?
     ///
     /// Cells are visited grouped by owning chunk — one map probe per chunk the
-    /// box touches (1–4 for anything player-sized) instead of one per cell.
+    /// box touches (1–8 for anything player-sized) instead of one per cell,
+    /// and a uniform chunk answers for all its cells with one solidity load.
     pub fn collides(&self, aabb: &Aabb) -> bool {
         // Same cell range as `Aabb::voxel_cells`: floor(min)..=floor(max).
         let (min, max) = (aabb.min(), aabb.max());
@@ -778,29 +841,33 @@ impl World {
         let (y0, y1) = (min.y.floor() as i32, max.y.floor() as i32);
         let (z0, z1) = (min.z.floor() as i32, max.z.floor() as i32);
 
-        // Out-of-world layers read as air, exactly like `is_solid`.
-        let (y0, y1) = (y0.max(0), y1.min(CHUNK_HEIGHT as i32 - 1));
-        if y0 > y1 {
-            return false;
-        }
-
-        let (cx0, cz0) = Self::chunk_of(x0, z0);
-        let (cx1, cz1) = Self::chunk_of(x1, z1);
-        for cx in cx0..=cx1 {
-            for cz in cz0..=cz1 {
-                let Some(loaded) = self.chunks.get(&(cx, cz)) else {
-                    continue; // unloaded chunks read as air
-                };
-                let xs = x0.max(cx * CHUNK_WIDTH as i32)..=x1.min((cx + 1) * CHUNK_WIDTH as i32 - 1);
-                let zs = z0.max(cz * CHUNK_DEPTH as i32)..=z1.min((cz + 1) * CHUNK_DEPTH as i32 - 1);
-                for x in xs {
-                    let lx = x.rem_euclid(CHUNK_WIDTH as i32) as usize;
-                    for z in zs.clone() {
-                        let lz = z.rem_euclid(CHUNK_DEPTH as i32) as usize;
-                        for y in y0..=y1 {
-                            let id = loaded.chunk.get_local(lx, y as usize, lz);
-                            if self.registry.is_solid(id) {
-                                return true;
+        let s = CHUNK_SIZE as i32;
+        for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
+            for cy in y0.div_euclid(s)..=y1.div_euclid(s) {
+                for cz in z0.div_euclid(s)..=z1.div_euclid(s) {
+                    let Some(loaded) = self.chunks.get(&(cx, cy, cz)) else {
+                        continue; // unloaded chunks read as air
+                    };
+                    // Uniform chunks: one lookup answers every cell in the box.
+                    if let Some(id) = loaded.chunk.uniform() {
+                        if self.registry.is_solid(id) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    let xs = x0.max(cx * s)..=x1.min((cx + 1) * s - 1);
+                    let ys = y0.max(cy * s)..=y1.min((cy + 1) * s - 1);
+                    let zs = z0.max(cz * s)..=z1.min((cz + 1) * s - 1);
+                    for x in xs {
+                        let lx = x.rem_euclid(s) as usize;
+                        for z in zs.clone() {
+                            let lz = z.rem_euclid(s) as usize;
+                            for y in ys.clone() {
+                                let ly = y.rem_euclid(s) as usize;
+                                let id = loaded.chunk.get_local(lx, ly, lz);
+                                if self.registry.is_solid(id) {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -810,24 +877,24 @@ impl World {
         false
     }
 
-    /// Every recorded edit as `((x, y, z), block)`, for saving.
+    /// Every recorded edit as `((x, y, z), block)`, for saving. Coordinates
+    /// are absolute — the save format is independent of the chunk keying.
     pub fn edits(&self) -> impl Iterator<Item = ((i32, i32, i32), BlockId)> + '_ {
-        self.edits.iter().flat_map(|(&(cx, cz), cells)| {
+        self.edits.iter().flat_map(|(&(cx, cy, cz), cells)| {
             cells.iter().map(move |(&index, &id)| {
                 let (lx, ly, lz) = Chunk::local_of(index);
-                let x = cx * CHUNK_WIDTH as i32 + lx as i32;
-                let z = cz * CHUNK_DEPTH as i32 + lz as i32;
-                ((x, ly as i32, z), id)
+                let x = cx * CHUNK_SIZE as i32 + lx as i32;
+                let y = cy * CHUNK_SIZE as i32 + ly as i32;
+                let z = cz * CHUNK_SIZE as i32 + lz as i32;
+                ((x, y, z), id)
             })
         })
     }
 
-    /// The chunk coordinate an absolute world `(x, z)` falls in.
-    fn chunk_of(x: i32, z: i32) -> Coord {
-        (
-            x.div_euclid(CHUNK_WIDTH as i32),
-            z.div_euclid(CHUNK_DEPTH as i32),
-        )
+    /// The chunk coordinate an absolute world position falls in.
+    fn chunk_of(x: i32, y: i32, z: i32) -> Coord {
+        let s = CHUNK_SIZE as i32;
+        (x.div_euclid(s), y.div_euclid(s), z.div_euclid(s))
     }
 }
 
@@ -844,35 +911,41 @@ mod tests {
     #[test]
     fn ground_is_solid_and_sky_is_air() {
         let world = World::generate();
-        assert!(world.is_solid(8, 0, 8), "deep ground should be solid");
+        assert!(world.is_solid(8, 0, 8), "surface-band ground should be solid");
         assert!(
-            !world.is_solid(8, CHUNK_HEIGHT as i32 - 1, 8),
-            "top of the world should be air"
+            world.is_solid(8, -200, 8) || world.block_at(8, -200, 8) == AIR,
+            "deep query must not panic"
         );
+        // Deep rock is stone forever down (within the pre-generated region).
+        assert!(world.is_solid(8, -40, 8), "no world floor: stone all the way down");
+        // Above the hills and below the island band: air.
+        assert!(!world.is_solid(8, 40, 8), "sky between terrain and islands is air");
     }
 
     #[test]
     fn collision_agrees_with_solidity() {
         let world = World::generate();
         let in_ground = Aabb::new(Vec3::new(8.5, 0.5, 8.5), Vec3::new(0.3, 0.3, 0.3));
-        let in_sky = Aabb::new(
-            Vec3::new(8.5, CHUNK_HEIGHT as f32 - 0.5, 8.5),
-            Vec3::new(0.3, 0.3, 0.3),
-        );
+        let in_sky = Aabb::new(Vec3::new(8.5, 40.0, 8.5), Vec3::new(0.3, 0.3, 0.3));
+        let in_deep = Aabb::new(Vec3::new(8.5, -30.0, 8.5), Vec3::new(0.3, 0.3, 0.3));
         assert!(world.collides(&in_ground));
         assert!(!world.collides(&in_sky));
+        assert!(world.collides(&in_deep), "uniform stone chunks collide");
     }
 
     #[test]
     fn collision_grouped_lookup_matches_per_cell_path() {
-        // Boxes straddling chunk boundaries exercise the multi-chunk grouping;
-        // the grouped fast path must agree with a per-cell `is_solid` sweep.
+        // Boxes straddling chunk boundaries exercise the multi-chunk grouping
+        // (including vertical boundaries now); the grouped fast path must
+        // agree with a per-cell `is_solid` sweep.
         let world = World::generate();
         for center in [
             Vec3::new(15.9, 18.0, 15.9), // corner of four chunks
             Vec3::new(0.1, 21.5, 8.0),   // one X boundary
             Vec3::new(-3.2, 19.0, -16.4),
-            Vec3::new(4.0, -1.0, 4.0), // below the world
+            Vec3::new(4.0, -1.0, 4.0),  // below the surface band: solid now
+            Vec3::new(4.0, 15.9, 4.0),  // straddles a vertical chunk boundary
+            Vec3::new(4.0, 200.0, 4.0), // unloaded high sky: air on both paths
         ] {
             let aabb = Aabb::new(center, Vec3::new(0.4, 0.9, 0.4));
             let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_solid(x, y, z));
@@ -891,7 +964,7 @@ mod tests {
         );
 
         let (x, z) = (8, 8);
-        let h = (0..CHUNK_HEIGHT as i32)
+        let h = (0..64)
             .rev()
             .find(|&y| world.is_solid(x, y, z))
             .expect("the column has solid ground");
@@ -900,25 +973,32 @@ mod tests {
         assert_eq!(world.block_at(x, h, z), grass);
         assert_eq!(world.block_at(x, h - 1, z), dirt);
         assert_eq!(world.block_at(x, h - 3, z), stone);
+        // And no bottom anymore: the deep layer continues below y = 0.
+        assert_eq!(world.block_at(x, -25, z), stone);
     }
 
     #[test]
     fn edits_persist_across_unload() {
         let mut world = World::generate();
-        // Break the surface block far enough out that it will stream away, then be
-        // regenerated when we ask again — the edit must replay.
+        // Break the surface block, then regenerate the chunk from scratch —
+        // the edit must replay. Also place a block above the old ceiling
+        // (y >= 64 is legal now) and expect the same.
         let (x, z) = (8, 8);
-        let h = (0..CHUNK_HEIGHT as i32)
+        let h = (0..64)
             .rev()
             .find(|&y| world.is_solid(x, y, z))
             .unwrap();
         world.set_block(x, h, z, AIR);
         assert_eq!(world.block_at(x, h, z), AIR);
+        let stone = world.registry().id_by_name("Stone").unwrap();
+        world.set_block(x, 70, z, stone);
 
-        // Drop the chunk and regenerate its data; the recorded edit should return.
+        // Drop the chunks and regenerate; the recorded edits should return.
         world.chunks.clear();
-        world.ensure_data(World::chunk_of(x, z));
+        world.ensure_data(World::chunk_of(x, h, z));
+        world.ensure_data(World::chunk_of(x, 70, z));
         assert_eq!(world.block_at(x, h, z), AIR, "edit survived reload");
+        assert_eq!(world.block_at(x, 70, z), stone, "high edit survived reload");
     }
 
     #[test]
@@ -933,8 +1013,8 @@ mod tests {
     #[test]
     fn stale_rev_mesh_results_are_dropped() {
         let mut world = World::generate();
-        world.center = (0, 0); // pretend the player streamed here
-        let coord = (0, 0);
+        world.center = (0, 0, 0); // pretend the player streamed here
+        let coord = (0, 0, 0);
         let rev = world.chunks[&coord].rev;
         assert!(world.mesh_result_applies(coord, rev));
 
@@ -954,43 +1034,92 @@ mod tests {
         assert_eq!(world.upload_queue.len(), 1);
         world.upload_queue.clear();
 
-        // Unloaded / out-of-range coords are rejected too.
-        assert!(!world.mesh_result_applies((99, 99), 0));
+        // Unloaded / out-of-range coords are rejected too — horizontally and
+        // vertically (the vertical radius is tighter).
+        assert!(!world.mesh_result_applies((99, 0, 99), 0));
+        assert!(!world.mesh_result_applies((0, 99, 0), 0));
+        let rv = world.vertical_radius();
+        assert!(!world.mesh_result_applies((0, rv + 1, 0), 0), "just past vertical range");
     }
 
     #[test]
     fn neighbour_edits_bump_the_bordering_chunks_rev() {
         let mut world = World::generate();
-        // An edit at x == 0 of chunk (0, 0) touches chunk (-1, 0)'s border.
-        let before = world.chunks[&(-1, 0)].rev;
+        // An edit at x == 0 of chunk (0, 0, 0) touches chunk (-1, 0, 0)'s border.
+        let before = world.chunks[&(-1, 0, 0)].rev;
         world.set_block(0, 5, 8, AIR);
-        assert_eq!(world.chunks[&(-1, 0)].rev, before + 1, "border neighbour");
-        assert_eq!(world.chunks[&(0, 0)].rev, 1, "edited chunk itself");
-        assert_eq!(world.chunks[&(1, 0)].rev, 0, "far side untouched");
+        assert_eq!(world.chunks[&(-1, 0, 0)].rev, before + 1, "border neighbour");
+        assert_eq!(world.chunks[&(0, 0, 0)].rev, 1, "edited chunk itself");
+        assert_eq!(world.chunks[&(1, 0, 0)].rev, 0, "far side untouched");
+
+        // Vertical borders count too: an edit at y == 16 (bottom of chunk
+        // layer 1) touches the chunk below.
+        let below = world.chunks[&(0, 0, 0)].rev;
+        world.set_block(8, 16, 8, AIR);
+        assert_eq!(world.chunks[&(0, 0, 0)].rev, below + 1, "chunk below bumped");
+        assert_eq!(world.chunks[&(0, 1, 0)].rev, 1, "edited vertical chunk");
     }
 
     #[test]
     fn landed_chunks_replay_edits_that_arrived_mid_flight() {
         let mut world = World::generate();
-        world.center = (0, 0);
-        let coord = (2, 2);
-        let (x, z) = (coord.0 * CHUNK_WIDTH as i32 + 3, coord.1 * CHUNK_DEPTH as i32 + 4);
+        world.center = (0, 0, 0);
+        let coord = (2, 0, 2);
+        let (x, z) = (coord.0 * CHUNK_SIZE as i32 + 3, coord.2 * CHUNK_SIZE as i32 + 4);
         // Simulate the coord being in flight: no data yet, edit lands meanwhile
         // (recorded in the overlay only).
         world.chunks.remove(&coord);
         world.set_block(x, 5, z, AIR);
         // The worker's result was built before that edit existed.
-        let raw = Chunk::new(coord.0, coord.1, &world.generator);
+        let raw = Chunk::new(coord.0, coord.1, coord.2, &world.generator);
         assert_ne!(raw.get_local(3, 5, 4), AIR, "terrain is solid there");
         world.pending_fresh = false;
         world.accept_chunk(coord, raw);
         assert_eq!(world.block_at(x, 5, z), AIR, "overlay replayed on landing");
         assert!(world.pending_fresh, "new data re-arms the fresh scan");
 
-        // Results for coords the world has moved past are discarded.
-        let far = (100, 100);
-        world.accept_chunk(far, Chunk::new(far.0, far.1, &world.generator));
+        // Results for coords the world has moved past are discarded —
+        // horizontally or vertically.
+        let far = (100, 0, 100);
+        world.accept_chunk(far, Chunk::new(far.0, far.1, far.2, &world.generator));
         assert!(!world.chunks.contains_key(&far), "out-of-range chunk dropped");
+        let high = (0, 100, 0);
+        world.accept_chunk(high, Chunk::new(high.0, high.1, high.2, &world.generator));
+        assert!(!world.chunks.contains_key(&high), "out-of-height chunk dropped");
+    }
+
+    #[test]
+    fn uniform_air_chunks_are_born_meshed() {
+        let world = World::generate();
+        // A sky chunk between the hills and the island band: uniform air,
+        // meshed on arrival with no mesh and no worker job ever queued.
+        let sky = &world.chunks[&(0, 3, 0)];
+        assert_eq!(sky.chunk.uniform(), Some(AIR));
+        assert!(sky.meshed, "uniform air needs no mesh job");
+        assert!(sky.mesh.is_none());
+        // A ground chunk still goes through the normal mesh path.
+        let ground = &world.chunks[&(0, 0, 0)];
+        assert!(!ground.meshed, "dense terrain waits for a real mesh");
+    }
+
+    #[test]
+    fn vertical_radius_derives_from_view_radius() {
+        let mut world = World::generate();
+        for (view, vertical) in [(3, 2), (4, 2), (6, 3), (8, 4), (10, 5)] {
+            world.set_view_radius(view);
+            assert_eq!(world.vertical_radius(), vertical, "view {view}");
+        }
+    }
+
+    #[test]
+    fn streaming_order_weights_vertical_double() {
+        let c = (0, 0, 0);
+        assert_eq!(World::order((4, 0, 0), c), 4);
+        assert_eq!(World::order((0, 2, 0), c), 4, "2 layers up ranks like 4 rings out");
+        assert!(
+            World::order((0, 3, 0), c) > World::order((5, 0, 0), c),
+            "lateral terrain streams before the sky"
+        );
     }
 
     #[test]
@@ -1003,6 +1132,6 @@ mod tests {
         assert_eq!(world.view_radius(), 3);
         // The change must force the next stream to rescan.
         assert!(world.pending_fresh);
-        assert_eq!(world.center, (i32::MIN, i32::MIN));
+        assert_eq!(world.center, NO_CENTER);
     }
 }

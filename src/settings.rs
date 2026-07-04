@@ -23,6 +23,8 @@ pub struct Settings {
     pub render_distance: i32,
     /// Vertical field of view in degrees.
     pub fov: f32,
+    /// Render-resolution scale relative to the window (0.25..=2.0).
+    pub render_scale: f32,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             max_fps: 0,
             render_distance: 6,
             fov: 70.0,
+            render_scale: 1.0,
         }
     }
 }
@@ -65,6 +68,9 @@ impl Settings {
                     self.render_distance = value.parse().unwrap_or(self.render_distance)
                 }
                 "fov" => self.fov = value.parse().unwrap_or(self.fov),
+                "render_scale" => {
+                    self.render_scale = value.parse().unwrap_or(self.render_scale)
+                }
                 _ => {}
             }
         }
@@ -76,8 +82,14 @@ impl Settings {
             let _ = fs::create_dir_all(dir);
         }
         let text = format!(
-            "fullscreen={}\nvsync={}\nmsaa={}\nmax_fps={}\nrender_distance={}\nfov={}\n",
-            self.fullscreen, self.vsync, self.msaa, self.max_fps, self.render_distance, self.fov
+            "fullscreen={}\nvsync={}\nmsaa={}\nmax_fps={}\nrender_distance={}\nfov={}\nrender_scale={}\n",
+            self.fullscreen,
+            self.vsync,
+            self.msaa,
+            self.max_fps,
+            self.render_distance,
+            self.fov,
+            self.render_scale
         );
         let _ = fs::write(SETTINGS_PATH, text);
     }
@@ -95,6 +107,7 @@ impl Settings {
         }
         self.render_distance = self.render_distance.clamp(3, 10);
         self.fov = self.fov.clamp(50.0, 110.0);
+        self.render_scale = self.render_scale.clamp(0.25, 2.0);
     }
 
     /// Push the current values to the engine. Cheap to call every frame: the
@@ -105,6 +118,7 @@ impl Settings {
         eng.set_fullscreen(self.fullscreen);
         eng.set_vsync(self.vsync);
         self.msaa = eng.set_msaa(self.msaa);
+        self.render_scale = eng.set_render_scale(self.render_scale);
         eng.set_target_fps(self.max_fps);
     }
 }
@@ -129,9 +143,10 @@ mod tests {
         s.max_fps = 144;
         s.render_distance = 8;
         s.fov = 90.0;
+        s.render_scale = 0.75;
         let text = format!(
-            "fullscreen={}\nvsync={}\nmsaa={}\nmax_fps={}\nrender_distance={}\nfov={}\n",
-            s.fullscreen, s.vsync, s.msaa, s.max_fps, s.render_distance, s.fov
+            "fullscreen={}\nvsync={}\nmsaa={}\nmax_fps={}\nrender_distance={}\nfov={}\nrender_scale={}\n",
+            s.fullscreen, s.vsync, s.msaa, s.max_fps, s.render_distance, s.fov, s.render_scale
         );
         let mut loaded = Settings::default();
         loaded.parse_from(&text);
@@ -158,11 +173,13 @@ mod tests {
             max_fps: 5,
             render_distance: 99,
             fov: 300.0,
+            render_scale: 9.0,
         };
         s.clamp();
         assert_eq!(s.msaa, 4);
         assert_eq!(s.max_fps, 10);
         assert_eq!(s.render_distance, 10);
         assert_eq!(s.fov, 110.0);
+        assert_eq!(s.render_scale, 2.0);
     }
 }

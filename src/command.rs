@@ -71,6 +71,7 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<String> {
             "  gfx fps <n>|off".to_string(),
             "  gfx renderdist <3-10>".to_string(),
             "  gfx fov <50-110>".to_string(),
+            "  gfx renderscale <25-200>  (percent)".to_string(),
         ]
     };
 
@@ -89,8 +90,11 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<String> {
                     settings.msaa
                 ),
                 format!(
-                    "     fps {}  renderdist {}  fov {:.0}",
-                    fps, settings.render_distance, settings.fov
+                    "     fps {}  renderdist {}  fov {:.0}  scale {:.0}%",
+                    fps,
+                    settings.render_distance,
+                    settings.fov,
+                    settings.render_scale * 100.0
                 ),
             ]
         }
@@ -141,6 +145,14 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<String> {
                         settings.render_distance = n;
                         settings.clamp();
                         format!("render distance {}", settings.render_distance)
+                    }
+                    Err(_) => return usage(),
+                },
+                "renderscale" | "scale" => match value.parse::<f32>() {
+                    Ok(pct) => {
+                        settings.render_scale = pct / 100.0;
+                        settings.clamp();
+                        format!("render scale {:.0}%", settings.render_scale * 100.0)
                     }
                     Err(_) => return usage(),
                 },
