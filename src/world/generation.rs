@@ -106,10 +106,14 @@ fn collapse(cells: Box<[u8; CHUNK_VOLUME]>) -> ChunkData {
 pub const ISLAND_MIN_Y: i32 = 64;
 /// Lattice cell size (blocks) of the island noise's base octave; the second
 /// octave runs at half this.
-const ISLAND_CELL: f32 = 24.0;
-/// Base-octave frequency, and the second octave's (double).
-const ISLAND_FREQ_0: f32 = 1.0 / ISLAND_CELL;
-const ISLAND_FREQ_1: f32 = 2.0 / ISLAND_CELL;
+const ISLAND_CELL: f64 = 24.0;
+/// Base-octave frequency, and the second octave's (double). f64: the
+/// world-coordinate -> lattice-coordinate reduction must run in f64 (see
+/// [`reduce`]) — in f32 the ULP of a world coordinate reaches 32 blocks at
+/// |w| = 2^28, larger than a whole lattice cell, well inside the certified
+/// ±1e9 world border.
+const ISLAND_FREQ_0: f64 = 1.0 / ISLAND_CELL;
+const ISLAND_FREQ_1: f64 = 2.0 / ISLAND_CELL;
 /// The solidity threshold never exceeds this, so islands thin out with
 /// altitude but never become impossible (noise tops out below 1.0).
 const ISLAND_MAX_THRESHOLD: f32 = 0.97;
@@ -122,18 +126,8 @@ pub fn island_threshold(y: i32) -> f32 {
 
 /// The island field at a world cell: 2-octave 3D value noise in [0, 1).
 pub fn island_noise(seed: i64, x: i32, y: i32, z: i32) -> f32 {
-    let a = octave(
-        octave_seed(seed, 0),
-        x as f32 * ISLAND_FREQ_0,
-        y as f32 * ISLAND_FREQ_0,
-        z as f32 * ISLAND_FREQ_0,
-    );
-    let b = octave(
-        octave_seed(seed, 1),
-        x as f32 * ISLAND_FREQ_1,
-        y as f32 * ISLAND_FREQ_1,
-        z as f32 * ISLAND_FREQ_1,
-    );
+    let a = octave(octave_seed(seed, 0), x, y, z, ISLAND_FREQ_0);
+    let b = octave(octave_seed(seed, 1), x, y, z, ISLAND_FREQ_1);
     (a + 0.5 * b) * (1.0 / 1.5)
 }
 
@@ -172,12 +166,29 @@ fn fade(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Bilinear lattice blend in the XZ plane at integer lattice level `ly`
-/// (`x`/`z` already in lattice units).
-fn plane_value(seed: u64, x: f32, ly: i32, z: f32) -> f32 {
-    let (x0, z0) = (x.floor(), z.floor());
-    let (xi, zi) = (x0 as i32, z0 as i32);
-    let (tx, tz) = (fade(x - x0), fade(z - z0));
+/// Reduce a world coordinate to its lattice cell and in-cell fraction, IN F64.
+///
+/// This is the one place world positions become lattice positions, and it must
+/// not run in f32: an i32 world coordinate is exact in f64 (and the fraction
+/// `t - floor(t)` is exact by Sterbenz), but in f32 the ULP of the coordinate
+/// itself reaches 32 blocks at |w| = 2^28 — larger than a lattice cell — which
+/// both quantized the fraction to steps (slab-shaped islands beyond ~1.5e8)
+/// and inflated the apparent cell span past [`OctaveColumn`]'s plane cache
+/// (index panic near y = 2.7e8). The i64 cell is fed to [`lattice`] as
+/// `cell as i32` (a wrapping truncation): within the certified ±1e9 world the
+/// cell never exceeds ±1e9/12 ≈ ±8.4e7, far inside i32, so the hash input —
+/// and therefore every lattice value — is unchanged wherever the old f32 path
+/// computed the right cell; beyond that it stays deterministic everywhere.
+fn reduce(w: i32, freq: f64) -> (i64, f32) {
+    let t = w as f64 * freq;
+    let cell = t.floor() as i64;
+    (cell, (t - cell as f64) as f32)
+}
+
+/// Bilinear lattice blend in the XZ plane at integer lattice level `ly`,
+/// from [`reduce`]d cells (`xi`/`zi`) and in-cell fractions (`fx`/`fz`).
+fn plane_value(seed: u64, xi: i32, fx: f32, ly: i32, zi: i32, fz: f32) -> f32 {
+    let (tx, tz) = (fade(fx), fade(fz));
     let v00 = lattice(seed, xi, ly, zi);
     let v10 = lattice(seed, xi + 1, ly, zi);
     let v01 = lattice(seed, xi, ly, zi + 1);
@@ -185,48 +196,60 @@ fn plane_value(seed: u64, x: f32, ly: i32, z: f32) -> f32 {
     lerp(lerp(v00, v10, tx), lerp(v01, v11, tx), tz)
 }
 
-/// One value-noise octave: the two bracketing XZ plane blends, faded in Y.
-/// Split this way (rather than a plain trilinear) so [`OctaveColumn`] can
-/// cache the plane blends per column and stay bit-identical.
-fn octave(seed: u64, x: f32, y: f32, z: f32) -> f32 {
-    let y0 = y.floor();
-    let yi = y0 as i32;
-    let ty = fade(y - y0);
-    lerp(plane_value(seed, x, yi, z), plane_value(seed, x, yi + 1, z), ty)
+/// One value-noise octave at a world cell: the two bracketing XZ plane blends,
+/// faded in Y. Split this way (rather than a plain trilinear) so
+/// [`OctaveColumn`] can cache the plane blends per column and stay
+/// bit-identical.
+fn octave(seed: u64, wx: i32, wy: i32, wz: i32, freq: f64) -> f32 {
+    let (xi, fx) = reduce(wx, freq);
+    let (zi, fz) = reduce(wz, freq);
+    let (yi, fy) = reduce(wy, freq);
+    let ty = fade(fy);
+    let (xi, zi, yi) = (xi as i32, zi as i32, yi as i32);
+    lerp(
+        plane_value(seed, xi, fx, yi, zi, fz),
+        plane_value(seed, xi, fx, yi + 1, zi, fz),
+        ty,
+    )
 }
 
 /// One octave sampled down a fixed (x, z) column: the XZ plane blends are
 /// computed once per lattice level instead of once per cell, which is the
 /// generator's hot path (a 20-cell column touches at most 4 levels).
 struct OctaveColumn {
-    freq: f32,
-    /// Lowest lattice level cached.
-    base: i32,
-    /// `plane_value` at `base + i`. A 20-cell column at the half-cell octave
-    /// spans at most ceil(19/12) + 1 = 3 level intervals, so 5 always fits.
+    freq: f64,
+    /// Lowest lattice cell cached (i64: the exact [`reduce`] cell).
+    base: i64,
+    /// `plane_value` at cell `base + i`. Span proof: cells come from the
+    /// monotone f64 map `y -> floor(fl(y * freq))`, so over a 20-cell column
+    /// (y_hi - y_lo = 19) at the half-cell octave (freq = 1/12) the cell
+    /// difference is at most floor(19/12) + 1 = 2 (the f64 rounding slack on
+    /// |y| <= 2^31 is ~1e-7, far below the next integer). With the +1 top
+    /// plane that is 4 entries, so 5 always fits — exactly, at any world
+    /// coordinate, which the old f32 path could not guarantee past |y| = 2^28.
     planes: [f32; 5],
 }
 
 impl OctaveColumn {
-    fn new(seed: u64, wx: i32, wz: i32, freq: f32, y_lo: i32, y_hi: i32) -> Self {
-        let x = wx as f32 * freq;
-        let z = wz as f32 * freq;
-        let base = (y_lo as f32 * freq).floor() as i32;
-        let top = (y_hi as f32 * freq).floor() as i32 + 1;
-        debug_assert!((top - base) < 5, "column spans more levels than cached");
+    fn new(seed: u64, wx: i32, wz: i32, freq: f64, y_lo: i32, y_hi: i32) -> Self {
+        let (xi, fx) = reduce(wx, freq);
+        let (zi, fz) = reduce(wz, freq);
+        let base = (y_lo as f64 * freq).floor() as i64;
+        let top = (y_hi as f64 * freq).floor() as i64 + 1;
+        debug_assert!(top - base < 5, "column spans more levels than cached");
         let mut planes = [0.0; 5];
-        for (i, level) in (base..=top).enumerate() {
-            planes[i] = plane_value(seed, x, level, z);
+        for (i, cell) in (base..=top).enumerate() {
+            planes[i] = plane_value(seed, xi as i32, fx, cell as i32, zi as i32, fz);
         }
         Self { freq, base, planes }
     }
 
-    /// Bit-identical to [`octave`] at (x, y, z) for y within the built range.
+    /// Bit-identical to [`octave`] at (x, y, z) for y within the built range:
+    /// same [`reduce`], same plane cells, same fade.
     fn sample(&self, y: i32) -> f32 {
-        let fy = y as f32 * self.freq;
-        let y0 = fy.floor();
-        let ty = fade(fy - y0);
-        let i = (y0 as i32 - self.base) as usize;
+        let (cell, fy) = reduce(y, self.freq);
+        let ty = fade(fy);
+        let i = (cell - self.base) as usize;
         lerp(self.planes[i], self.planes[i + 1], ty)
     }
 }
@@ -708,15 +731,80 @@ mod tests {
     #[test]
     fn column_cache_matches_the_pure_noise_fn() {
         // The generator's per-column fast path must be bit-identical to the
-        // standalone island functions.
+        // standalone island functions — including far from the origin, where
+        // the old f32 reduction disagreed with itself (and panicked past
+        // y = 2^28). 268_435_453 sits just below 2^28, 268_435_488 just above
+        // the old crash line; 999_999_981 rides the certified +1e9 border.
         for seed in [1, 42, -777] {
-            for (wx, wz) in [(0, 0), (13, -27), (-1000, 999)] {
-                let (y_lo, y_hi) = (96, 96 + 19);
-                let col = IslandColumn::new(seed, wx, wz, y_lo, y_hi);
-                for y in y_lo..=y_hi {
-                    assert_eq!(col.solid(y), island_at(seed, wx, y, wz), "at y={y}");
+            for (wx, wz) in [(0, 0), (13, -27), (-1000, 999), (300_000_000, -299_999_777)] {
+                for y_lo in [96, 268_435_453, 268_435_488, 999_999_981] {
+                    let y_hi = y_lo + 19;
+                    let col = IslandColumn::new(seed, wx, wz, y_lo, y_hi);
+                    for y in y_lo..=y_hi {
+                        // Bit-identity of the raw noise, not just the solid bool
+                        // (which is almost always false at high altitude).
+                        let cached = (col.o0.sample(y) + 0.5 * col.o1.sample(y)) * (1.0 / 1.5);
+                        assert_eq!(
+                            cached,
+                            island_noise(seed, wx, y, wz),
+                            "noise at ({wx}, {y}, {wz})"
+                        );
+                        assert_eq!(col.solid(y), island_at(seed, wx, y, wz), "at y={y}");
+                    }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn far_altitude_chunks_generate_without_panicking() {
+        // BUG 1 regression: at |y| >= 2^28 the f32 ULP of a world coordinate
+        // is >= 32 blocks, so the old f32 plane-cache span inflated past its
+        // [f32; 5] cache and indexed out of bounds. cy = 16_777_218 puts the
+        // chunk floor at y = 268_435_488 — the exact crash coordinate.
+        let g = hills(3);
+        g.generate(0, 16_777_218, 0);
+
+        // And a deterministic pseudo-random scan of the whole affected band,
+        // cy in [2.6e8/16, 1e9/16] (~45% of layers here crashed before).
+        let (lo, hi) = (260_000_000i64 / 16, 1_000_000_000i64 / 16);
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        for _ in 0..50 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let cy = (lo + ((state >> 16) % (hi - lo) as u64) as i64) as i32;
+            g.generate(-7, cy, 11);
+        }
+    }
+
+    #[test]
+    fn island_noise_is_not_lattice_quantized_far_out() {
+        // BUG 2 regression: with the f32 reduction, at wx = 3e8 (f32 ULP 16)
+        // every world x in a 16-block run collapsed to the same lattice
+        // fraction, so the noise was a staircase of at most ~6 distinct values
+        // over 48 blocks. Smooth value noise lerps a fresh fade fraction every
+        // block, so a 48-block line must show rich per-block variation.
+        let (y, z) = (200, 123);
+        for seed in [7, -31] {
+            let vals: Vec<f32> = (0..48)
+                .map(|i| island_noise(seed, 300_000_000 + i, y, z))
+                .collect();
+            let mut distinct = vals.clone();
+            distinct.sort_by(f32::total_cmp);
+            distinct.dedup();
+            assert!(
+                distinct.len() >= 24,
+                "seed {seed}: only {} distinct noise values over 48 blocks — \
+                 lattice-quantized",
+                distinct.len()
+            );
+            let moving = vals.windows(2).filter(|w| w[0] != w[1]).count();
+            assert!(
+                moving >= 40,
+                "seed {seed}: only {moving} of 47 consecutive deltas nonzero — \
+                 step-quantized"
+            );
         }
     }
 

@@ -11,8 +11,23 @@ use voxel_engine::DVec3;
 /// bound every float→block conversion can rely on.
 pub const WORLD_BORDER: f64 = 1.0e9;
 
+/// Slack past ±[`WORLD_BORDER`] within which [`block_coord`] still resolves a
+/// true cell instead of clamping. Player *positions* are clamped to exactly
+/// ±`WORLD_BORDER` (movement and `/tp`, the only continuous writers), but the
+/// AABBs built *around* a position extend up to their half-extents beyond it —
+/// clamping the conversion at the border itself collapsed those outer corners
+/// onto the border column (e.g. an AABB min of `-1e9 - 0.3` skipped its true
+/// column `-1_000_000_001`, so the outermost cells never collided and the
+/// player interpenetrated terrain at the negative border). 16 blocks covers
+/// any in-game AABB by a wide margin while staying light-years inside `i32`
+/// block math: `(1e9 + 16) / 16` chunks of 16 blocks fits `i32` fine.
+const BLOCK_COORD_SLACK: f64 = 16.0;
+
 /// The one conversion from an `f64` world coordinate to an integer block
-/// coordinate: clamp to ±[`WORLD_BORDER`], then floor.
+/// coordinate: clamp to ±([`WORLD_BORDER`] + [`BLOCK_COORD_SLACK`]), then
+/// floor. Together with movement/`/tp` clamping positions to exactly
+/// ±`WORLD_BORDER`, the slack makes every AABB reachable in play — including
+/// one straddling the border — resolve its true cells.
 ///
 /// Everything that turns a position into a cell goes through here (collision
 /// cell ranges, chunk lookup, the interact raycast's start cell, placement,
@@ -25,9 +40,10 @@ pub const WORLD_BORDER: f64 = 1.0e9;
 /// origin cell rather than a poisoned coordinate.
 #[inline]
 pub fn block_coord(v: f64) -> i32 {
-    // Floor in f64 (exact for |v| <= 1e9, far below 2^53), then narrow via
-    // i64 so the intermediate can provably never truncate.
-    v.clamp(-WORLD_BORDER, WORLD_BORDER).floor() as i64 as i32
+    // Floor in f64 (exact for |v| <= 1e9 + 16, far below 2^53), then narrow
+    // via i64 so the intermediate can provably never truncate.
+    v.clamp(-(WORLD_BORDER + BLOCK_COORD_SLACK), WORLD_BORDER + BLOCK_COORD_SLACK).floor() as i64
+        as i32
 }
 
 /// An axis-aligned bounding box defined by a centre point and half-extents.
@@ -95,10 +111,16 @@ mod tests {
         // Far coordinates stay exact in f64.
         assert_eq!(block_coord(100_000_000.75), 100_000_000);
         assert_eq!(block_coord(-100_000_000.25), -100_000_001);
-        // Past the border: clamped, never overflowing i32 math downstream.
-        assert_eq!(block_coord(WORLD_BORDER * 3.0), 1_000_000_000);
-        assert_eq!(block_coord(f64::INFINITY), 1_000_000_000);
-        assert_eq!(block_coord(f64::NEG_INFINITY), -1_000_000_000);
+        // An AABB corner just past the border (player clamped AT the border,
+        // half-extent hanging over) must resolve its true cell, not collapse
+        // onto the border column — the negative-border interpenetration bug.
+        assert_eq!(block_coord(-1.0e9 - 0.3), -1_000_000_001);
+        assert_eq!(block_coord(1.0e9 + 0.3), 1_000_000_000);
+        // Far past the border + slack: clamped, never overflowing i32 math
+        // downstream.
+        assert_eq!(block_coord(WORLD_BORDER * 3.0), 1_000_000_016);
+        assert_eq!(block_coord(f64::INFINITY), 1_000_000_016);
+        assert_eq!(block_coord(f64::NEG_INFINITY), -1_000_000_016);
         assert_eq!(block_coord(f64::NAN), 0);
     }
 

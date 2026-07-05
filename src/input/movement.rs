@@ -20,6 +20,18 @@ const WALK_SPEED: f64 = 6.0; // units / second on the ground
 const FLY_SPEED: f64 = 14.0; // units / second while flying
 const GRAVITY: f64 = 24.0; // units / second^2
 const JUMP_SPEED: f64 = 8.5; // initial upward velocity of a jump
+/// Fastest fall, units / second. Reached only after ~2.5 s of freefall
+/// (`GRAVITY * 2.5 = 60`) — far past any normal jump arc (which peaks well
+/// under a second), so jump and short-fall feel are unchanged. Its real job is
+/// bounding the per-frame fall distance so the collision substepping in
+/// [`move_with_collision`] has a small, fixed worst case.
+const TERMINAL_VELOCITY: f64 = -60.0;
+/// Largest single collision step along one axis, in units. Axis deltas above
+/// this are split into substeps so a fast fall tests every half-block on the
+/// way instead of one endpoint — an endpoint-only test let a terminal-velocity
+/// fall (6 units per dt-clamped 0.1 s frame) tunnel straight through a
+/// one-block-thin floor. Worst case is `60 * 0.1 / 0.5` ≈ 12 substeps.
+const MAX_COLLISION_STEP: f64 = 0.5;
 
 axis!(AxisZ { Forward = W, Backward = S });
 axis!(AxisX { Right = D, Left = A });
@@ -90,7 +102,7 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
         if input.jump && player.on_ground {
             player.velocity_y = JUMP_SPEED;
         }
-        player.velocity_y -= GRAVITY * dt;
+        player.velocity_y = (player.velocity_y - GRAVITY * dt).max(TERMINAL_VELOCITY);
         delta.y = player.velocity_y * dt;
     }
 
@@ -100,37 +112,77 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
 /// Apply `delta` one axis at a time so the player slides along walls instead of
 /// sticking, and detects when they land on the ground.
 ///
-/// Each axis clamps to ±[`WORLD_BORDER`] as it moves: the world border IS the
-/// clamp. Movement (the only continuous position writer besides `/tp`, which
-/// clamps the same way) can therefore never carry a coordinate past ±1e9, which
-/// is the invariant [`block_coord`](crate::math::block_coord)'s overflow-free
-/// i32 block math rests on.
+/// Each axis clamps to ±[`WORLD_BORDER`] as it moves (every substep clamps):
+/// the world border IS the clamp. Movement (the only continuous position writer
+/// besides `/tp`, which clamps the same way) can therefore never carry a
+/// coordinate past ±1e9, the invariant
+/// [`block_coord`](crate::math::block_coord)'s overflow-free i32 block math
+/// rests on.
+///
+/// Axis deltas larger than [`MAX_COLLISION_STEP`] are applied in substeps (see
+/// [`step_axis`]) so a fast fall stops at the first solid cell it crosses
+/// instead of tunneling past thin terrain; a blocked axis leaves the position
+/// at the last collision-free substep.
 fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
-    let start = player.position;
-    let mut pos = start;
+    let mut pos = player.position;
 
-    pos.x = (pos.x + delta.x).clamp(-WORLD_BORDER, WORLD_BORDER);
-    if world.collides(&Aabb::new(pos, PLAYER_HALF)) {
-        pos.x = start.x;
-    }
-
-    pos.z = (pos.z + delta.z).clamp(-WORLD_BORDER, WORLD_BORDER);
-    if world.collides(&Aabb::new(pos, PLAYER_HALF)) {
-        pos.z = start.z;
-    }
+    step_axis(&mut pos, 0, delta.x, world);
+    step_axis(&mut pos, 2, delta.z, world);
 
     // Landing on something while moving down means we're grounded.
     player.on_ground = false;
-    pos.y = (pos.y + delta.y).clamp(-WORLD_BORDER, WORLD_BORDER);
-    if world.collides(&Aabb::new(pos, PLAYER_HALF)) {
+    if step_axis(&mut pos, 1, delta.y, world) {
         if delta.y < 0.0 {
             player.on_ground = true;
         }
-        pos.y = start.y;
         player.velocity_y = 0.0;
     }
 
     player.position = pos;
+}
+
+/// Move `pos` along one `axis` (0 = x, 1 = y, 2 = z) by `delta`, clamping to
+/// ±[`WORLD_BORDER`], and stop at the first colliding position. Returns `true`
+/// if the move hit something; `pos` is then the last collision-free point
+/// reached along the way.
+///
+/// Deltas of at most [`MAX_COLLISION_STEP`] take a fast path that is the exact
+/// historical single-endpoint test (same float ops), so ordinary per-frame
+/// movement is untouched. Larger deltas — a long fall, a dt spike — are split
+/// into `ceil(|delta| / 0.5)` substeps (≈ 12 at terminal velocity under the
+/// game's 0.1 s dt clamp) so no solid cell thicker than half a block can be
+/// jumped over. The final substep lands exactly on the single-step endpoint, so
+/// an unobstructed move is identical either way.
+fn step_axis(pos: &mut DVec3, axis: usize, delta: f64, world: &World) -> bool {
+    let start = pos[axis];
+
+    // Fast path: the common per-frame case, identical to the pre-substepping
+    // behavior.
+    if delta.abs() <= MAX_COLLISION_STEP {
+        pos[axis] = (start + delta).clamp(-WORLD_BORDER, WORLD_BORDER);
+        if world.collides(&Aabb::new(*pos, PLAYER_HALF)) {
+            pos[axis] = start;
+            return true;
+        }
+        return false;
+    }
+
+    let target = (start + delta).clamp(-WORLD_BORDER, WORLD_BORDER);
+    let steps = (delta.abs() / MAX_COLLISION_STEP).ceil() as u32;
+    for i in 1..=steps {
+        let next = if i == steps {
+            target
+        } else {
+            (start + delta * (i as f64 / steps as f64)).clamp(-WORLD_BORDER, WORLD_BORDER)
+        };
+        let last_good = pos[axis];
+        pos[axis] = next;
+        if world.collides(&Aabb::new(*pos, PLAYER_HALF)) {
+            pos[axis] = last_good;
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -142,6 +194,17 @@ mod tests {
     fn walk_forward() -> MoveInput {
         MoveInput {
             forward_back: AxisZ::Forward,
+            left_right: AxisX::None,
+            up_down: AxisY::None,
+            jump: false,
+            toggle_fly: false,
+        }
+    }
+
+    /// No keys held at all — freefall / settle frames.
+    fn idle() -> MoveInput {
+        MoveInput {
+            forward_back: AxisZ::None,
             left_right: AxisX::None,
             up_down: AxisY::None,
             jump: false,
@@ -220,5 +283,98 @@ mod tests {
         assert!(player.position.y.is_finite() && player.position.z.is_finite());
         // And block conversion of the clamped position is still safe i32.
         assert_eq!(block_coord(player.position.x), 1_000_000_000);
+    }
+
+    /// The tunneling regression: a terminal-velocity fall onto a one-block-thin
+    /// floor must STOP on it. Before substepping, a 6-unit frame step (terminal
+    /// 60 × the game's 0.1 s dt clamp) tested only its endpoint and could jump
+    /// the floor's entire 1-block extent, dropping the player through.
+    #[test]
+    fn terminal_velocity_fall_stops_on_a_one_block_thin_floor() {
+        let mut world = World::generate();
+        let (x, z) = (0.5, 0.5);
+        let floor_y = 40; // above the hills, below the island band: open air
+        world.prepare_around(DVec3::new(x, floor_y as f64, z));
+        let stone = world.registry().id_by_name("Stone").unwrap();
+        let (bx, bz) = (block_coord(x), block_coord(z));
+        // A thin platform: exactly one block thick.
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                world.set_block(bx + dx, floor_y, bz + dz, stone);
+            }
+        }
+
+        // Feet start 158 blocks up: freefall reaches terminal velocity after
+        // ~78 blocks (2.5 s), leaving a long terminal-speed run whose 6-unit
+        // steps hit the pre-fix tunneling window when they cross the floor.
+        let start_feet = (floor_y + 1) as f64 + 158.0;
+        let mut player = Player::new(DVec3::new(x, start_feet + PLAYER_HALF.y, z));
+
+        // The fall column must be pure air or we'd measure an island instead.
+        for y in (floor_y + 1)..=(start_feet as i32 + 2) {
+            assert_eq!(
+                world.block_at(bx, y, bz),
+                crate::block::registry::AIR,
+                "fall column blocked at y={y}; pick a different column"
+            );
+        }
+
+        let mut reached_terminal = false;
+        for _ in 0..100 {
+            update_player(&mut player, &world, &idle(), 0.1);
+            assert!(
+                player.velocity_y >= TERMINAL_VELOCITY,
+                "velocity must never exceed terminal, got {}",
+                player.velocity_y
+            );
+            if player.velocity_y == TERMINAL_VELOCITY {
+                reached_terminal = true;
+            }
+        }
+
+        assert!(reached_terminal, "158 blocks of freefall must reach terminal velocity");
+        assert!(player.on_ground, "the fall must end standing on the thin floor");
+        let feet = player.position.y - PLAYER_HALF.y;
+        let top = (floor_y + 1) as f64;
+        assert!(
+            feet >= top - 1e-9 && feet < top + 0.3,
+            "feet must rest on the platform top ({top}), got {feet}"
+        );
+    }
+
+    /// Neither the terminal-velocity clamp nor collision substepping may change
+    /// how a jump feels: the apex of a normal jump must match the historical
+    /// integrator exactly. (A jump peaks at |v| = 8.5, nowhere near terminal,
+    /// and 60 fps deltas stay under the 0.5 substep threshold, so the fast path
+    /// runs the same float ops as before the change.)
+    #[test]
+    fn jump_apex_is_unchanged() {
+        let mut world = World::generate();
+        let mut player = player_on_runway(&mut world, 0.5, 0.5);
+        let dt = 1.0 / 60.0;
+
+        // One idle frame to plant the player (Player::new starts !on_ground).
+        update_player(&mut player, &world, &idle(), dt as f32);
+        assert!(player.on_ground, "must be standing before the jump");
+        let start_y = player.position.y;
+
+        let mut apex = start_y;
+        for frame in 0..60 {
+            let input = MoveInput { jump: frame == 0, ..idle() };
+            update_player(&mut player, &world, &input, dt as f32);
+            apex = apex.max(player.position.y);
+        }
+
+        // The discrete integrator analytically: v_k = J - G*dt*k stays positive
+        // for 21 steps at dt = 1/60, so the apex is sum_{k=1..21} v_k * dt.
+        // (`dt` crosses the physics boundary as f32, so mirror that rounding.)
+        let dt = (dt as f32) as f64;
+        let n = 21.0_f64;
+        let expected = JUMP_SPEED * n * dt - GRAVITY * dt * dt * (n * (n + 1.0) / 2.0);
+        let jumped = apex - start_y;
+        assert!(
+            (jumped - expected).abs() < 1e-9,
+            "jump apex changed: expected +{expected}, got +{jumped}"
+        );
     }
 }

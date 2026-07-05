@@ -206,6 +206,11 @@ impl Game {
             match event {
                 Incoming::Edit { x, y, z, spec } => {
                     // Resolve the portable spec against our own palette, then apply.
+                    // The server echoes our OWN edits back too (that server-ordered
+                    // echo is what converges racing edits on one cell); applying is
+                    // idempotent, so re-applying an edit we already made locally
+                    // just costs one redundant dirty-remesh per own edit —
+                    // acceptable.
                     let id = save::parse_block(&mut self.world, &spec);
                     self.world.set_block(x, y, z, id);
                 }

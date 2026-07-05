@@ -383,11 +383,15 @@ struct Field {
 struct Form {
     fields: Vec<Field>,
     selected: usize,
+    /// A transient validation message (e.g. a bad port) drawn in red in the
+    /// hint area. Set by the owning menu when a submit is refused; cleared on
+    /// the next editing keystroke.
+    error: Option<String>,
 }
 
 impl Form {
     fn new(fields: Vec<Field>) -> Self {
-        Self { fields, selected: 0 }
+        Self { fields, selected: 0, error: None }
     }
 
     /// Process a frame. Returns `Some(true)` on submit, `Some(false)` on cancel.
@@ -407,12 +411,14 @@ impl Form {
         }
         if eng.is_key_pressed(Key::Backspace) {
             self.fields[self.selected].value.pop();
+            self.error = None;
         }
         while let Some(c) = eng.get_char_pressed() {
             let field = &mut self.fields[self.selected];
             if !c.is_control() && field.value.len() < field.max {
                 field.value.push(c);
             }
+            self.error = None;
         }
         None
     }
@@ -448,13 +454,33 @@ impl Form {
 
         let hint_fs = 18;
         let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
+        // A refused submit's error sits just above the hint, in red, until the
+        // next keystroke.
+        if let Some(error) = &self.error {
+            let ex = (screen_w - f.measure_text(error, hint_fs)) / 2;
+            shadowed(f, error, ex, screen_h - 40 - (hint_fs + 8), hint_fs, Color::RED);
+        }
         shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
     }
 }
 
-/// Parse a port field, falling back to the default if it's blank or malformed.
-fn parse_port(text: &str) -> u16 {
-    text.trim().parse().unwrap_or(DEFAULT_PORT)
+/// The error shown when a submitted port doesn't parse.
+const PORT_ERROR: &str = "invalid port (1-65535)";
+
+/// Parse a port field. An EMPTY field keeps meaning [`DEFAULT_PORT`] — the
+/// form pre-fills the default, and clearing the field is a handy way to say
+/// "just use the default". Anything non-empty must be a real port (1-65535):
+/// `None` refuses the submit rather than silently falling back (a typo like
+/// "99999" used to silently become 5555 and host/join the wrong port).
+fn parse_port(text: &str) -> Option<u16> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(DEFAULT_PORT);
+    }
+    match text.parse::<u16>() {
+        Ok(0) | Err(_) => None,
+        Ok(port) => Some(port),
+    }
 }
 
 /// The host screen: choose a port, an optional password, and your name.
@@ -473,15 +499,23 @@ impl HostMenu {
         }
     }
 
-    /// Returns `Some(info)` to start hosting, `None` while editing. Cancelling (Esc)
-    /// is reported through the returned [`Option`] being `None` with `cancelled`.
+    /// Returns [`FormResult::Submit`] to start hosting, [`FormResult::Editing`]
+    /// while editing — including when a submit is refused for a bad port (the
+    /// form stays up with an error in the hint area) — and
+    /// [`FormResult::Cancel`] on Esc.
     pub fn update(&mut self, eng: &Engine) -> FormResult<HostInfo> {
         match self.form.update(eng) {
-            Some(true) => FormResult::Submit(HostInfo {
-                port: parse_port(self.form.value(0)),
-                password: self.form.value(1).to_string(),
-                name: self.form.value(2).to_string(),
-            }),
+            Some(true) => match parse_port(self.form.value(0)) {
+                Some(port) => FormResult::Submit(HostInfo {
+                    port,
+                    password: self.form.value(1).to_string(),
+                    name: self.form.value(2).to_string(),
+                }),
+                None => {
+                    self.form.error = Some(PORT_ERROR.to_string());
+                    FormResult::Editing
+                }
+            },
             Some(false) => FormResult::Cancel,
             None => FormResult::Editing,
         }
@@ -521,14 +555,22 @@ impl JoinMenu {
         }
     }
 
+    /// Same contract as [`HostMenu::update`]: a bad port refuses the submit and
+    /// keeps the form up with an error in the hint area.
     pub fn update(&mut self, eng: &Engine) -> FormResult<JoinInfo> {
         match self.form.update(eng) {
-            Some(true) => FormResult::Submit(JoinInfo {
-                host: self.form.value(0).trim().to_string(),
-                port: parse_port(self.form.value(1)),
-                password: self.form.value(2).to_string(),
-                name: self.form.value(3).to_string(),
-            }),
+            Some(true) => match parse_port(self.form.value(1)) {
+                Some(port) => FormResult::Submit(JoinInfo {
+                    host: self.form.value(0).trim().to_string(),
+                    port,
+                    password: self.form.value(2).to_string(),
+                    name: self.form.value(3).to_string(),
+                }),
+                None => {
+                    self.form.error = Some(PORT_ERROR.to_string());
+                    FormResult::Editing
+                }
+            },
             Some(false) => FormResult::Cancel,
             None => FormResult::Editing,
         }
@@ -556,4 +598,32 @@ pub enum FormResult<T> {
     Editing,
     Submit(T),
     Cancel,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_parsing_accepts_real_ports_and_refuses_junk() {
+        // Valid ports pass through untouched (whitespace tolerated).
+        assert_eq!(parse_port("5555"), Some(5555));
+        assert_eq!(parse_port(" 8080 "), Some(8080));
+        assert_eq!(parse_port("1"), Some(1));
+        assert_eq!(parse_port("65535"), Some(65535));
+
+        // An empty field keeps meaning the default — the pre-filled-form
+        // convenience must survive validation.
+        assert_eq!(parse_port(""), Some(DEFAULT_PORT));
+        assert_eq!(parse_port("   "), Some(DEFAULT_PORT));
+
+        // Out-of-range, zero, or non-numeric input refuses the submit instead
+        // of silently becoming the default (the "99999 -> 5555" bug).
+        assert_eq!(parse_port("99999"), None);
+        assert_eq!(parse_port("65536"), None);
+        assert_eq!(parse_port("0"), None);
+        assert_eq!(parse_port("-1"), None);
+        assert_eq!(parse_port("555x"), None);
+        assert_eq!(parse_port("port"), None);
+    }
 }

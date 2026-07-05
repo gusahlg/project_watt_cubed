@@ -12,6 +12,7 @@
 //! one element name per held unit — so old save files load identically.
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use voxel_engine::{Color, Engine, Frame, Key};
 
@@ -23,6 +24,10 @@ use crate::world::World;
 /// Starting capacity. Large-looking, but with no stacking it is modest — and meant
 /// to be upgraded over time.
 pub(crate) const START_CAPACITY: usize = 100;
+
+/// How long the "elements lost" warning stays on screen after the last
+/// overflowing break.
+const OVERFLOW_WARNING: Duration = Duration::from_millis(2500);
 
 /// The bare-list inventory view over the shared stash, and its HUD toggle.
 pub struct InventoryMod {
@@ -37,6 +42,9 @@ pub struct InventoryMod {
     header: String,
     /// The stash revision `rows` was built from; `u64::MAX` forces a first build.
     seen_rev: u64,
+    /// When a break last overflowed the stash (elements were destroyed), if
+    /// within the warning window. Drives the HUD's "elements lost" warning.
+    overflow_at: Option<Instant>,
 }
 
 impl InventoryMod {
@@ -47,6 +55,7 @@ impl InventoryMod {
             rows: Vec::new(),
             header: format!("Inventory  0/{START_CAPACITY}"),
             seen_rev: u64::MAX,
+            overflow_at: None,
         }
     }
 
@@ -95,25 +104,42 @@ impl Mod for InventoryMod {
         self.stash.borrow_mut().clear();
         self.visible = false;
         self.rows.clear();
+        self.overflow_at = None;
         // Force a rebuild against the cleared stash on the next update.
         self.seen_rev = u64::MAX;
     }
 
     fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
         // A broken block hands back its elements — each becomes one held unit.
-        self.stash.borrow_mut().add(elements);
+        // `add` is per-element best-effort: a full stash drops the overflow on
+        // the floor of the void, so arm the HUD warning — silently destroying
+        // elements is the one thing this list must never do quietly.
+        if !self.stash.borrow_mut().add(elements) {
+            self.overflow_at = Some(Instant::now());
+        }
         self.refresh_rows(world);
     }
 
     fn draw(&mut self, f: &mut Frame, screen_w: i32, _screen_h: i32) {
-        if !self.visible {
-            return;
-        }
-
         let fs = 18;
         let line_h = fs + 4;
         let x = screen_w - 230;
         let mut y = 90;
+
+        // The overflow warning outlives the list toggle: it is drawn for a
+        // short window after the last overflowing break EVEN while the list is
+        // closed, above where the list's header sits.
+        if let Some(at) = self.overflow_at {
+            if at.elapsed() <= OVERFLOW_WARNING {
+                shadowed(f, "Inventory full - elements lost!", x, y - line_h, fs, Color::RED);
+            } else {
+                self.overflow_at = None;
+            }
+        }
+
+        if !self.visible {
+            return;
+        }
 
         shadowed(f, &self.header, x, y, fs, Color::GOLD);
         y += line_h + 2;
@@ -179,6 +205,28 @@ mod tests {
             inventory.save_state(&world).as_deref(),
             Some("Stone,Stone,Soil")
         );
+    }
+
+    #[test]
+    fn breaking_into_a_full_stash_arms_the_overflow_warning() {
+        let world = World::new(1);
+        let stash = Rc::new(RefCell::new(ElementStash::new(1)));
+        let mut inventory = InventoryMod::new(stash.clone());
+        let stone = crate::block::element::El::Stone.id();
+
+        // Room left: no warning.
+        inventory.on_block_break(&[stone], &world);
+        assert!(inventory.overflow_at.is_none(), "no warning while everything fits");
+
+        // Full: the element is destroyed, and the warning must be armed.
+        inventory.on_block_break(&[stone], &world);
+        assert_eq!(stash.borrow().total(), 1, "the overflow element was dropped");
+        let armed = inventory.overflow_at.expect("dropping elements must arm the warning");
+        assert!(armed.elapsed() <= OVERFLOW_WARNING, "freshly armed: inside the window");
+
+        // Entering another world clears the warning with the rest of the state.
+        inventory.reset();
+        assert!(inventory.overflow_at.is_none(), "reset must clear the warning");
     }
 
     #[test]

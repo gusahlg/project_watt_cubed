@@ -546,8 +546,16 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32
     }
 }
 
-/// Validate and record a block edit, then broadcast it to every other player so all
-/// overlays stay in agreement.
+/// Validate and record a block edit, then broadcast it to EVERY player —
+/// including the sender — so all overlays converge on the server's ordering.
+///
+/// Echoing the edit back to its own sender is deliberate. When two players race
+/// edits on the same cell (place vs break), the order the server records them
+/// in is the one truth, and every client converges by applying the server's
+/// stream in that order; the sender's optimistic local apply is then either
+/// confirmed by its own echo or overwritten by the later edit. Excluding the
+/// sender (the old behavior) left the two editors permanently disagreeing
+/// about the cell whenever their edits raced.
 fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &str) {
     // Y is unbounded now (infinite world height/depth); reach is the real gate.
     if spec.len() > MAX_SPEC {
@@ -564,7 +572,7 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &s
     // The overlay stores the portable spec verbatim; the server never resolves it.
     state.edits.insert((x, y, z), spec.to_string());
     let msg = ServerMessage::Edit { x, y, z, spec: spec.to_string() };
-    broadcast(&mut state, &msg, |pid, _| pid != id);
+    broadcast(&mut state, &msg, |_, _| true);
 }
 
 /// Relay a chat line to its audience: proximity for local, everyone for global.
@@ -738,6 +746,49 @@ mod tests {
         let state = shared.lock().unwrap();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
         assert!(!state.edits.contains_key(&(500, 20, 500)), "out-of-reach edit dropped");
+    }
+
+    /// The server-ordered edit must be echoed back to its own sender — that
+    /// echo is what converges racing place-vs-break edits on one cell (see
+    /// [`on_edit`]). A rejected edit must echo nothing.
+    #[test]
+    fn edits_are_echoed_to_the_sender() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+        let mut players = HashMap::new();
+        players.insert(
+            1u32,
+            PlayerHandle {
+                name: "p".into(),
+                pos: DVec3::new(8.5, 20.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                out,
+                kick: stream,
+                ready: true,
+                backlog: Vec::new(),
+            },
+        );
+        let shared = Arc::new(Mutex::new(State {
+            edits: HashMap::new(),
+            players,
+            grid: HashMap::new(),
+            next_id: 2,
+        }));
+
+        // Out of reach: rejected, so nothing (not even an echo) is queued.
+        on_edit(&shared, 1, 500, 20, 500, "air");
+        assert!(rx.try_recv().is_err(), "a rejected edit must not be echoed");
+
+        // In reach: recorded AND echoed to the sender themself.
+        on_edit(&shared, 1, 8, 20, 8, "air");
+        let frame = rx.try_recv().expect("the sender must receive their own edit");
+        match ServerMessage::decode(&frame) {
+            Some(ServerMessage::Edit { x: 8, y: 20, z: 8, spec }) if spec == "air" => {}
+            other => panic!("expected the sender's edit echoed back, got {other:?}"),
+        }
     }
 
     /// A hand-built state, no sockets: the grid entry must follow the player
