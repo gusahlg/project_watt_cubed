@@ -9,7 +9,7 @@
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use voxel_engine::{Color, Engine, Vec3};
+use voxel_engine::{Color, DVec3, Engine};
 
 use crate::console::shadowed;
 use crate::game::{Game, Signal};
@@ -76,6 +76,9 @@ struct Bench {
     /// Per-frame durations, for avg and percentile stats.
     samples: Vec<f32>,
     started: bool,
+    /// Where to park the bench player (`WATT_BENCH_POS="x,y,z"`), for
+    /// far-coordinate fps parity checks. `None` benches at spawn.
+    pos: Option<DVec3>,
 }
 
 impl App {
@@ -98,6 +101,7 @@ impl App {
                 elapsed: 0.0,
                 samples: Vec::with_capacity(1 << 17),
                 started: false,
+                pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
             }),
         }
     }
@@ -179,11 +183,22 @@ impl App {
 
         if !bench.started {
             bench.started = true;
+            let pos = bench.pos;
             // Uncapped and unsynced, or the bench measures the throttle.
             self.settings.vsync = false;
             self.settings.max_fps = 0;
             self.settings.apply(eng);
             self.start_new_world(eng);
+            // Far-coordinate bench: park the player at the requested position
+            // with the ground under them made real, and give streaming a
+            // little extra warmup to catch up before sampling starts.
+            if let (Some(pos), Some(game)) = (pos, &mut self.game) {
+                game.player_mut().position = pos;
+                game.world_mut().prepare_around(pos);
+                if let Some(bench) = &mut self.bench {
+                    bench.warmup += 2.0;
+                }
+            }
             return true;
         }
         let Some(game) = &mut self.game else {
@@ -449,5 +464,12 @@ fn fresh_seed() -> i64 {
 /// land on solid ground.
 fn spawn_player(world: &World) -> Player {
     let surface = world.surface_y(0, 0);
-    Player::new(Vec3::new(0.5, surface as f32 + 3.0, 0.5))
+    Player::new(DVec3::new(0.5, surface as f64 + 3.0, 0.5))
+}
+
+/// Parse `WATT_BENCH_POS="x,y,z"` into a position (f64, comma-separated).
+fn parse_bench_pos(raw: &str) -> Option<DVec3> {
+    let mut parts = raw.split(',').map(|p| p.trim().parse::<f64>());
+    let (x, y, z) = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?);
+    parts.next().is_none().then(|| DVec3::new(x, y, z))
 }

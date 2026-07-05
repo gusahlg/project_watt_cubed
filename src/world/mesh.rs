@@ -10,9 +10,18 @@
 //!   rectangles (per face direction), cutting vertex counts by an order of
 //!   magnitude on rolling terrain. Merging is lossless because two faces merge
 //!   only on identical [`BlockId`] (== texture layer, and shade is constant per
-//!   direction), and UVs are the face plane's world coordinates: a quad
+//!   direction), and UVs are the face plane's CHUNK-LOCAL coordinates: a quad
 //!   spanning k blocks gets a uv extent of k, so REPEAT sampling tiles the
-//!   16x16 block texture once per block across the merged span.
+//!   16x16 block texture once per block across the merged span. Local UVs tile
+//!   seamlessly *across* chunks too: the texture period is 1 uv unit and a
+//!   chunk spans exactly 16 — a whole number of periods — so the pattern phase
+//!   at a chunk's 16-edge equals the neighbour's 0-edge.
+//! - Vertices are CHUNK-LOCAL (positions in 0..=16, exact in f32); the world
+//!   places each chunk with a per-draw camera-relative offset
+//!   (`Frame3D::draw_mesh(handle, offset)`), so far-from-origin chunks carry
+//!   no giant world coordinates that would round in f32 and jitter. Mesh AABBs
+//!   (computed by the engine from the vertices) are local for the same reason;
+//!   culling tests them against the same offset.
 //! - Per-face directional shading is baked into the vertex colour multiplier,
 //!   which fakes cheap lighting without needing lit shaders (the engine is
 //!   unlit); `color.a` carries the block-texture-array layer, i.e. the block id.
@@ -254,8 +263,8 @@ impl CellRead for UniformCells {
 /// slice indexed by [`BlockId`], so the per-voxel loops never leave L1. Colour
 /// comes from the block texture array: `color.a` = block id = texture layer.
 ///
-/// World-space positions are baked straight into the vertices, so every
-/// chunk's mesh is drawn at the origin.
+/// Positions are CHUNK-LOCAL (0..=16); the caller draws the mesh with a
+/// camera-relative offset (see the module docs).
 pub fn build_chunk_mesh(
     chunk: &Chunk,
     neighbours: &Neighbours,
@@ -276,11 +285,6 @@ pub fn build_chunk_mesh_with<N: NeighbourRead>(
     out: &mut MeshData,
 ) {
     out.clear();
-    let base = [
-        chunk.cx * CHUNK_SIZE as i32,
-        chunk.cy * CHUNK_SIZE as i32,
-        chunk.cz * CHUNK_SIZE as i32,
-    ];
     match chunk.data() {
         ChunkData::Uniform(id) => {
             if !solid[id.0 as usize] {
@@ -289,10 +293,10 @@ pub fn build_chunk_mesh_with<N: NeighbourRead>(
             // Uniform solid: interior faces are impossible, so only the six
             // border slices are swept. With six fully-solid neighbour planes
             // every mask comes up empty and the mesh stays empty.
-            sweep(&UniformCells(*id), true, neighbours, solid, base, out);
+            sweep(&UniformCells(*id), true, neighbours, solid, out);
         }
         ChunkData::Dense(cells) => {
-            sweep(&DenseCells(cells), false, neighbours, solid, base, out);
+            sweep(&DenseCells(cells), false, neighbours, solid, out);
         }
     }
 }
@@ -306,7 +310,6 @@ fn sweep<C: CellRead, N: NeighbourRead>(
     edge_only: bool,
     neighbours: &N,
     solid: &[bool],
-    base: [i32; 3],
     out: &mut MeshData,
 ) {
     let mut mask: [BlockId; MASK_CAP] = [AIR; MASK_CAP];
@@ -379,7 +382,7 @@ fn sweep<C: CellRead, N: NeighbourRead>(
                         let row = (v0 + dv) * CHUNK_SIZE;
                         mask[u0 + row..u0 + w + row].fill(AIR);
                     }
-                    emit_rect(out, dir, base, n, u0, v0, w, h, id);
+                    emit_rect(out, dir, n, u0, v0, w, h, id);
                 }
             }
         }
@@ -389,16 +392,17 @@ fn sweep<C: CellRead, N: NeighbourRead>(
 /// Append one merged rectangle: 4 vertices and 6 indices, corners scaled from
 /// the direction's unit-quad table by the rectangle's U/V extents.
 ///
-/// UV = the two varying world coordinates of the face's plane (+Y/-Y: (x,z);
-/// +X/-X: (z,y); +Z/-Z: (x,y)) — exactly `(pos[u_axis], pos[v_axis])` — so a
-/// rect spanning k blocks spans k uv units and REPEAT shows one texture
-/// repetition per block. Colour rgb = the direction's shade as a gray
-/// multiplier; colour a = the block id, i.e. the texture-array layer.
+/// UV = the two varying CHUNK-LOCAL coordinates of the face's plane (+Y/-Y:
+/// (x,z); +X/-X: (z,y); +Z/-Z: (x,y)) — exactly `(pos[u_axis], pos[v_axis])`
+/// — so a rect spanning k blocks spans k uv units and REPEAT shows one
+/// texture repetition per block. Local coords keep tiling seamless across
+/// chunk borders because 16 is a whole number of texture periods (period =
+/// 1 uv unit). Colour rgb = the direction's shade as a gray multiplier;
+/// colour a = the block id, i.e. the texture-array layer.
 #[allow(clippy::too_many_arguments)]
 fn emit_rect(
     out: &mut MeshData,
     dir: &Dir,
-    base: [i32; 3],
     n: usize,
     u0: usize,
     v0: usize,
@@ -409,10 +413,10 @@ fn emit_rect(
     debug_assert!(id.0 < 256, "block texture layers are u8 for now");
     let shade = (255.0 * dir.shade) as u8;
 
-    let mut origin = [0.0f32; 3]; // world position of the rect's minimum block corner
-    origin[dir.n_axis] = (base[dir.n_axis] + n as i32) as f32;
-    origin[dir.u_axis] = (base[dir.u_axis] + u0 as i32) as f32;
-    origin[dir.v_axis] = (base[dir.v_axis] + v0 as i32) as f32;
+    let mut origin = [0.0f32; 3]; // chunk-local position of the rect's minimum block corner
+    origin[dir.n_axis] = n as f32;
+    origin[dir.u_axis] = u0 as f32;
+    origin[dir.v_axis] = v0 as f32;
 
     let start = out.vertices.len() as u32;
     for corner in &dir.corners {
@@ -580,7 +584,7 @@ mod tests {
         assert_eq!(total_area(&data), reference as f32);
 
         // The merged top quad carries full-brightness shade, STONE's layer,
-        // and world-coordinate uvs spanning the full 3-block extent so REPEAT
+        // and local-coordinate uvs spanning the full 3-block extent so REPEAT
         // tiles the texture once per block.
         let top = data
             .vertices
@@ -702,11 +706,13 @@ mod tests {
     }
 
     #[test]
-    fn face_uvs_are_the_planes_world_coords_per_direction() {
-        // A single cube away from the origin: every face's uv must equal the
-        // two varying world coordinates of its plane. Faces are identified by
-        // their baked shade byte, which is unique per direction.
-        let mut chunk = empty_chunk();
+    fn face_uvs_are_the_planes_local_coords_per_direction() {
+        // A single cube in a chunk FAR from the origin: vertices must be
+        // chunk-local (0..=16 exactly — the far world coordinate never touches
+        // the f32 mesh), and every face's uv must equal the two varying local
+        // coordinates of its plane. Faces are identified by their baked shade
+        // byte, which is unique per direction.
+        let mut chunk = Chunk::new(6_250_000, 40, -6_250_000, &EmptyGen);
         chunk.set_local(2, 3, 4, STONE);
         let data = build(&chunk);
         assert_eq!(data.vertices.len(), 24, "six 1x1 faces");
@@ -714,6 +720,11 @@ mod tests {
         for q in data.vertices.chunks_exact(4) {
             let shade = q[0].color[0];
             for v in q {
+                assert!(
+                    v.pos.iter().all(|&c| (0.0..=CHUNK_SIZE as f32).contains(&c)),
+                    "vertices are chunk-local, got {:?}",
+                    v.pos
+                );
                 assert_eq!(v.color[3], STONE.0 as u8, "layer = block id");
                 assert_eq!([v.color[0], v.color[1], v.color[2]], [shade; 3], "gray shade");
                 match shade {
@@ -723,6 +734,30 @@ mod tests {
                     other => panic!("unexpected shade byte {other}"),
                 }
             }
+        }
+        // The cube sits at local (2, 3, 4) regardless of the chunk coordinate.
+        let min = |axis: usize| {
+            data.vertices.iter().map(|v| v.pos[axis]).fold(f32::INFINITY, f32::min)
+        };
+        assert_eq!((min(0), min(1), min(2)), (2.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn far_chunk_meshes_byte_identically_to_the_origin_chunk() {
+        // Chunk-local emission means the mesh is a pure function of contents —
+        // the chunk coordinate must not leak into a single float. This is what
+        // makes far terrain render exactly (the offset is applied per draw).
+        let mut near = Chunk::new(0, 0, 0, &EmptyGen);
+        let mut far = Chunk::new(62_500_000, -3_000, -62_500_000, &EmptyGen);
+        for (x, y, z, id) in [(0, 0, 0, STONE), (1, 0, 0, STONE), (5, 9, 15, DIRT)] {
+            near.set_local(x, y, z, id);
+            far.set_local(x, y, z, id);
+        }
+        let (a, b) = (build(&near), build(&far));
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.vertices.len(), b.vertices.len());
+        for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+            assert_eq!((va.pos, va.uv, va.color), (vb.pos, vb.uv, vb.color));
         }
     }
 

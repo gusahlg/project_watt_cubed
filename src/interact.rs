@@ -1,8 +1,13 @@
 //! interact.rs turns where the player looks into which block they act on: a voxel
 //! ray-march from the eye along the view direction, returning the first solid block
 //! within reach. Breaking and (later) placing are built on this one query.
-use voxel_engine::Vec3;
+//!
+//! The march runs in `f64`: at far coordinates an `f32` origin can't even
+//! represent which cell the eye is in (ULP > 1 block past ~2^24), while `f64`
+//! boundary distances stay exact out to the world border.
+use voxel_engine::DVec3;
 
+use crate::math::block_coord;
 use crate::world::World;
 
 /// A block the aim ray struck.
@@ -18,17 +23,19 @@ pub struct RayHit {
 /// March a ray from `origin` along `dir` up to `reach` world units and return the
 /// first solid block, using Amanatides–Woo grid traversal (each iteration crosses
 /// exactly one voxel face, so nothing is skipped or double-visited).
-pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<RayHit> {
+pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<RayHit> {
     let len = dir.length();
     if len == 0.0 {
         return None;
     }
     let dir = dir * (1.0 / len);
 
+    // The start cell goes through the shared clamped conversion; every further
+    // cell is one ±1 step from it, so the i32 march can't overflow either.
     let (mut x, mut y, mut z) = (
-        origin.x.floor() as i32,
-        origin.y.floor() as i32,
-        origin.z.floor() as i32,
+        block_coord(origin.x),
+        block_coord(origin.y),
+        block_coord(origin.z),
     );
     if world.is_solid(x, y, z) {
         return Some(RayHit {
@@ -37,20 +44,21 @@ pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<Ray
         });
     }
 
-    let step = |d: f32| if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 };
+    let step = |d: f64| if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 };
     let (step_x, step_y, step_z) = (step(dir.x), step(dir.y), step(dir.z));
 
     // Distance (in ray length) to the first voxel boundary on each axis, and the
     // distance between successive boundaries. A zero component never crosses, so its
-    // boundaries sit at infinity.
-    let boundary = |o: f32, cell: i32, d: f32| -> f32 {
+    // boundaries sit at infinity. (`cell as f64` is exact: cells are bounded by
+    // the world border, far below 2^53.)
+    let boundary = |o: f64, cell: i32, d: f64| -> f64 {
         if d == 0.0 {
-            return f32::INFINITY;
+            return f64::INFINITY;
         }
         let next = if d > 0.0 {
-            (cell as f32 + 1.0) - o
+            (cell as f64 + 1.0) - o
         } else {
-            o - cell as f32
+            o - cell as f64
         };
         next / d.abs()
     };
@@ -59,7 +67,7 @@ pub fn raycast(world: &World, origin: Vec3, dir: Vec3, reach: f32) -> Option<Ray
         boundary(origin.y, y, dir.y),
         boundary(origin.z, z, dir.z),
     );
-    let t_delta = |d: f32| if d == 0.0 { f32::INFINITY } else { (1.0 / d).abs() };
+    let t_delta = |d: f64| if d == 0.0 { f64::INFINITY } else { (1.0 / d).abs() };
     let (t_delta_x, t_delta_y, t_delta_z) = (t_delta(dir.x), t_delta(dir.y), t_delta(dir.z));
 
     let mut t = 0.0;
@@ -99,8 +107,8 @@ mod tests {
     fn looking_down_hits_the_ground() {
         let world = World::generate();
         // Start high above a known column and look straight down.
-        let origin = Vec3::new(8.5, 40.0, 8.5);
-        let hit = raycast(&world, origin, Vec3::new(0.0, -1.0, 0.0), 60.0)
+        let origin = DVec3::new(8.5, 40.0, 8.5);
+        let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)
             .expect("a downward ray should hit the terrain");
         assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
         // The cell just above the hit block is the empty one the ray last passed.
@@ -110,8 +118,8 @@ mod tests {
     #[test]
     fn previous_is_the_cell_above_when_looking_down() {
         let world = World::generate();
-        let origin = Vec3::new(8.5, 40.0, 8.5);
-        let hit = raycast(&world, origin, Vec3::new(0.0, -1.0, 0.0), 60.0)
+        let origin = DVec3::new(8.5, 40.0, 8.5);
+        let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)
             .expect("a downward ray should hit the terrain");
         // Straight down: `previous` is exactly the cell above the hit block, and
         // it is empty (a placed block would fit there).
@@ -123,7 +131,31 @@ mod tests {
     #[test]
     fn ray_into_open_sky_misses() {
         let world = World::generate();
-        let origin = Vec3::new(8.5, 40.0, 8.5);
-        assert!(raycast(&world, origin, Vec3::new(0.0, 1.0, 0.0), 20.0).is_none());
+        let origin = DVec3::new(8.5, 40.0, 8.5);
+        assert!(raycast(&world, origin, DVec3::new(0.0, 1.0, 0.0), 20.0).is_none());
+    }
+
+    #[test]
+    fn raycast_hits_correctly_at_1e8() {
+        // Far out, the ray must still land on the surface column under the eye
+        // and report the empty cell above it — the f32 version couldn't even
+        // resolve which column the origin was in.
+        let mut world = World::generate();
+        let origin = DVec3::new(1.0e8 + 8.5, 40.0, 8.5);
+        world.prepare_around(origin);
+        let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)
+            .expect("a downward ray should hit the terrain at 1e8");
+        let (bx, by, bz) = hit.block;
+        assert_eq!((bx, bz), (100_000_008, 8), "hits the column under the eye");
+        assert!(world.is_solid(bx, by, bz));
+        assert_eq!(by + 1, world.surface_y(bx, bz), "hits the surface block");
+        assert_eq!(hit.previous, (bx, by + 1, bz));
+        assert!(!world.is_solid(bx, by + 1, bz));
+
+        // A slanted ray from the same eye still steps cell-exactly.
+        let hit = raycast(&world, origin, DVec3::new(0.4, -1.0, 0.2), 60.0)
+            .expect("slanted far ray hits");
+        assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
+        assert!(!world.is_solid(hit.previous.0, hit.previous.1, hit.previous.2));
     }
 }

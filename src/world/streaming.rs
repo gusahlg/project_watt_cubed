@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 
-use voxel_engine::{Engine, MeshData, Vec3};
+use voxel_engine::{DVec3, Engine, MeshData};
 
 use crate::block::registry::{AIR, BlockId};
+use crate::math::block_coord;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::{
@@ -32,16 +33,16 @@ impl World {
     /// channel poll, the unload/generate pass only runs when the player crosses
     /// a chunk boundary (or the radius changed), and the fresh-mesh scan is
     /// skipped once a scan has found nothing left to hand out.
-    pub fn stream(&mut self, center: Vec3, eng: &mut Engine) {
+    pub fn stream(&mut self, center: DVec3, eng: &mut Engine) {
         // Palette growth re-uploads the block texture array before any meshing
         // this frame, so vertices never reference a layer that isn't there.
         // Covers the initial upload too (0 tracked -> N on the first stream).
         self.refresh_textures(eng);
         let s = CHUNK_SIZE as i32;
         let center_chunk = (
-            (center.x.floor() as i32).div_euclid(s),
-            (center.y.floor() as i32).div_euclid(s),
-            (center.z.floor() as i32).div_euclid(s),
+            block_coord(center.x).div_euclid(s),
+            block_coord(center.y).div_euclid(s),
+            block_coord(center.z).div_euclid(s),
         );
         // Adopt the real centre BEFORE draining: after a radius change or
         // world reset the stored centre is a far-away sentinel, and draining
@@ -264,8 +265,8 @@ impl World {
     /// few frames to catch up — during which collision would read the void as
     /// air and embed the player in late-arriving ground. Uniform fast paths
     /// make this box cheap (sky/deep-rock chunks are proven uniform).
-    pub fn prepare_around(&mut self, pos: Vec3) {
-        let c = Self::chunk_of(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+    pub fn prepare_around(&mut self, pos: DVec3) {
+        let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
         for cx in (c.0 - 1)..=(c.0 + 1) {
             for cz in (c.2 - 1)..=(c.2 + 1) {
                 for cy in (c.1 - 2)..=(c.1 + 1) {

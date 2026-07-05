@@ -3,7 +3,7 @@
 //! The window and the menu/play state machine live one level up in [`app`](crate::app);
 //! a `Game` is handed the engine each frame and reports back whether to keep playing
 //! or return to the menu.
-use voxel_engine::{Camera3D, Color, Engine, Key, MouseButton, Vec2, Vec3};
+use voxel_engine::{Camera3D, Color, DVec3, Engine, Key, MouseButton, Vec2, Vec3};
 
 use crate::block::AIR;
 use crate::command;
@@ -21,13 +21,14 @@ use crate::sim::Simulation;
 use crate::world::World;
 
 /// How far the player can reach to break a block, in world units.
-const REACH: f32 = 6.0;
+const REACH: f64 = 6.0;
 const HELP_TEXT: &str = "WASD move | mouse look | Space jump | F fly | LMB break | I inventory | C craft | Tab cursor | T chat/cmd | Esc menu";
 /// Half-extents of another player's drawn body — matches the collision box in
-/// [`player`](crate::player::PLAYER_HALF).
-const PEER_HALF: Vec3 = Vec3::new(0.3, 0.9, 0.3);
+/// [`player`](crate::player::PLAYER_HALF). `f64` like all position math; cast
+/// to `f32` only for the (camera-relative) draw calls.
+const PEER_HALF: DVec3 = DVec3::new(0.3, 0.9, 0.3);
 /// Peers past this distance get no floating name tag (it would be unreadable).
-const TAG_RANGE: f32 = 90.0;
+const TAG_RANGE: f64 = 90.0;
 
 /// What a game update wants the app to do next.
 pub enum Signal {
@@ -279,9 +280,11 @@ impl Game {
             if self.world.block_at(x, y, z) != AIR {
                 continue;
             }
+            // Overlap check in f64: at far coordinates an f32 cell centre
+            // would land whole blocks away from the real cell.
             let cell = Aabb::new(
-                Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5),
-                Vec3::splat(0.5),
+                DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+                DVec3::splat(0.5),
             );
             if cell.intersects(&self.player.aabb()) {
                 continue;
@@ -306,8 +309,16 @@ impl Game {
     }
 
     /// Render the world and HUD (owns its own draw pass for the frame).
+    ///
+    /// CAMERA REBASE: the camera sits at `Vec3::ZERO` looking along the view
+    /// direction ([`Player::camera_with_fov`](crate::player::Player)), and
+    /// every 3D draw is camera-relative — the world passes per-chunk offsets
+    /// to `draw_mesh`, peers subtract the eye. All differences are taken in
+    /// `f64` first, so only *small* camera-local values ever reach the `f32`
+    /// GPU path; the world can be 1e9 blocks wide without a vertex jittering.
     pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32) {
         let camera = self.player.camera_with_fov(fov);
+        let cam_pos = self.player.position;
 
         let p = self.player.position;
         let coord_text = format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z);
@@ -316,8 +327,8 @@ impl Game {
         let screen_h = eng.screen_height();
         let coord_x = (screen_w - eng.measure_text(&coord_text, coord_fs)) / 2;
 
-        // Gather the other players to draw, projecting a head point to screen space
-        // for the floating name tags.
+        // Gather the other players to draw (camera-relative), projecting a head
+        // point to screen space for the floating name tags.
         let peers = self.peer_draws(eng, &camera);
         let online = self.net.as_ref().map(|net| net.peers().count() + 1);
 
@@ -325,13 +336,14 @@ impl Game {
 
         {
             let mut f3 = f.begin_3d(&camera);
-            self.world.render(&mut f3);
+            self.world.render(&mut f3, cam_pos);
             // Other players: a body box and a small head, tinted per player.
+            // `peer.pos` is already camera-relative (see `peer_draws`).
             for peer in &peers {
-                let body = PEER_HALF * 2.0;
+                let body = (PEER_HALF * 2.0).as_vec3();
                 f3.draw_cube(peer.pos, body, peer.color);
                 f3.draw_cube_wires(peer.pos, body, Color::BLACK);
-                let head = peer.pos + Vec3::new(0.0, PEER_HALF.y + 0.2, 0.0);
+                let head = peer.pos + Vec3::new(0.0, PEER_HALF.y as f32 + 0.2, 0.0);
                 f3.draw_cube(head, Vec3::splat(0.4), peer.color);
             }
         }
@@ -374,18 +386,20 @@ impl Game {
 
     /// Build the per-frame draw data for other players, projecting a head point to
     /// screen space for the name tag (only for peers in front and within range).
+    /// The in-front/range filters run in `f64`; the projection takes the
+    /// CAMERA-RELATIVE head with the origin-based camera, matching the scene.
     fn peer_draws(&self, eng: &Engine, camera: &Camera3D) -> Vec<PeerDraw> {
         let Some(net) = &self.net else { return Vec::new() };
         let eye = self.player.position;
         let forward = self.player.forward();
         net.peers()
             .map(|peer| {
-                let head = peer.pos + Vec3::new(0.0, PEER_HALF.y + 0.4, 0.0);
+                let head = peer.pos + DVec3::new(0.0, PEER_HALF.y + 0.4, 0.0);
                 let to_head = head - eye;
                 let visible = to_head.dot(forward) > 0.0 && to_head.length() <= TAG_RANGE;
-                let tag = visible.then(|| eng.world_to_screen(head, camera));
+                let tag = visible.then(|| eng.world_to_screen(to_head.as_vec3(), camera));
                 PeerDraw {
-                    pos: peer.pos,
+                    pos: (peer.pos - eye).as_vec3(),
                     color: peer_color(&peer.name),
                     name: peer.name.clone(),
                     tag,
@@ -397,6 +411,8 @@ impl Game {
 
 /// Everything needed to draw one other player this frame.
 struct PeerDraw {
+    /// Camera-relative position (world position minus the eye, subtracted in
+    /// f64, then narrowed) — safe to hand to the f32 immediate draws.
     pos: Vec3,
     color: Color,
     name: String,

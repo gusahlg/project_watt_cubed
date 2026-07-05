@@ -7,9 +7,10 @@
 //! `/gfx` edits the [`Settings`] value only; the caller applies it to the engine
 //! (and the world's render distance) after the command returns. That keeps every
 //! command testable without a window.
-use voxel_engine::Vec3;
+use voxel_engine::DVec3;
 
 use crate::block::Composition;
+use crate::math::{WORLD_BORDER, block_coord};
 use crate::player::{PLAYER_HALF, Player};
 use crate::settings::Settings;
 use crate::world::World;
@@ -42,15 +43,19 @@ pub fn execute(
     }
 }
 
-/// `tp <x> <y> <z>` — move the player to absolute world coordinates.
+/// `tp <x> <y> <z>` — move the player to absolute world coordinates, clamped
+/// to the ±[`WORLD_BORDER`] cube (the same clamp movement applies, so no code
+/// path can carry a position that would overflow i32 block math). The output
+/// reports the position actually landed on, clamp included.
 fn teleport(args: &[&str], player: &mut Player) -> Vec<String> {
     if args.len() != 3 {
         return vec!["usage: tp <x> <y> <z>".to_string()];
     }
-    let parsed: Result<Vec<f32>, _> = args.iter().map(|a| a.parse::<f32>()).collect();
+    let parsed: Result<Vec<f64>, _> = args.iter().map(|a| a.parse::<f64>()).collect();
     match parsed.as_deref() {
-        Ok([x, y, z]) => {
-            player.position = Vec3::new(*x, *y, *z);
+        Ok([x, y, z]) if x.is_finite() && y.is_finite() && z.is_finite() => {
+            player.position = DVec3::new(*x, *y, *z)
+                .clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
             // Cancel any accumulated fall so the player doesn't rocket down on arrival.
             player.velocity_y = 0.0;
             vec![format!("teleported to {}", fmt_pos(player.position))]
@@ -194,9 +199,9 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<String> {
             // bias keeps it stable when standing exactly on a block's top face.
             let p = player.position;
             (
-                p.x.floor() as i32,
-                (p.y - PLAYER_HALF.y - 0.1).floor() as i32,
-                p.z.floor() as i32,
+                block_coord(p.x),
+                block_coord(p.y - PLAYER_HALF.y - 0.1),
+                block_coord(p.z),
             )
         }
         [x, y, z] => match (x.parse(), y.parse(), z.parse()) {
@@ -279,7 +284,7 @@ fn help() -> Vec<String> {
 }
 
 /// Format a position the same way the on-screen coordinate readout does.
-fn fmt_pos(p: Vec3) -> String {
+fn fmt_pos(p: DVec3) -> String {
     format!("X {:.1}  Y {:.1}  Z {:.1}", p.x, p.y, p.z)
 }
 
@@ -288,7 +293,7 @@ mod tests {
     use super::*;
 
     fn player() -> Player {
-        Player::new(Vec3::new(0.0, 0.0, 0.0))
+        Player::new(DVec3::new(0.0, 0.0, 0.0))
     }
 
     /// A real generated world; cheap and GPU-free (meshes are uploaded separately).
@@ -306,25 +311,44 @@ mod tests {
         let (mut p, w) = (player(), world());
         p.velocity_y = -50.0;
         let out = run("tp 1.5 2 3", &mut p, &w);
-        assert_eq!(p.position, Vec3::new(1.5, 2.0, 3.0));
+        assert_eq!(p.position, DVec3::new(1.5, 2.0, 3.0));
         assert_eq!(p.velocity_y, 0.0);
         assert!(out[0].contains("teleported"));
+    }
+
+    #[test]
+    fn tp_keeps_f64_precision_and_clamps_to_the_border() {
+        let (mut p, w) = (player(), world());
+        // Far coordinates parse as f64: no f32 quantisation on the way in.
+        run("tp 100000000.5 60 -7", &mut p, &w);
+        assert_eq!(p.position, DVec3::new(100_000_000.5, 60.0, -7.0));
+
+        // Past the border: clamped, and the OUTPUT reports the clamped spot.
+        let out = run("tp 99999999999 60 -99999999999", &mut p, &w);
+        assert_eq!(p.position.x, 1.0e9);
+        assert_eq!(p.position.z, -1.0e9);
+        assert!(out[0].contains("1000000000.0"), "reports the clamped position: {out:?}");
+
+        // Non-finite input is refused outright.
+        let before = p.position;
+        run("tp inf 0 0", &mut p, &w);
+        assert_eq!(p.position, before);
     }
 
     #[test]
     fn leading_slash_is_optional() {
         let (mut p, w) = (player(), world());
         run("/tp 4 5 6", &mut p, &w);
-        assert_eq!(p.position, Vec3::new(4.0, 5.0, 6.0));
+        assert_eq!(p.position, DVec3::new(4.0, 5.0, 6.0));
     }
 
     #[test]
     fn bad_args_do_not_move_the_player() {
         let (mut p, w) = (player(), world());
         run("tp 1 two 3", &mut p, &w);
-        assert_eq!(p.position, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(p.position, DVec3::new(0.0, 0.0, 0.0));
         run("tp 1 2", &mut p, &w);
-        assert_eq!(p.position, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(p.position, DVec3::new(0.0, 0.0, 0.0));
     }
 
     #[test]

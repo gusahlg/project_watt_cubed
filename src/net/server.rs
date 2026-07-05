@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use voxel_engine::Vec3;
+use voxel_engine::DVec3;
+
+use crate::math::block_coord;
 
 use crate::block::registry::BlockRegistry;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
@@ -58,12 +60,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RATE_LIMIT: u32 = 300;
 /// A position update is only sent to players within this many world units of the
 /// mover — nobody past render distance needs it.
-const INTEREST_RADIUS: f32 = 160.0;
+const INTEREST_RADIUS: f64 = 160.0;
 /// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
-const INTEREST_RADIUS_SQ: f32 = INTEREST_RADIUS * INTEREST_RADIUS;
+const INTEREST_RADIUS_SQ: f64 = INTEREST_RADIUS * INTEREST_RADIUS;
 /// A client may edit a block at most this far from its own reported eye position;
 /// farther edits are rejected as bogus. A little past the client's reach constant.
-const EDIT_REACH: f32 = 8.0;
+const EDIT_REACH: f64 = 8.0;
 /// Edits are streamed to a joining client in batches this size, so a very built-up
 /// world's snapshot never overflows a single frame's size cap. Derived from the
 /// worst case per edit — 12 bytes x/y/z + 2-byte length prefix + [`MAX_SPEC`]
@@ -92,7 +94,7 @@ struct Ctx {
 /// One connected player as the server tracks them.
 struct PlayerHandle {
     name: String,
-    pos: Vec3,
+    pos: DVec3,
     yaw: f32,
     pitch: f32,
     /// Outbound queue drained by this client's writer thread.
@@ -141,13 +143,13 @@ struct State {
 impl State {
     /// Add `id` to the grid bucket containing `pos`. Must run under the same lock
     /// hold as the roster/position change it mirrors, or the grid drifts.
-    fn grid_insert(&mut self, id: u32, pos: Vec3) {
+    fn grid_insert(&mut self, id: u32, pos: DVec3) {
         self.grid.entry(bucket_of(pos)).or_default().push(id);
     }
 
     /// Remove `id` from the grid bucket containing `pos`, dropping the bucket when
     /// it empties so long-running churn can never accumulate dead keys.
-    fn grid_remove(&mut self, id: u32, pos: Vec3) {
+    fn grid_remove(&mut self, id: u32, pos: DVec3) {
         let key = bucket_of(pos);
         if let Some(bucket) = self.grid.get_mut(&key) {
             bucket.retain(|&p| p != id);
@@ -158,11 +160,12 @@ impl State {
     }
 }
 
-/// The interest-grid bucket containing `pos`. `floor` (not truncation) so negative
-/// coordinates bucket consistently; the `as i32` casts saturate at the extremes,
-/// which is safe because insert and remove go through this same mapping.
-fn bucket_of(pos: Vec3) -> (i32, i32) {
-    ((pos.x / INTEREST_RADIUS).floor() as i32, (pos.z / INTEREST_RADIUS).floor() as i32)
+/// The interest-grid bucket containing `pos`. Goes through [`block_coord`]'s
+/// clamped floor (not truncation) so negative coordinates bucket consistently
+/// and a hostile-but-finite huge coordinate can't overflow the i32 key —
+/// insert and remove share this one mapping, so the grid stays consistent.
+fn bucket_of(pos: DVec3) -> (i32, i32) {
+    (block_coord(pos.x / INTEREST_RADIUS), block_coord(pos.z / INTEREST_RADIUS))
 }
 
 /// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
@@ -339,7 +342,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     // one locked scope so the id, spawn, and roster it sees are all consistent.
     let id;
     let spawn;
-    let existing: Vec<(u32, String, Vec3, f32, f32)>;
+    let existing: Vec<(u32, String, DVec3, f32, f32)>;
     let snapshot: Vec<(i32, i32, i32, String)>;
     {
         let mut state = shared.lock().unwrap();
@@ -473,7 +476,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
 /// same failures land the same ids on the kick list, [`kick_slow`] already
 /// tolerates ids that disconnected in the unlocked window, and ids are never
 /// reused, so a late kick can't hit the wrong player.
-fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vec3, yaw: f32, pitch: f32) {
+fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32) {
     // Ignore non-finite coordinates outright (a NaN would poison distance checks
     // and the grid keys).
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
@@ -554,7 +557,7 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &s
     // Reach check against the editor's own reported position — no reaching across
     // the map.
     let Some(h) = state.players.get(&id) else { return };
-    let target = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+    let target = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
     if h.pos.distance(target) > EDIT_REACH {
         return;
     }
@@ -641,12 +644,12 @@ fn reject(stream: &TcpStream, reason: &str) {
 
 /// A spawn point just above the origin surface, scattered a little per id so players
 /// don't stack on the exact same block.
-fn spawn_point(generator: &SineHills, id: u32) -> Vec3 {
+fn spawn_point(generator: &SineHills, id: u32) -> DVec3 {
     // A cheap deterministic scatter on a small grid around origin.
     let x = (id % 8) as i32 - 3;
     let z = ((id / 8) % 8) as i32 - 3;
     let surface = generator.height(x, z);
-    Vec3::new(x as f32 + 0.5, surface as f32 + 3.0, z as f32 + 0.5)
+    DVec3::new(x as f64 + 0.5, surface as f64 + 3.0, z as f64 + 0.5)
 }
 
 /// Current player count.
@@ -694,8 +697,8 @@ mod tests {
         let terrain = test_generator();
         for id in 1..20 {
             let p = spawn_point(&terrain, id);
-            let ground = terrain.height(p.x.floor() as i32, p.z.floor() as i32);
-            assert!(p.y > ground as f32, "spawn should be above ground");
+            let ground = terrain.height(block_coord(p.x), block_coord(p.z));
+            assert!(p.y > ground as f64, "spawn should be above ground");
         }
     }
 
@@ -713,7 +716,7 @@ mod tests {
             1u32,
             PlayerHandle {
                 name: "p".into(),
-                pos: Vec3::new(8.5, 20.0, 8.5),
+                pos: DVec3::new(8.5, 20.0, 8.5),
                 yaw: 0.0,
                 pitch: 0.0,
                 out,
@@ -746,7 +749,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 
-        let start = Vec3::new(10.0, 20.0, 10.0);
+        let start = DVec3::new(10.0, 20.0, 10.0);
         let mut players = HashMap::new();
         players.insert(
             1u32,
@@ -769,7 +772,7 @@ mod tests {
 
         // Crossing the x border: the entry moves buckets and the emptied bucket
         // is dropped, not left behind as a leaked key.
-        on_move(&shared, 1, Vec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0);
+        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0);
         {
             let s = shared.lock().unwrap();
             assert_eq!(s.grid.get(&(1, 0)).map(Vec::as_slice), Some(&[1u32][..]));
@@ -777,7 +780,7 @@ mod tests {
         }
 
         // Moving within the same bucket must not duplicate the entry.
-        on_move(&shared, 1, Vec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0);
+        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0);
         {
             let s = shared.lock().unwrap();
             assert_eq!(s.grid.get(&(1, 0)).map(Vec::len), Some(1));
@@ -785,7 +788,7 @@ mod tests {
         }
 
         // Negative coordinates floor toward -infinity: -1.0 is bucket -1, not 0.
-        on_move(&shared, 1, Vec3::new(-1.0, 20.0, -1.0), 0.0, 0.0);
+        on_move(&shared, 1, DVec3::new(-1.0, 20.0, -1.0), 0.0, 0.0);
         {
             let s = shared.lock().unwrap();
             assert_eq!(s.grid.get(&(-1, -1)).map(Vec::len), Some(1));
@@ -813,7 +816,7 @@ mod tests {
 
         // Alice teleports many buckets away. Bob (still at spawn) is far outside
         // her interest radius, so his view of her must not update.
-        let far = Vec3::new(4000.0, 30.0, 4000.0);
+        let far = DVec3::new(4000.0, 30.0, 4000.0);
         a.send_move(far, 0.0, 0.0);
         thread::sleep(settle);
         b.poll();
@@ -827,7 +830,7 @@ mod tests {
 
         // Bob moves right next to alice: she is within range of his new position,
         // so she hears it — which requires her grid entry to have followed her.
-        b.send_move(Vec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0);
+        b.send_move(DVec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0);
         thread::sleep(settle);
         a.poll();
         let bob_as_seen = a.peers().next().unwrap();
@@ -838,7 +841,7 @@ mod tests {
         );
 
         // And the reverse direction: bob's entry followed him too.
-        a.send_move(Vec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0);
+        a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0);
         thread::sleep(settle);
         b.poll();
         let alice_as_seen = b.peers().next().unwrap();
@@ -886,9 +889,9 @@ mod tests {
             // move throttle with a small sleep between sends).
             for step in 1..=3 {
                 thread::sleep(Duration::from_millis(40));
-                let d = (step * 200) as f32; // 200 > INTEREST_RADIUS: a new bucket each step
-                a.send_move(Vec3::new(d, 30.0, 0.0), 0.0, 0.0);
-                b.send_move(Vec3::new(-d, 30.0, -d), 0.0, 0.0);
+                let d = (step * 200) as f64; // 200 > INTEREST_RADIUS: a new bucket each step
+                a.send_move(DVec3::new(d, 30.0, 0.0), 0.0, 0.0);
+                b.send_move(DVec3::new(-d, 30.0, -d), 0.0, 0.0);
             }
             thread::sleep(Duration::from_millis(150));
             assert_eq!(

@@ -17,7 +17,8 @@ pub mod protocol;
 pub mod server;
 
 /// The protocol revision. Client and server must match exactly, checked at join.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: positions are 3x f64 on the wire (far-coordinate correctness).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The default TCP port a server listens on and a client dials.
 pub const DEFAULT_PORT: u16 = 5555;
@@ -41,6 +42,7 @@ pub mod chat {
     pub const LOCAL: u8 = 0;
     /// Global chat: reaches every connected player.
     pub const GLOBAL: u8 = 1;
-    /// How far local (proximity) chat carries, in world units.
-    pub const RADIUS: f32 = 48.0;
+    /// How far local (proximity) chat carries, in world units. `f64` like all
+    /// position math server-side.
+    pub const RADIUS: f64 = 48.0;
 }

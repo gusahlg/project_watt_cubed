@@ -3,19 +3,21 @@
 //! A world is procedural, so a save is tiny: the seed regenerates the terrain, and
 //! only the player's state, the blocks they've changed, and each mod's own state
 //! are stored. Block specs and mod state stay *strings* — the same portable
-//! by-name form the network protocol uses — but the container is binary (version
-//! 2, little-endian) because the old text format repeated the full spec on every
+//! by-name form the network protocol uses — but the container is binary
+//! (little-endian) because the old text format repeated the full spec on every
 //! edit line: thousands of mined blocks each spelled out "air" (or a long natural
-//! spec). Version 2 stores each distinct spec once in a table and each edit as a
-//! fixed 14 bytes referencing it.
+//! spec); each distinct spec is stored once in a table and each edit is a fixed
+//! 14 bytes referencing it. Version 3 widens the player position to f64 x3, so
+//! a far-out position (the game plays to ±1e9 blocks) restores bit-exactly;
+//! yaw/pitch stay f32. Other versions are rejected (v2 had no users).
 //!
 //! Layout (all integers little-endian):
 //!
 //! ```text
 //! magic      b"WATT"                                          4 bytes
-//! version    u16 = 2
+//! version    u16 = 3
 //! seed       i64
-//! player     pos f32 x3, yaw f32, pitch f32, flags u8 (bit 0 = fly)
+//! player     pos f64 x3, yaw f32, pitch f32, flags u8 (bit 0 = fly)
 //! spec table u16 count, then per spec: u16 byte-len + utf8 bytes
 //! edits      u32 count, then per edit: i32 x, i32 y, i32 z, u16 spec index
 //! mods       u8 count, then per mod: u8 name-len + utf8 name,
@@ -31,7 +33,7 @@ use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
-use voxel_engine::Vec3;
+use voxel_engine::DVec3;
 
 use crate::block::{AIR, BlockId, Composition};
 use crate::mods::Mods;
@@ -39,7 +41,7 @@ use crate::player::Player;
 use crate::world::World;
 
 const MAGIC: &[u8; 4] = b"WATT";
-const SAVE_VERSION: u16 = 2;
+const SAVE_VERSION: u16 = 3;
 
 /// Sanity caps while reading, so a corrupt length prefix can't balloon memory.
 const MAX_SPECS: usize = 4096;
@@ -99,7 +101,10 @@ pub fn save(name: &str, world: &World, player: &Player, mods: &Mods) -> io::Resu
     w.write_all(&world.seed().to_le_bytes())?;
 
     let p = player.position;
-    for v in [p.x, p.y, p.z, player.yaw, player.pitch] {
+    for v in [p.x, p.y, p.z] {
+        w.write_all(&v.to_le_bytes())?; // f64: far positions restore bit-exactly
+    }
+    for v in [player.yaw, player.pitch] {
         w.write_all(&v.to_le_bytes())?;
     }
     w.write_all(&[player.fly as u8])?;
@@ -201,6 +206,10 @@ impl<'a> Reader<'a> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    fn f64(&mut self) -> io::Result<f64> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn string(&mut self, len: usize) -> io::Result<String> {
         String::from_utf8(self.take(len)?.to_vec())
             .map_err(|_| corrupt("invalid UTF-8 in save file"))
@@ -226,7 +235,7 @@ pub fn load(name: &str, mods: &mut Mods) -> io::Result<(World, Player)> {
     let seed = r.i64()?;
     let mut world = World::new(seed);
 
-    let mut player = Player::new(Vec3::new(r.f32()?, r.f32()?, r.f32()?));
+    let mut player = Player::new(DVec3::new(r.f64()?, r.f64()?, r.f64()?));
     player.yaw = r.f32()?;
     player.pitch = r.f32()?;
     player.fly = r.u8()? & 1 != 0;
@@ -359,7 +368,7 @@ mod tests {
             .unwrap();
         world.set_block(bx, by, bz, AIR);
 
-        let mut player = Player::new(Vec3::new(1.0, 2.0, 3.0));
+        let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
         player.yaw = 0.5;
         player.pitch = -0.25;
         player.fly = true;
@@ -375,7 +384,7 @@ mod tests {
         let (loaded_world, loaded_player) = load(name, &mut fresh_mods).unwrap();
 
         assert_eq!(loaded_world.seed(), 4242);
-        assert_eq!(loaded_player.position, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(loaded_player.position, DVec3::new(1.0, 2.0, 3.0));
         assert_eq!(loaded_player.yaw, 0.5);
         assert_eq!(loaded_player.pitch, -0.25);
         assert!(loaded_player.fly);
@@ -385,6 +394,53 @@ mod tests {
             states_before,
             "mod state survives the round trip"
         );
+
+        let _ = fs::remove_file(save_path(name));
+    }
+
+    #[test]
+    fn far_positions_round_trip_bit_exactly() {
+        // The point of save v3: a player parked at 1e8 must come back to the
+        // same f64 bits, not an f32 approximation (which would be off by up
+        // to 4 blocks out there).
+        let name = "__unit_test_far_pos__";
+        let _ = fs::remove_file(save_path(name));
+
+        let world = World::new(77);
+        let pos = DVec3::new(1.0e8 + 0.123456789, 61.5, -(1.0e9 - 42.25));
+        let mut player = Player::new(pos);
+        player.yaw = 1.25;
+        player.pitch = -0.5;
+        let mut mods = Mods::with_defaults();
+        save(name, &world, &player, &mods).unwrap();
+
+        let (_, loaded) = load(name, &mut mods).unwrap();
+        assert_eq!(loaded.position.x.to_bits(), pos.x.to_bits());
+        assert_eq!(loaded.position.y.to_bits(), pos.y.to_bits());
+        assert_eq!(loaded.position.z.to_bits(), pos.z.to_bits());
+        assert_eq!(loaded.yaw, 1.25);
+        assert_eq!(loaded.pitch, -0.5);
+
+        let _ = fs::remove_file(save_path(name));
+    }
+
+    #[test]
+    fn older_save_versions_are_rejected() {
+        // v3 is the only accepted version; a v2 header (same magic) errors
+        // cleanly instead of misreading the f32-position layout.
+        let name = "__unit_test_old_version__";
+        fs::create_dir_all(saves_dir()).unwrap();
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 64]); // whatever follows must not be read
+        fs::write(save_path(name), bytes).unwrap();
+
+        let mut mods = Mods::with_defaults();
+        let err = match load(name, &mut mods) {
+            Ok(_) => panic!("v2 must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("version"), "got: {err}");
 
         let _ = fs::remove_file(save_path(name));
     }
@@ -400,7 +456,7 @@ mod tests {
         for i in 0..500 {
             world.set_block(i, 200, -i, AIR);
         }
-        let player = Player::new(Vec3::ZERO);
+        let player = Player::new(DVec3::ZERO);
         let mods = Mods::with_defaults();
         save(name, &world, &player, &mods).unwrap();
 
@@ -434,7 +490,7 @@ mod tests {
         for i in 0..20 {
             world.set_block(i, 200, i, AIR);
         }
-        let player = Player::new(Vec3::ZERO);
+        let player = Player::new(DVec3::ZERO);
         let mut mods = Mods::with_defaults();
         save(name, &world, &player, &mods).unwrap();
 
@@ -452,13 +508,13 @@ mod tests {
         let _ = fs::remove_file(save_path(name));
 
         let world = World::new(1234);
-        let player = Player::new(Vec3::new(0.0, 40.0, 0.0));
+        let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
         let mut mods = Mods::with_defaults();
         save(name, &world, &player, &mods).unwrap();
 
         let (loaded_world, loaded_player) = load(name, &mut mods).unwrap();
         assert_eq!(loaded_world.seed(), 1234);
-        assert_eq!(loaded_player.position, Vec3::new(0.0, 40.0, 0.0));
+        assert_eq!(loaded_player.position, DVec3::new(0.0, 40.0, 0.0));
         assert_eq!(loaded_world.edits().count(), 0);
 
         let _ = fs::remove_file(save_path(name));

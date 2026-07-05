@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use voxel_engine::{Color, Engine, Frame, Key, MouseButton, Vec3};
+use voxel_engine::{Color, DVec3, Engine, Frame, Key, MouseButton};
 
 use crate::block::crafting::craft_natural;
 use crate::block::registry::BlockId;
@@ -26,7 +26,7 @@ use crate::world::World;
 /// At most this many element kinds go into one natural craft.
 
 /// How far the player can reach to place a block — matches the break reach.
-const PLACE_REACH: f32 = 6.0;
+const PLACE_REACH: f64 = 6.0;
 /// Panel geometry: right-aligned like the inventory HUD, starting below the
 /// inventory's tallest possible extent (header at y=90 plus 14 capped rows).
 const PANEL_X_OFFSET: i32 = 230;
@@ -198,11 +198,12 @@ impl CraftingMod {
     }
 }
 
-/// The unit-cube AABB of a voxel cell.
+/// The unit-cube AABB of a voxel cell, in f64 like all position math (an f32
+/// centre would sit whole blocks off at far coordinates).
 fn cell_aabb(x: i32, y: i32, z: i32) -> Aabb {
     Aabb::new(
-        Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5),
-        Vec3::splat(0.5),
+        DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+        DVec3::splat(0.5),
     )
 }
 

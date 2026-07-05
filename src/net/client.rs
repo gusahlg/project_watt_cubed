@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use voxel_engine::Vec3;
+use voxel_engine::DVec3;
 
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION};
@@ -30,7 +30,7 @@ const HEARTBEAT: Duration = Duration::from_secs(1);
 /// Another player as this client last heard about them — enough to draw them.
 pub struct RemotePlayer {
     pub name: String,
-    pub pos: Vec3,
+    pub pos: DVec3,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -53,12 +53,12 @@ pub struct Connection {
     inbox: Receiver<ServerMessage>,
     player_id: u32,
     seed: i64,
-    spawn: Vec3,
+    spawn: DVec3,
     peers: HashMap<u32, RemotePlayer>,
     alive: bool,
     // Throttling state for outbound moves.
     last_move: Instant,
-    last_sent: Option<(Vec3, f32, f32)>,
+    last_sent: Option<(DVec3, f32, f32)>,
 }
 
 impl Connection {
@@ -130,7 +130,7 @@ impl Connection {
         self.seed
     }
     /// Where the server placed this player.
-    pub fn spawn(&self) -> Vec3 {
+    pub fn spawn(&self) -> DVec3 {
         self.spawn
     }
     /// This player's server-assigned id.
@@ -182,7 +182,7 @@ impl Connection {
             ServerMessage::PeerJoined { id, name } => {
                 self.peers.entry(id).or_insert(RemotePlayer {
                     name,
-                    pos: Vec3::ZERO,
+                    pos: DVec3::ZERO,
                     yaw: 0.0,
                     pitch: 0.0,
                 });
@@ -208,7 +208,7 @@ impl Connection {
 
     /// Report the local player's state, throttled and heartbeat. Cheap to call every
     /// frame; it only actually sends on the movement cadence or the heartbeat.
-    pub fn send_move(&mut self, pos: Vec3, yaw: f32, pitch: f32) {
+    pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32) {
         if !self.alive {
             return;
         }
@@ -290,7 +290,11 @@ mod tests {
 
         // Alice edits a block right next to her spawn; bob should receive it.
         let s = a.spawn();
-        let (bx, by, bz) = (s.x.floor() as i32, s.y.floor() as i32, s.z.floor() as i32);
+        let (bx, by, bz) = (
+            crate::math::block_coord(s.x),
+            crate::math::block_coord(s.y),
+            crate::math::block_coord(s.z),
+        );
         // Report position so the server's reach check passes, then edit.
         a.last_move = Instant::now() - HEARTBEAT; // force the throttle to send
         a.send_move(s, 0.0, 0.0);

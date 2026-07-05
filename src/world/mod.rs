@@ -43,7 +43,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
-use voxel_engine::{Frame3D, MeshData, MeshHandle};
+use voxel_engine::{DVec3, Frame3D, MeshData, MeshHandle};
 
 use crate::block::registry::{BlockId, BlockRegistry};
 use crate::render::Render;
@@ -228,19 +228,27 @@ impl World {
 
     /// Draw the meshed chunks. All per-voxel work happened when each chunk was
     /// built; a frame is one `draw_mesh` per chunk (the engine frustum-culls
-    /// each against its AABB internally).
-    pub fn render(&self, f: &mut Frame3D) {
-        for loaded in self.chunks.values() {
+    /// each against its offset AABB internally).
+    ///
+    /// Meshes are CHUNK-LOCAL (vertices in 0..=16), so each draw carries the
+    /// camera-relative offset `chunk_origin - cam`, computed here in `f64` and
+    /// only then narrowed to `f32`: near the camera — the only place precision
+    /// is visible — the difference is small and exact, no matter how far from
+    /// the world origin both sit.
+    pub fn render(&self, f: &mut Frame3D, cam: DVec3) {
+        let s = CHUNK_SIZE as f64;
+        for (&(cx, cy, cz), loaded) in &self.chunks {
             if let Some(handle) = loaded.mesh {
-                f.draw_mesh(handle);
+                let origin = DVec3::new(cx as f64 * s, cy as f64 * s, cz as f64 * s);
+                f.draw_mesh(handle, (origin - cam).as_vec3());
             }
         }
     }
 }
 
 impl Render for World {
-    fn render(&self, f: &mut Frame3D) {
-        World::render(self, f);
+    fn render(&self, f: &mut Frame3D, cam: DVec3) {
+        World::render(self, f, cam);
     }
 }
 
@@ -249,7 +257,7 @@ mod tests {
     use super::*;
     use crate::block::registry::AIR;
     use crate::math::Aabb;
-    use voxel_engine::Vec3;
+    use voxel_engine::DVec3;
 
     #[test]
     fn ground_is_solid_and_sky_is_air() {
@@ -268,9 +276,9 @@ mod tests {
     #[test]
     fn collision_agrees_with_solidity() {
         let world = World::generate();
-        let in_ground = Aabb::new(Vec3::new(8.5, 0.5, 8.5), Vec3::new(0.3, 0.3, 0.3));
-        let in_sky = Aabb::new(Vec3::new(8.5, 40.0, 8.5), Vec3::new(0.3, 0.3, 0.3));
-        let in_deep = Aabb::new(Vec3::new(8.5, -30.0, 8.5), Vec3::new(0.3, 0.3, 0.3));
+        let in_ground = Aabb::new(DVec3::new(8.5, 0.5, 8.5), DVec3::new(0.3, 0.3, 0.3));
+        let in_sky = Aabb::new(DVec3::new(8.5, 40.0, 8.5), DVec3::new(0.3, 0.3, 0.3));
+        let in_deep = Aabb::new(DVec3::new(8.5, -30.0, 8.5), DVec3::new(0.3, 0.3, 0.3));
         assert!(world.collides(&in_ground));
         assert!(!world.collides(&in_sky));
         assert!(world.collides(&in_deep), "uniform stone chunks collide");
@@ -283,14 +291,14 @@ mod tests {
         // agree with a per-cell `is_solid` sweep.
         let world = World::generate();
         for center in [
-            Vec3::new(15.9, 18.0, 15.9), // corner of four chunks
-            Vec3::new(0.1, 21.5, 8.0),   // one X boundary
-            Vec3::new(-3.2, 19.0, -16.4),
-            Vec3::new(4.0, -1.0, 4.0),  // below the surface band: solid now
-            Vec3::new(4.0, 15.9, 4.0),  // straddles a vertical chunk boundary
-            Vec3::new(4.0, 200.0, 4.0), // unloaded high sky: air on both paths
+            DVec3::new(15.9, 18.0, 15.9), // corner of four chunks
+            DVec3::new(0.1, 21.5, 8.0),   // one X boundary
+            DVec3::new(-3.2, 19.0, -16.4),
+            DVec3::new(4.0, -1.0, 4.0),  // below the surface band: solid now
+            DVec3::new(4.0, 15.9, 4.0),  // straddles a vertical chunk boundary
+            DVec3::new(4.0, 200.0, 4.0), // unloaded high sky: air on both paths
         ] {
-            let aabb = Aabb::new(center, Vec3::new(0.4, 0.9, 0.4));
+            let aabb = Aabb::new(center, DVec3::new(0.4, 0.9, 0.4));
             let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_solid(x, y, z));
             assert_eq!(world.collides(&aabb), reference, "at {center:?}");
         }

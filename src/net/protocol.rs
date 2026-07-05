@@ -7,9 +7,12 @@
 //! [`ServerMessage::PeerMove`] at tick rate for every player, so each is a fixed
 //! handful of bytes rather than a line of text. Variable data (names, chat, block
 //! specs) is length-prefixed and bounded by the caps in the [parent module](super).
+//!
+//! Positions travel as 3x f64 (24 bytes) since protocol v2: the game plays out
+//! to ±1e9 blocks, where f32 cannot even represent adjacent positions.
 use std::io::{self, Read, Write};
 
-use voxel_engine::Vec3;
+use voxel_engine::DVec3;
 
 use super::MAX_FRAME;
 
@@ -19,7 +22,7 @@ pub enum ClientMessage {
     /// First frame after connecting: identify and authenticate.
     Hello { protocol: u32, name: String, password: String },
     /// The client's own player state this tick (client simulates its own player).
-    Move { pos: Vec3, yaw: f32, pitch: f32 },
+    Move { pos: DVec3, yaw: f32, pitch: f32 },
     /// The client changed a block, described by portable spec (see [`save`](crate::save)).
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line on the given [`channel`](super::chat).
@@ -31,7 +34,7 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// Join accepted: the assigned id, the world seed to generate from, and where
     /// to spawn.
-    Welcome { player_id: u32, seed: i64, spawn: Vec3 },
+    Welcome { player_id: u32, seed: i64, spawn: DVec3 },
     /// Join refused (bad password, version mismatch, server full); the stream closes.
     Reject { reason: String },
     /// The full current edit overlay, sent once right after [`Welcome`](Self::Welcome).
@@ -41,7 +44,7 @@ pub enum ServerMessage {
     /// Another player disconnected.
     PeerLeft { id: u32 },
     /// Another player moved.
-    PeerMove { id: u32, pos: Vec3, yaw: f32, pitch: f32 },
+    PeerMove { id: u32, pos: DVec3, yaw: f32, pitch: f32 },
     /// A block changed somewhere in the world (from a peer or the server).
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line to display.
@@ -284,10 +287,14 @@ impl Writer {
     fn f32(&mut self, v: f32) {
         self.0.extend_from_slice(&v.to_bits().to_be_bytes());
     }
-    fn vec3(&mut self, v: Vec3) {
-        self.f32(v.x);
-        self.f32(v.y);
-        self.f32(v.z);
+    fn f64(&mut self, v: f64) {
+        self.0.extend_from_slice(&v.to_bits().to_be_bytes());
+    }
+    /// A position: 3x f64, 24 bytes — bit-exact at any distance from origin.
+    fn vec3(&mut self, v: DVec3) {
+        self.f64(v.x);
+        self.f64(v.y);
+        self.f64(v.z);
     }
     /// A `u16`-length-prefixed UTF-8 string. Callers cap lengths before sending;
     /// anything longer than `u16::MAX` is clamped so the prefix stays honest.
@@ -331,8 +338,11 @@ impl<'a> Reader<'a> {
     fn f32(&mut self) -> Option<f32> {
         Some(f32::from_bits(u32::from_be_bytes(self.take(4)?.try_into().ok()?)))
     }
-    fn vec3(&mut self) -> Option<Vec3> {
-        Some(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?)))
+    }
+    fn vec3(&mut self) -> Option<DVec3> {
+        Some(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
     }
     fn str(&mut self) -> Option<String> {
         let len = u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize;
@@ -356,7 +366,7 @@ mod tests {
                 password: "hunter2".into(),
             },
             ClientMessage::Move {
-                pos: Vec3::new(1.5, -2.0, 3.25),
+                pos: DVec3::new(1.5, -2.0, 3.25),
                 yaw: 0.5,
                 pitch: -0.25,
             },
@@ -374,7 +384,7 @@ mod tests {
             ServerMessage::Welcome {
                 player_id: 42,
                 seed: -9_999,
-                spawn: Vec3::new(0.5, 40.0, 0.5),
+                spawn: DVec3::new(0.5, 40.0, 0.5),
             },
             ServerMessage::Reject { reason: "bad password".into() },
             ServerMessage::Snapshot {
@@ -387,7 +397,7 @@ mod tests {
             ServerMessage::PeerLeft { id: 3 },
             ServerMessage::PeerMove {
                 id: 3,
-                pos: Vec3::new(9.0, 8.0, 7.0),
+                pos: DVec3::new(9.0, 8.0, 7.0),
                 yaw: 1.0,
                 pitch: 0.1,
             },
@@ -402,6 +412,27 @@ mod tests {
         for msg in cases {
             assert_eq!(ServerMessage::decode(&msg.encode()), Some(msg));
         }
+    }
+
+    #[test]
+    fn positions_round_trip_bit_exactly_at_far_coordinates() {
+        // The reason positions are f64 on the wire: at 1e8 the fractional
+        // part below survives exactly; an f32 wire would quantise it to a
+        // multiple of 8. Round-trip both directions of the hot path.
+        let pos = DVec3::new(1.0e8 + 0.123456789, -3_000.25, -(1.0e9 - 0.75));
+        let mv = ClientMessage::Move { pos, yaw: 1.0, pitch: -0.5 };
+        match ClientMessage::decode(&mv.encode()) {
+            Some(ClientMessage::Move { pos: got, .. }) => {
+                assert_eq!(got.x.to_bits(), pos.x.to_bits());
+                assert_eq!(got.y.to_bits(), pos.y.to_bits());
+                assert_eq!(got.z.to_bits(), pos.z.to_bits());
+            }
+            other => panic!("bad decode: {other:?}"),
+        }
+        let pm = ServerMessage::PeerMove { id: 7, pos, yaw: 0.0, pitch: 0.0 };
+        assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
+        let wl = ServerMessage::Welcome { player_id: 1, seed: 3, spawn: pos };
+        assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
     }
 
     #[test]
