@@ -239,6 +239,35 @@ blocks! {
     // Topsoil under a layer of growth: green over earthy brown.
     Grass => Composition::mixture(&[(El::Organic.id(), 65), (El::Soil.id(), 35)])
         .expect("builtin Grass sums to 100"),
+    // --- Ore veins: stone flecked with a payload element. Natural blocks, so
+    // the texture pipeline paints the flecks for free. Appended after the
+    // original palette — ids must never reorder. ---
+    // The starter fuel: shallow, common, and gone in a puff of smoke.
+    CoalVein => Composition::natural(&[El::Stone.id(), El::Coal.id()]),
+    // The workhorse metal, still wearing its rock.
+    IronVein => Composition::natural(&[El::Stone.id(), El::Iron.id()]),
+    // Wiring in the rough.
+    CopperVein => Composition::natural(&[El::Stone.id(), El::Copper.id()]),
+    // Deep glitter; heavy pockets for patient miners.
+    GoldVein => Composition::natural(&[El::Stone.id(), El::Gold.id()]),
+    // Dull grey seams that weigh more than they look.
+    LeadVein => Composition::natural(&[El::Stone.id(), El::Lead.id()]),
+    // Pale crystal veins with a charge-hoarding streak.
+    QuartzVein => Composition::natural(&[El::Stone.id(), El::Quartz.id()]),
+    // Yellow streaks best mined from a respectful distance.
+    SulfurVein => Composition::natural(&[El::Stone.id(), El::Sulfur.id()]),
+    // Rock with a faint glow seeping through the cracks.
+    LuminVein => Composition::natural(&[El::Stone.id(), El::Lumin.id()]),
+    // The deepest prize: aerospace-grade ore under miles of rock.
+    TitanVein => Composition::natural(&[El::Stone.id(), El::Titan.id()]),
+    // Sky-stone: only ever found up in the flying islands.
+    AeriumVein => Composition::natural(&[El::Stone.id(), El::Aerium.id()]),
+    // Pure volcanic glass pockets in the deep dark.
+    Obsidian => Composition::natural(&[El::Obsidian.id()]),
+    // Lowland beaches: what valleys have instead of grass.
+    Sand => Composition::natural(&[El::Sand.id()]),
+    // High-altitude island frosting.
+    Ice => Composition::natural(&[El::Ice.id()]),
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 # Project Watt Cubed Pitch
 
 Project Watt Cubed is a voxel sandbox game set in an infinite voxel world. The world is made of voxels consisting of different elements, each with unique properties.
+The world is infinite in all three axis so you can dig infinitely deep and go infinitely high as well, maximum freedom.
 
 The game is about:
 

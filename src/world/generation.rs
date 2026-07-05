@@ -13,11 +13,17 @@
 //!   fewer and smaller the higher you fly, asymptotically vanishing but never
 //!   impossible (the threshold clamps below the noise maximum).
 //!
+//! The surface band's stone is seasoned with single-cell **ore veins**, but
+//! only within the ore band (`depth = height - wy` in `3..=ORE_MAX_DEPTH`);
+//! below it stone is provably pure, so the deep-rock uniformity proof stays
+//! valid. Island stone rolls its own veins (the only Aerium source), lowland
+//! surfaces turn to sand, and island tops above [`ICE_SURFACE_Y`] freeze over.
+//!
 //! Generation is a pure function of (seed, chunk coord) — worker threads and
 //! multiplayer clients all reproduce identical chunks. Whole-chunk generation
-//! proves uniformity where it can (all-stone below the terrain, all-air above
-//! it and below the island band) and otherwise collapses an all-identical
-//! dense fill, so sky and deep rock cost bytes, not kilobytes.
+//! proves uniformity where it can (all-stone below the ore band, all-air above
+//! the terrain and below the island band) and otherwise collapses an
+//! all-identical dense fill, so sky and deep rock cost bytes, not kilobytes.
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
@@ -249,6 +255,55 @@ impl IslandColumn {
 }
 
 // ---------------------------------------------------------------------------
+// Ore scattering — pure functions of (seed, world cell), one cheap hash per
+// candidate stone cell. Everything here must stay bit-deterministic: workers
+// and multiplayer clients re-derive the same veins from the same seed.
+// ---------------------------------------------------------------------------
+
+/// Shallowest depth (`height - wy`) at which ore can appear. Shallower cells
+/// are grass/dirt anyway; the constant is the coal tier's floor.
+pub const ORE_MIN_DEPTH: i32 = 3;
+/// Deepest depth at which ore can appear. Strictly below this the stone is
+/// PURE by construction — the fact that lets [`SineHills::generate`] claim
+/// `Uniform(stone)` for chunks entirely beneath the band without a fill.
+pub const ORE_MAX_DEPTH: i32 = 64;
+/// Island surface cells at or above this altitude are Ice instead of grass —
+/// the game's only natural Ice source.
+pub const ICE_SURFACE_Y: i32 = 220;
+
+/// Island stone rolls AeriumVein at 1/45 — flying islands are the *only*
+/// natural Aerium source (the exploration reward that explains why they fly).
+const ISLAND_AERIUM_W: u32 = u32::MAX / 45;
+/// ...and QuartzVein at 1/160, stacked after the Aerium slice.
+const ISLAND_QUARTZ_W: u32 = u32::MAX / 160;
+
+/// One ore type the ground can roll: eligible from `min_depth` down, hit when
+/// the cell's one hash lands in a slice `width` wide. Slices are stacked
+/// cumulatively, so each ore's probability is exactly `width / 2^32`.
+#[derive(Clone, Copy)]
+struct Seam {
+    min_depth: i32,
+    width: u32,
+    block: BlockId,
+}
+
+/// Seeded hash of a world cell onto a uniform `u32` — the single roll a
+/// candidate ore cell makes. Same splitmix64 finisher as [`lattice`], seeded
+/// on a different stream so veins don't correlate with island noise.
+fn cell_hash(seed: i64, x: i32, y: i32, z: i32) -> u32 {
+    let mut h = (seed as u64 ^ 0x517C_C1B7_2722_0A95)
+        ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h >> 32) as u32
+}
+
+// ---------------------------------------------------------------------------
 // SineHills — the game's generator.
 // ---------------------------------------------------------------------------
 
@@ -272,6 +327,16 @@ pub struct SineHills {
     grass: BlockId,
     dirt: BlockId,
     stone: BlockId,
+    sand: BlockId,
+    ice: BlockId,
+    aerium_vein: BlockId,
+    quartz_vein: BlockId,
+    /// Ground ore table, sorted by `min_depth` so the roll can stop at the
+    /// first tier this cell is too shallow for.
+    seams: [Seam; 10],
+    /// Columns no taller than this get sand surfaces (lowland "beaches"):
+    /// `base - 6`, precomputed so the per-cell path never touches floats.
+    sand_height: i32,
 }
 
 impl SineHills {
@@ -287,6 +352,11 @@ impl SineHills {
         // Spread the seed's bits into two large, unrelated phase offsets.
         let offset_x = (seed.wrapping_mul(0x2545F491_4F6CDD1D) as u32 as f32) * 0.000_01;
         let offset_z = (seed.wrapping_mul(0x9E3779B9_7F4A7C15u64 as i64) as u32 as f32) * 0.000_01;
+        let seam = |min_depth: i32, rarity: u32, name: &str| Seam {
+            min_depth,
+            width: u32::MAX / rarity,
+            block: resolve(name),
+        };
         Self {
             base,
             seed,
@@ -295,30 +365,83 @@ impl SineHills {
             grass: resolve("Grass"),
             dirt: resolve("Dirt"),
             stone: resolve("Stone"),
+            sand: resolve("Sand"),
+            ice: resolve("Ice"),
+            aerium_vein: resolve("AeriumVein"),
+            quartz_vein: resolve("QuartzVein"),
+            // Depth-tiered rarities, sorted by tier: the shallow band carries
+            // fuel and workhorse metals, the deep band the exotic stuff.
+            seams: [
+                seam(ORE_MIN_DEPTH, 90, "CoalVein"),
+                seam(8, 110, "IronVein"),
+                seam(8, 130, "CopperVein"),
+                seam(20, 240, "SulfurVein"),
+                seam(20, 200, "QuartzVein"),
+                seam(20, 220, "LeadVein"),
+                seam(32, 300, "GoldVein"),
+                seam(32, 380, "LuminVein"),
+                seam(48, 460, "TitanVein"),
+                seam(48, 240, "Obsidian"),
+            ],
+            sand_height: base.round() as i32 - 6,
         }
     }
 
-    /// Surface-band layering for a cell below its column's surface.
-    fn ground_block(&self, wy: i32, height: i32) -> BlockId {
+    /// The ore (if any) a stone cell in the band rolls: one [`cell_hash`],
+    /// mapped through the cumulative rarity slices of the tiers this depth
+    /// reaches. `None` (by far the common case) keeps the cell plain stone.
+    fn ore_at(&self, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
+        let roll = cell_hash(self.seed, wx, wy, wz);
+        let mut cut = 0u32;
+        for seam in &self.seams {
+            if depth < seam.min_depth {
+                break; // sorted by tier: every later seam is deeper still
+            }
+            cut += seam.width;
+            if roll < cut {
+                return Some(seam.block);
+            }
+        }
+        None
+    }
+
+    /// Surface-band layering for a cell below its column's surface. Lowland
+    /// columns surface as sand instead of grass; stone cells inside the ore
+    /// band roll one hash for a vein, and below the band stay pure stone.
+    fn ground_block(&self, wx: i32, wy: i32, wz: i32, height: i32) -> BlockId {
         if wy >= height - 1 {
-            self.grass
+            if height <= self.sand_height { self.sand } else { self.grass }
         } else if wy >= height - 3 {
             self.dirt
         } else {
+            let depth = height - wy;
+            if depth <= ORE_MAX_DEPTH {
+                if let Some(ore) = self.ore_at(wx, wy, wz, depth) {
+                    return ore;
+                }
+            }
             self.stone
         }
     }
 
     /// The block for an island-solid cell, from what sits above it in the
-    /// field: exposed top -> grass, within 3 below a surface cell -> dirt,
-    /// buried deeper -> stone.
-    fn island_block(&self, above: [bool; 4]) -> BlockId {
+    /// field: exposed top -> grass (Ice at [`ICE_SURFACE_Y`] and up), within
+    /// 3 below a surface cell -> dirt, buried deeper -> stone — which rolls
+    /// the island veins: Aerium (found nowhere else) and a little quartz.
+    fn island_block(&self, wx: i32, wy: i32, wz: i32, above: [bool; 4]) -> BlockId {
         if !above[0] {
-            self.grass
+            if wy >= ICE_SURFACE_Y { self.ice } else { self.grass }
         } else if !above[1] || !above[2] || !above[3] {
             self.dirt
         } else {
-            self.stone
+            let roll = cell_hash(self.seed, wx, wy, wz);
+            if roll < ISLAND_AERIUM_W {
+                self.aerium_vein
+            } else if roll < ISLAND_AERIUM_W + ISLAND_QUARTZ_W {
+                self.quartz_vein
+            } else {
+                self.stone
+            }
         }
     }
 }
@@ -351,9 +474,9 @@ impl TerrainGenerator for SineHills {
     /// Surface band below `height`, the island field above it.
     fn block_at(&self, wx: i32, wy: i32, wz: i32, height: i32) -> BlockId {
         if wy < height {
-            self.ground_block(wy, height)
+            self.ground_block(wx, wy, wz, height)
         } else if island_at(self.seed, wx, wy, wz) {
-            self.island_block([
+            self.island_block(wx, wy, wz, [
                 island_at(self.seed, wx, wy + 1, wz),
                 island_at(self.seed, wx, wy + 2, wz),
                 island_at(self.seed, wx, wy + 3, wz),
@@ -365,7 +488,7 @@ impl TerrainGenerator for SineHills {
     }
 
     /// Whole-chunk generation with cheap uniformity proofs:
-    /// - entirely below every column's deep line -> `Uniform(stone)`, no fill;
+    /// - entirely below every column's ore band -> `Uniform(stone)`, no fill;
     /// - entirely above every column's surface and below the island band
     ///   -> `Uniform(air)`, no fill;
     /// - otherwise a dense fill (island noise sampled per column, cached per
@@ -390,8 +513,12 @@ impl TerrainGenerator for SineHills {
             }
         }
 
-        // Below the shallowest column's dirt line: stone forever down.
-        if y1 < h_min - 3 {
+        // Below the shallowest column's ore band: stone forever down. The
+        // proof must be exactly this conservative — a cell at depth
+        // `height - wy <= ORE_MAX_DEPTH` may roll a vein, so uniform stone
+        // can only be claimed when even the chunk's top cell in its
+        // shallowest column sits strictly below the band.
+        if y1 < h_min - ORE_MAX_DEPTH {
             return ChunkData::Uniform(self.stone);
         }
         // Above the tallest column and below the island band: guaranteed air.
@@ -424,9 +551,9 @@ impl TerrainGenerator for SineHills {
                 for ly in 0..CHUNK_SIZE {
                     let wy = y0 + ly as i32;
                     let id = if wy < height {
-                        self.ground_block(wy, height)
+                        self.ground_block(wx, wy, wz, height)
                     } else if isl[ly] {
-                        self.island_block([isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]])
+                        self.island_block(wx, wy, wz, [isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]])
                     } else {
                         AIR
                     };
@@ -523,7 +650,12 @@ mod tests {
         // Whole-chunk generation (fast paths, column cache, collapse) must be
         // cell-identical to the naive per-cell recipe.
         let g = hills(3);
-        for (cx, cy, cz) in [(0, 0, 0), (0, 1, 0), (2, 4, -3), (-1, 5, 7), (0, -2, 0), (0, 3, 0)] {
+        // (0, -2, 0) sits inside the ore band, (0, -4, 0) straddles its lower
+        // edge, and (2, 14, 3) reaches the frozen island altitudes.
+        let coords = [
+            (0, 0, 0), (0, 1, 0), (2, 4, -3), (-1, 5, 7), (0, -2, 0), (0, -4, 0), (0, 3, 0), (2, 14, 3),
+        ];
+        for (cx, cy, cz) in coords {
             let chunk = Chunk::new(cx, cy, cz, &g);
             for lz in 0..CHUNK_SIZE {
                 for lx in 0..CHUNK_SIZE {
@@ -546,12 +678,192 @@ mod tests {
     #[test]
     fn uniform_proofs_hold() {
         let g = hills(11);
-        // Deep rock: provably uniform stone without a fill.
-        assert_eq!(g.generate(0, -1, 0), ChunkData::Uniform(g.deep()));
+        // Deep rock below the ore band: provably uniform stone without a fill.
+        // (Terrain heights bottom out at 9, so cy = -5 — top cell y = -65 —
+        // is strictly deeper than depth 64 in every column.)
+        assert_eq!(g.generate(0, -5, 0), ChunkData::Uniform(g.deep()));
         assert_eq!(g.generate(5, -100, -5), ChunkData::Uniform(g.deep()));
+        // Inside the ore band the proof must NOT fire: seams make it dense.
+        assert!(matches!(g.generate(0, -1, 0), ChunkData::Dense(_)));
         // Sky below the island band: provably uniform air.
         assert_eq!(g.generate(0, 3, 0), ChunkData::Uniform(AIR));
         // Ground chunks stay dense (they mix layers and air).
         assert!(matches!(g.generate(0, 1, 0), ChunkData::Dense(_)));
+    }
+
+    /// Registry + generator pair, for tests that need to resolve vein ids.
+    fn hills_with_registry(seed: i64) -> (BlockRegistry, SineHills) {
+        let registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&registry, 20.0, seed);
+        (registry, generator)
+    }
+
+    #[test]
+    fn ore_rolls_are_deterministic_and_seed_driven() {
+        let (a, b, other) = (hills(42), hills(42), hills(43));
+        let mut differing = 0;
+        for x in -32..32 {
+            for z in -32..32 {
+                let h = a.height(x, z);
+                let wy = h - 12; // stone cell, inside the band
+                assert_eq!(a.block_at(x, wy, z, h), b.block_at(x, wy, z, h), "same seed, same veins");
+                if a.block_at(x, wy, z, h) != other.block_at(x, wy, z, h) {
+                    differing += 1;
+                }
+            }
+        }
+        assert!(differing > 20, "different seeds lay different veins ({differing} cells differ)");
+    }
+
+    #[test]
+    fn ore_frequency_is_the_right_magnitude() {
+        // Census one stone cell per column at depth 12 (the coal/iron/copper
+        // tier) over a 128x128 slab: each rate must land within 2x of its
+        // configured rarity — loose enough for hash noise, tight enough to
+        // catch a dropped or doubled slice.
+        let (reg, g) = hills_with_registry(5);
+        let veins = [
+            (reg.id_by_name("CoalVein").unwrap(), 90u32),
+            (reg.id_by_name("IronVein").unwrap(), 110),
+            (reg.id_by_name("CopperVein").unwrap(), 130),
+        ];
+        let mut counts = [0usize; 3];
+        let mut cells = 0usize;
+        for x in -64..64 {
+            for z in -64..64 {
+                let h = g.height(x, z);
+                let block = g.block_at(x, h - 12, z, h);
+                cells += 1;
+                if let Some(i) = veins.iter().position(|&(id, _)| id == block) {
+                    counts[i] += 1;
+                }
+            }
+        }
+        for (&(id, rarity), &count) in veins.iter().zip(&counts) {
+            let expected = cells / rarity as usize;
+            assert!(
+                count >= expected / 2 && count <= expected * 2,
+                "vein {id:?}: {count} hits, expected ~{expected} of {cells}"
+            );
+        }
+    }
+
+    #[test]
+    fn ore_tiers_respect_their_min_depth() {
+        let (reg, g) = hills_with_registry(5);
+        let deep_only: Vec<BlockId> = ["SulfurVein", "QuartzVein", "LeadVein", "GoldVein", "LuminVein", "TitanVein", "Obsidian"]
+            .iter()
+            .map(|n| reg.id_by_name(n).unwrap())
+            .collect();
+        let deepest: Vec<BlockId> = ["TitanVein", "Obsidian"]
+            .iter()
+            .map(|n| reg.id_by_name(n).unwrap())
+            .collect();
+        for x in -64..64 {
+            for z in -64..64 {
+                let h = g.height(x, z);
+                // Depth 12: only the shallow tier may appear.
+                let shallow = g.block_at(x, h - 12, z, h);
+                assert!(!deep_only.contains(&shallow), "deep-tier ore at depth 12: {shallow:?}");
+                // Depth 40: everything but the depth-48 tier is fair game.
+                let mid = g.block_at(x, h - 40, z, h);
+                assert!(!deepest.contains(&mid), "depth-48 ore at depth 40: {mid:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn stone_below_the_ore_band_is_pure_and_provably_uniform() {
+        let (reg, g) = hills_with_registry(7);
+        let stone = reg.id_by_name("Stone").unwrap();
+        for x in -48..48 {
+            for z in -48..48 {
+                let h = g.height(x, z);
+                for depth in [ORE_MAX_DEPTH + 1, 80, 200] {
+                    assert_eq!(g.block_at(x, h - depth, z, h), stone, "depth {depth} is pure stone");
+                }
+            }
+        }
+        // And a whole chunk strictly below the band still takes the no-fill
+        // uniform path — the memory backbone the band must not erode.
+        let chunk = Chunk::new(0, -5, 0, &g);
+        assert_eq!(chunk.uniform(), Some(stone), "deep chunk stays ChunkData::Uniform");
+    }
+
+    #[test]
+    fn island_stone_carries_aerium_and_quartz_veins() {
+        // Islands are the only Aerium source: a slab of island-band chunks
+        // must actually contain some, plus the rarer quartz sprinkle.
+        let (reg, g) = hills_with_registry(3);
+        let aerium = reg.id_by_name("AeriumVein").unwrap();
+        let quartz = reg.id_by_name("QuartzVein").unwrap();
+        let (mut aerium_cells, mut quartz_cells) = (0usize, 0usize);
+        for cx in -2..2 {
+            for cz in -2..2 {
+                for cy in 4..8 {
+                    if let ChunkData::Dense(cells) = g.generate(cx, cy, cz) {
+                        for &c in cells.iter() {
+                            let id = BlockId(c as u16);
+                            aerium_cells += (id == aerium) as usize;
+                            quartz_cells += (id == quartz) as usize;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(aerium_cells > 0, "island slab holds AeriumVein");
+        assert!(quartz_cells > 0, "island slab holds QuartzVein");
+        assert!(aerium_cells > quartz_cells, "1/45 outnumbers 1/160 ({aerium_cells} vs {quartz_cells})");
+    }
+
+    #[test]
+    fn island_tops_freeze_at_altitude() {
+        let (reg, g) = hills_with_registry(3);
+        let ice = reg.id_by_name("Ice").unwrap();
+        let grass = reg.id_by_name("Grass").unwrap();
+        let (mut frozen, mut grassy) = (0usize, 0usize);
+        for x in -80..80 {
+            for z in -80..80 {
+                // An island surface cell: solid with air directly above.
+                for y in [ICE_SURFACE_Y + 2, 100] {
+                    if island_at(g.seed, x, y, z) && !island_at(g.seed, x, y + 1, z) {
+                        let h = g.height(x, z);
+                        let block = g.block_at(x, y, z, h);
+                        if y >= ICE_SURFACE_Y {
+                            assert_eq!(block, ice, "island top at y={y} freezes over");
+                            frozen += 1;
+                        } else {
+                            assert_eq!(block, grass, "island top at y={y} stays grass");
+                            grassy += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(frozen > 0, "found frozen island tops");
+        assert!(grassy > 0, "found grassy island tops");
+    }
+
+    #[test]
+    fn lowland_surfaces_are_sand_beaches() {
+        let (reg, g) = hills_with_registry(3);
+        let sand = reg.id_by_name("Sand").unwrap();
+        let grass = reg.id_by_name("Grass").unwrap();
+        let beach_line = 20 - 6; // base 20.0: columns at or below base - 6
+        let (mut beaches, mut lawns) = (0usize, 0usize);
+        for x in -64..64 {
+            for z in -64..64 {
+                let h = g.height(x, z);
+                let surface = g.block_at(x, h - 1, z, h);
+                if h <= beach_line {
+                    assert_eq!(surface, sand, "valley column (h={h}) beaches over");
+                    beaches += 1;
+                } else {
+                    assert_eq!(surface, grass, "higher ground (h={h}) keeps its grass");
+                    lawns += 1;
+                }
+            }
+        }
+        assert!(beaches > 0 && lawns > 0, "slab spans both ({beaches} beaches, {lawns} lawns)");
     }
 }

@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn column_is_layered_grass_dirt_stone() {
-        let world = World::generate();
+        let mut world = World::generate();
         let reg = world.registry();
         let (grass, dirt, stone) = (
             reg.id_by_name("Grass").unwrap(),
@@ -988,18 +988,31 @@ mod tests {
             reg.id_by_name("Stone").unwrap(),
         );
 
-        let (x, z) = (8, 8);
-        let h = (0..64)
-            .rev()
-            .find(|&y| world.is_solid(x, y, z))
-            .expect("the column has solid ground");
+        // Lowland columns (height <= base - 6) surface as sand now, and band
+        // stone can carry ore flecks — those rules have their own tests in
+        // generation.rs. Here we pick a column tall enough for grass whose
+        // shallow stone rolled clean, and check the canonical layering.
+        let z = 8;
+        let (x, h) = (0..64)
+            .filter_map(|x| {
+                let h = (0..64).rev().find(|&y| world.is_solid(x, y, z))?;
+                // Above the beach line (base 20 - 6), with unmineralised
+                // shallow stone.
+                (world.surface_y(x, z) > 14 && world.block_at(x, h - 3, z) == stone)
+                    .then_some((x, h))
+            })
+            .next()
+            .expect("a tall column with clean shallow stone near spawn");
 
         assert_eq!(world.block_at(x, h + 1, z), AIR);
         assert_eq!(world.block_at(x, h, z), grass);
         assert_eq!(world.block_at(x, h - 1, z), dirt);
         assert_eq!(world.block_at(x, h - 3, z), stone);
-        // And no bottom anymore: the deep layer continues below y = 0.
-        assert_eq!(world.block_at(x, -25, z), stone);
+        // And no bottom anymore: the deep layer continues below y = 0 —
+        // checked below the ore band (depth > 64), where stone is provably
+        // pure. That chunk sits outside the pregenerated region, so load it.
+        world.ensure_data(World::chunk_of(x, h - 70, z));
+        assert_eq!(world.block_at(x, h - 70, z), stone);
     }
 
     #[test]

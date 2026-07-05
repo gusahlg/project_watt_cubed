@@ -208,6 +208,59 @@ elements! {
         color: (255, 240, 150),
         core: { durability: 40, hardness: 30, density: 70, temperature_resistance: 160, friction: 40, light_emission: 230, transparency: 30 },
     },
+    // Compressed ancient organics: soft, light, and eager to burn.
+    Coal => {
+        color: (40, 35, 30),
+        core: { durability: 20, hardness: 15, density: 65, temperature_resistance: 50, friction: 55, conductivity: 30, thermal_conductivity: 20 },
+    },
+    // Loose grains: barely holds itself together, let alone anything else.
+    Sand => {
+        color: (220, 200, 150),
+        core: { durability: 15, hardness: 12, density: 120, temperature_resistance: 170, friction: 30, thermal_conductivity: 20 },
+    },
+    // Frozen water: slick underfoot and gone at the first warm breeze.
+    Ice => {
+        color: (180, 220, 240),
+        core: { durability: 25, hardness: 20, density: 85, temperature_resistance: 20, friction: 5, thermal_conductivity: 40, transparency: 60 },
+    },
+    // The hoard metal: soft, absurdly heavy, conducts everything but restraint.
+    Gold => {
+        color: (255, 200, 60),
+        core: { durability: 60, hardness: 40, density: 250, temperature_resistance: 210, friction: 30, conductivity: 255, thermal_conductivity: 250 },
+    },
+    // Dense, dull, dependable — all shielding, none of the shine.
+    Lead => {
+        color: (90, 90, 110),
+        core: { durability: 110, hardness: 70, density: 255, temperature_resistance: 190, friction: 45, conductivity: 60, thermal_conductivity: 80 },
+    },
+    // Piezo crystal: squeeze it and it keeps the charge for later.
+    Quartz => {
+        color: (235, 225, 235),
+        core: { durability: 100, hardness: 170, density: 150, temperature_resistance: 200, friction: 30, transparency: 40 },
+        specials: [ElectricityStorage(90)],
+    },
+    // Volcanic glass: fears no furnace and very few tools.
+    Obsidian => {
+        color: (30, 25, 45),
+        core: { durability: 240, hardness: 220, density: 190, temperature_resistance: 255, friction: 45, thermal_conductivity: 15 },
+    },
+    // The overachiever metal: lighter than stone, tougher than iron.
+    Titan => {
+        color: (170, 180, 190),
+        core: { durability: 255, hardness: 240, density: 140, temperature_resistance: 245, friction: 40, conductivity: 80, thermal_conductivity: 90 },
+    },
+    // Sky-metal that barely believes in gravity — the reason islands fly.
+    Aerium => {
+        color: (150, 220, 255),
+        core: { durability: 35, hardness: 25, density: 5, temperature_resistance: 140, friction: 35, transparency: 20 },
+        specials: [Magnetism(60)],
+    },
+    // Glows all night and goes out with a bang.
+    Phosphor => {
+        color: (120, 255, 140),
+        core: { durability: 20, hardness: 10, density: 60, temperature_resistance: 70, friction: 40, light_emission: 200 },
+        specials: [ExplosionAtBreakage(60)],
+    },
 }
 
 #[cfg(test)]

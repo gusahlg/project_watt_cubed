@@ -61,9 +61,10 @@ mod tests {
     #[test]
     fn name_joins_element_names_in_id_order() {
         let mut reg = BlockRegistry::with_builtins();
-        // Passed Iron-first, but Stone has the lower element id, so it leads.
-        let id = craft_natural(&mut reg, &[El::Iron.id(), El::Stone.id()]).unwrap();
-        assert_eq!(reg.block(id).name.as_ref(), "Stone+Iron");
+        // Passed Glass-first, but Copper has the lower element id, so it leads.
+        // (Stone+Iron would dedup into the builtin IronVein and keep its name.)
+        let id = craft_natural(&mut reg, &[El::Glass.id(), El::Copper.id()]).unwrap();
+        assert_eq!(reg.block(id).name.as_ref(), "Copper+Glass");
     }
 
     #[test]

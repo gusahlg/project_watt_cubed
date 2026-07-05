@@ -24,7 +24,7 @@ use crate::mods::{ElementStash, Mod, ModContext};
 use crate::world::World;
 
 /// At most this many element kinds go into one natural craft.
-const MAX_SELECT: usize = 3;
+
 /// How far the player can reach to place a block — matches the break reach.
 const PLACE_REACH: f32 = 6.0;
 /// Panel geometry: right-aligned like the inventory HUD, starting below the
@@ -48,7 +48,9 @@ pub struct CraftingMod {
     open: bool,
     /// Cursor over the panel rows: elements, then Craft, then crafted blocks.
     cursor: usize,
-    /// Elements marked for the next craft (at most [`MAX_SELECT`]), in pick order.
+    /// Elements marked for the next craft, in pick order. Any number of
+    /// distinct elements combines into one natural block (the docs' "takes in
+    /// any amount of unique elements"); the list of element types is the bound.
     selected: Vec<ElementId>,
     /// Every crafted block type, in first-crafted order.
     crafted: Vec<Crafted>,
@@ -126,7 +128,7 @@ impl CraftingMod {
             let element = self.element_rows[self.cursor].0;
             if let Some(at) = self.selected.iter().position(|&e| e == element) {
                 self.selected.remove(at);
-            } else if self.selected.len() < MAX_SELECT {
+            } else {
                 self.selected.push(element);
             }
         } else if self.cursor == elements {
@@ -204,6 +206,29 @@ fn cell_aabb(x: i32, y: i32, z: i32) -> Aabb {
     )
 }
 
+impl CraftingMod {
+    /// Register one restored crafted-block entry (merging duplicate ids).
+    fn push_loaded(&mut self, world: &World, id: BlockId, count: u32, equip: bool) {
+        let at = match self.crafted.iter().position(|c| c.id == id) {
+            Some(at) => {
+                self.crafted[at].count += count;
+                at
+            }
+            None => {
+                self.crafted.push(Crafted {
+                    id,
+                    name: world.registry().block(id).name.clone(),
+                    count,
+                });
+                self.crafted.len() - 1
+            }
+        };
+        if equip {
+            self.equipped = Some(at);
+        }
+    }
+}
+
 impl Mod for CraftingMod {
     fn name(&self) -> &str {
         "Crafting"
@@ -266,7 +291,7 @@ impl Mod for CraftingMod {
 
         let craft_row = self.element_rows.len();
         let cursor = if self.cursor == craft_row { ">" } else { " " };
-        let row = format!("{cursor} [Craft: {}/{MAX_SELECT} picked]", self.selected.len());
+        let row = format!("{cursor} [Craft: {} picked]", self.selected.len());
         shadowed(f, &row, x, y, fs, Color::GOLD);
         y += line_h;
 
@@ -309,6 +334,14 @@ impl Mod for CraftingMod {
             };
             let Some((name, count)) = entry.rsplit_once('=') else { continue };
             let Ok(count) = count.parse::<u32>() else { continue };
+            // A crafted composition can dedup into a BUILTIN block (e.g.
+            // Stone+Iron == IronVein), which saves under the builtin's name —
+            // resolve block names first, then fall back to the '+'-joined
+            // element form.
+            if let Some(id) = world.registry().id_by_name(name) {
+                self.push_loaded(world, id, count, equip);
+                continue;
+            }
             // A crafted name is its element names joined with '+'. Resolve them
             // all; if any element is unknown (a save from a modded install),
             // skip the whole entry rather than mint a wrong block.
@@ -323,23 +356,7 @@ impl Mod for CraftingMod {
             let Some(id) = craft_natural(world.registry_mut(), &ids) else {
                 continue;
             };
-            let at = match self.crafted.iter().position(|c| c.id == id) {
-                Some(at) => {
-                    self.crafted[at].count += count;
-                    at
-                }
-                None => {
-                    self.crafted.push(Crafted {
-                        id,
-                        name: world.registry().block(id).name.clone(),
-                        count,
-                    });
-                    self.crafted.len() - 1
-                }
-            };
-            if equip {
-                self.equipped = Some(at);
-            }
+            self.push_loaded(world, id, count, equip);
         }
     }
 }
@@ -356,14 +373,16 @@ mod tests {
     fn save_load_round_trips_crafted_counts_and_equipped() {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
-        crafting.load_state("Stone+Iron=2,*Stone=1", &mut world);
+        // Copper+Glass has no builtin block: Stone+Iron would dedup into the
+        // builtin IronVein and come back under that name.
+        crafting.load_state("Copper+Glass=2,*Stone=1", &mut world);
         assert_eq!(crafting.crafted.len(), 2);
-        assert_eq!(crafting.crafted[0].name.as_ref(), "Stone+Iron");
+        assert_eq!(crafting.crafted[0].name.as_ref(), "Copper+Glass");
         assert_eq!(crafting.crafted[0].count, 2);
         assert_eq!(crafting.equipped, Some(1));
         assert_eq!(
             crafting.save_state(&world).as_deref(),
-            Some("Stone+Iron=2,*Stone=1")
+            Some("Copper+Glass=2,*Stone=1")
         );
     }
 
@@ -381,8 +400,8 @@ mod tests {
     fn loaded_names_recraft_to_registry_ids() {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
-        crafting.load_state("Stone+Iron=1", &mut world);
+        crafting.load_state("Copper+Glass=1", &mut world);
         let id = crafting.crafted[0].id;
-        assert_eq!(world.registry().id_by_name("Stone+Iron"), Some(id));
+        assert_eq!(world.registry().id_by_name("Copper+Glass"), Some(id));
     }
 }
