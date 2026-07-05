@@ -99,7 +99,20 @@ struct PlayerHandle {
     out: SyncSender<Arc<[u8]>>,
     /// A clone of the socket, kept only to force-close a misbehaving client.
     kick: TcpStream,
+    /// False until this player's Welcome/Snapshot bootstrap is fully queued.
+    /// Broadcasters must not push into a not-yet-ready queue: a racing frame
+    /// would beat Welcome onto the wire (failing the client handshake) or
+    /// interleave between snapshot batches (a stale batch would then revert a
+    /// newer edit). Instead they buffer into `backlog`, drained in order once
+    /// the bootstrap is done — so mid-join edits still arrive, AFTER the
+    /// snapshot they must override.
+    ready: bool,
+    backlog: Vec<Arc<[u8]>>,
 }
+
+/// Most frames a joining player can accumulate while their bootstrap queues.
+/// Overflow marks them slow (kicked) — matching the outbound-queue policy.
+const BOOTSTRAP_BACKLOG: usize = 256;
 
 /// The single piece of shared, mutable server state: the authoritative edit overlay
 /// (coordinate → portable block spec), the player roster, and the interest grid
@@ -359,6 +372,8 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
                 pitch: 0.0,
                 out: out.clone(),
                 kick: stream.try_clone()?,
+                ready: false,
+                backlog: Vec::new(),
             },
         );
         // Same lock hold as the roster insert, so the grid never lags the roster.
@@ -381,6 +396,26 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
             &ServerMessage::PeerMove { id: pid, pos: ppos, yaw: pyaw, pitch: ppitch },
         );
     }
+    // Bootstrap queued: go live. Frames broadcast during the bootstrap window
+    // were buffered; drain them in order (they postdate the snapshot) and only
+    // then let broadcasters push directly.
+    {
+        let mut state = shared.lock().unwrap();
+        let mut slow = false;
+        if let Some(h) = state.players.get_mut(&id) {
+            for frame in std::mem::take(&mut h.backlog) {
+                if h.out.try_send(frame).is_err() {
+                    slow = true;
+                    break;
+                }
+            }
+            h.ready = true;
+        }
+        if slow {
+            kick_slow(&state, &[id]);
+        }
+    }
+
     // Announce the newcomer to everyone already connected.
     broadcast_all(&shared, &ServerMessage::PeerJoined { id, name: name.clone() }, Some(id));
 
@@ -481,6 +516,11 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vec3, yaw: f32, pitch: f32)
                         continue;
                     }
                     let Some(h) = state.players.get(&pid) else { continue };
+                    // Bootstrapping joiners skip moves: their roster snapshot
+                    // carries current positions, and the next move re-delivers.
+                    if !h.ready {
+                        continue;
+                    }
                     // Squared-distance compare: per candidate per move, skip the sqrt.
                     if h.pos.distance_squared(pos) > INTEREST_RADIUS_SQ {
                         continue;
@@ -521,7 +561,7 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &s
     // The overlay stores the portable spec verbatim; the server never resolves it.
     state.edits.insert((x, y, z), spec.to_string());
     let msg = ServerMessage::Edit { x, y, z, spec: spec.to_string() };
-    broadcast(&state, &msg, |pid, _| pid != id);
+    broadcast(&mut state, &msg, |pid, _| pid != id);
 }
 
 /// Relay a chat line to its audience: proximity for local, everyone for global.
@@ -530,25 +570,34 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     if text.is_empty() {
         return;
     }
-    let state = shared.lock().unwrap();
+    let mut state = shared.lock().unwrap();
     let Some(sender) = state.players.get(&id) else { return };
     let from_name = sender.name.clone();
     let origin = sender.pos;
     let channel = if channel == chat::GLOBAL { chat::GLOBAL } else { chat::LOCAL };
     println!("<{from_name}> {text}");
     let msg = ServerMessage::Chat { from_id: id, from_name, channel, text };
-    broadcast(&state, &msg, |_, h| {
+    broadcast(&mut state, &msg, |_, h| {
         channel == chat::GLOBAL || h.pos.distance(origin) <= chat::RADIUS
     });
 }
 
 /// Send one message to every player matching `want`, encoding it just once. Players
 /// whose queue is full are force-closed (they've fallen too far behind).
-fn broadcast(state: &State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandle) -> bool) {
+fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandle) -> bool) {
     let frame: Arc<[u8]> = msg.encode().into();
     let mut slow = Vec::new();
-    for (&pid, h) in &state.players {
+    for (&pid, h) in state.players.iter_mut() {
         if !want(pid, h) {
+            continue;
+        }
+        if !h.ready {
+            // Bootstrapping: buffer so the frame lands AFTER the snapshot.
+            if h.backlog.len() < BOOTSTRAP_BACKLOG {
+                h.backlog.push(frame.clone());
+            } else {
+                slow.push(pid);
+            }
             continue;
         }
         match h.out.try_send(frame.clone()) {
@@ -562,8 +611,8 @@ fn broadcast(state: &State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandl
 
 /// Broadcast to everyone, optionally skipping one id (the originator).
 fn broadcast_all(shared: &Arc<Mutex<State>>, msg: &ServerMessage, except: Option<u32>) {
-    let state = shared.lock().unwrap();
-    broadcast(&state, msg, |pid, _| Some(pid) != except);
+    let mut state = shared.lock().unwrap();
+    broadcast(&mut state, msg, |pid, _| Some(pid) != except);
 }
 
 /// Force-close clients that couldn't keep up. Their reader threads then wake, error,
@@ -669,6 +718,8 @@ mod tests {
                 pitch: 0.0,
                 out,
                 kick: stream,
+                ready: true,
+                backlog: Vec::new(),
             },
         );
         let shared = Arc::new(Mutex::new(State {
@@ -699,7 +750,16 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(
             1u32,
-            PlayerHandle { name: "p".into(), pos: start, yaw: 0.0, pitch: 0.0, out, kick: stream },
+            PlayerHandle {
+                name: "p".into(),
+                pos: start,
+                yaw: 0.0,
+                pitch: 0.0,
+                out,
+                kick: stream,
+                ready: true,
+                backlog: Vec::new(),
+            },
         );
         let mut state =
             State { edits: HashMap::new(), players, grid: HashMap::new(), next_id: 2 };
