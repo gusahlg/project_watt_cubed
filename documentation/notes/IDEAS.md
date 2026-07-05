@@ -86,6 +86,31 @@ ahead of readability) — plus a few leaps beyond them worth considering.
   the edit log — snapshotting/handing off regions between server processes is
   plausible without a database. Massive-multiplayer runway.
 
+## Memory-reduction roadmap (concrete, ordered by value/effort)
+
+Measured surfaces today: chunk voxels (~1.8 MB dense at RD 6 thanks to
+Uniform + u8 cells), GPU mesh blocks (64 MiB device arenas, one usually),
+edit overlay (grows with play), engine host buffers, save files (binary v2).
+
+1. **Staging/immediate buffer decay** (engine, in flight): empty staging
+   blocks and oversized immediate buffers shrink back after bursts.
+2. **Edit-overlay compaction**: an edit that restores the GENERATED block at
+   a coord (e.g. placing stone back where stone was) can be dropped from the
+   overlay at write time — regeneration produces it anyway. Needs a cheap
+   "what would generate here" query, which block_at already is.
+3. **Mesh arena block size tuning**: 64 MiB is generous for ~5 MB of live
+   meshes; a 16 MiB first block + 64 MiB growth would cut idle GPU reserve
+   4x on small worlds. One-line constant + a growth policy.
+4. **Chunk map shrink on world exit**: free_meshes keeps chunk data for
+   re-entry; a world left behind (menu) could drop Dense payloads and keep
+   only Uniform tags + the overlay (regenerable). Worth it once worlds are
+   big; measure first.
+5. **MeshData scratch high-water decay**: same policy as immediate buffers,
+   world-side (the scratch holds the largest chunk ever meshed).
+6. **Server**: the edit overlay is the only unbounded state (HashMap<coord,
+   String>); intern spec strings (Arc<str> table, mirroring save v2's table)
+   — thousands of "air" entries currently each own a String. Cheap, large.
+
 ## Housekeeping ideas
 
 - Bench variants: `WATT_BENCH_SCENE=islands|deep|surface` to catch

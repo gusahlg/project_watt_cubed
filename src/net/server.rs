@@ -7,15 +7,20 @@
 //!
 //! **Threading.** One accept thread; per client a blocking reader thread and a
 //! bounded-queue writer thread, coordinated through a single [`Mutex`]-guarded
-//! [`State`]. The lock is held only for short, allocation-light bursts. This
-//! comfortably serves hundreds of players; past that the single lock and
-//! thread-per-client model become the ceiling, and an event-loop rewrite would be
-//! the next step — called out honestly rather than hidden.
+//! [`State`]. The lock is held only for short, allocation-light bursts; the hottest
+//! path — move fan-out — snapshots its recipients under the lock and pushes to
+//! their queues after releasing it. This comfortably serves hundreds of players;
+//! past that the one global lock and the thread-per-client model are still the
+//! ceiling (join/leave and global chat remain O(roster) under it), and an
+//! event-loop rewrite would be the next step — called out honestly rather than
+//! hidden.
 //!
 //! **Optimisation.** No voxel data is ever sent — a join transfers the seed plus the
 //! edit overlay, and live play is just small position/edit/chat frames. Position
 //! broadcasts are interest-managed (only players within [`INTEREST_RADIUS`] hear a
-//! move), which keeps the busiest traffic sub-quadratic as the roster grows.
+//! move) through a 2D bucket grid ([`State::grid`]): a move consults only the
+//! mover's 3×3 bucket neighbourhood instead of scanning the roster, so the busiest
+//! traffic costs O(nearby players) per move rather than O(everyone online).
 //!
 //! **Trust.** Joins are password-gated and version-checked; frames are size-capped by
 //! the [`protocol`] framing; every client is rate-limited; and every edit is bounds-
@@ -97,11 +102,54 @@ struct PlayerHandle {
 }
 
 /// The single piece of shared, mutable server state: the authoritative edit overlay
-/// (coordinate → portable block spec) and the player roster.
+/// (coordinate → portable block spec), the player roster, and the interest grid
+/// that indexes the roster by position.
 struct State {
     edits: HashMap<(i32, i32, i32), String>,
     players: HashMap<u32, PlayerHandle>,
+    /// Broad-phase interest grid: bucket key → ids of the players standing in it,
+    /// keyed by [`bucket_of`] — `(floor(x / INTEREST_RADIUS), floor(z /
+    /// INTEREST_RADIUS))`. Buckets are exactly one radius wide, so anyone within
+    /// [`INTEREST_RADIUS`] of a mover lives in the mover's 3×3 bucket
+    /// neighbourhood; [`on_move`] collects candidates there and still applies the
+    /// exact per-player distance check, so the grid only narrows the *candidate*
+    /// set, never the audience. Deliberately 2D: interest mirrors render distance,
+    /// which is horizontal, and players spread across a sliver of y compared to a
+    /// 160-unit radius — a y axis would add bucket churn from every jump and fall
+    /// while barely shrinking candidate sets. Ignoring y can only *widen* the
+    /// candidate set (3D distance ≥ horizontal distance), never miss a listener.
+    /// Invariant: exactly one entry per connected player, updated under the same
+    /// lock hold as the roster/position change it mirrors; empty buckets are
+    /// removed eagerly so churn can never leak keys.
+    grid: HashMap<(i32, i32), Vec<u32>>,
     next_id: u32,
+}
+
+impl State {
+    /// Add `id` to the grid bucket containing `pos`. Must run under the same lock
+    /// hold as the roster/position change it mirrors, or the grid drifts.
+    fn grid_insert(&mut self, id: u32, pos: Vec3) {
+        self.grid.entry(bucket_of(pos)).or_default().push(id);
+    }
+
+    /// Remove `id` from the grid bucket containing `pos`, dropping the bucket when
+    /// it empties so long-running churn can never accumulate dead keys.
+    fn grid_remove(&mut self, id: u32, pos: Vec3) {
+        let key = bucket_of(pos);
+        if let Some(bucket) = self.grid.get_mut(&key) {
+            bucket.retain(|&p| p != id);
+            if bucket.is_empty() {
+                self.grid.remove(&key);
+            }
+        }
+    }
+}
+
+/// The interest-grid bucket containing `pos`. `floor` (not truncation) so negative
+/// coordinates bucket consistently; the `as i32` casts saturate at the extremes,
+/// which is safe because insert and remove go through this same mapping.
+fn bucket_of(pos: Vec3) -> (i32, i32) {
+    ((pos.x / INTEREST_RADIUS).floor() as i32, (pos.z / INTEREST_RADIUS).floor() as i32)
 }
 
 /// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
@@ -109,6 +157,9 @@ struct State {
 pub struct ServerHandle {
     shutdown: Arc<AtomicBool>,
     addr: SocketAddr,
+    /// Test-only window into the shared state, for grid-leak assertions.
+    #[cfg(test)]
+    state: Arc<Mutex<State>>,
 }
 
 impl ServerHandle {
@@ -121,6 +172,20 @@ impl ServerHandle {
     /// Stop accepting new connections. Existing clients finish on their own sockets.
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Total player entries across every interest-grid bucket. Must always equal
+    /// the roster size — the leak the churn test guards against.
+    #[cfg(test)]
+    fn grid_entries(&self) -> usize {
+        self.state.lock().unwrap().grid.values().map(Vec::len).sum()
+    }
+
+    /// Number of live grid buckets. Empty buckets are removed eagerly, so this
+    /// must return to zero whenever the roster empties.
+    #[cfg(test)]
+    fn grid_buckets(&self) -> usize {
+        self.state.lock().unwrap().grid.len()
     }
 }
 
@@ -141,13 +206,21 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let shared = Arc::new(Mutex::new(State {
         edits: HashMap::new(),
         players: HashMap::new(),
+        grid: HashMap::new(),
         next_id: 1,
     }));
 
+    #[cfg(test)]
+    let state = shared.clone();
     let accept_shutdown = shutdown.clone();
     thread::spawn(move || accept_loop(listener, shared, ctx, accept_shutdown));
 
-    Ok(ServerHandle { shutdown, addr })
+    Ok(ServerHandle {
+        shutdown,
+        addr,
+        #[cfg(test)]
+        state,
+    })
 }
 
 /// Bind and serve on the current thread until the process exits — the dedicated
@@ -288,6 +361,8 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
                 kick: stream.try_clone()?,
             },
         );
+        // Same lock hold as the roster insert, so the grid never lags the roster.
+        state.grid_insert(id, spawn);
     }
     println!("[+] {name} joined as #{id} from {addr} ({} online)", online(&shared));
 
@@ -340,7 +415,11 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     // Cleanup: drop the player (which frees the writer), close the socket, tell peers.
     {
         let mut state = shared.lock().unwrap();
-        state.players.remove(&id);
+        if let Some(h) = state.players.remove(&id) {
+            // The handle's pos is the last committed one, so it names the exact
+            // bucket the grid still holds this id under.
+            state.grid_remove(id, h.pos);
+        }
     }
     let _ = stream.shutdown(Shutdown::Both);
     drop(out);
@@ -351,29 +430,77 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
 }
 
 /// Apply a validated position update and fan it out to interested players only.
+///
+/// Runs in two phases to keep the global lock hold minimal. Locked: commit the
+/// move, keep the grid current, and snapshot the recipients' senders (cheap
+/// `SyncSender` clones — one `Arc` bump each). Unlocked: the `try_send`s. Kick
+/// semantics are unchanged: `try_send` never blocked even under the lock, the
+/// same failures land the same ids on the kick list, [`kick_slow`] already
+/// tolerates ids that disconnected in the unlocked window, and ids are never
+/// reused, so a late kick can't hit the wrong player.
 fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: Vec3, yaw: f32, pitch: f32) {
-    // Ignore non-finite coordinates outright (a NaN would poison distance checks).
+    // Ignore non-finite coordinates outright (a NaN would poison distance checks
+    // and the grid keys).
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
         return;
     }
-    let mut state = shared.lock().unwrap();
-    if let Some(h) = state.players.get_mut(&id) {
-        h.pos = pos;
-        h.yaw = yaw;
-        h.pitch = pitch;
-    }
+    // Encode before locking — the frame doesn't depend on shared state.
     let frame: Arc<[u8]> = ServerMessage::PeerMove { id, pos, yaw, pitch }.encode().into();
-    let mut slow = Vec::new();
-    for (&pid, h) in &state.players {
-        // Squared-distance compare: this runs per listener per move, so skip the sqrt.
-        if pid == id || h.pos.distance_squared(pos) > INTEREST_RADIUS_SQ {
-            continue;
+
+    let mut recipients: Vec<(u32, SyncSender<Arc<[u8]>>)> = Vec::new();
+    {
+        let mut state = shared.lock().unwrap();
+        let old = match state.players.get_mut(&id) {
+            Some(h) => {
+                let old = h.pos;
+                h.pos = pos;
+                h.yaw = yaw;
+                h.pitch = pitch;
+                old
+            }
+            None => return, // Unreachable while the handler thread lives; be safe.
+        };
+        // Keep the grid honest before collecting from it.
+        let (from, to) = (bucket_of(old), bucket_of(pos));
+        if from != to {
+            state.grid_remove(id, old);
+            state.grid_insert(id, pos);
         }
-        if h.out.try_send(frame.clone()).is_err() {
-            slow.push(pid);
+        // Broad phase: buckets are one INTEREST_RADIUS wide, so every player in
+        // range is somewhere in the mover's 3×3 neighbourhood. Exact phase: the
+        // same per-player squared-distance check as ever — the grid narrows the
+        // candidate set, never the audience. `wrapping_add` so a hostile position
+        // at the i32 edge can't overflow; a wrapped key at worst nominates
+        // candidates the exact check rejects.
+        for dx in -1..=1i32 {
+            for dz in -1..=1i32 {
+                let key = (to.0.wrapping_add(dx), to.1.wrapping_add(dz));
+                let Some(bucket) = state.grid.get(&key) else { continue };
+                for &pid in bucket {
+                    if pid == id {
+                        continue;
+                    }
+                    let Some(h) = state.players.get(&pid) else { continue };
+                    // Squared-distance compare: per candidate per move, skip the sqrt.
+                    if h.pos.distance_squared(pos) > INTEREST_RADIUS_SQ {
+                        continue;
+                    }
+                    recipients.push((pid, h.out.clone()));
+                }
+            }
         }
     }
-    kick_slow(&state, &slow);
+
+    // Unlocked fan-out; a full (or hung-up) queue marks its owner for the kick pass.
+    let mut slow = Vec::new();
+    for (pid, out) in &recipients {
+        if out.try_send(frame.clone()).is_err() {
+            slow.push(*pid);
+        }
+    }
+    if !slow.is_empty() {
+        kick_slow(&shared.lock().unwrap(), &slow);
+    }
 }
 
 /// Validate and record a block edit, then broadcast it to every other player so all
@@ -447,12 +574,6 @@ fn kick_slow(state: &State, ids: &[u32]) {
             let _ = h.kick.shutdown(Shutdown::Both);
         }
     }
-}
-
-/// Queue one message to a single client (best-effort; a full queue drops it).
-fn send(out: &SyncSender<Arc<[u8]>>, msg: &ServerMessage) {
-    let frame: Arc<[u8]> = msg.encode().into();
-    let _ = out.try_send(frame);
 }
 
 /// Queue one message, waiting for space. Only safe on the receiving client's
@@ -550,7 +671,12 @@ mod tests {
                 kick: stream,
             },
         );
-        let shared = Arc::new(Mutex::new(State { edits: HashMap::new(), players, next_id: 2 }));
+        let shared = Arc::new(Mutex::new(State {
+            edits: HashMap::new(),
+            players,
+            grid: HashMap::new(),
+            next_id: 2,
+        }));
 
         on_edit(&shared, 1, 500, 20, 500, "air"); // far away: rejected
         on_edit(&shared, 1, 8, 20, 8, "air"); // in reach: recorded
@@ -558,5 +684,169 @@ mod tests {
         let state = shared.lock().unwrap();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
         assert!(!state.edits.contains_key(&(500, 20, 500)), "out-of-reach edit dropped");
+    }
+
+    /// A hand-built state, no sockets: the grid entry must follow the player
+    /// across bucket borders, never duplicate within a bucket, and floor (not
+    /// truncate) on negative coordinates.
+    #[test]
+    fn grid_membership_follows_movement_across_bucket_borders() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+        let start = Vec3::new(10.0, 20.0, 10.0);
+        let mut players = HashMap::new();
+        players.insert(
+            1u32,
+            PlayerHandle { name: "p".into(), pos: start, yaw: 0.0, pitch: 0.0, out, kick: stream },
+        );
+        let mut state =
+            State { edits: HashMap::new(), players, grid: HashMap::new(), next_id: 2 };
+        state.grid_insert(1, start);
+        assert_eq!(state.grid.get(&(0, 0)).map(Vec::len), Some(1));
+        let shared = Arc::new(Mutex::new(state));
+
+        // Crossing the x border: the entry moves buckets and the emptied bucket
+        // is dropped, not left behind as a leaked key.
+        on_move(&shared, 1, Vec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0);
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.grid.get(&(1, 0)).map(Vec::as_slice), Some(&[1u32][..]));
+            assert!(!s.grid.contains_key(&(0, 0)), "emptied bucket must be removed");
+        }
+
+        // Moving within the same bucket must not duplicate the entry.
+        on_move(&shared, 1, Vec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0);
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.grid.get(&(1, 0)).map(Vec::len), Some(1));
+            assert_eq!(s.grid.len(), 1);
+        }
+
+        // Negative coordinates floor toward -infinity: -1.0 is bucket -1, not 0.
+        on_move(&shared, 1, Vec3::new(-1.0, 20.0, -1.0), 0.0, 0.0);
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.grid.get(&(-1, -1)).map(Vec::len), Some(1));
+            assert_eq!(s.grid.len(), 1);
+        }
+    }
+
+    /// End-to-end over loopback: moves are only delivered inside the interest
+    /// radius, and delivery resumes when players end up adjacent again — i.e. the
+    /// grid entries genuinely follow the players around.
+    #[test]
+    fn far_players_hear_no_moves_until_adjacent() {
+        use crate::net::client::Connection;
+
+        let handle = spawn(0, Config { password: String::new(), seed: 4242 }).unwrap();
+        let port = handle.addr().port();
+        let mut a = Connection::connect("127.0.0.1", port, "alice", "").unwrap();
+        let mut b = Connection::connect("127.0.0.1", port, "bob", "").unwrap();
+
+        let settle = Duration::from_millis(150);
+        thread::sleep(settle);
+        a.poll();
+        b.poll();
+        assert_eq!(b.peers().count(), 1, "bob should see alice");
+
+        // Alice teleports many buckets away. Bob (still at spawn) is far outside
+        // her interest radius, so his view of her must not update.
+        let far = Vec3::new(4000.0, 30.0, 4000.0);
+        a.send_move(far, 0.0, 0.0);
+        thread::sleep(settle);
+        b.poll();
+        let alice_as_seen = b.peers().next().unwrap();
+        assert!(
+            alice_as_seen.pos.x < 100.0,
+            "bob must not hear a move from {} units away (saw x={})",
+            far.x,
+            alice_as_seen.pos.x
+        );
+
+        // Bob moves right next to alice: she is within range of his new position,
+        // so she hears it — which requires her grid entry to have followed her.
+        b.send_move(Vec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0);
+        thread::sleep(settle);
+        a.poll();
+        let bob_as_seen = a.peers().next().unwrap();
+        assert!(
+            bob_as_seen.pos.x > 3900.0,
+            "alice should hear bob once adjacent (saw x={})",
+            bob_as_seen.pos.x
+        );
+
+        // And the reverse direction: bob's entry followed him too.
+        a.send_move(Vec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0);
+        thread::sleep(settle);
+        b.poll();
+        let alice_as_seen = b.peers().next().unwrap();
+        assert!(
+            alice_as_seen.pos.x > 3900.0,
+            "bob should hear alice once adjacent (saw x={})",
+            alice_as_seen.pos.x
+        );
+
+        handle.stop();
+    }
+
+    /// Join, wander across bucket borders, leave — repeatedly. The grid must
+    /// always hold exactly one entry per connected player and drain to zero
+    /// buckets when everyone is gone: no leaked ids, no leaked keys.
+    #[test]
+    fn grid_never_leaks_entries_under_churn() {
+        use crate::net::client::Connection;
+
+        /// Poll `cond` for up to two seconds (server cleanup runs on its own
+        /// threads, so give it a moment rather than a fixed sleep).
+        fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let handle = spawn(0, Config { password: String::new(), seed: 7 }).unwrap();
+        let port = handle.addr().port();
+
+        for round in 0..3 {
+            let mut a = Connection::connect("127.0.0.1", port, "a", "").unwrap();
+            let mut b = Connection::connect("127.0.0.1", port, "b", "").unwrap();
+            assert!(
+                eventually(|| handle.grid_entries() == 2),
+                "round {round}: both joins should land in the grid"
+            );
+
+            // March both across several bucket borders (outpacing the client-side
+            // move throttle with a small sleep between sends).
+            for step in 1..=3 {
+                thread::sleep(Duration::from_millis(40));
+                let d = (step * 200) as f32; // 200 > INTEREST_RADIUS: a new bucket each step
+                a.send_move(Vec3::new(d, 30.0, 0.0), 0.0, 0.0);
+                b.send_move(Vec3::new(-d, 30.0, -d), 0.0, 0.0);
+            }
+            thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                handle.grid_entries(),
+                2,
+                "round {round}: moving must never grow or shrink membership"
+            );
+
+            drop(a);
+            drop(b);
+            assert!(
+                eventually(|| handle.grid_entries() == 0 && handle.grid_buckets() == 0),
+                "round {round}: grid must drain to zero entries and zero buckets, got {} entries in {} buckets",
+                handle.grid_entries(),
+                handle.grid_buckets()
+            );
+        }
+
+        handle.stop();
     }
 }
