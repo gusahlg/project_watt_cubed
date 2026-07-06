@@ -379,8 +379,12 @@ impl App {
         // take effect immediately while arrowing through the menu. Rebuild the
         // value strings AFTER applying, so hardware clamps (e.g. 8x MSAA on a
         // 4x device) show what actually took.
+        let before = (self.settings.msaa, self.settings.render_scale);
         self.settings.apply(eng);
-        if changed {
+        // apply() can write back hardware-clamped values with no event this
+        // frame (e.g. a hand-edited 8x MSAA config on a 4x device) — refresh
+        // whenever the shown values went stale, not just on Cycled.
+        if changed || (self.settings.msaa, self.settings.render_scale) != before {
             self.refresh_settings_menu();
         }
         if back {

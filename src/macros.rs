@@ -80,7 +80,7 @@ macro_rules! elements {
         $(
             $variant:ident => {
                 color: ($r:expr, $g:expr, $b:expr),
-                core: { $($core:tt)* }
+                core: { $($cf:ident : $cv:expr),* $(,)? }
                 $(, specials: [ $( $svar:ident ( $sval:expr ) ),* $(,)? ] )?
                 $(,)?
             }
@@ -110,7 +110,7 @@ macro_rules! elements {
                         name: stringify!($variant).into(),
                         color: ::voxel_engine::Color::new($r, $g, $b, 255),
                         core: $crate::block::element::CoreProperties {
-                            $($core)* ,
+                            $($cf: $cv,)*
                             ..Default::default()
                         },
                         specials: {
