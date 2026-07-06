@@ -9,13 +9,11 @@
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use voxel_engine::{Color, DVec3, Engine};
+use voxel_engine::{Color, DVec3, Engine, Frame};
 
-use crate::console::shadowed;
 use crate::game::{Game, Signal};
 use crate::menu::{
-    FormResult, HostInfo, HostMenu, JoinInfo, JoinMenu, MainChoice, MainMenu, ModMenu,
-    SettingsMenu,
+    self, HostInfo, JoinInfo, MainChoice, MenuEvent, MenuModel, SETTINGS_ROW_BACK,
 };
 use crate::mods::Mods;
 use crate::net::client::Connection;
@@ -40,16 +38,24 @@ enum Screen {
     Settings,
 }
 
-/// The whole program: the installed mods (persist across worlds), the menus,
-/// the graphics settings, and the current world if one is open.
+/// The whole program: the installed mods (persist across worlds), the menu
+/// models, the graphics settings, and the current world if one is open.
+///
+/// Menus are MODELS here (see [`crate::menu`]): the App builds one per screen,
+/// hands input to the first enabled menu-handling mod (or the core fallback if
+/// none — disabling the "Menus" mod can never brick navigation), and
+/// interprets the [`MenuEvent`]s that come back.
 pub struct App {
     /// The live world, if the player is in one.
     game: Option<Game>,
-    menu: MainMenu,
-    mod_menu: ModMenu,
-    host_menu: HostMenu,
-    join_menu: JoinMenu,
-    settings_menu: SettingsMenu,
+    /// The saves list the main-menu model was built from — the index map that
+    /// resolves a `Chosen(i)` on that screen back into a [`MainChoice`].
+    saves: Vec<String>,
+    main_model: MenuModel,
+    mods_model: MenuModel,
+    settings_model: MenuModel,
+    host_model: MenuModel,
+    join_model: MenuModel,
     /// Installed mods and their on/off state; shared with the game while playing.
     mods: Mods,
     screen: Screen,
@@ -83,18 +89,22 @@ struct Bench {
 
 impl App {
     pub fn new() -> Self {
+        let mods = Mods::with_defaults();
+        let saves = save::list_saves();
+        let settings = Settings::load();
         Self {
             game: None,
-            menu: MainMenu::new(),
-            mod_menu: ModMenu::new(),
-            host_menu: HostMenu::new(),
-            join_menu: JoinMenu::new(),
-            settings_menu: SettingsMenu::new(),
-            mods: Mods::with_defaults(),
+            main_model: menu::main_menu_model(&saves),
+            saves,
+            mods_model: menu::mods_menu_model(&mods),
+            settings_model: menu::settings_menu_model(&settings),
+            host_model: menu::host_menu_model(None),
+            join_model: menu::join_menu_model(None),
+            mods,
             screen: Screen::Menu,
             host: None,
             status: None,
-            settings: Settings::load(),
+            settings,
             bench: std::env::var("WATT_BENCH").ok().map(|v| Bench {
                 duration: v.parse().unwrap_or(10.0),
                 warmup: 3.0,
@@ -228,54 +238,151 @@ impl App {
         // p1 fps = the fps of the 99th-percentile (slowest 1%) frame time.
         let p99_dt = sorted[(frames.saturating_sub(1)) * 99 / 100];
         println!(
-            "BENCH frames={frames} avg_fps={avg_fps:.0} p1_fps={:.0} avg_ms={avg_ms:.3}",
-            1.0 / p99_dt.max(f32::EPSILON)
+            "BENCH frames={frames} avg_fps={avg_fps:.0} p1_fps={:.0} avg_ms={avg_ms:.3} rss_mb={}",
+            1.0 / p99_dt.max(f32::EPSILON),
+            resident_mb().unwrap_or(0),
         );
         false
     }
 
+    /// Drive a menu model through the mod layer, or through the core fallback
+    /// when no enabled mod handles menus (the no-brick guarantee).
+    fn drive(mods: &mut Mods, eng: &Engine, model: &mut MenuModel) -> Option<MenuEvent> {
+        if mods.menu_driver_available() {
+            mods.drive_menu(eng, model)
+        } else {
+            menu::fallback_drive(eng, model)
+        }
+    }
+
+    /// Draw a menu model through the mod layer, or through the core fallback.
+    fn draw_model(mods: &mut Mods, f: &mut Frame, model: &MenuModel, w: i32, h: i32) {
+        if mods.menu_driver_available() {
+            mods.draw_menu(f, model, w, h);
+        } else {
+            menu::fallback_draw(f, model, w, h);
+        }
+    }
+
+    /// Rebuild the main-menu model from the saves on disk (call when returning
+    /// to the menu), keeping the cursor on a real row and re-surfacing any
+    /// status line as the model's error text.
+    fn refresh_main_menu(&mut self) {
+        self.saves = save::list_saves();
+        let cursor = self.main_model.cursor;
+        self.main_model = menu::main_menu_model(&self.saves);
+        self.main_model.cursor = cursor;
+        self.main_model.clamp_cursor();
+        self.main_model.error = self.status.clone();
+    }
+
+    /// Rebuild the mod-list model from the mods' current on/off states.
+    fn refresh_mods_menu(&mut self) {
+        let cursor = self.mods_model.cursor;
+        self.mods_model = menu::mods_menu_model(&self.mods);
+        self.mods_model.cursor = cursor;
+        self.mods_model.clamp_cursor();
+    }
+
+    /// Rebuild the settings model's value strings from the live settings.
+    fn refresh_settings_menu(&mut self) {
+        let cursor = self.settings_model.cursor;
+        self.settings_model = menu::settings_menu_model(&self.settings);
+        self.settings_model.cursor = cursor;
+        self.settings_model.clamp_cursor();
+    }
+
     /// Start-menu logic. Returns `true` to quit the program.
     fn update_menu(&mut self, eng: &mut Engine) -> bool {
-        if let Some(choice) = self.menu.update(eng) {
+        let event = Self::drive(&mut self.mods, eng, &mut self.main_model);
+        if let Some(MenuEvent::Chosen(index)) = event {
             self.status = None;
-            match choice {
+            self.main_model.error = None;
+            match menu::main_choice_at(&self.saves, index) {
                 MainChoice::NewWorld => self.start_new_world(eng),
                 MainChoice::Load(name) => self.load_world(eng, &name),
                 MainChoice::Host => self.screen = Screen::Host,
                 MainChoice::Join => self.screen = Screen::Join,
-                MainChoice::Mods => self.screen = Screen::Mods,
-                MainChoice::Settings => self.screen = Screen::Settings,
+                MainChoice::Mods => {
+                    self.refresh_mods_menu();
+                    self.screen = Screen::Mods;
+                }
+                MainChoice::Settings => {
+                    // Values may have moved via /gfx in-game; show the truth.
+                    self.refresh_settings_menu();
+                    self.screen = Screen::Settings;
+                }
                 MainChoice::Quit => return true,
             }
         }
+        // Back on the start menu means nothing — there is nowhere further out.
         false
     }
 
     /// Host screen: fill in the form, then start an integrated server and connect to
-    /// it locally. Esc returns to the menu.
+    /// it locally. Esc returns to the menu. A bad port refuses the submit and
+    /// keeps the form up with an error in the hint area.
     fn update_host(&mut self, eng: &mut Engine) {
-        match self.host_menu.update(eng) {
-            FormResult::Submit(info) => self.start_host(eng, info),
-            FormResult::Cancel => self.screen = Screen::Menu,
-            FormResult::Editing => {}
+        match Self::drive(&mut self.mods, eng, &mut self.host_model) {
+            Some(MenuEvent::Submit) => match menu::parse_port(self.host_model.text_value(0)) {
+                Some(port) => {
+                    let info = HostInfo {
+                        port,
+                        password: self.host_model.text_value(1).to_string(),
+                        name: self.host_model.text_value(2).to_string(),
+                    };
+                    self.start_host(eng, info);
+                }
+                None => self.host_model.error = Some(menu::PORT_ERROR.to_string()),
+            },
+            Some(MenuEvent::Back) => self.screen = Screen::Menu,
+            _ => {}
         }
     }
 
     /// Join screen: fill in the address/port/password, then connect. Esc returns.
+    /// Same port contract as [`update_host`](Self::update_host).
     fn update_join(&mut self, eng: &mut Engine) {
-        match self.join_menu.update(eng) {
-            FormResult::Submit(info) => self.start_join(eng, info),
-            FormResult::Cancel => self.screen = Screen::Menu,
-            FormResult::Editing => {}
+        match Self::drive(&mut self.mods, eng, &mut self.join_model) {
+            Some(MenuEvent::Submit) => match menu::parse_port(self.join_model.text_value(1)) {
+                Some(port) => {
+                    let info = JoinInfo {
+                        host: self.join_model.text_value(0).trim().to_string(),
+                        port,
+                        password: self.join_model.text_value(2).to_string(),
+                        name: self.join_model.text_value(3).to_string(),
+                    };
+                    self.start_join(eng, info);
+                }
+                None => self.join_model.error = Some(menu::PORT_ERROR.to_string()),
+            },
+            Some(MenuEvent::Back) => self.screen = Screen::Menu,
+            _ => {}
         }
     }
 
-    /// Settings screen: edit values, apply them live, persist on the way out.
+    /// Settings screen: cycle values (the MEANING of each row stays here, not
+    /// in any mod), apply them live, persist on the way out.
     fn update_settings(&mut self, eng: &mut Engine) {
-        let back = self.settings_menu.update(eng, &mut self.settings);
+        let event = Self::drive(&mut self.mods, eng, &mut self.settings_model);
+        let mut back = false;
+        let mut changed = false;
+        match event {
+            Some(MenuEvent::Cycled(row, dir)) => {
+                menu::apply_settings_cycle(&mut self.settings, row, dir);
+                changed = true;
+            }
+            Some(MenuEvent::Chosen(SETTINGS_ROW_BACK)) | Some(MenuEvent::Back) => back = true,
+            _ => {}
+        }
         // Apply every frame — the engine no-ops unchanged values, so toggles
-        // take effect immediately while arrowing through the menu.
+        // take effect immediately while arrowing through the menu. Rebuild the
+        // value strings AFTER applying, so hardware clamps (e.g. 8x MSAA on a
+        // 4x device) show what actually took.
         self.settings.apply(eng);
+        if changed {
+            self.refresh_settings_menu();
+        }
         if back {
             self.settings.save();
             self.screen = Screen::Menu;
@@ -328,7 +435,7 @@ impl App {
     /// Report a connection/host failure and return to the menu.
     fn fail_to_menu(&mut self, message: String) {
         self.status = Some(message);
-        self.menu.refresh();
+        self.refresh_main_menu();
         self.screen = Screen::Menu;
     }
 
@@ -382,15 +489,24 @@ impl App {
             }
             eng.enable_cursor();
             self.game = None;
-            self.menu.refresh();
+            self.refresh_main_menu();
             self.screen = Screen::Menu;
         }
     }
 
-    /// Mod-menu logic; Esc returns to the start menu.
+    /// Mod-menu logic; Esc (or h/Backspace) returns to the start menu. A
+    /// toggle takes effect immediately — switching the "Menus" mod off here
+    /// flips the very next frame's driving and drawing to the core fallback.
     fn update_mods(&mut self, eng: &mut Engine) {
-        if self.mod_menu.update(eng, &mut self.mods) {
-            self.screen = Screen::Menu;
+        match Self::drive(&mut self.mods, eng, &mut self.mods_model) {
+            Some(MenuEvent::Toggled(index)) => {
+                self.mods.toggle(index);
+                // Rebuild from the source of truth (the driver only flipped
+                // the displayed state).
+                self.refresh_mods_menu();
+            }
+            Some(MenuEvent::Back) => self.screen = Screen::Menu,
+            _ => {}
         }
     }
 
@@ -405,44 +521,27 @@ impl App {
         }
     }
 
-    /// Draw the active screen.
+    /// Draw the active screen. Every menu screen goes through the mod layer
+    /// (or the core fallback); the connect/host status line rides in the main
+    /// model's `error`, so the renderer — whichever one — shows it.
     fn draw(&mut self, eng: &mut Engine) {
         let (w, h) = (eng.screen_width(), eng.screen_height());
-        match self.screen {
+        let model = match self.screen {
             Screen::Playing => {
                 let fov = self.settings.fov;
                 if let Some(game) = &mut self.game {
                     game.draw(eng, &mut self.mods, fov);
                 }
+                return;
             }
-            Screen::Menu => {
-                let status = self.status.clone();
-                let mut f = eng.begin_frame(MENU_CLEAR);
-                self.menu.draw(&mut f, w, h);
-                // A connect/host error from the last attempt, in red under the list.
-                if let Some(status) = &status {
-                    let fs = 20;
-                    let sx = (w - f.measure_text(status, fs)) / 2;
-                    shadowed(&mut f, status, sx, h - 70, fs, Color::SALMON);
-                }
-            }
-            Screen::Mods => {
-                let mut f = eng.begin_frame(MENU_CLEAR);
-                self.mod_menu.draw(&mut f, &self.mods, w, h);
-            }
-            Screen::Host => {
-                let mut f = eng.begin_frame(MENU_CLEAR);
-                self.host_menu.draw(&mut f, w, h);
-            }
-            Screen::Join => {
-                let mut f = eng.begin_frame(MENU_CLEAR);
-                self.join_menu.draw(&mut f, w, h);
-            }
-            Screen::Settings => {
-                let mut f = eng.begin_frame(MENU_CLEAR);
-                self.settings_menu.draw(&mut f, &self.settings, w, h);
-            }
-        }
+            Screen::Menu => &self.main_model,
+            Screen::Mods => &self.mods_model,
+            Screen::Host => &self.host_model,
+            Screen::Join => &self.join_model,
+            Screen::Settings => &self.settings_model,
+        };
+        let mut f = eng.begin_frame(MENU_CLEAR);
+        Self::draw_model(&mut self.mods, &mut f, model, w, h);
     }
 }
 
@@ -450,6 +549,17 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resident set size in MB via one `ps` call (bench-end only): a memory
+/// regression tripwire living next to the fps numbers, zero dependencies.
+fn resident_mb() -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(kb / 1024)
 }
 
 /// A world seed from the wall clock, so each new world differs.

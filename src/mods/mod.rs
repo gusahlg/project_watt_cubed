@@ -10,6 +10,7 @@
 //! matter and only what it draws where it wouldn't.
 pub mod crafting;
 pub mod inventory;
+pub mod menu_default;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,6 +18,7 @@ use std::rc::Rc;
 use voxel_engine::{Engine, Frame};
 
 use crate::block::ElementId;
+use crate::menu::{MenuEvent, MenuModel};
 use crate::player::Player;
 use crate::world::World;
 
@@ -185,6 +187,30 @@ pub trait Mod {
         let _ = (f, screen_w, screen_h);
     }
 
+    /// Whether this mod drives and draws the out-of-game menus. A separate
+    /// discriminator so [`drive_menu`](Self::drive_menu) returning `None` keeps
+    /// meaning "no event this frame" rather than "not my job". The FIRST
+    /// enabled mod with `handles_menus()` owns both input and visuals, so the
+    /// two can never split across mods.
+    fn handles_menus(&self) -> bool {
+        false
+    }
+
+    /// Interpret one frame of menu input against `menu`: move its cursor, edit
+    /// its text fields, and return at most one event. Only called on the mod
+    /// that [`handles_menus`](Self::handles_menus). Must never interpret what
+    /// the entries MEAN — that stays with the core.
+    fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
+        let _ = (eng, menu);
+        None
+    }
+
+    /// Draw a menu screen from its model. Only called on the mod that
+    /// [`handles_menus`](Self::handles_menus).
+    fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
+        let _ = (f, menu, screen_w, screen_h);
+    }
+
     /// Serialise persistent state to a single line for the save file, or `None` if
     /// the mod has nothing to persist. `world` resolves ids to portable names.
     fn save_state(&self, world: &World) -> Option<String> {
@@ -214,14 +240,17 @@ pub struct Mods {
 }
 
 impl Mods {
-    /// The default install: the bare-list inventory mod and the crafting mod,
-    /// both enabled, sharing one [`ElementStash`] — inventory fills it from
-    /// broken blocks, crafting spends it.
+    /// The default install: the menu mod (look/feel of every out-of-game
+    /// screen) first, then the bare-list inventory mod and the crafting mod,
+    /// all enabled. Inventory and crafting share one [`ElementStash`] —
+    /// inventory fills it from broken blocks, crafting spends it. Menus goes
+    /// FIRST so it wins the first-handler dispatch below by default.
     pub fn with_defaults() -> Self {
         let mut mods = Self {
             entries: Vec::new(),
         };
         let stash = Rc::new(RefCell::new(ElementStash::new(inventory::START_CAPACITY)));
+        mods.install(Box::new(menu_default::MenuDefaultMod::new()), true);
         mods.install(Box::new(inventory::InventoryMod::new(stash.clone())), true);
         mods.install(Box::new(crafting::CraftingMod::new(stash)), true);
         mods
@@ -267,6 +296,39 @@ impl Mods {
         for entry in &mut self.entries {
             if entry.enabled {
                 entry.module.draw(f, screen_w, screen_h);
+            }
+        }
+    }
+
+    /// Whether any enabled mod handles menus. When this is `false` the App
+    /// falls back to the built-in driver/renderer in [`crate::menu`] — the
+    /// guarantee that disabling the Menus mod can never brick navigation.
+    pub fn menu_driver_available(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.enabled && e.module.handles_menus())
+    }
+
+    /// Let the menu-handling mod interpret this frame's input. The FIRST
+    /// enabled mod with [`Mod::handles_menus`] wins, in install order — the
+    /// same one [`draw_menu`](Self::draw_menu) picks, so input and visuals
+    /// always come from a single mod.
+    pub fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
+        for entry in &mut self.entries {
+            if entry.enabled && entry.module.handles_menus() {
+                return entry.module.drive_menu(eng, menu);
+            }
+        }
+        None
+    }
+
+    /// Let the menu-handling mod draw a menu screen (first enabled handler,
+    /// same pick as [`drive_menu`](Self::drive_menu)).
+    pub fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
+        for entry in &mut self.entries {
+            if entry.enabled && entry.module.handles_menus() {
+                entry.module.draw_menu(f, menu, screen_w, screen_h);
+                return;
             }
         }
     }

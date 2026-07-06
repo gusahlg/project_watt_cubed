@@ -1,5 +1,5 @@
 # The game's core features
-This file describes the core features that align with the core philopshy to define the soul of the game.
+This file describes the core features that align with the core philosophy to define the soul of the game.
 
 ## The world
 The world of the game should have much variety, be aesthetically interesting and provide resources and other rewards in a balanced and fun way.

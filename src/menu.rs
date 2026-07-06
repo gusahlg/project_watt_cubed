@@ -1,17 +1,132 @@
-//! The out-of-game screens: the start menu (new / load / host / join / mods /
-//! settings / quit), the mod menu (toggle installed mods), the settings menu
-//! (graphics options), and the host/join forms. All are simple keyboard-driven —
-//! Up/Down to move, Enter to choose — kept deliberately plain so the menus are
-//! easy to restyle or replace (a menu is exactly the kind of thing a mod might
-//! take over).
+//! The out-of-game screens as pure MODELS: the start menu (new / load / host /
+//! join / mods / settings / quit), the mod list, the graphics settings, and the
+//! host/join forms.
+//!
+//! The user's fundamental holds here: a menu is really just a list of
+//! alternatives that lead to something. Core therefore owns only the MODEL and
+//! the MEANING — a [`MenuModel`] is built per screen by the functions below,
+//! and [`crate::app`] interprets the [`MenuEvent`]s that come back. The LOOK
+//! and the INTERACTION belong to mods (see
+//! [`menu_default`](crate::mods::menu_default), the default "Menus" mod),
+//! exactly like the inventory and crafting mods: default-enabled, disableable,
+//! replaceable.
+//!
+//! So that disabling the Menus mod can never brick navigation, this module
+//! also keeps a built-in fallback driver and renderer
+//! ([`fallback_drive`]/[`fallback_draw`]). The default mod is a thin wrapper
+//! around the same free functions ([`drive`]/[`draw_model`]) — one
+//! implementation, two entry points.
 use voxel_engine::{Color, Engine, Frame, Key};
 
 use crate::console::shadowed;
 use crate::mods::Mods;
 use crate::net::{DEFAULT_PORT, MAX_NAME};
-use crate::save;
+use crate::settings::Settings;
 
-/// What the player picked on the start menu.
+// ---------------------------------------------------------------------------
+// The model (frozen shapes — see ENGINE_DESIGN R6.1).
+// ---------------------------------------------------------------------------
+
+/// One whole menu screen: a titled list of entries with a cursor, a key hint
+/// line, and an optional error line. Everything a renderer needs — and nothing
+/// about what the entries MEAN.
+pub struct MenuModel {
+    pub title: String,
+    /// Present only on the start menu; renderers use it to pick the big
+    /// title treatment (48px gold + subtitle) over the compact one.
+    pub subtitle: Option<String>,
+    pub entries: Vec<MenuEntry>,
+    pub cursor: usize,
+    /// The key-hint line at the bottom of the screen.
+    pub hint: String,
+    /// A transient message (bad port, failed connect) drawn in the hint area.
+    /// Cleared by the driver on the next editing keystroke.
+    pub error: Option<String>,
+}
+
+/// One alternative in a menu.
+pub struct MenuEntry {
+    pub label: String,
+    /// A dimmer second line under the entry (mod descriptions).
+    pub detail: Option<String>,
+    pub kind: EntryKind,
+}
+
+/// What kind of alternative an entry is — which decides how the driver
+/// interacts with it and which events it can produce.
+pub enum EntryKind {
+    /// Activating it picks it ([`MenuEvent::Chosen`]).
+    Action,
+    /// An on/off switch ([`MenuEvent::Toggled`]); the bool is the shown state.
+    Toggle(bool),
+    /// A value stepped left/right through a list ([`MenuEvent::Cycled`]).
+    Cycle { value: String },
+    /// An editable text field; the driver types into it. `max` is the byte
+    /// cap; `masked` renders as `*`s (passwords).
+    Text { value: String, max: usize, masked: bool },
+}
+
+/// What the player did to a menu, in meaning-free index terms. The owner of
+/// the model (the App) turns these back into meaning.
+pub enum MenuEvent {
+    /// An [`EntryKind::Action`] entry was activated.
+    Chosen(usize),
+    /// An [`EntryKind::Toggle`] entry was flipped.
+    Toggled(usize),
+    /// An [`EntryKind::Cycle`] entry was stepped (`-1` or `+1`).
+    Cycled(usize, i32),
+    /// Leave this screen.
+    Back,
+    /// Submit the whole form (Enter while on a text field).
+    Submit,
+}
+
+impl MenuEntry {
+    pub fn action(label: impl Into<String>) -> Self {
+        Self { label: label.into(), detail: None, kind: EntryKind::Action }
+    }
+
+    pub fn toggle(label: impl Into<String>, on: bool, detail: impl Into<String>) -> Self {
+        Self { label: label.into(), detail: Some(detail.into()), kind: EntryKind::Toggle(on) }
+    }
+
+    pub fn cycle(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { label: label.into(), detail: None, kind: EntryKind::Cycle { value: value.into() } }
+    }
+
+    pub fn text(label: impl Into<String>, value: impl Into<String>, max: usize, masked: bool) -> Self {
+        Self {
+            label: label.into(),
+            detail: None,
+            kind: EntryKind::Text { value: value.into(), max, masked },
+        }
+    }
+}
+
+impl MenuModel {
+    /// The value of the text field at `index` (empty for non-text entries) —
+    /// how the App reads a submitted form back out of the model.
+    pub fn text_value(&self, index: usize) -> &str {
+        match &self.entries[index].kind {
+            EntryKind::Text { value, .. } => value,
+            _ => "",
+        }
+    }
+
+    /// Keep the cursor on a real entry after the list shrank (save deleted).
+    pub fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model builders — one per screen. The label/detail/value strings here are
+// byte-identical to what the old concrete menus rendered, so the default
+// renderer reproduces today's screens exactly.
+// ---------------------------------------------------------------------------
+
+/// What the player picked on the start menu (the meaning behind
+/// [`main_choice_at`]).
 pub enum MainChoice {
     NewWorld,
     Load(String),
@@ -22,333 +137,135 @@ pub enum MainChoice {
     Quit,
 }
 
-/// The start menu. Owns its list of existing saves and the current selection.
-pub struct MainMenu {
-    selected: usize,
-    saves: Vec<String>,
-}
-
-impl MainMenu {
-    pub fn new() -> Self {
-        Self {
-            selected: 0,
-            saves: save::list_saves(),
-        }
+/// The start menu: New World, one Load row per save, Host, Join, Mods,
+/// Settings, Quit.
+pub fn main_menu_model(saves: &[String]) -> MenuModel {
+    let mut entries = vec![MenuEntry::action("New World")];
+    for name in saves {
+        entries.push(MenuEntry::action(format!("Load: {name}")));
     }
-
-    /// Re-read the saves on disk (call when returning to the menu).
-    pub fn refresh(&mut self) {
-        self.saves = save::list_saves();
-        let max = self.item_count().saturating_sub(1);
-        self.selected = self.selected.min(max);
-    }
-
-    /// Total selectable rows: New World, one per save, Host, Join, Mods, Settings, Quit.
-    fn item_count(&self) -> usize {
-        self.saves.len() + 6
-    }
-
-    /// Resolve the current selection index into a concrete choice.
-    fn choice_at(&self, index: usize) -> MainChoice {
-        let saves = self.saves.len();
-        if index == 0 {
-            MainChoice::NewWorld
-        } else if index <= saves {
-            MainChoice::Load(self.saves[index - 1].clone())
-        } else if index == saves + 1 {
-            MainChoice::Host
-        } else if index == saves + 2 {
-            MainChoice::Join
-        } else if index == saves + 3 {
-            MainChoice::Mods
-        } else if index == saves + 4 {
-            MainChoice::Settings
-        } else {
-            MainChoice::Quit
-        }
-    }
-
-    /// Handle a frame of input, returning a choice when the player presses Enter.
-    /// Also accepts vim-style j/k/l for down/up/select.
-    pub fn update(&mut self, eng: &Engine) -> Option<MainChoice> {
-        let count = self.item_count();
-        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
-            self.selected = (self.selected + 1) % count;
-        }
-        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
-            self.selected = (self.selected + count - 1) % count;
-        }
-        if eng.is_key_pressed(Key::Enter) || eng.is_key_pressed(Key::L) {
-            return Some(self.choice_at(self.selected));
-        }
-        None
-    }
-
-    /// Draw the title and menu list.
-    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
-        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
-
-        let title = "PROJECT WATT CUBED";
-        let title_fs = 48;
-        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
-        shadowed(f, title, tx, screen_h / 6, title_fs, Color::GOLD);
-
-        let subtitle = "an infinite voxel world of elements";
-        let sub_fs = 20;
-        let sx = (screen_w - f.measure_text(subtitle, sub_fs)) / 2;
-        shadowed(f, subtitle, sx, screen_h / 6 + title_fs + 8, sub_fs, Color::GRAY);
-
-        // Build the labels in the same order as `choice_at`.
-        let mut labels = vec!["New World".to_string()];
-        for name in &self.saves {
-            labels.push(format!("Load: {name}"));
-        }
-        labels.push("Host Server".to_string());
-        labels.push("Join Server".to_string());
-        labels.push("Mods".to_string());
-        labels.push("Settings".to_string());
-        labels.push("Quit".to_string());
-
-        let fs = 28;
-        let line_h = fs + 14;
-        let start_y = screen_h / 2 - line_h;
-        for (i, label) in labels.iter().enumerate() {
-            let selected = i == self.selected;
-            let text = if selected {
-                format!("> {label}")
-            } else {
-                format!("  {label}")
-            };
-            let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            let x = (screen_w - f.measure_text(&text, fs)) / 2;
-            shadowed(f, &text, x, start_y + line_h * i as i32, fs, color);
-        }
-
-        let hint = "Up/Down or j/k select   Enter or l choose";
-        let hint_fs = 18;
-        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
-        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
+    entries.push(MenuEntry::action("Host Server"));
+    entries.push(MenuEntry::action("Join Server"));
+    entries.push(MenuEntry::action("Mods"));
+    entries.push(MenuEntry::action("Settings"));
+    entries.push(MenuEntry::action("Quit"));
+    MenuModel {
+        title: "PROJECT WATT CUBED".to_string(),
+        subtitle: Some("an infinite voxel world of elements".to_string()),
+        entries,
+        cursor: 0,
+        hint: "Up/Down or j/k select   Enter or l choose".to_string(),
+        error: None,
     }
 }
 
-impl Default for MainMenu {
-    fn default() -> Self {
-        Self::new()
+/// The index map for [`main_menu_model`]: resolve a [`MenuEvent::Chosen`]
+/// index against the same saves list the model was built from.
+pub fn main_choice_at(saves: &[String], index: usize) -> MainChoice {
+    let count = saves.len();
+    if index == 0 {
+        MainChoice::NewWorld
+    } else if index <= count {
+        MainChoice::Load(saves[index - 1].clone())
+    } else if index == count + 1 {
+        MainChoice::Host
+    } else if index == count + 2 {
+        MainChoice::Join
+    } else if index == count + 3 {
+        MainChoice::Mods
+    } else if index == count + 4 {
+        MainChoice::Settings
+    } else {
+        MainChoice::Quit
     }
 }
 
-/// The mod menu: toggle installed mods on and off.
-pub struct ModMenu {
-    selected: usize,
+/// The mod menu: one Toggle row per installed mod, description as the detail.
+pub fn mods_menu_model(mods: &Mods) -> MenuModel {
+    let entries = (0..mods.len())
+        .map(|i| MenuEntry::toggle(mods.name(i), mods.is_enabled(i), mods.description(i)))
+        .collect();
+    MenuModel {
+        title: "MODS".to_string(),
+        subtitle: None,
+        entries,
+        cursor: 0,
+        hint: "Up/Down or j/k select   Enter/l toggle   Esc/h back".to_string(),
+        error: None,
+    }
 }
 
-impl ModMenu {
-    pub fn new() -> Self {
-        Self { selected: 0 }
+/// Settings rows, top to bottom: Fullscreen, VSync, MSAA, Max FPS, Render
+/// Distance, FOV, Render Scale, Back.
+pub const SETTINGS_ROW_BACK: usize = 7;
+
+/// The settings menu: one Cycle row per graphics option plus a Back action.
+/// Values are formatted exactly as the old screen printed them.
+pub fn settings_menu_model(s: &Settings) -> MenuModel {
+    let on_off = |on: bool| if on { "On" } else { "Off" };
+    let max_fps = if s.max_fps == 0 {
+        "Uncapped".to_string()
+    } else {
+        s.max_fps.to_string()
+    };
+    let entries = vec![
+        MenuEntry::cycle("Fullscreen", on_off(s.fullscreen)),
+        MenuEntry::cycle("VSync", on_off(s.vsync)),
+        MenuEntry::cycle("MSAA", format!("{}x", s.msaa)),
+        MenuEntry::cycle("Max FPS", max_fps),
+        MenuEntry::cycle("Render Distance", s.render_distance.to_string()),
+        MenuEntry::cycle("FOV", format!("{}", s.fov)),
+        MenuEntry::cycle("Render Scale", format!("{:.0}%", s.render_scale * 100.0)),
+        MenuEntry::action("Back"),
+    ];
+    MenuModel {
+        title: "SETTINGS".to_string(),
+        subtitle: None,
+        entries,
+        cursor: 0,
+        hint: "Up/Down or j/k select | Left/Right or h/l change | Esc back".to_string(),
+        error: None,
     }
+}
 
-    /// Handle input; returns `true` when the player wants to go back.
-    /// Also accepts vim-style j/k/l/h for down/up/toggle/back.
-    pub fn update(&mut self, eng: &Engine, mods: &mut Mods) -> bool {
-        let count = mods.len().max(1);
-        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
-            self.selected = (self.selected + 1) % count;
+/// Apply one Left/Right (or Enter) step to a settings row, wrapping — the
+/// MEANING of a [`MenuEvent::Cycled`] on the settings screen, kept App-side so
+/// no mod ever decides what "MSAA" means.
+pub fn apply_settings_cycle(s: &mut Settings, row: usize, dir: i32) {
+    match row {
+        0 => s.fullscreen = !s.fullscreen,
+        1 => s.vsync = !s.vsync,
+        2 => s.msaa = cycle_list(&[1, 2, 4, 8], s.msaa, dir),
+        3 => s.max_fps = cycle_list(&[0, 30, 60, 120, 144, 240], s.max_fps, dir),
+        4 => {
+            let v = s.render_distance.clamp(3, 10) + dir;
+            s.render_distance = if v > 10 { 3 } else if v < 3 { 10 } else { v };
         }
-        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
-            self.selected = (self.selected + count - 1) % count;
+        5 => {
+            let v = s.fov.clamp(50.0, 110.0) + dir as f32 * 5.0;
+            s.fov = if v > 110.0 { 50.0 } else if v < 50.0 { 110.0 } else { v };
         }
-        if (eng.is_key_pressed(Key::Enter)
-            || eng.is_key_pressed(Key::Space)
-            || eng.is_key_pressed(Key::L))
-            && self.selected < mods.len()
-        {
-            mods.toggle(self.selected);
-        }
-        eng.is_key_pressed(Key::Escape)
-            || eng.is_key_pressed(Key::Backspace)
-            || eng.is_key_pressed(Key::H)
-    }
-
-    /// Draw the list of mods with their on/off state and descriptions.
-    pub fn draw(&self, f: &mut Frame, mods: &Mods, screen_w: i32, screen_h: i32) {
-        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
-
-        let title = "MODS";
-        let title_fs = 40;
-        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
-        shadowed(f, title, tx, screen_h / 8, title_fs, Color::GOLD);
-
-        let fs = 26;
-        let line_h = fs + 20;
-        let start_y = screen_h / 4 + 20;
-        let x = screen_w / 2 - 260;
-
-        if mods.is_empty() {
-            shadowed(f, "  (no mods installed)", x, start_y, fs, Color::GRAY);
-        }
-
-        for i in 0..mods.len() {
-            let selected = i == self.selected;
-            let mark = if mods.is_enabled(i) { "[x]" } else { "[ ]" };
-            let row = format!("{} {} {}", if selected { ">" } else { " " }, mark, mods.name(i));
-            let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
-            // Description under each row, dimmer.
-            shadowed(
-                f,
-                mods.description(i),
-                x + 40,
-                start_y + line_h * i as i32 + fs + 2,
-                16,
-                Color::DARKGRAY,
+        6 => {
+            // Percent steps; the engine clamps to 25%..200%.
+            let pct = cycle_list(
+                &[25, 50, 75, 100, 125, 150, 200],
+                (s.render_scale * 100.0).round() as u32,
+                dir,
             );
+            s.render_scale = pct as f32 / 100.0;
         }
-
-        let hint = "Up/Down or j/k select   Enter/l toggle   Esc/h back";
-        let hint_fs = 18;
-        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
-        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
+        _ => {}
     }
 }
-
-impl Default for ModMenu {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Rows in the settings menu, top to bottom: Fullscreen, VSync, MSAA, Max FPS,
-/// Render Distance, FOV, Render Scale, Back.
-const SETTINGS_ROWS: usize = 8;
-/// Index of the Back row.
-const SETTINGS_ROW_BACK: usize = SETTINGS_ROWS - 1;
 
 /// Step to the adjacent entry in `values`, wrapping at both ends. A current value
 /// not in the list (e.g. a hand-edited config) snaps to the first entry first.
-fn cycle_list(values: &[u32], current: u32, dir: i32) -> u32 {
+pub fn cycle_list(values: &[u32], current: u32, dir: i32) -> u32 {
     match values.iter().position(|&v| v == current) {
         Some(i) => values[(i as i32 + dir).rem_euclid(values.len() as i32) as usize],
         // Off-list (e.g. a /gfx or hand-edited value): snap to the first
         // entry without stepping, so Left can never jump 25% -> 200%.
         None => values[0],
-    }
-}
-
-/// The settings menu: graphics options cycled in place. Mutates the passed
-/// [`Settings`](crate::settings::Settings) directly; the caller applies and
-/// persists them.
-pub struct SettingsMenu {
-    selected: usize,
-}
-
-impl SettingsMenu {
-    pub fn new() -> Self {
-        Self { selected: 0 }
-    }
-
-    /// Handle input; returns `true` when the player wants to go back (Esc
-    /// anywhere, or Enter — or l — on the Back row). Left/Right cycle the
-    /// selected value down/up; Enter also cycles up. Also accepts vim-style
-    /// j/k for down/up and h/l as aliases of Left/Right.
-    pub fn update(&mut self, eng: &Engine, s: &mut crate::settings::Settings) -> bool {
-        if eng.is_key_pressed(Key::Escape) {
-            return true;
-        }
-        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
-            self.selected = (self.selected + 1) % SETTINGS_ROWS;
-        }
-        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
-            self.selected = (self.selected + SETTINGS_ROWS - 1) % SETTINGS_ROWS;
-        }
-        let enter = eng.is_key_pressed(Key::Enter);
-        let l = eng.is_key_pressed(Key::L);
-        if (enter || l) && self.selected == SETTINGS_ROW_BACK {
-            return true;
-        }
-        if eng.is_key_pressed(Key::Left) || eng.is_key_pressed(Key::H) {
-            self.cycle(s, -1);
-        }
-        if eng.is_key_pressed(Key::Right) || l || enter {
-            self.cycle(s, 1);
-        }
-        false
-    }
-
-    /// Apply one Left/Right (or Enter) step to the selected row's value, wrapping.
-    fn cycle(&self, s: &mut crate::settings::Settings, dir: i32) {
-        match self.selected {
-            0 => s.fullscreen = !s.fullscreen,
-            1 => s.vsync = !s.vsync,
-            2 => s.msaa = cycle_list(&[1, 2, 4, 8], s.msaa, dir),
-            3 => s.max_fps = cycle_list(&[0, 30, 60, 120, 144, 240], s.max_fps, dir),
-            4 => {
-                let v = s.render_distance.clamp(3, 10) + dir;
-                s.render_distance = if v > 10 { 3 } else if v < 3 { 10 } else { v };
-            }
-            5 => {
-                let v = s.fov.clamp(50.0, 110.0) + dir as f32 * 5.0;
-                s.fov = if v > 110.0 { 50.0 } else if v < 50.0 { 110.0 } else { v };
-            }
-            6 => {
-                // Percent steps; the engine clamps to 25%..200%.
-                let pct = cycle_list(
-                    &[25, 50, 75, 100, 125, 150, 200],
-                    (s.render_scale * 100.0).round() as u32,
-                    dir,
-                );
-                s.render_scale = pct as f32 / 100.0;
-            }
-            _ => {}
-        }
-    }
-
-    /// Draw the settings rows with their current values.
-    pub fn draw(&self, f: &mut Frame, s: &crate::settings::Settings, screen_w: i32, screen_h: i32) {
-        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
-
-        let title = "SETTINGS";
-        let title_fs = 40;
-        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
-        shadowed(f, title, tx, screen_h / 8, title_fs, Color::GOLD);
-
-        let on_off = |on: bool| if on { "On" } else { "Off" };
-        let max_fps = if s.max_fps == 0 {
-            "Uncapped".to_string()
-        } else {
-            s.max_fps.to_string()
-        };
-        let labels = [
-            format!("Fullscreen: {}", on_off(s.fullscreen)),
-            format!("VSync: {}", on_off(s.vsync)),
-            format!("MSAA: {}x", s.msaa),
-            format!("Max FPS: {max_fps}"),
-            format!("Render Distance: {}", s.render_distance),
-            format!("FOV: {}", s.fov),
-            format!("Render Scale: {:.0}%", s.render_scale * 100.0),
-            "Back".to_string(),
-        ];
-
-        let fs = 26;
-        let line_h = fs + 20;
-        let start_y = screen_h / 4 + 20;
-        let x = screen_w / 2 - 260;
-        for (i, label) in labels.iter().enumerate() {
-            let selected = i == self.selected;
-            let row = format!("{} {label}", if selected { ">" } else { " " });
-            let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
-        }
-
-        let hint = "Up/Down or j/k select | Left/Right or h/l change | Esc back";
-        let hint_fs = 18;
-        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
-        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
-    }
-}
-
-impl Default for SettingsMenu {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -367,112 +284,72 @@ pub struct JoinInfo {
     pub name: String,
 }
 
-/// One editable text field in a [`Form`].
-struct Field {
-    label: &'static str,
-    value: String,
-    /// Rendered as dots, for the password.
-    masked: bool,
-    /// Largest number of characters accepted.
-    max: usize,
+/// The host form: Port, optional Password (masked), Your name. `prior` (a
+/// previous host model) carries typed values over so re-opening the screen
+/// keeps what the player entered, like the old persistent form did.
+pub fn host_menu_model(prior: Option<&MenuModel>) -> MenuModel {
+    let mut model = MenuModel {
+        title: "HOST SERVER".to_string(),
+        subtitle: None,
+        entries: vec![
+            MenuEntry::text("Port", DEFAULT_PORT.to_string(), 5, false),
+            MenuEntry::text("Password (optional)", "", 64, true),
+            MenuEntry::text("Your name", "player", MAX_NAME, false),
+        ],
+        cursor: 0,
+        hint: "Up/Down field   type to edit   Enter start   Esc back".to_string(),
+        error: None,
+    };
+    if let Some(prior) = prior {
+        carry_text_values(prior, &mut model);
+    }
+    model
 }
 
-/// A tiny keyboard-driven form: Up/Down (or Tab) to pick a field, type to edit,
-/// Enter to submit, Esc to cancel. Shared by the host and join screens so the two
-/// stay identical to use.
-struct Form {
-    fields: Vec<Field>,
-    selected: usize,
-    /// A transient validation message (e.g. a bad port) drawn in red in the
-    /// hint area. Set by the owning menu when a submit is refused; cleared on
-    /// the next editing keystroke.
-    error: Option<String>,
+/// The join form: Address, Port, Password (masked), Your name. Same `prior`
+/// convention as [`host_menu_model`].
+pub fn join_menu_model(prior: Option<&MenuModel>) -> MenuModel {
+    let mut model = MenuModel {
+        title: "JOIN SERVER".to_string(),
+        subtitle: None,
+        entries: vec![
+            MenuEntry::text("Address", "127.0.0.1", 64, false),
+            MenuEntry::text("Port", DEFAULT_PORT.to_string(), 5, false),
+            MenuEntry::text("Password", "", 64, true),
+            MenuEntry::text("Your name", "player", MAX_NAME, false),
+        ],
+        cursor: 0,
+        hint: "Up/Down field   type to edit   Enter connect   Esc back".to_string(),
+        error: None,
+    };
+    if let Some(prior) = prior {
+        carry_text_values(prior, &mut model);
+    }
+    model
 }
 
-impl Form {
-    fn new(fields: Vec<Field>) -> Self {
-        Self { fields, selected: 0, error: None }
+/// Copy text-field values from a previous incarnation of the same form,
+/// positionally, so a rebuilt model keeps what the player typed.
+fn carry_text_values(prior: &MenuModel, model: &mut MenuModel) {
+    for (old, new) in prior.entries.iter().zip(model.entries.iter_mut()) {
+        if let (EntryKind::Text { value: from, .. }, EntryKind::Text { value: to, .. }) =
+            (&old.kind, &mut new.kind)
+        {
+            *to = from.clone();
+        }
     }
-
-    /// Process a frame. Returns `Some(true)` on submit, `Some(false)` on cancel.
-    fn update(&mut self, eng: &Engine) -> Option<bool> {
-        let n = self.fields.len();
-        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::Tab) {
-            self.selected = (self.selected + 1) % n;
-        }
-        if eng.is_key_pressed(Key::Up) {
-            self.selected = (self.selected + n - 1) % n;
-        }
-        if eng.is_key_pressed(Key::Enter) {
-            return Some(true);
-        }
-        if eng.is_key_pressed(Key::Escape) {
-            return Some(false);
-        }
-        if eng.is_key_pressed(Key::Backspace) {
-            self.fields[self.selected].value.pop();
-            self.error = None;
-        }
-        while let Some(c) = eng.get_char_pressed() {
-            let field = &mut self.fields[self.selected];
-            if !c.is_control() && field.value.len() < field.max {
-                field.value.push(c);
-            }
-            self.error = None;
-        }
-        None
-    }
-
-    fn value(&self, index: usize) -> &str {
-        &self.fields[index].value
-    }
-
-    /// Draw the form's title, its fields (the selected one highlighted), and a hint.
-    fn draw(&self, f: &mut Frame, title: &str, hint: &str, screen_w: i32, screen_h: i32) {
-        f.draw_rect(0, 0, screen_w, screen_h, Color::new(18, 20, 28, 255));
-
-        let title_fs = 40;
-        let tx = (screen_w - f.measure_text(title, title_fs)) / 2;
-        shadowed(f, title, tx, screen_h / 6, title_fs, Color::GOLD);
-
-        let fs = 26;
-        let line_h = fs + 22;
-        let start_y = screen_h / 2 - line_h;
-        let x = screen_w / 2 - 240;
-        for (i, field) in self.fields.iter().enumerate() {
-            let selected = i == self.selected;
-            let shown = if field.masked {
-                "*".repeat(field.value.chars().count())
-            } else {
-                field.value.clone()
-            };
-            let caret = if selected { "_" } else { "" };
-            let row = format!("{} {}: {}{}", if selected { ">" } else { " " }, field.label, shown, caret);
-            let color = if selected { Color::RAYWHITE } else { Color::GRAY };
-            shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
-        }
-
-        let hint_fs = 18;
-        let hx = (screen_w - f.measure_text(hint, hint_fs)) / 2;
-        // A refused submit's error sits just above the hint, in red, until the
-        // next keystroke.
-        if let Some(error) = &self.error {
-            let ex = (screen_w - f.measure_text(error, hint_fs)) / 2;
-            shadowed(f, error, ex, screen_h - 40 - (hint_fs + 8), hint_fs, Color::RED);
-        }
-        shadowed(f, hint, hx, screen_h - 40, hint_fs, Color::DARKGRAY);
-    }
+    model.cursor = prior.cursor.min(model.entries.len().saturating_sub(1));
 }
 
 /// The error shown when a submitted port doesn't parse.
-const PORT_ERROR: &str = "invalid port (1-65535)";
+pub const PORT_ERROR: &str = "invalid port (1-65535)";
 
 /// Parse a port field. An EMPTY field keeps meaning [`DEFAULT_PORT`] — the
 /// form pre-fills the default, and clearing the field is a handy way to say
 /// "just use the default". Anything non-empty must be a real port (1-65535):
 /// `None` refuses the submit rather than silently falling back (a typo like
 /// "99999" used to silently become 5555 and host/join the wrong port).
-fn parse_port(text: &str) -> Option<u16> {
+pub fn parse_port(text: &str) -> Option<u16> {
     let text = text.trim();
     if text.is_empty() {
         return Some(DEFAULT_PORT);
@@ -483,121 +360,336 @@ fn parse_port(text: &str) -> Option<u16> {
     }
 }
 
-/// The host screen: choose a port, an optional password, and your name.
-pub struct HostMenu {
-    form: Form,
+// ---------------------------------------------------------------------------
+// The driver: keys in, cursor/text mutations + one event out. Pure over a
+// per-frame key snapshot so it is unit-testable without an Engine.
+// ---------------------------------------------------------------------------
+
+/// One frame of menu-relevant input, snapshotted from the [`Engine`]. `chars`
+/// is the frame's drained text queue (layout- and shift-aware), consumed here
+/// so a menu frame owns its keystrokes.
+#[derive(Default, Clone, Debug)]
+pub struct MenuKeys {
+    pub up: bool,
+    pub down: bool,
+    pub j: bool,
+    pub k: bool,
+    pub enter: bool,
+    pub l: bool,
+    pub esc: bool,
+    pub h: bool,
+    pub tab: bool,
+    pub space: bool,
+    pub left: bool,
+    pub right: bool,
+    pub chars: Vec<char>,
+    pub backspace: bool,
 }
 
-impl HostMenu {
-    pub fn new() -> Self {
+impl MenuKeys {
+    /// Snapshot this frame's menu input, draining the char queue.
+    pub fn capture(eng: &Engine) -> Self {
+        let mut chars = Vec::new();
+        while let Some(c) = eng.get_char_pressed() {
+            chars.push(c);
+        }
         Self {
-            form: Form::new(vec![
-                Field { label: "Port", value: DEFAULT_PORT.to_string(), masked: false, max: 5 },
-                Field { label: "Password (optional)", value: String::new(), masked: true, max: 64 },
-                Field { label: "Your name", value: "player".to_string(), masked: false, max: MAX_NAME },
-            ]),
+            up: eng.is_key_pressed(Key::Up),
+            down: eng.is_key_pressed(Key::Down),
+            j: eng.is_key_pressed(Key::J),
+            k: eng.is_key_pressed(Key::K),
+            enter: eng.is_key_pressed(Key::Enter),
+            l: eng.is_key_pressed(Key::L),
+            esc: eng.is_key_pressed(Key::Escape),
+            h: eng.is_key_pressed(Key::H),
+            tab: eng.is_key_pressed(Key::Tab),
+            space: eng.is_key_pressed(Key::Space),
+            left: eng.is_key_pressed(Key::Left),
+            right: eng.is_key_pressed(Key::Right),
+            chars,
+            backspace: eng.is_key_pressed(Key::Backspace),
+        }
+    }
+}
+
+/// Interpret one frame of keys against a model: move the cursor, edit text
+/// fields, flip toggle displays, and emit at most one [`MenuEvent`]. This is
+/// the whole input contract of the old concrete menus, generalized per
+/// [`EntryKind`]:
+///
+/// - Up/Down (and j/k off text fields) move with wraparound.
+/// - Enter/l activate: Action -> [`MenuEvent::Chosen`], Toggle ->
+///   [`MenuEvent::Toggled`] (Space too — mod-menu parity), Cycle ->
+///   [`MenuEvent::Cycled`]`(+1)`.
+/// - Left/Right (and h/l) step Cycle entries.
+/// - Esc -> [`MenuEvent::Back`]; on Toggle rows h and Backspace too
+///   (mod-menu parity). On Action rows h does nothing (start-menu parity).
+/// - While the CURSOR is on a Text entry the form rules apply instead:
+///   Down/Tab and Up move fields, typed chars (including hjkl) go INTO the
+///   field (byte cap, control chars rejected), Backspace pops, Enter submits
+///   the whole form, Esc cancels. Editing clears `model.error`.
+///
+/// It never interprets meaning — that stays with the App.
+pub fn drive(keys: &MenuKeys, menu: &mut MenuModel) -> Option<MenuEvent> {
+    let n = menu.entries.len();
+    if n == 0 {
+        // Only an emptied mod list can get here; every back alias still works.
+        return (keys.esc || keys.h || keys.backspace).then_some(MenuEvent::Back);
+    }
+    menu.cursor = menu.cursor.min(n - 1);
+
+    if matches!(menu.entries[menu.cursor].kind, EntryKind::Text { .. }) {
+        return drive_text(keys, menu, n);
+    }
+
+    // List navigation first, so activation reads the post-move row (holding
+    // Down and tapping Enter picks what the highlight shows).
+    if keys.down || keys.j {
+        menu.cursor = (menu.cursor + 1) % n;
+    }
+    if keys.up || keys.k {
+        menu.cursor = (menu.cursor + n - 1) % n;
+    }
+    let cursor = menu.cursor;
+    match &mut menu.entries[cursor].kind {
+        EntryKind::Action => {
+            if keys.enter || keys.l {
+                return Some(MenuEvent::Chosen(cursor));
+            }
+        }
+        EntryKind::Toggle(on) => {
+            if keys.enter || keys.l || keys.space {
+                // Flip the DISPLAY optimistically; the owner rebuilds the
+                // model from the source of truth after acting on the event.
+                *on = !*on;
+                return Some(MenuEvent::Toggled(cursor));
+            }
+            if keys.esc || keys.h || keys.backspace {
+                return Some(MenuEvent::Back);
+            }
+        }
+        EntryKind::Cycle { .. } => {
+            if keys.left || keys.h {
+                return Some(MenuEvent::Cycled(cursor, -1));
+            }
+            if keys.right || keys.l || keys.enter {
+                return Some(MenuEvent::Cycled(cursor, 1));
+            }
+        }
+        // Navigation just landed on a text field; editing starts next frame.
+        EntryKind::Text { .. } => {}
+    }
+    if keys.esc {
+        return Some(MenuEvent::Back);
+    }
+    None
+}
+
+/// Form semantics while the cursor sits on a text field (see [`drive`]).
+fn drive_text(keys: &MenuKeys, menu: &mut MenuModel, n: usize) -> Option<MenuEvent> {
+    if keys.down || keys.tab {
+        menu.cursor = (menu.cursor + 1) % n;
+    }
+    if keys.up {
+        menu.cursor = (menu.cursor + n - 1) % n;
+    }
+    if keys.enter {
+        return Some(MenuEvent::Submit);
+    }
+    if keys.esc {
+        return Some(MenuEvent::Back);
+    }
+    // Edits target the (possibly just-moved-to) selected field, like the old
+    // form did. On a mixed menu the cursor may have landed on a non-text row,
+    // in which case the edits simply have nowhere to go.
+    if keys.backspace {
+        if let EntryKind::Text { value, .. } = &mut menu.entries[menu.cursor].kind {
+            value.pop();
+        }
+        menu.error = None;
+    }
+    for &c in &keys.chars {
+        if let EntryKind::Text { value, max, .. } = &mut menu.entries[menu.cursor].kind {
+            if !c.is_control() && value.len() < *max {
+                value.push(c);
+            }
+        }
+        menu.error = None;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// The renderer: the exact current visuals, driven entirely by the model. Three
+// families, picked from the model itself: the big-title start-menu style
+// (subtitle present), the form style (a text field anywhere), and the compact
+// list style (everything else).
+// ---------------------------------------------------------------------------
+
+/// Background for every menu screen.
+const MENU_BG: Color = Color::new(18, 20, 28, 255);
+
+/// Draw a menu model in the standard style. Free function so the default
+/// "Menus" mod and the core fallback share one implementation.
+pub fn draw_model(f: &mut Frame, menu: &MenuModel, w: i32, h: i32) {
+    f.draw_rect(0, 0, w, h, MENU_BG);
+    if menu.subtitle.is_some() {
+        draw_main_style(f, menu, w, h);
+    } else if menu
+        .entries
+        .iter()
+        .any(|e| matches!(e.kind, EntryKind::Text { .. }))
+    {
+        draw_form_style(f, menu, w, h);
+    } else {
+        draw_list_style(f, menu, w, h);
+    }
+}
+
+/// The start-menu look: 48px gold title at h/6, gray subtitle, centered rows.
+fn draw_main_style(f: &mut Frame, menu: &MenuModel, w: i32, h: i32) {
+    let title_fs = 48;
+    let tx = (w - f.measure_text(&menu.title, title_fs)) / 2;
+    shadowed(f, &menu.title, tx, h / 6, title_fs, Color::GOLD);
+
+    let subtitle = menu.subtitle.as_deref().unwrap_or("");
+    let sub_fs = 20;
+    let sx = (w - f.measure_text(subtitle, sub_fs)) / 2;
+    shadowed(f, subtitle, sx, h / 6 + title_fs + 8, sub_fs, Color::GRAY);
+
+    let fs = 28;
+    let line_h = fs + 14;
+    let start_y = h / 2 - line_h;
+    for (i, entry) in menu.entries.iter().enumerate() {
+        let selected = i == menu.cursor;
+        let text = if selected {
+            format!("> {}", entry.label)
+        } else {
+            format!("  {}", entry.label)
+        };
+        let color = if selected { Color::RAYWHITE } else { Color::GRAY };
+        let x = (w - f.measure_text(&text, fs)) / 2;
+        shadowed(f, &text, x, start_y + line_h * i as i32, fs, color);
+    }
+
+    draw_hint(f, &menu.hint, w, h);
+
+    // The start menu's status line (failed connect/host), salmon above the hint.
+    if let Some(error) = &menu.error {
+        let fs = 20;
+        let ex = (w - f.measure_text(error, fs)) / 2;
+        shadowed(f, error, ex, h - 70, fs, Color::SALMON);
+    }
+}
+
+/// The compact list look shared by the mod and settings screens: 40px title at
+/// h/8, left-aligned rows from h/4 + 20.
+fn draw_list_style(f: &mut Frame, menu: &MenuModel, w: i32, h: i32) {
+    let title_fs = 40;
+    let tx = (w - f.measure_text(&menu.title, title_fs)) / 2;
+    shadowed(f, &menu.title, tx, h / 8, title_fs, Color::GOLD);
+
+    let fs = 26;
+    let line_h = fs + 20;
+    let start_y = h / 4 + 20;
+    let x = w / 2 - 260;
+
+    if menu.entries.is_empty() {
+        // The only empty menu in the game is a modless mod list.
+        shadowed(f, "  (no mods installed)", x, start_y, fs, Color::GRAY);
+    }
+
+    for (i, entry) in menu.entries.iter().enumerate() {
+        let selected = i == menu.cursor;
+        let mark = if selected { ">" } else { " " };
+        let row = match &entry.kind {
+            EntryKind::Toggle(on) => {
+                format!("{} {} {}", mark, if *on { "[x]" } else { "[ ]" }, entry.label)
+            }
+            EntryKind::Cycle { value } => format!("{} {}: {}", mark, entry.label, value),
+            _ => format!("{} {}", mark, entry.label),
+        };
+        let color = if selected { Color::RAYWHITE } else { Color::GRAY };
+        shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
+        if let Some(detail) = &entry.detail {
+            shadowed(f, detail, x + 40, start_y + line_h * i as i32 + fs + 2, 16, Color::DARKGRAY);
         }
     }
 
-    /// Returns [`FormResult::Submit`] to start hosting, [`FormResult::Editing`]
-    /// while editing — including when a submit is refused for a bad port (the
-    /// form stays up with an error in the hint area) — and
-    /// [`FormResult::Cancel`] on Esc.
-    pub fn update(&mut self, eng: &Engine) -> FormResult<HostInfo> {
-        match self.form.update(eng) {
-            Some(true) => match parse_port(self.form.value(0)) {
-                Some(port) => FormResult::Submit(HostInfo {
-                    port,
-                    password: self.form.value(1).to_string(),
-                    name: self.form.value(2).to_string(),
-                }),
-                None => {
-                    self.form.error = Some(PORT_ERROR.to_string());
-                    FormResult::Editing
-                }
-            },
-            Some(false) => FormResult::Cancel,
-            None => FormResult::Editing,
-        }
+    draw_error(f, menu, w, h);
+    draw_hint(f, &menu.hint, w, h);
+}
+
+/// The form look shared by host and join: 40px title at h/6, "label: value"
+/// rows from h/2 - line_h with a trailing `_` caret on the selected field and
+/// `*`-masked passwords.
+fn draw_form_style(f: &mut Frame, menu: &MenuModel, w: i32, h: i32) {
+    let title_fs = 40;
+    let tx = (w - f.measure_text(&menu.title, title_fs)) / 2;
+    shadowed(f, &menu.title, tx, h / 6, title_fs, Color::GOLD);
+
+    let fs = 26;
+    let line_h = fs + 22;
+    let start_y = h / 2 - line_h;
+    let x = w / 2 - 240;
+    for (i, entry) in menu.entries.iter().enumerate() {
+        let selected = i == menu.cursor;
+        let mark = if selected { ">" } else { " " };
+        let row = match &entry.kind {
+            EntryKind::Text { value, masked, .. } => {
+                let shown = if *masked {
+                    "*".repeat(value.chars().count())
+                } else {
+                    value.clone()
+                };
+                let caret = if selected { "_" } else { "" };
+                format!("{} {}: {}{}", mark, entry.label, shown, caret)
+            }
+            EntryKind::Toggle(on) => {
+                format!("{} {} {}", mark, if *on { "[x]" } else { "[ ]" }, entry.label)
+            }
+            EntryKind::Cycle { value } => format!("{} {}: {}", mark, entry.label, value),
+            EntryKind::Action => format!("{} {}", mark, entry.label),
+        };
+        let color = if selected { Color::RAYWHITE } else { Color::GRAY };
+        shadowed(f, &row, x, start_y + line_h * i as i32, fs, color);
     }
 
-    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
-        self.form.draw(
-            f,
-            "HOST SERVER",
-            "Up/Down field   type to edit   Enter start   Esc back",
-            screen_w,
-            screen_h,
-        );
+    draw_error(f, menu, w, h);
+    draw_hint(f, &menu.hint, w, h);
+}
+
+/// The key-hint line every screen shows at the bottom.
+fn draw_hint(f: &mut Frame, hint: &str, w: i32, h: i32) {
+    let hint_fs = 18;
+    let hx = (w - f.measure_text(hint, hint_fs)) / 2;
+    shadowed(f, hint, hx, h - 40, hint_fs, Color::DARKGRAY);
+}
+
+/// A refused submit's error sits just above the hint, in red, until the next
+/// keystroke.
+fn draw_error(f: &mut Frame, menu: &MenuModel, w: i32, h: i32) {
+    if let Some(error) = &menu.error {
+        let hint_fs = 18;
+        let ex = (w - f.measure_text(error, hint_fs)) / 2;
+        shadowed(f, error, ex, h - 40 - (hint_fs + 8), hint_fs, Color::RED);
     }
 }
 
-impl Default for HostMenu {
-    fn default() -> Self {
-        Self::new()
-    }
+// ---------------------------------------------------------------------------
+// The no-brick fallback. The App uses these whenever NO enabled mod handles
+// menus, so switching the "Menus" mod off (or replacing it with a broken one
+// and disabling that) can never strand the player without navigation.
+// ---------------------------------------------------------------------------
+
+/// Built-in menu driver: same logic as the default mod (both are [`drive`]).
+pub fn fallback_drive(eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
+    drive(&MenuKeys::capture(eng), menu)
 }
 
-/// The join screen: enter a server address, port, password, and your name.
-pub struct JoinMenu {
-    form: Form,
-}
-
-impl JoinMenu {
-    pub fn new() -> Self {
-        Self {
-            form: Form::new(vec![
-                Field { label: "Address", value: "127.0.0.1".to_string(), masked: false, max: 64 },
-                Field { label: "Port", value: DEFAULT_PORT.to_string(), masked: false, max: 5 },
-                Field { label: "Password", value: String::new(), masked: true, max: 64 },
-                Field { label: "Your name", value: "player".to_string(), masked: false, max: MAX_NAME },
-            ]),
-        }
-    }
-
-    /// Same contract as [`HostMenu::update`]: a bad port refuses the submit and
-    /// keeps the form up with an error in the hint area.
-    pub fn update(&mut self, eng: &Engine) -> FormResult<JoinInfo> {
-        match self.form.update(eng) {
-            Some(true) => match parse_port(self.form.value(1)) {
-                Some(port) => FormResult::Submit(JoinInfo {
-                    host: self.form.value(0).trim().to_string(),
-                    port,
-                    password: self.form.value(2).to_string(),
-                    name: self.form.value(3).to_string(),
-                }),
-                None => {
-                    self.form.error = Some(PORT_ERROR.to_string());
-                    FormResult::Editing
-                }
-            },
-            Some(false) => FormResult::Cancel,
-            None => FormResult::Editing,
-        }
-    }
-
-    pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
-        self.form.draw(
-            f,
-            "JOIN SERVER",
-            "Up/Down field   type to edit   Enter connect   Esc back",
-            screen_w,
-            screen_h,
-        );
-    }
-}
-
-impl Default for JoinMenu {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The outcome of a form frame: still editing, submitted with a value, or cancelled.
-pub enum FormResult<T> {
-    Editing,
-    Submit(T),
-    Cancel,
+/// Built-in menu renderer: same drawing as the default mod ([`draw_model`]).
+pub fn fallback_draw(f: &mut Frame, menu: &MenuModel, w: i32, h: i32) {
+    draw_model(f, menu, w, h);
 }
 
 #[cfg(test)]
@@ -625,5 +717,320 @@ mod tests {
         assert_eq!(parse_port("-1"), None);
         assert_eq!(parse_port("555x"), None);
         assert_eq!(parse_port("port"), None);
+    }
+
+    // ---- model builders pin today's exact strings ----
+
+    #[test]
+    fn main_menu_model_matches_the_old_screen_exactly() {
+        let saves = vec!["alpha".to_string(), "beta".to_string()];
+        let m = main_menu_model(&saves);
+        assert_eq!(m.title, "PROJECT WATT CUBED");
+        assert_eq!(m.subtitle.as_deref(), Some("an infinite voxel world of elements"));
+        assert_eq!(m.hint, "Up/Down or j/k select   Enter or l choose");
+        let labels: Vec<&str> = m.entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "New World", "Load: alpha", "Load: beta", "Host Server", "Join Server", "Mods",
+                "Settings", "Quit"
+            ]
+        );
+        assert!(m.entries.iter().all(|e| matches!(e.kind, EntryKind::Action)));
+
+        // The index map resolves against the same saves list.
+        assert!(matches!(main_choice_at(&saves, 0), MainChoice::NewWorld));
+        assert!(matches!(main_choice_at(&saves, 2), MainChoice::Load(n) if n == "beta"));
+        assert!(matches!(main_choice_at(&saves, 3), MainChoice::Host));
+        assert!(matches!(main_choice_at(&saves, 4), MainChoice::Join));
+        assert!(matches!(main_choice_at(&saves, 5), MainChoice::Mods));
+        assert!(matches!(main_choice_at(&saves, 6), MainChoice::Settings));
+        assert!(matches!(main_choice_at(&saves, 7), MainChoice::Quit));
+    }
+
+    #[test]
+    fn settings_menu_model_prints_values_like_the_old_screen() {
+        let mut s = Settings::default();
+        s.msaa = 4;
+        s.max_fps = 0;
+        s.render_scale = 0.75;
+        let m = settings_menu_model(&s);
+        assert_eq!(m.title, "SETTINGS");
+        assert_eq!(m.hint, "Up/Down or j/k select | Left/Right or h/l change | Esc back");
+        let rows: Vec<(String, String)> = m
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Cycle { value } => Some((e.label.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Fullscreen".to_string(), "Off".to_string()),
+                ("VSync".to_string(), "Off".to_string()),
+                ("MSAA".to_string(), "4x".to_string()),
+                ("Max FPS".to_string(), "Uncapped".to_string()),
+                ("Render Distance".to_string(), "6".to_string()),
+                // f32 Display: whole values print without a decimal point,
+                // exactly as `format!("FOV: {}", s.fov)` did.
+                ("FOV".to_string(), "70".to_string()),
+                ("Render Scale".to_string(), "75%".to_string()),
+            ]
+        );
+        assert!(matches!(m.entries[SETTINGS_ROW_BACK].kind, EntryKind::Action));
+        assert_eq!(m.entries[SETTINGS_ROW_BACK].label, "Back");
+    }
+
+    #[test]
+    fn form_models_keep_the_old_fields_and_carry_values_forward() {
+        let host = host_menu_model(None);
+        assert_eq!(host.title, "HOST SERVER");
+        assert_eq!(host.hint, "Up/Down field   type to edit   Enter start   Esc back");
+        assert_eq!(host.text_value(0), DEFAULT_PORT.to_string());
+        assert!(matches!(
+            host.entries[1].kind,
+            EntryKind::Text { masked: true, max: 64, .. }
+        ));
+        assert_eq!(host.entries[1].label, "Password (optional)");
+        assert_eq!(host.text_value(2), "player");
+
+        let join = join_menu_model(None);
+        assert_eq!(join.title, "JOIN SERVER");
+        assert_eq!(join.hint, "Up/Down field   type to edit   Enter connect   Esc back");
+        assert_eq!(join.text_value(0), "127.0.0.1");
+        assert_eq!(join.text_value(1), DEFAULT_PORT.to_string());
+        assert!(matches!(join.entries[2].kind, EntryKind::Text { masked: true, .. }));
+        assert!(matches!(
+            join.entries[3].kind,
+            EntryKind::Text { max: MAX_NAME, masked: false, .. }
+        ));
+
+        // A rebuilt form keeps what the player typed.
+        let mut edited = host_menu_model(None);
+        if let EntryKind::Text { value, .. } = &mut edited.entries[1].kind {
+            *value = "hunter2".to_string();
+        }
+        edited.cursor = 2;
+        let rebuilt = host_menu_model(Some(&edited));
+        assert_eq!(rebuilt.text_value(1), "hunter2");
+        assert_eq!(rebuilt.cursor, 2);
+    }
+
+    // ---- driver: list navigation and events ----
+
+    fn action_menu(n: usize) -> MenuModel {
+        MenuModel {
+            title: String::new(),
+            subtitle: None,
+            entries: (0..n).map(|i| MenuEntry::action(format!("e{i}"))).collect(),
+            cursor: 0,
+            hint: String::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn cursor_wraps_both_ways_with_arrows_and_jk() {
+        let mut m = action_menu(3);
+        assert!(drive(&MenuKeys { down: true, ..Default::default() }, &mut m).is_none());
+        assert_eq!(m.cursor, 1);
+        drive(&MenuKeys { j: true, ..Default::default() }, &mut m);
+        drive(&MenuKeys { j: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 0, "down wraps past the end");
+        drive(&MenuKeys { up: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 2, "up wraps past the start");
+        drive(&MenuKeys { k: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 1);
+    }
+
+    #[test]
+    fn enter_and_l_choose_actions_and_esc_backs_out() {
+        let mut m = action_menu(3);
+        m.cursor = 2;
+        assert!(matches!(
+            drive(&MenuKeys { enter: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Chosen(2))
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { l: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Chosen(2))
+        ));
+        // h does nothing on an action list (start-menu parity)…
+        assert!(drive(&MenuKeys { h: true, ..Default::default() }, &mut m).is_none());
+        // …but Esc always means back.
+        assert!(matches!(
+            drive(&MenuKeys { esc: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Back)
+        ));
+        // Activation reads the post-move row.
+        m.cursor = 0;
+        assert!(matches!(
+            drive(&MenuKeys { down: true, enter: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Chosen(1))
+        ));
+    }
+
+    #[test]
+    fn toggle_rows_toggle_on_enter_l_space_and_back_on_h_backspace() {
+        let mut m = MenuModel {
+            title: String::new(),
+            subtitle: None,
+            entries: vec![
+                MenuEntry::toggle("a", true, ""),
+                MenuEntry::toggle("b", false, ""),
+            ],
+            cursor: 1,
+            hint: String::new(),
+            error: None,
+        };
+        for keys in [
+            MenuKeys { enter: true, ..Default::default() },
+            MenuKeys { l: true, ..Default::default() },
+            MenuKeys { space: true, ..Default::default() },
+        ] {
+            assert!(matches!(drive(&keys, &mut m), Some(MenuEvent::Toggled(1))));
+        }
+        // The display flipped optimistically each time: false -> true -> false -> true.
+        assert!(matches!(m.entries[1].kind, EntryKind::Toggle(true)));
+        // Mod-menu parity: h and Backspace also mean back on toggle rows.
+        assert!(matches!(
+            drive(&MenuKeys { h: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Back)
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { backspace: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Back)
+        ));
+    }
+
+    #[test]
+    fn cycle_rows_step_with_arrows_hl_and_enter() {
+        let mut m = MenuModel {
+            title: String::new(),
+            subtitle: None,
+            entries: vec![MenuEntry::cycle("MSAA", "4x")],
+            cursor: 0,
+            hint: String::new(),
+            error: None,
+        };
+        assert!(matches!(
+            drive(&MenuKeys { left: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Cycled(0, -1))
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { h: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Cycled(0, -1))
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { right: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Cycled(0, 1))
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { l: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Cycled(0, 1))
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { enter: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Cycled(0, 1))
+        ));
+    }
+
+    #[test]
+    fn empty_menu_still_backs_out() {
+        let mut m = action_menu(0);
+        assert!(drive(&MenuKeys { enter: true, ..Default::default() }, &mut m).is_none());
+        assert!(matches!(
+            drive(&MenuKeys { esc: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Back)
+        ));
+    }
+
+    // ---- driver: text (form) semantics ----
+
+    #[test]
+    fn text_fields_capture_hjkl_as_characters() {
+        let mut m = host_menu_model(None);
+        m.cursor = 2; // "Your name"
+        if let EntryKind::Text { value, .. } = &mut m.entries[2].kind {
+            value.clear();
+        }
+        // j/k/h/l key flags must NOT navigate while typing; the chars land in
+        // the field instead.
+        let keys = MenuKeys { j: true, chars: vec!['j', 'h'], ..Default::default() };
+        assert!(drive(&keys, &mut m).is_none());
+        assert_eq!(m.cursor, 2, "j does not move the cursor while on a text field");
+        assert_eq!(m.text_value(2), "jh");
+    }
+
+    #[test]
+    fn text_editing_respects_max_len_control_chars_and_backspace() {
+        let mut m = host_menu_model(None); // Port field: max 5, prefilled "5555"
+        m.error = Some(PORT_ERROR.to_string());
+        drive(&MenuKeys { chars: vec!['9', '9'], ..Default::default() }, &mut m);
+        assert_eq!(m.text_value(0), "55559", "the byte cap holds at 5");
+        assert_eq!(m.error, None, "any editing keystroke clears the error");
+
+        m.error = Some(PORT_ERROR.to_string());
+        drive(&MenuKeys { backspace: true, ..Default::default() }, &mut m);
+        assert_eq!(m.text_value(0), "5555");
+        assert_eq!(m.error, None, "backspace clears the error too");
+
+        drive(&MenuKeys { chars: vec!['\u{8}', '\t'], ..Default::default() }, &mut m);
+        assert_eq!(m.text_value(0), "5555", "control characters are rejected");
+    }
+
+    #[test]
+    fn form_navigation_uses_tab_and_arrows_and_enter_submits() {
+        let mut m = join_menu_model(None);
+        drive(&MenuKeys { tab: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 1);
+        drive(&MenuKeys { down: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 2);
+        drive(&MenuKeys { up: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 1);
+        // Tab wraps like Down.
+        m.cursor = 3;
+        drive(&MenuKeys { tab: true, ..Default::default() }, &mut m);
+        assert_eq!(m.cursor, 0);
+        assert!(matches!(
+            drive(&MenuKeys { enter: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Submit)
+        ));
+        assert!(matches!(
+            drive(&MenuKeys { esc: true, ..Default::default() }, &mut m),
+            Some(MenuEvent::Back)
+        ));
+    }
+
+    // ---- settings meaning stays core-side ----
+
+    #[test]
+    fn settings_cycle_wraps_every_row() {
+        let mut s = Settings::default();
+        apply_settings_cycle(&mut s, 0, 1);
+        assert!(s.fullscreen);
+        apply_settings_cycle(&mut s, 2, -1);
+        assert_eq!(s.msaa, 8, "msaa wraps 1 -> 8 going left");
+        s.render_distance = 10;
+        apply_settings_cycle(&mut s, 4, 1);
+        assert_eq!(s.render_distance, 3, "render distance wraps 10 -> 3");
+        s.fov = 50.0;
+        apply_settings_cycle(&mut s, 5, -1);
+        assert_eq!(s.fov, 110.0, "fov wraps 50 -> 110");
+        // The Back row cycles to nothing.
+        let before = s.clone();
+        apply_settings_cycle(&mut s, SETTINGS_ROW_BACK, 1);
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn cycle_list_wraps_and_snaps_off_list_values() {
+        assert_eq!(cycle_list(&[1, 2, 4, 8], 4, 1), 8);
+        assert_eq!(cycle_list(&[1, 2, 4, 8], 8, 1), 1);
+        assert_eq!(cycle_list(&[1, 2, 4, 8], 1, -1), 8);
+        // Off-list snaps to the first entry without stepping.
+        assert_eq!(cycle_list(&[25, 50, 100], 60, 1), 25);
     }
 }

@@ -156,8 +156,12 @@ mod tests {
     #[test]
     fn uniform_promotes_to_dense_on_first_differing_write() {
         let (g, stone, _) = hills(7);
-        let mut chunk = Chunk::new(0, -10, 0, &g); // deep rock: uniform stone
-        assert_eq!(chunk.uniform(), Some(stone));
+        // Deep rock — but caves can hollow deep chunks now, so scan along +z
+        // for one the generator still proves (or collapses) to uniform stone.
+        let mut chunk = (0..64)
+            .map(|cz| Chunk::new(0, -10, cz, &g))
+            .find(|c| c.uniform() == Some(stone))
+            .expect("a cave-free deep chunk within 64 along +z");
 
         // Writing the same block keeps the cheap representation.
         chunk.set_local(0, 0, 0, stone);

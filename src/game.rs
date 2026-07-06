@@ -52,6 +52,9 @@ pub struct Game {
     /// The live server connection when playing multiplayer; `None` in singleplayer.
     /// The player simulates locally and the server keeps everyone in sync.
     net: Option<Connection>,
+    /// Cached HUD coordinate line: the displayed values change far less often
+    /// than the frame rate, so the format!/measure pair runs only on change.
+    coord_cache: (i64, i64, i64, String),
 }
 
 impl Game {
@@ -64,6 +67,7 @@ impl Game {
             mouse_locked: true,
             save_name,
             net: None,
+            coord_cache: (i64::MIN, i64::MIN, i64::MIN, String::new()),
         }
     }
 
@@ -326,7 +330,13 @@ impl Game {
         let cam_pos = self.player.position;
 
         let p = self.player.position;
-        let coord_text = format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z);
+        // 0.1-block display resolution: only re-format when a shown digit moves.
+        let key = ((p.x * 10.0) as i64, (p.y * 10.0) as i64, (p.z * 10.0) as i64);
+        if (key.0, key.1, key.2) != (self.coord_cache.0, self.coord_cache.1, self.coord_cache.2) {
+            let text = format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z);
+            self.coord_cache = (key.0, key.1, key.2, text);
+        }
+        let coord_text = self.coord_cache.3.clone();
         let coord_fs = 26;
         let screen_w = eng.screen_width();
         let screen_h = eng.screen_height();
