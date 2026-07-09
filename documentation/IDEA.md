@@ -1,6 +1,6 @@
 # Project Watt Cubed Pitch
 
-Project Watt Cubed is a voxel sandbox game set in an infinite voxel world. The world is made of voxels consisting of different elements, each with unique properties.
+Project Watt Cubed is a voxel sandbox game set in an infinite voxel world. The world is made of voxels (should replace "block" with "voxel" elsewhere?) consisting of different elements, each with unique properties.
 The world is infinite in all three axis so you can dig infinitely deep and go infinitely high as well, maximum freedom.
 
 The game is about:
@@ -17,20 +17,21 @@ The second half of the game is what makes it truly meaningful and fun: people.
 
 This includes:
 
-* Cooperation
+* Coöperation
 * Interaction
 * Being part of a large economy
 * Creating lore
 * Building stories
 * Forming societies
 
-Since the game is about people, cooperation, and having fun together, the community around the game should play a major role.
+Since the game is about people, coöperation, and having fun together, the community around the game should play a major role.
 
 ## Modding and Customisation
 
-Every part of the game should be built with modding and customisation in mind.
+Every part of the game should be built with modding and customization in mind.
 
-This means that the power of a passionate community can be used to create a huge number of solutions, allowing every player to find a UI, feature, or playstyle that fits them perfectly — or to easily make their own.
+This means that the power of a passionate community can be used to create a huge number of solutions, allowing every player
+to find a UI, feature, or playstyle that fits them perfectly — or to easily make their own.
 
 ## Core Philosophy
 
