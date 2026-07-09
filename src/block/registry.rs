@@ -45,9 +45,12 @@ pub struct Block {
 pub struct BlockRegistry {
     elements: ElementRegistry,
     reactions: ReactionRegistry,
+    // NOTE: These three could be put into a single vector holding a tuple of block, bool and color.
+    // This would be ideal since it is more efficient.
     blocks: Vec<Block>, // cold records
     solid: Vec<bool>,   // HOT, indexed by BlockId
     color: Vec<Color>,  // HOT, indexed by BlockId
+
     dedup: HashMap<CompKey, BlockId>,
     names: HashMap<String, BlockId>,
 }
@@ -55,7 +58,7 @@ pub struct BlockRegistry {
 impl BlockRegistry {
     /// A registry preloaded with the built-in elements, reactions, and blocks.
     /// `AIR` is registered first, so it is always [`BlockId(0)`](BlockId).
-    pub fn with_builtins() -> Self {
+   pub fn with_builtins() -> Self {
         let mut registry = Self {
             elements: ElementRegistry::with_builtins(),
             reactions: ReactionRegistry::with_builtins(),
