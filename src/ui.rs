@@ -17,6 +17,35 @@ use voxel_engine::{Color, Engine, Frame, Key};
 /// this module needs no vector-math dependency of its own.
 pub type Px = (i32, i32);
 
+/// Fit a label into a fixed-width monospace row without splitting Unicode.
+/// The renderer advances every glyph by one font-size unit, so character count
+/// is the exact layout metric here.
+pub fn ellipsize(text: &str, max_chars: usize) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    text.chars()
+        .take(max_chars - 3)
+        .chain("...".chars())
+        .collect()
+}
+
+/// A cursor-following slice of `0..total` containing at most `capacity` rows.
+/// Used by compact HUD lists so the active crafting row never runs off-screen.
+pub fn visible_window(total: usize, cursor: usize, capacity: usize) -> std::ops::Range<usize> {
+    if total == 0 || capacity == 0 {
+        return 0..0;
+    }
+    let capacity = capacity.min(total);
+    let cursor = cursor.min(total - 1);
+    let start = cursor.saturating_sub(capacity / 2).min(total - capacity);
+    start..start + capacity
+}
+
 /// The nine placement points of a rectangle. A total enum — there is no
 /// "some magic offset" corner, so every HUD element names where it lives and the
 /// right/bottom/centre arithmetic exists in exactly one place ([`Anchor::origin`]).
@@ -626,5 +655,15 @@ mod tests {
         assert_eq!(common_prefix(&["tp", "teleport"]), "t");
         assert_eq!(common_prefix(&["gfx"]), "gfx");
         assert_eq!(common_prefix(&["pos", "gfx"]), "");
+    }
+
+    #[test]
+    fn ellipsize_and_visible_window_respect_hard_bounds() {
+        assert_eq!(ellipsize("Copper+Glass", 9), "Copper...");
+        assert_eq!(ellipsize("Iron", 9), "Iron");
+        assert_eq!(visible_window(20, 10, 5), 8..13);
+        assert_eq!(visible_window(20, 19, 5), 15..20);
+        assert_eq!(visible_window(2, 1, 5), 0..2);
+        assert_eq!(visible_window(2, 1, 0), 0..0);
     }
 }

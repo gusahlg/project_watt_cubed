@@ -477,9 +477,9 @@ impl World {
     /// Sanity check: a coord claimed as a live generate job (`generating`)
     /// should have no `Loaded` entry yet — it's only in that set because it's
     /// still absent. A generating coord that already has data would block its
-    /// own regeneration and never re-enter the mesh pipeline. Runs behind
-    /// `cfg(debug_assertions)` (on in test builds).
-    #[cfg(debug_assertions)]
+    /// own regeneration and never re-enter the mesh pipeline. Test-only: the
+    /// invariant is exercised directly without adding release work.
+    #[cfg(any(debug_assertions, test))]
     fn debug_assert_liveness(&self) {
         for coord in &self.generating {
             debug_assert!(

@@ -28,7 +28,6 @@ use crate::world::World;
 
 /// How far the player can reach to break a block, in world units.
 const REACH: f64 = 6.0;
-const HELP_TEXT: &str = "WASD move | mouse look | Space jump | F fly | LMB break | I inventory | C craft | Tab cursor | T chat/cmd | Esc menu";
 /// Peers past this distance get no floating name tag (it would be unreadable).
 const TAG_RANGE: f64 = 90.0;
 
@@ -169,8 +168,11 @@ impl Game {
             return Signal::Continue;
         }
 
-        // Esc (console closed) leaves to the menu.
+        // Esc closes an in-world mod overlay before leaving the world.
         if eng.is_key_pressed(Key::Escape) {
+            if mods.close_overlay() {
+                return Signal::Continue;
+            }
             return Signal::ExitToMenu;
         }
 
@@ -431,7 +433,11 @@ impl Game {
 
         let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
         // Draw minimap.
-        self.minimap.draw(&mut f, screen, self.player.yaw);
+        let player_col = IVec2::new(
+            self.player.position.x.floor() as i32,
+            self.player.position.z.floor() as i32,
+        );
+        self.minimap.draw(&mut f, screen, player_col, self.player.yaw);
 
         let theme = &self.theme;
 
@@ -460,10 +466,9 @@ impl Game {
         if theme.hud.shows_info() {
             ui::label(&mut f, theme, screen, Anchor::Top, (0, 12), 26, theme.palette.text, &coord_text);
             f.draw_fps(10, 12);
-            ui::label(&mut f, theme, screen, Anchor::TopLeft, (10, 40), 16, theme.palette.muted, HELP_TEXT);
             if let Some(count) = online {
                 let text = format!("players online: {count}");
-                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 12), 20, theme.palette.good, &text);
+                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 180), 20, theme.palette.good, &text);
             }
         }
 

@@ -76,41 +76,44 @@ impl World {
         mut paint: impl FnMut(i32, i32, i32, Color),
     ) {
         // Calls paint only for columns with top solid; caller pre-fills void.
+        // Bucket the footprint's vertical stacks in one pass over `chunks` and
+        // one sort, keyed by dense grid cell — no hashing. The old loop
+        // rescanned every loaded chunk once for every x/z chunk column in the
+        // minimap footprint (hundreds of full map scans per refresh).
         let s = CHUNK_SIZE as i32;
-        for ccx in x0.div_euclid(s)..=x1.div_euclid(s) {
-            for ccz in z0.div_euclid(s)..=z1.div_euclid(s) {
-                // Collect chunk-Ys once, reused across footprint.
-                let mut cys: Vec<i32> = self
-                    .chunks
-                    .keys()
-                    .filter(|c| c.x == ccx && c.z == ccz)
-                    .map(|c| c.y)
-                    .collect();
-                if cys.is_empty() {
-                    continue;
-                }
-                cys.sort_unstable_by(|a, b| b.cmp(a));
+        let (cx0, cx1) = (x0.div_euclid(s), x1.div_euclid(s));
+        let (cz0, cz1) = (z0.div_euclid(s), z1.div_euclid(s));
+        let grid_w = cx1 - cx0 + 1;
+        let mut stacks: Vec<(i32, i32, &super::Loaded)> = Vec::new();
+        for (&coord, loaded) in &self.chunks {
+            if (cx0..=cx1).contains(&coord.x) && (cz0..=cz1).contains(&coord.z) {
+                let cell = (coord.z - cz0) * grid_w + (coord.x - cx0);
+                stacks.push((cell, coord.y, loaded));
+            }
+        }
+        // Group by cell, top chunk first within each stack.
+        stacks.sort_unstable_by_key(|&(cell, cy, _)| (cell, std::cmp::Reverse(cy)));
 
-                let xs = x0.max(ccx * s)..=x1.min((ccx + 1) * s - 1);
-                let zs = z0.max(ccz * s)..=z1.min((ccz + 1) * s - 1);
-                for x in xs {
-                    let lx = x.rem_euclid(s) as usize;
-                    for z in zs.clone() {
-                        let lz = z.rem_euclid(s) as usize;
-                        for &cy in &cys {
-                            let loaded = &self.chunks[&Coord::new(ccx, cy, ccz)];
-                            let top = match loaded.chunk.uniform() {
-                                Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
-                                Some(_) => None,
-                                None => (0..s).rev().find_map(|ly| {
-                                    let id = loaded.chunk.get_local(lx, ly as usize, lz);
-                                    self.registry.is_solid(id).then_some((cy * s + ly, id))
-                                }),
-                            };
-                            if let Some((top_y, id)) = top {
-                                paint(x, z, top_y, self.registry.color(id));
-                                break; // topmost hit
-                            }
+        for stack in stacks.chunk_by(|a, b| a.0 == b.0) {
+            let (ccx, ccz) = (cx0 + stack[0].0 % grid_w, cz0 + stack[0].0 / grid_w);
+            let xs = x0.max(ccx * s)..=x1.min((ccx + 1) * s - 1);
+            let zs = z0.max(ccz * s)..=z1.min((ccz + 1) * s - 1);
+            for x in xs {
+                let lx = x.rem_euclid(s) as usize;
+                for z in zs.clone() {
+                    let lz = z.rem_euclid(s) as usize;
+                    for &(_, cy, loaded) in stack {
+                        let top = match loaded.chunk.uniform() {
+                            Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
+                            Some(_) => None,
+                            None => (0..s).rev().find_map(|ly| {
+                                let id = loaded.chunk.get_local(lx, ly as usize, lz);
+                                self.registry.is_solid(id).then_some((cy * s + ly, id))
+                            }),
+                        };
+                        if let Some((top_y, id)) = top {
+                            paint(x, z, top_y, self.registry.color(id));
+                            break; // topmost hit
                         }
                     }
                 }
@@ -191,5 +194,31 @@ impl World {
         // Single-sourced through the split iso in `coord.rs`, so the negative
         // `div_euclid` semantics live in exactly one place.
         BlockCoord::new(x, y, z).split().0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn indexed_surface_walk_matches_point_queries_across_chunk_edges() {
+        let world = World::new(73);
+        let (x0, z0, x1, z1) = (-18, -19, 21, 20);
+        let mut actual = BTreeMap::new();
+        world.for_surface_columns(x0, z0, x1, z1, |x, z, y, color| {
+            actual.insert((x, z), (y, [color.r, color.g, color.b, color.a]));
+        });
+
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                let expected = world.top_solid(x, z).map(|y| {
+                    let color = world.registry.color(world.block_at(x, y, z));
+                    (y, [color.r, color.g, color.b, color.a])
+                });
+                assert_eq!(actual.get(&(x, z)).copied(), expected, "column ({x}, {z})");
+            }
+        }
     }
 }
