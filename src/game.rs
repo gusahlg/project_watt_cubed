@@ -313,6 +313,7 @@ impl Game {
         if *settings != before {
             settings.apply(eng);
             self.world.set_view_radius(settings.render_distance);
+            self.world.set_lighting(settings.lighting, eng);
             settings.save();
         }
         // A `/time` change is shared: tell the server so every client's clock
@@ -382,14 +383,11 @@ impl Game {
         }
     }
 
-    /// Render the world and HUD (owns its own draw pass for the frame).
+    /// Render the world and HUD.
     ///
-    /// The camera sits at `Vec3::ZERO` looking along the view direction
-    /// ([`Player::camera_with_fov`](crate::player::Player)), and every 3D
-    /// draw is camera-relative — the world passes per-chunk offsets to
-    /// `draw_mesh`, peers subtract the eye. Differences are taken in `f64`
-    /// first, so only small camera-local values ever reach the `f32` GPU
-    /// path; the world can be 1e9 blocks wide without a vertex jittering.
+    /// The camera is at the origin looking along the view direction, and all
+    /// 3D draws are camera-relative. Differences are computed at f64 precision
+    /// before narrowing to f32 for the GPU, keeping far terrain stable.
     pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32) {
         let camera = self.player.camera_with_fov(fov);
         let cam_pos = self.player.position;

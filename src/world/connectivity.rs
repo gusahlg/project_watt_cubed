@@ -1,7 +1,9 @@
 //! Per-chunk face connectivity + camera-rooted visibility BFS — the "cave
 //! culling" occlusion pass. Frustum culling (in the engine) removes chunks
-//! outside the view; this removes chunks the view *cannot reach* because solid
-//! terrain walls them off (the far side of a hill, sealed cave networks).
+//! outside the view; this removes chunks the view *cannot reach* because opaque
+//! terrain walls them off (the far side of a hill, sealed cave networks). Keys on
+//! opacity, not solidity: water/glass are solid but see-through, so a sightline
+//! passes through them and does not seal the chunks behind.
 //!
 //! Two pure, engine-free pieces, both unit-tested headless like the mesher:
 //!
@@ -12,27 +14,21 @@
 //!   chunk map, entering a chunk only through a face its connectivity says the
 //!   sightline can traverse.
 //!
-//! **Correctness invariant:** the only way this pass can produce a *hole* (a
-//! visible chunk wrongly culled) is by failing to reach a chunk the camera can
-//! see. BFS *over*-reaching (visiting extra chunks) only weakens the cull — it
-//! is never wrong. So v1 is deliberately permissive: it reaches at least every
-//! visible chunk. The classic "don't propagate backwards" dot-product filter
-//! (`N · forward < 0`) — the one thing that can under-reach and punch holes — is
-//! intentionally omitted here; it is a later tightening once the result can be
-//! validated visually, and it is the reason `forward` is not a parameter yet.
+//! **Correctness:** the only way this pass produces a hole (visible chunk wrongly
+//! culled) is by failing to reach a visible chunk. Reaching extra chunks only
+//! weakens the cull. So this implementation is deliberately permissive: it reaches
+//! at least every visible chunk. Tighter optimizations are deferred.
 use super::chunk::{CHUNK_VOLUME, Chunk, ChunkData};
 use super::{FastMap, FastSet};
 use crate::block::registry::BlockId;
 use crate::coord::{ChunkCoord, Face};
 
-/// Which of a chunk's six faces a sightline can pass *between* through connected
-/// interior air. Six faces form 15 unordered pairs, one bit each, packed in a
-/// `u16`. A newtype so the pair↔bit layout stays private and this bitset can't
-/// be confused with any other mask.
+/// Which of a chunk's six faces a sightline can pass through. Encodes face pairs
+/// as bits in a `u16` for efficient connectivity checks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Connectivity(u16);
 
-/// Bit for the unordered face pair `{a, b}`. One bit per distinct pair (15 total).
+/// Bit mask for an unordered pair of faces.
 #[inline]
 fn pair_bit(a: Face, b: Face) -> u16 {
     let (a, b) = (a as usize, b as usize);
@@ -57,8 +53,7 @@ impl Connectivity {
         self.0 & pair_bit(a, b) != 0
     }
 
-    /// Record that an interior pocket touches every face in `faces` (a 6-bit
-    /// mask, bit `f as usize`): all pairs among those faces become connected.
+    /// Record a pocket touching certain faces; mark all face pairs as connected.
     fn add_pocket(&mut self, faces: u8) {
         for a in Face::ALL {
             for b in Face::ALL {
@@ -72,19 +67,21 @@ impl Connectivity {
         }
     }
 
-    /// Face connectivity of one chunk: flood-fill its non-solid cells and, for
-    /// each connected pocket, connect every pair of chunk faces it reaches.
-    /// `is_solid` classifies a [`BlockId`] — a closure so the caller can back it
-    /// with the registry or a snapshot table without this module knowing which.
-    pub fn compute(chunk: &Chunk, is_solid: impl Fn(BlockId) -> bool) -> Connectivity {
+    /// Face connectivity of one chunk: flood-fill the cells a sightline can pass
+    /// through and, for each connected pocket, connect every pair of chunk faces
+    /// it reaches. `blocks_sight` classifies a [`BlockId`] as opaque — a closure so
+    /// the caller can back it with the registry or a snapshot table without this
+    /// module knowing which. Keys on *opacity*, not solidity: water/glass are solid
+    /// but see-through, so a sightline passes through them.
+    pub fn compute(chunk: &Chunk, blocks_sight: impl Fn(BlockId) -> bool) -> Connectivity {
         let cells = match chunk.data() {
-            // Uniform chunks need no scan: solid seals everything, air opens it.
+            // Uniform chunks need no scan: opaque seals everything, see-through opens it.
             ChunkData::Uniform(id) => {
-                return if is_solid(*id) { Self::SEALED } else { Self::OPEN };
+                return if blocks_sight(*id) { Self::SEALED } else { Self::OPEN };
             }
             ChunkData::Dense(cells) => cells,
         };
-        let passable = |i: usize| !is_solid(BlockId(cells[i]));
+        let passable = |i: usize| !blocks_sight(BlockId(cells[i]));
 
         let mut visited = [false; CHUNK_VOLUME];
         let mut conn = Connectivity::SEALED;
@@ -113,8 +110,7 @@ impl Connectivity {
     }
 }
 
-/// The 6-bit face mask of the chunk faces a cell at local `(x, y, z)` lies on
-/// (bit `f as usize`). Interior cells return 0.
+/// Bitmask of chunk faces that a cell touches (0 for interior cells).
 fn boundary_faces(x: usize, y: usize, z: usize) -> u8 {
     const EDGE: usize = super::chunk::CHUNK_SIZE - 1;
     let mut m = 0u8;
@@ -169,12 +165,8 @@ fn orthogonal_neighbours(x: usize, y: usize, z: usize) -> impl Iterator<Item = (
     out.into_iter().take(n)
 }
 
-/// The occlusion pass: the set of chunks a sightline can reach from the
-/// camera's chunk, plus the reusable buffers its BFS needs. Owned by the
-/// `World` and rebuilt once per frame at the `&mut` streaming sync point — like
-/// [`Derived`](crate::derived::Derived), the visible set is never derived inside
-/// the `&self` render accessor. Buffers are cleared, not reallocated, so a
-/// steady-state frame does no heap work here.
+/// The occlusion pass: determines which chunks are visible from the camera.
+/// Rebuilt once per frame; buffers are cleared not reallocated for efficiency.
 #[derive(Default)]
 pub struct Occlusion {
     visible: FastSet<ChunkCoord>,
@@ -193,14 +185,9 @@ impl Occlusion {
         self.visible.contains(&coord)
     }
 
-    /// Recompute the visible set: a BFS outward from `origin` (the camera's
-    /// chunk) that enters a chunk only through a face its [`Connectivity`] can
-    /// traverse from the face it arrived on. `conn_of` returns a chunk's
-    /// connectivity, or `None` if it is not loaded.
-    ///
-    /// The camera's own chunk is a root that can see out of every face. Every
-    /// other chunk is reached across some face `X`, so it is entered on
-    /// `X.opposite()` and may leave through any face connected to that entry.
+    /// Recompute the visible set using BFS from the camera's chunk. Each chunk
+    /// is entered through a face and may exit through connected faces. The camera's
+    /// chunk can see out of every face; other chunks are reached progressively.
     pub fn rebuild(&mut self, origin: ChunkCoord, conn_of: impl Fn(ChunkCoord) -> Option<Connectivity>) {
         self.visible.clear();
         self.entered.clear();
@@ -232,11 +219,9 @@ impl Occlusion {
                     Some(entry) => conn.connects(entry, exit),
                 };
                 if open {
-                    // NOTE approximation: per-chunk connectivity ignores whether
-                    // the shared boundary plane with the neighbour is actually
-                    // open. This can over-report visibility (draw a chunk that is
-                    // in fact sealed off at the seam) — never under-report, so it
-                    // never culls a visible chunk. Standard cave-culling trade.
+                    // NOTE: per-chunk connectivity is conservative—we don't check if
+                    // the shared boundary is actually open, which can over-report
+                    // visibility. This never culls a visible chunk.
                     self.queue.push((coord.step(exit), Some(exit.opposite())));
                 }
             }

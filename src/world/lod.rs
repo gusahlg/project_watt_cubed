@@ -10,13 +10,14 @@
 //! never invalidated — so [`TileState`] has no `Dirty` variant (strictly fewer
 //! states than a chunk's [`MeshState`](super::MeshState)); it keeps an `Air`
 //! variant for the born-empty (sky/buried) tiles, mirroring the chunk path.
-use voxel_engine::{Engine, MeshData, MeshHandle};
+use voxel_engine::{Engine, Frame3D, MeshHandle, Vec3};
 
-use super::OwnedMesh;
+use super::ChunkMeshes;
 use super::chunk::CHUNK_SIZE;
 use super::generation::TerrainGenerator;
-use super::mesh::{Padded, build_chunk_mesh, new_chunk_mesh_data};
+use super::mesh::{ChunkMeshData, Padded, build_chunk_mesh, new_chunk_mesh_data};
 use crate::block::registry::{BlockId, HotTables};
+use crate::coord::ByPass;
 use crate::world::light::PaddedLight;
 
 /// LOD level carrier: everything about a tile's size derives from `k`.
@@ -70,26 +71,31 @@ pub(in crate::world) enum TileState {
     /// All air or fully buried (shell hides all faces); nothing drawn.
     Air,
     Meshing,
-    /// Owns GPU mesh; draw offset = tile.origin (recomputed at draw time).
-    Ready { mesh: OwnedMesh },
+    /// Owns GPU mesh(es), one per present pass; draw offset = tile.origin
+    /// (recomputed at draw time).
+    Ready { meshes: ChunkMeshes },
 }
 
 impl TileState {
-    /// Wrap a freshly uploaded tile handle.
-    pub(in crate::world) fn ready(handle: MeshHandle) -> Self {
-        TileState::Ready { mesh: OwnedMesh::new(handle) }
-    }
-    /// Free the tile's GPU mesh, if any. Consumes `self` (no double-free).
-    pub(in crate::world) fn free(self, eng: &mut Engine) {
-        if let TileState::Ready { mesh } = self {
-            mesh.free(eng);
+    /// The state a fresh multi-pass upload produces: `Ready` if any pass
+    /// yielded a handle, else `Air` (an all-empty tile uploads to nothing).
+    pub(in crate::world) fn from_upload(handles: ByPass<Option<MeshHandle>>) -> Self {
+        match ChunkMeshes::from_upload_handles(handles) {
+            Some(meshes) => TileState::Ready { meshes },
+            None => TileState::Air,
         }
     }
-    /// Drawable handle if Ready.
-    pub(in crate::world) fn drawable(&self) -> Option<MeshHandle> {
-        match self {
-            TileState::Ready { mesh } => Some(mesh.id()),
-            TileState::Air | TileState::Meshing => None,
+    /// Free the tile's GPU mesh(es), if any. Consumes `self` (no double-free).
+    pub(in crate::world) fn free(self, eng: &mut Engine) {
+        if let TileState::Ready { meshes } = self {
+            meshes.free(eng);
+        }
+    }
+    /// Record a draw for each present pass, depth-biased so full-res chunks
+    /// win on overlap.
+    pub(in crate::world) fn draw(&self, f: &mut Frame3D, offset: Vec3, scale: f32) {
+        if let TileState::Ready { meshes } = self {
+            meshes.draw_biased(f, offset, scale);
         }
     }
 }
@@ -112,13 +118,19 @@ fn sample_coarse<T: TerrainGenerator>(tile: Tile, terrain: &T) -> (Padded, Optio
     let cell = tile.lod.cell();
     let half = cell / 2;
     let (ox, oy, oz) = (tile.origin_x(), tile.origin_y(), tile.origin_z());
-    let sample = |x: i32, y: i32, z: i32| -> BlockId {
+    // The padded y-range is -1..=16 (PAD = CHUNK_SIZE + 2). Each level's world-y is
+    // the same across every column, so build the run once and share it — letting the
+    // generator sample one column profile per run instead of one per cell.
+    let ys: Vec<i32> = (0..CHUNK_SIZE + 2).map(|i| oy + (i as i32 - 1) * cell + half).collect();
+    // Skip per-cell generation if tile is uniformly one block (sky/water).
+    if let Some(id) = terrain.lod_tile_uniform(ox, oz, cell, ys[0], ys[CHUNK_SIZE + 1]) {
+        return (Padded::uniform(id), Some(id));
+    }
+    let padded = Padded::from_columns(|x, z, out| {
         let wx = ox + x * cell + half;
-        let wy = oy + y * cell + half;
         let wz = oz + z * cell + half;
-        terrain.block_at(wx, wy, wz, terrain.height(wx, wz))
-    };
-    let padded = Padded::from_cells(sample);
+        terrain.lod_column(wx, wz, &ys, out);
+    });
     // Interior-only uniform detection (the shell is excluded, matching how a
     // dense chunk's `uniform()` keys off its own 16³).
     let first = padded.at(0, 0, 0);
@@ -136,10 +148,11 @@ fn sample_coarse<T: TerrainGenerator>(tile: Tile, terrain: &T) -> (Padded, Optio
     (padded, uniform)
 }
 
-/// Build tile's opaque mesh from downsampled generator using full-res mesher.
-/// Vertices are cell-local 0..=16, drawn at scale=lod.cell() + tile origin.
-/// Lit flat; only opaque pass kept. Empty tiles become Air state.
-pub fn build_tile_mesh<T: TerrainGenerator>(tile: Tile, terrain: &T, tables: &HotTables) -> MeshData {
+/// Build tile's mesh (every pass) from downsampled generator using full-res
+/// mesher. Vertices are cell-local 0..=16, drawn at scale=lod.cell() + tile
+/// origin. Lit as open-sky (full skylight, no blocklight) so tile shading
+/// tracks day/night like real surface chunks. Empty tiles become Air state.
+pub fn build_tile_mesh<T: TerrainGenerator>(tile: Tile, terrain: &T, tables: &HotTables) -> ChunkMeshData {
     use voxel_engine::profile::{Meter, add};
     // Split the tile job into its two halves — coarse generator sampling vs.
     // greedy meshing — so the unified report shows which one the ~46ms/job cost
@@ -150,18 +163,23 @@ pub fn build_tile_mesh<T: TerrainGenerator>(tile: Tile, terrain: &T, tables: &Ho
 
     let t1 = std::time::Instant::now();
     let mut data = new_chunk_mesh_data();
-    build_chunk_mesh(&padded, uniform, tables, &PaddedLight::full(), &mut data);
+    build_chunk_mesh(&padded, uniform, tables, &PaddedLight::open_sky(), &mut data);
     add(Meter::TileMesh, t1.elapsed());
 
-    let [opaque, _transparent] = data.into_slots();
-    opaque
+    data
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
-    use voxel_engine::{MeshVertex, Normal};
+    use voxel_engine::{MeshData, MeshVertex, Normal, Pass};
+
+    /// These fixtures use only fully-opaque blocks (Grass/Stone), so their
+    /// geometry always lands in the opaque pass.
+    fn opaque(data: &ChunkMeshData) -> &MeshData {
+        &data[Pass::Opaque]
+    }
 
     fn tables() -> HotTables {
         BlockRegistry::with_builtins().hot_tables()
@@ -183,6 +201,10 @@ mod tests {
         }
         fn deep(&self) -> BlockId {
             self.deep
+        }
+        /// Uniform air for spans wholly above the surface.
+        fn lod_tile_uniform(&self, _ox: i32, _oz: i32, _cell: i32, y0: i32, _y1: i32) -> Option<BlockId> {
+            (y0 >= self.h).then_some(crate::block::registry::AIR)
         }
     }
     fn flat(h: i32) -> FlatGen {
@@ -227,9 +249,10 @@ mod tests {
         // h = 100 → the tile y=1 (world Y 64..128) brackets the surface.
         let tile = Tile { lod: Lod(2), x: 0, y: 1, z: 0 };
         let data = build_tile_mesh(tile, &flat(100), &tables());
-        assert!(!data.vertices().is_empty(), "the surface tile has geometry");
-        assert!(data.vertices().iter().any(|v: &MeshVertex| v.normal() == Normal::PosY), "a top");
-        assert_winds_outward(&data);
+        let mesh = opaque(&data);
+        assert!(!mesh.vertices().is_empty(), "the surface tile has geometry");
+        assert!(mesh.vertices().iter().any(|v: &MeshVertex| v.normal() == Normal::PosY), "a top");
+        assert_winds_outward(mesh);
     }
 
     /// Sky tile (above surface) meshes empty (born Air).
@@ -237,7 +260,24 @@ mod tests {
     fn sky_tile_meshes_empty() {
         // h = 100; tile y=5 spans world Y 320..384, all above the surface.
         let tile = Tile { lod: Lod(2), x: 0, y: 5, z: 0 };
-        assert!(build_tile_mesh(tile, &flat(100), &tables()).vertices().is_empty(), "sky is empty");
+        assert!(opaque(&build_tile_mesh(tile, &flat(100), &tables())).vertices().is_empty(), "sky is empty");
+    }
+
+    /// Early-out produces same result as full per-cell sample.
+    #[test]
+    fn sky_tile_early_out_matches_full_sample() {
+        // h = 100; tile y=5 spans world Y 320..384, wholly above the surface.
+        let tile = Tile { lod: Lod(2), x: 0, y: 5, z: 0 };
+        let (padded, uniform) = sample_coarse(tile, &flat(100));
+        assert_eq!(uniform, Some(crate::block::registry::AIR), "sky tile detected uniform air");
+        for y in -1..=CS {
+            for z in -1..=CS {
+                for x in -1..=CS {
+                    assert_eq!(padded.at(x, y, z), crate::block::registry::AIR);
+                }
+            }
+        }
+        assert!(opaque(&build_tile_mesh(tile, &flat(100), &tables())).vertices().is_empty());
     }
 
     /// Buried tile (below surface) meshes empty; uniform shell hides interior faces.
@@ -245,6 +285,6 @@ mod tests {
     fn buried_tile_meshes_empty() {
         // h = 100; tile y=0 spans world Y 0..64, all deep (surface is at 99).
         let tile = Tile { lod: Lod(2), x: 0, y: 0, z: 0 };
-        assert!(build_tile_mesh(tile, &flat(100), &tables()).vertices().is_empty(), "buried is empty");
+        assert!(opaque(&build_tile_mesh(tile, &flat(100), &tables())).vertices().is_empty(), "buried is empty");
     }
 }

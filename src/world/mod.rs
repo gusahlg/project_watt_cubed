@@ -37,15 +37,17 @@ pub mod light;
 pub mod lod;
 pub mod mesh;
 pub mod pipeline;
+pub mod skin;
 
 mod edits;
 mod query;
 mod streaming;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::sync::Arc;
 
-use voxel_engine::{DVec3, Engine, Frame3D, MeshData, MeshHandle, Vec3};
+use voxel_engine::{DVec3, Engine, Frame3D, MeshHandle, SurfaceData, Vec3};
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
@@ -55,6 +57,7 @@ use generation::{SineHills, TerrainGenerator};
 use light::LightGrid;
 use lod::{Tile, TileState};
 use mesh::{ChunkMeshData, new_chunk_mesh_data};
+use skin::{SkinColumn, SkinState};
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -80,11 +83,18 @@ const UPLOAD_BUDGET: usize = 4;
 /// first, so a locally broken block still vanishes the same frame while a
 /// multiplayer join snapshot flood spreads over a few frames instead of one hitch.
 const DIRTY_BUDGET: usize = 8;
-/// How many chunks the main-thread light-settle pass relaxes per stream. Each
-/// `propagate` is ~µs (it only floods a 16³ grid), so this can dwarf the mesh
-/// budget: settling must stay well ahead of meshing, which gates on it, or fresh
-/// meshes stall waiting for their neighbourhood light to converge.
-const LIGHT_SETTLE_BUDGET: usize = 64;
+/// How many settled light grids may be *applied* (published + border-diffed +
+/// mesh-invalidated) per drain. The analytic-light path publishes trivial grids
+/// synchronously in `store_chunk`, so only the residual Dense band reaches the
+/// worker pool; this caps the main-thread bookkeeping when many land at once.
+/// Leftovers stay in `light_inflight`/re-seed, so lowering it only spreads work.
+const LIGHT_APPLY_BUDGET: usize = 32;
+/// How many chunks the occlusion rebuild may flood-fill (`Connectivity::compute`)
+/// per frame. A boundary cross can newly load a whole shell of unclassified
+/// chunks; capping the fill keeps a cross from BFS-flooding O(cube) in one frame.
+/// On a partial fill the `occlusion_dirty` flag is left set so the rebuild
+/// re-runs next frame — convergence over frames, no correctness cost.
+const OCCLUSION_FILL_BUDGET: usize = 64;
 /// The seed a default (`generate`) world uses when none is chosen.
 pub const DEFAULT_SEED: i64 = 1;
 /// The far-tile ring tracks `view_radius`: the LOD pyramid fills the band from
@@ -95,6 +105,14 @@ const LOD_REACH: i32 = 2;
 /// their own budgets so a world-entry tile flood can't starve chunk meshing.
 const TILE_ENQUEUE_BUDGET: usize = 2;
 const TILE_UPLOAD_BUDGET: usize = 2;
+/// The far-skin ring (Zone 3) reaches this multiple of the view radius past the
+/// player — a 2-D `(x, z)` ring independent of player Y (a horizon backdrop),
+/// strictly beyond the Zone-2 tile ring (`SKIN_LOD` is coarser than `TILE_LOD`).
+const SKIN_REACH: i32 = 4;
+/// Skin surface jobs handed to the pool per stream, and skin uploads per frame —
+/// their own budgets so a world-entry skin flood can't starve chunk/tile work.
+const SKIN_ENQUEUE_BUDGET: usize = 2;
+const SKIN_UPLOAD_BUDGET: usize = 2;
 
 /// A chunk-coordinate map key. The [`ChunkCoord`] newtype owns the
 /// `chunk * CHUNK_SIZE + local` relationship (see [`crate::coord`]); the
@@ -198,7 +216,8 @@ impl Sticky {
 /// ownership: a born-air chunk is `Air` (nothing drawn, no worker job), a
 /// drawable one is `Ready(handle)`, and so on — see [`MeshState`].
 struct Loaded {
-    chunk: Chunk,
+    /// Shared voxel storage by refcount; edits via `Arc::make_mut`.
+    chunk: Arc<Chunk>,
     state: MeshState,
     /// Mesh-input revision: bumped whenever this chunk's mesh inputs change —
     /// a direct edit, or an edit on a neighbour's touching border (which flips
@@ -213,8 +232,9 @@ struct Loaded {
     /// flood-fill. Depends only on the chunk's own voxels, so a neighbour edit
     /// (which bumps `rev`) leaves it valid.
     connectivity: Option<Connectivity>,
-    /// The chunk's settled light grid, published by the main-thread
-    /// [`settle_light`](World::settle_light) pass (decoupled from meshing). Read
+    /// The chunk's settled light grid, published ([`publish_light`](World::publish_light))
+    /// either analytically (the trivial fast path) or when a worker-pool flood
+    /// lands (the flood runs off-thread, decoupled from meshing). Read
     /// as part of the neighbour shell ([`light::PaddedLight`]) when an adjacent
     /// chunk meshes or settles, and directly queryable for gameplay (mob spawns,
     /// plant growth) with no mesh. `None` until the chunk has first settled.
@@ -270,11 +290,24 @@ impl ChunkMeshes {
         let any = passes.iter().any(|(_, m)| m.is_some());
         any.then_some(Self(passes))
     }
+    /// Wrap freshly uploaded per-pass handles, same "≥1 present" rule as [`Self::new`].
+    pub(in crate::world) fn from_upload_handles(handles: ByPass<Option<MeshHandle>>) -> Option<Self> {
+        Self::new(ByPass::from_fn(|p| handles[p].map(OwnedMesh::new)))
+    }
     /// Record a draw for each present pass at `offset`/`scale`.
     fn draw(&self, f: &mut Frame3D, offset: Vec3, scale: f32) {
         for (_, m) in self.0.iter() {
             if let Some(mesh) = m {
                 f.draw_mesh(mesh.id(), offset, scale);
+            }
+        }
+    }
+    /// Record a depth-biased draw for each present pass — used for LOD tiles
+    /// so full-res chunks win on overlap.
+    pub(in crate::world) fn draw_biased(&self, f: &mut Frame3D, offset: Vec3, scale: f32) {
+        for (_, m) in self.0.iter() {
+            if let Some(mesh) = m {
+                f.draw_mesh_biased(mesh.id(), offset, scale);
             }
         }
     }
@@ -295,17 +328,26 @@ impl ChunkMeshes {
 
 /// Mesh-lifecycle state of a loaded chunk. Owns GPU mesh via [`OwnedMesh`] token;
 /// `rev` bumped when mesh inputs stale. Handle ownership rides the state machine:
-/// moves on edit (`Dirty.prev`) or frees on unload/shrink/remesh. `Meshing` owns none.
+/// moves on edit (`Dirty.prev`) or frees on unload/shrink/remesh.
+///
+/// "Needs a mesh" and "a build job is outstanding" are orthogonal, so the second
+/// is a `building` refinement of `NeedsMesh` — NOT a separate `Meshing` state
+/// mutually exclusive with it. That fusion was the old wedge: an async result
+/// that went stale purely because the view moved (no edit, no unload — the one
+/// transition carrying no event) had no way to un-claim a `Meshing` state, so
+/// the chunk stuck claimed-but-never-ready forever. Now the claim is a bool that
+/// only `Air`/`Ready` structurally cannot carry, and every result-consumption
+/// path clears it, so the wedge is unrepresentable.
 #[derive(Debug, PartialEq, Eq)]
 enum MeshState {
     /// Uniform-air, born meshed: nothing to draw, no worker job ever queued.
     Air,
-    /// Dense data with no mesh yet and no job outstanding: awaiting the fresh scan.
-    NeedsMesh,
-    /// A fresh mesh job is outstanding on the worker pool (owns no handle;
-    /// `rev` on `Loaded` referees its result; the `Meshing` state IS the
-    /// "mesh in flight" claim, held until the budgeted upload resolves).
-    Meshing,
+    /// Dense data with no mesh yet. `building` is the in-flight claim: `true`
+    /// once a fresh mesh job is outstanding on the worker pool (owns no handle;
+    /// `rev` on `Loaded` referees its result), held until the budgeted upload
+    /// resolves or the result is dropped. A `building` chunk still draws
+    /// nothing and is still "needs mesh" — it is just also claimed.
+    NeedsMesh { building: bool },
     /// Drawable: owns the live GPU mesh(es) (up to one per pass).
     Ready(ChunkMeshes),
     /// Edited, awaiting the synchronous remesh. `prev` is the previously-drawn
@@ -354,13 +396,25 @@ impl MeshState {
     /// Invalidate to `Dirty`, carrying the currently-drawn mesh forward as
     /// `prev` so it keeps drawing until the sync remesh. Nothing is freed here
     /// — the token just moves. `Ready(m) -> Dirty{Some(m)}`; an already-`Dirty`
-    /// chunk keeps its `prev`; handle-less states -> `Dirty{None}`.
+    /// chunk keeps its `prev`; handle-less states (incl. a `building` chunk,
+    /// whose in-flight claim is dropped — the sync remesh takes over and the
+    /// orphan async result is refereed out by `rev`) -> `Dirty{None}`.
     fn invalidate(&mut self) {
-        let prev = std::mem::replace(self, MeshState::NeedsMesh).into_owned();
+        let prev = std::mem::replace(self, MeshState::NeedsMesh { building: false }).into_owned();
         *self = MeshState::Dirty { prev };
     }
+    /// Release the in-flight mesh claim if this chunk is still awaiting its
+    /// build. A no-op once the chunk has moved on (`Dirty` via an edit,
+    /// `Ready`/`Air` via a prior consume): those states carry no claim. Called
+    /// at every mesh-result-consumption site whose result did NOT apply, so a
+    /// stale result (view moved, chunk left the box) can never wedge the claim.
+    fn release_build(&mut self) {
+        if let MeshState::NeedsMesh { building } = self {
+            *building = false;
+        }
+    }
     fn is_needs_mesh(&self) -> bool {
-        matches!(self, MeshState::NeedsMesh)
+        matches!(self, MeshState::NeedsMesh { .. })
     }
     fn is_dirty(&self) -> bool {
         matches!(self, MeshState::Dirty { .. })
@@ -399,8 +453,38 @@ pub struct World {
     generating: FastSet<Coord>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
     upload_queue: VecDeque<(Coord, u32, ChunkMeshData)>,
+    /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
+    /// old whole-map rescan `pending_fresh` armed). Seeded on load (self + 6
+    /// neighbours), on a light publish that moved a border, and on an
+    /// accept_mesh stale drop. Drained nearest-first by the mesh lane, so the
+    /// enqueue scan is O(shell) not O(cube).
+    mesh_worklist: FastSet<Coord>,
+    /// Whether the [`LightLane`] still has seeds/in-flight to drain (its
+    /// `pending` gate — the [`LaneSpec::pending`] accessor). Raised when the
+    /// worklist or in-flight set is non-empty, cleared when both drain.
+    light_pending: Sticky,
     /// Chunks needing light settling (budgeted, seeded on load/edit/border moves).
     light_worklist: FastSet<Coord>,
+    /// Chunks with a light-settle job in flight on the worker pool. A settle is
+    /// claimed out of `light_worklist` at submit and released here when its grid
+    /// lands, so at most one flood per chunk is in flight and the mesh gate
+    /// ([`light_ready`](World::light_ready)) treats an in-flight chunk as not yet
+    /// settled. An edit landing mid-flight re-seeds the worklist, so the next
+    /// stream resubmits with the fresh voxels once the current job drains.
+    light_inflight: FastSet<Coord>,
+    /// Settled light grids landed from the worker pool, awaiting budgeted
+    /// application ([`LightLane::integrate`] → [`publish_light`]). The light
+    /// *drain* lane previously had no per-frame budget: ~80 floods could land
+    /// and all apply in one frame. Buffering here and applying ≤
+    /// [`LIGHT_APPLY_BUDGET`] per drain caps that main-thread bookkeeping spike;
+    /// leftovers apply next frame (order-independent — each grid is absolute).
+    light_apply_queue: VecDeque<(Coord, light::LightGrid)>,
+    /// Skylight ceiling per `(x, z)` chunk column — the surface heightmap the
+    /// settle pass seeds skylight from. A pure generator function (independent of
+    /// y and of edits), so it is computed once per column and reused across every
+    /// vertical chunk and every re-settle instead of re-sampling 256 noise columns
+    /// per settle. Pruned when a column fully unloads.
+    ceilings: FastMap<(i32, i32), light::CeilingWindow>,
     /// Reusable buffer for draining worker results, so the drain neither
     /// borrows the channel across the processing loop nor allocates per frame.
     done_scratch: Vec<pipeline::Done>,
@@ -412,15 +496,31 @@ pub struct World {
     occlusion_dirty: Sticky,
     /// Whether occlusion was active last stream (render honours visible set if active).
     occlusion_active: bool,
-    /// Manual occlusion override (`VOXEL_OCCLUSION=1`, defaults off when GPU-bound signal unavailable).
+    /// Manual occlusion override (`VOXEL_OCCLUSION=0` to disable), on by default when GPU-bound signal unavailable.
     occlusion_forced: bool,
+    /// Cross-chunk lighting enable flag. Driven by the `lighting` graphics
+    /// setting via [`set_lighting`](World::set_lighting); the initial value only
+    /// governs pre-`enter_game` generation and is overridden on world entry.
+    lighting: bool,
+    /// Far LOD tile lane enable flag (`WATT_TILES=1` enables the tile ring).
+    tiles_enabled: bool,
+    /// Zone-3 far-skin lane enable flag (`WATT_SKINS=0` disables the skin ring).
+    skins_enabled: bool,
     /// Far LOD tiles (parallel lane to chunks; meet at occlusion-skip predicate).
     tiles: FastMap<Tile, TileState>,
     /// Finished tile meshes awaiting upload (never stale by edit, only by unload).
-    tile_upload_queue: VecDeque<(Tile, MeshData)>,
+    tile_upload_queue: VecDeque<(Tile, ChunkMeshData)>,
     /// Whether desired tiles still need enqueueing (the enqueue budget spreads a
     /// world-entry flood across frames).
     pending_tiles: Sticky,
+    /// Far-skin columns (Zone 3): the outermost fidelity lane, a 2-D `(x, z)`
+    /// ring of retained grey surfaces beyond the tile ring.
+    skins: FastMap<SkinColumn, SkinState>,
+    /// Finished skin surfaces awaiting budgeted upload (never stale by edit, only
+    /// by unload — a column carries no rev).
+    skin_upload_queue: VecDeque<(SkinColumn, SurfaceData)>,
+    /// Whether desired skin columns still need enqueueing (budget spreads a flood).
+    pending_skins: Sticky,
 }
 
 impl World {
@@ -434,6 +534,7 @@ impl World {
             registry,
             generator,
             chunks: FastMap::default(),
+            ceilings: FastMap::default(),
             edits: FastMap::default(),
             center: None,
             view: ViewVolume::cube(DEFAULT_VIEW_RADIUS),
@@ -445,16 +546,26 @@ impl World {
             workers: None,
             generating: FastSet::default(),
             upload_queue: VecDeque::new(),
+            mesh_worklist: FastSet::default(),
+            light_pending: Sticky::default(),
             light_worklist: FastSet::default(),
+            light_inflight: FastSet::default(),
+            light_apply_queue: VecDeque::new(),
             done_scratch: Vec::new(),
             textures_built: 0,
             occlusion: Occlusion::default(),
             occlusion_dirty: Sticky::default(),
             occlusion_active: false,
-            occlusion_forced: matches!(std::env::var("VOXEL_OCCLUSION").as_deref(), Ok("1")),
+            occlusion_forced: !matches!(std::env::var("VOXEL_OCCLUSION").as_deref(), Ok("0")),
+            lighting: true,
+            tiles_enabled: matches!(std::env::var("WATT_TILES").as_deref(), Ok("1")),
+            skins_enabled: !matches!(std::env::var("WATT_SKINS").as_deref(), Ok("0")),
             tiles: FastMap::default(),
             tile_upload_queue: VecDeque::new(),
             pending_tiles: Sticky::default(),
+            skins: FastMap::default(),
+            skin_upload_queue: VecDeque::new(),
+            pending_skins: Sticky::default(),
         };
         // Centre the pre-generated box on the origin's surface chunk, the
         // spawn point's own layer.
@@ -526,13 +637,32 @@ impl World {
         // hidden by full-res are never loaded (see `desired_tiles`), so nothing
         // wasted meshes; the rest are early-Z discarded under the chunks above.
         for (&tile, state) in &self.tiles {
-            let Some(handle) = state.drawable() else { continue };
             let origin = DVec3::new(
                 tile.origin_x() as f64,
                 tile.origin_y() as f64,
                 tile.origin_z() as f64,
             );
-            f.draw_mesh_biased(handle, (origin - cam).as_vec3(), tile.lod.cell() as f32);
+            state.draw(f, (origin - cam).as_vec3(), tile.lod.cell() as f32);
+        }
+
+        // Layer 3 — the Zone-3 far-skin backdrop: each ready column's grey
+        // surface at its world origin. The mesh is already in metres (scale 1.0)
+        // with absolute Y baked in, so the draw offset's Y is 0. The engine
+        // frustum-culls each column against its own aabb.
+        //
+        // Columns form a full disk around the player, but the fragment shader
+        // discards fragments within the near-zone horizontal radius, so the
+        // skin renders only BEYOND the near zones instead of poking through
+        // them. With LOD tiles on, that radius is the tile ring
+        // (`view.horizontal * LOD_REACH`); with tiles off there is no ring, so
+        // the skin must meet the full-res render distance (`view.horizontal`)
+        // to avoid a gap. That radius in metres is the clip.
+        let clip_reach = if self.tiles_enabled { LOD_REACH } else { 1 };
+        f.set_skin_clip((self.view.horizontal * clip_reach * CHUNK_SIZE as i32) as f32);
+        for (&col, state) in &self.skins {
+            let Some(handle) = state.drawable() else { continue };
+            let origin = DVec3::new(col.origin_x() as f64, 0.0, col.origin_z() as f64);
+            f.draw_surface(handle, (origin - cam).as_vec3(), 1.0);
         }
     }
 
@@ -575,13 +705,375 @@ impl World {
     /// chunk. Called only when the gate is active and the inputs changed.
     fn rebuild_occlusion(&mut self, origin: Coord) {
         let registry = &self.registry;
+        // Cap the per-frame connectivity flood: a boundary cross can newly load a
+        // whole shell of unclassified chunks, and filling them all in one frame
+        // is the O(cube) spike. Stop at the budget and re-arm below so the fill
+        // resumes next frame (partial classification only under-occludes — draws
+        // a few extra chunks — never a hole).
+        let mut filled = 0;
+        let mut capped = false;
         for loaded in self.chunks.values_mut() {
             if loaded.connectivity.is_none() {
-                loaded.connectivity = Some(Connectivity::compute(&loaded.chunk, |id| registry.is_solid(id)));
+                if filled >= OCCLUSION_FILL_BUDGET {
+                    capped = true;
+                    break;
+                }
+                // Sightlines pass through anything not opaque — water/glass are
+                // solid (collision) but see-through, so they must NOT seal chunks
+                // behind them, or terrain under water gets occlusion-culled.
+                loaded.connectivity = Some(Connectivity::compute(&loaded.chunk, |id| registry.is_opaque(id)));
+                filled += 1;
             }
         }
-        self.occlusion
-            .rebuild(origin, |c| self.chunks.get(&c).and_then(|l| l.connectivity));
+        // Leave `occlusion_dirty` set on a partial fill so the gate re-runs.
+        if capped {
+            self.occlusion_dirty.set();
+        }
+        // A *loaded* chunk whose connectivity the budget hasn't reached yet
+        // defaults to OPEN — drawn and passed through — so a partial fill only
+        // *weakens* the cull (temporary over-draw) and never punches a hole by
+        // culling a visible chunk. `None` stays reserved for genuinely unloaded
+        // chunks, which bound the BFS frontier.
+        self.occlusion.rebuild(origin, |c| {
+            self.chunks.get(&c).map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming lanes — the unified budgeted enqueue/integrate spine.
+// ---------------------------------------------------------------------------
+//
+// Every async streaming lane (fresh chunk meshing, far LOD tiles, far skins,
+// cross-chunk light) is the same shape: gather candidates near the player,
+// drop the ones already in flight, order nearest-first, submit up to a
+// per-frame budget to the worker pool, and integrate finished results. The
+// four lanes differed only in *where their state lives*, so that state is
+// reached through a [`LaneSpec`] of accessors and the loop is written once
+// ([`lane_enqueue`]/[`lane_integrate`]).
+//
+// The `const BUDGET` is REQUIRED, so "an async lane without a per-frame budget"
+// is a compile error — the concrete defect that let the light drain flood a
+// frame unbounded.
+
+/// How a lane names the work it wants to do this frame. A *geometry* lane
+/// derives its keys from the player centre each frame (tiles, skins: a desired
+/// ring minus what's already loaded). A *worklist* lane reads an explicit seed
+/// set accumulated on the `World` (mesh, light: coords poked dirty by loads and
+/// edits) — [`LaneSpec::seed_set`] returns `Some` for exactly those.
+pub(in crate::world) enum Candidates<K> {
+    /// The full candidate key list, recomputed from the centre this frame.
+    Geometry(Vec<K>),
+    /// Read the lane's seed set (`LaneSpec::seed_set`) for candidates.
+    Worklist,
+}
+
+/// One streaming lane. Zero-sized marker types (`MeshLane`, …) implement it;
+/// all mutable state lives on [`World`] behind these accessors, so the lane
+/// itself carries nothing and the generic loop stays allocation-free.
+pub(in crate::world) trait LaneSpec {
+    /// The lane's work key (a chunk `Coord`, a `Tile`, a `SkinColumn`).
+    /// The loop sorts by the [`order`](LaneSpec::order) metric, so the key
+    /// itself needs only `Copy + Eq + Hash` (set membership + move).
+    type Key: Copy + Eq + Hash;
+    /// Per-frame submit budget. REQUIRED — an unbudgeted lane can't compile.
+    const BUDGET: usize;
+
+    /// The candidate keys for this frame (see [`Candidates`]).
+    fn candidates(world: &World, center: Coord) -> Candidates<Self::Key>;
+    /// The worklist seed set, for worklist lanes (`None` for geometry lanes).
+    fn seed_set(world: &mut World) -> Option<&mut FastSet<Self::Key>>;
+    /// This lane's raise-then-consume "has pending work" gate.
+    fn pending(world: &mut World) -> &mut Sticky;
+    /// Nearest-first metric for `key` relative to `center` (lower = sooner).
+    fn order(center: Coord, key: Self::Key) -> i32;
+    /// Whether `key` already has a job in flight (skip re-submitting it).
+    fn in_flight(world: &World, key: Self::Key) -> bool;
+    /// Whether `key` may be submitted yet (data/light gates). Default: always.
+    fn ready(world: &World, key: Self::Key) -> bool {
+        let _ = (world, key);
+        true
+    }
+    /// Build the worker job for `key`, or `None` to drop it (unloaded/covered).
+    /// Takes `&mut World` so a lane may warm a cache while snapshotting (light
+    /// warms `ceilings` via `capture_ceiling`); it must not mutate lane state.
+    fn submit(world: &mut World, key: Self::Key) -> Option<pipeline::Job>;
+    /// Mark `key` in flight: remove it from the seed set (if any) and claim it
+    /// (a state transition or an in-flight-set insert), so it isn't re-submitted.
+    fn claim(world: &mut World, key: Self::Key);
+    /// Fold a finished result back into the world (upload a mesh, publish light).
+    fn integrate(world: &mut World, done: pipeline::Done);
+}
+
+/// The unified enqueue loop: gather → drop in-flight/unready → nearest-first →
+/// submit up to `BUDGET` → claim; clear `pending` once the backlog is drained.
+pub(in crate::world) fn lane_enqueue<S: LaneSpec>(world: &mut World, center: Coord) {
+    if !S::pending(world).get() {
+        return;
+    }
+    let worklist = S::seed_set(world).is_some();
+    let candidates: Vec<S::Key> = match S::candidates(world, center) {
+        Candidates::Geometry(v) => v,
+        Candidates::Worklist => {
+            S::seed_set(world).map(|s| s.iter().copied().collect()).unwrap_or_default()
+        }
+    };
+    // ONE `ready()` pass: partition into actionable (ready, not in flight) and
+    // blocked. For a WORKLIST lane, evict the blocked ones from the seed set —
+    // a worklist lane guarantees it re-seeds a key on its unblock event
+    // (`store_chunk` seeds a chunk's neighbours when data lands; `publish_light`
+    // seeds a chunk + moved-border neighbours when light lands), so a blocked
+    // seed is re-added exactly when it becomes actionable. Persisting it instead
+    // would force an O(accumulated backlog) rescan every frame — the `stream.mesh`
+    // spike. Evicting makes the per-frame cost O(fresh seeds this frame).
+    let mut ready_keys = Vec::new();
+    let mut blocked = Vec::new();
+    for k in candidates {
+        if S::in_flight(world, k) {
+            continue;
+        }
+        if S::ready(world, k) {
+            ready_keys.push(k);
+        } else if worklist {
+            blocked.push(k);
+        }
+    }
+    if worklist {
+        if let Some(set) = S::seed_set(world) {
+            for k in &blocked {
+                set.remove(k);
+            }
+        }
+    }
+    ready_keys.sort_by_key(|&k| S::order(center, k));
+    let backlog = ready_keys.len();
+    let mut submitted = 0;
+    for key in ready_keys {
+        if submitted >= S::BUDGET {
+            break;
+        }
+        let Some(job) = S::submit(world, key) else {
+            // Unloaded/covered: drop the stale seed so it isn't retried forever.
+            if let Some(set) = S::seed_set(world) {
+                set.remove(&key);
+            }
+            continue;
+        };
+        let workers = world.workers.get_or_insert_with(|| {
+            pipeline::Workers::spawn(pipeline::Workers::default_threads())
+        });
+        if workers.submit(job) {
+            S::claim(world, key);
+            submitted += 1;
+        }
+    }
+    // Clear the gate once the whole ready backlog submitted AND no seeds remain
+    // (only ready-but-over-budget seeds can remain now — blocked ones were evicted).
+    let drained =
+        submitted >= backlog && S::seed_set(world).map_or(true, |set| set.is_empty());
+    if drained {
+        S::pending(world).take();
+    }
+}
+
+/// Fold one finished [`pipeline::Done`] back into the world via its lane. The
+/// caller picks `S` by matching the `Done` variant; this is the single dispatch
+/// point that replaced the four ad-hoc drain arms.
+pub(in crate::world) fn lane_integrate<S: LaneSpec>(world: &mut World, done: pipeline::Done) {
+    S::integrate(world, done);
+}
+
+/// Fresh full-res chunk meshing. Worklist lane (seed set `mesh_worklist`);
+/// in-flight is the `NeedsMesh { building: true }` claim; ready is the 4-predicate gate.
+pub(in crate::world) struct MeshLane;
+impl LaneSpec for MeshLane {
+    type Key = Coord;
+    const BUDGET: usize = MESH_ENQUEUE_BUDGET;
+    fn candidates(_world: &World, _center: Coord) -> Candidates<Coord> {
+        Candidates::Worklist
+    }
+    fn seed_set(world: &mut World) -> Option<&mut FastSet<Coord>> {
+        Some(&mut world.mesh_worklist)
+    }
+    fn pending(world: &mut World) -> &mut Sticky {
+        &mut world.pending_fresh
+    }
+    fn order(center: Coord, key: Coord) -> i32 {
+        World::order(key, center)
+    }
+    fn in_flight(world: &World, key: Coord) -> bool {
+        matches!(
+            world.chunks.get(&key).map(|l| &l.state),
+            Some(MeshState::NeedsMesh { building: true })
+        )
+    }
+    fn ready(world: &World, key: Coord) -> bool {
+        // Awaiting a fresh mesh, in view, all neighbour data present, and the
+        // neighbourhood light settled — so it meshes once with final smooth light.
+        world.is_needs_mesh(key)
+            && world.in_mesh_box(key)
+            && world.neighbours_have_data(key)
+            && world.light_ready(key)
+    }
+    fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+        world.refresh_tables(); // the snapshot shares the solid-table Arc
+        let (rev, snapshot) = world.snapshot(key);
+        Some(pipeline::Job::Mesh { coord: key, rev, snapshot })
+    }
+    fn claim(world: &mut World, key: Coord) {
+        // NeedsMesh{false} → NeedsMesh{true}: setting `building` IS the
+        // mesh-in-flight claim (held until the budgeted upload retires it, or a
+        // stale result releases it). Out of the worklist too.
+        world.mesh_worklist.remove(&key);
+        if let Some(loaded) = world.chunks.get_mut(&key) {
+            debug_assert!(loaded.state.is_needs_mesh(), "mesh submit for non-NeedsMesh {key:?}");
+            loaded.state = MeshState::NeedsMesh { building: true };
+        }
+    }
+    fn integrate(world: &mut World, done: pipeline::Done) {
+        // The coord stays claimed (`building: true`) until the budgeted upload
+        // resolves; `accept_mesh` queues it (or drops+re-seeds if stale).
+        if let pipeline::Done::Mesh { coord, rev, data } = done {
+            world.accept_mesh(coord, rev, data);
+        }
+    }
+}
+
+/// Far LOD tiles. Geometry lane (desired ring); in-flight is the map entry;
+/// `TileState::Meshing` is the claim.
+pub(in crate::world) struct TileLane;
+impl LaneSpec for TileLane {
+    type Key = Tile;
+    const BUDGET: usize = TILE_ENQUEUE_BUDGET;
+    fn candidates(world: &World, center: Coord) -> Candidates<Tile> {
+        Candidates::Geometry(
+            world.desired_tiles(center).into_iter().filter(|t| !world.tiles.contains_key(t)).collect(),
+        )
+    }
+    fn seed_set(_world: &mut World) -> Option<&mut FastSet<Tile>> {
+        None
+    }
+    fn pending(world: &mut World) -> &mut Sticky {
+        &mut world.pending_tiles
+    }
+    fn order(center: Coord, key: Tile) -> i32 {
+        lod::tile_order(key, center)
+    }
+    fn in_flight(world: &World, key: Tile) -> bool {
+        world.tiles.contains_key(&key)
+    }
+    fn submit(world: &mut World, key: Tile) -> Option<pipeline::Job> {
+        // The coarse mesher reads the hot solidity/opacity tables like the chunk
+        // mesher; refresh them before the snapshot.
+        world.refresh_tables();
+        Some(pipeline::Job::Tile {
+            tile: key,
+            generator: world.generator.clone(),
+            tables: world.tables.get(),
+        })
+    }
+    fn claim(world: &mut World, key: Tile) {
+        world.tiles.insert(key, TileState::Meshing);
+    }
+    fn integrate(world: &mut World, done: pipeline::Done) {
+        // Tiles never go stale by edit; a landing for an unloaded tile is dropped
+        // at upload time (see `drain_results`).
+        if let pipeline::Done::Tile { tile, data } = done {
+            world.tile_upload_queue.push_back((tile, data));
+        }
+    }
+}
+
+/// Far skin columns (Zone 3). Geometry lane (2-D ring); in-flight is the map
+/// entry; `SkinState::Meshing` is the claim.
+pub(in crate::world) struct SkinLane;
+impl LaneSpec for SkinLane {
+    type Key = SkinColumn;
+    const BUDGET: usize = SKIN_ENQUEUE_BUDGET;
+    fn candidates(world: &World, center: Coord) -> Candidates<SkinColumn> {
+        Candidates::Geometry(
+            world.desired_columns(center).into_iter().filter(|c| !world.skins.contains_key(c)).collect(),
+        )
+    }
+    fn seed_set(_world: &mut World) -> Option<&mut FastSet<SkinColumn>> {
+        None
+    }
+    fn pending(world: &mut World) -> &mut Sticky {
+        &mut world.pending_skins
+    }
+    fn order(center: Coord, key: SkinColumn) -> i32 {
+        let cps = skin::SKIN_LOD.chunks_per_side();
+        let (pcx, pcz) = (center.x.div_euclid(cps), center.z.div_euclid(cps));
+        (key.x - pcx).abs().max((key.z - pcz).abs())
+    }
+    fn in_flight(world: &World, key: SkinColumn) -> bool {
+        world.skins.contains_key(&key)
+    }
+    fn submit(world: &mut World, key: SkinColumn) -> Option<pipeline::Job> {
+        // Height-only mesher: no tables to refresh.
+        Some(pipeline::Job::Skin { col: key, generator: world.generator.clone() })
+    }
+    fn claim(world: &mut World, key: SkinColumn) {
+        world.skins.insert(key, SkinState::Meshing);
+    }
+    fn integrate(world: &mut World, done: pipeline::Done) {
+        if let pipeline::Done::Skin { col, data } = done {
+            world.skin_upload_queue.push_back((col, data));
+        }
+    }
+}
+
+/// Cross-chunk light settling. Worklist lane (seed set `light_worklist`);
+/// in-flight is `light_inflight`. `BUDGET` is the newly-added apply cap that
+/// the old drain lane lacked.
+pub(in crate::world) struct LightLane;
+impl LaneSpec for LightLane {
+    type Key = Coord;
+    const BUDGET: usize = LIGHT_APPLY_BUDGET;
+    fn candidates(_world: &World, _center: Coord) -> Candidates<Coord> {
+        Candidates::Worklist
+    }
+    fn seed_set(world: &mut World) -> Option<&mut FastSet<Coord>> {
+        Some(&mut world.light_worklist)
+    }
+    fn pending(world: &mut World) -> &mut Sticky {
+        &mut world.light_pending
+    }
+    fn order(center: Coord, key: Coord) -> i32 {
+        World::order(key, center)
+    }
+    fn in_flight(world: &World, key: Coord) -> bool {
+        world.light_inflight.contains(&key)
+    }
+    fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+        if !world.lighting || !world.chunks.contains_key(&key) {
+            return None;
+        }
+        world.refresh_tables();
+        // Capture the frozen neighbourhood the flood reads; `capture_ceiling`
+        // warms the per-column ceiling cache (hence `&mut World`).
+        let shell = world.capture_face_shell(key);
+        let ceiling = world.capture_ceiling(key);
+        let snapshot = pipeline::LightSnapshot {
+            chunk: Arc::clone(&world.chunks[&key].chunk),
+            shell,
+            ceiling,
+            world_y0: key.y * CHUNK_SIZE as i32,
+            tables: world.tables.get(),
+        };
+        Some(pipeline::Job::Light { coord: key, snapshot })
+    }
+    fn claim(world: &mut World, key: Coord) {
+        // Out of the worklist, into the in-flight set (one flood per chunk).
+        world.light_worklist.remove(&key);
+        world.light_inflight.insert(key);
+    }
+    fn integrate(world: &mut World, done: pipeline::Done) {
+        // Buffer for budgeted application; the chunk stays in `light_inflight`
+        // (so `light_ready` keeps gating meshing) until it is actually applied.
+        if let pipeline::Done::Light { coord, grid } = done {
+            world.light_apply_queue.push_back((coord, grid));
+        }
     }
 }
 
@@ -814,7 +1306,11 @@ mod tests {
         assert!(sky.state.live_meshes().is_none());
         // A ground chunk still goes through the normal mesh path.
         let ground = &world.chunks[&ChunkCoord::new(0, 0, 0)];
-        assert_eq!(ground.state, MeshState::NeedsMesh, "dense terrain waits for a real mesh");
+        assert_eq!(
+            ground.state,
+            MeshState::NeedsMesh { building: false },
+            "dense terrain waits for a real mesh"
+        );
     }
 
     // === MeshState handle-ownership tests ===
@@ -854,8 +1350,8 @@ mod tests {
         assert!(world.chunks[&coord].state.live_meshes().unwrap().draws(h));
         for s in [
             MeshState::Air,
-            MeshState::NeedsMesh,
-            MeshState::Meshing,
+            MeshState::NeedsMesh { building: false },
+            MeshState::NeedsMesh { building: true },
             MeshState::Dirty { prev: None },
         ] {
             world.chunks.get_mut(&coord).unwrap().state = s;
@@ -871,19 +1367,52 @@ mod tests {
         let mut world = World::generate();
         world.center = Some(ChunkCoord::new(0, 0, 0));
         let coord = ChunkCoord::new(0, 0, 0);
-        world.chunks.get_mut(&coord).unwrap().state = MeshState::Meshing;
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
         let rev = world.chunks[&coord].rev;
 
-        world.set_block(2, 2, 2, AIR); // Meshing → Dirty, rev bumped
-        assert!(world.chunks[&coord].state.is_dirty(), "edit turns Meshing into Dirty");
+        world.set_block(2, 2, 2, AIR); // building → Dirty (claim dropped), rev bumped
+        assert!(world.chunks[&coord].state.is_dirty(), "edit turns a building chunk into Dirty");
         assert_ne!(world.chunks[&coord].rev, rev, "edit bumps rev, stranding the job");
 
         // The worker's result lands at the OLD rev: dropped, never uploaded. The
-        // `Dirty` state (not a side set) is now the claim; the sync remesh owns it.
+        // `Dirty` state is now the claim; the sync remesh owns it.
         world.pending_fresh.take();
         world.accept_mesh(coord, rev, new_chunk_mesh_data());
         assert!(world.upload_queue.is_empty(), "stale mesh result never queues");
         assert!(world.chunks[&coord].state.is_dirty(), "chunk stays Dirty for the sync remesh");
+        assert!(world.pending_fresh.get(), "drop re-arms the fresh scan");
+    }
+
+    #[test]
+    fn mesh_result_stale_by_box_exit_releases_the_claim() {
+        // The wedge regression. A fresh mesh result that no longer applies
+        // because the chunk left the mesh box — the view moved, with NO edit and
+        // NO rev bump — must release the in-flight claim. The old `Meshing` state
+        // had no un-claim on this path (only success or an edit cleared it), so a
+        // fast fly-by that caught a chunk mid-flight at the box edge wedged it
+        // claimed-but-never-ready forever: transparent, never re-meshed on
+        // landing. Now the claim is a `building` bool that the stale-drop path
+        // clears, so the chunk falls back to a re-meshable `NeedsMesh`.
+        let mut world = World::generate();
+        let coord = ChunkCoord::new(0, 0, 0);
+        world.center = Some(coord);
+        let rev = world.chunks[&coord].rev;
+        // Claim it, exactly as `MeshLane::claim` would when a job is submitted.
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+        // Player teleports far: the chunk is now outside the mesh box, so its
+        // in-flight result is stale by BOX (rev is untouched — no edit happened).
+        world.center = Some(ChunkCoord::new(1000, 0, 0));
+        assert!(!world.mesh_result_applies(coord, rev), "out-of-box result is stale");
+
+        world.pending_fresh.take();
+        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        assert!(world.upload_queue.is_empty(), "stale result never queues");
+        assert_eq!(
+            world.chunks[&coord].state,
+            MeshState::NeedsMesh { building: false },
+            "claim released — the chunk is re-meshable, not wedged in a Meshing state"
+        );
+        assert!(world.mesh_worklist.contains(&coord), "re-seeded for a later mesh");
         assert!(world.pending_fresh.get(), "drop re-arms the fresh scan");
     }
 
@@ -947,11 +1476,12 @@ mod tests {
         // Re-invalidating a Dirty{Some} keeps the same single token.
         s.invalidate();
         assert_eq!(s, MeshState::Dirty { prev: Some(meshes(h)) });
-        // Every handle-less state → Dirty{None}.
+        // Every handle-less state → Dirty{None} (a `building` chunk drops its
+        // claim in the process).
         for empty in [
             MeshState::Air,
-            MeshState::NeedsMesh,
-            MeshState::Meshing,
+            MeshState::NeedsMesh { building: false },
+            MeshState::NeedsMesh { building: true },
             MeshState::Dirty { prev: None },
         ] {
             let mut s = empty;

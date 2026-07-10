@@ -39,6 +39,23 @@ impl World {
         }
     }
 
+    /// Whether cross-chunk lighting is currently enabled.
+    pub fn lighting(&self) -> bool {
+        self.lighting
+    }
+
+    /// Toggle cross-chunk lighting. On a real change, drops every mesh and
+    /// re-scans from scratch (via [`free_meshes`](Self::free_meshes)) so the next
+    /// [`stream`](Self::stream) rebuilds them with — or without — settled light.
+    /// A no-op when the value is unchanged, so it is cheap to push every frame.
+    pub fn set_lighting(&mut self, on: bool, eng: &mut Engine) {
+        if on == self.lighting {
+            return;
+        }
+        self.lighting = on;
+        self.free_meshes(eng);
+    }
+
     /// Free every chunk's GPU mesh and reset every chunk to `NeedsMesh` — used
     /// when leaving a world. The voxel data stays; a later
     /// [`stream`](Self::stream) rebuilds the meshes from scratch. (Resetting to
@@ -46,7 +63,7 @@ impl World {
     /// old unconditional `meshed = false`; the next scan re-derives `Air`.)
     pub fn free_meshes(&mut self, eng: &mut Engine) {
         for loaded in self.chunks.values_mut() {
-            loaded.retire(MeshState::NeedsMesh, eng);
+            loaded.retire(MeshState::NeedsMesh { building: false }, eng);
         }
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
         // stale hint (a raised `pending_dirty` would just scan an empty fiber).
@@ -65,6 +82,9 @@ impl World {
         self.tile_upload_queue.clear();
         self.pending_tiles.take();
         self.center = None;
+        // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
+        // the next stream rebuilds them (the worklist is the fresh-mesh index now).
+        self.mesh_worklist = self.chunks.keys().copied().collect();
         self.pending_fresh.set();
     }
 
@@ -89,7 +109,7 @@ impl World {
         self.edits.entry(coord).or_default().insert(index, id);
 
         if let Some(loaded) = self.chunks.get_mut(&coord) {
-            loaded.chunk.set_index(index, id);
+            std::sync::Arc::make_mut(&mut loaded.chunk).set_index(index, id);
             // Editing this chunk's own voxels can open or seal an interior pocket,
             // so its connectivity is stale — invalidate it (the occlusion rebuild
             // recomputes lazily if the gate is active) and flag the visible set.
@@ -98,7 +118,7 @@ impl World {
             // Keep whatever is currently drawn as `prev` so the old mesh shows
             // until the sync remesh: Ready(m) → Dirty{Some(m)}, and re-editing
             // an already-Dirty{Some} chunk preserves its mesh (the token MOVES,
-            // no free). Meshing/NeedsMesh/Air draw nothing → Dirty{None}.
+            // no free). NeedsMesh (building or not)/Air draw nothing → Dirty{None}.
             loaded.state.invalidate();
             // Any in-flight worker mesh of this chunk is now stale.
             loaded.rev = loaded.rev.wrapping_add(1);
@@ -107,6 +127,7 @@ impl World {
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
             self.light_worklist.insert(coord);
+            self.light_pending.set();
         }
         // A block on a chunk face also changes that neighbour's exposed
         // faces — even when the edited chunk itself has no data (a remote
@@ -137,10 +158,11 @@ impl World {
             // A border edit can change this chunk's light directly (an emitter on
             // the shared face); re-settle it too.
             self.light_worklist.insert(coord);
+            self.light_pending.set();
         }
     }
 
-    /// All edits as ((x, y, z), block) for saving. Absolute world coords.
+    /// All edits as world coordinates and blocks for saving.
     pub fn edits(&self) -> impl Iterator<Item = ((i32, i32, i32), BlockId)> + '_ {
         self.edits.iter().flat_map(|(&coord, cells)| {
             cells.iter().map(move |(&index, &id)| {

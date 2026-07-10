@@ -63,7 +63,7 @@ pub enum Anchor {
 }
 
 impl Anchor {
-    /// Per-axis alignment factor: 0 = start edge, 1 = centre, 2 = end edge.
+    /// Per-axis alignment: 0=start, 1=center, 2=end.
     fn factors(self) -> (i32, i32) {
         use Anchor::*;
         match self {

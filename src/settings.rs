@@ -52,8 +52,14 @@ pub struct Settings {
     /// HUD/text scale, independent of render resolution (0.5..=2.0). Drives
     /// [`crate::ui::Theme::scale`].
     pub ui_scale: f32,
-    /// Six-way back-face culling of chunk meshes. Off by default (a GPU-side
-    /// trade only worth it when vertex-fetch bound — NEXT.md §1).
+    /// Cross-chunk lighting. On by default; pushed to [`crate::world::World`] on
+    /// world entry and on `/gfx` change (the engine has no say — it is a meshing
+    /// input, not a GPU state).
+    pub lighting: bool,
+    /// Six-way back-face culling of chunk meshes. Not a menu/persisted setting:
+    /// sourced once from `WATT_CULL=1` (a GPU-side trade only worth it when
+    /// vertex-fetch bound), so it is absent from [`SETTINGS`] and pushed to the
+    /// engine by [`apply`](Settings::apply) like the table fields.
     pub cull_faces: bool,
 }
 
@@ -68,6 +74,7 @@ impl Default for Settings {
             fov: 90.0,
             render_scale: 1.0,
             ui_scale: 1.0,
+            lighting: true,
             cull_faces: false,
         }
     }
@@ -183,16 +190,16 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_bool(&mut s.vsync, v),
     },
     Setting {
-        key: "cullfaces",
-        aliases: &["cull"],
-        label: "Six-Way Cull",
-        confirm: |s| format!("cullfaces {}", on_off(s.cull_faces, false)),
-        show: |s| on_off(s.cull_faces, true).to_string(),
-        parse_human: |s, v| set_bool(&mut s.cull_faces, v),
-        step: |s, _| s.cull_faces = !s.cull_faces,
+        key: "lighting",
+        aliases: &["light"],
+        label: "Lighting",
+        confirm: |s| format!("lighting {}", on_off(s.lighting, false)),
+        show: |s| on_off(s.lighting, true).to_string(),
+        parse_human: |s, v| set_bool(&mut s.lighting, v),
+        step: |s, _| s.lighting = !s.lighting,
         clamp: |_| {},
-        write: |s| s.cull_faces.to_string(),
-        read: |s, v| set_bool(&mut s.cull_faces, v),
+        write: |s| s.lighting.to_string(),
+        read: |s, v| set_bool(&mut s.lighting, v),
     },
     Setting {
         key: "msaa",
@@ -369,6 +376,9 @@ impl Settings {
         if let Ok(text) = fs::read_to_string(SETTINGS_PATH) {
             settings.parse_from(&text);
         }
+        // Six-way cull is env-only (not in the persisted table): opt in with
+        // `WATT_CULL=1`. Read after the file parse so it can't be overwritten.
+        settings.cull_faces = matches!(std::env::var("WATT_CULL").as_deref(), Ok("1"));
         settings.clamp();
         settings
     }
@@ -451,10 +461,8 @@ fn set_bool(dst: &mut bool, value: &str) -> bool {
     }
 }
 
-/// Store a parsed value into `dst`; `false` (untouched) on a bad value. The one
-/// setter behind every numeric field's `parse_human`/`read` — any `FromStr`
-/// type (`u32`/`i32`/`f32`). Clamping (finite range, NaN reset) stays a separate
-/// step so persistence can read raw values.
+/// Store a parsed numeric value; returns false if parse fails. Clamping is a
+/// separate step so persistence can read raw values.
 fn set_parsed<T: std::str::FromStr>(dst: &mut T, value: &str) -> bool {
     match value.parse() {
         Ok(n) => {
@@ -476,18 +484,12 @@ pub fn on_off(v: bool, caps: bool) -> &'static str {
     }
 }
 
-/// Clamp a value the caller has already made finite into `range`: ±INF clamps
-/// to an endpoint, everything else to `[lo, hi]`. NaN is handled a step up
-/// (reset to the field default) before this runs — see [`reset_nan`].
+/// Clamp a finite value to a range. NaN should be reset beforehand (see [`reset_nan`]).
 fn clamp_to(range: &RangeInclusive<f32>, v: f32) -> f32 {
     v.clamp(*range.start(), *range.end())
 }
 
-/// Reset a NaN sentinel to `default`. `f32::clamp` propagates NaN untouched, so a
-/// NaN input (e.g. `/gfx fov nan` or a corrupt config) would otherwise sail through
-/// to the renderer; resetting to the field default is friendlier than snapping to
-/// the range minimum. ±INF is a genuine over/underflow and is left for
-/// [`clamp_to`] to pull to the near endpoint.
+/// Reset NaN to the default value (f32::clamp would leave NaN untouched).
 fn reset_nan(v: f32, default: f32) -> f32 {
     if v.is_nan() { default } else { v }
 }
@@ -525,8 +527,7 @@ fn dist_clamp(s: &mut Settings) {
         s.render_distance.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
 }
 
-/// Step an integer within `[lo, hi]`, wrapping at both ends. Off-range values are
-/// clamped in first so the step lands on a valid neighbour.
+/// Step an integer within a range, wrapping at ends.
 fn wrap_clamp(cur: i32, lo: i32, hi: i32, delta: i32) -> i32 {
     let v = cur.clamp(lo, hi) + delta;
     if v > hi {
@@ -538,8 +539,7 @@ fn wrap_clamp(cur: i32, lo: i32, hi: i32, delta: i32) -> i32 {
     }
 }
 
-/// Step to the adjacent entry in `list`, wrapping at both ends. A value not in the
-/// list snaps to the first entry without stepping (so Left can't jump end to end).
+/// Step to adjacent entry in a list, wrapping at ends. Values not in list snap to first.
 fn cycle_list(list: &[i32], current: i32, dir: i32) -> i32 {
     match list.iter().position(|&v| v == current) {
         Some(i) => list[(i as i32 + dir).rem_euclid(list.len() as i32) as usize],
@@ -547,9 +547,7 @@ fn cycle_list(list: &[i32], current: i32, dir: i32) -> i32 {
     }
 }
 
-/// Snap to the largest list entry `<= v`, or the first entry if none is. For an
-/// ascending list this is a "round down to a supported value" retraction (e.g. the
-/// MSAA sample-count bucket).
+/// Snap to the largest list entry <= v (or first entry if none found).
 fn snap_down(list: &[i32], v: i32) -> i32 {
     list.iter().rev().copied().find(|&e| e <= v).unwrap_or(list[0])
 }
@@ -597,6 +595,7 @@ mod tests {
             fov: 300.0,
             render_scale: 9.0,
             ui_scale: 1.0,
+            lighting: true,
             cull_faces: false,
         };
         s.clamp();
@@ -679,7 +678,10 @@ mod tests {
             fov: 85.0,
             render_scale: 1.25,
             ui_scale: 1.25,
-            cull_faces: true,
+            lighting: false,
+            // Not persisted (env-only); must stay at the default so the composed
+            // roundtrip below — which never writes it — still lands `samples`.
+            cull_faces: false,
         };
         for field in &SETTINGS {
             let mut back = Settings::default();

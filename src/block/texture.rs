@@ -1,25 +1,27 @@
 //! Procedural block textures: one 16x16 RGBA8 layer per block id, blended
 //! from the colours of the elements in the block's composition.
 //!
-//! Layer index == block id == engine texture-array layer, so the mesher can
-//! stamp `BlockId` straight into `Vertex::color.a`. Layer 0 (air) is all
-//! white, satisfying the engine's layer-0-white contract (immediate cubes and
-//! flat-colored vertices sample it).
+//! Layer index == block id == engine texture-array layer, which the mesher
+//! carries as a dedicated per-vertex layer index. Each texel's alpha is the
+//! block's derived opacity ([`derive::derive_texel_alpha`]), so a translucent
+//! block (`transparency > 0`, routed to the blend pass) composites see-through
+//! while opaque blocks stay solid. Layer 0 (air) is all white, satisfying the
+//! engine's layer-0-white contract (immediate cubes and flat-colored vertices
+//! sample it).
 //!
 //! Everything here is a *deterministic function of the composition*, never of
 //! the block id, so multiplayer clients whose palettes grew in different
 //! orders still render identical materials. Textures are computed once per
 //! palette growth (world entry, crafting a new block type) — never per frame.
 use crate::block::composition::Composition;
+use crate::block::derive;
 use crate::block::element::ElementId;
 use crate::block::registry::{BlockId, BlockRegistry};
 
 /// Edge length of every block texture layer, in texels.
 pub const TEXTURE_SIZE: u32 = 16;
 
-/// Half-width of the soft transition band around each element cutoff, in
-/// noise units: texels whose noise value lands within this distance of a
-/// cutoff lerp between the two adjacent elements' colours.
+/// Soft transition band around element boundaries, in noise units.
 const BLEND: f32 = 0.06;
 /// Maximum per-texel brightness jitter, as a +/- fraction.
 const JITTER: f32 = 0.08;
@@ -43,9 +45,9 @@ pub fn build_block_textures(registry: &BlockRegistry) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// One block's layer: resolve the composition to sorted element fractions,
-/// seed the noise from them, then blend per texel.
+/// Build one texture layer by blending element colours across the texture.
 fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
+    let alpha = derive::derive_texel_alpha(&registry.block(id).core);
     let parts = parts(&registry.block(id).composition);
     let seed = seed_of(&parts);
     let (colors, cuts): (Vec<[f32; 3]>, Vec<f32>) = if parts.is_empty() {
@@ -60,8 +62,8 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
                 [c.r as f32, c.g as f32, c.b as f32]
             })
             .collect();
-        // Cumulative weights partition the noise range [0,1) among elements;
-        // the last cutoff is forced to 1.0 to absorb float drift.
+        // Weight thresholds partition the noise range across elements;
+        // last is clamped to 1.0 to absorb rounding.
         let mut acc = 0.0;
         let mut cuts: Vec<f32> = parts
             .iter()
@@ -85,7 +87,7 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
             for c in rgb {
                 out.push((c * jitter).clamp(0.0, 255.0).round() as u8);
             }
-            out.push(255);
+            out.push(alpha);
         }
     }
     out
@@ -114,10 +116,7 @@ fn seed_of(parts: &[(ElementId, f32)]) -> u32 {
     crate::hash::fnv1a_32(&bytes)
 }
 
-/// Map a noise value through the cumulative element cutoffs. Inside an
-/// element's band the texel is that element's colour; within [`BLEND`] of a
-/// cutoff it lerps toward the adjacent element for a soft transition
-/// (continuous across the cutoff: t hits 0.5 exactly on it).
+/// Pick a colour for a noise value, blending between elements near boundaries.
 fn pick_color(colors: &[[f32; 3]], cuts: &[f32], n: f32) -> [f32; 3] {
     let i = cuts
         .iter()
@@ -151,16 +150,13 @@ const OCTAVE1_PERIOD: u32 = 8;
 /// Channel index reserved for the brightness jitter hash (octaves use 0/1).
 const JITTER_CHANNEL: u32 = 0xdead_beef;
 
-/// 2-octave smooth value noise in [0,1), tiling with period [`TEXTURE_SIZE`]
-/// in both axes so REPEAT sampling is seamless.
+/// Tiling noise that repeats seamlessly across texture boundaries.
 fn tile_noise(seed: u32, x: f32, y: f32) -> f32 {
     (octave_noise(seed, 0, OCTAVE0_PERIOD, x, y) + 0.5 * octave_noise(seed, 1, OCTAVE1_PERIOD, x, y))
         / 1.5
 }
 
-/// One octave: bilinear interpolation (smoothstep-faded) of a random lattice.
-/// Lattice coordinates are taken modulo `period`, so x == 16 lands on the
-/// same lattice points as x == 0 — that is what makes the tile seamless.
+/// Generate one octave of seamless noise via interpolated lattice.
 fn octave_noise(seed: u32, octave: u32, period: u32, x: f32, y: f32) -> f32 {
     let cell = TEXTURE_SIZE as f32 / period as f32;
     let (fx, fy) = (x / cell, y / cell);
@@ -184,8 +180,7 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Hash `(seed, a, b, c)` to a uniform float in [0, 1). A few rounds of a
-/// xorshift-multiply mixer — cheap, stateless, and fully deterministic.
+/// Hash four values to a uniform float [0, 1) using xorshift-multiply.
 fn hash01(seed: u32, a: u32, b: u32, c: u32) -> f32 {
     let h = mix(
         seed ^ mix(
@@ -234,6 +229,20 @@ mod tests {
             layers[0].iter().all(|&b| b == 255),
             "layer 0 must satisfy the engine's layer-0-white contract"
         );
+    }
+
+    #[test]
+    fn translucent_block_layer_carries_sub_opaque_alpha() {
+        // Glass (transparency 90) routes to the blend pass; its texels must carry
+        // its derived opacity so the pipeline has real alpha to composite, while an
+        // opaque block stays fully opaque.
+        let mut reg = BlockRegistry::with_builtins();
+        let glass = reg.natural(&[El::Glass.id()]).unwrap();
+        let stone = reg.natural(&[El::Stone.id()]).unwrap();
+        let layers = build_block_textures(&reg);
+        let alpha = |id: BlockId| layers[id.0 as usize][3];
+        assert!(alpha(glass) < 255, "glass layer must be translucent, got {}", alpha(glass));
+        assert_eq!(alpha(stone), 255, "opaque block stays fully opaque");
     }
 
     #[test]

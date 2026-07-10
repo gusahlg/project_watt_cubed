@@ -32,7 +32,8 @@ fn rejected(lines: Vec<String>) -> Vec<Line> {
 /// The primary command names, in the order `help` lists them. This is the single
 /// source of truth for Tab-completion (see [`crate::console`]); aliases like
 /// `teleport` are intentionally omitted so completion offers the canonical name.
-pub const COMMAND_NAMES: &[&str] = &["tp", "pos", "inspect", "gfx", "time", "help"];
+pub const COMMAND_NAMES: &[&str] =
+    &["tp", "pos", "inspect", "gfx", "time", "walkspeed", "flyspeed", "help"];
 
 /// Run a console line against the game state, returning output lines for the log.
 ///
@@ -59,6 +60,8 @@ pub fn execute(
         "inspect" | "look" => inspect(&args, player, world),
         "gfx" | "graphics" => gfx(&args, settings),
         "time" => time(&args, sky),
+        "walkspeed" => walkspeed(&args, player),
+        "flyspeed" => flyspeed(&args, player),
         "help" | "?" => help(),
         other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
     }
@@ -200,6 +203,37 @@ fn gfx_set(s: &mut Settings, key: &str, value: &str) -> Option<String> {
     field.parse_human(s, value).then(|| field.confirm(s))
 }
 
+/// `walkspeed [n]` — show or set the player's ground walk speed, units/second.
+fn walkspeed(args: &[&str], player: &mut Player) -> Vec<Line> {
+    set_speed(args, "walkspeed", player, |p| &mut p.speed)
+}
+
+/// `flyspeed [n]` — show or set the player's flying speed, units/second.
+fn flyspeed(args: &[&str], player: &mut Player) -> Vec<Line> {
+    set_speed(args, "flyspeed", player, |p| &mut p.fly_speed)
+}
+
+/// Shared show/set logic for `walkspeed`/`flyspeed`: both just target a different
+/// intrinsic on [`Player`], so the parse-validate-write-confirm shape lives once.
+fn set_speed(
+    args: &[&str],
+    name: &str,
+    player: &mut Player,
+    field: impl FnOnce(&mut Player) -> &mut f64,
+) -> Vec<Line> {
+    match args {
+        [] => shown(vec![format!("{name}: {:.2}", *field(player))]),
+        [value] => match value.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => {
+                *field(player) = v;
+                shown(vec![format!("{name} set to {v:.2}")])
+            }
+            _ => rejected(vec![format!("{name}: value must be a positive number")]),
+        },
+        _ => rejected(vec![format!("usage: {name} [<units/second>]")]),
+    }
+}
+
 /// `inspect [x y z]` — describe the block at a cell (default: the block under the
 /// player's feet), showing what it's made of and the properties derived from that.
 /// The in-game window onto the element/block system.
@@ -291,6 +325,8 @@ fn help() -> Vec<Line> {
         "  inspect [x y z]      describe a block's elements & properties".to_string(),
         "  gfx [setting value]  show or change graphics settings".to_string(),
         "  time [set|length]    show or set the day/night clock".to_string(),
+        "  walkspeed [n]        show or set ground walk speed".to_string(),
+        "  flyspeed [n]         show or set flying speed".to_string(),
         "  help                 show this list".to_string(),
     ])
 }
@@ -439,6 +475,33 @@ mod tests {
         let before = sky.clock.day();
         assert!(time(&["set", "banana"], &mut sky)[0].text().contains("use"));
         assert_eq!(sky.clock.day(), before);
+    }
+
+    #[test]
+    fn walkspeed_and_flyspeed_set_independently() {
+        let (mut p, w) = (player(), world());
+        let out = run("walkspeed 10", &mut p, &w);
+        assert_eq!(p.speed, 10.0);
+        assert!(out[0].text().contains("walkspeed set to 10.00"));
+
+        run("flyspeed 25", &mut p, &w);
+        assert_eq!(p.fly_speed, 25.0);
+        // Setting one doesn't disturb the other.
+        assert_eq!(p.speed, 10.0);
+
+        let out = run("walkspeed", &mut p, &w);
+        assert!(out[0].text().contains("walkspeed: 10.00"));
+    }
+
+    #[test]
+    fn speed_commands_reject_non_positive_and_non_finite() {
+        let (mut p, w) = (player(), world());
+        let before = p.speed;
+        for bad in ["0", "-5", "inf", "nan", "banana"] {
+            let out = run(&format!("walkspeed {bad}"), &mut p, &w);
+            assert_eq!(p.speed, before, "{bad} should not change speed");
+            assert_eq!(out[0].spans().next().unwrap().role, Role::Error);
+        }
     }
 
     #[test]

@@ -36,7 +36,7 @@ fn sun_tint(daylight: f32) -> Color {
 
 /// Base exponential fog density in clear weather. Tuned so terrain fades into the
 /// horizon near the edge of a typical view radius rather than cutting off.
-const FOG_BASE: f32 = 0.0016;
+const FOG_BASE: f32 = 0.0009;
 
 /// The whole sky state, owned by the game.
 #[derive(Default)]
@@ -84,10 +84,7 @@ impl Sky {
         f.set_sky_light(env.sun_light, env.ambient, fog_color, fog_density);
     }
 
-    /// Draw the procedural sky: a zenith→horizon gradient, a horizon glow
-    /// toward the sun, and a sun disc. The two anchor colours come straight from
-    /// [`Atmosphere::radiance`] (the single source of truth); the engine's
-    /// fullscreen pass interpolates and adds the high-frequency features.
+    /// Draw the procedural sky: gradient, horizon glow, and sun disc.
     pub fn draw(&self, f: &mut Frame3D) {
         let sun = self.clock.sun_dir();
         let daylight = self.clock.daylight();

@@ -187,8 +187,7 @@ impl Face {
         }
     }
 
-    /// The opposing face. `Neg`/`Pos` variants of an axis are numbered
-    /// adjacently, so the opposite is the low bit flipped — no table needed.
+    /// The opposing face.
     #[inline]
     pub const fn opposite(self) -> Face {
         Face::ALL[(self as usize) ^ 1]
@@ -239,43 +238,38 @@ impl<T> IndexMut<Face> for ByFace<T> {
 }
 
 /// A value per draw [`Pass`], keyed by `Pass` instead of a loose index — the
-/// two-pass analogue of [`ByFace`]. Slot `k` always belongs to `Pass` with
-/// discriminant `k` (`Opaque = 0`, `Transparent = 1`), so the pass ⇄ slot
-/// mapping lives in exactly one place. Used for the opaque/transparent mesh
-/// product on both its CPU side (`ByPass<MeshData>`) and its GPU side
-/// (`ByPass<Option<OwnedMesh>>`).
+/// per-pass analogue of [`ByFace`]. Slot `k` always belongs to `Pass` with
+/// discriminant `k`, and the width is [`Pass::COUNT`](voxel_engine::Pass::COUNT),
+/// so the container follows the enum by construction — adding a pass never widens
+/// this type by hand. Used for the per-technique mesh product on both its CPU side
+/// (`ByPass<MeshData>`) and its GPU side (`ByPass<Option<OwnedMesh>>`).
 #[derive(Debug, PartialEq, Eq)]
-pub struct ByPass<T>([T; 2]);
+pub struct ByPass<T>([T; voxel_engine::Pass::COUNT]);
 
 impl<T> ByPass<T> {
-    /// Build one value per pass, in discriminant order (`Opaque`, `Transparent`).
+    /// Build one value per pass, in discriminant (= draw) order.
     #[inline]
     pub fn from_fn(mut f: impl FnMut(voxel_engine::Pass) -> T) -> Self {
-        ByPass([f(voxel_engine::Pass::Opaque), f(voxel_engine::Pass::Transparent)])
+        ByPass(voxel_engine::Pass::ALL.map(&mut f))
     }
     /// Iterate `(pass, &value)` in pass order.
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (voxel_engine::Pass, &T)> {
-        [voxel_engine::Pass::Opaque, voxel_engine::Pass::Transparent]
-            .into_iter()
-            .zip(self.0.iter())
+        voxel_engine::Pass::ALL.into_iter().zip(self.0.iter())
     }
     /// Mutably iterate `(pass, &mut value)` in pass order.
     #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (voxel_engine::Pass, &mut T)> {
-        [voxel_engine::Pass::Opaque, voxel_engine::Pass::Transparent]
-            .into_iter()
-            .zip(self.0.iter_mut())
+        voxel_engine::Pass::ALL.into_iter().zip(self.0.iter_mut())
     }
     /// Consume into `(pass, value)` pairs in pass order.
     #[inline]
     pub fn into_iter_passes(self) -> impl Iterator<Item = (voxel_engine::Pass, T)> {
-        let [op, tr] = self.0;
-        [(voxel_engine::Pass::Opaque, op), (voxel_engine::Pass::Transparent, tr)].into_iter()
+        voxel_engine::Pass::ALL.into_iter().zip(self.0)
     }
-    /// Consume into the raw `[opaque, transparent]` slots.
+    /// Consume into the raw per-pass slots, in discriminant order.
     #[inline]
-    pub fn into_slots(self) -> [T; 2] {
+    pub fn into_slots(self) -> [T; voxel_engine::Pass::COUNT] {
         self.0
     }
 }

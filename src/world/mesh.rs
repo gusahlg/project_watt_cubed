@@ -20,7 +20,7 @@
 //!   camera-relative offset, so far terrain never jitters.
 //! - Uniform fast paths: a uniform non-solid chunk is empty; a uniform solid one
 //!   only sweeps its six border slices.
-use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal, Pass};
+use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::light::PaddedLight;
@@ -103,18 +103,29 @@ impl Padded {
         Self { ids: ids.into_boxed_slice() }
     }
 
-    /// Build a padded neighbourhood by sampling a per-cell function over the whole
-    /// `-1..=16` range, including the shell. Used by the far LOD tile mesher, whose
-    /// "neighbours" are more coarse cells of the same pure generator — so the shell
-    /// is sampled directly (no neighbour-tile handshake), which makes a fully-buried
-    /// coarse tile mesh to *nothing* (its solid shell hides every interior face)
-    /// exactly as a buried chunk does.
-    pub fn from_cells(cell: impl Fn(i32, i32, i32) -> BlockId) -> Self {
+    /// Uniform padded neighbourhood for LOD tile early-out (all cells same block).
+    pub fn uniform(id: BlockId) -> Self {
+        Self { ids: vec![id.0; PAD * PAD * PAD].into_boxed_slice() }
+    }
+
+    /// Build a padded neighbourhood one vertical column at a time: `col(x, z, out)`
+    /// fills the `PAD` cells of the `(x, z)` column — padded-y `-1..=16` in order —
+    /// into `out`. Used by the far LOD tile mesher, whose "neighbours" are coarser
+    /// cells of the same pure generator, so the shell is sampled directly (no
+    /// neighbour-tile handshake) — a fully-buried coarse tile meshes to *nothing*
+    /// (its solid shell hides every interior face) exactly as a buried chunk does.
+    ///
+    /// The column-shaped interface (vs. a per-cell `Fn(x,y,z)`) lets the sampler
+    /// compute its per-column terrain profile once and reuse it down the run — the
+    /// dominant cost of a far tile — which a point-shaped fill cannot express.
+    pub fn from_columns(mut col: impl FnMut(i32, i32, &mut [BlockId])) -> Self {
         let mut ids = vec![AIR.0; PAD * PAD * PAD];
-        for y in -1..=CS {
-            for z in -1..=CS {
-                for x in -1..=CS {
-                    ids[Self::index(x, y, z)] = cell(x, y, z).0;
+        let mut buf = [AIR; PAD];
+        for z in -1..=CS {
+            for x in -1..=CS {
+                col(x, z, &mut buf);
+                for (yi, id) in buf.iter().enumerate() {
+                    ids[Self::index(x, yi as i32 - 1, z)] = id.0;
                 }
             }
         }
@@ -206,10 +217,9 @@ const DIRS: [Dir; 6] = [
 /// One slice of the sweep: 16 x 16 cells.
 const MASK_CAP: usize = CHUNK_SIZE * CHUNK_SIZE;
 
-/// The unified greedy-merge key (C-1). Two faces merge only when the whole sample
-/// matches — id (⇒ texture layer and pass), per-corner AO, and per-corner light —
-/// so an AO or light gradient never merges into a flat quad. `PartialEq` *is* the
-/// merge rule.
+/// The greedy-merge key: two faces merge only when the whole sample matches —
+/// block id, per-corner AO, and per-corner light — so an AO or light gradient
+/// never merges into a flat quad. `PartialEq` determines the merge rule.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FaceSample {
     id: BlockId,
@@ -401,8 +411,7 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
         )
     });
 
-    let pass = if tables.opaque[sample.id.0 as usize] { Pass::Opaque } else { Pass::Transparent };
-    out[pass].quad(corners);
+    out[tables.layer[sample.id.0 as usize]].quad(corners);
 }
 
 #[cfg(test)]
@@ -410,6 +419,7 @@ mod tests {
     use super::*;
     use super::super::chunk::CHUNK_VOLUME;
     use crate::world::generation::TerrainGenerator;
+    use voxel_engine::Pass;
 
     struct EmptyGen;
     impl TerrainGenerator for EmptyGen {
@@ -444,6 +454,7 @@ mod tests {
         HotTables {
             solid: vec![false, true, true].into(),
             opaque: vec![false, true, true].into(),
+            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Opaque].into(),
             emission: vec![0, 0, 0].into(),
         }
     }
@@ -462,8 +473,8 @@ mod tests {
     fn build(chunk: &Chunk) -> MeshData {
         let mut out = new_chunk_mesh_data();
         build_chunk_mesh(&solo(chunk), chunk.uniform(), &tables(), &PaddedLight::full(), &mut out);
-        assert!(out[Pass::Transparent].is_empty(), "opaque blocks make no transparent geometry");
-        let [opaque, _] = out.into_slots();
+        assert!(out[Pass::Blend].is_empty(), "opaque blocks make no transparent geometry");
+        let [opaque, _cutout, _blend] = out.into_slots();
         opaque
     }
 
@@ -643,11 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn translucent_faces_route_to_the_transparent_pass() {
+    fn translucent_faces_route_to_the_blend_pass() {
         const GLASS: BlockId = BlockId(3);
         let t = HotTables {
             solid: vec![false, true, true, true].into(),
             opaque: vec![false, true, true, false].into(),
+            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             emission: vec![0, 0, 0, 0].into(),
         };
         let mut chunk = empty_chunk();
@@ -657,8 +669,8 @@ mod tests {
 
         let mut out = new_chunk_mesh_data();
         build_chunk_mesh(&solo(&chunk), None, &t, &PaddedLight::full(), &mut out);
-        assert!(!out[Pass::Transparent].is_empty(), "glass emits transparent geometry");
-        assert_eq!(total_area(&out[Pass::Transparent]), 9.0, "internal + occluded glass faces culled");
+        assert!(!out[Pass::Blend].is_empty(), "glass emits blend geometry");
+        assert_eq!(total_area(&out[Pass::Blend]), 9.0, "internal + occluded glass faces culled");
         assert_eq!(total_area(&out[Pass::Opaque]), 6.0, "stone keeps all six faces (glass doesn't cull)");
     }
 

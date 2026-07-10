@@ -977,7 +977,7 @@ mod tests {
             [
                 ("Fullscreen".to_string(), "Off".to_string()),
                 ("VSync".to_string(), "Off".to_string()),
-                ("Six-Way Cull".to_string(), "Off".to_string()),
+                ("Lighting".to_string(), "On".to_string()),
                 ("MSAA".to_string(), "4x".to_string()),
                 ("Max FPS".to_string(), "Uncapped".to_string()),
                 ("Render Distance".to_string(), "6".to_string()),

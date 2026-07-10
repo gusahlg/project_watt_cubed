@@ -5,7 +5,7 @@
 //! Positions and velocities are `f64` so play stays precise out to the world
 //! border (see [`math`](crate::math)); view angles stay `f32` — a radian needs
 //! no more precision, only positions accumulate magnitude.
-use voxel_engine::{Camera3D, DVec3, Vec3};
+use voxel_engine::{Camera3D, DVec3, Vec3, WarpParams};
 
 use crate::math::{Aabb, Bounded};
 
@@ -13,6 +13,21 @@ use crate::math::{Aabb, Bounded};
 /// extent is not a constant — it derives from [`Stance::height`] — so there is no
 /// `y` here to fall out of sync with the stance.
 pub const PLAYER_HALF_WIDTH: f64 = 0.3;
+
+/// A fresh player's base ground walk speed, units/second. It lives on the player
+/// (see [`Player::speed`]) rather than in the movement module so it can vary per
+/// player; this is only the starting value.
+pub const DEFAULT_WALK_SPEED: f64 = 6.0;
+
+/// A fresh player's flying speed, units/second. Lives on the player (see
+/// [`Player::fly_speed`]) for the same reason [`DEFAULT_WALK_SPEED`] does — so it
+/// can vary per player; this is only the starting value.
+pub const DEFAULT_FLY_SPEED: f64 = 14.0;
+
+/// A fresh player's health, and the ceiling it's created at. Health is an intrinsic
+/// property the player carries but nothing yet reads or changes — see
+/// [`Player::health`].
+pub const MAX_HEALTH: f32 = 20.0;
 
 /// How tall the player stands and how high their eye sits, as a function of what
 /// they're doing. Geometry is a pure function of the stance — box height and eye
@@ -84,6 +99,15 @@ pub struct Player {
     pub motion: Motion,
     /// Standing or sneaking — drives the player's height and eye offset.
     pub stance: Stance,
+    /// Base ground walk speed in units/second — an intrinsic the movement code
+    /// reads to scale the walking target (sprint still multiplies on top).
+    pub speed: f64,
+    /// Flying speed in units/second — an intrinsic the movement code reads to
+    /// scale the flying target, mirroring [`Player::speed`] for walking.
+    pub fly_speed: f64,
+    /// Current health. Intrinsic and carried on the player, but *not wired*: no
+    /// system reads or mutates it yet, so it simply holds [`MAX_HEALTH`].
+    pub health: f32,
 }
 
 impl Player {
@@ -94,6 +118,9 @@ impl Player {
             pitch: 0.0,
             motion: Motion::Walking { velocity: DVec3::ZERO, on_ground: false },
             stance: Stance::Standing,
+            speed: DEFAULT_WALK_SPEED,
+            fly_speed: DEFAULT_FLY_SPEED,
+            health: MAX_HEALTH,
         }
     }
 
@@ -180,6 +207,7 @@ impl Player {
             target: self.forward().as_vec3(),
             up: Vec3::new(0.0, 1.0, 0.0),
             fovy,
+            warp: WarpParams::IDENTITY,
         }
     }
 }

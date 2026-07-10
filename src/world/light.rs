@@ -1,9 +1,9 @@
 //! Cross-chunk lighting (v2.1). A [`LightGrid`] holds skylight and blocklight
 //! (each `0..=15`) for every cell of one chunk. It is computed by [`propagate`]
-//! as a function of the chunk's own voxels, its neighbour light shell
-//! ([`PaddedLight`]), and the column ceiling ([`CeilingWindow`], the skylight
+//! as a function of the chunk's own voxels, its six neighbour face light layers
+//! ([`FaceShell`]), and the column ceiling ([`CeilingWindow`], the skylight
 //! source). Settling is *decoupled* from meshing: a cheap main-thread
-//! Gauss-Seidel pass (`World::settle_light`) relaxes the field over a worklist,
+//! Gauss-Seidel pass (the `LightLane` worklist lane) relaxes the field,
 //! reading the latest neighbour grids directly and enqueuing a neighbour only
 //! when their shared border moves ([`border_changed`]) — so convergence costs no
 //! GPU work. The mesher later samples the settled [`PaddedLight`] per vertex
@@ -17,16 +17,15 @@
 //! - **Blocklight:** a BFS seeded from every emissive cell (and from the
 //!   neighbour boundaries), attenuating by 1 per step, stopping at opaque cells.
 //!
-//! Propagation is a pure function of an owned snapshot ([`Padded`] voxels +
-//! [`PaddedLight`] shell + [`CeilingWindow`]), so the settle pass can run it on
-//! the main thread against the latest neighbour grids without any snapshot copy.
+//! Propagation is a pure function of a [`Chunk`], [`FaceShell`] (neighbour
+//! light layers), and [`CeilingWindow`], exactly matching what [`propagate`]
+//! reads (interior voxels and face borders only).
 use std::collections::VecDeque;
 
 use crate::block::registry::HotTables;
 use crate::coord::Face;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk};
-use super::mesh::Padded;
 
 /// Maximum light level; the 4-bit domain the packed vertex stores.
 pub const MAX_LIGHT: u8 = 15;
@@ -58,7 +57,7 @@ impl LightLevel {
     pub const fn attenuated(self) -> Self {
         Self(self.0.saturating_sub(1))
     }
-    /// The lattice join used by relaxation — the brighter of the two.
+    /// Returns the brighter of the two values.
     #[inline]
     pub fn brighter(self, o: Self) -> Self {
         Self(self.0.max(o.0))
@@ -66,7 +65,7 @@ impl LightLevel {
 }
 
 /// Skylight and blocklight paired; prevents channel desyncs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Lumel {
     pub sky: LightLevel,
     pub block: LightLevel,
@@ -92,6 +91,18 @@ impl LightGrid {
     /// An all-full-bright grid, for tests and the neutral mesher path.
     pub fn full() -> Self {
         Self { cells: vec![Lumel::FULL; CHUNK_VOLUME].into() }
+    }
+
+    /// Full skylight, no blocklight — the settled light of a chunk fully open to
+    /// the sky with no emitters. This is exactly `propagate(uniform_air, dark
+    /// shell, open ceiling, …)`'s result, so the analytic light fast path
+    /// ([`World::trivial_light`](crate::world::World)) can publish it without a
+    /// flood.
+    pub fn open_sky() -> Self {
+        Self {
+            cells: vec![Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }; CHUNK_VOLUME]
+                .into(),
+        }
     }
 
     #[inline]
@@ -131,6 +142,17 @@ impl PaddedLight {
     /// An all-full-bright shell — the neutral mesher path (tests).
     pub fn full() -> Self {
         Self { cells: vec![Lumel::FULL; PADL * PADL * PADL].into() }
+    }
+
+    /// Full skylight, no blocklight — the shell equivalent of
+    /// [`LightGrid::open_sky`]. Used to mesh coarse LOD tiles, which are top-down
+    /// surface approximations open to the sky with no emitters, so their shading
+    /// tracks day/night via skylight instead of clamping to a fake full emitter.
+    pub fn open_sky() -> Self {
+        Self {
+            cells: vec![Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }; PADL * PADL * PADL]
+                .into(),
+        }
     }
 
     /// A shell filled from a per-cell closure over signed coords `-1..=16` — for
@@ -182,8 +204,60 @@ impl PaddedLight {
     }
 }
 
+/// Six neighbour-light face layers (16x16 each) that settle reads. Interior
+/// floods locally; borders come from here. Replaces the old 18-cubed padding.
+pub struct FaceShell {
+    faces: [[Lumel; CHUNK_AREA]; 6], // indexed by Face as usize; near layer of each face neighbour
+}
+
+impl FaceShell {
+    /// Near border layer of the neighbour across `face` (0 for Pos, 15 for Neg).
+    #[inline]
+    fn near_layer(face: Face) -> usize {
+        match face {
+            Face::PosX | Face::PosY | Face::PosZ => 0,
+            _ => CHUNK_SIZE - 1,
+        }
+    }
+
+    /// Capture light grids from neighbours (or None for dark). Reads the near
+    /// border layer of each neighbour.
+    pub fn capture<'a>(grid_at: impl Fn(Face) -> Option<&'a LightGrid>) -> Self {
+        let mut faces = [[Lumel::DARK; CHUNK_AREA]; 6];
+        for face in Face::ALL {
+            let Some(g) = grid_at(face) else { continue };
+            let na = normal_axis(face);
+            let (au, av) = plane_axes(face);
+            let n = Self::near_layer(face);
+            let layer = &mut faces[face as usize];
+            for b in 0..CHUNK_SIZE {
+                for a in 0..CHUNK_SIZE {
+                    let mut lc = [0usize; 3];
+                    lc[na] = n;
+                    lc[au] = a;
+                    lc[av] = b;
+                    layer[a + b * CHUNK_SIZE] = g.at(Chunk::index(lc[0], lc[1], lc[2]));
+                }
+            }
+        }
+        Self { faces }
+    }
+
+    /// Light value from neighbour across `face` at coords `(a, b)`.
+    #[inline]
+    pub(in crate::world) fn at(&self, face: Face, a: usize, b: usize) -> Lumel {
+        self.faces[face as usize][a + b * CHUNK_SIZE]
+    }
+
+    /// All-dark shell (no neighbours).
+    pub fn dark() -> Self {
+        Self { faces: [[Lumel::DARK; CHUNK_AREA]; 6] }
+    }
+}
+
 /// Terrain surface height per column; determines skylight seeding. Pure function
 /// of generator (independent of chunk load order), so caves stay consistently dark.
+#[derive(Clone)]
 pub struct CeilingWindow {
     surface: [i32; CHUNK_AREA],
 }
@@ -206,7 +280,7 @@ impl CeilingWindow {
     }
 
     #[inline]
-    fn open_above(&self, lx: usize, lz: usize, world_y: i32) -> bool {
+    pub(in crate::world) fn open_above(&self, lx: usize, lz: usize, world_y: i32) -> bool {
         world_y >= self.surface[lx + lz * CHUNK_SIZE]
     }
 }
@@ -214,8 +288,8 @@ impl CeilingWindow {
 /// Recompute chunk light from scratch. Light removal needs no second pass:
 /// breaking emitters or placing blocks just lowers the grid. `world_y0` is chunk's Y origin.
 pub fn propagate(
-    padded: &Padded,
-    shell: &PaddedLight,
+    chunk: &Chunk,
+    shell: &FaceShell,
     ceiling: &CeilingWindow,
     world_y0: i32,
     tables: &HotTables,
@@ -223,7 +297,9 @@ pub fn propagate(
 ) {
     out.cells.fill(Lumel::DARK);
     let cs = CHUNK_SIZE as i32;
-    let opaque_at = |x: i32, y: i32, z: i32| tables.opaque[padded.at(x, y, z).0 as usize];
+    let opaque_at = |x: i32, y: i32, z: i32| {
+        tables.opaque[chunk.get_local(x as usize, y as usize, z as usize).0 as usize]
+    };
 
     // --- Skylight ---------------------------------------------------------
     let mut sky: Box<[LightLevel]> = vec![LightLevel::DARK; CHUNK_VOLUME].into();
@@ -283,7 +359,7 @@ pub fn propagate(
     queue.clear();
     for i in 0..CHUNK_VOLUME {
         let (x, y, z) = Chunk::local_of(i);
-        let em = tables.emission[padded.at(x as i32, y as i32, z as i32).0 as usize];
+        let em = tables.emission[chunk.get_local(x, y, z).0 as usize];
         if em > 0 {
             block[i] = LightLevel::new(em);
             queue.push_back(i);
@@ -328,20 +404,32 @@ pub fn propagate(
 
 /// Seed border cells from neighbour shell faces (skylight full-strength from +Y).
 /// Dark shell cells (missing neighbours) don't seed.
-fn seed_from_shell(shell: &PaddedLight, mut seed: impl FnMut(usize, Lumel)) {
+fn seed_from_shell(shell: &FaceShell, mut seed: impl FnMut(usize, Lumel)) {
     for face in Face::ALL {
-        for (ci, co) in face_cells(face) {
-            let src = shell.at(co[0], co[1], co[2]);
-            let sky = if face == Face::PosY && src.sky == LightLevel::FULL {
-                LightLevel::FULL
-            } else {
-                src.sky.attenuated()
-            };
-            let seeded = Lumel { sky, block: src.block.attenuated() };
-            if seeded == Lumel::DARK {
-                continue;
+        let na = normal_axis(face);
+        let (au, av) = plane_axes(face);
+        let inner = match face {
+            Face::PosX | Face::PosY | Face::PosZ => CS - 1,
+            _ => 0,
+        };
+        for b in 0..CHUNK_SIZE {
+            for a in 0..CHUNK_SIZE {
+                let src = shell.at(face, a, b);
+                let sky = if face == Face::PosY && src.sky == LightLevel::FULL {
+                    LightLevel::FULL
+                } else {
+                    src.sky.attenuated()
+                };
+                let seeded = Lumel { sky, block: src.block.attenuated() };
+                if seeded == Lumel::DARK {
+                    continue;
+                }
+                let mut ci = [0i32; 3];
+                ci[na] = inner;
+                ci[au] = a as i32;
+                ci[av] = b as i32;
+                seed(Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize), seeded);
             }
-            seed(Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize), seeded);
         }
     }
 }
@@ -399,23 +487,38 @@ fn face_cells(face: Face) -> impl Iterator<Item = ([i32; 3], [i32; 3])> {
 mod tests {
     use super::*;
     use crate::block::registry::BlockId;
+    use voxel_engine::Pass;
 
     fn tables() -> HotTables {
         HotTables {
             solid: vec![false, true, true].into(),
             opaque: vec![false, true, false].into(), // id 1 opaque (stone), id 2 clear
+            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             emission: vec![0, 0, 15].into(),         // id 2 emits 15
         }
     }
 
-    fn solo(chunk: &Chunk) -> Padded {
-        Padded::capture(|dx, dy, dz| (dx == 0 && dy == 0 && dz == 0).then_some(chunk))
-    }
-
     fn lit(chunk: &Chunk) -> LightGrid {
         let mut grid = LightGrid::dark();
-        propagate(&solo(chunk), &PaddedLight::dark(), &CeilingWindow::open(), 0, &tables(), &mut grid);
+        propagate(chunk, &FaceShell::dark(), &CeilingWindow::open(), 0, &tables(), &mut grid);
         grid
+    }
+
+    #[test]
+    fn analytic_grids_match_propagate() {
+        // The anchor for `World::trivial_light`: the analytic grids it publishes
+        // without a flood must equal what `propagate` computes with a dark shell.
+        let tables = tables();
+        // Uniform opaque (id 1) → all dark, regardless of ceiling.
+        let opaque = Chunk::from_uniform(0, -10, 0, BlockId(1));
+        let mut got = LightGrid::dark();
+        propagate(&opaque, &FaceShell::dark(), &CeilingWindow::from_heights(|_, _| 100), -160, &tables, &mut got);
+        assert!(got == LightGrid::dark(), "uniform opaque == dark()");
+        // Uniform air fully open to the sky → full sky, no blocklight.
+        let air = Chunk::from_uniform(0, 10, 0, BlockId(0));
+        let mut got = LightGrid::dark();
+        propagate(&air, &FaceShell::dark(), &CeilingWindow::open(), 160, &tables, &mut got);
+        assert!(got == LightGrid::open_sky(), "open-sky air == open_sky()");
     }
 
     #[test]
@@ -446,7 +549,7 @@ mod tests {
         let chunk = Chunk::from_dense(0, -8, 0, Box::new([0u8; CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 40); // surface well above this chunk
         let mut grid = LightGrid::dark();
-        propagate(&solo(&chunk), &PaddedLight::dark(), &ceiling, -128, &tables(), &mut grid);
+        propagate(&chunk, &FaceShell::dark(), &ceiling, -128, &tables(), &mut grid);
 
         assert_eq!(grid.at(Chunk::index(4, 8, 4)).sky, LightLevel::DARK, "cavern dark");
         assert_eq!(grid.at(Chunk::index(0, 0, 0)).sky, LightLevel::DARK, "cavern floor dark");
@@ -458,11 +561,50 @@ mod tests {
         chunk.set_local(8, 8, 8, BlockId(2)); // emitter, level 15
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // fully underground: isolate blocklight
         let mut grid = LightGrid::dark();
-        propagate(&solo(&chunk), &PaddedLight::dark(), &ceiling, 0, &tables(), &mut grid);
+        propagate(&chunk, &FaceShell::dark(), &ceiling, 0, &tables(), &mut grid);
 
         assert_eq!(grid.at(Chunk::index(8, 8, 8)).block.get(), 15, "the emitter");
         assert_eq!(grid.at(Chunk::index(9, 8, 8)).block.get(), 14, "one step");
         assert_eq!(grid.at(Chunk::index(11, 8, 8)).block.get(), 12, "three steps");
+    }
+
+    /// FaceShell reads neighbour near-layer correctly for all faces.
+    #[test]
+    fn face_shell_captures_the_neighbour_near_layer() {
+        let mut grid = LightGrid::dark();
+        for i in 0..CHUNK_VOLUME {
+            let (x, y, z) = Chunk::local_of(i);
+            grid.set(i, Lumel {
+                sky: LightLevel::new((x + y) as u8 % 16),
+                block: LightLevel::new((z + y) as u8 % 16),
+            });
+        }
+        for face in Face::ALL {
+            let (dx, dy, dz) = face.delta();
+            let padded = PaddedLight::capture(|nx, ny, nz| {
+                (nx == dx && ny == dy && nz == dz).then_some(&grid)
+            });
+            let shell = FaceShell::capture(|f| (f == face).then_some(&grid));
+            let na = normal_axis(face);
+            let (au, av) = plane_axes(face);
+            let outer = match face {
+                Face::PosX | Face::PosY | Face::PosZ => CS,
+                _ => -1,
+            };
+            for b in 0..CHUNK_SIZE {
+                for a in 0..CHUNK_SIZE {
+                    let mut co = [0i32; 3];
+                    co[na] = outer;
+                    co[au] = a as i32;
+                    co[av] = b as i32;
+                    assert_eq!(
+                        shell.at(face, a, b),
+                        padded.at(co[0], co[1], co[2]),
+                        "face {face:?} at ({a}, {b})"
+                    );
+                }
+            }
+        }
     }
 
     /// Two adjacent chunks relaxed by hand — a torch in the left chunk floods
@@ -477,10 +619,9 @@ mod tests {
         let right_c = Chunk::from_dense(1, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // underground: isolate blocklight
 
-        // A shell holding one neighbour at chunk offset `nbr_dx` (dark elsewhere)
-        // — the settle pass's `capture` in miniature.
-        fn shell(nbr_dx: i32, nbr: &LightGrid) -> PaddedLight {
-            PaddedLight::capture(|dx, _, _| (dx == nbr_dx).then_some(nbr))
+        // Shell with one neighbour across face (dark elsewhere).
+        fn shell(face: Face, nbr: &LightGrid) -> FaceShell {
+            FaceShell::capture(|f| (f == face).then_some(nbr))
         }
 
         let mut left = LightGrid::dark();
@@ -489,9 +630,9 @@ mod tests {
         loop {
             passes += 1;
             let mut new_left = LightGrid::dark();
-            propagate(&solo(&left_c), &shell(1, &right), &ceiling, 0, &tables, &mut new_left);
+            propagate(&left_c, &shell(Face::PosX, &right), &ceiling, 0, &tables, &mut new_left);
             let mut new_right = LightGrid::dark();
-            propagate(&solo(&right_c), &shell(-1, &new_left), &ceiling, 0, &tables, &mut new_right);
+            propagate(&right_c, &shell(Face::NegX, &new_left), &ceiling, 0, &tables, &mut new_right);
             let stable = !border_changed(&left, &new_left, Face::PosX)
                 && !border_changed(&right, &new_right, Face::NegX);
             left = new_left;

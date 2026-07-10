@@ -1,19 +1,16 @@
-//! Turns a [`Composition`] into the observable properties of a block. This is the
-//! heart of the "blocks are averages of their elements" rule: every core property
-//! is the weight-average of the contributing elements, the colour is the same
-//! average applied to element tints, and special behaviours are summed by kind.
+//! Computes the observable properties of a block from its [`Composition`]. Each
+//! core property blends from its contributing elements, the colour is blended
+//! similarly, and special behaviours are summed.
 //!
-//! Derivation runs once per distinct block at registration, never per voxel, so it
-//! favours clarity over raw speed — the hot path reads the precomputed results.
-use voxel_engine::Color;
+//! All computation happens once per distinct block at registration, never per voxel.
+//! The results are cached so rendering and physics read precomputed values.
+use voxel_engine::{Color, Pass};
 
 use crate::block::bary::{SparseSpecials, barycenter};
 use crate::block::composition::{Composition, Weights};
 use crate::block::element::{Core, CoreProperties, ElementRegistry, SpecialKind};
 
-/// Each core property of a block is the weighted average of its elements'. With
-/// natural weights of `1` this is the plain mean (so equal parts of `1, 2, 3`
-/// derive `2`); with mixture percentages it is the percentage-weighted mean.
+/// Blend each core property from its contributing elements, using their weights.
 pub fn derive_core(els: &ElementRegistry, comp: &Composition) -> CoreProperties {
     derive_core_from(els, &comp.weights())
 }
@@ -30,8 +27,7 @@ pub fn derive_core_from(els: &ElementRegistry, weights: &Weights) -> CorePropert
     .into()
 }
 
-/// The block's colour is its element tints averaged by the same weights — a
-/// 70/30 soil/clay mix looks 70% soil. Air (no elements) is transparent.
+/// Blend the block's colour from element tints using their weights.
 pub fn derive_color(els: &ElementRegistry, comp: &Composition) -> Color {
     derive_color_from(els, &comp.weights())
 }
@@ -60,6 +56,36 @@ pub fn derive_solid(comp: &Composition) -> bool {
 /// non-solid, hence non-opaque.
 pub fn derive_opaque(core: &CoreProperties, solid: bool) -> bool {
     solid && core.transparency == 0
+}
+
+/// The draw technique a block routes to — a pure function of the same
+/// `transparency` that drives [`derive_opaque`], so `Opaque` iff `derive_opaque`.
+/// A solid that lets light through is tinted see-through (water/glass) → [`Pass::Blend`].
+/// [`Pass::Cutout`] is reserved for atlas blocks with binary alpha holes; none
+/// source per-texel alpha yet, so nothing derives it. Air routes to `Opaque`
+/// (it is never meshed, so the slot is inert).
+pub fn derive_layer(core: &CoreProperties, solid: bool) -> Pass {
+    if !solid || core.transparency == 0 {
+        Pass::Opaque
+    } else {
+        Pass::Blend
+    }
+}
+
+/// The texel alpha stamped into a block's texture layer, from the same
+/// `transparency` (0..=100 % of light let through) that drives [`derive_layer`].
+/// Opaque blocks (`transparency == 0`) get a fully opaque 255; since they draw on
+/// the blend-disabled pipeline, only [`Pass::Blend`] blocks ever composite with
+/// this, so the two derivations agree by construction: `alpha < 255` iff `Blend`.
+/// A floor keeps a very clear block reading as glass rather than vanishing.
+pub fn derive_texel_alpha(core: &CoreProperties) -> u8 {
+    /// ~16 % — the minimum opacity a translucent block renders at.
+    const MIN_ALPHA: u8 = 40;
+    let t = core.transparency.min(100);
+    if t == 0 {
+        return 255;
+    }
+    (((100 - t) as u16 * 255 / 100) as u8).max(MIN_ALPHA)
 }
 
 /// A block's blocklight output on the mesher's 0..=15 scale, rescaled from the
@@ -125,6 +151,22 @@ mod tests {
         assert!(!derive_solid(&comp));
         assert_eq!(derive_color(&registry(), &comp), Color::new(0, 0, 0, 0));
         assert_eq!(derive_core(&registry(), &comp), CoreProperties::default());
+    }
+
+    #[test]
+    fn texel_alpha_agrees_with_layer_and_is_monotonic() {
+        let core = |t: u8| CoreProperties { transparency: t, ..Default::default() };
+        // Opaque iff transparency == 0 iff alpha == 255 — the shared invariant.
+        assert_eq!(derive_texel_alpha(&core(0)), 255);
+        assert_eq!(derive_layer(&core(0), true), Pass::Opaque);
+        for t in 1..=100u8 {
+            let a = derive_texel_alpha(&core(t));
+            assert!(a < 255, "translucent block must not be fully opaque (t={t})");
+            assert_eq!(derive_layer(&core(t), true), Pass::Blend);
+        }
+        // More transparent → lower alpha (weakly), floored so glass stays visible.
+        assert!(derive_texel_alpha(&core(30)) > derive_texel_alpha(&core(90)));
+        assert!(derive_texel_alpha(&core(100)) >= 40, "floor keeps clear blocks perceptible");
     }
 
     #[test]

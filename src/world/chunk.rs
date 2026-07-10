@@ -7,7 +7,7 @@
 //! all stone, so [`ChunkData::Uniform`] stores those as one id (~a dozen bytes)
 //! instead of a 4 KiB array. Dense cells are `u8` — safe because the palette is
 //! hard-capped at 256 block types ([`BlockRegistry::MAX_BLOCK_TYPES`]).
-use crate::block::registry::BlockId;
+use crate::block::registry::{BlockId, HotTables};
 use crate::world::generation::TerrainGenerator;
 
 /// Chunk edge length along every world axis (chunks are cubes).
@@ -64,7 +64,14 @@ impl Chunk {
         Self { cx, cy, cz, data: ChunkData::Dense(cells) }
     }
 
-    /// Flat index of chunk-local coord (x + z*16 + y*256).
+    /// Wrap pre-generated storage at a chunk coordinate — used by the column
+    /// generation worker, which produces [`ChunkData`] from `generate_column`
+    /// and pairs it with its coord.
+    pub fn from_data(cx: i32, cy: i32, cz: i32, data: ChunkData) -> Self {
+        Self { cx, cy, cz, data }
+    }
+
+    /// Flat index from chunk-local coordinates.
     pub const fn index(x: usize, y: usize, z: usize) -> usize {
         x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE
     }
@@ -90,6 +97,14 @@ impl Chunk {
             ChunkData::Uniform(id) => Some(id),
             ChunkData::Dense(_) => None,
         }
+    }
+
+    /// Whether this chunk is uniform *and* that block is opaque — the analytic
+    /// light fast path's "a full block of rock/solid, so its settled grid is all
+    /// dark" test. A non-uniform chunk is never trivially opaque.
+    #[inline]
+    pub fn is_uniform_opaque(&self, tables: &HotTables) -> bool {
+        self.uniform().is_some_and(|id| tables.opaque[id.0 as usize])
     }
 
     /// Read a voxel by flat index.

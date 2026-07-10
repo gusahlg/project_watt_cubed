@@ -10,7 +10,7 @@
 //! inspection, crafting, and the future simulation touch.
 use std::collections::HashMap;
 
-use voxel_engine::Color;
+use voxel_engine::{Color, Pass};
 
 use crate::block::composition::{Composition, MixError};
 use crate::block::derive;
@@ -50,7 +50,8 @@ pub struct BlockRegistry {
     reactions: ReactionRegistry,
     blocks: Vec<Block>,   // cold records
     solid: Vec<bool>,     // HOT, indexed by BlockId — collision key ("is there a block")
-    opaque: Vec<bool>,    // HOT — mesher cull key (solid & transparency == 0)
+    opaque: Vec<bool>,    // HOT — mesher cull/AO key (solid & transparency == 0)
+    layer: Vec<Pass>,     // HOT — mesher routing key (draw technique); Opaque iff `opaque`
     emission: Vec<u8>,    // HOT — blocklight seed, 0..=15
     color: Vec<Color>,    // HOT, indexed by BlockId
     dedup: HashMap<CompKey, BlockId>,
@@ -66,19 +67,24 @@ pub struct BlockRegistry {
 pub struct HotTables {
     pub solid: Box<[bool]>,
     pub opaque: Box<[bool]>,
+    /// Draw technique per block — the mesher's routing key. `layer[id] == Opaque`
+    /// exactly when `opaque[id]` (both derived from `transparency`); the bool is
+    /// kept for the branchless cull/AO hot loop, this for pass routing.
+    pub layer: Box<[Pass]>,
     pub emission: Box<[u8]>,
 }
 
 impl BlockRegistry {
     /// A registry preloaded with the built-in elements, reactions, and blocks.
     /// `AIR` is registered first, so it is always [`BlockId(0)`](BlockId).
-   pub fn with_builtins() -> Self {
+    pub fn with_builtins() -> Self {
         let mut registry = Self {
             elements: ElementRegistry::with_builtins(),
             reactions: ReactionRegistry::with_builtins(),
             blocks: Vec::new(),
             solid: Vec::new(),
             opaque: Vec::new(),
+            layer: Vec::new(),
             emission: Vec::new(),
             color: Vec::new(),
             dedup: HashMap::new(),
@@ -116,6 +122,7 @@ impl BlockRegistry {
         HotTables {
             solid: self.solid.clone().into_boxed_slice(),
             opaque: self.opaque.clone().into_boxed_slice(),
+            layer: self.layer.clone().into_boxed_slice(),
             emission: self.emission.clone().into_boxed_slice(),
         }
     }
@@ -195,6 +202,7 @@ impl BlockRegistry {
         let color = derive::derive_color_from(&self.elements, &weights);
         let solid = derive::derive_solid(&composition);
         let opaque = derive::derive_opaque(&core, solid);
+        let layer = derive::derive_layer(&core, solid);
         let emission = derive::derive_emission(&core);
         let specials = derive::derive_specials_from(&self.elements, &weights);
 
@@ -208,6 +216,7 @@ impl BlockRegistry {
             },
             solid,
             opaque,
+            layer,
             emission,
             color,
         );
@@ -229,6 +238,7 @@ impl BlockRegistry {
         block: Block,
         solid: bool,
         opaque: bool,
+        layer: Pass,
         emission: u8,
         color: Color,
     ) -> BlockId {
@@ -236,6 +246,7 @@ impl BlockRegistry {
         self.blocks.push(block);
         self.solid.push(solid);
         self.opaque.push(opaque);
+        self.layer.push(layer);
         self.emission.push(emission);
         self.color.push(color);
         id
@@ -392,12 +403,16 @@ mod tests {
     #[test]
     fn hot_arrays_agree_with_cold_records() {
         let reg = BlockRegistry::with_builtins();
+        let hot = reg.hot_tables();
         for i in 0..reg.block_count() {
             let id = BlockId(i as u8);
             let block = reg.block(id);
             let solid = derive::derive_solid(&block.composition);
             assert_eq!(reg.is_solid(id), solid);
             assert_eq!(reg.is_opaque(id), derive::derive_opaque(&block.core, solid));
+            assert_eq!(hot.layer[i], derive::derive_layer(&block.core, solid));
+            // The routing enum and the branchless cull bool are the same fact.
+            assert_eq!(hot.layer[i] == Pass::Opaque, reg.is_opaque(id));
             assert_eq!(reg.emission(id), derive::derive_emission(&block.core));
             assert_eq!(reg.color(id), derive::derive_color(reg.elements(), &block.composition));
         }

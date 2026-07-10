@@ -111,9 +111,11 @@ impl App {
             started: false,
             pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
         });
-        // Benchmark runs include the unified CPU, GPU, and worker profile unless
-        // the caller explicitly disables it. Safe here: `new()` runs before the
-        // renderer and worker threads read this variable.
+        // A benchmark run auto-enables the profiler (CPU subsystems + workers
+        // via VOXEL_PROFILE) unless the caller set it explicitly. Safe here:
+        // `new()` runs on the main thread at startup, before the renderer or
+        // any worker thread — the only reader of this var — exists. Reads
+        // happen later.
         if bench.is_some() && std::env::var_os("VOXEL_PROFILE").is_none() {
             unsafe { std::env::set_var("VOXEL_PROFILE", "1") };
         }
@@ -504,6 +506,7 @@ impl App {
     /// Install a freshly built game as the active screen.
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
         game.world_mut().set_view_radius(self.settings.render_distance);
+        game.world_mut().set_lighting(self.settings.lighting, eng);
         // Saves and servers can place the player far from the pre-generated
         // origin; make the ground under them real before physics runs.
         let pos = game.player().position;
