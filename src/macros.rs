@@ -155,14 +155,16 @@ macro_rules! blocks {
         impl Blk {
             /// This block's stable id in a built-in registry.
             pub const fn id(self) -> $crate::block::registry::BlockId {
-                $crate::block::registry::BlockId(self as u16)
+                $crate::block::registry::BlockId(self as u8)
             }
         }
 
         /// Register every built-in block in id order. `Air` lands at id 0.
         fn register_builtins(registry: &mut $crate::block::registry::BlockRegistry) {
             $(
-                let id = registry.register(stringify!($variant), $comp);
+                let id = registry
+                    .register(stringify!($variant), $comp)
+                    .expect("builtin block palette fits within the capacity cap");
                 debug_assert_eq!(id, Blk::$variant.id(), "builtin block id drift");
             )*
         }

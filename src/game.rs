@@ -3,11 +3,15 @@
 //! The window and the menu/play state machine live one level up in [`app`](crate::app);
 //! a `Game` is handed the engine each frame and reports back whether to keep playing
 //! or return to the menu.
+use std::time::Instant;
+
 use voxel_engine::{Camera3D, Color, DVec3, Engine, Key, MouseButton, Vec2, Vec3};
 
+use crate::avatar::Pose;
 use crate::block::AIR;
 use crate::command;
 use crate::console::{self, Console};
+use crate::ui::{self, Anchor, Theme};
 use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
@@ -18,15 +22,12 @@ use crate::player::Player;
 use crate::save;
 use crate::settings::Settings;
 use crate::sim::Simulation;
+use crate::sky::Sky;
 use crate::world::World;
 
 /// How far the player can reach to break a block, in world units.
 const REACH: f64 = 6.0;
 const HELP_TEXT: &str = "WASD move | mouse look | Space jump | F fly | LMB break | I inventory | C craft | Tab cursor | T chat/cmd | Esc menu";
-/// Half-extents of another player's drawn body — matches the collision box in
-/// [`player`](crate::player::PLAYER_HALF). `f64` like all position math; cast
-/// to `f32` only for the (camera-relative) draw calls.
-const PEER_HALF: DVec3 = DVec3::new(0.3, 0.9, 0.3);
 /// Peers past this distance get no floating name tag (it would be unreadable).
 const TAG_RANGE: f64 = 90.0;
 
@@ -55,6 +56,11 @@ pub struct Game {
     /// Cached HUD coordinate line: the displayed values change far less often
     /// than the frame rate, so the format!/measure pair runs only on change.
     coord_cache: (i64, i64, i64, String),
+    /// In-world UI look and HUD visibility (see [`ui::Theme`]).
+    theme: Theme,
+    /// Day/night clock, atmosphere colour, weather, and the lighting edge into
+    /// voxel shading (see [`crate::sky`]).
+    sky: Sky,
 }
 
 impl Game {
@@ -68,6 +74,8 @@ impl Game {
             save_name,
             net: None,
             coord_cache: (i64::MIN, i64::MIN, i64::MIN, String::new()),
+            theme: Theme::new(),
+            sky: Sky::new(),
         }
     }
 
@@ -123,6 +131,13 @@ impl Game {
         // tunnel the player through terrain.
         let dt = eng.frame_time().min(0.1);
 
+        // Advance the day/night clock (singleplayer drives it locally; a server
+        // sync overrides `day` on arrival).
+        self.sky.tick(dt as f64);
+
+        // Keep the HUD text scale in sync with the persisted setting.
+        self.theme.scale = settings.ui_scale;
+
         // Drain the server first so edits and chat keep flowing even while the
         // console is open or the player stands still.
         if self.apply_net_events() {
@@ -161,6 +176,19 @@ impl Game {
 
         if eng.is_key_pressed(Key::Tab) {
             self.toggle_mouse(eng);
+        }
+
+        // F1 cycles HUD visibility: Full → Minimal → Off → …
+        if eng.is_key_pressed(Key::F1) {
+            self.theme.cycle_hud();
+        }
+
+        // F2 saves a timestamped screenshot of the next presented frame.
+        if eng.is_key_pressed(Key::F2) {
+            match eng.screenshot() {
+                Some(path) => println!("screenshot queued: {}", path.display()),
+                None => eprintln!("screenshot could not be queued"),
+            }
         }
 
         if self.mouse_locked {
@@ -211,17 +239,25 @@ impl Game {
                 Incoming::Edit { x, y, z, spec } => {
                     // Resolve the portable spec against our own palette, then apply.
                     // The server echoes our OWN edits back too (that server-ordered
-                    // echo is what converges racing edits on one cell); applying is
-                    // idempotent, so re-applying an edit we already made locally
-                    // just costs one redundant dirty-remesh per own edit —
-                    // acceptable.
+                    // echo is what converges racing edits on one cell); re-applying
+                    // an edit we already made locally is harmless, just a redundant
+                    // dirty-remesh per own edit — acceptable.
                     let id = save::parse_block(&mut self.world, &spec);
                     self.world.set_block(x, y, z, id);
                 }
                 Incoming::Chat { from_name, channel, text } => {
-                    let scope = if channel == chat::GLOBAL { "[global] " } else { "" };
-                    self.console.print(format!("{scope}<{from_name}> {text}"));
+                    // Colour the scope tag and name so chat scans at a glance: a gold
+                    // [global] tag, a blue <name>, and the message body white.
+                    let name = ui::Line::of(ui::Role::Name, format!("<{from_name}> "));
+                    let line = if channel == chat::GLOBAL {
+                        ui::Line::of(ui::Role::Global, "[global] ")
+                            .then(ui::Role::Name, format!("<{from_name}> "))
+                    } else {
+                        name
+                    };
+                    self.console.push(line.then(ui::Role::Chat, text));
                 }
+                Incoming::Time { day } => self.sky.clock.set_day(day as f64),
                 Incoming::Disconnected => disconnected = true,
             }
         }
@@ -245,10 +281,13 @@ impl Game {
                 return;
             }
         }
-        self.console.print(format!("> {line}"));
+        self.console.echo(&line);
         let before = settings.clone();
-        for out in command::execute(&line, &mut self.player, &self.world, settings) {
-            self.console.print(out);
+        let day_before = self.sky.clock.day();
+        // Each output line already carries its role (System output vs Error
+        // rejection), so there is nothing to guess — just show them.
+        for out in command::execute(&line, &mut self.player, &self.world, settings, &mut self.sky) {
+            self.console.push(out);
         }
         // A `/gfx` command edits settings; push the result to the engine and
         // world, and persist it, only when something actually changed.
@@ -256,6 +295,13 @@ impl Game {
             settings.apply(eng);
             self.world.set_view_radius(settings.render_distance);
             settings.save();
+        }
+        // A `/time` change is shared: tell the server so every client's clock
+        // follows (the server relays it and hands it to future joiners).
+        if self.sky.clock.day() != day_before {
+            if let Some(net) = &mut self.net {
+                net.send_set_time(self.sky.clock.day() as f32);
+            }
         }
     }
 
@@ -283,7 +329,7 @@ impl Game {
     /// in an air cell that doesn't overlap the player. Well-behaved mods (the
     /// crafting mod) ran this exact check before queueing — and before spending a
     /// block on it — so within one frame the two always agree; re-checking here is
-    /// a cheap invariant against a mod that queues without validating.
+    /// a cheap guard against a mod that queues without validating.
     fn apply_placements(&mut self, placements: Vec<(i32, i32, i32, crate::block::BlockId)>) {
         for (x, y, z, id) in placements {
             if self.world.block_at(x, y, z) != AIR {
@@ -319,12 +365,12 @@ impl Game {
 
     /// Render the world and HUD (owns its own draw pass for the frame).
     ///
-    /// CAMERA REBASE: the camera sits at `Vec3::ZERO` looking along the view
-    /// direction ([`Player::camera_with_fov`](crate::player::Player)), and
-    /// every 3D draw is camera-relative — the world passes per-chunk offsets
-    /// to `draw_mesh`, peers subtract the eye. All differences are taken in
-    /// `f64` first, so only *small* camera-local values ever reach the `f32`
-    /// GPU path; the world can be 1e9 blocks wide without a vertex jittering.
+    /// The camera sits at `Vec3::ZERO` looking along the view direction
+    /// ([`Player::camera_with_fov`](crate::player::Player)), and every 3D
+    /// draw is camera-relative — the world passes per-chunk offsets to
+    /// `draw_mesh`, peers subtract the eye. Differences are taken in `f64`
+    /// first, so only small camera-local values ever reach the `f32` GPU
+    /// path; the world can be 1e9 blocks wide without a vertex jittering.
     pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32) {
         let camera = self.player.camera_with_fov(fov);
         let cam_pos = self.player.position;
@@ -337,84 +383,95 @@ impl Game {
             self.coord_cache = (key.0, key.1, key.2, text);
         }
         let coord_text = self.coord_cache.3.clone();
-        let coord_fs = 26;
         let screen_w = eng.screen_width();
         let screen_h = eng.screen_height();
-        let coord_x = (screen_w - eng.measure_text(&coord_text, coord_fs)) / 2;
+        let screen = (screen_w, screen_h);
 
         // Gather the other players to draw (camera-relative), projecting a head
         // point to screen space for the floating name tags.
         let peers = self.peer_draws(eng, &camera);
         let online = self.net.as_ref().map(|net| net.peers().count() + 1);
 
-        let mut f = eng.begin_frame(Color::SKYBLUE);
+        let mut f = eng.begin_frame(self.sky.clear());
 
         {
             let mut f3 = f.begin_3d(&camera);
+            self.sky.apply(&mut f3);
+            self.sky.draw(&mut f3);
             self.world.render(&mut f3, cam_pos);
-            // Other players: a body box and a small head, tinted per player.
-            // `peer.pos` is already camera-relative (see `peer_draws`).
+            // Other players: a six-box humanoid facing their travel/look
+            // direction, arms and legs swinging with their gait. `peer.feet` is
+            // already camera-relative (see `peer_draws`).
             for peer in &peers {
-                let body = (PEER_HALF * 2.0).as_vec3();
-                f3.draw_cube(peer.pos, body, peer.color);
-                f3.draw_cube_wires(peer.pos, body, Color::BLACK);
-                let head = peer.pos + Vec3::new(0.0, PEER_HALF.y as f32 + 0.2, 0.0);
-                f3.draw_cube(head, Vec3::splat(0.4), peer.color);
+                Pose::resolve(peer.feet, peer.yaw, peer.pitch, peer.phase, peer.amp)
+                    .draw(&mut f3, peer.color);
             }
         }
 
-        // Aiming crosshair at the screen centre.
-        let (cx, cy) = (screen_w / 2, screen_h / 2);
-        let cross = Color::new(255, 255, 255, 180);
-        f.draw_line(cx - 8, cy, cx + 8, cy, cross);
-        f.draw_line(cx, cy - 8, cx, cy + 8, cross);
+        let theme = &self.theme;
 
-        console::shadowed(&mut f, &coord_text, coord_x, 12, coord_fs, Color::WHITE);
-        f.draw_fps(10, 12);
-        console::shadowed(&mut f, HELP_TEXT, 10, 40, 16, Color::RAYWHITE);
+        // Reticle and world-space name tags: shown in every mode but fully-off.
+        if theme.hud.shows_world_ui() {
+            theme.crosshair.draw(&mut f, screen);
 
-        // Floating name tags over each visible player.
-        for peer in &peers {
-            if let Some(tag) = peer.tag {
-                let fs = 18;
-                let tw = f.measure_text(&peer.name, fs);
-                console::shadowed(
-                    &mut f,
-                    &peer.name,
-                    tag.x as i32 - tw / 2,
-                    tag.y as i32,
-                    fs,
-                    Color::WHITE,
-                );
+            // Floating name tags over each visible player.
+            for peer in &peers {
+                if let Some(tag) = peer.tag {
+                    let fs = theme.fs(18);
+                    let tw = f.measure_text(&peer.name, fs);
+                    console::shadowed(
+                        &mut f,
+                        &peer.name,
+                        tag.x as i32 - tw / 2,
+                        tag.y as i32,
+                        fs,
+                        theme.palette.text,
+                    );
+                }
             }
         }
-        if let Some(count) = online {
-            let text = format!("players online: {count}");
-            let w = f.measure_text(&text, 20);
-            console::shadowed(&mut f, &text, screen_w - w - 12, 12, 20, Color::LIME);
+
+        // Informational HUD text: coords, help, FPS, player count. Full mode only.
+        if theme.hud.shows_info() {
+            ui::label(&mut f, theme, screen, Anchor::Top, (0, 12), 26, theme.palette.text, &coord_text);
+            f.draw_fps(10, 12);
+            ui::label(&mut f, theme, screen, Anchor::TopLeft, (10, 40), 16, theme.palette.muted, HELP_TEXT);
+            if let Some(count) = online {
+                let text = format!("players online: {count}");
+                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 12), 20, theme.palette.good, &text);
+            }
         }
 
         // Enabled mods draw their HUD over the world, under the console.
-        mods.draw(&mut f, screen_w, screen_h);
+        mods.draw(&mut f, &self.world, screen_w, screen_h);
         self.console.draw(&mut f, screen_w, screen_h);
     }
 
     /// Build the per-frame draw data for other players, projecting a head point to
     /// screen space for the name tag (only for peers in front and within range).
     /// The in-front/range filters run in `f64`; the projection takes the
-    /// CAMERA-RELATIVE head with the origin-based camera, matching the scene.
+    /// camera-relative head with the origin-based camera, matching the scene.
     fn peer_draws(&self, eng: &Engine, camera: &Camera3D) -> Vec<PeerDraw> {
         let Some(net) = &self.net else { return Vec::new() };
         let eye = self.player.position;
         let forward = self.player.forward();
+        let now = Instant::now();
         net.peers()
             .map(|peer| {
-                let head = peer.pos + DVec3::new(0.0, PEER_HALF.y + 0.4, 0.0);
+                let r = peer.sample(now);
+                let head = r.pos + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
                 let to_head = head - eye;
                 let visible = to_head.dot(forward) > 0.0 && to_head.length() <= TAG_RANGE;
                 let tag = visible.then(|| eng.world_to_screen(to_head.as_vec3(), camera));
+                // Map horizontal speed to a swing amplitude: none when idle,
+                // saturating for a natural stride at walking pace.
+                let amp = (r.speed * 0.22).min(0.9);
                 PeerDraw {
-                    pos: (peer.pos - eye).as_vec3(),
+                    feet: (r.pos - eye).as_vec3(),
+                    yaw: r.yaw,
+                    pitch: r.pitch,
+                    phase: r.phase,
+                    amp,
                     color: peer_color(&peer.name),
                     name: peer.name.clone(),
                     tag,
@@ -426,9 +483,15 @@ impl Game {
 
 /// Everything needed to draw one other player this frame.
 struct PeerDraw {
-    /// Camera-relative position (world position minus the eye, subtracted in
-    /// f64, then narrowed) — safe to hand to the f32 immediate draws.
-    pos: Vec3,
+    /// Camera-relative feet position (world position minus the eye, subtracted
+    /// in f64, then narrowed) — safe to hand to the f32 immediate draws.
+    feet: Vec3,
+    /// Body facing and head look, interpolated from the network history.
+    yaw: f32,
+    pitch: f32,
+    /// Gait phase (radians) and speed-scaled swing amplitude.
+    phase: f32,
+    amp: f32,
     color: Color,
     name: String,
     /// Screen position for the name tag, or `None` when off-screen/behind us.
@@ -447,9 +510,6 @@ fn peer_color(name: &str) -> Color {
         Color::new(240, 150, 90, 255),
     ];
     // FNV-1a over the name, then index the palette.
-    let mut h: u32 = 2166136261;
-    for b in name.bytes() {
-        h = (h ^ b as u32).wrapping_mul(16777619);
-    }
+    let h = crate::hash::fnv1a_32(name.as_bytes());
     PALETTE[h as usize % PALETTE.len()]
 }

@@ -138,6 +138,10 @@ struct State {
     /// removed eagerly so churn can never leak keys.
     grid: HashMap<(i32, i32), Vec<u32>>,
     next_id: u32,
+    /// The shared world time as a `[0,1)` day fraction. Set by any client's
+    /// `/time`, echoed to everyone, and handed to each joiner so a session shares
+    /// one clock. The server does not itself advance it — clients tick locally.
+    day: f32,
 }
 
 impl State {
@@ -224,6 +228,7 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         players: HashMap::new(),
         grid: HashMap::new(),
         next_id: 1,
+        day: 0.3,
     }));
 
     #[cfg(test)]
@@ -342,10 +347,12 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     // one locked scope so the id, spawn, and roster it sees are all consistent.
     let id;
     let spawn;
+    let world_day;
     let existing: Vec<(u32, String, DVec3, f32, f32)>;
     let snapshot: Vec<(i32, i32, i32, String)>;
     {
         let mut state = shared.lock().unwrap();
+        world_day = state.day;
         if state.players.len() >= MAX_PLAYERS {
             drop(state);
             reject(&stream, "server full");
@@ -392,6 +399,8 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     for batch in snapshot.chunks(SNAPSHOT_BATCH) {
         send_blocking(&out, &ServerMessage::Snapshot { edits: batch.to_vec() });
     }
+    // Hand the newcomer the shared clock so their sky matches everyone else's.
+    send_blocking(&out, &ServerMessage::Time { day: world_day });
     for (pid, pname, ppos, pyaw, ppitch) in existing {
         send_blocking(&out, &ServerMessage::PeerJoined { id: pid, name: pname });
         send_blocking(
@@ -446,6 +455,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
             ClientMessage::Move { pos, yaw, pitch } => on_move(&shared, id, pos, yaw, pitch),
             ClientMessage::Edit { x, y, z, spec } => on_edit(&shared, id, x, y, z, &spec),
             ClientMessage::Chat { channel, text } => on_chat(&shared, id, channel, &text),
+            ClientMessage::SetTime { day } => on_set_time(&shared, day),
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
         }
     }
@@ -593,6 +603,19 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     });
 }
 
+/// Record and relay a `/time` change: store it as the shared clock so joiners
+/// inherit it, then echo it to everyone (the sender included, so all clocks agree).
+/// A non-finite value is ignored rather than poisoning the shared time.
+fn on_set_time(shared: &Arc<Mutex<State>>, day: f32) {
+    if !day.is_finite() {
+        return;
+    }
+    let day = day.rem_euclid(1.0);
+    let mut state = shared.lock().unwrap();
+    state.day = day;
+    broadcast(&mut state, &ServerMessage::Time { day }, |_, _| true);
+}
+
 /// Send one message to every player matching `want`, encoding it just once. Players
 /// whose queue is full are force-closed (they've fallen too far behind).
 fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandle) -> bool) {
@@ -650,14 +673,27 @@ fn reject(stream: &TcpStream, reason: &str) {
     println!("[x] rejected a connection: {reason}");
 }
 
-/// A spawn point just above the origin surface, scattered a little per id so players
-/// don't stack on the exact same block.
+/// A spawn point just above a dry-land surface near the origin, scattered a little
+/// per id so players don't stack on the exact same block. Scans outward for the
+/// first column above sea level so nobody spawns on the seabed.
 fn spawn_point(generator: &SineHills, id: u32) -> DVec3 {
     // A cheap deterministic scatter on a small grid around origin.
-    let x = (id % 8) as i32 - 3;
-    let z = ((id / 8) % 8) as i32 - 3;
-    let surface = generator.height(x, z);
-    DVec3::new(x as f64 + 0.5, surface as f64 + 3.0, z as f64 + 0.5)
+    let sx = (id % 8) as i32 - 3;
+    let sz = ((id / 8) % 8) as i32 - 3;
+    let sea = generator.sea_level();
+    // Spiral outward from the scattered start until a land column is found.
+    for r in 0..64 {
+        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
+            let (x, z) = (sx + dx * 8, sz + dz * 8);
+            let h = generator.height(x, z);
+            if h > sea {
+                return DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5);
+            }
+        }
+    }
+    // Fallback: sit on the water surface at the scattered origin.
+    let h = generator.height(sx, sz).max(sea);
+    DVec3::new(sx as f64 + 0.5, h as f64 + 3.0, sz as f64 + 0.5)
 }
 
 /// Current player count.
@@ -738,6 +774,7 @@ mod tests {
             players,
             grid: HashMap::new(),
             next_id: 2,
+            day: 0.3,
         }));
 
         on_edit(&shared, 1, 500, 20, 500, "air"); // far away: rejected
@@ -776,6 +813,7 @@ mod tests {
             players,
             grid: HashMap::new(),
             next_id: 2,
+            day: 0.3,
         }));
 
         // Out of reach: rejected, so nothing (not even an echo) is queued.
@@ -816,7 +854,7 @@ mod tests {
             },
         );
         let mut state =
-            State { edits: HashMap::new(), players, grid: HashMap::new(), next_id: 2 };
+            State { edits: HashMap::new(), players, grid: HashMap::new(), next_id: 2, day: 0.3 };
         state.grid_insert(1, start);
         assert_eq!(state.grid.get(&(0, 0)).map(Vec::len), Some(1));
         let shared = Arc::new(Mutex::new(state));
@@ -871,12 +909,12 @@ mod tests {
         a.send_move(far, 0.0, 0.0);
         thread::sleep(settle);
         b.poll();
-        let alice_as_seen = b.peers().next().unwrap();
+        let alice_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
         assert!(
-            alice_as_seen.pos.x < 100.0,
+            alice_as_seen.x < 100.0,
             "bob must not hear a move from {} units away (saw x={})",
             far.x,
-            alice_as_seen.pos.x
+            alice_as_seen.x
         );
 
         // Bob moves right next to alice: she is within range of his new position,
@@ -884,22 +922,22 @@ mod tests {
         b.send_move(DVec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0);
         thread::sleep(settle);
         a.poll();
-        let bob_as_seen = a.peers().next().unwrap();
+        let bob_as_seen = a.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
         assert!(
-            bob_as_seen.pos.x > 3900.0,
+            bob_as_seen.x > 3900.0,
             "alice should hear bob once adjacent (saw x={})",
-            bob_as_seen.pos.x
+            bob_as_seen.x
         );
 
         // And the reverse direction: bob's entry followed him too.
         a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0);
         thread::sleep(settle);
         b.poll();
-        let alice_as_seen = b.peers().next().unwrap();
+        let alice_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
         assert!(
-            alice_as_seen.pos.x > 3900.0,
+            alice_as_seen.x > 3900.0,
             "bob should hear alice once adjacent (saw x={})",
-            alice_as_seen.pos.x
+            alice_as_seen.x
         );
 
         handle.stop();

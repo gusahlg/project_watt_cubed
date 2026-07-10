@@ -25,12 +25,10 @@ pub fn craft_natural(registry: &mut BlockRegistry, elements: &[ElementId]) -> Op
     if let Some(existing) = registry.lookup(&composition) {
         return Some(existing);
     }
-    if registry.at_capacity() {
-        return None;
-    }
-    // `natural` auto-names by joining element names with "+" in the order given,
-    // which is now canonical (sorted, unique), and dedups the composition.
-    Some(registry.natural(&set))
+    // `natural` auto-names by joining element names with "+" (now sorted and
+    // deduped), dedups the composition, and returns `None` if the palette is
+    // at capacity.
+    registry.natural(&set)
 }
 
 #[cfg(test)]

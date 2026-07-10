@@ -37,7 +37,7 @@ pub fn build_block_textures(registry: &BlockRegistry) -> Vec<Vec<u8>> {
             if i == 0 {
                 vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
             } else {
-                layer_for(registry, BlockId(i as u16))
+                layer_for(registry, BlockId(i as u8))
             }
         })
         .collect()
@@ -81,8 +81,6 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
             let n = tile_noise(seed, x as f32 + 0.5, y as f32 + 0.5);
             let rgb = pick_color(&colors, &cuts, n);
             // ...and an uncorrelated per-texel hash speckles the brightness.
-            // (A pure per-texel hash has no spatial correlation, so the
-            // repeat seam is invisible by construction.)
             let jitter = 1.0 + (hash01(seed, JITTER_CHANNEL, x, y) * 2.0 - 1.0) * JITTER;
             for c in rgb {
                 out.push((c * jitter).clamp(0.0, 255.0).round() as u8);
@@ -93,41 +91,27 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
     out
 }
 
-/// The composition as `(element, fraction)` pairs: duplicates aggregated,
-/// fractions summing to 1, sorted by element id so the seed and the cutoff
-/// order are canonical. Natural blocks come out as equal fractions
-/// (`weights()` gives 1 per occurrence), mixtures as their percentages.
+/// The composition as `(element, fraction)` pairs: fractions summing to 1,
+/// sorted by element id so the seed and cutoff order are deterministic.
 fn parts(composition: &Composition) -> Vec<(ElementId, f32)> {
-    let mut acc: Vec<(ElementId, f32)> = Vec::new();
-    for &(e, w) in composition.weights().iter() {
-        match acc.iter_mut().find(|(id, _)| *id == e) {
-            Some(entry) => entry.1 += w as f32,
-            None => acc.push((e, w as f32)),
-        }
-    }
-    let total: f32 = acc.iter().map(|&(_, w)| w).sum();
-    if total > 0.0 {
-        for p in &mut acc {
-            p.1 /= total;
-        }
-    }
-    acc.sort_unstable_by_key(|&(e, _)| e);
-    acc
+    let weights = composition.weights();
+    let total = weights.total() as f32;
+    weights
+        .parts()
+        .iter()
+        .map(|&(e, w)| (e, if total > 0.0 { w as f32 / total } else { w as f32 }))
+        .collect()
 }
 
 /// FNV-1a over the sorted `(element id, whole percentage)` pairs. Composition
 /// -> seed, so identical materials look identical everywhere.
 fn seed_of(parts: &[(ElementId, f32)]) -> u32 {
-    const PRIME: u32 = 0x0100_0193;
-    let mut h: u32 = 0x811c_9dc5;
+    let mut bytes = Vec::with_capacity(parts.len() * 5);
     for &(e, frac) in parts {
-        for b in e.0.to_le_bytes() {
-            h = (h ^ b as u32).wrapping_mul(PRIME);
-        }
-        let pct = (frac * 100.0).round() as u8;
-        h = (h ^ pct as u32).wrapping_mul(PRIME);
+        bytes.extend_from_slice(&e.0.to_le_bytes());
+        bytes.push((frac * 100.0).round() as u8);
     }
-    h
+    crate::hash::fnv1a_32(&bytes)
 }
 
 /// Map a noise value through the cumulative element cutoffs. Inside an
@@ -228,7 +212,7 @@ mod tests {
     #[test]
     fn build_is_deterministic() {
         let mut reg = BlockRegistry::with_builtins();
-        reg.natural(&[El::Iron.id(), El::Sulfur.id()]);
+        reg.natural(&[El::Iron.id(), El::Sulfur.id()]).unwrap();
         let a = build_block_textures(&reg);
         let b = build_block_textures(&reg);
         assert_eq!(a, b, "two builds over the same palette are identical");
@@ -257,7 +241,7 @@ mod tests {
         // Stone (128,128,128) + Organic (86,176,0): gray texels have high
         // blue relative to organic's zero, green texels dominate in G.
         let mut reg = BlockRegistry::with_builtins();
-        let id = reg.natural(&[El::Stone.id(), El::Organic.id()]);
+        let id = reg.natural(&[El::Stone.id(), El::Organic.id()]).unwrap();
         let layers = build_block_textures(&reg);
         let layer = &layers[id.0 as usize];
 
@@ -298,15 +282,62 @@ mod tests {
     }
 
     #[test]
+    fn pick_color_is_continuous_across_a_cutoff() {
+        // Three distinct colours, one cutoff per colour (matches `layer_for`'s
+        // convention of forcing the last cutoff to 1.0). Check that a texel
+        // exactly on a cutoff sits at the midpoint, and that colors don't jump
+        // stepping across a cutoff.
+        let colors = [[0.0, 0.0, 0.0], [100.0, 100.0, 100.0], [200.0, 200.0, 200.0]];
+        let cuts = [0.5, 0.9, 1.0];
+        let eps = 1e-4;
+
+        // (a) exactly on the first cutoff: midpoint of colors[0] and colors[1].
+        let at_cutoff = pick_color(&colors, &cuts, cuts[0]);
+        for (c, want) in at_cutoff.iter().zip([50.0, 50.0, 50.0]) {
+            assert!((c - want).abs() < eps, "expected midpoint at cutoff, got {at_cutoff:?}");
+        }
+
+        // (b) no jump: sampling a few epsilons either side of each cutoff
+        // must differ by a tiny amount per channel, not a colour swap.
+        for &cut in &cuts {
+            let mut prev = pick_color(&colors, &cuts, cut - 4.0 * 1e-4);
+            for k in 1..=4 {
+                let d = 4.0 - k as f32;
+                let n = cut - d * 1e-4;
+                let cur = pick_color(&colors, &cuts, n);
+                for i in 0..3 {
+                    assert!(
+                        (cur[i] - prev[i]).abs() < 1.0,
+                        "discontinuity near cutoff {cut} at n={n}: {prev:?} -> {cur:?}"
+                    );
+                }
+                prev = cur;
+            }
+            let mut prev = pick_color(&colors, &cuts, cut + 1e-4);
+            for k in 2..=4 {
+                let n = cut + k as f32 * 1e-4;
+                let cur = pick_color(&colors, &cuts, n);
+                for i in 0..3 {
+                    assert!(
+                        (cur[i] - prev[i]).abs() < 1.0,
+                        "discontinuity near cutoff {cut} at n={n}: {prev:?} -> {cur:?}"
+                    );
+                }
+                prev = cur;
+            }
+        }
+    }
+
+    #[test]
     fn seed_depends_on_composition_not_registration_order() {
         // The same material registered in two registries (different ids if
         // other blocks landed first) must produce byte-identical layers.
         let mut reg_a = BlockRegistry::with_builtins();
-        let id_a = reg_a.natural(&[El::Copper.id(), El::Glass.id()]);
+        let id_a = reg_a.natural(&[El::Copper.id(), El::Glass.id()]).unwrap();
 
         let mut reg_b = BlockRegistry::with_builtins();
-        reg_b.natural(&[El::Sulfur.id()]); // shift subsequent ids
-        let id_b = reg_b.natural(&[El::Glass.id(), El::Copper.id()]); // order-independent
+        reg_b.natural(&[El::Sulfur.id()]).unwrap(); // shift subsequent ids
+        let id_b = reg_b.natural(&[El::Glass.id(), El::Copper.id()]).unwrap(); // order-independent
 
         assert_ne!(id_a, id_b, "test relies on differing ids");
         let layers_a = build_block_textures(&reg_a);

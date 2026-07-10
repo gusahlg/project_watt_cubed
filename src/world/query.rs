@@ -3,6 +3,7 @@
 //! these are `World` methods; the struct itself lives in `mod.rs`.
 
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
+use crate::coord::BlockCoord;
 use crate::math::{Aabb, block_coord};
 
 use super::chunk::CHUNK_SIZE;
@@ -35,15 +36,9 @@ impl World {
     /// outside the loaded region reads as [`AIR`] — Y is unbounded, so there
     /// is no world floor or ceiling anymore.
     pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
-        match self.chunks.get(&Self::chunk_of(x, y, z)) {
-            Some(loaded) => {
-                let s = CHUNK_SIZE as i32;
-                loaded.chunk.get_local(
-                    x.rem_euclid(s) as usize,
-                    y.rem_euclid(s) as usize,
-                    z.rem_euclid(s) as usize,
-                )
-            }
+        let (chunk, local) = BlockCoord::new(x, y, z).split();
+        match self.chunks.get(&chunk) {
+            Some(loaded) => loaded.chunk.get_local(local.lx(), local.ly(), local.lz()),
             None => AIR,
         }
     }
@@ -60,6 +55,10 @@ impl World {
     /// box touches (1–8 for anything player-sized) instead of one per cell,
     /// and a uniform chunk answers for all its cells with one solidity load.
     pub fn collides(&self, aabb: &Aabb) -> bool {
+        // TODO Stage 1: dedupe with Aabb::voxel_cells — this re-derives the same
+        // cell range but needs it grouped-by-chunk (one map probe per chunk),
+        // which voxel_cells' flat per-cell iterator doesn't provide; routing
+        // through it would change the iteration order/perf, so defer.
         // Same cell range as `Aabb::voxel_cells`: block_coord(min)..=block_coord(max)
         // (the shared clamped floor, so a box at the world border stays in i32).
         let (min, max) = (aabb.min(), aabb.max());
@@ -71,7 +70,7 @@ impl World {
         for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
             for cy in y0.div_euclid(s)..=y1.div_euclid(s) {
                 for cz in z0.div_euclid(s)..=z1.div_euclid(s) {
-                    let Some(loaded) = self.chunks.get(&(cx, cy, cz)) else {
+                    let Some(loaded) = self.chunks.get(&Coord::new(cx, cy, cz)) else {
                         continue; // unloaded chunks read as air
                     };
                     // Uniform chunks: one lookup answers every cell in the box.
@@ -85,12 +84,10 @@ impl World {
                     let ys = y0.max(cy * s)..=y1.min((cy + 1) * s - 1);
                     let zs = z0.max(cz * s)..=z1.min((cz + 1) * s - 1);
                     for x in xs {
-                        let lx = x.rem_euclid(s) as usize;
                         for z in zs.clone() {
-                            let lz = z.rem_euclid(s) as usize;
                             for y in ys.clone() {
-                                let ly = y.rem_euclid(s) as usize;
-                                let id = loaded.chunk.get_local(lx, ly, lz);
+                                let (_, local) = BlockCoord::new(x, y, z).split();
+                                let id = loaded.chunk.get_local(local.lx(), local.ly(), local.lz());
                                 if self.registry.is_solid(id) {
                                     return true;
                                 }
@@ -105,7 +102,8 @@ impl World {
 
     /// The chunk coordinate an absolute world position falls in.
     pub(in crate::world) fn chunk_of(x: i32, y: i32, z: i32) -> Coord {
-        let s = CHUNK_SIZE as i32;
-        (x.div_euclid(s), y.div_euclid(s), z.div_euclid(s))
+        // Single-sourced through the split iso in `coord.rs`, so the negative
+        // `div_euclid` semantics live in exactly one place.
+        BlockCoord::new(x, y, z).split().0
     }
 }

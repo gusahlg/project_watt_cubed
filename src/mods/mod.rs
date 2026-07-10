@@ -108,11 +108,6 @@ impl ElementStash {
         self.capacity
     }
 
-    /// Raise the capacity — the "very upgradeable over time" hook.
-    pub fn grow(&mut self, extra: usize) {
-        self.capacity += extra;
-    }
-
     /// The current content revision (see the field docs).
     pub fn rev(&self) -> u64 {
         self.rev
@@ -183,13 +178,15 @@ pub trait Mod {
     }
 
     /// Draw this mod's HUD while enabled, over the world and under the console.
-    fn draw(&mut self, f: &mut Frame, screen_w: i32, screen_h: i32) {
-        let _ = (f, screen_w, screen_h);
+    /// `world` gives read access to the registry so names can be resolved at draw
+    /// time rather than cached.
+    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
+        let _ = (f, world, screen_w, screen_h);
     }
 
     /// Whether this mod drives and draws the out-of-game menus. A separate
     /// discriminator so [`drive_menu`](Self::drive_menu) returning `None` keeps
-    /// meaning "no event this frame" rather than "not my job". The FIRST
+    /// meaning "no event this frame" rather than "not my job". The first
     /// enabled mod with `handles_menus()` owns both input and visuals, so the
     /// two can never split across mods.
     fn handles_menus(&self) -> bool {
@@ -199,7 +196,7 @@ pub trait Mod {
     /// Interpret one frame of menu input against `menu`: move its cursor, edit
     /// its text fields, and return at most one event. Only called on the mod
     /// that [`handles_menus`](Self::handles_menus). Must never interpret what
-    /// the entries MEAN — that stays with the core.
+    /// the entries mean — that stays with the core.
     fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
         let _ = (eng, menu);
         None
@@ -244,7 +241,7 @@ impl Mods {
     /// screen) first, then the bare-list inventory mod and the crafting mod,
     /// all enabled. Inventory and crafting share one [`ElementStash`] —
     /// inventory fills it from broken blocks, crafting spends it. Menus goes
-    /// FIRST so it wins the first-handler dispatch below by default.
+    /// first so it wins the first-handler dispatch below by default.
     pub fn with_defaults() -> Self {
         let mut mods = Self {
             entries: Vec::new(),
@@ -292,10 +289,10 @@ impl Mods {
     }
 
     /// Draw every enabled mod's HUD.
-    pub fn draw(&mut self, f: &mut Frame, screen_w: i32, screen_h: i32) {
+    pub fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
         for entry in &mut self.entries {
             if entry.enabled {
-                entry.module.draw(f, screen_w, screen_h);
+                entry.module.draw(f, world, screen_w, screen_h);
             }
         }
     }
@@ -309,7 +306,7 @@ impl Mods {
             .any(|e| e.enabled && e.module.handles_menus())
     }
 
-    /// Let the menu-handling mod interpret this frame's input. The FIRST
+    /// Let the menu-handling mod interpret this frame's input. The first
     /// enabled mod with [`Mod::handles_menus`] wins, in install order — the
     /// same one [`draw_menu`](Self::draw_menu) picks, so input and visuals
     /// always come from a single mod.

@@ -104,18 +104,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn looking_down_hits_the_ground() {
-        let world = World::generate();
-        // Start high above a known column and look straight down.
-        let origin = DVec3::new(8.5, 40.0, 8.5);
-        let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)
-            .expect("a downward ray should hit the terrain");
-        assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
-        // The cell just above the hit block is the empty one the ray last passed.
-        assert_eq!(hit.previous.1, hit.block.1 + 1);
-    }
-
-    #[test]
     fn previous_is_the_cell_above_when_looking_down() {
         let world = World::generate();
         let origin = DVec3::new(8.5, 40.0, 8.5);
@@ -147,10 +135,12 @@ mod tests {
             .expect("a downward ray should hit the terrain at 1e8");
         let (bx, by, bz) = hit.block;
         assert_eq!((bx, bz), (100_000_008, 8), "hits the column under the eye");
-        assert!(world.is_solid(bx, by, bz));
-        assert_eq!(by + 1, world.surface_y(bx, bz), "hits the surface block");
+        // The topmost solid of the column: terrain surface on land, or the water
+        // surface where the column is below sea level (water is a translucent solid).
+        assert!(world.is_solid(bx, by, bz), "hit is solid");
+        assert!(world.is_solid(bx, by - 1, bz), "and it is a real surface, not a floater");
         assert_eq!(hit.previous, (bx, by + 1, bz));
-        assert!(!world.is_solid(bx, by + 1, bz));
+        assert!(!world.is_solid(bx, by + 1, bz), "empty cell above the surface");
 
         // A slanted ray from the same eye still steps cell-exactly.
         let hit = raycast(&world, origin, DVec3::new(0.4, -1.0, 0.2), 60.0)

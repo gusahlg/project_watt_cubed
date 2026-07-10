@@ -9,8 +9,68 @@ use voxel_engine::{Camera3D, DVec3, Vec3};
 
 use crate::math::{Aabb, Bounded};
 
-/// Half the size of the player's collision box, measured from the eye position.
-pub const PLAYER_HALF: DVec3 = DVec3::new(0.3, 0.9, 0.3);
+/// The player's collision half-width on the horizontal axes (x and z). Vertical
+/// extent is not a constant — it derives from [`Stance::height`] — so there is no
+/// `y` here to fall out of sync with the stance.
+pub const PLAYER_HALF_WIDTH: f64 = 0.3;
+
+/// How tall the player stands and how high their eye sits, as a function of what
+/// they're doing. Geometry is a pure function of the stance — box height and eye
+/// height both derive from one [`height`](Stance::height), so there is no free
+/// float to drift and invalid heights are unrepresentable.
+///
+/// The eye is anchored to the *feet*, not to the box centre: [`eye_offset`] is the
+/// eye's height above the feet, fixed at 90% of the stance height so the eyes sit
+/// just below the crown. `Standing` is 1.8 tall; `Sneaking` shrinks the box *and*
+/// drops the eye proportionally, so crouching lowers both the head and the camera.
+///
+/// [`eye_offset`]: Stance::eye_offset
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Stance {
+    Standing,
+    Sneaking,
+}
+
+impl Stance {
+    /// Full standing (or crouching) height in blocks — the primitive from which
+    /// the box half-extent and eye height both derive, so they can't drift apart.
+    /// Sneaking lowers it.
+    pub fn height(self) -> f64 {
+        match self {
+            Stance::Standing => 1.8,
+            Stance::Sneaking => 1.5,
+        }
+    }
+
+    /// Eye height above the feet: 90% of the stance's full height, so the eyes sit
+    /// just below the crown and sneaking lowers the camera along with the box.
+    pub fn eye_offset(self) -> f64 {
+        self.height() * 0.9
+    }
+}
+
+/// How the player is moving through the world. A sum type instead of three loose
+/// fields (`velocity_y` / `on_ground` / `fly`) so the nonsense combinations —
+/// flying while grounded, flying with an accumulated fall velocity — are simply
+/// unrepresentable. Both variants carry a *full* velocity vector: walking drives
+/// `.xz` by inertia and `.y` by the gravity/jump integrator, flying drives all
+/// three toward a directly-commanded target.
+#[derive(Clone, Copy)]
+pub enum Motion {
+    /// On foot: subject to gravity, jumping, and ground contact.
+    Walking { velocity: DVec3, on_ground: bool },
+    /// Free flight: no gravity, no ground, velocity chases input on every axis.
+    Flying { velocity: DVec3 },
+}
+
+impl Motion {
+    /// The current velocity, whichever mode we're in.
+    pub fn velocity(self) -> DVec3 {
+        match self {
+            Motion::Walking { velocity, .. } | Motion::Flying { velocity } => velocity,
+        }
+    }
+}
 
 /// The player: where they are and where they're looking.
 pub struct Player {
@@ -20,12 +80,10 @@ pub struct Player {
     pub yaw: f32,
     /// Pitch in radians (up-down look), clamped by the look controller.
     pub pitch: f32,
-    /// Current vertical velocity, driven by gravity and jumping.
-    pub velocity_y: f64,
-    /// Whether the player is standing on solid ground this frame.
-    pub on_ground: bool,
-    /// When true, gravity is disabled and the player can move freely up/down.
-    pub fly: bool,
+    /// How the player is moving — walking (with gravity) or flying.
+    pub motion: Motion,
+    /// Standing or sneaking — drives the player's height and eye offset.
+    pub stance: Stance,
 }
 
 impl Player {
@@ -34,10 +92,51 @@ impl Player {
             position,
             yaw: 0.0,
             pitch: 0.0,
-            velocity_y: 0.0,
-            on_ground: false,
-            fly: false,
+            motion: Motion::Walking { velocity: DVec3::ZERO, on_ground: false },
+            stance: Stance::Standing,
         }
+    }
+
+    /// The player's current velocity.
+    pub fn velocity(&self) -> DVec3 {
+        self.motion.velocity()
+    }
+
+    /// Whether the player is standing on solid ground this frame (never while flying).
+    pub fn on_ground(&self) -> bool {
+        matches!(self.motion, Motion::Walking { on_ground: true, .. })
+    }
+
+    /// Whether the player is in free flight.
+    pub fn flying(&self) -> bool {
+        matches!(self.motion, Motion::Flying { .. })
+    }
+
+    /// Enter or leave flight. Horizontal momentum carries across the switch, but
+    /// vertical velocity is cleared so the player neither keeps falling into the
+    /// new mode nor launches when leaving it.
+    pub fn set_flying(&mut self, flying: bool) {
+        let v = self.velocity();
+        let velocity = DVec3::new(v.x, 0.0, v.z);
+        self.motion = if flying {
+            Motion::Flying { velocity }
+        } else {
+            Motion::Walking { velocity, on_ground: false }
+        };
+    }
+
+    /// Drop any accumulated vertical velocity (e.g. after a teleport, so the
+    /// player doesn't rocket down on arrival).
+    pub fn cancel_fall(&mut self) {
+        match &mut self.motion {
+            Motion::Walking { velocity, .. } | Motion::Flying { velocity } => velocity.y = 0.0,
+        }
+    }
+
+    /// The world-space height of the player's feet: the eye dropped by the
+    /// current stance's eye offset.
+    pub fn feet_y(&self) -> f64 {
+        self.position.y - self.stance.eye_offset()
     }
 
     /// Full view direction, including pitch. Built from `f64` trig of the
@@ -85,8 +184,25 @@ impl Player {
     }
 }
 
+/// The collision box for an eye at `eye` in the given `stance`. Built from the
+/// feet up, not the eye: the feet sit [`eye_offset`](Stance::eye_offset) below the
+/// eye, and the box rises the stance's full [`height`](Stance::height) from there,
+/// so a shorter (sneaking) box lowers both its top and — via the proportional eye
+/// offset — the eye itself.
+///
+/// Free-standing (not a `Player` method) so the collision stepper, which advances a
+/// bare eye position, can test candidate boxes without a whole `Player`.
+pub fn collision_box(eye: DVec3, stance: Stance) -> Aabb {
+    let half_y = stance.height() / 2.0;
+    let feet = eye.y - stance.eye_offset();
+    Aabb::new(
+        DVec3::new(eye.x, feet + half_y, eye.z),
+        DVec3::new(PLAYER_HALF_WIDTH, half_y, PLAYER_HALF_WIDTH),
+    )
+}
+
 impl Bounded for Player {
     fn aabb(&self) -> Aabb {
-        Aabb::new(self.position, PLAYER_HALF)
+        collision_box(self.position, self.stance)
     }
 }

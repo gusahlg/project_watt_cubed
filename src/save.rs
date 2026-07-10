@@ -107,7 +107,7 @@ pub fn save(name: &str, world: &World, player: &Player, mods: &Mods) -> io::Resu
     for v in [player.yaw, player.pitch] {
         w.write_all(&v.to_le_bytes())?;
     }
-    w.write_all(&[player.fly as u8])?;
+    w.write_all(&[player.flying() as u8])?;
 
     // Deduplicate specs into a first-seen-order table; edits reference it by index.
     let mut table: Vec<String> = Vec::new();
@@ -238,7 +238,7 @@ pub fn load(name: &str, mods: &mut Mods) -> io::Result<(World, Player)> {
     let mut player = Player::new(DVec3::new(r.f64()?, r.f64()?, r.f64()?));
     player.yaw = r.f32()?;
     player.pitch = r.f32()?;
-    player.fly = r.u8()? & 1 != 0;
+    player.set_flying(r.u8()? & 1 != 0);
 
     // Resolve each table spec to a block id once; edits then reuse the ids.
     let spec_count = r.u16()? as usize;
@@ -297,7 +297,7 @@ pub(crate) fn block_spec(world: &World, id: BlockId) -> String {
         }
         Composition::Mixture(mix) | Composition::Configuration { mix, .. } => {
             let parts: Vec<String> = mix
-                .0
+                .parts()
                 .iter()
                 .map(|&(e, pct)| format!("{}={}", elements.get(e).name, pct))
                 .collect();
@@ -371,7 +371,7 @@ mod tests {
         let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
         player.yaw = 0.5;
         player.pitch = -0.25;
-        player.fly = true;
+        player.set_flying(true);
 
         // Give the mods some state to persist (elements land in the inventory).
         let mut mods = Mods::with_defaults();
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(loaded_player.position, DVec3::new(1.0, 2.0, 3.0));
         assert_eq!(loaded_player.yaw, 0.5);
         assert_eq!(loaded_player.pitch, -0.25);
-        assert!(loaded_player.fly);
+        assert!(loaded_player.flying());
         assert_eq!(loaded_world.block_at(bx, by, bz), AIR, "broken block stays broken");
         assert_eq!(
             fresh_mods.save_states(&loaded_world),

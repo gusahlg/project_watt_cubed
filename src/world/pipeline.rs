@@ -29,23 +29,27 @@ use voxel_engine::MeshData;
 use super::Coord;
 use super::chunk::Chunk;
 use super::generation::SineHills;
-use super::mesh::{self, BorderPlanes};
-use crate::block::registry::BlockId;
+use super::light::PaddedLight;
+use super::lod::{self, Tile};
+use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
+use crate::block::registry::{BlockId, HotTables};
 
-/// Everything a mesh job needs, copied out of the world at enqueue time
-/// (at most ~7 KiB: a dense chunk's 4 KiB cells plus up to six 0.5 KiB border
-/// planes — a uniform chunk's clone is just its enum) so the worker shares no
-/// state with the live chunk map.
+/// Mesh job snapshot: pure mesher state (light pre-settled, no live chunk map sharing).
 pub struct ChunkSnapshot {
-    /// A clone of the chunk: its storage (uniform id or dense cells) and coords.
-    pub chunk: Chunk,
-    /// The six neighbour facing planes; a missing one reads as air.
-    pub borders: BorderPlanes,
-    /// The solidity table, shared by refcount. Palette growth swaps the
-    /// world's `Arc` for a new one while in-flight jobs keep the old — that is
+    /// The chunk's voxels plus a one-voxel shell from its 26 neighbours — the sole
+    /// voxel source for the mesh (it subsumes the chunk clone).
+    pub padded: Padded,
+    /// The chunk's uniform block id, if uniform — drives the mesher fast paths
+    /// (uniform air ⇒ empty, uniform solid ⇒ border slices only).
+    pub uniform: Option<BlockId>,
+    /// The settled light shell (this chunk's grid + its neighbours'), sampled per
+    /// vertex for smooth light across interior, border, and diagonal cells.
+    pub light: PaddedLight,
+    /// The hot tables (solid/opaque/emission), shared by refcount. Palette growth
+    /// swaps the world's `Arc` for a new one while in-flight jobs keep the old —
     /// harmless because the palette is append-only and every result is
     /// re-validated on arrival anyway.
-    pub solid: Arc<Vec<bool>>,
+    pub tables: Arc<HotTables>,
 }
 
 /// Work sent to the pool.
@@ -64,12 +68,17 @@ pub enum Job {
         rev: u32,
         snapshot: ChunkSnapshot,
     },
+    /// Build a far LOD tile's coarse mesh from its own generator clone (pure fn
+    /// of seed+coords — no snapshot, no rev). Carries the hot tables the greedy
+    /// mesher reads (solid/opaque), shared by refcount like a chunk snapshot's.
+    Tile { tile: Tile, generator: SineHills, tables: Arc<HotTables> },
 }
 
 /// Finished work returned to the main thread.
 pub enum Done {
     Chunk { coord: Coord, chunk: Chunk },
-    Mesh { coord: Coord, rev: u32, data: MeshData },
+    Mesh { coord: Coord, rev: u32, data: ChunkMeshData },
+    Tile { tile: Tile, data: MeshData },
 }
 
 /// The worker pool. Owned by the `World` and spawned lazily on the first
@@ -150,9 +159,7 @@ fn worker_loop(queue: &Mutex<Receiver<Job>>, done: &Sender<Done>) {
     }
 }
 
-/// Execute one job. Pure CPU on owned data; determinism with the synchronous
-/// paths is guaranteed by running the exact same code on the same inputs
-/// (`Chunk::new` + edit replay, `build_chunk_mesh_with`).
+/// Pure CPU on owned data (same code as sync paths for determinism).
 fn run(job: Job) -> Done {
     match job {
         Job::Generate {
@@ -160,7 +167,7 @@ fn run(job: Job) -> Done {
             generator,
             edits,
         } => {
-            let mut chunk = Chunk::new(coord.0, coord.1, coord.2, &generator);
+            let mut chunk = Chunk::new(coord.x, coord.y, coord.z, &generator);
             for (index, id) in edits {
                 chunk.set_index(index, id);
             }
@@ -171,9 +178,21 @@ fn run(job: Job) -> Done {
             rev,
             snapshot,
         } => {
-            let mut data = MeshData::default();
-            mesh::build_chunk_mesh_with(&snapshot.chunk, &snapshot.borders, &snapshot.solid, &mut data);
+            // Pure meshing: light was settled on the main thread and travels in
+            // the snapshot as a ready shell, so the worker only greedy-meshes.
+            let mut data = new_chunk_mesh_data();
+            mesh::build_chunk_mesh(
+                &snapshot.padded,
+                snapshot.uniform,
+                &snapshot.tables,
+                &snapshot.light,
+                &mut data,
+            );
             Done::Mesh { coord, rev, data }
+        }
+        Job::Tile { tile, generator, tables } => {
+            let data = lod::build_tile_mesh(tile, &generator, &tables);
+            Done::Tile { tile, data }
         }
     }
 }
@@ -182,8 +201,8 @@ fn run(job: Job) -> Done {
 mod tests {
     use super::*;
     use crate::block::registry::{AIR, BlockRegistry};
-    use crate::world::mesh::Neighbours;
     use std::time::Duration;
+    use voxel_engine::Pass;
 
     /// Mirrors `World::new`'s generator construction.
     fn generator(seed: i64) -> SineHills {
@@ -193,12 +212,12 @@ mod tests {
     #[test]
     fn worker_generation_matches_the_sync_path() {
         let generator = generator(42);
-        let coord = (3, 1, -2); // a ground chunk: y 16..=31 crosses the surface
+        let coord = Coord::new(3, 1, -2); // a ground chunk: y 16..=31 crosses the surface
         let edits = vec![
             (Chunk::index(1, 3, 2), AIR),         // dig a hole
             (Chunk::index(5, 14, 5), BlockId(1)), // place high in the chunk
         ];
-        let mut expected = Chunk::new(coord.0, coord.1, coord.2, &generator);
+        let mut expected = Chunk::new(coord.x, coord.y, coord.z, &generator);
         for &(index, id) in &edits {
             expected.set_index(index, id);
         }
@@ -227,45 +246,36 @@ mod tests {
         // The chunk holding the surface at the origin, with all six neighbours
         // (below: solid ground, above: sky, sides: more surface).
         let chunk = Chunk::new(0, 1, 0, &generator);
-        let (nx, px) = (Chunk::new(-1, 1, 0, &generator), Chunk::new(1, 1, 0, &generator));
-        let (nz, pz) = (Chunk::new(0, 1, -1, &generator), Chunk::new(0, 1, 1, &generator));
-        let (ny, py) = (Chunk::new(0, 0, 0, &generator), Chunk::new(0, 2, 0, &generator));
-        let neighbours = Neighbours {
-            neg_x: Some(&nx),
-            pos_x: Some(&px),
-            neg_z: Some(&nz),
-            pos_z: Some(&pz),
-            neg_y: Some(&ny),
-            pos_y: Some(&py),
+        // The 3x3x3 neighbourhood around it (only the 6 face-neighbours are
+        // interesting terrain here; the rest read as air, which is fine).
+        let neighbourhood = |dx: i32, dy: i32, dz: i32| Chunk::new(dx, 1 + dy, dz, &generator);
+        let neigh: Vec<Chunk> = (0..27)
+            .map(|k| neighbourhood(k % 3 - 1, k / 9 - 1, k / 3 % 3 - 1))
+            .collect();
+        let at = |dx: i32, dy: i32, dz: i32| -> Option<&Chunk> {
+            Some(&neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize])
         };
-        let solid: Arc<Vec<bool>> = Arc::new(
-            (0..registry.block_count())
-                .map(|i| registry.is_solid(BlockId(i as u16)))
-                .collect(),
-        );
+        let tables = Arc::new(registry.hot_tables());
+        let padded = Padded::capture(at);
+        let light = PaddedLight::full();
 
-        let mut expected = MeshData::default();
-        mesh::build_chunk_mesh(&chunk, &neighbours, &solid, &mut expected);
+        let mut expected = new_chunk_mesh_data();
+        mesh::build_chunk_mesh(&padded, None, &tables, &light, &mut expected);
         // The neighbours must actually matter, or equality proves nothing.
-        let alone = Neighbours {
-            neg_x: None,
-            pos_x: None,
-            neg_z: None,
-            pos_z: None,
-            neg_y: None,
-            pos_y: None,
-        };
-        let mut unculled = MeshData::default();
-        mesh::build_chunk_mesh(&chunk, &alone, &solid, &mut unculled);
-        assert_ne!(unculled.indices.len(), expected.indices.len(), "border culling engaged");
+        let mut unculled = new_chunk_mesh_data();
+        mesh::build_chunk_mesh(&Padded::capture(|dx, dy, dz| (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)), None, &tables, &light, &mut unculled);
+        let index_count =
+            |d: &ChunkMeshData| d[Pass::Opaque].buckets().iter().map(|b| b.len()).sum::<usize>();
+        assert_ne!(index_count(&unculled), index_count(&expected), "border culling engaged");
 
         let snapshot = ChunkSnapshot {
-            chunk: chunk.clone(),
-            borders: BorderPlanes::capture(&neighbours),
-            solid: Arc::clone(&solid),
+            padded: Padded::capture(at),
+            uniform: chunk.uniform(),
+            light: PaddedLight::full(),
+            tables: Arc::clone(&tables),
         };
         let workers = Workers::spawn(1);
-        assert!(workers.submit(Job::Mesh { coord: (0, 1, 0), rev: 7, snapshot }));
+        assert!(workers.submit(Job::Mesh { coord: Coord::new(0, 1, 0), rev: 7, snapshot }));
         let done = workers
             .results
             .recv_timeout(Duration::from_secs(10))
@@ -273,11 +283,10 @@ mod tests {
         let Done::Mesh { coord, rev, data } = done else {
             panic!("expected a mesh result");
         };
-        assert_eq!((coord, rev), ((0, 1, 0), 7));
-        assert_eq!(data.indices, expected.indices);
-        assert_eq!(data.vertices.len(), expected.vertices.len());
-        for (a, b) in data.vertices.iter().zip(expected.vertices.iter()) {
-            assert_eq!((a.pos, a.uv, a.color), (b.pos, b.uv, b.color));
+        assert_eq!((coord, rev), (Coord::new(0, 1, 0), 7));
+        for p in [Pass::Opaque, Pass::Transparent] {
+            assert_eq!(data[p].buckets(), expected[p].buckets());
+            assert_eq!(data[p].vertices(), expected[p].vertices(), "worker mesh matches sync");
         }
     }
 
@@ -291,7 +300,7 @@ mod tests {
             let workers = Workers::spawn(2);
             for i in 0..6 {
                 workers.submit(Job::Generate {
-                    coord: (i, 0, i),
+                    coord: Coord::new(i, 0, i),
                     generator: generator.clone(),
                     edits: Vec::new(),
                 });

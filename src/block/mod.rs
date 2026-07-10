@@ -12,6 +12,7 @@
 //! - [`reaction`] — emergent properties from element combinations.
 //! - [`registry`] — the [`BlockRegistry`], hot/cold split, and the crafting API.
 //! - [`crafting`] — canonicalised natural-tier crafting on top of the registry.
+pub mod bary;
 pub mod composition;
 pub mod crafting;
 pub mod derive;

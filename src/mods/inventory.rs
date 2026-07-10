@@ -35,13 +35,6 @@ pub struct InventoryMod {
     stash: Rc<RefCell<ElementStash>>,
     /// Whether the list is currently drawn (toggled with `I`).
     visible: bool,
-    /// Cached, pre-formatted "  {count}x {name}" rows for drawing, in the stash's
-    /// stable first-seen order. Rebuilt only when the stash's `rev` moves.
-    rows: Vec<String>,
-    /// Cached header ("Inventory used/capacity"), rebuilt with `rows`.
-    header: String,
-    /// The stash revision `rows` was built from; `u64::MAX` forces a first build.
-    seen_rev: u64,
     /// When a break last overflowed the stash (elements were destroyed), if
     /// within the warning window. Drives the HUD's "elements lost" warning.
     overflow_at: Option<Instant>,
@@ -52,34 +45,8 @@ impl InventoryMod {
         Self {
             stash,
             visible: true,
-            rows: Vec::new(),
-            header: format!("Inventory  0/{START_CAPACITY}"),
-            seen_rev: u64::MAX,
             overflow_at: None,
         }
-    }
-
-    /// Raise the capacity — the "very upgradeable over time" hook.
-    pub fn grow(&mut self, extra: usize) {
-        self.stash.borrow_mut().grow(extra);
-    }
-
-    /// Rebuild the cached rows if the stash changed since we last looked. Needs
-    /// the world only for element names, so callers with registry access (update,
-    /// break events, load) refresh; draw just uses the cache. Crafting-side spends
-    /// therefore show up on the next frame's update — imperceptible.
-    fn refresh_rows(&mut self, world: &World) {
-        let stash = self.stash.borrow();
-        if stash.rev() == self.seen_rev {
-            return;
-        }
-        let elements = world.registry().elements();
-        self.rows = stash
-            .iter()
-            .map(|(element, count)| format!("  {count}x {}", elements.get(element).name))
-            .collect();
-        self.header = format!("Inventory  {}/{}", stash.total(), stash.capacity());
-        self.seen_rev = stash.rev();
     }
 }
 
@@ -97,19 +64,15 @@ impl Mod for InventoryMod {
         if !ctx.capturing_text && eng.is_key_pressed(Key::I) {
             self.visible = !self.visible;
         }
-        self.refresh_rows(ctx.world);
     }
 
     fn reset(&mut self) {
         self.stash.borrow_mut().clear();
         self.visible = false;
-        self.rows.clear();
         self.overflow_at = None;
-        // Force a rebuild against the cleared stash on the next update.
-        self.seen_rev = u64::MAX;
     }
 
-    fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
+    fn on_block_break(&mut self, elements: &[ElementId], _world: &World) {
         // A broken block hands back its elements — each becomes one held unit.
         // `add` is per-element best-effort: a full stash drops the overflow on
         // the floor of the void, so arm the HUD warning — silently destroying
@@ -117,10 +80,9 @@ impl Mod for InventoryMod {
         if !self.stash.borrow_mut().add(elements) {
             self.overflow_at = Some(Instant::now());
         }
-        self.refresh_rows(world);
     }
 
-    fn draw(&mut self, f: &mut Frame, screen_w: i32, _screen_h: i32) {
+    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, _screen_h: i32) {
         let fs = 18;
         let line_h = fs + 4;
         let x = screen_w - 230;
@@ -141,17 +103,22 @@ impl Mod for InventoryMod {
             return;
         }
 
-        shadowed(f, &self.header, x, y, fs, Color::GOLD);
+        let stash = self.stash.borrow();
+        let elements = world.registry().elements();
+
+        let header = format!("Inventory  {}/{}", stash.total(), stash.capacity());
+        shadowed(f, &header, x, y, fs, Color::GOLD);
         y += line_h + 2;
 
-        if self.rows.is_empty() {
+        if stash.total() == 0 {
             shadowed(f, "  (empty) break blocks", x, y, fs, Color::RAYWHITE);
             return;
         }
 
         // Cap the visible rows so a full inventory doesn't run off-screen.
-        for row in self.rows.iter().take(14) {
-            shadowed(f, row, x, y, fs, Color::RAYWHITE);
+        for (element, count) in stash.iter().take(14) {
+            let row = format!("  {count}x {}", elements.get(element).name);
+            shadowed(f, &row, x, y, fs, Color::RAYWHITE);
             y += line_h;
         }
     }
@@ -181,7 +148,6 @@ impl Mod for InventoryMod {
                 }
             }
         }
-        self.refresh_rows(world);
     }
 }
 

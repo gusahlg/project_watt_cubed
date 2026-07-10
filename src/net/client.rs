@@ -27,12 +27,80 @@ const MOVE_INTERVAL: Duration = Duration::from_millis(33);
 /// the server's idle timeout never reaps an active-but-idle player.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
-/// Another player as this client last heard about them — enough to draw them.
+/// A gait cycle advances this many radians per world unit of horizontal travel,
+/// so limbs swing at a natural cadence tied to distance rather than frame rate.
+const STRIDE_FREQ: f64 = 4.5;
+
+/// One network state of a peer, snapshotted so we can interpolate between two.
+#[derive(Clone, Copy)]
+struct Snapshot {
+    pos: DVec3,
+    yaw: f32,
+    pitch: f32,
+}
+
+/// Another player as this client last heard about them, with just enough motion
+/// history to interpolate smoothly and drive a walk cycle.
 pub struct RemotePlayer {
     pub name: String,
+    prev: Snapshot,
+    target: Snapshot,
+    recv_at: Instant,
+    interval: Duration,
+    distance: f64,
+}
+
+/// Sampled render state at a point in time: an interpolated pose plus the derived
+/// horizontal speed and gait phase.
+pub struct Rendered {
     pub pos: DVec3,
     pub yaw: f32,
     pub pitch: f32,
+    pub speed: f32,
+    pub phase: f32,
+}
+
+impl RemotePlayer {
+    /// Interpolate this peer's pose at `now`, clamped to the latest packet (no
+    /// extrapolation), and report speed/phase for the walk animation.
+    pub fn sample(&self, now: Instant) -> Rendered {
+        let secs = self.interval.as_secs_f64();
+        let alpha = if secs > 0.0 {
+            (now.duration_since(self.recv_at).as_secs_f64() / secs).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let pos = self.prev.pos + (self.target.pos - self.prev.pos) * alpha;
+        let yaw = lerp_angle(self.prev.yaw, self.target.yaw, alpha as f32);
+        let pitch = self.prev.pitch + (self.target.pitch - self.prev.pitch) * alpha as f32;
+        let speed = if secs > 0.0 {
+            (horizontal(self.prev.pos, self.target.pos) / secs) as f32
+        } else {
+            0.0
+        };
+        Rendered {
+            pos,
+            yaw,
+            pitch,
+            speed,
+            phase: (self.distance * STRIDE_FREQ) as f32,
+        }
+    }
+}
+
+/// Horizontal (xz-only) distance between two world positions; jumping/falling on
+/// `pos.y` must not drive the gait.
+fn horizontal(a: DVec3, b: DVec3) -> f64 {
+    let (dx, dz) = (b.x - a.x, b.z - a.z);
+    (dx * dx + dz * dz).sqrt()
+}
+
+/// Shortest-arc angular lerp: wrap `b - a` into `[-π, π]` so a turn across the
+/// ±π seam takes the short way round instead of spinning the body.
+fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let delta = (b - a + PI).rem_euclid(TAU) - PI;
+    a + delta * t
 }
 
 /// Something from the server the game must act on. Peer presence and movement are
@@ -42,6 +110,8 @@ pub enum Incoming {
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line to show in the console.
     Chat { from_name: String, channel: u8, text: String },
+    /// The shared world time changed; `day` is a `[0,1)` fraction.
+    Time { day: f32 },
     /// The server dropped us; the game should leave the world.
     Disconnected,
 }
@@ -179,12 +249,18 @@ impl Connection {
             ServerMessage::Chat { from_name, channel, text, .. } => {
                 out.push(Incoming::Chat { from_name, channel, text })
             }
+            ServerMessage::Time { day } => out.push(Incoming::Time { day }),
             ServerMessage::PeerJoined { id, name } => {
+                // prev == target on join: speed 0 and a stationary phase, no
+                // Option<history> and no special-casing downstream.
+                let spawn = Snapshot { pos: self.spawn, yaw: 0.0, pitch: 0.0 };
                 self.peers.entry(id).or_insert(RemotePlayer {
                     name,
-                    pos: DVec3::ZERO,
-                    yaw: 0.0,
-                    pitch: 0.0,
+                    prev: spawn,
+                    target: spawn,
+                    recv_at: Instant::now(),
+                    interval: Duration::from_millis(0),
+                    distance: 0.0,
                 });
             }
             ServerMessage::PeerLeft { id } => {
@@ -192,9 +268,11 @@ impl Connection {
             }
             ServerMessage::PeerMove { id, pos, yaw, pitch } => {
                 if let Some(p) = self.peers.get_mut(&id) {
-                    p.pos = pos;
-                    p.yaw = yaw;
-                    p.pitch = pitch;
+                    p.interval = p.recv_at.elapsed();
+                    p.prev = p.target;
+                    p.target = Snapshot { pos, yaw, pitch };
+                    p.recv_at = Instant::now();
+                    p.distance += horizontal(p.prev.pos, p.target.pos);
                 }
             }
             ServerMessage::Reject { reason: _ } => {
@@ -235,6 +313,11 @@ impl Connection {
     pub fn send_chat(&mut self, channel: u8, text: String) {
         let text: String = text.chars().take(MAX_CHAT).collect();
         self.dispatch(&ClientMessage::Chat { channel, text });
+    }
+
+    /// Tell the server the player set the world time (via `/time`).
+    pub fn send_set_time(&mut self, day: f32) {
+        self.dispatch(&ClientMessage::SetTime { day });
     }
 
     /// Write one message, marking the connection dead if the socket errors.

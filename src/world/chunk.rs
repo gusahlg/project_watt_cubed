@@ -52,12 +52,24 @@ impl Chunk {
         }
     }
 
-    /// Flat array index of a chunk-local coordinate: `x + z*16 + y*256`.
+    /// Build a uniform chunk of one block — for tests that place voxels by hand.
+    #[cfg(test)]
+    pub fn from_uniform(cx: i32, cy: i32, cz: i32, id: BlockId) -> Self {
+        Self { cx, cy, cz, data: ChunkData::Uniform(id) }
+    }
+
+    /// Build a dense chunk from a raw cell array — for tests.
+    #[cfg(test)]
+    pub fn from_dense(cx: i32, cy: i32, cz: i32, cells: Box<[u8; CHUNK_VOLUME]>) -> Self {
+        Self { cx, cy, cz, data: ChunkData::Dense(cells) }
+    }
+
+    /// Flat index of chunk-local coord (x + z*16 + y*256).
     pub const fn index(x: usize, y: usize, z: usize) -> usize {
         x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE
     }
 
-    /// The chunk-local coordinate a flat index maps back to (inverse of [`index`]).
+    /// Chunk-local coord from flat index (inverse of index()).
     pub const fn local_of(index: usize) -> (usize, usize, usize) {
         let x = index % CHUNK_SIZE;
         let z = (index / CHUNK_SIZE) % CHUNK_SIZE;
@@ -85,7 +97,7 @@ impl Chunk {
     pub fn get_index(&self, index: usize) -> BlockId {
         match &self.data {
             ChunkData::Uniform(id) => *id,
-            ChunkData::Dense(cells) => BlockId(cells[index] as u16),
+            ChunkData::Dense(cells) => BlockId(cells[index]),
         }
     }
 
@@ -100,21 +112,28 @@ impl Chunk {
         self.set_index(Self::index(x, y, z), v);
     }
 
-    /// Overwrite a voxel by flat index — used to replay saved/broken-block
-    /// edits. The first write that differs from a uniform chunk's block
-    /// promotes it to dense storage; a matching write stays uniform for free.
+    /// Write voxel by flat index (replay saved/broken-block edits).
+    /// First differing write promotes uniform → dense; matching write stays uniform.
+    /// Dense chunk holding single id collapses back to Uniform (edit-revert), reclaiming 4 KiB.
     pub fn set_index(&mut self, index: usize, v: BlockId) {
-        debug_assert!(v.0 < 256, "dense cells are u8: palette must stay under 256");
         match &mut self.data {
             ChunkData::Uniform(id) => {
                 if *id == v {
                     return;
                 }
-                let mut cells = Box::new([id.0 as u8; CHUNK_VOLUME]);
-                cells[index] = v.0 as u8;
+                let mut cells = Box::new([id.0; CHUNK_VOLUME]);
+                cells[index] = v.0;
                 self.data = ChunkData::Dense(cells);
             }
-            ChunkData::Dense(cells) => cells[index] = v.0 as u8,
+            ChunkData::Dense(cells) => {
+                cells[index] = v.0;
+                // Only the just-written value can be the new uniform fill, so
+                // scan only when it could have unified the chunk — the common
+                // edit keeps a chunk mixed and never scans.
+                if v.0 == cells[0] && cells.iter().all(|&c| c == v.0) {
+                    self.data = ChunkData::Uniform(v);
+                }
+            }
         }
     }
 }
@@ -173,6 +192,31 @@ mod tests {
         assert_eq!(chunk.get_local(8, 8, 8), AIR);
         assert_eq!(chunk.get_local(0, 0, 0), stone);
         assert_eq!(chunk.get_local(15, 15, 15), stone);
+    }
+
+    #[test]
+    fn dense_chunk_recompacts_to_uniform_when_edited_back() {
+        let (g, stone, _) = hills(7);
+        let mut chunk = (0..64)
+            .map(|cz| Chunk::new(0, -10, cz, &g))
+            .find(|c| c.uniform() == Some(stone))
+            .expect("a cave-free deep chunk within 64 along +z");
+
+        // Dig a hole: promotes to dense.
+        chunk.set_local(8, 8, 8, AIR);
+        assert!(chunk.uniform().is_none(), "hole makes it dense");
+
+        // Fill it back with the original id: the chunk is one id again and
+        // must reclaim the array instead of staying dense forever.
+        chunk.set_local(8, 8, 8, stone);
+        assert_eq!(chunk.uniform(), Some(stone), "edit-and-revert collapses to uniform");
+
+        // A chunk left genuinely mixed must NOT collapse.
+        chunk.set_local(1, 1, 1, AIR);
+        chunk.set_local(2, 2, 2, AIR);
+        chunk.set_local(1, 1, 1, stone); // one hole remains at (2,2,2)
+        assert!(chunk.uniform().is_none(), "still-mixed chunk stays dense");
+        assert_eq!(chunk.get_local(2, 2, 2), AIR);
     }
 
     #[test]

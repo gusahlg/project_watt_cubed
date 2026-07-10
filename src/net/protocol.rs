@@ -27,6 +27,8 @@ pub enum ClientMessage {
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line on the given [`channel`](super::chat).
     Chat { channel: u8, text: String },
+    /// The player set the world time (via `/time`); `day` is a `[0,1)` fraction.
+    SetTime { day: f32 },
 }
 
 /// A message from the server to a client.
@@ -49,6 +51,9 @@ pub enum ServerMessage {
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line to display.
     Chat { from_id: u32, from_name: String, channel: u8, text: String },
+    /// The shared world time changed (a peer's `/time`, or the current value sent
+    /// to a joiner); `day` is a `[0,1)` fraction.
+    Time { day: f32 },
 }
 
 // Message type tags. Client and server tag spaces are independent.
@@ -57,6 +62,7 @@ mod tag {
     pub const MOVE: u8 = 1;
     pub const EDIT: u8 = 2;
     pub const CHAT: u8 = 3;
+    pub const SET_TIME: u8 = 4;
 
     pub const WELCOME: u8 = 0;
     pub const REJECT: u8 = 1;
@@ -66,6 +72,7 @@ mod tag {
     pub const PEER_MOVE: u8 = 5;
     pub const S_EDIT: u8 = 6;
     pub const S_CHAT: u8 = 7;
+    pub const S_TIME: u8 = 8;
 }
 
 impl ClientMessage {
@@ -97,6 +104,10 @@ impl ClientMessage {
                 w.u8(*channel);
                 w.str(text);
             }
+            ClientMessage::SetTime { day } => {
+                w.u8(tag::SET_TIME);
+                w.f32(*day);
+            }
         }
         w.into_inner()
     }
@@ -125,6 +136,7 @@ impl ClientMessage {
                 channel: r.u8()?,
                 text: r.str()?,
             },
+            tag::SET_TIME => ClientMessage::SetTime { day: r.f32()? },
             _ => return None,
         })
     }
@@ -185,6 +197,10 @@ impl ServerMessage {
                 w.u8(*channel);
                 w.str(text);
             }
+            ServerMessage::Time { day } => {
+                w.u8(tag::S_TIME);
+                w.f32(*day);
+            }
         }
         w.into_inner()
     }
@@ -230,6 +246,7 @@ impl ServerMessage {
                 channel: r.u8()?,
                 text: r.str()?,
             },
+            tag::S_TIME => ServerMessage::Time { day: r.f32()? },
             _ => return None,
         })
     }
@@ -372,6 +389,7 @@ mod tests {
             },
             ClientMessage::Edit { x: -4, y: 7, z: 900, spec: "natural:Stone".into() },
             ClientMessage::Chat { channel: 1, text: "hello world".into() },
+            ClientMessage::SetTime { day: 0.5 },
         ];
         for msg in cases {
             assert_eq!(ClientMessage::decode(&msg.encode()), Some(msg));
@@ -408,6 +426,7 @@ mod tests {
                 channel: 0,
                 text: "hi".into(),
             },
+            ServerMessage::Time { day: 0.75 },
         ];
         for msg in cases {
             assert_eq!(ServerMessage::decode(&msg.encode()), Some(msg));

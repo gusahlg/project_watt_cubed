@@ -12,14 +12,23 @@
 use voxel_engine::{DVec3, Engine, Key};
 
 use crate::macros::axis;
-use crate::math::{Aabb, WORLD_BORDER};
-use crate::player::{PLAYER_HALF, Player};
+use crate::math::WORLD_BORDER;
+use crate::player::{Motion, Player, Stance, collision_box};
 use crate::world::World;
 
 const WALK_SPEED: f64 = 6.0; // units / second on the ground
+const SPRINT_MULT: f64 = 1.5; // horizontal speed multiplier while sprinting
 const FLY_SPEED: f64 = 14.0; // units / second while flying
 const GRAVITY: f64 = 24.0; // units / second^2
 const JUMP_SPEED: f64 = 8.5; // initial upward velocity of a jump
+/// Velocity-approach rates (units / second of exponential response). Acceleration,
+/// braking, friction, and sprint transitions are all the *same* operation — velocity
+/// chasing a target — so a single rate per context is the only knob. A high ground
+/// rate keeps control snappy; a low air rate leaves a jump mostly ballistic with a
+/// little steer; flying sits in between for responsive free movement.
+const GROUND_ACCEL: f64 = 14.0;
+const AIR_ACCEL: f64 = 2.0;
+const FLY_ACCEL: f64 = 8.0;
 /// Fastest fall, units / second. Reached only after ~2.5 s of freefall
 /// (`GRAVITY * 2.5 = 60`) — far past any normal jump arc (which peaks well
 /// under a second), so jump and short-fall feel are unchanged. Its real job is
@@ -44,6 +53,12 @@ pub struct MoveInput {
     up_down: AxisY,
     jump: bool,
     toggle_fly: bool,
+    /// Held: move horizontally faster on the ground.
+    sprint: bool,
+    /// Held: crouch to the shorter (sneaking) hitbox. `LeftShift` overloads with
+    /// [`AxisY::Down`] — but that only descends while flying, so the two never
+    /// fire in the same mode.
+    sneak: bool,
 }
 
 impl MoveInput {
@@ -55,6 +70,8 @@ impl MoveInput {
             up_down: AxisY::sample(eng),
             jump: eng.is_key_down(Key::Space),
             toggle_fly: eng.is_key_pressed(Key::F),
+            sprint: eng.is_key_down(Key::LeftControl),
+            sneak: eng.is_key_down(Key::LeftShift),
         }
     }
 }
@@ -65,48 +82,91 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
     // The one f32 -> f64 physics boundary (see the module docs).
     let dt = dt as f64;
 
-    // Toggling fly clears vertical velocity so you neither keep falling into the
-    // new mode nor launch when you leave it.
     if input.toggle_fly {
-        player.fly = !player.fly;
-        player.velocity_y = 0.0;
+        player.set_flying(!player.flying());
     }
 
-    let mut delta = DVec3::ZERO;
+    resolve_stance(player, world, input);
 
-    // Horizontal movement is shared by both modes, but only worth computing when
-    // a key is actually held — otherwise we'd run the yaw trig, a normalize, and
-    // a scale every frame just to add a zero vector.
-    if input.forward_back.is_active() || input.left_right.is_active() {
-        let (forward, right) = player.movement_basis();
-        let mut direction = forward * input.forward_back.signum() as f64
-            + right * input.left_right.signum() as f64;
+    // Unit horizontal heading from the movement keys (zero when none held); each
+    // mode scales it by its own speed.
+    let heading = horizontal_heading(player, input);
 
-        // `forward` and `right` are already unit length, so a single axis needs
-        // no normalize. Only a diagonal (both axes active) would otherwise move
-        // sqrt(2) too fast, so that's the only case we pay for the sqrt.
-        if input.forward_back.is_active() && input.left_right.is_active() {
-            direction = direction.normalize();
+    let delta = match &mut player.motion {
+        // Flying: velocity chases a directly-commanded target on all three axes.
+        Motion::Flying { velocity } => {
+            let target = heading * FLY_SPEED + DVec3::Y * (input.up_down.signum() as f64 * FLY_SPEED);
+            *velocity = approach(*velocity, target, FLY_ACCEL, dt);
+            *velocity * dt
         }
+        // Walking: horizontal velocity chases the target (snappier on the ground
+        // than in the air); vertical stays the gravity/jump integrator.
+        Motion::Walking { velocity, on_ground } => {
+            let ground_speed = if input.sprint { WALK_SPEED * SPRINT_MULT } else { WALK_SPEED };
+            let target = heading * ground_speed;
+            let rate = if *on_ground { GROUND_ACCEL } else { AIR_ACCEL };
+            let horiz = approach(DVec3::new(velocity.x, 0.0, velocity.z), target, rate, dt);
+            velocity.x = horiz.x;
+            velocity.z = horiz.z;
 
-        let speed = if player.fly { FLY_SPEED } else { WALK_SPEED };
-        delta = direction * (speed * dt);
-    }
-
-    // Vertical movement is mode-specific, so each branch only runs its own work:
-    // flying skips gravity and jumping entirely; walking skips the fly controls.
-    if player.fly {
-        delta.y = input.up_down.signum() as f64 * FLY_SPEED * dt;
-    } else {
-        // Apply the jump before deriving delta.y so it takes effect this frame.
-        if input.jump && player.on_ground {
-            player.velocity_y = JUMP_SPEED;
+            // Apply the jump before integrating so it takes effect this frame.
+            if input.jump && *on_ground {
+                velocity.y = JUMP_SPEED;
+            }
+            velocity.y = (velocity.y - GRAVITY * dt).max(TERMINAL_VELOCITY);
+            *velocity * dt
         }
-        player.velocity_y = (player.velocity_y - GRAVITY * dt).max(TERMINAL_VELOCITY);
-        delta.y = player.velocity_y * dt;
-    }
+    };
 
     move_with_collision(player, world, delta);
+}
+
+/// The unit-length horizontal movement direction for this frame, or zero when no
+/// movement key is held. Computed only when a key is active — otherwise we'd run
+/// the yaw trig, a normalize, and a scale just to produce a zero vector.
+fn horizontal_heading(player: &Player, input: &MoveInput) -> DVec3 {
+    if !(input.forward_back.is_active() || input.left_right.is_active()) {
+        return DVec3::ZERO;
+    }
+    let (forward, right) = player.movement_basis();
+    let direction =
+        forward * input.forward_back.signum() as f64 + right * input.left_right.signum() as f64;
+
+    // `forward` and `right` are already unit length, so a single axis needs no
+    // normalize. Only a diagonal (both axes active) would otherwise move sqrt(2)
+    // too fast, so that's the only case we pay for the sqrt.
+    if input.forward_back.is_active() && input.left_right.is_active() {
+        direction.normalize()
+    } else {
+        direction
+    }
+}
+
+/// Move `current` velocity toward `target` by an exponential, frame-rate-correct
+/// step: over `dt` seconds it closes `1 - e^(-rate·dt)` of the gap. One law covers
+/// acceleration (target away from zero), braking/friction (target zero), and every
+/// speed change in between — no separate accel/decel clamps.
+fn approach(current: DVec3, target: DVec3, rate: f64, dt: f64) -> DVec3 {
+    let blend = 1.0 - (-rate * dt).exp();
+    current + (target - current) * blend
+}
+
+/// Update the player's [`Stance`] from the sneak key. Crouching down is always
+/// possible (the box only shrinks); standing back up needs headroom, so it's
+/// refused while a solid cell occupies the taller box — otherwise the player would
+/// grow into the ceiling. Sneaking is a walking-only stance: flying uses `LeftShift`
+/// to descend, so it never crouches.
+fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
+    let want_sneak = input.sneak && !player.flying();
+    player.stance = match (player.stance, want_sneak) {
+        (Stance::Standing, true) => Stance::Sneaking,
+        (Stance::Sneaking, false)
+            if !world.collides(&collision_box(player.position, Stance::Standing)) =>
+        {
+            Stance::Standing
+        }
+        (current, _) => current,
+    };
 }
 
 /// Apply `delta` one axis at a time so the player slides along walls instead of
@@ -125,20 +185,40 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
 /// at the last collision-free substep.
 fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
     let mut pos = player.position;
+    let stance = player.stance;
 
-    step_axis(&mut pos, 0, delta.x, world);
-    step_axis(&mut pos, 2, delta.z, world);
-
-    // Landing on something while moving down means we're grounded.
-    player.on_ground = false;
-    if step_axis(&mut pos, 1, delta.y, world) {
-        if delta.y < 0.0 {
-            player.on_ground = true;
-        }
-        player.velocity_y = 0.0;
-    }
-
+    let blocked_x = step_axis(&mut pos, 0, delta.x, world, stance);
+    let blocked_z = step_axis(&mut pos, 2, delta.z, world, stance);
+    let blocked_y = step_axis(&mut pos, 1, delta.y, world, stance);
     player.position = pos;
+
+    // A velocity component that ran into geometry is spent — zero it so the player
+    // doesn't accumulate speed into a wall. Landing (a downward y block) grounds us.
+    match &mut player.motion {
+        Motion::Flying { velocity } => {
+            if blocked_x {
+                velocity.x = 0.0;
+            }
+            if blocked_y {
+                velocity.y = 0.0;
+            }
+            if blocked_z {
+                velocity.z = 0.0;
+            }
+        }
+        Motion::Walking { velocity, on_ground } => {
+            if blocked_x {
+                velocity.x = 0.0;
+            }
+            if blocked_z {
+                velocity.z = 0.0;
+            }
+            *on_ground = blocked_y && delta.y < 0.0;
+            if blocked_y {
+                velocity.y = 0.0;
+            }
+        }
+    }
 }
 
 /// Move `pos` along one `axis` (0 = x, 1 = y, 2 = z) by `delta`, clamping to
@@ -153,14 +233,14 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
 /// game's 0.1 s dt clamp) so no solid cell thicker than half a block can be
 /// jumped over. The final substep lands exactly on the single-step endpoint, so
 /// an unobstructed move is identical either way.
-fn step_axis(pos: &mut DVec3, axis: usize, delta: f64, world: &World) -> bool {
+fn step_axis(pos: &mut DVec3, axis: usize, delta: f64, world: &World, stance: Stance) -> bool {
     let start = pos[axis];
 
     // Fast path: the common per-frame case, identical to the pre-substepping
     // behavior.
     if delta.abs() <= MAX_COLLISION_STEP {
         pos[axis] = (start + delta).clamp(-WORLD_BORDER, WORLD_BORDER);
-        if world.collides(&Aabb::new(*pos, PLAYER_HALF)) {
+        if world.collides(&collision_box(*pos, stance)) {
             pos[axis] = start;
             return true;
         }
@@ -177,7 +257,7 @@ fn step_axis(pos: &mut DVec3, axis: usize, delta: f64, world: &World) -> bool {
         };
         let last_good = pos[axis];
         pos[axis] = next;
-        if world.collides(&Aabb::new(*pos, PLAYER_HALF)) {
+        if world.collides(&collision_box(*pos, stance)) {
             pos[axis] = last_good;
             return true;
         }
@@ -189,6 +269,13 @@ fn step_axis(pos: &mut DVec3, axis: usize, delta: f64, world: &World) -> bool {
 mod tests {
     use super::*;
     use crate::math::block_coord;
+    use crate::player::Stance;
+
+    /// Standing eye height above the feet — the feet→eye conversion these tests use
+    /// to place a player whose feet rest on a given block.
+    fn stand_eye() -> f64 {
+        Stance::Standing.eye_offset()
+    }
 
     /// Hold W, nothing else — the reported far-coordinate stall scenario.
     fn walk_forward() -> MoveInput {
@@ -198,6 +285,8 @@ mod tests {
             up_down: AxisY::None,
             jump: false,
             toggle_fly: false,
+            sprint: false,
+            sneak: false,
         }
     }
 
@@ -209,6 +298,8 @@ mod tests {
             up_down: AxisY::None,
             jump: false,
             toggle_fly: false,
+            sprint: false,
+            sneak: false,
         }
     }
 
@@ -226,8 +317,8 @@ mod tests {
                 world.set_block(bx + dx, floor_y, bz + dz, stone);
             }
         }
-        // Feet on top of the runway: eye = feet + PLAYER_HALF.y.
-        let mut player = Player::new(DVec3::new(x, (floor_y + 1) as f64 + PLAYER_HALF.y, z));
+        // Feet on top of the runway: eye = feet + standing eye offset.
+        let mut player = Player::new(DVec3::new(x, (floor_y + 1) as f64 + stand_eye(), z));
         player.yaw = 0.0; // forward = +X
         player
     }
@@ -236,36 +327,39 @@ mod tests {
     fn walking_at_1e8_advances_at_full_speed_at_4000_fps() {
         // The proven bug: at x = 1e8 an f32 position's ULP (8.0!) dwarfs the
         // per-frame step 6.0/4000 = 0.0015, so f32 movement added ZERO for a
-        // whole second of frames. In f64, 4000 steps of dt = 1/4000 must cover
-        // ~6 blocks (one second at WALK_SPEED).
+        // whole second of frames. In f64 the step lands. We measure *steady-state*
+        // speed — velocity now ramps in via the accel law, so a first-second
+        // distance would undercount the ramp; warm up, then measure a clean second.
         let mut world = World::generate();
         let start_x = 1.0e8 + 0.5;
         let mut player = player_on_runway(&mut world, start_x, 0.5);
 
         let dt = 1.0 / 4000.0;
         for _ in 0..4000 {
-            let input = walk_forward();
-            update_player(&mut player, &world, &input, dt);
+            update_player(&mut player, &world, &walk_forward(), dt); // ramp to full speed
+        }
+        let window_start = player.position.x;
+        for _ in 0..4000 {
+            update_player(&mut player, &world, &walk_forward(), dt); // measured second
         }
 
-        let moved = player.position.x - start_x;
+        let moved = player.position.x - window_start;
         assert!(
             (moved - 6.0).abs() < 0.05,
-            "one second at WALK_SPEED must cover ~6 blocks, moved {moved}"
+            "one steady-state second at WALK_SPEED must cover ~6 blocks, moved {moved}"
         );
-        assert!(player.on_ground, "still standing on the runway");
+        assert!(player.on_ground(), "still standing on the runway");
         assert_eq!(player.position.z, 0.5, "no lateral drift");
     }
 
     #[test]
     fn movement_clamps_at_the_world_border_and_stays_finite() {
-        // Near the border there is no terrain loaded (unloaded chunks read as
-        // air), so fly there — the clamp is the border, not a wall of blocks.
-        let mut world = World::generate();
+        // Leave the border region unloaded (unloaded chunks read as air), so fly
+        // there — the clamp is the border, not a wall of blocks or a flying island.
+        let world = World::generate();
         let start_x = WORLD_BORDER - 1000.0;
-        world.prepare_around(DVec3::new(start_x, 300.0, 0.5));
         let mut player = Player::new(DVec3::new(start_x, 300.0, 0.5));
-        player.fly = true;
+        player.set_flying(true);
         player.yaw = 0.0; // forward = +X, straight at the border
 
         // 2000 steps x 0.1s x 14 units/s = 2800 blocks of intent: crosses the
@@ -297,44 +391,42 @@ mod tests {
         world.prepare_around(DVec3::new(x, floor_y as f64, z));
         let stone = world.registry().id_by_name("Stone").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
-        // A thin platform: exactly one block thick.
-        for dx in -2..=2 {
-            for dz in -2..=2 {
-                world.set_block(bx + dx, floor_y, bz + dz, stone);
-            }
-        }
 
         // Feet start 158 blocks up: freefall reaches terminal velocity after
         // ~78 blocks (2.5 s), leaving a long terminal-speed run whose 6-unit
         // steps hit the pre-fix tunneling window when they cross the floor.
         let start_feet = (floor_y + 1) as f64 + 158.0;
-        let mut player = Player::new(DVec3::new(x, start_feet + PLAYER_HALF.y, z));
 
-        // The fall column must be pure air or we'd measure an island instead.
-        for y in (floor_y + 1)..=(start_feet as i32 + 2) {
-            assert_eq!(
-                world.block_at(bx, y, bz),
-                crate::block::registry::AIR,
-                "fall column blocked at y={y}; pick a different column"
-            );
+        // Build the exact scenario instead of hoping generation left it empty: a
+        // one-block-thin platform under a carved-air fall column. Carving makes the
+        // test independent of whatever terrain generation happens to place here.
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                world.set_block(bx + dx, floor_y, bz + dz, stone);
+                for y in (floor_y + 1)..=(start_feet as i32 + 2) {
+                    world.set_block(bx + dx, y, bz + dz, crate::block::registry::AIR);
+                }
+            }
         }
+
+        let mut player = Player::new(DVec3::new(x, start_feet + stand_eye(), z));
 
         let mut reached_terminal = false;
         for _ in 0..100 {
             update_player(&mut player, &world, &idle(), 0.1);
             assert!(
-                player.velocity_y >= TERMINAL_VELOCITY,
+                player.velocity().y >= TERMINAL_VELOCITY,
                 "velocity must never exceed terminal, got {}",
-                player.velocity_y
+                player.velocity().y
             );
-            if player.velocity_y == TERMINAL_VELOCITY {
+            if player.velocity().y == TERMINAL_VELOCITY {
                 reached_terminal = true;
             }
         }
 
         assert!(reached_terminal, "158 blocks of freefall must reach terminal velocity");
-        assert!(player.on_ground, "the fall must end standing on the thin floor");
-        let feet = player.position.y - PLAYER_HALF.y;
+        assert!(player.on_ground(), "the fall must end standing on the thin floor");
+        let feet = player.position.y - stand_eye();
         let top = (floor_y + 1) as f64;
         assert!(
             feet >= top - 1e-9 && feet < top + 0.3,
@@ -355,7 +447,7 @@ mod tests {
 
         // One idle frame to plant the player (Player::new starts !on_ground).
         update_player(&mut player, &world, &idle(), dt as f32);
-        assert!(player.on_ground, "must be standing before the jump");
+        assert!(player.on_ground(), "must be standing before the jump");
         let start_y = player.position.y;
 
         let mut apex = start_y;
@@ -365,8 +457,8 @@ mod tests {
             apex = apex.max(player.position.y);
         }
 
-        // The discrete integrator analytically: v_k = J - G*dt*k stays positive
-        // for 21 steps at dt = 1/60, so the apex is sum_{k=1..21} v_k * dt.
+        // The jump reaches apex in 21 frames at 60 fps. Calculate the analytically
+        // expected height to verify the integrator hasn't changed.
         // (`dt` crosses the physics boundary as f32, so mirror that rounding.)
         let dt = (dt as f32) as f64;
         let n = 21.0_f64;

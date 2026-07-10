@@ -11,9 +11,28 @@ use voxel_engine::DVec3;
 
 use crate::block::Composition;
 use crate::math::{WORLD_BORDER, block_coord};
-use crate::player::{PLAYER_HALF, Player};
-use crate::settings::Settings;
+use crate::player::Player;
+use crate::settings::{SETTINGS, Settings, on_off};
+use crate::sky::{DayLength, Sky};
+use crate::ui::{Line, Role};
 use crate::world::World;
+
+/// Normal command output: each string becomes one neutral [`Role::System`] line.
+fn shown(lines: Vec<String>) -> Vec<Line> {
+    lines.into_iter().map(|l| Line::of(Role::System, l)).collect()
+}
+
+/// A rejection (bad args, unknown command, usage): [`Role::Error`] lines. Because
+/// the handler that owns the rejection is the only place that names it an error,
+/// severity is carried in the type — the caller never guesses it from the text.
+fn rejected(lines: Vec<String>) -> Vec<Line> {
+    lines.into_iter().map(|l| Line::of(Role::Error, l)).collect()
+}
+
+/// The primary command names, in the order `help` lists them. This is the single
+/// source of truth for Tab-completion (see [`crate::console`]); aliases like
+/// `teleport` are intentionally omitted so completion offers the canonical name.
+pub const COMMAND_NAMES: &[&str] = &["tp", "pos", "inspect", "gfx", "time", "help"];
 
 /// Run a console line against the game state, returning output lines for the log.
 ///
@@ -25,7 +44,8 @@ pub fn execute(
     player: &mut Player,
     world: &World,
     settings: &mut Settings,
-) -> Vec<String> {
+    sky: &mut Sky,
+) -> Vec<Line> {
     let line = line.strip_prefix('/').unwrap_or(line);
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else {
@@ -35,21 +55,80 @@ pub fn execute(
 
     match cmd {
         "tp" | "teleport" | "setpos" => teleport(&args, player),
-        "pos" | "where" => vec![format!("position: {}", fmt_pos(player.position))],
+        "pos" | "where" => shown(vec![format!("position: {}", fmt_pos(player.position))]),
         "inspect" | "look" => inspect(&args, player, world),
         "gfx" | "graphics" => gfx(&args, settings),
+        "time" => time(&args, sky),
         "help" | "?" => help(),
-        other => vec![format!("unknown command '{other}' — type 'help'")],
+        other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
     }
+}
+
+/// `/time` — show or set the day/night clock, or change the cycle length.
+///
+///   `time`                 show the current time and cycle length
+///   `time set <when>`      `0..1` fraction, `0..24` hour, or a name
+///                          (dawn/day/noon/dusk/night/midnight)
+///   `time length <secs>`   set how long a full cycle lasts
+fn time(args: &[&str], sky: &mut Sky) -> Vec<Line> {
+    match args {
+        [] => shown(vec![format!(
+            "time: {}  ({:.3} of day, cycle {:.0}s)",
+            clock_label(sky.clock.day()),
+            sky.clock.day(),
+            sky.day_length.0,
+        )]),
+        ["set", when] => match parse_when(when) {
+            Some(day) => {
+                sky.clock.set_day(day);
+                shown(vec![format!("time set to {}", clock_label(day))])
+            }
+            None => rejected(vec!["time: use 0..1, 0..24, or dawn|day|noon|dusk|night".to_string()]),
+        },
+        ["length", secs] => match secs.parse::<f64>() {
+            Ok(s) if s.is_finite() => {
+                sky.day_length = DayLength::clamped(s);
+                shown(vec![format!("day length set to {:.0}s", sky.day_length.0)])
+            }
+            _ => rejected(vec!["time: length must be a number of seconds".to_string()]),
+        },
+        _ => rejected(vec!["usage: time [set <when> | length <secs>]".to_string()]),
+    }
+}
+
+/// Parse a `/time set` argument into a day fraction in `[0, 1)`. Accepts named
+/// times, a `0..1` fraction, or a `0..24` hour.
+fn parse_when(s: &str) -> Option<f64> {
+    let named = match s.to_ascii_lowercase().as_str() {
+        "midnight" => Some(0.0),
+        "dawn" | "sunrise" => Some(0.25),
+        "morning" => Some(0.35),
+        "day" | "noon" | "midday" => Some(0.5),
+        "dusk" | "sunset" => Some(0.75),
+        "night" => Some(0.9),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    let v = s.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    // <= 1 reads as a fraction; otherwise as an hour of a 24-hour day.
+    Some(if v <= 1.0 { v.rem_euclid(1.0) } else { (v / 24.0).rem_euclid(1.0) })
+}
+
+/// A short `HH:MM`-ish label for a day fraction (0.0 = 00:00, 0.5 = 12:00).
+fn clock_label(day: f64) -> String {
+    let total = (day.rem_euclid(1.0) * 24.0 * 60.0).round() as i32;
+    format!("{:02}:{:02}", (total / 60) % 24, total % 60)
 }
 
 /// `tp <x> <y> <z>` — move the player to absolute world coordinates, clamped
 /// to the ±[`WORLD_BORDER`] cube (the same clamp movement applies, so no code
 /// path can carry a position that would overflow i32 block math). The output
 /// reports the position actually landed on, clamp included.
-fn teleport(args: &[&str], player: &mut Player) -> Vec<String> {
+fn teleport(args: &[&str], player: &mut Player) -> Vec<Line> {
     if args.len() != 3 {
-        return vec!["usage: tp <x> <y> <z>".to_string()];
+        return rejected(vec!["usage: tp <x> <y> <z>".to_string()]);
     }
     let parsed: Result<Vec<f64>, _> = args.iter().map(|a| a.parse::<f64>()).collect();
     match parsed.as_deref() {
@@ -57,16 +136,16 @@ fn teleport(args: &[&str], player: &mut Player) -> Vec<String> {
             player.position = DVec3::new(*x, *y, *z)
                 .clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
             // Cancel any accumulated fall so the player doesn't rocket down on arrival.
-            player.velocity_y = 0.0;
-            vec![format!("teleported to {}", fmt_pos(player.position))]
+            player.cancel_fall();
+            shown(vec![format!("teleported to {}", fmt_pos(player.position))])
         }
-        _ => vec!["tp: x, y and z must be numbers".to_string()],
+        _ => rejected(vec!["tp: x, y and z must be numbers".to_string()]),
     }
 }
 
 /// `gfx [setting value]` — show or change graphics settings at runtime.
 /// The caller applies the mutated [`Settings`] to the engine and persists it.
-fn gfx(args: &[&str], settings: &mut Settings) -> Vec<String> {
+fn gfx(args: &[&str], settings: &mut Settings) -> Vec<Line> {
     let usage = || {
         vec![
             "usage: gfx <setting> <value>".to_string(),
@@ -87,11 +166,11 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<String> {
             } else {
                 settings.max_fps.to_string()
             };
-            vec![
+            shown(vec![
                 format!(
                     "gfx: fullscreen {}  vsync {}  msaa {}x",
-                    on_off(settings.fullscreen),
-                    on_off(settings.vsync),
+                    on_off(settings.fullscreen, false),
+                    on_off(settings.vsync, false),
                     settings.msaa
                 ),
                 format!(
@@ -101,98 +180,30 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<String> {
                     settings.fov,
                     settings.render_scale * 100.0
                 ),
-            ]
+            ])
         }
-        [key, value] => {
-            let out = match *key {
-                "fullscreen" => match parse_toggle(value) {
-                    Some(v) => {
-                        settings.fullscreen = v;
-                        format!("fullscreen {}", on_off(v))
-                    }
-                    None => return usage(),
-                },
-                "vsync" => match parse_toggle(value) {
-                    Some(v) => {
-                        settings.vsync = v;
-                        format!("vsync {}", on_off(v))
-                    }
-                    None => return usage(),
-                },
-                "msaa" => match value.parse::<u32>() {
-                    Ok(n) => {
-                        settings.msaa = n;
-                        settings.clamp();
-                        format!("msaa {}x", settings.msaa)
-                    }
-                    Err(_) => return usage(),
-                },
-                "fps" => {
-                    let n = match *value {
-                        "off" | "uncapped" | "0" => Some(0),
-                        v => v.parse::<u32>().ok(),
-                    };
-                    match n {
-                        Some(n) => {
-                            settings.max_fps = n;
-                            settings.clamp();
-                            if settings.max_fps == 0 {
-                                "fps cap off".to_string()
-                            } else {
-                                format!("fps cap {}", settings.max_fps)
-                            }
-                        }
-                        None => return usage(),
-                    }
-                }
-                "renderdist" | "renderdistance" => match value.parse::<i32>() {
-                    Ok(n) => {
-                        settings.render_distance = n;
-                        settings.clamp();
-                        format!("render distance {}", settings.render_distance)
-                    }
-                    Err(_) => return usage(),
-                },
-                "renderscale" | "scale" => match value.parse::<f32>() {
-                    Ok(pct) => {
-                        settings.render_scale = pct / 100.0;
-                        settings.clamp();
-                        format!("render scale {:.0}%", settings.render_scale * 100.0)
-                    }
-                    Err(_) => return usage(),
-                },
-                "fov" => match value.parse::<f32>() {
-                    Ok(n) => {
-                        settings.fov = n;
-                        settings.clamp();
-                        format!("fov {:.0}", settings.fov)
-                    }
-                    Err(_) => return usage(),
-                },
-                _ => return usage(),
-            };
-            vec![out]
-        }
-        _ => usage(),
+        [key, value] => match gfx_set(settings, key, value) {
+            Some(msg) => shown(vec![msg]),
+            None => rejected(usage()),
+        },
+        _ => rejected(usage()),
     }
 }
 
-fn parse_toggle(value: &str) -> Option<bool> {
-    match value {
-        "on" | "true" | "1" | "yes" => Some(true),
-        "off" | "false" | "0" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn on_off(v: bool) -> &'static str {
-    if v { "on" } else { "off" }
+/// `/gfx <key> <value>` dispatches through the one [`SETTINGS`] table: find the
+/// field the key (or an alias) names, parse-and-clamp its value, and echo the
+/// field's confirm line. `None` (unknown key OR unparseable value) means the
+/// caller prints usage — and, because the field is written only after a successful
+/// parse, a bad value changes nothing.
+fn gfx_set(s: &mut Settings, key: &str, value: &str) -> Option<String> {
+    let field = SETTINGS.iter().find(|f| f.matches(key))?;
+    field.parse_human(s, value).then(|| field.confirm(s))
 }
 
 /// `inspect [x y z]` — describe the block at a cell (default: the block under the
 /// player's feet), showing what it's made of and the properties derived from that.
 /// The in-game window onto the element/block system.
-fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<String> {
+fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let cell = match args {
         [] => {
             // The block supporting the player: directly below the feet. The small
@@ -200,15 +211,15 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<String> {
             let p = player.position;
             (
                 block_coord(p.x),
-                block_coord(p.y - PLAYER_HALF.y - 0.1),
+                block_coord(player.feet_y() - 0.1),
                 block_coord(p.z),
             )
         }
         [x, y, z] => match (x.parse(), y.parse(), z.parse()) {
             (Ok(x), Ok(y), Ok(z)) => (x, y, z),
-            _ => return vec!["inspect: x, y and z must be integers".to_string()],
+            _ => return rejected(vec!["inspect: x, y and z must be integers".to_string()]),
         },
-        _ => return vec!["usage: inspect [<x> <y> <z>]".to_string()],
+        _ => return rejected(vec!["usage: inspect [<x> <y> <z>]".to_string()]),
     };
 
     let (x, y, z) = cell;
@@ -249,7 +260,7 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<String> {
             reaction.name, reaction.strength
         ));
     }
-    out
+    shown(out)
 }
 
 /// Render a composition as a readable element list, resolving ids to names.
@@ -263,7 +274,7 @@ fn describe_composition(world: &World, composition: &Composition) -> String {
             .collect::<Vec<_>>()
             .join(" + "),
         Composition::Mixture(mix) | Composition::Configuration { mix, .. } => mix
-            .0
+            .parts()
             .iter()
             .map(|&(e, p)| format!("{}% {}", p, elements.get(e).name))
             .collect::<Vec<_>>()
@@ -272,15 +283,16 @@ fn describe_composition(world: &World, composition: &Composition) -> String {
     }
 }
 
-fn help() -> Vec<String> {
-    vec![
+fn help() -> Vec<Line> {
+    shown(vec![
         "commands (a leading '/' is optional):".to_string(),
         "  tp <x> <y> <z>       teleport to coordinates".to_string(),
         "  pos                  show current coordinates".to_string(),
         "  inspect [x y z]      describe a block's elements & properties".to_string(),
         "  gfx [setting value]  show or change graphics settings".to_string(),
+        "  time [set|length]    show or set the day/night clock".to_string(),
         "  help                 show this list".to_string(),
-    ]
+    ])
 }
 
 /// Format a position the same way the on-screen coordinate readout does.
@@ -301,19 +313,25 @@ mod tests {
         World::generate()
     }
 
-    fn run(line: &str, p: &mut Player, w: &World) -> Vec<String> {
+    fn run(line: &str, p: &mut Player, w: &World) -> Vec<Line> {
         let mut s = Settings::default();
-        execute(line, p, w, &mut s)
+        let mut sky = Sky::new();
+        execute(line, p, w, &mut s, &mut sky)
+    }
+
+    /// All the lines' text joined — for asserting on multi-line output.
+    fn joined(lines: &[Line]) -> String {
+        lines.iter().map(Line::text).collect::<Vec<_>>().join("\n")
     }
 
     #[test]
     fn tp_sets_position_and_clears_fall() {
         let (mut p, w) = (player(), world());
-        p.velocity_y = -50.0;
+        p.motion = crate::player::Motion::Walking { velocity: DVec3::new(0.0, -50.0, 0.0), on_ground: false };
         let out = run("tp 1.5 2 3", &mut p, &w);
         assert_eq!(p.position, DVec3::new(1.5, 2.0, 3.0));
-        assert_eq!(p.velocity_y, 0.0);
-        assert!(out[0].contains("teleported"));
+        assert_eq!(p.velocity().y, 0.0);
+        assert!(out[0].text().contains("teleported"));
     }
 
     #[test]
@@ -327,7 +345,7 @@ mod tests {
         let out = run("tp 99999999999 60 -99999999999", &mut p, &w);
         assert_eq!(p.position.x, 1.0e9);
         assert_eq!(p.position.z, -1.0e9);
-        assert!(out[0].contains("1000000000.0"), "reports the clamped position: {out:?}");
+        assert!(out[0].text().contains("1000000000.0"), "reports the clamped position");
 
         // Non-finite input is refused outright.
         let before = p.position;
@@ -355,7 +373,8 @@ mod tests {
     fn unknown_command_reports_back() {
         let (mut p, w) = (player(), world());
         let out = run("fly-to-moon", &mut p, &w);
-        assert!(out[0].contains("unknown command"));
+        assert!(out[0].text().contains("unknown command"));
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Error);
     }
 
     #[test]
@@ -363,7 +382,7 @@ mod tests {
         let (mut p, w) = (player(), world());
         // Deep underground is stone: a single Stone element with stone's properties.
         let out = run("inspect 8 0 8", &mut p, &w);
-        let text = out.join("\n");
+        let text = joined(&out);
         assert!(text.contains("Stone"), "should name the block: {text}");
         assert!(text.contains("made of: Stone"), "should list elements: {text}");
         assert!(text.contains("density"), "should show core properties: {text}");
@@ -373,34 +392,59 @@ mod tests {
     fn inspect_above_world_is_air() {
         let (mut p, w) = (player(), world());
         let out = run("inspect 8 60 8", &mut p, &w);
-        assert!(out.join("\n").contains("air"));
+        assert!(joined(&out).contains("air"));
     }
 
     #[test]
     fn gfx_updates_settings_with_clamping() {
         let (mut p, w) = (player(), world());
         let mut s = Settings::default();
-        execute("gfx msaa 4", &mut p, &w, &mut s);
+        let mut sky = Sky::new();
+        execute("gfx msaa 4", &mut p, &w, &mut s, &mut sky);
         assert_eq!(s.msaa, 4);
-        execute("gfx fps 144", &mut p, &w, &mut s);
+        execute("gfx fps 144", &mut p, &w, &mut s, &mut sky);
         assert_eq!(s.max_fps, 144);
-        execute("gfx fps off", &mut p, &w, &mut s);
+        execute("gfx fps off", &mut p, &w, &mut s, &mut sky);
         assert_eq!(s.max_fps, 0);
-        execute("gfx renderdist 99", &mut p, &w, &mut s);
-        assert_eq!(s.render_distance, 10);
-        execute("gfx fullscreen on", &mut p, &w, &mut s);
+        execute("gfx renderdist 99", &mut p, &w, &mut s, &mut sky);
+        assert_eq!(s.render_distance, 20);
+        execute("gfx fullscreen on", &mut p, &w, &mut s, &mut sky);
         assert!(s.fullscreen);
-        let out = execute("gfx", &mut p, &w, &mut s);
-        assert!(out[0].contains("fullscreen on"));
+        let out = execute("gfx", &mut p, &w, &mut s, &mut sky);
+        assert!(out[0].text().contains("fullscreen on"));
     }
 
     #[test]
     fn gfx_bad_input_prints_usage_and_changes_nothing() {
         let (mut p, w) = (player(), world());
         let mut s = Settings::default();
+        let mut sky = Sky::new();
         let before = s.clone();
-        let out = execute("gfx msaa lots", &mut p, &w, &mut s);
-        assert!(out[0].contains("usage"));
+        let out = execute("gfx msaa lots", &mut p, &w, &mut s, &mut sky);
+        assert!(out[0].text().contains("usage"));
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Error);
         assert_eq!(s, before);
+    }
+
+    #[test]
+    fn time_set_accepts_names_fractions_and_hours() {
+        let mut sky = Sky::new();
+        assert!(time(&["set", "noon"], &mut sky)[0].text().contains("12:00"));
+        assert!((sky.clock.day() - 0.5).abs() < 1e-9);
+        time(&["set", "0.25"], &mut sky);
+        assert!((sky.clock.day() - 0.25).abs() < 1e-9);
+        time(&["set", "18"], &mut sky); // 18:00 → 0.75
+        assert!((sky.clock.day() - 0.75).abs() < 1e-9);
+        // A bad value leaves the clock untouched.
+        let before = sky.clock.day();
+        assert!(time(&["set", "banana"], &mut sky)[0].text().contains("use"));
+        assert_eq!(sky.clock.day(), before);
+    }
+
+    #[test]
+    fn time_length_clamps() {
+        let mut sky = Sky::new();
+        time(&["length", "1"], &mut sky); // below the 10s floor
+        assert_eq!(sky.day_length.0, 10.0);
     }
 }

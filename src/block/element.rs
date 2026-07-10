@@ -16,31 +16,86 @@ use crate::macros::elements;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ElementId(pub u16);
 
-/// The nine properties every element has. A block inherits each one as the
-/// weighted average of its elements (see [`derive_core`](crate::block::derive::derive_core)).
-///
-/// All values are `0..=255` except `transparency`, which reads as a percentage
-/// (`0..=100`). `Default` is all-zero, which is what an empty (air) block derives.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CoreProperties {
+/// Declares [`CoreProperties`] and its bidirectional [`Core`] array conversions
+/// from a single ordered field list — the one place the field order and the
+/// name-to-index mapping live. Reordering a line here reorders the struct and
+/// both `From` impls together.
+macro_rules! core_properties {
+    ($($(#[$doc:meta])* $field:ident),* $(,)?) => {
+        /// The nine properties every element has. A block inherits each one as the
+        /// weighted average of its elements (see [`derive_core`](crate::block::derive::derive_core)).
+        ///
+        /// All values are `0..=255` except `transparency`, which reads as a percentage
+        /// (`0..=100`). `Default` is all-zero, which is what an empty (air) block derives.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct CoreProperties {
+            $($(#[$doc])* pub $field: u8,)*
+        }
+
+        impl From<CoreProperties> for Core {
+            fn from(c: CoreProperties) -> Self {
+                Core([$(c.$field),*])
+            }
+        }
+
+        impl From<Core> for CoreProperties {
+            fn from(f: Core) -> Self {
+                let [$($field),*] = f.0;
+                CoreProperties { $($field),* }
+            }
+        }
+
+        /// The number of core properties, derived from the field list so it can't
+        /// drift out of sync with the struct.
+        pub const CORE_FIELD_COUNT: usize = {
+            const FIELDS: &[&str] = &[$(stringify!($field)),*];
+            FIELDS.len()
+        };
+    };
+}
+
+core_properties! {
     /// Damage a block absorbs before it breaks.
-    pub durability: u8,
+    durability,
     /// Damage floor: attacks weaker than this do nothing.
-    pub hardness: u8,
+    hardness,
     /// How readily electricity flows through it.
-    pub conductivity: u8,
+    conductivity,
     /// How readily heat flows through it.
-    pub thermal_conductivity: u8,
+    thermal_conductivity,
     /// Weight; heavier blocks are harder to move and push others less.
-    pub density: u8,
+    density,
     /// Highest temperature it survives before degrading.
-    pub temperature_resistance: u8,
+    temperature_resistance,
     /// Grip on neighbours: if this exceeds an adjacent block's density it drags it along.
-    pub friction: u8,
+    friction,
     /// Light output, `0` (none) to `255` (brightest).
-    pub light_emission: u8,
+    light_emission,
     /// Light transmission as a percentage, `0` (opaque) to `100` (clear).
-    pub transparency: u8,
+    transparency,
+}
+
+/// The nine core fields as a fixed-order array, so property math can loop instead
+/// of spelling out every field. Used by
+/// [`derive_core`](crate::block::derive::derive_core) and
+/// [`apply_reactions`](crate::block::reaction::apply_reactions).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Core(pub [u8; CORE_FIELD_COUNT]);
+
+impl Core {
+    /// The weighted mean of several cores. `parts` yields `(core, weight)`; a zero
+    /// total weight (an empty block) blends to all-zero.
+    pub fn blend(parts: impl IntoIterator<Item = (Core, u32)>) -> Core {
+        crate::block::bary::barycenter(parts)
+    }
+
+    /// Add `bonus` to each field (saturating), first scaling it by `strength/255`.
+    pub fn add_scaled(&mut self, bonus: Core, strength: u8) {
+        for i in 0..CORE_FIELD_COUNT {
+            let scaled = (bonus.0[i] as u32 * strength as u32 / 255) as u8;
+            self.0[i] = self.0[i].saturating_add(scaled);
+        }
+    }
 }
 
 /// Extra behaviours only some elements carry. Each holds an intrinsic strength
@@ -122,7 +177,9 @@ impl ElementRegistry {
     /// Add an element and return its fresh id. The modding entry point for new
     /// materials.
     pub fn register(&mut self, element: Element) -> ElementId {
-        let id = ElementId(self.elements.len() as u16);
+        let id = ElementId(
+            u16::try_from(self.elements.len()).expect("element palette exceeded u16::MAX"),
+        );
         self.elements.push(element);
         id
     }
@@ -261,11 +318,28 @@ elements! {
         core: { durability: 20, hardness: 10, density: 60, temperature_resistance: 70, friction: 40, light_emission: 200 },
         specials: [ExplosionAtBreakage(60)],
     },
+    // Deep blue and heavy; lets some light through, so blocks made of it are
+    // translucent solids (the glass path) — the world's oceans, rivers, and lakes.
+    Water => {
+        color: (40, 90, 200),
+        core: { durability: 5, hardness: 5, density: 200, temperature_resistance: 100, friction: 20, thermal_conductivity: 60, transparency: 55 },
+    },
+    // Fresh snow: soft, pale, and slick underfoot — the biome frosting on cold or
+    // high ground.
+    Snow => {
+        color: (240, 245, 255),
+        core: { durability: 8, hardness: 5, density: 40, temperature_resistance: 20, friction: 10, thermal_conductivity: 30 },
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_field_count_is_nine() {
+        assert_eq!(CORE_FIELD_COUNT, 9);
+    }
 
     #[test]
     fn builtin_ids_match_declaration_order() {

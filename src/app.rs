@@ -12,14 +12,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use voxel_engine::{Color, DVec3, Engine, Frame};
 
 use crate::game::{Game, Signal};
-use crate::menu::{
-    self, HostInfo, JoinInfo, MainChoice, MenuEvent, MenuModel, SETTINGS_ROW_BACK,
-};
+use crate::menu::{self, HostInfo, JoinInfo, MainChoice, MenuEvent, MenuModel, Notice};
 use crate::mods::Mods;
 use crate::net::client::Connection;
 use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
 use crate::save;
+use crate::session::Session;
 use crate::settings::Settings;
 use crate::world::World;
 
@@ -41,10 +40,10 @@ enum Screen {
 /// The whole program: the installed mods (persist across worlds), the menu
 /// models, the graphics settings, and the current world if one is open.
 ///
-/// Menus are MODELS here (see [`crate::menu`]): the App builds one per screen,
-/// hands input to the first enabled menu-handling mod (or the core fallback if
-/// none — disabling the "Menus" mod can never brick navigation), and
-/// interprets the [`MenuEvent`]s that come back.
+/// Menus are plain data models here (see [`crate::menu`]): the App builds one
+/// per screen, hands input to the first enabled menu-handling mod (or the
+/// core fallback if none — disabling the "Menus" mod can never brick
+/// navigation), and interprets the [`MenuEvent`]s that come back.
 pub struct App {
     /// The live world, if the player is in one.
     game: Option<Game>,
@@ -66,6 +65,8 @@ pub struct App {
     status: Option<String>,
     /// Graphics settings, persisted in `saves/settings.cfg`.
     settings: Settings,
+    /// Last-used connection details, persisted in `saves/session.cfg`.
+    session: Session,
     /// Headless-ish benchmark mode (`WATT_BENCH=<seconds>`): auto-enters a
     /// world, rotates the camera, prints one stats line, exits.
     bench: Option<Bench>,
@@ -92,19 +93,30 @@ impl App {
         let mods = Mods::with_defaults();
         let saves = save::list_saves();
         let settings = Settings::load();
+        let session = Session::load();
+        // Pre-fill the connection forms with what was used last time. Host has
+        // Port(0)/Password(1)/Name(2); Join has Address(0)/Port(1)/Password(2)/Name(3).
+        let mut host_model = menu::host_menu_model(None);
+        host_model.set_text(0, &session.port);
+        host_model.set_text(2, &session.name);
+        let mut join_model = menu::join_menu_model(None);
+        join_model.set_text(0, &session.address);
+        join_model.set_text(1, &session.port);
+        join_model.set_text(3, &session.name);
         Self {
             game: None,
             main_model: menu::main_menu_model(&saves),
             saves,
             mods_model: menu::mods_menu_model(&mods),
             settings_model: menu::settings_menu_model(&settings),
-            host_model: menu::host_menu_model(None),
-            join_model: menu::join_menu_model(None),
+            host_model,
+            join_model,
             mods,
             screen: Screen::Menu,
             host: None,
             status: None,
             settings,
+            session,
             bench: std::env::var("WATT_BENCH").ok().map(|v| Bench {
                 duration: v.parse().unwrap_or(10.0),
                 warmup: 3.0,
@@ -235,11 +247,14 @@ impl App {
         let avg_fps = frames as f32 / total.max(f32::EPSILON);
         let mut sorted = bench.samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        // p1 fps = the fps of the 99th-percentile (slowest 1%) frame time.
-        let p99_dt = sorted[(frames.saturating_sub(1)) * 99 / 100];
+        // p1 fps = the fps of the 99th-percentile (slowest 1%) frame time. With no
+        // samples there is no percentile to report, so emit it only when present.
+        let p1_fps = sorted
+            .get((frames.saturating_sub(1)) * 99 / 100)
+            .map(|dt| format!("{:.0}", 1.0 / dt.max(f32::EPSILON)))
+            .unwrap_or_else(|| "n/a".to_string());
         println!(
-            "BENCH frames={frames} avg_fps={avg_fps:.0} p1_fps={:.0} avg_ms={avg_ms:.3} rss_mb={}",
-            1.0 / p99_dt.max(f32::EPSILON),
+            "BENCH frames={frames} avg_fps={avg_fps:.0} p1_fps={p1_fps} avg_ms={avg_ms:.3} rss_mb={}",
             resident_mb().unwrap_or(0),
         );
         false
@@ -269,36 +284,36 @@ impl App {
     /// status line as the model's error text.
     fn refresh_main_menu(&mut self) {
         self.saves = save::list_saves();
-        let cursor = self.main_model.cursor;
+        let cursor = self.main_model.entries.cursor;
         self.main_model = menu::main_menu_model(&self.saves);
-        self.main_model.cursor = cursor;
+        self.main_model.entries.cursor = cursor;
         self.main_model.clamp_cursor();
-        self.main_model.error = self.status.clone();
+        self.main_model.notice = self.status.clone().map(Notice::info);
     }
 
     /// Rebuild the mod-list model from the mods' current on/off states.
     fn refresh_mods_menu(&mut self) {
-        let cursor = self.mods_model.cursor;
+        let cursor = self.mods_model.entries.cursor;
         self.mods_model = menu::mods_menu_model(&self.mods);
-        self.mods_model.cursor = cursor;
+        self.mods_model.entries.cursor = cursor;
         self.mods_model.clamp_cursor();
     }
 
     /// Rebuild the settings model's value strings from the live settings.
     fn refresh_settings_menu(&mut self) {
-        let cursor = self.settings_model.cursor;
+        let cursor = self.settings_model.entries.cursor;
         self.settings_model = menu::settings_menu_model(&self.settings);
-        self.settings_model.cursor = cursor;
+        self.settings_model.entries.cursor = cursor;
         self.settings_model.clamp_cursor();
     }
 
     /// Start-menu logic. Returns `true` to quit the program.
     fn update_menu(&mut self, eng: &mut Engine) -> bool {
         let event = Self::drive(&mut self.mods, eng, &mut self.main_model);
-        if let Some(MenuEvent::Chosen(index)) = event {
+        if let Some(MenuEvent::Chosen(id)) = event {
             self.status = None;
-            self.main_model.error = None;
-            match menu::main_choice_at(&self.saves, index) {
+            self.main_model.notice = None;
+            match menu::main_choice_at(&self.saves, id) {
                 MainChoice::NewWorld => self.start_new_world(eng),
                 MainChoice::Load(name) => self.load_world(eng, &name),
                 MainChoice::Host => self.screen = Screen::Host,
@@ -331,9 +346,14 @@ impl App {
                         password: self.host_model.text_value(1).to_string(),
                         name: self.host_model.text_value(2).to_string(),
                     };
+                    self.session.port = self.host_model.text_value(0).to_string();
+                    self.session.name = info.name.clone();
+                    self.session.save();
                     self.start_host(eng, info);
                 }
-                None => self.host_model.error = Some(menu::PORT_ERROR.to_string()),
+                None => {
+                    self.host_model.notice = Some(Notice::error(menu::PORT_ERROR.to_string()))
+                }
             },
             Some(MenuEvent::Back) => self.screen = Screen::Menu,
             _ => {}
@@ -352,27 +372,34 @@ impl App {
                         password: self.join_model.text_value(2).to_string(),
                         name: self.join_model.text_value(3).to_string(),
                     };
+                    self.session.address = info.host.clone();
+                    self.session.port = self.join_model.text_value(1).to_string();
+                    self.session.name = info.name.clone();
+                    self.session.save();
                     self.start_join(eng, info);
                 }
-                None => self.join_model.error = Some(menu::PORT_ERROR.to_string()),
+                None => {
+                    self.join_model.notice = Some(Notice::error(menu::PORT_ERROR.to_string()))
+                }
             },
             Some(MenuEvent::Back) => self.screen = Screen::Menu,
             _ => {}
         }
     }
 
-    /// Settings screen: cycle values (the MEANING of each row stays here, not
+    /// Settings screen: cycle values (what each row means stays here, not
     /// in any mod), apply them live, persist on the way out.
     fn update_settings(&mut self, eng: &mut Engine) {
         let event = Self::drive(&mut self.mods, eng, &mut self.settings_model);
         let mut back = false;
         let mut changed = false;
         match event {
-            Some(MenuEvent::Cycled(row, dir)) => {
-                menu::apply_settings_cycle(&mut self.settings, row, dir);
+            Some(MenuEvent::Cycled(row, step)) => {
+                menu::apply_settings_cycle(&mut self.settings, row, step);
                 changed = true;
             }
-            Some(MenuEvent::Chosen(SETTINGS_ROW_BACK)) | Some(MenuEvent::Back) => back = true,
+            // The settings screen's only Action row is Back.
+            Some(MenuEvent::Chosen(_)) | Some(MenuEvent::Back) => back = true,
             _ => {}
         }
         // Apply every frame — the engine no-ops unchanged values, so toggles
@@ -463,7 +490,7 @@ impl App {
             Ok((world, player)) => {
                 self.enter_game(eng, Game::new(world, player, name.to_string()))
             }
-            Err(_) => {}
+            Err(e) => self.fail_to_menu(format!("could not load {name}: {e}")),
         }
     }
 

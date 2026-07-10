@@ -56,11 +56,6 @@ pub struct CraftingMod {
     crafted: Vec<Crafted>,
     /// Index into `crafted` of the block RMB places, if any.
     equipped: Option<usize>,
-    /// Cached `(element, name, count)` rows mirroring the stash for drawing
-    /// (draw has no world access, so names are resolved when the stash changes).
-    element_rows: Vec<(ElementId, Box<str>, u32)>,
-    /// The stash revision `element_rows` was built from; `u64::MAX` forces a build.
-    seen_rev: u64,
 }
 
 impl CraftingMod {
@@ -72,33 +67,25 @@ impl CraftingMod {
             selected: Vec::new(),
             crafted: Vec::new(),
             equipped: None,
-            element_rows: Vec::new(),
-            seen_rev: u64::MAX,
         }
+    }
+
+    /// The held element kinds in stash order — the navigable element rows. Read
+    /// live from the shared stash (small, changes rarely) so no cache can drift.
+    fn elements(&self) -> Vec<ElementId> {
+        self.stash.borrow().iter().map(|(e, _)| e).collect()
     }
 
     /// Total rows the cursor can sit on: one per element kind, the Craft row,
     /// one per crafted block type. Always at least 1 (the Craft row).
     fn row_count(&self) -> usize {
-        self.element_rows.len() + 1 + self.crafted.len()
+        self.elements().len() + 1 + self.crafted.len()
     }
 
-    /// Mirror the stash into `element_rows` if it changed, drop selections whose
-    /// element ran out, and keep the cursor on a real row.
-    fn refresh(&mut self, world: &World) {
-        {
-            let stash = self.stash.borrow();
-            if stash.rev() != self.seen_rev {
-                let elements = world.registry().elements();
-                self.element_rows = stash
-                    .iter()
-                    .map(|(e, count)| (e, elements.get(e).name.clone(), count))
-                    .collect();
-                self.seen_rev = stash.rev();
-            }
-        }
-        let rows = &self.element_rows;
-        self.selected.retain(|&e| rows.iter().any(|(re, _, _)| *re == e));
+    /// Drop selections whose element ran out, and keep the cursor on a real row.
+    fn refresh(&mut self) {
+        let present = self.elements();
+        self.selected.retain(|e| present.contains(e));
         self.cursor = self.cursor.min(self.row_count() - 1);
     }
 
@@ -123,18 +110,18 @@ impl CraftingMod {
 
     /// Enter/L on the current row.
     fn activate(&mut self, ctx: &mut ModContext) {
-        let elements = self.element_rows.len();
-        if self.cursor < elements {
-            let element = self.element_rows[self.cursor].0;
+        let elements = self.elements();
+        if self.cursor < elements.len() {
+            let element = elements[self.cursor];
             if let Some(at) = self.selected.iter().position(|&e| e == element) {
                 self.selected.remove(at);
             } else {
                 self.selected.push(element);
             }
-        } else if self.cursor == elements {
+        } else if self.cursor == elements.len() {
             self.craft(ctx);
         } else {
-            self.equipped = Some(self.cursor - elements - 1);
+            self.equipped = Some(self.cursor - elements.len() - 1);
         }
     }
 
@@ -161,7 +148,7 @@ impl CraftingMod {
                 count: 1,
             }),
         }
-        self.refresh(ctx.world);
+        self.refresh();
     }
 
     /// RMB while the panel is closed: place the equipped block against whatever
@@ -248,7 +235,7 @@ impl Mod for CraftingMod {
     }
 
     fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        self.refresh(ctx.world);
+        self.refresh();
         if !ctx.capturing_text && eng.is_key_pressed(Key::C) {
             self.open = !self.open;
         }
@@ -259,7 +246,7 @@ impl Mod for CraftingMod {
         }
     }
 
-    fn draw(&mut self, f: &mut Frame, screen_w: i32, _screen_h: i32) {
+    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, _screen_h: i32) {
         let fs = 18;
         let line_h = fs + 4;
         let x = screen_w - PANEL_X_OFFSET;
@@ -278,19 +265,23 @@ impl Mod for CraftingMod {
         shadowed(f, "Crafting", x, y, fs, Color::GOLD);
         y += line_h + 2;
 
-        if self.element_rows.is_empty() {
-            shadowed(f, "  (no elements) break blocks", x, y, fs, Color::RAYWHITE);
-            y += line_h;
-        }
-        for (i, (element, name, count)) in self.element_rows.iter().enumerate() {
+        let stash = self.stash.borrow();
+        let elements = world.registry().elements();
+        let mut element_count = 0;
+        for (i, (element, count)) in stash.iter().enumerate() {
+            element_count += 1;
             let cursor = if self.cursor == i { ">" } else { " " };
-            let mark = if self.selected.contains(element) { "[x]" } else { "[ ]" };
-            let row = format!("{cursor} {mark} {count}x {name}");
+            let mark = if self.selected.contains(&element) { "[x]" } else { "[ ]" };
+            let row = format!("{cursor} {mark} {count}x {}", elements.get(element).name);
             shadowed(f, &row, x, y, fs, Color::RAYWHITE);
             y += line_h;
         }
+        if element_count == 0 {
+            shadowed(f, "  (no elements) break blocks", x, y, fs, Color::RAYWHITE);
+            y += line_h;
+        }
 
-        let craft_row = self.element_rows.len();
+        let craft_row = element_count;
         let cursor = if self.cursor == craft_row { ">" } else { " " };
         let row = format!("{cursor} [Craft: {} picked]", self.selected.len());
         shadowed(f, &row, x, y, fs, Color::GOLD);

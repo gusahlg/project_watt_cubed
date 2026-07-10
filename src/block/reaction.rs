@@ -6,8 +6,8 @@
 //!
 //! Like derivation, reaction matching runs once per block at registration, so the
 //! naive "test every reaction" scan here never touches the frame budget.
-use crate::block::composition::Composition;
-use crate::block::element::{CoreProperties, ElementId};
+use crate::block::composition::{Composition, Weights};
+use crate::block::element::{Core, CoreProperties, ElementId};
 
 /// An emergent property a reaction can grant that isn't one of the nine core
 /// properties. A tagged seam for behaviours later systems will read.
@@ -68,12 +68,17 @@ impl ReactionRegistry {
     }
 
     /// Every reaction whose reagents are all present in `comp`, each with its
-    /// computed strength. The strength compares the block's reagent ratios (the
-    /// reagents renormalised to 100% among themselves, ignoring inert filler) to
-    /// the reaction's optimum via L1 distance: identical ratios give `255`, and it
-    /// falls linearly to `0` at the maximum possible divergence.
+    /// computed strength. Strength compares the block's reagent ratios (ignoring
+    /// any inert filler) to the reaction's optimum: an exact match gives `255`,
+    /// tapering down to `0` the further the ratio drifts.
     pub fn active_for(&self, comp: &Composition) -> Box<[ActiveReaction]> {
-        let weights = comp.weights();
+        self.active_for_weights(&comp.weights())
+    }
+
+    /// [`active_for`](Self::active_for) from a precomputed [`Weights`], so the
+    /// registration path can reduce the composition once and share it across
+    /// derivation and reaction matching.
+    pub fn active_for_weights(&self, weights: &Weights) -> Box<[ActiveReaction]> {
         let mut active = Vec::new();
 
         for reaction in &self.reactions {
@@ -81,27 +86,32 @@ impl ReactionRegistry {
             let reagent_total: u32 = reaction
                 .reagents
                 .iter()
-                .map(|&(id, _)| weight_of(&weights, id))
+                .map(|&(id, _)| weights.weight_of(id))
                 .sum();
             let all_present = reaction
                 .reagents
                 .iter()
-                .all(|&(id, _)| weight_of(&weights, id) > 0);
-            if !all_present || reagent_total == 0 {
+                .all(|&(id, _)| weights.weight_of(id) > 0);
+            if !all_present {
                 continue;
             }
 
-            // L1 distance between actual reagent ratios and the optimum, in percent.
-            // Two distributions over the same support differ by at most 200.
-            let distance: u32 = reaction
+            // Compare actual reagent ratios to the reaction's optimum: sum the
+            // absolute percent differences across reagents. Accumulate over the
+            // common denominator `reagent_total` in u64 and divide once at the
+            // end, to avoid rounding each term down individually.
+            let total = reagent_total as u64;
+            let distance: u64 = reaction
                 .reagents
                 .iter()
                 .map(|&(id, optimal)| {
-                    let actual = weight_of(&weights, id) * 100 / reagent_total;
-                    actual.abs_diff(optimal as u32)
+                    let actual = weights.weight_of(id) as u64 * 100;
+                    let want = optimal as u64 * total;
+                    actual.abs_diff(want)
                 })
                 .sum();
-            let strength = (255 * (200u32.saturating_sub(distance)) / 200) as u8;
+            let max = 200 * total;
+            let strength = (255 * (max - distance.min(max)) / max) as u8;
 
             active.push(ActiveReaction {
                 name: reaction.name.clone(),
@@ -114,38 +124,17 @@ impl ReactionRegistry {
     }
 }
 
-/// The weight of a single element within a composition's weight list (`0` if absent).
-fn weight_of(weights: &[(ElementId, u16)], id: ElementId) -> u32 {
-    weights
-        .iter()
-        .find(|&&(e, _)| e == id)
-        .map(|&(_, w)| w as u32)
-        .unwrap_or(0)
-}
-
 /// Fold every active reaction's effect into a block's derived core properties.
 /// `CoreBonus` adds (saturating) each field scaled by `strength/255`; `Emergent`
 /// effects don't touch core properties (they live on the block record for now).
-pub fn apply_reactions(mut core: CoreProperties, active: &[ActiveReaction]) -> CoreProperties {
+pub fn apply_reactions(core: CoreProperties, active: &[ActiveReaction]) -> CoreProperties {
+    let mut acc = Core::from(core);
     for reaction in active {
         if let ReactionEffect::CoreBonus(bonus) = reaction.effect {
-            let scale = |v: u8| ((v as u32 * reaction.strength as u32) / 255) as u8;
-            core.durability = core.durability.saturating_add(scale(bonus.durability));
-            core.hardness = core.hardness.saturating_add(scale(bonus.hardness));
-            core.conductivity = core.conductivity.saturating_add(scale(bonus.conductivity));
-            core.thermal_conductivity = core
-                .thermal_conductivity
-                .saturating_add(scale(bonus.thermal_conductivity));
-            core.density = core.density.saturating_add(scale(bonus.density));
-            core.temperature_resistance = core
-                .temperature_resistance
-                .saturating_add(scale(bonus.temperature_resistance));
-            core.friction = core.friction.saturating_add(scale(bonus.friction));
-            core.light_emission = core.light_emission.saturating_add(scale(bonus.light_emission));
-            core.transparency = core.transparency.saturating_add(scale(bonus.transparency));
+            acc.add_scaled(Core::from(bonus), reaction.strength);
         }
     }
-    core
+    acc.into()
 }
 
 /// The built-in reaction table.
@@ -205,6 +194,29 @@ mod tests {
         let off = reg.active_for(&off);
         let off = off.iter().find(|r| r.name.as_ref() == "Alloy").unwrap();
         assert!(off.strength < peak.strength);
+    }
+
+    #[test]
+    fn duplicate_element_ratio_matches_equivalent_mixture() {
+        // A natural block whose reagents repeat (3 copper : 2 iron) must match the
+        // ratio of the equivalent 60/40 mixture.
+        let reg = ReactionRegistry::with_builtins();
+        let dup = Composition::natural(&[
+            El::Copper.id(),
+            El::Copper.id(),
+            El::Copper.id(),
+            El::Iron.id(),
+            El::Iron.id(),
+        ]);
+        let mix = Composition::mixture(&[(El::Copper.id(), 60), (El::Iron.id(), 40)]).unwrap();
+        let strength_of = |c: &Composition| {
+            reg.active_for(c)
+                .iter()
+                .find(|r| r.name.as_ref() == "Alloy")
+                .map(|r| r.strength)
+        };
+        assert_eq!(strength_of(&dup), Some(255), "3:2 hits the 60/40 optimum");
+        assert_eq!(strength_of(&dup), strength_of(&mix), "duplicate natural matches mixture ratio");
     }
 
     #[test]

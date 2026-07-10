@@ -3,29 +3,37 @@
 //! Press `T` (or `/`, which pre-fills a slash) to open it, type a line, and press
 //! Enter to submit; Esc closes it. Submitted lines are dispatched as commands by
 //! [`command`](crate::command). The console keeps a small scrollback `log`, so it
-//! doubles as the seed for a future chat box — swap the command dispatch for a
-//! network send and the UI is already here.
+//! doubles as a chat box — command output, chat, and system notices are the same
+//! scrollback of [`Line`]s, each span tagged with a [`Role`] that selects its
+//! colour when drawn.
+//!
+//! The editable line itself is a shared [`TextInput`], so cursor movement,
+//! history recall, word/line deletion, and Tab-completion all come for free and
+//! behave identically here and in any other text field.
 use voxel_engine::{Color, Engine, Frame, Key};
+
+use crate::command::COMMAND_NAMES;
+use crate::ui::{common_prefix, Completion, Line, Ring, Role, TextInput};
 
 /// Longest input line we accept.
 const MAX_INPUT: usize = 128;
 /// How many recent log lines to show on screen.
 const LOG_LINES: usize = 6;
 
-/// The console's state: whether it is capturing text, the current input line, and
-/// a bounded scrollback of past lines (command echoes and their output).
+/// The console's state: whether it is capturing text, the editable input line,
+/// and a bounded scrollback of past lines (chat, command echoes, and output).
 pub struct Console {
     active: bool,
-    input: String,
-    log: Vec<String>,
+    input: TextInput,
+    log: Ring<Line>,
 }
 
 impl Console {
     pub fn new() -> Self {
         Self {
             active: false,
-            input: String::new(),
-            log: Vec::new(),
+            input: TextInput::new(MAX_INPUT).with_completer(complete_command),
+            log: Ring::new(LOG_LINES * 4),
         }
     }
 
@@ -40,72 +48,83 @@ impl Console {
         self.active = true;
         self.input.clear();
         if slash {
-            self.input.push('/');
+            self.input.set("/");
         }
     }
 
-    /// Close the console and discard the in-progress line.
+    /// Close the console and discard the in-progress line (history is kept).
     pub fn close(&mut self) {
         self.active = false;
         self.input.clear();
     }
 
-    /// Append a line to the scrollback log, keeping it bounded.
+    /// Append a system/status line (the default role).
     pub fn print(&mut self, line: impl Into<String>) {
-        self.log.push(line.into());
-        let cap = LOG_LINES * 4;
-        if self.log.len() > cap {
-            let excess = self.log.len() - cap;
-            self.log.drain(0..excess);
-        }
+        self.push(Line::of(Role::System, line));
     }
 
-    /// Process this frame's text input. Returns the submitted line when the user
-    /// presses Enter (trimmed and non-empty), otherwise `None`. Esc closes the
-    /// console.
-    pub fn handle_input(&mut self, eng: &Engine) -> Option<String> {
-        // `get_char_pressed` already accounts for keyboard layout and shift state.
-        while let Some(c) = eng.get_char_pressed() {
-            if self.input.len() < MAX_INPUT && !c.is_control() {
-                self.input.push(c);
-            }
-        }
+    /// Echo a command the user submitted.
+    pub fn echo(&mut self, line: impl Into<String>) {
+        self.push(Line::of(Role::Command, format!("> {}", line.into())));
+    }
 
-        if eng.is_key_pressed(Key::Backspace) {
-            self.input.pop();
-        }
+    /// Append a pre-built line — the entry point for multi-colour lines (a
+    /// coloured player name, a highlighted value) that `print`/`echo` can't build.
+    pub fn push(&mut self, line: Line) {
+        self.log.push(line);
+    }
+
+    /// Process this frame's input. Returns the submitted line when the user
+    /// presses Enter (trimmed and non-empty), otherwise `None`. Esc closes the
+    /// console; an ambiguous Tab prints its candidate list to the log.
+    pub fn handle_input(&mut self, eng: &Engine) -> Option<String> {
         if eng.is_key_pressed(Key::Escape) {
             self.close();
             return None;
         }
-        if eng.is_key_pressed(Key::Enter) {
-            let line = std::mem::take(&mut self.input).trim().to_string();
+        let submitted = self.input.handle(eng);
+        if let Some(candidates) = self.input.take_notice() {
+            self.print(candidates.join("   "));
+        }
+        if let Some(line) = submitted {
             self.close();
-            if !line.is_empty() {
-                return Some(line);
-            }
+            return Some(line);
         }
         None
     }
 
     /// Draw the scrollback log (always, when non-empty) and, while open, the input
-    /// line. Kept at the bottom of the screen, chat-style.
+    /// line with a caret at the cursor. Kept at the bottom of the screen.
     pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
         let fs = 20;
         let line_h = fs + 4;
         let input_y = screen_h - line_h - 10;
 
-        // Recent log lines stacked upward, just above the input line.
-        for (i, line) in self.log.iter().rev().take(LOG_LINES).enumerate() {
+        // Recent log lines stacked upward, just above the input line. Each line's
+        // spans are drawn left-to-right; the monospace font makes `measure_text`
+        // an exact advance, so span placement needs no layout pass.
+        for (i, line) in self.log.iter_rev().take(LOG_LINES).enumerate() {
             let y = input_y - line_h * (i as i32 + 1) - 6;
-            shadowed(f, line, 12, y, fs, Color::RAYWHITE);
+            let mut x = 12;
+            for span in line.spans() {
+                shadowed(f, &span.text, x, y, fs, span.role.color());
+                x += f.measure_text(&span.text, fs);
+            }
         }
 
         if self.active {
             f.draw_rect(8, input_y - 4, screen_w - 16, line_h + 6, Color::new(0, 0, 0, 150));
-            // A trailing underscore stands in for a text cursor.
-            let text = format!("> {}_", self.input);
-            shadowed(f, &text, 12, input_y, fs, Color::YELLOW);
+            // Draw "> text" and a block caret sitting at the cursor column. We
+            // measure the text left of the cursor to place it, so mid-line edits
+            // show where typing will land.
+            let prompt = "> ";
+            let text = self.input.text();
+            let full = format!("{prompt}{text}");
+            shadowed(f, &full, 12, input_y, fs, Color::YELLOW);
+
+            let left = &full[..prompt.len() + self.input.cursor()];
+            let caret_x = 12 + f.measure_text(left, fs);
+            f.draw_rect(caret_x, input_y, 2, fs, Color::YELLOW);
         }
     }
 }
@@ -116,8 +135,65 @@ impl Default for Console {
     }
 }
 
+/// Tab-completion source for the console: complete the command word (the first
+/// token) against [`COMMAND_NAMES`], preserving a leading `/`. Once a space has
+/// been typed the command is chosen, so we stop offering completions.
+fn complete_command(input: &str) -> Completion {
+    let body = input.strip_prefix('/').unwrap_or(input);
+    if body.is_empty() || body.contains(char::is_whitespace) {
+        return Completion::None;
+    }
+    let lead = if input.starts_with('/') { "/" } else { "" };
+    let matches: Vec<&str> = COMMAND_NAMES
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with(body))
+        .collect();
+    match matches.as_slice() {
+        [] => Completion::None,
+        [only] => Completion::Full(format!("{lead}{only} ")),
+        many => Completion::Ambiguous(
+            format!("{lead}{}", common_prefix(many)),
+            many.iter().map(|s| s.to_string()).collect(),
+        ),
+    }
+}
+
 /// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
 pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
     f.draw_text(text, x + 1, y + 1, font_size, Color::new(0, 0, 0, 180));
     f.draw_text(text, x, y, font_size, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::Completion;
+
+    #[test]
+    fn completes_unique_command() {
+        match complete_command("po") {
+            Completion::Full(s) => assert_eq!(s, "pos "),
+            _ => panic!("expected a unique completion"),
+        }
+    }
+
+    #[test]
+    fn preserves_leading_slash() {
+        match complete_command("/po") {
+            Completion::Full(s) => assert_eq!(s, "/pos "),
+            _ => panic!("expected a unique completion"),
+        }
+    }
+
+    #[test]
+    fn empty_and_unknown_do_not_complete() {
+        assert!(matches!(complete_command(""), Completion::None));
+        assert!(matches!(complete_command("zzz"), Completion::None));
+    }
+
+    #[test]
+    fn no_completion_after_a_space() {
+        assert!(matches!(complete_command("tp 1"), Completion::None));
+    }
 }

@@ -18,10 +18,13 @@ use crate::block::element::{CoreProperties, El, ElementId, ElementRegistry, Spec
 use crate::block::reaction::{ActiveReaction, ReactionRegistry, apply_reactions};
 use crate::macros::blocks;
 
-/// A compact handle to a registered block. Voxels store this (2 bytes), so a chunk
-/// is just a flat array of ids into the registry.
+/// A compact handle to a registered block. Voxels store this (1 byte), so a chunk
+/// is just a flat array of ids into the registry. The [`MAX_BLOCK_TYPES`] cap keeps
+/// every id inside the `u8` space.
+///
+/// [`MAX_BLOCK_TYPES`]: BlockRegistry::MAX_BLOCK_TYPES
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BlockId(pub u16);
+pub struct BlockId(pub u8);
 
 /// Empty space. Always id `0`, the only non-solid block.
 pub const AIR: BlockId = BlockId(0);
@@ -45,14 +48,25 @@ pub struct Block {
 pub struct BlockRegistry {
     elements: ElementRegistry,
     reactions: ReactionRegistry,
-    // NOTE: These three could be put into a single vector holding a tuple of block, bool and color.
-    // This would be ideal since it is more efficient.
-    blocks: Vec<Block>, // cold records
-    solid: Vec<bool>,   // HOT, indexed by BlockId
-    color: Vec<Color>,  // HOT, indexed by BlockId
-
+    blocks: Vec<Block>,   // cold records
+    solid: Vec<bool>,     // HOT, indexed by BlockId — collision key ("is there a block")
+    opaque: Vec<bool>,    // HOT — mesher cull key (solid & transparency == 0)
+    emission: Vec<u8>,    // HOT — blocklight seed, 0..=15
+    color: Vec<Color>,    // HOT, indexed by BlockId
     dedup: HashMap<CompKey, BlockId>,
-    names: HashMap<String, BlockId>,
+    names: HashMap<Box<str>, BlockId>,
+}
+
+/// A cache-resident snapshot of the registry's hot per-voxel tables, indexed by
+/// [`BlockId`]. Bundled so meshing and light propagation read one immutable view
+/// at one revision (the registry is append-only, so `block_count()` stamps it) —
+/// no window in which `solid` is fresh but `opaque` is stale. Handed to worker
+/// mesh jobs behind an `Arc` via [`crate::derived::Derived`].
+#[derive(Default)]
+pub struct HotTables {
+    pub solid: Box<[bool]>,
+    pub opaque: Box<[bool]>,
+    pub emission: Box<[u8]>,
 }
 
 impl BlockRegistry {
@@ -64,6 +78,8 @@ impl BlockRegistry {
             reactions: ReactionRegistry::with_builtins(),
             blocks: Vec::new(),
             solid: Vec::new(),
+            opaque: Vec::new(),
+            emission: Vec::new(),
             color: Vec::new(),
             dedup: HashMap::new(),
             names: HashMap::new(),
@@ -77,6 +93,31 @@ impl BlockRegistry {
     #[inline]
     pub fn is_solid(&self, id: BlockId) -> bool {
         self.solid[id.0 as usize]
+    }
+
+    /// Whether the block hides the faces behind it — the mesher's cull key. A
+    /// translucent solid (glass) is solid but NOT opaque, so faces behind it
+    /// still draw. One array load, no branch, like [`is_solid`](Self::is_solid).
+    #[inline]
+    pub fn is_opaque(&self, id: BlockId) -> bool {
+        self.opaque[id.0 as usize]
+    }
+
+    /// The block's blocklight output, 0..=15. Read only during light propagation.
+    #[inline]
+    pub fn emission(&self, id: BlockId) -> u8 {
+        self.emission[id.0 as usize]
+    }
+
+    /// A fresh snapshot of the hot per-voxel tables for meshing/light jobs. Cheap
+    /// (three small array copies); rebuilt only when the palette grows, behind the
+    /// [`Derived`](crate::derived::Derived) revision cache on the world.
+    pub fn hot_tables(&self) -> HotTables {
+        HotTables {
+            solid: self.solid.clone().into_boxed_slice(),
+            opaque: self.opaque.clone().into_boxed_slice(),
+            emission: self.emission.clone().into_boxed_slice(),
+        }
     }
 
     /// The block's render colour. Read once per emitted mesh face.
@@ -124,55 +165,98 @@ impl BlockRegistry {
     /// the hot arrays. Returns the existing id if an identical composition is
     /// already registered, so equal blocks share one id.
     ///
-    /// Panics only if the palette would exceed the `u16` id space (65 536 blocks) —
-    /// a hard ceiling, reported rather than silently wrapped.
-    pub fn register(&mut self, name: &str, composition: Composition) -> BlockId {
+    /// Returns `None` if the composition is new and the palette is already at its
+    /// [`MAX_BLOCK_TYPES`](Self::MAX_BLOCK_TYPES) cap — the single gate that keeps
+    /// ids inside the `u8` voxel space rather than silently truncating.
+    ///
+    /// Name uniqueness is caller-enforced, not type-checked: if `name` was already
+    /// used for a *different* composition (e.g. two `Configuration`s with the same
+    /// mix but different `Layout`, since [`auto_name`](Self::auto_name) ignores
+    /// layout), the first registration wins and `id_by_name` keeps resolving to it.
+    pub fn register(&mut self, name: &str, composition: Composition) -> Option<BlockId> {
         let key = CompKey::of(&composition, self.blocks.len());
         if let Some(&existing) = self.dedup.get(&key) {
-            return existing;
+            return Some(existing);
         }
 
-        assert!(
-            self.blocks.len() <= u16::MAX as usize,
-            "block registry is full ({} blocks); BlockId is a u16",
-            self.blocks.len()
+        if self.at_capacity() {
+            return None;
+        }
+
+        // Reduce the composition to its weight multiset once, then share it
+        // across reaction matching and every derivation instead of re-walking
+        // it each time. (`derive_solid` only needs emptiness, not the weights.)
+        let weights = composition.weights();
+        let reactions = self.reactions.active_for_weights(&weights);
+        let core = apply_reactions(
+            derive::derive_core_from(&self.elements, &weights),
+            &reactions,
         );
-
-        let reactions = self.reactions.active_for(&composition);
-        let core = apply_reactions(derive::derive_core(&self.elements, &composition), &reactions);
-        let color = derive::derive_color(&self.elements, &composition);
+        let color = derive::derive_color_from(&self.elements, &weights);
         let solid = derive::derive_solid(&composition);
-        let specials = derive::derive_specials(&self.elements, &composition);
+        let opaque = derive::derive_opaque(&core, solid);
+        let emission = derive::derive_emission(&core);
+        let specials = derive::derive_specials_from(&self.elements, &weights);
 
-        let id = BlockId(self.blocks.len() as u16);
-        self.blocks.push(Block {
-            name: name.into(),
-            composition,
-            core,
-            specials,
-            reactions,
-        });
-        self.solid.push(solid);
-        self.color.push(color);
+        let id = self.push_block(
+            Block {
+                name: name.into(),
+                composition,
+                core,
+                specials,
+                reactions,
+            },
+            solid,
+            opaque,
+            emission,
+            color,
+        );
         self.dedup.insert(key, id);
-        self.names.entry(name.to_string()).or_insert(id);
+        debug_assert!(
+            self.names.get(name).is_none_or(|&existing| existing == id),
+            "block name collision: {name:?} already maps to a different id"
+        );
+        self.names.entry(name.into()).or_insert(id);
+        Some(id)
+    }
+
+    /// Append one block to the parallel SoA arrays in lockstep, returning its
+    /// freshly assigned [`BlockId`]. The single place the hot `solid`/`color`
+    /// arrays and the cold `blocks` vector grow together, so they can never
+    /// desync.
+    fn push_block(
+        &mut self,
+        block: Block,
+        solid: bool,
+        opaque: bool,
+        emission: u8,
+        color: Color,
+    ) -> BlockId {
+        let id = BlockId(self.blocks.len() as u8);
+        self.blocks.push(block);
+        self.solid.push(solid);
+        self.opaque.push(opaque);
+        self.emission.push(emission);
+        self.color.push(color);
         id
     }
 
     /// Craft a natural block from a set of elements (equal parts). The natural-tier
     /// crafter the player uses without a machine; also the modding entry point.
-    pub fn natural(&mut self, elements: &[ElementId]) -> BlockId {
+    /// Returns `None` if the palette is at capacity (see [`register`](Self::register)).
+    pub fn natural(&mut self, elements: &[ElementId]) -> Option<BlockId> {
         let composition = Composition::natural(elements);
         let name = self.auto_name(&composition);
         self.register(&name, composition)
     }
 
     /// Craft a mixture block from exact element percentages, which must sum to 100.
-    /// The first machine-crafted tier.
+    /// The first machine-crafted tier. Errors if the shares are invalid or the
+    /// palette is at capacity.
     pub fn mixture(&mut self, parts: &[(ElementId, u8)]) -> Result<BlockId, MixError> {
         let composition = Composition::mixture(parts)?;
         let name = self.auto_name(&composition);
-        Ok(self.register(&name, composition))
+        self.register(&name, composition).ok_or(MixError::Full)
     }
 
     /// A readable default name built from a composition's element names, e.g.
@@ -185,7 +269,7 @@ impl BlockRegistry {
                 .collect::<Vec<_>>()
                 .join("+"),
             Composition::Mixture(mix) | Composition::Configuration { mix, .. } => mix
-                .0
+                .parts()
                 .iter()
                 .map(|&(e, p)| format!("{}{}", self.elements.get(e).name, p))
                 .collect::<Vec<_>>()
@@ -195,13 +279,23 @@ impl BlockRegistry {
     }
 }
 
-/// A canonical, hashable key for deduplicating compositions. Element order is
-/// normalised so two natural blocks with the same elements collapse to one id.
+/// Which composition tier a [`CompKey::Reduced`] came from, so a `Mixture` and
+/// a `Configuration` with the same weights never collide even though they'd
+/// derive the same properties (layout aside).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Tier {
+    Natural,
+    Mixture,
+    Configuration,
+}
+
+/// A hashable key for deduplicating compositions. Element order is
+/// normalised so two blocks with the same tier and elements collapse to one id.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CompKey {
-    Natural(Vec<u16>),
-    Mix(Vec<(u16, u8)>),
-    Config(Vec<(u16, u8)>),
+    /// `Natural`/`Mixture`/`Configuration`, keyed by their weight multiset
+    /// (sorted by id, duplicates merged into a count/share).
+    Reduced(Tier, Vec<(u16, u32)>),
     /// Computational blocks are opaque, so they never dedup — keyed by a unique
     /// registration index instead.
     Computational(usize),
@@ -210,22 +304,20 @@ enum CompKey {
 impl CompKey {
     fn of(composition: &Composition, fresh_index: usize) -> Self {
         match composition {
-            Composition::Natural(els) => {
-                let mut v: Vec<u16> = els.iter().map(|e| e.0).collect();
-                v.sort_unstable(); // duplicates kept: they change derived weights
-                CompKey::Natural(v)
-            }
-            Composition::Mixture(mix) => CompKey::Mix(sorted_parts(mix)),
-            Composition::Configuration { mix, .. } => CompKey::Config(sorted_parts(mix)),
             Composition::Computational(_) => CompKey::Computational(fresh_index),
+            _ => {
+                let tier = match composition {
+                    Composition::Natural(_) => Tier::Natural,
+                    Composition::Mixture(_) => Tier::Mixture,
+                    Composition::Configuration { .. } => Tier::Configuration,
+                    Composition::Computational(_) => unreachable!("handled above"),
+                };
+                let parts =
+                    composition.weights().parts().iter().map(|&(e, w)| (e.0, w)).collect();
+                CompKey::Reduced(tier, parts)
+            }
         }
     }
-}
-
-fn sorted_parts(mix: &crate::block::composition::Mix) -> Vec<(u16, u8)> {
-    let mut v: Vec<(u16, u8)> = mix.0.iter().map(|&(e, p)| (e.0, p)).collect();
-    v.sort_unstable();
-    v
 }
 
 // The built-in block palette. `AIR` must be first (id 0). Built-in blocks are
@@ -271,6 +363,16 @@ blocks! {
     Sand => Composition::natural(&[El::Sand.id()]),
     // High-altitude island frosting.
     Ice => Composition::natural(&[El::Ice.id()]),
+    // Oceans, rivers, and lakes: a translucent solid you can stand on (the glass
+    // render path), filling every column up to sea level.
+    Water => Composition::natural(&[El::Water.id()]),
+    // Biome dressing on cold or high ground.
+    Snow => Composition::natural(&[El::Snow.id()]),
+    // Tree trunk: woody brown, distinct from packed dirt.
+    Wood => Composition::mixture(&[(El::Soil.id(), 55), (El::Coal.id(), 25), (El::Clay.id(), 20)])
+        .expect("builtin Wood sums to 100"),
+    // Tree canopy: pure living green.
+    Leaves => Composition::natural(&[El::Organic.id()]),
 }
 
 #[cfg(test)]
@@ -291,9 +393,12 @@ mod tests {
     fn hot_arrays_agree_with_cold_records() {
         let reg = BlockRegistry::with_builtins();
         for i in 0..reg.block_count() {
-            let id = BlockId(i as u16);
+            let id = BlockId(i as u8);
             let block = reg.block(id);
-            assert_eq!(reg.is_solid(id), derive::derive_solid(&block.composition));
+            let solid = derive::derive_solid(&block.composition);
+            assert_eq!(reg.is_solid(id), solid);
+            assert_eq!(reg.is_opaque(id), derive::derive_opaque(&block.core, solid));
+            assert_eq!(reg.emission(id), derive::derive_emission(&block.core));
             assert_eq!(reg.color(id), derive::derive_color(reg.elements(), &block.composition));
         }
     }
@@ -307,14 +412,54 @@ mod tests {
     #[test]
     fn identical_compositions_dedup() {
         let mut reg = BlockRegistry::with_builtins();
-        let a = reg.natural(&[El::Stone.id()]);
+        let a = reg.natural(&[El::Stone.id()]).unwrap();
         // Same as the built-in Stone — must resolve to the existing id, not a new one.
         assert_eq!(a, Blk::Stone.id());
         let before = reg.block_count();
-        let b = reg.natural(&[El::Iron.id(), El::Copper.id()]);
-        let c = reg.natural(&[El::Copper.id(), El::Iron.id()]); // order-independent
+        let b = reg.natural(&[El::Iron.id(), El::Copper.id()]).unwrap();
+        let c = reg.natural(&[El::Copper.id(), El::Iron.id()]).unwrap(); // order-independent
         assert_eq!(b, c);
         assert_eq!(reg.block_count(), before + 1);
+    }
+
+    #[test]
+    fn duplicated_natural_element_does_not_collapse_to_singleton() {
+        let mut reg = BlockRegistry::with_builtins();
+        let before = reg.block_count();
+        // [Stone, Stone] carries a different weight (count 2) than plain [Stone]
+        // (count 1), so it must register as a distinct block, not dedup with Stone.
+        let doubled = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
+        assert_ne!(doubled, Blk::Stone.id());
+        assert_eq!(reg.block_count(), before + 1);
+        // Registering the same doubled composition again dedups with itself.
+        let doubled_again = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
+        assert_eq!(doubled, doubled_again);
+        assert_eq!(reg.block_count(), before + 1);
+    }
+
+    #[test]
+    fn registering_past_cap_refuses_rather_than_wraps() {
+        use crate::block::element::ElementId;
+        let mut reg = BlockRegistry::with_builtins();
+        let n = reg.elements().len() as u16;
+        // Fill the palette to its cap with distinct three-element natural blocks.
+        'fill: for i in 0..n {
+            for j in (i + 1)..n {
+                for k in (j + 1)..n {
+                    if reg.at_capacity() {
+                        break 'fill;
+                    }
+                    reg.natural(&[ElementId(i), ElementId(j), ElementId(k)]);
+                }
+            }
+        }
+        assert!(reg.at_capacity(), "test needs enough elements to fill the palette");
+        assert_eq!(reg.block_count(), BlockRegistry::MAX_BLOCK_TYPES);
+        // A brand-new composition past the cap is refused, not truncated into a
+        // colliding u8 voxel id.
+        assert_eq!(reg.natural(&[ElementId(0), ElementId(1), ElementId(2), ElementId(3)]), None);
+        assert_eq!(reg.mixture(&[(ElementId(0), 60), (ElementId(1), 40)]), Err(MixError::Full));
+        assert_eq!(reg.block_count(), BlockRegistry::MAX_BLOCK_TYPES);
     }
 
     #[test]

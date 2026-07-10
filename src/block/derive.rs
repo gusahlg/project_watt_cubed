@@ -7,86 +7,42 @@
 //! favours clarity over raw speed — the hot path reads the precomputed results.
 use voxel_engine::Color;
 
-use crate::block::composition::Composition;
-use crate::block::element::{CoreProperties, ElementRegistry, SpecialKind};
-
-/// The nine core fields in a fixed order, so derivation can loop over them.
-const FIELD_COUNT: usize = 9;
-
-/// Read an element's core properties into the fixed-order array used for averaging.
-fn fields(c: &CoreProperties) -> [u8; FIELD_COUNT] {
-    [
-        c.durability,
-        c.hardness,
-        c.conductivity,
-        c.thermal_conductivity,
-        c.density,
-        c.temperature_resistance,
-        c.friction,
-        c.light_emission,
-        c.transparency,
-    ]
-}
-
-/// Rebuild core properties from the fixed-order array.
-fn from_fields(f: [u8; FIELD_COUNT]) -> CoreProperties {
-    CoreProperties {
-        durability: f[0],
-        hardness: f[1],
-        conductivity: f[2],
-        thermal_conductivity: f[3],
-        density: f[4],
-        temperature_resistance: f[5],
-        friction: f[6],
-        light_emission: f[7],
-        transparency: f[8],
-    }
-}
+use crate::block::bary::{SparseSpecials, barycenter};
+use crate::block::composition::{Composition, Weights};
+use crate::block::element::{Core, CoreProperties, ElementRegistry, SpecialKind};
 
 /// Each core property of a block is the weighted average of its elements'. With
 /// natural weights of `1` this is the plain mean (so equal parts of `1, 2, 3`
 /// derive `2`); with mixture percentages it is the percentage-weighted mean.
 pub fn derive_core(els: &ElementRegistry, comp: &Composition) -> CoreProperties {
-    let mut acc = [0u32; FIELD_COUNT];
-    let mut total = 0u32;
+    derive_core_from(els, &comp.weights())
+}
 
-    for (id, weight) in comp.weights().iter().copied() {
-        let f = fields(&els.get(id).core);
-        for i in 0..FIELD_COUNT {
-            acc[i] += f[i] as u32 * weight as u32;
-        }
-        total += weight as u32;
-    }
-
-    if total == 0 {
-        return CoreProperties::default();
-    }
-    from_fields(std::array::from_fn(|i| (acc[i] / total) as u8))
+/// [`derive_core`] from a precomputed [`Weights`], so a caller registering a
+/// block can reduce the composition once and share it across every derivation.
+pub fn derive_core_from(els: &ElementRegistry, weights: &Weights) -> CoreProperties {
+    Core::blend(
+        weights
+            .parts()
+            .iter()
+            .map(|&(id, weight)| (Core::from(els.get(id).core), weight)),
+    )
+    .into()
 }
 
 /// The block's colour is its element tints averaged by the same weights — a
 /// 70/30 soil/clay mix looks 70% soil. Air (no elements) is transparent.
 pub fn derive_color(els: &ElementRegistry, comp: &Composition) -> Color {
-    let mut acc = [0u32; 4];
-    let mut total = 0u32;
+    derive_color_from(els, &comp.weights())
+}
 
-    for (id, weight) in comp.weights().iter().copied() {
-        let c = els.get(id).color;
-        let channels = [c.r, c.g, c.b, c.a];
-        for i in 0..4 {
-            acc[i] += channels[i] as u32 * weight as u32;
-        }
-        total += weight as u32;
-    }
-
-    if total == 0 {
-        return Color::new(0, 0, 0, 0);
-    }
-    Color::new(
-        (acc[0] / total) as u8,
-        (acc[1] / total) as u8,
-        (acc[2] / total) as u8,
-        (acc[3] / total) as u8,
+/// [`derive_color`] from a precomputed [`Weights`].
+pub fn derive_color_from(els: &ElementRegistry, weights: &Weights) -> Color {
+    barycenter(
+        weights
+            .parts()
+            .iter()
+            .map(|&(id, weight)| (els.get(id).color, weight)),
     )
 }
 
@@ -97,32 +53,44 @@ pub fn derive_solid(comp: &Composition) -> bool {
     !comp.is_empty()
 }
 
+/// Whether a block hides the faces behind it — the mesher's cull key (distinct
+/// from [`derive_solid`], which is collision's key). A block is opaque when it is
+/// solid *and* lets no light through (`transparency == 0`); a translucent solid
+/// like glass is solid but NOT opaque, so faces behind it still draw. Air is
+/// non-solid, hence non-opaque.
+pub fn derive_opaque(core: &CoreProperties, solid: bool) -> bool {
+    solid && core.transparency == 0
+}
+
+/// A block's blocklight output on the mesher's 0..=15 scale, rescaled from the
+/// element `light_emission` (0..=255). Baked once per block; the light BFS seeds
+/// from blocks whose value is > 0.
+pub fn derive_emission(core: &CoreProperties) -> u8 {
+    (core.light_emission as u16 * 15 / 255) as u8
+}
+
 /// Special behaviours a block exhibits, each scaled by how much of the carrying
 /// element it contains and summed across carriers. Returned sorted by kind for a
 /// stable, inspectable order.
 pub fn derive_specials(els: &ElementRegistry, comp: &Composition) -> Box<[(SpecialKind, u8)]> {
-    let weights = comp.weights();
-    let total: u32 = weights.iter().map(|&(_, w)| w as u32).sum();
-    if total == 0 {
-        return Box::from([]);
-    }
+    derive_specials_from(els, &comp.weights())
+}
 
-    // Accumulate each kind's weighted strength across every element that carries it.
-    let mut sums: Vec<(SpecialKind, u32)> = Vec::new();
-    for (id, weight) in weights.iter().copied() {
-        for special in els.get(id).specials.iter().copied() {
-            let contribution = special.strength() as u32 * weight as u32;
-            match sums.iter_mut().find(|(k, _)| *k == special.kind()) {
-                Some((_, acc)) => *acc += contribution,
-                None => sums.push((special.kind(), contribution)),
-            }
-        }
-    }
-
-    sums.sort_by_key(|&(k, _)| k);
-    sums.into_iter()
-        .map(|(k, acc)| (k, (acc / total) as u8))
-        .collect()
+/// [`derive_specials`] from a precomputed [`Weights`].
+pub fn derive_specials_from(els: &ElementRegistry, weights: &Weights) -> Box<[(SpecialKind, u8)]> {
+    // Each element contributes its specials (kind + strength) weighted by its
+    // share; barycenter merges by kind, sorts, and divides by the total.
+    barycenter(weights.parts().iter().map(|&(id, weight)| {
+        let specials = els
+            .get(id)
+            .specials
+            .iter()
+            .map(|s| (s.kind(), s.strength()))
+            .collect();
+        (SparseSpecials(specials), weight)
+    }))
+    .0
+    .into()
 }
 
 #[cfg(test)]
@@ -136,8 +104,7 @@ mod tests {
 
     #[test]
     fn documented_average_holds() {
-        // A bespoke three-element registry with durabilities 1, 2, 3: equal parts
-        // must derive exactly 2, the documented example.
+        // Three elements with durabilities 1, 2, 3: equal parts should derive 2.
         let mut els = ElementRegistry::with_builtins();
         let mut mk = |d: u8| {
             els.register(crate::block::element::Element {
