@@ -70,7 +70,7 @@ impl RemotePlayer {
         } else {
             1.0
         };
-        let pos = self.prev.pos + (self.target.pos - self.prev.pos) * alpha;
+        let pos = self.prev.pos.lerp(self.target.pos, alpha);
         let yaw = lerp_angle(self.prev.yaw, self.target.yaw, alpha as f32);
         let pitch = self.prev.pitch + (self.target.pitch - self.prev.pitch) * alpha as f32;
         let speed = if secs > 0.0 {

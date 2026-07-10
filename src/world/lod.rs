@@ -140,9 +140,19 @@ fn sample_coarse<T: TerrainGenerator>(tile: Tile, terrain: &T) -> (Padded, Optio
 /// Vertices are cell-local 0..=16, drawn at scale=lod.cell() + tile origin.
 /// Lit flat; only opaque pass kept. Empty tiles become Air state.
 pub fn build_tile_mesh<T: TerrainGenerator>(tile: Tile, terrain: &T, tables: &HotTables) -> MeshData {
+    use voxel_engine::profile::{Meter, add};
+    // Split the tile job into its two halves — coarse generator sampling vs.
+    // greedy meshing — so the unified report shows which one the ~46ms/job cost
+    // lives in. Worker-thread code, but `profile` is an atomic global sink.
+    let t0 = std::time::Instant::now();
     let (padded, uniform) = sample_coarse(tile, terrain);
+    add(Meter::TileSample, t0.elapsed());
+
+    let t1 = std::time::Instant::now();
     let mut data = new_chunk_mesh_data();
     build_chunk_mesh(&padded, uniform, tables, &PaddedLight::full(), &mut data);
+    add(Meter::TileMesh, t1.elapsed());
+
     let [opaque, _transparent] = data.into_slots();
     opaque
 }

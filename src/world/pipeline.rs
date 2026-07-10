@@ -142,6 +142,18 @@ impl Drop for Workers {
     }
 }
 
+/// The profiler meter for a job kind. Workers run off the main thread, but
+/// [`voxel_engine::profile`] is an atomic global, so they feed the same unified
+/// report as the CPU and GPU tiers.
+fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
+    use voxel_engine::profile::Meter;
+    match job {
+        Job::Generate { .. } => Meter::WorkGenerate,
+        Job::Mesh { .. } => Meter::WorkMesh,
+        Job::Tile { .. } => Meter::WorkTile,
+    }
+}
+
 fn worker_loop(queue: &Mutex<Receiver<Job>>, done: &Sender<Done>) {
     loop {
         // Lock only around `recv`; the job itself runs unlocked. A poisoned
@@ -153,7 +165,11 @@ fn worker_loop(queue: &Mutex<Receiver<Job>>, done: &Sender<Done>) {
         let Ok(job) = job else {
             return; // queue closed: the world is shutting the pool down
         };
-        if done.send(run(job)).is_err() {
+        let meter = job_meter(&job);
+        let start = std::time::Instant::now();
+        let result = run(job);
+        voxel_engine::profile::add(meter, start.elapsed());
+        if done.send(result).is_err() {
             return; // result channel closed mid-shutdown: stop early
         }
     }

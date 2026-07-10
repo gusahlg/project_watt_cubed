@@ -103,6 +103,26 @@ impl App {
         join_model.set_text(0, &session.address);
         join_model.set_text(1, &session.port);
         join_model.set_text(3, &session.name);
+        let bench = std::env::var("WATT_BENCH").ok().map(|v| Bench {
+            duration: v.parse().unwrap_or(10.0),
+            warmup: 3.0,
+            elapsed: 0.0,
+            samples: Vec::with_capacity(1 << 17),
+            started: false,
+            pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
+        });
+        // A benchmark run auto-enables both profilers (CPU subsystems + workers
+        // via VOXEL_PROFILE, frame phases + per-pass GPU via VOXEL_ENGINE_TIMING)
+        // unless the caller set them explicitly. Safe here: `new()` runs on the
+        // main thread at startup, before the renderer or any worker thread — the
+        // only readers of these vars — exist. Reads happen later.
+        if bench.is_some() {
+            for key in ["VOXEL_PROFILE", "VOXEL_ENGINE_TIMING"] {
+                if std::env::var_os(key).is_none() {
+                    unsafe { std::env::set_var(key, "1") };
+                }
+            }
+        }
         Self {
             game: None,
             main_model: menu::main_menu_model(&saves),
@@ -117,14 +137,7 @@ impl App {
             status: None,
             settings,
             session,
-            bench: std::env::var("WATT_BENCH").ok().map(|v| Bench {
-                duration: v.parse().unwrap_or(10.0),
-                warmup: 3.0,
-                elapsed: 0.0,
-                samples: Vec::with_capacity(1 << 17),
-                started: false,
-                pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
-            }),
+            bench,
         }
     }
 

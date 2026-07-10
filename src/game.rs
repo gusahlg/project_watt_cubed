@@ -144,7 +144,11 @@ impl Game {
 
         // Drain the server first so edits and chat keep flowing even while the
         // console is open or the player stands still.
-        if self.apply_net_events() {
+        let net_disconnected = {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
+            self.apply_net_events()
+        };
+        if net_disconnected {
             self.console.print("* disconnected from server".to_string());
             return Signal::ExitToMenu;
         }
@@ -200,7 +204,10 @@ impl Game {
         }
 
         let input = movement::MoveInput::from_input(eng);
-        movement::update_player(&mut self.player, &self.world, &input, dt);
+        {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::Physics);
+            movement::update_player(&mut self.player, &self.world, &input, dt);
+        }
 
         // Break the aimed-at block into its elements while actually aiming (cursor
         // locked, not navigating a free cursor).
@@ -406,8 +413,12 @@ impl Game {
 
         {
             let mut f3 = f.begin_3d(&camera);
-            self.sky.apply(&mut f3);
-            self.sky.draw(&mut f3);
+            {
+                let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
+                self.sky.apply(&mut f3);
+                self.sky.draw(&mut f3);
+            }
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
             self.world.render(&mut f3, cam_pos);
             // Other players: a six-box humanoid facing their travel/look
             // direction, arms and legs swinging with their gait. `peer.feet` is
@@ -418,6 +429,7 @@ impl Game {
             }
         }
 
+        let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
         // Draw minimap.
         self.minimap.draw(&mut f, screen, self.player.yaw);
 

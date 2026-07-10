@@ -69,7 +69,10 @@ impl World {
         self.occlusion_dirty.raise(full_pass);
         // Land worker results before the scans below, so freshly generated
         // chunks count as data this frame and finished meshes draw this frame.
-        self.drain_results(eng);
+        {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
+            self.drain_results(eng);
+        }
         if full_pass {
             self.unload_far(center_chunk, eng);
             self.request_region_data(center_chunk);
@@ -112,16 +115,25 @@ impl World {
         // Settle light BEFORE meshing: it is cheap (main-thread Gauss-Seidel over
         // the worklist) and the mesh gate waits on it, so relaxing first lets a
         // freshly settled chunk mesh the same frame.
-        self.settle_light(center_chunk);
-        self.build_meshes(center_chunk, eng);
+        {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamLight);
+            self.settle_light(center_chunk);
+        }
+        {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamMesh);
+            self.build_meshes(center_chunk, eng);
+        }
         // Far LOD tiles: a parallel lane. Select/unload only on a boundary cross;
         // enqueue is budgeted, so `pending_tiles` spreads a world-entry flood.
-        if full_pass {
-            self.unload_tiles(center_chunk, eng);
-            self.pending_tiles.set();
-        }
-        if self.pending_tiles.get() {
-            self.enqueue_tiles(center_chunk);
+        {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamTiles);
+            if full_pass {
+                self.unload_tiles(center_chunk, eng);
+                self.pending_tiles.set();
+            }
+            if self.pending_tiles.get() {
+                self.enqueue_tiles(center_chunk);
+            }
         }
         // Occlusion is derived state, rebuilt here at the `&mut` sync point (never
         // in the `&self` render) — and only when the adaptive gate is active AND
@@ -130,6 +142,7 @@ impl World {
         // pays nothing for occlusion.
         let occlusion_on = self.occlusion_enabled();
         if occlusion_on && (self.occlusion_dirty.take() || !self.occlusion_active) {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamOcclusion);
             self.rebuild_occlusion(center_chunk);
         }
         self.occlusion_active = occlusion_on;
