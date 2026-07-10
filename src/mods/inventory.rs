@@ -10,7 +10,7 @@
 //! [`mods`](crate::mods)): this mod fills and displays it, the crafting mod spends
 //! from it. Its save format is unchanged from when it owned the items outright —
 //! one element name per held unit — so old save files load identically.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,8 @@ use voxel_engine::{Color, Engine, Frame, Key};
 
 use crate::block::ElementId;
 use crate::console::shadowed;
-use crate::mods::{ElementStash, Mod, ModContext};
+use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
+use crate::ui::ellipsize;
 use crate::world::World;
 
 /// Starting capacity. Large-looking, but with no stacking it is modest — and meant
@@ -29,25 +30,50 @@ pub(crate) const START_CAPACITY: usize = 100;
 /// overflowing break.
 const OVERFLOW_WARNING: Duration = Duration::from_millis(2500);
 
+pub(crate) const PANEL_X: i32 = 12;
+pub(crate) const PANEL_Y: i32 = 44;
+const PANEL_WIDTH: i32 = 300;
+const PANEL_PAD: i32 = 8;
+const FONT_SIZE: i32 = 18;
+const LINE_HEIGHT: i32 = FONT_SIZE + 4;
+/// Console scrollback occupies the bottom 184 pixels at its maximum extent.
+const BOTTOM_RESERVE: i32 = 234;
+
 /// The bare-list inventory view over the shared stash, and its HUD toggle.
 pub struct InventoryMod {
     /// The shared element counts (filled here, spent by crafting).
     stash: Rc<RefCell<ElementStash>>,
-    /// Whether the list is currently drawn (toggled with `I`).
-    visible: bool,
+    /// Shared with crafting so its expanded panel replaces this compact list.
+    ui: Rc<Cell<ItemUiState>>,
     /// When a break last overflowed the stash (elements were destroyed), if
     /// within the warning window. Drives the HUD's "elements lost" warning.
     overflow_at: Option<Instant>,
 }
 
 impl InventoryMod {
-    pub fn new(stash: Rc<RefCell<ElementStash>>) -> Self {
+    pub(crate) fn new(stash: Rc<RefCell<ElementStash>>, ui: Rc<Cell<ItemUiState>>) -> Self {
         Self {
             stash,
-            visible: true,
+            ui,
             overflow_at: None,
         }
     }
+
+    /// Bottom edge of the compact panel for `kinds` rows at this screen height.
+    /// Crafting uses the same calculation to place its equipped hint below it.
+    pub(crate) fn panel_bottom(screen_h: i32, kinds: usize) -> i32 {
+        let rows = visible_rows(screen_h, kinds).max(1);
+        PANEL_Y + PANEL_PAD * 2 + LINE_HEIGHT + 2 + rows as i32 * LINE_HEIGHT
+    }
+}
+
+fn row_capacity(screen_h: i32) -> usize {
+    let content_y = PANEL_Y + PANEL_PAD + LINE_HEIGHT + 2;
+    ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize
+}
+
+fn visible_rows(screen_h: i32, kinds: usize) -> usize {
+    kinds.min(row_capacity(screen_h))
 }
 
 impl Mod for InventoryMod {
@@ -62,13 +88,17 @@ impl Mod for InventoryMod {
     fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
         // `I` shows/hides the list, but not while something else is capturing keys.
         if !ctx.capturing_text && eng.is_key_pressed(Key::I) {
-            self.visible = !self.visible;
+            let mut ui = self.ui.get();
+            ui.inventory_visible = !ui.inventory_visible;
+            self.ui.set(ui);
         }
     }
 
     fn reset(&mut self) {
         self.stash.borrow_mut().clear();
-        self.visible = false;
+        let mut ui = self.ui.get();
+        ui.inventory_visible = true;
+        self.ui.set(ui);
         self.overflow_at = None;
     }
 
@@ -82,44 +112,82 @@ impl Mod for InventoryMod {
         }
     }
 
-    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, _screen_h: i32) {
-        let fs = 18;
-        let line_h = fs + 4;
-        let x = screen_w - 230;
-        let mut y = 90;
+    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
+        let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
+        let text_x = PANEL_X + PANEL_PAD;
 
         // The overflow warning outlives the list toggle: it is drawn for a
         // short window after the last overflowing break EVEN while the list is
         // closed, above where the list's header sits.
-        if let Some(at) = self.overflow_at {
-            if at.elapsed() <= OVERFLOW_WARNING {
-                shadowed(f, "Inventory full - elements lost!", x, y - line_h, fs, Color::RED);
-            } else {
+        let overflow = self
+            .overflow_at
+            .is_some_and(|at| at.elapsed() <= OVERFLOW_WARNING);
+        if self.overflow_at.is_some() && !overflow {
                 self.overflow_at = None;
             }
-        }
 
-        if !self.visible {
+        let ui = self.ui.get();
+        if !ui.inventory_visible || ui.crafting_open {
+            if overflow {
+                let text = "Inventory full - elements lost!";
+                let x = ((screen_w - f.measure_text(text, FONT_SIZE)) / 2).max(0);
+                shadowed(f, text, x, PANEL_Y, FONT_SIZE, Color::RED);
+            }
             return;
         }
 
         let stash = self.stash.borrow();
         let elements = world.registry().elements();
+        let total = stash.total();
+        let kind_count = stash.iter().count();
+        let shown = visible_rows(screen_h, kind_count);
+        let body_rows = shown.max(1);
+        let height = PANEL_PAD * 2 + LINE_HEIGHT + 2 + body_rows as i32 * LINE_HEIGHT;
+        f.draw_rect(PANEL_X, PANEL_Y, width, height, Color::new(8, 10, 14, 190));
 
-        let header = format!("Inventory  {}/{}", stash.total(), stash.capacity());
-        shadowed(f, &header, x, y, fs, Color::GOLD);
-        y += line_h + 2;
+        let header = if overflow {
+            ellipsize(
+                "Inventory full - elements lost!",
+                ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize,
+            )
+        } else {
+            format!("Inventory  {total}/{}", stash.capacity())
+        };
+        shadowed(
+            f,
+            &header,
+            text_x,
+            PANEL_Y + PANEL_PAD,
+            FONT_SIZE,
+            if overflow { Color::RED } else { Color::GOLD },
+        );
+        let mut y = PANEL_Y + PANEL_PAD + LINE_HEIGHT + 2;
 
-        if stash.total() == 0 {
-            shadowed(f, "  (empty) break blocks", x, y, fs, Color::RAYWHITE);
+        if total == 0 {
+            shadowed(f, "(empty)", text_x, y, FONT_SIZE, Color::RAYWHITE);
             return;
         }
 
-        // Cap the visible rows so a full inventory doesn't run off-screen.
-        for (element, count) in stash.iter().take(14) {
-            let row = format!("  {count}x {}", elements.get(element).name);
-            shadowed(f, &row, x, y, fs, Color::RAYWHITE);
-            y += line_h;
+        let max_chars = ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize;
+        for (element, count) in stash.iter().take(shown) {
+            let row = ellipsize(
+                &format!("{count}x {}", elements.get(element).name),
+                max_chars,
+            );
+            shadowed(f, &row, text_x, y, FONT_SIZE, Color::RAYWHITE);
+            y += LINE_HEIGHT;
+        }
+        if kind_count > shown && shown > 0 {
+            let hidden = kind_count - shown + 1;
+            let row_y = y - LINE_HEIGHT;
+            shadowed(
+                f,
+                &format!("+{hidden} more"),
+                text_x,
+                row_y,
+                FONT_SIZE,
+                Color::LIGHTGRAY,
+            );
         }
     }
 
@@ -159,12 +227,16 @@ mod tests {
     fn old_save_lines_load_and_resave_in_the_same_format() {
         let mut world = World::new(1);
         let stash = Rc::new(RefCell::new(ElementStash::new(10)));
-        let mut inventory = InventoryMod::new(stash.clone());
+        let mut inventory =
+            InventoryMod::new(stash.clone(), Rc::new(Cell::new(ItemUiState::default())));
         // A pre-stash save line: one element name per held unit, pickup order,
         // possibly interleaved. Unknown names are skipped, exactly as before.
         inventory.load_state("Stone,Soil,Stone,Bogus", &mut world);
         assert_eq!(stash.borrow().total(), 3);
-        assert_eq!(stash.borrow().count(crate::block::element::El::Stone.id()), 2);
+        assert_eq!(
+            stash.borrow().count(crate::block::element::El::Stone.id()),
+            2
+        );
         // Re-saving emits the same one-name-per-unit format (grouped by
         // first-seen element, which the old grouped HUD view matched anyway).
         assert_eq!(
@@ -177,32 +249,52 @@ mod tests {
     fn breaking_into_a_full_stash_arms_the_overflow_warning() {
         let world = World::new(1);
         let stash = Rc::new(RefCell::new(ElementStash::new(1)));
-        let mut inventory = InventoryMod::new(stash.clone());
+        let mut inventory =
+            InventoryMod::new(stash.clone(), Rc::new(Cell::new(ItemUiState::default())));
         let stone = crate::block::element::El::Stone.id();
 
         // Room left: no warning.
         inventory.on_block_break(&[stone], &world);
-        assert!(inventory.overflow_at.is_none(), "no warning while everything fits");
+        assert!(
+            inventory.overflow_at.is_none(),
+            "no warning while everything fits"
+        );
 
         // Full: the element is destroyed, and the warning must be armed.
         inventory.on_block_break(&[stone], &world);
-        assert_eq!(stash.borrow().total(), 1, "the overflow element was dropped");
-        let armed = inventory.overflow_at.expect("dropping elements must arm the warning");
-        assert!(armed.elapsed() <= OVERFLOW_WARNING, "freshly armed: inside the window");
+        assert_eq!(
+            stash.borrow().total(),
+            1,
+            "the overflow element was dropped"
+        );
+        let armed = inventory
+            .overflow_at
+            .expect("dropping elements must arm the warning");
+        assert!(
+            armed.elapsed() <= OVERFLOW_WARNING,
+            "freshly armed: inside the window"
+        );
 
         // Entering another world clears the warning with the rest of the state.
         inventory.reset();
-        assert!(inventory.overflow_at.is_none(), "reset must clear the warning");
+        assert!(
+            inventory.overflow_at.is_none(),
+            "reset must clear the warning"
+        );
     }
 
     #[test]
     fn load_replaces_previous_contents() {
         let mut world = World::new(1);
         let stash = Rc::new(RefCell::new(ElementStash::new(10)));
-        let mut inventory = InventoryMod::new(stash.clone());
+        let mut inventory =
+            InventoryMod::new(stash.clone(), Rc::new(Cell::new(ItemUiState::default())));
         inventory.load_state("Stone,Stone", &mut world);
         inventory.load_state("Iron", &mut world);
         assert_eq!(stash.borrow().total(), 1);
-        assert_eq!(stash.borrow().count(crate::block::element::El::Iron.id()), 1);
+        assert_eq!(
+            stash.borrow().count(crate::block::element::El::Iron.id()),
+            1
+        );
     }
 }

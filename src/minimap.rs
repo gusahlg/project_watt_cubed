@@ -9,12 +9,12 @@
 
 use std::time::{Duration, Instant};
 
-use voxel_engine::{Color, Engine, Frame, IVec2};
+use voxel_engine::{Color, Engine, Frame, IVec2, Vec2};
 
 use crate::world::World;
 
 /// How the map is oriented relative to the world.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Orientation {
     /// North (−Z? +Z — the world's fixed axis) always points up; the map never
     /// rotates and the player marker spins instead.
@@ -123,7 +123,11 @@ impl Minimap {
                     continue;
                 }
                 let nx = if u > 0 { self.top_y[idx - 1] } else { i32::MIN };
-                let nz = if v > 0 { self.top_y[idx - sz] } else { i32::MIN };
+                let nz = if v > 0 {
+                    self.top_y[idx - sz]
+                } else {
+                    i32::MIN
+                };
                 let neighbour = nx.max(nz);
                 if neighbour == i32::MIN {
                     continue;
@@ -145,16 +149,85 @@ impl Minimap {
         self.last_refresh = Some(now);
     }
 
-    /// Draws the minimap quad. `rotation = match orient { NorthUp => 0.0,
-    /// Heading => -yaw }`.
-    pub fn draw(&self, f: &mut Frame, screen: (i32, i32), yaw: f32) {
+    /// Draw the map, border, and player marker. Between raster refreshes the
+    /// marker tracks the player's offset from the cached center instead of
+    /// falsely remaining centered over stale terrain.
+    pub fn draw(&self, f: &mut Frame, screen: (i32, i32), player_col: IVec2, yaw: f32) {
         let half = self.cfg.screen_px as f32 / 2.0;
         let cx = screen.0 as f32 - self.cfg.margin.0 as f32 - half;
         let cy = self.cfg.margin.1 as f32 + half;
-        let rotation = match self.cfg.orient {
-            Orientation::NorthUp => 0.0,
-            Orientation::Heading => -yaw,
-        };
+        let rotation = map_rotation(self.cfg.orient, yaw);
         f.draw_minimap([cx, cy], half, rotation, Color::WHITE);
+
+        let edge = half as i32;
+        let (left, top) = (cx as i32 - edge, cy as i32 - edge);
+        let (right, bottom) = (cx as i32 + edge, cy as i32 + edge);
+        let border = Color::new(235, 238, 244, 210);
+        f.draw_line(left, top, right, top, border);
+        f.draw_line(right, top, right, bottom, border);
+        f.draw_line(right, bottom, left, bottom, border);
+        f.draw_line(left, bottom, left, top, border);
+
+        let center = self.center.unwrap_or(player_col);
+        let texel_scale = self.cfg.screen_px as f32 / self.cfg.size as f32;
+        let map_offset = Vec2::new(
+            (player_col.x - center.x) as f32 * texel_scale,
+            (player_col.y - center.y) as f32 * texel_scale,
+        );
+        let (sin, cos) = rotation.sin_cos();
+        let marker = Vec2::new(
+            cx + map_offset.x * cos - map_offset.y * sin,
+            cy + map_offset.x * sin + map_offset.y * cos,
+        );
+        let marker_angle = match self.cfg.orient {
+            Orientation::NorthUp => yaw,
+            Orientation::Heading => -std::f32::consts::FRAC_PI_2,
+        };
+        draw_player_marker(f, marker, marker_angle);
+    }
+}
+
+/// In heading-up mode yaw zero points along world +X (texture-right), so the
+/// map needs an additional quarter-turn to place that direction at screen-up.
+fn map_rotation(orientation: Orientation, yaw: f32) -> f32 {
+    match orientation {
+            Orientation::NorthUp => 0.0,
+        Orientation::Heading => -yaw - std::f32::consts::FRAC_PI_2,
+    }
+}
+
+fn draw_player_marker(f: &mut Frame, center: Vec2, angle: f32) {
+    let dir = Vec2::new(angle.cos(), angle.sin());
+    let side = Vec2::new(-dir.y, dir.x);
+    let tip = center + dir * 10.0;
+    let tail = center - dir * 7.0;
+    let left = tail + side * 5.0;
+    let right = tail - side * 5.0;
+    let line = |f: &mut Frame, a: Vec2, b: Vec2| {
+        f.draw_line(
+            a.x.round() as i32,
+            a.y.round() as i32,
+            b.x.round() as i32,
+            b.y.round() as i32,
+            Color::WHITE,
+        );
+        };
+    line(f, tip, left);
+    line(f, left, right);
+    line(f, right, tip);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_up_rotates_world_forward_to_screen_up() {
+        for yaw in [-2.0, 0.0, 1.25] {
+            let rotation = map_rotation(Orientation::Heading, yaw);
+            let screen_angle = yaw + rotation;
+            assert!((screen_angle + std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        }
+        assert_eq!(map_rotation(Orientation::NorthUp, 2.0), 0.0);
     }
 }

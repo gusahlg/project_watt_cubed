@@ -59,8 +59,8 @@
     "voxel-engine": {
       "flake": false,
       "locked": {
-        "lastModified": 1783625094,
-        "narHash": "sha256-ye0ru1FtOiI0MO0lxw/QeRNfmBF7NN7qWs89K19l38M=",
+        "lastModified": 1783703691,
+        "narHash": "sha256-SvUAhSd2Acd1j4uUDm6NsPRzOHW2RFETEGFBtQ3CGBs=",
         "path": "/home/gusahlg/repos/voxel-engine",
         "type": "path"
       },

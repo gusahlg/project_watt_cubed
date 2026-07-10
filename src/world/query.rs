@@ -9,7 +9,7 @@ use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
 use super::generation::TerrainGenerator;
-use super::{Coord, World};
+use super::{Coord, FastMap, World};
 
 impl World {
     /// The seed this world was generated from.
@@ -76,29 +76,32 @@ impl World {
         mut paint: impl FnMut(i32, i32, i32, Color),
     ) {
         // Calls paint only for columns with top solid; caller pre-fills void.
+        // Index the relevant vertical stacks in one pass over `chunks`. The old
+        // loop rescanned every loaded chunk once for every x/z chunk column in
+        // the minimap footprint (hundreds of full map scans per refresh).
         let s = CHUNK_SIZE as i32;
-        for ccx in x0.div_euclid(s)..=x1.div_euclid(s) {
-            for ccz in z0.div_euclid(s)..=z1.div_euclid(s) {
-                // Collect chunk-Ys once, reused across footprint.
-                let mut cys: Vec<i32> = self
-                    .chunks
-                    .keys()
-                    .filter(|c| c.x == ccx && c.z == ccz)
-                    .map(|c| c.y)
-                    .collect();
-                if cys.is_empty() {
-                    continue;
+        let cx_range = x0.div_euclid(s)..=x1.div_euclid(s);
+        let cz_range = z0.div_euclid(s)..=z1.div_euclid(s);
+        let mut stacks: FastMap<(i32, i32), Vec<(i32, &super::Loaded)>> = FastMap::default();
+        for (&coord, loaded) in &self.chunks {
+            if cx_range.contains(&coord.x) && cz_range.contains(&coord.z) {
+                stacks
+                    .entry((coord.x, coord.z))
+                    .or_default()
+                    .push((coord.y, loaded));
                 }
-                cys.sort_unstable_by(|a, b| b.cmp(a));
+        }
 
-                let xs = x0.max(ccx * s)..=x1.min((ccx + 1) * s - 1);
-                let zs = z0.max(ccz * s)..=z1.min((ccz + 1) * s - 1);
+        for ((ccx, ccz), stack) in &mut stacks {
+            stack.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+
+            let xs = x0.max(*ccx * s)..=x1.min((*ccx + 1) * s - 1);
+            let zs = z0.max(*ccz * s)..=z1.min((*ccz + 1) * s - 1);
                 for x in xs {
                     let lx = x.rem_euclid(s) as usize;
                     for z in zs.clone() {
                         let lz = z.rem_euclid(s) as usize;
-                        for &cy in &cys {
-                            let loaded = &self.chunks[&Coord::new(ccx, cy, ccz)];
+                    for &(cy, loaded) in stack.iter() {
                             let top = match loaded.chunk.uniform() {
                                 Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
                                 Some(_) => None,
@@ -116,7 +119,6 @@ impl World {
                 }
             }
         }
-    }
 
     /// Look up the block id at an absolute world voxel coordinate. Anything
     /// outside the loaded region reads as [`AIR`] — Y is unbounded, so there
@@ -191,5 +193,31 @@ impl World {
         // Single-sourced through the split iso in `coord.rs`, so the negative
         // `div_euclid` semantics live in exactly one place.
         BlockCoord::new(x, y, z).split().0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn indexed_surface_walk_matches_point_queries_across_chunk_edges() {
+        let world = World::new(73);
+        let (x0, z0, x1, z1) = (-18, -19, 21, 20);
+        let mut actual = BTreeMap::new();
+        world.for_surface_columns(x0, z0, x1, z1, |x, z, y, color| {
+            actual.insert((x, z), (y, [color.r, color.g, color.b, color.a]));
+        });
+
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                let expected = world.top_solid(x, z).map(|y| {
+                    let color = world.registry.color(world.block_at(x, y, z));
+                    (y, [color.r, color.g, color.b, color.a])
+                });
+                assert_eq!(actual.get(&(x, z)).copied(), expected, "column ({x}, {z})");
+            }
+        }
     }
 }

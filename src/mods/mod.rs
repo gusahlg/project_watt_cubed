@@ -12,7 +12,7 @@ pub mod crafting;
 pub mod inventory;
 pub mod menu_default;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use voxel_engine::{Engine, Frame};
@@ -31,6 +31,8 @@ pub struct ElementStash {
     /// Per-element counts in first-seen order, so display rows are stable as
     /// counts change (matching the old inventory's grouped view).
     counts: Vec<(ElementId, u32)>,
+    /// Cached sum of `counts`; pickups and crafting read it every frame.
+    total: u32,
     /// Soft cap on total held elements — the old inventory capacity, upgradeable.
     capacity: usize,
     /// Bumped on every content change; caches (like the inventory's display rows)
@@ -42,6 +44,7 @@ impl ElementStash {
     pub fn new(capacity: usize) -> Self {
         Self {
             counts: Vec::new(),
+            total: 0,
             capacity,
             rev: 0,
         }
@@ -54,7 +57,7 @@ impl ElementStash {
         let mut all = true;
         let mut added = false;
         for &element in elements {
-            if self.total() as usize >= self.capacity {
+            if self.total as usize >= self.capacity {
                 all = false;
                 continue;
             }
@@ -62,6 +65,7 @@ impl ElementStash {
                 Some((_, count)) => *count += 1,
                 None => self.counts.push((element, 1)),
             }
+            self.total += 1;
             added = true;
         }
         if added {
@@ -92,6 +96,7 @@ impl ElementStash {
         for &element in elements {
             if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
                 *count -= 1;
+                self.total -= 1;
             }
         }
         self.counts.retain(|&(_, count)| count > 0);
@@ -101,7 +106,7 @@ impl ElementStash {
 
     /// Total elements held, across all kinds.
     pub fn total(&self) -> u32 {
-        self.counts.iter().map(|&(_, c)| c).sum()
+        self.total
     }
 
     pub fn capacity(&self) -> usize {
@@ -121,7 +126,26 @@ impl ElementStash {
     /// Drop everything (used when loading a save into this stash).
     pub fn clear(&mut self) {
         self.counts.clear();
+        self.total = 0;
         self.rev += 1;
+    }
+}
+
+/// Shared visibility state for the inventory/crafting pair. Crafting replaces
+/// the compact inventory panel while open, so two independently toggleable mods
+/// never draw over one another.
+#[derive(Clone, Copy)]
+pub(crate) struct ItemUiState {
+    pub inventory_visible: bool,
+    pub crafting_open: bool,
+}
+
+impl Default for ItemUiState {
+    fn default() -> Self {
+        Self {
+            inventory_visible: true,
+            crafting_open: false,
+        }
     }
 }
 
@@ -182,6 +206,12 @@ pub trait Mod {
     /// time rather than cached.
     fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
         let _ = (f, world, screen_w, screen_h);
+    }
+
+    /// Close a modal in-world overlay before the core interprets Escape as
+    /// "leave the world". Returns whether this mod consumed the key.
+    fn close_overlay(&mut self) -> bool {
+        false
     }
 
     /// Whether this mod drives and draws the out-of-game menus. A separate
@@ -247,9 +277,13 @@ impl Mods {
             entries: Vec::new(),
         };
         let stash = Rc::new(RefCell::new(ElementStash::new(inventory::START_CAPACITY)));
+        let item_ui = Rc::new(Cell::new(ItemUiState::default()));
         mods.install(Box::new(menu_default::MenuDefaultMod::new()), true);
-        mods.install(Box::new(inventory::InventoryMod::new(stash.clone())), true);
-        mods.install(Box::new(crafting::CraftingMod::new(stash)), true);
+        mods.install(
+            Box::new(inventory::InventoryMod::new(stash.clone(), item_ui.clone())),
+            true,
+        );
+        mods.install(Box::new(crafting::CraftingMod::new(stash, item_ui)), true);
         mods
     }
 
@@ -295,6 +329,15 @@ impl Mods {
                 entry.module.draw(f, world, screen_w, screen_h);
             }
         }
+    }
+
+    /// Give enabled mods first refusal on Escape. The first open overlay closes
+    /// and consumes it; otherwise the game can return to its main menu.
+    pub fn close_overlay(&mut self) -> bool {
+        self.entries
+            .iter_mut()
+            .filter(|entry| entry.enabled)
+            .any(|entry| entry.module.close_overlay())
     }
 
     /// Whether any enabled mod handles menus. When this is `false` the App
@@ -381,11 +424,7 @@ impl Mods {
 
     /// Restore a mod's state by name (ignoring unknown names from other installs).
     pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.module.name() == name)
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.module.name() == name) {
             entry.module.load_state(data, world);
         }
     }

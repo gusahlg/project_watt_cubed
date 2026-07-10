@@ -340,6 +340,7 @@ impl Spline {
 
     /// Min/max image of the curve over `[lo, hi]`. Scans interior knots since
     /// non-monotone curves (like RIDGE_KNOTS) don't reach extrema at endpoints alone.
+    #[cfg(test)]
     fn image(self, lo: f32, hi: f32) -> (f32, f32) {
         let a = self.eval(lo);
         let b = self.eval(hi);

@@ -9,7 +9,7 @@
 //! them after `mods.update` with the same air/no-player-overlap check this mod
 //! runs *before* decrementing a count, so the accounting stays exact (see
 //! [`try_place`](CraftingMod::try_place)).
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use voxel_engine::{Color, DVec3, Engine, Frame, Key, MouseButton};
@@ -20,17 +20,18 @@ use crate::block::{AIR, ElementId};
 use crate::console::shadowed;
 use crate::interact;
 use crate::math::{Aabb, Bounded};
-use crate::mods::{ElementStash, Mod, ModContext};
+use crate::mods::inventory::{InventoryMod, PANEL_X, PANEL_Y};
+use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
+use crate::ui::{ellipsize, visible_window};
 use crate::world::World;
-
-/// At most this many element kinds go into one natural craft.
 
 /// How far the player can reach to place a block — matches the break reach.
 const PLACE_REACH: f64 = 6.0;
-/// Panel geometry: right-aligned like the inventory HUD, starting below the
-/// inventory's tallest possible extent (header at y=90 plus 14 capped rows).
-const PANEL_X_OFFSET: i32 = 230;
-const PANEL_Y: i32 = 440;
+const PANEL_WIDTH: i32 = 360;
+const PANEL_PAD: i32 = 8;
+const FONT_SIZE: i32 = 18;
+const LINE_HEIGHT: i32 = FONT_SIZE + 4;
+const BOTTOM_RESERVE: i32 = 190;
 
 /// One crafted block type the player holds: its id, its (stable, portable) name,
 /// and how many are left to place.
@@ -44,8 +45,8 @@ struct Crafted {
 pub struct CraftingMod {
     /// The shared element counts (filled by the inventory mod, spent here).
     stash: Rc<RefCell<ElementStash>>,
-    /// Whether the panel is on screen (toggled with `C`).
-    open: bool,
+    /// Shared with inventory so this expanded panel replaces its compact view.
+    ui: Rc<Cell<ItemUiState>>,
     /// Cursor over the panel rows: elements, then Craft, then crafted blocks.
     cursor: usize,
     /// Elements marked for the next craft, in pick order. Any number of
@@ -59,15 +60,25 @@ pub struct CraftingMod {
 }
 
 impl CraftingMod {
-    pub fn new(stash: Rc<RefCell<ElementStash>>) -> Self {
+    pub(crate) fn new(stash: Rc<RefCell<ElementStash>>, ui: Rc<Cell<ItemUiState>>) -> Self {
         Self {
             stash,
-            open: false,
+            ui,
             cursor: 0,
             selected: Vec::new(),
             crafted: Vec::new(),
             equipped: None,
         }
+    }
+
+    fn is_open(&self) -> bool {
+        self.ui.get().crafting_open
+    }
+
+    fn set_open(&self, open: bool) {
+        let mut ui = self.ui.get();
+        ui.crafting_open = open;
+        self.ui.set(ui);
     }
 
     /// The held element kinds in stash order — the navigable element rows. Read
@@ -91,12 +102,6 @@ impl CraftingMod {
 
     /// Panel-open key handling: move the cursor, toggle selections, craft, equip.
     fn navigate(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        // Esc also closes per the design; note the game currently leaves to the
-        // menu on Esc before mods run, so in practice C is the close key.
-        if eng.is_key_pressed(Key::Escape) {
-            self.open = false;
-            return;
-        }
         if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
             self.cursor = self.cursor.saturating_sub(1);
         }
@@ -129,6 +134,16 @@ impl CraftingMod {
     /// set. The selection is kept so another Enter crafts another, stock allowing.
     fn craft(&mut self, ctx: &mut ModContext) {
         if self.selected.is_empty() {
+            return;
+        }
+        // Avoid growing the block registry if another mod depleted the stash
+        // between selection and activation.
+        if self
+            .selected
+            .iter()
+            .any(|&element| self.stash.borrow().count(element) == 0)
+        {
+            self.refresh();
             return;
         }
         // Resolve the block first: a full palette refuses NEW compositions,
@@ -164,7 +179,9 @@ impl CraftingMod {
         if !eng.is_mouse_button_pressed(MouseButton::Right) || !ctx.mouse_locked {
             return;
         }
-        let Some(equipped) = self.equipped else { return };
+        let Some(equipped) = self.equipped else {
+            return;
+        };
         if self.crafted[equipped].count == 0 {
             return;
         }
@@ -223,7 +240,7 @@ impl Mod for CraftingMod {
     }
 
     fn reset(&mut self) {
-        self.open = false;
+        self.set_open(false);
         self.cursor = 0;
         self.selected.clear();
         self.crafted.clear();
@@ -236,63 +253,155 @@ impl Mod for CraftingMod {
 
     fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
         self.refresh();
-        if !ctx.capturing_text && eng.is_key_pressed(Key::C) {
-            self.open = !self.open;
+        if ctx.capturing_text {
+            return;
         }
-        if self.open {
+        if eng.is_key_pressed(Key::C) {
+            self.set_open(!self.is_open());
+        }
+        if self.is_open() {
             self.navigate(eng, ctx);
         } else {
             self.try_place(eng, ctx);
         }
     }
 
-    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, _screen_h: i32) {
-        let fs = 18;
-        let line_h = fs + 4;
-        let x = screen_w - PANEL_X_OFFSET;
-        let mut y = PANEL_Y;
+    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
+        let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
+        let text_x = PANEL_X + PANEL_PAD;
 
-        if !self.open {
+        if !self.is_open() {
             // Closed: just a small reminder of what RMB will place.
             if let Some(equipped) = self.equipped {
                 let entry = &self.crafted[equipped];
-                let hint = format!("RMB place {} ({})", entry.name, entry.count);
-                shadowed(f, &hint, x, y, 16, Color::RAYWHITE);
+                let kinds = self.stash.borrow().iter().count();
+                let ui = self.ui.get();
+                let y = if ui.inventory_visible {
+                    InventoryMod::panel_bottom(screen_h, kinds) + 6
+                } else {
+                    PANEL_Y
+                };
+                let hint = ellipsize(
+                    &format!("Equipped: {} x{}", entry.name, entry.count),
+                    ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize,
+                );
+                let hint_w = (hint.chars().count() as i32 * FONT_SIZE + PANEL_PAD * 2).min(width);
+                f.draw_rect(
+                    PANEL_X,
+                    y,
+                    hint_w,
+                    FONT_SIZE + PANEL_PAD * 2,
+                    Color::new(8, 10, 14, 190),
+                );
+                shadowed(f, &hint, text_x, y + PANEL_PAD, FONT_SIZE, Color::RAYWHITE);
             }
             return;
         }
 
-        shadowed(f, "Crafting", x, y, fs, Color::GOLD);
-        y += line_h + 2;
-
         let stash = self.stash.borrow();
         let elements = world.registry().elements();
-        let mut element_count = 0;
-        for (i, (element, count)) in stash.iter().enumerate() {
-            element_count += 1;
-            let cursor = if self.cursor == i { ">" } else { " " };
-            let mark = if self.selected.contains(&element) { "[x]" } else { "[ ]" };
-            let row = format!("{cursor} {mark} {count}x {}", elements.get(element).name);
-            shadowed(f, &row, x, y, fs, Color::RAYWHITE);
-            y += line_h;
-        }
-        if element_count == 0 {
-            shadowed(f, "  (no elements) break blocks", x, y, fs, Color::RAYWHITE);
-            y += line_h;
+        let held: Vec<(ElementId, u32)> = stash.iter().collect();
+        let element_count = held.len();
+        let total_rows = element_count + 1 + self.crafted.len();
+        let selected_names = self
+            .selected
+            .iter()
+            .map(|&id| elements.get(id).name.as_ref())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let header_rows = 1 + usize::from(!selected_names.is_empty());
+        let content_y = PANEL_Y + PANEL_PAD + header_rows as i32 * LINE_HEIGHT + 2;
+        let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
+        let window = visible_window(total_rows, self.cursor, capacity);
+        let shown = window.len();
+        let height =
+            PANEL_PAD * 2 + header_rows as i32 * LINE_HEIGHT + 2 + shown as i32 * LINE_HEIGHT;
+        f.draw_rect(PANEL_X, PANEL_Y, width, height, Color::new(8, 10, 14, 210));
+
+        shadowed(
+            f,
+            &format!("Crafting  {}/{}", self.selected.len(), element_count),
+            text_x,
+            PANEL_Y + PANEL_PAD,
+            FONT_SIZE,
+            Color::GOLD,
+        );
+        let max_chars = ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize;
+        if !selected_names.is_empty() {
+            let recipe = ellipsize(&selected_names, max_chars);
+            shadowed(
+                f,
+                &recipe,
+                text_x,
+                PANEL_Y + PANEL_PAD + LINE_HEIGHT,
+                FONT_SIZE,
+                Color::LIGHTGRAY,
+            );
         }
 
-        let craft_row = element_count;
-        let cursor = if self.cursor == craft_row { ">" } else { " " };
-        let row = format!("{cursor} [Craft: {} picked]", self.selected.len());
-        shadowed(f, &row, x, y, fs, Color::GOLD);
-        y += line_h;
+        let mut y = content_y;
+        for row_index in window {
+            let active = self.cursor == row_index;
+            let cursor = if active { ">" } else { " " };
+            let (text, color) = if row_index < element_count {
+                let (element, count) = held[row_index];
+                let mark = if self.selected.contains(&element) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                (
+                    format!("{cursor} {mark} {count}x {}", elements.get(element).name),
+                    if active {
+                        Color::SKYBLUE
+                    } else {
+                        Color::RAYWHITE
+                    },
+                )
+            } else if row_index == element_count {
+                let label = if self.selected.is_empty() {
+                    "select elements"
+                } else {
+                    "craft selected"
+                };
+                (
+                    format!("{cursor} [ {label} ]"),
+                    if self.selected.is_empty() {
+                        Color::GRAY
+                    } else {
+                        Color::GOLD
+                    },
+                )
+            } else {
+                let i = row_index - element_count - 1;
+                let entry = &self.crafted[i];
+                let equipped = if self.equipped == Some(i) {
+                    "[E]"
+                } else {
+                    "   "
+                };
+                (
+                    format!("{cursor} {equipped} {}x {}", entry.count, entry.name),
+                    if self.equipped == Some(i) {
+                        Color::LIME
+                    } else if active {
+                        Color::SKYBLUE
+                    } else {
+                        Color::RAYWHITE
+                    },
+                )
+            };
+            shadowed(f, &ellipsize(&text, max_chars), text_x, y, FONT_SIZE, color);
+            y += LINE_HEIGHT;
+        }
+    }
 
-        for (i, entry) in self.crafted.iter().enumerate() {
-            let cursor = if self.cursor == craft_row + 1 + i { ">" } else { " " };
-            let equipped = if self.equipped == Some(i) { "*" } else { " " };
-            let row = format!("{cursor} {equipped}{}x {}", entry.count, entry.name);
-            shadowed(f, &row, x, y, fs, Color::RAYWHITE);
-            y += line_h;
+    fn close_overlay(&mut self) -> bool {
+        if self.is_open() {
+            self.set_open(false);
+            true
+        } else {
+            false
         }
     }
 
@@ -324,8 +433,12 @@ impl Mod for CraftingMod {
                 Some(rest) => (true, rest),
                 None => (false, raw),
             };
-            let Some((name, count)) = entry.rsplit_once('=') else { continue };
-            let Ok(count) = count.parse::<u32>() else { continue };
+            let Some((name, count)) = entry.rsplit_once('=') else {
+                continue;
+            };
+            let Ok(count) = count.parse::<u32>() else {
+                continue;
+            };
             // A crafted composition can dedup into a BUILTIN block (e.g.
             // Stone+Iron == IronVein), which saves under the builtin's name —
             // resolve block names first, then fall back to the '+'-joined
@@ -358,7 +471,10 @@ mod tests {
     use super::*;
 
     fn mod_with_stash() -> CraftingMod {
-        CraftingMod::new(Rc::new(RefCell::new(ElementStash::new(10))))
+        CraftingMod::new(
+            Rc::new(RefCell::new(ElementStash::new(10))),
+            Rc::new(Cell::new(ItemUiState::default())),
+        )
     }
 
     #[test]
@@ -383,7 +499,11 @@ mod tests {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
         crafting.load_state("Stone+Unobtainium=5,Iron=3", &mut world);
-        assert_eq!(crafting.crafted.len(), 1, "unknown-element entry is skipped");
+        assert_eq!(
+            crafting.crafted.len(),
+            1,
+            "unknown-element entry is skipped"
+        );
         assert_eq!(crafting.crafted[0].name.as_ref(), "Iron");
         assert_eq!(crafting.crafted[0].count, 3);
     }
@@ -395,5 +515,15 @@ mod tests {
         crafting.load_state("Copper+Glass=1", &mut world);
         let id = crafting.crafted[0].id;
         assert_eq!(world.registry().id_by_name("Copper+Glass"), Some(id));
+    }
+
+    #[test]
+    fn escape_close_consumes_only_an_open_panel() {
+        let mut crafting = mod_with_stash();
+        assert!(!crafting.close_overlay());
+        crafting.set_open(true);
+        assert!(crafting.close_overlay());
+        assert!(!crafting.is_open());
+        assert!(!crafting.close_overlay());
     }
 }
