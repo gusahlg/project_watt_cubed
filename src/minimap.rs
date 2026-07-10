@@ -191,7 +191,7 @@ impl Minimap {
 /// map needs an additional quarter-turn to place that direction at screen-up.
 fn map_rotation(orientation: Orientation, yaw: f32) -> f32 {
     match orientation {
-            Orientation::NorthUp => 0.0,
+        Orientation::NorthUp => 0.0,
         Orientation::Heading => -yaw - std::f32::consts::FRAC_PI_2,
     }
 }
@@ -211,7 +211,7 @@ fn draw_player_marker(f: &mut Frame, center: Vec2, angle: f32) {
             b.y.round() as i32,
             Color::WHITE,
         );
-        };
+    };
     line(f, tip, left);
     line(f, left, right);
     line(f, right, tip);

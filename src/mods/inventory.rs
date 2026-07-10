@@ -123,8 +123,8 @@ impl Mod for InventoryMod {
             .overflow_at
             .is_some_and(|at| at.elapsed() <= OVERFLOW_WARNING);
         if self.overflow_at.is_some() && !overflow {
-                self.overflow_at = None;
-            }
+            self.overflow_at = None;
+        }
 
         let ui = self.ui.get();
         if !ui.inventory_visible || ui.crafting_open {
@@ -169,7 +169,10 @@ impl Mod for InventoryMod {
         }
 
         let max_chars = ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize;
-        for (element, count) in stash.iter().take(shown) {
+        // When the kinds overflow the panel, the last row slot becomes the
+        // "+N more" summary instead of an element row.
+        let listed = if kind_count > shown { shown - 1 } else { shown };
+        for (element, count) in stash.iter().take(listed) {
             let row = ellipsize(
                 &format!("{count}x {}", elements.get(element).name),
                 max_chars,
@@ -177,14 +180,13 @@ impl Mod for InventoryMod {
             shadowed(f, &row, text_x, y, FONT_SIZE, Color::RAYWHITE);
             y += LINE_HEIGHT;
         }
-        if kind_count > shown && shown > 0 {
-            let hidden = kind_count - shown + 1;
-            let row_y = y - LINE_HEIGHT;
+        if kind_count > listed {
+            let hidden = kind_count - listed;
             shadowed(
                 f,
                 &format!("+{hidden} more"),
                 text_x,
-                row_y,
+                y,
                 FONT_SIZE,
                 Color::LIGHTGRAY,
             );

@@ -9,7 +9,7 @@ use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
 use super::generation::TerrainGenerator;
-use super::{Coord, FastMap, World};
+use super::{Coord, World};
 
 impl World {
     /// The seed this world was generated from.
@@ -76,49 +76,50 @@ impl World {
         mut paint: impl FnMut(i32, i32, i32, Color),
     ) {
         // Calls paint only for columns with top solid; caller pre-fills void.
-        // Index the relevant vertical stacks in one pass over `chunks`. The old
-        // loop rescanned every loaded chunk once for every x/z chunk column in
-        // the minimap footprint (hundreds of full map scans per refresh).
+        // Bucket the footprint's vertical stacks in one pass over `chunks` and
+        // one sort, keyed by dense grid cell — no hashing. The old loop
+        // rescanned every loaded chunk once for every x/z chunk column in the
+        // minimap footprint (hundreds of full map scans per refresh).
         let s = CHUNK_SIZE as i32;
-        let cx_range = x0.div_euclid(s)..=x1.div_euclid(s);
-        let cz_range = z0.div_euclid(s)..=z1.div_euclid(s);
-        let mut stacks: FastMap<(i32, i32), Vec<(i32, &super::Loaded)>> = FastMap::default();
+        let (cx0, cx1) = (x0.div_euclid(s), x1.div_euclid(s));
+        let (cz0, cz1) = (z0.div_euclid(s), z1.div_euclid(s));
+        let grid_w = cx1 - cx0 + 1;
+        let mut stacks: Vec<(i32, i32, &super::Loaded)> = Vec::new();
         for (&coord, loaded) in &self.chunks {
-            if cx_range.contains(&coord.x) && cz_range.contains(&coord.z) {
-                stacks
-                    .entry((coord.x, coord.z))
-                    .or_default()
-                    .push((coord.y, loaded));
-                }
+            if (cx0..=cx1).contains(&coord.x) && (cz0..=cz1).contains(&coord.z) {
+                let cell = (coord.z - cz0) * grid_w + (coord.x - cx0);
+                stacks.push((cell, coord.y, loaded));
+            }
         }
+        // Group by cell, top chunk first within each stack.
+        stacks.sort_unstable_by_key(|&(cell, cy, _)| (cell, std::cmp::Reverse(cy)));
 
-        for ((ccx, ccz), stack) in &mut stacks {
-            stack.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-
-            let xs = x0.max(*ccx * s)..=x1.min((*ccx + 1) * s - 1);
-            let zs = z0.max(*ccz * s)..=z1.min((*ccz + 1) * s - 1);
-                for x in xs {
-                    let lx = x.rem_euclid(s) as usize;
-                    for z in zs.clone() {
-                        let lz = z.rem_euclid(s) as usize;
-                    for &(cy, loaded) in stack.iter() {
-                            let top = match loaded.chunk.uniform() {
-                                Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
-                                Some(_) => None,
-                                None => (0..s).rev().find_map(|ly| {
-                                    let id = loaded.chunk.get_local(lx, ly as usize, lz);
-                                    self.registry.is_solid(id).then_some((cy * s + ly, id))
-                                }),
-                            };
-                            if let Some((top_y, id)) = top {
-                                paint(x, z, top_y, self.registry.color(id));
-                                break; // topmost hit
-                            }
+        for stack in stacks.chunk_by(|a, b| a.0 == b.0) {
+            let (ccx, ccz) = (cx0 + stack[0].0 % grid_w, cz0 + stack[0].0 / grid_w);
+            let xs = x0.max(ccx * s)..=x1.min((ccx + 1) * s - 1);
+            let zs = z0.max(ccz * s)..=z1.min((ccz + 1) * s - 1);
+            for x in xs {
+                let lx = x.rem_euclid(s) as usize;
+                for z in zs.clone() {
+                    let lz = z.rem_euclid(s) as usize;
+                    for &(_, cy, loaded) in stack {
+                        let top = match loaded.chunk.uniform() {
+                            Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
+                            Some(_) => None,
+                            None => (0..s).rev().find_map(|ly| {
+                                let id = loaded.chunk.get_local(lx, ly as usize, lz);
+                                self.registry.is_solid(id).then_some((cy * s + ly, id))
+                            }),
+                        };
+                        if let Some((top_y, id)) = top {
+                            paint(x, z, top_y, self.registry.color(id));
+                            break; // topmost hit
                         }
                     }
                 }
             }
         }
+    }
 
     /// Look up the block id at an absolute world voxel coordinate. Anything
     /// outside the loaded region reads as [`AIR`] — Y is unbounded, so there
