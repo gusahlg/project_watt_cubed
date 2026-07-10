@@ -37,6 +37,7 @@ pub mod interact;
 pub mod macros;
 pub mod math;
 pub mod menu;
+pub mod minimap;
 pub mod mods;
 pub mod net;
 pub mod player;

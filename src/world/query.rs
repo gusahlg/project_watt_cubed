@@ -5,6 +5,7 @@
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 use crate::coord::BlockCoord;
 use crate::math::{Aabb, block_coord};
+use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
 use super::generation::TerrainGenerator;
@@ -30,6 +31,91 @@ impl World {
     /// Surface height of a column, for placing the player on spawn.
     pub fn surface_y(&self, x: i32, z: i32) -> i32 {
         self.generator.height(x, z)
+    }
+
+    /// Highest solid block's Y in column (x, z) from loaded chunks, or None if empty.
+    pub fn top_solid(&self, x: i32, z: i32) -> Option<i32> {
+        let s = CHUNK_SIZE as i32;
+        let (cx, cz) = (x.div_euclid(s), z.div_euclid(s));
+        let (lx, lz) = (x.rem_euclid(s) as usize, z.rem_euclid(s) as usize);
+
+        // Scan loaded chunks top-down (Y unbounded).
+        let mut cys: Vec<i32> = self
+            .chunks
+            .keys()
+            .filter(|c| c.x == cx && c.z == cz)
+            .map(|c| c.y)
+            .collect();
+        cys.sort_unstable_by(|a, b| b.cmp(a));
+
+        for cy in cys {
+            let loaded = &self.chunks[&Coord::new(cx, cy, cz)];
+            if let Some(id) = loaded.chunk.uniform() {
+                if self.registry.is_solid(id) {
+                    return Some(cy * s + s - 1);
+                }
+                continue; // uniform air
+            }
+            for ly in (0..s).rev() {
+                let id = loaded.chunk.get_local(lx, ly as usize, lz);
+                if self.registry.is_solid(id) {
+                    return Some(cy * s + ly);
+                }
+            }
+        }
+        None
+    }
+
+    /// Calls paint for the top solid block of each column in the x/z rectangle.
+    pub fn for_surface_columns(
+        &self,
+        x0: i32,
+        z0: i32,
+        x1: i32,
+        z1: i32,
+        mut paint: impl FnMut(i32, i32, i32, Color),
+    ) {
+        // Calls paint only for columns with top solid; caller pre-fills void.
+        let s = CHUNK_SIZE as i32;
+        for ccx in x0.div_euclid(s)..=x1.div_euclid(s) {
+            for ccz in z0.div_euclid(s)..=z1.div_euclid(s) {
+                // Collect chunk-Ys once, reused across footprint.
+                let mut cys: Vec<i32> = self
+                    .chunks
+                    .keys()
+                    .filter(|c| c.x == ccx && c.z == ccz)
+                    .map(|c| c.y)
+                    .collect();
+                if cys.is_empty() {
+                    continue;
+                }
+                cys.sort_unstable_by(|a, b| b.cmp(a));
+
+                let xs = x0.max(ccx * s)..=x1.min((ccx + 1) * s - 1);
+                let zs = z0.max(ccz * s)..=z1.min((ccz + 1) * s - 1);
+                for x in xs {
+                    let lx = x.rem_euclid(s) as usize;
+                    for z in zs.clone() {
+                        let lz = z.rem_euclid(s) as usize;
+                        for &cy in &cys {
+                            let loaded = &self.chunks[&Coord::new(ccx, cy, ccz)];
+                            let top = match loaded.chunk.uniform() {
+                                Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
+                                Some(_) => None,
+                                None => (0..s).rev().find_map(|ly| {
+                                    let id = loaded.chunk.get_local(lx, ly as usize, lz);
+                                    self.registry.is_solid(id).then_some((cy * s + ly, id))
+                                }),
+                            };
+                            if let Some((top_y, id)) = top {
+                                paint(x, z, top_y, self.registry.color(id));
+                                break; // topmost hit
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Look up the block id at an absolute world voxel coordinate. Anything

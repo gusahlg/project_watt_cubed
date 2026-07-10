@@ -5,7 +5,7 @@
 //! or return to the menu.
 use std::time::Instant;
 
-use voxel_engine::{Camera3D, Color, DVec3, Engine, Key, MouseButton, Vec2, Vec3};
+use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Key, MouseButton, Vec2, Vec3};
 
 use crate::avatar::Pose;
 use crate::block::AIR;
@@ -15,6 +15,7 @@ use crate::ui::{self, Anchor, Theme};
 use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
+use crate::minimap::{Minimap, MinimapConfig};
 use crate::mods::{ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
@@ -61,6 +62,8 @@ pub struct Game {
     /// Day/night clock, atmosphere colour, weather, and the lighting edge into
     /// voxel shading (see [`crate::sky`]).
     sky: Sky,
+    /// Top-down minimap: throttled terrain raster drawn in the HUD corner.
+    minimap: Minimap,
 }
 
 impl Game {
@@ -76,6 +79,7 @@ impl Game {
             coord_cache: (i64::MIN, i64::MIN, i64::MIN, String::new()),
             theme: Theme::new(),
             sky: Sky::new(),
+            minimap: Minimap::new(MinimapConfig::DEFAULT),
         }
     }
 
@@ -222,6 +226,12 @@ impl Game {
 
         // Load/mesh/unload chunks around the player, then step physics.
         self.world.stream(self.player.position, eng);
+
+        // Refresh minimap (throttled).
+        let p = self.player.position;
+        let player_col = IVec2::new(p.x.floor() as i32, p.z.floor() as i32);
+        self.minimap
+            .refresh(eng, &self.world, player_col, Instant::now());
         self.sim.advance(&mut self.world, dt);
         Signal::Continue
     }
@@ -407,6 +417,9 @@ impl Game {
                     .draw(&mut f3, peer.color);
             }
         }
+
+        // Draw minimap.
+        self.minimap.draw(&mut f, screen, self.player.yaw);
 
         let theme = &self.theme;
 
