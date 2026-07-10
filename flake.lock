@@ -37,7 +37,8 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "voxel-engine": "voxel-engine"
       }
     },
     "systems": {
@@ -53,6 +54,19 @@
         "owner": "nix-systems",
         "repo": "default",
         "type": "github"
+      }
+    },
+    "voxel-engine": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783625094,
+        "narHash": "sha256-ye0ru1FtOiI0MO0lxw/QeRNfmBF7NN7qWs89K19l38M=",
+        "path": "/home/gusahlg/repos/voxel-engine",
+        "type": "path"
+      },
+      "original": {
+        "path": "/home/gusahlg/repos/voxel-engine",
+        "type": "path"
       }
     }
   },

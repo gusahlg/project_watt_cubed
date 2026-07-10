@@ -4,11 +4,15 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # The renderer lives in a sibling checkout. A relative path input works for
-    # the local-checkout workflow (nix run in this repo); switch it to a git URL
-    # if this flake ever needs to be fetched from a registry.
+    # The renderer lives in a sibling checkout. This MUST be an absolute path: a
+    # relative `path:../voxel-engine` resolves against the flake's *store copy*
+    # once `nix run` archives this git tree, landing at `…-source/../voxel-engine`
+    # (nonexistent) — so it only ever worked from a dirty tree. An absolute path
+    # resolves the same whether the tree is clean or dirty, and still picks up
+    # local edits to the sibling. Machine-specific; switch to a git URL
+    # (github:gusahlg/voxel-engine) if this flake is ever fetched from elsewhere.
     voxel-engine = {
-      url = "path:../voxel-engine";
+      url = "path:/home/gusahlg/repos/voxel-engine";
       flake = false;
     };
   };
