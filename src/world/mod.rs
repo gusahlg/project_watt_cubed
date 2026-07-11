@@ -499,6 +499,9 @@ pub struct World {
     /// setting via [`set_lighting`](World::set_lighting); the initial value only
     /// governs pre-`enter_game` generation and is overridden on world entry.
     lighting: bool,
+    /// Generation stamp for asynchronous light jobs. Toggling lighting advances
+    /// it so a result captured under the previous mode cannot publish later.
+    light_epoch: u32,
     /// Far LOD tile lane enable flag (`WATT_TILES=1` enables the tile ring).
     tiles_enabled: bool,
     /// Zone-3 far-skin lane enable flag (`WATT_SKINS=0` disables the skin ring).
@@ -580,6 +583,7 @@ impl World {
             occlusion_active: false,
             occlusion_forced: !matches!(std::env::var("VOXEL_OCCLUSION").as_deref(), Ok("0")),
             lighting: true,
+            light_epoch: 0,
             tiles_enabled: matches!(std::env::var("WATT_TILES").as_deref(), Ok("1")),
             skins_enabled: !matches!(std::env::var("WATT_SKINS").as_deref(), Ok("0")),
             tiles: FastMap::default(),
@@ -1204,7 +1208,11 @@ impl LaneSpec for LightLane {
             world_y0: key.y * CHUNK_SIZE as i32,
             tables: world.tables.get(),
         };
-        Some(pipeline::Job::Light { coord: key, snapshot })
+        Some(pipeline::Job::Light {
+            coord: key,
+            epoch: world.light_epoch,
+            snapshot: Box::new(snapshot),
+        })
     }
     fn claim(world: &mut World, key: Coord) {
         // Out of the worklist, into the in-flight set (one flood per chunk).
@@ -1214,8 +1222,14 @@ impl LaneSpec for LightLane {
     fn integrate(world: &mut World, done: pipeline::Done) {
         // Buffer for budgeted application; the chunk stays in `light_inflight`
         // (so `light_ready` keeps gating meshing) until it is actually applied.
-        if let pipeline::Done::Light { coord, grid } = done {
-            world.light_apply_queue.push_back((coord, grid));
+        if let pipeline::Done::Light { coord, epoch, grid } = done {
+            if world.lighting
+                && epoch == world.light_epoch
+                && world.chunks.contains_key(&coord)
+                && world.light_inflight.contains(&coord)
+            {
+                world.light_apply_queue.push_back((coord, grid));
+            }
         }
     }
 }
@@ -1357,6 +1371,59 @@ mod tests {
         let ha: Vec<i32> = (0..16).map(|x| a.surface_y(x, 0)).collect();
         let hb: Vec<i32> = (0..16).map(|x| b.surface_y(x, 0)).collect();
         assert_ne!(ha, hb, "different seeds should sculpt different terrain");
+    }
+
+    #[test]
+    fn lighting_toggle_reseeds_only_stale_work_and_rejects_old_results() {
+        let mut world = World::generate();
+        let coord = ChunkCoord::new(0, 0, 0);
+        let missing = ChunkCoord::new(1, 0, 0);
+
+        // Pretend this chunk already had a grid while a newer settle was in
+        // flight. Disabling must not preserve that known-stale grid.
+        world.light_worklist.clear();
+        world.chunks.get_mut(&coord).unwrap().light = Some(light::LightGrid::dark());
+        world.light_inflight.insert(coord);
+        assert!(world.transition_lighting(false));
+        let off_epoch = world.light_epoch;
+        assert!(!world.lighting());
+        assert!(world.light_worklist.is_empty());
+        assert!(world.light_inflight.is_empty());
+        assert!(world.chunks[&coord].light.is_none());
+
+        // An edit made while disabled remains dormant, and a chunk loaded while
+        // disabled is represented by an absent grid.
+        let old = world.block_at(3, 3, 3);
+        let stone = world.registry().id_by_name("Stone").unwrap();
+        world.set_block(3, 3, 3, if old == AIR { stone } else { AIR });
+        world.chunks.get_mut(&missing).unwrap().light = None;
+        assert!(world.light_worklist.contains(&coord));
+
+        assert!(world.transition_lighting(true));
+        assert_eq!(world.light_epoch, off_epoch.wrapping_add(1));
+        assert!(world.light_worklist.contains(&coord));
+        assert!(world.light_worklist.contains(&missing));
+        assert!(world.light_pending.get());
+
+        // A worker from the disabled generation cannot publish after re-enable;
+        // a result stamped with the current generation can.
+        world.light_inflight.insert(coord);
+        <LightLane as LaneSpec>::integrate(
+            &mut world,
+            pipeline::Done::Light { coord, epoch: off_epoch, grid: light::LightGrid::dark() },
+        );
+        assert!(world.light_apply_queue.is_empty());
+        let current_epoch = world.light_epoch;
+        <LightLane as LaneSpec>::integrate(
+            &mut world,
+            pipeline::Done::Light {
+                coord,
+                epoch: current_epoch,
+                grid: light::LightGrid::dark(),
+            },
+        );
+        assert_eq!(world.light_apply_queue.len(), 1);
+        assert!(!world.transition_lighting(true), "same value is a no-op");
     }
 
     #[test]

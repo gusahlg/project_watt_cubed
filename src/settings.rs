@@ -96,6 +96,8 @@ pub struct Setting {
     aliases: &'static [&'static str],
     /// The settings-menu row label.
     label: &'static str,
+    /// Value syntax shown by `/gfx` help, including the preferred console key.
+    usage: &'static str,
     /// The exact `/gfx` confirmation line for the current value.
     confirm: fn(&Settings) -> String,
     /// The human-facing value string (menu display and `/gfx` value read-out).
@@ -118,6 +120,11 @@ impl Setting {
     /// The settings-menu row label.
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// Preferred console key and accepted value syntax.
+    pub fn usage(&self) -> &'static str {
+        self.usage
     }
 
     /// Whether this field answers to `name` (its key or any console alias).
@@ -169,6 +176,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "fullscreen",
         aliases: &[],
         label: "Fullscreen",
+        usage: "fullscreen on|off",
         confirm: |s| format!("fullscreen {}", on_off(s.fullscreen, false)),
         show: |s| on_off(s.fullscreen, true).to_string(),
         parse_human: |s, v| set_bool(&mut s.fullscreen, v),
@@ -181,6 +189,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "vsync",
         aliases: &[],
         label: "VSync",
+        usage: "vsync on|off",
         confirm: |s| format!("vsync {}", on_off(s.vsync, false)),
         show: |s| on_off(s.vsync, true).to_string(),
         parse_human: |s, v| set_bool(&mut s.vsync, v),
@@ -192,7 +201,8 @@ pub const SETTINGS: [Setting; 9] = [
     Setting {
         key: "lighting",
         aliases: &["light"],
-        label: "Lighting",
+        label: "Voxel Lighting",
+        usage: "lighting on|off",
         confirm: |s| format!("lighting {}", on_off(s.lighting, false)),
         show: |s| on_off(s.lighting, true).to_string(),
         parse_human: |s, v| set_bool(&mut s.lighting, v),
@@ -205,6 +215,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "msaa",
         aliases: &[],
         label: "MSAA",
+        usage: "msaa 1|2|4|8",
         confirm: |s| format!("msaa {}x", s.msaa),
         show: |s| format!("{}x", s.msaa),
         parse_human: |s, v| {
@@ -223,6 +234,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "max_fps",
         aliases: &["fps"],
         label: "Max FPS",
+        usage: "fps <10-1000>|off",
         confirm: |s| {
             if s.max_fps == 0 {
                 "fps cap off".to_string()
@@ -260,6 +272,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "render_distance",
         aliases: &["renderdist", "renderdistance"],
         label: "Render Distance",
+        usage: "renderdist <3-20>",
         confirm: |s| format!("render distance {}", s.render_distance),
         show: |s| s.render_distance.to_string(),
         parse_human: |s, v| {
@@ -285,6 +298,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "fov",
         aliases: &[],
         label: "FOV",
+        usage: "fov <50-220>",
         confirm: |s| format!("fov {:.0}", s.fov),
         // f32 Display prints whole values without a decimal point, exactly as the
         // old `format!("FOV: {}", s.fov)` screen did.
@@ -315,6 +329,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "render_scale",
         aliases: &["renderscale", "scale"],
         label: "Render Scale",
+        usage: "renderscale <25-200>",
         confirm: |s| format!("render scale {:.0}%", s.render_scale * 100.0),
         // Percent-encoded for humans (75%), stored raw (0.75) for save-compat.
         show: |s| format!("{:.0}%", s.render_scale * 100.0),
@@ -342,6 +357,7 @@ pub const SETTINGS: [Setting; 9] = [
         key: "ui_scale",
         aliases: &["uiscale", "hudscale"],
         label: "UI Scale",
+        usage: "uiscale <50-200>",
         confirm: |s| format!("ui scale {:.0}%", s.ui_scale * 100.0),
         show: |s| format!("{:.0}%", s.ui_scale * 100.0),
         parse_human: |s, v| match v.parse::<f32>() {

@@ -182,8 +182,9 @@ impl World {
                     self.pending_fresh.set();
                 }
             } else {
-                // No flood: drop seeds so `light_ready` never blocks meshing.
-                self.light_worklist.clear();
+                // No flood. Edit seeds stay dormant so re-enabling lighting only
+                // settles chunks changed while it was off; `light_ready` bypasses
+                // this worklist while disabled.
             }
         }
         // Sync dirty remesh (edited chunks, budgeted) then the fresh mesh lane

@@ -956,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_menu_model_prints_values_like_the_old_screen() {
+    fn settings_menu_model_prints_descriptor_values() {
         let mut s = Settings::default();
         s.msaa = 4;
         s.max_fps = 0;
@@ -977,7 +977,7 @@ mod tests {
             [
                 ("Fullscreen".to_string(), "Off".to_string()),
                 ("VSync".to_string(), "Off".to_string()),
-                ("Lighting".to_string(), "On".to_string()),
+                ("Voxel Lighting".to_string(), "On".to_string()),
                 ("MSAA".to_string(), "4x".to_string()),
                 ("Max FPS".to_string(), "Uncapped".to_string()),
                 ("Render Distance".to_string(), "6".to_string()),
@@ -1219,7 +1219,7 @@ mod tests {
     #[test]
     fn settings_cycle_wraps_every_row() {
         // Row indices follow the SETTINGS table order:
-        // 0 fullscreen, 1 vsync, 2 cullfaces, 3 msaa, 4 max_fps,
+        // 0 fullscreen, 1 vsync, 2 lighting, 3 msaa, 4 max_fps,
         // 5 render_distance, 6 fov, 7 render_scale, 8 ui_scale.
         let mut s = Settings::default();
         apply_settings_cycle(&mut s, 0, Step::Next);

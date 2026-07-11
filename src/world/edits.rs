@@ -54,11 +54,62 @@ impl World {
     /// [`stream`](Self::stream) rebuilds them with — or without — settled light.
     /// A no-op when the value is unchanged, so it is cheap to push every frame.
     pub fn set_lighting(&mut self, on: bool, eng: &mut Engine) {
-        if on == self.lighting {
+        if !self.transition_lighting(on) {
             return;
         }
-        self.lighting = on;
         self.free_meshes(eng);
+    }
+
+    /// Move the CPU lighting pipeline between enabled and full-bright modes.
+    /// Kept separate from GPU mesh retirement so the asynchronous state machine
+    /// can be tested without constructing an engine.
+    pub(in crate::world) fn transition_lighting(&mut self, on: bool) -> bool {
+        if on == self.lighting {
+            return false;
+        }
+
+        self.lighting = on;
+        self.light_epoch = self.light_epoch.wrapping_add(1);
+        if !on {
+            // Work captured but not yet published has no trustworthy settled
+            // grid. Mark those chunks missing so re-enable discovers them without
+            // retaining a second dormant work set.
+            let unsettled: Vec<_> = self
+                .light_worklist
+                .iter()
+                .chain(&self.light_inflight)
+                .copied()
+                .chain(self.light_apply_queue.iter().map(|(coord, _)| *coord))
+                .collect();
+            for coord in unsettled {
+                if let Some(loaded) = self.chunks.get_mut(&coord) {
+                    loaded.light = None;
+                }
+            }
+            self.light_worklist.clear();
+        }
+        self.light_inflight.clear();
+        self.light_apply_queue.clear();
+        self.light_pending.take();
+        // `light_gate` (degraded/blocked_since) is left untouched on purpose: the
+        // per-frame `tick_light_gate` reconciles it against live predicates. With
+        // lighting off, `light_ready` is data-only, so blocked timers drain and any
+        // degraded chunk is re-meshed full-bright and cleared.
+
+        if on {
+            // Edits made while off remain in the dormant worklist. Chunks loaded
+            // while off have no grid, so add only those; unchanged settled grids
+            // remain valid and avoid a whole-volume relight.
+            self.light_worklist.extend(
+                self.chunks
+                    .iter()
+                    .filter_map(|(&coord, loaded)| loaded.light.is_none().then_some(coord)),
+            );
+            if !self.light_worklist.is_empty() {
+                self.light_pending.set();
+            }
+        }
+        true
     }
 
     /// Free every chunk's GPU mesh and reset every chunk to `NeedsMesh` — used
@@ -68,6 +119,9 @@ impl World {
     /// old unconditional `meshed = false`; the next scan re-derives `Air`.)
     pub fn free_meshes(&mut self, eng: &mut Engine) {
         for loaded in self.chunks.values_mut() {
+            // Any worker mesh captured before this reset must not be accepted if
+            // it lands after the next stream establishes a new centre.
+            loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::NeedsMesh { building: false }, eng);
         }
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the

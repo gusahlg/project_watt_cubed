@@ -98,7 +98,8 @@ pub enum Job {
     /// Relax the light grid for `coord` from a frozen neighbourhood snapshot.
     Light {
         coord: Coord,
-        snapshot: LightSnapshot,
+        epoch: u32,
+        snapshot: Box<LightSnapshot>,
     },
     /// Build a far LOD tile's coarse mesh. The [`TileSource`] is the tile's sole
     /// voxel authority: `Pure` reads the bare generator; `Edited` (a tile in
@@ -180,7 +181,7 @@ pub enum Done {
     /// paired with its coord. Landed together and stored in one drain step.
     Column { col: (i32, i32), chunks: Vec<(Coord, Chunk)> },
     Mesh { coord: Coord, rev: u32, data: ChunkMeshData },
-    Light { coord: Coord, grid: LightGrid },
+    Light { coord: Coord, epoch: u32, grid: LightGrid },
     Tile { tile: Tile, data: ChunkMeshData },
     Skin { col: SkinColumn, data: SurfaceData },
 }
@@ -520,7 +521,7 @@ fn run(job: Job) -> Done {
             );
             Done::Mesh { coord, rev, data }
         }
-        Job::Light { coord, snapshot } => {
+        Job::Light { coord, epoch, snapshot } => {
             // Pure flood: same `propagate` the sync path called, now on an owned
             // neighbourhood snapshot instead of live neighbour grids.
             let mut grid = LightGrid::dark();
@@ -532,7 +533,7 @@ fn run(job: Job) -> Done {
                 &snapshot.tables,
                 &mut grid,
             );
-            Done::Light { coord, grid }
+            Done::Light { coord, epoch, grid }
         }
         Job::Tile { tile, source, tables } => {
             let (generator, edits) = source.parts();

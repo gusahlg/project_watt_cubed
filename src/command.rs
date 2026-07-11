@@ -12,7 +12,7 @@ use voxel_engine::DVec3;
 use crate::block::Composition;
 use crate::math::{WORLD_BORDER, block_coord};
 use crate::player::Player;
-use crate::settings::{SETTINGS, Settings, on_off};
+use crate::settings::{SETTINGS, Settings};
 use crate::sky::{DayLength, Sky};
 use crate::ui::{Line, Role};
 use crate::world::World;
@@ -150,41 +150,13 @@ fn teleport(args: &[&str], player: &mut Player) -> Vec<Line> {
 /// The caller applies the mutated [`Settings`] to the engine and persists it.
 fn gfx(args: &[&str], settings: &mut Settings) -> Vec<Line> {
     let usage = || {
-        vec![
-            "usage: gfx <setting> <value>".to_string(),
-            "  gfx fullscreen on|off".to_string(),
-            "  gfx vsync on|off".to_string(),
-            "  gfx msaa 1|2|4|8".to_string(),
-            "  gfx fps <n>|off".to_string(),
-            "  gfx renderdist <3-10>".to_string(),
-            "  gfx fov <50-110>".to_string(),
-            "  gfx renderscale <25-200>  (percent)".to_string(),
-        ]
+        std::iter::once("usage: gfx <setting> <value>".to_string())
+            .chain(SETTINGS.iter().map(|field| format!("  gfx {}", field.usage())))
+            .collect()
     };
 
     match args {
-        [] => {
-            let fps = if settings.max_fps == 0 {
-                "uncapped".to_string()
-            } else {
-                settings.max_fps.to_string()
-            };
-            shown(vec![
-                format!(
-                    "gfx: fullscreen {}  vsync {}  msaa {}x",
-                    on_off(settings.fullscreen, false),
-                    on_off(settings.vsync, false),
-                    settings.msaa
-                ),
-                format!(
-                    "     fps {}  renderdist {}  fov {:.0}  scale {:.0}%",
-                    fps,
-                    settings.render_distance,
-                    settings.fov,
-                    settings.render_scale * 100.0
-                ),
-            ])
-        }
+        [] => shown(SETTINGS.iter().map(|field| field.confirm(settings)).collect()),
         [key, value] => match gfx_set(settings, key, value) {
             Some(msg) => shown(vec![msg]),
             None => rejected(usage()),
@@ -446,8 +418,13 @@ mod tests {
         assert_eq!(s.render_distance, 20);
         execute("gfx fullscreen on", &mut p, &w, &mut s, &mut sky);
         assert!(s.fullscreen);
+        execute("gfx lighting off", &mut p, &w, &mut s, &mut sky);
+        assert!(!s.lighting);
         let out = execute("gfx", &mut p, &w, &mut s, &mut sky);
-        assert!(out[0].text().contains("fullscreen on"));
+        let text = joined(&out);
+        assert!(text.contains("fullscreen on"));
+        assert!(text.contains("lighting off"));
+        assert!(text.contains("ui scale"));
     }
 
     #[test]
@@ -458,6 +435,9 @@ mod tests {
         let before = s.clone();
         let out = execute("gfx msaa lots", &mut p, &w, &mut s, &mut sky);
         assert!(out[0].text().contains("usage"));
+        let text = joined(&out);
+        assert!(text.contains("lighting on|off"));
+        assert!(text.contains("uiscale <50-200>"));
         assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
         assert_eq!(s, before);
     }
