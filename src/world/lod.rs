@@ -4,7 +4,7 @@
 //! region; each cell samples the generator (islands + overhangs included), and
 //! the result meshes through [`build_chunk_mesh`](super::mesh::build_chunk_mesh)
 //! exactly like a chunk — so a buried tile meshes to nothing, a sky tile to
-//! nothing, and only the silhouette tiles carry geometry (WORLD-DESIGN §7.7, §12).
+//! nothing, and only the silhouette tiles carry geometry.
 //!
 //! Tiles are a pure function of the generator seed and coordinates — never edited,
 //! never invalidated — so [`TileState`] has no `Dirty` variant (strictly fewer
@@ -13,11 +13,11 @@
 use voxel_engine::{Engine, Frame3D, MeshHandle, Vec3};
 
 use super::ChunkMeshes;
-use super::chunk::CHUNK_SIZE;
+use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::TerrainGenerator;
 use super::mesh::{ChunkMeshData, Padded, build_chunk_mesh, new_chunk_mesh_data};
-use crate::block::registry::{BlockId, HotTables};
-use crate::coord::ByPass;
+use crate::block::registry::{AIR, BlockId, HotTables};
+use crate::coord::{ByPass, ChunkCoord};
 use crate::world::light::PaddedLight;
 
 /// LOD level carrier: everything about a tile's size derives from `k`.
@@ -39,9 +39,12 @@ impl Lod {
     }
 }
 
-/// The single far-terrain LOD level: 4 m cells, 64 m (4-chunk) tiles. A pyramid
-/// of levels was tried but its differently-sized grids left cracks at the
-/// level-to-level band edges; one uniform level tiles the far shell seamlessly.
+/// The pyramid's finest tile level: 4 m cells, 64 m (4-chunk) tiles. Ring
+/// selection lives in [`pyramid`](crate::world::pyramid) (`PyramidCfg.finest`
+/// = this, plus coarser rings; band-edge seams are carried by calibrated droop
+/// + ring overlap, not by grid alignment). This const remains only as the
+/// compile-time floor for the skin coarseness assert (`skin.rs`:
+/// `SKIN_LOD > TILE_LOD`).
 pub(in crate::world) const TILE_LOD: Lod = Lod(2);
 
 /// A far tile: 3D cell with level and grid coords. World min corner is (x, y, z) * span.
@@ -114,7 +117,11 @@ const CS: i32 = CHUNK_SIZE as i32;
 /// Sample generator at tile's 2^k-metre stride into a padded 16³ block. Returns
 /// padded neighbourhood and uniform interior id (if all agree). Shell is sampled
 /// directly; tiles whose shell matches interior mesh to nothing.
-fn sample_coarse<T: TerrainGenerator>(tile: Tile, terrain: &T) -> (Padded, Option<BlockId>) {
+fn sample_coarse<T: TerrainGenerator>(
+    tile: Tile,
+    terrain: &T,
+    edits: &[(i32, i32, i32, BlockId)],
+) -> (Padded, Option<BlockId>) {
     let cell = tile.lod.cell();
     let half = cell / 2;
     let (ox, oy, oz) = (tile.origin_x(), tile.origin_y(), tile.origin_z());
@@ -122,14 +129,18 @@ fn sample_coarse<T: TerrainGenerator>(tile: Tile, terrain: &T) -> (Padded, Optio
     // the same across every column, so build the run once and share it — letting the
     // generator sample one column profile per run instead of one per cell.
     let ys: Vec<i32> = (0..CHUNK_SIZE + 2).map(|i| oy + (i as i32 - 1) * cell + half).collect();
-    // Skip per-cell generation if tile is uniformly one block (sky/water).
-    if let Some(id) = terrain.lod_tile_uniform(ox, oz, cell, ys[0], ys[CHUNK_SIZE + 1]) {
-        return (Padded::uniform(id), Some(id));
+    // Skip per-cell generation if tile is uniformly one block (sky/water) — but
+    // only when no edit could break that uniformity within this tile's footprint.
+    if edits.is_empty() {
+        if let Some(id) = terrain.lod_tile_uniform(ox, oz, cell, ys[0], ys[CHUNK_SIZE + 1]) {
+            return (Padded::uniform(id), Some(id));
+        }
     }
     let padded = Padded::from_columns(|x, z, out| {
         let wx = ox + x * cell + half;
         let wz = oz + z * cell + half;
         terrain.lod_column(wx, wz, &ys, out);
+        reduce_edits_into_column(out, edits, ox, oy, oz, x, z, cell, half);
     });
     // Interior-only uniform detection (the shell is excluded, matching how a
     // dense chunk's `uniform()` keys off its own 16³).
@@ -148,17 +159,85 @@ fn sample_coarse<T: TerrainGenerator>(tile: Tile, terrain: &T) -> (Padded, Optio
     (padded, uniform)
 }
 
+/// Flatten a `GenerateColumn`-shaped overlay (per-chunk flat-index cells) to
+/// absolute world voxels `(wx, wy, wz, block)`, the shape the coarse-cell reducer
+/// scans.
+fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32, i32, BlockId)> {
+    let mut out = Vec::new();
+    for (coord, cells) in edits {
+        for &(index, id) in cells {
+            let (lx, ly, lz) = Chunk::local_of(index);
+            out.push((
+                coord.x * CS + lx as i32,
+                coord.y * CS + ly as i32,
+                coord.z * CS + lz as i32,
+                id,
+            ));
+        }
+    }
+    out
+}
+
+/// Coarse-cell reducer for ONE padded column `(x, z)` of a tile. For each
+/// edit whose world XZ lands in this column's `cell`-wide footprint, resolve the
+/// vertical cell it hits: a SOLID edit overwrites the cell (latest wins, since
+/// edits replay in order); an AIR edit clears the cell ONLY when it covers the
+/// cell's exact sample point — air never wins a vote it didn't earn.
+#[allow(clippy::too_many_arguments)]
+fn reduce_edits_into_column(
+    out: &mut [BlockId],
+    edits: &[(i32, i32, i32, BlockId)],
+    ox: i32,
+    oy: i32,
+    oz: i32,
+    x: i32,
+    z: i32,
+    cell: i32,
+    half: i32,
+) {
+    if edits.is_empty() {
+        return;
+    }
+    let (fx, fz) = (ox + x * cell, oz + z * cell); // this column's footprint min corner
+    for &(ewx, ewy, ewz, id) in edits {
+        if ewx < fx || ewx >= fx + cell || ewz < fz || ewz >= fz + cell {
+            continue;
+        }
+        // `out[i]` is padded-y `i - 1`, world-y-centred at `oy + (i-1)*cell + half`.
+        let i = (ewy - oy).div_euclid(cell) + 1;
+        let Some(slot) = usize::try_from(i).ok().and_then(|i| out.get_mut(i)) else {
+            continue;
+        };
+        if id != AIR {
+            *slot = id; // latest solid wins the cell
+        } else {
+            let (sx, sy, sz) = (fx + half, oy + (i - 1) * cell + half, fz + half);
+            if ewx == sx && ewy == sy && ewz == sz {
+                *slot = AIR; // air only when it covers the sample point
+            }
+        }
+    }
+}
+
 /// Build tile's mesh (every pass) from downsampled generator using full-res
 /// mesher. Vertices are cell-local 0..=16, drawn at scale=lod.cell() + tile
 /// origin. Lit as open-sky (full skylight, no blocklight) so tile shading
 /// tracks day/night like real surface chunks. Empty tiles become Air state.
-pub fn build_tile_mesh<T: TerrainGenerator>(tile: Tile, terrain: &T, tables: &HotTables) -> ChunkMeshData {
+pub fn build_tile_mesh<T: TerrainGenerator>(
+    tile: Tile,
+    terrain: &T,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+) -> ChunkMeshData {
     use voxel_engine::profile::{Meter, add};
     // Split the tile job into its two halves — coarse generator sampling vs.
     // greedy meshing — so the unified report shows which one the ~46ms/job cost
     // lives in. Worker-thread code, but `profile` is an atomic global sink.
     let t0 = std::time::Instant::now();
-    let (padded, uniform) = sample_coarse(tile, terrain);
+    // Flatten the `GenerateColumn`-shaped overlay to world-space voxels once, so
+    // the per-column reducer is a flat scan (edit counts per tile are small).
+    let flat = flatten_edits(edits);
+    let (padded, uniform) = sample_coarse(tile, terrain, &flat);
     add(Meter::TileSample, t0.elapsed());
 
     let t1 = std::time::Instant::now();
@@ -248,7 +327,7 @@ mod tests {
     fn surface_tile_meshes_a_visible_surface() {
         // h = 100 → the tile y=1 (world Y 64..128) brackets the surface.
         let tile = Tile { lod: Lod(2), x: 0, y: 1, z: 0 };
-        let data = build_tile_mesh(tile, &flat(100), &tables());
+        let data = build_tile_mesh(tile, &flat(100), &[], &tables());
         let mesh = opaque(&data);
         assert!(!mesh.vertices().is_empty(), "the surface tile has geometry");
         assert!(mesh.vertices().iter().any(|v: &MeshVertex| v.normal() == Normal::PosY), "a top");
@@ -260,7 +339,7 @@ mod tests {
     fn sky_tile_meshes_empty() {
         // h = 100; tile y=5 spans world Y 320..384, all above the surface.
         let tile = Tile { lod: Lod(2), x: 0, y: 5, z: 0 };
-        assert!(opaque(&build_tile_mesh(tile, &flat(100), &tables())).vertices().is_empty(), "sky is empty");
+        assert!(opaque(&build_tile_mesh(tile, &flat(100), &[], &tables())).vertices().is_empty(), "sky is empty");
     }
 
     /// Early-out produces same result as full per-cell sample.
@@ -268,7 +347,7 @@ mod tests {
     fn sky_tile_early_out_matches_full_sample() {
         // h = 100; tile y=5 spans world Y 320..384, wholly above the surface.
         let tile = Tile { lod: Lod(2), x: 0, y: 5, z: 0 };
-        let (padded, uniform) = sample_coarse(tile, &flat(100));
+        let (padded, uniform) = sample_coarse(tile, &flat(100), &[]);
         assert_eq!(uniform, Some(crate::block::registry::AIR), "sky tile detected uniform air");
         for y in -1..=CS {
             for z in -1..=CS {
@@ -277,7 +356,7 @@ mod tests {
                 }
             }
         }
-        assert!(opaque(&build_tile_mesh(tile, &flat(100), &tables())).vertices().is_empty());
+        assert!(opaque(&build_tile_mesh(tile, &flat(100), &[], &tables())).vertices().is_empty());
     }
 
     /// Buried tile (below surface) meshes empty; uniform shell hides interior faces.
@@ -285,6 +364,6 @@ mod tests {
     fn buried_tile_meshes_empty() {
         // h = 100; tile y=0 spans world Y 0..64, all deep (surface is at 99).
         let tile = Tile { lod: Lod(2), x: 0, y: 0, z: 0 };
-        assert!(opaque(&build_tile_mesh(tile, &flat(100), &tables())).vertices().is_empty(), "buried is empty");
+        assert!(opaque(&build_tile_mesh(tile, &flat(100), &[], &tables())).vertices().is_empty(), "buried is empty");
     }
 }

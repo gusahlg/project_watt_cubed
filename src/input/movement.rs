@@ -12,7 +12,7 @@
 use voxel_engine::{DVec3, Engine, Key};
 
 use crate::macros::axis;
-use crate::math::WORLD_BORDER;
+use crate::math::{WORLD_BORDER, block_coord};
 use crate::player::{Motion, Player, Stance, collision_box};
 use crate::world::World;
 
@@ -35,6 +35,19 @@ const TERMINAL_VELOCITY: f64 = -60.0;
 /// this are split into substeps so a fast fall stops at the first solid cell
 /// instead of tunneling past thin terrain.
 const MAX_COLLISION_STEP: f64 = 0.5;
+
+/// Swimming: horizontal reach is slower than a walk, and every axis chases its
+/// target through the same [`approach`] law at a low rate — that single damping
+/// *is* the water's drag, which is why swimming needs no separate friction or
+/// terminal-velocity clamp. Vertical targets: a full-strength liquid buoys a
+/// fully-submerged, idle player up at [`SWIM_FLOAT_SPEED`] until their head breaks
+/// the surface, where they instead settle at [`SWIM_SETTLE_SPEED`] and bob; holding
+/// ascend/descend overrides both at [`SWIM_VERT_SPEED`].
+const SWIM_SPEED: f64 = 4.0;
+const SWIM_ACCEL: f64 = 6.0;
+const SWIM_VERT_SPEED: f64 = 5.0;
+const SWIM_FLOAT_SPEED: f64 = 3.0;
+const SWIM_SETTLE_SPEED: f64 = 1.0;
 
 axis!(AxisZ { Forward = W, Backward = S });
 axis!(AxisX { Right = D, Left = A });
@@ -82,6 +95,11 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
 
     resolve_stance(player, world, input);
 
+    // Reconcile the walking/swimming boundary before integrating, so this frame
+    // runs under the right physics the instant the feet cross a water surface.
+    let liquid = sample_liquid(player, world);
+    reconcile_liquid(player, liquid);
+
     // Unit horizontal heading from the movement keys (zero when none held); each
     // mode scales it by its own speed.
     let heading = horizontal_heading(player, input);
@@ -114,9 +132,73 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
             velocity.y = (velocity.y - GRAVITY * dt).max(TERMINAL_VELOCITY);
             *velocity * dt
         }
+        // Swimming: every axis chases its target through one drag law. Horizontal
+        // follows the movement keys; vertical is a held ascend/descend, or — idle —
+        // buoyancy that floats the player to the surface and lets them bob there.
+        Motion::Swimming { velocity } => {
+            let vertical = if input.up_down.is_active() {
+                input.up_down.signum() as f64 * SWIM_VERT_SPEED
+            } else if liquid.fully_submerged() {
+                SWIM_FLOAT_SPEED * liquid.strength()
+            } else {
+                -SWIM_SETTLE_SPEED
+            };
+            let target = heading * SWIM_SPEED + DVec3::Y * vertical;
+            *velocity = approach(*velocity, target, SWIM_ACCEL, dt);
+            *velocity * dt
+        }
     };
 
     move_with_collision(player, world, delta);
+}
+
+/// The buoyancy the player is immersed in this frame, sampled at the feet and the
+/// eye. Two samples are enough to tell "wading / at the surface" (feet only) from
+/// "fully under" (eye too), which is all the swim physics needs.
+#[derive(Clone, Copy)]
+struct Liquid {
+    feet: u8,
+    eye: u8,
+}
+
+impl Liquid {
+    /// Feet in liquid — the player swims rather than walks.
+    fn submerged(&self) -> bool {
+        self.feet > 0
+    }
+
+    /// Head under the surface too — buoyancy floats the player upward.
+    fn fully_submerged(&self) -> bool {
+        self.eye > 0
+    }
+
+    /// Buoyancy strength on a `0.0..=1.0` scale (water ≈ 0.78), from whichever
+    /// sample the player is most deeply immersed in.
+    fn strength(&self) -> f64 {
+        self.feet.max(self.eye) as f64 / 255.0
+    }
+}
+
+/// Sample the liquid at the player's feet and eye voxels.
+fn sample_liquid(player: &Player, world: &World) -> Liquid {
+    let p = player.position;
+    let (x, z) = (block_coord(p.x), block_coord(p.z));
+    Liquid {
+        feet: world.buoyancy_at(x, block_coord(player.feet_y()), z),
+        eye: world.buoyancy_at(x, block_coord(p.y), z),
+    }
+}
+
+/// Move the player across the walking/swimming boundary as they enter or leave a
+/// liquid, carrying momentum across the switch. Flying is unaffected — it ignores
+/// water entirely — so only the grounded/submerged pair converts here.
+fn reconcile_liquid(player: &mut Player, liquid: Liquid) {
+    let velocity = player.velocity();
+    player.motion = match (&player.motion, liquid.submerged()) {
+        (Motion::Walking { .. }, true) => Motion::Swimming { velocity },
+        (Motion::Swimming { .. }, false) => Motion::Walking { velocity, on_ground: false },
+        (motion, _) => *motion,
+    };
 }
 
 /// The unit-length horizontal movement direction for this frame, or zero when no
@@ -154,7 +236,9 @@ fn approach(current: DVec3, target: DVec3, rate: f64, dt: f64) -> DVec3 {
 /// grow into the ceiling. Sneaking is a walking-only stance: flying uses `LeftShift`
 /// to descend, so it never crouches.
 fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
-    let want_sneak = input.sneak && !player.flying();
+    // Sneaking is a walking-only stance: flying uses `LeftShift` to descend and
+    // swimming uses it to dive, so neither should crouch the hitbox.
+    let want_sneak = input.sneak && !player.flying() && !player.swimming();
     player.stance = match (player.stance, want_sneak) {
         (Stance::Standing, true) => Stance::Sneaking,
         (Stance::Sneaking, false)
@@ -213,6 +297,19 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
             *on_ground = blocked_y && delta.y < 0.0;
             if blocked_y {
                 velocity.y = 0.0;
+            }
+        }
+        // Swimming has no ground contact; a blocked axis just spends its velocity,
+        // like flying into a wall.
+        Motion::Swimming { velocity } => {
+            if blocked_x {
+                velocity.x = 0.0;
+            }
+            if blocked_y {
+                velocity.y = 0.0;
+            }
+            if blocked_z {
+                velocity.z = 0.0;
             }
         }
     }
@@ -301,17 +398,21 @@ mod tests {
     }
 
     /// Build a flat stone runway at `y = floor_y` under the given start, long
-    /// enough for the walk tests, and stand the player on it. Terrain at these
-    /// heights (well above the hills, below the island band) is air, so the
-    /// runway is the only geometry.
+    /// enough for the walk tests, and stand the player on it. The generator
+    /// puts real terrain up here (heights reach ~52 at the far columns), so
+    /// standing room is CARVED above the runway — the runway must be the only
+    /// geometry the walker can touch.
     fn player_on_runway(world: &mut World, x: f64, z: f64) -> Player {
         let floor_y = 40;
         world.prepare_around(DVec3::new(x, floor_y as f64, z));
         let stone = world.registry().id_by_name("Stone").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
-        for dx in -2..=12 {
+        for dx in -2..=14 {
             for dz in -2..=2 {
                 world.set_block(bx + dx, floor_y, bz + dz, stone);
+                for y in (floor_y + 1)..=(floor_y + 3) {
+                    world.set_block(bx + dx, y, bz + dz, crate::block::AIR);
+                }
             }
         }
         // Feet on top of the runway: eye = feet + standing eye offset.

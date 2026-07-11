@@ -1,7 +1,8 @@
 //! Zone 3 — the far grey height-skin ring. Beyond the full-res chunks (Zone 1)
 //! and the volumetric LOD tiles (Zone 2), the skin fills the horizon with a
-//! wide, cheap, low-fidelity backdrop: the terrain *surface only*, flat grey,
-//! under distance fog. Because world-gen is deterministic, a skin column is a
+//! wide, cheap, low-fidelity backdrop: the terrain *surface only*, tinted by the
+//! surface block's palette colour and fogged toward the sky at the far edge.
+//! Because world-gen is deterministic, a skin column is a
 //! pure function of `(seed, x, z)` — never stored beyond its cached surface
 //! mesh, never edited, never invalidated (WORLD-DESIGN Zone 3).
 //!
@@ -11,10 +12,11 @@
 //! no `Dirty`). The skin needs a NEW retained mesh primitive: the packed voxel
 //! vertex cannot encode a continuous arbitrary-Y grey surface, so this lane
 //! rides [`SurfaceData`]/[`SurfaceHandle`] instead of `MeshData`/`MeshHandle`.
-use voxel_engine::{Engine, SurfaceData, SurfaceHandle, SurfaceVertex};
+use voxel_engine::{Color, Engine, SurfaceData, SurfaceHandle, SurfaceVertex};
 
 use super::generation::TerrainGenerator;
 use super::lod::Lod;
+use crate::block::registry::BlockId;
 
 /// The single far-skin LOD level: 64 m cells, 1024 m columns — strictly coarser
 /// than the Zone-2 tile ring (asserted below), so the skin always sits outside
@@ -155,8 +157,22 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-/// Base grey the whole skin is tinted from, before shading.
-const SKIN_GREY: [f32; 3] = [130.0, 130.0, 130.0];
+/// Fallback tint when the palette has no colour for a surface block (an empty
+/// colour table in tests, or an out-of-range id) — a neutral mid-grey.
+const SKIN_FALLBACK: [f32; 3] = [130.0, 130.0, 130.0];
+
+/// The skin's base tint for a surface block: the palette's render colour for
+/// that block. This is where the flat `SKIN_GREY` died — the horizon now carries
+/// the real terrain palette (grass green, sand, snow), and the *fog-is-sky*
+/// handoff does the rest: the fragment shader fogs distant skin toward the sky
+/// colour, so the coloured backdrop dissolves into the sky at the horizon with
+/// no grey seam and no separate sky-fill pass.
+fn block_average_color(colors: &[Color], id: BlockId) -> [f32; 3] {
+    match colors.get(id.0 as usize) {
+        Some(c) => [c.r as f32, c.g as f32, c.b as f32],
+        None => SKIN_FALLBACK,
+    }
+}
 
 /// Vertical period (metres) of the topographic height band, and its brightness
 /// amplitude. A gentle sinusoid of absolute world Y lightens/darkens the grey to
@@ -176,13 +192,14 @@ fn lambert(normal: [f32; 3]) -> f32 {
     0.4 + 0.6 * l
 }
 
-/// A shaded skin vertex: base grey scaled by the per-quad `lambert` factor and a
-/// per-vertex height band keyed off absolute world Y `y`.
-fn skin_vertex(pos: [f32; 3], lambert: f32) -> SurfaceVertex {
+/// A shaded skin vertex: the surface block's `base` palette colour scaled by the
+/// per-quad `lambert` factor and a per-vertex height band keyed off absolute
+/// world Y `y`.
+fn skin_vertex(pos: [f32; 3], lambert: f32, base: [f32; 3]) -> SurfaceVertex {
     let band = 0.5 + 0.5 * (pos[1] * (std::f32::consts::TAU / SKIN_BAND_M)).sin();
     let f = lambert * (1.0 - SKIN_BAND_AMT + SKIN_BAND_AMT * band);
     let ch = |c: f32| (c * f).round().clamp(0.0, 255.0) as u8;
-    SurfaceVertex { pos, color: [ch(SKIN_GREY[0]), ch(SKIN_GREY[1]), ch(SKIN_GREY[2]), 255] }
+    SurfaceVertex { pos, color: [ch(base[0]), ch(base[1]), ch(base[2]), 255] }
 }
 
 /// Build a far-skin column's grey surface mesh off-thread from the generator
@@ -191,12 +208,19 @@ fn skin_vertex(pos: [f32; 3], lambert: f32) -> SurfaceVertex {
 /// Column-LOCAL horizontal coords (`0..=span`) and ABSOLUTE (drooped) world-Y:
 /// the caller draws the column at camera-relative offset `(ox−cam.x, 0, oz−cam.z)`
 /// with scale 1.0. Always non-empty (`N²` top cells) → the column is born `Ready`.
-pub fn build_skin_mesh<T: TerrainGenerator>(col: SkinColumn, terrain: &T) -> SurfaceData {
+pub fn build_skin_mesh<T: TerrainGenerator>(col: SkinColumn, terrain: &T, colors: &[Color]) -> SurfaceData {
+    let (ox, oz) = (col.origin_x(), col.origin_z());
     let corners = sample_corners(col, terrain);
     let y = |ix: i32, iz: i32| corners.0[cidx(ix, iz)];
     // Column-local horizontal (0..=span), absolute drooped Y.
     let pos =
         |ix: i32, iz: i32| [(ix * SKIN_CELL) as f32, y(ix, iz) as f32, (iz * SKIN_CELL) as f32];
+    // Per-corner base tint from the terrain surface block's palette colour,
+    // sampled on the same shared integer grid as the heights (so adjacent columns
+    // agree on their shared edge — seam-consistent colour, like the height band).
+    let base = |ix: i32, iz: i32| {
+        block_average_color(colors, terrain.surface_at(ox + ix * SKIN_CELL, oz + iz * SKIN_CELL))
+    };
 
     let mut data = SurfaceData::new();
 
@@ -204,9 +228,10 @@ pub fn build_skin_mesh<T: TerrainGenerator>(col: SkinColumn, terrain: &T) -> Sur
     for iz in 0..N {
         for ix in 0..N {
             let p = [pos(ix, iz), pos(ix, iz + 1), pos(ix + 1, iz + 1), pos(ix + 1, iz)];
+            let c = [base(ix, iz), base(ix, iz + 1), base(ix + 1, iz + 1), base(ix + 1, iz)];
             let n = cross(sub(p[1], p[0]), sub(p[3], p[0]));
             let s = lambert(n);
-            data.quad(std::array::from_fn(|i| skin_vertex(p[i], s)));
+            data.quad(std::array::from_fn(|i| skin_vertex(p[i], s, c[i])));
         }
     }
 
@@ -214,19 +239,20 @@ pub fn build_skin_mesh<T: TerrainGenerator>(col: SkinColumn, terrain: &T) -> Sur
     // an interior boundary the neighbour column drops the identical skirt to the
     // same floor (shared corners), so those back-to-back quads are never seen;
     // only the true outer shell boundary is visible.
-    let mut skirt = |a: [f32; 3], b: [f32; 3]| {
+    let mut skirt = |a: [f32; 3], b: [f32; 3], ca: [f32; 3], cb: [f32; 3]| {
         let floor = a[1].min(b[1]) - APRON as f32;
         let (ba, bb) = ([a[0], floor, a[2]], [b[0], floor, b[2]]);
         let n = cross(sub(b, a), sub(ba, a));
         let s = lambert(n);
         let quad = [a, b, bb, ba];
-        data.quad(std::array::from_fn(|i| skin_vertex(quad[i], s)));
+        let col = [ca, cb, cb, ca];
+        data.quad(std::array::from_fn(|i| skin_vertex(quad[i], s, col[i])));
     };
     for i in 0..N {
-        skirt(pos(i, 0), pos(i + 1, 0)); // iz == 0
-        skirt(pos(i, N), pos(i + 1, N)); // iz == N
-        skirt(pos(0, i), pos(0, i + 1)); // ix == 0
-        skirt(pos(N, i), pos(N, i + 1)); // ix == N
+        skirt(pos(i, 0), pos(i + 1, 0), base(i, 0), base(i + 1, 0));
+        skirt(pos(i, N), pos(i + 1, N), base(i, N), base(i + 1, N));
+        skirt(pos(0, i), pos(0, i + 1), base(0, i), base(0, i + 1));
+        skirt(pos(N, i), pos(N, i + 1), base(N, i), base(N, i + 1));
     }
 
     data
@@ -313,7 +339,7 @@ mod tests {
     fn top_quads_wind_upward() {
         let g = SlopedGen { a: 2, b: 5, c: 30 };
         for &col in &COLS {
-            let data = build_skin_mesh(col, &g);
+            let data = build_skin_mesh(col, &g, &[]);
             let tops = (N * N) as usize;
             for q in data.verts().chunks_exact(4).take(tops) {
                 let p: Vec<[f32; 3]> = q.iter().map(|v| v.pos).collect();
@@ -331,7 +357,7 @@ mod tests {
         for h in [-50, 0, 200] {
             let g = FlatGen { h };
             for &col in &COLS {
-                let data = build_skin_mesh(col, &g);
+                let data = build_skin_mesh(col, &g, &[]);
                 assert!(!data.is_empty(), "a column always has a surface");
                 let ys: Vec<f32> = data.verts().iter().map(|v| v.pos[1]).collect();
                 let (lo, hi) = ys.iter().fold((f32::MAX, f32::MIN), |(l, h), &y| (l.min(y), h.max(y)));

@@ -95,6 +95,18 @@ pub fn derive_emission(core: &CoreProperties) -> u8 {
     (core.light_emission as u16 * 15 / 255) as u8
 }
 
+/// A block's buoyancy strength (`0` when it carries no [`SpecialKind::Buoyancy`]),
+/// read from its already-derived specials. Non-zero marks the block as a passable
+/// liquid — collision's third axis, orthogonal to `solid`/`opaque`: a liquid still
+/// meshes (it stays solid to the mesher) but the player swims through it rather
+/// than standing on it. The value drives the buoyancy/drag the swimmer feels.
+pub fn derive_buoyancy(specials: &[(SpecialKind, u8)]) -> u8 {
+    specials
+        .iter()
+        .find_map(|&(kind, strength)| (kind == SpecialKind::Buoyancy).then_some(strength))
+        .unwrap_or(0)
+}
+
 /// Special behaviours a block exhibits, each scaled by how much of the carrying
 /// element it contains and summed across carriers. Returned sorted by kind for a
 /// stable, inspectable order.

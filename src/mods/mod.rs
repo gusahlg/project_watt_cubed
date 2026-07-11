@@ -20,6 +20,7 @@ use voxel_engine::{Engine, Frame};
 use crate::block::ElementId;
 use crate::menu::{MenuEvent, MenuModel};
 use crate::player::Player;
+use crate::ui::HudElement;
 use crate::world::World;
 
 /// The element counts the player is carrying — the single source of truth shared
@@ -201,11 +202,14 @@ pub trait Mod {
         let _ = (elements, world);
     }
 
-    /// Draw this mod's HUD while enabled, over the world and under the console.
-    /// `world` gives read access to the registry so names can be resolved at draw
-    /// time rather than cached.
-    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
-        let _ = (f, world, screen_w, screen_h);
+    /// This mod's HUD contribution while enabled, as data — a list of
+    /// [`HudElement`]s the core renders over the world and under the console. A
+    /// mod describes *what* to show and never draws, so panel chrome and layout
+    /// live in one place ([`crate::ui::render_hud`]). `world` gives read access to
+    /// the registry so names resolve at build time rather than being cached.
+    fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
+        let _ = (world, screen);
+        Vec::new()
     }
 
     /// Close a modal in-world overlay before the core interprets Escape as
@@ -322,13 +326,14 @@ impl Mods {
         }
     }
 
-    /// Draw every enabled mod's HUD.
-    pub fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
-        for entry in &mut self.entries {
-            if entry.enabled {
-                entry.module.draw(f, world, screen_w, screen_h);
-            }
-        }
+    /// Collect every enabled mod's HUD contribution, in install order (so a
+    /// later mod draws over an earlier one).
+    pub fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .flat_map(|e| e.module.hud(world, screen))
+            .collect()
     }
 
     /// Give enabled mods first refusal on Escape. The first open overlay closes

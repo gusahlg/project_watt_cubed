@@ -60,12 +60,12 @@ impl Console {
 
     /// Append a system/status line (the default role).
     pub fn print(&mut self, line: impl Into<String>) {
-        self.push(Line::of(Role::System, line));
+        self.push(Line::of(Role::Dim, line));
     }
 
     /// Echo a command the user submitted.
     pub fn echo(&mut self, line: impl Into<String>) {
-        self.push(Line::of(Role::Command, format!("> {}", line.into())));
+        self.push(Line::of(Role::Accent, format!("> {}", line.into())));
     }
 
     /// Append a pre-built line — the entry point for multi-colour lines (a
@@ -159,11 +159,7 @@ fn complete_command(input: &str) -> Completion {
     }
 }
 
-/// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
-pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
-    f.draw_text(text, x + 1, y + 1, font_size, Color::new(0, 0, 0, 180));
-    f.draw_text(text, x, y, font_size, color);
-}
+pub use crate::ui::shadowed;
 
 #[cfg(test)]
 mod tests {

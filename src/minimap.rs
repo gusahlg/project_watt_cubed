@@ -77,6 +77,15 @@ impl Minimap {
         }
     }
 
+    /// Toggle between north-up (fixed map, spinning marker) and heading-up
+    /// (rotating map, marker locked pointing up).
+    pub fn toggle_orientation(&mut self) {
+        self.cfg.orient = match self.cfg.orient {
+            Orientation::NorthUp => Orientation::Heading,
+            Orientation::Heading => Orientation::NorthUp,
+        };
+    }
+
     /// Throttled + recenter-gated rescan: when due, rebuilds `rgba` from the
     /// world's top-solid columns (colour × slope-shade) and uploads it via
     /// [`Engine::update_minimap`].

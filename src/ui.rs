@@ -93,29 +93,6 @@ impl Anchor {
     }
 }
 
-/// Semantic UI colours: call sites ask for a *role*, not a raw RGB, so a palette
-/// swap can't miss a site and there are no scattered `Color::` literals.
-#[derive(Clone, Copy)]
-pub struct Palette {
-    pub text: Color,
-    pub muted: Color,
-    pub accent: Color,
-    pub good: Color,
-    pub warn: Color,
-    pub bad: Color,
-}
-
-impl Palette {
-    pub const DEFAULT: Self = Self {
-        text: Color::WHITE,
-        muted: Color::RAYWHITE,
-        accent: Color::SKYBLUE,
-        good: Color::LIME,
-        warn: Color::GOLD,
-        bad: Color::SALMON,
-    };
-}
-
 /// The aiming reticle, as data: swap the value to restyle it.
 #[derive(Clone, Copy)]
 pub struct Crosshair {
@@ -177,7 +154,6 @@ impl HudMode {
 /// The whole in-world UI look, threaded through drawing. `scale` routes every font
 /// size; `hud` is the master visibility cycle.
 pub struct Theme {
-    pub palette: Palette,
     pub scale: f32,
     pub crosshair: Crosshair,
     pub hud: HudMode,
@@ -186,7 +162,6 @@ pub struct Theme {
 impl Theme {
     pub fn new() -> Self {
         Self {
-            palette: Palette::DEFAULT,
             scale: 1.0,
             crosshair: Crosshair::DEFAULT,
             hud: HudMode::Full,
@@ -225,41 +200,149 @@ pub fn label(
     let fs = theme.fs(base_fs);
     let w = f.measure_text(text, fs);
     let (x, y) = at.origin(screen, (w, fs), off);
-    crate::console::shadowed(f, text, x, y, fs, color);
+    shadowed(f, text, x, y, fs, color);
 }
 
-/// The semantic role of a run of console text — what it *means*, not what colour
-/// it is. Rendering resolves a role to a colour through [`Role::color`], so a line
-/// can only ever be an on-palette colour and the command layer speaks meaning
-/// (`Error` vs `System`) instead of pixels.
+/// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
+/// The base text-draw primitive: every UI string in the game goes through here.
+pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
+    f.draw_text(text, x + 1, y + 1, font_size, Color::new(0, 0, 0, 180));
+    f.draw_text(text, x, y, font_size, color);
+}
+
+// ---------------------------------------------------------------------------
+// HUD widget vocabulary. A mod describes *what* to show as data ([`HudElement`]s)
+// and never draws — [`render_hud`] is the only code that touches the frame, so
+// panel chrome, ellipsis, and scaling live in exactly one place and a new mod
+// can't reinvent (or misplace) any of it. The vocabulary is deliberately closed:
+// a screen-anchored [`Label`](HudElement::Label) and a boxed [`Panel`].
+// ---------------------------------------------------------------------------
+
+/// One panel row's text plus its emphasis. The panel resolves the role to a
+/// colour and ellipsizes the text to the panel width.
+#[derive(Clone)]
+pub struct Row {
+    pub text: String,
+    pub role: Role,
+}
+
+impl Row {
+    pub fn new(role: Role, text: impl Into<String>) -> Self {
+        Self { text: text.into(), role }
+    }
+}
+
+/// Shared panel rhythm: one padding/font/line-height for every HUD panel, so
+/// panels line up and their heights are computed identically.
+pub const PANEL_PAD: i32 = 8;
+pub const PANEL_FONT: i32 = 18;
+pub const PANEL_LINE: i32 = PANEL_FONT + 4;
+/// The translucent background behind every HUD panel.
+pub const PANEL_BG: Color = Color::new(8, 10, 14, 200);
+
+/// A translucent HUD box at an absolute screen position: a background sized to
+/// its content, header line(s), a small gap, then body rows. Every row is
+/// ellipsized to fit `width`. The single owner of panel chrome.
+pub struct Panel {
+    pub at: Px,
+    pub width: i32,
+    pub header: Vec<Row>,
+    pub rows: Vec<Row>,
+}
+
+impl Panel {
+    /// Total pixel height of the drawn box (padding + header + gap + body). The
+    /// body reserves at least one line so an empty panel still frames its box.
+    pub fn height(&self) -> i32 {
+        let body = self.rows.len().max(1) as i32;
+        PANEL_PAD * 2 + self.header.len() as i32 * PANEL_LINE + 2 + body * PANEL_LINE
+    }
+
+    fn draw(&self, f: &mut Frame) {
+        let (x, y) = self.at;
+        f.draw_rect(x, y, self.width, self.height(), PANEL_BG);
+        let text_x = x + PANEL_PAD;
+        let max_chars = ((self.width - PANEL_PAD * 2) / PANEL_FONT).max(1) as usize;
+        let mut cy = y + PANEL_PAD;
+        let mut row = |r: &Row, cy: i32| {
+            shadowed(f, &ellipsize(&r.text, max_chars), text_x, cy, PANEL_FONT, r.role.color());
+        };
+        for r in &self.header {
+            row(r, cy);
+            cy += PANEL_LINE;
+        }
+        cy += 2;
+        for r in &self.rows {
+            row(r, cy);
+            cy += PANEL_LINE;
+        }
+    }
+}
+
+/// One thing a mod contributes to the HUD. Closed on purpose (see the module
+/// note): a screen-anchored label or a boxed panel — nothing that lets a mod
+/// draw arbitrarily.
+pub enum HudElement {
+    /// A screen-anchored line of text, scaled by the theme.
+    Label {
+        at: Anchor,
+        off: Px,
+        base_fs: i32,
+        role: Role,
+        text: String,
+    },
+    /// A translucent content box at an absolute position.
+    Panel(Panel),
+}
+
+/// Draw every mod's contributed HUD. The only place mod HUD reaches the frame.
+pub fn render_hud(f: &mut Frame, theme: &Theme, screen: Px, elements: &[HudElement]) {
+    for el in elements {
+        match el {
+            HudElement::Label { at, off, base_fs, role, text } => {
+                label(f, theme, screen, *at, *off, *base_fs, role.color(), text)
+            }
+            HudElement::Panel(p) => p.draw(f),
+        }
+    }
+}
+
+/// The style role of a run of UI text — its *emphasis*, not a raw RGB. Rendering
+/// resolves a role to a colour through [`Role::color`], so text can only ever be an
+/// on-palette colour and call sites speak emphasis (`Danger` vs `Dim`) instead of
+/// pixels. This is the single colour table for the whole UI: HUD, console, menus,
+/// and mods all ask for a role, never a raw `Color::`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
-    /// A chat message body.
-    Chat,
-    /// The echo of a command the user submitted.
-    Command,
-    /// Neutral system/status text or normal command output.
-    System,
-    /// A rejected input or error.
-    Error,
-    /// A player name.
-    Name,
-    /// The `[global]` chat-scope tag.
-    Global,
-    /// A highlighted value inside otherwise-neutral text.
-    Value,
+    /// Primary text: coords, labels, the brightest normal text.
+    Primary,
+    /// Normal body text (chat, list rows).
+    Muted,
+    /// De-emphasised text (system output, secondary detail).
+    Dim,
+    /// Unavailable / inactive text (a disabled action, an unselected row).
+    Disabled,
+    /// The active/selected item, links, player names.
+    Accent,
+    /// A positive value or state (counts, equipped, success).
+    Positive,
+    /// A caution: the `[global]` tag, a header, a soft warning.
+    Warning,
+    /// An error or destructive outcome.
+    Danger,
 }
 
 impl Role {
     pub fn color(self) -> Color {
         match self {
-            Role::Chat => Color::RAYWHITE,
-            Role::Command => Color::SKYBLUE,
-            Role::System => Color::LIGHTGRAY,
-            Role::Error => Color::SALMON,
-            Role::Name => Color::SKYBLUE,
-            Role::Global => Color::GOLD,
-            Role::Value => Color::LIME,
+            Role::Primary => Color::WHITE,
+            Role::Muted => Color::RAYWHITE,
+            Role::Dim => Color::LIGHTGRAY,
+            Role::Disabled => Color::GRAY,
+            Role::Accent => Color::SKYBLUE,
+            Role::Positive => Color::LIME,
+            Role::Warning => Color::GOLD,
+            Role::Danger => Color::SALMON,
         }
     }
 }

@@ -20,6 +20,8 @@
 //!   camera-relative offset, so far terrain never jitters.
 //! - Uniform fast paths: a uniform non-solid chunk is empty; a uniform solid one
 //!   only sweeps its six border slices.
+use std::cell::RefCell;
+
 use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
@@ -42,6 +44,23 @@ pub fn new_chunk_mesh_data() -> ChunkMeshData {
 const CS: i32 = CHUNK_SIZE as i32;
 /// Padded neighbourhood edge: the 16 chunk cells plus one shell voxel each side.
 const PAD: usize = CHUNK_SIZE + 2;
+/// Cells in one [`Padded`] buffer.
+const PAD_VOL: usize = PAD * PAD * PAD;
+
+// Thread-local free list of [`Padded`] backing buffers. Each `Padded`
+// constructor (`capture`/`from_columns`/`uniform`) allocated a fresh
+// `PAD_VOL`-byte `Box<[u8]>` per call — the per-job neighbourhood-snapshot churn
+// the LOD-tile mesher pays on the worker (via `from_columns`) and the streamer
+// pays per remesh (via `capture`). Buffers are reclaimed on [`Drop`] and reused.
+// Bounded ([`PADDED_POOL_CAP`]) so the cross-thread path (a `capture`d
+// neighbourhood built on the main thread and dropped on a worker) can only
+// migrate a handful of buffers into a worker's list, not grow without bound.
+thread_local! {
+    static PADDED_POOL: RefCell<Vec<Box<[u8]>>> = const { RefCell::new(Vec::new()) };
+}
+/// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
+/// single job holds at most one live neighbourhood at a time.
+const PADDED_POOL_CAP: usize = 4;
 
 /// The chunk's 16³ voxels plus a one-voxel shell pulled from its 26 neighbours,
 /// indexed by signed coords `x, y, z ∈ -1..=16`. Owned, so a mesh job shares
@@ -60,6 +79,17 @@ impl Padded {
     #[inline]
     fn index(x: i32, y: i32, z: i32) -> usize {
         (x + 1) as usize + (z + 1) as usize * PAD + (y + 1) as usize * PAD * PAD
+    }
+
+    /// A `PAD_VOL`-byte buffer, recycled from [`PADDED_POOL`] if one is available
+    /// (else freshly allocated). Contents are UNSPECIFIED — a recycled buffer
+    /// holds a previous job's voxels — so every caller must fully initialise it
+    /// (`fill` then, where partial, overwrite the touched cells) before use.
+    fn take_buf() -> Box<[u8]> {
+        PADDED_POOL
+            .with_borrow_mut(|p| p.pop())
+            .filter(|b| b.len() == PAD_VOL)
+            .unwrap_or_else(|| vec![AIR.0; PAD_VOL].into_boxed_slice())
     }
 
     /// The block at signed coord `(x, y, z)`, each `∈ -1..=16`. Shared with the
@@ -87,7 +117,11 @@ impl Padded {
                 (0, c as usize)
             }
         };
-        let mut ids = vec![AIR.0; PAD * PAD * PAD];
+        let mut ids = Self::take_buf();
+        // Missing neighbours must read AIR, and only present cells are written
+        // below, so a recycled buffer MUST be cleared first (else a prior job's
+        // voxels would leak into the unwritten shell cells — a silent visual bug).
+        ids.fill(AIR.0);
         for y in -1..=CS {
             for z in -1..=CS {
                 for x in -1..=CS {
@@ -100,12 +134,14 @@ impl Padded {
                 }
             }
         }
-        Self { ids: ids.into_boxed_slice() }
+        Self { ids }
     }
 
     /// Uniform padded neighbourhood for LOD tile early-out (all cells same block).
     pub fn uniform(id: BlockId) -> Self {
-        Self { ids: vec![id.0; PAD * PAD * PAD].into_boxed_slice() }
+        let mut ids = Self::take_buf();
+        ids.fill(id.0); // full overwrite: clears any recycled contents
+        Self { ids }
     }
 
     /// Build a padded neighbourhood one vertical column at a time: `col(x, z, out)`
@@ -119,7 +155,10 @@ impl Padded {
     /// compute its per-column terrain profile once and reuse it down the run — the
     /// dominant cost of a far tile — which a point-shaped fill cannot express.
     pub fn from_columns(mut col: impl FnMut(i32, i32, &mut [BlockId])) -> Self {
-        let mut ids = vec![AIR.0; PAD * PAD * PAD];
+        // No pre-clear: the loop below covers every (x, z) column across the full
+        // `-1..=CS` padded range and every padded-y cell of each, so a recycled
+        // buffer is fully overwritten.
+        let mut ids = Self::take_buf();
         let mut buf = [AIR; PAD];
         for z in -1..=CS {
             for x in -1..=CS {
@@ -129,7 +168,20 @@ impl Padded {
                 }
             }
         }
-        Self { ids: ids.into_boxed_slice() }
+        Self { ids }
+    }
+}
+
+impl Drop for Padded {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.ids);
+        if buf.len() == PAD_VOL {
+            PADDED_POOL.with_borrow_mut(|p| {
+                if p.len() < PADDED_POOL_CAP {
+                    p.push(buf);
+                }
+            });
+        }
     }
 }
 

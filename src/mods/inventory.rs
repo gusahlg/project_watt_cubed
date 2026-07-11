@@ -14,12 +14,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use voxel_engine::{Color, Engine, Frame, Key};
+use voxel_engine::{Engine, Key};
 
 use crate::block::ElementId;
-use crate::console::shadowed;
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
-use crate::ui::ellipsize;
+use crate::ui::{Anchor, HudElement, Panel, Role, Row, PANEL_FONT};
 use crate::world::World;
 
 /// Starting capacity. Large-looking, but with no stacking it is modest — and meant
@@ -92,6 +91,11 @@ impl Mod for InventoryMod {
             ui.inventory_visible = !ui.inventory_visible;
             self.ui.set(ui);
         }
+        // Expire the overflow warning once its window has passed (drawing no
+        // longer mutates state, so the clock is advanced here).
+        if self.overflow_at.is_some_and(|at| at.elapsed() > OVERFLOW_WARNING) {
+            self.overflow_at = None;
+        }
     }
 
     fn reset(&mut self) {
@@ -112,28 +116,27 @@ impl Mod for InventoryMod {
         }
     }
 
-    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
+    fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
         let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
-        let text_x = PANEL_X + PANEL_PAD;
-
-        // The overflow warning outlives the list toggle: it is drawn for a
-        // short window after the last overflowing break EVEN while the list is
-        // closed, above where the list's header sits.
         let overflow = self
             .overflow_at
             .is_some_and(|at| at.elapsed() <= OVERFLOW_WARNING);
-        if self.overflow_at.is_some() && !overflow {
-            self.overflow_at = None;
-        }
 
         let ui = self.ui.get();
         if !ui.inventory_visible || ui.crafting_open {
+            // The overflow warning outlives the list toggle: shown for a short
+            // window after the last overflowing break even while the list is
+            // closed, centred where the list's header would sit.
             if overflow {
-                let text = "Inventory full - elements lost!";
-                let x = ((screen_w - f.measure_text(text, FONT_SIZE)) / 2).max(0);
-                shadowed(f, text, x, PANEL_Y, FONT_SIZE, Color::RED);
+                return vec![HudElement::Label {
+                    at: Anchor::Top,
+                    off: (0, PANEL_Y),
+                    base_fs: PANEL_FONT,
+                    role: Role::Danger,
+                    text: "Inventory full - elements lost!".into(),
+                }];
             }
-            return;
+            return Vec::new();
         }
 
         let stash = self.stash.borrow();
@@ -141,56 +144,37 @@ impl Mod for InventoryMod {
         let total = stash.total();
         let kind_count = stash.iter().count();
         let shown = visible_rows(screen_h, kind_count);
-        let body_rows = shown.max(1);
-        let height = PANEL_PAD * 2 + LINE_HEIGHT + 2 + body_rows as i32 * LINE_HEIGHT;
-        f.draw_rect(PANEL_X, PANEL_Y, width, height, Color::new(8, 10, 14, 190));
 
         let header = if overflow {
-            ellipsize(
-                "Inventory full - elements lost!",
-                ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize,
-            )
+            Row::new(Role::Danger, "Inventory full - elements lost!")
         } else {
-            format!("Inventory  {total}/{}", stash.capacity())
+            Row::new(Role::Warning, format!("Inventory  {total}/{}", stash.capacity()))
         };
-        shadowed(
-            f,
-            &header,
-            text_x,
-            PANEL_Y + PANEL_PAD,
-            FONT_SIZE,
-            if overflow { Color::RED } else { Color::GOLD },
-        );
-        let mut y = PANEL_Y + PANEL_PAD + LINE_HEIGHT + 2;
 
+        let mut rows = Vec::new();
         if total == 0 {
-            shadowed(f, "(empty)", text_x, y, FONT_SIZE, Color::RAYWHITE);
-            return;
+            rows.push(Row::new(Role::Muted, "(empty)"));
+        } else {
+            // When the kinds overflow the panel, the last row slot becomes the
+            // "+N more" summary instead of an element row.
+            let listed = if kind_count > shown { shown - 1 } else { shown };
+            for (element, count) in stash.iter().take(listed) {
+                rows.push(Row::new(
+                    Role::Muted,
+                    format!("{count}x {}", elements.get(element).name),
+                ));
+            }
+            if kind_count > listed {
+                rows.push(Row::new(Role::Dim, format!("+{} more", kind_count - listed)));
+            }
         }
 
-        let max_chars = ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize;
-        // When the kinds overflow the panel, the last row slot becomes the
-        // "+N more" summary instead of an element row.
-        let listed = if kind_count > shown { shown - 1 } else { shown };
-        for (element, count) in stash.iter().take(listed) {
-            let row = ellipsize(
-                &format!("{count}x {}", elements.get(element).name),
-                max_chars,
-            );
-            shadowed(f, &row, text_x, y, FONT_SIZE, Color::RAYWHITE);
-            y += LINE_HEIGHT;
-        }
-        if kind_count > listed {
-            let hidden = kind_count - listed;
-            shadowed(
-                f,
-                &format!("+{hidden} more"),
-                text_x,
-                y,
-                FONT_SIZE,
-                Color::LIGHTGRAY,
-            );
-        }
+        vec![HudElement::Panel(Panel {
+            at: (PANEL_X, PANEL_Y),
+            width,
+            header: vec![header],
+            rows,
+        })]
     }
 
     fn save_state(&self, world: &World) -> Option<String> {

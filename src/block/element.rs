@@ -112,6 +112,9 @@ pub enum SpecialProperty {
     HeatToElectricity(u8),
     /// Acts as a battery.
     ElectricityStorage(u8),
+    /// Passable liquid: buoys and drags anything moving through it. The strength
+    /// is the upward push (and, inversely, the viscosity) the player feels.
+    Buoyancy(u8),
 }
 
 /// The tag of a [`SpecialProperty`] without its strength — used to group and
@@ -123,6 +126,7 @@ pub enum SpecialKind {
     Corrosion,
     HeatToElectricity,
     ElectricityStorage,
+    Buoyancy,
 }
 
 impl SpecialProperty {
@@ -134,6 +138,7 @@ impl SpecialProperty {
             SpecialProperty::Corrosion(_) => SpecialKind::Corrosion,
             SpecialProperty::HeatToElectricity(_) => SpecialKind::HeatToElectricity,
             SpecialProperty::ElectricityStorage(_) => SpecialKind::ElectricityStorage,
+            SpecialProperty::Buoyancy(_) => SpecialKind::Buoyancy,
         }
     }
 
@@ -144,7 +149,8 @@ impl SpecialProperty {
             | SpecialProperty::Magnetism(v)
             | SpecialProperty::Corrosion(v)
             | SpecialProperty::HeatToElectricity(v)
-            | SpecialProperty::ElectricityStorage(v) => v,
+            | SpecialProperty::ElectricityStorage(v)
+            | SpecialProperty::Buoyancy(v) => v,
         }
     }
 }
@@ -323,6 +329,7 @@ elements! {
     Water => {
         color: (40, 90, 200),
         core: { durability: 5, hardness: 5, density: 200, temperature_resistance: 100, friction: 20, thermal_conductivity: 60, transparency: 55 },
+        specials: [Buoyancy(200)],
     },
     // Fresh snow: soft, pale, and slick underfoot — the biome frosting on cold or
     // high ground.

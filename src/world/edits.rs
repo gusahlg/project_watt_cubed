@@ -9,6 +9,7 @@ use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
 
 use super::chunk::Chunk;
+use super::lod::{Lod, Tile};
 use super::{Coord, MeshState, VIEW_RADIUS_RANGE, World};
 
 impl World {
@@ -25,6 +26,10 @@ impl World {
         if radius != self.view.horizontal {
             let shrunk = radius < self.view.horizontal;
             self.view = super::ViewVolume::cube(radius);
+            // The pyramid's innermost ring begins where the full-res box ends, so
+            // its `unit` tracks the render distance in metres. Droop needs no
+            // recalibration — it depends only on the LOD cell grids, not `unit`.
+            self.pyramid.unit = (radius * super::chunk::CHUNK_SIZE as i32) as f32;
             // Invalidate the centre so the next stream reruns the full
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
@@ -107,6 +112,9 @@ impl World {
             return previous;
         }
         self.edits.entry(coord).or_default().insert(index, id);
+        // The edit also invalidates the far LOD tiles that cover this voxel (at
+        // every active pyramid level), so they remesh from the overlay.
+        self.mark_dirty_tiles_from_edit(x, y, z);
 
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             std::sync::Arc::make_mut(&mut loaded.chunk).set_index(index, id);
@@ -160,6 +168,61 @@ impl World {
             self.light_worklist.insert(coord);
             self.light_pending.set();
         }
+    }
+
+    /// Mark the far tile that contains world voxel `(x, y, z)` dirty at every
+    /// active pyramid level, PLUS the cardinal-neighbour tile whenever the edit
+    /// lies within one CELL of a tile face — a border cell feeds the neighbour
+    /// tile's padded shell, so that neighbour must remesh too. World→tile is
+    /// `div_euclid(lod.span())`; the within-a-cell test is on the in-tile remainder.
+    fn mark_dirty_tiles_from_edit(&mut self, x: i32, y: i32, z: i32) {
+        // Snapshot the active levels first: `active_lods` borrows `self.pyramid`,
+        // and marking borrows `self.dirty_tiles` mutably (two entries: Lod2, Lod4).
+        let lods: Vec<Lod> = self.pyramid.active_lods().collect();
+        for lod in lods {
+            let (span, cell) = (lod.span(), lod.cell());
+            let (tx, ty, tz) = (x.div_euclid(span), y.div_euclid(span), z.div_euclid(span));
+            self.dirty_tiles.mark(Tile { lod, x: tx, y: ty, z: tz });
+            let (rx, ry, rz) = (x.rem_euclid(span), y.rem_euclid(span), z.rem_euclid(span));
+            let mut border = |dx: i32, dy: i32, dz: i32| {
+                self.dirty_tiles.mark(Tile { lod, x: tx + dx, y: ty + dy, z: tz + dz });
+            };
+            if rx < cell {
+                border(-1, 0, 0);
+            }
+            if rx >= span - cell {
+                border(1, 0, 0);
+            }
+            if ry < cell {
+                border(0, -1, 0);
+            }
+            if ry >= span - cell {
+                border(0, 1, 0);
+            }
+            if rz < cell {
+                border(0, 0, -1);
+            }
+            if rz >= span - cell {
+                border(0, 0, 1);
+            }
+        }
+    }
+
+    /// Project the edit overlay onto one tile — every edited chunk whose
+    /// coord lies in the tile's chunk span, in `GenerateColumn`-shaped form. The
+    /// far-tile mesher's coarse-cell reducer replays these onto the downsample.
+    pub(in crate::world) fn edits_for_tile(&self, tile: Tile) -> Vec<(Coord, Vec<(usize, BlockId)>)> {
+        let cps = tile.lod.chunks_per_side();
+        let (x0, y0, z0) = (tile.x * cps, tile.y * cps, tile.z * cps);
+        self.edits
+            .iter()
+            .filter(|(c, _)| {
+                (x0..x0 + cps).contains(&c.x)
+                    && (y0..y0 + cps).contains(&c.y)
+                    && (z0..z0 + cps).contains(&c.z)
+            })
+            .map(|(&c, cells)| (c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
+            .collect()
     }
 
     /// All edits as world coordinates and blocks for saving.

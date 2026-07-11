@@ -26,8 +26,11 @@ use std::ops::RangeInclusive;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use voxel_engine::SurfaceData;
+use std::collections::HashSet;
+
+use voxel_engine::{Color, SurfaceData};
 
 use super::Coord;
 use super::chunk::Chunk;
@@ -97,13 +100,78 @@ pub enum Job {
         coord: Coord,
         snapshot: LightSnapshot,
     },
-    /// Build a far LOD tile's coarse mesh from its own generator clone (pure fn
-    /// of seed+coords — no snapshot, no rev). Carries the hot tables the greedy
-    /// mesher reads (solid/opaque), shared by refcount like a chunk snapshot's.
-    Tile { tile: Tile, generator: SineHills, tables: Arc<HotTables> },
-    /// Build a far-skin column's grey surface mesh from its own generator clone
-    /// (pure fn of seed+coords — no snapshot, no rev, no tables: height only).
-    Skin { col: SkinColumn, generator: SineHills },
+    /// Build a far LOD tile's coarse mesh. The [`TileSource`] is the tile's sole
+    /// voxel authority: `Pure` reads the bare generator; `Edited` (a tile in
+    /// `DirtyTiles`) carries the edit overlay it must replay — a dirty tile is
+    /// UNCONSTRUCTABLE without it. Carries the hot tables the greedy mesher
+    /// reads (solid/opaque), shared by refcount like a chunk snapshot's.
+    Tile { tile: Tile, source: TileSource, tables: Arc<HotTables> },
+    /// Build a far-skin column's coloured surface mesh from its own generator
+    /// clone (pure fn of seed+coords — no snapshot, no rev, no tables: height +
+    /// surface block). `colors` is the palette's per-block render colour, so the
+    /// skin tints from the real terrain surface instead of a flat grey.
+    Skin { col: SkinColumn, generator: SineHills, colors: Arc<[Color]> },
+}
+
+/// How a tile job samples the world. A dirty tile remeshed without its
+/// edit overlay is UNCONSTRUCTABLE: the enqueue path for a tile in
+/// [`DirtyTiles`] builds [`TileSource::edited`], whose constructor demands the
+/// overlay; a pure tile stays type-true pure. `TileState` keeps its 3 states.
+pub enum TileSource {
+    Pure {
+        generator: SineHills,
+    },
+    /// Coarse-cell edit semantics: within a cell's
+    /// footprint the latest SOLID edit wins the cell; an AIR edit applies only
+    /// when it covers the cell's sample point (air never wins a vote it didn't
+    /// earn — DH's conservative reducer). `edits` is `GenerateColumn`-shaped.
+    Edited {
+        generator: SineHills,
+        edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
+    },
+}
+
+impl TileSource {
+    /// A pure (never-edited) tile's source.
+    pub fn pure(generator: SineHills) -> TileSource {
+        TileSource::Pure { generator }
+    }
+    /// An edited tile's source — the overlay is mandatory.
+    pub fn edited(generator: SineHills, edits: Vec<(Coord, Vec<(usize, BlockId)>)>) -> TileSource {
+        TileSource::Edited { generator, edits }
+    }
+    /// Generator + edit overlay (empty for a pure tile), for the mesher.
+    pub fn parts(&self) -> (&SineHills, &[(Coord, Vec<(usize, BlockId)>)]) {
+        match self {
+            TileSource::Pure { generator } => (generator, &[]),
+            TileSource::Edited { generator, edits } => (generator, edits),
+        }
+    }
+}
+
+/// The far-tile invalidation set: tiles an edit touched, awaiting a remesh from
+/// their [`TileSource::edited`] overlay. Lives on `World`, OUTSIDE `TileState`
+/// — consulted only at enqueue time, so it can never wedge a
+/// tile mid-flight. Keyed by [`Tile`] (level + grid coords), so the same edit
+/// marks its containing tile at every active pyramid level.
+#[derive(Default)]
+pub struct DirtyTiles(HashSet<Tile>);
+
+impl DirtyTiles {
+    pub fn mark(&mut self, t: Tile) {
+        self.0.insert(t);
+    }
+    /// Claim a tile for re-enqueue (returns whether it was dirty).
+    pub fn take(&mut self, t: &Tile) -> bool {
+        self.0.remove(t)
+    }
+    pub fn contains(&self, t: &Tile) -> bool {
+        self.0.contains(t)
+    }
+    /// The currently-dirty tiles (for the tile lane's re-enqueue scan).
+    pub fn iter(&self) -> impl Iterator<Item = Tile> + '_ {
+        self.0.iter().copied()
+    }
 }
 
 /// Finished work returned to the main thread.
@@ -134,27 +202,140 @@ fn priority(job: &Job) -> Priority {
     }
 }
 
-/// Two-class FIFO shared by the pool. `pop` drains `near` fully before `far`, so
-/// far LOD jobs fill idle workers without ever starving the chunk under the
-/// player. `closed` is the shutdown flag a blocked `pop` wakes on.
+/// Admission-control deadline: enqueue/apply loops check it *between* items and
+/// never abort an item already admitted. Time, not counts — so a burst of cheap
+/// items and a burst of expensive ones no longer share one integer "budget".
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline(Instant);
+
+impl Deadline {
+    /// A deadline `budget` from now.
+    pub fn from_budget(budget: Duration) -> Deadline {
+        Deadline(Instant::now() + budget)
+    }
+    #[must_use]
+    pub fn expired(self) -> bool {
+        Instant::now() >= self.0
+    }
+}
+
+// All three tuned against time_to_first_full_render — the
+// values are a first cut, not measured optima. Chunk streaming gets the lion's
+// share; the far LOD ring and the light settle enqueue each get a slim slice so
+// a world-entry flood of either can't stall the chunk under the player.
+/// Per-frame admission budget for fresh chunk meshing (the [`MeshLane`] enqueue).
+pub const STREAM_BUDGET: Duration = Duration::from_millis(2);
+/// Per-frame admission budget for the cross-chunk light settle work. The
+/// *apply* drain in `streaming.rs` and the [`LightLane`] enqueue each mint their
+/// OWN window from this value (two loops, two windows — the per-frame light cost
+/// is their sum).
+pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(1);
+/// Per-frame admission budget for a far LOD lane (tiles and skins each mint one).
+pub const LOD_ENQUEUE_BUDGET: Duration = Duration::from_millis(1);
+
+// Each loop mints a FRESH `Deadline::from_budget(...)` at the instant it starts —
+// never one frame-start snapshot shared across lanes. The lanes run sequentially
+// (drain → light → mesh → LOD), so a single anchored instant would leave every
+// lane after the first ~1 ms pre-expired and admitting nothing (world-entry
+// starvation: `MeshLane`/`LightLane` never drain). Budgets are admission caps,
+// so idle lanes still return immediately.
+
+/// Far-queue cap. At the cap [`Workers::submit_far`] REJECTS
+/// the submit (returns `false`) and the lane simply does not claim the key, so
+/// it retries naturally on a later frame — retry-not-drop lives at the
+/// requester. Rejection at admission, never eviction after acceptance: an
+/// accepted far job has already been claimed by its lane (`Meshing` state), and
+/// a claimed key is owed exactly one `Done` — evicting it would strand the claim
+/// forever (a permanent hole + an `entry_complete` hang).
+pub const FAR_QUEUE_CAP: usize = 256;
+
+/// One far-queue entry's ordering key: distance first, then a monotone sequence
+/// number so equal-distance jobs keep FIFO order.
+#[derive(Clone, Copy, Debug)]
+struct FarEntry {
+    dist2: u64,
+    seq: u64,
+}
+
+/// The far scheduling class: nearest-first pop, FIFO tie-break on equal `dist2`
+/// via the monotone `seq`. Replaces the far `VecDeque` in [`JobQueue`] (the near
+/// class keeps its FIFO — its batches already arrive nearest-sorted).
+/// Representation is a flat `Vec` scanned on pop: the queue is small (capped at
+/// [`FAR_QUEUE_CAP`] by admission) and pop runs only a handful of times per
+/// frame, so the scan beats a heap's constant factor and keeps the FIFO
+/// tie-break trivial.
+#[derive(Default)]
+pub struct FarQueue {
+    entries: Vec<(FarEntry, Job)>,
+    next_seq: u64,
+}
+
+impl FarQueue {
+    /// Push `job` keyed by `dist2` (squared euclidean METRES from the job's
+    /// world-space centre to the player, computed at submit).
+    pub fn push(&mut self, job: Job, dist2: u64) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.push((FarEntry { dist2, seq }, job));
+    }
+
+    /// Pop the nearest job: lowest `dist2`, earliest `seq` breaking ties.
+    pub fn pop_nearest(&mut self) -> Option<Job> {
+        let idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (e, _))| (e.dist2, e.seq))
+            .map(|(i, _)| i)?;
+        Some(self.entries.swap_remove(idx).1)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Two-class queue shared by the pool. `pop` drains `near` fully before `far`,
+/// so far LOD jobs fill idle workers without ever starving the chunk under the
+/// player. Near is FIFO; far is distance-ordered (see [`FarQueue`]). `closed` is
+/// the shutdown flag a blocked `pop` wakes on.
 #[derive(Default)]
 struct JobQueue {
     near: VecDeque<Job>,
-    far: VecDeque<Job>,
+    far: FarQueue,
     closed: bool,
 }
 
 impl JobQueue {
+    /// Push at the job's scheduling class. A far job pushed here (the legacy
+    /// [`Workers::submit`] path and headless tests) carries no distance, so it
+    /// sorts at `dist2 = 0` and equal-distance far jobs fall back to FIFO by
+    /// `seq` — the old `VecDeque` order. This legacy path is uncapped (its only
+    /// producers are tests); the streaming lanes go through the cap-checked
+    /// [`Workers::submit_far`].
     fn push(&mut self, job: Job) {
         match priority(&job) {
             Priority::Near => self.near.push_back(job),
-            Priority::Far => self.far.push_back(job),
+            Priority::Far => self.far.push(job, 0),
         }
     }
 
-    /// The next job to run: near-first, FIFO within a class.
+    /// Admit a far job keyed by `dist2`, or REJECT it at [`FAR_QUEUE_CAP`]
+    /// (returns whether it was admitted). Rejection is the whole cap mechanism:
+    /// the lane never claims a rejected key, so it retries on a later frame.
+    #[must_use]
+    fn push_far(&mut self, job: Job, dist2: u64) -> bool {
+        debug_assert!(matches!(priority(&job), Priority::Far), "push_far on a near job");
+        if self.far.len() >= FAR_QUEUE_CAP {
+            return false;
+        }
+        self.far.push(job, dist2);
+        true
+    }
+
+    /// The next job to run: near-first (FIFO), then the nearest far job.
     fn pop(&mut self) -> Option<Job> {
-        self.near.pop_front().or_else(|| self.far.pop_front())
+        self.near.pop_front().or_else(|| self.far.pop_nearest())
     }
 }
 
@@ -207,6 +388,27 @@ impl Workers {
         drop(queue);
         cvar.notify_one();
         true
+    }
+
+    /// Queue a far LOD job keyed by `dist2` (squared metres to the player).
+    /// Unlike [`submit`](Self::submit), the far class is distance-ordered, so
+    /// the nearest LOD work drains first. Returns whether it was admitted:
+    /// `false` when the pool is shutting down OR the far queue is at
+    /// [`FAR_QUEUE_CAP`] — the caller must NOT claim a rejected key (accepted ⇒
+    /// claimed ⇒ owed exactly one `Done`), it just retries on a later frame.
+    #[must_use]
+    pub fn submit_far(&self, job: Job, dist2: u64) -> bool {
+        let (lock, cvar) = &*self.gate;
+        let mut queue = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if queue.closed {
+            return false;
+        }
+        let admitted = queue.push_far(job, dist2);
+        drop(queue);
+        if admitted {
+            cvar.notify_one();
+        }
+        admitted
     }
 
     /// Non-blocking poll for one finished result.
@@ -332,12 +534,13 @@ fn run(job: Job) -> Done {
             );
             Done::Light { coord, grid }
         }
-        Job::Tile { tile, generator, tables } => {
-            let data = lod::build_tile_mesh(tile, &generator, &tables);
+        Job::Tile { tile, source, tables } => {
+            let (generator, edits) = source.parts();
+            let data = lod::build_tile_mesh(tile, generator, edits, &tables);
             Done::Tile { tile, data }
         }
-        Job::Skin { col, generator } => {
-            let data = skin::build_skin_mesh(col, &generator);
+        Job::Skin { col, generator, colors } => {
+            let data = skin::build_skin_mesh(col, &generator, &colors);
             Done::Skin { col, data }
         }
     }
@@ -447,7 +650,7 @@ mod tests {
             generator: terrain.clone(),
             edits: Vec::new(),
         };
-        let far = |c: i32| Job::Skin { col: SkinColumn { x: c, z: c }, generator: terrain.clone() };
+        let far = |c: i32| Job::Skin { col: SkinColumn { x: c, z: c }, generator: terrain.clone(), colors: Arc::from([]) };
 
         // Interleave far/near so a FIFO alone would not reproduce the order.
         let mut q = JobQueue::default();
@@ -462,6 +665,41 @@ mod tests {
         assert!(matches!(q.pop(), Some(Job::Skin { col: SkinColumn { x: 0, .. }, .. })));
         assert!(matches!(q.pop(), Some(Job::Skin { col: SkinColumn { x: 1, .. }, .. })));
         assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn far_queue_contract() {
+        // Tag each far job with a distinct column id so pops are identifiable.
+        let terrain = generator(0);
+        let job = |id: i32| Job::Skin { col: SkinColumn { x: id, z: 0 }, generator: terrain.clone(), colors: Arc::from([]) };
+        let id_of = |j: &Job| match j {
+            Job::Skin { col, .. } => col.x,
+            _ => panic!("expected a Skin job"),
+        };
+
+        // push dist2 {9, 1, 4, 1}: pops must see 1(first-pushed), 1, 4, 9.
+        let mut q = FarQueue::default();
+        q.push(job(0), 9); // seq 0
+        q.push(job(1), 1); // seq 1 — first-pushed of the two dist2 = 1
+        q.push(job(2), 4); // seq 2
+        q.push(job(3), 1); // seq 3
+        assert_eq!(id_of(&q.pop_nearest().unwrap()), 1, "nearest, first-pushed tie");
+        assert_eq!(id_of(&q.pop_nearest().unwrap()), 3, "nearest, second tie (FIFO)");
+        assert_eq!(id_of(&q.pop_nearest().unwrap()), 2, "dist2 = 4 next");
+        assert_eq!(id_of(&q.pop_nearest().unwrap()), 0, "dist2 = 9 last");
+        assert!(q.pop_nearest().is_none(), "drained");
+
+        // At the cap, admission REJECTS (never evicts an accepted job: accepted
+        // ⇒ claimed ⇒ owed a Done); everything already admitted survives.
+        let mut q = JobQueue::default();
+        for i in 0..FAR_QUEUE_CAP {
+            assert!(q.push_far(job(i as i32), i as u64), "under the cap admits");
+        }
+        assert!(!q.push_far(job(-1), 0), "at the cap rejects — even a nearer job");
+        assert_eq!(q.far.len(), FAR_QUEUE_CAP, "rejection leaves the queue intact");
+        // Popping frees a slot, so the next submit admits again (lane retry).
+        assert_eq!(id_of(&q.pop().unwrap()), 0, "nearest still pops first");
+        assert!(q.push_far(job(-1), 0), "below the cap admits again");
     }
 
     #[test]
@@ -480,7 +718,7 @@ mod tests {
                     edits: Vec::new(),
                 });
                 // A far job too, so drop must drain/close both classes.
-                workers.submit(Job::Skin { col: SkinColumn { x: i, z: i }, generator: generator.clone() });
+                workers.submit(Job::Skin { col: SkinColumn { x: i, z: i }, generator: generator.clone(), colors: Arc::from([]) });
             }
             drop(workers); // flags closed, wakes workers, then joins — must be bounded
             let _ = finished.send(());

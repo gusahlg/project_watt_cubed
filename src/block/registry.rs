@@ -50,8 +50,9 @@ pub struct BlockRegistry {
     reactions: ReactionRegistry,
     blocks: Vec<Block>,   // cold records
     solid: Vec<bool>,     // HOT, indexed by BlockId — collision key ("is there a block")
+    buoyancy: Vec<u8>,    // HOT — 0 = not a liquid; >0 = passable liquid + swim strength
     opaque: Vec<bool>,    // HOT — mesher cull/AO key (solid & transparency == 0)
-    layer: Vec<Pass>,     // HOT — mesher routing key (draw technique); Opaque iff `opaque`
+    layer: Vec<Pass>,     // HOT — mesher routing key; Blend iff solid && !opaque (air's slot is inert)
     emission: Vec<u8>,    // HOT — blocklight seed, 0..=15
     color: Vec<Color>,    // HOT, indexed by BlockId
     dedup: HashMap<CompKey, BlockId>,
@@ -83,6 +84,7 @@ impl BlockRegistry {
             reactions: ReactionRegistry::with_builtins(),
             blocks: Vec::new(),
             solid: Vec::new(),
+            buoyancy: Vec::new(),
             opaque: Vec::new(),
             layer: Vec::new(),
             emission: Vec::new(),
@@ -99,6 +101,31 @@ impl BlockRegistry {
     #[inline]
     pub fn is_solid(&self, id: BlockId) -> bool {
         self.solid[id.0 as usize]
+    }
+
+    /// Whether the block is a passable liquid — collision's third axis. A liquid
+    /// is still `solid` (so it meshes), but the movement code swims *through* it
+    /// instead of colliding, so [`collides`](crate::world::World::collides) skips
+    /// it. One array load, like [`is_solid`](Self::is_solid).
+    #[inline]
+    pub fn is_liquid(&self, id: BlockId) -> bool {
+        self.buoyancy[id.0 as usize] > 0
+    }
+
+    /// The block's buoyancy strength (`0` for non-liquids) — the upward push and
+    /// inverse viscosity a swimmer feels. Read a handful of times per frame while
+    /// sampling the water around the player, not per voxel.
+    #[inline]
+    pub fn buoyancy(&self, id: BlockId) -> u8 {
+        self.buoyancy[id.0 as usize]
+    }
+
+    /// Whether the block obstructs — the shared predicate for "stops the player and
+    /// stops the aim ray": a solid that is *not* a passable liquid. Collision and
+    /// interaction both key off this, so water blocks neither. Two array loads.
+    #[inline]
+    pub fn is_obstacle(&self, id: BlockId) -> bool {
+        self.is_solid(id) && !self.is_liquid(id)
     }
 
     /// Whether the block hides the faces behind it — the mesher's cull key. A
@@ -205,6 +232,7 @@ impl BlockRegistry {
         let layer = derive::derive_layer(&core, solid);
         let emission = derive::derive_emission(&core);
         let specials = derive::derive_specials_from(&self.elements, &weights);
+        let buoyancy = derive::derive_buoyancy(&specials);
 
         let id = self.push_block(
             Block {
@@ -215,6 +243,7 @@ impl BlockRegistry {
                 reactions,
             },
             solid,
+            buoyancy,
             opaque,
             layer,
             emission,
@@ -237,6 +266,7 @@ impl BlockRegistry {
         &mut self,
         block: Block,
         solid: bool,
+        buoyancy: u8,
         opaque: bool,
         layer: Pass,
         emission: u8,
@@ -245,6 +275,7 @@ impl BlockRegistry {
         let id = BlockId(self.blocks.len() as u8);
         self.blocks.push(block);
         self.solid.push(solid);
+        self.buoyancy.push(buoyancy);
         self.opaque.push(opaque);
         self.layer.push(layer);
         self.emission.push(emission);
@@ -411,8 +442,10 @@ mod tests {
             assert_eq!(reg.is_solid(id), solid);
             assert_eq!(reg.is_opaque(id), derive::derive_opaque(&block.core, solid));
             assert_eq!(hot.layer[i], derive::derive_layer(&block.core, solid));
-            // The routing enum and the branchless cull bool are the same fact.
-            assert_eq!(hot.layer[i] == Pass::Opaque, reg.is_opaque(id));
+            // Blend routing exactly marks translucent solids; air and opaque
+            // solids both route Opaque (air's slot is inert — it is never meshed,
+            // so "layer == Opaque iff opaque" was a false invariant for non-solids).
+            assert_eq!(hot.layer[i] == Pass::Blend, reg.is_solid(id) && !reg.is_opaque(id));
             assert_eq!(reg.emission(id), derive::derive_emission(&block.core));
             assert_eq!(reg.color(id), derive::derive_color(reg.elements(), &block.composition));
         }

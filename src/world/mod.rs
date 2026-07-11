@@ -37,6 +37,7 @@ pub mod light;
 pub mod lod;
 pub mod mesh;
 pub mod pipeline;
+pub mod pyramid;
 pub mod skin;
 
 mod edits;
@@ -47,7 +48,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
 
-use voxel_engine::{DVec3, Engine, Frame3D, MeshHandle, SurfaceData, Vec3};
+use voxel_engine::{Color, DVec3, Engine, Frame3D, MeshHandle, SurfaceData, Vec3};
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
@@ -72,10 +73,6 @@ const DATA_MARGIN: i32 = 1;
 /// walking back and forth across the boundary doesn't thrash. Isotropic: the
 /// streamed volume is a cube (see [`ViewVolume`]), so one margin serves every axis.
 const UNLOAD_MARGIN: i32 = 3;
-/// How many fresh-chunk *mesh jobs* may be handed to the worker pool per
-/// stream. Bounds the enqueue-time snapshot cost (a few KiB copy each) and
-/// keeps the queue from flooding when a world is entered.
-const MESH_ENQUEUE_BUDGET: usize = 8;
 /// How many finished worker meshes may be uploaded to the GPU per stream —
 /// the upload is the only part of the async path the render thread still pays.
 const UPLOAD_BUDGET: usize = 4;
@@ -83,12 +80,6 @@ const UPLOAD_BUDGET: usize = 4;
 /// first, so a locally broken block still vanishes the same frame while a
 /// multiplayer join snapshot flood spreads over a few frames instead of one hitch.
 const DIRTY_BUDGET: usize = 8;
-/// How many settled light grids may be *applied* (published + border-diffed +
-/// mesh-invalidated) per drain. The analytic-light path publishes trivial grids
-/// synchronously in `store_chunk`, so only the residual Dense band reaches the
-/// worker pool; this caps the main-thread bookkeeping when many land at once.
-/// Leftovers stay in `light_inflight`/re-seed, so lowering it only spreads work.
-const LIGHT_APPLY_BUDGET: usize = 32;
 /// How many chunks the occlusion rebuild may flood-fill (`Connectivity::compute`)
 /// per frame. A boundary cross can newly load a whole shell of unclassified
 /// chunks; capping the fill keeps a cross from BFS-flooding O(cube) in one frame.
@@ -97,21 +88,22 @@ const LIGHT_APPLY_BUDGET: usize = 32;
 const OCCLUSION_FILL_BUDGET: usize = 64;
 /// The seed a default (`generate`) world uses when none is chosen.
 pub const DEFAULT_SEED: i64 = 1;
-/// The far-tile ring tracks `view_radius`: the LOD pyramid fills the band from
-/// render distance out to twice render distance ([`level_at`](lod::level_at)),
-/// finer levels near and coarser far, no matter the setting.
-const LOD_REACH: i32 = 2;
-/// Tile mesh jobs handed to the pool per stream, and tile uploads per frame —
-/// their own budgets so a world-entry tile flood can't starve chunk meshing.
-const TILE_ENQUEUE_BUDGET: usize = 2;
+/// Tile uploads per frame — its own budget so a world-entry tile flood can't
+/// starve chunk uploads. (The tile *enqueue* is time-budgeted; see
+/// `pipeline::LOD_ENQUEUE_BUDGET`.)
 const TILE_UPLOAD_BUDGET: usize = 2;
-/// The far-skin ring (Zone 3) reaches this multiple of the view radius past the
-/// player — a 2-D `(x, z)` ring independent of player Y (a horizon backdrop),
-/// strictly beyond the Zone-2 tile ring (`SKIN_LOD` is coarser than `TILE_LOD`).
+/// With tiles OFF, the far-skin ring (Zone 3) reaches this multiple of the view
+/// radius — the legacy horizon backdrop. With tiles ON every zone radius derives
+/// from ONE authority, [`pyramid::PyramidCfg`]: the skin starts at
+/// `pyramid.outer_m()` (also the render clip) and reaches [`SKIN_PAST_PYRAMID`]×
+/// beyond it, so the zones cannot drift apart again (Zone 3 strictly outside
+/// Zone 2 by construction).
 const SKIN_REACH: i32 = 4;
-/// Skin surface jobs handed to the pool per stream, and skin uploads per frame —
-/// their own budgets so a world-entry skin flood can't starve chunk/tile work.
-const SKIN_ENQUEUE_BUDGET: usize = 2;
+/// Tiles-on skin reach as a multiple of the pyramid's outer edge (one octave of
+/// backdrop past the last tile ring).
+const SKIN_PAST_PYRAMID: f32 = 2.0;
+/// Skin uploads per frame — its own budget so a world-entry skin flood can't
+/// starve chunk/tile uploads. (The skin *enqueue* is time-budgeted; see `pipeline::LOD_ENQUEUE_BUDGET`.)
 const SKIN_UPLOAD_BUDGET: usize = 2;
 
 /// A chunk-coordinate map key. The [`ChunkCoord`] newtype owns the
@@ -476,9 +468,14 @@ pub struct World {
     /// application ([`LightLane::integrate`] → [`publish_light`]). The light
     /// *drain* lane previously had no per-frame budget: ~80 floods could land
     /// and all apply in one frame. Buffering here and applying ≤
-    /// [`LIGHT_APPLY_BUDGET`] per drain caps that main-thread bookkeeping spike;
-    /// leftovers apply next frame (order-independent — each grid is absolute).
+    /// a per-frame time budget ([`pipeline::LIGHT_APPLY_BUDGET`]) caps that
+    /// main-thread bookkeeping spike; leftovers apply next frame (each grid is absolute).
     light_apply_queue: VecDeque<(Coord, light::LightGrid)>,
+    /// Light-gate degraded-path state defined in [`streaming`]: per-chunk
+    /// timers for how long a fresh mesh has waited on neighbour light, plus the set
+    /// of chunks currently showing a degraded (known-not-final) mesh awaiting relight.
+    /// Kept in one struct so the feature's footprint on `World` is a single field.
+    light_gate: streaming::LightGate,
     /// Skylight ceiling per `(x, z)` chunk column — the surface heightmap the
     /// settle pass seeds skylight from. A pure generator function (independent of
     /// y and of edits), so it is computed once per column and reused across every
@@ -521,6 +518,23 @@ pub struct World {
     skin_upload_queue: VecDeque<(SkinColumn, SurfaceData)>,
     /// Whether desired skin columns still need enqueueing (budget spreads a flood).
     pending_skins: Sticky,
+    /// The D1 LOD-pyramid configuration (finest `Lod(2)` + `Lod(4)`, log falloff).
+    /// Its `unit` tracks the render distance in metres (updated on a radius change);
+    /// [`level_for`](pyramid::level_for) reads it to pick a distance's tile level.
+    pyramid: pyramid::PyramidCfg,
+    /// The calibrated per-level droop ([`DroopTable`](pyramid::DroopTable)), cached
+    /// so the ±2²⁰ m generator sweep runs once (config-invariant: it depends only
+    /// on the LOD cell grids, not `unit`). Coarser levels droop further, so the
+    /// finer ring wins the depth test wherever two rings overlap — the bias ladder.
+    droop: pyramid::DroopTable,
+    /// Far tiles an edit invalidated, awaiting a remesh from their edit overlay
+    /// ([`TileSource::edited`](pipeline::TileSource)). Outside `TileState`.
+    dirty_tiles: pipeline::DirtyTiles,
+    /// Per-block render colours (palette snapshot at construction), handed to the
+    /// skin lane so the horizon tints from the real terrain surface. The palette is
+    /// append-only, so an out-of-range id from a later growth falls back to the
+    /// skin's neutral tint until the next world load re-snapshots.
+    skin_colors: Arc<[Color]>,
 }
 
 impl World {
@@ -530,6 +544,13 @@ impl World {
     pub fn new(seed: i64) -> Self {
         let registry = BlockRegistry::with_builtins();
         let generator = SineHills::new(&registry, 20.0, seed);
+        // The pyramid's innermost ring begins where the full-res box ends, so its
+        // `unit` is the render distance in metres. Droop is calibrated once from
+        // the generator here (config-invariant — it never re-runs on a radius change).
+        let pyramid = pyramid::PyramidCfg::d1((DEFAULT_VIEW_RADIUS * CHUNK_SIZE as i32) as f32);
+        let droop = pyramid::DroopTable::calibrate(&generator, &pyramid);
+        let skin_colors: Arc<[Color]> =
+            (0..registry.block_count()).map(|i| registry.color(BlockId(i as u8))).collect();
         let mut world = Self {
             registry,
             generator,
@@ -551,6 +572,7 @@ impl World {
             light_worklist: FastSet::default(),
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
+            light_gate: streaming::LightGate::default(),
             done_scratch: Vec::new(),
             textures_built: 0,
             occlusion: Occlusion::default(),
@@ -566,6 +588,10 @@ impl World {
             skins: FastMap::default(),
             skin_upload_queue: VecDeque::new(),
             pending_skins: Sticky::default(),
+            pyramid,
+            droop,
+            dirty_tiles: pipeline::DirtyTiles::default(),
+            skin_colors,
         };
         // Centre the pre-generated box on the origin's surface chunk, the
         // spawn point's own layer.
@@ -637,9 +663,14 @@ impl World {
         // hidden by full-res are never loaded (see `desired_tiles`), so nothing
         // wasted meshes; the rest are early-Z discarded under the chunks above.
         for (&tile, state) in &self.tiles {
+            // The LOD bias ladder: sink each tile by its calibrated droop
+            // so a coarser ring sits BELOW the finer ring it overlaps and loses the
+            // depth test there — coarse-under-fine, never a z-fight or a hole. All
+            // tiles also draw depth-biased under the full-res chunks (see `draw`).
+            let droop = self.droop.droop(tile.lod, &self.pyramid) as f64;
             let origin = DVec3::new(
                 tile.origin_x() as f64,
-                tile.origin_y() as f64,
+                tile.origin_y() as f64 - droop,
                 tile.origin_z() as f64,
             );
             state.draw(f, (origin - cam).as_vec3(), tile.lod.cell() as f32);
@@ -653,12 +684,16 @@ impl World {
         // Columns form a full disk around the player, but the fragment shader
         // discards fragments within the near-zone horizontal radius, so the
         // skin renders only BEYOND the near zones instead of poking through
-        // them. With LOD tiles on, that radius is the tile ring
-        // (`view.horizontal * LOD_REACH`); with tiles off there is no ring, so
-        // the skin must meet the full-res render distance (`view.horizontal`)
-        // to avoid a gap. That radius in metres is the clip.
-        let clip_reach = if self.tiles_enabled { LOD_REACH } else { 1 };
-        f.set_skin_clip((self.view.horizontal * clip_reach * CHUNK_SIZE as i32) as f32);
+        // them. With LOD tiles on, that radius is the pyramid's outer edge —
+        // derived from the SAME cfg that shapes the tile rings, so the skin can
+        // never start inside (or short of) the last ring. With tiles off there
+        // is no ring, so the skin must meet the full-res render distance.
+        let clip_m = if self.tiles_enabled {
+            self.pyramid.outer_m()
+        } else {
+            (self.view.horizontal * CHUNK_SIZE as i32) as f32
+        };
+        f.set_skin_clip(clip_m);
         for (&col, state) in &self.skins {
             let Some(handle) = state.drawable() else { continue };
             let origin = DVec3::new(col.origin_x() as f64, 0.0, col.origin_z() as f64);
@@ -752,9 +787,11 @@ impl World {
 // reached through a [`LaneSpec`] of accessors and the loop is written once
 // ([`lane_enqueue`]/[`lane_integrate`]).
 //
-// The `const BUDGET` is REQUIRED, so "an async lane without a per-frame budget"
-// is a compile error — the concrete defect that let the light drain flood a
-// frame unbounded.
+// Each lane is handed a per-frame time [`Deadline`](pipeline::Deadline) at its
+// enqueue call site (minted fresh from its `pipeline::*_BUDGET` const), checked
+// BETWEEN admitted items — the time-based admission control that replaced the
+// old integer count budgets (a burst of cheap items and a burst of expensive
+// ones no longer share one integer, and no lane can flood a frame unbounded).
 
 /// How a lane names the work it wants to do this frame. A *geometry* lane
 /// derives its keys from the player centre each frame (tiles, skins: a desired
@@ -776,8 +813,13 @@ pub(in crate::world) trait LaneSpec {
     /// The loop sorts by the [`order`](LaneSpec::order) metric, so the key
     /// itself needs only `Copy + Eq + Hash` (set membership + move).
     type Key: Copy + Eq + Hash;
-    /// Per-frame submit budget. REQUIRED — an unbudgeted lane can't compile.
-    const BUDGET: usize;
+
+    /// Forward-progress floor: admissions guaranteed per call BEFORE the frame
+    /// deadline is consulted (see the rationale in [`lane_enqueue`]). REQUIRED
+    /// per lane — a floor sized for cheap admits (light seeding) would repeal
+    /// the time budget for expensive ones (mesh snapshot captures), so each
+    /// lane states its own.
+    const MIN_ADMIT: usize;
 
     /// The candidate keys for this frame (see [`Candidates`]).
     fn candidates(world: &World, center: Coord) -> Candidates<Self::Key>;
@@ -794,6 +836,13 @@ pub(in crate::world) trait LaneSpec {
         let _ = (world, key);
         true
     }
+    /// Squared euclidean METRES from `key`'s world-space centre to the player,
+    /// for a far (distance-ordered) lane — the [`FarQueue`](pipeline::FarQueue)
+    /// key. `None` (the default) marks a near lane, which submits FIFO.
+    fn dist2(world: &World, center: Coord, key: Self::Key) -> Option<u64> {
+        let _ = (world, center, key);
+        None
+    }
     /// Build the worker job for `key`, or `None` to drop it (unloaded/covered).
     /// Takes `&mut World` so a lane may warm a cache while snapshotting (light
     /// warms `ceilings` via `capture_ceiling`); it must not mutate lane state.
@@ -806,8 +855,13 @@ pub(in crate::world) trait LaneSpec {
 }
 
 /// The unified enqueue loop: gather → drop in-flight/unready → nearest-first →
-/// submit up to `BUDGET` → claim; clear `pending` once the backlog is drained.
-pub(in crate::world) fn lane_enqueue<S: LaneSpec>(world: &mut World, center: Coord) {
+/// submit until the frame `deadline` expires (checked between admitted items,
+/// never mid-item) → claim; clear `pending` once the whole ready backlog drained.
+pub(in crate::world) fn lane_enqueue<S: LaneSpec>(
+    world: &mut World,
+    center: Coord,
+    deadline: pipeline::Deadline,
+) {
     if !S::pending(world).get() {
         return;
     }
@@ -846,10 +900,23 @@ pub(in crate::world) fn lane_enqueue<S: LaneSpec>(world: &mut World, center: Coo
         }
     }
     ready_keys.sort_by_key(|&k| S::order(center, k));
-    let backlog = ready_keys.len();
-    let mut submitted = 0;
+    // Admission is time-gated: check the deadline BETWEEN items (never abort an
+    // admitted item mid-work). `exhausted` stays true only if every ready key
+    // was processed before the clock ran out.
+    //
+    // Forward-progress floor: the per-frame gather/partition/sort above is O(worklist)
+    // and is charged against the same `deadline`. For a large worklist under a small
+    // budget (e.g. the 1 ms light lane in a debug build), that setup alone can exhaust
+    // the budget before the FIRST submit — starving the lane to zero admissions every
+    // frame, forever (the seed set never shrinks). Guaranteeing at least
+    // `S::MIN_ADMIT` admissions per call makes the seed set strictly shrink so
+    // the lane always converges; the deadline then gates only ADDITIONAL
+    // admissions.
+    let mut exhausted = true;
+    let mut admitted = 0usize;
     for key in ready_keys {
-        if submitted >= S::BUDGET {
+        if admitted >= S::MIN_ADMIT && deadline.expired() {
+            exhausted = false;
             break;
         }
         let Some(job) = S::submit(world, key) else {
@@ -859,18 +926,32 @@ pub(in crate::world) fn lane_enqueue<S: LaneSpec>(world: &mut World, center: Coo
             }
             continue;
         };
+        // Far (distance-ordered) lanes push to the FarQueue keyed by dist²; near
+        // lanes keep their FIFO. A closed pool declines — leave the seed to retry.
+        // Compute dist² (immutable borrow) before taking the workers pool (mutable).
+        let far = S::dist2(world, center, key);
         let workers = world.workers.get_or_insert_with(|| {
             pipeline::Workers::spawn(pipeline::Workers::default_threads())
         });
-        if workers.submit(job) {
+        let accepted = match far {
+            Some(dist2) => workers.submit_far(job, dist2),
+            None => workers.submit(job),
+        };
+        if accepted {
             S::claim(world, key);
-            submitted += 1;
+            admitted += 1;
+        } else {
+            // The pool declined (shutting down, or the far queue is at its
+            // admission cap). Nothing later in this pass can be admitted either
+            // — stop instead of building and discarding a job per remaining
+            // key. The unclaimed keys stay candidates and retry next frame.
+            exhausted = false;
+            break;
         }
     }
     // Clear the gate once the whole ready backlog submitted AND no seeds remain
-    // (only ready-but-over-budget seeds can remain now — blocked ones were evicted).
-    let drained =
-        submitted >= backlog && S::seed_set(world).map_or(true, |set| set.is_empty());
+    // (only ready-but-time-sliced seeds can remain now — blocked ones were evicted).
+    let drained = exhausted && S::seed_set(world).map_or(true, |set| set.is_empty());
     if drained {
         S::pending(world).take();
     }
@@ -883,12 +964,26 @@ pub(in crate::world) fn lane_integrate<S: LaneSpec>(world: &mut World, done: pip
     S::integrate(world, done);
 }
 
+/// Squared euclidean metres from the player-chunk centre to a world-space point,
+/// the [`FarQueue`](pipeline::FarQueue) distance key. The player position is
+/// taken at chunk-centre granularity — the same granularity the lane's `order`
+/// metric already uses.
+fn player_dist2(center: Coord, wx: i64, wy: i64, wz: i64) -> u64 {
+    let s = CHUNK_SIZE as i64;
+    let half = s / 2;
+    let (px, py, pz) = (center.x as i64 * s + half, center.y as i64 * s + half, center.z as i64 * s + half);
+    let (dx, dy, dz) = (wx - px, wy - py, wz - pz);
+    (dx * dx + dy * dy + dz * dz) as u64
+}
+
 /// Fresh full-res chunk meshing. Worklist lane (seed set `mesh_worklist`);
 /// in-flight is the `NeedsMesh { building: true }` claim; ready is the 4-predicate gate.
 pub(in crate::world) struct MeshLane;
 impl LaneSpec for MeshLane {
     type Key = Coord;
-    const BUDGET: usize = MESH_ENQUEUE_BUDGET;
+    /// Low floor: each admit captures a padded voxel+light snapshot (tens of
+    /// KiB of copies), so a big floor would repeal the 2 ms window.
+    const MIN_ADMIT: usize = 4;
     fn candidates(_world: &World, _center: Coord) -> Candidates<Coord> {
         Candidates::Worklist
     }
@@ -908,16 +1003,23 @@ impl LaneSpec for MeshLane {
         )
     }
     fn ready(world: &World, key: Coord) -> bool {
-        // Awaiting a fresh mesh, in view, all neighbour data present, and the
-        // neighbourhood light settled — so it meshes once with final smooth light.
+        // Awaiting a fresh mesh, in view, all neighbour data present, and EITHER
+        // the neighbourhood light settled (mesh once with final smooth light) OR
+        // the chunk has waited on neighbour light past the degrade deadline —
+        // then it meshes DEGRADED now and remeshes when real light lands.
         world.is_needs_mesh(key)
             && world.in_mesh_box(key)
             && world.neighbours_have_data(key)
-            && world.light_ready(key)
+            && (world.light_ready(key) || world.light_wait_expired(key))
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         world.refresh_tables(); // the snapshot shares the solid-table Arc
-        let (rev, snapshot) = world.snapshot(key);
+        // A key admitted with light not yet ready is meshed DEGRADED: missing
+        // neighbour light planes stand in as fully-lit open-sky, and the chunk is
+        // recorded so it remeshes (and clears) once its real light arrives.
+        let degraded = !world.light_ready(key);
+        let (rev, snapshot) = world.snapshot(key, degraded);
+        world.mark_degraded(key, degraded);
         Some(pipeline::Job::Mesh { coord: key, rev, snapshot })
     }
     fn claim(world: &mut World, key: Coord) {
@@ -944,8 +1046,17 @@ impl LaneSpec for MeshLane {
 pub(in crate::world) struct TileLane;
 impl LaneSpec for TileLane {
     type Key = Tile;
-    const BUDGET: usize = TILE_ENQUEUE_BUDGET;
+    /// An admit is a generator clone + (rarely) an edit-overlay copy — cheap.
+    const MIN_ADMIT: usize = 8;
     fn candidates(world: &World, center: Coord) -> Candidates<Tile> {
+        // DESIRED tiles only — a dirty tile outside the desired ring (typically
+        // one under the full-res box, since ordinary edits happen at reach
+        // distance) is deliberately NOT pulled in: it would cost a ~46 ms far
+        // job whose mesh draws hidden. It keeps its dirty mark and remeshes as
+        // `TileSource::Edited` if it ever becomes desired (`submit` keys off
+        // `dirty_tiles.contains`). A dirty tile that is desired re-enters here
+        // the frame `remesh_dirty_tiles` frees it (still-loaded tiles need
+        // `&mut Engine` to free, which the streaming lane owns).
         Candidates::Geometry(
             world.desired_tiles(center).into_iter().filter(|t| !world.tiles.contains_key(t)).collect(),
         )
@@ -959,6 +1070,14 @@ impl LaneSpec for TileLane {
     fn order(center: Coord, key: Tile) -> i32 {
         lod::tile_order(key, center)
     }
+    fn dist2(_world: &World, center: Coord, key: Tile) -> Option<u64> {
+        // Squared metres from the tile's world-space centre to the player-chunk
+        // centre — the FarQueue's nearest-first key.
+        let span = key.lod.span() as i64;
+        let (tx, ty, tz) =
+            (key.origin_x() as i64 + span / 2, key.origin_y() as i64 + span / 2, key.origin_z() as i64 + span / 2);
+        Some(player_dist2(center, tx, ty, tz))
+    }
     fn in_flight(world: &World, key: Tile) -> bool {
         world.tiles.contains_key(&key)
     }
@@ -966,13 +1085,22 @@ impl LaneSpec for TileLane {
         // The coarse mesher reads the hot solidity/opacity tables like the chunk
         // mesher; refresh them before the snapshot.
         world.refresh_tables();
-        Some(pipeline::Job::Tile {
-            tile: key,
-            generator: world.generator.clone(),
-            tables: world.tables.get(),
-        })
+        // A tile in `DirtyTiles` MUST carry its edit overlay: it can only build
+        // `TileSource::edited`, whose ctor demands the overlay. A clean
+        // tile stays type-true pure. Enqueue does not clear the dirty flag — that
+        // is `claim`'s job, once the pool accepts.
+        let generator = world.generator.clone();
+        let source = if world.dirty_tiles.contains(&key) {
+            pipeline::TileSource::edited(generator, world.edits_for_tile(key))
+        } else {
+            pipeline::TileSource::pure(generator)
+        };
+        Some(pipeline::Job::Tile { tile: key, source, tables: world.tables.get() })
     }
     fn claim(world: &mut World, key: Tile) {
+        // Claim the tile out of the dirty set (if it was there) as it goes in
+        // flight, so a later edit re-marks it for a fresh remesh.
+        world.dirty_tiles.take(&key);
         world.tiles.insert(key, TileState::Meshing);
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
@@ -989,7 +1117,8 @@ impl LaneSpec for TileLane {
 pub(in crate::world) struct SkinLane;
 impl LaneSpec for SkinLane {
     type Key = SkinColumn;
-    const BUDGET: usize = SKIN_ENQUEUE_BUDGET;
+    /// An admit is a generator clone + a palette Arc bump — cheap.
+    const MIN_ADMIT: usize = 8;
     fn candidates(world: &World, center: Coord) -> Candidates<SkinColumn> {
         Candidates::Geometry(
             world.desired_columns(center).into_iter().filter(|c| !world.skins.contains_key(c)).collect(),
@@ -1006,12 +1135,24 @@ impl LaneSpec for SkinLane {
         let (pcx, pcz) = (center.x.div_euclid(cps), center.z.div_euclid(cps));
         (key.x - pcx).abs().max((key.z - pcz).abs())
     }
+    fn dist2(_world: &World, center: Coord, key: SkinColumn) -> Option<u64> {
+        // A 2-D horizon backdrop (independent of player Y): pass the player's own
+        // centre Y so the vertical term drops out, leaving squared metres in x/z.
+        let span = skin::SKIN_LOD.span() as i64;
+        let py = center.y as i64 * CHUNK_SIZE as i64 + CHUNK_SIZE as i64 / 2;
+        Some(player_dist2(center, key.origin_x() as i64 + span / 2, py, key.origin_z() as i64 + span / 2))
+    }
     fn in_flight(world: &World, key: SkinColumn) -> bool {
         world.skins.contains_key(&key)
     }
     fn submit(world: &mut World, key: SkinColumn) -> Option<pipeline::Job> {
-        // Height-only mesher: no tables to refresh.
-        Some(pipeline::Job::Skin { col: key, generator: world.generator.clone() })
+        // Height + surface-block mesher: no hot tables, but it needs the palette
+        // colours to tint the horizon from the real terrain surface.
+        Some(pipeline::Job::Skin {
+            col: key,
+            generator: world.generator.clone(),
+            colors: Arc::clone(&world.skin_colors),
+        })
     }
     fn claim(world: &mut World, key: SkinColumn) {
         world.skins.insert(key, SkinState::Meshing);
@@ -1024,12 +1165,14 @@ impl LaneSpec for SkinLane {
 }
 
 /// Cross-chunk light settling. Worklist lane (seed set `light_worklist`);
-/// in-flight is `light_inflight`. `BUDGET` is the newly-added apply cap that
-/// the old drain lane lacked.
+/// in-flight is `light_inflight`. Its enqueue is time-budgeted from the frame's
+/// `light_apply` deadline; the apply drain in `streaming.rs` shares that deadline.
 pub(in crate::world) struct LightLane;
 impl LaneSpec for LightLane {
     type Key = Coord;
-    const BUDGET: usize = LIGHT_APPLY_BUDGET;
+    /// High floor: an admit is a light-shell capture, far cheaper than a mesh
+    /// snapshot, and the settle worklist must drain fast for meshing to start.
+    const MIN_ADMIT: usize = 32;
     fn candidates(_world: &World, _center: Coord) -> Candidates<Coord> {
         Candidates::Worklist
     }
@@ -1142,7 +1285,9 @@ mod tests {
             DVec3::new(4.0, 200.0, 4.0), // unloaded high sky: air on both paths
         ] {
             let aabb = Aabb::new(center, DVec3::new(0.4, 0.9, 0.4));
-            let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_solid(x, y, z));
+            // Collision skips liquids (they are solid to the mesher but passable),
+            // so the reference keys off the same obstacle predicate.
+            let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_obstacle(x, y, z));
             assert_eq!(world.collides(&aabb), reference, "at {center:?}");
         }
     }
@@ -1258,11 +1403,15 @@ mod tests {
         assert_eq!(world.chunks[&ChunkCoord::new(1, 0, 0)].rev, 0, "far side untouched");
 
         // Vertical borders count too: an edit at y == 16 (bottom of chunk
-        // layer 1) touches the chunk below. That cell is air here, so PLACE a
-        // solid block — a real change (a no-op placement is now skipped whole).
+        // layer 1) touches the chunk below.
+        // Edit to whatever the cell is NOT (the generator owns what's there —
+        // the origin surface sits around y=25, so this cell is usually solid),
+        // so the no-op-placement skip can't swallow the change.
         let stone = world.registry().id_by_name("Stone").unwrap();
+        let other =
+            if world.block_at(8, 16, 8) == crate::block::AIR { stone } else { crate::block::AIR };
         let below = world.chunks[&ChunkCoord::new(0, 0, 0)].rev;
-        world.set_block(8, 16, 8, stone);
+        world.set_block(8, 16, 8, other);
         assert_eq!(world.chunks[&ChunkCoord::new(0, 0, 0)].rev, below + 1, "chunk below bumped");
         assert_eq!(world.chunks[&ChunkCoord::new(0, 1, 0)].rev, 1, "edited vertical chunk");
     }

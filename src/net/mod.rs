@@ -14,6 +14,13 @@
 //! and rate-limited server-side ([`server`]).
 pub mod client;
 pub mod protocol;
+
+// The `.lock().unwrap()` painpoint in `server` is now the ONE
+// `LockRecover::lock_recover` helper (server.rs); deny any regression back to
+// a bare `.unwrap()` on the production paths. Scoped to this module only; the
+// tests module carries its own `#![allow]` (setup unwraps there are loud test
+// failures, which is the desired behavior).
+#[deny(clippy::unwrap_used)]
 pub mod server;
 
 /// The protocol revision. Client and server must match exactly, checked at join.

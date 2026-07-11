@@ -10,6 +10,7 @@ use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Key, MouseButton, Vec2
 use crate::avatar::Pose;
 use crate::block::AIR;
 use crate::command;
+use crate::harness::{CameraPose, DebugView};
 use crate::console::{self, Console};
 use crate::ui::{self, Anchor, Theme};
 use crate::input::{look, movement};
@@ -63,6 +64,12 @@ pub struct Game {
     sky: Sky,
     /// Top-down minimap: throttled terrain raster drawn in the HUD corner.
     minimap: Minimap,
+    /// What the app renders: `Normal` play, or `TerrainKey` for the
+    /// harness's sky-hole detector (flat terrain key, sky/fog passes disabled).
+    debug_view: DebugView,
+    /// Monotone frame counter driving the temporal (dither) sequence — the game
+    /// owns this truth; the engine exposes no frame index.
+    frame_index: u64,
 }
 
 impl Game {
@@ -79,7 +86,44 @@ impl Game {
             theme: Theme::new(),
             sky: Sky::new(),
             minimap: Minimap::new(MinimapConfig::DEFAULT),
+            debug_view: DebugView::Normal,
+            frame_index: 0,
         }
+    }
+
+    /// Build a headless, deterministic game for the golden-shot harness:
+    /// a fresh world at `seed` and a player at the origin. The harness teleports
+    /// the camera per shot ([`teleport`](Self::teleport)) and selects what to
+    /// render with [`set_debug_view`](Self::set_debug_view).
+    pub fn scripted(seed: u64) -> Game {
+        let world = World::new(seed as i64);
+        let player = Player::new(DVec3::new(0.0, 80.0, 0.0));
+        Game::new(world, player, "scripted".to_string())
+    }
+
+    /// Select what the app renders for a capture.
+    pub fn set_debug_view(&mut self, view: DebugView) {
+        self.debug_view = view;
+    }
+
+    /// Place the player (and thus the render camera) at `pose`. The harness
+    /// drives the same `Player` → `camera_with_fov` path the game uses.
+    pub fn teleport(&mut self, pose: CameraPose) {
+        self.player.position = pose.pos;
+        self.player.yaw = pose.yaw;
+        self.player.pitch = pose.pitch;
+    }
+
+    /// Pin the day/night clock fraction (0.5 = noon, 0.0 = midnight). Fixes
+    /// each shot's lighting before capture, driving the same `SkyClock` the
+    /// `/time` command and net sync do.
+    pub fn set_day(&mut self, day: f64) {
+        self.sky.clock.set_day(day);
+    }
+
+    /// Swap the atmosphere colour table.
+    pub fn set_palette(&mut self, palette: crate::sky::Palette) {
+        self.sky.atmosphere.palette = palette;
     }
 
     /// Attach a server connection, turning this into a multiplayer session.
@@ -201,6 +245,11 @@ impl Game {
             }
         }
 
+        // F3 toggles the minimap between north-up and heading-up orientation.
+        if eng.is_key_pressed(Key::F3) {
+            self.minimap.toggle_orientation();
+        }
+
         if self.mouse_locked {
             look::update(&mut self.player, eng);
         }
@@ -267,14 +316,14 @@ impl Game {
                 Incoming::Chat { from_name, channel, text } => {
                     // Colour the scope tag and name so chat scans at a glance: a gold
                     // [global] tag, a blue <name>, and the message body white.
-                    let name = ui::Line::of(ui::Role::Name, format!("<{from_name}> "));
+                    let name = ui::Line::of(ui::Role::Accent, format!("<{from_name}> "));
                     let line = if channel == chat::GLOBAL {
-                        ui::Line::of(ui::Role::Global, "[global] ")
-                            .then(ui::Role::Name, format!("<{from_name}> "))
+                        ui::Line::of(ui::Role::Warning, "[global] ")
+                            .then(ui::Role::Accent, format!("<{from_name}> "))
                     } else {
                         name
                     };
-                    self.console.push(line.then(ui::Role::Chat, text));
+                    self.console.push(line.then(ui::Role::Muted, text));
                 }
                 Incoming::Time { day } => self.sky.clock.set_day(day as f64),
                 Incoming::Disconnected => disconnected = true,
@@ -346,13 +395,16 @@ impl Game {
     }
 
     /// Apply the block placements mods queued this frame. A placement lands only
-    /// in an air cell that doesn't overlap the player. Well-behaved mods (the
-    /// crafting mod) ran this exact check before queueing — and before spending a
-    /// block on it — so within one frame the two always agree; re-checking here is
-    /// a cheap guard against a mod that queues without validating.
+    /// in a non-obstacle cell (air, or a liquid it replaces) that doesn't overlap
+    /// the player. Well-behaved mods (the crafting mod) ran an equivalent check
+    /// before queueing — and before spending a block on it — so within one frame
+    /// the two always agree; re-checking here is a cheap guard against a mod that
+    /// queues without validating.
     fn apply_placements(&mut self, placements: Vec<(i32, i32, i32, crate::block::BlockId)>) {
         for (x, y, z, id) in placements {
-            if self.world.block_at(x, y, z) != AIR {
+            // Lands in any non-obstacle cell — air, or a passable liquid it replaces
+            // (raycast hands back a liquid `previous` when aiming through water).
+            if self.world.is_obstacle(x, y, z) {
                 continue;
             }
             // Overlap check in f64: at far coordinates an f32 cell centre
@@ -400,6 +452,7 @@ impl Game {
             self.coord_cache = (key.0, key.1, key.2, text);
         }
         let coord_text = self.coord_cache.3.clone();
+        let fps_text = format!("{:2} FPS", eng.fps());
         let screen_w = eng.screen_width();
         let screen_h = eng.screen_height();
         let screen = (screen_w, screen_h);
@@ -409,13 +462,39 @@ impl Game {
         let peers = self.peer_draws(eng, &camera);
         let online = self.net.as_ref().map(|net| net.peers().count() + 1);
 
-        let mut f = eng.begin_frame(self.sky.clear());
+        // Compose the single per-frame lighting truth: the source for the
+        // engine's per-frame UBO for sky/fog and avatar key lighting. The UBO is
+        // the only path; legacy push lanes have been retired.
+        //
+        // Exposure is the render thread's latest metered+smoothed value,
+        // sourced through `Engine::exposure_for_compose`; temporal smoothing
+        // already happened render-side, so frame delta is passed only for
+        // signature symmetry (unused there).
+        let dt = eng.frame_time();
+        let exposure = eng.exposure_for_compose(dt);
+        let snapshot = crate::frame_snapshot::compose(&self.sky, self.frame_index, exposure);
+        let frame_uniforms = voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot);
+        self.frame_index = self.frame_index.wrapping_add(1);
+
+        // TerrainKey: flat terrain, sky/fog disabled, magenta clear for the
+        // sky-hole detector. Normal: real clear, no debug flat.
+        let (clear, debug_flat) = match self.debug_view {
+            DebugView::Normal => (self.sky.clear(), None),
+            DebugView::TerrainKey => (crate::harness::SKY_KEY, Some(crate::harness::TERRAIN_KEY)),
+        };
+
+        let mut f = eng.begin_frame(clear);
 
         {
-            let mut f3 = f.begin_3d(&camera);
-            {
+            // The player's f64 eye is the render-space origin for camera rebase:
+            // TAA's translation reprojection depends on this.
+            let mut f3 = f.begin_3d(&camera, self.player.position);
+            f3.set_debug_flat(debug_flat);
+            // The per-frame UBO carries the composed lighting truth in every mode
+            // (the renderer overlays the debug-flat reserved key for TerrainKey).
+            f3.set_frame_uniforms(frame_uniforms);
+            if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
-                self.sky.apply(&mut f3);
                 self.sky.draw(&mut f3);
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
@@ -454,7 +533,7 @@ impl Game {
                         tag.x as i32 - tw / 2,
                         tag.y as i32,
                         fs,
-                        theme.palette.text,
+                        ui::Role::Primary.color(),
                     );
                 }
             }
@@ -462,16 +541,18 @@ impl Game {
 
         // Informational HUD text: coords, help, FPS, player count. Full mode only.
         if theme.hud.shows_info() {
-            ui::label(&mut f, theme, screen, Anchor::Top, (0, 12), 26, theme.palette.text, &coord_text);
-            f.draw_fps(10, 12);
+            ui::label(&mut f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), &coord_text);
+            ui::label(&mut f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), &fps_text);
             if let Some(count) = online {
                 let text = format!("players online: {count}");
-                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 180), 20, theme.palette.good, &text);
+                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), &text);
             }
         }
 
-        // Enabled mods draw their HUD over the world, under the console.
-        mods.draw(&mut f, &self.world, screen_w, screen_h);
+        // Enabled mods contribute their HUD as data; the core renders it over the
+        // world, under the console. Mods never touch the frame themselves.
+        let hud = mods.hud(&self.world, screen);
+        ui::render_hud(&mut f, theme, screen, &hud);
         self.console.draw(&mut f, screen_w, screen_h);
     }
 

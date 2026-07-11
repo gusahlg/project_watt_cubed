@@ -143,7 +143,23 @@ impl World {
         self.registry.is_solid(self.block_at(x, y, z))
     }
 
-    /// Collision test: does the given box overlap any solid voxel?
+    /// Whether the block at a world voxel obstructs movement and the aim ray — a
+    /// solid that is not a passable liquid. The predicate collision and interaction
+    /// share, so water stops neither.
+    pub fn is_obstacle(&self, x: i32, y: i32, z: i32) -> bool {
+        self.registry.is_obstacle(self.block_at(x, y, z))
+    }
+
+    /// The buoyancy of the liquid at a world voxel coordinate, or `0` if the cell
+    /// is air or a non-liquid solid. The movement code samples this at the swimmer's
+    /// feet and eye to decide whether — and how strongly — to swim.
+    pub fn buoyancy_at(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.registry.buoyancy(self.block_at(x, y, z))
+    }
+
+    /// Collision test: does the given box overlap any solid, non-liquid voxel?
+    /// Liquids are `solid` (so they mesh) but passable, so the player swims through
+    /// them; only genuine obstacles block movement here.
     ///
     /// Cells are visited grouped by owning chunk — one map probe per chunk the
     /// box touches (1–8 for anything player-sized) instead of one per cell,
@@ -169,7 +185,7 @@ impl World {
                     };
                     // Uniform chunks: one lookup answers every cell in the box.
                     if let Some(id) = loaded.chunk.uniform() {
-                        if self.registry.is_solid(id) {
+                        if self.registry.is_obstacle(id) {
                             return true;
                         }
                         continue;
@@ -182,7 +198,7 @@ impl World {
                             for y in ys.clone() {
                                 let (_, local) = BlockCoord::new(x, y, z).split();
                                 let id = loaded.chunk.get_local(local.lx(), local.ly(), local.lz());
-                                if self.registry.is_solid(id) {
+                                if self.registry.is_obstacle(id) {
                                     return true;
                                 }
                             }

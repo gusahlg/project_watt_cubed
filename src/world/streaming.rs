@@ -3,6 +3,8 @@
 //! unloading far chunks, and the radius/centre bookkeeping. Code motion only:
 //! these are `World` methods; the struct itself lives in `mod.rs`.
 
+use std::time::{Duration, Instant};
+
 use voxel_engine::{DVec3, Engine};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
@@ -11,14 +13,49 @@ use crate::math::block_coord;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::TerrainGenerator;
-use super::lod::{TILE_LOD, Tile, TileState};
+use super::lod::{Tile, TileState};
 use super::mesh::ChunkMeshData;
 use super::skin::{self, SkinColumn, SkinState};
 use super::{
-    Coord, DIRTY_BUDGET, FastSet, LIGHT_APPLY_BUDGET, LOD_REACH, LightLane, Loaded,
-    MeshLane, MeshState, SKIN_REACH, SKIN_UPLOAD_BUDGET, SkinLane, TILE_UPLOAD_BUDGET, TileLane,
-    UPLOAD_BUDGET, World, lane_enqueue, lane_integrate, light, mesh, pipeline,
+    Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
+    SKIN_REACH, SKIN_UPLOAD_BUDGET, SkinLane, TILE_UPLOAD_BUDGET, TileLane, UPLOAD_BUDGET, World,
+    lane_enqueue, lane_integrate, light, mesh, pipeline, pyramid,
 };
+
+/// How long a chunk's fresh mesh may wait on neighbour light before it is meshed
+/// DEGRADED — missing neighbour light planes stand in as fully-lit open-sky — and
+/// later remeshed through the existing `Dirty` machinery once real light lands.
+///
+// PROVISIONAL(pre-A): tuned against `time_to_first_full_render`. Wait-time gating
+// (rather than meshing unconditionally) is load-bearing: at a cold world entry the
+// overwhelming majority of chunks receive neighbour light well within this window
+// and mesh once with final smooth light, so only the few stragglers ever degrade —
+// which is what keeps the ≤3-thread worker pool (≈46 ms/mesh job) from a remesh
+// storm where every chunk meshes twice. Mirrors the frozen contract value in
+// this is its final home.
+const LIGHT_WAIT_DEGRADE: Duration = Duration::from_millis(150);
+
+/// How many still-loaded far tiles an edit burst may FREE-for-remesh per stream
+/// Capped like [`DIRTY_BUDGET`] so a wide edit can't blank the whole far
+/// backdrop at once (a freed tile draws nothing until its Edited remesh lands) nor
+/// storm the ≤3-thread pool; leftovers stay dirty+loaded and are freed on a later
+/// frame (retry-not-drop). The actual meshing is budgeted again downstream by the
+/// tile lane's FarQueue deadline.
+const DIRTY_TILE_BUDGET: usize = 4;
+
+/// State backing the light-gate degraded path. Bundled into one struct so
+/// the feature adds a single field to [`World`] (`world/mod.rs` is being edited
+/// concurrently — this keeps the merge surface to one line there).
+///
+/// `blocked_since` records, per chunk, the first frame its fresh mesh was observed
+/// blocked purely on neighbour light (data present, light not settled). `degraded`
+/// is the set of chunks currently drawing a degraded (known-not-final) mesh, still
+/// owed a remesh once their real light arrives.
+#[derive(Default)]
+pub(in crate::world) struct LightGate {
+    blocked_since: FastMap<Coord, Instant>,
+    degraded: FastSet<Coord>,
+}
 
 impl World {
     /// The mesh box: chunks meshed and drawn around `center`.
@@ -68,11 +105,16 @@ impl World {
         self.center = Some(center_chunk);
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
+        // Time budgets, not counts: each loop below mints its OWN fresh
+        // admission window at the instant it starts — the lanes run
+        // sequentially, so one shared frame-start snapshot would leave every
+        // lane after the first pre-expired (world-entry starvation).
         // Land worker results before the scans below, so freshly generated
         // chunks count as data this frame and finished meshes draw this frame.
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
-            self.drain_results(eng);
+            let apply = pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET);
+            self.drain_results(eng, apply);
         }
         if full_pass {
             self.unload_far(center_chunk, eng);
@@ -133,7 +175,7 @@ impl World {
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamLight);
             if self.lighting {
-                lane_enqueue::<LightLane>(self, center_chunk);
+                lane_enqueue::<LightLane>(self, center_chunk, pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET));
                 // While light is unsettled, keep the mesh lane armed so it
                 // re-checks `light_ready` as grids land.
                 if !self.light_worklist.is_empty() || !self.light_inflight.is_empty() {
@@ -149,9 +191,18 @@ impl World {
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamMesh);
             self.remesh_dirty(center_chunk, eng);
+            // Advance the light-gate degrade timers and keep still-waiting chunks on
+            // the worklist (their degrade fires on the clock, which raises no re-seed
+            // event) BEFORE the mesh lane reads them.
+            self.tick_light_gate();
             // The mesh lane evicts blocked/stale seeds itself (see `lane_enqueue`),
             // so the worklist stays O(fresh work) with no separate prune here.
-            lane_enqueue::<MeshLane>(self, center_chunk);
+            lane_enqueue::<MeshLane>(self, center_chunk, pipeline::Deadline::from_budget(pipeline::STREAM_BUDGET));
+            // Level-triggered backstop to the edge-triggered degraded clear: once
+            // ALL light work is quiescent, any chunk still degraded is owed a
+            // remesh that no future light-arrival event will ever deliver (its
+            // missing neighbour is already terminal). Promote it to final now.
+            self.flush_degraded_terminal(eng);
         }
         // Far LOD tiles + Zone-3 far skin: geometry lanes. Select/unload only on a
         // boundary cross; the lane's budget spreads a world-entry flood.
@@ -162,7 +213,11 @@ impl World {
                     self.unload_tiles(center_chunk, eng);
                     self.pending_tiles.set();
                 }
-                lane_enqueue::<TileLane>(self, center_chunk);
+                // Free the GPU mesh of edited-but-still-loaded tiles so the lane can
+                // re-admit and remesh them from their overlay (runs every frame — an
+                // edit can land any frame, not just a boundary cross).
+                self.remesh_dirty_tiles(eng);
+                lane_enqueue::<TileLane>(self, center_chunk, pipeline::Deadline::from_budget(pipeline::LOD_ENQUEUE_BUDGET));
             } else {
                 // Lane disabled: free any lingering tiles and stop enqueueing.
                 for (_, state) in self.tiles.drain() {
@@ -174,7 +229,7 @@ impl World {
                     self.unload_skins(center_chunk, eng);
                     self.pending_skins.set();
                 }
-                lane_enqueue::<SkinLane>(self, center_chunk);
+                lane_enqueue::<SkinLane>(self, center_chunk, pipeline::Deadline::from_budget(pipeline::LOD_ENQUEUE_BUDGET));
             } else {
                 for (_, state) in self.skins.drain() {
                     state.free(eng);
@@ -198,7 +253,7 @@ impl World {
 
     /// Land finished worker results (non-blocking). Generate results clear `generating`.
     /// Stale results drop and re-arm fresh scan. Budgeted mesh upload to GPU.
-    fn drain_results(&mut self, eng: &mut Engine) {
+    fn drain_results(&mut self, eng: &mut Engine, light_apply: pipeline::Deadline) {
         if let Some(workers) = &self.workers {
             while let Some(done) = workers.try_recv() {
                 self.done_scratch.push(done);
@@ -276,10 +331,10 @@ impl World {
         // is capped. The chunk stays in `light_inflight` (so `light_ready` still
         // blocks meshing) until it is actually applied here. Order-independent:
         // each grid is absolute, so leftovers apply next frame with no seam.
-        let mut applied = 0;
-        while applied < LIGHT_APPLY_BUDGET {
+        // Time-budgeted (checked between grids): an admitted grid always
+        // publishes; leftovers apply next frame (each grid is absolute, no seam).
+        while !light_apply.expired() {
             let Some((coord, grid)) = self.light_apply_queue.pop_front() else { break };
-            applied += 1;
             self.light_inflight.remove(&coord);
             self.publish_light(coord, grid);
         }
@@ -563,28 +618,36 @@ impl World {
     }
 
     /// Snapshot for mesh job: chunk storage, neighbour shell, solidity table, and rev.
-    pub(in crate::world) fn snapshot(&self, coord: Coord) -> (u32, pipeline::ChunkSnapshot) {
+    pub(in crate::world) fn snapshot(
+        &self,
+        coord: Coord,
+        degraded: bool,
+    ) -> (u32, pipeline::ChunkSnapshot) {
         let loaded = &self.chunks[&coord];
         (
             loaded.rev,
             pipeline::ChunkSnapshot {
                 padded: self.capture_padded(coord),
                 uniform: loaded.chunk.uniform(),
-                light: self.capture_padded_light(coord),
+                light: self.capture_padded_light(coord, degraded),
                 tables: self.tables.get(),
             },
         )
     }
 
-    /// Settled light shell for chunk and 26 neighbours (18³). Missing reads dark, ensures seamless light.
-    fn capture_padded_light(&self, coord: Coord) -> light::PaddedLight {
+    /// Settled light shell for chunk and 26 neighbours (18³). A missing grid reads
+    /// dark for a normal mesh; for a `degraded` mesh it stands in as fully-lit
+    /// open-sky, so an unsettled neighbourhood fails toward visible-and-plausible.
+    fn capture_padded_light(&self, coord: Coord, degraded: bool) -> light::PaddedLight {
         if !self.lighting {
             return light::PaddedLight::full();
         }
+        let fallback = degraded.then(light::LightGrid::open_sky);
         light::PaddedLight::capture(|dx, dy, dz| {
             self.chunks
                 .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz))
                 .and_then(|l| l.light.as_ref())
+                .or(fallback.as_ref())
         })
     }
 
@@ -699,6 +762,23 @@ impl World {
             let n = coord.step(*face);
             self.light_worklist.insert(n);
             self.mesh_worklist.insert(n);
+            // A DEGRADED neighbour meshed with fake open-sky light across this
+            // border; now that real light has crossed it, force its remesh through
+            // the Dirty machinery — seeding the worklist alone can't, since the
+            // neighbour is already `Ready` and so fails the mesh lane's
+            // `is_needs_mesh` gate (remesh-on-arrival).
+            if self.light_gate.degraded.contains(&n) {
+                if let Some(loaded) = self.chunks.get_mut(&n) {
+                    if matches!(
+                        loaded.state,
+                        MeshState::Ready(_) | MeshState::NeedsMesh { building: true }
+                    ) {
+                        loaded.state.invalidate();
+                        loaded.rev = loaded.rev.wrapping_add(1);
+                        self.pending_dirty.set();
+                    }
+                }
+            }
         }
         if !self.light_worklist.is_empty() {
             self.light_pending.set();
@@ -728,29 +808,108 @@ impl World {
         })
     }
 
-    /// Tiles to load: LOD ring out to LOD_REACH × view_radius, minus fully-covered by slab.
+    /// Tiles to load: the D1 LOD *pyramid*. Every active level
+    /// ([`PyramidCfg::active_lods`](pyramid::PyramidCfg::active_lods) — `Lod(2)`
+    /// then `Lod(4)`) emits, at its own span stride, the tiles whose XZ distance
+    /// from the player falls in that level's band ([`pyramid::acceptable`]), plus
+    /// [`pyramid::ring_overlap`] extra coarse tiles reaching INWARD under the finer
+    /// ring so the coarse ring underlaps it — coarse-under-fine, no hole and no
+    /// z-fight (the droop bias in `render` sinks the coarser tile below the finer
+    /// one it overlaps). Buried/air tiles cost only an empty sample; the slab-
+    /// containment cull ([`tile_occluded`](Self::tile_occluded)) drops tiles the
+    /// full-res box fully covers.
     pub(in crate::world) fn desired_tiles(&self, center: Coord) -> Vec<Tile> {
-        let lod = TILE_LOD;
-        let cps = lod.chunks_per_side();
-        let (ptx, pty, ptz) =
-            (center.x.div_euclid(cps), center.y.div_euclid(cps), center.z.div_euclid(cps));
-        // `+1` covers the partial tile the centre sits inside. A cube volume, so
-        // the vertical reach mirrors the horizontal — the shell hangs islands and
-        // overhangs above/below, and buried/air tiles cost only an empty sample.
-        let tr = (self.view.horizontal * LOD_REACH).div_euclid(cps) + 1;
-        let tvr = (self.view.vertical * LOD_REACH).div_euclid(cps) + 1;
+        let cfg = &self.pyramid;
+        let cs = CHUNK_SIZE as i32;
+        // Player XZ centre in metres (world block == metre).
+        let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
         let mut out = Vec::new();
-        for tx in (ptx - tr)..=(ptx + tr) {
-            for ty in (pty - tvr)..=(pty + tvr) {
-                for tz in (ptz - tr)..=(ptz + tr) {
-                    let tile = Tile { lod, x: tx, y: ty, z: tz };
-                    if !self.tile_occluded(tile) {
-                        out.push(tile);
+        for (ring, lod) in cfg.active_lods().enumerate() {
+            let span = lod.span();
+            let cps = lod.chunks_per_side();
+            // A whole `ring_overlap` coarse tile(s) of inward underlap: a tile
+            // this far inside the band's inner edge, pushed back OUT by the overlap,
+            // lands in the band — so the union `wants(d) || wants(d+ov)` is the band
+            // widened inward. For D1 the overlap is < the band width, so the widened
+            // bands stay contiguous (no gap between levels).
+            let overlap_m = pyramid::ring_overlap(lod) as f32 * span as f32;
+            // LOADING is exact-band on purpose: `level_for` equality, not the
+            // `acceptable` tolerance — tolerance is keep-side hysteresis, and
+            // using it here would over-load one-ring-finer tiles across the box
+            // corners of the next band out.
+            let wants = |d: f32| pyramid::level_for(d, cfg) == pyramid::LodChoice::Level(lod);
+            // Box reach: the band's outer edge is `unit·base^(ring+1)` m; `+1` tile
+            // covers the partial tile the edge/centre sits inside. The distance test
+            // culls the box corners the ring doesn't own.
+            let outer_m = cfg.unit * cfg.base.powi(ring as i32 + 1);
+            let reach = (outer_m / span as f32).ceil() as i32 + 1;
+            let (ptx, ptz) = (center.x.div_euclid(cps), center.z.div_euclid(cps));
+            // Vertical extent is the streamed vertical SLAB, NOT the horizontal LOD
+            // reach. Terrain exists only within `view.vertical` of the player at every
+            // XZ (the generator's height envelope is global), so mirroring the coarse
+            // ring's huge horizontal reach vertically would demand thousands of pure-
+            // air tiles above/below the world and stall `entry_complete`. This is the
+            // same slab `tile_occluded` assumes (mod.rs).
+            let vr = self.view.vertical;
+            let (ty_lo, ty_hi) =
+                ((center.y - vr).div_euclid(cps), (center.y + vr).div_euclid(cps));
+            for tx in (ptx - reach)..=(ptx + reach) {
+                for tz in (ptz - reach)..=(ptz + reach) {
+                    let (tcx, tcz) = (tx * span + span / 2, tz * span + span / 2);
+                    let dist = ((tcx - pcx) as f32).hypot((tcz - pcz) as f32);
+                    if !(wants(dist) || wants(dist + overlap_m)) {
+                        continue;
+                    }
+                    for ty in ty_lo..=ty_hi {
+                        let tile = Tile { lod, x: tx, y: ty, z: tz };
+                        if !self.tile_occluded(tile) {
+                            out.push(tile);
+                        }
                     }
                 }
             }
         }
         out
+    }
+
+    /// Free the GPU mesh of any still-loaded far tile an edit marked dirty,
+    /// so [`TileLane::candidates`] re-admits it and it remeshes from its edit
+    /// overlay as [`TileSource::Edited`](pipeline::TileSource) — `TileLane::submit`
+    /// keys `Edited` off `dirty_tiles.contains`, which the free path leaves set
+    /// (`claim` clears it only once the pool accepts).
+    ///
+    /// Free-before-remesh is the whole point: dropping the `tiles` entry is
+    /// what makes the tile "not loaded" so the lane re-admits it — but its `Ready`
+    /// handle MUST be consumed exactly once first, or the later `Meshing` claim
+    /// would overwrite (leak) it. A `Meshing` tile is skipped: it owns an in-flight
+    /// claim (removing it would strand the landing result) and was already taken out
+    /// of `dirty_tiles` at claim; a re-edit re-marks it and this pass frees it once
+    /// it lands `Ready`. Budgeted by [`DIRTY_TILE_BUDGET`]; a still-dirty leftover
+    /// stays loaded+claimable and is freed on a later frame (retry-not-drop).
+    fn remesh_dirty_tiles(&mut self, eng: &mut Engine) {
+        // The dirty set is edit-sized, so this scan is cheap. Take only loaded,
+        // non-`Meshing` tiles (Ready owns a handle; Air owns none — an edit can turn
+        // a born-empty sky/buried tile solid, so it must remesh too).
+        let stale: Vec<Tile> = self
+            .dirty_tiles
+            .iter()
+            .filter(|t| {
+                matches!(self.tiles.get(t), Some(TileState::Ready { .. } | TileState::Air))
+            })
+            .take(DIRTY_TILE_BUDGET)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for tile in stale {
+            // `free` consumes the entry exactly once (no-op for `Air`). The tile stays
+            // in `dirty_tiles`, so the re-admit builds `TileSource::Edited`.
+            if let Some(state) = self.tiles.remove(&tile) {
+                state.free(eng);
+            }
+        }
+        // The tile lane is gated by this sticky; raise it so the freed tiles re-enqueue.
+        self.pending_tiles.set();
     }
 
     /// Free tiles outside the desired ring (runs on a boundary cross).
@@ -764,17 +923,26 @@ impl World {
         }
     }
 
-    /// Skin columns to load: a 2-D `(x, z)` disk on the [`SKIN_LOD`] grid out to
-    /// `SKIN_REACH × view_radius`, independent of player y (a horizon backdrop).
-    /// Mirrors [`desired_tiles`](Self::desired_tiles) with the vertical axis
-    /// removed. No near-field cull: a `SKIN_LOD` column (1024 m) always dwarfs
-    /// the full-res box, so per-column occlusion could never fire — the render's
-    /// fragment clip hides the near part of the disk instead (see `set_skin_clip`).
+    /// Skin columns to load: a 2-D `(x, z)` disk on the [`SKIN_LOD`] grid,
+    /// independent of player y (a horizon backdrop). With tiles ON the disk is
+    /// sized from the pyramid's outer edge (`outer_m × SKIN_PAST_PYRAMID` — the
+    /// skin is Zone 3, strictly OUTSIDE the last tile ring, derived from the
+    /// same cfg so the zones can't drift); with tiles off, the legacy
+    /// `SKIN_REACH × view_radius`. Mirrors [`desired_tiles`](Self::desired_tiles)
+    /// with the vertical axis removed. No near-field cull: a `SKIN_LOD` column
+    /// (1024 m) always dwarfs the full-res box, so per-column occlusion could
+    /// never fire — the render's fragment clip hides the near part of the disk
+    /// instead (see `set_skin_clip`).
     pub(in crate::world) fn desired_columns(&self, center: Coord) -> Vec<SkinColumn> {
         let cps = skin::SKIN_LOD.chunks_per_side();
         let (pcx, pcz) = (center.x.div_euclid(cps), center.z.div_euclid(cps));
+        let reach_chunks = if self.tiles_enabled {
+            (super::SKIN_PAST_PYRAMID * self.pyramid.outer_m() / CHUNK_SIZE as f32).ceil() as i32
+        } else {
+            self.view.horizontal * SKIN_REACH
+        };
         // `+1` covers the partial column the centre sits inside.
-        let cr = (self.view.horizontal * SKIN_REACH).div_euclid(cps) + 1;
+        let cr = reach_chunks.div_euclid(cps) + 1;
         let mut out = Vec::new();
         for cx in (pcx - cr)..=(pcx + cr) {
             for cz in (pcz - cr)..=(pcz + cr) {
@@ -817,6 +985,301 @@ impl World {
             })
     }
 
+    /// A chunk waiting purely on neighbour light: it has data and is in view and
+    /// awaiting a fresh mesh, but its neighbourhood light has not settled. The
+    /// [`LightGate`] times exactly these chunks.
+    fn chunk_light_blocked(&self, coord: Coord) -> bool {
+        self.is_needs_mesh(coord)
+            && self.in_mesh_box(coord)
+            && self.neighbours_have_data(coord)
+            && !self.light_ready(coord)
+    }
+
+    /// Whether `coord` has waited on neighbour light past [`LIGHT_WAIT_DEGRADE`] —
+    /// the mesh-lane predicate that admits a DEGRADED mesh.
+    pub(in crate::world) fn light_wait_expired(&self, coord: Coord) -> bool {
+        self.light_gate.blocked_since.get(&coord).is_some_and(|t| t.elapsed() >= LIGHT_WAIT_DEGRADE)
+    }
+
+    /// Record (or clear) that `coord` is currently drawing a degraded, known-not-
+    /// final mesh. The set is queryable by [`entry_complete`](Self::entry_complete)
+    /// ("none pending").
+    pub(in crate::world) fn mark_degraded(&mut self, coord: Coord, degraded: bool) {
+        if degraded {
+            self.light_gate.degraded.insert(coord);
+        } else {
+            self.light_gate.degraded.remove(&coord);
+        }
+    }
+
+    /// Advance the light-gate before the mesh lane runs: start a timer for
+    /// each newly light-blocked mesh candidate, reap timers whose chunk stopped
+    /// waiting, drop degraded entries for unloaded chunks, and re-seed still-waiting
+    /// chunks onto the mesh worklist so a wait-time degrade (which raises no re-seed
+    /// event of its own) is never stranded by worklist eviction.
+    fn tick_light_gate(&mut self) {
+        // `LightGate` is `Default`, so move it out to break the self-borrow while
+        // the predicates below read the chunk map.
+        let mut gate = std::mem::take(&mut self.light_gate);
+        gate.degraded.retain(|c| self.chunks.contains_key(c));
+        gate.blocked_since.retain(|c, _| self.chunk_light_blocked(*c));
+        // Remesh-on-arrival safety net: a DEGRADED chunk clears only when it is
+        // re-invalidated after its light settles. The event-driven path
+        // (`publish_light` border-move) MISSES a degraded chunk whose neighbour's
+        // FINAL light publish doesn't move their shared border — it would then stay
+        // degraded forever though `light_ready` is now true (the world-entry stall at
+        // `degraded=N`). So sweep the bounded, shrinking set: any entry now light-ready
+        // and still drawing a `Ready` mesh is invalidated to remesh, which clears its
+        // flag in `mesh_chunk`. One remesh per chunk, so it converges (no re-arm once
+        // out of the set).
+        let relit: Vec<Coord> =
+            gate.degraded.iter().copied().filter(|&c| self.light_ready(c)).collect();
+        for c in relit {
+            if let Some(loaded) = self.chunks.get_mut(&c) {
+                if matches!(loaded.state, MeshState::Ready(_)) {
+                    loaded.state.invalidate();
+                    loaded.rev = loaded.rev.wrapping_add(1);
+                    self.pending_dirty.set();
+                }
+            }
+        }
+        let now = Instant::now();
+        let fresh: Vec<Coord> = self
+            .mesh_worklist
+            .iter()
+            .copied()
+            .filter(|c| self.chunk_light_blocked(*c) && !gate.blocked_since.contains_key(c))
+            .collect();
+        for c in fresh {
+            gate.blocked_since.insert(c, now);
+        }
+        if !gate.blocked_since.is_empty() {
+            for &c in gate.blocked_since.keys() {
+                self.mesh_worklist.insert(c);
+            }
+            self.pending_fresh.set();
+        }
+        self.light_gate = gate;
+    }
+
+    /// Forward-progress floor for the degraded set. The edge-triggered
+    /// clear (`publish_light` → invalidate-on-arrival, and the `tick_light_gate`
+    /// remesh-on-arrival sweep) only fires while light is still *moving*: a
+    /// degraded chunk whose missing neighbour has already reached its TERMINAL
+    /// light state (unloaded, or settled with a border that never moved) gets no
+    /// further arrival, so it stays degraded forever and `entry_complete` (which
+    /// requires an empty degraded set) hangs.
+    ///
+    /// This is the level-triggered backstop. It fires ONLY at true light
+    /// quiescence — no generate, mesh, or light work of any kind outstanding — at
+    /// which point every remaining degraded chunk's neighbourhood is provably
+    /// final, so re-meshing against the REAL current light (missing planes read
+    /// dark, which is the correct terminal input for a never-lit neighbour — NOT
+    /// the degraded open-sky fallback) is strictly more correct than the mesh it
+    /// currently draws. Each chunk is promoted to a FINAL mesh and dropped from
+    /// the set, so the pass runs once and `degraded` drains to empty. It cannot
+    /// fire early (the AND-guard) and cannot re-degrade its own output
+    /// (`remesh_terminal` marks final unconditionally).
+    fn flush_degraded_terminal(&mut self, eng: &mut Engine) {
+        let quiescent = self.generating.is_empty()
+            && self.mesh_worklist.is_empty()
+            && self.light_worklist.is_empty()
+            && self.light_inflight.is_empty()
+            && self.light_apply_queue.is_empty()
+            && !self.light_gate.degraded.is_empty();
+        if !quiescent {
+            return;
+        }
+        // Promote SETTLED degraded chunks, a few per frame: `remesh_terminal`
+        // is a synchronous main-thread mesh build (milliseconds each), so an
+        // unbudgeted pass over N stuck chunks would be one big hitch. The world
+        // is quiescent here (nothing else re-degrades), so the set drains
+        // monotonically across frames either way; a still-building/Dirty chunk
+        // is left for a later flush once its own path settles it.
+        const TERMINAL_FLUSH_BUDGET: usize = 2;
+        let stuck: Vec<Coord> = self.light_gate.degraded.iter().copied().collect();
+        let mut promoted = 0usize;
+        for coord in stuck {
+            if promoted >= TERMINAL_FLUSH_BUDGET {
+                break;
+            }
+            match self.chunks.get(&coord).map(|l| &l.state) {
+                // Settled on a degraded mesh — the stuck case. Promote to final.
+                Some(MeshState::Ready(_) | MeshState::Air) => {
+                    self.remesh_terminal(coord, eng);
+                    promoted += 1;
+                }
+                // Unloaded out from under the set between marking and here.
+                None => self.mark_degraded(coord, false),
+                // Still building (in-flight degraded result pending) or Dirty (a
+                // sync remesh owns it): another path is about to resolve it. Leave
+                // it in the set; a later frame's flush promotes it once settled, so
+                // the flush never races an in-flight upload for the same chunk.
+                Some(MeshState::NeedsMesh { .. } | MeshState::Dirty { .. }) => {}
+            }
+        }
+    }
+
+    /// Re-mesh a degraded chunk against its neighbours' REAL final light and mark
+    /// it FINAL — the terminal-flush counterpart to the degraded mesh-lane path.
+    /// Unlike [`mesh_chunk`](Self::mesh_chunk) (which recomputes `degraded` from
+    /// `light_ready` and so would re-degrade a chunk with a terminally-missing
+    /// neighbour), this forces `degraded = false`: at the quiescence the caller
+    /// guarantees, a missing plane is a settled neighbour's real (possibly dark)
+    /// light, so the mesh IS final. The chunk is `Ready`/`Air` here; `retire`
+    /// frees its degraded mesh exactly once.
+    fn remesh_terminal(&mut self, coord: Coord, eng: &mut Engine) {
+        self.refresh_tables();
+        let mut scratch = std::mem::replace(&mut self.scratch, mesh::new_chunk_mesh_data());
+        let tables = self.tables.get();
+        let uniform = self.chunks[&coord].chunk.uniform();
+        let padded = self.capture_padded(coord);
+        self.mark_degraded(coord, false);
+        let light = self.capture_padded_light(coord, false);
+        mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
+        let handles = ByPass::from_fn(|p| eng.upload_mesh(&scratch[p]));
+        self.scratch = scratch;
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.retire(MeshState::from_upload(handles), eng);
+        }
+    }
+
+    /// World-entry completeness predicate: true once, within the view
+    /// radius, every chunk shows a FINAL-light mesh (`Ready`/`Air`, none degraded
+    /// and none still waiting on light), no near generate/mesh/light work is queued
+    /// or in flight, every desired LOD-ring tile is `Ready`/`Air`, and every desired
+    /// skin column is `Ready`. Reads private streaming state — its home here.
+    pub fn entry_complete(&self) -> bool {
+        let Some(center) = self.center else { return false };
+        // No near work queued or in flight, and nothing owed a final-light remesh.
+        if !self.generating.is_empty()
+            || !self.mesh_worklist.is_empty()
+            || !self.upload_queue.is_empty()
+            || !self.light_worklist.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.light_apply_queue.is_empty()
+            || !self.light_gate.degraded.is_empty()
+            || !self.light_gate.blocked_since.is_empty()
+        {
+            return false;
+        }
+        // Every in-view chunk has a final mesh (data loaded, not building/dirty).
+        for coord in self.mesh_box(center).coords() {
+            match self.chunks.get(&coord).map(|l| &l.state) {
+                Some(MeshState::Air | MeshState::Ready(_)) => {}
+                _ => return false,
+            }
+        }
+        // Far LOD ring: every desired tile Ready/Air, every desired skin Ready.
+        if self.tiles_enabled {
+            if !self.tile_upload_queue.is_empty() {
+                return false;
+            }
+            if self.desired_tiles(center).into_iter().any(|t| {
+                !matches!(self.tiles.get(&t), Some(TileState::Ready { .. } | TileState::Air))
+            }) {
+                return false;
+            }
+        }
+        if self.skins_enabled {
+            if !self.skin_upload_queue.is_empty() {
+                return false;
+            }
+            if self.desired_columns(center).into_iter().any(|c| {
+                !matches!(self.skins.get(&c), Some(SkinState::Ready { .. }))
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Human-readable reason `entry_complete` is not yet true — the first
+    /// unsatisfied clause with a count, so a stalled bless/harness run says WHICH
+    /// streaming stage is stuck instead of hanging silently. Clause order mirrors
+    /// [`entry_complete`](Self::entry_complete).
+    pub fn entry_debug(&self) -> String {
+        let Some(center) = self.center else { return "no stream centre yet".into() };
+        let near: [(&str, usize); 8] = [
+            ("generating", self.generating.len()),
+            ("mesh_worklist", self.mesh_worklist.len()),
+            ("upload_queue", self.upload_queue.len()),
+            ("light_worklist", self.light_worklist.len()),
+            ("light_inflight", self.light_inflight.len()),
+            ("light_apply_queue", self.light_apply_queue.len()),
+            ("degraded", self.light_gate.degraded.len()),
+            ("light_blocked", self.light_gate.blocked_since.len()),
+        ];
+        let pending: Vec<String> =
+            near.iter().filter(|(_, n)| *n != 0).map(|(k, n)| format!("{k}={n}")).collect();
+        if !pending.is_empty() {
+            let mut msg = format!("near work pending: {}", pending.join(", "));
+            // If the fresh-mesh lane is the blocker, tally WHICH ready()-predicate the
+            // stuck chunks fail — the four gates from `MeshLane::ready`.
+            if !self.mesh_worklist.is_empty() {
+                let (mut not_needs, mut out_box, mut no_neigh, mut lit_or_expired) = (0, 0, 0, 0);
+                for &c in self.mesh_worklist.iter() {
+                    if !self.is_needs_mesh(c) {
+                        not_needs += 1;
+                    } else if !self.in_mesh_box(c) {
+                        out_box += 1;
+                    } else if !self.neighbours_have_data(c) {
+                        no_neigh += 1;
+                    } else if self.light_ready(c) || self.light_wait_expired(c) {
+                        lit_or_expired += 1;
+                    }
+                }
+                msg.push_str(&format!(
+                    " | mesh_worklist stuck-on: not_needs_mesh={not_needs} out_of_box={out_box} \
+                     no_neighbour_data={no_neigh} ready_but_unclaimed={lit_or_expired} \
+                     (lighting={})",
+                    self.lighting
+                ));
+            }
+            return msg;
+        }
+        let unmeshed = self
+            .mesh_box(center)
+            .coords()
+            .filter(|c| {
+                !matches!(self.chunks.get(c).map(|l| &l.state), Some(MeshState::Air | MeshState::Ready(_)))
+            })
+            .count();
+        if unmeshed != 0 {
+            return format!("chunks without a final mesh: {unmeshed}");
+        }
+        if self.tiles_enabled {
+            if !self.tile_upload_queue.is_empty() {
+                return format!("tile_upload_queue = {}", self.tile_upload_queue.len());
+            }
+            let desired = self.desired_tiles(center);
+            let not_ready = desired
+                .iter()
+                .filter(|t| !matches!(self.tiles.get(t), Some(TileState::Ready { .. } | TileState::Air)))
+                .count();
+            if not_ready != 0 {
+                return format!(
+                    "far LOD tiles not Ready/Air: {not_ready} of {} desired",
+                    desired.len()
+                );
+            }
+        }
+        if self.skins_enabled {
+            if !self.skin_upload_queue.is_empty() {
+                return format!("skin_upload_queue = {}", self.skin_upload_queue.len());
+            }
+            let desired = self.desired_columns(center);
+            let not_ready = desired
+                .iter()
+                .filter(|c| !matches!(self.skins.get(c), Some(SkinState::Ready { .. })))
+                .count();
+            if not_ready != 0 {
+                return format!("far skin columns not Ready: {not_ready} of {} desired", desired.len());
+            }
+        }
+        "entry complete".into()
+    }
+
     /// Build chunk GPU mesh (sync dirty-remesh). Frees old handle exactly once; all-air → Air.
     fn mesh_chunk(&mut self, coord: Coord, eng: &mut Engine) {
         self.refresh_tables();
@@ -832,7 +1295,14 @@ impl World {
         // geometry updates this frame for responsiveness, and the relit result
         // lands a frame or two later when the light lane reconverges and marks
         // this chunk dirty again — the visible light lag Minecraft also shows.
-        let light = self.capture_padded_light(coord);
+        // A dirty remesh runs against the currently-published light. If that light
+        // is now final, the chunk is no longer degraded; if a neighbour is still
+        // unsettled it stays degraded (missing planes read dark here — the sync
+        // path keeps its stale-but-plausible behaviour). This is the remesh-on-
+        // arrival that clears a chunk degraded by the mesh lane.
+        let degraded = !self.light_ready(coord);
+        self.mark_degraded(coord, degraded);
+        let light = self.capture_padded_light(coord, degraded);
         mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
         let handles = ByPass::from_fn(|p| eng.upload_mesh(&scratch[p]));
         self.scratch = scratch;
