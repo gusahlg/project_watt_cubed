@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(s.render_distance, 3, "render distance wraps 20 -> 3");
         s.fov = 50.0;
         apply_settings_cycle(&mut s, 6, Step::Prev);
-        assert_eq!(s.fov, 120.0, "fov wraps 50 -> 120");
+        assert_eq!(s.fov, 220.0, "fov wraps 50 -> 220");
         // The Back row cycles to nothing.
         let before = s.clone();
         apply_settings_cycle(&mut s, SETTINGS_ROW_BACK, Step::Next);

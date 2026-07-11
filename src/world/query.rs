@@ -33,6 +33,11 @@ impl World {
         self.generator.height(x, z)
     }
 
+    /// Sea level, so spawn logic can tell dry land from seabed/ocean columns.
+    pub fn sea_level(&self) -> i32 {
+        self.generator.sea_level()
+    }
+
     /// Highest solid block's Y in column (x, z) from loaded chunks, or None if empty.
     pub fn top_solid(&self, x: i32, z: i32) -> Option<i32> {
         let s = CHUNK_SIZE as i32;

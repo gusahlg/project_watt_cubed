@@ -611,11 +611,23 @@ fn fresh_seed() -> i64 {
         .unwrap_or(1)
 }
 
-/// Spawn the player just above the surface at the world origin, so they drop and
-/// land on solid ground.
+/// Spawn the player just above dry land near the world origin, so they drop and
+/// land on solid ground instead of sinking into an ocean/lake column that
+/// happens to sit at (0, 0). Spirals outward from the origin for the first
+/// column above sea level, mirroring `net::server::spawn_point`.
 fn spawn_player(world: &World) -> Player {
-    let surface = world.surface_y(0, 0);
-    Player::new(DVec3::new(0.5, surface as f64 + 3.0, 0.5))
+    let sea = world.sea_level();
+    for r in 0..64 {
+        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
+            let (x, z) = (dx * 8, dz * 8);
+            let h = world.surface_y(x, z);
+            if h > sea {
+                return Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
+            }
+        }
+    }
+    let h = world.surface_y(0, 0).max(sea);
+    Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
 }
 
 /// Parse `WATT_BENCH_POS="x,y,z"` into a position (f64, comma-separated).

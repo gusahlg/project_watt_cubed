@@ -482,29 +482,12 @@ impl Warp {
     }
 }
 
-/// A 2-D field source: a bare fBm, or one read through a domain warp so its
-/// features meander. Lets `Control` shape either kind — so height fields can be
-/// warped, not just biome axes. 2-D only; never reached by `Term` bounds.
-#[derive(Clone)]
-enum Field2 {
-    Bare(Fbm),
-    Warped(Warp),
-}
-
-impl Field2 {
-    fn at(&self, wx: i32, wz: i32) -> Unit {
-        match self {
-            Field2::Bare(f) => f.at(wx, wz),
-            Field2::Warped(w) => w.at(wx, wz),
-        }
-    }
-}
-
 /// Field shaped by a spline curve for terrain control. The gamma parameter
 /// redistributes values (gamma > 1 favors lower values, gamma < 1 favors higher).
+/// The field is read through a domain warp so its features meander.
 #[derive(Clone)]
 struct Control {
-    field: Field2,
+    field: Warp,
     gamma: f32,
     curve: Spline,
 }
@@ -945,12 +928,12 @@ impl Terrain {
         let fbm = |salt: u64, cell: f64, octaves: u8| Fbm { stream: s.stream(salt), cell, octaves };
         // Shared height-warp offsets (like the biome axes share theirs), so
         // continentalness and erosion meander in step rather than decorrelating.
-        let hwarp = |field: Fbm| Field2::Warped(Warp {
+        let hwarp = |field: Fbm| Warp {
             field,
             dx: fbm(HEIGHT_WARPX_SALT, HEIGHT_WARP_CELL, 2),
             dz: fbm(HEIGHT_WARPZ_SALT, HEIGHT_WARP_CELL, 2),
             amp: HEIGHT_WARP_AMP,
-        });
+        };
         let seam = |min_depth: i32, rarity: u32, name: &str| Seam {
             min_depth,
             width: u32::MAX / rarity,

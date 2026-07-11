@@ -30,7 +30,7 @@ pub use voxel_engine::RENDER_SCALE_RANGE;
 const SETTINGS_PATH: &str = "saves/settings.cfg";
 
 /// Field-of-view clamp range, in degrees. Shared with the settings menu stepper.
-pub const FOV_RANGE: RangeInclusive<f32> = 60.0..=120.0;
+pub const FOV_RANGE: RangeInclusive<f32> = 60.0..=220.0;
 
 /// HUD/text scale clamp range (multiplier). Shared with the settings menu stepper.
 pub const UI_SCALE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
@@ -602,7 +602,7 @@ mod tests {
         assert_eq!(s.msaa, 4);
         assert_eq!(s.max_fps, 10);
         assert_eq!(s.render_distance, 20);
-        assert_eq!(s.fov, 120.0);
+        assert_eq!(s.fov, 220.0);
         assert_eq!(s.render_scale, 2.0);
     }
 

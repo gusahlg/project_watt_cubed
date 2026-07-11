@@ -5,7 +5,7 @@
 //! Positions and velocities are `f64` so play stays precise out to the world
 //! border (see [`math`](crate::math)); view angles stay `f32` — a radian needs
 //! no more precision, only positions accumulate magnitude.
-use voxel_engine::{Camera3D, DVec3, Vec3, WarpParams};
+use voxel_engine::{Camera3D, DVec3, Lens, Vec3, WarpStrength};
 
 use crate::math::{Aabb, Bounded};
 
@@ -202,12 +202,25 @@ impl Player {
     /// per-draw offsets, peers by subtracting the eye) — see
     /// [`Game::draw`](crate::game::Game).
     pub fn camera_with_fov(&self, fovy: f32) -> Camera3D {
+        // Two regimes, seam at 120°. Below, plain rectilinear at the dialed fovy.
+        // Above, the dial stops widening the *vertical* FOV — which would collapse
+        // and then flip the projection as it neared 180° — and instead buys
+        // *horizontal* reach through the wide lens: vertical pins at 120° and the
+        // 120→220 travel maps onto WarpStrength 0→MAX (2.0), edges compressing as
+        // it grows. At exactly 120 the two regimes coincide, so the seam is
+        // seamless.
+        let (fovy, lens) = if fovy > 120.0 {
+            let strength = WarpStrength::new((fovy - 120.0) / 50.0).unwrap();
+            (120.0, Lens::WideFov { strength })
+        } else {
+            (fovy, Lens::Rectilinear)
+        };
         Camera3D {
             position: Vec3::ZERO,
             target: self.forward().as_vec3(),
             up: Vec3::new(0.0, 1.0, 0.0),
             fovy,
-            warp: WarpParams::IDENTITY,
+            lens,
         }
     }
 }
