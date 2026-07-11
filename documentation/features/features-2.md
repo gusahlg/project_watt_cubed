@@ -2,7 +2,10 @@
 I am rewriting key parts of the features file entirely in a new draft that has more thought through and refined versions of the features described in the original
 feature file. After this I will write a new feature file that more extensively goes through the final versions of the core features of the game.
 
-## Core Properties
+## Elements
+Elements make up the blocks in the world. These are the different kinds of properties that define elements
+
+### Core Properties
 I think the core properties that any element should have are these:
 - Durability, how much damage it can take until it breaks
 - Hardness, how hard it is to damage it, acts as a floor for the least amount of damage it can take, if it is attacked with something lower it takes no damage
@@ -10,7 +13,17 @@ I think the core properties that any element should have are these:
 - Density, how heavy it is, will affect how easily it is moved
 - Friction, how much it grips to adjacent blocks, if the value is higher than an adjacent blocks density that blocks moves with it (if the pushing force is adequate)
 
-## Special Properties
+### Special Properties
+Special properties are properties that not every element has.
+
+### Reaction Properties
+Reaction properties are properties that do not belong to a single element, rather they come active when a certain combinations of elements are present at once in a block.
+
+## Blocks
+Blocks contain elements and inherit their properties in different ways depending on what kind of block it is. There are two different kinds of blocks that behave differently.
+
+### Natural Blocks
+Natural blocks are combinations between mutliple elemtns that 
 
 # Thoughts
 Random thoughts and debates that need to be resolved to be able to write another draft.
