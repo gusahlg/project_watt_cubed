@@ -20,6 +20,8 @@ use std::path::Path;
 
 use voxel_engine::Engine;
 
+use crate::render_config::RenderConfig;
+
 pub use crate::world::VIEW_RADIUS_RANGE;
 /// Render-resolution scale clamp range — re-exported from the engine, which owns
 /// the single source (it does the real clamp in `set_render_scale`). Re-exporting
@@ -34,6 +36,8 @@ pub const FOV_RANGE: RangeInclusive<f32> = 60.0..=220.0;
 
 /// HUD/text scale clamp range (multiplier). Shared with the settings menu stepper.
 pub const UI_SCALE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
+
+pub const SHAKE_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
@@ -52,6 +56,8 @@ pub struct Settings {
     /// HUD/text scale, independent of render resolution (0.5..=2.0). Drives
     /// [`crate::ui::Theme::scale`].
     pub ui_scale: f32,
+    /// Camera shake intensity (0..=1); an accessibility control, not a constant.
+    pub shake: f32,
     /// Cross-chunk lighting. On by default; pushed to [`crate::world::World`] on
     /// world entry and on `/gfx` change (the engine has no say — it is a meshing
     /// input, not a GPU state).
@@ -61,6 +67,26 @@ pub struct Settings {
     /// vertex-fetch bound), so it is absent from [`SETTINGS`] and pushed to the
     /// engine by [`apply`](Settings::apply) like the table fields.
     pub cull_faces: bool,
+
+    // Render lanes — the source of truth for [`RenderConfig`] (built by
+    // [`render_config`](Settings::render_config)). The engine lanes go live via
+    // `set_flags` in [`apply`](Settings::apply); `occlusion`/`lod2` are world
+    // construction inputs and take effect on the next world entry; `clouds`/
+    // `weather` are per-frame look lanes read through the game's cached config.
+    pub occlusion: bool,
+    pub lod2: bool,
+    pub blocklight: bool,
+    pub exposure: bool,
+    pub bloom: bool,
+    pub godrays: bool,
+    pub clouds: bool,
+    pub weather: bool,
+    pub taa: bool,
+    pub fog: bool,
+    pub ambient: bool,
+    pub sunlight: bool,
+    pub shadows: bool,
+    pub sky: bool,
 }
 
 impl Default for Settings {
@@ -74,8 +100,25 @@ impl Default for Settings {
             fov: 90.0,
             render_scale: 1.0,
             ui_scale: 1.0,
+            shake: 1.0,
             lighting: true,
             cull_faces: false,
+            // Render lanes: the shipped defaults. `lod2` (the far field) ships off —
+            // near-only by default; the harness keeps it on via `RenderConfig::golden`.
+            occlusion: true,
+            lod2: false,
+            blocklight: false,
+            exposure: false,
+            bloom: true,
+            godrays: true,
+            clouds: true,
+            weather: true,
+            taa: false,
+            fog: false,
+            ambient: false,
+            sunlight: true,
+            shadows: false,
+            sky: true,
         }
     }
 }
@@ -85,17 +128,42 @@ impl Default for Settings {
 // surface. No common wire type — each field touches its own struct member.
 // ---------------------------------------------------------------------------
 
-/// One setting: its persistence key (+ console aliases), menu label, and the
-/// behaviour every surface needs, each as a plain `fn` pointer. Non-capturing
-/// closures in [`SETTINGS`] fill these; the uniform fields delegate to the shared
-/// helpers below, the float fields touch `f32` directly.
+/// Settings submenu category.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Category {
+    Video,
+    World,
+    Interface,
+}
+
+impl Category {
+    /// All categories in menu order with their page titles.
+    pub const ALL: [(Category, &'static str); 3] =
+        [(Category::Video, "Video"), (Category::World, "World"), (Category::Interface, "Interface")];
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuKind {
+    Toggle,
+    Choice,
+    Bar,
+}
+
+/// A setting descriptor: key, label, and behavior functions that every surface
+/// (persistence, menu, console) uses. Closures in [`SETTINGS`] fill the function
+/// pointers; float fields touch `f32` directly via shared helpers.
 pub struct Setting {
+    category: Category,
+    menu_kind: MenuKind,
+    fraction: fn(&Settings) -> f32,
     /// The `key=` name used in `saves/settings.cfg` and the primary console name.
     key: &'static str,
     /// Extra names the `/gfx` console command accepts for this field.
     aliases: &'static [&'static str],
     /// The settings-menu row label.
     label: &'static str,
+    /// Value syntax shown by `/gfx` help, including the preferred console key.
+    usage: &'static str,
     /// The exact `/gfx` confirmation line for the current value.
     confirm: fn(&Settings) -> String,
     /// The human-facing value string (menu display and `/gfx` value read-out).
@@ -118,6 +186,23 @@ impl Setting {
     /// The settings-menu row label.
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    pub fn category(&self) -> Category {
+        self.category
+    }
+
+    pub fn menu_kind(&self) -> MenuKind {
+        self.menu_kind
+    }
+
+    pub fn fraction(&self, s: &Settings) -> f32 {
+        (self.fraction)(s)
+    }
+
+    /// Preferred console key and accepted value syntax.
+    pub fn usage(&self) -> &'static str {
+        self.usage
     }
 
     /// Whether this field answers to `name` (its key or any console alias).
@@ -158,17 +243,46 @@ impl Setting {
     }
 }
 
+/// A `Category::Video` on/off row over a single `bool` field. Every render-lane
+/// toggle shares this exact behaviour set, so the field name is the only variable.
+macro_rules! video_toggle {
+    ($field:ident, $key:literal, $label:literal $(, $aliases:expr)?) => {
+        Setting {
+            category: Category::Video,
+            menu_kind: MenuKind::Toggle,
+            fraction: |_| 0.0,
+            key: $key,
+            aliases: video_toggle!(@aliases $($aliases)?),
+            label: $label,
+            usage: concat!($key, " on|off"),
+            confirm: |s| format!(concat!($key, " {}"), on_off(s.$field, false)),
+            show: |s| on_off(s.$field, true).to_string(),
+            parse_human: |s, v| set_bool(&mut s.$field, v),
+            step: |s, _| s.$field = !s.$field,
+            clamp: |_| {},
+            write: |s| s.$field.to_string(),
+            read: |s, v| set_bool(&mut s.$field, v),
+        }
+    };
+    (@aliases) => { &[] };
+    (@aliases $aliases:expr) => { $aliases };
+}
+
 /// The MSAA sample counts offered — one list shared by its stepper and its
 /// "round down to a supported count" clamp bucket.
 const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 9] = [
+pub const SETTINGS: [Setting; 24] = [
     Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Toggle,
+        fraction: |_| 0.0,
         key: "fullscreen",
         aliases: &[],
         label: "Fullscreen",
+        usage: "fullscreen on|off",
         confirm: |s| format!("fullscreen {}", on_off(s.fullscreen, false)),
         show: |s| on_off(s.fullscreen, true).to_string(),
         parse_human: |s, v| set_bool(&mut s.fullscreen, v),
@@ -178,9 +292,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_bool(&mut s.fullscreen, v),
     },
     Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Toggle,
+        fraction: |_| 0.0,
         key: "vsync",
         aliases: &[],
         label: "VSync",
+        usage: "vsync on|off",
         confirm: |s| format!("vsync {}", on_off(s.vsync, false)),
         show: |s| on_off(s.vsync, true).to_string(),
         parse_human: |s, v| set_bool(&mut s.vsync, v),
@@ -190,9 +308,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_bool(&mut s.vsync, v),
     },
     Setting {
+        category: Category::World,
+        menu_kind: MenuKind::Toggle,
+        fraction: |_| 0.0,
         key: "lighting",
         aliases: &["light"],
-        label: "Lighting",
+        label: "Voxel Lighting",
+        usage: "lighting on|off",
         confirm: |s| format!("lighting {}", on_off(s.lighting, false)),
         show: |s| on_off(s.lighting, true).to_string(),
         parse_human: |s, v| set_bool(&mut s.lighting, v),
@@ -202,9 +324,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_bool(&mut s.lighting, v),
     },
     Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Choice,
+        fraction: |_| 0.0,
         key: "msaa",
         aliases: &[],
         label: "MSAA",
+        usage: "msaa 1|2|4|8",
         confirm: |s| format!("msaa {}x", s.msaa),
         show: |s| format!("{}x", s.msaa),
         parse_human: |s, v| {
@@ -220,9 +346,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_parsed(&mut s.msaa, v),
     },
     Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| (s.max_fps as f32 / 240.0).min(1.0),
         key: "max_fps",
         aliases: &["fps"],
         label: "Max FPS",
+        usage: "fps <10-1000>|off",
         confirm: |s| {
             if s.max_fps == 0 {
                 "fps cap off".to_string()
@@ -257,9 +387,15 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_parsed(&mut s.max_fps, v),
     },
     Setting {
+        category: Category::World,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| {
+            frac(s.render_distance as f32, *VIEW_RADIUS_RANGE.start() as f32, *VIEW_RADIUS_RANGE.end() as f32)
+        },
         key: "render_distance",
         aliases: &["renderdist", "renderdistance"],
         label: "Render Distance",
+        usage: "renderdist <3-20>",
         confirm: |s| format!("render distance {}", s.render_distance),
         show: |s| s.render_distance.to_string(),
         parse_human: |s, v| {
@@ -282,9 +418,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_parsed(&mut s.render_distance, v),
     },
     Setting {
+        category: Category::Interface,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| frac(s.fov, *FOV_RANGE.start(), *FOV_RANGE.end()),
         key: "fov",
         aliases: &[],
         label: "FOV",
+        usage: "fov <50-220>",
         confirm: |s| format!("fov {:.0}", s.fov),
         // f32 Display prints whole values without a decimal point, exactly as the
         // old `format!("FOV: {}", s.fov)` screen did.
@@ -312,9 +452,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_parsed(&mut s.fov, v),
     },
     Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| frac(s.render_scale, *RENDER_SCALE_RANGE.start(), *RENDER_SCALE_RANGE.end()),
         key: "render_scale",
         aliases: &["renderscale", "scale"],
         label: "Render Scale",
+        usage: "renderscale <25-200>",
         confirm: |s| format!("render scale {:.0}%", s.render_scale * 100.0),
         // Percent-encoded for humans (75%), stored raw (0.75) for save-compat.
         show: |s| format!("{:.0}%", s.render_scale * 100.0),
@@ -339,9 +483,13 @@ pub const SETTINGS: [Setting; 9] = [
         read: |s, v| set_parsed(&mut s.render_scale, v),
     },
     Setting {
+        category: Category::Interface,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| frac(s.ui_scale, *UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end()),
         key: "ui_scale",
         aliases: &["uiscale", "hudscale"],
         label: "UI Scale",
+        usage: "uiscale <50-200>",
         confirm: |s| format!("ui scale {:.0}%", s.ui_scale * 100.0),
         show: |s| format!("{:.0}%", s.ui_scale * 100.0),
         parse_human: |s, v| match v.parse::<f32>() {
@@ -364,6 +512,48 @@ pub const SETTINGS: [Setting; 9] = [
         write: |s| s.ui_scale.to_string(),
         read: |s, v| set_parsed(&mut s.ui_scale, v),
     },
+    Setting {
+        category: Category::Interface,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| frac(s.shake, *SHAKE_RANGE.start(), *SHAKE_RANGE.end()),
+        key: "shake",
+        aliases: &["camerashake"],
+        label: "Camera Shake",
+        usage: "shake <0-100>",
+        confirm: |s| format!("camera shake {:.0}%", s.shake * 100.0),
+        show: |s| format!("{:.0}%", s.shake * 100.0),
+        parse_human: |s, v| match v.parse::<f32>() {
+            Ok(pct) => {
+                s.shake = pct / 100.0;
+                shake_clamp(s);
+                true
+            }
+            Err(_) => false,
+        },
+        step: |s, d| {
+            let pct = cycle_list(&[0, 25, 50, 75, 100], (s.shake * 100.0).round() as i32, d);
+            s.shake = pct as f32 / 100.0;
+        },
+        clamp: shake_clamp,
+        write: |s| s.shake.to_string(),
+        read: |s, v| set_parsed(&mut s.shake, v),
+    },
+    // Render lanes (see [`Settings::render_config`]). Engine lanes apply live via
+    // `set_flags`; occlusion/lod2 apply on next world entry; clouds/weather per frame.
+    video_toggle!(lod2, "lod2", "Distant LOD", &["lod"]),
+    video_toggle!(occlusion, "occlusion", "Occlusion Culling", &["occ"]),
+    video_toggle!(sky, "sky", "Procedural Sky"),
+    video_toggle!(sunlight, "sunlight", "Sunlight", &["sun"]),
+    video_toggle!(ambient, "ambient", "Ambient Light", &["amb"]),
+    video_toggle!(shadows, "shadows", "Shadows", &["shadow"]),
+    video_toggle!(blocklight, "blocklight", "Block Light"),
+    video_toggle!(fog, "fog", "Distance Fog"),
+    video_toggle!(clouds, "clouds", "Clouds"),
+    video_toggle!(weather, "weather", "Weather"),
+    video_toggle!(bloom, "bloom", "Bloom"),
+    video_toggle!(godrays, "godrays", "Godrays"),
+    video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
+    video_toggle!(taa, "taa", "Temporal AA", &["aa"]),
 ];
 
 /// The Back action sits just past the settings rows — derived, never hand-numbered.
@@ -433,6 +623,32 @@ impl Settings {
         self.render_scale = eng.set_render_scale(self.render_scale);
         eng.set_target_fps(self.max_fps);
         eng.set_cull_faces(self.cull_faces);
+        // Engine render lanes live-swap on both threads; occlusion/lod2 are world
+        // inputs (applied on world entry) and aren't part of `engine_flags`.
+        eng.set_flags(self.render_config().engine_flags());
+    }
+
+    /// The render lanes this settings state names — the single source the game's
+    /// world construction and per-frame [`compose`](crate::frame_snapshot::compose)
+    /// both derive from. (The golden harness keeps its own pinned
+    /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
+    pub fn render_config(&self) -> RenderConfig {
+        RenderConfig {
+            occlusion: self.occlusion,
+            lod2: self.lod2,
+            blocklight: self.blocklight,
+            exposure: self.exposure,
+            bloom: self.bloom,
+            godrays: self.godrays,
+            clouds: self.clouds,
+            weather: self.weather,
+            taa: self.taa,
+            fog: self.fog,
+            ambient: self.ambient,
+            sunlight: self.sunlight,
+            shadows: self.shadows,
+            sky: self.sky,
+        }
     }
 }
 
@@ -484,6 +700,15 @@ pub fn on_off(v: bool, caps: bool) -> &'static str {
     }
 }
 
+/// Normalize to 0..=1 for menu bar display.
+fn frac(v: f32, lo: f32, hi: f32) -> f32 {
+    if hi <= lo {
+        0.0
+    } else {
+        ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+}
+
 /// Clamp a finite value to a range. NaN should be reset beforehand (see [`reset_nan`]).
 fn clamp_to(range: &RangeInclusive<f32>, v: f32) -> f32 {
     v.clamp(*range.start(), *range.end())
@@ -510,6 +735,10 @@ fn ui_scale_clamp(s: &mut Settings) {
         &UI_SCALE_RANGE,
         reset_nan(s.ui_scale, Settings::default().ui_scale),
     );
+}
+
+fn shake_clamp(s: &mut Settings) {
+    s.shake = clamp_to(&SHAKE_RANGE, reset_nan(s.shake, Settings::default().shake));
 }
 
 fn fps_clamp(s: &mut Settings) {
@@ -595,6 +824,7 @@ mod tests {
             fov: 300.0,
             render_scale: 9.0,
             ui_scale: 1.0,
+            shake: 5.0,
             lighting: true,
             cull_faces: false,
         };
@@ -604,6 +834,7 @@ mod tests {
         assert_eq!(s.render_distance, 20);
         assert_eq!(s.fov, 220.0);
         assert_eq!(s.render_scale, 2.0);
+        assert_eq!(s.shake, 1.0);
     }
 
     #[test]
@@ -678,6 +909,7 @@ mod tests {
             fov: 85.0,
             render_scale: 1.25,
             ui_scale: 1.25,
+            shake: 0.5,
             lighting: false,
             // Not persisted (env-only); must stay at the default so the composed
             // roundtrip below — which never writes it — still lands `samples`.

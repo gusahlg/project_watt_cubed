@@ -1,12 +1,17 @@
 [package]
 name = "project_watt_cubed"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+default-run = "project_watt_cubed"
 
 [dependencies]
 # Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
-# types (glam Vec2/Vec3) and Color the game uses, so it is the only dependency.
+# types (glam Vec2/Vec3) and Color the game uses
 voxel_engine = { path = "../voxel-engine" }
+
+# Vector math, matching the engine's version so the re-exported `Vec3`/`Mat4`
+# and our direct `UVec3` (section block origins) are the same `glam` types.
+glam = "0.32.1"
 
 # Maximum-performance release build: aggressive inlining across the whole
 # dependency graph (fat LTO), a single codegen unit so the optimizer sees
@@ -17,3 +22,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Keep our own crates fast to compile in dev, but optimize dependencies
+# (glam, ash, winit, etc.) so debug runs aren't crippled by unoptimized math.
+[profile.dev.package."*"]
+opt-level = 2

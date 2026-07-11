@@ -1,28 +1,20 @@
-//! The default menu mod: the game's menus made visible.
+//! The default menu mod: the standard out-of-game look.
 //!
-//! The core menus are, by design, just [`MenuModel`]s — lists of alternatives
-//! that lead to something, with no look and no keybindings of their own. This
-//! mod *is* the standard look and interaction: arrows or j/k to move, Enter or
-//! l to pick, Esc (or h, where it isn't a typed character) to go back, plus
-//! the host/join text-field editing. Switch it off in the mod menu and the
-//! core's plain built-in fallback takes over — navigation can never brick —
-//! or install a replacement mod with `handles_menus()` for a whole new skin.
-//!
-//! Both the driving and the drawing are thin wrappers over the free functions
-//! in [`crate::menu`] ([`menu::drive`], [`menu::draw_model`]); the fallback
-//! uses the same ones, so there is exactly one implementation of the standard
-//! behavior.
-use voxel_engine::{Engine, Frame};
-
-use crate::menu::{self, MenuEvent, MenuKeys, MenuModel};
+//! Mods supply themes but never handle menu input/state — that lives in the
+//! menu module. This mod provides the built-in theme. Disable it and the App
+//! falls back to the same one, so navigation can never brick. Install a
+//! replacement mod for a whole new look.
+use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::mods::Mod;
 
-/// The standard menu look and keys, as a disableable, replaceable mod.
-pub struct MenuDefaultMod;
+/// The standard menu look, as a disableable, replaceable mod.
+pub struct MenuDefaultMod {
+    theme: DefaultTheme,
+}
 
 impl MenuDefaultMod {
     pub fn new() -> Self {
-        Self
+        Self { theme: DefaultTheme }
     }
 }
 
@@ -38,18 +30,10 @@ impl Mod for MenuDefaultMod {
     }
 
     fn description(&self) -> &str {
-        "The standard menu look and keys (arrows/hjkl, Enter, Esc)."
+        "The standard menu look (title/panel screens, bars and toggles)."
     }
 
-    fn handles_menus(&self) -> bool {
-        true
-    }
-
-    fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
-        menu::drive(&MenuKeys::capture(eng), menu)
-    }
-
-    fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
-        menu::draw_model(f, menu, screen_w, screen_h);
+    fn menu_theme(&self) -> Option<&dyn MenuTheme> {
+        Some(&self.theme)
     }
 }

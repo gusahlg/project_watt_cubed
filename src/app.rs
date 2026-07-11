@@ -9,15 +9,18 @@
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use voxel_engine::{Color, DVec3, Engine, Frame};
+use voxel_engine::{Color, DVec3, Engine};
 
 use crate::game::{Game, Signal};
-use crate::menu::{self, HostInfo, JoinInfo, MainChoice, MenuEvent, MenuModel, Notice};
+use crate::input::router::{Context, Router, View};
+use crate::menu::menus::MainMenu;
+use crate::menu::theme::{DefaultTheme, MenuTheme};
+use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
 use crate::mods::Mods;
 use crate::net::client::Connection;
 use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
-use crate::save;
+use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
 use crate::settings::Settings;
 use crate::world::World;
@@ -26,43 +29,30 @@ const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
 /// Background for every non-world screen.
 const MENU_CLEAR: Color = Color::new(18, 20, 28, 255);
+/// How often a dirty world writes itself in the background.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Which top-level screen is active.
 enum Screen {
-    Menu,
-    Playing,
-    Mods,
-    Host,
-    Join,
-    Settings,
+    Menus(MenuStack),
+    Playing(Box<Game>),
 }
 
-/// The whole program: the installed mods (persist across worlds), the menu
-/// models, the graphics settings, and the current world if one is open.
-///
-/// Menus are plain data models here (see [`crate::menu`]): the App builds one
-/// per screen, hands input to the first enabled menu-handling mod (or the
-/// core fallback if none — disabling the "Menus" mod can never brick
-/// navigation), and interprets the [`MenuEvent`]s that come back.
+/// The whole program: the installed mods (persist across worlds), the graphics
+/// settings, and either the menu stack or the current world.
 pub struct App {
-    /// The live world, if the player is in one.
-    game: Option<Game>,
-    /// The saves list the main-menu model was built from — the index map that
-    /// resolves a `Chosen(i)` on that screen back into a [`MainChoice`].
-    saves: Vec<String>,
-    main_model: MenuModel,
-    mods_model: MenuModel,
-    settings_model: MenuModel,
-    host_model: MenuModel,
-    join_model: MenuModel,
+    /// Available save slots, refreshed on menu return.
+    saves: Vec<Slot>,
+    /// The slot behind the open singleplayer world; `None` on menus and in
+    /// multiplayer (a networked world is a server mirror, never saved locally).
+    active: Option<ActiveSlot>,
+    /// Shared router for menus and in-game input.
+    router: Router,
     /// Installed mods and their on/off state; shared with the game while playing.
     mods: Mods,
     screen: Screen,
     /// The integrated server when hosting, kept alive for the session so friends can
     /// stay connected; stopping it frees the port for a later host.
     host: Option<ServerHandle>,
-    /// A one-line status/error shown under the start menu (e.g. a failed connect).
-    status: Option<String>,
     /// Graphics settings, persisted in `saves/settings.cfg`.
     settings: Settings,
     /// Last-used connection details, persisted in `saves/session.cfg`.
@@ -70,6 +60,24 @@ pub struct App {
     /// Headless-ish benchmark mode (`WATT_BENCH=<seconds>`): auto-enters a
     /// world, rotates the camera, prints one stats line, exits.
     bench: Option<Bench>,
+}
+
+/// The save slot behind the open singleplayer world: identity, header
+/// metadata carried across writes, accumulated playtime, and the autosaver.
+struct ActiveSlot {
+    id: SlotId,
+    /// Persists name/created; seed/playtime/edits restamped on writes.
+    meta: SaveMeta,
+    /// Total seconds played, fractional to avoid per-frame truncation.
+    playtime: f64,
+    autosaver: Autosaver,
+}
+
+impl ActiveSlot {
+    fn new(id: SlotId, meta: SaveMeta) -> Self {
+        let playtime = meta.playtime_secs as f64;
+        Self { id, meta, playtime, autosaver: Autosaver::new(AUTOSAVE_INTERVAL) }
+    }
 }
 
 /// State for the `WATT_BENCH` frame-rate benchmark.
@@ -91,18 +99,9 @@ struct Bench {
 impl App {
     pub fn new() -> Self {
         let mods = Mods::with_defaults();
-        let saves = save::list_saves();
+        let saves = save::list();
         let settings = Settings::load();
         let session = Session::load();
-        // Pre-fill the connection forms with what was used last time. Host has
-        // Port(0)/Password(1)/Name(2); Join has Address(0)/Port(1)/Password(2)/Name(3).
-        let mut host_model = menu::host_menu_model(None);
-        host_model.set_text(0, &session.port);
-        host_model.set_text(2, &session.name);
-        let mut join_model = menu::join_menu_model(None);
-        join_model.set_text(0, &session.address);
-        join_model.set_text(1, &session.port);
-        join_model.set_text(3, &session.name);
         let bench = std::env::var("WATT_BENCH").ok().map(|v| Bench {
             duration: v.parse().unwrap_or(10.0),
             warmup: 3.0,
@@ -120,17 +119,12 @@ impl App {
             unsafe { std::env::set_var("VOXEL_PROFILE", "1") };
         }
         Self {
-            game: None,
-            main_model: menu::main_menu_model(&saves),
             saves,
-            mods_model: menu::mods_menu_model(&mods),
-            settings_model: menu::settings_menu_model(&settings),
-            host_model,
-            join_model,
+            active: None,
+            router: Router::new(),
             mods,
-            screen: Screen::Menu,
+            screen: Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::new()))),
             host: None,
-            status: None,
             settings,
             session,
             bench,
@@ -150,12 +144,15 @@ impl App {
             render_scale: app.settings.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
+            // Engine-side render lanes from the persisted settings (the single
+            // source; the world's own occlusion/lod2 lanes come from the same
+            // `Settings::render_config` at world entry).
+            flags: app.settings.render_config().engine_flags(),
         };
         voxel_engine::run(config, move |eng| app.frame(eng));
     }
 
-    /// One engine frame: update the active screen, then draw it.
-    /// Returning `false` stops the engine (after autosaving any open world).
+    /// One engine frame: update and draw the active screen.
     fn frame(&mut self, eng: &mut Engine) -> bool {
         // OS close button: save and go. Settings save too — the player may be
         // mid-edit on the Settings screen.
@@ -163,7 +160,7 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
-            self.autosave();
+            self.flush_save();
             return false;
         }
 
@@ -172,25 +169,9 @@ impl App {
         }
 
         let quit = match self.screen {
-            Screen::Menu => self.update_menu(eng),
-            Screen::Playing => {
+            Screen::Menus(_) => self.update_menus(eng),
+            Screen::Playing(_) => {
                 self.update_playing(eng);
-                false
-            }
-            Screen::Mods => {
-                self.update_mods(eng);
-                false
-            }
-            Screen::Host => {
-                self.update_host(eng);
-                false
-            }
-            Screen::Join => {
-                self.update_join(eng);
-                false
-            }
-            Screen::Settings => {
-                self.update_settings(eng);
                 false
             }
         };
@@ -198,9 +179,14 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
-            self.autosave();
+            self.flush_save();
             return false;
         }
+        // Force vsync on whenever we're not in a live world (menus, loading):
+        // there's nothing to gain from tearing/uncapped frames on a static
+        // screen, and it keeps the GPU quiet. In-world we honour the setting.
+        let in_world = matches!(self.screen, Screen::Playing(_));
+        eng.set_vsync(!in_world || self.settings.vsync);
         self.draw(eng);
         true
     }
@@ -223,7 +209,7 @@ impl App {
             // Far-coordinate bench: park the player at the requested position
             // with the ground under them made real, and give streaming a
             // little extra warmup to catch up before sampling starts.
-            if let (Some(pos), Some(game)) = (pos, &mut self.game) {
+            if let (Some(pos), Screen::Playing(game)) = (pos, &mut self.screen) {
                 game.player_mut().position = pos;
                 game.world_mut().prepare_around(pos);
                 if let Some(bench) = &mut self.bench {
@@ -232,7 +218,7 @@ impl App {
             }
             return true;
         }
-        let Some(game) = &mut self.game else {
+        let Screen::Playing(game) = &mut self.screen else {
             return true;
         };
         // A slow spin sweeps the frustum across the terrain like a player would.
@@ -269,164 +255,69 @@ impl App {
         false
     }
 
-    /// Drive a menu model through the mod layer, or through the core fallback
-    /// when no enabled mod handles menus (the no-brick guarantee).
-    fn drive(mods: &mut Mods, eng: &Engine, model: &mut MenuModel) -> Option<MenuEvent> {
-        if mods.menu_driver_available() {
-            mods.drive_menu(eng, model)
-        } else {
-            menu::fallback_drive(eng, model)
+    /// Update the menu stack and apply settings live each frame.
+    fn update_menus(&mut self, eng: &mut Engine) -> bool {
+        let dt = eng.frame_time();
+        // Menus are an exclusive router context.
+        self.router.set_context(Context::Menu);
+        let intents = match self.router.frame(eng, dt).view() {
+            View::Menu(m) => crate::menu::gather(&m),
+            _ => Vec::new(),
+        };
+        // A per-frame snapshot so a menu never holds a live `&Mods`.
+        let mods = ModRow::snapshot(&self.mods);
+        let before = self.settings.clone();
+        let mut effect = None;
+        if let Screen::Menus(stack) = &mut self.screen {
+            let mut ctx = Ctx {
+                settings: &mut self.settings,
+                saves: &self.saves,
+                mods: &mods,
+                session: &self.session,
+            };
+            effect = stack.update(&intents, &mut ctx);
+        }
+        // Apply every frame for immediate feedback and to show hardware clamps.
+        self.settings.apply(eng);
+        // Persist whenever a step (or a hardware clamp) moved a value.
+        if self.settings != before {
+            self.settings.save();
+        }
+        match effect {
+            Some(effect) => self.handle_effect(eng, effect),
+            None => false,
         }
     }
 
-    /// Draw a menu model through the mod layer, or through the core fallback.
-    fn draw_model(mods: &mut Mods, f: &mut Frame, model: &MenuModel, w: i32, h: i32) {
-        if mods.menu_driver_available() {
-            mods.draw_menu(f, model, w, h);
-        } else {
-            menu::fallback_draw(f, model, w, h);
-        }
-    }
-
-    /// Rebuild the main-menu model from the saves on disk (call when returning
-    /// to the menu), keeping the cursor on a real row and re-surfacing any
-    /// status line as the model's error text.
-    fn refresh_main_menu(&mut self) {
-        self.saves = save::list_saves();
-        let cursor = self.main_model.entries.cursor;
-        self.main_model = menu::main_menu_model(&self.saves);
-        self.main_model.entries.cursor = cursor;
-        self.main_model.clamp_cursor();
-        self.main_model.notice = self.status.clone().map(Notice::info);
-    }
-
-    /// Rebuild the mod-list model from the mods' current on/off states.
-    fn refresh_mods_menu(&mut self) {
-        let cursor = self.mods_model.entries.cursor;
-        self.mods_model = menu::mods_menu_model(&self.mods);
-        self.mods_model.entries.cursor = cursor;
-        self.mods_model.clamp_cursor();
-    }
-
-    /// Rebuild the settings model's value strings from the live settings.
-    fn refresh_settings_menu(&mut self) {
-        let cursor = self.settings_model.entries.cursor;
-        self.settings_model = menu::settings_menu_model(&self.settings);
-        self.settings_model.entries.cursor = cursor;
-        self.settings_model.clamp_cursor();
-    }
-
-    /// Start-menu logic. Returns `true` to quit the program.
-    fn update_menu(&mut self, eng: &mut Engine) -> bool {
-        let event = Self::drive(&mut self.mods, eng, &mut self.main_model);
-        if let Some(MenuEvent::Chosen(id)) = event {
-            self.status = None;
-            self.main_model.notice = None;
-            match menu::main_choice_at(&self.saves, id) {
-                MainChoice::NewWorld => self.start_new_world(eng),
-                MainChoice::Load(name) => self.load_world(eng, &name),
-                MainChoice::Host => self.screen = Screen::Host,
-                MainChoice::Join => self.screen = Screen::Join,
-                MainChoice::Mods => {
-                    self.refresh_mods_menu();
-                    self.screen = Screen::Mods;
-                }
-                MainChoice::Settings => {
-                    // Values may have moved via /gfx in-game; show the truth.
-                    self.refresh_settings_menu();
-                    self.screen = Screen::Settings;
-                }
-                MainChoice::Quit => return true,
+    /// Interpret one menu effect. Returns `true` only for Quit.
+    fn handle_effect(&mut self, eng: &mut Engine, effect: AppEffect) -> bool {
+        match effect {
+            AppEffect::NewWorld => self.start_new_world(eng),
+            AppEffect::Load(name) => self.load_world(eng, &name),
+            AppEffect::Host(info) => {
+                self.session.port = info.port.to_string();
+                self.session.name = info.name.clone();
+                self.session.save();
+                self.start_host(eng, info);
             }
+            AppEffect::Join(info) => {
+                self.session.address = info.host.clone();
+                self.session.port = info.port.to_string();
+                self.session.name = info.name.clone();
+                self.session.save();
+                self.start_join(eng, info);
+            }
+            AppEffect::ToggleMod(index) => self.mods.toggle(index),
+            AppEffect::Quit => return true,
         }
-        // Back on the start menu means nothing — there is nowhere further out.
         false
     }
 
-    /// Host screen: fill in the form, then start an integrated server and connect to
-    /// it locally. Esc returns to the menu. A bad port refuses the submit and
-    /// keeps the form up with an error in the hint area.
-    fn update_host(&mut self, eng: &mut Engine) {
-        match Self::drive(&mut self.mods, eng, &mut self.host_model) {
-            Some(MenuEvent::Submit) => match menu::parse_port(self.host_model.text_value(0)) {
-                Some(port) => {
-                    let info = HostInfo {
-                        port,
-                        password: self.host_model.text_value(1).to_string(),
-                        name: self.host_model.text_value(2).to_string(),
-                    };
-                    self.session.port = self.host_model.text_value(0).to_string();
-                    self.session.name = info.name.clone();
-                    self.session.save();
-                    self.start_host(eng, info);
-                }
-                None => {
-                    self.host_model.notice = Some(Notice::error(menu::PORT_ERROR.to_string()))
-                }
-            },
-            Some(MenuEvent::Back) => self.screen = Screen::Menu,
-            _ => {}
-        }
-    }
-
-    /// Join screen: fill in the address/port/password, then connect. Esc returns.
-    /// Same port contract as [`update_host`](Self::update_host).
-    fn update_join(&mut self, eng: &mut Engine) {
-        match Self::drive(&mut self.mods, eng, &mut self.join_model) {
-            Some(MenuEvent::Submit) => match menu::parse_port(self.join_model.text_value(1)) {
-                Some(port) => {
-                    let info = JoinInfo {
-                        host: self.join_model.text_value(0).trim().to_string(),
-                        port,
-                        password: self.join_model.text_value(2).to_string(),
-                        name: self.join_model.text_value(3).to_string(),
-                    };
-                    self.session.address = info.host.clone();
-                    self.session.port = self.join_model.text_value(1).to_string();
-                    self.session.name = info.name.clone();
-                    self.session.save();
-                    self.start_join(eng, info);
-                }
-                None => {
-                    self.join_model.notice = Some(Notice::error(menu::PORT_ERROR.to_string()))
-                }
-            },
-            Some(MenuEvent::Back) => self.screen = Screen::Menu,
-            _ => {}
-        }
-    }
-
-    /// Settings screen: cycle values (what each row means stays here, not
-    /// in any mod), apply them live, persist on the way out.
-    fn update_settings(&mut self, eng: &mut Engine) {
-        let event = Self::drive(&mut self.mods, eng, &mut self.settings_model);
-        let mut back = false;
-        let mut changed = false;
-        match event {
-            Some(MenuEvent::Cycled(row, step)) => {
-                menu::apply_settings_cycle(&mut self.settings, row, step);
-                changed = true;
-            }
-            // The settings screen's only Action row is Back.
-            Some(MenuEvent::Chosen(_)) | Some(MenuEvent::Back) => back = true,
-            _ => {}
-        }
-        // Apply every frame — the engine no-ops unchanged values, so toggles
-        // take effect immediately while arrowing through the menu. Rebuild the
-        // value strings AFTER applying, so hardware clamps (e.g. 8x MSAA on a
-        // 4x device) show what actually took.
-        let before = (self.settings.msaa, self.settings.render_scale);
-        self.settings.apply(eng);
-        // apply() can write back hardware-clamped values with no event this
-        // frame (e.g. a hand-edited 8x MSAA config on a 4x device) — refresh
-        // whenever the shown values went stale, not just on Cycled.
-        if changed || (self.settings.msaa, self.settings.render_scale) != before {
-            self.refresh_settings_menu();
-        }
-        if back {
-            self.settings.save();
-            self.screen = Screen::Menu;
-        }
+    /// Return to the start menu with an optional notice (e.g. a failed connect).
+    fn to_menu(&mut self, notice: Option<String>) {
+        self.active = None;
+        self.saves = save::list();
+        self.screen = Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::with_notice(notice))));
     }
 
     /// Spin up a fresh integrated server and join it on loopback. Any previous host
@@ -460,13 +351,13 @@ impl App {
         }
     }
 
-    /// Build the local world from the server's seed and spawn, then enter play with
-    /// the connection attached.
+    /// Join a remote world via an existing connection.
     fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection) {
         let world = World::new(conn.seed());
         let player = Player::new(conn.spawn());
         // A networked world is a live mirror, not a save — per-world mod state
         // starts clean, but the player's enable/disable choices persist.
+        self.active = None;
         self.mods.reset_state();
         let game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
         self.enter_game(eng, game);
@@ -474,9 +365,7 @@ impl App {
 
     /// Report a connection/host failure and return to the menu.
     fn fail_to_menu(&mut self, message: String) {
-        self.status = Some(message);
-        self.refresh_main_menu();
-        self.screen = Screen::Menu;
+        self.to_menu(Some(message));
     }
 
     /// Create a fresh world with a time-seeded generator and enter it.
@@ -484,20 +373,47 @@ impl App {
         let seed = fresh_seed();
         let world = World::new(seed);
         let player = spawn_player(&world);
-        let name = save::next_new_name();
+        let id = save::fresh_id();
+        let now = save::unix_now();
+        self.active = Some(ActiveSlot::new(
+            id.clone(),
+            SaveMeta {
+                name: id.as_str().to_string(),
+                seed,
+                created: now,
+                last_played: now,
+                playtime_secs: 0,
+                edit_count: 0,
+            },
+        ));
 
         // A new world starts from a clean default mod set (empty inventory, etc.);
         // the mod menu's enable/disable choices persist.
         self.mods.reset_state();
-        self.enter_game(eng, Game::new(world, player, name));
+        self.enter_game(eng, Game::new(world, player, id.as_str().to_string()));
     }
 
     /// Load an existing save and enter it. Stays on the menu if loading fails.
     fn load_world(&mut self, eng: &mut Engine, name: &str) {
+        let id = match SlotId::new(name) {
+            Ok(id) => id,
+            Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
+        };
         self.mods.reset_state();
-        match save::load(name, &mut self.mods) {
-            Ok((world, player)) => {
-                self.enter_game(eng, Game::new(world, player, name.to_string()))
+        match save::load(&id, &mut self.mods) {
+            Ok((world, player, meta, report)) => {
+                self.active = Some(ActiveSlot::new(id.clone(), meta));
+                let mut game = Game::new(world, player, id.as_str().to_string());
+                // Degraded loads still enter the world, but say so.
+                if report.source == save::Source::Backup {
+                    game.notify("* save was unreadable — restored from the backup");
+                }
+                if let Some((recovered, expected)) = report.salvage {
+                    game.notify(format!(
+                        "* save was damaged — recovered {recovered} of {expected} edits"
+                    ));
+                }
+                self.enter_game(eng, game)
             }
             Err(e) => self.fail_to_menu(format!("could not load {name}: {e}")),
         }
@@ -507,82 +423,97 @@ impl App {
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
         game.world_mut().set_view_radius(self.settings.render_distance);
         game.world_mut().set_lighting(self.settings.lighting, eng);
+        // World-construction lanes apply on entry, before streaming spins.
+        let render = self.settings.render_config();
+        game.world_mut().set_render_lanes(render.occlusion, render.lod2);
+        game.set_render_config(render);
         // Saves and servers can place the player far from the pre-generated
         // origin; make the ground under them real before physics runs.
         let pos = game.player().position;
         game.world_mut().prepare_around(pos);
-        game.on_enter(eng);
-        self.game = Some(game);
-        self.screen = Screen::Playing;
+        game.on_enter(eng, &mut self.router);
+        self.screen = Screen::Playing(Box::new(game));
     }
 
-    /// In-world logic; leaves to the menu (autosaving) when the game signals it.
+    /// In-world update: run the game and handle autosave.
     fn update_playing(&mut self, eng: &mut Engine) {
-        let signal = match &mut self.game {
-            Some(game) => game.update(eng, &mut self.mods, &mut self.settings),
-            None => Signal::ExitToMenu,
+        let dt = eng.frame_time() as f64;
+        let Screen::Playing(game) = &mut self.screen else {
+            return;
         };
+        let signal = game.update(eng, &mut self.router, &mut self.mods, &mut self.settings);
         if let Signal::ExitToMenu = signal {
-            self.autosave();
-            if let Some(game) = &mut self.game {
+            self.flush_save();
+            if let Screen::Playing(game) = &mut self.screen {
                 // Return the world's GPU meshes to the engine before dropping it.
                 game.free_gpu(eng);
             }
             eng.enable_cursor();
-            self.game = None;
-            self.refresh_main_menu();
-            self.screen = Screen::Menu;
+            self.to_menu(None); // drops the Box<Game>
+            return;
+        }
+        // Periodic autosave on edits; bench/multiplayer never save.
+        if self.bench.is_some() {
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        active.playtime += dt;
+        active.meta.playtime_secs = active.playtime as u64;
+        let ActiveSlot { id, meta, autosaver, .. } = active;
+        let tick = autosaver.tick(id, game.world().edit_generation(), || {
+            save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
+        });
+        if let Tick::Finished(Err(e)) = tick {
+            game.notify(format!("* autosave failed: {e}"));
         }
     }
 
-    /// Mod-menu logic; Esc (or h/Backspace) returns to the start menu. A
-    /// toggle takes effect immediately — switching the "Menus" mod off here
-    /// flips the very next frame's driving and drawing to the core fallback.
-    fn update_mods(&mut self, eng: &mut Engine) {
-        match Self::drive(&mut self.mods, eng, &mut self.mods_model) {
-            Some(MenuEvent::Toggled(index)) => {
-                self.mods.toggle(index);
-                // Rebuild from the source of truth (the driver only flipped
-                // the displayed state).
-                self.refresh_mods_menu();
-            }
-            Some(MenuEvent::Back) => self.screen = Screen::Menu,
-            _ => {}
+    /// Synchronously write the singleplayer world (networked and bench worlds
+    /// are never saved).
+    fn flush_save(&mut self) {
+        let Screen::Playing(game) = &self.screen else {
+            return;
+        };
+        if game.is_multiplayer() || self.bench.is_some() {
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        active.meta.playtime_secs = active.playtime as u64;
+        let ActiveSlot { id, meta, autosaver, .. } = active;
+        if let Err(e) = autosaver.flush_now(id, game.world().edit_generation(), || {
+            save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
+        }) {
+            eprintln!("could not save {id}: {e}");
         }
     }
 
-    /// Save the open world, if any (best-effort — a failed save shouldn't crash).
-    /// Networked worlds are server mirrors, not local saves, so they're never written.
-    fn autosave(&mut self) {
-        if let Some(game) = &self.game {
-            if game.is_multiplayer() {
-                return;
-            }
-            let _ = save::save(game.save_name(), game.world(), game.player(), &self.mods);
-        }
-    }
-
-    /// Draw the active screen. Every menu screen goes through the mod layer
-    /// (or the core fallback); the connect/host status line rides in the main
-    /// model's `error`, so the renderer — whichever one — shows it.
+    /// Draw the active screen (game or menu).
     fn draw(&mut self, eng: &mut Engine) {
         let (w, h) = (eng.screen_width(), eng.screen_height());
-        let model = match self.screen {
-            Screen::Playing => {
-                let fov = self.settings.fov;
-                if let Some(game) = &mut self.game {
-                    game.draw(eng, &mut self.mods, fov);
-                }
-                return;
-            }
-            Screen::Menu => &self.main_model,
-            Screen::Mods => &self.mods_model,
-            Screen::Host => &self.host_model,
-            Screen::Join => &self.join_model,
-            Screen::Settings => &self.settings_model,
-        };
-        let mut f = eng.begin_frame(MENU_CLEAR);
-        Self::draw_model(&mut self.mods, &mut f, model, w, h);
+        if let Screen::Playing(game) = &mut self.screen {
+            let fov = self.settings.fov;
+            let shake = self.settings.shake;
+            game.draw(eng, &mut self.mods, fov, shake);
+            return;
+        }
+        // Mods snapshot avoids borrow conflict between theme and view.
+        let mods = ModRow::snapshot(&self.mods);
+        let fallback = DefaultTheme;
+        let theme: &dyn MenuTheme = self.mods.menu_theme().unwrap_or(&fallback);
+        let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
+        if let Screen::Menus(stack) = &self.screen {
+            let ctx = Ctx {
+                settings: &mut self.settings,
+                saves: &self.saves,
+                mods: &mods,
+                session: &self.session,
+            };
+            stack.draw(&ctx, theme, &mut f, w, h);
+        }
     }
 }
 

@@ -3,40 +3,33 @@
 //! collapses the feature list into.
 //!
 //! Only two things are inputs the world shares: [`SkyClock`] (the "when") and
-//! [`Weather`]. Everything else derives. [`SkyEnv`] is the sole output edge into
-//! the mesh pipeline. Drawing a real gradient dome, sun disc, stars, and clouds
-//! is deferred behind [`Sky::draw`], which is a no-op until the engine grows a
-//! background pass — the seams here do not change when it lands.
+//! [`Weather`]. Everything else derives. The lighting edge into voxel shading is
+//! [`crate::frame_snapshot::compose`] → the per-frame UBO; this module
+//! owns [`Sky::clear`] (flat clear) and [`Sky::draw`] (the procedural
+//! background pass).
 mod atmosphere;
 mod clock;
-mod env;
+pub mod palette;
 mod weather;
 
 pub use atmosphere::Atmosphere;
+pub use palette::{Anchor, Palette, Role};
 pub use clock::{DayLength, SkyClock};
-pub use env::SkyEnv;
 pub use weather::{Precip, Weather};
 
-use voxel_engine::{Color, Frame3D, SkyDesc, Vec3};
+use voxel_engine::{Frame3D, LinearRgb, SkyDesc};
 
-/// The warm horizon glow smeared toward the sun. It is strongest at low sun
-/// (sunrise/sunset) and cools toward pale daylight as the sun climbs, so a
-/// midday sky glows only faintly while dawn/dusk flare orange.
-fn sun_tint(daylight: f32) -> Color {
-    let warm = Color::rgb(240, 150, 70);
-    let pale = Color::rgb(210, 205, 200);
+use crate::sky::palette::Rgb;
+
+/// The warm sun-disc tint. Authored as display-space sRGB literals, decoded to
+/// linear, and handed to the engine boundary UNCHANGED (`to_linear`, no clamp) —
+/// warm orange at low sun (sunrise/sunset), cooling toward pale as it climbs.
+fn sun_tint(daylight: f32) -> LinearRgb {
     let t = daylight.clamp(0.0, 1.0);
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-    Color::rgb(
-        mix(warm.r, pale.r),
-        mix(warm.g, pale.g),
-        mix(warm.b, pale.b),
-    )
+    Rgb::from_srgb8(240, 150, 70)
+        .lerp(Rgb::from_srgb8(210, 205, 200), t)
+        .to_linear()
 }
-
-/// Base exponential fog density in clear weather. Tuned so terrain fades into the
-/// horizon near the edge of a typical view radius rather than cutting off.
-const FOG_BASE: f32 = 0.0009;
 
 /// The whole sky state, owned by the game.
 #[derive(Default)]
@@ -59,41 +52,20 @@ impl Sky {
     }
 
     /// The flat clear colour for [`Engine::begin_frame`](voxel_engine::Engine::begin_frame).
-    pub fn clear(&self) -> Color {
+    pub fn clear(&self) -> LinearRgb {
         self.atmosphere.clear(self.clock.sun_dir())
     }
 
-    /// This frame's contribution to voxel lighting.
-    pub fn env(&self) -> SkyEnv {
-        SkyEnv::resolve(&self.clock, &self.atmosphere, &self.weather)
-    }
-
-    /// Horizon fog colour and density (weather thickens it).
-    pub fn fog(&self) -> (Color, f32) {
-        (
-            self.atmosphere.horizon(self.clock.sun_dir()),
-            FOG_BASE + self.weather.fog_bonus(),
-        )
-    }
-
-    /// Push the frame's sky lighting and fog into an active 3D scope. Call once
-    /// per frame inside `begin_3d`, before or after world geometry.
-    pub fn apply(&self, f: &mut Frame3D) {
-        let env = self.env();
-        let (fog_color, fog_density) = self.fog();
-        f.set_sky_light(env.sun_light, env.ambient, fog_color, fog_density);
-    }
-
-    /// Draw the procedural sky: gradient, horizon glow, and sun disc.
+    /// Draw the procedural sky. Only sun geometry + disc tint cross here; the
+    /// gradient/glow colours are read GPU-side from the shared per-frame UBO (the
+    /// same linear source the terrain fog reads), so the sky and the fog
+    /// it blends into cannot diverge.
     pub fn draw(&self, f: &mut Frame3D) {
         let sun = self.clock.sun_dir();
         let daylight = self.clock.daylight();
         f.set_sky(SkyDesc {
             sun_dir: sun,
-            zenith: self.atmosphere.radiance(Vec3::Y, sun),
-            horizon: self.atmosphere.horizon(sun),
             sun_tint: sun_tint(daylight),
-            exposure: 0.6 + 0.4 * daylight,
             sun_angular_radius: 0.03,
         });
     }

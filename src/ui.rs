@@ -11,7 +11,9 @@
 //!   frame drives every text field in the game the same way.
 use std::collections::VecDeque;
 
-use voxel_engine::{Color, Engine, Frame, Key};
+use voxel_engine::{Color, Frame};
+
+use crate::input::intent::EditKey;
 
 /// A screen-space size or offset in pixels, `(x, y)`. Kept as a plain tuple so
 /// this module needs no vector-math dependency of its own.
@@ -93,29 +95,6 @@ impl Anchor {
     }
 }
 
-/// Semantic UI colours: call sites ask for a *role*, not a raw RGB, so a palette
-/// swap can't miss a site and there are no scattered `Color::` literals.
-#[derive(Clone, Copy)]
-pub struct Palette {
-    pub text: Color,
-    pub muted: Color,
-    pub accent: Color,
-    pub good: Color,
-    pub warn: Color,
-    pub bad: Color,
-}
-
-impl Palette {
-    pub const DEFAULT: Self = Self {
-        text: Color::WHITE,
-        muted: Color::RAYWHITE,
-        accent: Color::SKYBLUE,
-        good: Color::LIME,
-        warn: Color::GOLD,
-        bad: Color::SALMON,
-    };
-}
-
 /// The aiming reticle, as data: swap the value to restyle it.
 #[derive(Clone, Copy)]
 pub struct Crosshair {
@@ -177,7 +156,6 @@ impl HudMode {
 /// The whole in-world UI look, threaded through drawing. `scale` routes every font
 /// size; `hud` is the master visibility cycle.
 pub struct Theme {
-    pub palette: Palette,
     pub scale: f32,
     pub crosshair: Crosshair,
     pub hud: HudMode,
@@ -186,7 +164,6 @@ pub struct Theme {
 impl Theme {
     pub fn new() -> Self {
         Self {
-            palette: Palette::DEFAULT,
             scale: 1.0,
             crosshair: Crosshair::DEFAULT,
             hud: HudMode::Full,
@@ -225,41 +202,149 @@ pub fn label(
     let fs = theme.fs(base_fs);
     let w = f.measure_text(text, fs);
     let (x, y) = at.origin(screen, (w, fs), off);
-    crate::console::shadowed(f, text, x, y, fs, color);
+    shadowed(f, text, x, y, fs, color);
 }
 
-/// The semantic role of a run of console text — what it *means*, not what colour
-/// it is. Rendering resolves a role to a colour through [`Role::color`], so a line
-/// can only ever be an on-palette colour and the command layer speaks meaning
-/// (`Error` vs `System`) instead of pixels.
+/// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
+/// The base text-draw primitive: every UI string in the game goes through here.
+pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
+    f.draw_text(text, x + 1, y + 1, font_size, Color::new(0, 0, 0, 180));
+    f.draw_text(text, x, y, font_size, color);
+}
+
+// ---------------------------------------------------------------------------
+// HUD widget vocabulary. A mod describes *what* to show as data ([`HudElement`]s)
+// and never draws — [`render_hud`] is the only code that touches the frame, so
+// panel chrome, ellipsis, and scaling live in exactly one place and a new mod
+// can't reinvent (or misplace) any of it. The vocabulary is deliberately closed:
+// a screen-anchored [`Label`](HudElement::Label) and a boxed [`Panel`].
+// ---------------------------------------------------------------------------
+
+/// One panel row's text plus its emphasis. The panel resolves the role to a
+/// colour and ellipsizes the text to the panel width.
+#[derive(Clone)]
+pub struct Row {
+    pub text: String,
+    pub role: Role,
+}
+
+impl Row {
+    pub fn new(role: Role, text: impl Into<String>) -> Self {
+        Self { text: text.into(), role }
+    }
+}
+
+/// Shared panel rhythm: one padding/font/line-height for every HUD panel, so
+/// panels line up and their heights are computed identically.
+pub const PANEL_PAD: i32 = 8;
+pub const PANEL_FONT: i32 = 18;
+pub const PANEL_LINE: i32 = PANEL_FONT + 4;
+/// The translucent background behind every HUD panel.
+pub const PANEL_BG: Color = Color::new(8, 10, 14, 200);
+
+/// A translucent HUD box at an absolute screen position: a background sized to
+/// its content, header line(s), a small gap, then body rows. Every row is
+/// ellipsized to fit `width`. The single owner of panel chrome.
+pub struct Panel {
+    pub at: Px,
+    pub width: i32,
+    pub header: Vec<Row>,
+    pub rows: Vec<Row>,
+}
+
+impl Panel {
+    /// Total pixel height of the drawn box (padding + header + gap + body). The
+    /// body reserves at least one line so an empty panel still frames its box.
+    pub fn height(&self) -> i32 {
+        let body = self.rows.len().max(1) as i32;
+        PANEL_PAD * 2 + self.header.len() as i32 * PANEL_LINE + 2 + body * PANEL_LINE
+    }
+
+    fn draw(&self, f: &mut Frame) {
+        let (x, y) = self.at;
+        f.draw_rect(x, y, self.width, self.height(), PANEL_BG);
+        let text_x = x + PANEL_PAD;
+        let max_chars = ((self.width - PANEL_PAD * 2) / PANEL_FONT).max(1) as usize;
+        let mut cy = y + PANEL_PAD;
+        let mut row = |r: &Row, cy: i32| {
+            shadowed(f, &ellipsize(&r.text, max_chars), text_x, cy, PANEL_FONT, r.role.color());
+        };
+        for r in &self.header {
+            row(r, cy);
+            cy += PANEL_LINE;
+        }
+        cy += 2;
+        for r in &self.rows {
+            row(r, cy);
+            cy += PANEL_LINE;
+        }
+    }
+}
+
+/// One thing a mod contributes to the HUD. Closed on purpose (see the module
+/// note): a screen-anchored label or a boxed panel — nothing that lets a mod
+/// draw arbitrarily.
+pub enum HudElement {
+    /// A screen-anchored line of text, scaled by the theme.
+    Label {
+        at: Anchor,
+        off: Px,
+        base_fs: i32,
+        role: Role,
+        text: String,
+    },
+    /// A translucent content box at an absolute position.
+    Panel(Panel),
+}
+
+/// Draw every mod's contributed HUD. The only place mod HUD reaches the frame.
+pub fn render_hud(f: &mut Frame, theme: &Theme, screen: Px, elements: &[HudElement]) {
+    for el in elements {
+        match el {
+            HudElement::Label { at, off, base_fs, role, text } => {
+                label(f, theme, screen, *at, *off, *base_fs, role.color(), text)
+            }
+            HudElement::Panel(p) => p.draw(f),
+        }
+    }
+}
+
+/// The style role of a run of UI text — its *emphasis*, not a raw RGB. Rendering
+/// resolves a role to a colour through [`Role::color`], so text can only ever be an
+/// on-palette colour and call sites speak emphasis (`Danger` vs `Dim`) instead of
+/// pixels. This is the single colour table for the whole UI: HUD, console, menus,
+/// and mods all ask for a role, never a raw `Color::`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
-    /// A chat message body.
-    Chat,
-    /// The echo of a command the user submitted.
-    Command,
-    /// Neutral system/status text or normal command output.
-    System,
-    /// A rejected input or error.
-    Error,
-    /// A player name.
-    Name,
-    /// The `[global]` chat-scope tag.
-    Global,
-    /// A highlighted value inside otherwise-neutral text.
-    Value,
+    /// Primary text: coords, labels, the brightest normal text.
+    Primary,
+    /// Normal body text (chat, list rows).
+    Muted,
+    /// De-emphasised text (system output, secondary detail).
+    Dim,
+    /// Unavailable / inactive text (a disabled action, an unselected row).
+    Disabled,
+    /// The active/selected item, links, player names.
+    Accent,
+    /// A positive value or state (counts, equipped, success).
+    Positive,
+    /// A caution: the `[global]` tag, a header, a soft warning.
+    Warning,
+    /// An error or destructive outcome.
+    Danger,
 }
 
 impl Role {
     pub fn color(self) -> Color {
         match self {
-            Role::Chat => Color::RAYWHITE,
-            Role::Command => Color::SKYBLUE,
-            Role::System => Color::LIGHTGRAY,
-            Role::Error => Color::SALMON,
-            Role::Name => Color::SKYBLUE,
-            Role::Global => Color::GOLD,
-            Role::Value => Color::LIME,
+            Role::Primary => Color::WHITE,
+            Role::Muted => Color::RAYWHITE,
+            Role::Dim => Color::LIGHTGRAY,
+            Role::Disabled => Color::GRAY,
+            Role::Accent => Color::SKYBLUE,
+            Role::Positive => Color::LIME,
+            Role::Warning => Color::GOLD,
+            Role::Danger => Color::SALMON,
         }
     }
 }
@@ -363,16 +448,128 @@ pub enum Completion {
     None,
 }
 
-/// An editable single line of text.
+/// Editable line of text with a boundary-safe caret and byte cap.
 ///
 /// The cursor is a byte offset kept on a `char` boundary by construction — every
-/// mutation goes through a method that steps by whole characters, so UTF-8 text
-/// can never panic a `String::insert`/`remove`. History recall stashes the live
-/// line as a draft so walking back down restores it.
-pub struct TextInput {
+/// mutation steps by whole characters, so UTF-8 text can never panic a
+/// `String::insert`/`remove`. The text and caret live in one place so there's a
+/// single source of truth for editing state.
+pub struct EditBuf {
     text: String,
     cursor: usize,
     max: usize,
+}
+
+impl EditBuf {
+    pub fn new(max: usize) -> Self {
+        Self { text: String::new(), cursor: 0, max }
+    }
+
+    /// A buffer pre-filled with `init` (truncated to the cap on a char boundary),
+    /// caret at the end.
+    pub fn with(init: &str, max: usize) -> Self {
+        let mut b = Self::new(max);
+        b.set(init);
+        b
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Caret as a char index, for drawing a cursor mid-string.
+    pub fn caret_chars(&self) -> usize {
+        self.text[..self.cursor].chars().count()
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Replace the whole value (truncated to the cap), caret to the end.
+    pub fn set(&mut self, s: &str) {
+        let mut s = s.to_string();
+        while s.len() > self.max {
+            s.pop();
+        }
+        self.cursor = s.len();
+        self.text = s;
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Insert one printable char at the caret if it still fits the cap.
+    pub fn insert_char(&mut self, c: char) -> bool {
+        if c.is_control() || self.text.len() + c.len_utf8() > self.max {
+            return false;
+        }
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
+            self.text.remove(i);
+            self.cursor = i;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn delete_forward(&mut self) {
+        if self.cursor < self.text.len() {
+            self.text.remove(self.cursor);
+        }
+    }
+
+    /// Delete back to the start of the previous word.
+    pub fn delete_word(&mut self) {
+        let left = &self.text[..self.cursor];
+        let trimmed = left.trim_end_matches(char::is_whitespace);
+        let start = match trimmed.rfind(char::is_whitespace) {
+            Some(i) => i + trimmed[i..].chars().next().map_or(1, char::len_utf8),
+            None => 0,
+        };
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    pub fn left(&mut self) {
+        if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
+            self.cursor = i;
+        }
+    }
+
+    pub fn right(&mut self) {
+        if let Some(c) = self.text[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.text.len();
+    }
+}
+
+/// An editable single line of text.
+///
+/// Wraps an [`EditBuf`] for the text/caret, and adds history recall (walking back
+/// down restores the live draft) and optional Tab-completion.
+pub struct TextInput {
+    buf: EditBuf,
     history: Ring<String>,
     /// `Some(i)` while browsing history at index `i`; `None` when editing live.
     scrub: Option<usize>,
@@ -385,9 +582,7 @@ pub struct TextInput {
 impl TextInput {
     pub fn new(max: usize) -> Self {
         Self {
-            text: String::new(),
-            cursor: 0,
-            max,
+            buf: EditBuf::new(max),
             history: Ring::new(64),
             scrub: None,
             draft: String::new(),
@@ -403,26 +598,24 @@ impl TextInput {
     }
 
     pub fn text(&self) -> &str {
-        &self.text
+        self.buf.text()
     }
 
     /// Byte offset of the cursor within [`text`](Self::text), on a char boundary.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.buf.cursor()
     }
 
     /// Clear the line (but keep history), e.g. when the field is opened.
     pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
+        self.buf.clear();
         self.scrub = None;
         self.draft.clear();
     }
 
     /// Replace the line's contents and park the cursor at the end.
     pub fn set(&mut self, s: impl Into<String>) {
-        self.text = s.into();
-        self.cursor = self.text.len();
+        self.buf.set(&s.into());
         self.scrub = None;
     }
 
@@ -431,110 +624,55 @@ impl TextInput {
         self.notice.take()
     }
 
-    /// Drive one frame of editing. Returns the submitted line (trimmed,
-    /// non-empty) when Enter is pressed, otherwise `None`. Esc is left to the
-    /// owner so it can decide what closing a field means.
-    pub fn handle(&mut self, eng: &Engine) -> Option<String> {
-        let ctrl = eng.is_key_down(Key::LeftControl) || eng.is_key_down(Key::RightControl);
-
-        // Typed characters. While Ctrl is held we skip insertion so chords like
-        // Ctrl+U don't also deposit a stray glyph.
-        while let Some(c) = eng.get_char_pressed() {
-            if !ctrl && !c.is_control() && self.text.len() + c.len_utf8() <= self.max {
-                self.text.insert(self.cursor, c);
-                self.cursor += c.len_utf8();
+    /// Drive one frame of editing with typed chars and at most one [`EditKey`].
+    /// Returns the submitted line (trimmed, non-empty) on [`EditKey::Submit`],
+    /// otherwise `None`. Esc is left to the owner so it can decide what closing
+    /// a field means.
+    pub fn handle(&mut self, chars: &[char], edit: Option<EditKey>) -> Option<String> {
+        // Control chars are filtered upstream and by insert_char, so chords never deposit a stray glyph.
+        for &c in chars {
+            if self.buf.insert_char(c) {
                 self.scrub = None;
             }
         }
 
-        if eng.is_key_pressed(Key::Left) {
-            self.move_left();
-        }
-        if eng.is_key_pressed(Key::Right) {
-            self.move_right();
-        }
-        if eng.is_key_pressed(Key::Home) {
-            self.cursor = 0;
-        }
-        if eng.is_key_pressed(Key::End) {
-            self.cursor = self.text.len();
-        }
-        if eng.is_key_pressed(Key::Backspace) {
-            if ctrl {
-                self.delete_word();
-            } else {
-                self.backspace();
+        match edit {
+            Some(EditKey::Left) => self.buf.left(),
+            Some(EditKey::Right) => self.buf.right(),
+            Some(EditKey::Home) => self.buf.home(),
+            Some(EditKey::End) => self.buf.end(),
+            Some(EditKey::Backspace) => {
+                self.buf.backspace();
+                self.scrub = None;
             }
-        }
-        if eng.is_key_pressed(Key::Delete) {
-            self.delete_forward();
-        }
-        if ctrl && eng.is_key_pressed(Key::U) {
-            self.text.clear();
-            self.cursor = 0;
-            self.scrub = None;
-        }
-        if eng.is_key_pressed(Key::Up) {
-            self.history_prev();
-        }
-        if eng.is_key_pressed(Key::Down) {
-            self.history_next();
-        }
-        if eng.is_key_pressed(Key::Tab) {
-            self.try_complete();
-        }
-        if eng.is_key_pressed(Key::Enter) {
-            let line = std::mem::take(&mut self.text).trim().to_string();
-            self.cursor = 0;
-            self.scrub = None;
-            self.draft.clear();
-            if !line.is_empty() {
-                self.push_history(line.clone());
-                return Some(line);
+            Some(EditKey::DelWord) => {
+                self.buf.delete_word();
+                self.scrub = None;
             }
+            Some(EditKey::Delete) => {
+                self.buf.delete_forward();
+                self.scrub = None;
+            }
+            Some(EditKey::ClearLine) => {
+                self.buf.clear();
+                self.scrub = None;
+            }
+            Some(EditKey::HistoryUp) => self.history_prev(),
+            Some(EditKey::HistoryDown) => self.history_next(),
+            Some(EditKey::Complete) => self.try_complete(),
+            Some(EditKey::Submit) => {
+                let line = self.buf.text().trim().to_string();
+                self.buf.clear();
+                self.scrub = None;
+                self.draft.clear();
+                if !line.is_empty() {
+                    self.push_history(line.clone());
+                    return Some(line);
+                }
+            }
+            None => {}
         }
         None
-    }
-
-    fn move_left(&mut self) {
-        if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.cursor = i;
-        }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(c) = self.text[self.cursor..].chars().next() {
-            self.cursor += c.len_utf8();
-        }
-    }
-
-    fn backspace(&mut self) {
-        if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.text.remove(i);
-            self.cursor = i;
-            self.scrub = None;
-        }
-    }
-
-    fn delete_forward(&mut self) {
-        if self.cursor < self.text.len() {
-            self.text.remove(self.cursor);
-            self.scrub = None;
-        }
-    }
-
-    /// Delete from the cursor back to the start of the previous word: skip any
-    /// run of whitespace, then the word before it.
-    fn delete_word(&mut self) {
-        let left = &self.text[..self.cursor];
-        let trimmed = left.trim_end_matches(char::is_whitespace);
-        let start = match trimmed.rfind(char::is_whitespace) {
-            Some(i) => i + trimmed[i..].chars().next().map_or(1, char::len_utf8),
-            None => 0,
-        };
-        self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
-        self.scrub = None;
     }
 
     fn history_prev(&mut self) {
@@ -543,7 +681,7 @@ impl TextInput {
         }
         let next = match self.scrub {
             None => {
-                self.draft = self.text.clone();
+                self.draft = self.buf.text().to_string();
                 self.history.len() - 1
             }
             Some(0) => 0,
@@ -551,8 +689,7 @@ impl TextInput {
         };
         self.scrub = Some(next);
         if let Some(entry) = self.history.get(next) {
-            self.text = entry.clone();
-            self.cursor = self.text.len();
+            self.buf.set(entry);
         }
     }
 
@@ -563,14 +700,13 @@ impl TextInput {
         if i + 1 < self.history.len() {
             self.scrub = Some(i + 1);
             if let Some(entry) = self.history.get(i + 1) {
-                self.text = entry.clone();
-                self.cursor = self.text.len();
+                self.buf.set(entry);
             }
         } else {
             // Past the newest entry: back to the line we were typing.
             self.scrub = None;
-            self.text = std::mem::take(&mut self.draft);
-            self.cursor = self.text.len();
+            let draft = std::mem::take(&mut self.draft);
+            self.buf.set(&draft);
         }
     }
 
@@ -585,7 +721,7 @@ impl TextInput {
         let Some(f) = self.completer else {
             return;
         };
-        match f(&self.text) {
+        match f(self.buf.text()) {
             Completion::Full(s) => self.set(s),
             Completion::Ambiguous(prefix, cands) => {
                 self.set(prefix);

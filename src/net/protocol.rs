@@ -14,6 +14,8 @@ use std::io::{self, Read, Write};
 
 use voxel_engine::DVec3;
 
+use crate::presence::Stance;
+
 use super::MAX_FRAME;
 
 /// A message from a client to the server.
@@ -22,7 +24,11 @@ pub enum ClientMessage {
     /// First frame after connecting: identify and authenticate.
     Hello { protocol: u32, name: String, password: String },
     /// The client's own player state this tick (client simulates its own player).
-    Move { pos: DVec3, yaw: f32, pitch: f32 },
+    Move { pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+    /// Visual-only event broadcast to other players.
+    Swing,
+    /// Latency probe; the server echoes `nonce` back in [`ServerMessage::Pong`].
+    Ping { nonce: u32 },
     /// The client changed a block, described by portable spec (see [`save`](crate::save)).
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line on the given [`channel`](super::chat).
@@ -46,7 +52,11 @@ pub enum ServerMessage {
     /// Another player disconnected.
     PeerLeft { id: u32 },
     /// Another player moved.
-    PeerMove { id: u32, pos: DVec3, yaw: f32, pitch: f32 },
+    PeerMove { id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+    /// Another player swung their arm.
+    PeerSwing { id: u32 },
+    /// Echo of a [`ClientMessage::Ping`], carrying its `nonce` unchanged.
+    Pong { nonce: u32 },
     /// A block changed somewhere in the world (from a peer or the server).
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line to display.
@@ -63,6 +73,8 @@ mod tag {
     pub const EDIT: u8 = 2;
     pub const CHAT: u8 = 3;
     pub const SET_TIME: u8 = 4;
+    pub const SWING: u8 = 5;
+    pub const PING: u8 = 6;
 
     pub const WELCOME: u8 = 0;
     pub const REJECT: u8 = 1;
@@ -73,6 +85,8 @@ mod tag {
     pub const S_EDIT: u8 = 6;
     pub const S_CHAT: u8 = 7;
     pub const S_TIME: u8 = 8;
+    pub const PEER_SWING: u8 = 9;
+    pub const PONG: u8 = 10;
 }
 
 impl ClientMessage {
@@ -86,11 +100,17 @@ impl ClientMessage {
                 w.str(name);
                 w.str(password);
             }
-            ClientMessage::Move { pos, yaw, pitch } => {
+            ClientMessage::Move { pos, yaw, pitch, stance } => {
                 w.u8(tag::MOVE);
                 w.vec3(*pos);
                 w.f32(*yaw);
                 w.f32(*pitch);
+                w.u8(stance.wire());
+            }
+            ClientMessage::Swing => w.u8(tag::SWING),
+            ClientMessage::Ping { nonce } => {
+                w.u8(tag::PING);
+                w.u32(*nonce);
             }
             ClientMessage::Edit { x, y, z, spec } => {
                 w.u8(tag::EDIT);
@@ -125,7 +145,10 @@ impl ClientMessage {
                 pos: r.vec3()?,
                 yaw: r.f32()?,
                 pitch: r.f32()?,
+                stance: Stance::from_wire(r.u8()?)?,
             },
+            tag::SWING => ClientMessage::Swing,
+            tag::PING => ClientMessage::Ping { nonce: r.u32()? },
             tag::EDIT => ClientMessage::Edit {
                 x: r.i32()?,
                 y: r.i32()?,
@@ -176,12 +199,21 @@ impl ServerMessage {
                 w.u8(tag::PEER_LEFT);
                 w.u32(*id);
             }
-            ServerMessage::PeerMove { id, pos, yaw, pitch } => {
+            ServerMessage::PeerMove { id, pos, yaw, pitch, stance } => {
                 w.u8(tag::PEER_MOVE);
                 w.u32(*id);
                 w.vec3(*pos);
                 w.f32(*yaw);
                 w.f32(*pitch);
+                w.u8(stance.wire());
+            }
+            ServerMessage::PeerSwing { id } => {
+                w.u8(tag::PEER_SWING);
+                w.u32(*id);
+            }
+            ServerMessage::Pong { nonce } => {
+                w.u8(tag::PONG);
+                w.u32(*nonce);
             }
             ServerMessage::Edit { x, y, z, spec } => {
                 w.u8(tag::S_EDIT);
@@ -233,7 +265,10 @@ impl ServerMessage {
                 pos: r.vec3()?,
                 yaw: r.f32()?,
                 pitch: r.f32()?,
+                stance: Stance::from_wire(r.u8()?)?,
             },
+            tag::PEER_SWING => ServerMessage::PeerSwing { id: r.u32()? },
+            tag::PONG => ServerMessage::Pong { nonce: r.u32()? },
             tag::S_EDIT => ServerMessage::Edit {
                 x: r.i32()?,
                 y: r.i32()?,
@@ -386,7 +421,10 @@ mod tests {
                 pos: DVec3::new(1.5, -2.0, 3.25),
                 yaw: 0.5,
                 pitch: -0.25,
+                stance: Stance::Sneaking,
             },
+            ClientMessage::Swing,
+            ClientMessage::Ping { nonce: 7 },
             ClientMessage::Edit { x: -4, y: 7, z: 900, spec: "natural:Stone".into() },
             ClientMessage::Chat { channel: 1, text: "hello world".into() },
             ClientMessage::SetTime { day: 0.5 },
@@ -418,7 +456,10 @@ mod tests {
                 pos: DVec3::new(9.0, 8.0, 7.0),
                 yaw: 1.0,
                 pitch: 0.1,
+                stance: Stance::Swimming,
             },
+            ServerMessage::PeerSwing { id: 3 },
+            ServerMessage::Pong { nonce: 7 },
             ServerMessage::Edit { x: 0, y: 0, z: 0, spec: "air".into() },
             ServerMessage::Chat {
                 from_id: 3,
@@ -439,7 +480,7 @@ mod tests {
         // part below survives exactly; an f32 wire would quantise it to a
         // multiple of 8. Round-trip both directions of the hot path.
         let pos = DVec3::new(1.0e8 + 0.123456789, -3_000.25, -(1.0e9 - 0.75));
-        let mv = ClientMessage::Move { pos, yaw: 1.0, pitch: -0.5 };
+        let mv = ClientMessage::Move { pos, yaw: 1.0, pitch: -0.5, stance: Stance::Standing };
         match ClientMessage::decode(&mv.encode()) {
             Some(ClientMessage::Move { pos: got, .. }) => {
                 assert_eq!(got.x.to_bits(), pos.x.to_bits());
@@ -448,7 +489,7 @@ mod tests {
             }
             other => panic!("bad decode: {other:?}"),
         }
-        let pm = ServerMessage::PeerMove { id: 7, pos, yaw: 0.0, pitch: 0.0 };
+        let pm = ServerMessage::PeerMove { id: 7, pos, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
         assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
         let wl = ServerMessage::Welcome { player_id: 1, seed: 3, spawn: pos };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));

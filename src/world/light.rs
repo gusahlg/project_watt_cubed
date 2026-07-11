@@ -20,6 +20,7 @@
 //! Propagation is a pure function of a [`Chunk`], [`FaceShell`] (neighbour
 //! light layers), and [`CeilingWindow`], exactly matching what [`propagate`]
 //! reads (interior voxels and face borders only).
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use crate::block::registry::HotTables;
@@ -35,6 +36,24 @@ pub const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
 const CS: i32 = CHUNK_SIZE as i32;
 /// Padded light shell edge: the 16 chunk cells plus one shell cell each side.
 const PADL: usize = CHUNK_SIZE + 2;
+/// Cells in one [`PaddedLight`] buffer.
+const PADL_VOL: usize = PADL * PADL * PADL;
+
+// Thread-local free list of [`PaddedLight`] backing buffers. Every `PaddedLight`
+// constructor (`dark`/`full`/`open_sky`/`capture`) allocated a fresh
+// `PADL_VOL`-cell `Box<[Lumel]>` per call — the per-job light-shell churn the
+// LOD-tile mesher pays in [`build_tile_mesh`](crate::world::lod) (via
+// `open_sky`) and the streamer pays per remesh (via `capture`). Buffers are
+// reclaimed on [`Drop`] and reused. Bounded ([`PLIGHT_POOL_CAP`]) so the
+// cross-thread path (a `capture`d shell built on the main thread and dropped on
+// a worker) can only ever migrate a handful of buffers into a worker's list
+// rather than growing without bound.
+thread_local! {
+    static PLIGHT_POOL: RefCell<Vec<Box<[Lumel]>>> = const { RefCell::new(Vec::new()) };
+}
+/// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
+/// single job holds at most one live shell at a time.
+const PLIGHT_POOL_CAP: usize = 4;
 
 /// Light value: 4-bit clamped to 0..=15. Every constructor clamps or is const-checked.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -128,6 +147,17 @@ impl PaddedLight {
         (x + 1) as usize + (z + 1) as usize * PADL + (y + 1) as usize * PADL * PADL
     }
 
+    /// A `PADL_VOL`-cell buffer, recycled from [`PLIGHT_POOL`] if one is available
+    /// (else freshly allocated). Contents are UNSPECIFIED — a recycled buffer
+    /// holds a previous job's light — so every caller must fully initialise it
+    /// (`fill` then, where partial, overwrite the touched cells) before use.
+    fn take_buf() -> Box<[Lumel]> {
+        PLIGHT_POOL
+            .with_borrow_mut(|p| p.pop())
+            .filter(|b| b.len() == PADL_VOL)
+            .unwrap_or_else(|| vec![Lumel::DARK; PADL_VOL].into_boxed_slice())
+    }
+
     /// Light at signed coord (x, y, z) in -1..=16.
     #[inline]
     pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> Lumel {
@@ -136,12 +166,16 @@ impl PaddedLight {
 
     /// An all-dark shell (no neighbour light anywhere) — the neutral settle path.
     pub fn dark() -> Self {
-        Self { cells: vec![Lumel::DARK; PADL * PADL * PADL].into() }
+        let mut cells = Self::take_buf();
+        cells.fill(Lumel::DARK); // clears any recycled contents
+        Self { cells }
     }
 
     /// An all-full-bright shell — the neutral mesher path (tests).
     pub fn full() -> Self {
-        Self { cells: vec![Lumel::FULL; PADL * PADL * PADL].into() }
+        let mut cells = Self::take_buf();
+        cells.fill(Lumel::FULL);
+        Self { cells }
     }
 
     /// Full skylight, no blocklight — the shell equivalent of
@@ -149,17 +183,17 @@ impl PaddedLight {
     /// surface approximations open to the sky with no emitters, so their shading
     /// tracks day/night via skylight instead of clamping to a fake full emitter.
     pub fn open_sky() -> Self {
-        Self {
-            cells: vec![Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }; PADL * PADL * PADL]
-                .into(),
-        }
+        let mut cells = Self::take_buf();
+        cells.fill(Lumel { sky: LightLevel::FULL, block: LightLevel::DARK });
+        Self { cells }
     }
 
     /// A shell filled from a per-cell closure over signed coords `-1..=16` — for
     /// exercising the mesher's smooth-light sampling with a known field.
     #[cfg(test)]
     pub fn from_fn(f: impl Fn(i32, i32, i32) -> Lumel) -> Self {
-        let mut cells = vec![Lumel::DARK; PADL * PADL * PADL];
+        let mut cells = Self::take_buf();
+        cells.fill(Lumel::DARK); // clear recycled contents; loop below covers every cell
         for y in -1..=CS {
             for z in -1..=CS {
                 for x in -1..=CS {
@@ -167,7 +201,7 @@ impl PaddedLight {
                 }
             }
         }
-        Self { cells: cells.into() }
+        Self { cells }
     }
 
     /// Copy the chunk and its shell out of the light field. `grid_at(dx, dy, dz)`
@@ -187,7 +221,11 @@ impl PaddedLight {
                 (0, c as usize)
             }
         };
-        let mut cells = vec![Lumel::DARK; PADL * PADL * PADL];
+        let mut cells = Self::take_buf();
+        // Missing neighbours must read DARK, and only present cells are written
+        // below, so a recycled buffer MUST be cleared first (else a prior job's
+        // light would leak into the unwritten shell cells — a silent visual bug).
+        cells.fill(Lumel::DARK);
         for y in -1..=CS {
             for z in -1..=CS {
                 for x in -1..=CS {
@@ -200,7 +238,20 @@ impl PaddedLight {
                 }
             }
         }
-        Self { cells: cells.into() }
+        Self { cells }
+    }
+}
+
+impl Drop for PaddedLight {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.cells);
+        if buf.len() == PADL_VOL {
+            PLIGHT_POOL.with_borrow_mut(|p| {
+                if p.len() < PLIGHT_POOL_CAP {
+                    p.push(buf);
+                }
+            });
+        }
     }
 }
 
@@ -285,6 +336,36 @@ impl CeilingWindow {
     }
 }
 
+/// Reusable flood scratch for [`propagate`]: the two per-channel level grids and
+/// the BFS frontier. Held thread-local so a worker's repeated `propagate` calls
+/// reuse one allocation each instead of allocating two `CHUNK_VOLUME` boxes and a
+/// growing `VecDeque` per job (the light-settle churn). Never shared or sent
+/// across threads (borrowed only for the duration of one `propagate` call), so it
+/// is sound to key on the calling worker.
+struct FloodScratch {
+    sky: Vec<LightLevel>,
+    block: Vec<LightLevel>,
+    queue: VecDeque<usize>,
+}
+
+thread_local! {
+    static FLOOD: RefCell<FloodScratch> = const {
+        RefCell::new(FloodScratch { sky: Vec::new(), block: Vec::new(), queue: VecDeque::new() })
+    };
+}
+
+/// Reset a channel grid to the all-dark initial state (every unseeded cell must
+/// read `DARK`), sizing it on first use. `fill` reuses the existing allocation
+/// when the length already matches — the common (post-warmup) case.
+fn reset_dark(v: &mut Vec<LightLevel>) {
+    if v.len() != CHUNK_VOLUME {
+        v.clear();
+        v.resize(CHUNK_VOLUME, LightLevel::DARK);
+    } else {
+        v.fill(LightLevel::DARK);
+    }
+}
+
 /// Recompute chunk light from scratch. Light removal needs no second pass:
 /// breaking emitters or placing blocks just lowers the grid. `world_y0` is chunk's Y origin.
 pub fn propagate(
@@ -302,8 +383,15 @@ pub fn propagate(
     };
 
     // --- Skylight ---------------------------------------------------------
-    let mut sky: Box<[LightLevel]> = vec![LightLevel::DARK; CHUNK_VOLUME].into();
-    let mut queue: VecDeque<usize> = VecDeque::new();
+    // Borrow the thread-local flood scratch out for the whole call (put back at
+    // the end). `sky`/`block` are reset to all-dark below; `queue` is emptied —
+    // so no stale flood state from a prior job survives.
+    let (mut sky, mut block, mut queue) = FLOOD.with_borrow_mut(|s| {
+        (std::mem::take(&mut s.sky), std::mem::take(&mut s.block), std::mem::take(&mut s.queue))
+    });
+    reset_dark(&mut sky);
+    reset_dark(&mut block);
+    queue.clear();
     // Seed 1: open sky floods down each column until the first opaque voxel
     // (classic heightmap seed, gated by ceiling). Deep chunks seed nothing here;
     // their light arrives from the +Y halo.
@@ -355,7 +443,8 @@ pub fn propagate(
     }
 
     // --- Blocklight -------------------------------------------------------
-    let mut block: Box<[LightLevel]> = vec![LightLevel::DARK; CHUNK_VOLUME].into();
+    // `block` was reset to all-dark above; the sky flood drained `queue`, but
+    // clear defensively before reseeding.
     queue.clear();
     for i in 0..CHUNK_VOLUME {
         let (x, y, z) = Chunk::local_of(i);
@@ -400,6 +489,13 @@ pub fn propagate(
     for i in 0..CHUNK_VOLUME {
         out.set(i, Lumel { sky: sky[i], block: block[i] });
     }
+
+    // Return the scratch buffers (with their capacity) for the next call.
+    FLOOD.with_borrow_mut(|s| {
+        s.sky = sky;
+        s.block = block;
+        s.queue = queue;
+    });
 }
 
 /// Seed border cells from neighbour shell faces (skylight full-strength from +Y).
@@ -495,6 +591,7 @@ mod tests {
             opaque: vec![false, true, false].into(), // id 1 opaque (stone), id 2 clear
             layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             emission: vec![0, 0, 15].into(),         // id 2 emits 15
+            water: vec![false, false, false].into(),
         }
     }
 

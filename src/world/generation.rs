@@ -81,13 +81,6 @@ pub trait TerrainGenerator {
         }
     }
 
-    /// Whether a LOD tile is uniformly one block. `(ox, oz)` is world min corner,
-    /// `cell` the stride, and `[y0, y1]` the sampled Y range. Returns `Some(id)`
-    /// to skip per-cell generation; None to sample each cell.
-    fn lod_tile_uniform(&self, _ox: i32, _oz: i32, _cell: i32, _y0: i32, _y1: i32) -> Option<BlockId> {
-        None
-    }
-
     /// Generate a whole 16-cube chunk's storage. The default densely evaluates
     /// [`block_at`](Self::block_at) and collapses to [`ChunkData::Uniform`] when
     /// every cell agrees; [`Terrain`] overrides it with shortcuts.
@@ -1293,34 +1286,6 @@ impl TerrainGenerator for Terrain {
         for (o, &wy) in out.iter_mut().zip(ys) {
             *o = self.cell_base(&p, wx, wy, wz, false);
         }
-    }
-
-    /// Fast path when tile is wholly above surface or below island band.
-    /// Checks if every cell is air or water (one block); None means per-cell sample.
-    fn lod_tile_uniform(&self, ox: i32, oz: i32, cell: i32, y0: i32, y1: i32) -> Option<BlockId> {
-        let half = cell / 2;
-        let cs = CHUNK_SIZE as i32;
-        let (mut h_max, mut w_min, mut w_max) = (i32::MIN, i32::MAX, i32::MIN);
-        for z in -1..=cs {
-            for x in -1..=cs {
-                let p = self.profile(ox + x * cell + half, oz + z * cell + half);
-                h_max = h_max.max(p.height);
-                w_min = w_min.min(p.water_level);
-                w_max = w_max.max(p.water_level);
-            }
-        }
-        // Footprint the profile scan covers: the tile grid plus its one-cell margin.
-        let span = (cs + 2) * cell;
-        let dims = (span, y1 - y0 + 1, span);
-        if y0 >= h_max + OVERHANG_REACH && !self.islands.possible(ox - cell + half, y0, oz - cell + half, dims) {
-            if y1 < w_min {
-                return Some(self.water);
-            }
-            if y0 >= w_max {
-                return Some(AIR);
-            }
-        }
-        None
     }
 
     /// Whole-chunk generation: sample the column profiles, then fill from them.

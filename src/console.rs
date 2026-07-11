@@ -10,9 +10,10 @@
 //! The editable line itself is a shared [`TextInput`], so cursor movement,
 //! history recall, word/line deletion, and Tab-completion all come for free and
 //! behave identically here and in any other text field.
-use voxel_engine::{Color, Engine, Frame, Key};
+use voxel_engine::{Color, Frame};
 
 use crate::command::COMMAND_NAMES;
+use crate::input::intent::EditKey;
 use crate::ui::{common_prefix, Completion, Line, Ring, Role, TextInput};
 
 /// Longest input line we accept.
@@ -60,12 +61,12 @@ impl Console {
 
     /// Append a system/status line (the default role).
     pub fn print(&mut self, line: impl Into<String>) {
-        self.push(Line::of(Role::System, line));
+        self.push(Line::of(Role::Dim, line));
     }
 
     /// Echo a command the user submitted.
     pub fn echo(&mut self, line: impl Into<String>) {
-        self.push(Line::of(Role::Command, format!("> {}", line.into())));
+        self.push(Line::of(Role::Accent, format!("> {}", line.into())));
     }
 
     /// Append a pre-built line — the entry point for multi-colour lines (a
@@ -74,15 +75,11 @@ impl Console {
         self.log.push(line);
     }
 
-    /// Process this frame's input. Returns the submitted line when the user
-    /// presses Enter (trimmed and non-empty), otherwise `None`. Esc closes the
-    /// console; an ambiguous Tab prints its candidate list to the log.
-    pub fn handle_input(&mut self, eng: &Engine) -> Option<String> {
-        if eng.is_key_pressed(Key::Escape) {
-            self.close();
-            return None;
-        }
-        let submitted = self.input.handle(eng);
+    /// Process input characters and an edit key. Returns submitted line (trimmed,
+    /// non-empty), else `None`. Tab shows candidates; closing on Esc is the
+    /// caller's job (it owns the event).
+    pub fn handle_input(&mut self, chars: &[char], edit: Option<EditKey>) -> Option<String> {
+        let submitted = self.input.handle(chars, edit);
         if let Some(candidates) = self.input.take_notice() {
             self.print(candidates.join("   "));
         }
@@ -159,11 +156,7 @@ fn complete_command(input: &str) -> Completion {
     }
 }
 
-/// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
-pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
-    f.draw_text(text, x + 1, y + 1, font_size, Color::new(0, 0, 0, 180));
-    f.draw_text(text, x, y, font_size, color);
-}
+pub use crate::ui::shadowed;
 
 #[cfg(test)]
 mod tests {

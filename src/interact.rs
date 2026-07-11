@@ -1,6 +1,8 @@
 //! interact.rs turns where the player looks into which block they act on: a voxel
-//! ray-march from the eye along the view direction, returning the first solid block
-//! within reach. Breaking and (later) placing are built on this one query.
+//! ray-march from the eye along the view direction, returning the first *obstacle*
+//! block within reach. Passable liquids are transparent to the ray — the same
+//! `solid && !liquid` predicate collision uses — so the aim reaches through water to
+//! the terrain behind it. Breaking and (later) placing are built on this one query.
 //!
 //! The march runs in `f64`: at far coordinates an `f32` origin can't even
 //! represent which cell the eye is in (ULP > 1 block past ~2^24), while `f64`
@@ -12,7 +14,7 @@ use crate::world::World;
 
 /// A block the aim ray struck.
 pub struct RayHit {
-    /// The solid block that was hit.
+    /// The obstacle block that was hit (solid, non-liquid).
     pub block: (i32, i32, i32),
     /// The last cell the ray passed through *before* the hit block — where a
     /// placed block would go. If the ray starts inside a solid block, this is
@@ -21,8 +23,10 @@ pub struct RayHit {
 }
 
 /// March a ray from `origin` along `dir` up to `reach` world units and return the
-/// first solid block, using Amanatides–Woo grid traversal (each iteration crosses
-/// exactly one voxel face, so nothing is skipped or double-visited).
+/// first obstacle block (solid, non-liquid), using Amanatides–Woo grid traversal
+/// (each iteration crosses exactly one voxel face, so nothing is skipped or
+/// double-visited). Liquids are passed through, so a ray cast from inside water — or
+/// across a lake — reaches the terrain, not the water surface.
 pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<RayHit> {
     let len = dir.length();
     if len == 0.0 {
@@ -37,7 +41,7 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
         block_coord(origin.y),
         block_coord(origin.z),
     );
-    if world.is_solid(x, y, z) {
+    if world.is_obstacle(x, y, z) {
         return Some(RayHit {
             block: (x, y, z),
             previous: (x, y, z),
@@ -89,7 +93,7 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
         if t > reach {
             break;
         }
-        if world.is_solid(x, y, z) {
+        if world.is_obstacle(x, y, z) {
             return Some(RayHit {
                 block: (x, y, z),
                 previous,
@@ -113,7 +117,7 @@ mod tests {
         // it is empty (a placed block would fit there).
         let (bx, by, bz) = hit.block;
         assert_eq!(hit.previous, (bx, by + 1, bz));
-        assert!(!world.is_solid(bx, by + 1, bz));
+        assert!(!world.is_obstacle(bx, by + 1, bz));
     }
 
     #[test]
@@ -129,23 +133,30 @@ mod tests {
         // and report the empty cell above it — the f32 version couldn't even
         // resolve which column the origin was in.
         let mut world = World::generate();
-        let origin = DVec3::new(1.0e8 + 8.5, 40.0, 8.5);
-        world.prepare_around(origin);
+        // Start above whatever the generator built here (the surface reaches
+        // ~49 at this column), so the ray enters from open air rather than
+        // starting inside the ground and tripping the inside-a-block guard.
+        let probe = DVec3::new(1.0e8 + 8.5, 40.0, 8.5);
+        world.prepare_around(probe);
+        let top = world.surface_y(100_000_008, 8) as f64 + 5.0;
+        let origin = DVec3::new(1.0e8 + 8.5, top, 8.5);
         let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)
             .expect("a downward ray should hit the terrain at 1e8");
         let (bx, by, bz) = hit.block;
         assert_eq!((bx, bz), (100_000_008, 8), "hits the column under the eye");
-        // The topmost solid of the column: terrain surface on land, or the water
-        // surface where the column is below sea level (water is a translucent solid).
-        assert!(world.is_solid(bx, by, bz), "hit is solid");
-        assert!(world.is_solid(bx, by - 1, bz), "and it is a real surface, not a floater");
+        // The topmost *obstacle* of the column: the terrain surface. Where the column
+        // is below sea level the ray passes straight through the water column above it
+        // (a passable liquid) and lands on the seabed, so `previous` — the placement
+        // cell — is water, not air, but still placeable (not an obstacle).
+        assert!(world.is_obstacle(bx, by, bz), "hit is an obstacle");
+        assert!(world.is_obstacle(bx, by - 1, bz), "and it is a real surface, not a floater");
         assert_eq!(hit.previous, (bx, by + 1, bz));
-        assert!(!world.is_solid(bx, by + 1, bz), "empty cell above the surface");
+        assert!(!world.is_obstacle(bx, by + 1, bz), "placeable cell above the surface");
 
         // A slanted ray from the same eye still steps cell-exactly.
         let hit = raycast(&world, origin, DVec3::new(0.4, -1.0, 0.2), 60.0)
             .expect("slanted far ray hits");
-        assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
-        assert!(!world.is_solid(hit.previous.0, hit.previous.1, hit.previous.2));
+        assert!(world.is_obstacle(hit.block.0, hit.block.1, hit.block.2));
+        assert!(!world.is_obstacle(hit.previous.0, hit.previous.1, hit.previous.2));
     }
 }

@@ -31,7 +31,7 @@ use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,23 @@ use crate::math::block_coord;
 use crate::block::registry::BlockRegistry;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat};
+use crate::presence::Stance;
 use crate::world::generation::{SineHills, TerrainGenerator};
+
+/// Poison-recovering lock: a client thread that panics while holding
+/// the state must not take the whole server down with it — [`State`] is plain
+/// data, valid at every point a panic could interrupt, so recovery is always
+/// sound. The ONE place the recovery policy lives; call sites say
+/// `lock_recover()` and can't drift back to a bare `.unwrap()`.
+trait LockRecover<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Largest concurrent roster. A hard bound so a flood of connects can't spawn
 /// unbounded threads.
@@ -97,6 +113,7 @@ struct PlayerHandle {
     pos: DVec3,
     yaw: f32,
     pitch: f32,
+    stance: Stance,
     /// Outbound queue drained by this client's writer thread.
     out: SyncSender<Arc<[u8]>>,
     /// A clone of the socket, kept only to force-close a misbehaving client.
@@ -198,14 +215,14 @@ impl ServerHandle {
     /// the roster size — the leak the churn test guards against.
     #[cfg(test)]
     fn grid_entries(&self) -> usize {
-        self.state.lock().unwrap().grid.values().map(Vec::len).sum()
+        self.state.lock_recover().grid.values().map(Vec::len).sum()
     }
 
     /// Number of live grid buckets. Empty buckets are removed eagerly, so this
     /// must return to zero whenever the roster empties.
     #[cfg(test)]
     fn grid_buckets(&self) -> usize {
-        self.state.lock().unwrap().grid.len()
+        self.state.lock_recover().grid.len()
     }
 }
 
@@ -348,10 +365,10 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     let id;
     let spawn;
     let world_day;
-    let existing: Vec<(u32, String, DVec3, f32, f32)>;
+    let existing: Vec<(u32, String, DVec3, f32, f32, Stance)>;
     let snapshot: Vec<(i32, i32, i32, String)>;
     {
-        let mut state = shared.lock().unwrap();
+        let mut state = shared.lock_recover();
         world_day = state.day;
         if state.players.len() >= MAX_PLAYERS {
             drop(state);
@@ -365,7 +382,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
         existing = state
             .players
             .iter()
-            .map(|(&pid, h)| (pid, h.name.clone(), h.pos, h.yaw, h.pitch))
+            .map(|(&pid, h)| (pid, h.name.clone(), h.pos, h.yaw, h.pitch, h.stance))
             .collect();
         snapshot = state
             .edits
@@ -380,6 +397,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
                 pos: spawn,
                 yaw: 0.0,
                 pitch: 0.0,
+                stance: Stance::Standing,
                 out: out.clone(),
                 kick: stream.try_clone()?,
                 ready: false,
@@ -401,18 +419,24 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
     }
     // Hand the newcomer the shared clock so their sky matches everyone else's.
     send_blocking(&out, &ServerMessage::Time { day: world_day });
-    for (pid, pname, ppos, pyaw, ppitch) in existing {
+    for (pid, pname, ppos, pyaw, ppitch, pstance) in existing {
         send_blocking(&out, &ServerMessage::PeerJoined { id: pid, name: pname });
         send_blocking(
             &out,
-            &ServerMessage::PeerMove { id: pid, pos: ppos, yaw: pyaw, pitch: ppitch },
+            &ServerMessage::PeerMove {
+                id: pid,
+                pos: ppos,
+                yaw: pyaw,
+                pitch: ppitch,
+                stance: pstance,
+            },
         );
     }
     // Bootstrap queued: go live. Frames broadcast during the bootstrap window
     // were buffered; drain them in order (they postdate the snapshot) and only
     // then let broadcasters push directly.
     {
-        let mut state = shared.lock().unwrap();
+        let mut state = shared.lock_recover();
         let mut slow = false;
         if let Some(h) = state.players.get_mut(&id) {
             for frame in std::mem::take(&mut h.backlog) {
@@ -452,17 +476,32 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
             continue; // Junk frame; ignore it.
         };
         match msg {
-            ClientMessage::Move { pos, yaw, pitch } => on_move(&shared, id, pos, yaw, pitch),
+            ClientMessage::Move { pos, yaw, pitch, stance } => {
+                on_move(&shared, id, pos, yaw, pitch, stance)
+            }
             ClientMessage::Edit { x, y, z, spec } => on_edit(&shared, id, x, y, z, &spec),
             ClientMessage::Chat { channel, text } => on_chat(&shared, id, channel, &text),
             ClientMessage::SetTime { day } => on_set_time(&shared, day),
+            // Clients ignore swings for unknown peers, so broadcast to
+            // everyone-but-sender is safe.
+            ClientMessage::Swing => {
+                broadcast_all(&shared, &ServerMessage::PeerSwing { id }, Some(id))
+            }
+            ClientMessage::Ping { nonce } => {
+                let state = shared.lock_recover();
+                if let Some(h) = state.players.get(&id) {
+                    // Best-effort: a full queue drops the probe, and the
+                    // client simply re-sends on its interval.
+                    let _ = h.out.try_send(ServerMessage::Pong { nonce }.encode().into());
+                }
+            }
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
         }
     }
 
     // Cleanup: drop the player (which frees the writer), close the socket, tell peers.
     {
-        let mut state = shared.lock().unwrap();
+        let mut state = shared.lock_recover();
         if let Some(h) = state.players.remove(&id) {
             // The handle's pos is the last committed one, so it names the exact
             // bucket the grid still holds this id under.
@@ -486,24 +525,26 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
 /// same failures land the same ids on the kick list, [`kick_slow`] already
 /// tolerates ids that disconnected in the unlocked window, and ids are never
 /// reused, so a late kick can't hit the wrong player.
-fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32) {
+fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
     // Ignore non-finite coordinates outright (a NaN would poison distance checks
     // and the grid keys).
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
         return;
     }
     // Encode before locking — the frame doesn't depend on shared state.
-    let frame: Arc<[u8]> = ServerMessage::PeerMove { id, pos, yaw, pitch }.encode().into();
+    let frame: Arc<[u8]> =
+        ServerMessage::PeerMove { id, pos, yaw, pitch, stance }.encode().into();
 
     let mut recipients: Vec<(u32, SyncSender<Arc<[u8]>>)> = Vec::new();
     {
-        let mut state = shared.lock().unwrap();
+        let mut state = shared.lock_recover();
         let old = match state.players.get_mut(&id) {
             Some(h) => {
                 let old = h.pos;
                 h.pos = pos;
                 h.yaw = yaw;
                 h.pitch = pitch;
+                h.stance = stance;
                 old
             }
             None => return, // Unreachable while the handler thread lives; be safe.
@@ -552,7 +593,7 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32
         }
     }
     if !slow.is_empty() {
-        kick_slow(&shared.lock().unwrap(), &slow);
+        kick_slow(&shared.lock_recover(), &slow);
     }
 }
 
@@ -571,7 +612,7 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &s
     if spec.len() > MAX_SPEC {
         return;
     }
-    let mut state = shared.lock().unwrap();
+    let mut state = shared.lock_recover();
     // Reach check against the editor's own reported position — no reaching across
     // the map.
     let Some(h) = state.players.get(&id) else { return };
@@ -591,7 +632,7 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     if text.is_empty() {
         return;
     }
-    let mut state = shared.lock().unwrap();
+    let mut state = shared.lock_recover();
     let Some(sender) = state.players.get(&id) else { return };
     let from_name = sender.name.clone();
     let origin = sender.pos;
@@ -611,7 +652,7 @@ fn on_set_time(shared: &Arc<Mutex<State>>, day: f32) {
         return;
     }
     let day = day.rem_euclid(1.0);
-    let mut state = shared.lock().unwrap();
+    let mut state = shared.lock_recover();
     state.day = day;
     broadcast(&mut state, &ServerMessage::Time { day }, |_, _| true);
 }
@@ -645,7 +686,7 @@ fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerH
 
 /// Broadcast to everyone, optionally skipping one id (the originator).
 fn broadcast_all(shared: &Arc<Mutex<State>>, msg: &ServerMessage, except: Option<u32>) {
-    let mut state = shared.lock().unwrap();
+    let mut state = shared.lock_recover();
     broadcast(&mut state, msg, |pid, _| Some(pid) != except);
 }
 
@@ -698,7 +739,7 @@ fn spawn_point(generator: &SineHills, id: u32) -> DVec3 {
 
 /// Current player count.
 fn online(shared: &Arc<Mutex<State>>) -> usize {
-    shared.lock().unwrap().players.len()
+    shared.lock_recover().players.len()
 }
 
 /// Trim a name to the length cap and strip control characters; fall back to a
@@ -716,6 +757,11 @@ fn clean_chat(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Test setup (bind/connect/spawn) may unwrap: a panic here is a loud test
+    // failure, which is exactly what the deny on the PRODUCTION paths exists
+    // to prevent (a client thread silently poisoning the shared state).
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     fn test_generator() -> SineHills {
@@ -763,6 +809,7 @@ mod tests {
                 pos: DVec3::new(8.5, 20.0, 8.5),
                 yaw: 0.0,
                 pitch: 0.0,
+                stance: Stance::Standing,
                 out,
                 kick: stream,
                 ready: true,
@@ -780,7 +827,7 @@ mod tests {
         on_edit(&shared, 1, 500, 20, 500, "air"); // far away: rejected
         on_edit(&shared, 1, 8, 20, 8, "air"); // in reach: recorded
 
-        let state = shared.lock().unwrap();
+        let state = shared.lock_recover();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
         assert!(!state.edits.contains_key(&(500, 20, 500)), "out-of-reach edit dropped");
     }
@@ -802,6 +849,7 @@ mod tests {
                 pos: DVec3::new(8.5, 20.0, 8.5),
                 yaw: 0.0,
                 pitch: 0.0,
+                stance: Stance::Standing,
                 out,
                 kick: stream,
                 ready: true,
@@ -847,6 +895,7 @@ mod tests {
                 pos: start,
                 yaw: 0.0,
                 pitch: 0.0,
+                stance: Stance::Standing,
                 out,
                 kick: stream,
                 ready: true,
@@ -861,25 +910,25 @@ mod tests {
 
         // Crossing the x border: the entry moves buckets and the emptied bucket
         // is dropped, not left behind as a leaked key.
-        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0);
+        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0, Stance::Standing);
         {
-            let s = shared.lock().unwrap();
+            let s = shared.lock_recover();
             assert_eq!(s.grid.get(&(1, 0)).map(Vec::as_slice), Some(&[1u32][..]));
             assert!(!s.grid.contains_key(&(0, 0)), "emptied bucket must be removed");
         }
 
         // Moving within the same bucket must not duplicate the entry.
-        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0);
+        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0, Stance::Standing);
         {
-            let s = shared.lock().unwrap();
+            let s = shared.lock_recover();
             assert_eq!(s.grid.get(&(1, 0)).map(Vec::len), Some(1));
             assert_eq!(s.grid.len(), 1);
         }
 
         // Negative coordinates floor toward -infinity: -1.0 is bucket -1, not 0.
-        on_move(&shared, 1, DVec3::new(-1.0, 20.0, -1.0), 0.0, 0.0);
+        on_move(&shared, 1, DVec3::new(-1.0, 20.0, -1.0), 0.0, 0.0, Stance::Standing);
         {
-            let s = shared.lock().unwrap();
+            let s = shared.lock_recover();
             assert_eq!(s.grid.get(&(-1, -1)).map(Vec::len), Some(1));
             assert_eq!(s.grid.len(), 1);
         }
@@ -906,7 +955,7 @@ mod tests {
         // Alice teleports many buckets away. Bob (still at spawn) is far outside
         // her interest radius, so his view of her must not update.
         let far = DVec3::new(4000.0, 30.0, 4000.0);
-        a.send_move(far, 0.0, 0.0);
+        a.send_move(far, 0.0, 0.0, Stance::Standing);
         thread::sleep(settle);
         b.poll();
         let alice_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
@@ -919,7 +968,7 @@ mod tests {
 
         // Bob moves right next to alice: she is within range of his new position,
         // so she hears it — which requires her grid entry to have followed her.
-        b.send_move(DVec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0);
+        b.send_move(DVec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0, Stance::Standing);
         thread::sleep(settle);
         a.poll();
         let bob_as_seen = a.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
@@ -930,7 +979,7 @@ mod tests {
         );
 
         // And the reverse direction: bob's entry followed him too.
-        a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0);
+        a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0, Stance::Standing);
         thread::sleep(settle);
         b.poll();
         let alice_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
@@ -979,8 +1028,8 @@ mod tests {
             for step in 1..=3 {
                 thread::sleep(Duration::from_millis(40));
                 let d = (step * 200) as f64; // 200 > INTEREST_RADIUS: a new bucket each step
-                a.send_move(DVec3::new(d, 30.0, 0.0), 0.0, 0.0);
-                b.send_move(DVec3::new(-d, 30.0, -d), 0.0, 0.0);
+                a.send_move(DVec3::new(d, 30.0, 0.0), 0.0, 0.0, Stance::Standing);
+                b.send_move(DVec3::new(-d, 30.0, -d), 0.0, 0.0, Stance::Standing);
             }
             thread::sleep(Duration::from_millis(150));
             assert_eq!(

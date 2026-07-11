@@ -1,11 +1,7 @@
-//! player.rs holds the player's position and view orientation, and derives the
-//! render camera from them. Input modules mutate this; the world reads its
-//! [`Aabb`] for collision.
-//!
-//! Positions and velocities are `f64` so play stays precise out to the world
-//! border (see [`math`](crate::math)); view angles stay `f32` — a radian needs
-//! no more precision, only positions accumulate magnitude.
-use voxel_engine::{Camera3D, DVec3, Lens, Vec3, WarpStrength};
+//! Player state: position and orientation. Positions use `f64` for precision
+//! out to world borders; view angles use `f32` since rotation doesn't
+//! accumulate magnitude (see [`math`](crate::math)).
+use voxel_engine::DVec3;
 
 use crate::math::{Aabb, Bounded};
 
@@ -74,15 +70,24 @@ impl Stance {
 pub enum Motion {
     /// On foot: subject to gravity, jumping, and ground contact.
     Walking { velocity: DVec3, on_ground: bool },
+    /// Submerged in a liquid: buoyancy fights gravity and drag damps every axis,
+    /// so there is neither ground contact nor a fall to accumulate — the reason
+    /// this is its own variant rather than a flag on `Walking`.
+    Swimming { velocity: DVec3 },
     /// Free flight: no gravity, no ground, velocity chases input on every axis.
-    Flying { velocity: DVec3 },
+    /// `noclip` additionally skips collision, letting the player pass through
+    /// solid geometry — meaningful only in flight, so it rides on this variant
+    /// rather than being a loose flag that could contradict walking/swimming.
+    Flying { velocity: DVec3, noclip: bool },
 }
 
 impl Motion {
     /// The current velocity, whichever mode we're in.
     pub fn velocity(self) -> DVec3 {
         match self {
-            Motion::Walking { velocity, .. } | Motion::Flying { velocity } => velocity,
+            Motion::Walking { velocity, .. }
+            | Motion::Swimming { velocity }
+            | Motion::Flying { velocity, .. } => velocity,
         }
     }
 }
@@ -139,6 +144,17 @@ impl Player {
         matches!(self.motion, Motion::Flying { .. })
     }
 
+    /// Whether the player is flying with collision disabled (passing through
+    /// solid geometry). False whenever not flying.
+    pub fn noclip(&self) -> bool {
+        matches!(self.motion, Motion::Flying { noclip: true, .. })
+    }
+
+    /// Whether the player is swimming in a liquid.
+    pub fn swimming(&self) -> bool {
+        matches!(self.motion, Motion::Swimming { .. })
+    }
+
     /// Enter or leave flight. Horizontal momentum carries across the switch, but
     /// vertical velocity is cleared so the player neither keeps falling into the
     /// new mode nor launches when leaving it.
@@ -146,9 +162,24 @@ impl Player {
         let v = self.velocity();
         let velocity = DVec3::new(v.x, 0.0, v.z);
         self.motion = if flying {
-            Motion::Flying { velocity }
+            Motion::Flying { velocity, noclip: false }
         } else {
             Motion::Walking { velocity, on_ground: false }
+        };
+    }
+
+    /// Advance the flight state one step in the cycle
+    /// walking → flying → flying+noclip → walking, carrying horizontal momentum
+    /// across each switch (vertical is cleared, as in [`Player::set_flying`]).
+    /// Landing back to `Walking` lets [`reconcile_liquid`] promote to swimming
+    /// next frame if the feet are submerged, so no liquid special-case is needed.
+    pub fn cycle_fly(&mut self) {
+        let v = self.velocity();
+        let velocity = DVec3::new(v.x, 0.0, v.z);
+        self.motion = match self.motion {
+            Motion::Flying { noclip: false, .. } => Motion::Flying { velocity, noclip: true },
+            Motion::Flying { noclip: true, .. } => Motion::Walking { velocity, on_ground: false },
+            _ => Motion::Flying { velocity, noclip: false },
         };
     }
 
@@ -156,7 +187,9 @@ impl Player {
     /// player doesn't rocket down on arrival).
     pub fn cancel_fall(&mut self) {
         match &mut self.motion {
-            Motion::Walking { velocity, .. } | Motion::Flying { velocity } => velocity.y = 0.0,
+            Motion::Walking { velocity, .. }
+            | Motion::Swimming { velocity }
+            | Motion::Flying { velocity, .. } => velocity.y = 0.0,
         }
     }
 
@@ -187,42 +220,6 @@ impl Player {
         (forward, right)
     }
 
-    /// Build the engine camera that looks out from the player's eye.
-    pub fn camera(&self) -> Camera3D {
-        self.camera_with_fov(70.0)
-    }
-
-    /// Like [`camera`](Self::camera) but with a caller-chosen vertical field of
-    /// view in degrees, so the FOV graphics setting can drive the render camera.
-    ///
-    /// CAMERA REBASE: the engine is `f32`, so instead of handing it a huge
-    /// world-space eye position (whose f32 rounding would make far terrain
-    /// jitter), the camera sits at the origin looking along the view
-    /// direction, and every 3D draw is made camera-relative (chunk meshes via
-    /// per-draw offsets, peers by subtracting the eye) — see
-    /// [`Game::draw`](crate::game::Game).
-    pub fn camera_with_fov(&self, fovy: f32) -> Camera3D {
-        // Two regimes, seam at 120°. Below, plain rectilinear at the dialed fovy.
-        // Above, the dial stops widening the *vertical* FOV — which would collapse
-        // and then flip the projection as it neared 180° — and instead buys
-        // *horizontal* reach through the wide lens: vertical pins at 120° and the
-        // 120→220 travel maps onto WarpStrength 0→MAX (2.0), edges compressing as
-        // it grows. At exactly 120 the two regimes coincide, so the seam is
-        // seamless.
-        let (fovy, lens) = if fovy > 120.0 {
-            let strength = WarpStrength::new((fovy - 120.0) / 50.0).unwrap();
-            (120.0, Lens::WideFov { strength })
-        } else {
-            (fovy, Lens::Rectilinear)
-        };
-        Camera3D {
-            position: Vec3::ZERO,
-            target: self.forward().as_vec3(),
-            up: Vec3::new(0.0, 1.0, 0.0),
-            fovy,
-            lens,
-        }
-    }
 }
 
 /// The collision box for an eye at `eye` in the given `stance`. Built from the

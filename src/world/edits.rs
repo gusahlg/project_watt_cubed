@@ -24,8 +24,8 @@ impl World {
         let radius = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
         if radius != self.view.horizontal {
             let shrunk = radius < self.view.horizontal;
-            self.view = super::ViewVolume::cube(radius);
-            // Invalidate the centre so the next stream reruns the full
+            self.view = super::ViewVolume::view(radius);
+            // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
             self.pending_fresh.set();
@@ -39,6 +39,12 @@ impl World {
         }
     }
 
+    /// Set render lanes (occlusion/lod2). Entry-only; mesh teardown not needed.
+    pub fn set_render_lanes(&mut self, occlusion: bool, lod2: bool) {
+        self.occlusion_forced = occlusion;
+        self.lod2 = lod2;
+    }
+
     /// Whether cross-chunk lighting is currently enabled.
     pub fn lighting(&self) -> bool {
         self.lighting
@@ -49,11 +55,62 @@ impl World {
     /// [`stream`](Self::stream) rebuilds them with — or without — settled light.
     /// A no-op when the value is unchanged, so it is cheap to push every frame.
     pub fn set_lighting(&mut self, on: bool, eng: &mut Engine) {
-        if on == self.lighting {
+        if !self.transition_lighting(on) {
             return;
         }
-        self.lighting = on;
         self.free_meshes(eng);
+    }
+
+    /// Move the CPU lighting pipeline between enabled and full-bright modes.
+    /// Kept separate from GPU mesh retirement so the asynchronous state machine
+    /// can be tested without constructing an engine.
+    pub(in crate::world) fn transition_lighting(&mut self, on: bool) -> bool {
+        if on == self.lighting {
+            return false;
+        }
+
+        self.lighting = on;
+        self.light_epoch = self.light_epoch.wrapping_add(1);
+        if !on {
+            // Work captured but not yet published has no trustworthy settled
+            // grid. Mark those chunks missing so re-enable discovers them without
+            // retaining a second dormant work set.
+            let unsettled: Vec<_> = self
+                .light_worklist
+                .iter()
+                .chain(&self.light_inflight)
+                .copied()
+                .chain(self.light_apply_queue.iter().map(|(coord, _)| *coord))
+                .collect();
+            for coord in unsettled {
+                if let Some(loaded) = self.chunks.get_mut(&coord) {
+                    loaded.light = None;
+                }
+            }
+            self.light_worklist.clear();
+        }
+        self.light_inflight.clear();
+        self.light_apply_queue.clear();
+        self.light_pending.take();
+        // `light_gate` (degraded/blocked_since) is left untouched on purpose: the
+        // per-frame `tick_light_gate` reconciles it against live predicates. With
+        // lighting off, `light_ready` is data-only, so blocked timers drain and any
+        // degraded chunk is re-meshed full-bright and cleared.
+
+        if on {
+            // Edits made while off remain in the dormant worklist. Chunks loaded
+            // while off have no grid, so add only those; unchanged settled grids
+            // remain valid and avoid a whole-volume relight.
+            self.light_worklist.extend(
+                self.chunks
+                    .iter()
+                    .filter_map(|(&coord, loaded)| loaded.light.is_none().then_some(coord)),
+            );
+            if !self.light_worklist.is_empty() {
+                self.light_pending.set();
+            }
+        }
+        true
     }
 
     /// Free every chunk's GPU mesh and reset every chunk to `NeedsMesh` — used
@@ -63,6 +120,9 @@ impl World {
     /// old unconditional `meshed = false`; the next scan re-derives `Air`.)
     pub fn free_meshes(&mut self, eng: &mut Engine) {
         for loaded in self.chunks.values_mut() {
+            // Any worker mesh captured before this reset must not be accepted if
+            // it lands after the next stream establishes a new centre.
+            loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::NeedsMesh { building: false }, eng);
         }
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
@@ -75,12 +135,14 @@ impl World {
         // coord gets generated or meshed twice, never wrongly.
         self.generating.clear();
         self.upload_queue.clear();
-        // Far LOD tiles belong to the world we are leaving; free them too.
-        for (_, state) in self.tiles.drain() {
+        // Sections belong to the world being left.
+        for (_, state) in self.sections.drain() {
             state.free(eng);
         }
-        self.tile_upload_queue.clear();
-        self.pending_tiles.take();
+        self.section_upload_queue.clear();
+        self.pending_sections.take();
+        self.dirty_sections.clear();
+        self.section_visible.clear();
         self.center = None;
         // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).
@@ -107,6 +169,11 @@ impl World {
             return previous;
         }
         self.edits.entry(coord).or_default().insert(index, id);
+        self.edit_generation += 1;
+        // Invalidate section to re-extract from overlay.
+        if self.lod2 {
+            self.mark_dirty_sections_from_edit(x, y, z);
+        }
 
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             std::sync::Arc::make_mut(&mut loaded.chunk).set_index(index, id);
@@ -160,6 +227,26 @@ impl World {
             self.light_worklist.insert(coord);
             self.light_pending.set();
         }
+    }
+
+    /// Mark sections covering this voxel dirty at every active detail so they
+    /// re-extract from the edit overlay. Sections span the full vertical domain
+    /// (Y-independent), so edits outside [0, DOMAIN_H) don't touch any section.
+    fn mark_dirty_sections_from_edit(&mut self, x: i32, y: i32, z: i32) {
+        if !(0..super::section::DOMAIN_H).contains(&y) {
+            return;
+        }
+        let details: Vec<u8> = self.section_pyramid.active_lods().map(|l| l.0).collect();
+        for detail in details {
+            let span = (super::section::SECTION_N as i32) << detail;
+            let pos = super::section::SectionPos {
+                detail,
+                x: x.div_euclid(span),
+                z: z.div_euclid(span),
+            };
+            self.dirty_sections.insert(pos);
+        }
+        self.pending_sections.set();
     }
 
     /// All edits as world coordinates and blocks for saving.

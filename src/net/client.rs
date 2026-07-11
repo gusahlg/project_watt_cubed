@@ -18,6 +18,7 @@ use voxel_engine::DVec3;
 
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION};
+use crate::presence::{self, Stance, WireAction};
 
 /// How long to wait for the initial TCP connect and the server's `Welcome`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,10 +27,8 @@ const MOVE_INTERVAL: Duration = Duration::from_millis(33);
 /// A move is sent at least this often even when standing still, as a heartbeat so
 /// the server's idle timeout never reaps an active-but-idle player.
 const HEARTBEAT: Duration = Duration::from_secs(1);
-
-/// A gait cycle advances this many radians per world unit of horizontal travel,
-/// so limbs swing at a natural cadence tied to distance rather than frame rate.
-const STRIDE_FREQ: f64 = 4.5;
+/// How often a latency probe is sent while connected.
+const PING_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One network state of a peer, snapshotted so we can interpolate between two.
 #[derive(Clone, Copy)]
@@ -37,12 +36,15 @@ struct Snapshot {
     pos: DVec3,
     yaw: f32,
     pitch: f32,
+    stance: Stance,
 }
 
 /// Another player as this client last heard about them, with just enough motion
 /// history to interpolate smoothly and drive a walk cycle.
 pub struct RemotePlayer {
     pub name: String,
+    /// Animation state for this peer.
+    pub anim: presence::Animator,
     prev: Snapshot,
     target: Snapshot,
     recv_at: Instant,
@@ -58,6 +60,8 @@ pub struct Rendered {
     pub pitch: f32,
     pub speed: f32,
     pub phase: f32,
+    /// Broadcast stance; the renderer's animator handles the visual blend.
+    pub stance: Stance,
 }
 
 impl RemotePlayer {
@@ -83,7 +87,8 @@ impl RemotePlayer {
             yaw,
             pitch,
             speed,
-            phase: (self.distance * STRIDE_FREQ) as f32,
+            phase: (self.distance * presence::STRIDE_FREQ) as f32,
+            stance: self.target.stance,
         }
     }
 }
@@ -110,6 +115,10 @@ pub enum Incoming {
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// A chat line to show in the console.
     Chat { from_name: String, channel: u8, text: String },
+    /// A player joined the server.
+    Joined { name: String },
+    /// A player left the server.
+    Left { name: String },
     /// The shared world time changed; `day` is a `[0,1)` fraction.
     Time { day: f32 },
     /// The server dropped us; the game should leave the world.
@@ -128,7 +137,10 @@ pub struct Connection {
     alive: bool,
     // Throttling state for outbound moves.
     last_move: Instant,
-    last_sent: Option<(DVec3, f32, f32)>,
+    last_sent: Option<(DVec3, f32, f32, Stance)>,
+    ping_sent: Option<(u32, Instant)>,
+    ping_seq: u32,
+    ping_ms: Option<u32>,
 }
 
 impl Connection {
@@ -192,6 +204,9 @@ impl Connection {
             alive: true,
             last_move: Instant::now(),
             last_sent: None,
+            ping_sent: None,
+            ping_seq: 0,
+            ping_ms: None,
         })
     }
 
@@ -215,11 +230,31 @@ impl Connection {
     pub fn peers(&self) -> impl Iterator<Item = &RemotePlayer> {
         self.peers.values()
     }
+    /// Mutable peer access for stepping animation each frame.
+    pub fn peers_mut(&mut self) -> impl Iterator<Item = &mut RemotePlayer> {
+        self.peers.values_mut()
+    }
+    /// Last measured round trip to the server, if a pong has arrived yet.
+    pub fn ping_ms(&self) -> Option<u32> {
+        self.ping_ms
+    }
 
     /// Drain everything the server has said since the last frame. Peer join/leave/
     /// move is applied to the local table here; edits and chat are returned for the
     /// game to handle.
     pub fn poll(&mut self) -> Vec<Incoming> {
+        // Periodic latency probe.
+        let due = match self.ping_sent {
+            None => true,
+            Some((_, at)) => at.elapsed() >= PING_INTERVAL,
+        };
+        if due && self.alive {
+            self.ping_seq = self.ping_seq.wrapping_add(1);
+            let nonce = self.ping_seq;
+            self.dispatch(&ClientMessage::Ping { nonce });
+            self.ping_sent = Some((nonce, Instant::now()));
+        }
+
         let mut out = Vec::new();
         loop {
             match self.inbox.try_recv() {
@@ -253,9 +288,12 @@ impl Connection {
             ServerMessage::PeerJoined { id, name } => {
                 // prev == target on join: speed 0 and a stationary phase, no
                 // Option<history> and no special-casing downstream.
-                let spawn = Snapshot { pos: self.spawn, yaw: 0.0, pitch: 0.0 };
+                let spawn =
+                    Snapshot { pos: self.spawn, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
+                out.push(Incoming::Joined { name: name.clone() });
                 self.peers.entry(id).or_insert(RemotePlayer {
                     name,
+                    anim: presence::Animator::default(),
                     prev: spawn,
                     target: spawn,
                     recv_at: Instant::now(),
@@ -264,15 +302,29 @@ impl Connection {
                 });
             }
             ServerMessage::PeerLeft { id } => {
-                self.peers.remove(&id);
+                if let Some(p) = self.peers.remove(&id) {
+                    out.push(Incoming::Left { name: p.name });
+                }
             }
-            ServerMessage::PeerMove { id, pos, yaw, pitch } => {
+            ServerMessage::PeerMove { id, pos, yaw, pitch, stance } => {
                 if let Some(p) = self.peers.get_mut(&id) {
                     p.interval = p.recv_at.elapsed();
                     p.prev = p.target;
-                    p.target = Snapshot { pos, yaw, pitch };
+                    p.target = Snapshot { pos, yaw, pitch, stance };
                     p.recv_at = Instant::now();
                     p.distance += horizontal(p.prev.pos, p.target.pos);
+                }
+            }
+            ServerMessage::PeerSwing { id } => {
+                if let Some(p) = self.peers.get_mut(&id) {
+                    p.anim.on_action(WireAction::Swing);
+                }
+            }
+            ServerMessage::Pong { nonce } => {
+                if let Some((sent_nonce, at)) = self.ping_sent {
+                    if sent_nonce == nonce {
+                        self.ping_ms = Some(at.elapsed().as_millis() as u32);
+                    }
                 }
             }
             ServerMessage::Reject { reason: _ } => {
@@ -286,19 +338,25 @@ impl Connection {
 
     /// Report the local player's state, throttled and heartbeat. Cheap to call every
     /// frame; it only actually sends on the movement cadence or the heartbeat.
-    pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32) {
+    pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
         if !self.alive {
             return;
         }
         let elapsed = self.last_move.elapsed();
-        let changed = self.last_sent != Some((pos, yaw, pitch));
+        let changed = self.last_sent != Some((pos, yaw, pitch, stance));
         let due = (changed && elapsed >= MOVE_INTERVAL) || elapsed >= HEARTBEAT;
         if !due {
             return;
         }
         self.last_move = Instant::now();
-        self.last_sent = Some((pos, yaw, pitch));
-        self.dispatch(&ClientMessage::Move { pos, yaw, pitch });
+        self.last_sent = Some((pos, yaw, pitch, stance));
+        self.dispatch(&ClientMessage::Move { pos, yaw, pitch, stance });
+    }
+
+    /// Tell the server the player swung their arm (block break/place), so
+    /// nearby avatars animate it.
+    pub fn send_swing(&mut self) {
+        self.dispatch(&ClientMessage::Swing);
     }
 
     /// Tell the server about a block the player changed.
@@ -380,7 +438,7 @@ mod tests {
         );
         // Report position so the server's reach check passes, then edit.
         a.last_move = Instant::now() - HEARTBEAT; // force the throttle to send
-        a.send_move(s, 0.0, 0.0);
+        a.send_move(s, 0.0, 0.0, Stance::Standing);
         a.send_edit(bx, by, bz, "air".into());
 
         thread::sleep(Duration::from_millis(150));

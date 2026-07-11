@@ -237,8 +237,14 @@ mod tests {
     #[test]
     fn generated_sky_chunk_is_uniform_air() {
         let (g, _, _) = hills(7);
-        // Above the terrain (h <= 31) and below the island band (y >= 64).
-        let sky = Chunk::new(0, 3, 0, &g);
+        // No fixed sky band exists (hills reach ~88 here and islands can sit
+        // higher): find the first generated layer that IS uniform air. The
+        // point stays "generation yields the compact representation", without
+        // hardcoding where the generator puts terrain.
+        let sky = (2..64)
+            .map(|cy| Chunk::new(0, cy, 0, &g))
+            .find(|c| c.uniform() == Some(AIR))
+            .expect("a chunk layer above the terrain is uniform air, stored as one id");
         assert_eq!(sky.uniform(), Some(AIR), "sky chunk stores one id, not 4 KiB");
         // The uniform representation really is tiny: the enum is pointer-sized
         // plus a tag, nowhere near CHUNK_VOLUME bytes.
@@ -247,8 +253,10 @@ mod tests {
 
     #[test]
     fn edit_replay_on_uniform_chunk_promotes_correctly() {
-        let (g, stone, dirt) = hills(7);
-        let mut chunk = Chunk::new(2, 3, 2, &g); // uniform air sky chunk
+        let (_, stone, dirt) = hills(7);
+        // Constructed uniform-air chunk: this test is about edit replay and
+        // promotion, not about where the generator happens to put terrain.
+        let mut chunk = Chunk::from_uniform(2, 3, 2, AIR);
         assert_eq!(chunk.uniform(), Some(AIR));
         // Replaying an edit overlay (flat index -> id) like the world does.
         for (index, id) in [(Chunk::index(1, 2, 3), stone), (Chunk::index(0, 0, 0), dirt)] {

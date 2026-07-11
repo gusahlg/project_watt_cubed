@@ -12,17 +12,16 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use voxel_engine::{Color, DVec3, Engine, Frame, Key, MouseButton};
+use voxel_engine::{DVec3, Engine};
 
 use crate::block::crafting::craft_natural;
 use crate::block::registry::BlockId;
 use crate::block::{AIR, ElementId};
-use crate::console::shadowed;
 use crate::interact;
 use crate::math::{Aabb, Bounded};
 use crate::mods::inventory::{InventoryMod, PANEL_X, PANEL_Y};
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
-use crate::ui::{ellipsize, visible_window};
+use crate::ui::{visible_window, HudElement, Panel, Role, Row};
 use crate::world::World;
 
 /// How far the player can reach to place a block — matches the break reach.
@@ -100,15 +99,15 @@ impl CraftingMod {
         self.cursor = self.cursor.min(self.row_count() - 1);
     }
 
-    /// Panel-open key handling: move the cursor, toggle selections, craft, equip.
-    fn navigate(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
+    /// Navigate panel using intent flags.
+    fn navigate(&mut self, ctx: &mut ModContext) {
+        if ctx.nav_up {
             self.cursor = self.cursor.saturating_sub(1);
         }
-        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
+        if ctx.nav_down {
             self.cursor = (self.cursor + 1).min(self.row_count() - 1);
         }
-        if eng.is_key_pressed(Key::Enter) || eng.is_key_pressed(Key::L) {
+        if ctx.nav_confirm {
             self.activate(ctx);
         }
     }
@@ -175,8 +174,8 @@ impl CraftingMod {
     /// and the queue is applied later in the same frame against the same world
     /// state — so a placement that costs a block always lands, and a rejected
     /// aim costs nothing.
-    fn try_place(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        if !eng.is_mouse_button_pressed(MouseButton::Right) || !ctx.mouse_locked {
+    fn try_place(&mut self, ctx: &mut ModContext) {
+        if !ctx.place {
             return;
         }
         let Some(equipped) = self.equipped else {
@@ -251,51 +250,42 @@ impl Mod for CraftingMod {
         "Craft natural blocks from gathered elements and place them (press C)."
     }
 
-    fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
+    fn update(&mut self, _eng: &Engine, ctx: &mut ModContext) {
         self.refresh();
-        if ctx.capturing_text {
-            return;
-        }
-        if eng.is_key_pressed(Key::C) {
+        if ctx.toggle_crafting {
             self.set_open(!self.is_open());
         }
         if self.is_open() {
-            self.navigate(eng, ctx);
+            self.navigate(ctx);
         } else {
-            self.try_place(eng, ctx);
+            self.try_place(ctx);
         }
     }
 
-    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
+    fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
         let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
-        let text_x = PANEL_X + PANEL_PAD;
 
         if !self.is_open() {
             // Closed: just a small reminder of what RMB will place.
-            if let Some(equipped) = self.equipped {
-                let entry = &self.crafted[equipped];
-                let kinds = self.stash.borrow().iter().count();
-                let ui = self.ui.get();
-                let y = if ui.inventory_visible {
-                    InventoryMod::panel_bottom(screen_h, kinds) + 6
-                } else {
-                    PANEL_Y
-                };
-                let hint = ellipsize(
-                    &format!("Equipped: {} x{}", entry.name, entry.count),
-                    ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize,
-                );
-                let hint_w = (hint.chars().count() as i32 * FONT_SIZE + PANEL_PAD * 2).min(width);
-                f.draw_rect(
-                    PANEL_X,
-                    y,
-                    hint_w,
-                    FONT_SIZE + PANEL_PAD * 2,
-                    Color::new(8, 10, 14, 190),
-                );
-                shadowed(f, &hint, text_x, y + PANEL_PAD, FONT_SIZE, Color::RAYWHITE);
-            }
-            return;
+            let Some(equipped) = self.equipped else {
+                return Vec::new();
+            };
+            let entry = &self.crafted[equipped];
+            let kinds = self.stash.borrow().iter().count();
+            let ui = self.ui.get();
+            let y = if ui.inventory_visible {
+                InventoryMod::panel_bottom(screen_h, kinds) + 6
+            } else {
+                PANEL_Y
+            };
+            let hint = format!("Equipped: {} x{}", entry.name, entry.count);
+            let hint_w = (hint.chars().count() as i32 * FONT_SIZE + PANEL_PAD * 2).min(width);
+            return vec![HudElement::Panel(Panel {
+                at: (PANEL_X, y),
+                width: hint_w,
+                header: Vec::new(),
+                rows: vec![Row::new(Role::Muted, hint)],
+            })];
         }
 
         let stash = self.stash.borrow();
@@ -313,87 +303,54 @@ impl Mod for CraftingMod {
         let content_y = PANEL_Y + PANEL_PAD + header_rows as i32 * LINE_HEIGHT + 2;
         let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
         let window = visible_window(total_rows, self.cursor, capacity);
-        let shown = window.len();
-        let height =
-            PANEL_PAD * 2 + header_rows as i32 * LINE_HEIGHT + 2 + shown as i32 * LINE_HEIGHT;
-        f.draw_rect(PANEL_X, PANEL_Y, width, height, Color::new(8, 10, 14, 210));
 
-        shadowed(
-            f,
-            &format!("Crafting  {}/{}", self.selected.len(), element_count),
-            text_x,
-            PANEL_Y + PANEL_PAD,
-            FONT_SIZE,
-            Color::GOLD,
-        );
-        let max_chars = ((width - PANEL_PAD * 2) / FONT_SIZE).max(1) as usize;
+        let mut header = vec![Row::new(
+            Role::Warning,
+            format!("Crafting  {}/{}", self.selected.len(), element_count),
+        )];
         if !selected_names.is_empty() {
-            let recipe = ellipsize(&selected_names, max_chars);
-            shadowed(
-                f,
-                &recipe,
-                text_x,
-                PANEL_Y + PANEL_PAD + LINE_HEIGHT,
-                FONT_SIZE,
-                Color::LIGHTGRAY,
-            );
+            header.push(Row::new(Role::Dim, selected_names));
         }
 
-        let mut y = content_y;
-        for row_index in window {
-            let active = self.cursor == row_index;
-            let cursor = if active { ">" } else { " " };
-            let (text, color) = if row_index < element_count {
-                let (element, count) = held[row_index];
-                let mark = if self.selected.contains(&element) {
-                    "[x]"
+        let rows = window
+            .map(|row_index| {
+                let active = self.cursor == row_index;
+                let cursor = if active { ">" } else { " " };
+                if row_index < element_count {
+                    let (element, count) = held[row_index];
+                    let mark = if self.selected.contains(&element) { "[x]" } else { "[ ]" };
+                    Row::new(
+                        if active { Role::Accent } else { Role::Muted },
+                        format!("{cursor} {mark} {count}x {}", elements.get(element).name),
+                    )
+                } else if row_index == element_count {
+                    let label = if self.selected.is_empty() { "select elements" } else { "craft selected" };
+                    Row::new(
+                        if self.selected.is_empty() { Role::Disabled } else { Role::Warning },
+                        format!("{cursor} [ {label} ]"),
+                    )
                 } else {
-                    "[ ]"
-                };
-                (
-                    format!("{cursor} {mark} {count}x {}", elements.get(element).name),
-                    if active {
-                        Color::SKYBLUE
-                    } else {
-                        Color::RAYWHITE
-                    },
-                )
-            } else if row_index == element_count {
-                let label = if self.selected.is_empty() {
-                    "select elements"
-                } else {
-                    "craft selected"
-                };
-                (
-                    format!("{cursor} [ {label} ]"),
-                    if self.selected.is_empty() {
-                        Color::GRAY
-                    } else {
-                        Color::GOLD
-                    },
-                )
-            } else {
-                let i = row_index - element_count - 1;
-                let entry = &self.crafted[i];
-                let equipped = if self.equipped == Some(i) {
-                    "[E]"
-                } else {
-                    "   "
-                };
-                (
-                    format!("{cursor} {equipped} {}x {}", entry.count, entry.name),
-                    if self.equipped == Some(i) {
-                        Color::LIME
+                    let i = row_index - element_count - 1;
+                    let entry = &self.crafted[i];
+                    let equipped = if self.equipped == Some(i) { "[E]" } else { "   " };
+                    let role = if self.equipped == Some(i) {
+                        Role::Positive
                     } else if active {
-                        Color::SKYBLUE
+                        Role::Accent
                     } else {
-                        Color::RAYWHITE
-                    },
-                )
-            };
-            shadowed(f, &ellipsize(&text, max_chars), text_x, y, FONT_SIZE, color);
-            y += LINE_HEIGHT;
-        }
+                        Role::Muted
+                    };
+                    Row::new(role, format!("{cursor} {equipped} {}x {}", entry.count, entry.name))
+                }
+            })
+            .collect();
+
+        vec![HudElement::Panel(Panel {
+            at: (PANEL_X, PANEL_Y),
+            width,
+            header,
+            rows,
+        })]
     }
 
     fn close_overlay(&mut self) -> bool {

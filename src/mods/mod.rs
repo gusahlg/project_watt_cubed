@@ -15,11 +15,12 @@ pub mod menu_default;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use voxel_engine::{Engine, Frame};
+use voxel_engine::Engine;
 
 use crate::block::ElementId;
-use crate::menu::{MenuEvent, MenuModel};
+use crate::menu::theme::MenuTheme;
 use crate::player::Player;
+use crate::ui::HudElement;
 use crate::world::World;
 
 /// The element counts the player is carrying — the single source of truth shared
@@ -156,11 +157,13 @@ pub struct ModContext<'a> {
     pub world: &'a mut World,
     pub screen_w: i32,
     pub screen_h: i32,
-    /// True while the console or a menu is capturing keys, so mods leave input alone.
-    pub capturing_text: bool,
-    /// Whether the mouse is captured for aiming — world-affecting clicks
-    /// (breaking, placing) must only fire while it is.
-    pub mouse_locked: bool,
+    /// Keybind intents; `place` gated on mouse capture separately.
+    pub place: bool,
+    pub toggle_inventory: bool,
+    pub toggle_crafting: bool,
+    pub nav_up: bool,
+    pub nav_down: bool,
+    pub nav_confirm: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
     /// drains these after `mods.update` and applies each only if the cell is air
     /// and doesn't overlap the player — mods that spend resources on a placement
@@ -201,11 +204,14 @@ pub trait Mod {
         let _ = (elements, world);
     }
 
-    /// Draw this mod's HUD while enabled, over the world and under the console.
-    /// `world` gives read access to the registry so names can be resolved at draw
-    /// time rather than cached.
-    fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
-        let _ = (f, world, screen_w, screen_h);
+    /// This mod's HUD contribution while enabled, as data — a list of
+    /// [`HudElement`]s the core renders over the world and under the console. A
+    /// mod describes *what* to show and never draws, so panel chrome and layout
+    /// live in one place ([`crate::ui::render_hud`]). `world` gives read access to
+    /// the registry so names resolve at build time rather than being cached.
+    fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
+        let _ = (world, screen);
+        Vec::new()
     }
 
     /// Close a modal in-world overlay before the core interprets Escape as
@@ -214,28 +220,9 @@ pub trait Mod {
         false
     }
 
-    /// Whether this mod drives and draws the out-of-game menus. A separate
-    /// discriminator so [`drive_menu`](Self::drive_menu) returning `None` keeps
-    /// meaning "no event this frame" rather than "not my job". The first
-    /// enabled mod with `handles_menus()` owns both input and visuals, so the
-    /// two can never split across mods.
-    fn handles_menus(&self) -> bool {
-        false
-    }
-
-    /// Interpret one frame of menu input against `menu`: move its cursor, edit
-    /// its text fields, and return at most one event. Only called on the mod
-    /// that [`handles_menus`](Self::handles_menus). Must never interpret what
-    /// the entries mean — that stays with the core.
-    fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
-        let _ = (eng, menu);
+    /// Optional theme override; fallback prevents breaking nav.
+    fn menu_theme(&self) -> Option<&dyn MenuTheme> {
         None
-    }
-
-    /// Draw a menu screen from its model. Only called on the mod that
-    /// [`handles_menus`](Self::handles_menus).
-    fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
-        let _ = (f, menu, screen_w, screen_h);
     }
 
     /// Serialise persistent state to a single line for the save file, or `None` if
@@ -322,13 +309,14 @@ impl Mods {
         }
     }
 
-    /// Draw every enabled mod's HUD.
-    pub fn draw(&mut self, f: &mut Frame, world: &World, screen_w: i32, screen_h: i32) {
-        for entry in &mut self.entries {
-            if entry.enabled {
-                entry.module.draw(f, world, screen_w, screen_h);
-            }
-        }
+    /// Collect every enabled mod's HUD contribution, in install order (so a
+    /// later mod draws over an earlier one).
+    pub fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .flat_map(|e| e.module.hud(world, screen))
+            .collect()
     }
 
     /// Give enabled mods first refusal on Escape. The first open overlay closes
@@ -340,37 +328,12 @@ impl Mods {
             .any(|entry| entry.module.close_overlay())
     }
 
-    /// Whether any enabled mod handles menus. When this is `false` the App
-    /// falls back to the built-in driver/renderer in [`crate::menu`] — the
-    /// guarantee that disabling the Menus mod can never brick navigation.
-    pub fn menu_driver_available(&self) -> bool {
+    /// Fallback theme ensures disabling menu mod never breaks nav.
+    pub fn menu_theme(&self) -> Option<&dyn MenuTheme> {
         self.entries
             .iter()
-            .any(|e| e.enabled && e.module.handles_menus())
-    }
-
-    /// Let the menu-handling mod interpret this frame's input. The first
-    /// enabled mod with [`Mod::handles_menus`] wins, in install order — the
-    /// same one [`draw_menu`](Self::draw_menu) picks, so input and visuals
-    /// always come from a single mod.
-    pub fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
-        for entry in &mut self.entries {
-            if entry.enabled && entry.module.handles_menus() {
-                return entry.module.drive_menu(eng, menu);
-            }
-        }
-        None
-    }
-
-    /// Let the menu-handling mod draw a menu screen (first enabled handler,
-    /// same pick as [`drive_menu`](Self::drive_menu)).
-    pub fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
-        for entry in &mut self.entries {
-            if entry.enabled && entry.module.handles_menus() {
-                entry.module.draw_menu(f, menu, screen_w, screen_h);
-                return;
-            }
-        }
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.menu_theme())
     }
 
     /// Number of installed mods (for the mod menu).

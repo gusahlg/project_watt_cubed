@@ -5,57 +5,9 @@
 //!   id handles and `builtin_elements()`, so adding a material is a single row.
 //! - [`blocks!`] — the built-in block table; generates the [`Blk`](crate::block::registry)
 //!   id handles and `register_builtins()` from element compositions.
-//! - [`axis!`] — a keyboard-driven movement axis (positive / negative / none),
-//!   so adding a new control axis doesn't repeat the same `if`-ladder.
 //!
 //! Both macros use fully-qualified `::voxel_engine::...` paths so they expand
 //! correctly regardless of what the call site has imported.
-
-/// Define a tri-state movement axis bound to two keys.
-///
-/// ```ignore
-/// axis!(#[derive(Clone, Copy)] AxisX { Right = D, Left = A });
-/// let dir = AxisX::sample(&eng); // Right / Left / None
-/// let s = dir.signum();          // +1.0 / -1.0 / 0.0
-/// ```
-macro_rules! axis {
-    ($(#[$meta:meta])* $name:ident { $pos:ident = $pkey:ident, $neg:ident = $nkey:ident }) => {
-        $(#[$meta])*
-        pub enum $name {
-            $pos,
-            $neg,
-            None,
-        }
-
-        impl $name {
-            /// Read this axis from the current keyboard state.
-            pub fn sample(eng: &::voxel_engine::Engine) -> Self {
-                if eng.is_key_down(::voxel_engine::Key::$pkey) {
-                    $name::$pos
-                } else if eng.is_key_down(::voxel_engine::Key::$nkey) {
-                    $name::$neg
-                } else {
-                    $name::None
-                }
-            }
-
-            /// `+1.0` for the positive direction, `-1.0` for the negative, `0.0` for none.
-            pub fn signum(&self) -> f32 {
-                match self {
-                    $name::$pos => 1.0,
-                    $name::$neg => -1.0,
-                    $name::None => 0.0,
-                }
-            }
-
-            /// Whether a direction is being held this frame (not `None`).
-            pub fn is_active(&self) -> bool {
-                !matches!(self, $name::None)
-            }
-        }
-    };
-}
-pub(crate) use axis;
 
 /// Define the built-in element table. Generates the [`El`] handle enum (each
 /// variant's discriminant is its [`ElementId`](crate::block::element::ElementId),
