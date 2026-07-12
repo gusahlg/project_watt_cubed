@@ -1319,6 +1319,22 @@ mod tests {
     }
 
     #[test]
+    fn restoring_the_generated_block_compacts_the_overlay() {
+        // Edit-and-revert must leave NO overlay weight: regeneration produces
+        // the reverted block anyway, so saves and join transfers stay
+        // proportional to the world's real difference from its seed.
+        let mut world = World::generate();
+        let (x, z) = (8, 8);
+        let h = (0..96).rev().find(|&y| world.is_solid(x, y, z)).unwrap();
+        let original = world.block_at(x, h, z);
+        assert_eq!(world.edits().count(), 0);
+        world.set_block(x, h, z, AIR);
+        assert_eq!(world.edits().count(), 1, "a real edit is recorded");
+        world.set_block(x, h, z, original);
+        assert_eq!(world.edits().count(), 0, "restoring generation drops the entry");
+    }
+
+    #[test]
     fn edits_persist_across_unload() {
         let mut world = World::generate();
         // Break the surface block, then regenerate the chunk from scratch —

@@ -9,6 +9,7 @@ use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
 
 use super::chunk::Chunk;
+use super::generation::TerrainGenerator;
 use super::{Coord, MeshState, VIEW_RADIUS_RANGE, World};
 
 impl World {
@@ -168,7 +169,23 @@ impl World {
         if previous == id && self.chunks.contains_key(&coord) {
             return previous;
         }
-        self.edits.entry(coord).or_default().insert(index, id);
+        // Overlay compaction: a write that restores what generation would
+        // produce is pure weight in the overlay — regeneration yields it
+        // anyway. Drop the entry instead of storing it, so the overlay (and
+        // every save and join transfer built from it) stays proportional to
+        // the world's real difference from its seed. One generator query per
+        // edit: user-click/network rate, never the voxel hot path.
+        let generated = self.generator.block_at(x, y, z, self.generator.height(x, z));
+        if id == generated {
+            if let Some(cells) = self.edits.get_mut(&coord) {
+                cells.remove(&index);
+                if cells.is_empty() {
+                    self.edits.remove(&coord);
+                }
+            }
+        } else {
+            self.edits.entry(coord).or_default().insert(index, id);
+        }
         self.edit_generation += 1;
         // Invalidate section to re-extract from overlay.
         if self.lod2 {

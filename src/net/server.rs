@@ -137,7 +137,12 @@ const BOOTSTRAP_BACKLOG: usize = 256;
 /// (coordinate → portable block spec), the player roster, and the interest grid
 /// that indexes the roster by position.
 struct State {
-    edits: HashMap<(i32, i32, i32), String>,
+    edits: HashMap<(i32, i32, i32), std::sync::Arc<str>>,
+    /// Distinct spec strings, shared by every edit naming them: a thousand
+    /// broken blocks are a thousand map entries but ONE "air" allocation. The
+    /// overlay is the server's only unbounded state, so its per-entry weight
+    /// is the memory story of a long-lived world.
+    spec_pool: std::collections::HashSet<std::sync::Arc<str>>,
     players: HashMap<u32, PlayerHandle>,
     /// Broad-phase interest grid: bucket key → ids of the players standing in it,
     /// keyed by [`bucket_of`] — `(floor(x / INTEREST_RADIUS), floor(z /
@@ -242,6 +247,7 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     });
     let shared = Arc::new(Mutex::new(State {
         edits: HashMap::new(),
+        spec_pool: std::collections::HashSet::new(),
         players: HashMap::new(),
         grid: HashMap::new(),
         next_id: 1,
@@ -387,7 +393,7 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
         snapshot = state
             .edits
             .iter()
-            .map(|(&(x, y, z), spec)| (x, y, z, spec.clone()))
+            .map(|(&(x, y, z), spec)| (x, y, z, spec.to_string()))
             .collect();
 
         state.players.insert(
@@ -621,8 +627,16 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, x: i32, y: i32, z: i32, spec: &s
         return;
     }
     // The overlay stores the portable spec verbatim; the server never resolves it.
-    state.edits.insert((x, y, z), spec.to_string());
+    let spec: std::sync::Arc<str> = match state.spec_pool.get(spec) {
+        Some(shared) => shared.clone(),
+        None => {
+            let shared: std::sync::Arc<str> = std::sync::Arc::from(spec);
+            state.spec_pool.insert(shared.clone());
+            shared
+        }
+    };
     let msg = ServerMessage::Edit { x, y, z, spec: spec.to_string() };
+    state.edits.insert((x, y, z), spec);
     broadcast(&mut state, &msg, |_, _| true);
 }
 
@@ -817,6 +831,7 @@ mod tests {
         );
         let shared = Arc::new(Mutex::new(State {
             edits: HashMap::new(),
+            spec_pool: std::collections::HashSet::new(),
             players,
             grid: HashMap::new(),
             next_id: 2,
@@ -857,6 +872,7 @@ mod tests {
         );
         let shared = Arc::new(Mutex::new(State {
             edits: HashMap::new(),
+            spec_pool: std::collections::HashSet::new(),
             players,
             grid: HashMap::new(),
             next_id: 2,
@@ -902,7 +918,14 @@ mod tests {
             },
         );
         let mut state =
-            State { edits: HashMap::new(), players, grid: HashMap::new(), next_id: 2, day: 0.3 };
+            State {
+                edits: HashMap::new(),
+                spec_pool: std::collections::HashSet::new(),
+                players,
+                grid: HashMap::new(),
+                next_id: 2,
+                day: 0.3,
+            };
         state.grid_insert(1, start);
         assert_eq!(state.grid.get(&(0, 0)).map(Vec::len), Some(1));
         let shared = Arc::new(Mutex::new(state));
