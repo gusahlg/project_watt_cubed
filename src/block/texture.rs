@@ -30,18 +30,22 @@ const NEUTRAL_GRAY: [f32; 3] = [140.0, 140.0, 140.0];
 
 const BYTES_PER_LAYER: usize = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
 
-/// Build one 16x16 RGBA8 texture layer per registered block, indexed by block
-/// id. Block 0 (air) is pure white; every other layer is the element blend of
-/// that block's composition. Feed straight to `Engine::set_block_textures`.
+/// Build the 16x16 RGBA8 texture layer for one block id. Block 0 (air) is pure
+/// white; every other layer is the element blend of that block's composition.
+/// The world's incremental texture cache calls this per newly registered id.
+pub fn build_block_texture(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
+    if id.0 == 0 {
+        vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
+    } else {
+        layer_for(registry, id)
+    }
+}
+
+/// Build one texture layer per registered block, indexed by block id. Feed
+/// straight to `Engine::set_block_textures`.
 pub fn build_block_textures(registry: &BlockRegistry) -> Vec<Vec<u8>> {
     (0..registry.block_count())
-        .map(|i| {
-            if i == 0 {
-                vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
-            } else {
-                layer_for(registry, BlockId(i as u8))
-            }
-        })
+        .map(|i| build_block_texture(registry, BlockId(i as u16)))
         .collect()
 }
 

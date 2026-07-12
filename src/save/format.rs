@@ -39,7 +39,9 @@ pub const HEADER_LEN: usize = NAME_OFF + 1 + NAME_FIELD + 8 + 8 + 8 + 8 + 4;
 const EDIT_BYTES: usize = 14;
 
 /// Sanity caps while reading, so a corrupt length prefix can't balloon memory.
-const MAX_SPECS: usize = 4096;
+/// Specs track the block palette cap — a long-played world can legitimately
+/// reference one spec per registered block type.
+const MAX_SPECS: usize = 16_384;
 const MAX_EDITS: u32 = 50_000_000;
 const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
 

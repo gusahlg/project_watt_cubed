@@ -529,6 +529,13 @@ pub struct World {
     done_scratch: Vec<pipeline::Done>,
     /// Block count last uploaded. Rebuilds/re-uploads when palette grows.
     textures_built: usize,
+    /// Built texture layers by id, kept so palette growth (crafting registers
+    /// one block at a time) appends new layers instead of regenerating all.
+    texture_cache: Vec<Vec<u8>>,
+    /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
+    /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
+    /// stream pass reads the engine cap (identity in practice — ids start tiny).
+    texture_layer_cap: u16,
     /// Occlusion visible set (rebuilt at stream sync point, read by render).
     occlusion: Occlusion,
     /// Occlusion visible set needs rebuild (input-triggered on centre/chunk/connectivity change).
@@ -604,6 +611,8 @@ impl World {
             light_gate: streaming::LightGate::default(),
             done_scratch: Vec::new(),
             textures_built: 0,
+            texture_cache: Vec::new(),
+            texture_layer_cap: u16::MAX,
             occlusion: Occlusion::default(),
             occlusion_dirty: Sticky::default(),
             occlusion_active: false,

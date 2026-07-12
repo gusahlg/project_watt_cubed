@@ -515,11 +515,22 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // scripted path anyway).
         g.draw(eng, &mut mods, settings.fov, 0.0);
 
-        if !g.world().entry_complete() {
+        // Captures additionally wait for the fully-refined far field: a coarse
+        // ancestor cover is entry-playable, but refinement landing later moves
+        // horizon pixels — and, through the exposure meter, the whole frame's
+        // brightness — which made blessed shots run-to-run flaky.
+        let entry = g.world().entry_complete();
+        let refined = !matches!(stage.kind, StageKind::Capture { .. })
+            || g.world().far_field_refined();
+        if !entry || !refined {
             frame += 1;
             // Sample a few times a second (entry_debug scans the box — not per frame).
             if frame.is_multiple_of(20) {
-                let sig = g.world().entry_debug();
+                let sig = if entry {
+                    format!("far field refining… sections pending: {}", g.world().far_field_pending())
+                } else {
+                    g.world().entry_debug()
+                };
                 if sig != last_sig {
                     eprintln!("harness: streaming… {sig}");
                     last_sig = sig;

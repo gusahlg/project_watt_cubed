@@ -385,20 +385,45 @@ mod tests {
 
     #[test]
     fn palette_gc_reclaims_dead_entries() {
-        // Drive a palette to saturation with distinct ids, then overwrite them
-        // all: the next new id must GC the strays instead of paying full width.
+        // Saturate the palette with distinct ids, then leave only two alive:
+        // the next NEW id must GC the strays instead of paying full width.
         let mut chunk = Chunk::from_uniform(0, 0, 0, BlockId(0));
         for i in 0..PALETTE_MAX {
-            chunk.set_index(i, BlockId((i % 256) as u8));
+            chunk.set_index(i, BlockId(i as u16));
         }
-        // Palette now holds every id 0..=255. Overwrite all cells to id 0.
-        for i in 0..CHUNK_VOLUME {
-            chunk.set_index(i, BlockId(0));
+        // Overwrite all but the last cell (an all-equal write would collapse to
+        // Uniform — the other reclaim path, tested elsewhere).
+        for i in 0..CHUNK_VOLUME - 1 {
+            chunk.set_index(i, BlockId(1));
         }
-        // (The all-equal write collapsed it back to Uniform along the way —
-        // which IS the reclaim. Verify reads survived the churn.)
-        assert_eq!(chunk.uniform(), Some(BlockId(0)));
-        assert_eq!(chunk.get_local(3, 3, 3), BlockId(0));
+        assert!(matches!(chunk.data(), ChunkData::Paletted { palette, .. } if palette.len() == PALETTE_MAX));
+
+        chunk.set_index(0, BlockId(999)); // palette full — must GC, not promote
+        match chunk.data() {
+            ChunkData::Paletted { palette, .. } => {
+                assert_eq!(palette.len(), 3, "GC kept only the live ids plus the new one")
+            }
+            other => panic!("expected GC'd Paletted, got a {other:?} variant"),
+        }
+        assert_eq!(chunk.get_index(0), BlockId(999));
+        assert_eq!(chunk.get_index(CHUNK_VOLUME - 1), BlockId(0));
+        assert_eq!(chunk.get_index(100), BlockId(1));
+    }
+
+    #[test]
+    fn past_256_distinct_blocks_one_chunk_pays_full_width() {
+        // A museum wall: more distinct blocks than the u8 index space. Storage
+        // must promote to Dense (one full id per cell) and stay correct, never
+        // panic — this is legal play under the widened global palette.
+        let mut chunk = Chunk::from_uniform(0, 0, 0, BlockId(0));
+        for i in 0..300 {
+            chunk.set_index(i, BlockId(1000 + i as u16));
+        }
+        assert!(matches!(chunk.data(), ChunkData::Dense(_)), "257th distinct id promotes");
+        for i in 0..300 {
+            assert_eq!(chunk.get_index(i), BlockId(1000 + i as u16));
+        }
+        assert_eq!(chunk.get_index(400), BlockId(0), "untouched cells keep the old fill");
     }
 
     #[test]

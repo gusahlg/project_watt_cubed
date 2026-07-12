@@ -592,6 +592,7 @@ mod tests {
             layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             emission: vec![0, 0, 15].into(),         // id 2 emits 15
             water: vec![false, false, false].into(),
+            ..HotTables::default()
         }
     }
 

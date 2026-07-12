@@ -284,7 +284,9 @@ fn emit(
         MeshVertex::new(
             [pos[0] as u8, pos[1] as u8, pos[2] as u8],
             dir.normal,
-            layer,
+            // Vertex layer only (tables above index by the true id); wraps
+            // past the device texture-layer cap like the chunk mesher.
+            layer % tables.layer_cap,
             Ao::NONE,
             Light::new(sample.sky, 0),
             false,

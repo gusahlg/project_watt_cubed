@@ -370,7 +370,13 @@ impl App {
 
     /// Create a fresh world with a time-seeded generator and enter it.
     fn start_new_world(&mut self, eng: &mut Engine) {
-        let seed = fresh_seed();
+        // Benchmarks pin the seed (`WATT_BENCH_SEED`, default when benching) so
+        // fps/rss deltas measure the code, not terrain-lottery variance.
+        let seed = match (&self.bench, std::env::var("WATT_BENCH_SEED")) {
+            (_, Ok(s)) => s.parse().unwrap_or_else(|_| fresh_seed()),
+            (Some(_), _) => 42,
+            (None, _) => fresh_seed(),
+        };
         let world = World::new(seed);
         let player = spawn_player(&world);
         let id = save::fresh_id();

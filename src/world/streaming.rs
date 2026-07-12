@@ -1109,6 +1109,39 @@ impl World {
         true
     }
 
+    /// Every desired far-field section is itself Ready — the strongest far-field
+    /// state. `entry_complete` accepts a Ready *ancestor* as covering (right for
+    /// playability), but a coarse cover moves the horizon's pixels — and through
+    /// the exposure meter, the whole frame's brightness — as refinement lands.
+    /// The golden harness gates captures on this so blessed shots are the
+    /// converged frame; gameplay never waits on it.
+    pub fn far_field_refined(&self) -> bool {
+        let Some(center) = self.center else { return false };
+        if !self.lod2 {
+            return true;
+        }
+        if !self.section_upload_queue.is_empty() {
+            return false;
+        }
+        self.desired_sections(center)
+            .into_iter()
+            .all(|c| self.sections.get(&c).is_some_and(|s| s.is_ready()))
+    }
+
+    /// How many desired far-field sections still lack their own mesh — the
+    /// harness's progress signal while it waits on
+    /// [`far_field_refined`](Self::far_field_refined).
+    pub fn far_field_pending(&self) -> usize {
+        let Some(center) = self.center else { return 0 };
+        if !self.lod2 {
+            return 0;
+        }
+        self.desired_sections(center)
+            .into_iter()
+            .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
+            .count()
+    }
+
     /// Human-readable reason `entry_complete` is not yet true — the first
     /// unsatisfied clause with a count, so a stalled bless/harness run says WHICH
     /// streaming stage is stuck instead of hanging silently. Clause order mirrors
@@ -1248,15 +1281,35 @@ impl World {
         // while `&mut self.tables` is held, so bind `registry` separately.
         let count = self.registry.block_count();
         let registry = &self.registry;
-        self.tables.sync(Revision::from_count(count), || registry.hot_tables());
+        let layer_cap = self.texture_layer_cap;
+        self.tables.sync(Revision::from_count(count), || {
+            let mut tables = registry.hot_tables();
+            tables.layer_cap = layer_cap;
+            tables
+        });
     }
 
     /// Rebuild/upload block texture array on palette growth (rare: world entry or new block type).
+    /// The per-id layer cache makes growth O(new blocks), not O(palette).
     fn refresh_textures(&mut self, eng: &mut Engine) {
+        // Never zero (modulo divisor) and never past the vertex field's u16.
+        self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
         let count = self.registry.block_count();
         if self.textures_built != count {
-            let layers = crate::block::texture::build_block_textures(&self.registry);
-            eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, &layers);
+            for i in self.texture_cache.len()..count {
+                self.texture_cache.push(crate::block::texture::build_block_texture(
+                    &self.registry,
+                    crate::block::registry::BlockId(i as u16),
+                ));
+            }
+            let visible = count.min(self.texture_layer_cap as usize);
+            if count > visible && self.textures_built <= visible {
+                eprintln!(
+                    "block palette ({count}) exceeds the device texture-layer cap \
+                     ({visible}); further block textures wrap onto existing layers"
+                );
+            }
+            eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, &self.texture_cache[..visible]);
             self.textures_built = count;
         }
     }

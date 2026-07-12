@@ -599,7 +599,11 @@ impl Game {
             self.coord_cache = (key.0, key.1, key.2, text);
         }
         let coord_text = self.coord_cache.3.clone();
-        let fps_text = format!("{:2} FPS", eng.fps());
+        // Scripted (harness) frames pin the readout: a live FPS number is the
+        // one nondeterministic pixel region in an otherwise reproducible shot,
+        // and golden diffs must only ever see real rendering drift.
+        let fps_text =
+            if self.scripted { "-- FPS".to_string() } else { format!("{:2} FPS", eng.fps()) };
         let screen_w = eng.screen_width();
         let screen_h = eng.screen_height();
         let screen = (screen_w, screen_h);
@@ -626,10 +630,15 @@ impl Game {
         } else {
             voxel_engine::skeleton::Exposure::DEFAULT
         };
+        // Scripted (harness) frames pin the dither phase: capture lands on an
+        // arbitrary frame index under uncapped pacing, and a cycling blue-noise
+        // phase is per-run LSB wobble on gradient/blend surfaces (water) that a
+        // golden diff must never see.
+        let dither_frame = if self.scripted { 0 } else { self.frame_index };
         let snapshot = crate::frame_snapshot::compose(
             &self.sky,
             pose.eye,
-            self.frame_index,
+            dither_frame,
             exposure,
             &self.render,
         );

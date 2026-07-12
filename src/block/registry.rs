@@ -18,13 +18,14 @@ use crate::block::element::{CoreProperties, El, ElementId, ElementRegistry, Spec
 use crate::block::reaction::{ActiveReaction, ReactionRegistry, apply_reactions};
 use crate::macros::blocks;
 
-/// A compact handle to a registered block. Voxels store this (1 byte), so a chunk
-/// is just a flat array of ids into the registry. The [`MAX_BLOCK_TYPES`] cap keeps
-/// every id inside the `u8` space.
+/// A compact handle to a registered block. Chunks store these through per-chunk
+/// palettes (cells stay one byte — see [`ChunkData`](crate::world::chunk::ChunkData)),
+/// so widening the id space costs no chunk memory. The [`MAX_BLOCK_TYPES`] cap
+/// keeps every id inside the mesh vertex's 14-bit texture-layer field.
 ///
 /// [`MAX_BLOCK_TYPES`]: BlockRegistry::MAX_BLOCK_TYPES
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BlockId(pub u8);
+pub struct BlockId(pub u16);
 
 /// Empty space. Always id `0`, the only non-solid block.
 pub const AIR: BlockId = BlockId(0);
@@ -64,7 +65,6 @@ pub struct BlockRegistry {
 /// at one revision (the registry is append-only, so `block_count()` stamps it) —
 /// no window in which `solid` is fresh but `opaque` is stale. Handed to worker
 /// mesh jobs behind an `Arc` via [`crate::derived::Derived`].
-#[derive(Default)]
 pub struct HotTables {
     pub solid: Box<[bool]>,
     pub opaque: Box<[bool]>,
@@ -78,6 +78,24 @@ pub struct HotTables {
     /// animated water shading. Water and glass share [`Pass::Blend`], so this,
     /// not the pass, is what distinguishes them at the fragment.
     pub water: Box<[bool]>,
+    /// The device's texture-array layer ceiling; the mesher emits
+    /// `id % layer_cap` as the vertex layer. Identity while the palette fits
+    /// (every id < cap — the common case). Never zero: defaults to `u16::MAX`
+    /// and the world stamps the real cap when it refreshes tables.
+    pub layer_cap: u16,
+}
+
+impl Default for HotTables {
+    fn default() -> Self {
+        Self {
+            solid: Box::default(),
+            opaque: Box::default(),
+            layer: Box::default(),
+            emission: Box::default(),
+            water: Box::default(),
+            layer_cap: u16::MAX,
+        }
+    }
 }
 
 impl BlockRegistry {
@@ -165,6 +183,9 @@ impl BlockRegistry {
                 .zip(self.layer.iter())
                 .map(|(&b, &l)| b > 0 && l == Pass::Blend)
                 .collect(),
+            // The registry owns no device knowledge; the world stamps the real
+            // cap right after (see `World::refresh_tables`).
+            layer_cap: u16::MAX,
         }
     }
 
@@ -184,11 +205,13 @@ impl BlockRegistry {
         &self.elements
     }
 
-    /// How many distinct blocks are registered.
-    /// Hard cap on distinct block types: the mesher stores the texture-array
-    /// layer as a u8 (vertex color alpha), and it also bounds what remote
-    /// network specs can make a client's palette (and texture memory) grow to.
-    pub const MAX_BLOCK_TYPES: usize = 256;
+    /// Hard cap on distinct block types: the packed mesh vertex carries the
+    /// texture-array layer in a 14-bit field (the engine's `MASK_LAYER`), and it
+    /// also bounds what remote network specs can make a client's palette (and
+    /// texture memory) grow to. Distinct *looks* saturate earlier at the GPU's
+    /// `maxImageArrayLayers` (commonly 2048) — past that, layers wrap with a loud
+    /// log but registration never fails.
+    pub const MAX_BLOCK_TYPES: usize = 16_384;
 
     /// Whether the palette can still take a NEW composition.
     pub fn at_capacity(&self) -> bool {
@@ -286,7 +309,7 @@ impl BlockRegistry {
         emission: u8,
         color: Color,
     ) -> BlockId {
-        let id = BlockId(self.blocks.len() as u8);
+        let id = BlockId(self.blocks.len() as u16);
         self.blocks.push(block);
         self.solid.push(solid);
         self.buoyancy.push(buoyancy);
@@ -450,7 +473,7 @@ mod tests {
         let reg = BlockRegistry::with_builtins();
         let hot = reg.hot_tables();
         for i in 0..reg.block_count() {
-            let id = BlockId(i as u8);
+            let id = BlockId(i as u16);
             let block = reg.block(id);
             let solid = derive::derive_solid(&block.composition);
             assert_eq!(reg.is_solid(id), solid);
@@ -469,7 +492,7 @@ mod tests {
     fn dump_colors() {
         let reg = BlockRegistry::with_builtins();
         for i in 0..reg.block_count() {
-            let id = BlockId(i as u8);
+            let id = BlockId(i as u16);
             let c = reg.color(id);
             let name = &reg.block(id).name;
             eprintln!("id={i} name={name} rgba=({},{},{},{})", c.r, c.g, c.b, c.a);
@@ -523,23 +546,29 @@ mod tests {
         use crate::block::element::ElementId;
         let mut reg = BlockRegistry::with_builtins();
         let n = reg.elements().len() as u16;
-        // Fill the palette to its cap with distinct three-element natural blocks.
+        // Fill the palette to its cap with distinct two-element mixtures: element
+        // pairs × 99 split ratios comfortably exceeds MAX_BLOCK_TYPES.
         'fill: for i in 0..n {
             for j in (i + 1)..n {
-                for k in (j + 1)..n {
+                for p in 1..=99u8 {
                     if reg.at_capacity() {
                         break 'fill;
                     }
-                    reg.natural(&[ElementId(i), ElementId(j), ElementId(k)]);
+                    reg.mixture(&[(ElementId(i), p), (ElementId(j), 100 - p)])
+                        .expect("distinct mixture registers below the cap");
                 }
             }
         }
-        assert!(reg.at_capacity(), "test needs enough elements to fill the palette");
+        assert!(reg.at_capacity(), "test needs enough element pairs to fill the palette");
         assert_eq!(reg.block_count(), BlockRegistry::MAX_BLOCK_TYPES);
         // A brand-new composition past the cap is refused, not truncated into a
-        // colliding u8 voxel id.
+        // colliding voxel id. (A natural and a three-way mixture — neither shape
+        // was registered by the pair fill.)
         assert_eq!(reg.natural(&[ElementId(0), ElementId(1), ElementId(2), ElementId(3)]), None);
-        assert_eq!(reg.mixture(&[(ElementId(0), 60), (ElementId(1), 40)]), Err(MixError::Full));
+        assert_eq!(
+            reg.mixture(&[(ElementId(0), 50), (ElementId(1), 30), (ElementId(2), 20)]),
+            Err(MixError::Full)
+        );
         assert_eq!(reg.block_count(), BlockRegistry::MAX_BLOCK_TYPES);
     }
 

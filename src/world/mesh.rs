@@ -47,16 +47,15 @@ const PAD: usize = CHUNK_SIZE + 2;
 /// Cells in one [`Padded`] buffer.
 const PAD_VOL: usize = PAD * PAD * PAD;
 
-// Thread-local free list of [`Padded`] backing buffers. Each `Padded`
-// constructor (`capture`/`from_columns`/`uniform`) allocated a fresh
-// `PAD_VOL`-byte `Box<[u8]>` per call — the per-job neighbourhood-snapshot churn
-// the LOD-tile mesher pays on the worker (via `from_columns`) and the streamer
-// pays per remesh (via `capture`). Buffers are reclaimed on [`Drop`] and reused.
-// Bounded ([`PADDED_POOL_CAP`]) so the cross-thread path (a `capture`d
-// neighbourhood built on the main thread and dropped on a worker) can only
-// migrate a handful of buffers into a worker's list, not grow without bound.
+// Thread-local free list of [`Padded`] backing buffers. `Padded::capture`
+// allocated a fresh `PAD_VOL`-cell buffer per call — the per-remesh
+// neighbourhood-snapshot churn the streamer pays. Buffers are reclaimed on
+// [`Drop`] and reused. Bounded ([`PADDED_POOL_CAP`]) so the cross-thread path
+// (a `capture`d neighbourhood built on the main thread and dropped on a
+// worker) can only migrate a handful of buffers into a worker's list, not
+// grow without bound.
 thread_local! {
-    static PADDED_POOL: RefCell<Vec<Box<[u8]>>> = const { RefCell::new(Vec::new()) };
+    static PADDED_POOL: RefCell<Vec<Box<[u16]>>> = const { RefCell::new(Vec::new()) };
 }
 /// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
 /// single job holds at most one live neighbourhood at a time.
@@ -72,7 +71,7 @@ const PADDED_POOL_CAP: usize = 4;
 /// at a chunk edge fall into a neighbour's *interior* layer), and the own-cell
 /// scan — so there is no interior/border special-casing anywhere.
 pub struct Padded {
-    ids: Box<[u8]>, // PAD*PAD*PAD, raw BlockId bytes
+    ids: Box<[u16]>, // PAD*PAD*PAD, raw BlockId values
 }
 
 impl Padded {
@@ -81,11 +80,11 @@ impl Padded {
         (x + 1) as usize + (z + 1) as usize * PAD + (y + 1) as usize * PAD * PAD
     }
 
-    /// A `PAD_VOL`-byte buffer, recycled from [`PADDED_POOL`] if one is available
+    /// A `PAD_VOL`-cell buffer, recycled from [`PADDED_POOL`] if one is available
     /// (else freshly allocated). Contents are UNSPECIFIED — a recycled buffer
     /// holds a previous job's voxels — so every caller must fully initialise it
     /// (`fill` then, where partial, overwrite the touched cells) before use.
-    fn take_buf() -> Box<[u8]> {
+    fn take_buf() -> Box<[u16]> {
         PADDED_POOL
             .with_borrow_mut(|p| p.pop())
             .filter(|b| b.len() == PAD_VOL)
@@ -137,39 +136,6 @@ impl Padded {
         Self { ids }
     }
 
-    /// Uniform padded neighbourhood for LOD tile early-out (all cells same block).
-    pub fn uniform(id: BlockId) -> Self {
-        let mut ids = Self::take_buf();
-        ids.fill(id.0); // full overwrite: clears any recycled contents
-        Self { ids }
-    }
-
-    /// Build a padded neighbourhood one vertical column at a time: `col(x, z, out)`
-    /// fills the `PAD` cells of the `(x, z)` column — padded-y `-1..=16` in order —
-    /// into `out`. Used by the far LOD tile mesher, whose "neighbours" are coarser
-    /// cells of the same pure generator, so the shell is sampled directly (no
-    /// neighbour-tile handshake) — a fully-buried coarse tile meshes to *nothing*
-    /// (its solid shell hides every interior face) exactly as a buried chunk does.
-    ///
-    /// The column-shaped interface (vs. a per-cell `Fn(x,y,z)`) lets the sampler
-    /// compute its per-column terrain profile once and reuse it down the run — the
-    /// dominant cost of a far tile — which a point-shaped fill cannot express.
-    pub fn from_columns(mut col: impl FnMut(i32, i32, &mut [BlockId])) -> Self {
-        // No pre-clear: the loop below covers every (x, z) column across the full
-        // `-1..=CS` padded range and every padded-y cell of each, so a recycled
-        // buffer is fully overwritten.
-        let mut ids = Self::take_buf();
-        let mut buf = [AIR; PAD];
-        for z in -1..=CS {
-            for x in -1..=CS {
-                col(x, z, &mut buf);
-                for (yi, id) in buf.iter().enumerate() {
-                    ids[Self::index(x, yi as i32 - 1, z)] = id.0;
-                }
-            }
-        }
-        Self { ids }
-    }
 }
 
 impl Drop for Padded {
@@ -457,7 +423,10 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
         MeshVertex::new(
             pos,
             dir.normal,
-            sample.id.0,
+            // Vertex layer only — table lookups stay on the true id. Wraps
+            // once the palette outgrows the device's texture-layer cap
+            // (identity below it; the growth path logs the crossing once).
+            sample.id.0 % tables.layer_cap,
             Ao::new(sample.ao[i]),
             Light::new(sample.sky[i], sample.block[i]),
             tables.water[sample.id.0 as usize],
@@ -510,11 +479,74 @@ mod tests {
             layer: vec![Pass::Opaque, Pass::Opaque, Pass::Opaque].into(),
             emission: vec![0, 0, 0].into(),
             water: vec![false, false, false].into(),
+            ..HotTables::default()
         }
     }
 
     fn empty_chunk() -> Chunk {
         Chunk::new(0, 0, 0, &EmptyGen)
+    }
+
+    #[test]
+    fn blocks_past_the_old_u8_cap_mesh_with_their_own_layer() {
+        // A block id above 255 must reach the vertex intact — the whole point
+        // of the 14-bit layer field. Real registry, grown past the old cap.
+        let mut reg = crate::block::registry::BlockRegistry::with_builtins();
+        let els = 0..reg.elements().len() as u16;
+        let mut high = AIR;
+        'grow: for i in els.clone() {
+            for j in els.clone().filter(|&j| j > i) {
+                for p in 1..=99u8 {
+                    use crate::block::element::ElementId;
+                    high = reg
+                        .mixture(&[(ElementId(i), p), (ElementId(j), 100 - p)])
+                        .expect("mixture registers below the cap");
+                    if reg.block_count() > 300 {
+                        break 'grow;
+                    }
+                }
+            }
+        }
+        assert!(high.0 > 255, "registry grew past the old u8 cap");
+
+        let mut chunk = Chunk::from_uniform(0, 0, 0, AIR);
+        chunk.set_local(8, 8, 8, high);
+        let real = reg.hot_tables(); // layer_cap = u16::MAX → identity
+        let mut out = new_chunk_mesh_data();
+        build_chunk_mesh(&solo(&chunk), None, &real, &PaddedLight::full(), &mut out);
+        let pass = real.layer[high.0 as usize];
+        let layers: Vec<u16> = out[pass].vertices().iter().map(|v| v.layer()).collect();
+        assert!(!layers.is_empty(), "the lone block meshed");
+        assert!(layers.iter().all(|&l| l == high.0), "vertex carries the full 14-bit id");
+    }
+
+    #[test]
+    fn vertex_layers_wrap_at_the_device_texture_cap() {
+        // Past the device's texture-layer ceiling the mesher wraps the VERTEX
+        // layer only (tables still index the true id) — crafting keeps working
+        // on min-spec GPUs, textures just repeat.
+        let high = BlockId(300);
+        let mut chunk = Chunk::from_uniform(0, 0, 0, AIR);
+        chunk.set_local(8, 8, 8, high);
+        // Air (id 0) stays non-solid/clear or the lone block's faces get culled.
+        let flags = |v: bool| {
+            let mut f = vec![v; 301];
+            f[0] = false;
+            f.into()
+        };
+        let t = HotTables {
+            solid: flags(true),
+            opaque: flags(true),
+            layer: vec![Pass::Opaque; 301].into(),
+            emission: vec![0; 301].into(),
+            water: vec![false; 301].into(),
+            layer_cap: 256, // a min-spec-ish ceiling
+        };
+        let mut out = new_chunk_mesh_data();
+        build_chunk_mesh(&solo(&chunk), None, &t, &PaddedLight::full(), &mut out);
+        let layers: Vec<u16> = out[Pass::Opaque].vertices().iter().map(|v| v.layer()).collect();
+        assert!(!layers.is_empty());
+        assert!(layers.iter().all(|&l| l == 300 % 256), "vertex layer wraps, id stays true");
     }
 
     /// A padded neighbourhood holding just `chunk` (air shell).
@@ -726,6 +758,7 @@ mod tests {
             layer: vec![Pass::Opaque, Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             emission: vec![0, 0, 0, 0].into(),
             water: vec![false, false, false, false].into(),
+            ..HotTables::default()
         };
         let mut chunk = empty_chunk();
         chunk.set_local(5, 5, 5, GLASS);
