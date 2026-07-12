@@ -66,9 +66,16 @@ nix develop
 cargo run --release
 
 # Or build/run the packaged binary directly:
-nix run
+./play.sh   # re-pins the ../voxel-engine flake input, then `nix run`
 nix build   # produces ./result/bin/project_watt_cubed
 ```
+
+A plain `nix run` also works, but note the trap `play.sh` exists to avoid:
+the flake copies `../voxel-engine` into the Nix store when the lock file is
+written, so after any engine change a bare `nix run` builds the current game
+against a stale engine snapshot and fails with phantom missing-API errors.
+`nix flake update voxel-engine` re-pins it (the dev-shell `cargo` path always
+uses the live sibling and never needs this).
 
 On macOS, install MoltenVK and the Vulkan loader once (`brew install
 molten-vk vulkan-loader`) and use plain `cargo run --release`.
