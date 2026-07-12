@@ -557,8 +557,14 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             }
             StageKind::Capture { path } => {
                 // The frame is already drawn (single advance point above); capture
-                // re-presents `last_lists` straight to `path`.
-                let r = voxel_engine::skeleton::screenshot_to(eng, path).map_err(|e| e.to_string());
+                // re-presents `last_lists` straight to `path`. A fresh checkout has
+                // no golden dir yet (goldens ship unblessed), so create the parent
+                // here — the first-ever `bless` must not fail on ENOENT.
+                let r = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| voxel_engine::skeleton::screenshot_to(eng, path))
+                    .map_err(|e| e.to_string());
                 sink.borrow_mut().captures.insert(path.clone(), r);
                 true
             }
