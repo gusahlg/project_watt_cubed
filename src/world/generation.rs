@@ -86,19 +86,18 @@ pub trait TerrainGenerator {
     /// every cell agrees; [`Terrain`] overrides it with shortcuts.
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let y0 = cy * CHUNK_SIZE as i32;
-        let mut cells = Box::new([0u8; CHUNK_VOLUME]);
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 let wx = cx * CHUNK_SIZE as i32 + lx as i32;
                 let wz = cz * CHUNK_SIZE as i32 + lz as i32;
                 let height = self.height(wx, wz);
                 for ly in 0..CHUNK_SIZE {
-                    let id = self.block_at(wx, y0 + ly as i32, wz, height);
-                    cells[Chunk::index(lx, ly, lz)] = id.0;
+                    cells[Chunk::index(lx, ly, lz)] = self.block_at(wx, y0 + ly as i32, wz, height);
                 }
             }
         }
-        collapse(cells)
+        ChunkData::from_cells(cells)
     }
 
     /// Generate a whole vertical run of chunks at horizontal column `(cx, cz)`,
@@ -108,16 +107,6 @@ pub trait TerrainGenerator {
     /// sharing) — [`Terrain`] overrides it with the profile-sharing fast path.
     fn generate_column(&self, cx: i32, cz: i32, cy: RangeInclusive<i32>) -> Vec<(i32, ChunkData)> {
         cy.map(|cyy| (cyy, self.generate(cx, cyy, cz))).collect()
-    }
-}
-
-/// Collapse a dense fill to `Uniform` when every cell came out identical.
-fn collapse(cells: Box<[u8; CHUNK_VOLUME]>) -> ChunkData {
-    let first = cells[0];
-    if cells.iter().all(|&c| c == first) {
-        ChunkData::Uniform(BlockId(first))
-    } else {
-        ChunkData::Dense(cells)
     }
 }
 
@@ -1385,7 +1374,7 @@ impl Terrain {
             }
         }
 
-        let mut cells = Box::new([0u8; CHUNK_VOLUME]);
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
         let islands_possible = y1 + 4 >= self.islands.band_bottom() && y0 <= self.islands.band_top();
         let mut isl: [bool; CHUNK_SIZE + 4];
         for lz in 0..CHUNK_SIZE {
@@ -1444,11 +1433,11 @@ impl Terrain {
                             }
                         }
                     }
-                    cells[Chunk::index(lx, ly, lz)] = id.0;
+                    cells[Chunk::index(lx, ly, lz)] = id;
                 }
             }
         }
-        collapse(cells)
+        ChunkData::from_cells(cells)
     }
 }
 

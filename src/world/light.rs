@@ -623,13 +623,13 @@ mod tests {
         // A full opaque layer at y=5 seals the lower half: with no gap for the
         // horizontal skylight flood to leak through, everything below is dark,
         // while the open cells above are lit to the layer.
-        let mut cells = [0u8; CHUNK_VOLUME];
+        let mut cells = [BlockId(0); CHUNK_VOLUME];
         for z in 0..16 {
             for x in 0..16 {
-                cells[Chunk::index(x, 5, z)] = 1; // opaque floor across the chunk
+                cells[Chunk::index(x, 5, z)] = BlockId(1); // opaque floor across the chunk
             }
         }
-        let chunk = Chunk::from_dense(0, 0, 0, Box::new(cells));
+        let chunk = Chunk::from_cells(0, 0, 0, Box::new(cells));
         let grid = lit(&chunk);
 
         assert_eq!(grid.at(Chunk::index(4, 15, 4)).sky, LightLevel::FULL, "top lit");
@@ -643,7 +643,7 @@ mod tests {
         // A hollow chunk whose top is far below the terrain surface: the ceiling
         // reports the top as closed, so no skylight is seeded and the cavern is
         // dark — consistently, regardless of the 16-cell chunk alignment.
-        let chunk = Chunk::from_dense(0, -8, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let chunk = Chunk::from_cells(0, -8, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 40); // surface well above this chunk
         let mut grid = LightGrid::dark();
         propagate(&chunk, &FaceShell::dark(), &ceiling, -128, &tables(), &mut grid);
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn blocklight_falls_off_by_one_per_step() {
-        let mut chunk = Chunk::from_dense(0, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let mut chunk = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         chunk.set_local(8, 8, 8, BlockId(2)); // emitter, level 15
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // fully underground: isolate blocklight
         let mut grid = LightGrid::dark();
@@ -711,9 +711,9 @@ mod tests {
     #[test]
     fn settle_reaches_a_fixpoint_across_a_border() {
         let tables = tables();
-        let mut left_c = Chunk::from_dense(0, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let mut left_c = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         left_c.set_local(14, 8, 8, BlockId(2)); // emitter near the +X border
-        let right_c = Chunk::from_dense(1, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let right_c = Chunk::from_cells(1, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // underground: isolate blocklight
 
         // Shell with one neighbour across face (dark elsewhere).

@@ -74,15 +74,25 @@ impl Connectivity {
     /// module knowing which. Keys on *opacity*, not solidity: water/glass are solid
     /// but see-through, so a sightline passes through them.
     pub fn compute(chunk: &Chunk, blocks_sight: impl Fn(BlockId) -> bool) -> Connectivity {
-        let cells = match chunk.data() {
+        match chunk.data() {
             // Uniform chunks need no scan: opaque seals everything, see-through opens it.
             ChunkData::Uniform(id) => {
-                return if blocks_sight(*id) { Self::SEALED } else { Self::OPEN };
+                if blocks_sight(*id) { Self::SEALED } else { Self::OPEN }
             }
-            ChunkData::Dense(cells) => cells,
-        };
-        let passable = |i: usize| !blocks_sight(BlockId(cells[i]));
+            // One classify per palette entry up front; the fill then reads a
+            // bool per cell instead of re-classifying ids — faster than the
+            // old per-cell closure over global ids.
+            ChunkData::Paletted { palette, cells } => {
+                let sight: Vec<bool> = palette.iter().map(|&id| blocks_sight(id)).collect();
+                Self::flood(|i| !sight[cells[i] as usize])
+            }
+            ChunkData::Dense(cells) => Self::flood(|i| !blocks_sight(cells[i])),
+        }
+    }
 
+    /// The pocket flood fill over an abstract passability predicate — shared by
+    /// every dense representation.
+    fn flood(passable: impl Fn(usize) -> bool) -> Connectivity {
         let mut visited = [false; CHUNK_VOLUME];
         let mut conn = Connectivity::SEALED;
         let mut stack: Vec<usize> = Vec::new();
@@ -240,17 +250,17 @@ mod tests {
         id == STONE
     }
 
-    /// A dense chunk built from a per-cell fill closure.
+    /// A mixed chunk built from a per-cell fill closure.
     fn dense(mut fill: impl FnMut(usize, usize, usize) -> BlockId) -> Chunk {
-        let mut cells = Box::new([0u8; CHUNK_VOLUME]);
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
-                    cells[Chunk::index(x, y, z)] = fill(x, y, z).0;
+                    cells[Chunk::index(x, y, z)] = fill(x, y, z);
                 }
             }
         }
-        Chunk::from_dense(0, 0, 0, cells)
+        Chunk::from_cells(0, 0, 0, cells)
     }
 
     #[test]

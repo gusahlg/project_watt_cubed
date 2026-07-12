@@ -698,7 +698,17 @@ mod tests {
     fn uniform_solid_fast_path_matches_a_dense_fill() {
         let uniform = Chunk::new(0, 0, 0, &SolidGen);
         assert_eq!(uniform.uniform(), Some(STONE));
-        let dense = Chunk::from_dense(0, 0, 0, Box::new([STONE.0; CHUNK_VOLUME]));
+        // All-stone content in a NON-uniform representation (from_cells would
+        // collapse it), so the two mesh paths really diverge below.
+        let dense = Chunk::from_data(
+            0,
+            0,
+            0,
+            super::super::chunk::ChunkData::Paletted {
+                palette: vec![STONE],
+                cells: Box::new([0u8; CHUNK_VOLUME]),
+            },
+        );
         assert!(dense.uniform().is_none());
 
         let (a, b) = (build(&uniform), build(&dense));
