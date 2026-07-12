@@ -481,8 +481,20 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
     let mut settle_start: Option<Instant> = None;
     let mut sample_total_ms = 0f32;
     let mut sample_n = 0u32;
+    let mut floated = false;
 
     voxel_engine::run(scripted_config(), move |eng| {
+        // First frame of the whole run: pull our just-opened (and therefore
+        // focused) window out of the tiling layout. gharial ignores the
+        // fixed-size hint and re-splits the column the moment another window
+        // on the tag is touched mid-run — which resizes the swapchain and
+        // breaks every later capture. Floating keeps the requested size for
+        // the whole run. Best-effort: no gharialctl (other WMs, CI) → no-op;
+        // a mis-timed focus is caught by the capture-dimension guard anyway.
+        if !floated {
+            floated = true;
+            let _ = std::process::Command::new("gharialctl").arg("toggle-float").status();
+        }
         let stage = &stages[idx];
         // First frame of a stage: (re)build its scripted game and reset the
         // per-stage watchdog / sample accumulators.
