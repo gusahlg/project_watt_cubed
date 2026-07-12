@@ -62,6 +62,7 @@ pub fn to_doc(
 
     Ok(SaveDoc {
         meta,
+        worldgen_version: crate::world::placement::WORLDGEN_VERSION,
         player: PlayerState {
             pos: [player.position.x, player.position.y, player.position.z],
             yaw: player.yaw,
@@ -79,6 +80,19 @@ pub fn to_doc(
 /// into `mods`. Total: unknown specs degrade to air, exactly like the network
 /// path.
 pub fn from_doc(doc: SaveDoc, mods: &mut Mods) -> (World, Player, SaveMeta) {
+    // Warn, never reject: the seed regenerates terrain fine, but a save from
+    // another worldgen replays its edits over terrain whose MATERIALS may have
+    // moved (a mined-out iron vein may now sit in coal). Geometry never moves
+    // across worldgen versions — that invariant is what keeps old saves sane.
+    if doc.worldgen_version != crate::world::placement::WORLDGEN_VERSION {
+        eprintln!(
+            "save '{}' was written by worldgen v{} (current v{}): terrain materials \
+             may differ under old edits",
+            doc.meta.name,
+            doc.worldgen_version,
+            crate::world::placement::WORLDGEN_VERSION,
+        );
+    }
     let mut world = World::new(doc.meta.seed);
 
     let mut player = Player::new(DVec3::new(

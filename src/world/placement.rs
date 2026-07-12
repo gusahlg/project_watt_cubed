@@ -27,6 +27,15 @@ use crate::block::registry::{BlockId, BlockRegistry};
 /// staying far inside `MAX_BLOCK_TYPES`.
 pub const ENUM_CAP: usize = 1024;
 
+/// Bumped whenever the same (seed, coord) can yield different chunk MATERIALS
+/// than before. Saves stamp it (loader warns on mismatch — edits replay over
+/// terrain whose materials moved) and the join handshake folds it into the
+/// protocol version (mixed peers get an error instead of silent divergence).
+/// v1: the legacy hand-written picker. v2: element-first placement (this
+/// module) — grass/dirt became their natural unions, Obsidian gained its
+/// stone host, overlap pairs / beach edges / cave-wall Lumin exist.
+pub const WORLDGEN_VERSION: u16 = 2;
+
 /// Scattered stream B rarities are stream A's scaled down by this — pairs stay
 /// genuine finds (P(pair) ~ p²/8 per stone cell), singles move by ~+12%.
 pub const STREAM_B_SCALE: u32 = 8;

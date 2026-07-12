@@ -125,6 +125,7 @@ mod tests {
         use super::super::format::{PlayerState, SaveDoc, encode};
         use super::super::slot::SaveMeta;
         encode(&SaveDoc {
+            worldgen_version: 2,
             meta: SaveMeta {
                 name: "auto".to_string(),
                 seed: 1,

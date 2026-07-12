@@ -25,7 +25,10 @@ pub mod server;
 
 /// The protocol revision. Client and server must match exactly, checked at join.
 /// v2: positions are 3x f64 on the wire (far-coordinate correctness).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: element-first worldgen (worldgen v2) — chunk materials are a pure
+/// function of (seed, worldgen), so any worldgen change MUST bump this: mixed
+/// peers would silently desync on terrain contents otherwise.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The default TCP port a server listens on and a client dials.
 pub const DEFAULT_PORT: u16 = 5555;

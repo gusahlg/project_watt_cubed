@@ -177,6 +177,7 @@ mod tests {
 
     fn doc(name: &str, edits: u32) -> SaveDoc {
         SaveDoc {
+            worldgen_version: 2,
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,

@@ -1,6 +1,31 @@
 # Element-first world generation — the plan
 
-Status: agreed direction, not yet implemented.
+Status: **LANDED 2026-07-12** (`src/world/placement.rs` + the generator
+rewiring in `generation.rs`), including the Phase-4 follow-ups. Deltas from
+this document as written:
+
+- The palette cap was lifted FIRST (BlockId u16, 16,384 ids, per-chunk
+  palettes — the doc's "sanctioned future lift"), so C1's arithmetic relaxed:
+  `ENUM_CAP = 1024`. The builtin table enumerates 50 new naturals (45 ground
+  pairs, the island pair, {Soil,Organic}, {Soil,Clay}, {Soil,Sand},
+  {Stone,Obsidian}) — registry lands at 75 ids, inside the doc's estimate.
+- The generator had grown past the doc's parity table (snow, deserts, water
+  tables, overhangs, ravines, trees). The vocabulary adapted: one
+  `SurfaceKind` axis {Grassy, Shore, Snowy, Desert, BeachEdge}, plus `Flood`
+  and `Overhang` contexts (Water is an element and floods via the table).
+  Trees stay a decoration overlay, as the doc intended.
+- Stream B is DERIVED from the same authored rows (rarity ÷8), not a second
+  stream field in the vocabulary. Arity ≤ 2 holds by the two-stream dedup.
+- Cave-wall Lumin (the vision-note idea) landed with VERTICAL adjacency only
+  (cavern floors/ceilings): one column, two carve reads post-roll, and the
+  deep Uniform(stone) proof needs just two extra dormancy sups (chunk
+  above/below — same columns). Beach edges dither at +1 (1/2) and +2 (1/4).
+- Guards: save format v5 carries `worldgen_version` (v4 files load and warn);
+  `PROTOCOL_VERSION` bumped to 4 (mixed peers error instead of desyncing).
+- Tests: the geometry/material census (frozen legacy picker), stream-B
+  statistics, dither bands/rates, cave-wall adjacency invariant, proof
+  soundness vs the dense fill, v4 save compat — all in-tree and green.
+
 Discussed 2026-07-07; supersedes nothing — it *completes* the block-hierarchy
 vision by making terrain speak the same language as everything else.
 

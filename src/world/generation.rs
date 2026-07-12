@@ -831,10 +831,6 @@ const ISLAND_KEEL_H: f32 = 22.0;
 const ISLAND_DETAIL_AMP: f32 = 0.30;
 const ISLAND_BAND_SPAN: i32 = 120;
 
-/// Island ore odds — flying islands are the only natural Aerium source.
-const ISLAND_AERIUM_W: u32 = u32::MAX / 45;
-const ISLAND_QUARTZ_W: u32 = u32::MAX / 160;
-
 // ---------------------------------------------------------------------------
 // Terrain — the game's generator. `SineHills` kept as an alias so existing call
 // sites need no change.
