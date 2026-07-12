@@ -179,6 +179,7 @@ impl Game {
         settings.apply(eng);
         self.world.set_view_radius(settings.render_distance);
         self.world.set_lighting(settings.lighting, eng);
+        self.world.set_ao(settings.ao, eng);
         self.render = settings.render_config();
     }
 

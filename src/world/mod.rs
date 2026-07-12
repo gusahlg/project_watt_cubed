@@ -537,6 +537,21 @@ pub struct World {
     /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
     /// stream pass reads the engine cap (identity in practice — ids start tiny).
     texture_layer_cap: u16,
+    /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
+    /// input like `lighting`: toggling remeshes the world.
+    ao: bool,
+    /// Bumped whenever a chunk gains or loses a drawable mesh (retire installs
+    /// and frees, unloads, the free-meshes passes). `invalidate()` keeps the
+    /// previous mesh drawing, so per-edit dirtying never bumps.
+    draw_set_rev: u64,
+    /// Drawable chunk coords, rebuilt by `sync_draw_cache` when `draw_set_rev`
+    /// moved — render walks this (~live set) instead of every loaded chunk.
+    draw_cache: Vec<Coord>,
+    draw_cache_rev: u64,
+    /// Bumped whenever a non-registry meshing input stamped onto the hot
+    /// tables changes (AO today), so `refresh_tables` rebuilds even though the
+    /// block count didn't move — the count and epoch fold into one revision.
+    tables_epoch: u32,
     /// Occlusion visible set (rebuilt at stream sync point, read by render).
     occlusion: Occlusion,
     /// Occlusion visible set needs rebuild (input-triggered on centre/chunk/connectivity change).
@@ -616,6 +631,12 @@ impl World {
             textures_built: 0,
             texture_cache: Vec::new(),
             texture_layer_cap: u16::MAX,
+            ao: true,
+            tables_epoch: 0,
+            draw_set_rev: 0,
+            draw_cache: Vec::new(),
+            // Differs from `draw_set_rev` so the first stream builds the cache.
+            draw_cache_rev: u64::MAX,
             occlusion: Occlusion::default(),
             occlusion_dirty: Sticky::default(),
             occlusion_active: false,
@@ -681,11 +702,19 @@ impl World {
         // Layer 1 — full-res chunks, drawn first so they fill depth before the
         // tile backdrop. No ownership cull: the tiles under them are pushed back by
         // depth bias, not skipped, so there is no boundary to align.
+        // The drawable-coords cache (synced at the end of `stream`, the frame's
+        // last mutation point) — the walk is O(live), not O(loaded).
+        debug_assert_eq!(
+            self.draw_cache.len(),
+            self.chunks.values().filter(|l| l.state.live_meshes().is_some()).count(),
+            "draw cache went stale: a mesh-set mutation missed its draw_set_rev bump"
+        );
         let mut live = 0u64;
-        for (&coord, loaded) in &self.chunks {
+        for &coord in &self.draw_cache {
             if self.occlusion_active && !self.occlusion.is_visible(coord) {
                 continue;
             }
+            let Some(loaded) = self.chunks.get(&coord) else { continue };
             if let Some(meshes) = loaded.state.live_meshes() {
                 live += 1;
                 let origin =

@@ -386,7 +386,13 @@ fn face_sample(
         let mut cor = o;
         cor[dir.u_axis] += du;
         cor[dir.v_axis] += dv;
-        ao[i] = corner_ao(opaque_at(s1), opaque_at(s2), opaque_at(cor));
+        // AO off: every corner reads unoccluded (Ao::NONE). Beyond the flat
+        // look, uniform AO merges quads a gradient would split — a perf lever.
+        ao[i] = if tables.ao {
+            corner_ao(opaque_at(s1), opaque_at(s2), opaque_at(cor))
+        } else {
+            3
+        };
         let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
         for p in [o, s1, s2, cor] {
             if opaque_at(p) {
@@ -541,6 +547,7 @@ mod tests {
             emission: vec![0; 301].into(),
             water: vec![false; 301].into(),
             layer_cap: 256, // a min-spec-ish ceiling
+            ..HotTables::default()
         };
         let mut out = new_chunk_mesh_data();
         build_chunk_mesh(&solo(&chunk), None, &t, &PaddedLight::full(), &mut out);
@@ -688,6 +695,15 @@ mod tests {
         chunk.set_local(0, 1, 0, STONE); // wall above the first cell (its own top is culled)
         let data = build(&chunk);
         assert_eq!(quads_in_y_plane(&data, 1.0), 2, "AO from the wall splits the two exposed tops");
+
+        // The same scene with AO off: every corner reads unoccluded, so the
+        // split disappears and the run merges — the toggle's perf story.
+        let mut no_ao = tables();
+        no_ao.ao = false;
+        let mut out = new_chunk_mesh_data();
+        build_chunk_mesh(&solo(&chunk), None, &no_ao, &PaddedLight::full(), &mut out);
+        let [opaque, ..] = out.into_slots();
+        assert_eq!(quads_in_y_plane(&opaque, 1.0), 1, "AO off merges what the gradient split");
     }
 
     #[test]

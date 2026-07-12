@@ -297,6 +297,12 @@ fn scripted_config() -> voxel_engine::Config {
         width: 1280,
         height: 720,
         vsync: false,
+        // A tiling WM re-sizing the window mid-run captures at the wrong
+        // dimensions and every ImageMatch reads 100%-changed. Fixed size is a
+        // hint (a WM may still force-tile), but it keeps the window floating
+        // on the ones that honour it; the dimension check in `evaluate`
+        // reports any breach as "window resized", not as pixel drift.
+        resizable: false,
         // Engine-side lanes for every capture (blocklight ON for cave_interior's
         // emitter; a no-op for the emitter-free shots). Process-global — one
         // event loop drives all stages — so it matches `golden()`'s engine flags.
@@ -703,6 +709,19 @@ fn eval_criterion(c: &Criterion, bless: bool, out: &Outcomes) -> Result<(), Fail
                 what: format!("image_match {}", shot.name),
                 detail: format!("load golden {}: {e}", golden.display()),
             })?;
+            // A dimension mismatch is never pixel drift: the WM resized the
+            // window mid-run (tiling WMs may ignore the fixed-size hint). Name
+            // the real problem instead of reporting a meaningless 100%.
+            if (got.width, got.height) != (want.width, want.height) {
+                return Err(Failure {
+                    what: format!("image_match {}", shot.name),
+                    detail: format!(
+                        "capture is {}×{} but the golden is {}×{} — the harness window was \
+                         resized during the run (keep it floating/untouched and re-run)",
+                        got.width, got.height, want.width, want.height
+                    ),
+                });
+            }
             let stats = diff(&got, &want);
             if stats.pct_changed > *max_pct_changed {
                 return Err(Failure {

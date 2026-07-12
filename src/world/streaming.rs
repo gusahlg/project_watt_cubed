@@ -134,6 +134,7 @@ impl World {
             // `NeedsMesh`, but a `Dirty` chunk STAYS dirty (→ `prev: None`) so
             // the same-frame dirty pass still remeshes it exactly as before.
             let keep = self.mesh_box(center_chunk);
+            let mut retired = false;
             for (&coord, loaded) in self.chunks.iter_mut() {
                 if keep.contains(coord) {
                     continue;
@@ -149,6 +150,7 @@ impl World {
                 };
                 let stays_dirty = matches!(next, MeshState::Dirty { .. });
                 loaded.retire(next, eng);
+                retired = true;
                 // A retired `Dirty` chunk (its drawn mesh just freed) still needs
                 // the same-frame dirty pass to remesh it — which only runs when
                 // `pending_dirty` is set. Set it explicitly here rather than
@@ -156,6 +158,9 @@ impl World {
                 if stays_dirty {
                     self.pending_dirty.set();
                 }
+            }
+            if retired {
+                self.draw_set_rev += 1;
             }
         }
         // Light settling: a worklist lane. Analytic-trivial grids (deep opaque,
@@ -226,8 +231,32 @@ impl World {
             self.rebuild_occlusion(center_chunk);
         }
         self.occlusion_active = occlusion_on;
+        // Stream is the frame's last mutation point before render: refresh the
+        // drawable-coords cache here (only when the set actually changed), so
+        // `render` walks the ~live set instead of every loaded chunk.
+        self.sync_draw_cache();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
+    }
+
+    /// Rebuild the drawable-coords cache when the mesh set changed. The set
+    /// mutates only through `retire` installs/frees, unloads, and the
+    /// free-meshes passes — each bumps `draw_set_rev`; `invalidate()` keeps the
+    /// previous mesh drawing, so edits alone never bump. Steady state: no
+    /// bump, no walk. (`render`'s debug assert cross-checks the cache against
+    /// a fresh walk, so a missed bump cannot ship silently.)
+    fn sync_draw_cache(&mut self) {
+        if self.draw_cache_rev == self.draw_set_rev {
+            return;
+        }
+        self.draw_cache.clear();
+        self.draw_cache.extend(
+            self.chunks
+                .iter()
+                .filter(|(_, l)| l.state.live_meshes().is_some())
+                .map(|(&c, _)| c),
+        );
+        self.draw_cache_rev = self.draw_set_rev;
     }
 
     /// Land finished worker results (non-blocking). Generate results clear `generating`.
@@ -299,6 +328,7 @@ impl World {
                 // claim as the state moves to `Ready`/`Air`), keeping the async
                 // path correct by construction rather than by assertion.
                 loaded.retire(MeshState::from_upload(handles), eng);
+                self.draw_set_rev += 1;
             }
         }
 
@@ -526,6 +556,7 @@ impl World {
             .collect();
         // A removed chunk changes what the BFS can reach.
         self.occlusion_dirty.raise(!far.is_empty());
+        self.draw_set_rev += !far.is_empty() as u64;
         for coord in far {
             // Free whatever mesh the chunk was drawing (Ready, or an edited
             // Dirty still showing its old mesh); Air/NeedsMesh own none.
@@ -1272,19 +1303,25 @@ impl World {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             debug_assert!(loaded.state.is_dirty(), "sync remesh of non-Dirty {coord:?}");
             loaded.retire(MeshState::from_upload(handles), eng);
+            self.draw_set_rev += 1;
         }
     }
 
-    /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected).
+    /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected)
+    /// or a stamped meshing input (AO) flipped — the epoch folds into the revision's high bits
+    /// (block count stays far below 2^32, so the two never collide).
     pub(in crate::world) fn refresh_tables(&mut self) {
         // Split the borrow: `sync`'s rebuild closure needs `&self.registry`
         // while `&mut self.tables` is held, so bind `registry` separately.
         let count = self.registry.block_count();
         let registry = &self.registry;
         let layer_cap = self.texture_layer_cap;
-        self.tables.sync(Revision::from_count(count), || {
+        let ao = self.ao;
+        let rev = Revision::from_count(count | (self.tables_epoch as usize) << 32);
+        self.tables.sync(rev, || {
             let mut tables = registry.hot_tables();
             tables.layer_cap = layer_cap;
+            tables.ao = ao;
             tables
         });
     }

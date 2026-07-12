@@ -87,6 +87,12 @@ pub struct Settings {
     pub sunlight: bool,
     pub shadows: bool,
     pub sky: bool,
+    pub vrs: bool,
+    pub water_anim: bool,
+    /// Baked corner ambient occlusion in the mesher — a MESHING input like
+    /// `lighting` (toggling remeshes the world). Off also merges more quads,
+    /// so it doubles as a perf lever.
+    pub ao: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +125,9 @@ impl Default for Settings {
             sunlight: true,
             shadows: false,
             sky: true,
+            vrs: true,
+            water_anim: true,
+            ao: true,
         }
     }
 }
@@ -274,7 +283,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 24] = [
+pub const SETTINGS: [Setting; 27] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -554,6 +563,9 @@ pub const SETTINGS: [Setting; 24] = [
     video_toggle!(godrays, "godrays", "Godrays"),
     video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
     video_toggle!(taa, "taa", "Temporal AA", &["aa"]),
+    video_toggle!(vrs, "vrs", "Variable-Rate Shading"),
+    video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
+    video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
 ];
 
 /// The Back action sits just past the settings rows — derived, never hand-numbered.
@@ -648,6 +660,8 @@ impl Settings {
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
+            vrs: self.vrs,
+            water_anim: self.water_anim,
         }
     }
 }

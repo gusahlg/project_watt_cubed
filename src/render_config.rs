@@ -60,6 +60,12 @@ pub struct RenderConfig {
     pub shadows: bool,
     /// Off shows the clear colour (`RenderFlags::sky`).
     pub sky: bool,
+    /// Variable-rate shading (`RenderFlags::vrs`): depth-classified coarse
+    /// fragment shading on distant/flat regions. Off shades full-rate everywhere.
+    pub vrs: bool,
+    /// Water surface animation (`RenderFlags::water_anim`). Off freezes the
+    /// phase — water renders, but still.
+    pub water_anim: bool,
 }
 
 impl Default for RenderConfig {
@@ -83,6 +89,8 @@ impl Default for RenderConfig {
             sunlight: true,
             shadows: false,
             sky: true,
+            vrs: true,
+            water_anim: true,
         }
     }
 }
@@ -110,6 +118,8 @@ impl RenderConfig {
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
+            vrs: self.vrs,
+            water_anim: self.water_anim,
         }
     }
 }

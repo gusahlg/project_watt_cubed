@@ -83,6 +83,9 @@ pub struct HotTables {
     /// (every id < cap — the common case). Never zero: defaults to `u16::MAX`
     /// and the world stamps the real cap when it refreshes tables.
     pub layer_cap: u16,
+    /// Baked corner ambient occlusion — a meshing input the world stamps from
+    /// its settings (like `layer_cap`); off reads every corner unoccluded.
+    pub ao: bool,
 }
 
 impl Default for HotTables {
@@ -94,6 +97,7 @@ impl Default for HotTables {
             emission: Box::default(),
             water: Box::default(),
             layer_cap: u16::MAX,
+            ao: true,
         }
     }
 }
@@ -183,9 +187,10 @@ impl BlockRegistry {
                 .zip(self.layer.iter())
                 .map(|(&b, &l)| b > 0 && l == Pass::Blend)
                 .collect(),
-            // The registry owns no device knowledge; the world stamps the real
-            // cap right after (see `World::refresh_tables`).
+            // The registry owns no device or settings knowledge; the world
+            // stamps the real cap and AO choice right after (`refresh_tables`).
             layer_cap: u16::MAX,
+            ao: true,
         }
     }
 

@@ -62,6 +62,17 @@ impl World {
         self.free_meshes(eng);
     }
 
+    /// Toggle baked corner AO. A meshing input like lighting: the hot tables
+    /// restamp (epoch bump) and every mesh rebuilds with the new corners.
+    pub fn set_ao(&mut self, on: bool, eng: &mut Engine) {
+        if on == self.ao {
+            return;
+        }
+        self.ao = on;
+        self.tables_epoch = self.tables_epoch.wrapping_add(1);
+        self.free_meshes(eng);
+    }
+
     /// Move the CPU lighting pipeline between enabled and full-bright modes.
     /// Kept separate from GPU mesh retirement so the asynchronous state machine
     /// can be tested without constructing an engine.
@@ -126,6 +137,8 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::NeedsMesh { building: false }, eng);
         }
+        // Every drawn mesh is gone: the drawable set is empty until remeshes land.
+        self.draw_set_rev += 1;
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
         // stale hint (a raised `pending_dirty` would just scan an empty fiber).
         self.pending_dirty.take();
