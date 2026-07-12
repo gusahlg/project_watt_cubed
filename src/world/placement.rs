@@ -32,9 +32,9 @@ pub const ENUM_CAP: usize = 1024;
 /// terrain whose materials moved) and the join handshake folds it into the
 /// protocol version (mixed peers get an error instead of silent divergence).
 /// v1: the legacy hand-written picker. v2: element-first placement (this
-/// module) — grass/dirt became their natural unions, Obsidian gained its
-/// stone host, overlap pairs / beach edges / cave-wall Lumin exist.
-pub const WORLDGEN_VERSION: u16 = 2;
+/// module). v3: the alien pass — trees/Wood/Leaves retired, elements recolored,
+/// per-biome crust, luminous surface scatter, bolder landforms.
+pub const WORLDGEN_VERSION: u16 = 3;
 
 /// Scattered stream B rarities are stream A's scaled down by this — pairs stay
 /// genuine finds (P(pair) ~ p²/8 per stone cell), singles move by ~+12%.
@@ -156,8 +156,14 @@ pub struct PlacementTable {
 pub struct Resolved {
     /// Ground surface (depth 1) by [`SurfaceKind`].
     pub dress: [BlockId; SurfaceKind::COUNT],
-    /// Ground depths 2..=3 (the soil/clay crust).
-    pub crust: BlockId,
+    /// Ground depths 2..=3, by [`SurfaceKind`] — the crust composition follows
+    /// the biome (frozen ground under snow, sandy clay under deserts).
+    pub crust: [BlockId; SurfaceKind::COUNT],
+    /// Surface (depth 1) scatter by [`SurfaceKind`]: cumulative slices whose id
+    /// is the surface union PLUS the payload (glowing tufts on the plains,
+    /// phosphor sparks in the desert). One stream, one payload — surface finds
+    /// stay singles by construction.
+    pub surface_scatter: Vec<Vec<Slice>>,
     /// Ground depth ≥ 4, overhang shelves, island interiors.
     pub stone: BlockId,
     /// Flooded cells.
@@ -221,8 +227,13 @@ pub fn builtin() -> PlacementTable {
             // holding soil — the beach fading into the grass.
             banded(El::Sand, ground(1..=1, SurfaceMask::BEACH_EDGE)),
             banded(El::Soil, ground(1..=1, SurfaceMask::BEACH_EDGE)),
-            banded(El::Soil, ground(2..=3, SurfaceMask::ANY)),
-            banded(El::Clay, ground(2..=3, SurfaceMask::ANY)),
+            // Crust follows the biome: temperate/shore/beach ground binds soil
+            // with clay; deserts run sandy clay; snowy ground freezes through.
+            banded(El::Soil, ground(2..=3, SurfaceMask::GRASSY.or(SurfaceMask::SHORE).or(SurfaceMask::BEACH_EDGE))),
+            banded(El::Clay, ground(2..=3, SurfaceMask::GRASSY.or(SurfaceMask::SHORE).or(SurfaceMask::BEACH_EDGE).or(SurfaceMask::DESERT))),
+            banded(El::Sand, ground(2..=3, SurfaceMask::DESERT)),
+            banded(El::Soil, ground(2..=3, SurfaceMask::SNOWY)),
+            banded(El::Ice, ground(2..=3, SurfaceMask::SNOWY)),
             // --- The world's rock.
             banded(El::Stone, ground(4..=i32::MAX, SurfaceMask::ANY)),
             banded(El::Stone, Context::Overhang),
@@ -248,6 +259,20 @@ pub fn builtin() -> PlacementTable {
             banded(El::Stone, island(4..=i32::MAX, IslandSurface::Any)),
             island_seam(El::Aerium, 45),
             island_seam(El::Quartz, 160),
+            // --- Surface glow: scattered luminous growth. Lumin tufts across
+            // the teal plains; phosphor sparks in the ash deserts — the night
+            // face of the planet. Depth-1 scattered rules join the SURFACE
+            // union (host names the union's anchor, asserted at compile).
+            rule(
+                El::Lumin,
+                ground(1..=1, SurfaceMask::GRASSY),
+                Kind::Scattered { rarity: 700, host: El::Soil.id() },
+            ),
+            rule(
+                El::Phosphor,
+                ground(1..=1, SurfaceMask::DESERT),
+                Kind::Scattered { rarity: 900, host: El::Sand.id() },
+            ),
             // --- Lumin clusters on deep cavern walls: the deep caves glow.
             rule(
                 El::Lumin,
@@ -274,12 +299,12 @@ impl PlacementTable {
             reachable.insert(v);
         };
 
-        // Banded unions per context case.
-        for kind in SurfaceKind::ALL {
-            add(&self.ground_banded_union(1, kind));
-        }
+        // Banded ground unions: every depth band × every surface kind, since
+        // the crust now varies by biome (frozen ground, sandy desert).
         for band in self.ground_depth_bands() {
-            add(&self.ground_banded_union(band, SurfaceKind::Grassy));
+            for kind in SurfaceKind::ALL {
+                add(&self.ground_banded_union(band, kind));
+            }
         }
         add(&self.banded_union(|c| matches!(c, Context::Flood)));
         add(&self.banded_union(|c| matches!(c, Context::Overhang)));
@@ -289,9 +314,12 @@ impl PlacementTable {
             }
         }
 
-        // Scattered singles and same-region pairs (arity ≤ 2 by the two-stream
-        // construction — one payload per stream, deduped).
-        let ground_seams = self.scattered(|c| matches!(c, Context::Ground { .. }));
+        // Sub-surface ore seams (depth ≥ 2, below the crust) and island interior
+        // scatter: singles and same-region pairs (arity ≤ 2 by the two-stream
+        // construction — one payload per stream, deduped). Depth-1 SURFACE
+        // scatter is handled separately below (its payload joins the full
+        // surface union, not just a host).
+        let ground_seams = self.ore_seams();
         let island_seams = self.scattered(|c| matches!(c, Context::Island { .. }));
         for seams in [&ground_seams, &island_seams] {
             for (i, a) in seams.iter().enumerate() {
@@ -304,6 +332,16 @@ impl PlacementTable {
                         add(&[host, ea, eb]);
                     }
                 }
+            }
+        }
+        // Surface scatter: the payload joins the FULL depth-1 banded union of
+        // its kind (a glowing tuft is Organic+Soil+Lumin, not Soil+Lumin).
+        for kind in SurfaceKind::ALL {
+            let base = self.ground_banded_union(1, kind);
+            for r in self.surface_scatter_rules(kind) {
+                let mut union = base.clone();
+                union.push(r.element.0);
+                add(&union);
             }
         }
         for r in self.scattered(|c| matches!(c, Context::CaveWall { .. })) {
@@ -351,7 +389,25 @@ impl PlacementTable {
         };
 
         let dress = SurfaceKind::ALL.map(|k| union_id(self.ground_banded_union(1, k)));
+        let crust = SurfaceKind::ALL.map(|k| union_id(self.ground_banded_union(2, k)));
         let stone = union_id(self.ground_banded_union(4, SurfaceKind::Grassy));
+
+        // Surface scatter per kind: cumulative slices, payload joined onto the
+        // full depth-1 union. One stream (surface finds stay singles).
+        let surface_scatter: Vec<Vec<Slice>> = SurfaceKind::ALL
+            .iter()
+            .map(|&kind| {
+                let base = self.ground_banded_union(1, kind);
+                self.surface_scatter_rules(kind)
+                    .iter()
+                    .map(|r| {
+                        let mut union = base.clone();
+                        union.push(r.element.0);
+                        Slice { min_depth: 1, width: u32::MAX / r.rarity(), id: union_id(union) }
+                    })
+                    .collect()
+            })
+            .collect();
 
         let slices = |seams: &[&PlacementRule], scale: u32| -> Vec<Slice> {
             let mut min_depth = i32::MIN;
@@ -413,7 +469,8 @@ impl PlacementTable {
 
         Resolved {
             dress,
-            crust: union_id(self.ground_banded_union(2, SurfaceKind::Grassy)),
+            crust,
+            surface_scatter,
             stone,
             water: union_id(self.banded_union(|c| matches!(c, Context::Flood))),
             seams: slices(&ground_seams, 1),
@@ -487,7 +544,7 @@ impl PlacementTable {
     }
 
     /// Distinct ground depth-band representatives from banded rule endpoints,
-    /// so enumeration visits every distinct union (1 is handled per-kind).
+    /// so enumeration visits every distinct union at every kind.
     fn ground_depth_bands(&self) -> Vec<i32> {
         let mut starts: Vec<i32> = self
             .rules
@@ -508,6 +565,21 @@ impl PlacementTable {
             .iter()
             .filter(|r| matches!(r.kind, Kind::Scattered { .. }) && pred(&r.context))
             .collect()
+    }
+
+    /// Sub-surface ore seams: scattered ground rules below the crust (depth
+    /// start ≥ 2), in authored order — the cumulative slice walk's rows.
+    fn ore_seams(&self) -> Vec<&PlacementRule> {
+        self.scattered(|c| matches!(c, Context::Ground { depth, .. } if *depth.start() >= 2))
+    }
+
+    /// Depth-1 surface scatter rules for one kind, in authored order — the
+    /// luminous surface growth whose payload joins the full surface union.
+    fn surface_scatter_rules(&self, kind: SurfaceKind) -> Vec<&PlacementRule> {
+        self.scattered(|c| {
+            matches!(c, Context::Ground { depth, surface }
+                if *depth.start() == 1 && *depth.end() == 1 && surface.contains(kind))
+        })
     }
 }
 
@@ -552,12 +624,12 @@ mod tests {
         let baseline = BlockRegistry::with_builtins().block_count();
         let (reg, _) = compiled();
         let added = reg.block_count() - baseline;
-        // Ground pairs C(10,2) = 45 (every seam range reaches depth 64, so all
-        // overlap) + island pair 1 + new banded naturals ({Organic,Soil},
-        // {Soil,Clay}, {Sand,Soil}) + {Stone,Obsidian} (the one vein that was
-        // pure before) + cave-wall dedups into LuminVein. Everything else
-        // dedups into existing builtins.
-        assert_eq!(added, 45 + 1 + 3 + 1, "reachable set drifted — re-derive before accepting");
+        // 45 ground ore pairs C(10,2) + 1 island pair + banded naturals
+        // {Organic,Soil}, {Soil,Clay}, {Sand,Soil}, {Sand,Clay} (desert crust),
+        // {Soil,Ice} (snowy crust) + {Stone,Obsidian} + surface scatter
+        // {Organic,Soil,Lumin} and {Sand,Phosphor}. Cave-wall Lumin dedups
+        // into LuminVein; everything else dedups into existing builtins.
+        assert_eq!(added, 45 + 1 + 5 + 1 + 2, "reachable set drifted — re-derive before accepting");
         assert!(reg.block_count() <= ENUM_CAP);
     }
 
@@ -641,14 +713,29 @@ mod tests {
             *comp(r.dress[SurfaceKind::BeachEdge as usize]),
             natural(&[El::Soil, El::Sand])
         );
-        assert_eq!(*comp(r.crust), natural(&[El::Soil, El::Clay]));
+        // Crust follows the biome now.
+        let cr = |k: SurfaceKind| comp(r.crust[k as usize]);
+        assert_eq!(*cr(SurfaceKind::Grassy), natural(&[El::Soil, El::Clay]));
+        assert_eq!(*cr(SurfaceKind::Desert), natural(&[El::Sand, El::Clay]));
+        assert_eq!(*cr(SurfaceKind::Snowy), natural(&[El::Soil, El::Ice]));
         assert_eq!(r.stone, reg.id_by_name("Stone").unwrap());
         assert_eq!(r.water, reg.id_by_name("Water").unwrap());
         assert_eq!(r.island_ice, reg.id_by_name("Ice").unwrap());
         assert_eq!(r.island_grass, r.dress[SurfaceKind::Grassy as usize]);
-        assert_eq!(r.island_crust, r.crust);
+        assert_eq!(r.island_crust, r.crust[SurfaceKind::Grassy as usize]);
         // Cave-wall Lumin dedups into the LuminVein composition.
         assert_eq!(r.cave_wall.unwrap().id, reg.id_by_name("LuminVein").unwrap());
+        // Surface scatter: grassy plains grow Organic+Soil+Lumin tufts; the
+        // ash desert grows Sand+Phosphor sparks; other kinds have none.
+        assert_eq!(
+            *comp(r.surface_scatter[SurfaceKind::Grassy as usize][0].id),
+            natural(&[El::Organic, El::Soil, El::Lumin])
+        );
+        assert_eq!(
+            *comp(r.surface_scatter[SurfaceKind::Desert as usize][0].id),
+            natural(&[El::Sand, El::Phosphor])
+        );
+        assert!(r.surface_scatter[SurfaceKind::Shore as usize].is_empty());
     }
 
     #[test]

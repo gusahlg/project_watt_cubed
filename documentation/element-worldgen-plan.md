@@ -1,8 +1,20 @@
 # Element-first world generation — the plan
 
 Status: **LANDED 2026-07-12** (`src/world/placement.rs` + the generator
-rewiring in `generation.rs`), including the Phase-4 follow-ups. Deltas from
-this document as written:
+rewiring in `generation.rs`), including the Phase-4 follow-ups.
+
+**v3 (alien pass, same day):** Wood/Leaves blocks and Earth-style trees
+retired entirely — terrain now emits ONLY element unions the table derives,
+no decoration overlay, no named blocks. Elements recolored to an alien
+palette (teal Organic, violet-grey Soil, slate Stone, ash Sand, teal Water,
+mint Lumin). Crust varies by biome (sandy desert / frozen snowy), and the
+top ground cell scatters luminous growth (Organic+Soil+Lumin tufts on the
+plains, Sand+Phosphor sparks in the desert) — the night face of the planet.
+Landform knobs pushed bolder (common tall terraces, blade-thin ridges).
+The material-parity census gate ended here by design (v2→v3 deliberately
+moves materials); geometry invariance remains the load-bearing test.
+
+Deltas from this document as written:
 
 - The palette cap was lifted FIRST (BlockId u16, 16,384 ids, per-chunk
   palettes — the doc's "sanctioned future lift"), so C1's arithmetic relaxed:

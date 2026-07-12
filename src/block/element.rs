@@ -223,24 +223,24 @@ impl ElementRegistry {
 // is a representative spread so derivation, specials, and reactions have something
 // to chew on. `core { .. }` lists only the non-zero properties; the rest default to 0.
 elements! {
-    // Heavy, hard, inert — the bedrock of the world.
+    // Heavy, hard, inert — the bedrock of the world. Cool basalt slate.
     Stone => {
-        color: (128, 128, 128),
+        color: (112, 118, 128),
         core: { durability: 120, hardness: 180, density: 210, temperature_resistance: 230, friction: 90, thermal_conductivity: 35 },
     },
-    // Loose earth: soft, gritty, middling everything.
+    // Loose regolith: soft, gritty, middling everything. Muted violet-grey.
     Soil => {
-        color: (121, 85, 58),
+        color: (112, 94, 124),
         core: { durability: 30, hardness: 20, density: 110, temperature_resistance: 120, friction: 70, thermal_conductivity: 25 },
     },
-    // Binds soil; a touch denser and stickier.
+    // Binds soil; a touch denser and stickier. Dusky mauve.
     Clay => {
-        color: (150, 100, 70),
+        color: (136, 98, 130),
         core: { durability: 45, hardness: 35, density: 130, temperature_resistance: 150, friction: 80, thermal_conductivity: 20 },
     },
-    // Living matter: light, vivid green, flammable in spirit (low temp resistance).
+    // Living matter: light, vivid teal, flammable in spirit (low temp resistance).
     Organic => {
-        color: (86, 176, 0),
+        color: (24, 186, 156),
         core: { durability: 15, hardness: 8, density: 40, temperature_resistance: 60, friction: 65, thermal_conductivity: 15, light_emission: 0 },
     },
     // The conductor: routes electricity and heat readily; harvests heat too.
@@ -266,9 +266,9 @@ elements! {
         color: (210, 235, 240),
         core: { durability: 20, hardness: 50, density: 100, temperature_resistance: 180, friction: 20, transparency: 90 },
     },
-    // Glowing crystal: a built-in light source.
+    // Glowing crystal: a built-in light source. Cold mint-glow.
     Lumin => {
-        color: (255, 240, 150),
+        color: (152, 255, 214),
         core: { durability: 40, hardness: 30, density: 70, temperature_resistance: 160, friction: 40, light_emission: 230, transparency: 30 },
     },
     // Compressed ancient organics: soft, light, and eager to burn.
@@ -276,9 +276,9 @@ elements! {
         color: (40, 35, 30),
         core: { durability: 20, hardness: 15, density: 65, temperature_resistance: 50, friction: 55, conductivity: 30, thermal_conductivity: 20 },
     },
-    // Loose grains: barely holds itself together, let alone anything else.
+    // Loose ash-pale grains: barely holds itself together, let alone anything else.
     Sand => {
-        color: (220, 200, 150),
+        color: (212, 206, 188),
         core: { durability: 15, hardness: 12, density: 120, temperature_resistance: 170, friction: 30, thermal_conductivity: 20 },
     },
     // Frozen water: slick underfoot and gone at the first warm breeze.
@@ -327,7 +327,7 @@ elements! {
     // Deep blue and heavy; lets some light through, so blocks made of it are
     // translucent solids (the glass path) — the world's oceans, rivers, and lakes.
     Water => {
-        color: (40, 90, 200),
+        color: (22, 118, 138),
         core: { durability: 5, hardness: 5, density: 200, temperature_resistance: 100, friction: 20, thermal_conductivity: 60, transparency: 55 },
         specials: [Buoyancy(200)],
     },

@@ -452,11 +452,10 @@ blocks! {
     Water => Composition::natural(&[El::Water.id()]),
     // Biome dressing on cold or high ground.
     Snow => Composition::natural(&[El::Snow.id()]),
-    // Tree trunk: woody brown, distinct from packed dirt.
-    Wood => Composition::mixture(&[(El::Soil.id(), 55), (El::Coal.id(), 25), (El::Clay.id(), 20)])
-        .expect("builtin Wood sums to 100"),
-    // Tree canopy: pure living green.
-    Leaves => Composition::natural(&[El::Organic.id()]),
+    // (Wood/Leaves were retired with Earth-style trees: every block terrain
+    // emits is now a natural union the placement table derives. Old saves that
+    // placed them still load — specs are compositional, so the mixtures simply
+    // re-register by their elements.)
 }
 
 #[cfg(test)]
@@ -513,9 +512,11 @@ mod tests {
     }
 
     #[test]
-    fn stone_keeps_its_grey() {
+    fn stone_keeps_its_slate() {
+        // A pure single-element block carries its element's colour exactly —
+        // the derivation adds nothing for a one-part composition.
         let reg = BlockRegistry::with_builtins();
-        assert_eq!(reg.color(Blk::Stone.id()), Color::new(128, 128, 128, 255));
+        assert_eq!(reg.color(Blk::Stone.id()), Color::new(112, 118, 128, 255));
     }
 
     #[test]

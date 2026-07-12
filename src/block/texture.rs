@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn two_element_natural_block_shows_both_element_colors() {
-        // Stone (128,128,128) + Organic (86,176,0): gray texels have high
-        // blue relative to organic's zero, green texels dominate in G.
+        // Stone (112,118,128 slate) + Organic (24,186,156 teal): slate texels
+        // are near-grey (R≈G≈B), teal texels have G far above R.
         let mut reg = BlockRegistry::with_builtins();
         let id = reg.natural(&[El::Stone.id(), El::Organic.id()]).unwrap();
         let layers = build_block_textures(&reg);
@@ -262,15 +262,15 @@ mod tests {
         let mut organicish = 0;
         for texel in layer.chunks_exact(4) {
             let (r, g, b) = (texel[0] as i32, texel[1] as i32, texel[2] as i32);
-            if b >= 100 && (r - g).abs() <= 30 {
+            if (r - g).abs() <= 25 && (g - b).abs() <= 25 && r >= 70 {
                 stoneish += 1;
             }
-            if g >= 140 && b <= 50 {
+            if g - r >= 60 && g >= 120 {
                 organicish += 1;
             }
         }
-        assert!(stoneish >= 5, "expected stone-dominant texels, got {stoneish}");
-        assert!(organicish >= 5, "expected organic-dominant texels, got {organicish}");
+        assert!(stoneish >= 5, "expected slate-dominant texels, got {stoneish}");
+        assert!(organicish >= 5, "expected teal-dominant texels, got {organicish}");
     }
 
     #[test]
