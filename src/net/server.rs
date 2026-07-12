@@ -76,12 +76,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RATE_LIMIT: u32 = 300;
 /// A position update is only sent to players within this many world units of the
 /// mover — nobody past render distance needs it.
-const INTEREST_RADIUS: f64 = 160.0;
+const INTEREST_RADIUS: f64 = 160.0 * crate::math::PER_METER;
 /// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
 const INTEREST_RADIUS_SQ: f64 = INTEREST_RADIUS * INTEREST_RADIUS;
 /// A client may edit a block at most this far from its own reported eye position;
 /// farther edits are rejected as bogus. A little past the client's reach constant.
-const EDIT_REACH: f64 = 8.0;
+const EDIT_REACH: f64 = 8.0 * crate::math::PER_METER;
 /// Edits are streamed to a joining client in batches this size, so a very built-up
 /// world's snapshot never overflows a single frame's size cap. Derived from the
 /// worst case per edit — 12 bytes x/y/z + 2-byte length prefix + [`MAX_SPEC`]

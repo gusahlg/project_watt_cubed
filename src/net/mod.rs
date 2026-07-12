@@ -52,7 +52,7 @@ pub mod chat {
     pub const LOCAL: u8 = 0;
     /// Global chat: reaches every connected player.
     pub const GLOBAL: u8 = 1;
-    /// How far local (proximity) chat carries, in world units. `f64` like all
-    /// position math server-side.
-    pub const RADIUS: f64 = 48.0;
+    /// How far local (proximity) chat carries: 48 m, in world units. `f64`
+    /// like all position math server-side.
+    pub const RADIUS: f64 = 48.0 * crate::math::PER_METER;
 }

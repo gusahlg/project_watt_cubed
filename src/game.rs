@@ -31,8 +31,8 @@ use crate::sim::Simulation;
 use crate::sky::Sky;
 use crate::world::World;
 
-/// How far the player can reach to break a block, in world units.
-const REACH: f64 = 6.0;
+/// How far the player can reach to break a block: 6 m, in world units.
+const REACH: f64 = 6.0 * crate::math::PER_METER;
 
 /// What a game update wants the app to do next.
 pub enum Signal {

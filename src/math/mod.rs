@@ -11,6 +11,19 @@ use voxel_engine::DVec3;
 /// bound every float→block conversion can rely on.
 pub const WORLD_BORDER: f64 = 1.0e9;
 
+/// How large one voxel is, in metres. The voxel lattice itself never moves
+/// (one block = one world unit — saves, worldgen, meshes, coordinates all
+/// stay put); instead, everything HUMAN-scale is authored in metres and
+/// multiplied by [`PER_METER`], so shrinking this makes the whole grid read
+/// finer relative to the player while timings (jump arcs, walk feel) stay
+/// identical — lengths and velocities scale, seconds don't.
+pub const BLOCK_METERS: f64 = 0.85;
+
+/// Metres → world units (blocks): the multiplier for every authored
+/// human-scale length and velocity. Exponential response RATES (1/s) never
+/// take it — they live in the time domain.
+pub const PER_METER: f64 = 1.0 / BLOCK_METERS;
+
 /// Slack past ±[`WORLD_BORDER`] within which [`block_coord`] still resolves a
 /// true cell instead of clamping. Player *positions* are clamped to exactly
 /// ±`WORLD_BORDER` (movement and `/tp`, the only continuous writers), but the

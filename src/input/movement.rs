@@ -13,13 +13,13 @@ use voxel_engine::DVec3;
 
 use crate::input::intent::{GameplayAxis, GameplayEvent, GameplayState};
 use crate::input::router::Gameplay;
-use crate::math::{WORLD_BORDER, block_coord};
+use crate::math::{PER_METER, WORLD_BORDER, block_coord};
 use crate::player::{Motion, Player, Stance, collision_box};
 use crate::world::World;
 
 const SPRINT_MULT: f64 = 1.5; // horizontal speed multiplier while sprinting
-const GRAVITY: f64 = 24.0; // units / second^2
-const JUMP_SPEED: f64 = 8.5; // initial upward velocity of a jump
+const GRAVITY: f64 = 24.0 * PER_METER; // metres / second^2, in world units
+const JUMP_SPEED: f64 = 8.5 * PER_METER; // initial upward velocity of a jump
 /// Velocity-approach rates (units / second of exponential response). Acceleration,
 /// braking, friction, and sprint transitions are all the *same* operation — velocity
 /// chasing a target — so a single rate per context is the only knob. A high ground
@@ -31,7 +31,7 @@ const FLY_ACCEL: f64 = 8.0;
 /// Fastest fall, units / second. Reached well past any normal jump arc,
 /// so jump and short-fall feel are unchanged. Its real job is bounding the
 /// per-frame fall distance so collision substepping has a small, fixed worst case.
-const TERMINAL_VELOCITY: f64 = -60.0;
+const TERMINAL_VELOCITY: f64 = -60.0 * PER_METER;
 /// Largest single collision step along one axis, in units. Axis deltas above
 /// this are split into substeps so a fast fall stops at the first solid cell
 /// instead of tunneling past thin terrain.
@@ -44,11 +44,11 @@ const MAX_COLLISION_STEP: f64 = 0.5;
 /// fully-submerged, idle player up at [`SWIM_FLOAT_SPEED`] until their head breaks
 /// the surface, where they instead settle at [`SWIM_SETTLE_SPEED`] and bob; holding
 /// ascend/descend overrides both at [`SWIM_VERT_SPEED`].
-const SWIM_SPEED: f64 = 4.0;
-const SWIM_ACCEL: f64 = 6.0;
-const SWIM_VERT_SPEED: f64 = 5.0;
-const SWIM_FLOAT_SPEED: f64 = 3.0;
-const SWIM_SETTLE_SPEED: f64 = 1.0;
+const SWIM_SPEED: f64 = 4.0 * PER_METER;
+const SWIM_ACCEL: f64 = 6.0; // an approach RATE (1/s) — time-domain, never scaled
+const SWIM_VERT_SPEED: f64 = 5.0 * PER_METER;
+const SWIM_FLOAT_SPEED: f64 = 3.0 * PER_METER;
+const SWIM_SETTLE_SPEED: f64 = 1.0 * PER_METER;
 
 /// The movement intent gathered for a single frame.
 pub struct MoveInput {
@@ -440,8 +440,9 @@ mod tests {
 
         let moved = player.position.x - window_start;
         assert!(
-            (moved - 6.0).abs() < 0.05,
-            "one steady-state second at WALK_SPEED must cover ~6 blocks, moved {moved}"
+            (moved - crate::player::DEFAULT_WALK_SPEED).abs() < 0.05,
+            "one steady-state second at WALK_SPEED must cover ~{} blocks, moved {moved}",
+            crate::player::DEFAULT_WALK_SPEED
         );
         assert!(player.on_ground(), "still standing on the runway");
         assert_eq!(player.position.z, 0.5, "no lateral drift");

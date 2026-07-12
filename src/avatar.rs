@@ -92,14 +92,19 @@ pub struct Pose {
 }
 
 /// Half-width of the contact-shadow blob, and its darkness (alpha over terrain).
-const SHADOW_RADIUS: f32 = 0.4;
+const SHADOW_RADIUS: f32 = 0.4 * SCALE;
 const SHADOW_COLOR: Color = Color::new(0, 0, 0, 90);
 /// Nudge the shadow just above the feet plane so it doesn't z-fight the ground.
 const SHADOW_LIFT: f32 = 0.02;
 
+/// Metres → world units for the rig: the whole model is authored in metres
+/// (head at 1.7, hip at 0.9) and scaled once where body-local space meets the
+/// world, so the avatar always matches the player's collision height.
+const SCALE: f32 = crate::math::PER_METER as f32;
+
 impl Pose {
     /// Head-top height above the feet, so name tags anchor to the model.
-    pub const HEAD_TOP: f32 = 1.9;
+    pub const HEAD_TOP: f32 = 1.9 * SCALE;
 
     /// Resolve rig: body faces body_yaw, head tracks yaw/pitch,
     /// stance compresses/tips, gait/action drive limbs.
@@ -145,7 +150,7 @@ impl Pose {
             // Prone stance rotation about hip.
             let hip = squash(HIP);
             let local = hip + prone_rot * (local - hip);
-            parts[i] = (pose.feet + body_rot * local, body_rot * prone_rot * swing_rot);
+            parts[i] = (pose.feet + body_rot * (local * SCALE), body_rot * prone_rot * swing_rot);
         }
         Self { feet: pose.feet, parts }
     }
@@ -155,7 +160,7 @@ impl Pose {
         f3.draw_shadow(ground, SHADOW_RADIUS, SHADOW_COLOR);
         for (i, part) in RIG.iter().enumerate() {
             let (center, rot) = self.parts[i];
-            f3.draw_box(center, part.half, rot, tint(color, part.tint));
+            f3.draw_box(center, part.half * SCALE, rot, tint(color, part.tint));
         }
     }
 }
