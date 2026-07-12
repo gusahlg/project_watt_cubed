@@ -708,6 +708,16 @@ const OVERHANG_SALT: u64 = 0x2B9F_10E6_A4C7_5D33;
 /// Salt for the tree scatter roll (S7 decoration), kept off the ore `cell_hash`
 /// stream so tree placement and ore rolls never correlate.
 const TREE_SALT: i64 = 0x51ED_2C97_7A3B_10F5u64 as i64;
+/// Decorrelates the second ore stream from the first: two independent rolls
+/// per stone cell whose deduped union is the cell's payload set — 0, 1, or 2
+/// extra elements, never more (the arity-2 bound is this construction).
+const ORE_B_SALT: i64 = 0x9D3A_44E1_0C67_B52Bu64 as i64;
+/// The cave-wall (floor/ceiling) cluster roll — its own stream so cavern
+/// glow is independent of the seam layout.
+const CAVE_WALL_SALT: i64 = 0x2F8C_71A5_E9D0_63B7u64 as i64;
+/// The beach-edge dither — the column hash deciding whether a just-above-water
+/// grassy column joins the sand/soil transition band.
+const BEACH_SALT: i64 = 0x6B14_D8F3_2A79_C40Du64 as i64;
 
 /// Continentalness → base height offset from sea level: deep ocean floors, coastal
 /// shelves, inland plains, and high interiors.
@@ -1035,9 +1045,12 @@ impl Terrain {
 
     /// The ground column's surface dressing, classified from the shared context:
     /// shore at/under the water table, snow on cold or high ground, desert on
-    /// hot & dry, grass otherwise. The one axis the depth-1 placement rules
-    /// filter on — the block itself comes from the [`placement`] dress LUT.
-    fn surface_kind(&self, p: &Column) -> placement::SurfaceKind {
+    /// hot & dry, grass otherwise — except that a grassy column one or two
+    /// blocks above the water line may dither into the beach-edge band (sand
+    /// still holding soil), so beaches fade into grass instead of ending on a
+    /// hard line. One axis the depth-1 placement rules filter on — the block
+    /// itself comes from the [`placement`] dress LUT.
+    fn surface_kind(&self, p: &Column, wx: i32, wz: i32) -> placement::SurfaceKind {
         use placement::SurfaceKind::*;
         if p.height <= p.water_level {
             Shore
@@ -1046,37 +1059,65 @@ impl Terrain {
         } else if p.temperature.0 > HOT && p.humidity.0 < DRY {
             Desert
         } else {
+            let rim = p.height - p.water_level;
+            if rim <= 2 {
+                // Half the columns at +1, a quarter at +2 — a dissolving edge.
+                let cut = u32::MAX / if rim == 1 { 2 } else { 4 };
+                if cell_hash(self.seed ^ BEACH_SALT, wx, 0, wz) < cut {
+                    return BeachEdge;
+                }
+            }
             Grassy
         }
     }
 
     /// The surface block a column dresses in — the banded element union of its
     /// [`surface_kind`](Self::surface_kind).
-    fn dress(&self, p: &Column) -> BlockId {
-        self.mat.dress[self.surface_kind(p) as usize]
+    fn dress(&self, p: &Column, wx: i32, wz: i32) -> BlockId {
+        self.mat.dress[self.surface_kind(p, wx, wz) as usize]
     }
 
-    /// The ore (if any) a stone cell rolls, through the cumulative rarity slices.
+    /// The ore (if any) a stone cell rolls: two decorrelated hash streams, each
+    /// walking the cumulative rarity slices (stream B's are ÷8), deduped —
+    /// distinct hits on both streams yield the overlap pair, a multi-yield
+    /// find. Stream A alone is byte-identical to the legacy distribution.
     fn ore_at(&self, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
-        let roll = cell_hash(self.seed, wx, wy, wz);
-        let mut cut = 0u32;
-        for slice in &self.mat.seams {
-            if depth < slice.min_depth {
-                break;
+        let hit = |slices: &[placement::Slice], roll: u32| -> Option<usize> {
+            let mut cut = 0u32;
+            for (i, slice) in slices.iter().enumerate() {
+                if depth < slice.min_depth {
+                    break;
+                }
+                cut += slice.width;
+                if roll < cut {
+                    return Some(i);
+                }
             }
-            cut += slice.width;
-            if roll < cut {
-                return Some(slice.id);
+            None
+        };
+        let a = hit(&self.mat.seams, cell_hash(self.seed, wx, wy, wz));
+        // The B roll only exists where it can land (below the shallowest
+        // slice), so the common stone cell pays one hash, as before.
+        let b = if depth >= self.mat.seams.first().map_or(i32::MAX, |s| s.min_depth) {
+            hit(&self.mat.seams_b, cell_hash(self.seed ^ ORE_B_SALT, wx, wy, wz))
+        } else {
+            None
+        };
+        match (a, b) {
+            (Some(i), Some(j)) if i != j => {
+                let (hi, lo) = if i > j { (i, j) } else { (j, i) };
+                Some(self.mat.pairs[hi][lo])
             }
+            (Some(i), _) | (None, Some(i)) => Some(self.mat.seams[i].id),
+            (None, None) => None,
         }
-        None
     }
 
     /// A ground cell below its column's surface, carve decision supplied.
     fn ground(&self, p: &Column, wx: i32, wy: i32, wz: i32, carved: bool) -> BlockId {
         let height = p.height;
         if wy >= height - 1 {
-            self.dress(p)
+            self.dress(p, wx, wz)
         } else if wy >= height - 3 {
             self.mat.crust
         } else if carved {
@@ -1088,8 +1129,27 @@ impl Terrain {
                     return ore;
                 }
             }
+            if let Some(id) = self.cave_wall_at(p, wx, wy, wz, depth) {
+                return id;
+            }
             self.mat.stone
         }
+    }
+
+    /// The cave-wall cluster (Lumin on deep cavern floors and ceilings), if it
+    /// lands here: eligible depth, its own hash roll, and a carved cell
+    /// directly above or below — VERTICAL adjacency only, so the check stays
+    /// inside one column (two carve reads, only after the rare roll hits) and
+    /// the deep-uniform proof only needs carve dormancy one chunk up/down.
+    fn cave_wall_at(&self, p: &Column, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
+        let cw = self.mat.cave_wall.as_ref()?;
+        if depth < cw.min_depth
+            || cell_hash(self.seed ^ CAVE_WALL_SALT, wx, wy, wz) >= cw.width
+        {
+            return None;
+        }
+        let carved_v = |ny: i32| ny < p.height && self.carved(wx, ny, wz, p.height);
+        (carved_v(wy + 1) || carved_v(wy - 1)).then_some(cw.id)
     }
 
     /// The block for an island-solid cell, from what sits above it in the field.
@@ -1099,15 +1159,28 @@ impl Terrain {
         } else if !above[1] || !above[2] || !above[3] {
             self.mat.island_crust
         } else {
-            let roll = cell_hash(self.seed, wx, wy, wz);
-            let mut cut = 0u32;
-            for slice in &self.mat.island_seams {
-                cut += slice.width;
-                if roll < cut {
-                    return slice.id;
+            // Interior scatter: the same two-stream dedup as the ground ores
+            // (an Aerium+Quartz overlap is the island's multi-yield find).
+            let hit = |slices: &[placement::Slice], roll: u32| -> Option<usize> {
+                let mut cut = 0u32;
+                for (i, slice) in slices.iter().enumerate() {
+                    cut += slice.width;
+                    if roll < cut {
+                        return Some(i);
+                    }
                 }
+                None
+            };
+            let a = hit(&self.mat.island_seams, cell_hash(self.seed, wx, wy, wz));
+            let b = hit(&self.mat.island_seams_b, cell_hash(self.seed ^ ORE_B_SALT, wx, wy, wz));
+            match (a, b) {
+                (Some(i), Some(j)) if i != j => {
+                    let (hi, lo) = if i > j { (i, j) } else { (j, i) };
+                    self.mat.island_pairs[hi][lo]
+                }
+                (Some(i), _) | (None, Some(i)) => self.mat.island_seams[i].id,
+                (None, None) => self.mat.stone,
             }
-            self.mat.stone
         }
     }
 
@@ -1132,7 +1205,15 @@ impl Terrain {
     /// `Seam` scatter, but with a multi-cell payload ([`tree_voxel`]).
     fn tree_at(&self, ox: i32, oz: i32) -> Option<i32> {
         let p = self.profile(ox, oz);
-        if p.height <= p.water_level || self.surface_kind(&p) != placement::SurfaceKind::Grassy {
+        // Trees keep growing on beach-edge columns (they were grassy before
+        // the dither existed — geometry must not move): beach palms.
+        let kind = self.surface_kind(&p, ox, oz);
+        if p.height <= p.water_level
+            || !matches!(
+                kind,
+                placement::SurfaceKind::Grassy | placement::SurfaceKind::BeachEdge
+            )
+        {
             return None;
         }
         (cell_hash(self.seed ^ TREE_SALT, ox, 0, oz) < u32::MAX / TREE_RARITY).then_some(p.height)
@@ -1222,7 +1303,7 @@ impl TerrainGenerator for Terrain {
     }
 
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
-        self.dress(&self.profile(wx, wz))
+        self.dress(&self.profile(wx, wz), wx, wz)
     }
 
     fn deep(&self) -> BlockId {
@@ -1271,6 +1352,37 @@ impl TerrainGenerator for Terrain {
 }
 
 impl Terrain {
+    /// The deep Uniform(stone) proof: every cell sits below every scattered
+    /// rule's reach and both carve fields are dormant over the chunk box — and,
+    /// when a cave-wall rule exists, over the boxes one chunk above and below
+    /// too, since its VERTICAL adjacency reads one cell past the chunk's rim
+    /// (same columns, so the height extents carry over). The dense fill's
+    /// collapse remains the correctness backstop; this is a CPU shortcut.
+    fn deep_uniform_provable(
+        &self,
+        x0: i32,
+        y0: i32,
+        z0: i32,
+        y1: i32,
+        h_min: i32,
+        h_max: i32,
+    ) -> bool {
+        if y1 >= h_min - self.mat.max_scattered_depth
+            || !self.caves.dormant(x0, y0, z0, h_max - y0)
+            || !self.ravines.dormant(x0, y0, z0, h_max - y0)
+        {
+            return false;
+        }
+        if self.mat.cave_wall.is_none() {
+            return true;
+        }
+        let cs = CHUNK_SIZE as i32;
+        [y0 - cs, y0 + cs].into_iter().all(|ny0| {
+            self.caves.dormant(x0, ny0, z0, h_max - ny0)
+                && self.ravines.dormant(x0, ny0, z0, h_max - ny0)
+        })
+    }
+
     /// The 256 column profiles for a chunk column, plus the height/water extents
     /// the fast paths read. `cy`-invariant — sampled once per vertical column.
     fn column_profiles(&self, x0: i32, z0: i32) -> (Vec<Column>, i32, i32, i32, i32) {
@@ -1308,12 +1420,8 @@ impl Terrain {
 
         // Deep below every scattered rule's reach and beyond either carve
         // field's: solid stone. The depth bound is derived from the placement
-        // table, not a constant; carve dormancy also covers the carve-gated
-        // cave-wall rule (no carved cells → no walls).
-        if y1 < h_min - self.mat.max_scattered_depth
-            && self.caves.dormant(x0, y0, z0, h_max - y0)
-            && self.ravines.dormant(x0, y0, z0, h_max - y0)
-        {
+        // table, not a constant.
+        if self.deep_uniform_provable(x0, y0, z0, y1, h_min, h_max) {
             return ChunkData::Uniform(self.mat.stone);
         }
         // Above every surface and below the island band: uniform sky. Fully below
@@ -1759,16 +1867,24 @@ mod tests {
                     h_min = h_min.min(h);
                 }
             }
-            if y0 + 15 < h_min - g.mat.max_scattered_depth
-                && g.caves.dormant(x0, y0, z0, h_max - y0)
-                && g.ravines.dormant(x0, y0, z0, h_max - y0)
-            {
+            if g.deep_uniform_provable(x0, y0, z0, y0 + 15, h_min, h_max) {
                 proven = Some(cz);
                 break;
             }
         }
         let cz = proven.expect("a bound-cleared deep chunk within 128");
         assert_eq!(g.generate(0, cy, cz), ChunkData::Uniform(stone));
+        // Proof soundness: the per-cell path agrees with the shortcut on every
+        // cell — the proof is a CPU shortcut, never a semantic gate.
+        let (x0, y0, z0) = (0, cy * 16, cz * 16);
+        for lx in 0..16 {
+            for lz in 0..16 {
+                let h = g.height(x0 + lx, z0 + lz);
+                for ly in 0..16 {
+                    assert_eq!(g.block_at(x0 + lx, y0 + ly, z0 + lz, h), stone);
+                }
+            }
+        }
     }
 
     /// A frozen copy of the pre-placement material picker (named blocks and the
@@ -1896,8 +2012,15 @@ mod tests {
     /// far coordinates.
     #[test]
     fn placement_rewiring_is_geometry_identical_and_material_mapped() {
-        let (reg, g) = terrain_with_registry(3);
+        let (reg, mut g) = terrain_with_registry(3);
+        // The legacy picker predates stream B and the cave-wall clusters: with
+        // both silenced, stream A must reproduce its distribution EXACTLY (the
+        // doc's material-parity gate). Their distributions have their own tests.
+        g.mat.seams_b.clear();
+        g.mat.island_seams_b.clear();
+        g.mat.cave_wall = None;
         let legacy = Legacy::resolve(&reg);
+        let beach = reg.id_by_name("Soil+Sand").unwrap();
         let map = |old: BlockId| -> BlockId {
             if old == legacy.grass {
                 reg.id_by_name("Soil+Organic").unwrap()
@@ -1941,7 +2064,14 @@ mod tests {
                             reg.is_solid(new),
                             "geometry moved at ({wx},{wy},{wz}): {old:?} vs {new:?}"
                         );
-                        if map(old) != new {
+                        // The beach-edge dither may claim a legacy-grass
+                        // SURFACE cell within two blocks of the water line —
+                        // material-only, its rates have their own test.
+                        let dithered = old == legacy.grass
+                            && new == beach
+                            && wy >= p.height - 1
+                            && (1..=2).contains(&(p.height - p.water_level));
+                        if map(old) != new && !dithered {
                             mismatches += 1;
                         }
                     }
@@ -1950,5 +2080,116 @@ mod tests {
         }
         assert_eq!(mismatches, 0, "material mapping broke somewhere in {cells} cells");
         assert!(cells > 50_000, "census actually covered ground ({cells} cells)");
+    }
+
+    /// Doc test 8 — stream B's distribution: overlap pairs occur (multi-yield
+    /// finds are real), stay rare, arity never exceeds two (every emitted id is
+    /// a known single or pair), and the single rate stays in the expected band
+    /// (stream A's ~5.4% plus B's ~1/8 bonus at full eligibility).
+    #[test]
+    fn stream_b_yields_bounded_pairs_and_boosted_singles() {
+        use std::collections::HashSet;
+        let (_reg, g) = terrain_with_registry(11);
+        let single_ids: HashSet<BlockId> = g.mat.seams.iter().map(|s| s.id).collect();
+        let pair_ids: HashSet<BlockId> = g.mat.pairs.iter().flatten().copied().collect();
+
+        let (mut singles, mut pairs, mut total) = (0u64, 0u64, 0u64);
+        // Depth 60: every tier eligible on both streams. The roll is a pure
+        // function of (seed, cell), so sampling it directly is the real thing.
+        for wx in 0..512 {
+            for wz in 0..512 {
+                total += 1;
+                match g.ore_at(wx, -1000, wz, 60) {
+                    None => {}
+                    Some(id) if single_ids.contains(&id) => singles += 1,
+                    Some(id) if pair_ids.contains(&id) => pairs += 1,
+                    Some(id) => panic!("ore_at emitted an unknown id {id:?} — arity bound broken"),
+                }
+            }
+        }
+        let single_rate = singles as f64 / total as f64;
+        assert!(
+            (0.045..=0.075).contains(&single_rate),
+            "single-vein rate {single_rate:.4} left the expected band"
+        );
+        assert!(pairs > 10, "overlap pairs must actually occur (got {pairs} in {total})");
+        assert!(
+            (pairs as f64) < (singles as f64) * 0.05,
+            "pairs must stay rare finds ({pairs} pairs vs {singles} singles)"
+        );
+    }
+
+    /// The beach-edge dither: about half the grassy columns one block above
+    /// the water line (and a quarter at two) dissolve into Soil+Sand; the band
+    /// never reaches higher ground.
+    #[test]
+    fn beach_edge_dither_holds_its_band_and_rates() {
+        let (reg, g) = terrain_with_registry(3);
+        let beach = reg.id_by_name("Soil+Sand").unwrap();
+        let mut rim = [[0u64; 2]; 3]; // [rim-1, rim-2, rim-3+ grassy][total, beach]
+        for wx in -512..512 {
+            for wz in -512..512 {
+                let p = g.profile(wx, wz);
+                if p.height <= p.water_level
+                    || p.temperature.0 < COLD
+                    || p.height - g.sea_level > SNOW_ABOVE_SEA
+                    || (p.temperature.0 > HOT && p.humidity.0 < DRY)
+                {
+                    continue; // not otherwise-grassy: the dither never applies
+                }
+                let band = ((p.height - p.water_level).min(3) - 1) as usize;
+                rim[band][0] += 1;
+                if g.dress(&p, wx, wz) == beach {
+                    rim[band][1] += 1;
+                }
+            }
+        }
+        assert!(rim[0][0] > 200 && rim[1][0] > 200, "seed 3 must offer shoreline to sample");
+        let rate = |b: [u64; 2]| b[1] as f64 / b[0] as f64;
+        assert!((0.42..=0.58).contains(&rate(rim[0])), "+1 rim ~half: {:?}", rim[0]);
+        assert!((0.17..=0.33).contains(&rate(rim[1])), "+2 rim ~quarter: {:?}", rim[1]);
+        assert_eq!(rim[2][1], 0, "the dither never reaches above the +2 rim");
+    }
+
+    /// Cave-wall clusters: below the seam band (depth > 64) the only Lumin is
+    /// the wall rule's, so every hit there must sit vertically against a carved
+    /// cell — and the glow does occur.
+    #[test]
+    fn cave_wall_lumin_hugs_carved_floors_and_ceilings() {
+        let (reg, g) = terrain_with_registry(9);
+        let lumin = reg.id_by_name("LuminVein").unwrap();
+        let (mut found, mut scanned) = (0u64, 0u64);
+        'scan: for cz in 0..96 {
+            for cy in [-6i32, -7, -8] {
+                let (x0, y0, z0) = (0, cy * 16, cz * 16);
+                for lx in 0..16 {
+                    for lz in 0..16 {
+                        let (wx, wz) = (x0 + lx, z0 + lz);
+                        let p = g.profile(wx, wz);
+                        for ly in 0..16 {
+                            let wy = y0 + ly;
+                            if p.height - wy <= 64 {
+                                continue; // seam band: Lumin is ambiguous there
+                            }
+                            scanned += 1;
+                            if g.cell_base(&p, wx, wy, wz, true) == lumin {
+                                found += 1;
+                                let carved_v = |ny: i32| {
+                                    ny < p.height && g.carved(wx, ny, wz, p.height)
+                                };
+                                assert!(
+                                    carved_v(wy + 1) || carved_v(wy - 1),
+                                    "wall Lumin at ({wx},{wy},{wz}) without adjacent carve"
+                                );
+                                if found >= 25 {
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found > 0, "deep caverns must actually glow (scanned {scanned} cells)");
     }
 }

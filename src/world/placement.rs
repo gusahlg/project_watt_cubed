@@ -311,11 +311,23 @@ impl PlacementTable {
 
         // --- 2. Canonical registration. BTreeSet iteration IS the canonical
         // order; identical compositions dedup to existing (builtin) ids.
+        // Reactive terrain is a feature (a Sulfur+Coal seam SHOULD be exciting
+        // to mine) — but never a mystery: audit every reactive combo here so a
+        // surprising world behaviour is a read of startup output.
         for els in &reachable {
             let ids: Vec<ElementId> = els.iter().map(|&e| ElementId(e)).collect();
-            registry
+            let id = registry
                 .natural(&ids)
                 .expect("block palette cannot hold the worldgen enumeration");
+            let block = registry.block(id);
+            if !block.reactions.is_empty() {
+                eprintln!(
+                    "placement: terrain can emit reactive {} ({} reaction{})",
+                    block.name,
+                    block.reactions.len(),
+                    if block.reactions.len() == 1 { "" } else { "s" }
+                );
+            }
         }
 
         // --- 3. Resolve the LUTs (pure lookups — everything registered above).
