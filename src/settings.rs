@@ -827,6 +827,9 @@ mod tests {
             shake: 5.0,
             lighting: true,
             cull_faces: false,
+            // Render lanes aren't under test here; take them as-shipped so adding a
+            // lane can't break this clamp test.
+            ..Settings::default()
         };
         s.clamp();
         assert_eq!(s.msaa, 4);
@@ -912,8 +915,10 @@ mod tests {
             shake: 0.5,
             lighting: false,
             // Not persisted (env-only); must stay at the default so the composed
-            // roundtrip below — which never writes it — still lands `samples`.
+            // roundtrip below — which never writes it — still lands `samples`. The
+            // render lanes likewise stay at their persisted defaults via the spread.
             cull_faces: false,
+            ..Settings::default()
         };
         for field in &SETTINGS {
             let mut back = Settings::default();

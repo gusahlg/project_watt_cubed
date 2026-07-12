@@ -18,7 +18,7 @@ use voxel_engine::DVec3;
 
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION};
-use crate::presence::{self, Stance, WireAction};
+use crate::presence::{self, Eye, Stance, WireAction};
 
 /// How long to wait for the initial TCP connect and the server's `Welcome`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,7 +55,9 @@ pub struct RemotePlayer {
 /// Sampled render state at a point in time: an interpolated pose plus the derived
 /// horizontal speed and gait phase.
 pub struct Rendered {
-    pub pos: DVec3,
+    /// The peer's eye position; drop to [`Feet`](presence::Feet) via
+    /// [`Eye::feet`](presence::Eye::feet) with `stance` before rendering.
+    pub pos: Eye,
     pub yaw: f32,
     pub pitch: f32,
     pub speed: f32,
@@ -83,7 +85,7 @@ impl RemotePlayer {
             0.0
         };
         Rendered {
-            pos,
+            pos: Eye(pos),
             yaw,
             pitch,
             speed,
@@ -416,8 +418,8 @@ mod tests {
         .unwrap();
         let port = handle.addr().port();
 
-        let mut a = Connection::connect("127.0.0.1", port, "alice", "pw").unwrap();
-        let mut b = Connection::connect("127.0.0.1", port, "bob", "pw").unwrap();
+        let mut a = Connection::connect("127.0.0.1", port, "walnutty", "pw").unwrap();
+        let mut b = Connection::connect("127.0.0.1", port, "guahlg", "pw").unwrap();
         assert_eq!(a.seed(), 4242);
         assert_eq!(b.seed(), 4242);
         assert_ne!(a.player_id(), b.player_id());
@@ -426,10 +428,10 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
         a.poll();
         b.poll();
-        assert_eq!(a.peers().count(), 1, "alice should see bob");
-        assert_eq!(b.peers().count(), 1, "bob should see alice");
+        assert_eq!(a.peers().count(), 1, "walnutty should see guahlg");
+        assert_eq!(b.peers().count(), 1, "guahlg should see walnutty");
 
-        // Alice edits a block right next to her spawn; bob should receive it.
+        // Walnutty edits a block right next to her spawn; guahlg should receive it.
         let s = a.spawn();
         let (bx, by, bz) = (
             crate::math::block_coord(s.x),
@@ -445,7 +447,7 @@ mod tests {
         let events = b.poll();
         assert!(
             events.iter().any(|e| matches!(e, Incoming::Edit { x, y, z, .. } if (*x, *y, *z) == (bx, by, bz))),
-            "bob should receive alice's edit"
+            "guahlg should receive walnutty's edit"
         );
 
         // Global chat reaches everyone regardless of distance.
@@ -454,7 +456,7 @@ mod tests {
         let events = b.poll();
         assert!(
             events.iter().any(|e| matches!(e, Incoming::Chat { text, .. } if text == "hello")),
-            "bob should receive alice's global chat"
+            "guahlg should receive walnutty's global chat"
         );
 
         handle.stop();

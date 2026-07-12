@@ -24,7 +24,7 @@ use crate::mods::{ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
-use crate::presence::{self, Gait, RenderPose, Stance, TagVisibility, WireAction};
+use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility, WireAction};
 use crate::save;
 use crate::settings::Settings;
 use crate::sim::Simulation;
@@ -676,20 +676,21 @@ impl Game {
             // The player's own body, whenever the camera can see it (third
             // person and freecam) — the same humanoid + animator the peers use.
             if self.camera.shows_body() {
-                let feet = DVec3::new(
+                let feet = Feet(DVec3::new(
                     self.player.position.x,
                     self.player.feet_y(),
                     self.player.position.z,
-                );
+                ));
                 let v = self.player.velocity();
                 let speed = ((v.x * v.x + v.z * v.z).sqrt()) as f32;
-                let rp = RenderPose {
-                    feet: (feet - pose.eye).as_vec3(),
-                    yaw: self.player.yaw,
-                    pitch: self.player.pitch,
-                    stance: Stance::of_player(&self.player),
-                    gait: Gait::new(self.local_gait as f32, speed),
-                };
+                let rp = RenderPose::new(
+                    feet,
+                    Eye(pose.eye),
+                    self.player.yaw,
+                    self.player.pitch,
+                    Stance::of_player(&self.player),
+                    Gait::new(self.local_gait as f32, speed),
+                );
                 let rig = self.local_anim.step(&rp, dt);
                 Pose::resolve(&rp, &rig).draw(&mut f3, peer_color(&self.save_name));
             }
@@ -759,15 +760,10 @@ impl Game {
         net.peers_mut()
             .map(|peer| {
                 let r = peer.sample(now);
-                let rp = RenderPose {
-                    feet: (r.pos - eye).as_vec3(),
-                    yaw: r.yaw,
-                    pitch: r.pitch,
-                    stance: r.stance,
-                    gait: Gait::new(r.phase, r.speed),
-                };
+                let feet = r.pos.feet(r.stance);
+                let rp = RenderPose::new(feet, Eye(eye), r.yaw, r.pitch, r.stance, Gait::new(r.phase, r.speed));
                 let rig = peer.anim.step(&rp, dt);
-                let head = r.pos + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
+                let head = feet.0 + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
                 let to_head = head - eye;
                 let dist = to_head.length();
                 let tag = if to_head.dot(forward) > 0.0 && dist > 1e-6 {

@@ -8,7 +8,7 @@
 //! each frame from state; no mutated flags. Anything derivable from pose
 //! trajectory (speed, gait, body yaw) is derived client-side, never networked.
 //! Only non-derivable signal is a discrete action sent as a WireAction.
-use voxel_engine::Vec3;
+use voxel_engine::{DVec3, Vec3};
 
 use crate::player::{self, Player};
 
@@ -51,6 +51,17 @@ impl Stance {
         matches!(self, Stance::Swimming)
     }
 
+    /// Eye height above the feet for a broadcast stance. Reuses [`player::Stance`]'s
+    /// offset so the eye/feet gap can't drift from the local player's; swimming
+    /// keeps the standing eye height (the local swimmer's box is still upright).
+    pub fn eye_offset(self) -> f64 {
+        match self {
+            Stance::Sneaking => player::Stance::Sneaking,
+            Stance::Standing | Stance::Swimming => player::Stance::Standing,
+        }
+        .eye_offset()
+    }
+
     /// Wire codec: one byte, closed set. `from_wire` rejects unknown values so
     /// a hostile byte can't smuggle an out-of-enum stance.
     pub fn wire(self) -> u8 {
@@ -90,6 +101,26 @@ impl Gait {
     }
 }
 
+/// A world-space position anchored at the eye (camera height). What the wire
+/// carries, and the authoritative origin for the server's reach checks. Distinct
+/// type from [`Feet`] so the two anchors can't be swapped by accident — the class
+/// of bug where a remote avatar renders eye-high instead of on the ground.
+#[derive(Clone, Copy)]
+pub struct Eye(pub DVec3);
+
+/// A world-space position anchored at the feet — the avatar rig's origin. The only
+/// way to reach it from an [`Eye`] is [`Eye::feet`], which *requires* a stance, so
+/// the eye-height drop can never be silently skipped.
+#[derive(Clone, Copy)]
+pub struct Feet(pub DVec3);
+
+impl Eye {
+    /// Drop to the feet for the given stance.
+    pub fn feet(self, stance: Stance) -> Feet {
+        Feet(self.0 - DVec3::new(0.0, stance.eye_offset(), 0.0))
+    }
+}
+
 /// The single per-frame pose the avatar renders from. Remote authority
 /// produces it by snapshot interpolation; local authority directly from
 /// [`Player`]. `feet` is already camera-relative (world minus eye, subtracted
@@ -102,6 +133,16 @@ pub struct RenderPose {
     pub pitch: f32,
     pub stance: Stance,
     pub gait: Gait,
+}
+
+impl RenderPose {
+    /// Build a pose from a world-space [`Feet`] position, narrowed relative to the
+    /// camera. Taking a typed `Feet` (never a bare vector) is the guard: callers
+    /// must convert an eye position through [`Eye::feet`] first, so an eye can't be
+    /// mistaken for feet.
+    pub fn new(feet: Feet, camera: Eye, yaw: f32, pitch: f32, stance: Stance, gait: Gait) -> Self {
+        Self { feet: (feet.0 - camera.0).as_vec3(), yaw, pitch, stance, gait }
+    }
 }
 
 /// Name-tag visibility with fade baked in: no `(visible, alpha)` pair to
