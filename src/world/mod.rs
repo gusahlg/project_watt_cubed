@@ -37,6 +37,7 @@ pub mod light;
 pub mod lod;
 pub mod mesh;
 pub mod pipeline;
+pub mod placement;
 pub mod pyramid;
 pub mod section;
 
