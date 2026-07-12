@@ -827,6 +827,7 @@ mod tests {
             shake: 5.0,
             lighting: true,
             cull_faces: false,
+            ..Settings::default()
         };
         s.clamp();
         assert_eq!(s.msaa, 4);
@@ -914,6 +915,9 @@ mod tests {
             // Not persisted (env-only); must stay at the default so the composed
             // roundtrip below — which never writes it — still lands `samples`.
             cull_faces: false,
+            // Fields added since this fixture was written: defaults roundtrip
+            // trivially, so the spread above stays the interesting part.
+            ..Settings::default()
         };
         for field in &SETTINGS {
             let mut back = Settings::default();
