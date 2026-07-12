@@ -42,6 +42,52 @@ pub enum Signal {
     ExitToMenu,
 }
 
+/// Everything [`Game::compose_phase`] decides before frame recording starts:
+/// the camera pose, the composed per-frame lighting truth, peer render poses,
+/// and the cached HUD strings — handed read-only to the scene and HUD phases.
+struct Scene {
+    pose: ViewPose,
+    camera: Camera3D,
+    peers: Vec<PeerDraw>,
+    frame_uniforms: voxel_engine::skeleton::FrameUniformsGpu,
+    clear: voxel_engine::LinearRgb,
+    debug_flat: Option<Color>,
+    coord_text: String,
+    fps_text: String,
+    screen: (i32, i32),
+    online: Option<usize>,
+    ping_ms: Option<u32>,
+    dt: f32,
+}
+
+/// One frame's routed input, snapshotted into plain data by
+/// [`Game::input_phase`] so the router borrow ends before later phases take
+/// `&mut Engine`. Which fields are live depends on the frame's exclusive
+/// context: `is_text` carries the console's typing, everything else gameplay.
+#[derive(Default)]
+struct FrameInput {
+    is_text: bool,
+    text_chars: Vec<char>,
+    text_edit: Option<crate::input::intent::EditKey>,
+    move_input: Option<movement::MoveInput>,
+    look_delta: Vec2,
+    fly_axes: FlyAxes,
+    do_break: bool,
+    do_place: bool,
+    toggle_inventory: bool,
+    toggle_crafting: bool,
+    nav_up: bool,
+    nav_down: bool,
+    nav_confirm: bool,
+    open_console: bool,
+    open_chat: bool,
+    toggle_capture: bool,
+    g_escape: bool,
+    g_hud: bool,
+    g_shot: bool,
+    g_minimap: bool,
+}
+
 /// The live world the player is in.
 pub struct Game {
     world: World,
@@ -124,6 +170,18 @@ impl Game {
         self.render = render;
     }
 
+    /// Push every live-applicable setting into this game: engine values, the
+    /// world's view radius and lighting lane, and the per-frame look config.
+    /// THE one path — world entry and in-game `/gfx` edits both come through
+    /// here, so they can never drift apart. (World-construction lanes
+    /// — occlusion/lod2 — stay entry-only by design; see `App::enter_game`.)
+    pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
+        settings.apply(eng);
+        self.world.set_view_radius(settings.render_distance);
+        self.world.set_lighting(settings.lighting, eng);
+        self.render = settings.render_config();
+    }
+
     pub fn scripted(seed: u64, render: crate::render_config::RenderConfig) -> Game {
         let world = World::with_config(seed as i64, render);
         let player = Player::new(DVec3::new(0.0, 80.0, 0.0));
@@ -204,6 +262,9 @@ impl Game {
     }
 
     /// Advance one frame. Returns Signal::ExitToMenu when the player leaves.
+    /// One frame of in-world logic, as a sequence of named phases. Each phase
+    /// is a plain method — the flow reads top to bottom and any early Signal
+    /// short-circuits the rest of the frame, exactly as before the split.
     pub fn update(
         &mut self,
         eng: &mut Engine,
@@ -233,20 +294,32 @@ impl Game {
         // Keep the HUD text scale in sync with the persisted setting.
         self.theme.scale = settings.ui_scale;
 
-        // Drain the server first so edits and chat keep flowing even while the
-        // console is open or the player stands still.
+        if let Some(signal) = self.net_phase() {
+            return signal;
+        }
+        let input = self.input_phase(eng, router, dt);
+        if let Some(signal) = self.overlay_phase(&input, eng, router, mods, settings) {
+            return signal;
+        }
+        let detached = self.motion_phase(&input, dt);
+        self.interact_phase(&input, detached, eng, mods);
+        self.stream_phase(eng, dt);
+        Signal::Continue
+    }
+
+    /// Drain server events and send our heartbeat. `Some(ExitToMenu)` when the
+    /// server dropped us. Runs before input so edits and chat keep flowing even
+    /// while the console is open or the player stands still — and the move
+    /// report doubles as the keepalive, so it too runs unconditionally.
+    fn net_phase(&mut self) -> Option<Signal> {
         let net_disconnected = {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
             self.apply_net_events()
         };
         if net_disconnected {
             self.console.print("* disconnected from server".to_string());
-            return Signal::ExitToMenu;
+            return Some(Signal::ExitToMenu);
         }
-
-        // Report our own state to the server every frame — this doubles as the
-        // keepalive heartbeat, so it must run even while the console is open
-        // (otherwise the server's idle timeout kicks a chatting player).
         if let Some(net) = &mut self.net {
             net.send_move(
                 self.player.position,
@@ -255,110 +328,111 @@ impl Game {
                 Stance::of_player(&self.player),
             );
         }
+        None
+    }
 
-        // The exclusive context for this frame: Text while the console captures
-        // typing (the world freezes locally — peers keep moving over the net).
+    /// The once-per-frame router transition: pick the exclusive context (Text
+    /// while the console captures typing) and snapshot every intent into plain
+    /// data, so the router borrow ends before any `&mut Engine` side effects
+    /// (screenshot, cursor grab, console open) run in later phases.
+    fn input_phase(&mut self, eng: &mut Engine, router: &mut Router, dt: f32) -> FrameInput {
         router.set_context(if self.console.is_open() { Context::Text } else { Context::Gameplay });
 
-        // The once-per-frame transition: snapshot this frame's intents into
-        // locals, then drop the router borrow before any `&mut Engine` side
-        // effects (screenshot, cursor grab, console open) run below.
-        let mut is_text = false;
-        let mut text_chars: Vec<char> = Vec::new();
-        let mut text_edit = None;
-        let mut move_input = None;
-        let mut look_delta = Vec2::ZERO;
-        let mut fly_axes = FlyAxes::default();
-        let (mut do_break, mut do_place) = (false, false);
-        let (mut toggle_inventory, mut toggle_crafting) = (false, false);
-        let (mut nav_up, mut nav_down, mut nav_confirm) = (false, false, false);
-        let (mut open_console, mut open_chat, mut toggle_capture) = (false, false, false);
-        // Global events are evaluated unconditionally below, so bind once (no
-        // dead initializer).
-        let (g_escape, g_hud, g_shot, g_minimap);
-        {
-            let input = router.frame(eng, dt);
-            match input.view() {
-                View::Gameplay(gp) => {
-                    move_input = Some(movement::MoveInput::from_view(&gp));
-                    look_delta = gp.look();
-                    // Same axes the player reads, reinterpreted by the freecam rig
-                    // when the camera is detached (the two never both consume them).
-                    fly_axes = FlyAxes {
-                        forward: gp.axis(GameplayAxis::MoveZ) as f64,
-                        right: gp.axis(GameplayAxis::MoveX) as f64,
-                        up: gp.axis(GameplayAxis::MoveY) as f64,
-                        boost: gp.state(GameplayState::Sprint),
-                    };
-                    do_break = gp.event(GameplayEvent::Break);
-                    do_place = gp.event(GameplayEvent::Place);
-                    toggle_inventory = gp.event(GameplayEvent::ToggleInventory);
-                    toggle_crafting = gp.event(GameplayEvent::ToggleCrafting);
-                    open_console = gp.event(GameplayEvent::OpenConsole);
-                    open_chat = gp.event(GameplayEvent::OpenChat);
-                    toggle_capture = gp.event(GameplayEvent::ToggleCapture);
-                    nav_up = gp.overlay_nav(MenuEvent::Up);
-                    nav_down = gp.overlay_nav(MenuEvent::Down);
-                    nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
-                }
-                View::Text(t) => {
-                    is_text = true;
-                    text_chars = t.chars().collect();
-                    text_edit = t.edit();
-                }
-                // The game never routes to Menu; treat it like Text (inert).
-                View::Menu(_) => is_text = true,
+        let mut f = FrameInput::default();
+        let input = router.frame(eng, dt);
+        match input.view() {
+            View::Gameplay(gp) => {
+                f.move_input = Some(movement::MoveInput::from_view(&gp));
+                f.look_delta = gp.look();
+                // Same axes the player reads, reinterpreted by the freecam rig
+                // when the camera is detached (the two never both consume them).
+                f.fly_axes = FlyAxes {
+                    forward: gp.axis(GameplayAxis::MoveZ) as f64,
+                    right: gp.axis(GameplayAxis::MoveX) as f64,
+                    up: gp.axis(GameplayAxis::MoveY) as f64,
+                    boost: gp.state(GameplayState::Sprint),
+                };
+                f.do_break = gp.event(GameplayEvent::Break);
+                f.do_place = gp.event(GameplayEvent::Place);
+                f.toggle_inventory = gp.event(GameplayEvent::ToggleInventory);
+                f.toggle_crafting = gp.event(GameplayEvent::ToggleCrafting);
+                f.open_console = gp.event(GameplayEvent::OpenConsole);
+                f.open_chat = gp.event(GameplayEvent::OpenChat);
+                f.toggle_capture = gp.event(GameplayEvent::ToggleCapture);
+                f.nav_up = gp.overlay_nav(MenuEvent::Up);
+                f.nav_down = gp.overlay_nav(MenuEvent::Down);
+                f.nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
             }
-            let global = input.global();
-            g_escape = global.event(GlobalEvent::Escape);
-            g_hud = global.event(GlobalEvent::CycleHud);
-            g_shot = global.event(GlobalEvent::Screenshot);
-            g_minimap = global.event(GlobalEvent::MinimapMode);
+            View::Text(t) => {
+                f.is_text = true;
+                f.text_chars = t.chars().collect();
+                f.text_edit = t.edit();
+            }
+            // The game never routes to Menu; treat it like Text (inert).
+            View::Menu(_) => f.is_text = true,
         }
+        let global = input.global();
+        f.g_escape = global.event(GlobalEvent::Escape);
+        f.g_hud = global.event(GlobalEvent::CycleHud);
+        f.g_shot = global.event(GlobalEvent::Screenshot);
+        f.g_minimap = global.event(GlobalEvent::MinimapMode);
+        f
+    }
 
+    /// Console, escape routing, and the global toggles (mouse capture, HUD
+    /// cycle, screenshot, minimap, camera modes). `Some` consumes the frame:
+    /// while typing, nothing below the console runs.
+    fn overlay_phase(
+        &mut self,
+        input: &FrameInput,
+        eng: &mut Engine,
+        router: &mut Router,
+        mods: &mut Mods,
+        settings: &mut Settings,
+    ) -> Option<Signal> {
         // Text context: the console owns all input; nothing else runs. Esc is
         // the game's call (the Text view has no bindable events), and here it
         // means "close the console", never "leave the world".
-        if is_text {
-            if g_escape {
+        if input.is_text {
+            if input.g_escape {
                 self.console.close();
-                return Signal::Continue;
+                return Some(Signal::Continue);
             }
-            if let Some(line) = self.console.handle_input(&text_chars, text_edit) {
+            if let Some(line) = self.console.handle_input(&input.text_chars, input.text_edit) {
                 self.submit_line(line, eng, settings);
             }
-            return Signal::Continue;
+            return Some(Signal::Continue);
         }
 
         // Esc closes an in-world mod overlay before leaving the world.
-        if g_escape {
+        if input.g_escape {
             if mods.close_overlay() {
-                return Signal::Continue;
+                return Some(Signal::Continue);
             }
-            return Signal::ExitToMenu;
+            return Some(Signal::ExitToMenu);
         }
 
         // Open the console: `/` (OpenConsole) pre-fills a slash, `T` (OpenChat)
         // does not. Drain the char queue so the opening key isn't also typed.
-        if open_console || open_chat {
-            self.console.open(open_console);
+        if input.open_console || input.open_chat {
+            self.console.open(input.open_console);
             while eng.get_char_pressed().is_some() {}
-            return Signal::Continue;
+            return Some(Signal::Continue);
         }
 
-        if toggle_capture {
+        if input.toggle_capture {
             toggle_mouse(eng, router);
         }
-        if g_hud {
+        if input.g_hud {
             self.theme.cycle_hud();
         }
-        if g_shot {
+        if input.g_shot {
             match eng.screenshot() {
                 Some(path) => println!("screenshot queued: {}", path.display()),
                 None => eprintln!("screenshot could not be queued"),
             }
         }
-        if g_minimap {
+        if input.g_minimap {
             self.minimap.toggle_orientation();
         }
 
@@ -369,70 +443,79 @@ impl Game {
         if eng.is_key_pressed(Key::F6) {
             self.camera.toggle_freecam(&self.player, &self.world, settings.fov);
         }
-        self.camera.fx.update(dt);
+        None
+    }
 
-        // Exactly one thing consumes look/move per frame: the detached rig
-        // (player frozen) or the player. See `CameraMode`.
-        let detached = if let Some(rig) = self.camera.free_rig() {
-            rig.look(look_delta);
-            rig.fly(fly_axes, dt);
+    /// Camera effects plus movement. Exactly one thing consumes look/move per
+    /// frame — the detached freecam rig (player frozen) or the player; returns
+    /// whether the rig had it (see `CameraMode`).
+    fn motion_phase(&mut self, input: &FrameInput, dt: f32) -> bool {
+        self.camera.fx.update(dt);
+        if let Some(rig) = self.camera.free_rig() {
+            rig.look(input.look_delta);
+            rig.fly(input.fly_axes, dt);
             true
         } else {
             // Look (inert while uncaptured — the query already zeroed the delta).
-            look::apply(&mut self.player, look_delta);
+            look::apply(&mut self.player, input.look_delta);
 
-            if let Some(input) = &move_input {
+            if let Some(mi) = &input.move_input {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::Physics);
-                movement::update_player(&mut self.player, &self.world, input, dt);
+                movement::update_player(&mut self.player, &self.world, mi, dt);
             }
             // Advance the local walk cycle from horizontal travel, mirroring
             // how peers' phases accumulate from their snapshots.
             let v = self.player.velocity();
             self.local_gait += (v.x * v.x + v.z * v.z).sqrt() * dt as f64 * presence::STRIDE_FREQ;
             false
-        };
+        }
+    }
 
+    /// World edits: block breaking, then the mods' frame hooks and whatever
+    /// placements they queued. Mods run once per frame here — never inside the
+    /// voxel loop.
+    fn interact_phase(&mut self, input: &FrameInput, detached: bool, eng: &mut Engine, mods: &mut Mods) {
         // Break is capture-gated in the query; freecam additionally can't act
         // on the world (the crosshair isn't where the player aims).
-        if do_break && !detached {
+        if input.do_break && !detached {
             self.break_block(mods);
         }
 
-        // Mods run once per frame here — never inside the voxel loop.
         let placements = {
             let mut ctx = ModContext {
                 player: &mut self.player,
                 world: &mut self.world,
                 screen_w: eng.screen_width(),
                 screen_h: eng.screen_height(),
-                place: do_place,
-                toggle_inventory,
-                toggle_crafting,
-                nav_up,
-                nav_down,
-                nav_confirm,
+                place: input.do_place,
+                toggle_inventory: input.toggle_inventory,
+                toggle_crafting: input.toggle_crafting,
+                nav_up: input.nav_up,
+                nav_down: input.nav_down,
+                nav_confirm: input.nav_confirm,
                 placements: Vec::new(),
             };
             mods.update(eng, &mut ctx);
             ctx.placements
         };
         self.apply_placements(placements);
+    }
 
-        // Load/mesh/unload chunks around the camera (the player, unless the
-        // freecam rig has flown elsewhere), then step physics.
+    /// Load/mesh/unload chunks around the camera (the player, unless the
+    /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
+    /// step the simulation.
+    fn stream_phase(&mut self, eng: &mut Engine, dt: f32) {
         let stream_center = match &self.camera.mode {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
         self.world.stream(stream_center, eng);
 
-        // Refresh minimap (throttled).
         let p = self.player.position;
         let player_col = IVec2::new(p.x.floor() as i32, p.z.floor() as i32);
         self.minimap
             .refresh(eng, &self.world, player_col, Instant::now());
         self.sim.advance(&mut self.world, dt);
-        Signal::Continue
     }
 
     /// Drain queued server messages: apply world edits, surface chat, and report a
@@ -504,15 +587,10 @@ impl Game {
         for out in command::execute(&line, &mut self.player, &self.world, settings, &mut self.sky) {
             self.console.push(out);
         }
-        // A `/gfx` command edits settings; push the result to the engine and
-        // world, and persist it, only when something actually changed.
+        // A `/gfx` command edits settings; push the result through the one
+        // application path and persist it, only when something actually changed.
         if *settings != before {
-            settings.apply(eng);
-            self.world.set_view_radius(settings.render_distance);
-            self.world.set_lighting(settings.lighting, eng);
-            // Occlusion/lod2 are entry-only (a live world stays as constructed); the
-            // per-frame look lanes (clouds/weather) update immediately here.
-            self.render = settings.render_config();
+            self.apply_settings(eng, settings);
             settings.save();
         }
         // A `/time` change is shared: tell the server so every client's clock
@@ -586,10 +664,19 @@ impl Game {
     /// 3D draws are camera-relative. Differences are computed at f64 precision
     /// before narrowing to f32 for the GPU, keeping far terrain stable.
     pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32) {
+        let scene = self.compose_phase(eng, fov, shake);
+        let mut f = eng.begin_frame(scene.clear);
+        self.scene_phase(&mut f, &scene);
+        self.hud_phase(&mut f, mods, &scene);
+    }
+
+    /// Everything a frame needs decided BEFORE recording starts: the camera
+    /// pose, the per-frame lighting truth (the engine UBO's single source),
+    /// peer render poses, and the cached HUD strings.
+    fn compose_phase(&mut self, eng: &mut Engine, fov: f32, shake: f32) -> Scene {
         // The one pose this frame renders from: mode observation plus effects.
         let pose = self.camera.pose(&self.player, &self.world, fov, shake);
         let camera = pose.camera3d();
-        let cam_pos = pose.eye;
 
         let p = self.player.position;
         // 0.1-block display resolution: only re-format when a shown digit moves.
@@ -604,9 +691,7 @@ impl Game {
         // and golden diffs must only ever see real rendering drift.
         let fps_text =
             if self.scripted { "-- FPS".to_string() } else { format!("{:2} FPS", eng.fps()) };
-        let screen_w = eng.screen_width();
-        let screen_h = eng.screen_height();
-        let screen = (screen_w, screen_h);
+        let screen = (eng.screen_width(), eng.screen_height());
 
         // `dt` steps each peer's animator (body-yaw follow, stance blend, swing).
         let dt = eng.frame_time();
@@ -656,8 +741,25 @@ impl Game {
             }
         };
 
-        let mut f = eng.begin_frame(clear);
+        Scene {
+            pose,
+            camera,
+            peers,
+            frame_uniforms,
+            clear,
+            debug_flat,
+            coord_text,
+            fps_text,
+            screen,
+            online,
+            ping_ms,
+            dt,
+        }
+    }
 
+    /// The 3D scope: sky, world, and every humanoid, all camera-relative.
+    fn scene_phase(&mut self, f: &mut voxel_engine::Frame, scene: &Scene) {
+        let Scene { pose, camera, peers, dt, .. } = scene;
         {
             // The pose's f64 eye is the render-space origin for camera rebase:
             // TAA's translation reprojection depends on this.
@@ -665,21 +767,21 @@ impl Game {
             // the composed per-frame UBO carries the lighting truth in every mode
             // (the renderer overlays the debug-flat reserved key for TerrainKey).
             let mut f3 = f.begin_3d(
-                &camera,
+                camera,
                 pose.eye,
-                voxel_engine::Lighting::Composed(frame_uniforms),
+                voxel_engine::Lighting::Composed(scene.frame_uniforms),
             );
-            f3.set_debug_flat(debug_flat);
+            f3.set_debug_flat(scene.debug_flat);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
                 self.sky.draw(&mut f3);
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
-            self.world.render(&mut f3, cam_pos);
+            self.world.render(&mut f3, pose.eye);
             // Other players: a six-box humanoid, head tracking their look and
             // body lazily following, limbs swinging with their gait. Poses are
             // already camera-relative (see peer_draws).
-            for peer in &peers {
+            for peer in peers {
                 Pose::resolve(&peer.pose, &peer.rig).draw(&mut f3, peer.color);
             }
             // The player's own body, whenever the camera can see it (third
@@ -699,35 +801,41 @@ impl Game {
                     stance: Stance::of_player(&self.player),
                     gait: Gait::new(self.local_gait as f32, speed),
                 };
-                let rig = self.local_anim.step(&rp, dt);
+                let rig = self.local_anim.step(&rp, *dt);
                 Pose::resolve(&rp, &rig).draw(&mut f3, peer_color(&self.save_name));
             }
         }
+    }
 
+    /// Everything over the world: minimap, reticle, name tags, info text, the
+    /// mods' HUD data (rendered by the core — mods never touch the frame), and
+    /// the console on top.
+    fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
+        let screen = scene.screen;
         let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
         // Draw minimap.
         let player_col = IVec2::new(
             self.player.position.x.floor() as i32,
             self.player.position.z.floor() as i32,
         );
-        self.minimap.draw(&mut f, screen, player_col, self.player.yaw);
+        self.minimap.draw(f, screen, player_col, self.player.yaw);
 
         let theme = &self.theme;
 
         // Reticle and world-space name tags: shown in every mode but fully-off.
         if theme.hud.shows_world_ui() {
-            theme.crosshair.draw(&mut f, screen);
+            theme.crosshair.draw(f, screen);
 
             // Floating name tags over each visible player, in the peer's own
             // tint, fading with distance and dimming when terrain occludes the
             // head (instead of drawing full-strength through walls).
-            for peer in &peers {
+            for peer in &scene.peers {
                 if let Some((tag, alpha)) = peer.tag {
                     let fs = theme.fs(18);
                     let tw = f.measure_text(&peer.name, fs);
                     let c = peer.color;
                     console::shadowed(
-                        &mut f,
+                        f,
                         &peer.name,
                         tag.x as i32 - tw / 2,
                         tag.y as i32,
@@ -740,22 +848,22 @@ impl Game {
 
         // Informational HUD text: coords, help, FPS, player count. Full mode only.
         if theme.hud.shows_info() {
-            ui::label(&mut f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), &coord_text);
-            ui::label(&mut f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), &fps_text);
-            if let Some(count) = online {
-                let text = match ping_ms {
+            ui::label(f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), &scene.coord_text);
+            ui::label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), &scene.fps_text);
+            if let Some(count) = scene.online {
+                let text = match scene.ping_ms {
                     Some(ms) => format!("players online: {count}   {ms} ms"),
                     None => format!("players online: {count}"),
                 };
-                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), &text);
+                ui::label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), &text);
             }
         }
 
         // Enabled mods contribute their HUD as data; the core renders it over the
         // world, under the console. Mods never touch the frame themselves.
         let hud = mods.hud(&self.world, screen);
-        ui::render_hud(&mut f, theme, screen, &hud);
-        self.console.draw(&mut f, screen_w, screen_h);
+        ui::render_hud(f, theme, screen, &hud);
+        self.console.draw(f, screen.0, screen.1);
     }
 
     /// Build the per-frame draw data for other players. `&mut self` because animator state advances here.

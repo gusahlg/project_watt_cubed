@@ -427,12 +427,11 @@ impl App {
 
     /// Install a freshly built game as the active screen.
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
-        game.world_mut().set_view_radius(self.settings.render_distance);
-        game.world_mut().set_lighting(self.settings.lighting, eng);
-        // World-construction lanes apply on entry, before streaming spins.
+        // World-construction lanes apply on entry only, before streaming spins;
+        // everything live-applicable goes through the same path `/gfx` uses.
         let render = self.settings.render_config();
         game.world_mut().set_render_lanes(render.occlusion, render.lod2);
-        game.set_render_config(render);
+        game.apply_settings(eng, &mut self.settings);
         // Saves and servers can place the player far from the pre-generated
         // origin; make the ground under them real before physics runs.
         let pos = game.player().position;
