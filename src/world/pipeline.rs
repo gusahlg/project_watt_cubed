@@ -512,7 +512,7 @@ mod tests {
 
     /// Mirrors `World::new`'s generator construction.
     fn generator(seed: i64) -> SineHills {
-        SineHills::new(&BlockRegistry::with_builtins(), 20.0, seed)
+        SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
     }
 
     /// Create a far section job tagged by id for scheduler tests.
@@ -566,8 +566,8 @@ mod tests {
 
     #[test]
     fn worker_meshing_matches_the_sync_mesher() {
-        let registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&registry, 20.0, 5);
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 5);
         // The chunk holding the surface at the origin, with all six neighbours
         // (below: solid ground, above: sky, sides: more surface).
         let chunk = Chunk::new(0, 1, 0, &generator);

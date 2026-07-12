@@ -374,7 +374,10 @@ mod tests {
         water: BlockId,
     }
     fn setup() -> (BlockRegistry, HotTables, Blocks) {
-        let r = BlockRegistry::with_builtins();
+        // Compile the placement table so the hot tables cover every id the
+        // real generator can emit (the fixtures below use builtin names only).
+        let mut r = BlockRegistry::with_builtins();
+        crate::world::placement::builtin().compile(&mut r);
         let id = |n: &str| r.id_by_name(n).unwrap();
         let blocks = Blocks {
             grass: id("Grass"),
@@ -634,7 +637,7 @@ mod tests {
     #[test]
     fn meshing_is_deterministic() {
         let (_r, tables, _b) = setup();
-        let r#gen = SineHills::new(&BlockRegistry::with_builtins(), 20.0, 0xBEEF);
+        let r#gen = SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
         let sec = Section::extract(FINEST, &r#gen, &[]);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);

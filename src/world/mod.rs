@@ -581,8 +581,10 @@ impl World {
     ///
     /// [`RenderConfig`]: crate::render_config::RenderConfig
     pub fn with_config(seed: i64, render: crate::render_config::RenderConfig) -> Self {
-        let registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&registry, 20.0, seed);
+        // `mut` for the placement compile: the generator registers every block
+        // terrain can emit here at startup, then keeps only resolved ids.
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, seed);
         // The section ladder's innermost ring begins where the full-res box ends,
         // so its `unit` is the render distance in metres.
         let unit = (DEFAULT_VIEW_RADIUS * CHUNK_SIZE as i32) as f32;
@@ -1283,9 +1285,12 @@ mod tests {
     fn column_is_layered_grass_dirt_stone() {
         let mut world = World::generate();
         let reg = world.registry();
+        // Terrain speaks elements now: the crust blocks are the natural unions
+        // the placement table derives, not the authored Grass/Dirt mixtures
+        // (which remain registered for crafting and old saves).
         let (grass, dirt, stone) = (
-            reg.id_by_name("Grass").unwrap(),
-            reg.id_by_name("Dirt").unwrap(),
+            reg.id_by_name("Soil+Organic").unwrap(),
+            reg.id_by_name("Soil+Clay").unwrap(),
             reg.id_by_name("Stone").unwrap(),
         );
 

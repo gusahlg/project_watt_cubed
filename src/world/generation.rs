@@ -30,6 +30,7 @@
 use std::ops::RangeInclusive;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
+use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
 /// Produces terrain for absolute world coordinates.
@@ -681,9 +682,6 @@ const OVERHANG_REACH: i32 = 8;
 /// block of height above it — so shelves fade out with altitude above the ground.
 const OVERHANG_THRESH: f32 = 0.60;
 const OVERHANG_FADE: f32 = 0.05;
-/// Shallowest / deepest depth at which ground ore can appear.
-const ORE_MIN_DEPTH: i32 = 3;
-const ORE_MAX_DEPTH: i32 = 64;
 /// Island surface cells at or above this altitude freeze to Ice.
 const ICE_SURFACE_Y: i32 = 220;
 
@@ -827,15 +825,6 @@ const ISLAND_BAND_SPAN: i32 = 120;
 const ISLAND_AERIUM_W: u32 = u32::MAX / 45;
 const ISLAND_QUARTZ_W: u32 = u32::MAX / 160;
 
-/// One ground ore tier: eligible from `min_depth` down, hit when the cell's hash
-/// lands in a cumulative slice `width` wide.
-#[derive(Clone, Copy)]
-struct Seam {
-    min_depth: i32,
-    width: u32,
-    block: BlockId,
-}
-
 // ---------------------------------------------------------------------------
 // Terrain — the game's generator. `SineHills` kept as an alias so existing call
 // sites need no change.
@@ -879,28 +868,28 @@ pub struct Terrain {
     overhangs: Fbm,
     islands: Islands,
 
-    grass: BlockId,
-    dirt: BlockId,
-    stone: BlockId,
-    sand: BlockId,
-    snow: BlockId,
-    ice: BlockId,
-    water: BlockId,
+    /// Pre-resolved placement LUTs — the generator's only view of the palette.
+    /// Terrain speaks elements: every material below is the union of the
+    /// elements whose placement rules want the cell (see [`placement`]).
+    mat: placement::Resolved,
+    /// Tree decoration blocks (multi-cell payloads live outside the per-cell
+    /// placement table, exactly like the scatter that plants them).
     wood: BlockId,
     leaves: BlockId,
-    aerium_vein: BlockId,
-    quartz_vein: BlockId,
-    /// Ground ore table, sorted by `min_depth`.
-    seams: [Seam; 10],
 }
 
 /// Kept for compatibility with existing call sites.
 pub type SineHills = Terrain;
 
 impl Terrain {
-    /// Build the generator for a seed, resolving its palette against the registry.
-    /// `base` sets sea level. Panics if a built-in block is missing.
-    pub fn new(registry: &BlockRegistry, base: f32, seed: i64) -> Self {
+    /// Build the generator for a seed. `base` sets sea level.
+    ///
+    /// Compiles the builtin placement table against the registry — startup,
+    /// main thread, before any worker exists: every block terrain can emit is
+    /// registered here in canonical order, and the generator keeps only the
+    /// resolved ids (it can never register at runtime — it holds no registry).
+    pub fn new(registry: &mut BlockRegistry, base: f32, seed: i64) -> Self {
+        let mat = placement::builtin().compile(registry);
         let resolve = |name: &str| {
             registry
                 .id_by_name(name)
@@ -915,11 +904,6 @@ impl Terrain {
             dx: fbm(HEIGHT_WARPX_SALT, HEIGHT_WARP_CELL, 2),
             dz: fbm(HEIGHT_WARPZ_SALT, HEIGHT_WARP_CELL, 2),
             amp: HEIGHT_WARP_AMP,
-        };
-        let seam = |min_depth: i32, rarity: u32, name: &str| Seam {
-            min_depth,
-            width: u32::MAX / rarity,
-            block: resolve(name),
         };
         Self {
             seed,
@@ -972,29 +956,9 @@ impl Terrain {
                 band_lo: ISLAND_MIN_Y,
                 band_span: ISLAND_BAND_SPAN,
             },
-            grass: resolve("Grass"),
-            dirt: resolve("Dirt"),
-            stone: resolve("Stone"),
-            sand: resolve("Sand"),
-            snow: resolve("Snow"),
-            ice: resolve("Ice"),
-            water: resolve("Water"),
+            mat,
             wood: resolve("Wood"),
             leaves: resolve("Leaves"),
-            aerium_vein: resolve("AeriumVein"),
-            quartz_vein: resolve("QuartzVein"),
-            seams: [
-                seam(ORE_MIN_DEPTH, 90, "CoalVein"),
-                seam(8, 110, "IronVein"),
-                seam(8, 130, "CopperVein"),
-                seam(20, 240, "SulfurVein"),
-                seam(20, 200, "QuartzVein"),
-                seam(20, 220, "LeadVein"),
-                seam(32, 300, "GoldVein"),
-                seam(32, 380, "LuminVein"),
-                seam(48, 460, "TitanVein"),
-                seam(48, 240, "Obsidian"),
-            ],
         }
     }
 
@@ -1069,31 +1033,40 @@ impl Terrain {
         }
     }
 
-    /// The surface block a column dresses in: sand at/under sea (shore, lakebed),
-    /// snow on cold or high ground, sand on hot & dry, grass otherwise.
-    fn dress(&self, p: &Column) -> BlockId {
+    /// The ground column's surface dressing, classified from the shared context:
+    /// shore at/under the water table, snow on cold or high ground, desert on
+    /// hot & dry, grass otherwise. The one axis the depth-1 placement rules
+    /// filter on — the block itself comes from the [`placement`] dress LUT.
+    fn surface_kind(&self, p: &Column) -> placement::SurfaceKind {
+        use placement::SurfaceKind::*;
         if p.height <= p.water_level {
-            self.sand
+            Shore
         } else if p.temperature.0 < COLD || p.height - self.sea_level > SNOW_ABOVE_SEA {
-            self.snow
+            Snowy
         } else if p.temperature.0 > HOT && p.humidity.0 < DRY {
-            self.sand
+            Desert
         } else {
-            self.grass
+            Grassy
         }
+    }
+
+    /// The surface block a column dresses in — the banded element union of its
+    /// [`surface_kind`](Self::surface_kind).
+    fn dress(&self, p: &Column) -> BlockId {
+        self.mat.dress[self.surface_kind(p) as usize]
     }
 
     /// The ore (if any) a stone cell rolls, through the cumulative rarity slices.
     fn ore_at(&self, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
         let roll = cell_hash(self.seed, wx, wy, wz);
         let mut cut = 0u32;
-        for seam in &self.seams {
-            if depth < seam.min_depth {
+        for slice in &self.mat.seams {
+            if depth < slice.min_depth {
                 break;
             }
-            cut += seam.width;
+            cut += slice.width;
             if roll < cut {
-                return Some(seam.block);
+                return Some(slice.id);
             }
         }
         None
@@ -1105,35 +1078,36 @@ impl Terrain {
         if wy >= height - 1 {
             self.dress(p)
         } else if wy >= height - 3 {
-            self.dirt
+            self.mat.crust
         } else if carved {
             AIR
         } else {
             let depth = height - wy;
-            if depth <= ORE_MAX_DEPTH {
+            if depth <= self.mat.max_scattered_depth {
                 if let Some(ore) = self.ore_at(wx, wy, wz, depth) {
                     return ore;
                 }
             }
-            self.stone
+            self.mat.stone
         }
     }
 
     /// The block for an island-solid cell, from what sits above it in the field.
     fn island_block(&self, wx: i32, wy: i32, wz: i32, above: [bool; 4]) -> BlockId {
         if !above[0] {
-            if wy >= ICE_SURFACE_Y { self.ice } else { self.grass }
+            if wy >= ICE_SURFACE_Y { self.mat.island_ice } else { self.mat.island_grass }
         } else if !above[1] || !above[2] || !above[3] {
-            self.dirt
+            self.mat.island_crust
         } else {
             let roll = cell_hash(self.seed, wx, wy, wz);
-            if roll < ISLAND_AERIUM_W {
-                self.aerium_vein
-            } else if roll < ISLAND_AERIUM_W + ISLAND_QUARTZ_W {
-                self.quartz_vein
-            } else {
-                self.stone
+            let mut cut = 0u32;
+            for slice in &self.mat.island_seams {
+                cut += slice.width;
+                if roll < cut {
+                    return slice.id;
+                }
             }
+            self.mat.stone
         }
     }
 
@@ -1158,7 +1132,7 @@ impl Terrain {
     /// `Seam` scatter, but with a multi-cell payload ([`tree_voxel`]).
     fn tree_at(&self, ox: i32, oz: i32) -> Option<i32> {
         let p = self.profile(ox, oz);
-        if p.height <= p.water_level || self.dress(&p) != self.grass {
+        if p.height <= p.water_level || self.surface_kind(&p) != placement::SurfaceKind::Grassy {
             return None;
         }
         (cell_hash(self.seed ^ TREE_SALT, ox, 0, oz) < u32::MAX / TREE_RARITY).then_some(p.height)
@@ -1209,9 +1183,9 @@ impl Terrain {
         if wy < p.height {
             self.ground(p, wx, wy, wz, caves && self.carved(wx, wy, wz, p.height))
         } else if wy < p.water_level {
-            self.water
+            self.mat.water
         } else if self.overhang_solid(wx, wy, wz, p.height) {
-            self.stone
+            self.mat.stone
         } else if self.islands.solid(wx, wy, wz) {
             self.island_block(wx, wy, wz, [
                 self.islands.solid(wx, wy + 1, wz),
@@ -1252,7 +1226,7 @@ impl TerrainGenerator for Terrain {
     }
 
     fn deep(&self) -> BlockId {
-        self.stone
+        self.mat.stone
     }
 
     fn block_at(&self, wx: i32, wy: i32, wz: i32, _height: i32) -> BlockId {
@@ -1332,13 +1306,15 @@ impl Terrain {
         let y0 = cy * CHUNK_SIZE as i32;
         let y1 = y0 + CHUNK_SIZE as i32 - 1;
 
-        // Deep below every ore band and beyond either carve field's reach: solid
-        // stone. Both caves and ravines must be dormant for the chunk to be safe.
-        if y1 < h_min - ORE_MAX_DEPTH
+        // Deep below every scattered rule's reach and beyond either carve
+        // field's: solid stone. The depth bound is derived from the placement
+        // table, not a constant; carve dormancy also covers the carve-gated
+        // cave-wall rule (no carved cells → no walls).
+        if y1 < h_min - self.mat.max_scattered_depth
             && self.caves.dormant(x0, y0, z0, h_max - y0)
             && self.ravines.dormant(x0, y0, z0, h_max - y0)
         {
-            return ChunkData::Uniform(self.stone);
+            return ChunkData::Uniform(self.mat.stone);
         }
         // Above every surface and below the island band: uniform sky. Fully below
         // the lowest water table → water; fully at/above the highest → air. (A
@@ -1351,7 +1327,7 @@ impl Terrain {
             && !self.islands.possible(x0, y0, z0, (cs, cs, cs))
         {
             if y1 < w_min {
-                return ChunkData::Uniform(self.water);
+                return ChunkData::Uniform(self.mat.water);
             }
             if y0 >= w_max {
                 return ChunkData::Uniform(AIR);
@@ -1415,9 +1391,9 @@ impl Terrain {
                     let mut id = if wy < height {
                         self.ground(p, wx, wy, wz, carved[ly])
                     } else if wy < p.water_level {
-                        self.water
+                        self.mat.water
                     } else if self.overhang_solid(wx, wy, wz, height) {
-                        self.stone
+                        self.mat.stone
                     } else if isl[ly] {
                         self.island_block(wx, wy, wz, [isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]])
                     } else {
@@ -1449,7 +1425,7 @@ mod generate_column_tests {
     /// range — the shared-profile fast path can't change a single cell.
     #[test]
     fn generate_column_matches_per_chunk_generate() {
-        let g = Terrain::new(&BlockRegistry::with_builtins(), 20.0, 3);
+        let g = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 3);
         for (cx, cz) in [(0, 0), (2, -3), (-1, 7), (0, -4)] {
             let cy_lo = -3;
             let cy_hi = 5;
@@ -1467,12 +1443,12 @@ mod tests {
     use super::*;
 
     fn terrain(seed: i64) -> Terrain {
-        Terrain::new(&BlockRegistry::with_builtins(), 20.0, seed)
+        Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
     }
 
     fn terrain_with_registry(seed: i64) -> (BlockRegistry, Terrain) {
-        let registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&registry, 20.0, seed);
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = Terrain::new(&mut registry, 20.0, seed);
         (registry, generator)
     }
 
@@ -1783,7 +1759,7 @@ mod tests {
                     h_min = h_min.min(h);
                 }
             }
-            if y0 + 15 < h_min - ORE_MAX_DEPTH
+            if y0 + 15 < h_min - g.mat.max_scattered_depth
                 && g.caves.dormant(x0, y0, z0, h_max - y0)
                 && g.ravines.dormant(x0, y0, z0, h_max - y0)
             {
@@ -1793,5 +1769,186 @@ mod tests {
         }
         let cz = proven.expect("a bound-cleared deep chunk within 128");
         assert_eq!(g.generate(0, cy, cz), ChunkData::Uniform(stone));
+    }
+
+    /// A frozen copy of the pre-placement material picker (named blocks and the
+    /// hand-written branches), so the element-first rewiring can be censused
+    /// against it: geometry must be IDENTICAL, and materials must map exactly
+    /// (identity everywhere except the three accepted drifts — grass and dirt
+    /// become their natural unions, pure Obsidian becomes Stone+Obsidian).
+    struct Legacy {
+        grass: BlockId,
+        dirt: BlockId,
+        stone: BlockId,
+        sand: BlockId,
+        snow: BlockId,
+        ice: BlockId,
+        water: BlockId,
+        aerium_vein: BlockId,
+        quartz_vein: BlockId,
+        seams: [(i32, u32, BlockId); 10],
+    }
+
+    impl Legacy {
+        fn resolve(reg: &BlockRegistry) -> Legacy {
+            let id = |n: &str| reg.id_by_name(n).unwrap();
+            let seam = |d: i32, r: u32, n: &str| (d, u32::MAX / r, id(n));
+            Legacy {
+                grass: id("Grass"),
+                dirt: id("Dirt"),
+                stone: id("Stone"),
+                sand: id("Sand"),
+                snow: id("Snow"),
+                ice: id("Ice"),
+                water: id("Water"),
+                aerium_vein: id("AeriumVein"),
+                quartz_vein: id("QuartzVein"),
+                seams: [
+                    seam(3, 90, "CoalVein"),
+                    seam(8, 110, "IronVein"),
+                    seam(8, 130, "CopperVein"),
+                    seam(20, 240, "SulfurVein"),
+                    seam(20, 200, "QuartzVein"),
+                    seam(20, 220, "LeadVein"),
+                    seam(32, 300, "GoldVein"),
+                    seam(32, 380, "LuminVein"),
+                    seam(48, 460, "TitanVein"),
+                    seam(48, 240, "Obsidian"),
+                ],
+            }
+        }
+
+        fn dress(&self, g: &Terrain, p: &Column) -> BlockId {
+            if p.height <= p.water_level {
+                self.sand
+            } else if p.temperature.0 < COLD || p.height - g.sea_level > SNOW_ABOVE_SEA {
+                self.snow
+            } else if p.temperature.0 > HOT && p.humidity.0 < DRY {
+                self.sand
+            } else {
+                self.grass
+            }
+        }
+
+        fn cell_base(&self, g: &Terrain, p: &Column, wx: i32, wy: i32, wz: i32) -> BlockId {
+            let height = p.height;
+            if wy < height {
+                // legacy ground()
+                if wy >= height - 1 {
+                    self.dress(g, p)
+                } else if wy >= height - 3 {
+                    self.dirt
+                } else if g.carved(wx, wy, wz, height) {
+                    AIR
+                } else {
+                    let depth = height - wy;
+                    if depth <= 64 {
+                        let roll = cell_hash(g.seed, wx, wy, wz);
+                        let mut cut = 0u32;
+                        for &(min_depth, width, block) in &self.seams {
+                            if depth < min_depth {
+                                break;
+                            }
+                            cut += width;
+                            if roll < cut {
+                                return block;
+                            }
+                        }
+                    }
+                    self.stone
+                }
+            } else if wy < p.water_level {
+                self.water
+            } else if g.overhang_solid(wx, wy, wz, height) {
+                self.stone
+            } else if g.islands.solid(wx, wy, wz) {
+                // legacy island_block()
+                let above = [
+                    g.islands.solid(wx, wy + 1, wz),
+                    g.islands.solid(wx, wy + 2, wz),
+                    g.islands.solid(wx, wy + 3, wz),
+                    g.islands.solid(wx, wy + 4, wz),
+                ];
+                if !above[0] {
+                    if wy >= ICE_SURFACE_Y { self.ice } else { self.grass }
+                } else if !above[1] || !above[2] || !above[3] {
+                    self.dirt
+                } else {
+                    let roll = cell_hash(g.seed, wx, wy, wz);
+                    if roll < u32::MAX / 45 {
+                        self.aerium_vein
+                    } else if roll < u32::MAX / 45 + u32::MAX / 160 {
+                        self.quartz_vein
+                    } else {
+                        self.stone
+                    }
+                }
+            } else {
+                AIR
+            }
+        }
+    }
+
+    /// The doc's tests 1 + 2: the element-first rewiring must place solid cells
+    /// exactly where the legacy picker did (geometry invariance — what keeps
+    /// old saves meaningful), and every material must map exactly through the
+    /// accepted-drift table. Censused across origin, deep, island-band, and
+    /// far coordinates.
+    #[test]
+    fn placement_rewiring_is_geometry_identical_and_material_mapped() {
+        let (reg, g) = terrain_with_registry(3);
+        let legacy = Legacy::resolve(&reg);
+        let map = |old: BlockId| -> BlockId {
+            if old == legacy.grass {
+                reg.id_by_name("Soil+Organic").unwrap()
+            } else if old == legacy.dirt {
+                reg.id_by_name("Soil+Clay").unwrap()
+            } else if old == reg.id_by_name("Obsidian").unwrap() {
+                reg.id_by_name("Stone+Obsidian").unwrap()
+            } else {
+                old
+            }
+        };
+
+        let chunks: Vec<(i32, i32, i32)> = [
+            // Spawn area: surface band with crust, ores, water, carve.
+            (0, 0, 0), (0, 1, 0), (0, -1, 0), (1, 0, -1), (2, 3, 2),
+            // Deep rock inside and below the ore band.
+            (0, -3, 0), (1, -4, 1),
+            // The island band (ISLAND_MIN_Y = 112 → cy 7+), icy heights.
+            (0, 8, 0), (3, 9, -2), (0, 14, 5),
+            // Far out: the f64-spine coordinates the old round fixed.
+            (6_250_000, 0, 0), (6_250_000, 8, 0), (-6_250_000, -2, 3),
+        ]
+        .into_iter()
+        .collect();
+
+        let (mut cells, mut mismatches) = (0u64, 0u64);
+        for (cx, cy, cz) in chunks {
+            let (x0, y0, z0) =
+                (cx * CHUNK_SIZE as i32, cy * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32);
+            for lz in 0..CHUNK_SIZE as i32 {
+                for lx in 0..CHUNK_SIZE as i32 {
+                    let (wx, wz) = (x0 + lx, z0 + lz);
+                    let p = g.profile(wx, wz);
+                    for ly in 0..CHUNK_SIZE as i32 {
+                        let wy = y0 + ly;
+                        let old = legacy.cell_base(&g, &p, wx, wy, wz);
+                        let new = g.cell_base(&p, wx, wy, wz, true);
+                        cells += 1;
+                        assert_eq!(
+                            reg.is_solid(old),
+                            reg.is_solid(new),
+                            "geometry moved at ({wx},{wy},{wz}): {old:?} vs {new:?}"
+                        );
+                        if map(old) != new {
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(mismatches, 0, "material mapping broke somewhere in {cells} cells");
+        assert!(cells > 50_000, "census actually covered ground ({cells} cells)");
     }
 }

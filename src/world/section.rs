@@ -590,7 +590,7 @@ mod tests {
     }
 
     fn sine(seed: i64) -> SineHills {
-        SineHills::new(&BlockRegistry::with_builtins(), 20.0, seed)
+        SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
     }
 
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };

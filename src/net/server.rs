@@ -234,11 +234,11 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Resolve the generator's palette once so spawn heights match the client terrain.
-    let registry = BlockRegistry::with_builtins();
+    let mut registry = BlockRegistry::with_builtins();
     let ctx = Arc::new(Ctx {
         password: config.password,
         seed: config.seed,
-        generator: SineHills::new(&registry, TERRAIN_BASE, config.seed),
+        generator: SineHills::new(&mut registry, TERRAIN_BASE, config.seed),
     });
     let shared = Arc::new(Mutex::new(State {
         edits: HashMap::new(),
@@ -765,8 +765,7 @@ mod tests {
     use super::*;
 
     fn test_generator() -> SineHills {
-        let registry = BlockRegistry::with_builtins();
-        SineHills::new(&registry, TERRAIN_BASE, 4242)
+        SineHills::new(&mut BlockRegistry::with_builtins(), TERRAIN_BASE, 4242)
     }
 
     #[test]
