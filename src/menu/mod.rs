@@ -128,8 +128,6 @@ pub struct View<A: Copy> {
     pub title: String,
     pub style: Style,
     pub rows: Vec<Row<A>>,
-    /// When true, append a visible Back row that emits Back (also via Esc).
-    pub back_row: bool,
     /// Confirm while editing a Text row picks this (form submit).
     pub default: Option<A>,
     pub hint: String,
@@ -137,20 +135,8 @@ pub struct View<A: Copy> {
 }
 
 impl<A: Copy> View<A> {
-    pub fn effective_len(&self) -> usize {
-        self.rows.len() + self.back_row as usize
-    }
-
-    pub fn is_back_row(&self, i: usize) -> bool {
-        self.back_row && i == self.rows.len()
-    }
-
     pub fn is_selectable(&self, i: usize) -> bool {
-        if i < self.rows.len() {
-            self.rows[i].tag.is_some()
-        } else {
-            self.is_back_row(i)
-        }
+        self.rows.get(i).is_some_and(|r| r.tag.is_some())
     }
 
     fn tag_at(&self, i: usize) -> Option<A> {
@@ -244,7 +230,7 @@ impl Cursor {
 
     /// Immutable resolution (for use in draw).
     pub fn resolved<A: Copy>(&self, view: &View<A>) -> usize {
-        let n = view.effective_len();
+        let n = view.rows.len();
         if n == 0 {
             return 0;
         }
@@ -265,7 +251,7 @@ impl Cursor {
     }
 
     fn nav<A: Copy>(&mut self, view: &View<A>, dir: Dir) {
-        let n = view.effective_len();
+        let n = view.rows.len();
         if n == 0 {
             return;
         }
@@ -317,7 +303,7 @@ impl<M: Menu> Screen for Framed<M> {
     fn draw(&self, ctx: &Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {
         let view = self.menu.view(ctx);
         let sel = self.cursor.resolved(&view);
-        let pv = present(&view);
+        let pv = present(&view, ctx.settings.menu_scale);
         theme.draw(f, &pv, sel, w, h);
     }
 }
@@ -358,7 +344,7 @@ impl MenuStack {
 
 /// On Text rows, editing has priority so characters don't trigger nav.
 pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -> Option<Msg<A>> {
-    let n = view.effective_len();
+    let n = view.rows.len();
     if n == 0 {
         return cancel(intents).then_some(Msg::Back);
     }
@@ -412,9 +398,6 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
         return Some(Msg::Back);
     }
     let sel = cursor.index.min(n - 1);
-    if view.is_back_row(sel) {
-        return confirm(intents).then_some(Msg::Back);
-    }
     let tag = view.tag_at(sel)?;
     match view.kind_at(sel) {
         Some(RowKind::Value(_)) => {
@@ -445,8 +428,8 @@ fn cancel(intents: &[Intent]) -> bool {
     intents.iter().any(|i| matches!(i, Intent::Cancel))
 }
 
-pub fn present<A: Copy>(view: &View<A>) -> PresentedView {
-    let mut rows: Vec<PresentedRow> = view
+pub fn present<A: Copy>(view: &View<A>, scale: f32) -> PresentedView {
+    let rows = view
         .rows
         .iter()
         .map(|r| PresentedRow {
@@ -456,18 +439,11 @@ pub fn present<A: Copy>(view: &View<A>) -> PresentedView {
             selectable: r.tag.is_some(),
         })
         .collect();
-    if view.back_row {
-        rows.push(PresentedRow {
-            label: "Back".to_string(),
-            detail: None,
-            kind: RowKind::Action,
-            selectable: true,
-        });
-    }
     PresentedView {
         title: view.title.clone(),
         style: view.style.clone(),
         rows,
+        scale,
         hint: view.hint.clone(),
         notice: view.notice.clone(),
     }

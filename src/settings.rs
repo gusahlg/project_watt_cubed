@@ -56,6 +56,9 @@ pub struct Settings {
     /// HUD/text scale, independent of render resolution (0.5..=2.0). Drives
     /// [`crate::ui::Theme::scale`].
     pub ui_scale: f32,
+    /// Menu text base scale (0.5..=2.0); the theme still shrinks rows to fit
+    /// the window, so this can never push settings off screen.
+    pub menu_scale: f32,
     /// Camera shake intensity (0..=1); an accessibility control, not a constant.
     pub shake: f32,
     /// Cross-chunk lighting. On by default; pushed to [`crate::world::World`] on
@@ -112,6 +115,7 @@ impl Default for Settings {
             fov: 90.0,
             render_scale: 1.0,
             ui_scale: 1.0,
+            menu_scale: 1.0,
             shake: 1.0,
             lighting: true,
             cull_faces: false,
@@ -292,7 +296,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 30] = [
+pub const SETTINGS: [Setting; 31] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -533,6 +537,36 @@ pub const SETTINGS: [Setting; 30] = [
     Setting {
         category: Category::Interface,
         menu_kind: MenuKind::Bar,
+        fraction: |s| frac(s.menu_scale, *UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end()),
+        key: "menu_scale",
+        aliases: &["menuscale"],
+        label: "Menu Scale",
+        usage: "menuscale <50-200>",
+        confirm: |s| format!("menu scale {:.0}%", s.menu_scale * 100.0),
+        show: |s| format!("{:.0}%", s.menu_scale * 100.0),
+        parse_human: |s, v| match v.parse::<f32>() {
+            Ok(pct) => {
+                s.menu_scale = pct / 100.0;
+                menu_scale_clamp(s);
+                true
+            }
+            Err(_) => false,
+        },
+        step: |s, d| {
+            let pct = cycle_list(
+                &[50, 75, 100, 125, 150, 200],
+                (s.menu_scale * 100.0).round() as i32,
+                d,
+            );
+            s.menu_scale = pct as f32 / 100.0;
+        },
+        clamp: menu_scale_clamp,
+        write: |s| s.menu_scale.to_string(),
+        read: |s, v| set_parsed(&mut s.menu_scale, v),
+    },
+    Setting {
+        category: Category::Interface,
+        menu_kind: MenuKind::Bar,
         fraction: |s| frac(s.shake, *SHAKE_RANGE.start(), *SHAKE_RANGE.end()),
         key: "shake",
         aliases: &["camerashake"],
@@ -579,9 +613,6 @@ pub const SETTINGS: [Setting; 30] = [
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
 ];
-
-/// The Back action sits just past the settings rows — derived, never hand-numbered.
-pub const SETTINGS_ROW_BACK: usize = SETTINGS.len();
 
 impl Settings {
     /// Load from disk, falling back to defaults for missing/invalid entries.
@@ -763,6 +794,13 @@ fn ui_scale_clamp(s: &mut Settings) {
     s.ui_scale = clamp_to(
         &UI_SCALE_RANGE,
         reset_nan(s.ui_scale, Settings::default().ui_scale),
+    );
+}
+
+fn menu_scale_clamp(s: &mut Settings) {
+    s.menu_scale = clamp_to(
+        &UI_SCALE_RANGE,
+        reset_nan(s.menu_scale, Settings::default().menu_scale),
     );
 }
 
