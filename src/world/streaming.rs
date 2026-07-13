@@ -362,7 +362,7 @@ impl World {
     }
 
     /// Mesh result at `rev`: queue for upload if still applies; else drop and re-arm scan.
-    pub(in crate::world) fn accept_mesh(&mut self, coord: Coord, rev: u32, data: ChunkMeshData) {
+    pub(in crate::world) fn accept_mesh(&mut self, coord: Coord, rev: u32, data: Box<ChunkMeshData>) {
         if self.mesh_result_applies(coord, rev) {
             self.upload_queue.push_back((coord, rev, data));
         } else {

@@ -524,7 +524,7 @@ pub struct World {
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
-    upload_queue: VecDeque<(Coord, u32, ChunkMeshData)>,
+    upload_queue: VecDeque<(Coord, u32, Box<ChunkMeshData>)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
     /// old whole-map rescan `pending_fresh` armed). Seeded on load (self + 6
     /// neighbours), on a light publish that moved a border, and on an
@@ -1639,12 +1639,12 @@ mod tests {
         assert!(!world.mesh_result_applies(coord, rev));
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert!(world.upload_queue.is_empty(), "stale result never queues");
         assert!(world.pending_fresh.get(), "drop re-arms the scan");
 
         let rev = world.chunks[&coord].rev;
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert_eq!(world.upload_queue.len(), 1);
         world.upload_queue.clear();
 
@@ -1756,7 +1756,7 @@ mod tests {
         assert_ne!(world.chunks[&coord].rev, rev, "edit bumps rev");
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert!(world.upload_queue.is_empty(), "stale mesh result never queues");
         assert!(world.chunks[&coord].state.is_dirty(), "chunk stays Dirty for the sync remesh");
         assert!(world.pending_fresh.get(), "drop re-arms the fresh scan");
@@ -1775,7 +1775,7 @@ mod tests {
         assert!(!world.mesh_result_applies(coord, rev), "out-of-box result is stale");
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert!(world.upload_queue.is_empty(), "stale result never queues");
         assert_eq!(
             world.chunks[&coord].state,

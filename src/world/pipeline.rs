@@ -111,10 +111,19 @@ pub(in crate::world) enum Done {
     /// A generated column: every chunk built for the requested `cy` range,
     /// paired with its coord. Landed together and stored in one drain step.
     Column { col: (i32, i32), chunks: Vec<(Coord, Chunk)> },
-    Mesh { coord: Coord, rev: u32, data: ChunkMeshData },
+    /// Boxed: `ChunkMeshData` is ~530 B inline (three passes × Vec headers ×
+    /// six index buckets), and it dominated the whole enum — every channel
+    /// send/recv and match memcpy'd it. One box per mesh job is noise next to
+    /// the meshing itself; the Box rides untouched into `upload_queue`.
+    Mesh { coord: Coord, rev: u32, data: Box<ChunkMeshData> },
     Light { coord: Coord, epoch: u32, grid: LightGrid },
     Section { pos: SectionPos, meshes: [SectionMeshData; 4] },
 }
+
+// Keep the result channel payload small: the largest variant should be the
+// `Section` mesh array, not an inlined per-chunk mesh (see structural
+// opportunity #8 — this was 544 B with `ChunkMeshData` inline).
+const _: () = assert!(size_of::<Done>() <= 128);
 
 /// A job's scheduling class. Derived from its kind — near work outranks far LOD
 /// work — so it never rides along on the wire as a redundant field.
@@ -470,7 +479,7 @@ fn run(job: Job) -> Done {
         } => {
             // Pure meshing: light was settled on the main thread and travels in
             // the snapshot as a ready shell, so the worker only greedy-meshes.
-            let mut data = new_chunk_mesh_data();
+            let mut data = Box::new(new_chunk_mesh_data());
             mesh::build_chunk_mesh(
                 &snapshot.padded,
                 snapshot.uniform,
@@ -671,6 +680,58 @@ mod tests {
         // Popping frees a slot, so the next submit admits again (lane retry).
         assert_eq!(id_of(&q.pop().unwrap()), 0, "nearest still pops first");
         assert!(q.push_far(job(-1), 0), "below the cap admits again");
+    }
+
+    /// Worker→main channel throughput (structural-opportunities #8): floods the
+    /// pool with real mesh jobs and reports jobs/second plus `size_of::<Done>()`.
+    /// Ignored: a timing benchmark, not a correctness gate. Run with
+    /// `cargo test --release mesh_result_channel_throughput -- --ignored --nocapture`.
+    /// 2026-07-13 (RTX 3070 box, 4 workers): 544 B inline ≈ 28.6k jobs/s;
+    /// boxed 112 B ≈ 29.2k jobs/s — throughput is meshing-bound, the boxing is
+    /// a payload/regression guard rather than a measured speedup.
+    #[test]
+    #[ignore]
+    fn mesh_result_channel_throughput() {
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let neigh: Vec<Chunk> = (0..27)
+            .map(|k| Chunk::new(k % 3 - 1, 1 + k / 9 - 1, k / 3 % 3 - 1, &generator))
+            .collect();
+        let at = |dx: i32, dy: i32, dz: i32| -> Option<&Chunk> {
+            Some(&neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize])
+        };
+        let tables = Arc::new(registry.hot_tables());
+        let snapshot = || ChunkSnapshot {
+            padded: Padded::capture(at),
+            uniform: None,
+            light: PaddedLight::full(),
+            tables: Arc::clone(&tables),
+        };
+
+        const JOBS: u32 = 4000;
+        let workers = Workers::spawn(4);
+        let start = std::time::Instant::now();
+        for i in 0..JOBS {
+            assert!(workers.submit(Job::Mesh {
+                coord: Coord::new(i as i32, 1, 0),
+                rev: 1,
+                snapshot: snapshot(),
+            }));
+        }
+        let mut got = 0;
+        while got < JOBS {
+            let done = workers.results.recv_timeout(Duration::from_secs(30)).expect("drained");
+            assert!(matches!(done, Done::Mesh { .. }));
+            got += 1;
+        }
+        let dt = start.elapsed();
+        println!(
+            "size_of::<Done>() = {} B; {} mesh jobs in {:.3}s = {:.0} jobs/s",
+            std::mem::size_of::<Done>(),
+            JOBS,
+            dt.as_secs_f64(),
+            JOBS as f64 / dt.as_secs_f64()
+        );
     }
 
     #[test]
