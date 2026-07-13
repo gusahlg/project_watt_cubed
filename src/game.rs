@@ -286,8 +286,12 @@ impl Game {
         }
 
         // Advance the day/night clock (singleplayer drives it locally; a server
-        // sync overrides `day` on arrival).
-        self.sky.tick(dt as f64);
+        // sync overrides `day` on arrival). The day_night lane freezes it at
+        // the current time of day — permanent daylight without a special case
+        // anywhere downstream (compose still reads the clock every frame).
+        if self.render.day_night {
+            self.sky.tick(dt as f64);
+        }
 
         // Keep the HUD text scale in sync with the persisted setting.
         self.theme.scale = settings.ui_scale;

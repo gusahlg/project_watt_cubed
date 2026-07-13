@@ -139,7 +139,9 @@ impl From<&FrameSnapshot> for FrameUniformsGpu {
             horizon: [s.horizon.r(), s.horizon.g(), s.horizon.b(), s.fog_density],
             candle: [s.candle.r(), s.candle.g(), s.candle.b(), s.ambient_floor],
             exposure_dither: [s.exposure.0, s.dither.0, s.jitter.0.x, s.jitter.0.y],
-            reserved: [0.0; 4],
+            // x = stars gain: always composed ON; the engine's RenderFlags::stars
+            // gate (frame::gate_uniforms) zeroes it, like every other lane gate.
+            extras: [1.0, 0.0, 0.0, 0.0],
             anim: [s.anim_time, s.anim_uv[0], s.anim_uv[1], s.camera_y],
         }
     }

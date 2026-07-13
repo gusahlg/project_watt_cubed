@@ -22,6 +22,12 @@ pub struct RenderConfig {
     pub clouds: bool,
     /// Weather coverage (per-frame lookup, no engine gate).
     pub weather: bool,
+    /// Night starfield (`RenderFlags::stars`): off skips the sky pass's
+    /// per-pixel hash-grid star evaluation.
+    pub stars: bool,
+    /// Day/night cycle (per-frame lookup, no engine gate): off freezes the
+    /// sky clock at the current time of day.
+    pub day_night: bool,
     /// Screen-space sun god rays.
     pub godrays: bool,
     /// Temporal AA with camera jitter (always coupled).
@@ -55,6 +61,8 @@ impl Default for RenderConfig {
             godrays: true,
             clouds: true,
             weather: true,
+            stars: true,
+            day_night: true,
             // Keep these identical to the previous shipped look.
             taa: false,
             fog: false,
@@ -91,6 +99,7 @@ impl RenderConfig {
             vrs: self.vrs,
             water_anim: self.water_anim,
             vignette: self.vignette,
+            stars: self.stars,
         }
     }
 }

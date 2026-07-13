@@ -81,6 +81,11 @@ pub struct Settings {
     pub godrays: bool,
     pub clouds: bool,
     pub weather: bool,
+    /// Night starfield in the sky pass (engine `RenderFlags::stars`).
+    pub stars: bool,
+    /// Day/night cycle: off freezes the sky clock (permanent current time of
+    /// day — a strip-down lever and an accessibility control, not a look lane).
+    pub day_night: bool,
     pub taa: bool,
     pub fog: bool,
     pub ambient: bool,
@@ -120,6 +125,8 @@ impl Default for Settings {
             godrays: true,
             clouds: true,
             weather: true,
+            stars: true,
+            day_night: true,
             taa: false,
             fog: false,
             ambient: false,
@@ -285,7 +292,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 28] = [
+pub const SETTINGS: [Setting; 30] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -561,6 +568,8 @@ pub const SETTINGS: [Setting; 28] = [
     video_toggle!(fog, "fog", "Distance Fog"),
     video_toggle!(clouds, "clouds", "Clouds"),
     video_toggle!(weather, "weather", "Weather"),
+    video_toggle!(stars, "stars", "Night Stars"),
+    video_toggle!(day_night, "day_night", "Day/Night Cycle", &["daynight"]),
     video_toggle!(bloom, "bloom", "Bloom"),
     video_toggle!(godrays, "godrays", "Godrays"),
     video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
@@ -657,6 +666,8 @@ impl Settings {
             godrays: self.godrays,
             clouds: self.clouds,
             weather: self.weather,
+            stars: self.stars,
+            day_night: self.day_night,
             taa: self.taa,
             fog: self.fog,
             ambient: self.ambient,
