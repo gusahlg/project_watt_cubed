@@ -185,9 +185,9 @@ Extract pure selectors and test sRGB-only formats, missing screenshot-transfer u
 
 ### E-05 — Shadow fitting assumes 16:9
 
-**Priority: P2. Status: open.**
+**Priority: P2. Status: fixed (2026-07-13, see F-05/F-06).**
 
-[`shadow::fit`](../../voxel-engine/src/vk/shadow.rs#L239) hardcodes `16:9`. Wider windows and wide-FOV source frusta can extend outside the map and produce moving fully-lit strips. Pass the actual source aspect/extent and test all eight frustum corners at 1:1, 16:9, and 32:9.
+[`shadow::fit`](../../voxel-engine/src/vk/shadow.rs) hardcoded `16:9` around the forward frustum slice. Wider windows and wide-FOV source frusta could extend outside the map and produce moving fully-lit strips. Resolved by replacing the slice fit with eye-centred cascades (F-06): the footprint no longer depends on view direction, aspect, or lens at all.
 
 ### E-06 — Curvature is raster-only and hardcoded in a reusable engine
 
@@ -228,6 +228,16 @@ Do not re-enable it piecemeal. Repair shader type/load, color/depth input indice
 ### F-04 — Protocol decoders accepted arbitrary trailing bytes
 
 **Fixed in the audit worktree.** Both decoders now require the reader to consume the exact frame. A table-driven test appends a byte to every client and server message variant and requires rejection.
+
+## Fixed after the audit (2026-07-13)
+
+### F-05 — Shadow occluder pass read the placement SSBO at half stride
+
+`shadow_depth.vert.slang` declared binding 0 as `StructuredBuffer<float4>` (16-byte stride) while the CPU/`mesh3d.vert` record is the 32-byte `DrawOffset`. Occluder draw 0 was placed correctly by luck; every odd instance read `fade/mode/flat_rgba` bits as its placement and every later even instance read the WRONG draw's offset. Because the draw list re-sorts by camera distance each frame, the garbage reshuffled with the view — the user-visible "shadows move around as the player looks around". The shader now mirrors the full `DrawOffset` record.
+
+### F-06 — Cascade fit was camera-anchored and slice-fitted
+
+`shadow::fit` fitted each cascade to the forward view-frustum slice (16:9 rectilinear assumed; see E-05) and snapped its texel grid in CAMERA-relative space, so the grid moved with the eye and every shadow edge crawled during translation. Replaced with eye-centred spheres (radius = the receiver's distance-based selection split + bias margin) and an f64 WORLD-space texel snap: the fit reads no camera orientation, matrices are bitwise-identical under rotation, translation moves the map in exact whole-texel steps, and coverage is total for any FOV/lens/aspect. At the shipped fovy the eye-centred sphere is also ~3.5× smaller than the old slice sphere, i.e. ~3.5× finer shadow texels. Locked by five unit tests in `vk/shadow.rs` and the `shadow_probe` A/B/A capture diagnostic (swing the camera away and back: `pct_changed = 0.0`).
 
 ### F-05 — Opaque emissive chunks took the all-dark lighting shortcut
 
