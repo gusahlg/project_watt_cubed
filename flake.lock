@@ -59,14 +59,18 @@
     "voxel-engine": {
       "flake": false,
       "locked": {
-        "lastModified": 1783879687,
-        "narHash": "sha256-FseCETwIsIisxny0jS+liOaKYpCULs9/C6BWOPdG4fE=",
-        "path": "/home/gusahlg/repos/voxel-engine",
-        "type": "path"
+        "lastModified": 1783926843,
+        "narHash": "sha256-UQvLbPNlN4+LSPuv3ouSWL1NfmyuheA5Ur+28NxaklU=",
+        "ref": "experimental",
+        "rev": "6edce7470eeafcf95426ca24445b02634462a173",
+        "revCount": 55,
+        "type": "git",
+        "url": "file:///home/gusahlg/repos/voxel-engine"
       },
       "original": {
-        "path": "/home/gusahlg/repos/voxel-engine",
-        "type": "path"
+        "ref": "experimental",
+        "type": "git",
+        "url": "file:///home/gusahlg/repos/voxel-engine"
       }
     }
   },

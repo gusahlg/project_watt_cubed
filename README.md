@@ -70,12 +70,12 @@ cargo run --release
 nix build   # produces ./result/bin/project_watt_cubed
 ```
 
-A plain `nix run` also works, but note the trap `play.sh` exists to avoid:
-the flake copies `../voxel-engine` into the Nix store when the lock file is
-written, so after any engine change a bare `nix run` builds the current game
-against a stale engine snapshot and fails with phantom missing-API errors.
-`nix flake update voxel-engine` re-pins it (the dev-shell `cargo` path always
-uses the live sibling and never needs this).
+A plain `nix run` also works, but note the trap `play.sh` exists to avoid: the
+flake pins the sibling engine's committed `experimental` revision, so after a
+new engine commit a bare `nix run` can build the current game against a stale
+engine API. `nix flake update voxel-engine` re-pins it. Uncommitted engine edits
+are intentionally visible only to the dev-shell `cargo` path; commit them before
+testing the pure Nix package.
 
 On macOS, install MoltenVK and the Vulkan loader once (`brew install
 molten-vk vulkan-loader`) and use plain `cargo run --release`.
