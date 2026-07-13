@@ -1383,8 +1383,11 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
         world.view = ViewVolume::view(20);
-        world.section_mip =
-            Some(HeightMip::bake(&world.generator, &world.registry, BakeExtent::new(2048, section::FINEST_DETAIL + 3)));
+        world.section_mip = Some(HeightMip::bake(
+            &world.generator,
+            &world.registry.color_snapshot(),
+            BakeExtent::new(2048, section::FINEST_DETAIL + 3),
+        ));
         let mip = world.section_mip.clone().unwrap();
 
         let cell = SectionPos { detail: section::FINEST_DETAIL, x: 0, z: 0 };
@@ -1427,8 +1430,11 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
         world.view = ViewVolume::view(20);
-        world.section_mip =
-            Some(HeightMip::bake(&world.generator, &world.registry, BakeExtent::new(2048, section::FINEST_DETAIL + 3)));
+        world.section_mip = Some(HeightMip::bake(
+            &world.generator,
+            &world.registry.color_snapshot(),
+            BakeExtent::new(2048, section::FINEST_DETAIL + 3),
+        ));
         let mip = world.section_mip.clone().unwrap();
 
         // Far section: clip draws it, so don't skip it.

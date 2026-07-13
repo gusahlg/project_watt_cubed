@@ -13,8 +13,6 @@
 
 use voxel_engine::{Color, DVec3};
 
-use crate::block::registry::BlockRegistry;
-
 use super::generation::TerrainGenerator;
 use super::metric::HeightEnvelope;
 use super::section::{FINEST_DETAIL, SECTION_N, SectionPos};
@@ -92,7 +90,7 @@ impl HeightMip {
     /// Each level is built by reducing four finer children (min/max bounds) where they exist,
     /// or sampling the generator at this level's stride for areas the finer level doesn't cover.
     /// Finer children on the boundary are included in the parent to preserve containment.
-    pub fn bake<G: TerrainGenerator>(terra: &G, registry: &BlockRegistry, extent: BakeExtent) -> HeightMip {
+    pub fn bake<G: TerrainGenerator>(terra: &G, colors: &[Color], extent: BakeExtent) -> HeightMip {
         let (finest, coarsest) = (extent.finest, extent.coarsest);
         let mut levels: Vec<MipLevel> = Vec::with_capacity((coarsest - finest + 1) as usize);
         for detail in finest..=coarsest {
@@ -106,7 +104,7 @@ impl HeightMip {
             let nx = (radius.div_euclid(span) - x0 + 1) as usize;
             let nz = (radius.div_euclid(span) - z0 + 1) as usize;
             let child = levels.last();
-            levels.push(build_level(terra, registry, detail, x0, z0, nx, nz, child));
+            levels.push(build_level(terra, colors, detail, x0, z0, nx, nz, child));
         }
         HeightMip { finest, coarsest, levels }
     }
@@ -207,7 +205,7 @@ fn section_span(detail: u8) -> i32 {
 /// cells without full coverage are sampled from the generator and merged with any existing children.
 fn build_level<G: TerrainGenerator>(
     terra: &G,
-    registry: &BlockRegistry,
+    colors: &[Color],
     detail: u8,
     x0: i32,
     z0: i32,
@@ -227,7 +225,7 @@ fn build_level<G: TerrainGenerator>(
             let cell = if kids.iter().all(Option::is_some) {
                 merge(kids.map(|k| *k.unwrap()))
             } else {
-                let mut c = sample_section(terra, registry, detail, ax, az);
+                let mut c = sample_section(terra, colors, detail, ax, az);
                 for k in kids.iter().flatten() {
                     c.lo = c.lo.min(k.lo);
                     c.hi = c.hi.max(k.hi);
@@ -244,7 +242,7 @@ fn build_level<G: TerrainGenerator>(
 /// at the same points [`Section::extract`] samples, ensuring `hi` bounds drawable terrain.
 fn sample_section<G: TerrainGenerator>(
     terra: &G,
-    registry: &BlockRegistry,
+    colors: &[Color],
     detail: u8,
     ax: i32,
     az: i32,
@@ -264,7 +262,8 @@ fn sample_section<G: TerrainGenerator>(
             lo = lo.min(h);
             hi = hi.max(h);
             if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
-                let c = registry.color(terra.surface_at(wx, wz));
+                let id = terra.surface_at(wx, wz);
+                let c = colors[id.0 as usize];
                 r += c.r as u64;
                 g += c.g as u64;
                 b += c.b as u64;
@@ -286,6 +285,7 @@ fn merge(kids: [MipCell; 4]) -> MipCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::registry::BlockRegistry;
     use crate::world::generation::Terrain;
 
     fn terra(seed: i64) -> (BlockRegistry, Terrain) {
@@ -296,7 +296,7 @@ mod tests {
 
     /// A small extent keeps the property tests fast; the timing test uses the real one.
     fn small(reg: &BlockRegistry, g: &Terrain) -> HeightMip {
-        HeightMip::bake(g, reg, BakeExtent::new(2048, FINEST_DETAIL + 3))
+        HeightMip::bake(g, &reg.color_snapshot(), BakeExtent::new(2048, FINEST_DETAIL + 3))
     }
 
     /// Recorded `hi` bounds every ground height sampled by the LOD extractor.
@@ -505,7 +505,7 @@ mod tests {
         // (half_m = outer_m, coarsest = FINEST_DETAIL + (levels-1)*step, step=1).
         for (name, half_m, coarsest) in [("5-level", 3072, FINEST_DETAIL + 4), ("7-level", 12288, FINEST_DETAIL + 6)] {
             let t = std::time::Instant::now();
-            let mip = HeightMip::bake(&g, &reg, BakeExtent::new(half_m, coarsest));
+            let mip = HeightMip::bake(&g, &reg.color_snapshot(), BakeExtent::new(half_m, coarsest));
             let dt = t.elapsed();
             let total: usize = mip.levels.iter().map(|l| l.cells.len()).sum();
             let per: Vec<usize> = mip.levels.iter().map(|l| l.cells.len()).collect();

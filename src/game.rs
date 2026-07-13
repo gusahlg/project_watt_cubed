@@ -31,9 +31,6 @@ use crate::sim::Simulation;
 use crate::sky::Sky;
 use crate::world::World;
 
-/// How far the player can reach to break a block: 6 m, in world units.
-const REACH: f64 = 6.0 * crate::math::PER_METER;
-
 /// What a game update wants the app to do next.
 pub enum Signal {
     /// Keep playing.
@@ -488,7 +485,9 @@ impl Game {
                 world: &mut self.world,
                 screen_w: eng.screen_width(),
                 screen_h: eng.screen_height(),
-                place: input.do_place,
+                // A detached camera cannot perform player-origin actions: its
+                // crosshair no longer represents the frozen player's aim.
+                place: input.do_place && !detached,
                 toggle_inventory: input.toggle_inventory,
                 toggle_crafting: input.toggle_crafting,
                 nav_up: input.nav_up,
@@ -606,7 +605,12 @@ impl Game {
     /// Break the block the player is looking at, handing its elements to the mods.
     fn break_block(&mut self, mods: &mut Mods) {
         let Some(hit) =
-            interact::raycast(&self.world, self.player.position, self.player.forward(), REACH)
+            interact::raycast(
+                &self.world,
+                self.player.position,
+                self.player.forward(),
+                interact::REACH,
+            )
         else {
             return;
         };

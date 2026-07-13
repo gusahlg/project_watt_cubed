@@ -200,6 +200,13 @@ impl BlockRegistry {
         self.color[id.0 as usize]
     }
 
+    /// Immutable colour table for background jobs. The element-worldgen
+    /// compiler registers additional natural compositions after the builtins,
+    /// so recreating a builtin-only registry on a worker is not equivalent.
+    pub(crate) fn color_snapshot(&self) -> Box<[Color]> {
+        self.color.clone().into_boxed_slice()
+    }
+
     /// The full cold record for a block, for inspection and crafting.
     pub fn block(&self, id: BlockId) -> &Block {
         &self.blocks[id.0 as usize]

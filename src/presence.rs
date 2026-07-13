@@ -265,3 +265,50 @@ pub fn wrap_pi(a: f32) -> f32 {
     use std::f32::consts::{PI, TAU};
     (a + PI).rem_euclid(TAU) - PI
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eye_to_feet_uses_the_broadcast_stance_height() {
+        let eye = Eye(DVec3::new(17.25, 93.0, -8.5));
+        for stance in [Stance::Standing, Stance::Sneaking, Stance::Swimming] {
+            let feet = eye.feet(stance);
+            assert_eq!(feet.0.x.to_bits(), eye.0.x.to_bits());
+            assert_eq!(feet.0.z.to_bits(), eye.0.z.to_bits());
+            assert_eq!(feet.0.y, eye.0.y - stance.eye_offset());
+        }
+    }
+
+    #[test]
+    fn remote_pose_keeps_sub_block_offsets_at_far_coordinates() {
+        // Subtract in f64 before narrowing. Narrowing each absolute position first
+        // would erase these offsets hundreds of millions of units from the origin.
+        let camera = Eye(DVec3::new(900_000_000.25, 71.5, -800_000_000.75));
+        let remote_eye = Eye(camera.0 + DVec3::new(3.125, 2.0, -4.375));
+        let stance = Stance::Sneaking;
+        let pose = RenderPose::new(
+            remote_eye.feet(stance),
+            camera,
+            0.0,
+            0.0,
+            stance,
+            Gait::new(0.0, 0.0),
+        );
+
+        assert_eq!(
+            pose.feet,
+            Vec3::new(3.125, (2.0 - stance.eye_offset()) as f32, -4.375)
+        );
+    }
+
+    #[test]
+    fn wire_stance_is_a_closed_round_trip() {
+        for stance in [Stance::Standing, Stance::Sneaking, Stance::Swimming] {
+            assert_eq!(Stance::from_wire(stance.wire()), Some(stance));
+        }
+        assert_eq!(Stance::from_wire(3), None);
+        assert_eq!(Stance::from_wire(u8::MAX), None);
+    }
+}

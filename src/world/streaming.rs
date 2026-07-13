@@ -646,7 +646,7 @@ impl World {
     /// without a flood, or `None` if it must go through the worker settle. The
     /// two trivial cases collapse the load-time light-job burst to the thin
     /// Dense surface band (see [`store_chunk`](Self::store_chunk)):
-    /// - a uniform-*opaque* chunk settles to all-dark (no light enters);
+    /// - a uniform opaque, non-emissive chunk settles to all-dark (no light enters);
     /// - a uniform-*air* chunk fully above every column's surface, with no near
     ///   blocklight from a loaded neighbour, settles to full sky / dark block.
     ///
@@ -661,9 +661,10 @@ impl World {
         }
         self.refresh_tables();
         let tables = self.tables.get();
-        // A full block of opaque rock settles to all-dark: no skylight column
-        // stays open through it and no neighbour light can relax into an opaque
-        // cell — so this holds regardless of neighbours (dark unconditionally).
+        // A full block of inert opaque rock settles to all-dark: no skylight
+        // column stays open through it and no neighbour light can relax into an
+        // opaque cell. Emissive opaque blocks must take the flood path so they
+        // can seed their own blocklight.
         if chunk.is_uniform_opaque(&tables) {
             return Some(light::LightGrid::dark());
         }
@@ -814,13 +815,15 @@ impl World {
             return;
         }
         let generator = self.generator.clone();
+        // The generator stores resolved IDs for every element-worldgen
+        // composition registered during `World::new`. A fresh builtin registry
+        // is too short for those IDs; snapshot the matching color table instead.
+        let colors = self.registry.color_snapshot();
         let cfg = &self.section_pyramid;
         let extent = BakeExtent::new(cfg.outer_m() as i32, cfg.coarsest());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // Use fresh builtin registry (not Clone/Send); bake is seed-pure.
-            let registry = crate::block::registry::BlockRegistry::with_builtins();
-            let _ = tx.send(HeightMip::bake(&generator, &registry, extent));
+            let _ = tx.send(HeightMip::bake(&generator, &colors, extent));
         });
         self.section_mip_rx = Some(rx);
     }

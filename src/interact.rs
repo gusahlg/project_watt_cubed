@@ -12,6 +12,11 @@ use voxel_engine::DVec3;
 use crate::math::block_coord;
 use crate::world::World;
 
+/// Player interaction radius: six metres expressed in world units. Breaking
+/// and placement share this value so changes in the unit scale cannot make one
+/// action reach farther than the other.
+pub const REACH: f64 = 6.0 * crate::math::PER_METER;
+
 /// A block the aim ray struck.
 pub struct RayHit {
     /// The obstacle block that was hit (solid, non-liquid).

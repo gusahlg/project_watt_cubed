@@ -135,7 +135,7 @@ impl ClientMessage {
     /// Parse a frame payload. `None` on any malformed or truncated input.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        Some(match r.u8()? {
+        let message = match r.u8()? {
             tag::HELLO => ClientMessage::Hello {
                 protocol: r.u32()?,
                 name: r.str()?,
@@ -161,7 +161,8 @@ impl ClientMessage {
             },
             tag::SET_TIME => ClientMessage::SetTime { day: r.f32()? },
             _ => return None,
-        })
+        };
+        r.finished().then_some(message)
     }
 }
 
@@ -240,7 +241,7 @@ impl ServerMessage {
     /// Parse a frame payload. `None` on any malformed or truncated input.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        Some(match r.u8()? {
+        let message = match r.u8()? {
             tag::WELCOME => ServerMessage::Welcome {
                 player_id: r.u32()?,
                 seed: r.i64()?,
@@ -283,7 +284,8 @@ impl ServerMessage {
             },
             tag::S_TIME => ServerMessage::Time { day: r.f32()? },
             _ => return None,
-        })
+        };
+        r.finished().then_some(message)
     }
 }
 
@@ -374,6 +376,9 @@ impl<'a> Reader<'a> {
         let slice = self.bytes.get(self.pos..end)?;
         self.pos = end;
         Some(slice)
+    }
+    fn finished(&self) -> bool {
+        self.pos == self.bytes.len()
     }
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
@@ -501,6 +506,67 @@ mod tests {
         // Chop the payload short: the reader must report failure, not panic.
         assert_eq!(ClientMessage::decode(&full[..full.len() - 2]), None);
         assert_eq!(ClientMessage::decode(&[]), None);
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected_for_every_message_direction() {
+        let client_cases = [
+            ClientMessage::Hello {
+                protocol: 1,
+                name: "player".into(),
+                password: String::new(),
+            },
+            ClientMessage::Move {
+                pos: DVec3::new(1.0, 2.0, 3.0),
+                yaw: 0.25,
+                pitch: -0.5,
+                stance: Stance::Standing,
+            },
+            ClientMessage::Swing,
+            ClientMessage::Ping { nonce: 9 },
+            ClientMessage::Edit { x: 1, y: 2, z: 3, spec: "air".into() },
+            ClientMessage::Chat { channel: 0, text: "hi".into() },
+            ClientMessage::SetTime { day: 0.25 },
+        ];
+        for message in client_cases {
+            let mut payload = message.encode();
+            payload.push(0xa5);
+            assert_eq!(ClientMessage::decode(&payload), None, "accepted suffix after {message:?}");
+        }
+
+        let server_cases = [
+            ServerMessage::Welcome {
+                player_id: 1,
+                seed: 2,
+                spawn: DVec3::new(3.0, 4.0, 5.0),
+            },
+            ServerMessage::Reject { reason: "no".into() },
+            ServerMessage::Snapshot { edits: vec![(1, 2, 3, "air".into())] },
+            ServerMessage::PeerJoined { id: 2, name: "peer".into() },
+            ServerMessage::PeerLeft { id: 2 },
+            ServerMessage::PeerMove {
+                id: 2,
+                pos: DVec3::new(6.0, 7.0, 8.0),
+                yaw: 0.5,
+                pitch: -0.25,
+                stance: Stance::Sneaking,
+            },
+            ServerMessage::PeerSwing { id: 2 },
+            ServerMessage::Pong { nonce: 9 },
+            ServerMessage::Edit { x: 1, y: 2, z: 3, spec: "air".into() },
+            ServerMessage::Chat {
+                from_id: 2,
+                from_name: "peer".into(),
+                channel: 0,
+                text: "hi".into(),
+            },
+            ServerMessage::Time { day: 0.5 },
+        ];
+        for message in server_cases {
+            let mut payload = message.encode();
+            payload.push(0x5a);
+            assert_eq!(ServerMessage::decode(&payload), None, "accepted suffix after {message:?}");
+        }
     }
 
     #[test]

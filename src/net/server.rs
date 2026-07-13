@@ -532,9 +532,15 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Mutex<State>>,
 /// tolerates ids that disconnected in the unlocked window, and ids are never
 /// reused, so a late kick can't hit the wrong player.
 fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
-    // Ignore non-finite coordinates outright (a NaN would poison distance checks
-    // and the grid keys).
-    if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
+    // Ignore non-finite pose data outright. A NaN position poisons distance
+    // checks/grid keys; a NaN angle propagates into peer interpolation and render
+    // matrices even though the server itself does not otherwise use the angle.
+    if !pos.x.is_finite()
+        || !pos.y.is_finite()
+        || !pos.z.is_finite()
+        || !yaw.is_finite()
+        || !pitch.is_finite()
+    {
         return;
     }
     // Encode before locking — the frame doesn't depend on shared state.
@@ -844,6 +850,49 @@ mod tests {
         let state = shared.lock_recover();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
         assert!(!state.edits.contains_key(&(500, 20, 500)), "out-of-reach edit dropped");
+    }
+
+    #[test]
+    fn nonfinite_angles_do_not_enter_authoritative_state() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let start = DVec3::new(8.5, 20.0, 8.5);
+
+        let mut players = HashMap::new();
+        players.insert(
+            1,
+            PlayerHandle {
+                name: "p".into(),
+                pos: start,
+                yaw: 0.25,
+                pitch: -0.5,
+                stance: Stance::Standing,
+                out,
+                kick: stream,
+                ready: true,
+                backlog: Vec::new(),
+            },
+        );
+        let shared = Arc::new(Mutex::new(State {
+            edits: HashMap::new(),
+            spec_pool: std::collections::HashSet::new(),
+            players,
+            grid: HashMap::new(),
+            next_id: 2,
+            day: 0.3,
+        }));
+
+        let attempted = DVec3::new(9.5, 20.0, 8.5);
+        on_move(&shared, 1, attempted, f32::NAN, 0.0, Stance::Sneaking);
+        on_move(&shared, 1, attempted, 0.0, f32::INFINITY, Stance::Swimming);
+
+        let state = shared.lock_recover();
+        let player = &state.players[&1];
+        assert_eq!(player.pos, start);
+        assert_eq!(player.yaw, 0.25);
+        assert_eq!(player.pitch, -0.5);
+        assert_eq!(player.stance, Stance::Standing);
     }
 
     /// The server-ordered edit must be echoed back to its own sender — that

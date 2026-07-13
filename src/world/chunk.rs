@@ -149,12 +149,15 @@ impl Chunk {
         }
     }
 
-    /// Whether this chunk is uniform *and* that block is opaque — the analytic
-    /// light fast path's "a full block of rock/solid, so its settled grid is all
-    /// dark" test. A non-uniform chunk is never trivially opaque.
+    /// Whether this chunk is uniform, opaque, and non-emissive — the analytic
+    /// light fast path's "a full block of inert rock, so its settled grid is all
+    /// dark" test. Opaque emitters still need propagation to seed blocklight.
     #[inline]
     pub fn is_uniform_opaque(&self, tables: &HotTables) -> bool {
-        self.uniform().is_some_and(|id| tables.opaque[id.0 as usize])
+        self.uniform().is_some_and(|id| {
+            let index = id.0 as usize;
+            tables.opaque[index] && tables.emission[index] == 0
+        })
     }
 
     /// Read a voxel by flat index. For paletted chunks this is one extra
