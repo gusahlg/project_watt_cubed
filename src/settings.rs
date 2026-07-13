@@ -87,6 +87,7 @@ pub struct Settings {
     pub sunlight: bool,
     pub shadows: bool,
     pub sky: bool,
+    pub vignette: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +120,7 @@ impl Default for Settings {
             sunlight: true,
             shadows: false,
             sky: true,
+            vignette: false,
         }
     }
 }
@@ -274,7 +276,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 24] = [
+pub const SETTINGS: [Setting; 25] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -554,6 +556,7 @@ pub const SETTINGS: [Setting; 24] = [
     video_toggle!(godrays, "godrays", "Godrays"),
     video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
     video_toggle!(taa, "taa", "Temporal AA", &["aa"]),
+    video_toggle!(vignette, "vignette", "Vignette"),
 ];
 
 /// The Back action sits just past the settings rows — derived, never hand-numbered.
@@ -648,6 +651,7 @@ impl Settings {
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
+            vignette: self.vignette,
         }
     }
 }

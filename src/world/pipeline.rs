@@ -113,7 +113,7 @@ pub(in crate::world) enum Done {
     Column { col: (i32, i32), chunks: Vec<(Coord, Chunk)> },
     Mesh { coord: Coord, rev: u32, data: ChunkMeshData },
     Light { coord: Coord, epoch: u32, grid: LightGrid },
-    Section { pos: SectionPos, meshes: SectionMeshData },
+    Section { pos: SectionPos, meshes: [SectionMeshData; 4] },
 }
 
 /// A job's scheduling class. Derived from its kind — near work outranks far LOD

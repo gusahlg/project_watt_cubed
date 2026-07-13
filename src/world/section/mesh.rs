@@ -1,28 +1,17 @@
 //! Stack mesher: turns a [`Section`]'s RLE columns straight into GPU-ready
 //! [`MeshData`] — no intermediate voxel grid.
 //!
-//! A run stack is meshed as boxes: every solid run in a column emits up to six
-//! faces (top/bottom capped against the vertically adjacent run in the SAME
-//! column; the four sides Y-segment-split against the *whole run stack* of the
-//! horizontally adjacent column, so overhangs and floating islands split
-//! correctly where a heightmap comparison could not). The cull key is opacity,
-//! reusing the chunk mesher's rule verbatim ([`covered`]): an opaque neighbour
-//! hides a face, a translucent one (water) does not cover a solid face, and two
-//! same-block translucent runs hide their shared face (no walls inside water).
+//! Each solid run emits up to six faces. Vertical faces split where column heights differ
+//! (so overhangs render correctly, unlike a heightmap-only approach). Opacity rules: opaque
+//! blocks hide faces; translucent (water) does not cover solid; two translucent blocks of
+//! the same type hide their shared edge (no internal walls).
 //!
-//! Section borders (the ±X/±Z edge columns) are unconditional overdraw per the
-//! ledger — the edge face is drawn as if the neighbour were air and given a
-//! one-step inward micro-offset ([`MeshVertex::with_micro`]) so coincident
-//! overdraw from the abutting section cannot z-fight. Interior faces carry zero
-//! offset.
+//! Section borders (edge columns) overdraw as air with an inward micro-offset to prevent
+//! z-fighting with adjacent sections at different detail levels.
 //!
-//! A section (32×32 columns) is emitted as a `2×2×K` grid of 16³-CELL blocks
-//! (vertex positions are 5-bit, `0..=16`), each drawn by the caller at
-//! `offset = section_origin + block_origin·cell`, `scale = cell` — identical to
-//! today's tile draws. `K` spans only the vertical slabs the runs actually
-//! reach, so sky/deep space costs nothing. There is NO ambient occlusion at LOD
-//! range (a fixed `Ao::NONE`) and skylight is the per-run baked nibble, which
-//! keeps meshing embarrassingly parallel.
+//! Output: a 2×2 grid of 16³-cell blocks per section, only for the vertical range occupied
+//! by solid geometry (sky/deep space cost nothing). No ambient occlusion; skylight is
+//! per-run baked nibble, enabling parallel meshing.
 use glam::UVec3;
 use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
 
@@ -30,15 +19,13 @@ use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
 use super::{DOMAIN_H, FULL_SKYLIGHT, SECTION_N, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
 
-/// One block's mesh plus its origin in CELLS within the section (drawn at
-/// `section_origin + origin·cell`, `scale = cell`). Only non-empty blocks appear.
+/// One block's mesh plus its origin in cells within the section. Only non-empty blocks appear.
 pub(in crate::world) type SectionMeshData = Vec<(UVec3, ChunkMeshData)>;
 
 /// Cells per mesh-block edge — the 5-bit vertex position range (`0..=16`). Fixed by design.
 const BLOCK: i32 = 16;
-/// Mesh blocks per section side (`32 / 16 = 2`).
+const QUAD_N: usize = SECTION_N / 2;
 const BLOCKS_XZ: i32 = SECTION_N as i32 / BLOCK;
-/// Cells in one block slice (`16×16`).
 const SLICE: usize = (BLOCK * BLOCK) as usize;
 
 /// One solid-or-air run of a column expressed in CELL coordinates (`[lo, hi)`,
@@ -60,7 +47,7 @@ struct FaceSample {
     micro: [i8; 3],
 }
 
-/// Face direction; corners copied from chunk mesher for winding; micro-offset zero for verticals (never borders).
+/// Face direction with corner winding; micro-offset zero for verticals (never borders).
 struct Dir {
     normal: Normal,
     n_axis: usize,
@@ -158,7 +145,7 @@ fn cell_at(runs: &[CellRun], cy: i32) -> (BlockId, u8) {
     (AIR, 0)
 }
 
-/// Y edges asymmetric (floor=cull, sky=lit). Section edges drawn beyond boundary (overdraw with assumed-air neighbor).
+/// Sample a face: cull if covered by neighbor; overdraw section edges as air.
 fn face_sample(
     cols: &[Vec<CellRun>],
     n_cells: i32,
@@ -170,8 +157,8 @@ fn face_sample(
     if sy < 0 || sy >= n_cells {
         return None; // above the ceiling in the top block: no cell here
     }
-    let col = &cols[sx as usize + sz as usize * SECTION_N];
-    let (me, my_sky) = cell_at(col, sy);
+    let col = &cols[sx as usize + sz as usize * QUAD_N];
+    let (me, _) = cell_at(col, sy);
     if me == AIR {
         return None;
     }
@@ -186,11 +173,12 @@ fn face_sample(
         } else {
             cell_at(col, ny)
         }
-    } else if nx < 0 || nx >= SECTION_N as i32 || nz < 0 || nz >= SECTION_N as i32 {
-        micro = dir.micro; // section border: overdraw as if air, nudge inward
-        (AIR, my_sky)
+    } else if nx < 0 || nx >= QUAD_N as i32 || nz < 0 || nz >= QUAD_N as i32 {
+        // Quadrant border: overdraw as air, nudge inward. Light as sky (not buried cell's dark skylight).
+        micro = dir.micro;
+        (AIR, FULL_SKYLIGHT)
     } else {
-        cell_at(&cols[nx as usize + nz as usize * SECTION_N], ny)
+        cell_at(&cols[nx as usize + nz as usize * QUAD_N], ny)
     };
     if covered(me, nbr, tables) {
         return None;
@@ -198,7 +186,7 @@ fn face_sample(
     Some(FaceSample { block: me, sky, micro })
 }
 
-/// Greedy-mesh one block; sweep mirrors chunk mesher's mask/grow/sweep for segment-splitting and merging.
+/// Greedy-mesh one block: merge adjacent quads with identical properties.
 fn build_block(cols: &[Vec<CellRun>], n_cells: i32, base: [i32; 3], tables: &HotTables, out: &mut ChunkMeshData) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
@@ -272,7 +260,7 @@ fn emit(
     origin[dir.u_axis] = u0 as u32;
     origin[dir.v_axis] = v0 as u32;
     let layer = sample.block.0;
-    // Opaque pass prevents z-fight on coarse LOD. Clears water bit (animated only). Distant-Horizons: no fluid on LOD.
+    // Route water to opaque pass (no animated texturing at LOD range).
     let is_water = tables.water[layer as usize];
     let pass = if is_water { Pass::Opaque } else { tables.layer[layer as usize] };
     let corners = std::array::from_fn(|i| {
@@ -294,13 +282,27 @@ fn emit(
     out[pass].quad(corners);
 }
 
-/// Mesh a whole section into per-block [`ChunkMeshData`]. Deterministic: the same
-/// section yields bit-identical output (fixed block iteration order, run-based
-/// sampling with no floats).
-pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables) -> SectionMeshData {
+/// Mesh a whole section as four independent quadrant sub-meshes (indexed by
+/// [`SectionPos::quadrant`]), each over its 16×16 column sub-grid. A quadrant's
+/// outer edge is treated exactly like a section border — overdrawn as if the
+/// neighbour were air, with the inward micro-nudge — because the abutting quadrant
+/// may be drawn at a different detail or not at all. Deterministic: the same
+/// section yields bit-identical output per quadrant (fixed iteration order,
+/// run-based sampling with no floats).
+pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables) -> [SectionMeshData; 4] {
     let n_cells = DOMAIN_H / section.pos().cell_size();
-    let cols: Vec<Vec<CellRun>> =
-        (0..SECTION_N * SECTION_N).map(|i| column_cells(section, i % SECTION_N, i / SECTION_N, n_cells)).collect();
+    std::array::from_fn(|q| build_quadrant(section, tables, q as u8, n_cells))
+}
+
+/// Mesh one quadrant `q` (its 16×16 column sub-grid) into section-space block
+/// origins. Block origins are in CELLS relative to the section min-corner, so the
+/// caller positions them the same way regardless of quadrant.
+fn build_quadrant(section: &Section, tables: &HotTables, q: u8, n_cells: i32) -> SectionMeshData {
+    let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
+    // Just this quadrant's columns, indexed locally over QUAD_N×QUAD_N.
+    let cols: Vec<Vec<CellRun>> = (0..QUAD_N * QUAD_N)
+        .map(|i| column_cells(section, qx * QUAD_N + i % QUAD_N, qz * QUAD_N + i / QUAD_N, n_cells))
+        .collect();
 
     // The vertical slab that actually holds solid runs — sky and deep space are
     // skipped entirely, so K is small for thin terrain.
@@ -315,18 +317,16 @@ pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables
     }
     let mut result = SectionMeshData::new();
     if yhi <= ylo {
-        return result; // no solid geometry anywhere
+        return result; // no solid geometry in this quadrant
     }
 
+    // Section-space cell origin of the quadrant's XZ corner (0 or 16).
+    let (ox, oz) = ((qx * QUAD_N) as u32, (qz * QUAD_N) as u32);
     for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
-        for bz in 0..BLOCKS_XZ {
-            for bx in 0..BLOCKS_XZ {
-                let base = [bx * BLOCK, by * BLOCK, bz * BLOCK];
-                let mut data = new_chunk_mesh_data();
-                if build_block(&cols, n_cells, base, tables, &mut data) {
-                    result.push((UVec3::new(base[0] as u32, base[1] as u32, base[2] as u32), data));
-                }
-            }
+        let base = [0, by * BLOCK, 0];
+        let mut data = new_chunk_mesh_data();
+        if build_block(&cols, n_cells, base, tables, &mut data) {
+            result.push((UVec3::new(ox, (by * BLOCK) as u32, oz), data));
         }
     }
     result
@@ -342,7 +342,7 @@ mod tests {
 
     // -- fixtures ----------------------------------------------------------
 
-    /// Test generator mirroring section.rs's FnGen for extraction reuse.
+    /// Test generator for reusable terrain setup.
     struct FnGen<H, B> {
         h: H,
         b: B,
@@ -388,9 +388,7 @@ mod tests {
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
     const CELL: i32 = 1 << FINEST_DETAIL;
 
-    /// A ground/surface/air column with an optional water table and an optional
-    /// solid shelf `[shelf.0, shelf.1)` above the surface (metres) — the same
-    /// class generator section.rs uses, so every terrain shape is reachable.
+    /// Terrain with configurable surface height, water table, and floating shelf.
     fn terrain_gen(
         b: &Blocks,
         h: i32,
@@ -420,27 +418,25 @@ mod tests {
         }
     }
 
-    fn mesh_of(section: &Section, tables: &HotTables) -> SectionMeshData {
+    fn mesh_of(section: &Section, tables: &HotTables) -> [SectionMeshData; 4] {
         build_section_mesh(section, tables)
     }
 
-    /// Every vertex of every quad in `data`, tagged with its block-relative
-    /// position, normal, layer, skylight, micro, water and the block origin.
-    fn all_quads<'a>(mesh: &'a SectionMeshData) -> impl Iterator<Item = (UVec3, Pass, &'a [MeshVertex])> {
-        mesh.iter().flat_map(|(origin, data)| {
+    /// Iterate all quads across all quadrants with their origins and passes.
+    fn all_quads<'a>(mesh: &'a [SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &'a [MeshVertex])> {
+        mesh.iter().flatten().flat_map(|(origin, data)| {
             Pass::ALL.into_iter().flat_map(move |p| {
                 data[p].vertices().chunks_exact(4).map(move |q| (*origin, p, q))
             })
         })
     }
 
-    fn normals_present(mesh: &SectionMeshData, want: Normal) -> bool {
+    fn normals_present(mesh: &[SectionMeshData; 4], want: Normal) -> bool {
         all_quads(mesh).any(|(_, _, q)| q[0].normal() == want)
     }
 
-    /// Every quad winds CCW from outside (engine back-face-culls otherwise) —
-    /// checked in WORLD cell space (block origin + local position).
-    fn assert_winds_outward(mesh: &SectionMeshData) {
+    /// Every quad must wind counter-clockwise from outside (engine back-face-culls otherwise).
+    fn assert_winds_outward(mesh: &[SectionMeshData; 4]) {
         let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
         let cross = |a: [f32; 3], b: [f32; 3]| {
             [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
@@ -471,10 +467,7 @@ mod tests {
         assert!(normals_present(&mesh, Normal::PosY), "the surface has a top");
         assert_winds_outward(&mesh);
 
-        // Interior side faces are all culled (identical opaque neighbours); the
-        // only side faces are the section-edge overdraw, which carry a micro
-        // offset. So: every side quad has micro != 0, and every interior quad
-        // (top) has micro == 0.
+        // Interior side faces culled; only section-edge quads have micro offset.
         for (_, _, q) in all_quads(&mesh) {
             let side = matches!(
                 q[0].normal(),
@@ -492,19 +485,14 @@ mod tests {
     #[test]
     fn air_only_section_is_empty() {
         let (_r, tables, b) = setup();
-        // Surface at the floor: every column is all air over the whole domain.
         let sec = Section::extract(FINEST, &terrain_gen(&b, 0, 0, None), &[]);
-        assert!(mesh_of(&sec, &tables).is_empty(), "an all-air section meshes to nothing");
+        assert!(mesh_of(&sec, &tables).iter().all(|q| q.is_empty()), "an all-air section meshes to nothing");
     }
 
     #[test]
     fn floating_shelf_emits_a_bottom_and_segment_split_sides() {
         let (_r, tables, b) = setup();
-        // Ground at 100 everywhere, plus a detached stone slab in cells [108,112)
-        // covering only the LOW-X half of the section (world x < 64). The slab's
-        // edge column sits inside the section, so its exposed side faces the air
-        // gap of the neighbouring slab-free column. This is the segment-split case
-        // a heightmap mesher cannot handle.
+        // Ground at 100 everywhere, plus a floating stone slab in cells [108,112) for x < 48.
         let (stone, dirt, grass) = (b.stone, b.dirt, b.grass);
         let r#gen = FnGen {
             h: |_, _| 100,
@@ -515,7 +503,7 @@ mod tests {
                     dirt
                 } else if y < 100 {
                     grass
-                } else if y >= 108 && y < 112 && x < 64 {
+                } else if y >= 108 && y < 112 && x < 48 {
                     stone
                 } else {
                     AIR
@@ -527,11 +515,8 @@ mod tests {
         let sec = Section::extract(FINEST, &r#gen, &[]);
         let mesh = mesh_of(&sec, &tables);
         assert_winds_outward(&mesh);
-        // The slab's underside is open to the gap; a downward face a pure
-        // ground-only mesher would never emit.
         assert!(normals_present(&mesh, Normal::NegY), "the floating slab shows its underside");
-        // The slab's inner edge faces the neighbour column's air across the gap
-        // band; an interior (micro == 0) side quad survives the segment split.
+        // Interior side faces should survive the segment split (not merge into overdraw).
         let interior_side = all_quads(&mesh).any(|(_, _, q)| {
             matches!(q[0].normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ)
                 && q[0].micro() == [0, 0, 0]
@@ -545,8 +530,6 @@ mod tests {
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
         let sec = Section::extract(FINEST, &terrain_gen(&b, 40, 80, None), &[]);
         let mesh = mesh_of(&sec, &tables);
-        // LOD water is an OPAQUE solid (Distant-Horizons rule: no fluid pass on
-        // coarse sections), and it never carries the animated-water bit.
         let is_water_quad = |q: &[MeshVertex]| tables.water[q[0].layer() as usize];
         let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(q));
         assert!(opaque_water, "water surface meshes into the opaque pass");
@@ -555,8 +538,7 @@ mod tests {
             !all_quads(&mesh).any(|(_, p, _)| p == Pass::Blend),
             "no translucent geometry on a LOD section"
         );
-        // No interior water wall exists (water-vs-water is suppressed); every water
-        // side face is a section-border overdraw (micro != 0).
+        // Water-vs-water is suppressed; all water side faces are borders (micro != 0).
         for (_, _, q) in all_quads(&mesh) {
             if !is_water_quad(q) {
                 continue;
@@ -577,8 +559,7 @@ mod tests {
         let sec = Section::extract(FINEST, &terrain_gen(&b, 200, 0, Some((300, 320))), &[]);
         let mesh = mesh_of(&sec, &tables);
         let mut seen = std::collections::HashSet::new();
-        for (origin, data) in &mesh {
-            // Origins are distinct 16-cell-aligned block corners.
+        for (origin, data) in mesh.iter().flatten() {
             assert!(seen.insert((origin.x, origin.y, origin.z)), "two blocks share an origin");
             assert!(origin.x % 16 == 0 && origin.y % 16 == 0 && origin.z % 16 == 0, "block origin off-grid");
             assert!(origin.x < SECTION_N as u32 && origin.z < SECTION_N as u32, "block origin outside section XZ");
@@ -594,22 +575,17 @@ mod tests {
     #[test]
     fn a_flat_top_merges_and_a_checkerboard_does_not() {
         let (_r, tables, b) = setup();
-        // Flat grass top: each 16×16 XZ block's top plane should merge to ONE
-        // quad, so the section's four XZ blocks give exactly four top quads.
         let flat = Section::extract(FINEST, &terrain_gen(&b, 200, 0, None), &[]);
         let tops = all_quads(&build_section_mesh(&flat, &tables))
             .filter(|(_, _, q)| q[0].normal() == Normal::PosY)
             .count();
         assert_eq!(tops, BLOCKS_XZ as usize * BLOCKS_XZ as usize, "a uniform flat top merges per block");
 
-        // A checkerboard of two surface blocks cannot merge its tops.
         let (grass, dirt) = (b.grass, b.dirt);
         let stone = b.stone;
         let checker = FnGen {
             h: |_, _| 200,
-            // The alternating band is a full cell thick ([196,200), centre at 198)
-            // so it samples; a 1 m band would miss the sampler. Alternates at each
-            // 4-meter cell boundary.
+            // Checkerboard varies at cell boundaries (not single-meter bands).
             b: move |x: i32, y, z: i32| {
                 if y >= 200 {
                     AIR
@@ -625,7 +601,6 @@ mod tests {
         let sec = Section::extract(FINEST, &checker, &[]);
         let mesh = build_section_mesh(&sec, &tables);
         let top_quads = all_quads(&mesh).filter(|(_, _, q)| q[0].normal() == Normal::PosY).count();
-        // 32×32 alternating tops cannot merge across the id change: many quads.
         assert!(top_quads > 100, "checkerboard tops must not merge (got {top_quads})");
     }
 
@@ -636,8 +611,9 @@ mod tests {
         let sec = Section::extract(FINEST, &r#gen, &[]);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);
-        let flatten = |m: &SectionMeshData| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
             m.iter()
+                .flatten()
                 .flat_map(|(o, d)| {
                     Pass::ALL.into_iter().map(move |p| {
                         (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
@@ -649,13 +625,32 @@ mod tests {
     }
 
     #[test]
-    fn coarser_detail_agrees_on_the_exposed_surface() {
-        // Detail 2 vs detail 4 over the same world area (a coarse section spans
-        // 2× the metres, so its grid-0 area overlaps the finest grid-0 area).
-        // Both should carry a top surface — a sanity check that extraction and
-        // meshing generalise across the stride, not an exact-equality claim.
+    fn each_quadrant_mesh_stays_within_its_xz_bounds() {
+        // Quadrants don't leak into adjacent quadrants' XZ bands.
         let (_r, tables, b) = setup();
-        for detail in [FINEST_DETAIL, FINEST_DETAIL + 2] {
+        let sec = Section::extract(FINEST, &terrain_gen(&b, 200, 0, Some((260, 280))), &[]);
+        let mesh = build_section_mesh(&sec, &tables);
+        for (q, quad) in mesh.iter().enumerate() {
+            let (lox, loz) = (((q & 1) * QUAD_N) as f32, ((q >> 1) * QUAD_N) as f32);
+            for (origin, data) in quad {
+                assert_eq!((origin.x, origin.z), (lox as u32, loz as u32), "quadrant {q} origin off its band");
+                for p in Pass::ALL {
+                    for v in data[p].vertices() {
+                        let l = v.local_pos();
+                        let (wx, wz) = (origin.x as f32 + l[0], origin.z as f32 + l[2]);
+                        assert!((lox - 1.0..=lox + QUAD_N as f32 + 1.0).contains(&wx), "quadrant {q} vertex x {wx} escapes");
+                        assert!((loz - 1.0..=loz + QUAD_N as f32 + 1.0).contains(&wz), "quadrant {q} vertex z {wz} escapes");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coarser_detail_agrees_on_the_exposed_surface() {
+        // Coarser detail levels still have a visible surface.
+        let (_r, tables, b) = setup();
+        for detail in [FINEST_DETAIL, FINEST_DETAIL + 2, FINEST_DETAIL + 4, FINEST_DETAIL + 6] {
             let pos = SectionPos { detail, x: 0, z: 0 };
             let sec = Section::extract(pos, &terrain_gen(&b, 200, 0, None), &[]);
             let mesh = build_section_mesh(&sec, &tables);
