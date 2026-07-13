@@ -1,34 +1,27 @@
-//! Column-LOD representation: the far field as run-length-encoded vertical
-//! columns instead of volumetric tiles.
+//! Run-length-encoded vertical columns for far LOD instead of dense tiles.
 //!
-//! Terrain is overwhelmingly vertically homogeneous, so a far column is stored
-//! as a top-down stack of [`LodRun`]s — `{palette-id, height, skylight}` — rather
-//! than a dense cell array. Every run of a [`LodColumn`] is contiguous and
-//! non-overlapping, and the stack tiles a *fixed world-Y domain*
-//! `[LOD_FLOOR_Y, LOD_CEIL_Y)`: the sum of run heights is always [`DOMAIN_H`], so
-//! a run's bottom is derivable from the runs above it and no per-run `y` is stored
-//! (the "predict, store only exceptions" lesson). This is a hard struct invariant,
-//! checked by [`LodColumn::validate`]; the downsampler and (later) the mesher rely
-//! on it.
+//! Terrain is vertically homogeneous, so far columns compress as stacks of
+//! [`LodRun`]s (block id, height, skylight) rather than cell arrays. Each
+//! [`LodColumn`] is a top-down run stack over the fixed world-Y domain
+//! `[LOD_FLOOR_Y, LOD_CEIL_Y)`. Run bottoms are implicit (derived from runs
+//! above), which is a struct invariant enforced by [`LodColumn::validate`].
+//! This invariant is load-bearing: the downsampler and mesher depend on it.
 //!
-//! A [`Section`] is an `N×N` grid of columns at one detail level, plus a per-section
-//! [`Palette`] mapping the runs' small `id` indices to real [`BlockId`]s (a section
-//! rarely holds more than a handful of block types). The finest sections are
-//! *extracted* once from the generator ([`Section::extract`]); every coarser level
-//! is a pure `4→1` integer merge ([`Section::downsample`]) — the generator is never
-//! re-sampled per level. The conservative merge reducers (air never wins a tie,
-//! skylight by mean) are correctness invariants, not polish: they keep hollow
-//! silhouettes from developing holes as detail drops.
+//! A [`Section`] is an N×N grid of columns at one detail level, with a
+//! per-section [`Palette`] mapping run ids to real [`BlockId`]s (sections
+//! typically contain only a few block types). Finest sections are extracted
+//! once from the generator; coarser levels are pure 4-to-1 integer merges
+//! via [`Section::downsample`] (no re-sampling). Conservative merge rules
+//! (air loses ties, skylight by vote winners' mean) prevent hollow silhouettes
+//! from developing holes as detail drops.
 //!
-//! Skylight is baked per run straight from the generator's surface height
-//! (`CeilingWindow` semantics): a cell open to the sky (`y >= height`) is fully lit
-//! (15), a buried cell is dark (0). No neighbour floods — this matches what today's
-//! far tiles already render (`PaddedLight::open_sky`), and the visible top face of
-//! the ground reads the lit air run above it exactly as the chunk mesher does.
+//! Skylight is baked per run from the generator's surface height: cells at or
+//! above the surface are fully lit (15), buried cells are dark (0). No neighbor
+//! diffusion. This matches the existing far-tile rendering and the chunk mesher's
+//! treatment of the topmost air layer.
 //!
-//! These types are registered so the module compiles and its tests run, but
-//! nothing wires them into `World`, the streaming lanes, or rendering yet.
-//! Hence the module-wide `dead_code` allowance below.
+//! These types compile and test in isolation; they are not yet wired into
+//! World, streaming lanes, or rendering. Module-wide dead_code allowance below.
 #![allow(dead_code)]
 
 use crate::block::registry::{AIR, BlockId};
@@ -44,32 +37,58 @@ pub(in crate::world) use mesh::{SectionMeshData, build_section_mesh};
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
 
-/// The finest column-LOD detail level — `Lod(2)`, i.e. 4 m cells. `detail` doubles
-/// the cell size per level (`cell = 1 << detail`); Zone-1 full-res chunks remain the
-/// near renderer below this.
+/// Finest LOD detail level: cell size is 2^detail metres. Zone-1 full-res chunks are finer.
 pub(in crate::world) const FINEST_DETAIL: u8 = 2;
 
-/// The fixed world-Y domain every column tiles. The floor sits at 0: surface height
-/// is always `>= 1` (`Terrain::profile` clamps it), so everything below y=0 is solid
-/// ground and never a silhouette. The ceiling clears the island band (~245) and all
-/// but the rarest mountains with headroom, and `DOMAIN_H` stays a power of two so it
-/// divides every level's cell size and fits the 12-bit run height.
-const LOD_FLOOR_Y: i32 = 0;
-const LOD_CEIL_Y: i32 = 512;
+/// Fixed world-Y domain all columns tile. Floor at y=0 (below is solid ground).
+/// Ceiling at 512 (covers terrain and islands). Domain height is a power of two.
+pub(in crate::world) const LOD_FLOOR_Y: i32 = 0;
+pub(in crate::world) const LOD_CEIL_Y: i32 = 512;
 /// Vertical extent every column's runs sum to.
 pub(in crate::world) const DOMAIN_H: i32 = LOD_CEIL_Y - LOD_FLOOR_Y;
 
 /// Chunk size as a signed coordinate (edit flattening).
 const CS: i32 = CHUNK_SIZE as i32;
 
-// ---------------------------------------------------------------------------
-// SectionPos — one canonical packed position for every node of the hierarchy.
-// ---------------------------------------------------------------------------
+// Quadrant: 2-bit child convention (bit 0 = +X, bit 1 = +Z).
 
-/// A section's place in the quadtree: a detail level and integer grid coords at that
-/// level. Parent/child rescale is **floor division only** (`div_euclid`) — rounding a
-/// signed coordinate toward zero is the classic quadtree bug, so it is unrepresentable
-/// here.
+/// One of four quadrants: bit 0 = +X, bit 1 = +Z.
+/// All code routes through this definition; bit meaning is canonical here.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(in crate::world) struct Quadrant(u8);
+
+impl Quadrant {
+    /// All four quadrants, ascending — the canonical iteration order.
+    pub const ALL: [Quadrant; 4] = [Quadrant(0), Quadrant(1), Quadrant(2), Quadrant(3)];
+
+    pub fn new(q: u8) -> Quadrant {
+        debug_assert!(q < 4, "quadrant is a 2-bit index, got {q}");
+        Quadrant(q & 0b11)
+    }
+    /// The quadrant a `(x, z)` grid coord occupies within its parent.
+    pub fn of_coords(x: i32, z: i32) -> Quadrant {
+        Quadrant((x.rem_euclid(2) | (z.rem_euclid(2) << 1)) as u8)
+    }
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+    /// The +X bit as an offset (0 or 1).
+    pub const fn dx(self) -> i32 {
+        (self.0 & 1) as i32
+    }
+    /// The +Z bit as an offset (0 or 1).
+    pub const fn dz(self) -> i32 {
+        (self.0 >> 1) as i32
+    }
+}
+
+// SectionPos: canonical position for every node of the hierarchy.
+
+/// A section's place in the quadtree: detail level and grid coords.
+/// Uses floor division (div_euclid) only to avoid the classic quadtree bug of rounding toward zero.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::world) struct SectionPos {
     pub detail: u8,
@@ -78,12 +97,12 @@ pub(in crate::world) struct SectionPos {
 }
 
 impl SectionPos {
-    /// Metres per cell at this level (`2^detail`).
+    /// Metres per cell (2^detail).
     pub const fn cell_size(self) -> i32 {
         1 << self.detail
     }
 
-    /// Metres per section side (`N · 2^detail`).
+    /// Metres per section side (N * 2^detail).
     pub const fn span(self) -> i32 {
         (SECTION_N as i32) << self.detail
     }
@@ -98,33 +117,28 @@ impl SectionPos {
         self.z * self.span()
     }
 
-    /// The coarser section that contains this one. Floor division so the map is
-    /// total and consistent across the sign boundary.
+    /// Coarser section containing this one, computed with floor division.
     pub fn parent(self) -> SectionPos {
         SectionPos { detail: self.detail + 1, x: self.x.div_euclid(2), z: self.z.div_euclid(2) }
     }
 
-    /// The finer child in the given 2-bit quadrant (bit 0 = +X, bit 1 = +Z). The
-    /// exact inverse of [`parent`](Self::parent): `self.child(q).parent() == self`.
-    pub fn child(self, quadrant: u8) -> SectionPos {
+    /// Finer child at quadrant q; inverse of parent().
+    pub fn child(self, quadrant: Quadrant) -> SectionPos {
         debug_assert!(self.detail > 0, "finest level has no children");
-        debug_assert!(quadrant < 4, "quadrant is a 2-bit index");
         SectionPos {
             detail: self.detail - 1,
-            x: self.x * 2 + (quadrant & 1) as i32,
-            z: self.z * 2 + (quadrant >> 1) as i32,
+            x: self.x * 2 + quadrant.dx(),
+            z: self.z * 2 + quadrant.dz(),
         }
     }
 
-    /// Which quadrant of its parent this section occupies (inverse of the child map).
-    pub fn quadrant(self) -> u8 {
-        (self.x.rem_euclid(2) | (self.z.rem_euclid(2) << 1)) as u8
+    /// Which quadrant of its parent this section occupies.
+    pub fn quadrant(self) -> Quadrant {
+        Quadrant::of_coords(self.x, self.z)
     }
 }
 
-// ---------------------------------------------------------------------------
-// LodRun — bit-packed datapoint.
-// ---------------------------------------------------------------------------
+// LodRun: bit-packed datapoint.
 
 const ID_SHIFT: u64 = 0;
 const HEIGHT_SHIFT: u64 = 16;
@@ -133,22 +147,20 @@ const ID_MASK: u64 = (1 << 16) - 1;
 const HEIGHT_MASK: u64 = (1 << 12) - 1;
 const SKYLIGHT_MASK: u64 = (1 << 4) - 1;
 
-/// The largest height a single run can encode (12 bits) — comfortably above
-/// [`DOMAIN_H`], so a full-domain uniform column is one run.
+/// Largest height a single run can encode (12 bits).
 pub(in crate::world) const MAX_RUN_HEIGHT: u16 = HEIGHT_MASK as u16;
-/// Fully-lit skylight nibble.
+/// Fully-lit skylight (4 bits, max value).
 pub(in crate::world) const FULL_SKYLIGHT: u8 = SKYLIGHT_MASK as u8;
 
-/// One vertical run: a section-palette `id` (u16), a `height` in metres (u12), and a
-/// baked `skylight` nibble (u4). The top 32 bits are reserved for block-light and
-/// flags. `#[repr(transparent)]` + const mask accessors keep the exact-integer
-/// equality the greedy mesher and run coalescing depend on.
+/// One vertical run: palette id (u16), height in metres (u12), skylight (u4).
+/// Top 32 bits reserved for block-light and flags. repr(transparent) + const
+/// accessors preserve exact-integer equality for mesher and coalescing.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::world) struct LodRun(u64);
 
 impl LodRun {
-    /// Pack a run. `height` must be a non-empty `u12`; `skylight` a `u4`.
+    /// Pack a run. Height and skylight are validated by debug_assert.
     pub const fn new(id: u16, height: u16, skylight: u8) -> Self {
         debug_assert!(height >= 1, "an empty run is not representable");
         debug_assert!(height as u64 <= HEIGHT_MASK, "run height overflows 12 bits");
@@ -160,38 +172,33 @@ impl LodRun {
         )
     }
 
-    /// Palette index of this run's block.
     pub const fn id(self) -> u16 {
         ((self.0 >> ID_SHIFT) & ID_MASK) as u16
     }
 
-    /// Run thickness in metres.
     pub const fn height(self) -> u16 {
         ((self.0 >> HEIGHT_SHIFT) & HEIGHT_MASK) as u16
     }
 
-    /// Baked skylight nibble (0..=15).
     pub const fn skylight(self) -> u8 {
         ((self.0 >> SKYLIGHT_SHIFT) & SKYLIGHT_MASK) as u8
     }
 }
 
-// ---------------------------------------------------------------------------
-// Palette — per-section id-map.
-// ---------------------------------------------------------------------------
+// Palette: per-section id-map.
 
-/// A section's `id → BlockId` map. Runs store the small dense index; the real block
-/// id is looked up here, so a section pays one palette instead of a `BlockId` per run.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+/// Per-section id to BlockId map. Runs store dense indices; real block ids
+/// are looked up here, so a section stores one palette instead of BlockId per run.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(in crate::world) struct Palette(Vec<BlockId>);
 
 impl Palette {
+    /// Palette id 0 is reserved for AIR. Skylight and empty columns always use a fixed id.
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self(vec![AIR])
     }
 
-    /// The index for `b`, inserting it if new. Linear scan — a section palette is
-    /// tiny (a handful of block types), so a map would cost more than it saves.
+    /// Index for b, inserting if new. Linear scan: palettes are tiny (few block types).
     pub fn intern(&mut self, b: BlockId) -> u16 {
         match self.0.iter().position(|&x| x == b) {
             Some(i) => i as u16,
@@ -212,14 +219,10 @@ impl Palette {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LodColumn — a top-down run stack over the fixed domain.
-// ---------------------------------------------------------------------------
+// LodColumn: top-down run stack over the fixed domain.
 
-/// A single column's runs, ordered top-down (index 0 is the topmost run, whose top
-/// is [`LOD_CEIL_Y`]). Contiguous, non-overlapping, tiling `[LOD_FLOOR_Y,
-/// LOD_CEIL_Y)`: `sum(run.height) == DOMAIN_H`. Terrain is ~1–4 runs, so a plain
-/// `Vec` is the whole storage.
+/// A column's runs, top-down (index 0 is the topmost). Contiguous, non-overlapping,
+/// tiling the domain exactly. Typical terrain has 1-4 runs; stored as a Vec.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(in crate::world) struct LodColumn {
     runs: Vec<LodRun>,
@@ -237,9 +240,8 @@ impl LodColumn {
         &self.runs
     }
 
-    /// The canonical-form invariant: non-empty, every run tall, the heights tile the
-    /// domain exactly, and no two adjacent runs share `(id, skylight)` (else they
-    /// would have been coalesced — a merge-rate and equality hazard downstream).
+    /// Canonical-form invariant: non-empty, heights tile domain exactly,
+    /// no adjacent runs share (id, skylight) — they would have been coalesced.
     fn validate(&self) {
         debug_assert!(!self.runs.is_empty(), "a column has at least one run");
         let mut sum: i64 = 0;
@@ -268,12 +270,10 @@ impl LodColumn {
             }
             top = bottom;
         }
-        // y outside the domain: clamp to the nearest end run.
         if y >= LOD_CEIL_Y { self.runs[0] } else { *self.runs.last().unwrap() }
     }
 
-    /// The topmost non-air run's top-Y and block, or `None` for an all-air column.
-    /// The exposed-surface probe the parity tests key on.
+    /// Topmost solid run's top-Y and block, or None for all-air columns.
     pub fn topmost_solid(&self, palette: &Palette) -> Option<(i32, BlockId)> {
         let mut top = LOD_CEIL_Y;
         for &run in &self.runs {
@@ -286,9 +286,8 @@ impl LodColumn {
         None
     }
 
-    /// Expand back to one [`BlockId`] per `cell`-tall slice, bottom-up. Only valid
-    /// when every run height is a whole number of cells (true for extracted finest
-    /// columns) — the inverse of the RLE, used by the parity tests.
+    /// Expand runs back to one BlockId per cell-tall slice, bottom-up.
+    /// Valid only when run heights are whole cell multiples (true for extracted finest columns).
     pub fn cell_ids(&self, palette: &Palette, cell: i32) -> Vec<BlockId> {
         let mut out = Vec::with_capacity((DOMAIN_H / cell) as usize);
         for &run in self.runs.iter().rev() {
@@ -302,11 +301,9 @@ impl LodColumn {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Section — N×N columns at one detail level.
-// ---------------------------------------------------------------------------
+// Section: N×N columns at one detail level.
 
-/// An `N×N` grid of [`LodColumn`]s at one detail level, with its own [`Palette`].
+/// N×N grid of LodColumns at one detail level, with a per-section Palette.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(in crate::world) struct Section {
     pos: SectionPos,
@@ -323,22 +320,13 @@ impl Section {
         &self.palette
     }
 
-    /// The column at grid `(ix, iz)`, both in `0..N`.
     pub fn column(&self, ix: usize, iz: usize) -> &LodColumn {
         debug_assert!(ix < SECTION_N && iz < SECTION_N);
         &self.cols[ix + iz * SECTION_N]
     }
 
-    /// Extract a finest-level section directly from the generator, replaying the
-    /// player edit overlay onto the coarse cells (`edits` is the tile-shaped
-    /// `GenerateColumn` overlay — see `World::edits_for_tile`).
-    ///
-    /// Each column is sampled once over the full domain through the generator's own
-    /// `lod_column` contract (caves excluded, profile cached per column inside the
-    /// generator), then RLE-compacted. Skylight is baked per cell from the column's
-    /// surface height. See the module deviation note: band-skipping the deep ground /
-    /// high air is a runtime-cost optimisation deferred until the extractor is wired
-    /// to a generator that exposes `water_level` / island bounds — the trait does not.
+    /// Extract finest-level section from the generator, applying player edits.
+    /// Each column is sampled once, then RLE-compacted. Skylight is baked from surface height.
     pub fn extract<G: TerrainGenerator>(
         pos: SectionPos,
         r#gen: &G,
@@ -348,7 +336,6 @@ impl Section {
         debug_assert_eq!(DOMAIN_H % cell, 0, "cell size must divide the domain");
         let n = (DOMAIN_H / cell) as usize;
         let half = cell / 2;
-        // Cell-centre world-Y for each slice, bottom-up; cy-invariant across columns.
         let ys: Vec<i32> = (0..n).map(|j| LOD_FLOOR_Y + j as i32 * cell + half).collect();
         let flat = flatten_edits(edits);
 
@@ -368,25 +355,23 @@ impl Section {
         Section { pos, palette, cols: cols.into_boxed_slice() }
     }
 
-    /// Merge four finest-or-equal children (indexed by [`SectionPos::quadrant`]) into
-    /// their coarser parent. Each parent column is the `4→1` vote of its `2×2` block
-    /// of child columns (air never wins a tie, skylight by mean) — the generator is
-    /// not touched.
+    /// Merge four children into their coarser parent via 4-to-1 voting.
+    /// Each parent column votes on its 2x2 child block (air loses ties, skylight by winners' mean).
     pub fn downsample(children: [Section; 4]) -> Section {
         let parent_pos = children[0].pos.parent();
         for (q, child) in children.iter().enumerate() {
-            debug_assert_eq!(child.pos, parent_pos.child(q as u8), "child {q} misplaced");
+            debug_assert_eq!(child.pos, parent_pos.child(Quadrant::new(q as u8)), "child {q} misplaced");
         }
 
         let mut palette = Palette::new();
         let mut cols: Vec<LodColumn> = Vec::with_capacity(SECTION_N * SECTION_N);
         for pz in 0..SECTION_N {
             for px in 0..SECTION_N {
-                // The 2×2 child columns under this parent column. Each lands in one
-                // child section (a consecutive index pair never straddles the N split).
+                // Gather the 2x2 child columns under this parent position.
                 let sources: [(&LodColumn, &Palette); 4] = std::array::from_fn(|q| {
-                    let gx = 2 * px + (q & 1);
-                    let gz = 2 * pz + (q >> 1);
+                    let qd = Quadrant::new(q as u8);
+                    let gx = 2 * px + qd.dx() as usize;
+                    let gz = 2 * pz + qd.dz() as usize;
                     let sect = &children[(gx / SECTION_N) + (gz / SECTION_N) * 2];
                     (sect.column(gx % SECTION_N, gz % SECTION_N), &sect.palette)
                 });
@@ -397,12 +382,9 @@ impl Section {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Extraction helpers.
-// ---------------------------------------------------------------------------
+// Extraction and downsample helpers.
 
-/// Flatten a tile-shaped overlay (per-chunk flat-index cells) to absolute world
-/// voxels — the shape the coarse-cell reducer scans. Mirrors `lod::flatten_edits`.
+/// Flatten tile edits (per-chunk flat indices) to absolute world coordinates.
 fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32, i32, BlockId)> {
     let mut out = Vec::new();
     for (coord, cells) in edits {
@@ -414,11 +396,8 @@ fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32
     out
 }
 
-/// Replay edits onto one column's coarse cells, preserving the conservative
-/// semantics of `lod::reduce_edits_into_column` exactly: within a cell's footprint the
-/// latest SOLID edit overwrites the cell; an AIR edit clears it only when it covers
-/// the cell's exact sample point (air never wins a vote it did not earn). `LOD_FLOOR_Y`
-/// plays the role of the tile's `oy`; cells are indexed directly (no padding).
+/// Apply edits to one column's coarse cells: solid edits overwrite the cell,
+/// air edits only clear at the cell's exact center sample point.
 fn apply_edits(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
     if flat.is_empty() {
         return;
@@ -443,8 +422,7 @@ fn apply_edits(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32
     }
 }
 
-/// RLE a bottom-up cell array (with its cell-centre Ys and column surface height)
-/// into a validated top-down [`LodColumn`], baking skylight per cell.
+/// RLE a cell array into a top-down LodColumn, baking skylight per cell.
 fn rle_column(cells: &[BlockId], ys: &[i32], height: i32, cell: i32, palette: &mut Palette) -> LodColumn {
     let sky = |y: i32| if y >= height { FULL_SKYLIGHT } else { 0 };
     let mut runs: Vec<LodRun> = Vec::new();
@@ -460,19 +438,21 @@ fn rle_column(cells: &[BlockId], ys: &[i32], height: i32, cell: i32, palette: &m
         j = k;
     }
     runs.reverse(); // built bottom-up; a column is stored top-down
+    // Ceiling-window law at the source (see downsample_column): ceiling air is lit.
+    debug_assert!(
+        runs.first().is_none_or(|r| palette.get(r.id()) != AIR || r.skylight() == FULL_SKYLIGHT),
+        "bake produced unlit ceiling air (height/lod_column disagree above the domain)"
+    );
     LodColumn::from_top_down(runs)
 }
 
-// ---------------------------------------------------------------------------
 // Downsample helpers.
-// ---------------------------------------------------------------------------
 
-/// Merge four child columns into one parent column: sweep the sorted union of their
-/// Y-transitions, vote each slice (air never wins a tie unless all four are air;
-/// skylight by mean), then coalesce adjacent identical runs. Order-independent, hence
-/// deterministic regardless of quadrant arrangement.
+/// Merge four child columns into one parent column via voting.
+/// Sweeps Y-transitions, votes each slice (air loses ties, skylight by winners' mean),
+/// then coalesces adjacent identical runs. Order-independent for determinism.
 fn downsample_column(children: [(&LodColumn, &Palette); 4], out_palette: &mut Palette) -> LodColumn {
-    // Every run boundary across the four stacks, descending from ceil to floor.
+    // Collect all Y-transitions from the four stacks.
     let mut bounds: Vec<i32> = Vec::with_capacity(16);
     for (col, _) in children {
         let mut top = LOD_CEIL_Y;
@@ -485,27 +465,30 @@ fn downsample_column(children: [(&LodColumn, &Palette); 4], out_palette: &mut Pa
     bounds.sort_unstable_by(|a, b| b.cmp(a));
     bounds.dedup();
 
-    // One vote per maximal slice, coalescing on (block, skylight) as we go (compare
-    // real BlockIds — child palettes differ — then intern into the parent).
+    // Vote each maximal slice and coalesce adjacent identical runs into the parent.
     let mut merged: Vec<(BlockId, i32, u8)> = Vec::new();
     for w in bounds.windows(2) {
         let (hi, lo) = (w[0], w[1]);
         let mid = lo + (hi - lo) / 2;
         let mut ids = [AIR; 4];
-        let mut sky_sum = 0u32;
+        let mut skys = [0u8; 4];
         for (i, (col, pal)) in children.iter().enumerate() {
             let run = col.at(mid);
             ids[i] = pal.get(run.id());
-            sky_sum += run.skylight() as u32;
+            skys[i] = run.skylight();
         }
-        let block = mode_air_loses(ids);
-        let light = ((sky_sum + 2) / 4) as u8; // arithmetic mean, rounded
+        let (block, light) = vote_slice(ids, skys);
         match merged.last_mut() {
             Some(last) if last.0 == block && last.2 == light => last.1 += hi - lo,
             _ => merged.push((block, hi - lo, light)),
         }
     }
 
+    // Ceiling-window law: air at the domain ceiling must stay fully lit; preserve during merge.
+    debug_assert!(
+        merged.first().is_none_or(|&(b, _, l)| b != AIR || l == FULL_SKYLIGHT),
+        "downsample produced unlit ceiling air"
+    );
     let runs = merged
         .into_iter()
         .map(|(block, h, light)| LodRun::new(out_palette.intern(block), h as u16, light))
@@ -513,9 +496,21 @@ fn downsample_column(children: [(&LodColumn, &Palette); 4], out_palette: &mut Pa
     LodColumn::from_top_down(runs)
 }
 
-/// Mode of four blocks with the conservative bias: air only wins when it has a strict
-/// plurality (never a tie); ties among solids break to the smallest [`BlockId`] for
-/// determinism. Keeps hollow structures from opening holes as detail drops.
+/// Vote one slice: block by mode_air_loses, skylight by mean of winning block's values only.
+fn vote_slice(ids: [BlockId; 4], skys: [u8; 4]) -> (BlockId, u8) {
+    let block = mode_air_loses(ids);
+    let (mut sum, mut n) = (0u32, 0u32);
+    for i in 0..4 {
+        if ids[i] == block {
+            sum += skys[i] as u32;
+            n += 1;
+        }
+    }
+    (block, ((sum + n / 2) / n) as u8)
+}
+
+/// Mode of four blocks: air only wins with strict plurality (never ties).
+/// Solid ties break to smallest BlockId for determinism.
 fn mode_air_loses(ids: [BlockId; 4]) -> BlockId {
     if ids.iter().all(|&b| b == AIR) {
         return AIR;
@@ -543,10 +538,7 @@ mod tests {
 
     // -- fixtures ----------------------------------------------------------
 
-    /// A generator scripted by two closures: `h` gives the surface height (drives
-    /// skylight), `b` gives the un-decorated block at a world cell (drives the
-    /// silhouette). Extraction only consumes `height` + `lod_column` (which defaults
-    /// to looping `lod_block_at`), so these two fully determine every column class.
+    /// Test generator: h = surface height, b = block at cell. These two closures fully determine every column.
     struct FnGen<H, B> {
         h: H,
         b: B,
@@ -597,8 +589,7 @@ mod tests {
     const CELL: i32 = 1 << FINEST_DETAIL;
     const NCELLS: usize = (DOMAIN_H / CELL) as usize;
 
-    /// A ground/surface/air column with an optional water table and an optional solid
-    /// shelf `[shelf.0, shelf.1)` above the surface — realises every terrain class.
+    /// Test generator: ground + surface + air, with optional water table and solid shelf.
     fn terrain_gen(
         b: &Blocks,
         h: i32,
@@ -631,8 +622,7 @@ mod tests {
 
     // -- reference (independent of the code under test) --------------------
 
-    /// The coarse-cell sample sweep `lod::sample_coarse` performs per column, done
-    /// straight from the generator contract — the parity oracle.
+    /// Reference: coarse-cell sweep per column from generator contract (parity oracle).
     fn reference_cells<G: TerrainGenerator>(r#gen: &G, wx: i32, wz: i32, cell: i32) -> Vec<BlockId> {
         let half = cell / 2;
         let ys: Vec<i32> = (0..DOMAIN_H / cell).map(|j| LOD_FLOOR_Y + j * cell + half).collect();
@@ -641,8 +631,7 @@ mod tests {
         out
     }
 
-    /// `lod::reduce_edits_into_column` re-derived independently, against which the
-    /// module's `apply_edits` is checked (the coord.rs testing idiom).
+    /// Reference implementation of apply_edits for testing.
     fn reference_reduce(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
         let half = cell / 2;
         for &(ewx, ewy, ewz, id) in flat {
@@ -661,15 +650,15 @@ mod tests {
         }
     }
 
-    // -- SectionPos / LodRun packing --------------------------------------
+    // SectionPos / LodRun packing tests.
 
     #[test]
     fn child_parent_is_an_involution_across_the_sign_boundary() {
         for &(x, z) in &[(0, 0), (1, 1), (-1, -1), (-1, 0), (5, -7), (-4, 3), (i32::MIN / 4, 9)] {
             let p = SectionPos { detail: 5, x, z };
-            for q in 0..4u8 {
+            for q in Quadrant::ALL {
                 let c = p.child(q);
-                assert_eq!(c.parent(), p, "child({q}).parent() != self at {x},{z}");
+                assert_eq!(c.parent(), p, "child({q:?}).parent() != self at {x},{z}");
                 assert_eq!(c.quadrant(), q, "quadrant disagrees with child index");
                 assert_eq!(c.detail, 4);
             }
@@ -678,7 +667,7 @@ mod tests {
 
     #[test]
     fn parent_uses_floor_division_not_toward_zero() {
-        // The classic bug: -1 >> 1 must be -1 (floor), not 0 (toward zero).
+        // Ensure -1 divides to -1 (floor), not 0 (toward zero).
         let p = SectionPos { detail: 2, x: -1, z: -3 };
         assert_eq!(p.parent(), SectionPos { detail: 3, x: -1, z: -2 });
     }
@@ -691,7 +680,7 @@ mod tests {
         }
     }
 
-    // -- extraction: column classes ---------------------------------------
+    // Extraction: column classes tests.
 
     /// Every terrain class extracts to a canonical, domain-tiling column whose cells
     /// and exposed surface match the generator's own coarse sweep.
@@ -743,14 +732,13 @@ mod tests {
         }
     }
 
-    // -- extraction: edits -------------------------------------------------
+    // Extraction: edits tests.
 
     #[test]
     fn edit_reduction_matches_the_reference_reducer() {
         let b = blocks();
         let r#gen = terrain_gen(&b, 100, 0, None);
-        // A solid placement above the surface, and an AIR dig — one on a sample point
-        // (clears), one off it (ignored), exercising both branches.
+        // Solid placement above surface (overwrites), air digs on/off sample point.
         let cell = CELL;
         let (fx, fz) = (FINEST.min_x(), FINEST.min_z());
         let (half, j) = (cell / 2, 20i32);
@@ -773,7 +761,7 @@ mod tests {
         assert_eq!(got[5], b.air, "air edit on the sample point cleared the cell");
     }
 
-    /// Pack world-voxel edits into the tile-shaped overlay `extract` consumes.
+    /// Convert world edits to chunk-overlay format for extraction.
     fn overlay_from_world(edits: &[(i32, i32, i32, BlockId)]) -> Vec<(ChunkCoord, Vec<(usize, BlockId)>)> {
         use crate::coord::BlockCoord;
         let mut map: std::collections::HashMap<ChunkCoord, Vec<(usize, BlockId)>> = Default::default();
@@ -784,7 +772,7 @@ mod tests {
         map.into_iter().collect()
     }
 
-    // -- determinism -------------------------------------------------------
+    // Determinism tests.
 
     #[test]
     fn extraction_is_deterministic() {
@@ -798,13 +786,13 @@ mod tests {
     fn downsample_is_deterministic() {
         let r#gen = sine(0x1234);
         let parent = SectionPos { detail: FINEST_DETAIL + 1, x: 0, z: 0 };
-        let kids = || std::array::from_fn(|q| Section::extract(parent.child(q as u8), &r#gen, &[]));
+        let kids = || std::array::from_fn(|q| Section::extract(parent.child(Quadrant::new(q as u8)), &r#gen, &[]));
         assert_eq!(Section::downsample(kids()), Section::downsample(kids()));
     }
 
     // -- downsample reducers ----------------------------------------------
 
-    /// Build a hand-specified column from bottom-up `(block, height)` slices.
+    /// Build a test column from (block, height) slices, bottom-up.
     fn column_of(pal: &mut Palette, slices: &[(BlockId, i32)]) -> LodColumn {
         let mut runs: Vec<LodRun> = slices
             .iter()
@@ -818,7 +806,7 @@ mod tests {
     fn air_never_wins_a_two_two_tie() {
         let b = blocks();
         let mut pal = Palette::new();
-        // Two solid children, two all-air children, over a band at the same Y.
+        // Two solid children, two all-air children.
         let solid = column_of(&mut pal, &[(b.stone, 200), (b.air, DOMAIN_H - 200)]);
         let air = column_of(&mut pal, &[(b.air, DOMAIN_H)]);
         let mut out = Palette::new();
@@ -826,7 +814,7 @@ mod tests {
             [(&solid, &pal), (&solid, &pal), (&air, &pal), (&air, &pal)],
             &mut out,
         );
-        // The bottom 200 m stays solid despite the 2/2 split.
+        // Solid survives the 2/2 tie.
         assert_eq!(out.get(parent.at(100).id()), b.stone, "solid survives the tie");
         assert_eq!(out.get(parent.at(400).id()), b.air, "the all-air band above stays air");
     }
@@ -834,21 +822,21 @@ mod tests {
     #[test]
     fn mode_prefers_a_strict_plurality_and_averages_light() {
         let b = blocks();
-        // 3 air / 1 stone: air legitimately wins (not a tie).
+        // 3 air / 1 stone: air wins.
         assert_eq!(mode_air_loses([b.air, b.air, b.air, b.stone]), b.air);
-        // 2 stone / 2 dirt: solids tie, smallest id wins deterministically.
+        // 2 stone / 2 dirt: solids tie, smallest id wins.
         let lo = if b.stone.0 < b.dirt.0 { b.stone } else { b.dirt };
         assert_eq!(mode_air_loses([b.stone, b.stone, b.dirt, b.dirt]), lo);
-        // Skylight mean rounds: (15+15+0+0+2)/4 = 8.
+        // Skylight averages winners only; buried winner keeps its dark value.
         let mut pal = Palette::new();
         let lit = column_of(&mut pal, &[(b.air, DOMAIN_H)]);
         let dark = column_of(&mut pal, &[(b.stone, DOMAIN_H)]);
         let mut out = Palette::new();
         let parent = downsample_column([(&lit, &pal), (&lit, &pal), (&dark, &pal), (&dark, &pal)], &mut out);
-        assert_eq!(parent.at(256).skylight(), 8, "mean of 15,15,0,0 rounds to 8");
+        assert_eq!(parent.at(256).skylight(), 0, "buried winner keeps its own light");
     }
 
-    // -- parity + island survival on the real generator -------------------
+    // Parity and island survival on real generator.
 
     #[test]
     fn exposed_surface_matches_sample_coarse_on_sinehills() {
@@ -866,15 +854,13 @@ mod tests {
 
     #[test]
     fn islands_survive_two_merges() {
-        // A section positioned so its columns sit under the island band, at a seed
-        // whose islands are large enough to hold a 2/4 majority through two merges.
         let seed = island_bearing_seed();
         let r#gen = sine(seed);
         let grand = SectionPos { detail: FINEST_DETAIL + 2, x: 0, z: 0 };
-        // Build the 4×4 finest grid, merge to 2×2, merge to 1.
+        // Build 4x4 finest, merge to 2x2, merge to 1.
         let level1: [Section; 4] = std::array::from_fn(|q| {
-            let mid = grand.child(q as u8);
-            Section::downsample(std::array::from_fn(|r| Section::extract(mid.child(r as u8), &r#gen, &[])))
+            let mid = grand.child(Quadrant::new(q as u8));
+            Section::downsample(std::array::from_fn(|r| Section::extract(mid.child(Quadrant::new(r as u8)), &r#gen, &[])))
         });
         let top = Section::downsample(level1);
         assert!(
@@ -883,7 +869,7 @@ mod tests {
         );
     }
 
-    /// Whether any column of `sec` still carries a solid run high in the island band.
+    /// Check if any column has a solid run in the island band.
     fn has_island_block(sec: &Section) -> bool {
         (0..SECTION_N).any(|iz| {
             (0..SECTION_N).any(|ix| {
@@ -902,8 +888,7 @@ mod tests {
         })
     }
 
-    /// A seed whose finest extraction actually contains island geometry, so the
-    /// survival assertion tests merging rather than an empty sky.
+    /// Find a seed with island geometry in finest extraction.
     fn island_bearing_seed() -> i64 {
         for seed in 0i64..64 {
             let r#gen = sine(seed);

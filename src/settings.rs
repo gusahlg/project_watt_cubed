@@ -93,6 +93,7 @@ pub struct Settings {
     /// `lighting` (toggling remeshes the world). Off also merges more quads,
     /// so it doubles as a perf lever.
     pub ao: bool,
+    pub vignette: bool,
 }
 
 impl Default for Settings {
@@ -128,6 +129,7 @@ impl Default for Settings {
             vrs: true,
             water_anim: true,
             ao: true,
+            vignette: false,
         }
     }
 }
@@ -283,7 +285,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 27] = [
+pub const SETTINGS: [Setting; 28] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -566,6 +568,7 @@ pub const SETTINGS: [Setting; 27] = [
     video_toggle!(vrs, "vrs", "Variable-Rate Shading"),
     video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
+    video_toggle!(vignette, "vignette", "Vignette"),
 ];
 
 /// The Back action sits just past the settings rows — derived, never hand-numbered.
@@ -662,6 +665,7 @@ impl Settings {
             sky: self.sky,
             vrs: self.vrs,
             water_anim: self.water_anim,
+            vignette: self.vignette,
         }
     }
 }
@@ -841,6 +845,8 @@ mod tests {
             shake: 5.0,
             lighting: true,
             cull_faces: false,
+            // Render lanes aren't under test here; take them as-shipped so adding a
+            // lane can't break this clamp test.
             ..Settings::default()
         };
         s.clamp();
@@ -927,7 +933,8 @@ mod tests {
             shake: 0.5,
             lighting: false,
             // Not persisted (env-only); must stay at the default so the composed
-            // roundtrip below — which never writes it — still lands `samples`.
+            // roundtrip below — which never writes it — still lands `samples`. The
+            // render lanes likewise stay at their persisted defaults via the spread.
             cull_faces: false,
             // Fields added since this fixture was written: defaults roundtrip
             // trivially, so the spread above stays the interesting part.

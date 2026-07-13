@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn names_are_capped_and_sanitised() {
-        assert_eq!(clean_name("  bob\n "), "bob");
+        assert_eq!(clean_name("  guahlg\n "), "guahlg");
         assert_eq!(clean_name(""), "player");
         assert_eq!(clean_name(&"x".repeat(100)).len(), MAX_NAME);
     }
@@ -965,50 +965,50 @@ mod tests {
 
         let handle = spawn(0, Config { password: String::new(), seed: 4242 }).unwrap();
         let port = handle.addr().port();
-        let mut a = Connection::connect("127.0.0.1", port, "alice", "").unwrap();
-        let mut b = Connection::connect("127.0.0.1", port, "bob", "").unwrap();
+        let mut a = Connection::connect("127.0.0.1", port, "walnutty", "").unwrap();
+        let mut b = Connection::connect("127.0.0.1", port, "guahlg", "").unwrap();
 
         let settle = Duration::from_millis(150);
         thread::sleep(settle);
         a.poll();
         b.poll();
-        assert_eq!(b.peers().count(), 1, "bob should see alice");
+        assert_eq!(b.peers().count(), 1, "guahlg should see walnutty");
 
-        // Alice teleports many buckets away. Bob (still at spawn) is far outside
+        // Walnutty teleports many buckets away. guahlg (still at spawn) is far outside
         // her interest radius, so his view of her must not update.
         let far = DVec3::new(4000.0, 30.0, 4000.0);
         a.send_move(far, 0.0, 0.0, Stance::Standing);
         thread::sleep(settle);
         b.poll();
-        let alice_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
+        let walnutty_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos.0;
         assert!(
-            alice_as_seen.x < 100.0,
-            "bob must not hear a move from {} units away (saw x={})",
+            walnutty_as_seen.x < 100.0,
+            "guahlg must not hear a move from {} units away (saw x={})",
             far.x,
-            alice_as_seen.x
+            walnutty_as_seen.x
         );
 
-        // Bob moves right next to alice: she is within range of his new position,
+        // guahlg moves right next to walnutty: she is within range of his new position,
         // so she hears it — which requires her grid entry to have followed her.
         b.send_move(DVec3::new(4004.0, 30.0, 4004.0), 0.0, 0.0, Stance::Standing);
         thread::sleep(settle);
         a.poll();
-        let bob_as_seen = a.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
+        let guahlg_as_seen = a.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos.0;
         assert!(
-            bob_as_seen.x > 3900.0,
-            "alice should hear bob once adjacent (saw x={})",
-            bob_as_seen.x
+            guahlg_as_seen.x > 3900.0,
+            "walnutty should hear guahlg once adjacent (saw x={})",
+            guahlg_as_seen.x
         );
 
-        // And the reverse direction: bob's entry followed him too.
+        // And the reverse direction: guahlg's entry followed him too.
         a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0, Stance::Standing);
         thread::sleep(settle);
         b.poll();
-        let alice_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos;
+        let walnutty_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos.0;
         assert!(
-            alice_as_seen.x > 3900.0,
-            "bob should hear alice once adjacent (saw x={})",
-            alice_as_seen.x
+            walnutty_as_seen.x > 3900.0,
+            "guahlg should hear walnutty once adjacent (saw x={})",
+            walnutty_as_seen.x
         );
 
         handle.stop();

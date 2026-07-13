@@ -1,28 +1,19 @@
-//! A minimal six-box humanoid for remote players. The rig is described once as a
-//! `const` table in body-local space (origin = feet, +Y up, -Z forward); `Pose`
-//! resolves it into world-space boxes given facing, look, and gait, and draws them
-//! with the engine's oriented, face-shaded [`Frame3D::draw_box`].
-//!
-//! The design keeps all animation in the type: each part carries a [`Swing`] rule,
-//! so `resolve` is a single loop with no per-part name matching.
+//! Six-box humanoid for remote players. Animation lives in the type (each part
+//! carries a [`Swing`] rule), so resolution is a single loop with no per-part
+//! name matching.
 use voxel_engine::{Color, Frame3D, Mat3, Vec3};
 
 use crate::presence::{RenderPose, RigParams, wrap_pi};
 
-/// How a part responds to motion.
 enum Swing {
-    /// Faces the body only (torso).
     None,
-    /// Tracks look yaw/pitch; body yaw lags via animator.
+    /// Head tracks yaw/pitch separately from body.
     Look,
-    /// Swings about its pivot; `phase_offset` puts limbs in antiphase.
-    /// `action_arm` marks the arm that responds to interact.
+    /// Limbs swing with gait phase; phase_offset staggers left/right; action_arm responds to input.
     Limb { phase_offset: f32, action_arm: bool },
 }
 
-/// One rigid box in body-local space. `pivot` is where it rotates; `rest` is the
-/// box centre at rest; `tint` darkens limbs vs. head/torso so the player colour
-/// still identifies them.
+/// tint: darkens limbs vs head/torso so player colour still identifies the avatar.
 struct Part {
     pivot: Vec3,
     rest: Vec3,
@@ -34,7 +25,7 @@ struct Part {
 use std::f32::consts::PI;
 
 const RIG: [Part; 6] = [
-    // Head — tracks look pitch, pivots at the neck.
+    // Head.
     Part {
         pivot: Vec3::new(0.0, 1.5, 0.0),
         rest: Vec3::new(0.0, 1.7, 0.0),
@@ -42,7 +33,7 @@ const RIG: [Part; 6] = [
         tint: 1.0,
         swing: Swing::Look,
     },
-    // Torso — faces only.
+    // Torso.
     Part {
         pivot: Vec3::new(0.0, 1.15, 0.0),
         rest: Vec3::new(0.0, 1.15, 0.0),
@@ -84,8 +75,6 @@ const RIG: [Part; 6] = [
     },
 ];
 
-/// Fully-resolved, ready to draw: world-space centre + rotation per part, plus
-/// the feet position so the contact shadow anchors to the model.
 pub struct Pose {
     feet: Vec3,
     parts: [(Vec3, Mat3); 6],
@@ -94,7 +83,7 @@ pub struct Pose {
 /// Half-width of the contact-shadow blob, and its darkness (alpha over terrain).
 const SHADOW_RADIUS: f32 = 0.4 * SCALE;
 const SHADOW_COLOR: Color = Color::new(0, 0, 0, 90);
-/// Nudge the shadow just above the feet plane so it doesn't z-fight the ground.
+/// Lifts shadow above feet plane to avoid z-fighting.
 const SHADOW_LIFT: f32 = 0.02;
 
 /// Metres → world units for the rig: the whole model is authored in metres
@@ -106,23 +95,15 @@ impl Pose {
     /// Head-top height above the feet, so name tags anchor to the model.
     pub const HEAD_TOP: f32 = 1.9 * SCALE;
 
-    /// Resolve rig: body faces body_yaw, head tracks yaw/pitch,
-    /// stance compresses/tips, gait/action drive limbs.
     pub fn resolve(pose: &RenderPose, rig: &RigParams) -> Self {
-        /// Rig tips toward -Z (forward) at full swim blend.
+        /// Tips body forward in prone stance.
         const PRONE_ANGLE: f32 = -1.3;
-        /// Action-arm amplitude multiplier.
         const ACTION_AMP: f32 = 1.6;
-        /// Prone rotation pivot (body-local hip height).
         const HIP: Vec3 = Vec3::new(0.0, 0.9, 0.0);
 
-        // World yaw and glam's rotation sense are mirrored about Y (player
-        // yaw turns +X toward +Z; `from_rotation_y` turns +X toward −Z), so
-        // yaw enters the rig negated — the ONE place the mapping lives,
-        // covering the body and the head offset together.
-        let body_rot = Mat3::from_rotation_y(-rig.body_yaw);
+        // Negate yaw to flip rotation sense; -pi/2 offset aligns body-local -Z forward with world +X.
+        let body_rot = Mat3::from_rotation_y(-rig.body_yaw - PI / 2.0);
         let head_yaw = Mat3::from_rotation_y(-wrap_pi(pose.yaw - rig.body_yaw));
-        // Stance height blend factor.
         let h = 1.0 + (pose.stance.height_scale() - 1.0) * rig.stance_blend;
         let squash = |v: Vec3| Vec3::new(v.x, v.y * h, v.z);
         let prone_rot = if pose.stance.prone() {
@@ -147,7 +128,6 @@ impl Pose {
             };
             let pivot = squash(part.pivot);
             let local = pivot + swing_rot * (squash(part.rest) - pivot);
-            // Prone stance rotation about hip.
             let hip = squash(HIP);
             let local = hip + prone_rot * (local - hip);
             parts[i] = (pose.feet + body_rot * (local * SCALE), body_rot * prone_rot * swing_rot);
@@ -165,7 +145,6 @@ impl Pose {
     }
 }
 
-/// Scale a colour's RGB toward black by `factor`, leaving alpha untouched.
 fn tint(color: Color, factor: f32) -> Color {
     let s = |v: u8| (v as f32 * factor).round().clamp(0.0, 255.0) as u8;
     Color::new(s(color.r), s(color.g), s(color.b), color.a)
