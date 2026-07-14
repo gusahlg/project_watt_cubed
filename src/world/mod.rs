@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, Frame3D, MeshHandle, Vec3};
+use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
@@ -307,10 +307,10 @@ impl ChunkMeshes {
     }
     /// Draw each present pass with cross-fade and far-material styling.
     /// `(1.0, 0, 0)` is identical to [`draw`](Self::draw).
-    fn draw_faded(&self, f: &mut Frame3D, offset: Vec3, detail: Detail, fade: f32, mode: u32, flat_rgba: u32) {
+    fn draw_faded(&self, f: &mut Frame3D, offset: Vec3, detail: Detail, fade: f32, style: FadeStyle, flat_rgba: u32) {
         for (_, m) in self.0.iter() {
             if let Some(mesh) = m {
-                f.draw_mesh_faded(mesh.id(), offset, detail, fade, mode, flat_rgba);
+                f.draw_mesh_faded(mesh.id(), offset, detail, fade, style, flat_rgba);
             }
         }
     }
@@ -329,10 +329,8 @@ impl ChunkMeshes {
     }
 }
 
-/// Per-draw `mode` bitflags: flat palette-average colour instead of texture,
-/// and fade-the-complement for an outgoing cell.
-const DRAW_FLAT_COLOR: u32 = 1;
-const DRAW_FADE_OUT: u32 = 2;
+// Per-draw style (flat palette-average colour, fade-the-complement) is the
+// typed engine `FadeStyle` now — no raw mode bits.
 /// Detail threshold for flat palette-average colour (far-material optimization).
 /// The outer rings lose per-texel detail to sub-pixel shimmer, so average colour
 /// reduces bandwidth; nearer rings keep texture. Inert until the mip bake lands.
@@ -378,14 +376,14 @@ impl SectionState {
         matches!(self, SectionState::Ready { .. })
     }
     /// Draw the quadrants `mask` selects at `detail`, with cross-fade and far-material
-    /// styling via `fade`/`mode`/`flat_rgba`. `(1.0, 0, 0)` is flat draw.
+    /// styling via `fade`/`style`/`flat_rgba`.
     /// The shader hands the near ground to full-res chunks via coverage dither.
-    fn draw(&self, f: &mut Frame3D, cam: DVec3, mask: QuadrantMask, detail: Detail, fade: f32, mode: u32, flat_rgba: u32) {
+    fn draw(&self, f: &mut Frame3D, cam: DVec3, mask: QuadrantMask, detail: Detail, fade: f32, style: FadeStyle, flat_rgba: u32) {
         if let SectionState::Ready { quadrants } = self {
             for q in mask.iter() {
                 for (wmin, meshes) in &quadrants[q.index()] {
                     let offset = (DVec3::new(wmin[0], wmin[1], wmin[2]) - cam).as_vec3();
-                    meshes.draw_faded(f, offset, detail, fade, mode, flat_rgba);
+                    meshes.draw_faded(f, offset, detail, fade, style, flat_rgba);
                 }
             }
         }
@@ -637,6 +635,11 @@ pub struct World {
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
     dirty_sections: FastSet<SectionPos>,
+    /// The desired section frontier computed ONCE per stream frame and shared
+    /// by unloading, the load lane, and the covering rebuild — the selection
+    /// sweep (grid walk + relief coarsening) used to run up to three times a
+    /// frame for identical inputs.
+    section_desired: Vec<SectionPos>,
     /// Visible sections (covering-resolved) — the desired cut this frame, before the
     /// cross-fade. Feeds `unload_sections` and the fade.
     section_visible: Vec<(SectionPos, QuadrantMask)>,
@@ -718,6 +721,7 @@ impl World {
             section_upload_queue: VecDeque::new(),
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
+            section_desired: Vec::new(),
             section_visible: Vec::new(),
             section_fade: swapfade::SwapFade::default(),
         };
@@ -821,25 +825,25 @@ impl World {
                 }
             }
             if let Some(state) = self.sections.get(&pos) {
-                let (flat_mode, flat_rgba) = self.section_material(pos);
-                let mode = flat_mode | if out { DRAW_FADE_OUT } else { 0 };
-                state.draw(f, cam, mask, Detail::new(pos.detail), fade, mode, flat_rgba);
+                let (flat_color, flat_rgba) = self.section_material(pos);
+                let style = FadeStyle { flat_color, complement: out };
+                state.draw(f, cam, mask, Detail::new(pos.detail), fade, style, flat_rgba);
             }
         }
     }
 
     /// Far-material style: flat palette-average past [`FLAT_DETAIL`] if available,
     /// else textured. Returns `mode` bit and packed sRGB colour.
-    fn section_material(&self, pos: SectionPos) -> (u32, u32) {
+    fn section_material(&self, pos: SectionPos) -> (bool, u32) {
         if pos.detail < FLAT_DETAIL {
-            return (0, 0);
+            return (false, 0);
         }
         match self.section_mip.as_ref().and_then(|m| m.color(pos)) {
             Some(c) => (
-                DRAW_FLAT_COLOR,
+                true,
                 c.r as u32 | (c.g as u32) << 8 | (c.b as u32) << 16 | (c.a as u32) << 24,
             ),
-            None => (0, 0),
+            None => (false, 0),
         }
     }
 
@@ -1204,12 +1208,13 @@ impl LaneSpec for SectionLane {
     /// Modest floor: heavy work runs off-thread.
     const MIN_ADMIT: usize = 4;
     fn candidates(world: &World, center: Coord) -> Candidates<SectionPos> {
-        // Start with desired sections, filter those already loaded and those
-        // provably inside the coverage clip (skip load).
+        // Start with the frame's cached desired set, filter those already
+        // loaded and those provably inside the coverage clip (skip load).
         Candidates::Geometry(
             world
-                .desired_sections(center)
-                .into_iter()
+                .section_desired
+                .iter()
+                .copied()
                 .filter(|s| {
                     !world.sections.contains_key(s)
                         && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
@@ -1380,6 +1385,72 @@ mod tests {
         world.sections.remove(&cell);
         world.sections.insert(cell.parent(), empty_ready());
         assert!(world.section_covered(cell), "a Ready ancestor covers the finer cell");
+    }
+
+    /// The fast-movement staleness fix (user report: flying far up left a
+    /// couple of stale LOD cubes floating over a missing far field): the load
+    /// lane is LEVEL-triggered — armed for as long as any desired cell is
+    /// unloaded, uncovered, and unskipped — instead of relying on boundary-
+    /// crossing events that can go quiet with holes still open.
+    #[test]
+    fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
+        let mut world = lod2_world();
+        let center = ChunkCoord::new(0, 0, 0);
+        world.pending_sections.take();
+
+        // Fresh world: everything desired is missing — the rebuild must arm.
+        world.section_desired = world.desired_sections(center);
+        world.rebuild_section_visible(center);
+        assert!(world.pending_sections.get(), "open holes must keep the lane armed");
+
+        // Everything in flight (Meshing): no hole is unclaimed — no re-arm.
+        world.pending_sections.take();
+        for &cell in &world.section_desired.clone() {
+            world.sections.insert(cell, SectionState::Meshing);
+        }
+        world.section_desired = world.desired_sections(center);
+        world.rebuild_section_visible(center);
+        assert!(!world.pending_sections.get(), "in-flight cells are not holes");
+
+        // Everything Ready: converged — still no re-arm.
+        world.pending_sections.take();
+        for &cell in &world.section_desired.clone() {
+            world.sections.insert(cell, SectionState::Ready { quadrants: Default::default() });
+        }
+        world.section_desired = world.desired_sections(center);
+        world.rebuild_section_visible(center);
+        assert!(!world.pending_sections.get(), "a converged covering leaves the lane idle");
+    }
+
+    /// ANY chunk creation re-arms the far-field lane (it changes the coverage
+    /// picture the section skip reads), so LOD reacts to streaming activity
+    /// instead of waiting for the next boundary crossing.
+    #[test]
+    fn chunk_creation_arms_the_section_lane() {
+        let mut world = lod2_world();
+        world.pending_sections.take();
+        world.ensure_data(ChunkCoord::new(40, 0, 40));
+        assert!(world.pending_sections.get(), "a stored chunk must re-arm the section lane");
+    }
+
+    /// The desired frontier tracks eye ALTITUDE continuously: far above the
+    /// LOD slab the near rings vanish (they sit wholly overhead) and coarse
+    /// rings take over, so selection must differ from the ground frontier.
+    #[test]
+    fn desired_frontier_responds_to_altitude() {
+        let mut world = lod2_world();
+        let center = ChunkCoord::new(0, 0, 0);
+        world.section_eye_y = 40.0;
+        let ground: FastSet<_> = world.desired_sections(center).into_iter().collect();
+        world.section_eye_y = 4000.0;
+        let sky: FastSet<_> = world.desired_sections(center).into_iter().collect();
+        assert_ne!(ground, sky, "altitude must reshape the desired frontier");
+        assert!(!sky.is_empty(), "high altitude still selects a (coarser) far field");
+        let finest = world.section_pyramid.finest.0;
+        assert!(
+            sky.iter().all(|s| s.detail > finest),
+            "wholly-overhead near rings must drop out at altitude"
+        );
     }
 
     /// A settled born-air chunk for testing coverage skip logic.

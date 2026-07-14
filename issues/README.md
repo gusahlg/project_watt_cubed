@@ -10,32 +10,35 @@ This folder is a forward-looking engineering audit of Project Watt Cubed and its
 
 Those ideas are useful tests for architecture. They are not reasons to preserve a draft implementation when the implementation contradicts the desired game.
 
-## Status after the 2026-07-14 burn-down
+## Status after the 2026-07-14 burn-downs
 
-Every game-side confirmed bug (G-01 through G-17) is FIXED with regression
-tests, except the reduced remainder of G-03 (generated overhangs/islands still
-do not shadow the columns beneath them — constructed roofs now do). The wire
-protocol moved to v6: authoritative edits with acks and rollback, a content
-fingerprint in the handshake, an explicit permissioned teleport, position
-corrections, peer visibility exits, and a synchronized day cycle. Fast-motion
-chunk streaming now re-prioritizes to the live view centre and deschedules
-left-behind jobs. Details and the per-issue record live in
+Every confirmed bug from the audit is FIXED with regression tests — both the
+game side (G-01 through G-17, protocol v6: authoritative edits with acks and
+rollback, content fingerprint, permissioned teleport, position corrections,
+visibility exits, synchronized day cycle) and the engine side (E-01 through
+E-08: exposure slot correctness, truthful TAA barriers, toggle resets, pure
+support-checked swapchain selectors, bounded LOD draw inputs, documented
+bounded curvature, and the water depth-absorption local-read path repaired
+and LIVE with a zero-error validation smoke). The one remainder is the
+reduced G-03 (generated overhangs/islands still don't shadow the columns
+beneath them — constructed roofs now do). Streaming re-prioritizes to the
+live view centre, deschedules left-behind jobs, and the far-LOD load lane is
+level-triggered so the covering can never silently stall behind the live
+frontier. Details and the per-issue record live in
 [confirmed-bugs.md](confirmed-bugs.md).
 
 ## Highest-value next work
 
 | Priority | Finding | Why it matters |
 |---|---|---|
-| P1 | [E-01: exposure reads the wrong in-flight slot](confirmed-bugs.md#e-01--exposure-readback-reads-a-slot-that-was-not-the-one-waited) | Finite but torn exposure values can cause brightness instability. |
-| P1 | [E-02: TAA barriers omit actual prior accesses](confirmed-bugs.md#e-02--taa-history-barriers-do-not-describe-the-real-previous-accesses) | Temporal corruption is possible even when basic validation is quiet. |
 | P1 | [R-01/R-11: publishable engine URL + clean-checkout CI](nix-and-release.md) | Reproducible releases beyond this machine. |
 | P2 | [G-03 remainder: generated volumetrics don't shadow](confirmed-bugs.md#g-03--generated-overhangs-and-islands-do-not-shadow-lower-chunks) | A visible lighting simplification under islands/overhangs. |
-| P2 | [E-03…E-08: engine toggle/portability/shader debt](confirmed-bugs.md#voxel-engine-and-gpu) | Correctness and portability of the renderer surface. |
+| P2 | [R-04…R-10: release packaging/tooling roadmap](nix-and-release.md) | Split product binaries, shader provenance, XDG state paths, golden references. |
 | — | [structural-opportunities.md](structural-opportunities.md) | Architecture directions (server-side economy state, deterministic simulation, texture indirection, …). |
 
 ## Files in this audit
 
-- [confirmed-bugs.md](confirmed-bugs.md) — the open engine/GPU issues, the reduced G-03 remainder, and the record of everything fixed.
+- [confirmed-bugs.md](confirmed-bugs.md) — the reduced G-03 remainder and the record of everything fixed.
 - [structural-opportunities.md](structural-opportunities.md) — larger design and performance improvements that should inform future work.
 - [testing-and-graphics.md](testing-and-graphics.md) — commands, outcomes, graphics observations, and a practical test roadmap.
 - [branch-integration.md](branch-integration.md) — what changed on main, how conflicts were resolved, and what still needs attention.

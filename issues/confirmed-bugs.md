@@ -3,18 +3,18 @@
 This file separates open defects from items already fixed. Suggested tests are
 deliberately concrete; several exist as protocol/model tests without a GPU.
 
-## Game, world, and networking
+## Open
 
 ### G-03 — Generated overhangs and islands do not shadow lower chunks
 
 **Priority: P2 (reduced 2026-07-14 — the constructed-roof half is fixed). Status: open.**
 
 The skylight ceiling now includes edited opaque roofs with per-column cache
-invalidation and re-settling of the chunks below (see the burn-down below), and
-the former ignored regression test is green. What remains is the GENERATED
-volumetrics: [`TerrainGenerator::height`](../src/world/generation.rs) describes
-ground only, so overhang shelves and flying islands still do not shadow the
-columns beneath them — every vertical chunk under an island still injects full
+invalidation and re-settling of the chunks below, and the former ignored
+regression test is green. What remains is the GENERATED volumetrics:
+[`TerrainGenerator::height`](../src/world/generation.rs) describes ground
+only, so overhang shelves and flying islands still do not shadow the columns
+beneath them — every vertical chunk under an island still injects full
 skylight when its top is above ground height.
 
 Lifting this needs a generator-side column occupancy summary (topmost solid
@@ -23,63 +23,64 @@ only at a proven top boundary followed by downward cross-chunk propagation.
 The visual symptom is bounded (island undersides read as unlit strips, noted
 in the audit's visual inspection), which is why this is P2 now.
 
-## Voxel-engine and GPU
+## Fixed 2026-07-14, second round (engine burn-down)
 
-### E-01 — Exposure readback reads a slot that was not the one waited
+Every engine issue from the audit is fixed on the engine's `experimental`
+(merged to its `main` via voxel-engine PR #2). Verified by the engine suite
+(84 tests + a new all-module SPIR-V validation gate), a validation smoke with
+the water absorption path LIVE (standard + sync validation, resize, autoshot —
+zero errors), and the release game benchmark at its default 8× MSAA (zero
+errors, 55 avg FPS, matching the audit baseline).
 
-**Priority: P1. Status: open.**
+- **E-01 (P1)** — the exposure readback reads the fence-WAITED slot's own
+  buffer (frame N−2's completed value) instead of the possibly in-flight
+  `slot.other()`. The parity rule is a pure function with a timeline-model
+  unit test.
+- **E-02 (P1)** — TAA history barriers derive their `src` scopes from each
+  shared image's tracked prior use (transfer-read for the last resolve
+  source, compute-sample for the last history input) instead of claiming a
+  storage write that never was, or no dependency at all for an image the
+  previous frame sampled.
+- **E-03 (P2)** — exposure/TAA flag transitions reset their temporal state:
+  exposure off pins 1.0 structurally on both the render (tonemap) and main
+  (`compose`) threads; any TAA toggle invalidates history so a stale scene
+  cannot ghost into the first re-enabled frame.
+- **E-04 (P2)** — swapchain format/usage/composite/present-mode selection is
+  factored into pure, support-checked selectors with portability-matrix
+  tests: UNORM preferred in any colorspace before a loud sRGB last resort,
+  `TRANSFER_SRC` requested only when offered (screenshots refuse gracefully
+  without it), composite alpha falls back to a supported bit.
+- **E-05** — already fixed 2026-07-13 by the eye-centred cascade rework (see
+  the shadow entries in the first-round record).
+- **E-06 (P2)** — curvature is documented and bounded as presentation-only:
+  the droop touches clip position alone (world-space consumers all agree on
+  the flat world; culling stays conservative in the safe direction) and is
+  clamped so arbitrary distances cannot fold the horizon.
+- **E-07 (P2)** — public LOD draw inputs are bounded: `Detail::new` clamps to
+  a shift-safe `MAX_LEVEL`, `draw_mesh_faded` sanitizes non-finite fade and
+  takes a typed `FadeStyle` instead of raw mode bits (the game ported in
+  lockstep), and the LOD clip shader branches explicitly on zero vertical
+  coverage instead of evaluating an equal-edge `smoothstep`.
+- **E-08 (P2)** — the water depth-absorption local-read path is repaired and
+  ENABLED as one coherent change: the depth input attachment loads as vec4
+  (the module passes `spirv-val` at vulkan1.3, enforced for the whole tracked
+  inventory by a new gate test), the pipeline carries the complete
+  input-attachment mapping and the render-pass instance sets/restores the
+  same mapping around the blend draws, the scene pass runs depth in
+  `RENDERING_LOCAL_READ` whenever the pipeline exists (one
+  `depth_pass_layout` function feeds every barrier and attachment info), and
+  a framebuffer-local BY_REGION barrier orders opaque depth writes before the
+  water branch's reads. MSAA keeps the flat-tint fallback.
 
-The renderer waits for the current frame slot in [`wait_slot_and_reclaim`](../../voxel-engine/src/vk/mod.rs#L918). [`ExposureRing::views`](../../voxel-engine/src/vk/exposure.rs#L172), however, writes that slot and reads `slot.other()`, normally the immediately previous slot that may still be in flight. A NaN guard does not make a finite partial read safe.
+Game-side in the same round (user report): the far-LOD load lane is now
+LEVEL-triggered — armed for as long as any desired cell is unloaded,
+uncovered, and unskipped — instead of relying on boundary-crossing events
+that could go quiet with holes still open (flying far up left stale coarse
+cubes floating over a missing far field). Any chunk creation and every
+section landing also re-arm it, and the selection sweep (grid walk + relief
+coarsening) runs once per frame instead of up to three times.
 
-Read the exact slot whose completion was waited, then overwrite that slot with the new compute result. Add a pure alternating-slot/timeline ownership test.
-
-### E-02 — TAA history barriers do not describe the real previous accesses
-
-**Priority: P1. Status: open.**
-
-In [`taa.rs`](../../voxel-engine/src/vk/taa.rs#L445), the prior history source is declared as a compute storage write even though its last post-resolve use was transfer-read. The image becoming output is transitioned from `UNDEFINED` with no real dependency even though the preceding frame sampled it. Because history images are shared rather than per-frame-slot, these cross-submission dependencies matter.
-
-Track actual layout/access state: transfer-read to compute-sampled for the resolved source, and compute-sampled to compute-storage-write for the next output. Add TAA-on synchronization validation plus static-hold and orbit goldens.
-
-### E-03 — Exposure Off retains stale metered exposure, and TAA toggles retain old history
-
-**Priority: P2. Status: open.**
-
-The public flag says disabling exposure pins it to 1.0, but [`Renderer::set_flags`](../../voxel-engine/src/vk/mod.rs#L658) only replaces booleans and [`Engine::exposure_for_compose`](../../voxel-engine/src/vk/exposure.rs#L575) always returns the shared stale value. Bloom/tonemap can therefore retain the old meter. TAA has the analogous stale-history problem after an off/on toggle.
-
-Reset/publish `Exposure::DEFAULT`, reset meter timing, and invalidate TAA history on relevant flag transitions. Add live-toggle tests and captures.
-
-### E-04 — Swapchain format/usage/composite selection is not portable
-
-**Priority: P2. Status: open.**
-
-[`swapchain.rs`](../../voxel-engine/src/vk/swapchain.rs#L29) falls back to an arbitrary surface format when UNORM is absent. Choosing sRGB would double-encode the already display-encoded tonemap output. Swapchain creation also requests transfer-source usage and opaque composite alpha without checking support.
-
-Extract pure selectors and test sRGB-only formats, missing screenshot-transfer usage, unsupported opaque alpha, and present-mode fallbacks.
-
-### E-06 — Curvature is raster-only and hardcoded in a reusable engine
-
-**Priority: P2. Status: open.**
-
-The mesh vertex shader applies a fixed roughly-300-km visual curvature to clip position, while CPU culling, world outputs, and shadow depth remain flat. This can create horizon popping and geometry/shadow disagreement. Make curvature explicit configuration and apply it coherently, or document and tightly bound it as presentation-only.
-
-### E-07 — New public LOD draw inputs are insufficiently bounded
-
-**Priority: P2. Status: open.**
-
-[`Detail::new`](../../voxel-engine/src/mesh.rs#L354) accepts any `u8`, while [`Detail::scale`](../../voxel-engine/src/mesh.rs#L360) shifts `1u32 << level`. [`draw_mesh_faded`](../../voxel-engine/src/frame.rs#L432) accepts arbitrary non-finite fade and raw mode bits. The fragment shader also evaluates equal-edge `smoothstep` when vertical clip is zero.
-
-Use a checked/bounded `Detail`, clamp or reject non-finite fade, replace mode bits with a typed style, and make zero vertical coverage an explicit branch. Add boundary/property tests.
-
-### E-08 — The disabled water-depth SPIR-V remains invalid
-
-**Priority: P2. Status: runtime-safe, implementation still open.**
-
-Commit `5efc734` sets [`WATER_DEPTH_ABSORPTION_VALIDATED`](../../voxel-engine/src/vk/pipeline.rs#L88) false, so the valid flat-tint pipeline is selected and the Vulkan smoke is clean. However, `shaders_spv/mesh3d_water.frag.spv` still fails standalone `spirv-val`, and the source path still lacks a coherent dynamic-rendering local-read attachment/layout/mapping design.
-
-Do not re-enable it piecemeal. Repair shader type/load, color/depth input indices, dynamic-rendering local-read layouts, descriptor layout, and rendering input-attachment state as one change, then require both `spirv-val` and validation smoke to pass.
-
-## Fixed 2026-07-14 (issue burn-down)
+## Fixed 2026-07-14, first round (issue burn-down)
 
 Every game-side confirmed bug from the 2026-07-13 audit was fixed on
 `experimental`, with regression tests. Protocol v6 covers the wire changes.
@@ -134,8 +135,6 @@ Every game-side confirmed bug from the 2026-07-13 audit was fixed on
   (`block_coord_end`), shared by `voxel_cells` and `collides`.
 - **G-17 (P3)** — reaction registration validates reagents (non-empty, unique,
   nonzero shares summing to 100).
-- **E-05** — was already fixed 2026-07-13 by the eye-centred cascade rework
-  (see the F-05/F-06 entries below).
 
 Additionally, fast-movement chunk streaming was reworked: the near job queue
 re-prioritizes against the LIVE view centre at every dequeue, and queued jobs
@@ -178,7 +177,9 @@ no strikes) instead of ground through.
 
 ### F-09 — Invalid water local-read runtime and incorrect present wait stages
 
-**Fixed conservatively by engine commit `5efc734`.** The invalid water pipeline is dormant in favor of the valid flat-tint fallback, and the mixed present submission uses correctness-first `ALL_COMMANDS` waits. A validation-enabled, immediate-present, resize/autoshot smoke completed 36 frames with zero warnings/errors and none of the five previously observed VUID/hazard reports.
+**Fixed conservatively by engine commit `5efc734`** (and the water path itself
+fully repaired and re-enabled 2026-07-14, see E-08 above). The mixed present
+submission uses correctness-first `ALL_COMMANDS` waits.
 
 ### F-10 — MSAA depth was bound to a single-sample godray descriptor
 
@@ -188,8 +189,8 @@ no strikes) instead of ground through.
 
 **Fixed in the audit worktree and lock file.** Cargo used the live sibling
 engine while `nix run` used the older content hash in `flake.lock`. The input
-now pins committed engine revision `6edce74`, and `checks.package` compiles
-and tests the pure distributable against that locked source. See
+now pins a committed engine revision, and `checks.package` compiles and tests
+the pure distributable against that locked source. See
 [nix-and-release.md](nix-and-release.md).
 
 ### F-12 — Nix imported 5 GiB of build output and shipped an unlaunchable golden tool
