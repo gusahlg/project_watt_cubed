@@ -33,6 +33,14 @@ two intentional ignores (both timing benchmarks). The constructed-roof
 skylight regression is no longer ignored — the ceiling model now includes
 edited roofs, and the test is green in the ordinary suite.
 
+**2026-07-14, second round (engine burn-down):** game suite 363 passed
+(far-LOD responsiveness tests added); engine suite 84 passed plus a new
+all-module `spirv-val --target-env vulkan1.3` gate. Validation smokes after
+enabling the water depth-absorption local-read path: engine demo (standard +
+sync validation, resize, autoshot) — zero errors; release game at default 8×
+MSAA (`WATT_BENCH=1`, both validation layers) — zero errors, 55 avg FPS / 46
+1% low, matching the audit baseline.
+
 Useful commands:
 
 ```sh

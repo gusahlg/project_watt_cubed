@@ -78,14 +78,14 @@ payload/regression guard rather than a measured speedup).
 
 ## 9. Make GPU resource ownership and access state explicit
 
-The exposure and TAA findings share a cause: resource parity and last-access knowledge live in comments and call-site convention. Small typed state machines would make illegal choices harder:
-
-- `Waited<FrameSlot>` before host reads;
-- per-image tracked layout/stage/access for shared TAA history;
-- explicit invalidation epochs for exposure/TAA toggles and resize;
-- per-slot ownership wherever frames can overlap.
-
-Main's move to per-slot shadow maps is a good example of this direction.
+**Substantially landed 2026-07-14** with the exposure/TAA fixes: the exposure
+slot parity is one pure, unit-tested function; TAA history barriers derive
+their source scopes from per-image tracked layouts; exposure/TAA toggles
+reset their temporal state; and the scene depth layout comes from a single
+`depth_pass_layout` function for both configurations. Remaining direction:
+typed `Waited<FrameSlot>` proofs before host reads, and explicit invalidation
+epochs on resize (today resize recreates the resources outright, which is
+equivalent but implicit).
 
 ## 10. Decouple shader generation from ordinary builds
 
@@ -97,7 +97,13 @@ The engine build script can regenerate tracked SPIR-V fallbacks during a normal 
 - updates tracked fallbacks only on deliberate invocation;
 - lets ordinary builds verify rather than rewrite the manifest.
 
-The currently disabled water variant demonstrates why a checked module inventory matters.
+**Partial progress 2026-07-14:** an all-module `spirv-val --target-env
+vulkan1.3` gate now runs in the engine test suite (skipping loudly outside
+the dev shell), and the fallbacks were regenerated once with the dev shell's
+PINNED slangc — since the flake pins the compiler, ordinary rebuilds are now
+byte-stable. The explicit `shader-gen` task with a source/options/compiler
+manifest remains the full answer. (The once-invalid water module that
+motivated this is repaired and its pipeline live — see E-08.)
 
 ## 11. Move golden rendering toward fixed-extent offscreen capture
 

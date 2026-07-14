@@ -256,6 +256,11 @@ impl World {
             // ladder; mip only coarsens, no upward pops during bake.
             self.poll_mip();
             self.ensure_mip_bake();
+            // ONE selection sweep per frame: unloading, the load lane, and the
+            // covering rebuild below all read this cache. The frontier tracks
+            // the live eye (altitude included) continuously, so it must be
+            // fresh every frame, not only on boundary crossings.
+            self.section_desired = self.desired_sections(center_chunk);
             if full_pass {
                 self.unload_sections(center_chunk, eng);
                 self.pending_sections.set();
@@ -386,6 +391,9 @@ impl World {
             section_uploads += 1;
             if let Some(state @ SectionState::Meshing) = self.sections.get_mut(&pos) {
                 *state = SectionState::from_upload(pos, meshes, eng);
+                // A new Ready section moves the covering: re-arm the lane so
+                // any refinement it exposes loads immediately.
+                self.pending_sections.set();
             }
         }
     }
@@ -644,6 +652,12 @@ impl World {
         }
         // A new chunk changes what the BFS can reach.
         self.occlusion_dirty.set();
+        // And it changes the near-field coverage picture the section skip
+        // reads: re-arm the far-field lane so LOD reacts to ANY chunk
+        // creation instead of waiting for a boundary crossing.
+        if self.lod2 {
+            self.pending_sections.set();
+        }
         // Seed this chunk and 6 neighbours; a neighbour may have been
         // blocked waiting on this data even if itself uniform air.
         self.mesh_worklist.insert(coord);
@@ -1037,11 +1051,28 @@ impl World {
 
     /// Rebuild the visible set every frame; as sections become Ready, the covering
     /// changes and stale entries would draw incorrectly.
-    fn rebuild_section_visible(&mut self, center: Coord) {
-        let desired = self.desired_sections(center);
+    ///
+    /// Also the LEVEL-TRIGGERED load arming (the fast-movement staleness fix):
+    /// while ANY desired cell is unloaded, uncovered by a Ready self/ancestor,
+    /// and not skipped as chunk-covered near field, the section lane stays
+    /// armed. The old edge-triggered arming (boundary crossings and a few
+    /// events) could go quiet with holes still open — flying far up left the
+    /// covering permanently behind the live frontier, drawing a couple of
+    /// stale coarse cubes over an otherwise missing far field.
+    pub(in crate::world) fn rebuild_section_visible(&mut self, center: Coord) {
+        let desired = std::mem::take(&mut self.section_desired);
         let max = self.section_pyramid.coarsest();
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
         let cut = quadtree::resolve_covering(&desired, max, &ready);
+        let backlog = desired.iter().any(|&c| {
+            !self.sections.contains_key(&c)
+                && quadtree::drawable_cover(c, max, &ready).is_none()
+                && !self.coverage_skips(center, c)
+        });
+        self.section_desired = desired;
+        if backlog {
+            self.pending_sections.set();
+        }
         self.section_visible = cut.iter().copied().collect();
         // Drive cross-fade toward new cut; it decides what actually draws.
         self.section_fade.update_now(&self.section_visible);
@@ -1050,9 +1081,9 @@ impl World {
     /// Unload sections outside desired, visible, and hysteresis bands (boundary cross).
     /// Hysteresis prevents thrashing at view edges.
     fn unload_sections(&mut self, center: Coord, eng: &mut Engine) {
-        // KEEP uses real eye (delta = 0): hysteresis doesn't move with prediction,
-        // so sections stay kept even as fast-moving eye passes.
-        let desired: FastSet<SectionPos> = self.desired_sections(center).into_iter().collect();
+        // KEEP reads the frame's cached frontier (already velocity-unioned),
+        // so sections stay kept even as a fast-moving eye passes.
+        let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
         let visible: FastSet<SectionPos> = self.section_visible.iter().map(|(p, _)| *p).collect();
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing tile vanishes mid-fade.
