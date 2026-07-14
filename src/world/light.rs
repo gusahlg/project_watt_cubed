@@ -306,8 +306,11 @@ impl FaceShell {
     }
 }
 
-/// Terrain surface height per column; determines skylight seeding. Pure function
-/// of generator (independent of chunk load order), so caves stay consistently dark.
+/// The skylight ceiling per column: the Y at and above which a column is open
+/// sky. Seeded from the generator's ground height (a pure function, so caves
+/// stay consistently dark regardless of chunk load order), then RAISED by
+/// edited opaque roofs ([`raise`](Self::raise)) so a player-built ceiling
+/// shadows every chunk below it instead of leaking full skylight.
 #[derive(Clone)]
 pub struct CeilingWindow {
     surface: [i32; CHUNK_AREA],
@@ -333,6 +336,19 @@ impl CeilingWindow {
     #[inline]
     pub(in crate::world) fn open_above(&self, lx: usize, lz: usize, world_y: i32) -> bool {
         world_y >= self.surface[lx + lz * CHUNK_SIZE]
+    }
+
+    /// Raise one column's ceiling to at least `surface` (a constructed opaque
+    /// roof: open sky begins at the cell ABOVE it). Never lowers — the
+    /// generator ground below stays the floor of the value.
+    pub(in crate::world) fn raise(&mut self, lx: usize, lz: usize, surface: i32) {
+        let cell = &mut self.surface[lx + lz * CHUNK_SIZE];
+        *cell = (*cell).max(surface);
+    }
+
+    /// The Y at which this column becomes open sky (see [`open_above`](Self::open_above)).
+    pub(in crate::world) fn surface_at(&self, lx: usize, lz: usize) -> i32 {
+        self.surface[lx + lz * CHUNK_SIZE]
     }
 }
 
@@ -587,11 +603,12 @@ mod tests {
 
     fn tables() -> HotTables {
         HotTables {
-            solid: vec![false, true, true].into(),
-            opaque: vec![false, true, false].into(), // id 1 opaque (stone), id 2 clear
-            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
-            emission: vec![0, 0, 15].into(),         // id 2 emits 15
-            water: vec![false, false, false].into(),
+            solid: vec![false, true, true, true].into(),
+            opaque: vec![false, true, false, true].into(), // id 1 stone, id 3 opaque emitter
+            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
+            emission: vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
+            water: vec![false, false, false, false].into(),
+            ..HotTables::default()
         }
     }
 
@@ -611,6 +628,20 @@ mod tests {
         let mut got = LightGrid::dark();
         propagate(&opaque, &FaceShell::dark(), &CeilingWindow::from_heights(|_, _| 100), -160, &tables, &mut got);
         assert!(got == LightGrid::dark(), "uniform opaque == dark()");
+        // Opaque does not imply dark: an opaque emitter must bypass the analytic
+        // shortcut and seed blocklight in the regular propagation path.
+        let emissive = Chunk::from_uniform(0, -10, 0, BlockId(3));
+        assert!(!emissive.is_uniform_opaque(&tables));
+        let mut got = LightGrid::dark();
+        propagate(
+            &emissive,
+            &FaceShell::dark(),
+            &CeilingWindow::from_heights(|_, _| 100),
+            -160,
+            &tables,
+            &mut got,
+        );
+        assert_eq!(got.at(Chunk::index(8, 8, 8)).block, LightLevel::FULL);
         // Uniform air fully open to the sky → full sky, no blocklight.
         let air = Chunk::from_uniform(0, 10, 0, BlockId(0));
         let mut got = LightGrid::dark();
@@ -623,13 +654,13 @@ mod tests {
         // A full opaque layer at y=5 seals the lower half: with no gap for the
         // horizontal skylight flood to leak through, everything below is dark,
         // while the open cells above are lit to the layer.
-        let mut cells = [0u8; CHUNK_VOLUME];
+        let mut cells = [BlockId(0); CHUNK_VOLUME];
         for z in 0..16 {
             for x in 0..16 {
-                cells[Chunk::index(x, 5, z)] = 1; // opaque floor across the chunk
+                cells[Chunk::index(x, 5, z)] = BlockId(1); // opaque floor across the chunk
             }
         }
-        let chunk = Chunk::from_dense(0, 0, 0, Box::new(cells));
+        let chunk = Chunk::from_cells(0, 0, 0, Box::new(cells));
         let grid = lit(&chunk);
 
         assert_eq!(grid.at(Chunk::index(4, 15, 4)).sky, LightLevel::FULL, "top lit");
@@ -638,12 +669,91 @@ mod tests {
         assert_eq!(grid.at(Chunk::index(0, 0, 0)).sky, LightLevel::DARK, "floor sealed dark");
     }
 
+    /// A player-built roof in the chunk above must stop the analytic per-column
+    /// skylight seed in the chunk below: the ceiling window is raised by edited
+    /// opaque cells and the edit invalidates the cached column (the G-03 fix).
+    #[test]
+    fn constructed_roof_in_upper_chunk_shadows_lower_chunk() {
+        use crate::coord::ChunkCoord;
+        use crate::world::World;
+
+        // Safely above terrain and the flying-island band, exactly on a chunk
+        // boundary so the roof occupies local y=0 of the upper chunk.
+        const ROOF_Y: i32 = 400;
+        let lower_cy = ROOF_Y.div_euclid(CS) - 1;
+        let lower_y0 = lower_cy * CS;
+        let lower_coord = ChunkCoord::new(0, lower_cy, 0);
+
+        let mut world = World::new(0x5EED);
+        let before = world.capture_ceiling(lower_coord);
+        assert!(before.open_above(8, 8, ROOF_Y), "fixture starts open to sky");
+
+        let stone = world.registry().id_by_name("Stone").expect("builtin Stone");
+        for z in 0..CS {
+            for x in 0..CS {
+                world.set_block(x, ROOF_Y, z, stone);
+            }
+        }
+
+        // The ceiling moved, so every LOADED chunk below the roof in this
+        // column is owed a re-settle (the roof chunk itself is unloaded here,
+        // so any worklist entry in the column proves the cascade fired).
+        assert!(
+            world.light_worklist.iter().any(|c| c.x == 0 && c.z == 0),
+            "raising a column's ceiling must re-seed the loaded chunks below it"
+        );
+
+        let ceiling = world.capture_ceiling(lower_coord);
+
+        // Settle the real upper neighbour containing the opaque roof.
+        let mut roof_cells = [BlockId(0); CHUNK_VOLUME];
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                roof_cells[Chunk::index(x, 0, z)] = BlockId(1);
+            }
+        }
+        let roof = Chunk::from_cells(0, lower_cy + 1, 0, Box::new(roof_cells));
+        let mut roof_light = LightGrid::dark();
+        propagate(
+            &roof,
+            &FaceShell::dark(),
+            &ceiling,
+            ROOF_Y,
+            &tables(),
+            &mut roof_light,
+        );
+        assert_eq!(
+            roof_light.at(Chunk::index(8, 0, 8)).sky,
+            LightLevel::DARK,
+            "the roof's lower face is dark",
+        );
+
+        let upper_shell =
+            FaceShell::capture(|face| (face == Face::PosY).then_some(&roof_light));
+        let lower = Chunk::from_uniform(0, lower_cy, 0, BlockId(0));
+        let mut lower_light = LightGrid::dark();
+        propagate(
+            &lower,
+            &upper_shell,
+            &ceiling,
+            lower_y0,
+            &tables(),
+            &mut lower_light,
+        );
+
+        assert_eq!(
+            lower_light.at(Chunk::index(8, CHUNK_SIZE - 1, 8)).sky,
+            LightLevel::DARK,
+            "the constructed roof must shadow the chunk directly below it",
+        );
+    }
+
     #[test]
     fn cave_in_a_deep_chunk_is_dark() {
         // A hollow chunk whose top is far below the terrain surface: the ceiling
         // reports the top as closed, so no skylight is seeded and the cavern is
         // dark — consistently, regardless of the 16-cell chunk alignment.
-        let chunk = Chunk::from_dense(0, -8, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let chunk = Chunk::from_cells(0, -8, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 40); // surface well above this chunk
         let mut grid = LightGrid::dark();
         propagate(&chunk, &FaceShell::dark(), &ceiling, -128, &tables(), &mut grid);
@@ -654,7 +764,7 @@ mod tests {
 
     #[test]
     fn blocklight_falls_off_by_one_per_step() {
-        let mut chunk = Chunk::from_dense(0, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let mut chunk = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         chunk.set_local(8, 8, 8, BlockId(2)); // emitter, level 15
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // fully underground: isolate blocklight
         let mut grid = LightGrid::dark();
@@ -711,9 +821,9 @@ mod tests {
     #[test]
     fn settle_reaches_a_fixpoint_across_a_border() {
         let tables = tables();
-        let mut left_c = Chunk::from_dense(0, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let mut left_c = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         left_c.set_local(14, 8, 8, BlockId(2)); // emitter near the +X border
-        let right_c = Chunk::from_dense(1, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let right_c = Chunk::from_cells(1, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // underground: isolate blocklight
 
         // Shell with one neighbour across face (dark elsewhere).

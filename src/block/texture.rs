@@ -30,18 +30,22 @@ const NEUTRAL_GRAY: [f32; 3] = [140.0, 140.0, 140.0];
 
 const BYTES_PER_LAYER: usize = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
 
-/// Build one 16x16 RGBA8 texture layer per registered block, indexed by block
-/// id. Block 0 (air) is pure white; every other layer is the element blend of
-/// that block's composition. Feed straight to `Engine::set_block_textures`.
+/// Build the 16x16 RGBA8 texture layer for one block id. Block 0 (air) is pure
+/// white; every other layer is the element blend of that block's composition.
+/// The world's incremental texture cache calls this per newly registered id.
+pub fn build_block_texture(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
+    if id.0 == 0 {
+        vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
+    } else {
+        layer_for(registry, id)
+    }
+}
+
+/// Build one texture layer per registered block, indexed by block id. Feed
+/// straight to `Engine::set_block_textures`.
 pub fn build_block_textures(registry: &BlockRegistry) -> Vec<Vec<u8>> {
     (0..registry.block_count())
-        .map(|i| {
-            if i == 0 {
-                vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
-            } else {
-                layer_for(registry, BlockId(i as u8))
-            }
-        })
+        .map(|i| build_block_texture(registry, BlockId(i as u16)))
         .collect()
 }
 
@@ -247,8 +251,8 @@ mod tests {
 
     #[test]
     fn two_element_natural_block_shows_both_element_colors() {
-        // Stone (128,128,128) + Organic (86,176,0): gray texels have high
-        // blue relative to organic's zero, green texels dominate in G.
+        // Stone (112,118,128 slate) + Organic (24,186,156 teal): slate texels
+        // are near-grey (R≈G≈B), teal texels have G far above R.
         let mut reg = BlockRegistry::with_builtins();
         let id = reg.natural(&[El::Stone.id(), El::Organic.id()]).unwrap();
         let layers = build_block_textures(&reg);
@@ -258,15 +262,15 @@ mod tests {
         let mut organicish = 0;
         for texel in layer.chunks_exact(4) {
             let (r, g, b) = (texel[0] as i32, texel[1] as i32, texel[2] as i32);
-            if b >= 100 && (r - g).abs() <= 30 {
+            if (r - g).abs() <= 25 && (g - b).abs() <= 25 && r >= 70 {
                 stoneish += 1;
             }
-            if g >= 140 && b <= 50 {
+            if g - r >= 60 && g >= 120 {
                 organicish += 1;
             }
         }
-        assert!(stoneish >= 5, "expected stone-dominant texels, got {stoneish}");
-        assert!(organicish >= 5, "expected organic-dominant texels, got {organicish}");
+        assert!(stoneish >= 5, "expected slate-dominant texels, got {stoneish}");
+        assert!(organicish >= 5, "expected teal-dominant texels, got {organicish}");
     }
 
     #[test]

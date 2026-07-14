@@ -21,16 +21,29 @@ use super::MAX_FRAME;
 /// A message from a client to the server.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientMessage {
-    /// First frame after connecting: identify and authenticate.
-    Hello { protocol: u32, name: String, password: String },
+    /// First frame after connecting: identify and authenticate. `fingerprint`
+    /// is the sender's [`content_fingerprint`](super::content_fingerprint);
+    /// the server rejects a mismatch so two builds that would generate
+    /// different worlds from one seed never silently join.
+    Hello { protocol: u32, fingerprint: u64, name: String, password: String },
     /// The client's own player state this tick (client simulates its own player).
+    /// Server-side this is plausibility-checked (movement envelope + border);
+    /// discontinuities must go through [`Teleport`](Self::Teleport).
     Move { pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+    /// An explicit position discontinuity (`/tp`). Unlike `Move` it is exempt
+    /// from the movement envelope, but the server may refuse it
+    /// (configuration) and answer with a [`ServerMessage::Position`] snap-back.
+    Teleport { pos: DVec3 },
     /// Visual-only event broadcast to other players.
     Swing,
     /// Latency probe; the server echoes `nonce` back in [`ServerMessage::Pong`].
     Ping { nonce: u32 },
-    /// The client changed a block, described by portable spec (see [`save`](crate::save)).
-    Edit { x: i32, y: i32, z: i32, spec: String },
+    /// The client changed a block, described by portable spec (see
+    /// [`save`](crate::save)). `req` identifies this request in the sender's
+    /// [`ServerMessage::EditAck`]; `expect` is the cell revision the sender
+    /// believes is current (0 = never edited), so racing edits on one cell
+    /// resolve to exactly one winner.
+    Edit { req: u32, x: i32, y: i32, z: i32, expect: u32, spec: String },
     /// A chat line on the given [`channel`](super::chat).
     Chat { channel: u8, text: String },
     /// The player set the world time (via `/time`); `day` is a `[0,1)` fraction.
@@ -45,25 +58,41 @@ pub enum ServerMessage {
     Welcome { player_id: u32, seed: i64, spawn: DVec3 },
     /// Join refused (bad password, version mismatch, server full); the stream closes.
     Reject { reason: String },
-    /// The full current edit overlay, sent once right after [`Welcome`](Self::Welcome).
-    Snapshot { edits: Vec<(i32, i32, i32, String)> },
-    /// Another player joined.
+    /// The full current edit overlay, sent once right after
+    /// [`Welcome`](Self::Welcome). Each cell carries its authoritative
+    /// revision so the joiner's future edit expectations line up.
+    Snapshot { edits: Vec<(i32, i32, i32, u32, String)> },
+    /// Another player joined (roster only — their pose arrives via
+    /// [`PeerMove`](Self::PeerMove) once they are inside interest range).
     PeerJoined { id: u32, name: String },
     /// Another player disconnected.
     PeerLeft { id: u32 },
-    /// Another player moved.
+    /// Another player moved (also the "entered interest range" signal).
     PeerMove { id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+    /// Another player left interest range: hide their avatar instead of
+    /// drawing a frozen ghost at the last heard pose. They re-appear on the
+    /// next [`PeerMove`](Self::PeerMove) for that id.
+    PeerExited { id: u32 },
     /// Another player swung their arm.
     PeerSwing { id: u32 },
     /// Echo of a [`ClientMessage::Ping`], carrying its `nonce` unchanged.
     Pong { nonce: u32 },
-    /// A block changed somewhere in the world (from a peer or the server).
-    Edit { x: i32, y: i32, z: i32, spec: String },
+    /// A block changed somewhere in the world, at its new authoritative
+    /// revision. Sent to everyone except the editor (who gets the ack).
+    Edit { x: i32, y: i32, z: i32, rev: u32, spec: String },
+    /// The verdict on the sender's own [`ClientMessage::Edit`]: `accepted`
+    /// with the committed revision, or rejected (stale expectation, out of
+    /// reach, invalid spec) — the signal prediction rolls back on.
+    EditAck { req: u32, accepted: bool, rev: u32 },
+    /// The server's authoritative position for THIS player (refused teleport,
+    /// implausible movement): snap to it.
+    Position { pos: DVec3 },
     /// A chat line to display.
     Chat { from_id: u32, from_name: String, channel: u8, text: String },
     /// The shared world time changed (a peer's `/time`, or the current value sent
-    /// to a joiner); `day` is a `[0,1)` fraction.
-    Time { day: f32 },
+    /// to a joiner); `day` is a `[0,1)` fraction and `day_secs` the shared
+    /// real-seconds length of a full cycle, so every clock advances in step.
+    Time { day: f32, day_secs: f32 },
 }
 
 // Message type tags. Client and server tag spaces are independent.
@@ -75,6 +104,7 @@ mod tag {
     pub const SET_TIME: u8 = 4;
     pub const SWING: u8 = 5;
     pub const PING: u8 = 6;
+    pub const TELEPORT: u8 = 7;
 
     pub const WELCOME: u8 = 0;
     pub const REJECT: u8 = 1;
@@ -87,6 +117,9 @@ mod tag {
     pub const S_TIME: u8 = 8;
     pub const PEER_SWING: u8 = 9;
     pub const PONG: u8 = 10;
+    pub const EDIT_ACK: u8 = 11;
+    pub const POSITION: u8 = 12;
+    pub const PEER_EXITED: u8 = 13;
 }
 
 impl ClientMessage {
@@ -94,9 +127,10 @@ impl ClientMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
-            ClientMessage::Hello { protocol, name, password } => {
+            ClientMessage::Hello { protocol, fingerprint, name, password } => {
                 w.u8(tag::HELLO);
                 w.u32(*protocol);
+                w.u64(*fingerprint);
                 w.str(name);
                 w.str(password);
             }
@@ -107,16 +141,22 @@ impl ClientMessage {
                 w.f32(*pitch);
                 w.u8(stance.wire());
             }
+            ClientMessage::Teleport { pos } => {
+                w.u8(tag::TELEPORT);
+                w.vec3(*pos);
+            }
             ClientMessage::Swing => w.u8(tag::SWING),
             ClientMessage::Ping { nonce } => {
                 w.u8(tag::PING);
                 w.u32(*nonce);
             }
-            ClientMessage::Edit { x, y, z, spec } => {
+            ClientMessage::Edit { req, x, y, z, expect, spec } => {
                 w.u8(tag::EDIT);
+                w.u32(*req);
                 w.i32(*x);
                 w.i32(*y);
                 w.i32(*z);
+                w.u32(*expect);
                 w.str(spec);
             }
             ClientMessage::Chat { channel, text } => {
@@ -135,9 +175,10 @@ impl ClientMessage {
     /// Parse a frame payload. `None` on any malformed or truncated input.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        Some(match r.u8()? {
+        let message = match r.u8()? {
             tag::HELLO => ClientMessage::Hello {
                 protocol: r.u32()?,
+                fingerprint: r.u64()?,
                 name: r.str()?,
                 password: r.str()?,
             },
@@ -147,12 +188,15 @@ impl ClientMessage {
                 pitch: r.f32()?,
                 stance: Stance::from_wire(r.u8()?)?,
             },
+            tag::TELEPORT => ClientMessage::Teleport { pos: r.vec3()? },
             tag::SWING => ClientMessage::Swing,
             tag::PING => ClientMessage::Ping { nonce: r.u32()? },
             tag::EDIT => ClientMessage::Edit {
+                req: r.u32()?,
                 x: r.i32()?,
                 y: r.i32()?,
                 z: r.i32()?,
+                expect: r.u32()?,
                 spec: r.str()?,
             },
             tag::CHAT => ClientMessage::Chat {
@@ -161,7 +205,8 @@ impl ClientMessage {
             },
             tag::SET_TIME => ClientMessage::SetTime { day: r.f32()? },
             _ => return None,
-        })
+        };
+        r.finished().then_some(message)
     }
 }
 
@@ -183,10 +228,11 @@ impl ServerMessage {
             ServerMessage::Snapshot { edits } => {
                 w.u8(tag::SNAPSHOT);
                 w.u32(edits.len() as u32);
-                for (x, y, z, spec) in edits {
+                for (x, y, z, rev, spec) in edits {
                     w.i32(*x);
                     w.i32(*y);
                     w.i32(*z);
+                    w.u32(*rev);
                     w.str(spec);
                 }
             }
@@ -207,6 +253,10 @@ impl ServerMessage {
                 w.f32(*pitch);
                 w.u8(stance.wire());
             }
+            ServerMessage::PeerExited { id } => {
+                w.u8(tag::PEER_EXITED);
+                w.u32(*id);
+            }
             ServerMessage::PeerSwing { id } => {
                 w.u8(tag::PEER_SWING);
                 w.u32(*id);
@@ -215,12 +265,23 @@ impl ServerMessage {
                 w.u8(tag::PONG);
                 w.u32(*nonce);
             }
-            ServerMessage::Edit { x, y, z, spec } => {
+            ServerMessage::Edit { x, y, z, rev, spec } => {
                 w.u8(tag::S_EDIT);
                 w.i32(*x);
                 w.i32(*y);
                 w.i32(*z);
+                w.u32(*rev);
                 w.str(spec);
+            }
+            ServerMessage::EditAck { req, accepted, rev } => {
+                w.u8(tag::EDIT_ACK);
+                w.u32(*req);
+                w.u8(*accepted as u8);
+                w.u32(*rev);
+            }
+            ServerMessage::Position { pos } => {
+                w.u8(tag::POSITION);
+                w.vec3(*pos);
             }
             ServerMessage::Chat { from_id, from_name, channel, text } => {
                 w.u8(tag::S_CHAT);
@@ -229,9 +290,10 @@ impl ServerMessage {
                 w.u8(*channel);
                 w.str(text);
             }
-            ServerMessage::Time { day } => {
+            ServerMessage::Time { day, day_secs } => {
                 w.u8(tag::S_TIME);
                 w.f32(*day);
+                w.f32(*day_secs);
             }
         }
         w.into_inner()
@@ -240,7 +302,7 @@ impl ServerMessage {
     /// Parse a frame payload. `None` on any malformed or truncated input.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        Some(match r.u8()? {
+        let message = match r.u8()? {
             tag::WELCOME => ServerMessage::Welcome {
                 player_id: r.u32()?,
                 seed: r.i64()?,
@@ -251,7 +313,7 @@ impl ServerMessage {
                 let count = r.u32()? as usize;
                 let mut edits = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
-                    edits.push((r.i32()?, r.i32()?, r.i32()?, r.str()?));
+                    edits.push((r.i32()?, r.i32()?, r.i32()?, r.u32()?, r.str()?));
                 }
                 ServerMessage::Snapshot { edits }
             }
@@ -267,23 +329,36 @@ impl ServerMessage {
                 pitch: r.f32()?,
                 stance: Stance::from_wire(r.u8()?)?,
             },
+            tag::PEER_EXITED => ServerMessage::PeerExited { id: r.u32()? },
             tag::PEER_SWING => ServerMessage::PeerSwing { id: r.u32()? },
             tag::PONG => ServerMessage::Pong { nonce: r.u32()? },
             tag::S_EDIT => ServerMessage::Edit {
                 x: r.i32()?,
                 y: r.i32()?,
                 z: r.i32()?,
+                rev: r.u32()?,
                 spec: r.str()?,
             },
+            tag::EDIT_ACK => ServerMessage::EditAck {
+                req: r.u32()?,
+                accepted: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                rev: r.u32()?,
+            },
+            tag::POSITION => ServerMessage::Position { pos: r.vec3()? },
             tag::S_CHAT => ServerMessage::Chat {
                 from_id: r.u32()?,
                 from_name: r.str()?,
                 channel: r.u8()?,
                 text: r.str()?,
             },
-            tag::S_TIME => ServerMessage::Time { day: r.f32()? },
+            tag::S_TIME => ServerMessage::Time { day: r.f32()?, day_secs: r.f32()? },
             _ => return None,
-        })
+        };
+        r.finished().then_some(message)
     }
 }
 
@@ -328,6 +403,9 @@ impl Writer {
         self.0.push(v);
     }
     fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
     fn i32(&mut self, v: i32) {
@@ -375,11 +453,17 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Some(slice)
     }
+    fn finished(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
     }
     fn i32(&mut self) -> Option<i32> {
         Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?))
@@ -414,6 +498,7 @@ mod tests {
         let cases = [
             ClientMessage::Hello {
                 protocol: 1,
+                fingerprint: 0xDEAD_BEEF_1234_5678,
                 name: "player".into(),
                 password: "hunter2".into(),
             },
@@ -423,9 +508,17 @@ mod tests {
                 pitch: -0.25,
                 stance: Stance::Sneaking,
             },
+            ClientMessage::Teleport { pos: DVec3::new(1.0e8, -40.0, 3.5) },
             ClientMessage::Swing,
             ClientMessage::Ping { nonce: 7 },
-            ClientMessage::Edit { x: -4, y: 7, z: 900, spec: "natural:Stone".into() },
+            ClientMessage::Edit {
+                req: 12,
+                x: -4,
+                y: 7,
+                z: 900,
+                expect: 3,
+                spec: "natural:Stone".into(),
+            },
             ClientMessage::Chat { channel: 1, text: "hello world".into() },
             ClientMessage::SetTime { day: 0.5 },
         ];
@@ -445,8 +538,8 @@ mod tests {
             ServerMessage::Reject { reason: "bad password".into() },
             ServerMessage::Snapshot {
                 edits: vec![
-                    (1, 2, 3, "air".into()),
-                    (-5, 6, -7, "mixture:Soil=70;Clay=30".into()),
+                    (1, 2, 3, 1, "air".into()),
+                    (-5, 6, -7, 9, "mixture:Soil=70;Clay=30".into()),
                 ],
             },
             ServerMessage::PeerJoined { id: 3, name: "friend".into() },
@@ -458,20 +551,32 @@ mod tests {
                 pitch: 0.1,
                 stance: Stance::Swimming,
             },
+            ServerMessage::PeerExited { id: 3 },
             ServerMessage::PeerSwing { id: 3 },
             ServerMessage::Pong { nonce: 7 },
-            ServerMessage::Edit { x: 0, y: 0, z: 0, spec: "air".into() },
+            ServerMessage::Edit { x: 0, y: 0, z: 0, rev: 4, spec: "air".into() },
+            ServerMessage::EditAck { req: 12, accepted: true, rev: 4 },
+            ServerMessage::EditAck { req: 13, accepted: false, rev: 4 },
+            ServerMessage::Position { pos: DVec3::new(-1.0e9, 2.0, 3.0) },
             ServerMessage::Chat {
                 from_id: 3,
                 from_name: "friend".into(),
                 channel: 0,
                 text: "hi".into(),
             },
-            ServerMessage::Time { day: 0.75 },
+            ServerMessage::Time { day: 0.75, day_secs: 600.0 },
         ];
         for msg in cases {
             assert_eq!(ServerMessage::decode(&msg.encode()), Some(msg));
         }
+    }
+
+    #[test]
+    fn edit_ack_rejects_non_boolean_accepted_bytes() {
+        let mut payload = ServerMessage::EditAck { req: 1, accepted: true, rev: 2 }.encode();
+        // The `accepted` byte sits right after the tag and req.
+        payload[5] = 2;
+        assert_eq!(ServerMessage::decode(&payload), None);
     }
 
     #[test]
@@ -497,10 +602,78 @@ mod tests {
 
     #[test]
     fn truncated_frame_decodes_to_none() {
-        let full = ClientMessage::Edit { x: 1, y: 2, z: 3, spec: "air".into() }.encode();
+        let full =
+            ClientMessage::Edit { req: 1, x: 1, y: 2, z: 3, expect: 0, spec: "air".into() }
+                .encode();
         // Chop the payload short: the reader must report failure, not panic.
         assert_eq!(ClientMessage::decode(&full[..full.len() - 2]), None);
         assert_eq!(ClientMessage::decode(&[]), None);
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected_for_every_message_direction() {
+        let client_cases = [
+            ClientMessage::Hello {
+                protocol: 1,
+                fingerprint: 7,
+                name: "player".into(),
+                password: String::new(),
+            },
+            ClientMessage::Move {
+                pos: DVec3::new(1.0, 2.0, 3.0),
+                yaw: 0.25,
+                pitch: -0.5,
+                stance: Stance::Standing,
+            },
+            ClientMessage::Teleport { pos: DVec3::new(1.0, 2.0, 3.0) },
+            ClientMessage::Swing,
+            ClientMessage::Ping { nonce: 9 },
+            ClientMessage::Edit { req: 1, x: 1, y: 2, z: 3, expect: 0, spec: "air".into() },
+            ClientMessage::Chat { channel: 0, text: "hi".into() },
+            ClientMessage::SetTime { day: 0.25 },
+        ];
+        for message in client_cases {
+            let mut payload = message.encode();
+            payload.push(0xa5);
+            assert_eq!(ClientMessage::decode(&payload), None, "accepted suffix after {message:?}");
+        }
+
+        let server_cases = [
+            ServerMessage::Welcome {
+                player_id: 1,
+                seed: 2,
+                spawn: DVec3::new(3.0, 4.0, 5.0),
+            },
+            ServerMessage::Reject { reason: "no".into() },
+            ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] },
+            ServerMessage::PeerJoined { id: 2, name: "peer".into() },
+            ServerMessage::PeerLeft { id: 2 },
+            ServerMessage::PeerMove {
+                id: 2,
+                pos: DVec3::new(6.0, 7.0, 8.0),
+                yaw: 0.5,
+                pitch: -0.25,
+                stance: Stance::Sneaking,
+            },
+            ServerMessage::PeerExited { id: 2 },
+            ServerMessage::PeerSwing { id: 2 },
+            ServerMessage::Pong { nonce: 9 },
+            ServerMessage::Edit { x: 1, y: 2, z: 3, rev: 1, spec: "air".into() },
+            ServerMessage::EditAck { req: 4, accepted: false, rev: 0 },
+            ServerMessage::Position { pos: DVec3::new(1.0, 2.0, 3.0) },
+            ServerMessage::Chat {
+                from_id: 2,
+                from_name: "peer".into(),
+                channel: 0,
+                text: "hi".into(),
+            },
+            ServerMessage::Time { day: 0.5, day_secs: 600.0 },
+        ];
+        for message in server_cases {
+            let mut payload = message.encode();
+            payload.push(0x5a);
+            assert_eq!(ServerMessage::decode(&payload), None, "accepted suffix after {message:?}");
+        }
     }
 
     #[test]

@@ -4,15 +4,14 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # The renderer lives in a sibling checkout. This MUST be an absolute path: a
-    # relative `path:../voxel-engine` resolves against the flake's *store copy*
-    # once `nix run` archives this git tree, landing at `…-source/../voxel-engine`
-    # (nonexistent) — so it only ever worked from a dirty tree. An absolute path
-    # resolves the same whether the tree is clean or dirty, and still picks up
-    # local edits to the sibling. Machine-specific; switch to a git URL
-    # (github:gusahlg/voxel-engine) if this flake is ever fetched from elsewhere.
+    # The renderer lives in a sibling checkout. Use the local Git repository,
+    # not a raw `path:` snapshot: the latter copied ignored build products such
+    # as voxel-engine/target into the Nix store (about 5 GiB on this machine).
+    # This packages the committed experimental revision and records that exact
+    # revision in flake.lock. It remains machine-specific until the engine audit
+    # commits are published, at which point this should become a remote Git URL.
     voxel-engine = {
-      url = "path:/home/gusahlg/repos/voxel-engine";
+      url = "git+file:///home/gusahlg/repos/voxel-engine?ref=experimental";
       flake = false;
     };
   };
@@ -53,7 +52,10 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "project_watt_cubed";
-          version = "0.1.0";
+          # Keep the Nix package identity tied to Cargo instead of maintaining a
+          # second version that had already drifted behind (0.1.0 vs 0.2.0).
+          version =
+            (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 
           src = combinedSrc;
           sourceRoot = "source/game";
@@ -62,15 +64,36 @@
 
           nativeBuildInputs = slang;
 
-          # Wrap the binary so it can dlopen the Vulkan loader and windowing
-          # libs at runtime.
+          # Every installed binary is part of the package contract. In
+          # particular `golden` also creates a window, so leaving it with only
+          # the default glibc runpath makes the shipped tool fail to open X11.
+          # Do not hide missing outputs or patchelf failures with `|| true`.
           postFixup = ''
-            patchelf --set-rpath "${libraryPath}" $out/bin/project_watt_cubed || true
-            patchelf --set-rpath "${libraryPath}" $out/bin/watt_server || true
+            for binary in project_watt_cubed watt_server golden golden_compare; do
+              patchelf --set-rpath "${libraryPath}" "$out/bin/$binary"
+            done
           '';
 
           meta.mainProgram = "project_watt_cubed";
         };
+
+        # `nix flake check` must compile the pure package, not merely evaluate
+        # the dev shell. This is the check that catches a stale voxel-engine
+        # input when the game starts using a newly merged renderer API.
+        checks.package = self.packages.${system}.default;
+
+        # A raw path input once pulled the engine's ignored `target/` directory
+        # into the store, turning a ~1 MiB source tree into a 5 GiB snapshot.
+        # Keep a generous ceiling so normal source growth is harmless while a
+        # source-filter regression fails quickly and explains itself.
+        checks.engine-source-budget = pkgs.runCommand "voxel-engine-source-budget" { } ''
+          size=$(du -sb ${voxel-engine} | cut -f1)
+          if test "$size" -gt 16777216; then
+            echo "voxel-engine source is $size bytes; expected at most 16 MiB" >&2
+            exit 1
+          fi
+          printf '%s\n' "$size" > "$out"
+        '';
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ rustc cargo rustfmt clippy ]

@@ -3,7 +3,8 @@
 use voxel_engine::{Key, MouseButton};
 
 use crate::input::intent::{
-    AxisSource, Chord, GameplayAxis, GameplayEvent, GameplayState, GlobalEvent, MenuEvent, Source,
+    AxisSource, Chord, GameplayAxis, GameplayEvent, GameplayState, GlobalEvent, MenuEvent, Mods,
+    Source,
 };
 use crate::input::look;
 
@@ -46,16 +47,19 @@ impl Default for Bindings {
             AxisSource::KeyPair { neg: Source::Key(Key::S), pos: Source::Key(Key::W) },
         ];
 
-        // Vim and arrow keys for navigation preferences.
+        // Vim and arrow keys for navigation preferences: j/k rows, h/l values,
+        // Shift+H back and Shift+L confirm.
         let mut menu_event: [Vec<Chord>; MenuEvent::COUNT] = Default::default();
         menu_event[ME::Up as usize] =
             vec![Chord::key(Key::Up), Chord::key(Key::K), Chord::bare(Source::WheelUp)];
         menu_event[ME::Down as usize] =
             vec![Chord::key(Key::Down), Chord::key(Key::J), Chord::bare(Source::WheelDown)];
-        menu_event[ME::Left as usize] = vec![Chord::key(Key::Left)];
-        menu_event[ME::Right as usize] = vec![Chord::key(Key::Right)];
-        menu_event[ME::Confirm as usize] = vec![Chord::key(Key::Enter), Chord::key(Key::L)];
-        menu_event[ME::Back as usize] = vec![Chord::key(Key::Escape), Chord::key(Key::H)];
+        menu_event[ME::Left as usize] = vec![Chord::key(Key::Left), Chord::key(Key::H)];
+        menu_event[ME::Right as usize] = vec![Chord::key(Key::Right), Chord::key(Key::L)];
+        menu_event[ME::Confirm as usize] =
+            vec![Chord::key(Key::Enter), Chord::with(Mods::SHIFT, Source::Key(Key::L))];
+        menu_event[ME::Back as usize] =
+            vec![Chord::key(Key::Escape), Chord::with(Mods::SHIFT, Source::Key(Key::H))];
         menu_event[ME::NextTab as usize] = vec![Chord::key(Key::Tab)];
         menu_event[ME::Toggle as usize] = vec![Chord::key(Key::Space)];
         menu_event[ME::Delete as usize] = vec![Chord::key(Key::Backspace)];

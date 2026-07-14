@@ -56,6 +56,9 @@ pub struct Settings {
     /// HUD/text scale, independent of render resolution (0.5..=2.0). Drives
     /// [`crate::ui::Theme::scale`].
     pub ui_scale: f32,
+    /// Menu text base scale (0.5..=2.0); the theme still shrinks rows to fit
+    /// the window, so this can never push settings off screen.
+    pub menu_scale: f32,
     /// Camera shake intensity (0..=1); an accessibility control, not a constant.
     pub shake: f32,
     /// Cross-chunk lighting. On by default; pushed to [`crate::world::World`] on
@@ -81,12 +84,23 @@ pub struct Settings {
     pub godrays: bool,
     pub clouds: bool,
     pub weather: bool,
+    /// Night starfield in the sky pass (engine `RenderFlags::stars`).
+    pub stars: bool,
+    /// Day/night cycle: off freezes the sky clock (permanent current time of
+    /// day — a strip-down lever and an accessibility control, not a look lane).
+    pub day_night: bool,
     pub taa: bool,
     pub fog: bool,
     pub ambient: bool,
     pub sunlight: bool,
     pub shadows: bool,
     pub sky: bool,
+    pub vrs: bool,
+    pub water_anim: bool,
+    /// Baked corner ambient occlusion in the mesher — a MESHING input like
+    /// `lighting` (toggling remeshes the world). Off also merges more quads,
+    /// so it doubles as a perf lever.
+    pub ao: bool,
     pub vignette: bool,
 }
 
@@ -101,6 +115,7 @@ impl Default for Settings {
             fov: 90.0,
             render_scale: 1.0,
             ui_scale: 1.0,
+            menu_scale: 1.0,
             shake: 1.0,
             lighting: true,
             cull_faces: false,
@@ -114,12 +129,17 @@ impl Default for Settings {
             godrays: true,
             clouds: true,
             weather: true,
+            stars: true,
+            day_night: true,
             taa: false,
             fog: false,
             ambient: false,
             sunlight: true,
             shadows: false,
             sky: true,
+            vrs: true,
+            water_anim: true,
+            ao: true,
             vignette: false,
         }
     }
@@ -276,7 +296,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 25] = [
+pub const SETTINGS: [Setting; 31] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -517,6 +537,36 @@ pub const SETTINGS: [Setting; 25] = [
     Setting {
         category: Category::Interface,
         menu_kind: MenuKind::Bar,
+        fraction: |s| frac(s.menu_scale, *UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end()),
+        key: "menu_scale",
+        aliases: &["menuscale"],
+        label: "Menu Scale",
+        usage: "menuscale <50-200>",
+        confirm: |s| format!("menu scale {:.0}%", s.menu_scale * 100.0),
+        show: |s| format!("{:.0}%", s.menu_scale * 100.0),
+        parse_human: |s, v| match v.parse::<f32>() {
+            Ok(pct) => {
+                s.menu_scale = pct / 100.0;
+                menu_scale_clamp(s);
+                true
+            }
+            Err(_) => false,
+        },
+        step: |s, d| {
+            let pct = cycle_list(
+                &[50, 75, 100, 125, 150, 200],
+                (s.menu_scale * 100.0).round() as i32,
+                d,
+            );
+            s.menu_scale = pct as f32 / 100.0;
+        },
+        clamp: menu_scale_clamp,
+        write: |s| s.menu_scale.to_string(),
+        read: |s, v| set_parsed(&mut s.menu_scale, v),
+    },
+    Setting {
+        category: Category::Interface,
+        menu_kind: MenuKind::Bar,
         fraction: |s| frac(s.shake, *SHAKE_RANGE.start(), *SHAKE_RANGE.end()),
         key: "shake",
         aliases: &["camerashake"],
@@ -552,15 +602,17 @@ pub const SETTINGS: [Setting; 25] = [
     video_toggle!(fog, "fog", "Distance Fog"),
     video_toggle!(clouds, "clouds", "Clouds"),
     video_toggle!(weather, "weather", "Weather"),
+    video_toggle!(stars, "stars", "Night Stars"),
+    video_toggle!(day_night, "day_night", "Day/Night Cycle", &["daynight"]),
     video_toggle!(bloom, "bloom", "Bloom"),
     video_toggle!(godrays, "godrays", "Godrays"),
     video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
     video_toggle!(taa, "taa", "Temporal AA", &["aa"]),
+    video_toggle!(vrs, "vrs", "Variable-Rate Shading"),
+    video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
+    video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
 ];
-
-/// The Back action sits just past the settings rows — derived, never hand-numbered.
-pub const SETTINGS_ROW_BACK: usize = SETTINGS.len();
 
 impl Settings {
     /// Load from disk, falling back to defaults for missing/invalid entries.
@@ -645,12 +697,16 @@ impl Settings {
             godrays: self.godrays,
             clouds: self.clouds,
             weather: self.weather,
+            stars: self.stars,
+            day_night: self.day_night,
             taa: self.taa,
             fog: self.fog,
             ambient: self.ambient,
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
+            vrs: self.vrs,
+            water_anim: self.water_anim,
             vignette: self.vignette,
         }
     }
@@ -738,6 +794,13 @@ fn ui_scale_clamp(s: &mut Settings) {
     s.ui_scale = clamp_to(
         &UI_SCALE_RANGE,
         reset_nan(s.ui_scale, Settings::default().ui_scale),
+    );
+}
+
+fn menu_scale_clamp(s: &mut Settings) {
+    s.menu_scale = clamp_to(
+        &UI_SCALE_RANGE,
+        reset_nan(s.menu_scale, Settings::default().menu_scale),
     );
 }
 
@@ -922,6 +985,8 @@ mod tests {
             // roundtrip below — which never writes it — still lands `samples`. The
             // render lanes likewise stay at their persisted defaults via the spread.
             cull_faces: false,
+            // Fields added since this fixture was written: defaults roundtrip
+            // trivially, so the spread above stays the interesting part.
             ..Settings::default()
         };
         for field in &SETTINGS {

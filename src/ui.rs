@@ -151,6 +151,17 @@ impl HudMode {
     pub fn shows_world_ui(self) -> bool {
         !matches!(self, HudMode::Off)
     }
+
+    /// Whether the minimap is shown. Informational like coords/FPS: `Full` only.
+    pub fn shows_minimap(self) -> bool {
+        matches!(self, HudMode::Full)
+    }
+
+    /// Whether mod-contributed HUD widgets (hotbar, stash) are shown. Gameplay
+    /// UI like the reticle: everything but `Off`.
+    pub fn shows_mod_hud(self) -> bool {
+        !matches!(self, HudMode::Off)
+    }
 }
 
 /// The whole in-world UI look, threaded through drawing. `scale` routes every font
@@ -784,6 +795,14 @@ mod tests {
         assert!(HudMode::Minimal.shows_world_ui());
         assert!(!HudMode::Off.shows_world_ui());
         assert_eq!(HudMode::Off.next(), HudMode::Full);
+        // Off hides EVERY widget: minimap and mod HUD included, not just the
+        // reticle/info text (the G-14 regression).
+        assert!(HudMode::Full.shows_minimap());
+        assert!(!HudMode::Minimal.shows_minimap());
+        assert!(!HudMode::Off.shows_minimap());
+        assert!(HudMode::Full.shows_mod_hud());
+        assert!(HudMode::Minimal.shows_mod_hud());
+        assert!(!HudMode::Off.shows_mod_hud());
     }
 
     #[test]

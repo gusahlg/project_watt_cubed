@@ -11,6 +11,19 @@ use voxel_engine::DVec3;
 /// bound every float→block conversion can rely on.
 pub const WORLD_BORDER: f64 = 1.0e9;
 
+/// How large one voxel is, in metres. The voxel lattice itself never moves
+/// (one block = one world unit — saves, worldgen, meshes, coordinates all
+/// stay put); instead, everything HUMAN-scale is authored in metres and
+/// multiplied by [`PER_METER`], so shrinking this makes the whole grid read
+/// finer relative to the player while timings (jump arcs, walk feel) stay
+/// identical — lengths and velocities scale, seconds don't.
+pub const BLOCK_METERS: f64 = 0.85;
+
+/// Metres → world units (blocks): the multiplier for every authored
+/// human-scale length and velocity. Exponential response RATES (1/s) never
+/// take it — they live in the time domain.
+pub const PER_METER: f64 = 1.0 / BLOCK_METERS;
+
 /// Slack past ±[`WORLD_BORDER`] within which [`block_coord`] still resolves a
 /// true cell instead of clamping. Player *positions* are clamped to exactly
 /// ±`WORLD_BORDER` (movement and `/tp`, the only continuous writers), but the
@@ -46,6 +59,19 @@ pub fn block_coord(v: f64) -> i32 {
         as i32
 }
 
+/// The exclusive-upper-edge partner of [`block_coord`]: the last cell an
+/// interval ending at `v` still overlaps. A voxel spans `[x, x+1)`, so a box
+/// whose maximum lands exactly on an integer boundary touches — but does not
+/// overlap — the next cell: `ceil(v) - 1`, not `floor(v)`. Matches the strict
+/// overlap rule of [`Aabb::intersects`]. `NaN` resolves to cell 0 like
+/// [`block_coord`] (subtraction happens in f64, so the NaN survives to the
+/// saturating cast).
+#[inline]
+pub fn block_coord_end(v: f64) -> i32 {
+    (v.clamp(-(WORLD_BORDER + BLOCK_COORD_SLACK), WORLD_BORDER + BLOCK_COORD_SLACK).ceil() - 1.0)
+        as i64 as i32
+}
+
 /// An axis-aligned bounding box defined by a centre point and half-extents.
 #[derive(Clone, Copy, Debug)]
 pub struct Aabb {
@@ -77,16 +103,19 @@ impl Aabb {
             && d.z.abs() < self.half.z + other.half.z
     }
 
-    /// Every integer voxel cell this box overlaps. A voxel `(x, y, z)` occupies
-    /// the unit cube `[x, x+1)` on each axis, so the overlapped cells run from the
-    /// floor of the box minimum to the floor of its maximum (both through
-    /// [`block_coord`], so a box at the border can't overflow block math).
+    /// Every integer voxel cell this box strictly overlaps. A voxel `(x, y, z)`
+    /// occupies the unit cube `[x, x+1)` on each axis, so cells run from the
+    /// floor of the box minimum ([`block_coord`]) to the last cell before its
+    /// maximum ([`block_coord_end`]) — a box ending exactly on an integer
+    /// boundary does not visit the touching-only next voxel, matching
+    /// [`Aabb::intersects`]. Both bounds clamp, so a box at the border can't
+    /// overflow block math.
     pub fn voxel_cells(&self) -> impl Iterator<Item = (i32, i32, i32)> {
         let min = self.min();
         let max = self.max();
-        let (x0, x1) = (block_coord(min.x), block_coord(max.x));
-        let (y0, y1) = (block_coord(min.y), block_coord(max.y));
-        let (z0, z1) = (block_coord(min.z), block_coord(max.z));
+        let (x0, x1) = (block_coord(min.x), block_coord_end(max.x));
+        let (y0, y1) = (block_coord(min.y), block_coord_end(max.y));
+        let (z0, z1) = (block_coord(min.z), block_coord_end(max.z));
 
         (x0..=x1)
             .flat_map(move |x| (y0..=y1).flat_map(move |y| (z0..=z1).map(move |z| (x, y, z))))
@@ -122,6 +151,29 @@ mod tests {
         assert_eq!(block_coord(f64::INFINITY), 1_000_000_016);
         assert_eq!(block_coord(f64::NEG_INFINITY), -1_000_000_016);
         assert_eq!(block_coord(f64::NAN), 0);
+    }
+
+    #[test]
+    fn exact_face_contact_excludes_the_next_voxel() {
+        // A box spanning exactly [0, 1] on each axis overlaps only voxel 0:
+        // voxel 1 begins at the non-overlapping boundary.
+        let unit = Aabb::new(DVec3::new(0.5, 0.5, 0.5), DVec3::new(0.5, 0.5, 0.5));
+        assert_eq!(unit.voxel_cells().collect::<Vec<_>>(), vec![(0, 0, 0)]);
+
+        // The same at a negative integer boundary: [-1, 0] is voxel -1 only.
+        let neg = Aabb::new(DVec3::new(-0.5, -0.5, -0.5), DVec3::new(0.5, 0.5, 0.5));
+        assert_eq!(neg.voxel_cells().collect::<Vec<_>>(), vec![(-1, -1, -1)]);
+
+        // Any real protrusion past the boundary includes the next voxel again.
+        let over = Aabb::new(DVec3::new(0.5, 0.5, 0.5), DVec3::new(0.501, 0.5, 0.5));
+        let xs: Vec<i32> = over.voxel_cells().map(|c| c.0).collect();
+        assert!(xs.contains(&-1) && xs.contains(&0) && xs.contains(&1));
+
+        assert_eq!(block_coord_end(1.0), 0);
+        assert_eq!(block_coord_end(-1.0), -2);
+        assert_eq!(block_coord_end(1.5), 1);
+        assert_eq!(block_coord_end(f64::NAN), 0);
+        assert_eq!(block_coord_end(f64::INFINITY), 1_000_000_015);
     }
 
     #[test]

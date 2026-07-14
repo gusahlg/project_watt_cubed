@@ -131,8 +131,18 @@ pub enum Composition {
 
 impl Composition {
     /// Convenience constructor for an equal-parts natural block.
+    ///
+    /// Naturals are SETS by design (unspecified, equal parts), so construction
+    /// canonicalizes: sorted by element id, duplicates dropped. Every path
+    /// that builds a natural — worldgen, crafting, save/network spec parsing —
+    /// therefore agrees on one composition per set, and a duplicated listing
+    /// can never mint a second registry block that fails to round-trip.
+    /// Ratios are what [`Mixture`](Composition::Mixture) is for.
     pub fn natural(elements: &[ElementId]) -> Self {
-        Composition::Natural(Box::from(elements))
+        let mut set: Vec<ElementId> = elements.to_vec();
+        set.sort_unstable_by_key(|e| e.0);
+        set.dedup();
+        Composition::Natural(set.into_boxed_slice())
     }
 
     /// Convenience constructor for a validated mixture.
@@ -204,17 +214,19 @@ mod tests {
     }
 
     #[test]
-    fn weights_aggregate_duplicates() {
-        // A natural block listing the same element more than once reduces to one
-        // entry with the summed weight, sorted by id.
+    fn naturals_canonicalize_to_sets() {
+        // Naturals are sets: duplicates drop and order never matters, so every
+        // spelling of one set IS one composition (registry lookup, saves, and
+        // network specs can't mint duplicate variants — the G-15 fix).
         let (copper, iron) = (ElementId(5), ElementId(2));
         let comp = Composition::natural(&[copper, copper, iron]);
+        assert_eq!(comp, Composition::natural(&[iron, copper]));
         let w = comp.weights();
-        assert_eq!(w.parts(), &[(iron, 1), (copper, 2)], "deduped and sorted by id");
-        assert_eq!(w.weight_of(copper), 2, "both occurrences summed");
+        assert_eq!(w.parts(), &[(iron, 1), (copper, 1)], "equal parts, sorted by id");
+        assert_eq!(w.weight_of(copper), 1);
         assert_eq!(w.weight_of(iron), 1);
         assert_eq!(w.weight_of(ElementId(99)), 0, "absent element weighs 0");
-        assert_eq!(w.total(), 3);
+        assert_eq!(w.total(), 2);
     }
 
     #[test]

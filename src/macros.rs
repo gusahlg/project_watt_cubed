@@ -107,7 +107,7 @@ macro_rules! blocks {
         impl Blk {
             /// This block's stable id in a built-in registry.
             pub const fn id(self) -> $crate::block::registry::BlockId {
-                $crate::block::registry::BlockId(self as u8)
+                $crate::block::registry::BlockId(self as u16)
             }
         }
 

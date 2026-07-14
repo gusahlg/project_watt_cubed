@@ -2,18 +2,19 @@
 //! `World`/`Player`/`Mods` to and from `SaveDoc`, so this whole module is
 //! testable without constructing a world.
 //!
-//! Layout, version 4 (all integers little-endian):
+//! Layout, version 5 (all integers little-endian):
 //!
 //! ```text
-//! header (fixed 107 bytes, peekable without the body):
+//! header (fixed 109 bytes, peekable without the body):
 //!   magic        b"WATT"                                       4
-//!   version      u16 = 4                                       2
+//!   version      u16 = 5                                       2
 //!   name         u8 len + 64-byte field (utf8, zero padded)   65
 //!   seed         i64                                           8
 //!   created      u64 unix secs                                 8
 //!   last_played  u64 unix secs                                 8
 //!   playtime     u64 secs                                      8
 //!   edit_count   u32                                           4
+//!   worldgen     u16 (v5+; a v4 header ends here, worldgen 1)   2
 //! player         pos f64 x3, yaw f32, pitch f32,
 //!                flags u8 (bit 0 = fly, bit 1 = noclip)       33
 //! spec table     u16 count, then per spec: u16 len + utf8
@@ -22,6 +23,10 @@
 //!                                        u32 state-len + utf8
 //! ```
 //!
+//! Version 4 files (no worldgen stamp) still decode — the field defaults to
+//! worldgen 1 and the loader WARNS rather than rejects: the seed regenerates
+//! terrain fine, but its materials may have moved under the edits.
+//!
 //! The edit count lives only in the header (no body prefix), and each record is
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
@@ -29,17 +34,30 @@
 use super::slot::{SaveError, SaveMeta};
 
 pub const MAGIC: &[u8; 4] = b"WATT";
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 const NAME_FIELD: usize = 64;
 /// Offset of the name length byte, for in-place renames via [`set_name`].
 const NAME_OFF: usize = 6;
-pub const HEADER_LEN: usize = NAME_OFF + 1 + NAME_FIELD + 8 + 8 + 8 + 8 + 4;
+/// The version-4 header, which the v5 header extends by the worldgen stamp.
+const HEADER_LEN_V4: usize = NAME_OFF + 1 + NAME_FIELD + 8 + 8 + 8 + 8 + 4;
+pub const HEADER_LEN: usize = HEADER_LEN_V4 + 2;
+
+/// Header length for a supported on-disk version, or `BadVersion`.
+fn header_len(version: u16) -> Result<usize, SaveError> {
+    match version {
+        4 => Ok(HEADER_LEN_V4),
+        5 => Ok(HEADER_LEN),
+        v => Err(SaveError::BadVersion(v)),
+    }
+}
 
 const EDIT_BYTES: usize = 14;
 
 /// Sanity caps while reading, so a corrupt length prefix can't balloon memory.
-const MAX_SPECS: usize = 4096;
+/// Specs track the block palette cap — a long-played world can legitimately
+/// reference one spec per registered block type.
+const MAX_SPECS: usize = 16_384;
 const MAX_EDITS: u32 = 50_000_000;
 const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
 
@@ -47,6 +65,10 @@ const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaveDoc {
     pub meta: SaveMeta,
+    /// Which worldgen semantics generated this world's terrain — see
+    /// `placement::WORLDGEN_VERSION`. A mismatch on load WARNS (the seed still
+    /// regenerates, but materials under old edits may have moved).
+    pub worldgen_version: u16,
     pub player: PlayerState,
     /// Deduplicated block-spec table; edits reference it by index.
     pub specs: Vec<String>,
@@ -116,6 +138,7 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     out.extend_from_slice(&doc.meta.last_played.to_le_bytes());
     out.extend_from_slice(&doc.meta.playtime_secs.to_le_bytes());
     out.extend_from_slice(&edit_count.to_le_bytes());
+    out.extend_from_slice(&doc.worldgen_version.to_le_bytes());
     debug_assert_eq!(out.len(), HEADER_LEN);
 
     for v in doc.player.pos {
@@ -165,15 +188,15 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
 /// Read the metadata alone. Needs only the first [`HEADER_LEN`] bytes, so the
 /// slot list never touches file bodies.
 pub fn peek_meta(bytes: &[u8]) -> Result<SaveMeta, SaveError> {
-    if bytes.len() < HEADER_LEN {
+    if bytes.len() < NAME_OFF {
         return Err(SaveError::Corrupt("save file is shorter than its header"));
     }
     if &bytes[..4] != MAGIC {
         return Err(SaveError::Corrupt("not a watt-cubed save (bad magic)"));
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != VERSION {
-        return Err(SaveError::BadVersion(version));
+    if bytes.len() < header_len(version)? {
+        return Err(SaveError::Corrupt("save file is shorter than its header"));
     }
     let name_len = bytes[NAME_OFF] as usize;
     if name_len > NAME_FIELD {
@@ -255,7 +278,14 @@ impl<'a> Reader<'a> {
 
 pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let meta = peek_meta(bytes)?;
-    let mut r = Reader { bytes, pos: HEADER_LEN };
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    // v4 predates the worldgen stamp: those worlds came from the legacy picker.
+    let worldgen_version = if version >= 5 {
+        u16::from_le_bytes(bytes[HEADER_LEN - 2..HEADER_LEN].try_into().unwrap())
+    } else {
+        1
+    };
+    let mut r = Reader { bytes, pos: header_len(version)? };
 
     // Header through spec table must be intact — there's no way to regenerate
     // a partial spec table, and everything after depends on it.
@@ -268,6 +298,16 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     };
     let flags = r.u8()?;
     let player = PlayerState { flying: flags & 1 != 0, noclip: flags & 2 != 0, ..player };
+    // Raw float bit patterns are not all valid game states: NaN/Infinity would
+    // poison camera/physics on load, and a position outside the border breaks
+    // the clamp every continuous writer maintains. Reject rather than repair —
+    // the slot store then falls back to the intact backup file.
+    if player.pos.iter().any(|v| !v.is_finite() || v.abs() > crate::math::WORLD_BORDER)
+        || !player.yaw.is_finite()
+        || !player.pitch.is_finite()
+    {
+        return Err(SaveError::Corrupt("player state is non-finite or out of world"));
+    }
 
     let spec_count = r.u16()? as usize;
     if spec_count > MAX_SPECS {
@@ -322,7 +362,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
         .is_ok();
     }
 
-    let doc = SaveDoc { meta, player, specs, edits, mods };
+    let doc = SaveDoc { meta, worldgen_version, player, specs, edits, mods };
     Ok(if clean {
         Decoded::Intact(doc)
     } else {
@@ -336,6 +376,7 @@ mod tests {
 
     fn sample() -> SaveDoc {
         SaveDoc {
+            worldgen_version: 2,
             meta: SaveMeta {
                 name: "My World".to_string(),
                 seed: -4242,
@@ -454,6 +495,32 @@ mod tests {
         bytes[0] = b'W';
         bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(3))));
+        bytes[4..6].copy_from_slice(&6u16.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(6))));
+    }
+
+    #[test]
+    fn version_4_files_still_decode_with_the_legacy_worldgen_stamp() {
+        // A v4 file is a v5 file minus the 2-byte worldgen stamp: build one by
+        // splicing it out and patching the version. It must decode INTACT with
+        // worldgen_version defaulting to 1 (the legacy picker era) and every
+        // other field bit-identical — old worlds load, they just warn.
+        let doc = sample();
+        let v5 = encode(&doc).unwrap();
+        let mut v4 = Vec::with_capacity(v5.len() - 2);
+        v4.extend_from_slice(&v5[..HEADER_LEN - 2]);
+        v4.extend_from_slice(&v5[HEADER_LEN..]);
+        v4[4..6].copy_from_slice(&4u16.to_le_bytes());
+
+        let got = expect_intact(decode(&v4).unwrap());
+        assert_eq!(got.worldgen_version, 1, "v4 files predate the stamp");
+        assert_eq!(got.meta, doc.meta);
+        assert_eq!(got.player, doc.player);
+        assert_eq!(got.specs, doc.specs);
+        assert_eq!(got.edits, doc.edits);
+        assert_eq!(got.mods, doc.mods);
+        // And the peek path (slot lists) accepts the shorter header too.
+        assert_eq!(peek_meta(&v4).unwrap().name, doc.meta.name);
     }
 
     #[test]
@@ -472,6 +539,27 @@ mod tests {
         doc.meta.name = format!("{}é", "x".repeat(63)); // é straddles the 64-byte cut
         let bytes = encode(&doc).unwrap();
         assert_eq!(peek_meta(&bytes).unwrap().name, "x".repeat(63));
+    }
+
+    #[test]
+    fn non_finite_or_out_of_world_player_state_is_rejected() {
+        let doc = sample();
+        let base = encode(&doc).unwrap();
+
+        // NaN into pos.x (first f64 after the header).
+        let mut bytes = base.clone();
+        bytes[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
+
+        // Infinity into yaw (after the three f64 position words).
+        let mut bytes = base.clone();
+        bytes[HEADER_LEN + 24..HEADER_LEN + 28].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
+
+        // A finite position far outside the world border is corrupt too.
+        let mut bytes = base;
+        bytes[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&3.0e9f64.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
     }
 
     #[test]

@@ -16,16 +16,22 @@ pub use bridge::{LoadReport, encode_current, load, save, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
 pub use store::{Source, fresh_id, list};
 
-use crate::block::{AIR, BlockId, Composition};
+use crate::block::{AIR, BlockId, BlockRegistry, Composition};
 use crate::world::World;
 
 /// Serialize a block as portable element names shared with the network layer.
 pub(crate) fn block_spec(world: &World, id: BlockId) -> String {
+    registry_block_spec(world.registry(), id)
+}
+
+/// [`block_spec`] against a bare registry — the headless server and the
+/// content fingerprint have no `World`.
+pub(crate) fn registry_block_spec(registry: &BlockRegistry, id: BlockId) -> String {
     if id == AIR {
         return "air".to_string();
     }
-    let elements = world.registry().elements();
-    match &world.registry().block(id).composition {
+    let elements = registry.elements();
+    match &registry.block(id).composition {
         Composition::Natural(els) if els.is_empty() => "air".to_string(),
         Composition::Natural(els) => {
             let names: Vec<String> = els.iter().map(|&e| elements.get(e).name.to_string()).collect();
@@ -45,6 +51,14 @@ pub(crate) fn block_spec(world: &World, id: BlockId) -> String {
 
 /// Deserialize a block spec, registering into palette; inverse of block_spec().
 pub(crate) fn parse_block(world: &mut World, spec: &str) -> BlockId {
+    registry_parse_block(world.registry_mut(), spec)
+}
+
+/// [`parse_block`] against a bare registry. The server uses this to VALIDATE
+/// and canonicalize incoming edit specs with the exact rules clients apply,
+/// then re-serializes via [`registry_block_spec`] — so an edit overlay never
+/// stores two strings for one block, and junk never interns at all.
+pub(crate) fn registry_parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
     if spec == "air" {
         return AIR;
     }
@@ -52,32 +66,31 @@ pub(crate) fn parse_block(world: &mut World, spec: &str) -> BlockId {
         // Any unknown element rejects the spec to prevent mismatches with the sender.
         let mut ids = Vec::new();
         for name in rest.split(',') {
-            match world.registry().elements().id_by_name(name) {
+            match registry.elements().id_by_name(name) {
                 Some(id) => ids.push(id),
                 None => return AIR,
             }
         }
-        return crate::block::crafting::craft_natural(world.registry_mut(), &ids)
-            .unwrap_or(AIR);
+        return crate::block::crafting::craft_natural(registry, &ids).unwrap_or(AIR);
     }
     if let Some(rest) = spec.strip_prefix("mixture:") {
         let mut parts = Vec::new();
         for entry in rest.split(';') {
             let Some((name, pct)) = entry.split_once('=') else { return AIR };
-            let Some(id) = world.registry().elements().id_by_name(name) else { return AIR };
+            let Some(id) = registry.elements().id_by_name(name) else { return AIR };
             let Ok(pct) = pct.parse::<u8>() else { return AIR };
             parts.push((id, pct));
         }
         let Ok(composition) = crate::block::Composition::mixture(&parts) else {
             return AIR;
         };
-        if let Some(existing) = world.registry().lookup(&composition) {
+        if let Some(existing) = registry.lookup(&composition) {
             return existing;
         }
-        if world.registry().at_capacity() {
+        if registry.at_capacity() {
             return AIR;
         }
-        return world.registry_mut().mixture(&parts).unwrap_or(AIR);
+        return registry.mixture(&parts).unwrap_or(AIR);
     }
     AIR
 }
@@ -111,6 +124,37 @@ mod tests {
             last_played: 0,
             playtime_secs: 42,
             edit_count: 0,
+        }
+    }
+
+    /// G-15's round-trip property: EVERY reconstructable registered block —
+    /// the full compiled worldgen palette plus crafted naturals and mixtures —
+    /// serializes to a spec that parses back to the SAME id. (Computational
+    /// blocks are excluded: not yet reconstructable by design.)
+    #[test]
+    fn block_specs_round_trip_for_every_supported_composition() {
+        let mut world = World::new(11);
+        // Add a crafted natural (duplicated listing) and a mixture on top of
+        // the compiled palette.
+        let dup = crate::block::crafting::craft_natural(
+            world.registry_mut(),
+            &[El::Copper.id(), El::Copper.id(), El::Glass.id()],
+        )
+        .unwrap();
+        let mix = world.registry_mut().mixture(&[(El::Soil.id(), 70), (El::Clay.id(), 30)]).unwrap();
+        let _ = (dup, mix);
+
+        for i in 0..world.registry().block_count() {
+            let id = BlockId(i as u16);
+            if matches!(world.registry().block(id).composition, Composition::Computational(_)) {
+                continue;
+            }
+            let spec = block_spec(&world, id);
+            assert_eq!(
+                parse_block(&mut world, &spec),
+                id,
+                "spec '{spec}' must parse back to block #{i}"
+            );
         }
     }
 

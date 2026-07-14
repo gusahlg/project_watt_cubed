@@ -37,13 +37,13 @@ pub const COMMAND_NAMES: &[&str] =
 
 /// Run a console line against the game state, returning output lines for the log.
 ///
-/// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. Commands
-/// that only read the world (like `inspect`) take it by shared reference, so the
-/// borrow sits happily alongside the `&mut Player`.
+/// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. The world
+/// is `&mut` for `tp` alone (it must prepare collision data at the destination);
+/// read-only commands like `inspect` reborrow it shared.
 pub fn execute(
     line: &str,
     player: &mut Player,
-    world: &World,
+    world: &mut World,
     settings: &mut Settings,
     sky: &mut Sky,
 ) -> Vec<Line> {
@@ -55,7 +55,7 @@ pub fn execute(
     let args: Vec<&str> = parts.collect();
 
     match cmd {
-        "tp" | "teleport" | "setpos" => teleport(&args, player),
+        "tp" | "teleport" | "setpos" => teleport(&args, player, world),
         "pos" | "where" => shown(vec![format!("position: {}", fmt_pos(player.position))]),
         "inspect" | "look" => inspect(&args, player, world),
         "gfx" | "graphics" => gfx(&args, settings),
@@ -129,15 +129,22 @@ fn clock_label(day: f64) -> String {
 /// to the ±[`WORLD_BORDER`] cube (the same clamp movement applies, so no code
 /// path can carry a position that would overflow i32 block math). The output
 /// reports the position actually landed on, clamp included.
-fn teleport(args: &[&str], player: &mut Player) -> Vec<Line> {
+///
+/// The discontinuity is transactional: collision data around the destination
+/// is generated synchronously BEFORE the player lands there, so the next
+/// physics step never runs against unloaded not-yet-generated air (falling
+/// through or embedding in terrain that streams in a moment later).
+fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
     if args.len() != 3 {
         return rejected(vec!["usage: tp <x> <y> <z>".to_string()]);
     }
     let parsed: Result<Vec<f64>, _> = args.iter().map(|a| a.parse::<f64>()).collect();
     match parsed.as_deref() {
         Ok([x, y, z]) if x.is_finite() && y.is_finite() && z.is_finite() => {
-            player.position = DVec3::new(*x, *y, *z)
+            let target = DVec3::new(*x, *y, *z)
                 .clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
+            world.prepare_around(target);
+            player.position = target;
             // Cancel any accumulated fall so the player doesn't rocket down on arrival.
             player.cancel_fall();
             shown(vec![format!("teleported to {}", fmt_pos(player.position))])
@@ -321,7 +328,7 @@ mod tests {
         World::generate()
     }
 
-    fn run(line: &str, p: &mut Player, w: &World) -> Vec<Line> {
+    fn run(line: &str, p: &mut Player, w: &mut World) -> Vec<Line> {
         let mut s = Settings::default();
         let mut sky = Sky::new();
         execute(line, p, w, &mut s, &mut sky)
@@ -334,9 +341,9 @@ mod tests {
 
     #[test]
     fn tp_sets_position_and_clears_fall() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         p.motion = crate::player::Motion::Walking { velocity: DVec3::new(0.0, -50.0, 0.0), on_ground: false };
-        let out = run("tp 1.5 2 3", &mut p, &w);
+        let out = run("tp 1.5 2 3", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(1.5, 2.0, 3.0));
         assert_eq!(p.velocity().y, 0.0);
         assert!(out[0].text().contains("teleported"));
@@ -344,52 +351,69 @@ mod tests {
 
     #[test]
     fn tp_keeps_f64_precision_and_clamps_to_the_border() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         // Far coordinates parse as f64: no f32 quantisation on the way in.
-        run("tp 100000000.5 60 -7", &mut p, &w);
+        run("tp 100000000.5 60 -7", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(100_000_000.5, 60.0, -7.0));
 
         // Past the border: clamped, and the OUTPUT reports the clamped spot.
-        let out = run("tp 99999999999 60 -99999999999", &mut p, &w);
+        let out = run("tp 99999999999 60 -99999999999", &mut p, &mut w);
         assert_eq!(p.position.x, 1.0e9);
         assert_eq!(p.position.z, -1.0e9);
         assert!(out[0].text().contains("1000000000.0"), "reports the clamped position");
 
         // Non-finite input is refused outright.
         let before = p.position;
-        run("tp inf 0 0", &mut p, &w);
+        run("tp inf 0 0", &mut p, &mut w);
         assert_eq!(p.position, before);
     }
 
     #[test]
+    fn tp_prepares_collision_data_at_the_destination() {
+        let (mut p, mut w) = (player(), world());
+        // Far outside the pre-generated spawn region: without the prepare, the
+        // ground under the destination would be unloaded air and the next
+        // physics step would fall straight through.
+        let (x, z) = (5_000, 5_000);
+        let surface = w.surface_y(x, z);
+        run(&format!("tp {x} {} {z}", surface + 2), &mut p, &mut w);
+        // `is_solid` reads AIR for unloaded chunks, so this proves the ground
+        // cell (rock or seabed) was actually generated by the teleport.
+        assert!(
+            w.is_solid(x, surface, z),
+            "the destination's ground must be loaded before physics resumes"
+        );
+    }
+
+    #[test]
     fn leading_slash_is_optional() {
-        let (mut p, w) = (player(), world());
-        run("/tp 4 5 6", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        run("/tp 4 5 6", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(4.0, 5.0, 6.0));
     }
 
     #[test]
     fn bad_args_do_not_move_the_player() {
-        let (mut p, w) = (player(), world());
-        run("tp 1 two 3", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        run("tp 1 two 3", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(0.0, 0.0, 0.0));
-        run("tp 1 2", &mut p, &w);
+        run("tp 1 2", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(0.0, 0.0, 0.0));
     }
 
     #[test]
     fn unknown_command_reports_back() {
-        let (mut p, w) = (player(), world());
-        let out = run("fly-to-moon", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        let out = run("fly-to-moon", &mut p, &mut w);
         assert!(out[0].text().contains("unknown command"));
         assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
     }
 
     #[test]
     fn inspect_reports_elements_and_properties() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         // Deep underground is stone: a single Stone element with stone's properties.
-        let out = run("inspect 8 0 8", &mut p, &w);
+        let out = run("inspect 8 0 8", &mut p, &mut w);
         let text = joined(&out);
         assert!(text.contains("Stone"), "should name the block: {text}");
         assert!(text.contains("made of: Stone"), "should list elements: {text}");
@@ -398,29 +422,29 @@ mod tests {
 
     #[test]
     fn inspect_above_world_is_air() {
-        let (mut p, w) = (player(), world());
-        let out = run("inspect 8 60 8", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        let out = run("inspect 8 60 8", &mut p, &mut w);
         assert!(joined(&out).contains("air"));
     }
 
     #[test]
     fn gfx_updates_settings_with_clamping() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         let mut s = Settings::default();
         let mut sky = Sky::new();
-        execute("gfx msaa 4", &mut p, &w, &mut s, &mut sky);
+        execute("gfx msaa 4", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.msaa, 4);
-        execute("gfx fps 144", &mut p, &w, &mut s, &mut sky);
+        execute("gfx fps 144", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.max_fps, 144);
-        execute("gfx fps off", &mut p, &w, &mut s, &mut sky);
+        execute("gfx fps off", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.max_fps, 0);
-        execute("gfx renderdist 99", &mut p, &w, &mut s, &mut sky);
+        execute("gfx renderdist 99", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.render_distance, 20);
-        execute("gfx fullscreen on", &mut p, &w, &mut s, &mut sky);
+        execute("gfx fullscreen on", &mut p, &mut w, &mut s, &mut sky);
         assert!(s.fullscreen);
-        execute("gfx lighting off", &mut p, &w, &mut s, &mut sky);
+        execute("gfx lighting off", &mut p, &mut w, &mut s, &mut sky);
         assert!(!s.lighting);
-        let out = execute("gfx", &mut p, &w, &mut s, &mut sky);
+        let out = execute("gfx", &mut p, &mut w, &mut s, &mut sky);
         let text = joined(&out);
         assert!(text.contains("fullscreen on"));
         assert!(text.contains("lighting off"));
@@ -429,11 +453,11 @@ mod tests {
 
     #[test]
     fn gfx_bad_input_prints_usage_and_changes_nothing() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         let mut s = Settings::default();
         let mut sky = Sky::new();
         let before = s.clone();
-        let out = execute("gfx msaa lots", &mut p, &w, &mut s, &mut sky);
+        let out = execute("gfx msaa lots", &mut p, &mut w, &mut s, &mut sky);
         assert!(out[0].text().contains("usage"));
         let text = joined(&out);
         assert!(text.contains("lighting on|off"));
@@ -459,26 +483,26 @@ mod tests {
 
     #[test]
     fn walkspeed_and_flyspeed_set_independently() {
-        let (mut p, w) = (player(), world());
-        let out = run("walkspeed 10", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        let out = run("walkspeed 10", &mut p, &mut w);
         assert_eq!(p.speed, 10.0);
         assert!(out[0].text().contains("walkspeed set to 10.00"));
 
-        run("flyspeed 25", &mut p, &w);
+        run("flyspeed 25", &mut p, &mut w);
         assert_eq!(p.fly_speed, 25.0);
         // Setting one doesn't disturb the other.
         assert_eq!(p.speed, 10.0);
 
-        let out = run("walkspeed", &mut p, &w);
+        let out = run("walkspeed", &mut p, &mut w);
         assert!(out[0].text().contains("walkspeed: 10.00"));
     }
 
     #[test]
     fn speed_commands_reject_non_positive_and_non_finite() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         let before = p.speed;
         for bad in ["0", "-5", "inf", "nan", "banana"] {
-            let out = run(&format!("walkspeed {bad}"), &mut p, &w);
+            let out = run(&format!("walkspeed {bad}"), &mut p, &mut w);
             assert_eq!(p.speed, before, "{bad} should not change speed");
             assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
         }

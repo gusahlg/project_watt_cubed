@@ -384,7 +384,11 @@ impl Section {
 
 // Extraction and downsample helpers.
 
-/// Flatten tile edits (per-chunk flat indices) to absolute world coordinates.
+/// Flatten tile edits (per-chunk flat indices) to absolute world coordinates,
+/// sorted by ascending `(y, x, z)`. The sort is the determinism contract
+/// [`apply_edits`] relies on: edits originate in hash maps whose iteration
+/// order is arbitrary, but position is session-independent truth — so live
+/// edit history and an unordered join snapshot flatten identically.
 fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32, i32, BlockId)> {
     let mut out = Vec::new();
     for (coord, cells) in edits {
@@ -393,31 +397,51 @@ fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32
             out.push((coord.x * CS + lx as i32, coord.y * CS + ly as i32, coord.z * CS + lz as i32, id));
         }
     }
+    out.sort_unstable_by_key(|&(x, y, z, _)| (y, x, z));
     out
 }
 
-/// Apply edits to one column's coarse cells: solid edits overwrite the cell,
-/// air edits only clear at the cell's exact center sample point.
+/// Apply edits to one column's coarse cells — an ORDER-INDEPENDENT reduction.
+/// Many fine edits can land in one coarse cell; the winner is decided by
+/// POSITION, never input order:
+/// - an edit exactly at the cell's centre sample point wins outright (it IS
+///   the cell's sample — and it is the only way an air edit clears a cell);
+/// - otherwise the topmost solid edit (greatest `(y, x, z)`) wins — `flat` is
+///   sorted ascending by [`flatten_edits`], so last-write-wins realizes that
+///   tie-break in one sweep;
+/// - air edits off the sample point never affect the coarse cell.
 fn apply_edits(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
     if flat.is_empty() {
         return;
     }
+    debug_assert!(
+        flat.windows(2).all(|w| (w[0].1, w[0].0, w[0].2) <= (w[1].1, w[1].0, w[1].2)),
+        "flat edits must arrive (y, x, z)-sorted (see flatten_edits)"
+    );
     let half = cell / 2;
-    for &(ewx, ewy, ewz, id) in flat {
+    let n = cells.len();
+    let slot_j = move |ewx: i32, ewy: i32, ewz: i32| -> Option<usize> {
         if ewx < fx || ewx >= fx + cell || ewz < fz || ewz >= fz + cell {
-            continue;
+            return None;
         }
         let j = (ewy - LOD_FLOOR_Y).div_euclid(cell);
-        let Some(slot) = usize::try_from(j).ok().and_then(|j| cells.get_mut(j)) else {
-            continue;
-        };
-        if id != AIR {
-            *slot = id;
-        } else {
-            let (sx, sy, sz) = (fx + half, LOD_FLOOR_Y + j * cell + half, fz + half);
-            if ewx == sx && ewy == sy && ewz == sz {
-                *slot = AIR;
-            }
+        usize::try_from(j).ok().filter(|&j| j < n)
+    };
+    let is_centre = |ewx: i32, ewy: i32, ewz: i32, j: usize| {
+        ewx == fx + half && ewz == fz + half && ewy == LOD_FLOOR_Y + j as i32 * cell + half
+    };
+    // Pass 1: solid, non-centre edits (ascending order makes topmost win).
+    for &(ewx, ewy, ewz, id) in flat {
+        let Some(j) = slot_j(ewx, ewy, ewz) else { continue };
+        if id != AIR && !is_centre(ewx, ewy, ewz, j) {
+            cells[j] = id;
+        }
+    }
+    // Pass 2: centre-sample edits override everything, air included.
+    for &(ewx, ewy, ewz, id) in flat {
+        let Some(j) = slot_j(ewx, ewy, ewz) else { continue };
+        if is_centre(ewx, ewy, ewz, j) {
+            cells[j] = id;
         }
     }
 }
@@ -582,7 +606,7 @@ mod tests {
     }
 
     fn sine(seed: i64) -> SineHills {
-        SineHills::new(&BlockRegistry::with_builtins(), 20.0, seed)
+        SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
     }
 
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
@@ -631,21 +655,37 @@ mod tests {
         out
     }
 
-    /// Reference implementation of apply_edits for testing.
+    /// Reference implementation of the apply_edits POSITION rule, written
+    /// per-cell (independent of input order by construction): a centre-sample
+    /// edit wins outright; otherwise the solid edit at the greatest (y, x, z)
+    /// wins; otherwise the generator cell stands.
     fn reference_reduce(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
         let half = cell / 2;
-        for &(ewx, ewy, ewz, id) in flat {
-            if ewx < fx || ewx >= fx + cell || ewz < fz || ewz >= fz + cell {
+        for (j, slot) in cells.iter_mut().enumerate() {
+            let centre = (fx + half, LOD_FLOOR_Y + j as i32 * cell + half, fz + half);
+            if let Some(&(_, _, _, id)) =
+                flat.iter().find(|&&(x, y, z, _)| (x, y, z) == centre)
+            {
+                *slot = id;
                 continue;
             }
-            let i = (ewy - LOD_FLOOR_Y).div_euclid(cell);
-            let Some(slot) = usize::try_from(i).ok().and_then(|i| cells.get_mut(i)) else {
-                continue;
-            };
-            if id != AIR {
+            let mut best: Option<((i32, i32, i32), BlockId)> = None;
+            for &(x, y, z, id) in flat {
+                if id == AIR
+                    || x < fx
+                    || x >= fx + cell
+                    || z < fz
+                    || z >= fz + cell
+                    || (y - LOD_FLOOR_Y).div_euclid(cell) != j as i32
+                {
+                    continue;
+                }
+                if best.is_none_or(|(key, _)| (y, x, z) > key) {
+                    best = Some(((y, x, z), id));
+                }
+            }
+            if let Some((_, id)) = best {
                 *slot = id;
-            } else if (ewx, ewy, ewz) == (fx + half, LOD_FLOOR_Y + i * cell + half, fz + half) {
-                *slot = AIR;
             }
         }
     }
@@ -770,6 +810,62 @@ mod tests {
             map.entry(c).or_default().push((Chunk::index(l.lx(), l.ly(), l.lz()), id));
         }
         map.into_iter().collect()
+    }
+
+    /// G-07: edits originate in hash maps with no ordering contract, so the
+    /// coarse reduction must give ONE answer for every input permutation —
+    /// including several different solids racing one coarse cell, the exact
+    /// case the old last-write-wins reducer got wrong.
+    #[test]
+    fn edit_reduction_is_independent_of_input_permutation() {
+        let b = blocks();
+        let r#gen = terrain_gen(&b, 100, 0, None);
+        let cell = CELL;
+        let (fx, fz) = (FINEST.min_x(), FINEST.min_z());
+        let (half, j) = (cell / 2, 20i32);
+        let cell_y = LOD_FLOOR_Y + j * cell;
+        // Three solids and one air, ALL inside coarse cell j of column (0, 0),
+        // plus a centre-sample air in another cell.
+        let edits_world = [
+            (fx, cell_y, fz, b.stone),
+            (fx + 1, cell_y + 1, fz, b.grass),
+            (fx, cell_y + 2, fz + 1, b.sand),
+            (fx + 1, cell_y, fz + 1, b.air),
+            (fx + half, LOD_FLOOR_Y + 5 * cell + half, fz + half, b.air),
+        ];
+
+        // Baseline: the reference position rule.
+        let mut want = reference_cells(&r#gen, fx + half, fz + half, cell);
+        reference_reduce(&mut want, &flatten_edits(&overlay_from_world(&edits_world)), fx, fz, cell);
+        assert_eq!(want[j as usize], b.sand, "the topmost (y,x,z) solid must win");
+        assert_eq!(want[5], b.air, "the centre-sample air clears its cell");
+
+        // Every permutation of the overlay input extracts identically.
+        let mut order: Vec<usize> = (0..edits_world.len()).collect();
+        permute(&mut order, 0, &mut |order| {
+            let permuted: Vec<_> = order.iter().map(|&i| edits_world[i]).collect();
+            // One chunk-group per edit preserves the permuted order into
+            // flatten_edits' input.
+            let overlay: Vec<_> = permuted
+                .iter()
+                .flat_map(|e| overlay_from_world(std::slice::from_ref(e)))
+                .collect();
+            let sec = Section::extract(FINEST, &r#gen, &overlay);
+            assert_eq!(sec.column(0, 0).cell_ids(sec.palette(), cell), want, "order {order:?}");
+        });
+    }
+
+    /// Minimal Heap's-algorithm permutation driver for the test above.
+    fn permute(order: &mut Vec<usize>, k: usize, visit: &mut impl FnMut(&[usize])) {
+        if k == order.len() {
+            visit(order);
+            return;
+        }
+        for i in k..order.len() {
+            order.swap(k, i);
+            permute(order, k + 1, visit);
+            order.swap(k, i);
+        }
     }
 
     // Determinism tests.

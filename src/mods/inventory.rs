@@ -115,6 +115,13 @@ impl Mod for InventoryMod {
         }
     }
 
+    fn on_break_rejected(&mut self, elements: &[ElementId]) {
+        // The server refused the break this loot came from: take it back.
+        // Best-effort — anything already spent can't be revoked, which errs
+        // in the player's favour on a rare race rather than going negative.
+        self.stash.borrow_mut().revoke(elements);
+    }
+
     fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
         let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
         let overflow = self

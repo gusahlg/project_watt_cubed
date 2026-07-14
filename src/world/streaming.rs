@@ -53,6 +53,36 @@ pub(in crate::world) struct LightGate {
     degraded: FastSet<Coord>,
 }
 
+/// The strike/quarantine identity of a panicked job — the per-lane key
+/// [`World::fail_job`] counts strikes against. A generate failure is keyed by
+/// its whole column: the failing chunk inside a column job is unknown, and the
+/// span requested for a column varies with the view, so per-span keys would
+/// never accumulate strikes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(in crate::world) enum FailKey {
+    Column { col: (i32, i32) },
+    Mesh { coord: Coord },
+    Light { coord: Coord },
+    Section { pos: SectionPos },
+}
+
+impl FailKey {
+    fn of(key: &pipeline::JobKey) -> FailKey {
+        match key {
+            pipeline::JobKey::Column { col, .. } => FailKey::Column { col: *col },
+            pipeline::JobKey::Mesh { coord } => FailKey::Mesh { coord: *coord },
+            pipeline::JobKey::Light { coord } => FailKey::Light { coord: *coord },
+            pipeline::JobKey::Section { pos } => FailKey::Section { pos: *pos },
+        }
+    }
+}
+
+/// Panics tolerated per claim before it is quarantined. A panic is a real bug
+/// in job code, usually deterministic for one input — retrying a couple of
+/// times absorbs flukes (allocation pressure, a racing palette snapshot)
+/// without looping forever on poison.
+const MAX_JOB_STRIKES: u8 = 3;
+
 impl World {
     /// The mesh box: chunks meshed and drawn around `center`.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
@@ -115,6 +145,12 @@ impl World {
         // against it would discard all results and regenerate them immediately.
         let full_pass = Some(center_chunk) != self.center;
         self.center = Some(center_chunk);
+        // Publish the live view to the worker pool: queued near jobs re-order
+        // toward the player's CURRENT position at every dequeue, and entries
+        // left far behind by fast movement are descheduled instead of run.
+        if let Some(workers) = &self.workers {
+            workers.set_view(center_chunk.x, center_chunk.z, self.view.horizontal);
+        }
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
         // Each lane creates its own budget window, not shared: lanes run
@@ -148,6 +184,7 @@ impl World {
             // Ready chunks drop to NeedsMesh; Dirty chunks stay dirty
             // (prev: None) so same-frame dirty pass still remeshes them.
             let keep = self.mesh_box(center_chunk);
+            let mut retired = false;
             for (&coord, loaded) in self.chunks.iter_mut() {
                 if keep.contains(coord) {
                     continue;
@@ -161,6 +198,7 @@ impl World {
                 };
                 let stays_dirty = matches!(next, MeshState::Dirty { .. });
                 loaded.retire(next, eng);
+                retired = true;
                 // A retired `Dirty` chunk (its drawn mesh just freed) still needs
                 // the same-frame dirty pass to remesh it — which only runs when
                 // `pending_dirty` is set. Set it explicitly here rather than
@@ -168,6 +206,9 @@ impl World {
                 if stays_dirty {
                     self.pending_dirty.set();
                 }
+            }
+            if retired {
+                self.draw_set_rev += 1;
             }
         }
         // Light settling: worklist lane. Trivial grids publish synchronously;
@@ -240,8 +281,32 @@ impl World {
             self.rebuild_occlusion(center_chunk);
         }
         self.occlusion_active = occlusion_on;
+        // Stream is the frame's last mutation point before render: refresh the
+        // drawable-coords cache here (only when the set actually changed), so
+        // `render` walks the ~live set instead of every loaded chunk.
+        self.sync_draw_cache();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
+    }
+
+    /// Rebuild the drawable-coords cache when the mesh set changed. The set
+    /// mutates only through `retire` installs/frees, unloads, and the
+    /// free-meshes passes — each bumps `draw_set_rev`; `invalidate()` keeps the
+    /// previous mesh drawing, so edits alone never bump. Steady state: no
+    /// bump, no walk. (`render`'s debug assert cross-checks the cache against
+    /// a fresh walk, so a missed bump cannot ship silently.)
+    fn sync_draw_cache(&mut self) {
+        if self.draw_cache_rev == self.draw_set_rev {
+            return;
+        }
+        self.draw_cache.clear();
+        self.draw_cache.extend(
+            self.chunks
+                .iter()
+                .filter(|(_, l)| l.state.live_meshes().is_some())
+                .map(|(&c, _)| c),
+        );
+        self.draw_cache_rev = self.draw_set_rev;
     }
 
     /// Land finished worker results (non-blocking). Generate results clear `generating`.
@@ -267,6 +332,8 @@ impl World {
                 m @ pipeline::Done::Mesh { .. } => lane_integrate::<MeshLane>(self, m),
                 l @ pipeline::Done::Light { .. } => lane_integrate::<LightLane>(self, l),
                 sc @ pipeline::Done::Section { .. } => lane_integrate::<SectionLane>(self, sc),
+                pipeline::Done::Failed(key) => self.fail_job(*key),
+                pipeline::Done::Cancelled(key) => self.cancel_job(*key),
             }
         }
         self.done_scratch = done;
@@ -301,6 +368,7 @@ impl World {
                 // (edit would bump rev, get dropped). Route through retire anyway
                 // to free any stray token as state moves to Ready/Air.
                 loaded.retire(MeshState::from_upload(handles), eng);
+                self.draw_set_rev += 1;
             }
         }
 
@@ -332,7 +400,7 @@ impl World {
     }
 
     /// Mesh result at `rev`: queue for upload if still applies; else drop and re-arm scan.
-    pub(in crate::world) fn accept_mesh(&mut self, coord: Coord, rev: u32, data: ChunkMeshData) {
+    pub(in crate::world) fn accept_mesh(&mut self, coord: Coord, rev: u32, data: Box<ChunkMeshData>) {
         if self.mesh_result_applies(coord, rev) {
             self.upload_queue.push_back((coord, rev, data));
         } else {
@@ -364,7 +432,10 @@ impl World {
         self.ensure_data(center);
         let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
         for coord in self.data_box(center).coords() {
-            if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
+            if self.chunks.contains_key(&coord)
+                || self.generating.contains(&coord)
+                || self.quarantined.contains(&FailKey::Column { col: (coord.x, coord.z) })
+            {
                 continue;
             }
             let entry = columns.entry((coord.x, coord.z)).or_insert((coord.y, coord.y));
@@ -413,6 +484,96 @@ impl World {
         for (coord, chunk) in chunks {
             self.generating.remove(&coord);
             self.accept_chunk(coord, chunk);
+        }
+    }
+
+    /// A queued job was DESCHEDULED at the pool: its region left the live view
+    /// while it waited (fast movement). Release the exact claim with no strike
+    /// and no requeue — the work is unwanted where the player is now, and the
+    /// boundary-cross scans re-request it if the player ever returns.
+    pub(in crate::world) fn cancel_job(&mut self, key: pipeline::JobKey) {
+        match key {
+            pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                for cyy in cy {
+                    self.generating.remove(&Coord::new(cx, cyy, cz));
+                }
+            }
+            pipeline::JobKey::Mesh { coord } => {
+                if let Some(loaded) = self.chunks.get_mut(&coord) {
+                    loaded.state.release_build();
+                }
+            }
+            pipeline::JobKey::Light { coord } => {
+                self.light_inflight.remove(&coord);
+                // Re-seed rather than drop: if the chunk is still loaded (the
+                // cancel ring sits outside the unload ring, so this is rare),
+                // it is owed a settle; an unloaded chunk's seed is dropped by
+                // the lane's submit.
+                self.light_worklist.insert(coord);
+                self.light_pending.set();
+            }
+            pipeline::JobKey::Section { pos } => {
+                if matches!(self.sections.get(&pos), Some(SectionState::Meshing)) {
+                    self.sections.remove(&pos);
+                }
+            }
+        }
+    }
+
+    /// A worker job PANICKED: release its exact claim so streaming can
+    /// converge, then retry (the normal scans re-request freed work) up to
+    /// [`MAX_JOB_STRIKES`] times. Past that the claim is quarantined — a
+    /// bounded hole instead of an infinite panic loop — and every enqueue path
+    /// skips it via `quarantined`.
+    pub(in crate::world) fn fail_job(&mut self, key: pipeline::JobKey) {
+        let fail_key = FailKey::of(&key);
+        let strikes = self.job_strikes.entry(fail_key).or_insert(0);
+        *strikes = strikes.saturating_add(1);
+        let quarantine = *strikes >= MAX_JOB_STRIKES;
+        if quarantine {
+            self.quarantined.insert(fail_key);
+            eprintln!("streaming: {fail_key:?} panicked {MAX_JOB_STRIKES} times — quarantined");
+        }
+        match key {
+            pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                for cyy in cy {
+                    self.generating.remove(&Coord::new(cx, cyy, cz));
+                }
+                // Freed claims are only re-requested on a boundary cross;
+                // re-request now so a standing-still player still converges.
+                if !quarantine {
+                    if let Some(center) = self.center {
+                        self.request_region_data(center);
+                    }
+                }
+            }
+            pipeline::JobKey::Mesh { coord } => {
+                if let Some(loaded) = self.chunks.get_mut(&coord) {
+                    loaded.state.release_build();
+                }
+                if !quarantine {
+                    self.mesh_worklist.insert(coord);
+                    self.pending_fresh.set();
+                }
+            }
+            pipeline::JobKey::Light { coord } => {
+                self.light_inflight.remove(&coord);
+                if !quarantine {
+                    self.light_worklist.insert(coord);
+                    self.light_pending.set();
+                }
+                // Quarantined light: the chunk never settles, so the mesh
+                // lane's degrade timeout takes over and the terminal flush
+                // promotes it — the world converges on fallback light.
+            }
+            pipeline::JobKey::Section { pos } => {
+                if matches!(self.sections.get(&pos), Some(SectionState::Meshing)) {
+                    self.sections.remove(&pos);
+                }
+                if !quarantine {
+                    self.pending_sections.set();
+                }
+            }
         }
     }
 
@@ -505,6 +666,7 @@ impl World {
             .collect();
         // A removed chunk changes what the BFS can reach.
         self.occlusion_dirty.raise(!far.is_empty());
+        self.draw_set_rev += !far.is_empty() as u64;
         for coord in far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             if let Some(loaded) = self.chunks.remove(&coord) {
@@ -592,11 +754,17 @@ impl World {
         })
     }
 
-    /// Skylight ceiling: surface height per column (pure generator fn, caves dark
-    /// consistently). Keyed by `(x, z)` chunk column — the surface heightmap is
-    /// independent of `y` and of edits, so it is computed once per column and
-    /// shared across every vertical chunk and every re-settle. `capture_ceiling`
-    /// therefore samples 256 noise columns *once per column ever*, not per settle.
+    /// Skylight ceiling: ground height per column (pure generator fn, caves dark
+    /// consistently) RAISED by edited opaque roofs, so a player-built ceiling
+    /// shadows the chunks below it (G-03). Keyed by `(x, z)` chunk column and
+    /// cached — the generator half never changes and `set_block` invalidates
+    /// the entry when an edit moves a column's ceiling, so `capture_ceiling`
+    /// samples 256 noise columns once per column, not per settle.
+    ///
+    /// Generated volumetrics (overhang shelves, flying islands) are still NOT
+    /// part of the ceiling: `height()` deliberately describes ground only, so
+    /// they don't shadow the columns beneath them — a known model limit that
+    /// needs a generator-side occupancy summary to lift.
     pub(in crate::world) fn capture_ceiling(&mut self, coord: Coord) -> light::CeilingWindow {
         if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
             return ceiling.clone();
@@ -604,9 +772,25 @@ impl World {
         let x0 = coord.x * CHUNK_SIZE as i32;
         let z0 = coord.z * CHUNK_SIZE as i32;
         let generator = &self.generator;
-        let ceiling = light::CeilingWindow::from_heights(|lx, lz| {
+        let mut ceiling = light::CeilingWindow::from_heights(|lx, lz| {
             generator.height(x0 + lx as i32, z0 + lz as i32)
         });
+        // Every edited opaque cell in this column is a potential roof: open
+        // sky begins above the topmost one. The overlay has no column index,
+        // so this scans edited chunks — once per cached column, off the voxel
+        // hot path.
+        for (&c, cells) in &self.edits {
+            if c.x != coord.x || c.z != coord.z {
+                continue;
+            }
+            for (&index, &id) in cells {
+                if !self.registry.is_opaque(id) {
+                    continue;
+                }
+                let (lx, ly, lz) = Chunk::local_of(index);
+                ceiling.raise(lx, lz, c.y * CHUNK_SIZE as i32 + ly as i32 + 1);
+            }
+        }
         self.ceilings.insert((coord.x, coord.z), ceiling.clone());
         ceiling
     }
@@ -615,7 +799,7 @@ impl World {
     /// without a flood, or `None` if it must go through the worker settle. The
     /// two trivial cases collapse the load-time light-job burst to the thin
     /// Dense surface band (see [`store_chunk`](Self::store_chunk)):
-    /// - a uniform-*opaque* chunk settles to all-dark (no light enters);
+    /// - a uniform opaque, non-emissive chunk settles to all-dark (no light enters);
     /// - a uniform-*air* chunk fully above every column's surface, with no near
     ///   blocklight from a loaded neighbour, settles to full sky / dark block.
     ///
@@ -630,9 +814,10 @@ impl World {
         }
         self.refresh_tables();
         let tables = self.tables.get();
-        // A full block of opaque rock settles to all-dark: no skylight column
-        // stays open through it and no neighbour light can relax into an opaque
-        // cell — so this holds regardless of neighbours (dark unconditionally).
+        // A full block of inert opaque rock settles to all-dark: no skylight
+        // column stays open through it and no neighbour light can relax into an
+        // opaque cell. Emissive opaque blocks must take the flood path so they
+        // can seed their own blocklight.
         if chunk.is_uniform_opaque(&tables) {
             return Some(light::LightGrid::dark());
         }
@@ -783,13 +968,15 @@ impl World {
             return;
         }
         let generator = self.generator.clone();
+        // The generator stores resolved IDs for every element-worldgen
+        // composition registered during `World::new`. A fresh builtin registry
+        // is too short for those IDs; snapshot the matching color table instead.
+        let colors = self.registry.color_snapshot();
         let cfg = &self.section_pyramid;
         let extent = BakeExtent::new(cfg.outer_m() as i32, cfg.coarsest());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // Use fresh builtin registry (not Clone/Send); bake is seed-pure.
-            let registry = crate::block::registry::BlockRegistry::with_builtins();
-            let _ = tx.send(HeightMip::bake(&generator, &registry, extent));
+            let _ = tx.send(HeightMip::bake(&generator, &colors, extent));
         });
         self.section_mip_rx = Some(rx);
     }
@@ -1114,12 +1301,52 @@ impl World {
         true
     }
 
+    /// Every desired far-field section is itself Ready — the strongest far-field
+    /// state. `entry_complete` accepts a Ready *ancestor* as covering (right for
+    /// playability), but a coarse cover moves the horizon's pixels — and through
+    /// the exposure meter, the whole frame's brightness — as refinement lands.
+    /// The golden harness gates captures on this so blessed shots are the
+    /// converged frame; gameplay never waits on it.
+    pub fn far_field_refined(&self) -> bool {
+        let Some(center) = self.center else { return false };
+        if !self.lod2 {
+            return true;
+        }
+        if !self.section_upload_queue.is_empty() {
+            return false;
+        }
+        self.desired_sections(center)
+            .into_iter()
+            .all(|c| self.sections.get(&c).is_some_and(|s| s.is_ready()))
+    }
+
+    /// How many desired far-field sections still lack their own mesh — the
+    /// harness's progress signal while it waits on
+    /// [`far_field_refined`](Self::far_field_refined).
+    pub fn far_field_pending(&self) -> usize {
+        let Some(center) = self.center else { return 0 };
+        if !self.lod2 {
+            return 0;
+        }
+        self.desired_sections(center)
+            .into_iter()
+            .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
+            .count()
+    }
+
     /// Human-readable reason `entry_complete` is not yet true — the first
     /// unsatisfied clause with a count, so a stalled bless/harness run says WHICH
     /// streaming stage is stuck instead of hanging silently. Clause order mirrors
     /// [`entry_complete`](Self::entry_complete).
     pub fn entry_debug(&self) -> String {
         let Some(center) = self.center else { return "no stream centre yet".into() };
+        if !self.quarantined.is_empty() {
+            return format!(
+                "{} claim(s) quarantined after repeated worker panics: {:?}",
+                self.quarantined.len(),
+                self.quarantined.iter().take(4).collect::<Vec<_>>()
+            );
+        }
         let near: [(&str, usize); 8] = [
             ("generating", self.generating.len()),
             ("mesh_worklist", self.mesh_worklist.len()),
@@ -1232,24 +1459,50 @@ impl World {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             debug_assert!(loaded.state.is_dirty(), "sync remesh of non-Dirty {coord:?}");
             loaded.retire(MeshState::from_upload(handles), eng);
+            self.draw_set_rev += 1;
         }
     }
 
-    /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected).
+    /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected)
+    /// or a stamped meshing input (AO) flipped — the epoch folds into the revision's high bits
+    /// (block count stays far below 2^32, so the two never collide).
     pub(in crate::world) fn refresh_tables(&mut self) {
         // Split the borrow: `sync`'s rebuild closure needs `&self.registry`
         // while `&mut self.tables` is held, so bind `registry` separately.
         let count = self.registry.block_count();
         let registry = &self.registry;
-        self.tables.sync(Revision::from_count(count), || registry.hot_tables());
+        let layer_cap = self.texture_layer_cap;
+        let ao = self.ao;
+        let rev = Revision::from_count(count | (self.tables_epoch as usize) << 32);
+        self.tables.sync(rev, || {
+            let mut tables = registry.hot_tables();
+            tables.layer_cap = layer_cap;
+            tables.ao = ao;
+            tables
+        });
     }
 
     /// Rebuild/upload block texture array on palette growth (rare: world entry or new block type).
+    /// The per-id layer cache makes growth O(new blocks), not O(palette).
     fn refresh_textures(&mut self, eng: &mut Engine) {
+        // Never zero (modulo divisor) and never past the vertex field's u16.
+        self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
         let count = self.registry.block_count();
         if self.textures_built != count {
-            let layers = crate::block::texture::build_block_textures(&self.registry);
-            eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, &layers);
+            for i in self.texture_cache.len()..count {
+                self.texture_cache.push(crate::block::texture::build_block_texture(
+                    &self.registry,
+                    crate::block::registry::BlockId(i as u16),
+                ));
+            }
+            let visible = count.min(self.texture_layer_cap as usize);
+            if count > visible && self.textures_built <= visible {
+                eprintln!(
+                    "block palette ({count}) exceeds the device texture-layer cap \
+                     ({visible}); further block textures wrap onto existing layers"
+                );
+            }
+            eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, &self.texture_cache[..visible]);
             self.textures_built = count;
         }
     }

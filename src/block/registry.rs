@@ -18,13 +18,14 @@ use crate::block::element::{CoreProperties, El, ElementId, ElementRegistry, Spec
 use crate::block::reaction::{ActiveReaction, ReactionRegistry, apply_reactions};
 use crate::macros::blocks;
 
-/// A compact handle to a registered block. Voxels store this (1 byte), so a chunk
-/// is just a flat array of ids into the registry. The [`MAX_BLOCK_TYPES`] cap keeps
-/// every id inside the `u8` space.
+/// A compact handle to a registered block. Chunks store these through per-chunk
+/// palettes (cells stay one byte — see [`ChunkData`](crate::world::chunk::ChunkData)),
+/// so widening the id space costs no chunk memory. The [`MAX_BLOCK_TYPES`] cap
+/// keeps every id inside the mesh vertex's 14-bit texture-layer field.
 ///
 /// [`MAX_BLOCK_TYPES`]: BlockRegistry::MAX_BLOCK_TYPES
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BlockId(pub u8);
+pub struct BlockId(pub u16);
 
 /// Empty space. Always id `0`, the only non-solid block.
 pub const AIR: BlockId = BlockId(0);
@@ -64,7 +65,6 @@ pub struct BlockRegistry {
 /// at one revision (the registry is append-only, so `block_count()` stamps it) —
 /// no window in which `solid` is fresh but `opaque` is stale. Handed to worker
 /// mesh jobs behind an `Arc` via [`crate::derived::Derived`].
-#[derive(Default)]
 pub struct HotTables {
     pub solid: Box<[bool]>,
     pub opaque: Box<[bool]>,
@@ -78,6 +78,28 @@ pub struct HotTables {
     /// animated water shading. Water and glass share [`Pass::Blend`], so this,
     /// not the pass, is what distinguishes them at the fragment.
     pub water: Box<[bool]>,
+    /// The device's texture-array layer ceiling; the mesher emits
+    /// `id % layer_cap` as the vertex layer. Identity while the palette fits
+    /// (every id < cap — the common case). Never zero: defaults to `u16::MAX`
+    /// and the world stamps the real cap when it refreshes tables.
+    pub layer_cap: u16,
+    /// Baked corner ambient occlusion — a meshing input the world stamps from
+    /// its settings (like `layer_cap`); off reads every corner unoccluded.
+    pub ao: bool,
+}
+
+impl Default for HotTables {
+    fn default() -> Self {
+        Self {
+            solid: Box::default(),
+            opaque: Box::default(),
+            layer: Box::default(),
+            emission: Box::default(),
+            water: Box::default(),
+            layer_cap: u16::MAX,
+            ao: true,
+        }
+    }
 }
 
 impl BlockRegistry {
@@ -165,6 +187,10 @@ impl BlockRegistry {
                 .zip(self.layer.iter())
                 .map(|(&b, &l)| b > 0 && l == Pass::Blend)
                 .collect(),
+            // The registry owns no device or settings knowledge; the world
+            // stamps the real cap and AO choice right after (`refresh_tables`).
+            layer_cap: u16::MAX,
+            ao: true,
         }
     }
 
@@ -172,6 +198,13 @@ impl BlockRegistry {
     #[inline]
     pub fn color(&self, id: BlockId) -> Color {
         self.color[id.0 as usize]
+    }
+
+    /// Immutable colour table for background jobs. The element-worldgen
+    /// compiler registers additional natural compositions after the builtins,
+    /// so recreating a builtin-only registry on a worker is not equivalent.
+    pub(crate) fn color_snapshot(&self) -> Box<[Color]> {
+        self.color.clone().into_boxed_slice()
     }
 
     /// The full cold record for a block, for inspection and crafting.
@@ -184,11 +217,13 @@ impl BlockRegistry {
         &self.elements
     }
 
-    /// How many distinct blocks are registered.
-    /// Hard cap on distinct block types: the mesher stores the texture-array
-    /// layer as a u8 (vertex color alpha), and it also bounds what remote
-    /// network specs can make a client's palette (and texture memory) grow to.
-    pub const MAX_BLOCK_TYPES: usize = 256;
+    /// Hard cap on distinct block types: the packed mesh vertex carries the
+    /// texture-array layer in a 14-bit field (the engine's `MASK_LAYER`), and it
+    /// also bounds what remote network specs can make a client's palette (and
+    /// texture memory) grow to. Distinct *looks* saturate earlier at the GPU's
+    /// `maxImageArrayLayers` (commonly 2048) — past that, layers wrap with a loud
+    /// log but registration never fails.
+    pub const MAX_BLOCK_TYPES: usize = 16_384;
 
     /// Whether the palette can still take a NEW composition.
     pub fn at_capacity(&self) -> bool {
@@ -286,7 +321,7 @@ impl BlockRegistry {
         emission: u8,
         color: Color,
     ) -> BlockId {
-        let id = BlockId(self.blocks.len() as u8);
+        let id = BlockId(self.blocks.len() as u16);
         self.blocks.push(block);
         self.solid.push(solid);
         self.buoyancy.push(buoyancy);
@@ -424,11 +459,10 @@ blocks! {
     Water => Composition::natural(&[El::Water.id()]),
     // Biome dressing on cold or high ground.
     Snow => Composition::natural(&[El::Snow.id()]),
-    // Tree trunk: woody brown, distinct from packed dirt.
-    Wood => Composition::mixture(&[(El::Soil.id(), 55), (El::Coal.id(), 25), (El::Clay.id(), 20)])
-        .expect("builtin Wood sums to 100"),
-    // Tree canopy: pure living green.
-    Leaves => Composition::natural(&[El::Organic.id()]),
+    // (Wood/Leaves were retired with Earth-style trees: every block terrain
+    // emits is now a natural union the placement table derives. Old saves that
+    // placed them still load — specs are compositional, so the mixtures simply
+    // re-register by their elements.)
 }
 
 #[cfg(test)]
@@ -450,7 +484,7 @@ mod tests {
         let reg = BlockRegistry::with_builtins();
         let hot = reg.hot_tables();
         for i in 0..reg.block_count() {
-            let id = BlockId(i as u8);
+            let id = BlockId(i as u16);
             let block = reg.block(id);
             let solid = derive::derive_solid(&block.composition);
             assert_eq!(reg.is_solid(id), solid);
@@ -469,7 +503,7 @@ mod tests {
     fn dump_colors() {
         let reg = BlockRegistry::with_builtins();
         for i in 0..reg.block_count() {
-            let id = BlockId(i as u8);
+            let id = BlockId(i as u16);
             let c = reg.color(id);
             let name = &reg.block(id).name;
             eprintln!("id={i} name={name} rgba=({},{},{},{})", c.r, c.g, c.b, c.a);
@@ -485,9 +519,11 @@ mod tests {
     }
 
     #[test]
-    fn stone_keeps_its_grey() {
+    fn stone_keeps_its_slate() {
+        // A pure single-element block carries its element's colour exactly —
+        // the derivation adds nothing for a one-part composition.
         let reg = BlockRegistry::with_builtins();
-        assert_eq!(reg.color(Blk::Stone.id()), Color::new(128, 128, 128, 255));
+        assert_eq!(reg.color(Blk::Stone.id()), Color::new(112, 118, 128, 255));
     }
 
     #[test]
@@ -504,18 +540,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicated_natural_element_does_not_collapse_to_singleton() {
+    fn duplicated_natural_element_collapses_to_the_set() {
         let mut reg = BlockRegistry::with_builtins();
         let before = reg.block_count();
-        // [Stone, Stone] carries a different weight (count 2) than plain [Stone]
-        // (count 1), so it must register as a distinct block, not dedup with Stone.
+        // Naturals are sets (G-15): [Stone, Stone] canonicalizes to [Stone],
+        // so it dedups with the builtin instead of minting a duplicate block
+        // that would fail to round-trip through save/network specs.
         let doubled = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
-        assert_ne!(doubled, Blk::Stone.id());
-        assert_eq!(reg.block_count(), before + 1);
-        // Registering the same doubled composition again dedups with itself.
-        let doubled_again = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
-        assert_eq!(doubled, doubled_again);
-        assert_eq!(reg.block_count(), before + 1);
+        assert_eq!(doubled, Blk::Stone.id());
+        assert_eq!(reg.block_count(), before, "no duplicate variant registered");
     }
 
     #[test]
@@ -523,23 +556,29 @@ mod tests {
         use crate::block::element::ElementId;
         let mut reg = BlockRegistry::with_builtins();
         let n = reg.elements().len() as u16;
-        // Fill the palette to its cap with distinct three-element natural blocks.
+        // Fill the palette to its cap with distinct two-element mixtures: element
+        // pairs × 99 split ratios comfortably exceeds MAX_BLOCK_TYPES.
         'fill: for i in 0..n {
             for j in (i + 1)..n {
-                for k in (j + 1)..n {
+                for p in 1..=99u8 {
                     if reg.at_capacity() {
                         break 'fill;
                     }
-                    reg.natural(&[ElementId(i), ElementId(j), ElementId(k)]);
+                    reg.mixture(&[(ElementId(i), p), (ElementId(j), 100 - p)])
+                        .expect("distinct mixture registers below the cap");
                 }
             }
         }
-        assert!(reg.at_capacity(), "test needs enough elements to fill the palette");
+        assert!(reg.at_capacity(), "test needs enough element pairs to fill the palette");
         assert_eq!(reg.block_count(), BlockRegistry::MAX_BLOCK_TYPES);
         // A brand-new composition past the cap is refused, not truncated into a
-        // colliding u8 voxel id.
+        // colliding voxel id. (A natural and a three-way mixture — neither shape
+        // was registered by the pair fill.)
         assert_eq!(reg.natural(&[ElementId(0), ElementId(1), ElementId(2), ElementId(3)]), None);
-        assert_eq!(reg.mixture(&[(ElementId(0), 60), (ElementId(1), 40)]), Err(MixError::Full));
+        assert_eq!(
+            reg.mixture(&[(ElementId(0), 50), (ElementId(1), 30), (ElementId(2), 20)]),
+            Err(MixError::Full)
+        );
         assert_eq!(reg.block_count(), BlockRegistry::MAX_BLOCK_TYPES);
     }
 

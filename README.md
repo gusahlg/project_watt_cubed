@@ -38,10 +38,16 @@ starting with `/` is a local command (e.g. `/tp`).
 
 ### Safety
 
-Connections are password-gated, every wire frame is length-capped, each client is
-rate-limited, and every edit is bounds- and reach-validated server-side, so a client
-can't reach across the map or flood the server. Traffic is **not** encrypted — host
-behind a VPN or trusted network if you need confidentiality on the wire.
+Connections are password-gated and version/content-checked (a build whose
+worldgen would produce a different world from the shared seed is refused at
+join). Every wire frame is length-capped, each client is rate-limited, and
+pre-auth connections are bounded. Movement is plausibility-checked server-side
+(implausible jumps are snapped back; `/tp` is an explicit request the server
+may refuse via `--no-teleport`), and every edit is validated against reach,
+spec well-formedness, and the cell's current revision — racing edits resolve
+to exactly one winner and the loser's client rolls its prediction back.
+Traffic is **not** encrypted — host behind a VPN or trusted network if you
+need confidentiality on the wire.
 
 ## Graphics
 
@@ -66,9 +72,16 @@ nix develop
 cargo run --release
 
 # Or build/run the packaged binary directly:
-nix run
+./play.sh   # re-pins the ../voxel-engine flake input, then `nix run`
 nix build   # produces ./result/bin/project_watt_cubed
 ```
+
+A plain `nix run` also works, but note the trap `play.sh` exists to avoid: the
+flake pins the sibling engine's committed `experimental` revision, so after a
+new engine commit a bare `nix run` can build the current game against a stale
+engine API. `nix flake update voxel-engine` re-pins it. Uncommitted engine edits
+are intentionally visible only to the dev-shell `cargo` path; commit them before
+testing the pure Nix package.
 
 On macOS, install MoltenVK and the Vulkan loader once (`brew install
 molten-vk vulkan-loader`) and use plain `cargo run --release`.

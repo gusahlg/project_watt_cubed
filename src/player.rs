@@ -3,22 +3,22 @@
 //! accumulate magnitude (see [`math`](crate::math)).
 use voxel_engine::DVec3;
 
-use crate::math::{Aabb, Bounded};
+use crate::math::{Aabb, Bounded, PER_METER};
 
 /// The player's collision half-width on the horizontal axes (x and z). Vertical
 /// extent is not a constant — it derives from [`Stance::height`] — so there is no
 /// `y` here to fall out of sync with the stance.
-pub const PLAYER_HALF_WIDTH: f64 = 0.3;
+pub const PLAYER_HALF_WIDTH: f64 = 0.3 * PER_METER;
 
 /// A fresh player's base ground walk speed, units/second. It lives on the player
 /// (see [`Player::speed`]) rather than in the movement module so it can vary per
 /// player; this is only the starting value.
-pub const DEFAULT_WALK_SPEED: f64 = 6.0;
+pub const DEFAULT_WALK_SPEED: f64 = 6.0 * PER_METER;
 
 /// A fresh player's flying speed, units/second. Lives on the player (see
 /// [`Player::fly_speed`]) for the same reason [`DEFAULT_WALK_SPEED`] does — so it
 /// can vary per player; this is only the starting value.
-pub const DEFAULT_FLY_SPEED: f64 = 14.0;
+pub const DEFAULT_FLY_SPEED: f64 = 14.0 * PER_METER;
 
 /// A fresh player's health, and the ceiling it's created at. Health is an intrinsic
 /// property the player carries but nothing yet reads or changes — see
@@ -32,7 +32,7 @@ pub const MAX_HEALTH: f32 = 20.0;
 ///
 /// The eye is anchored to the *feet*, not to the box centre: [`eye_offset`] is the
 /// eye's height above the feet, fixed at 90% of the stance height so the eyes sit
-/// just below the crown. `Standing` is 1.8 tall; `Sneaking` shrinks the box *and*
+/// just below the crown. `Standing` is 1.8 m tall; `Sneaking` shrinks the box *and*
 /// drops the eye proportionally, so crouching lowers both the head and the camera.
 ///
 /// [`eye_offset`]: Stance::eye_offset
@@ -43,13 +43,13 @@ pub enum Stance {
 }
 
 impl Stance {
-    /// Full standing (or crouching) height in blocks — the primitive from which
-    /// the box half-extent and eye height both derive, so they can't drift apart.
-    /// Sneaking lowers it.
+    /// Full standing (or crouching) height (1.8 m / 1.5 m in world units) — the
+    /// primitive from which the box half-extent and eye height both derive, so
+    /// they can't drift apart. Sneaking lowers it.
     pub fn height(self) -> f64 {
         match self {
-            Stance::Standing => 1.8,
-            Stance::Sneaking => 1.5,
+            Stance::Standing => 1.8 * PER_METER,
+            Stance::Sneaking => 1.5 * PER_METER,
         }
     }
 

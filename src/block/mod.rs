@@ -23,5 +23,5 @@ pub mod texture;
 
 pub use composition::{Composition, Mix, MixError};
 pub use element::{CoreProperties, Element, ElementId, ElementRegistry, SpecialKind, SpecialProperty};
-pub use reaction::{ActiveReaction, Reaction, ReactionEffect, ReactionRegistry};
+pub use reaction::{ActiveReaction, Reaction, ReactionEffect, ReactionError, ReactionRegistry};
 pub use registry::{AIR, Block, BlockId, BlockRegistry};

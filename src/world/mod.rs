@@ -35,6 +35,7 @@ pub mod light;
 pub mod lod;
 pub mod mesh;
 pub mod pipeline;
+pub mod placement;
 pub mod pyramid;
 pub mod section;
 
@@ -523,7 +524,7 @@ pub struct World {
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
-    upload_queue: VecDeque<(Coord, u32, ChunkMeshData)>,
+    upload_queue: VecDeque<(Coord, u32, Box<ChunkMeshData>)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
     /// old whole-map rescan `pending_fresh` armed). Seeded on load (self + 6
     /// neighbours), on a light publish that moved a border, and on an
@@ -562,8 +563,38 @@ pub struct World {
     /// Reusable buffer for draining worker results, so the drain neither
     /// borrows the channel across the processing loop nor allocates per frame.
     done_scratch: Vec<pipeline::Done>,
+    /// Panic counts per failed claim, for the bounded-retry policy in
+    /// [`fail_job`](World::fail_job). Rare by construction (a strike is a
+    /// worker panic), so the map stays tiny.
+    job_strikes: FastMap<streaming::FailKey, u8>,
+    /// Claims that kept panicking: permanently parked so one poison input is a
+    /// bounded hole in the world, not an infinite resubmit-panic loop. Every
+    /// scan that would re-request the work consults this set.
+    quarantined: FastSet<streaming::FailKey>,
     /// Block count last uploaded. Rebuilds/re-uploads when palette grows.
     textures_built: usize,
+    /// Built texture layers by id, kept so palette growth (crafting registers
+    /// one block at a time) appends new layers instead of regenerating all.
+    texture_cache: Vec<Vec<u8>>,
+    /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
+    /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
+    /// stream pass reads the engine cap (identity in practice — ids start tiny).
+    texture_layer_cap: u16,
+    /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
+    /// input like `lighting`: toggling remeshes the world.
+    ao: bool,
+    /// Bumped whenever a chunk gains or loses a drawable mesh (retire installs
+    /// and frees, unloads, the free-meshes passes). `invalidate()` keeps the
+    /// previous mesh drawing, so per-edit dirtying never bumps.
+    draw_set_rev: u64,
+    /// Drawable chunk coords, rebuilt by `sync_draw_cache` when `draw_set_rev`
+    /// moved — render walks this (~live set) instead of every loaded chunk.
+    draw_cache: Vec<Coord>,
+    draw_cache_rev: u64,
+    /// Bumped whenever a non-registry meshing input stamped onto the hot
+    /// tables changes (AO today), so `refresh_tables` rebuilds even though the
+    /// block count didn't move — the count and epoch fold into one revision.
+    tables_epoch: u32,
     /// Occlusion visible set (rebuilt at stream sync point, read by render).
     occlusion: Occlusion,
     /// Occlusion visible set needs rebuild (input-triggered on centre/chunk/connectivity change).
@@ -627,8 +658,10 @@ impl World {
     ///
     /// [`RenderConfig`]: crate::render_config::RenderConfig
     pub fn with_config(seed: i64, render: crate::render_config::RenderConfig) -> Self {
-        let registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&registry, 20.0, seed);
+        // `mut` for the placement compile: the generator registers every block
+        // terrain can emit here at startup, then keeps only resolved ids.
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, seed);
         // The section ladder's innermost ring begins where the full-res box ends,
         // so its `unit` is the render distance in metres.
         let unit = (DEFAULT_VIEW_RADIUS * CHUNK_SIZE as i32) as f32;
@@ -657,7 +690,17 @@ impl World {
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
             done_scratch: Vec::new(),
+            job_strikes: FastMap::default(),
+            quarantined: FastSet::default(),
             textures_built: 0,
+            texture_cache: Vec::new(),
+            texture_layer_cap: u16::MAX,
+            ao: true,
+            tables_epoch: 0,
+            draw_set_rev: 0,
+            draw_cache: Vec::new(),
+            // Differs from `draw_set_rev` so the first stream builds the cache.
+            draw_cache_rev: u64::MAX,
             occlusion: Occlusion::default(),
             occlusion_dirty: Sticky::default(),
             occlusion_active: false,
@@ -729,11 +772,19 @@ impl World {
         // Layer 1 — full-res chunks, drawn first so they fill depth before the
         // tile backdrop. No ownership cull: the tiles under them are pushed back by
         // depth bias, not skipped, so there is no boundary to align.
+        // The drawable-coords cache (synced at the end of `stream`, the frame's
+        // last mutation point) — the walk is O(live), not O(loaded).
+        debug_assert_eq!(
+            self.draw_cache.len(),
+            self.chunks.values().filter(|l| l.state.live_meshes().is_some()).count(),
+            "draw cache went stale: a mesh-set mutation missed its draw_set_rev bump"
+        );
         let mut live = 0u64;
-        for (&coord, loaded) in &self.chunks {
+        for &coord in &self.draw_cache {
             if self.occlusion_active && !self.occlusion.is_visible(coord) {
                 continue;
             }
+            let Some(loaded) = self.chunks.get(&coord) else { continue };
             if let Some(meshes) = loaded.state.live_meshes() {
                 live += 1;
                 let origin =
@@ -1112,7 +1163,9 @@ impl LaneSpec for MeshLane {
     fn ready(world: &World, key: Coord) -> bool {
         // Ready if needs mesh, in view, has all neighbour data, and either light
         // is settled or wait timeout expired (then mesh degraded and remesh later).
+        // Quarantined (repeatedly panicking) meshes are never ready.
         world.is_needs_mesh(key)
+            && !world.quarantined.contains(&streaming::FailKey::Mesh { coord: key })
             && world.in_mesh_box(key)
             && world.neighbours_have_data(key)
             && (world.light_ready(key) || world.light_wait_expired(key))
@@ -1157,7 +1210,11 @@ impl LaneSpec for SectionLane {
             world
                 .desired_sections(center)
                 .into_iter()
-                .filter(|s| !world.sections.contains_key(s) && !world.coverage_skips(center, *s))
+                .filter(|s| {
+                    !world.sections.contains_key(s)
+                        && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
+                        && !world.coverage_skips(center, *s)
+                })
                 .collect(),
         )
     }
@@ -1229,7 +1286,10 @@ impl LaneSpec for LightLane {
         world.light_inflight.contains(&key)
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
-        if !world.lighting || !world.chunks.contains_key(&key) {
+        if !world.lighting
+            || !world.chunks.contains_key(&key)
+            || world.quarantined.contains(&streaming::FailKey::Light { coord: key })
+        {
             return None;
         }
         world.refresh_tables();
@@ -1342,8 +1402,11 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
         world.view = ViewVolume::view(20);
-        world.section_mip =
-            Some(HeightMip::bake(&world.generator, &world.registry, BakeExtent::new(2048, section::FINEST_DETAIL + 3)));
+        world.section_mip = Some(HeightMip::bake(
+            &world.generator,
+            &world.registry.color_snapshot(),
+            BakeExtent::new(2048, section::FINEST_DETAIL + 3),
+        ));
         let mip = world.section_mip.clone().unwrap();
 
         let cell = SectionPos { detail: section::FINEST_DETAIL, x: 0, z: 0 };
@@ -1386,8 +1449,11 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
         world.view = ViewVolume::view(20);
-        world.section_mip =
-            Some(HeightMip::bake(&world.generator, &world.registry, BakeExtent::new(2048, section::FINEST_DETAIL + 3)));
+        world.section_mip = Some(HeightMip::bake(
+            &world.generator,
+            &world.registry.color_snapshot(),
+            BakeExtent::new(2048, section::FINEST_DETAIL + 3),
+        ));
         let mip = world.section_mip.clone().unwrap();
 
         // Far section: clip draws it, so don't skip it.
@@ -1460,9 +1526,12 @@ mod tests {
     fn column_is_layered_grass_dirt_stone() {
         let mut world = World::generate();
         let reg = world.registry();
+        // Terrain speaks elements now: the crust blocks are the natural unions
+        // the placement table derives, not the authored Grass/Dirt mixtures
+        // (which remain registered for crafting and old saves).
         let (grass, dirt, stone) = (
-            reg.id_by_name("Grass").unwrap(),
-            reg.id_by_name("Dirt").unwrap(),
+            reg.id_by_name("Soil+Organic").unwrap(),
+            reg.id_by_name("Soil+Clay").unwrap(),
             reg.id_by_name("Stone").unwrap(),
         );
 
@@ -1482,6 +1551,22 @@ mod tests {
         // Deep stone persists below y = 0.
         world.ensure_data(World::chunk_of(x, h - 70, z));
         assert_eq!(world.block_at(x, h - 70, z), stone);
+    }
+
+    #[test]
+    fn restoring_the_generated_block_compacts_the_overlay() {
+        // Edit-and-revert must leave NO overlay weight: regeneration produces
+        // the reverted block anyway, so saves and join transfers stay
+        // proportional to the world's real difference from its seed.
+        let mut world = World::generate();
+        let (x, z) = (8, 8);
+        let h = (0..96).rev().find(|&y| world.is_solid(x, y, z)).unwrap();
+        let original = world.block_at(x, h, z);
+        assert_eq!(world.edits().count(), 0);
+        world.set_block(x, h, z, AIR);
+        assert_eq!(world.edits().count(), 1, "a real edit is recorded");
+        world.set_block(x, h, z, original);
+        assert_eq!(world.edits().count(), 0, "restoring generation drops the entry");
     }
 
     #[test]
@@ -1562,6 +1647,91 @@ mod tests {
     }
 
     #[test]
+    fn failed_jobs_release_claims_then_quarantine_after_repeated_strikes() {
+        let mut world = World::generate();
+        let coord = *world.chunks.keys().next().unwrap();
+
+        // Mesh lane: a panicked build releases the claim and re-seeds the worklist.
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+        world.mesh_worklist.remove(&coord);
+        world.fail_job(pipeline::JobKey::Mesh { coord });
+        assert!(
+            matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }),
+            "the build claim must be released"
+        );
+        assert!(world.mesh_worklist.contains(&coord), "released work is re-seeded");
+
+        // Strike out: the third failure quarantines and stops re-seeding.
+        world.fail_job(pipeline::JobKey::Mesh { coord });
+        world.mesh_worklist.remove(&coord);
+        world.fail_job(pipeline::JobKey::Mesh { coord });
+        assert!(world.quarantined.contains(&streaming::FailKey::Mesh { coord }));
+        assert!(!world.mesh_worklist.contains(&coord), "quarantined claims are not re-seeded");
+        assert!(
+            !<MeshLane as LaneSpec>::ready(&world, coord),
+            "the mesh lane skips a quarantined coord"
+        );
+
+        // Light lane: claim released and re-seeded, then quarantined likewise.
+        world.light_inflight.insert(coord);
+        world.light_worklist.remove(&coord);
+        world.fail_job(pipeline::JobKey::Light { coord });
+        assert!(!world.light_inflight.contains(&coord));
+        assert!(world.light_worklist.contains(&coord));
+        for _ in 0..2 {
+            world.light_inflight.insert(coord);
+            world.fail_job(pipeline::JobKey::Light { coord });
+        }
+        assert!(!world.light_inflight.contains(&coord), "claim always releases");
+        assert!(world.quarantined.contains(&streaming::FailKey::Light { coord }));
+        assert!(
+            <LightLane as LaneSpec>::submit(&mut world, coord).is_none(),
+            "a quarantined light claim never resubmits"
+        );
+
+        // Generate lane: every claimed coord in the failed column span clears.
+        let (cx, cz) = (100, 100);
+        for cy in 0..=2 {
+            world.generating.insert(ChunkCoord::new(cx, cy, cz));
+        }
+        world.fail_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=2 });
+        assert!((0..=2).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
+
+        // Section lane: a panicked Meshing claim is dropped so selection retries.
+        let pos = SectionPos { detail: 2, x: 9, z: 9 };
+        world.sections.insert(pos, SectionState::Meshing);
+        world.fail_job(pipeline::JobKey::Section { pos });
+        assert!(!world.sections.contains_key(&pos), "the Meshing claim must clear");
+    }
+
+    /// Descheduled (left-behind) jobs release their claims like panics do,
+    /// but with NO strike, NO quarantine, and no forced requeue — coming back
+    /// later must re-request the work as if it had never been claimed.
+    #[test]
+    fn cancelled_jobs_release_claims_without_strikes() {
+        let mut world = World::generate();
+        let coord = *world.chunks.keys().next().unwrap();
+
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+        world.cancel_job(pipeline::JobKey::Mesh { coord });
+        assert!(matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }));
+
+        world.light_inflight.insert(coord);
+        world.cancel_job(pipeline::JobKey::Light { coord });
+        assert!(!world.light_inflight.contains(&coord));
+
+        let (cx, cz) = (200, 200);
+        for cy in 0..=1 {
+            world.generating.insert(ChunkCoord::new(cx, cy, cz));
+        }
+        world.cancel_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=1 });
+        assert!((0..=1).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
+
+        assert!(world.quarantined.is_empty(), "cancellation is not a failure");
+        assert!(world.job_strikes.is_empty(), "cancellation earns no strikes");
+    }
+
+    #[test]
     fn stale_rev_mesh_results_are_dropped() {
         let mut world = World::generate();
         world.center = Some(ChunkCoord::new(0, 0, 0));
@@ -1573,12 +1743,12 @@ mod tests {
         assert!(!world.mesh_result_applies(coord, rev));
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert!(world.upload_queue.is_empty(), "stale result never queues");
         assert!(world.pending_fresh.get(), "drop re-arms the scan");
 
         let rev = world.chunks[&coord].rev;
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert_eq!(world.upload_queue.len(), 1);
         world.upload_queue.clear();
 
@@ -1690,7 +1860,7 @@ mod tests {
         assert_ne!(world.chunks[&coord].rev, rev, "edit bumps rev");
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert!(world.upload_queue.is_empty(), "stale mesh result never queues");
         assert!(world.chunks[&coord].state.is_dirty(), "chunk stays Dirty for the sync remesh");
         assert!(world.pending_fresh.get(), "drop re-arms the fresh scan");
@@ -1709,7 +1879,7 @@ mod tests {
         assert!(!world.mesh_result_applies(coord, rev), "out-of-box result is stale");
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, new_chunk_mesh_data());
+        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
         assert!(world.upload_queue.is_empty(), "stale result never queues");
         assert_eq!(
             world.chunks[&coord].state,

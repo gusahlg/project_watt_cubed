@@ -24,8 +24,6 @@ use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
 use crate::ui::{visible_window, HudElement, Panel, Role, Row};
 use crate::world::World;
 
-/// How far the player can reach to place a block — matches the break reach.
-const PLACE_REACH: f64 = 6.0;
 const PANEL_WIDTH: i32 = 360;
 const PANEL_PAD: i32 = 8;
 const FONT_SIZE: i32 = 18;
@@ -188,7 +186,7 @@ impl CraftingMod {
             ctx.world,
             ctx.player.position,
             ctx.player.forward(),
-            PLACE_REACH,
+            interact::REACH,
         ) else {
             return;
         };
@@ -260,6 +258,12 @@ impl Mod for CraftingMod {
         } else {
             self.try_place(ctx);
         }
+    }
+
+    fn on_place_rejected(&mut self, id: BlockId, world: &World) {
+        // The server refused the placement: the spent block comes back to the
+        // pouch (re-listing it if the entry emptied meanwhile).
+        self.push_loaded(world, id, 1, false);
     }
 
     fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
