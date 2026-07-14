@@ -4,7 +4,7 @@
 
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 use crate::coord::BlockCoord;
-use crate::math::{Aabb, block_coord};
+use crate::math::{Aabb, block_coord, block_coord_end};
 use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
@@ -170,16 +170,15 @@ impl World {
     /// box touches (1–8 for anything player-sized) instead of one per cell,
     /// and a uniform chunk answers for all its cells with one solidity load.
     pub fn collides(&self, aabb: &Aabb) -> bool {
-        // TODO Stage 1: dedupe with Aabb::voxel_cells — this re-derives the same
-        // cell range but needs it grouped-by-chunk (one map probe per chunk),
-        // which voxel_cells' flat per-cell iterator doesn't provide; routing
-        // through it would change the iteration order/perf, so defer.
-        // Same cell range as `Aabb::voxel_cells`: block_coord(min)..=block_coord(max)
-        // (the shared clamped floor, so a box at the world border stays in i32).
+        // Same cell range as `Aabb::voxel_cells` (shared clamped floor and
+        // exclusive-upper-edge helpers, so a box at the world border stays in
+        // i32 and exact face contact does not visit the touching next voxel),
+        // but grouped by owning chunk — voxel_cells' flat per-cell iterator
+        // can't provide the one-map-probe-per-chunk order this hot path needs.
         let (min, max) = (aabb.min(), aabb.max());
-        let (x0, x1) = (block_coord(min.x), block_coord(max.x));
-        let (y0, y1) = (block_coord(min.y), block_coord(max.y));
-        let (z0, z1) = (block_coord(min.z), block_coord(max.z));
+        let (x0, x1) = (block_coord(min.x), block_coord_end(max.x));
+        let (y0, y1) = (block_coord(min.y), block_coord_end(max.y));
+        let (z0, z1) = (block_coord(min.z), block_coord_end(max.z));
 
         let s = CHUNK_SIZE as i32;
         for cx in x0.div_euclid(s)..=x1.div_euclid(s) {

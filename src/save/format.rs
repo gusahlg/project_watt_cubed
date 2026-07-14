@@ -298,6 +298,16 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     };
     let flags = r.u8()?;
     let player = PlayerState { flying: flags & 1 != 0, noclip: flags & 2 != 0, ..player };
+    // Raw float bit patterns are not all valid game states: NaN/Infinity would
+    // poison camera/physics on load, and a position outside the border breaks
+    // the clamp every continuous writer maintains. Reject rather than repair —
+    // the slot store then falls back to the intact backup file.
+    if player.pos.iter().any(|v| !v.is_finite() || v.abs() > crate::math::WORLD_BORDER)
+        || !player.yaw.is_finite()
+        || !player.pitch.is_finite()
+    {
+        return Err(SaveError::Corrupt("player state is non-finite or out of world"));
+    }
 
     let spec_count = r.u16()? as usize;
     if spec_count > MAX_SPECS {
@@ -529,6 +539,27 @@ mod tests {
         doc.meta.name = format!("{}é", "x".repeat(63)); // é straddles the 64-byte cut
         let bytes = encode(&doc).unwrap();
         assert_eq!(peek_meta(&bytes).unwrap().name, "x".repeat(63));
+    }
+
+    #[test]
+    fn non_finite_or_out_of_world_player_state_is_rejected() {
+        let doc = sample();
+        let base = encode(&doc).unwrap();
+
+        // NaN into pos.x (first f64 after the header).
+        let mut bytes = base.clone();
+        bytes[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
+
+        // Infinity into yaw (after the three f64 position words).
+        let mut bytes = base.clone();
+        bytes[HEADER_LEN + 24..HEADER_LEN + 28].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
+
+        // A finite position far outside the world border is corrupt too.
+        let mut bytes = base;
+        bytes[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&3.0e9f64.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
     }
 
     #[test]

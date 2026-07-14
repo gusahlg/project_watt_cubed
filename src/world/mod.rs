@@ -563,6 +563,14 @@ pub struct World {
     /// Reusable buffer for draining worker results, so the drain neither
     /// borrows the channel across the processing loop nor allocates per frame.
     done_scratch: Vec<pipeline::Done>,
+    /// Panic counts per failed claim, for the bounded-retry policy in
+    /// [`fail_job`](World::fail_job). Rare by construction (a strike is a
+    /// worker panic), so the map stays tiny.
+    job_strikes: FastMap<streaming::FailKey, u8>,
+    /// Claims that kept panicking: permanently parked so one poison input is a
+    /// bounded hole in the world, not an infinite resubmit-panic loop. Every
+    /// scan that would re-request the work consults this set.
+    quarantined: FastSet<streaming::FailKey>,
     /// Block count last uploaded. Rebuilds/re-uploads when palette grows.
     textures_built: usize,
     /// Built texture layers by id, kept so palette growth (crafting registers
@@ -682,6 +690,8 @@ impl World {
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
             done_scratch: Vec::new(),
+            job_strikes: FastMap::default(),
+            quarantined: FastSet::default(),
             textures_built: 0,
             texture_cache: Vec::new(),
             texture_layer_cap: u16::MAX,
@@ -1153,7 +1163,9 @@ impl LaneSpec for MeshLane {
     fn ready(world: &World, key: Coord) -> bool {
         // Ready if needs mesh, in view, has all neighbour data, and either light
         // is settled or wait timeout expired (then mesh degraded and remesh later).
+        // Quarantined (repeatedly panicking) meshes are never ready.
         world.is_needs_mesh(key)
+            && !world.quarantined.contains(&streaming::FailKey::Mesh { coord: key })
             && world.in_mesh_box(key)
             && world.neighbours_have_data(key)
             && (world.light_ready(key) || world.light_wait_expired(key))
@@ -1198,7 +1210,11 @@ impl LaneSpec for SectionLane {
             world
                 .desired_sections(center)
                 .into_iter()
-                .filter(|s| !world.sections.contains_key(s) && !world.coverage_skips(center, *s))
+                .filter(|s| {
+                    !world.sections.contains_key(s)
+                        && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
+                        && !world.coverage_skips(center, *s)
+                })
                 .collect(),
         )
     }
@@ -1270,7 +1286,10 @@ impl LaneSpec for LightLane {
         world.light_inflight.contains(&key)
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
-        if !world.lighting || !world.chunks.contains_key(&key) {
+        if !world.lighting
+            || !world.chunks.contains_key(&key)
+            || world.quarantined.contains(&streaming::FailKey::Light { coord: key })
+        {
             return None;
         }
         world.refresh_tables();
@@ -1625,6 +1644,91 @@ mod tests {
         );
         assert_eq!(world.light_apply_queue.len(), 1);
         assert!(!world.transition_lighting(true), "same value is a no-op");
+    }
+
+    #[test]
+    fn failed_jobs_release_claims_then_quarantine_after_repeated_strikes() {
+        let mut world = World::generate();
+        let coord = *world.chunks.keys().next().unwrap();
+
+        // Mesh lane: a panicked build releases the claim and re-seeds the worklist.
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+        world.mesh_worklist.remove(&coord);
+        world.fail_job(pipeline::JobKey::Mesh { coord });
+        assert!(
+            matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }),
+            "the build claim must be released"
+        );
+        assert!(world.mesh_worklist.contains(&coord), "released work is re-seeded");
+
+        // Strike out: the third failure quarantines and stops re-seeding.
+        world.fail_job(pipeline::JobKey::Mesh { coord });
+        world.mesh_worklist.remove(&coord);
+        world.fail_job(pipeline::JobKey::Mesh { coord });
+        assert!(world.quarantined.contains(&streaming::FailKey::Mesh { coord }));
+        assert!(!world.mesh_worklist.contains(&coord), "quarantined claims are not re-seeded");
+        assert!(
+            !<MeshLane as LaneSpec>::ready(&world, coord),
+            "the mesh lane skips a quarantined coord"
+        );
+
+        // Light lane: claim released and re-seeded, then quarantined likewise.
+        world.light_inflight.insert(coord);
+        world.light_worklist.remove(&coord);
+        world.fail_job(pipeline::JobKey::Light { coord });
+        assert!(!world.light_inflight.contains(&coord));
+        assert!(world.light_worklist.contains(&coord));
+        for _ in 0..2 {
+            world.light_inflight.insert(coord);
+            world.fail_job(pipeline::JobKey::Light { coord });
+        }
+        assert!(!world.light_inflight.contains(&coord), "claim always releases");
+        assert!(world.quarantined.contains(&streaming::FailKey::Light { coord }));
+        assert!(
+            <LightLane as LaneSpec>::submit(&mut world, coord).is_none(),
+            "a quarantined light claim never resubmits"
+        );
+
+        // Generate lane: every claimed coord in the failed column span clears.
+        let (cx, cz) = (100, 100);
+        for cy in 0..=2 {
+            world.generating.insert(ChunkCoord::new(cx, cy, cz));
+        }
+        world.fail_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=2 });
+        assert!((0..=2).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
+
+        // Section lane: a panicked Meshing claim is dropped so selection retries.
+        let pos = SectionPos { detail: 2, x: 9, z: 9 };
+        world.sections.insert(pos, SectionState::Meshing);
+        world.fail_job(pipeline::JobKey::Section { pos });
+        assert!(!world.sections.contains_key(&pos), "the Meshing claim must clear");
+    }
+
+    /// Descheduled (left-behind) jobs release their claims like panics do,
+    /// but with NO strike, NO quarantine, and no forced requeue — coming back
+    /// later must re-request the work as if it had never been claimed.
+    #[test]
+    fn cancelled_jobs_release_claims_without_strikes() {
+        let mut world = World::generate();
+        let coord = *world.chunks.keys().next().unwrap();
+
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+        world.cancel_job(pipeline::JobKey::Mesh { coord });
+        assert!(matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }));
+
+        world.light_inflight.insert(coord);
+        world.cancel_job(pipeline::JobKey::Light { coord });
+        assert!(!world.light_inflight.contains(&coord));
+
+        let (cx, cz) = (200, 200);
+        for cy in 0..=1 {
+            world.generating.insert(ChunkCoord::new(cx, cy, cz));
+        }
+        world.cancel_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=1 });
+        assert!((0..=1).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
+
+        assert!(world.quarantined.is_empty(), "cancellation is not a failure");
+        assert!(world.job_strikes.is_empty(), "cancellation earns no strikes");
     }
 
     #[test]

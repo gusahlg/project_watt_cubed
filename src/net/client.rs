@@ -45,11 +45,23 @@ pub struct RemotePlayer {
     pub name: String,
     /// Animation state for this peer.
     pub anim: presence::Animator,
+    /// Whether this peer is inside interest range with a real pose. Joins
+    /// start hidden (the roster carries names, not positions); the first
+    /// `PeerMove` reveals them and `PeerExited` hides them again — so a peer
+    /// who wandered off is not drawn frozen at their last heard pose.
+    visible: bool,
     prev: Snapshot,
     target: Snapshot,
     recv_at: Instant,
     interval: Duration,
     distance: f64,
+}
+
+impl RemotePlayer {
+    /// Whether this peer should be drawn (see the `visible` field).
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
 }
 
 /// Sampled render state at a point in time: an interpolated pose plus the derived
@@ -113,16 +125,28 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 /// Something from the server the game must act on. Peer presence and movement are
 /// applied inside [`Connection::poll`]; these are what the game still has to handle.
 pub enum Incoming {
-    /// A block changed somewhere — apply it to the local world overlay.
+    /// A block changed somewhere — apply it to the local world overlay. Stale
+    /// revisions were already filtered out by the connection.
     Edit { x: i32, y: i32, z: i32, spec: String },
+    /// The server accepted our own edit `req`: prediction can forget it.
+    EditAccepted { req: u32 },
+    /// The server rejected our own edit `req`: roll the optimistic economy
+    /// back, and — when `restore` is set (no newer authoritative content has
+    /// landed on the cell since) — restore the cell to what it held before
+    /// the optimistic apply.
+    EditRejected { req: u32, restore: bool },
+    /// The server's authoritative position for us (refused teleport,
+    /// implausible movement): snap to it.
+    Position { pos: DVec3 },
     /// A chat line to show in the console.
     Chat { from_name: String, channel: u8, text: String },
     /// A player joined the server.
     Joined { name: String },
     /// A player left the server.
     Left { name: String },
-    /// The shared world time changed; `day` is a `[0,1)` fraction.
-    Time { day: f32 },
+    /// The shared world time changed; `day` is a `[0,1)` fraction and
+    /// `day_secs` the server's cycle length in real seconds.
+    Time { day: f32, day_secs: f32 },
     /// The server dropped us; the game should leave the world.
     Disconnected,
 }
@@ -143,6 +167,14 @@ pub struct Connection {
     ping_sent: Option<(u32, Instant)>,
     ping_seq: u32,
     ping_ms: Option<u32>,
+    /// CONFIRMED cell revisions from the server (snapshot, broadcasts, and
+    /// accepted acks) — what future edit expectations are computed against.
+    cell_revs: HashMap<(i32, i32, i32), u32>,
+    /// Our in-flight edits as `(req, cell, expect)`, in send order. Counted
+    /// per cell so a quick break-then-place chain expects the revisions its
+    /// own earlier requests will commit.
+    pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
+    next_req: u32,
 }
 
 impl Connection {
@@ -163,6 +195,7 @@ impl Connection {
         // Send the handshake and wait, briefly, for the reply.
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
+            fingerprint: crate::net::content_fingerprint(),
             name: name.to_string(),
             password: password.to_string(),
         };
@@ -209,6 +242,9 @@ impl Connection {
             ping_sent: None,
             ping_seq: 0,
             ping_ms: None,
+            cell_revs: HashMap::new(),
+            pending_edits: Vec::new(),
+            next_req: 0,
         })
     }
 
@@ -278,24 +314,54 @@ impl Connection {
     fn apply(&mut self, msg: ServerMessage, out: &mut Vec<Incoming>) {
         match msg {
             ServerMessage::Snapshot { edits } => {
-                for (x, y, z, spec) in edits {
+                for (x, y, z, rev, spec) in edits {
+                    self.cell_revs.insert((x, y, z), rev);
                     out.push(Incoming::Edit { x, y, z, spec });
                 }
             }
-            ServerMessage::Edit { x, y, z, spec } => out.push(Incoming::Edit { x, y, z, spec }),
+            ServerMessage::Edit { x, y, z, rev, spec } => {
+                // Per-cell revisions make application order-independent: only
+                // strictly newer content lands, so a stale or reordered frame
+                // can never revert a newer cell.
+                let cell = (x, y, z);
+                if rev > self.cell_revs.get(&cell).copied().unwrap_or(0) {
+                    self.cell_revs.insert(cell, rev);
+                    out.push(Incoming::Edit { x, y, z, spec });
+                }
+            }
+            ServerMessage::EditAck { req, accepted, rev } => {
+                let Some(at) = self.pending_edits.iter().position(|&(r, _, _)| r == req) else {
+                    return;
+                };
+                let (_, cell, expect) = self.pending_edits.remove(at);
+                if accepted {
+                    let known = self.cell_revs.entry(cell).or_insert(0);
+                    *known = (*known).max(rev);
+                    out.push(Incoming::EditAccepted { req });
+                } else {
+                    // Restore our optimistic apply only if nothing newer has
+                    // confirmed on the cell meanwhile (the race winner's Edit
+                    // broadcast may land before or after this ack).
+                    let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
+                    out.push(Incoming::EditRejected { req, restore: confirmed <= expect });
+                }
+            }
+            ServerMessage::Position { pos } => out.push(Incoming::Position { pos }),
             ServerMessage::Chat { from_name, channel, text, .. } => {
                 out.push(Incoming::Chat { from_name, channel, text })
             }
-            ServerMessage::Time { day } => out.push(Incoming::Time { day }),
+            ServerMessage::Time { day, day_secs } => out.push(Incoming::Time { day, day_secs }),
             ServerMessage::PeerJoined { id, name } => {
                 // prev == target on join: speed 0 and a stationary phase, no
-                // Option<history> and no special-casing downstream.
+                // Option<history> and no special-casing downstream. Hidden
+                // until their first PeerMove carries a real pose.
                 let spawn =
                     Snapshot { pos: self.spawn, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
                 out.push(Incoming::Joined { name: name.clone() });
                 self.peers.entry(id).or_insert(RemotePlayer {
                     name,
                     anim: presence::Animator::default(),
+                    visible: false,
                     prev: spawn,
                     target: spawn,
                     recv_at: Instant::now(),
@@ -310,11 +376,26 @@ impl Connection {
             }
             ServerMessage::PeerMove { id, pos, yaw, pitch, stance } => {
                 if let Some(p) = self.peers.get_mut(&id) {
-                    p.interval = p.recv_at.elapsed();
-                    p.prev = p.target;
-                    p.target = Snapshot { pos, yaw, pitch, stance };
+                    let snapshot = Snapshot { pos, yaw, pitch, stance };
+                    if p.visible {
+                        p.interval = p.recv_at.elapsed();
+                        p.prev = p.target;
+                        p.target = snapshot;
+                        p.distance += horizontal(p.prev.pos, p.target.pos);
+                    } else {
+                        // Re-entering interest range: snap, never lerp the
+                        // avatar across the distance covered while hidden.
+                        p.visible = true;
+                        p.interval = Duration::from_millis(0);
+                        p.prev = snapshot;
+                        p.target = snapshot;
+                    }
                     p.recv_at = Instant::now();
-                    p.distance += horizontal(p.prev.pos, p.target.pos);
+                }
+            }
+            ServerMessage::PeerExited { id } => {
+                if let Some(p) = self.peers.get_mut(&id) {
+                    p.visible = false;
                 }
             }
             ServerMessage::PeerSwing { id } => {
@@ -355,18 +436,41 @@ impl Connection {
         self.dispatch(&ClientMessage::Move { pos, yaw, pitch, stance });
     }
 
+    /// Tell the server about an explicit `/tp` discontinuity. Ordinary moves
+    /// are envelope-checked server-side; this is the sanctioned jump, which
+    /// the server may still refuse with a [`Incoming::Position`] snap-back.
+    pub fn send_teleport(&mut self, pos: DVec3) {
+        // Reset the move throttle memory so the next `send_move` reports the
+        // post-teleport position promptly.
+        self.last_sent = None;
+        self.dispatch(&ClientMessage::Teleport { pos });
+    }
+
     /// Tell the server the player swung their arm (block break/place), so
     /// nearby avatars animate it.
     pub fn send_swing(&mut self) {
         self.dispatch(&ClientMessage::Swing);
     }
 
-    /// Tell the server about a block the player changed.
-    pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: String) {
+    /// Tell the server about a block the player changed. Returns the request
+    /// id the eventual [`Incoming::EditAccepted`]/[`Incoming::EditRejected`]
+    /// verdict will carry — the game keys its rollback bookkeeping on it.
+    /// The expected revision counts our own in-flight edits on the cell, so a
+    /// quick break-then-place chain lines up with the revisions its earlier
+    /// requests will commit.
+    pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: String) -> u32 {
+        let cell = (x, y, z);
+        let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
+        let in_flight = self.pending_edits.iter().filter(|&&(_, c, _)| c == cell).count() as u32;
+        let expect = confirmed + in_flight;
+        self.next_req = self.next_req.wrapping_add(1);
+        let req = self.next_req;
         if spec.len() > MAX_SPEC {
-            return;
+            return req; // never sent; no ack will come, nothing pends
         }
-        self.dispatch(&ClientMessage::Edit { x, y, z, spec });
+        self.pending_edits.push((req, cell, expect));
+        self.dispatch(&ClientMessage::Edit { req, x, y, z, expect, spec });
+        req
     }
 
     /// Send a chat line on the given channel.
@@ -413,7 +517,7 @@ mod tests {
     fn two_clients_sync_over_loopback() {
         let handle = server::spawn(
             0,
-            Config { password: "pw".into(), seed: 4242 },
+            Config { password: "pw".into(), seed: 4242, ..Config::default() },
         )
         .unwrap();
         let port = handle.addr().port();
@@ -441,7 +545,7 @@ mod tests {
         // Report position so the server's reach check passes, then edit.
         a.last_move = Instant::now() - HEARTBEAT; // force the throttle to send
         a.send_move(s, 0.0, 0.0, Stance::Standing);
-        a.send_edit(bx, by, bz, "air".into());
+        let _ = a.send_edit(bx, by, bz, "air".into());
 
         thread::sleep(Duration::from_millis(150));
         let events = b.poll();
@@ -462,9 +566,58 @@ mod tests {
         handle.stop();
     }
 
+    /// G-01 end to end: two clients race a break on ONE cell. Exactly one is
+    /// accepted; the other is rejected (its rollback signal) and converges on
+    /// the winner's authoritative edit.
+    #[test]
+    fn racing_breaks_on_one_cell_yield_exactly_one_acceptance() {
+        let handle =
+            server::spawn(0, Config { seed: 4242, ..Config::default() }).unwrap();
+        let port = handle.addr().port();
+        let mut a = Connection::connect("127.0.0.1", port, "a", "").unwrap();
+        let mut b = Connection::connect("127.0.0.1", port, "b", "").unwrap();
+        thread::sleep(Duration::from_millis(150));
+        a.poll();
+        b.poll();
+
+        // A block under a's spawn: both spawns scatter within a few blocks of
+        // the origin, so it is within both players' edit reach.
+        let s = a.spawn();
+        let cell = (
+            crate::math::block_coord(s.x),
+            crate::math::block_coord(s.y - 3.0),
+            crate::math::block_coord(s.z),
+        );
+        let _ = a.send_edit(cell.0, cell.1, cell.2, "air".into());
+        let _ = b.send_edit(cell.0, cell.1, cell.2, "air".into());
+        thread::sleep(Duration::from_millis(200));
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        let mut loser_saw_authoritative_edit = false;
+        for events in [a.poll(), b.poll()] {
+            for event in events {
+                match event {
+                    Incoming::EditAccepted { .. } => accepted += 1,
+                    Incoming::EditRejected { .. } => rejected += 1,
+                    Incoming::Edit { x, y, z, .. } if (x, y, z) == cell => {
+                        loser_saw_authoritative_edit = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!((accepted, rejected), (1, 1), "exactly one break wins the cell");
+        assert!(
+            loser_saw_authoritative_edit,
+            "the loser must receive the winner's authoritative edit"
+        );
+        handle.stop();
+    }
+
     #[test]
     fn wrong_password_is_rejected() {
-        let handle = server::spawn(0, Config { password: "secret".into(), seed: 1 }).unwrap();
+        let handle = server::spawn(0, Config { password: "secret".into(), seed: 1, ..Config::default() }).unwrap();
         let port = handle.addr().port();
         let err = match Connection::connect("127.0.0.1", port, "eve", "guess") {
             Ok(_) => panic!("a wrong password must be refused"),

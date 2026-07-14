@@ -28,14 +28,16 @@ The disposable semantic merge was tested before touching the real branches:
 
 After the audit tests/fixes, the game library suite reached 340 passed with two intentional ignores: the existing height-mip timing benchmark and the new known-bug constructed-roof skylight regression. Final all-target verification should remain the release gate after future edits.
 
+**2026-07-14 update:** after the issue burn-down the suite is 360 passed with
+two intentional ignores (both timing benchmarks). The constructed-roof
+skylight regression is no longer ignored — the ceiling model now includes
+edited roofs, and the test is green in the ordinary suite.
+
 Useful commands:
 
 ```sh
 cargo test --all-targets
-cargo test --lib world::light::tests::constructed_roof_in_upper_chunk_shadows_lower_chunk -- --ignored --exact
 ```
-
-The second command is expected to fail today with `LightLevel(15)` versus `LightLevel(0)`. It should be made non-ignored when the ceiling model is fixed.
 
 ## New regression coverage
 

@@ -260,6 +260,12 @@ impl Mod for CraftingMod {
         }
     }
 
+    fn on_place_rejected(&mut self, id: BlockId, world: &World) {
+        // The server refused the placement: the spent block comes back to the
+        // pouch (re-listing it if the entry emptied meanwhile).
+        self.push_loaded(world, id, 1, false);
+    }
+
     fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
         let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
 

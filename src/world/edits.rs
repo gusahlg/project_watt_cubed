@@ -188,18 +188,46 @@ impl World {
         // every save and join transfer built from it) stays proportional to
         // the world's real difference from its seed. One generator query per
         // edit: user-click/network rate, never the voxel hot path.
+        let old_edit = self.edits.get(&coord).and_then(|cells| cells.get(&index)).copied();
         let generated = self.generator.block_at(x, y, z, self.generator.height(x, z));
-        if id == generated {
+        let new_edit = if id == generated {
             if let Some(cells) = self.edits.get_mut(&coord) {
                 cells.remove(&index);
                 if cells.is_empty() {
                     self.edits.remove(&coord);
                 }
             }
+            None
         } else {
             self.edits.entry(coord).or_default().insert(index, id);
-        }
+            Some(id)
+        };
         self.edit_generation += 1;
+        // Skylight ceiling upkeep (G-03): a roof appearing above a column's
+        // current ceiling raises it; the topmost edited roof disappearing
+        // lowers it. Either way the cached window is stale, and every loaded
+        // chunk at or below the edit seeds skylight from it — re-settle them
+        // so a constructed roof actually darkens the world underneath.
+        if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
+            let cell = ceiling.surface_at(lx, lz);
+            let raises = new_edit.is_some_and(|id| self.registry.is_opaque(id)) && y + 1 > cell;
+            let lowers = old_edit.is_some_and(|id| self.registry.is_opaque(id)) && y + 1 == cell;
+            if raises || lowers {
+                self.ceilings.remove(&(coord.x, coord.z));
+                if self.lighting {
+                    let shadowed: Vec<Coord> = self
+                        .chunks
+                        .keys()
+                        .copied()
+                        .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
+                        .collect();
+                    for c in shadowed {
+                        self.light_worklist.insert(c);
+                    }
+                    self.light_pending.set();
+                }
+            }
+        }
         // Invalidate section to re-extract from overlay.
         if self.lod2 {
             self.mark_dirty_sections_from_edit(x, y, z);

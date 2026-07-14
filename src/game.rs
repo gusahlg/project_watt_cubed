@@ -85,6 +85,23 @@ struct FrameInput {
     g_minimap: bool,
 }
 
+/// One optimistic edit awaiting the server's verdict: everything needed to
+/// undo it if the verdict is a rejection.
+struct PendingEdit {
+    cell: (i32, i32, i32),
+    /// What the cell held before the optimistic apply.
+    prev: crate::block::BlockId,
+    kind: PendingKind,
+}
+
+/// The economy side of a pending edit — what to give back on rejection.
+enum PendingKind {
+    /// Breaking awarded these elements; a rejection revokes them.
+    Break(Vec<crate::block::ElementId>),
+    /// Placing spent one crafted block of this id; a rejection refunds it.
+    Place(crate::block::BlockId),
+}
+
 /// The live world the player is in.
 pub struct Game {
     world: World,
@@ -98,6 +115,10 @@ pub struct Game {
     /// The live server connection when playing multiplayer; `None` in singleplayer.
     /// The player simulates locally and the server keeps everyone in sync.
     net: Option<Connection>,
+    /// Rollback bookkeeping for optimistic edits awaiting a server verdict,
+    /// keyed by the connection's request id: what the cell held before, and
+    /// what the economy optimistically did (loot gained, item spent).
+    pending_edits: std::collections::HashMap<u32, PendingEdit>,
     /// Animation state for the player's own third-person body — the same
     /// machine each remote player carries.
     local_anim: presence::Animator,
@@ -145,6 +166,7 @@ impl Game {
             console: Console::new(),
             save_name,
             net: None,
+            pending_edits: std::collections::HashMap::new(),
             local_anim: presence::Animator::default(),
             local_gait: 0.0,
             coord_cache: (i64::MIN, i64::MIN, i64::MIN, String::new()),
@@ -296,7 +318,7 @@ impl Game {
         // Keep the HUD text scale in sync with the persisted setting.
         self.theme.scale = settings.ui_scale;
 
-        if let Some(signal) = self.net_phase() {
+        if let Some(signal) = self.net_phase(mods) {
             return signal;
         }
         let input = self.input_phase(eng, router, dt);
@@ -313,10 +335,10 @@ impl Game {
     /// server dropped us. Runs before input so edits and chat keep flowing even
     /// while the console is open or the player stands still — and the move
     /// report doubles as the keepalive, so it too runs unconditionally.
-    fn net_phase(&mut self) -> Option<Signal> {
+    fn net_phase(&mut self, mods: &mut Mods) -> Option<Signal> {
         let net_disconnected = {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
-            self.apply_net_events()
+            self.apply_net_events(mods)
         };
         if net_disconnected {
             self.console.print("* disconnected from server".to_string());
@@ -443,6 +465,14 @@ impl Game {
             self.camera.cycle_person();
         }
         if eng.is_key_pressed(Key::F6) {
+            // Reattaching after the rig flew far away resumes physics at the
+            // frozen player, whose chunks may have streamed out (the centre
+            // followed the camera). Restore the collision halo synchronously
+            // BEFORE the toggle so the first reattached step never runs
+            // against unloaded air.
+            if self.camera.free_rig().is_some() {
+                self.world.prepare_around(self.player.position);
+            }
             self.camera.toggle_freecam(&self.player, &self.world, settings.fov);
         }
         None
@@ -522,9 +552,10 @@ impl Game {
         self.sim.advance(&mut self.world, dt);
     }
 
-    /// Drain queued server messages: apply world edits, surface chat, and report a
-    /// lost connection. Returns `true` if the server dropped us.
-    fn apply_net_events(&mut self) -> bool {
+    /// Drain queued server messages: apply world edits, resolve our own edit
+    /// verdicts (rolling back rejected predictions), surface chat, and report
+    /// a lost connection. Returns `true` if the server dropped us.
+    fn apply_net_events(&mut self, mods: &mut Mods) -> bool {
         let events = match &mut self.net {
             Some(net) => net.poll(),
             None => return false,
@@ -533,13 +564,33 @@ impl Game {
         for event in events {
             match event {
                 Incoming::Edit { x, y, z, spec } => {
-                    // Resolve the portable spec against our own palette, then apply.
-                    // The server echoes our OWN edits back too (that server-ordered
-                    // echo is what converges racing edits on one cell); re-applying
-                    // an edit we already made locally is harmless, just a redundant
-                    // dirty-remesh per own edit — acceptable.
+                    // Resolve the portable spec against our own palette, then
+                    // apply. The connection already dropped stale revisions,
+                    // and our own edits come back as acks, not broadcasts.
                     let id = save::parse_block(&mut self.world, &spec);
                     self.world.set_block(x, y, z, id);
+                }
+                Incoming::EditAccepted { req } => {
+                    // Prediction confirmed: the optimistic apply IS the truth.
+                    self.pending_edits.remove(&req);
+                }
+                Incoming::EditRejected { req, restore } => {
+                    let Some(pending) = self.pending_edits.remove(&req) else { continue };
+                    if restore {
+                        let (x, y, z) = pending.cell;
+                        self.world.set_block(x, y, z, pending.prev);
+                    }
+                    match pending.kind {
+                        PendingKind::Break(elements) => mods.on_break_rejected(&elements),
+                        PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
+                    }
+                }
+                Incoming::Position { pos } => {
+                    // Authoritative snap-back (refused teleport or implausible
+                    // move): land safely, exactly like a local teleport.
+                    self.world.prepare_around(pos);
+                    self.player.position = pos;
+                    self.player.cancel_fall();
                 }
                 Incoming::Chat { from_name, channel, text } => {
                     // Colour the scope tag and name so chat scans at a glance: a gold
@@ -559,7 +610,11 @@ impl Game {
                 Incoming::Left { name } => {
                     self.console.push(ui::Line::of(ui::Role::Muted, format!("* {name} left")));
                 }
-                Incoming::Time { day } => self.sky.clock.set_day(day as f64),
+                Incoming::Time { day, day_secs } => {
+                    // The server owns the shared clock: phase AND cycle length.
+                    self.sky.clock.set_day(day as f64);
+                    self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
+                }
                 Incoming::Disconnected => disconnected = true,
             }
         }
@@ -586,9 +641,11 @@ impl Game {
         self.console.echo(&line);
         let before = settings.clone();
         let day_before = self.sky.clock.day();
+        let day_len_before = self.sky.day_length;
+        let pos_before = self.player.position;
         // Each output line already carries its role (System output vs Error
         // rejection), so there is nothing to guess — just show them.
-        for out in command::execute(&line, &mut self.player, &self.world, settings, &mut self.sky) {
+        for out in command::execute(&line, &mut self.player, &mut self.world, settings, &mut self.sky) {
             self.console.push(out);
         }
         // A `/gfx` command edits settings; push the result through the one
@@ -602,6 +659,20 @@ impl Game {
         if self.sky.clock.day() != day_before {
             if let Some(net) = &mut self.net {
                 net.send_set_time(self.sky.clock.day() as f32);
+            }
+        }
+        // The cycle LENGTH is server-owned in multiplayer: a local change
+        // would silently desync every clock's advance rate.
+        if self.sky.day_length != day_len_before && self.net.is_some() {
+            self.sky.day_length = day_len_before;
+            self.console.print("* day length is set by the server".to_string());
+        }
+        // A `/tp` is a position discontinuity: ordinary moves are envelope-
+        // checked server-side, so report it as an explicit teleport (the
+        // server may still snap us back if teleports are disabled).
+        if self.player.position != pos_before {
+            if let Some(net) = &mut self.net {
+                net.send_teleport(self.player.position);
             }
         }
     }
@@ -625,10 +696,19 @@ impl Game {
         self.world.set_block(x, y, z, AIR);
         mods.on_block_break(&elements, &self.world);
         self.local_anim.on_action(WireAction::Swing);
-        // Tell the server (it validates and relays to everyone else). We apply
-        // locally above for a responsive feel; the server is still authoritative.
+        // Tell the server (it validates and relays to everyone else). The
+        // apply above is a PREDICTION for responsiveness: the ack rolls it
+        // back — cell and loot both — if we lose the race for this cell.
         if let Some(net) = &mut self.net {
-            net.send_edit(x, y, z, "air".to_string());
+            let req = net.send_edit(x, y, z, "air".to_string());
+            self.pending_edits.insert(
+                req,
+                PendingEdit {
+                    cell: (x, y, z),
+                    prev: id,
+                    kind: PendingKind::Break(elements.to_vec()),
+                },
+            );
             net.send_swing();
         }
     }
@@ -655,13 +735,19 @@ impl Game {
             if cell.intersects(&self.player.aabb()) {
                 continue;
             }
+            let prev = self.world.block_at(x, y, z);
             self.world.set_block(x, y, z, id);
             self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
             // validates and relays, exactly like breaking does with "air".
+            // The spent crafted block is refunded if the server says no.
             if let Some(net) = &mut self.net {
                 let spec = save::block_spec(&self.world, id);
-                net.send_edit(x, y, z, spec);
+                let req = net.send_edit(x, y, z, spec);
+                self.pending_edits.insert(
+                    req,
+                    PendingEdit { cell: (x, y, z), prev, kind: PendingKind::Place(id) },
+                );
                 net.send_swing();
             }
         }
@@ -823,14 +909,16 @@ impl Game {
     fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
         let screen = scene.screen;
         let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
-        // Draw minimap.
-        let player_col = IVec2::new(
-            self.player.position.x.floor() as i32,
-            self.player.position.z.floor() as i32,
-        );
-        self.minimap.draw(f, screen, player_col, self.player.yaw);
-
         let theme = &self.theme;
+
+        // Minimap: informational, so Full mode only (HUD Off must blank it too).
+        if theme.hud.shows_minimap() {
+            let player_col = IVec2::new(
+                self.player.position.x.floor() as i32,
+                self.player.position.z.floor() as i32,
+            );
+            self.minimap.draw(f, screen, player_col, self.player.yaw);
+        }
 
         // Reticle and world-space name tags: shown in every mode but fully-off.
         if theme.hud.shows_world_ui() {
@@ -871,8 +959,11 @@ impl Game {
 
         // Enabled mods contribute their HUD as data; the core renders it over the
         // world, under the console. Mods never touch the frame themselves.
-        let hud = mods.hud(&self.world, screen);
-        ui::render_hud(f, theme, screen, &hud);
+        // Gameplay UI, so it follows the reticle: hidden only when HUD is Off.
+        if theme.hud.shows_mod_hud() {
+            let hud = mods.hud(&self.world, screen);
+            ui::render_hud(f, theme, screen, &hud);
+        }
         self.console.draw(f, screen.0, screen.1);
     }
 
@@ -884,6 +975,9 @@ impl Game {
         let forward = pose.forward();
         let now = Instant::now();
         net.peers_mut()
+            // Outside interest range there is no live pose: drawing the last
+            // heard one would freeze a ghost in place.
+            .filter(|peer| peer.visible())
             .map(|peer| {
                 let r = peer.sample(now);
                 let feet = r.pos.feet(r.stance);

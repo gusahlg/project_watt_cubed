@@ -30,16 +30,18 @@ Prefer server-owned stable phases: immutable read snapshot, deterministic intent
 
 ## 4. Give streaming jobs identity, cancellation, failure, and budgets
 
-The near queue is FIFO/unbounded, rapid camera motion can enqueue obsolete regions, landed results are integrated without a firm time budget, and caught panics cannot release claims. Treat a job as a first-class record:
+**Largely landed 2026-07-14.** Jobs now carry a claim identity (`JobKey`);
+panics report `Done::Failed` with bounded retry then quarantine; queued jobs
+whose region leaves the live view are descheduled at dequeue
+(`Done::Cancelled`, claim released without strikes); and near work pops
+nearest to the CURRENT view centre rather than FIFO. Enqueue/apply budgets
+already existed.
 
-- lane/key/revision/center epoch;
-- priority by distance and age;
-- cancellation when its view epoch is obsolete;
-- `Done::Failed` with bounded retry/quarantine;
-- bounded enqueue and result-integration budgets;
-- shutdown that cancels rather than drains irrelevant work.
-
-Add a stress test that teleports the stream center repeatedly while injecting slow and failing jobs, then requires bounded queues and convergence around the last center.
+Remaining: a stress test that teleports the stream centre repeatedly while
+injecting slow and failing jobs, then requires bounded queues and convergence
+around the last centre; and shutdown that cancels rather than drains
+irrelevant work (drop today joins after at most one job per worker, which has
+been acceptable).
 
 ## 5. Separate infinite-world truth from the current finite vertical LOD slab
 
@@ -69,9 +71,10 @@ The desired answer can favor speed; it should not be an accidental discontinuity
 
 ## 8. Reduce result-channel payload size and measure worker throughput
 
-Clippy exposed a material performance smell: `pipeline::Done` is at least 544 bytes because `ChunkMeshData` sits inline in one enum variant. Box the large variant, split channels, or send an owning pointer. Add a `size_of` guard and a benchmark that measures jobs/second and channel contention before and after.
-
-This is a measurement candidate, not a guaranteed speedup.
+**Done.** The mesh variant is boxed (`Done` ≤ 128 B, compile-time guarded) and
+the ignored `mesh_result_channel_throughput` benchmark records the before/after
+(28.6k → 29.2k jobs/s; throughput is meshing-bound, the boxing is a
+payload/regression guard rather than a measured speedup).
 
 ## 9. Make GPU resource ownership and access state explicit
 

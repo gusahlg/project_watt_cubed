@@ -38,10 +38,16 @@ starting with `/` is a local command (e.g. `/tp`).
 
 ### Safety
 
-Connections are password-gated, every wire frame is length-capped, each client is
-rate-limited, and every edit is bounds- and reach-validated server-side, so a client
-can't reach across the map or flood the server. Traffic is **not** encrypted — host
-behind a VPN or trusted network if you need confidentiality on the wire.
+Connections are password-gated and version/content-checked (a build whose
+worldgen would produce a different world from the shared seed is refused at
+join). Every wire frame is length-capped, each client is rate-limited, and
+pre-auth connections are bounded. Movement is plausibility-checked server-side
+(implausible jumps are snapped back; `/tp` is an explicit request the server
+may refuse via `--no-teleport`), and every edit is validated against reach,
+spec well-formedness, and the cell's current revision — racing edits resolve
+to exactly one winner and the loser's client rolls its prediction back.
+Traffic is **not** encrypted — host behind a VPN or trusted network if you
+need confidentiality on the wire.
 
 ## Graphics
 

@@ -328,7 +328,7 @@ impl App {
             thread::sleep(Duration::from_millis(150));
         }
         let seed = fresh_seed();
-        let config = Config { password: info.password.clone(), seed };
+        let config = Config { password: info.password.clone(), seed, ..Config::default() };
         match server::spawn(info.port, config) {
             Ok(handle) => {
                 let port = handle.addr().port();

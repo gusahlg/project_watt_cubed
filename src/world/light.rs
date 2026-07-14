@@ -306,8 +306,11 @@ impl FaceShell {
     }
 }
 
-/// Terrain surface height per column; determines skylight seeding. Pure function
-/// of generator (independent of chunk load order), so caves stay consistently dark.
+/// The skylight ceiling per column: the Y at and above which a column is open
+/// sky. Seeded from the generator's ground height (a pure function, so caves
+/// stay consistently dark regardless of chunk load order), then RAISED by
+/// edited opaque roofs ([`raise`](Self::raise)) so a player-built ceiling
+/// shadows every chunk below it instead of leaking full skylight.
 #[derive(Clone)]
 pub struct CeilingWindow {
     surface: [i32; CHUNK_AREA],
@@ -333,6 +336,19 @@ impl CeilingWindow {
     #[inline]
     pub(in crate::world) fn open_above(&self, lx: usize, lz: usize, world_y: i32) -> bool {
         world_y >= self.surface[lx + lz * CHUNK_SIZE]
+    }
+
+    /// Raise one column's ceiling to at least `surface` (a constructed opaque
+    /// roof: open sky begins at the cell ABOVE it). Never lowers — the
+    /// generator ground below stays the floor of the value.
+    pub(in crate::world) fn raise(&mut self, lx: usize, lz: usize, surface: i32) {
+        let cell = &mut self.surface[lx + lz * CHUNK_SIZE];
+        *cell = (*cell).max(surface);
+    }
+
+    /// The Y at which this column becomes open sky (see [`open_above`](Self::open_above)).
+    pub(in crate::world) fn surface_at(&self, lx: usize, lz: usize) -> i32 {
+        self.surface[lx + lz * CHUNK_SIZE]
     }
 }
 
@@ -654,10 +670,9 @@ mod tests {
     }
 
     /// A player-built roof in the chunk above must stop the analytic per-column
-    /// skylight seed in the chunk below. Ignored until `CeilingWindow` includes
-    /// overlay/generated volumetric occluders instead of ground height alone.
+    /// skylight seed in the chunk below: the ceiling window is raised by edited
+    /// opaque cells and the edit invalidates the cached column (the G-03 fix).
     #[test]
-    #[ignore = "known bug: the cached skylight ceiling ignores constructed roofs"]
     fn constructed_roof_in_upper_chunk_shadows_lower_chunk() {
         use crate::coord::ChunkCoord;
         use crate::world::World;
@@ -679,6 +694,14 @@ mod tests {
                 world.set_block(x, ROOF_Y, z, stone);
             }
         }
+
+        // The ceiling moved, so every LOADED chunk below the roof in this
+        // column is owed a re-settle (the roof chunk itself is unloaded here,
+        // so any worklist entry in the column proves the cascade fired).
+        assert!(
+            world.light_worklist.iter().any(|c| c.x == 0 && c.z == 0),
+            "raising a column's ceiling must re-seed the loaded chunks below it"
+        );
 
         let ceiling = world.capture_ceiling(lower_coord);
 

@@ -540,18 +540,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicated_natural_element_does_not_collapse_to_singleton() {
+    fn duplicated_natural_element_collapses_to_the_set() {
         let mut reg = BlockRegistry::with_builtins();
         let before = reg.block_count();
-        // [Stone, Stone] carries a different weight (count 2) than plain [Stone]
-        // (count 1), so it must register as a distinct block, not dedup with Stone.
+        // Naturals are sets (G-15): [Stone, Stone] canonicalizes to [Stone],
+        // so it dedups with the builtin instead of minting a duplicate block
+        // that would fail to round-trip through save/network specs.
         let doubled = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
-        assert_ne!(doubled, Blk::Stone.id());
-        assert_eq!(reg.block_count(), before + 1);
-        // Registering the same doubled composition again dedups with itself.
-        let doubled_again = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
-        assert_eq!(doubled, doubled_again);
-        assert_eq!(reg.block_count(), before + 1);
+        assert_eq!(doubled, Blk::Stone.id());
+        assert_eq!(reg.block_count(), before, "no duplicate variant registered");
     }
 
     #[test]

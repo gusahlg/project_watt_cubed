@@ -105,6 +105,27 @@ impl ElementStash {
         true
     }
 
+    /// Take back elements, best-effort: each entry removes one of that element
+    /// if any are held. Unlike [`consume`](Self::consume) this is NOT
+    /// all-or-nothing — it is the rollback path for a server-rejected break,
+    /// where whatever was already spent elsewhere simply can't be revoked.
+    pub fn revoke(&mut self, elements: &[ElementId]) {
+        let mut removed = false;
+        for &element in elements {
+            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
+                if *count > 0 {
+                    *count -= 1;
+                    self.total -= 1;
+                    removed = true;
+                }
+            }
+        }
+        if removed {
+            self.counts.retain(|&(_, count)| count > 0);
+            self.rev += 1;
+        }
+    }
+
     /// Total elements held, across all kinds.
     pub fn total(&self) -> u32 {
         self.total
@@ -202,6 +223,18 @@ pub trait Mod {
     /// to; a crafting or logging mod could too.
     fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
         let _ = (elements, world);
+    }
+
+    /// The server rejected a break this client predicted (someone else won the
+    /// cell): revoke the loot [`on_block_break`](Self::on_block_break) awarded.
+    fn on_break_rejected(&mut self, elements: &[ElementId]) {
+        let _ = elements;
+    }
+
+    /// The server rejected a placement this client predicted: refund whatever
+    /// was spent on placing a block of `id`.
+    fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
+        let _ = (id, world);
     }
 
     /// This mod's HUD contribution while enabled, as data — a list of
@@ -305,6 +338,24 @@ impl Mods {
         for entry in &mut self.entries {
             if entry.enabled {
                 entry.module.on_block_break(elements, world);
+            }
+        }
+    }
+
+    /// Fan a rejected-break rollback out to every enabled mod.
+    pub fn on_break_rejected(&mut self, elements: &[ElementId]) {
+        for entry in &mut self.entries {
+            if entry.enabled {
+                entry.module.on_break_rejected(elements);
+            }
+        }
+    }
+
+    /// Fan a rejected-placement refund out to every enabled mod.
+    pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
+        for entry in &mut self.entries {
+            if entry.enabled {
+                entry.module.on_place_rejected(id, world);
             }
         }
     }

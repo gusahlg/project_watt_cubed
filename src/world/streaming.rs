@@ -53,6 +53,36 @@ pub(in crate::world) struct LightGate {
     degraded: FastSet<Coord>,
 }
 
+/// The strike/quarantine identity of a panicked job — the per-lane key
+/// [`World::fail_job`] counts strikes against. A generate failure is keyed by
+/// its whole column: the failing chunk inside a column job is unknown, and the
+/// span requested for a column varies with the view, so per-span keys would
+/// never accumulate strikes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(in crate::world) enum FailKey {
+    Column { col: (i32, i32) },
+    Mesh { coord: Coord },
+    Light { coord: Coord },
+    Section { pos: SectionPos },
+}
+
+impl FailKey {
+    fn of(key: &pipeline::JobKey) -> FailKey {
+        match key {
+            pipeline::JobKey::Column { col, .. } => FailKey::Column { col: *col },
+            pipeline::JobKey::Mesh { coord } => FailKey::Mesh { coord: *coord },
+            pipeline::JobKey::Light { coord } => FailKey::Light { coord: *coord },
+            pipeline::JobKey::Section { pos } => FailKey::Section { pos: *pos },
+        }
+    }
+}
+
+/// Panics tolerated per claim before it is quarantined. A panic is a real bug
+/// in job code, usually deterministic for one input — retrying a couple of
+/// times absorbs flukes (allocation pressure, a racing palette snapshot)
+/// without looping forever on poison.
+const MAX_JOB_STRIKES: u8 = 3;
+
 impl World {
     /// The mesh box: chunks meshed and drawn around `center`.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
@@ -115,6 +145,12 @@ impl World {
         // against it would discard all results and regenerate them immediately.
         let full_pass = Some(center_chunk) != self.center;
         self.center = Some(center_chunk);
+        // Publish the live view to the worker pool: queued near jobs re-order
+        // toward the player's CURRENT position at every dequeue, and entries
+        // left far behind by fast movement are descheduled instead of run.
+        if let Some(workers) = &self.workers {
+            workers.set_view(center_chunk.x, center_chunk.z, self.view.horizontal);
+        }
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
         // Each lane creates its own budget window, not shared: lanes run
@@ -296,6 +332,8 @@ impl World {
                 m @ pipeline::Done::Mesh { .. } => lane_integrate::<MeshLane>(self, m),
                 l @ pipeline::Done::Light { .. } => lane_integrate::<LightLane>(self, l),
                 sc @ pipeline::Done::Section { .. } => lane_integrate::<SectionLane>(self, sc),
+                pipeline::Done::Failed(key) => self.fail_job(*key),
+                pipeline::Done::Cancelled(key) => self.cancel_job(*key),
             }
         }
         self.done_scratch = done;
@@ -394,7 +432,10 @@ impl World {
         self.ensure_data(center);
         let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
         for coord in self.data_box(center).coords() {
-            if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
+            if self.chunks.contains_key(&coord)
+                || self.generating.contains(&coord)
+                || self.quarantined.contains(&FailKey::Column { col: (coord.x, coord.z) })
+            {
                 continue;
             }
             let entry = columns.entry((coord.x, coord.z)).or_insert((coord.y, coord.y));
@@ -443,6 +484,96 @@ impl World {
         for (coord, chunk) in chunks {
             self.generating.remove(&coord);
             self.accept_chunk(coord, chunk);
+        }
+    }
+
+    /// A queued job was DESCHEDULED at the pool: its region left the live view
+    /// while it waited (fast movement). Release the exact claim with no strike
+    /// and no requeue — the work is unwanted where the player is now, and the
+    /// boundary-cross scans re-request it if the player ever returns.
+    pub(in crate::world) fn cancel_job(&mut self, key: pipeline::JobKey) {
+        match key {
+            pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                for cyy in cy {
+                    self.generating.remove(&Coord::new(cx, cyy, cz));
+                }
+            }
+            pipeline::JobKey::Mesh { coord } => {
+                if let Some(loaded) = self.chunks.get_mut(&coord) {
+                    loaded.state.release_build();
+                }
+            }
+            pipeline::JobKey::Light { coord } => {
+                self.light_inflight.remove(&coord);
+                // Re-seed rather than drop: if the chunk is still loaded (the
+                // cancel ring sits outside the unload ring, so this is rare),
+                // it is owed a settle; an unloaded chunk's seed is dropped by
+                // the lane's submit.
+                self.light_worklist.insert(coord);
+                self.light_pending.set();
+            }
+            pipeline::JobKey::Section { pos } => {
+                if matches!(self.sections.get(&pos), Some(SectionState::Meshing)) {
+                    self.sections.remove(&pos);
+                }
+            }
+        }
+    }
+
+    /// A worker job PANICKED: release its exact claim so streaming can
+    /// converge, then retry (the normal scans re-request freed work) up to
+    /// [`MAX_JOB_STRIKES`] times. Past that the claim is quarantined — a
+    /// bounded hole instead of an infinite panic loop — and every enqueue path
+    /// skips it via `quarantined`.
+    pub(in crate::world) fn fail_job(&mut self, key: pipeline::JobKey) {
+        let fail_key = FailKey::of(&key);
+        let strikes = self.job_strikes.entry(fail_key).or_insert(0);
+        *strikes = strikes.saturating_add(1);
+        let quarantine = *strikes >= MAX_JOB_STRIKES;
+        if quarantine {
+            self.quarantined.insert(fail_key);
+            eprintln!("streaming: {fail_key:?} panicked {MAX_JOB_STRIKES} times — quarantined");
+        }
+        match key {
+            pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                for cyy in cy {
+                    self.generating.remove(&Coord::new(cx, cyy, cz));
+                }
+                // Freed claims are only re-requested on a boundary cross;
+                // re-request now so a standing-still player still converges.
+                if !quarantine {
+                    if let Some(center) = self.center {
+                        self.request_region_data(center);
+                    }
+                }
+            }
+            pipeline::JobKey::Mesh { coord } => {
+                if let Some(loaded) = self.chunks.get_mut(&coord) {
+                    loaded.state.release_build();
+                }
+                if !quarantine {
+                    self.mesh_worklist.insert(coord);
+                    self.pending_fresh.set();
+                }
+            }
+            pipeline::JobKey::Light { coord } => {
+                self.light_inflight.remove(&coord);
+                if !quarantine {
+                    self.light_worklist.insert(coord);
+                    self.light_pending.set();
+                }
+                // Quarantined light: the chunk never settles, so the mesh
+                // lane's degrade timeout takes over and the terminal flush
+                // promotes it — the world converges on fallback light.
+            }
+            pipeline::JobKey::Section { pos } => {
+                if matches!(self.sections.get(&pos), Some(SectionState::Meshing)) {
+                    self.sections.remove(&pos);
+                }
+                if !quarantine {
+                    self.pending_sections.set();
+                }
+            }
         }
     }
 
@@ -623,11 +754,17 @@ impl World {
         })
     }
 
-    /// Skylight ceiling: surface height per column (pure generator fn, caves dark
-    /// consistently). Keyed by `(x, z)` chunk column — the surface heightmap is
-    /// independent of `y` and of edits, so it is computed once per column and
-    /// shared across every vertical chunk and every re-settle. `capture_ceiling`
-    /// therefore samples 256 noise columns *once per column ever*, not per settle.
+    /// Skylight ceiling: ground height per column (pure generator fn, caves dark
+    /// consistently) RAISED by edited opaque roofs, so a player-built ceiling
+    /// shadows the chunks below it (G-03). Keyed by `(x, z)` chunk column and
+    /// cached — the generator half never changes and `set_block` invalidates
+    /// the entry when an edit moves a column's ceiling, so `capture_ceiling`
+    /// samples 256 noise columns once per column, not per settle.
+    ///
+    /// Generated volumetrics (overhang shelves, flying islands) are still NOT
+    /// part of the ceiling: `height()` deliberately describes ground only, so
+    /// they don't shadow the columns beneath them — a known model limit that
+    /// needs a generator-side occupancy summary to lift.
     pub(in crate::world) fn capture_ceiling(&mut self, coord: Coord) -> light::CeilingWindow {
         if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
             return ceiling.clone();
@@ -635,9 +772,25 @@ impl World {
         let x0 = coord.x * CHUNK_SIZE as i32;
         let z0 = coord.z * CHUNK_SIZE as i32;
         let generator = &self.generator;
-        let ceiling = light::CeilingWindow::from_heights(|lx, lz| {
+        let mut ceiling = light::CeilingWindow::from_heights(|lx, lz| {
             generator.height(x0 + lx as i32, z0 + lz as i32)
         });
+        // Every edited opaque cell in this column is a potential roof: open
+        // sky begins above the topmost one. The overlay has no column index,
+        // so this scans edited chunks — once per cached column, off the voxel
+        // hot path.
+        for (&c, cells) in &self.edits {
+            if c.x != coord.x || c.z != coord.z {
+                continue;
+            }
+            for (&index, &id) in cells {
+                if !self.registry.is_opaque(id) {
+                    continue;
+                }
+                let (lx, ly, lz) = Chunk::local_of(index);
+                ceiling.raise(lx, lz, c.y * CHUNK_SIZE as i32 + ly as i32 + 1);
+            }
+        }
         self.ceilings.insert((coord.x, coord.z), ceiling.clone());
         ceiling
     }
@@ -1187,6 +1340,13 @@ impl World {
     /// [`entry_complete`](Self::entry_complete).
     pub fn entry_debug(&self) -> String {
         let Some(center) = self.center else { return "no stream centre yet".into() };
+        if !self.quarantined.is_empty() {
+            return format!(
+                "{} claim(s) quarantined after repeated worker panics: {:?}",
+                self.quarantined.len(),
+                self.quarantined.iter().take(4).collect::<Vec<_>>()
+            );
+        }
         let near: [(&str, usize); 8] = [
             ("generating", self.generating.len()),
             ("mesh_worklist", self.mesh_worklist.len()),

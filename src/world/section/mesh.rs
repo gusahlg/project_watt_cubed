@@ -276,7 +276,10 @@ fn emit(
             // past the device texture-layer cap like the chunk mesher.
             layer % tables.layer_cap,
             Ao::NONE,
-            Light::new(sample.sky, 0),
+            // Self-emission from the hot table: a luminous material must not
+            // go dark the moment it crosses the full-res/LOD boundary. No
+            // coarse flood — the glow is the block's own, not its spill.
+            Light::new(sample.sky, tables.emission[layer as usize]),
             false,
         )
         .with_micro(sample.micro)
@@ -485,6 +488,53 @@ mod tests {
                 assert_eq!(micro, [0, 0, 0], "a top/bottom face carries a spurious micro offset");
             }
         }
+    }
+
+    /// G-11: a luminous material must keep its glow across the full-res→LOD
+    /// boundary — exposed far vertices carry the block's self-emission from
+    /// the hot table instead of hardwired zero blocklight.
+    #[test]
+    fn luminous_surfaces_keep_emission_in_the_far_mesh() {
+        let (r, tables, b) = setup();
+        // Any compiled block that emits (element worldgen places Lumin unions).
+        let lumin = BlockId(
+            tables
+                .emission
+                .iter()
+                .position(|&e| e > 0)
+                .expect("the compiled palette contains a luminous block") as u16,
+        );
+        let expected = tables.emission[lumin.0 as usize];
+
+        // Flat luminous ground. Whole-column lumin, so the coarse cell centres
+        // sample it regardless of the finest detail's cell size.
+        let r#gen = FnGen {
+            h: move |_, _| 96,
+            b: move |_, y, _| if y < 96 { lumin } else { AIR },
+            surf: lumin,
+            deep: lumin,
+        };
+        let _ = (b.stone, b.dirt);
+        let sec = Section::extract(FINEST, &r#gen, &[]);
+        let mesh = mesh_of(&sec, &tables);
+        let mut tops = 0;
+        for (_, _, q) in all_quads(&mesh) {
+            if q[0].normal() != Normal::PosY {
+                continue;
+            }
+            tops += 1;
+            for v in q {
+                assert_eq!(
+                    v.light(),
+                    Light::new(FULL_SKYLIGHT, expected),
+                    "far vertices must carry the block's self-emission"
+                );
+            }
+        }
+        assert!(tops > 0, "the luminous surface must emit top faces");
+
+        // Sanity: the registry agrees this block really emits.
+        assert!(r.hot_tables().emission[lumin.0 as usize] > 0);
     }
 
     #[test]
