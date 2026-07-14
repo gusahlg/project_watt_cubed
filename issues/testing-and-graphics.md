@@ -33,6 +33,22 @@ two intentional ignores (both timing benchmarks). The constructed-roof
 skylight regression is no longer ignored — the ceiling model now includes
 edited roofs, and the test is green in the ordinary suite.
 
+**2026-07-14, third round (shadows + measured render wins):** shadow model
+fixed (sun shadow floors skylight at a sky-dome ambient instead of erasing
+it; fixed 3×3 PCF replaces the stippling rotated 4-tap) — verified by
+`shadow_probe` captures (A/B/A view-independence still `pct_changed 0.0`) and
+before/after crops. Measured performance on the `WATT_BENCH` scenario
+(RTX 3070, user settings — fullscreen, msaa 1, taa+exposure on): the exposure
+CPU readback was 1.4 ms/frame (85% of the frame) reading write-combined
+memory — HOST_CACHED drops record time 1.42 → 0.12 ms; TAA's full-res
+copy-back was eliminated (downstream samples the resolve output directly);
+GPU attribution now covers the render-command tail (new `resolve`/`post`
+passes), which localized the remaining big items: TAA resolve ~0.5 ms at
+fullscreen (texture-fetch-bound — a shared-memory tiling rewrite is the
+recorded next opportunity) and the unmetered tonemap present-copy. Far-LOD
+draws measured cheap at altitude (0.30 ms GPU, 0.01 ms record) — already
+batched via multi-draw-indirect, nothing to win there.
+
 **2026-07-14, second round (engine burn-down):** game suite 363 passed
 (far-LOD responsiveness tests added); engine suite 84 passed plus a new
 all-module `spirv-val --target-env vulkan1.3` gate. Validation smokes after

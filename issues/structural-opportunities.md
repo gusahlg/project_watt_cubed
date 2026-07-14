@@ -144,3 +144,12 @@ The project has unusually useful timing hooks and a benchmark mode. Extend that 
 - GPU passes with VRS/TAA/exposure toggles.
 
 Record median and tail latency, memory, queue depths, and draw/section counts. This keeps “performance over readability” grounded in measured benefit and prevents correctness shortcuts from masquerading as optimization.
+
+**2026-07-14 status:** GPU attribution now covers the whole render command
+buffer (`resolve`/`post` passes). Bench numbers on the standing scenario
+(RTX 3070, fullscreen, msaa 1, taa+exposure on): 1.63 ms/frame, record
+0.12 ms, GPU ≈ 1.55 ms of which TAA resolve ~0.5 ms and sky ~0.33 ms.
+Measured next opportunities: a shared-memory tiling rewrite of
+`taa_resolve.comp` (the resolve is texture-fetch-bound: ~11 samples/px), and
+extending GPU metering to the copy command buffer (tonemap present-copy is
+the last unmeasured GPU segment).
