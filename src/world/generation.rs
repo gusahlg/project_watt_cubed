@@ -129,11 +129,21 @@ struct Fbm {
     stream: Stream,
     cell: f64,
     octaves: u8,
+    /// Sum of the octave weights. This is immutable for a field, so computing
+    /// it for every 2-D/3-D sample only burns cycles during chunk generation.
+    norm: f32,
 }
 
 impl Fbm {
-    fn norm(&self) -> f32 {
-        (0..self.octaves).map(|o| 0.5f32.powi(o as i32)).sum()
+    fn new(stream: Stream, cell: f64, octaves: u8) -> Self {
+        assert!(octaves as usize <= MAX_FBM_OCTAVES, "FBM octave cache is too small");
+        let norm = (0..octaves).map(|o| 0.5f32.powi(o as i32)).sum();
+        Self {
+            stream,
+            cell,
+            octaves,
+            norm,
+        }
     }
 
     fn at3(&self, wx: i32, wy: i32, wz: i32) -> Unit {
@@ -144,7 +154,7 @@ impl Fbm {
             acc += w * octave(self.stream.octave(o as u64), wx, wy, wz, f);
             w *= 0.5;
         }
-        Unit(acc / self.norm())
+        Unit(acc / self.norm)
     }
 
     fn at(&self, wx: i32, wz: i32) -> Unit {
@@ -155,18 +165,22 @@ impl Fbm {
             acc += w * octave2(self.stream.octave(o as u64), wx, wz, f);
             w *= 0.5;
         }
-        Unit(acc / self.norm())
+        Unit(acc / self.norm)
     }
 
     /// Cached planes down a column; bit-identical to at3, cheaper.
     fn column(&self, wx: i32, wz: i32, y_lo: i32, y_hi: i32) -> FbmColumn {
-        let cols = (0..self.octaves)
-            .map(|o| {
+        let cols = std::array::from_fn(|index| {
+            (index < self.octaves as usize).then(|| {
+                let o = index as u8;
                 let f = (1u32 << o) as f64 / self.cell;
                 OctaveColumn::new(self.stream.octave(o as u64), wx, wz, f, y_lo, y_hi)
             })
-            .collect();
-        FbmColumn { cols, norm: self.norm() }
+        });
+        FbmColumn {
+            cols,
+            norm: self.norm,
+        }
     }
 
     fn bound(&self, x0: i32, y0: i32, z0: i32) -> Interval {
@@ -179,8 +193,11 @@ impl Fbm {
             hi += w * h;
             w *= 0.5;
         }
-        let n = self.norm();
-        Interval { lo: lo / n, hi: hi / n }
+        let n = self.norm;
+        Interval {
+            lo: lo / n,
+            hi: hi / n,
+        }
     }
 
     fn sup(&self, x0: i32, y0: i32, z0: i32) -> Unit {
@@ -196,7 +213,7 @@ impl Fbm {
             hi += w * octave2_sup(self.stream.octave(o as u64), x0, z0, dx, dz, f);
             w *= 0.5;
         }
-        hi / self.norm()
+        hi / self.norm
     }
 }
 
@@ -206,8 +223,13 @@ struct Interval {
     hi: f32,
 }
 
+/// Every configured terrain FBM has at most three octaves. Keeping the cached
+/// vertical planes inline avoids two tiny heap allocations (cave + ravine) for
+/// every dense XZ column, plus island-detail allocations where active.
+const MAX_FBM_OCTAVES: usize = 3;
+
 struct FbmColumn {
-    cols: Vec<OctaveColumn>,
+    cols: [Option<OctaveColumn>; MAX_FBM_OCTAVES],
     norm: f32,
 }
 
@@ -215,7 +237,7 @@ impl FbmColumn {
     fn sample(&self, y: i32) -> Unit {
         let mut acc = 0.0;
         let mut w = 1.0;
-        for c in &self.cols {
+        for c in self.cols.iter().flatten() {
             acc += w * c.sample(y);
             w *= 0.5;
         }
@@ -320,13 +342,21 @@ impl Islands {
 
     fn density(&self, core: f32, center: i32, wy: i32, detail: f32) -> f32 {
         let dy = (wy - center) as f32;
-        let vfall = if dy >= 0.0 { dy / self.top_h } else { -dy / self.keel_h };
+        let vfall = if dy >= 0.0 {
+            dy / self.top_h
+        } else {
+            -dy / self.keel_h
+        };
         core - vfall + (detail * 2.0 - 1.0) * self.detail_amp
     }
 
     fn column(&self, wx: i32, wz: i32, y_lo: i32, y_hi: i32) -> Option<IslandColumn> {
         let (core, center) = self.core_center(wx, wz)?;
-        Some(IslandColumn { core, center, detail: self.detail.column(wx, wz, y_lo, y_hi) })
+        Some(IslandColumn {
+            core,
+            center,
+            detail: self.detail.column(wx, wz, y_lo, y_hi),
+        })
     }
 
     fn solid_col(&self, c: &IslandColumn, wy: i32) -> bool {
@@ -336,7 +366,9 @@ impl Islands {
     fn solid(&self, wx: i32, wy: i32, wz: i32) -> bool {
         match self.core_center(wx, wz) {
             None => false,
-            Some((core, center)) => self.density(core, center, wy, self.detail.at3(wx, wy, wz).0) > 0.0,
+            Some((core, center)) => {
+                self.density(core, center, wy, self.detail.at3(wx, wy, wz).0) > 0.0
+            }
         }
     }
 
@@ -400,10 +432,16 @@ struct Warp {
 }
 
 impl Warp {
-    fn at(&self, wx: i32, wz: i32) -> Unit {
+    fn coordinates(&self, wx: i32, wz: i32) -> (i32, i32) {
         let ox = (self.dx.at(wx, wz).0 as f64 * 2.0 - 1.0) * self.amp;
         let oz = (self.dz.at(wx, wz).0 as f64 * 2.0 - 1.0) * self.amp;
-        self.field.at(wx + ox.round() as i32, wz + oz.round() as i32)
+        (wx + ox.round() as i32, wz + oz.round() as i32)
+    }
+
+    #[cfg(test)]
+    fn at(&self, wx: i32, wz: i32) -> Unit {
+        let (x, z) = self.coordinates(wx, wz);
+        self.field.at(x, z)
     }
 }
 
@@ -416,8 +454,15 @@ struct Control {
 }
 
 impl Control {
-    fn at(&self, wx: i32, wz: i32) -> f32 {
-        self.curve.eval(self.field.at(wx, wz).0.powf(self.gamma))
+    fn shape(&self, raw: Unit) -> f32 {
+        // Most terrain controls deliberately use the identity gamma. Avoid a
+        // comparatively expensive libm call for those samples.
+        let redistributed = if self.gamma == 1.0 {
+            raw.0
+        } else {
+            raw.0.powf(self.gamma)
+        };
+        self.curve.eval(redistributed)
     }
 }
 
@@ -523,7 +568,10 @@ fn octave_bound(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
     let (xc, xn, xf0, xf1) = axis(x0, freq);
     let (yc, yn, yf0, yf1) = axis(y0, freq);
     let (zc, zn, zf0, zf1) = axis(z0, freq);
-    debug_assert!(xn <= 3 && yn <= 3 && zn <= 3, "16 blocks cross at most 2 cell boundaries");
+    debug_assert!(
+        xn <= 3 && yn <= 3 && zn <= 3,
+        "16 blocks cross at most 2 cell boundaries"
+    );
 
     let mut corner = [[[0.0f32; 4]; 4]; 4];
     for (i, plane) in corner.iter_mut().enumerate().take(xn + 1) {
@@ -540,7 +588,10 @@ fn octave_bound(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
     }
 
     let ends = |i: usize, n: usize, f0: f32, f1: f32| -> [f32; 2] {
-        [if i == 0 { f0 } else { 0.0 }, if i + 1 == n { f1 } else { 1.0 }]
+        [
+            if i == 0 { f0 } else { 0.0 },
+            if i + 1 == n { f1 } else { 1.0 },
+        ]
     };
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for i in 0..xn {
@@ -651,10 +702,10 @@ const CONT_KNOTS: &[(f32, f32)] = &[
     (0.35, -12.0),
     (0.48, -3.0),
     (0.55, 2.0),
-    (0.62, 4.0),   // flat bench — plains
-    (0.66, 14.0),  // sharp step up — escarpment
+    (0.62, 4.0),  // flat bench — plains
+    (0.66, 14.0), // sharp step up — escarpment
     (0.82, 26.0),
-    (0.90, 30.0),  // high plateau shelf
+    (0.90, 30.0), // high plateau shelf
     (1.00, 52.0),
 ];
 /// Erosion → relief amplitude: flat plains at low erosion, jagged mountains high.
@@ -665,8 +716,8 @@ const EROSION_KNOTS: &[(f32, f32)] = &[
     (0.30, 5.0),
     (0.52, 16.0),
     (0.72, 42.0),
-    (0.88, 90.0),   // steepened tail — dramatic highlands
-    (1.00, 150.0),  // rare, genuinely tall country
+    (0.88, 90.0),  // steepened tail — dramatic highlands
+    (1.00, 150.0), // rare, genuinely tall country
 ];
 /// Weirdness → signed ridge factor: peaks flanking a valley floor at the mid band,
 /// where rivers run.
@@ -815,7 +866,7 @@ impl Terrain {
         // resolved by hand; every material is an enumerated element union.
         let mat = placement::builtin().compile(registry);
         let s = Seed(seed);
-        let fbm = |salt: u64, cell: f64, octaves: u8| Fbm { stream: s.stream(salt), cell, octaves };
+        let fbm = |salt: u64, cell: f64, octaves: u8| Fbm::new(s.stream(salt), cell, octaves);
         // Shared height-warp offsets (like the biome axes share theirs), so
         // continentalness and erosion meander in step rather than decorrelating.
         let hwarp = |field: Fbm| Warp {
@@ -827,13 +878,25 @@ impl Terrain {
         Self {
             seed,
             sea_level: base.round() as i32,
-            continentalness: Control { field: hwarp(fbm(CONT_SALT, 280.0, 3)), gamma: 1.0, curve: Spline(CONT_KNOTS) },
+            continentalness: Control {
+                field: hwarp(fbm(CONT_SALT, 280.0, 3)),
+                gamma: 1.0,
+                curve: Spline(CONT_KNOTS),
+            },
             // Erosion redistributed toward its floor (gamma > 1): flat-to-rolling
             // country becomes the common case and tall relief a rarer, sharper tail.
-            erosion: Control { field: hwarp(fbm(EROSION_SALT, 320.0, 3)), gamma: 1.35, curve: Spline(EROSION_KNOTS) },
+            erosion: Control {
+                field: hwarp(fbm(EROSION_SALT, 320.0, 3)),
+                gamma: 1.35,
+                curve: Spline(EROSION_KNOTS),
+            },
             // Weirdness warped too: rivers meander with the ridge valleys rather
             // than running the lattice, since the river read shares this field.
-            weirdness: Control { field: hwarp(fbm(WEIRD_SALT, 72.0, 3)), gamma: 1.0, curve: Spline(RIDGE_KNOTS) },
+            weirdness: Control {
+                field: hwarp(fbm(WEIRD_SALT, 72.0, 3)),
+                gamma: 1.0,
+                curve: Spline(RIDGE_KNOTS),
+            },
             detail: fbm(DETAIL_SALT, 64.0, 3),
             lakes: fbm(LAKE_SALT, 220.0, 2),
             ranges: fbm(RANGE_SALT, 150.0, 3),
@@ -852,13 +915,21 @@ impl Terrain {
             },
             caves: Term {
                 field: fbm(CAVE_SALT, 24.0, 2),
-                ramp: Ramp { start: 0.80, slope: 0.000_4, floor: 0.58 },
+                ramp: Ramp {
+                    start: 0.80,
+                    slope: 0.000_4,
+                    floor: 0.58,
+                },
                 gate: CAVE_MIN_DEPTH,
                 origin: 0,
             },
             ravines: Term {
                 field: fbm(RAVINE_SALT, 30.0, 2),
-                ramp: Ramp { start: 0.90, slope: 0.000_2, floor: 0.80 },
+                ramp: Ramp {
+                    start: 0.90,
+                    slope: 0.000_2,
+                    floor: 0.80,
+                },
                 gate: RAVINE_MIN_DEPTH,
                 origin: 0,
             },
@@ -887,9 +958,18 @@ impl Terrain {
     /// Everything a column needs, sampled once. `height` folds continentalness
     /// (base), erosion·ridge (relief), and rivers (valley-floor channels).
     fn profile(&self, wx: i32, wz: i32) -> Column {
-        let base = self.continentalness.at(wx, wz);
-        let amp = self.erosion.at(wx, wz);
-        let ridge = self.weirdness.at(wx, wz);
+        // These three axes intentionally share their warp fields. Compute that
+        // displacement once, then retain raw weirdness for the river pass below
+        // instead of sampling the same warped field a second time.
+        let (hx, hz) = self.continentalness.field.coordinates(wx, wz);
+        let base = self
+            .continentalness
+            .shape(self.continentalness.field.field.at(hx, hz));
+        let amp = self
+            .erosion
+            .shape(self.erosion.field.field.at(hx, hz));
+        let raw_weirdness = self.weirdness.field.field.at(hx, hz);
+        let ridge = self.weirdness.shape(raw_weirdness);
         // Mid-frequency rolling detail on every column: a small baseline so plains
         // are never dead flat, growing with erosion so mountains get rough flanks.
         let detail = self.detail.at(wx, wz).0 * 2.0 - 1.0;
@@ -918,7 +998,7 @@ impl Terrain {
 
         // Rivers: carve toward a sub-sea channel at the valley floor (weirdness
         // 0.5), gated to inland columns so ocean basins aren't double-carved.
-        let w = self.weirdness.field.at(wx, wz).0;
+        let w = raw_weirdness.0;
         let d = (w - 0.5).abs();
         if base > RIVER_INLAND && d < RIVER_HALF {
             let t = 1.0 - d / RIVER_HALF;
@@ -942,11 +1022,13 @@ impl Terrain {
             water_level = self.sea_level + LAKE_RISE;
         }
 
+        // The climate axes share a second warp pair by construction.
+        let (climate_x, climate_z) = self.temperature.coordinates(wx, wz);
         Column {
             height: (h.round() as i32).max(1),
             water_level,
-            temperature: self.temperature.at(wx, wz),
-            humidity: self.humidity.at(wx, wz),
+            temperature: self.temperature.field.at(climate_x, climate_z),
+            humidity: self.humidity.field.at(climate_x, climate_z),
         }
     }
 
@@ -1020,7 +1102,10 @@ impl Terrain {
         // The B roll only exists where it can land (below the shallowest
         // slice), so the common stone cell pays one hash, as before.
         let b = if depth >= self.mat.seams.first().map_or(i32::MAX, |s| s.min_depth) {
-            hit(&self.mat.seams_b, cell_hash(self.seed ^ ORE_B_SALT, wx, wy, wz))
+            hit(
+                &self.mat.seams_b,
+                cell_hash(self.seed ^ ORE_B_SALT, wx, wy, wz),
+            )
         } else {
             None
         };
@@ -1064,9 +1149,7 @@ impl Terrain {
     /// the deep-uniform proof only needs carve dormancy one chunk up/down.
     fn cave_wall_at(&self, p: &Column, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
         let cw = self.mat.cave_wall.as_ref()?;
-        if depth < cw.min_depth
-            || cell_hash(self.seed ^ CAVE_WALL_SALT, wx, wy, wz) >= cw.width
-        {
+        if depth < cw.min_depth || cell_hash(self.seed ^ CAVE_WALL_SALT, wx, wy, wz) >= cw.width {
             return None;
         }
         let carved_v = |ny: i32| ny < p.height && self.carved(wx, ny, wz, p.height);
@@ -1076,7 +1159,11 @@ impl Terrain {
     /// The block for an island-solid cell, from what sits above it in the field.
     fn island_block(&self, wx: i32, wy: i32, wz: i32, above: [bool; 4]) -> BlockId {
         if !above[0] {
-            if wy >= ICE_SURFACE_Y { self.mat.island_ice } else { self.mat.island_grass }
+            if wy >= ICE_SURFACE_Y {
+                self.mat.island_ice
+            } else {
+                self.mat.island_grass
+            }
         } else if !above[1] || !above[2] || !above[3] {
             self.mat.island_crust
         } else {
@@ -1093,7 +1180,10 @@ impl Terrain {
                 None
             };
             let a = hit(&self.mat.island_seams, cell_hash(self.seed, wx, wy, wz));
-            let b = hit(&self.mat.island_seams_b, cell_hash(self.seed ^ ORE_B_SALT, wx, wy, wz));
+            let b = hit(
+                &self.mat.island_seams_b,
+                cell_hash(self.seed ^ ORE_B_SALT, wx, wy, wz),
+            );
             match (a, b) {
                 (Some(i), Some(j)) if i != j => {
                     let (hi, lo) = if i > j { (i, j) } else { (j, i) };
@@ -1133,17 +1223,21 @@ impl Terrain {
         } else if self.overhang_solid(wx, wy, wz, p.height) {
             self.mat.stone
         } else if self.islands.solid(wx, wy, wz) {
-            self.island_block(wx, wy, wz, [
-                self.islands.solid(wx, wy + 1, wz),
-                self.islands.solid(wx, wy + 2, wz),
-                self.islands.solid(wx, wy + 3, wz),
-                self.islands.solid(wx, wy + 4, wz),
-            ])
+            self.island_block(
+                wx,
+                wy,
+                wz,
+                [
+                    self.islands.solid(wx, wy + 1, wz),
+                    self.islands.solid(wx, wy + 2, wz),
+                    self.islands.solid(wx, wy + 3, wz),
+                    self.islands.solid(wx, wy + 4, wz),
+                ],
+            )
         } else {
             AIR
         }
     }
-
 }
 
 impl TerrainGenerator for Terrain {
@@ -1200,8 +1294,13 @@ impl TerrainGenerator for Terrain {
     fn generate_column(&self, cx: i32, cz: i32, cy: RangeInclusive<i32>) -> Vec<(i32, ChunkData)> {
         let (x0, z0) = (cx * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32);
         let (profiles, h_min, h_max, w_min, w_max) = self.column_profiles(x0, z0);
-        cy.map(|cyy| (cyy, self.fill_chunk(x0, z0, cyy, &profiles, h_min, h_max, w_min, w_max)))
-            .collect()
+        cy.map(|cyy| {
+            (
+                cyy,
+                self.fill_chunk(x0, z0, cyy, &profiles, h_min, h_max, w_min, w_max),
+            )
+        })
+        .collect()
     }
 }
 
@@ -1239,20 +1338,25 @@ impl Terrain {
 
     /// The 256 column profiles for a chunk column, plus the height/water extents
     /// the fast paths read. `cy`-invariant — sampled once per vertical column.
-    fn column_profiles(&self, x0: i32, z0: i32) -> (Vec<Column>, i32, i32, i32, i32) {
-        let mut profiles: Vec<Column> = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
+    fn column_profiles(
+        &self,
+        x0: i32,
+        z0: i32,
+    ) -> ([Column; CHUNK_SIZE * CHUNK_SIZE], i32, i32, i32, i32) {
         let (mut h_min, mut h_max) = (i32::MAX, i32::MIN);
         let (mut w_min, mut w_max) = (i32::MAX, i32::MIN);
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let p = self.profile(x0 + lx as i32, z0 + lz as i32);
-                h_min = h_min.min(p.height);
-                h_max = h_max.max(p.height);
-                w_min = w_min.min(p.water_level);
-                w_max = w_max.max(p.water_level);
-                profiles.push(p);
-            }
-        }
+        // Exactly one chunk column is sampled at a time. Keeping its fixed 256
+        // profiles inline avoids one allocator round trip for every column job.
+        let profiles = std::array::from_fn(|index| {
+            let lx = index % CHUNK_SIZE;
+            let lz = index / CHUNK_SIZE;
+            let p = self.profile(x0 + lx as i32, z0 + lz as i32);
+            h_min = h_min.min(p.height);
+            h_max = h_max.max(p.height);
+            w_min = w_min.min(p.water_level);
+            w_max = w_max.max(p.water_level);
+            p
+        });
         (profiles, h_min, h_max, w_min, w_max)
     }
 
@@ -1285,9 +1389,7 @@ impl Terrain {
         // Guarded past the overhang reach above the tallest surface, since a shelf
         // can place solid rock up to `OVERHANG_REACH` blocks over the ground.
         let cs = CHUNK_SIZE as i32;
-        if y0 >= h_max + OVERHANG_REACH
-            && !self.islands.possible(x0, y0, z0, (cs, cs, cs))
-        {
+        if y0 >= h_max + OVERHANG_REACH && !self.islands.possible(x0, y0, z0, (cs, cs, cs)) {
             if y1 < w_min {
                 return ChunkData::Uniform(self.mat.water);
             }
@@ -1297,7 +1399,8 @@ impl Terrain {
         }
 
         let mut cells = Box::new([AIR; CHUNK_VOLUME]);
-        let islands_possible = y1 + 4 >= self.islands.band_bottom() && y0 <= self.islands.band_top();
+        let islands_possible =
+            y1 + 4 >= self.islands.band_bottom() && y0 <= self.islands.band_top();
         let mut isl: [bool; CHUNK_SIZE + 4];
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
@@ -1326,8 +1429,10 @@ impl Terrain {
                     let rav_col = self.ravines.field.column(wx, wz, y0, y1.min(cave_top));
                     for (k, cell) in carved.iter_mut().enumerate() {
                         let wy = y0 + k as i32;
-                        let cave = wy <= cave_top && self.caves.excess_col(&cave_col, wy, height) > 0.0;
-                        let rav = wy <= rav_top && self.ravines.excess_col(&rav_col, wy, height) > 0.0;
+                        let cave =
+                            wy <= cave_top && self.caves.excess_col(&cave_col, wy, height) > 0.0;
+                        let rav =
+                            wy <= rav_top && self.ravines.excess_col(&rav_col, wy, height) > 0.0;
                         *cell = cave || rav;
                     }
                 }
@@ -1341,7 +1446,12 @@ impl Terrain {
                     } else if self.overhang_solid(wx, wy, wz, height) {
                         self.mat.stone
                     } else if isl[ly] {
-                        self.island_block(wx, wy, wz, [isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]])
+                        self.island_block(
+                            wx,
+                            wy,
+                            wz,
+                            [isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]],
+                        )
                     } else {
                         AIR
                     };
@@ -1452,25 +1562,45 @@ mod tests {
         // An endpoints-only image would miss the trough; `image` must not.
         let s = Spline(RIDGE_KNOTS);
         let (mn, mx) = s.image(0.0, 1.0);
-        assert!(mn <= -0.69, "image floor reaches the interior trough, got {mn}");
-        assert!(mx >= 0.99, "image ceiling reaches the interior peak, got {mx}");
+        assert!(
+            mn <= -0.69,
+            "image floor reaches the interior trough, got {mn}"
+        );
+        assert!(
+            mx >= 0.99,
+            "image ceiling reaches the interior peak, got {mx}"
+        );
         // Census: dense sampling never leaves the reported image.
         for i in 0..=1000 {
             let x = i as f32 / 1000.0;
             let v = s.eval(x);
-            assert!(v >= mn - 1e-6 && v <= mx + 1e-6, "eval {v} outside image at {x}");
+            assert!(
+                v >= mn - 1e-6 && v <= mx + 1e-6,
+                "eval {v} outside image at {x}"
+            );
         }
         // A sub-interval straddling only the trough side stays tight.
         let (mn2, mx2) = s.image(0.35, 0.65);
-        assert!(mn2 <= -0.69 && mx2 <= 0.21, "sub-interval image [{mn2},{mx2}]");
+        assert!(
+            mn2 <= -0.69 && mx2 <= 0.21,
+            "sub-interval image [{mn2},{mx2}]"
+        );
     }
 
     #[test]
     fn generated_chunks_match_per_cell_block_at() {
         let g = terrain(3);
         let coords = [
-            (0, 0, 0), (0, 1, 0), (2, 4, -3), (-1, 5, 7), (0, -2, 0),
-            (0, -4, 0), (0, 3, 0), (2, 14, 3), (0, -1, 5), (0, -40, 0),
+            (0, 0, 0),
+            (0, 1, 0),
+            (2, 4, -3),
+            (-1, 5, 7),
+            (0, -2, 0),
+            (0, -4, 0),
+            (0, 3, 0),
+            (2, 14, 3),
+            (0, -1, 5),
+            (0, -40, 0),
         ];
         for (cx, cy, cz) in coords {
             let chunk = Chunk::new(cx, cy, cz, &g);
@@ -1520,7 +1650,10 @@ mod tests {
             }
         }
         assert!(ocean > 0, "oceans exist (columns below sea level)");
-        assert!(mountain > 0, "mountains exist (columns well above sea level)");
+        assert!(
+            mountain > 0,
+            "mountains exist (columns well above sea level)"
+        );
     }
 
     #[test]
@@ -1535,7 +1668,11 @@ mod tests {
                 let (wx, wz) = (x * 3, z * 3);
                 let h = g.height(wx, wz);
                 if h < sea {
-                    assert_eq!(g.block_at(wx, sea - 1, wz, h), water, "ocean fills to sea level");
+                    assert_eq!(
+                        g.block_at(wx, sea - 1, wz, h),
+                        water,
+                        "ocean fills to sea level"
+                    );
                     found = true;
                     break 'scan;
                 }
@@ -1553,7 +1690,10 @@ mod tests {
             let (wx, wz) = (i * 37, i * -53);
             g.temperature.at(wx, wz) != g.temperature.field.at(wx, wz)
         });
-        assert!(differs, "domain warp moves the biome sample off the raw lattice");
+        assert!(
+            differs,
+            "domain warp moves the biome sample off the raw lattice"
+        );
     }
 
     #[test]
@@ -1621,7 +1761,10 @@ mod tests {
                 }
             }
         }
-        assert!(found, "an overhang shelf sits above the heightfield surface");
+        assert!(
+            found,
+            "an overhang shelf sits above the heightfield surface"
+        );
     }
 
     #[test]
@@ -1632,21 +1775,27 @@ mod tests {
         // No island cell exists below the band floor, however far down we probe.
         for y in [isl.band_bottom() - 1, -100, -1000] {
             for x in -64..64 {
-                assert!(!isl.solid(x * 5, y, x * 3 - 7), "no islands below the band floor");
+                assert!(
+                    !isl.solid(x * 5, y, x * 3 - 7),
+                    "no islands below the band floor"
+                );
             }
         }
 
         // Keels clear water: the band floor sits above the highest water surface
         // (sea level plus a lake's rise), so islands and water never interact.
         let max_water = g.sea_level + LAKE_RISE;
-        assert!(isl.band_bottom() > max_water, "island keels clear the water table");
+        assert!(
+            isl.band_bottom() > max_water,
+            "island keels clear the water table"
+        );
 
         // Islands genuinely exist within the band over a wide region (the mask is
         // low-frequency, so a small window can miss every island).
         let any = (-4000..4000).step_by(32).any(|x| {
-            (-4000..4000).step_by(32).any(|z| {
-                (isl.band_bottom()..=isl.band_top()).any(|y| isl.solid(x, y, z))
-            })
+            (-4000..4000)
+                .step_by(32)
+                .any(|z| (isl.band_bottom()..=isl.band_top()).any(|y| isl.solid(x, y, z)))
         });
         assert!(any, "the band holds islands somewhere");
     }
@@ -1789,7 +1938,11 @@ mod tests {
                     g.islands.solid(wx, wy + 4, wz),
                 ];
                 if !above[0] {
-                    if wy >= ICE_SURFACE_Y { self.ice } else { self.grass }
+                    if wy >= ICE_SURFACE_Y {
+                        self.ice
+                    } else {
+                        self.grass
+                    }
                 } else if !above[1] || !above[2] || !above[3] {
                     self.dirt
                 } else {
@@ -1825,21 +1978,33 @@ mod tests {
 
         let chunks: Vec<(i32, i32, i32)> = [
             // Spawn area: surface band with crust, ores, water, carve.
-            (0, 0, 0), (0, 1, 0), (0, -1, 0), (1, 0, -1), (2, 3, 2),
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (1, 0, -1),
+            (2, 3, 2),
             // Deep rock inside and below the ore band.
-            (0, -3, 0), (1, -4, 1),
+            (0, -3, 0),
+            (1, -4, 1),
             // The island band (ISLAND_MIN_Y = 112 → cy 7+), icy heights.
-            (0, 8, 0), (3, 9, -2), (0, 14, 5),
+            (0, 8, 0),
+            (3, 9, -2),
+            (0, 14, 5),
             // Far out: the f64-spine coordinates the old round fixed.
-            (6_250_000, 0, 0), (6_250_000, 8, 0), (-6_250_000, -2, 3),
+            (6_250_000, 0, 0),
+            (6_250_000, 8, 0),
+            (-6_250_000, -2, 3),
         ]
         .into_iter()
         .collect();
 
         let mut cells = 0u64;
         for (cx, cy, cz) in chunks {
-            let (x0, y0, z0) =
-                (cx * CHUNK_SIZE as i32, cy * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32);
+            let (x0, y0, z0) = (
+                cx * CHUNK_SIZE as i32,
+                cy * CHUNK_SIZE as i32,
+                cz * CHUNK_SIZE as i32,
+            );
             for lz in 0..CHUNK_SIZE as i32 {
                 for lx in 0..CHUNK_SIZE as i32 {
                     let (wx, wz) = (x0 + lx, z0 + lz);
@@ -1863,7 +2028,10 @@ mod tests {
                 }
             }
         }
-        assert!(cells > 50_000, "census actually covered ground ({cells} cells)");
+        assert!(
+            cells > 50_000,
+            "census actually covered ground ({cells} cells)"
+        );
     }
 
     /// Doc test 8 — stream B's distribution: overlap pairs occur (multi-yield
@@ -1896,7 +2064,10 @@ mod tests {
             (0.045..=0.075).contains(&single_rate),
             "single-vein rate {single_rate:.4} left the expected band"
         );
-        assert!(pairs > 10, "overlap pairs must actually occur (got {pairs} in {total})");
+        assert!(
+            pairs > 10,
+            "overlap pairs must actually occur (got {pairs} in {total})"
+        );
         assert!(
             (pairs as f64) < (singles as f64) * 0.05,
             "pairs must stay rare finds ({pairs} pairs vs {singles} singles)"
@@ -1928,10 +2099,21 @@ mod tests {
                 }
             }
         }
-        assert!(rim[0][0] > 200 && rim[1][0] > 200, "seed 3 must offer shoreline to sample");
+        assert!(
+            rim[0][0] > 200 && rim[1][0] > 200,
+            "seed 3 must offer shoreline to sample"
+        );
         let rate = |b: [u64; 2]| b[1] as f64 / b[0] as f64;
-        assert!((0.42..=0.58).contains(&rate(rim[0])), "+1 rim ~half: {:?}", rim[0]);
-        assert!((0.17..=0.33).contains(&rate(rim[1])), "+2 rim ~quarter: {:?}", rim[1]);
+        assert!(
+            (0.42..=0.58).contains(&rate(rim[0])),
+            "+1 rim ~half: {:?}",
+            rim[0]
+        );
+        assert!(
+            (0.17..=0.33).contains(&rate(rim[1])),
+            "+2 rim ~quarter: {:?}",
+            rim[1]
+        );
         assert_eq!(rim[2][1], 0, "the dither never reaches above the +2 rim");
     }
 
@@ -1958,9 +2140,8 @@ mod tests {
                             scanned += 1;
                             if g.cell_base(&p, wx, wy, wz, true) == lumin {
                                 found += 1;
-                                let carved_v = |ny: i32| {
-                                    ny < p.height && g.carved(wx, ny, wz, p.height)
-                                };
+                                let carved_v =
+                                    |ny: i32| ny < p.height && g.carved(wx, ny, wz, p.height);
                                 assert!(
                                     carved_v(wy + 1) || carved_v(wy - 1),
                                     "wall Lumin at ({wx},{wy},{wz}) without adjacent carve"
@@ -1974,6 +2155,9 @@ mod tests {
                 }
             }
         }
-        assert!(found > 0, "deep caverns must actually glow (scanned {scanned} cells)");
+        assert!(
+            found > 0,
+            "deep caverns must actually glow (scanned {scanned} cells)"
+        );
     }
 }

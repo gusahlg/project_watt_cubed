@@ -20,12 +20,12 @@
 //!   camera-relative offset, so far terrain never jitters.
 //! - Uniform fast paths: a uniform non-solid chunk is empty; a uniform solid one
 //!   only sweeps its six border slices.
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::light::PaddedLight;
+use super::light::{MAX_LIGHT, PaddedLight};
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::coord::ByPass;
 
@@ -47,19 +47,15 @@ const PAD: usize = CHUNK_SIZE + 2;
 /// Cells in one [`Padded`] buffer.
 const PAD_VOL: usize = PAD * PAD * PAD;
 
-// Thread-local free list of [`Padded`] backing buffers. `Padded::capture`
-// allocated a fresh `PAD_VOL`-cell buffer per call — the per-remesh
-// neighbourhood-snapshot churn the streamer pays. Buffers are reclaimed on
-// [`Drop`] and reused. Bounded ([`PADDED_POOL_CAP`]) so the cross-thread path
-// (a `capture`d neighbourhood built on the main thread and dropped on a
-// worker) can only migrate a handful of buffers into a worker's list, not
-// grow without bound.
-thread_local! {
-    static PADDED_POOL: RefCell<Vec<Box<[u16]>>> = const { RefCell::new(Vec::new()) };
-}
-/// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
-/// single job holds at most one live neighbourhood at a time.
-const PADDED_POOL_CAP: usize = 4;
+// Cross-thread free list of [`Padded`] backing buffers. Snapshots are captured
+// on the main thread and dropped by workers, so the old thread-local pool
+// stranded every returned buffer on the wrong thread. One bounded shared pool
+// completes the ownership round trip and replaces repeated allocator traffic
+// with one short lock at capture/drop.
+static PADDED_POOL: Mutex<Vec<Box<[u16]>>> = Mutex::new(Vec::new());
+/// Enough slack for a traversal burst without retaining an unbounded queue's
+/// worth of snapshots (64 × 18³ × 2 bytes is under 0.75 MiB).
+const PADDED_POOL_CAP: usize = 64;
 
 /// The chunk's 16³ voxels plus a one-voxel shell pulled from its 26 neighbours,
 /// indexed by signed coords `x, y, z ∈ -1..=16`. Owned, so a mesh job shares
@@ -86,7 +82,9 @@ impl Padded {
     /// (`fill` then, where partial, overwrite the touched cells) before use.
     fn take_buf() -> Box<[u16]> {
         PADDED_POOL
-            .with_borrow_mut(|p| p.pop())
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
             .filter(|b| b.len() == PAD_VOL)
             .unwrap_or_else(|| vec![AIR.0; PAD_VOL].into_boxed_slice())
     }
@@ -142,11 +140,12 @@ impl Drop for Padded {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.ids);
         if buf.len() == PAD_VOL {
-            PADDED_POOL.with_borrow_mut(|p| {
-                if p.len() < PADDED_POOL_CAP {
-                    p.push(buf);
-                }
-            });
+            let mut pool = PADDED_POOL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pool.len() < PADDED_POOL_CAP {
+                pool.push(buf);
+            }
         }
     }
 }
@@ -268,6 +267,28 @@ pub fn build_chunk_mesh(
     light: &PaddedLight,
     out: &mut ChunkMeshData,
 ) {
+    build_chunk_mesh_inner(padded, uniform, tables, Some(light), out);
+}
+
+/// Build with constant full light and no light-shell allocation. This is the
+/// stripped-profile path; when AO is also disabled, face sampling returns
+/// immediately after culling and skips the entire four-corner stencil.
+pub fn build_chunk_mesh_unlit(
+    padded: &Padded,
+    uniform: Option<BlockId>,
+    tables: &HotTables,
+    out: &mut ChunkMeshData,
+) {
+    build_chunk_mesh_inner(padded, uniform, tables, None, out);
+}
+
+fn build_chunk_mesh_inner(
+    padded: &Padded,
+    uniform: Option<BlockId>,
+    tables: &HotTables,
+    light: Option<&PaddedLight>,
+    out: &mut ChunkMeshData,
+) {
     for (_, m) in out.iter_mut() {
         m.clear();
     }
@@ -285,7 +306,7 @@ fn sweep(
     padded: &Padded,
     edge_only: bool,
     tables: &HotTables,
-    light: &PaddedLight,
+    light: Option<&PaddedLight>,
     out: &mut ChunkMeshData,
 ) {
     let mut mask: [Option<FaceSample>; MASK_CAP] = [None; MASK_CAP];
@@ -348,7 +369,7 @@ fn sweep(
 fn face_sample(
     padded: &Padded,
     tables: &HotTables,
-    light: &PaddedLight,
+    light: Option<&PaddedLight>,
     dir: &Dir,
     n: usize,
     u: usize,
@@ -370,12 +391,24 @@ fn face_sample(
         return None;
     }
 
+    // Minimum/Fast disable both lighting and AO. Their merge key is constant,
+    // so none of the twelve neighbour probes or sixteen light reads/divisions
+    // can affect the result.
+    if !tables.ao && light.is_none() {
+        return Some(FaceSample {
+            id,
+            ao: [3; 4],
+            sky: [MAX_LIGHT; 4],
+            block: [MAX_LIGHT; 4],
+        });
+    }
+
     let opaque_at = |p: [i32; 3]| tables.opaque[padded.at(p[0], p[1], p[2]).0 as usize];
     // Per corner: AO from three outward occluders; smooth light as average of
     // up to 4 touching cells (opaque cells skipped). Always has one light term.
     let mut ao = [0u8; 4];
-    let mut sky = [0u8; 4];
-    let mut block = [0u8; 4];
+    let mut sky = [MAX_LIGHT; 4];
+    let mut block = [MAX_LIGHT; 4];
     for i in 0..4 {
         let du = if dir.corners[i][1] > 0.0 { 1 } else { -1 };
         let dv = if dir.corners[i][2] > 0.0 { 1 } else { -1 };
@@ -393,18 +426,20 @@ fn face_sample(
         } else {
             3
         };
-        let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
-        for p in [o, s1, s2, cor] {
-            if opaque_at(p) {
-                continue;
+        if let Some(light) = light {
+            let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
+            for p in [o, s1, s2, cor] {
+                if opaque_at(p) {
+                    continue;
+                }
+                let lum = light.at(p[0], p[1], p[2]);
+                ssum += lum.sky.get() as u32;
+                bsum += lum.block.get() as u32;
+                count += 1;
             }
-            let lum = light.at(p[0], p[1], p[2]);
-            ssum += lum.sky.get() as u32;
-            bsum += lum.block.get() as u32;
-            count += 1;
+            sky[i] = (ssum / count) as u8;
+            block[i] = (bsum / count) as u8;
         }
-        sky[i] = (ssum / count) as u8;
-        block[i] = (bsum / count) as u8;
     }
 
     Some(FaceSample { id, ao, sky, block })
@@ -702,6 +737,12 @@ mod tests {
         no_ao.ao = false;
         let mut out = new_chunk_mesh_data();
         build_chunk_mesh(&solo(&chunk), None, &no_ao, &PaddedLight::full(), &mut out);
+        let mut unlit = new_chunk_mesh_data();
+        build_chunk_mesh_unlit(&solo(&chunk), None, &no_ao, &mut unlit);
+        for pass in Pass::ALL {
+            assert_eq!(unlit[pass].buckets(), out[pass].buckets());
+            assert_eq!(unlit[pass].vertices(), out[pass].vertices());
+        }
         let [opaque, ..] = out.into_slots();
         assert_eq!(quads_in_y_plane(&opaque, 1.0), 1, "AO off merges what the gradient split");
     }

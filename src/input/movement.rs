@@ -51,6 +51,7 @@ const SWIM_FLOAT_SPEED: f64 = 3.0 * PER_METER;
 const SWIM_SETTLE_SPEED: f64 = 1.0 * PER_METER;
 
 /// The movement intent gathered for a single frame.
+#[derive(Clone, Copy)]
 pub struct MoveInput {
     move_x: f32,
     move_y: f32,
@@ -75,6 +76,39 @@ impl MoveInput {
             sprint: gp.state(GameplayState::Sprint),
             sneak: gp.state(GameplayState::Sneak),
         }
+    }
+
+    /// Edge-triggered flight toggle, exposed so a slower fixed physics clock can
+    /// latch the event until it actually executes a tick.
+    pub(crate) fn toggle_fly(&self) -> bool {
+        self.toggle_fly
+    }
+
+    /// Held jump state, exposed so a fixed physics clock can also retain a
+    /// short press that begins and ends between two physics ticks.
+    pub(crate) fn jump(&self) -> bool {
+        self.jump
+    }
+
+    /// Override only the edge-triggered field when replaying held input across
+    /// fixed ticks; all held axes/states remain the current frame's values.
+    pub(crate) fn set_toggle_fly(&mut self, toggle: bool) {
+        self.toggle_fly = toggle;
+    }
+
+    pub(crate) fn set_jump(&mut self, jump: bool) {
+        self.jump = jump;
+    }
+
+    /// Reuse the already-sampled axes for detached freecam instead of probing
+    /// the same movement bindings a second time in the frame.
+    pub(crate) fn freecam_axes(&self) -> (f64, f64, f64, bool) {
+        (
+            self.move_z as f64,
+            self.move_x as f64,
+            self.move_y as f64,
+            self.sprint,
+        )
     }
 }
 
@@ -112,8 +146,15 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
         }
         // Walking: horizontal velocity chases the target (snappier on the ground
         // than in the air); vertical stays the gravity/jump integrator.
-        Motion::Walking { velocity, on_ground } => {
-            let ground_speed = if input.sprint { walk_speed * SPRINT_MULT } else { walk_speed };
+        Motion::Walking {
+            velocity,
+            on_ground,
+        } => {
+            let ground_speed = if input.sprint {
+                walk_speed * SPRINT_MULT
+            } else {
+                walk_speed
+            };
             let target = heading * ground_speed;
             let rate = if *on_ground { GROUND_ACCEL } else { AIR_ACCEL };
             let horiz = approach(DVec3::new(velocity.x, 0.0, velocity.z), target, rate, dt);
@@ -191,7 +232,10 @@ fn reconcile_liquid(player: &mut Player, liquid: Liquid) {
     let velocity = player.velocity();
     player.motion = match (&player.motion, liquid.submerged()) {
         (Motion::Walking { .. }, true) => Motion::Swimming { velocity },
-        (Motion::Swimming { .. }, false) => Motion::Walking { velocity, on_ground: false },
+        (Motion::Swimming { .. }, false) => Motion::Walking {
+            velocity,
+            on_ground: false,
+        },
         (motion, _) => *motion,
     };
 }
@@ -284,7 +328,10 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
                 velocity.z = 0.0;
             }
         }
-        Motion::Walking { velocity, on_ground } => {
+        Motion::Walking {
+            velocity,
+            on_ground,
+        } => {
             if blocked_x {
                 velocity.x = 0.0;
             }
@@ -332,6 +379,11 @@ fn step_axis(
     stance: Stance,
     noclip: bool,
 ) -> bool {
+    // Standing still is overwhelmingly common. Avoid an AABB build plus a
+    // world collision query for the two (often all three) idle axes.
+    if delta == 0.0 {
+        return false;
+    }
     let start = pos[axis];
 
     // Fast path: the common per-frame case, identical to the pre-substepping
@@ -378,7 +430,10 @@ mod tests {
 
     /// Hold forward, nothing else — the reported far-coordinate stall scenario.
     fn walk_forward() -> MoveInput {
-        MoveInput { move_z: 1.0, ..idle() }
+        MoveInput {
+            move_z: 1.0,
+            ..idle()
+        }
     }
 
     /// No keys held at all — freefall / settle frames.
@@ -520,8 +575,14 @@ mod tests {
             }
         }
 
-        assert!(reached_terminal, "158 blocks of freefall must reach terminal velocity");
-        assert!(player.on_ground(), "the fall must end standing on the thin floor");
+        assert!(
+            reached_terminal,
+            "158 blocks of freefall must reach terminal velocity"
+        );
+        assert!(
+            player.on_ground(),
+            "the fall must end standing on the thin floor"
+        );
         let feet = player.position.y - stand_eye();
         let top = (floor_y + 1) as f64;
         assert!(
@@ -548,7 +609,10 @@ mod tests {
 
         let mut apex = start_y;
         for frame in 0..60 {
-            let input = MoveInput { jump: frame == 0, ..idle() };
+            let input = MoveInput {
+                jump: frame == 0,
+                ..idle()
+            };
             update_player(&mut player, &world, &input, dt as f32);
             apex = apex.max(player.position.y);
         }

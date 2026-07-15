@@ -32,7 +32,7 @@ use super::generation::TerrainGenerator;
 
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
-pub(in crate::world) use mesh::{SectionMeshData, build_section_mesh};
+pub(in crate::world) use mesh::{SectionMeshData, extract_section_mesh};
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;

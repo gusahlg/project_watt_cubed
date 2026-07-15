@@ -13,7 +13,7 @@ use super::metric::EyeMetric;
 use super::pyramid::PyramidCfg;
 use super::section::{Quadrant, SectionPos};
 use super::summary::{CellSummary, SseBudget};
-use super::FastMap;
+use super::{FastMap, FastSet};
 
 /// Which of a section's four quadrants to draw, as a 4-bit set. Bit `q` selects
 /// [`SectionPos::child`]'s [`Quadrant`], matching [`SectionPos::quadrant`] exactly.
@@ -75,11 +75,15 @@ impl CoverCut {
 }
 
 /// Inner and outer distance bounds for a detail level's annulus. Innermost band
-/// starts at 0; coarsest band ends at infinity.
+/// starts at 0; the configured coarsest band ends at the radial horizon.
 fn band_radii(ring: usize, cfg: &PyramidCfg) -> (f32, f32) {
     let lo = if ring == 0 { 0.0 } else { cfg.unit * cfg.base.powi(ring as i32) };
     let coarsest = ring + 1 == cfg.levels.get() as usize;
-    let hi = if coarsest { f32::INFINITY } else { cfg.unit * cfg.base.powi(ring as i32 + 1) };
+    let hi = if coarsest {
+        cfg.outer_m()
+    } else {
+        cfg.unit * cfg.base.powi(ring as i32 + 1)
+    };
     (lo, hi)
 }
 
@@ -99,7 +103,7 @@ pub(in crate::world) fn desired_sections(eye: &EyeMetric, cfg: &PyramidCfg) -> V
             continue;
         };
         // Reach to the band's outer radius; +1 covers partial edge sections.
-        let outer = if annulus.hi().is_finite() { annulus.hi() } else { cfg.outer_m() };
+        let outer = annulus.hi();
         let reach = (outer / span as f32).ceil() as i32 + 1;
         let (psx, psz) = (ax.div_euclid(span), az.div_euclid(span));
         for sx in (psx - reach)..=(psx + reach) {
@@ -127,7 +131,7 @@ pub(in crate::world) fn coarsen_by_error(
     summary: &impl Fn(SectionPos) -> CellSummary,
     budget: &SseBudget,
 ) -> Vec<SectionPos> {
-    let mut set: std::collections::HashSet<SectionPos> = frontier.into_iter().collect();
+    let mut set: FastSet<SectionPos> = frontier.into_iter().collect();
     // One detail level per pass to keep merges order-independent. Adjacent bands
     // can overlap (a cell and its parent both present), so level-by-level ensures
     // each pass is deterministic, with newly-formed parents reconsidered at the next level.
@@ -165,7 +169,7 @@ pub(in crate::world) fn coarsen_by_error(
 /// Result is a superset of each input, never dropping cells. Overlaps are pruned
 /// by [`resolve_covering`].
 pub(in crate::world) fn union_frontiers(a: Vec<SectionPos>, b: Vec<SectionPos>) -> Vec<SectionPos> {
-    let mut set: std::collections::HashSet<SectionPos> = a.into_iter().collect();
+    let mut set: FastSet<SectionPos> = a.into_iter().collect();
     set.extend(b);
     let mut out: Vec<SectionPos> = set.into_iter().collect();
     out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
@@ -311,8 +315,7 @@ mod tests {
             let detail = lod.0;
             let span = SectionPos { detail, x: 0, z: 0 }.span();
             let (lo, hi) = band_radii(ring, cfg);
-            let outer = if hi.is_finite() { hi } else { cfg.outer_m() };
-            let reach = (outer / span as f32).ceil() as i32 + 1;
+            let reach = (hi / span as f32).ceil() as i32 + 1;
             let (psx, psz) = (pcx.div_euclid(span), pcz.div_euclid(span));
             for sx in (psx - reach)..=(psx + reach) {
                 for sz in (psz - reach)..=(psz + reach) {
@@ -391,6 +394,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn configured_outer_radius_is_a_real_radial_horizon() {
+        let cfg = PyramidCfg::sections_with(96.0, 1, FINEST_DETAIL);
+        let metric = eye(0, 0, &cfg);
+        let desired = desired_sections(&metric, &cfg);
+        assert_eq!(band_radii(0, &cfg).1, cfg.outer_m());
+        assert!(!desired.is_empty());
+        assert!(
+            desired
+                .iter()
+                .all(|&cell| metric.range(cell).near().get() < cfg.outer_m()),
+            "the grid sweep must reject square-corner cells beyond the radial horizon"
+        );
+
+        let corner = SectionPos {
+            detail: cfg.finest.0,
+            x: 2,
+            z: 2,
+        };
+        assert!(metric.range(corner).near().get() >= cfg.outer_m());
+        assert!(!desired.contains(&corner));
     }
 
     /// The covering invariant on a synthetic loaded set: every desired cell gets

@@ -14,7 +14,7 @@ mod weather;
 
 pub use atmosphere::Atmosphere;
 pub use palette::{Anchor, Palette, Role};
-pub use clock::{DayLength, SkyClock};
+pub use clock::{DayLength, SkyClock, SkyFrame};
 pub use weather::{Precip, Weather};
 
 use voxel_engine::{Frame3D, LinearRgb, SkyDesc};
@@ -51,9 +51,27 @@ impl Sky {
         self.clock.advance(dt, self.day_length);
     }
 
+    /// Sample the sun once for every consumer in a rendered frame.
+    pub fn frame(&self) -> SkyFrame {
+        self.clock.frame()
+    }
+
+    /// Sample an explicit day fraction without mutating authoritative clock
+    /// state. Stripped profiles use noon when the cycle is disabled, so joining
+    /// or selecting the profile at night cannot freeze the playable view black.
+    pub fn frame_at_day(&self, day: f64) -> SkyFrame {
+        let mut clock = self.clock;
+        clock.set_day(day);
+        clock.frame()
+    }
+
     /// The flat clear colour for [`Engine::begin_frame`](voxel_engine::Engine::begin_frame).
     pub fn clear(&self) -> LinearRgb {
-        self.atmosphere.clear(self.clock.sun_dir())
+        self.clear_at(self.frame())
+    }
+
+    pub fn clear_at(&self, sky: SkyFrame) -> LinearRgb {
+        self.atmosphere.clear(sky.sun_dir)
     }
 
     /// Draw the procedural sky. Only sun geometry + disc tint cross here; the
@@ -61,11 +79,13 @@ impl Sky {
     /// same linear source the terrain fog reads), so the sky and the fog
     /// it blends into cannot diverge.
     pub fn draw(&self, f: &mut Frame3D) {
-        let sun = self.clock.sun_dir();
-        let daylight = self.clock.daylight();
+        self.draw_at(f, self.frame());
+    }
+
+    pub fn draw_at(&self, f: &mut Frame3D, sky: SkyFrame) {
         f.set_sky(SkyDesc {
-            sun_dir: sun,
-            sun_tint: sun_tint(daylight),
+            sun_dir: sky.sun_dir,
+            sun_tint: sun_tint(sky.daylight),
             sun_angular_radius: 0.03,
         });
     }

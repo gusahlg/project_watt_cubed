@@ -31,16 +31,49 @@ struct FadeCell {
 pub(in crate::world) struct SwapFade {
     cells: FastMap<SectionPos, FadeCell>,
     last: Option<Instant>,
+    animating: bool,
 }
 
 impl SwapFade {
     /// Advance by wall-clock time since the last call, then adopt `cut`. First call steps
     /// by zero, so no sudden fade jumps on startup.
-    pub fn update_now(&mut self, cut: &[(SectionPos, QuadrantMask)]) {
+    pub fn update_now(&mut self, cut: &[(SectionPos, QuadrantMask)]) -> bool {
+        let now = Instant::now();
+        if self.settled_on(cut) {
+            self.last = None;
+            self.animating = false;
+            return false;
+        }
+        let dt = self.last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+        self.last = Some(now);
+        self.update(cut, dt);
+        true
+    }
+
+    /// Advance an already-active fade whose covering cut is known unchanged.
+    /// This skips the settled/cut comparison used when adopting a new covering.
+    pub fn advance_now(&mut self, cut: &[(SectionPos, QuadrantMask)]) -> bool {
+        if !self.animating {
+            return false;
+        }
         let now = Instant::now();
         let dt = self.last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
         self.last = Some(now);
         self.update(cut, dt);
+        true
+    }
+
+    pub fn animating(&self) -> bool {
+        self.animating
+    }
+
+    fn settled_on(&self, cut: &[(SectionPos, QuadrantMask)]) -> bool {
+        self.cells.len() == cut.len()
+            && cut.iter().all(|(pos, mask)| {
+                self.cells
+                    .get(pos)
+                    .is_some_and(|cell| !cell.out && cell.fade == 1.0 && cell.mask == *mask)
+            })
     }
 
     /// Adopt a new desired `cut` and advance every cell's fade by `dt` seconds. New cells
@@ -48,17 +81,16 @@ impl SwapFade {
     /// before fading fully out, it reverses direction and fades back in.
     pub fn update(&mut self, cut: &[(SectionPos, QuadrantMask)], dt: f32) {
         let step = if FADE_SECS > 0.0 { (dt / FADE_SECS).max(0.0) } else { 1.0 };
-        let desired: FastMap<SectionPos, QuadrantMask> = cut.iter().copied().collect();
+        // Mark old cells outgoing, then overwrite desired entries in place. The
+        // prior implementation allocated a temporary hash map every fade tick.
+        for cell in self.cells.values_mut() {
+            cell.out = true;
+        }
         // Desired cells fade in (reversing if they were fading out) and get fresh masks.
-        for (&pos, &mask) in &desired {
+        for &(pos, mask) in cut {
             let e = self.cells.entry(pos).or_insert(FadeCell { mask, fade: 0.0, out: false });
             e.mask = mask;
             e.out = false;
-        }
-        for (pos, c) in self.cells.iter_mut() {
-            if !desired.contains_key(pos) {
-                c.out = true;
-            }
         }
         self.cells.retain(|_, c| {
             if c.out {
@@ -69,6 +101,10 @@ impl SwapFade {
                 true
             }
         });
+        self.animating = self.cells.values().any(|cell| cell.out || cell.fade < 1.0);
+        if !self.animating {
+            self.last = None;
+        }
     }
 
     /// The cells to draw this frame: `(pos, mask, fade, fade_out)`. `fade_out` selects the

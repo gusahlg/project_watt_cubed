@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
+use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle};
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
@@ -69,9 +69,14 @@ use section::{SectionMeshData, SectionPos};
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
+/// Default number of vertical chunk layers meshed above and below the player.
+const DEFAULT_VERTICAL_RADIUS: i32 = 3;
 /// The range a runtime render-distance change is clamped to. Shared: the
 /// settings model and the settings menu stepper clamp to the same bounds.
-pub const VIEW_RADIUS_RANGE: std::ops::RangeInclusive<i32> = 3..=20;
+pub const VIEW_RADIUS_RANGE: std::ops::RangeInclusive<i32> = 0..=20;
+/// Runtime vertical streaming-distance bounds. Kept independent from the
+/// horizontal radius so minimum-mode worlds need not load unused sky/rock.
+pub const VERTICAL_RADIUS_RANGE: std::ops::RangeInclusive<i32> = 1..=10;
 /// One extra shell of *data* (not meshed) in all three axes so edge chunks can
 /// cull faces against their neighbours without re-meshing when those
 /// neighbours later load.
@@ -112,9 +117,10 @@ use connectivity::{Connectivity, Occlusion};
 /// terrain is mostly lateral, so a full cube would load a tall column of empty
 /// sky and deep rock that never produces drawable geometry — tripling the
 /// loaded set (and every O(loaded) streaming pass) for nothing on screen. The
-/// vertical radius is derived from the horizontal one ([`vertical_for`]), tall
-/// enough to keep the ground under vertical movement (jumping, cliffs, flight)
-/// without paying for the whole render sphere.
+/// vertical radius can be configured independently, tall enough to keep the
+/// ground under vertical movement (jumping, cliffs, flight) without paying for
+/// the whole render sphere. The compatibility render-radius setter still uses
+/// [`vertical_for`] to preserve its historical behaviour.
 ///
 /// [`vertical_for`]: ViewVolume::vertical_for
 #[derive(Clone, Copy)]
@@ -129,10 +135,17 @@ impl ViewVolume {
     fn vertical_for(horizontal: i32) -> i32 {
         (horizontal / 2).clamp(2, 5)
     }
+    /// Explicit anisotropic volume. Runtime setters clamp before construction.
+    fn new(horizontal: i32, vertical: i32) -> Self {
+        Self {
+            horizontal,
+            vertical,
+        }
+    }
     /// The streamed volume for a horizontal view radius, with the vertical
     /// radius derived from it.
     fn view(horizontal: i32) -> Self {
-        Self { horizontal, vertical: Self::vertical_for(horizontal) }
+        Self::new(horizontal, Self::vertical_for(horizontal))
     }
     /// The full-res coverage slab in metres: the shader's LOD-cull volume, which
     /// must equal this streamed full-res volume (one source of truth for both).
@@ -141,6 +154,12 @@ impl ViewVolume {
             radius: (self.horizontal * CHUNK_SIZE as i32) as f32,
             half_height: (self.vertical * CHUNK_SIZE as i32) as f32,
         }
+    }
+
+    /// LOD ring unit cannot be zero even when the stripped near field draws
+    /// only the current chunk column.
+    fn lod_unit(&self) -> f32 {
+        (self.horizontal.max(1) * CHUNK_SIZE as i32) as f32
     }
     /// The mesh box grown by `dh` rings horizontally and `dv` layers vertically.
     fn box_at(self, center: Coord, dh: i32, dv: i32) -> ChunkBox {
@@ -294,25 +313,15 @@ impl ChunkMeshes {
         any.then_some(Self(passes))
     }
     /// Wrap freshly uploaded per-pass handles, same "at least 1 present" rule as [`Self::new`].
-    pub(in crate::world) fn from_upload_handles(handles: ByPass<Option<MeshHandle>>) -> Option<Self> {
+    pub(in crate::world) fn from_upload_handles(
+        handles: ByPass<Option<MeshHandle>>,
+    ) -> Option<Self> {
         Self::new(ByPass::from_fn(|p| handles[p].map(OwnedMesh::new)))
     }
-    /// Record a draw for each present pass at `offset`/`detail`.
-    fn draw(&self, f: &mut Frame3D, offset: Vec3, detail: Detail) {
-        for (_, m) in self.0.iter() {
-            if let Some(mesh) = m {
-                f.draw_mesh(mesh.id(), offset, detail);
-            }
-        }
-    }
-    /// Draw each present pass with cross-fade and far-material styling.
-    /// `(1.0, 0, 0)` is identical to [`draw`](Self::draw).
-    fn draw_faded(&self, f: &mut Frame3D, offset: Vec3, detail: Detail, fade: f32, style: FadeStyle, flat_rgba: u32) {
-        for (_, m) in self.0.iter() {
-            if let Some(mesh) = m {
-                f.draw_mesh_faded(mesh.id(), offset, detail, fade, style, flat_rgba);
-            }
-        }
+    /// Copy the lightweight engine handles into the immutable per-frame draw
+    /// cache. GPU ownership remains here; the cache only prepares submissions.
+    fn handles(&self) -> ByPass<Option<MeshHandle>> {
+        ByPass::from_fn(|pass| self.0[pass].as_ref().map(OwnedMesh::id))
     }
     /// Free every present pass's GPU allocation. Consumes `self`.
     fn free(self, eng: &mut Engine) {
@@ -325,8 +334,84 @@ impl ChunkMeshes {
     /// Whether any pass draws `handle` — for the render/ownership tests.
     #[cfg(test)]
     fn draws(&self, handle: MeshHandle) -> bool {
-        self.0.iter().any(|(_, m)| m.as_ref().is_some_and(|o| o.id() == handle))
+        self.0
+            .iter()
+            .any(|(_, m)| m.as_ref().is_some_and(|o| o.id() == handle))
     }
+}
+
+/// Prepared full-resolution draw record. Rebuilt only when the live mesh set
+/// changes, so steady-state render avoids a hash lookup and chunk-origin
+/// multiplication for every visible chunk and pass.
+struct ChunkDraw {
+    coord: Coord,
+    origin: DVec3,
+    handles: ByPass<Option<MeshHandle>>,
+}
+
+/// Exact inputs to the expensive far-field frontier selection. Covering still
+/// refreshes as worker results land, but an idle eye can reuse the same radial/
+/// relief cut instead of rebuilding temporary grids and hash sets every stream tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SectionFrontierKey {
+    center_xz: [i32; 2],
+    eye_y: u64,
+    velocity: [u64; 3],
+    unit: u32,
+    finest: u8,
+    levels: u8,
+    step: u8,
+    mip_ready: bool,
+}
+
+impl ChunkDraw {
+    fn draw(&self, f: &mut Frame3D, cam: DVec3) {
+        let offset = (self.origin - cam).as_vec3();
+        for (_, handle) in self.handles.iter() {
+            if let Some(handle) = handle {
+                f.draw_mesh(*handle, offset, Detail::FULL);
+            }
+        }
+    }
+}
+
+/// One ready far-field block with world origin and copied GPU handles. Section
+/// selection/material work is prepared at streaming cadence; render only rebases
+/// these records and emits commands.
+struct SectionBlockDraw {
+    origin: DVec3,
+    handles: ByPass<Option<MeshHandle>>,
+}
+
+impl SectionBlockDraw {
+    fn draw(
+        &self,
+        f: &mut Frame3D,
+        cam: DVec3,
+        detail: Detail,
+        fade: f32,
+        style: FadeStyle,
+        flat_rgba: u32,
+    ) {
+        let offset = (self.origin - cam).as_vec3();
+        for (_, handle) in self.handles.iter() {
+            if let Some(handle) = handle {
+                f.draw_mesh_faded(*handle, offset, detail, fade, style, flat_rgba);
+            }
+        }
+    }
+}
+
+/// Header for a contiguous range in `section_block_draws`, keeping occlusion at
+/// section granularity while avoiding steady-frame map lookups and material work.
+struct SectionDraw {
+    pos: SectionPos,
+    blocks_start: usize,
+    blocks_len: usize,
+    detail: Detail,
+    fade: f32,
+    style: FadeStyle,
+    flat_rgba: u32,
 }
 
 // Per-draw style (flat palette-average colour, fade-the-complement) is the
@@ -339,18 +424,27 @@ const FLAT_DETAIL: u8 = section::FINEST_DETAIL + 4;
 /// A section is either meshing or ready. Blocks are pre-positioned at upload,
 /// so draw needs only camera-relative offset arithmetic.
 pub(in crate::world) enum SectionState {
-    Meshing,
+    /// An asynchronous extraction claim. The token distinguishes repeated
+    /// claims for the same position inside one configuration epoch, so a late
+    /// cancellation/result cannot capture an unload/re-admit replacement.
+    Meshing { token: u64 },
     /// Blocks grouped by quadrant (indexed by [`SectionPos::quadrant`]); the draw
     /// path renders only the quadrants a [`QuadrantMask`] selects. Each block is
     /// positioned at a world min-corner, drawn at the section's [`Detail`]
     /// (cell size `2^detail`) — derived from the map key `pos.detail`, not stored.
-    Ready { quadrants: [Vec<([f64; 3], ChunkMeshes)>; 4] },
+    Ready {
+        quadrants: [Vec<([f64; 3], ChunkMeshes)>; 4],
+    },
 }
 
 impl SectionState {
     /// Upload each quadrant's block meshes with pre-baked world positions so draw
     /// needs only the camera-relative subtract. Empty quadrants upload to no handles.
-    fn from_upload(pos: SectionPos, meshes: [SectionMeshData; 4], eng: &mut Engine) -> SectionState {
+    fn from_upload(
+        pos: SectionPos,
+        meshes: [SectionMeshData; 4],
+        eng: &mut Engine,
+    ) -> SectionState {
         let cell = pos.cell_size();
         let (mx, mz) = (pos.min_x() as f64, pos.min_z() as f64);
         let quadrants = meshes.map(|quad| {
@@ -374,19 +468,6 @@ impl SectionState {
 
     fn is_ready(&self) -> bool {
         matches!(self, SectionState::Ready { .. })
-    }
-    /// Draw the quadrants `mask` selects at `detail`, with cross-fade and far-material
-    /// styling via `fade`/`style`/`flat_rgba`.
-    /// The shader hands the near ground to full-res chunks via coverage dither.
-    fn draw(&self, f: &mut Frame3D, cam: DVec3, mask: QuadrantMask, detail: Detail, fade: f32, style: FadeStyle, flat_rgba: u32) {
-        if let SectionState::Ready { quadrants } = self {
-            for q in mask.iter() {
-                for (wmin, meshes) in &quadrants[q.index()] {
-                    let offset = (DVec3::new(wmin[0], wmin[1], wmin[2]) - cam).as_vec3();
-                    meshes.draw_faded(f, offset, detail, fade, style, flat_rgba);
-                }
-            }
-        }
     }
     fn free(self, eng: &mut Engine) {
         if let SectionState::Ready { quadrants, .. } = self {
@@ -493,7 +574,10 @@ impl MeshState {
 pub struct World {
     /// Read-only block palette; meshing/collision read its hot solidity arrays.
     registry: BlockRegistry,
-    generator: SineHills,
+    /// Immutable terrain recipe shared with generation, LOD, and mip workers.
+    /// Cloning this for a job only bumps an `Arc`; the resolved placement vectors
+    /// stay in one allocation instead of being deep-cloned per admission.
+    generator: Arc<SineHills>,
     chunks: FastMap<Coord, Loaded>,
     /// Player edits grouped by chunk (inner key: flat voxel index for replay on regenerate).
     edits: FastMap<Coord, FastMap<usize, BlockId>>,
@@ -522,7 +606,7 @@ pub struct World {
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
-    upload_queue: VecDeque<(Coord, u32, Box<ChunkMeshData>)>,
+    upload_queue: VecDeque<(Coord, u32, pipeline::MeshOutput)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
     /// old whole-map rescan `pending_fresh` armed). Seeded on load (self + 6
     /// neighbours), on a light publish that moved a border, and on an
@@ -585,9 +669,10 @@ pub struct World {
     /// and frees, unloads, the free-meshes passes). `invalidate()` keeps the
     /// previous mesh drawing, so per-edit dirtying never bumps.
     draw_set_rev: u64,
-    /// Drawable chunk coords, rebuilt by `sync_draw_cache` when `draw_set_rev`
-    /// moved — render walks this (~live set) instead of every loaded chunk.
-    draw_cache: Vec<Coord>,
+    /// Prepared drawable records, rebuilt by `sync_draw_cache` when
+    /// `draw_set_rev` moves. Render walks these directly: no chunk-map lookup
+    /// and no repeated world-origin multiplication in the frame hot path.
+    draw_cache: Vec<ChunkDraw>,
     draw_cache_rev: u64,
     /// Bumped whenever a non-registry meshing input stamped onto the hot
     /// tables changes (AO today), so `refresh_tables` rebuilds even though the
@@ -610,6 +695,14 @@ pub struct World {
     light_epoch: u32,
     /// LOD2 column-section far field enable.
     lod2: bool,
+    /// Invalidates asynchronous section extraction across live ladder/meshing
+    /// transitions, including positions shared by the old and new ladders.
+    section_epoch: u32,
+    /// Monotonic identity for repeated claims within one section epoch.
+    section_claim_seq: u64,
+    /// `LaneSpec::submit` constructs the owned worker job before the pool accepts
+    /// it; `claim` immediately consumes this token only after acceptance.
+    section_pending_claim: Option<(SectionPos, u64)>,
     /// LOD pyramid config with `unit` in metres.
     section_pyramid: pyramid::PyramidCfg,
     /// The eye altitude captured each `stream()` before chunk-coord floor rounds it.
@@ -630,7 +723,7 @@ pub struct World {
     /// Loaded sections.
     sections: FastMap<SectionPos, SectionState>,
     /// Finished section meshes awaiting budgeted upload.
-    section_upload_queue: VecDeque<(SectionPos, [SectionMeshData; 4])>,
+    section_upload_queue: VecDeque<(SectionPos, u32, u64, [SectionMeshData; 4])>,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -640,12 +733,20 @@ pub struct World {
     /// sweep (grid walk + relief coarsening) used to run up to three times a
     /// frame for identical inputs.
     section_desired: Vec<SectionPos>,
+    section_frontier_key: Option<SectionFrontierKey>,
     /// Visible sections (covering-resolved) — the desired cut this frame, before the
     /// cross-fade. Feeds `unload_sections` and the fade.
     section_visible: Vec<(SectionPos, QuadrantMask)>,
+    /// Readiness/frontier input changed and the covering cut must be rebuilt.
+    /// Steady streaming ticks only advance an active fade (or touch its clock).
+    section_cover_dirty: bool,
     /// Temporal cross-fade over successive LOD cuts with per-cell dissolve state.
     /// Presentation only; never affects selection logic.
     section_fade: swapfade::SwapFade,
+    /// Prepared far-field draw headers and their flat block records. Rebuilt at
+    /// streaming cadence after covering/fade changes, never in render.
+    section_draw_cache: Vec<SectionDraw>,
+    section_block_draws: Vec<SectionBlockDraw>,
 }
 
 impl World {
@@ -661,14 +762,32 @@ impl World {
     ///
     /// [`RenderConfig`]: crate::render_config::RenderConfig
     pub fn with_config(seed: i64, render: crate::render_config::RenderConfig) -> Self {
+        Self::with_config_inner(seed, render, true)
+    }
+
+    /// Construct without synchronously generating the full origin data box.
+    /// Interactive startup uses this path and calls [`prepare_around`](Self::prepare_around)
+    /// for the small collision-safe spawn slab; streaming fills the remainder
+    /// asynchronously. Existing constructors retain eager data for tests and
+    /// headless callers that query the origin before their first stream.
+    pub fn with_config_lazy(seed: i64, render: crate::render_config::RenderConfig) -> Self {
+        Self::with_config_inner(seed, render, false)
+    }
+
+    fn with_config_inner(
+        seed: i64,
+        render: crate::render_config::RenderConfig,
+        pregenerate_origin: bool,
+    ) -> Self {
         // `mut` for the placement compile: the generator registers every block
         // terrain can emit here at startup, then keeps only resolved ids.
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, seed);
+        let generator = Arc::new(SineHills::new(&mut registry, 20.0, seed));
         // The section ladder's innermost ring begins where the full-res box ends,
         // so its `unit` is the render distance in metres.
         let unit = (DEFAULT_VIEW_RADIUS * CHUNK_SIZE as i32) as f32;
         let lod2 = render.lod2;
+        let (lod_levels, lod_detail) = render.normalized_lod();
         let mut world = Self {
             registry,
             generator,
@@ -677,7 +796,7 @@ impl World {
             edits: FastMap::default(),
             edit_generation: 0,
             center: None,
-            view: ViewVolume::view(DEFAULT_VIEW_RADIUS),
+            view: ViewVolume::new(DEFAULT_VIEW_RADIUS, DEFAULT_VERTICAL_RADIUS),
             pending_fresh: Sticky::raised(),
             pending_dirty: Sticky::default(),
             radius_shrunk: Sticky::default(),
@@ -711,7 +830,10 @@ impl World {
             lighting: true,
             light_epoch: 0,
             lod2,
-            section_pyramid: pyramid::PyramidCfg::sections(unit),
+            section_epoch: 0,
+            section_claim_seq: 0,
+            section_pending_claim: None,
+            section_pyramid: pyramid::PyramidCfg::sections_with(unit, lod_levels, lod_detail),
             section_eye_y: 0.0,
             section_eye_prev: None,
             section_vel: DVec3::ZERO,
@@ -722,13 +844,19 @@ impl World {
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_desired: Vec::new(),
+            section_frontier_key: None,
             section_visible: Vec::new(),
+            section_cover_dirty: true,
             section_fade: swapfade::SwapFade::default(),
+            section_draw_cache: Vec::new(),
+            section_block_draws: Vec::new(),
         };
-        // Centre the pre-generated box on the origin's surface chunk, the
-        // spawn point's own layer.
-        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
-        world.ensure_region_data(ChunkCoord::new(0, cy, 0));
+        if pregenerate_origin {
+            // Centre the pre-generated box on the origin's surface chunk, the
+            // spawn point's own layer.
+            let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+            world.ensure_region_data(ChunkCoord::new(0, cy, 0));
+        }
         world
     }
 
@@ -740,7 +868,24 @@ impl World {
     /// Whether `coord` is a loaded chunk awaiting its fresh mesh — dense data,
     /// no mesh, no job outstanding, not edited. The fresh-scan meshed-ness test.
     fn is_needs_mesh(&self, coord: Coord) -> bool {
-        self.chunks.get(&coord).is_some_and(|l| l.state.is_needs_mesh())
+        self.chunks
+            .get(&coord)
+            .is_some_and(|l| l.state.is_needs_mesh())
+    }
+
+    /// Whether a section result belongs to the currently configured ladder.
+    /// Worker results can outlive a live settings transition, so both landing
+    /// and upload validate this before retaining geometry.
+    fn section_pos_active(&self, pos: SectionPos) -> bool {
+        if !self.lod2 {
+            return false;
+        }
+        let finest = self.section_pyramid.finest.0;
+        let Some(delta) = pos.detail.checked_sub(finest) else {
+            return false;
+        };
+        delta < self.section_pyramid.levels.get() * self.section_pyramid.step()
+            && delta % self.section_pyramid.step() == 0
     }
 
     /// Sanity check: a coord claimed as a live generate job (`generating`)
@@ -768,7 +913,6 @@ impl World {
     /// is visible — the difference is small and exact, no matter how far from
     /// the world origin both sit.
     pub fn render(&self, f: &mut Frame3D, cam: DVec3) {
-        let s = CHUNK_SIZE as f64;
         // A pure projection of prepared state. When occlusion is active the
         // visible set was rebuilt in `stream`; when it is off (the default, no
         // GPU-bound signal) every frustum-visible chunk draws — the baseline
@@ -780,30 +924,41 @@ impl World {
         // last mutation point) — the walk is O(live), not O(loaded).
         debug_assert_eq!(
             self.draw_cache.len(),
-            self.chunks.values().filter(|l| l.state.live_meshes().is_some()).count(),
+            self.chunks
+                .values()
+                .filter(|l| l.state.live_meshes().is_some())
+                .count(),
             "draw cache went stale: a mesh-set mutation missed its draw_set_rev bump"
         );
+        #[cfg(debug_assertions)]
+        for draw in &self.draw_cache {
+            let meshes = self
+                .chunks
+                .get(&draw.coord)
+                .and_then(|loaded| loaded.state.live_meshes())
+                .expect("prepared draw must still own a live mesh");
+            debug_assert_eq!(draw.handles, meshes.handles(), "prepared handles went stale");
+        }
         let mut live = 0u64;
-        for &coord in &self.draw_cache {
-            if self.occlusion_active && !self.occlusion.is_visible(coord) {
+        for draw in &self.draw_cache {
+            if self.occlusion_active && !self.occlusion.is_visible(draw.coord) {
                 continue;
             }
-            let Some(loaded) = self.chunks.get(&coord) else { continue };
-            if let Some(meshes) = loaded.state.live_meshes() {
-                live += 1;
-                let origin =
-                    DVec3::new(coord.x as f64 * s, coord.y as f64 * s, coord.z as f64 * s);
-                // Full-res chunks are unit-scale: their local 0..=16 coords are
-                // already metres. LOD sections pass 2^k here (see `SectionState::draw`).
-                meshes.draw(f, (origin - cam).as_vec3(), Detail::FULL);
-            }
+            live += 1;
+            // Full-res chunks are unit-scale: their local 0..=16 coords are
+            // already metres. LOD sections pass 2^k (see `SectionState::draw`).
+            draw.draw(f, cam);
         }
         // Set-size gauges: `list.world` cost is O(these). A spike here localizes a
         // regression to a grown set (view volume / section frontier), not a
         // per-item slowdown. See `profile::Gauge`.
-        use voxel_engine::profile::{gauge, Gauge};
+        use voxel_engine::profile::{Gauge, gauge};
         gauge(Gauge::WorldChunks, self.chunks.len() as u64);
         gauge(Gauge::WorldChunksLive, live);
+
+        if !self.lod2 {
+            return;
+        }
 
         // Layer 2 — section far field: the covering-resolved visible set built
         // in `stream`. The shader discards LOD-section fragments inside the
@@ -812,38 +967,30 @@ impl World {
         // Vertical extent: the streamed slab guarantees `vertical` chunks above
         // and below the eye even when the eye sits at a chunk boundary.
         f.set_lod_clip(self.view.coverage());
-        // Draw the cross-fade view with per-cell dissolve. Bands screen-door-dissolve
-        // instead of popping. At rest every cell is fade 1 / mode 0 (unless flat).
-        for (pos, mask, fade, out) in self.section_fade.draws() {
+        // Draw the prepared cross-fade view. Hash lookups, quadrant expansion,
+        // material resolution, origins, and handle extraction ran at stream cadence.
+        for draw in &self.section_draw_cache {
             // Occlusion cull sections hidden behind terrain. Under-claiming means
             // a miss wastes a draw but never creates holes.
-            if self.occlusion_active {
+            if self.occlusion_active && self.edits.is_empty() {
                 if let Some(mip) = &self.section_mip {
-                    if mip.occludes(cam, pos) {
+                    if mip.occludes(cam, draw.pos) {
                         continue;
                     }
                 }
             }
-            if let Some(state) = self.sections.get(&pos) {
-                let (flat_color, flat_rgba) = self.section_material(pos);
-                let style = FadeStyle { flat_color, complement: out };
-                state.draw(f, cam, mask, Detail::new(pos.detail), fade, style, flat_rgba);
+            for block in &self.section_block_draws
+                [draw.blocks_start..draw.blocks_start + draw.blocks_len]
+            {
+                block.draw(
+                    f,
+                    cam,
+                    draw.detail,
+                    draw.fade,
+                    draw.style,
+                    draw.flat_rgba,
+                );
             }
-        }
-    }
-
-    /// Far-material style: flat palette-average past [`FLAT_DETAIL`] if available,
-    /// else textured. Returns `mode` bit and packed sRGB colour.
-    fn section_material(&self, pos: SectionPos) -> (bool, u32) {
-        if pos.detail < FLAT_DETAIL {
-            return (false, 0);
-        }
-        match self.section_mip.as_ref().and_then(|m| m.color(pos)) {
-            Some(c) => (
-                true,
-                c.r as u32 | (c.g as u32) << 8 | (c.b as u32) << 16 | (c.a as u32) << 24,
-            ),
-            None => (false, 0),
         }
     }
 
@@ -854,6 +1001,12 @@ impl World {
     /// Skip only if all backing chunks are settled (drawable or born-air, never
     /// in-flight), to avoid holes during fast descent.
     fn coverage_skips(&self, center: Coord, key: SectionPos) -> bool {
+        // The immutable mip describes generator terrain only. An edit can raise
+        // a roof above its baked high bound or remove the baked support, so it
+        // cannot prove that near chunks cover this section while edits exist.
+        if !self.edits.is_empty() {
+            return false;
+        }
         let cov = self.view.coverage();
         let cs = CHUNK_SIZE as i32;
         let (h_lim, v_lim) = (0.75 * cov.radius, 0.75 * cov.half_height);
@@ -870,8 +1023,12 @@ impl World {
         }
         // Vertical: the section's terrain must sit inside the eye's slab, else
         // clip draws the part that pokes out. If unbaked, can't prove, so don't skip.
-        let Some(mip) = &self.section_mip else { return false };
-        let Some((lo, hi)) = mip.relief_band(key) else { return false };
+        let Some(mip) = &self.section_mip else {
+            return false;
+        };
+        let Some((lo, hi)) = mip.relief_band(key) else {
+            return false;
+        };
         let ey = self.section_eye_y as f32;
         if lo < ey - v_lim || hi > ey + v_lim {
             return false;
@@ -880,7 +1037,10 @@ impl World {
         // actually covered now, not just in-range.
         let (cx_lo, cx_hi) = (x0.div_euclid(cs), (x0 + span - 1).div_euclid(cs));
         let (cz_lo, cz_hi) = (z0.div_euclid(cs), (z0 + span - 1).div_euclid(cs));
-        let (cy_lo, cy_hi) = ((lo.floor() as i32).div_euclid(cs), (hi.floor() as i32).div_euclid(cs));
+        let (cy_lo, cy_hi) = (
+            (lo.floor() as i32).div_euclid(cs),
+            (hi.floor() as i32).div_euclid(cs),
+        );
         for cy in cy_lo..=cy_hi {
             for cz in cz_lo..=cz_hi {
                 for cx in cx_lo..=cx_hi {
@@ -929,7 +1089,9 @@ impl World {
                 // Sightlines pass through anything not opaque — water/glass are
                 // solid (collision) but see-through, so they must NOT seal chunks
                 // behind them, or terrain under water gets occlusion-culled.
-                loaded.connectivity = Some(Connectivity::compute(&loaded.chunk, |id| registry.is_opaque(id)));
+                loaded.connectivity = Some(Connectivity::compute(&loaded.chunk, |id| {
+                    registry.is_opaque(id)
+                }));
                 filled += 1;
             }
         }
@@ -943,7 +1105,9 @@ impl World {
         // culling a visible chunk. `None` stays reserved for genuinely unloaded
         // chunks, which bound the BFS frontier.
         self.occlusion.rebuild(origin, |c| {
-            self.chunks.get(&c).map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
+            self.chunks
+                .get(&c)
+                .map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
         });
     }
 }
@@ -1033,9 +1197,9 @@ pub(in crate::world) fn lane_enqueue<S: LaneSpec>(
     let worklist = S::seed_set(world).is_some();
     let candidates: Vec<S::Key> = match S::candidates(world, center) {
         Candidates::Geometry(v) => v,
-        Candidates::Worklist => {
-            S::seed_set(world).map(|s| s.iter().copied().collect()).unwrap_or_default()
-        }
+        Candidates::Worklist => S::seed_set(world)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default(),
     };
     // Partition into ready (not in-flight) and blocked. For worklist lanes, evict
     // blocked seeds since they'll be re-added when unblocked. This avoids
@@ -1084,9 +1248,9 @@ pub(in crate::world) fn lane_enqueue<S: LaneSpec>(
         // Far lanes use distance ordering; near lanes use FIFO.
         // Compute dist² before taking the mutable workers pool.
         let far = S::dist2(world, center, key);
-        let workers = world.workers.get_or_insert_with(|| {
-            pipeline::Workers::spawn(pipeline::Workers::default_threads())
-        });
+        let workers = world
+            .workers
+            .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()));
         let accepted = match far {
             Some(dist2) => workers.submit_far(job, dist2),
             None => workers.submit(job),
@@ -1118,7 +1282,11 @@ pub(in crate::world) fn lane_integrate<S: LaneSpec>(world: &mut World, done: pip
 fn player_dist2(center: Coord, wx: i64, wy: i64, wz: i64) -> u64 {
     let s = CHUNK_SIZE as i64;
     let half = s / 2;
-    let (px, py, pz) = (center.x as i64 * s + half, center.y as i64 * s + half, center.z as i64 * s + half);
+    let (px, py, pz) = (
+        center.x as i64 * s + half,
+        center.y as i64 * s + half,
+        center.z as i64 * s + half,
+    );
     let (dx, dy, dz) = (wx - px, wy - py, wz - pz);
     (dx * dx + dy * dy + dz * dz) as u64
 }
@@ -1169,7 +1337,9 @@ impl LaneSpec for MeshLane {
         // is settled or wait timeout expired (then mesh degraded and remesh later).
         // Quarantined (repeatedly panicking) meshes are never ready.
         world.is_needs_mesh(key)
-            && !world.quarantined.contains(&streaming::FailKey::Mesh { coord: key })
+            && !world
+                .quarantined
+                .contains(&streaming::FailKey::Mesh { coord: key })
             && world.in_mesh_box(key)
             && world.neighbours_have_data(key)
             && (world.light_ready(key) || world.light_wait_expired(key))
@@ -1181,14 +1351,21 @@ impl LaneSpec for MeshLane {
         let degraded = !world.light_ready(key);
         let (rev, snapshot) = world.snapshot(key, degraded);
         world.mark_degraded(key, degraded);
-        Some(pipeline::Job::Mesh { coord: key, rev, snapshot })
+        Some(pipeline::Job::Mesh {
+            coord: key,
+            rev,
+            snapshot,
+        })
     }
     fn claim(world: &mut World, key: Coord) {
         // Set building flag to claim the mesh job. Held until upload retires
         // it or a stale result releases it. Remove from worklist.
         world.mesh_worklist.remove(&key);
         if let Some(loaded) = world.chunks.get_mut(&key) {
-            debug_assert!(loaded.state.is_needs_mesh(), "mesh submit for non-NeedsMesh {key:?}");
+            debug_assert!(
+                loaded.state.is_needs_mesh(),
+                "mesh submit for non-NeedsMesh {key:?}"
+            );
             loaded.state = MeshState::NeedsMesh { building: true };
         }
     }
@@ -1217,7 +1394,9 @@ impl LaneSpec for SectionLane {
                 .copied()
                 .filter(|s| {
                     !world.sections.contains_key(s)
-                        && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
+                        && !world
+                            .quarantined
+                            .contains(&streaming::FailKey::Section { pos: *s })
                         && !world.coverage_skips(center, *s)
                 })
                 .collect(),
@@ -1232,7 +1411,10 @@ impl LaneSpec for SectionLane {
     fn order(center: Coord, key: SectionPos) -> i32 {
         let cs = CHUNK_SIZE as i32;
         let span = key.span();
-        let (psx, psz) = ((center.x * cs).div_euclid(span), (center.z * cs).div_euclid(span));
+        let (psx, psz) = (
+            (center.x * cs).div_euclid(span),
+            (center.z * cs).div_euclid(span),
+        );
         (key.x - psx).abs().max((key.z - psz).abs())
     }
     fn dist2(world: &World, center: Coord, key: SectionPos) -> Option<u64> {
@@ -1244,27 +1426,73 @@ impl LaneSpec for SectionLane {
         // Bias by motion direction so leading edge fills first.
         let cs = CHUNK_SIZE as i64;
         let (px, pz) = (center.x as i64 * cs + cs / 2, center.z as i64 * cs + cs / 2);
-        Some(motion_biased_dist2(base, world.section_vel, (cx - px) as f64, (cz - pz) as f64))
+        Some(motion_biased_dist2(
+            base,
+            world.section_vel,
+            (cx - px) as f64,
+            (cz - pz) as f64,
+        ))
     }
     fn in_flight(world: &World, key: SectionPos) -> bool {
         world.sections.contains_key(&key)
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
         world.refresh_tables();
+        world.section_claim_seq = world.section_claim_seq.wrapping_add(1);
+        let token = world.section_claim_seq;
+        world.section_pending_claim = Some((key, token));
         Some(pipeline::Job::Section {
             pos: key,
-            generator: world.generator.clone(),
+            epoch: world.section_epoch,
+            token,
+            generator: Arc::clone(&world.generator),
             edits: world.edits_for_section(key),
             tables: world.tables.get(),
         })
     }
     fn claim(world: &mut World, key: SectionPos) {
+        let (pending, token) = world
+            .section_pending_claim
+            .take()
+            .expect("section claim must immediately follow an accepted submit");
+        assert_eq!(pending, key, "section submit/claim key mismatch");
         world.dirty_sections.remove(&key);
-        world.sections.insert(key, SectionState::Meshing);
+        world.sections.insert(key, SectionState::Meshing { token });
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
-        if let pipeline::Done::Section { pos, meshes } = done {
-            world.section_upload_queue.push_back((pos, meshes));
+        if let pipeline::Done::Section {
+            pos,
+            epoch,
+            token,
+            meshes,
+        } = done
+        {
+            if epoch != world.section_epoch {
+                return;
+            }
+            let owns_claim = matches!(
+                world.sections.get(&pos),
+                Some(SectionState::Meshing { token: live }) if *live == token
+            );
+            if !owns_claim {
+                return;
+            }
+            // An edit may have landed after this job captured its overlay.
+            // Reject the known-stale CPU mesh before it reaches the GPU queue;
+            // the dirty marker remains armed until the replacement claim.
+            if world.dirty_sections.contains(&pos) {
+                world.sections.remove(&pos);
+                world.pending_sections.set();
+                world.section_cover_dirty = true;
+            } else if world.section_pos_active(pos) {
+                world
+                    .section_upload_queue
+                    .push_back((pos, epoch, token, meshes));
+            } else {
+                // Disabled/out-of-ladder work is an obsolete claim, not a new
+                // section. Do not let it occupy the map or reach GPU upload.
+                world.sections.remove(&pos);
+            }
         }
     }
 }
@@ -1293,7 +1521,9 @@ impl LaneSpec for LightLane {
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         if !world.lighting
             || !world.chunks.contains_key(&key)
-            || world.quarantined.contains(&streaming::FailKey::Light { coord: key })
+            || world
+                .quarantined
+                .contains(&streaming::FailKey::Light { coord: key })
         {
             return None;
         }
@@ -1351,8 +1581,31 @@ mod tests {
     #[test]
     fn lod2_is_the_default_and_near_only_leaves_sections_dormant() {
         assert!(World::generate().lod2, "lod2 far field on by default");
-        let d = World::with_config(DEFAULT_SEED, RenderConfig { lod2: false, ..RenderConfig::default() });
+        let d = World::with_config(
+            DEFAULT_SEED,
+            RenderConfig {
+                lod2: false,
+                ..RenderConfig::default()
+            },
+        );
         assert!(!d.lod2 && d.sections.is_empty() && d.section_visible.is_empty());
+    }
+
+    #[test]
+    fn lazy_construction_defers_region_generation_and_uses_configured_ladder() {
+        let render = RenderConfig {
+            lod_levels: 3,
+            lod_detail: 5,
+            ..RenderConfig::default()
+        };
+        let mut world = World::with_config_lazy(DEFAULT_SEED, render);
+        assert!(world.chunks.is_empty(), "lazy startup performs no region generation");
+        assert_eq!(world.section_pyramid.finest, lod::Lod(5));
+        assert_eq!(world.section_pyramid.levels.get(), 3);
+
+        let y = world.generator.height(0, 0) as f64;
+        world.prepare_around(DVec3::new(0.0, y, 0.0));
+        assert_eq!(world.chunks.len(), 3 * 3 * 4, "collision slab remains synchronous");
     }
 
     #[test]
@@ -1362,14 +1615,179 @@ mod tests {
         world.center = Some(center);
         let pos = world.desired_sections(center)[0];
         assert!(!<SectionLane as LaneSpec>::in_flight(&world, pos));
+        let job = <SectionLane as LaneSpec>::submit(&mut world, pos).unwrap();
+        let token = match job {
+            pipeline::Job::Section {
+                token, generator, ..
+            } => {
+                assert!(
+                    Arc::ptr_eq(&generator, &world.generator),
+                    "section admission shares the world's immutable terrain"
+                );
+                token
+            }
+            _ => unreachable!(),
+        };
         <SectionLane as LaneSpec>::claim(&mut world, pos);
-        assert!(matches!(world.sections.get(&pos), Some(SectionState::Meshing)));
-        assert!(<SectionLane as LaneSpec>::in_flight(&world, pos), "claim marks in-flight");
+        assert!(matches!(
+            world.sections.get(&pos),
+            Some(SectionState::Meshing { token: live }) if *live == token
+        ));
+        assert!(
+            <SectionLane as LaneSpec>::in_flight(&world, pos),
+            "claim marks in-flight"
+        );
+        let epoch = world.section_epoch;
         <SectionLane as LaneSpec>::integrate(
             &mut world,
-            pipeline::Done::Section { pos, meshes: Default::default() },
+            pipeline::Done::Section {
+                pos,
+                epoch,
+                token,
+                meshes: Default::default(),
+            },
         );
-        assert_eq!(world.section_upload_queue.len(), 1, "landing queued for upload");
+        assert_eq!(
+            world.section_upload_queue.len(),
+            1,
+            "landing queued for upload"
+        );
+    }
+
+    #[test]
+    fn stale_section_results_are_rejected_when_disabled_or_outside_ladder() {
+        let mut world = lod2_world();
+        let active = SectionPos {
+            detail: world.section_pyramid.finest.0,
+            x: 0,
+            z: 0,
+        };
+        let active_token = 1;
+        world
+            .sections
+            .insert(active, SectionState::Meshing { token: active_token });
+        world.lod2 = false;
+        let epoch = world.section_epoch;
+        <SectionLane as LaneSpec>::integrate(
+            &mut world,
+            pipeline::Done::Section {
+                pos: active,
+                epoch,
+                token: active_token,
+                meshes: Default::default(),
+            },
+        );
+        assert!(world.section_upload_queue.is_empty());
+        assert!(!world.sections.contains_key(&active));
+
+        world.lod2 = true;
+        let outside = SectionPos {
+            detail: world.section_pyramid.coarsest() + 1,
+            x: 0,
+            z: 0,
+        };
+        let outside_token = 2;
+        world
+            .sections
+            .insert(outside, SectionState::Meshing { token: outside_token });
+        <SectionLane as LaneSpec>::integrate(
+            &mut world,
+            pipeline::Done::Section {
+                pos: outside,
+                epoch,
+                token: outside_token,
+                meshes: Default::default(),
+            },
+        );
+        assert!(world.section_upload_queue.is_empty());
+        assert!(!world.sections.contains_key(&outside));
+    }
+
+    #[test]
+    fn stale_section_epoch_cannot_capture_or_cancel_a_replacement_claim() {
+        let mut world = lod2_world();
+        let pos = SectionPos {
+            detail: world.section_pyramid.finest.0,
+            x: 2,
+            z: -3,
+        };
+        let stale_epoch = world.section_epoch;
+        // Model a live ladder/meshing transition followed by a replacement job
+        // for a position shared by both configurations.
+        world.section_epoch = world.section_epoch.wrapping_add(1);
+        let live_token = 20;
+        let stale_token = 10;
+        world
+            .sections
+            .insert(pos, SectionState::Meshing { token: live_token });
+
+        <SectionLane as LaneSpec>::integrate(
+            &mut world,
+            pipeline::Done::Section {
+                pos,
+                epoch: stale_epoch,
+                token: stale_token,
+                meshes: Default::default(),
+            },
+        );
+        assert!(world.section_upload_queue.is_empty());
+        assert!(matches!(
+            world.sections.get(&pos),
+            Some(SectionState::Meshing { token }) if *token == live_token
+        ));
+
+        world.cancel_job(pipeline::JobKey::Section {
+            pos,
+            epoch: stale_epoch,
+            token: stale_token,
+        });
+        assert!(
+            matches!(
+                world.sections.get(&pos),
+                Some(SectionState::Meshing { token }) if *token == live_token
+            ),
+            "old cancellation must not release the replacement claim"
+        );
+    }
+
+    #[test]
+    fn stale_same_epoch_section_token_cannot_capture_cancel_or_fail_replacement() {
+        let mut world = lod2_world();
+        let pos = SectionPos {
+            detail: world.section_pyramid.finest.0,
+            x: -4,
+            z: 5,
+        };
+        let epoch = world.section_epoch;
+        let stale_token = 41;
+        let live_token = 42;
+        world
+            .sections
+            .insert(pos, SectionState::Meshing { token: live_token });
+
+        <SectionLane as LaneSpec>::integrate(
+            &mut world,
+            pipeline::Done::Section {
+                pos,
+                epoch,
+                token: stale_token,
+                meshes: Default::default(),
+            },
+        );
+        assert!(world.section_upload_queue.is_empty());
+
+        let stale_key = pipeline::JobKey::Section {
+            pos,
+            epoch,
+            token: stale_token,
+        };
+        world.cancel_job(stale_key.clone());
+        world.fail_job(stale_key);
+        assert!(matches!(
+            world.sections.get(&pos),
+            Some(SectionState::Meshing { token }) if *token == live_token
+        ));
+        assert!(world.job_strikes.is_empty(), "stale failure must not charge a strike");
     }
 
     #[test]
@@ -1378,13 +1796,21 @@ mod tests {
         let mut world = lod2_world();
         let center = ChunkCoord::new(0, 0, 0);
         let cell = world.desired_sections(center)[0];
-        assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-        let empty_ready = || SectionState::Ready { quadrants: Default::default() };
+        assert!(
+            !world.section_covered(cell),
+            "nothing loaded means uncovered"
+        );
+        let empty_ready = || SectionState::Ready {
+            quadrants: Default::default(),
+        };
         world.sections.insert(cell, empty_ready());
         assert!(world.section_covered(cell), "a Ready self covers");
         world.sections.remove(&cell);
         world.sections.insert(cell.parent(), empty_ready());
-        assert!(world.section_covered(cell), "a Ready ancestor covers the finer cell");
+        assert!(
+            world.section_covered(cell),
+            "a Ready ancestor covers the finer cell"
+        );
     }
 
     /// The fast-movement staleness fix (user report: flying far up left a
@@ -1401,25 +1827,44 @@ mod tests {
         // Fresh world: everything desired is missing — the rebuild must arm.
         world.section_desired = world.desired_sections(center);
         world.rebuild_section_visible(center);
-        assert!(world.pending_sections.get(), "open holes must keep the lane armed");
+        assert!(
+            world.pending_sections.get(),
+            "open holes must keep the lane armed"
+        );
 
         // Everything in flight (Meshing): no hole is unclaimed — no re-arm.
         world.pending_sections.take();
-        for &cell in &world.section_desired.clone() {
-            world.sections.insert(cell, SectionState::Meshing);
+        for (token, &cell) in world.section_desired.clone().iter().enumerate() {
+            world.sections.insert(
+                cell,
+                SectionState::Meshing {
+                    token: token as u64,
+                },
+            );
         }
         world.section_desired = world.desired_sections(center);
         world.rebuild_section_visible(center);
-        assert!(!world.pending_sections.get(), "in-flight cells are not holes");
+        assert!(
+            !world.pending_sections.get(),
+            "in-flight cells are not holes"
+        );
 
         // Everything Ready: converged — still no re-arm.
         world.pending_sections.take();
         for &cell in &world.section_desired.clone() {
-            world.sections.insert(cell, SectionState::Ready { quadrants: Default::default() });
+            world.sections.insert(
+                cell,
+                SectionState::Ready {
+                    quadrants: Default::default(),
+                },
+            );
         }
         world.section_desired = world.desired_sections(center);
         world.rebuild_section_visible(center);
-        assert!(!world.pending_sections.get(), "a converged covering leaves the lane idle");
+        assert!(
+            !world.pending_sections.get(),
+            "a converged covering leaves the lane idle"
+        );
     }
 
     /// ANY chunk creation re-arms the far-field lane (it changes the coverage
@@ -1430,7 +1875,10 @@ mod tests {
         let mut world = lod2_world();
         world.pending_sections.take();
         world.ensure_data(ChunkCoord::new(40, 0, 40));
-        assert!(world.pending_sections.get(), "a stored chunk must re-arm the section lane");
+        assert!(
+            world.pending_sections.get(),
+            "a stored chunk must re-arm the section lane"
+        );
     }
 
     /// The desired frontier tracks eye ALTITUDE continuously: far above the
@@ -1445,7 +1893,10 @@ mod tests {
         world.section_eye_y = 4000.0;
         let sky: FastSet<_> = world.desired_sections(center).into_iter().collect();
         assert_ne!(ground, sky, "altitude must reshape the desired frontier");
-        assert!(!sky.is_empty(), "high altitude still selects a (coarser) far field");
+        assert!(
+            !sky.is_empty(),
+            "high altitude still selects a (coarser) far field"
+        );
         let finest = world.section_pyramid.finest.0;
         assert!(
             sky.iter().all(|s| s.detail > finest),
@@ -1474,42 +1925,66 @@ mod tests {
         world.center = Some(center);
         world.view = ViewVolume::view(20);
         world.section_mip = Some(HeightMip::bake(
-            &world.generator,
+            world.generator.as_ref(),
             &world.registry.color_snapshot(),
             BakeExtent::new(2048, section::FINEST_DETAIL + 3),
         ));
         let mip = world.section_mip.clone().unwrap();
 
-        let cell = SectionPos { detail: section::FINEST_DETAIL, x: 0, z: 0 };
+        let cell = SectionPos {
+            detail: section::FINEST_DETAIL,
+            x: 0,
+            z: 0,
+        };
         let (lo, hi) = mip.relief_band(cell).expect("near cell is baked");
         // Centre the eye on the cell's relief so its terrain sits inside the slab.
         world.section_eye_y = ((lo + hi) * 0.5) as f64;
 
         // Selection stays total: skip is invisible to covering.
-        assert!(world.desired_sections(center).contains(&cell), "cell still desired");
+        assert!(
+            world.desired_sections(center).contains(&cell),
+            "cell still desired"
+        );
 
         // With nothing loaded, footprint is unbacked, so don't skip.
-        assert!(!world.coverage_skips(center, cell), "unbacked near disc must not be skipped");
+        assert!(
+            !world.coverage_skips(center, cell),
+            "unbacked near disc must not be skipped"
+        );
 
         // Back the footprint with settled chunks.
         let cs = CHUNK_SIZE as i32;
         let nchunks = cell.span() / cs;
-        let (cy_lo, cy_hi) = ((lo.floor() as i32).div_euclid(cs), (hi.floor() as i32).div_euclid(cs));
+        let (cy_lo, cy_hi) = (
+            (lo.floor() as i32).div_euclid(cs),
+            (hi.floor() as i32).div_euclid(cs),
+        );
         for cy in cy_lo..=cy_hi {
             for cz in 0..nchunks {
                 for cx in 0..nchunks {
-                    world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_chunk(cx, cy, cz));
+                    world
+                        .chunks
+                        .insert(ChunkCoord::new(cx, cy, cz), air_chunk(cx, cy, cz));
                 }
             }
         }
-        assert!(world.coverage_skips(center, cell), "backed near disc inside the slab is skipped");
+        assert!(
+            world.coverage_skips(center, cell),
+            "backed near disc inside the slab is skipped"
+        );
 
         // If any chunk is in-flight, don't skip (fast-descent guard).
-        world.chunks.insert(ChunkCoord::new(0, cy_lo, 0), Loaded {
-            state: MeshState::NeedsMesh { building: true },
-            ..air_chunk(0, cy_lo, 0)
-        });
-        assert!(!world.coverage_skips(center, cell), "an in-flight covering chunk blocks the skip");
+        world.chunks.insert(
+            ChunkCoord::new(0, cy_lo, 0),
+            Loaded {
+                state: MeshState::NeedsMesh { building: true },
+                ..air_chunk(0, cy_lo, 0)
+            },
+        );
+        assert!(
+            !world.coverage_skips(center, cell),
+            "an in-flight covering chunk blocks the skip"
+        );
     }
 
     /// Verify sections outside the skipped core are never skipped.
@@ -1521,23 +1996,37 @@ mod tests {
         world.center = Some(center);
         world.view = ViewVolume::view(20);
         world.section_mip = Some(HeightMip::bake(
-            &world.generator,
+            world.generator.as_ref(),
             &world.registry.color_snapshot(),
             BakeExtent::new(2048, section::FINEST_DETAIL + 3),
         ));
         let mip = world.section_mip.clone().unwrap();
 
         // Far section: clip draws it, so don't skip it.
-        let far = SectionPos { detail: section::FINEST_DETAIL, x: 5, z: 0 };
+        let far = SectionPos {
+            detail: section::FINEST_DETAIL,
+            x: 5,
+            z: 0,
+        };
         if let Some((lo, hi)) = mip.relief_band(far) {
             world.section_eye_y = ((lo + hi) * 0.5) as f64;
         }
-        assert!(!world.coverage_skips(center, far), "a far section is never skipped");
+        assert!(
+            !world.coverage_skips(center, far),
+            "a far section is never skipped"
+        );
 
         // Near section but eye is high above it: terrain pokes out of slab, so don't skip.
-        let near = SectionPos { detail: section::FINEST_DETAIL, x: 0, z: 0 };
+        let near = SectionPos {
+            detail: section::FINEST_DETAIL,
+            x: 0,
+            z: 0,
+        };
         world.section_eye_y = 5000.0;
-        assert!(!world.coverage_skips(center, near), "high eye over low ground is not skipped");
+        assert!(
+            !world.coverage_skips(center, near),
+            "high eye over low ground is not skipped"
+        );
     }
 
     /// A `Ready` state drawing a single opaque mesh `h` (the common test shape).
@@ -1553,15 +2042,53 @@ mod tests {
     }
 
     #[test]
+    fn draw_cache_prepares_origin_and_handles() {
+        let mut world = World::with_config_lazy(DEFAULT_SEED, RenderConfig::default());
+        let coord = ChunkCoord::new(-3, 4, 7);
+        let handle = MeshHandle::from_raw_parts(17, 9);
+        world.chunks.insert(
+            coord,
+            Loaded {
+                state: ready(handle),
+                ..air_chunk(coord.x, coord.y, coord.z)
+            },
+        );
+        world.draw_set_rev = world.draw_set_rev.wrapping_add(1);
+        world.sync_draw_cache();
+
+        assert_eq!(world.draw_cache.len(), 1);
+        let draw = &world.draw_cache[0];
+        assert_eq!(draw.coord, coord);
+        assert_eq!(
+            draw.origin,
+            DVec3::new(
+                coord.x as f64 * CHUNK_SIZE as f64,
+                coord.y as f64 * CHUNK_SIZE as f64,
+                coord.z as f64 * CHUNK_SIZE as f64,
+            )
+        );
+        assert_eq!(draw.handles[Pass::Opaque], Some(handle));
+    }
+
+    #[test]
     fn ground_is_solid_and_sky_is_air() {
         let world = World::generate();
-        assert!(world.is_solid(8, 0, 8), "surface-band ground should be solid");
+        assert!(
+            world.is_solid(8, 0, 8),
+            "surface-band ground should be solid"
+        );
         assert!(
             world.is_solid(8, -200, 8) || world.block_at(8, -200, 8) == AIR,
             "deep query must not panic"
         );
-        assert!(world.is_solid(8, -40, 8), "no world floor: stone all the way down");
-        assert!(!world.is_solid(8, 40, 8), "sky between terrain and islands is air");
+        assert!(
+            world.is_solid(8, -40, 8),
+            "no world floor: stone all the way down"
+        );
+        assert!(
+            !world.is_solid(8, 40, 8),
+            "sky between terrain and islands is air"
+        );
     }
 
     #[test]
@@ -1588,7 +2115,9 @@ mod tests {
         ] {
             let aabb = Aabb::new(center, DVec3::new(0.4, 0.9, 0.4));
             // Collision skips liquids (solid to mesher, passable to collision).
-            let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_obstacle(x, y, z));
+            let reference = aabb
+                .voxel_cells()
+                .any(|(x, y, z)| world.is_obstacle(x, y, z));
             assert_eq!(world.collides(&aabb), reference, "at {center:?}");
         }
     }
@@ -1637,17 +2166,18 @@ mod tests {
         world.set_block(x, h, z, AIR);
         assert_eq!(world.edits().count(), 1, "a real edit is recorded");
         world.set_block(x, h, z, original);
-        assert_eq!(world.edits().count(), 0, "restoring generation drops the entry");
+        assert_eq!(
+            world.edits().count(),
+            0,
+            "restoring generation drops the entry"
+        );
     }
 
     #[test]
     fn edits_persist_across_unload() {
         let mut world = World::generate();
         let (x, z) = (8, 8);
-        let h = (0..64)
-            .rev()
-            .find(|&y| world.is_solid(x, y, z))
-            .unwrap();
+        let h = (0..64).rev().find(|&y| world.is_solid(x, y, z)).unwrap();
         world.set_block(x, h, z, AIR);
         assert_eq!(world.block_at(x, h, z), AIR);
         let stone = world.registry().id_by_name("Stone").unwrap();
@@ -1701,7 +2231,11 @@ mod tests {
         world.light_inflight.insert(coord);
         <LightLane as LaneSpec>::integrate(
             &mut world,
-            pipeline::Done::Light { coord, epoch: off_epoch, grid: light::LightGrid::dark() },
+            pipeline::Done::Light {
+                coord,
+                epoch: off_epoch,
+                grid: light::LightGrid::dark(),
+            },
         );
         assert!(world.light_apply_queue.is_empty());
         let current_epoch = world.light_epoch;
@@ -1727,17 +2261,30 @@ mod tests {
         world.mesh_worklist.remove(&coord);
         world.fail_job(pipeline::JobKey::Mesh { coord });
         assert!(
-            matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }),
+            matches!(
+                world.chunks[&coord].state,
+                MeshState::NeedsMesh { building: false }
+            ),
             "the build claim must be released"
         );
-        assert!(world.mesh_worklist.contains(&coord), "released work is re-seeded");
+        assert!(
+            world.mesh_worklist.contains(&coord),
+            "released work is re-seeded"
+        );
 
         // Strike out: the third failure quarantines and stops re-seeding.
         world.fail_job(pipeline::JobKey::Mesh { coord });
         world.mesh_worklist.remove(&coord);
         world.fail_job(pipeline::JobKey::Mesh { coord });
-        assert!(world.quarantined.contains(&streaming::FailKey::Mesh { coord }));
-        assert!(!world.mesh_worklist.contains(&coord), "quarantined claims are not re-seeded");
+        assert!(
+            world
+                .quarantined
+                .contains(&streaming::FailKey::Mesh { coord })
+        );
+        assert!(
+            !world.mesh_worklist.contains(&coord),
+            "quarantined claims are not re-seeded"
+        );
         assert!(
             !<MeshLane as LaneSpec>::ready(&world, coord),
             "the mesh lane skips a quarantined coord"
@@ -1753,8 +2300,15 @@ mod tests {
             world.light_inflight.insert(coord);
             world.fail_job(pipeline::JobKey::Light { coord });
         }
-        assert!(!world.light_inflight.contains(&coord), "claim always releases");
-        assert!(world.quarantined.contains(&streaming::FailKey::Light { coord }));
+        assert!(
+            !world.light_inflight.contains(&coord),
+            "claim always releases"
+        );
+        assert!(
+            world
+                .quarantined
+                .contains(&streaming::FailKey::Light { coord })
+        );
         assert!(
             <LightLane as LaneSpec>::submit(&mut world, coord).is_none(),
             "a quarantined light claim never resubmits"
@@ -1765,14 +2319,31 @@ mod tests {
         for cy in 0..=2 {
             world.generating.insert(ChunkCoord::new(cx, cy, cz));
         }
-        world.fail_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=2 });
+        world.fail_job(pipeline::JobKey::Column {
+            col: (cx, cz),
+            cy: 0..=2,
+        });
         assert!((0..=2).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
         // Section lane: a panicked Meshing claim is dropped so selection retries.
-        let pos = SectionPos { detail: 2, x: 9, z: 9 };
-        world.sections.insert(pos, SectionState::Meshing);
-        world.fail_job(pipeline::JobKey::Section { pos });
-        assert!(!world.sections.contains_key(&pos), "the Meshing claim must clear");
+        let pos = SectionPos {
+            detail: 2,
+            x: 9,
+            z: 9,
+        };
+        let token = 77;
+        world
+            .sections
+            .insert(pos, SectionState::Meshing { token });
+        world.fail_job(pipeline::JobKey::Section {
+            pos,
+            epoch: world.section_epoch,
+            token,
+        });
+        assert!(
+            !world.sections.contains_key(&pos),
+            "the Meshing claim must clear"
+        );
     }
 
     /// Descheduled (left-behind) jobs release their claims like panics do,
@@ -1785,7 +2356,10 @@ mod tests {
 
         world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
         world.cancel_job(pipeline::JobKey::Mesh { coord });
-        assert!(matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }));
+        assert!(matches!(
+            world.chunks[&coord].state,
+            MeshState::NeedsMesh { building: false }
+        ));
 
         world.light_inflight.insert(coord);
         world.cancel_job(pipeline::JobKey::Light { coord });
@@ -1795,11 +2369,20 @@ mod tests {
         for cy in 0..=1 {
             world.generating.insert(ChunkCoord::new(cx, cy, cz));
         }
-        world.cancel_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=1 });
+        world.cancel_job(pipeline::JobKey::Column {
+            col: (cx, cz),
+            cy: 0..=1,
+        });
         assert!((0..=1).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
-        assert!(world.quarantined.is_empty(), "cancellation is not a failure");
-        assert!(world.job_strikes.is_empty(), "cancellation earns no strikes");
+        assert!(
+            world.quarantined.is_empty(),
+            "cancellation is not a failure"
+        );
+        assert!(
+            world.job_strikes.is_empty(),
+            "cancellation earns no strikes"
+        );
     }
 
     #[test]
@@ -1814,12 +2397,12 @@ mod tests {
         assert!(!world.mesh_result_applies(coord, rev));
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
+        world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
         assert!(world.upload_queue.is_empty(), "stale result never queues");
         assert!(world.pending_fresh.get(), "drop re-arms the scan");
 
         let rev = world.chunks[&coord].rev;
-        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
+        world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
         assert_eq!(world.upload_queue.len(), 1);
         world.upload_queue.clear();
 
@@ -1828,7 +2411,10 @@ mod tests {
         assert!(!world.mesh_result_applies(ChunkCoord::new(99, 0, 99), 0));
         assert!(!world.mesh_result_applies(ChunkCoord::new(0, 99, 0), 0));
         let rv = world.view.vertical;
-        assert!(!world.mesh_result_applies(ChunkCoord::new(0, rv + 1, 0), 0), "just past vertical range");
+        assert!(
+            !world.mesh_result_applies(ChunkCoord::new(0, rv + 1, 0), 0),
+            "just past vertical range"
+        );
     }
 
     #[test]
@@ -1836,18 +2422,41 @@ mod tests {
         let mut world = World::generate();
         let before = world.chunks[&ChunkCoord::new(-1, 0, 0)].rev;
         world.set_block(0, 5, 8, AIR);
-        assert_eq!(world.chunks[&ChunkCoord::new(-1, 0, 0)].rev, before + 1, "border neighbour");
-        assert_eq!(world.chunks[&ChunkCoord::new(0, 0, 0)].rev, 1, "edited chunk itself");
-        assert_eq!(world.chunks[&ChunkCoord::new(1, 0, 0)].rev, 0, "far side untouched");
+        assert_eq!(
+            world.chunks[&ChunkCoord::new(-1, 0, 0)].rev,
+            before + 1,
+            "border neighbour"
+        );
+        assert_eq!(
+            world.chunks[&ChunkCoord::new(0, 0, 0)].rev,
+            1,
+            "edited chunk itself"
+        );
+        assert_eq!(
+            world.chunks[&ChunkCoord::new(1, 0, 0)].rev,
+            0,
+            "far side untouched"
+        );
 
         // Vertical borders also bump rev on the neighbour below.
         let stone = world.registry().id_by_name("Stone").unwrap();
-        let other =
-            if world.block_at(8, 16, 8) == crate::block::AIR { stone } else { crate::block::AIR };
+        let other = if world.block_at(8, 16, 8) == crate::block::AIR {
+            stone
+        } else {
+            crate::block::AIR
+        };
         let below = world.chunks[&ChunkCoord::new(0, 0, 0)].rev;
         world.set_block(8, 16, 8, other);
-        assert_eq!(world.chunks[&ChunkCoord::new(0, 0, 0)].rev, below + 1, "chunk below bumped");
-        assert_eq!(world.chunks[&ChunkCoord::new(0, 1, 0)].rev, 1, "edited vertical chunk");
+        assert_eq!(
+            world.chunks[&ChunkCoord::new(0, 0, 0)].rev,
+            below + 1,
+            "chunk below bumped"
+        );
+        assert_eq!(
+            world.chunks[&ChunkCoord::new(0, 1, 0)].rev,
+            1,
+            "edited vertical chunk"
+        );
     }
 
     #[test]
@@ -1855,10 +2464,13 @@ mod tests {
         let mut world = World::generate();
         world.center = Some(ChunkCoord::new(0, 0, 0));
         let coord = ChunkCoord::new(2, 0, 2);
-        let (x, z) = (coord.x * CHUNK_SIZE as i32 + 3, coord.z * CHUNK_SIZE as i32 + 4);
+        let (x, z) = (
+            coord.x * CHUNK_SIZE as i32 + 3,
+            coord.z * CHUNK_SIZE as i32 + 4,
+        );
         world.chunks.remove(&coord);
         world.set_block(x, 5, z, AIR);
-        let raw = Chunk::new(coord.x, coord.y, coord.z, &world.generator);
+        let raw = Chunk::new(coord.x, coord.y, coord.z, world.generator.as_ref());
         assert_ne!(raw.get_local(3, 5, 4), AIR, "terrain is solid there");
         world.pending_fresh.take();
         world.accept_chunk(coord, raw);
@@ -1866,11 +2478,23 @@ mod tests {
         assert!(world.pending_fresh.get(), "new data re-arms the fresh scan");
 
         let far = ChunkCoord::new(100, 0, 100);
-        world.accept_chunk(far, Chunk::new(far.x, far.y, far.z, &world.generator));
-        assert!(!world.chunks.contains_key(&far), "out-of-range chunk dropped");
+        world.accept_chunk(
+            far,
+            Chunk::new(far.x, far.y, far.z, world.generator.as_ref()),
+        );
+        assert!(
+            !world.chunks.contains_key(&far),
+            "out-of-range chunk dropped"
+        );
         let high = ChunkCoord::new(0, 100, 0);
-        world.accept_chunk(high, Chunk::new(high.x, high.y, high.z, &world.generator));
-        assert!(!world.chunks.contains_key(&high), "out-of-height chunk dropped");
+        world.accept_chunk(
+            high,
+            Chunk::new(high.x, high.y, high.z, world.generator.as_ref()),
+        );
+        assert!(
+            !world.chunks.contains_key(&high),
+            "out-of-height chunk dropped"
+        );
     }
 
     #[test]
@@ -1896,12 +2520,19 @@ mod tests {
         world.chunks.get_mut(&coord).unwrap().state = ready(h);
 
         world.set_block(3, 3, 3, AIR);
-        assert_eq!(world.chunks[&coord].state, MeshState::Dirty { prev: Some(meshes(h)) });
+        assert_eq!(
+            world.chunks[&coord].state,
+            MeshState::Dirty {
+                prev: Some(meshes(h))
+            }
+        );
 
         world.set_block(4, 4, 4, AIR);
         assert_eq!(
             world.chunks[&coord].state,
-            MeshState::Dirty { prev: Some(meshes(h)) },
+            MeshState::Dirty {
+                prev: Some(meshes(h))
+            },
             "re-edit preserves the single handle"
         );
 
@@ -1914,7 +2545,10 @@ mod tests {
         ] {
             world.chunks.get_mut(&coord).unwrap().state = s;
             let state = &world.chunks[&coord].state;
-            assert!(state.live_meshes().is_none(), "nothing to free for {state:?}");
+            assert!(
+                state.live_meshes().is_none(),
+                "nothing to free for {state:?}"
+            );
         }
     }
 
@@ -1927,13 +2561,22 @@ mod tests {
         let rev = world.chunks[&coord].rev;
 
         world.set_block(2, 2, 2, AIR);
-        assert!(world.chunks[&coord].state.is_dirty(), "edit turns a building chunk into Dirty");
+        assert!(
+            world.chunks[&coord].state.is_dirty(),
+            "edit turns a building chunk into Dirty"
+        );
         assert_ne!(world.chunks[&coord].rev, rev, "edit bumps rev");
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
-        assert!(world.upload_queue.is_empty(), "stale mesh result never queues");
-        assert!(world.chunks[&coord].state.is_dirty(), "chunk stays Dirty for the sync remesh");
+        world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
+        assert!(
+            world.upload_queue.is_empty(),
+            "stale mesh result never queues"
+        );
+        assert!(
+            world.chunks[&coord].state.is_dirty(),
+            "chunk stays Dirty for the sync remesh"
+        );
         assert!(world.pending_fresh.get(), "drop re-arms the fresh scan");
     }
 
@@ -1947,24 +2590,30 @@ mod tests {
         let rev = world.chunks[&coord].rev;
         world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
         world.center = Some(ChunkCoord::new(1000, 0, 0));
-        assert!(!world.mesh_result_applies(coord, rev), "out-of-box result is stale");
+        assert!(
+            !world.mesh_result_applies(coord, rev),
+            "out-of-box result is stale"
+        );
 
         world.pending_fresh.take();
-        world.accept_mesh(coord, rev, Box::new(new_chunk_mesh_data()));
+        world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
         assert!(world.upload_queue.is_empty(), "stale result never queues");
         assert_eq!(
             world.chunks[&coord].state,
             MeshState::NeedsMesh { building: false },
             "claim released, chunk is re-meshable"
         );
-        assert!(world.mesh_worklist.contains(&coord), "re-seeded for a later mesh");
+        assert!(
+            world.mesh_worklist.contains(&coord),
+            "re-seeded for a later mesh"
+        );
         assert!(world.pending_fresh.get(), "drop re-arms the fresh scan");
     }
 
     #[test]
     fn view_volume_vertical_is_derived_and_flatter() {
         let mut world = World::generate();
-        for (view, vertical) in [(3, 2), (4, 2), (6, 3), (8, 4), (10, 5), (20, 5)] {
+        for (view, vertical) in [(1, 2), (3, 2), (4, 2), (6, 3), (8, 4), (10, 5), (20, 5)] {
             world.set_view_radius(view);
             assert_eq!(world.view.horizontal, view, "view {view}");
             assert_eq!(world.view.vertical, vertical, "vertical at view {view}");
@@ -1972,10 +2621,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_view_distances_clamp_axes_independently() {
+        let mut world = World::generate();
+        world.center = Some(ChunkCoord::new(1, 2, 3));
+        world.set_view_distances(0, 0);
+        assert_eq!((world.view_radius(), world.vertical_radius()), (0, 1));
+        assert_eq!(world.center, None);
+        assert!(world.radius_shrunk.get());
+
+        world.set_view_distances(i32::MAX, i32::MAX);
+        assert_eq!((world.view_radius(), world.vertical_radius()), (20, 10));
+        assert!(world.radius_shrunk.get(), "a later grow preserves the queued shrink");
+    }
+
+    #[test]
+    fn horizontal_distance_change_invalidates_the_lod_range() {
+        let render = RenderConfig::default();
+        let mut world = World::with_config_lazy(DEFAULT_SEED, render);
+        assert!(!world.section_config_changed(render));
+        world.set_view_distances(3, 2);
+        assert!(
+            world.section_config_changed(render),
+            "LOD unit must follow the full-resolution radius before streaming"
+        );
+    }
+
+    #[test]
+    fn pure_lod_toggle_preserves_the_height_mip_contract() {
+        let render = RenderConfig::default();
+        let world = World::with_config_lazy(DEFAULT_SEED, render);
+        let toggled = RenderConfig { lod2: !render.lod2, ..render };
+        assert!(world.section_config_changed(toggled));
+        assert!(
+            !world.section_pyramid_changed(toggled),
+            "on/off does not change the generator-only mip extent"
+        );
+
+        let changed = RenderConfig { lod_levels: render.lod_levels + 1, ..render };
+        assert!(world.section_pyramid_changed(changed));
+    }
+
+    #[test]
     fn streaming_order_weights_vertical_double() {
         let c = ChunkCoord::new(0, 0, 0);
         assert_eq!(World::order(ChunkCoord::new(4, 0, 0), c), 4);
-        assert_eq!(World::order(ChunkCoord::new(0, 2, 0), c), 4, "2 layers up ranks like 4 rings out");
+        assert_eq!(
+            World::order(ChunkCoord::new(0, 2, 0), c),
+            4,
+            "2 layers up ranks like 4 rings out"
+        );
         assert!(
             World::order(ChunkCoord::new(0, 3, 0), c) > World::order(ChunkCoord::new(5, 0, 0), c),
             "lateral terrain streams before the sky"
@@ -1991,8 +2685,16 @@ mod tests {
         assert!(ahead < base, "cell ahead of motion sorts sooner");
         assert!(behind > base, "cell behind motion sorts later");
         assert_eq!(base - ahead, behind - base, "symmetric about the base key");
-        assert_eq!(motion_biased_dist2(base, vx, 0.0, 500.0), base, "perpendicular is unbiased");
-        assert_eq!(motion_biased_dist2(base, DVec3::ZERO, 500.0, 0.0), base, "identity at rest");
+        assert_eq!(
+            motion_biased_dist2(base, vx, 0.0, 500.0),
+            base,
+            "perpendicular is unbiased"
+        );
+        assert_eq!(
+            motion_biased_dist2(base, DVec3::ZERO, 500.0, 0.0),
+            base,
+            "identity at rest"
+        );
         assert_eq!(
             motion_biased_dist2(base, DVec3::new(0.1, 0.0, 0.0), 500.0, 0.0),
             base,
@@ -2007,7 +2709,7 @@ mod tests {
         world.set_view_radius(99);
         assert_eq!(world.view_radius(), 20);
         world.set_view_radius(1);
-        assert_eq!(world.view_radius(), 3);
+        assert_eq!(world.view_radius(), 1);
         assert!(world.pending_fresh.get());
         assert_eq!(world.center, None);
     }
@@ -2017,7 +2719,10 @@ mod tests {
         let mut world = World::generate();
         world.set_view_radius(4);
         world.set_view_radius(8);
-        assert!(world.radius_shrunk.get(), "grow must not clobber a queued shrink");
+        assert!(
+            world.radius_shrunk.get(),
+            "grow must not clobber a queued shrink"
+        );
         assert!(world.radius_shrunk.take());
         assert!(!world.radius_shrunk.get(), "take consumes it");
     }
@@ -2027,9 +2732,19 @@ mod tests {
         let h = MeshHandle::from_raw_parts(5, 2);
         let mut s = ready(h);
         s.invalidate();
-        assert_eq!(s, MeshState::Dirty { prev: Some(meshes(h)) });
+        assert_eq!(
+            s,
+            MeshState::Dirty {
+                prev: Some(meshes(h))
+            }
+        );
         s.invalidate();
-        assert_eq!(s, MeshState::Dirty { prev: Some(meshes(h)) });
+        assert_eq!(
+            s,
+            MeshState::Dirty {
+                prev: Some(meshes(h))
+            }
+        );
         for empty in [
             MeshState::Air,
             MeshState::NeedsMesh { building: false },
@@ -2061,7 +2776,10 @@ mod tests {
         let coord = ChunkCoord::new(0, 0, 0);
         world.set_block(1, 1, 1, AIR);
         assert!(world.pending_dirty.get(), "an edit raises the dirty hint");
-        let in_fiber = world.chunks.iter().any(|(&c, l)| c == coord && l.state.is_dirty());
+        let in_fiber = world
+            .chunks
+            .iter()
+            .any(|(&c, l)| c == coord && l.state.is_dirty());
         assert!(in_fiber, "the edited chunk is in the Dirty fiber");
     }
 
@@ -2085,20 +2803,31 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
         let desired = world.desired_sections(center);
-        assert!(!desired.is_empty(), "a lod2 world wants a far frontier at spawn");
+        assert!(
+            !desired.is_empty(),
+            "a lod2 world wants a far frontier at spawn"
+        );
 
         let workers = pipeline::Workers::spawn(2);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while world.desired_sections(center).iter().any(|&c| !world.section_covered(c)) {
-            assert!(std::time::Instant::now() < deadline, "covering did not converge: {}", world.entry_debug());
+        while world
+            .desired_sections(center)
+            .iter()
+            .any(|&c| !world.section_covered(c))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "covering did not converge: {}",
+                world.entry_debug()
+            );
             // Submit every desired-but-unloaded section (the real lane path).
             for pos in world.desired_sections(center) {
                 if <SectionLane as LaneSpec>::in_flight(&world, pos) {
                     continue;
                 }
-                <SectionLane as LaneSpec>::claim(&mut world, pos);
                 if let Some(job) = <SectionLane as LaneSpec>::submit(&mut world, pos) {
                     assert!(workers.submit(job), "worker pool admits the section job");
+                    <SectionLane as LaneSpec>::claim(&mut world, pos);
                 }
             }
             // Drain finished jobs and yield briefly when the pool is empty.
@@ -2110,15 +2839,30 @@ mod tests {
             if !got {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            while let Some((pos, _meshes)) = world.section_upload_queue.pop_front() {
-                if let Some(s @ SectionState::Meshing) = world.sections.get_mut(&pos) {
-                    *s = SectionState::Ready { quadrants: Default::default() };
+            while let Some((pos, _epoch, token, _meshes)) =
+                world.section_upload_queue.pop_front()
+            {
+                let owns_claim = matches!(
+                    world.sections.get(&pos),
+                    Some(SectionState::Meshing { token: live }) if *live == token
+                );
+                if owns_claim {
+                    let s = world.sections.get_mut(&pos).unwrap();
+                    *s = SectionState::Ready {
+                        quadrants: Default::default(),
+                    };
                 }
             }
         }
-        assert!(world.sections.values().any(|s| s.is_ready()), "at least one Ready section");
         assert!(
-            world.desired_sections(center).iter().all(|&c| world.section_covered(c)),
+            world.sections.values().any(|s| s.is_ready()),
+            "at least one Ready section"
+        );
+        assert!(
+            world
+                .desired_sections(center)
+                .iter()
+                .all(|&c| world.section_covered(c)),
             "terminal state: every desired cell has a drawable ancestor-or-self",
         );
     }
@@ -2140,8 +2884,11 @@ mod tests {
         // near spawn) and each must carry a published light grid so `light_ready`
         // is gateable purely by `light_inflight`/`light_worklist` membership.
         for n in std::iter::once(c).chain(crate::coord::Face::ALL.iter().map(|&f| c.step(f))) {
-            world.chunks.get_mut(&n).expect("neighbourhood pregenerated near spawn").light =
-                Some(light::LightGrid::dark());
+            world
+                .chunks
+                .get_mut(&n)
+                .expect("neighbourhood pregenerated near spawn")
+                .light = Some(light::LightGrid::dark());
         }
         world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh { building: false };
         assert!(world.neighbours_have_data(c));
@@ -2151,7 +2898,10 @@ mod tests {
         world.light_worklist.clear();
         world.light_inflight.insert(c);
         assert!(!world.light_ready(c), "in-flight light blocks readiness");
-        assert!(!<MeshLane as LaneSpec>::ready(&world, c), "blocked: not mesh-ready yet");
+        assert!(
+            !<MeshLane as LaneSpec>::ready(&world, c),
+            "blocked: not mesh-ready yet"
+        );
 
         // Seed C, then run the real eviction path: lane_enqueue partitions
         // candidates into ready/blocked and evicts every blocked worklist seed.
@@ -2162,7 +2912,10 @@ mod tests {
             c,
             pipeline::Deadline::from_budget(std::time::Duration::from_secs(1)),
         );
-        assert!(!world.mesh_worklist.contains(&c), "lane_enqueue evicted the blocked seed");
+        assert!(
+            !world.mesh_worklist.contains(&c),
+            "lane_enqueue evicted the blocked seed"
+        );
 
         // C's light settles — but to the SAME grid it already had (e.g. a flood
         // that changes nothing new). `settle_light` is the atomic terminal
@@ -2172,9 +2925,21 @@ mod tests {
 
         // Fixed: light is ready AND the chunk is back on the worklist with a scan
         // armed, so the mesh lane will claim it next stream instead of stranding it.
-        assert!(world.light_ready(c), "light_inflight cleared, grid published: ready now");
-        assert!(<MeshLane as LaneSpec>::ready(&world, c), "every MeshLane::ready predicate holds");
-        assert!(world.mesh_worklist.contains(&c), "re-seeded: ready chunk restored to the seed set");
-        assert!(world.pending_fresh.get(), "re-armed: the fresh scan will pick it up");
+        assert!(
+            world.light_ready(c),
+            "light_inflight cleared, grid published: ready now"
+        );
+        assert!(
+            <MeshLane as LaneSpec>::ready(&world, c),
+            "every MeshLane::ready predicate holds"
+        );
+        assert!(
+            world.mesh_worklist.contains(&c),
+            "re-seeded: ready chunk restored to the seed set"
+        );
+        assert!(
+            world.pending_fresh.get(),
+            "re-armed: the fresh scan will pick it up"
+        );
     }
 }

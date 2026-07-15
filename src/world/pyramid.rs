@@ -1,6 +1,8 @@
 //! Distance-driven LOD selection: map XZ distance to LOD level and keep tolerance.
 use std::num::NonZeroU8;
 
+use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE};
+
 use super::lod::Lod;
 use super::metric::EyeDist;
 
@@ -22,22 +24,37 @@ pub struct PyramidCfg {
     pub unit: f32,
     /// ≥ 2.0 for exponential falloff.
     pub base: f32,
+    /// Cached integer log2(base). Selection and covering query this for every
+    /// section, so deriving it once avoids repeated floating-point logarithms.
+    step: u8,
 }
 
 impl PyramidCfg {
     /// Standard config: base 2, 7 rings starting at finest LOD.
     pub fn sections(unit: f32) -> PyramidCfg {
+        Self::sections_with(unit, SECTION_LEVELS, super::section::FINEST_DETAIL)
+    }
+
+    /// Configurable section ladder. Inputs are clamped defensively even though
+    /// [`RenderConfig`](crate::render_config::RenderConfig) normalizes them at
+    /// the settings boundary: construction from tests and internal callers
+    /// must preserve the same `detail <= 9` hierarchy invariant.
+    pub fn sections_with(unit: f32, levels: u8, detail: u8) -> PyramidCfg {
+        let detail = detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
+        let levels = levels.clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end());
+        let levels = levels.min(9 - detail + 1);
         PyramidCfg {
-            finest: Lod(2),
-            levels: NonZeroU8::new(SECTION_LEVELS).unwrap(),
+            finest: Lod(detail),
+            levels: NonZeroU8::new(levels).unwrap(),
             unit,
             base: 2.0,
+            step: 1,
         }
     }
 
     /// LOD value increment per ring (log2 of base, floored at 1 for degenerate bases).
     pub fn step(&self) -> u8 {
-        (self.base.log2().round() as i32).max(1) as u8
+        self.step
     }
 
     pub fn coarsest(&self) -> u8 {
@@ -62,14 +79,18 @@ pub(in crate::world) fn level_for(dist: EyeDist, cfg: &PyramidCfg) -> LodChoice 
     if !(dist_xz >= cfg.unit) {
         return LodChoice::Level(cfg.finest);
     }
-    let ring = (dist_xz / cfg.unit).log(cfg.base).floor();
-    // Non-finite ring (corrupt cfg) saturates past horizon.
-    let ring = if ring.is_finite() { ring as u32 } else { u32::MAX };
-    if ring >= cfg.levels.get() as u32 {
-        LodChoice::BeyondHorizon
-    } else {
-        LodChoice::Level(Lod(cfg.finest.0 + ring as u8 * cfg.step()))
+    // At most eight multiply/compare steps beat a transcendental logarithm on
+    // the per-section visibility path, while preserving exact band boundaries.
+    let mut ring = 0u8;
+    let mut upper = cfg.unit * cfg.base;
+    while dist_xz >= upper {
+        ring = ring.saturating_add(1);
+        if ring >= cfg.levels.get() {
+            return LodChoice::BeyondHorizon;
+        }
+        upper *= cfg.base;
     }
+    LodChoice::Level(Lod(cfg.finest.0 + ring * cfg.step()))
 }
 
 /// Keep-side tolerance for hysteresis: whether `lod` is drawable at this distance.
@@ -77,9 +98,7 @@ pub(in crate::world) fn level_for(dist: EyeDist, cfg: &PyramidCfg) -> LodChoice 
 /// Past the horizon, nothing is acceptable.
 pub(in crate::world) fn acceptable(dist: EyeDist, lod: Lod, cfg: &PyramidCfg) -> bool {
     match level_for(dist, cfg) {
-        LodChoice::Level(expected) => {
-            lod.0 == expected.0 || lod.0 + cfg.step() == expected.0
-        }
+        LodChoice::Level(expected) => lod.0 == expected.0 || lod.0 + cfg.step() == expected.0,
         LodChoice::BeyondHorizon => false,
     }
 }
@@ -89,7 +108,13 @@ mod tests {
     use super::*;
 
     fn d1() -> PyramidCfg {
-        PyramidCfg { finest: Lod(2), levels: NonZeroU8::new(2).unwrap(), unit: 256.0, base: 4.0 }
+        PyramidCfg {
+            finest: Lod(2),
+            levels: NonZeroU8::new(2).unwrap(),
+            unit: 256.0,
+            base: 4.0,
+            step: 2,
+        }
     }
 
     /// `level_for` is monotone and always returns a valid level; tolerance prevents thrashing.
@@ -103,7 +128,10 @@ mod tests {
             if let LodChoice::Level(l) = c {
                 assert!(l.0 >= last_coarseness, "never finer with distance");
                 last_coarseness = l.0;
-                assert!(acceptable(d, l, &cfg), "chosen level acceptable at its distance");
+                assert!(
+                    acceptable(d, l, &cfg),
+                    "chosen level acceptable at its distance"
+                );
                 // One ring finer (one step apart) is also acceptable.
                 if l.0 > cfg.finest.0 {
                     assert!(
@@ -135,4 +163,16 @@ mod tests {
         assert_eq!(level_for(d(f32::INFINITY), &cfg), LodChoice::Level(Lod(2)));
     }
 
+    #[test]
+    fn configurable_sections_clamp_to_supported_hierarchy() {
+        let cfg = PyramidCfg::sections_with(64.0, u8::MAX, 6);
+        assert_eq!(cfg.finest, Lod(6));
+        assert_eq!(cfg.levels.get(), 4);
+        assert_eq!(cfg.coarsest(), 9);
+        assert_eq!(cfg.outer_m(), 1024.0);
+
+        let minimum = PyramidCfg::sections_with(64.0, 0, 0);
+        assert_eq!(minimum.finest, Lod(2));
+        assert_eq!(minimum.levels.get(), 1);
+    }
 }

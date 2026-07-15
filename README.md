@@ -60,6 +60,14 @@ Graphics are tunable at runtime from **Settings** on the start menu or the
 `/gfx msaa 4`, `/gfx fps 144`, `/gfx renderdist 8`, `/gfx fov 90`). Settings
 persist in `saves/settings.cfg`.
 
+The Performance page and `/gfx preset minimum|fast|default` provide named
+starting points. Advanced controls include independent horizontal/vertical
+streaming distance, streaming, physics, sky-clock, and mod-update rates,
+HUD/gameplay subsystem gates, and far-field range/quality
+(`/gfx lod_levels 3`, `/gfx lod_detail 4`). The full benchmark contract and
+remaining optimization backlog are in
+[documentation/performance.md](documentation/performance.md).
+
 ## Running on NixOS
 
 The included `flake.nix` wires up the Vulkan loader and windowing libraries.

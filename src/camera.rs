@@ -33,7 +33,9 @@ impl ViewPose {
     /// [`Player::forward`], `f64` trig of the `f32` angles.
     pub fn forward(&self) -> DVec3 {
         let (yaw, pitch) = (self.yaw as f64, self.pitch as f64);
-        DVec3::new(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos())
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        DVec3::new(cos_yaw * cos_pitch, sin_pitch, sin_yaw * cos_pitch)
     }
 
     /// Build the engine camera. Rebases the f64 eye to the origin so the engine

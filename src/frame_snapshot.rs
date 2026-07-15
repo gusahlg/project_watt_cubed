@@ -7,7 +7,7 @@ use voxel_engine::{genconst, DVec3, Vec3};
 
 use crate::render_config::RenderConfig;
 use crate::sky::palette::{Palette, Rgb, Role, RAIN_HORIZON, RAIN_ZENITH};
-use crate::sky::Sky;
+use crate::sky::{Sky, SkyFrame};
 
 /// Minimum ambient luma: shadowed/indoor scenes floor here instead of pure black,
 /// preserving the old day-night look when sky was centralized.
@@ -25,6 +25,17 @@ pub struct DitherPhase(pub f32);
 pub fn dither_at(frame_index: u64) -> DitherPhase {
     let table = &genconst::DITHER_PHASE_16;
     DitherPhase(table[(frame_index % table.len() as u64) as usize])
+}
+
+/// Wrapped camera XZ consumed by water/cloud shaders. Kept separate so a
+/// frozen lighting packet can update this precision-preserving lane only when
+/// the camera actually moves.
+pub(crate) fn animation_uv(cam_world: DVec3) -> [f32; 2] {
+    let period = genconst::ANIM_PERIOD as f64;
+    [
+        (cam_world.x / period).rem_euclid(1.0) as f32,
+        (cam_world.z / period).rem_euclid(1.0) as f32,
+    ]
 }
 
 /// Per-frame rendering state (linear colour, unclamped).
@@ -64,18 +75,58 @@ pub fn compose(
     exposure: Exposure,
     render: &RenderConfig,
 ) -> FrameSnapshot {
+    compose_at(sky, sky.frame(), cam_world, frame_index, exposure, render)
+}
+
+/// Compose from a clock sample shared with clear-colour and sky-geometry
+/// consumers. The game uses this path so one frame performs one sun sample.
+pub fn compose_at(
+    sky: &Sky,
+    sky_frame: SkyFrame,
+    cam_world: DVec3,
+    frame_index: u64,
+    exposure: Exposure,
+    render: &RenderConfig,
+) -> FrameSnapshot {
+    compose_at_with_uv(
+        sky,
+        sky_frame,
+        cam_world,
+        animation_uv(cam_world),
+        frame_index,
+        exposure,
+        render,
+    )
+}
+
+/// Game hot path: accepts the separately cached camera-XZ animation anchor.
+/// Public compose helpers retain their self-contained contract above.
+pub(crate) fn compose_at_with_uv(
+    sky: &Sky,
+    sky_frame: SkyFrame,
+    cam_world: DVec3,
+    anim_uv: [f32; 2],
+    frame_index: u64,
+    exposure: Exposure,
+    render: &RenderConfig,
+) -> FrameSnapshot {
     let clock = &sky.clock;
     let atm = &sky.atmosphere;
     let weather = &sky.weather;
 
-    let sun_dir = clock.sun_dir();
-    let elev = clock.sun_elevation();
-    let daylight = clock.daylight();
+    let sun_dir = sky_frame.sun_dir;
+    let elev = sky_frame.elevation;
+    let daylight = sky_frame.daylight;
 
     // Direct light, scaled/desaturated by overcast.
     let mut light = atm.palette.at(Role::Light, elev);
-    // Disable weather here (not in shader) to allow debug captures without branch overhead.
-    let coverage = if render.weather { weather.coverage } else { 0.0 };
+    // Disable weather here (not in shader) to allow stripped profiles and debug
+    // captures to skip every weather-derived lane without a shader branch.
+    let (coverage, rain, fog_bonus) = if render.weather {
+        (weather.coverage, weather.rain_strength(), weather.fog_bonus())
+    } else {
+        (0.0, 0.0, 0.0)
+    };
     let overcast = coverage * 0.5;
     let light_luma = light.luma();
     light = light
@@ -85,7 +136,6 @@ pub fn compose(
     // Ambient: tinted shadow floor so caves don't render pure black.
     // Keep zenith RAW for re-tinting on GPU; `ambient_floor` records the floored luma.
     // Rain desaturates sky (zenith/horizon only; direct light already muted above).
-    let rain = weather.rain_strength();
     let zenith = atm.palette.at(Role::Zenith, elev).rain_override(RAIN_ZENITH, rain);
     let amt = 0.10 + 0.12 * daylight;
     let ambient = zenith.scale(amt);
@@ -96,16 +146,17 @@ pub fn compose(
     let horizon = atm.palette.at(Role::Horizon, elev).rain_override(RAIN_HORIZON, rain);
     // Fog density (passed in horizon.w). Engine RenderFlags::fog gate controls it downstream;
     // currently disabled by default, so fog is inert until that flag is turned on.
-    let fog_density = FOG_BASE + weather.fog_bonus();
+    let fog_density = FOG_BASE + fog_bonus;
 
-    // Wrap time and camera position in f64 before downcast to preserve f32 phase precision at distance.
+    // Freeze time when neither animation consumer is enabled. Camera XZ must
+    // remain world-anchored even for still water, so its wrapped coordinates
+    // are retained (the game caches this whole packet between camera moves).
     let period = genconst::ANIM_PERIOD as f64;
-    let anim_time = (clock.day() * sky.day_length.0).rem_euclid(period) as f32;
-    let anim_uv = [
-        (cam_world.x / period).rem_euclid(1.0) as f32,
-        (cam_world.z / period).rem_euclid(1.0) as f32,
-    ];
-
+    let anim_time = if render.water_anim || render.clouds {
+        (clock.day() * sky.day_length.0).rem_euclid(period) as f32
+    } else {
+        0.0
+    };
     FrameSnapshot {
         frame_index,
         sun_dir,
@@ -126,6 +177,61 @@ pub fn compose(
         anim_uv,
         // When clouds are off, f32::MAX makes sky.frag early-out at no cost.
         camera_y: if render.clouds { cam_world.y as f32 } else { f32::MAX },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sky::Precip;
+
+    fn channels(rgb: Rgb) -> [f32; 3] {
+        [rgb.r(), rgb.g(), rgb.b()]
+    }
+
+    #[test]
+    fn disabled_weather_removes_every_weather_derived_lane() {
+        let mut sky = Sky::new();
+        let render = RenderConfig {
+            weather: false,
+            clouds: false,
+            water_anim: false,
+            ..RenderConfig::default()
+        };
+        sky.weather.coverage = 1.0;
+        sky.weather.precip = Precip::Rain;
+        sky.weather.wetness = 1.0;
+        let storm = compose(&sky, DVec3::ZERO, 0, Exposure::DEFAULT, &render);
+
+        sky.weather.coverage = 0.0;
+        sky.weather.precip = Precip::Clear;
+        sky.weather.wetness = 0.0;
+        let clear = compose(&sky, DVec3::ZERO, 0, Exposure::DEFAULT, &render);
+
+        assert_eq!(channels(storm.light), channels(clear.light));
+        assert_eq!(channels(storm.zenith), channels(clear.zenith));
+        assert_eq!(channels(storm.horizon), channels(clear.horizon));
+        assert_eq!(storm.fog_density, clear.fog_density);
+    }
+
+    #[test]
+    fn disabled_animation_consumers_freeze_time_but_keep_world_anchoring() {
+        let sky = Sky::new();
+        let render = RenderConfig {
+            clouds: false,
+            water_anim: false,
+            ..RenderConfig::default()
+        };
+        let snapshot = compose(
+            &sky,
+            DVec3::new(12_345.0, 80.0, -54_321.0),
+            9,
+            Exposure::DEFAULT,
+            &render,
+        );
+        assert_eq!(snapshot.anim_time, 0.0);
+        assert_ne!(snapshot.anim_uv, [0.0; 2]);
+        assert_eq!(snapshot.camera_y, f32::MAX);
     }
 }
 

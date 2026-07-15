@@ -60,6 +60,12 @@ pub struct App {
     /// Headless-ish benchmark mode (`WATT_BENCH=<seconds>`): auto-enters a
     /// world, rotates the camera, prints one stats line, exits.
     bench: Option<Bench>,
+    /// The engine starts from the same values as `settings`, but the first
+    /// settings-menu frame still applies once so hardware clamps (notably
+    /// MSAA) are reflected back into the model.  After that, menu frames push
+    /// only real changes instead of sending an identical command bundle at the
+    /// render thread every refresh.
+    menu_settings_applied: bool,
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -74,20 +80,27 @@ struct ActiveSlot {
 }
 
 impl ActiveSlot {
-    fn new(id: SlotId, meta: SaveMeta) -> Self {
+    fn new(id: SlotId, meta: SaveMeta, generation: u64) -> Self {
         let playtime = meta.playtime_secs as f64;
-        Self { id, meta, playtime, autosaver: Autosaver::new(AUTOSAVE_INTERVAL) }
+        let mut autosaver = Autosaver::new(AUTOSAVE_INTERVAL);
+        autosaver.reset(generation);
+        Self {
+            id,
+            meta,
+            playtime,
+            autosaver,
+        }
     }
 }
 
 /// State for the `WATT_BENCH` frame-rate benchmark.
 struct Bench {
     /// Measurement length in seconds (after warmup).
-    duration: f32,
+    duration: f64,
     /// Seconds of warmup left before sampling starts (world streaming in).
-    warmup: f32,
+    warmup: f64,
     /// Elapsed measured time.
-    elapsed: f32,
+    elapsed: f64,
     /// Per-frame durations, for avg and percentile stats.
     samples: Vec<f32>,
     started: bool,
@@ -100,22 +113,41 @@ impl App {
     pub fn new() -> Self {
         let mods = Mods::with_defaults();
         let saves = save::list();
-        let settings = Settings::load();
+        let mut settings = Settings::load();
         let session = Session::load();
-        let bench = std::env::var("WATT_BENCH").ok().map(|v| Bench {
-            duration: v.parse().unwrap_or(10.0),
-            warmup: 3.0,
-            elapsed: 0.0,
-            samples: Vec::with_capacity(1 << 17),
-            started: false,
-            pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
+        let bench = std::env::var("WATT_BENCH").ok().map(|v| {
+            let duration = v.parse::<f64>().unwrap_or(10.0).max(0.0);
+            // Keep target-rate headline runs out of the allocator: 25k samples
+            // per measured second covers the requested 20k-FPS goal with margin.
+            let sample_capacity = (duration.ceil() as usize).saturating_mul(25_000);
+            Bench {
+                duration,
+                warmup: 3.0,
+                elapsed: 0.0,
+                samples: Vec::with_capacity(sample_capacity),
+                started: false,
+                pos: std::env::var("WATT_BENCH_POS")
+                    .ok()
+                    .and_then(|s| parse_bench_pos(&s)),
+            }
         });
-        // A benchmark run auto-enables the profiler (CPU subsystems + workers
-        // via VOXEL_PROFILE) unless the caller set it explicitly. Safe here:
-        // `new()` runs on the main thread at startup, before the renderer or
-        // any worker thread — the only reader of this var — exists. Reads
-        // happen later.
-        if bench.is_some() && std::env::var_os("VOXEL_PROFILE").is_none() {
+        if bench.is_some()
+            && let Ok(profile) = std::env::var("WATT_BENCH_PRESET")
+            && !settings.select_preset(&profile)
+        {
+            eprintln!(
+                "unknown WATT_BENCH_PRESET={profile:?}; expected minimum, fast, or default"
+            );
+        }
+        // Profiling is deliberately opt-in for benchmarks. At very high frame
+        // rates its per-scope clocks, atomics, and GPU timestamp traffic become
+        // part of the result and can dwarf the code being measured. Use
+        // `WATT_BENCH_PROFILE=1` (or set VOXEL_PROFILE directly) for an
+        // attribution run; headline FPS runs stay uninstrumented.
+        if bench.is_some()
+            && matches!(std::env::var("WATT_BENCH_PROFILE").as_deref(), Ok("1"))
+            && std::env::var_os("VOXEL_PROFILE").is_none()
+        {
             unsafe { std::env::set_var("VOXEL_PROFILE", "1") };
         }
         Self {
@@ -128,6 +160,7 @@ impl App {
             settings,
             session,
             bench,
+            menu_settings_applied: false,
         }
     }
 
@@ -186,7 +219,12 @@ impl App {
         // there's nothing to gain from tearing/uncapped frames on a static
         // screen, and it keeps the GPU quiet. In-world we honour the setting.
         let in_world = matches!(self.screen, Screen::Playing(_));
-        eng.set_vsync(!in_world || self.settings.vsync);
+        let effective_vsync = !in_world || self.settings.vsync;
+        // `RenderClient::set_vsync` is a command, not a free idempotent store.
+        // Read the cached engine state first so steady frames send nothing.
+        if eng.vsync() != effective_vsync {
+            eng.set_vsync(effective_vsync);
+        }
         self.draw(eng);
         true
     }
@@ -225,10 +263,10 @@ impl App {
         game.player_mut().yaw += 0.4 * dt;
 
         if bench.warmup > 0.0 {
-            bench.warmup -= dt;
+            bench.warmup -= f64::from(dt);
             return true;
         }
-        bench.elapsed += dt;
+        bench.elapsed += f64::from(dt);
         if dt > 0.0 {
             bench.samples.push(dt);
         }
@@ -237,9 +275,12 @@ impl App {
         }
 
         let frames = bench.samples.len();
-        let total: f32 = bench.samples.iter().sum();
-        let avg_ms = total / frames.max(1) as f32 * 1000.0;
-        let avg_fps = frames as f32 / total.max(f32::EPSILON);
+        // Accumulate into f64: at 20k FPS, summing hundreds of thousands of
+        // 50us f32 samples in f32 measurably drifts the requested run length
+        // and can over-report throughput by roughly half a percent.
+        let total: f64 = bench.samples.iter().map(|&dt| f64::from(dt)).sum();
+        let avg_ms = total / frames.max(1) as f64 * 1000.0;
+        let avg_fps = frames as f64 / total.max(f64::EPSILON);
         let mut sorted = bench.samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         // p1 fps = the fps of the 99th-percentile (slowest 1%) frame time. With no
@@ -277,9 +318,14 @@ impl App {
             };
             effect = stack.update(&intents, &mut ctx);
         }
-        // Apply every frame for immediate feedback and to show hardware clamps.
-        self.settings.apply(eng);
-        // Persist whenever a step (or a hardware clamp) moved a value.
+        // Apply once on first presentation (to read hardware clamps back), then
+        // only when input moved a setting. Static menu frames no longer enqueue
+        // the same render configuration over and over.
+        if !self.menu_settings_applied || self.settings != before {
+            self.settings.apply(eng);
+            self.menu_settings_applied = true;
+        }
+        // Persist whenever a step or hardware clamp moved a value.
         if self.settings != before {
             self.settings.save();
         }
@@ -328,7 +374,11 @@ impl App {
             thread::sleep(Duration::from_millis(150));
         }
         let seed = fresh_seed();
-        let config = Config { password: info.password.clone(), seed, ..Config::default() };
+        let config = Config {
+            password: info.password.clone(),
+            seed,
+            ..Config::default()
+        };
         match server::spawn(info.port, config) {
             Ok(handle) => {
                 let port = handle.addr().port();
@@ -353,7 +403,10 @@ impl App {
 
     /// Join a remote world via an existing connection.
     fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection) {
-        let world = World::new(conn.seed());
+        // Build with the selected lanes but leave the bulk view volume to the
+        // asynchronous streamer. Entry prepares only the collision-safe spawn
+        // neighbourhood after all distance/lighting settings are applied.
+        let world = World::with_config_lazy(conn.seed(), self.settings.render_config());
         let player = Player::new(conn.spawn());
         // A networked world is a live mirror, not a save — per-world mod state
         // starts clean, but the player's enable/disable choices persist.
@@ -377,21 +430,27 @@ impl App {
             (Some(_), _) => 42,
             (None, _) => fresh_seed(),
         };
-        let world = World::new(seed);
+        let world = World::with_config_lazy(seed, self.settings.render_config());
+        let generation = world.edit_generation();
         let player = spawn_player(&world);
         let id = save::fresh_id();
         let now = save::unix_now();
-        self.active = Some(ActiveSlot::new(
-            id.clone(),
-            SaveMeta {
-                name: id.as_str().to_string(),
-                seed,
-                created: now,
-                last_played: now,
-                playtime_secs: 0,
-                edit_count: 0,
-            },
-        ));
+        // Bench worlds are disposable. Do not create autosave state or carry a
+        // save snapshot that the benchmark path will intentionally never use.
+        self.active = self.bench.is_none().then(|| {
+            ActiveSlot::new(
+                id.clone(),
+                SaveMeta {
+                    name: id.as_str().to_string(),
+                    seed,
+                    created: now,
+                    last_played: now,
+                    playtime_secs: 0,
+                    edit_count: 0,
+                },
+                generation,
+            )
+        });
 
         // A new world starts from a clean default mod set (empty inventory, etc.);
         // the mod menu's enable/disable choices persist.
@@ -406,9 +465,10 @@ impl App {
             Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
         };
         self.mods.reset_state();
-        match save::load(&id, &mut self.mods) {
+        match save::load_with_config(&id, &mut self.mods, self.settings.render_config()) {
             Ok((world, player, meta, report)) => {
-                self.active = Some(ActiveSlot::new(id.clone(), meta));
+                let generation = world.edit_generation();
+                self.active = Some(ActiveSlot::new(id.clone(), meta, generation));
                 let mut game = Game::new(world, player, id.as_str().to_string());
                 // Degraded loads still enter the world, but say so.
                 if report.source == save::Source::Backup {
@@ -427,10 +487,9 @@ impl App {
 
     /// Install a freshly built game as the active screen.
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
-        // World-construction lanes apply on entry only, before streaming spins;
-        // everything live-applicable goes through the same path `/gfx` uses.
-        let render = self.settings.render_config();
-        game.world_mut().set_render_lanes(render.occlusion, render.lod2);
+        // Apply every world and engine lane before generating the small
+        // collision-safe neighbourhood. This prevents a Minimum/Fast profile
+        // from first constructing the default volume only to tear it down.
         game.apply_settings(eng, &mut self.settings);
         // Saves and servers can place the player far from the pre-generated
         // origin; make the ground under them real before physics runs.
@@ -442,7 +501,6 @@ impl App {
 
     /// In-world update: run the game and handle autosave.
     fn update_playing(&mut self, eng: &mut Engine) {
-        let dt = eng.frame_time() as f64;
         let Screen::Playing(game) = &mut self.screen else {
             return;
         };
@@ -464,9 +522,18 @@ impl App {
         let Some(active) = &mut self.active else {
             return;
         };
+        let dt = eng.frame_time() as f64;
         active.playtime += dt;
         active.meta.playtime_secs = active.playtime as u64;
-        let ActiveSlot { id, meta, autosaver, .. } = active;
+        if !self.settings.autosave {
+            return;
+        }
+        let ActiveSlot {
+            id,
+            meta,
+            autosaver,
+            ..
+        } = active;
         let tick = autosaver.tick(id, game.world().edit_generation(), || {
             save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
         });
@@ -488,7 +555,12 @@ impl App {
             return;
         };
         active.meta.playtime_secs = active.playtime as u64;
-        let ActiveSlot { id, meta, autosaver, .. } = active;
+        let ActiveSlot {
+            id,
+            meta,
+            autosaver,
+            ..
+        } = active;
         if let Err(e) = autosaver.flush_now(id, game.world().edit_generation(), || {
             save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
         }) {
@@ -498,13 +570,13 @@ impl App {
 
     /// Draw the active screen (game or menu).
     fn draw(&mut self, eng: &mut Engine) {
-        let (w, h) = (eng.screen_width(), eng.screen_height());
         if let Screen::Playing(game) = &mut self.screen {
             let fov = self.settings.fov;
             let shake = self.settings.shake;
             game.draw(eng, &mut self.mods, fov, shake);
             return;
         }
+        let (w, h) = (eng.screen_width(), eng.screen_height());
         // Mods snapshot avoids borrow conflict between theme and view.
         let mods = ModRow::snapshot(&self.mods);
         let fallback = DefaultTheme;
@@ -554,7 +626,16 @@ fn fresh_seed() -> i64 {
 fn spawn_player(world: &World) -> Player {
     let sea = world.sea_level();
     for r in 0..64 {
-        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
+        for (dx, dz) in [
+            (r, 0),
+            (0, r),
+            (-r, 0),
+            (0, -r),
+            (r, r),
+            (-r, -r),
+            (r, -r),
+            (-r, r),
+        ] {
             let (x, z) = (dx * 8, dz * 8);
             let h = world.surface_y(x, z);
             if h > sea {
@@ -569,6 +650,10 @@ fn spawn_player(world: &World) -> Player {
 /// Parse `WATT_BENCH_POS="x,y,z"` into a position (f64, comma-separated).
 fn parse_bench_pos(raw: &str) -> Option<DVec3> {
     let mut parts = raw.split(',').map(|p| p.trim().parse::<f64>());
-    let (x, y, z) = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?);
+    let (x, y, z) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
     parts.next().is_none().then(|| DVec3::new(x, y, z))
 }

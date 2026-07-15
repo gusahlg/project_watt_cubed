@@ -32,6 +32,16 @@ pub struct SkyClock {
     day: f64,
 }
 
+/// The clock-derived values consumed together by a rendered frame. Sampling
+/// them as one unit prevents lighting, clear colour, and sky geometry from
+/// independently repeating the same trigonometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkyFrame {
+    pub sun_dir: Vec3,
+    pub elevation: f32,
+    pub daylight: f32,
+}
+
 impl Default for SkyClock {
     fn default() -> Self {
         Self { day: 0.3 } // start a little after sunrise
@@ -55,12 +65,27 @@ impl SkyClock {
         self.day = day.rem_euclid(1.0);
     }
 
+    fn direction(&self) -> Vec3 {
+        let a = TAU * (self.day - 0.25); // 0 at sunrise, π/2 at noon
+        Vec3::new(a.cos() as f32, a.sin() as f32, 0.2).normalize()
+    }
+
+    /// All clock-derived render values with one sun-direction evaluation.
+    pub fn frame(&self) -> SkyFrame {
+        let sun_dir = self.direction();
+        let elevation = sun_dir.y;
+        SkyFrame {
+            sun_dir,
+            elevation,
+            daylight: smoothstep(-0.12, 0.18, elevation),
+        }
+    }
+
     /// Unit direction toward the sun. Rises in the east (`+x`), peaks overhead at
     /// noon, sets in the west; a small `z` tilt keeps it off a perfect great
     /// circle so the arc reads as a path rather than a line.
     pub fn sun_dir(&self) -> Vec3 {
-        let a = TAU * (self.day - 0.25); // 0 at sunrise, π/2 at noon
-        Vec3::new(a.cos() as f32, a.sin() as f32, 0.2).normalize()
+        self.direction()
     }
 
     /// Sun elevation above the horizon, `[-1, 1]` (`sun_dir().y`). The single
@@ -72,7 +97,7 @@ impl SkyClock {
     /// Daylight amount in `[0, 1]`: 0 through the night, 1 in full day, with a
     /// smooth twilight either side of the horizon crossing.
     pub fn daylight(&self) -> f32 {
-        smoothstep(-0.12, 0.18, self.sun_elevation())
+        self.frame().daylight
     }
 }
 
@@ -100,5 +125,14 @@ mod tests {
         assert!(noon.sun_elevation() > 0.9, "noon sun overhead");
         assert!(midnight.sun_elevation() < -0.9, "midnight sun below");
         assert!(noon.daylight() > 0.99 && midnight.daylight() < 0.01);
+    }
+
+    #[test]
+    fn frame_sample_matches_individual_clock_lanes() {
+        let clock = SkyClock { day: 0.37 };
+        let frame = clock.frame();
+        assert_eq!(frame.sun_dir, clock.sun_dir());
+        assert_eq!(frame.elevation, clock.sun_elevation());
+        assert_eq!(frame.daylight, clock.daylight());
     }
 }

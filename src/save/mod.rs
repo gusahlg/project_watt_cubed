@@ -12,7 +12,7 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{LoadReport, encode_current, load, save, unix_now};
+pub use bridge::{LoadReport, encode_current, load, load_with_config, save, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
 pub use store::{Source, fresh_id, list};
 
@@ -101,6 +101,7 @@ mod tests {
     use crate::block::element::El;
     use crate::mods::Mods;
     use crate::player::Player;
+    use crate::render_config::RenderConfig;
     use std::fs;
     use voxel_engine::DVec3;
 
@@ -201,6 +202,46 @@ mod tests {
             fresh_mods.save_states(&loaded_world),
             states_before,
             "mod state survives the round trip"
+        );
+
+        cleanup(&id);
+    }
+
+    #[test]
+    fn configured_load_is_lazy_and_replays_the_same_save_state() {
+        let id = slot("__unit_test_configured_load__");
+        let render = RenderConfig {
+            occlusion: false,
+            lod2: false,
+            lod_levels: 1,
+            lod_detail: 6,
+            ..RenderConfig::default()
+        };
+        let mut world = World::with_config_lazy(31337, render);
+        let stone = parse_block(&mut world, "natural:Stone");
+        let edit = (4, 513, -3);
+        world.set_block(edit.0, edit.1, edit.2, stone);
+        let player = Player::new(DVec3::new(4.5, 513.0, -2.5));
+        let mods = Mods::with_defaults();
+        save(&id, &world, &player, &mods, meta("configured")).unwrap();
+
+        let mut fresh_mods = Mods::with_defaults();
+        let (mut loaded, loaded_player, loaded_meta, report) =
+            load_with_config(&id, &mut fresh_mods, render).unwrap();
+
+        assert_eq!(loaded.seed(), 31337);
+        assert_eq!(loaded_player.position, player.position);
+        assert_eq!(loaded_meta.name, "configured");
+        assert_eq!(report.source, Source::Live);
+        assert!(report.salvage.is_none());
+        assert_eq!(loaded.edits().count(), 1, "the edit overlay is restored eagerly");
+        assert_eq!(loaded.top_solid(4, -3), None, "terrain data starts lazy");
+
+        loaded.prepare_around(loaded_player.position);
+        assert_eq!(
+            block_spec(&loaded, loaded.block_at(edit.0, edit.1, edit.2)),
+            "natural:Stone",
+            "lazy chunk generation replays the restored edit"
         );
 
         cleanup(&id);

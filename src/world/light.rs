@@ -22,6 +22,7 @@
 //! reads (interior voxels and face borders only).
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use crate::block::registry::HotTables;
 use crate::coord::Face;
@@ -39,21 +40,11 @@ const PADL: usize = CHUNK_SIZE + 2;
 /// Cells in one [`PaddedLight`] buffer.
 const PADL_VOL: usize = PADL * PADL * PADL;
 
-// Thread-local free list of [`PaddedLight`] backing buffers. Every `PaddedLight`
-// constructor (`dark`/`full`/`open_sky`/`capture`) allocated a fresh
-// `PADL_VOL`-cell `Box<[Lumel]>` per call — the per-job light-shell churn the
-// LOD-tile mesher pays in [`build_tile_mesh`](crate::world::lod) (via
-// `open_sky`) and the streamer pays per remesh (via `capture`). Buffers are
-// reclaimed on [`Drop`] and reused. Bounded ([`PLIGHT_POOL_CAP`]) so the
-// cross-thread path (a `capture`d shell built on the main thread and dropped on
-// a worker) can only ever migrate a handful of buffers into a worker's list
-// rather than growing without bound.
-thread_local! {
-    static PLIGHT_POOL: RefCell<Vec<Box<[Lumel]>>> = const { RefCell::new(Vec::new()) };
-}
-/// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
-/// single job holds at most one live shell at a time.
-const PLIGHT_POOL_CAP: usize = 4;
+// Snapshots are captured on the main thread and dropped by worker threads. A
+// shared pool returns those buffers to the producer; the former TLS pool kept
+// them on workers and forced the producer back through the allocator.
+static PLIGHT_POOL: Mutex<Vec<Box<[Lumel]>>> = Mutex::new(Vec::new());
+const PLIGHT_POOL_CAP: usize = 64;
 
 /// Light value: 4-bit clamped to 0..=15. Every constructor clamps or is const-checked.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -153,7 +144,9 @@ impl PaddedLight {
     /// (`fill` then, where partial, overwrite the touched cells) before use.
     fn take_buf() -> Box<[Lumel]> {
         PLIGHT_POOL
-            .with_borrow_mut(|p| p.pop())
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
             .filter(|b| b.len() == PADL_VOL)
             .unwrap_or_else(|| vec![Lumel::DARK; PADL_VOL].into_boxed_slice())
     }
@@ -246,11 +239,12 @@ impl Drop for PaddedLight {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.cells);
         if buf.len() == PADL_VOL {
-            PLIGHT_POOL.with_borrow_mut(|p| {
-                if p.len() < PLIGHT_POOL_CAP {
-                    p.push(buf);
-                }
-            });
+            let mut pool = PLIGHT_POOL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pool.len() < PLIGHT_POOL_CAP {
+                pool.push(buf);
+            }
         }
     }
 }

@@ -203,11 +203,9 @@ impl Player {
     /// `f32` angles so adding it to an `f64` position loses nothing.
     pub fn forward(&self) -> DVec3 {
         let (yaw, pitch) = (self.yaw as f64, self.pitch as f64);
-        DVec3::new(
-            yaw.cos() * pitch.cos(),
-            pitch.sin(),
-            yaw.sin() * pitch.cos(),
-        )
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        DVec3::new(cos_yaw * cos_pitch, sin_pitch, sin_yaw * cos_pitch)
     }
 
     /// The forward and right basis vectors on the XZ plane, used for ground

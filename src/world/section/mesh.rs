@@ -1,5 +1,6 @@
-//! Stack mesher: turns a [`Section`]'s RLE columns straight into GPU-ready
-//! [`MeshData`] — no intermediate voxel grid.
+//! Stack mesher: expands a [`Section`]'s RLE columns once into one compact dense
+//! scratch, then turns it into GPU-ready [`MeshData`]. The dense snapshot removes
+//! thousands of tiny per-column allocations and makes every face-neighbour read O(1).
 //!
 //! Each solid run emits up to six faces. Vertical faces split where column heights differ
 //! (so overhangs render correctly, unlike a heightmap-only approach). Opacity rules: opaque
@@ -13,10 +14,16 @@
 //! by solid geometry (sky/deep space cost nothing). No ambient occlusion; skylight is
 //! per-run baked nibble, enabling parallel meshing.
 use glam::UVec3;
+use std::sync::Mutex;
 use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
 
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{DOMAIN_H, FULL_SKYLIGHT, SECTION_N, Section};
+use super::{
+    DOMAIN_H, FULL_SKYLIGHT, LOD_FLOOR_Y, SECTION_N, Section, SectionPos, apply_edits,
+    flatten_edits,
+};
+use super::super::generation::TerrainGenerator;
+use crate::coord::ChunkCoord;
 use crate::block::registry::{AIR, BlockId, HotTables};
 
 /// One block's mesh plus its origin in cells within the section. Only non-empty blocks appear.
@@ -28,15 +35,156 @@ const QUAD_N: usize = SECTION_N / 2;
 const BLOCKS_XZ: i32 = SECTION_N as i32 / BLOCK;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
 
-/// One solid-or-air run of a column expressed in CELL coordinates (`[lo, hi)`,
-/// bottom-up), with its block and baked skylight. Air runs are kept so a
-/// neighbour lookup over the whole stack is a plain scan.
 #[derive(Clone, Copy)]
-struct CellRun {
-    lo: i32,
-    hi: i32,
+struct Cell {
     block: BlockId,
     sky: u8,
+}
+
+static DENSE_CELL_POOL: Mutex<Vec<Vec<Cell>>> = Mutex::new(Vec::new());
+const DENSE_CELL_POOL_CAP: usize = 8;
+
+fn take_dense_cells(len: usize) -> Vec<Cell> {
+    let mut cells = DENSE_CELL_POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .unwrap_or_default();
+    cells.resize(len, Cell { block: AIR, sky: 0 });
+    cells.fill(Cell { block: AIR, sky: 0 });
+    cells
+}
+
+/// One allocation shared by all four quadrant meshes. Cells are column-major
+/// (Y contiguous), matching RLE expansion and vertical face reads.
+struct DenseSection {
+    cells: Vec<Cell>,
+    n_cells: i32,
+    solid_y: [Option<(i32, i32)>; 4],
+}
+
+impl Drop for DenseSection {
+    fn drop(&mut self) {
+        let cells = std::mem::take(&mut self.cells);
+        let mut pool = DENSE_CELL_POOL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.len() < DENSE_CELL_POOL_CAP {
+            pool.push(cells);
+        }
+    }
+}
+
+impl DenseSection {
+    fn new(section: &Section, n_cells: i32) -> Self {
+        let mut cells = take_dense_cells(SECTION_N * SECTION_N * n_cells as usize);
+        let mut solid_y: [Option<(i32, i32)>; 4] = [None; 4];
+        let cell_size = section.pos().cell_size();
+        let palette = section.palette();
+        for iz in 0..SECTION_N {
+            for ix in 0..SECTION_N {
+                let base = (ix + iz * SECTION_N) * n_cells as usize;
+                let mut cy = 0usize;
+                // Stored top-down; dense cell coordinates are bottom-up.
+                for &run in section.column(ix, iz).runs().iter().rev() {
+                    debug_assert_eq!(
+                        run.height() as i32 % cell_size,
+                        0,
+                        "run height is not a whole number of cells"
+                    );
+                    let count = (run.height() as i32 / cell_size) as usize;
+                    let next = cy + count;
+                    let block = palette.get(run.id());
+                    cells[base + cy..base + next].fill(Cell {
+                        block,
+                        sky: run.skylight(),
+                    });
+                    if block != AIR {
+                        let quadrant = ix / QUAD_N + (iz / QUAD_N) * 2;
+                        let lo = cy as i32;
+                        let hi = next as i32;
+                        solid_y[quadrant] = Some(match solid_y[quadrant] {
+                            Some((old_lo, old_hi)) => (old_lo.min(lo), old_hi.max(hi)),
+                            None => (lo, hi),
+                        });
+                    }
+                    cy = next;
+                }
+                debug_assert_eq!(cy, n_cells as usize, "cell column must tile the domain");
+            }
+        }
+        Self { cells, n_cells, solid_y }
+    }
+
+    /// Production section job: sample straight into the dense meshing scratch.
+    /// This skips 1024 individually boxed RLE columns that the worker used to
+    /// create and immediately expand again.
+    fn extract<G: TerrainGenerator>(
+        pos: SectionPos,
+        r#gen: &G,
+        edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    ) -> Self {
+        let cell_size = pos.cell_size();
+        let n_cells = DOMAIN_H / cell_size;
+        let half = cell_size / 2;
+        let ys: Vec<i32> = (0..n_cells)
+            .map(|j| LOD_FLOOR_Y + j * cell_size + half)
+            .collect();
+        let flat = flatten_edits(edits);
+        let mut scratch = vec![AIR; n_cells as usize];
+        let mut cells = take_dense_cells(SECTION_N * SECTION_N * n_cells as usize);
+        let mut solid_y: [Option<(i32, i32)>; 4] = [None; 4];
+
+        for iz in 0..SECTION_N {
+            for ix in 0..SECTION_N {
+                let fx = pos.min_x() + ix as i32 * cell_size;
+                let fz = pos.min_z() + iz as i32 * cell_size;
+                let (wx, wz) = (fx + half, fz + half);
+                r#gen.lod_column(wx, wz, &ys, &mut scratch);
+                apply_edits(&mut scratch, &flat, fx, fz, cell_size);
+                let height = r#gen.height(wx, wz);
+                let base = (ix + iz * SECTION_N) * n_cells as usize;
+                let mut lo = n_cells;
+                let mut hi = 0;
+                for (cy, (&block, &y)) in scratch.iter().zip(&ys).enumerate() {
+                    cells[base + cy] = Cell {
+                        block,
+                        sky: if y >= height { FULL_SKYLIGHT } else { 0 },
+                    };
+                    if block != AIR {
+                        lo = lo.min(cy as i32);
+                        hi = hi.max(cy as i32 + 1);
+                    }
+                }
+                if hi > lo {
+                    let quadrant = ix / QUAD_N + (iz / QUAD_N) * 2;
+                    solid_y[quadrant] = Some(match solid_y[quadrant] {
+                        Some((old_lo, old_hi)) => (old_lo.min(lo), old_hi.max(hi)),
+                        None => (lo, hi),
+                    });
+                }
+            }
+        }
+        Self { cells, n_cells, solid_y }
+    }
+
+    #[inline]
+    fn at(&self, x: usize, y: i32, z: usize) -> Cell {
+        self.cells[(x + z * SECTION_N) * self.n_cells as usize + y as usize]
+    }
+}
+
+struct QuadrantCells<'a> {
+    dense: &'a DenseSection,
+    ox: usize,
+    oz: usize,
+}
+
+impl QuadrantCells<'_> {
+    #[inline]
+    fn at(&self, x: i32, y: i32, z: i32) -> Cell {
+        self.dense.at(self.ox + x as usize, y, self.oz + z as usize)
+    }
 }
 
 /// Merge key: block, skylight, micro must match; border faces never merge into interior.
@@ -114,40 +262,9 @@ fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
     tables.opaque[nbr.0 as usize] || nbr == my
 }
 
-/// Explode one column's top-down metre runs into bottom-up CELL runs tiling
-/// `[0, n_cells)`. Run heights must be whole cells; the block partition and
-/// vertex encoding depend on it, so we assert rather than assume.
-fn column_cells(section: &Section, ix: usize, iz: usize, n_cells: i32) -> Vec<CellRun> {
-    let cell = section.pos().cell_size();
-    let col = section.column(ix, iz);
-    let pal = section.palette();
-    let mut runs = Vec::with_capacity(col.runs().len());
-    let mut top = n_cells;
-    for &r in col.runs() {
-        debug_assert_eq!(r.height() as i32 % cell, 0, "run height is not a whole number of cells");
-        let lo = top - r.height() as i32 / cell;
-        runs.push(CellRun { lo, hi: top, block: pal.get(r.id()), sky: r.skylight() });
-        top = lo;
-    }
-    debug_assert_eq!(top, 0, "cell runs must tile the domain");
-    runs.reverse();
-    runs
-}
-
-/// The `(block, skylight)` at cell `cy` of a column (assumed in `[0, n_cells)`).
-#[inline]
-fn cell_at(runs: &[CellRun], cy: i32) -> (BlockId, u8) {
-    for r in runs {
-        if cy >= r.lo && cy < r.hi {
-            return (r.block, r.sky);
-        }
-    }
-    (AIR, 0)
-}
-
 /// Sample a face: cull if covered by neighbor; overdraw section edges as air.
 fn face_sample(
-    cols: &[Vec<CellRun>],
+    cols: &QuadrantCells<'_>,
     n_cells: i32,
     tables: &HotTables,
     dir: &Dir,
@@ -157,8 +274,7 @@ fn face_sample(
     if sy < 0 || sy >= n_cells {
         return None; // above the ceiling in the top block: no cell here
     }
-    let col = &cols[sx as usize + sz as usize * QUAD_N];
-    let (me, _) = cell_at(col, sy);
+    let me = cols.at(sx, sy, sz).block;
     if me == AIR {
         return None;
     }
@@ -171,14 +287,16 @@ fn face_sample(
         } else if ny >= n_cells {
             (AIR, FULL_SKYLIGHT) // above the ceiling: open sky
         } else {
-            cell_at(col, ny)
+            let cell = cols.at(sx, ny, sz);
+            (cell.block, cell.sky)
         }
     } else if nx < 0 || nx >= QUAD_N as i32 || nz < 0 || nz >= QUAD_N as i32 {
         // Quadrant border: overdraw as air, nudge inward. Light as sky (not buried cell's dark skylight).
         micro = dir.micro;
         (AIR, FULL_SKYLIGHT)
     } else {
-        cell_at(&cols[nx as usize + nz as usize * QUAD_N], ny)
+        let cell = cols.at(nx, ny, nz);
+        (cell.block, cell.sky)
     };
     if covered(me, nbr, tables) {
         return None;
@@ -187,7 +305,13 @@ fn face_sample(
 }
 
 /// Greedy-mesh one block: merge adjacent quads with identical properties.
-fn build_block(cols: &[Vec<CellRun>], n_cells: i32, base: [i32; 3], tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+fn build_block(
+    cols: &QuadrantCells<'_>,
+    n_cells: i32,
+    base: [i32; 3],
+    tables: &HotTables,
+    out: &mut ChunkMeshData,
+) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -296,41 +420,47 @@ fn emit(
 /// run-based sampling with no floats).
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables) -> [SectionMeshData; 4] {
     let n_cells = DOMAIN_H / section.pos().cell_size();
-    std::array::from_fn(|q| build_quadrant(section, tables, q as u8, n_cells))
+    let dense = DenseSection::new(section, n_cells);
+    build_dense_section_mesh(&dense, tables)
+}
+
+/// Fused worker path: generator/edit sampling and meshing share one dense
+/// allocation instead of constructing an RLE `Section` only to expand it.
+pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+) -> [SectionMeshData; 4] {
+    let dense = DenseSection::extract(pos, r#gen, edits);
+    build_dense_section_mesh(&dense, tables)
+}
+
+fn build_dense_section_mesh(dense: &DenseSection, tables: &HotTables) -> [SectionMeshData; 4] {
+    std::array::from_fn(|q| build_quadrant(dense, tables, q as u8))
 }
 
 /// Mesh one quadrant `q` (its 16×16 column sub-grid) into section-space block
 /// origins. Block origins are in CELLS relative to the section min-corner, so the
 /// caller positions them the same way regardless of quadrant.
-fn build_quadrant(section: &Section, tables: &HotTables, q: u8, n_cells: i32) -> SectionMeshData {
+fn build_quadrant(dense: &DenseSection, tables: &HotTables, q: u8) -> SectionMeshData {
     let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
-    // Just this quadrant's columns, indexed locally over QUAD_N×QUAD_N.
-    let cols: Vec<Vec<CellRun>> = (0..QUAD_N * QUAD_N)
-        .map(|i| column_cells(section, qx * QUAD_N + i % QUAD_N, qz * QUAD_N + i / QUAD_N, n_cells))
-        .collect();
-
-    // The vertical slab that actually holds solid runs — sky and deep space are
-    // skipped entirely, so K is small for thin terrain.
-    let (mut ylo, mut yhi) = (n_cells, 0);
-    for col in &cols {
-        for r in col {
-            if r.block != AIR {
-                ylo = ylo.min(r.lo);
-                yhi = yhi.max(r.hi);
-            }
-        }
-    }
     let mut result = SectionMeshData::new();
-    if yhi <= ylo {
+    let Some((ylo, yhi)) = dense.solid_y[q as usize] else {
         return result; // no solid geometry in this quadrant
-    }
+    };
+    let cols = QuadrantCells {
+        dense,
+        ox: qx * QUAD_N,
+        oz: qz * QUAD_N,
+    };
 
     // Section-space cell origin of the quadrant's XZ corner (0 or 16).
     let (ox, oz) = ((qx * QUAD_N) as u32, (qz * QUAD_N) as u32);
     for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
         let base = [0, by * BLOCK, 0];
         let mut data = new_chunk_mesh_data();
-        if build_block(&cols, n_cells, base, tables, &mut data) {
+        if build_block(&cols, dense.n_cells, base, tables, &mut data) {
             result.push((UVec3::new(ox, (by * BLOCK) as u32, oz), data));
         }
     }
@@ -428,6 +558,26 @@ mod tests {
 
     fn mesh_of(section: &Section, tables: &HotTables) -> [SectionMeshData; 4] {
         build_section_mesh(section, tables)
+    }
+
+    fn flatten_mesh(
+        mesh: &[SectionMeshData; 4],
+    ) -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+        mesh.iter()
+            .flatten()
+            .flat_map(|(origin, data)| {
+                Pass::ALL.into_iter().map(move |pass| {
+                    (
+                        origin.x,
+                        origin.y,
+                        origin.z,
+                        pass as u8,
+                        data[pass].vertices().to_vec(),
+                        data[pass].buckets().clone(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Iterate all quads across all quadrants with their origins and passes.
@@ -666,17 +816,25 @@ mod tests {
         let sec = Section::extract(FINEST, &r#gen, &[]);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);
-        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
-            m.iter()
-                .flatten()
-                .flat_map(|(o, d)| {
-                    Pass::ALL.into_iter().map(move |p| {
-                        (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
-                    })
-                })
-                .collect()
-        };
-        assert_eq!(flatten(&a), flatten(&b), "same section must mesh bit-identically");
+        assert_eq!(flatten_mesh(&a), flatten_mesh(&b), "same section must mesh bit-identically");
+    }
+
+    #[test]
+    fn fused_extraction_is_byte_identical_to_the_rle_path() {
+        let (_registry, tables, blocks) = setup();
+        let r#gen = terrain_gen(&blocks, 200, 0, Some((260, 280)));
+        let edits = vec![(
+            ChunkCoord::new(0, 12, 0),
+            vec![(crate::world::chunk::Chunk::index(8, 8, 8), AIR)],
+        )];
+        let section = Section::extract(FINEST, &r#gen, &edits);
+        let via_rle = build_section_mesh(&section, &tables);
+        let fused = extract_section_mesh(FINEST, &r#gen, &edits, &tables);
+        assert_eq!(
+            flatten_mesh(&fused),
+            flatten_mesh(&via_rle),
+            "fusing extraction may remove allocations but not change a vertex or index"
+        );
     }
 
     #[test]

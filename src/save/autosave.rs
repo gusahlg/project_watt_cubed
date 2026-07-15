@@ -18,6 +18,12 @@ pub struct Autosaver {
     pending_gen: u64,
     in_flight: bool,
     last_attempt: Instant,
+    /// Spawned only for an actually-due periodic write. Clean worlds, disabled
+    /// autosave, and synchronous exit-only saves create no background thread.
+    writer: Option<Writer>,
+}
+
+struct Writer {
     tx: mpsc::Sender<(SlotId, Vec<u8>)>,
     rx: mpsc::Receiver<std::io::Result<()>>,
 }
@@ -32,6 +38,17 @@ pub enum Tick {
 
 impl Autosaver {
     pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            saved_gen: 0,
+            pending_gen: 0,
+            in_flight: false,
+            last_attempt: Instant::now(),
+            writer: None,
+        }
+    }
+
+    fn spawn_writer() -> Writer {
         let (tx, job_rx) = mpsc::channel::<(SlotId, Vec<u8>)>();
         let (done_tx, rx) = mpsc::channel();
         thread::Builder::new()
@@ -43,15 +60,7 @@ impl Autosaver {
                 }
             })
             .expect("spawn autosave thread");
-        Self {
-            interval,
-            saved_gen: 0,
-            pending_gen: 0,
-            in_flight: false,
-            last_attempt: Instant::now(),
-            tx,
-            rx,
-        }
+        Writer { tx, rx }
     }
 
     /// Note a freshly loaded/created world so its current state doesn't count
@@ -69,7 +78,11 @@ impl Autosaver {
         encode: impl FnOnce() -> Result<Vec<u8>, SaveError>,
     ) -> Tick {
         if self.in_flight {
-            match self.rx.try_recv() {
+            let writer = self
+                .writer
+                .as_ref()
+                .expect("in-flight autosave must have a writer");
+            match writer.rx.try_recv() {
                 Ok(result) => {
                     self.in_flight = false;
                     if result.is_ok() {
@@ -77,7 +90,15 @@ impl Autosaver {
                     }
                     return Tick::Finished(result.map_err(SaveError::from));
                 }
-                Err(_) => return Tick::Idle,
+                Err(mpsc::TryRecvError::Empty) => return Tick::Idle,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.in_flight = false;
+                    self.writer = None;
+                    return Tick::Finished(Err(SaveError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "autosave thread died",
+                    ))));
+                }
             }
         }
         if generation == self.saved_gen || self.last_attempt.elapsed() < self.interval {
@@ -89,9 +110,25 @@ impl Autosaver {
             Err(e) => return Tick::Finished(Err(e)),
         };
         self.pending_gen = generation;
-        self.in_flight = true;
-        let _ = self.tx.send((id.clone(), bytes));
-        Tick::Started
+        let sent = self
+            .writer
+            .get_or_insert_with(Self::spawn_writer)
+            .tx
+            .send((id.clone(), bytes));
+        match sent {
+            Ok(()) => {
+                self.in_flight = true;
+                Tick::Started
+            }
+            Err(_) => {
+                // Drop the dead sender so a later due tick can create a fresh worker.
+                self.writer = None;
+                Tick::Finished(Err(SaveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "autosave thread died",
+                ))))
+            }
+        }
     }
 
     /// Exit flush: drain pending writes then save unconditionally.
@@ -104,10 +141,16 @@ impl Autosaver {
     ) -> Result<(), SaveError> {
         if self.in_flight {
             // The drained result doesn't matter — we overwrite right below.
-            let _ = self
-                .rx
-                .recv()
-                .map_err(|_| SaveError::Io(std::io::Error::other("autosave thread died")))?;
+            let writer = self
+                .writer
+                .as_ref()
+                .expect("in-flight autosave must have a writer");
+            if writer.rx.recv().is_err() {
+                // Exit's synchronous snapshot is authoritative and does not
+                // depend on the dead worker. Retire it, then continue instead
+                // of turning a background failure into lost exit state.
+                self.writer = None;
+            }
             self.in_flight = false;
         }
         store::write(id, &encode()?)?;
@@ -183,6 +226,65 @@ mod tests {
         auto.flush_now(&id, 2, bytes).unwrap();
         assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
         assert!(matches!(auto.tick(&id, 2, bytes), Tick::Idle), "gen 2 saved by flush");
+
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+    }
+
+    #[test]
+    fn clean_reset_and_fresh_flush_do_not_spawn_a_worker() {
+        let id = SlotId::new("__autosave_lazy__").unwrap();
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+
+        let mut auto = Autosaver::new(Duration::ZERO);
+        auto.reset(7);
+        assert!(matches!(auto.tick(&id, 7, || panic!("clean state encoded")), Tick::Idle));
+        assert!(auto.writer.is_none());
+
+        auto.flush_now(&id, 7, bytes).unwrap();
+        assert!(auto.writer.is_none(), "synchronous exit save needs no worker");
+
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+    }
+
+    #[test]
+    fn disconnected_completion_channel_releases_and_retires_writer() {
+        let id = SlotId::new("__autosave_dead__").unwrap();
+        let mut auto = Autosaver::new(Duration::ZERO);
+        let (tx, _jobs) = mpsc::channel();
+        let (done_tx, rx) = mpsc::channel();
+        drop(done_tx);
+        auto.writer = Some(Writer { tx, rx });
+        auto.in_flight = true;
+
+        let Tick::Finished(Err(SaveError::Io(error))) = auto.tick(&id, 1, bytes) else {
+            panic!("disconnected writer must surface an I/O failure");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(!auto.in_flight);
+        assert!(auto.writer.is_none());
+    }
+
+    #[test]
+    fn disconnected_writer_cannot_skip_the_exit_flush() {
+        let id = SlotId::new("__autosave_dead_flush__").unwrap();
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+
+        let mut auto = Autosaver::new(Duration::ZERO);
+        let (tx, _jobs) = mpsc::channel();
+        let (done_tx, rx) = mpsc::channel();
+        drop(done_tx);
+        auto.writer = Some(Writer { tx, rx });
+        auto.in_flight = true;
+
+        auto.flush_now(&id, 9, bytes).unwrap();
+        assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
+        assert!(!auto.in_flight);
+        assert!(auto.writer.is_none());
+        assert_eq!(auto.saved_gen, 9);
 
         let _ = fs::remove_file(format!("saves/{id}.save"));
         let _ = fs::remove_file(format!("saves/{id}.save.bak"));

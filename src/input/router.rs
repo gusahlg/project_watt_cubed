@@ -118,8 +118,24 @@ impl Router {
     /// Per-frame input observation: advances repeat timers and returns an
     /// immutable view of the current input state.
     pub fn frame<'e>(&'e mut self, engine: &'e Engine, dt: f32) -> FrameInput<'e> {
+        self.frame_filtered(engine, dt, true, true, true)
+    }
+
+    /// Gameplay variant that can structurally skip mod placement, mod UI, and
+    /// minimap physical probes independently. Menus use [`frame`](Self::frame).
+    pub fn frame_filtered<'e>(
+        &'e mut self,
+        engine: &'e Engine,
+        dt: f32,
+        mod_logic: bool,
+        mod_ui: bool,
+        minimap: bool,
+    ) -> FrameInput<'e> {
         let mut global_fired = [false; GlobalEvent::COUNT];
         for e in GlobalEvent::ALL {
+            if !minimap && e == GlobalEvent::MinimapMode {
+                continue;
+            }
             global_fired[e as usize] =
                 self.bindings.global_event[e as usize].iter().any(|c| c.edged(engine));
         }
@@ -129,6 +145,15 @@ impl Router {
         match self.context {
             Context::Gameplay => {
                 for e in GameplayEvent::ALL {
+                    let disabled = match e {
+                        GameplayEvent::Place => !mod_logic,
+                        GameplayEvent::ToggleInventory | GameplayEvent::ToggleCrafting => !mod_ui,
+                        _ => false,
+                    };
+                    if disabled {
+                        self.timers.gameplay[e as usize] = -1.0;
+                        continue;
+                    }
                     gameplay_fired[e as usize] = eval_event(
                         &self.bindings.gameplay_event[e as usize],
                         e.repeat(),
