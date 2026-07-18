@@ -126,10 +126,6 @@ impl ReactionRegistry {
                 continue;
             }
 
-            // Compare actual reagent ratios to the reaction's optimum: sum the
-            // absolute percent differences across reagents. Accumulate over the
-            // common denominator `reagent_total` in u64 and divide once at the
-            // end, to avoid rounding each term down individually.
             let total = reagent_total as u64;
             let distance: u64 = reaction
                 .reagents

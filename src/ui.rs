@@ -223,13 +223,7 @@ pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color
     f.draw_text(text, x, y, font_size, color);
 }
 
-// ---------------------------------------------------------------------------
-// HUD widget vocabulary. A mod describes *what* to show as data ([`HudElement`]s)
-// and never draws — [`render_hud`] is the only code that touches the frame, so
-// panel chrome, ellipsis, and scaling live in exactly one place and a new mod
-// can't reinvent (or misplace) any of it. The vocabulary is deliberately closed:
-// a screen-anchored [`Label`](HudElement::Label) and a boxed [`Panel`].
-// ---------------------------------------------------------------------------
+// HUD widget vocabulary: mods describe what to show as data, [`render_hud`] draws it.
 
 /// One panel row's text plus its emphasis. The panel resolves the role to a
 /// colour and ellipsizes the text to the panel width.
@@ -795,8 +789,7 @@ mod tests {
         assert!(HudMode::Minimal.shows_world_ui());
         assert!(!HudMode::Off.shows_world_ui());
         assert_eq!(HudMode::Off.next(), HudMode::Full);
-        // Off hides EVERY widget: minimap and mod HUD included, not just the
-        // reticle/info text (the G-14 regression).
+        // Off hides EVERY widget: minimap and mod HUD included, not just the reticle/info text.
         assert!(HudMode::Full.shows_minimap());
         assert!(!HudMode::Minimal.shows_minimap());
         assert!(!HudMode::Off.shows_minimap());

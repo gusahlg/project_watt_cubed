@@ -24,6 +24,9 @@ struct Part {
 
 use std::f32::consts::PI;
 
+/// Index of the head part in [`RIG`]; omitted for the local first-person body.
+const HEAD: usize = 0;
+
 const RIG: [Part; 6] = [
     // Head.
     Part {
@@ -135,10 +138,17 @@ impl Pose {
         Self { feet: pose.feet, parts }
     }
 
-    pub fn draw(&self, f3: &mut Frame3D, color: Color) {
+    /// `include_head` is false for the local player in first-person view: the
+    /// camera sits inside the head box, so drawing it would clip the near plane
+    /// when pitching down. The rest of the body still renders — visible when the
+    /// player looks down, and casting a shadow like any other avatar.
+    pub fn draw(&self, f3: &mut Frame3D, color: Color, include_head: bool) {
         let ground = self.feet + Vec3::new(0.0, SHADOW_LIFT, 0.0);
         f3.draw_shadow(ground, SHADOW_RADIUS, SHADOW_COLOR);
         for (i, part) in RIG.iter().enumerate() {
+            if i == HEAD && !include_head {
+                continue;
+            }
             let (center, rot) = self.parts[i];
             f3.draw_box(center, part.half * SCALE, rot, tint(color, part.tint));
         }

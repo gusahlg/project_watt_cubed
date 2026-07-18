@@ -24,6 +24,7 @@
 //! - [`render`] — the [`Render`](render::Render) trait for drawable things.
 //! - [`macros`] — declarative macros that generate repetitive code.
 pub mod app;
+pub mod audio;
 pub mod avatar;
 pub mod block;
 pub mod camera;
@@ -35,6 +36,7 @@ pub mod frame_snapshot;
 pub mod game;
 pub mod harness;
 pub mod hash;
+pub mod ident;
 pub mod input;
 pub mod interact;
 pub mod macros;
@@ -48,6 +50,7 @@ pub mod presence;
 pub mod render;
 pub mod render_config;
 pub mod save;
+pub mod sched;
 pub mod session;
 pub mod settings;
 pub mod sim;

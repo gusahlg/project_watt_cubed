@@ -1,55 +1,46 @@
-//! The authoritative, headless multiplayer server: it owns the one true world
-//! (seed + edit overlay) and the roster of connected players, and it never trusts a
-//! client. It runs with no window, no GPU, and no chunk machinery — terrain is
-//! procedural, so the server only tracks the *seed* and the sparse overlay of
-//! *edits*, each an opaque portable block spec ([`save`](crate::save)). That makes it
-//! tiny to run and lets it scale to many players on a cheap box.
+//! Authoritative, headless multiplayer server: owns the seed + edit overlay
+//! and the player roster; terrain is procedural, so no voxel data is ever sent.
 //!
 //! **Threading.** One accept thread; per client a blocking reader thread and a
 //! bounded-queue writer thread, coordinated through a single [`Mutex`]-guarded
-//! [`State`]. The lock is held only for short, allocation-light bursts; the hottest
-//! path — move fan-out — snapshots its recipients under the lock and pushes to
-//! their queues after releasing it. This comfortably serves hundreds of players;
-//! past that the one global lock and the thread-per-client model are still the
-//! ceiling (join/leave and global chat remain O(roster) under it), and an
-//! event-loop rewrite would be the next step — called out honestly rather than
-//! hidden.
+//! [`State`]. The lock is held only for short bursts — move fan-out snapshots
+//! its recipients under the lock and pushes to their queues after releasing
+//! it. Comfortably serves hundreds of players; past that the one global lock
+//! and thread-per-client model are the ceiling (join/leave and global chat
+//! stay O(roster)) — an event-loop rewrite would be the next step.
 //!
-//! **Optimisation.** No voxel data is ever sent — a join transfers the seed plus the
-//! edit overlay, and live play is just small position/edit/chat frames. Position
-//! broadcasts are interest-managed (only players within [`INTEREST_RADIUS`] hear a
-//! move) through a 2D bucket grid ([`State::grid`]): a move consults only the
-//! mover's 3×3 bucket neighbourhood instead of scanning the roster, so the busiest
-//! traffic costs O(nearby players) per move rather than O(everyone online).
+//! **Interest management.** Position broadcasts only reach players within
+//! [`INTEREST_RADIUS`], via a 2D bucket grid ([`State::grid`]): a move consults
+//! only the mover's 3×3 bucket neighbourhood instead of scanning the roster.
 //!
-//! **Trust.** Joins are password-gated and version-checked; frames are size-capped by
-//! the [`protocol`] framing; every client is rate-limited; and every edit is bounds-
-//! and reach-validated against the sender's own reported position before it is
-//! recorded.
+//! **Trust.** Joins are password-gated and version-checked; frames are size-capped
+//! by [`protocol`]; every client is rate-limited; every edit is bounds- and
+//! reach-validated against the sender's own reported position.
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use quinn::{Endpoint, Incoming, SendStream};
+use tokio::runtime::Runtime;
+use tokio::sync::Notify;
 use voxel_engine::DVec3;
 
 use crate::math::block_coord;
 
 use crate::block::registry::BlockRegistry;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
-use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat};
+use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
 use crate::world::generation::{SineHills, TerrainGenerator};
 
-/// Poison-recovering lock: a client thread that panics while holding
-/// the state must not take the whole server down with it — [`State`] is plain
-/// data, valid at every point a panic could interrupt, so recovery is always
-/// sound. The ONE place the recovery policy lives; call sites say
-/// `lock_recover()` and can't drift back to a bare `.unwrap()`.
+/// A client thread that panics while holding the state must not take the whole
+/// server down with it — [`State`] is plain data, valid at every point a panic
+/// could interrupt, so recovery is always sound.
 trait LockRecover<T> {
     fn lock_recover(&self) -> MutexGuard<'_, T>;
 }
@@ -60,69 +51,60 @@ impl<T> LockRecover<T> for Mutex<T> {
     }
 }
 
-/// Largest concurrent roster. A hard bound so a flood of connects can't spawn
-/// unbounded threads.
+/// Hard bound so a flood of connects can't spawn unbounded threads.
 const MAX_PLAYERS: usize = 256;
-/// Concurrent not-yet-authenticated connections the server will hold.
 /// `MAX_PLAYERS` bounds the roster only AFTER a handshake; without this cap a
-/// flood of silent connects would squat one thread and file descriptor each
-/// for the whole [`HANDSHAKE_TIMEOUT`]. Connections past the cap are refused
-/// in the accept loop, before any thread is spawned for them.
+/// flood of silent connects would squat a thread+fd each for the whole
+/// [`HANDSHAKE_TIMEOUT`]. Refused in the accept loop, before any thread spawns.
 const HANDSHAKE_CAP: usize = 64;
-/// Depth of a client's outbound frame queue. A client that falls this far behind is
-/// treated as unresponsive and dropped, so one slow peer can't grow memory without
-/// bound.
+/// A client this far behind is treated as unresponsive and dropped, so one
+/// slow peer can't grow memory without bound.
 const OUT_CAPACITY: usize = 1024;
-/// A connection that sends nothing for this long is reaped (clients heartbeat well
-/// under it). Also bounds how long a stalled handshake can squat a thread.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a client has to send its `Hello` before we hang up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Message budget per client per second; excess frames are dropped. Blunts flooding.
+/// Bounds a client that reads and holds, so a reject still gets delivered
+/// before teardown without hanging forever.
+const REJECT_DRAIN: Duration = Duration::from_secs(3);
 const RATE_LIMIT: u32 = 300;
-/// A position update is only sent to players within this many world units of the
-/// mover — nobody past render distance needs it.
+/// A 20 ms capture cadence is ~50 frames/s sustained; 100 leaves headroom for
+/// bursts while capping a voice flood under [`RATE_LIMIT`]. Excess frames are
+/// dropped silently — voice is loss-tolerant, never a kick trigger.
+const VOICE_RATE_LIMIT: u32 = 100;
+/// Player ids come from a strictly-incrementing `next_id` and are NEVER
+/// reused, so each id has exactly one incarnation and a constant epoch is
+/// sound. Reopen if ids ever become reusable: this must become a per-id join
+/// generation on `PlayerHandle`.
+const VOICE_EPOCH: u32 = 0;
 const INTEREST_RADIUS: f64 = 160.0 * crate::math::PER_METER;
 /// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
 const INTEREST_RADIUS_SQ: f64 = INTEREST_RADIUS * INTEREST_RADIUS;
-/// A client may edit a block at most this far from its own reported eye position;
-/// farther edits are rejected as bogus. A little past the client's reach constant.
+/// A little past the client's own reach constant.
 const EDIT_REACH: f64 = 8.0 * crate::math::PER_METER;
-/// Fastest plausible legitimate speed (world units/second) for the movement
-/// envelope: terminal fall is 60 m/s and default boosted flight well under
-/// that, so 80 m/s accepts every stock movement with headroom while making
+/// Terminal fall is 60 m/s and default boosted flight well under that, so
+/// 80 m/s accepts every stock movement with headroom while making
 /// `Move(anywhere)` reach-forging impossible. Deliberate discontinuities go
 /// through [`ClientMessage::Teleport`] instead.
 const MAX_MOVE_SPEED: f64 = 80.0 * crate::math::PER_METER;
-/// Latency slack added to the envelope window, so jitter between a client's
-/// send cadence and our receive time never rejects honest movement.
+/// So jitter between a client's send cadence and our receive time never
+/// rejects honest movement.
 const MOVE_SLACK_SECS: f64 = 0.3;
-/// Longest gap credited to the envelope: past this, elapsed time stops buying
-/// displacement (an idle client can't bank a cross-map jump allowance).
+/// Past this, elapsed time stops buying displacement (an idle client can't
+/// bank a cross-map jump allowance).
 const MOVE_WINDOW_CAP_SECS: f64 = 2.0;
-/// Hard cap on the server's canonical spec pool. Matches the client palette
-/// cap ([`format::MAX_SPECS`](crate::save::format)); edits needing a NEW spec
-/// past it are rejected, so a hostile client can exhaust neither server
-/// memory nor its peers' palettes.
+/// Matches the client palette cap ([`format::MAX_SPECS`](crate::save::format));
+/// a hostile client can exhaust neither server memory nor peers' palettes.
 const MAX_SPEC_POOL: usize = 16_384;
-/// Edits are streamed to a joining client in batches this size, so a very built-up
-/// world's snapshot never overflows a single frame's size cap. Derived from the
-/// worst case per edit — 12 bytes x/y/z + 4-byte revision + 2-byte length
+/// Worst case per edit — 12 bytes x/y/z + 4-byte revision + 2-byte length
 /// prefix + [`MAX_SPEC`] spec bytes — with headroom for the frame header.
 const SNAPSHOT_BATCH: usize = (crate::net::MAX_FRAME - 64) / (12 + 4 + 2 + MAX_SPEC);
-/// Average terrain height the generator oscillates around — matches the client's
-/// [`World`](crate::world::World::new) so server spawn heights land on real ground.
+/// Matches the client's [`World`](crate::world::World::new) so server spawn
+/// heights land on real ground.
 const TERRAIN_BASE: f32 = 20.0;
 
-/// The public knobs for a server. Built by the dedicated binary and the in-game host.
 pub struct Config {
-    /// Password every client must present. Empty means no password is required.
+    /// Empty means no password is required.
     pub password: String,
-    /// The world seed all clients generate their terrain from.
     pub seed: i64,
-    /// Real seconds per full day/night cycle, shared with every client.
     pub day_secs: f32,
-    /// Whether clients may `/tp` (an explicit [`ClientMessage::Teleport`]).
     /// Off, a teleport is answered with an authoritative snap-back.
     pub allow_teleport: bool,
 }
@@ -138,9 +120,6 @@ impl Default for Config {
     }
 }
 
-/// Immutable per-server context shared with every connection handler: the auth
-/// password, the seed, the content fingerprint joins must match, and just
-/// enough of the generator to place spawns on ground.
 struct Ctx {
     password: String,
     seed: i64,
@@ -150,95 +129,79 @@ struct Ctx {
     generator: SineHills,
 }
 
-/// One connected player as the server tracks them.
 struct PlayerHandle {
     name: String,
     pos: DVec3,
     yaw: f32,
     pitch: f32,
     stance: Stance,
-    /// When the last accepted `Move`/`Teleport` landed — the movement
-    /// envelope's time anchor.
+    /// The movement envelope's time anchor.
     last_move: Instant,
-    /// Ids currently inside mutual interest range (visibility is symmetric,
-    /// so `a.visible.contains(b) == b.visible.contains(a)`). Maintained by the
-    /// mover's diff in [`on_move`]; drives PeerExited/re-entry pose events.
+    /// Ids inside mutual interest range (`a.visible.contains(b) ==
+    /// b.visible.contains(a)`). Maintained by [`on_move`]'s diff; drives
+    /// PeerExited/re-entry pose events.
     visible: std::collections::HashSet<u32>,
-    /// Outbound queue drained by this client's writer thread.
     out: SyncSender<Arc<[u8]>>,
-    /// A clone of the socket, kept only to force-close a misbehaving client.
-    kick: TcpStream,
-    /// False until this player's Welcome/Snapshot bootstrap is fully queued.
-    /// Broadcasters must not push into a not-yet-ready queue: a racing frame
-    /// would beat Welcome onto the wire (failing the client handshake) or
-    /// interleave between snapshot batches (a stale batch would then revert a
-    /// newer edit). Instead they buffer into `backlog`, drained in order once
-    /// the bootstrap is done — so mid-join edits still arrive, AFTER the
-    /// snapshot they must override.
+    /// Wakes a misbehaving client's reader out of its blocking read so cleanup
+    /// runs. A `Notify` rather than `quinn::Connection` so it's cheap to
+    /// fabricate in state-only tests.
+    kick: Arc<Notify>,
+    /// False until Welcome/Snapshot is fully queued. Broadcasters must not
+    /// push into a not-yet-ready queue — a racing frame could beat Welcome
+    /// onto the wire or interleave between snapshot batches — so they buffer
+    /// into `backlog` instead, drained in order once the bootstrap is done.
     ready: bool,
     backlog: Vec<Arc<[u8]>>,
 }
 
-/// Most frames a joining player can accumulate while their bootstrap queues.
-/// Overflow marks them slow (kicked) — matching the outbound-queue policy.
+/// Overflow marks a joiner slow (kicked) — matching the outbound-queue policy.
 const BOOTSTRAP_BACKLOG: usize = 256;
 
-/// One authoritative overlay cell: its canonical spec and its revision — the
-/// optimistic-concurrency token racing edits compare against.
+/// The optimistic-concurrency token racing edits compare against.
 struct Cell {
     spec: std::sync::Arc<str>,
     rev: u32,
 }
 
-/// The single piece of shared, mutable server state: the authoritative edit overlay
-/// (coordinate → canonical block spec + revision), the player roster, and the
-/// interest grid that indexes the roster by position.
 struct State {
     edits: HashMap<(i32, i32, i32), Cell>,
     /// Distinct CANONICAL spec strings, shared by every edit naming them: a
     /// thousand broken blocks are a thousand map entries but ONE "air"
-    /// allocation. Entries are released as soon as no live cell references
-    /// them ([`State::release`]), and the pool is capped at [`MAX_SPEC_POOL`],
-    /// so the overlay's per-entry weight — the memory story of a long-lived
-    /// world — is bounded by real content, not by attacker-minted strings.
+    /// allocation. Released once no live cell references them
+    /// ([`State::release`]) and capped at [`MAX_SPEC_POOL`], so per-entry
+    /// weight is bounded by real content, not attacker-minted strings.
     spec_pool: std::collections::HashSet<std::sync::Arc<str>>,
-    /// The same compiled palette clients build, used to validate and
-    /// canonicalize incoming edit specs with EXACTLY the rules clients apply.
+    /// The same compiled palette clients build, so specs validate/canonicalize
+    /// under EXACTLY the rules clients apply.
     registry: BlockRegistry,
     players: HashMap<u32, PlayerHandle>,
-    /// Broad-phase interest grid: bucket key → ids of the players standing in it,
-    /// keyed by [`bucket_of`] — `(floor(x / INTEREST_RADIUS), floor(z /
-    /// INTEREST_RADIUS))`. Buckets are exactly one radius wide, so anyone within
-    /// [`INTEREST_RADIUS`] of a mover lives in the mover's 3×3 bucket
-    /// neighbourhood; [`on_move`] collects candidates there and still applies the
-    /// exact per-player distance check, so the grid only narrows the *candidate*
-    /// set, never the audience. Deliberately 2D: interest mirrors render distance,
-    /// which is horizontal, and players spread across a sliver of y compared to a
-    /// 160-unit radius — a y axis would add bucket churn from every jump and fall
-    /// while barely shrinking candidate sets. Ignoring y can only *widen* the
-    /// candidate set (3D distance ≥ horizontal distance), never miss a listener.
-    /// Invariant: exactly one entry per connected player, updated under the same
-    /// lock hold as the roster/position change it mirrors; empty buckets are
-    /// removed eagerly so churn can never leak keys.
+    /// Bucket key → ids standing in it, keyed by [`bucket_of`]. Buckets are
+    /// exactly one [`INTEREST_RADIUS`] wide, so anyone in range of a mover
+    /// lives in its 3×3 neighbourhood; [`on_move`] still applies the exact
+    /// per-player distance check, so the grid only narrows candidates, never
+    /// the audience. Deliberately 2D — a y axis would add bucket churn from
+    /// every jump/fall while barely shrinking candidate sets, and ignoring y
+    /// can only widen the candidate set, never miss a listener. Invariant:
+    /// exactly one entry per connected player, updated under the same lock
+    /// hold as the position change it mirrors; empty buckets are removed
+    /// eagerly so churn can never leak keys.
     grid: HashMap<(i32, i32), Vec<u32>>,
     next_id: u32,
-    /// The shared clock: the `[0,1)` day fraction that was current at
-    /// `day_set`. Clients advance locally at the shared cycle length; the
-    /// server advances only when asked ([`State::day_now`]), so a late joiner
-    /// receives the CURRENT phase rather than whatever `/time` last set.
+    /// The `[0,1)` day fraction current at `day_set`. The server advances it
+    /// only when asked ([`State::day_now`]), so a late joiner receives the
+    /// CURRENT phase rather than whatever `/time` last set.
     day: f32,
     day_set: Instant,
 }
 
 impl State {
-    /// Add `id` to the grid bucket containing `pos`. Must run under the same lock
-    /// hold as the roster/position change it mirrors, or the grid drifts.
+    /// Must run under the same lock hold as the roster/position change it
+    /// mirrors, or the grid drifts.
     fn grid_insert(&mut self, id: u32, pos: DVec3) {
         self.grid.entry(bucket_of(pos)).or_default().push(id);
     }
 
-    /// Remove `id` from the grid bucket containing `pos`, dropping the bucket when
-    /// it empties so long-running churn can never accumulate dead keys.
+    /// Drops the bucket when it empties so churn can never accumulate dead keys.
     fn grid_remove(&mut self, id: u32, pos: DVec3) {
         let key = bucket_of(pos);
         if let Some(bucket) = self.grid.get_mut(&key) {
@@ -249,14 +212,12 @@ impl State {
         }
     }
 
-    /// The day fraction as of now, advanced from the last set point at the
-    /// shared cycle length.
     fn day_now(&self, day_secs: f32) -> f32 {
         let elapsed = self.day_set.elapsed().as_secs_f32();
         (self.day + elapsed / day_secs.max(1.0)).rem_euclid(1.0)
     }
 
-    /// Intern a canonical spec, or `None` at the [`MAX_SPEC_POOL`] cap.
+    /// `None` at the [`MAX_SPEC_POOL`] cap.
     fn intern(&mut self, spec: &str) -> Option<std::sync::Arc<str>> {
         if let Some(shared) = self.spec_pool.get(spec) {
             return Some(shared.clone());
@@ -269,9 +230,8 @@ impl State {
         Some(shared)
     }
 
-    /// Drop a spec's pool entry once no live cell references it. `old` is the
-    /// reference just removed from the overlay: when the pool entry and `old`
-    /// are the only two remaining owners, the string is dead content.
+    /// `old` is the reference just removed from the overlay: when the pool
+    /// entry and `old` are the only two remaining owners, it's dead content.
     fn release(&mut self, old: std::sync::Arc<str>) {
         if std::sync::Arc::strong_count(&old) == 2 {
             self.spec_pool.remove(&old);
@@ -292,6 +252,10 @@ fn bucket_of(pos: DVec3) -> (i32, i32) {
 pub struct ServerHandle {
     shutdown: Arc<AtomicBool>,
     addr: SocketAddr,
+    /// The runtime hosting quinn, held so it outlives the handle. The accept loop
+    /// and every client handler thread also hold clones, so a detached server keeps
+    /// running and existing clients finish even after the handle is dropped.
+    _rt: Arc<Runtime>,
     /// Test-only window into the shared state, for grid-leak assertions.
     #[cfg(test)]
     state: Arc<Mutex<State>>,
@@ -316,23 +280,26 @@ impl ServerHandle {
         self.state.lock_recover().grid.values().map(Vec::len).sum()
     }
 
-    /// Number of live grid buckets. Empty buckets are removed eagerly, so this
-    /// must return to zero whenever the roster empties.
+    /// Must return to zero whenever the roster empties.
     #[cfg(test)]
     fn grid_buckets(&self) -> usize {
         self.state.lock_recover().grid.len()
     }
 }
 
-/// Bind `port` and start serving in the background, returning a handle with the
-/// resolved address. Bind to port 0 to let the OS pick a free port.
+/// Bind to port 0 to let the OS pick a free port.
 pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    let addr = listener.local_addr()?;
+    let rt = Arc::new(Runtime::new()?);
+    let endpoint = {
+        // Must run inside the runtime: construction spawns quinn's UDP driver.
+        let _guard = rt.enter();
+        Endpoint::server(quic::server_config()?, (Ipv4Addr::UNSPECIFIED, port).into())?
+    };
+    let addr = endpoint.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Resolve the generator's palette once: it doubles as spawn-height terrain,
-    // the content identity joins must match, and the edit-spec validator.
+    // Doubles as spawn-height terrain, the content identity joins must match,
+    // and the edit-spec validator.
     let mut registry = BlockRegistry::with_builtins();
     let generator = SineHills::new(&mut registry, TERRAIN_BASE, config.seed);
     let ctx = Arc::new(Ctx {
@@ -357,18 +324,19 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     #[cfg(test)]
     let state = shared.clone();
     let accept_shutdown = shutdown.clone();
-    thread::spawn(move || accept_loop(listener, shared, ctx, accept_shutdown));
+    let accept_rt = rt.clone();
+    thread::spawn(move || accept_loop(endpoint, accept_rt, shared, ctx, accept_shutdown));
 
     Ok(ServerHandle {
         shutdown,
         addr,
+        _rt: rt,
         #[cfg(test)]
         state,
     })
 }
 
-/// Bind and serve on the current thread until the process exits — the dedicated
-/// server's entry point.
+/// The dedicated server binary's entry point.
 pub fn run(port: u16, config: Config) -> io::Result<()> {
     let handle = spawn(port, config)?;
     println!("watt-cubed server listening on {}", handle.addr());
@@ -388,123 +356,98 @@ impl Drop for HandshakeSlot {
     }
 }
 
-/// Accept connections until asked to stop, handing each to its own handler thread.
-fn accept_loop(listener: TcpListener, shared: Arc<Mutex<State>>, ctx: Arc<Ctx>, shutdown: Arc<AtomicBool>) {
-    // Non-blocking accept so the loop can notice `stop()` between connections.
-    let _ = listener.set_nonblocking(true);
+fn accept_loop(
+    endpoint: Endpoint,
+    rt: Arc<Runtime>,
+    shared: Arc<Mutex<State>>,
+    ctx: Arc<Ctx>,
+    shutdown: Arc<AtomicBool>,
+) {
     let pending = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                // Bound pre-auth resources BEFORE spawning: past the cap the
-                // connection is refused right here. The reject write goes into
-                // an empty send buffer, so it cannot block the accept loop.
-                if pending.fetch_add(1, Ordering::Relaxed) >= HANDSHAKE_CAP {
-                    pending.fetch_sub(1, Ordering::Relaxed);
-                    let _ = stream.set_nonblocking(false);
-                    reject(&stream, "server busy");
-                    continue;
-                }
-                let slot = HandshakeSlot(pending.clone());
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_nodelay(true);
-                let shared = shared.clone();
-                let ctx = ctx.clone();
-                thread::spawn(move || {
-                    // A dropped connection is routine; the error is the disconnect cause.
-                    let _ = handle_client(stream, addr, shared, ctx, slot);
-                });
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => thread::sleep(Duration::from_millis(200)),
+        // Bounded wait so `stop()` (which only flips the flag) is noticed
+        // promptly between connections.
+        let incoming = match rt
+            .block_on(async { tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await })
+        {
+            Ok(Some(incoming)) => incoming,
+            Ok(None) => break, // endpoint closed
+            Err(_elapsed) => continue,
+        };
+
+        // A QUIC CONNECTION_REFUSED past the cap, before any handshake, so a
+        // flood of silent connects can't squat handler threads. The accept
+        // loop is the only adder, so load-then-add can't overshoot the cap.
+        if pending.load(Ordering::Relaxed) >= HANDSHAKE_CAP {
+            incoming.refuse();
+            continue;
         }
+        pending.fetch_add(1, Ordering::Relaxed);
+        let slot = HandshakeSlot(pending.clone());
+        let shared = shared.clone();
+        let ctx = ctx.clone();
+        let handler_rt = rt.clone();
+        thread::spawn(move || {
+            // A dropped connection is routine; the error is the disconnect cause.
+            let _ = handle_client(incoming, handler_rt, shared, ctx, slot);
+        });
     }
 }
 
-/// Drive one client: authenticate, register, stream the world snapshot, then relay
-/// its messages until it disconnects, tidying up on the way out.
 fn handle_client(
-    stream: TcpStream,
-    addr: SocketAddr,
+    incoming: Incoming,
+    rt: Arc<Runtime>,
     shared: Arc<Mutex<State>>,
     ctx: Arc<Ctx>,
     slot: HandshakeSlot,
 ) -> io::Result<()> {
-    // The first frame must be a valid, authenticated Hello within the handshake window.
-    // Buffered reads (one buffered read per frame, not two syscalls) plus a scratch
-    // Vec reused for every frame this client ever sends — no per-frame allocation.
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let mut reader = io::BufReader::new(stream.try_clone()?);
+    // The scratch Vec is reused for every frame this client ever sends.
+    let conn = rt.block_on(async { incoming.await }).map_err(io::Error::other)?;
+    let addr = conn.remote_address();
+    let (mut send, mut recv) = rt
+        .block_on(async { tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()).await })
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))?
+        .map_err(io::Error::other)?;
+
     let mut frame = Vec::new();
-    protocol::read_frame(&mut reader, &mut frame)?;
+    rt.block_on(async {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, protocol::read_frame_async(&mut recv, &mut frame)).await
+    })
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
+
     let name = match ClientMessage::decode(&frame) {
         Some(ClientMessage::Hello { protocol, fingerprint, name, password }) => {
             if protocol != PROTOCOL_VERSION {
-                reject(&stream, "protocol version mismatch");
+                reject(&rt, &mut send, &conn, "protocol version mismatch");
                 return Ok(());
             }
             if fingerprint != ctx.fingerprint {
-                // Same protocol, different generated content (worldgen rules,
-                // element table, placement palette): a join would silently
-                // build a DIFFERENT world from the shared seed. Refuse loudly.
-                reject(&stream, "world content mismatch (different game/content versions)");
+                // Same protocol, different generated content: a join would
+                // silently build a DIFFERENT world from the shared seed.
+                reject(&rt, &mut send, &conn, "world content mismatch (different game/content versions)");
                 return Ok(());
             }
             if password != ctx.password {
-                reject(&stream, "wrong password");
+                reject(&rt, &mut send, &conn, "wrong password");
                 return Ok(());
             }
             clean_name(&name)
         }
         _ => {
-            reject(&stream, "expected hello");
+            reject(&rt, &mut send, &conn, "expected hello");
             return Ok(());
         }
     };
-    // Authenticated: the pre-auth window is over, free the handshake slot (the
-    // roster's own MAX_PLAYERS bound takes it from here).
+    // Pre-auth window is over; the roster's own MAX_PLAYERS bound takes over.
     drop(slot);
 
-    // Switch to the idle timeout and wire up the writer.
-    stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
+    // Made before the lock, and the writer spawned only after a slot is
+    // secured, so the still-owned `send` handles a "server full" reject
+    // directly and reliably.
     let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-    let writer_stream = stream.try_clone()?;
-    let writer_shutdown = stream.try_clone()?;
-    let writer = thread::spawn(move || {
-        // Buffered, flushed once per drained batch: block for the first frame, then
-        // opportunistically drain whatever else queued up before paying one flush —
-        // a burst of broadcasts costs one syscall instead of one per message.
-        //
-        // Any write error shuts the socket down so the reader thread unblocks
-        // and the player is cleaned up, instead of silently ghosting them.
-        let mut w = io::BufWriter::new(writer_stream);
-        let fail = |s: &TcpStream| {
-            let _ = s.shutdown(Shutdown::Both);
-        };
-        while let Ok(frame) = rx.recv() {
-            if protocol::write_frame(&mut w, &frame).is_err() {
-                return fail(&writer_shutdown);
-            }
-            loop {
-                match rx.try_recv() {
-                    Ok(frame) => {
-                        if protocol::write_frame(&mut w, &frame).is_err() {
-                            return fail(&writer_shutdown);
-                        }
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                }
-            }
-            if w.flush().is_err() {
-                return fail(&writer_shutdown);
-            }
-        }
-    });
+    let kick = Arc::new(Notify::new());
 
-    // Register the player and gather what the newcomer needs to bootstrap. Done in
-    // one locked scope so the id, spawn, and roster it sees are all consistent.
+    // One locked scope so the id, spawn, and roster snapshot are consistent.
     let id;
     let spawn;
     let world_day;
@@ -515,7 +458,7 @@ fn handle_client(
         world_day = state.day_now(ctx.day_secs);
         if state.players.len() >= MAX_PLAYERS {
             drop(state);
-            reject(&stream, "server full");
+            reject(&rt, &mut send, &conn, "server full");
             return Ok(());
         }
         id = state.next_id;
@@ -523,8 +466,7 @@ fn handle_client(
         spawn = spawn_point(&ctx.generator, id);
 
         // Roster only — poses flow through the visibility machinery once the
-        // joiner reports their first move, so a far peer is never bootstrapped
-        // as a frozen ghost at a stale position.
+        // joiner reports their first move, so a far peer isn't a frozen ghost.
         existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
         snapshot = state
             .edits
@@ -543,7 +485,7 @@ fn handle_client(
                 last_move: Instant::now(),
                 visible: std::collections::HashSet::new(),
                 out: out.clone(),
-                kick: stream.try_clone()?,
+                kick: kick.clone(),
                 ready: false,
                 backlog: Vec::new(),
             },
@@ -551,9 +493,30 @@ fn handle_client(
         // Same lock hold as the roster insert, so the grid never lags the roster.
         state.grid_insert(id, spawn);
     }
+
+    // A write error ends the writer; the connection close at cleanup unblocks
+    // one stuck on a slow client's flow-control window. QUIC has no user
+    // flush — quinn transmits.
+    let writer_rt = rt.clone();
+    let writer = thread::spawn(move || {
+        while let Ok(frame) = rx.recv() {
+            if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+                return;
+            }
+            loop {
+                match rx.try_recv() {
+                    Ok(frame) => {
+                        if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+    });
     println!("[+] {name} joined as #{id} from {addr} ({} online)", online(&shared));
 
-    // Bootstrap the newcomer: who they are, the world edits, and who else is here.
     // These sends BLOCK (we're on this client's own handler thread): a built-up
     // world or big roster can exceed the outbound queue, and dropping bootstrap
     // frames would ghost the join.
@@ -587,15 +550,27 @@ fn handle_client(
         }
     }
 
-    // Announce the newcomer to everyone already connected.
     broadcast_all(&shared, &ServerMessage::PeerJoined { id, name: name.clone() }, Some(id));
 
-    // Relay loop with a light per-second rate limiter.
+    // Voice carries a second, tighter per-second budget of its own: it is far
+    // chattier than any other message and must not eat a peer's general budget.
     let mut window = Instant::now();
     let mut count: u32 = 0;
+    let mut voice_window = Instant::now();
+    let mut voice_count: u32 = 0;
     loop {
-        if protocol::read_frame(&mut reader, &mut frame).is_err() {
-            break; // EOF, timeout, or a malformed length: the client is gone.
+        // A kick (slow client) wakes this out of the blocking read so cleanup
+        // runs; the read future is only ever dropped on that teardown path, so
+        // no partial frame desyncs a live stream.
+        let read = rt.block_on(async {
+            tokio::select! {
+                r = protocol::read_frame_async(&mut recv, &mut frame) => Some(r),
+                _ = kick.notified() => None,
+            }
+        });
+        match read {
+            Some(Ok(())) => {}
+            _ => break, // EOF, a malformed length, or a kick: the client is gone.
         }
 
         if window.elapsed() >= Duration::from_secs(1) {
@@ -608,7 +583,7 @@ fn handle_client(
         }
 
         let Some(msg) = ClientMessage::decode(&frame) else {
-            continue; // Junk frame; ignore it.
+            continue;
         };
         match msg {
             ClientMessage::Move { pos, yaw, pitch, stance } => {
@@ -620,6 +595,17 @@ fn handle_client(
             }
             ClientMessage::Chat { channel, text } => on_chat(&shared, id, channel, &text),
             ClientMessage::SetTime { day } => on_set_time(&shared, &ctx, day),
+            ClientMessage::Voice { seq, payload } => {
+                if voice_window.elapsed() >= Duration::from_secs(1) {
+                    voice_window = Instant::now();
+                    voice_count = 0;
+                }
+                voice_count += 1;
+                if voice_count > VOICE_RATE_LIMIT {
+                    continue; // Over the voice budget this second — drop silently.
+                }
+                on_voice(&shared, id, seq, payload);
+            }
             // Clients ignore swings for unknown peers, so broadcast to
             // everyone-but-sender is safe.
             ClientMessage::Swing => {
@@ -637,16 +623,13 @@ fn handle_client(
         }
     }
 
-    // Cleanup: drop the player (which frees the writer), close the socket, tell peers.
     {
         let mut state = shared.lock_recover();
         if let Some(h) = state.players.remove(&id) {
-            // The handle's pos is the last committed one, so it names the exact
-            // bucket the grid still holds this id under.
+            // h.pos is the last committed one, naming the bucket the grid holds it under.
             state.grid_remove(id, h.pos);
-            // Visibility is symmetric: everyone who could see the leaver holds
-            // a reciprocal entry that must not dangle (PeerLeft removes the
-            // avatar client-side either way).
+            // Everyone who could see the leaver holds a reciprocal entry that
+            // must not dangle.
             for pid in h.visible {
                 if let Some(other) = state.players.get_mut(&pid) {
                     other.visible.remove(&id);
@@ -654,7 +637,9 @@ fn handle_client(
             }
         }
     }
-    let _ = stream.shutdown(Shutdown::Both);
+    // Close the connection FIRST: it errors any write the writer is stuck on for a
+    // slow client, so dropping `out` and joining actually completes.
+    conn.close(0u32.into(), b"bye");
     drop(out);
     let _ = writer.join();
     broadcast_all(&shared, &ServerMessage::PeerLeft { id }, None);
@@ -662,8 +647,6 @@ fn handle_client(
     Ok(())
 }
 
-/// Apply a validated position update and fan it out to interested players only.
-///
 /// Validation is a plausibility ENVELOPE, not full physics: a move may cover
 /// at most [`MAX_MOVE_SPEED`] × (elapsed + slack) world units and must stay
 /// inside the world border. An implausible move is not committed — the server
@@ -678,9 +661,9 @@ fn handle_client(
 /// list, [`kick_slow`] tolerates ids that disconnected in the unlocked window,
 /// and ids are never reused, so a late kick can't hit the wrong player.
 fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
-    // Ignore non-finite pose data outright. A NaN position poisons distance
-    // checks/grid keys; a NaN angle propagates into peer interpolation and render
-    // matrices even though the server itself does not otherwise use the angle.
+    // A NaN position poisons distance checks/grid keys; a NaN angle propagates
+    // into peer interpolation and render matrices even though the server
+    // itself does not otherwise use the angle.
     if !pos.x.is_finite()
         || !pos.y.is_finite()
         || !pos.z.is_finite()
@@ -741,12 +724,9 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
     dispatch(shared, sends);
 }
 
-/// Commit an accepted position (and optionally angles/stance), keep the grid
-/// current, and queue the interest fan-out INCLUDING the visibility diff:
-/// peers staying in range get the move, peers entering range get both sides'
-/// poses (the "un-hide" signal), and peers leaving range get [`PeerExited`]
-/// both ways so nobody keeps drawing a frozen ghost. Must run under the state
-/// lock; the queued sends go out after it drops.
+/// Must run under the state lock; the queued sends go out after it drops.
+/// Peers entering/leaving range get both sides' poses/[`PeerExited`], so
+/// nobody keeps drawing a frozen ghost.
 ///
 /// [`PeerExited`]: ServerMessage::PeerExited
 fn commit_pose(
@@ -766,7 +746,6 @@ fn commit_pose(
     }
     h.last_move = Instant::now();
     let (yaw, pitch, stance) = (h.yaw, h.pitch, h.stance);
-    // Keep the grid honest before collecting from it.
     let (from, to) = (bucket_of(old), bucket_of(pos));
     if from != to {
         state.grid_remove(id, old);
@@ -775,12 +754,9 @@ fn commit_pose(
     let move_frame: Arc<[u8]> =
         ServerMessage::PeerMove { id, pos, yaw, pitch, stance }.encode().into();
 
-    // Broad phase: buckets are one INTEREST_RADIUS wide, so every player in
-    // range is somewhere in the mover's 3×3 neighbourhood. Exact phase: the
-    // same per-player squared-distance check as ever — the grid narrows the
-    // candidate set, never the audience. `wrapping_add` so a hostile position
-    // at the i32 edge can't overflow; a wrapped key at worst nominates
-    // candidates the exact check rejects.
+    // Buckets are one INTEREST_RADIUS wide: the grid only narrows candidates
+    // (never the audience), so an exact distance check still gates below.
+    // `wrapping_add` so a hostile i32-edge position can't overflow.
     let mut now_visible: Vec<u32> = Vec::new();
     for dx in -1..=1i32 {
         for dz in -1..=1i32 {
@@ -791,12 +767,9 @@ fn commit_pose(
                     continue;
                 }
                 let Some(other) = state.players.get(&pid) else { continue };
-                // Bootstrapping joiners wait: visibility forms once they are
-                // ready and either side moves.
                 if !other.ready {
                     continue;
                 }
-                // Squared-distance compare: per candidate per move, skip the sqrt.
                 if other.pos.distance_squared(pos) > INTEREST_RADIUS_SQ {
                     continue;
                 }
@@ -805,7 +778,6 @@ fn commit_pose(
         }
     }
 
-    // Departures: in the old set, not the new — both sides hide each other.
     let mover_out = state.players[&id].out.clone();
     let departed: Vec<u32> = state.players[&id]
         .visible
@@ -829,9 +801,8 @@ fn commit_pose(
             ));
         }
     }
-    // Arrivals and stayers. An arriving peer needs the mover's pose (the move
-    // frame doubles as it) AND the mover needs the arriving peer's current
-    // pose, or the mover would keep hiding them until they next move.
+    // An arriving peer needs the mover's pose AND the mover needs theirs, or
+    // the mover keeps hiding them until they next move.
     for pid in now_visible {
         let entered = !state.players[&id].visible.contains(&pid);
         let Some(other) = state.players.get_mut(&pid) else { continue };
@@ -853,8 +824,7 @@ fn commit_pose(
     }
 }
 
-/// Unlocked fan-out of queued `(recipient, sender, frame)` triples; a full (or
-/// hung-up) queue marks its owner for the kick pass.
+/// A full (or hung-up) queue marks its owner for the kick pass.
 fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<(u32, SyncSender<Arc<[u8]>>, Arc<[u8]>)>) {
     let mut slow = Vec::new();
     for (pid, out, frame) in sends {
@@ -867,21 +837,10 @@ fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<(u32, SyncSender<Arc<[u8]>>, 
     }
 }
 
-/// Validate, order, and record a block edit — the authoritative cell
-/// transition. The sender gets an [`EditAck`] verdict (their rollback signal);
-/// everyone else gets the committed [`Edit`] at its new revision.
-///
-/// The gates, in order:
-/// - reach, against the sender's last ACCEPTED position (the envelope in
-///   [`on_move`] is what makes that position meaningful);
-/// - spec validity: parsed and canonicalized by the SAME rules clients apply,
-///   so junk never interns and equivalent spellings collapse to one string;
-/// - the expected cell revision: when two players race one cell, exactly one
-///   expectation matches — the loser is rejected and rolls back (no duplicate
-///   loot, no ghost blocks).
-///
-/// [`EditAck`]: ServerMessage::EditAck
-/// [`Edit`]: ServerMessage::Edit
+/// Gates, in order: reach (against the sender's last ACCEPTED position, per
+/// [`on_move`]'s envelope), spec validity (parsed/canonicalized by the same
+/// rules clients apply), then the expected cell revision — when two players
+/// race one cell, the loser is rejected and rolls back.
 fn on_edit(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32, expect: u32, spec: &str) {
     let mut state = shared.lock_recover();
     let Some(h) = state.players.get(&id) else { return };
@@ -894,22 +853,18 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32
             );
         }
     };
-    // Y is unbounded (infinite world height/depth); reach is the real gate,
-    // checked against the editor's own last accepted position — no reaching
-    // across the map.
+    // Y is unbounded (infinite world height/depth); reach is the real gate.
     let target = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
     if spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH {
         return reject(&state, ack_to);
     }
-    // Validate and canonicalize through the shared palette rules. Anything
-    // unparseable resolves to AIR; only the literal "air" spec may mean AIR,
-    // so junk is rejected instead of silently breaking a block.
+    // Anything unparseable resolves to AIR; only the literal "air" spec may
+    // mean AIR, so junk is rejected instead of silently breaking a block.
     let block = crate::save::registry_parse_block(&mut state.registry, spec);
     if block == crate::block::AIR && spec != "air" {
         return reject(&state, ack_to);
     }
     let canonical = crate::save::registry_block_spec(&state.registry, block);
-    // Optimistic concurrency: the sender must have seen the current cell.
     let current = state.edits.get(&(x, y, z)).map_or(0, |c| c.rev);
     if expect != current {
         return reject(&state, ack_to);
@@ -929,7 +884,6 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32
     broadcast(&mut state, &msg, |pid, _| pid != id);
 }
 
-/// Relay a chat line to its audience: proximity for local, everyone for global.
 fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     let text = clean_chat(text);
     if text.is_empty() {
@@ -947,10 +901,26 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     });
 }
 
-/// Record and relay a `/time` change: anchor the shared clock at the new
-/// phase so joiners inherit the CURRENT time, then echo it to everyone (the
-/// sender included, so all clocks agree). A non-finite value is ignored
-/// rather than poisoning the shared time.
+/// Voice is loss-tolerant: `try_send` and DROP on a full/closed queue, never
+/// counted toward the slow-client kick ([`kick_slow`]/[`OUT_CAPACITY`]) — a
+/// voice flood degrades only that listener's own audio.
+fn on_voice(shared: &Arc<Mutex<State>>, id: u32, seq: u32, payload: Vec<u8>) {
+    let frame: Arc<[u8]> =
+        ServerMessage::PeerVoice { id, epoch: VOICE_EPOCH, seq, payload }.encode().into();
+    let state = shared.lock_recover();
+    let Some(speaker) = state.players.get(&id) else { return };
+    // `visible` IS the interest audience; no separate distance scan needed.
+    for &pid in &speaker.visible {
+        if let Some(other) = state.players.get(&pid) {
+            if other.ready {
+                let _ = other.out.try_send(frame.clone());
+            }
+        }
+    }
+}
+
+/// Anchors the shared clock so joiners inherit the CURRENT time. A non-finite
+/// value is ignored rather than poisoning the shared time.
 fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, day: f32) {
     if !day.is_finite() {
         return;
@@ -962,8 +932,8 @@ fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, day: f32) {
     broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
 }
 
-/// Send one message to every player matching `want`, encoding it just once. Players
-/// whose queue is full are force-closed (they've fallen too far behind).
+/// Encodes `msg` just once for every recipient. Players whose queue is full
+/// are force-closed (they've fallen too far behind).
 fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandle) -> bool) {
     let frame: Arc<[u8]> = msg.encode().into();
     let mut slow = Vec::new();
@@ -989,7 +959,6 @@ fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerH
     kick_slow(state, &slow);
 }
 
-/// Broadcast to everyone, optionally skipping one id (the originator).
 fn broadcast_all(shared: &Arc<Mutex<State>>, msg: &ServerMessage, except: Option<u32>) {
     let mut state = shared.lock_recover();
     broadcast(&mut state, msg, |pid, _| Some(pid) != except);
@@ -1000,34 +969,40 @@ fn broadcast_all(shared: &Arc<Mutex<State>>, msg: &ServerMessage, except: Option
 fn kick_slow(state: &State, ids: &[u32]) {
     for id in ids {
         if let Some(h) = state.players.get(id) {
-            let _ = h.kick.shutdown(Shutdown::Both);
+            // `notify_one` stores a permit if the reader isn't currently
+            // awaiting, so a kick is never missed.
+            h.kick.notify_one();
         }
     }
 }
 
-/// Queue one message, waiting for space. Only safe on the receiving client's
-/// own handler thread (used for the join bootstrap, which must not drop frames).
+/// Only safe on the receiving client's own handler thread (used for the join
+/// bootstrap, which must not drop frames).
 fn send_blocking(out: &SyncSender<Arc<[u8]>>, msg: &ServerMessage) {
     let frame: Arc<[u8]> = msg.encode().into();
     let _ = out.send(frame);
 }
 
-/// Reply with a rejection and let the socket close.
-fn reject(stream: &TcpStream, reason: &str) {
-    let mut w = stream;
-    let _ = protocol::write_frame(&mut w, &ServerMessage::Reject { reason: reason.into() }.encode());
+/// QUIC (unlike TCP) can discard buffered stream data when a connection closes,
+/// so we wait (bounded) for the peer to close after reading — otherwise a
+/// rejected client would see "no reply" instead of the reason.
+fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason: &str) {
+    rt.block_on(async {
+        let _ =
+            protocol::write_frame_async(send, &ServerMessage::Reject { reason: reason.into() }.encode())
+                .await;
+        let _ = send.finish();
+        let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
+    });
     println!("[x] rejected a connection: {reason}");
 }
 
-/// A spawn point just above a dry-land surface near the origin, scattered a little
-/// per id so players don't stack on the exact same block. Scans outward for the
-/// first column above sea level so nobody spawns on the seabed.
+/// Scattered a little per id so players don't stack on the exact same block;
+/// scans outward for the first column above sea level.
 fn spawn_point(generator: &SineHills, id: u32) -> DVec3 {
-    // A cheap deterministic scatter on a small grid around origin.
     let sx = (id % 8) as i32 - 3;
     let sz = ((id / 8) % 8) as i32 - 3;
     let sea = generator.sea_level();
-    // Spiral outward from the scattered start until a land column is found.
     for r in 0..64 {
         for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
             let (x, z) = (sx + dx * 8, sz + dz * 8);
@@ -1042,20 +1017,16 @@ fn spawn_point(generator: &SineHills, id: u32) -> DVec3 {
     DVec3::new(sx as f64 + 0.5, h as f64 + 3.0, sz as f64 + 0.5)
 }
 
-/// Current player count.
 fn online(shared: &Arc<Mutex<State>>) -> usize {
     shared.lock_recover().players.len()
 }
 
-/// Trim a name to the length cap and strip control characters; fall back to a
-/// generic label if nothing usable remains.
 fn clean_name(raw: &str) -> String {
     let name: String = raw.chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
     let name = name.trim().to_string();
     if name.is_empty() { "player".to_string() } else { name }
 }
 
-/// Trim a chat line to the length cap and strip control characters.
 fn clean_chat(raw: &str) -> String {
     raw.chars().filter(|c| !c.is_control()).take(MAX_CHAT).collect::<String>().trim().to_string()
 }
@@ -1099,7 +1070,7 @@ mod tests {
     /// A roster entry for direct state tests. `last_move` starts well in the
     /// past so the first envelope window is at its cap (a fresh anchor allows
     /// only ~30 world units); tests re-age it between deliberate big moves.
-    fn test_player(pos: DVec3, out: SyncSender<Arc<[u8]>>, kick: TcpStream) -> PlayerHandle {
+    fn test_player(pos: DVec3, out: SyncSender<Arc<[u8]>>, kick: Arc<Notify>) -> PlayerHandle {
         PlayerHandle {
             name: "p".into(),
             pos,
@@ -1115,10 +1086,39 @@ mod tests {
         }
     }
 
-    /// A throwaway loopback socket to fill `kick` handles.
-    fn stream_pair() -> TcpStream {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        TcpStream::connect(listener.local_addr().unwrap()).unwrap()
+    /// A throwaway kick handle for state-only players (never notified).
+    fn test_kick() -> Arc<Notify> {
+        Arc::new(Notify::new())
+    }
+
+    /// A client runtime + endpoint for the raw-handshake tests, wired with the same
+    /// accept-any-cert config real clients use.
+    fn client_endpoint() -> (Runtime, Endpoint) {
+        let rt = Runtime::new().unwrap();
+        quic::install_crypto();
+        let mut ep = {
+            let _g = rt.enter();
+            Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into()).unwrap()
+        };
+        ep.set_default_client_config(quic::client_config());
+        (rt, ep)
+    }
+
+    /// Dial, open the reliable stream, send one crafted message, and return the
+    /// server's first reply — the raw handshake path `Connection::connect` hides.
+    fn raw_reply(addr: SocketAddr, hello: &ClientMessage) -> ServerMessage {
+        // The server binds 0.0.0.0; quinn refuses to dial the unspecified address, so
+        // reach it over loopback (`handle.addr()` carries only the resolved port).
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()));
+        let (rt, ep) = client_endpoint();
+        rt.block_on(async {
+            let conn = ep.connect(target, "watt").unwrap().await.unwrap();
+            let (mut s, mut r) = conn.open_bi().await.unwrap();
+            protocol::write_frame_async(&mut s, &hello.encode()).await.unwrap();
+            let mut buf = Vec::new();
+            protocol::read_frame_async(&mut r, &mut buf).await.unwrap();
+            ServerMessage::decode(&buf).unwrap()
+        })
     }
 
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
@@ -1159,7 +1159,7 @@ mod tests {
     fn edit_reach_is_enforced() {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
-        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, stream_pair()));
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
         on_edit(&shared, 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
@@ -1175,7 +1175,7 @@ mod tests {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let start = DVec3::new(8.5, 20.0, 8.5);
         let mut players = HashMap::new();
-        let mut p = test_player(start, out, stream_pair());
+        let mut p = test_player(start, out, test_kick());
         p.yaw = 0.25;
         p.pitch = -0.5;
         players.insert(1, p);
@@ -1193,15 +1193,15 @@ mod tests {
         assert_eq!(player.stance, Stance::Standing);
     }
 
-    /// G-02: a jump no legitimate movement could make is NOT committed — the
-    /// server keeps the last accepted position (which edit reach reads) and
-    /// snaps the client back with an authoritative `Position`.
+    /// A jump no legitimate movement could make is NOT committed — the server
+    /// keeps the last accepted position (which edit reach reads) and snaps the
+    /// client back with an authoritative `Position`.
     #[test]
     fn implausible_moves_are_rejected_and_corrected() {
         let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let start = DVec3::new(8.5, 20.0, 8.5);
         let mut players = HashMap::new();
-        players.insert(1u32, test_player(start, out, stream_pair()));
+        players.insert(1u32, test_player(start, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
         // A plausible walk step commits.
@@ -1236,7 +1236,7 @@ mod tests {
         let start = DVec3::new(8.5, 20.0, 8.5);
         let far = DVec3::new(50_000.5, 30.0, -2_000.5);
         let mut players = HashMap::new();
-        players.insert(1u32, test_player(start, out, stream_pair()));
+        players.insert(1u32, test_player(start, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
         on_teleport(&shared, &test_ctx(true), 1, far);
@@ -1251,14 +1251,14 @@ mod tests {
         }
     }
 
-    /// G-01: the cell revision makes racing edits resolve to exactly one
-    /// winner, and the sender's ack — not a broadcast echo — carries the
-    /// verdict prediction rolls back on.
+    /// The cell revision makes racing edits resolve to exactly one winner, and
+    /// the sender's ack — not a broadcast echo — carries the verdict prediction
+    /// rolls back on.
     #[test]
     fn edit_revisions_arbitrate_races_and_ack_the_sender() {
         let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
-        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, stream_pair()));
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let ack = |rx: &std::sync::mpsc::Receiver<Arc<[u8]>>| {
             match ServerMessage::decode(&rx.try_recv().expect("an ack is owed")) {
@@ -1286,13 +1286,13 @@ mod tests {
         assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), "natural:Stone");
     }
 
-    /// G-06: equivalent spec spellings collapse to ONE canonical pool entry,
-    /// and a spec no live cell references leaves the pool instead of leaking.
+    /// Equivalent spec spellings collapse to ONE canonical pool entry, and a
+    /// spec no live cell references leaves the pool instead of leaking.
     #[test]
     fn spec_pool_canonicalizes_and_releases_dead_entries() {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
-        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, stream_pair()));
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
         // Two spellings of the same composition: one canonical entry.
@@ -1317,7 +1317,35 @@ mod tests {
         }
     }
 
-    /// G-10: a late joiner reads the CURRENT phase, not the last set value.
+    /// Voice relays to the speaker's interest set and nobody else, stamps the
+    /// server epoch, and — since it rides the shared queue with a plain
+    /// try_send — is simply absent from a peer who cannot hear the speaker.
+    #[test]
+    fn voice_relays_only_to_the_visible_set() {
+        let (out1, _rx1) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let (out2, rx2) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let (out3, rx3) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        // 1 speaks; 2 is in its interest set; 3 is not.
+        let mut p1 = test_player(DVec3::new(0.0, 20.0, 0.0), out1, test_kick());
+        p1.visible.insert(2);
+        players.insert(1u32, p1);
+        players.insert(2u32, test_player(DVec3::new(1.0, 20.0, 0.0), out2, test_kick()));
+        players.insert(3u32, test_player(DVec3::new(9e3, 20.0, 0.0), out3, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+
+        on_voice(&shared, 1, 42, vec![1, 2, 3]);
+
+        match ServerMessage::decode(&rx2.try_recv().expect("the visible peer hears it")) {
+            Some(ServerMessage::PeerVoice { id, epoch, seq, payload }) => {
+                assert_eq!((id, epoch, seq, payload), (1, VOICE_EPOCH, 42, vec![1, 2, 3]));
+            }
+            other => panic!("expected PeerVoice, got {other:?}"),
+        }
+        assert!(rx3.try_recv().is_err(), "a peer outside interest hears nothing");
+    }
+
+    /// A late joiner reads the CURRENT phase, not the last set value.
     #[test]
     fn shared_clock_advances_between_set_and_join() {
         let mut state = test_state(HashMap::new());
@@ -1335,7 +1363,7 @@ mod tests {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let start = DVec3::new(10.0, 20.0, 10.0);
         let mut players = HashMap::new();
-        players.insert(1u32, test_player(start, out, stream_pair()));
+        players.insert(1u32, test_player(start, out, test_kick()));
         let mut state = test_state(players);
         state.grid_insert(1, start);
         assert_eq!(state.grid.get(&(0, 0)).map(Vec::len), Some(1));
@@ -1428,27 +1456,19 @@ mod tests {
         handle.stop();
     }
 
-    /// G-08: same protocol, different generated content — the handshake must
-    /// refuse the join instead of letting two builds silently diverge on one
-    /// seed.
+    /// Same protocol, different generated content — the handshake must refuse
+    /// the join instead of letting two builds silently diverge on one seed.
     #[test]
     fn mismatched_content_fingerprint_is_rejected() {
         let handle = spawn(0, Config { password: String::new(), seed: 3, ..Config::default() }).unwrap();
-        let stream = TcpStream::connect(handle.addr()).unwrap();
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
             fingerprint: crate::net::content_fingerprint() ^ 1,
             name: "drifted".into(),
             password: String::new(),
         };
-        let mut w = &stream;
-        protocol::write_frame(&mut w, &hello.encode()).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut reader = io::BufReader::new(stream.try_clone().unwrap());
-        let mut frame = Vec::new();
-        protocol::read_frame(&mut reader, &mut frame).unwrap();
-        match ServerMessage::decode(&frame) {
-            Some(ServerMessage::Reject { reason }) => {
+        match raw_reply(handle.addr(), &hello) {
+            ServerMessage::Reject { reason } => {
                 assert!(reason.contains("content"), "unexpected reason: {reason}")
             }
             other => panic!("expected a content-mismatch rejection, got {other:?}"),
@@ -1467,34 +1487,31 @@ mod tests {
         let handle = spawn(0, Config { password: String::new(), seed: 1, ..Config::default() }).unwrap();
         let addr = handle.addr();
 
-        // Fill every pre-auth slot with connections that never send a byte.
-        let squatters: Vec<TcpStream> =
-            (0..HANDSHAKE_CAP).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        // Fill every pre-auth slot with connections that complete the QUIC
+        // handshake but never open their stream — the server's `accept_bi` blocks,
+        // holding the slot exactly as a silent TCP client did.
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()));
+        let (squat_rt, squat_ep) = client_endpoint();
+        let squatters: Vec<quinn::Connection> = squat_rt.block_on(async {
+            let mut v = Vec::new();
+            for _ in 0..HANDSHAKE_CAP {
+                v.push(squat_ep.connect(target, "watt").unwrap().await.unwrap());
+            }
+            v
+        });
         // Let the accept loop take them all in before probing past the cap.
         thread::sleep(Duration::from_millis(300));
 
-        // One more must be turned away quickly — a Reject frame or an
-        // immediate close, NOT a 10-second handshake squat.
-        let extra = TcpStream::connect(addr).unwrap();
-        extra.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut reader = io::BufReader::new(extra.try_clone().unwrap());
-        let mut frame = Vec::new();
-        match protocol::read_frame(&mut reader, &mut frame) {
-            Ok(()) => match ServerMessage::decode(&frame) {
-                Some(ServerMessage::Reject { reason }) => {
-                    assert!(reason.contains("busy"), "unexpected reason: {reason}")
-                }
-                other => panic!("expected a busy rejection, got {other:?}"),
-            },
-            Err(e) => assert_ne!(
-                e.kind(),
-                io::ErrorKind::WouldBlock,
-                "over-cap connection was left squatting instead of refused"
-            ),
-        }
+        // One more must be turned away promptly (a QUIC refusal), not left squatting.
+        assert!(
+            Connection::connect("127.0.0.1", addr.port(), "extra", "").is_err(),
+            "a connection past the handshake cap must be refused"
+        );
 
         // Freeing the squatters must free their slots for a real player.
         drop(squatters);
+        drop(squat_ep);
+        drop(squat_rt);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match Connection::connect("127.0.0.1", addr.port(), "late", "") {

@@ -1,36 +1,37 @@
-//! The client side of multiplayer: a [`Connection`] the [`Game`](crate::game) owns
-//! while playing on a server. It hides the socket behind a small, poll-based API —
-//! the game hands it the local player each frame, drains the events it needs to act
-//! on (world edits and chat), and reads the peer table to draw everyone else.
-//!
-//! A background thread does the blocking reads and feeds a channel, so the render
-//! loop never stalls on the network. Sends happen inline from the game thread (they
-//! are tiny and infrequent). Position sends are throttled and heartbeat so a
-//! standing-still player still proves they are alive without spamming the wire.
-use std::collections::HashMap;
-use std::io;
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+//! The client side of multiplayer: a [`Connection`] the [`Game`](crate::game)
+//! owns while playing on a server, hiding the socket behind a small poll-based
+//! API. A background thread does the blocking reads and feeds a channel, so
+//! the render loop never stalls on the network. Sends happen inline from the
+//! game thread (tiny and infrequent). Position sends are throttled and
+//! heartbeat so a standing-still player still proves they are alive.
+use std::collections::{HashMap, VecDeque};
+use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use quinn::{Endpoint, SendStream};
+use tokio::runtime::Runtime;
 use voxel_engine::DVec3;
 
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
-use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION};
+use crate::net::{MAX_CHAT, MAX_SPEC, MAX_VOICE_PAYLOAD, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
 
-/// How long to wait for the initial TCP connect and the server's `Welcome`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Fastest cadence position updates are sent at (~30 Hz), even while moving.
 const MOVE_INTERVAL: Duration = Duration::from_millis(33);
-/// A move is sent at least this often even when standing still, as a heartbeat so
-/// the server's idle timeout never reaps an active-but-idle player.
+/// So the server's idle timeout never reaps an active-but-idle player.
 const HEARTBEAT: Duration = Duration::from_secs(1);
-/// How often a latency probe is sent while connected.
 const PING_INTERVAL: Duration = Duration::from_secs(2);
+/// Voice is loss-tolerant, so an overrun drops the OLDEST frame rather than
+/// blocking or growing — stale audio is worthless.
+const VOICE_RING_CAP: usize = 64;
 
-/// One network state of a peer, snapshotted so we can interpolate between two.
+/// `(speaker id, epoch, seq, opus payload)`.
+type VoiceFrame = (u32, u32, u32, Vec<u8>);
+
+/// Snapshotted so we can interpolate between two.
 #[derive(Clone, Copy)]
 struct Snapshot {
     pos: DVec3,
@@ -39,16 +40,15 @@ struct Snapshot {
     stance: Stance,
 }
 
-/// Another player as this client last heard about them, with just enough motion
-/// history to interpolate smoothly and drive a walk cycle.
 pub struct RemotePlayer {
+    /// Also the audio runtime's voice `SessionKey`. Kept on the value so
+    /// [`peers`](Connection::peers) (which drops the map key) still carries it.
+    id: u32,
     pub name: String,
-    /// Animation state for this peer.
     pub anim: presence::Animator,
-    /// Whether this peer is inside interest range with a real pose. Joins
-    /// start hidden (the roster carries names, not positions); the first
-    /// `PeerMove` reveals them and `PeerExited` hides them again — so a peer
-    /// who wandered off is not drawn frozen at their last heard pose.
+    /// Joins start hidden (the roster carries names, not positions); the
+    /// first `PeerMove` reveals them and `PeerExited` hides them again — so a
+    /// peer who wandered off isn't drawn frozen at their last heard pose.
     visible: bool,
     prev: Snapshot,
     target: Snapshot,
@@ -58,14 +58,15 @@ pub struct RemotePlayer {
 }
 
 impl RemotePlayer {
-    /// Whether this peer should be drawn (see the `visible` field).
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
     pub fn visible(&self) -> bool {
         self.visible
     }
 }
 
-/// Sampled render state at a point in time: an interpolated pose plus the derived
-/// horizontal speed and gait phase.
 pub struct Rendered {
     /// The peer's eye position; drop to [`Feet`](presence::Feet) via
     /// [`Eye::feet`](presence::Eye::feet) with `stance` before rendering.
@@ -122,40 +123,42 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
     a + delta * t
 }
 
-/// Something from the server the game must act on. Peer presence and movement are
-/// applied inside [`Connection::poll`]; these are what the game still has to handle.
+/// Peer presence and movement are applied inside [`Connection::poll`]; these
+/// are what the game still has to handle.
 pub enum Incoming {
-    /// A block changed somewhere — apply it to the local world overlay. Stale
-    /// revisions were already filtered out by the connection.
+    /// Stale revisions were already filtered out by the connection.
     Edit { x: i32, y: i32, z: i32, spec: String },
     /// The server accepted our own edit `req`: prediction can forget it.
     EditAccepted { req: u32 },
-    /// The server rejected our own edit `req`: roll the optimistic economy
-    /// back, and — when `restore` is set (no newer authoritative content has
-    /// landed on the cell since) — restore the cell to what it held before
-    /// the optimistic apply.
+    /// `restore` is set when no newer authoritative content has landed on the
+    /// cell since, so the optimistic apply should roll back.
     EditRejected { req: u32, restore: bool },
-    /// The server's authoritative position for us (refused teleport,
-    /// implausible movement): snap to it.
     Position { pos: DVec3 },
-    /// A chat line to show in the console.
     Chat { from_name: String, channel: u8, text: String },
-    /// A player joined the server.
     Joined { name: String },
-    /// A player left the server.
     Left { name: String },
-    /// The shared world time changed; `day` is a `[0,1)` fraction and
-    /// `day_secs` the server's cycle length in real seconds.
+    /// Surfaced so the game can react (audio) beyond the local animator
+    /// update already applied in `apply()`.
+    PeerSwing { id: u32 },
     Time { day: f32, day_secs: f32 },
-    /// The server dropped us; the game should leave the world.
     Disconnected,
 }
 
-/// A live connection to a server. Dropping it closes the socket, which ends the
-/// reader thread and signals the server that this player left.
+/// Dropping it closes the QUIC connection, which ends the reader thread and
+/// signals the server that this player left.
 pub struct Connection {
-    stream: TcpStream,
+    conn: quinn::Connection,
+    send: SendStream,
+    /// Not needed to keep the connection alive (quinn's driver self-sustains
+    /// while a connection is open), but required at [`Drop`] to `wait_idle` —
+    /// flushing the close frame before the runtime is torn down.
+    endpoint: Endpoint,
+    rt: Arc<Runtime>,
     inbox: Receiver<ServerMessage>,
+    /// Kept OUT of `inbox`: voice must not share the reliable, ordered event
+    /// channel. `Arc<Mutex<VecDeque>>` rather than a second `mpsc` because std
+    /// channels are unbounded and can't drop-oldest — the bound is the point.
+    voice_in: Arc<Mutex<VecDeque<VoiceFrame>>>,
     player_id: u32,
     seed: i64,
     spawn: DVec3,
@@ -178,9 +181,8 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Dial `host:port`, authenticate with `name`/`password`, and return the ready
-    /// connection once the server's `Welcome` arrives. `Err` carries a human-readable
-    /// reason (bad address, refused, wrong password, version mismatch).
+    /// `Err` carries a human-readable reason (bad address, refused, wrong
+    /// password, version mismatch).
     pub fn connect(host: &str, port: u16, name: &str, password: &str) -> Result<Self, String> {
         let addr = (host, port)
             .to_socket_addrs()
@@ -188,37 +190,65 @@ impl Connection {
             .next()
             .ok_or_else(|| "address resolved to nothing".to_string())?;
 
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-            .map_err(|e| format!("could not reach {addr}: {e}"))?;
-        stream.set_nodelay(true).ok();
+        let rt = Arc::new(Runtime::new().map_err(|e| format!("runtime: {e}"))?);
+        quic::install_crypto();
+        let mut endpoint = {
+            // Must run inside the runtime: construction spawns quinn's UDP driver.
+            let _guard = rt.enter();
+            Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())
+                .map_err(|e| format!("endpoint: {e}"))?
+        };
+        endpoint.set_default_client_config(quic::client_config());
 
-        // Send the handshake and wait, briefly, for the reply.
+        let conn = rt.block_on(async {
+            let connecting = endpoint.connect(addr, "watt").map_err(|e| e.to_string())?;
+            tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                .await
+                .map_err(|_| "connect timed out".to_string())?
+                .map_err(|e| format!("could not reach {addr}: {e}"))
+        })?;
+        let (mut send, mut recv) =
+            rt.block_on(conn.open_bi()).map_err(|e| format!("stream: {e}"))?;
+
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
             fingerprint: crate::net::content_fingerprint(),
             name: name.to_string(),
             password: password.to_string(),
         };
-        write(&stream, &hello).map_err(|e| format!("send failed: {e}"))?;
+        rt.block_on(protocol::write_frame_async(&mut send, &hello.encode()))
+            .map_err(|e| format!("send failed: {e}"))?;
 
-        stream.set_read_timeout(Some(CONNECT_TIMEOUT)).ok();
-        // Buffered so a frame costs one buffered read, not two syscalls; the scratch
-        // Vec is reused across frames so the reader loop never allocates per frame.
-        let mut reader = io::BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        // The scratch Vec is reused across frames so the reader loop never allocates.
         let mut frame = Vec::new();
-        protocol::read_frame(&mut reader, &mut frame).map_err(|e| format!("no reply: {e}"))?;
+        rt.block_on(async {
+            tokio::time::timeout(CONNECT_TIMEOUT, protocol::read_frame_async(&mut recv, &mut frame))
+                .await
+                .map_err(|_| "no reply: timed out".to_string())?
+                .map_err(|e| format!("no reply: {e}"))
+        })?;
         let (player_id, seed, spawn) = match ServerMessage::decode(&frame) {
             Some(ServerMessage::Welcome { player_id, seed, spawn }) => (player_id, seed, spawn),
             Some(ServerMessage::Reject { reason }) => return Err(reason),
             _ => return Err("unexpected reply from server".to_string()),
         };
 
-        // Handshake done: reads now block indefinitely on the background thread.
-        stream.set_read_timeout(None).ok();
         let (tx, inbox) = mpsc::channel();
+        let voice_in: Arc<Mutex<VecDeque<VoiceFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let voice_reader = voice_in.clone();
+        let reader_rt = rt.clone();
         thread::spawn(move || {
-            while protocol::read_frame(&mut reader, &mut frame).is_ok() {
+            while reader_rt.block_on(protocol::read_frame_async(&mut recv, &mut frame)).is_ok() {
                 match ServerMessage::decode(&frame) {
+                    // A hung-up game side stops draining but voice just rolls
+                    // over; the connection close ends the loop.
+                    Some(ServerMessage::PeerVoice { id, epoch, seq, payload }) => {
+                        let mut ring = voice_reader.lock().unwrap_or_else(PoisonError::into_inner);
+                        if ring.len() >= VOICE_RING_CAP {
+                            ring.pop_front();
+                        }
+                        ring.push_back((id, epoch, seq, payload));
+                    }
                     Some(msg) => {
                         if tx.send(msg).is_err() {
                             break; // The game side hung up.
@@ -230,8 +260,12 @@ impl Connection {
         });
 
         Ok(Self {
-            stream,
+            conn,
+            send,
+            endpoint,
+            rt,
             inbox,
+            voice_in,
             player_id,
             seed,
             spawn,
@@ -248,40 +282,31 @@ impl Connection {
         })
     }
 
-    /// The world seed to generate terrain from.
     pub fn seed(&self) -> i64 {
         self.seed
     }
-    /// Where the server placed this player.
     pub fn spawn(&self) -> DVec3 {
         self.spawn
     }
-    /// This player's server-assigned id.
     pub fn player_id(&self) -> u32 {
         self.player_id
     }
-    /// Whether the connection is still up.
     pub fn is_alive(&self) -> bool {
         self.alive
     }
-    /// The other players currently known, for rendering.
     pub fn peers(&self) -> impl Iterator<Item = &RemotePlayer> {
         self.peers.values()
     }
-    /// Mutable peer access for stepping animation each frame.
     pub fn peers_mut(&mut self) -> impl Iterator<Item = &mut RemotePlayer> {
         self.peers.values_mut()
     }
-    /// Last measured round trip to the server, if a pong has arrived yet.
     pub fn ping_ms(&self) -> Option<u32> {
         self.ping_ms
     }
 
-    /// Drain everything the server has said since the last frame. Peer join/leave/
-    /// move is applied to the local table here; edits and chat are returned for the
-    /// game to handle.
+    /// Peer join/leave/move is applied to the local table here; edits and
+    /// chat are returned for the game to handle.
     pub fn poll(&mut self) -> Vec<Incoming> {
-        // Periodic latency probe.
         let due = match self.ping_sent {
             None => true,
             Some((_, at)) => at.elapsed() >= PING_INTERVAL,
@@ -310,7 +335,6 @@ impl Connection {
         out
     }
 
-    /// Fold one server message into the peer table or the game's event list.
     fn apply(&mut self, msg: ServerMessage, out: &mut Vec<Incoming>) {
         match msg {
             ServerMessage::Snapshot { edits } => {
@@ -359,6 +383,7 @@ impl Connection {
                     Snapshot { pos: self.spawn, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
                 out.push(Incoming::Joined { name: name.clone() });
                 self.peers.entry(id).or_insert(RemotePlayer {
+                    id,
                     name,
                     anim: presence::Animator::default(),
                     visible: false,
@@ -402,6 +427,7 @@ impl Connection {
                 if let Some(p) = self.peers.get_mut(&id) {
                     p.anim.on_action(WireAction::Swing);
                 }
+                out.push(Incoming::PeerSwing { id });
             }
             ServerMessage::Pong { nonce } => {
                 if let Some((sent_nonce, at)) = self.ping_sent {
@@ -416,11 +442,15 @@ impl Connection {
             }
             // A second Welcome is meaningless mid-session.
             ServerMessage::Welcome { .. } => {}
+            // Voice never reaches here: the reader thread routes PeerVoice into
+            // the dedicated ring (see `connect`), not the `inbox` this drains.
+            // The arm exists only to keep the match exhaustive.
+            ServerMessage::PeerVoice { .. } => {}
         }
     }
 
-    /// Report the local player's state, throttled and heartbeat. Cheap to call every
-    /// frame; it only actually sends on the movement cadence or the heartbeat.
+    /// Cheap to call every frame; it only actually sends on the movement
+    /// cadence or the heartbeat.
     pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
         if !self.alive {
             return;
@@ -436,28 +466,23 @@ impl Connection {
         self.dispatch(&ClientMessage::Move { pos, yaw, pitch, stance });
     }
 
-    /// Tell the server about an explicit `/tp` discontinuity. Ordinary moves
-    /// are envelope-checked server-side; this is the sanctioned jump, which
-    /// the server may still refuse with a [`Incoming::Position`] snap-back.
+    /// Ordinary moves are envelope-checked server-side; this is the sanctioned
+    /// jump, which the server may still refuse with an [`Incoming::Position`]
+    /// snap-back.
     pub fn send_teleport(&mut self, pos: DVec3) {
-        // Reset the move throttle memory so the next `send_move` reports the
-        // post-teleport position promptly.
+        // So the next `send_move` reports the post-teleport position promptly.
         self.last_sent = None;
         self.dispatch(&ClientMessage::Teleport { pos });
     }
 
-    /// Tell the server the player swung their arm (block break/place), so
-    /// nearby avatars animate it.
     pub fn send_swing(&mut self) {
         self.dispatch(&ClientMessage::Swing);
     }
 
-    /// Tell the server about a block the player changed. Returns the request
-    /// id the eventual [`Incoming::EditAccepted`]/[`Incoming::EditRejected`]
-    /// verdict will carry — the game keys its rollback bookkeeping on it.
-    /// The expected revision counts our own in-flight edits on the cell, so a
-    /// quick break-then-place chain lines up with the revisions its earlier
-    /// requests will commit.
+    /// Returns the request id the eventual [`Incoming::EditAccepted`]/
+    /// [`Incoming::EditRejected`] verdict will carry. The expected revision
+    /// counts our own in-flight edits on the cell, so a quick break-then-place
+    /// chain lines up with the revisions its earlier requests will commit.
     pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: String) -> u32 {
         let cell = (x, y, z);
         let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
@@ -473,20 +498,38 @@ impl Connection {
         req
     }
 
-    /// Send a chat line on the given channel.
+    /// `seq` orders the local stream for the receiver's jitter buffer. Not
+    /// throttled — capture already paces frames. An over-cap payload is
+    /// dropped rather than sent; capture never produces one.
+    pub fn send_voice(&mut self, seq: u32, payload: &[u8]) {
+        if payload.len() > MAX_VOICE_PAYLOAD {
+            return;
+        }
+        self.dispatch(&ClientMessage::Voice { seq, payload: payload.to_vec() });
+    }
+
+    /// Frames that overran the ring were already dropped (oldest first).
+    pub fn drain_voice(&mut self) -> Vec<VoiceFrame> {
+        self.voice_in.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect()
+    }
+
     pub fn send_chat(&mut self, channel: u8, text: String) {
         let text: String = text.chars().take(MAX_CHAT).collect();
         self.dispatch(&ClientMessage::Chat { channel, text });
     }
 
-    /// Tell the server the player set the world time (via `/time`).
     pub fn send_set_time(&mut self, day: f32) {
         self.dispatch(&ClientMessage::SetTime { day });
     }
 
-    /// Write one message, marking the connection dead if the socket errors.
+    /// Blocks the game thread on the client runtime — sends are tiny and
+    /// infrequent enough that this is fine.
     fn dispatch(&mut self, msg: &ClientMessage) {
-        if self.alive && write(&self.stream, msg).is_err() {
+        if !self.alive {
+            return;
+        }
+        let encoded = msg.encode();
+        if self.rt.block_on(protocol::write_frame_async(&mut self.send, &encoded)).is_err() {
             self.alive = false;
         }
     }
@@ -494,16 +537,19 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Closing the socket ends the reader thread and tells the server we left.
-        let _ = self.stream.shutdown(Shutdown::Both);
+        // Keep the runtime alive until quinn has actually sent the
+        // CONNECTION_CLOSE, so the server frees this player promptly instead
+        // of waiting out its idle timeout — otherwise the reader thread
+        // unblocks and drops the last runtime ref before the close frame goes
+        // out. Bounded so leaving a world never hitches for long.
+        self.conn.close(0u32.into(), b"bye");
+        // `wait_idle` drives the endpoint driver until the close frame is
+        // actually sent (unlike `closed()`, which resolves before transmit).
+        let endpoint = self.endpoint.clone();
+        let _ = self
+            .rt
+            .block_on(async move { tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await });
     }
-}
-
-/// Frame and write one client message to the stream (usable from a shared borrow,
-/// since `&TcpStream` implements `Write`).
-fn write(stream: &TcpStream, msg: &ClientMessage) -> io::Result<()> {
-    let mut w = stream;
-    protocol::write_frame(&mut w, &msg.encode())
 }
 
 #[cfg(test)]
@@ -566,7 +612,7 @@ mod tests {
         handle.stop();
     }
 
-    /// G-01 end to end: two clients race a break on ONE cell. Exactly one is
+    /// End-to-end: two clients race a break on ONE cell. Exactly one is
     /// accepted; the other is rejected (its rollback signal) and converges on
     /// the winner's authoritative edit.
     #[test]

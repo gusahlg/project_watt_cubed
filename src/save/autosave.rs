@@ -1,23 +1,28 @@
 //! Periodic autosave with dirty tracking.
 //!
 //! Serialization on caller's thread keeps I/O off render; `in_flight` ensures
-//! at most one pending write to prevent races.
+//! at most one pending write to prevent races. The *how often* — the interval
+//! throttle — is not here: it rides the scheduler's frame clock as an interval
+//! gate (`sched::Scheduler::register_interval`), so no wall-clock `Instant`
+//! timer is hand-rolled in this lane.
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::slot::{SaveError, SlotId};
 use super::store;
 
+/// How often the world is autosaved when dirty. Consumed by the scheduler's
+/// interval gate (registered per world by `Game::new`), not by any timer here.
+pub const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct Autosaver {
-    interval: Duration,
     /// Last generation successfully written.
     saved_gen: u64,
     /// Generation handed to the writer thread, promoted on success.
     pending_gen: u64,
     in_flight: bool,
-    last_attempt: Instant,
     tx: mpsc::Sender<(SlotId, Vec<u8>)>,
     rx: mpsc::Receiver<std::io::Result<()>>,
 }
@@ -31,7 +36,7 @@ pub enum Tick {
 }
 
 impl Autosaver {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new() -> Self {
         let (tx, job_rx) = mpsc::channel::<(SlotId, Vec<u8>)>();
         let (done_tx, rx) = mpsc::channel();
         thread::Builder::new()
@@ -43,31 +48,18 @@ impl Autosaver {
                 }
             })
             .expect("spawn autosave thread");
-        Self {
-            interval,
-            saved_gen: 0,
-            pending_gen: 0,
-            in_flight: false,
-            last_attempt: Instant::now(),
-            tx,
-            rx,
-        }
+        Self { saved_gen: 0, pending_gen: 0, in_flight: false, tx, rx }
     }
 
     /// Note a freshly loaded/created world so its current state doesn't count
     /// as dirty.
     pub fn reset(&mut self, generation: u64) {
         self.saved_gen = generation;
-        self.last_attempt = Instant::now();
     }
 
-    /// Call once per frame. `encode` runs only when a write is actually due.
-    pub fn tick(
-        &mut self,
-        id: &SlotId,
-        generation: u64,
-        encode: impl FnOnce() -> Result<Vec<u8>, SaveError>,
-    ) -> Tick {
+    /// Poll a completing background write. `Finished` once it lands; `Idle`
+    /// while a write is still in flight or none is. Call once per frame.
+    pub fn poll(&mut self) -> Tick {
         if self.in_flight {
             match self.rx.try_recv() {
                 Ok(result) => {
@@ -80,10 +72,26 @@ impl Autosaver {
                 Err(_) => return Tick::Idle,
             }
         }
-        if generation == self.saved_gen || self.last_attempt.elapsed() < self.interval {
-            return Tick::Idle;
-        }
-        self.last_attempt = Instant::now();
+        Tick::Idle
+    }
+
+    /// A new write is warranted iff the world advanced past what's saved and no
+    /// write is already in flight (the artifact mutex — at most one pending
+    /// write). The scheduler's interval gate throttles how often the caller
+    /// acts on this.
+    pub fn wants_write(&self, generation: u64) -> bool {
+        !self.in_flight && generation != self.saved_gen
+    }
+
+    /// Encode on the caller's thread and hand the bytes to the writer. The
+    /// caller must have checked [`Self::wants_write`] and the scheduler's
+    /// interval gate first.
+    pub fn start(
+        &mut self,
+        id: &SlotId,
+        generation: u64,
+        encode: impl FnOnce() -> Result<Vec<u8>, SaveError>,
+    ) -> Tick {
         let bytes = match encode() {
             Ok(bytes) => bytes,
             Err(e) => return Tick::Finished(Err(e)),
@@ -113,6 +121,12 @@ impl Autosaver {
         store::write(id, &encode()?)?;
         self.saved_gen = generation;
         Ok(())
+    }
+}
+
+impl Default for Autosaver {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -153,11 +167,13 @@ mod tests {
         let _ = fs::remove_file(format!("saves/{id}.save"));
         let _ = fs::remove_file(format!("saves/{id}.save.bak"));
 
-        let mut auto = Autosaver::new(Duration::ZERO);
-        assert!(matches!(auto.tick(&id, 0, bytes), Tick::Idle), "gen 0 is clean");
-        assert!(matches!(auto.tick(&id, 1, bytes), Tick::Started));
+        let mut auto = Autosaver::new();
+        assert!(!auto.wants_write(0), "gen 0 is clean");
+        assert!(auto.wants_write(1), "gen 1 is dirty");
+        assert!(matches!(auto.start(&id, 1, bytes), Tick::Started));
+        assert!(!auto.wants_write(1), "no second write while one is in flight");
         loop {
-            match auto.tick(&id, 1, bytes) {
+            match auto.poll() {
                 Tick::Finished(result) => {
                     result.unwrap();
                     break;
@@ -166,7 +182,7 @@ mod tests {
             }
         }
         assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
-        assert!(matches!(auto.tick(&id, 1, bytes), Tick::Idle), "gen 1 now saved");
+        assert!(!auto.wants_write(1), "gen 1 now saved");
 
         let _ = fs::remove_file(format!("saves/{id}.save"));
         let _ = fs::remove_file(format!("saves/{id}.save.bak"));
@@ -178,11 +194,11 @@ mod tests {
         let _ = fs::remove_file(format!("saves/{id}.save"));
         let _ = fs::remove_file(format!("saves/{id}.save.bak"));
 
-        let mut auto = Autosaver::new(Duration::ZERO);
-        assert!(matches!(auto.tick(&id, 1, bytes), Tick::Started));
+        let mut auto = Autosaver::new();
+        assert!(matches!(auto.start(&id, 1, bytes), Tick::Started));
         auto.flush_now(&id, 2, bytes).unwrap();
         assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
-        assert!(matches!(auto.tick(&id, 2, bytes), Tick::Idle), "gen 2 saved by flush");
+        assert!(!auto.wants_write(2), "gen 2 saved by flush");
 
         let _ = fs::remove_file(format!("saves/{id}.save"));
         let _ = fs::remove_file(format!("saves/{id}.save.bak"));

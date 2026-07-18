@@ -9,6 +9,8 @@
 //! at most one level deep (the common case). Stand-ins deeper than one level
 //! (during initial load) are drawn whole; overlap is arbitrated by depth bias.
 
+use crate::ident::Detail;
+
 use super::metric::EyeMetric;
 use super::pyramid::PyramidCfg;
 use super::section::{Quadrant, SectionPos};
@@ -61,7 +63,7 @@ impl CoverCut {
                 debug_assert!(!mask.is_empty(), "empty-mask entry {p:?} survived the prune");
                 for q in mask.iter() {
                     debug_assert!(
-                        p.detail == 0 || !area_covered(p.child(q), &map),
+                        p.detail.0 == 0 || !area_covered(p.child(q), &map),
                         "drawn quadrant {q:?} of {p:?} is already tiled by finer cells"
                     );
                 }
@@ -90,7 +92,7 @@ pub(in crate::world) fn desired_sections(eye: &EyeMetric, cfg: &PyramidCfg) -> V
     let mut out = Vec::new();
     let (ax, az) = eye.anchor();
     for (ring, lod) in cfg.active_lods().enumerate() {
-        let detail = lod.0;
+        let detail = lod;
         let span = SectionPos { detail, x: 0, z: 0 }.span();
         // Test membership against the full 3D range (including eye altitude).
         // XZ projection skips bands wholly overhead and bounds the grid sweep.
@@ -131,10 +133,10 @@ pub(in crate::world) fn coarsen_by_error(
     // One detail level per pass to keep merges order-independent. Adjacent bands
     // can overlap (a cell and its parent both present), so level-by-level ensures
     // each pass is deterministic, with newly-formed parents reconsidered at the next level.
-    for target in (cfg.finest.0 + 1)..=cfg.coarsest() {
+    for target in (cfg.finest.0 + 1)..=cfg.coarsest().0 {
         let mut kids: FastMap<SectionPos, u8> = FastMap::default();
         for &c in &set {
-            if c.detail == target - 1 {
+            if c.detail.0 == target - 1 {
                 *kids.entry(c.parent()).or_insert(0) += 1;
             }
         }
@@ -176,7 +178,7 @@ pub(in crate::world) fn union_frontiers(a: Vec<SectionPos>, b: Vec<SectionPos>) 
 /// if no ancestor up the tree is loaded yet (transient during progressive load).
 pub(in crate::world) fn drawable_cover(
     cell: SectionPos,
-    max_detail: u8,
+    max_detail: Detail,
     ready: &impl Fn(SectionPos) -> bool,
 ) -> Option<SectionPos> {
     let mut c = cell;
@@ -198,7 +200,7 @@ pub(in crate::world) fn drawable_cover(
 /// tiled by finer cells (recursive check via [`area_covered`]).
 pub(in crate::world) fn resolve_covering(
     desired: &[SectionPos],
-    max_detail: u8,
+    max_detail: Detail,
     ready: &impl Fn(SectionPos) -> bool,
 ) -> CoverCut {
     let mut draw: FastMap<SectionPos, QuadrantMask> = FastMap::default();
@@ -219,7 +221,7 @@ pub(in crate::world) fn resolve_covering(
     let mut out = Vec::with_capacity(draw.len());
     for (&p, &mask) in &draw {
         let mut m = mask;
-        if p.detail > 0 {
+        if p.detail.0 > 0 {
             for q in Quadrant::ALL {
                 if m.contains(q) && area_covered(p.child(q), &draw) {
                     m.remove(q);
@@ -240,7 +242,7 @@ fn area_covered(cell: SectionPos, draw: &FastMap<SectionPos, QuadrantMask>) -> b
     if m == QuadrantMask::ALL {
         return true;
     }
-    if cell.detail == 0 {
+    if cell.detail.0 == 0 {
         return false;
     }
     Quadrant::ALL.into_iter().all(|q| m.contains(q) || area_covered(cell.child(q), draw))
@@ -249,7 +251,6 @@ fn area_covered(cell: SectionPos, draw: &FastMap<SectionPos, QuadrantMask>) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::lod::Lod;
     use crate::world::metric::{DyCap, EyeDist, EyeMetric, HeightEnvelope};
     use crate::world::pyramid::{self, LodChoice};
     use crate::world::section::FINEST_DETAIL;
@@ -308,7 +309,7 @@ mod tests {
         }
         let mut out = Vec::new();
         for (ring, lod) in cfg.active_lods().enumerate() {
-            let detail = lod.0;
+            let detail = lod;
             let span = SectionPos { detail, x: 0, z: 0 }.span();
             let (lo, hi) = band_radii(ring, cfg);
             let outer = if hi.is_finite() { hi } else { cfg.outer_m() };
@@ -362,14 +363,14 @@ mod tests {
         for c in &desired {
             assert!(c.detail >= FINEST_DETAIL, "never finer than the finest section");
             assert!(c.detail <= cfg.coarsest(), "never coarser than the horizon (root excluded)");
-            let ring = (c.detail - cfg.finest.0) as usize;
+            let ring = (c.detail.0 - cfg.finest.0) as usize;
             let (lo, hi) = band_radii(ring, &cfg);
             let r = eye(0, 0, &cfg).range(*c);
             assert!(r.near().get() < hi && r.far().get() >= lo, "desired cell {c:?} intersects its band");
         }
         for r in (cfg.unit as i32)..(cfg.outer_m() as i32) {
             let want_detail = match pyramid::level_for(EyeDist::new(r as f32), &cfg) {
-                LodChoice::Level(l) => l.0,
+                LodChoice::Level(l) => l,
                 _ => continue,
             };
             let covered = desired.iter().any(|c| {
@@ -377,10 +378,10 @@ mod tests {
                     && (c.min_x()..c.min_x() + c.span()).contains(&r)
                     && (c.min_z()..c.min_z() + c.span()).contains(&0)
             });
-            assert!(covered, "distance {r} (detail {want_detail}) has a desired section on the +X ray");
+            assert!(covered, "distance {r} (detail {want_detail:?}) has a desired section on the +X ray");
         }
         for &(dx, dz) in &[(1i32, 0i32), (0, 1), (1, 1), (-1, 2)] {
-            let mut coarsest_seen = 0u8;
+            let mut coarsest_seen = 0i8;
             for step in 0..400 {
                 let (pcx, pcz) = (dx * step * 8, dz * step * 8);
                 if let LodChoice::Level(l) =
@@ -415,14 +416,14 @@ mod tests {
             assert!(!mask.is_empty(), "an empty-mask entry survived the prune");
             for q in mask.iter() {
                 assert!(
-                    p.detail == 0 || drawn.get(&p.child(q)) != Some(&QuadrantMask::ALL),
+                    p.detail.0 == 0 || drawn.get(&p.child(q)) != Some(&QuadrantMask::ALL),
                     "parent {p:?} draws quadrant {q:?} whose child is already drawn ALL"
                 );
             }
         }
 
         let coarse = cfg.coarsest();
-        let coarse_only = move |p: SectionPos| p.detail >= coarse - 1;
+        let coarse_only = move |p: SectionPos| p.detail.0 >= coarse.0 - 1;
         for &cell in &desired {
             assert!(
                 drawable_cover(cell, max, &coarse_only).is_some(),
@@ -434,12 +435,12 @@ mod tests {
     /// One-level stand-in with three ready siblings yields exact partition.
     #[test]
     fn one_missing_child_yields_an_exact_partition() {
-        let parent = SectionPos { detail: FINEST_DETAIL + 2, x: 3, z: -2 };
+        let parent = SectionPos { detail: Detail(FINEST_DETAIL.0 + 2), x: 3, z: -2 };
         let missing_q = q(2);
         let children: [SectionPos; 4] = std::array::from_fn(|i| parent.child(q(i as u8)));
         let ready = move |p: SectionPos| p == parent || (children.contains(&p) && p != parent.child(missing_q));
 
-        let draw = resolve_covering(&children, FINEST_DETAIL + 2, &ready);
+        let draw = resolve_covering(&children, Detail(FINEST_DETAIL.0 + 2), &ready);
         let map: FastMap<SectionPos, QuadrantMask> = draw.iter().copied().collect();
 
         let mut want_parent = QuadrantMask::EMPTY;
@@ -457,7 +458,7 @@ mod tests {
         for &(p, mask) in draw.iter() {
             for qi in mask.iter() {
                 let c = p.child(qi);
-                let span = 1i32 << (c.detail - FINEST_DETAIL);
+                let span = 1i32 << (c.detail.0 - FINEST_DETAIL.0);
                 for dx in 0..span {
                     for dz in 0..span {
                         *covers.entry((c.x * span + dx, c.z * span + dz)).or_insert(0) += 1;
@@ -467,14 +468,14 @@ mod tests {
         }
         assert!(covers.values().all(|&n| n == 1), "every finest cell is drawn exactly once (no overlap, no hole)");
         // The covered footprint is exactly the parent's area: (2^(parent-finest))² finest cells.
-        let parent_span = 1i32 << (parent.detail - FINEST_DETAIL);
+        let parent_span = 1i32 << (parent.detail.0 - FINEST_DETAIL.0);
         assert_eq!(covers.len() as i32, parent_span * parent_span);
     }
 
     /// Coarse cells pruned even against partially drawn children, avoiding overlay.
     #[test]
     fn coarse_overlay_prunes_against_partially_drawn_children() {
-        let g = SectionPos { detail: FINEST_DETAIL + 2, x: 1, z: 1 };
+        let g = SectionPos { detail: Detail(FINEST_DETAIL.0 + 2), x: 1, z: 1 };
         let c = g.child(q(1)); // partially drawn: one of its own children is missing
         let missing = c.child(q(3));
         let mut desired: Vec<SectionPos> = vec![g];
@@ -482,7 +483,7 @@ mod tests {
         desired.extend(Quadrant::ALL.into_iter().filter(|&qi| g.child(qi) != c).map(|qi| g.child(qi)));
         let ready = move |p: SectionPos| p != missing;
 
-        let draw = resolve_covering(&desired, FINEST_DETAIL + 2, &ready);
+        let draw = resolve_covering(&desired, Detail(FINEST_DETAIL.0 + 2), &ready);
         let map: FastMap<SectionPos, QuadrantMask> = draw.iter().copied().collect();
         assert!(!map.contains_key(&g), "coarse cell fully tiled by finer draws is pruned");
         let mut want_c = QuadrantMask::EMPTY;
@@ -492,11 +493,11 @@ mod tests {
         // Exact partition over g's whole footprint at finest granularity.
         let mut covers: std::collections::HashMap<(i32, i32), u32> = Default::default();
         // Use FINEST_DETAIL - 1 base to avoid exponent underflow.
-        const BASE: u8 = FINEST_DETAIL - 1;
+        const BASE: i8 = FINEST_DETAIL.0 - 1;
         for &(p, mask) in draw.iter() {
             for qi in mask.iter() {
                 let cell = p.child(qi);
-                let span = 1i32 << (cell.detail - BASE);
+                let span = 1i32 << (cell.detail.0 - BASE);
                 for dx in 0..span {
                     for dz in 0..span {
                         *covers.entry((cell.x * span + dx, cell.z * span + dz)).or_insert(0) += 1;
@@ -505,7 +506,7 @@ mod tests {
             }
         }
         assert!(covers.values().all(|&n| n == 1), "no overlap, no double-draw");
-        let g_span = 1i32 << (g.detail - BASE);
+        let g_span = 1i32 << (g.detail.0 - BASE);
         assert_eq!(covers.len() as i32, g_span * g_span, "no hole across g's footprint");
     }
 
@@ -519,12 +520,12 @@ mod tests {
                 assert!(pyramid::acceptable(d, l, &cfg), "the band's own level is kept");
                 if l.0 > cfg.finest.0 {
                     assert!(
-                        pyramid::acceptable(d, Lod(l.0 - 1), &cfg),
+                        pyramid::acceptable(d, Detail(l.0 - 1), &cfg),
                         "one detail finer is kept (expected-1 hysteresis)"
                     );
                 }
                 assert!(
-                    !pyramid::acceptable(d, Lod(l.0 + 1), &cfg),
+                    !pyramid::acceptable(d, Detail(l.0 + 1), &cfg),
                     "one detail coarser is NOT acceptable"
                 );
             }
@@ -584,7 +585,7 @@ mod tests {
             let span = s.span();
             let (cx, cz) = (s.x * span + span / 2, s.z * span + span / 2);
             let kept = kept_above.contains(&s)
-                || pyramid::acceptable(above.point(cx as f64, cz as f64), Lod(s.detail), &cfg);
+                || pyramid::acceptable(above.point(cx as f64, cz as f64), s.detail, &cfg);
             assert!(kept, "a small climb unloaded {s:?} at the band edge (thrash)");
         }
     }
@@ -660,7 +661,7 @@ mod tests {
         CellSummary { env: HeightEnvelope::new(0.0, 0.0), err: CellError::from_metres(0.0) }
     }
     /// True if `coarser` tiles the same footprint with equal-or-coarser cells.
-    fn is_coarsening_of(finer: &[SectionPos], coarser: &HashSet<SectionPos>, max: u8) -> bool {
+    fn is_coarsening_of(finer: &[SectionPos], coarser: &HashSet<SectionPos>, max: Detail) -> bool {
         finer.iter().all(|&c| {
             let mut a = c;
             loop {
@@ -722,7 +723,7 @@ mod tests {
             CellSummary { env: HeightEnvelope::new(0.0, 512.0), err }
         };
         let desired = coarsen_by_error(desired_sections(&m, &cfg), &m, &cfg, &summary, &ladder(&cfg));
-        let details: HashSet<u8> = desired.iter().map(|c| c.detail).collect();
+        let details: HashSet<Detail> = desired.iter().map(|c| c.detail).collect();
         assert!(details.len() >= 2, "expected a mixed-detail cut, got {details:?}");
         let max = cfg.coarsest();
         let all_ready = |_p: SectionPos| true;
@@ -813,7 +814,7 @@ mod tests {
         let pred = desired_sections(&eye_at(0, 400.0, 0, &cfg), &cfg);
         let hi_finest = stat.iter().map(|c| c.detail).min().unwrap();
         let lo_finest = pred.iter().map(|c| c.detail).min().unwrap();
-        assert!(lo_finest < hi_finest, "descent didn't refine (hi {hi_finest}, lo {lo_finest})");
+        assert!(lo_finest < hi_finest, "descent didn't refine (hi {hi_finest:?}, lo {lo_finest:?})");
         let union = union_frontiers(stat, pred);
         assert!(union.iter().any(|c| c.detail == lo_finest), "finer descent cells missing from desire");
     }
@@ -883,7 +884,7 @@ mod tests {
         let cfg = cfg();
         let m = eye_at(700, 300.0, -400, &cfg);
         let desired = coarsen_by_error(desired_sections(&m, &cfg), &m, &cfg, &low_ground, &ladder(&cfg));
-        let details: HashSet<u8> = desired.iter().map(|c| c.detail).collect();
+        let details: HashSet<Detail> = desired.iter().map(|c| c.detail).collect();
         assert!(details.len() >= 2, "expected a mixed-detail cut from altitude, got {details:?}");
         let max = cfg.coarsest();
         let all_ready = |_p: SectionPos| true;

@@ -37,7 +37,7 @@ pub(crate) fn registry_block_spec(registry: &BlockRegistry, id: BlockId) -> Stri
             let names: Vec<String> = els.iter().map(|&e| elements.get(e).name.to_string()).collect();
             format!("natural:{}", names.join(","))
         }
-        Composition::Mixture(mix) | Composition::Configuration { mix, .. } => {
+        Composition::Mixture(mix) => {
             let parts: Vec<String> = mix
                 .parts()
                 .iter()
@@ -45,7 +45,6 @@ pub(crate) fn registry_block_spec(registry: &BlockRegistry, id: BlockId) -> Stri
                 .collect();
             format!("mixture:{}", parts.join(";"))
         }
-        Composition::Computational(_) => "air".to_string(), // not yet reconstructable
     }
 }
 
@@ -127,10 +126,9 @@ mod tests {
         }
     }
 
-    /// G-15's round-trip property: EVERY reconstructable registered block —
-    /// the full compiled worldgen palette plus crafted naturals and mixtures —
-    /// serializes to a spec that parses back to the SAME id. (Computational
-    /// blocks are excluded: not yet reconstructable by design.)
+    /// Round-trip property: EVERY registered block — the full compiled worldgen
+    /// palette plus crafted naturals and mixtures — serializes to a spec that
+    /// parses back to the SAME id.
     #[test]
     fn block_specs_round_trip_for_every_supported_composition() {
         let mut world = World::new(11);
@@ -146,9 +144,6 @@ mod tests {
 
         for i in 0..world.registry().block_count() {
             let id = BlockId(i as u16);
-            if matches!(world.registry().block(id).composition, Composition::Computational(_)) {
-                continue;
-            }
             let spec = block_spec(&world, id);
             assert_eq!(
                 parse_block(&mut world, &spec),
@@ -171,8 +166,8 @@ mod tests {
         world.set_block(bx, by, bz, AIR);
 
         let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
-        player.yaw = 0.5;
-        player.pitch = -0.25;
+        player.orientation.yaw = 0.5;
+        player.orientation.pitch = -0.25;
         player.set_flying(true);
 
         // Give the mods some state to persist (elements land in the inventory).
@@ -191,8 +186,8 @@ mod tests {
         assert_eq!(loaded_meta.name, "round trip");
         assert_eq!(loaded_meta.playtime_secs, 42);
         assert_eq!(loaded_player.position, DVec3::new(1.0, 2.0, 3.0));
-        assert_eq!(loaded_player.yaw, 0.5);
-        assert_eq!(loaded_player.pitch, -0.25);
+        assert_eq!(loaded_player.orientation.yaw, 0.5);
+        assert_eq!(loaded_player.orientation.pitch, -0.25);
         assert!(loaded_player.flying());
         assert_eq!(loaded_world.block_at(bx, by, bz), AIR, "broken block stays broken");
         assert_eq!(report.source, Source::Live);
@@ -214,8 +209,8 @@ mod tests {
         let world = World::new(77);
         let pos = DVec3::new(1.0e8 + 0.123456789, 61.5, -(1.0e9 - 42.25));
         let mut player = Player::new(pos);
-        player.yaw = 1.25;
-        player.pitch = -0.5;
+        player.orientation.yaw = 1.25;
+        player.orientation.pitch = -0.5;
         let mut mods = Mods::with_defaults();
         save(&id, &world, &player, &mods, meta("far")).unwrap();
 
@@ -223,8 +218,8 @@ mod tests {
         assert_eq!(loaded.position.x.to_bits(), pos.x.to_bits());
         assert_eq!(loaded.position.y.to_bits(), pos.y.to_bits());
         assert_eq!(loaded.position.z.to_bits(), pos.z.to_bits());
-        assert_eq!(loaded.yaw, 1.25);
-        assert_eq!(loaded.pitch, -0.5);
+        assert_eq!(loaded.orientation.yaw, 1.25);
+        assert_eq!(loaded.orientation.pitch, -0.5);
 
         cleanup(&id);
     }

@@ -137,8 +137,6 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::NeedsMesh { building: false }, eng);
         }
-        // Every drawn mesh is gone: the drawable set is empty until remeshes land.
-        self.draw_set_rev += 1;
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
         // stale hint (a raised `pending_dirty` would just scan an empty fiber).
         self.pending_dirty.take();
@@ -203,7 +201,7 @@ impl World {
             Some(id)
         };
         self.edit_generation += 1;
-        // Skylight ceiling upkeep (G-03): a roof appearing above a column's
+        // Skylight ceiling upkeep: a roof appearing above a column's
         // current ceiling raises it; the topmost edited roof disappearing
         // lowers it. Either way the cached window is stale, and every loaded
         // chunk at or below the edit seeds skylight from it — re-settle them
@@ -294,15 +292,19 @@ impl World {
         if !(0..super::section::DOMAIN_H).contains(&y) {
             return;
         }
-        let details: Vec<u8> = self.section_pyramid.active_lods().map(|l| l.0).collect();
+        let details: Vec<_> = self.section_pyramid.active_lods().collect();
         for detail in details {
-            let span = (super::section::SECTION_N as i32) << detail;
+            let span = super::section::section_span(detail);
             let pos = super::section::SectionPos {
                 detail,
                 x: x.div_euclid(span),
                 z: z.div_euclid(span),
             };
             self.dirty_sections.insert(pos);
+            // The heightmip edit overlay (streaming.rs `refresh_section_overlay`)
+            // keys its cache on this same per-section counter, so it re-derives
+            // exactly the cells this edit could have changed.
+            *self.section_edit_rev.entry(pos).or_insert(0) += 1;
         }
         self.pending_sections.set();
     }

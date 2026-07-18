@@ -114,7 +114,7 @@ pub(in crate::world) enum Job {
 /// A panicking job returns this in [`Done::Failed`] so the main thread can
 /// release the EXACT claim instead of leaving it stranded forever.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::world) enum JobKey {
+pub(crate) enum JobKey {
     Column { col: (i32, i32), cy: RangeInclusive<i32> },
     Mesh { coord: Coord },
     Light { coord: Coord },
@@ -268,26 +268,19 @@ impl Deadline {
     }
 }
 
-// All three tuned against time_to_first_full_render — the
-// values are a first cut, not measured optima. Chunk streaming gets the lion's
-// share; the far LOD ring and the light settle enqueue each get a slim slice so
-// a world-entry flood of either can't stall the chunk under the player.
-/// Per-frame admission budget for fresh chunk meshing (the [`MeshLane`] enqueue).
-pub const STREAM_BUDGET: Duration = Duration::from_millis(2);
-/// Per-frame admission budget for the cross-chunk light settle work. The
-/// *apply* drain in `streaming.rs` and the [`LightLane`] enqueue each mint their
-/// OWN window from this value (two loops, two windows — the per-frame light cost
-/// is their sum).
+/// Per-frame budget for the *apply* half of the light settle work — the
+/// `drain_results` loop that folds settled grids into chunks (`DrainLane`'s
+/// internal window). The *admit* half's budget now lives in the `light_admit`
+/// producer's manifest (one budget locus per lane); this remains its own window
+/// because it is a distinct loop in a distinct pass.
 pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(1);
-/// Per-frame admission budget for a far LOD lane (tiles and skins each mint one).
-pub const LOD_ENQUEUE_BUDGET: Duration = Duration::from_millis(1);
 
-// Each loop mints a FRESH `Deadline::from_budget(...)` at the instant it starts —
-// never one frame-start snapshot shared across lanes. The lanes run sequentially
+// Each admission producer mints a FRESH `Deadline::from_budget(...)` from its
+// scheduler-provided budget at the instant its `run()` starts — never one
+// frame-start snapshot shared across lanes. The lanes run sequentially
 // (drain → light → mesh → LOD), so a single anchored instant would leave every
 // lane after the first ~1 ms pre-expired and admitting nothing (world-entry
-// starvation: `MeshLane`/`LightLane` never drain). Budgets are admission caps,
-// so idle lanes still return immediately.
+// starvation). Budgets are admission caps, so idle lanes still return immediately.
 
 /// Far-queue cap. At the cap [`Workers::submit_far`] REJECTS
 /// the submit (returns `false`) and the lane simply does not claim the key, so
@@ -675,7 +668,7 @@ fn run(job: Job) -> Done {
         }
         Job::Section { pos, generator, edits, tables } => {
             // Pure CPU on owned data; reuses sync path.
-            let sec = Section::extract(pos, &generator, &edits);
+            let sec = Section::extract(pos, &generator, &edits, voxel_engine::Rev::START);
             let meshes = section::build_section_mesh(&sec, &tables);
             Done::Section { pos, meshes }
         }
@@ -699,7 +692,7 @@ mod tests {
     /// Create a far section job tagged by id for scheduler tests.
     fn section_job(terrain: &SineHills, id: i32) -> Job {
         Job::Section {
-            pos: SectionPos { detail: 2, x: id, z: 0 },
+            pos: SectionPos { detail: voxel_engine::Detail(2), x: id, z: 0 },
             generator: terrain.clone(),
             edits: Vec::new(),
             tables: Arc::new(BlockRegistry::with_builtins().hot_tables()),
@@ -763,13 +756,12 @@ mod tests {
         };
         let tables = Arc::new(registry.hot_tables());
         let padded = Padded::capture(at);
-        let light = PaddedLight::full();
 
         let mut expected = new_chunk_mesh_data();
-        mesh::build_chunk_mesh(&padded, None, &tables, &light, &mut expected);
+        mesh::build_chunk_mesh(&padded, None, &tables, &mut expected);
         // The neighbours must actually matter, or equality proves nothing.
         let mut unculled = new_chunk_mesh_data();
-        mesh::build_chunk_mesh(&Padded::capture(|dx, dy, dz| (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)), None, &tables, &light, &mut unculled);
+        mesh::build_chunk_mesh(&Padded::capture(|dx, dy, dz| (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)), None, &tables, &mut unculled);
         let index_count =
             |d: &ChunkMeshData| d[Pass::Opaque].buckets().iter().map(|b| b.len()).sum::<usize>();
         assert_ne!(index_count(&unculled), index_count(&expected), "border culling engaged");
@@ -976,7 +968,7 @@ mod tests {
             JobKey::Column { col: (3, -2), cy: 0..=2 },
             JobKey::Mesh { coord: Coord::new(1, 2, 3) },
             JobKey::Light { coord: Coord::new(-1, 0, 1) },
-            JobKey::Section { pos: SectionPos { detail: 2, x: 5, z: -5 } },
+            JobKey::Section { pos: SectionPos { detail: voxel_engine::Detail(2), x: 5, z: -5 } },
         ];
         for key in keys.clone() {
             assert!(workers.submit(Job::Panic(Box::new(key))));

@@ -93,9 +93,7 @@ pub trait TerrainGenerator {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The noise vocabulary.
-// ---------------------------------------------------------------------------
 
 /// Noise sample in [0, 1); prevents silent misuse with coordinates/heights.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
@@ -431,9 +429,7 @@ struct Column {
     humidity: Unit,
 }
 
-// ---------------------------------------------------------------------------
 // Value noise primitives. Uses f64 world coordinates for far-out stability.
-// ---------------------------------------------------------------------------
 
 fn lattice(seed: u64, x: i32, y: i32, z: i32) -> f32 {
     let h = seed
@@ -592,9 +588,7 @@ fn cell_hash(seed: i64, x: i32, y: i32, z: i32) -> u32 {
     (h >> 32) as u32
 }
 
-// ---------------------------------------------------------------------------
 // Tuning surface — the one place terrain flavour lives, as const data.
-// ---------------------------------------------------------------------------
 
 /// Islands start above sea; no water interaction.
 pub const ISLAND_MIN_Y: i32 = 112;
@@ -750,10 +744,8 @@ const ISLAND_KEEL_H: f32 = 22.0;
 const ISLAND_DETAIL_AMP: f32 = 0.30;
 const ISLAND_BAND_SPAN: i32 = 120;
 
-// ---------------------------------------------------------------------------
 // Terrain — the game's generator. `SineHills` kept as an alias so existing call
 // sites need no change.
-// ---------------------------------------------------------------------------
 
 /// Natural terrain — oceans, coasts, mountains, plains, rivers, and biomes —
 /// expressed as data over the noise vocabulary, plus the flying-island and cave
@@ -1149,9 +1141,8 @@ impl Terrain {
 impl TerrainGenerator for Terrain {
     /// The LOD/spawn surface height — the topmost *ground* cell's column value.
     /// Caves never carve the top [`CAVE_MIN_DEPTH`] cells, so the topmost ground
-    /// cell is always `height − 1`. Overhang shelves (S6) sit in the air *above*
-    /// this, so they never move the walkable ground surface LOD and spawn key
-    /// off — that stays the one column `height`.
+    /// cell is always `height − 1`. Overhang shelves sit in the air above the surface
+    /// and never move the walkable ground level; LOD and spawn key off the base height.
     fn height(&self, wx: i32, wz: i32) -> i32 {
         self.profile(wx, wz).height
     }
@@ -1427,7 +1418,7 @@ mod tests {
     #[test]
     fn bound_encloses_samples_both_sides() {
         // The interval bound must enclose every cell — lower AND upper — so a
-        // density built from it can decide `straddles(0)` soundly (D7).
+        // density built from it can decide `straddles(0)` soundly.
         let g = terrain(7);
         for (cx, cy, cz) in [(0, -3, 0), (2, -1, -5), (-4, -30, 6), (30_000_000, 4, -7)] {
             let (x0, y0, z0) = (cx * 16, cy * 16, cz * 16);

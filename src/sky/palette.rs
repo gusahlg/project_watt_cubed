@@ -226,10 +226,10 @@ impl Palette {
     }
 }
 
-/// Default palette: "New shoka", imported as LINEAR light (L10/L1 verdict: linear
-/// import + sigmoid tonemap beat PBR-Neutral and EOTF-decode). Changing the default
-/// look is a data edit here, nowhere else. Note the HDR horizon-day blue (1.3),
-/// which only survives because the sky path now carries linear f32 end-to-end (L9).
+/// Default palette: "New shoka", imported as LINEAR light.
+/// Sigmoid tonemap works well here. Changing the default look is a data edit here,
+/// nowhere else. Note the HDR horizon-day blue (1.3), which survives because
+/// the sky path carries linear f32 end-to-end.
 pub const NEW_SHOKA: Palette = Palette::new([
     [Rgb::linear(1.0, 0.588, 0.3555), Rgb::linear(0.90, 0.84, 0.79), Rgb::linear(0.048, 0.052, 0.061)],
     [Rgb::linear(0.143, 0.244, 0.365), Rgb::linear(0.143, 0.244, 0.365), Rgb::linear(0.014, 0.019, 0.025)],

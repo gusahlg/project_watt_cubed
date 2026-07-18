@@ -46,17 +46,14 @@ impl Local {
         (x < n && y < n && z < n).then_some(Self { x, y, z })
     }
 
-    /// Local X as `usize`, for [`Chunk::index`](crate::world::chunk::Chunk::index).
     #[inline]
     pub fn lx(self) -> usize {
         self.x as usize
     }
-    /// Local Y as `usize`.
     #[inline]
     pub fn ly(self) -> usize {
         self.y as usize
     }
-    /// Local Z as `usize`.
     #[inline]
     pub fn lz(self) -> usize {
         self.z as usize
@@ -69,7 +66,6 @@ impl BlockCoord {
         Self { x, y, z }
     }
 
-    /// Splits a world block coordinate into a chunk and its local position within that chunk.
     #[inline]
     pub fn split(self) -> (ChunkCoord, Local) {
         let s = CHUNK_SIZE as i32;
@@ -86,7 +82,6 @@ impl BlockCoord {
         (chunk, local)
     }
 
-    /// Reconstructs a world block coordinate from a chunk and local position.
     #[inline]
     pub fn join(c: ChunkCoord, l: Local) -> Self {
         let s = CHUNK_SIZE as i32;
@@ -121,20 +116,17 @@ impl ChunkCoord {
         (self.x, self.y, self.z)
     }
 
-    /// The neighbouring chunk across `face`: `(cx+dx, cy+dy, cz+dz)`.
     #[inline]
     pub fn step(self, face: Face) -> Self {
         let (dx, dy, dz) = face.delta();
         Self { x: self.x + dx, y: self.y + dy, z: self.z + dz }
     }
 
-    /// Horizontal distance to chunk `o` (max of x and z difference).
     #[inline]
     pub fn ring(self, o: ChunkCoord) -> i32 {
         (self.x - o.x).abs().max((self.z - o.z).abs())
     }
 
-    /// Vertical (chunk-layer) distance to `o`.
     #[inline]
     pub fn updown(self, o: ChunkCoord) -> i32 {
         (self.y - o.y).abs()
@@ -164,7 +156,6 @@ pub enum Face {
 }
 
 impl Face {
-    /// Every face in discriminant order.
     pub const ALL: [Face; 6] = [
         Face::NegX,
         Face::PosX,
@@ -174,7 +165,6 @@ impl Face {
         Face::PosY,
     ];
 
-    /// The offset `(dx, dy, dz)` for stepping to an adjacent chunk in this face direction.
     #[inline]
     pub const fn delta(self) -> (i32, i32, i32) {
         match self {
@@ -187,14 +177,11 @@ impl Face {
         }
     }
 
-    /// The opposing face.
     #[inline]
     pub const fn opposite(self) -> Face {
         Face::ALL[(self as usize) ^ 1]
     }
 
-    /// Whether a cell at local coord `l` sits on this face — i.e. an edit there
-    /// also changes the neighbour across this face.
     #[inline]
     pub fn touches(self, l: Local) -> bool {
         let edge = (CHUNK_SIZE - 1) as u8;
@@ -209,13 +196,9 @@ impl Face {
     }
 }
 
-/// A value per chunk face, keyed by [`Face`] instead of a loose plane index.
-/// `[T; 6]` indexed through `Index<Face>`, so slot `k` always belongs to
-/// `Face::ALL[k]`.
 pub struct ByFace<T>([T; 6]);
 
 impl<T> ByFace<T> {
-    /// Build one value per face, in [`Face::ALL`] order.
     #[inline]
     pub fn from_fn(f: impl FnMut(Face) -> T) -> Self {
         ByFace(Face::ALL.map(f))
@@ -247,27 +230,22 @@ impl<T> IndexMut<Face> for ByFace<T> {
 pub struct ByPass<T>([T; voxel_engine::Pass::COUNT]);
 
 impl<T> ByPass<T> {
-    /// Build one value per pass, in discriminant (= draw) order.
     #[inline]
     pub fn from_fn(mut f: impl FnMut(voxel_engine::Pass) -> T) -> Self {
         ByPass(voxel_engine::Pass::ALL.map(&mut f))
     }
-    /// Iterate `(pass, &value)` in pass order.
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (voxel_engine::Pass, &T)> {
         voxel_engine::Pass::ALL.into_iter().zip(self.0.iter())
     }
-    /// Mutably iterate `(pass, &mut value)` in pass order.
     #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (voxel_engine::Pass, &mut T)> {
         voxel_engine::Pass::ALL.into_iter().zip(self.0.iter_mut())
     }
-    /// Consume into `(pass, value)` pairs in pass order.
     #[inline]
     pub fn into_iter_passes(self) -> impl Iterator<Item = (voxel_engine::Pass, T)> {
         voxel_engine::Pass::ALL.into_iter().zip(self.0)
     }
-    /// Consume into the raw per-pass slots, in discriminant order.
     #[inline]
     pub fn into_slots(self) -> [T; voxel_engine::Pass::COUNT] {
         self.0
@@ -289,8 +267,6 @@ impl<T> IndexMut<voxel_engine::Pass> for ByPass<T> {
     }
 }
 
-/// A chunk-space box around `center` with horizontal radius `rh` and vertical radius `rv`.
-/// Represents "the region around the player" for membership tests and iteration.
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkBox {
     pub center: ChunkCoord,
@@ -304,7 +280,6 @@ impl ChunkBox {
         Self { center, rh, rv }
     }
 
-    /// Whether `c` lies within the box (inclusive on every axis).
     #[inline]
     pub fn contains(self, c: ChunkCoord) -> bool {
         c.ring(self.center) <= self.rh && c.updown(self.center) <= self.rv

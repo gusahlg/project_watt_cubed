@@ -9,9 +9,7 @@ use crate::session::Session;
 use crate::settings::{Category, MenuKind, SETTINGS};
 use crate::ui::EditBuf;
 
-// ---------------------------------------------------------------------------
 // Start menu.
-// ---------------------------------------------------------------------------
 
 /// The start menu: New World, one Load row per save, then Host/Join/Mods/
 /// Settings/Quit.
@@ -107,9 +105,7 @@ impl Menu for MainMenu {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Mods menu.
-// ---------------------------------------------------------------------------
 
 /// One toggle row per installed mod.
 pub struct ModsMenu;
@@ -145,9 +141,7 @@ impl Menu for ModsMenu {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Host / Join forms.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub enum HostAction {
@@ -307,9 +301,7 @@ impl Menu for JoinMenu {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Settings: a hub that pushes one page per category.
-// ---------------------------------------------------------------------------
 
 /// The settings hub: one row per [`Category`], each pushing its page.
 pub struct SettingsHub;
@@ -395,9 +387,7 @@ impl Menu for SettingsPage {
     }
 }
 
-// ---------------------------------------------------------------------------
 // A generic yes/no dialog (provided for callers that need a confirmation).
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub enum Choice {
@@ -443,9 +433,7 @@ impl Menu for ConfirmDialog {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers.
-// ---------------------------------------------------------------------------
 
 /// Returns remembered or falls back to default.
 fn prefill<'a>(remembered: &'a str, default: &'a str) -> &'a str {

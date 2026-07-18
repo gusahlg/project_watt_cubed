@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Key, Vec2};
 
+use crate::audio::{AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound};
 use crate::avatar::Pose;
 use crate::block::AIR;
 use crate::camera::{CameraMode, FlyAxes, GameCamera, ViewPose};
@@ -26,6 +27,7 @@ use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
 use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility, WireAction};
 use crate::save;
+use crate::sched::Ctx as SchedCtx;
 use crate::settings::Settings;
 use crate::sim::Simulation;
 use crate::sky::Sky;
@@ -79,6 +81,8 @@ struct FrameInput {
     open_console: bool,
     open_chat: bool,
     toggle_capture: bool,
+    /// Push-to-talk held this frame (level, not edge — see `GameplayState::PushToTalk`).
+    ptt: bool,
     g_escape: bool,
     g_hud: bool,
     g_shot: bool,
@@ -108,7 +112,6 @@ pub struct Game {
     player: Player,
     /// First/third person and freecam modes, plus shake effects.
     camera: GameCamera,
-    sim: Simulation,
     console: Console,
     /// The save slot this world belongs to.
     save_name: String,
@@ -137,9 +140,6 @@ pub struct Game {
     /// What the app renders: `Normal` play, or `TerrainKey` for the
     /// harness's sky-hole detector (flat terrain key, sky/fog passes disabled).
     debug_view: DebugView,
-    /// Monotone frame counter driving the temporal (dither) sequence — the game
-    /// owns this truth; the engine exposes no frame index.
-    frame_index: u64,
     /// Golden-harness capture mode: the pose is pinned by [`teleport`](Self::teleport)
     /// and the clock by [`set_day`](Self::set_day), so `update` consumes NO live
     /// input and does NOT advance the clock. Without this a stray desktop cursor
@@ -154,15 +154,45 @@ pub struct Game {
     /// [`RenderConfig::golden`] via [`scripted`](Self::scripted). Read per frame,
     /// so live toggling is possible if ever wanted.
     render: crate::render_config::RenderConfig,
+    /// The producer scheduler owns the fixed-tick
+    /// sim lane (registered in [`Game::new`]); other lanes still run directly
+    /// in `stream_phase` and migrate in one at a time.
+    sched: crate::sched::Scheduler,
+    /// The autosave interval gate on the scheduler's frame clock
+    /// (replaces the autosaver's `Instant` throttle). App reads
+    /// [`Game::autosave_due`] and clears it via [`Game::mark_autosave`]; the
+    /// save itself stays in `App` (its inputs — mods, meta, slot — live there).
+    autosave_interval: crate::sched::IntervalHandle,
+    /// The minimap throttle gate on the scheduler's frame clock
+    /// (replaces the minimap's `last_refresh: Instant`). The recenter half of
+    /// the gate stays a state comparison inside [`Minimap`].
+    minimap_interval: crate::sched::IntervalHandle,
 }
 
 impl Game {
-    pub fn new(world: World, player: Player, save_name: String) -> Self {
+    pub fn new(mut world: World, player: Player, save_name: String) -> Self {
+        let mut sched = crate::sched::Scheduler::new();
+        // The fixed-tick sim runs through the scheduler. A pure clock lane is
+        // never "starved", so its forward-progress floor is effectively infinite
+        // — it fires only when whole ticks are due.
+        let sim_id =
+            sched.register(Simulation::manifest(), Box::new(Simulation::new()), u32::MAX);
+        sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
+        // The autosave and minimap throttles are scheduler interval gates.
+        let autosave_interval =
+            sched.register_interval(crate::save::autosave::AUTOSAVE_INTERVAL.as_secs_f32());
+        let minimap_interval =
+            sched.register_interval(MinimapConfig::DEFAULT.refresh_every.as_secs_f32());
+        // The stream lanes are call-point-driven producers (see
+        // sched::Scheduler::manual); World drives them via run_manual at their
+        // exact positions in stream(). One registration point keeps the lane
+        // types private to crate::world.
+        let stream_lanes = crate::world::lanes::StreamLanes::register(&mut sched);
+        world.set_stream_lanes(stream_lanes);
         Self {
             world,
             player,
             camera: GameCamera::new(),
-            sim: Simulation::new(),
             console: Console::new(),
             save_name,
             net: None,
@@ -174,10 +204,24 @@ impl Game {
             sky: Sky::new(),
             minimap: Minimap::new(MinimapConfig::DEFAULT),
             debug_view: DebugView::Normal,
-            frame_index: 0,
             scripted: false,
             render: crate::render_config::RenderConfig::default(),
+            sched,
+            autosave_interval,
+            minimap_interval,
         }
+    }
+
+    /// Whether the autosave interval has elapsed on the scheduler's frame clock.
+    /// `App` gates a new save on this ∧ the world being dirty.
+    pub fn autosave_due(&self) -> bool {
+        self.sched.interval_due(self.autosave_interval)
+    }
+
+    /// Clear the autosave interval when a save is attempted — matches the old
+    /// `last_attempt` bump, so the next save is a full interval out.
+    pub fn mark_autosave(&mut self) {
+        self.sched.interval_reset(self.autosave_interval);
     }
 
     /// Build a headless, deterministic game for the golden-shot harness:
@@ -220,8 +264,8 @@ impl Game {
     /// drives the same `Player` → `camera_with_fov` path the game uses.
     pub fn teleport(&mut self, pose: CameraPose) {
         self.player.position = pose.pos;
-        self.player.yaw = pose.yaw;
-        self.player.pitch = pose.pitch;
+        self.player.orientation.yaw = pose.yaw;
+        self.player.orientation.pitch = pose.pitch;
     }
 
     /// Pin the day/night clock fraction (0.5 = noon, 0.0 = midnight). Fixes
@@ -291,6 +335,8 @@ impl Game {
         router: &mut Router,
         mods: &mut Mods,
         settings: &mut Settings,
+        sound: &mut SoundSystem,
+        audio: &mut AudioDirector,
     ) -> Signal {
         // Clamp dt so a stall (window minimized, world load hitch) becomes one
         // slightly-long step instead of a single giant physics step that would
@@ -302,8 +348,10 @@ impl Game {
         // step the deterministic world so terrain streams in before the frame is
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
-            self.world.stream(self.player.position, eng);
-            self.sim.advance(&mut self.world, dt);
+            self.world.stream(self.player.position, eng, &mut self.sched);
+            let clocks = self.sched.clocks(dt);
+            let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
+            self.sched.tick(&mut sched_ctx, &clocks);
             return Signal::Continue;
         }
 
@@ -318,16 +366,32 @@ impl Game {
         // Keep the HUD text scale in sync with the persisted setting.
         self.theme.scale = settings.ui_scale;
 
-        if let Some(signal) = self.net_phase(mods) {
+        // This frame's unrecoverable audio facts, accumulated across the
+        // phases and folded by the director. Everything else — footsteps, splash, the
+        // underwater bed, voice sessions — the director DERIVES from the readout.
+        let mut events: Vec<SoundEvent> = Vec::new();
+
+        if let Some(signal) = self.net_phase(mods, &mut events) {
             return signal;
         }
         let input = self.input_phase(eng, router, dt);
-        if let Some(signal) = self.overlay_phase(&input, eng, router, mods, settings) {
-            return signal;
-        }
-        let detached = self.motion_phase(&input, dt);
-        self.interact_phase(&input, detached, eng, mods);
-        self.stream_phase(eng, dt);
+        // The overlay may consume the frame (console typing, opening chat): movement,
+        // interaction and streaming run only on an unconsumed ("active") frame, exactly
+        // as before. Audio, though, commits EVERY frame so voice/emitters/faults — and
+        // the `/voicetest` cue submitted while the console is open — stay live; only a
+        // real exit short-circuits it.
+        let active =
+            match self.overlay_phase(&input, eng, router, mods, settings, sound, &mut events) {
+                Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
+                Some(Signal::Continue) => false,
+                None => {
+                    let detached = self.motion_phase(&input, dt);
+                    self.interact_phase(&input, detached, eng, mods, &mut events);
+                    self.stream_phase(eng, dt);
+                    true
+                }
+            };
+        self.commit_audio(dt, &input, sound, audio, settings, events, active);
         Signal::Continue
     }
 
@@ -335,10 +399,10 @@ impl Game {
     /// server dropped us. Runs before input so edits and chat keep flowing even
     /// while the console is open or the player stands still — and the move
     /// report doubles as the keepalive, so it too runs unconditionally.
-    fn net_phase(&mut self, mods: &mut Mods) -> Option<Signal> {
+    fn net_phase(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) -> Option<Signal> {
         let net_disconnected = {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
-            self.apply_net_events(mods)
+            self.apply_net_events(mods, events)
         };
         if net_disconnected {
             self.console.print("* disconnected from server".to_string());
@@ -347,8 +411,8 @@ impl Game {
         if let Some(net) = &mut self.net {
             net.send_move(
                 self.player.position,
-                self.player.yaw,
-                self.player.pitch,
+                self.player.orientation.yaw,
+                self.player.orientation.pitch,
                 Stance::of_player(&self.player),
             );
         }
@@ -383,6 +447,7 @@ impl Game {
                 f.open_console = gp.event(GameplayEvent::OpenConsole);
                 f.open_chat = gp.event(GameplayEvent::OpenChat);
                 f.toggle_capture = gp.event(GameplayEvent::ToggleCapture);
+                f.ptt = gp.state(GameplayState::PushToTalk);
                 f.nav_up = gp.overlay_nav(MenuEvent::Up);
                 f.nav_down = gp.overlay_nav(MenuEvent::Down);
                 f.nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
@@ -413,6 +478,8 @@ impl Game {
         router: &mut Router,
         mods: &mut Mods,
         settings: &mut Settings,
+        sound: &mut SoundSystem,
+        events: &mut Vec<SoundEvent>,
     ) -> Option<Signal> {
         // Text context: the console owns all input; nothing else runs. Esc is
         // the game's call (the Text view has no bindable events), and here it
@@ -423,7 +490,7 @@ impl Game {
                 return Some(Signal::Continue);
             }
             if let Some(line) = self.console.handle_input(&input.text_chars, input.text_edit) {
-                self.submit_line(line, eng, settings);
+                self.submit_line(line, eng, settings, sound, events);
             }
             return Some(Signal::Continue);
         }
@@ -495,10 +562,12 @@ impl Game {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::Physics);
                 movement::update_player(&mut self.player, &self.world, mi, dt);
             }
-            // Advance the local walk cycle from horizontal travel, mirroring
-            // how peers' phases accumulate from their snapshots.
+            // Advance the local walk cycle from horizontal travel so the third-person
+            // body animates. The AUDIO gait (footstep phase-crossings) is derived
+            // inside the director from the same speed — this one drives rendering only.
             let v = self.player.velocity();
-            self.local_gait += (v.x * v.x + v.z * v.z).sqrt() * dt as f64 * presence::STRIDE_FREQ;
+            let speed = (v.x * v.x + v.z * v.z).sqrt();
+            self.local_gait += speed * dt as f64 * presence::STRIDE_FREQ;
             false
         }
     }
@@ -506,11 +575,18 @@ impl Game {
     /// World edits: block breaking, then the mods' frame hooks and whatever
     /// placements they queued. Mods run once per frame here — never inside the
     /// voxel loop.
-    fn interact_phase(&mut self, input: &FrameInput, detached: bool, eng: &mut Engine, mods: &mut Mods) {
+    fn interact_phase(
+        &mut self,
+        input: &FrameInput,
+        detached: bool,
+        eng: &mut Engine,
+        mods: &mut Mods,
+        events: &mut Vec<SoundEvent>,
+    ) {
         // Break is capture-gated in the query; freecam additionally can't act
         // on the world (the crosshair isn't where the player aims).
         if input.do_break && !detached {
-            self.break_block(mods);
+            self.break_block(mods, events);
         }
 
         let placements = {
@@ -532,43 +608,127 @@ impl Game {
             mods.update(eng, &mut ctx);
             ctx.placements
         };
-        self.apply_placements(placements);
+        self.apply_placements(placements, events);
     }
 
     /// Load/mesh/unload chunks around the camera (the player, unless the
     /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
     /// step the simulation.
     fn stream_phase(&mut self, eng: &mut Engine, dt: f32) {
+        // The scheduler drives the fixed-tick sim lane. Its clock
+        // (fixed-tick accumulator + catch-up cap) is derived once per frame
+        // here; other lanes still run directly below until they migrate in.
+        let clocks = self.sched.clocks(dt);
+        let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
+        self.sched.tick(&mut sched_ctx, &clocks);
+
         let stream_center = match &self.camera.mode {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
-        self.world.stream(stream_center, eng);
+        self.world.stream(stream_center, eng, &mut self.sched);
 
         let p = self.player.position;
         let player_col = IVec2::new(p.x.floor() as i32, p.z.floor() as i32);
-        self.minimap
-            .refresh(eng, &self.world, player_col, Instant::now());
-        self.sim.advance(&mut self.world, dt);
+        // The minimap throttle rides the scheduler's interval gate (advanced in
+        // clocks() above); the recenter half stays inside Minimap::due. Reset
+        // the gate whenever a rebuild actually happens (either trigger).
+        let due = self.sched.interval_due(self.minimap_interval);
+        if self.minimap.refresh(eng, &self.world, player_col, due) {
+            self.sched.interval_reset(self.minimap_interval);
+        }
+    }
+
+    /// Hand this frame's readout to the audio director: it folds
+    /// the drained `events`, derives the rest from the trace (footsteps, splash,
+    /// underwater bed, voice sessions), commits the [`AudioFrame`], and services the
+    /// voice/capture path. The window, medium, gait and session bookkeeping that used
+    /// to live here are the director's now.
+    fn commit_audio(
+        &mut self,
+        dt: f32,
+        input: &FrameInput,
+        sound: &mut SoundSystem,
+        audio: &mut AudioDirector,
+        settings: &Settings,
+        events: Vec<SoundEvent>,
+        active: bool,
+    ) {
+        // THE per-frame peer sample: one `Instant`, consumed by the director for
+        // both remote footsteps and voice sessions. `peer_draws` in draw() keeps its
+        // own richer sample — it runs in the separate draw() call, steps each peer's
+        // animator, and needs render fields absent from `PeerPose`.
+        let now = Instant::now();
+        let peers: Vec<PeerPose> = self
+            .net
+            .as_ref()
+            .map(|net| {
+                net.peers()
+                    .map(|p| {
+                        let r = p.sample(now);
+                        PeerPose {
+                            id: p.id(),
+                            at: r.pos.0,
+                            visible: p.visible(),
+                            phase: r.phase,
+                            speed: r.speed,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // On a console-owned frame the player isn't stepped, so freeze the listener
+        // velocity: a stale walk speed would fire phantom footsteps in the director.
+        let velocity = if active { self.player.velocity() } else { DVec3::ZERO };
+        let player = PlayerPose {
+            pos: self.player.position,
+            yaw: self.player.orientation.yaw,
+            pitch: self.player.orientation.pitch,
+            velocity,
+            on_ground: self.player.on_ground(),
+        };
+
+        let ctx = AudioCtx {
+            dt,
+            player,
+            ptt: input.ptt,
+            voice_enabled: settings.voice_enabled,
+            events,
+            peers: &peers,
+            world: &self.world,
+            net: self.net.as_mut(),
+            console: &mut self.console,
+        };
+        audio.frame(ctx, sound);
     }
 
     /// Drain queued server messages: apply world edits, resolve our own edit
     /// verdicts (rolling back rejected predictions), surface chat, and report
     /// a lost connection. Returns `true` if the server dropped us.
-    fn apply_net_events(&mut self, mods: &mut Mods) -> bool {
-        let events = match &mut self.net {
+    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) -> bool {
+        let incoming = match &mut self.net {
             Some(net) => net.poll(),
             None => return false,
         };
         let mut disconnected = false;
-        for event in events {
+        for event in incoming {
             match event {
                 Incoming::Edit { x, y, z, spec } => {
                     // Resolve the portable spec against our own palette, then
                     // apply. The connection already dropped stale revisions,
                     // and our own edits come back as acks, not broadcasts.
+                    // Snapshot the cell first so a remote break names the block that
+                    // WAS there (its sound class), not a generic default.
+                    let prev = self.world.block_at(x, y, z);
                     let id = save::parse_block(&mut self.world, &spec);
                     self.world.set_block(x, y, z, id);
+                    let at = cell_center(x, y, z);
+                    events.push(if id == AIR {
+                        SoundEvent::BlockBroken { at, block: prev }
+                    } else {
+                        SoundEvent::BlockPlaced { at, block: id }
+                    });
                 }
                 Incoming::EditAccepted { req } => {
                     // Prediction confirmed: the optimistic apply IS the truth.
@@ -616,6 +776,14 @@ impl Game {
                     self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
                 }
                 Incoming::Disconnected => disconnected = true,
+                Incoming::PeerSwing { id } => {
+                    // The swing edge → a whoosh at the peer's current position. The
+                    // local animator update already happened in `Connection::apply`.
+                    if let Some(peer) = self.net.as_ref().and_then(|net| net.peers().find(|p| p.id() == id))
+                    {
+                        events.push(SoundEvent::PeerSwing { at: peer.sample(Instant::now()).pos.0 });
+                    }
+                }
             }
         }
         disconnected
@@ -624,7 +792,20 @@ impl Game {
     /// Handle one submitted console line. A leading `/` is always a local command; in
     /// multiplayer any other line is chat (a leading `!` sends it to global chat),
     /// while in singleplayer it stays a command as before.
-    fn submit_line(&mut self, line: String, eng: &mut Engine, settings: &mut Settings) {
+    fn submit_line(
+        &mut self,
+        line: String,
+        eng: &mut Engine,
+        settings: &mut Settings,
+        sound: &mut SoundSystem,
+        events: &mut Vec<SoundEvent>,
+    ) {
+        // `/voicetest` plays the canned UI cue; emit it as a fact and let the
+        // director route it (it runs this frame even though the console owns input).
+        // `execute` below prints the acknowledgement.
+        if line.trim() == "/voicetest" {
+            events.push(SoundEvent::Ui(UiSound::VoiceTest));
+        }
         if !line.starts_with('/') {
             if let Some(net) = &mut self.net {
                 let (channel, text) = match line.strip_prefix('!') {
@@ -653,6 +834,9 @@ impl Game {
         if *settings != before {
             self.apply_settings(eng, settings);
             settings.save();
+            // Push the audio mix through the one committer whenever `/gfx`-style
+            // settings edits touch a volume/mute/deafen row.
+            sound.set_mix(settings.mix_change());
         }
         // A `/time` change is shared: tell the server so every client's clock
         // follows (the server relays it and hands it to future joiners).
@@ -678,7 +862,7 @@ impl Game {
     }
 
     /// Break the block the player is looking at, handing its elements to the mods.
-    fn break_block(&mut self, mods: &mut Mods) {
+    fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) =
             interact::raycast(
                 &self.world,
@@ -693,6 +877,8 @@ impl Game {
         let id = self.world.block_at(x, y, z);
         // Snapshot the block's elements before it's removed.
         let elements = self.world.registry().block(id).composition.elements();
+        // Report the broken block; the director derives its class-specific cue.
+        events.push(SoundEvent::BlockBroken { at: cell_center(x, y, z), block: id });
         self.world.set_block(x, y, z, AIR);
         mods.on_block_break(&elements, &self.world);
         self.local_anim.on_action(WireAction::Swing);
@@ -719,7 +905,11 @@ impl Game {
     /// before queueing — and before spending a block on it — so within one frame
     /// the two always agree; re-checking here is a cheap guard against a mod that
     /// queues without validating.
-    fn apply_placements(&mut self, placements: Vec<(i32, i32, i32, crate::block::BlockId)>) {
+    fn apply_placements(
+        &mut self,
+        placements: Vec<(i32, i32, i32, crate::block::BlockId)>,
+        events: &mut Vec<SoundEvent>,
+    ) {
         for (x, y, z, id) in placements {
             // Lands in any non-obstacle cell — air, or a passable liquid it replaces
             // (raycast hands back a liquid `previous` when aiming through water).
@@ -736,6 +926,8 @@ impl Game {
                 continue;
             }
             let prev = self.world.block_at(x, y, z);
+            // Report the placed block; the director derives its class-specific cue.
+            events.push(SoundEvent::BlockPlaced { at: cell_center(x, y, z), block: id });
             self.world.set_block(x, y, z, id);
             self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
@@ -810,20 +1002,13 @@ impl Game {
         } else {
             voxel_engine::skeleton::Exposure::DEFAULT
         };
-        // Scripted (harness) frames pin the dither phase: capture lands on an
-        // arbitrary frame index under uncapped pacing, and a cycling blue-noise
-        // phase is per-run LSB wobble on gradient/blend surfaces (water) that a
-        // golden diff must never see.
-        let dither_frame = if self.scripted { 0 } else { self.frame_index };
         let snapshot = crate::frame_snapshot::compose(
             &self.sky,
             pose.eye,
-            dither_frame,
             exposure,
             &self.render,
         );
         let frame_uniforms = voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot);
-        self.frame_index = self.frame_index.wrapping_add(1);
 
         // TerrainKey: flat terrain, sky/fog disabled, magenta clear for the
         // sky-hole detector. Normal: real clear, no debug flat.
@@ -877,11 +1062,12 @@ impl Game {
             // body lazily following, limbs swinging with their gait. Poses are
             // already camera-relative (see peer_draws).
             for peer in peers {
-                Pose::resolve(&peer.pose, &peer.rig).draw(&mut f3, peer.color);
+                Pose::resolve(&peer.pose, &peer.rig).draw(&mut f3, peer.color, true);
             }
-            // The player's own body, whenever the camera can see it (third
-            // person and freecam) — the same humanoid + animator the peers use.
-            if self.camera.shows_body() {
+            // The player's own body — always drawn so it casts a shadow and is
+            // visible when looking down. In first person the head is omitted (the
+            // camera sits inside it); third person and freecam show the full body.
+            {
                 let feet = Feet(DVec3::new(
                     self.player.position.x,
                     self.player.feet_y(),
@@ -892,13 +1078,17 @@ impl Game {
                 let rp = RenderPose::new(
                     feet,
                     Eye(pose.eye),
-                    self.player.yaw,
-                    self.player.pitch,
+                    self.player.orientation.yaw,
+                    self.player.orientation.pitch,
                     Stance::of_player(&self.player),
                     Gait::new(self.local_gait as f32, speed),
                 );
                 let rig = self.local_anim.step(&rp, *dt);
-                Pose::resolve(&rp, &rig).draw(&mut f3, peer_color(&self.save_name));
+                Pose::resolve(&rp, &rig).draw(
+                    &mut f3,
+                    peer_color(&self.save_name),
+                    self.camera.shows_body(),
+                );
             }
         }
     }
@@ -917,7 +1107,7 @@ impl Game {
                 self.player.position.x.floor() as i32,
                 self.player.position.z.floor() as i32,
             );
-            self.minimap.draw(f, screen, player_col, self.player.yaw);
+            self.minimap.draw(f, screen, player_col, self.player.orientation.yaw);
         }
 
         // Reticle and world-space name tags: shown in every mode but fully-off.
@@ -1024,6 +1214,11 @@ struct PeerDraw {
     /// Screen position + fade alpha for the name tag, or `None` when
     /// off-screen, behind us, or out of range.
     tag: Option<(Vec2, f32)>,
+}
+
+/// The world-space centre of a voxel cell (occurrence position).
+fn cell_center(x: i32, y: i32, z: i32) -> DVec3 {
+    DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
 }
 
 /// Toggle capture and sync cursor grab with the OS.

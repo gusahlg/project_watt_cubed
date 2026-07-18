@@ -68,7 +68,7 @@ impl Default for RenderConfig {
             fog: false,
             ambient: false,
             sunlight: true,
-            shadows: false,
+            shadows: true,
             sky: true,
             vrs: true,
             water_anim: true,

@@ -4,7 +4,8 @@
 
 use std::time::{Duration, Instant};
 
-use voxel_engine::{DVec3, Engine};
+use voxel_engine::producer::Progress;
+use voxel_engine::{DVec3, Engine, FadeStyle};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
 use crate::derived::Revision;
@@ -16,12 +17,43 @@ use super::heightmip::{BakeExtent, HeightMip};
 use super::mesh::ChunkMeshData;
 use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
-use super::summary::SseBudget;
+use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
     Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
-    SECTION_UPLOAD_BUDGET, SectionLane, SectionState, UPLOAD_BUDGET, World, lane_enqueue,
-    lane_integrate, light, mesh, pipeline, pyramid, quadtree,
+    SECTION_UPLOAD_BUDGET, SectionLane, SectionState, StreamLane, UPLOAD_BUDGET, World,
+    light, mesh, pipeline, pyramid, quadtree,
 };
+
+/// Exact upload placement for a chunk mesh: integer chunk origin, full detail.
+/// Pinned at upload so the GPU record is written once; draws only mark
+/// visibility.
+fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
+    voxel_engine::MeshPlacement::terrain(
+        voxel_engine::IVec3::new(coord.x, coord.y, coord.z) * CHUNK_SIZE as i32,
+        voxel_engine::Detail::FULL,
+    )
+}
+
+/// Edits whose chunk falls inside `pos`'s footprint and height domain. Free
+/// function (not a `World` method) so callers needing only `&self.edits` — the
+/// heightmip overlay refresh among them — don't have to borrow the rest of `World`.
+fn edits_in_footprint(
+    edits: &FastMap<Coord, FastMap<usize, crate::block::registry::BlockId>>,
+    pos: SectionPos,
+) -> Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> {
+    let cs = CHUNK_SIZE as i32;
+    let span = pos.span();
+    let (cx0, cz0) = (pos.min_x().div_euclid(cs), pos.min_z().div_euclid(cs));
+    let cn = span / cs; // chunk columns per section side
+    let cy_hi = super::section::DOMAIN_H / cs; // vertical chunk-layer count
+    edits
+        .iter()
+        .filter(|(c, _)| {
+            (cx0..cx0 + cn).contains(&c.x) && (cz0..cz0 + cn).contains(&c.z) && (0..cy_hi).contains(&c.y)
+        })
+        .map(|(&c, cells)| (c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
+        .collect()
+}
 
 /// Screen-space-error gain at 90° fov and 1080-line viewport.
 /// Currently used only for documentation; `coarse_ok` cancels it out.
@@ -83,6 +115,12 @@ impl FailKey {
 /// without looping forever on poison.
 const MAX_JOB_STRIKES: u8 = 3;
 
+/// Forward-progress floor for the generation lane: admit at least this many
+/// columns before the deadline can stop it, so a boundary-cross flood still
+/// makes strict progress each frame under a tight budget (the same floor role
+/// [`super::StreamLane::MIN_ADMIT`] plays for the per-chunk lanes).
+const GEN_MIN_ADMIT: usize = 8;
+
 impl World {
     /// The mesh box: chunks meshed and drawn around `center`.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
@@ -112,7 +150,7 @@ impl World {
 
     /// Land worker results, queue generation/meshing, free distant chunks.
     /// Steady-state zero cost: one channel poll, lazy unload/generate on boundary cross.
-    pub fn stream(&mut self, center: DVec3, eng: &mut Engine) {
+    pub fn stream(&mut self, center: DVec3, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
         // Palette growth re-uploads the block texture array before any meshing
         // this frame, so vertices never reference a layer that isn't there.
         // Covers the initial upload too (0 tracked -> N on the first stream).
@@ -160,12 +198,15 @@ impl World {
         // chunks count as data this frame and finished meshes draw this frame.
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
-            let apply = pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET);
-            self.drain_results(eng, apply);
+            let drain_lane = self.lanes().drain;
+            sched.run_manual(drain_lane, self, Some(&mut *eng));
         }
         if full_pass {
             self.unload_far(center_chunk, eng);
-            self.request_region_data(center_chunk);
+            // Centre chunk synchronously for collision safety before async catches
+            // up; the rest of the data box is armed for the budgeted generate lane.
+            self.ensure_data(center_chunk);
+            self.pending_gen.set();
             // Mesh box moved: re-seed loaded chunks awaiting mesh that just
             // entered the box. Cheap boundary-cross scan that avoids stale holes.
             let fresh: Vec<Coord> = self
@@ -178,13 +219,19 @@ impl World {
             self.mesh_worklist.extend(fresh);
             self.pending_fresh.set();
         }
+        // Runs every frame to drain a boundary-cross flood across frames;
+        // self-gates on `pending_gen` so a settled world pays one flag check.
+        // Placed after unload so freed slots can regenerate.
+        {
+            let gen_lane = self.lanes().generate;
+            sched.run_manual(gen_lane, self, None);
+        }
         if self.radius_shrunk.take() {
             // Free meshes between new radius and unload ring (data stays).
             // Air/NeedsMesh own no handle.
             // Ready chunks drop to NeedsMesh; Dirty chunks stay dirty
             // (prev: None) so same-frame dirty pass still remeshes them.
             let keep = self.mesh_box(center_chunk);
-            let mut retired = false;
             for (&coord, loaded) in self.chunks.iter_mut() {
                 if keep.contains(coord) {
                     continue;
@@ -198,7 +245,6 @@ impl World {
                 };
                 let stays_dirty = matches!(next, MeshState::Dirty { .. });
                 loaded.retire(next, eng);
-                retired = true;
                 // A retired `Dirty` chunk (its drawn mesh just freed) still needs
                 // the same-frame dirty pass to remesh it — which only runs when
                 // `pending_dirty` is set. Set it explicitly here rather than
@@ -207,16 +253,14 @@ impl World {
                     self.pending_dirty.set();
                 }
             }
-            if retired {
-                self.draw_set_rev += 1;
-            }
         }
         // Light settling: worklist lane. Trivial grids publish synchronously;
         // only the dense surface band reaches the worker pool.
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamLight);
             if self.lighting {
-                lane_enqueue::<LightLane>(self, center_chunk, pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET));
+                let light_lane = self.lanes().light_admit;
+                sched.run_manual(light_lane, self, None);
                 // While light is unsettled, keep the mesh lane armed so it
                 // re-checks `light_ready` as grids land.
                 if !self.light_worklist.is_empty() || !self.light_inflight.is_empty() {
@@ -232,14 +276,16 @@ impl World {
         // (worklist seeded on load/light-move, O(shell) not a whole-map rescan).
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamMesh);
-            self.remesh_dirty(center_chunk, eng);
+            let dirty_lane = self.lanes().dirty_remesh;
+            sched.run_manual(dirty_lane, self, Some(&mut *eng));
             // Advance the light-gate degrade timers and keep still-waiting chunks on
             // the worklist (their degrade fires on the clock, which raises no re-seed
             // event) BEFORE the mesh lane reads them.
             self.tick_light_gate();
-            // The mesh lane evicts blocked/stale seeds itself (see `lane_enqueue`),
+            // The mesh lane evicts blocked/stale seeds itself (see `admit`),
             // so the worklist stays O(fresh work) with no separate prune here.
-            lane_enqueue::<MeshLane>(self, center_chunk, pipeline::Deadline::from_budget(pipeline::STREAM_BUDGET));
+            let mesh_lane = self.lanes().mesh_admit;
+            sched.run_manual(mesh_lane, self, None);
             // Level-triggered backstop to the edge-triggered degraded clear: once
             // ALL light work is quiescent, any chunk still degraded is owed a
             // remesh that no future light-arrival event will ever deliver (its
@@ -252,10 +298,15 @@ impl World {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamTiles);
             // Update pyramid unit to track the current view distance.
             self.section_pyramid.unit = (self.view.horizontal * CHUNK_SIZE as i32) as f32;
-            // Background max-mip bake. Until it lands, selection uses worst-case
-            // ladder; mip only coarsens, no upward pops during bake.
-            self.poll_mip();
-            self.ensure_mip_bake();
+            // Until the bake lands, selection uses the worst-case ladder;
+            // mip only coarsens, no upward pops during bake.
+            let mip_lane = self.lanes().mip;
+            sched.run_manual(mip_lane, self, None);
+            // Section overlay lane: refresh the edit overlay BEFORE
+            // selection/occlusion/material read it (the frontier's error
+            // coarsening below already consults it).
+            let overlay_lane = self.lanes().section_overlay;
+            sched.run_manual(overlay_lane, self, None);
             // ONE selection sweep per frame: unloading, the load lane, and the
             // covering rebuild below all read this cache. The frontier tracks
             // the live eye (altitude included) continuously, so it must be
@@ -265,58 +316,33 @@ impl World {
                 self.unload_sections(center_chunk, eng);
                 self.pending_sections.set();
             }
-            // Free GPU meshes of edited sections so they re-extract from the
-            // updated generator overlay (edits land every frame).
-            self.remesh_dirty_sections(eng);
-            lane_enqueue::<SectionLane>(
-                self,
-                center_chunk,
-                pipeline::Deadline::from_budget(pipeline::LOD_ENQUEUE_BUDGET),
-            );
-            self.rebuild_section_visible(center_chunk);
+            // Section dirty-remesh lane: free GPU meshes of edited sections so
+            // they re-extract from the updated generator overlay.
+            let section_remesh_lane = self.lanes().section_remesh;
+            sched.run_manual(section_remesh_lane, self, Some(&mut *eng));
+            let section_lane = self.lanes().section_admit;
+            sched.run_manual(section_lane, self, None);
+            // Section visible-set lane: rebuild the covering + advance the fade.
+            let visible_lane = self.lanes().section_visible;
+            sched.run_manual(visible_lane, self, Some(&mut *eng));
         }
         // Occlusion is derived state, rebuilt here at the `&mut` sync point (never
-        // in the `&self` render) — and only when the adaptive gate is active AND
-        // an input changed (or it was just activated). When the gate is off this
-        // is skipped entirely and render draws everything, so a CPU-bound world
-        // pays nothing for occlusion.
-        let occlusion_on = self.occlusion_enabled();
-        if occlusion_on && (self.occlusion_dirty.take() || !self.occlusion_active) {
+        // in the `&self` render). The lane self-gates: it rebuilds only when the
+        // adaptive gate is active AND an input changed (or it was just
+        // activated), and always updates `occlusion_active` (so turning the gate
+        // off lets render draw everything). A CPU-bound world pays nothing.
+        {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamOcclusion);
-            self.rebuild_occlusion(center_chunk);
+            let occ_lane = self.lanes().occlusion;
+            sched.run_manual(occ_lane, self, Some(&mut *eng));
         }
-        self.occlusion_active = occlusion_on;
-        // Stream is the frame's last mutation point before render: refresh the
-        // drawable-coords cache here (only when the set actually changed), so
-        // `render` walks the ~live set instead of every loaded chunk.
-        self.sync_draw_cache();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
     }
 
-    /// Rebuild the drawable-coords cache when the mesh set changed. The set
-    /// mutates only through `retire` installs/frees, unloads, and the
-    /// free-meshes passes — each bumps `draw_set_rev`; `invalidate()` keeps the
-    /// previous mesh drawing, so edits alone never bump. Steady state: no
-    /// bump, no walk. (`render`'s debug assert cross-checks the cache against
-    /// a fresh walk, so a missed bump cannot ship silently.)
-    fn sync_draw_cache(&mut self) {
-        if self.draw_cache_rev == self.draw_set_rev {
-            return;
-        }
-        self.draw_cache.clear();
-        self.draw_cache.extend(
-            self.chunks
-                .iter()
-                .filter(|(_, l)| l.state.live_meshes().is_some())
-                .map(|(&c, _)| c),
-        );
-        self.draw_cache_rev = self.draw_set_rev;
-    }
-
     /// Land finished worker results (non-blocking). Generate results clear `generating`.
     /// Stale results drop and re-arm fresh scan. Budgeted mesh upload to GPU.
-    fn drain_results(&mut self, eng: &mut Engine, light_apply: pipeline::Deadline) {
+    pub(in crate::world) fn drain_results(&mut self, eng: &mut Engine, light_apply: pipeline::Deadline) {
         if let Some(workers) = &self.workers {
             while let Some(done) = workers.try_recv() {
                 self.done_scratch.push(done);
@@ -334,9 +360,9 @@ impl World {
         for result in done.drain(..) {
             match result {
                 pipeline::Done::Column { col, chunks } => self.accept_column(col, chunks),
-                m @ pipeline::Done::Mesh { .. } => lane_integrate::<MeshLane>(self, m),
-                l @ pipeline::Done::Light { .. } => lane_integrate::<LightLane>(self, l),
-                sc @ pipeline::Done::Section { .. } => lane_integrate::<SectionLane>(self, sc),
+                m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
+                l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
+                sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
                 pipeline::Done::Failed(key) => self.fail_job(*key),
                 pipeline::Done::Cancelled(key) => self.cancel_job(*key),
             }
@@ -366,14 +392,15 @@ impl World {
                 continue;
             }
             // Both passes upload together under one budget charge (same rev).
-            let handles = ByPass::from_fn(|p| eng.upload_mesh(&data[p]));
-            // Light was settled before mesh was enqueued; upload is pure GPU handoff.
+            // The worker baked per-vertex sky/block light into `data` from the
+            // settled shell in its snapshot, so this is a pure GPU handoff —
+            // every chunk, all distances, uploads the same plain way.
+            let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
             if let Some(loaded) = self.chunks.get_mut(&coord) {
                 // Rev check guarantees state is NeedsMesh { building: true }
                 // (edit would bump rev, get dropped). Route through retire anyway
                 // to free any stray token as state moves to Ready/Air.
                 loaded.retire(MeshState::from_upload(handles), eng);
-                self.draw_set_rev += 1;
             }
         }
 
@@ -389,8 +416,19 @@ impl World {
         while section_uploads < SECTION_UPLOAD_BUDGET {
             let Some((pos, meshes)) = self.section_upload_queue.pop_front() else { break };
             section_uploads += 1;
+            // `section_material` borrows all of `self`, so it must run before
+            // `self.sections.get_mut` below takes an overlapping mutable borrow.
+            let (flat_color, flat_rgba) = self.section_material(pos);
             if let Some(state @ SectionState::Meshing) = self.sections.get_mut(&pos) {
                 *state = SectionState::from_upload(pos, meshes, eng);
+                // Slots are born visible (residency implies it for everything but the
+                // far field), so a section that Coverage does not draw — or draws only
+                // in part — must be corrected here, at the transition that gave it slots
+                // to correct. No frame intervenes: patches flush at submit.
+                state.set_visible(eng, self.section_fade.drawn_mask(pos));
+                // Push the section's far-material style so it doesn't draw one frame at
+                // the engine's post-upload default.
+                state.push_style(eng, FadeStyle { flat_color }, flat_rgba);
                 // A new Ready section moves the covering: re-arm the lane so
                 // any refinement it exposes loads immediately.
                 self.pending_sections.set();
@@ -432,12 +470,24 @@ impl World {
         a.ring(b).max(2 * a.updown(b))
     }
 
-    /// Queue generation for missing chunks in the data box, grouped into vertical
-    /// columns so the `cy`-invariant column profile is sampled once per column
-    /// instead of once per chunk. Nearest column first; the centre is generated
-    /// synchronously first for collision safety.
-    fn request_region_data(&mut self, center: Coord) {
-        self.ensure_data(center);
+    /// The [`GenerateLane`](lanes::GenerateLane) producer's body: queue worker
+    /// jobs for missing chunks in the data box, grouped into vertical columns so
+    /// the `cy`-invariant column profile is sampled once per column, nearest
+    /// column first, up to `deadline`. Self-gates on `pending_gen` (raised on a
+    /// boundary cross and by a generate strike-out re-request). Column
+    /// granularity means it keeps its own gather/claim rather than the per-chunk
+    /// [`admit`](super::admit) loop, but the forward-progress floor + time budget
+    /// are the one shared rule ([`admission_exhausted`](super::admission_exhausted)).
+    /// The centre chunk is generated synchronously in `stream` (collision safety);
+    /// `accept_column` lands these results. Leftover columns re-arm the gate.
+    pub(in crate::world) fn request_region_data(
+        &mut self,
+        center: Coord,
+        deadline: pipeline::Deadline,
+    ) -> Progress {
+        if !self.pending_gen.take() {
+            return Progress::Idle;
+        }
         let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
         for coord in self.data_box(center).coords() {
             if self.chunks.contains_key(&coord)
@@ -451,14 +501,17 @@ impl World {
             entry.1 = entry.1.max(coord.y);
         }
         if columns.is_empty() {
-            return;
+            return Progress::Idle;
         }
         let mut cols: Vec<((i32, i32), (i32, i32))> = columns.into_iter().collect();
         cols.sort_by_key(|&((cx, cz), _)| (cx - center.x).abs().max((cz - center.z).abs()));
-        let workers = self
-            .workers
-            .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()));
+        let mut admitted = 0usize;
+        let mut remaining = 0usize;
         for ((cx, cz), (cy_lo, cy_hi)) in cols {
+            if super::admission_exhausted(admitted, GEN_MIN_ADMIT, deadline) {
+                remaining += 1;
+                continue;
+            }
             // Collect edits for the landing chunk to replay.
             let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo..=cy_hi)
                 .filter_map(|cy| {
@@ -468,12 +521,16 @@ impl World {
                         .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
                 })
                 .collect();
-            let accepted = workers.submit(pipeline::Job::GenerateColumn {
+            let job = pipeline::Job::GenerateColumn {
                 col: (cx, cz),
                 cy: cy_lo..=cy_hi,
                 generator: self.generator.clone(),
                 edits,
-            });
+            };
+            let accepted = self
+                .workers
+                .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()))
+                .submit(job);
             if accepted {
                 // Claim every missing coord in the span so it isn't re-requested.
                 for cy in cy_lo..=cy_hi {
@@ -482,7 +539,17 @@ impl World {
                         self.generating.insert(coord);
                     }
                 }
+                admitted += 1;
+            } else {
+                // Pool shutting down: leave the rest for a later frame.
+                remaining += 1;
             }
+        }
+        if remaining > 0 {
+            self.pending_gen.set();
+            Progress::Partial { remaining: remaining as u32 }
+        } else {
+            Progress::Idle
         }
     }
 
@@ -547,12 +614,10 @@ impl World {
                 for cyy in cy {
                     self.generating.remove(&Coord::new(cx, cyy, cz));
                 }
-                // Freed claims are only re-requested on a boundary cross;
-                // re-request now so a standing-still player still converges.
+                // Freed claims are only re-requested on a boundary cross; re-arm
+                // the generate lane now so a standing-still player still converges.
                 if !quarantine {
-                    if let Some(center) = self.center {
-                        self.request_region_data(center);
-                    }
+                    self.pending_gen.set();
                 }
             }
             pipeline::JobKey::Mesh { coord } => {
@@ -680,7 +745,6 @@ impl World {
             .collect();
         // A removed chunk changes what the BFS can reach.
         self.occlusion_dirty.raise(!far.is_empty());
-        self.draw_set_rev += !far.is_empty() as u64;
         for coord in far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             if let Some(loaded) = self.chunks.remove(&coord) {
@@ -698,13 +762,18 @@ impl World {
 
     /// Remesh edited (`Dirty`) chunks synchronously, budgeted, nearest first —
     /// carved out from the async mesh lane so a broken block never lags a frame.
-    /// The fresh-mesh half is now the [`MeshLane`] worklist lane.
-    fn remesh_dirty(&mut self, center: Coord, eng: &mut Engine) {
+    /// Reports `Progress::Partial { remaining }` when more `Dirty` chunks are
+    /// queued than the per-frame [`DIRTY_BUDGET`] (they stay `Dirty`, drained
+    /// next frame).
+    pub(in crate::world) fn remesh_dirty(&mut self, eng: &mut Engine) -> Progress {
         // Collect dirty chunks into vec; pass mutates them, can't hold filter borrow.
         // Gated by pending_dirty so idle frames skip the scan.
         if !self.pending_dirty.take() {
-            return;
+            return Progress::Idle;
         }
+        let Some(center) = self.center else {
+            return Progress::Idle;
+        };
         let mut dirty: Vec<Coord> = self
             .chunks
             .iter()
@@ -714,13 +783,19 @@ impl World {
         dirty.sort_by_key(|&coord| Self::order(coord, center));
         // Leftovers past the budget stay `Dirty` (still in the fiber); re-arm
         // the hint so the next frame drains them.
-        if dirty.len() > DIRTY_BUDGET {
+        let remaining = dirty.len().saturating_sub(DIRTY_BUDGET);
+        if remaining > 0 {
             self.pending_dirty.set();
         }
         for coord in dirty.into_iter().take(DIRTY_BUDGET) {
             // No neighbour-data gate: edited chunks remesh even with missing
             // neighbour data (mesher reads them as air).
             self.mesh_chunk(coord, eng);
+        }
+        if remaining > 0 {
+            Progress::Partial { remaining: remaining as u32 }
+        } else {
+            Progress::Idle
         }
     }
 
@@ -770,7 +845,7 @@ impl World {
 
     /// Skylight ceiling: ground height per column (pure generator fn, caves dark
     /// consistently) RAISED by edited opaque roofs, so a player-built ceiling
-    /// shadows the chunks below it (G-03). Keyed by `(x, z)` chunk column and
+    /// shadows the chunks below it. Keyed by `(x, z)` chunk column and
     /// cached — the generator half never changes and `set_block` invalidates
     /// the entry when an edit moves a column's ceiling, so `capture_ceiling`
     /// samples 256 noise columns once per column, not per settle.
@@ -939,7 +1014,7 @@ impl World {
         })
     }
 
-    // --- Column-LOD sections -----------------------------------------
+    // Column-LOD section selection and streaming.
 
     /// Per-frame selection metric: chunk-centre XZ, `dy` from eye altitude to LOD envelope.
     /// XZ stays on chunk centre (not eye) to keep `dy=0` bit-identical to shipped LOD2.
@@ -964,7 +1039,13 @@ impl World {
         let cfg = &self.section_pyramid;
         let radial = quadtree::desired_sections(metric, cfg);
         match &self.section_mip {
-            Some(mip) => quadtree::coarsen_by_error(radial, metric, cfg, &|c| mip.summary(c), &self.sse_budget()),
+            Some(mip) => {
+                let summary_at = |c: SectionPos| match self.section_overlay.get(&c) {
+                    Some(ov) => CellSummary { env: HeightEnvelope::new(ov.lo, ov.hi), err: CellError::from_metres(ov.hi - ov.lo) },
+                    None => mip.summary(c),
+                };
+                quadtree::coarsen_by_error(radial, metric, cfg, &summary_at, &self.sse_budget())
+            }
             None => radial,
         }
     }
@@ -977,7 +1058,7 @@ impl World {
 
     /// Spawn background max-mip bake (idempotent: no-op if spawned or landed).
     /// Runs off main thread; worst-case ladder streams meanwhile.
-    fn ensure_mip_bake(&mut self) {
+    pub(in crate::world) fn ensure_mip_bake(&mut self) {
         if self.section_mip.is_some() || self.section_mip_rx.is_some() {
             return;
         }
@@ -997,12 +1078,45 @@ impl World {
 
     /// Install background bake if landed. Newly-arrived mip only coarsens
     /// far field, so just re-arm section pass to re-select.
-    fn poll_mip(&mut self) {
+    pub(in crate::world) fn poll_mip(&mut self) {
         if let Some(rx) = &self.section_mip_rx {
             if let Ok(mip) = rx.try_recv() {
                 self.section_mip = Some(mip);
                 self.section_mip_rx = None;
                 self.pending_sections.set();
+            }
+        }
+    }
+
+    /// Re-derive the edit-folded cell for every section touched by a live edit,
+    /// fixing the immutable bake's edit-staleness (a mined-out feature would
+    /// otherwise keep occluding/colouring/measuring error as if still solid).
+    /// The `&mut` sync point `render`'s `&self` readers may never recompute
+    /// (occlusion-class derived state is rebuilt here, not in render).
+    ///
+    /// Cost is bounded by `section_edit_rev`'s size (sections an edit has EVER
+    /// touched), not by view distance or total edit count: untouched cells never
+    /// enter the loop, so an unedited world pays nothing (`section_overlay` stays
+    /// empty and every reader falls back to the pure bake, bit-identical to
+    /// before this cache existed).
+    pub(in crate::world) fn refresh_section_overlay(&mut self) {
+        self.section_overlay.clear();
+        let positions: Vec<(SectionPos, u64)> =
+            self.section_edit_rev.iter().map(|(&p, &r)| (p, r)).collect();
+        for (pos, rev_n) in positions {
+            let rev = voxel_engine::Rev(rev_n);
+            let touched = edits_in_footprint(&self.edits, pos);
+            if touched.is_empty() {
+                // Reverted back to what the generator would produce (overlay
+                // compaction, edits.rs): no override, the pure bake applies.
+                continue;
+            }
+            let cell = *self.section_overlay_cache.get_or_recompute(pos, rev, || {
+                let colors = self.registry.color_snapshot();
+                Some(super::heightmip::resample_cell(pos, &self.generator, &touched, &colors))
+            });
+            if let Some(cell) = cell {
+                self.section_overlay.insert(pos, cell);
             }
         }
     }
@@ -1033,20 +1147,7 @@ impl World {
         &self,
         pos: SectionPos,
     ) -> Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> {
-        let cs = CHUNK_SIZE as i32;
-        let span = pos.span();
-        let (cx0, cz0) = (pos.min_x().div_euclid(cs), pos.min_z().div_euclid(cs));
-        let cn = span / cs; // chunk columns per section side
-        let cy_hi = super::section::DOMAIN_H / cs; // vertical chunk-layer count
-        self.edits
-            .iter()
-            .filter(|(c, _)| {
-                (cx0..cx0 + cn).contains(&c.x)
-                    && (cz0..cz0 + cn).contains(&c.z)
-                    && (0..cy_hi).contains(&c.y)
-            })
-            .map(|(&c, cells)| (c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
-            .collect()
+        edits_in_footprint(&self.edits, pos)
     }
 
     /// Rebuild the visible set every frame; as sections become Ready, the covering
@@ -1059,7 +1160,10 @@ impl World {
     /// events) could go quiet with holes still open — flying far up left the
     /// covering permanently behind the live frontier, drawing a couple of
     /// stale coarse cubes over an otherwise missing far field.
-    pub(in crate::world) fn rebuild_section_visible(&mut self, center: Coord) {
+    pub(in crate::world) fn rebuild_section_visible(&mut self, mut eng: Option<&mut Engine>) {
+        let Some(center) = self.center else {
+            return;
+        };
         let desired = std::mem::take(&mut self.section_desired);
         let max = self.section_pyramid.coarsest();
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
@@ -1074,8 +1178,17 @@ impl World {
             self.pending_sections.set();
         }
         self.section_visible = cut.iter().copied().collect();
-        // Drive cross-fade toward new cut; it decides what actually draws.
-        self.section_fade.update_now(&self.section_visible);
+        // Adopt the new cut (hard pop); it decides what actually draws.
+        let changed = self.section_fade.update_now(&self.section_visible);
+        // The mask is a projection of that decision, so it follows the same diff —
+        // a region whose slots have not landed yet is caught by the upload site instead.
+        if let Some(eng) = eng.as_deref_mut() {
+            for (pos, mask) in changed {
+                if let Some(state) = self.sections.get(&pos) {
+                    state.set_visible(eng, mask);
+                }
+            }
+        }
     }
 
     /// Unload sections outside desired, visible, and hysteresis bands (boundary cross).
@@ -1101,7 +1214,16 @@ impl World {
                 let span = s.span();
                 let (cx, cz) = (s.x * span + span / 2, s.z * span + span / 2);
                 let dist = metric.point(cx as f64, cz as f64);
-                !pyramid::acceptable(dist, super::lod::Lod(s.detail), cfg)
+                if !pyramid::acceptable(dist, s.detail, cfg) {
+                    return true;
+                }
+                // Dormant VRAM floor: unload anything finer than the current
+                // affordable floor. `vram_budget_floor`
+                // always returns `Detail::FULL` today, and every section is
+                // coarser than that by construction (`FINEST_DETAIL` > 0), so
+                // this never fires until the floor is activated.
+                pyramid::required_detail(dist, cfg, pyramid::vram_budget_floor())
+                    .is_some_and(|req| s.detail < req)
             })
             .collect();
         for s in stale {
@@ -1112,7 +1234,7 @@ impl World {
     }
 
     /// Free GPU meshes so edited sections re-extract from the updated overlay.
-    fn remesh_dirty_sections(&mut self, eng: &mut Engine) {
+    pub(in crate::world) fn remesh_dirty_sections(&mut self, eng: &mut Engine) {
         if self.dirty_sections.is_empty() {
             return;
         }
@@ -1286,7 +1408,7 @@ impl World {
         self.mark_degraded(coord, false);
         let light = self.capture_padded_light(coord, false);
         mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        let handles = ByPass::from_fn(|p| eng.upload_mesh(&scratch[p]));
+        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&scratch[p], chunk_placement(coord)));
         self.scratch = scratch;
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             loaded.retire(MeshState::from_upload(handles), eng);
@@ -1483,14 +1605,13 @@ impl World {
         self.mark_degraded(coord, degraded);
         let light = self.capture_padded_light(coord, degraded);
         mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        let handles = ByPass::from_fn(|p| eng.upload_mesh(&scratch[p]));
+        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&scratch[p], chunk_placement(coord)));
         self.scratch = scratch;
         // `retire` frees the edited-Ready chunk's old mesh (`Dirty.prev`) exactly
         // once and installs the fresh `Ready`/`Air` state.
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             debug_assert!(loaded.state.is_dirty(), "sync remesh of non-Dirty {coord:?}");
             loaded.retire(MeshState::from_upload(handles), eng);
-            self.draw_set_rev += 1;
         }
     }
 
@@ -1536,5 +1657,72 @@ impl World {
             eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, &self.texture_cache[..visible]);
             self.textures_built = count;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::StreamLane;
+
+    /// `admit::<MeshLane>` evicts a light-blocked seed from `mesh_worklist` once its wait exceeds
+    /// `LIGHT_WAIT_DEGRADE`, trusting `tick_light_gate` to unconditionally re-seed
+    /// every still-blocked chunk it is timing — keyed off `light_gate.blocked_since`,
+    /// NOT off current `mesh_worklist` membership. If that re-seed were conditioned
+    /// on membership instead, an evicted-but-still-blocked chunk would never return
+    /// to the worklist and would be stranded forever despite being mesh-ready via
+    /// `light_wait_expired`. This pins the unconditional re-seed.
+    #[test]
+    fn light_wait_expiry_reseeds_an_evicted_chunk_without_stranding_it() {
+        let mut world = World::generate();
+        let c = ChunkCoord::new(0, 0, 0);
+        world.center = Some(c);
+
+        // C and its 6 face neighbours must have data (generate() pregenerates
+        // near spawn); C's own light stays unset so `light_ready(c)` is false
+        // and `chunk_light_blocked(c)` holds without touching the light worklist.
+        for n in std::iter::once(c).chain(crate::coord::Face::ALL.iter().map(|&f| c.step(f))) {
+            world.chunks.get_mut(&n).expect("neighbourhood pregenerated near spawn");
+        }
+        world.chunks.get_mut(&c).unwrap().light = None;
+        world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh { building: false };
+        assert!(world.neighbours_have_data(c));
+        assert!(world.in_mesh_box(c));
+        assert!(world.chunk_light_blocked(c), "no published light: c is light-blocked");
+
+        // Seed C and run the gate once to start its wait timer (the same call
+        // `stream` makes just before the mesh-admit lane).
+        world.mesh_worklist.insert(c);
+        world.tick_light_gate();
+        assert!(
+            world.light_gate.blocked_since.contains_key(&c),
+            "the gate must start timing a freshly-blocked worklist entry"
+        );
+        assert!(!world.light_wait_expired(c), "not yet past the wait budget");
+
+        // Back-date the timer past LIGHT_WAIT_DEGRADE without sleeping — the
+        // gate's expiry is wall-clock, so this is the only deterministic way to
+        // reach the expired state.
+        world.light_gate.blocked_since.insert(c, Instant::now() - LIGHT_WAIT_DEGRADE - Duration::from_millis(1));
+        assert!(world.light_wait_expired(c), "back-dated timer must read as expired");
+
+        // Simulate `admit::<MeshLane>`'s real eviction of a blocked seed
+        // (its own `light_wait_expired` doesn't gate `chunk_light_blocked`, so a
+        // seed can be evicted from the worklist between one tick and the next).
+        world.mesh_worklist.remove(&c);
+        assert!(!world.mesh_worklist.contains(&c), "seed evicted, simulating the real path");
+
+        // The next `tick_light_gate` must re-seed it purely from the still-open
+        // timer, with no dependency on `c` already being in the worklist.
+        world.tick_light_gate();
+        assert!(
+            world.mesh_worklist.contains(&c),
+            "eviction-stall regression: an expired-but-evicted chunk must be re-seeded"
+        );
+        assert!(world.pending_fresh.get(), "re-armed: the fresh scan will pick it up");
+        assert!(
+            <MeshLane as StreamLane>::ready(&world, c),
+            "expired wait admits a degraded mesh even though light never settled"
+        );
     }
 }

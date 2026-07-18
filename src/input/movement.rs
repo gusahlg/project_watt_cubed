@@ -414,7 +414,7 @@ mod tests {
         }
         // Feet on top of the runway: eye = feet + standing eye offset.
         let mut player = Player::new(DVec3::new(x, (floor_y + 1) as f64 + stand_eye(), z));
-        player.yaw = 0.0; // forward = +X
+        player.orientation.yaw = 0.0; // forward = +X
         player
     }
 
@@ -456,7 +456,7 @@ mod tests {
         let start_x = WORLD_BORDER - 1000.0;
         let mut player = Player::new(DVec3::new(start_x, 300.0, 0.5));
         player.set_flying(true);
-        player.yaw = 0.0; // forward = +X, straight at the border
+        player.orientation.yaw = 0.0; // forward = +X, straight at the border
 
         // 2000 steps x 0.1s x 14 units/s = 2800 blocks of intent: crosses the
         // remaining 1000 and keeps pushing.

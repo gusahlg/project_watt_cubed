@@ -1,4 +1,4 @@
-//! Stack mesher: turns a [`Section`]'s RLE columns straight into GPU-ready
+//! Stack mesher: turns a [`Section`]'s brick stacks straight into GPU-ready
 //! [`MeshData`] — no intermediate voxel grid.
 //!
 //! Each solid run emits up to six faces. Vertical faces split where column heights differ
@@ -10,13 +10,15 @@
 //! z-fighting with adjacent sections at different detail levels.
 //!
 //! Output: a 2×2 grid of 16³-cell blocks per section, only for the vertical range occupied
-//! by solid geometry (sky/deep space cost nothing). No ambient occlusion; skylight is
-//! per-run baked nibble, enabling parallel meshing.
+//! by solid geometry (sky/deep space cost nothing). Per-corner AO samples neighbour-column
+//! occupancy within the quadrant (quadrant-border corners see no occluder, so read
+//! unoccluded); light is not baked — every vertex takes neutral daylight (full sky, no
+//! blocklight) so coarse tiles track day/night.
 use glam::UVec3;
 use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
 
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{DOMAIN_H, FULL_SKYLIGHT, SECTION_N, Section};
+use super::{BrickStack, DOMAIN_H, SECTION_N, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
 
 /// One block's mesh plus its origin in cells within the section. Only non-empty blocks appear.
@@ -25,26 +27,36 @@ pub(in crate::world) type SectionMeshData = Vec<(UVec3, ChunkMeshData)>;
 /// Cells per mesh-block edge — the 5-bit vertex position range (`0..=16`). Fixed by design.
 const BLOCK: i32 = 16;
 const QUAD_N: usize = SECTION_N / 2;
+#[cfg(test)]
 const BLOCKS_XZ: i32 = SECTION_N as i32 / BLOCK;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
 
 /// One solid-or-air run of a column expressed in CELL coordinates (`[lo, hi)`,
-/// bottom-up), with its block and baked skylight. Air runs are kept so a
-/// neighbour lookup over the whole stack is a plain scan.
+/// bottom-up), with its block. Air runs are kept so a neighbour lookup over the
+/// whole stack is a plain scan.
 #[derive(Clone, Copy)]
 struct CellRun {
     lo: i32,
     hi: i32,
     block: BlockId,
-    sky: u8,
 }
 
-/// Merge key: block, skylight, micro must match; border faces never merge into interior.
+/// Merge key: block, micro, and AO must all match — an AO gradient must never
+/// merge into a flat quad (mirrors the chunk mesher's `FaceSample`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FaceSample {
     block: BlockId,
-    sky: u8,
     micro: [i8; 3],
+    ao: [u8; 4],
+}
+
+/// Per-vertex AO level `0..=3` (`3` = unoccluded) from its three occluders;
+/// two touching sides fully occlude the corner. Same model as the chunk mesher.
+fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
+    if side1 && side2 {
+        return 0;
+    }
+    3 - (side1 as u8 + side2 as u8 + corner as u8)
 }
 
 /// Face direction with corner winding; micro-offset zero for verticals (never borders).
@@ -114,38 +126,49 @@ fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
     tables.opaque[nbr.0 as usize] || nbr == my
 }
 
-/// Explode one column's top-down metre runs into bottom-up CELL runs tiling
-/// `[0, n_cells)`. Run heights must be whole cells; the block partition and
-/// vertex encoding depend on it, so we assert rather than assume.
-fn column_cells(section: &Section, ix: usize, iz: usize, n_cells: i32) -> Vec<CellRun> {
-    let cell = section.pos().cell_size();
-    let col = section.column(ix, iz);
-    let pal = section.palette();
-    let mut runs = Vec::with_capacity(col.runs().len());
-    let mut top = n_cells;
-    for &r in col.runs() {
-        debug_assert_eq!(r.height() as i32 % cell, 0, "run height is not a whole number of cells");
-        let lo = top - r.height() as i32 / cell;
-        runs.push(CellRun { lo, hi: top, block: pal.get(r.id()), sky: r.skylight() });
-        top = lo;
+/// Decode one quadrant-local column (ix, iz in 0..16) into bottom-up CellRuns
+/// tiling `[0, n_cells)` over the quadrant's [`BrickStack`].
+fn column_cells(stack: &BrickStack, ix: usize, iz: usize) -> Vec<CellRun> {
+    let mut runs = Vec::new();
+    let mut lo = 0i32;
+    for run in stack.column_runs(ix, iz) {
+        let hi = lo + run.count;
+        runs.push(CellRun { lo, hi, block: run.block });
+        lo = hi;
     }
-    debug_assert_eq!(top, 0, "cell runs must tile the domain");
-    runs.reverse();
     runs
 }
 
-/// The `(block, skylight)` at cell `cy` of a column (assumed in `[0, n_cells)`).
+/// The block at cell `cy` of a column (assumed in `[0, n_cells)`).
 #[inline]
-fn cell_at(runs: &[CellRun], cy: i32) -> (BlockId, u8) {
+fn cell_at(runs: &[CellRun], cy: i32) -> BlockId {
     for r in runs {
         if cy >= r.lo && cy < r.hi {
-            return (r.block, r.sky);
+            return r.block;
         }
     }
-    (AIR, 0)
+    AIR
+}
+
+/// Opaque-occupancy probe for AO sampling: below-floor reads solid (matches the
+/// cull rule's "solid ground"), above-ceiling and outside the quadrant read air
+/// (matches the border-overdraw convention) — never data this quadrant lacks.
+fn occluder(cols: &[Vec<CellRun>], n_cells: i32, tables: &HotTables, p: [i32; 3]) -> bool {
+    let [px, py, pz] = p;
+    if py < 0 {
+        return true;
+    }
+    if py >= n_cells || px < 0 || px >= QUAD_N as i32 || pz < 0 || pz >= QUAD_N as i32 {
+        return false;
+    }
+    let id = cell_at(&cols[px as usize + pz as usize * QUAD_N], py);
+    tables.opaque[id.0 as usize]
 }
 
 /// Sample a face: cull if covered by neighbor; overdraw section edges as air.
+/// Per-corner AO reads the two in-plane occluders plus the diagonal, in the
+/// layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
+/// uses, just backed by column runs instead of a padded voxel grid.
 fn face_sample(
     cols: &[Vec<CellRun>],
     n_cells: i32,
@@ -158,32 +181,44 @@ fn face_sample(
         return None; // above the ceiling in the top block: no cell here
     }
     let col = &cols[sx as usize + sz as usize * QUAD_N];
-    let (me, _) = cell_at(col, sy);
+    let me = cell_at(col, sy);
     if me == AIR {
         return None;
     }
     let d = dir.normal.direction();
     let (nx, ny, nz) = (sx + d[0] as i32, sy + d[1] as i32, sz + d[2] as i32);
     let mut micro = [0i8; 3];
-    let (nbr, sky) = if dir.n_axis == 1 {
+    let nbr = if dir.n_axis == 1 {
         if ny < 0 {
             return None; // below the floor: solid ground, never a silhouette
         } else if ny >= n_cells {
-            (AIR, FULL_SKYLIGHT) // above the ceiling: open sky
+            AIR // above the ceiling: open sky
         } else {
             cell_at(col, ny)
         }
     } else if nx < 0 || nx >= QUAD_N as i32 || nz < 0 || nz >= QUAD_N as i32 {
-        // Quadrant border: overdraw as air, nudge inward. Light as sky (not buried cell's dark skylight).
+        // Quadrant border: overdraw as air, nudge inward.
         micro = dir.micro;
-        (AIR, FULL_SKYLIGHT)
+        AIR
     } else {
         cell_at(&cols[nx as usize + nz as usize * QUAD_N], ny)
     };
     if covered(me, nbr, tables) {
         return None;
     }
-    Some(FaceSample { block: me, sky, micro })
+    let o = [nx, ny, nz];
+    let occ = |eu: i32, ev: i32| {
+        let mut p = o;
+        p[dir.u_axis] += eu;
+        p[dir.v_axis] += ev;
+        occluder(cols, n_cells, tables, p)
+    };
+    let ao = std::array::from_fn(|i| {
+        let eu = if dir.corners[i][1] > 0 { 1 } else { -1 };
+        let ev = if dir.corners[i][2] > 0 { 1 } else { -1 };
+        vertex_ao(occ(eu, 0), occ(0, ev), occ(eu, ev))
+    });
+    Some(FaceSample { block: me, micro, ao })
 }
 
 /// Greedy-mesh one block: merge adjacent quads with identical properties.
@@ -263,7 +298,7 @@ fn emit(
     // Route water to opaque pass (no animated texturing at LOD range).
     let is_water = tables.water[layer as usize];
     let pass = if is_water { Pass::Opaque } else { tables.layer[layer as usize] };
-    let corners = std::array::from_fn(|i| {
+    let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
         let cr = dir.corners[i];
         let mut pos = [0u32; 3];
         pos[dir.n_axis] = origin[dir.n_axis] + cr[0];
@@ -275,15 +310,19 @@ fn emit(
             // Vertex layer only (tables above index by the true id); wraps
             // past the device texture-layer cap like the chunk mesher.
             layer % tables.layer_cap,
-            Ao::NONE,
-            // Self-emission from the hot table: a luminous material must not
-            // go dark the moment it crosses the full-res/LOD boundary. No
-            // coarse flood — the glow is the block's own, not its spill.
-            Light::new(sample.sky, tables.emission[layer as usize]),
+            Ao::new(sample.ao[i]),
+            // Coarse LOD tiles have no smooth-light field — neutral daylight so
+            // their shading tracks day/night via skylight rather than clamping.
+            Light::DAY,
             false,
         )
         .with_micro(sample.micro)
     });
+    // Same anisotropy fix as the chunk mesher: rotate the quad so the fixed
+    // diagonal falls on the darker corner pair, not the brighter one.
+    if (sample.ao[0] as u32 + sample.ao[2] as u32) < (sample.ao[1] as u32 + sample.ao[3] as u32) {
+        corners.rotate_left(1);
+    }
     out[pass].quad(corners);
 }
 
@@ -304,10 +343,8 @@ pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables
 /// caller positions them the same way regardless of quadrant.
 fn build_quadrant(section: &Section, tables: &HotTables, q: u8, n_cells: i32) -> SectionMeshData {
     let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
-    // Just this quadrant's columns, indexed locally over QUAD_N×QUAD_N.
-    let cols: Vec<Vec<CellRun>> = (0..QUAD_N * QUAD_N)
-        .map(|i| column_cells(section, qx * QUAD_N + i % QUAD_N, qz * QUAD_N + i / QUAD_N, n_cells))
-        .collect();
+    let stack = &section.quadrants[q as usize];
+    let cols: Vec<Vec<CellRun>> = (0..QUAD_N * QUAD_N).map(|i| column_cells(stack, i % QUAD_N, i / QUAD_N)).collect();
 
     // The vertical slab that actually holds solid runs — sky and deep space are
     // skipped entirely, so K is small for thin terrain.
@@ -345,9 +382,8 @@ mod tests {
     use voxel_engine::Pass;
     use crate::world::section::{FINEST_DETAIL, SectionPos};
 
-    // -- fixtures ----------------------------------------------------------
+    // Test fixtures
 
-    /// Test generator for reusable terrain setup.
     struct FnGen<H, B> {
         h: H,
         b: B,
@@ -394,7 +430,7 @@ mod tests {
     }
 
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
-    const CELL: i32 = 1 << FINEST_DETAIL;
+    const CELL: i32 = 1 << FINEST_DETAIL.0;
 
     /// Terrain with configurable surface height, water table, and floating shelf.
     fn terrain_gen(
@@ -426,11 +462,14 @@ mod tests {
         }
     }
 
+    fn extract(pos: SectionPos, g: &impl TerrainGenerator) -> Section {
+        Section::extract(pos, g, &[], voxel_engine::Rev::START)
+    }
+
     fn mesh_of(section: &Section, tables: &HotTables) -> [SectionMeshData; 4] {
         build_section_mesh(section, tables)
     }
 
-    /// Iterate all quads across all quadrants with their origins and passes.
     fn all_quads<'a>(mesh: &'a [SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &'a [MeshVertex])> {
         mesh.iter().flatten().flat_map(|(origin, data)| {
             Pass::ALL.into_iter().flat_map(move |p| {
@@ -464,12 +503,12 @@ mod tests {
         }
     }
 
-    // -- cases -------------------------------------------------------------
+    // Test cases
 
     #[test]
     fn flat_terrain_shows_tops_and_only_border_side_walls() {
         let (_r, tables, b) = setup();
-        let sec = Section::extract(FINEST, &terrain_gen(&b, 200, 0, None), &[]);
+        let sec = extract(FINEST, &terrain_gen(&b, 200, 0, None));
         let mesh = mesh_of(&sec, &tables);
         assert!(!mesh.is_empty(), "flat ground has geometry");
         assert!(normals_present(&mesh, Normal::PosY), "the surface has a top");
@@ -490,57 +529,10 @@ mod tests {
         }
     }
 
-    /// G-11: a luminous material must keep its glow across the full-res→LOD
-    /// boundary — exposed far vertices carry the block's self-emission from
-    /// the hot table instead of hardwired zero blocklight.
-    #[test]
-    fn luminous_surfaces_keep_emission_in_the_far_mesh() {
-        let (r, tables, b) = setup();
-        // Any compiled block that emits (element worldgen places Lumin unions).
-        let lumin = BlockId(
-            tables
-                .emission
-                .iter()
-                .position(|&e| e > 0)
-                .expect("the compiled palette contains a luminous block") as u16,
-        );
-        let expected = tables.emission[lumin.0 as usize];
-
-        // Flat luminous ground. Whole-column lumin, so the coarse cell centres
-        // sample it regardless of the finest detail's cell size.
-        let r#gen = FnGen {
-            h: move |_, _| 96,
-            b: move |_, y, _| if y < 96 { lumin } else { AIR },
-            surf: lumin,
-            deep: lumin,
-        };
-        let _ = (b.stone, b.dirt);
-        let sec = Section::extract(FINEST, &r#gen, &[]);
-        let mesh = mesh_of(&sec, &tables);
-        let mut tops = 0;
-        for (_, _, q) in all_quads(&mesh) {
-            if q[0].normal() != Normal::PosY {
-                continue;
-            }
-            tops += 1;
-            for v in q {
-                assert_eq!(
-                    v.light(),
-                    Light::new(FULL_SKYLIGHT, expected),
-                    "far vertices must carry the block's self-emission"
-                );
-            }
-        }
-        assert!(tops > 0, "the luminous surface must emit top faces");
-
-        // Sanity: the registry agrees this block really emits.
-        assert!(r.hot_tables().emission[lumin.0 as usize] > 0);
-    }
-
     #[test]
     fn air_only_section_is_empty() {
         let (_r, tables, b) = setup();
-        let sec = Section::extract(FINEST, &terrain_gen(&b, 0, 0, None), &[]);
+        let sec = extract(FINEST, &terrain_gen(&b, 0, 0, None));
         assert!(mesh_of(&sec, &tables).iter().all(|q| q.is_empty()), "an all-air section meshes to nothing");
     }
 
@@ -567,7 +559,7 @@ mod tests {
             surf: grass,
             deep: stone,
         };
-        let sec = Section::extract(FINEST, &r#gen, &[]);
+        let sec = extract(FINEST, &r#gen);
         let mesh = mesh_of(&sec, &tables);
         assert_winds_outward(&mesh);
         assert!(normals_present(&mesh, Normal::NegY), "the floating slab shows its underside");
@@ -583,7 +575,7 @@ mod tests {
     fn lod_water_routes_to_opaque_with_no_internal_walls() {
         let (_r, tables, b) = setup();
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
-        let sec = Section::extract(FINEST, &terrain_gen(&b, 40, 80, None), &[]);
+        let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
         let is_water_quad = |q: &[MeshVertex]| tables.water[q[0].layer() as usize];
         let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(q));
@@ -611,7 +603,7 @@ mod tests {
     #[test]
     fn every_vertex_is_block_local_and_blocks_tile_without_overlap() {
         let (_r, tables, b) = setup();
-        let sec = Section::extract(FINEST, &terrain_gen(&b, 200, 0, Some((300, 320))), &[]);
+        let sec = extract(FINEST, &terrain_gen(&b, 200, 0, Some((300, 320))));
         let mesh = mesh_of(&sec, &tables);
         let mut seen = std::collections::HashSet::new();
         for (origin, data) in mesh.iter().flatten() {
@@ -630,7 +622,7 @@ mod tests {
     #[test]
     fn a_flat_top_merges_and_a_checkerboard_does_not() {
         let (_r, tables, b) = setup();
-        let flat = Section::extract(FINEST, &terrain_gen(&b, 200, 0, None), &[]);
+        let flat = extract(FINEST, &terrain_gen(&b, 200, 0, None));
         let tops = all_quads(&build_section_mesh(&flat, &tables))
             .filter(|(_, _, q)| q[0].normal() == Normal::PosY)
             .count();
@@ -653,7 +645,7 @@ mod tests {
             surf: grass,
             deep: stone,
         };
-        let sec = Section::extract(FINEST, &checker, &[]);
+        let sec = extract(FINEST, &checker);
         let mesh = build_section_mesh(&sec, &tables);
         let top_quads = all_quads(&mesh).filter(|(_, _, q)| q[0].normal() == Normal::PosY).count();
         assert!(top_quads > 100, "checkerboard tops must not merge (got {top_quads})");
@@ -663,7 +655,7 @@ mod tests {
     fn meshing_is_deterministic() {
         let (_r, tables, _b) = setup();
         let r#gen = SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
-        let sec = Section::extract(FINEST, &r#gen, &[]);
+        let sec = extract(FINEST, &r#gen);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);
         let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
@@ -681,9 +673,8 @@ mod tests {
 
     #[test]
     fn each_quadrant_mesh_stays_within_its_xz_bounds() {
-        // Quadrants don't leak into adjacent quadrants' XZ bands.
         let (_r, tables, b) = setup();
-        let sec = Section::extract(FINEST, &terrain_gen(&b, 200, 0, Some((260, 280))), &[]);
+        let sec = extract(FINEST, &terrain_gen(&b, 200, 0, Some((260, 280))));
         let mesh = build_section_mesh(&sec, &tables);
         for (q, quad) in mesh.iter().enumerate() {
             let (lox, loz) = (((q & 1) * QUAD_N) as f32, ((q >> 1) * QUAD_N) as f32);
@@ -703,13 +694,14 @@ mod tests {
 
     #[test]
     fn coarser_detail_agrees_on_the_exposed_surface() {
-        // Coarser detail levels still have a visible surface.
         let (_r, tables, b) = setup();
-        for detail in [FINEST_DETAIL, FINEST_DETAIL + 2, FINEST_DETAIL + 4, FINEST_DETAIL + 6] {
+        use crate::ident::Detail;
+        let k = FINEST_DETAIL.0;
+        for detail in [FINEST_DETAIL, Detail(k + 2), Detail(k + 4), Detail(k + 6)] {
             let pos = SectionPos { detail, x: 0, z: 0 };
-            let sec = Section::extract(pos, &terrain_gen(&b, 200, 0, None), &[]);
+            let sec = extract(pos, &terrain_gen(&b, 200, 0, None));
             let mesh = build_section_mesh(&sec, &tables);
-            assert!(normals_present(&mesh, Normal::PosY), "detail {detail} lost the top surface");
+            assert!(normals_present(&mesh, Normal::PosY), "detail {detail:?} lost the top surface");
             assert_winds_outward(&mesh);
         }
     }

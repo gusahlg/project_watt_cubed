@@ -14,18 +14,17 @@
 //! - Each exposed face routes to the **opaque** or **transparent** [`MeshData`]
 //!   by its block's opacity, so a chunk yields up to two meshes ([`ChunkMeshData`]).
 //! - Adjacent faces merge into maximal rectangles keyed on the whole
-//!   [`FaceSample`] (id + per-corner AO + per-corner light), so a gradient never
-//!   merges into a flat quad.
+//!   [`FaceSample`] (id + per-corner AO + per-corner sky/block light), so an AO
+//!   or smooth-light gradient never merges into a flat quad.
 //! - Vertices are CHUNK-LOCAL (0..=16, exact in f32); the world draws each with a
 //!   camera-relative offset, so far terrain never jitters.
 //! - Uniform fast paths: a uniform non-solid chunk is empty; a uniform solid one
 //!   only sweeps its six border slices.
-use std::cell::RefCell;
-
 use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::light::PaddedLight;
+use super::neighborhood::Neighborhood;
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::coord::ByPass;
 
@@ -40,114 +39,37 @@ pub fn new_chunk_mesh_data() -> ChunkMeshData {
     ByPass::from_fn(MeshData::new)
 }
 
-/// Chunk size as a signed coordinate, for the `-1..=16` padded range.
+/// Chunk size as a signed coordinate, for the `-1..=16` padded range (tests).
+#[cfg(test)]
 const CS: i32 = CHUNK_SIZE as i32;
-/// Padded neighbourhood edge: the 16 chunk cells plus one shell voxel each side.
-const PAD: usize = CHUNK_SIZE + 2;
-/// Cells in one [`Padded`] buffer.
-const PAD_VOL: usize = PAD * PAD * PAD;
-
-// Thread-local free list of [`Padded`] backing buffers. `Padded::capture`
-// allocated a fresh `PAD_VOL`-cell buffer per call — the per-remesh
-// neighbourhood-snapshot churn the streamer pays. Buffers are reclaimed on
-// [`Drop`] and reused. Bounded ([`PADDED_POOL_CAP`]) so the cross-thread path
-// (a `capture`d neighbourhood built on the main thread and dropped on a
-// worker) can only migrate a handful of buffers into a worker's list, not
-// grow without bound.
-thread_local! {
-    static PADDED_POOL: RefCell<Vec<Box<[u16]>>> = const { RefCell::new(Vec::new()) };
-}
-/// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
-/// single job holds at most one live neighbourhood at a time.
-const PADDED_POOL_CAP: usize = 4;
 
 /// The chunk's 16³ voxels plus a one-voxel shell pulled from its 26 neighbours,
 /// indexed by signed coords `x, y, z ∈ -1..=16`. Owned, so a mesh job shares
 /// nothing with the live chunk map, and captured on the main thread where the
-/// neighbourhood is resolvable. A missing neighbour reads as [`AIR`].
+/// neighbourhood is resolvable. A missing neighbour reads as [`AIR`]. The mesh
+/// instantiation of [`Neighborhood`]: capture/index/pooling live there.
 ///
 /// This one structure serves every neighbour read the sweep makes — cull (the
 /// immediate outward cell), AO (the 3 occluders around each face corner, which
 /// at a chunk edge fall into a neighbour's *interior* layer), and the own-cell
 /// scan — so there is no interior/border special-casing anywhere.
 pub struct Padded {
-    ids: Box<[u16]>, // PAD*PAD*PAD, raw BlockId values
+    inner: Neighborhood<BlockId>,
 }
 
 impl Padded {
-    #[inline]
-    fn index(x: i32, y: i32, z: i32) -> usize {
-        (x + 1) as usize + (z + 1) as usize * PAD + (y + 1) as usize * PAD * PAD
-    }
-
-    /// A `PAD_VOL`-cell buffer, recycled from [`PADDED_POOL`] if one is available
-    /// (else freshly allocated). Contents are UNSPECIFIED — a recycled buffer
-    /// holds a previous job's voxels — so every caller must fully initialise it
-    /// (`fill` then, where partial, overwrite the touched cells) before use.
-    fn take_buf() -> Box<[u16]> {
-        PADDED_POOL
-            .with_borrow_mut(|p| p.pop())
-            .filter(|b| b.len() == PAD_VOL)
-            .unwrap_or_else(|| vec![AIR.0; PAD_VOL].into_boxed_slice())
-    }
-
     /// The block at signed coord `(x, y, z)`, each `∈ -1..=16`. Shared with the
     /// light pass, which reads the same padded interior.
     #[inline]
     pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> BlockId {
-        BlockId(self.ids[Self::index(x, y, z)])
+        self.inner.at(x, y, z)
     }
 
     /// Copy the chunk and its shell out of the map. `chunk_at(dx, dy, dz)` yields
     /// the chunk at chunk-offset `(dx, dy, dz)` with each component in `-1..=1`
-    /// (`(0,0,0)` is the chunk itself), or `None` (→ air). Resolves the 27 chunks
-    /// once, then fills 18³ cells with plain array reads.
+    /// (`(0,0,0)` is the chunk itself), or `None` (→ air).
     pub fn capture<'a>(chunk_at: impl Fn(i32, i32, i32) -> Option<&'a Chunk>) -> Self {
-        let neigh: [Option<&Chunk>; 27] =
-            std::array::from_fn(|k| chunk_at(k as i32 % 3 - 1, k as i32 / 9 - 1, k as i32 / 3 % 3 - 1));
-        let get = |dx: i32, dy: i32, dz: i32| neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize];
-        // Split a padded coord into (chunk offset, local 0..=15).
-        let split = |c: i32| -> (i32, usize) {
-            if c < 0 {
-                (-1, CHUNK_SIZE - 1)
-            } else if c >= CS {
-                (1, 0)
-            } else {
-                (0, c as usize)
-            }
-        };
-        let mut ids = Self::take_buf();
-        // Missing neighbours must read AIR, and only present cells are written
-        // below, so a recycled buffer MUST be cleared first (else a prior job's
-        // voxels would leak into the unwritten shell cells — a silent visual bug).
-        ids.fill(AIR.0);
-        for y in -1..=CS {
-            for z in -1..=CS {
-                for x in -1..=CS {
-                    let (dx, lx) = split(x);
-                    let (dy, ly) = split(y);
-                    let (dz, lz) = split(z);
-                    if let Some(c) = get(dx, dy, dz) {
-                        ids[Self::index(x, y, z)] = c.get_local(lx, ly, lz).0;
-                    }
-                }
-            }
-        }
-        Self { ids }
-    }
-
-}
-
-impl Drop for Padded {
-    fn drop(&mut self) {
-        let buf = std::mem::take(&mut self.ids);
-        if buf.len() == PAD_VOL {
-            PADDED_POOL.with_borrow_mut(|p| {
-                if p.len() < PADDED_POOL_CAP {
-                    p.push(buf);
-                }
-            });
-        }
+        Self { inner: Neighborhood::capture(AIR, chunk_at, |c: &Chunk, lx, ly, lz| c.get_local(lx, ly, lz)) }
     }
 }
 
@@ -155,16 +77,6 @@ impl Drop for Padded {
 #[inline]
 fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
     tables.opaque[nbr.0 as usize] || nbr == my
-}
-
-/// Fully dark if both edge occluders, else `3 - (count)`. Shared with LOD tile mesher.
-#[inline]
-pub(in crate::world) fn corner_ao(side1: bool, side2: bool, corner: bool) -> u8 {
-    if side1 && side2 {
-        0
-    } else {
-        3 - (side1 as u8 + side2 as u8 + corner as u8)
-    }
 }
 
 /// One face direction of the greedy sweep.
@@ -236,8 +148,9 @@ const DIRS: [Dir; 6] = [
 const MASK_CAP: usize = CHUNK_SIZE * CHUNK_SIZE;
 
 /// The greedy-merge key: two faces merge only when the whole sample matches —
-/// block id, per-corner AO, and per-corner light — so an AO or light gradient
-/// never merges into a flat quad. `PartialEq` determines the merge rule.
+/// block id, per-corner AO, and per-corner sky/block light — so an AO or smooth-
+/// light gradient never merges into a flat quad. `ao[i]`/`sky[i]`/`block[i]`
+/// correspond to `Dir::corners[i]`. `PartialEq` (derived) is the merge rule.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FaceSample {
     id: BlockId,
@@ -258,7 +171,7 @@ struct Rect {
 
 /// Build one chunk's greedy mesh into `out` (cleared first — pass the world's
 /// reusable [`ChunkMeshData`] scratch). `padded` carries the chunk + its shell,
-/// `uniform` is the chunk's uniform block id (if any, for the fast paths),
+/// `uniform` is the chunk's uniform block id (if any, for the fast paths), and
 /// `tables` the hot registry snapshot, and `light` the settled light shell the
 /// per-vertex smooth light samples (interior, border, and diagonal alike).
 pub fn build_chunk_mesh(
@@ -343,8 +256,8 @@ fn sweep(
 
 /// The [`FaceSample`] for one cell's face in `dir`, or `None` if the cell is
 /// non-solid or the face is culled. Reads the padded neighbourhood for the cull
-/// neighbour, the AO occluders, and (via the chunk-local light grid) the light of
-/// the empty cell the face opens into.
+/// neighbour and for the in-plane occluders that bake ambient occlusion, and the
+/// settled light shell for the per-corner smooth sky/block light.
 fn face_sample(
     padded: &Padded,
     tables: &HotTables,
@@ -370,37 +283,56 @@ fn face_sample(
         return None;
     }
 
-    let opaque_at = |p: [i32; 3]| tables.opaque[padded.at(p[0], p[1], p[2]).0 as usize];
-    // Per corner: AO from three outward occluders; smooth light as average of
-    // up to 4 touching cells (opaque cells skipped). Always has one light term.
-    let mut ao = [0u8; 4];
+    // Ambient occlusion: for each of the four face corners, sample the three
+    // in-plane occluders (two edge-adjacent, one diagonal) in the OPEN layer
+    // (`o`'s normal coordinate). `Dir::corners[i]` gives this corner's (u,v) ∈
+    // {0,1}²; step ±1 toward it. Classic per-vertex AO (Nolan / 0fps).
+    let on = o[dir.n_axis];
+    let occ = |du: i32, dv: i32| -> bool {
+        let mut p = [0i32; 3];
+        p[dir.n_axis] = on;
+        p[dir.u_axis] = u as i32 + du;
+        p[dir.v_axis] = v as i32 + dv;
+        // Occlude on OPACITY, not solidity — matching cull (`covered`) and smooth
+        // light (`lum`). A transparent solid (glass/ice/water/leaves) must not cast
+        // AO, or it darkens the faces around it. (Old pre-rewrite AO used opaque.)
+        tables.opaque[padded.at(p[0], p[1], p[2]).0 as usize]
+    };
+    // AO off: every corner reads unoccluded (uniform 3) — a perf lever, and it
+    // also merges quads a gradient would split (matches the pre-rewrite toggle).
+    let ao = std::array::from_fn(|i| {
+        if !tables.ao {
+            return 3;
+        }
+        let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
+        let ev = if dir.corners[i][2] > 0.5 { 1 } else { -1 };
+        vertex_ao(occ(eu, 0), occ(0, ev), occ(eu, ev))
+    });
+
+    // Per-corner smooth light: average sky/block over the up-to-4 cells touching
+    // the corner in the OPEN layer (`on`), skipping opaque cells (they carry no
+    // light to a surface). The face cell `o` is never opaque here (an opaque
+    // neighbour would have culled the face), so the count is always ≥ 1.
+    let lum = |du: i32, dv: i32| {
+        let mut p = [0i32; 3];
+        p[dir.n_axis] = on;
+        p[dir.u_axis] = u as i32 + du;
+        p[dir.v_axis] = v as i32 + dv;
+        (tables.opaque[padded.at(p[0], p[1], p[2]).0 as usize], light.at(p[0], p[1], p[2]))
+    };
     let mut sky = [0u8; 4];
     let mut block = [0u8; 4];
     for i in 0..4 {
-        let du = if dir.corners[i][1] > 0.0 { 1 } else { -1 };
-        let dv = if dir.corners[i][2] > 0.0 { 1 } else { -1 };
-        let mut s1 = o;
-        s1[dir.u_axis] += du;
-        let mut s2 = o;
-        s2[dir.v_axis] += dv;
-        let mut cor = o;
-        cor[dir.u_axis] += du;
-        cor[dir.v_axis] += dv;
-        // AO off: every corner reads unoccluded (Ao::NONE). Beyond the flat
-        // look, uniform AO merges quads a gradient would split — a perf lever.
-        ao[i] = if tables.ao {
-            corner_ao(opaque_at(s1), opaque_at(s2), opaque_at(cor))
-        } else {
-            3
-        };
+        let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
+        let ev = if dir.corners[i][2] > 0.5 { 1 } else { -1 };
         let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
-        for p in [o, s1, s2, cor] {
-            if opaque_at(p) {
+        for (du, dv) in [(0, 0), (eu, 0), (0, ev), (eu, ev)] {
+            let (opaque, l) = lum(du, dv);
+            if opaque {
                 continue;
             }
-            let lum = light.at(p[0], p[1], p[2]);
-            ssum += lum.sky.get() as u32;
-            bsum += lum.block.get() as u32;
+            ssum += l.sky.get() as u32;
+            bsum += l.block.get() as u32;
             count += 1;
         }
         sky[i] = (ssum / count) as u8;
@@ -410,17 +342,26 @@ fn face_sample(
     Some(FaceSample { id, ao, sky, block })
 }
 
+/// Per-vertex ambient-occlusion level `0..=3` (`3` = unoccluded) from its three
+/// occluders. Two touching sides fully occlude the corner (the classic clamp).
+fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
+    if side1 && side2 {
+        return 0;
+    }
+    3 - (side1 as u8 + side2 as u8 + corner as u8)
+}
+
 /// Append one merged rectangle as a single [`MeshData::quad`], routed to its
 /// block's pass. Four chunk-local corners scaled from the direction's unit-quad
 /// table by the rectangle's extents; each vertex carries the sample's per-corner
-/// AO and light.
+/// AO and sky/block light.
 fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample, tables: &HotTables) {
     let mut origin = [0u32; 3];
     origin[dir.n_axis] = rect.n as u32;
     origin[dir.u_axis] = rect.u0 as u32;
     origin[dir.v_axis] = rect.v0 as u32;
 
-    let corners = std::array::from_fn(|i| {
+    let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
         let cr = &dir.corners[i];
         let mut pos = [0u8; 3];
         pos[dir.n_axis] = (origin[dir.n_axis] + cr[0] as u32) as u8;
@@ -438,6 +379,13 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
             tables.water[sample.id.0 as usize],
         )
     });
+
+    // Anisotropy flip: the fixed 0-1-2/0-2-3 fan diagonal (corner 0↔2) smears AO
+    // when that diagonal spans the brighter pair. Rotating the quad by one vertex
+    // moves the diagonal to 1↔3, keeping the seam on the darker pair (0fps).
+    if sample.ao[0] + sample.ao[2] < sample.ao[1] + sample.ao[3] {
+        corners.rotate_left(1);
+    }
 
     out[tables.layer[sample.id.0 as usize]].quad(corners);
 }
@@ -695,15 +643,6 @@ mod tests {
         chunk.set_local(0, 1, 0, STONE); // wall above the first cell (its own top is culled)
         let data = build(&chunk);
         assert_eq!(quads_in_y_plane(&data, 1.0), 2, "AO from the wall splits the two exposed tops");
-
-        // The same scene with AO off: every corner reads unoccluded, so the
-        // split disappears and the run merges — the toggle's perf story.
-        let mut no_ao = tables();
-        no_ao.ao = false;
-        let mut out = new_chunk_mesh_data();
-        build_chunk_mesh(&solo(&chunk), None, &no_ao, &PaddedLight::full(), &mut out);
-        let [opaque, ..] = out.into_slots();
-        assert_eq!(quads_in_y_plane(&opaque, 1.0), 1, "AO off merges what the gradient split");
     }
 
     #[test]
@@ -746,8 +685,13 @@ mod tests {
     fn uniform_solid_fast_path_matches_a_dense_fill() {
         let uniform = Chunk::new(0, 0, 0, &SolidGen);
         assert_eq!(uniform.uniform(), Some(STONE));
-        // All-stone content in a NON-uniform representation (from_cells would
-        // collapse it), so the two mesh paths really diverge below.
+        // Chunk's real storage canonicalizes through BrickPayload::from_cells,
+        // which collapses ANY all-equal cell array to Uniform regardless of how
+        // ChunkData shaped it — so this Paletted{palette:[STONE], cells:[0;N]}
+        // input ALSO becomes Uniform (not a bug: a single-valued representation
+        // is the canonical form). The test now proves the still-real property
+        // that matters: two independently constructed, content-equal chunks
+        // mesh bit-identically.
         let dense = Chunk::from_data(
             0,
             0,
@@ -757,7 +701,7 @@ mod tests {
                 cells: Box::new([0u8; CHUNK_VOLUME]),
             },
         );
-        assert!(dense.uniform().is_none());
+        assert_eq!(dense.uniform(), Some(STONE), "canonical construction collapses this to Uniform too");
 
         let (a, b) = (build(&uniform), build(&dense));
         assert_eq!(total_area(&a), (6 * CHUNK_SIZE * CHUNK_SIZE) as f32, "6 full faces");

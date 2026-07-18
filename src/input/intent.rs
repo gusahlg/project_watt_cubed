@@ -171,38 +171,53 @@ impl Repeat {
     }
 }
 
-/// Continuous axis binding.
+/// A continuous movement axis: a held key pair, positive wins if both held.
+/// Split from look axes (see [`LookAxis`]) — sampled keys and mouse deltas
+/// have different signatures and were never one concept.
 #[derive(Clone, Copy)]
-pub enum AxisSource {
-    KeyPair { neg: Source, pos: Source },
-    MouseX { sens: f32, invert: bool },
-    MouseY { sens: f32, invert: bool },
+pub enum MovementAxis {
+    KeyPair { neg: Key, pos: Key },
 }
 
-impl AxisSource {
-    /// Key-pair axis only; positive wins if both held.
+impl MovementAxis {
     pub fn sample(self, eng: &Engine) -> f32 {
         match self {
-            AxisSource::KeyPair { neg, pos } => {
-                if pos.is_down(eng) {
+            MovementAxis::KeyPair { neg, pos } => {
+                if eng.is_key_down(pos) {
                     1.0
-                } else if neg.is_down(eng) {
+                } else if eng.is_key_down(neg) {
                     -1.0
                 } else {
                     0.0
                 }
             }
-            _ => 0.0,
         }
     }
+}
 
-    /// Mouse axis only.
-    pub fn mouse_component(self, delta: Vec2) -> f32 {
-        match self {
-            AxisSource::MouseX { sens, invert } => delta.x * sens * if invert { -1.0 } else { 1.0 },
-            AxisSource::MouseY { sens, invert } => delta.y * sens * if invert { -1.0 } else { 1.0 },
-            AxisSource::KeyPair { .. } => 0.0,
-        }
+/// Which mouse-delta component a [`LookAxis`] reads.
+#[derive(Clone, Copy)]
+pub enum MouseAxis {
+    X,
+    Y,
+}
+
+/// A continuous look axis: one mouse-delta component, optionally inverted.
+/// No sensitivity here — that's applied once, uniformly, by
+/// [`Orientation::look`](crate::camera::Orientation::look).
+#[derive(Clone, Copy)]
+pub struct LookAxis {
+    pub axis: MouseAxis,
+    pub invert: bool,
+}
+
+impl LookAxis {
+    pub fn sample(self, delta: Vec2) -> f32 {
+        let raw = match self.axis {
+            MouseAxis::X => delta.x,
+            MouseAxis::Y => delta.y,
+        };
+        if self.invert { -raw } else { raw }
     }
 }
 
@@ -214,12 +229,20 @@ pub enum GameplayState {
     Sprint,
     Sneak,
     Jump,
+    /// Push-to-talk transmit gate. Held (level), not an edge event: the voice
+    /// consumer needs both the press (start capture) and the release (stop) —
+    /// an edge event surfaces only the press. Mirrors Sneak/Sprint.
+    PushToTalk,
 }
 
 impl GameplayState {
-    pub const COUNT: usize = 3;
-    pub const ALL: [GameplayState; Self::COUNT] =
-        [GameplayState::Sprint, GameplayState::Sneak, GameplayState::Jump];
+    pub const COUNT: usize = 4;
+    pub const ALL: [GameplayState; Self::COUNT] = [
+        GameplayState::Sprint,
+        GameplayState::Sneak,
+        GameplayState::Jump,
+        GameplayState::PushToTalk,
+    ];
 }
 
 /// A gameplay edge event (bound to modifier-exact chords).

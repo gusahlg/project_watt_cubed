@@ -1,19 +1,22 @@
 //! Screen-space error budget for LOD selection: measured geometric error per cell
 //! and a test to decide if that error fits within the pixel tolerance at a given
-//! distance. Tested early; wired into LOD selection later.
+//! distance.
 #![allow(dead_code)]
+
+use crate::ident::Detail;
 
 use super::metric::{EyeDist, HeightEnvelope};
 
 /// Geometric error in metres when drawing a cell coarse — an over-approximation
-/// until baking refines it. Worst case: 2^detail (the implicit error from the old ladder).
+/// until baking refines it.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
 pub(in crate::world) struct CellError(f32);
 
 impl CellError {
-    /// Error for a cell with no summary: 2^detail metres (matches the old ladder).
-    pub fn worst_case(detail: u8) -> CellError {
-        CellError((1u32 << detail) as f32)
+    /// Error for a cell with no summary: 2^k metres. `Detail::scale` is `exp2`,
+    /// so this is well-defined at any sign of `k`.
+    pub fn worst_case(detail: Detail) -> CellError {
+        CellError(detail.scale())
     }
     /// A measured error in metres. Still conservative: caller passes the full relief range
     /// which bounds any column's vertical displacement when drawn coarse.
@@ -47,10 +50,10 @@ impl SseBudget {
     }
 
     /// Calibrate the budget to match the old radial ladder exactly at worst case
-    /// (error = 2^detail). This ensures worst-case terrain stays bit-identical,
-    /// while flatter terrain can coarsen further. Backward-compatible by design.
-    pub fn ladder(k: f32, unit: f32, finest: u8) -> SseBudget {
-        SseBudget { tau_px: k * (1u32 << finest) as f32 / unit, k }
+    /// (error = 2^finest), so worst-case terrain stays bit-identical while flatter
+    /// terrain can coarsen further. `finest` is the raw level `k`.
+    pub fn ladder(k: f32, unit: f32, finest: i8) -> SseBudget {
+        SseBudget { tau_px: k * Detail(finest).scale() / unit, k }
     }
 
     /// Test if error at distance d fits within budget. Cross-multiplied to handle d=0 safely.
@@ -65,15 +68,15 @@ mod tests {
 
     #[test]
     fn worst_case_is_two_to_the_detail() {
-        assert_eq!(CellError::worst_case(0).get(), 1.0);
-        assert_eq!(CellError::worst_case(2).get(), 4.0);
-        assert_eq!(CellError::worst_case(5).get(), 32.0);
+        assert_eq!(CellError::worst_case(Detail(0)).get(), 1.0);
+        assert_eq!(CellError::worst_case(Detail(2)).get(), 4.0);
+        assert_eq!(CellError::worst_case(Detail(5)).get(), 32.0);
     }
 
     #[test]
     fn coarse_ok_is_monotone_in_distance_and_total_at_zero() {
         let b = SseBudget::new(2.0, 500.0);
-        let err = CellError::worst_case(4); // 16 m
+        let err = CellError::worst_case(Detail(4)); // 16 m
         // Near: error too large for the budget.
         assert!(!b.coarse_ok(err, EyeDist::new(1.0)));
         // Far enough: fits.
@@ -84,7 +87,7 @@ mod tests {
 
     #[test]
     fn cell_summary_carries_envelope_and_error() {
-        let s = CellSummary { env: HeightEnvelope::new(0.0, 512.0), err: CellError::worst_case(3) };
+        let s = CellSummary { env: HeightEnvelope::new(0.0, 512.0), err: CellError::worst_case(Detail(3)) };
         assert_eq!(s.err.get(), 8.0);
     }
 }

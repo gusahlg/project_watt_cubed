@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{Color, DVec3, Engine};
 
+use crate::audio::{AudioDirector, CuePalette, CueSymbols, OneShot, SoundConfig, SoundSystem};
 use crate::game::{Game, Signal};
 use crate::input::router::{Context, Router, View};
 use crate::menu::menus::MainMenu;
@@ -29,8 +30,6 @@ const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
 /// Background for every non-world screen.
 const MENU_CLEAR: Color = Color::new(18, 20, 28, 255);
-/// How often a dirty world writes itself in the background.
-const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 enum Screen {
     Menus(MenuStack),
@@ -60,6 +59,14 @@ pub struct App {
     /// Headless-ish benchmark mode (`WATT_BENCH=<seconds>`): auto-enters a
     /// world, rotates the camera, prints one stats line, exits.
     bench: Option<Bench>,
+    /// Owns all playback continuation; enters/leaves world state as the screen changes.
+    sound: SoundSystem,
+    /// Cue name → id table resolved once at catalog load; used here to mint the
+    /// menu-click UI cue (the director owns every in-world cue).
+    cues: CueSymbols,
+    /// Gameplay reports facts, this decides sounds. Owns the mic and all
+    /// trace-derived state.
+    audio: AudioDirector,
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -76,7 +83,7 @@ struct ActiveSlot {
 impl ActiveSlot {
     fn new(id: SlotId, meta: SaveMeta) -> Self {
         let playtime = meta.playtime_secs as f64;
-        Self { id, meta, playtime, autosaver: Autosaver::new(AUTOSAVE_INTERVAL) }
+        Self { id, meta, playtime, autosaver: Autosaver::new() }
     }
 }
 
@@ -118,6 +125,17 @@ impl App {
         if bench.is_some() && std::env::var_os("VOXEL_PROFILE").is_none() {
             unsafe { std::env::set_var("VOXEL_PROFILE", "1") };
         }
+        // A missing device or a missing/corrupt catalog degrades to silence — the
+        // client never panics on audio, it just runs muted with a startup warning.
+        let (mut sound, cues) = SoundSystem::with_graceful_degradation(SoundConfig::default());
+        sound.set_mix(settings.mix_change());
+        // A missing or mode-mismatched cue role degrades that cue to silence with
+        // a startup warning, rather than failing catalog load.
+        let (palette, warnings) = CuePalette::build(&cues, sound.catalog());
+        for w in warnings {
+            eprintln!("{w}");
+        }
+        let audio = AudioDirector::new(palette);
         Self {
             saves,
             active: None,
@@ -128,6 +146,9 @@ impl App {
             settings,
             session,
             bench,
+            sound,
+            cues,
+            audio,
         }
     }
 
@@ -222,7 +243,7 @@ impl App {
             return true;
         };
         // A slow spin sweeps the frustum across the terrain like a player would.
-        game.player_mut().yaw += 0.4 * dt;
+        game.player_mut().orientation.yaw += 0.4 * dt;
 
         if bench.warmup > 0.0 {
             bench.warmup -= dt;
@@ -258,12 +279,18 @@ impl App {
     /// Update the menu stack and apply settings live each frame.
     fn update_menus(&mut self, eng: &mut Engine) -> bool {
         let dt = eng.frame_time();
-        // Menus are an exclusive router context.
         self.router.set_context(Context::Menu);
         let intents = match self.router.frame(eng, dt).view() {
             View::Menu(m) => crate::menu::gather(&m),
             _ => Vec::new(),
         };
+        // Menus have no per-frame audio cadence, so this is the one cue emission
+        // site outside the game.
+        if intents.iter().any(|i| matches!(i, crate::menu::Intent::Confirm | crate::menu::Intent::Nav(_))) {
+            if let Some(cue) = self.sound.catalog().typed::<OneShot>(&self.cues, "menu_click") {
+                self.sound.play_ui(cue);
+            }
+        }
         // A per-frame snapshot so a menu never holds a live `&Mods`.
         let mods = ModRow::snapshot(&self.mods);
         let before = self.settings.clone();
@@ -282,6 +309,7 @@ impl App {
         // Persist whenever a step (or a hardware clamp) moved a value.
         if self.settings != before {
             self.settings.save();
+            self.sound.set_mix(self.settings.mix_change());
         }
         match effect {
             Some(effect) => self.handle_effect(eng, effect),
@@ -315,6 +343,10 @@ impl App {
 
     /// Return to the start menu with an optional notice (e.g. a failed connect).
     fn to_menu(&mut self, notice: Option<String>) {
+        self.sound.leave_world();
+        // The director's trace-derived state and mic persist on App across worlds
+        // (unlike the old per-Game fields), so they need an explicit reset here.
+        self.audio.enter_world();
         self.active = None;
         self.saves = save::list();
         self.screen = Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::with_notice(notice))));
@@ -333,7 +365,6 @@ impl App {
             Ok(handle) => {
                 let port = handle.addr().port();
                 self.host = Some(handle);
-                // Connect our own client to the server we just started.
                 match Connection::connect("127.0.0.1", port, &info.name, &info.password) {
                     Ok(conn) => self.enter_net_game(eng, conn),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
@@ -437,6 +468,10 @@ impl App {
         let pos = game.player().position;
         game.world_mut().prepare_around(pos);
         game.on_enter(eng, &mut self.router);
+        self.sound.enter_world();
+        // The director's trace-derived state is world-scoped too, and must reset
+        // in lockstep with `sound`; its occurrence clock stays monotone.
+        self.audio.enter_world();
         self.screen = Screen::Playing(Box::new(game));
     }
 
@@ -446,7 +481,14 @@ impl App {
         let Screen::Playing(game) = &mut self.screen else {
             return;
         };
-        let signal = game.update(eng, &mut self.router, &mut self.mods, &mut self.settings);
+        let signal = game.update(
+            eng,
+            &mut self.router,
+            &mut self.mods,
+            &mut self.settings,
+            &mut self.sound,
+            &mut self.audio,
+        );
         if let Signal::ExitToMenu = signal {
             self.flush_save();
             if let Screen::Playing(game) = &mut self.screen {
@@ -467,11 +509,19 @@ impl App {
         active.playtime += dt;
         active.meta.playtime_secs = active.playtime as u64;
         let ActiveSlot { id, meta, autosaver, .. } = active;
-        let tick = autosaver.tick(id, game.world().edit_generation(), || {
-            save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
-        });
-        if let Tick::Finished(Err(e)) = tick {
+        if let Tick::Finished(Err(e)) = autosaver.poll() {
             game.notify(format!("* autosave failed: {e}"));
+        }
+        // The interval gate is cleared on the attempt, not on success, so a
+        // failing write doesn't retry every frame.
+        if autosaver.wants_write(game.world().edit_generation()) && game.autosave_due() {
+            game.mark_autosave();
+            let started = autosaver.start(id, game.world().edit_generation(), || {
+                save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
+            });
+            if let Tick::Finished(Err(e)) = started {
+                game.notify(format!("* autosave failed: {e}"));
+            }
         }
     }
 

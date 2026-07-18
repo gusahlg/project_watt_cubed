@@ -1,29 +1,23 @@
-//! chunk.rs stores one 16x16x16 cube of voxels. It owns no generation logic of
-//! its own — it asks a [`TerrainGenerator`] to fill itself.
-//!
-//! A cell is a [`BlockId`] — a compact index into the world's
-//! [`BlockRegistry`](crate::block::BlockRegistry), not a block itself. Storage
-//! is the memory backbone of the infinite-Y world: most chunks are all air or
-//! all stone, so [`ChunkData::Uniform`] stores those as one id (~a dozen bytes)
-//! instead of a cell array. Mixed chunks store one *palette index* per cell
-//! ([`ChunkData::Paletted`]): a chunk holds a handful of distinct blocks, so the
-//! cell array stays one byte per cell no matter how wide the global palette
-//! grows. Past [`PALETTE_MAX`] distinct blocks in one chunk (a museum wall of
-//! crafted blocks — legal play, never a crash) storage falls back to one full
-//! [`BlockId`] per cell ([`ChunkData::Dense`]).
+//! [`ChunkData`] is construction vocabulary only: the generator still speaks
+//! it (`from_cells`, `Uniform`), but a [`Chunk`]'s actual storage is
+//! [`Brick`] — one representation, shared with LOD sections.
+//! [`ChunkData::from_cells`] picks the cheapest representation: `Uniform`
+//! when every cell agrees, else palette-indexed cells, else the full-width
+//! fallback for a museum-wall chunk past [`PALETTE_MAX`] distinct blocks
+//! (legal play, never a crash).
 use crate::block::registry::{AIR, BlockId, HotTables};
+use crate::ident::{BlockState, Detail};
+use crate::world::brick::{Brick, BrickPayload, PALETTE_MAX, PackStrategy};
 use crate::world::generation::TerrainGenerator;
 
 /// Chunk edge length along every world axis (chunks are cubes).
 pub const CHUNK_SIZE: usize = 16;
-/// Cells per chunk.
+/// Cells per chunk (== `brick::BRICK_VOLUME`: a chunk is a k=0 brick).
 pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
-/// Distinct blocks a paletted chunk can hold — the `u8` cell index space.
-const PALETTE_MAX: usize = 256;
 
-/// A chunk's voxel storage. `Uniform` is what makes an infinite-Y world
-/// affordable: sky and deep rock cost no array. `Paletted` is the mixed-chunk
-/// workhorse; `Dense` the >[`PALETTE_MAX`]-distinct escape hatch.
+/// Construction-vocabulary storage shape (see module doc). `BlockId`-keyed —
+/// widened to `BlockState{id, state:0}` only at [`Chunk::from_data`]'s
+/// boundary.
 #[derive(Clone, PartialEq, Debug)]
 pub enum ChunkData {
     /// Every cell is this block.
@@ -38,10 +32,8 @@ pub enum ChunkData {
 }
 
 impl ChunkData {
-    /// Build storage from a dense fill, choosing the cheapest representation:
-    /// `Uniform` when every cell agrees, else palette-indexed cells, else the
-    /// full-width fallback. The generator's correctness backstop — every fill
-    /// path funnels through here.
+    /// The generator's correctness backstop — every fill path funnels
+    /// through here.
     pub fn from_cells(cells: Box<[BlockId; CHUNK_VOLUME]>) -> ChunkData {
         let first = cells[0];
         if cells.iter().all(|&c| c == first) {
@@ -74,6 +66,32 @@ impl ChunkData {
     }
 }
 
+/// Widen a construction-vocabulary [`ChunkData`] into the real storage
+/// [`Brick`] (level 0, the k=0 chunk brick). Construction-boundary only —
+/// [`BrickPayload::from_cells`] is never called on a hot path; this runs
+/// once per chunk generation/load, not per edit.
+fn chunk_data_to_brick(data: ChunkData) -> Brick {
+    let mut cells = Box::new([BlockState { id: AIR, state: 0 }; CHUNK_VOLUME]);
+    match data {
+        ChunkData::Uniform(id) => cells.fill(BlockState { id, state: 0 }),
+        ChunkData::Paletted { palette, cells: idx } => {
+            for i in 0..CHUNK_VOLUME {
+                cells[i] = BlockState { id: palette[idx[i] as usize], state: 0 };
+            }
+        }
+        ChunkData::Dense(dense) => {
+            for i in 0..CHUNK_VOLUME {
+                cells[i] = BlockState { id: dense[i], state: 0 };
+            }
+        }
+    }
+    Brick {
+        level: Detail(0),
+        rev: voxel_engine::Rev::START,
+        payload: BrickPayload::from_cells(&cells, PackStrategy::Paletted),
+    }
+}
+
 /// A 16-cube region of the world. `Clone` copies at most the cell array plus a
 /// small palette (uniform chunks clone for free) — used to snapshot a chunk for
 /// a worker-thread mesh job (see [`pipeline`](super::pipeline)), never on a
@@ -86,24 +104,24 @@ pub struct Chunk {
     pub cy: i32,
     /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_SIZE + local z).
     pub cz: i32,
-    data: ChunkData,
+    data: Brick,
 }
 
 impl Chunk {
     /// Create a chunk at the given chunk coordinate and fill it using `generator`.
     pub fn new<G: TerrainGenerator>(cx: i32, cy: i32, cz: i32, generator: &G) -> Self {
-        Self {
-            cx,
-            cy,
-            cz,
-            data: generator.generate(cx, cy, cz),
-        }
+        Self { cx, cy, cz, data: chunk_data_to_brick(generator.generate(cx, cy, cz)) }
     }
 
     /// Build a uniform chunk of one block — for tests that place voxels by hand.
     #[cfg(test)]
     pub fn from_uniform(cx: i32, cy: i32, cz: i32, id: BlockId) -> Self {
-        Self { cx, cy, cz, data: ChunkData::Uniform(id) }
+        Self {
+            cx,
+            cy,
+            cz,
+            data: Brick { level: Detail(0), rev: voxel_engine::Rev::START, payload: BrickPayload::Uniform(BlockState { id, state: 0 }) },
+        }
     }
 
     /// Build a chunk from a raw cell array — for tests. Palettizes through the
@@ -111,14 +129,14 @@ impl Chunk {
     /// representation.
     #[cfg(test)]
     pub fn from_cells(cx: i32, cy: i32, cz: i32, cells: Box<[BlockId; CHUNK_VOLUME]>) -> Self {
-        Self { cx, cy, cz, data: ChunkData::from_cells(cells) }
+        Self { cx, cy, cz, data: chunk_data_to_brick(ChunkData::from_cells(cells)) }
     }
 
     /// Wrap pre-generated storage at a chunk coordinate — used by the column
     /// generation worker, which produces [`ChunkData`] from `generate_column`
     /// and pairs it with its coord.
     pub fn from_data(cx: i32, cy: i32, cz: i32, data: ChunkData) -> Self {
-        Self { cx, cy, cz, data }
+        Self { cx, cy, cz, data: chunk_data_to_brick(data) }
     }
 
     /// Flat index from chunk-local coordinates.
@@ -134,17 +152,19 @@ impl Chunk {
         (x, y, z)
     }
 
-    /// The raw storage, for the mesher's uniform fast paths and flat reads.
+    /// The raw storage: the mesher's uniform fast paths and flat reads, plus
+    /// (once a consumer needs it) the chunk's `Brick.rev`. The stored truth
+    /// is `Brick`, full stop — `ChunkData` never appears here.
     #[inline]
-    pub fn data(&self) -> &ChunkData {
+    pub fn data(&self) -> &Brick {
         &self.data
     }
 
     /// The single block filling this chunk, if it is uniform.
     #[inline]
     pub fn uniform(&self) -> Option<BlockId> {
-        match self.data {
-            ChunkData::Uniform(id) => Some(id),
+        match &self.data.payload {
+            BrickPayload::Uniform(v) => Some(v.id),
             _ => None,
         }
     }
@@ -165,10 +185,11 @@ impl Chunk {
     /// wherever reads cluster (meshing, collision, light).
     #[inline]
     pub fn get_index(&self, index: usize) -> BlockId {
-        match &self.data {
-            ChunkData::Uniform(id) => *id,
-            ChunkData::Paletted { palette, cells } => palette[cells[index] as usize],
-            ChunkData::Dense(cells) => cells[index],
+        match &self.data.payload {
+            BrickPayload::Uniform(v) => v.id,
+            BrickPayload::Paletted { palette, cells } => palette[cells[index] as usize].id,
+            BrickPayload::Dense(cells) => cells[index].id,
+            BrickPayload::Rle { .. } => unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)"),
         }
     }
 
@@ -186,18 +207,20 @@ impl Chunk {
     /// Write voxel by flat index (replay saved/broken-block edits).
     /// First differing write promotes uniform → paletted; matching write stays
     /// uniform. Storage holding a single id collapses back to Uniform
-    /// (edit-revert), reclaiming the cell array.
+    /// (edit-revert), reclaiming the cell array. In-place on [`BrickPayload`]:
+    /// `from_cells` never runs per edit, only at construction.
     pub fn set_index(&mut self, index: usize, v: BlockId) {
-        match &mut self.data {
-            ChunkData::Uniform(id) => {
-                if *id == v {
+        let v = BlockState { id: v, state: 0 };
+        match &mut self.data.payload {
+            BrickPayload::Uniform(cur) => {
+                if *cur == v {
                     return;
                 }
-                let mut cells = Box::new([0u8; CHUNK_VOLUME]);
+                let mut cells = vec![0u8; CHUNK_VOLUME].into_boxed_slice();
                 cells[index] = 1;
-                self.data = ChunkData::Paletted { palette: vec![*id, v], cells };
+                self.data.payload = BrickPayload::Paletted { palette: vec![*cur, v].into_boxed_slice(), cells };
             }
-            ChunkData::Paletted { palette, cells } => {
+            BrickPayload::Paletted { palette, cells } => {
                 let slot = match palette.iter().position(|&p| p == v) {
                     Some(k) => k as u8,
                     None => {
@@ -206,17 +229,22 @@ impl Chunk {
                             // collect from live cells first; only a genuinely
                             // 256-distinct chunk pays the full-width fallback.
                             if !gc_palette(palette, cells) {
-                                let mut dense = Box::new([AIR; CHUNK_VOLUME]);
+                                let mut dense = vec![BlockState { id: AIR, state: 0 }; CHUNK_VOLUME].into_boxed_slice();
                                 for (d, &c) in dense.iter_mut().zip(cells.iter()) {
                                     *d = palette[c as usize];
                                 }
                                 dense[index] = v;
-                                self.data = ChunkData::Dense(dense);
+                                self.data.payload = BrickPayload::Dense(dense);
                                 return;
                             }
                         }
-                        palette.push(v);
-                        (palette.len() - 1) as u8
+                        // Box<[BlockState]> has no in-place push: grow via a
+                        // Vec and re-box (palettes are tiny; amortized cost).
+                        let mut grown = palette.to_vec();
+                        grown.push(v);
+                        let slot = (grown.len() - 1) as u8;
+                        *palette = grown.into_boxed_slice();
+                        slot
                     }
                 };
                 cells[index] = slot;
@@ -224,22 +252,23 @@ impl Chunk {
                 // scan only when it could have unified the chunk — the common
                 // edit keeps a chunk mixed and never scans.
                 if slot == cells[0] && cells.iter().all(|&c| c == slot) {
-                    self.data = ChunkData::Uniform(v);
+                    self.data.payload = BrickPayload::Uniform(v);
                 }
             }
-            ChunkData::Dense(cells) => {
+            BrickPayload::Dense(cells) => {
                 cells[index] = v;
                 if v == cells[0] && cells.iter().all(|&c| c == v) {
-                    self.data = ChunkData::Uniform(v);
+                    self.data.payload = BrickPayload::Uniform(v);
                 }
             }
+            BrickPayload::Rle { .. } => unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)"),
         }
     }
 }
 
 /// Compact a full palette down to its live entries, remapping cells. Returns
 /// `false` when every entry is genuinely in use (nothing to reclaim).
-fn gc_palette(palette: &mut Vec<BlockId>, cells: &mut Box<[u8; CHUNK_VOLUME]>) -> bool {
+fn gc_palette(palette: &mut Box<[BlockState]>, cells: &mut Box<[u8]>) -> bool {
     let mut used = [false; PALETTE_MAX];
     for &c in cells.iter() {
         used[c as usize] = true;
@@ -248,17 +277,17 @@ fn gc_palette(palette: &mut Vec<BlockId>, cells: &mut Box<[u8; CHUNK_VOLUME]>) -
         return false;
     }
     let mut remap = [0u8; PALETTE_MAX];
-    let mut live: Vec<BlockId> = Vec::with_capacity(palette.len());
-    for (i, &id) in palette.iter().enumerate() {
+    let mut live: Vec<BlockState> = Vec::with_capacity(palette.len());
+    for (i, &s) in palette.iter().enumerate() {
         if used[i] {
             remap[i] = live.len() as u8;
-            live.push(id);
+            live.push(s);
         }
     }
     for c in cells.iter_mut() {
         *c = remap[*c as usize];
     }
-    *palette = live;
+    *palette = live.into_boxed_slice();
     true
 }
 
@@ -314,7 +343,7 @@ mod tests {
         chunk.set_local(8, 8, 8, AIR);
         assert!(chunk.uniform().is_none(), "differing write goes paletted");
         assert!(
-            matches!(chunk.data(), ChunkData::Paletted { palette, .. } if palette.len() == 2),
+            matches!(&chunk.data().payload, BrickPayload::Paletted { palette, .. } if palette.len() == 2),
             "promotion palettizes, never pays full width"
         );
         assert_eq!(chunk.get_local(8, 8, 8), AIR);
@@ -359,9 +388,11 @@ mod tests {
             .find(|c| c.uniform() == Some(AIR))
             .expect("a chunk layer above the terrain is uniform air, stored as one id");
         assert_eq!(sky.uniform(), Some(AIR), "sky chunk stores one id, not a cell array");
-        // The uniform representation really is tiny: the enum is a few pointers
-        // wide (the Paletted variant's Vec + Box), nowhere near CHUNK_VOLUME.
+        // The construction-vocabulary enum stays tiny (a few pointers wide).
         assert!(std::mem::size_of::<ChunkData>() <= 40);
+        // So does the real stored representation: Brick is a few pointers +
+        // an enum tag, nowhere near CHUNK_VOLUME.
+        assert!(std::mem::size_of::<Brick>() <= 64, "got {}", std::mem::size_of::<Brick>());
     }
 
     #[test]
@@ -399,11 +430,11 @@ mod tests {
         for i in 0..CHUNK_VOLUME - 1 {
             chunk.set_index(i, BlockId(1));
         }
-        assert!(matches!(chunk.data(), ChunkData::Paletted { palette, .. } if palette.len() == PALETTE_MAX));
+        assert!(matches!(&chunk.data().payload, BrickPayload::Paletted { palette, .. } if palette.len() == PALETTE_MAX));
 
         chunk.set_index(0, BlockId(999)); // palette full — must GC, not promote
-        match chunk.data() {
-            ChunkData::Paletted { palette, .. } => {
+        match &chunk.data().payload {
+            BrickPayload::Paletted { palette, .. } => {
                 assert_eq!(palette.len(), 3, "GC kept only the live ids plus the new one")
             }
             other => panic!("expected GC'd Paletted, got a {other:?} variant"),
@@ -422,7 +453,7 @@ mod tests {
         for i in 0..300 {
             chunk.set_index(i, BlockId(1000 + i as u16));
         }
-        assert!(matches!(chunk.data(), ChunkData::Dense(_)), "257th distinct id promotes");
+        assert!(matches!(&chunk.data().payload, BrickPayload::Dense(_)), "257th distinct id promotes");
         for i in 0..300 {
             assert_eq!(chunk.get_index(i), BlockId(1000 + i as u16));
         }
@@ -443,5 +474,83 @@ mod tests {
         assert_eq!(chunk.get_local(1, 2, 3), stone);
         assert_eq!(chunk.get_local(0, 0, 0), dirt);
         assert_eq!(chunk.get_local(5, 5, 5), AIR, "untouched cells keep the old fill");
+    }
+
+    // ChunkData -> Brick construction and the in-place BrickPayload ops
+    // agree with an independent reference.
+
+    /// Independent reference for `set_index`'s edit-sequence semantics:
+    /// replay onto a plain `HashMap<usize, BlockId>` overlay on top of the
+    /// generator's cells, read back through `get`. Deliberately NOT the
+    /// production promote/GC/dense-escape state machine — this is a
+    /// different code path (no palette at all) so it can't share a bug with
+    /// `Chunk::set_index`.
+    struct ReferenceOverlay {
+        base: BlockId,
+        edits: std::collections::HashMap<usize, BlockId>,
+    }
+    impl ReferenceOverlay {
+        fn set(&mut self, i: usize, v: BlockId) {
+            self.edits.insert(i, v);
+        }
+        fn get(&self, i: usize) -> BlockId {
+            self.edits.get(&i).copied().unwrap_or(self.base)
+        }
+    }
+
+    /// Reachable failure: fails if any promote/GC/dense-escape transition in
+    /// `set_index`'s `BrickPayload` state machine loses or corrupts a cell
+    /// relative to a dead-simple overlay reference, across every transition
+    /// (uniform->paletted, paletted GC, paletted->dense, dense stays dense,
+    /// collapse back to uniform).
+    #[test]
+    fn set_index_matches_an_independent_overlay_reference_across_every_transition() {
+        let mut chunk = Chunk::from_uniform(0, 0, 0, AIR);
+        let mut reference = ReferenceOverlay { base: AIR, edits: Default::default() };
+
+        // splitmix64: deterministic PRNG, no rand dep.
+        let mut state = 0xC0FFEEu64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+
+        // 400 edits: enough to cross uniform->paletted, force a GC (bounded
+        // id range keeps the palette saturating), and revisit indices so
+        // some writes are "matching write stays" no-ops.
+        for _ in 0..400 {
+            let index = (next() % CHUNK_VOLUME as u64) as usize;
+            let id = BlockId((next() % 300) as u16); // >256 range: also exercises Dense
+            chunk.set_index(index, id);
+            reference.set(index, id);
+        }
+
+        for i in 0..CHUNK_VOLUME {
+            assert_eq!(chunk.get_index(i), reference.get(i), "cell {i} diverged from the overlay reference");
+        }
+    }
+
+    /// Reachable failure: fails if `chunk_data_to_brick`'s widening
+    /// (`BlockId -> BlockState{id, state:0}` then `BrickPayload::from_cells`)
+    /// drops or reorders a cell relative to `ChunkData::from_cells`'s own
+    /// palette — an independent construction of the "same" chunk two ways.
+    #[test]
+    fn construction_boundary_roundtrips_every_cell() {
+        let (g, _, _) = hills(11);
+        for (cx, cy, cz) in [(0, 0, 0), (0, -10, 0), (3, 2, -5)] {
+            let want = g.generate(cx, cy, cz);
+            let chunk = Chunk::from_data(cx, cy, cz, want.clone());
+            for i in 0..CHUNK_VOLUME {
+                let want_id = match &want {
+                    ChunkData::Uniform(id) => *id,
+                    ChunkData::Paletted { palette, cells } => palette[cells[i] as usize],
+                    ChunkData::Dense(cells) => cells[i],
+                };
+                assert_eq!(chunk.get_index(i), want_id, "cell {i} at ({cx},{cy},{cz})");
+            }
+        }
     }
 }

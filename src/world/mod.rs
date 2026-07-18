@@ -28,12 +28,14 @@
 //!   surface height, coordinate mapping, registry/seed accessors.
 //! * `edits.rs` — player edits: block placement, the edit overlay, dirty
 //!   marking, mesh freeing, and the render-distance setting.
+pub mod brick;
 pub mod chunk;
 pub mod connectivity;
 pub mod generation;
 pub mod light;
 pub mod lod;
 pub mod mesh;
+mod neighborhood;
 pub mod pipeline;
 pub mod placement;
 pub mod pyramid;
@@ -46,7 +48,8 @@ mod quadtree;
 mod query;
 mod streaming;
 mod summary;
-mod swapfade;
+mod coverage;
+pub(crate) mod lanes;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -54,7 +57,8 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
+use voxel_engine::producer::Progress;
+use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle};
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
@@ -65,6 +69,7 @@ use heightmip::HeightMip;
 use light::LightGrid;
 use mesh::{ChunkMeshData, new_chunk_mesh_data};
 use quadtree::QuadrantMask;
+use section::Quadrant;
 use section::{SectionMeshData, SectionPos};
 
 /// Default number of chunk rings meshed and drawn around the player.
@@ -297,20 +302,13 @@ impl ChunkMeshes {
     pub(in crate::world) fn from_upload_handles(handles: ByPass<Option<MeshHandle>>) -> Option<Self> {
         Self::new(ByPass::from_fn(|p| handles[p].map(OwnedMesh::new)))
     }
-    /// Record a draw for each present pass at `offset`/`detail`.
-    fn draw(&self, f: &mut Frame3D, offset: Vec3, detail: Detail) {
+    /// Push far-material style onto each present pass's resident mesh (LOD
+    /// sections). Placement and detail are pinned at upload; the engine delta-gates
+    /// identical style. Full-res chunks never call it (default textured style).
+    fn set_style(&self, eng: &mut Engine, style: FadeStyle, flat_rgba: u32) {
         for (_, m) in self.0.iter() {
             if let Some(mesh) = m {
-                f.draw_mesh(mesh.id(), offset, detail);
-            }
-        }
-    }
-    /// Draw each present pass with cross-fade and far-material styling.
-    /// `(1.0, 0, 0)` is identical to [`draw`](Self::draw).
-    fn draw_faded(&self, f: &mut Frame3D, offset: Vec3, detail: Detail, fade: f32, style: FadeStyle, flat_rgba: u32) {
-        for (_, m) in self.0.iter() {
-            if let Some(mesh) = m {
-                f.draw_mesh_faded(mesh.id(), offset, detail, fade, style, flat_rgba);
+                eng.set_mesh_style(mesh.id(), style, flat_rgba);
             }
         }
     }
@@ -322,6 +320,14 @@ impl ChunkMeshes {
             }
         }
     }
+    /// Patch every present pass's slot in the GPU visibility mask.
+    fn set_visible(&self, eng: &mut Engine, on: bool) {
+        for (_, m) in self.0.iter() {
+            if let Some(mesh) = m {
+                eng.set_visible(mesh.id(), on);
+            }
+        }
+    }
     /// Whether any pass draws `handle` — for the render/ownership tests.
     #[cfg(test)]
     fn draws(&self, handle: MeshHandle) -> bool {
@@ -329,69 +335,106 @@ impl ChunkMeshes {
     }
 }
 
-// Per-draw style (flat palette-average colour, fade-the-complement) is the
-// typed engine `FadeStyle` now — no raw mode bits.
+// Per-draw style (flat palette-average colour) is the typed engine `FadeStyle`
+// now — no raw mode bits.
 /// Detail threshold for flat palette-average colour (far-material optimization).
 /// The outer rings lose per-texel detail to sub-pixel shimmer, so average colour
 /// reduces bandwidth; nearer rings keep texture. Inert until the mip bake lands.
-const FLAT_DETAIL: u8 = section::FINEST_DETAIL + 4;
+const FLAT_DETAIL: Detail = Detail(section::FINEST_DETAIL.0 + 4);
 
 /// A section is either meshing or ready. Blocks are pre-positioned at upload,
 /// so draw needs only camera-relative offset arithmetic.
 pub(in crate::world) enum SectionState {
     Meshing,
-    /// Blocks grouped by quadrant (indexed by [`SectionPos::quadrant`]); the draw
-    /// path renders only the quadrants a [`QuadrantMask`] selects. Each block is
-    /// positioned at a world min-corner, drawn at the section's [`Detail`]
-    /// (cell size `2^detail`) — derived from the map key `pos.detail`, not stored.
-    Ready { quadrants: [Vec<([f64; 3], ChunkMeshes)>; 4] },
+    /// Block meshes grouped by quadrant (indexed by [`SectionPos::quadrant`]).
+    /// Position and detail (cell size `2^detail`, from the map key `pos.detail`)
+    /// are pinned into each resident mesh at upload; visibility is a per-quadrant
+    /// `set_visible` mask and style a `set_style` push, so nothing per-block is
+    /// stored beyond the meshes themselves.
+    Ready {
+        quadrants: [Vec<ChunkMeshes>; 4],
+        /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
+        /// re-observed next frame (the steady case) sends nothing.
+        last_style: Option<(FadeStyle, u32)>,
+    },
 }
 
 impl SectionState {
-    /// Upload each quadrant's block meshes with pre-baked world positions so draw
-    /// needs only the camera-relative subtract. Empty quadrants upload to no handles.
+    /// Upload each quadrant's block meshes at their absolute world origin and
+    /// detail (pinned once — the engine recovers camera-relative position). Empty
+    /// quadrants upload to no handles.
     fn from_upload(pos: SectionPos, meshes: [SectionMeshData; 4], eng: &mut Engine) -> SectionState {
         let cell = pos.cell_size();
-        let (mx, mz) = (pos.min_x() as f64, pos.min_z() as f64);
+        let detail = pos.detail;
         let quadrants = meshes.map(|quad| {
             let mut blocks = Vec::new();
             for (block_origin, data) in quad {
-                let handles = ByPass::from_fn(|p| eng.upload_mesh(&data[p]));
+                let placement = voxel_engine::MeshPlacement::terrain(
+                    voxel_engine::IVec3::new(
+                        pos.min_x() + block_origin.x as i32 * cell,
+                        block_origin.y as i32 * cell,
+                        pos.min_z() + block_origin.z as i32 * cell,
+                    ),
+                    detail,
+                );
+                let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement));
                 if let Some(meshes) = ChunkMeshes::from_upload_handles(handles) {
-                    // Block origin is in section-space CELLS; the section floor is world-Y 0.
-                    let wmin = [
-                        mx + block_origin.x as f64 * cell as f64,
-                        block_origin.y as f64 * cell as f64,
-                        mz + block_origin.z as f64 * cell as f64,
-                    ];
-                    blocks.push((wmin, meshes));
+                    blocks.push(meshes);
                 }
             }
             blocks
         });
-        SectionState::Ready { quadrants }
+        SectionState::Ready { quadrants, last_style: None }
     }
 
     fn is_ready(&self) -> bool {
         matches!(self, SectionState::Ready { .. })
     }
-    /// Draw the quadrants `mask` selects at `detail`, with cross-fade and far-material
-    /// styling via `fade`/`style`/`flat_rgba`.
-    /// The shader hands the near ground to full-res chunks via coverage dither.
-    fn draw(&self, f: &mut Frame3D, cam: DVec3, mask: QuadrantMask, detail: Detail, fade: f32, style: FadeStyle, flat_rgba: u32) {
-        if let SectionState::Ready { quadrants } = self {
-            for q in mask.iter() {
-                for (wmin, meshes) in &quadrants[q.index()] {
-                    let offset = (DVec3::new(wmin[0], wmin[1], wmin[2]) - cam).as_vec3();
-                    meshes.draw_faded(f, offset, detail, fade, style, flat_rgba);
-                }
+
+    /// Project `mask` onto this region's slots: the quadrants it selects are
+    /// visible, the rest not. `None` draws nothing. Walks EVERY quadrant, so a
+    /// quadrant leaving the mask is cleared rather than stranded at its last value.
+    fn set_visible(&self, eng: &mut Engine, mask: Option<QuadrantMask>) {
+        let SectionState::Ready { quadrants, .. } = self else {
+            return;
+        };
+        for q in Quadrant::ALL {
+            let on = mask.is_some_and(|m| m.contains(q));
+            for meshes in &quadrants[q.index()] {
+                meshes.set_visible(eng, on);
             }
         }
+    }
+    /// Push the far-material style onto every block mesh of this section
+    /// (visibility decides which actually draw). The engine delta-gates unchanged style.
+    fn set_style(&self, eng: &mut Engine, style: FadeStyle, flat_rgba: u32) {
+        let SectionState::Ready { quadrants, .. } = self else {
+            return;
+        };
+        for quad in quadrants {
+            for meshes in quad {
+                meshes.set_style(eng, style, flat_rgba);
+            }
+        }
+    }
+    /// [`Self::set_style`], gated on the pushed tuple actually changing since last
+    /// time — the DrawDyn contract ("at rest, zero writes"): the engine delta-gates
+    /// per-mesh too, but a settled far field must not even attempt the walk.
+    fn push_style(&mut self, eng: &mut Engine, style: FadeStyle, flat_rgba: u32) {
+        let key = (style, flat_rgba);
+        let SectionState::Ready { last_style, .. } = self else {
+            return;
+        };
+        if *last_style == Some(key) {
+            return;
+        }
+        *last_style = Some(key);
+        self.set_style(eng, style, flat_rgba);
     }
     fn free(self, eng: &mut Engine) {
         if let SectionState::Ready { quadrants, .. } = self {
             for quad in quadrants {
-                for (_, meshes) in quad {
+                for meshes in quad {
                     meshes.free(eng);
                 }
             }
@@ -521,6 +564,10 @@ pub struct World {
     workers: Option<pipeline::Workers>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
+    /// The [`GenerateLane`](lanes::GenerateLane)'s raise-then-consume gate: the
+    /// data box has columns to request. Raised on a boundary cross and by a
+    /// generate strike-out re-request; drained when the box is fully requested.
+    pending_gen: Sticky,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
     upload_queue: VecDeque<(Coord, u32, Box<ChunkMeshData>)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
@@ -530,7 +577,7 @@ pub struct World {
     /// enqueue scan is O(shell) not O(cube).
     mesh_worklist: FastSet<Coord>,
     /// Whether the [`LightLane`] still has seeds/in-flight to drain (its
-    /// `pending` gate — the [`LaneSpec::pending`] accessor). Raised when the
+    /// `pending` gate — the [`StreamLane::pending`] accessor). Raised when the
     /// worklist or in-flight set is non-empty, cleared when both drain.
     light_pending: Sticky,
     /// Chunks needing light settling (budgeted, seeded on load/edit/border moves).
@@ -581,14 +628,6 @@ pub struct World {
     /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
     /// input like `lighting`: toggling remeshes the world.
     ao: bool,
-    /// Bumped whenever a chunk gains or loses a drawable mesh (retire installs
-    /// and frees, unloads, the free-meshes passes). `invalidate()` keeps the
-    /// previous mesh drawing, so per-edit dirtying never bumps.
-    draw_set_rev: u64,
-    /// Drawable chunk coords, rebuilt by `sync_draw_cache` when `draw_set_rev`
-    /// moved — render walks this (~live set) instead of every loaded chunk.
-    draw_cache: Vec<Coord>,
-    draw_cache_rev: u64,
     /// Bumped whenever a non-registry meshing input stamped onto the hot
     /// tables changes (AO today), so `refresh_tables` rebuilds even though the
     /// block count didn't move — the count and epoch fold into one revision.
@@ -601,6 +640,10 @@ pub struct World {
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
     occlusion_forced: bool,
+    /// Scheduler handles for the `stream` call-point CPU lanes, set by
+    /// `Game::new` after it registers them. `None` only before
+    /// that wiring (a bare `World` with no scheduler never calls `stream`).
+    stream_lanes: Option<lanes::StreamLanes>,
     /// Cross-chunk lighting enable flag. Driven by the `lighting` graphics
     /// setting via [`set_lighting`](World::set_lighting); the initial value only
     /// governs pre-`enter_game` generation and is overridden on world entry.
@@ -635,17 +678,31 @@ pub struct World {
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
     dirty_sections: FastSet<SectionPos>,
+    /// Per-section edit generation: bumped (alongside `dirty_sections`) whenever an
+    /// edit lands in a section's footprint at any active detail. Stamps
+    /// `section_overlay_cache` so a cell is only ever re-derived when ITS OWN
+    /// footprint changed (locality) — never on an edit elsewhere.
+    section_edit_rev: FastMap<SectionPos, u64>,
+    /// Memoized edit-folded cell, keyed by `section_edit_rev`. `None` means the
+    /// cell's footprint currently has no edits (overlay compaction can revert
+    /// this after having been `Some`); the pure bake applies unchanged.
+    section_overlay_cache: voxel_engine::rev::DerivedMap<SectionPos, Option<heightmip::MipCell>>,
+    /// This frame's resolved overlay snapshot (refreshed in `stream`'s `&mut`
+    /// pass): the only edit-staleness fix `render`'s `&self` readers consult —
+    /// occlusion, section colour, and the coverage-skip relief test all prefer
+    /// this over `section_mip`'s immutable bake when a cell is present here.
+    section_overlay: FastMap<SectionPos, heightmip::MipCell>,
     /// The desired section frontier computed ONCE per stream frame and shared
     /// by unloading, the load lane, and the covering rebuild — the selection
     /// sweep (grid walk + relief coarsening) used to run up to three times a
     /// frame for identical inputs.
     section_desired: Vec<SectionPos>,
-    /// Visible sections (covering-resolved) — the desired cut this frame, before the
-    /// cross-fade. Feeds `unload_sections` and the fade.
+    /// Visible sections (covering-resolved) — the desired cut this frame. Feeds
+    /// `unload_sections` and the coverage projection.
     section_visible: Vec<(SectionPos, QuadrantMask)>,
-    /// Temporal cross-fade over successive LOD cuts with per-cell dissolve state.
-    /// Presentation only; never affects selection logic.
-    section_fade: swapfade::SwapFade,
+    /// Drawn-coverage projection over successive LOD cuts (hard pop). Presentation
+    /// only; never affects selection logic.
+    section_fade: coverage::Coverage,
 }
 
 impl World {
@@ -685,6 +742,7 @@ impl World {
             tables: crate::derived::Derived::default(),
             workers: None,
             generating: FastSet::default(),
+            pending_gen: Sticky::default(),
             upload_queue: VecDeque::new(),
             mesh_worklist: FastSet::default(),
             light_pending: Sticky::default(),
@@ -700,14 +758,11 @@ impl World {
             texture_layer_cap: u16::MAX,
             ao: true,
             tables_epoch: 0,
-            draw_set_rev: 0,
-            draw_cache: Vec::new(),
-            // Differs from `draw_set_rev` so the first stream builds the cache.
-            draw_cache_rev: u64::MAX,
             occlusion: Occlusion::default(),
             occlusion_dirty: Sticky::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
+            stream_lanes: None,
             lighting: true,
             light_epoch: 0,
             lod2,
@@ -721,9 +776,12 @@ impl World {
             section_upload_queue: VecDeque::new(),
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
+            section_edit_rev: FastMap::default(),
+            section_overlay_cache: voxel_engine::rev::DerivedMap::new(),
+            section_overlay: FastMap::default(),
             section_desired: Vec::new(),
             section_visible: Vec::new(),
-            section_fade: swapfade::SwapFade::default(),
+            section_fade: coverage::Coverage::default(),
         };
         // Centre the pre-generated box on the origin's surface chunk, the
         // spawn point's own layer.
@@ -762,74 +820,20 @@ impl World {
     /// built; a frame is one `draw_mesh` per chunk (the engine frustum-culls
     /// each against its offset AABB internally).
     ///
-    /// Meshes are CHUNK-LOCAL (vertices in 0..=16), so each draw carries the
-    /// camera-relative offset `chunk_origin - cam`, computed here in `f64` and
-    /// only then narrowed to `f32`: near the camera — the only place precision
-    /// is visible — the difference is small and exact, no matter how far from
-    /// the world origin both sit.
-    pub fn render(&self, f: &mut Frame3D, cam: DVec3) {
-        let s = CHUNK_SIZE as f64;
-        // A pure projection of prepared state. When occlusion is active the
-        // visible set was rebuilt in `stream`; when it is off (the default, no
-        // GPU-bound signal) every frustum-visible chunk draws — the baseline
-        // path, no occlusion cost. The engine frustum-culls each drawn chunk.
-        // Layer 1 — full-res chunks, drawn first so they fill depth before the
-        // tile backdrop. No ownership cull: the tiles under them are pushed back by
-        // depth bias, not skipped, so there is no boundary to align.
-        // The drawable-coords cache (synced at the end of `stream`, the frame's
-        // last mutation point) — the walk is O(live), not O(loaded).
-        debug_assert_eq!(
-            self.draw_cache.len(),
-            self.chunks.values().filter(|l| l.state.live_meshes().is_some()).count(),
-            "draw cache went stale: a mesh-set mutation missed its draw_set_rev bump"
-        );
-        let mut live = 0u64;
-        for &coord in &self.draw_cache {
-            if self.occlusion_active && !self.occlusion.is_visible(coord) {
-                continue;
-            }
-            let Some(loaded) = self.chunks.get(&coord) else { continue };
-            if let Some(meshes) = loaded.state.live_meshes() {
-                live += 1;
-                let origin =
-                    DVec3::new(coord.x as f64 * s, coord.y as f64 * s, coord.z as f64 * s);
-                // Full-res chunks are unit-scale: their local 0..=16 coords are
-                // already metres. LOD sections pass 2^k here (see `SectionState::draw`).
-                meshes.draw(f, (origin - cam).as_vec3(), Detail::FULL);
-            }
-        }
-        // Set-size gauges: `list.world` cost is O(these). A spike here localizes a
-        // regression to a grown set (view volume / section frontier), not a
-        // per-item slowdown. See `profile::Gauge`.
+    /// Terrain chunks and LOD sections are RESIDENT meshes: placement and detail
+    /// pinned at upload, visibility a `set_visible` mask, style a `set_style`
+    /// push (both maintained in `stream`). The engine draws every visible
+    /// resident mesh itself, so `render` submits no per-mesh draws — it only sets
+    /// the frame's LOD-cull volume and reports the set-size gauge.
+    pub fn render(&self, f: &mut Frame3D, _cam: DVec3) {
+        // The shader discards LOD-section fragments inside the full-res radius
+        // (chunks own the near ground) and fades in the sections beyond it. The
+        // streamed slab guarantees `vertical` chunks above and below the eye.
+        f.set_lod_clip(self.view.coverage());
+        // Set-size gauge: a spike localizes a regression to a grown set (view
+        // volume / section frontier). See `profile::Gauge`.
         use voxel_engine::profile::{gauge, Gauge};
         gauge(Gauge::WorldChunks, self.chunks.len() as u64);
-        gauge(Gauge::WorldChunksLive, live);
-
-        // Layer 2 — section far field: the covering-resolved visible set built
-        // in `stream`. The shader discards LOD-section fragments inside the
-        // full-res radius (chunks own the near ground) and fades in the sections
-        // beyond it. Skipped at zero cost if the section lane is inactive.
-        // Vertical extent: the streamed slab guarantees `vertical` chunks above
-        // and below the eye even when the eye sits at a chunk boundary.
-        f.set_lod_clip(self.view.coverage());
-        // Draw the cross-fade view with per-cell dissolve. Bands screen-door-dissolve
-        // instead of popping. At rest every cell is fade 1 / mode 0 (unless flat).
-        for (pos, mask, fade, out) in self.section_fade.draws() {
-            // Occlusion cull sections hidden behind terrain. Under-claiming means
-            // a miss wastes a draw but never creates holes.
-            if self.occlusion_active {
-                if let Some(mip) = &self.section_mip {
-                    if mip.occludes(cam, pos) {
-                        continue;
-                    }
-                }
-            }
-            if let Some(state) = self.sections.get(&pos) {
-                let (flat_color, flat_rgba) = self.section_material(pos);
-                let style = FadeStyle { flat_color, complement: out };
-                state.draw(f, cam, mask, Detail::new(pos.detail), fade, style, flat_rgba);
-            }
-        }
     }
 
     /// Far-material style: flat palette-average past [`FLAT_DETAIL`] if available,
@@ -838,7 +842,12 @@ impl World {
         if pos.detail < FLAT_DETAIL {
             return (false, 0);
         }
-        match self.section_mip.as_ref().and_then(|m| m.color(pos)) {
+        let color = self
+            .section_overlay
+            .get(&pos)
+            .map(|c| c.color)
+            .or_else(|| self.section_mip.as_ref().and_then(|m| m.color(pos)));
+        match color {
             Some(c) => (
                 true,
                 c.r as u32 | (c.g as u32) << 8 | (c.b as u32) << 16 | (c.a as u32) << 24,
@@ -870,14 +879,39 @@ impl World {
         }
         // Vertical: the section's terrain must sit inside the eye's slab, else
         // clip draws the part that pokes out. If unbaked, can't prove, so don't skip.
-        let Some(mip) = &self.section_mip else { return false };
-        let Some((lo, hi)) = mip.relief_band(key) else { return false };
+        // An edited footprint prefers the fresh overlay over the (possibly stale) bake.
+        let (lo, hi) = if let Some(c) = self.section_overlay.get(&key) {
+            (c.lo, c.hi)
+        } else {
+            let Some(mip) = &self.section_mip else { return false };
+            let Some(band) = mip.relief_band(key) else { return false };
+            band
+        };
         let ey = self.section_eye_y as f32;
         if lo < ey - v_lim || hi > ey + v_lim {
             return false;
         }
         // Every chunk backing the footprint is settled, so the near area is
         // actually covered now, not just in-range.
+        self.backing_chunks_ready(key)
+    }
+
+    /// Whether every full-res chunk backing `key`'s footprint is settled
+    /// (drawable or born-air, never in-flight). Used by [`Self::coverage_skips`]
+    /// to skip the near-LOD load only where full-res provably covers. A footprint
+    /// whose vertical band can't be proven (no overlay, no baked mip) reads as
+    /// NOT ready — fail toward keeping the section loaded, never toward a hole.
+    fn backing_chunks_ready(&self, key: SectionPos) -> bool {
+        let cs = CHUNK_SIZE as i32;
+        let span = key.span();
+        let (x0, z0) = (key.min_x(), key.min_z());
+        let (lo, hi) = if let Some(c) = self.section_overlay.get(&key) {
+            (c.lo, c.hi)
+        } else {
+            let Some(mip) = &self.section_mip else { return false };
+            let Some(band) = mip.relief_band(key) else { return false };
+            band
+        };
         let (cx_lo, cx_hi) = (x0.div_euclid(cs), (x0 + span - 1).div_euclid(cs));
         let (cz_lo, cz_hi) = (z0.div_euclid(cs), (z0 + span - 1).div_euclid(cs));
         let (cy_lo, cy_hi) = ((lo.floor() as i32).div_euclid(cs), (hi.floor() as i32).div_euclid(cs));
@@ -907,11 +941,47 @@ impl World {
         self.occlusion_forced
     }
 
+    /// Wire the scheduler handles for the `stream` CPU lanes.
+    /// Called once by `Game::new` after registering the producers.
+    pub fn set_stream_lanes(&mut self, lanes: lanes::StreamLanes) {
+        self.stream_lanes = Some(lanes);
+    }
+
+    /// The registered stream-lane handles (panics if `stream` runs before
+    /// `Game::new` wired them — see [`World::stream_lanes`]).
+    fn lanes(&self) -> lanes::StreamLanes {
+        self.stream_lanes.expect("stream lanes registered by Game::new")
+    }
+
     /// Rebuild the occlusion visible set: lazily fill any missing per-chunk
     /// connectivity (only floods chunks not yet classified — so a world that
     /// never activates occlusion never pays it), then BFS from the camera's
-    /// chunk. Called only when the gate is active and the inputs changed.
-    fn rebuild_occlusion(&mut self, origin: Coord) {
+    /// chunk, then patch each drawable chunk's GPU visibility mask to its
+    /// occlusion bit (`apply_occlusion_masks`). Nothing filters at draw time.
+    ///
+    /// The [`OcclusionLane`](lanes::OcclusionLane) producer's body: self-gates
+    /// each call on the adaptive `occlusion_dirty`/`occlusion_active` state
+    /// and reports `Progress::Partial` while the connectivity fill is budget-capped.
+    pub(in crate::world) fn rebuild_occlusion(&mut self, eng: &mut Engine) -> Progress {
+        // Recompute due-ness from current state every call; never cache it.
+        let on = self.occlusion_enabled();
+        let was_active = self.occlusion_active;
+        let due = on && (self.occlusion_dirty.take() || !was_active);
+        self.occlusion_active = on;
+        if !on {
+            // Gate off (or never on): restore every mask the last active pass may
+            // have hidden, once, so render draws everything.
+            if was_active {
+                self.reveal_all(eng);
+            }
+            return Progress::Idle;
+        }
+        if !due {
+            return Progress::Idle;
+        }
+        let Some(origin) = self.center else {
+            return Progress::Idle;
+        };
         let registry = &self.registry;
         // Cap the per-frame connectivity flood: a boundary cross can newly load a
         // whole shell of unclassified chunks, and filling them all in one frame
@@ -945,26 +1015,67 @@ impl World {
         self.occlusion.rebuild(origin, |c| {
             self.chunks.get(&c).map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
         });
+        self.apply_occlusion_masks(eng);
+        if capped {
+            let remaining = self.chunks.values().filter(|l| l.connectivity.is_none()).count();
+            Progress::Partial { remaining: remaining as u32 }
+        } else {
+            Progress::Idle
+        }
+    }
+
+    /// Patch every drawable chunk's GPU visibility mask to its occlusion bit —
+    /// the recast of the BFS visible-set into `set_visible` (nothing filters at
+    /// draw time). Runs only after a real rebuild (mask changed), so steady
+    /// state pays nothing. Imperfect masking is only ever a wasted draw
+    /// (occluded geometry is depth-culled), never a hole, so no cross-frame diff
+    /// is kept: a freshly-remeshed chunk is re-hidden on the next rebuild.
+    fn apply_occlusion_masks(&mut self, eng: &mut Engine) {
+        for (&coord, loaded) in self.chunks.iter() {
+            if let Some(meshes) = loaded.state.live_meshes() {
+                meshes.set_visible(eng, self.occlusion.is_visible(coord));
+            }
+        }
+    }
+
+    /// Reveal every drawable chunk (set its mask visible) — the one-shot restore
+    /// when the occlusion gate turns off, since only occlusion ever hides a
+    /// resident chunk mesh.
+    fn reveal_all(&mut self, eng: &mut Engine) {
+        for loaded in self.chunks.values() {
+            if let Some(meshes) = loaded.state.live_meshes() {
+                meshes.set_visible(eng, true);
+            }
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Streaming lanes — the unified budgeted enqueue/integrate spine.
-// ---------------------------------------------------------------------------
-//
+// Streaming lanes: async admission producers.
 // Every async streaming lane (fresh chunk meshing, far LOD sections,
-// cross-chunk light) is the same shape: gather candidates near the player,
-// drop the ones already in flight, order nearest-first, submit up to a
-// per-frame budget to the worker pool, and integrate finished results. The
-// lanes differed only in *where their state lives*, so that state is
-// reached through a [`LaneSpec`] of accessors and the loop is written once
-// ([`lane_enqueue`]/[`lane_integrate`]).
+// cross-chunk light, column generation) is the same shape: gather candidates
+// near the player, drop the ones already in flight, order nearest-first, submit
+// up to a per-frame budget to the worker pool, and integrate finished results.
+// The lanes differ only in *where their state lives*, reached through a
+// [`StreamLane`] of accessors so the admission loop ([`admit`]) is written once.
 //
-// Each lane is handed a per-frame time [`Deadline`](pipeline::Deadline) at its
-// enqueue call site (minted fresh from its `pipeline::*_BUDGET` const), checked
-// BETWEEN admitted items — the time-based admission control that replaced the
-// old integer count budgets (a burst of cheap items and a burst of expensive
-// ones no longer share one integer, and no lane can flood a frame unbounded).
+// Each lane is a `sched::Run` producer registered in [`lanes`]; the scheduler
+// hands it its `Budget::Millis` and it derives its [`Deadline`](pipeline::Deadline)
+// from that (never a private `pipeline::*_BUDGET` const — one budget locus, the
+// manifest). The deadline is checked BETWEEN admitted items, and the forward-
+// progress floor ([`admission_exhausted`]) is the single definition of "admit at
+// least `MIN_ADMIT` before the clock can stop you", shared with the generation
+// lane so no producer hand-rolls its own budget/floor.
+
+/// The one admission-stop rule (forward-progress floor + time budget): stop only
+/// once at least `min_admit` items have been admitted AND the deadline has
+/// passed. The single definition every streaming producer's admit loop shares.
+pub(in crate::world) fn admission_exhausted(
+    admitted: usize,
+    min_admit: usize,
+    deadline: pipeline::Deadline,
+) -> bool {
+    admitted >= min_admit && deadline.expired()
+}
 
 /// How a lane defines its work this frame. A geometry lane derives candidates
 /// from the player centre. A worklist lane reads an explicit dirty set
@@ -972,21 +1083,24 @@ impl World {
 pub(in crate::world) enum Candidates<K> {
     /// The full candidate key list, recomputed from the centre this frame.
     Geometry(Vec<K>),
-    /// Read the lane's seed set (`LaneSpec::seed_set`) for candidates.
+    /// Read the lane's seed set (`StreamLane::seed_set`) for candidates.
     Worklist,
 }
 
-/// One streaming lane. Zero-sized marker types (`MeshLane`, …) implement it;
-/// all mutable state lives on [`World`] behind these accessors, so the lane
-/// itself carries nothing and the generic loop stays allocation-free.
-pub(in crate::world) trait LaneSpec {
+/// The accessor surface of one streaming lane. Zero-sized marker types
+/// (`MeshLane`, …) implement it AND `sched::Run` (in [`lanes`]); all mutable
+/// state lives on [`World`] behind these accessors, so the lane carries nothing
+/// and the shared [`admit`] loop stays allocation-free. This is *not* a
+/// scheduler: budget and forward-progress come from the scheduler that drives
+/// the producer, never from here.
+pub(in crate::world) trait StreamLane {
     /// The lane's work key: chunk `Coord` or `SectionPos`.
     /// Must be `Copy + Eq + Hash`.
     type Key: Copy + Eq + Hash;
 
-    /// Minimum admissions guaranteed per call, before deadline checks. Each lane
-    /// sets this based on typical cost; a small floor for cheap work prevents
-    /// budget theft by expensive work.
+    /// Minimum admissions before the deadline can stop the loop — the forward-
+    /// progress floor, so setup cost (gather/sort) alone can't starve a lane
+    /// under a tight budget. One value per lane; enforced once, in [`admit`].
     const MIN_ADMIT: usize;
 
     /// The candidate keys for this frame (see [`Candidates`]).
@@ -1019,10 +1133,12 @@ pub(in crate::world) trait LaneSpec {
     fn integrate(world: &mut World, done: pipeline::Done);
 }
 
-/// The unified enqueue loop: gather, filter unready/in-flight, sort nearest-first,
-/// submit until deadline expires (checked between items, never mid-item), then claim.
-/// Clear pending once the ready backlog drains.
-pub(in crate::world) fn lane_enqueue<S: LaneSpec>(
+/// The shared admission loop: gather, filter unready/in-flight, sort
+/// nearest-first, submit until the deadline expires (checked between items,
+/// never mid-item, and never before `MIN_ADMIT`), then claim. Clears the lane's
+/// pending gate once the ready backlog drains. `deadline` comes from the
+/// scheduler's per-producer budget — this loop owns no budget of its own.
+pub(in crate::world) fn admit<S: StreamLane>(
     world: &mut World,
     center: Coord,
     deadline: pipeline::Deadline,
@@ -1060,17 +1176,12 @@ pub(in crate::world) fn lane_enqueue<S: LaneSpec>(
         }
     }
     ready_keys.sort_by_key(|&k| S::order(center, k));
-    // Admission is time-gated: check deadline between items, never mid-work.
-    // `exhausted` stays true only if all ready keys were processed before timeout.
-    //
-    // Forward-progress floor: large worklists under tight budgets can starve if
-    // setup (gather/partition/sort) alone exhausts the budget before the first
-    // submit. Guaranteeing at least MIN_ADMIT admissions makes the seed set
-    // shrink strictly, so the lane converges.
+    // `exhausted` stays true only if all ready keys were processed before the
+    // deadline stopped the loop (the floor lives in `admission_exhausted`).
     let mut exhausted = true;
     let mut admitted = 0usize;
     for key in ready_keys {
-        if admitted >= S::MIN_ADMIT && deadline.expired() {
+        if admission_exhausted(admitted, S::MIN_ADMIT, deadline) {
             exhausted = false;
             break;
         }
@@ -1107,13 +1218,6 @@ pub(in crate::world) fn lane_enqueue<S: LaneSpec>(
     }
 }
 
-/// Fold one finished [`pipeline::Done`] back into the world via its lane. The
-/// caller picks `S` by matching the `Done` variant; this is the single dispatch
-/// point that replaced the four ad-hoc drain arms.
-pub(in crate::world) fn lane_integrate<S: LaneSpec>(world: &mut World, done: pipeline::Done) {
-    S::integrate(world, done);
-}
-
 /// Squared distance in metres from player-chunk centre to a world point.
 fn player_dist2(center: Coord, wx: i64, wy: i64, wz: i64) -> u64 {
     let s = CHUNK_SIZE as i64;
@@ -1142,7 +1246,7 @@ fn motion_biased_dist2(base: u64, vel: DVec3, dx: f64, dz: f64) -> u64 {
 
 /// Fresh full-res chunk meshing.
 pub(in crate::world) struct MeshLane;
-impl LaneSpec for MeshLane {
+impl StreamLane for MeshLane {
     type Key = Coord;
     /// Low floor: admits are relatively cheap.
     const MIN_ADMIT: usize = 4;
@@ -1203,7 +1307,7 @@ impl LaneSpec for MeshLane {
 
 /// LOD2 column sections.
 pub(in crate::world) struct SectionLane;
-impl LaneSpec for SectionLane {
+impl StreamLane for SectionLane {
     type Key = SectionPos;
     /// Modest floor: heavy work runs off-thread.
     const MIN_ADMIT: usize = 4;
@@ -1271,7 +1375,7 @@ impl LaneSpec for SectionLane {
 
 /// Cross-chunk light settling.
 pub(in crate::world) struct LightLane;
-impl LaneSpec for LightLane {
+impl StreamLane for LightLane {
     type Key = Coord;
     /// High floor: settle must drain fast so meshing can start.
     const MIN_ADMIT: usize = 32;
@@ -1361,11 +1465,11 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
         let pos = world.desired_sections(center)[0];
-        assert!(!<SectionLane as LaneSpec>::in_flight(&world, pos));
-        <SectionLane as LaneSpec>::claim(&mut world, pos);
+        assert!(!<SectionLane as StreamLane>::in_flight(&world, pos));
+        <SectionLane as StreamLane>::claim(&mut world, pos);
         assert!(matches!(world.sections.get(&pos), Some(SectionState::Meshing)));
-        assert!(<SectionLane as LaneSpec>::in_flight(&world, pos), "claim marks in-flight");
-        <SectionLane as LaneSpec>::integrate(
+        assert!(<SectionLane as StreamLane>::in_flight(&world, pos), "claim marks in-flight");
+        <SectionLane as StreamLane>::integrate(
             &mut world,
             pipeline::Done::Section { pos, meshes: Default::default() },
         );
@@ -1379,7 +1483,7 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         let cell = world.desired_sections(center)[0];
         assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-        let empty_ready = || SectionState::Ready { quadrants: Default::default() };
+        let empty_ready = || SectionState::Ready { quadrants: Default::default(), last_style: None };
         world.sections.insert(cell, empty_ready());
         assert!(world.section_covered(cell), "a Ready self covers");
         world.sections.remove(&cell);
@@ -1396,11 +1500,12 @@ mod tests {
     fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
         let mut world = lod2_world();
         let center = ChunkCoord::new(0, 0, 0);
+        world.center = Some(center);
         world.pending_sections.take();
 
         // Fresh world: everything desired is missing — the rebuild must arm.
         world.section_desired = world.desired_sections(center);
-        world.rebuild_section_visible(center);
+        world.rebuild_section_visible(None);
         assert!(world.pending_sections.get(), "open holes must keep the lane armed");
 
         // Everything in flight (Meshing): no hole is unclaimed — no re-arm.
@@ -1409,17 +1514,64 @@ mod tests {
             world.sections.insert(cell, SectionState::Meshing);
         }
         world.section_desired = world.desired_sections(center);
-        world.rebuild_section_visible(center);
+        world.rebuild_section_visible(None);
         assert!(!world.pending_sections.get(), "in-flight cells are not holes");
 
         // Everything Ready: converged — still no re-arm.
         world.pending_sections.take();
         for &cell in &world.section_desired.clone() {
-            world.sections.insert(cell, SectionState::Ready { quadrants: Default::default() });
+            world.sections.insert(cell, SectionState::Ready { quadrants: Default::default(), last_style: None });
         }
         world.section_desired = world.desired_sections(center);
-        world.rebuild_section_visible(center);
+        world.rebuild_section_visible(None);
         assert!(!world.pending_sections.get(), "a converged covering leaves the lane idle");
+    }
+
+    /// A LOD aux lane driven end-to-end through the scheduler's `run_manual`
+    /// (the call-point path `World::stream` uses) has the same effect as the
+    /// direct method — here the visible-set lane arming the section lane
+    /// while the covering has open holes.
+    #[test]
+    fn section_visible_lane_drives_through_run_manual() {
+        let mut world = lod2_world();
+        let center = ChunkCoord::new(0, 0, 0);
+        world.center = Some(center);
+        world.pending_sections.take();
+        world.section_desired = world.desired_sections(center);
+
+        let mut sched = crate::sched::Scheduler::new();
+        let handle = sched.register_manual(
+            lanes::SectionVisibleLane::manifest(),
+            Box::new(lanes::SectionVisibleLane),
+        );
+        sched.run_manual(handle, &mut world, None);
+
+        assert!(
+            world.pending_sections.get(),
+            "the visible lane, driven via run_manual, arms the section lane on open holes"
+        );
+    }
+
+    /// The mesh admit lane IS the `MeshLane` producer now (no shim): driven
+    /// end-to-end through the scheduler's `run_manual` it has the same effect as
+    /// calling `admit` directly — here clearing `pending_fresh` once its
+    /// worklist is empty (drained).
+    #[test]
+    fn mesh_admit_lane_drives_through_run_manual() {
+        let mut world = lod2_world();
+        let center = ChunkCoord::new(0, 0, 0);
+        world.center = Some(center);
+        world.mesh_worklist.clear();
+        world.pending_fresh.set();
+
+        let mut sched = crate::sched::Scheduler::new();
+        let handle = sched.register_manual(MeshLane::manifest(), Box::new(MeshLane));
+        sched.run_manual(handle, &mut world, None);
+
+        assert!(
+            !world.pending_fresh.get(),
+            "the mesh-admit lane, driven via run_manual, drains an empty worklist"
+        );
     }
 
     /// ANY chunk creation re-arms the far-field lane (it changes the coverage
@@ -1446,7 +1598,7 @@ mod tests {
         let sky: FastSet<_> = world.desired_sections(center).into_iter().collect();
         assert_ne!(ground, sky, "altitude must reshape the desired frontier");
         assert!(!sky.is_empty(), "high altitude still selects a (coarser) far field");
-        let finest = world.section_pyramid.finest.0;
+        let finest = world.section_pyramid.finest;
         assert!(
             sky.iter().all(|s| s.detail > finest),
             "wholly-overhead near rings must drop out at altitude"
@@ -1476,7 +1628,7 @@ mod tests {
         world.section_mip = Some(HeightMip::bake(
             &world.generator,
             &world.registry.color_snapshot(),
-            BakeExtent::new(2048, section::FINEST_DETAIL + 3),
+            BakeExtent::new(2048, Detail(section::FINEST_DETAIL.0 + 3)),
         ));
         let mip = world.section_mip.clone().unwrap();
 
@@ -1523,7 +1675,7 @@ mod tests {
         world.section_mip = Some(HeightMip::bake(
             &world.generator,
             &world.registry.color_snapshot(),
-            BakeExtent::new(2048, section::FINEST_DETAIL + 3),
+            BakeExtent::new(2048, Detail(section::FINEST_DETAIL.0 + 3)),
         ));
         let mip = world.section_mip.clone().unwrap();
 
@@ -1699,13 +1851,13 @@ mod tests {
 
         // Results from old generation don't publish after re-enable.
         world.light_inflight.insert(coord);
-        <LightLane as LaneSpec>::integrate(
+        <LightLane as StreamLane>::integrate(
             &mut world,
             pipeline::Done::Light { coord, epoch: off_epoch, grid: light::LightGrid::dark() },
         );
         assert!(world.light_apply_queue.is_empty());
         let current_epoch = world.light_epoch;
-        <LightLane as LaneSpec>::integrate(
+        <LightLane as StreamLane>::integrate(
             &mut world,
             pipeline::Done::Light {
                 coord,
@@ -1739,7 +1891,7 @@ mod tests {
         assert!(world.quarantined.contains(&streaming::FailKey::Mesh { coord }));
         assert!(!world.mesh_worklist.contains(&coord), "quarantined claims are not re-seeded");
         assert!(
-            !<MeshLane as LaneSpec>::ready(&world, coord),
+            !<MeshLane as StreamLane>::ready(&world, coord),
             "the mesh lane skips a quarantined coord"
         );
 
@@ -1756,7 +1908,7 @@ mod tests {
         assert!(!world.light_inflight.contains(&coord), "claim always releases");
         assert!(world.quarantined.contains(&streaming::FailKey::Light { coord }));
         assert!(
-            <LightLane as LaneSpec>::submit(&mut world, coord).is_none(),
+            <LightLane as StreamLane>::submit(&mut world, coord).is_none(),
             "a quarantined light claim never resubmits"
         );
 
@@ -1769,7 +1921,7 @@ mod tests {
         assert!((0..=2).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
         // Section lane: a panicked Meshing claim is dropped so selection retries.
-        let pos = SectionPos { detail: 2, x: 9, z: 9 };
+        let pos = SectionPos { detail: Detail(2), x: 9, z: 9 };
         world.sections.insert(pos, SectionState::Meshing);
         world.fail_job(pipeline::JobKey::Section { pos });
         assert!(!world.sections.contains_key(&pos), "the Meshing claim must clear");
@@ -2093,18 +2245,18 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "covering did not converge: {}", world.entry_debug());
             // Submit every desired-but-unloaded section (the real lane path).
             for pos in world.desired_sections(center) {
-                if <SectionLane as LaneSpec>::in_flight(&world, pos) {
+                if <SectionLane as StreamLane>::in_flight(&world, pos) {
                     continue;
                 }
-                <SectionLane as LaneSpec>::claim(&mut world, pos);
-                if let Some(job) = <SectionLane as LaneSpec>::submit(&mut world, pos) {
+                <SectionLane as StreamLane>::claim(&mut world, pos);
+                if let Some(job) = <SectionLane as StreamLane>::submit(&mut world, pos) {
                     assert!(workers.submit(job), "worker pool admits the section job");
                 }
             }
             // Drain finished jobs and yield briefly when the pool is empty.
             let mut got = false;
             while let Some(done) = workers.try_recv() {
-                <SectionLane as LaneSpec>::integrate(&mut world, done);
+                <SectionLane as StreamLane>::integrate(&mut world, done);
                 got = true;
             }
             if !got {
@@ -2112,7 +2264,7 @@ mod tests {
             }
             while let Some((pos, _meshes)) = world.section_upload_queue.pop_front() {
                 if let Some(s @ SectionState::Meshing) = world.sections.get_mut(&pos) {
-                    *s = SectionState::Ready { quadrants: Default::default() };
+                    *s = SectionState::Ready { quadrants: Default::default(), last_style: None };
                 }
             }
         }
@@ -2125,13 +2277,10 @@ mod tests {
 
     #[test]
     fn light_settle_to_identical_grid_reseeds_evicted_mesh_seed() {
-        // Regression: `lane_enqueue::<MeshLane>` evicts a light-blocked seed from
-        // `mesh_worklist`, trusting `settle_light` to re-seed it once the block
-        // clears. `settle_light` used to early-return without re-seeding when the
-        // settled grid was IDENTICAL to the old one, stranding a chunk that
-        // settled to the light it already had (ready-but-unreachable — the golden
-        // idle stall). The fix re-arms this chunk's mesh readiness UNCONDITIONALLY,
-        // before the `self_changed` early-return; this pins that.
+        // `admit::<MeshLane>` evicts a light-blocked seed from `mesh_worklist`,
+        // trusting `settle_light` to re-seed it once the block clears — even
+        // when the settled grid is IDENTICAL to the old one, which would
+        // otherwise strand a ready-but-unreachable chunk.
         let mut world = World::generate();
         let c = ChunkCoord::new(0, 0, 0);
         world.center = Some(c);
@@ -2151,29 +2300,26 @@ mod tests {
         world.light_worklist.clear();
         world.light_inflight.insert(c);
         assert!(!world.light_ready(c), "in-flight light blocks readiness");
-        assert!(!<MeshLane as LaneSpec>::ready(&world, c), "blocked: not mesh-ready yet");
+        assert!(!<MeshLane as StreamLane>::ready(&world, c), "blocked: not mesh-ready yet");
 
-        // Seed C, then run the real eviction path: lane_enqueue partitions
+        // Seed C, then run the real eviction path: admit partitions
         // candidates into ready/blocked and evicts every blocked worklist seed.
         world.mesh_worklist.insert(c);
         world.pending_fresh.set();
-        lane_enqueue::<MeshLane>(
+        admit::<MeshLane>(
             &mut world,
             c,
             pipeline::Deadline::from_budget(std::time::Duration::from_secs(1)),
         );
-        assert!(!world.mesh_worklist.contains(&c), "lane_enqueue evicted the blocked seed");
+        assert!(!world.mesh_worklist.contains(&c), "admit evicted the blocked seed");
 
-        // C's light settles — but to the SAME grid it already had (e.g. a flood
-        // that changes nothing new). `settle_light` is the atomic terminal
-        // transition: it releases the in-flight claim ITSELF (no separate
-        // `light_inflight.remove` at the call site), publishes, and re-arms mesh.
+        // C's light settles — but to the SAME grid it already had. `settle_light`
+        // is the atomic terminal transition: it releases the in-flight claim
+        // itself, publishes, and re-arms mesh.
         world.settle_light(c, light::LightGrid::dark());
 
-        // Fixed: light is ready AND the chunk is back on the worklist with a scan
-        // armed, so the mesh lane will claim it next stream instead of stranding it.
         assert!(world.light_ready(c), "light_inflight cleared, grid published: ready now");
-        assert!(<MeshLane as LaneSpec>::ready(&world, c), "every MeshLane::ready predicate holds");
+        assert!(<MeshLane as StreamLane>::ready(&world, c), "every MeshLane::ready predicate holds");
         assert!(world.mesh_worklist.contains(&c), "re-seeded: ready chunk restored to the seed set");
         assert!(world.pending_fresh.get(), "re-armed: the fresh scan will pick it up");
     }

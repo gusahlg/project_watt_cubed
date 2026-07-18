@@ -31,6 +31,8 @@
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
 
+use crate::ident::codec;
+
 use super::slot::{SaveError, SaveMeta};
 
 pub const MAGIC: &[u8; 4] = b"WATT";
@@ -141,19 +143,23 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     out.extend_from_slice(&doc.worldgen_version.to_le_bytes());
     debug_assert_eq!(out.len(), HEADER_LEN);
 
-    for v in doc.player.pos {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out.extend_from_slice(&doc.player.yaw.to_le_bytes());
-    out.extend_from_slice(&doc.player.pitch.to_le_bytes());
+    let mut pw = codec::Writer::new();
+    pw.pose(codec::Pose {
+        pos: voxel_engine::DVec3::new(doc.player.pos[0], doc.player.pos[1], doc.player.pos[2]),
+        yaw: doc.player.yaw,
+        pitch: doc.player.pitch,
+    });
+    out.extend_from_slice(&pw.into_inner());
     out.push(doc.player.flying as u8 | (doc.player.noclip as u8) << 1);
 
     out.extend_from_slice(&(doc.specs.len() as u16).to_le_bytes());
     for spec in &doc.specs {
-        let len = u16::try_from(spec.len())
-            .map_err(|_| SaveError::Corrupt("block spec too long to save"))?;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(spec.as_bytes());
+        if u16::try_from(spec.len()).is_err() {
+            return Err(SaveError::Corrupt("block spec too long to save"));
+        }
+        let mut sw = codec::Writer::new();
+        sw.str16(spec);
+        out.extend_from_slice(&sw.into_inner());
     }
 
     for edit in &doc.edits {
@@ -230,48 +236,45 @@ pub fn set_name(bytes: &mut [u8], name: &str) -> Result<(), SaveError> {
     Ok(())
 }
 
-/// Bounds-checked cursor; truncation surfaces as an error, never a panic.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+/// A truncated read is the one error this format ever reports for it — every
+/// [`codec::CodecError`] a save can hit collapses to that (a decode never
+/// sees `UnknownTag`/`DataTooLarge`: this file's records are all fixed-width).
+fn truncated<T>(_: codec::CodecError) -> Result<T, SaveError> {
+    Err(SaveError::Corrupt("save file is truncated"))
 }
 
+/// Thin framing over the shared little-endian cursor ([`codec::Reader`]):
+/// same bounds-checked primitives as `net/protocol.rs`, plus save's own
+/// strict-UTF-8 string convention (corrupt text is a corrupt file, not a
+/// lossy repair).
+struct Reader<'a>(codec::Reader<'a>);
+
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], SaveError> {
-        if self.bytes.len() - self.pos < n {
-            return Err(SaveError::Corrupt("save file is truncated"));
-        }
-        let slice = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(slice)
+    fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
+        Self(codec::Reader::with_pos(bytes, pos))
+    }
+
+    fn remaining(&self) -> usize {
+        self.0.remaining()
     }
 
     fn u8(&mut self) -> Result<u8, SaveError> {
-        Ok(self.take(1)?[0])
+        self.0.u8().or_else(truncated)
     }
-
     fn u16(&mut self) -> Result<u16, SaveError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        self.0.u16().or_else(truncated)
     }
-
     fn u32(&mut self) -> Result<u32, SaveError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        self.0.u32().or_else(truncated)
     }
-
     fn i32(&mut self) -> Result<i32, SaveError> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        self.0.i32().or_else(truncated)
     }
-
-    fn f32(&mut self) -> Result<f32, SaveError> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    fn pose(&mut self) -> Result<codec::Pose, SaveError> {
+        self.0.pose().or_else(truncated)
     }
-
-    fn f64(&mut self) -> Result<f64, SaveError> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
     fn string(&mut self, len: usize) -> Result<String, SaveError> {
-        String::from_utf8(self.take(len)?.to_vec())
+        String::from_utf8(self.0.take(len).or_else(truncated)?.to_vec())
             .map_err(|_| SaveError::Corrupt("invalid UTF-8 in save file"))
     }
 }
@@ -285,14 +288,15 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     } else {
         1
     };
-    let mut r = Reader { bytes, pos: header_len(version)? };
+    let mut r = Reader::with_pos(bytes, header_len(version)?);
 
     // Header through spec table must be intact — there's no way to regenerate
     // a partial spec table, and everything after depends on it.
+    let pose = r.pose()?;
     let player = PlayerState {
-        pos: [r.f64()?, r.f64()?, r.f64()?],
-        yaw: r.f32()?,
-        pitch: r.f32()?,
+        pos: [pose.pos.x, pose.pos.y, pose.pos.z],
+        yaw: pose.yaw,
+        pitch: pose.pitch,
         flying: false,
         noclip: false,
     };
@@ -326,7 +330,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     // Fixed-width records: a truncated tail is still a valid prefix. A spec
     // index outside the table also truncates — past that point the bytes
     // aren't trustworthy.
-    let avail = ((bytes.len() - r.pos) / EDIT_BYTES) as u32;
+    let avail = (r.remaining() / EDIT_BYTES) as u32;
     let n = expected.min(avail);
     let mut clean = n == expected;
     let mut edits = Vec::with_capacity(n as usize);

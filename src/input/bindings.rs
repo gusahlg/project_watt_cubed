@@ -3,17 +3,16 @@
 use voxel_engine::{Key, MouseButton};
 
 use crate::input::intent::{
-    AxisSource, Chord, GameplayAxis, GameplayEvent, GameplayState, GlobalEvent, MenuEvent, Mods,
-    Source,
+    Chord, GameplayAxis, GameplayEvent, GameplayState, GlobalEvent, LookAxis, MenuEvent,
+    MouseAxis, Mods, MovementAxis, Source,
 };
-use crate::input::look;
 
 pub struct Bindings {
     pub gameplay_state: [Vec<Source>; GameplayState::COUNT],
     pub gameplay_event: [Vec<Chord>; GameplayEvent::COUNT],
-    pub gameplay_axis: [AxisSource; GameplayAxis::COUNT],
-    pub look_x: AxisSource,
-    pub look_y: AxisSource,
+    pub gameplay_axis: [MovementAxis; GameplayAxis::COUNT],
+    pub look_x: LookAxis,
+    pub look_y: LookAxis,
     pub menu_event: [Vec<Chord>; MenuEvent::COUNT],
     pub global_event: [Vec<Chord>; GlobalEvent::COUNT],
 }
@@ -29,6 +28,7 @@ impl Default for Bindings {
         gameplay_state[GS::Sprint as usize] = vec![Source::Key(Key::LeftControl)];
         gameplay_state[GS::Sneak as usize] = vec![Source::Key(Key::LeftShift)];
         gameplay_state[GS::Jump as usize] = vec![Source::Key(Key::Space)];
+        gameplay_state[GS::PushToTalk as usize] = vec![Source::Key(Key::V)];
 
         let mut gameplay_event: [Vec<Chord>; GameplayEvent::COUNT] = Default::default();
         gameplay_event[GE::ToggleFly as usize] = vec![Chord::key(Key::F)];
@@ -42,9 +42,9 @@ impl Default for Bindings {
 
         // Coordinate system: forward (+Z) = W/S, right (+X) = D/A, up (+Y) = Space/LeftShift.
         let gameplay_axis = [
-            AxisSource::KeyPair { neg: Source::Key(Key::A), pos: Source::Key(Key::D) },
-            AxisSource::KeyPair { neg: Source::Key(Key::LeftShift), pos: Source::Key(Key::Space) },
-            AxisSource::KeyPair { neg: Source::Key(Key::S), pos: Source::Key(Key::W) },
+            MovementAxis::KeyPair { neg: Key::A, pos: Key::D },
+            MovementAxis::KeyPair { neg: Key::LeftShift, pos: Key::Space },
+            MovementAxis::KeyPair { neg: Key::S, pos: Key::W },
         ];
 
         // Vim and arrow keys for navigation preferences: j/k rows, h/l values,
@@ -74,8 +74,8 @@ impl Default for Bindings {
             gameplay_state,
             gameplay_event,
             gameplay_axis,
-            look_x: AxisSource::MouseX { sens: look::SENSITIVITY, invert: false },
-            look_y: AxisSource::MouseY { sens: look::SENSITIVITY, invert: true },
+            look_x: LookAxis { axis: MouseAxis::X, invert: false },
+            look_y: LookAxis { axis: MouseAxis::Y, invert: true },
             menu_event,
             global_event,
         }

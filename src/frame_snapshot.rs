@@ -17,19 +17,8 @@ const AVOID_DARK_LEVEL: f32 = 0.030;
 /// Tuned so terrain fades at the view horizon instead of cutting off abruptly.
 const FOG_BASE: f32 = 0.00023;
 
-/// Per-frame dither phase; gains are shader-side.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DitherPhase(pub f32);
-
-/// Per-frame dither phase from the generated constant table; shared with shaders.
-pub fn dither_at(frame_index: u64) -> DitherPhase {
-    let table = &genconst::DITHER_PHASE_16;
-    DitherPhase(table[(frame_index % table.len() as u64) as usize])
-}
-
 /// Per-frame rendering state (linear colour, unclamped).
 pub struct FrameSnapshot {
-    pub frame_index: u64,
     pub sun_dir: Vec3,
     /// Sun elevation in radians; drives palette blending for day/night.
     pub elevation: f32,
@@ -43,7 +32,6 @@ pub struct FrameSnapshot {
     pub turbidity: f32,
     /// Live autoexposure value from the render thread.
     pub exposure: Exposure,
-    pub dither: DitherPhase,
     /// `JitterOffset::ZERO` until Phase E.
     pub jitter: JitterOffset,
     /// World time wrapped into [0, ANIM_PERIOD) for shader animation phase (unused).
@@ -60,7 +48,6 @@ pub struct FrameSnapshot {
 pub fn compose(
     sky: &Sky,
     cam_world: DVec3,
-    frame_index: u64,
     exposure: Exposure,
     render: &RenderConfig,
 ) -> FrameSnapshot {
@@ -107,7 +94,6 @@ pub fn compose(
     ];
 
     FrameSnapshot {
-        frame_index,
         sun_dir,
         elevation: elev,
         day_night_mix: Palette::day_night_mix(elev),
@@ -120,7 +106,6 @@ pub fn compose(
         fog_density,
         turbidity: atm.turbidity,
         exposure,
-        dither: dither_at(frame_index),
         jitter: JitterOffset::ZERO,
         anim_time,
         anim_uv,
@@ -138,7 +123,8 @@ impl From<&FrameSnapshot> for FrameUniformsGpu {
             zenith: [s.zenith.r(), s.zenith.g(), s.zenith.b(), s.turbidity],
             horizon: [s.horizon.r(), s.horizon.g(), s.horizon.b(), s.fog_density],
             candle: [s.candle.r(), s.candle.g(), s.candle.b(), s.ambient_floor],
-            exposure_dither: [s.exposure.0, s.dither.0, s.jitter.0.x, s.jitter.0.y],
+            // .y is a reserved zero (post-effect dither removed); .zw carry TAA jitter.
+            exposure_dither: [s.exposure.0, 0.0, s.jitter.0.x, s.jitter.0.y],
             // x = stars gain: always composed ON; the engine's RenderFlags::stars
             // gate (frame::gate_uniforms) zeroes it, like every other lane gate.
             extras: [1.0, 0.0, 0.0, 0.0],

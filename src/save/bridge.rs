@@ -39,7 +39,6 @@ pub fn to_doc(
     meta.seed = world.seed();
     meta.last_played = unix_now();
 
-    // Deduplicate block specs for compact storage.
     let mut specs: Vec<String> = Vec::new();
     let mut index_of: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
     let mut edits: Vec<Edit> = Vec::new();
@@ -65,8 +64,8 @@ pub fn to_doc(
         worldgen_version: crate::world::placement::WORLDGEN_VERSION,
         player: PlayerState {
             pos: [player.position.x, player.position.y, player.position.z],
-            yaw: player.yaw,
-            pitch: player.pitch,
+            yaw: player.orientation.yaw,
+            pitch: player.orientation.pitch,
             flying: player.flying(),
             noclip: player.noclip(),
         },
@@ -100,8 +99,8 @@ pub fn from_doc(doc: SaveDoc, mods: &mut Mods) -> (World, Player, SaveMeta) {
         doc.player.pos[1],
         doc.player.pos[2],
     ));
-    player.yaw = doc.player.yaw;
-    player.pitch = doc.player.pitch;
+    player.orientation.yaw = doc.player.yaw;
+    player.orientation.pitch = doc.player.pitch;
     if doc.player.flying {
         player.set_flying(true);
         // Noclip is only reachable through the fly cycle (fly → fly+noclip).
@@ -110,7 +109,6 @@ pub fn from_doc(doc: SaveDoc, mods: &mut Mods) -> (World, Player, SaveMeta) {
         }
     }
 
-    // Map specs to block IDs; used by all edits.
     let block_ids: Vec<_> = doc
         .specs
         .iter()

@@ -229,15 +229,16 @@ impl Gameplay<'_> {
     }
 
     /// Yaw (x) and pitch (y) deltas from this frame's mouse motion, with
-    /// sensitivity and invert applied. Zero while uncaptured.
+    /// invert applied. Sensitivity is not: callers scale via
+    /// `Orientation::look`. Zero while uncaptured.
     pub fn look(&self) -> Vec2 {
         if !self.fi.captured {
             return Vec2::ZERO;
         }
         let delta = self.fi.eng.mouse_delta();
         Vec2::new(
-            self.fi.bindings.look_x.mouse_component(delta),
-            self.fi.bindings.look_y.mouse_component(delta),
+            self.fi.bindings.look_x.sample(delta),
+            self.fi.bindings.look_y.sample(delta),
         )
     }
 

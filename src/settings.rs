@@ -102,6 +102,22 @@ pub struct Settings {
     /// so it doubles as a perf lever.
     pub ao: bool,
     pub vignette: bool,
+
+    // Audio mix (0..=100 percent). The single source for [`mix_change`], which the
+    // spine pushes to `SoundSystem::set_mix`. `voice_enabled` is the transmit gate
+    // (does PTT capture do anything); `voice_incoming` is the inverse of deafen.
+    pub master_volume: u8,
+    pub effects_volume: u8,
+    pub voice_volume: u8,
+    pub voice_enabled: bool,
+    pub voice_incoming: bool,
+    /// Transient master mute (the `/mute` command). Absent from [`SETTINGS`] so it
+    /// is never persisted and resets to `false` each launch — like [`cull_faces`],
+    /// a runtime-only field on the same struct so it can ride [`mix_change`] to the
+    /// mixer without a separate plumbing path.
+    ///
+    /// [`cull_faces`]: Settings::cull_faces
+    pub muted: bool,
 }
 
 impl Default for Settings {
@@ -141,14 +157,17 @@ impl Default for Settings {
             water_anim: true,
             ao: true,
             vignette: false,
+            master_volume: 80,
+            effects_volume: 100,
+            voice_volume: 100,
+            voice_enabled: true,
+            voice_incoming: true,
+            muted: false,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// One `Setting` per field: a flat set of behaviour `fn`s folded over by every
-// surface. No common wire type — each field touches its own struct member.
-// ---------------------------------------------------------------------------
+// One `Setting` per field: behaviour folded over by every surface (persistence, menu, console).
 
 /// Settings submenu category.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -156,12 +175,17 @@ pub enum Category {
     Video,
     World,
     Interface,
+    Audio,
 }
 
 impl Category {
     /// All categories in menu order with their page titles.
-    pub const ALL: [(Category, &'static str); 3] =
-        [(Category::Video, "Video"), (Category::World, "World"), (Category::Interface, "Interface")];
+    pub const ALL: [(Category, &'static str); 4] = [
+        (Category::Video, "Video"),
+        (Category::World, "World"),
+        (Category::Interface, "Interface"),
+        (Category::Audio, "Audio"),
+    ];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -265,16 +289,16 @@ impl Setting {
     }
 }
 
-/// A `Category::Video` on/off row over a single `bool` field. Every render-lane
+/// An on/off row over a single `bool` field in the given category. Every render-lane
 /// toggle shares this exact behaviour set, so the field name is the only variable.
-macro_rules! video_toggle {
-    ($field:ident, $key:literal, $label:literal $(, $aliases:expr)?) => {
+macro_rules! toggle_setting {
+    ($cat:expr, $field:ident, $key:literal, $label:literal, $aliases:expr) => {
         Setting {
-            category: Category::Video,
+            category: $cat,
             menu_kind: MenuKind::Toggle,
             fraction: |_| 0.0,
             key: $key,
-            aliases: video_toggle!(@aliases $($aliases)?),
+            aliases: $aliases,
             label: $label,
             usage: concat!($key, " on|off"),
             confirm: |s| format!(concat!($key, " {}"), on_off(s.$field, false)),
@@ -284,6 +308,42 @@ macro_rules! video_toggle {
             clamp: |_| {},
             write: |s| s.$field.to_string(),
             read: |s, v| set_bool(&mut s.$field, v),
+        }
+    };
+}
+
+macro_rules! video_toggle {
+    ($field:ident, $key:literal, $label:literal $(, $aliases:expr)?) => {
+        toggle_setting!(Category::Video, $field, $key, $label, video_toggle!(@aliases $($aliases)?))
+    };
+    (@aliases) => { &[] };
+    (@aliases $aliases:expr) => { $aliases };
+}
+
+/// A `Category::Audio` 0..=100 percent volume slider over a `u8` field.
+macro_rules! volume_bar {
+    ($field:ident, $key:literal, $label:literal $(, $aliases:expr)?) => {
+        Setting {
+            category: Category::Audio,
+            menu_kind: MenuKind::Bar,
+            fraction: |s| s.$field as f32 / 100.0,
+            key: $key,
+            aliases: volume_bar!(@aliases $($aliases)?),
+            label: $label,
+            usage: concat!($key, " <0-100>"),
+            confirm: |s| format!(concat!($key, " {}%"), s.$field),
+            show: |s| format!("{}%", s.$field),
+            parse_human: |s, v| {
+                let ok = set_parsed(&mut s.$field, v);
+                if ok {
+                    vol_clamp(&mut s.$field);
+                }
+                ok
+            },
+            step: |s, d| s.$field = cycle_list(&[0, 25, 50, 75, 100], s.$field as i32, d) as u8,
+            clamp: |s| vol_clamp(&mut s.$field),
+            write: |s| s.$field.to_string(),
+            read: |s, v| set_parsed(&mut s.$field, v),
         }
     };
     (@aliases) => { &[] };
@@ -296,7 +356,7 @@ const MSAA: &[i32] = &[1, 2, 4, 8];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 31] = [
+pub const SETTINGS: [Setting; 36] = [
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -612,6 +672,12 @@ pub const SETTINGS: [Setting; 31] = [
     video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
+    // Audio mix (see [`Settings::mix_change`]).
+    volume_bar!(master_volume, "master_volume", "Master Volume", &["volume", "master"]),
+    volume_bar!(effects_volume, "effects_volume", "Effects Volume", &["effects", "sfx"]),
+    volume_bar!(voice_volume, "voice_volume", "Voice Volume", &["voice_vol"]),
+    toggle_setting!(Category::Audio, voice_enabled, "voice_enabled", "Voice Chat", &["voice", "mic"]),
+    toggle_setting!(Category::Audio, voice_incoming, "voice_incoming", "Hear Voice", &["deafen_inverse", "hearvoice"]),
 ];
 
 impl Settings {
@@ -710,11 +776,23 @@ impl Settings {
             vignette: self.vignette,
         }
     }
+
+    /// The audio mix this settings state names — the single source the spine
+    /// pushes to `SoundSystem::set_mix`. Percents map to linear [0, 1] gains;
+    /// `muted` is the transient runtime `/mute` flag (never persisted);
+    /// `deafen` is the inverse of the persisted `voice_incoming` gate.
+    pub fn mix_change(&self) -> crate::audio::MixChange {
+        crate::audio::MixChange {
+            master: self.master_volume as f32 / 100.0,
+            effects: self.effects_volume as f32 / 100.0,
+            voice: self.voice_volume as f32 / 100.0,
+            muted: self.muted,
+            deafen: !self.voice_incoming,
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
 // Shared value helpers — the single definition each surface reuses.
-// ---------------------------------------------------------------------------
 
 /// Parse an on/off word. The one toggle parser (persistence AND `/gfx`).
 pub fn parse_toggle(value: &str) -> Option<bool> {
@@ -812,6 +890,11 @@ fn fps_clamp(s: &mut Settings) {
     if s.max_fps != 0 {
         s.max_fps = s.max_fps.clamp(10, 1000);
     }
+}
+
+/// Clamp a volume percent into 0..=100 (u8 already excludes negatives/overflow).
+fn vol_clamp(v: &mut u8) {
+    *v = (*v).min(100);
 }
 
 fn msaa_clamp(s: &mut Settings) {
@@ -998,6 +1081,35 @@ mod tests {
         back.parse_from(&samples.to_text());
         back.clamp();
         assert_eq!(back, samples);
+    }
+
+    #[test]
+    fn audio_fields_roundtrip_and_clamp() {
+        // Non-default audio mix survives the text codec, and an out-of-range
+        // volume snaps to 100 on clamp (u8 already excludes negatives).
+        let s = Settings {
+            master_volume: 45,
+            effects_volume: 0,
+            voice_volume: 75,
+            voice_enabled: false,
+            voice_incoming: false,
+            ..Settings::default()
+        };
+        let mut back = Settings::default();
+        back.parse_from(&s.to_text());
+        back.clamp();
+        assert_eq!(back, s);
+
+        let mut over = Settings { master_volume: 200, ..Settings::default() };
+        over.clamp();
+        assert_eq!(over.master_volume, 100);
+
+        // Percent maps to linear gain; deafen is the inverse of voice_incoming.
+        let mix = Settings { voice_incoming: false, master_volume: 50, ..Settings::default() }
+            .mix_change();
+        assert_eq!(mix.master, 0.5);
+        assert!(mix.deafen);
+        assert!(!mix.muted);
     }
 
     #[test]

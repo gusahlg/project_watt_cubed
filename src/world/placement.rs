@@ -5,7 +5,7 @@
 //! over the shared context fields (depth below surface, surface kind, flood,
 //! overhang, island shell, cave walls), and the block at a cell IS the union of
 //! the elements placed there: several → their natural mixture, one → a pure
-//! block, none → air. See `documentation/element-worldgen-plan.md`.
+//! block, none → air.
 //!
 //! The vocabulary is deliberately CLOSED — no closures, no arbitrary
 //! predicates. That is what makes the reachable combination set mechanically
@@ -102,7 +102,7 @@ pub enum Context {
     Ground { depth: RangeInclusive<i32>, surface: SurfaceMask },
     /// Between the surface and the water table (oceans, rivers, lakes).
     Flood,
-    /// Overhang-shelf cells above the surface (the S6 3-D fill).
+    /// Overhang-shelf cells above the surface.
     Overhang,
     /// Island-solid cells. `below` counts solid cells to the island's upper
     /// surface (0 = the surface cell itself).
@@ -287,7 +287,7 @@ impl PlacementTable {
     /// Enumerate every composition terrain can emit, register the set in
     /// canonical order (sorted element lists — table row order can never
     /// reshuffle ids), and resolve the generator's LUTs. Runs at startup on
-    /// the main thread, before any worker exists (C2). Idempotent: identical
+    /// the main thread, before any worker thread exists. Idempotent: identical
     /// compositions dedup inside the registry.
     pub fn compile(&self, registry: &mut BlockRegistry) -> Resolved {
         // --- 1. The reachable set, canonically ordered by BTreeSet.

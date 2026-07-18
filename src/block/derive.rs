@@ -107,6 +107,69 @@ pub fn derive_buoyancy(specials: &[(SpecialKind, u8)]) -> u8 {
         .unwrap_or(0)
 }
 
+/// The acoustic material class of a block — the single partition that drives BOTH
+/// sound-cue naming (`break_<class>`/`place_<class>`/`step_<class>`) and the
+/// occlusion DDA's per-cell absorption weight, so the two can never drift. Ordered
+/// hardest→softest; `Water` doubles as the open/no-wall class (non-solids and
+/// passable liquids), which never triggers a break/place/step cue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SoundClass {
+    Stone,
+    Soil,
+    Wood,
+    Glass,
+    Foliage,
+    Water,
+}
+
+impl SoundClass {
+    /// The cue-name stem this class resolves to in the block-cue table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoundClass::Stone => "stone",
+            SoundClass::Soil => "soil",
+            SoundClass::Wood => "wood",
+            SoundClass::Glass => "glass",
+            SoundClass::Foliage => "foliage",
+            SoundClass::Water => "water",
+        }
+    }
+
+    /// Acoustic absorption per metre (`0..=255`) — how strongly sound is attenuated
+    /// crossing one voxel (the DDA's per-cell weight). `Water` (and every non-wall)
+    /// is acoustically Open (`0`); values are distinct per class so a block's class
+    /// and its absorption are mutually recoverable.
+    pub fn absorption(self) -> u8 {
+        match self {
+            SoundClass::Stone => 200,   // dense stone / metal
+            SoundClass::Soil => 140,    // soil / packed earth / sand
+            SoundClass::Wood => 90,     // wood / organic aggregates / coal
+            SoundClass::Glass => 60,    // glass / ice — transmit sound like light
+            SoundClass::Foliage => 30,  // foliage / snow / very light matter
+            SoundClass::Water => 0,     // open: occlusion is a property of walls
+        }
+    }
+}
+
+/// Classify a block acoustically from the same derived physics the rest of the
+/// block uses — density is the dominant proxy for sound absorption, with translucent
+/// solids (glass/ice) carved out low. Non-solids and passable liquids (water) are
+/// `Water` (open); the acoustics kernel handles the water *medium* separately.
+pub fn derive_sound_class(core: &CoreProperties, solid: bool, buoyant: bool) -> SoundClass {
+    if !solid || buoyant {
+        return SoundClass::Water;
+    }
+    if core.transparency >= 50 {
+        return SoundClass::Glass;
+    }
+    match core.density {
+        170.. => SoundClass::Stone,
+        90..=169 => SoundClass::Soil,
+        50..=89 => SoundClass::Wood,
+        _ => SoundClass::Foliage,
+    }
+}
+
 /// Special behaviours a block exhibits, each scaled by how much of the carrying
 /// element it contains and summed across carriers. Returned sorted by kind for a
 /// stable, inspectable order.

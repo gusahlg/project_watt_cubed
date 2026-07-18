@@ -462,6 +462,14 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
     let mut settings = Settings::default();
     // Update requires a router even though scripted games consume no live input.
     let mut router = crate::input::router::Router::new();
+    // `Game::update` requires the audio seam, but the scripted path returns before
+    // touching it — a muted SoundSystem (NullBackend + empty catalog) satisfies the
+    // signature with no audio device and no `assets/sounds` dependency.
+    let (mut sound, cues) = crate::audio::SoundSystem::mute();
+    // Scripted `Game::update` returns before the audio seam, but its signature needs a
+    // director; build one from the loaded catalog (warnings discarded — headless).
+    let (palette, _) = crate::audio::CuePalette::build(&cues, sound.catalog());
+    let mut audio = crate::audio::AudioDirector::new(palette);
     let outcomes = Rc::new(RefCell::new(Outcomes::default()));
     let sink = Rc::clone(&outcomes);
 
@@ -528,7 +536,7 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // was a blank (uniform black) frame that passed ImageMatch trivially.
         // Streaming frames draw too, matching the real app (which renders while
         // chunks load) and warming pipelines before the captured frame.
-        g.update(eng, &mut router, &mut mods, &mut settings);
+        g.update(eng, &mut router, &mut mods, &mut settings, &mut sound, &mut audio);
         // Shake 0: captures must be deterministic (no live trauma exists in the
         // scripted path anyway).
         g.draw(eng, &mut mods, settings.fov, 0.0);

@@ -3,6 +3,7 @@
 //! accumulate magnitude (see [`math`](crate::math)).
 use voxel_engine::DVec3;
 
+use crate::camera::Orientation;
 use crate::math::{Aabb, Bounded, PER_METER};
 
 /// The player's collision half-width on the horizontal axes (x and z). Vertical
@@ -96,10 +97,8 @@ impl Motion {
 pub struct Player {
     /// Eye position in world space.
     pub position: DVec3,
-    /// Yaw in radians (rotation around the Y axis / left-right look).
-    pub yaw: f32,
-    /// Pitch in radians (up-down look), clamped by the look controller.
-    pub pitch: f32,
+    /// View angles — the one orientation; every camera mode is a function of it.
+    pub orientation: Orientation,
     /// How the player is moving — walking (with gravity) or flying.
     pub motion: Motion,
     /// Standing or sneaking — drives the player's height and eye offset.
@@ -119,8 +118,7 @@ impl Player {
     pub fn new(position: DVec3) -> Self {
         Self {
             position,
-            yaw: 0.0,
-            pitch: 0.0,
+            orientation: Orientation { yaw: 0.0, pitch: 0.0 },
             motion: Motion::Walking { velocity: DVec3::ZERO, on_ground: false },
             stance: Stance::Standing,
             speed: DEFAULT_WALK_SPEED,
@@ -199,22 +197,16 @@ impl Player {
         self.position.y - self.stance.eye_offset()
     }
 
-    /// Full view direction, including pitch. Built from `f64` trig of the
-    /// `f32` angles so adding it to an `f64` position loses nothing.
+    /// Full view direction, including pitch.
     pub fn forward(&self) -> DVec3 {
-        let (yaw, pitch) = (self.yaw as f64, self.pitch as f64);
-        DVec3::new(
-            yaw.cos() * pitch.cos(),
-            pitch.sin(),
-            yaw.sin() * pitch.cos(),
-        )
+        self.orientation.direction()
     }
 
     /// The forward and right basis vectors on the XZ plane, used for ground
     /// movement. Returned together because they share one `sin`/`cos` of the yaw,
     /// and both come out unit length already (no normalize needed).
     pub fn movement_basis(&self) -> (DVec3, DVec3) {
-        let (sin_yaw, cos_yaw) = (self.yaw as f64).sin_cos();
+        let (sin_yaw, cos_yaw) = (self.orientation.yaw as f64).sin_cos();
         let forward = DVec3::new(cos_yaw, 0.0, sin_yaw);
         let right = DVec3::new(-sin_yaw, 0.0, cos_yaw);
         (forward, right)

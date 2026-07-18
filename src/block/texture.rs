@@ -25,7 +25,7 @@ pub const TEXTURE_SIZE: u32 = 16;
 const BLEND: f32 = 0.06;
 /// Maximum per-texel brightness jitter, as a +/- fraction.
 const JITTER: f32 = 0.08;
-/// Neutral gray base for compositions with no elements (Computational).
+/// Neutral gray base for compositions with no elements.
 const NEUTRAL_GRAY: [f32; 3] = [140.0, 140.0, 140.0];
 
 const BYTES_PER_LAYER: usize = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
@@ -55,8 +55,8 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
     let parts = parts(&registry.block(id).composition);
     let seed = seed_of(&parts);
     let (colors, cuts): (Vec<[f32; 3]>, Vec<f32>) = if parts.is_empty() {
-        // Computational blocks (and any degenerate empty composition beyond
-        // air) get a neutral gray base with speckle only.
+        // Any degenerate empty composition beyond air gets a neutral gray base
+        // with speckle only.
         (vec![NEUTRAL_GRAY], vec![1.0])
     } else {
         let colors = parts
@@ -66,8 +66,6 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
                 [c.r as f32, c.g as f32, c.b as f32]
             })
             .collect();
-        // Weight thresholds partition the noise range across elements;
-        // last is clamped to 1.0 to absorb rounding.
         let mut acc = 0.0;
         let mut cuts: Vec<f32> = parts
             .iter()
@@ -83,10 +81,8 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
     let mut out = Vec::with_capacity(BYTES_PER_LAYER);
     for y in 0..TEXTURE_SIZE {
         for x in 0..TEXTURE_SIZE {
-            // Smooth tiling noise picks the texel's element...
             let n = tile_noise(seed, x as f32 + 0.5, y as f32 + 0.5);
             let rgb = pick_color(&colors, &cuts, n);
-            // ...and an uncorrelated per-texel hash speckles the brightness.
             let jitter = 1.0 + (hash01(seed, JITTER_CHANNEL, x, y) * 2.0 - 1.0) * JITTER;
             for c in rgb {
                 out.push((c * jitter).clamp(0.0, 255.0).round() as u8);
@@ -109,7 +105,7 @@ fn parts(composition: &Composition) -> Vec<(ElementId, f32)> {
         .collect()
 }
 
-/// FNV-1a over the sorted `(element id, whole percentage)` pairs. Composition
+/// FNV / FNV1a over the sorted `(element id, whole percentage)` pairs. Composition
 /// -> seed, so identical materials look identical everywhere.
 fn seed_of(parts: &[(ElementId, f32)]) -> u32 {
     let mut bytes = Vec::with_capacity(parts.len() * 5);
@@ -145,7 +141,7 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     ]
 }
 
-// ---- tiling value noise -------------------------------------------------
+// tiling value noise
 
 /// Octave 0: a 4x4 random lattice across the tile (one cell = 4 texels).
 const OCTAVE0_PERIOD: u32 = 4;

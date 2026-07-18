@@ -28,12 +28,44 @@ pub struct ViewPose {
     pub fovy: f32,
 }
 
+/// View direction from yaw/pitch angles — THE one construction, shared by
+/// [`Player::forward`](crate::player::Player::forward), [`ViewPose::forward`]
+/// and [`FreeRig::fly`]. `f64` trig of the `f32` angles so adding the result
+/// to an `f64` position loses nothing.
+pub fn direction_from_angles(yaw: f32, pitch: f32) -> DVec3 {
+    let (yaw, pitch) = (yaw as f64, pitch as f64);
+    DVec3::new(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos())
+}
+
+/// The one orientation: yaw + pitch, and the one look clamp. `Player` stores
+/// this directly (`Player::orientation`). [`FreeRig`] deliberately keeps its
+/// own detached yaw/pitch — the free camera is a transient view that must not
+/// write back into the player's stored angles (merging it into `Motion::Flying`
+/// was refuted) — but routes `look()` through this type so there is exactly one
+/// formula and one clamp.
+#[derive(Clone, Copy)]
+pub struct Orientation {
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl Orientation {
+    pub fn direction(self) -> DVec3 {
+        direction_from_angles(self.yaw, self.pitch)
+    }
+
+    /// `d` is a raw (uninverted-by-sensitivity) look delta; `sensitivity`
+    /// scales it here so callers don't each bake in their own copy.
+    pub fn look(&mut self, d: Vec2, sensitivity: f32) {
+        self.yaw += d.x * sensitivity;
+        self.pitch = (self.pitch + d.y * sensitivity).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+}
+
 impl ViewPose {
-    /// Full view direction from the angles — same construction as
-    /// [`Player::forward`], `f64` trig of the `f32` angles.
+    /// Full view direction from the angles.
     pub fn forward(&self) -> DVec3 {
-        let (yaw, pitch) = (self.yaw as f64, self.pitch as f64);
-        DVec3::new(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos())
+        direction_from_angles(self.yaw, self.pitch)
     }
 
     /// Build the engine camera. Rebases the f64 eye to the origin so the engine
@@ -83,7 +115,6 @@ impl PersonView {
         }
     }
 
-    /// Whether the player's own body should be drawn (any view that can see it).
     pub fn shows_body(self) -> bool {
         !matches!(self, PersonView::First)
     }
@@ -117,16 +148,18 @@ impl FreeRig {
         Self { pos: pose.eye, yaw: pose.yaw, pitch: pose.pitch, speed }
     }
 
-    /// Apply an already-scaled look delta, same clamp as the player look path.
-    pub fn look(&mut self, look: Vec2) {
-        self.yaw += look.x;
-        self.pitch = (self.pitch + look.y).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    /// Raw look delta; same [`Orientation::look`] clamp as the player look path.
+    pub fn look(&mut self, d: Vec2) {
+        let mut o = Orientation { yaw: self.yaw, pitch: self.pitch };
+        o.look(d, crate::input::look::SENSITIVITY);
+        self.yaw = o.yaw;
+        self.pitch = o.pitch;
     }
 
     /// No inertia — camera wants crisp stops, not player feel.
     pub fn fly(&mut self, axes: FlyAxes, dt: f32) {
-        let (yaw, pitch) = (self.yaw as f64, self.pitch as f64);
-        let forward = DVec3::new(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos());
+        let forward = direction_from_angles(self.yaw, self.pitch);
+        let yaw = self.yaw as f64;
         let right = DVec3::new(-yaw.sin(), 0.0, yaw.cos());
         let wish = forward * axes.forward + right * axes.right + DVec3::Y * axes.up;
         if wish != DVec3::ZERO {
@@ -251,7 +284,6 @@ impl GameCamera {
         };
     }
 
-    /// Applies effects (shake) on top of the mode's base pose.
     pub fn pose(&self, player: &Player, world: &World, base_fov: f32, shake: f32) -> ViewPose {
         let pose = match &self.mode {
             CameraMode::Person(view) => person_pose(*view, player, world, base_fov),
@@ -280,8 +312,8 @@ fn person_pose(view: PersonView, player: &Player, world: &World, base_fov: f32) 
     match view {
         PersonView::First => ViewPose {
             eye: player.position,
-            yaw: player.yaw,
-            pitch: player.pitch,
+            yaw: player.orientation.yaw,
+            pitch: player.orientation.pitch,
             roll: 0.0,
             fovy: base_fov,
         },
@@ -289,9 +321,9 @@ fn person_pose(view: PersonView, player: &Player, world: &World, base_fov: f32) 
             let dir = if front { player.forward() } else { -player.forward() };
             let len = boom_clamp(world, player.position, dir, distance);
             let (yaw, pitch) = if front {
-                (player.yaw + std::f32::consts::PI, -player.pitch)
+                (player.orientation.yaw + std::f32::consts::PI, -player.orientation.pitch)
             } else {
-                (player.yaw, player.pitch)
+                (player.orientation.yaw, player.orientation.pitch)
             };
             ViewPose { eye: player.position + dir * len, yaw, pitch, roll: 0.0, fovy: base_fov }
         }

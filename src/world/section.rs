@@ -1,34 +1,29 @@
-//! Run-length-encoded vertical columns for far LOD instead of dense tiles.
+//! Section: a quadtree node backed by four brick stacks.
 //!
-//! Terrain is vertically homogeneous, so far columns compress as stacks of
-//! [`LodRun`]s (block id, height, skylight) rather than cell arrays. Each
-//! [`LodColumn`] is a top-down run stack over the fixed world-Y domain
-//! `[LOD_FLOOR_Y, LOD_CEIL_Y)`. Run bottoms are implicit (derived from runs
-//! above), which is a struct invariant enforced by [`LodColumn::validate`].
-//! This invariant is load-bearing: the downsampler and mesher depend on it.
+//! A section is `pos` (detail + grid coords) plus four [`BrickStack`]s, one
+//! per intra-section mesh quadrant (bit 0 = +X, bit 1 = +Z — same convention
+//! [`Quadrant`] uses for the UNRELATED inter-section quadtree-child concept;
+//! the two "quadrant" notions share a bit layout by coincidence, not by
+//! design, so this file never reuses [`Quadrant`] for the intra-section
+//! split). Each stack is a vertical run of [`Brick`]s (16³ cells) built
+//! directly from RLE column data.
 //!
-//! A [`Section`] is an N×N grid of columns at one detail level, with a
-//! per-section [`Palette`] mapping run ids to real [`BlockId`]s (sections
-//! typically contain only a few block types). Finest sections are extracted
-//! once from the generator; coarser levels are pure 4-to-1 integer merges
-//! via [`Section::downsample`] (no re-sampling). Conservative merge rules
-//! (air loses ties, skylight by vote winners' mean) prevent hollow silhouettes
-//! from developing holes as detail drops.
+//! Each detail level is independently re-sampled from the generator; there is
+//! no 4-to-1 merge between levels.
 //!
-//! Skylight is baked per run from the generator's surface height: cells at or
-//! above the surface are fully lit (15), buried cells are dark (0). No neighbor
-//! diffusion. This matches the existing far-tile rendering and the chunk mesher's
-//! treatment of the topmost air layer.
-//!
-//! These types compile and test in isolation; they are not yet wired into
-//! World, streaming lanes, or rendering. Module-wide dead_code allowance below.
-#![allow(dead_code)]
+//! Lighting is NOT baked here: no per-cell skylight in any payload. Far
+//! sections are shaded by the same light-volume sample the chunk mesher
+//! relies on (or the neutral fallback), so a relight is a texture write,
+//! never a section re-extract.
 
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::ChunkCoord;
+use crate::ident::{BlockState, Detail};
 
+use super::brick::{BRICK_DIM, BRICK_VOLUME, Brick, BrickPayload, PALETTE_MAX, Run, RleColumns, cell_index};
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::TerrainGenerator;
+use super::lod;
 
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
@@ -37,8 +32,16 @@ pub(in crate::world) use mesh::{SectionMeshData, build_section_mesh};
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
 
-/// Finest LOD detail level: cell size is 2^detail metres. Zone-1 full-res chunks are finer.
-pub(in crate::world) const FINEST_DETAIL: u8 = 2;
+/// Finest LOD detail level: cell size is 2^k metres. Zone-1 full-res chunks are finer.
+pub(in crate::world) const FINEST_DETAIL: Detail = Detail(2);
+
+/// Metres per section side at detail `d` (`32·2^k`) — the section-grid span, the
+/// one place [`SECTION_N`] scales the shared cell size. Free function so callers
+/// holding just a [`Detail`] (heightmip, edit dirtying) don't fabricate a
+/// [`SectionPos`].
+pub(in crate::world) fn section_span(d: Detail) -> i32 {
+    SECTION_N as i32 * lod::cell(d)
+}
 
 /// Fixed world-Y domain all columns tile. Floor at y=0 (below is solid ground).
 /// Ceiling at 512 (covers terrain and islands). Domain height is a power of two.
@@ -61,6 +64,7 @@ impl Quadrant {
     /// All four quadrants, ascending — the canonical iteration order.
     pub const ALL: [Quadrant; 4] = [Quadrant(0), Quadrant(1), Quadrant(2), Quadrant(3)];
 
+    #[cfg(test)]
     pub fn new(q: u8) -> Quadrant {
         debug_assert!(q < 4, "quadrant is a 2-bit index, got {q}");
         Quadrant(q & 0b11)
@@ -90,225 +94,143 @@ impl Quadrant {
 /// A section's place in the quadtree: detail level and grid coords.
 /// Uses floor division (div_euclid) only to avoid the classic quadtree bug of rounding toward zero.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(in crate::world) struct SectionPos {
-    pub detail: u8,
+pub(crate) struct SectionPos {
+    pub detail: Detail,
     pub x: i32,
     pub z: i32,
 }
 
 impl SectionPos {
-    /// Metres per cell (2^detail).
-    pub const fn cell_size(self) -> i32 {
-        1 << self.detail
+    /// Metres per cell (2^k).
+    pub fn cell_size(self) -> i32 {
+        lod::cell(self.detail)
     }
 
-    /// Metres per section side (N * 2^detail).
-    pub const fn span(self) -> i32 {
-        (SECTION_N as i32) << self.detail
+    /// Metres per section side (N * 2^k).
+    pub fn span(self) -> i32 {
+        section_span(self.detail)
     }
 
     /// World min-corner X of this section.
-    pub const fn min_x(self) -> i32 {
+    pub fn min_x(self) -> i32 {
         self.x * self.span()
     }
 
     /// World min-corner Z of this section.
-    pub const fn min_z(self) -> i32 {
+    pub fn min_z(self) -> i32 {
         self.z * self.span()
     }
 
     /// Coarser section containing this one, computed with floor division.
     pub fn parent(self) -> SectionPos {
-        SectionPos { detail: self.detail + 1, x: self.x.div_euclid(2), z: self.z.div_euclid(2) }
+        SectionPos { detail: Detail(self.detail.0 + 1), x: self.x.div_euclid(2), z: self.z.div_euclid(2) }
     }
 
     /// Finer child at quadrant q; inverse of parent().
-    pub fn child(self, quadrant: Quadrant) -> SectionPos {
-        debug_assert!(self.detail > 0, "finest level has no children");
+    ///
+    /// `pub(in crate::world)`, not `pub`: widening `SectionPos` crate-wide
+    /// must not drag the unrelated intra-section [`Quadrant`] type with it.
+    pub(in crate::world) fn child(self, quadrant: Quadrant) -> SectionPos {
+        debug_assert!(self.detail.0 > 0, "finest level has no children");
         SectionPos {
-            detail: self.detail - 1,
+            detail: Detail(self.detail.0 - 1),
             x: self.x * 2 + quadrant.dx(),
             z: self.z * 2 + quadrant.dz(),
         }
     }
 
     /// Which quadrant of its parent this section occupies.
-    pub fn quadrant(self) -> Quadrant {
+    pub(in crate::world) fn quadrant(self) -> Quadrant {
         Quadrant::of_coords(self.x, self.z)
     }
-}
 
-// LodRun: bit-packed datapoint.
-
-const ID_SHIFT: u64 = 0;
-const HEIGHT_SHIFT: u64 = 16;
-const SKYLIGHT_SHIFT: u64 = 28;
-const ID_MASK: u64 = (1 << 16) - 1;
-const HEIGHT_MASK: u64 = (1 << 12) - 1;
-const SKYLIGHT_MASK: u64 = (1 << 4) - 1;
-
-/// Largest height a single run can encode (12 bits).
-pub(in crate::world) const MAX_RUN_HEIGHT: u16 = HEIGHT_MASK as u16;
-/// Fully-lit skylight (4 bits, max value).
-pub(in crate::world) const FULL_SKYLIGHT: u8 = SKYLIGHT_MASK as u8;
-
-/// One vertical run: palette id (u16), height in metres (u12), skylight (u4).
-/// Top 32 bits reserved for block-light and flags. repr(transparent) + const
-/// accessors preserve exact-integer equality for mesher and coalescing.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(in crate::world) struct LodRun(u64);
-
-impl LodRun {
-    /// Pack a run. Height and skylight are validated by debug_assert.
-    pub const fn new(id: u16, height: u16, skylight: u8) -> Self {
-        debug_assert!(height >= 1, "an empty run is not representable");
-        debug_assert!(height as u64 <= HEIGHT_MASK, "run height overflows 12 bits");
-        debug_assert!(skylight as u64 <= SKYLIGHT_MASK, "skylight overflows 4 bits");
-        LodRun(
-            ((id as u64) << ID_SHIFT)
-                | ((height as u64) << HEIGHT_SHIFT)
-                | ((skylight as u64) << SKYLIGHT_SHIFT),
-        )
+    /// Cells tiling the domain at this position's detail (`DOMAIN_H / cell_size`).
+    fn n_cells(self) -> i32 {
+        DOMAIN_H / self.cell_size()
     }
 
-    pub const fn id(self) -> u16 {
-        ((self.0 >> ID_SHIFT) & ID_MASK) as u16
-    }
-
-    pub const fn height(self) -> u16 {
-        ((self.0 >> HEIGHT_SHIFT) & HEIGHT_MASK) as u16
-    }
-
-    pub const fn skylight(self) -> u8 {
-        ((self.0 >> SKYLIGHT_SHIFT) & SKYLIGHT_MASK) as u8
+    /// Bricks per quadrant stack (`max(1, n_cells.div_ceil(16))`, derived
+    /// from `n_cells` rather than a hardcoded `2^(5-k)` so it stays correct
+    /// at the coarse rings where `n_cells < 16` (single padded brick)).
+    fn num_bricks(self) -> usize {
+        (self.n_cells() as usize).div_ceil(BRICK_DIM).max(1)
     }
 }
 
-// Palette: per-section id-map.
+// BrickStack: one quadrant's vertical run of bricks.
 
-/// Per-section id to BlockId map. Runs store dense indices; real block ids
-/// are looked up here, so a section stores one palette instead of BlockId per run.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(in crate::world) struct Palette(Vec<BlockId>);
-
-impl Palette {
-    /// Palette id 0 is reserved for AIR. Skylight and empty columns always use a fixed id.
-    pub fn new() -> Self {
-        Self(vec![AIR])
-    }
-
-    /// Index for b, inserting if new. Linear scan: palettes are tiny (few block types).
-    pub fn intern(&mut self, b: BlockId) -> u16 {
-        match self.0.iter().position(|&x| x == b) {
-            Some(i) => i as u16,
-            None => {
-                let i = self.0.len();
-                self.0.push(b);
-                i as u16
-            }
-        }
-    }
-
-    pub fn get(&self, i: u16) -> BlockId {
-        self.0[i as usize]
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
+/// One resolved (BlockId, cell-count) run, bottom-up, cell units — the
+/// shared decode the mesher uses.
+#[derive(Clone, Copy)]
+pub(in crate::world) struct DecodedRun {
+    pub block: BlockId,
+    pub count: i32,
 }
 
-// LodColumn: top-down run stack over the fixed domain.
+/// One quadrant's vertical stack of bricks. Stack index b covers cells
+/// `[16b, 16b+16)` above [`LOD_FLOOR_Y`]. A brick's cells beyond this
+/// section's `n_cells` (only possible at the coarse rings, where
+/// `n_cells < 16`) are padded AIR — invisible to every reader bounded by
+/// `n_cells` (the mesher) or by the stack's own brick count (`column_runs`,
+/// self-bounding).
+pub(in crate::world) struct BrickStack(Box<[Brick]>);
 
-/// A column's runs, top-down (index 0 is the topmost). Contiguous, non-overlapping,
-/// tiling the domain exactly. Typical terrain has 1-4 runs; stored as a Vec.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(in crate::world) struct LodColumn {
-    runs: Vec<LodRun>,
-}
-
-impl LodColumn {
-    /// Wrap top-down runs, enforcing the tiling invariant (debug builds).
-    pub fn from_top_down(runs: Vec<LodRun>) -> Self {
-        let col = Self { runs };
-        col.validate();
-        col
+impl BrickStack {
+    fn from_bricks(bricks: Vec<Brick>) -> Self {
+        BrickStack(bricks.into_boxed_slice())
     }
 
-    pub fn runs(&self) -> &[LodRun] {
-        &self.runs
-    }
-
-    /// Canonical-form invariant: non-empty, heights tile domain exactly,
-    /// no adjacent runs share (id, skylight) — they would have been coalesced.
-    fn validate(&self) {
-        debug_assert!(!self.runs.is_empty(), "a column has at least one run");
-        let mut sum: i64 = 0;
-        for (i, run) in self.runs.iter().enumerate() {
-            debug_assert!(run.height() >= 1, "run {i} is empty");
-            sum += run.height() as i64;
-            if i > 0 {
-                let prev = self.runs[i - 1];
-                debug_assert!(
-                    prev.id() != run.id() || prev.skylight() != run.skylight(),
-                    "runs {} and {i} share (id, skylight) and must be one run",
-                    i - 1
-                );
+    /// Decode one brick's column (x, z) into resolved (BlockId, count) runs.
+    fn brick_column(brick: &Brick, x: usize, z: usize) -> Vec<(BlockId, u8)> {
+        match &brick.payload {
+            BrickPayload::Uniform(v) => vec![(v.id, BRICK_DIM as u8)],
+            BrickPayload::Rle { palette, columns } => {
+                columns.runs_for_column(x, z).iter().map(|r| (palette[r.palette_index() as usize].id, r.count())).collect()
             }
+            BrickPayload::Paletted { palette, cells } => decode_dense_column(x, z, |y| palette[cells[cell_index(x, y, z)] as usize].id),
+            BrickPayload::Dense(cells) => decode_dense_column(x, z, |y| cells[cell_index(x, y, z)].id),
         }
-        debug_assert_eq!(sum, DOMAIN_H as i64, "column runs must tile the domain");
     }
 
-    /// The run spanning world-Y `y` (assumed within the domain).
-    fn at(&self, y: i32) -> LodRun {
-        let mut top = LOD_CEIL_Y;
-        for &run in &self.runs {
-            let bottom = top - run.height() as i32;
-            if y >= bottom && y < top {
-                return run;
-            }
-            top = bottom;
-        }
-        if y >= LOD_CEIL_Y { self.runs[0] } else { *self.runs.last().unwrap() }
-    }
-
-    /// Topmost solid run's top-Y and block, or None for all-air columns.
-    pub fn topmost_solid(&self, palette: &Palette) -> Option<(i32, BlockId)> {
-        let mut top = LOD_CEIL_Y;
-        for &run in &self.runs {
-            let b = palette.get(run.id());
-            if b != AIR {
-                return Some((top, b));
-            }
-            top -= run.height() as i32;
-        }
-        None
-    }
-
-    /// Expand runs back to one BlockId per cell-tall slice, bottom-up.
-    /// Valid only when run heights are whole cell multiples (true for extracted finest columns).
-    pub fn cell_ids(&self, palette: &Palette, cell: i32) -> Vec<BlockId> {
-        let mut out = Vec::with_capacity((DOMAIN_H / cell) as usize);
-        for &run in self.runs.iter().rev() {
-            debug_assert_eq!(run.height() as i32 % cell, 0, "run not a whole number of cells");
-            let b = palette.get(run.id());
-            for _ in 0..(run.height() as i32 / cell) {
-                out.push(b);
+    /// Fused bottom-up runs for local column (x, z) across the whole stack:
+    /// decode each brick's column, then fuse adjacent equal-BlockId runs
+    /// across brick boundaries (originals are maximal within a brick, so
+    /// fusion exactly reconstructs the continuous run stream).
+    pub fn column_runs(&self, x: usize, z: usize) -> Vec<DecodedRun> {
+        let mut out: Vec<DecodedRun> = Vec::new();
+        for brick in self.0.iter() {
+            for (id, count) in Self::brick_column(brick, x, z) {
+                match out.last_mut() {
+                    Some(last) if last.block == id => last.count += count as i32,
+                    _ => out.push(DecodedRun { block: id, count: count as i32 }),
+                }
             }
         }
         out
     }
+
 }
 
-// Section: N×N columns at one detail level.
+/// Decode a Paletted/Dense brick's column via a per-cell lookup closure,
+/// coalescing adjacent equal ids into runs (shared by both variants).
+fn decode_dense_column(_x: usize, _z: usize, cell: impl Fn(usize) -> BlockId) -> Vec<(BlockId, u8)> {
+    let mut out: Vec<(BlockId, u8)> = Vec::new();
+    for y in 0..BRICK_DIM {
+        let id = cell(y);
+        match out.last_mut() {
+            Some((last_id, count)) if *last_id == id => *count += 1,
+            _ => out.push((id, 1)),
+        }
+    }
+    out
+}
 
-/// N×N grid of LodColumns at one detail level, with a per-section Palette.
-#[derive(Clone, PartialEq, Eq, Debug)]
+// Section: pos + four brick stacks.
+
+/// A section: position plus four quadrant brick stacks (bit 0 = +X, bit 1 = +Z).
 pub(in crate::world) struct Section {
     pos: SectionPos,
-    palette: Palette,
-    cols: Box<[LodColumn]>,
+    quadrants: [BrickStack; 4],
 }
 
 impl Section {
@@ -316,73 +238,80 @@ impl Section {
         self.pos
     }
 
-    pub fn palette(&self) -> &Palette {
-        &self.palette
+    /// Global-column (0..SECTION_N each) to (quadrant, local x, local z).
+    fn locate(ix: usize, iz: usize) -> (usize, usize, usize) {
+        debug_assert!(ix < SECTION_N && iz < SECTION_N);
+        (ix / BRICK_DIM + (iz / BRICK_DIM) * 2, ix % BRICK_DIM, iz % BRICK_DIM)
     }
 
-    pub fn column(&self, ix: usize, iz: usize) -> &LodColumn {
-        debug_assert!(ix < SECTION_N && iz < SECTION_N);
-        &self.cols[ix + iz * SECTION_N]
+    /// Fused bottom-up runs for global column (ix, iz) (0..SECTION_N each).
+    pub fn column_runs(&self, ix: usize, iz: usize) -> Vec<DecodedRun> {
+        let (q, lx, lz) = Self::locate(ix, iz);
+        self.quadrants[q].column_runs(lx, lz)
+    }
+
+    /// Topmost solid cell's absolute Y (top-exclusive) and block over global
+    /// column (ix, iz), or `None` for an all-air column. Convenience for
+    /// heightmip's `resample_cell` seam.
+    pub fn topmost_solid(&self, ix: usize, iz: usize) -> Option<(i32, BlockId)> {
+        let cell = self.pos.cell_size();
+        let mut y = LOD_FLOOR_Y;
+        let mut top = None;
+        for run in self.column_runs(ix, iz) {
+            y += run.count * cell; // run.count is CELL units; Y is metres
+            if run.block != AIR {
+                top = Some((y, run.block));
+            }
+        }
+        top
     }
 
     /// Extract finest-level section from the generator, applying player edits.
-    /// Each column is sampled once, then RLE-compacted. Skylight is baked from surface height.
+    /// Each column is sampled once, then RLE-compacted straight into
+    /// per-brick runs. `rev` stamps every extracted brick: transient section
+    /// bricks carry the edit_generation observed at extract time.
     pub fn extract<G: TerrainGenerator>(
         pos: SectionPos,
         r#gen: &G,
         edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+        rev: voxel_engine::Rev,
     ) -> Section {
         let cell = pos.cell_size();
         debug_assert_eq!(DOMAIN_H % cell, 0, "cell size must divide the domain");
-        let n = (DOMAIN_H / cell) as usize;
+        let n = pos.n_cells() as usize;
+        let num_bricks = pos.num_bricks();
         let half = cell / 2;
         let ys: Vec<i32> = (0..n).map(|j| LOD_FLOOR_Y + j as i32 * cell + half).collect();
         let flat = flatten_edits(edits);
 
-        let mut palette = Palette::new();
-        let mut cols: Vec<LodColumn> = Vec::with_capacity(SECTION_N * SECTION_N);
         let mut scratch = vec![AIR; n];
-        for iz in 0..SECTION_N as i32 {
-            for ix in 0..SECTION_N as i32 {
-                let (fx, fz) = (pos.min_x() + ix * cell, pos.min_z() + iz * cell);
-                let (wx, wz) = (fx + half, fz + half);
-                r#gen.lod_column(wx, wz, &ys, &mut scratch);
-                apply_edits(&mut scratch, &flat, fx, fz, cell);
-                let height = r#gen.height(wx, wz);
-                cols.push(rle_column(&scratch, &ys, height, cell, &mut palette));
+        let quadrants: [BrickStack; 4] = std::array::from_fn(|q| {
+            let (qx, qz) = (q & 1, q >> 1);
+            let mut per_brick: Vec<[Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]> =
+                (0..num_bricks).map(|_| std::array::from_fn(|_| Vec::new())).collect();
+            for lz in 0..BRICK_DIM {
+                for lx in 0..BRICK_DIM {
+                    let (ix, iz) = (qx * BRICK_DIM + lx, qz * BRICK_DIM + lz);
+                    let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
+                    let (wx, wz) = (fx + half, fz + half);
+                    r#gen.lod_column(wx, wz, &ys, &mut scratch);
+                    apply_edits(&mut scratch, &flat, fx, fz, cell);
+                    let full_runs = rle_slice(&scratch);
+                    let bricked = slice_into_bricks(&full_runs, num_bricks);
+                    let local_col = lx + lz * BRICK_DIM;
+                    for (b, cols) in bricked.into_iter().enumerate() {
+                        per_brick[b][local_col] = cols;
+                    }
+                }
             }
-        }
-        Section { pos, palette, cols: cols.into_boxed_slice() }
+            BrickStack::from_bricks(per_brick.into_iter().map(|cols| build_brick(pos.detail, rev, cols)).collect())
+        });
+        Section { pos, quadrants }
     }
 
-    /// Merge four children into their coarser parent via 4-to-1 voting.
-    /// Each parent column votes on its 2x2 child block (air loses ties, skylight by winners' mean).
-    pub fn downsample(children: [Section; 4]) -> Section {
-        let parent_pos = children[0].pos.parent();
-        for (q, child) in children.iter().enumerate() {
-            debug_assert_eq!(child.pos, parent_pos.child(Quadrant::new(q as u8)), "child {q} misplaced");
-        }
-
-        let mut palette = Palette::new();
-        let mut cols: Vec<LodColumn> = Vec::with_capacity(SECTION_N * SECTION_N);
-        for pz in 0..SECTION_N {
-            for px in 0..SECTION_N {
-                // Gather the 2x2 child columns under this parent position.
-                let sources: [(&LodColumn, &Palette); 4] = std::array::from_fn(|q| {
-                    let qd = Quadrant::new(q as u8);
-                    let gx = 2 * px + qd.dx() as usize;
-                    let gz = 2 * pz + qd.dz() as usize;
-                    let sect = &children[(gx / SECTION_N) + (gz / SECTION_N) * 2];
-                    (sect.column(gx % SECTION_N, gz % SECTION_N), &sect.palette)
-                });
-                cols.push(downsample_column(sources, &mut palette));
-            }
-        }
-        Section { pos: parent_pos, palette, cols: cols.into_boxed_slice() }
-    }
 }
 
-// Extraction and downsample helpers.
+// Extraction helpers.
 
 /// Flatten tile edits (per-chunk flat indices) to absolute world coordinates,
 /// sorted by ascending `(y, x, z)`. The sort is the determinism contract
@@ -446,123 +375,113 @@ fn apply_edits(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32
     }
 }
 
-/// RLE a cell array into a top-down LodColumn, baking skylight per cell.
-fn rle_column(cells: &[BlockId], ys: &[i32], height: i32, cell: i32, palette: &mut Palette) -> LodColumn {
-    let sky = |y: i32| if y >= height { FULL_SKYLIGHT } else { 0 };
-    let mut runs: Vec<LodRun> = Vec::new();
+/// Run-length compact a cell slice into bottom-up (BlockId, count) segments.
+/// `i32` counts: a full-domain slice can be up to `DOMAIN_H/cell` long
+/// (≤128 in practice), safely past `u8` before per-brick slicing narrows it.
+fn rle_slice(cells: &[BlockId]) -> Vec<(BlockId, i32)> {
+    let mut out = Vec::new();
     let mut j = 0;
     while j < cells.len() {
-        let (id, light) = (cells[j], sky(ys[j]));
+        let id = cells[j];
         let mut k = j + 1;
-        while k < cells.len() && cells[k] == id && sky(ys[k]) == light {
+        while k < cells.len() && cells[k] == id {
             k += 1;
         }
-        let h = ((k - j) as i32 * cell) as u16;
-        runs.push(LodRun::new(palette.intern(id), h, light));
+        out.push((id, (k - j) as i32));
         j = k;
     }
-    runs.reverse(); // built bottom-up; a column is stored top-down
-    // Ceiling-window law at the source (see downsample_column): ceiling air is lit.
-    debug_assert!(
-        runs.first().is_none_or(|r| palette.get(r.id()) != AIR || r.skylight() == FULL_SKYLIGHT),
-        "bake produced unlit ceiling air (height/lod_column disagree above the domain)"
-    );
-    LodColumn::from_top_down(runs)
+    out
 }
 
-// Downsample helpers.
-
-/// Merge four child columns into one parent column via voting.
-/// Sweeps Y-transitions, votes each slice (air loses ties, skylight by winners' mean),
-/// then coalesces adjacent identical runs. Order-independent for determinism.
-fn downsample_column(children: [(&LodColumn, &Palette); 4], out_palette: &mut Palette) -> LodColumn {
-    // Collect all Y-transitions from the four stacks.
-    let mut bounds: Vec<i32> = Vec::with_capacity(16);
-    for (col, _) in children {
-        let mut top = LOD_CEIL_Y;
-        bounds.push(top);
-        for run in col.runs() {
-            top -= run.height() as i32;
-            bounds.push(top);
+/// Slice a column's full-domain bottom-up runs into per-brick windows of
+/// exactly [`BRICK_DIM`] cells each, splitting any run that spans a
+/// boundary. Short of a full brick (coarse rings): the remainder is padded
+/// AIR — unobserved by any n_cells-bounded reader.
+fn slice_into_bricks(runs: &[(BlockId, i32)], num_bricks: usize) -> Vec<Vec<(BlockId, u8)>> {
+    let mut out: Vec<Vec<(BlockId, u8)>> = (0..num_bricks).map(|_| Vec::new()).collect();
+    let (mut b, mut remaining) = (0usize, BRICK_DIM as i32);
+    for &(id, count) in runs {
+        let mut count = count;
+        while count > 0 && b < num_bricks {
+            let take = count.min(remaining);
+            out[b].push((id, take as u8));
+            count -= take;
+            remaining -= take;
+            if remaining == 0 {
+                b += 1;
+                remaining = BRICK_DIM as i32;
+            }
         }
     }
-    bounds.sort_unstable_by(|a, b| b.cmp(a));
-    bounds.dedup();
-
-    // Vote each maximal slice and coalesce adjacent identical runs into the parent.
-    let mut merged: Vec<(BlockId, i32, u8)> = Vec::new();
-    for w in bounds.windows(2) {
-        let (hi, lo) = (w[0], w[1]);
-        let mid = lo + (hi - lo) / 2;
-        let mut ids = [AIR; 4];
-        let mut skys = [0u8; 4];
-        for (i, (col, pal)) in children.iter().enumerate() {
-            let run = col.at(mid);
-            ids[i] = pal.get(run.id());
-            skys[i] = run.skylight();
+    if b < num_bricks && remaining < BRICK_DIM as i32 {
+        // Merge into the last real segment if it's already air (e.g. a
+        // column that trails off into open sky before the padding starts) —
+        // pushing a second AIR entry here would violate RleColumns'
+        // adjacent-runs-differ invariant (brick.rs).
+        match out[b].last_mut() {
+            Some((id, c)) if *id == AIR => *c += remaining as u8,
+            _ => out[b].push((AIR, remaining as u8)),
         }
-        let (block, light) = vote_slice(ids, skys);
-        match merged.last_mut() {
-            Some(last) if last.0 == block && last.2 == light => last.1 += hi - lo,
-            _ => merged.push((block, hi - lo, light)),
-        }
+        b += 1;
     }
-
-    // Ceiling-window law: air at the domain ceiling must stay fully lit; preserve during merge.
-    debug_assert!(
-        merged.first().is_none_or(|&(b, _, l)| b != AIR || l == FULL_SKYLIGHT),
-        "downsample produced unlit ceiling air"
-    );
-    let runs = merged
-        .into_iter()
-        .map(|(block, h, light)| LodRun::new(out_palette.intern(block), h as u16, light))
-        .collect();
-    LodColumn::from_top_down(runs)
+    for slot in out.iter_mut().take(num_bricks).skip(b) {
+        slot.push((AIR, BRICK_DIM as u8));
+    }
+    out
 }
 
-/// Vote one slice: block by mode_air_loses, skylight by mean of winning block's values only.
-fn vote_slice(ids: [BlockId; 4], skys: [u8; 4]) -> (BlockId, u8) {
-    let block = mode_air_loses(ids);
-    let (mut sum, mut n) = (0u32, 0u32);
-    for i in 0..4 {
-        if ids[i] == block {
-            sum += skys[i] as u32;
-            n += 1;
+/// Build one brick's [`BrickPayload`] from 256 columns' worth of already-RLE
+/// (BlockId, count) segments (count in CELL units, each column summing to
+/// [`BRICK_DIM`]).
+/// `columns[x + z*16]`, x-major (matches [`RleColumns`]).
+fn build_brick(level: Detail, rev: voxel_engine::Rev, columns: [Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]) -> Brick {
+    let mut palette: Vec<BlockState> = Vec::new();
+    let mut column_runs: [Vec<Run>; BRICK_DIM * BRICK_DIM] = std::array::from_fn(|_| Vec::new());
+    for (col, segs) in columns.iter().enumerate() {
+        for &(id, count) in segs {
+            let state = BlockState { id, state: 0 };
+            let idx = match palette.iter().position(|p| *p == state) {
+                Some(i) => i,
+                None => {
+                    palette.push(state);
+                    palette.len() - 1
+                }
+            };
+            if palette.len() > PALETTE_MAX {
+                return build_dense_brick(level, rev, &columns);
+            }
+            column_runs[col].push(Run::new(idx as u8, count));
         }
     }
-    (block, ((sum + n / 2) / n) as u8)
+    Brick { level, rev, payload: BrickPayload::Rle { palette: palette.into_boxed_slice(), columns: RleColumns::from_column_runs(column_runs) } }
 }
 
-/// Mode of four blocks: air only wins with strict plurality (never ties).
-/// Solid ties break to smallest BlockId for determinism.
-fn mode_air_loses(ids: [BlockId; 4]) -> BlockId {
-    if ids.iter().all(|&b| b == AIR) {
-        return AIR;
-    }
-    let mut best = AIR;
-    let mut best_count = 0usize;
-    for &cand in &ids {
-        let count = ids.iter().filter(|&&b| b == cand).count();
-        let wins = count > best_count
-            || (count == best_count && best == AIR && cand != AIR)
-            || (count == best_count && best != AIR && cand != AIR && cand.0 < best.0);
-        if wins {
-            best = cand;
-            best_count = count;
+/// Palette-overflow escape (>256 distinct values in one brick): re-decode
+/// the same column segments into a flat 4096-cell buffer instead.
+fn build_dense_brick(level: Detail, rev: voxel_engine::Rev, columns: &[Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]) -> Brick {
+    let mut cells = vec![BlockState { id: AIR, state: 0 }; BRICK_VOLUME];
+    for (col, segs) in columns.iter().enumerate() {
+        let (x, z) = (col % BRICK_DIM, col / BRICK_DIM);
+        let mut y = 0usize;
+        for &(id, count) in segs {
+            for _ in 0..count {
+                cells[cell_index(x, y, z)] = BlockState { id, state: 0 };
+                y += 1;
+            }
         }
     }
-    best
+    Brick { level, rev, payload: BrickPayload::Dense(cells.into_boxed_slice()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
+    use crate::coord::BlockCoord;
     use crate::world::generation::SineHills;
 
-    // -- fixtures ----------------------------------------------------------
+    // Test fixtures
 
-    /// Test generator: h = surface height, b = block at cell. These two closures fully determine every column.
     struct FnGen<H, B> {
         h: H,
         b: B,
@@ -595,14 +514,7 @@ mod tests {
     fn blocks() -> Blocks {
         let r = BlockRegistry::with_builtins();
         let id = |n: &str| r.id_by_name(n).unwrap();
-        Blocks {
-            air: AIR,
-            grass: id("Grass"),
-            dirt: id("Dirt"),
-            stone: id("Stone"),
-            sand: id("Sand"),
-            water: id("Water"),
-        }
+        Blocks { air: AIR, grass: id("Grass"), dirt: id("Dirt"), stone: id("Stone"), sand: id("Sand"), water: id("Water") }
     }
 
     fn sine(seed: i64) -> SineHills {
@@ -610,18 +522,19 @@ mod tests {
     }
 
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
-    const CELL: i32 = 1 << FINEST_DETAIL;
-    const NCELLS: usize = (DOMAIN_H / CELL) as usize;
+    const CELL: i32 = 1 << FINEST_DETAIL.0;
 
-    /// Test generator: ground + surface + air, with optional water table and solid shelf.
+    fn extract<G: TerrainGenerator>(pos: SectionPos, g: &G, edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Section {
+        Section::extract(pos, g, edits, voxel_engine::Rev::START)
+    }
+
     fn terrain_gen(
         b: &Blocks,
         h: i32,
         water: i32,
         shelf: Option<(i32, i32)>,
     ) -> FnGen<impl Fn(i32, i32) -> i32, impl Fn(i32, i32, i32) -> BlockId> {
-        let (grass, dirt, stone, sand, water_id, air) =
-            (b.grass, b.dirt, b.stone, b.sand, b.water, b.air);
+        let (grass, dirt, stone, sand, water_id, air) = (b.grass, b.dirt, b.stone, b.sand, b.water, b.air);
         FnGen {
             h: move |_, _| h,
             b: move |_, y, _| {
@@ -644,8 +557,6 @@ mod tests {
         }
     }
 
-    // -- reference (independent of the code under test) --------------------
-
     /// Reference: coarse-cell sweep per column from generator contract (parity oracle).
     fn reference_cells<G: TerrainGenerator>(r#gen: &G, wx: i32, wz: i32, cell: i32) -> Vec<BlockId> {
         let half = cell / 2;
@@ -656,28 +567,18 @@ mod tests {
     }
 
     /// Reference implementation of the apply_edits POSITION rule, written
-    /// per-cell (independent of input order by construction): a centre-sample
-    /// edit wins outright; otherwise the solid edit at the greatest (y, x, z)
-    /// wins; otherwise the generator cell stands.
+    /// per-cell (independent of input order by construction).
     fn reference_reduce(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
         let half = cell / 2;
         for (j, slot) in cells.iter_mut().enumerate() {
             let centre = (fx + half, LOD_FLOOR_Y + j as i32 * cell + half, fz + half);
-            if let Some(&(_, _, _, id)) =
-                flat.iter().find(|&&(x, y, z, _)| (x, y, z) == centre)
-            {
+            if let Some(&(_, _, _, id)) = flat.iter().find(|&&(x, y, z, _)| (x, y, z) == centre) {
                 *slot = id;
                 continue;
             }
             let mut best: Option<((i32, i32, i32), BlockId)> = None;
             for &(x, y, z, id) in flat {
-                if id == AIR
-                    || x < fx
-                    || x >= fx + cell
-                    || z < fz
-                    || z >= fz + cell
-                    || (y - LOD_FLOOR_Y).div_euclid(cell) != j as i32
-                {
+                if id == AIR || x < fx || x >= fx + cell || z < fz || z >= fz + cell || (y - LOD_FLOOR_Y).div_euclid(cell) != j as i32 {
                     continue;
                 }
                 if best.is_none_or(|(key, _)| (y, x, z) > key) {
@@ -690,17 +591,36 @@ mod tests {
         }
     }
 
-    // SectionPos / LodRun packing tests.
+    /// Bottom-up flat cell list for global column (ix, iz), from the fused
+    /// [`Section::column_runs`].
+    fn column_ids(section: &Section, ix: usize, iz: usize) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        for run in section.column_runs(ix, iz) {
+            out.extend(std::iter::repeat_n(run.block, run.count as usize));
+        }
+        out
+    }
+
+    fn overlay_from_world(edits: &[(i32, i32, i32, BlockId)]) -> Vec<(ChunkCoord, Vec<(usize, BlockId)>)> {
+        let mut map: std::collections::HashMap<ChunkCoord, Vec<(usize, BlockId)>> = Default::default();
+        for &(x, y, z, id) in edits {
+            let (c, l) = BlockCoord::new(x, y, z).split();
+            map.entry(c).or_default().push((Chunk::index(l.lx(), l.ly(), l.lz()), id));
+        }
+        map.into_iter().collect()
+    }
+
+    // SectionPos / Quadrant tests.
 
     #[test]
     fn child_parent_is_an_involution_across_the_sign_boundary() {
         for &(x, z) in &[(0, 0), (1, 1), (-1, -1), (-1, 0), (5, -7), (-4, 3), (i32::MIN / 4, 9)] {
-            let p = SectionPos { detail: 5, x, z };
+            let p = SectionPos { detail: Detail(5), x, z };
             for q in Quadrant::ALL {
                 let c = p.child(q);
                 assert_eq!(c.parent(), p, "child({q:?}).parent() != self at {x},{z}");
                 assert_eq!(c.quadrant(), q, "quadrant disagrees with child index");
-                assert_eq!(c.detail, 4);
+                assert_eq!(c.detail, Detail(4));
             }
         }
     }
@@ -708,43 +628,32 @@ mod tests {
     #[test]
     fn parent_uses_floor_division_not_toward_zero() {
         // Ensure -1 divides to -1 (floor), not 0 (toward zero).
-        let p = SectionPos { detail: 2, x: -1, z: -3 };
-        assert_eq!(p.parent(), SectionPos { detail: 3, x: -1, z: -2 });
-    }
-
-    #[test]
-    fn lodrun_packs_and_unpacks_each_field() {
-        for &(id, h, sky) in &[(0u16, 1u16, 0u8), (513, DOMAIN_H as u16, 15), (65535, MAX_RUN_HEIGHT, 9)] {
-            let r = LodRun::new(id, h, sky);
-            assert_eq!((r.id(), r.height(), r.skylight()), (id, h, sky));
-        }
+        let p = SectionPos { detail: Detail(2), x: -1, z: -3 };
+        assert_eq!(p.parent(), SectionPos { detail: Detail(3), x: -1, z: -2 });
     }
 
     // Extraction: column classes tests.
 
-    /// Every terrain class extracts to a canonical, domain-tiling column whose cells
-    /// and exposed surface match the generator's own coarse sweep.
+    /// Every terrain class extracts to a canonical column whose cells and
+    /// exposed surface match the generator's own coarse sweep.
     #[test]
     fn extraction_matches_the_generator_sweep_for_every_class() {
         let b = blocks();
         let cases: [(&str, i32, i32, Option<(i32, i32)>); 6] = [
-            ("uniform-air", 0, 0, None),      // surface at the floor: all air
-            ("deep-ground", 400, 0, None),    // ground fills almost the whole domain
-            ("water-covered", 30, 60, None),  // ocean column
-            ("shore", 40, 40, None),          // height == water table: sand beach
-            ("overhang", 100, 0, Some((108, 112))), // solid shelf above the surface
-            ("island", 64, 0, Some((120, 140))),    // solid body high in the sky
+            ("uniform-air", 0, 0, None),
+            ("deep-ground", 400, 0, None),
+            ("water-covered", 30, 60, None),
+            ("shore", 40, 40, None),
+            ("overhang", 100, 0, Some((108, 112))),
+            ("island", 64, 0, Some((120, 140))),
         ];
         for (name, h, water, shelf) in cases {
             let r#gen = terrain_gen(&b, h, water, shelf);
-            let sec = Section::extract(FINEST, &r#gen, &[]);
-            let col = sec.column(0, 0);
-            // Cells round-trip through the RLE and equal the reference sweep.
+            let sec = extract(FINEST, &r#gen, &[]);
             let want = reference_cells(&r#gen, FINEST.min_x() + CELL / 2, FINEST.min_z() + CELL / 2, CELL);
-            assert_eq!(col.cell_ids(sec.palette(), CELL), want, "{name}: cells");
-            // Exposed surface agrees with the reference topmost solid cell.
+            assert_eq!(column_ids(&sec, 0, 0), want, "{name}: cells");
             let ref_top = want.iter().rposition(|&c| c != AIR);
-            match (col.topmost_solid(sec.palette()), ref_top) {
+            match (sec.topmost_solid(0, 0), ref_top) {
                 (Some((top_y, id)), Some(j)) => {
                     assert_eq!(top_y, LOD_FLOOR_Y + (j as i32 + 1) * CELL, "{name}: surface Y");
                     assert_eq!(id, want[j], "{name}: surface block");
@@ -755,43 +664,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn skylight_is_lit_at_and_above_the_surface_and_dark_below() {
-        let b = blocks();
-        let r#gen = terrain_gen(&b, 100, 0, None);
-        let sec = Section::extract(FINEST, &r#gen, &[]);
-        let col = sec.column(0, 0);
-        let mut top = LOD_CEIL_Y;
-        for &run in col.runs() {
-            let bottom = top - run.height() as i32;
-            // A run is uniform in skylight; sample its bottom cell's centre.
-            let lit = bottom + CELL / 2 >= 100;
-            assert_eq!(run.skylight() == FULL_SKYLIGHT, lit, "run [{bottom},{top}) skylight");
-            assert!(run.skylight() == 0 || run.skylight() == FULL_SKYLIGHT);
-            top = bottom;
-        }
-    }
-
     // Extraction: edits tests.
 
     #[test]
     fn edit_reduction_matches_the_reference_reducer() {
         let b = blocks();
         let r#gen = terrain_gen(&b, 100, 0, None);
-        // Solid placement above surface (overwrites), air digs on/off sample point.
         let cell = CELL;
         let (fx, fz) = (FINEST.min_x(), FINEST.min_z());
         let (half, j) = (cell / 2, 20i32);
         let sample_y = LOD_FLOOR_Y + j * cell + half;
         let edits_world = [
-            (fx + half, sample_y, fz + half, b.stone),      // solid: overwrites the cell
-            (fx + half, LOD_FLOOR_Y + 5 * cell + half, fz + half, b.air), // air on sample point: clears
-            (fx + 1, LOD_FLOOR_Y + 6 * cell + half, fz + half, b.air),    // air off sample point: ignored
+            (fx + half, sample_y, fz + half, b.stone),
+            (fx + half, LOD_FLOOR_Y + 5 * cell + half, fz + half, b.air),
+            (fx + 1, LOD_FLOOR_Y + 6 * cell + half, fz + half, b.air),
         ];
         let overlay = overlay_from_world(&edits_world);
 
-        let sec = Section::extract(FINEST, &r#gen, &overlay);
-        let got = sec.column(0, 0).cell_ids(sec.palette(), cell);
+        let sec = extract(FINEST, &r#gen, &overlay);
+        let got = column_ids(&sec, 0, 0);
 
         let mut want = reference_cells(&r#gen, fx + half, fz + half, cell);
         let flat = flatten_edits(&overlay);
@@ -801,21 +692,8 @@ mod tests {
         assert_eq!(got[5], b.air, "air edit on the sample point cleared the cell");
     }
 
-    /// Convert world edits to chunk-overlay format for extraction.
-    fn overlay_from_world(edits: &[(i32, i32, i32, BlockId)]) -> Vec<(ChunkCoord, Vec<(usize, BlockId)>)> {
-        use crate::coord::BlockCoord;
-        let mut map: std::collections::HashMap<ChunkCoord, Vec<(usize, BlockId)>> = Default::default();
-        for &(x, y, z, id) in edits {
-            let (c, l) = BlockCoord::new(x, y, z).split();
-            map.entry(c).or_default().push((Chunk::index(l.lx(), l.ly(), l.lz()), id));
-        }
-        map.into_iter().collect()
-    }
-
-    /// G-07: edits originate in hash maps with no ordering contract, so the
-    /// coarse reduction must give ONE answer for every input permutation —
-    /// including several different solids racing one coarse cell, the exact
-    /// case the old last-write-wins reducer got wrong.
+    /// Edits originate in hash maps with no ordering contract, so the
+    /// coarse reduction must give ONE answer for every input permutation.
     #[test]
     fn edit_reduction_is_independent_of_input_permutation() {
         let b = blocks();
@@ -824,8 +702,6 @@ mod tests {
         let (fx, fz) = (FINEST.min_x(), FINEST.min_z());
         let (half, j) = (cell / 2, 20i32);
         let cell_y = LOD_FLOOR_Y + j * cell;
-        // Three solids and one air, ALL inside coarse cell j of column (0, 0),
-        // plus a centre-sample air in another cell.
         let edits_world = [
             (fx, cell_y, fz, b.stone),
             (fx + 1, cell_y + 1, fz, b.grass),
@@ -834,28 +710,20 @@ mod tests {
             (fx + half, LOD_FLOOR_Y + 5 * cell + half, fz + half, b.air),
         ];
 
-        // Baseline: the reference position rule.
         let mut want = reference_cells(&r#gen, fx + half, fz + half, cell);
         reference_reduce(&mut want, &flatten_edits(&overlay_from_world(&edits_world)), fx, fz, cell);
         assert_eq!(want[j as usize], b.sand, "the topmost (y,x,z) solid must win");
         assert_eq!(want[5], b.air, "the centre-sample air clears its cell");
 
-        // Every permutation of the overlay input extracts identically.
         let mut order: Vec<usize> = (0..edits_world.len()).collect();
         permute(&mut order, 0, &mut |order| {
             let permuted: Vec<_> = order.iter().map(|&i| edits_world[i]).collect();
-            // One chunk-group per edit preserves the permuted order into
-            // flatten_edits' input.
-            let overlay: Vec<_> = permuted
-                .iter()
-                .flat_map(|e| overlay_from_world(std::slice::from_ref(e)))
-                .collect();
-            let sec = Section::extract(FINEST, &r#gen, &overlay);
-            assert_eq!(sec.column(0, 0).cell_ids(sec.palette(), cell), want, "order {order:?}");
+            let overlay: Vec<_> = permuted.iter().flat_map(|e| overlay_from_world(std::slice::from_ref(e))).collect();
+            let sec = extract(FINEST, &r#gen, &overlay);
+            assert_eq!(column_ids(&sec, 0, 0), want, "order {order:?}");
         });
     }
 
-    /// Minimal Heap's-algorithm permutation driver for the test above.
     fn permute(order: &mut Vec<usize>, k: usize, visit: &mut impl FnMut(&[usize])) {
         if k == order.len() {
             visit(order);
@@ -873,126 +741,100 @@ mod tests {
     #[test]
     fn extraction_is_deterministic() {
         let r#gen = sine(0xBEEF);
-        let a = Section::extract(FINEST, &r#gen, &[]);
-        let b = Section::extract(FINEST, &r#gen, &[]);
-        assert_eq!(a, b, "same seed + pos must extract bit-identically");
+        let a = extract(FINEST, &r#gen, &[]);
+        let b = extract(FINEST, &r#gen, &[]);
+        for iz in 0..SECTION_N {
+            for ix in 0..SECTION_N {
+                assert_eq!(column_ids(&a, ix, iz), column_ids(&b, ix, iz), "same seed + pos must extract bit-identically");
+            }
+        }
     }
-
-    #[test]
-    fn downsample_is_deterministic() {
-        let r#gen = sine(0x1234);
-        let parent = SectionPos { detail: FINEST_DETAIL + 1, x: 0, z: 0 };
-        let kids = || std::array::from_fn(|q| Section::extract(parent.child(Quadrant::new(q as u8)), &r#gen, &[]));
-        assert_eq!(Section::downsample(kids()), Section::downsample(kids()));
-    }
-
-    // -- downsample reducers ----------------------------------------------
-
-    /// Build a test column from (block, height) slices, bottom-up.
-    fn column_of(pal: &mut Palette, slices: &[(BlockId, i32)]) -> LodColumn {
-        let mut runs: Vec<LodRun> = slices
-            .iter()
-            .map(|&(b, h)| LodRun::new(pal.intern(b), h as u16, if b == AIR { FULL_SKYLIGHT } else { 0 }))
-            .collect();
-        runs.reverse();
-        LodColumn::from_top_down(runs)
-    }
-
-    #[test]
-    fn air_never_wins_a_two_two_tie() {
-        let b = blocks();
-        let mut pal = Palette::new();
-        // Two solid children, two all-air children.
-        let solid = column_of(&mut pal, &[(b.stone, 200), (b.air, DOMAIN_H - 200)]);
-        let air = column_of(&mut pal, &[(b.air, DOMAIN_H)]);
-        let mut out = Palette::new();
-        let parent = downsample_column(
-            [(&solid, &pal), (&solid, &pal), (&air, &pal), (&air, &pal)],
-            &mut out,
-        );
-        // Solid survives the 2/2 tie.
-        assert_eq!(out.get(parent.at(100).id()), b.stone, "solid survives the tie");
-        assert_eq!(out.get(parent.at(400).id()), b.air, "the all-air band above stays air");
-    }
-
-    #[test]
-    fn mode_prefers_a_strict_plurality_and_averages_light() {
-        let b = blocks();
-        // 3 air / 1 stone: air wins.
-        assert_eq!(mode_air_loses([b.air, b.air, b.air, b.stone]), b.air);
-        // 2 stone / 2 dirt: solids tie, smallest id wins.
-        let lo = if b.stone.0 < b.dirt.0 { b.stone } else { b.dirt };
-        assert_eq!(mode_air_loses([b.stone, b.stone, b.dirt, b.dirt]), lo);
-        // Skylight averages winners only; buried winner keeps its dark value.
-        let mut pal = Palette::new();
-        let lit = column_of(&mut pal, &[(b.air, DOMAIN_H)]);
-        let dark = column_of(&mut pal, &[(b.stone, DOMAIN_H)]);
-        let mut out = Palette::new();
-        let parent = downsample_column([(&lit, &pal), (&lit, &pal), (&dark, &pal), (&dark, &pal)], &mut out);
-        assert_eq!(parent.at(256).skylight(), 0, "buried winner keeps its own light");
-    }
-
-    // Parity and island survival on real generator.
 
     #[test]
     fn exposed_surface_matches_sample_coarse_on_sinehills() {
         for &seed in &[1i64, 7, 42, 0xABCD] {
             let r#gen = sine(seed);
-            let sec = Section::extract(FINEST, &r#gen, &[]);
+            let sec = extract(FINEST, &r#gen, &[]);
             for &(ix, iz) in &[(0usize, 0usize), (5, 9), (17, 3), (31, 31)] {
                 let (wx, wz) = (FINEST.min_x() + ix as i32 * CELL + CELL / 2, FINEST.min_z() + iz as i32 * CELL + CELL / 2);
                 let want = reference_cells(&r#gen, wx, wz, CELL);
-                let col = sec.column(ix, iz);
-                assert_eq!(col.cell_ids(sec.palette(), CELL), want, "seed {seed} col {ix},{iz}");
+                assert_eq!(column_ids(&sec, ix, iz), want, "seed {seed} col {ix},{iz}");
             }
         }
     }
 
+    // Roundtrip tests: column_ids(extract(...)) must match the unchanged
+    // sampling stage (gen.lod_column + apply_edits) at every ring.
+
+    /// Reachable failure: fails if per-brick RLE construction or the
+    /// column_runs/topmost_solid accessor layer drops, duplicates, or
+    /// mis-orders a cell relative to the untouched sampling stage, at any
+    /// ring including the padded coarse rings.
     #[test]
-    fn islands_survive_two_merges() {
-        let seed = island_bearing_seed();
-        let r#gen = sine(seed);
-        let grand = SectionPos { detail: FINEST_DETAIL + 2, x: 0, z: 0 };
-        // Build 4x4 finest, merge to 2x2, merge to 1.
-        let level1: [Section; 4] = std::array::from_fn(|q| {
-            let mid = grand.child(Quadrant::new(q as u8));
-            Section::downsample(std::array::from_fn(|r| Section::extract(mid.child(Quadrant::new(r as u8)), &r#gen, &[])))
-        });
-        let top = Section::downsample(level1);
-        assert!(
-            has_island_block(&top),
-            "islands present at finest vanished entirely after two merges (seed {seed})"
-        );
-    }
-
-    /// Check if any column has a solid run in the island band.
-    fn has_island_block(sec: &Section) -> bool {
-        (0..SECTION_N).any(|iz| {
-            (0..SECTION_N).any(|ix| {
-                let col = sec.column(ix, iz);
-                let mut top = LOD_CEIL_Y;
-                for &run in col.runs() {
-                    let bottom = top - run.height() as i32;
-                    let solid = sec.palette().get(run.id()) != AIR;
-                    if solid && bottom >= crate::world::generation::ISLAND_MIN_Y {
-                        return true;
-                    }
-                    top = bottom;
-                }
-                false
-            })
-        })
-    }
-
-    /// Find a seed with island geometry in finest extraction.
-    fn island_bearing_seed() -> i64 {
-        for seed in 0i64..64 {
-            let r#gen = sine(seed);
-            let sec = Section::extract(SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 }, &r#gen, &[]);
-            if has_island_block(&sec) {
-                return seed;
+    fn roundtrip_every_column_matches_the_sampling_stage_at_every_ring() {
+        let b = blocks();
+        let r#gen = terrain_gen(&b, 200, 40, Some((260, 280)));
+        let k = FINEST_DETAIL.0;
+        for dk in 0..=6 {
+            let pos = SectionPos { detail: Detail(k + dk), x: 0, z: 0 };
+            let cell = pos.cell_size();
+            let sec = extract(pos, &r#gen, &[]);
+            for &(ix, iz) in &[(0usize, 0usize), (5, 9), (15, 15), (16, 0), (31, 31)] {
+                let (wx, wz) = (pos.min_x() + ix as i32 * cell + cell / 2, pos.min_z() + iz as i32 * cell + cell / 2);
+                let want = reference_cells(&r#gen, wx, wz, cell);
+                // At the coarse rings (n_cells < 16) the single brick pads
+                // its tail with AIR; compare only the real cells.
+                let got = column_ids(&sec, ix, iz);
+                assert_eq!(&got[..want.len()], want.as_slice(), "detail {dk} col {ix},{iz}");
+                assert!(got[want.len()..].iter().all(|&c| c == AIR), "detail {dk} col {ix},{iz}: brick padding must be AIR");
             }
         }
-        panic!("no island-bearing seed found in 0..64");
     }
+
+    /// Reachable failure: fails if any horizontal-axis term in `cell_index`,
+    /// `Section::extract`'s quadrant/local-column mapping, or `column_runs`
+    /// swaps x and z — a marker only at local column (3, 11) would then
+    /// surface at the detectably different (11, 3). A height-only generator
+    /// (as used by every other fixture here) cannot catch this: it is
+    /// column-position-blind by construction.
+    #[test]
+    fn roundtrip_x_z_asymmetric_marker_column_stays_put() {
+        let b = blocks();
+        let cell = CELL;
+        let r#gen = FnGen {
+            h: |_, _| 0,
+            b: move |wx: i32, y: i32, wz: i32| {
+                if !(200..204).contains(&y) {
+                    return AIR;
+                }
+                let (lx, lz) = (wx.div_euclid(cell).rem_euclid(32), wz.div_euclid(cell).rem_euclid(32));
+                if lx == 3 && lz == 11 { b.stone } else { AIR }
+            },
+            surf: b.air,
+            deep: b.air,
+        };
+        let sec = extract(FINEST, &r#gen, &[]);
+        assert!(column_ids(&sec, 3, 11).iter().any(|&c| c == b.stone), "marker missing at its true column (3, 11)");
+        assert!(column_ids(&sec, 11, 3).iter().all(|&c| c == AIR), "marker leaked to the transposed column (11, 3)");
+    }
+
+    /// Reachable failure: fails if the RLE slicer or per-brick construction
+    /// mishandles a run that spans exactly the boundary between two bricks
+    /// (cell 16), e.g. double-counting or dropping a cell at the seam.
+    #[test]
+    fn roundtrip_edit_straddling_a_brick_y_boundary() {
+        let b = blocks();
+        let r#gen = terrain_gen(&b, 0, 0, None); // all-air baseline
+        let cell = CELL;
+        // Cell index 16 is the first brick's ceiling / second brick's floor.
+        let wy = LOD_FLOOR_Y + 16 * cell + cell / 2;
+        let edits_world = [(FINEST.min_x() + cell / 2, wy, FINEST.min_z() + cell / 2, b.stone)];
+        let overlay = overlay_from_world(&edits_world);
+        let sec = extract(FINEST, &r#gen, &overlay);
+        let mut want = reference_cells(&r#gen, FINEST.min_x() + cell / 2, FINEST.min_z() + cell / 2, cell);
+        reference_reduce(&mut want, &flatten_edits(&overlay), FINEST.min_x(), FINEST.min_z(), cell);
+        assert_eq!(column_ids(&sec, 0, 0), want);
+        assert_eq!(want[16], b.stone, "edit landed at the brick boundary cell");
+    }
+
 }

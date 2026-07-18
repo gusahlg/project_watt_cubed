@@ -15,13 +15,126 @@
 pub mod client;
 pub mod protocol;
 
-// The `.lock().unwrap()` painpoint in `server` is now the ONE
-// `LockRecover::lock_recover` helper (server.rs); deny any regression back to
-// a bare `.unwrap()` on the production paths. Scoped to this module only; the
-// tests module carries its own `#![allow]` (setup unwraps there are loud test
-// failures, which is the desired behavior).
+// Deny a bare `.unwrap()` on production paths; server.rs's `lock_recover()`
+// is the one sanctioned recovery point. The tests module carries its own
+// `#![allow]` since a setup unwrap there is a loud, desired test failure.
 #[deny(clippy::unwrap_used)]
 pub mod server;
+
+/// Shared QUIC transport setup for [`client`] and [`server`]. One place mints the
+/// server's self-signed cert, the accept-any-cert client verifier, and the common
+/// transport tuning, and installs the process-wide rustls crypto provider exactly
+/// once. Encryption is TLS 1.3; server identity is NOT authenticated (self-signed
+/// cert, client accepts any) — the real gate stays the app-level password in
+/// [`Hello`](protocol::ClientMessage::Hello), now carried over an encrypted channel
+/// instead of the old plaintext TCP stream.
+pub(crate) mod quic {
+    use std::io;
+    use std::sync::{Arc, Once};
+    use std::time::Duration;
+
+    use quinn::{ClientConfig, ServerConfig, TransportConfig, VarInt};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    /// Idle connections are reaped after this long (mirrors the server's
+    /// `IDLE_TIMEOUT`); a keep-alive well under it holds a quiet-but-live link open.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+    const KEEP_ALIVE: Duration = Duration::from_secs(10);
+
+    /// rustls 0.23 requires a provider installed before any TLS config is built;
+    /// both endpoints call this, so `Once` makes concurrent callers safe.
+    pub(crate) fn install_crypto() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// Caps concurrent bidi streams at 1: all app traffic multiplexes onto one stream.
+    fn transport() -> Arc<TransportConfig> {
+        let mut t = TransportConfig::default();
+        t.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30s fits a QUIC VarInt")));
+        t.keep_alive_interval(Some(KEEP_ALIVE));
+        t.max_concurrent_bidi_streams(VarInt::from_u32(1));
+        Arc::new(t)
+    }
+
+    /// Fresh self-signed cert per process — no files, no CA.
+    pub(crate) fn server_config() -> io::Result<ServerConfig> {
+        install_crypto();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["watt".to_string()]).map_err(io::Error::other)?;
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        let mut cfg =
+            ServerConfig::with_single_cert(vec![cert.der().clone()], key).map_err(io::Error::other)?;
+        cfg.transport_config(transport());
+        Ok(cfg)
+    }
+
+    /// The client endpoint config: encrypts, but accepts ANY server cert (see the
+    /// module note) — confidentiality without server authentication.
+    pub(crate) fn client_config() -> ClientConfig {
+        install_crypto();
+        let rustls_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+            .expect("a default rustls ClientConfig is TLS 1.3 capable");
+        let mut cfg = ClientConfig::new(Arc::new(quic));
+        cfg.transport_config(transport());
+        cfg
+    }
+
+    /// A verifier that accepts every server certificate. The password in `Hello`
+    /// is the real authentication; TLS here buys confidentiality, not identity.
+    #[derive(Debug)]
+    struct SkipServerVerification(Arc<CryptoProvider>);
+
+    impl SkipServerVerification {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+        }
+    }
+
+    impl ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+}
 
 /// The protocol revision. Client and server must match exactly, checked at join.
 /// v2: positions are 3x f64 on the wire (far-coordinate correctness).
@@ -32,23 +145,30 @@ pub mod server;
 /// v6: authoritative edits (request id + expected cell revision + ack),
 /// content fingerprint in `Hello`, explicit `Teleport`, `Position`
 /// corrections, peer visibility exits, and synchronized day length.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7: message payloads now frame `ident::codec`'s shared little-endian
+/// primitives instead of a hand-rolled big-endian codec — wire bytes changed,
+/// only the frame-length prefix stays BE.
+/// v8: voice chat — `ClientMessage::Voice` and `ServerMessage::PeerVoice`
+/// carry opaque opus frames. New message tags change the wire, so mixed v7/v8
+/// peers must not join.
+pub const PROTOCOL_VERSION: u32 = 8;
 
-/// The default TCP port a server listens on and a client dials.
 pub const DEFAULT_PORT: u16 = 5555;
 
 /// Hard cap on a single wire frame (bytes). A frame claiming more is rejected
 /// before a byte of its body is read, so a hostile peer can't force a huge alloc.
 pub const MAX_FRAME: usize = 64 * 1024;
 
-/// Longest accepted player name.
 pub const MAX_NAME: usize = 24;
-
-/// Longest accepted chat line.
 pub const MAX_CHAT: usize = 256;
-
-/// Longest accepted block spec string (an edit's portable composition).
 pub const MAX_SPEC: usize = 256;
+
+/// Largest accepted voice payload (bytes): one 20 ms opus frame at up to
+/// ~64 kbps with margin. `net` owns its own copy of the cap rather than
+/// depending on the `audio` crate: the two modules fan out in parallel and net
+/// must compile without it. The codec rejects any inbound voice frame past this
+/// cap, and callers guard outbound.
+pub const MAX_VOICE_PAYLOAD: usize = 400;
 
 /// A stable 64-bit digest of everything that determines what a seed GENERATES:
 /// the worldgen version, the element table, and the full compiled placement
@@ -58,9 +178,9 @@ pub const MAX_SPEC: usize = 256;
 /// fingerprints and rejects the join instead. Protocol changes are versioned
 /// separately by [`PROTOCOL_VERSION`].
 ///
-/// FNV-1a (not the std hasher) so the value is identical across platforms,
-/// architectures, and Rust releases. The placement compile is seed-invariant,
-/// so one fingerprint speaks for every world a build can generate.
+/// Uses FNV hash (not the std hasher) so the value is identical across
+/// platforms, architectures, and Rust releases. The placement compile is
+/// seed-invariant, so one fingerprint speaks for every world a build can generate.
 pub fn content_fingerprint() -> u64 {
     let mut registry = crate::block::BlockRegistry::with_builtins();
     let _ = crate::world::placement::builtin().compile(&mut registry);
@@ -97,11 +217,8 @@ pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
 
 /// Chat channels. Local is proximity-limited; global reaches everyone.
 pub mod chat {
-    /// Proximity chat: only players within [`RADIUS`] world units hear it.
     pub const LOCAL: u8 = 0;
-    /// Global chat: reaches every connected player.
     pub const GLOBAL: u8 = 1;
-    /// How far local (proximity) chat carries: 48 m, in world units. `f64`
-    /// like all position math server-side.
+    /// How far local (proximity) chat carries.
     pub const RADIUS: f64 = 48.0 * crate::math::PER_METER;
 }

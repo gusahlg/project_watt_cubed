@@ -22,7 +22,6 @@ use voxel_engine::DVec3;
 const POSE_A: CameraPose = CameraPose { pos: DVec3::new(0.0, 110.0, 0.0), yaw: 0.24, pitch: -0.35 };
 const POSE_B: CameraPose = CameraPose { pos: DVec3::new(0.0, 110.0, 0.0), yaw: 1.24, pitch: -0.1 };
 
-/// (capture name, pose, shadows on)
 const STEPS: [(&str, CameraPose, bool); 4] = [
     ("a_before", POSE_A, true),
     ("b_swing", POSE_B, true),
@@ -38,6 +37,14 @@ fn main() {
     let mut mods = Mods::with_defaults();
     let mut settings = Settings::default();
     let mut router = Router::new();
+    // Scripted `Game::update` returns before the audio seam runs; a muted
+    // SoundSystem (NullBackend + empty catalog) satisfies the signature with no
+    // audio device and no `assets/sounds` dependency.
+    let (mut sound, cues) = project_watt_cubed::audio::SoundSystem::mute();
+    // Update needs an AudioDirector; the scripted path never reaches it, so build a
+    // throwaway from the loaded catalog (palette warnings discarded — headless probe).
+    let (palette, _) = project_watt_cubed::audio::CuePalette::build(&cues, sound.catalog());
+    let mut audio = project_watt_cubed::audio::AudioDirector::new(palette);
 
     let render = RenderConfig { shadows: true, ..RenderConfig::golden() };
     let config = voxel_engine::Config {
@@ -61,7 +68,7 @@ fn main() {
             g.set_day(0.35);
             g
         });
-        g.update(eng, &mut router, &mut mods, &mut settings);
+        g.update(eng, &mut router, &mut mods, &mut settings, &mut sound, &mut audio);
         g.draw(eng, &mut mods, settings.fov, 0.0);
 
         if !g.world().entry_complete() || !g.world().far_field_refined() {
@@ -87,7 +94,6 @@ fn main() {
         true
     });
 
-    // Post-run: decode and report. a_before vs a_after must be ~identical.
     let load = |n: &str| voxel_engine::skeleton::load_png(&shot_path(n)).expect("decode");
     let before = load("a_before");
     let after = load("a_after");

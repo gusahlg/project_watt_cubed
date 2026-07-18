@@ -18,7 +18,8 @@
 //! culled) is by failing to reach a visible chunk. Reaching extra chunks only
 //! weakens the cull. So this implementation is deliberately permissive: it reaches
 //! at least every visible chunk. Tighter optimizations are deferred.
-use super::chunk::{CHUNK_VOLUME, Chunk, ChunkData};
+use super::brick::BrickPayload;
+use super::chunk::{CHUNK_VOLUME, Chunk};
 use super::{FastMap, FastSet};
 use crate::block::registry::BlockId;
 use crate::coord::{ChunkCoord, Face};
@@ -74,19 +75,19 @@ impl Connectivity {
     /// module knowing which. Keys on *opacity*, not solidity: water/glass are solid
     /// but see-through, so a sightline passes through them.
     pub fn compute(chunk: &Chunk, blocks_sight: impl Fn(BlockId) -> bool) -> Connectivity {
-        match chunk.data() {
+        match &chunk.data().payload {
             // Uniform chunks need no scan: opaque seals everything, see-through opens it.
-            ChunkData::Uniform(id) => {
-                if blocks_sight(*id) { Self::SEALED } else { Self::OPEN }
+            BrickPayload::Uniform(v) => {
+                if blocks_sight(v.id) { Self::SEALED } else { Self::OPEN }
             }
             // One classify per palette entry up front; the fill then reads a
-            // bool per cell instead of re-classifying ids — faster than the
-            // old per-cell closure over global ids.
-            ChunkData::Paletted { palette, cells } => {
-                let sight: Vec<bool> = palette.iter().map(|&id| blocks_sight(id)).collect();
+            // bool per cell instead of re-classifying ids.
+            BrickPayload::Paletted { palette, cells } => {
+                let sight: Vec<bool> = palette.iter().map(|s| blocks_sight(s.id)).collect();
                 Self::flood(|i| !sight[cells[i] as usize])
             }
-            ChunkData::Dense(cells) => Self::flood(|i| !blocks_sight(cells[i])),
+            BrickPayload::Dense(cells) => Self::flood(|i| !blocks_sight(cells[i].id)),
+            BrickPayload::Rle { .. } => unreachable!("chunks never construct Rle payloads (PackStrategy::Paletted only)"),
         }
     }
 

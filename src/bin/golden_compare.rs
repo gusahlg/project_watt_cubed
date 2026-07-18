@@ -15,10 +15,8 @@ use std::path::PathBuf;
 use project_watt_cubed::harness::{diff, golden_shots, is_uniform, GoldenShot, GOLDEN_DIR};
 use voxel_engine::load_png;
 
-/// Placed beside blessed refs so the whole golden set travels together.
 const CAPTURES_DIR: &str = "tests/golden/captures";
 
-/// Mirrors the harness `ImageMatch` bound so thresholds stay in sync.
 const MAX_PCT_CHANGED: f32 = 0.5;
 
 fn golden_path(name: &str) -> PathBuf {

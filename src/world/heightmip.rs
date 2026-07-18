@@ -13,9 +13,13 @@
 
 use voxel_engine::{Color, DVec3};
 
+use crate::block::registry::AIR;
+use crate::coord::ChunkCoord;
+use crate::ident::Detail;
 use super::generation::TerrainGenerator;
+use super::lod;
 use super::metric::HeightEnvelope;
-use super::section::{FINEST_DETAIL, SECTION_N, SectionPos};
+use super::section::{FINEST_DETAIL, LOD_FLOOR_Y, SECTION_N, Section, SectionPos, section_span};
 use super::summary::{CellError, CellSummary};
 
 /// The world region and detail band a bake covers. The finest level is always
@@ -25,12 +29,12 @@ use super::summary::{CellError, CellSummary};
 #[derive(Clone, Copy, Debug)]
 pub(in crate::world) struct BakeExtent {
     half_m: i32,
-    finest: u8,
-    coarsest: u8,
+    finest: Detail,
+    coarsest: Detail,
 }
 
 impl BakeExtent {
-    pub fn new(half_m: i32, coarsest: u8) -> BakeExtent {
+    pub fn new(half_m: i32, coarsest: Detail) -> BakeExtent {
         debug_assert!(half_m > 0, "extent half-side must be positive");
         debug_assert!(FINEST_DETAIL <= coarsest, "finest detail exceeds coarsest");
         BakeExtent { half_m, finest: FINEST_DETAIL, coarsest }
@@ -38,11 +42,13 @@ impl BakeExtent {
 }
 
 /// One baked cell: ground-height bounds (lo, hi), relief (hi - lo), and palette-average colour.
+/// Also the shape [`resample_cell`] produces for the edit overlay (`World::section_overlay`),
+/// so a cache hit there is a drop-in replacement for a baked cell at the same position.
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct MipCell {
-    lo: f32,
-    hi: f32,
-    color: Color,
+pub(in crate::world) struct MipCell {
+    pub(in crate::world) lo: f32,
+    pub(in crate::world) hi: f32,
+    pub(in crate::world) color: Color,
 }
 
 impl MipCell {
@@ -56,7 +62,7 @@ impl MipCell {
 /// in section-grid coords at this `detail`.
 #[derive(Clone, PartialEq, Debug)]
 struct MipLevel {
-    detail: u8,
+    detail: Detail,
     x0: i32,
     z0: i32,
     nx: usize,
@@ -77,8 +83,8 @@ impl MipLevel {
 /// The max-mip: one [`MipLevel`] per detail from `finest` to `coarsest`, indexed by (detail - finest).
 #[derive(Clone, PartialEq, Debug)]
 pub(in crate::world) struct HeightMip {
-    finest: u8,
-    coarsest: u8,
+    finest: Detail,
+    coarsest: Detail,
     levels: Vec<MipLevel>,
 }
 
@@ -92,12 +98,13 @@ impl HeightMip {
     /// Finer children on the boundary are included in the parent to preserve containment.
     pub fn bake<G: TerrainGenerator>(terra: &G, colors: &[Color], extent: BakeExtent) -> HeightMip {
         let (finest, coarsest) = (extent.finest, extent.coarsest);
-        let mut levels: Vec<MipLevel> = Vec::with_capacity((coarsest - finest + 1) as usize);
-        for detail in finest..=coarsest {
+        let mut levels: Vec<MipLevel> = Vec::with_capacity((coarsest.0 - finest.0 + 1) as usize);
+        for k in finest.0..=coarsest.0 {
+            let detail = Detail(k);
             // Coverage radius halves per level below the coarsest (which spans the
             // whole extent). Aligned to the absolute section grid so a parent's
             // children map by index doubling.
-            let radius = extent.half_m >> (coarsest - detail);
+            let radius = extent.half_m >> (coarsest.0 - k);
             let span = section_span(detail);
             let x0 = (-radius).div_euclid(span);
             let z0 = (-radius).div_euclid(span);
@@ -132,7 +139,7 @@ impl HeightMip {
         if pos.detail < self.finest || pos.detail > self.coarsest {
             return None;
         }
-        self.levels[(pos.detail - self.finest) as usize].get(pos.x, pos.z)
+        self.levels[(pos.detail.0 - self.finest.0) as usize].get(pos.x, pos.z)
     }
 
     /// The baked ground-height envelope `(lo, hi)` of a cell, if inside the extent.
@@ -188,6 +195,7 @@ impl HeightMip {
         let gz = (wz.floor() as i32).div_euclid(span);
         lvl.get(gx, gz).map(|c| c.lo)
     }
+
 }
 
 /// Max march samples to prevent unbounded loops on very distant cells.
@@ -196,17 +204,12 @@ const OCCLUDE_MARCH_CAP: usize = 64;
 /// Sample colour every 4th cell (reduces cost without visible loss for coarse tints).
 const COLOR_STRIDE: i32 = 4;
 
-/// Metres per section side at a detail level.
-fn section_span(detail: u8) -> i32 {
-    (SECTION_N as i32) << detail
-}
-
 /// Build one level over its grid. Cells with all four children take min/max from them;
 /// cells without full coverage are sampled from the generator and merged with any existing children.
 fn build_level<G: TerrainGenerator>(
     terra: &G,
     colors: &[Color],
-    detail: u8,
+    detail: Detail,
     x0: i32,
     z0: i32,
     nx: usize,
@@ -243,11 +246,11 @@ fn build_level<G: TerrainGenerator>(
 fn sample_section<G: TerrainGenerator>(
     terra: &G,
     colors: &[Color],
-    detail: u8,
+    detail: Detail,
     ax: i32,
     az: i32,
 ) -> MipCell {
-    let cell = 1i32 << detail;
+    let cell = lod::cell(detail);
     let half = cell / 2;
     let span = section_span(detail);
     let (min_x, min_z) = (ax * span, az * span);
@@ -282,6 +285,42 @@ fn merge(kids: [MipCell; 4]) -> MipCell {
     MipCell { lo, hi, color: Color::new(mean(|c| c.r), mean(|c| c.g), mean(|c| c.b), 255) }
 }
 
+/// Edit-folded cell for a section whose footprint has a live edit: derived via
+/// [`Section::extract`], the SAME generator-plus-edits fold the mesh path itself
+/// trusts, so the overlay can never disagree with what's actually drawn. Correct
+/// even when a dig removed the topmost block the bake recorded — unlike a bake
+/// patch (which only has the aggregate lo/hi, not per-column detail, and so can
+/// only safely grow, never shrink), this resamples every column fresh.
+///
+/// Only called for edited cells (bounded, rare); the immutable bake covers
+/// everything else at zero cost.
+pub(in crate::world) fn resample_cell<G: TerrainGenerator>(
+    pos: SectionPos,
+    terra: &G,
+    edits: &[(ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],
+    colors: &[Color],
+) -> MipCell {
+    let section = Section::extract(pos, terra, edits, voxel_engine::Rev::START);
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for iz in 0..SECTION_N {
+        for ix in 0..SECTION_N {
+            let (h, block) = match section.topmost_solid(ix, iz) {
+                Some((top, block)) => (top as f32, block),
+                None => (LOD_FLOOR_Y as f32, AIR), // dug through to the floor: rare, conservative
+            };
+            lo = lo.min(h);
+            hi = hi.max(h);
+            let c = colors[block.0 as usize];
+            r += c.r as u64;
+            g += c.g as u64;
+            b += c.b as u64;
+            n += 1;
+        }
+    }
+    MipCell { lo, hi, color: Color::new((r / n) as u8, (g / n) as u8, (b / n) as u8, 255) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +335,7 @@ mod tests {
 
     /// A small extent keeps the property tests fast; the timing test uses the real one.
     fn small(reg: &BlockRegistry, g: &Terrain) -> HeightMip {
-        HeightMip::bake(g, &reg.color_snapshot(), BakeExtent::new(2048, FINEST_DETAIL + 3))
+        HeightMip::bake(g, &reg.color_snapshot(), BakeExtent::new(2048, Detail(FINEST_DETAIL.0 + 3)))
     }
 
     /// Recorded `hi` bounds every ground height sampled by the LOD extractor.
@@ -305,7 +344,7 @@ mod tests {
         let (reg, g) = terra(7);
         let mip = small(&reg, &g);
         let lvl = &mip.levels[0];
-        let cell = 1i32 << lvl.detail;
+        let cell = 1i32 << lvl.detail.0;
         let half = cell / 2;
         let span = section_span(lvl.detail);
         for sz in 0..lvl.nz.min(4) {
@@ -366,7 +405,7 @@ mod tests {
             "finest section past coverage should be worst_case"
         );
         // Its coarsest ancestor (same ground, largest coverage) is inside the bake.
-        let anc = SectionPos { detail: mip.coarsest, x: past.x >> (mip.coarsest - FINEST_DETAIL), z: 0 };
+        let anc = SectionPos { detail: mip.coarsest, x: past.x >> (mip.coarsest.0 - FINEST_DETAIL.0), z: 0 };
         assert!(mip.color(anc).is_some(), "coarse ancestor should be baked");
     }
 
@@ -394,7 +433,7 @@ mod tests {
     /// reads blockers at the coarsest level (here, the only one) and targets a
     /// cell's own level, so one level exercises the whole march.
     fn hand_mip(
-        detail: u8,
+        detail: Detail,
         x0: i32,
         z0: i32,
         nx: usize,
@@ -411,7 +450,7 @@ mod tests {
         HeightMip { finest: detail, coarsest: detail, levels: vec![MipLevel { detail, x0, z0, nx, nz, cells }] }
     }
 
-    const OD: u8 = FINEST_DETAIL; // a modest detail so a few cells span a wide march
+    const OD: Detail = FINEST_DETAIL; // a modest detail so a few cells span a wide march
 
     /// Flat terrain above the eye occludes nothing.
     #[test]
@@ -496,6 +535,63 @@ mod tests {
         assert_eq!(mip.occludes(eye, cell), mip.occludes(eye, cell));
     }
 
+    /// `resample_cell`'s lo/hi is exactly the min/max of `topmost_solid` over every
+    /// column `Section::extract` produces — the aggregation itself is correct,
+    /// independent of whether any edit is present.
+    #[test]
+    fn resample_cell_matches_an_independent_reduction_over_extracted_columns() {
+        let (reg, g) = terra(23);
+        let colors = reg.color_snapshot();
+        let pos = SectionPos { detail: FINEST_DETAIL, x: 3, z: -2 };
+        let got = resample_cell(pos, &g, &[], &colors);
+
+        let section = Section::extract(pos, &g, &[], voxel_engine::Rev::START);
+        let (mut want_lo, mut want_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for iz in 0..SECTION_N {
+            for ix in 0..SECTION_N {
+                let h = section.topmost_solid(ix, iz).map_or(LOD_FLOOR_Y as f32, |(top, _)| top as f32);
+                want_lo = want_lo.min(h);
+                want_hi = want_hi.max(h);
+            }
+        }
+        assert_eq!(got.lo, want_lo);
+        assert_eq!(got.hi, want_hi);
+    }
+
+    /// An edit changes what `resample_cell` reports, which an
+    /// immutable bake — sampled once at startup — can never reflect. Building a
+    /// column up past the unedited height is the deterministic direction (digging
+    /// down depends on what the generator puts underneath); the defect is
+    /// symmetric, so this direction is sufficient to prove the overlay is live.
+    #[test]
+    fn resample_cell_folds_edits_the_bake_never_sees() {
+        use crate::coord::BlockCoord;
+        use crate::world::chunk::Chunk;
+
+        let (reg, g) = terra(23);
+        let stone = reg.id_by_name("Stone").unwrap();
+        let colors = reg.color_snapshot();
+        let pos = SectionPos { detail: FINEST_DETAIL, x: 100, z: -50 };
+        let cell = pos.cell_size();
+        let (wx, wz) = (pos.min_x() + cell / 2, pos.min_z() + cell / 2); // column (0,0)'s sample point
+
+        let unedited = resample_cell(pos, &g, &[], &colors);
+        let built_y = unedited.hi as i32 + 40;
+        let (coord, local) = BlockCoord::new(wx, built_y, wz).split();
+        let index = Chunk::index(local.lx(), local.ly(), local.lz());
+        let edits = vec![(coord, vec![(index, stone)])];
+
+        let edited = resample_cell(pos, &g, &edits, &colors);
+        assert!(
+            edited.hi >= built_y as f32,
+            "a built-up column must raise the cell's recorded height to at least where it was built"
+        );
+        assert!(
+            edited.hi > unedited.hi,
+            "the edit must actually change the result — proving the overlay, not the bake, saw it"
+        );
+    }
+
     /// Benchmark 5-level and 7-level bakes to verify performance stays within budget.
     /// Run: `cargo test --release -- --ignored --nocapture bake_timing`.
     #[test]
@@ -503,7 +599,10 @@ mod tests {
     fn bake_timing_at_target_extent() {
         let (reg, g) = terra(1);
         // (half_m = outer_m, coarsest = FINEST_DETAIL + (levels-1)*step, step=1).
-        for (name, half_m, coarsest) in [("5-level", 3072, FINEST_DETAIL + 4), ("7-level", 12288, FINEST_DETAIL + 6)] {
+        for (name, half_m, coarsest) in [
+            ("5-level", 3072, Detail(FINEST_DETAIL.0 + 4)),
+            ("7-level", 12288, Detail(FINEST_DETAIL.0 + 6)),
+        ] {
             let t = std::time::Instant::now();
             let mip = HeightMip::bake(&g, &reg.color_snapshot(), BakeExtent::new(half_m, coarsest));
             let dt = t.elapsed();

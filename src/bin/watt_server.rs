@@ -57,7 +57,6 @@ fn main() {
     }
 }
 
-/// Read the value following a flag at `args[i]`, advancing the cursor past it.
 fn take(args: &[String], i: &mut usize, flag: &str) -> String {
     *i += 1;
     args.get(*i)
@@ -65,7 +64,6 @@ fn take(args: &[String], i: &mut usize, flag: &str) -> String {
         .unwrap_or_else(|| die(&format!("{flag} needs a value")))
 }
 
-/// A seed from the wall clock, matching how the game seeds a fresh world.
 fn fresh_seed() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

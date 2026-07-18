@@ -14,6 +14,7 @@ use voxel_engine::{Color, Pass};
 
 use crate::block::composition::{Composition, MixError};
 use crate::block::derive;
+use crate::block::derive::SoundClass;
 use crate::block::element::{CoreProperties, El, ElementId, ElementRegistry, SpecialKind};
 use crate::block::reaction::{ActiveReaction, ReactionRegistry, apply_reactions};
 use crate::macros::blocks;
@@ -55,6 +56,7 @@ pub struct BlockRegistry {
     opaque: Vec<bool>,    // HOT — mesher cull/AO key (solid & transparency == 0)
     layer: Vec<Pass>,     // HOT — mesher routing key; Blend iff solid && !opaque (air's slot is inert)
     emission: Vec<u8>,    // HOT — blocklight seed, 0..=15
+    sound: Vec<SoundClass>, // HOT — acoustic class; drives cue naming + absorption
     color: Vec<Color>,    // HOT, indexed by BlockId
     dedup: HashMap<CompKey, BlockId>,
     names: HashMap<Box<str>, BlockId>,
@@ -73,6 +75,11 @@ pub struct HotTables {
     /// kept for the branchless cull/AO hot loop, this for pass routing.
     pub layer: Box<[Pass]>,
     pub emission: Box<[u8]>,
+    /// Per-block acoustic absorption per metre (`0..=255`), indexed by `BlockId`.
+    /// The acoustic occlusion DDA (`World::capture_acoustic_window`) reads this once
+    /// per traced cell; open blocks (air, water) are `0`. Derived from the same
+    /// physics as the render tables so it shares their snapshot revision.
+    pub absorption: Box<[u8]>,
     /// Per-block liquid flag (`buoyancy > 0`) — the mesher stamps it onto each
     /// emitted face's water material bit so the transparent shader can select
     /// animated water shading. Water and glass share [`Pass::Blend`], so this,
@@ -95,6 +102,7 @@ impl Default for HotTables {
             opaque: Box::default(),
             layer: Box::default(),
             emission: Box::default(),
+            absorption: Box::default(),
             water: Box::default(),
             layer_cap: u16::MAX,
             ao: true,
@@ -115,6 +123,7 @@ impl BlockRegistry {
             opaque: Vec::new(),
             layer: Vec::new(),
             emission: Vec::new(),
+            sound: Vec::new(),
             color: Vec::new(),
             dedup: HashMap::new(),
             names: HashMap::new(),
@@ -169,6 +178,22 @@ impl BlockRegistry {
         self.emission[id.0 as usize]
     }
 
+    /// The block's acoustic absorption per metre (`0..=255`) — the occlusion DDA's
+    /// per-cell weight. Read once per traced cell by the acoustic window capture.
+    #[inline]
+    pub fn absorption(&self, id: BlockId) -> u8 {
+        self.sound[id.0 as usize].absorption()
+    }
+
+    /// The block's acoustic material class as a cue-name stem (`"stone"`, `"soil"`,
+    /// `"wood"`, `"glass"`, `"foliage"`, `"water"`) — the naming key the block-cue
+    /// table resolves `break_<class>`/`place_<class>`/`step_<class>` against. Same
+    /// classification as [`absorption`](Self::absorption), so the two never drift.
+    #[inline]
+    pub fn sound_class(&self, id: BlockId) -> &'static str {
+        self.sound[id.0 as usize].as_str()
+    }
+
     /// A fresh snapshot of the hot per-voxel tables for meshing/light jobs. Cheap
     /// (three small array copies); rebuilt only when the palette grows, behind the
     /// [`Derived`](crate::derived::Derived) revision cache on the world.
@@ -178,6 +203,7 @@ impl BlockRegistry {
             opaque: self.opaque.clone().into_boxed_slice(),
             layer: self.layer.clone().into_boxed_slice(),
             emission: self.emission.clone().into_boxed_slice(),
+            absorption: self.sound.iter().map(|c| c.absorption()).collect(),
             // A liquid that is also translucent (⇒ `Pass::Blend`): the water shader
             // assumes a see-through reflective surface, so an opaque liquid (e.g.
             // lava, `transparency == 0` ⇒ `Pass::Opaque`) must NOT take it.
@@ -232,7 +258,7 @@ impl BlockRegistry {
 
     /// The already-registered block for this composition, if any (no growth).
     pub fn lookup(&self, composition: &Composition) -> Option<BlockId> {
-        self.dedup.get(&CompKey::of(composition, self.blocks.len())).copied()
+        self.dedup.get(&CompKey::of(composition)).copied()
     }
 
     pub fn block_count(&self) -> usize {
@@ -253,11 +279,10 @@ impl BlockRegistry {
     /// ids inside the `u8` voxel space rather than silently truncating.
     ///
     /// Name uniqueness is caller-enforced, not type-checked: if `name` was already
-    /// used for a *different* composition (e.g. two `Configuration`s with the same
-    /// mix but different `Layout`, since [`auto_name`](Self::auto_name) ignores
-    /// layout), the first registration wins and `id_by_name` keeps resolving to it.
+    /// used for a *different* composition, the first registration wins and
+    /// `id_by_name` keeps resolving to it.
     pub fn register(&mut self, name: &str, composition: Composition) -> Option<BlockId> {
-        let key = CompKey::of(&composition, self.blocks.len());
+        let key = CompKey::of(&composition);
         if let Some(&existing) = self.dedup.get(&key) {
             return Some(existing);
         }
@@ -282,6 +307,7 @@ impl BlockRegistry {
         let emission = derive::derive_emission(&core);
         let specials = derive::derive_specials_from(&self.elements, &weights);
         let buoyancy = derive::derive_buoyancy(&specials);
+        let sound = derive::derive_sound_class(&core, solid, buoyancy > 0);
 
         let id = self.push_block(
             Block {
@@ -296,6 +322,7 @@ impl BlockRegistry {
             opaque,
             layer,
             emission,
+            sound,
             color,
         );
         self.dedup.insert(key, id);
@@ -319,6 +346,7 @@ impl BlockRegistry {
         opaque: bool,
         layer: Pass,
         emission: u8,
+        sound: SoundClass,
         color: Color,
     ) -> BlockId {
         let id = BlockId(self.blocks.len() as u16);
@@ -328,6 +356,7 @@ impl BlockRegistry {
         self.opaque.push(opaque);
         self.layer.push(layer);
         self.emission.push(emission);
+        self.sound.push(sound);
         self.color.push(color);
         id
     }
@@ -359,55 +388,39 @@ impl BlockRegistry {
                 .map(|&e| self.elements.get(e).name.to_string())
                 .collect::<Vec<_>>()
                 .join("+"),
-            Composition::Mixture(mix) | Composition::Configuration { mix, .. } => mix
+            Composition::Mixture(mix) => mix
                 .parts()
                 .iter()
                 .map(|&(e, p)| format!("{}{}", self.elements.get(e).name, p))
                 .collect::<Vec<_>>()
                 .join("+"),
-            Composition::Computational(_) => "Computer".to_string(),
         }
     }
 }
 
-/// Which composition tier a [`CompKey::Reduced`] came from, so a `Mixture` and
-/// a `Configuration` with the same weights never collide even though they'd
-/// derive the same properties (layout aside).
+/// Which composition tier a [`CompKey`] came from, so a `Natural` and a
+/// `Mixture` with the same weights never collide even though they'd derive the
+/// same properties.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Tier {
     Natural,
     Mixture,
-    Configuration,
 }
 
-/// A hashable key for deduplicating compositions. Element order is
-/// normalised so two blocks with the same tier and elements collapse to one id.
+/// A hashable key for deduplicating compositions: the tier plus its weight
+/// multiset (sorted by id, duplicates merged), so two blocks with the same tier
+/// and elements collapse to one id.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum CompKey {
-    /// `Natural`/`Mixture`/`Configuration`, keyed by their weight multiset
-    /// (sorted by id, duplicates merged into a count/share).
-    Reduced(Tier, Vec<(u16, u32)>),
-    /// Computational blocks are opaque, so they never dedup — keyed by a unique
-    /// registration index instead.
-    Computational(usize),
-}
+struct CompKey(Tier, Vec<(u16, u32)>);
 
 impl CompKey {
-    fn of(composition: &Composition, fresh_index: usize) -> Self {
-        match composition {
-            Composition::Computational(_) => CompKey::Computational(fresh_index),
-            _ => {
-                let tier = match composition {
-                    Composition::Natural(_) => Tier::Natural,
-                    Composition::Mixture(_) => Tier::Mixture,
-                    Composition::Configuration { .. } => Tier::Configuration,
-                    Composition::Computational(_) => unreachable!("handled above"),
-                };
-                let parts =
-                    composition.weights().parts().iter().map(|&(e, w)| (e.0, w)).collect();
-                CompKey::Reduced(tier, parts)
-            }
-        }
+    fn of(composition: &Composition) -> Self {
+        let tier = match composition {
+            Composition::Natural(_) => Tier::Natural,
+            Composition::Mixture(_) => Tier::Mixture,
+        };
+        let parts = composition.weights().parts().iter().map(|&(e, w)| (e.0, w)).collect();
+        CompKey(tier, parts)
     }
 }
 
@@ -543,7 +556,7 @@ mod tests {
     fn duplicated_natural_element_collapses_to_the_set() {
         let mut reg = BlockRegistry::with_builtins();
         let before = reg.block_count();
-        // Naturals are sets (G-15): [Stone, Stone] canonicalizes to [Stone],
+        // Naturals are sets: [Stone, Stone] canonicalizes to [Stone],
         // so it dedups with the builtin instead of minting a duplicate block
         // that would fail to round-trip through save/network specs.
         let doubled = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
@@ -586,6 +599,43 @@ mod tests {
     fn mixture_rejects_bad_percentages() {
         let mut reg = BlockRegistry::with_builtins();
         assert!(reg.mixture(&[(El::Soil.id(), 70), (El::Clay.id(), 20)]).is_err());
+    }
+
+    #[test]
+    fn absorption_classes_and_open_cells() {
+        let reg = BlockRegistry::with_builtins();
+        let hot = reg.hot_tables();
+        // Snapshot mirrors the accessor, indexed by BlockId.
+        for i in 0..reg.block_count() {
+            assert_eq!(hot.absorption[i], reg.absorption(BlockId(i as u16)));
+        }
+        // Open cells: air (non-solid) and water (passable liquid) absorb nothing,
+        // so `solid && absorption > 0` never fires for them.
+        assert_eq!(reg.absorption(AIR), 0);
+        let water = reg.id_by_name("Water").unwrap();
+        assert!(reg.is_solid(water) && reg.is_liquid(water));
+        assert_eq!(reg.absorption(water), 0);
+        // Every other solid is an occluding wall (non-zero class).
+        for i in 0..reg.block_count() {
+            let id = BlockId(i as u16);
+            if reg.is_solid(id) && !reg.is_liquid(id) {
+                assert!(reg.absorption(id) > 0, "solid wall {} absorbs", reg.block(id).name);
+            }
+        }
+        // Spot-check the intended classes.
+        assert_eq!(reg.absorption(Blk::Stone.id()), 200); // dense
+        assert_eq!(reg.sound_class(Blk::Stone.id()), "stone");
+        assert_eq!(reg.absorption(reg.id_by_name("Ice").unwrap()), 60); // translucent
+        assert_eq!(reg.sound_class(reg.id_by_name("Ice").unwrap()), "glass");
+        assert_eq!(reg.sound_class(AIR), "water"); // non-solid folds into the open class
+        assert_eq!(reg.sound_class(water), "water");
+        // Every block resolves to one of the six catalog stems game.rs names cues
+        // against — guards a future SoundClass variant added without a cue name.
+        const STEMS: [&str; 6] = ["stone", "soil", "wood", "glass", "foliage", "water"];
+        for i in 0..reg.block_count() {
+            let stem = reg.sound_class(BlockId(i as u16));
+            assert!(STEMS.contains(&stem), "block {i} has uncatalogued sound class {stem}");
+        }
     }
 
     #[test]
