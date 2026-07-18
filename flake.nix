@@ -7,11 +7,11 @@
     # The renderer lives in a sibling checkout. Use the local Git repository,
     # not a raw `path:` snapshot: the latter copied ignored build products such
     # as voxel-engine/target into the Nix store (about 5 GiB on this machine).
-    # This packages the committed experimental revision and records that exact
+    # This packages the committed main revision and records that exact
     # revision in flake.lock. It remains machine-specific until the engine audit
     # commits are published, at which point this should become a remote Git URL.
     voxel-engine = {
-      url = "git+file:///home/gusahlg/repos/voxel-engine?ref=experimental";
+      url = "git+file:///home/gusahlg/repos/voxel-engine?ref=main";
       flake = false;
     };
   };
@@ -33,6 +33,10 @@
           libxcursor
           libxrandr
           libxi
+          # cpal uses ALSA for input/output on Linux. Kira's realtime audio
+          # scheduling feature also talks to the system D-Bus daemon.
+          alsa-lib
+          dbus
         ];
 
         libraryPath = pkgs.lib.makeLibraryPath runtimeLibs;
@@ -62,7 +66,8 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = slang;
+          nativeBuildInputs = [ pkgs.pkg-config ] ++ slang;
+          buildInputs = runtimeLibs;
 
           # Every installed binary is part of the package contract. In
           # particular `golden` also creates a window, so leaving it with only
@@ -96,6 +101,7 @@
         '';
 
         devShells.default = pkgs.mkShell {
+          nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = with pkgs; [ rustc cargo rustfmt clippy ]
             ++ runtimeLibs
             ++ slang

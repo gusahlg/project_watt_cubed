@@ -83,7 +83,11 @@ impl Capture {
             Some(ref want) => host
                 .input_devices()
                 .map_err(|e| CaptureError::Stream(e.to_string()))?
-                .find(|d| d.name().map(|n| &n == want).unwrap_or(false))
+                .find(|d| {
+                    d.description()
+                        .map(|desc| desc.name() == want)
+                        .unwrap_or(false)
+                })
                 .ok_or(CaptureError::NoDevice)?,
             None => host.default_input_device().ok_or(CaptureError::NoDevice)?,
         };
@@ -91,7 +95,7 @@ impl Capture {
         let supported = device
             .default_input_config()
             .map_err(|e| CaptureError::Stream(e.to_string()))?;
-        let src_hz = supported.sample_rate().0;
+        let src_hz = supported.sample_rate();
         let channels = supported.channels() as usize;
         let format = supported.sample_format();
         let config = supported.config();
@@ -107,7 +111,7 @@ impl Capture {
         // cpal runs the error callback on the audio thread too, so it must be lock- and
         // alloc-free — just latch a preallocated flag; poll_fault reads it.
         let err_lost = lost.clone();
-        let error_cb = move |_e: cpal::StreamError| {
+        let error_cb = move |_e: cpal::Error| {
             err_lost.store(true, Ordering::Relaxed);
         };
         let stream = match format {
@@ -185,15 +189,15 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     channels: usize,
     mut producer: rtrb::Producer<f32>,
-    error_cb: impl FnMut(cpal::StreamError) + Send + 'static,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+    error_cb: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     let inv = 1.0 / channels.max(1) as f32;
     device.build_input_stream(
-        config,
+        *config,
         move |data: &[T], _| {
             for frame in data.chunks_exact(channels) {
                 let mono: f32 = frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>() * inv;

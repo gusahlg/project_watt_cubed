@@ -13,6 +13,19 @@ voxel_engine = { path = "../voxel-engine" }
 # and our direct `UVec3` (section block origins) are the same `glam` types.
 glam = "0.32.1"
 
+# Multiplayer transport and its async runtime/TLS setup.
+quinn = { version = "0.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Audio output/capture, realtime queues, voice codec, and cue manifests.
+cpal = "0.18"
+kira = "0.12"
+opus-rs = "0.1"
+rtrb = "0.3"
+toml = "0.9"
+
 # Maximum-performance release build: aggressive inlining across the whole
 # dependency graph (fat LTO), a single codegen unit so the optimizer sees
 # everything at once, and stripped symbols. Run the game with `cargo run

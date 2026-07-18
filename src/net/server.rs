@@ -1508,8 +1508,22 @@ mod tests {
             "a connection past the handshake cap must be refused"
         );
 
-        // Freeing the squatters must free their slots for a real player.
+        // Freeing the squatters must free their slots for a real player. These
+        // are raw quinn connections rather than our `Connection` wrapper, so
+        // mirror its graceful shutdown: explicitly queue CONNECTION_CLOSE and
+        // keep the runtime alive until the endpoint has transmitted it. Merely
+        // dropping the handles and runtime together can strand the server-side
+        // handlers until HANDSHAKE_TIMEOUT, making this assertion race 5s
+        // against a deliberate 10s timeout.
+        for conn in &squatters {
+            conn.close(0u32.into(), b"test complete");
+        }
         drop(squatters);
+        squat_rt
+            .block_on(async {
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, squat_ep.wait_idle()).await
+            })
+            .expect("squatter endpoint did not finish graceful shutdown");
         drop(squat_ep);
         drop(squat_rt);
         let deadline = Instant::now() + Duration::from_secs(5);

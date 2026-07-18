@@ -758,10 +758,24 @@ mod tests {
         let padded = Padded::capture(at);
 
         let mut expected = new_chunk_mesh_data();
-        mesh::build_chunk_mesh(&padded, None, &tables, &mut expected);
+        mesh::build_chunk_mesh(
+            &padded,
+            None,
+            &tables,
+            &PaddedLight::full(),
+            &mut expected,
+        );
         // The neighbours must actually matter, or equality proves nothing.
         let mut unculled = new_chunk_mesh_data();
-        mesh::build_chunk_mesh(&Padded::capture(|dx, dy, dz| (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)), None, &tables, &mut unculled);
+        mesh::build_chunk_mesh(
+            &Padded::capture(|dx, dy, dz| {
+                (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)
+            }),
+            None,
+            &tables,
+            &PaddedLight::full(),
+            &mut unculled,
+        );
         let index_count =
             |d: &ChunkMeshData| d[Pass::Opaque].buckets().iter().map(|b| b.len()).sum::<usize>();
         assert_ne!(index_count(&unculled), index_count(&expected), "border culling engaged");

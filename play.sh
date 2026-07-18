@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The one command that always runs the CURRENT code.
 #
-# The flake pins the committed ../voxel-engine experimental revision, so after
+# The flake pins the committed ../voxel-engine main revision, so after
 # an engine commit a plain `nix run` can build today's game against yesterday's
 # engine API and fail with phantom missing-method/field errors. Re-pinning first
 # makes that impossible. Uncommitted engine edits remain a dev-shell concern.
