@@ -51,6 +51,7 @@ const SWIM_FLOAT_SPEED: f64 = 3.0 * PER_METER;
 const SWIM_SETTLE_SPEED: f64 = 1.0 * PER_METER;
 
 /// The movement intent gathered for a single frame.
+#[derive(Clone, Copy)]
 pub struct MoveInput {
     move_x: f32,
     move_y: f32,
@@ -75,6 +76,34 @@ impl MoveInput {
             sprint: gp.state(GameplayState::Sprint),
             sneak: gp.state(GameplayState::Sneak),
         }
+    }
+
+    /// Edge-triggered flight toggle, exposed so a slower fixed physics clock can
+    /// latch the event until it actually executes a tick.
+    pub(crate) fn toggle_fly(&self) -> bool {
+        self.toggle_fly
+    }
+
+    /// Held jump state, exposed so a fixed physics clock can also retain a
+    /// short press that begins and ends between two physics ticks.
+    pub(crate) fn jump(&self) -> bool {
+        self.jump
+    }
+
+    /// Override only the edge-triggered field when replaying held input across
+    /// fixed ticks; all held axes/states remain the current frame's values.
+    pub(crate) fn set_toggle_fly(&mut self, toggle: bool) {
+        self.toggle_fly = toggle;
+    }
+
+    pub(crate) fn set_jump(&mut self, jump: bool) {
+        self.jump = jump;
+    }
+
+    /// Reuse the already-sampled axes for detached freecam instead of probing
+    /// the same movement bindings a second time in the frame.
+    pub(crate) fn freecam_axes(&self) -> (f64, f64, f64, bool) {
+        (self.move_z as f64, self.move_x as f64, self.move_y as f64, self.sprint)
     }
 }
 
@@ -332,6 +361,11 @@ fn step_axis(
     stance: Stance,
     noclip: bool,
 ) -> bool {
+    // Standing still is overwhelmingly common. Avoid an AABB build plus a
+    // world collision query for the two (often all three) idle axes.
+    if delta == 0.0 {
+        return false;
+    }
     let start = pos[axis];
 
     // Fast path: the common per-frame case, identical to the pre-substepping

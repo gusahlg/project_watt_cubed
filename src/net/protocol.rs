@@ -10,6 +10,7 @@
 //! Positions travel as 3x f64 (24 bytes): the game plays out to ±1e9 blocks,
 //! where f32 cannot even represent adjacent positions.
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
 use voxel_engine::DVec3;
@@ -19,75 +20,167 @@ use crate::presence::Stance;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
-/// A message from a client to the server.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ClientMessage {
-    /// `fingerprint` is the sender's [`content_fingerprint`](super::content_fingerprint);
-    /// the server rejects a mismatch so two builds that would generate
-    /// different worlds from one seed never silently join.
-    Hello { protocol: u32, fingerprint: u64, name: String, password: String },
-    /// Client simulates its own player; server-side this is plausibility-checked
-    /// (movement envelope + border) — discontinuities must go through
-    /// [`Teleport`](Self::Teleport).
-    Move { pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
-    /// Exempt from the movement envelope, but the server may refuse it
-    /// (configuration) and answer with a [`ServerMessage::Position`] snap-back.
-    Teleport { pos: DVec3 },
-    Swing,
-    /// The server echoes `nonce` back in [`ServerMessage::Pong`].
-    Ping { nonce: u32 },
-    /// `req` identifies this request in the sender's [`ServerMessage::EditAck`];
-    /// `expect` is the cell revision the sender believes is current (0 = never
-    /// edited), so racing edits on one cell resolve to exactly one winner.
-    Edit { req: u32, x: i32, y: i32, z: i32, expect: u32, spec: String },
-    Chat { channel: u8, text: String },
-    /// `day` is a `[0,1)` fraction.
-    SetTime { day: f32 },
-    /// Part of a loss-tolerant journal: `seq` orders the sender's own stream so
-    /// the receiver's jitter buffer can reorder and detect gaps. The server
-    /// stamps speaker id + epoch on relay; the client never mints those.
-    /// `payload` is bounded by [`MAX_VOICE_PAYLOAD`](super::MAX_VOICE_PAYLOAD).
-    Voice { seq: u32, payload: Vec<u8> },
+/// One field's wire codec: how it is written to and read back from a message
+/// payload. The [`messages!`] table below pairs every enum field with exactly
+/// one of these impls, so the field's Rust type IS its wire format — encode
+/// and decode can never disagree on layout, and a new message is one table row.
+trait Wire: Sized {
+    fn put(&self, w: &mut codec::Writer);
+    /// `None` on malformed or truncated input (the whole message is rejected).
+    fn get(r: &mut codec::Reader) -> Option<Self>;
 }
 
-/// A message from the server to a client.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ServerMessage {
-    Welcome { player_id: u32, seed: i64, spawn: DVec3 },
-    /// The stream closes after this (bad password, version mismatch, server full).
-    Reject { reason: String },
-    /// Sent once right after [`Welcome`](Self::Welcome). Each cell carries its
-    /// authoritative revision so the joiner's future edit expectations line up.
-    Snapshot { edits: Vec<(i32, i32, i32, u32, String)> },
-    /// Roster only — a peer's pose arrives via [`PeerMove`](Self::PeerMove) once
-    /// they are inside interest range.
-    PeerJoined { id: u32, name: String },
-    PeerLeft { id: u32 },
-    /// Also the "entered interest range" signal.
-    PeerMove { id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
-    /// A peer left interest range: hide their avatar instead of drawing a
-    /// frozen ghost at the last heard pose. They re-appear on the next
-    /// [`PeerMove`](Self::PeerMove) for that id.
-    PeerExited { id: u32 },
-    PeerSwing { id: u32 },
-    /// Echo of a [`ClientMessage::Ping`], carrying its `nonce` unchanged.
-    Pong { nonce: u32 },
-    /// Sent to everyone except the editor (who gets the ack).
-    Edit { x: i32, y: i32, z: i32, rev: u32, spec: String },
-    /// `accepted` with the committed revision, or rejected (stale expectation,
-    /// out of reach, invalid spec) — the signal prediction rolls back on.
-    EditAck { req: u32, accepted: bool, rev: u32 },
-    /// Refused teleport or implausible movement: snap to it.
-    Position { pos: DVec3 },
-    Chat { from_id: u32, from_name: String, channel: u8, text: String },
-    /// `day` is a `[0,1)` fraction and `day_secs` the shared real-seconds
-    /// length of a full cycle, so every clock advances in step.
-    Time { day: f32, day_secs: f32 },
-    /// `id` is the speaker's server-assigned player id (the runtime's
-    /// `SessionKey`); `epoch` distinguishes reconnections under a reused id —
-    /// constant `0` here because the server never reuses ids. `seq` and
-    /// `payload` are the sender's own [`ClientMessage::Voice`] values, unchanged.
-    PeerVoice { id: u32, epoch: u32, seq: u32, payload: Vec<u8> },
+/// Plain fixed-width fields whose `Writer`/`Reader` method pair share a name.
+macro_rules! wire_scalar {
+    ($($t:ty => $m:ident),* $(,)?) => {$(
+        impl Wire for $t {
+            fn put(&self, w: &mut codec::Writer) {
+                w.$m(*self);
+            }
+            fn get(r: &mut codec::Reader) -> Option<Self> {
+                r.$m().ok()
+            }
+        }
+    )*};
+}
+wire_scalar!(u8 => u8, u32 => u32, u64 => u64, i32 => i32, i64 => i64, f32 => f32, DVec3 => vec3);
+
+/// Strings travel as `Arc<str>` end to end: the sender can broadcast one
+/// interned name/spec as a refcount bump per recipient, and the receiver
+/// stores the very allocation the decoder produced (peer rosters, edit
+/// ledgers) instead of cloning it onward.
+impl Wire for Arc<str> {
+    fn put(&self, w: &mut codec::Writer) {
+        w.str16(self);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        r.str16_lossy().ok().map(Arc::from)
+    }
+}
+
+impl Wire for Stance {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u8(self.wire());
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        Stance::from_wire(r.u8().ok()?)
+    }
+}
+
+/// One byte, strictly `0`/`1` — any other value rejects the whole message
+/// rather than silently mapping to `true`.
+impl Wire for bool {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u8(*self as u8);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        match r.u8().ok()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// A voice payload: u16 length prefix, bounded by [`MAX_VOICE_PAYLOAD`].
+/// Callers must have already refused an over-cap payload (client `send_voice`,
+/// server relay); the assert catches one that forgot. Decode rejects a length
+/// prefix past the cap before the bytes are trusted — a hostile peer can't
+/// smuggle an over-cap frame past the codec.
+impl Wire for Vec<u8> {
+    fn put(&self, w: &mut codec::Writer) {
+        debug_assert!(
+            self.len() <= MAX_VOICE_PAYLOAD,
+            "voice payload {} exceeds MAX_VOICE_PAYLOAD; callers must guard",
+            self.len()
+        );
+        w.u16(self.len() as u16);
+        w.raw(self);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let len = r.u16().ok()? as usize;
+        if len > MAX_VOICE_PAYLOAD {
+            return None;
+        }
+        Some(r.take(len).ok()?.to_vec())
+    }
+}
+
+/// The snapshot edit list: u32 count, then each cell's coord, revision, and
+/// spec. The pre-reserve is clamped so a forged count can't balloon memory
+/// before the per-entry reads fail on truncation.
+impl Wire for Vec<(i32, i32, i32, u32, Arc<str>)> {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u32(self.len() as u32);
+        for (x, y, z, rev, spec) in self {
+            w.i32(*x);
+            w.i32(*y);
+            w.i32(*z);
+            w.u32(*rev);
+            w.str16(spec);
+        }
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let count = r.u32().ok()? as usize;
+        let mut edits = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            edits.push((
+                r.i32().ok()?,
+                r.i32().ok()?,
+                r.i32().ok()?,
+                r.u32().ok()?,
+                r.str16_lossy().ok()?.into(),
+            ));
+        }
+        Some(edits)
+    }
+}
+
+/// Define one direction's message enum AND its codec from a single table:
+/// `Variant = TAG { field: Type, .. }`. Declaration order of the fields is the
+/// wire order; each type's [`Wire`] impl is its byte format. Generates the
+/// enum (docs preserved), `encode` (tag byte + fields), and a total `decode`
+/// that rejects malformed, truncated, and trailing-byte payloads.
+macro_rules! messages {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident = $tag:path $( { $( $field:ident : $ty:ty ),+ $(,)? } )?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Clone, Debug, PartialEq)]
+        pub enum $name {
+            $( $(#[$variant_meta])* $variant $( { $( $field : $ty ),+ } )? ),*
+        }
+
+        impl $name {
+            /// Serialise to a frame payload (tag byte + fields, in declared order).
+            pub fn encode(&self) -> Vec<u8> {
+                let mut w = codec::Writer::new();
+                match self {
+                    $( $name::$variant $( { $( $field ),+ } )? => {
+                        w.u8($tag);
+                        $( $( Wire::put($field, &mut w); )+ )?
+                    } )*
+                }
+                w.into_inner()
+            }
+
+            /// Parse a frame payload. `None` on any malformed or truncated input.
+            pub fn decode(bytes: &[u8]) -> Option<Self> {
+                let mut r = codec::Reader::new(bytes);
+                let message = match r.u8().ok()? {
+                    $( t if t == $tag => $name::$variant $( { $( $field: Wire::get(&mut r)? ),+ } )?, )*
+                    _ => return None,
+                };
+                r.finished().then_some(message)
+            }
+        }
+    };
 }
 
 // Message type tags. Client and server tag spaces are independent.
@@ -119,287 +212,76 @@ mod tag {
     pub const PEER_VOICE: u8 = 14;
 }
 
-/// Callers must have already refused an over-cap payload (client `send_voice`,
-/// server relay); the assert catches one that forgot.
-fn write_voice_payload(w: &mut codec::Writer, payload: &[u8]) {
-    debug_assert!(
-        payload.len() <= MAX_VOICE_PAYLOAD,
-        "voice payload {} exceeds MAX_VOICE_PAYLOAD; callers must guard",
-        payload.len()
-    );
-    w.u16(payload.len() as u16);
-    w.raw(payload);
-}
-
-/// Rejects a length prefix past [`MAX_VOICE_PAYLOAD`] before the bytes are
-/// trusted — a hostile peer can't smuggle an over-cap frame past the codec.
-fn read_voice_payload(r: &mut codec::Reader) -> Option<Vec<u8>> {
-    let len = r.u16().ok()? as usize;
-    if len > MAX_VOICE_PAYLOAD {
-        return None;
-    }
-    Some(r.take(len).ok()?.to_vec())
-}
-
-impl ClientMessage {
-    /// Serialise to a frame payload (tag byte + fields).
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = codec::Writer::new();
-        match self {
-            ClientMessage::Hello { protocol, fingerprint, name, password } => {
-                w.u8(tag::HELLO);
-                w.u32(*protocol);
-                w.u64(*fingerprint);
-                w.str16(name);
-                w.str16(password);
-            }
-            ClientMessage::Move { pos, yaw, pitch, stance } => {
-                w.u8(tag::MOVE);
-                w.vec3(*pos);
-                w.f32(*yaw);
-                w.f32(*pitch);
-                w.u8(stance.wire());
-            }
-            ClientMessage::Teleport { pos } => {
-                w.u8(tag::TELEPORT);
-                w.vec3(*pos);
-            }
-            ClientMessage::Swing => w.u8(tag::SWING),
-            ClientMessage::Ping { nonce } => {
-                w.u8(tag::PING);
-                w.u32(*nonce);
-            }
-            ClientMessage::Edit { req, x, y, z, expect, spec } => {
-                w.u8(tag::EDIT);
-                w.u32(*req);
-                w.i32(*x);
-                w.i32(*y);
-                w.i32(*z);
-                w.u32(*expect);
-                w.str16(spec);
-            }
-            ClientMessage::Chat { channel, text } => {
-                w.u8(tag::CHAT);
-                w.u8(*channel);
-                w.str16(text);
-            }
-            ClientMessage::SetTime { day } => {
-                w.u8(tag::SET_TIME);
-                w.f32(*day);
-            }
-            ClientMessage::Voice { seq, payload } => {
-                w.u8(tag::VOICE);
-                w.u32(*seq);
-                write_voice_payload(&mut w, payload);
-            }
-        }
-        w.into_inner()
-    }
-
-    /// Parse a frame payload. `None` on any malformed or truncated input.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut r = codec::Reader::new(bytes);
-        let message = match r.u8().ok()? {
-            tag::HELLO => ClientMessage::Hello {
-                protocol: r.u32().ok()?,
-                fingerprint: r.u64().ok()?,
-                name: r.str16_lossy().ok()?,
-                password: r.str16_lossy().ok()?,
-            },
-            tag::MOVE => ClientMessage::Move {
-                pos: r.vec3().ok()?,
-                yaw: r.f32().ok()?,
-                pitch: r.f32().ok()?,
-                stance: Stance::from_wire(r.u8().ok()?)?,
-            },
-            tag::TELEPORT => ClientMessage::Teleport { pos: r.vec3().ok()? },
-            tag::SWING => ClientMessage::Swing,
-            tag::PING => ClientMessage::Ping { nonce: r.u32().ok()? },
-            tag::EDIT => ClientMessage::Edit {
-                req: r.u32().ok()?,
-                x: r.i32().ok()?,
-                y: r.i32().ok()?,
-                z: r.i32().ok()?,
-                expect: r.u32().ok()?,
-                spec: r.str16_lossy().ok()?,
-            },
-            tag::CHAT => ClientMessage::Chat {
-                channel: r.u8().ok()?,
-                text: r.str16_lossy().ok()?,
-            },
-            tag::SET_TIME => ClientMessage::SetTime { day: r.f32().ok()? },
-            tag::VOICE => ClientMessage::Voice {
-                seq: r.u32().ok()?,
-                payload: read_voice_payload(&mut r)?,
-            },
-            _ => return None,
-        };
-        r.finished().then_some(message)
+messages! {
+    /// A message from a client to the server.
+    pub enum ClientMessage {
+        /// `fingerprint` is the sender's [`content_fingerprint`](super::content_fingerprint);
+        /// the server rejects a mismatch so two builds that would generate
+        /// different worlds from one seed never silently join.
+        Hello = tag::HELLO { protocol: u32, fingerprint: u64, name: Arc<str>, password: Arc<str> },
+        /// Client simulates its own player; server-side this is plausibility-checked
+        /// (movement envelope + border) — discontinuities must go through
+        /// [`Teleport`](Self::Teleport).
+        Move = tag::MOVE { pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+        /// Exempt from the movement envelope, but the server may refuse it
+        /// (configuration) and answer with a [`ServerMessage::Position`] snap-back.
+        Teleport = tag::TELEPORT { pos: DVec3 },
+        Swing = tag::SWING,
+        /// The server echoes `nonce` back in [`ServerMessage::Pong`].
+        Ping = tag::PING { nonce: u32 },
+        /// `req` identifies this request in the sender's [`ServerMessage::EditAck`];
+        /// `expect` is the cell revision the sender believes is current (0 = never
+        /// edited), so racing edits on one cell resolve to exactly one winner.
+        Edit = tag::EDIT { req: u32, x: i32, y: i32, z: i32, expect: u32, spec: Arc<str> },
+        Chat = tag::CHAT { channel: u8, text: Arc<str> },
+        /// `day` is a `[0,1)` fraction.
+        SetTime = tag::SET_TIME { day: f32 },
+        /// Part of a loss-tolerant journal: `seq` orders the sender's own stream so
+        /// the receiver's jitter buffer can reorder and detect gaps. The server
+        /// stamps speaker id + epoch on relay; the client never mints those.
+        /// `payload` is bounded by [`MAX_VOICE_PAYLOAD`](super::MAX_VOICE_PAYLOAD).
+        Voice = tag::VOICE { seq: u32, payload: Vec<u8> },
     }
 }
 
-impl ServerMessage {
-    /// Serialise to a frame payload (tag byte + fields).
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = codec::Writer::new();
-        match self {
-            ServerMessage::Welcome { player_id, seed, spawn } => {
-                w.u8(tag::WELCOME);
-                w.u32(*player_id);
-                w.i64(*seed);
-                w.vec3(*spawn);
-            }
-            ServerMessage::Reject { reason } => {
-                w.u8(tag::REJECT);
-                w.str16(reason);
-            }
-            ServerMessage::Snapshot { edits } => {
-                w.u8(tag::SNAPSHOT);
-                w.u32(edits.len() as u32);
-                for (x, y, z, rev, spec) in edits {
-                    w.i32(*x);
-                    w.i32(*y);
-                    w.i32(*z);
-                    w.u32(*rev);
-                    w.str16(spec);
-                }
-            }
-            ServerMessage::PeerJoined { id, name } => {
-                w.u8(tag::PEER_JOINED);
-                w.u32(*id);
-                w.str16(name);
-            }
-            ServerMessage::PeerLeft { id } => {
-                w.u8(tag::PEER_LEFT);
-                w.u32(*id);
-            }
-            ServerMessage::PeerMove { id, pos, yaw, pitch, stance } => {
-                w.u8(tag::PEER_MOVE);
-                w.u32(*id);
-                w.vec3(*pos);
-                w.f32(*yaw);
-                w.f32(*pitch);
-                w.u8(stance.wire());
-            }
-            ServerMessage::PeerExited { id } => {
-                w.u8(tag::PEER_EXITED);
-                w.u32(*id);
-            }
-            ServerMessage::PeerSwing { id } => {
-                w.u8(tag::PEER_SWING);
-                w.u32(*id);
-            }
-            ServerMessage::Pong { nonce } => {
-                w.u8(tag::PONG);
-                w.u32(*nonce);
-            }
-            ServerMessage::Edit { x, y, z, rev, spec } => {
-                w.u8(tag::S_EDIT);
-                w.i32(*x);
-                w.i32(*y);
-                w.i32(*z);
-                w.u32(*rev);
-                w.str16(spec);
-            }
-            ServerMessage::EditAck { req, accepted, rev } => {
-                w.u8(tag::EDIT_ACK);
-                w.u32(*req);
-                w.u8(*accepted as u8);
-                w.u32(*rev);
-            }
-            ServerMessage::Position { pos } => {
-                w.u8(tag::POSITION);
-                w.vec3(*pos);
-            }
-            ServerMessage::Chat { from_id, from_name, channel, text } => {
-                w.u8(tag::S_CHAT);
-                w.u32(*from_id);
-                w.str16(from_name);
-                w.u8(*channel);
-                w.str16(text);
-            }
-            ServerMessage::Time { day, day_secs } => {
-                w.u8(tag::S_TIME);
-                w.f32(*day);
-                w.f32(*day_secs);
-            }
-            ServerMessage::PeerVoice { id, epoch, seq, payload } => {
-                w.u8(tag::PEER_VOICE);
-                w.u32(*id);
-                w.u32(*epoch);
-                w.u32(*seq);
-                write_voice_payload(&mut w, payload);
-            }
-        }
-        w.into_inner()
-    }
-
-    /// Parse a frame payload. `None` on any malformed or truncated input.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut r = codec::Reader::new(bytes);
-        let message = match r.u8().ok()? {
-            tag::WELCOME => ServerMessage::Welcome {
-                player_id: r.u32().ok()?,
-                seed: r.i64().ok()?,
-                spawn: r.vec3().ok()?,
-            },
-            tag::REJECT => ServerMessage::Reject { reason: r.str16_lossy().ok()? },
-            tag::SNAPSHOT => {
-                let count = r.u32().ok()? as usize;
-                let mut edits = Vec::with_capacity(count.min(1024));
-                for _ in 0..count {
-                    edits.push((r.i32().ok()?, r.i32().ok()?, r.i32().ok()?, r.u32().ok()?, r.str16_lossy().ok()?));
-                }
-                ServerMessage::Snapshot { edits }
-            }
-            tag::PEER_JOINED => ServerMessage::PeerJoined {
-                id: r.u32().ok()?,
-                name: r.str16_lossy().ok()?,
-            },
-            tag::PEER_LEFT => ServerMessage::PeerLeft { id: r.u32().ok()? },
-            tag::PEER_MOVE => ServerMessage::PeerMove {
-                id: r.u32().ok()?,
-                pos: r.vec3().ok()?,
-                yaw: r.f32().ok()?,
-                pitch: r.f32().ok()?,
-                stance: Stance::from_wire(r.u8().ok()?)?,
-            },
-            tag::PEER_EXITED => ServerMessage::PeerExited { id: r.u32().ok()? },
-            tag::PEER_SWING => ServerMessage::PeerSwing { id: r.u32().ok()? },
-            tag::PONG => ServerMessage::Pong { nonce: r.u32().ok()? },
-            tag::S_EDIT => ServerMessage::Edit {
-                x: r.i32().ok()?,
-                y: r.i32().ok()?,
-                z: r.i32().ok()?,
-                rev: r.u32().ok()?,
-                spec: r.str16_lossy().ok()?,
-            },
-            tag::EDIT_ACK => ServerMessage::EditAck {
-                req: r.u32().ok()?,
-                accepted: match r.u8().ok()? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                },
-                rev: r.u32().ok()?,
-            },
-            tag::POSITION => ServerMessage::Position { pos: r.vec3().ok()? },
-            tag::S_CHAT => ServerMessage::Chat {
-                from_id: r.u32().ok()?,
-                from_name: r.str16_lossy().ok()?,
-                channel: r.u8().ok()?,
-                text: r.str16_lossy().ok()?,
-            },
-            tag::S_TIME => ServerMessage::Time { day: r.f32().ok()?, day_secs: r.f32().ok()? },
-            tag::PEER_VOICE => ServerMessage::PeerVoice {
-                id: r.u32().ok()?,
-                epoch: r.u32().ok()?,
-                seq: r.u32().ok()?,
-                payload: read_voice_payload(&mut r)?,
-            },
-            _ => return None,
-        };
-        r.finished().then_some(message)
+messages! {
+    /// A message from the server to a client.
+    pub enum ServerMessage {
+        Welcome = tag::WELCOME { player_id: u32, seed: i64, spawn: DVec3 },
+        /// The stream closes after this (bad password, version mismatch, server full).
+        Reject = tag::REJECT { reason: Arc<str> },
+        /// Sent once right after [`Welcome`](Self::Welcome). Each cell carries its
+        /// authoritative revision so the joiner's future edit expectations line up.
+        Snapshot = tag::SNAPSHOT { edits: Vec<(i32, i32, i32, u32, Arc<str>)> },
+        /// Roster only — a peer's pose arrives via [`PeerMove`](Self::PeerMove) once
+        /// they are inside interest range.
+        PeerJoined = tag::PEER_JOINED { id: u32, name: Arc<str> },
+        PeerLeft = tag::PEER_LEFT { id: u32 },
+        /// Also the "entered interest range" signal.
+        PeerMove = tag::PEER_MOVE { id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+        /// A peer left interest range: hide their avatar instead of drawing a
+        /// frozen ghost at the last heard pose. They re-appear on the next
+        /// [`PeerMove`](Self::PeerMove) for that id.
+        PeerExited = tag::PEER_EXITED { id: u32 },
+        PeerSwing = tag::PEER_SWING { id: u32 },
+        /// Echo of a [`ClientMessage::Ping`], carrying its `nonce` unchanged.
+        Pong = tag::PONG { nonce: u32 },
+        /// Sent to everyone except the editor (who gets the ack).
+        Edit = tag::S_EDIT { x: i32, y: i32, z: i32, rev: u32, spec: Arc<str> },
+        /// `accepted` with the committed revision, or rejected (stale expectation,
+        /// out of reach, invalid spec) — the signal prediction rolls back on.
+        EditAck = tag::EDIT_ACK { req: u32, accepted: bool, rev: u32 },
+        /// Refused teleport or implausible movement: snap to it.
+        Position = tag::POSITION { pos: DVec3 },
+        Chat = tag::S_CHAT { from_id: u32, from_name: Arc<str>, channel: u8, text: Arc<str> },
+        /// `day` is a `[0,1)` fraction and `day_secs` the shared real-seconds
+        /// length of a full cycle, so every clock advances in step.
+        Time = tag::S_TIME { day: f32, day_secs: f32 },
+        /// `id` is the speaker's server-assigned player id (the runtime's
+        /// `SessionKey`); `epoch` distinguishes reconnections under a reused id —
+        /// constant `0` here because the server never reuses ids. `seq` and
+        /// `payload` are the sender's own [`ClientMessage::Voice`] values, unchanged.
+        PeerVoice = tag::PEER_VOICE { id: u32, epoch: u32, seq: u32, payload: Vec<u8> },
     }
 }
 
@@ -584,7 +466,7 @@ mod tests {
                 protocol: 1,
                 fingerprint: 7,
                 name: "player".into(),
-                password: String::new(),
+                password: "".into(),
             },
             ClientMessage::Move {
                 pos: DVec3::new(1.0, 2.0, 3.0),

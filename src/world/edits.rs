@@ -7,10 +7,11 @@ use voxel_engine::Engine;
 
 use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
+use crate::render_config::RenderConfig;
 
 use super::chunk::Chunk;
 use super::generation::TerrainGenerator;
-use super::{Coord, MeshState, VIEW_RADIUS_RANGE, World};
+use super::{Coord, MeshState, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
 
 impl World {
     /// Current render distance in chunk rings.
@@ -18,14 +19,30 @@ impl World {
         self.view.horizontal
     }
 
-    /// Change the render distance (clamped to 3..=10). Marks streaming dirty so
-    /// the next [`stream`](Self::stream) unloads past the new radius or resumes
-    /// meshing out to it.
+    /// Current vertical streaming distance in chunk layers above and below the eye.
+    pub fn vertical_radius(&self) -> i32 {
+        self.view.vertical
+    }
+
+    /// Compatibility setter for callers with a single render-distance value.
+    /// The vertical distance retains its historical half-horizontal derivation.
     pub fn set_view_radius(&mut self, radius: i32) {
-        let radius = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
-        if radius != self.view.horizontal {
-            let shrunk = radius < self.view.horizontal;
-            self.view = super::ViewVolume::view(radius);
+        let horizontal = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
+        let view = super::ViewVolume::view(horizontal);
+        self.set_view_distances(view.horizontal, view.vertical);
+    }
+
+    /// Set the anisotropic full-resolution streaming volume. Independent axes
+    /// let minimum mode keep only the collision-relevant vertical slab. Marks
+    /// streaming dirty so the next [`stream`](Self::stream) unloads past the
+    /// new radius or resumes meshing out to it.
+    pub fn set_view_distances(&mut self, horizontal: i32, vertical: i32) {
+        let horizontal = horizontal.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
+        let vertical =
+            vertical.clamp(*VERTICAL_RADIUS_RANGE.start(), *VERTICAL_RADIUS_RANGE.end());
+        if horizontal != self.view.horizontal || vertical != self.view.vertical {
+            let shrunk = horizontal < self.view.horizontal || vertical < self.view.vertical;
+            self.view = super::ViewVolume::new(horizontal, vertical);
             // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
@@ -41,9 +58,92 @@ impl World {
     }
 
     /// Set render lanes (occlusion/lod2). Entry-only; mesh teardown not needed.
+    /// Live settings must use [`set_render_config`](Self::set_render_config)
+    /// so GPU state is retired.
     pub fn set_render_lanes(&mut self, occlusion: bool, lod2: bool) {
         self.occlusion_forced = occlusion;
         self.lod2 = lod2;
+    }
+
+    /// Apply the live world-owned subset of render settings. A far-field ladder
+    /// transition retires every old section allocation and all derived state;
+    /// enabling then re-arms streaming to build the new hierarchy.
+    pub fn set_render_config(&mut self, render: RenderConfig, eng: &mut Engine) {
+        if self.occlusion_forced != render.occlusion {
+            self.occlusion_forced = render.occlusion;
+            self.occlusion_dirty.set();
+            if !render.occlusion {
+                // Stop consulting an old visible set immediately, before the
+                // next mutable stream sync point.
+                self.occlusion_active = false;
+            }
+        }
+
+        if !self.section_config_changed(render) {
+            return;
+        }
+        let pyramid_changed = self.section_pyramid_changed(render);
+        let (levels, detail) = render.normalized_lod();
+        let unit = self.view.lod_unit();
+        // A pure on/off transition retires draw/claim state but preserves the
+        // immutable generator mip (and an in-flight bake). Ladder/range changes
+        // alter its extent and must rebuild it.
+        self.clear_section_lane(eng, pyramid_changed);
+        self.lod2 = render.lod2;
+        self.section_pyramid = super::pyramid::PyramidCfg::sections_with(unit, levels, detail);
+        if self.lod2 {
+            self.pending_sections.set();
+        }
+    }
+
+    /// Pure change detector kept separate so distance-only LOD invalidation is
+    /// regression-testable without constructing a renderer/Engine.
+    pub(in crate::world) fn section_config_changed(&self, render: RenderConfig) -> bool {
+        self.lod2 != render.lod2 || self.section_pyramid_changed(render)
+    }
+
+    pub(in crate::world) fn section_pyramid_changed(&self, render: RenderConfig) -> bool {
+        let (levels, detail) = render.normalized_lod();
+        let unit = self.view.lod_unit();
+        self.section_pyramid.levels.get() != levels
+            || self.section_pyramid.finest.0 != detail as i8
+            || self.section_pyramid.unit != unit
+    }
+
+    /// Retire the whole far-section lane: free every GPU allocation, drop all
+    /// derived selection/cover state, purge queued far jobs, and advance the
+    /// epoch so in-flight worker results from the old configuration can never
+    /// land. `reset_mip` additionally discards the relief bake (its extent
+    /// depends on the ladder).
+    pub(in crate::world) fn clear_section_lane(&mut self, eng: &mut Engine, reset_mip: bool) {
+        // Queued section snapshots belong to the old epoch/configuration. Drop
+        // them immediately instead of letting a queue of obsolete, heavyweight
+        // jobs monopolize workers after a live LOD change.
+        if let Some(workers) = &self.workers {
+            let _ = workers.clear_far();
+        }
+        self.section_epoch = self.section_epoch.wrapping_add(1);
+        self.section_pending_claim = None;
+        for (_, state) in self.sections.drain() {
+            state.free(eng);
+        }
+        self.section_upload_queue.clear();
+        self.pending_sections.take();
+        self.dirty_sections.clear();
+        self.section_desired.clear();
+        self.section_frontier_key = None;
+        self.section_visible.clear();
+        self.section_fade = Default::default();
+        self.section_cover_dirty.set();
+        if reset_mip {
+            // Ladder/distance changes alter the required bake extent and levels.
+            self.section_mip = None;
+            self.section_mip_rx = None;
+        }
+        self.section_eye_prev = None;
+        self.section_vel = voxel_engine::DVec3::ZERO;
+        self.job_strikes.retain(|key, _| !matches!(key, super::streaming::FailKey::Section { .. }));
+        self.quarantined.retain(|key| !matches!(key, super::streaming::FailKey::Section { .. }));
     }
 
     /// Whether cross-chunk lighting is currently enabled.
@@ -228,7 +328,7 @@ impl World {
         }
         // Invalidate section to re-extract from overlay.
         if self.lod2 {
-            self.mark_dirty_sections_from_edit(x, y, z);
+            self.mark_dirty_sections_from_edit(coord, x, y, z);
         }
 
         if let Some(loaded) = self.chunks.get_mut(&coord) {
@@ -288,7 +388,7 @@ impl World {
     /// Mark sections covering this voxel dirty at every active detail so they
     /// re-extract from the edit overlay. Sections span the full vertical domain
     /// (Y-independent), so edits outside [0, DOMAIN_H) don't touch any section.
-    fn mark_dirty_sections_from_edit(&mut self, x: i32, y: i32, z: i32) {
+    fn mark_dirty_sections_from_edit(&mut self, chunk: Coord, x: i32, y: i32, z: i32) {
         if !(0..super::section::DOMAIN_H).contains(&y) {
             return;
         }
@@ -305,6 +405,10 @@ impl World {
             // keys its cache on this same per-section counter, so it re-derives
             // exactly the cells this edit could have changed.
             *self.section_edit_rev.entry(pos).or_insert(0) += 1;
+            // Index the edited chunk under every footprint that contains it,
+            // and queue the exact overlay re-derivation this edit requires.
+            self.section_edit_chunks.entry(pos).or_default().insert(chunk);
+            self.section_overlay_dirty.insert(pos);
         }
         self.pending_sections.set();
     }

@@ -33,8 +33,9 @@ pub struct ViewPose {
 /// and [`FreeRig::fly`]. `f64` trig of the `f32` angles so adding the result
 /// to an `f64` position loses nothing.
 pub fn direction_from_angles(yaw: f32, pitch: f32) -> DVec3 {
-    let (yaw, pitch) = (yaw as f64, pitch as f64);
-    DVec3::new(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos())
+    let (sin_yaw, cos_yaw) = (yaw as f64).sin_cos();
+    let (sin_pitch, cos_pitch) = (pitch as f64).sin_cos();
+    DVec3::new(cos_yaw * cos_pitch, sin_pitch, sin_yaw * cos_pitch)
 }
 
 /// The one orientation: yaw + pitch, and the one look clamp. `Player` stores

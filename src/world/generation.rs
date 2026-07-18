@@ -127,11 +127,16 @@ struct Fbm {
     stream: Stream,
     cell: f64,
     octaves: u8,
+    /// Sum of the octave weights. Immutable for a field, so computing it for
+    /// every 2-D/3-D sample only burns cycles during chunk generation.
+    norm: f32,
 }
 
 impl Fbm {
-    fn norm(&self) -> f32 {
-        (0..self.octaves).map(|o| 0.5f32.powi(o as i32)).sum()
+    fn new(stream: Stream, cell: f64, octaves: u8) -> Self {
+        assert!(octaves as usize <= MAX_FBM_OCTAVES, "FBM octave cache is too small");
+        let norm = (0..octaves).map(|o| 0.5f32.powi(o as i32)).sum();
+        Self { stream, cell, octaves, norm }
     }
 
     fn at3(&self, wx: i32, wy: i32, wz: i32) -> Unit {
@@ -142,7 +147,7 @@ impl Fbm {
             acc += w * octave(self.stream.octave(o as u64), wx, wy, wz, f);
             w *= 0.5;
         }
-        Unit(acc / self.norm())
+        Unit(acc / self.norm)
     }
 
     fn at(&self, wx: i32, wz: i32) -> Unit {
@@ -153,18 +158,21 @@ impl Fbm {
             acc += w * octave2(self.stream.octave(o as u64), wx, wz, f);
             w *= 0.5;
         }
-        Unit(acc / self.norm())
+        Unit(acc / self.norm)
     }
 
     /// Cached planes down a column; bit-identical to at3, cheaper.
     fn column(&self, wx: i32, wz: i32, y_lo: i32, y_hi: i32) -> FbmColumn {
-        let cols = (0..self.octaves)
-            .map(|o| {
+        // Inline array (no per-column heap allocation for the two or three
+        // octave planes); `flatten` in `sample` skips the unused slots.
+        let cols = std::array::from_fn(|index| {
+            (index < self.octaves as usize).then(|| {
+                let o = index as u8;
                 let f = (1u32 << o) as f64 / self.cell;
                 OctaveColumn::new(self.stream.octave(o as u64), wx, wz, f, y_lo, y_hi)
             })
-            .collect();
-        FbmColumn { cols, norm: self.norm() }
+        });
+        FbmColumn { cols, norm: self.norm }
     }
 
     fn bound(&self, x0: i32, y0: i32, z0: i32) -> Interval {
@@ -177,7 +185,7 @@ impl Fbm {
             hi += w * h;
             w *= 0.5;
         }
-        let n = self.norm();
+        let n = self.norm;
         Interval { lo: lo / n, hi: hi / n }
     }
 
@@ -194,7 +202,7 @@ impl Fbm {
             hi += w * octave2_sup(self.stream.octave(o as u64), x0, z0, dx, dz, f);
             w *= 0.5;
         }
-        hi / self.norm()
+        hi / self.norm
     }
 }
 
@@ -204,8 +212,14 @@ struct Interval {
     hi: f32,
 }
 
+/// Every configured terrain FBM has at most this many octaves. Keeping the
+/// cached vertical planes inline avoids two tiny heap allocations (cave +
+/// ravine) for every dense XZ column, plus island-detail allocations where
+/// active. [`Fbm::new`] asserts the bound.
+const MAX_FBM_OCTAVES: usize = 3;
+
 struct FbmColumn {
-    cols: Vec<OctaveColumn>,
+    cols: [Option<OctaveColumn>; MAX_FBM_OCTAVES],
     norm: f32,
 }
 
@@ -213,7 +227,7 @@ impl FbmColumn {
     fn sample(&self, y: i32) -> Unit {
         let mut acc = 0.0;
         let mut w = 1.0;
-        for c in &self.cols {
+        for c in self.cols.iter().flatten() {
             acc += w * c.sample(y);
             w *= 0.5;
         }
@@ -398,10 +412,21 @@ struct Warp {
 }
 
 impl Warp {
-    fn at(&self, wx: i32, wz: i32) -> Unit {
+    /// The displaced sample coordinates. Split from [`at`](Self::at) so
+    /// controls that intentionally share one displacement field pair (the
+    /// height axes; the climate axes) can compute the warp once and read each
+    /// of their fields at the same coordinates — bit-identical to warping each
+    /// read separately, because the fields share dx/dz by construction.
+    fn coordinates(&self, wx: i32, wz: i32) -> (i32, i32) {
         let ox = (self.dx.at(wx, wz).0 as f64 * 2.0 - 1.0) * self.amp;
         let oz = (self.dz.at(wx, wz).0 as f64 * 2.0 - 1.0) * self.amp;
-        self.field.at(wx + ox.round() as i32, wz + oz.round() as i32)
+        (wx + ox.round() as i32, wz + oz.round() as i32)
+    }
+
+    #[cfg(test)]
+    fn at(&self, wx: i32, wz: i32) -> Unit {
+        let (x, z) = self.coordinates(wx, wz);
+        self.field.at(x, z)
     }
 }
 
@@ -414,8 +439,16 @@ struct Control {
 }
 
 impl Control {
-    fn at(&self, wx: i32, wz: i32) -> f32 {
-        self.curve.eval(self.field.at(wx, wz).0.powf(self.gamma))
+    /// Shape an already-sampled raw field value: gamma redistribution, then
+    /// the spline. Takes the sample rather than coordinates so warp-sharing
+    /// callers (see `Terrain::profile`) can feed one shared read to several
+    /// controls.
+    fn shape(&self, raw: Unit) -> f32 {
+        // Most terrain controls deliberately use the identity gamma. Avoid a
+        // comparatively expensive libm call for those samples (`powf(x, 1.0)`
+        // is exactly `x`, so the bypass is bit-identical).
+        let redistributed = if self.gamma == 1.0 { raw.0 } else { raw.0.powf(self.gamma) };
+        self.curve.eval(redistributed)
     }
 }
 
@@ -807,7 +840,7 @@ impl Terrain {
         // resolved by hand; every material is an enumerated element union.
         let mat = placement::builtin().compile(registry);
         let s = Seed(seed);
-        let fbm = |salt: u64, cell: f64, octaves: u8| Fbm { stream: s.stream(salt), cell, octaves };
+        let fbm = |salt: u64, cell: f64, octaves: u8| Fbm::new(s.stream(salt), cell, octaves);
         // Shared height-warp offsets (like the biome axes share theirs), so
         // continentalness and erosion meander in step rather than decorrelating.
         let hwarp = |field: Fbm| Warp {
@@ -879,9 +912,15 @@ impl Terrain {
     /// Everything a column needs, sampled once. `height` folds continentalness
     /// (base), erosion·ridge (relief), and rivers (valley-floor channels).
     fn profile(&self, wx: i32, wz: i32) -> Column {
-        let base = self.continentalness.at(wx, wz);
-        let amp = self.erosion.at(wx, wz);
-        let ridge = self.weirdness.at(wx, wz);
+        // The three height axes intentionally share their warp displacement
+        // fields (see `hwarp` in the constructor). Compute that displacement
+        // once, and retain raw weirdness for the river pass below instead of
+        // sampling the same warped field a second time — bit-identical.
+        let (hx, hz) = self.continentalness.field.coordinates(wx, wz);
+        let base = self.continentalness.shape(self.continentalness.field.field.at(hx, hz));
+        let amp = self.erosion.shape(self.erosion.field.field.at(hx, hz));
+        let raw_weirdness = self.weirdness.field.field.at(hx, hz);
+        let ridge = self.weirdness.shape(raw_weirdness);
         // Mid-frequency rolling detail on every column: a small baseline so plains
         // are never dead flat, growing with erosion so mountains get rough flanks.
         let detail = self.detail.at(wx, wz).0 * 2.0 - 1.0;
@@ -910,7 +949,7 @@ impl Terrain {
 
         // Rivers: carve toward a sub-sea channel at the valley floor (weirdness
         // 0.5), gated to inland columns so ocean basins aren't double-carved.
-        let w = self.weirdness.field.at(wx, wz).0;
+        let w = raw_weirdness.0;
         let d = (w - 0.5).abs();
         if base > RIVER_INLAND && d < RIVER_HALF {
             let t = 1.0 - d / RIVER_HALF;
@@ -934,11 +973,13 @@ impl Terrain {
             water_level = self.sea_level + LAKE_RISE;
         }
 
+        // The climate axes share their warp pair by construction too.
+        let (climate_x, climate_z) = self.temperature.coordinates(wx, wz);
         Column {
             height: (h.round() as i32).max(1),
             water_level,
-            temperature: self.temperature.at(wx, wz),
-            humidity: self.humidity.at(wx, wz),
+            temperature: self.temperature.field.at(climate_x, climate_z),
+            humidity: self.humidity.field.at(climate_x, climate_z),
         }
     }
 
@@ -1230,20 +1271,26 @@ impl Terrain {
 
     /// The 256 column profiles for a chunk column, plus the height/water extents
     /// the fast paths read. `cy`-invariant — sampled once per vertical column.
-    fn column_profiles(&self, x0: i32, z0: i32) -> (Vec<Column>, i32, i32, i32, i32) {
-        let mut profiles: Vec<Column> = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
+    /// Exactly one chunk column is sampled at a time, so the fixed 256-profile
+    /// array lives inline instead of costing an allocator round trip per job.
+    fn column_profiles(
+        &self,
+        x0: i32,
+        z0: i32,
+    ) -> ([Column; CHUNK_SIZE * CHUNK_SIZE], i32, i32, i32, i32) {
         let (mut h_min, mut h_max) = (i32::MAX, i32::MIN);
         let (mut w_min, mut w_max) = (i32::MAX, i32::MIN);
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let p = self.profile(x0 + lx as i32, z0 + lz as i32);
-                h_min = h_min.min(p.height);
-                h_max = h_max.max(p.height);
-                w_min = w_min.min(p.water_level);
-                w_max = w_max.max(p.water_level);
-                profiles.push(p);
-            }
-        }
+        // Index order matches the old lz-outer/lx-inner push order exactly.
+        let profiles = std::array::from_fn(|index| {
+            let lx = index % CHUNK_SIZE;
+            let lz = index / CHUNK_SIZE;
+            let p = self.profile(x0 + lx as i32, z0 + lz as i32);
+            h_min = h_min.min(p.height);
+            h_max = h_max.max(p.height);
+            w_min = w_min.min(p.water_level);
+            w_max = w_max.max(p.water_level);
+            p
+        });
         (profiles, h_min, h_max, w_min, w_max)
     }
 

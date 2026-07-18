@@ -14,13 +14,12 @@ use crate::math::block_coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::TerrainGenerator;
 use super::heightmip::{BakeExtent, HeightMip};
-use super::mesh::ChunkMeshData;
 use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
 use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
     Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
-    SECTION_UPLOAD_BUDGET, SectionLane, SectionState, StreamLane, UPLOAD_BUDGET, World,
+    SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, StreamLane, UPLOAD_BUDGET, World,
     light, mesh, pipeline, pyramid, quadtree,
 };
 
@@ -37,7 +36,8 @@ fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
 /// Edits whose chunk falls inside `pos`'s footprint and height domain. Free
 /// function (not a `World` method) so callers needing only `&self.edits` — the
 /// heightmip overlay refresh among them — don't have to borrow the rest of `World`.
-fn edits_in_footprint(
+#[cfg(test)]
+pub(in crate::world) fn edits_in_footprint(
     edits: &FastMap<Coord, FastMap<usize, crate::block::registry::BlockId>>,
     pos: SectionPos,
 ) -> Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> {
@@ -64,9 +64,15 @@ const SSE_K: f32 = 1080.0 / 2.0; // tan(45°) = 1
 /// (safer for fast motion, low cost) but never shrinks the view.
 const TAU_STREAM: f64 = 1.0;
 
-/// Above this frame gap, treat eye motion as teleport/pause; discard velocity
-/// to zero prediction. Roughly two dropped frames at 30 fps.
-const MAX_PREDICT_DT: f64 = 1.0 / 15.0;
+/// Above this sample gap, treat eye motion as pause/teleport; discard velocity
+/// to zero prediction. Generous (streaming may legitimately run at 15 Hz under
+/// `stream_hz`); the speed cap below catches genuine discontinuities.
+const MAX_PREDICT_SAMPLE_GAP: f64 = 0.5;
+
+/// Above this apparent speed (m/s), treat the motion as a teleport rather than
+/// travel: prediction is zeroed AND queued far work is purged, because its
+/// admission-time priorities are stale where the eye is now.
+const MAX_PREDICT_SPEED: f64 = 512.0;
 
 /// Timeout before meshing a chunk with missing neighbour light as degraded.
 /// Degraded chunks remesh once real light arrives.
@@ -104,7 +110,7 @@ impl FailKey {
             pipeline::JobKey::Column { col, .. } => FailKey::Column { col: *col },
             pipeline::JobKey::Mesh { coord } => FailKey::Mesh { coord: *coord },
             pipeline::JobKey::Light { coord } => FailKey::Light { coord: *coord },
-            pipeline::JobKey::Section { pos } => FailKey::Section { pos: *pos },
+            pipeline::JobKey::Section { pos, .. } => FailKey::Section { pos: *pos },
         }
     }
 }
@@ -148,31 +154,68 @@ impl World {
         self.center.is_some_and(|c| self.mesh_box(c).contains(coord))
     }
 
-    /// Land worker results, queue generation/meshing, free distant chunks.
+    /// The every-frame half of streaming: land finished worker results, run
+    /// the budgeted uploads, and remesh edited chunks — everything whose
+    /// LATENCY the player sees directly. The game runs this every frame no
+    /// matter how `stream_hz` throttles [`stream`](Self::stream), so a 15 Hz
+    /// Minimum profile still publishes finished terrain the frame it lands
+    /// and a mined block still vanishes the same frame it was clicked.
+    /// Steady-state cost is a channel poll and two sticky-flag checks.
+    pub fn pump(&mut self, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+        // Palette growth re-uploads the block texture array before any upload
+        // this frame references a new layer.
+        self.refresh_textures(eng);
+        {
+            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
+            let drain_lane = self.lanes().drain;
+            sched.run_manual(drain_lane, self, Some(&mut *eng));
+        }
+        // The synchronous edit remesh: self-gates on `pending_dirty`, so an
+        // editless frame pays one flag check.
+        let dirty_lane = self.lanes().dirty_remesh;
+        sched.run_manual(dirty_lane, self, Some(&mut *eng));
+    }
+
+    /// Land worker results, queue generation/meshing, free distant chunks —
+    /// the topology half, run at `stream_hz` (or out of band on forced
+    /// refreshes). [`pump`](Self::pump) covers the every-frame latency half;
+    /// the drain/dirty lanes here are second-run no-ops on a pumped frame.
     /// Steady-state zero cost: one channel poll, lazy unload/generate on boundary cross.
     pub fn stream(&mut self, center: DVec3, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
-        // Palette growth re-uploads the block texture array before any meshing
-        // this frame, so vertices never reference a layer that isn't there.
-        // Covers the initial upload too (0 tracked -> N on the first stream).
-        self.refresh_textures(eng);
         // Capture eye altitude; section metric measures dy from it.
         self.section_eye_y = center.y;
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
         // or teleport-sized gaps, so prediction never fires on garbage input.
         let now = Instant::now();
+        let mut discontinuity = false;
         self.section_vel = match self.section_eye_prev {
             Some((prev, t)) => {
                 let dt = now.duration_since(t).as_secs_f64();
                 let v = (center - prev) / dt;
-                if center.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_DT && v.is_finite() {
+                let sane =
+                    center.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_SAMPLE_GAP && v.is_finite();
+                if sane && v.length() <= MAX_PREDICT_SPEED {
                     v
                 } else {
+                    // Implausible motion = teleport/large jump: on top of
+                    // zeroed prediction, queued far jobs still carry stale
+                    // admission priorities from the old position.
+                    discontinuity = sane;
                     DVec3::ZERO
                 }
             }
             None => DVec3::ZERO,
         };
         self.section_eye_prev = center.is_finite().then_some((center, now));
+        if discontinuity && let Some(workers) = &self.workers {
+            // Purge queued (not running) far work and release each exact
+            // claim, so obsolete jobs cannot monopolize workers while the
+            // frontier at the new position waits. Ready sections stay.
+            for key in workers.clear_far() {
+                self.cancel_job(key);
+            }
+            self.pending_sections.set();
+        }
         let s = CHUNK_SIZE as i32;
         let center_chunk = ChunkCoord::new(
             block_coord(center.x).div_euclid(s),
@@ -194,13 +237,12 @@ impl World {
         // Each lane creates its own budget window, not shared: lanes run
         // sequentially, so a single frame-start snapshot would starve lanes
         // after the first.
-        // Land worker results before the scans below, so freshly generated
-        // chunks count as data this frame and finished meshes draw this frame.
-        {
-            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
-            let drain_lane = self.lanes().drain;
-            sched.run_manual(drain_lane, self, Some(&mut *eng));
-        }
+        // Textures, worker results, and edit remeshes land through the ONE
+        // owner of that trio — after the centre update above, so a
+        // boundary-cross frame's results drain against the live centre, not
+        // the one they'd be discarded by. (When the game already pumped this
+        // frame, these self-gate down to flag checks.)
+        self.pump(eng, sched);
         if full_pass {
             self.unload_far(center_chunk, eng);
             // Centre chunk synchronously for collision safety before async catches
@@ -297,7 +339,7 @@ impl World {
         if self.lod2 {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamTiles);
             // Update pyramid unit to track the current view distance.
-            self.section_pyramid.unit = (self.view.horizontal * CHUNK_SIZE as i32) as f32;
+            self.section_pyramid.unit = self.view.lod_unit();
             // Until the bake lands, selection uses the worst-case ladder;
             // mip only coarsens, no upward pops during bake.
             let mip_lane = self.lanes().mip;
@@ -307,11 +349,33 @@ impl World {
             // coarsening below already consults it).
             let overlay_lane = self.lanes().section_overlay;
             sched.run_manual(overlay_lane, self, None);
-            // ONE selection sweep per frame: unloading, the load lane, and the
-            // covering rebuild below all read this cache. The frontier tracks
-            // the live eye (altitude included) continuously, so it must be
-            // fresh every frame, not only on boundary crossings.
-            self.section_desired = self.desired_sections(center_chunk);
+            // ONE selection sweep, retained across passes: unloading, the load
+            // lane, and the covering rebuild below all read this cache. The
+            // frontier is a pure function of the key's inputs (eye, velocity,
+            // ladder, relief-mip readiness), so while they are bit-identical —
+            // a still camera — the sweep (grid walk + relief coarsening) is
+            // skipped entirely. Edits force a recompute: relief coarsening
+            // consults the edit overlay, which the key cannot cheaply cover.
+            let frontier_key = SectionFrontierKey {
+                center_xz: [center_chunk.x, center_chunk.z],
+                eye_y: self.section_eye_y.to_bits(),
+                velocity: [
+                    self.section_vel.x.to_bits(),
+                    self.section_vel.y.to_bits(),
+                    self.section_vel.z.to_bits(),
+                ],
+                unit: self.section_pyramid.unit.to_bits(),
+                finest: self.section_pyramid.finest.0,
+                levels: self.section_pyramid.levels.get(),
+                step: self.section_pyramid.step(),
+                mip_ready: self.section_mip.is_some(),
+            };
+            if self.section_frontier_key != Some(frontier_key) || !self.dirty_sections.is_empty()
+            {
+                self.section_desired = self.desired_sections(center_chunk);
+                self.section_frontier_key = Some(frontier_key);
+                self.section_cover_dirty.set();
+            }
             if full_pass {
                 self.unload_sections(center_chunk, eng);
                 self.pending_sections.set();
@@ -322,9 +386,15 @@ impl World {
             sched.run_manual(section_remesh_lane, self, Some(&mut *eng));
             let section_lane = self.lanes().section_admit;
             sched.run_manual(section_lane, self, None);
-            // Section visible-set lane: rebuild the covering + advance the fade.
-            let visible_lane = self.lanes().section_visible;
-            sched.run_manual(visible_lane, self, Some(&mut *eng));
+            // Section visible-set lane: re-resolve the covering only when an
+            // event moved it (upload/unload/free/claim release/frontier or
+            // ladder change) or while admission is still pending — the
+            // level-triggered backstop that keeps holes re-arming the lane.
+            // A converged, still far field pays a flag check, no covering walk.
+            if self.section_cover_dirty.take() || self.pending_sections.get() {
+                let visible_lane = self.lanes().section_visible;
+                sched.run_manual(visible_lane, self, Some(&mut *eng));
+            }
         }
         // Occlusion is derived state, rebuilt here at the `&mut` sync point (never
         // in the `&self` render). The lane self-gates: it rebuilds only when the
@@ -411,15 +481,24 @@ impl World {
             self.settle_light(coord, grid);
         }
 
-        // Section uploads, on their own budget. Dropped if unloaded since landing (no rev tracking).
+        // Section uploads, on their own budget. Re-validated by claim token at
+        // the moment of upload: an entry that sat queued across an unload or a
+        // re-admission must not capture the replacement claim. The budget
+        // scales with queue pressure (amortized eighth of the backlog) so a
+        // ladder-change or spawn flood drains in a bounded handful of frames
+        // instead of trickling out at the steady-state rate, while a quiet
+        // trickle keeps the small fixed budget.
+        let section_budget = SECTION_UPLOAD_BUDGET.max(self.section_upload_queue.len() / 8);
         let mut section_uploads = 0;
-        while section_uploads < SECTION_UPLOAD_BUDGET {
-            let Some((pos, meshes)) = self.section_upload_queue.pop_front() else { break };
+        while section_uploads < section_budget {
+            let Some((pos, token, meshes)) = self.section_upload_queue.pop_front() else { break };
             section_uploads += 1;
             // `section_material` borrows all of `self`, so it must run before
             // `self.sections.get_mut` below takes an overlapping mutable borrow.
             let (flat_color, flat_rgba) = self.section_material(pos);
-            if let Some(state @ SectionState::Meshing) = self.sections.get_mut(&pos) {
+            if let Some(state @ SectionState::Meshing { .. }) = self.sections.get_mut(&pos)
+                && matches!(state, SectionState::Meshing { token: t } if *t == token)
+            {
                 *state = SectionState::from_upload(pos, meshes, eng);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
@@ -432,6 +511,7 @@ impl World {
                 // A new Ready section moves the covering: re-arm the lane so
                 // any refinement it exposes loads immediately.
                 self.pending_sections.set();
+                self.section_cover_dirty.set();
             }
         }
     }
@@ -446,7 +526,12 @@ impl World {
     }
 
     /// Mesh result at `rev`: queue for upload if still applies; else drop and re-arm scan.
-    pub(in crate::world) fn accept_mesh(&mut self, coord: Coord, rev: u32, data: Box<ChunkMeshData>) {
+    pub(in crate::world) fn accept_mesh(
+        &mut self,
+        coord: Coord,
+        rev: u32,
+        data: pipeline::MeshOutput,
+    ) {
         if self.mesh_result_applies(coord, rev) {
             self.upload_queue.push_back((coord, rev, data));
         } else {
@@ -587,9 +672,15 @@ impl World {
                 self.light_worklist.insert(coord);
                 self.light_pending.set();
             }
-            pipeline::JobKey::Section { pos } => {
-                if matches!(self.sections.get(&pos), Some(SectionState::Meshing)) {
+            pipeline::JobKey::Section { pos, epoch, token } => {
+                // Release only the exact claim: a same-position replacement
+                // minted after this job was queued keeps its own claim.
+                let held = epoch == self.section_epoch
+                    && matches!(self.sections.get(&pos),
+                        Some(SectionState::Meshing { token: t }) if *t == token);
+                if held {
                     self.sections.remove(&pos);
+                    self.section_cover_dirty.set();
                 }
             }
         }
@@ -639,9 +730,13 @@ impl World {
                 // lane's degrade timeout takes over and the terminal flush
                 // promotes it — the world converges on fallback light.
             }
-            pipeline::JobKey::Section { pos } => {
-                if matches!(self.sections.get(&pos), Some(SectionState::Meshing)) {
+            pipeline::JobKey::Section { pos, epoch, token } => {
+                let held = epoch == self.section_epoch
+                    && matches!(self.sections.get(&pos),
+                        Some(SectionState::Meshing { token: t }) if *t == token);
+                if held {
                     self.sections.remove(&pos);
+                    self.section_cover_dirty.set();
                 }
                 if !quarantine {
                     self.pending_sections.set();
@@ -675,7 +770,7 @@ impl World {
         if self.chunks.contains_key(&coord) {
             return;
         }
-        let chunk = Chunk::new(coord.x, coord.y, coord.z, &self.generator);
+        let chunk = Chunk::new(coord.x, coord.y, coord.z, &*self.generator);
         self.store_chunk(coord, chunk);
     }
 
@@ -811,7 +906,9 @@ impl World {
             pipeline::ChunkSnapshot {
                 padded: self.capture_padded(coord),
                 uniform: loaded.chunk.uniform(),
-                light: self.capture_padded_light(coord, degraded),
+                // Lighting off omits the 18³ shell entirely — the mesher's
+                // unlit path reads constant full light instead.
+                light: self.lighting.then(|| self.capture_padded_light(coord, degraded)),
                 tables: self.tables.get(),
             },
         )
@@ -820,10 +917,9 @@ impl World {
     /// Settled light shell for chunk and 26 neighbours (18³). A missing grid reads
     /// dark for a normal mesh; for a `degraded` mesh it stands in as fully-lit
     /// open-sky, so an unsettled neighbourhood fails toward visible-and-plausible.
+    /// Only called with lighting enabled (the disabled path captures nothing).
     fn capture_padded_light(&self, coord: Coord, degraded: bool) -> light::PaddedLight {
-        if !self.lighting {
-            return light::PaddedLight::full();
-        }
+        debug_assert!(self.lighting, "unlit meshes take the no-shell path");
         let fallback = degraded.then(light::LightGrid::open_sky);
         light::PaddedLight::capture(|dx, dy, dz| {
             self.chunks
@@ -1071,7 +1167,7 @@ impl World {
         let extent = BakeExtent::new(cfg.outer_m() as i32, cfg.coarsest());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(HeightMip::bake(&generator, &colors, extent));
+            let _ = tx.send(HeightMip::bake(&*generator, &colors, extent));
         });
         self.section_mip_rx = Some(rx);
     }
@@ -1099,24 +1195,35 @@ impl World {
     /// enter the loop, so an unedited world pays nothing (`section_overlay` stays
     /// empty and every reader falls back to the pure bake, bit-identical to
     /// before this cache existed).
+    /// A quiet frame is one set-emptiness check: only the exact positions
+    /// edits touched since the last refresh (`section_overlay_dirty`) are
+    /// re-derived, and the resolved map is maintained incrementally instead
+    /// of cleared and rebuilt every pass.
     pub(in crate::world) fn refresh_section_overlay(&mut self) {
-        self.section_overlay.clear();
-        let positions: Vec<(SectionPos, u64)> =
-            self.section_edit_rev.iter().map(|(&p, &r)| (p, r)).collect();
-        for (pos, rev_n) in positions {
-            let rev = voxel_engine::Rev(rev_n);
-            let touched = edits_in_footprint(&self.edits, pos);
+        if self.section_overlay_dirty.is_empty() {
+            return;
+        }
+        let positions: Vec<SectionPos> = self.section_overlay_dirty.drain().collect();
+        for pos in positions {
+            let rev = voxel_engine::Rev(self.section_edit_rev.get(&pos).copied().unwrap_or(0));
+            let touched = self.edits_for_section(pos);
             if touched.is_empty() {
                 // Reverted back to what the generator would produce (overlay
                 // compaction, edits.rs): no override, the pure bake applies.
+                self.section_overlay.remove(&pos);
                 continue;
             }
             let cell = *self.section_overlay_cache.get_or_recompute(pos, rev, || {
                 let colors = self.registry.color_snapshot();
-                Some(super::heightmip::resample_cell(pos, &self.generator, &touched, &colors))
+                Some(super::heightmip::resample_cell(pos, &*self.generator, &touched, &colors))
             });
-            if let Some(cell) = cell {
-                self.section_overlay.insert(pos, cell);
+            match cell {
+                Some(cell) => {
+                    self.section_overlay.insert(pos, cell);
+                }
+                None => {
+                    self.section_overlay.remove(&pos);
+                }
             }
         }
     }
@@ -1142,12 +1249,27 @@ impl World {
     }
 
     /// Edits affecting this section: chunks within its footprint and height domain.
-    /// Used when re-extracting after an edit.
+    /// Used when re-extracting after an edit. Reads the `section_edit_chunks`
+    /// index — O(this section's edited chunks), not a scan of every edit in
+    /// the world (the reference scan survives as `edits_in_footprint`, pinned
+    /// equivalent by test). Compacted-away chunks fall out at the lookup.
     pub(in crate::world) fn edits_for_section(
         &self,
         pos: SectionPos,
     ) -> Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> {
-        edits_in_footprint(&self.edits, pos)
+        let Some(chunks) = self.section_edit_chunks.get(&pos) else {
+            return Vec::new();
+        };
+        chunks
+            .iter()
+            .filter_map(|&c| {
+                let cells = self.edits.get(&c)?;
+                if cells.is_empty() {
+                    return None;
+                }
+                Some((c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
+            })
+            .collect()
     }
 
     /// Rebuild the visible set every frame; as sections become Ready, the covering
@@ -1226,11 +1348,13 @@ impl World {
                     .is_some_and(|req| s.detail < req)
             })
             .collect();
-        for s in stale {
-            if let Some(state) = self.sections.remove(&s) {
+        for s in &stale {
+            if let Some(state) = self.sections.remove(s) {
                 state.free(eng);
             }
         }
+        // Removals move the covering (a freed cell may re-expose an ancestor).
+        self.section_cover_dirty.raise(!stale.is_empty());
     }
 
     /// Free GPU meshes so edited sections re-extract from the updated overlay.
@@ -1249,7 +1373,7 @@ impl World {
                     self.dirty_sections.remove(&s);
                     freed = true;
                 }
-                Some(SectionState::Meshing) => {} // in flight: free once it lands Ready
+                Some(SectionState::Meshing { .. }) => {} // in flight: free once it lands Ready
                 None => {
                     self.dirty_sections.remove(&s);
                 }
@@ -1257,6 +1381,7 @@ impl World {
         }
         if freed {
             self.pending_sections.set();
+            self.section_cover_dirty.set();
         }
     }
 

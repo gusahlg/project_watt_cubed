@@ -1,0 +1,140 @@
+# Performance pass and benchmark contract
+
+This document records the July 2026 optimization pass — originally developed on
+`experimental` (PR #5) and re-implemented on top of the post-refactor `main`
+architecture (producer scheduler, resident GPU meshes, audio stack) — and the
+contract for measuring it later. The requested goals are:
+
+| Scenario | Future target | Frame-time equivalent |
+| --- | ---: | ---: |
+| Minimum, stripped but playable | above 20,000 FPS | below 0.050 ms |
+| Fast, with more presentation and gameplay systems enabled | above 5,000 FPS | below 0.200 ms |
+
+These are **unverified targets, not measured results**. They are hardware-, driver-, resolution-, scene-, and frame-definition-dependent. A future result must report average FPS, 1%-low FPS (`p1_fps` in the built-in harness), average frame time, sample count, end-of-run RSS, and the exact settings and machine. At these rates, also distinguish application frames produced from frames accepted by the render thread and images actually presented; counting work that a latest-frame mailbox discards is not rendering throughput.
+
+## Profiles and controls
+
+The settings menu and `/gfx` command share the persisted descriptor table in [`src/settings.rs`](../src/settings.rs). Selecting a named profile applies all profile-owned fields atomically. Editing any individual profile-owned field marks the state `Custom` (enforced once, in the `Setting::step`/`parse_human` wrappers — no UI surface has to remember it); it does not discard the edited values. Profiles deliberately preserve fullscreen, FOV, UI scale, menu scale, camera shake, audio, and the environment-only face-culling choice. They remove any FPS cap and own VSync plus the rendering/gameplay cost controls.
+
+| Profile | World and clocks | Presentation | Gameplay/background work |
+| --- | --- | --- | --- |
+| **Minimum** | horizontal distance 0 (current chunk column only), vertical distance 1, 25% render scale, 1x MSAA, VSync off, streaming/sky/mod rates 15 Hz, physics 30 Hz, distant LOD off | HUD off; minimap, mod HUD, player models, name tags, sky and costly post/light lanes off | simulation, mod updates, and periodic autosave off |
+| **Fast** | horizontal distance 3, vertical distance 2, 50% render scale, 1x MSAA, VSync off, streaming, physics, sky, and mod rates 60 Hz; distant LOD on with 3 levels starting at detail 4 | minimal HUD, player models on; minimap, mod HUD, name tags, sky and costly post/light lanes off | simulation, mod updates, and autosave on |
+| **Default** | restores the shipped mix: distance 6/3, 100% scale, every-frame streaming, physics, sky-clock, and mod advancement; distant LOD is off by default | full HUD and the shipped visual lanes | simulation, mods, minimap, models, tags, and autosave on |
+| **Custom** | exact individually selected values | exact individually selected values | exact individually selected values |
+
+“Costly lanes off” currently means occlusion, voxel/block lighting, baked AO, auto exposure, bloom, god rays, clouds, weather, stars, day/night animation, TAA, fog, ambient light, shadows, procedural sky, VRS, water animation, and vignette are disabled. Sunlight remains enabled so stripped terrain is still readable. Fast then re-enables its explicitly configured distant LOD lane.
+
+The independent performance controls are:
+
+- `render_distance`: 0–20 horizontal chunk rings; zero draws only the current chunk column while retaining an unmeshed collision/data halo. `vertical_distance`: 1–10 chunk layers above and below the eye. Separating them avoids loading tall columns of invisible sky and deep rock.
+- `lod2`: far field on/off; `lod_levels`: 1–8 base-2 distance rings; `lod_detail`: 2–6, where a lower value is finer and the cell width is `2^detail` metres. The approximate outer range is `max(render_distance, 1) × 16 × 2^lod_levels` metres. The hierarchy is shortened when needed so `lod_detail + lod_levels - 1 <= 9` (one source: `render_config::max_lod_levels`).
+- `stream_hz`: every frame, 15, 30, 60, 120, or 240 Hz. Forced refreshes still occur after teleports, net snap-backs, freecam changes, HUD/minimap activation, and settings changes.
+- `physics_hz`: every frame, 30, 60, 120, 240, 500, or 1000 Hz. Mouse look and camera effects remain render-rate responsive; edge-triggered flight/jump input is latched until a physics tick consumes it.
+- `sky_hz`: every frame, 15, 30, 60, 120, or 240 Hz. It throttles local day/night-clock advancement; `day_night=off` renders fixed noon while preserving the authoritative clock for networking and future re-enables.
+- `mod_hz`: every frame, 15, 30, 60, 120, or 240 Hz. It schedules enabled mod-hook batches without losing placement, inventory, crafting, or navigation edges between ticks; one permitted batch replays every queued edge-bearing frame in order, and a delayed placement keeps its exact edge-time raycast cell (`ModContext::place_target`).
+- `simulation`, `mod_logic`, and `autosave`: independently remove simulation ticks (the producer stays registered on the scheduler; `Scheduler::set_enabled` gates it), mod hooks, and periodic save serialization. Core movement, mining, and an explicit save on clean world exit remain available. Crafted-block placement requires `mod_logic`; inventory/crafting input additionally requires `mod_hud` and a visible master HUD, preventing hidden modal input.
+- `hud_mode`: Off, Minimal, or Full, plus independent `minimap`, `mod_hud`, `player_models`, and `name_tags` gates.
+
+All four rate lanes and the scheduler's `Cadence::Hz` producers run on ONE accumulator implementation, [`sched::RateGate`](../src/sched/mod.rs): a bounded bank (0.25 s cap — a pause replays a bounded burst, never an unbounded one) with `0` as the explicit every-frame mode.
+
+## Implemented in this pass
+
+### Startup, settings, and application loop
+
+- Interactive new, loaded, and network worlds use lazy construction (`World::with_config_lazy`, `save::load_with_config`). The selected view and render configuration is installed before a small collision-safe spawn slab is prepared; the previous eager default-volume generation is avoided. Headless/test constructors retain their eager contract.
+- The autosave writer thread is created only when a dirty periodic write is actually due (`Autosaver` spawns lazily; a dead worker is replaced on the next due write). Clean worlds, disabled autosave, and synchronous exit-only saves create no background thread; disabled autosave also bypasses polling and serialization in `App::update_playing`.
+- `WATT_BENCH` no longer enables instrumentation implicitly. `WATT_BENCH_PROFILE=1` opts into attribution; headline measurements remain uninstrumented. `WATT_BENCH_PRESET` applies a profile for the run without persisting it.
+- The benchmark sample vector reserves for 25,000 measured frames per second up front; duration, warmup, and elapsed-time accounting use `f64` on one clock, so long high-rate runs avoid boundary drift and `f32` accumulation error.
+
+### Game update and presentation
+
+- Physics, world streaming, sky-clock advancement, and mod dispatch have independent `RateGate` clocks; the fixed-tick simulation already runs at 20 Hz on the scheduler. Singleplayer returns from the net phase before any polling or profiling scope.
+- Input routing snapshots movement axes once and reuses them for movement and freecam (`MoveInput::freecam_axes`). Disabled mod logic skips placement probes at the router (`Router::frame_filtered`), disabled mod UI skips inventory/crafting/navigation probes, a disabled minimap skips its mode key, and an overlay is closed once when its HUD lane is hidden so an invisible modal cannot consume input.
+- HUD Off records nothing unless the console is open; Minimal does not draw closed console scrollback. Full-HUD coordinates are reformatted only when the rounded tenth changes; FPS is sampled at 4 Hz and reformatted only when its displayed integer changes; online text changes only with count or ping. All ride one keyed-memo primitive ([`derived::Memo`](../src/derived.rs)).
+- Camera orientation is cached by exact yaw/pitch/roll/FOV bit patterns (the f64 eye stays outside the key, so translation rebuilds nothing). Sun direction/elevation/daylight are sampled once per frame ([`SkyFrame`](../src/sky/clock.rs)) and cached by clock value; `day_night=off` uses cached fixed-noon lighting and performs no steady-frame trigonometry.
+- With weather, clouds, water animation, and auto exposure disabled, the composed lighting packet and clear colour are cached by clock value; wrapped camera-XZ animation coordinates are recomputed only when the eye XZ changes and patched into the cached packet. Minimum and Fast use this stripped path. The exposure read itself is skipped when the lane is off.
+- Disabling weather removes every weather-derived input before uniform composition: coverage, rain palette overrides, and fog bonus all become zero.
+- Peer draw records, the audio peer sample, and mod-placement buffers retain capacity across frames. Disabling models avoids animator/rig composition; disabling tags avoids projection, occlusion raycasts, text measurement, and name cloning — a fully hidden peer produces no record at all.
+- Idle collision axes return before building an AABB or querying the world; view-direction trig uses fused `sin_cos`.
+- The crafting mod mirrors held elements only when the shared stash revision changes and retains the mirror vector's capacity.
+
+### World streaming and LOD
+
+- Horizontal and vertical view distances are independent (`World::set_view_distances`); the minimum `0/1` mesh volume is the current vertical column plus the unmeshed data/collision halo.
+- The LOD ladder is configurable and transitions live (`World::set_render_config`): a change frees old GPU-owned sections exactly once, purges queued far jobs, clears derived frontier/cover state, re-arms the new ladder, and advances the section **epoch**. Every asynchronous section claim also carries a unique **token** (`SectionState::Meshing { token }`, `JobKey::Section { pos, epoch, token }`), validated at result integration AND at the moment of upload — an old result, cancellation, failure, or queued upload can never capture a same-position replacement after unload/re-admission.
+- The far-field frontier is retained across streaming passes until its exact eye, velocity, ladder, or relief-mip inputs change (`SectionFrontierKey`); edits force a recompute because relief coarsening consults the edit overlay. Per-section band selection uses bounded multiply/compare steps instead of logarithms, with the base-2 step cached in `PyramidCfg`.
+- Large camera discontinuities (implausible apparent speed, > 512 m/s) purge queued far work and cancel its exact claims, so obsolete jobs cannot monopolize workers; Ready sections stay resident.
+- Padded voxel/light snapshots and greedy-mesh outputs use bounded cross-thread pools (snapshots are captured on the main thread and dropped by workers — a thread-local pool stranded every buffer). Lighting-off snapshots omit the 18³ light shell entirely, and disabling both lighting and AO selects a culling-only face-sample path; a parity test pins the unlit mesher byte-identical to a full-bright shell.
+- Worker jobs share one immutable terrain generator through `Arc` instead of deep-cloning the compiled terrain per job, and skip per-job profiling labels/clocks when profiling is disabled.
+
+Note: the PR-era chunk/section **draw caches** and the temporal **swap fade** were *not* ported — the GPU refactor superseded both. Meshes are resident with placement, detail, visibility, and style pinned at upload; `World::render` submits no per-mesh draws, so there is no per-frame draw walk left to cache.
+
+### Authoritative terrain generation
+
+- Each immutable fBm field precomputes its octave normalization once (`Fbm::new`).
+- The height axes intentionally share their warp displacement fields, as do the climate axes; warp coordinates are now computed once per column and shared (`Warp::coordinates`). Raw warped weirdness is reused for ridge shaping and river placement, and identity-gamma controls bypass `powf` (`Control::shape`).
+- A generation column uses a fixed 256-profile array instead of a heap allocation, and fBm octave-column state is inline (`MAX_FBM_OCTAVES`) instead of allocating tiny vectors per column.
+
+These are caching and redundant-work removals, not a world-generation redesign. The same authoritative seed/coordinate mapping remains exact — the per-cell/per-chunk/column parity tests and goldens pass unchanged.
+
+### Protocol
+
+The client/server message enums and their binary codec are generated from one `messages!` table over a per-field `Wire` trait ([`src/net/protocol.rs`](../src/net/protocol.rs)): the declaration is the wire format, so encode and decode cannot drift. The byte layout is unchanged (all round-trip, bit-exactness, trailing-byte, and forged-frame tests pass verbatim).
+
+## Future benchmark procedure
+
+Use the release profile in [`Cargo.toml`](../Cargo.toml). Build once so compilation is outside every sample:
+
+```sh
+cargo build --release
+```
+
+For interactive inspection, select a profile in the settings menu or run `/gfx preset minimum`, `/gfx preset fast`, or `/gfx preset default`. Benchmark runs can apply the profile without mutating the saved configuration by setting `WATT_BENCH_PRESET`; record any separately overridden Custom settings because the `preset=` marker alone does not recreate them.
+
+Run at least five samples per profile on the same machine, native release binary, window size, compositor state, GPU power mode, driver, and temperature envelope:
+
+```sh
+for run in 1 2 3 4 5; do
+  WATT_BENCH=30 WATT_BENCH_PRESET=minimum WATT_BENCH_SEED=42 \
+    ./target/release/project_watt_cubed
+done
+```
+
+The harness performs a three-second warmup, slowly rotates the camera, and prints `frames`, `avg_fps`, `p1_fps`, `avg_ms`, and `rss_mb`. Use these scenarios:
+
+1. **Minimum target:** `WATT_BENCH_PRESET=minimum`, seed 42, spawn position.
+2. **Fast target:** `WATT_BENCH_PRESET=fast`, otherwise identical.
+3. **Default/control:** `WATT_BENCH_PRESET=default`, otherwise identical.
+4. **Far-coordinate parity:** repeat Minimum and Fast with `WATT_BENCH_POS="1000000,128,-1000000"`; this path receives two extra warmup seconds.
+5. **LOD stress:** Custom profile with distant LOD enabled, record distance/vertical/levels/detail explicitly, then use the same seed and position.
+6. **Attribution only:** repeat a representative failure with `WATT_BENCH_PROFILE=1`. Never compare this run directly with the uninstrumented target.
+
+Keep `VOXEL_PROFILE` unset and `WATT_BENCH_PROFILE` absent for headline numbers. VSync must be off and the FPS cap zero. Also capture CPU/GPU model, clocks/power policy, RAM, OS, window resolution, render scale, backend, driver, commit IDs for both this repository and the sibling renderer, and whether the window was visible or occluded.
+
+The current harness is a steady rotating-camera test, not a movement/streaming benchmark. Before claiming cold-start or traversal performance, add deterministic scenarios that cross chunk boundaries at fixed velocities and separately report startup-to-playable, convergence, hitch percentiles, upload backlog, and steady state. Validate frame semantics with render-thread/GPU counters.
+
+## Prioritized remaining opportunities
+
+### P0: sibling `voxel-engine`
+
+Unchanged from the original audit (`../voxel-engine`): stop cloning completed draw lists in `finish_frame`; make stripped render lanes structurally absent (shadow PCF, bloom, HDR/tonemap); reject/coalesce before frame construction under the latest-frame mailbox; move allocator maintenance off every frame; replace the exposure reducer with a hierarchical reduction; cache view/projection/frustum construction by orientation/lens/viewport; add a true water-effects-off path. The engine's own test target currently fails to compile (`vk/taa.rs`), independent of this repository.
+
+### P1: game and world
+
+1. Split streaming into a cheap result/upload pump and an event/rate-driven topology pass, so a 15 Hz Minimum profile publishes finished work promptly without repeating admission bookkeeping.
+2. Move multiplayer transport polling behind a bounded wake or event path.
+3. Broaden lighting-packet caching to mixed configurations (revision-key static components; isolate cloud/water/exposure updates).
+4. Add compact lighting-on snapshot variants (`all dark`/`all bright`) so uniform lit chunks avoid the padded copy while voxel lighting remains enabled.
+5. A fused far-section extract+mesh path that samples the generator directly into one pooled dense buffer (bypassing the per-section RLE brick build), behind a byte-parity oracle against the current `Section::extract` → `build_section_mesh` path.
+6. Batch terrain-noise evaluation across columns. SIMD or reassociation is allowed only if an authoritative byte-parity test proves it does not alter generated blocks.
+7. Cache name-tag text/measurement and share peer names (`Arc<str>`) for the models/tags-on multiplayer case.
+8. Budget mod edge bursts: a time budget with an ordered continuation would bound third-party hook cost without losing or reordering actions.
+9. Rekey or reprioritize accepted far jobs during continuous high-speed travel (teleports and ladder changes already purge; steady traversal can still leave valid-but-low-value jobs queued).
+
+## Correctness constraints
+
+- **World generation is authoritative.** For a fixed worldgen version, seed, registry, and coordinate, generated blocks must remain identical. Caching may remove duplicate evaluation but must not change hash streams, sample coordinates, floating-point ordering, placement precedence, save replay, or server/client agreement.
+- **LOD remains a consecutive base-2 hierarchy.** Detail is 2–6, levels are 1–8, coarsest detail never exceeds 9, near chunks own the clipped inner volume, and covering logic may show the selected level or its one-level-finer hysteresis fallback — never a hole. Live changes must free each GPU handle exactly once and discard stale asynchronous results (the epoch/token machinery).
+- **Optimization gates cannot change core playability.** Minimum must retain input, camera, collision, mining, authoritative edits, readable terrain, console access, and an explicit clean-exit save. Placement/inventory hooks are recoverable by enabling `mod_logic`, `mod_hud`, and a master HUD mode that exposes mod UI; disabled optional systems must perform no hidden periodic work.
+- **Measure the optimized program, not the profiler.** Headline runs are release, uncapped, unsynced, fixed-scene, and uninstrumented. Golden/worldgen/state-machine tests establish correctness; they do not substitute for a benchmark, and no FPS target is considered met until a reproducible run records it.

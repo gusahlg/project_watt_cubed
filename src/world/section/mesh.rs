@@ -1,5 +1,4 @@
-//! Stack mesher: turns a [`Section`]'s brick stacks straight into GPU-ready
-//! [`MeshData`] — no intermediate voxel grid.
+//! Section mesher: turns a section's cells into GPU-ready [`MeshData`].
 //!
 //! Each solid run emits up to six faces. Vertical faces split where column heights differ
 //! (so overhangs render correctly, unlike a heightmap-only approach). Opacity rules: opaque
@@ -9,16 +8,32 @@
 //! Section borders (edge columns) overdraw as air with an inward micro-offset to prevent
 //! z-fighting with adjacent sections at different detail levels.
 //!
+//! The mesher reads a DENSE column-major quadrant grid ([`DenseQuad`]): every
+//! neighbour/AO probe is one O(1) indexed load, where the old run-list walk
+//! paid an O(runs) linear scan per probe (~14 probes × 24k face positions per
+//! 16³ block adds up). The grid has two producers sharing one pooled
+//! worker-local buffer:
+//! - [`build_section_mesh`] decodes a stored [`Section`]'s brick stacks — the
+//!   reference path, kept as the byte-parity oracle;
+//! - [`extract_section_mesh`] samples the generator (and folds edits) straight
+//!   into the grid — the production worker path, which never builds the RLE
+//!   brick storage only to decode it again.
+//!
 //! Output: a 2×2 grid of 16³-cell blocks per section, only for the vertical range occupied
 //! by solid geometry (sky/deep space cost nothing). Per-corner AO samples neighbour-column
 //! occupancy within the quadrant (quadrant-border corners see no occluder, so read
 //! unoccluded); light is not baked — every vertex takes neutral daylight (full sky, no
 //! blocklight) so coarse tiles track day/night.
+use std::cell::RefCell;
+
 use glam::UVec3;
 use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
 
+use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{BrickStack, DOMAIN_H, SECTION_N, Section};
+use super::{BRICK_DIM, ChunkCoord, DOMAIN_H, SECTION_N, SectionPos};
+#[cfg(test)]
+use super::{BrickStack, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
 
 /// One block's mesh plus its origin in cells within the section. Only non-empty blocks appear.
@@ -31,14 +46,28 @@ const QUAD_N: usize = SECTION_N / 2;
 const BLOCKS_XZ: i32 = SECTION_N as i32 / BLOCK;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
 
-/// One solid-or-air run of a column expressed in CELL coordinates (`[lo, hi)`,
-/// bottom-up), with its block. Air runs are kept so a neighbour lookup over the
-/// whole stack is a plain scan.
-#[derive(Clone, Copy)]
-struct CellRun {
-    lo: i32,
-    hi: i32,
-    block: BlockId,
+// One dense quadrant buffer per worker thread, reused across the four
+// quadrants of every job. Born and dropped on the same thread (unlike the
+// main-thread-captured mesh snapshots), so a lock-free thread-local is right.
+thread_local! {
+    static DENSE_QUAD: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One quadrant's cells as a dense column-major grid: `QUAD_N × QUAD_N`
+/// columns of `n_cells` cells each. Column-major keeps a column's vertical
+/// neighbours adjacent — the mesher's most frequent probe direction.
+struct DenseQuad<'a> {
+    cells: &'a [BlockId],
+    n_cells: i32,
+}
+
+impl DenseQuad<'_> {
+    /// The cell at quadrant-local `(ix, iz, y)`; every coordinate must be in
+    /// range (callers bound-check against the quadrant/domain first).
+    #[inline]
+    fn at(&self, ix: i32, iz: i32, y: i32) -> BlockId {
+        self.cells[(ix as usize + iz as usize * QUAD_N) * self.n_cells as usize + y as usize]
+    }
 }
 
 /// Merge key: block, micro, and AO must all match — an AO gradient must never
@@ -123,65 +152,38 @@ const DIRS: [Dir; 6] = [
 /// Chunk mesher's cull rule: opaque or same-block faces hide.
 #[inline]
 fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
-    tables.opaque[nbr.0 as usize] || nbr == my
-}
-
-/// Decode one quadrant-local column (ix, iz in 0..16) into bottom-up CellRuns
-/// tiling `[0, n_cells)` over the quadrant's [`BrickStack`].
-fn column_cells(stack: &BrickStack, ix: usize, iz: usize) -> Vec<CellRun> {
-    let mut runs = Vec::new();
-    let mut lo = 0i32;
-    for run in stack.column_runs(ix, iz) {
-        let hi = lo + run.count;
-        runs.push(CellRun { lo, hi, block: run.block });
-        lo = hi;
-    }
-    runs
-}
-
-/// The block at cell `cy` of a column (assumed in `[0, n_cells)`).
-#[inline]
-fn cell_at(runs: &[CellRun], cy: i32) -> BlockId {
-    for r in runs {
-        if cy >= r.lo && cy < r.hi {
-            return r.block;
-        }
-    }
-    AIR
+    tables.opaque(nbr) || nbr == my
 }
 
 /// Opaque-occupancy probe for AO sampling: below-floor reads solid (matches the
 /// cull rule's "solid ground"), above-ceiling and outside the quadrant read air
 /// (matches the border-overdraw convention) — never data this quadrant lacks.
-fn occluder(cols: &[Vec<CellRun>], n_cells: i32, tables: &HotTables, p: [i32; 3]) -> bool {
+fn occluder(quad: &DenseQuad<'_>, tables: &HotTables, p: [i32; 3]) -> bool {
     let [px, py, pz] = p;
     if py < 0 {
         return true;
     }
-    if py >= n_cells || px < 0 || px >= QUAD_N as i32 || pz < 0 || pz >= QUAD_N as i32 {
+    if py >= quad.n_cells || px < 0 || px >= QUAD_N as i32 || pz < 0 || pz >= QUAD_N as i32 {
         return false;
     }
-    let id = cell_at(&cols[px as usize + pz as usize * QUAD_N], py);
-    tables.opaque[id.0 as usize]
+    tables.opaque(quad.at(px, pz, py))
 }
 
 /// Sample a face: cull if covered by neighbor; overdraw section edges as air.
 /// Per-corner AO reads the two in-plane occluders plus the diagonal, in the
 /// layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
-/// uses, just backed by column runs instead of a padded voxel grid.
+/// uses, just backed by the dense quadrant grid instead of a padded voxel grid.
 fn face_sample(
-    cols: &[Vec<CellRun>],
-    n_cells: i32,
+    quad: &DenseQuad<'_>,
     tables: &HotTables,
     dir: &Dir,
     s: [i32; 3],
 ) -> Option<FaceSample> {
     let [sx, sy, sz] = s;
-    if sy < 0 || sy >= n_cells {
+    if sy < 0 || sy >= quad.n_cells {
         return None; // above the ceiling in the top block: no cell here
     }
-    let col = &cols[sx as usize + sz as usize * QUAD_N];
-    let me = cell_at(col, sy);
+    let me = quad.at(sx, sz, sy);
     if me == AIR {
         return None;
     }
@@ -191,17 +193,17 @@ fn face_sample(
     let nbr = if dir.n_axis == 1 {
         if ny < 0 {
             return None; // below the floor: solid ground, never a silhouette
-        } else if ny >= n_cells {
+        } else if ny >= quad.n_cells {
             AIR // above the ceiling: open sky
         } else {
-            cell_at(col, ny)
+            quad.at(sx, sz, ny)
         }
     } else if nx < 0 || nx >= QUAD_N as i32 || nz < 0 || nz >= QUAD_N as i32 {
         // Quadrant border: overdraw as air, nudge inward.
         micro = dir.micro;
         AIR
     } else {
-        cell_at(&cols[nx as usize + nz as usize * QUAD_N], ny)
+        quad.at(nx, nz, ny)
     };
     if covered(me, nbr, tables) {
         return None;
@@ -211,7 +213,7 @@ fn face_sample(
         let mut p = o;
         p[dir.u_axis] += eu;
         p[dir.v_axis] += ev;
-        occluder(cols, n_cells, tables, p)
+        occluder(quad, tables, p)
     };
     let ao = std::array::from_fn(|i| {
         let eu = if dir.corners[i][1] > 0 { 1 } else { -1 };
@@ -222,7 +224,12 @@ fn face_sample(
 }
 
 /// Greedy-mesh one block: merge adjacent quads with identical properties.
-fn build_block(cols: &[Vec<CellRun>], n_cells: i32, base: [i32; 3], tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+fn build_block(
+    quad: &DenseQuad<'_>,
+    base: [i32; 3],
+    tables: &HotTables,
+    out: &mut ChunkMeshData,
+) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -236,7 +243,7 @@ fn build_block(cols: &[Vec<CellRun>], n_cells: i32, base: [i32; 3], tables: &Hot
                     local[dir.u_axis] = u;
                     local[dir.v_axis] = v;
                     let s = [base[0] + local[0], base[1] + local[1], base[2] + local[2]];
-                    let cell = face_sample(cols, n_cells, tables, dir, s);
+                    let cell = face_sample(quad, tables, dir, s);
                     mask[(u + v * BLOCK) as usize] = cell;
                     any |= cell.is_some();
                 }
@@ -296,7 +303,7 @@ fn emit(
     origin[dir.v_axis] = v0 as u32;
     let layer = sample.block.0;
     // Route water to opaque pass (no animated texturing at LOD range).
-    let is_water = tables.water[layer as usize];
+    let is_water = tables.water(BlockId(layer));
     let pass = if is_water { Pass::Opaque } else { tables.layer[layer as usize] };
     let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
         let cr = dir.corners[i];
@@ -332,29 +339,109 @@ fn emit(
 /// neighbour were air, with the inward micro-nudge — because the abutting quadrant
 /// may be drawn at a different detail or not at all. Deterministic: the same
 /// section yields bit-identical output per quadrant (fixed iteration order,
-/// run-based sampling with no floats).
+/// dense-grid sampling with no floats).
+///
+/// This is the REFERENCE path (stored bricks → dense grid → mesh); production
+/// far jobs take [`extract_section_mesh`], which the parity test pins against
+/// this one byte for byte.
+#[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables) -> [SectionMeshData; 4] {
-    let n_cells = DOMAIN_H / section.pos().cell_size();
-    std::array::from_fn(|q| build_quadrant(section, tables, q as u8, n_cells))
+    let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
+    mesh_section_with(n_cells, tables, |dense, q| {
+        fill_from_stack(dense, n_cells, &section.quadrants[q as usize])
+    })
+}
+
+/// Extract AND mesh a section in one pass: sample the generator (folding the
+/// edit overlay) directly into the dense quadrant grid, then mesh it — the
+/// production worker path. Skips the whole RLE brick round trip
+/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
+/// which existed only because the temporary [`Section`] was built and dropped.
+pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+) -> [SectionMeshData; 4] {
+    let cell = pos.cell_size();
+    let n_cells = (DOMAIN_H / cell) as usize;
+    let ys = super::cell_centers(pos);
+    let flat = super::flatten_edits(edits);
+    mesh_section_with(n_cells, tables, |dense, q| {
+        let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
+        for lz in 0..BRICK_DIM {
+            for lx in 0..BRICK_DIM {
+                let (ix, iz) = (qx * BRICK_DIM + lx, qz * BRICK_DIM + lz);
+                let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
+                let (wx, wz) = (fx + cell / 2, fz + cell / 2);
+                // The mesher's column-major layout doubles as the
+                // generator's output slice: no per-column scratch at all.
+                let column = &mut dense[(lx + lz * QUAD_N) * n_cells..][..n_cells];
+                r#gen.lod_column(wx, wz, &ys, column);
+                super::apply_edits(column, &flat, fx, fz, cell);
+            }
+        }
+    })
+}
+
+/// The one section-mesh driver both producers share: for each quadrant, `fill`
+/// overwrites this worker's pooled dense grid (contents unspecified on entry —
+/// every cell must be written), then the mesher runs over it. Producers differ
+/// ONLY in how the grid is filled (stored bricks vs live generator), so their
+/// meshing can never diverge.
+fn mesh_section_with(
+    n_cells: usize,
+    tables: &HotTables,
+    mut fill: impl FnMut(&mut [BlockId], u8),
+) -> [SectionMeshData; 4] {
+    DENSE_QUAD.with_borrow_mut(|dense| {
+        dense.resize(QUAD_N * QUAD_N * n_cells, AIR);
+        std::array::from_fn(|q| {
+            fill(dense, q as u8);
+            mesh_quadrant(&DenseQuad { cells: dense, n_cells: n_cells as i32 }, tables, q as u8)
+        })
+    })
+}
+
+/// Decode one quadrant's [`BrickStack`] into the dense grid (column-major).
+/// Stack runs can extend past `n_cells` at the coarse rings (bricks pad to 16
+/// cells with AIR); the column slice bound clips them exactly as the old
+/// `n_cells`-bounded reader ignored them.
+#[cfg(test)]
+fn fill_from_stack(dense: &mut [BlockId], n_cells: usize, stack: &BrickStack) {
+    for iz in 0..QUAD_N {
+        for ix in 0..QUAD_N {
+            let column = &mut dense[(ix + iz * QUAD_N) * n_cells..][..n_cells];
+            let mut at = 0usize;
+            for run in stack.column_runs(ix, iz) {
+                let end = (at + run.count as usize).min(n_cells);
+                column[at..end].fill(run.block);
+                at = end;
+                if at == n_cells {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Mesh one quadrant `q` (its 16×16 column sub-grid) into section-space block
 /// origins. Block origins are in CELLS relative to the section min-corner, so the
 /// caller positions them the same way regardless of quadrant.
-fn build_quadrant(section: &Section, tables: &HotTables, q: u8, n_cells: i32) -> SectionMeshData {
+fn mesh_quadrant(quad: &DenseQuad<'_>, tables: &HotTables, q: u8) -> SectionMeshData {
     let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
-    let stack = &section.quadrants[q as usize];
-    let cols: Vec<Vec<CellRun>> = (0..QUAD_N * QUAD_N).map(|i| column_cells(stack, i % QUAD_N, i / QUAD_N)).collect();
+    let n_cells = quad.n_cells;
 
-    // The vertical slab that actually holds solid runs — sky and deep space are
-    // skipped entirely, so K is small for thin terrain.
+    // The vertical slab that actually holds solid cells — sky and deep space
+    // are skipped entirely, so the block count is small for thin terrain.
     let (mut ylo, mut yhi) = (n_cells, 0);
-    for col in &cols {
-        for r in col {
-            if r.block != AIR {
-                ylo = ylo.min(r.lo);
-                yhi = yhi.max(r.hi);
-            }
+    for col in quad.cells.chunks_exact(n_cells as usize) {
+        // Scan from both ends: terrain columns are solid-below/air-above, so
+        // each end test stops at the first hit instead of walking the middle.
+        if let Some(first) = col.iter().position(|&id| id != AIR) {
+            let last = col.iter().rposition(|&id| id != AIR).expect("some cell is non-air");
+            ylo = ylo.min(first as i32);
+            yhi = yhi.max(last as i32 + 1);
         }
     }
     let mut result = SectionMeshData::new();
@@ -367,7 +454,7 @@ fn build_quadrant(section: &Section, tables: &HotTables, q: u8, n_cells: i32) ->
     for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
         let base = [0, by * BLOCK, 0];
         let mut data = new_chunk_mesh_data();
-        if build_block(&cols, n_cells, base, tables, &mut data) {
+        if build_block(quad, base, tables, &mut data) {
             result.push((UVec3::new(ox, (by * BLOCK) as u32, oz), data));
         }
     }
@@ -577,7 +664,7 @@ mod tests {
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
         let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
-        let is_water_quad = |q: &[MeshVertex]| tables.water[q[0].layer() as usize];
+        let is_water_quad = |q: &[MeshVertex]| tables.water(BlockId(q[0].layer()));
         let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(q));
         assert!(opaque_water, "water surface meshes into the opaque pass");
         assert!(!all_quads(&mesh).any(|(_, _, q)| q[0].is_water()), "LOD water clears the water bit");
@@ -649,6 +736,81 @@ mod tests {
         let mesh = build_section_mesh(&sec, &tables);
         let top_quads = all_quads(&mesh).filter(|(_, _, q)| q[0].normal() == Normal::PosY).count();
         assert!(top_quads > 100, "checkerboard tops must not merge (got {top_quads})");
+    }
+
+    /// THE parity oracle for the fused production path: for every generator
+    /// shape, detail level, and edit pattern, `extract_section_mesh` (generator
+    /// → dense grid → mesh) must be byte-identical to the reference storage
+    /// path (generator → RLE bricks → dense grid → mesh). Any divergence means
+    /// the two extraction paths disagree on cell values — a hole or seam.
+    #[test]
+    fn fused_extract_mesh_matches_the_storage_path_exactly() {
+        let (_r, tables, b) = setup();
+        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+            m.iter()
+                .flatten()
+                .flat_map(|(o, d)| {
+                    Pass::ALL.into_iter().map(move |p| {
+                        (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
+                    })
+                })
+                .collect()
+        };
+
+        // Edits inside the finest section footprint, exercising every
+        // apply_edits branch: a centre-sample hit (air AND solid), off-centre
+        // solid edits contending for one coarse cell, and an out-of-footprint
+        // edit that must be ignored identically.
+        let cs = crate::world::chunk::CHUNK_SIZE;
+        let edit_chunk = crate::coord::ChunkCoord::new(0, 6, 0); // world y 96..112
+        let far_chunk = crate::coord::ChunkCoord::new(50, 6, 0);
+        let idx = |x: usize, y: usize, z: usize| x + z * cs + y * cs * cs;
+        let edits = vec![
+            (
+                edit_chunk,
+                vec![
+                    (idx(2, 6, 2), b.stone), // centre of cell (0,?,0) at CELL=4: (2, 96+6=102?, 2)
+                    (idx(3, 1, 5), b.dirt),  // off-centre solid
+                    (idx(3, 2, 5), AIR),     // off-centre air (must not clear)
+                    (idx(2, 10, 2), AIR),    // another candidate centre hit
+                    (idx(7, 3, 9), b.sand),
+                ],
+            ),
+            (far_chunk, vec![(idx(1, 1, 1), b.stone)]),
+        ];
+
+        use crate::ident::Detail;
+        let k = FINEST_DETAIL.0;
+        for detail in [FINEST_DETAIL, Detail(k + 2), Detail(k + 4), Detail(k + 7)] {
+            let pos = SectionPos { detail, x: 0, z: 0 };
+            for (label, r#gen) in [
+                ("flat", terrain_gen(&b, 200, 0, None)),
+                ("water", terrain_gen(&b, 40, 80, None)),
+                ("shelf", terrain_gen(&b, 200, 0, Some((300, 320)))),
+            ] {
+                for edit_set in [&[][..], &edits[..]] {
+                    let stored =
+                        Section::extract(pos, &r#gen, edit_set, voxel_engine::Rev::START);
+                    let reference = build_section_mesh(&stored, &tables);
+                    let fused = extract_section_mesh(pos, &r#gen, edit_set, &tables);
+                    assert_eq!(
+                        flatten(&reference),
+                        flatten(&fused),
+                        "fused path diverged: {label} at {detail:?} (edits: {})",
+                        !edit_set.is_empty(),
+                    );
+                }
+            }
+            // The real terrain generator, off-origin so warps/rivers vary.
+            let hills = SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
+            let pos = SectionPos { detail, x: 3, z: -2 };
+            let stored = Section::extract(pos, &hills, &edits, voxel_engine::Rev::START);
+            assert_eq!(
+                flatten(&build_section_mesh(&stored, &tables)),
+                flatten(&extract_section_mesh(pos, &hills, &edits, &tables)),
+                "fused path diverged on SineHills at {detail:?}",
+            );
+        }
     }
 
     #[test]

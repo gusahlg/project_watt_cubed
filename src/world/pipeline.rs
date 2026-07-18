@@ -33,7 +33,7 @@ use super::chunk::Chunk;
 use super::generation::{SineHills, TerrainGenerator};
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
-use super::section::{self, Section, SectionMeshData, SectionPos};
+use super::section::{self, SectionMeshData, SectionPos};
 use crate::block::registry::{BlockId, HotTables};
 
 /// Mesh job snapshot: pure mesher state (light pre-settled, no live chunk map sharing).
@@ -46,7 +46,9 @@ pub struct ChunkSnapshot {
     pub uniform: Option<BlockId>,
     /// The settled light shell (this chunk's grid + its neighbours'), sampled per
     /// vertex for smooth light across interior, border, and diagonal cells.
-    pub light: PaddedLight,
+    /// `None` is the allocation-free constant-full-light path used when voxel
+    /// lighting is disabled — the 18³ shell is never captured at all.
+    pub light: Option<PaddedLight>,
     /// The hot tables (solid/opaque/emission), shared by refcount. Palette growth
     /// swaps the world's `Arc` for a new one while in-flight jobs keep the old —
     /// harmless because the palette is append-only and every result is
@@ -81,7 +83,7 @@ pub(in crate::world) enum Job {
     GenerateColumn {
         col: (i32, i32),
         cy: RangeInclusive<i32>,
-        generator: SineHills,
+        generator: Arc<SineHills>,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
     },
     /// Greedy-mesh a snapshot taken at chunk revision `rev`.
@@ -97,10 +99,15 @@ pub(in crate::world) enum Job {
         snapshot: Box<LightSnapshot>,
     },
     /// Extract and mesh a section's columns at its detail level. Pure computation
-    /// with no live snapshots or neighbor lookups.
+    /// with no live snapshots or neighbor lookups. `epoch`/`token` are the
+    /// asynchronous claim identity: a result from a retired ladder epoch, or
+    /// from a claim replaced after unload/re-admission, must never capture the
+    /// live section at the same position.
     Section {
         pos: SectionPos,
-        generator: SineHills,
+        epoch: u32,
+        token: ClaimToken,
+        generator: Arc<SineHills>,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
         tables: Arc<HotTables>,
     },
@@ -110,6 +117,15 @@ pub(in crate::world) enum Job {
     Panic(Box<JobKey>),
 }
 
+/// The unique identity of one asynchronous section claim, minted by the
+/// section lane's submit (a wrapping counter on `World`). A result,
+/// cancellation, or failure presents its token back; anything that doesn't
+/// match the live `Meshing` claim belongs to a superseded job and must not
+/// touch the replacement. A plain `u64` would let any counter impersonate a
+/// claim — the newtype confines minting to the one owner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ClaimToken(pub(in crate::world) u64);
+
 /// The claim a job holds while in flight, extractable from the job itself.
 /// A panicking job returns this in [`Done::Failed`] so the main thread can
 /// release the EXACT claim instead of leaving it stranded forever.
@@ -118,7 +134,7 @@ pub(crate) enum JobKey {
     Column { col: (i32, i32), cy: RangeInclusive<i32> },
     Mesh { coord: Coord },
     Light { coord: Coord },
-    Section { pos: SectionPos },
+    Section { pos: SectionPos, epoch: u32, token: ClaimToken },
 }
 
 impl JobKey {
@@ -128,7 +144,9 @@ impl JobKey {
             Job::GenerateColumn { col, cy, .. } => JobKey::Column { col: *col, cy: cy.clone() },
             Job::Mesh { coord, .. } => JobKey::Mesh { coord: *coord },
             Job::Light { coord, .. } => JobKey::Light { coord: *coord },
-            Job::Section { pos, .. } => JobKey::Section { pos: *pos },
+            Job::Section { pos, epoch, token, .. } => {
+                JobKey::Section { pos: *pos, epoch: *epoch, token: *token }
+            }
             #[cfg(test)]
             Job::Panic(key) => (**key).clone(),
         }
@@ -144,9 +162,9 @@ pub(in crate::world) enum Done {
     /// six index buckets), and it dominated the whole enum — every channel
     /// send/recv and match memcpy'd it. One box per mesh job is noise next to
     /// the meshing itself; the Box rides untouched into `upload_queue`.
-    Mesh { coord: Coord, rev: u32, data: Box<ChunkMeshData> },
+    Mesh { coord: Coord, rev: u32, data: MeshOutput },
     Light { coord: Coord, epoch: u32, grid: LightGrid },
-    Section { pos: SectionPos, meshes: [SectionMeshData; 4] },
+    Section { pos: SectionPos, epoch: u32, token: ClaimToken, meshes: [SectionMeshData; 4] },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
     /// and apply the bounded retry/quarantine policy — without this, a single
     /// bad job left `generating`/`light_inflight`/`building`/`Meshing` claimed
@@ -163,6 +181,56 @@ pub(in crate::world) enum Done {
 // `Section` mesh array, not an inlined per-chunk mesh (see structural
 // opportunity #8 — this was 544 B with `ChunkMeshData` inline).
 const _: () = assert!(size_of::<Done>() <= 128);
+
+/// Cross-thread pool for greedy-mesh output. Geometry vectors retain their
+/// capacities after upload/stale rejection, so traversal refills them without
+/// allocating vertex and index buckets from scratch for every job.
+// The box is intentional: besides being recycled with the geometry, it keeps
+// `Done::Mesh` pointer-sized instead of inflating every result-channel message.
+#[allow(clippy::vec_box)]
+static MESH_OUTPUT_POOL: Mutex<Vec<Box<ChunkMeshData>>> = Mutex::new(Vec::new());
+const MESH_OUTPUT_POOL_CAP: usize = 32;
+
+/// A pooled `Box<ChunkMeshData>`: taken from [`MESH_OUTPUT_POOL`] at job start
+/// (workers), returned on drop wherever the result dies (upload or stale
+/// rejection on the main thread) — completing the cross-thread round trip.
+pub(in crate::world) struct MeshOutput(Option<Box<ChunkMeshData>>);
+
+impl MeshOutput {
+    pub(in crate::world) fn new() -> Self {
+        let data = MESH_OUTPUT_POOL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+            .unwrap_or_else(|| Box::new(new_chunk_mesh_data()));
+        Self(Some(data))
+    }
+}
+
+impl std::ops::Deref for MeshOutput {
+    type Target = ChunkMeshData;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("live pooled mesh output")
+    }
+}
+
+impl std::ops::DerefMut for MeshOutput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_deref_mut().expect("live pooled mesh output")
+    }
+}
+
+impl Drop for MeshOutput {
+    fn drop(&mut self) {
+        let Some(data) = self.0.take() else { return };
+        let mut pool =
+            MESH_OUTPUT_POOL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.len() < MESH_OUTPUT_POOL_CAP {
+            pool.push(data);
+        }
+    }
+}
 
 /// A job's scheduling class. Derived from its kind — near work outranks far LOD
 /// work — so it never rides along on the wire as a redundant field.
@@ -332,6 +400,12 @@ impl FarQueue {
         Some(self.entries.swap_remove(idx).1)
     }
 
+    /// Drop every queued entry, returning the exact claims so the caller can
+    /// release them (a claimed key is owed exactly one resolution).
+    fn clear_claims(&mut self) -> Vec<JobKey> {
+        self.entries.drain(..).map(|(_, job)| JobKey::of(&job)).collect()
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -367,6 +441,10 @@ impl JobQueue {
             }
             Priority::Far => self.far.push(job, 0),
         }
+    }
+
+    fn clear_far(&mut self) -> Vec<JobKey> {
+        self.far.clear_claims()
     }
 
     /// Admit a far job keyed by `dist2`, or REJECT it at [`FAR_QUEUE_CAP`]
@@ -506,6 +584,15 @@ impl Workers {
     pub(in crate::world) fn try_recv(&self) -> Option<Done> {
         self.results.try_recv().ok()
     }
+
+    /// Drop queued far-section work and return every exact claim. Callers
+    /// either cancel those claims in place (camera discontinuity) or retire the
+    /// whole section lane (configuration change). A worker already executing a
+    /// job is unaffected and remains protected by epoch/token validation.
+    pub(in crate::world) fn clear_far(&self) -> Vec<JobKey> {
+        let (lock, _) = &*self.gate;
+        lock.lock().unwrap_or_else(|p| p.into_inner()).clear_far()
+    }
 }
 
 impl Drop for Workers {
@@ -565,45 +652,34 @@ fn worker_loop(gate: &(Mutex<JobQueue>, Condvar), view: &ViewGate, done: &Sender
             }
         }
         let Some(job) = job else { continue };
-        let meter = job_meter(&job);
-        let label = job_label(&job);
+        // Headline runs keep profiling disabled: avoid the per-job label
+        // allocation and worker clock reads in that mode. The claim key still
+        // identifies a panicking job in the report.
+        let profile_start =
+            voxel_engine::profile::is_enabled().then(|| (job_meter(&job), std::time::Instant::now()));
         let key = JobKey::of(&job);
-        let start = std::time::Instant::now();
         // Guard the job body: a panic in `run` (bad generator sample, light/mesh
         // index, edit replay) used to unwind straight out of `worker_loop` and
         // KILL this thread — as workers died one by one, the whole pool went
         // silent and every streaming counter froze (the entry STALL). Catching it
         // keeps the thread alive, and `Done::Failed` hands the job's claim back
         // to the main thread so `fail_job` can release it and retry/quarantine —
-        // a claimed key is owed exactly one `Done`, panic or not. The label
+        // a claimed key is owed exactly one `Done`, panic or not. The key
         // names the culprit so it stops being invisible.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job)));
-        voxel_engine::profile::add(meter, start.elapsed());
+        if let Some((meter, start)) = profile_start {
+            voxel_engine::profile::add(meter, start.elapsed());
+        }
         let produced = match result {
             Ok(produced) => produced,
             Err(_) => {
-                eprintln!("worker: job PANICKED (thread survives, claim released): {label}");
+                eprintln!("worker: job PANICKED (thread survives, claim released): {key:?}");
                 Done::Failed(Box::new(key))
             }
         };
         if done.send(produced).is_err() {
             return; // result channel closed mid-shutdown: stop early
         }
-    }
-}
-
-/// A short, allocation-cheap identifier for a job, captured before `run`
-/// consumes it — so a panic report names the exact culprit (kind + coord).
-fn job_label(job: &Job) -> String {
-    match job {
-        Job::GenerateColumn { col: (cx, cz), cy, .. } => {
-            format!("GenerateColumn col=({cx},{cz}) cy={}..={}", cy.start(), cy.end())
-        }
-        Job::Mesh { coord, rev, .. } => format!("Mesh {coord:?} rev={rev}"),
-        Job::Light { coord, epoch, .. } => format!("Light {coord:?} epoch={epoch}"),
-        Job::Section { pos, .. } => format!("Section {pos:?}"),
-        #[cfg(test)]
-        Job::Panic(key) => format!("Panic {key:?}"),
     }
 }
 
@@ -642,14 +718,22 @@ fn run(job: Job) -> Done {
         } => {
             // Pure meshing: light was settled on the main thread and travels in
             // the snapshot as a ready shell, so the worker only greedy-meshes.
-            let mut data = Box::new(new_chunk_mesh_data());
-            mesh::build_chunk_mesh(
-                &snapshot.padded,
-                snapshot.uniform,
-                &snapshot.tables,
-                &snapshot.light,
-                &mut data,
-            );
+            let mut data = MeshOutput::new();
+            match &snapshot.light {
+                Some(light) => mesh::build_chunk_mesh(
+                    &snapshot.padded,
+                    snapshot.uniform,
+                    &snapshot.tables,
+                    light,
+                    &mut data,
+                ),
+                None => mesh::build_chunk_mesh_unlit(
+                    &snapshot.padded,
+                    snapshot.uniform,
+                    &snapshot.tables,
+                    &mut data,
+                ),
+            }
             Done::Mesh { coord, rev, data }
         }
         Job::Light { coord, epoch, snapshot } => {
@@ -666,11 +750,14 @@ fn run(job: Job) -> Done {
             );
             Done::Light { coord, epoch, grid }
         }
-        Job::Section { pos, generator, edits, tables } => {
-            // Pure CPU on owned data; reuses sync path.
-            let sec = Section::extract(pos, &generator, &edits, voxel_engine::Rev::START);
-            let meshes = section::build_section_mesh(&sec, &tables);
-            Done::Section { pos, meshes }
+        Job::Section { pos, epoch, token, generator, edits, tables } => {
+            // Fused extract+mesh on owned data: the generator samples straight
+            // into the dense quadrant grid — no RLE brick storage is built for
+            // a result whose Section would be dropped after meshing anyway.
+            // Pinned byte-identical to the storage path by the parity test in
+            // `section::mesh`.
+            let meshes = section::extract_section_mesh(pos, &*generator, &edits, &tables);
+            Done::Section { pos, epoch, token, meshes }
         }
         #[cfg(test)]
         Job::Panic(key) => panic!("injected worker panic for {key:?}"),
@@ -685,15 +772,17 @@ mod tests {
     use voxel_engine::Pass;
 
     /// Mirrors `World::new`'s generator construction.
-    fn generator(seed: i64) -> SineHills {
-        SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
+    fn generator(seed: i64) -> Arc<SineHills> {
+        Arc::new(SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed))
     }
 
     /// Create a far section job tagged by id for scheduler tests.
-    fn section_job(terrain: &SineHills, id: i32) -> Job {
+    fn section_job(terrain: &Arc<SineHills>, id: i32) -> Job {
         Job::Section {
             pos: SectionPos { detail: voxel_engine::Detail(2), x: id, z: 0 },
-            generator: terrain.clone(),
+            epoch: 0,
+            token: ClaimToken(id as u64),
+            generator: Arc::clone(terrain),
             edits: Vec::new(),
             tables: Arc::new(BlockRegistry::with_builtins().hot_tables()),
         }
@@ -714,7 +803,7 @@ mod tests {
             (Chunk::index(1, 3, 2), AIR),         // dig a hole
             (Chunk::index(5, 14, 5), BlockId(1)), // place high in the chunk
         ];
-        let mut expected = Chunk::new(coord.x, coord.y, coord.z, &generator);
+        let mut expected = Chunk::new(coord.x, coord.y, coord.z, &*generator);
         for &(index, id) in &edits {
             expected.set_index(index, id);
         }
@@ -783,7 +872,7 @@ mod tests {
         let snapshot = ChunkSnapshot {
             padded: Padded::capture(at),
             uniform: chunk.uniform(),
-            light: PaddedLight::full(),
+            light: Some(PaddedLight::full()),
             tables: Arc::clone(&tables),
         };
         let workers = Workers::spawn(1);
@@ -945,7 +1034,7 @@ mod tests {
         let snapshot = || ChunkSnapshot {
             padded: Padded::capture(at),
             uniform: None,
-            light: PaddedLight::full(),
+            light: Some(PaddedLight::full()),
             tables: Arc::clone(&tables),
         };
 
@@ -982,7 +1071,7 @@ mod tests {
             JobKey::Column { col: (3, -2), cy: 0..=2 },
             JobKey::Mesh { coord: Coord::new(1, 2, 3) },
             JobKey::Light { coord: Coord::new(-1, 0, 1) },
-            JobKey::Section { pos: SectionPos { detail: voxel_engine::Detail(2), x: 5, z: -5 } },
+            JobKey::Section { pos: SectionPos { detail: voxel_engine::Detail(2), x: 5, z: -5 }, epoch: 0, token: ClaimToken(0) },
         ];
         for key in keys.clone() {
             assert!(workers.submit(Job::Panic(Box::new(key))));

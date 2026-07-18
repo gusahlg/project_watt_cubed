@@ -8,7 +8,8 @@ use voxel_engine::{Engine, Vec2};
 
 use crate::input::bindings::Bindings;
 use crate::input::intent::{
-    Chord, EditKey, GameplayAxis, GameplayEvent, GameplayState, GlobalEvent, MenuEvent, Repeat,
+    Chord, EditKey, GameplayAxis, GameplayEvent, GameplayState, GlobalEvent, MenuEvent, Mods,
+    Repeat,
 };
 use crate::input::intent::Source;
 use voxel_engine::Key;
@@ -43,12 +44,19 @@ impl Timers {
 }
 
 /// Advance a repeat timer and report whether the event fires this frame.
-fn eval_event(chords: &[Chord], repeat: Option<Repeat>, timer: &mut f32, eng: &Engine, dt: f32) -> bool {
-    let edged = chords.iter().any(|c| c.edged(eng));
+fn eval_event(
+    chords: &[Chord],
+    repeat: Option<Repeat>,
+    timer: &mut f32,
+    eng: &Engine,
+    mods: Mods,
+    dt: f32,
+) -> bool {
+    let edged = chords.iter().any(|c| c.edged(eng, mods));
     let Some(rep) = repeat else {
         return edged;
     };
-    let held = chords.iter().any(|c| c.held(eng));
+    let held = chords.iter().any(|c| c.held(eng, mods));
     if !held {
         *timer = -1.0; // unprime
         return edged;
@@ -118,10 +126,31 @@ impl Router {
     /// Per-frame input observation: advances repeat timers and returns an
     /// immutable view of the current input state.
     pub fn frame<'e>(&'e mut self, engine: &'e Engine, dt: f32) -> FrameInput<'e> {
+        self.frame_filtered(engine, dt, true, true, true)
+    }
+
+    /// Gameplay variant that can structurally skip mod placement, mod UI, and
+    /// minimap physical probes independently — a disabled lane's chords are
+    /// never evaluated and its repeat timer is unprimed, so a held key cannot
+    /// autofire the instant the lane re-enables. Menus use [`frame`](Self::frame).
+    pub fn frame_filtered<'e>(
+        &'e mut self,
+        engine: &'e Engine,
+        dt: f32,
+        mod_logic: bool,
+        mod_ui: bool,
+        minimap: bool,
+    ) -> FrameInput<'e> {
+        // ONE modifier sample serves every chord this frame (the old
+        // per-chord probe re-read four keys dozens of times per frame).
+        let mods = Mods::current(engine);
         let mut global_fired = [false; GlobalEvent::COUNT];
         for e in GlobalEvent::ALL {
+            if !minimap && e == GlobalEvent::MinimapMode {
+                continue;
+            }
             global_fired[e as usize] =
-                self.bindings.global_event[e as usize].iter().any(|c| c.edged(engine));
+                self.bindings.global_event[e as usize].iter().any(|c| c.edged(engine, mods));
         }
 
         let mut gameplay_fired = [false; GameplayEvent::COUNT];
@@ -129,11 +158,21 @@ impl Router {
         match self.context {
             Context::Gameplay => {
                 for e in GameplayEvent::ALL {
+                    let disabled = match e {
+                        GameplayEvent::Place => !mod_logic,
+                        GameplayEvent::ToggleInventory | GameplayEvent::ToggleCrafting => !mod_ui,
+                        _ => false,
+                    };
+                    if disabled {
+                        self.timers.gameplay[e as usize] = -1.0;
+                        continue;
+                    }
                     gameplay_fired[e as usize] = eval_event(
                         &self.bindings.gameplay_event[e as usize],
                         e.repeat(),
                         &mut self.timers.gameplay[e as usize],
                         engine,
+                        mods,
                         dt,
                     );
                 }
@@ -145,6 +184,7 @@ impl Router {
                         e.repeat(),
                         &mut self.timers.menu[e as usize],
                         engine,
+                        mods,
                         dt,
                     );
                 }
@@ -157,6 +197,7 @@ impl Router {
             bindings: &self.bindings,
             context: self.context,
             captured: self.captured,
+            mods,
             global_fired,
             gameplay_fired,
             menu_fired,
@@ -176,6 +217,8 @@ pub struct FrameInput<'e> {
     bindings: &'e Bindings,
     context: Context,
     captured: bool,
+    /// The frame's one modifier sample, shared by every lazy chord query.
+    mods: Mods,
     global_fired: [bool; GlobalEvent::COUNT],
     gameplay_fired: [bool; GameplayEvent::COUNT],
     menu_fired: [bool; MenuEvent::COUNT],
@@ -249,7 +292,7 @@ impl Gameplay<'_> {
     /// Menu-style navigation for in-world overlays: reuses menu bindings
     /// without leaving gameplay context, edge-only (no repeat timers).
     pub fn overlay_nav(&self, e: MenuEvent) -> bool {
-        self.fi.bindings.menu_event[e as usize].iter().any(|c| c.edged(self.fi.eng))
+        self.fi.bindings.menu_event[e as usize].iter().any(|c| c.edged(self.fi.eng, self.fi.mods))
     }
 }
 

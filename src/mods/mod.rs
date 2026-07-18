@@ -180,6 +180,9 @@ pub struct ModContext<'a> {
     pub screen_h: i32,
     /// Keybind intents; `place` gated on mouse capture separately.
     pub place: bool,
+    /// Placement cell resolved from the exact frame that raised `place`.
+    /// Fixed-cadence replay may run after the player has moved or looked away.
+    pub place_target: Option<(i32, i32, i32)>,
     pub toggle_inventory: bool,
     pub toggle_crafting: bool,
     pub nav_up: bool,
@@ -214,7 +217,9 @@ pub trait Mod {
     /// NOT touched — those persist across worlds.
     fn reset(&mut self) {}
 
-    /// Per-frame logic while enabled. Runs after movement, before rendering.
+    /// Cadence-controlled logic while enabled (the game's `mod_hz`). Runs
+    /// after movement, before rendering; edge inputs accumulated between
+    /// ticks are replayed in order without loss.
     fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
         let _ = (eng, ctx);
     }

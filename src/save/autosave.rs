@@ -23,6 +23,12 @@ pub struct Autosaver {
     /// Generation handed to the writer thread, promoted on success.
     pending_gen: u64,
     in_flight: bool,
+    /// Spawned only for an actually-due periodic write. Clean worlds, disabled
+    /// autosave, and synchronous exit-only saves create no background thread.
+    writer: Option<Writer>,
+}
+
+struct Writer {
     tx: mpsc::Sender<(SlotId, Vec<u8>)>,
     rx: mpsc::Receiver<std::io::Result<()>>,
 }
@@ -35,8 +41,16 @@ pub enum Tick {
     Finished(Result<(), SaveError>),
 }
 
+fn writer_died() -> SaveError {
+    SaveError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "autosave thread died"))
+}
+
 impl Autosaver {
     pub fn new() -> Self {
+        Self { saved_gen: 0, pending_gen: 0, in_flight: false, writer: None }
+    }
+
+    fn spawn_writer() -> Writer {
         let (tx, job_rx) = mpsc::channel::<(SlotId, Vec<u8>)>();
         let (done_tx, rx) = mpsc::channel();
         thread::Builder::new()
@@ -48,7 +62,7 @@ impl Autosaver {
                 }
             })
             .expect("spawn autosave thread");
-        Self { saved_gen: 0, pending_gen: 0, in_flight: false, tx, rx }
+        Writer { tx, rx }
     }
 
     /// Note a freshly loaded/created world so its current state doesn't count
@@ -58,21 +72,29 @@ impl Autosaver {
     }
 
     /// Poll a completing background write. `Finished` once it lands; `Idle`
-    /// while a write is still in flight or none is. Call once per frame.
+    /// while a write is still in flight or none is. Call once per frame; with
+    /// no write in flight (the common case) this is a branch, no channel read.
     pub fn poll(&mut self) -> Tick {
-        if self.in_flight {
-            match self.rx.try_recv() {
-                Ok(result) => {
-                    self.in_flight = false;
-                    if result.is_ok() {
-                        self.saved_gen = self.pending_gen;
-                    }
-                    return Tick::Finished(result.map_err(SaveError::from));
+        if !self.in_flight {
+            return Tick::Idle;
+        }
+        let writer = self.writer.as_ref().expect("in-flight autosave must have a writer");
+        match writer.rx.try_recv() {
+            Ok(result) => {
+                self.in_flight = false;
+                if result.is_ok() {
+                    self.saved_gen = self.pending_gen;
                 }
-                Err(_) => return Tick::Idle,
+                Tick::Finished(result.map_err(SaveError::from))
+            }
+            Err(mpsc::TryRecvError::Empty) => Tick::Idle,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Drop the dead channel so a later due write spawns a fresh worker.
+                self.in_flight = false;
+                self.writer = None;
+                Tick::Finished(Err(writer_died()))
             }
         }
-        Tick::Idle
     }
 
     /// A new write is warranted iff the world advanced past what's saved and no
@@ -83,9 +105,10 @@ impl Autosaver {
         !self.in_flight && generation != self.saved_gen
     }
 
-    /// Encode on the caller's thread and hand the bytes to the writer. The
-    /// caller must have checked [`Self::wants_write`] and the scheduler's
-    /// interval gate first.
+    /// Encode on the caller's thread and hand the bytes to the writer,
+    /// creating the writer thread on the first actually-due write. The caller
+    /// must have checked [`Self::wants_write`] and the scheduler's interval
+    /// gate first.
     pub fn start(
         &mut self,
         id: &SlotId,
@@ -97,12 +120,22 @@ impl Autosaver {
             Err(e) => return Tick::Finished(Err(e)),
         };
         self.pending_gen = generation;
-        self.in_flight = true;
-        let _ = self.tx.send((id.clone(), bytes));
-        Tick::Started
+        let sent = self.writer.get_or_insert_with(Self::spawn_writer).tx.send((id.clone(), bytes));
+        match sent {
+            Ok(()) => {
+                self.in_flight = true;
+                Tick::Started
+            }
+            Err(_) => {
+                // Drop the dead sender so a later due tick creates a fresh worker.
+                self.writer = None;
+                Tick::Finished(Err(writer_died()))
+            }
+        }
     }
 
-    /// Exit flush: drain pending writes then save unconditionally.
+    /// Exit flush: drain pending writes then save unconditionally, on this
+    /// thread — a clean exit never spawns the writer just to say goodbye.
     /// Edit generation doesn't track position/mods, so exit captures complete state.
     pub fn flush_now(
         &mut self,
@@ -111,11 +144,13 @@ impl Autosaver {
         encode: impl FnOnce() -> Result<Vec<u8>, SaveError>,
     ) -> Result<(), SaveError> {
         if self.in_flight {
+            let writer = self.writer.as_ref().expect("in-flight autosave must have a writer");
             // The drained result doesn't matter — we overwrite right below.
-            let _ = self
-                .rx
-                .recv()
-                .map_err(|_| SaveError::Io(std::io::Error::other("autosave thread died")))?;
+            // A dead worker isn't fatal either: the synchronous write is the
+            // one that has to land.
+            if writer.rx.recv().is_err() {
+                self.writer = None;
+            }
             self.in_flight = false;
         }
         store::write(id, &encode()?)?;
@@ -159,6 +194,22 @@ mod tests {
             edits: vec![],
             mods: vec![],
         })
+    }
+
+    #[test]
+    fn clean_worlds_never_spawn_a_writer_thread() {
+        let id = SlotId::new("__autosave_lazy__").unwrap();
+        let mut auto = Autosaver::new();
+        assert!(auto.writer.is_none(), "construction spawns nothing");
+        auto.reset(7);
+        assert!(!auto.wants_write(7));
+        assert!(matches!(auto.poll(), Tick::Idle));
+        assert!(auto.writer.is_none(), "polling a clean world spawns nothing");
+        // A synchronous exit save also needs no background worker.
+        auto.flush_now(&id, 7, bytes).unwrap();
+        assert!(auto.writer.is_none());
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
     }
 
     #[test]

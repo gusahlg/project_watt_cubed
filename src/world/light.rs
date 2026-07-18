@@ -310,7 +310,7 @@ pub fn propagate(
     out.cells.fill(Lumel::DARK);
     let cs = CHUNK_SIZE as i32;
     let opaque_at = |x: i32, y: i32, z: i32| {
-        tables.opaque[chunk.get_local(x as usize, y as usize, z as usize).0 as usize]
+        tables.opaque(chunk.get_local(x as usize, y as usize, z as usize))
     };
 
     // Skylight: borrow thread-local scratch, reset dark, seed and flood.
@@ -513,14 +513,14 @@ mod tests {
     use voxel_engine::Pass;
 
     fn tables() -> HotTables {
-        HotTables {
-            solid: vec![false, true, true, true].into(),
-            opaque: vec![false, true, false, true].into(), // id 1 stone, id 3 opaque emitter
-            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
-            emission: vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
-            water: vec![false, false, false, false].into(),
-            ..HotTables::default()
-        }
+        HotTables::from_parts(
+            &[false, true, true, true],
+            &[false, true, false, true], // id 1 stone, id 3 opaque emitter
+            &[false, false, false, false],
+            vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
+            vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
+            vec![0, 0, 0, 0].into(),
+        )
     }
 
     fn lit(chunk: &Chunk) -> LightGrid {

@@ -19,7 +19,7 @@ use crate::ident::Detail;
 use super::generation::TerrainGenerator;
 use super::lod;
 use super::metric::HeightEnvelope;
-use super::section::{FINEST_DETAIL, LOD_FLOOR_Y, SECTION_N, Section, SectionPos, section_span};
+use super::section::{FINEST_DETAIL, LOD_FLOOR_Y, SECTION_N, SectionPos, section_span};
 use super::summary::{CellError, CellSummary};
 
 /// The world region and detail band a bake covers. The finest level is always
@@ -254,27 +254,51 @@ fn sample_section<G: TerrainGenerator>(
     let half = cell / 2;
     let span = section_span(detail);
     let (min_x, min_z) = (ax * span, az * span);
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    let mut fold = MipFold::new();
     for iz in 0..SECTION_N as i32 {
         for ix in 0..SECTION_N as i32 {
             let wx = min_x + ix * cell + half;
             let wz = min_z + iz * cell + half;
             // Height must sample every cell; colour is an average, sampled on a stride to save cost.
-            let h = terra.height(wx, wz) as f32;
-            lo = lo.min(h);
-            hi = hi.max(h);
+            fold.height(terra.height(wx, wz) as f32);
             if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
-                let id = terra.surface_at(wx, wz);
-                let c = colors[id.0 as usize];
-                r += c.r as u64;
-                g += c.g as u64;
-                b += c.b as u64;
-                n += 1;
+                fold.color(colors[terra.surface_at(wx, wz).0 as usize]);
             }
         }
     }
-    MipCell { lo, hi, color: Color::new((r / n) as u8, (g / n) as u8, (b / n) as u8, 255) }
+    fold.finish()
+}
+
+/// The one lo/hi/mean-colour fold both the pure bake ([`sample_section`]) and
+/// the edit-folded resample ([`resample_cell`]) reduce their columns through,
+/// so the two can never round or accumulate differently.
+struct MipFold {
+    lo: f32,
+    hi: f32,
+    r: u64,
+    g: u64,
+    b: u64,
+    n: u64,
+}
+
+impl MipFold {
+    fn new() -> Self {
+        Self { lo: f32::INFINITY, hi: f32::NEG_INFINITY, r: 0, g: 0, b: 0, n: 0 }
+    }
+    fn height(&mut self, h: f32) {
+        self.lo = self.lo.min(h);
+        self.hi = self.hi.max(h);
+    }
+    fn color(&mut self, c: Color) {
+        self.r += c.r as u64;
+        self.g += c.g as u64;
+        self.b += c.b as u64;
+        self.n += 1;
+    }
+    fn finish(self) -> MipCell {
+        let Self { lo, hi, r, g, b, n } = self;
+        MipCell { lo, hi, color: Color::new((r / n) as u8, (g / n) as u8, (b / n) as u8, 255) }
+    }
 }
 
 /// Merge four cells: hi = max, lo = min, colour = mean.
@@ -300,25 +324,33 @@ pub(in crate::world) fn resample_cell<G: TerrainGenerator>(
     edits: &[(ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],
     colors: &[Color],
 ) -> MipCell {
-    let section = Section::extract(pos, terra, edits, voxel_engine::Rev::START);
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
-    for iz in 0..SECTION_N {
-        for ix in 0..SECTION_N {
-            let (h, block) = match section.topmost_solid(ix, iz) {
-                Some((top, block)) => (top as f32, block),
+    // Sample columns directly (generator + edit fold), with no RLE Section
+    // built in between: this used to run a full `Section::extract` — four
+    // brick stacks and thousands of transient run vectors — per edited cell,
+    // only to read one topmost-solid value per column back out. The column
+    // fold below is pinned equivalent to the extract-based reference by test.
+    let cell = pos.cell_size();
+    let half = cell / 2;
+    let ys = crate::world::section::cell_centers(pos);
+    let flat = crate::world::section::flatten_edits(edits);
+    let mut column = vec![AIR; ys.len()];
+    let mut fold = MipFold::new();
+    for iz in 0..SECTION_N as i32 {
+        for ix in 0..SECTION_N as i32 {
+            let (fx, fz) = (pos.min_x() + ix * cell, pos.min_z() + iz * cell);
+            terra.lod_column(fx + half, fz + half, &ys, &mut column);
+            crate::world::section::apply_edits(&mut column, &flat, fx, fz, cell);
+            // Topmost non-air cell → the world-space TOP of its run (exclusive),
+            // exactly what `Section::topmost_solid` reports from stored runs.
+            let (h, block) = match column.iter().rposition(|&id| id != AIR) {
+                Some(j) => (LOD_FLOOR_Y as f32 + ((j as i32 + 1) * cell) as f32, column[j]),
                 None => (LOD_FLOOR_Y as f32, AIR), // dug through to the floor: rare, conservative
             };
-            lo = lo.min(h);
-            hi = hi.max(h);
-            let c = colors[block.0 as usize];
-            r += c.r as u64;
-            g += c.g as u64;
-            b += c.b as u64;
-            n += 1;
+            fold.height(h);
+            fold.color(colors[block.0 as usize]);
         }
     }
-    MipCell { lo, hi, color: Color::new((r / n) as u8, (g / n) as u8, (b / n) as u8, 255) }
+    fold.finish()
 }
 
 #[cfg(test)]
@@ -326,6 +358,59 @@ mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
     use crate::world::generation::Terrain;
+    use crate::world::section::Section;
+
+    /// The extract-based reference `resample_cell` replaced: build the full
+    /// RLE section and read `topmost_solid` per column. The fused direct
+    /// sampler must match it exactly for every detail and edit pattern.
+    fn resample_reference(
+        pos: SectionPos,
+        terra: &Terrain,
+        edits: &[(crate::coord::ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],
+        colors: &[Color],
+    ) -> MipCell {
+        use crate::block::registry::AIR;
+        let section = Section::extract(pos, terra, edits, voxel_engine::Rev::START);
+        let mut fold = MipFold::new();
+        for iz in 0..SECTION_N {
+            for ix in 0..SECTION_N {
+                let (h, block) = match section.topmost_solid(ix, iz) {
+                    Some((top, block)) => (top as f32, block),
+                    None => (LOD_FLOOR_Y as f32, AIR),
+                };
+                fold.height(h);
+                fold.color(colors[block.0 as usize]);
+            }
+        }
+        fold.finish()
+    }
+
+    #[test]
+    fn fused_resample_matches_the_extract_reference() {
+        let (reg, g) = terra(0xC0FFEE);
+        let colors = reg.color_snapshot();
+        let cs = 16usize;
+        let idx = |x: usize, y: usize, z: usize| x + z * cs + y * cs * cs;
+        let stone = reg.id_by_name("Stone").unwrap();
+        let edits = vec![
+            (crate::coord::ChunkCoord::new(0, 5, 0), vec![(idx(2, 6, 2), stone), (idx(3, 1, 5), crate::block::registry::AIR)]),
+            (crate::coord::ChunkCoord::new(1, 8, 1), vec![(idx(9, 9, 9), stone)]),
+        ];
+        use crate::ident::Detail;
+        for detail in [FINEST_DETAIL, Detail(FINEST_DETAIL.0 + 3), Detail(FINEST_DETAIL.0 + 7)] {
+            for pos in [
+                SectionPos { detail, x: 0, z: 0 },
+                SectionPos { detail, x: -1, z: 2 },
+            ] {
+                for edit_set in [&[][..], &edits[..]] {
+                    let want = resample_reference(pos, &g, edit_set, &colors);
+                    let got = resample_cell(pos, &g, edit_set, &colors);
+                    assert_eq!((want.lo, want.hi, want.color), (got.lo, got.hi, got.color),
+                        "fused resample diverged at {pos:?} (edits: {})", !edit_set.is_empty());
+                }
+            }
+        }
+    }
 
     fn terra(seed: i64) -> (BlockRegistry, Terrain) {
         let mut registry = BlockRegistry::with_builtins();

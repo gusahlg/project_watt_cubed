@@ -68,11 +68,19 @@ pub struct BlockRegistry {
 /// no window in which `solid` is fresh but `opaque` is stale. Handed to worker
 /// mesh jobs behind an `Arc` via [`crate::derived::Derived`].
 pub struct HotTables {
-    pub solid: Box<[bool]>,
-    pub opaque: Box<[bool]>,
+    /// The three boolean properties the meshers probe per face — solid,
+    /// opaque, water — PACKED one byte per block (see the `FLAG_*` bits and
+    /// the [`solid`]/[`opaque`]/[`water`] accessors). One array means the
+    /// ~14 probes a face sample makes (cull + AO stencil) all hit the same
+    /// L1-resident table instead of three parallel ones.
+    ///
+    /// [`solid`]: HotTables::solid
+    /// [`opaque`]: HotTables::opaque
+    /// [`water`]: HotTables::water
+    flags: Box<[u8]>,
     /// Draw technique per block — the mesher's routing key. `layer[id] == Opaque`
-    /// exactly when `opaque[id]` (both derived from `transparency`); the bool is
-    /// kept for the branchless cull/AO hot loop, this for pass routing.
+    /// exactly when the opaque flag (both derived from `transparency`); the flag
+    /// serves the branchless cull/AO hot loop, this the pass routing.
     pub layer: Box<[Pass]>,
     pub emission: Box<[u8]>,
     /// Per-block acoustic absorption per metre (`0..=255`), indexed by `BlockId`.
@@ -80,11 +88,6 @@ pub struct HotTables {
     /// per traced cell; open blocks (air, water) are `0`. Derived from the same
     /// physics as the render tables so it shares their snapshot revision.
     pub absorption: Box<[u8]>,
-    /// Per-block liquid flag (`buoyancy > 0`) — the mesher stamps it onto each
-    /// emitted face's water material bit so the transparent shader can select
-    /// animated water shading. Water and glass share [`Pass::Blend`], so this,
-    /// not the pass, is what distinguishes them at the fragment.
-    pub water: Box<[bool]>,
     /// The device's texture-array layer ceiling; the mesher emits
     /// `id % layer_cap` as the vertex layer. Identity while the palette fits
     /// (every id < cap — the common case). Never zero: defaults to `u16::MAX`
@@ -95,15 +98,63 @@ pub struct HotTables {
     pub ao: bool,
 }
 
+const FLAG_SOLID: u8 = 1 << 0;
+const FLAG_OPAQUE: u8 = 1 << 1;
+/// Liquid AND translucent (`Pass::Blend`) — the animated-water material bit.
+/// Water and glass share the pass; this flag is what distinguishes them.
+const FLAG_WATER: u8 = 1 << 2;
+
+impl HotTables {
+    /// Pack one block's flag byte from its boolean properties.
+    fn pack(solid: bool, opaque: bool, water: bool) -> u8 {
+        (solid as u8) * FLAG_SOLID + (opaque as u8) * FLAG_OPAQUE + (water as u8) * FLAG_WATER
+    }
+
+    /// Build from parallel boolean tables (tests and the registry snapshot).
+    pub fn from_parts(
+        solid: &[bool],
+        opaque: &[bool],
+        water: &[bool],
+        layer: Box<[Pass]>,
+        emission: Box<[u8]>,
+        absorption: Box<[u8]>,
+    ) -> Self {
+        debug_assert!(solid.len() == opaque.len() && solid.len() == water.len());
+        let flags = solid
+            .iter()
+            .zip(opaque)
+            .zip(water)
+            .map(|((&s, &o), &w)| Self::pack(s, o, w))
+            .collect();
+        Self { flags, layer, emission, absorption, layer_cap: u16::MAX, ao: true }
+    }
+
+    /// Whether `id` blocks movement (the mesher's own-cell gate).
+    #[inline]
+    pub fn solid(&self, id: BlockId) -> bool {
+        self.flags[id.0 as usize] & FLAG_SOLID != 0
+    }
+
+    /// Whether `id` hides a neighbouring face (the cull/AO probe).
+    #[inline]
+    pub fn opaque(&self, id: BlockId) -> bool {
+        self.flags[id.0 as usize] & FLAG_OPAQUE != 0
+    }
+
+    /// Whether `id` takes the animated-water material bit.
+    #[inline]
+    pub fn water(&self, id: BlockId) -> bool {
+        self.flags[id.0 as usize] & FLAG_WATER != 0
+    }
+}
+
 impl Default for HotTables {
     fn default() -> Self {
         Self {
-            solid: Box::default(),
-            opaque: Box::default(),
+            flags: Box::default(),
             layer: Box::default(),
             emission: Box::default(),
             absorption: Box::default(),
-            water: Box::default(),
             layer_cap: u16::MAX,
             ao: true,
         }
@@ -198,21 +249,24 @@ impl BlockRegistry {
     /// (three small array copies); rebuilt only when the palette grows, behind the
     /// [`Derived`](crate::derived::Derived) revision cache on the world.
     pub fn hot_tables(&self) -> HotTables {
+        // A liquid that is also translucent (⇒ `Pass::Blend`) takes the water
+        // material bit: the water shader assumes a see-through reflective
+        // surface, so an opaque liquid (e.g. lava, `transparency == 0` ⇒
+        // `Pass::Opaque`) must NOT take it.
+        let flags = (0..self.solid.len())
+            .map(|i| {
+                HotTables::pack(
+                    self.solid[i],
+                    self.opaque[i],
+                    self.buoyancy[i] > 0 && self.layer[i] == Pass::Blend,
+                )
+            })
+            .collect();
         HotTables {
-            solid: self.solid.clone().into_boxed_slice(),
-            opaque: self.opaque.clone().into_boxed_slice(),
+            flags,
             layer: self.layer.clone().into_boxed_slice(),
             emission: self.emission.clone().into_boxed_slice(),
             absorption: self.sound.iter().map(|c| c.absorption()).collect(),
-            // A liquid that is also translucent (⇒ `Pass::Blend`): the water shader
-            // assumes a see-through reflective surface, so an opaque liquid (e.g.
-            // lava, `transparency == 0` ⇒ `Pass::Opaque`) must NOT take it.
-            water: self
-                .buoyancy
-                .iter()
-                .zip(self.layer.iter())
-                .map(|(&b, &l)| b > 0 && l == Pass::Blend)
-                .collect(),
             // The registry owns no device or settings knowledge; the world
             // stamps the real cap and AO choice right after (`refresh_tables`).
             layer_cap: u16::MAX,

@@ -2,6 +2,7 @@
 use std::num::NonZeroU8;
 
 use crate::ident::Detail;
+use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, max_lod_levels};
 
 use super::metric::EyeDist;
 
@@ -23,22 +24,38 @@ pub struct PyramidCfg {
     pub unit: f32,
     /// ≥ 2.0 for exponential falloff.
     pub base: f32,
+    /// Cached integer log2(base). Selection and covering query this for every
+    /// section, so deriving it once avoids repeated floating-point logarithms.
+    step: u8,
 }
 
 impl PyramidCfg {
     /// Standard config: base 2, 7 rings starting at finest LOD.
     pub fn sections(unit: f32) -> PyramidCfg {
+        Self::sections_with(unit, SECTION_LEVELS, super::section::FINEST_DETAIL.0 as u8)
+    }
+
+    /// Configurable section ladder. Inputs are clamped defensively even though
+    /// [`RenderConfig`](crate::render_config::RenderConfig) normalizes them at
+    /// the settings boundary: construction from tests and internal callers
+    /// must preserve the same coarsest-detail hierarchy invariant.
+    pub fn sections_with(unit: f32, levels: u8, detail: u8) -> PyramidCfg {
+        let detail = detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
+        let levels = levels
+            .clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end())
+            .min(max_lod_levels(detail));
         PyramidCfg {
-            finest: super::section::FINEST_DETAIL,
-            levels: NonZeroU8::new(SECTION_LEVELS).unwrap(),
+            finest: Detail(detail as i8),
+            levels: NonZeroU8::new(levels).expect("levels clamped to a nonzero range"),
             unit,
             base: 2.0,
+            step: 1,
         }
     }
 
-    /// LOD value increment per ring (log2 of base, floored at 1 for degenerate bases).
+    /// LOD value increment per ring (integer log2 of base, cached at construction).
     pub fn step(&self) -> u8 {
-        (self.base.log2().round() as i32).max(1) as u8
+        self.step
     }
 
     pub fn coarsest(&self) -> Detail {
@@ -72,14 +89,19 @@ pub(in crate::world) fn level_for(dist: EyeDist, cfg: &PyramidCfg) -> LodChoice 
     if !(dist_xz >= cfg.unit) {
         return LodChoice::Level(cfg.finest);
     }
-    let ring = (dist_xz / cfg.unit).log(cfg.base).floor();
-    // Non-finite ring (corrupt cfg) saturates past horizon.
-    let ring = if ring.is_finite() { ring as u32 } else { u32::MAX };
-    if ring >= cfg.levels.get() as u32 {
-        LodChoice::BeyondHorizon
-    } else {
-        LodChoice::Level(ringed_detail(cfg.finest, ring, cfg.step()))
+    // At most eight multiply/compare steps beat a transcendental logarithm on
+    // the per-section visibility path, while preserving exact band boundaries.
+    // Bounded by the levels cap even for a degenerate (non-growing) base.
+    let mut ring = 0u32;
+    let mut upper = cfg.unit * cfg.base;
+    while dist_xz >= upper {
+        ring += 1;
+        if ring >= cfg.levels.get() as u32 {
+            return LodChoice::BeyondHorizon;
+        }
+        upper *= cfg.base;
     }
+    LodChoice::Level(ringed_detail(cfg.finest, ring, cfg.step()))
 }
 
 /// Keep-side tolerance for hysteresis: whether `lod` is drawable at this distance.
@@ -151,7 +173,28 @@ mod tests {
     use super::*;
 
     fn d1() -> PyramidCfg {
-        PyramidCfg { finest: Detail(2), levels: NonZeroU8::new(2).unwrap(), unit: 256.0, base: 4.0 }
+        PyramidCfg {
+            finest: Detail(2),
+            levels: NonZeroU8::new(2).unwrap(),
+            unit: 256.0,
+            base: 4.0,
+            step: 2,
+        }
+    }
+
+    /// The configurable constructor clamps into the supported ladder and
+    /// shortens levels so the coarsest ring never exceeds the hierarchy cap.
+    #[test]
+    fn configurable_ladder_clamps_and_respects_the_coarsest_cap() {
+        let cfg = PyramidCfg::sections_with(256.0, 8, 6);
+        assert_eq!(cfg.finest, Detail(6));
+        assert_eq!(cfg.levels.get(), 4, "detail 6 exposes only levels 6 through 9");
+        assert_eq!(cfg.coarsest(), Detail(9));
+
+        let default = PyramidCfg::sections_with(256.0, SECTION_LEVELS, 2);
+        assert_eq!(default.finest, super::super::section::FINEST_DETAIL);
+        assert_eq!(default.levels.get(), SECTION_LEVELS);
+        assert_eq!(default.step(), 1);
     }
 
     /// `level_for` is monotone and always returns a valid level; tolerance prevents thrashing.

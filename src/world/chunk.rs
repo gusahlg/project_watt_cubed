@@ -176,7 +176,7 @@ impl Chunk {
     pub fn is_uniform_opaque(&self, tables: &HotTables) -> bool {
         self.uniform().is_some_and(|id| {
             let index = id.0 as usize;
-            tables.opaque[index] && tables.emission[index] == 0
+            tables.opaque(BlockId(index as u16)) && tables.emission[index] == 0
         })
     }
 

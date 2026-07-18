@@ -89,13 +89,17 @@ impl ActiveSlot {
 
 /// State for the `WATT_BENCH` frame-rate benchmark.
 struct Bench {
-    /// Measurement length in seconds (after warmup).
-    duration: f32,
+    /// Measurement length in seconds (after warmup). `f64`, like every other
+    /// wall-time accumulator here: a long high-rate run must not drift on
+    /// `f32` accumulation error at the sample boundary.
+    duration: f64,
     /// Seconds of warmup left before sampling starts (world streaming in).
-    warmup: f32,
+    warmup: f64,
     /// Elapsed measured time.
-    elapsed: f32,
-    /// Per-frame durations, for avg and percentile stats.
+    elapsed: f64,
+    /// Per-frame durations, for avg and percentile stats. Reserved for
+    /// 25,000 measured frames per second up front, keeping target-rate runs
+    /// out of the allocator.
     samples: Vec<f32>,
     started: bool,
     /// Where to park the bench player (`WATT_BENCH_POS="x,y,z"`), for
@@ -107,22 +111,37 @@ impl App {
     pub fn new() -> Self {
         let mods = Mods::with_defaults();
         let saves = save::list();
-        let settings = Settings::load();
+        let mut settings = Settings::load();
         let session = Session::load();
-        let bench = std::env::var("WATT_BENCH").ok().map(|v| Bench {
-            duration: v.parse().unwrap_or(10.0),
-            warmup: 3.0,
-            elapsed: 0.0,
-            samples: Vec::with_capacity(1 << 17),
-            started: false,
-            pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
+        let bench = std::env::var("WATT_BENCH").ok().map(|v| {
+            let duration = v.parse::<f64>().unwrap_or(10.0).max(0.0);
+            let sample_capacity = (duration.ceil() as usize).saturating_mul(25_000);
+            Bench {
+                duration,
+                warmup: 3.0,
+                elapsed: 0.0,
+                samples: Vec::with_capacity(sample_capacity),
+                started: false,
+                pos: std::env::var("WATT_BENCH_POS").ok().and_then(|s| parse_bench_pos(&s)),
+            }
         });
-        // A benchmark run auto-enables the profiler (CPU subsystems + workers
-        // via VOXEL_PROFILE) unless the caller set it explicitly. Safe here:
-        // `new()` runs on the main thread at startup, before the renderer or
-        // any worker thread — the only reader of this var — exists. Reads
-        // happen later.
-        if bench.is_some() && std::env::var_os("VOXEL_PROFILE").is_none() {
+        // A reproducible benchmark can pin a performance profile without
+        // mutating the saved configuration (the run never persists settings).
+        if bench.is_some()
+            && let Ok(preset) = std::env::var("WATT_BENCH_PRESET")
+            && !settings.select_preset(preset.trim())
+        {
+            eprintln!("WATT_BENCH_PRESET={preset:?} not recognized; using saved settings");
+        }
+        // Instrumentation is opt-in (`WATT_BENCH_PROFILE=1`): headline
+        // measurements stay uninstrumented, attribution runs are explicit and
+        // reported separately. Safe here: `new()` runs on the main thread at
+        // startup, before the renderer or any worker thread — the only reader
+        // of this var — exists. Reads happen later.
+        if bench.is_some()
+            && matches!(std::env::var("WATT_BENCH_PROFILE").as_deref(), Ok("1"))
+            && std::env::var_os("VOXEL_PROFILE").is_none()
+        {
             unsafe { std::env::set_var("VOXEL_PROFILE", "1") };
         }
         // A missing device or a missing/corrupt catalog degrades to silence — the
@@ -216,7 +235,10 @@ impl App {
     /// camera, sample frame times, and print the stats line when done.
     /// Returns `false` when the benchmark is finished and the app should exit.
     fn bench_frame(&mut self, eng: &mut Engine) -> bool {
+        // One clock for the wall-time/sample boundary: the f32 frame time is
+        // the sample, its f64 widening the accumulator step.
         let dt = eng.frame_time();
+        let dt64 = dt as f64;
         let bench = self.bench.as_mut().expect("bench_frame without bench");
 
         if !bench.started {
@@ -246,10 +268,10 @@ impl App {
         game.player_mut().orientation.yaw += 0.4 * dt;
 
         if bench.warmup > 0.0 {
-            bench.warmup -= dt;
+            bench.warmup -= dt64;
             return true;
         }
-        bench.elapsed += dt;
+        bench.elapsed += dt64;
         if dt > 0.0 {
             bench.samples.push(dt);
         }
@@ -258,9 +280,9 @@ impl App {
         }
 
         let frames = bench.samples.len();
-        let total: f32 = bench.samples.iter().sum();
-        let avg_ms = total / frames.max(1) as f32 * 1000.0;
-        let avg_fps = frames as f32 / total.max(f32::EPSILON);
+        let total: f64 = bench.samples.iter().map(|&s| s as f64).sum();
+        let avg_ms = total / frames.max(1) as f64 * 1000.0;
+        let avg_fps = frames as f64 / total.max(f64::EPSILON);
         let mut sorted = bench.samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         // p1 fps = the fps of the 99th-percentile (slowest 1%) frame time. With no
@@ -384,7 +406,9 @@ impl App {
 
     /// Join a remote world via an existing connection.
     fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection) {
-        let world = World::new(conn.seed());
+        // Lazy construction: the collision-safe spawn slab is prepared in
+        // `enter_game`; streaming fills the remainder asynchronously.
+        let world = World::with_config_lazy(conn.seed(), self.settings.render_config());
         let player = Player::new(conn.spawn());
         // A networked world is a live mirror, not a save — per-world mod state
         // starts clean, but the player's enable/disable choices persist.
@@ -408,7 +432,10 @@ impl App {
             (Some(_), _) => 42,
             (None, _) => fresh_seed(),
         };
-        let world = World::new(seed);
+        // Lazy construction: `spawn_player` queries only a few surface columns
+        // (generated on demand), and `enter_game` prepares the collision-safe
+        // spawn slab — the previous eager default-volume generation is avoided.
+        let world = World::with_config_lazy(seed, self.settings.render_config());
         let player = spawn_player(&world);
         let id = save::fresh_id();
         let now = save::unix_now();
@@ -437,7 +464,7 @@ impl App {
             Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
         };
         self.mods.reset_state();
-        match save::load(&id, &mut self.mods) {
+        match save::load_with_config(&id, &mut self.mods, self.settings.render_config()) {
             Ok((world, player, meta, report)) => {
                 self.active = Some(ActiveSlot::new(id.clone(), meta));
                 let mut game = Game::new(world, player, id.as_str().to_string());
@@ -508,6 +535,11 @@ impl App {
         };
         active.playtime += dt;
         active.meta.playtime_secs = active.playtime as u64;
+        // Disabled autosave performs no polling and no serialization — the
+        // explicit save on clean world exit (`flush_save`) remains.
+        if !self.settings.autosave {
+            return;
+        }
         let ActiveSlot { id, meta, autosaver, .. } = active;
         if let Tick::Finished(Err(e)) = autosaver.poll() {
             game.notify(format!("* autosave failed: {e}"));

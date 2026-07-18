@@ -21,7 +21,8 @@ pub fn craft_natural(registry: &mut BlockRegistry, elements: &[ElementId]) -> Op
     }
     // Existing compositions come back without growing the palette; new ones
     // are refused once the palette hits its texture-layer-bounded cap.
-    let composition = crate::block::Composition::natural(&set);
+    // `set` was canonicalized above, so the composition skips a second sort.
+    let composition = crate::block::Composition::natural_sorted(&set);
     if let Some(existing) = registry.lookup(&composition) {
         return Some(existing);
     }

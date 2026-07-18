@@ -12,7 +12,7 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{LoadReport, encode_current, load, save, unix_now};
+pub use bridge::{LoadReport, encode_current, load, load_with_config, save, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
 pub use store::{Source, fresh_id, list};
 

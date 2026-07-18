@@ -4,6 +4,7 @@
 use voxel_engine::DVec3;
 
 use crate::mods::Mods;
+use crate::render_config::RenderConfig;
 use crate::player::Player;
 use crate::world::World;
 
@@ -79,6 +80,26 @@ pub fn to_doc(
 /// into `mods`. Total: unknown specs degrade to air, exactly like the network
 /// path.
 pub fn from_doc(doc: SaveDoc, mods: &mut Mods) -> (World, Player, SaveMeta) {
+    restore_doc(doc, mods, World::new)
+}
+
+/// Restore a document for an interactive session without synchronously
+/// generating the default origin data box. The selected render configuration
+/// is installed at construction time, so disabled LOD lanes never allocate
+/// their startup state only to tear it down on the first frame.
+pub(crate) fn from_doc_with_config(
+    doc: SaveDoc,
+    mods: &mut Mods,
+    render: RenderConfig,
+) -> (World, Player, SaveMeta) {
+    restore_doc(doc, mods, |seed| World::with_config_lazy(seed, render))
+}
+
+fn restore_doc(
+    doc: SaveDoc,
+    mods: &mut Mods,
+    make_world: impl FnOnce(i64) -> World,
+) -> (World, Player, SaveMeta) {
     // Warn, never reject: the seed regenerates terrain fine, but a save from
     // another worldgen replays its edits over terrain whose MATERIALS may have
     // moved (a mined-out iron vein may now sit in coal). Geometry never moves
@@ -92,7 +113,7 @@ pub fn from_doc(doc: SaveDoc, mods: &mut Mods) -> (World, Player, SaveMeta) {
             crate::world::placement::WORLDGEN_VERSION,
         );
     }
-    let mut world = World::new(doc.meta.seed);
+    let mut world = make_world(doc.meta.seed);
 
     let mut player = Player::new(DVec3::new(
         doc.player.pos[0],
@@ -155,6 +176,25 @@ pub fn save(
 /// Load a slot, laddering to the backup and salvaging a truncated tail if it
 /// comes to that. The report says how far down the ladder we went.
 pub fn load(id: &SlotId, mods: &mut Mods) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
+    load_inner(id, mods, from_doc)
+}
+
+/// Load an interactive session with its render/LOD lanes configured before
+/// any terrain is generated. Unlike [`load`], this takes the lazy world path;
+/// save replay and recovery behavior are otherwise identical.
+pub fn load_with_config(
+    id: &SlotId,
+    mods: &mut Mods,
+    render: RenderConfig,
+) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
+    load_inner(id, mods, |doc, mods| from_doc_with_config(doc, mods, render))
+}
+
+fn load_inner(
+    id: &SlotId,
+    mods: &mut Mods,
+    restore: impl FnOnce(SaveDoc, &mut Mods) -> (World, Player, SaveMeta),
+) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
     let (decoded, source) = store::read(id)?;
     let (doc, salvage) = match decoded {
         format::Decoded::Intact(doc) => (doc, None),
@@ -162,6 +202,6 @@ pub fn load(id: &SlotId, mods: &mut Mods) -> Result<(World, Player, SaveMeta, Lo
             (doc, Some((recovered, expected)))
         }
     };
-    let (world, player, meta) = from_doc(doc, mods);
+    let (world, player, meta) = restore(doc, mods);
     Ok((world, player, meta, LoadReport { source, salvage }))
 }

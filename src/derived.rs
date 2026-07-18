@@ -88,9 +88,60 @@ impl<T: Default> Default for Derived<T> {
     }
 }
 
+/// A value cached against an arbitrary equality key — the single-threaded,
+/// per-frame sibling of [`Derived`]: no revision protocol, no `Arc`, one slot.
+/// The caller keys it by a cheap projection of the inputs (bit patterns for
+/// floats) and rebuilds in place only when the key changes; [`invalidate`]
+/// empties the slot when an input outside the key changes (a settings edit).
+///
+/// [`invalidate`]: Memo::invalidate
+#[derive(Default)]
+pub struct Memo<K, V> {
+    slot: Option<(K, V)>,
+}
+
+impl<K: PartialEq, V> Memo<K, V> {
+    pub const fn new() -> Self {
+        Self { slot: None }
+    }
+
+    /// The cached value for `key`, building it only on a key change.
+    pub fn get_or(&mut self, key: K, build: impl FnOnce() -> V) -> &V {
+        let stale = !matches!(&self.slot, Some((k, _)) if *k == key);
+        if stale {
+            self.slot = Some((key, build()));
+        }
+        &self.slot.as_ref().expect("slot filled above").1
+    }
+
+    /// The cached value, whatever key it was built for; `None` when empty.
+    pub fn get(&self) -> Option<&V> {
+        self.slot.as_ref().map(|(_, v)| v)
+    }
+
+    /// Empty the slot: the next [`get_or`](Self::get_or) rebuilds.
+    pub fn invalidate(&mut self) {
+        self.slot = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memo_rebuilds_only_on_key_change_or_invalidate() {
+        let mut memo: Memo<u32, u32> = Memo::new();
+        let mut builds = 0;
+        assert_eq!(*memo.get_or(1, || { builds += 1; 10 }), 10);
+        assert_eq!(*memo.get_or(1, || { builds += 1; 99 }), 10);
+        assert_eq!(builds, 1);
+        assert_eq!(*memo.get_or(2, || { builds += 1; 20 }), 20);
+        assert_eq!(builds, 2);
+        memo.invalidate();
+        assert_eq!(*memo.get_or(2, || { builds += 1; 21 }), 21);
+        assert_eq!(builds, 3);
+    }
 
     #[test]
     fn sync_does_not_rebuild_when_revision_unchanged() {

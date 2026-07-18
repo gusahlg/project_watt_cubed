@@ -18,16 +18,21 @@
 
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::ChunkCoord;
-use crate::ident::{BlockState, Detail};
+#[cfg(test)]
+use crate::ident::BlockState;
+use crate::ident::Detail;
 
-use super::brick::{BRICK_DIM, BRICK_VOLUME, Brick, BrickPayload, PALETTE_MAX, Run, RleColumns, cell_index};
+use super::brick::BRICK_DIM;
+#[cfg(test)]
+use super::brick::{BRICK_VOLUME, Brick, BrickPayload, PALETTE_MAX, Run, RleColumns, cell_index};
 use super::chunk::{CHUNK_SIZE, Chunk};
+#[cfg(test)]
 use super::generation::TerrainGenerator;
 use super::lod;
 
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
-pub(in crate::world) use mesh::{SectionMeshData, build_section_mesh};
+pub(in crate::world) use mesh::{SectionMeshData, extract_section_mesh};
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
@@ -152,6 +157,7 @@ impl SectionPos {
     /// Bricks per quadrant stack (`max(1, n_cells.div_ceil(16))`, derived
     /// from `n_cells` rather than a hardcoded `2^(5-k)` so it stays correct
     /// at the coarse rings where `n_cells < 16` (single padded brick)).
+    #[cfg(test)]
     fn num_bricks(self) -> usize {
         (self.n_cells() as usize).div_ceil(BRICK_DIM).max(1)
     }
@@ -161,6 +167,7 @@ impl SectionPos {
 
 /// One resolved (BlockId, cell-count) run, bottom-up, cell units — the
 /// shared decode the mesher uses.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(in crate::world) struct DecodedRun {
     pub block: BlockId,
@@ -173,8 +180,10 @@ pub(in crate::world) struct DecodedRun {
 /// `n_cells < 16`) are padded AIR — invisible to every reader bounded by
 /// `n_cells` (the mesher) or by the stack's own brick count (`column_runs`,
 /// self-bounding).
+#[cfg(test)]
 pub(in crate::world) struct BrickStack(Box<[Brick]>);
 
+#[cfg(test)]
 impl BrickStack {
     fn from_bricks(bricks: Vec<Brick>) -> Self {
         BrickStack(bricks.into_boxed_slice())
@@ -213,6 +222,7 @@ impl BrickStack {
 
 /// Decode a Paletted/Dense brick's column via a per-cell lookup closure,
 /// coalescing adjacent equal ids into runs (shared by both variants).
+#[cfg(test)]
 fn decode_dense_column(_x: usize, _z: usize, cell: impl Fn(usize) -> BlockId) -> Vec<(BlockId, u8)> {
     let mut out: Vec<(BlockId, u8)> = Vec::new();
     for y in 0..BRICK_DIM {
@@ -228,11 +238,20 @@ fn decode_dense_column(_x: usize, _z: usize, cell: impl Fn(usize) -> BlockId) ->
 // Section: pos + four brick stacks.
 
 /// A section: position plus four quadrant brick stacks (bit 0 = +X, bit 1 = +Z).
+///
+/// TEST-ONLY since the fused paths landed: production far jobs
+/// ([`mesh::extract_section_mesh`]) and the edit overlay
+/// (`heightmip::resample_cell`) sample the generator directly — this stored
+/// form survives as the INDEPENDENT implementation their byte-parity oracles
+/// are pinned against. (Chunk storage's bricks in `brick.rs` remain
+/// production; only the section-level stacking is oracle machinery now.)
+#[cfg(test)]
 pub(in crate::world) struct Section {
     pos: SectionPos,
     quadrants: [BrickStack; 4],
 }
 
+#[cfg(test)]
 impl Section {
     pub fn pos(&self) -> SectionPos {
         self.pos
@@ -281,7 +300,7 @@ impl Section {
         let n = pos.n_cells() as usize;
         let num_bricks = pos.num_bricks();
         let half = cell / 2;
-        let ys: Vec<i32> = (0..n).map(|j| LOD_FLOOR_Y + j as i32 * cell + half).collect();
+        let ys = cell_centers(pos);
         let flat = flatten_edits(edits);
 
         let mut scratch = vec![AIR; n];
@@ -311,14 +330,26 @@ impl Section {
 
 }
 
-// Extraction helpers.
+// Extraction helpers — shared by [`Section::extract`] (storage path) and the
+// fused [`mesh::extract_section_mesh`] production path, so the two can never
+// disagree on sample coordinates or edit folding.
+
+/// The world-Y centre of every vertical cell of a section at `pos`'s detail —
+/// the exact generator sample heights both extraction paths use.
+pub(in crate::world) fn cell_centers(pos: SectionPos) -> Vec<i32> {
+    let cell = pos.cell_size();
+    let half = cell / 2;
+    (0..pos.n_cells()).map(|j| LOD_FLOOR_Y + j * cell + half).collect()
+}
 
 /// Flatten tile edits (per-chunk flat indices) to absolute world coordinates,
 /// sorted by ascending `(y, x, z)`. The sort is the determinism contract
 /// [`apply_edits`] relies on: edits originate in hash maps whose iteration
 /// order is arbitrary, but position is session-independent truth — so live
 /// edit history and an unordered join snapshot flatten identically.
-fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32, i32, BlockId)> {
+pub(in crate::world) fn flatten_edits(
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+) -> Vec<(i32, i32, i32, BlockId)> {
     let mut out = Vec::new();
     for (coord, cells) in edits {
         for &(index, id) in cells {
@@ -339,7 +370,13 @@ fn flatten_edits(edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Vec<(i32, i32
 ///   sorted ascending by [`flatten_edits`], so last-write-wins realizes that
 ///   tie-break in one sweep;
 /// - air edits off the sample point never affect the coarse cell.
-fn apply_edits(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
+pub(in crate::world) fn apply_edits(
+    cells: &mut [BlockId],
+    flat: &[(i32, i32, i32, BlockId)],
+    fx: i32,
+    fz: i32,
+    cell: i32,
+) {
     if flat.is_empty() {
         return;
     }
@@ -378,6 +415,7 @@ fn apply_edits(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32
 /// Run-length compact a cell slice into bottom-up (BlockId, count) segments.
 /// `i32` counts: a full-domain slice can be up to `DOMAIN_H/cell` long
 /// (≤128 in practice), safely past `u8` before per-brick slicing narrows it.
+#[cfg(test)]
 fn rle_slice(cells: &[BlockId]) -> Vec<(BlockId, i32)> {
     let mut out = Vec::new();
     let mut j = 0;
@@ -397,6 +435,7 @@ fn rle_slice(cells: &[BlockId]) -> Vec<(BlockId, i32)> {
 /// exactly [`BRICK_DIM`] cells each, splitting any run that spans a
 /// boundary. Short of a full brick (coarse rings): the remainder is padded
 /// AIR — unobserved by any n_cells-bounded reader.
+#[cfg(test)]
 fn slice_into_bricks(runs: &[(BlockId, i32)], num_bricks: usize) -> Vec<Vec<(BlockId, u8)>> {
     let mut out: Vec<Vec<(BlockId, u8)>> = (0..num_bricks).map(|_| Vec::new()).collect();
     let (mut b, mut remaining) = (0usize, BRICK_DIM as i32);
@@ -434,6 +473,7 @@ fn slice_into_bricks(runs: &[(BlockId, i32)], num_bricks: usize) -> Vec<Vec<(Blo
 /// (BlockId, count) segments (count in CELL units, each column summing to
 /// [`BRICK_DIM`]).
 /// `columns[x + z*16]`, x-major (matches [`RleColumns`]).
+#[cfg(test)]
 fn build_brick(level: Detail, rev: voxel_engine::Rev, columns: [Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]) -> Brick {
     let mut palette: Vec<BlockState> = Vec::new();
     let mut column_runs: [Vec<Run>; BRICK_DIM * BRICK_DIM] = std::array::from_fn(|_| Vec::new());
@@ -458,6 +498,7 @@ fn build_brick(level: Detail, rev: voxel_engine::Rev, columns: [Vec<(BlockId, u8
 
 /// Palette-overflow escape (>256 distinct values in one brick): re-decode
 /// the same column segments into a flat 4096-cell buffer instead.
+#[cfg(test)]
 fn build_dense_brick(level: Detail, rev: voxel_engine::Rev, columns: &[Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]) -> Brick {
     let mut cells = vec![BlockState { id: AIR, state: 0 }; BRICK_VOLUME];
     for (col, segs) in columns.iter().enumerate() {

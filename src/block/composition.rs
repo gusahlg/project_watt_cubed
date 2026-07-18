@@ -122,6 +122,17 @@ impl Composition {
         Composition::Natural(set.into_boxed_slice())
     }
 
+    /// [`natural`](Self::natural) for input the caller has ALREADY sorted by
+    /// id and deduplicated (crafting canonicalizes before the palette lookup)
+    /// — skips re-canonicalizing what is canonical by construction.
+    pub fn natural_sorted(elements: &[ElementId]) -> Self {
+        debug_assert!(
+            elements.windows(2).all(|w| w[0].0 < w[1].0),
+            "natural_sorted input must be strictly id-ascending"
+        );
+        Composition::Natural(elements.to_vec().into_boxed_slice())
+    }
+
     /// Convenience constructor for a validated mixture.
     pub fn mixture(parts: &[(ElementId, u8)]) -> Result<Self, MixError> {
         Mix::new(parts).map(Composition::Mixture)

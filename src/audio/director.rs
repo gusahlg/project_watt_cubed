@@ -285,9 +285,10 @@ impl AudioDirector {
         }
 
         // --- Derived: remote footsteps (per-peer phase crossing) ---
-        let mut live: HashSet<u32> = HashSet::with_capacity(ctx.peers.len());
+        // Roster diffs scan the (small) peer slice directly instead of building
+        // a per-frame `HashSet`: O(n·m) over single-digit counts beats an
+        // allocation plus hashing every multiplayer frame.
         for peer in ctx.peers {
-            live.insert(peer.id);
             let prev = self.peer_gait.insert(peer.id, peer.phase);
             if let Some(prev) = prev {
                 if phase_crossed(prev, peer.phase) && peer.speed > 0.5 {
@@ -297,7 +298,8 @@ impl AudioDirector {
                 }
             }
         }
-        self.peer_gait.retain(|id, _| live.contains(id));
+        let peers = ctx.peers;
+        self.peer_gait.retain(|id, _| peers.iter().any(|p| p.id == *id));
 
         // --- Derived: splash on a listener medium transition (both directions) ---
         if let Some(prev) = self.prev_medium {
@@ -323,11 +325,13 @@ impl AudioDirector {
             for peer in ctx.peers {
                 sound.set_session_present(SessionKey(peer.id), peer.visible, Some(peer.at));
             }
-            let gone: Vec<u32> = self.voice_open.difference(&live).copied().collect();
-            for id in gone {
-                sound.close_session(SessionKey(id));
-                self.voice_open.remove(&id);
-            }
+            self.voice_open.retain(|&id| {
+                let present = peers.iter().any(|p| p.id == id);
+                if !present {
+                    sound.close_session(SessionKey(id));
+                }
+                present
+            });
         }
 
         // A rejected frame is a construction bug: debug-assert, never panic in release.

@@ -130,7 +130,9 @@ struct Ctx {
 }
 
 struct PlayerHandle {
-    name: String,
+    /// Interned once at join; every roster/join/chat broadcast that carries
+    /// it is a refcount bump, never a per-recipient allocation.
+    name: Arc<str>,
     pos: DVec3,
     yaw: f32,
     pitch: f32,
@@ -427,7 +429,7 @@ fn handle_client(
                 reject(&rt, &mut send, &conn, "world content mismatch (different game/content versions)");
                 return Ok(());
             }
-            if password != ctx.password {
+            if *password != *ctx.password {
                 reject(&rt, &mut send, &conn, "wrong password");
                 return Ok(());
             }
@@ -451,8 +453,8 @@ fn handle_client(
     let id;
     let spawn;
     let world_day;
-    let existing: Vec<(u32, String)>;
-    let snapshot: Vec<(i32, i32, i32, u32, String)>;
+    let existing: Vec<(u32, Arc<str>)>;
+    let snapshot: Vec<(i32, i32, i32, u32, Arc<str>)>;
     {
         let mut state = shared.lock_recover();
         world_day = state.day_now(ctx.day_secs);
@@ -468,10 +470,12 @@ fn handle_client(
         // Roster only — poses flow through the visibility machinery once the
         // joiner reports their first move, so a far peer isn't a frozen ghost.
         existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
+        // The pooled `Arc<str>` spec goes straight onto the wire message: a
+        // built-up world's join snapshot clones refcounts, not strings.
         snapshot = state
             .edits
             .iter()
-            .map(|(&(x, y, z), cell)| (x, y, z, cell.rev, cell.spec.to_string()))
+            .map(|(&(x, y, z), cell)| (x, y, z, cell.rev, cell.spec.clone()))
             .collect();
 
         state.players.insert(
@@ -873,14 +877,15 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32
     let Some(spec) = state.intern(&canonical) else {
         return reject(&state, ack_to); // pool at cap: refuse new content
     };
-    if let Some(old) = state.edits.insert((x, y, z), Cell { spec, rev }) {
+    if let Some(old) = state.edits.insert((x, y, z), Cell { spec: spec.clone(), rev }) {
         state.release(old.spec);
     }
     if let Some(out) = ack_to {
         let _ = out
             .try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
     }
-    let msg = ServerMessage::Edit { x, y, z, rev, spec: canonical };
+    // The broadcast carries the SAME pooled Arc the ledger stores.
+    let msg = ServerMessage::Edit { x, y, z, rev, spec };
     broadcast(&mut state, &msg, |pid, _| pid != id);
 }
 
@@ -895,7 +900,7 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     let origin = sender.pos;
     let channel = if channel == chat::GLOBAL { chat::GLOBAL } else { chat::LOCAL };
     println!("<{from_name}> {text}");
-    let msg = ServerMessage::Chat { from_id: id, from_name, channel, text };
+    let msg = ServerMessage::Chat { from_id: id, from_name, channel, text: text.into() };
     broadcast(&mut state, &msg, |_, h| {
         channel == chat::GLOBAL || h.pos.distance(origin) <= chat::RADIUS
     });
@@ -1021,10 +1026,10 @@ fn online(shared: &Arc<Mutex<State>>) -> usize {
     shared.lock_recover().players.len()
 }
 
-fn clean_name(raw: &str) -> String {
+fn clean_name(raw: &str) -> Arc<str> {
     let name: String = raw.chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
-    let name = name.trim().to_string();
-    if name.is_empty() { "player".to_string() } else { name }
+    let name = name.trim();
+    if name.is_empty() { "player".into() } else { name.into() }
 }
 
 fn clean_chat(raw: &str) -> String {
@@ -1046,8 +1051,8 @@ mod tests {
 
     #[test]
     fn names_are_capped_and_sanitised() {
-        assert_eq!(clean_name("  guahlg\n "), "guahlg");
-        assert_eq!(clean_name(""), "player");
+        assert_eq!(&*clean_name("  guahlg\n "), "guahlg");
+        assert_eq!(&*clean_name(""), "player");
         assert_eq!(clean_name(&"x".repeat(100)).len(), MAX_NAME);
     }
 
@@ -1465,7 +1470,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             fingerprint: crate::net::content_fingerprint() ^ 1,
             name: "drifted".into(),
-            password: String::new(),
+            password: "".into(),
         };
         match raw_reply(handle.addr(), &hello) {
             ServerMessage::Reject { reason } => {

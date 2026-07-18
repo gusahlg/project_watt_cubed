@@ -44,7 +44,10 @@ pub struct RemotePlayer {
     /// Also the audio runtime's voice `SessionKey`. Kept on the value so
     /// [`peers`](Connection::peers) (which drops the map key) still carries it.
     id: u32,
-    pub name: String,
+    /// Shared with the wire message that delivered it and with every draw
+    /// record that shows it — a name is cloned as a refcount bump, never a
+    /// fresh allocation.
+    pub name: Arc<str>,
     pub anim: presence::Animator,
     /// Joins start hidden (the roster carries names, not positions); the
     /// first `PeerMove` reveals them and `PeerExited` hides them again — so a
@@ -127,16 +130,16 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 /// are what the game still has to handle.
 pub enum Incoming {
     /// Stale revisions were already filtered out by the connection.
-    Edit { x: i32, y: i32, z: i32, spec: String },
+    Edit { x: i32, y: i32, z: i32, spec: Arc<str> },
     /// The server accepted our own edit `req`: prediction can forget it.
     EditAccepted { req: u32 },
     /// `restore` is set when no newer authoritative content has landed on the
     /// cell since, so the optimistic apply should roll back.
     EditRejected { req: u32, restore: bool },
     Position { pos: DVec3 },
-    Chat { from_name: String, channel: u8, text: String },
-    Joined { name: String },
-    Left { name: String },
+    Chat { from_name: Arc<str>, channel: u8, text: Arc<str> },
+    Joined { name: Arc<str> },
+    Left { name: Arc<str> },
     /// Surfaced so the game can react (audio) beyond the local animator
     /// update already applied in `apply()`.
     PeerSwing { id: u32 },
@@ -213,8 +216,8 @@ impl Connection {
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
             fingerprint: crate::net::content_fingerprint(),
-            name: name.to_string(),
-            password: password.to_string(),
+            name: name.into(),
+            password: password.into(),
         };
         rt.block_on(protocol::write_frame_async(&mut send, &hello.encode()))
             .map_err(|e| format!("send failed: {e}"))?;
@@ -229,7 +232,7 @@ impl Connection {
         })?;
         let (player_id, seed, spawn) = match ServerMessage::decode(&frame) {
             Some(ServerMessage::Welcome { player_id, seed, spawn }) => (player_id, seed, spawn),
-            Some(ServerMessage::Reject { reason }) => return Err(reason),
+            Some(ServerMessage::Reject { reason }) => return Err(reason.to_string()),
             _ => return Err("unexpected reply from server".to_string()),
         };
 
@@ -483,7 +486,7 @@ impl Connection {
     /// [`Incoming::EditRejected`] verdict will carry. The expected revision
     /// counts our own in-flight edits on the cell, so a quick break-then-place
     /// chain lines up with the revisions its earlier requests will commit.
-    pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: String) -> u32 {
+    pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: Arc<str>) -> u32 {
         let cell = (x, y, z);
         let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
         let in_flight = self.pending_edits.iter().filter(|&&(_, c, _)| c == cell).count() as u32;
@@ -513,8 +516,8 @@ impl Connection {
         self.voice_in.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect()
     }
 
-    pub fn send_chat(&mut self, channel: u8, text: String) {
-        let text: String = text.chars().take(MAX_CHAT).collect();
+    pub fn send_chat(&mut self, channel: u8, text: &str) {
+        let text: Arc<str> = text.chars().take(MAX_CHAT).collect::<String>().into();
         self.dispatch(&ClientMessage::Chat { channel, text });
     }
 
@@ -605,7 +608,7 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
         let events = b.poll();
         assert!(
-            events.iter().any(|e| matches!(e, Incoming::Chat { text, .. } if text == "hello")),
+            events.iter().any(|e| matches!(e, Incoming::Chat { text, .. } if &**text == "hello")),
             "guahlg should receive walnutty's global chat"
         );
 

@@ -20,9 +20,9 @@ use std::path::Path;
 
 use voxel_engine::Engine;
 
-use crate::render_config::RenderConfig;
+use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, max_lod_levels};
 
-pub use crate::world::VIEW_RADIUS_RANGE;
+pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RADIUS_RANGE};
 /// Render-resolution scale clamp range — re-exported from the engine, which owns
 /// the single source (it does the real clamp in `set_render_scale`). Re-exporting
 /// here mirrors the [`VIEW_RADIUS_RANGE`] re-export so the settings UI and the
@@ -39,8 +39,25 @@ pub const UI_SCALE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
 
 pub const SHAKE_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
+// Performance-profile markers (see [`Settings::preset`]).
+pub const PRESET_CUSTOM: u8 = 0;
+pub const PRESET_MINIMUM: u8 = 1;
+pub const PRESET_FAST: u8 = 2;
+pub const PRESET_DEFAULT: u8 = 3;
+
+// HUD visibility modes (see [`Settings::hud_mode`]).
+pub const HUD_OFF: u8 = 0;
+pub const HUD_MINIMAL: u8 = 1;
+pub const HUD_FULL: u8 = 2;
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
+    /// Performance profile marker. Editing any individual profile-owned
+    /// setting changes this to [`PRESET_CUSTOM`] (see [`Setting::step`] /
+    /// [`Setting::parse_human`]); choosing another profile applies it
+    /// atomically. Personal controls (fullscreen, FOV, UI/menu scale, shake,
+    /// audio) never touch it.
+    pub preset: u8,
     pub fullscreen: bool,
     pub vsync: bool,
     /// MSAA sample count: 1 (off), 2, 4 or 8. Clamped to hardware support on apply.
@@ -70,6 +87,38 @@ pub struct Settings {
     /// vertex-fetch bound), so it is absent from [`SETTINGS`] and pushed to the
     /// engine by [`apply`](Settings::apply) like the table fields.
     pub cull_faces: bool,
+
+    // Performance controls — cost levers independent of the look lanes below.
+    /// Number of chunks streamed above and below the camera, decoupled from
+    /// the horizontal ring radius so tall invisible columns aren't loaded.
+    pub vertical_distance: i32,
+    /// Number of far-field LOD levels, including the nearest configured level.
+    pub lod_levels: u8,
+    /// Detail exponent of the nearest far-field LOD level (`2^detail` metres).
+    pub lod_detail: u8,
+    /// World streaming update rate; zero updates every frame.
+    pub stream_hz: u32,
+    /// Fixed physics update rate; zero updates every frame.
+    pub physics_hz: u32,
+    /// Day/night clock update rate; zero updates every frame.
+    pub sky_hz: u32,
+    /// Gameplay-mod update rate; zero updates every frame. Input edges are
+    /// retained until the next permitted mod tick.
+    pub mod_hz: u32,
+    /// Run world simulation.
+    pub simulation: bool,
+    /// Run gameplay-mod update hooks at `mod_hz`. Mining and core movement
+    /// remain available when disabled, but inventory/crafting UI logic stays
+    /// dormant.
+    pub mod_logic: bool,
+    /// Periodically persist world edits while playing.
+    pub autosave: bool,
+    /// HUD visibility: [`HUD_OFF`], [`HUD_MINIMAL`], or [`HUD_FULL`].
+    pub hud_mode: u8,
+    pub minimap: bool,
+    pub mod_hud: bool,
+    pub player_models: bool,
+    pub name_tags: bool,
 
     // Render lanes — the source of truth for [`RenderConfig`] (built by
     // [`render_config`](Settings::render_config)). The engine lanes go live via
@@ -123,6 +172,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            preset: PRESET_DEFAULT,
             fullscreen: false,
             vsync: false,
             msaa: 1,
@@ -135,6 +185,21 @@ impl Default for Settings {
             shake: 1.0,
             lighting: true,
             cull_faces: false,
+            vertical_distance: 3,
+            lod_levels: 7,
+            lod_detail: 2,
+            stream_hz: 0,
+            physics_hz: 0,
+            sky_hz: 0,
+            mod_hz: 0,
+            simulation: true,
+            mod_logic: true,
+            autosave: true,
+            hud_mode: HUD_FULL,
+            minimap: true,
+            mod_hud: true,
+            player_models: true,
+            name_tags: true,
             // Render lanes: the shipped defaults. `lod2` (the far field) ships off —
             // near-only by default; the harness keeps it on via `RenderConfig::golden`.
             occlusion: true,
@@ -172,6 +237,7 @@ impl Default for Settings {
 /// Settings submenu category.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
+    Performance,
     Video,
     World,
     Interface,
@@ -180,7 +246,8 @@ pub enum Category {
 
 impl Category {
     /// All categories in menu order with their page titles.
-    pub const ALL: [(Category, &'static str); 4] = [
+    pub const ALL: [(Category, &'static str); 5] = [
+        (Category::Performance, "Performance"),
         (Category::Video, "Video"),
         (Category::World, "World"),
         (Category::Interface, "Interface"),
@@ -262,13 +329,33 @@ impl Setting {
     }
 
     /// Apply one menu Left/Right step (`dir` = -1 or +1), wrapping at the ends.
+    /// A profile-owned value that actually changes marks the state Custom.
     pub fn step(&self, s: &mut Settings, dir: i32) {
-        (self.step)(s, dir)
+        let before = s.clone();
+        (self.step)(s, dir);
+        self.note_custom(s, &before);
     }
 
     /// Parse a `/gfx` value and clamp. Returns whether the value parsed.
+    /// A profile-owned value that actually changes marks the state Custom.
     pub fn parse_human(&self, s: &mut Settings, value: &str) -> bool {
-        (self.parse_human)(s, value)
+        let before = s.clone();
+        let parsed = (self.parse_human)(s, value);
+        if parsed {
+            self.note_custom(s, &before);
+        }
+        parsed
+    }
+
+    /// The one place the "editing an individual field marks Custom" rule
+    /// lives, so no UI surface has to remember it. The preset row applies its
+    /// own marker; personal controls (fullscreen, FOV, UI/menu scale, shake,
+    /// audio) are not profile-owned and never touch it. Persistence `read`
+    /// deliberately bypasses this — loading restores the saved marker.
+    fn note_custom(&self, s: &mut Settings, before: &Settings) {
+        if *s != *before && Settings::PROFILE_OWNED_KEYS.contains(&self.key) {
+            s.preset = PRESET_CUSTOM;
+        }
     }
 
     /// The exact `/gfx` confirmation line for the current value.
@@ -350,13 +437,274 @@ macro_rules! volume_bar {
     (@aliases $aliases:expr) => { $aliases };
 }
 
+/// A percent-displayed `f32` bar (stored as a raw multiplier, shown ×100):
+/// the shape render/UI/menu scale and camera shake all share — fraction from
+/// the range, percent show/confirm, parse-as-percent + clamp, and a stepper
+/// cycling a fixed percent list. One macro instead of four ~30-line blocks.
+macro_rules! percent_bar {
+    ($cat:expr, $field:ident, $key:literal, $label:literal, $range:expr, $clamp:path,
+     $steps:expr, $usage:literal, $confirm:literal, $aliases:expr) => {
+        Setting {
+            category: $cat,
+            menu_kind: MenuKind::Bar,
+            fraction: |s| frac(s.$field, *$range.start(), *$range.end()),
+            key: $key,
+            aliases: $aliases,
+            label: $label,
+            usage: $usage,
+            confirm: |s| format!(concat!($confirm, " {:.0}%"), s.$field * 100.0),
+            show: |s| format!("{:.0}%", s.$field * 100.0),
+            parse_human: |s, v| match v.parse::<f32>() {
+                Ok(pct) => {
+                    s.$field = pct / 100.0;
+                    $clamp(s);
+                    true
+                }
+                Err(_) => false,
+            },
+            step: |s, d| {
+                let pct = cycle_list($steps, (s.$field * 100.0).round() as i32, d);
+                s.$field = pct as f32 / 100.0;
+            },
+            clamp: $clamp,
+            write: |s| s.$field.to_string(),
+            read: |s, v| set_parsed(&mut s.$field, v),
+        }
+    };
+}
+
+/// A `Category::Performance` fixed-rate row over a `u32` Hz field: cycles the
+/// offered rates, snaps stray persisted values down to a supported rate, and
+/// shares the "0 = every frame" convention. One macro instead of four
+/// hand-written descriptors, so a new throttled lane is a single row.
+macro_rules! rate_setting {
+    ($field:ident, $key:literal, $label:literal, $kind:literal, $rates:expr, $usage:literal, $aliases:expr) => {
+        Setting {
+            category: Category::Performance,
+            menu_kind: MenuKind::Choice,
+            fraction: |_| 0.0,
+            key: $key,
+            aliases: $aliases,
+            label: $label,
+            usage: $usage,
+            confirm: |s| rate_confirm($kind, s.$field),
+            show: |s| rate_name(s.$field),
+            parse_human: |s, v| parse_rate(&mut s.$field, v, $rates),
+            step: |s, d| s.$field = cycle_list($rates, s.$field as i32, d) as u32,
+            clamp: |s| s.$field = snap_rate($rates, s.$field.min(i32::MAX as u32) as i32) as u32,
+            write: |s| s.$field.to_string(),
+            read: |s, v| set_parsed(&mut s.$field, v),
+        }
+    };
+}
+
 /// The MSAA sample counts offered — one list shared by its stepper and its
 /// "round down to a supported count" clamp bucket.
 const MSAA: &[i32] = &[1, 2, 4, 8];
+const PRESETS: &[i32] =
+    &[PRESET_CUSTOM as i32, PRESET_MINIMUM as i32, PRESET_FAST as i32, PRESET_DEFAULT as i32];
+const STREAM_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
+const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
+const SKY_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
+const MOD_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 36] = [
+pub const SETTINGS: [Setting; 52] = [
+    Setting {
+        category: Category::Performance,
+        menu_kind: MenuKind::Choice,
+        fraction: |_| 0.0,
+        key: "preset",
+        aliases: &["profile"],
+        label: "Performance Preset",
+        usage: "preset custom|minimum|fast|default",
+        confirm: |s| format!("performance preset {}", preset_name(s.preset).to_ascii_lowercase()),
+        show: |s| preset_name(s.preset).to_string(),
+        parse_human: Settings::select_preset,
+        step: |s, d| {
+            let preset = cycle_list(PRESETS, s.preset as i32, d) as u8;
+            s.apply_preset(preset);
+        },
+        clamp: preset_clamp,
+        write: |s| s.preset.to_string(),
+        // Loading restores the saved marker and every saved field independently;
+        // it must not reapply a profile or turn later lines into Custom.
+        read: |s, v| set_parsed(&mut s.preset, v),
+    },
+    Setting {
+        category: Category::Performance,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| {
+            frac(
+                s.vertical_distance as f32,
+                *VERTICAL_DISTANCE_RANGE.start() as f32,
+                *VERTICAL_DISTANCE_RANGE.end() as f32,
+            )
+        },
+        key: "vertical_distance",
+        aliases: &["vertical", "verticaldist"],
+        label: "Vertical Distance",
+        usage: "vertical_distance <1-10>",
+        confirm: |s| format!("vertical distance {}", s.vertical_distance),
+        show: |s| s.vertical_distance.to_string(),
+        parse_human: |s, v| {
+            let parsed = set_parsed(&mut s.vertical_distance, v);
+            if parsed {
+                vertical_distance_clamp(s);
+            }
+            parsed
+        },
+        step: |s, d| {
+            s.vertical_distance = wrap_clamp(
+                s.vertical_distance,
+                *VERTICAL_DISTANCE_RANGE.start(),
+                *VERTICAL_DISTANCE_RANGE.end(),
+                d,
+            );
+        },
+        clamp: vertical_distance_clamp,
+        write: |s| s.vertical_distance.to_string(),
+        read: |s, v| set_parsed(&mut s.vertical_distance, v),
+    },
+    Setting {
+        category: Category::Performance,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| {
+            frac(
+                s.lod_levels as f32,
+                *LOD_LEVELS_RANGE.start() as f32,
+                *LOD_LEVELS_RANGE.end() as f32,
+            )
+        },
+        key: "lod_levels",
+        aliases: &["lodlevels"],
+        label: "LOD Range",
+        usage: "lod_levels <1-8>",
+        confirm: |s| format!("LOD range {} levels (~{} m)", s.lod_levels, lod_range_metres(s)),
+        show: |s| format!("{} levels (~{} m)", s.lod_levels, lod_range_metres(s)),
+        parse_human: |s, v| {
+            let parsed = set_parsed(&mut s.lod_levels, v);
+            if parsed {
+                lod_clamp(s);
+            }
+            parsed
+        },
+        step: |s, d| {
+            let max = max_lod_levels(s.lod_detail);
+            s.lod_levels = wrap_clamp(s.lod_levels as i32, 1, max as i32, d) as u8;
+        },
+        clamp: lod_clamp,
+        write: |s| s.lod_levels.to_string(),
+        read: |s, v| set_parsed(&mut s.lod_levels, v),
+    },
+    Setting {
+        category: Category::Performance,
+        menu_kind: MenuKind::Bar,
+        fraction: |s| {
+            frac(
+                s.lod_detail as f32,
+                *LOD_DETAIL_RANGE.start() as f32,
+                *LOD_DETAIL_RANGE.end() as f32,
+            )
+        },
+        key: "lod_detail",
+        aliases: &["loddetail"],
+        label: "LOD Quality",
+        usage: "lod_detail <2-6>",
+        confirm: |s| format!("LOD quality {} m cells", lod_cell_metres(s.lod_detail)),
+        show: |s| format!("{} m cells", lod_cell_metres(s.lod_detail)),
+        parse_human: |s, v| {
+            let parsed = set_parsed(&mut s.lod_detail, v);
+            if parsed {
+                lod_clamp(s);
+            }
+            parsed
+        },
+        step: |s, d| {
+            s.lod_detail = wrap_clamp(
+                s.lod_detail as i32,
+                *LOD_DETAIL_RANGE.start() as i32,
+                *LOD_DETAIL_RANGE.end() as i32,
+                d,
+            ) as u8;
+            lod_clamp(s);
+        },
+        clamp: lod_clamp,
+        write: |s| s.lod_detail.to_string(),
+        read: |s, v| set_parsed(&mut s.lod_detail, v),
+    },
+    rate_setting!(
+        stream_hz,
+        "stream_hz",
+        "Streaming Rate",
+        "streaming",
+        STREAM_RATES,
+        "stream_hz every|15|30|60|120|240",
+        &["streamrate"]
+    ),
+    rate_setting!(
+        physics_hz,
+        "physics_hz",
+        "Physics Rate",
+        "physics",
+        PHYSICS_RATES,
+        "physics_hz every|30|60|120|240|500|1000",
+        &["physicsrate"]
+    ),
+    rate_setting!(
+        sky_hz,
+        "sky_hz",
+        "Sky Clock Rate",
+        "sky clock",
+        SKY_RATES,
+        "sky_hz every|15|30|60|120|240",
+        &["skyrate"]
+    ),
+    rate_setting!(
+        mod_hz,
+        "mod_hz",
+        "Mod Update Rate",
+        "mod updates",
+        MOD_RATES,
+        "mod_hz every|15|30|60|120|240",
+        &["modrate"]
+    ),
+    Setting {
+        category: Category::Performance,
+        menu_kind: MenuKind::Choice,
+        fraction: |_| 0.0,
+        key: "hud_mode",
+        aliases: &["hud"],
+        label: "HUD Mode",
+        usage: "hud_mode off|minimal|full",
+        confirm: |s| format!("HUD {}", hud_name(s.hud_mode).to_ascii_lowercase()),
+        show: |s| hud_name(s.hud_mode).to_string(),
+        parse_human: |s, v| match parse_hud_mode(v) {
+            Some(mode) => {
+                s.hud_mode = mode;
+                true
+            }
+            None => false,
+        },
+        step: |s, d| s.hud_mode = cycle_list(&[0, 1, 2], s.hud_mode as i32, d) as u8,
+        clamp: hud_mode_clamp,
+        write: |s| s.hud_mode.to_string(),
+        read: |s, v| set_parsed(&mut s.hud_mode, v),
+    },
+    toggle_setting!(Category::Performance, simulation, "simulation", "Simulation", &["sim"]),
+    toggle_setting!(Category::Performance, mod_logic, "mod_logic", "Mod Updates", &["mods"]),
+    toggle_setting!(Category::Performance, autosave, "autosave", "Autosave", &[]),
+    toggle_setting!(Category::Performance, minimap, "minimap", "Minimap", &["map"]),
+    toggle_setting!(Category::Performance, mod_hud, "mod_hud", "Mod HUD", &["modhud"]),
+    toggle_setting!(
+        Category::Performance,
+        player_models,
+        "player_models",
+        "Player Models",
+        &["models"]
+    ),
+    toggle_setting!(Category::Performance, name_tags, "name_tags", "Name Tags", &["nametags"]),
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Toggle,
@@ -477,7 +825,7 @@ pub const SETTINGS: [Setting; 36] = [
         key: "render_distance",
         aliases: &["renderdist", "renderdistance"],
         label: "Render Distance",
-        usage: "renderdist <3-20>",
+        usage: "renderdist <0-20>",
         confirm: |s| format!("render distance {}", s.render_distance),
         show: |s| s.render_distance.to_string(),
         parse_human: |s, v| {
@@ -533,123 +881,54 @@ pub const SETTINGS: [Setting; 36] = [
         write: |s| s.fov.to_string(),
         read: |s, v| set_parsed(&mut s.fov, v),
     },
-    Setting {
-        category: Category::Video,
-        menu_kind: MenuKind::Bar,
-        fraction: |s| frac(s.render_scale, *RENDER_SCALE_RANGE.start(), *RENDER_SCALE_RANGE.end()),
-        key: "render_scale",
-        aliases: &["renderscale", "scale"],
-        label: "Render Scale",
-        usage: "renderscale <25-200>",
-        confirm: |s| format!("render scale {:.0}%", s.render_scale * 100.0),
-        // Percent-encoded for humans (75%), stored raw (0.75) for save-compat.
-        show: |s| format!("{:.0}%", s.render_scale * 100.0),
-        parse_human: |s, v| match v.parse::<f32>() {
-            Ok(pct) => {
-                s.render_scale = pct / 100.0;
-                scale_clamp(s);
-                true
-            }
-            Err(_) => false,
-        },
-        step: |s, d| {
-            let pct = cycle_list(
-                &[25, 50, 75, 100, 125, 150, 200],
-                (s.render_scale * 100.0).round() as i32,
-                d,
-            );
-            s.render_scale = pct as f32 / 100.0;
-        },
-        clamp: scale_clamp,
-        write: |s| s.render_scale.to_string(),
-        read: |s, v| set_parsed(&mut s.render_scale, v),
-    },
-    Setting {
-        category: Category::Interface,
-        menu_kind: MenuKind::Bar,
-        fraction: |s| frac(s.ui_scale, *UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end()),
-        key: "ui_scale",
-        aliases: &["uiscale", "hudscale"],
-        label: "UI Scale",
-        usage: "uiscale <50-200>",
-        confirm: |s| format!("ui scale {:.0}%", s.ui_scale * 100.0),
-        show: |s| format!("{:.0}%", s.ui_scale * 100.0),
-        parse_human: |s, v| match v.parse::<f32>() {
-            Ok(pct) => {
-                s.ui_scale = pct / 100.0;
-                ui_scale_clamp(s);
-                true
-            }
-            Err(_) => false,
-        },
-        step: |s, d| {
-            let pct = cycle_list(
-                &[50, 75, 100, 125, 150, 200],
-                (s.ui_scale * 100.0).round() as i32,
-                d,
-            );
-            s.ui_scale = pct as f32 / 100.0;
-        },
-        clamp: ui_scale_clamp,
-        write: |s| s.ui_scale.to_string(),
-        read: |s, v| set_parsed(&mut s.ui_scale, v),
-    },
-    Setting {
-        category: Category::Interface,
-        menu_kind: MenuKind::Bar,
-        fraction: |s| frac(s.menu_scale, *UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end()),
-        key: "menu_scale",
-        aliases: &["menuscale"],
-        label: "Menu Scale",
-        usage: "menuscale <50-200>",
-        confirm: |s| format!("menu scale {:.0}%", s.menu_scale * 100.0),
-        show: |s| format!("{:.0}%", s.menu_scale * 100.0),
-        parse_human: |s, v| match v.parse::<f32>() {
-            Ok(pct) => {
-                s.menu_scale = pct / 100.0;
-                menu_scale_clamp(s);
-                true
-            }
-            Err(_) => false,
-        },
-        step: |s, d| {
-            let pct = cycle_list(
-                &[50, 75, 100, 125, 150, 200],
-                (s.menu_scale * 100.0).round() as i32,
-                d,
-            );
-            s.menu_scale = pct as f32 / 100.0;
-        },
-        clamp: menu_scale_clamp,
-        write: |s| s.menu_scale.to_string(),
-        read: |s, v| set_parsed(&mut s.menu_scale, v),
-    },
-    Setting {
-        category: Category::Interface,
-        menu_kind: MenuKind::Bar,
-        fraction: |s| frac(s.shake, *SHAKE_RANGE.start(), *SHAKE_RANGE.end()),
-        key: "shake",
-        aliases: &["camerashake"],
-        label: "Camera Shake",
-        usage: "shake <0-100>",
-        confirm: |s| format!("camera shake {:.0}%", s.shake * 100.0),
-        show: |s| format!("{:.0}%", s.shake * 100.0),
-        parse_human: |s, v| match v.parse::<f32>() {
-            Ok(pct) => {
-                s.shake = pct / 100.0;
-                shake_clamp(s);
-                true
-            }
-            Err(_) => false,
-        },
-        step: |s, d| {
-            let pct = cycle_list(&[0, 25, 50, 75, 100], (s.shake * 100.0).round() as i32, d);
-            s.shake = pct as f32 / 100.0;
-        },
-        clamp: shake_clamp,
-        write: |s| s.shake.to_string(),
-        read: |s, v| set_parsed(&mut s.shake, v),
-    },
+    percent_bar!(
+        Category::Video,
+        render_scale,
+        "render_scale",
+        "Render Scale",
+        RENDER_SCALE_RANGE,
+        scale_clamp,
+        &[25, 50, 75, 100, 125, 150, 200],
+        "renderscale <25-200>",
+        "render scale",
+        &["renderscale", "scale"]
+    ),
+    percent_bar!(
+        Category::Interface,
+        ui_scale,
+        "ui_scale",
+        "UI Scale",
+        UI_SCALE_RANGE,
+        ui_scale_clamp,
+        &[50, 75, 100, 125, 150, 200],
+        "uiscale <50-200>",
+        "ui scale",
+        &["uiscale", "hudscale"]
+    ),
+    percent_bar!(
+        Category::Interface,
+        menu_scale,
+        "menu_scale",
+        "Menu Scale",
+        UI_SCALE_RANGE,
+        menu_scale_clamp,
+        &[50, 75, 100, 125, 150, 200],
+        "menuscale <50-200>",
+        "menu scale",
+        &["menuscale"]
+    ),
+    percent_bar!(
+        Category::Interface,
+        shake,
+        "shake",
+        "Camera Shake",
+        SHAKE_RANGE,
+        shake_clamp,
+        &[0, 25, 50, 75, 100],
+        "shake <0-100>",
+        "camera shake",
+        &["camerashake"]
+    ),
     // Render lanes (see [`Settings::render_config`]). Engine lanes apply live via
     // `set_flags`; occlusion/lod2 apply on next world entry; clouds/weather per frame.
     video_toggle!(lod2, "lod2", "Distant LOD", &["lod"]),
@@ -680,7 +959,151 @@ pub const SETTINGS: [Setting; 36] = [
     toggle_setting!(Category::Audio, voice_incoming, "voice_incoming", "Hear Voice", &["deafen_inverse", "hearvoice"]),
 ];
 
+/// The fields a named performance profile owns, as one declaration: generates
+/// both [`Settings::copy_profile_values`] (what selecting a profile writes)
+/// and [`Settings::PROFILE_OWNED_KEYS`] (what [`Setting::note_custom`] watches
+/// for individual edits). Every listed field's descriptor `key` equals its
+/// field name, which the key list relies on. Personal/window controls
+/// (fullscreen, FOV, UI/menu scale, shake, cull, audio) are deliberately
+/// absent: profiles preserve them.
+macro_rules! profile_owned {
+    ($($field:ident),* $(,)?) => {
+        impl Settings {
+            /// The persisted keys whose individual edit makes the state Custom.
+            const PROFILE_OWNED_KEYS: &'static [&'static str] = &[$(stringify!($field)),*];
+
+            /// Copy only settings a profile owns. Personal/window controls
+            /// deliberately remain untouched when a profile is selected.
+            fn copy_profile_values(&mut self, p: &Self) {
+                $(self.$field = p.$field;)*
+            }
+        }
+    };
+}
+
+profile_owned!(
+    vsync,
+    msaa,
+    max_fps,
+    render_distance,
+    render_scale,
+    lighting,
+    vertical_distance,
+    lod_levels,
+    lod_detail,
+    stream_hz,
+    physics_hz,
+    sky_hz,
+    mod_hz,
+    simulation,
+    mod_logic,
+    autosave,
+    hud_mode,
+    minimap,
+    mod_hud,
+    player_models,
+    name_tags,
+    occlusion,
+    lod2,
+    blocklight,
+    exposure,
+    bloom,
+    godrays,
+    clouds,
+    weather,
+    stars,
+    day_night,
+    taa,
+    fog,
+    ambient,
+    sunlight,
+    shadows,
+    sky,
+    vrs,
+    water_anim,
+    ao,
+    vignette,
+);
+
 impl Settings {
+    /// Record that an individual setting no longer matches a named profile.
+    pub fn mark_custom(&mut self) {
+        self.preset = PRESET_CUSTOM;
+    }
+
+    /// Apply a named/numeric performance profile. Shared by `/gfx`, the menu,
+    /// and reproducible benchmark startup (`WATT_BENCH_PRESET`).
+    pub fn select_preset(&mut self, value: &str) -> bool {
+        let Some(preset) = parse_preset(value) else {
+            return false;
+        };
+        self.apply_preset(preset);
+        true
+    }
+
+    fn apply_preset(&mut self, preset: u8) {
+        let preset = preset.min(PRESET_DEFAULT);
+        if preset == PRESET_CUSTOM {
+            self.mark_custom();
+            return;
+        }
+
+        let mut profile = Self::default();
+        match preset {
+            PRESET_MINIMUM => {
+                profile.vsync = false;
+                profile.msaa = 1;
+                profile.render_distance = 0;
+                profile.render_scale = 0.25;
+                profile.lighting = false;
+                profile.vertical_distance = 1;
+                profile.lod_levels = 1;
+                profile.lod_detail = 6;
+                profile.stream_hz = 15;
+                profile.physics_hz = 30;
+                profile.sky_hz = 15;
+                profile.mod_hz = 15;
+                profile.simulation = false;
+                profile.mod_logic = false;
+                profile.autosave = false;
+                profile.hud_mode = HUD_OFF;
+                profile.minimap = false;
+                profile.mod_hud = false;
+                profile.player_models = false;
+                profile.name_tags = false;
+                disable_costly_lanes(&mut profile);
+                profile.lod2 = false;
+            }
+            PRESET_FAST => {
+                profile.vsync = false;
+                profile.msaa = 1;
+                profile.render_distance = 3;
+                profile.render_scale = 0.5;
+                profile.lighting = false;
+                profile.vertical_distance = 2;
+                profile.lod_levels = 3;
+                profile.lod_detail = 4;
+                profile.stream_hz = 60;
+                profile.physics_hz = 60;
+                profile.sky_hz = 60;
+                profile.mod_hz = 60;
+                profile.simulation = true;
+                profile.autosave = true;
+                profile.hud_mode = HUD_MINIMAL;
+                profile.minimap = false;
+                profile.mod_hud = false;
+                profile.player_models = true;
+                profile.name_tags = false;
+                disable_costly_lanes(&mut profile);
+                profile.lod2 = true;
+            }
+            PRESET_DEFAULT => {}
+            _ => unreachable!("preset was clamped above"),
+        }
+        self.copy_profile_values(&profile);
+        self.preset = preset;
+    }
+
     /// Load from disk, falling back to defaults for missing/invalid entries.
     pub fn load() -> Self {
         let mut settings = Self::default();
@@ -757,6 +1180,8 @@ impl Settings {
         RenderConfig {
             occlusion: self.occlusion,
             lod2: self.lod2,
+            lod_levels: self.lod_levels,
+            lod_detail: self.lod_detail,
             blocklight: self.blocklight,
             exposure: self.exposure,
             bloom: self.bloom,
@@ -793,6 +1218,121 @@ impl Settings {
 }
 
 // Shared value helpers — the single definition each surface reuses.
+
+/// The "costly lanes off" set the Minimum and Fast profiles share: every
+/// optional presentation lane a stripped profile removes. Sunlight stays on so
+/// stripped terrain remains readable.
+fn disable_costly_lanes(s: &mut Settings) {
+    s.occlusion = false;
+    s.lod2 = false;
+    s.blocklight = false;
+    s.exposure = false;
+    s.bloom = false;
+    s.godrays = false;
+    s.clouds = false;
+    s.weather = false;
+    s.stars = false;
+    s.day_night = false;
+    s.taa = false;
+    s.fog = false;
+    s.ambient = false;
+    s.sunlight = true;
+    s.shadows = false;
+    s.sky = false;
+    s.vrs = false;
+    s.water_anim = false;
+    s.ao = false;
+    s.vignette = false;
+}
+
+fn preset_name(preset: u8) -> &'static str {
+    match preset {
+        PRESET_MINIMUM => "Minimum",
+        PRESET_FAST => "Fast",
+        PRESET_DEFAULT => "Default",
+        _ => "Custom",
+    }
+}
+
+fn parse_preset(value: &str) -> Option<u8> {
+    match value {
+        "custom" | "0" => Some(PRESET_CUSTOM),
+        "minimum" | "min" | "1" => Some(PRESET_MINIMUM),
+        "fast" | "2" => Some(PRESET_FAST),
+        "default" | "3" => Some(PRESET_DEFAULT),
+        _ => None,
+    }
+}
+
+fn preset_clamp(s: &mut Settings) {
+    s.preset = s.preset.min(PRESET_DEFAULT);
+}
+
+fn hud_name(mode: u8) -> &'static str {
+    match mode {
+        HUD_MINIMAL => "Minimal",
+        HUD_FULL => "Full",
+        _ => "Off",
+    }
+}
+
+fn parse_hud_mode(value: &str) -> Option<u8> {
+    match value {
+        "off" | "0" => Some(HUD_OFF),
+        "minimal" | "min" | "1" => Some(HUD_MINIMAL),
+        "full" | "2" => Some(HUD_FULL),
+        _ => None,
+    }
+}
+
+fn hud_mode_clamp(s: &mut Settings) {
+    s.hud_mode = s.hud_mode.min(HUD_FULL);
+}
+
+fn rate_name(rate: u32) -> String {
+    if rate == 0 { "Every frame".to_string() } else { format!("{rate} Hz") }
+}
+
+fn rate_confirm(kind: &str, rate: u32) -> String {
+    if rate == 0 { format!("{kind} every frame") } else { format!("{kind} {rate} Hz") }
+}
+
+fn parse_rate(dst: &mut u32, value: &str, choices: &[i32]) -> bool {
+    let parsed = match value {
+        "every" | "frame" | "0" => 0,
+        _ => match value.parse::<u32>() {
+            Ok(rate) => rate,
+            Err(_) => return false,
+        },
+    };
+    *dst = snap_rate(choices, parsed.min(i32::MAX as u32) as i32) as u32;
+    true
+}
+
+fn vertical_distance_clamp(s: &mut Settings) {
+    s.vertical_distance = s
+        .vertical_distance
+        .clamp(*VERTICAL_DISTANCE_RANGE.start(), *VERTICAL_DISTANCE_RANGE.end());
+}
+
+fn lod_clamp(s: &mut Settings) {
+    s.lod_detail = s.lod_detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
+    s.lod_levels = s.lod_levels.clamp(*LOD_LEVELS_RANGE.start(), max_lod_levels(s.lod_detail));
+}
+
+/// The approximate far-field outer range in metres for the confirm/show text.
+fn lod_range_metres(s: &Settings) -> u64 {
+    let radius = s
+        .render_distance
+        .clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end())
+        .max(1) as u64;
+    let levels = s.lod_levels.clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end());
+    radius * 16 * (1_u64 << levels)
+}
+
+fn lod_cell_metres(detail: u8) -> u32 {
+    1_u32 << detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end())
+}
 
 /// Parse an on/off word. The one toggle parser (persistence AND `/gfx`).
 pub fn parse_toggle(value: &str) -> Option<bool> {
@@ -929,6 +1469,21 @@ fn cycle_list(list: &[i32], current: i32, dir: i32) -> i32 {
 /// Snap to the largest list entry <= v (or first entry if none found).
 fn snap_down(list: &[i32], v: i32) -> i32 {
     list.iter().rev().copied().find(|&e| e <= v).unwrap_or(list[0])
+}
+
+/// Rate zero is the explicit every-frame mode. A malformed positive value must
+/// never clamp to zero (which would increase work); it snaps to the nearest
+/// supported rate at or below it, with the minimum positive rate as the floor.
+fn snap_rate(list: &[i32], v: i32) -> i32 {
+    if v == 0 {
+        return 0;
+    }
+    list.iter()
+        .rev()
+        .copied()
+        .find(|&e| e > 0 && e <= v)
+        .or_else(|| list.iter().copied().find(|&e| e > 0))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1110,6 +1665,133 @@ mod tests {
         assert_eq!(mix.master, 0.5);
         assert!(mix.deafen);
         assert!(!mix.muted);
+    }
+
+    #[test]
+    fn positive_rates_never_snap_to_every_frame() {
+        assert_eq!(snap_rate(STREAM_RATES, 0), 0);
+        assert_eq!(snap_rate(STREAM_RATES, 1), 15);
+        assert_eq!(snap_rate(STREAM_RATES, 14), 15);
+        assert_eq!(snap_rate(STREAM_RATES, 29), 15);
+        assert_eq!(snap_rate(STREAM_RATES, 59), 30);
+        assert_eq!(snap_rate(PHYSICS_RATES, 999), 500);
+        assert_eq!(snap_rate(MOD_RATES, 1), 15);
+    }
+
+    #[test]
+    fn presets_apply_owned_fields_and_preserve_personal_controls() {
+        let preset = SETTINGS.iter().find(|f| f.matches("preset")).unwrap();
+        let mut s = Settings::default();
+        s.fullscreen = true;
+        s.max_fps = 777;
+        s.fov = 105.0;
+        s.ui_scale = 1.5;
+        s.menu_scale = 0.75;
+        s.shake = 0.25;
+        s.cull_faces = true;
+
+        assert!(preset.parse_human(&mut s, "minimum"));
+        assert_eq!(s.preset, PRESET_MINIMUM);
+        assert_eq!(s.max_fps, 0, "a performance preset must remove an old cap");
+        assert_eq!(s.render_scale, 0.25);
+        assert_eq!((s.render_distance, s.vertical_distance), (0, 1));
+        assert!(!s.lod2);
+        assert_eq!((s.lod_levels, s.lod_detail), (1, 6));
+        assert_eq!(lod_range_metres(&s), 32, "zero near radius keeps one LOD unit");
+        assert_eq!((s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz), (15, 30, 15, 15));
+        assert_eq!(s.hud_mode, HUD_OFF);
+        assert!(!s.simulation && !s.mod_logic && !s.autosave);
+        assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
+        assert!(!s.lighting && !s.occlusion && !s.ao && !s.vrs);
+        assert!(!s.sky && !s.bloom && !s.clouds && !s.water_anim);
+        assert!(s.sunlight);
+
+        assert!(preset.parse_human(&mut s, "fast"));
+        assert_eq!(s.preset, PRESET_FAST);
+        assert_eq!(s.max_fps, 0);
+        assert_eq!(s.render_scale, 0.5);
+        assert_eq!((s.render_distance, s.vertical_distance), (3, 2));
+        assert!(s.lod2);
+        assert_eq!((s.lod_levels, s.lod_detail), (3, 4));
+        assert_eq!(lod_range_metres(&s), 384);
+        assert_eq!((s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz), (60, 60, 60, 60));
+        assert_eq!(s.hud_mode, HUD_MINIMAL);
+        assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
+        assert!(!s.minimap && !s.mod_hud && !s.name_tags);
+
+        assert!(preset.parse_human(&mut s, "default"));
+        let expected = Settings {
+            fullscreen: true,
+            fov: 105.0,
+            ui_scale: 1.5,
+            menu_scale: 0.75,
+            shake: 0.25,
+            cull_faces: true,
+            ..Settings::default()
+        };
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn lod_clamp_enforces_combined_detail_limit() {
+        let mut s = Settings::default();
+        s.lod_detail = 6;
+        s.lod_levels = 8;
+        s.clamp();
+        assert_eq!((s.lod_detail, s.lod_levels), (6, 4));
+        assert!(s.lod_detail + s.lod_levels - 1 <= 9, "coarsest level within the ladder cap");
+
+        s.lod_detail = 255;
+        s.lod_levels = 0;
+        s.clamp();
+        assert_eq!((s.lod_detail, s.lod_levels), (6, 1));
+
+        let detail = SETTINGS.iter().find(|f| f.matches("lod_detail")).unwrap();
+        let levels = SETTINGS.iter().find(|f| f.matches("lod_levels")).unwrap();
+        s.lod_detail = 5;
+        s.lod_levels = 5;
+        detail.step(&mut s, 1);
+        assert_eq!((s.lod_detail, s.lod_levels), (6, 4));
+
+        s.render_distance = 3;
+        s.lod_levels = 3;
+        s.lod_detail = 4;
+        assert_eq!(levels.show(&s), "3 levels (~384 m)");
+        assert_eq!(detail.show(&s), "16 m cells");
+    }
+
+    #[test]
+    fn interactive_edits_mark_custom_but_persistence_does_not() {
+        let preset = SETTINGS.iter().find(|f| f.matches("preset")).unwrap();
+        let scale = SETTINGS.iter().find(|f| f.matches("render_scale")).unwrap();
+
+        let mut s = Settings::default();
+        assert!(preset.parse_human(&mut s, "fast"));
+        assert_eq!(s.preset, PRESET_FAST);
+        assert!(scale.parse_human(&mut s, "75"));
+        assert_eq!(s.preset, PRESET_CUSTOM);
+
+        assert!(preset.parse_human(&mut s, "fast"));
+        assert!(!scale.parse_human(&mut s, "not-a-number"));
+        assert_eq!(s.preset, PRESET_FAST);
+        scale.step(&mut s, 1);
+        assert_eq!(s.preset, PRESET_CUSTOM);
+
+        // Personal controls are not profile-owned: editing them keeps the profile.
+        let fov = SETTINGS.iter().find(|f| f.matches("fov")).unwrap();
+        assert!(preset.parse_human(&mut s, "fast"));
+        fov.step(&mut s, 1);
+        assert_eq!(s.preset, PRESET_FAST, "FOV is a personal control");
+
+        let mut loaded = Settings::default();
+        loaded.parse_from("preset=2\nrender_scale=0.75\nautosave=false\n");
+        loaded.clamp();
+        assert_eq!(loaded.preset, PRESET_FAST);
+        assert_eq!(loaded.render_scale, 0.75);
+        assert!(!loaded.autosave);
+
+        loaded.mark_custom();
+        assert_eq!(loaded.preset, PRESET_CUSTOM);
     }
 
     #[test]

@@ -23,7 +23,7 @@
 use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::light::PaddedLight;
+use super::light::{MAX_LIGHT, PaddedLight};
 use super::neighborhood::Neighborhood;
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::coord::ByPass;
@@ -76,7 +76,7 @@ impl Padded {
 /// Opaque neighbour or same block hides a face (two glass blocks share a hidden internal face).
 #[inline]
 fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
-    tables.opaque[nbr.0 as usize] || nbr == my
+    tables.opaque(nbr) || nbr == my
 }
 
 /// One face direction of the greedy sweep.
@@ -181,11 +181,34 @@ pub fn build_chunk_mesh(
     light: &PaddedLight,
     out: &mut ChunkMeshData,
 ) {
+    build_chunk_mesh_inner(padded, uniform, tables, Some(light), out);
+}
+
+/// Build with constant full light and no light-shell input at all. This is the
+/// stripped-profile path (voxel lighting disabled); when AO is also disabled,
+/// face sampling returns immediately after culling and skips the entire
+/// four-corner stencil.
+pub fn build_chunk_mesh_unlit(
+    padded: &Padded,
+    uniform: Option<BlockId>,
+    tables: &HotTables,
+    out: &mut ChunkMeshData,
+) {
+    build_chunk_mesh_inner(padded, uniform, tables, None, out);
+}
+
+fn build_chunk_mesh_inner(
+    padded: &Padded,
+    uniform: Option<BlockId>,
+    tables: &HotTables,
+    light: Option<&PaddedLight>,
+    out: &mut ChunkMeshData,
+) {
     for (_, m) in out.iter_mut() {
         m.clear();
     }
     match uniform {
-        Some(id) if !tables.solid[id.0 as usize] => {} // uniform non-solid: empty
+        Some(id) if !tables.solid(id) => {} // uniform non-solid: empty
         Some(_) => sweep(padded, true, tables, light, out), // uniform solid: borders only
         None => sweep(padded, false, tables, light, out),   // dense
     }
@@ -198,7 +221,7 @@ fn sweep(
     padded: &Padded,
     edge_only: bool,
     tables: &HotTables,
-    light: &PaddedLight,
+    light: Option<&PaddedLight>,
     out: &mut ChunkMeshData,
 ) {
     let mut mask: [Option<FaceSample>; MASK_CAP] = [None; MASK_CAP];
@@ -261,7 +284,7 @@ fn sweep(
 fn face_sample(
     padded: &Padded,
     tables: &HotTables,
-    light: &PaddedLight,
+    light: Option<&PaddedLight>,
     dir: &Dir,
     n: usize,
     u: usize,
@@ -272,7 +295,7 @@ fn face_sample(
     c[dir.u_axis] = u as i32;
     c[dir.v_axis] = v as i32;
     let id = padded.at(c[0], c[1], c[2]);
-    if !tables.solid[id.0 as usize] {
+    if !tables.solid(id) {
         return None;
     }
     // The cell the face opens into: one step along the normal.
@@ -281,6 +304,13 @@ fn face_sample(
     let nbr = padded.at(o[0], o[1], o[2]);
     if covered(id, nbr, tables) {
         return None;
+    }
+
+    // Minimum/Fast disable both lighting and AO. Their merge key is constant,
+    // so none of the twelve neighbour probes or sixteen light reads/divisions
+    // can affect the result — culling alone decides the mesh.
+    if !tables.ao && light.is_none() {
+        return Some(FaceSample { id, ao: [3; 4], sky: [MAX_LIGHT; 4], block: [MAX_LIGHT; 4] });
     }
 
     // Ambient occlusion: for each of the four face corners, sample the three
@@ -296,7 +326,7 @@ fn face_sample(
         // Occlude on OPACITY, not solidity — matching cull (`covered`) and smooth
         // light (`lum`). A transparent solid (glass/ice/water/leaves) must not cast
         // AO, or it darkens the faces around it. (Old pre-rewrite AO used opaque.)
-        tables.opaque[padded.at(p[0], p[1], p[2]).0 as usize]
+        tables.opaque(padded.at(p[0], p[1], p[2]))
     };
     // AO off: every corner reads unoccluded (uniform 3) — a perf lever, and it
     // also merges quads a gradient would split (matches the pre-rewrite toggle).
@@ -313,30 +343,34 @@ fn face_sample(
     // the corner in the OPEN layer (`on`), skipping opaque cells (they carry no
     // light to a surface). The face cell `o` is never opaque here (an opaque
     // neighbour would have culled the face), so the count is always ≥ 1.
-    let lum = |du: i32, dv: i32| {
-        let mut p = [0i32; 3];
-        p[dir.n_axis] = on;
-        p[dir.u_axis] = u as i32 + du;
-        p[dir.v_axis] = v as i32 + dv;
-        (tables.opaque[padded.at(p[0], p[1], p[2]).0 as usize], light.at(p[0], p[1], p[2]))
-    };
-    let mut sky = [0u8; 4];
-    let mut block = [0u8; 4];
-    for i in 0..4 {
-        let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
-        let ev = if dir.corners[i][2] > 0.5 { 1 } else { -1 };
-        let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
-        for (du, dv) in [(0, 0), (eu, 0), (0, ev), (eu, ev)] {
-            let (opaque, l) = lum(du, dv);
-            if opaque {
-                continue;
+    // Without a light shell every corner reads constant full light — exactly
+    // what averaging a full shell would produce, minus the sixteen reads.
+    let mut sky = [MAX_LIGHT; 4];
+    let mut block = [MAX_LIGHT; 4];
+    if let Some(light) = light {
+        let lum = |du: i32, dv: i32| {
+            let mut p = [0i32; 3];
+            p[dir.n_axis] = on;
+            p[dir.u_axis] = u as i32 + du;
+            p[dir.v_axis] = v as i32 + dv;
+            (tables.opaque(padded.at(p[0], p[1], p[2])), light.at(p[0], p[1], p[2]))
+        };
+        for i in 0..4 {
+            let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
+            let ev = if dir.corners[i][2] > 0.5 { 1 } else { -1 };
+            let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
+            for (du, dv) in [(0, 0), (eu, 0), (0, ev), (eu, ev)] {
+                let (opaque, l) = lum(du, dv);
+                if opaque {
+                    continue;
+                }
+                ssum += l.sky.get() as u32;
+                bsum += l.block.get() as u32;
+                count += 1;
             }
-            ssum += l.sky.get() as u32;
-            bsum += l.block.get() as u32;
-            count += 1;
+            sky[i] = (ssum / count) as u8;
+            block[i] = (bsum / count) as u8;
         }
-        sky[i] = (ssum / count) as u8;
-        block[i] = (bsum / count) as u8;
     }
 
     Some(FaceSample { id, ao, sky, block })
@@ -376,7 +410,7 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
             sample.id.0 % tables.layer_cap,
             Ao::new(sample.ao[i]),
             Light::new(sample.sky[i], sample.block[i]),
-            tables.water[sample.id.0 as usize],
+            tables.water(sample.id),
         )
     });
 
@@ -427,18 +461,45 @@ mod tests {
     const DIRT: BlockId = BlockId(2);
 
     fn tables() -> HotTables {
-        HotTables {
-            solid: vec![false, true, true].into(),
-            opaque: vec![false, true, true].into(),
-            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Opaque].into(),
-            emission: vec![0, 0, 0].into(),
-            water: vec![false, false, false].into(),
-            ..HotTables::default()
-        }
+        HotTables::from_parts(
+            &[false, true, true],
+            &[false, true, true],
+            &[false, false, false],
+            vec![Pass::Opaque, Pass::Opaque, Pass::Opaque].into(),
+            vec![0, 0, 0].into(),
+            vec![0, 0, 0].into(),
+        )
     }
 
     fn empty_chunk() -> Chunk {
         Chunk::new(0, 0, 0, &EmptyGen)
+    }
+
+    /// The unlit path must be byte-identical to meshing against a full-bright
+    /// shell — it is the same computation minus the reads. Checked with AO on
+    /// AND off (off additionally takes the constant-sample early return).
+    #[test]
+    fn unlit_mesh_matches_full_bright_shell_exactly() {
+        let solid = Chunk::new(0, 0, 0, &SolidGen);
+        let mut dense = empty_chunk();
+        for (x, y, z) in [(0, 0, 0), (1, 0, 0), (5, 9, 3), (15, 15, 15), (8, 8, 8)] {
+            dense.set_local(x, y, z, if (x + y + z) % 2 == 0 { STONE } else { DIRT });
+        }
+        for chunk in [&solid, &dense] {
+            let padded = Padded::capture(|dx, dy, dz| ((dx, dy, dz) == (0, 0, 0)).then_some(chunk));
+            for ao in [false, true] {
+                let mut tables = tables();
+                tables.ao = ao;
+                let mut lit = new_chunk_mesh_data();
+                build_chunk_mesh(&padded, chunk.uniform(), &tables, &PaddedLight::full(), &mut lit);
+                let mut unlit = new_chunk_mesh_data();
+                build_chunk_mesh_unlit(&padded, chunk.uniform(), &tables, &mut unlit);
+                for ((_, a), (_, b)) in lit.iter().zip(unlit.iter()) {
+                    assert_eq!(a.vertices(), b.vertices(), "ao={ao}");
+                    assert_eq!(a.buckets(), b.buckets(), "ao={ao}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -483,20 +544,17 @@ mod tests {
         let mut chunk = Chunk::from_uniform(0, 0, 0, AIR);
         chunk.set_local(8, 8, 8, high);
         // Air (id 0) stays non-solid/clear or the lone block's faces get culled.
-        let flags = |v: bool| {
-            let mut f = vec![v; 301];
-            f[0] = false;
-            f.into()
-        };
-        let t = HotTables {
-            solid: flags(true),
-            opaque: flags(true),
-            layer: vec![Pass::Opaque; 301].into(),
-            emission: vec![0; 301].into(),
-            water: vec![false; 301].into(),
-            layer_cap: 256, // a min-spec-ish ceiling
-            ..HotTables::default()
-        };
+        let mut bools = vec![true; 301];
+        bools[0] = false;
+        let mut t = HotTables::from_parts(
+            &bools,
+            &bools,
+            &vec![false; 301],
+            vec![Pass::Opaque; 301].into(),
+            vec![0; 301].into(),
+            vec![0; 301].into(),
+        );
+        t.layer_cap = 256; // a min-spec-ish ceiling
         let mut out = new_chunk_mesh_data();
         build_chunk_mesh(&solo(&chunk), None, &t, &PaddedLight::full(), &mut out);
         let layers: Vec<u16> = out[Pass::Opaque].vertices().iter().map(|v| v.layer()).collect();
@@ -525,7 +583,7 @@ mod tests {
             if !range.contains(&x) || !range.contains(&y) || !range.contains(&z) {
                 return false;
             }
-            t.solid[chunk.get_local(x as usize, y as usize, z as usize).0 as usize]
+            t.solid(chunk.get_local(x as usize, y as usize, z as usize))
         };
         let mut area = 0;
         for y in 0..CS {
@@ -712,14 +770,14 @@ mod tests {
     #[test]
     fn translucent_faces_route_to_the_blend_pass() {
         const GLASS: BlockId = BlockId(3);
-        let t = HotTables {
-            solid: vec![false, true, true, true].into(),
-            opaque: vec![false, true, true, false].into(),
-            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
-            emission: vec![0, 0, 0, 0].into(),
-            water: vec![false, false, false, false].into(),
-            ..HotTables::default()
-        };
+        let t = HotTables::from_parts(
+            &[false, true, true, true],
+            &[false, true, true, false],
+            &[false, false, false, false],
+            vec![Pass::Opaque, Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
+            vec![0, 0, 0, 0].into(),
+            vec![0, 0, 0, 0].into(),
+        );
         let mut chunk = empty_chunk();
         chunk.set_local(5, 5, 5, GLASS);
         chunk.set_local(6, 5, 5, GLASS); // adjacent glass: shared face culled

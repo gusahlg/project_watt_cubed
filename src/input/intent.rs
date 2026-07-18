@@ -137,14 +137,16 @@ impl Chord {
         Chord { mods, source }
     }
 
-    /// Chord fired this frame (no subset firing).
-    pub fn edged(self, eng: &Engine) -> bool {
-        self.source.is_pressed(eng) && Mods::current(eng) == self.mods
+    /// Chord fired this frame (no subset firing). `mods` is the frame's
+    /// modifier sample — taken ONCE per router frame instead of re-probing
+    /// four modifier keys for every chord of every binding.
+    pub fn edged(self, eng: &Engine, mods: Mods) -> bool {
+        self.source.is_pressed(eng) && mods == self.mods
     }
 
     /// Hold condition for auto-repeat (source down, mod match).
-    pub fn held(self, eng: &Engine) -> bool {
-        self.source.is_down(eng) && Mods::current(eng) == self.mods
+    pub fn held(self, eng: &Engine, mods: Mods) -> bool {
+        self.source.is_down(eng) && mods == self.mods
     }
 }
 
