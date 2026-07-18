@@ -174,6 +174,8 @@ impl World {
         // editless frame pays one flag check.
         let dirty_lane = self.lanes().dirty_remesh;
         sched.run_manual(dirty_lane, self, Some(&mut *eng));
+        // Fold any settle events into the LOD clip the moment they land.
+        self.refresh_lod_clip();
     }
 
     /// Land worker results, queue generation/meshing, free distant chunks —
@@ -234,6 +236,9 @@ impl World {
         }
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
+        // The ring geometry is centred on the eye: a boundary cross restarts
+        // the settled-ring scan (the far clip contracts until re-proven).
+        self.lod_clip_shrunk.raise(full_pass);
         // Each lane creates its own budget window, not shared: lanes run
         // sequentially, so a single frame-start snapshot would starve lanes
         // after the first.
@@ -269,6 +274,8 @@ impl World {
             sched.run_manual(gen_lane, self, None);
         }
         if self.radius_shrunk.take() {
+            // Meshes are about to be freed: the settled scan must restart.
+            self.lod_clip_shrunk.set();
             // Free meshes between new radius and unload ring (data stays).
             // Air/NeedsMesh own no handle.
             // Ready chunks drop to NeedsMesh; Dirty chunks stay dirty
@@ -406,6 +413,9 @@ impl World {
             let occ_lane = self.lanes().occlusion;
             sched.run_manual(occ_lane, self, Some(&mut *eng));
         }
+        // Unloads/boundary crossings above may have shrunk the settled rings;
+        // fold them in before this frame renders.
+        self.refresh_lod_clip();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
     }
@@ -471,6 +481,8 @@ impl World {
                 // (edit would bump rev, get dropped). Route through retire anyway
                 // to free any stray token as state moves to Ready/Air.
                 loaded.retire(MeshState::from_upload(handles), eng);
+                // A newly drawn chunk may complete a settled ring.
+                self.lod_clip_grow.set();
             }
         }
 
@@ -789,6 +801,9 @@ impl World {
         let born_air = chunk.uniform().is_some_and(|id| !self.registry.is_solid(id));
         let state =
             if born_air { MeshState::Air } else { MeshState::NeedsMesh { building: false } };
+        // Born-air is already settled; a sky ring can complete without a
+        // single upload.
+        self.lod_clip_grow.raise(born_air);
         // No flood-fill here; occlusion rebuild computes connectivity lazily.
         let chunk = std::sync::Arc::new(chunk);
         // Liveness check: coord must not be claimed in generating (would shadow data).

@@ -7,6 +7,62 @@ use crate::math::Aabb;
 use crate::render_config::RenderConfig;
 use voxel_engine::{DVec3, Pass};
 
+/// The settled LOD clip: full-res radius only where chunks are actually
+/// drawn (or born-air), ring by ring — the far field covers everything
+/// beyond, so a loading edge shows coarse terrain, never a hole.
+#[test]
+fn lod_clip_tracks_the_settled_rings() {
+    let mut world = World::generate();
+    world.set_view_radius(3);
+    let center = ChunkCoord::new(0, 2, 0);
+    world.center = Some(center);
+    world.ensure_region_data(center);
+
+    // Nothing is drawn yet: the whole far field must stay visible.
+    world.refresh_lod_clip();
+    assert_eq!(world.lod_clip().radius, 0.0, "unmeshed centre keeps the clip closed");
+
+    // Settle every chunk in the mesh box (Air is settled by definition).
+    let coords: Vec<Coord> = world.chunks.keys().copied().collect();
+    for coord in coords {
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::Air;
+    }
+    world.lod_clip_grow.set();
+    world.refresh_lod_clip();
+    assert_eq!(
+        world.lod_clip().radius,
+        world.view.coverage().radius,
+        "fully settled must be bit-identical to the full-res clip"
+    );
+    assert_eq!(world.lod_clip().half_height, world.view.coverage().half_height);
+
+    // A drawn mesh counts settled the same as Air (edited chunks keep their
+    // previous mesh on screen, so they must not reopen the clip).
+    let h = MeshHandle::from_raw_parts(7, 1);
+    let probe = ChunkCoord::new(1, center.y, 0);
+    world.chunks.get_mut(&probe).unwrap().state = MeshState::Dirty { prev: Some(meshes(h)) };
+    world.lod_clip_shrunk.set();
+    world.refresh_lod_clip();
+    assert_eq!(world.lod_clip().radius, world.view.coverage().radius);
+
+    // Unsettle one column at ring 2: the clip retreats to one ring inside it
+    // (the nearest face of ring 2 can be 16 m from an off-centre eye).
+    world.chunks.get_mut(&ChunkCoord::new(2, center.y, -1)).unwrap().state =
+        MeshState::NeedsMesh { building: false };
+    world.lod_clip_shrunk.set();
+    world.refresh_lod_clip();
+    assert_eq!(world.lod_clip().radius, CHUNK_SIZE as f32, "rings 0..=1 settled, ring 2 open");
+
+    // Events are the only triggers: without a flag the cached value stands,
+    // and growth resumes from the frontier ring once the column settles.
+    world.chunks.get_mut(&ChunkCoord::new(2, center.y, -1)).unwrap().state = MeshState::Air;
+    world.refresh_lod_clip();
+    assert_eq!(world.lod_clip().radius, CHUNK_SIZE as f32, "no event, no rescan");
+    world.lod_clip_grow.set();
+    world.refresh_lod_clip();
+    assert_eq!(world.lod_clip().radius, world.view.coverage().radius);
+}
+
 fn lod2_world() -> World {
     World::with_config(DEFAULT_SEED, RenderConfig::default())
 }

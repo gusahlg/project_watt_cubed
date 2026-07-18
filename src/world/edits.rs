@@ -231,6 +231,8 @@ impl World {
     /// `NeedsMesh` — rather than back to `Air` for born-air chunks — matches the
     /// old unconditional `meshed = false`; the next scan re-derives `Air`.)
     pub fn free_meshes(&mut self, eng: &mut Engine) {
+        // Every drawn mesh is going away: the settled-ring scan restarts.
+        self.lod_clip_shrunk.set();
         for loaded in self.chunks.values_mut() {
             // Any worker mesh captured before this reset must not be accepted if
             // it lands after the next stream establishes a new centre.

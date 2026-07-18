@@ -498,6 +498,15 @@ impl MeshState {
             _ => None,
         }
     }
+
+    /// Whether this chunk contributes its final ground truth to the frame:
+    /// something is drawn for it, or there is provably nothing to draw
+    /// (born-air). THE handoff predicate — near-section admission skipping
+    /// and the settled LOD clip both gate on it, so "the chunks cover this"
+    /// can never mean two different things.
+    fn settled(&self) -> bool {
+        self.live_meshes().is_some() || matches!(self, MeshState::Air)
+    }
     /// Move the owned meshes out for freeing. Consumes `self`; the caller owns
     /// the token afterwards and must `free` it (or carry it on).
     #[must_use]
@@ -717,6 +726,20 @@ pub struct World {
     /// edits touched since the last overlay refresh. Empty on a quiet frame,
     /// so the refresh lane is a set-emptiness check and nothing more.
     section_overlay_dirty: FastSet<SectionPos>,
+    /// Consecutive fully-[`settled`](MeshState::settled) chunk rings around
+    /// the centre, `0..=horizontal+1` (`horizontal+1` = the whole mesh box).
+    /// THE input to the settled LOD clip: far sections keep drawing over any
+    /// column whose chunks are not yet on screen, so a loading edge shows
+    /// coarse terrain instead of a hole. Maintained incrementally — grown
+    /// outward on upload/air events (each ring re-scanned at most once per
+    /// loading wave), reset by centre moves, unloads, and mesh teardown.
+    lod_clip_rings: i32,
+    /// A settle event landed (chunk mesh upload, born-air store): try to
+    /// extend [`lod_clip_rings`](Self::lod_clip_rings) outward.
+    lod_clip_grow: Sticky,
+    /// The ring geometry or settledness regressed (centre moved, chunks
+    /// unloaded or meshes freed): restart the ring scan from zero.
+    lod_clip_shrunk: Sticky,
     /// The far covering must be re-resolved: set by every event that can move
     /// it (a section landing Ready, an unload/free, a claim release, a
     /// frontier change, a ladder change). While clear AND no admission is
@@ -876,6 +899,9 @@ impl World {
             section_visible: Vec::new(),
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
+            lod_clip_rings: 0,
+            lod_clip_grow: Sticky::default(),
+            lod_clip_shrunk: Sticky::raised(),
             section_epoch: 0,
             section_claim_seq: 0,
             section_pending_claim: None,
@@ -925,14 +951,64 @@ impl World {
     /// resident mesh itself, so `render` submits no per-mesh draws — it only sets
     /// the frame's LOD-cull volume and reports the set-size gauge.
     pub fn render(&self, f: &mut Frame3D, _cam: DVec3) {
-        // The shader discards LOD-section fragments inside the full-res radius
-        // (chunks own the near ground) and fades in the sections beyond it. The
-        // streamed slab guarantees `vertical` chunks above and below the eye.
-        f.set_lod_clip(self.view.coverage());
+        // The shader discards LOD-section fragments inside the SETTLED radius:
+        // the rings whose chunks are actually drawn (or born-air). While a
+        // loading edge is still meshing, the clip stays behind it and the far
+        // sections keep covering the gap — coarse terrain instead of a hole —
+        // then hands off ring by ring as uploads land. Fully settled, this is
+        // exactly the old full-res radius.
+        f.set_lod_clip(self.lod_clip());
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.
         use voxel_engine::profile::{gauge, Gauge};
         gauge(Gauge::WorldChunks, self.chunks.len() as u64);
+    }
+
+    /// The LOD-cull volume for this frame: the full-res slab shrunk to the
+    /// settled rings. `rings` counts settled rings from the centre, so the
+    /// nearest possibly-unsettled column sits at chess distance `rings`; its
+    /// closest face is at least `(rings - 1) * 16` m from any eye position
+    /// inside the centre chunk — the conservative discard radius. With every
+    /// ring settled this is bit-identical to [`ViewVolume::coverage`].
+    fn lod_clip(&self) -> CoverageVolume {
+        let full = self.view.coverage();
+        let radius_m = ((self.lod_clip_rings - 1).max(0) * CHUNK_SIZE as i32) as f32;
+        CoverageVolume { radius: radius_m.min(full.radius), half_height: full.half_height }
+    }
+
+    /// Advance the settled-ring scan at a `&mut` sync point (end of `pump`
+    /// and of `stream`). Self-gates on the two event flags: a converged,
+    /// still frame is two flag checks. Growth re-scans only from the current
+    /// frontier ring, so a loading wave costs each ring once, not per frame.
+    pub(in crate::world) fn refresh_lod_clip(&mut self) {
+        if self.lod_clip_shrunk.take() {
+            self.lod_clip_rings = 0;
+            self.lod_clip_grow.set();
+        }
+        if !self.lod_clip_grow.take() {
+            return;
+        }
+        let Some(center) = self.center else { return };
+        let max_rings = self.view.horizontal + 1;
+        while self.lod_clip_rings < max_rings && self.ring_settled(center, self.lod_clip_rings) {
+            self.lod_clip_rings += 1;
+        }
+    }
+
+    /// Whether every column of the chess-distance `ring` around `center` is
+    /// fully settled across the streamed vertical range.
+    fn ring_settled(&self, center: Coord, ring: i32) -> bool {
+        let v = self.view.vertical;
+        let column = |cx: i32, cz: i32| {
+            (center.y - v..=center.y + v)
+                .all(|cy| self.chunks.get(&Coord::new(cx, cy, cz)).is_some_and(|l| l.state.settled()))
+        };
+        if ring == 0 {
+            return column(center.x, center.z);
+        }
+        let r = ring;
+        (-r..=r).all(|d| column(center.x + d, center.z - r) && column(center.x + d, center.z + r))
+            && (1 - r..r).all(|d| column(center.x - r, center.z + d) && column(center.x + r, center.z + d))
     }
 
     /// Far-material style: flat palette-average past [`FLAT_DETAIL`] if available,
@@ -1017,9 +1093,8 @@ impl World {
         for cy in cy_lo..=cy_hi {
             for cz in cz_lo..=cz_hi {
                 for cx in cx_lo..=cx_hi {
-                    let settled = self.chunks.get(&Coord::new(cx, cy, cz)).is_some_and(|l| {
-                        l.state.live_meshes().is_some() || matches!(l.state, MeshState::Air)
-                    });
+                    let settled =
+                        self.chunks.get(&Coord::new(cx, cy, cz)).is_some_and(|l| l.state.settled());
                     if !settled {
                         return false;
                     }
