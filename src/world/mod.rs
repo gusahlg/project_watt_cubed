@@ -1379,6 +1379,12 @@ pub(in crate::world) trait StreamLane {
         let _ = (world, key);
         true
     }
+    /// A worklist seed was evicted as BLOCKED by this pass's [`admit`] — the
+    /// lane's chance to register it with an event source that will re-seed it
+    /// (the mesh lane starts its light-degrade timer here). Default: no-op.
+    fn on_blocked(world: &mut World, key: Self::Key) {
+        let _ = (world, key);
+    }
     /// Squared distance in metres from `key` to player, for far-lane distance ordering.
     /// `None` (default) marks a near lane using FIFO ordering.
     fn dist2(world: &World, center: Coord, key: Self::Key) -> Option<u64> {
@@ -1434,6 +1440,11 @@ pub(in crate::world) fn admit<S: StreamLane>(
             for k in &blocked {
                 set.remove(k);
             }
+        }
+        // Each eviction is an EVENT the lane may need to time/track — the
+        // hook runs after the seed-set borrow ends.
+        for k in blocked {
+            S::on_blocked(world, k);
         }
     }
     ready_keys.sort_by_key(|&k| S::order(center, k));
@@ -1528,6 +1539,16 @@ impl StreamLane for MeshLane {
             world.chunks.get(&key).map(|l| &l.state),
             Some(MeshState::NeedsMesh { building: true, .. })
         )
+    }
+    fn on_blocked(world: &mut World, key: Coord) {
+        // Start the degrade timer at the eviction EVENT (the gate used to
+        // discover blocked chunks by re-scanning the whole worklist against
+        // ~15 hash probes each, every pass of a flood). Only light-blockage is
+        // timed — a seed evicted for missing neighbour data or leaving the box
+        // is re-seeded by its own events, not by a degrade clock.
+        if world.chunk_light_blocked(key) {
+            world.light_gate.note_blocked(key);
+        }
     }
     fn ready(world: &World, key: Coord) -> bool {
         // Ready if needs mesh, in view, has all neighbour data, and either light

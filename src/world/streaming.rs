@@ -104,6 +104,14 @@ pub(in crate::world) struct LightGate {
     degraded: FastSet<Coord>,
 }
 
+impl LightGate {
+    /// Start the wait timer for a light-blocked chunk (keeps an existing
+    /// timer — re-eviction must not push the degrade horizon out).
+    pub(in crate::world) fn note_blocked(&mut self, coord: Coord) {
+        self.blocked_since.entry(coord).or_insert_with(Instant::now);
+    }
+}
+
 /// The strike/quarantine identity of a panicked job — the per-lane key
 /// [`World::fail_job`] counts strikes against. A generate failure is keyed by
 /// its whole column: the failing chunk inside a column job is unknown, and the
@@ -1601,7 +1609,7 @@ impl World {
     /// A chunk waiting purely on neighbour light: it has data and is in view and
     /// awaiting a fresh mesh, but its neighbourhood light has not settled. The
     /// [`LightGate`] times exactly these chunks.
-    fn chunk_light_blocked(&self, coord: Coord) -> bool {
+    pub(in crate::world) fn chunk_light_blocked(&self, coord: Coord) -> bool {
         self.is_needs_mesh(coord)
             && self.in_mesh_box(coord)
             && self.neighbours_have_data(coord)
@@ -1625,40 +1633,43 @@ impl World {
         }
     }
 
-    /// Advance the light-gate before the mesh lane runs: start a timer for
-    /// each newly light-blocked mesh candidate, reap timers whose chunk stopped
-    /// waiting, drop degraded entries for unloaded chunks, and re-seed still-waiting
-    /// chunks onto the mesh worklist so a wait-time degrade (which raises no re-seed
-    /// event of its own) is never stranded by worklist eviction.
+    /// Advance the light-gate before the mesh lane runs: reap timers whose
+    /// chunk stopped waiting, drop degraded entries for unloaded chunks,
+    /// promote degraded chunks whose light became ready without a border
+    /// event, and re-seed exactly the chunks whose DEGRADE TIMER expired —
+    /// expiry raises no event of its own, so this sweep (over ONLY the timed
+    /// map, never the whole worklist) is what un-strands them. Timers START at
+    /// the admit loop's blocked-eviction event ([`MeshLane::on_blocked`]);
+    /// every pre-expiry re-seed comes from a real event (a grid landing via
+    /// `settle_light`, neighbour data via `store_chunk`). The old gate
+    /// re-scanned the entire `mesh_worklist` (~15 hash probes per seed) and
+    /// unconditionally re-seeded every blocked chunk, every pass of a flood.
     fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
         // the predicates below read the chunk map.
         let mut gate = std::mem::take(&mut self.light_gate);
         gate.degraded.retain(|c| self.chunks.contains_key(c));
         gate.blocked_since.retain(|c, _| self.chunk_light_blocked(*c));
-        // Safety net: event-driven path misses degraded chunks whose neighbour light
-        // settled without moving shared border. Sweep them: any now light-ready
-        // gets its ASYNC rebuild scheduled (old mesh keeps drawing), clearing
-        // the degraded flag at the rebuild's submit.
+        // Safety net: event-driven paths miss degraded chunks whose neighbour
+        // light settled without moving the shared border. Sweep them: any now
+        // light-ready gets its ASYNC rebuild scheduled (the old mesh keeps
+        // drawing), clearing the degraded flag at the rebuild's submit.
         let relit: Vec<Coord> =
             gate.degraded.iter().copied().filter(|&c| self.light_ready(c)).collect();
         for c in relit {
             self.remesh_async(c);
         }
-        let now = Instant::now();
-        let fresh: Vec<Coord> = self
-            .mesh_worklist
-            .iter()
-            .copied()
-            .filter(|c| self.chunk_light_blocked(*c) && !gate.blocked_since.contains_key(c))
-            .collect();
-        for c in fresh {
-            gate.blocked_since.insert(c, now);
-        }
-        if !gate.blocked_since.is_empty() {
-            for &c in gate.blocked_since.keys() {
+        // The expiry sweep: a chunk past LIGHT_WAIT_DEGRADE is mesh-ready via
+        // `light_wait_expired` but was evicted from the worklist when it
+        // blocked — re-seed it now that the clock (not an event) unblocked it.
+        let mut expired = false;
+        for (&c, t) in &gate.blocked_since {
+            if t.elapsed() >= LIGHT_WAIT_DEGRADE {
                 self.mesh_worklist.insert(c);
+                expired = true;
             }
+        }
+        if expired {
             self.pending_fresh.set();
         }
         self.light_gate = gate;
@@ -1990,13 +2001,47 @@ mod tests {
     use super::*;
     use super::super::StreamLane;
 
-    /// `admit::<MeshLane>` evicts a light-blocked seed from `mesh_worklist` once its wait exceeds
-    /// `LIGHT_WAIT_DEGRADE`, trusting `tick_light_gate` to unconditionally re-seed
-    /// every still-blocked chunk it is timing — keyed off `light_gate.blocked_since`,
-    /// NOT off current `mesh_worklist` membership. If that re-seed were conditioned
-    /// on membership instead, an evicted-but-still-blocked chunk would never return
-    /// to the worklist and would be stranded forever despite being mesh-ready via
-    /// `light_wait_expired`. This pins the unconditional re-seed.
+    /// A degraded drawn chunk whose neighbourhood becomes light-ready WITHOUT
+    /// a border event (nothing re-seeds it) is promoted by the gate's relit
+    /// sweep — through the ASYNC rebuild path: old mesh carried and drawing,
+    /// no sync `Dirty` involvement.
+    #[test]
+    fn relit_degraded_chunk_promotes_through_the_async_path() {
+        let mut world = World::generate();
+        let c = ChunkCoord::new(0, 0, 0);
+        world.center = Some(c);
+        for n in std::iter::once(c).chain(Face::ALL.iter().map(|&f| c.step(f))) {
+            world.chunks.get_mut(&n).expect("pregenerated").light =
+                Some(light::LightGrid::dark());
+        }
+        let h = voxel_engine::MeshHandle::from_raw_parts(21, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(c, true);
+        world.light_worklist.clear();
+        world.pending_dirty.take();
+
+        world.tick_light_gate();
+
+        let state = &world.chunks[&c].state;
+        assert!(
+            matches!(state, MeshState::NeedsMesh { building: false, prev: Some(_) }),
+            "promoted through the async rebuild: {state:?}"
+        );
+        assert!(world.mesh_worklist.contains(&c), "seeded for the rebuild");
+        assert!(!world.pending_dirty.get(), "the sync dirty path is not involved");
+    }
+
+    /// The admit loop evicts a light-blocked seed from `mesh_worklist` and
+    /// starts its degrade timer at that EVENT (`MeshLane::on_blocked`); expiry
+    /// raises no event of its own, so `tick_light_gate`'s sweep over the timed
+    /// map — NOT worklist membership — is what re-seeds the chunk once
+    /// `light_wait_expired` makes it mesh-ready. This pins both halves: an
+    /// un-expired evicted chunk is NOT re-seeded by a tick (its re-seed must
+    /// come from a real event), and an expired one always is.
     #[test]
     fn light_wait_expiry_reseeds_an_evicted_chunk_without_stranding_it() {
         let mut world = World::generate();
@@ -2015,15 +2060,29 @@ mod tests {
         assert!(world.in_mesh_box(c));
         assert!(world.chunk_light_blocked(c), "no published light: c is light-blocked");
 
-        // Seed C and run the gate once to start its wait timer (the same call
-        // `stream` makes just before the mesh-admit lane).
+        // Seed C and run the REAL admission pass: it must evict the blocked
+        // seed and start its wait timer through the `on_blocked` event.
         world.mesh_worklist.insert(c);
-        world.tick_light_gate();
+        world.pending_fresh.set();
+        super::super::admit::<MeshLane>(
+            &mut world,
+            c,
+            pipeline::Deadline::from_budget(Duration::from_millis(5)),
+        );
+        assert!(!world.mesh_worklist.contains(&c), "the blocked seed is evicted");
         assert!(
             world.light_gate.blocked_since.contains_key(&c),
-            "the gate must start timing a freshly-blocked worklist entry"
+            "eviction must start the wait timer"
         );
         assert!(!world.light_wait_expired(c), "not yet past the wait budget");
+
+        // Before expiry, a tick must NOT re-seed it — pre-expiry re-seeds come
+        // from real events, never from the per-pass sweep.
+        world.tick_light_gate();
+        assert!(
+            !world.mesh_worklist.contains(&c),
+            "an un-expired evicted chunk is not re-seeded by the sweep"
+        );
 
         // Back-date the timer past LIGHT_WAIT_DEGRADE without sleeping — the
         // gate's expiry is wall-clock, so this is the only deterministic way to
@@ -2031,13 +2090,7 @@ mod tests {
         world.light_gate.blocked_since.insert(c, Instant::now() - LIGHT_WAIT_DEGRADE - Duration::from_millis(1));
         assert!(world.light_wait_expired(c), "back-dated timer must read as expired");
 
-        // Simulate `admit::<MeshLane>`'s real eviction of a blocked seed
-        // (its own `light_wait_expired` doesn't gate `chunk_light_blocked`, so a
-        // seed can be evicted from the worklist between one tick and the next).
-        world.mesh_worklist.remove(&c);
-        assert!(!world.mesh_worklist.contains(&c), "seed evicted, simulating the real path");
-
-        // The next `tick_light_gate` must re-seed it purely from the still-open
+        // The next `tick_light_gate` must re-seed it purely from the expired
         // timer, with no dependency on `c` already being in the worklist.
         world.tick_light_gate();
         assert!(
