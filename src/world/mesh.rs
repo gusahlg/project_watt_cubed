@@ -67,9 +67,18 @@ impl Padded {
 
     /// Copy the chunk and its shell out of the map. `chunk_at(dx, dy, dz)` yields
     /// the chunk at chunk-offset `(dx, dy, dz)` with each component in `-1..=1`
-    /// (`(0,0,0)` is the chunk itself), or `None` (→ air).
+    /// (`(0,0,0)` is the chunk itself), or `None` (→ air). Row-wise: the bulk
+    /// of the halo fills through [`Chunk::copy_row`]'s one-dispatch-per-row
+    /// reads (this runs on the main thread inside every mesh admit).
     pub fn capture<'a>(chunk_at: impl Fn(i32, i32, i32) -> Option<&'a Chunk>) -> Self {
-        Self { inner: Neighborhood::capture(AIR, chunk_at, |c: &Chunk, lx, ly, lz| c.get_local(lx, ly, lz)) }
+        Self {
+            inner: Neighborhood::capture_rows(
+                AIR,
+                chunk_at,
+                |c: &Chunk, lx, ly, lz| c.get_local(lx, ly, lz),
+                |c: &Chunk, ly, lz, out| c.copy_row(ly, lz, out),
+            ),
+        }
     }
 }
 
@@ -479,7 +488,8 @@ mod tests {
     /// gauge for the row-wise capture redesign. Ignored: a timing benchmark,
     /// not a correctness gate. Run with
     /// `cargo test --release padded_capture_throughput -- --ignored --nocapture`.
-    /// 2026-07-19 (12-core box), per-cell closure capture: ~26.7k captures/s.
+    /// 2026-07-19 (12-core box), per-cell closure capture: ~26.7k captures/s;
+    /// row-wise (`capture_rows` + `copy_row`): ~337k captures/s (12.7×).
     #[test]
     #[ignore]
     fn padded_capture_throughput() {

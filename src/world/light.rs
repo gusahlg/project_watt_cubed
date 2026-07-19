@@ -113,6 +113,13 @@ impl LightGrid {
     fn set(&mut self, idx: usize, v: Lumel) {
         self.cells[idx] = v;
     }
+    /// Copy the 16-cell x-row at `(y, z)` — cells are x-fastest, so this is
+    /// one contiguous slice copy (the shell capture's bulk read).
+    #[inline]
+    pub fn copy_row(&self, y: usize, z: usize, out: &mut [Lumel]) {
+        let base = Chunk::index(0, y, z);
+        out.copy_from_slice(&self.cells[base..base + CHUNK_SIZE]);
+    }
 }
 
 /// Light grid plus one-cell shell from 26 neighbours (coords -1..=16). Serves
@@ -159,12 +166,16 @@ impl PaddedLight {
     /// Copy the chunk and its shell out of the light field. `grid_at(dx, dy, dz)`
     /// yields the [`LightGrid`] at chunk-offset `(dx, dy, dz)` (each `∈ -1..=1`,
     /// `(0,0,0)` is the chunk itself), or `None` (→ dark). Mirrors
-    /// [`Padded::capture`](super::mesh::Padded::capture) cell-for-cell.
+    /// [`Padded::capture`](super::mesh::Padded::capture) cell-for-cell; the
+    /// bulk fills through [`LightGrid::copy_row`]'s contiguous slice copies.
     pub fn capture<'a>(grid_at: impl Fn(i32, i32, i32) -> Option<&'a LightGrid>) -> Self {
         Self {
-            inner: Neighborhood::capture(Lumel::DARK, grid_at, |g: &LightGrid, lx, ly, lz| {
-                g.at(Chunk::index(lx, ly, lz))
-            }),
+            inner: Neighborhood::capture_rows(
+                Lumel::DARK,
+                grid_at,
+                |g: &LightGrid, lx, ly, lz| g.at(Chunk::index(lx, ly, lz)),
+                |g: &LightGrid, ly, lz, out| g.copy_row(ly, lz, out),
+            ),
         }
     }
 
@@ -309,8 +320,14 @@ pub fn propagate(
 ) {
     out.cells.fill(Lumel::DARK);
     let cs = CHUNK_SIZE as i32;
+    // Decode the opacity field ONCE (payload-specialized, ~a palette pass)
+    // into an L1-resident bitset: the flood probes it ~6 times per relaxed
+    // cell, and each probe used to be a payload dispatch + palette load.
+    let mut opaque_bits = [0u64; CHUNK_VOLUME / 64];
+    chunk.fill_opacity(|id| tables.opaque(id), &mut opaque_bits);
     let opaque_at = |x: i32, y: i32, z: i32| {
-        tables.opaque(chunk.get_local(x as usize, y as usize, z as usize))
+        let i = Chunk::index(x as usize, y as usize, z as usize);
+        (opaque_bits[i >> 6] >> (i & 63)) & 1 != 0
     };
 
     // Skylight: borrow thread-local scratch, reset dark, seed and flood.
@@ -533,7 +550,8 @@ mod tests {
     /// propagate opacity-bitset redesign. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release light_propagate_throughput -- --ignored --nocapture`.
-    /// 2026-07-19 (12-core box), per-probe `get_local`: ~18.1k settles/s.
+    /// 2026-07-19 (12-core box), per-probe `get_local`: ~18.1k settles/s;
+    /// decoded opacity bitset: ~32.6k settles/s (1.8×).
     #[test]
     #[ignore]
     fn light_propagate_throughput() {

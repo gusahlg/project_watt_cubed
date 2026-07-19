@@ -199,6 +199,71 @@ impl Chunk {
         self.get_index(Self::index(x, y, z))
     }
 
+    /// Copy the 16-cell x-row at `(y, z)` into `out` — the snapshot capture's
+    /// bulk read. ONE payload dispatch per row instead of one per cell:
+    /// Uniform fills, Paletted runs 16 palette loads over its contiguous `u8`
+    /// row (x is the fastest axis in [`cell_index`](super::brick::cell_index)),
+    /// Dense strides its row directly.
+    #[inline]
+    pub fn copy_row(&self, y: usize, z: usize, out: &mut [BlockId]) {
+        debug_assert_eq!(out.len(), CHUNK_SIZE);
+        let base = Self::index(0, y, z);
+        match &self.data.payload {
+            BrickPayload::Uniform(v) => out.fill(v.id),
+            BrickPayload::Paletted { palette, cells } => {
+                for (o, &idx) in out.iter_mut().zip(&cells[base..base + CHUNK_SIZE]) {
+                    *o = palette[idx as usize].id;
+                }
+            }
+            BrickPayload::Dense(cells) => {
+                for (o, c) in out.iter_mut().zip(&cells[base..base + CHUNK_SIZE]) {
+                    *o = c.id;
+                }
+            }
+            BrickPayload::Rle { .. } => {
+                unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)")
+            }
+        }
+    }
+
+    /// Fill `out` with one opacity bit per cell (cell-index order), decoded
+    /// ONCE per light settle instead of a payload dispatch + palette load per
+    /// flood probe (~6 probes × up to 4096 relaxed cells). Uniform: one
+    /// probe; Paletted: one probe per palette entry then a linear cell pass;
+    /// Dense: one linear pass.
+    pub fn fill_opacity(
+        &self,
+        opaque: impl Fn(BlockId) -> bool,
+        out: &mut [u64; CHUNK_VOLUME / 64],
+    ) {
+        match &self.data.payload {
+            BrickPayload::Uniform(v) => out.fill(if opaque(v.id) { u64::MAX } else { 0 }),
+            BrickPayload::Paletted { palette, cells } => {
+                let mut lut = [false; super::brick::PALETTE_MAX];
+                for (i, p) in palette.iter().enumerate() {
+                    lut[i] = opaque(p.id);
+                }
+                out.fill(0);
+                for (i, &idx) in cells.iter().enumerate() {
+                    if lut[idx as usize] {
+                        out[i >> 6] |= 1 << (i & 63);
+                    }
+                }
+            }
+            BrickPayload::Dense(cells) => {
+                out.fill(0);
+                for (i, c) in cells.iter().enumerate() {
+                    if opaque(c.id) {
+                        out[i >> 6] |= 1 << (i & 63);
+                    }
+                }
+            }
+            BrickPayload::Rle { .. } => {
+                unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)")
+            }
+        }
+    }
+
     /// Write a voxel using chunk-local coordinates.
     pub fn set_local(&mut self, x: usize, y: usize, z: usize, v: BlockId) {
         self.set_index(Self::index(x, y, z), v);

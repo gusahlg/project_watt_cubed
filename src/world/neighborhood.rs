@@ -154,6 +154,53 @@ impl<T: Pooled> Neighborhood<T> {
         }
         Self { buf }
     }
+
+    /// [`capture`](Self::capture), row-wise: every padded x-row's 16 interior
+    /// cells come from ONE source (only `dx` varies along x), so they fill
+    /// through `extract_row` — one bulk read per row — leaving just the two
+    /// x-end shell cells as per-cell `extract` calls. 18² row reads + 2·18²
+    /// cell reads replace 18³ dependent closure calls with three coordinate
+    /// splits each; this runs on the MAIN thread inside every mesh admit, so
+    /// its cost gates admission throughput directly. Cell-identical to
+    /// `capture` (pinned by the law test).
+    pub fn capture_rows<S: Copy>(
+        fill: T,
+        src_at: impl Fn(i32, i32, i32) -> Option<S>,
+        extract: impl Fn(S, usize, usize, usize) -> T,
+        extract_row: impl Fn(S, usize, usize, &mut [T]),
+    ) -> Self {
+        let neigh: [Option<S>; 27] =
+            std::array::from_fn(|k| src_at(k as i32 % 3 - 1, k as i32 / 9 - 1, k as i32 / 3 % 3 - 1));
+        let get = |dx: i32, dy: i32, dz: i32| neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize];
+        let split = |c: i32| -> (i32, usize) {
+            if c < 0 {
+                (-1, CHUNK_SIZE - 1)
+            } else if c >= CS {
+                (1, 0)
+            } else {
+                (0, c as usize)
+            }
+        };
+        let mut buf = Self::take_buf(fill);
+        buf.fill(fill); // same recycled-buffer rule as `capture`
+        for y in -1..=CS {
+            let (dy, ly) = split(y);
+            for z in -1..=CS {
+                let (dz, lz) = split(z);
+                let row = Self::index(-1, y, z);
+                if let Some(s) = get(-1, dy, dz) {
+                    buf[row] = extract(s, CHUNK_SIZE - 1, ly, lz);
+                }
+                if let Some(s) = get(0, dy, dz) {
+                    extract_row(s, ly, lz, &mut buf[row + 1..row + 1 + CHUNK_SIZE]);
+                }
+                if let Some(s) = get(1, dy, dz) {
+                    buf[row + 1 + CHUNK_SIZE] = extract(s, 0, ly, lz);
+                }
+            }
+        }
+        Self { buf }
+    }
 }
 
 impl<T: Pooled> Drop for Neighborhood<T> {
@@ -207,6 +254,40 @@ mod tests {
             }
         }
         buf
+    }
+
+    /// `capture_rows` must be cell-identical to `capture` under the same
+    /// sources — including the missing-neighbour holes — when its row
+    /// extractor is the per-cell extractor unrolled. This is what lets the
+    /// mesh/light captures switch to the row path with no behavioral wiggle.
+    #[test]
+    fn capture_rows_matches_capture_cell_for_cell() {
+        let present = |dx: i32, dy: i32, dz: i32| {
+            !(dx == 1 && dy == 1 && dz == -1) && !(dx == -1 && dy == 0 && dz == 0)
+        };
+        let src_at = |dx: i32, dy: i32, dz: i32| present(dx, dy, dz).then_some((dx, dy, dz));
+        let extract = |(dx, dy, dz): (i32, i32, i32), lx: usize, ly: usize, lz: usize| {
+            dx * 10_000 + dy * 1_000 + dz * 100 + lx as i32 * 256 + ly as i32 * 16 + lz as i32
+        };
+
+        let want: Neighborhood<i32> = Neighborhood::capture(-1, src_at, extract);
+        let got: Neighborhood<i32> = Neighborhood::capture_rows(
+            -1,
+            src_at,
+            extract,
+            |s, ly, lz, out: &mut [i32]| {
+                for (lx, o) in out.iter_mut().enumerate() {
+                    *o = extract(s, lx, ly, lz);
+                }
+            },
+        );
+        for y in -1..=CS {
+            for z in -1..=CS {
+                for x in -1..=CS {
+                    assert_eq!(got.at(x, y, z), want.at(x, y, z), "cell ({x}, {y}, {z})");
+                }
+            }
+        }
     }
 
     #[test]
