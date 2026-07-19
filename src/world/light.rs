@@ -138,6 +138,13 @@ impl PaddedLight {
         self.inner.at(x, y, z)
     }
 
+    /// Flat-index read (same [`padded_index`](super::neighborhood::padded_index)
+    /// layout as [`Padded`](super::mesh::Padded)) — the sweep's stride walk.
+    #[inline]
+    pub(in crate::world) fn at_flat(&self, i: usize) -> Lumel {
+        self.inner.at_flat(i)
+    }
+
     /// An all-dark shell (no neighbour light anywhere) — the neutral settle path.
     pub fn dark() -> Self {
         Self { inner: Neighborhood::filled(Lumel::DARK) }

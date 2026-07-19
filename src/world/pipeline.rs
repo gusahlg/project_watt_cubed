@@ -1208,6 +1208,8 @@ mod tests {
     /// 2026-07-13 (RTX 3070 box, 4 workers): 544 B inline ≈ 28.6k jobs/s;
     /// boxed 112 B ≈ 29.2k jobs/s — throughput is meshing-bound, the boxing is
     /// a payload/regression guard rather than a measured speedup.
+    /// 2026-07-19 (12-core box, 4 workers): 26.8k jobs/s pre-layout work;
+    /// row-wise capture 30.3k; + stride-walk mesher 48.5k jobs/s.
     #[test]
     #[ignore]
     fn mesh_result_channel_throughput() {

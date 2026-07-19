@@ -71,6 +71,14 @@ impl<T: Pooled> Neighborhood<T> {
         padded_index(x, y, z)
     }
 
+    /// Direct flat read at a [`padded_index`] — the mesher's stride walk,
+    /// which carries indices as `base + n·s_n + u·s_u + v·s_v` adds instead
+    /// of rebuilding coordinates through dynamic axis indexing per probe.
+    #[inline]
+    pub(in crate::world) fn at_flat(&self, i: usize) -> T {
+        self.buf[i]
+    }
+
     /// A `PAD_VOL`-cell buffer, recycled from the pool if one is available
     /// (else freshly allocated, filled with `seed`). Recycled contents are
     /// UNSPECIFIED — a recycled buffer holds a previous job's cells — so every

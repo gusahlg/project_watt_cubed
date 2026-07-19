@@ -24,7 +24,7 @@ use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::light::{MAX_LIGHT, PaddedLight};
-use super::neighborhood::Neighborhood;
+use super::neighborhood::{Neighborhood, padded_index};
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::coord::ByPass;
 
@@ -63,6 +63,12 @@ impl Padded {
     #[inline]
     pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> BlockId {
         self.inner.at(x, y, z)
+    }
+
+    /// Flat-index read — the sweep's stride walk.
+    #[inline]
+    fn at_flat(&self, i: usize) -> BlockId {
+        self.inner.at_flat(i)
     }
 
     /// Copy the chunk and its shell out of the map. `chunk_at(dx, dy, dz)` yields
@@ -223,6 +229,18 @@ fn build_chunk_mesh_inner(
     }
 }
 
+/// The index delta of one step along world axis `axis` (0=X, 1=Y, 2=Z) in the
+/// padded 18³ layout — derived from the ONE layout law ([`padded_index`])
+/// rather than restating it. The sweep walks flat indices with these strides:
+/// every probe becomes `base ± s` adds where the coordinate form paid three
+/// scattered `[i32; 3]` writes through dynamic axis indices plus two
+/// multiplies, ~30 times per face candidate.
+fn axis_stride(axis: usize) -> i32 {
+    let mut p = [0i32; 3];
+    p[axis] = 1;
+    padded_index(p[0], p[1], p[2]) as i32 - padded_index(0, 0, 0) as i32
+}
+
 /// The greedy sweep over all six directions. `edge_only` restricts each direction
 /// to its border slice (the uniform-solid fast path — a uniform chunk's interior
 /// slices can never expose a face).
@@ -234,20 +252,26 @@ fn sweep(
     out: &mut ChunkMeshData,
 ) {
     let mut mask: [Option<FaceSample>; MASK_CAP] = [None; MASK_CAP];
+    let flat_origin = padded_index(0, 0, 0) as i32;
 
     for dir in &DIRS {
         let edge_n = if dir.step > 0 { CHUNK_SIZE - 1 } else { 0 };
+        let (s_n, s_u, s_v) =
+            (axis_stride(dir.n_axis), axis_stride(dir.u_axis), axis_stride(dir.v_axis));
 
         for n in 0..CHUNK_SIZE {
             if edge_only && n != edge_n {
                 continue;
             }
+            let base_n = flat_origin + n as i32 * s_n;
 
             // Phase 1: mask of exposed faces in this slice, as FaceSamples.
             let mut any = false;
             for v in 0..CHUNK_SIZE {
+                let base_v = base_n + v as i32 * s_v;
                 for u in 0..CHUNK_SIZE {
-                    mask[u + v * CHUNK_SIZE] = face_sample(padded, tables, light, dir, n, u, v);
+                    mask[u + v * CHUNK_SIZE] =
+                        face_sample(padded, tables, light, dir, s_n, s_u, s_v, base_v + u as i32 * s_u);
                     any |= mask[u + v * CHUNK_SIZE].is_some();
                 }
             }
@@ -289,28 +313,27 @@ fn sweep(
 /// The [`FaceSample`] for one cell's face in `dir`, or `None` if the cell is
 /// non-solid or the face is culled. Reads the padded neighbourhood for the cull
 /// neighbour and for the in-plane occluders that bake ambient occlusion, and the
-/// settled light shell for the per-corner smooth sky/block light.
+/// settled light shell for the per-corner smooth sky/block light. `idx` is the
+/// cell's flat padded index; every probe is a stride add off it (`s_n`/`s_u`/
+/// `s_v` from [`axis_stride`]) — same cells, same order as the coordinate form.
+#[allow(clippy::too_many_arguments)]
 fn face_sample(
     padded: &Padded,
     tables: &HotTables,
     light: Option<&PaddedLight>,
     dir: &Dir,
-    n: usize,
-    u: usize,
-    v: usize,
+    s_n: i32,
+    s_u: i32,
+    s_v: i32,
+    idx: i32,
 ) -> Option<FaceSample> {
-    let mut c = [0i32; 3];
-    c[dir.n_axis] = n as i32;
-    c[dir.u_axis] = u as i32;
-    c[dir.v_axis] = v as i32;
-    let id = padded.at(c[0], c[1], c[2]);
+    let id = padded.at_flat(idx as usize);
     if !tables.solid(id) {
         return None;
     }
     // The cell the face opens into: one step along the normal.
-    let mut o = c;
-    o[dir.n_axis] += dir.step;
-    let nbr = padded.at(o[0], o[1], o[2]);
+    let open = idx + dir.step * s_n;
+    let nbr = padded.at_flat(open as usize);
     if covered(id, nbr, tables) {
         return None;
     }
@@ -324,18 +347,13 @@ fn face_sample(
 
     // Ambient occlusion: for each of the four face corners, sample the three
     // in-plane occluders (two edge-adjacent, one diagonal) in the OPEN layer
-    // (`o`'s normal coordinate). `Dir::corners[i]` gives this corner's (u,v) ∈
-    // {0,1}²; step ±1 toward it. Classic per-vertex AO (Nolan / 0fps).
-    let on = o[dir.n_axis];
+    // (`open`'s normal coordinate). `Dir::corners[i]` gives this corner's
+    // (u,v) ∈ {0,1}²; step ±1 toward it. Classic per-vertex AO (Nolan / 0fps).
     let occ = |du: i32, dv: i32| -> bool {
-        let mut p = [0i32; 3];
-        p[dir.n_axis] = on;
-        p[dir.u_axis] = u as i32 + du;
-        p[dir.v_axis] = v as i32 + dv;
         // Occlude on OPACITY, not solidity — matching cull (`covered`) and smooth
         // light (`lum`). A transparent solid (glass/ice/water/leaves) must not cast
         // AO, or it darkens the faces around it. (Old pre-rewrite AO used opaque.)
-        tables.opaque(padded.at(p[0], p[1], p[2]))
+        tables.opaque(padded.at_flat((open + du * s_u + dv * s_v) as usize))
     };
     // AO off: every corner reads unoccluded (uniform 3) — a perf lever, and it
     // also merges quads a gradient would split (matches the pre-rewrite toggle).
@@ -349,8 +367,8 @@ fn face_sample(
     });
 
     // Per-corner smooth light: average sky/block over the up-to-4 cells touching
-    // the corner in the OPEN layer (`on`), skipping opaque cells (they carry no
-    // light to a surface). The face cell `o` is never opaque here (an opaque
+    // the corner in the OPEN layer, skipping opaque cells (they carry no
+    // light to a surface). The face cell `open` is never opaque here (an opaque
     // neighbour would have culled the face), so the count is always ≥ 1.
     // Without a light shell every corner reads constant full light — exactly
     // what averaging a full shell would produce, minus the sixteen reads.
@@ -358,11 +376,8 @@ fn face_sample(
     let mut block = [MAX_LIGHT; 4];
     if let Some(light) = light {
         let lum = |du: i32, dv: i32| {
-            let mut p = [0i32; 3];
-            p[dir.n_axis] = on;
-            p[dir.u_axis] = u as i32 + du;
-            p[dir.v_axis] = v as i32 + dv;
-            (tables.opaque(padded.at(p[0], p[1], p[2])), light.at(p[0], p[1], p[2]))
+            let p = (open + du * s_u + dv * s_v) as usize;
+            (tables.opaque(padded.at_flat(p)), light.at_flat(p))
         };
         for i in 0..4 {
             let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
