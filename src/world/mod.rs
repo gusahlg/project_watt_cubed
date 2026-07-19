@@ -954,6 +954,18 @@ impl World {
                 "generating coord {coord:?} already has data — a stuck generate claim"
             );
         }
+        // A queued settled grid is a TRANSFERRED light claim: the in-flight
+        // entry must be held until `settle_light` releases it, or `light_ready`
+        // would admit a mesh against a grid that is about to change.
+        // (`section_pending_claim` is deliberately NOT asserted `None` here: a
+        // far-cap-rejected submit leaves it set until the next submit
+        // overwrites it — a benign leftover, not a stranded claim.)
+        for (coord, _) in &self.light_apply_queue {
+            debug_assert!(
+                self.light_inflight.contains(coord),
+                "queued light grid for {coord:?} without its in-flight claim"
+            );
+        }
     }
 
     /// Draw the meshed chunks. All per-voxel work happened when each chunk was
@@ -1633,14 +1645,10 @@ impl StreamLane for LightLane {
         world.light_inflight.insert(key);
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
+        // `accept_light` owns the claim rule (release-or-transfer on every
+        // consumed result) — see its doc for the epoch soundness argument.
         if let pipeline::Done::Light { coord, epoch, grid } = done {
-            if world.lighting
-                && epoch == world.light_epoch
-                && world.chunks.contains_key(&coord)
-                && world.light_inflight.contains(&coord)
-            {
-                world.light_apply_queue.push_back((coord, grid));
-            }
+            world.accept_light(coord, epoch, grid);
         }
     }
 }

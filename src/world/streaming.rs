@@ -436,8 +436,28 @@ impl World {
             return;
         }
         // Route each result through its lane's integrate or accept_column.
+        //
+        // THE claim rule, enforced at this chokepoint: a claimed key
+        // (`generating` / `building` / `light_inflight` / `Meshing{token}`)
+        // is owed exactly ONE `Done`, and consuming that `Done` — whatever is
+        // decided about its payload — must release or transfer the claim.
+        // Claims are otherwise released only by the exact-identity
+        // cancel/fail paths or by the bulk wipes that also retire the claim's
+        // identity (`transition_lighting`'s epoch bump, `clear_section_lane`,
+        // `free_meshes`). The debug postconditions below make a violation
+        // loud instead of a permanent quiet wedge.
         let mut done = std::mem::take(&mut self.done_scratch);
         for result in done.drain(..) {
+            #[cfg(debug_assertions)]
+            let light_audit = match &result {
+                pipeline::Done::Light { coord, epoch, .. } => Some((*coord, *epoch)),
+                _ => None,
+            };
+            #[cfg(debug_assertions)]
+            let section_audit = match &result {
+                pipeline::Done::Section { pos, epoch, token, .. } => Some((*pos, *epoch, *token)),
+                _ => None,
+            };
             match result {
                 pipeline::Done::Column { col, chunks } => self.accept_column(col, chunks),
                 m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
@@ -445,6 +465,30 @@ impl World {
                 sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
                 pipeline::Done::Failed(key) => self.fail_job(*key),
                 pipeline::Done::Cancelled(key) => self.cancel_job(*key),
+            }
+            // A consumed CURRENT-epoch light result must have released its
+            // claim or transferred it into the apply queue.
+            #[cfg(debug_assertions)]
+            if let Some((coord, epoch)) = light_audit {
+                debug_assert!(
+                    epoch != self.light_epoch
+                        || !self.light_inflight.contains(&coord)
+                        || self.light_apply_queue.iter().any(|(c, _)| *c == coord),
+                    "light Done for {coord:?} left its claim neither released nor transferred"
+                );
+            }
+            // A consumed section result that still matches the LIVE claim must
+            // have been transferred to the upload queue (anything else was a
+            // superseded claim and must have been left alone).
+            #[cfg(debug_assertions)]
+            if let Some((pos, epoch, token)) = section_audit {
+                debug_assert!(
+                    epoch != self.section_epoch
+                        || !matches!(self.sections.get(&pos),
+                            Some(SectionState::Meshing { token: t }) if *t == token)
+                        || self.section_upload_queue.iter().any(|(p, t, _)| *p == pos && *t == token),
+                    "section Done for {pos:?} matched the live claim but was not transferred"
+                );
             }
         }
         self.done_scratch = done;
@@ -555,6 +599,40 @@ impl World {
             self.pending_fresh.set();
             self.mesh_worklist.insert(coord);
         }
+    }
+
+    /// Light result at `epoch`: release-or-transfer the claim, then queue the
+    /// grid if it still applies. The claim rule at this consumption site: a
+    /// claimed key is owed exactly one `Done`, and consuming that `Done` must
+    /// release or transfer the claim — silently dropping a result used to
+    /// wedge its coord's `light_inflight` entry forever (a chunk re-loaded at
+    /// that coord could never settle light again: `light_ready` read the
+    /// stale claim as still-in-flight, the mesh lane skipped it as in-flight,
+    /// and quiescence — degraded promotion, `entry_complete` — never came).
+    ///
+    /// Epoch reasoning (what makes the unconditional release sound):
+    /// [`transition_lighting`](Self::transition_lighting) is the only
+    /// `light_epoch` bump and it clears `light_inflight` in the same breath, so
+    /// - a CURRENT-epoch result is the unique owner of any in-flight entry at
+    ///   its coord (releasing can never steal a newer claim), while
+    /// - a STALE-epoch result's claim was already wiped at the bump — an entry
+    ///   present now belongs to a post-bump job and must not be touched.
+    pub(in crate::world) fn accept_light(&mut self, coord: Coord, epoch: u32, grid: light::LightGrid) {
+        if epoch != self.light_epoch {
+            return;
+        }
+        if !self.lighting || !self.chunks.contains_key(&coord) {
+            // Unusable result — the chunk unloaded mid-flight (the common
+            // fast-flight case; `lighting` off with a matching epoch is
+            // unreachable today since the toggle bumps it, kept as a guard).
+            // Release the claim, drop the payload.
+            self.light_inflight.remove(&coord);
+            return;
+        }
+        // TRANSFER: the claim stays held through the apply queue (so
+        // `light_ready` keeps treating the chunk as unsettled);
+        // [`settle_light`](Self::settle_light) is the release point.
+        self.light_apply_queue.push_back((coord, grid));
     }
 
     /// Mesh result still applies: chunk loaded, in view range, rev not bumped.
@@ -855,11 +933,26 @@ impl World {
             .collect();
         // A removed chunk changes what the BFS can reach.
         self.occlusion_dirty.raise(!far.is_empty());
-        for coord in far {
+        for &coord in &far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             if let Some(loaded) = self.chunks.remove(&coord) {
                 loaded.state.free_owned(eng);
             }
+        }
+        // Settled grids still queued for removed chunks describe the world
+        // being unloaded: applying one to a LATER re-generated chunk would
+        // publish stale light past every epoch check. Drop them and release
+        // the claims they were carrying (one retain pass, not per-coord scans).
+        if !self.light_apply_queue.is_empty() && !far.is_empty() {
+            let removed: FastSet<Coord> = far.iter().copied().collect();
+            let inflight = &mut self.light_inflight;
+            self.light_apply_queue.retain(|(c, _)| {
+                let gone = removed.contains(c);
+                if gone {
+                    inflight.remove(c);
+                }
+                !gone
+            });
         }
         // Drop cached ceilings for columns that no longer have any loaded chunk;
         // the heightmap is pure, so a re-entered column simply recomputes once.

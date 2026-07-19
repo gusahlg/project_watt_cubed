@@ -632,6 +632,60 @@ fn cancelled_jobs_release_claims_without_strikes() {
     assert!(world.job_strikes.is_empty(), "cancellation earns no strikes");
 }
 
+/// The claim rule at the light-result consumption site: an unusable result
+/// (its chunk unloaded mid-flight — the ROUTINE fast-flight case) must RELEASE
+/// its `light_inflight` claim, never drop silently. A leaked claim wedged the
+/// coord forever: a chunk re-loaded there read as perpetually in-flight, so
+/// its light never settled, its mesh stayed degraded, and quiescence
+/// (`flush_degraded_terminal`, `entry_complete`) never came.
+#[test]
+fn unloaded_light_result_releases_the_claim() {
+    let mut world = World::generate();
+    let coord = ChunkCoord::new(0, 0, 0);
+    let epoch = world.light_epoch;
+
+    // A light job was in flight when the chunk unloaded (pre-mesh states own
+    // no GPU handle, so dropping the entry engine-free is sound).
+    world.light_inflight.insert(coord);
+    world.chunks.remove(&coord).expect("origin pregenerated");
+
+    <LightLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Light { coord, epoch, grid: light::LightGrid::dark() },
+    );
+    assert!(world.light_apply_queue.is_empty(), "an unusable result never queues");
+    assert!(!world.light_inflight.contains(&coord), "the claim must release");
+
+    // The coord is usable again: a re-loaded chunk settles normally instead of
+    // reading as forever in-flight.
+    world.ensure_data(coord);
+    world.settle_light(coord, light::LightGrid::dark());
+    assert!(world.chunks[&coord].light.is_some(), "a re-loaded chunk settles");
+    assert!(!world.light_inflight.contains(&coord));
+}
+
+/// A STALE-epoch light result's claim was wiped by the toggle that bumped the
+/// epoch, so consuming it must never touch `light_inflight` — an entry present
+/// at its coord belongs to a NEWER job (the epoch-soundness half of
+/// `accept_light`'s unconditional release).
+#[test]
+fn stale_epoch_light_result_never_touches_a_newer_claim() {
+    let mut world = World::generate();
+    let coord = ChunkCoord::new(0, 0, 0);
+    let stale = world.light_epoch;
+    assert!(world.transition_lighting(false));
+    assert!(world.transition_lighting(true));
+
+    // A post-bump job holds the live claim.
+    world.light_inflight.insert(coord);
+    <LightLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Light { coord, epoch: stale, grid: light::LightGrid::dark() },
+    );
+    assert!(world.light_inflight.contains(&coord), "the newer claim survives");
+    assert!(world.light_apply_queue.is_empty(), "the stale grid never publishes");
+}
+
 #[test]
 fn stale_rev_mesh_results_are_dropped() {
     let mut world = World::generate();
