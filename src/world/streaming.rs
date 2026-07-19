@@ -239,6 +239,7 @@ impl World {
         );
         // Update centre before draining: old centre may be a sentinel, so draining
         // against it would discard all results and regenerate them immediately.
+        let prev_center = self.center;
         let full_pass = Some(center_chunk) != self.center;
         self.center = Some(center_chunk);
         // Publish the live view to the worker pool: queued near jobs re-order
@@ -249,9 +250,12 @@ impl World {
         }
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
-        // The ring geometry is centred on the eye: a boundary cross restarts
-        // the settled-ring scan (the far clip contracts until re-proven).
-        self.lod_clip_shrunk.raise(full_pass);
+        // The ring geometry is centred on the eye: a boundary cross SHIFTS the
+        // settled rings by the move's chess distance (only a vertical move or
+        // the first pass restarts the scan) — see `shift_lod_clip`.
+        if full_pass {
+            self.shift_lod_clip(prev_center, center_chunk);
+        }
         // Each lane creates its own budget window, not shared: lanes run
         // sequentially, so a single frame-start snapshot would starve lanes
         // after the first.
@@ -332,11 +336,14 @@ impl World {
             if self.lighting {
                 let light_lane = self.lanes().light_admit;
                 sched.run_manual(light_lane, self, None);
-                // While light is unsettled, keep the mesh lane armed so it
-                // re-checks `light_ready` as grids land.
-                if !self.light_worklist.is_empty() || !self.light_inflight.is_empty() {
-                    self.pending_fresh.set();
-                }
+                // No level-triggered mesh-lane forcing here: every event that
+                // can flip a chunk's mesh-readiness arms `pending_fresh` WITH
+                // a seed (`settle_light` seeds self + moved-border neighbours,
+                // `store_chunk` seeds self + 6, the light gate re-seeds timed
+                // chunks, fail/cancel re-seed). The old unconditional forcing
+                // while any light work existed papered over wedged
+                // `light_inflight` claims — fixed at the root in `accept_light`
+                // — at the cost of a full admission pass every frame of a flood.
             } else {
                 // No flood. Edit seeds stay dormant so re-enabling lighting only
                 // settles chunks changed while it was off; `light_ready` bypasses

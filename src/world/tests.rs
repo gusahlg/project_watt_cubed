@@ -724,6 +724,46 @@ fn async_rebuild_claim_and_stale_release_preserve_the_drawn_mesh() {
     assert!(world.pending_fresh.get());
 }
 
+/// A boundary cross SHIFTS the settled LOD-clip rings by the move's chess
+/// distance instead of resetting them to zero: the far clip no longer
+/// collapses (and far LOD no longer pops over the settled near field) on
+/// every crossed boundary while flying — only a vertical move restarts,
+/// because `ring_settled`'s proof doesn't transfer across chunk layers.
+#[test]
+fn boundary_cross_shifts_the_settled_rings_by_chess_distance() {
+    let mut world = World::generate();
+    world.set_view_radius(3);
+    let center = ChunkCoord::new(0, 2, 0);
+    world.center = Some(center);
+    world.ensure_region_data(center);
+    let coords: Vec<Coord> = world.chunks.keys().copied().collect();
+    for coord in coords {
+        world.chunks.get_mut(&coord).unwrap().state = MeshState::Air;
+    }
+    world.lod_clip_grow.set();
+    world.refresh_lod_clip();
+    let full = world.lod_clip_rings;
+    assert_eq!(full, world.view.horizontal + 1, "settled through the whole box");
+
+    // A one-chunk horizontal move: the proven rings shift down by one — no
+    // reset, and the outward scan re-arms from the shifted frontier.
+    world.shift_lod_clip(Some(center), ChunkCoord::new(1, 2, 0));
+    assert_eq!(world.lod_clip_rings, full - 1);
+    assert!(world.lod_clip_grow.get(), "growth resumes from the frontier");
+    assert!(!world.lod_clip_shrunk.get(), "a horizontal move never resets");
+
+    // A diagonal move is chess distance 1 too (shifts accumulate).
+    world.shift_lod_clip(Some(ChunkCoord::new(1, 2, 0)), ChunkCoord::new(2, 2, 1));
+    assert_eq!(world.lod_clip_rings, full - 2);
+
+    // A vertical move restarts the scan; the next refresh re-proves from zero
+    // (everything here is still settled, so it regrows to full).
+    world.shift_lod_clip(Some(ChunkCoord::new(2, 2, 1)), ChunkCoord::new(2, 3, 1));
+    assert!(world.lod_clip_shrunk.get(), "a layer change resets");
+    world.refresh_lod_clip();
+    assert_eq!(world.lod_clip_rings, full, "reset then regrown over settled chunks");
+}
+
 /// A boundary cross prunes STALE upload entries in one pass — releasing each
 /// claim and re-seeding, exactly like the pop-time stale path — instead of
 /// letting a deep post-flight backlog trickle out at drain speed while real

@@ -1032,6 +1032,37 @@ impl World {
         CoverageVolume { radius: radius_m.min(full.radius), half_height: full.half_height }
     }
 
+    /// Fold a streaming-centre move into the settled-ring count WITHOUT
+    /// restarting the scan. Proven-settled rings survive a horizontal move
+    /// shifted down by its chess distance `d`: a column at chess distance
+    /// ρ ≤ rings−d−1 from the NEW centre lies at chess ≤ ρ+d ≤ rings−1 from
+    /// the old centre — inside the proven settled disc, over the SAME vertical
+    /// span (which is why a vertical move still resets: `ring_settled` scans
+    /// `center.y ± vertical`, and the proof does not transfer across layers).
+    /// Settledness cannot have regressed on this pass either: `unload_box` ⊇
+    /// mesh box, so a boundary-cross unload never removes a chunk inside a
+    /// countable ring; every OTHER regression (radius shrink, mesh teardown,
+    /// `free_meshes`) still raises `lod_clip_shrunk`, and a raised shrink wins
+    /// over the shift (the reset in [`refresh_lod_clip`](Self::refresh_lod_clip)
+    /// runs after).
+    ///
+    /// The old behavior — reset to zero on EVERY boundary cross — collapsed
+    /// the far clip each crossed boundary: far LOD popped back over the whole
+    /// settled near field for frames (the flying flicker) and every ring was
+    /// re-proven from scratch, O(R²·V) hash probes per cross.
+    pub(in crate::world) fn shift_lod_clip(&mut self, prev: Option<Coord>, new: Coord) {
+        match prev {
+            Some(p) if p.y == new.y => {
+                let d = (new.x - p.x).abs().max((new.z - p.z).abs());
+                self.lod_clip_rings = (self.lod_clip_rings - d).max(0);
+                // Resume the outward scan from the shifted frontier.
+                self.lod_clip_grow.set();
+            }
+            // A vertical move or the very first pass: restart from zero.
+            _ => self.lod_clip_shrunk.set(),
+        }
+    }
+
     /// Advance the settled-ring scan at a `&mut` sync point (end of `pump`
     /// and of `stream`). Self-gates on the two event flags: a converged,
     /// still frame is two flag checks. Growth re-scans only from the current
