@@ -340,8 +340,11 @@ impl Deadline {
 /// `drain_results` loop that folds settled grids into chunks (`DrainLane`'s
 /// internal window). The *admit* half's budget now lives in the `light_admit`
 /// producer's manifest (one budget locus per lane); this remains its own window
-/// because it is a distinct loop in a distinct pass.
-pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(1);
+/// because it is a distinct loop in a distinct pass. 2 ms: each apply is cheap
+/// bookkeeping, and a deep apply queue HOLDS light claims — chunks read as
+/// unsettled, mesh degraded, and remesh again — so draining it fast is worth
+/// twice the old 1 ms window (the flood peaks near 1.8k queued grids).
+pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(2);
 
 // Each admission producer mints a FRESH `Deadline::from_budget(...)` from its
 // scheduler-provided budget at the instant its `run()` starts — never one
@@ -509,11 +512,21 @@ pub struct Workers {
 }
 
 impl Workers {
-    /// The pool size for this machine: leave a core for the render thread,
-    /// never more than 3 (chunk work is bursty, not sustained), at least 1.
+    /// The pool size for `cores` logical CPUs: reserve two (the main/render
+    /// thread plus OS/audio/driver headroom), use the rest, cap at 12. The
+    /// old `min(3)` cap starved loading on big machines — a fast-flight
+    /// generate+light+mesh flood is sustained, not bursty, and three workers
+    /// simply cannot keep up. Past ~12 the producers outrun the main-thread
+    /// consumers instead; the backpressure there is the upload-queue
+    /// admission gate, the bounded data box, and [`FAR_QUEUE_CAP`].
+    /// Pure so the mapping is pinnable by test.
+    fn threads_for(cores: usize) -> usize {
+        cores.saturating_sub(2).clamp(1, 12)
+    }
+
+    /// [`threads_for`](Self::threads_for) at this machine's core count.
     pub fn default_threads() -> usize {
-        let cores = thread::available_parallelism().map_or(1, |n| n.get());
-        cores.saturating_sub(1).min(3).max(1)
+        Self::threads_for(thread::available_parallelism().map_or(1, |n| n.get()))
     }
 
     /// Spawn `threads` workers (at least 1) sharing one job queue.
@@ -1062,6 +1075,14 @@ mod tests {
             dt.as_secs_f64(),
             JOBS as f64 / dt.as_secs_f64()
         );
+    }
+
+    /// The pool-size policy: reserve two cores, cap at 12, floor at 1.
+    #[test]
+    fn thread_policy_reserves_two_and_caps() {
+        for (cores, want) in [(1, 1), (2, 1), (3, 1), (4, 2), (8, 6), (12, 10), (14, 12), (24, 12)] {
+            assert_eq!(Workers::threads_for(cores), want, "cores = {cores}");
+        }
     }
 
     /// Queue dequeue cost under a live moving view — the gauge for the queue
