@@ -93,9 +93,23 @@ const UNLOAD_MARGIN: i32 = 3;
 /// The vertical unload hysteresis. Smaller than [`UNLOAD_MARGIN`] because the
 /// vertical streaming radius is itself smaller (see [`ViewVolume`]).
 const UNLOAD_MARGIN_V: i32 = 2;
-/// How many finished worker meshes may be uploaded to the GPU per stream —
-/// the upload is the only part of the async path the render thread still pays.
-const UPLOAD_BUDGET: usize = 4;
+/// Per-frame BYTE budget for chunk-mesh GPU uploads — the upload is the only
+/// part of the async path the render thread still pays, and its real cost is
+/// bytes staged, not mesh count (the old 4-mesh budget charged a tiny stale
+/// drop the same as a full surface chunk, so a post-flight queue of stale
+/// entries starved real uploads for dozens of frames). Half the engine's
+/// 8 MiB/frame transfer window, leaving room for section uploads that share it.
+const UPLOAD_BUDGET_BYTES: usize = 4 << 20;
+/// Hard cap on upload-queue pops per drain, so even a mountain of
+/// free-to-drop stale entries takes bounded time.
+const UPLOAD_SCAN_MAX: usize = 256;
+/// Upload-queue depth past which MESH ADMISSION pauses: the workers are
+/// outproducing the byte budget, so more jobs would only grow the backlog
+/// (and its memory — each entry owns a pooled mesh buffer). The run-site gate
+/// leaves `pending_fresh` raised and the worklist intact, so admission
+/// self-resumes as the queue drains. Also the backpressure that bounds the
+/// pool's unbounded result channel under the scaled worker count.
+const UPLOAD_QUEUE_MAX: usize = 96;
 /// How many *dirty* (edited) chunks may remesh per frame. Processed nearest
 /// first, so a locally broken block still vanishes the same frame while a
 /// multiplayer join snapshot flood spreads over a few frames instead of one hitch.

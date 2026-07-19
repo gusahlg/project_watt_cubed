@@ -19,8 +19,9 @@ use super::section::SectionPos;
 use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
     Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
-    SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, StreamLane, UPLOAD_BUDGET, World,
-    light, mesh, pipeline, pyramid, quadtree,
+    SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, StreamLane,
+    UPLOAD_BUDGET_BYTES, UPLOAD_QUEUE_MAX, UPLOAD_SCAN_MAX, World, light, mesh, pipeline, pyramid,
+    quadtree,
 };
 
 /// Exact upload placement for a chunk mesh: integer chunk origin, full detail.
@@ -31,6 +32,18 @@ fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
         voxel_engine::IVec3::new(coord.x, coord.y, coord.z) * CHUNK_SIZE as i32,
         voxel_engine::Detail::FULL,
     )
+}
+
+/// The GPU bytes a finished mesh will stage on upload (vertices + index
+/// buckets across every pass) — what the byte-based upload budget charges.
+pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshOutput) -> usize {
+    voxel_engine::Pass::ALL
+        .iter()
+        .map(|&p| {
+            std::mem::size_of_val(data[p].vertices())
+                + data[p].buckets().iter().map(|b| std::mem::size_of_val(&b[..])).sum::<usize>()
+        })
+        .sum()
 }
 
 /// Edits whose chunk falls inside `pos`'s footprint and height domain. Free
@@ -250,6 +263,9 @@ impl World {
         self.pump(eng, sched);
         if full_pass {
             self.unload_far(center_chunk, eng);
+            // Stale queued uploads (the trailing edge of fast movement) release
+            // in ONE pass here instead of trickling through the drain budget.
+            self.prune_upload_queue();
             // Centre chunk synchronously for collision safety before async catches
             // up; the rest of the data box is armed for the budgeted generate lane.
             self.ensure_data(center_chunk);
@@ -339,8 +355,13 @@ impl World {
             self.tick_light_gate();
             // The mesh lane evicts blocked/stale seeds itself (see `admit`),
             // so the worklist stays O(fresh work) with no separate prune here.
-            let mesh_lane = self.lanes().mesh_admit;
-            sched.run_manual(mesh_lane, self, None);
+            // A deep upload queue pauses the RUN (never `ready` — that would
+            // evict the whole worklist with no re-seed event): `pending_fresh`
+            // stays raised and admission self-resumes as uploads drain.
+            if !self.upload_backlogged() {
+                let mesh_lane = self.lanes().mesh_admit;
+                sched.run_manual(mesh_lane, self, None);
+            }
             // Level-triggered backstop to the edge-triggered degraded clear: once
             // ALL light work is quiescent, any chunk still degraded is owed a
             // remesh that no future light-arrival event will ever deliver (its
@@ -499,28 +520,27 @@ impl World {
         }
         self.done_scratch = done;
 
-        // Budgeted uploads. Re-validate at the moment of upload: an entry may
-        // have sat queued across frames while an edit bumped the chunk's rev
-        // (the synchronous dirty remesh has it covered in that case).
-        let mut uploads = 0;
-        while uploads < UPLOAD_BUDGET {
+        // Budgeted uploads, charged in BYTES (the actual staging cost — see
+        // `UPLOAD_BUDGET_BYTES`). A stale entry costs nothing but a bounded
+        // pop (`UPLOAD_SCAN_MAX`), so a post-flight queue of stale entries no
+        // longer starves real uploads for dozens of frames. The byte check
+        // sits at the loop head, so at least one real upload always lands —
+        // the same forward-progress floor the admission lanes keep.
+        // Re-validate at the moment of upload: an entry may have sat queued
+        // across frames while an edit bumped the chunk's rev.
+        let mut upload_bytes = 0usize;
+        let mut pops = 0usize;
+        while upload_bytes < UPLOAD_BUDGET_BYTES && pops < UPLOAD_SCAN_MAX {
             let Some((coord, rev, data)) = self.upload_queue.pop_front() else {
                 break;
             };
-            // Charge the budget per CONSUMED entry, whether it uploads or is
-            // dropped as stale — otherwise a queue full of stale entries drains
-            // entirely in one frame, defeating UPLOAD_BUDGET.
-            uploads += 1;
+            pops += 1;
             if !self.mesh_result_applies(coord, rev) {
                 // Stale while queued: edit made it Dirty or it left the box.
-                // Release build claim so it can re-seed.
-                if let Some(loaded) = self.chunks.get_mut(&coord) {
-                    loaded.state.release_build();
-                }
-                self.pending_fresh.set();
-                self.mesh_worklist.insert(coord);
+                self.drop_stale_upload(coord);
                 continue;
             }
+            upload_bytes += mesh_output_bytes(&data);
             // Both passes upload together under one budget charge (same rev).
             // The worker baked per-vertex sky/block light into `data` from the
             // settled shell in its snapshot, so this is a pure GPU handoff —
@@ -597,14 +617,48 @@ impl World {
         if self.mesh_result_applies(coord, rev) {
             self.upload_queue.push_back((coord, rev, data));
         } else {
-            // Stale: chunk edited (Dirty) or left box. Release build claim so
-            // it can re-seed.
-            if let Some(loaded) = self.chunks.get_mut(&coord) {
-                loaded.state.release_build();
-            }
-            self.pending_fresh.set();
-            self.mesh_worklist.insert(coord);
+            // Stale: chunk edited (Dirty) or left box.
+            self.drop_stale_upload(coord);
         }
+    }
+
+    /// Release a stale mesh result's build claim and re-seed the coord so it
+    /// can mesh again later — the one stale-drop path, shared by the accept
+    /// site, the pop-time re-validation, and the boundary-cross prune.
+    fn drop_stale_upload(&mut self, coord: Coord) {
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.state.release_build();
+        }
+        self.pending_fresh.set();
+        self.mesh_worklist.insert(coord);
+    }
+
+    /// One-pass prune of stale upload entries (boundary cross): each is
+    /// released and re-seeded exactly like the pop-time stale path — without
+    /// letting a deep post-flight backlog of left-behind meshes trickle out
+    /// at drain speed while real uploads wait behind it.
+    pub(in crate::world) fn prune_upload_queue(&mut self) {
+        if self.upload_queue.is_empty() {
+            return;
+        }
+        let mut queue = std::mem::take(&mut self.upload_queue);
+        let mut stale: Vec<Coord> = Vec::new();
+        queue.retain(|&(coord, rev, _)| {
+            let live = self.mesh_result_applies(coord, rev);
+            if !live {
+                stale.push(coord);
+            }
+            live
+        });
+        self.upload_queue = queue;
+        for coord in stale {
+            self.drop_stale_upload(coord);
+        }
+    }
+
+    /// Whether mesh admission should pause this pass (see [`UPLOAD_QUEUE_MAX`]).
+    pub(in crate::world) fn upload_backlogged(&self) -> bool {
+        self.upload_queue.len() >= UPLOAD_QUEUE_MAX
     }
 
     /// Light result at `epoch`: release-or-transfer the claim, then queue the

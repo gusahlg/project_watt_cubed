@@ -724,6 +724,85 @@ fn async_rebuild_claim_and_stale_release_preserve_the_drawn_mesh() {
     assert!(world.pending_fresh.get());
 }
 
+/// A boundary cross prunes STALE upload entries in one pass — releasing each
+/// claim and re-seeding, exactly like the pop-time stale path — instead of
+/// letting a deep post-flight backlog trickle out at drain speed while real
+/// uploads wait behind it.
+#[test]
+fn boundary_cross_prunes_stale_uploads_in_one_pass() {
+    let mut world = World::generate();
+    world.center = Some(ChunkCoord::new(0, 0, 0));
+    let stale_coord = ChunkCoord::new(0, 0, 0);
+    let valid_coord = ChunkCoord::new(1, 0, 0);
+    for &c in &[stale_coord, valid_coord] {
+        world.chunks.get_mut(&c).unwrap().state =
+            MeshState::NeedsMesh { building: true, prev: None };
+        let rev = world.chunks[&c].rev;
+        world.upload_queue.push_back((c, rev, pipeline::MeshOutput::new()));
+    }
+    // An edit landed while the first entry sat queued.
+    world.chunks.get_mut(&stale_coord).unwrap().rev =
+        world.chunks[&stale_coord].rev.wrapping_add(1);
+
+    world.pending_fresh.take();
+    world.mesh_worklist.clear();
+    world.prune_upload_queue();
+
+    assert_eq!(world.upload_queue.len(), 1, "only the stale entry is pruned");
+    assert_eq!(world.upload_queue[0].0, valid_coord);
+    assert!(
+        matches!(world.chunks[&stale_coord].state, MeshState::NeedsMesh { building: false, .. }),
+        "the pruned entry's claim is released"
+    );
+    assert!(world.mesh_worklist.contains(&stale_coord), "and its coord re-seeded");
+    assert!(world.pending_fresh.get());
+    assert!(
+        matches!(world.chunks[&valid_coord].state, MeshState::NeedsMesh { building: true, .. }),
+        "the live entry's claim is untouched"
+    );
+}
+
+/// The byte-based upload budget charges exactly what staging costs: vertex
+/// bytes plus index bytes across every pass — pinning the stride assumptions
+/// (packed 8 B vertices, u32 indices) the budget's sizing was derived from.
+#[test]
+fn upload_byte_accounting_matches_vertex_and_index_sizes() {
+    let mut world = World::generate();
+    world.refresh_tables();
+    let coord = ChunkCoord::new(0, 0, 0); // surface chunk: non-empty mesh
+    let (_, snapshot) = world.snapshot(coord, true);
+    let mut out = pipeline::MeshOutput::new();
+    mesh::build_chunk_mesh(
+        &snapshot.padded,
+        snapshot.uniform,
+        &snapshot.tables,
+        &snapshot.light.expect("lighting on by default"),
+        &mut out,
+    );
+    let expected: usize = Pass::ALL
+        .iter()
+        .map(|&p| {
+            out[p].vertices().len() * 8
+                + out[p].buckets().iter().map(|b| b.len() * 4).sum::<usize>()
+        })
+        .sum();
+    assert!(expected > 0, "a surface chunk yields geometry");
+    assert_eq!(streaming::mesh_output_bytes(&out), expected);
+}
+
+/// Mesh admission pauses at the upload-queue cap and resumes below it.
+#[test]
+fn upload_backlog_pauses_mesh_admission_at_the_cap() {
+    let mut world = World::generate();
+    assert!(!world.upload_backlogged());
+    for i in 0..96 {
+        world.upload_queue.push_back((ChunkCoord::new(i, 0, 0), 0, pipeline::MeshOutput::new()));
+    }
+    assert!(world.upload_backlogged(), "at the cap admission pauses");
+    world.upload_queue.pop_front();
+    assert!(!world.upload_backlogged(), "below the cap it resumes");
+}
+
 /// A STALE-epoch light result's claim was wiped by the toggle that bumped the
 /// epoch, so consuming it must never touch `light_inflight` — an entry present
 /// at its coord belongs to a NEWER job (the epoch-soundness half of
