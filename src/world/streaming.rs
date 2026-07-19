@@ -282,17 +282,22 @@ impl World {
             // up; the rest of the data box is armed for the budgeted generate lane.
             self.ensure_data(center_chunk);
             self.pending_gen.set();
-            // Mesh box moved: re-seed loaded chunks awaiting mesh that just
-            // entered the box. Cheap boundary-cross scan that avoids stale holes.
-            let fresh: Vec<Coord> = self
-                .chunks
-                .iter()
-                .filter(|(_, l)| l.state.is_needs_mesh())
-                .map(|(&c, _)| c)
-                .filter(|&c| self.in_mesh_box(c))
+            // Mesh box moved: re-seed loaded NeedsMesh chunks that JUST
+            // entered it. Only the shell (new ∖ old) needs probing — a chunk
+            // in old ∩ new was either already seeded, or was evicted as
+            // blocked, and blocked evictions re-seed through their own events
+            // (data arrival, light settle, degrade expiry). O(|shell|) probes
+            // instead of the old all-chunks iteration per cross.
+            let new_box = self.mesh_box(center_chunk);
+            let prev_box = self.prev_mesh_box;
+            let fresh: Vec<Coord> = new_box
+                .coords()
+                .filter(|&c| prev_box.is_none_or(|p| !p.contains(c)))
+                .filter(|&c| self.is_needs_mesh(c))
                 .collect();
             self.mesh_worklist.extend(fresh);
             self.pending_fresh.set();
+            self.prev_mesh_box = Some(new_box);
         }
         // Runs every frame to drain a boundary-cross flood across frames;
         // self-gates on `pending_gen` so a settled world pays one flag check.
@@ -964,6 +969,13 @@ impl World {
             "storing {coord:?} still claimed in generating — a stuck generate claim"
         );
         self.chunks.insert(coord, Loaded { chunk: std::sync::Arc::clone(&chunk), state, rev: 0, connectivity: None, light: None });
+        // Ceiling-cache lifetime: the column's count drops its entry at zero.
+        *self.column_chunks.entry((coord.x, coord.z)).or_insert(0) += 1;
+        // Occlusion learns of the new chunk through the fill queue (bounded
+        // drain per rebuild) — no per-rebuild missing-connectivity scan.
+        if self.occlusion_enabled() {
+            self.conn_fill_queue.push_back(coord);
+        }
         // Light: try the analytic fast path first — a uniform-opaque chunk settles
         // to all-dark and an above-surface uniform-air chunk to full sky with no
         // flood. A trivial grid publishes synchronously (which fans the border to
@@ -977,8 +989,9 @@ impl World {
                 }
             }
         }
-        // A new chunk changes what the BFS can reach.
-        self.occlusion_dirty.set();
+        // A new chunk changes what the BFS can reach — topology class:
+        // debounced (an unclassified fresh chunk is over-draw, never a hole).
+        self.occlusion_topo_dirty.set();
         // And it changes the near-field coverage picture the section skip
         // reads: re-arm the far-field lane so LOD reacts to ANY chunk
         // creation instead of waiting for a boundary crossing.
@@ -1005,12 +1018,21 @@ impl World {
             .copied()
             .filter(|&coord| !unload.contains(coord))
             .collect();
-        // A removed chunk changes what the BFS can reach.
-        self.occlusion_dirty.raise(!far.is_empty());
+        // A removed chunk changes what the BFS can reach — topology class.
+        self.occlusion_topo_dirty.raise(!far.is_empty());
         for &coord in &far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             if let Some(loaded) = self.chunks.remove(&coord) {
                 loaded.state.free_owned(eng);
+            }
+            self.dirty_worklist.remove(&coord);
+            // Column refcount: the last chunk out drops the cached ceiling.
+            if let Some(count) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
+                *count -= 1;
+                if *count == 0 {
+                    self.column_chunks.remove(&(coord.x, coord.z));
+                    self.ceilings.remove(&(coord.x, coord.z));
+                }
             }
         }
         // Settled grids still queued for removed chunks describe the world
@@ -1028,13 +1050,8 @@ impl World {
                 !gone
             });
         }
-        // Drop cached ceilings for columns that no longer have any loaded chunk;
-        // the heightmap is pure, so a re-entered column simply recomputes once.
-        if !self.ceilings.is_empty() {
-            let live: FastSet<(i32, i32)> =
-                self.chunks.keys().map(|c| (c.x, c.z)).collect();
-            self.ceilings.retain(|col, _| live.contains(col));
-        }
+        // (Ceilings for fully-unloaded columns dropped by the refcount above;
+        // the heightmap is pure, so a re-entered column simply recomputes once.)
     }
 
     /// Remesh edited (`Dirty`) chunks synchronously, budgeted, nearest first —
@@ -1043,20 +1060,20 @@ impl World {
     /// queued than the per-frame [`DIRTY_BUDGET`] (they stay `Dirty`, drained
     /// next frame).
     pub(in crate::world) fn remesh_dirty(&mut self, eng: &mut Engine) -> Progress {
-        // Collect dirty chunks into vec; pass mutates them, can't hold filter borrow.
-        // Gated by pending_dirty so idle frames skip the scan.
+        // Gated by pending_dirty so idle frames pay one flag check.
         if !self.pending_dirty.take() {
             return Progress::Idle;
         }
         let Some(center) = self.center else {
             return Progress::Idle;
         };
-        let mut dirty: Vec<Coord> = self
-            .chunks
-            .iter()
-            .filter(|(_, l)| l.state.is_dirty())
-            .map(|(&coord, _)| coord)
-            .collect();
+        // Drain the MAINTAINED membership set (entries whose chunk moved on —
+        // unloaded, or resolved by another path — drop right here), instead of
+        // filtering every loaded chunk each frame the hint is up: during a
+        // light flood that was an O(world) iteration per frame.
+        let chunks = &self.chunks;
+        self.dirty_worklist.retain(|c| chunks.get(c).is_some_and(|l| l.state.is_dirty()));
+        let mut dirty: Vec<Coord> = self.dirty_worklist.iter().copied().collect();
         dirty.sort_by_key(|&coord| Self::order(coord, center));
         // Leftovers past the budget stay `Dirty` (still in the fiber); re-arm
         // the hint so the next frame drains them.
@@ -1065,6 +1082,7 @@ impl World {
             self.pending_dirty.set();
         }
         for coord in dirty.into_iter().take(DIRTY_BUDGET) {
+            self.dirty_worklist.remove(&coord);
             // No neighbour-data gate: edited chunks remesh even with missing
             // neighbour data (mesher reads them as air).
             self.mesh_chunk(coord, eng);

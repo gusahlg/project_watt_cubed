@@ -46,6 +46,9 @@ impl World {
             // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
+            // The next full pass must probe the WHOLE new box (a grown radius
+            // exposes chunks the old shell diff would skip).
+            self.prev_mesh_box = None;
             self.pending_fresh.set();
             // On shrink, meshes between the new radius and the (also shrunk)
             // unload ring would otherwise stay drawn until the player moves;
@@ -239,8 +242,9 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::needs_mesh(), eng);
         }
-        // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
-        // stale hint (a raised `pending_dirty` would just scan an empty fiber).
+        // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop
+        // the membership set and the stale hint with it.
+        self.dirty_worklist.clear();
         self.pending_dirty.take();
         // Drop the pipeline bookkeeping too: buffered worker meshes are for a
         // world we are leaving, and in-flight jobs may re-run from scratch if
@@ -338,17 +342,13 @@ impl World {
             // Editing this chunk's own voxels can open or seal an interior pocket,
             // so its connectivity is stale — invalidate it (the occlusion rebuild
             // recomputes lazily if the gate is active) and flag the visible set.
+            // IMMEDIATE class: stale connectivity can hide a visible chunk.
             loaded.connectivity = None;
             self.occlusion_dirty.set();
-            // Keep whatever is currently drawn as `prev` so the old mesh shows
-            // until the sync remesh: Ready(m) → Dirty{Some(m)}, re-editing an
-            // already-Dirty{Some} chunk preserves its mesh, and a NeedsMesh
-            // mid-async-rebuild carries its still-drawn `prev` over (the token
-            // MOVES, no free). Bare NeedsMesh/Air draw nothing → Dirty{None}.
-            loaded.state.invalidate();
-            // Any in-flight worker mesh of this chunk is now stale.
-            loaded.rev = loaded.rev.wrapping_add(1);
-            self.pending_dirty.set();
+            if self.occlusion_enabled() {
+                self.conn_fill_queue.push_back(coord);
+            }
+            self.invalidate_mesh(coord);
             self.pending_fresh.set();
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
@@ -368,16 +368,27 @@ impl World {
         previous
     }
 
+    /// Invalidate a chunk's mesh into the SYNC edit path: state → `Dirty`
+    /// (carrying the drawn mesh — see [`MeshState::invalidate`]), rev bump to
+    /// strand in-flight builds, dirty-worklist membership, and the hint. THE
+    /// one edit-class invalidation path, so `remesh_dirty` can drain the
+    /// membership set instead of filtering every loaded chunk.
+    pub(in crate::world) fn invalidate_mesh(&mut self, coord: Coord) {
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.state.invalidate();
+            loaded.rev = loaded.rev.wrapping_add(1);
+            self.dirty_worklist.insert(coord);
+            self.pending_dirty.set();
+        }
+    }
+
     /// Mark a loaded chunk stale so the next stream remeshes it.
     fn mark_dirty(&mut self, coord: Coord) {
-        if let Some(loaded) = self.chunks.get_mut(&coord) {
+        if self.chunks.contains_key(&coord) {
             // Same transition as `set_block`'s own chunk: carry the drawn mesh
-            // forward as `prev` (Ready → Dirty{Some}, already-Dirty keeps it).
-            loaded.state.invalidate();
-            // The neighbour's border edit changed this chunk's exposed faces,
-            // so any in-flight worker mesh of it is stale too.
-            loaded.rev = loaded.rev.wrapping_add(1);
-            self.pending_dirty.set();
+            // forward as `prev`, bump rev (the neighbour's border edit changed
+            // this chunk's exposed faces, so in-flight meshes are stale too).
+            self.invalidate_mesh(coord);
             // In case the dirty pass drops it (missing neighbour data), the
             // fresh scan must be able to pick it back up later.
             self.pending_fresh.set();

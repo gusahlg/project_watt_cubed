@@ -1165,6 +1165,25 @@ fn from_upload_and_into_owned_agree_on_handle_ownership() {
     assert!(air.into_owned().is_none());
 }
 
+/// The dirty pass drains a MAINTAINED membership set (`dirty_worklist`)
+/// instead of filtering every loaded chunk per frame — so every edit-class
+/// invalidation must record itself there.
+#[test]
+fn dirty_worklist_tracks_the_dirty_fiber() {
+    let mut world = World::generate();
+    world.set_block(1, 1, 1, AIR);
+    assert!(world.dirty_worklist.contains(&ChunkCoord::new(0, 0, 0)));
+    // A face-touching edit dirties the neighbour into the set too.
+    world.set_block(0, 2, 2, AIR);
+    assert!(world.dirty_worklist.contains(&ChunkCoord::new(-1, 0, 0)));
+    // Membership invariant: every Dirty chunk is tracked.
+    for (&c, l) in world.chunks.iter() {
+        if l.state.is_dirty() {
+            assert!(world.dirty_worklist.contains(&c), "{c:?} dirty but untracked");
+        }
+    }
+}
+
 #[test]
 fn edit_raises_pending_dirty_and_enters_the_dirty_fiber() {
     let mut world = World::generate();

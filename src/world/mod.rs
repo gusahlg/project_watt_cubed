@@ -55,7 +55,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use voxel_engine::producer::Progress;
 use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle};
@@ -120,6 +120,12 @@ const DIRTY_BUDGET: usize = 8;
 /// On a partial fill the `occlusion_dirty` flag is left set so the rebuild
 /// re-runs next frame — convergence over frames, no correctness cost.
 const OCCLUSION_FILL_BUDGET: usize = 64;
+/// Minimum spacing between TOPOLOGY-triggered occlusion rebuilds (chunk
+/// loads/unloads). Their staleness is over-draw only — a not-yet-hidden fresh
+/// chunk — never a hole, so a load flood no longer pays a full BFS + mask
+/// walk every stream pass. Root moves and edits rebuild immediately (a stale
+/// BFS root or stale connectivity CAN hide a visible chunk).
+const OCCLUSION_DEBOUNCE: Duration = Duration::from_millis(100);
 /// The seed a default (`generate`) world uses when none is chosen.
 pub const DEFAULT_SEED: i64 = 1;
 /// Column-section uploads per frame; separate budget so a world-entry
@@ -708,8 +714,35 @@ pub struct World {
     tables_epoch: u32,
     /// Occlusion visible set (rebuilt at stream sync point, read by render).
     occlusion: Occlusion,
-    /// Occlusion visible set needs rebuild (input-triggered on centre/chunk/connectivity change).
+    /// Occlusion needs an IMMEDIATE rebuild: the BFS root moved or an edit
+    /// changed connectivity — staleness of either can hide a visible chunk (a
+    /// hole), so these never debounce.
     occlusion_dirty: Sticky,
+    /// Occlusion needs a TOPOLOGY rebuild (a chunk loaded/unloaded): staleness
+    /// is over-draw only, so these debounce at [`OCCLUSION_DEBOUNCE`] — a load
+    /// flood pays one rebuild per window instead of one per pass.
+    occlusion_topo_dirty: Sticky,
+    /// The last occlusion rebuild's instant — the debounce clock.
+    last_occlusion_rebuild: Option<Instant>,
+    /// Chunks needing a connectivity fill for the occlusion BFS — fed by
+    /// loads and connectivity-invalidating edits (only while the gate is on;
+    /// activation reseeds from scratch), drained up to
+    /// [`OCCLUSION_FILL_BUDGET`] per rebuild. Replaces the per-rebuild
+    /// all-chunks missing-connectivity scan; unloaded entries drop lazily at pop.
+    conn_fill_queue: VecDeque<Coord>,
+    /// Membership set of the SYNC `Dirty` fiber, maintained by
+    /// [`invalidate_mesh`](World::invalidate_mesh) and pruned on
+    /// unload/free/drain — the dirty pass drains this set instead of
+    /// filtering every loaded chunk each frame `pending_dirty` is up.
+    dirty_worklist: FastSet<Coord>,
+    /// The mesh box of the previous full pass: a boundary cross probes only
+    /// the entered shell (new ∖ old) for NeedsMesh re-seeding. `None` after a
+    /// radius change, so the next cross probes the whole box.
+    prev_mesh_box: Option<ChunkBox>,
+    /// Loaded-chunk count per `(x, z)` column — a column's cached ceiling
+    /// drops exactly when its last chunk unloads (was: rebuild a live-column
+    /// set over the WHOLE map per boundary cross).
+    column_chunks: FastMap<(i32, i32), u16>,
     /// Whether occlusion was active last stream (render honours visible set if active).
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
@@ -917,6 +950,12 @@ impl World {
             tables_epoch: 0,
             occlusion: Occlusion::default(),
             occlusion_dirty: Sticky::default(),
+            occlusion_topo_dirty: Sticky::default(),
+            last_occlusion_rebuild: None,
+            conn_fill_queue: VecDeque::new(),
+            dirty_worklist: FastSet::default(),
+            prev_mesh_box: None,
+            column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
             stream_lanes: None,
@@ -1227,7 +1266,6 @@ impl World {
         // Recompute due-ness from current state every call; never cache it.
         let on = self.occlusion_enabled();
         let was_active = self.occlusion_active;
-        let due = on && (self.occlusion_dirty.take() || !was_active);
         self.occlusion_active = on;
         if !on {
             // Gate off (or never on): restore every mask the last active pass may
@@ -1237,34 +1275,55 @@ impl World {
             }
             return Progress::Idle;
         }
-        if !due {
-            return Progress::Idle;
+        // Two trigger classes: immediate (root moved / edit / activation —
+        // staleness could hide a visible chunk) rebuilds now; topology (chunk
+        // loads/unloads — staleness is over-draw only) debounces, so a load
+        // flood pays one BFS+mask walk per window instead of one per pass.
+        let immediate = self.occlusion_dirty.take() || !was_active;
+        let debounce_over = self
+            .last_occlusion_rebuild
+            .is_none_or(|t| t.elapsed() >= OCCLUSION_DEBOUNCE);
+        if !immediate && !(self.occlusion_topo_dirty.get() && debounce_over) {
+            return Progress::Idle; // an undebounced topo flag is Sticky: it retries
         }
+        self.occlusion_topo_dirty.take(); // any rebuild covers topology too
+        self.last_occlusion_rebuild = Some(Instant::now());
         let Some(origin) = self.center else {
             return Progress::Idle;
         };
-        let registry = &self.registry;
-        // Cap the per-frame connectivity flood: a boundary cross can newly load a
-        // whole shell of unclassified chunks, and filling them all in one frame
-        // is the O(cube) spike. Stop at the budget and re-arm below so the fill
-        // resumes next frame (partial classification only under-occludes — draws
-        // a few extra chunks — never a hole).
-        let mut filled = 0;
-        let mut capped = false;
-        for loaded in self.chunks.values_mut() {
-            if loaded.connectivity.is_none() {
-                if filled >= OCCLUSION_FILL_BUDGET {
-                    capped = true;
-                    break;
-                }
-                // Sightlines pass through anything not opaque — water/glass are
-                // solid (collision) but see-through, so they must NOT seal chunks
-                // behind them, or terrain under water gets occlusion-culled.
-                loaded.connectivity = Some(Connectivity::compute(&loaded.chunk, |id| registry.is_opaque(id)));
-                filled += 1;
-            }
+        // Off→on activation: the fill queue only accumulates while the gate is
+        // on, so reseed it from scratch — the ONE remaining full missing-
+        // connectivity scan, paid per activation instead of per rebuild.
+        if !was_active {
+            self.conn_fill_queue.clear();
+            let missing =
+                self.chunks.iter().filter(|(_, l)| l.connectivity.is_none()).map(|(&c, _)| c);
+            self.conn_fill_queue.extend(missing);
         }
-        // Leave `occlusion_dirty` set on a partial fill so the gate re-runs.
+        let registry = &self.registry;
+        // Budgeted connectivity fill from the QUEUE (loads/edits push; unloaded
+        // entries drop lazily here): a boundary cross can newly load a whole
+        // shell of unclassified chunks, and filling them all in one frame is
+        // the O(cube) spike. Stop at the budget and re-arm below so the fill
+        // resumes next pass (partial classification only under-occludes —
+        // draws a few extra chunks — never a hole).
+        let mut filled = 0;
+        while filled < OCCLUSION_FILL_BUDGET {
+            let Some(coord) = self.conn_fill_queue.pop_front() else { break };
+            let Some(loaded) = self.chunks.get_mut(&coord) else { continue };
+            if loaded.connectivity.is_some() {
+                continue;
+            }
+            // Sightlines pass through anything not opaque — water/glass are
+            // solid (collision) but see-through, so they must NOT seal chunks
+            // behind them, or terrain under water gets occlusion-culled.
+            loaded.connectivity =
+                Some(Connectivity::compute(&loaded.chunk, |id| registry.is_opaque(id)));
+            filled += 1;
+        }
+        // Leave the IMMEDIATE flag set on a partial fill so the gate re-runs
+        // next pass without waiting out the debounce.
+        let capped = !self.conn_fill_queue.is_empty();
         if capped {
             self.occlusion_dirty.set();
         }
@@ -1278,8 +1337,7 @@ impl World {
         });
         self.apply_occlusion_masks(eng);
         if capped {
-            let remaining = self.chunks.values().filter(|l| l.connectivity.is_none()).count();
-            Progress::Partial { remaining: remaining as u32 }
+            Progress::Partial { remaining: self.conn_fill_queue.len() as u32 }
         } else {
             Progress::Idle
         }
