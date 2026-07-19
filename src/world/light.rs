@@ -529,6 +529,42 @@ mod tests {
         grid
     }
 
+    /// Full settle-flood cost for a surface-band chunk — the gauge for the
+    /// propagate opacity-bitset redesign. Ignored: a timing benchmark, not a
+    /// correctness gate. Run with
+    /// `cargo test --release light_propagate_throughput -- --ignored --nocapture`.
+    /// 2026-07-19 (12-core box), per-probe `get_local`: ~18.1k settles/s.
+    #[test]
+    #[ignore]
+    fn light_propagate_throughput() {
+        use crate::block::registry::BlockRegistry;
+        use crate::world::generation::{SineHills, TerrainGenerator};
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 5);
+        // The surface chunk at the origin: the Dense band every load floods
+        // (deep/sky chunks take the analytic fast paths and never get here).
+        let cy = generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let chunk = Chunk::new(0, cy, 0, &generator);
+        let tables = registry.hot_tables();
+        let shell = FaceShell::dark();
+        let ceiling = CeilingWindow::from_heights(|lx, lz| generator.height(lx as i32, lz as i32));
+        let mut out = LightGrid::dark();
+
+        const N: usize = 4000;
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            propagate(&chunk, &shell, &ceiling, cy * CHUNK_SIZE as i32, &tables, &mut out);
+            std::hint::black_box(&out);
+        }
+        let dt = start.elapsed();
+        println!(
+            "{N} propagates in {:.3}s = {:.0} settles/s",
+            dt.as_secs_f64(),
+            N as f64 / dt.as_secs_f64()
+        );
+    }
+
     #[test]
     fn analytic_grids_match_propagate() {
         // The anchor for `World::trivial_light`: the analytic grids it publishes

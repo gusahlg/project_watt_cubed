@@ -1627,6 +1627,19 @@ impl World {
             .count()
     }
 
+    /// Snapshot the streaming-queue depths (see [`super::StreamGauges`]).
+    pub fn stream_gauges(&self) -> super::StreamGauges {
+        super::StreamGauges {
+            chunks: self.chunks.len(),
+            generating: self.generating.len(),
+            mesh_worklist: self.mesh_worklist.len(),
+            upload_queue: self.upload_queue.len(),
+            light_worklist: self.light_worklist.len(),
+            light_inflight: self.light_inflight.len(),
+            light_apply_queue: self.light_apply_queue.len(),
+        }
+    }
+
     /// Human-readable reason `entry_complete` is not yet true — the first
     /// unsatisfied clause with a count, so a stalled bless/harness run says WHICH
     /// streaming stage is stuck instead of hanging silently. Clause order mirrors

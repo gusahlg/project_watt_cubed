@@ -1064,6 +1064,51 @@ mod tests {
         );
     }
 
+    /// Queue dequeue cost under a live moving view — the gauge for the queue
+    /// redesign (today's near class runs a retain + full re-key scan on every
+    /// pop). Ignored: a timing benchmark, not a correctness gate. Run with
+    /// `cargo test --release queue_pop_throughput -- --ignored --nocapture`.
+    /// 2026-07-19 (12-core box), retain+scan Vec: ~529k pops/s at depth 512.
+    #[test]
+    #[ignore]
+    fn queue_pop_throughput() {
+        let terrain = generator(7);
+        // Columns within ±7 of the origin: always wanted at radius 16, so the
+        // benchmark measures the scan, never descheduling churn.
+        let near = |i: i32| Job::GenerateColumn {
+            col: (i % 15 - 7, (i / 15) % 15 - 7),
+            cy: 0..=0,
+            generator: terrain.clone(),
+            edits: Vec::new(),
+        };
+        const QUEUE: usize = 512;
+        const POPS: usize = 100_000;
+        let gate = ViewGate::new();
+        gate.set(0, 0, 16);
+        let mut q = JobQueue::default();
+        for i in 0..QUEUE {
+            q.push(near(i as i32));
+        }
+        let mut cancelled = Vec::new();
+        let start = Instant::now();
+        for n in 0..POPS {
+            // Boundary-cross cadence: nudge the live centre every 64 pops so
+            // the re-key path sees a moving view (never far enough to shed).
+            if n % 64 == 0 {
+                gate.set(((n / 64) % 3) as i32, 0, 16);
+            }
+            let job = q.pop(&gate, &mut cancelled);
+            assert!(cancelled.is_empty(), "benchmark jobs must stay in view");
+            q.push(job.expect("queue kept full"));
+        }
+        let dt = start.elapsed();
+        println!(
+            "{POPS} pops (queue depth {QUEUE}, moving gate) in {:.3}s = {:.0} pops/s",
+            dt.as_secs_f64(),
+            POPS as f64 / dt.as_secs_f64()
+        );
+    }
+
     #[test]
     fn panicking_jobs_report_failed_with_their_claim_and_leave_the_pool_alive() {
         let workers = Workers::spawn(1);

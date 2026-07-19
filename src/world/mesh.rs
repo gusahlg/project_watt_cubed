@@ -475,6 +475,48 @@ mod tests {
         Chunk::new(0, 0, 0, &EmptyGen)
     }
 
+    /// Snapshot-capture cost (the main-thread half of every mesh admit) — the
+    /// gauge for the row-wise capture redesign. Ignored: a timing benchmark,
+    /// not a correctness gate. Run with
+    /// `cargo test --release padded_capture_throughput -- --ignored --nocapture`.
+    /// 2026-07-19 (12-core box), per-cell closure capture: ~26.7k captures/s.
+    #[test]
+    #[ignore]
+    fn padded_capture_throughput() {
+        use crate::block::registry::BlockRegistry;
+        use crate::world::generation::SineHills;
+        use crate::world::light::LightGrid;
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 5);
+        // The SURFACE band (world y 48..96): mixed paletted chunks — the case
+        // that actually reaches the pool (uniform chunks capture cheap).
+        let neigh: Vec<Chunk> = (0..27)
+            .map(|k| Chunk::new(k % 3 - 1, 4 + k / 9 - 1, k / 3 % 3 - 1, &generator))
+            .collect();
+        let at = |dx: i32, dy: i32, dz: i32| -> Option<&Chunk> {
+            Some(&neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize])
+        };
+        let grids: Vec<LightGrid> = (0..27).map(|_| LightGrid::open_sky()).collect();
+        let light_at = |dx: i32, dy: i32, dz: i32| -> Option<&LightGrid> {
+            Some(&grids[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize])
+        };
+
+        const N: usize = 4000;
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            let p = Padded::capture(at);
+            let l = PaddedLight::capture(light_at);
+            std::hint::black_box((&p, &l));
+        }
+        let dt = start.elapsed();
+        println!(
+            "{N} padded+light captures in {:.3}s = {:.0} captures/s",
+            dt.as_secs_f64(),
+            N as f64 / dt.as_secs_f64()
+        );
+    }
+
     /// The unlit path must be byte-identical to meshing against a full-bright
     /// shell — it is the same computation minus the reads. Checked with AO on
     /// AND off (off additionally takes the constant-sample early return).

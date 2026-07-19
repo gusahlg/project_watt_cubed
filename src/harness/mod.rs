@@ -326,6 +326,11 @@ struct Stage {
     view: DebugView,
     /// One-shot world edit run once after teleport (mirrors [`GoldenShot::setup`]).
     setup: Option<fn(&mut Game)>,
+    /// Horizontal view radius override (chunks), applied straight through
+    /// `World::set_view_distances` — the scripted `Game::update` never applies
+    /// `Settings`, so this is the only way a stage can stream a non-default
+    /// radius. `None` keeps the world's default.
+    radius: Option<i32>,
     /// The render lanes this stage's world is built with — part of the shot's
     /// identity, so e.g. `tile_boundary` is *defined* as tiles-on and cannot be
     /// captured with the wrong far-field filler. Threaded into [`Game::scripted`].
@@ -342,10 +347,166 @@ enum StageKind {
     Capture { path: PathBuf },
     /// Accumulate frame time over [`SAMPLE_FRAMES`] ready frames; record the mean (ms) under `name`.
     FrameSample { name: String },
+    /// After entry completes, fly the player at `speed_mps` along +X for
+    /// `secs`, then stop and measure how long streaming takes to fully
+    /// re-settle — the fast-flight lag scenario, reproduced. Records a
+    /// [`StressOutcome`] under `name`. `pace_hz` throttles the loop (see
+    /// [`StressSpec::pace_hz`]).
+    StressFlight { name: String, speed_mps: f64, secs: f64, pace_hz: f64 },
 }
 
 /// Sample width for `FrameSample`'s mean (120 frames).
 const SAMPLE_FRAMES: u32 = 120;
+
+// ============================================================================
+// Stress-flight scenario (fast flight then stop — the streaming-lag repro)
+// ============================================================================
+
+/// One stress-flight scenario for [`run_stress`].
+#[derive(Clone, Copy, Debug)]
+pub struct StressSpec {
+    pub name: &'static str,
+    /// Flight speed (m/s). Keep below the streamer's teleport threshold
+    /// (`MAX_PREDICT_SPEED` = 512) so this exercises TRAVEL, not the purge path.
+    pub speed_mps: f64,
+    /// Flight duration after entry completes.
+    pub secs: f64,
+    /// Horizontal view radius (chunks) — see [`Stage::radius`].
+    pub radius: i32,
+    /// Frame pacing (Hz; 0 = uncapped). The capture window runs vsync-off at
+    /// thousands of FPS, which hands the per-frame-budgeted streaming lanes
+    /// ~30× more wall-time per second than a real session and hides every
+    /// backlog symptom. Pacing to 60 restores a real game's budget rate; the
+    /// recorded frame times cover only the WORK half (update+draw), never the
+    /// pacing sleep.
+    pub pace_hz: f64,
+}
+
+/// Frame-time distribution over one phase of a stress run (milliseconds).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub frames: usize,
+    pub p50: f32,
+    pub p95: f32,
+    pub p99: f32,
+    pub max: f32,
+}
+
+impl FrameStats {
+    /// Sorts `ms` in place and reads the nearest-rank percentiles.
+    fn from_ms(ms: &mut Vec<f32>) -> FrameStats {
+        if ms.is_empty() {
+            return FrameStats::default();
+        }
+        ms.sort_by(f32::total_cmp);
+        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
+        FrameStats {
+            frames: ms.len(),
+            p50: at(0.50),
+            p95: at(0.95),
+            p99: at(0.99),
+            max: *ms.last().expect("non-empty"),
+        }
+    }
+}
+
+/// A finished stress run's numbers. First landings are report-only; thresholds
+/// get pinned (like the throughput tests' doc-comment numbers) once a few runs
+/// establish the machine's baseline.
+#[derive(Clone, Debug)]
+pub struct StressOutcome {
+    /// Frame times while flying.
+    pub flight: FrameStats,
+    /// Frame times between stopping and settling (or the cap).
+    pub settle: FrameStats,
+    /// Stop → first `entry_complete` frame. `None` = still unsettled at
+    /// [`STRESS_SETTLE_CAP`] — the permanent-wedge symptom the claim-release
+    /// fixes target.
+    pub settle_time: Option<Duration>,
+    /// `entry_debug()` at the cap (empty when settled) — names the stuck stage.
+    pub stuck: String,
+    /// Peak queue depths observed across the whole run.
+    pub max_upload_queue: usize,
+    pub max_light_apply: usize,
+    pub max_mesh_worklist: usize,
+    pub max_chunks: usize,
+}
+
+/// How long after stopping a stress run waits for `entry_complete` before
+/// recording the world as wedged. Generous: a healthy settle is seconds.
+const STRESS_SETTLE_CAP: Duration = Duration::from_secs(60);
+
+/// Live state of the one in-flight stress run (stage-local, like the
+/// capture/sample accumulators).
+struct StressRun {
+    flight_start: Instant,
+    stopped: Option<Instant>,
+    flight_ms: Vec<f32>,
+    settle_ms: Vec<f32>,
+    max_upload: usize,
+    max_apply: usize,
+    max_worklist: usize,
+    max_chunks: usize,
+}
+
+impl StressRun {
+    fn new() -> StressRun {
+        StressRun {
+            flight_start: Instant::now(),
+            stopped: None,
+            flight_ms: Vec::new(),
+            settle_ms: Vec::new(),
+            max_upload: 0,
+            max_apply: 0,
+            max_worklist: 0,
+            max_chunks: 0,
+        }
+    }
+
+    fn finish(mut self, settle_time: Option<Duration>, stuck: String) -> StressOutcome {
+        StressOutcome {
+            flight: FrameStats::from_ms(&mut self.flight_ms),
+            settle: FrameStats::from_ms(&mut self.settle_ms),
+            settle_time,
+            stuck,
+            max_upload_queue: self.max_upload,
+            max_light_apply: self.max_apply,
+            max_mesh_worklist: self.max_worklist,
+            max_chunks: self.max_chunks,
+        }
+    }
+}
+
+/// Run each stress scenario in its own stage (fresh `Game` per spec) inside the
+/// process's single event loop and return the outcomes in spec order.
+pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
+    let stages = specs
+        .iter()
+        .map(|s| Stage {
+            seed: GOLDEN_SEED,
+            // Above the SineHills band (amplitude 20 around ~64) so a straight
+            // +X flight stays airborne; scripted games run no physics, so the
+            // height only affects which chunk layers stream.
+            cam: Some(CameraPose { pos: DVec3::new(0.0, 96.0, 0.0), yaw: 0.0, pitch: -0.15 }),
+            day: SCRIPTED_DEFAULT_DAY,
+            view: DebugView::Normal,
+            setup: None,
+            radius: Some(s.radius),
+            render: crate::render_config::RenderConfig::golden(),
+            kind: StageKind::StressFlight {
+                name: s.name.to_string(),
+                speed_mps: s.speed_mps,
+                secs: s.secs,
+                pace_hz: s.pace_hz,
+            },
+        })
+        .collect();
+    let out = execute(stages);
+    specs
+        .iter()
+        .filter_map(|s| out.stress.get(s.name).map(|o| (s.name.to_string(), o.clone())))
+        .collect()
+}
 
 /// Wall-clock hold AFTER `entry_complete` before a `Capture` screenshot.
 /// `entry_complete` only means the CPU worklists (mesh/light) have drained — but
@@ -371,6 +532,7 @@ struct Outcomes {
     captures: std::collections::HashMap<PathBuf, Result<(), String>>,
     entry_times: std::collections::HashMap<u64, Duration>,
     frame_times: std::collections::HashMap<String, f32>,
+    stress: std::collections::HashMap<String, StressOutcome>,
 }
 
 /// Scratch capture path for a shot/view (decoded back by the evaluator).
@@ -405,6 +567,7 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
             day: SCRIPTED_DEFAULT_DAY,
             view: DebugView::Normal,
             setup: None,
+            radius: None,
             render: crate::render_config::RenderConfig::golden(),
             kind: StageKind::EntryTime,
         })
@@ -417,6 +580,7 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                 day: shot.day,
                 view: DebugView::Normal,
                 setup: shot.setup,
+                radius: None,
                 render: crate::render_config::RenderConfig::golden(),
                 kind: StageKind::Capture { path: image_capture_path(shot.name, bless) },
             }),
@@ -426,6 +590,7 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                 day: shot.day,
                 view: DebugView::TerrainKey,
                 setup: shot.setup,
+                radius: None,
                 render: crate::render_config::RenderConfig::golden(),
                 kind: StageKind::Capture { path: scratch_path(shot.name, "terrainkey") },
             }),
@@ -435,6 +600,7 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                 day: shot.day,
                 view: DebugView::Normal,
                 setup: shot.setup,
+                radius: None,
                 render: crate::render_config::RenderConfig::golden(),
                 kind: StageKind::FrameSample { name: shot.name.to_string() },
             }),
@@ -489,9 +655,13 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
     let mut settle_start: Option<Instant> = None;
     let mut sample_total_ms = 0f32;
     let mut sample_n = 0u32;
+    let mut stress: Option<StressRun> = None;
     let mut floated = false;
 
     voxel_engine::run(scripted_config(), move |eng| {
+        // Work-half timestamp for the stress stages' frame samples (their
+        // pacing sleep must not count as frame cost).
+        let frame_started = Instant::now();
         // First frame of the whole run: pull our just-opened (and therefore
         // focused) window out of the tiling layout. gharial ignores the
         // fixed-size hint and re-splits the column the moment another window
@@ -512,6 +682,12 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             if let Some(cam) = stage.cam {
                 g.teleport(cam);
             }
+            // Non-default streaming radius (stress stages): scripted updates
+            // never apply `Settings`, so push it straight into the world.
+            // Vertical stays at the settings default (3 layers).
+            if let Some(radius) = stage.radius {
+                g.world_mut().set_view_distances(radius, Settings::default().vertical_distance);
+            }
             // Pin the shot's lighting, then run its one-shot world edit (cave
             // carve) — both before the first `update`/stream so the edit is in
             // the overlay when the carved chunks generate.
@@ -526,6 +702,7 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             settle_start = None;
             sample_total_ms = 0.0;
             sample_n = 0;
+            stress = None;
             g
         });
         // Advance ONE frame exactly as the app does: update THEN draw. Drawing
@@ -540,6 +717,70 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // Shake 0: captures must be deterministic (no live trauma exists in the
         // scripted path anyway).
         g.draw(eng, &mut mods, settings.fov, 0.0);
+
+        // A live stress run owns its stage's frames from here: it deliberately
+        // flies THROUGH the un-entry states the gate below waits out, so it
+        // bypasses that gate and its watchdog (the run keeps its own settle cap).
+        if let StageKind::StressFlight { name, speed_mps, secs, pace_hz } = &stage.kind {
+            if let Some(run) = stress.as_mut() {
+                // The WORK half of this frame (update+draw, everything above);
+                // the pacing sleep below is deliberately excluded.
+                let work = frame_started.elapsed();
+                let ms = work.as_secs_f32() * 1000.0;
+                let gauges = g.world().stream_gauges();
+                run.max_upload = run.max_upload.max(gauges.upload_queue);
+                run.max_apply = run.max_apply.max(gauges.light_apply_queue);
+                run.max_worklist = run.max_worklist.max(gauges.mesh_worklist);
+                run.max_chunks = run.max_chunks.max(gauges.chunks);
+                let finished = match run.stopped {
+                    None => {
+                        run.flight_ms.push(ms);
+                        // dt-based advance: constant speed at any frame rate. The
+                        // clamp keeps one hitch from a teleport-sized jump (the
+                        // streamer treats >0.5 s gaps as discontinuities).
+                        let dt = f64::from(eng.frame_time()).min(0.1);
+                        g.player_mut().position.x += speed_mps * dt;
+                        if run.flight_start.elapsed().as_secs_f64() >= *secs {
+                            run.stopped = Some(Instant::now());
+                            eprintln!("stress {name}: flight over — settling…");
+                        }
+                        None
+                    }
+                    Some(stopped) => {
+                        run.settle_ms.push(ms);
+                        if g.world().entry_complete() {
+                            Some((Some(stopped.elapsed()), String::new()))
+                        } else if stopped.elapsed() >= STRESS_SETTLE_CAP {
+                            Some((None, g.world().entry_debug()))
+                        } else {
+                            if frame.is_multiple_of(120) {
+                                eprintln!("stress {name}: settling… {}", g.world().entry_debug());
+                            }
+                            None
+                        }
+                    }
+                };
+                frame += 1;
+                if let Some((settle_time, stuck)) = finished {
+                    let outcome = stress.take().expect("run is live").finish(settle_time, stuck);
+                    sink.borrow_mut().stress.insert(name.clone(), outcome);
+                    idx += 1;
+                    game = None;
+                    if idx >= stages.len() {
+                        return false;
+                    }
+                } else if *pace_hz > 0.0 {
+                    // Pace to the target cadence so per-frame lane budgets fire
+                    // at a real session's rate, not the capture window's
+                    // uncapped thousands of FPS.
+                    let target = Duration::from_secs_f64(1.0 / pace_hz);
+                    if let Some(rest) = target.checked_sub(frame_started.elapsed()) {
+                        std::thread::sleep(rest);
+                    }
+                }
+                return true;
+            }
+        }
 
         // Captures additionally wait for the fully-refined far field: a coarse
         // ancestor cover is entry-playable, but refinement landing later moves
@@ -614,6 +855,15 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
                     sink.borrow_mut().frame_times.insert(name.clone(), mean);
                 }
                 full
+            }
+            StageKind::StressFlight { name, speed_mps, pace_hz, .. } => {
+                // Entry complete: begin the flight. The branch above the entry
+                // gate owns every subsequent frame of this stage.
+                eprintln!(
+                    "stress {name}: entry complete — flying +X at {speed_mps} m/s ({pace_hz} Hz pace)"
+                );
+                stress = Some(StressRun::new());
+                false
             }
         };
 
@@ -906,6 +1156,7 @@ pub fn time_to_first_full_render(seed: u64) -> Duration {
         day: SCRIPTED_DEFAULT_DAY,
         view: DebugView::Normal,
         setup: None,
+        radius: None,
         render: crate::render_config::RenderConfig::golden(),
         kind: StageKind::EntryTime,
     }]);

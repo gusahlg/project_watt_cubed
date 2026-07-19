@@ -116,6 +116,21 @@ const SECTION_UPLOAD_BUDGET: usize = 2;
 /// `chunk * CHUNK_SIZE + local` relationship (see [`crate::coord`]); the
 /// `Coord` alias keeps the shorter name the `world` module already used.
 use crate::coord::ChunkCoord as Coord;
+
+/// Live streaming-queue depths — the numeric twin of
+/// [`entry_debug`](World::entry_debug)'s formatted counters, for the harness's
+/// stress metrics (peak backlog depths, settle progress) where parsing a
+/// debug string would be absurd.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamGauges {
+    pub chunks: usize,
+    pub generating: usize,
+    pub mesh_worklist: usize,
+    pub upload_queue: usize,
+    pub light_worklist: usize,
+    pub light_inflight: usize,
+    pub light_apply_queue: usize,
+}
 use connectivity::{Connectivity, Occlusion};
 
 /// The streamed chunk volume around the player: a horizontal ring radius and a
