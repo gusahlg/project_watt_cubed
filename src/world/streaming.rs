@@ -250,11 +250,17 @@ impl World {
         let prev_center = self.center;
         let full_pass = Some(center_chunk) != self.center;
         self.center = Some(center_chunk);
-        // Publish the live view to the worker pool: queued near jobs re-order
-        // toward the player's CURRENT position at every dequeue, and entries
-        // left far behind by fast movement are descheduled instead of run.
+        // Publish the live view to the worker pool: queued jobs re-key toward
+        // the player's CURRENT position on every view change, and entries left
+        // behind by fast movement — far sections included — are descheduled
+        // instead of run. The far horizon is the outer ladder radius plus the
+        // velocity lookahead, so prediction-desired sections survive it.
         if let Some(workers) = &self.workers {
-            workers.set_view(center_chunk.x, center_chunk.z, self.view.horizontal);
+            let vxz = (self.section_vel.x * self.section_vel.x
+                + self.section_vel.z * self.section_vel.z)
+                .sqrt();
+            let far_m = f64::from(self.section_pyramid.outer_m()) + vxz * TAU_STREAM;
+            workers.set_view(center_chunk.x, center_chunk.z, self.view.horizontal, far_m);
         }
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);

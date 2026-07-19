@@ -29,7 +29,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::Coord;
-use super::chunk::Chunk;
+use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::{SineHills, TerrainGenerator};
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
@@ -271,14 +271,14 @@ impl Job {
 /// only genuinely left-behind work is.
 const CANCEL_MARGIN: i32 = 4;
 
-/// The live view, shared with the worker pool and consulted at DEQUEUE time.
-/// The world stores the streaming centre and radius here every frame; workers
-/// then (a) pop the near job CLOSEST to where the player is NOW — not where
-/// they were when it was enqueued — and (b) deschedule queued jobs whose
-/// region fell out of range entirely. Fast movement therefore reorders the
-/// backlog every pop and sheds it instead of grinding through stale regions.
+/// The live view, shared with the worker pool. The world stores the streaming
+/// centre/radius (and the far-field horizon) here every stream pass; the
+/// queues then re-key their backlogs toward where the player is NOW and
+/// deschedule entries left behind — once per CHANGE ([`ViewGate::epoch`]),
+/// not per pop. Fast movement therefore reorders the backlog and sheds it
+/// instead of grinding through stale regions.
 ///
-/// Two relaxed atomics: centre and radius may briefly disagree mid-update;
+/// Relaxed atomics: centre and radius may briefly disagree mid-update;
 /// [`CANCEL_MARGIN`] absorbs the tear (it can only mis-order or briefly spare
 /// a job, never cancel wanted work — the margin exceeds any one-frame move).
 pub(in crate::world) struct ViewGate {
@@ -286,16 +286,44 @@ pub(in crate::world) struct ViewGate {
     center: AtomicU64,
     /// Horizontal view radius in chunks; `i32::MAX` (permissive) until set.
     radius: AtomicI32,
+    /// Monotone stamp of the `(centre, radius)` pair: bumped only when one
+    /// actually changes, so the queues' O(n) re-key/deschedule rebuild runs
+    /// once per boundary cross instead of once per pop.
+    epoch: AtomicU64,
+    /// Far-field descheduling horizon in METRES (`f64` bits; +∞ until set):
+    /// the outer ladder radius plus the velocity lookahead, refreshed every
+    /// stream pass. Deliberately NOT folded into `epoch` — it wobbles with
+    /// velocity every pass, and the wanted checks read it LIVE rather than
+    /// baking it into keys.
+    far_m: AtomicU64,
 }
 
 impl ViewGate {
     fn new() -> Self {
-        Self { center: AtomicU64::new(0), radius: AtomicI32::new(i32::MAX) }
+        Self {
+            center: AtomicU64::new(0),
+            radius: AtomicI32::new(i32::MAX),
+            epoch: AtomicU64::new(0),
+            far_m: AtomicU64::new(f64::INFINITY.to_bits()),
+        }
     }
 
     fn set(&self, cx: i32, cz: i32, radius: i32) {
-        self.center.store(((cx as u32 as u64) << 32) | (cz as u32 as u64), Ordering::Relaxed);
-        self.radius.store(radius, Ordering::Relaxed);
+        let packed = ((cx as u32 as u64) << 32) | (cz as u32 as u64);
+        let prev_center = self.center.swap(packed, Ordering::Relaxed);
+        let prev_radius = self.radius.swap(radius, Ordering::Relaxed);
+        if prev_center != packed || prev_radius != radius {
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the far-field horizon (metres from the eye).
+    fn set_far(&self, metres: f64) {
+        self.far_m.store(metres.to_bits(), Ordering::Relaxed);
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
     }
 
     fn center(&self) -> (i32, i32) {
@@ -316,6 +344,36 @@ impl ViewGate {
     fn wanted(&self, cx: i32, cz: i32) -> bool {
         let radius = self.radius.load(Ordering::Relaxed);
         radius == i32::MAX || self.dist(cx, cz) <= radius + CANCEL_MARGIN
+    }
+
+    /// The eye position in metres — the centre chunk's centre, matching
+    /// [`player_dist2`](super::player_dist2)'s convention.
+    fn eye_m(&self) -> (f64, f64) {
+        let (cx, cz) = self.center();
+        let s = CHUNK_SIZE as f64;
+        (cx as f64 * s + s / 2.0, cz as f64 * s + s / 2.0)
+    }
+
+    /// Live squared horizontal distance (m²) from the eye to a world point —
+    /// the far class's re-key metric (2-D, like its admission metric).
+    fn far_dist2_m(&self, wx: i64, wz: i64) -> u64 {
+        let (ex, ez) = self.eye_m();
+        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
+        (dx * dx + dz * dz) as u64
+    }
+
+    /// Whether a far entry with world-centre `(wx, wz)` and footprint `span`
+    /// is still inside the live horizon. The entry's own span is the
+    /// hysteresis margin — sections are large, so the chunk-sized
+    /// [`CANCEL_MARGIN`] would be meaningless here. Permissive until both a
+    /// view and a horizon have been published.
+    fn far_wanted(&self, wx: i64, wz: i64, span: i64) -> bool {
+        let far = f64::from_bits(self.far_m.load(Ordering::Relaxed));
+        if !far.is_finite() || self.radius.load(Ordering::Relaxed) == i32::MAX {
+            return true;
+        }
+        let limit = far + span as f64;
+        (self.far_dist2_m(wx, wz) as f64) <= limit * limit
     }
 }
 
@@ -362,140 +420,196 @@ pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(2);
 /// forever (a permanent hole + an `entry_complete` hang).
 pub const FAR_QUEUE_CAP: usize = 256;
 
-/// One far-queue entry's ordering key: distance first, then a monotone sequence
-/// number so equal-distance jobs keep FIFO order.
-#[derive(Clone, Copy, Debug)]
-struct FarEntry {
-    dist2: u64,
+/// One queued job with its scheduling key. `d` is the class metric — near:
+/// live chess distance in chunks; far: squared metres (admission-keyed,
+/// re-keyed live on epoch changes). `(wx, wz)` is the entry's location for
+/// re-keying — the chunk column for near jobs, the world-space section centre
+/// for far — and `span` the far footprint (the descheduling margin; 0 near).
+struct Keyed {
+    d: u64,
     seq: u64,
+    wx: i64,
+    wz: i64,
+    span: i64,
+    job: Job,
 }
 
-/// The far scheduling class: nearest-first pop, FIFO tie-break on equal `dist2`
-/// via the monotone `seq`. Replaces the far `VecDeque` in [`JobQueue`] (the near
-/// class keeps its FIFO — its batches already arrive nearest-sorted).
-/// Representation is a flat `Vec` scanned on pop: the queue is small (capped at
-/// [`FAR_QUEUE_CAP`] by admission) and pop runs only a handful of times per
-/// frame, so the scan beats a heap's constant factor and keeps the FIFO
-/// tie-break trivial.
+// Ordered by (d, seq) only — the FIFO tie-break on equal distance. The job
+// payload never participates.
+impl PartialEq for Keyed {
+    fn eq(&self, other: &Self) -> bool {
+        (self.d, self.seq) == (other.d, other.seq)
+    }
+}
+impl Eq for Keyed {}
+impl PartialOrd for Keyed {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Keyed {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.d, self.seq).cmp(&(other.d, other.seq))
+    }
+}
+
+/// A nearest-first queue whose keys go stale as the player moves. The whole
+/// backlog is SYNCED — every entry re-keyed against the live view, the
+/// left-behind descheduled into `cancelled` — at most once per [`ViewGate`]
+/// epoch (a real centre/radius change), then pops are plain O(log n) heap
+/// pops. The old representation paid an O(n) retain + full re-key min-scan
+/// under the queue mutex on EVERY pop, which is the lock-hold hazard a
+/// 10-worker pool multiplies.
 #[derive(Default)]
-pub struct FarQueue {
-    entries: Vec<(FarEntry, Job)>,
+struct EpochHeap {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<Keyed>>,
+    keyed_at: u64,
     next_seq: u64,
 }
 
-impl FarQueue {
-    /// Push `job` keyed by `dist2` (squared euclidean METRES from the job's
-    /// world-space centre to the player, computed at submit).
-    pub(in crate::world) fn push(&mut self, job: Job, dist2: u64) {
+impl EpochHeap {
+    fn push(&mut self, d: u64, wx: i64, wz: i64, span: i64, job: Job) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.entries.push((FarEntry { dist2, seq }, job));
+        self.heap.push(std::cmp::Reverse(Keyed { d, seq, wx, wz, span, job }));
     }
 
-    /// Pop the nearest job: lowest `dist2`, earliest `seq` breaking ties.
-    pub(in crate::world) fn pop_nearest(&mut self) -> Option<Job> {
-        let idx = self
-            .entries
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (e, _))| (e.dist2, e.seq))
-            .map(|(i, _)| i)?;
-        Some(self.entries.swap_remove(idx).1)
+    /// Re-key every entry and deschedule the unwanted, once per epoch.
+    fn sync(
+        &mut self,
+        epoch: u64,
+        key: impl Fn(&Keyed) -> u64,
+        wanted: impl Fn(&Keyed) -> bool,
+        cancelled: &mut Vec<JobKey>,
+    ) {
+        if self.keyed_at == epoch {
+            return;
+        }
+        self.keyed_at = epoch;
+        if self.heap.is_empty() {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.heap.len());
+        for std::cmp::Reverse(mut entry) in std::mem::take(&mut self.heap).into_vec() {
+            if wanted(&entry) {
+                entry.d = key(&entry);
+                kept.push(std::cmp::Reverse(entry));
+            } else {
+                cancelled.push(JobKey::of(&entry.job));
+            }
+        }
+        self.heap = std::collections::BinaryHeap::from(kept); // O(n) heapify
+    }
+
+    fn pop(&mut self) -> Option<Job> {
+        self.heap.pop().map(|std::cmp::Reverse(k)| k.job)
+    }
+
+    fn len(&self) -> usize {
+        self.heap.len()
     }
 
     /// Drop every queued entry, returning the exact claims so the caller can
     /// release them (a claimed key is owed exactly one resolution).
-    fn clear_claims(&mut self) -> Vec<JobKey> {
-        self.entries.drain(..).map(|(_, job)| JobKey::of(&job)).collect()
+    fn drain_claims(&mut self) -> Vec<JobKey> {
+        std::mem::take(&mut self.heap)
+            .into_vec()
+            .into_iter()
+            .map(|std::cmp::Reverse(k)| JobKey::of(&k.job))
+            .collect()
     }
+}
 
-    fn len(&self) -> usize {
-        self.entries.len()
+/// A far job's world-space centre and footprint span (metres), for live
+/// re-keying and horizon descheduling without any callback into the `World`.
+fn far_center_span(job: &Job) -> (i64, i64, i64) {
+    match job {
+        Job::Section { pos, .. } => {
+            let span = pos.span() as i64;
+            (pos.min_x() as i64 + span / 2, pos.min_z() as i64 + span / 2, span)
+        }
+        _ => (0, 0, 0),
     }
 }
 
 /// Two-class queue shared by the pool. `pop` drains `near` fully before `far`,
 /// so far LOD jobs fill idle workers without ever starving the chunk under the
-/// player. Near is LIVE-distance-ordered against the [`ViewGate`] (nearest to
-/// where the player is NOW pops first, and left-behind entries are descheduled
-/// at pop); far is distance-ordered at admission (see [`FarQueue`]). `closed`
-/// is the shutdown flag a blocked `pop` wakes on.
+/// player. Both classes live in [`EpochHeap`]s: near keys by live chess
+/// distance, far by admission dist² re-keyed (and horizon-descheduled) on
+/// every view change — sustained fast flight sheds far work it has left
+/// behind instead of grinding it (the old far class re-keyed NEVER: only the
+/// >512 m/s teleport purge touched it). `closed` is the shutdown flag a
+/// blocked `pop` wakes on.
 #[derive(Default)]
 struct JobQueue {
-    near: Vec<(u64, Job)>,
-    near_seq: u64,
-    far: FarQueue,
+    near: EpochHeap,
+    far: EpochHeap,
     closed: bool,
 }
 
 impl JobQueue {
     /// Push at the job's scheduling class. A far job pushed here (the legacy
     /// [`Workers::submit`] path and headless tests) carries no distance, so it
-    /// sorts at `dist2 = 0` and equal-distance far jobs fall back to FIFO by
-    /// `seq` — the old `VecDeque` order. This legacy path is uncapped (its only
-    /// producers are tests); the streaming lanes go through the cap-checked
-    /// [`Workers::submit_far`].
-    fn push(&mut self, job: Job) {
+    /// sorts at `d = 0` and equal-distance far jobs fall back to FIFO by `seq`.
+    /// This legacy path is uncapped (its only producers are tests); the
+    /// streaming lanes go through the cap-checked [`Workers::submit_far`].
+    fn push(&mut self, job: Job, gate: &ViewGate) {
         match priority(&job) {
             Priority::Near => {
-                let seq = self.near_seq;
-                self.near_seq += 1;
-                self.near.push((seq, job));
+                let (cx, cz) = job.col().unwrap_or((0, 0));
+                let d = gate.dist(cx, cz) as u64;
+                self.near.push(d, cx as i64, cz as i64, 0, job);
             }
-            Priority::Far => self.far.push(job, 0),
+            Priority::Far => {
+                let (wx, wz, span) = far_center_span(&job);
+                self.far.push(0, wx, wz, span, job);
+            }
         }
     }
 
     fn clear_far(&mut self) -> Vec<JobKey> {
-        self.far.clear_claims()
+        self.far.drain_claims()
     }
 
-    /// Admit a far job keyed by `dist2`, or REJECT it at [`FAR_QUEUE_CAP`]
-    /// (returns whether it was admitted). Rejection is the whole cap mechanism:
-    /// the lane never claims a rejected key, so it retries on a later frame.
+    /// Admit a far job keyed by `dist2` (squared metres, motion-biased at the
+    /// lane), or REJECT it at [`FAR_QUEUE_CAP`] (returns whether it was
+    /// admitted). Rejection is the whole cap mechanism: the lane never claims
+    /// a rejected key, so it retries on a later frame.
     #[must_use]
     fn push_far(&mut self, job: Job, dist2: u64) -> bool {
         debug_assert!(matches!(priority(&job), Priority::Far), "push_far on a near job");
         if self.far.len() >= FAR_QUEUE_CAP {
             return false;
         }
-        self.far.push(job, dist2);
+        let (wx, wz, span) = far_center_span(&job);
+        self.far.push(dist2, wx, wz, span, job);
         true
     }
 
     /// The next job to run: the near job closest to the LIVE view centre
     /// (FIFO by seq on ties, and the whole class before any far job), then
-    /// the nearest far job. Near entries whose region left the view are
-    /// drained into `cancelled` — the caller reports each as
-    /// [`Done::Cancelled`] so its claim is released instead of stranded.
-    ///
-    /// The linear scan re-keys every entry against the CURRENT centre, which
-    /// is what makes fast movement re-prioritize the backlog for free; the
-    /// near queue is bounded by the admission budgets, so the scan stays tiny
-    /// next to the job that follows it.
+    /// the nearest far job. On a view change (and only then), both heaps
+    /// re-key and drain their left-behind entries into `cancelled` — the
+    /// caller reports each as [`Done::Cancelled`] so its claim is released
+    /// instead of stranded.
     fn pop(&mut self, gate: &ViewGate, cancelled: &mut Vec<JobKey>) -> Option<Job> {
-        // Deschedule first, then select — two passes so the winning index
-        // can't be invalidated by a removal.
-        self.near.retain(|(_, job)| match job.col() {
-            Some((cx, cz)) if !gate.wanted(cx, cz) => {
-                cancelled.push(JobKey::of(job));
-                false
-            }
-            _ => true,
-        });
-        let best = self
-            .near
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (seq, job))| {
-                let d = job.col().map_or(0, |(cx, cz)| gate.dist(cx, cz));
-                (d, *seq)
-            })
-            .map(|(i, _)| i);
-        match best {
-            Some(i) => Some(self.near.swap_remove(i).1),
-            None => self.far.pop_nearest(),
-        }
+        let epoch = gate.epoch();
+        self.near.sync(
+            epoch,
+            |e| gate.dist(e.wx as i32, e.wz as i32) as u64,
+            |e| gate.wanted(e.wx as i32, e.wz as i32),
+            cancelled,
+        );
+        // Far syncs on the same trigger even while near work exists: a flood
+        // keeps workers in the near class for a long time, and stale far
+        // claims must release promptly, not once the near backlog drains.
+        self.far.sync(
+            epoch,
+            |e| gate.far_dist2_m(e.wx, e.wz),
+            |e| gate.far_wanted(e.wx, e.wz, e.span),
+            cancelled,
+        );
+        self.near.pop().or_else(|| self.far.pop())
     }
 }
 
@@ -550,11 +664,12 @@ impl Workers {
         }
     }
 
-    /// Publish the live streaming centre and horizontal radius (chunks). The
-    /// queue re-prioritizes near work against it at every pop and descheduled
-    /// left-behind entries — the fast-movement fix.
-    pub(in crate::world) fn set_view(&self, cx: i32, cz: i32, radius: i32) {
+    /// Publish the live streaming centre, horizontal radius (chunks), and the
+    /// far-field horizon (metres). The queues re-key their backlogs against it
+    /// and deschedule left-behind entries — once per change, at the pool.
+    pub(in crate::world) fn set_view(&self, cx: i32, cz: i32, radius: i32, far_m: f64) {
         self.view.set(cx, cz, radius);
+        self.view.set_far(far_m);
     }
 
     /// Queue a job at its scheduling class; returns whether it was accepted.
@@ -566,7 +681,7 @@ impl Workers {
         if queue.closed {
             return false;
         }
-        queue.push(job);
+        queue.push(job, &self.view);
         drop(queue);
         cvar.notify_one();
         true
@@ -932,10 +1047,10 @@ mod tests {
         // Interleave far/near so a FIFO alone would not reproduce the order.
         let mut q = JobQueue::default();
         let gate = open_gate();
-        q.push(far(0));
-        q.push(near(0));
-        q.push(far(1));
-        q.push(near(1));
+        q.push(far(0), &gate);
+        q.push(near(0), &gate);
+        q.push(far(1), &gate);
+        q.push(near(1), &gate);
 
         // All near first (FIFO within class), then all far (FIFO within class).
         assert!(matches!(pop_clean(&mut q, &gate), Some(Job::GenerateColumn { col: (0, 0), .. })));
@@ -961,10 +1076,10 @@ mod tests {
 
         let mut q = JobQueue::default();
         let gate = open_gate();
-        q.push(near(26, 26)); // enqueued first, but no longer the closest
-        q.push(near(0, 1)); // right next to the ORIGINAL centre
-        q.push(near(6, 6)); // a few chunks out from the original centre
-        q.push(near(28, 29)); // right next to where the player ends up
+        q.push(near(26, 26), &gate); // enqueued first, but no longer the closest
+        q.push(near(0, 1), &gate); // right next to the ORIGINAL centre
+        q.push(near(6, 6), &gate); // a few chunks out from the original centre
+        q.push(near(28, 29), &gate); // right next to where the player ends up
 
         // The player sprints to (28, 28) with radius 3: priorities flip, and
         // everything left more than radius + CANCEL_MARGIN chunks behind is
@@ -976,6 +1091,12 @@ mod tests {
             matches!(first, Job::GenerateColumn { col: (28, 29), .. }),
             "the job nearest the LIVE centre must pop first, not the oldest"
         );
+        // Cancellation ORDER was never load-bearing (the epoch rebuild drains
+        // in heap layout order); the SET of descheduled claims is the contract.
+        cancelled.sort_by_key(|k| match k {
+            JobKey::Column { col, .. } => *col,
+            _ => (i32::MAX, i32::MAX),
+        });
         assert_eq!(
             cancelled,
             vec![
@@ -1001,16 +1122,18 @@ mod tests {
         let id_of = section_id;
 
         // push dist2 {9, 1, 4, 1}: pops must see 1(first-pushed), 1, 4, 9.
-        let mut q = FarQueue::default();
-        q.push(job(0), 9); // seq 0
-        q.push(job(1), 1); // seq 1 — first-pushed of the two dist2 = 1
-        q.push(job(2), 4); // seq 2
-        q.push(job(3), 1); // seq 3
-        assert_eq!(id_of(&q.pop_nearest().unwrap()), 1, "nearest, first-pushed tie");
-        assert_eq!(id_of(&q.pop_nearest().unwrap()), 3, "nearest, second tie (FIFO)");
-        assert_eq!(id_of(&q.pop_nearest().unwrap()), 2, "dist2 = 4 next");
-        assert_eq!(id_of(&q.pop_nearest().unwrap()), 0, "dist2 = 9 last");
-        assert!(q.pop_nearest().is_none(), "drained");
+        // A permissive gate never bumps its epoch, so the admission keys hold.
+        let mut q = JobQueue::default();
+        let gate = open_gate();
+        assert!(q.push_far(job(0), 9)); // seq 0
+        assert!(q.push_far(job(1), 1)); // seq 1 — first-pushed of the two dist2 = 1
+        assert!(q.push_far(job(2), 4)); // seq 2
+        assert!(q.push_far(job(3), 1)); // seq 3
+        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 1, "nearest, first-pushed tie");
+        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 3, "nearest, second tie (FIFO)");
+        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 2, "dist2 = 4 next");
+        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 0, "dist2 = 9 last");
+        assert!(pop_clean(&mut q, &gate).is_none(), "drained");
 
         // At the cap, admission REJECTS (never evicts an accepted job: accepted
         // ⇒ claimed ⇒ owed a Done); everything already admitted survives.
@@ -1023,6 +1146,44 @@ mod tests {
         // Popping frees a slot, so the next submit admits again (lane retry).
         assert_eq!(id_of(&pop_clean(&mut q, &open_gate()).unwrap()), 0, "nearest still pops first");
         assert!(q.push_far(job(-1), 0), "below the cap admits again");
+    }
+
+    /// Sustained fast movement (below the teleport threshold) must DESCHEDULE
+    /// far work left beyond the live horizon and re-key the survivors to the
+    /// live eye: admission-time priorities go stale in metres per frame, and
+    /// the old far class never revisited them, so workers ground through
+    /// sections the player had left kilometres behind.
+    #[test]
+    fn far_queue_rekeys_live_and_deschedules_beyond_the_horizon() {
+        let terrain = generator(0);
+        let job = |id: i32| section_job(&terrain, id);
+        let (wx0, wz0, span0) = far_center_span(&job(0));
+        let (wx50, wz50, _) = far_center_span(&job(50));
+
+        let mut q = JobQueue::default();
+        let gate = ViewGate::new();
+        // Admission claims job 50 is NEAREST (dist2 = 1 vs 100) — stale lies.
+        assert!(q.push_far(job(0), 100));
+        assert!(q.push_far(job(50), 1));
+
+        // The player appears at the origin; the horizon covers section 0 but
+        // falls short of section 50 (midpoint of their true eye distances).
+        gate.set(0, 0, 8);
+        let eye = |wx: i64, wz: i64| {
+            let (ex, ez) = (8.0f64, 8.0f64);
+            ((wx as f64 - ex).powi(2) + (wz as f64 - ez).powi(2)).sqrt()
+        };
+        gate.set_far((eye(wx0, wz0) + eye(wx50, wz50)) / 2.0 - span0 as f64);
+
+        let mut cancelled = Vec::new();
+        let popped = q.pop(&gate, &mut cancelled).expect("the in-horizon section survives");
+        assert_eq!(section_id(&popped), 0, "re-keyed to the LIVE eye, not admission dist");
+        assert_eq!(cancelled.len(), 1, "the beyond-horizon section is descheduled");
+        assert!(
+            matches!(&cancelled[0], JobKey::Section { pos, .. } if pos.x == 50),
+            "with its exact claim reported: {cancelled:?}"
+        );
+        assert!(q.pop(&gate, &mut cancelled).is_none(), "drained");
     }
 
     /// Worker→main channel throughput (structural-opportunities #8): floods the
@@ -1089,7 +1250,9 @@ mod tests {
     /// redesign (today's near class runs a retain + full re-key scan on every
     /// pop). Ignored: a timing benchmark, not a correctness gate. Run with
     /// `cargo test --release queue_pop_throughput -- --ignored --nocapture`.
-    /// 2026-07-19 (12-core box), retain+scan Vec: ~529k pops/s at depth 512.
+    /// 2026-07-19 (12-core box), retain+scan Vec: ~529k pops/s at depth 512;
+    /// epoch-synced BinaryHeap: ~3.66M pops/s (the mutex hold per pop is the
+    /// number that matters under a 10-worker pool).
     #[test]
     #[ignore]
     fn queue_pop_throughput() {
@@ -1108,7 +1271,7 @@ mod tests {
         gate.set(0, 0, 16);
         let mut q = JobQueue::default();
         for i in 0..QUEUE {
-            q.push(near(i as i32));
+            q.push(near(i as i32), &gate);
         }
         let mut cancelled = Vec::new();
         let start = Instant::now();
@@ -1120,7 +1283,7 @@ mod tests {
             }
             let job = q.pop(&gate, &mut cancelled);
             assert!(cancelled.is_empty(), "benchmark jobs must stay in view");
-            q.push(job.expect("queue kept full"));
+            q.push(job.expect("queue kept full"), &gate);
         }
         let dt = start.elapsed();
         println!(

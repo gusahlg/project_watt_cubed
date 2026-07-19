@@ -628,6 +628,17 @@ fn cancelled_jobs_release_claims_without_strikes() {
     world.cancel_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=1 });
     assert!((0..=1).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
+    // Section: only the EXACT token clears the claim (a live replacement
+    // minted after the cancelled job must survive), and clearing re-arms the
+    // covering so selection retries.
+    let pos = SectionPos { detail: Detail(2), x: 7, z: 7 };
+    world.sections.insert(pos, SectionState::Meshing { token: pipeline::ClaimToken(9) });
+    world.cancel_job(pipeline::JobKey::Section { pos, epoch: 0, token: pipeline::ClaimToken(8) });
+    assert!(world.sections.contains_key(&pos), "a superseded cancel leaves the live claim");
+    world.cancel_job(pipeline::JobKey::Section { pos, epoch: 0, token: pipeline::ClaimToken(9) });
+    assert!(!world.sections.contains_key(&pos), "the exact claim releases");
+    assert!(world.section_cover_dirty.get(), "release re-arms the covering");
+
     assert!(world.quarantined.is_empty(), "cancellation is not a failure");
     assert!(world.job_strikes.is_empty(), "cancellation earns no strikes");
 }
