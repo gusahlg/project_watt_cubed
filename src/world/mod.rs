@@ -489,12 +489,16 @@ impl SectionState {
 enum MeshState {
     /// Uniform-air, born meshed: nothing to draw, no worker job ever queued.
     Air,
-    /// Dense data with no mesh yet. `building` is the in-flight claim: `true`
-    /// once a fresh mesh job is outstanding on the worker pool (owns no handle;
-    /// `rev` on `Loaded` referees its result), held until the budgeted upload
-    /// resolves or the result is dropped. A `building` chunk still draws
-    /// nothing and is still "needs mesh" — it is just also claimed.
-    NeedsMesh { building: bool },
+    /// Dense data awaiting a fresh ASYNC mesh. `building` is the in-flight
+    /// claim: `true` once a mesh job is outstanding on the worker pool (`rev`
+    /// on `Loaded` referees its result), held until the budgeted upload
+    /// resolves or the result is dropped. `prev` is the still-drawn old mesh
+    /// of a chunk whose rebuild was requested asynchronously (a light grid
+    /// landed, a degraded mesh's real light arrived — see
+    /// [`World::remesh_async`]): it keeps drawing until the fresh upload
+    /// retires it, so an async relight never blanks the chunk. `None` for a
+    /// never-meshed chunk.
+    NeedsMesh { building: bool, prev: Option<ChunkMeshes> },
     /// Drawable: owns the live GPU mesh(es) (up to one per pass).
     Ready(ChunkMeshes),
     /// Edited, awaiting the synchronous remesh. `prev` is the previously-drawn
@@ -509,7 +513,9 @@ impl MeshState {
     /// in the state (the render/draw gate).
     fn live_meshes(&self) -> Option<&ChunkMeshes> {
         match self {
-            MeshState::Ready(m) | MeshState::Dirty { prev: Some(m) } => Some(m),
+            MeshState::Ready(m)
+            | MeshState::Dirty { prev: Some(m) }
+            | MeshState::NeedsMesh { prev: Some(m), .. } => Some(m),
             _ => None,
         }
     }
@@ -527,7 +533,9 @@ impl MeshState {
     #[must_use]
     fn into_owned(self) -> Option<ChunkMeshes> {
         match self {
-            MeshState::Ready(m) | MeshState::Dirty { prev: Some(m) } => Some(m),
+            MeshState::Ready(m)
+            | MeshState::Dirty { prev: Some(m) }
+            | MeshState::NeedsMesh { prev: Some(m), .. } => Some(m),
             _ => None,
         }
     }
@@ -548,23 +556,30 @@ impl MeshState {
             None => MeshState::Air,
         }
     }
+    /// A fresh never-meshed (or reset) state: not building, nothing carried.
+    fn needs_mesh() -> MeshState {
+        MeshState::NeedsMesh { building: false, prev: None }
+    }
     /// Invalidate to `Dirty`, carrying the currently-drawn mesh forward as
     /// `prev` so it keeps drawing until the sync remesh. Nothing is freed here
     /// — the token just moves. `Ready(m) -> Dirty{Some(m)}`; an already-`Dirty`
-    /// chunk keeps its `prev`; handle-less states (incl. a `building` chunk,
-    /// whose in-flight claim is dropped — the sync remesh takes over and the
-    /// orphan async result is refereed out by `rev`) -> `Dirty{None}`.
+    /// chunk keeps its `prev`, and so does a `NeedsMesh` carrying one (an edit
+    /// landing mid-async-rebuild keeps drawing the old mesh); other handle-less
+    /// states (incl. a bare `building` chunk, whose in-flight claim is dropped
+    /// — the sync remesh takes over and the orphan async result is refereed
+    /// out by `rev`) -> `Dirty{None}`.
     fn invalidate(&mut self) {
-        let prev = std::mem::replace(self, MeshState::NeedsMesh { building: false }).into_owned();
+        let prev = std::mem::replace(self, MeshState::needs_mesh()).into_owned();
         *self = MeshState::Dirty { prev };
     }
     /// Release the in-flight mesh claim if this chunk is still awaiting its
-    /// build. A no-op once the chunk has moved on (`Dirty` via an edit,
-    /// `Ready`/`Air` via a prior consume): those states carry no claim. Called
-    /// at every mesh-result-consumption site whose result did NOT apply, so a
-    /// stale result (view moved, chunk left the box) can never wedge the claim.
+    /// build (a carried `prev` keeps drawing). A no-op once the chunk has
+    /// moved on (`Dirty` via an edit, `Ready`/`Air` via a prior consume):
+    /// those states carry no claim. Called at every mesh-result-consumption
+    /// site whose result did NOT apply, so a stale result (view moved, chunk
+    /// left the box) can never wedge the claim.
     fn release_build(&mut self) {
-        if let MeshState::NeedsMesh { building } = self {
+        if let MeshState::NeedsMesh { building, .. } = self {
             *building = false;
         }
     }
@@ -1466,7 +1481,7 @@ impl StreamLane for MeshLane {
     fn in_flight(world: &World, key: Coord) -> bool {
         matches!(
             world.chunks.get(&key).map(|l| &l.state),
-            Some(MeshState::NeedsMesh { building: true })
+            Some(MeshState::NeedsMesh { building: true, .. })
         )
     }
     fn ready(world: &World, key: Coord) -> bool {
@@ -1489,12 +1504,16 @@ impl StreamLane for MeshLane {
         Some(pipeline::Job::Mesh { coord: key, rev, snapshot })
     }
     fn claim(world: &mut World, key: Coord) {
-        // Set building flag to claim the mesh job. Held until upload retires
+        // Set the building flag IN PLACE to claim the mesh job — a whole-state
+        // overwrite would silently drop a carried `prev` mesh (leaking its GPU
+        // handle and blanking the chunk mid-rebuild). Held until upload retires
         // it or a stale result releases it. Remove from worklist.
         world.mesh_worklist.remove(&key);
         if let Some(loaded) = world.chunks.get_mut(&key) {
             debug_assert!(loaded.state.is_needs_mesh(), "mesh submit for non-NeedsMesh {key:?}");
-            loaded.state = MeshState::NeedsMesh { building: true };
+            if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
+                *building = true;
+            }
         }
     }
     fn integrate(world: &mut World, done: pipeline::Done) {

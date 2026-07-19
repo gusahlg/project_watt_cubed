@@ -285,11 +285,17 @@ impl World {
                 if keep.contains(coord) {
                     continue;
                 }
-                // Ready becomes NeedsMesh; Dirty stays Dirty (prev: None).
-                // Same-frame dirty pass remeshes it. Retire frees old mesh.
+                // Ready becomes NeedsMesh; Dirty stays Dirty (prev: None); a
+                // NeedsMesh carrying a rebuild's old mesh drops it (keeping
+                // its claim truthful — the in-flight result resolves as
+                // stale). Same-frame dirty pass remeshes Dirty chunks.
+                // Retire frees the old mesh.
                 let next = match loaded.state {
-                    MeshState::Ready(_) => MeshState::NeedsMesh { building: false },
+                    MeshState::Ready(_) => MeshState::needs_mesh(),
                     MeshState::Dirty { prev: Some(_) } => MeshState::Dirty { prev: None },
+                    MeshState::NeedsMesh { building, prev: Some(_) } => {
+                        MeshState::NeedsMesh { building, prev: None }
+                    }
                     _ => continue,
                 };
                 let stays_dirty = matches!(next, MeshState::Dirty { .. });
@@ -877,8 +883,7 @@ impl World {
         // Uniform non-solid chunks produce no geometry, so start Air.
         // Check solidity, not AIR id, for future non-solid blocks.
         let born_air = chunk.uniform().is_some_and(|id| !self.registry.is_solid(id));
-        let state =
-            if born_air { MeshState::Air } else { MeshState::NeedsMesh { building: false } };
+        let state = if born_air { MeshState::Air } else { MeshState::needs_mesh() };
         // Born-air is already settled; a sky ring can complete without a
         // single upload.
         self.lod_clip_grow.raise(born_air);
@@ -1142,6 +1147,40 @@ impl World {
         })
     }
 
+    /// Schedule an ASYNC rebuild for a chunk whose mesh inputs changed off the
+    /// edit path (a light grid landed, a degraded mesh's real light arrived).
+    /// The chunk keeps drawing its current mesh — carried as `NeedsMesh.prev`
+    /// — until the fresh worker result uploads, and the rev bump both strands
+    /// any in-flight build against the old inputs and stales any queued
+    /// upload. This replaces the old routing of light arrivals through the
+    /// SYNC `Dirty` machinery, which built up to `DIRTY_BUDGET` full greedy
+    /// meshes per frame ON THE MAIN THREAD during load floods (nearly every
+    /// chunk meshes degraded first under the 150 ms light gate, then relights)
+    /// — the "still laggy seconds after stopping" stall. The sync path stays
+    /// for player edits only, where same-frame response is the point.
+    fn remesh_async(&mut self, coord: Coord) {
+        let Some(loaded) = self.chunks.get_mut(&coord) else { return };
+        match &mut loaded.state {
+            // Carry the drawn mesh into the rebuild state.
+            MeshState::Ready(_) => {
+                let prev =
+                    std::mem::replace(&mut loaded.state, MeshState::needs_mesh()).into_owned();
+                loaded.state = MeshState::NeedsMesh { building: false, prev };
+            }
+            // Already awaiting/mid-build: the rev bump below strands the
+            // in-flight result; its stale drop releases the claim and
+            // re-seeds, keeping the one-claim-one-Done discipline (never a
+            // second job for a still-claimed coord).
+            MeshState::NeedsMesh { .. } => {}
+            // Dirty: the sync edit remesh owns it and reads light at build
+            // time (its rev was already bumped by the edit). Air: no geometry.
+            MeshState::Dirty { .. } | MeshState::Air => return,
+        }
+        loaded.rev = loaded.rev.wrapping_add(1);
+        self.mesh_worklist.insert(coord);
+        self.pending_fresh.set();
+    }
+
     /// Publish settled light, re-arm mesh readiness, and seed neighbours to re-settle.
     /// Shared by sync (trivial) and async settle paths.
     pub(in crate::world) fn settle_light(&mut self, coord: Coord, grid: light::LightGrid) {
@@ -1176,37 +1215,21 @@ impl World {
             self.light_worklist.insert(n);
             self.mesh_worklist.insert(n);
             // A DEGRADED neighbour meshed with fake open-sky light across this
-            // border; now that real light has crossed it, force its remesh through
-            // the Dirty machinery — seeding the worklist alone can't, since the
-            // neighbour is already `Ready` and so fails the mesh lane's
-            // `is_needs_mesh` gate (remesh-on-arrival).
+            // border; now that real light has crossed it, schedule its ASYNC
+            // rebuild — seeding the worklist alone can't, since the neighbour
+            // is already `Ready` and so fails the mesh lane's `is_needs_mesh`
+            // gate. The old mesh keeps drawing until the rebuild uploads.
             if self.light_gate.degraded.contains(&n) {
-                if let Some(loaded) = self.chunks.get_mut(&n) {
-                    if matches!(
-                        loaded.state,
-                        MeshState::Ready(_) | MeshState::NeedsMesh { building: true }
-                    ) {
-                        loaded.state.invalidate();
-                        loaded.rev = loaded.rev.wrapping_add(1);
-                        self.pending_dirty.set();
-                    }
-                }
+                self.remesh_async(n);
             }
         }
         if !self.light_worklist.is_empty() {
             self.light_pending.set();
         }
-        // Light changed: invalidate any showing/building mesh (bump rev to strand
-        // in-flight builds). Unmeshed/unbuilt chunks will mesh fresh with new light.
-        let loaded = self.chunks.get_mut(&coord).unwrap();
-        if matches!(
-            loaded.state,
-            MeshState::Ready(_) | MeshState::Dirty { .. } | MeshState::NeedsMesh { building: true }
-        ) {
-            loaded.state.invalidate();
-            loaded.rev = loaded.rev.wrapping_add(1);
-            self.pending_dirty.set();
-        }
+        // Light changed: schedule the chunk's ASYNC rebuild (rev bump strands
+        // in-flight builds and stales queued uploads; a drawn mesh keeps
+        // drawing as `prev`). Unmeshed chunks simply mesh fresh with new light.
+        self.remesh_async(coord);
     }
 
     /// Chunk + 1-voxel neighbour shell for mesh build (shared by worker and sync paths).
@@ -1553,18 +1576,13 @@ impl World {
         gate.degraded.retain(|c| self.chunks.contains_key(c));
         gate.blocked_since.retain(|c, _| self.chunk_light_blocked(*c));
         // Safety net: event-driven path misses degraded chunks whose neighbour light
-        // settled without moving shared border. Sweep them: any now light-ready and
-        // showing Ready mesh gets invalidated to remesh, clearing the degraded flag.
+        // settled without moving shared border. Sweep them: any now light-ready
+        // gets its ASYNC rebuild scheduled (old mesh keeps drawing), clearing
+        // the degraded flag at the rebuild's submit.
         let relit: Vec<Coord> =
             gate.degraded.iter().copied().filter(|&c| self.light_ready(c)).collect();
         for c in relit {
-            if let Some(loaded) = self.chunks.get_mut(&c) {
-                if matches!(loaded.state, MeshState::Ready(_)) {
-                    loaded.state.invalidate();
-                    loaded.rev = loaded.rev.wrapping_add(1);
-                    self.pending_dirty.set();
-                }
-            }
+            self.remesh_async(c);
         }
         let now = Instant::now();
         let fresh: Vec<Coord> = self
@@ -1794,8 +1812,8 @@ impl World {
                 Some(MeshState::Air | MeshState::Ready(_)) => {}
                 None => missing += 1,
                 Some(MeshState::Dirty { .. }) => dirty += 1,
-                Some(MeshState::NeedsMesh { building: true }) => building += 1,
-                Some(MeshState::NeedsMesh { building: false }) => {
+                Some(MeshState::NeedsMesh { building: true, .. }) => building += 1,
+                Some(MeshState::NeedsMesh { building: false, .. }) => {
                     if in_wl {
                         queued += 1;
                     } else {
@@ -1931,7 +1949,7 @@ mod tests {
             world.chunks.get_mut(&n).expect("neighbourhood pregenerated near spawn");
         }
         world.chunks.get_mut(&c).unwrap().light = None;
-        world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh { building: false };
+        world.chunks.get_mut(&c).unwrap().state = MeshState::needs_mesh();
         assert!(world.neighbours_have_data(c));
         assert!(world.in_mesh_box(c));
         assert!(world.chunk_light_blocked(c), "no published light: c is light-blocked");

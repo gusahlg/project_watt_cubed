@@ -48,7 +48,7 @@ fn lod_clip_tracks_the_settled_rings() {
     // Unsettle one column at ring 2: the clip retreats to one ring inside it
     // (the nearest face of ring 2 can be 16 m from an off-centre eye).
     world.chunks.get_mut(&ChunkCoord::new(2, center.y, -1)).unwrap().state =
-        MeshState::NeedsMesh { building: false };
+        MeshState::NeedsMesh { building: false, prev: None };
     world.lod_clip_shrunk.set();
     world.refresh_lod_clip();
     assert_eq!(world.lod_clip().radius, CHUNK_SIZE as f32, "rings 0..=1 settled, ring 2 open");
@@ -332,7 +332,7 @@ fn coverage_skip_is_sound_and_backed() {
 
     // If any chunk is in-flight, don't skip (fast-descent guard).
     world.chunks.insert(ChunkCoord::new(0, cy_lo, 0), Loaded {
-        state: MeshState::NeedsMesh { building: true },
+        state: MeshState::NeedsMesh { building: true, prev: None },
         ..air_chunk(0, cy_lo, 0)
     });
     assert!(!world.coverage_skips(center, cell), "an in-flight covering chunk blocks the skip");
@@ -549,11 +549,11 @@ fn failed_jobs_release_claims_then_quarantine_after_repeated_strikes() {
     let coord = *world.chunks.keys().next().unwrap();
 
     // Mesh lane: a panicked build releases the claim and re-seeds the worklist.
-    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true, prev: None };
     world.mesh_worklist.remove(&coord);
     world.fail_job(pipeline::JobKey::Mesh { coord });
     assert!(
-        matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }),
+        matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false, prev: None }),
         "the build claim must be released"
     );
     assert!(world.mesh_worklist.contains(&coord), "released work is re-seeded");
@@ -613,9 +613,9 @@ fn cancelled_jobs_release_claims_without_strikes() {
     let mut world = World::generate();
     let coord = *world.chunks.keys().next().unwrap();
 
-    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true, prev: None };
     world.cancel_job(pipeline::JobKey::Mesh { coord });
-    assert!(matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false }));
+    assert!(matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false, prev: None }));
 
     world.light_inflight.insert(coord);
     world.cancel_job(pipeline::JobKey::Light { coord });
@@ -662,6 +662,66 @@ fn unloaded_light_result_releases_the_claim() {
     world.settle_light(coord, light::LightGrid::dark());
     assert!(world.chunks[&coord].light.is_some(), "a re-loaded chunk settles");
     assert!(!world.light_inflight.contains(&coord));
+}
+
+/// A light grid landing on an already-drawn chunk schedules an ASYNC rebuild:
+/// the old mesh keeps drawing (carried as `NeedsMesh.prev`, still `settled()`
+/// so the LOD clip holds), the mesh worklist is seeded, and the rev bump
+/// strands stale work — while the SYNC dirty path stays untouched (its
+/// main-thread build storm during light floods was the post-flight lag).
+#[test]
+fn light_arrival_schedules_async_rebuild_and_keeps_drawing() {
+    let mut world = World::generate();
+    world.center = Some(ChunkCoord::new(0, 0, 0));
+    let coord = ChunkCoord::new(0, 0, 0);
+    let h = MeshHandle::from_raw_parts(11, 1);
+    world.chunks.get_mut(&coord).unwrap().state = ready(h);
+    world.chunks.get_mut(&coord).unwrap().light = Some(light::LightGrid::open_sky());
+    let rev = world.chunks[&coord].rev;
+
+    world.pending_dirty.take();
+    world.settle_light(coord, light::LightGrid::dark()); // a CHANGED grid
+
+    let state = &world.chunks[&coord].state;
+    assert!(
+        matches!(state, MeshState::NeedsMesh { building: false, prev: Some(_) }),
+        "async rebuild scheduled with the old mesh carried: {state:?}"
+    );
+    assert!(state.settled(), "a carried mesh still counts settled (the LOD clip holds)");
+    assert!(state.live_meshes().unwrap().draws(h), "the old mesh keeps drawing");
+    assert_ne!(world.chunks[&coord].rev, rev, "the rev bump strands stale work");
+    assert!(world.mesh_worklist.contains(&coord));
+    assert!(world.pending_fresh.get());
+    assert!(!world.pending_dirty.get(), "the sync dirty path is NOT involved");
+}
+
+/// Claiming an async rebuild flips `building` IN PLACE — a whole-state
+/// overwrite would blank the chunk and leak the carried handle — and a stale
+/// result's release keeps the carried mesh drawing while re-seeding the retry.
+#[test]
+fn async_rebuild_claim_and_stale_release_preserve_the_drawn_mesh() {
+    let mut world = World::generate();
+    world.center = Some(ChunkCoord::new(0, 0, 0));
+    let coord = ChunkCoord::new(0, 0, 0);
+    let h = MeshHandle::from_raw_parts(12, 1);
+    world.chunks.get_mut(&coord).unwrap().state =
+        MeshState::NeedsMesh { building: false, prev: Some(meshes(h)) };
+
+    <MeshLane as StreamLane>::claim(&mut world, coord);
+    let state = &world.chunks[&coord].state;
+    assert!(matches!(state, MeshState::NeedsMesh { building: true, prev: Some(_) }));
+    assert!(state.live_meshes().unwrap().draws(h), "still drawing through the claim");
+
+    // A stale result (rev moved on) releases the claim and keeps `prev`.
+    let rev = world.chunks[&coord].rev;
+    world.chunks.get_mut(&coord).unwrap().rev = rev.wrapping_add(1);
+    world.pending_fresh.take();
+    world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
+    let state = &world.chunks[&coord].state;
+    assert!(matches!(state, MeshState::NeedsMesh { building: false, prev: Some(_) }));
+    assert!(state.live_meshes().unwrap().draws(h), "a stale drop keeps drawing");
+    assert!(world.mesh_worklist.contains(&coord), "re-seeded for the retry");
+    assert!(world.pending_fresh.get());
 }
 
 /// A STALE-epoch light result's claim was wiped by the toggle that bumped the
@@ -767,7 +827,7 @@ fn uniform_air_chunks_are_born_meshed() {
     let ground = &world.chunks[&ChunkCoord::new(0, 0, 0)];
     assert_eq!(
         ground.state,
-        MeshState::NeedsMesh { building: false },
+        MeshState::NeedsMesh { building: false, prev: None },
         "dense terrain waits for a real mesh"
     );
 }
@@ -792,8 +852,8 @@ fn handle_is_tracked_exactly_once_across_edits() {
     assert!(world.chunks[&coord].state.live_meshes().unwrap().draws(h));
     for s in [
         MeshState::Air,
-        MeshState::NeedsMesh { building: false },
-        MeshState::NeedsMesh { building: true },
+        MeshState::NeedsMesh { building: false, prev: None },
+        MeshState::NeedsMesh { building: true, prev: None },
         MeshState::Dirty { prev: None },
     ] {
         world.chunks.get_mut(&coord).unwrap().state = s;
@@ -807,7 +867,7 @@ fn edit_during_meshing_drops_the_stale_async_result() {
     let mut world = World::generate();
     world.center = Some(ChunkCoord::new(0, 0, 0));
     let coord = ChunkCoord::new(0, 0, 0);
-    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true, prev: None };
     let rev = world.chunks[&coord].rev;
 
     world.set_block(2, 2, 2, AIR);
@@ -829,7 +889,7 @@ fn mesh_result_stale_by_box_exit_releases_the_claim() {
     let coord = ChunkCoord::new(0, 0, 0);
     world.center = Some(coord);
     let rev = world.chunks[&coord].rev;
-    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true };
+    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true, prev: None };
     world.center = Some(ChunkCoord::new(1000, 0, 0));
     assert!(!world.mesh_result_applies(coord, rev), "out-of-box result is stale");
 
@@ -838,7 +898,7 @@ fn mesh_result_stale_by_box_exit_releases_the_claim() {
     assert!(world.upload_queue.is_empty(), "stale result never queues");
     assert_eq!(
         world.chunks[&coord].state,
-        MeshState::NeedsMesh { building: false },
+        MeshState::NeedsMesh { building: false, prev: None },
         "claim released, chunk is re-meshable"
     );
     assert!(world.mesh_worklist.contains(&coord), "re-seeded for a later mesh");
@@ -957,14 +1017,21 @@ fn invalidate_carries_or_clears_the_owned_mesh() {
     assert_eq!(s, MeshState::Dirty { prev: Some(meshes(h)) });
     for empty in [
         MeshState::Air,
-        MeshState::NeedsMesh { building: false },
-        MeshState::NeedsMesh { building: true },
+        MeshState::NeedsMesh { building: false, prev: None },
+        MeshState::NeedsMesh { building: true, prev: None },
         MeshState::Dirty { prev: None },
     ] {
         let mut s = empty;
         s.invalidate();
         assert_eq!(s, MeshState::Dirty { prev: None });
     }
+
+    // An edit landing mid-async-rebuild carries the still-drawn mesh into
+    // `Dirty` — the chunk keeps drawing through both machineries.
+    let h2 = MeshHandle::from_raw_parts(6, 1);
+    let mut s = MeshState::NeedsMesh { building: true, prev: Some(meshes(h2)) };
+    s.invalidate();
+    assert_eq!(s, MeshState::Dirty { prev: Some(meshes(h2)) });
 }
 
 #[test]
@@ -1068,7 +1135,7 @@ fn light_settle_to_identical_grid_reseeds_evicted_mesh_seed() {
         world.chunks.get_mut(&n).expect("neighbourhood pregenerated near spawn").light =
             Some(light::LightGrid::dark());
     }
-    world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh { building: false };
+    world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh { building: false, prev: None };
     assert!(world.neighbours_have_data(c));
     assert!(world.in_mesh_box(c));
 

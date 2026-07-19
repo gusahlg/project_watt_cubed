@@ -237,7 +237,7 @@ impl World {
             // Any worker mesh captured before this reset must not be accepted if
             // it lands after the next stream establishes a new centre.
             loaded.rev = loaded.rev.wrapping_add(1);
-            loaded.retire(MeshState::NeedsMesh { building: false }, eng);
+            loaded.retire(MeshState::needs_mesh(), eng);
         }
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
         // stale hint (a raised `pending_dirty` would just scan an empty fiber).
@@ -341,9 +341,10 @@ impl World {
             loaded.connectivity = None;
             self.occlusion_dirty.set();
             // Keep whatever is currently drawn as `prev` so the old mesh shows
-            // until the sync remesh: Ready(m) → Dirty{Some(m)}, and re-editing
-            // an already-Dirty{Some} chunk preserves its mesh (the token MOVES,
-            // no free). NeedsMesh (building or not)/Air draw nothing → Dirty{None}.
+            // until the sync remesh: Ready(m) → Dirty{Some(m)}, re-editing an
+            // already-Dirty{Some} chunk preserves its mesh, and a NeedsMesh
+            // mid-async-rebuild carries its still-drawn `prev` over (the token
+            // MOVES, no free). Bare NeedsMesh/Air draw nothing → Dirty{None}.
             loaded.state.invalidate();
             // Any in-flight worker mesh of this chunk is now stale.
             loaded.rev = loaded.rev.wrapping_add(1);
