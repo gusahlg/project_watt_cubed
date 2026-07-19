@@ -517,7 +517,11 @@ impl World {
                 l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
                 sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
                 pipeline::Done::Failed(key) => self.fail_job(*key),
-                pipeline::Done::Cancelled(key) => self.cancel_job(*key),
+                pipeline::Done::Cancelled(keys) => {
+                    for key in keys {
+                        self.cancel_job(key);
+                    }
+                }
             }
             // A consumed CURRENT-epoch light result must have released its
             // claim or transferred it into the apply queue.

@@ -170,11 +170,14 @@ pub(in crate::world) enum Done {
     /// bad job left `generating`/`light_inflight`/`building`/`Meshing` claimed
     /// forever and streaming never converged.
     Failed(Box<JobKey>),
-    /// The job was DESCHEDULED at the pool before running: its region left
-    /// the live view while it sat queued (fast movement). `World::cancel_job`
-    /// releases the claim — no strike, no requeue; the normal boundary-cross
-    /// scans re-request the work if the player ever comes back.
-    Cancelled(Box<JobKey>),
+    /// One pop's whole batch of jobs DESCHEDULED at the pool before running:
+    /// their regions left the live view while they sat queued (fast
+    /// movement). `World::cancel_job` releases each claim — no strike, no
+    /// requeue; the normal boundary-cross scans re-request the work if the
+    /// player ever comes back. Batched: a fast-flight epoch rebuild can shed
+    /// hundreds of entries at once, and one boxed slice + one channel send
+    /// beats one of each per key.
+    Cancelled(Box<[JobKey]>),
 }
 
 // Keep the result channel payload small: the largest variant should be the
@@ -189,7 +192,10 @@ const _: () = assert!(size_of::<Done>() <= 128);
 // `Done::Mesh` pointer-sized instead of inflating every result-channel message.
 #[allow(clippy::vec_box)]
 static MESH_OUTPUT_POOL: Mutex<Vec<Box<ChunkMeshData>>> = Mutex::new(Vec::new());
-const MESH_OUTPUT_POOL_CAP: usize = 32;
+// 64: enough for every worker of a 12-thread pool to hold one buffer with a
+// frame's worth queued behind the byte-budgeted upload drain (the cap only
+// bounds RETAINED capacity — a miss allocates fresh, it never blocks).
+const MESH_OUTPUT_POOL_CAP: usize = 64;
 
 /// A pooled `Box<ChunkMeshData>`: taken from [`MESH_OUTPUT_POOL`] at job start
 /// (workers), returned on drop wherever the result dies (upload or stale
@@ -645,6 +651,12 @@ impl Workers {
 
     /// Spawn `threads` workers (at least 1) sharing one job queue.
     pub fn spawn(threads: usize) -> Self {
+        // UNBOUNDED by design: a bounded channel would let a slow main thread
+        // block a worker mid-send (priority inversion against the render
+        // loop), and the memory is already structurally bounded — results ≤
+        // outstanding claims, and every claim came through an admission gate
+        // (the upload-queue backpressure for meshes, the bounded data box for
+        // generation, FAR_QUEUE_CAP for sections, one-per-coord for light).
         let (done, results) = mpsc::channel::<Done>();
         let gate = Arc::new((Mutex::new(JobQueue::default()), Condvar::new()));
         let view = Arc::new(ViewGate::new());
@@ -755,10 +767,13 @@ fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
 
 fn worker_loop(gate: &(Mutex<JobQueue>, Condvar), view: &ViewGate, done: &Sender<Done>) {
     let (lock, cvar) = gate;
+    // Reused across iterations: descheduling is bursty (one epoch rebuild can
+    // shed hundreds of keys), and the buffer's capacity survives the drain.
+    let mut cancelled: Vec<JobKey> = Vec::new();
     loop {
         // Lock only around the dequeue; the job itself runs unlocked. Poisoned
         // mutexes (a sibling panicked) still yield a usable queue.
-        let mut cancelled: Vec<JobKey> = Vec::new();
+        cancelled.clear();
         let job = {
             let mut queue = lock.lock().unwrap_or_else(|p| p.into_inner());
             loop {
@@ -772,12 +787,12 @@ fn worker_loop(gate: &(Mutex<JobQueue>, Condvar), view: &ViewGate, done: &Sender
                 queue = cvar.wait(queue).unwrap_or_else(|p| p.into_inner());
             }
         };
-        // Report descheduled entries so their claims release; then run the
+        // Report the descheduled batch so its claims release; then run the
         // popped job (if the pop found only cancellations, just loop back).
-        for key in cancelled {
-            if done.send(Done::Cancelled(Box::new(key))).is_err() {
-                return;
-            }
+        if !cancelled.is_empty()
+            && done.send(Done::Cancelled(cancelled.drain(..).collect())).is_err()
+        {
+            return;
         }
         let Some(job) = job else { continue };
         // Headline runs keep profiling disabled: avoid the per-job label

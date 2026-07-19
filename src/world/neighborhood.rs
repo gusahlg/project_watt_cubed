@@ -19,8 +19,9 @@ const PAD_VOL: usize = PAD * PAD * PAD;
 /// dropped by workers, so a thread-local pool would strand every returned
 /// buffer on the wrong thread (the capturer's list stays empty and allocates
 /// forever). One bounded SHARED pool completes the ownership round trip;
-/// enough slack for a traversal burst (32 × 18³ × 2 B ≈ 0.36 MiB per type).
-const POOL_CAP: usize = 32;
+/// enough slack for a traversal burst across a 12-worker pool
+/// (64 × 18³ × 2 B ≈ 0.7 MiB per type).
+const POOL_CAP: usize = 64;
 
 /// A cell type that owns a shared free list of halo buffers. A `static`
 /// cannot name a generic `T`, so the per-type pool lives behind this trait —
