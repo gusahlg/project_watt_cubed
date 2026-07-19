@@ -142,6 +142,14 @@ impl FailKey {
 /// without looping forever on poison.
 const MAX_JOB_STRIKES: u8 = 3;
 
+/// Why a claim is being resolved WITHOUT a payload — see
+/// [`World::resolve_claim`]. Cancelled: descheduled at the pool, no strike.
+/// Failed: the job panicked; strikes accumulate toward quarantine.
+enum ClaimOutcome {
+    Cancelled,
+    Failed,
+}
+
 /// Forward-progress floor for the generation lane: admit at least this many
 /// columns before the deadline can stop it, so a boundary-cross flood still
 /// makes strict progress each frame under a tight budget (the same floor role
@@ -574,16 +582,11 @@ impl World {
             // Both passes upload together under one budget charge (same rev).
             // The worker baked per-vertex sky/block light into `data` from the
             // settled shell in its snapshot, so this is a pure GPU handoff —
-            // every chunk, all distances, uploads the same plain way.
-            let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
-            if let Some(loaded) = self.chunks.get_mut(&coord) {
-                // Rev check guarantees state is NeedsMesh { building: true }
-                // (edit would bump rev, get dropped). Route through retire anyway
-                // to free any stray token as state moves to Ready/Air.
-                loaded.retire(MeshState::from_upload(handles), eng);
-                // A newly drawn chunk may complete a settled ring.
-                self.lod_clip_grow.set();
-            }
+            // every chunk, all distances, uploads the same plain way. (The rev
+            // check above guarantees the state is NeedsMesh { building: true }.)
+            self.upload_chunk(coord, &data, eng);
+            // A newly drawn chunk may complete a settled ring.
+            self.lod_clip_grow.set();
         }
 
         // Budgeted light application. Order-independent: each grid is absolute,
@@ -689,6 +692,17 @@ impl World {
     /// Whether mesh admission should pause this pass (see [`UPLOAD_QUEUE_MAX`]).
     pub(in crate::world) fn upload_backlogged(&self) -> bool {
         self.upload_queue.len() >= UPLOAD_QUEUE_MAX
+    }
+
+    /// Upload one built chunk mesh (every pass) and retire the chunk's state
+    /// to the fresh `Ready`/`Air` — the one upload+install step shared by the
+    /// async drain, the sync edit remesh, and the terminal degraded promotion.
+    /// `retire` frees whatever the old state carried, exactly once.
+    fn upload_chunk(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
+        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.retire(MeshState::from_upload(handles), eng);
+        }
     }
 
     /// Light result at `epoch`: release-or-transfer the claim, then queue the
@@ -830,27 +844,76 @@ impl World {
     /// A queued job was DESCHEDULED at the pool: its region left the live view
     /// while it waited (fast movement). Release the exact claim with no strike
     /// and no requeue — the work is unwanted where the player is now, and the
-    /// boundary-cross scans re-request it if the player ever returns.
+    /// boundary-cross scans re-request it if the player ever returns. (The one
+    /// exception: a still-loaded chunk is OWED its light settle, so light
+    /// claims re-seed — the cancel ring sits outside the unload ring, so this
+    /// is rare.)
     pub(in crate::world) fn cancel_job(&mut self, key: pipeline::JobKey) {
+        self.resolve_claim(key, ClaimOutcome::Cancelled);
+    }
+
+    /// A worker job PANICKED: release its exact claim so streaming can
+    /// converge, then retry (the normal scans re-request freed work) up to
+    /// [`MAX_JOB_STRIKES`] times. Past that the claim is quarantined — a
+    /// bounded hole instead of an infinite panic loop — and every enqueue path
+    /// skips it via `quarantined`.
+    pub(in crate::world) fn fail_job(&mut self, key: pipeline::JobKey) {
+        self.resolve_claim(key, ClaimOutcome::Failed);
+    }
+
+    /// The ONE payload-less claim-resolution path (cancel and fail shared the
+    /// whole per-kind release; only the strike/re-arm policy differed).
+    /// RELEASE is unconditional per kind; RE-ARM follows `outcome`: a
+    /// cancellation re-arms only the light settle it still owes, a
+    /// non-quarantined failure re-arms its lane for the retry.
+    fn resolve_claim(&mut self, key: pipeline::JobKey, outcome: ClaimOutcome) {
+        let rearm = match outcome {
+            ClaimOutcome::Cancelled => matches!(key, pipeline::JobKey::Light { .. }),
+            ClaimOutcome::Failed => {
+                let fail_key = FailKey::of(&key);
+                let strikes = self.job_strikes.entry(fail_key).or_insert(0);
+                *strikes = strikes.saturating_add(1);
+                let quarantine = *strikes >= MAX_JOB_STRIKES;
+                if quarantine {
+                    self.quarantined.insert(fail_key);
+                    eprintln!(
+                        "streaming: {fail_key:?} panicked {MAX_JOB_STRIKES} times — quarantined"
+                    );
+                }
+                !quarantine
+            }
+        };
         match key {
             pipeline::JobKey::Column { col: (cx, cz), cy } => {
                 for cyy in cy {
                     self.generating.remove(&Coord::new(cx, cyy, cz));
+                }
+                // Freed generate claims are otherwise only re-requested on a
+                // boundary cross; a retryable failure re-arms the lane so a
+                // standing-still player still converges.
+                if rearm {
+                    self.pending_gen.set();
                 }
             }
             pipeline::JobKey::Mesh { coord } => {
                 if let Some(loaded) = self.chunks.get_mut(&coord) {
                     loaded.state.release_build();
                 }
+                if rearm {
+                    self.mesh_worklist.insert(coord);
+                    self.pending_fresh.set();
+                }
             }
             pipeline::JobKey::Light { coord } => {
                 self.light_inflight.remove(&coord);
-                // Re-seed rather than drop: if the chunk is still loaded (the
-                // cancel ring sits outside the unload ring, so this is rare),
-                // it is owed a settle; an unloaded chunk's seed is dropped by
-                // the lane's submit.
-                self.light_worklist.insert(coord);
-                self.light_pending.set();
+                if rearm {
+                    // An unloaded chunk's seed is dropped by the lane's submit.
+                    self.light_worklist.insert(coord);
+                    self.light_pending.set();
+                }
+                // Quarantined light: the chunk never settles, so the mesh
+                // lane's degrade timeout takes over and the terminal flush
+                // promotes it — the world converges on fallback light.
             }
             pipeline::JobKey::Section { pos, epoch, token } => {
                 // Release only the exact claim: a same-position replacement
@@ -862,63 +925,7 @@ impl World {
                     self.sections.remove(&pos);
                     self.section_cover_dirty.set();
                 }
-            }
-        }
-    }
-
-    /// A worker job PANICKED: release its exact claim so streaming can
-    /// converge, then retry (the normal scans re-request freed work) up to
-    /// [`MAX_JOB_STRIKES`] times. Past that the claim is quarantined — a
-    /// bounded hole instead of an infinite panic loop — and every enqueue path
-    /// skips it via `quarantined`.
-    pub(in crate::world) fn fail_job(&mut self, key: pipeline::JobKey) {
-        let fail_key = FailKey::of(&key);
-        let strikes = self.job_strikes.entry(fail_key).or_insert(0);
-        *strikes = strikes.saturating_add(1);
-        let quarantine = *strikes >= MAX_JOB_STRIKES;
-        if quarantine {
-            self.quarantined.insert(fail_key);
-            eprintln!("streaming: {fail_key:?} panicked {MAX_JOB_STRIKES} times — quarantined");
-        }
-        match key {
-            pipeline::JobKey::Column { col: (cx, cz), cy } => {
-                for cyy in cy {
-                    self.generating.remove(&Coord::new(cx, cyy, cz));
-                }
-                // Freed claims are only re-requested on a boundary cross; re-arm
-                // the generate lane now so a standing-still player still converges.
-                if !quarantine {
-                    self.pending_gen.set();
-                }
-            }
-            pipeline::JobKey::Mesh { coord } => {
-                if let Some(loaded) = self.chunks.get_mut(&coord) {
-                    loaded.state.release_build();
-                }
-                if !quarantine {
-                    self.mesh_worklist.insert(coord);
-                    self.pending_fresh.set();
-                }
-            }
-            pipeline::JobKey::Light { coord } => {
-                self.light_inflight.remove(&coord);
-                if !quarantine {
-                    self.light_worklist.insert(coord);
-                    self.light_pending.set();
-                }
-                // Quarantined light: the chunk never settles, so the mesh
-                // lane's degrade timeout takes over and the terminal flush
-                // promotes it — the world converges on fallback light.
-            }
-            pipeline::JobKey::Section { pos, epoch, token } => {
-                let held = epoch == self.section_epoch
-                    && matches!(self.sections.get(&pos),
-                        Some(SectionState::Meshing { token: t }) if *t == token);
-                if held {
-                    self.sections.remove(&pos);
-                    self.section_cover_dirty.set();
-                }
-                if !quarantine {
+                if rearm {
                     self.pending_sections.set();
                 }
             }
@@ -1759,11 +1766,8 @@ impl World {
         self.mark_degraded(coord, false);
         let light = self.capture_padded_light(coord, false);
         mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&scratch[p], chunk_placement(coord)));
+        self.upload_chunk(coord, &scratch, eng);
         self.scratch = scratch;
-        if let Some(loaded) = self.chunks.get_mut(&coord) {
-            loaded.retire(MeshState::from_upload(handles), eng);
-        }
     }
 
     /// World-entry completeness predicate: true once, within the view
@@ -1969,14 +1973,14 @@ impl World {
         self.mark_degraded(coord, degraded);
         let light = self.capture_padded_light(coord, degraded);
         mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&scratch[p], chunk_placement(coord)));
+        debug_assert!(
+            self.chunks.get(&coord).is_some_and(|l| l.state.is_dirty()),
+            "sync remesh of non-Dirty {coord:?}"
+        );
+        // `upload_chunk`'s retire frees the edited-Ready chunk's old mesh
+        // (`Dirty.prev`) exactly once and installs the fresh `Ready`/`Air`.
+        self.upload_chunk(coord, &scratch, eng);
         self.scratch = scratch;
-        // `retire` frees the edited-Ready chunk's old mesh (`Dirty.prev`) exactly
-        // once and installs the fresh `Ready`/`Air` state.
-        if let Some(loaded) = self.chunks.get_mut(&coord) {
-            debug_assert!(loaded.state.is_dirty(), "sync remesh of non-Dirty {coord:?}");
-            loaded.retire(MeshState::from_upload(handles), eng);
-        }
     }
 
     /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected)
