@@ -810,12 +810,10 @@ mod tests {
     fn uniform_solid_fast_path_matches_a_dense_fill() {
         let uniform = Chunk::new(0, 0, 0, &SolidGen);
         assert_eq!(uniform.uniform(), Some(STONE));
-        // Chunk's real storage canonicalizes through BrickPayload::from_cells,
-        // which collapses ANY all-equal cell array to Uniform regardless of how
-        // ChunkData shaped it — so this Paletted{palette:[STONE], cells:[0;N]}
-        // input ALSO becomes Uniform (not a bug: a single-valued representation
-        // is the canonical form). The test now proves the still-real property
-        // that matters: two independently constructed, content-equal chunks
+        // Chunk construction canonicalizes single-valued palettes to Uniform
+        // (chunk_data_to_brick), so this Paletted{palette:[STONE], cells:[0;N]}
+        // input also becomes Uniform — not a bug, the canonical form. What the
+        // test proves: two independently constructed, content-equal chunks
         // mesh bit-identically.
         let dense = Chunk::from_data(
             0,

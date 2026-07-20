@@ -157,6 +157,24 @@ struct Registered {
     enabled: bool,
 }
 
+impl Registered {
+    /// Fresh bookkeeping around a manifest/runner pair; `floor`/`hz_gate` are
+    /// the only fields that vary by registration path.
+    fn new(manifest: Producer, runner: Box<dyn Run>, floor: u32, hz_gate: Option<RateGate>) -> Self {
+        Registered {
+            manifest,
+            runner,
+            stamp: Rev::START,
+            has_run: false,
+            ticks_skipped: 0,
+            floor,
+            meter: None,
+            hz_gate,
+            enabled: true,
+        }
+    }
+}
+
 /// Executes the manifest graph: ready-set from cadence ∧ rev, registration
 /// order, budget+floor enforced once, one profiler row per producer once a
 /// `Meter` is wired.
@@ -209,20 +227,10 @@ impl Scheduler {
     /// `tick` never runs these; the owner drives them with
     /// [`Scheduler::run_manual`] at the exact point their order requires.
     pub fn register_manual(&mut self, manifest: Producer, runner: Box<dyn Run>) -> ManualHandle {
-        self.manual.push(Registered {
-            manifest,
-            runner,
-            stamp: Rev::START,
-            has_run: false,
-            ticks_skipped: 0,
-            // A pure call-point lane is driven every frame by its owner; the
-            // forward-progress floor (a starvation backstop for cadence-gated
-            // producers) is inapplicable, so it never force-fires on its own.
-            floor: u32::MAX,
-            meter: None,
-            hz_gate: None,
-            enabled: true,
-        });
+        // A pure call-point lane is driven every frame by its owner; the
+        // forward-progress floor (a starvation backstop for cadence-gated
+        // producers) is inapplicable, so it never force-fires on its own.
+        self.manual.push(Registered::new(manifest, runner, u32::MAX, None));
         ManualHandle(self.manual.len() - 1)
     }
 
@@ -293,17 +301,7 @@ impl Scheduler {
             Cadence::Hz(hz) => Some(RateGate::from_hz(hz as u32)),
             _ => None,
         };
-        self.producers.push(Registered {
-            manifest,
-            runner,
-            stamp: Rev::START,
-            has_run: false,
-            ticks_skipped: 0,
-            floor,
-            meter: None,
-            hz_gate,
-            enabled: true,
-        });
+        self.producers.push(Registered::new(manifest, runner, floor, hz_gate));
         self.source_revs.push(Rev::START);
         id
     }

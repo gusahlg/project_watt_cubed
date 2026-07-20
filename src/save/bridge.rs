@@ -4,7 +4,6 @@
 use voxel_engine::DVec3;
 
 use crate::mods::Mods;
-use crate::render_config::RenderConfig;
 use crate::player::Player;
 use crate::world::World;
 
@@ -77,25 +76,13 @@ pub fn to_doc(
 }
 
 /// Rebuild a ready-to-play world and player from a doc, restoring mod state
-/// into `mods`. Total: unknown specs degrade to air, exactly like the network
-/// path.
-pub fn from_doc(doc: SaveDoc, mods: &mut Mods) -> (World, Player, SaveMeta) {
-    restore_doc(doc, mods, World::new)
-}
-
-/// Restore a document for an interactive session without synchronously
-/// generating the default origin data box. The selected render configuration
-/// is installed at construction time, so disabled LOD lanes never allocate
-/// their startup state only to tear it down on the first frame.
-pub(crate) fn from_doc_with_config(
-    doc: SaveDoc,
-    mods: &mut Mods,
-    render: RenderConfig,
-) -> (World, Player, SaveMeta) {
-    restore_doc(doc, mods, |seed| World::with_config_lazy(seed, render))
-}
-
-fn restore_doc(
+/// into `mods`. Unknown specs degrade to air, exactly like the network path.
+/// `make_world` is the caller's choice of `World` constructor — `World::new`
+/// for tests/headless callers, `|seed| World::with_config_lazy(seed, render)`
+/// for interactive sessions that want their render config installed before
+/// any terrain generates. One function instead of a config/no-config pair:
+/// the constructor closure already expresses the choice `World` itself offers.
+pub fn from_doc(
     doc: SaveDoc,
     mods: &mut Mods,
     make_world: impl FnOnce(i64) -> World,
@@ -175,25 +162,11 @@ pub fn save(
 
 /// Load a slot, laddering to the backup and salvaging a truncated tail if it
 /// comes to that. The report says how far down the ladder we went.
-pub fn load(id: &SlotId, mods: &mut Mods) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
-    load_inner(id, mods, from_doc)
-}
-
-/// Load an interactive session with its render/LOD lanes configured before
-/// any terrain is generated. Unlike [`load`], this takes the lazy world path;
-/// save replay and recovery behavior are otherwise identical.
-pub fn load_with_config(
+/// `make_world` is forwarded straight to [`from_doc`].
+pub fn load(
     id: &SlotId,
     mods: &mut Mods,
-    render: RenderConfig,
-) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
-    load_inner(id, mods, |doc, mods| from_doc_with_config(doc, mods, render))
-}
-
-fn load_inner(
-    id: &SlotId,
-    mods: &mut Mods,
-    restore: impl FnOnce(SaveDoc, &mut Mods) -> (World, Player, SaveMeta),
+    make_world: impl FnOnce(i64) -> World,
 ) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
     let (decoded, source) = store::read(id)?;
     let (doc, salvage) = match decoded {
@@ -202,6 +175,6 @@ fn load_inner(
             (doc, Some((recovered, expected)))
         }
     };
-    let (world, player, meta) = restore(doc, mods);
+    let (world, player, meta) = from_doc(doc, mods, make_world);
     Ok((world, player, meta, LoadReport { source, salvage }))
 }

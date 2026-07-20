@@ -241,9 +241,9 @@ impl World {
 
         let hot = self.registry.hot_tables();
         let occlude = |id: BlockId| {
-            let i = id.0 as usize;
-            if hot.solid(crate::block::registry::BlockId(i as u16)) && hot.absorption[i] > 0 {
-                Cell::Solid { absorption: hot.absorption[i] }
+            let absorption = hot.absorption(id);
+            if hot.solid(id) && absorption > 0 {
+                Cell::Solid { absorption }
             } else {
                 Cell::Open
             }

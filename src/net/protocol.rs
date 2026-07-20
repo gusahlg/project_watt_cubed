@@ -82,27 +82,45 @@ impl Wire for bool {
     }
 }
 
-/// A voice payload: u16 length prefix, bounded by [`MAX_VOICE_PAYLOAD`].
-/// Callers must have already refused an over-cap payload (client `send_voice`,
-/// server relay); the assert catches one that forgot. Decode rejects a length
-/// prefix past the cap before the bytes are trusted — a hostile peer can't
-/// smuggle an over-cap frame past the codec.
-impl Wire for Vec<u8> {
+/// Raw audio bytes already known to fit [`MAX_VOICE_PAYLOAD`] — the bound is
+/// checked once, in `TryFrom<Vec<u8>>` below, so nothing downstream (encode,
+/// relay) needs to re-check or trust a caller.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoicePayload(Vec<u8>);
+
+impl VoicePayload {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_boxed_slice(self) -> Box<[u8]> {
+        self.0.into_boxed_slice()
+    }
+}
+
+/// `Err` if `bytes` exceeds [`MAX_VOICE_PAYLOAD`] — the only place that bound
+/// is enforced; every `VoicePayload` in the system is provably in range.
+impl TryFrom<Vec<u8>> for VoicePayload {
+    type Error = ();
+    fn try_from(bytes: Vec<u8>) -> Result<Self, ()> {
+        (bytes.len() <= MAX_VOICE_PAYLOAD).then_some(Self(bytes)).ok_or(())
+    }
+}
+
+/// u16 length prefix, then the bytes. Decode rejects a length prefix past the
+/// cap before the bytes are trusted — a hostile peer can't smuggle an
+/// over-cap frame past the codec.
+impl Wire for VoicePayload {
     fn put(&self, w: &mut codec::Writer) {
-        debug_assert!(
-            self.len() <= MAX_VOICE_PAYLOAD,
-            "voice payload {} exceeds MAX_VOICE_PAYLOAD; callers must guard",
-            self.len()
-        );
-        w.u16(self.len() as u16);
-        w.raw(self);
+        w.u16(self.0.len() as u16);
+        w.raw(&self.0);
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
         let len = r.u16().ok()? as usize;
         if len > MAX_VOICE_PAYLOAD {
             return None;
         }
-        Some(r.take(len).ok()?.to_vec())
+        Some(Self(r.take(len).ok()?.to_vec()))
     }
 }
 
@@ -240,7 +258,7 @@ messages! {
         /// the receiver's jitter buffer can reorder and detect gaps. The server
         /// stamps speaker id + epoch on relay; the client never mints those.
         /// `payload` is bounded by [`MAX_VOICE_PAYLOAD`](super::MAX_VOICE_PAYLOAD).
-        Voice = tag::VOICE { seq: u32, payload: Vec<u8> },
+        Voice = tag::VOICE { seq: u32, payload: VoicePayload },
     }
 }
 
@@ -281,7 +299,7 @@ messages! {
         /// `SessionKey`); `epoch` distinguishes reconnections under a reused id —
         /// constant `0` here because the server never reuses ids. `seq` and
         /// `payload` are the sender's own [`ClientMessage::Voice`] values, unchanged.
-        PeerVoice = tag::PEER_VOICE { id: u32, epoch: u32, seq: u32, payload: Vec<u8> },
+        PeerVoice = tag::PEER_VOICE { id: u32, epoch: u32, seq: u32, payload: VoicePayload },
     }
 }
 
@@ -366,8 +384,8 @@ mod tests {
             },
             ClientMessage::Chat { channel: 1, text: "hello world".into() },
             ClientMessage::SetTime { day: 0.5 },
-            ClientMessage::Voice { seq: 5, payload: vec![1, 2, 3, 4] },
-            ClientMessage::Voice { seq: 0, payload: Vec::new() },
+            ClientMessage::Voice { seq: 5, payload: vec![1, 2, 3, 4].try_into().unwrap() },
+            ClientMessage::Voice { seq: 0, payload: Vec::new().try_into().unwrap() },
         ];
         for msg in cases {
             assert_eq!(ClientMessage::decode(&msg.encode()), Some(msg));
@@ -412,8 +430,8 @@ mod tests {
                 text: "hi".into(),
             },
             ServerMessage::Time { day: 0.75, day_secs: 600.0 },
-            ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7] },
-            ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new() },
+            ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7].try_into().unwrap() },
+            ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new().try_into().unwrap() },
         ];
         for msg in cases {
             assert_eq!(ServerMessage::decode(&msg.encode()), Some(msg));
@@ -480,7 +498,7 @@ mod tests {
             ClientMessage::Edit { req: 1, x: 1, y: 2, z: 3, expect: 0, spec: "air".into() },
             ClientMessage::Chat { channel: 0, text: "hi".into() },
             ClientMessage::SetTime { day: 0.25 },
-            ClientMessage::Voice { seq: 3, payload: vec![7, 7] },
+            ClientMessage::Voice { seq: 3, payload: vec![7, 7].try_into().unwrap() },
         ];
         for message in client_cases {
             let mut payload = message.encode();
@@ -518,7 +536,7 @@ mod tests {
                 text: "hi".into(),
             },
             ServerMessage::Time { day: 0.5, day_secs: 600.0 },
-            ServerMessage::PeerVoice { id: 2, epoch: 1, seq: 4, payload: vec![5, 5] },
+            ServerMessage::PeerVoice { id: 2, epoch: 1, seq: 4, payload: vec![5, 5].try_into().unwrap() },
         ];
         for message in server_cases {
             let mut payload = message.encode();
@@ -529,7 +547,7 @@ mod tests {
 
     #[test]
     fn voice_payload_at_the_cap_round_trips_both_directions() {
-        let payload: Vec<u8> = (0..MAX_VOICE_PAYLOAD).map(|i| i as u8).collect();
+        let payload: VoicePayload = (0..MAX_VOICE_PAYLOAD).map(|i| i as u8).collect::<Vec<u8>>().try_into().unwrap();
         let cm = ClientMessage::Voice { seq: 99, payload: payload.clone() };
         assert_eq!(ClientMessage::decode(&cm.encode()), Some(cm));
         let sm = ServerMessage::PeerVoice { id: 7, epoch: 0, seq: 99, payload };
@@ -538,8 +556,8 @@ mod tests {
 
     /// A frame whose length prefix claims more than [`MAX_VOICE_PAYLOAD`] is
     /// refused by the decoder before the bytes are trusted — the encode path
-    /// can't build one (callers guard + `debug_assert`), so the frame is forged
-    /// directly, exactly as a hostile peer would.
+    /// can't build one (`VoicePayload::try_from` refuses it), so the frame is
+    /// forged directly, exactly as a hostile peer would.
     #[test]
     fn oversized_voice_frame_is_rejected_both_directions() {
         let over = vec![0u8; MAX_VOICE_PAYLOAD + 1];

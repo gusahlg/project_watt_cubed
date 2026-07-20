@@ -24,7 +24,7 @@ use crate::ident::Detail;
 
 use super::brick::BRICK_DIM;
 #[cfg(test)]
-use super::brick::{BRICK_VOLUME, Brick, BrickPayload, PALETTE_MAX, Run, RleColumns, cell_index};
+use super::brick::{BRICK_VOLUME, Brick, BrickPayload, PackStrategy, cell_index};
 use super::chunk::{CHUNK_SIZE, Chunk};
 #[cfg(test)]
 use super::generation::TerrainGenerator;
@@ -286,9 +286,11 @@ impl Section {
     }
 
     /// Extract finest-level section from the generator, applying player edits.
-    /// Each column is sampled once, then RLE-compacted straight into
-    /// per-brick runs. `rev` stamps every extracted brick: transient section
-    /// bricks carry the edit_generation observed at extract time.
+    /// Each column is sampled once into its cell's slot in the owning brick's
+    /// flat array; [`BrickPayload::from_cells`] (the same packer chunk
+    /// storage uses) then picks the payload variant. `rev` stamps every
+    /// extracted brick: transient section bricks carry the edit_generation
+    /// observed at extract time.
     pub fn extract<G: TerrainGenerator>(
         pos: SectionPos,
         r#gen: &G,
@@ -306,8 +308,10 @@ impl Section {
         let mut scratch = vec![AIR; n];
         let quadrants: [BrickStack; 4] = std::array::from_fn(|q| {
             let (qx, qz) = (q & 1, q >> 1);
-            let mut per_brick: Vec<[Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]> =
-                (0..num_bricks).map(|_| std::array::from_fn(|_| Vec::new())).collect();
+            // Cells beyond `n` (only possible at the coarse rings, where
+            // `n < num_bricks * BRICK_DIM`) stay AIR — unobserved by any
+            // n_cells-bounded reader.
+            let mut per_brick = vec![[BlockState { id: AIR, state: 0 }; BRICK_VOLUME]; num_bricks];
             for lz in 0..BRICK_DIM {
                 for lx in 0..BRICK_DIM {
                     let (ix, iz) = (qx * BRICK_DIM + lx, qz * BRICK_DIM + lz);
@@ -315,15 +319,18 @@ impl Section {
                     let (wx, wz) = (fx + half, fz + half);
                     r#gen.lod_column(wx, wz, &ys, &mut scratch);
                     apply_edits(&mut scratch, &flat, fx, fz, cell);
-                    let full_runs = rle_slice(&scratch);
-                    let bricked = slice_into_bricks(&full_runs, num_bricks);
-                    let local_col = lx + lz * BRICK_DIM;
-                    for (b, cols) in bricked.into_iter().enumerate() {
-                        per_brick[b][local_col] = cols;
+                    for (y, &id) in scratch.iter().enumerate() {
+                        let (b, ly) = (y / BRICK_DIM, y % BRICK_DIM);
+                        per_brick[b][cell_index(lx, ly, lz)] = BlockState { id, state: 0 };
                     }
                 }
             }
-            BrickStack::from_bricks(per_brick.into_iter().map(|cols| build_brick(pos.detail, rev, cols)).collect())
+            BrickStack::from_bricks(
+                per_brick
+                    .into_iter()
+                    .map(|cells| Brick { level: pos.detail, rev, payload: BrickPayload::from_cells(&cells, PackStrategy::Rle) })
+                    .collect(),
+            )
         });
         Section { pos, quadrants }
     }
@@ -410,108 +417,6 @@ pub(in crate::world) fn apply_edits(
             cells[j] = id;
         }
     }
-}
-
-/// Run-length compact a cell slice into bottom-up (BlockId, count) segments.
-/// `i32` counts: a full-domain slice can be up to `DOMAIN_H/cell` long
-/// (≤128 in practice), safely past `u8` before per-brick slicing narrows it.
-#[cfg(test)]
-fn rle_slice(cells: &[BlockId]) -> Vec<(BlockId, i32)> {
-    let mut out = Vec::new();
-    let mut j = 0;
-    while j < cells.len() {
-        let id = cells[j];
-        let mut k = j + 1;
-        while k < cells.len() && cells[k] == id {
-            k += 1;
-        }
-        out.push((id, (k - j) as i32));
-        j = k;
-    }
-    out
-}
-
-/// Slice a column's full-domain bottom-up runs into per-brick windows of
-/// exactly [`BRICK_DIM`] cells each, splitting any run that spans a
-/// boundary. Short of a full brick (coarse rings): the remainder is padded
-/// AIR — unobserved by any n_cells-bounded reader.
-#[cfg(test)]
-fn slice_into_bricks(runs: &[(BlockId, i32)], num_bricks: usize) -> Vec<Vec<(BlockId, u8)>> {
-    let mut out: Vec<Vec<(BlockId, u8)>> = (0..num_bricks).map(|_| Vec::new()).collect();
-    let (mut b, mut remaining) = (0usize, BRICK_DIM as i32);
-    for &(id, count) in runs {
-        let mut count = count;
-        while count > 0 && b < num_bricks {
-            let take = count.min(remaining);
-            out[b].push((id, take as u8));
-            count -= take;
-            remaining -= take;
-            if remaining == 0 {
-                b += 1;
-                remaining = BRICK_DIM as i32;
-            }
-        }
-    }
-    if b < num_bricks && remaining < BRICK_DIM as i32 {
-        // Merge into the last real segment if it's already air (e.g. a
-        // column that trails off into open sky before the padding starts) —
-        // pushing a second AIR entry here would violate RleColumns'
-        // adjacent-runs-differ invariant (brick.rs).
-        match out[b].last_mut() {
-            Some((id, c)) if *id == AIR => *c += remaining as u8,
-            _ => out[b].push((AIR, remaining as u8)),
-        }
-        b += 1;
-    }
-    for slot in out.iter_mut().take(num_bricks).skip(b) {
-        slot.push((AIR, BRICK_DIM as u8));
-    }
-    out
-}
-
-/// Build one brick's [`BrickPayload`] from 256 columns' worth of already-RLE
-/// (BlockId, count) segments (count in CELL units, each column summing to
-/// [`BRICK_DIM`]).
-/// `columns[x + z*16]`, x-major (matches [`RleColumns`]).
-#[cfg(test)]
-fn build_brick(level: Detail, rev: voxel_engine::Rev, columns: [Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]) -> Brick {
-    let mut palette: Vec<BlockState> = Vec::new();
-    let mut column_runs: [Vec<Run>; BRICK_DIM * BRICK_DIM] = std::array::from_fn(|_| Vec::new());
-    for (col, segs) in columns.iter().enumerate() {
-        for &(id, count) in segs {
-            let state = BlockState { id, state: 0 };
-            let idx = match palette.iter().position(|p| *p == state) {
-                Some(i) => i,
-                None => {
-                    palette.push(state);
-                    palette.len() - 1
-                }
-            };
-            if palette.len() > PALETTE_MAX {
-                return build_dense_brick(level, rev, &columns);
-            }
-            column_runs[col].push(Run::new(idx as u8, count));
-        }
-    }
-    Brick { level, rev, payload: BrickPayload::Rle { palette: palette.into_boxed_slice(), columns: RleColumns::from_column_runs(column_runs) } }
-}
-
-/// Palette-overflow escape (>256 distinct values in one brick): re-decode
-/// the same column segments into a flat 4096-cell buffer instead.
-#[cfg(test)]
-fn build_dense_brick(level: Detail, rev: voxel_engine::Rev, columns: &[Vec<(BlockId, u8)>; BRICK_DIM * BRICK_DIM]) -> Brick {
-    let mut cells = vec![BlockState { id: AIR, state: 0 }; BRICK_VOLUME];
-    for (col, segs) in columns.iter().enumerate() {
-        let (x, z) = (col % BRICK_DIM, col / BRICK_DIM);
-        let mut y = 0usize;
-        for &(id, count) in segs {
-            for _ in 0..count {
-                cells[cell_index(x, y, z)] = BlockState { id, state: 0 };
-                y += 1;
-            }
-        }
-    }
-    Brick { level, rev, payload: BrickPayload::Dense(cells.into_boxed_slice()) }
 }
 
 #[cfg(test)]

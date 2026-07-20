@@ -33,6 +33,7 @@ use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::{SineHills, TerrainGenerator};
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
+use super::neighborhood::BoundedPool;
 use super::section::{self, SectionMeshData, SectionPos};
 use crate::block::registry::{BlockId, HotTables};
 
@@ -190,12 +191,9 @@ const _: () = assert!(size_of::<Done>() <= 128);
 /// allocating vertex and index buckets from scratch for every job.
 // The box is intentional: besides being recycled with the geometry, it keeps
 // `Done::Mesh` pointer-sized instead of inflating every result-channel message.
-#[allow(clippy::vec_box)]
-static MESH_OUTPUT_POOL: Mutex<Vec<Box<ChunkMeshData>>> = Mutex::new(Vec::new());
 // 64: enough for every worker of a 12-thread pool to hold one buffer with a
-// frame's worth queued behind the byte-budgeted upload drain (the cap only
-// bounds RETAINED capacity — a miss allocates fresh, it never blocks).
-const MESH_OUTPUT_POOL_CAP: usize = 64;
+// frame's worth queued behind the byte-budgeted upload drain.
+static MESH_OUTPUT_POOL: BoundedPool<Box<ChunkMeshData>> = BoundedPool::new(64);
 
 /// A pooled `Box<ChunkMeshData>`: taken from [`MESH_OUTPUT_POOL`] at job start
 /// (workers), returned on drop wherever the result dies (upload or stale
@@ -204,11 +202,7 @@ pub(in crate::world) struct MeshOutput(Option<Box<ChunkMeshData>>);
 
 impl MeshOutput {
     pub(in crate::world) fn new() -> Self {
-        let data = MESH_OUTPUT_POOL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop()
-            .unwrap_or_else(|| Box::new(new_chunk_mesh_data()));
+        let data = MESH_OUTPUT_POOL.take().unwrap_or_else(|| Box::new(new_chunk_mesh_data()));
         Self(Some(data))
     }
 }
@@ -229,11 +223,8 @@ impl std::ops::DerefMut for MeshOutput {
 
 impl Drop for MeshOutput {
     fn drop(&mut self) {
-        let Some(data) = self.0.take() else { return };
-        let mut pool =
-            MESH_OUTPUT_POOL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pool.len() < MESH_OUTPUT_POOL_CAP {
-            pool.push(data);
+        if let Some(data) = self.0.take() {
+            MESH_OUTPUT_POOL.put(data);
         }
     }
 }

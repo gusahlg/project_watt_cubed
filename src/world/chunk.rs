@@ -7,7 +7,7 @@
 //! (legal play, never a crash).
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::ident::{BlockState, Detail};
-use crate::world::brick::{Brick, BrickPayload, PALETTE_MAX, PackStrategy};
+use crate::world::brick::{Brick, ChunkPayload, PALETTE_MAX};
 use crate::world::generation::TerrainGenerator;
 
 /// Chunk edge length along every world axis (chunks are cubes).
@@ -67,29 +67,28 @@ impl ChunkData {
 }
 
 /// Widen a construction-vocabulary [`ChunkData`] into the real storage
-/// [`Brick`] (level 0, the k=0 chunk brick). Construction-boundary only —
-/// [`BrickPayload::from_cells`] is never called on a hot path; this runs
-/// once per chunk generation/load, not per edit.
-fn chunk_data_to_brick(data: ChunkData) -> Brick {
-    let mut cells = Box::new([BlockState { id: AIR, state: 0 }; CHUNK_VOLUME]);
-    match data {
-        ChunkData::Uniform(id) => cells.fill(BlockState { id, state: 0 }),
-        ChunkData::Paletted { palette, cells: idx } => {
-            for i in 0..CHUNK_VOLUME {
-                cells[i] = BlockState { id: palette[idx[i] as usize], state: 0 };
-            }
+/// [`Brick<ChunkPayload>`] (level 0). Already palettized in the same per-cell
+/// shape, so this is a direct variant-for-variant widen
+/// (`BlockId → BlockState{id, state:0}`), never a re-pack — construction-
+/// boundary only, once per chunk generation/load. The one canonicalization:
+/// a single-entry `Paletted` collapses to `Uniform`, so a directly
+/// constructed single-valued `ChunkData` still lands on the uniform fast
+/// paths (analytic light, free clone, born-air). No other all-equal case is
+/// reachable — the builder returns `Uniform` for an all-equal array, and
+/// `Dense` means 257+ distinct ids.
+fn chunk_data_to_brick(data: ChunkData) -> Brick<ChunkPayload> {
+    let widen = |id: BlockId| BlockState { id, state: 0 };
+    let payload = match data {
+        ChunkData::Uniform(id) => ChunkPayload::Uniform(widen(id)),
+        ChunkData::Paletted { palette, cells: _ } if palette.len() == 1 => {
+            ChunkPayload::Uniform(widen(palette[0]))
         }
-        ChunkData::Dense(dense) => {
-            for i in 0..CHUNK_VOLUME {
-                cells[i] = BlockState { id: dense[i], state: 0 };
-            }
+        ChunkData::Paletted { palette, cells } => {
+            ChunkPayload::Paletted { palette: palette.into_iter().map(widen).collect(), cells }
         }
-    }
-    Brick {
-        level: Detail(0),
-        rev: voxel_engine::Rev::START,
-        payload: BrickPayload::from_cells(&cells, PackStrategy::Paletted),
-    }
+        ChunkData::Dense(dense) => ChunkPayload::Dense(dense.iter().map(|&id| widen(id)).collect()),
+    };
+    Brick { level: Detail(0), rev: voxel_engine::Rev::START, payload }
 }
 
 /// A 16-cube region of the world. `Clone` copies at most the cell array plus a
@@ -104,7 +103,7 @@ pub struct Chunk {
     pub cy: i32,
     /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_SIZE + local z).
     pub cz: i32,
-    data: Brick,
+    data: Brick<ChunkPayload>,
 }
 
 impl Chunk {
@@ -120,7 +119,7 @@ impl Chunk {
             cx,
             cy,
             cz,
-            data: Brick { level: Detail(0), rev: voxel_engine::Rev::START, payload: BrickPayload::Uniform(BlockState { id, state: 0 }) },
+            data: Brick { level: Detail(0), rev: voxel_engine::Rev::START, payload: ChunkPayload::Uniform(BlockState { id, state: 0 }) },
         }
     }
 
@@ -156,7 +155,7 @@ impl Chunk {
     /// (once a consumer needs it) the chunk's `Brick.rev`. The stored truth
     /// is `Brick`, full stop — `ChunkData` never appears here.
     #[inline]
-    pub fn data(&self) -> &Brick {
+    pub fn data(&self) -> &Brick<ChunkPayload> {
         &self.data
     }
 
@@ -164,7 +163,7 @@ impl Chunk {
     #[inline]
     pub fn uniform(&self) -> Option<BlockId> {
         match &self.data.payload {
-            BrickPayload::Uniform(v) => Some(v.id),
+            ChunkPayload::Uniform(v) => Some(v.id),
             _ => None,
         }
     }
@@ -186,10 +185,9 @@ impl Chunk {
     #[inline]
     pub fn get_index(&self, index: usize) -> BlockId {
         match &self.data.payload {
-            BrickPayload::Uniform(v) => v.id,
-            BrickPayload::Paletted { palette, cells } => palette[cells[index] as usize].id,
-            BrickPayload::Dense(cells) => cells[index].id,
-            BrickPayload::Rle { .. } => unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)"),
+            ChunkPayload::Uniform(v) => v.id,
+            ChunkPayload::Paletted { palette, cells } => palette[cells[index] as usize].id,
+            ChunkPayload::Dense(cells) => cells[index].id,
         }
     }
 
@@ -209,19 +207,16 @@ impl Chunk {
         debug_assert_eq!(out.len(), CHUNK_SIZE);
         let base = Self::index(0, y, z);
         match &self.data.payload {
-            BrickPayload::Uniform(v) => out.fill(v.id),
-            BrickPayload::Paletted { palette, cells } => {
+            ChunkPayload::Uniform(v) => out.fill(v.id),
+            ChunkPayload::Paletted { palette, cells } => {
                 for (o, &idx) in out.iter_mut().zip(&cells[base..base + CHUNK_SIZE]) {
                     *o = palette[idx as usize].id;
                 }
             }
-            BrickPayload::Dense(cells) => {
+            ChunkPayload::Dense(cells) => {
                 for (o, c) in out.iter_mut().zip(&cells[base..base + CHUNK_SIZE]) {
                     *o = c.id;
                 }
-            }
-            BrickPayload::Rle { .. } => {
-                unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)")
             }
         }
     }
@@ -237,8 +232,8 @@ impl Chunk {
         out: &mut [u64; CHUNK_VOLUME / 64],
     ) {
         match &self.data.payload {
-            BrickPayload::Uniform(v) => out.fill(if opaque(v.id) { u64::MAX } else { 0 }),
-            BrickPayload::Paletted { palette, cells } => {
+            ChunkPayload::Uniform(v) => out.fill(if opaque(v.id) { u64::MAX } else { 0 }),
+            ChunkPayload::Paletted { palette, cells } => {
                 let mut lut = [false; super::brick::PALETTE_MAX];
                 for (i, p) in palette.iter().enumerate() {
                     lut[i] = opaque(p.id);
@@ -250,16 +245,13 @@ impl Chunk {
                     }
                 }
             }
-            BrickPayload::Dense(cells) => {
+            ChunkPayload::Dense(cells) => {
                 out.fill(0);
                 for (i, c) in cells.iter().enumerate() {
                     if opaque(c.id) {
                         out[i >> 6] |= 1 << (i & 63);
                     }
                 }
-            }
-            BrickPayload::Rle { .. } => {
-                unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)")
             }
         }
     }
@@ -272,20 +264,20 @@ impl Chunk {
     /// Write voxel by flat index (replay saved/broken-block edits).
     /// First differing write promotes uniform → paletted; matching write stays
     /// uniform. Storage holding a single id collapses back to Uniform
-    /// (edit-revert), reclaiming the cell array. In-place on [`BrickPayload`]:
+    /// (edit-revert), reclaiming the cell array. In-place on [`ChunkPayload`]:
     /// `from_cells` never runs per edit, only at construction.
     pub fn set_index(&mut self, index: usize, v: BlockId) {
         let v = BlockState { id: v, state: 0 };
         match &mut self.data.payload {
-            BrickPayload::Uniform(cur) => {
+            ChunkPayload::Uniform(cur) => {
                 if *cur == v {
                     return;
                 }
                 let mut cells = vec![0u8; CHUNK_VOLUME].into_boxed_slice();
                 cells[index] = 1;
-                self.data.payload = BrickPayload::Paletted { palette: vec![*cur, v].into_boxed_slice(), cells };
+                self.data.payload = ChunkPayload::Paletted { palette: vec![*cur, v].into_boxed_slice(), cells };
             }
-            BrickPayload::Paletted { palette, cells } => {
+            ChunkPayload::Paletted { palette, cells } => {
                 let slot = match palette.iter().position(|&p| p == v) {
                     Some(k) => k as u8,
                     None => {
@@ -299,7 +291,7 @@ impl Chunk {
                                     *d = palette[c as usize];
                                 }
                                 dense[index] = v;
-                                self.data.payload = BrickPayload::Dense(dense);
+                                self.data.payload = ChunkPayload::Dense(dense);
                                 return;
                             }
                         }
@@ -317,16 +309,15 @@ impl Chunk {
                 // scan only when it could have unified the chunk — the common
                 // edit keeps a chunk mixed and never scans.
                 if slot == cells[0] && cells.iter().all(|&c| c == slot) {
-                    self.data.payload = BrickPayload::Uniform(v);
+                    self.data.payload = ChunkPayload::Uniform(v);
                 }
             }
-            BrickPayload::Dense(cells) => {
+            ChunkPayload::Dense(cells) => {
                 cells[index] = v;
                 if v == cells[0] && cells.iter().all(|&c| c == v) {
-                    self.data.payload = BrickPayload::Uniform(v);
+                    self.data.payload = ChunkPayload::Uniform(v);
                 }
             }
-            BrickPayload::Rle { .. } => unreachable!("chunks never construct Rle payloads (E2: PackStrategy::Paletted only)"),
         }
     }
 }
@@ -408,7 +399,7 @@ mod tests {
         chunk.set_local(8, 8, 8, AIR);
         assert!(chunk.uniform().is_none(), "differing write goes paletted");
         assert!(
-            matches!(&chunk.data().payload, BrickPayload::Paletted { palette, .. } if palette.len() == 2),
+            matches!(&chunk.data().payload, ChunkPayload::Paletted { palette, .. } if palette.len() == 2),
             "promotion palettizes, never pays full width"
         );
         assert_eq!(chunk.get_local(8, 8, 8), AIR);
@@ -457,7 +448,7 @@ mod tests {
         assert!(std::mem::size_of::<ChunkData>() <= 40);
         // So does the real stored representation: Brick is a few pointers +
         // an enum tag, nowhere near CHUNK_VOLUME.
-        assert!(std::mem::size_of::<Brick>() <= 64, "got {}", std::mem::size_of::<Brick>());
+        assert!(std::mem::size_of::<Brick<ChunkPayload>>() <= 64, "got {}", std::mem::size_of::<Brick<ChunkPayload>>());
     }
 
     #[test]
@@ -495,11 +486,11 @@ mod tests {
         for i in 0..CHUNK_VOLUME - 1 {
             chunk.set_index(i, BlockId(1));
         }
-        assert!(matches!(&chunk.data().payload, BrickPayload::Paletted { palette, .. } if palette.len() == PALETTE_MAX));
+        assert!(matches!(&chunk.data().payload, ChunkPayload::Paletted { palette, .. } if palette.len() == PALETTE_MAX));
 
         chunk.set_index(0, BlockId(999)); // palette full — must GC, not promote
         match &chunk.data().payload {
-            BrickPayload::Paletted { palette, .. } => {
+            ChunkPayload::Paletted { palette, .. } => {
                 assert_eq!(palette.len(), 3, "GC kept only the live ids plus the new one")
             }
             other => panic!("expected GC'd Paletted, got a {other:?} variant"),
@@ -518,7 +509,7 @@ mod tests {
         for i in 0..300 {
             chunk.set_index(i, BlockId(1000 + i as u16));
         }
-        assert!(matches!(&chunk.data().payload, BrickPayload::Dense(_)), "257th distinct id promotes");
+        assert!(matches!(&chunk.data().payload, ChunkPayload::Dense(_)), "257th distinct id promotes");
         for i in 0..300 {
             assert_eq!(chunk.get_index(i), BlockId(1000 + i as u16));
         }
@@ -541,7 +532,7 @@ mod tests {
         assert_eq!(chunk.get_local(5, 5, 5), AIR, "untouched cells keep the old fill");
     }
 
-    // ChunkData -> Brick construction and the in-place BrickPayload ops
+    // ChunkData -> Brick construction and the in-place ChunkPayload ops
     // agree with an independent reference.
 
     /// Independent reference for `set_index`'s edit-sequence semantics:
@@ -564,7 +555,7 @@ mod tests {
     }
 
     /// Reachable failure: fails if any promote/GC/dense-escape transition in
-    /// `set_index`'s `BrickPayload` state machine loses or corrupts a cell
+    /// `set_index`'s `ChunkPayload` state machine loses or corrupts a cell
     /// relative to a dead-simple overlay reference, across every transition
     /// (uniform->paletted, paletted GC, paletted->dense, dense stays dense,
     /// collapse back to uniform).
@@ -599,9 +590,9 @@ mod tests {
     }
 
     /// Reachable failure: fails if `chunk_data_to_brick`'s widening
-    /// (`BlockId -> BlockState{id, state:0}` then `BrickPayload::from_cells`)
-    /// drops or reorders a cell relative to `ChunkData::from_cells`'s own
-    /// palette — an independent construction of the "same" chunk two ways.
+    /// (`BlockId -> BlockState{id, state:0}`, variant-for-variant) drops or
+    /// reorders a cell relative to `ChunkData::from_cells`'s own palette — an
+    /// independent construction of the "same" chunk two ways.
     #[test]
     fn construction_boundary_roundtrips_every_cell() {
         let (g, _, _) = hills(11);

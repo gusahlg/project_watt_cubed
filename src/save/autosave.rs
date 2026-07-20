@@ -65,6 +65,13 @@ impl Autosaver {
         Writer { tx, rx }
     }
 
+    /// The live writer for an in-flight write. Both `poll` and `flush_now`
+    /// only reach here after checking `in_flight`, which is never set true
+    /// without a writer.
+    fn writer(&self) -> &Writer {
+        self.writer.as_ref().expect("in-flight autosave must have a writer")
+    }
+
     /// Note a freshly loaded/created world so its current state doesn't count
     /// as dirty.
     pub fn reset(&mut self, generation: u64) {
@@ -78,8 +85,7 @@ impl Autosaver {
         if !self.in_flight {
             return Tick::Idle;
         }
-        let writer = self.writer.as_ref().expect("in-flight autosave must have a writer");
-        match writer.rx.try_recv() {
+        match self.writer().rx.try_recv() {
             Ok(result) => {
                 self.in_flight = false;
                 if result.is_ok() {
@@ -144,11 +150,10 @@ impl Autosaver {
         encode: impl FnOnce() -> Result<Vec<u8>, SaveError>,
     ) -> Result<(), SaveError> {
         if self.in_flight {
-            let writer = self.writer.as_ref().expect("in-flight autosave must have a writer");
             // The drained result doesn't matter — we overwrite right below.
             // A dead worker isn't fatal either: the synchronous write is the
             // one that has to land.
-            if writer.rx.recv().is_err() {
+            if self.writer().rx.recv().is_err() {
                 self.writer = None;
             }
             self.in_flight = false;

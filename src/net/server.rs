@@ -900,7 +900,7 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
     let origin = sender.pos;
     let channel = if channel == chat::GLOBAL { chat::GLOBAL } else { chat::LOCAL };
     println!("<{from_name}> {text}");
-    let msg = ServerMessage::Chat { from_id: id, from_name, channel, text: text.into() };
+    let msg = ServerMessage::Chat { from_id: id, from_name, channel, text };
     broadcast(&mut state, &msg, |_, h| {
         channel == chat::GLOBAL || h.pos.distance(origin) <= chat::RADIUS
     });
@@ -909,7 +909,7 @@ fn on_chat(shared: &Arc<Mutex<State>>, id: u32, channel: u8, text: &str) {
 /// Voice is loss-tolerant: `try_send` and DROP on a full/closed queue, never
 /// counted toward the slow-client kick ([`kick_slow`]/[`OUT_CAPACITY`]) — a
 /// voice flood degrades only that listener's own audio.
-fn on_voice(shared: &Arc<Mutex<State>>, id: u32, seq: u32, payload: Vec<u8>) {
+fn on_voice(shared: &Arc<Mutex<State>>, id: u32, seq: u32, payload: protocol::VoicePayload) {
     let frame: Arc<[u8]> =
         ServerMessage::PeerVoice { id, epoch: VOICE_EPOCH, seq, payload }.encode().into();
     let state = shared.lock_recover();
@@ -1032,8 +1032,8 @@ fn clean_name(raw: &str) -> Arc<str> {
     if name.is_empty() { "player".into() } else { name.into() }
 }
 
-fn clean_chat(raw: &str) -> String {
-    raw.chars().filter(|c| !c.is_control()).take(MAX_CHAT).collect::<String>().trim().to_string()
+fn clean_chat(raw: &str) -> Arc<str> {
+    raw.chars().filter(|c| !c.is_control()).take(MAX_CHAT).collect::<String>().trim().into()
 }
 
 #[cfg(test)]
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn chat_is_sanitised() {
-        assert_eq!(clean_chat("hi\tthere\n"), "hithere");
+        assert_eq!(&*clean_chat("hi\tthere\n"), "hithere");
         assert_eq!(clean_chat(&"a".repeat(500)).len(), MAX_CHAT);
     }
 
@@ -1339,11 +1339,11 @@ mod tests {
         players.insert(3u32, test_player(DVec3::new(9e3, 20.0, 0.0), out3, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        on_voice(&shared, 1, 42, vec![1, 2, 3]);
+        on_voice(&shared, 1, 42, vec![1, 2, 3].try_into().unwrap());
 
         match ServerMessage::decode(&rx2.try_recv().expect("the visible peer hears it")) {
             Some(ServerMessage::PeerVoice { id, epoch, seq, payload }) => {
-                assert_eq!((id, epoch, seq, payload), (1, VOICE_EPOCH, 42, vec![1, 2, 3]));
+                assert_eq!((id, epoch, seq, payload.as_slice()), (1, VOICE_EPOCH, 42, &[1, 2, 3][..]));
             }
             other => panic!("expected PeerVoice, got {other:?}"),
         }
@@ -1513,22 +1513,15 @@ mod tests {
             "a connection past the handshake cap must be refused"
         );
 
-        // Freeing the squatters must free their slots for a real player. These
-        // are raw quinn connections rather than our `Connection` wrapper, so
-        // mirror its graceful shutdown: explicitly queue CONNECTION_CLOSE and
-        // keep the runtime alive until the endpoint has transmitted it. Merely
-        // dropping the handles and runtime together can strand the server-side
-        // handlers until HANDSHAKE_TIMEOUT, making this assertion race 5s
-        // against a deliberate 10s timeout.
+        // Freeing the squatters must free their slots for a real player. Reuse
+        // the graceful-shutdown helper (these are raw quinn connections, not
+        // our `Connection` wrapper) — merely dropping the handles would strand
+        // the server-side handlers until HANDSHAKE_TIMEOUT, racing this
+        // assertion's 5s against a 10s timeout.
         for conn in &squatters {
-            conn.close(0u32.into(), b"test complete");
+            crate::net::client::graceful_close(conn, &squat_ep, &squat_rt);
         }
         drop(squatters);
-        squat_rt
-            .block_on(async {
-                tokio::time::timeout(HANDSHAKE_TIMEOUT, squat_ep.wait_idle()).await
-            })
-            .expect("squatter endpoint did not finish graceful shutdown");
         drop(squat_ep);
         drop(squat_rt);
         let deadline = Instant::now() + Duration::from_secs(5);

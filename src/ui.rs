@@ -162,6 +162,36 @@ impl HudMode {
     pub fn shows_mod_hud(self) -> bool {
         !matches!(self, HudMode::Off)
     }
+
+    /// Stable persistence/console code (`Off=0, Minimal=1, Full=2`), independent
+    /// of declaration order so the on-disk value never shifts if variants move.
+    pub fn code(self) -> u8 {
+        match self {
+            HudMode::Off => 0,
+            HudMode::Minimal => 1,
+            HudMode::Full => 2,
+        }
+    }
+
+    /// Parse a persisted code or a console word; the single source both the
+    /// settings `read` and `/gfx` parse fold through.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" | "0" => Some(HudMode::Off),
+            "minimal" | "min" | "1" => Some(HudMode::Minimal),
+            "full" | "2" => Some(HudMode::Full),
+            _ => None,
+        }
+    }
+
+    /// Capitalized display name for the menu row and confirm line.
+    pub fn label(self) -> &'static str {
+        match self {
+            HudMode::Off => "Off",
+            HudMode::Minimal => "Minimal",
+            HudMode::Full => "Full",
+        }
+    }
 }
 
 /// The whole in-world UI look, threaded through drawing. `scale` routes every font

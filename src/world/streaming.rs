@@ -218,7 +218,6 @@ impl World {
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
         // or teleport-sized gaps, so prediction never fires on garbage input.
         let now = Instant::now();
-        let mut discontinuity = false;
         self.section_vel = match self.section_eye_prev {
             Some((prev, t)) => {
                 let dt = now.duration_since(t).as_secs_f64();
@@ -228,25 +227,17 @@ impl World {
                 if sane && v.length() <= MAX_PREDICT_SPEED {
                     v
                 } else {
-                    // Implausible motion = teleport/large jump: on top of
-                    // zeroed prediction, queued far jobs still carry stale
-                    // admission priorities from the old position.
-                    discontinuity = sane;
+                    // Implausible motion (teleport, pause, or faster than
+                    // MAX_PREDICT_SPEED): zero prediction. Far jobs left behind
+                    // by the jump are re-keyed and descheduled by the pool's
+                    // per-epoch sync (the boundary cross bumps the view epoch),
+                    // so no separate purge is needed here.
                     DVec3::ZERO
                 }
             }
             None => DVec3::ZERO,
         };
         self.section_eye_prev = center.is_finite().then_some((center, now));
-        if discontinuity && let Some(workers) = &self.workers {
-            // Purge queued (not running) far work and release each exact
-            // claim, so obsolete jobs cannot monopolize workers while the
-            // frontier at the new position waits. Ready sections stay.
-            for key in workers.clear_far() {
-                self.cancel_job(key);
-            }
-            self.pending_sections.set();
-        }
         let s = CHUNK_SIZE as i32;
         let center_chunk = ChunkCoord::new(
             block_coord(center.x).div_euclid(s),
@@ -1868,13 +1859,16 @@ impl World {
                 self.quarantined.iter().take(4).collect::<Vec<_>>()
             );
         }
+        // Share the one queue-depth source with the harness gauge, so the two
+        // can never drift; the gate counters have no gauge field, so stay local.
+        let g = self.stream_gauges();
         let near: [(&str, usize); 8] = [
-            ("generating", self.generating.len()),
-            ("mesh_worklist", self.mesh_worklist.len()),
-            ("upload_queue", self.upload_queue.len()),
-            ("light_worklist", self.light_worklist.len()),
-            ("light_inflight", self.light_inflight.len()),
-            ("light_apply_queue", self.light_apply_queue.len()),
+            ("generating", g.generating),
+            ("mesh_worklist", g.mesh_worklist),
+            ("upload_queue", g.upload_queue),
+            ("light_worklist", g.light_worklist),
+            ("light_inflight", g.light_inflight),
+            ("light_apply_queue", g.light_apply_queue),
             ("degraded", self.light_gate.degraded.len()),
             ("light_blocked", self.light_gate.blocked_since.len()),
         ];

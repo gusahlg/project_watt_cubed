@@ -288,20 +288,18 @@ pub struct Failure {
     pub detail: String,
 }
 
-/// Fixed offscreen-capture window config: a real winit window still
-/// backs it (the engine has no headless path), but size/pacing are pinned so
-/// captures are reproducible across machines.
+/// Fixed offscreen-capture window config: a real winit window still backs the
+/// surface (no fully headless path yet), but stays unmapped — captures render
+/// into an owned offscreen image, independent of presents, so nothing flashes
+/// on the desktop and no WM can tile/resize it mid-run. Size/pacing are
+/// pinned for reproducibility across machines.
 fn scripted_config() -> voxel_engine::Config {
     voxel_engine::Config {
         title: "golden-harness".into(),
         width: 1280,
         height: 720,
         vsync: false,
-        // A tiling WM re-sizing the window mid-run captures at the wrong
-        // dimensions and every ImageMatch reads 100%-changed. Fixed size is a
-        // hint (a WM may still force-tile), but it keeps the window floating
-        // on the ones that honour it; the dimension check in `evaluate`
-        // reports any breach as "window resized", not as pixel drift.
+        visible: false,
         resizable: false,
         // Engine-side lanes for every capture (blocklight ON for cave_interior's
         // emitter; a no-op for the emitter-free shots). Process-global — one
@@ -336,6 +334,22 @@ struct Stage {
     /// captured with the wrong far-field filler. Threaded into [`Game::scripted`].
     render: crate::render_config::RenderConfig,
     kind: StageKind,
+}
+
+impl Stage {
+    /// A stage at the world's default streaming radius — every site but the
+    /// stress-flight builder wants this.
+    fn new(
+        seed: u64,
+        cam: Option<CameraPose>,
+        day: f64,
+        view: DebugView,
+        setup: Option<fn(&mut Game)>,
+        render: crate::render_config::RenderConfig,
+        kind: StageKind,
+    ) -> Self {
+        Stage { seed, cam, day, view, setup, radius: None, render, kind }
+    }
 }
 
 enum StageKind {
@@ -491,6 +505,8 @@ pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
             day: SCRIPTED_DEFAULT_DAY,
             view: DebugView::Normal,
             setup: None,
+            // The one site that needs a non-default radius, so it stays a
+            // plain literal rather than `Stage::new` + an override.
             radius: Some(s.radius),
             render: crate::render_config::RenderConfig::golden(),
             kind: StageKind::StressFlight {
@@ -561,49 +577,47 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
     }
     let mut stages: Vec<Stage> = entry_seeds
         .into_iter()
-        .map(|seed| Stage {
-            seed,
-            cam: None,
-            day: SCRIPTED_DEFAULT_DAY,
-            view: DebugView::Normal,
-            setup: None,
-            radius: None,
-            render: crate::render_config::RenderConfig::golden(),
-            kind: StageKind::EntryTime,
+        .map(|seed| {
+            Stage::new(
+                seed,
+                None,
+                SCRIPTED_DEFAULT_DAY,
+                DebugView::Normal,
+                None,
+                crate::render_config::RenderConfig::golden(),
+                StageKind::EntryTime,
+            )
         })
         .collect();
     for c in &acc.criteria {
         match c {
-            Criterion::ImageMatch { shot, .. } => stages.push(Stage {
-                seed: shot.seed,
-                cam: Some(shot.cam),
-                day: shot.day,
-                view: DebugView::Normal,
-                setup: shot.setup,
-                radius: None,
-                render: crate::render_config::RenderConfig::golden(),
-                kind: StageKind::Capture { path: image_capture_path(shot.name, bless) },
-            }),
-            Criterion::SkyHoleCount { shot, .. } => stages.push(Stage {
-                seed: shot.seed,
-                cam: Some(shot.cam),
-                day: shot.day,
-                view: DebugView::TerrainKey,
-                setup: shot.setup,
-                radius: None,
-                render: crate::render_config::RenderConfig::golden(),
-                kind: StageKind::Capture { path: scratch_path(shot.name, "terrainkey") },
-            }),
-            Criterion::FrameTime { shot, .. } => stages.push(Stage {
-                seed: shot.seed,
-                cam: Some(shot.cam),
-                day: shot.day,
-                view: DebugView::Normal,
-                setup: shot.setup,
-                radius: None,
-                render: crate::render_config::RenderConfig::golden(),
-                kind: StageKind::FrameSample { name: shot.name.to_string() },
-            }),
+            Criterion::ImageMatch { shot, .. } => stages.push(Stage::new(
+                shot.seed,
+                Some(shot.cam),
+                shot.day,
+                DebugView::Normal,
+                shot.setup,
+                crate::render_config::RenderConfig::golden(),
+                StageKind::Capture { path: image_capture_path(shot.name, bless) },
+            )),
+            Criterion::SkyHoleCount { shot, .. } => stages.push(Stage::new(
+                shot.seed,
+                Some(shot.cam),
+                shot.day,
+                DebugView::TerrainKey,
+                shot.setup,
+                crate::render_config::RenderConfig::golden(),
+                StageKind::Capture { path: scratch_path(shot.name, "terrainkey") },
+            )),
+            Criterion::FrameTime { shot, .. } => stages.push(Stage::new(
+                shot.seed,
+                Some(shot.cam),
+                shot.day,
+                DebugView::Normal,
+                shot.setup,
+                crate::render_config::RenderConfig::golden(),
+                StageKind::FrameSample { name: shot.name.to_string() },
+            )),
             Criterion::EntryTime { .. } | Criterion::NoProvisional { .. } => {}
         }
     }
@@ -1150,16 +1164,15 @@ pub fn time_to_first_full_render(seed: u64) -> Duration {
     // Standalone/contract path: drives its own single-`EntryTime`-stage `run`.
     // `golden` does NOT call this — it reads the number from `run_acceptance`'s
     // single pass — so the golden process still opens exactly one event loop.
-    let out = execute(vec![Stage {
+    let out = execute(vec![Stage::new(
         seed,
-        cam: None,
-        day: SCRIPTED_DEFAULT_DAY,
-        view: DebugView::Normal,
-        setup: None,
-        radius: None,
-        render: crate::render_config::RenderConfig::golden(),
-        kind: StageKind::EntryTime,
-    }]);
+        None,
+        SCRIPTED_DEFAULT_DAY,
+        DebugView::Normal,
+        None,
+        crate::render_config::RenderConfig::golden(),
+        StageKind::EntryTime,
+    )]);
     out.entry_times.get(&seed).copied().unwrap_or_default()
 }
 

@@ -146,6 +146,13 @@ impl HotTables {
     pub fn water(&self, id: BlockId) -> bool {
         self.flags[id.0 as usize] & FLAG_WATER != 0
     }
+
+    /// Acoustic absorption per metre (`0..=255`) for `id` — the occlusion
+    /// DDA's per-cell probe.
+    #[inline]
+    pub fn absorption(&self, id: BlockId) -> u8 {
+        self.absorption[id.0 as usize]
+    }
 }
 
 impl Default for HotTables {

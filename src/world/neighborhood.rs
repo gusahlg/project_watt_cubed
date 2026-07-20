@@ -23,23 +23,50 @@ const PAD_VOL: usize = PAD * PAD * PAD;
 /// (64 × 18³ × 2 B ≈ 0.7 MiB per type).
 const POOL_CAP: usize = 64;
 
-/// A cell type that owns a shared free list of halo buffers. A `static`
-/// cannot name a generic `T`, so the per-type pool lives behind this trait —
-/// one concrete monomorphic pool per implementor, keeping BlockId and Lumel
-/// free lists isolated. Generic recycle policy (cap, reuse) stays in the
-/// generic methods; an impl only hands out its pool. Written by `pooled_cell!`.
-pub trait Pooled: Copy + Send + 'static {
-    fn with_pool<R>(f: impl FnOnce(&mut Vec<Box<[Self]>>) -> R) -> R;
+/// A bounded cross-thread free list. `take` hands back a retired value or
+/// `None` (the caller allocates fresh — a miss never blocks); `put` keeps a
+/// value only while under `cap`, so the cap bounds RETAINED capacity, nothing
+/// else. Poison is swallowed: a sibling panic leaves the list usable. One
+/// invariant shared by the halo pools here and the mesh-output pool
+/// ([`pipeline::MeshOutput`](super::pipeline)).
+pub struct BoundedPool<T> {
+    free: Mutex<Vec<T>>,
+    cap: usize,
 }
 
-/// One `impl Pooled` = one cross-thread buffer free list for `$t`. The lock is
-/// held only for a `pop`/`push`, never across a fill.
+impl<T> BoundedPool<T> {
+    pub(in crate::world) const fn new(cap: usize) -> Self {
+        Self { free: Mutex::new(Vec::new()), cap }
+    }
+    pub(in crate::world) fn take(&self) -> Option<T> {
+        self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop()
+    }
+    pub(in crate::world) fn put(&self, item: T) {
+        let mut free = self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.len() < self.cap {
+            free.push(item);
+        }
+    }
+}
+
+/// A cell type that owns a shared free list of halo buffers. A `static`
+/// cannot name a generic `T`, so the per-type pool lives behind this trait —
+/// one concrete monomorphic [`BoundedPool`] per implementor, keeping BlockId
+/// and Lumel free lists isolated. Written by `pooled_cell!`.
+pub trait Pooled: Copy + Send + 'static {
+    fn pool() -> &'static BoundedPool<Box<[Self]>>;
+}
+
+/// One `impl Pooled` = one cross-thread buffer free list for `$t`.
 macro_rules! pooled_cell {
     ($t:ty) => {
         impl $crate::world::neighborhood::Pooled for $t {
-            fn with_pool<R>(f: impl FnOnce(&mut Vec<Box<[$t]>>) -> R) -> R {
-                static POOL: Mutex<Vec<Box<[$t]>>> = Mutex::new(Vec::new());
-                f(&mut POOL.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+            fn pool() -> &'static $crate::world::neighborhood::BoundedPool<Box<[$t]>> {
+                static POOL: $crate::world::neighborhood::BoundedPool<Box<[$t]>> =
+                    $crate::world::neighborhood::BoundedPool::new(
+                        $crate::world::neighborhood::POOL_CAP,
+                    );
+                &POOL
             }
         }
     };
@@ -84,7 +111,8 @@ impl<T: Pooled> Neighborhood<T> {
     /// UNSPECIFIED — a recycled buffer holds a previous job's cells — so every
     /// caller must fully overwrite it before reading back.
     fn take_buf(seed: T) -> Box<[T]> {
-        T::with_pool(|p| p.pop())
+        T::pool()
+            .take()
             .filter(|b| b.len() == PAD_VOL)
             .unwrap_or_else(|| vec![seed; PAD_VOL].into_boxed_slice())
     }
@@ -215,11 +243,7 @@ impl<T: Pooled> Drop for Neighborhood<T> {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.buf);
         if buf.len() == PAD_VOL {
-            T::with_pool(|p| {
-                if p.len() < POOL_CAP {
-                    p.push(buf);
-                }
-            });
+            T::pool().put(buf);
         }
     }
 }

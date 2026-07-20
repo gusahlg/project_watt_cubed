@@ -184,6 +184,7 @@ impl App {
             render_scale: app.settings.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
+            visible: true,
             // Engine-side render lanes from the persisted settings (the single
             // source; the world's own occlusion/lod2 lanes come from the same
             // `Settings::render_config` at world entry).
@@ -464,7 +465,8 @@ impl App {
             Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
         };
         self.mods.reset_state();
-        match save::load_with_config(&id, &mut self.mods, self.settings.render_config()) {
+        let render = self.settings.render_config();
+        match save::load(&id, &mut self.mods, |seed| World::with_config_lazy(seed, render)) {
             Ok((world, player, meta, report)) => {
                 self.active = Some(ActiveSlot::new(id.clone(), meta));
                 let mut game = Game::new(world, player, id.as_str().to_string());

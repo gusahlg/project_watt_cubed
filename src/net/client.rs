@@ -15,8 +15,8 @@ use quinn::{Endpoint, SendStream};
 use tokio::runtime::Runtime;
 use voxel_engine::DVec3;
 
-use crate::net::protocol::{self, ClientMessage, ServerMessage};
-use crate::net::{MAX_CHAT, MAX_SPEC, MAX_VOICE_PAYLOAD, PROTOCOL_VERSION, quic};
+use crate::net::protocol::{self, ClientMessage, ServerMessage, VoicePayload};
+use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,7 +29,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 const VOICE_RING_CAP: usize = 64;
 
 /// `(speaker id, epoch, seq, opus payload)`.
-type VoiceFrame = (u32, u32, u32, Vec<u8>);
+type VoiceFrame = (u32, u32, u32, VoicePayload);
 
 /// Snapshotted so we can interpolate between two.
 #[derive(Clone, Copy)]
@@ -505,10 +505,8 @@ impl Connection {
     /// throttled — capture already paces frames. An over-cap payload is
     /// dropped rather than sent; capture never produces one.
     pub fn send_voice(&mut self, seq: u32, payload: &[u8]) {
-        if payload.len() > MAX_VOICE_PAYLOAD {
-            return;
-        }
-        self.dispatch(&ClientMessage::Voice { seq, payload: payload.to_vec() });
+        let Ok(payload) = VoicePayload::try_from(payload.to_vec()) else { return };
+        self.dispatch(&ClientMessage::Voice { seq, payload });
     }
 
     /// Frames that overran the ring were already dropped (oldest first).
@@ -540,19 +538,22 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Keep the runtime alive until quinn has actually sent the
-        // CONNECTION_CLOSE, so the server frees this player promptly instead
-        // of waiting out its idle timeout — otherwise the reader thread
-        // unblocks and drops the last runtime ref before the close frame goes
-        // out. Bounded so leaving a world never hitches for long.
-        self.conn.close(0u32.into(), b"bye");
-        // `wait_idle` drives the endpoint driver until the close frame is
-        // actually sent (unlike `closed()`, which resolves before transmit).
-        let endpoint = self.endpoint.clone();
-        let _ = self
-            .rt
-            .block_on(async move { tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await });
+        graceful_close(&self.conn, &self.endpoint, &self.rt);
     }
+}
+
+/// Sends `CONNECTION_CLOSE` and blocks until quinn has actually transmitted
+/// it, so the peer frees this connection promptly instead of waiting out its
+/// idle timeout. The one place this lives — [`Connection::drop`] and any
+/// other graceful QUIC shutdown (e.g. a test driving raw `quinn::Connection`s
+/// below the app handshake) calls this instead of re-deriving it. Bounded so
+/// a caller never hitches for long.
+pub(crate) fn graceful_close(conn: &quinn::Connection, endpoint: &Endpoint, rt: &Runtime) {
+    conn.close(0u32.into(), b"bye");
+    // `wait_idle` waits for the close frame to actually send, unlike
+    // `closed()`, which resolves before transmit.
+    let endpoint = endpoint.clone();
+    let _ = rt.block_on(async move { tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await });
 }
 
 #[cfg(test)]

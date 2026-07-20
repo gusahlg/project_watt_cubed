@@ -5,12 +5,15 @@
 
 use crate::ident::{BlockState, Detail};
 
-/// A brick: 16³ cells at `level`. World extent = 16·2^level.
+/// A brick: 16³ cells at `level`. World extent = 16·2^level. The payload
+/// packing is a type parameter: sections use the full [`BrickPayload`]
+/// (default), chunks the Rle-free [`ChunkPayload`], so "an Rle chunk" is
+/// unrepresentable rather than a guarded-against runtime state.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Brick {
+pub struct Brick<P = BrickPayload> {
     pub level: Detail,
     pub rev: voxel_engine::Rev,
-    pub payload: BrickPayload,
+    pub payload: P,
 }
 
 /// Brick edge length: frozen — every payload variant and cross-chunk seam
@@ -130,6 +133,19 @@ pub enum BrickPayload {
     Dense(Box<[BlockState]>),
     // Per-face payloads deliberately excluded: this is the one traversal
     // structure, not one of several parallel representations.
+}
+
+/// A chunk's payload — the k=0 [`Brick`]'s packing: `Uniform`/`Paletted`/
+/// `Dense` only. The vertical-run [`BrickPayload::Rle`] variant is a section
+/// concern, absent here so chunk code needs no dead match arm for a state it
+/// can never hold — field-identical to the three shared [`BrickPayload`]
+/// variants, so storage stays byte-for-byte what it always was; only the
+/// unreachable fourth case is gone.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ChunkPayload {
+    Uniform(BlockState),
+    Paletted { palette: Box<[BlockState]>, cells: Box<[u8]> },
+    Dense(Box<[BlockState]>),
 }
 
 impl BrickPayload {

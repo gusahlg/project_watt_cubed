@@ -12,7 +12,7 @@ use crate::avatar::Pose;
 use crate::block::AIR;
 use crate::camera::{CameraMode, FlyAxes, GameCamera, ViewPose};
 use crate::command;
-use crate::derived::Memo;
+use crate::derived::{Memo, Revision};
 use crate::harness::{CameraPose, DebugView};
 use crate::console::{self, Console};
 use crate::ui::{self, Anchor, HudMode, Theme};
@@ -189,9 +189,9 @@ pub struct Game {
     local_anim: presence::Animator,
     /// The local walk-cycle phase, accumulated from horizontal travel, same as a peer's.
     local_gait: f64,
-    /// Cached HUD coordinate line: the displayed values change far less often
-    /// than the frame rate, so the format!/measure pair runs only on change.
-    coord_cache: (i64, i64, i64, String),
+    /// Cached HUD coordinate line, keyed by the 0.1-block-quantized position —
+    /// `format!` reruns only when the quantized position changes.
+    coord_cache: Memo<[i64; 3], String>,
     /// In-world UI look and HUD visibility (see [`ui::Theme`]).
     theme: Theme,
     /// Day/night clock, atmosphere colour, weather, and the lighting edge into
@@ -271,11 +271,17 @@ pub struct Game {
     /// `Camera3D` by (yaw, pitch, roll, fovy) bits; the f64 eye stays outside
     /// so pure translation reuses the orientation basis.
     camera_cache: Memo<[u32; 4], Camera3D>,
-    /// Clock sample by day value; day/night off pins fixed noon.
+    /// Clock sample by day value; day/night off pins fixed noon. Pure in the
+    /// day value (sun geometry only), so it needs no revision.
     sky_frame_cache: Memo<u64, SkyFrame>,
-    /// Composed lighting packet + clear colour by day value, valid only while
-    /// weather/clouds/water-anim/exposure are all disabled.
-    static_frame_cache: Memo<u64, StaticFrame>,
+    /// Bumped whenever render config or palette changes — the single stamp
+    /// every render-dependent frame cache folds into its key, so a stale packet
+    /// is a key mismatch the compiler enforces rather than a forgotten
+    /// `invalidate` at each mutation site.
+    content_rev: Revision,
+    /// Composed lighting packet + clear colour, keyed by `(day, content_rev)`
+    /// and valid only while weather/clouds/water-anim/exposure are all disabled.
+    static_frame_cache: Memo<(u64, u64), StaticFrame>,
     /// Wrapped camera-XZ animation coordinates by eye XZ bits.
     anim_uv_cache: Memo<[u64; 2], [f32; 2]>,
     /// FPS label by displayed integer, refreshed at [`FPS_LABEL_INTERVAL`].
@@ -321,7 +327,7 @@ impl Game {
             pending_edits: std::collections::HashMap::new(),
             local_anim: presence::Animator::default(),
             local_gait: 0.0,
-            coord_cache: (i64::MIN, i64::MIN, i64::MIN, String::new()),
+            coord_cache: Memo::new(),
             theme: Theme::new(),
             sky: Sky::new(),
             // Constructed present so scripted/harness games keep the full
@@ -350,6 +356,7 @@ impl Game {
             name_tags: true,
             camera_cache: Memo::new(),
             sky_frame_cache: Memo::new(),
+            content_rev: Revision::default(),
             static_frame_cache: Memo::new(),
             anim_uv_cache: Memo::new(),
             fps_cache: Memo::new(),
@@ -380,8 +387,13 @@ impl Game {
     /// Pushed at world entry and on each in-game `/gfx` edit to adopt new render config.
     pub fn set_render_config(&mut self, render: crate::render_config::RenderConfig) {
         self.render = render;
-        self.static_frame_cache.invalidate();
-        self.sky_frame_cache.invalidate();
+        self.bump_content_rev();
+    }
+
+    /// Retire every render-dependent frame cache in one stamp bump. The single
+    /// place render config or palette changes announce themselves.
+    fn bump_content_rev(&mut self) {
+        self.content_rev.0 = self.content_rev.0.wrapping_add(1);
     }
 
     /// Push every live-applicable setting into this game: engine values, the
@@ -402,15 +414,10 @@ impl Game {
         self.world.set_lighting(settings.lighting, eng);
         self.world.set_ao(settings.ao, eng);
         self.render = render;
-        self.static_frame_cache.invalidate();
-        self.sky_frame_cache.invalidate();
+        self.bump_content_rev();
 
         self.theme.scale = settings.ui_scale;
-        self.theme.hud = match settings.hud_mode {
-            crate::settings::HUD_OFF => HudMode::Off,
-            crate::settings::HUD_MINIMAL => HudMode::Minimal,
-            _ => HudMode::Full,
-        };
+        self.theme.hud = settings.hud_mode;
 
         self.stream_gate.set_hz(settings.stream_hz);
         self.physics_gate.set_hz(settings.physics_hz);
@@ -430,7 +437,7 @@ impl Game {
         }
 
         let mod_ui_will_be_active =
-            settings.mod_logic && settings.mod_hud && self.theme.hud.shows_mod_hud();
+            mod_ui_active(settings.mod_logic, settings.mod_hud, self.theme.hud);
         if mod_ui_will_be_active {
             // If visibility is restored before the next frame, the overlay is
             // visible again and does not need to be force-closed.
@@ -452,7 +459,7 @@ impl Game {
     /// input. Keeping one predicate for routing and Escape prevents invisible
     /// overlays when either the mod lane or the master HUD is disabled.
     fn mod_ui_active(&self) -> bool {
-        self.mod_logic && self.mod_hud && self.theme.hud.shows_mod_hud()
+        mod_ui_active(self.mod_logic, self.mod_hud, self.theme.hud)
     }
 
     /// The mod UI just became invisible: force-close any open overlay once and
@@ -499,7 +506,7 @@ impl Game {
     /// Swap the atmosphere colour table.
     pub fn set_palette(&mut self, palette: crate::sky::Palette) {
         self.sky.atmosphere.palette = palette;
-        self.static_frame_cache.invalidate();
+        self.bump_content_rev();
     }
 
     /// Attach a server connection, turning this into a multiplayer session.
@@ -760,11 +767,7 @@ impl Game {
             self.theme.cycle_hud();
             // The HUD hotkey and the settings row edit the same state; sync it
             // back (marking Custom) so the menu, `/gfx`, and persistence agree.
-            settings.hud_mode = match self.theme.hud {
-                HudMode::Off => crate::settings::HUD_OFF,
-                HudMode::Minimal => crate::settings::HUD_MINIMAL,
-                HudMode::Full => crate::settings::HUD_FULL,
-            };
+            settings.hud_mode = self.theme.hud;
             settings.mark_custom();
             settings.save();
             if mod_ui_was_active && !self.mod_ui_active() {
@@ -1395,7 +1398,10 @@ impl Game {
             && !self.render.exposure;
         let (mut frame_uniforms, cached_clear) = if cacheable_frame {
             let render = &self.render;
-            let cached = self.static_frame_cache.get_or(sky_day.to_bits(), || {
+            // (day, content_rev): any render/palette change bumps the stamp, so
+            // the freeze predicate's own inputs invalidate the entry structurally.
+            let key = (sky_day.to_bits(), self.content_rev.0);
+            let cached = self.static_frame_cache.get_or(key, || {
                 let snapshot = crate::frame_snapshot::compose_at(
                     sky, sky_frame, pose.eye, anim_uv, exposure, render,
                 );
@@ -1406,7 +1412,6 @@ impl Game {
             });
             (cached.uniforms, Some(cached.clear))
         } else {
-            self.static_frame_cache.invalidate();
             let snapshot = crate::frame_snapshot::compose_at(
                 sky, sky_frame, pose.eye, anim_uv, exposure, &self.render,
             );
@@ -1444,11 +1449,8 @@ impl Game {
         }
         let p = self.player.position;
         // 0.1-block display resolution: only re-format when a shown digit moves.
-        let key = ((p.x * 10.0) as i64, (p.y * 10.0) as i64, (p.z * 10.0) as i64);
-        if (key.0, key.1, key.2) != (self.coord_cache.0, self.coord_cache.1, self.coord_cache.2) {
-            let text = format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z);
-            self.coord_cache = (key.0, key.1, key.2, text);
-        }
+        let key = [(p.x * 10.0) as i64, (p.y * 10.0) as i64, (p.z * 10.0) as i64];
+        self.coord_cache.get_or(key, || format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z));
         // Scripted (harness) frames pin the readout: a live FPS number is the
         // one nondeterministic pixel region in an otherwise reproducible shot,
         // and golden diffs must only ever see real rendering drift. Live FPS is
@@ -1577,7 +1579,9 @@ impl Game {
         // Informational HUD text: coords, help, FPS, player count. Full mode
         // only — read from the `Game`-side caches `refresh_hud_text` maintains.
         if theme.hud.shows_info() {
-            ui::label(f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), &self.coord_cache.3);
+            if let Some(coord_text) = self.coord_cache.get() {
+                ui::label(f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), coord_text);
+            }
             if let Some(fps_text) = self.fps_cache.get() {
                 ui::label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
             }
@@ -1696,6 +1700,13 @@ struct PeerTag {
     alpha: f32,
     /// Refcount bump of the connection's interned name, never a fresh String.
     name: std::sync::Arc<str>,
+}
+
+/// Whether a mod-supplied modal can both be seen and receive input. Free over
+/// its inputs so the live predicate and the would-be-applied check in
+/// `apply_settings` share one rule instead of restating it.
+fn mod_ui_active(mod_logic: bool, mod_hud: bool, hud: HudMode) -> bool {
+    mod_logic && mod_hud && hud.shows_mod_hud()
 }
 
 /// The world-space centre of a voxel cell (occurrence position).

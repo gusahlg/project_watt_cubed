@@ -18,7 +18,7 @@
 //! culled) is by failing to reach a visible chunk. Reaching extra chunks only
 //! weakens the cull. So this implementation is deliberately permissive: it reaches
 //! at least every visible chunk. Tighter optimizations are deferred.
-use super::brick::BrickPayload;
+use super::brick::ChunkPayload;
 use super::chunk::{CHUNK_VOLUME, Chunk};
 use super::{FastMap, FastSet};
 use crate::block::registry::BlockId;
@@ -77,17 +77,16 @@ impl Connectivity {
     pub fn compute(chunk: &Chunk, blocks_sight: impl Fn(BlockId) -> bool) -> Connectivity {
         match &chunk.data().payload {
             // Uniform chunks need no scan: opaque seals everything, see-through opens it.
-            BrickPayload::Uniform(v) => {
+            ChunkPayload::Uniform(v) => {
                 if blocks_sight(v.id) { Self::SEALED } else { Self::OPEN }
             }
             // One classify per palette entry up front; the fill then reads a
             // bool per cell instead of re-classifying ids.
-            BrickPayload::Paletted { palette, cells } => {
+            ChunkPayload::Paletted { palette, cells } => {
                 let sight: Vec<bool> = palette.iter().map(|s| blocks_sight(s.id)).collect();
                 Self::flood(|i| !sight[cells[i] as usize])
             }
-            BrickPayload::Dense(cells) => Self::flood(|i| !blocks_sight(cells[i].id)),
-            BrickPayload::Rle { .. } => unreachable!("chunks never construct Rle payloads (PackStrategy::Paletted only)"),
+            ChunkPayload::Dense(cells) => Self::flood(|i| !blocks_sight(cells[i].id)),
         }
     }
 

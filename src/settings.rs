@@ -21,6 +21,7 @@ use std::path::Path;
 use voxel_engine::Engine;
 
 use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, max_lod_levels};
+use crate::ui::HudMode;
 
 pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RADIUS_RANGE};
 /// Render-resolution scale clamp range — re-exported from the engine, which owns
@@ -39,25 +40,56 @@ pub const UI_SCALE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
 
 pub const SHAKE_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
-// Performance-profile markers (see [`Settings::preset`]).
-pub const PRESET_CUSTOM: u8 = 0;
-pub const PRESET_MINIMUM: u8 = 1;
-pub const PRESET_FAST: u8 = 2;
-pub const PRESET_DEFAULT: u8 = 3;
+/// Performance profile marker. Editing any profile-owned setting drops this to
+/// [`Preset::Custom`]; choosing a profile applies it atomically. Personal
+/// controls never touch it. Persisted by its stable [`Preset::code`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Preset {
+    Custom,
+    Minimum,
+    Fast,
+    Default,
+}
 
-// HUD visibility modes (see [`Settings::hud_mode`]).
-pub const HUD_OFF: u8 = 0;
-pub const HUD_MINIMAL: u8 = 1;
-pub const HUD_FULL: u8 = 2;
+impl Preset {
+    /// Stable persistence/console code (`Custom=0, Minimum=1, Fast=2, Default=3`).
+    pub fn code(self) -> u8 {
+        match self {
+            Preset::Custom => 0,
+            Preset::Minimum => 1,
+            Preset::Fast => 2,
+            Preset::Default => 3,
+        }
+    }
+
+    /// Parse a persisted code or a console word; the single source `/gfx`,
+    /// persistence `read`, and benchmark startup fold through.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "custom" | "0" => Some(Preset::Custom),
+            "minimum" | "min" | "1" => Some(Preset::Minimum),
+            "fast" | "2" => Some(Preset::Fast),
+            "default" | "3" => Some(Preset::Default),
+            _ => None,
+        }
+    }
+
+    /// Capitalized display name for the menu row and confirm line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Preset::Custom => "Custom",
+            Preset::Minimum => "Minimum",
+            Preset::Fast => "Fast",
+            Preset::Default => "Default",
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
-    /// Performance profile marker. Editing any individual profile-owned
-    /// setting changes this to [`PRESET_CUSTOM`] (see [`Setting::step`] /
-    /// [`Setting::parse_human`]); choosing another profile applies it
-    /// atomically. Personal controls (fullscreen, FOV, UI/menu scale, shake,
-    /// audio) never touch it.
-    pub preset: u8,
+    /// Performance profile marker (see [`Preset`] and [`Setting::step`] /
+    /// [`Setting::parse_human`]).
+    pub preset: Preset,
     pub fullscreen: bool,
     pub vsync: bool,
     /// MSAA sample count: 1 (off), 2, 4 or 8. Clamped to hardware support on apply.
@@ -113,8 +145,8 @@ pub struct Settings {
     pub mod_logic: bool,
     /// Periodically persist world edits while playing.
     pub autosave: bool,
-    /// HUD visibility: [`HUD_OFF`], [`HUD_MINIMAL`], or [`HUD_FULL`].
-    pub hud_mode: u8,
+    /// HUD visibility. Persisted by its stable [`HudMode::code`].
+    pub hud_mode: HudMode,
     pub minimap: bool,
     pub mod_hud: bool,
     pub player_models: bool,
@@ -172,7 +204,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            preset: PRESET_DEFAULT,
+            preset: Preset::Default,
             fullscreen: false,
             vsync: false,
             msaa: 1,
@@ -195,7 +227,7 @@ impl Default for Settings {
             simulation: true,
             mod_logic: true,
             autosave: true,
-            hud_mode: HUD_FULL,
+            hud_mode: HudMode::Full,
             minimap: true,
             mod_hud: true,
             player_models: true,
@@ -331,30 +363,39 @@ impl Setting {
     /// Apply one menu Left/Right step (`dir` = -1 or +1), wrapping at the ends.
     /// A profile-owned value that actually changes marks the state Custom.
     pub fn step(&self, s: &mut Settings, dir: i32) {
-        let before = s.clone();
+        let before = self.owned_value(s);
         (self.step)(s, dir);
-        self.note_custom(s, &before);
+        self.note_custom(s, before);
     }
 
     /// Parse a `/gfx` value and clamp. Returns whether the value parsed.
     /// A profile-owned value that actually changes marks the state Custom.
     pub fn parse_human(&self, s: &mut Settings, value: &str) -> bool {
-        let before = s.clone();
+        let before = self.owned_value(s);
         let parsed = (self.parse_human)(s, value);
         if parsed {
-            self.note_custom(s, &before);
+            self.note_custom(s, before);
         }
         parsed
     }
 
-    /// The one place the "editing an individual field marks Custom" rule
-    /// lives, so no UI surface has to remember it. The preset row applies its
-    /// own marker; personal controls (fullscreen, FOV, UI/menu scale, shake,
-    /// audio) are not profile-owned and never touch it. Persistence `read`
+    /// This field's serialized value, but only when it is profile-owned —
+    /// `None` for personal controls. Scopes the change check to the one field
+    /// instead of the whole-`Settings` clone + compare it used to run per edit.
+    fn owned_value(&self, s: &Settings) -> Option<String> {
+        Settings::PROFILE_OWNED_KEYS.contains(&self.key).then(|| (self.write)(s))
+    }
+
+    /// The one place the "editing a field marks Custom" rule lives, so no UI
+    /// surface has to remember it. The preset row applies its own marker;
+    /// personal controls (fullscreen, FOV, UI/menu scale, shake, audio) are
+    /// not profile-owned, so this is a no-op for them. Persistence `read`
     /// deliberately bypasses this — loading restores the saved marker.
-    fn note_custom(&self, s: &mut Settings, before: &Settings) {
-        if *s != *before && Settings::PROFILE_OWNED_KEYS.contains(&self.key) {
-            s.preset = PRESET_CUSTOM;
+    fn note_custom(&self, s: &mut Settings, before: Option<String>) {
+        if let Some(before) = before
+            && (self.write)(s) != before
+        {
+            s.preset = Preset::Custom;
         }
     }
 
@@ -501,8 +542,6 @@ macro_rules! rate_setting {
 /// The MSAA sample counts offered — one list shared by its stepper and its
 /// "round down to a supported count" clamp bucket.
 const MSAA: &[i32] = &[1, 2, 4, 8];
-const PRESETS: &[i32] =
-    &[PRESET_CUSTOM as i32, PRESET_MINIMUM as i32, PRESET_FAST as i32, PRESET_DEFAULT as i32];
 const STREAM_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
 const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 const SKY_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
@@ -519,18 +558,26 @@ pub const SETTINGS: [Setting; 52] = [
         aliases: &["profile"],
         label: "Performance Preset",
         usage: "preset custom|minimum|fast|default",
-        confirm: |s| format!("performance preset {}", preset_name(s.preset).to_ascii_lowercase()),
-        show: |s| preset_name(s.preset).to_string(),
+        confirm: |s| format!("performance preset {}", s.preset.label().to_ascii_lowercase()),
+        show: |s| s.preset.label().to_string(),
         parse_human: Settings::select_preset,
         step: |s, d| {
-            let preset = cycle_list(PRESETS, s.preset as i32, d) as u8;
-            s.apply_preset(preset);
+            // Cycle by persisted code order (Custom→Minimum→Fast→Default).
+            let order = [Preset::Custom, Preset::Minimum, Preset::Fast, Preset::Default];
+            let code = cycle_list(&[0, 1, 2, 3], s.preset.code() as i32, d);
+            s.apply_preset(order[code as usize]);
         },
-        clamp: preset_clamp,
-        write: |s| s.preset.to_string(),
+        clamp: |_| {},
+        write: |s| s.preset.code().to_string(),
         // Loading restores the saved marker and every saved field independently;
         // it must not reapply a profile or turn later lines into Custom.
-        read: |s, v| set_parsed(&mut s.preset, v),
+        read: |s, v| match Preset::parse(v) {
+            Some(p) => {
+                s.preset = p;
+                true
+            }
+            None => false,
+        },
     },
     Setting {
         category: Category::Performance,
@@ -678,19 +725,31 @@ pub const SETTINGS: [Setting; 52] = [
         aliases: &["hud"],
         label: "HUD Mode",
         usage: "hud_mode off|minimal|full",
-        confirm: |s| format!("HUD {}", hud_name(s.hud_mode).to_ascii_lowercase()),
-        show: |s| hud_name(s.hud_mode).to_string(),
-        parse_human: |s, v| match parse_hud_mode(v) {
+        confirm: |s| format!("HUD {}", s.hud_mode.label().to_ascii_lowercase()),
+        show: |s| s.hud_mode.label().to_string(),
+        parse_human: |s, v| match HudMode::parse(v) {
             Some(mode) => {
                 s.hud_mode = mode;
                 true
             }
             None => false,
         },
-        step: |s, d| s.hud_mode = cycle_list(&[0, 1, 2], s.hud_mode as i32, d) as u8,
-        clamp: hud_mode_clamp,
-        write: |s| s.hud_mode.to_string(),
-        read: |s, v| set_parsed(&mut s.hud_mode, v),
+        step: |s, d| {
+            // Cycle by the persisted code order (Off→Minimal→Full), unchanged
+            // from the pre-enum `[0,1,2]` stepper.
+            let modes = [HudMode::Off, HudMode::Minimal, HudMode::Full];
+            let code = cycle_list(&[0, 1, 2], s.hud_mode.code() as i32, d);
+            s.hud_mode = modes[code as usize];
+        },
+        clamp: |_| {},
+        write: |s| s.hud_mode.code().to_string(),
+        read: |s, v| match HudMode::parse(v) {
+            Some(mode) => {
+                s.hud_mode = mode;
+                true
+            }
+            None => false,
+        },
     },
     toggle_setting!(Category::Performance, simulation, "simulation", "Simulation", &["sim"]),
     toggle_setting!(Category::Performance, mod_logic, "mod_logic", "Mod Updates", &["mods"]),
@@ -1028,80 +1087,61 @@ profile_owned!(
 impl Settings {
     /// Record that an individual setting no longer matches a named profile.
     pub fn mark_custom(&mut self) {
-        self.preset = PRESET_CUSTOM;
+        self.preset = Preset::Custom;
     }
 
     /// Apply a named/numeric performance profile. Shared by `/gfx`, the menu,
     /// and reproducible benchmark startup (`WATT_BENCH_PRESET`).
     pub fn select_preset(&mut self, value: &str) -> bool {
-        let Some(preset) = parse_preset(value) else {
+        let Some(preset) = Preset::parse(value) else {
             return false;
         };
         self.apply_preset(preset);
         true
     }
 
-    fn apply_preset(&mut self, preset: u8) {
-        let preset = preset.min(PRESET_DEFAULT);
-        if preset == PRESET_CUSTOM {
+    fn apply_preset(&mut self, preset: Preset) {
+        if preset == Preset::Custom {
             self.mark_custom();
             return;
         }
 
-        let mut profile = Self::default();
-        match preset {
-            PRESET_MINIMUM => {
-                profile.vsync = false;
-                profile.msaa = 1;
-                profile.render_distance = 0;
-                profile.render_scale = 0.25;
-                profile.lighting = false;
-                profile.vertical_distance = 1;
-                profile.lod_levels = 1;
-                profile.lod_detail = 6;
-                profile.stream_hz = 15;
-                profile.physics_hz = 30;
-                profile.sky_hz = 15;
-                profile.mod_hz = 15;
-                profile.simulation = false;
-                profile.mod_logic = false;
-                profile.autosave = false;
-                profile.hud_mode = HUD_OFF;
-                profile.minimap = false;
-                profile.mod_hud = false;
-                profile.player_models = false;
-                profile.name_tags = false;
-                disable_costly_lanes(&mut profile);
-                profile.lod2 = false;
-            }
-            PRESET_FAST => {
-                profile.vsync = false;
-                profile.msaa = 1;
-                profile.render_distance = 3;
-                profile.render_scale = 0.5;
-                profile.lighting = false;
-                profile.vertical_distance = 2;
-                profile.lod_levels = 3;
-                profile.lod_detail = 4;
-                profile.stream_hz = 60;
-                profile.physics_hz = 60;
-                profile.sky_hz = 60;
-                profile.mod_hz = 60;
-                profile.simulation = true;
-                profile.autosave = true;
-                profile.hud_mode = HUD_MINIMAL;
-                profile.minimap = false;
-                profile.mod_hud = false;
-                profile.player_models = true;
-                profile.name_tags = false;
-                disable_costly_lanes(&mut profile);
-                profile.lod2 = true;
-            }
-            PRESET_DEFAULT => {}
-            _ => unreachable!("preset was clamped above"),
-        }
+        // Each profile is a diffable override literal over `stripped()` (the
+        // default with the costly lanes off); only the perf/gameplay fields and
+        // `lod2` differ, so a glance shows exactly what a profile changes. Fast
+        // omits `mod_logic`, keeping the default (mods stay live).
+        let profile = match preset {
+            Preset::Minimum => Settings {
+                vsync: false, msaa: 1, render_distance: 0, render_scale: 0.25, lighting: false,
+                vertical_distance: 1, lod_levels: 1, lod_detail: 6,
+                stream_hz: 15, physics_hz: 30, sky_hz: 15, mod_hz: 15,
+                simulation: false, mod_logic: false, autosave: false,
+                hud_mode: HudMode::Off, minimap: false, mod_hud: false,
+                player_models: false, name_tags: false, lod2: false,
+                ..Self::stripped()
+            },
+            Preset::Fast => Settings {
+                vsync: false, msaa: 1, render_distance: 3, render_scale: 0.5, lighting: false,
+                vertical_distance: 2, lod_levels: 3, lod_detail: 4,
+                stream_hz: 60, physics_hz: 60, sky_hz: 60, mod_hz: 60,
+                simulation: true, autosave: true,
+                hud_mode: HudMode::Minimal, minimap: false, mod_hud: false,
+                player_models: true, name_tags: false, lod2: true,
+                ..Self::stripped()
+            },
+            Preset::Default => Self::default(),
+            Preset::Custom => unreachable!("Custom returned early above"),
+        };
         self.copy_profile_values(&profile);
         self.preset = preset;
+    }
+
+    /// Default settings with every optional presentation lane stripped — the
+    /// shared base the Minimum and Fast profiles override.
+    fn stripped() -> Self {
+        let mut s = Self::default();
+        disable_costly_lanes(&mut s);
+        s
     }
 
     /// Load from disk, falling back to defaults for missing/invalid entries.
@@ -1243,50 +1283,6 @@ fn disable_costly_lanes(s: &mut Settings) {
     s.water_anim = false;
     s.ao = false;
     s.vignette = false;
-}
-
-fn preset_name(preset: u8) -> &'static str {
-    match preset {
-        PRESET_MINIMUM => "Minimum",
-        PRESET_FAST => "Fast",
-        PRESET_DEFAULT => "Default",
-        _ => "Custom",
-    }
-}
-
-fn parse_preset(value: &str) -> Option<u8> {
-    match value {
-        "custom" | "0" => Some(PRESET_CUSTOM),
-        "minimum" | "min" | "1" => Some(PRESET_MINIMUM),
-        "fast" | "2" => Some(PRESET_FAST),
-        "default" | "3" => Some(PRESET_DEFAULT),
-        _ => None,
-    }
-}
-
-fn preset_clamp(s: &mut Settings) {
-    s.preset = s.preset.min(PRESET_DEFAULT);
-}
-
-fn hud_name(mode: u8) -> &'static str {
-    match mode {
-        HUD_MINIMAL => "Minimal",
-        HUD_FULL => "Full",
-        _ => "Off",
-    }
-}
-
-fn parse_hud_mode(value: &str) -> Option<u8> {
-    match value {
-        "off" | "0" => Some(HUD_OFF),
-        "minimal" | "min" | "1" => Some(HUD_MINIMAL),
-        "full" | "2" => Some(HUD_FULL),
-        _ => None,
-    }
-}
-
-fn hud_mode_clamp(s: &mut Settings) {
-    s.hud_mode = s.hud_mode.min(HUD_FULL);
 }
 
 fn rate_name(rate: u32) -> String {
@@ -1691,7 +1687,7 @@ mod tests {
         s.cull_faces = true;
 
         assert!(preset.parse_human(&mut s, "minimum"));
-        assert_eq!(s.preset, PRESET_MINIMUM);
+        assert_eq!(s.preset, Preset::Minimum);
         assert_eq!(s.max_fps, 0, "a performance preset must remove an old cap");
         assert_eq!(s.render_scale, 0.25);
         assert_eq!((s.render_distance, s.vertical_distance), (0, 1));
@@ -1699,7 +1695,7 @@ mod tests {
         assert_eq!((s.lod_levels, s.lod_detail), (1, 6));
         assert_eq!(lod_range_metres(&s), 32, "zero near radius keeps one LOD unit");
         assert_eq!((s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz), (15, 30, 15, 15));
-        assert_eq!(s.hud_mode, HUD_OFF);
+        assert_eq!(s.hud_mode, HudMode::Off);
         assert!(!s.simulation && !s.mod_logic && !s.autosave);
         assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
         assert!(!s.lighting && !s.occlusion && !s.ao && !s.vrs);
@@ -1707,7 +1703,7 @@ mod tests {
         assert!(s.sunlight);
 
         assert!(preset.parse_human(&mut s, "fast"));
-        assert_eq!(s.preset, PRESET_FAST);
+        assert_eq!(s.preset, Preset::Fast);
         assert_eq!(s.max_fps, 0);
         assert_eq!(s.render_scale, 0.5);
         assert_eq!((s.render_distance, s.vertical_distance), (3, 2));
@@ -1715,7 +1711,7 @@ mod tests {
         assert_eq!((s.lod_levels, s.lod_detail), (3, 4));
         assert_eq!(lod_range_metres(&s), 384);
         assert_eq!((s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz), (60, 60, 60, 60));
-        assert_eq!(s.hud_mode, HUD_MINIMAL);
+        assert_eq!(s.hud_mode, HudMode::Minimal);
         assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
         assert!(!s.minimap && !s.mod_hud && !s.name_tags);
 
@@ -1767,31 +1763,31 @@ mod tests {
 
         let mut s = Settings::default();
         assert!(preset.parse_human(&mut s, "fast"));
-        assert_eq!(s.preset, PRESET_FAST);
+        assert_eq!(s.preset, Preset::Fast);
         assert!(scale.parse_human(&mut s, "75"));
-        assert_eq!(s.preset, PRESET_CUSTOM);
+        assert_eq!(s.preset, Preset::Custom);
 
         assert!(preset.parse_human(&mut s, "fast"));
         assert!(!scale.parse_human(&mut s, "not-a-number"));
-        assert_eq!(s.preset, PRESET_FAST);
+        assert_eq!(s.preset, Preset::Fast);
         scale.step(&mut s, 1);
-        assert_eq!(s.preset, PRESET_CUSTOM);
+        assert_eq!(s.preset, Preset::Custom);
 
         // Personal controls are not profile-owned: editing them keeps the profile.
         let fov = SETTINGS.iter().find(|f| f.matches("fov")).unwrap();
         assert!(preset.parse_human(&mut s, "fast"));
         fov.step(&mut s, 1);
-        assert_eq!(s.preset, PRESET_FAST, "FOV is a personal control");
+        assert_eq!(s.preset, Preset::Fast, "FOV is a personal control");
 
         let mut loaded = Settings::default();
         loaded.parse_from("preset=2\nrender_scale=0.75\nautosave=false\n");
         loaded.clamp();
-        assert_eq!(loaded.preset, PRESET_FAST);
+        assert_eq!(loaded.preset, Preset::Fast);
         assert_eq!(loaded.render_scale, 0.75);
         assert!(!loaded.autosave);
 
         loaded.mark_custom();
-        assert_eq!(loaded.preset, PRESET_CUSTOM);
+        assert_eq!(loaded.preset, Preset::Custom);
     }
 
     #[test]

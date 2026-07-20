@@ -12,7 +12,7 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{LoadReport, encode_current, load, load_with_config, save, unix_now};
+pub use bridge::{LoadReport, encode_current, load, save, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
 pub use store::{Source, fresh_id, list};
 
@@ -179,7 +179,7 @@ mod tests {
 
         let mut fresh_mods = Mods::with_defaults();
         let (loaded_world, loaded_player, loaded_meta, report) =
-            load(&id, &mut fresh_mods).unwrap();
+            load(&id, &mut fresh_mods, World::new).unwrap();
 
         assert_eq!(loaded_world.seed(), 4242);
         assert_eq!(loaded_meta.seed, 4242, "seed is stamped into the header");
@@ -214,7 +214,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         save(&id, &world, &player, &mods, meta("far")).unwrap();
 
-        let (_, loaded, _, _) = load(&id, &mut mods).unwrap();
+        let (_, loaded, _, _) = load(&id, &mut mods, World::new).unwrap();
         assert_eq!(loaded.position.x.to_bits(), pos.x.to_bits());
         assert_eq!(loaded.position.y.to_bits(), pos.y.to_bits());
         assert_eq!(loaded.position.z.to_bits(), pos.z.to_bits());
@@ -233,7 +233,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         save(&id, &world, &player, &mods, meta("empty")).unwrap();
 
-        let (loaded_world, loaded_player, _, _) = load(&id, &mut mods).unwrap();
+        let (loaded_world, loaded_player, _, _) = load(&id, &mut mods, World::new).unwrap();
         assert_eq!(loaded_world.seed(), 1234);
         assert_eq!(loaded_player.position, DVec3::new(0.0, 40.0, 0.0));
         assert_eq!(loaded_world.edits().count(), 0);
@@ -253,7 +253,7 @@ mod tests {
         save(&id, &world, &player, &mods, meta("v2")).unwrap(); // rotates v1 to .bak
         fs::write(format!("saves/{id}.save"), b"NOPE not a save").unwrap();
 
-        let (loaded_world, _, loaded_meta, report) = load(&id, &mut mods).unwrap();
+        let (loaded_world, _, loaded_meta, report) = load(&id, &mut mods, World::new).unwrap();
         assert_eq!(report.source, Source::Backup);
         assert_eq!(loaded_meta.name, "v1");
         assert_eq!(loaded_world.block_at(1, 200, 1), AIR);
