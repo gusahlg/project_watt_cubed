@@ -20,13 +20,11 @@
 
 use std::time::Duration;
 
-use voxel_engine::producer::{
-    Budget, Cadence, Footprint, FootprintKey, Producer, Progress,
-};
+use voxel_engine::producer::{Budget, Cadence, Footprint, FootprintKey, Producer, Progress};
 
 use crate::sched::{Ctx, ManualHandle, Run, Scheduler};
 
-use super::{admit, pipeline, LightLane, MeshLane, SectionLane};
+use super::{Coord, LightLane, MeshLane, SectionLane, World, admit, pipeline};
 
 /// A CPU, `Cadence::Frame`, `Global`-footprint manifest — the shape every stream
 /// lane shares. `name` and `budget` (the pass's per-frame item cap, declarative)
@@ -46,11 +44,19 @@ fn stream_manifest(name: &'static str, budget: Budget) -> Producer {
 /// The per-frame admission deadline from the scheduler-provided budget — the one
 /// place a lane's `Budget::Millis` becomes a [`Deadline`](pipeline::Deadline),
 /// so the budget has a single definition (the manifest).
-fn deadline(budget: Budget) -> pipeline::Deadline {
+fn duration(budget: Budget) -> Duration {
     let Budget::Millis(ms) = budget else {
         unreachable!("streaming admission lanes declare Budget::Millis");
     };
-    pipeline::Deadline::from_budget(Duration::from_secs_f32(ms / 1000.0))
+    Duration::from_secs_f32(ms / 1000.0)
+}
+
+fn paced_deadline(world: &World, budget: Budget) -> pipeline::Deadline {
+    pipeline::Deadline::from_budget(world.stream_pacer.duration(duration(budget)))
+}
+
+fn stream_center(world: &World) -> Coord {
+    world.center.expect("stream lanes run after center is set")
 }
 
 /// Declares a `new` row's marker struct (docs attach to it); a `use` row's
@@ -151,10 +157,9 @@ stream_lanes! {
     /// Lands finished worker results (generate/mesh/light-apply); mesh upload
     /// to GPU is budgeted. CPU lane — needs the engine.
     drain: new DrainLane("drain", Budget::Millis(1.0))
-        => |ctx, _b| {
+        => |ctx, b| {
             let eng = ctx.eng.as_deref_mut().expect("drain is a CPU lane; eng required");
-            let apply = pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET);
-            ctx.world.drain_results(eng, apply);
+            ctx.world.drain_results(eng, duration(b));
             Progress::Idle
         },
     /// Column granularity (one job per `(cx,cz)` span) means this keeps its own
@@ -162,28 +167,32 @@ stream_lanes! {
     /// `admit` loop, but shares the one budget + forward-progress floor rule.
     generate: new GenerateLane("generate", Budget::Millis(2.0))
         => |ctx, b| {
-            let center = ctx.world.center.expect("generate runs after center is set");
-            ctx.world.request_region_data(center, deadline(b))
+            let center = stream_center(ctx.world);
+            let deadline = paced_deadline(ctx.world, b);
+            ctx.world.request_region_data(center, deadline)
         },
     /// Cross-chunk light settling admission (the `world::LightLane` marker).
     light_admit: use LightLane("light_admit", Budget::Millis(1.0))
         => |ctx, b| {
-            let center = ctx.world.center.expect("light-admit runs after center is set");
-            admit::<LightLane>(ctx.world, center, deadline(b));
+            let center = stream_center(ctx.world);
+            let deadline = paced_deadline(ctx.world, b);
+            admit::<LightLane>(ctx.world, center, deadline);
             Progress::Idle
         },
     /// Fresh full-res chunk meshing admission (the `world::MeshLane` marker).
     mesh_admit: use MeshLane("mesh_admit", Budget::Millis(2.0))
         => |ctx, b| {
-            let center = ctx.world.center.expect("mesh-admit runs after center is set");
-            admit::<MeshLane>(ctx.world, center, deadline(b));
+            let center = stream_center(ctx.world);
+            let deadline = paced_deadline(ctx.world, b);
+            admit::<MeshLane>(ctx.world, center, deadline);
             Progress::Idle
         },
     /// LOD2 column-section admission (the `world::SectionLane` marker).
     section_admit: use SectionLane("section_admit", Budget::Millis(1.0))
         => |ctx, b| {
-            let center = ctx.world.center.expect("section-admit runs after center is set");
-            admit::<SectionLane>(ctx.world, center, deadline(b));
+            let center = stream_center(ctx.world);
+            let deadline = paced_deadline(ctx.world, b);
+            admit::<SectionLane>(ctx.world, center, deadline);
             Progress::Idle
         },
 }

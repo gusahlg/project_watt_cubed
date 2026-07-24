@@ -46,8 +46,12 @@ pre-auth connections are bounded. Movement is plausibility-checked server-side
 may refuse via `--no-teleport`), and every edit is validated against reach,
 spec well-formedness, and the cell's current revision — racing edits resolve
 to exactly one winner and the loser's client rolls its prediction back.
-Traffic is **not** encrypted — host behind a VPN or trusted network if you
-need confidentiality on the wire.
+Traffic uses QUIC encrypted with TLS 1.3. The server currently generates a
+fresh self-signed certificate and clients accept any certificate, so server
+identity is **not authenticated**. Passive observers cannot read the traffic,
+but an active man-in-the-middle can impersonate the server and capture the
+application password. Use a trusted network or VPN until certificate pinning
+or trust-on-first-use is implemented.
 
 ## Graphics
 
@@ -85,3 +89,11 @@ testing the pure Nix package.
 
 On macOS, install MoltenVK and the Vulkan loader once (`brew install
 molten-vk vulkan-loader`) and use plain `cargo run --release`.
+
+## Licensing and contributions
+
+Project-owned software is licensed `AGPL-3.0-or-later`; project-owned art,
+audio, and documentation are licensed `CC-BY-SA-4.0`. Third-party material
+keeps its own compatible licence. See [LICENSE.md](LICENSE.md) for the complete
+matrix, [THIRD_PARTY.md](THIRD_PARTY.md) for provenance and notice handling,
+and [CONTRIBUTING.md](CONTRIBUTING.md) for DCO sign-off requirements.

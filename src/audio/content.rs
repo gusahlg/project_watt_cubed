@@ -3,13 +3,14 @@
 //! module constructs one, so possession proves the id was admitted at load.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use super::backend::StoredClip;
 use super::backend::{ClipId, ClipStore};
 use super::frame::OccurrenceId;
-use super::backend::StoredClip;
 
 // Response is owned by acoustics.rs (its fixed curves live there); re-exported
 // so callers referencing `content::Response` still resolve. Authored cues never
@@ -80,6 +81,14 @@ pub enum ClipMode {
     Loop,
 }
 
+// Catalog safety bounds. They are deliberately generous for effects while
+// excluding values that underflow playback rate, overflow wall-clock expiry, or
+// retain an inaudible one-shot for effectively forever.
+const MIN_PITCH_SEMITONES: f32 = -48.0;
+const MAX_PITCH_SEMITONES: f32 = 48.0;
+const MAX_DELAY_SECONDS: f32 = 60.0;
+const MAX_ONE_SHOT_SECONDS: f32 = 3_600.0;
+
 // Catalog internals: only consumed within the crate via `Catalog::cue` (pub(crate)),
 // so they carry crate-private fields (ClipId) without over-exposing them.
 pub(crate) struct Layer {
@@ -111,7 +120,11 @@ impl Catalog {
         clips: &mut dyn ClipStore,
     ) -> Result<(Self, CueSymbols), CatalogError> {
         let manifest_path = dir.join("catalog.toml");
-        let manifest = std::fs::read_to_string(&manifest_path).map_err(CatalogError::Io)?;
+        let manifest =
+            std::fs::read_to_string(&manifest_path).map_err(|source| CatalogError::Io {
+                path: manifest_path,
+                source,
+            })?;
         // A read failure names the path it tried so the error can point at the missing asset.
         let mut resolve = |name: &str| -> Result<Vec<u8>, PathBuf> {
             let p = dir.join(name);
@@ -146,6 +159,10 @@ impl Catalog {
         self.cues[raw as usize].mode
     }
 
+    pub(crate) fn response_of(&self, raw: u16) -> Response {
+        self.cues[raw as usize].response
+    }
+
     /// Core loader, split from `load` so tests drive it with an in-memory
     /// manifest and a mock file resolver (no filesystem, no real assets).
     pub(crate) fn from_manifest(
@@ -153,8 +170,8 @@ impl Catalog {
         resolve: &mut dyn FnMut(&str) -> Result<Vec<u8>, PathBuf>,
         clips: &mut dyn ClipStore,
     ) -> Result<(Self, CueSymbols), CatalogError> {
-        let root: toml::Value =
-            toml::from_str(manifest).map_err(|e| CatalogError::Manifest(format!("toml parse: {e}")))?;
+        let root: toml::Value = toml::from_str(manifest)
+            .map_err(|e| CatalogError::Manifest(format!("toml parse: {e}")))?;
         let cues_tbl = root
             .get("cues")
             .and_then(toml::Value::as_table)
@@ -169,8 +186,12 @@ impl Catalog {
 
         let mut cues = Vec::with_capacity(names.len());
         let mut symbols = BTreeMap::new();
+        // A clip referenced by several cues/layers is decoded and retained once.
+        // The normalized relative name is a stable key because unsafe aliases
+        // (`.`, `..`, absolute paths) are rejected before resolution.
+        let mut clip_cache: BTreeMap<String, StoredClip> = BTreeMap::new();
         for (index, (name, cue_val)) in names.into_iter().enumerate() {
-            let cue = parse_cue(name, cue_val, resolve, clips)?;
+            let cue = parse_cue(name, cue_val, resolve, clips, &mut clip_cache)?;
             cues.push(cue);
             symbols.insert(name.clone(), index as u16);
         }
@@ -201,7 +222,10 @@ impl CueSymbols {
 /// draws bit-for-bit (regression-pinned in the tests). Returns a bucket in
 /// `[0, n)`; range parameters map the bucket linearly at realization (mod.rs).
 pub(crate) fn draw(id: OccurrenceId, layer: u16, kind: DrawKind, n: u32) -> u32 {
-    debug_assert!(n >= 1, "draw n must be >= 1 (variant/param counts are load-checked)");
+    debug_assert!(
+        n >= 1,
+        "draw n must be >= 1 (variant/param counts are load-checked)"
+    );
     draw_raw(id, layer, kind) % n
 }
 
@@ -230,8 +254,12 @@ pub(crate) enum DrawKind {
 
 #[derive(Debug)]
 pub enum CatalogError {
-    Io(std::io::Error),
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Manifest(String),
+    UnsafePath(PathBuf),
     UnknownFile(PathBuf),
     EmptyCue(String),
     EmptyLayer(String),
@@ -239,7 +267,48 @@ pub enum CatalogError {
     MixedMode(String),
     TooManyCues,
     TooManyLayers(String),
+    TooManyVariants(String),
     Decode(String),
+    InvalidDuration(String),
+}
+
+impl fmt::Display for CatalogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(f, "could not read `{}`: {source}", path.display())
+            }
+            Self::Manifest(reason) => write!(f, "invalid catalog: {reason}"),
+            Self::UnsafePath(path) => {
+                write!(
+                    f,
+                    "asset path `{}` must be a safe relative path",
+                    path.display()
+                )
+            }
+            Self::UnknownFile(path) => write!(f, "catalog asset `{}` is missing", path.display()),
+            Self::EmptyCue(cue) => write!(f, "cue `{cue}` has no layers"),
+            Self::EmptyLayer(cue) => write!(f, "cue `{cue}` has a layer with no variants"),
+            Self::BadRange(reason) => write!(f, "invalid catalog range: {reason}"),
+            Self::MixedMode(cue) => write!(f, "cue `{cue}` mixes one-shot and loop layers"),
+            Self::TooManyCues => write!(f, "catalog contains more than {} cues", u16::MAX),
+            Self::TooManyLayers(cue) => write!(f, "cue `{cue}` contains more than 255 layers"),
+            Self::TooManyVariants(cue) => {
+                write!(f, "cue `{cue}` has a layer with more than 256 variants")
+            }
+            Self::Decode(reason) => write!(f, "audio clip decode failed: {reason}"),
+            Self::InvalidDuration(reason) => write!(f, "invalid audio clip duration: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CatalogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 // ---- loader interior (pure over the resolver + ClipStore) ----
@@ -249,6 +318,7 @@ fn parse_cue(
     val: &toml::Value,
     resolve: &mut dyn FnMut(&str) -> Result<Vec<u8>, PathBuf>,
     clips: &mut dyn ClipStore,
+    clip_cache: &mut BTreeMap<String, StoredClip>,
 ) -> Result<Cue, CatalogError> {
     let tbl = val
         .as_table()
@@ -272,7 +342,7 @@ fn parse_cue(
     let mut layers = Vec::with_capacity(layers_val.len());
     let mut clip_secs = Vec::with_capacity(layers_val.len()); // longest variant per layer
     for layer_val in layers_val {
-        let (layer, secs) = parse_layer(name, layer_val, resolve, clips)?;
+        let (layer, secs) = parse_layer(name, layer_val, resolve, clips, clip_cache)?;
         layers.push(layer);
         clip_secs.push(secs);
     }
@@ -297,6 +367,22 @@ fn parse_cue(
             })
             .fold(0.0_f32, f32::max),
     };
+    if matches!(mode, ClipMode::OneShot)
+        && (!max_duration.is_finite() || max_duration > MAX_ONE_SHOT_SECONDS)
+    {
+        return Err(CatalogError::InvalidDuration(format!(
+            "cue `{name}` lasts {max_duration:?} s; maximum is {MAX_ONE_SHOT_SECONDS} s"
+        )));
+    }
+    if matches!(response, Response::Ui)
+        && layers
+            .iter()
+            .any(|layer| *layer.delay.start() != 0.0 || *layer.delay.end() != 0.0)
+    {
+        return Err(CatalogError::BadRange(format!(
+            "cue `{name}`: UI layers require `delay = [0]`"
+        )));
+    }
 
     Ok(Cue {
         layers: layers.into_boxed_slice(),
@@ -326,6 +412,7 @@ fn parse_layer(
     val: &toml::Value,
     resolve: &mut dyn FnMut(&str) -> Result<Vec<u8>, PathBuf>,
     clips: &mut dyn ClipStore,
+    clip_cache: &mut BTreeMap<String, StoredClip>,
 ) -> Result<(Layer, f32), CatalogError> {
     let tbl = val
         .as_table()
@@ -336,6 +423,9 @@ fn parse_layer(
         .and_then(toml::Value::as_array)
         .filter(|a| !a.is_empty())
         .ok_or_else(|| CatalogError::EmptyLayer(cue.to_string()))?;
+    if variant_files.len() > 256 {
+        return Err(CatalogError::TooManyVariants(cue.to_owned()));
+    }
 
     let mut variants = Vec::with_capacity(variant_files.len());
     let mut max_variant_s = 0.0_f32; // longest decoded clip in this layer
@@ -343,8 +433,29 @@ fn parse_layer(
         let file = file_val.as_str().ok_or_else(|| {
             CatalogError::Manifest(format!("cue `{cue}`: variant entry is not a string"))
         })?;
-        let bytes = resolve(file).map_err(CatalogError::UnknownFile)?;
-        let StoredClip { id, duration_s } = clips.store(&bytes).map_err(CatalogError::Decode)?;
+        let relative = Path::new(file);
+        if file.is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(CatalogError::UnsafePath(relative.to_owned()));
+        }
+        let StoredClip { id, duration_s } = match clip_cache.get(file).copied() {
+            Some(stored) => stored,
+            None => {
+                let bytes = resolve(file).map_err(CatalogError::UnknownFile)?;
+                let stored = clips.store(&bytes).map_err(CatalogError::Decode)?;
+                if !stored.duration_s.is_finite() || stored.duration_s <= 0.0 {
+                    return Err(CatalogError::InvalidDuration(format!(
+                        "`{file}` decoded to {:?} s",
+                        stored.duration_s
+                    )));
+                }
+                clip_cache.insert(file.to_owned(), stored);
+                stored
+            }
+        };
         max_variant_s = max_variant_s.max(duration_s);
         variants.push(id);
     }
@@ -353,10 +464,22 @@ fn parse_layer(
     // Authored gain must be in (0, 4]. A non-positive gain is silence authored as
     // a voice (waste a slot); > 4 breaks the audibility upper-bound proof.
     if *gain.start() <= 0.0 || *gain.end() > 4.0 {
-        return Err(CatalogError::BadRange(format!("cue `{cue}`: `gain` must be in (0, 4]")));
+        return Err(CatalogError::BadRange(format!(
+            "cue `{cue}`: `gain` must be in (0, 4]"
+        )));
     }
     let pitch = parse_range(cue, tbl.get("pitch"), "pitch")?;
     let delay = parse_range(cue, tbl.get("delay"), "delay")?;
+    if *pitch.start() < MIN_PITCH_SEMITONES || *pitch.end() > MAX_PITCH_SEMITONES {
+        return Err(CatalogError::BadRange(format!(
+            "cue `{cue}`: `pitch` must be within [{MIN_PITCH_SEMITONES}, {MAX_PITCH_SEMITONES}] semitones"
+        )));
+    }
+    if *delay.start() < 0.0 || *delay.end() > MAX_DELAY_SECONDS {
+        return Err(CatalogError::BadRange(format!(
+            "cue `{cue}`: `delay` must be within [0, {MAX_DELAY_SECONDS}] seconds"
+        )));
+    }
     let mode = parse_mode(cue, tbl.get("mode"))?;
 
     Ok((
@@ -391,9 +514,9 @@ fn parse_range(
     val: Option<&toml::Value>,
     field: &str,
 ) -> Result<RangeInclusive<f32>, CatalogError> {
-    let arr = val.and_then(toml::Value::as_array).ok_or_else(|| {
-        CatalogError::Manifest(format!("cue `{cue}`: missing array `{field}`"))
-    })?;
+    let arr = val
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| CatalogError::Manifest(format!("cue `{cue}`: missing array `{field}`")))?;
     let nums: Vec<f32> = arr
         .iter()
         .map(as_f32)
@@ -411,10 +534,14 @@ fn parse_range(
         }
     };
     if !lo.is_finite() || !hi.is_finite() {
-        return Err(CatalogError::BadRange(format!("cue `{cue}`: `{field}` non-finite")));
+        return Err(CatalogError::BadRange(format!(
+            "cue `{cue}`: `{field}` non-finite"
+        )));
     }
     if lo > hi {
-        return Err(CatalogError::BadRange(format!("cue `{cue}`: `{field}` reversed")));
+        return Err(CatalogError::BadRange(format!(
+            "cue `{cue}`: `{field}` reversed"
+        )));
     }
     Ok(lo..=hi)
 }
@@ -438,7 +565,7 @@ mod tests {
     }
     impl ClipStore for MockClips {
         fn store(&mut self, bytes: &[u8]) -> Result<StoredClip, String> {
-            let id = ClipId(u32::from(self.next));
+            let id = ClipId(self.next);
             self.next += 1;
             Ok(StoredClip {
                 id,
@@ -545,9 +672,7 @@ mod tests {
         assert!((c.max_duration - 4.5).abs() < 1e-4);
     }
 
-    fn expect_err(
-        res: Result<(Catalog, CueSymbols), CatalogError>,
-    ) -> CatalogError {
+    fn expect_err(res: Result<(Catalog, CueSymbols), CatalogError>) -> CatalogError {
         match res {
             Ok(_) => panic!("expected a CatalogError"),
             Err(e) => e,
@@ -567,7 +692,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_toml() {
-        assert!(matches!(load_err("this is not = = toml"), CatalogError::Manifest(_)));
+        assert!(matches!(
+            load_err("this is not = = toml"),
+            CatalogError::Manifest(_)
+        ));
     }
 
     #[test]
@@ -601,6 +729,86 @@ mod tests {
             delay = [0.0]
             mode = "one_shot""#;
         assert!(matches!(load_err(m), CatalogError::BadRange(_)));
+    }
+
+    #[test]
+    fn rejects_negative_delay_and_extreme_pitch() {
+        let negative_delay = r#"[cues.x]
+            response = "world"
+            [[cues.x.layers]]
+            variants = ["a.wav"]
+            gain = [1.0]
+            pitch = [0.0]
+            delay = [-0.1]
+            mode = "one_shot""#;
+        assert!(matches!(
+            load_err(negative_delay),
+            CatalogError::BadRange(_)
+        ));
+
+        let extreme_pitch = r#"[cues.x]
+            response = "world"
+            [[cues.x.layers]]
+            variants = ["a.wav"]
+            gain = [1.0]
+            pitch = [-1000.0]
+            delay = [0.0]
+            mode = "one_shot""#;
+        assert!(matches!(load_err(extreme_pitch), CatalogError::BadRange(_)));
+    }
+
+    #[test]
+    fn ui_delay_is_rejected_instead_of_silently_ignored() {
+        let m = r#"[cues.x]
+            response = "ui"
+            [[cues.x.layers]]
+            variants = ["a.wav"]
+            gain = [1.0]
+            pitch = [0.0]
+            delay = [0.1]
+            mode = "one_shot""#;
+        assert!(matches!(load_err(m), CatalogError::BadRange(_)));
+    }
+
+    #[test]
+    fn rejects_paths_that_escape_the_catalog_root() {
+        for path in ["../secret.wav", "/tmp/secret.wav", "./alias.wav", ""] {
+            let m = format!(
+                r#"[cues.x]
+                    response = "world"
+                    [[cues.x.layers]]
+                    variants = ["{path}"]
+                    gain = [1.0]
+                    pitch = [0.0]
+                    delay = [0.0]
+                    mode = "one_shot""#
+            );
+            assert!(matches!(load_err(&m), CatalogError::UnsafePath(_)));
+        }
+    }
+
+    #[test]
+    fn repeated_variant_file_is_decoded_once() {
+        let m = r#"[cues.x]
+            response = "world"
+            [[cues.x.layers]]
+            variants = ["shared.wav"]
+            gain = [1.0]
+            pitch = [0.0]
+            delay = [0.0]
+            mode = "one_shot"
+            [[cues.x.layers]]
+            variants = ["shared.wav"]
+            gain = [0.5]
+            pitch = [0.0]
+            delay = [0.0]
+            mode = "one_shot""#;
+        let mut clips = MockClips { next: 0 };
+        let mut resolve = ok_resolver();
+        let (catalog, symbols) = Catalog::from_manifest(m, &mut resolve, &mut clips).unwrap();
+        let cue = catalog.cue(catalog.typed::<OneShot>(&symbols, "x").unwrap());
+        assert_eq!(clips.next, 1);
+        assert_eq!(cue.layers[0].variants[0], cue.layers[1].variants[0]);
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //! dependencies) fed and drained by [`World::stream`](super::World::stream).
 //!
 //! Threading model:
-//! - `min(3, cores - 1).max(1)` worker threads share ONE [`JobQueue`] behind a
-//!   `Mutex` + `Condvar`. A worker holds the lock only while dequeuing (or
-//!   waiting for work); every job runs unlocked.
+//! - `clamp(cores - 2, 1, 12)` worker threads share ONE [`JobQueue`] behind a
+//!   `Mutex` and separate work/pace condition variables. A worker holds the
+//!   lock only while dequeuing (or waiting); every job runs unlocked. The
+//!   velocity-aware pacer may park a suffix of the pool during fast travel.
 //! - Jobs carry owned value data only (a generator clone, a voxel snapshot,
 //!   border planes, an `Arc`'d solidity table). Workers never touch the GPU,
 //!   the `World`, or the live chunk map, so there is nothing to contend on
@@ -14,17 +15,18 @@
 //!   dequeues before far LOD work (tile/skin), so a burst of slow tile jobs
 //!   can never make the chunk under the player wait behind them. Within a class
 //!   the order is FIFO, and the world sorts each batch nearest-first first.
-//! - Results come back on a plain `mpsc` channel, drained non-blockingly once
-//!   per frame. The main thread re-validates every result on arrival (the
-//!   chunk may have unloaded, edits may have landed while the job flew).
+//! - Results come back on a plain `mpsc` channel, integrated non-blockingly up
+//!   to an adaptive per-frame deadline and progress floor. The main thread
+//!   re-validates every result on arrival (the chunk may have unloaded, edits
+//!   may have landed while the job flew).
 //! - Shutdown: dropping [`Workers`] closes the job sender, so a blocked
 //!   `recv()` errors out and each loop exits; `Drop` then joins the handles.
 //!   Bounded even mid-burst (a worker finishes at most its current job), and
 //!   a stuck GPU can never block it — workers never issue GPU calls.
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -132,22 +134,40 @@ pub(crate) struct ClaimToken(pub(in crate::world) u64);
 /// release the EXACT claim instead of leaving it stranded forever.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum JobKey {
-    Column { col: (i32, i32), cy: RangeInclusive<i32> },
-    Mesh { coord: Coord },
-    Light { coord: Coord },
-    Section { pos: SectionPos, epoch: u32, token: ClaimToken },
+    Column {
+        col: (i32, i32),
+        cy: RangeInclusive<i32>,
+    },
+    Mesh {
+        coord: Coord,
+    },
+    Light {
+        coord: Coord,
+    },
+    Section {
+        pos: SectionPos,
+        epoch: u32,
+        token: ClaimToken,
+    },
 }
 
 impl JobKey {
     /// The claim identity of a job, captured before the job runs.
     fn of(job: &Job) -> JobKey {
         match job {
-            Job::GenerateColumn { col, cy, .. } => JobKey::Column { col: *col, cy: cy.clone() },
+            Job::GenerateColumn { col, cy, .. } => JobKey::Column {
+                col: *col,
+                cy: cy.clone(),
+            },
             Job::Mesh { coord, .. } => JobKey::Mesh { coord: *coord },
             Job::Light { coord, .. } => JobKey::Light { coord: *coord },
-            Job::Section { pos, epoch, token, .. } => {
-                JobKey::Section { pos: *pos, epoch: *epoch, token: *token }
-            }
+            Job::Section {
+                pos, epoch, token, ..
+            } => JobKey::Section {
+                pos: *pos,
+                epoch: *epoch,
+                token: *token,
+            },
             #[cfg(test)]
             Job::Panic(key) => (**key).clone(),
         }
@@ -158,14 +178,30 @@ impl JobKey {
 pub(in crate::world) enum Done {
     /// A generated column: every chunk built for the requested `cy` range,
     /// paired with its coord. Landed together and stored in one drain step.
-    Column { col: (i32, i32), chunks: Vec<(Coord, Chunk)> },
+    Column {
+        col: (i32, i32),
+        chunks: Vec<(Coord, Chunk)>,
+    },
     /// Boxed: `ChunkMeshData` is ~530 B inline (three passes × Vec headers ×
     /// six index buckets), and it dominated the whole enum — every channel
     /// send/recv and match memcpy'd it. One box per mesh job is noise next to
     /// the meshing itself; the Box rides untouched into `upload_queue`.
-    Mesh { coord: Coord, rev: u32, data: MeshOutput },
-    Light { coord: Coord, epoch: u32, grid: LightGrid },
-    Section { pos: SectionPos, epoch: u32, token: ClaimToken, meshes: [SectionMeshData; 4] },
+    Mesh {
+        coord: Coord,
+        rev: u32,
+        data: MeshOutput,
+    },
+    Light {
+        coord: Coord,
+        epoch: u32,
+        grid: LightGrid,
+    },
+    Section {
+        pos: SectionPos,
+        epoch: u32,
+        token: ClaimToken,
+        meshes: [SectionMeshData; 4],
+    },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
     /// and apply the bounded retry/quarantine policy — without this, a single
     /// bad job left `generating`/`light_inflight`/`building`/`Meshing` claimed
@@ -202,7 +238,9 @@ pub(in crate::world) struct MeshOutput(Option<Box<ChunkMeshData>>);
 
 impl MeshOutput {
     pub(in crate::world) fn new() -> Self {
-        let data = MESH_OUTPUT_POOL.take().unwrap_or_else(|| Box::new(new_chunk_mesh_data()));
+        let data = MESH_OUTPUT_POOL
+            .take()
+            .unwrap_or_else(|| Box::new(new_chunk_mesh_data()));
         Self(Some(data))
     }
 }
@@ -275,9 +313,10 @@ const CANCEL_MARGIN: i32 = 4;
 /// not per pop. Fast movement therefore reorders the backlog and sheds it
 /// instead of grinding through stale regions.
 ///
-/// Relaxed atomics: centre and radius may briefly disagree mid-update;
-/// [`CANCEL_MARGIN`] absorbs the tear (it can only mis-order or briefly spare
-/// a job, never cancel wanted work — the margin exceeds any one-frame move).
+/// Centre/radius/velocity/horizon fields are written Relaxed, then published by
+/// a Release epoch bump; queue rebuilds Acquire that epoch before reading the
+/// snapshot. [`CANCEL_MARGIN`] remains the spatial hysteresis, not a substitute
+/// for cross-atomic publication.
 pub(in crate::world) struct ViewGate {
     /// `(cx as u32) << 32 | (cz as u32)`.
     center: AtomicU64,
@@ -293,6 +332,15 @@ pub(in crate::world) struct ViewGate {
     /// velocity every pass, and the wanted checks read it LIVE rather than
     /// baking it into keys.
     far_m: AtomicU64,
+    /// Horizontal eye velocity, as `f64` bits. Queue priorities use this to
+    /// favor the leading edge during travel instead of spending the reduced
+    /// budget behind the player.
+    vel_x: AtomicU64,
+    vel_z: AtomicU64,
+    /// Velocity-aware concurrency and near-queue lookahead. Both are published
+    /// by the main thread from the world's single streaming pacer.
+    active_workers: AtomicUsize,
+    near_queue_cap: AtomicUsize,
 }
 
 impl ViewGate {
@@ -302,6 +350,12 @@ impl ViewGate {
             radius: AtomicI32::new(i32::MAX),
             epoch: AtomicU64::new(0),
             far_m: AtomicU64::new(f64::INFINITY.to_bits()),
+            vel_x: AtomicU64::new(0.0f64.to_bits()),
+            vel_z: AtomicU64::new(0.0f64.to_bits()),
+            active_workers: AtomicUsize::new(1),
+            // Permissive until a real Workers pool publishes its capacity;
+            // direct queue tests and non-streaming users retain legacy behavior.
+            near_queue_cap: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -310,7 +364,7 @@ impl ViewGate {
         let prev_center = self.center.swap(packed, Ordering::Relaxed);
         let prev_radius = self.radius.swap(radius, Ordering::Relaxed);
         if prev_center != packed || prev_radius != radius {
-            self.epoch.fetch_add(1, Ordering::Relaxed);
+            self.epoch.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -319,8 +373,30 @@ impl ViewGate {
         self.far_m.store(metres.to_bits(), Ordering::Relaxed);
     }
 
+    fn set_velocity(&self, x: f64, z: f64) {
+        self.vel_x.store(x.to_bits(), Ordering::Relaxed);
+        self.vel_z.store(z.to_bits(), Ordering::Relaxed);
+    }
+
+    fn set_active_workers(&self, active: usize) {
+        let active = active.max(1);
+        self.active_workers.store(active, Ordering::Relaxed);
+        // A few queued jobs per active thread hide variance without admitting
+        // a whole view volume that will be stale before it runs.
+        self.near_queue_cap
+            .store((active * 4).max(8), Ordering::Relaxed);
+    }
+
+    fn active_workers(&self) -> usize {
+        self.active_workers.load(Ordering::Relaxed).max(1)
+    }
+
+    fn near_queue_cap(&self) -> usize {
+        self.near_queue_cap.load(Ordering::Relaxed).max(1)
+    }
+
     fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Relaxed)
+        self.epoch.load(Ordering::Acquire)
     }
 
     fn center(&self) -> (i32, i32) {
@@ -335,6 +411,24 @@ impl ViewGate {
         }
         let (px, pz) = self.center();
         (cx - px).abs().max((cz - pz).abs())
+    }
+
+    /// Motion-biased near priority. Keep the chess-distance semantics but
+    /// reserve fractional key space so leading/trailing alignment can adjust
+    /// it without collapsing adjacent rings onto one integer.
+    fn near_key(&self, cx: i32, cz: i32) -> u64 {
+        let base = self.dist(cx, cz) as u64 * 1024;
+        if base == 0 {
+            return 0;
+        }
+        let (px, pz) = self.center();
+        let (dx, dz) = ((cx - px) as f64, (cz - pz) as f64);
+        let velocity = glam::DVec3::new(
+            f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
+            0.0,
+            f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
+        );
+        super::motion_biased_dist2(base, velocity, dx, dz)
     }
 
     /// Whether a job at this column is still worth running.
@@ -357,6 +451,18 @@ impl ViewGate {
         let (ex, ez) = self.eye_m();
         let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
         (dx * dx + dz * dz) as u64
+    }
+
+    fn far_key(&self, wx: i64, wz: i64) -> u64 {
+        let (ex, ez) = self.eye_m();
+        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
+        let base = (dx * dx + dz * dz) as u64;
+        let vel = glam::DVec3::new(
+            f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
+            0.0,
+            f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
+        );
+        super::motion_biased_dist2(base, vel, dx, dz)
     }
 
     /// Whether a far entry with world-centre `(wx, wz)` and footprint `span`
@@ -468,7 +574,14 @@ impl EpochHeap {
     fn push(&mut self, d: u64, wx: i64, wz: i64, span: i64, job: Job) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.heap.push(std::cmp::Reverse(Keyed { d, seq, wx, wz, span, job }));
+        self.heap.push(std::cmp::Reverse(Keyed {
+            d,
+            seq,
+            wx,
+            wz,
+            span,
+            job,
+        }));
     }
 
     /// Re-key every entry and deschedule the unwanted, once per epoch.
@@ -523,7 +636,11 @@ fn far_center_span(job: &Job) -> (i64, i64, i64) {
     match job {
         Job::Section { pos, .. } => {
             let span = pos.span() as i64;
-            (pos.min_x() as i64 + span / 2, pos.min_z() as i64 + span / 2, span)
+            (
+                pos.min_x() as i64 + span / 2,
+                pos.min_z() as i64 + span / 2,
+                span,
+            )
         }
         _ => (0, 0, 0),
     }
@@ -536,6 +653,7 @@ fn far_center_span(job: &Job) -> (i64, i64, i64) {
 /// every view change — sustained fast flight sheds far work it has left
 /// behind instead of grinding it (the old far class re-keyed NEVER: only the
 /// >512 m/s teleport purge touched it). `closed` is the shutdown flag a
+///
 /// blocked `pop` wakes on.
 #[derive(Default)]
 struct JobQueue {
@@ -548,13 +666,17 @@ impl JobQueue {
     /// Push at the job's scheduling class. A far job pushed here (the legacy
     /// [`Workers::submit`] path and headless tests) carries no distance, so it
     /// sorts at `d = 0` and equal-distance far jobs fall back to FIFO by `seq`.
-    /// This legacy path is uncapped (its only producers are tests); the
-    /// streaming lanes go through the cap-checked [`Workers::submit_far`].
-    fn push(&mut self, job: Job, gate: &ViewGate) {
+    /// Far work on this legacy path is uncapped (its only producers are tests);
+    /// streaming far lanes use cap-checked [`Workers::submit_far`]. Near work
+    /// obeys the pacer's bounded lookahead.
+    fn push(&mut self, job: Job, gate: &ViewGate) -> bool {
         match priority(&job) {
             Priority::Near => {
+                if self.near.len() >= gate.near_queue_cap() {
+                    return false;
+                }
                 let (cx, cz) = job.col().unwrap_or((0, 0));
-                let d = gate.dist(cx, cz) as u64;
+                let d = gate.near_key(cx, cz);
                 self.near.push(d, cx as i64, cz as i64, 0, job);
             }
             Priority::Far => {
@@ -562,6 +684,7 @@ impl JobQueue {
                 self.far.push(0, wx, wz, span, job);
             }
         }
+        true
     }
 
     fn clear_far(&mut self) -> Vec<JobKey> {
@@ -574,7 +697,10 @@ impl JobQueue {
     /// a rejected key, so it retries on a later frame.
     #[must_use]
     fn push_far(&mut self, job: Job, dist2: u64) -> bool {
-        debug_assert!(matches!(priority(&job), Priority::Far), "push_far on a near job");
+        debug_assert!(
+            matches!(priority(&job), Priority::Far),
+            "push_far on a near job"
+        );
         if self.far.len() >= FAR_QUEUE_CAP {
             return false;
         }
@@ -593,7 +719,7 @@ impl JobQueue {
         let epoch = gate.epoch();
         self.near.sync(
             epoch,
-            |e| gate.dist(e.wx as i32, e.wz as i32) as u64,
+            |e| gate.near_key(e.wx as i32, e.wz as i32),
             |e| gate.wanted(e.wx as i32, e.wz as i32),
             cancelled,
         );
@@ -602,7 +728,7 @@ impl JobQueue {
         // claims must release promptly, not once the near backlog drains.
         self.far.sync(
             epoch,
-            |e| gate.far_dist2_m(e.wx, e.wz),
+            |e| gate.far_key(e.wx, e.wz),
             |e| gate.far_wanted(e.wx, e.wz, e.span),
             cancelled,
         );
@@ -610,16 +736,25 @@ impl JobQueue {
     }
 }
 
+/// Recover a poisoned queue rather than duplicating the same policy at every
+/// short critical section. Worker panics are surfaced through their result;
+/// the remaining queue is still safe to drain or close.
+fn lock_queue(lock: &Mutex<JobQueue>) -> MutexGuard<'_, JobQueue> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The worker pool. Owned by the `World` and spawned lazily on the first
 /// `stream()`, so headless worlds (dedicated server, tests) never start threads.
 pub struct Workers {
-    /// The shared job queue + its wait condition; `Drop` sets `closed` and wakes
-    /// every worker to join.
-    gate: Arc<(Mutex<JobQueue>, Condvar)>,
+    /// Shared queue plus separate work/pace conditions. Inactive workers wait
+    /// on `pace`, so a `notify_one` for new work cannot be stolen by a worker
+    /// the adaptive limit has parked.
+    gate: Arc<(Mutex<JobQueue>, Condvar, Condvar)>,
     /// The live view snapshot the queue re-prioritizes and descheduled against.
     view: Arc<ViewGate>,
     results: Receiver<Done>,
     handles: Vec<JoinHandle<()>>,
+    capacity: usize,
 }
 
 impl Workers {
@@ -649,14 +784,20 @@ impl Workers {
         // (the upload-queue backpressure for meshes, the bounded data box for
         // generation, FAR_QUEUE_CAP for sections, one-per-coord for light).
         let (done, results) = mpsc::channel::<Done>();
-        let gate = Arc::new((Mutex::new(JobQueue::default()), Condvar::new()));
+        let capacity = threads.max(1);
+        let gate = Arc::new((
+            Mutex::new(JobQueue::default()),
+            Condvar::new(),
+            Condvar::new(),
+        ));
         let view = Arc::new(ViewGate::new());
-        let handles = (0..threads.max(1))
-            .map(|_| {
+        view.set_active_workers(capacity);
+        let handles = (0..capacity)
+            .map(|worker_id| {
                 let gate = Arc::clone(&gate);
                 let view = Arc::clone(&view);
                 let done = done.clone();
-                thread::spawn(move || worker_loop(&gate, &view, &done))
+                thread::spawn(move || worker_loop(worker_id, &gate, &view, &done))
             })
             .collect();
         Self {
@@ -664,30 +805,81 @@ impl Workers {
             view,
             results,
             handles,
+            capacity,
         }
     }
 
     /// Publish the live streaming centre, horizontal radius (chunks), and the
     /// far-field horizon (metres). The queues re-key their backlogs against it
     /// and deschedule left-behind entries — once per change, at the pool.
-    pub(in crate::world) fn set_view(&self, cx: i32, cz: i32, radius: i32, far_m: f64) {
-        self.view.set(cx, cz, radius);
+    pub(in crate::world) fn set_view(
+        &self,
+        cx: i32,
+        cz: i32,
+        radius: i32,
+        far_m: f64,
+        vel_x: f64,
+        vel_z: f64,
+    ) {
+        // Publish every matching field before `set` releases the new epoch.
+        self.view.set_velocity(vel_x, vel_z);
         self.view.set_far(far_m);
+        self.view.set(cx, cz, radius);
+    }
+
+    /// Park/unpark workers to match the world's current effort signal. Both
+    /// condition sets are notified on a transition so workers migrate to the
+    /// correct wait set before the next job notification.
+    pub(in crate::world) fn set_active_workers(&self, active: usize) {
+        let active = active.clamp(1, self.capacity);
+        if self.view.active_workers() == active {
+            return;
+        }
+        let (lock, work, pace) = &*self.gate;
+        // The worker's predicate check and Condvar::wait both happen while
+        // holding this mutex. Publish the matching state under that same mutex
+        // so an unpark notification cannot land in the gap between them.
+        let queue = lock_queue(lock);
+        // Keep the in-lock check too: it makes the transition safe even if a
+        // future caller publishes pacing from more than one thread.
+        if self.view.active_workers() == active {
+            return;
+        }
+        self.view.set_active_workers(active);
+        drop(queue);
+        work.notify_all();
+        pace.notify_all();
+    }
+
+    pub(in crate::world) fn active_workers(&self) -> usize {
+        self.view.active_workers().min(self.capacity)
+    }
+
+    pub(in crate::world) fn worker_capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(in crate::world) fn queue_depths(&self) -> (usize, usize) {
+        let (lock, _, _) = &*self.gate;
+        let queue = lock_queue(lock);
+        (queue.near.len(), queue.far.len())
     }
 
     /// Queue a job at its scheduling class; returns whether it was accepted.
-    /// `false` only once the pool is shutting down (`closed`), so the caller
-    /// must not mark the coord in flight and the normal scans simply retry it.
+    /// `false` means shutdown or adaptive near-lookahead backpressure, so the
+    /// caller must not claim it and the normal pending lane retries later.
     pub(in crate::world) fn submit(&self, job: Job) -> bool {
-        let (lock, cvar) = &*self.gate;
-        let mut queue = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (lock, work, _) = &*self.gate;
+        let mut queue = lock_queue(lock);
         if queue.closed {
             return false;
         }
-        queue.push(job, &self.view);
+        let admitted = queue.push(job, &self.view);
         drop(queue);
-        cvar.notify_one();
-        true
+        if admitted {
+            work.notify_one();
+        }
+        admitted
     }
 
     /// Queue a far LOD job keyed by `dist2` (squared metres to the player).
@@ -698,15 +890,15 @@ impl Workers {
     /// claimed ⇒ owed exactly one `Done`), it just retries on a later frame.
     #[must_use]
     pub(in crate::world) fn submit_far(&self, job: Job, dist2: u64) -> bool {
-        let (lock, cvar) = &*self.gate;
-        let mut queue = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (lock, work, _) = &*self.gate;
+        let mut queue = lock_queue(lock);
         if queue.closed {
             return false;
         }
         let admitted = queue.push_far(job, dist2);
         drop(queue);
         if admitted {
-            cvar.notify_one();
+            work.notify_one();
         }
         admitted
     }
@@ -721,8 +913,8 @@ impl Workers {
     /// whole section lane (configuration change). A worker already executing a
     /// job is unaffected and remains protected by epoch/token validation.
     pub(in crate::world) fn clear_far(&self) -> Vec<JobKey> {
-        let (lock, _) = &*self.gate;
-        lock.lock().unwrap_or_else(|p| p.into_inner()).clear_far()
+        let (lock, _, _) = &*self.gate;
+        lock_queue(lock).clear_far()
     }
 }
 
@@ -731,9 +923,10 @@ impl Drop for Workers {
     /// either waiting on the condvar (returns at once) or finishing one job, so
     /// the join is bounded and GPU-independent.
     fn drop(&mut self) {
-        let (lock, cvar) = &*self.gate;
-        lock.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
-        cvar.notify_all();
+        let (lock, work, pace) = &*self.gate;
+        lock_queue(lock).closed = true;
+        work.notify_all();
+        pace.notify_all();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -756,8 +949,13 @@ fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
     }
 }
 
-fn worker_loop(gate: &(Mutex<JobQueue>, Condvar), view: &ViewGate, done: &Sender<Done>) {
-    let (lock, cvar) = gate;
+fn worker_loop(
+    worker_id: usize,
+    gate: &(Mutex<JobQueue>, Condvar, Condvar),
+    view: &ViewGate,
+    done: &Sender<Done>,
+) {
+    let (lock, work, pace) = gate;
     // Reused across iterations: descheduling is bursty (one epoch rebuild can
     // shed hundreds of keys), and the buffer's capacity survives the drain.
     let mut cancelled: Vec<JobKey> = Vec::new();
@@ -766,22 +964,28 @@ fn worker_loop(gate: &(Mutex<JobQueue>, Condvar), view: &ViewGate, done: &Sender
         // mutexes (a sibling panicked) still yield a usable queue.
         cancelled.clear();
         let job = {
-            let mut queue = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut queue = lock_queue(lock);
             loop {
+                if queue.closed {
+                    return;
+                }
+                if worker_id >= view.active_workers() {
+                    queue = pace.wait(queue).unwrap_or_else(|p| p.into_inner());
+                    continue;
+                }
                 let job = queue.pop(view, &mut cancelled);
                 if job.is_some() || !cancelled.is_empty() {
                     break job;
                 }
-                if queue.closed {
-                    return; // pool shutting down and drained
-                }
-                queue = cvar.wait(queue).unwrap_or_else(|p| p.into_inner());
+                queue = work.wait(queue).unwrap_or_else(|p| p.into_inner());
             }
         };
         // Report the descheduled batch so its claims release; then run the
         // popped job (if the pop found only cancellations, just loop back).
         if !cancelled.is_empty()
-            && done.send(Done::Cancelled(cancelled.drain(..).collect())).is_err()
+            && done
+                .send(Done::Cancelled(cancelled.drain(..).collect()))
+                .is_err()
         {
             return;
         }
@@ -789,8 +993,8 @@ fn worker_loop(gate: &(Mutex<JobQueue>, Condvar), view: &ViewGate, done: &Sender
         // Headline runs keep profiling disabled: avoid the per-job label
         // allocation and worker clock reads in that mode. The claim key still
         // identifies a panicking job in the report.
-        let profile_start =
-            voxel_engine::profile::is_enabled().then(|| (job_meter(&job), std::time::Instant::now()));
+        let profile_start = voxel_engine::profile::is_enabled()
+            .then(|| (job_meter(&job), std::time::Instant::now()));
         let key = JobKey::of(&job);
         // Guard the job body: a panic in `run` (bad generator sample, light/mesh
         // index, edit replay) used to unwind straight out of `worker_loop` and
@@ -870,7 +1074,11 @@ fn run(job: Job) -> Done {
             }
             Done::Mesh { coord, rev, data }
         }
-        Job::Light { coord, epoch, snapshot } => {
+        Job::Light {
+            coord,
+            epoch,
+            snapshot,
+        } => {
             // Pure flood: same `propagate` the sync path called, now on an owned
             // neighbourhood snapshot instead of live neighbour grids.
             let mut grid = LightGrid::dark();
@@ -884,14 +1092,26 @@ fn run(job: Job) -> Done {
             );
             Done::Light { coord, epoch, grid }
         }
-        Job::Section { pos, epoch, token, generator, edits, tables } => {
+        Job::Section {
+            pos,
+            epoch,
+            token,
+            generator,
+            edits,
+            tables,
+        } => {
             // Fused extract+mesh on owned data: the generator samples straight
             // into the dense quadrant grid — no RLE brick storage is built for
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
             let meshes = section::extract_section_mesh(pos, &*generator, &edits, &tables);
-            Done::Section { pos, epoch, token, meshes }
+            Done::Section {
+                pos,
+                epoch,
+                token,
+                meshes,
+            }
         }
         #[cfg(test)]
         Job::Panic(key) => panic!("injected worker panic for {key:?}"),
@@ -907,13 +1127,21 @@ mod tests {
 
     /// Mirrors `World::new`'s generator construction.
     fn generator(seed: i64) -> Arc<SineHills> {
-        Arc::new(SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed))
+        Arc::new(SineHills::new(
+            &mut BlockRegistry::with_builtins(),
+            20.0,
+            seed,
+        ))
     }
 
     /// Create a far section job tagged by id for scheduler tests.
     fn section_job(terrain: &Arc<SineHills>, id: i32) -> Job {
         Job::Section {
-            pos: SectionPos { detail: voxel_engine::Detail(2), x: id, z: 0 },
+            pos: SectionPos {
+                detail: voxel_engine::Detail(2),
+                x: id,
+                z: 0,
+            },
             epoch: 0,
             token: ClaimToken(id as u64),
             generator: Arc::clone(terrain),
@@ -957,7 +1185,11 @@ mod tests {
             panic!("expected a column result");
         };
         assert_eq!(col, (coord.x, coord.z));
-        let chunk = &chunks.iter().find(|(c, _)| *c == coord).expect("coord in column").1;
+        let chunk = &chunks
+            .iter()
+            .find(|(c, _)| *c == coord)
+            .expect("coord in column")
+            .1;
         assert_eq!(chunk.data(), expected.data(), "voxel-identical to sync");
     }
 
@@ -981,27 +1213,28 @@ mod tests {
         let padded = Padded::capture(at);
 
         let mut expected = new_chunk_mesh_data();
-        mesh::build_chunk_mesh(
-            &padded,
-            None,
-            &tables,
-            &PaddedLight::full(),
-            &mut expected,
-        );
+        mesh::build_chunk_mesh(&padded, None, &tables, &PaddedLight::full(), &mut expected);
         // The neighbours must actually matter, or equality proves nothing.
         let mut unculled = new_chunk_mesh_data();
         mesh::build_chunk_mesh(
-            &Padded::capture(|dx, dy, dz| {
-                (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)
-            }),
+            &Padded::capture(|dx, dy, dz| (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)),
             None,
             &tables,
             &PaddedLight::full(),
             &mut unculled,
         );
-        let index_count =
-            |d: &ChunkMeshData| d[Pass::Opaque].buckets().iter().map(|b| b.len()).sum::<usize>();
-        assert_ne!(index_count(&unculled), index_count(&expected), "border culling engaged");
+        let index_count = |d: &ChunkMeshData| {
+            d[Pass::Opaque]
+                .buckets()
+                .iter()
+                .map(|b| b.len())
+                .sum::<usize>()
+        };
+        assert_ne!(
+            index_count(&unculled),
+            index_count(&expected),
+            "border culling engaged"
+        );
 
         let snapshot = ChunkSnapshot {
             padded: Padded::capture(at),
@@ -1010,7 +1243,11 @@ mod tests {
             tables: Arc::clone(&tables),
         };
         let workers = Workers::spawn(1);
-        assert!(workers.submit(Job::Mesh { coord: Coord::new(0, 1, 0), rev: 7, snapshot }));
+        assert!(workers.submit(Job::Mesh {
+            coord: Coord::new(0, 1, 0),
+            rev: 7,
+            snapshot
+        }));
         let done = workers
             .results
             .recv_timeout(Duration::from_secs(10))
@@ -1021,7 +1258,11 @@ mod tests {
         assert_eq!((coord, rev), (Coord::new(0, 1, 0), 7));
         for p in Pass::ALL {
             assert_eq!(data[p].buckets(), expected[p].buckets());
-            assert_eq!(data[p].vertices(), expected[p].vertices(), "worker mesh matches sync");
+            assert_eq!(
+                data[p].vertices(),
+                expected[p].vertices(),
+                "worker mesh matches sync"
+            );
         }
     }
 
@@ -1035,7 +1276,10 @@ mod tests {
     fn pop_clean(q: &mut JobQueue, gate: &ViewGate) -> Option<Job> {
         let mut cancelled = Vec::new();
         let job = q.pop(gate, &mut cancelled);
-        assert!(cancelled.is_empty(), "unexpected descheduling: {cancelled:?}");
+        assert!(
+            cancelled.is_empty(),
+            "unexpected descheduling: {cancelled:?}"
+        );
         job
     }
 
@@ -1059,8 +1303,14 @@ mod tests {
         q.push(near(1), &gate);
 
         // All near first (FIFO within class), then all far (FIFO within class).
-        assert!(matches!(pop_clean(&mut q, &gate), Some(Job::GenerateColumn { col: (0, 0), .. })));
-        assert!(matches!(pop_clean(&mut q, &gate), Some(Job::GenerateColumn { col: (1, 1), .. })));
+        assert!(matches!(
+            pop_clean(&mut q, &gate),
+            Some(Job::GenerateColumn { col: (0, 0), .. })
+        ));
+        assert!(matches!(
+            pop_clean(&mut q, &gate),
+            Some(Job::GenerateColumn { col: (1, 1), .. })
+        ));
         assert_eq!(section_id(&pop_clean(&mut q, &gate).unwrap()), 0);
         assert_eq!(section_id(&pop_clean(&mut q, &gate).unwrap()), 1);
         assert!(pop_clean(&mut q, &gate).is_none());
@@ -1106,8 +1356,14 @@ mod tests {
         assert_eq!(
             cancelled,
             vec![
-                JobKey::Column { col: (0, 1), cy: 0..=0 },
-                JobKey::Column { col: (6, 6), cy: 0..=0 },
+                JobKey::Column {
+                    col: (0, 1),
+                    cy: 0..=0
+                },
+                JobKey::Column {
+                    col: (6, 6),
+                    cy: 0..=0
+                },
             ],
             "left-behind work is descheduled with its claims"
         );
@@ -1118,6 +1374,39 @@ mod tests {
         assert!(matches!(second, Job::GenerateColumn { col: (26, 26), .. }));
         assert!(cancelled.is_empty());
         assert!(q.pop(&gate, &mut cancelled).is_none(), "queue drained");
+    }
+
+    #[test]
+    fn fast_travel_prioritizes_the_leading_edge_and_bounds_lookahead() {
+        let terrain = generator(0);
+        let near = |cx: i32| Job::GenerateColumn {
+            col: (cx, 0),
+            cy: 0..=0,
+            generator: terrain.clone(),
+            edits: Vec::new(),
+        };
+        let mut q = JobQueue::default();
+        let gate = open_gate();
+        gate.set_velocity(100.0, 0.0);
+        gate.set(0, 0, 20);
+        gate.set_active_workers(2); // near cap = max(2 * 4, 8)
+
+        // Equal distance, trailing inserted first: direction must win.
+        assert!(q.push(near(-5), &gate));
+        assert!(q.push(near(5), &gate));
+        assert!(matches!(
+            pop_clean(&mut q, &gate),
+            Some(Job::GenerateColumn { col: (5, 0), .. })
+        ));
+
+        // Refill to the adaptive lookahead ceiling. Rejection leaves ownership
+        // with the caller, which therefore never claims doomed extra work.
+        while q.near.len() < gate.near_queue_cap() {
+            let id = q.near.len() as i32 + 1;
+            assert!(q.push(near(id), &gate));
+        }
+        assert!(!q.push(near(19), &gate));
+        assert_eq!(q.near.len(), 8);
     }
 
     #[test]
@@ -1135,10 +1424,26 @@ mod tests {
         assert!(q.push_far(job(1), 1)); // seq 1 — first-pushed of the two dist2 = 1
         assert!(q.push_far(job(2), 4)); // seq 2
         assert!(q.push_far(job(3), 1)); // seq 3
-        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 1, "nearest, first-pushed tie");
-        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 3, "nearest, second tie (FIFO)");
-        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 2, "dist2 = 4 next");
-        assert_eq!(id_of(&pop_clean(&mut q, &gate).unwrap()), 0, "dist2 = 9 last");
+        assert_eq!(
+            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            1,
+            "nearest, first-pushed tie"
+        );
+        assert_eq!(
+            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            3,
+            "nearest, second tie (FIFO)"
+        );
+        assert_eq!(
+            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            2,
+            "dist2 = 4 next"
+        );
+        assert_eq!(
+            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            0,
+            "dist2 = 9 last"
+        );
         assert!(pop_clean(&mut q, &gate).is_none(), "drained");
 
         // At the cap, admission REJECTS (never evicts an accepted job: accepted
@@ -1147,10 +1452,21 @@ mod tests {
         for i in 0..FAR_QUEUE_CAP {
             assert!(q.push_far(job(i as i32), i as u64), "under the cap admits");
         }
-        assert!(!q.push_far(job(-1), 0), "at the cap rejects — even a nearer job");
-        assert_eq!(q.far.len(), FAR_QUEUE_CAP, "rejection leaves the queue intact");
+        assert!(
+            !q.push_far(job(-1), 0),
+            "at the cap rejects — even a nearer job"
+        );
+        assert_eq!(
+            q.far.len(),
+            FAR_QUEUE_CAP,
+            "rejection leaves the queue intact"
+        );
         // Popping frees a slot, so the next submit admits again (lane retry).
-        assert_eq!(id_of(&pop_clean(&mut q, &open_gate()).unwrap()), 0, "nearest still pops first");
+        assert_eq!(
+            id_of(&pop_clean(&mut q, &open_gate()).unwrap()),
+            0,
+            "nearest still pops first"
+        );
         assert!(q.push_far(job(-1), 0), "below the cap admits again");
     }
 
@@ -1182,9 +1498,19 @@ mod tests {
         gate.set_far((eye(wx0, wz0) + eye(wx50, wz50)) / 2.0 - span0 as f64);
 
         let mut cancelled = Vec::new();
-        let popped = q.pop(&gate, &mut cancelled).expect("the in-horizon section survives");
-        assert_eq!(section_id(&popped), 0, "re-keyed to the LIVE eye, not admission dist");
-        assert_eq!(cancelled.len(), 1, "the beyond-horizon section is descheduled");
+        let popped = q
+            .pop(&gate, &mut cancelled)
+            .expect("the in-horizon section survives");
+        assert_eq!(
+            section_id(&popped),
+            0,
+            "re-keyed to the LIVE eye, not admission dist"
+        );
+        assert_eq!(
+            cancelled.len(),
+            1,
+            "the beyond-horizon section is descheduled"
+        );
         assert!(
             matches!(&cancelled[0], JobKey::Section { pos, .. } if pos.x == 50),
             "with its exact claim reported: {cancelled:?}"
@@ -1232,7 +1558,10 @@ mod tests {
         }
         let mut got = 0;
         while got < JOBS {
-            let done = workers.results.recv_timeout(Duration::from_secs(30)).expect("drained");
+            let done = workers
+                .results
+                .recv_timeout(Duration::from_secs(30))
+                .expect("drained");
             assert!(matches!(done, Done::Mesh { .. }));
             got += 1;
         }
@@ -1249,7 +1578,16 @@ mod tests {
     /// The pool-size policy: reserve two cores, cap at 12, floor at 1.
     #[test]
     fn thread_policy_reserves_two_and_caps() {
-        for (cores, want) in [(1, 1), (2, 1), (3, 1), (4, 2), (8, 6), (12, 10), (14, 12), (24, 12)] {
+        for (cores, want) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (8, 6),
+            (12, 10),
+            (14, 12),
+            (24, 12),
+        ] {
             assert_eq!(Workers::threads_for(cores), want, "cores = {cores}");
         }
     }
@@ -1305,17 +1643,36 @@ mod tests {
     fn panicking_jobs_report_failed_with_their_claim_and_leave_the_pool_alive() {
         let workers = Workers::spawn(1);
         let keys = [
-            JobKey::Column { col: (3, -2), cy: 0..=2 },
-            JobKey::Mesh { coord: Coord::new(1, 2, 3) },
-            JobKey::Light { coord: Coord::new(-1, 0, 1) },
-            JobKey::Section { pos: SectionPos { detail: voxel_engine::Detail(2), x: 5, z: -5 }, epoch: 0, token: ClaimToken(0) },
+            JobKey::Column {
+                col: (3, -2),
+                cy: 0..=2,
+            },
+            JobKey::Mesh {
+                coord: Coord::new(1, 2, 3),
+            },
+            JobKey::Light {
+                coord: Coord::new(-1, 0, 1),
+            },
+            JobKey::Section {
+                pos: SectionPos {
+                    detail: voxel_engine::Detail(2),
+                    x: 5,
+                    z: -5,
+                },
+                epoch: 0,
+                token: ClaimToken(0),
+            },
         ];
         for key in keys.clone() {
             assert!(workers.submit(Job::Panic(Box::new(key))));
         }
         let mut got = Vec::new();
         for _ in 0..keys.len() {
-            match workers.results.recv_timeout(Duration::from_secs(10)).expect("failure lands") {
+            match workers
+                .results
+                .recv_timeout(Duration::from_secs(10))
+                .expect("failure lands")
+            {
                 Done::Failed(k) => got.push(*k),
                 _ => panic!("expected Done::Failed for an injected panic"),
             }
@@ -1332,7 +1689,10 @@ mod tests {
             generator: terrain,
             edits: Vec::new(),
         }));
-        let done = workers.results.recv_timeout(Duration::from_secs(10)).expect("pool alive");
+        let done = workers
+            .results
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pool alive");
         assert!(matches!(done, Done::Column { .. }));
     }
 

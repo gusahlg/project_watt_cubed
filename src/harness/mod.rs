@@ -74,7 +74,14 @@ pub struct CameraPose {
 impl CameraPose {
     /// Delegates camera derivation to the game's ViewPose path to avoid reimplementing projection math.
     pub fn camera(&self, fovy: f32) -> Camera3D {
-        ViewPose { eye: self.pos, yaw: self.yaw, pitch: self.pitch, roll: 0.0, fovy }.camera3d()
+        ViewPose {
+            eye: self.pos,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            roll: 0.0,
+            fovy,
+        }
+        .camera3d()
     }
 }
 
@@ -123,11 +130,17 @@ pub struct DiffStats {
 /// report a total mismatch so callers surface it as a plain failure.
 pub fn diff(a: &Screenshot, b: &Screenshot) -> DiffStats {
     if a.width != b.width || a.height != b.height || a.rgba.len() != b.rgba.len() {
-        return DiffStats { max_channel_delta: u8::MAX, pct_changed: 100.0 };
+        return DiffStats {
+            max_channel_delta: u8::MAX,
+            pct_changed: 100.0,
+        };
     }
     let total_px = (a.width as usize) * (a.height as usize);
     if total_px == 0 {
-        return DiffStats { max_channel_delta: 0, pct_changed: 0.0 };
+        return DiffStats {
+            max_channel_delta: 0,
+            pct_changed: 0.0,
+        };
     }
 
     let mut max_delta = 0u8;
@@ -234,7 +247,14 @@ pub enum Phase {
 impl Phase {
     /// Every phase in ascending order — the cumulative sweep filters this by
     /// `<= through`.
-    pub const ALL: [Phase; 6] = [Phase::PreA, Phase::A, Phase::B, Phase::C, Phase::D, Phase::E];
+    pub const ALL: [Phase; 6] = [
+        Phase::PreA,
+        Phase::A,
+        Phase::B,
+        Phase::C,
+        Phase::D,
+        Phase::E,
+    ];
 
     /// The literal inside the marker: "pre-A", "A", "B", "C", "D", "E".
     pub fn marker(self) -> &'static str {
@@ -263,7 +283,10 @@ impl std::fmt::Display for Phase {
 /// An acceptance criterion that EXECUTES (strings don't).
 pub enum Criterion {
     /// Capture `shot`, compare against its blessed golden.
-    ImageMatch { shot: GoldenShot, max_pct_changed: f32 },
+    ImageMatch {
+        shot: GoldenShot,
+        max_pct_changed: f32,
+    },
     /// Capture `shot` under [`DebugView::TerrainKey`]; `sky_hole_count ≤ max`.
     SkyHoleCount { shot: GoldenShot, max: u32 },
     /// `time_to_first_full_render(seed) ≤ max`.
@@ -289,17 +312,15 @@ pub struct Failure {
 }
 
 /// Fixed offscreen-capture window config: a real winit window still backs the
-/// surface (no fully headless path yet), but stays unmapped — captures render
-/// into an owned offscreen image, independent of presents, so nothing flashes
-/// on the desktop and no WM can tile/resize it mid-run. Size/pacing are
-/// pinned for reproducibility across machines.
+/// surface (the engine has no fully headless path). Size and pacing are pinned
+/// for reproducibility across machines; the dimension check in `evaluate`
+/// reports any WM-forced resize as "window resized", rather than pixel drift.
 fn scripted_config() -> voxel_engine::Config {
     voxel_engine::Config {
         title: "golden-harness".into(),
         width: 1280,
         height: 720,
         vsync: false,
-        visible: false,
         resizable: false,
         // Engine-side lanes for every capture (blocklight ON for cave_interior's
         // emitter; a no-op for the emitter-free shots). Process-global — one
@@ -348,7 +369,16 @@ impl Stage {
         render: crate::render_config::RenderConfig,
         kind: StageKind,
     ) -> Self {
-        Stage { seed, cam, day, view, setup, radius: None, render, kind }
+        Stage {
+            seed,
+            cam,
+            day,
+            view,
+            setup,
+            radius: None,
+            render,
+            kind,
+        }
     }
 }
 
@@ -366,7 +396,12 @@ enum StageKind {
     /// re-settle — the fast-flight lag scenario, reproduced. Records a
     /// [`StressOutcome`] under `name`. `pace_hz` throttles the loop (see
     /// [`StressSpec::pace_hz`]).
-    StressFlight { name: String, speed_mps: f64, secs: f64, pace_hz: f64 },
+    StressFlight {
+        name: String,
+        speed_mps: f64,
+        secs: f64,
+        pace_hz: f64,
+    },
 }
 
 /// Sample width for `FrameSample`'s mean (120 frames).
@@ -408,7 +443,7 @@ pub struct FrameStats {
 
 impl FrameStats {
     /// Sorts `ms` in place and reads the nearest-rank percentiles.
-    fn from_ms(ms: &mut Vec<f32>) -> FrameStats {
+    fn from_ms(ms: &mut [f32]) -> FrameStats {
         if ms.is_empty() {
             return FrameStats::default();
         }
@@ -444,6 +479,10 @@ pub struct StressOutcome {
     pub max_light_apply: usize,
     pub max_mesh_worklist: usize,
     pub max_chunks: usize,
+    pub max_worker_near_queue: usize,
+    pub max_worker_far_queue: usize,
+    pub min_active_workers: usize,
+    pub min_stream_effort: f32,
 }
 
 /// How long after stopping a stress run waits for `entry_complete` before
@@ -461,6 +500,10 @@ struct StressRun {
     max_apply: usize,
     max_worklist: usize,
     max_chunks: usize,
+    max_worker_near: usize,
+    max_worker_far: usize,
+    min_active_workers: usize,
+    min_effort: f32,
 }
 
 impl StressRun {
@@ -474,6 +517,10 @@ impl StressRun {
             max_apply: 0,
             max_worklist: 0,
             max_chunks: 0,
+            max_worker_near: 0,
+            max_worker_far: 0,
+            min_active_workers: usize::MAX,
+            min_effort: 1.0,
         }
     }
 
@@ -487,6 +534,14 @@ impl StressRun {
             max_light_apply: self.max_apply,
             max_mesh_worklist: self.max_worklist,
             max_chunks: self.max_chunks,
+            max_worker_near_queue: self.max_worker_near,
+            max_worker_far_queue: self.max_worker_far,
+            min_active_workers: if self.min_active_workers == usize::MAX {
+                0
+            } else {
+                self.min_active_workers
+            },
+            min_stream_effort: self.min_effort,
         }
     }
 }
@@ -501,7 +556,11 @@ pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
             // Above the SineHills band (amplitude 20 around ~64) so a straight
             // +X flight stays airborne; scripted games run no physics, so the
             // height only affects which chunk layers stream.
-            cam: Some(CameraPose { pos: DVec3::new(0.0, 96.0, 0.0), yaw: 0.0, pitch: -0.15 }),
+            cam: Some(CameraPose {
+                pos: DVec3::new(0.0, 96.0, 0.0),
+                yaw: 0.0,
+                pitch: -0.15,
+            }),
             day: SCRIPTED_DEFAULT_DAY,
             view: DebugView::Normal,
             setup: None,
@@ -520,7 +579,11 @@ pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
     let out = execute(stages);
     specs
         .iter()
-        .filter_map(|s| out.stress.get(s.name).map(|o| (s.name.to_string(), o.clone())))
+        .filter_map(|s| {
+            out.stress
+                .get(s.name)
+                .map(|o| (s.name.to_string(), o.clone()))
+        })
         .collect()
 }
 
@@ -559,7 +622,11 @@ fn scratch_path(name: &str, tag: &str) -> PathBuf {
 /// The Normal-view capture path for an `ImageMatch` shot: the golden itself
 /// when blessing (captured straight in), else a scratch file to diff.
 fn image_capture_path(name: &str, bless: bool) -> PathBuf {
-    if bless { golden_path(name) } else { scratch_path(name, "normal") }
+    if bless {
+        golden_path(name)
+    } else {
+        scratch_path(name, "normal")
+    }
 }
 
 /// Derive the engine work-list from the acceptance set (pure). One `EntryTime`
@@ -598,7 +665,9 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                 DebugView::Normal,
                 shot.setup,
                 crate::render_config::RenderConfig::golden(),
-                StageKind::Capture { path: image_capture_path(shot.name, bless) },
+                StageKind::Capture {
+                    path: image_capture_path(shot.name, bless),
+                },
             )),
             Criterion::SkyHoleCount { shot, .. } => stages.push(Stage::new(
                 shot.seed,
@@ -607,7 +676,9 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                 DebugView::TerrainKey,
                 shot.setup,
                 crate::render_config::RenderConfig::golden(),
-                StageKind::Capture { path: scratch_path(shot.name, "terrainkey") },
+                StageKind::Capture {
+                    path: scratch_path(shot.name, "terrainkey"),
+                },
             )),
             Criterion::FrameTime { shot, .. } => stages.push(Stage::new(
                 shot.seed,
@@ -616,7 +687,9 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                 DebugView::Normal,
                 shot.setup,
                 crate::render_config::RenderConfig::golden(),
-                StageKind::FrameSample { name: shot.name.to_string() },
+                StageKind::FrameSample {
+                    name: shot.name.to_string(),
+                },
             )),
             Criterion::EntryTime { .. } | Criterion::NoProvisional { .. } => {}
         }
@@ -685,7 +758,9 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // a mis-timed focus is caught by the capture-dimension guard anyway.
         if !floated {
             floated = true;
-            let _ = std::process::Command::new("gharialctl").arg("toggle-float").status();
+            let _ = std::process::Command::new("gharialctl")
+                .arg("toggle-float")
+                .status();
         }
         let stage = &stages[idx];
         // First frame of a stage: (re)build its scripted game and reset the
@@ -700,7 +775,8 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             // never apply `Settings`, so push it straight into the world.
             // Vertical stays at the settings default (3 layers).
             if let Some(radius) = stage.radius {
-                g.world_mut().set_view_distances(radius, Settings::default().vertical_distance);
+                g.world_mut()
+                    .set_view_distances(radius, Settings::default().vertical_distance);
             }
             // Pin the shot's lighting, then run its one-shot world edit (cave
             // carve) — both before the first `update`/stream so the edit is in
@@ -727,7 +803,14 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // was a blank (uniform black) frame that passed ImageMatch trivially.
         // Streaming frames draw too, matching the real app (which renders while
         // chunks load) and warming pipelines before the captured frame.
-        g.update(eng, &mut router, &mut mods, &mut settings, &mut sound, &mut audio);
+        g.update(
+            eng,
+            &mut router,
+            &mut mods,
+            &mut settings,
+            &mut sound,
+            &mut audio,
+        );
         // Shake 0: captures must be deterministic (no live trauma exists in the
         // scripted path anyway).
         g.draw(eng, &mut mods, settings.fov, 0.0);
@@ -735,65 +818,79 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // A live stress run owns its stage's frames from here: it deliberately
         // flies THROUGH the un-entry states the gate below waits out, so it
         // bypasses that gate and its watchdog (the run keeps its own settle cap).
-        if let StageKind::StressFlight { name, speed_mps, secs, pace_hz } = &stage.kind {
-            if let Some(run) = stress.as_mut() {
-                // The WORK half of this frame (update+draw, everything above);
-                // the pacing sleep below is deliberately excluded.
-                let work = frame_started.elapsed();
-                let ms = work.as_secs_f32() * 1000.0;
-                let gauges = g.world().stream_gauges();
-                run.max_upload = run.max_upload.max(gauges.upload_queue);
-                run.max_apply = run.max_apply.max(gauges.light_apply_queue);
-                run.max_worklist = run.max_worklist.max(gauges.mesh_worklist);
-                run.max_chunks = run.max_chunks.max(gauges.chunks);
-                let finished = match run.stopped {
-                    None => {
-                        run.flight_ms.push(ms);
-                        // dt-based advance: constant speed at any frame rate. The
-                        // clamp keeps one hitch from a teleport-sized jump (the
-                        // streamer treats >0.5 s gaps as discontinuities).
-                        let dt = f64::from(eng.frame_time()).min(0.1);
-                        g.player_mut().position.x += speed_mps * dt;
-                        if run.flight_start.elapsed().as_secs_f64() >= *secs {
-                            run.stopped = Some(Instant::now());
-                            eprintln!("stress {name}: flight over — settling…");
+        if let StageKind::StressFlight {
+            name,
+            speed_mps,
+            secs,
+            pace_hz,
+        } = &stage.kind
+            && let Some(run) = stress.as_mut()
+        {
+            // The WORK half of this frame (update+draw, everything above);
+            // the pacing sleep below is deliberately excluded.
+            let work = frame_started.elapsed();
+            let ms = work.as_secs_f32() * 1000.0;
+            let gauges = g.world().stream_gauges();
+            run.max_upload = run.max_upload.max(gauges.upload_queue);
+            run.max_apply = run.max_apply.max(gauges.light_apply_queue);
+            run.max_worklist = run.max_worklist.max(gauges.mesh_worklist);
+            run.max_chunks = run.max_chunks.max(gauges.chunks);
+            run.max_worker_near = run.max_worker_near.max(gauges.worker_near_queue);
+            run.max_worker_far = run.max_worker_far.max(gauges.worker_far_queue);
+            if gauges.worker_capacity != 0 {
+                run.min_active_workers = run.min_active_workers.min(gauges.active_workers);
+            }
+            run.min_effort = run.min_effort.min(gauges.effort);
+            let finished = match run.stopped {
+                None => {
+                    run.flight_ms.push(ms);
+                    // dt-based advance: constant speed at any frame rate. The
+                    // clamp keeps one hitch from a teleport-sized jump (the
+                    // streamer treats >0.5 s gaps as discontinuities).
+                    let dt = f64::from(eng.frame_time()).min(0.1);
+                    g.player_mut().position.x += speed_mps * dt;
+                    if run.flight_start.elapsed().as_secs_f64() >= *secs {
+                        run.stopped = Some(Instant::now());
+                        eprintln!("stress {name}: flight over — settling…");
+                    }
+                    None
+                }
+                Some(stopped) => {
+                    run.settle_ms.push(ms);
+                    if g.world().entry_complete() {
+                        Some((Some(stopped.elapsed()), String::new()))
+                    } else if stopped.elapsed() >= STRESS_SETTLE_CAP {
+                        Some((None, g.world().entry_debug()))
+                    } else {
+                        if frame.is_multiple_of(120) {
+                            eprintln!("stress {name}: settling… {}", g.world().entry_debug());
                         }
                         None
                     }
-                    Some(stopped) => {
-                        run.settle_ms.push(ms);
-                        if g.world().entry_complete() {
-                            Some((Some(stopped.elapsed()), String::new()))
-                        } else if stopped.elapsed() >= STRESS_SETTLE_CAP {
-                            Some((None, g.world().entry_debug()))
-                        } else {
-                            if frame.is_multiple_of(120) {
-                                eprintln!("stress {name}: settling… {}", g.world().entry_debug());
-                            }
-                            None
-                        }
-                    }
-                };
-                frame += 1;
-                if let Some((settle_time, stuck)) = finished {
-                    let outcome = stress.take().expect("run is live").finish(settle_time, stuck);
-                    sink.borrow_mut().stress.insert(name.clone(), outcome);
-                    idx += 1;
-                    game = None;
-                    if idx >= stages.len() {
-                        return false;
-                    }
-                } else if *pace_hz > 0.0 {
-                    // Pace to the target cadence so per-frame lane budgets fire
-                    // at a real session's rate, not the capture window's
-                    // uncapped thousands of FPS.
-                    let target = Duration::from_secs_f64(1.0 / pace_hz);
-                    if let Some(rest) = target.checked_sub(frame_started.elapsed()) {
-                        std::thread::sleep(rest);
-                    }
                 }
-                return true;
+            };
+            frame += 1;
+            if let Some((settle_time, stuck)) = finished {
+                let outcome = stress
+                    .take()
+                    .expect("run is live")
+                    .finish(settle_time, stuck);
+                sink.borrow_mut().stress.insert(name.clone(), outcome);
+                idx += 1;
+                game = None;
+                if idx >= stages.len() {
+                    return false;
+                }
+            } else if *pace_hz > 0.0 {
+                // Pace to the target cadence so per-frame lane budgets fire
+                // at a real session's rate, not the capture window's
+                // uncapped thousands of FPS.
+                let target = Duration::from_secs_f64(1.0 / pace_hz);
+                if let Some(rest) = target.checked_sub(frame_started.elapsed()) {
+                    std::thread::sleep(rest);
+                }
             }
+            return true;
         }
 
         // Captures additionally wait for the fully-refined far field: a coarse
@@ -801,14 +898,17 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         // horizon pixels — and, through the exposure meter, the whole frame's
         // brightness — which made blessed shots run-to-run flaky.
         let entry = g.world().entry_complete();
-        let refined = !matches!(stage.kind, StageKind::Capture { .. })
-            || g.world().far_field_refined();
+        let refined =
+            !matches!(stage.kind, StageKind::Capture { .. }) || g.world().far_field_refined();
         if !entry || !refined {
             frame += 1;
             // Sample a few times a second (entry_debug scans the box — not per frame).
             if frame.is_multiple_of(20) {
                 let sig = if entry {
-                    format!("far field refining… sections pending: {}", g.world().far_field_pending())
+                    format!(
+                        "far field refining… sections pending: {}",
+                        g.world().far_field_pending()
+                    )
                 } else {
                     g.world().entry_debug()
                 };
@@ -822,7 +922,11 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             if stalled || stage_start.elapsed() > HARD_TIMEOUT {
                 eprintln!(
                     "harness: entry {} — {}",
-                    if stalled { "STALLED (no progress in 8s)" } else { "timed out (180s)" },
+                    if stalled {
+                        "STALLED (no progress in 8s)"
+                    } else {
+                        "timed out (180s)"
+                    },
                     g.world().entry_debug()
                 );
                 std::process::exit(2);
@@ -844,7 +948,9 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
 
         let done = match &stage.kind {
             StageKind::EntryTime => {
-                sink.borrow_mut().entry_times.insert(stage.seed, stage_start.elapsed());
+                sink.borrow_mut()
+                    .entry_times
+                    .insert(stage.seed, stage_start.elapsed());
                 true
             }
             StageKind::Capture { path } => {
@@ -870,7 +976,12 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
                 }
                 full
             }
-            StageKind::StressFlight { name, speed_mps, pace_hz, .. } => {
+            StageKind::StressFlight {
+                name,
+                speed_mps,
+                pace_hz,
+                ..
+            } => {
                 // Entry complete: begin the flight. The branch above the entry
                 // gate owns every subsequent frame of this stage.
                 eprintln!(
@@ -891,7 +1002,9 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
         true
     });
 
-    Rc::try_unwrap(outcomes).map(RefCell::into_inner).unwrap_or_default()
+    Rc::try_unwrap(outcomes)
+        .map(RefCell::into_inner)
+        .unwrap_or_default()
 }
 
 /// Path of the blessed golden PNG for a shot name.
@@ -911,9 +1024,16 @@ pub struct Report {
 /// artifacts. Exactly one `run` per process.
 pub fn run_acceptance(acc: &Acceptance, bless: bool) -> Report {
     let outcomes = execute(plan_stages(acc, bless));
-    let golden_entry_time = outcomes.entry_times.get(&GOLDEN_SEED).copied().unwrap_or_default();
+    let golden_entry_time = outcomes
+        .entry_times
+        .get(&GOLDEN_SEED)
+        .copied()
+        .unwrap_or_default();
     let result = evaluate(acc, bless, &outcomes);
-    Report { golden_entry_time, result }
+    Report {
+        golden_entry_time,
+        result,
+    }
 }
 
 /// Frozen-contract wrapper (`check`): run the whole
@@ -945,9 +1065,10 @@ fn evaluate(acc: &Acceptance, bless: bool, out: &Outcomes) -> Result<(), Vec<Fai
 fn capture_result(out: &Outcomes, path: &Path, what: &str) -> Result<(), Failure> {
     match out.captures.get(path) {
         Some(Ok(())) => Ok(()),
-        Some(Err(e)) => {
-            Err(Failure { what: what.to_string(), detail: format!("screenshot_to: {e}") })
-        }
+        Some(Err(e)) => Err(Failure {
+            what: what.to_string(),
+            detail: format!("screenshot_to: {e}"),
+        }),
         None => Err(Failure {
             what: what.to_string(),
             detail: format!("no capture recorded for {}", path.display()),
@@ -957,7 +1078,10 @@ fn capture_result(out: &Outcomes, path: &Path, what: &str) -> Result<(), Failure
 
 fn eval_criterion(c: &Criterion, bless: bool, out: &Outcomes) -> Result<(), Failure> {
     match c {
-        Criterion::ImageMatch { shot, max_pct_changed } => {
+        Criterion::ImageMatch {
+            shot,
+            max_pct_changed,
+        } => {
             let path = image_capture_path(shot.name, bless);
             capture_result(out, &path, &format!("image_match {}", shot.name))?;
             if bless {
@@ -1051,10 +1175,14 @@ fn eval_criterion(c: &Criterion, bless: bool, out: &Outcomes) -> Result<(), Fail
         }
 
         Criterion::FrameTime { shot, max_ms } => {
-            let mean_ms = out.frame_times.get(shot.name).copied().ok_or_else(|| Failure {
-                what: format!("frame_time {}", shot.name),
-                detail: "no frame-time sample recorded".into(),
-            })?;
+            let mean_ms = out
+                .frame_times
+                .get(shot.name)
+                .copied()
+                .ok_or_else(|| Failure {
+                    what: format!("frame_time {}", shot.name),
+                    detail: "no frame-time sample recorded".into(),
+                })?;
             if mean_ms > *max_ms {
                 return Err(Failure {
                     what: format!("frame_time {}", shot.name),
@@ -1074,7 +1202,11 @@ fn eval_criterion(c: &Criterion, bless: bool, out: &Outcomes) -> Result<(), Fail
 /// survives for a phase `p <= through` — cumulative, so a late phase also
 /// clears every earlier marker. Fully live (pure filesystem, no engine).
 fn no_provisional(through: Phase) -> Result<(), Failure> {
-    let targets: Vec<Phase> = Phase::ALL.iter().copied().filter(|p| *p <= through).collect();
+    let targets: Vec<Phase> = Phase::ALL
+        .iter()
+        .copied()
+        .filter(|p| *p <= through)
+        .collect();
     let mut hits: Vec<(Phase, String)> = Vec::new();
     for root in ["src", "voxel-engine/src"] {
         scan_dir(std::path::Path::new(root), &targets, &mut hits);
@@ -1090,9 +1222,17 @@ fn no_provisional(through: Phase) -> Result<(), Failure> {
         if count == 0 {
             continue;
         }
-        let examples: Vec<&str> =
-            hits.iter().filter(|(hp, _)| hp == p).take(4).map(|(_, loc)| loc.as_str()).collect();
-        detail.push_str(&format!("PROVISIONAL({}): {count} [{}]; ", p.marker(), examples.join(", ")));
+        let examples: Vec<&str> = hits
+            .iter()
+            .filter(|(hp, _)| hp == p)
+            .take(4)
+            .map(|(_, loc)| loc.as_str())
+            .collect();
+        detail.push_str(&format!(
+            "PROVISIONAL({}): {count} [{}]; ",
+            p.marker(),
+            examples.join(", ")
+        ));
     }
     Err(Failure {
         what: format!("no_provisional(through {through})"),
@@ -1188,7 +1328,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
     vec![
         GoldenShot {
             seed: GOLDEN_SEED,
-            cam: CameraPose { pos: DVec3::new(0.0, 80.0, 0.0), yaw: 0.0, pitch: -0.2 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 80.0, 0.0),
+                yaw: 0.0,
+                pitch: -0.2,
+            },
             name: "spawn_forward",
             day: SCRIPTED_DEFAULT_DAY,
             setup: None,
@@ -1196,7 +1340,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
         GoldenShot {
             seed: GOLDEN_SEED,
             // Looking out at the horizon — the shot where LOD/skin holes show.
-            cam: CameraPose { pos: DVec3::new(0.0, 90.0, 0.0), yaw: 2.35, pitch: 0.0 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 90.0, 0.0),
+                yaw: 2.35,
+                pitch: 0.0,
+            },
             name: "horizon",
             day: SCRIPTED_DEFAULT_DAY,
             setup: None,
@@ -1206,7 +1354,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
             // Looking down-forward so the full-res box edge — view_radius = 6
             // chunks = 96 m — sits mid-frame: this is where the chunk→far-tile
             // handoff must be seamless.
-            cam: CameraPose { pos: DVec3::new(0.0, 110.0, 0.0), yaw: 0.0, pitch: -0.35 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 110.0, 0.0),
+                yaw: 0.0,
+                pitch: -0.35,
+            },
             name: "tile_boundary",
             day: SCRIPTED_DEFAULT_DAY,
             setup: None,
@@ -1214,7 +1366,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
         GoldenShot {
             seed: GOLDEN_SEED,
             // PROVISIONAL(pre-A): pose reviewed at first capture. Primary-day pose (mirrors spawn_forward) at midnight.
-            cam: CameraPose { pos: DVec3::new(0.0, 80.0, 0.0), yaw: 0.0, pitch: -0.2 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 80.0, 0.0),
+                yaw: 0.0,
+                pitch: -0.2,
+            },
             name: "night_field",
             day: 0.0,
             setup: None,
@@ -1228,7 +1384,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
             // no chunk boundary runs through it, so no cross-chunk light re-settle
             // can strand the emitter's blocklight. Genuinely underground (surface
             // ~64); `carve_cave` seals the shell dark, facing the +x emitter.
-            cam: CameraPose { pos: DVec3::new(8.0, 40.0, 8.0), yaw: 0.0, pitch: 0.0 },
+            cam: CameraPose {
+                pos: DVec3::new(8.0, 40.0, 8.0),
+                yaw: 0.0,
+                pitch: 0.0,
+            },
             name: "cave_interior",
             day: 0.5,
             setup: Some(carve_cave),
@@ -1238,7 +1398,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
             // PROVISIONAL(pre-A): pose reviewed at first capture. Golden pos
             // +30 m, grazing down (~ −8°), yaw along the day-0.35 sun azimuth so
             // the 64/256 m splits + fade band sit mid-frame.
-            cam: CameraPose { pos: DVec3::new(0.0, 110.0, 0.0), yaw: 0.24, pitch: -0.14 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 110.0, 0.0),
+                yaw: 0.24,
+                pitch: -0.14,
+            },
             name: "shadow_boundary",
             day: 0.35,
             setup: None,
@@ -1249,7 +1413,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
             // near-level (~ −1°), yaw toward the day-0.30 sun azimuth so pure sky
             // sits over fog→1 terrain. `pos.y` is a stand-in for surface_y(0,0)+2,
             // to be re-pinned at first capture.
-            cam: CameraPose { pos: DVec3::new(0.0, 66.0, 0.0), yaw: 0.20, pitch: -0.017 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 66.0, 0.0),
+                yaw: 0.20,
+                pitch: -0.017,
+            },
             name: "horizon_fog_vs_sky",
             day: 0.30,
             setup: None,
@@ -1265,7 +1433,11 @@ pub fn golden_shots() -> Vec<GoldenShot> {
             // (as shadow_boundary reasons) so the sun's specular GLINT lands on the
             // water. Pinned day ⇒ pinned `anim` phase ⇒ deterministic wave
             // geometry. This is the golden that protects every WATER_* tunable.
-            cam: CameraPose { pos: DVec3::new(0.0, 72.0, 0.0), yaw: 0.24, pitch: -0.12 },
+            cam: CameraPose {
+                pos: DVec3::new(0.0, 72.0, 0.0),
+                yaw: 0.24,
+                pitch: -0.12,
+            },
             name: "water",
             day: SCRIPTED_DEFAULT_DAY,
             setup: None,
@@ -1285,8 +1457,12 @@ pub fn golden_shots() -> Vec<GoldenShot> {
 fn carve_cave(game: &mut Game) {
     let registry = game.world().registry();
     // The one built-in light-emitting block (`El::Lumin`, block/registry).
-    let emitter = registry.id_by_name("LuminVein").expect("LuminVein is a built-in block");
-    let stone = registry.id_by_name("Stone").expect("Stone is a built-in block");
+    let emitter = registry
+        .id_by_name("LuminVein")
+        .expect("LuminVein is a built-in block");
+    let stone = registry
+        .id_by_name("Stone")
+        .expect("Stone is a built-in block");
     let air = crate::block::registry::AIR;
     let p = game.player().position;
     let (cx, cy, cz) = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
@@ -1318,7 +1494,11 @@ mod tests {
         for _ in 0..(w * h) {
             rgba.extend_from_slice(&[c.r, c.g, c.b, c.a]);
         }
-        Screenshot { width: w, height: h, rgba }
+        Screenshot {
+            width: w,
+            height: h,
+            rgba,
+        }
     }
 
     fn set_px(shot: &mut Screenshot, x: u32, y: u32, c: Color) {
@@ -1331,11 +1511,17 @@ mod tests {
         // The bless guard: a flat fill (the black-screenshot failure) is
         // uniform; a single differing pixel (any real scene) is not.
         let flat = filled(8, 6, Color::rgb(0, 0, 0));
-        assert!(is_uniform(&flat), "an all-black frame is uniform → unblessable");
+        assert!(
+            is_uniform(&flat),
+            "an all-black frame is uniform → unblessable"
+        );
 
         let mut scene = a_clone(&flat);
         set_px(&mut scene, 3, 2, Color::rgb(1, 0, 0));
-        assert!(!is_uniform(&scene), "one differing pixel makes it a real frame");
+        assert!(
+            !is_uniform(&scene),
+            "one differing pixel makes it a real frame"
+        );
     }
 
     #[test]
@@ -1354,7 +1540,11 @@ mod tests {
         let d = diff(&a, &b);
         assert_eq!(d.max_channel_delta, 200);
         // Exactly one of 100 pixels changed.
-        assert!((d.pct_changed - 1.0).abs() < 1e-4, "pct_changed = {}", d.pct_changed);
+        assert!(
+            (d.pct_changed - 1.0).abs() < 1e-4,
+            "pct_changed = {}",
+            d.pct_changed
+        );
     }
 
     #[test]
@@ -1379,7 +1569,11 @@ mod tests {
     }
 
     fn a_clone(s: &Screenshot) -> Screenshot {
-        Screenshot { width: s.width, height: s.height, rgba: s.rgba.clone() }
+        Screenshot {
+            width: s.width,
+            height: s.height,
+            rgba: s.rgba.clone(),
+        }
     }
 
     #[test]
@@ -1464,7 +1658,13 @@ mod tests {
         let mut hits = Vec::new();
         scan_line("// PROVISIONAL(A): a", &targets, path, 1, &mut hits);
         scan_line("// PROVISIONAL(pre-A): b", &targets, path, 2, &mut hits);
-        scan_line("// PROVISIONAL(C): out of range", &targets, path, 3, &mut hits);
+        scan_line(
+            "// PROVISIONAL(C): out of range",
+            &targets,
+            path,
+            3,
+            &mut hits,
+        );
         let phases: Vec<Phase> = hits.iter().map(|(p, _)| *p).collect();
         assert_eq!(phases, vec![Phase::A, Phase::PreA]);
     }
@@ -1477,6 +1677,9 @@ mod tests {
         let path = std::path::Path::new("x.rs");
         let mut hits = Vec::new();
         scan_line("PROVISIONAL(pre-A)", &targets, path, 1, &mut hits);
-        assert_eq!(hits.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![Phase::PreA]);
+        assert_eq!(
+            hits.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![Phase::PreA]
+        );
     }
 }

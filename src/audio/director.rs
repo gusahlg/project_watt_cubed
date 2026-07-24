@@ -14,6 +14,7 @@ use glam::{DVec3, IVec3};
 
 use crate::block::registry::BlockId;
 use crate::console::Console;
+use crate::math::PER_METER;
 use crate::net::client::Connection;
 use crate::presence::STRIDE_FREQ;
 use crate::world::World;
@@ -28,8 +29,9 @@ use super::{
     SessionKey, SoundSystem, VoicePacket,
 };
 
-/// Radius (metres) of the acoustic window captured around the listener.
-const ACOUSTIC_RADIUS: u32 = 32;
+/// Radius of the acoustic window, authored as 32 metres and converted to whole
+/// world cells. Round outward so the advertised range is never truncated.
+const ACOUSTIC_RADIUS: u32 = (32.0 * PER_METER) as u32 + 1;
 
 /// The unrecoverable facts: everything else the director derives from
 /// `AudioCtx`. Closed — its fold is one `match`, no bus/trait indirection.
@@ -43,6 +45,7 @@ pub enum SoundEvent {
 /// The local listener pose, built once per frame from `Player`.
 pub struct PlayerPose {
     pub pos: DVec3,
+    pub feet: DVec3,
     pub yaw: f32,
     pub pitch: f32,
     pub velocity: DVec3,
@@ -56,6 +59,7 @@ pub struct PlayerPose {
 pub struct PeerPose {
     pub id: u32,
     pub at: DVec3,
+    pub feet: DVec3,
     pub visible: bool,
     pub phase: f32,
     pub speed: f32,
@@ -84,14 +88,17 @@ struct Gait {
 
 impl Gait {
     fn new() -> Self {
-        Self { phase: 0.0, prev: 0.0 }
+        Self {
+            phase: 0.0,
+            prev: 0.0,
+        }
     }
 
     /// Advance by this frame's travel and report whether a π boundary was crossed.
     fn advance(&mut self, speed: f64, dt: f32) -> bool {
         self.phase += speed * dt as f64 * STRIDE_FREQ;
-        let crossed =
-            (self.phase / std::f64::consts::PI).floor() != (self.prev / std::f64::consts::PI).floor();
+        let crossed = (self.phase / std::f64::consts::PI).floor()
+            != (self.prev / std::f64::consts::PI).floor();
         self.prev = self.phase;
         crossed
     }
@@ -123,7 +130,11 @@ impl WindowCache {
 
     fn refresh(&mut self, world: &World, pos: DVec3, dt: f32) -> Option<Arc<AcousticWindow>> {
         self.timer += dt;
-        let cell = IVec3::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+        let cell = IVec3::new(
+            pos.x.floor() as i32,
+            pos.y.floor() as i32,
+            pos.z.floor() as i32,
+        );
         let edit_gen = world.edit_generation();
         let stale = self.window.is_none()
             || edit_gen != self.edit_gen
@@ -148,29 +159,47 @@ struct CaptureLane {
 
 impl CaptureLane {
     fn new() -> Self {
-        Self { capture: None, faulted: false }
+        Self {
+            capture: None,
+            faulted: false,
+        }
     }
 
     fn service(&mut self, want_tx: bool, net: Option<&mut Connection>, console: &mut Console) {
+        // One failure is reported per press. Releasing PTT rearms discovery so a
+        // hot-plugged/default device can recover without reloading the world.
+        if !want_tx {
+            self.faulted = false;
+        }
         if want_tx && self.capture.is_none() && !self.faulted {
             match Capture::new(CaptureConfig { device: None }) {
                 Ok(c) => self.capture = Some(c),
                 Err(e) => {
                     self.faulted = true;
-                    console.print(format!("* voice capture unavailable: {e:?}"));
+                    console.print(format!("* voice capture unavailable: {e}"));
                 }
             }
         }
+        let mut runtime_fault = None;
         if let Some(cap) = self.capture.as_mut() {
             cap.set_transmitting(want_tx);
-            if let Some(net) = net {
-                for f in cap.drain() {
-                    net.send_voice(f.seq.0, &f.payload);
+            match (want_tx, net) {
+                (true, Some(net)) => {
+                    for f in cap.drain() {
+                        net.send_voice(f.seq.0, &f.payload);
+                    }
+                }
+                _ => {
+                    // Release means stop now; do not send an already-encoded tail.
+                    cap.drain().for_each(drop);
                 }
             }
-            if let Some(e) = cap.poll_fault() {
-                console.print(format!("* voice capture error: {e:?}"));
-            }
+            runtime_fault = cap.poll_fault();
+        }
+        if let Some(error) = runtime_fault {
+            console.print(format!("* voice capture error: {error}"));
+            self.capture = None;
+            self.faulted = true;
         }
     }
 }
@@ -226,17 +255,29 @@ impl AudioDirector {
     /// Push one occurrence, bounded like `Game::emit` so `AudioFrame::new` never
     /// rejects the whole frame for overflow. Ids are minted in push order, so the
     /// journal is strictly increasing by construction.
-    fn push(&mut self, journal: &mut Vec<Occurrence>, at: Option<DVec3>, sfx: Sfx<OneShot>) {
+    fn push(
+        &mut self,
+        journal: &mut Vec<Occurrence>,
+        at: Option<DVec3>,
+        medium: Medium,
+        sfx: Sfx<OneShot>,
+    ) {
         if journal.len() >= MAX_OCCURRENCES {
             return;
         }
         let id = self.mint();
-        journal.push(Occurrence { id, cue: sfx.cue, at, gain: sfx.gain });
+        journal.push(Occurrence {
+            id,
+            cue: sfx.cue,
+            at,
+            medium,
+            gain: sfx.gain,
+        });
     }
 
     pub fn frame(&mut self, mut ctx: AudioCtx<'_>, sound: &mut SoundSystem) {
         let dt = ctx.dt;
-        let medium = listener_medium(ctx.world, ctx.player.pos);
+        let medium = medium_at(ctx.world, ctx.player.pos);
         let listener = Listener {
             pos: ctx.player.pos,
             yaw: ctx.player.yaw,
@@ -251,18 +292,22 @@ impl AudioDirector {
         for ev in &ctx.events {
             match ev {
                 SoundEvent::BlockBroken { at, block } => {
-                    if let Some(sfx) = self.palette.break_block(ctx.world.registry().sound_class(*block)) {
-                        self.push(&mut journal, Some(*at), sfx);
+                    if let Some(sfx) = self
+                        .palette
+                        .break_block(ctx.world.registry().sound_class(*block))
+                    {
+                        self.push(&mut journal, Some(*at), medium_at(ctx.world, *at), sfx);
                     }
                 }
                 SoundEvent::BlockPlaced { at, block } => {
-                    if let Some(sfx) = self.palette.place(ctx.world.registry().sound_class(*block)) {
-                        self.push(&mut journal, Some(*at), sfx);
+                    if let Some(sfx) = self.palette.place(ctx.world.registry().sound_class(*block))
+                    {
+                        self.push(&mut journal, Some(*at), medium_at(ctx.world, *at), sfx);
                     }
                 }
                 SoundEvent::PeerSwing { at } => {
                     if let Some(sfx) = self.palette.swing() {
-                        self.push(&mut journal, Some(*at), sfx);
+                        self.push(&mut journal, Some(*at), medium_at(ctx.world, *at), sfx);
                     }
                 }
                 // UI is fire-and-forget outside the journal (the menus path).
@@ -278,9 +323,14 @@ impl AudioDirector {
         let v = ctx.player.velocity;
         let speed = (v.x * v.x + v.z * v.z).sqrt();
         if self.gait.advance(speed, dt) && speed > 0.5 && ctx.player.on_ground {
-            let p = ctx.player.pos;
-            if let Some(sfx) = self.palette.step(sound_class_below(ctx.world, p)) {
-                self.push(&mut journal, Some(p), sfx);
+            let feet = ctx.player.feet;
+            if let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, feet)) {
+                self.push(
+                    &mut journal,
+                    Some(feet),
+                    medium_at(ctx.world, ctx.player.pos),
+                    sfx,
+                );
             }
         }
 
@@ -290,40 +340,56 @@ impl AudioDirector {
         // allocation plus hashing every multiplayer frame.
         for peer in ctx.peers {
             let prev = self.peer_gait.insert(peer.id, peer.phase);
-            if let Some(prev) = prev {
-                if phase_crossed(prev, peer.phase) && peer.speed > 0.5 {
-                    if let Some(sfx) = self.palette.step(sound_class_below(ctx.world, peer.at)) {
-                        self.push(&mut journal, Some(peer.at), sfx);
-                    }
-                }
+            if let Some(prev) = prev
+                && phase_crossed(prev, peer.phase)
+                && peer.speed > 0.5
+                && let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, peer.feet))
+            {
+                self.push(
+                    &mut journal,
+                    Some(peer.feet),
+                    medium_at(ctx.world, peer.at),
+                    sfx,
+                );
             }
         }
         let peers = ctx.peers;
-        self.peer_gait.retain(|id, _| peers.iter().any(|p| p.id == *id));
+        self.peer_gait
+            .retain(|id, _| peers.iter().any(|p| p.id == *id));
 
         // --- Derived: splash on a listener medium transition (both directions) ---
-        if let Some(prev) = self.prev_medium {
-            if matches!(prev, Medium::Water) != matches!(medium, Medium::Water) {
-                if let Some(sfx) = self.palette.splash() {
-                    self.push(&mut journal, Some(ctx.player.pos), sfx);
-                }
-            }
+        if let Some(prev) = self.prev_medium
+            && matches!(prev, Medium::Water) != matches!(medium, Medium::Water)
+            && let Some(sfx) = self.palette.splash()
+        {
+            self.push(&mut journal, Some(ctx.player.pos), medium, sfx);
         }
         self.prev_medium = Some(medium);
 
         // --- Derived: emitter table (latest-wins), one underwater bed iff submerged ---
         let mut emitters: Vec<Emitter> = Vec::new();
-        if matches!(medium, Medium::Water) {
-            if let Some(sfx) = self.palette.underwater_loop() {
-                emitters.push(Emitter { id: EmitterId(0), cue: sfx.cue, at: ctx.player.pos, gain: sfx.gain });
-            }
+        if matches!(medium, Medium::Water)
+            && let Some(sfx) = self.palette.underwater_loop()
+        {
+            emitters.push(Emitter {
+                id: EmitterId(0),
+                cue: sfx.cue,
+                at: ctx.player.pos,
+                medium: Medium::Water,
+                gain: sfx.gain,
+            });
         }
 
         // --- Voice sessions: present per visible peer, close on roster exit.
         // Consumes the one peer sample instead of resampling net. ---
         if ctx.net.is_some() {
             for peer in ctx.peers {
-                sound.set_session_present(SessionKey(peer.id), peer.visible, Some(peer.at));
+                sound.set_session_present(
+                    SessionKey(peer.id),
+                    peer.visible,
+                    Some(peer.at),
+                    medium_at(ctx.world, peer.at),
+                );
             }
             self.voice_open.retain(|&id| {
                 let present = peers.iter().any(|p| p.id == id);
@@ -356,8 +422,9 @@ impl AudioDirector {
         }
 
         // --- Capture / push-to-talk ---
-        let want_tx = ctx.ptt && ctx.voice_enabled;
-        self.capture.service(want_tx, ctx.net.as_deref_mut(), ctx.console);
+        let want_tx = ctx.ptt && ctx.voice_enabled && ctx.net.is_some();
+        self.capture
+            .service(want_tx, ctx.net.as_deref_mut(), ctx.console);
 
         // --- Surface faults to the console, deduped once per Fault kind ---
         let mut seen: HashSet<std::mem::Discriminant<Fault>> = HashSet::new();
@@ -371,8 +438,12 @@ impl AudioDirector {
 
 /// The listener's medium, read from the block occupying the eye cell (buoyant
 /// blocks are water for acoustics).
-fn listener_medium(world: &World, pos: DVec3) -> Medium {
-    let id = world.block_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+fn medium_at(world: &World, pos: DVec3) -> Medium {
+    let id = world.block_at(
+        pos.x.floor() as i32,
+        pos.y.floor() as i32,
+        pos.z.floor() as i32,
+    );
     if world.registry().buoyancy(id) > 0 {
         Medium::Water
     } else {
@@ -382,11 +453,11 @@ fn listener_medium(world: &World, pos: DVec3) -> Medium {
 
 /// The sound class of the block just under a foot position (the 0.1 m probe below
 /// the eye/feet pos), for footstep cue selection.
-fn sound_class_below(world: &World, pos: DVec3) -> &'static str {
+fn sound_class_at_feet(world: &World, feet: DVec3) -> &'static str {
     let below = world.block_at(
-        pos.x.floor() as i32,
-        (pos.y - 0.1).floor() as i32,
-        pos.z.floor() as i32,
+        feet.x.floor() as i32,
+        (feet.y - 0.1).floor() as i32,
+        feet.z.floor() as i32,
     );
     world.registry().sound_class(below)
 }

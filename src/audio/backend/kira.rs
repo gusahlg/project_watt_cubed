@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::DVec3;
 use kira::{
-    AudioManager, AudioManagerSettings, DefaultBackend, Decibels, Frame, Panning, Tween,
+    AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Frame, Panning, Tween,
     effect::{
         filter::{FilterBuilder, FilterHandle, FilterMode},
         panning_control::{PanningControlBuilder, PanningControlHandle},
@@ -41,7 +41,7 @@ use rtrb::Consumer;
 
 use super::super::acoustics::{Dsp, Listener};
 use super::super::voice::{
-    JitterBuffer, PlayoutStep, VoicePacket, VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE,
+    JitterBuffer, PlayoutStep, VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE, VoicePacket,
 };
 use super::{Backend, BackendVoice, ClipId, ClipStore, StoredClip};
 
@@ -101,7 +101,10 @@ impl KiraBackend {
     }
 
     /// A fresh sub-track carrying the initial `Dsp` as track volume + lowpass + pan.
-    fn open_track(&mut self, dsp: &Dsp) -> Option<(TrackHandle, FilterHandle, PanningControlHandle)> {
+    fn open_track(
+        &mut self,
+        dsp: &Dsp,
+    ) -> Option<(TrackHandle, FilterHandle, PanningControlHandle)> {
         let mut builder = TrackBuilder::new();
         let pan = builder.add_effect(PanningControlBuilder(pan_scalar(dsp).into()));
         let filter = builder.add_effect(
@@ -120,7 +123,10 @@ impl ClipStore for KiraBackend {
         let data = StaticSoundData::from_cursor(Cursor::new(bytes.to_vec()))
             .map_err(|e| format!("clip decode: {e:?}"))?;
         let duration_s = data.duration().as_secs_f32();
-        let id = ClipId(self.clips.len() as u32);
+        let id = ClipId(
+            u32::try_from(self.clips.len())
+                .map_err(|_| "too many decoded audio clips".to_owned())?,
+        );
         self.clips.push(data);
         Ok(StoredClip { id, duration_s })
     }
@@ -142,10 +148,22 @@ impl Backend for KiraBackend {
         let data = self.clips.get(clip.0 as usize)?.clone();
         let (mut track, filter, pan) = self.open_track(&dsp)?;
         let data = data.playback_rate(rate as f64);
-        let data = if looped { data.loop_region(0.0..) } else { data };
+        let data = if looped {
+            data.loop_region(0.0..)
+        } else {
+            data
+        };
         let sound = track.play(data).ok()?;
         let id = self.mint();
-        self.voices.insert(id, LiveVoice { track, filter, pan, sound: SoundHandle::Clip(sound) });
+        self.voices.insert(
+            id,
+            LiveVoice {
+                track,
+                filter,
+                pan,
+                sound: SoundHandle::Clip(sound),
+            },
+        );
         Some(BackendVoice(id))
     }
 
@@ -161,7 +179,11 @@ impl Backend for KiraBackend {
             return None;
         }
         // Opened muted: the runtime unmutes via update() once the peer is presented.
-        let dsp = Dsp { gain: 0.0, lowpass_hz: 20_000.0, pan: None };
+        let dsp = Dsp {
+            gain: 0.0,
+            lowpass_hz: 20_000.0,
+            pan: None,
+        };
         let (mut track, filter, pan) = self.open_track(&dsp)?;
         let decoder = VoiceDecoder {
             feed,
@@ -171,7 +193,15 @@ impl Backend for KiraBackend {
         };
         let sound = track.play(StreamingSoundData::from_decoder(decoder)).ok()?;
         let id = self.mint();
-        self.voices.insert(id, LiveVoice { track, filter, pan, sound: SoundHandle::Stream(sound) });
+        self.voices.insert(
+            id,
+            LiveVoice {
+                track,
+                filter,
+                pan,
+                sound: SoundHandle::Stream(sound),
+            },
+        );
         Some(BackendVoice(id))
     }
 
@@ -194,7 +224,9 @@ impl Backend for KiraBackend {
     }
 
     fn set_master(&mut self, master: f32) {
-        self.manager.main_track().set_volume(gain_db(master), GAUGE_TWEEN);
+        self.manager
+            .main_track()
+            .set_volume(gain_db(master), GAUGE_TWEEN);
     }
 
     fn alive(&self) -> bool {

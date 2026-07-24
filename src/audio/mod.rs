@@ -13,6 +13,7 @@
 //! a panic across the game seam.
 
 pub mod acoustics;
+pub mod assets;
 pub mod capture;
 pub mod content;
 pub mod director;
@@ -23,7 +24,6 @@ pub mod voice;
 pub(crate) mod backend;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -32,37 +32,20 @@ use glam::DVec3;
 
 use acoustics::{AcousticWindow, Coords, Dsp, SmoothedCoords, audibility, respond, trace};
 use backend::kira::KiraBackend;
-use backend::{Backend, BackendVoice, ClipId, ClipStore, StoredClip};
-use content::{Catalog, CatalogError, Cue, DrawKind, draw, draw_raw};
+use backend::null::NullBackend;
+use backend::{Backend, BackendVoice, ClipId, ClipStore};
+use content::{Catalog, CatalogError, DrawKind, Layer, draw, draw_raw};
 use voice::{PACKET_QUEUE_DEPTH, Session};
 
 // Re-exports so callers name these through `crate::audio::*` (the seam surface).
 pub use acoustics::{Listener, Medium, Response};
+pub use assets::{AudioAssets, SoundConfig};
 pub use capture::{Capture, CaptureConfig, CaptureError, EncodedFrame};
 pub use content::{CueId, CueMode, CueSymbols, Loop, OneShot};
 pub use director::{AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent};
 pub use frame::{AudioFrame, Emitter, EmitterId, FrameError, Occurrence, OccurrenceId};
 pub use palette::{CuePalette, Sfx, UiSound};
 pub use voice::{Epoch, Seq, SessionKey, VoicePacket};
-
-/// Runtime tuning handed to [`SoundSystem::new`].
-pub struct SoundConfig {
-    pub max_voices: usize,           // physical budget; groups compete
-    pub smoothing_halflife_s: f32,   // coordinate smoothing half-life
-    pub jitter_target_ms: u32,       // voice playout delay target (2 frames = 40 ms)
-    pub content_dir: PathBuf,
-}
-
-impl Default for SoundConfig {
-    fn default() -> Self {
-        Self {
-            max_voices: 32,
-            smoothing_halflife_s: 0.05,
-            jitter_target_ms: 40,
-            content_dir: PathBuf::from("assets/sounds"),
-        }
-    }
-}
 
 /// Control snapshot. `muted` silences all output at the master; `deafen` mutes
 /// incoming voice only, leaving decoders running.
@@ -77,7 +60,29 @@ pub struct MixChange {
 
 impl Default for MixChange {
     fn default() -> Self {
-        Self { master: 1.0, effects: 1.0, voice: 1.0, muted: false, deafen: false }
+        Self {
+            master: 1.0,
+            effects: 1.0,
+            voice: 1.0,
+            muted: false,
+            deafen: false,
+        }
+    }
+}
+
+impl MixChange {
+    fn normalized(mut self) -> Self {
+        fn gain(value: f32) -> f32 {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+        self.master = gain(self.master);
+        self.effects = gain(self.effects);
+        self.voice = gain(self.voice);
+        self
     }
 }
 
@@ -85,22 +90,42 @@ impl Default for MixChange {
 #[derive(Debug)]
 pub enum Fault {
     BackendLost,
-    DecoderFailed { session: SessionKey },
-    CatalogWarning(String),
-    Starved { session: SessionKey },
-    BadUiCue { cue: CueId<OneShot> },
+    Starved {
+        session: SessionKey,
+    },
+    BadUiCue {
+        cue: CueId<OneShot>,
+    },
     /// A one-shot occurrence reached its `max_duration` with layers that never
     /// sounded (lost the voice budget for its whole life): an audible drop, logged
     /// rather than silently discarded.
-    OccurrenceDropped { id: OccurrenceId, pending: usize },
+    OccurrenceDropped {
+        id: OccurrenceId,
+        pending: usize,
+    },
 }
 
 /// Only construction can fail: a dead backend degrades in place, but a
 /// malformed catalog has no silent fallback.
 #[derive(Debug)]
 pub enum SoundInitError {
-    Backend(String),
     Catalog(CatalogError),
+}
+
+impl std::fmt::Display for SoundInitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SoundInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Catalog(error) => Some(error),
+        }
+    }
 }
 
 // --- coordinate smoothing ---
@@ -109,12 +134,18 @@ pub enum SoundInitError {
 pub(crate) struct Smoothed {
     distance: f32,
     occlusion: f32,
+    medium: Medium,
     init: bool,
 }
 
 impl Smoothed {
     pub(crate) fn new() -> Self {
-        Self { distance: 0.0, occlusion: 0.0, init: false }
+        Self {
+            distance: 0.0,
+            occlusion: 0.0,
+            medium: Medium::Air,
+            init: false,
+        }
     }
     /// Advance toward `raw` and mint the smoothed value. The returned
     /// [`SmoothedCoords`] is the only coords `respond`/`audibility`/`dsp_for` accept,
@@ -128,12 +159,13 @@ impl Smoothed {
             self.distance += (raw.distance - self.distance) * k;
             self.occlusion += (raw.occlusion - self.occlusion) * k;
         }
+        self.medium = raw.medium;
         SmoothedCoords::new(self.distance, self.occlusion, raw.medium)
     }
     /// The already-integrated value without advancing — the apply passes read this
     /// after ranking observed once this frame.
-    fn current(&self, medium: Medium) -> SmoothedCoords {
-        SmoothedCoords::new(self.distance, self.occlusion, medium)
+    fn current(&self) -> SmoothedCoords {
+        SmoothedCoords::new(self.distance, self.occlusion, self.medium)
     }
 }
 
@@ -142,21 +174,40 @@ impl Smoothed {
 struct GroupState {
     cue: CueId<OneShot>,
     at: Option<DVec3>,
+    medium: Medium,
     gain: f32,
     smooth: Smoothed,
     layers: Box<[LayerState]>,
     age: f32, // seconds since realization; ≥ cue.max_duration ⇒ Released
 }
 
+/// Every randomized layer parameter is drawn together exactly once. One-shots,
+/// looping emitters, and UI playback all use this same realization path, keeping
+/// variant/gain/pitch/delay semantics from drifting between sinks.
+#[derive(Clone, Copy)]
+struct LayerDraw {
+    clip: ClipId,
+    gain: f32,
+    rate: f32,
+    delay: f32,
+}
+
 enum LayerState {
-    Pending { delay: f32 },
+    Pending { draw: LayerDraw },
     Sounding { voice: BackendVoice, gain: f32 },
     Done,
 }
 
 struct EmitterVoice {
-    voice: BackendVoice,
+    cue: CueId<Loop>,
     smooth: Smoothed,
+    age: f32,
+    layers: Box<[EmitterLayer]>,
+}
+
+struct EmitterLayer {
+    draw: LayerDraw,
+    voice: Option<BackendVoice>,
 }
 
 /// The allocation ranking key — unifies the three state maps under one budget.
@@ -174,8 +225,9 @@ pub struct SoundSystem {
     backend: Box<dyn Backend>,
     cfg: SoundConfig,
     mix: MixChange,
-    /// Idempotence: occurrences with id ≤ this were already realized.
-    high_water: OccurrenceId,
+    /// Idempotence: occurrences at or below this id were already realized.
+    /// `None` is the only correct fresh sentinel because id zero is valid.
+    high_water: Option<OccurrenceId>,
     clip_voices: HashMap<OccurrenceId, GroupState>,
     emitter_voices: HashMap<EmitterId, EmitterVoice>,
     sessions: HashMap<SessionKey, Session>,
@@ -196,7 +248,8 @@ pub struct SoundSystem {
 }
 
 impl SoundSystem {
-    pub fn new(cfg: SoundConfig) -> Result<(Self, CueSymbols), SoundInitError> {
+    pub fn new(mut cfg: SoundConfig) -> Result<(Self, CueSymbols), SoundInitError> {
+        cfg.normalize();
         let mut faults = VecDeque::new();
         let mut reported_lost = false;
         // A missing/failed device degrades to a silent NullBackend rather
@@ -216,7 +269,10 @@ impl SoundSystem {
             Catalog::load(&cfg.content_dir, clips).map_err(SoundInitError::Catalog)?
         };
 
-        Ok((Self::assemble(backend, catalog, faults, reported_lost, cfg), symbols))
+        Ok((
+            Self::assemble(backend, catalog, faults, reported_lost, cfg),
+            symbols,
+        ))
     }
 
     /// A guaranteed-silent system: a `NullBackend` over an empty catalog, with no
@@ -231,7 +287,7 @@ impl SoundSystem {
             catalog,
             VecDeque::new(),
             true,
-            SoundConfig::default(),
+            SoundConfig::silent(),
         );
         (system, symbols)
     }
@@ -243,7 +299,7 @@ impl SoundSystem {
         match Self::new(cfg) {
             Ok(pair) => pair,
             Err(e) => {
-                eprintln!("audio: init failed ({e:?}); running muted");
+                eprintln!("audio: init failed ({e}); running muted");
                 Self::mute()
             }
         }
@@ -262,7 +318,7 @@ impl SoundSystem {
             catalog,
             backend,
             mix: MixChange::default(),
-            high_water: OccurrenceId(0),
+            high_water: None,
             clip_voices: HashMap::new(),
             emitter_voices: HashMap::new(),
             sessions: HashMap::new(),
@@ -287,10 +343,9 @@ impl SoundSystem {
         &self.catalog
     }
 
-    /// Reset all world-scoped state (voices, sessions, high-water → 0). Idempotent.
+    /// Reset all world-scoped state (voices, sessions, high-water → empty). Idempotent.
     /// Game's `next_occurrence` counter is process-monotone and never resets, so a
-    /// fresh high-water of 0 accepts everything while ids from a prior world can
-    /// never replay as fresh. Exactly one side resets — this one.
+    /// fresh high-water accepts every valid id, including zero.
     pub fn enter_world(&mut self) {
         for (_, group) in self.clip_voices.drain() {
             for layer in group.layers.iter() {
@@ -300,7 +355,7 @@ impl SoundSystem {
             }
         }
         for (_, ev) in self.emitter_voices.drain() {
-            self.backend.stop(ev.voice);
+            stop_emitter(&mut *self.backend, ev);
         }
         for (_, session) in self.sessions.drain() {
             if let Session::Streaming { voice, .. } = session {
@@ -311,7 +366,7 @@ impl SoundSystem {
             self.backend.stop(voice); // menu cues must not bleed across a world load
         }
         self.session_starved.clear();
-        self.high_water = OccurrenceId(0);
+        self.high_water = None;
     }
 
     pub fn leave_world(&mut self) {
@@ -328,9 +383,7 @@ impl SoundSystem {
             let (_, listener, occurrences, _, _) = frame.into_parts();
             self.last_listener = listener;
             for o in &occurrences {
-                if o.id > self.high_water {
-                    self.high_water = o.id;
-                }
+                self.high_water = Some(self.high_water.map_or(o.id, |seen| seen.max(o.id)));
             }
             return;
         }
@@ -344,20 +397,21 @@ impl SoundSystem {
         for group in self.clip_voices.values_mut() {
             group.age += dt;
         }
+        for emitter in self.emitter_voices.values_mut() {
+            emitter.age += dt;
+        }
         for occ in &occurrences {
-            if occ.id <= self.high_water {
+            if self.high_water.is_some_and(|seen| occ.id <= seen) {
                 continue; // idempotence
             }
-            if occ.id > max_id {
-                max_id = occ.id;
-            }
+            max_id = Some(max_id.map_or(occ.id, |seen| seen.max(occ.id)));
             let cue = self.catalog.cue(occ.cue);
             let layers: Box<[LayerState]> = cue
                 .layers
                 .iter()
                 .enumerate()
                 .map(|(li, layer)| LayerState::Pending {
-                    delay: draw_range(occ.id, li as u16, DrawKind::Delay, &layer.delay).max(0.0),
+                    draw: draw_layer(layer, occ.id, li as u16),
                 })
                 .collect();
             self.clip_voices.insert(
@@ -365,6 +419,7 @@ impl SoundSystem {
                 GroupState {
                     cue: occ.cue,
                     at: occ.at,
+                    medium: occ.medium,
                     gain: occ.gain,
                     smooth: Smoothed::new(),
                     layers,
@@ -376,56 +431,100 @@ impl SoundSystem {
 
         // --- Emitter reconcile (latest-wins snapshot) ---
         let table: HashMap<EmitterId, Emitter> = emitters.iter().map(|e| (e.id, *e)).collect();
-        // Release emitters absent from the table.
+        // Release emitters absent from the table, or whose stable id was reused
+        // for a different cue. Keeping the old decoded loop in the latter case
+        // would make the snapshot lie about what is sounding.
         let gone: Vec<EmitterId> = self
             .emitter_voices
-            .keys()
-            .copied()
-            .filter(|id| !table.contains_key(id))
+            .iter()
+            .filter_map(|(id, state)| {
+                table
+                    .get(id)
+                    .is_none_or(|emitter| emitter.cue != state.cue)
+                    .then_some(*id)
+            })
             .collect();
         for id in gone {
             if let Some(ev) = self.emitter_voices.remove(&id) {
-                self.backend.stop(ev.voice);
+                stop_emitter(&mut *self.backend, ev);
             }
         }
-        // Spawn emitters present in the table but absent in the map.
+        // Realize deterministic layer data for new loop groups. Actual backend
+        // voices open only after ranking grants the whole group a budget.
         for e in &emitters {
             if self.emitter_voices.contains_key(&e.id) {
                 continue;
             }
-            if let Some(voice) = spawn_emitter(&self.catalog, &mut *self.backend, e, &listener) {
-                self.emitter_voices
-                    .insert(e.id, EmitterVoice { voice, smooth: Smoothed::new() });
-            }
+            let cue = self.catalog.cue(e.cue);
+            let draw_id = OccurrenceId(e.id.0 ^ EMITTER_DRAW_SALT);
+            let layers = cue
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(index, layer)| EmitterLayer {
+                    draw: draw_layer(layer, draw_id, index as u16),
+                    voice: None,
+                })
+                .collect();
+            self.emitter_voices.insert(
+                e.id,
+                EmitterVoice {
+                    cue: e.cue,
+                    smooth: Smoothed::new(),
+                    age: 0.0,
+                    layers,
+                },
+            );
         }
 
         // --- Trace coords, rank by audibility, allocate whole groups ---
         let mut cands: Vec<(f32, GroupKey, usize)> = Vec::new();
 
         for (id, group) in self.clip_voices.iter_mut() {
-            let raw = raw_coords(&window, &listener, group.at);
+            let raw = raw_coords(&window, &listener, group.at, group.medium);
             let sc = group.smooth.observe(&raw, k);
             let cue = self.catalog.cue(group.cue);
             // Rank with the group's loudest possible layer gain so the bound covers
             // every layer's `lgain`: audibility ≥ applied for all of them.
-            let max_lgain = cue.layers.iter().map(|l| *l.gain.end()).fold(0.0f32, f32::max);
+            let max_lgain = cue
+                .layers
+                .iter()
+                .map(|l| *l.gain.end())
+                .fold(0.0f32, f32::max);
             let aud = audibility(cue.response, sc, group.gain * max_lgain);
             // Cost is the voices the group will actually hold — Done layers hold none.
-            let cost = group.layers.iter().filter(|l| !matches!(l, LayerState::Done)).count();
+            let cost = group
+                .layers
+                .iter()
+                .filter(|l| !matches!(l, LayerState::Done))
+                .count();
             cands.push((aud, GroupKey::Clip(*id), cost));
         }
         for (id, ev) in self.emitter_voices.iter_mut() {
             let e = table[id];
-            let raw = raw_coords(&window, &listener, Some(e.at));
+            let raw = raw_coords(&window, &listener, Some(e.at), e.medium);
             let sc = ev.smooth.observe(&raw, k);
-            let aud = audibility(Response::Ambient, sc, e.gain);
-            cands.push((aud, GroupKey::Emitter(*id), 1));
+            let cue = self.catalog.cue(ev.cue);
+            let max_lgain = ev
+                .layers
+                .iter()
+                .map(|layer| layer.draw.gain)
+                .fold(0.0, f32::max);
+            let aud = audibility(cue.response, sc, e.gain * max_lgain);
+            cands.push((aud, GroupKey::Emitter(*id), ev.layers.len()));
         }
         // Sessions smooth like every other source: a per-session `Smoothed`
         // cell, observed here, read again in apply_sessions.
         for (id, session) in self.sessions.iter_mut() {
-            if let Session::Streaming { present: true, last_at, smooth, .. } = session {
-                let raw = raw_coords(&window, &listener, *last_at);
+            if let Session::Streaming {
+                present: true,
+                last_at,
+                last_medium,
+                smooth,
+                ..
+            } = session
+            {
+                let raw = raw_coords(&window, &listener, *last_at, *last_medium);
                 let sc = smooth.observe(&raw, k);
                 let aud = audibility(Response::Voice, sc, 1.0);
                 cands.push((aud, GroupKey::Voice(*id), 1));
@@ -471,7 +570,8 @@ impl SoundSystem {
                     }
                 }
                 if pending > 0 {
-                    self.faults.push_back(Fault::OccurrenceDropped { id, pending });
+                    self.faults
+                        .push_back(Fault::OccurrenceDropped { id, pending });
                 }
             }
         }
@@ -486,27 +586,44 @@ impl SoundSystem {
             let allocated = winners.contains(&GroupKey::Clip(*id));
             let cue = self.catalog.cue(group.cue);
             let response = cue.response;
-            let sc = group.smooth.current(listener.medium);
-            for (li, layer) in group.layers.iter_mut().enumerate() {
+            let sc = group.smooth.current();
+            for layer in group.layers.iter_mut() {
                 match layer {
-                    LayerState::Pending { delay } => {
-                        if allocated && group.age >= *delay {
-                            let l = &cue.layers[li];
-                            let vi = draw(*id, li as u16, DrawKind::Variant, l.variants.len() as u32) as usize;
-                            let clip = l.variants[vi];
-                            let lgain = draw_range(*id, li as u16, DrawKind::Gain, &l.gain);
-                            let rate = 2f32.powf(draw_range(*id, li as u16, DrawKind::Pitch, &l.pitch) / 12.0);
-                            let dsp = dsp_for(response, sc, listener, group.at, group.gain * lgain, self.mix.effects);
+                    LayerState::Pending { draw } => {
+                        if allocated && group.age >= draw.delay {
+                            let dsp = dsp_for(
+                                response,
+                                sc,
+                                listener,
+                                group.at,
+                                group.gain * draw.gain,
+                                self.mix.effects,
+                            );
                             // A clip group's cue is `CueId<OneShot>` by type, so it never loops.
-                            match self.backend.play_clip(clip, dsp, rate, false, group.at, listener) {
-                                Some(voice) => *layer = LayerState::Sounding { voice, gain: lgain },
+                            match self
+                                .backend
+                                .play_clip(draw.clip, dsp, draw.rate, false, group.at, listener)
+                            {
+                                Some(voice) => {
+                                    *layer = LayerState::Sounding {
+                                        voice,
+                                        gain: draw.gain,
+                                    }
+                                }
                                 None => *layer = LayerState::Done,
                             }
                         }
                     }
                     LayerState::Sounding { voice, gain } => {
                         if allocated {
-                            let dsp = dsp_for(response, sc, listener, group.at, group.gain * *gain, self.mix.effects);
+                            let dsp = dsp_for(
+                                response,
+                                sc,
+                                listener,
+                                group.at,
+                                group.gain * *gain,
+                                self.mix.effects,
+                            );
                             self.backend.update(*voice, dsp, group.at, listener);
                         } else {
                             // A losing sounding clip is stopped (no resume).
@@ -528,14 +645,35 @@ impl SoundSystem {
     ) {
         for (id, ev) in self.emitter_voices.iter_mut() {
             let e = table[id];
-            let sc = ev.smooth.current(listener.medium);
+            let sc = ev.smooth.current();
             let allocated = winners.contains(&GroupKey::Emitter(*id));
+            let response = self.catalog.cue(ev.cue).response;
             // A losing emitter is muted (loop preserved), never stopped — mirrors the
             // streaming-session rule and, unlike a stop, avoids the per-frame respawn
             // churn a still-tabled emitter would cause.
             let bus = if allocated { self.mix.effects } else { 0.0 };
-            let dsp = dsp_for(Response::Ambient, sc, listener, Some(e.at), e.gain, bus);
-            self.backend.update(ev.voice, dsp, Some(e.at), listener);
+            for layer in ev.layers.iter_mut() {
+                let dsp = dsp_for(
+                    response,
+                    sc,
+                    listener,
+                    Some(e.at),
+                    e.gain * layer.draw.gain,
+                    bus,
+                );
+                if let Some(voice) = layer.voice {
+                    self.backend.update(voice, dsp, Some(e.at), listener);
+                } else if allocated && ev.age >= layer.draw.delay {
+                    layer.voice = self.backend.play_clip(
+                        layer.draw.clip,
+                        dsp,
+                        layer.draw.rate,
+                        true,
+                        Some(e.at),
+                        listener,
+                    );
+                }
+            }
         }
     }
 
@@ -545,14 +683,21 @@ impl SoundSystem {
         listener: &Listener,
     ) {
         for (id, session) in self.sessions.iter() {
-            let Session::Streaming { present, last_at, voice, smooth, .. } = session else {
+            let Session::Streaming {
+                present,
+                last_at,
+                voice,
+                smooth,
+                ..
+            } = session
+            else {
                 continue;
             };
             let allocated = winners.contains(&GroupKey::Voice(*id));
             // detach/deafen/allocation-loss all mute (gain 0), never stop.
             let audible = *present && allocated && !self.mix.deafen;
             // The smoothed coords were integrated in ranking; read, don't re-trace.
-            let sc = smooth.current(listener.medium);
+            let sc = smooth.current();
             let bus = if audible { self.mix.voice } else { 0.0 };
             let dsp = dsp_for(Response::Voice, sc, listener, *last_at, 1.0, bus);
             self.backend.update(*voice, dsp, *last_at, listener);
@@ -574,7 +719,13 @@ impl SoundSystem {
         }
         let act = match self.sessions.get(&pkt.session) {
             Some(Session::Tombstone { epoch }) => {
-                if pkt.epoch > *epoch { Act::OpenNew { floor: Some(*epoch) } } else { Act::Drop }
+                if pkt.epoch > *epoch {
+                    Act::OpenNew {
+                        floor: Some(*epoch),
+                    }
+                } else {
+                    Act::Drop
+                }
             }
             Some(Session::Streaming { epoch, .. }) => {
                 if pkt.epoch < *epoch {
@@ -641,6 +792,7 @@ impl SoundSystem {
                         voice,
                         present: false,
                         last_at: None,
+                        last_medium: self.last_listener.medium,
                         smooth: Smoothed::new(),
                     },
                 );
@@ -657,11 +809,24 @@ impl SoundSystem {
     }
 
     /// Presentation control, decoupled from the decoder lifetime. Never stops.
-    pub fn set_session_present(&mut self, session: SessionKey, present: bool, at: Option<DVec3>) {
-        if let Some(Session::Streaming { present: p, last_at, .. }) = self.sessions.get_mut(&session) {
+    pub fn set_session_present(
+        &mut self,
+        session: SessionKey,
+        present: bool,
+        at: Option<DVec3>,
+        medium: Medium,
+    ) {
+        if let Some(Session::Streaming {
+            present: p,
+            last_at,
+            last_medium,
+            ..
+        }) = self.sessions.get_mut(&session)
+        {
             *p = present;
             if at.is_some() {
                 *last_at = at;
+                *last_medium = medium;
             }
         }
     }
@@ -676,6 +841,7 @@ impl SoundSystem {
     }
 
     pub fn set_mix(&mut self, mix: MixChange) {
+        let mix = mix.normalized();
         self.mix = mix;
         let master = if mix.muted { 0.0 } else { mix.master };
         self.backend.set_master(master);
@@ -686,12 +852,30 @@ impl SoundSystem {
         self.faults.drain(..)
     }
 
+    /// App-wide maintenance tick. It is intentionally independent of
+    /// `AudioFrame`, so menus and loading screens reclaim finished UI tracks and
+    /// future music/device recovery has one lifecycle hook.
+    pub fn service(&mut self) {
+        let now = Instant::now();
+        let mut index = 0;
+        while index < self.ui_voices.len() {
+            if self.ui_voices[index].1 <= now {
+                let (voice, _) = self.ui_voices.swap_remove(index);
+                self.backend.stop(voice);
+            } else {
+                index += 1;
+            }
+        }
+        if !self.backend.alive() {
+            self.report_lost_once();
+        }
+    }
+
     /// UI one-shot outside the frame journal (menus have no AudioFrame cadence).
     /// Non-Ui cue ⇒ `Fault::BadUiCue` + no-op (fire-and-forget).
     pub fn play_ui(&mut self, cue: CueId<OneShot>) {
         let now = Instant::now();
-        // Drop handles whose finite one-shot has elapsed (kira already freed the voice).
-        self.ui_voices.retain(|(_, expiry)| *expiry > now);
+        self.service();
 
         let cue_ref = self.catalog.cue(cue);
         if !matches!(cue_ref.response, Response::Ui) {
@@ -705,15 +889,24 @@ impl SoundSystem {
         self.ui_counter = self.ui_counter.wrapping_add(1);
         let expiry = now + Duration::from_secs_f32(cue_ref.max_duration.max(0.0));
         // Ui is non-spatial: coincident smoothed coords (nothing to integrate).
-        let ui_dsp = respond(Response::Ui, SmoothedCoords::coincident(Medium::Air), &self.last_listener, None);
-        for (li, l) in cue_ref.layers.iter().enumerate() {
-            let vi = draw(id, li as u16, DrawKind::Variant, l.variants.len() as u32) as usize;
-            let clip = l.variants[vi];
-            let lgain = draw_range(id, li as u16, DrawKind::Gain, &l.gain);
-            let rate = 2f32.powf(draw_range(id, li as u16, DrawKind::Pitch, &l.pitch) / 12.0);
-            let dsp = Dsp { gain: (ui_dsp.gain * lgain * self.mix.effects).clamp(0.0, 4.0), ..ui_dsp };
+        let ui_dsp = respond(
+            Response::Ui,
+            SmoothedCoords::coincident(Medium::Air),
+            &self.last_listener,
+            None,
+        );
+        for (li, layer) in cue_ref.layers.iter().enumerate() {
+            let draw = draw_layer(layer, id, li as u16);
+            debug_assert_eq!(draw.delay, 0.0, "UI delay is rejected by the catalog");
+            let dsp = Dsp {
+                gain: (ui_dsp.gain * draw.gain * self.mix.effects).clamp(0.0, 4.0),
+                ..ui_dsp
+            };
             // Budget-exempt (menus have no frame cadence) but retained, not leaked.
-            if let Some(voice) = self.backend.play_clip(clip, dsp, rate, false, None, &self.last_listener) {
+            if let Some(voice) =
+                self.backend
+                    .play_clip(draw.clip, dsp, draw.rate, false, None, &self.last_listener)
+            {
                 self.ui_voices.push((voice, expiry));
             }
         }
@@ -745,10 +938,19 @@ fn smoothing_factor(dt: f32, halflife_s: f32) -> f32 {
 }
 
 /// Raw (unsmoothed) coords for a source. A non-spatial source is coincident.
-fn raw_coords(window: &AcousticWindow, listener: &Listener, at: Option<DVec3>) -> Coords {
+fn raw_coords(
+    window: &AcousticWindow,
+    listener: &Listener,
+    at: Option<DVec3>,
+    medium: Medium,
+) -> Coords {
     match at {
-        Some(pos) => trace(window, listener.pos, pos, listener.medium),
-        None => Coords { distance: 0.0, occlusion: 0.0, medium: listener.medium },
+        Some(pos) => trace(window, listener.pos, pos, medium),
+        None => Coords {
+            distance: 0.0,
+            occlusion: 0.0,
+            medium: listener.medium,
+        },
     }
 }
 
@@ -768,7 +970,12 @@ fn dsp_for(
 }
 
 /// Map a deterministic draw bucket onto a `[lo, hi]` range (no RNG state).
-fn draw_range(id: OccurrenceId, layer: u16, kind: DrawKind, range: &std::ops::RangeInclusive<f32>) -> f32 {
+fn draw_range(
+    id: OccurrenceId,
+    layer: u16,
+    kind: DrawKind,
+    range: &std::ops::RangeInclusive<f32>,
+) -> f32 {
     let (lo, hi) = (*range.start(), *range.end());
     if lo == hi {
         return lo;
@@ -779,81 +986,25 @@ fn draw_range(id: OccurrenceId, layer: u16, kind: DrawKind, range: &std::ops::Ra
     lo + (u as f32) * (hi - lo)
 }
 
+fn draw_layer(layer: &Layer, id: OccurrenceId, index: u16) -> LayerDraw {
+    let variant = draw(id, index, DrawKind::Variant, layer.variants.len() as u32) as usize;
+    LayerDraw {
+        clip: layer.variants[variant],
+        gain: draw_range(id, index, DrawKind::Gain, &layer.gain),
+        rate: 2f32.powf(draw_range(id, index, DrawKind::Pitch, &layer.pitch) / 12.0),
+        delay: draw_range(id, index, DrawKind::Delay, &layer.delay),
+    }
+}
+
 /// Salt (a reserved bit above the layer/kind fields) mixed into an emitter's draw
 /// id so emitter `n` and occurrence `n` never share a variant/pitch draw.
 const EMITTER_DRAW_SALT: u64 = 1 << 58;
 
-/// Spawn a looping emitter voice from its cue's first layer (muted; the frame's
-/// allocation sets its real gain). Deterministic variant/pitch by emitter id.
-fn spawn_emitter(
-    catalog: &Catalog,
-    backend: &mut dyn Backend,
-    e: &Emitter,
-    listener: &Listener,
-) -> Option<BackendVoice> {
-    let cue: &Cue = catalog.cue(e.cue);
-    let layer = cue.layers.first()?;
-    let id = OccurrenceId(e.id.0 ^ EMITTER_DRAW_SALT);
-    let vi = draw(id, 0, DrawKind::Variant, layer.variants.len() as u32) as usize;
-    let clip = layer.variants[vi];
-    let rate = 2f32.powf(draw_range(id, 0, DrawKind::Pitch, &layer.pitch) / 12.0);
-    let dsp = Dsp { gain: 0.0, lowpass_hz: 20_000.0, pan: None };
-    // An emitter's cue is `CueId<Loop>` by type, so it always loops.
-    backend.play_clip(clip, dsp, rate, true, Some(e.at), listener)
-}
-
-/// A silent, dead backend used when no audio device is available. It is a
-/// permissive `ClipStore` (so the catalog still loads and `CueSymbols` resolves)
-/// but every playback call is a no-op and `alive()` is `false`.
-struct NullBackend {
-    next_clip: u32,
-    next_voice: u64,
-}
-
-impl NullBackend {
-    fn new() -> Self {
-        Self { next_clip: 0, next_voice: 0 }
-    }
-}
-
-impl ClipStore for NullBackend {
-    fn store(&mut self, _bytes: &[u8]) -> Result<StoredClip, String> {
-        let id = ClipId(self.next_clip);
-        self.next_clip += 1;
-        // A nominal duration keeps zero-delay one-shots from folding to instant
-        // release in the catalog's max_duration computation.
-        Ok(StoredClip { id, duration_s: 0.25 })
-    }
-}
-
-impl Backend for NullBackend {
-    fn play_clip(
-        &mut self,
-        _clip: ClipId,
-        _dsp: Dsp,
-        _rate: f32,
-        _looped: bool,
-        _spatial: Option<DVec3>,
-        _listener: &Listener,
-    ) -> Option<BackendVoice> {
-        None
-    }
-    fn play_stream(
-        &mut self,
-        _feed: rtrb::Consumer<VoicePacket>,
-        _jitter_target_ms: u32,
-        _starved: Arc<AtomicBool>,
-        _spatial: Option<DVec3>,
-        _listener: &Listener,
-    ) -> Option<BackendVoice> {
-        let _ = self.next_voice;
-        None
-    }
-    fn update(&mut self, _v: BackendVoice, _dsp: Dsp, _spatial: Option<DVec3>, _listener: &Listener) {}
-    fn stop(&mut self, _v: BackendVoice) {}
-    fn set_master(&mut self, _master: f32) {}
-    fn alive(&self) -> bool {
-        false
+fn stop_emitter(backend: &mut dyn Backend, emitter: EmitterVoice) {
+    for layer in emitter.layers {
+        if let Some(voice) = layer.voice {
+            backend.stop(voice);
+        }
     }
 }
 
@@ -868,11 +1019,15 @@ mod seam_tests {
 
     use glam::{DVec3, IVec3, UVec3};
 
-    use super::acoustics::{AcousticWindow, Cell, Listener, Medium, Response, SmoothedCoords, respond};
+    use super::acoustics::{
+        AcousticWindow, Cell, Dsp, Listener, Medium, Response, SmoothedCoords, respond,
+    };
     use super::backend::ClipId;
-    use super::backend::recording::{Intent, RecordingBackend, Recorder};
+    use super::backend::recording::{Intent, Recorder, RecordingBackend};
     use super::content::{Catalog, CueSymbols, Loop, OneShot};
-    use super::{AudioFrame, Emitter, EmitterId, Occurrence, OccurrenceId, SoundConfig, SoundSystem};
+    use super::{
+        AudioFrame, Emitter, EmitterId, Occurrence, OccurrenceId, SoundConfig, SoundSystem,
+    };
 
     // Shared catalog fixture: one one-shot, one loop bed, and a loud/quiet pair whose
     // only difference is layer gain (authored gain ≠ 1.0).
@@ -895,6 +1050,21 @@ mod seam_tests {
         delay = [0.0]
         mode = "loop"
 
+        [cues.layered_bed]
+        response = "world"
+        [[cues.layered_bed.layers]]
+        variants = ["e"]
+        gain = [0.5]
+        pitch = [0.0]
+        delay = [0.0]
+        mode = "loop"
+        [[cues.layered_bed.layers]]
+        variants = ["f"]
+        gain = [1.5]
+        pitch = [0.0]
+        delay = [0.2]
+        mode = "loop"
+
         [cues.loud]
         response = "world"
         [[cues.loud.layers]]
@@ -912,6 +1082,15 @@ mod seam_tests {
         pitch = [0.0]
         delay = [0.0]
         mode = "one_shot"
+
+        [cues.ui]
+        response = "ui"
+        [[cues.ui.layers]]
+        variants = ["g"]
+        gain = [1.0]
+        pitch = [0.0]
+        delay = [0.0]
+        mode = "one_shot"
     "#;
 
     /// A `SoundSystem` over a `RecordingBackend` + the in-memory catalog, plus the
@@ -920,7 +1099,10 @@ mod seam_tests {
         let (mut backend, rec) = RecordingBackend::new();
         let mut resolve = |_name: &str| -> Result<Vec<u8>, std::path::PathBuf> { Ok(vec![0u8]) };
         let (catalog, syms) = Catalog::from_manifest(MANIFEST, &mut resolve, &mut backend).unwrap();
-        let cfg = SoundConfig { max_voices, ..SoundConfig::default() };
+        let cfg = SoundConfig {
+            max_voices,
+            ..SoundConfig::default()
+        };
         let sys = SoundSystem::assemble(Box::new(backend), catalog, VecDeque::new(), false, cfg);
         (sys, syms, rec)
     }
@@ -934,7 +1116,12 @@ mod seam_tests {
     }
 
     fn origin_listener() -> Listener {
-        Listener { pos: DVec3::ZERO, yaw: 0.0, pitch: 0.0, medium: Medium::Air }
+        Listener {
+            pos: DVec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            medium: Medium::Air,
+        }
     }
 
     fn source(x: f64) -> DVec3 {
@@ -942,7 +1129,10 @@ mod seam_tests {
     }
 
     fn count_play_clips(rec: &Recorder) -> usize {
-        rec.intents().iter().filter(|i| matches!(i, Intent::PlayClip { .. })).count()
+        rec.intents()
+            .iter()
+            .filter(|i| matches!(i, Intent::PlayClip { .. }))
+            .count()
     }
 
     fn played_clips(rec: &Recorder) -> Vec<ClipId> {
@@ -955,11 +1145,24 @@ mod seam_tests {
             .collect()
     }
 
-    fn update_gains(rec: &Recorder) -> Vec<f32> {
+    fn played_dsps(rec: &Recorder) -> Vec<Dsp> {
         rec.intents()
             .into_iter()
-            .filter_map(|i| match i {
-                Intent::Update { dsp, .. } => Some(dsp.gain),
+            .filter_map(|intent| match intent {
+                Intent::PlayClip { dsp, .. } => Some(dsp),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn emitter_gains(rec: &Recorder) -> Vec<f32> {
+        rec.intents()
+            .into_iter()
+            .filter_map(|intent| match intent {
+                Intent::PlayClip {
+                    dsp, looped: true, ..
+                }
+                | Intent::Update { dsp, .. } => Some(dsp.gain),
                 _ => None,
             })
             .collect()
@@ -973,19 +1176,51 @@ mod seam_tests {
     fn a8_moving_source_gain_is_smoothed() {
         let (mut sound, syms, rec) = system(32);
         let bed = sound.catalog().typed::<Loop>(&syms, "bed").unwrap();
-        let emit = |x| Emitter { id: EmitterId(0), cue: bed, at: source(x), gain: 1.0 };
+        let emit = |x| Emitter {
+            id: EmitterId(0),
+            cue: bed,
+            at: source(x),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
 
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![], vec![emit(10.0)], open_window()).unwrap());
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![], vec![emit(50.0)], open_window()).unwrap());
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![],
+                vec![emit(10.0)],
+                open_window(),
+            )
+            .unwrap(),
+        );
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![],
+                vec![emit(50.0)],
+                open_window(),
+            )
+            .unwrap(),
+        );
 
-        let gains = update_gains(&rec);
+        let gains = emitter_gains(&rec);
         assert_eq!(gains.len(), 2, "one emitter Update per frame");
         let (g1, g2) = (gains[0], gains[1]);
         // What a NO-smoothing path would emit at the new 50 m distance.
-        let unsmoothed =
-            respond(Response::Ambient, SmoothedCoords::new(50.0, 0.0, Medium::Air), &origin_listener(), Some(source(50.0))).gain;
+        let unsmoothed = respond(
+            Response::Ambient,
+            SmoothedCoords::new(50.0, 0.0, Medium::Air),
+            &origin_listener(),
+            Some(source(50.0)),
+        )
+        .gain;
         assert!(g2 < g1, "receding source must get quieter: g1={g1} g2={g2}");
-        assert!(g2 > unsmoothed + 1e-4, "smoothing must damp the jump: g2={g2} unsmoothed={unsmoothed}");
+        assert!(
+            g2 > unsmoothed + 1e-4,
+            "smoothing must damp the jump: g2={g2} unsmoothed={unsmoothed}"
+        );
     }
 
     // With room for exactly one voice, the louder group wins, decided by audibility
@@ -1003,29 +1238,110 @@ mod seam_tests {
 
         let at = Some(source(12.0));
         let occs = vec![
-            Occurrence { id: OccurrenceId(1), cue: quiet, at, gain: 1.0 },
-            Occurrence { id: OccurrenceId(2), cue: loud, at, gain: 1.0 },
+            Occurrence {
+                id: OccurrenceId(1),
+                cue: quiet,
+                at,
+                medium: Medium::Air,
+                gain: 1.0,
+            },
+            Occurrence {
+                id: OccurrenceId(2),
+                cue: loud,
+                at,
+                medium: Medium::Air,
+                gain: 1.0,
+            },
         ];
         sound.submit(AudioFrame::new(0.1, origin_listener(), occs, vec![], open_window()).unwrap());
 
         let clips = played_clips(&rec);
         assert_eq!(clips.len(), 1, "budget of 1 must voice exactly one group");
-        assert_eq!(clips[0], loud_clip, "the louder group (higher layer gain) must win, not the lower id");
+        assert_eq!(
+            clips[0], loud_clip,
+            "the louder group (higher layer gain) must win, not the lower id"
+        );
+    }
+
+    #[test]
+    fn occurrence_source_medium_reaches_cross_water_response() {
+        let (mut sound, syms, rec) = system(32);
+        let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
+        let mut listener = origin_listener();
+        listener.medium = Medium::Water;
+        let at = source(4.0);
+        let occurrence = Occurrence {
+            id: OccurrenceId(0),
+            cue,
+            at: Some(at),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
+        sound.submit(
+            AudioFrame::new(0.1, listener, vec![occurrence], vec![], open_window()).unwrap(),
+        );
+
+        let actual = played_dsps(&rec)[0].gain;
+        let expected = respond(
+            Response::World,
+            SmoothedCoords::new(4.0 * crate::math::BLOCK_METERS as f32, 0.0, Medium::Air),
+            &listener,
+            Some(at),
+        )
+        .gain;
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual={actual} expected={expected}"
+        );
     }
 
     // The journal is idempotent: an occurrence id at or below the high-water mark
     // must not re-realize. Reachable failure: the id/high-water guard is dropped
     // and the re-submitted occurrence plays a second clip.
     #[test]
-    fn a3_occurrence_realized_once() {
+    fn a3_occurrence_zero_is_realized_exactly_once() {
         let (mut sound, syms, rec) = system(32);
         let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
-        let occ = || Occurrence { id: OccurrenceId(1), cue, at: Some(source(4.0)), gain: 1.0 };
+        let occ = || Occurrence {
+            id: OccurrenceId(0),
+            cue,
+            at: Some(source(4.0)),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
 
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![occ()], vec![], open_window()).unwrap());
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![occ()], vec![], open_window()).unwrap());
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![occ()], vec![], open_window()).unwrap(),
+        );
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![occ()], vec![], open_window()).unwrap(),
+        );
 
-        assert_eq!(count_play_clips(&rec), 1, "id ≤ high_water must not re-realize");
+        assert_eq!(
+            count_play_clips(&rec),
+            1,
+            "id ≤ high_water must not re-realize"
+        );
+    }
+
+    #[test]
+    fn expired_ui_voice_is_stopped_before_the_next_click() {
+        let (mut sound, syms, rec) = system(32);
+        let cue = sound.catalog().typed::<OneShot>(&syms, "ui").unwrap();
+        sound.ui_voices.push((
+            super::BackendVoice(777),
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        ));
+
+        sound.play_ui(cue);
+
+        assert!(
+            rec.intents()
+                .iter()
+                .any(|intent| matches!(intent, Intent::Stop { v } if v.0 == 777)),
+            "expired UI tracks must be explicitly reclaimed"
+        );
+        assert_eq!(count_play_clips(&rec), 1);
     }
 
     // The emitter table is a latest-wins snapshot: an emitter absent from this
@@ -1035,13 +1351,106 @@ mod seam_tests {
     fn a2_absent_emitter_is_stopped() {
         let (mut sound, syms, rec) = system(32);
         let bed = sound.catalog().typed::<Loop>(&syms, "bed").unwrap();
-        let e = Emitter { id: EmitterId(0), cue: bed, at: source(5.0), gain: 1.0 };
+        let e = Emitter {
+            id: EmitterId(0),
+            cue: bed,
+            at: source(5.0),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
 
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![], vec![e], open_window()).unwrap());
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![], vec![], open_window()).unwrap());
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![e], open_window()).unwrap(),
+        );
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], open_window()).unwrap(),
+        );
 
-        let stops = rec.intents().iter().filter(|i| matches!(i, Intent::Stop { .. })).count();
+        let stops = rec
+            .intents()
+            .iter()
+            .filter(|i| matches!(i, Intent::Stop { .. }))
+            .count();
         assert_eq!(stops, 1, "an emitter absent from the table must be stopped");
+    }
+
+    #[test]
+    fn layered_emitter_honors_every_layer_delay_gain_and_response() {
+        let (mut sound, syms, rec) = system(32);
+        let cue = sound.catalog().typed::<Loop>(&syms, "layered_bed").unwrap();
+        let emitter = Emitter {
+            id: EmitterId(4),
+            cue,
+            at: source(4.0),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
+
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![emitter], open_window()).unwrap(),
+        );
+        assert_eq!(played_dsps(&rec).len(), 1, "zero-delay layer starts first");
+
+        sound.submit(
+            AudioFrame::new(0.2, origin_listener(), vec![], vec![emitter], open_window()).unwrap(),
+        );
+        let played = played_dsps(&rec);
+        assert_eq!(played.len(), 2, "delayed second loop layer must start");
+
+        let spatial = respond(
+            Response::World,
+            SmoothedCoords::new(4.0 * crate::math::BLOCK_METERS as f32, 0.0, Medium::Air),
+            &origin_listener(),
+            Some(source(4.0)),
+        )
+        .gain;
+        assert!((played[0].gain - spatial * 0.5).abs() < 1e-5);
+        assert!((played[1].gain - spatial * 1.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn reusing_an_emitter_id_for_a_new_cue_stops_the_old_group() {
+        let (mut sound, syms, rec) = system(32);
+        let bed = sound.catalog().typed::<Loop>(&syms, "bed").unwrap();
+        let layered = sound.catalog().typed::<Loop>(&syms, "layered_bed").unwrap();
+        let make = |cue| Emitter {
+            id: EmitterId(9),
+            cue,
+            at: source(3.0),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
+
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![],
+                vec![make(bed)],
+                open_window(),
+            )
+            .unwrap(),
+        );
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![],
+                vec![make(layered)],
+                open_window(),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(count_play_clips(&rec), 2);
+        assert_eq!(
+            rec.intents()
+                .iter()
+                .filter(|intent| matches!(intent, Intent::Stop { .. }))
+                .count(),
+            1,
+            "cue replacement must retire the prior loop"
+        );
     }
 
     // A dead backend is a total no-op, yet the high-water mark still advances so a
@@ -1054,14 +1463,38 @@ mod seam_tests {
     fn a12_dead_backend_no_ops_yet_advances_high_water() {
         let (mut sound, syms, rec) = system(32);
         let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
-        let occ = |id| Occurrence { id: OccurrenceId(id), cue, at: Some(source(4.0)), gain: 1.0 };
+        let occ = |id| Occurrence {
+            id: OccurrenceId(id),
+            cue,
+            at: Some(source(4.0)),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
 
         rec.set_alive(false);
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![occ(5)], vec![], open_window()).unwrap());
-        assert!(rec.intents().is_empty(), "a dead backend records no intents");
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![occ(5)], vec![], open_window()).unwrap(),
+        );
+        assert!(
+            rec.intents().is_empty(),
+            "a dead backend records no intents"
+        );
 
         rec.set_alive(true);
-        sound.submit(AudioFrame::new(0.1, origin_listener(), vec![occ(5), occ(6)], vec![], open_window()).unwrap());
-        assert_eq!(count_play_clips(&rec), 1, "only the fresh id 6 plays; id 5 was past the dead-frame water mark");
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![occ(5), occ(6)],
+                vec![],
+                open_window(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            count_play_clips(&rec),
+            1,
+            "only the fresh id 6 plays; id 5 was past the dead-frame water mark"
+        );
     }
 }

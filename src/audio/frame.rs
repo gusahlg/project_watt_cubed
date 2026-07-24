@@ -23,7 +23,8 @@ pub struct Occurrence {
     pub cue: CueId<OneShot>, // one-shot by type: max_duration is finite, so the
     // journal release guard can never leak a never-ending voice
     pub at: Option<DVec3>, // None = non-spatial (UI)
-    pub gain: f32,         // authored scale, finite, [0, 4]
+    pub medium: Medium,
+    pub gain: f32, // authored scale, finite, [0, 4]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,7 @@ pub struct Emitter {
     pub id: EmitterId,
     pub cue: CueId<Loop>, // Loop-capable by type, not a submit-time check
     pub at: DVec3,
+    pub medium: Medium,
     pub gain: f32,
 }
 
@@ -89,10 +91,10 @@ impl AudioFrame {
 
         let mut prev: Option<OccurrenceId> = None;
         for o in &occurrences {
-            if let Some(at) = o.at {
-                if !at.is_finite() {
-                    return Err(FrameError::NonFinite);
-                }
+            if let Some(at) = o.at
+                && !at.is_finite()
+            {
+                return Err(FrameError::NonFinite);
             }
             if !o.gain.is_finite() {
                 return Err(FrameError::NonFinite);
@@ -100,10 +102,10 @@ impl AudioFrame {
             if !gain_in_range(o.gain) {
                 return Err(FrameError::OutOfRange);
             }
-            if let Some(p) = prev {
-                if o.id <= p {
-                    return Err(FrameError::UnorderedOccurrences);
-                }
+            if let Some(p) = prev
+                && o.id <= p
+            {
+                return Err(FrameError::UnorderedOccurrences);
             }
             prev = Some(o.id);
         }
@@ -125,7 +127,13 @@ impl AudioFrame {
             seen.push(e.id);
         }
 
-        Ok(Self { dt, listener, occurrences, emitters, window })
+        Ok(Self {
+            dt,
+            listener,
+            occurrences,
+            emitters,
+            window,
+        })
     }
 
     pub fn dt(&self) -> f32 {
@@ -146,8 +154,22 @@ impl AudioFrame {
 
     /// Consume the frame, moving the owned journal and table out without cloning
     /// — the committer takes ownership at submit.
-    pub fn into_parts(self) -> (f32, Listener, Vec<Occurrence>, Vec<Emitter>, Arc<AcousticWindow>) {
-        (self.dt, self.listener, self.occurrences, self.emitters, self.window)
+    pub fn into_parts(
+        self,
+    ) -> (
+        f32,
+        Listener,
+        Vec<Occurrence>,
+        Vec<Emitter>,
+        Arc<AcousticWindow>,
+    ) {
+        (
+            self.dt,
+            self.listener,
+            self.occurrences,
+            self.emitters,
+            self.window,
+        )
     }
 }
 
@@ -159,24 +181,50 @@ mod tests {
     use super::*;
 
     fn window() -> Arc<AcousticWindow> {
-        Arc::new(AcousticWindow::new(IVec3::ZERO, UVec3::ONE, vec![Cell::Open].into_boxed_slice()).unwrap())
+        Arc::new(
+            AcousticWindow::new(IVec3::ZERO, UVec3::ONE, vec![Cell::Open].into_boxed_slice())
+                .unwrap(),
+        )
     }
 
     fn listener() -> Listener {
-        Listener { pos: DVec3::ZERO, yaw: 0.0, pitch: 0.0, medium: Medium::Air }
+        Listener {
+            pos: DVec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            medium: Medium::Air,
+        }
     }
 
     fn occ(id: u64, gain: f32) -> Occurrence {
-        Occurrence { id: OccurrenceId(id), cue: CueId::TEST, at: None, gain }
+        Occurrence {
+            id: OccurrenceId(id),
+            cue: CueId::TEST,
+            at: None,
+            medium: Medium::Air,
+            gain,
+        }
     }
 
     fn emitter(id: u64, gain: f32) -> Emitter {
-        Emitter { id: EmitterId(id), cue: CueId::TEST, at: DVec3::ZERO, gain }
+        Emitter {
+            id: EmitterId(id),
+            cue: CueId::TEST,
+            at: DVec3::ZERO,
+            medium: Medium::Air,
+            gain,
+        }
     }
 
     #[test]
     fn accepts_valid_frame() {
-        let f = AudioFrame::new(0.016, listener(), vec![occ(1, 1.0), occ(2, 0.5)], vec![emitter(1, 1.0)], window());
+        let f = AudioFrame::new(
+            0.016,
+            listener(),
+            vec![occ(1, 1.0), occ(2, 0.5)],
+            vec![emitter(1, 1.0)],
+            window(),
+        );
         assert!(f.is_ok());
     }
 
@@ -185,7 +233,13 @@ mod tests {
         let f = AudioFrame::new(f32::NAN, listener(), vec![], vec![], window());
         assert!(matches!(f, Err(FrameError::NonFinite)));
 
-        let bad = Occurrence { id: OccurrenceId(1), cue: CueId::TEST, at: Some(DVec3::new(f64::NAN, 0.0, 0.0)), gain: 1.0 };
+        let bad = Occurrence {
+            id: OccurrenceId(1),
+            cue: CueId::TEST,
+            at: Some(DVec3::new(f64::NAN, 0.0, 0.0)),
+            medium: Medium::Air,
+            gain: 1.0,
+        };
         let f = AudioFrame::new(0.016, listener(), vec![bad], vec![], window());
         assert!(matches!(f, Err(FrameError::NonFinite)));
     }
@@ -203,22 +257,42 @@ mod tests {
 
     #[test]
     fn rejects_unordered_occurrences() {
-        let f = AudioFrame::new(0.016, listener(), vec![occ(2, 1.0), occ(2, 1.0)], vec![], window());
+        let f = AudioFrame::new(
+            0.016,
+            listener(),
+            vec![occ(2, 1.0), occ(2, 1.0)],
+            vec![],
+            window(),
+        );
         assert!(matches!(f, Err(FrameError::UnorderedOccurrences)));
 
-        let f = AudioFrame::new(0.016, listener(), vec![occ(3, 1.0), occ(1, 1.0)], vec![], window());
+        let f = AudioFrame::new(
+            0.016,
+            listener(),
+            vec![occ(3, 1.0), occ(1, 1.0)],
+            vec![],
+            window(),
+        );
         assert!(matches!(f, Err(FrameError::UnorderedOccurrences)));
     }
 
     #[test]
     fn rejects_duplicate_emitter() {
-        let f = AudioFrame::new(0.016, listener(), vec![], vec![emitter(1, 1.0), emitter(1, 1.0)], window());
+        let f = AudioFrame::new(
+            0.016,
+            listener(),
+            vec![],
+            vec![emitter(1, 1.0), emitter(1, 1.0)],
+            window(),
+        );
         assert!(matches!(f, Err(FrameError::DuplicateEmitter)));
     }
 
     #[test]
     fn rejects_over_limit() {
-        let occs: Vec<_> = (0..(MAX_OCCURRENCES as u64 + 1)).map(|i| occ(i, 1.0)).collect();
+        let occs: Vec<_> = (0..(MAX_OCCURRENCES as u64 + 1))
+            .map(|i| occ(i, 1.0))
+            .collect();
         let f = AudioFrame::new(0.016, listener(), occs, vec![], window());
         assert!(matches!(f, Err(FrameError::OverLimit)));
     }

@@ -24,9 +24,27 @@ fn main() {
     // to 60 Hz so streaming budgets fire at a real session's rate. All well
     // below the streamer's 512 m/s teleport threshold: this exercises travel.
     let specs = [
-        StressSpec { name: "r6_64mps", speed_mps: 64.0, secs: 10.0, radius: 6, pace_hz: 60.0 },
-        StressSpec { name: "r6_200mps", speed_mps: 200.0, secs: 10.0, radius: 6, pace_hz: 60.0 },
-        StressSpec { name: "r20_200mps", speed_mps: 200.0, secs: 10.0, radius: 20, pace_hz: 60.0 },
+        StressSpec {
+            name: "r6_64mps",
+            speed_mps: 64.0,
+            secs: 10.0,
+            radius: 6,
+            pace_hz: 60.0,
+        },
+        StressSpec {
+            name: "r6_200mps",
+            speed_mps: 200.0,
+            secs: 10.0,
+            radius: 6,
+            pace_hz: 60.0,
+        },
+        StressSpec {
+            name: "r20_200mps",
+            speed_mps: 200.0,
+            secs: 10.0,
+            radius: 20,
+            pace_hz: 60.0,
+        },
     ];
 
     let reports = run_stress(&specs);
@@ -49,8 +67,17 @@ fn main() {
             o.settle.frames, o.settle.p50, o.settle.p95, o.settle.p99, o.settle.max
         );
         println!(
-            "  peaks: upload_queue={} light_apply={} mesh_worklist={} chunks={}",
-            o.max_upload_queue, o.max_light_apply, o.max_mesh_worklist, o.max_chunks
+            "  peaks: upload_queue={} light_apply={} mesh_worklist={} worker_near={} worker_far={} chunks={}",
+            o.max_upload_queue,
+            o.max_light_apply,
+            o.max_mesh_worklist,
+            o.max_worker_near_queue,
+            o.max_worker_far_queue,
+            o.max_chunks
+        );
+        println!(
+            "  adaptive floor: effort={:.2} active_workers={}",
+            o.min_stream_effort, o.min_active_workers
         );
         if !o.stuck.is_empty() {
             println!("  STUCK: {}", o.stuck);

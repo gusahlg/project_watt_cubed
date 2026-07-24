@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
+# SPDX-License-Identifier: CC-BY-SA-4.0
+
+version = 1
+collection = "Project Watt Cubed deterministic placeholder sound effects"
+copyright = "2026 Project Watt Cubed contributors"
+license = "CC-BY-SA-4.0"
+source_kind = "deterministic-synthesis"
+generator = "src/bin/gen_tones.rs"
+generator_license = "AGPL-3.0-or-later"
+command = "cargo run --features dev-tools --bin gen_tones -- --force"
+format = "mono 48000 Hz 16-bit PCM WAV"
+
+[[asset]]
+path = "assets/sounds/generated/break_default_1.wav"
+sha256 = "a07e413c50233872f2d80d7f51291cbf3265971f321d070fe6f0aa69a12b4266"
+
+[[asset]]
+path = "assets/sounds/generated/break_default_2.wav"
+sha256 = "4fb4ae46f4523ffd79b42043ab262f8485bfa00307e874ed1a0e9afc3d163b7e"
+
+[[asset]]
+path = "assets/sounds/generated/menu_click_1.wav"
+sha256 = "1379f83bd7d436f2981cde8af8b5f39f19ace8bdb346fc3a8205ef2d65319313"
+
+[[asset]]
+path = "assets/sounds/generated/place_default_1.wav"
+sha256 = "7e2074b2d6ec363c31e5c7b689a27da1f24c21f67fa6c1017e13dcf3b394c49b"
+
+[[asset]]
+path = "assets/sounds/generated/splash_1.wav"
+sha256 = "2c8765fc685ccf354d3a651df67315356fcde7ebeb091c3071195ea00d410f97"
+
+[[asset]]
+path = "assets/sounds/generated/step_default_1.wav"
+sha256 = "32bf2f0955b681f78e6480aa0dedad1eabe166acd24d76f16dc02c8a63570808"
+
+[[asset]]
+path = "assets/sounds/generated/step_default_2.wav"
+sha256 = "91595cc4cab37a80d1a5557a676970af17e24c0cb03012698af6302eca147b97"
+
+[[asset]]
+path = "assets/sounds/generated/swing_1.wav"
+sha256 = "4831169ced6e158413fbf6f76392fa50f2cb853dc193b3b2b90c2547f0a61d91"
+
+[[asset]]
+path = "assets/sounds/generated/underwater_loop_1.wav"
+sha256 = "b6adce523149c08de75a42f29bf0065c347b4eda489492b9ac91e4b0c45ceebc"
+
+[[asset]]
+path = "assets/sounds/generated/voicetest_1.wav"
+sha256 = "02547ca630035ab661e7e0424074ce40462388ac05a6a2bf88fac9cd3c8aea06"

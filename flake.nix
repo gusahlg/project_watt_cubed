@@ -66,16 +66,36 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
+          # `CARGO_MANIFEST_DIR` points into the ephemeral Nix build tree, where
+          # `.git` is intentionally absent. Bake the flake identities into the
+          # benchmark binary; ordinary Cargo builds still probe their live
+          # worktrees at report time.
+          WATT_BUILD_GAME_REV = self.dirtyRev or (self.rev or "unknown");
+          WATT_BUILD_GAME_DIRTY = if self ? dirtyRev then "1" else "0";
+          WATT_BUILD_ENGINE_REV = voxel-engine.rev or "unknown";
+          WATT_BUILD_ENGINE_DIRTY = if voxel-engine ? dirtyRev then "1" else "0";
+
           nativeBuildInputs = [ pkgs.pkg-config ] ++ slang;
           buildInputs = runtimeLibs;
 
-          # Every installed binary is part of the package contract. In
-          # particular `golden` also creates a window, so leaving it with only
-          # the default glibc runpath makes the shipped tool fail to open X11.
-          # Do not hide missing outputs or patchelf failures with `|| true`.
+          # Runtime lookup first checks this executable-relative data root, so
+          # `nix run` works from any directory and never depends on the checkout.
+          postInstall = ''
+            mkdir -p "$out/share/project_watt_cubed"
+            cp -R assets "$out/share/project_watt_cubed/assets"
+            test -f "$out/share/project_watt_cubed/assets/sounds/catalog.toml"
+          '';
+
+          # Every installed binary is part of the package contract. Patch the
+          # directory rather than a hand-maintained name list: Cargo discovers
+          # `src/bin/*` automatically, and a newly added window/audio tool must
+          # not ship with only the default glibc runpath. Do not hide missing
+          # outputs or patchelf failures with `|| true`.
           postFixup = ''
-            for binary in project_watt_cubed watt_server golden golden_compare; do
-              patchelf --set-rpath "${libraryPath}" "$out/bin/$binary"
+            for binary in "$out"/bin/*; do
+              test -f "$binary"
+              test -x "$binary"
+              patchelf --set-rpath "${libraryPath}" "$binary"
             done
           '';
 
@@ -100,8 +120,22 @@
           printf '%s\n' "$size" > "$out"
         '';
 
+        checks.reuse = pkgs.runCommand "reuse-lint" {
+          nativeBuildInputs = [ pkgs.reuse ];
+        } ''
+          cp -R ${self} source
+          chmod -R u+w source
+          cd source
+          reuse lint
+          touch "$out"
+        '';
+
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [
+            pkgs.cargo-deny
+            pkgs.pkg-config
+            pkgs.reuse
+          ];
           buildInputs = with pkgs; [ rustc cargo rustfmt clippy ]
             ++ runtimeLibs
             ++ slang

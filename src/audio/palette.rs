@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::block::derive::SoundClass;
 
+use super::acoustics::Response;
 use super::content::{Catalog, CueId, CueMode, CueSymbols, Loop, OneShot};
 
 /// In-game UI cues routed through the director (`SoundEvent::Ui`). Menu cues
@@ -70,13 +71,41 @@ impl CuePalette {
     pub fn build(symbols: &CueSymbols, catalog: &Catalog) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let palette = Self {
-            step: class_map::<OneShot>("step", symbols, catalog, &mut warnings),
-            break_: class_map::<OneShot>("break", symbols, catalog, &mut warnings),
-            place: class_map::<OneShot>("place", symbols, catalog, &mut warnings),
-            splash: checked::<OneShot>("splash", symbols, catalog, &mut warnings, true),
-            swing: checked::<OneShot>("swing", symbols, catalog, &mut warnings, true),
-            underwater_loop: checked::<Loop>("underwater_loop", symbols, catalog, &mut warnings, true),
-            voicetest: checked::<OneShot>("voicetest", symbols, catalog, &mut warnings, true),
+            step: class_map::<OneShot>("step", Response::World, symbols, catalog, &mut warnings),
+            break_: class_map::<OneShot>("break", Response::World, symbols, catalog, &mut warnings),
+            place: class_map::<OneShot>("place", Response::World, symbols, catalog, &mut warnings),
+            splash: checked::<OneShot>(
+                "splash",
+                Response::World,
+                symbols,
+                catalog,
+                &mut warnings,
+                true,
+            ),
+            swing: checked::<OneShot>(
+                "swing",
+                Response::World,
+                symbols,
+                catalog,
+                &mut warnings,
+                true,
+            ),
+            underwater_loop: checked::<Loop>(
+                "underwater_loop",
+                Response::Ambient,
+                symbols,
+                catalog,
+                &mut warnings,
+                true,
+            ),
+            voicetest: checked::<OneShot>(
+                "voicetest",
+                Response::Ui,
+                symbols,
+                catalog,
+                &mut warnings,
+                true,
+            ),
         };
         (palette, warnings)
     }
@@ -111,15 +140,30 @@ impl CuePalette {
 /// missing `_default` or a mode mismatch warns.
 fn class_map<M: CueMode>(
     kind: &str,
+    response: Response,
     symbols: &CueSymbols,
     catalog: &Catalog,
     warnings: &mut Vec<String>,
 ) -> BTreeMap<&'static str, Sfx<M>> {
-    let default = checked::<M>(&format!("{kind}_default"), symbols, catalog, warnings, true);
+    let default = checked::<M>(
+        &format!("{kind}_default"),
+        response,
+        symbols,
+        catalog,
+        warnings,
+        true,
+    );
     let mut map = BTreeMap::new();
     for class in CLASSES {
         let name = class.as_str();
-        let specific = checked::<M>(&format!("{kind}_{name}"), symbols, catalog, warnings, false);
+        let specific = checked::<M>(
+            &format!("{kind}_{name}"),
+            response,
+            symbols,
+            catalog,
+            warnings,
+            false,
+        );
         if let Some(sfx) = specific.or(default) {
             map.insert(name, sfx);
         }
@@ -133,6 +177,7 @@ fn class_map<M: CueMode>(
 /// default). A present-but-wrong-mode cue always warns and is dropped.
 fn checked<M: CueMode>(
     name: &str,
+    response: Response,
     symbols: &CueSymbols,
     catalog: &Catalog,
     warnings: &mut Vec<String>,
@@ -146,7 +191,17 @@ fn checked<M: CueMode>(
             None
         }
         Some(raw) => match catalog.typed::<M>(symbols, name) {
-            Some(cue) => Some(Sfx { cue, gain: DEFAULT_GAIN }),
+            Some(cue) if catalog.response_of(raw) == response => Some(Sfx {
+                cue,
+                gain: DEFAULT_GAIN,
+            }),
+            Some(_) => {
+                warnings.push(format!(
+                    "audio: cue `{name}` has {:?} response but role needs {response:?} — ignored",
+                    catalog.response_of(raw)
+                ));
+                None
+            }
             None => {
                 warnings.push(format!(
                     "audio: cue `{name}` is {:?} but role needs {:?} — ignored",
@@ -156,5 +211,50 @@ fn checked<M: CueMode>(
                 None
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::audio::backend::{ClipId, ClipStore, StoredClip};
+
+    struct Clips;
+
+    impl ClipStore for Clips {
+        fn store(&mut self, _bytes: &[u8]) -> Result<StoredClip, String> {
+            Ok(StoredClip {
+                id: ClipId(0),
+                duration_s: 0.1,
+            })
+        }
+    }
+
+    #[test]
+    fn role_rejects_a_mode_correct_but_wrong_response_cue() {
+        let manifest = r#"
+            [cues.step_default]
+            response = "ui"
+            [[cues.step_default.layers]]
+            variants = ["step.wav"]
+            gain = [1.0]
+            pitch = [0.0]
+            delay = [0.0]
+            mode = "one_shot"
+        "#;
+        let mut clips = Clips;
+        let mut resolve = |_name: &str| -> Result<Vec<u8>, PathBuf> { Ok(vec![0]) };
+        let (catalog, symbols) =
+            Catalog::from_manifest(manifest, &mut resolve, &mut clips).unwrap();
+        let (palette, warnings) = CuePalette::build(&symbols, &catalog);
+
+        assert!(palette.step("stone").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("response") && warning.contains("step_default"))
+        );
     }
 }

@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+version = 1
+
+# Project-owned software, build metadata, launchers, and development tooling.
+[[annotations]]
+path = [
+  ".gitignore",
+  ".github/**",
+  "Cargo.lock",
+  "Cargo.toml",
+  "deny.toml",
+  "flake.lock",
+  "flake.nix",
+  "play.sh",
+  "scripts/**",
+  "src/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors <https://github.com/gusahlg/project_watt_cubed/blob/main/CONTRIBUTORS.md>"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+# Project-owned prose and creative content. Substantial source-code snippets
+# carry their own AGPL SPDX snippet markers inside the document.
+[[annotations]]
+path = [
+  "README.md",
+  "assets/attribution/**",
+  "assets/music/README.md",
+  "assets/sounds/README.md",
+  "assets/sounds/catalog.toml",
+  "documentation/**",
+  "issues/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors <https://github.com/gusahlg/project_watt_cubed/blob/main/CONTRIBUTORS.md>"
+SPDX-License-Identifier = "CC-BY-SA-4.0"

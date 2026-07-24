@@ -9,5 +9,9 @@
 # shell builds against the live sibling directly.)
 set -euo pipefail
 cd "$(dirname "$0")"
+# Flake sources intentionally exclude untracked files. Point development runs
+# at the live asset tree so newly dropped-in music and replacement sounds are
+# visible immediately; an explicit caller override still wins.
+export WATT_ASSET_DIR="${WATT_ASSET_DIR:-$PWD/assets}"
 nix flake update voxel-engine
 exec nix run . "$@"

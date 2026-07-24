@@ -41,7 +41,11 @@ pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshOutput) -> usize 
         .iter()
         .map(|&p| {
             std::mem::size_of_val(data[p].vertices())
-                + data[p].buckets().iter().map(|b| std::mem::size_of_val(&b[..])).sum::<usize>()
+                + data[p]
+                    .buckets()
+                    .iter()
+                    .map(|b| std::mem::size_of_val(&b[..]))
+                    .sum::<usize>()
         })
         .sum()
 }
@@ -62,7 +66,9 @@ pub(in crate::world) fn edits_in_footprint(
     edits
         .iter()
         .filter(|(c, _)| {
-            (cx0..cx0 + cn).contains(&c.x) && (cz0..cz0 + cn).contains(&c.z) && (0..cy_hi).contains(&c.y)
+            (cx0..cx0 + cn).contains(&c.x)
+                && (cz0..cz0 + cn).contains(&c.z)
+                && (0..cy_hi).contains(&c.y)
         })
         .map(|(&c, cells)| (c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
         .collect()
@@ -86,6 +92,112 @@ const MAX_PREDICT_SAMPLE_GAP: f64 = 0.5;
 /// travel: prediction is zeroed AND queued far work is purged, because its
 /// admission-time priorities are stale where the eye is now.
 const MAX_PREDICT_SPEED: f64 = 512.0;
+
+/// Travel up to this speed gets the full streaming budget. It is comfortably
+/// above ordinary walking/sprinting, so normal play and world entry retain
+/// maximum convergence speed. Above it, useful chunk lifetime falls roughly
+/// inversely with velocity, and effort follows the same curve.
+const FULL_EFFORT_SPEED_MPS: f64 = 24.0;
+
+/// Keep a small progress floor even during extreme travel. Stopping is never
+/// required for the centre/collision neighbourhood to advance, while the cap
+/// leaves most CPU and transfer time to the frame loop.
+const MIN_STREAM_EFFORT: f32 = 0.15;
+
+/// Once travel stops, restore background capacity over this time constant.
+/// Shedding is immediate (a hitch should stop now); recovery is deliberately
+/// damped so the first stationary frame cannot release a catch-up avalanche.
+const STREAM_RECOVERY_SECS: f64 = 0.75;
+
+/// A real mesh upload always makes progress even when the scaled byte budget is
+/// tiny. Most chunks fit below this; an unusually large first mesh is allowed
+/// to overrun it once, just as it may overrun the normal byte budget once.
+const MIN_UPLOAD_BUDGET_BYTES: usize = 256 << 10;
+
+/// Minimum completed results integrated per drain before its time budget may
+/// stop it. This releases claims promptly without reverting to the old
+/// unbounded channel drain.
+const RESULT_INTEGRATE_FLOOR: usize = 8;
+
+/// Velocity-aware streaming load controller. `effort` is the one normalized
+/// signal shared by worker concurrency, queue lookahead, admission deadlines,
+/// result integration, and GPU uploads, so those stages cannot fight each
+/// other by independently trying to catch up.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::world) struct StreamPacer {
+    speed_mps: f64,
+    effort: f32,
+}
+
+impl Default for StreamPacer {
+    fn default() -> Self {
+        Self {
+            speed_mps: 0.0,
+            effort: 1.0,
+        }
+    }
+}
+
+impl StreamPacer {
+    /// The useful-work fraction at `speed_mps`. Inverse scaling models the
+    /// shrinking time a chunk remains in view; it is continuous at the full
+    /// effort threshold and bounded away from zero for forward progress.
+    fn target_effort(speed_mps: f64) -> f32 {
+        if speed_mps.is_nan() || speed_mps <= FULL_EFFORT_SPEED_MPS {
+            return 1.0;
+        }
+        if speed_mps.is_infinite() {
+            return MIN_STREAM_EFFORT;
+        }
+        (FULL_EFFORT_SPEED_MPS / speed_mps).max(f64::from(MIN_STREAM_EFFORT)) as f32
+    }
+
+    fn update(&mut self, velocity: DVec3, sample_dt: f64) {
+        self.speed_mps = velocity.x.hypot(velocity.z);
+        let target = Self::target_effort(self.speed_mps);
+        if target <= self.effort {
+            // Load shedding has to beat the next expensive frame.
+            self.effort = target;
+            return;
+        }
+        // Recovery is a time-based exponential, independent of stream_hz.
+        let dt = sample_dt.clamp(0.0, MAX_PREDICT_SAMPLE_GAP);
+        let alpha = 1.0 - (-dt / STREAM_RECOVERY_SECS).exp();
+        self.effort += (target - self.effort) * alpha as f32;
+        if (target - self.effort).abs() < 0.001 {
+            self.effort = target;
+        }
+    }
+
+    pub(in crate::world) fn effort(self) -> f32 {
+        self.effort
+    }
+
+    pub(in crate::world) fn speed_mps(self) -> f64 {
+        self.speed_mps
+    }
+
+    pub(in crate::world) fn duration(self, base: Duration) -> Duration {
+        base.mul_f32(self.effort)
+    }
+
+    pub(in crate::world) fn floor(self, base: usize) -> usize {
+        ((base as f32 * self.effort).ceil() as usize).clamp(1, base.max(1))
+    }
+
+    fn upload_bytes(self) -> usize {
+        ((UPLOAD_BUDGET_BYTES as f32 * self.effort) as usize).max(MIN_UPLOAD_BUDGET_BYTES)
+    }
+
+    fn section_uploads(self) -> usize {
+        ((SECTION_UPLOAD_BUDGET as f32 * self.effort).round() as usize)
+            .clamp(1, SECTION_UPLOAD_BUDGET)
+    }
+
+    fn active_workers(self, capacity: usize) -> usize {
+        ((capacity as f32 * self.effort).ceil() as usize).clamp(1, capacity.max(1))
+    }
+}
 
 /// Timeout before meshing a chunk with missing neighbour light as degraded.
 /// Degraded chunks remesh once real light arrives.
@@ -180,7 +292,8 @@ impl World {
     /// this, so a chunk is enqueued only if its result would be accepted.
     /// `false` before the first stream (no centre yet).
     pub(in crate::world) fn in_mesh_box(&self, coord: Coord) -> bool {
-        self.center.is_some_and(|c| self.mesh_box(c).contains(coord))
+        self.center
+            .is_some_and(|c| self.mesh_box(c).contains(coord))
     }
 
     /// The every-frame half of streaming: land finished worker results, run
@@ -218,25 +331,37 @@ impl World {
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
         // or teleport-sized gaps, so prediction never fires on garbage input.
         let now = Instant::now();
-        self.section_vel = match self.section_eye_prev {
+        let (section_vel, pacing_vel, sample_dt) = match self.section_eye_prev {
             Some((prev, t)) => {
                 let dt = now.duration_since(t).as_secs_f64();
                 let v = (center - prev) / dt;
                 let sane =
                     center.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_SAMPLE_GAP && v.is_finite();
-                if sane && v.length() <= MAX_PREDICT_SPEED {
-                    v
+                if sane {
+                    // Prediction treats >512 m/s as a discontinuity, but the
+                    // pacer still sees that finite motion. Sustained extreme
+                    // flight therefore sheds load instead of masquerading as
+                    // rest; a one-off teleport gets the same safe one-frame
+                    // shedding and then a gradual recovery.
+                    let prediction = if v.length() <= MAX_PREDICT_SPEED {
+                        v
+                    } else {
+                        DVec3::ZERO
+                    };
+                    (prediction, v, dt)
                 } else {
                     // Implausible motion (teleport, pause, or faster than
                     // MAX_PREDICT_SPEED): zero prediction. Far jobs left behind
                     // by the jump are re-keyed and descheduled by the pool's
                     // per-epoch sync (the boundary cross bumps the view epoch),
                     // so no separate purge is needed here.
-                    DVec3::ZERO
+                    (DVec3::ZERO, DVec3::ZERO, dt.min(MAX_PREDICT_SAMPLE_GAP))
                 }
             }
-            None => DVec3::ZERO,
+            None => (DVec3::ZERO, DVec3::ZERO, 0.0),
         };
+        self.section_vel = section_vel;
+        self.stream_pacer.update(pacing_vel, sample_dt);
         self.section_eye_prev = center.is_finite().then_some((center, now));
         let s = CHUNK_SIZE as i32;
         let center_chunk = ChunkCoord::new(
@@ -254,13 +379,24 @@ impl World {
         // behind by fast movement — far sections included — are descheduled
         // instead of run. The far horizon is the outer ladder radius plus the
         // velocity lookahead, so prediction-desired sections survive it.
-        if let Some(workers) = &self.workers {
-            let vxz = (self.section_vel.x * self.section_vel.x
-                + self.section_vel.z * self.section_vel.z)
-                .sqrt();
-            let far_m = f64::from(self.section_pyramid.outer_m()) + vxz * TAU_STREAM;
-            workers.set_view(center_chunk.x, center_chunk.z, self.view.horizontal, far_m);
-        }
+        let vxz = self.section_vel.x.hypot(self.section_vel.z);
+        let far_m = f64::from(self.section_pyramid.outer_m()) + vxz * TAU_STREAM;
+        // Configure the pool before any lane can submit this frame. On the
+        // first stream this avoids one permissive/full-capacity burst from a
+        // lazily spawned pool before the pacer catches it on the next pass.
+        let pacer = self.stream_pacer;
+        let velocity = self.section_vel;
+        let view_radius = self.view.horizontal;
+        let workers = self.worker_pool();
+        workers.set_view(
+            center_chunk.x,
+            center_chunk.z,
+            view_radius,
+            far_m,
+            velocity.x,
+            velocity.z,
+        );
+        workers.set_active_workers(pacer.active_workers(workers.worker_capacity()));
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
         // The ring geometry is centred on the eye: a boundary cross SHIFTS the
@@ -331,9 +467,13 @@ impl World {
                 let next = match loaded.state {
                     MeshState::Ready(_) => MeshState::needs_mesh(),
                     MeshState::Dirty { prev: Some(_) } => MeshState::Dirty { prev: None },
-                    MeshState::NeedsMesh { building, prev: Some(_) } => {
-                        MeshState::NeedsMesh { building, prev: None }
-                    }
+                    MeshState::NeedsMesh {
+                        building,
+                        prev: Some(_),
+                    } => MeshState::NeedsMesh {
+                        building,
+                        prev: None,
+                    },
                     _ => continue,
                 };
                 let stays_dirty = matches!(next, MeshState::Dirty { .. });
@@ -429,8 +569,7 @@ impl World {
                 step: self.section_pyramid.step(),
                 mip_ready: self.section_mip.is_some(),
             };
-            if self.section_frontier_key != Some(frontier_key) || !self.dirty_sections.is_empty()
-            {
+            if self.section_frontier_key != Some(frontier_key) || !self.dirty_sections.is_empty() {
                 self.section_desired = self.desired_sections(center_chunk);
                 self.section_frontier_key = Some(frontier_key);
                 self.section_cover_dirty.set();
@@ -472,82 +611,30 @@ impl World {
         self.debug_assert_liveness();
     }
 
-    /// Land finished worker results (non-blocking). Generate results clear `generating`.
-    /// Stale results drop and re-arm fresh scan. Budgeted mesh upload to GPU.
-    pub(in crate::world) fn drain_results(&mut self, eng: &mut Engine, light_apply: pipeline::Deadline) {
-        if let Some(workers) = &self.workers {
-            while let Some(done) = workers.try_recv() {
-                self.done_scratch.push(done);
-            }
+    /// Land finished worker results (non-blocking). Generate results clear
+    /// `generating`; stale results release their exact claims. Result
+    /// integration used to drain the unbounded channel in one frame, making a
+    /// productive worker burst a main-thread hitch. It now shares the adaptive
+    /// effort signal and keeps a small forward-progress floor.
+    pub(in crate::world) fn drain_results(&mut self, eng: &mut Engine, result_budget: Duration) {
+        let pacer = self.stream_pacer;
+        let result_deadline = pipeline::Deadline::from_budget(pacer.duration(result_budget));
+        let result_floor = pacer.floor(RESULT_INTEGRATE_FLOOR);
+        let mut integrated = 0usize;
+        while integrated < result_floor || !result_deadline.expired() {
+            let Some(result) = self.workers.as_ref().and_then(pipeline::Workers::try_recv) else {
+                break;
+            };
+            self.integrate_worker_result(result);
+            integrated += 1;
         }
-        if self.done_scratch.is_empty()
-            && self.upload_queue.is_empty()
+
+        if self.upload_queue.is_empty()
             && self.section_upload_queue.is_empty()
             && self.light_apply_queue.is_empty()
         {
             return;
         }
-        // Route each result through its lane's integrate or accept_column.
-        //
-        // THE claim rule, enforced at this chokepoint: a claimed key
-        // (`generating` / `building` / `light_inflight` / `Meshing{token}`)
-        // is owed exactly ONE `Done`, and consuming that `Done` — whatever is
-        // decided about its payload — must release or transfer the claim.
-        // Claims are otherwise released only by the exact-identity
-        // cancel/fail paths or by the bulk wipes that also retire the claim's
-        // identity (`transition_lighting`'s epoch bump, `clear_section_lane`,
-        // `free_meshes`). The debug postconditions below make a violation
-        // loud instead of a permanent quiet wedge.
-        let mut done = std::mem::take(&mut self.done_scratch);
-        for result in done.drain(..) {
-            #[cfg(debug_assertions)]
-            let light_audit = match &result {
-                pipeline::Done::Light { coord, epoch, .. } => Some((*coord, *epoch)),
-                _ => None,
-            };
-            #[cfg(debug_assertions)]
-            let section_audit = match &result {
-                pipeline::Done::Section { pos, epoch, token, .. } => Some((*pos, *epoch, *token)),
-                _ => None,
-            };
-            match result {
-                pipeline::Done::Column { col, chunks } => self.accept_column(col, chunks),
-                m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
-                l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
-                sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
-                pipeline::Done::Failed(key) => self.fail_job(*key),
-                pipeline::Done::Cancelled(keys) => {
-                    for key in keys {
-                        self.cancel_job(key);
-                    }
-                }
-            }
-            // A consumed CURRENT-epoch light result must have released its
-            // claim or transferred it into the apply queue.
-            #[cfg(debug_assertions)]
-            if let Some((coord, epoch)) = light_audit {
-                debug_assert!(
-                    epoch != self.light_epoch
-                        || !self.light_inflight.contains(&coord)
-                        || self.light_apply_queue.iter().any(|(c, _)| *c == coord),
-                    "light Done for {coord:?} left its claim neither released nor transferred"
-                );
-            }
-            // A consumed section result that still matches the LIVE claim must
-            // have been transferred to the upload queue (anything else was a
-            // superseded claim and must have been left alone).
-            #[cfg(debug_assertions)]
-            if let Some((pos, epoch, token)) = section_audit {
-                debug_assert!(
-                    epoch != self.section_epoch
-                        || !matches!(self.sections.get(&pos),
-                            Some(SectionState::Meshing { token: t }) if *t == token)
-                        || self.section_upload_queue.iter().any(|(p, t, _)| *p == pos && *t == token),
-                    "section Done for {pos:?} matched the live claim but was not transferred"
-                );
-            }
-        }
-        self.done_scratch = done;
 
         // Budgeted uploads, charged in BYTES (the actual staging cost — see
         // `UPLOAD_BUDGET_BYTES`). A stale entry costs nothing but a bounded
@@ -557,9 +644,11 @@ impl World {
         // the same forward-progress floor the admission lanes keep.
         // Re-validate at the moment of upload: an entry may have sat queued
         // across frames while an edit bumped the chunk's rev.
+        let upload_budget = pacer.upload_bytes();
         let mut upload_bytes = 0usize;
+        let mut uploads = 0usize;
         let mut pops = 0usize;
-        while upload_bytes < UPLOAD_BUDGET_BYTES && pops < UPLOAD_SCAN_MAX {
+        while (uploads == 0 || upload_bytes < upload_budget) && pops < UPLOAD_SCAN_MAX {
             let Some((coord, rev, data)) = self.upload_queue.pop_front() else {
                 break;
             };
@@ -570,6 +659,7 @@ impl World {
                 continue;
             }
             upload_bytes += mesh_output_bytes(&data);
+            uploads += 1;
             // Both passes upload together under one budget charge (same rev).
             // The worker baked per-vertex sky/block light into `data` from the
             // settled shell in its snapshot, so this is a pure GPU handoff —
@@ -582,22 +672,29 @@ impl World {
 
         // Budgeted light application. Order-independent: each grid is absolute,
         // leftovers apply next frame with no seam.
-        while !light_apply.expired() {
-            let Some((coord, grid)) = self.light_apply_queue.pop_front() else { break };
+        let light_apply =
+            pipeline::Deadline::from_budget(pacer.duration(pipeline::LIGHT_APPLY_BUDGET));
+        let mut light_applied = 0usize;
+        while light_applied == 0 || !light_apply.expired() {
+            let Some((coord, grid)) = self.light_apply_queue.pop_front() else {
+                break;
+            };
             self.settle_light(coord, grid);
+            light_applied += 1;
         }
 
         // Section uploads, on their own budget. Re-validated by claim token at
         // the moment of upload: an entry that sat queued across an unload or a
         // re-admission must not capture the replacement claim. The budget
-        // scales with queue pressure (amortized eighth of the backlog) so a
-        // ladder-change or spawn flood drains in a bounded handful of frames
-        // instead of trickling out at the steady-state rate, while a quiet
-        // trickle keeps the small fixed budget.
-        let section_budget = SECTION_UPLOAD_BUDGET.max(self.section_upload_queue.len() / 8);
+        // is a hard, velocity-scaled ceiling. Backlog no longer increases the
+        // render thread's per-frame work — that positive feedback loop was the
+        // exact high-speed hitch this pacer is designed to avoid.
+        let section_budget = pacer.section_uploads();
         let mut section_uploads = 0;
         while section_uploads < section_budget {
-            let Some((pos, token, meshes)) = self.section_upload_queue.pop_front() else { break };
+            let Some((pos, token, meshes)) = self.section_upload_queue.pop_front() else {
+                break;
+            };
             section_uploads += 1;
             // `section_material` borrows all of `self`, so it must run before
             // `self.sections.get_mut` below takes an overlapping mutable borrow.
@@ -619,6 +716,63 @@ impl World {
                 self.pending_sections.set();
                 self.section_cover_dirty.set();
             }
+        }
+    }
+
+    /// Route one completed worker payload through its owning lane. This is the
+    /// claim-resolution chokepoint: every accepted claim is owed exactly one
+    /// payload, cancellation, or failure, and consuming it must release or
+    /// transfer that claim even when the result became stale in flight.
+    fn integrate_worker_result(&mut self, result: pipeline::Done) {
+        #[cfg(debug_assertions)]
+        let light_audit = match &result {
+            pipeline::Done::Light { coord, epoch, .. } => Some((*coord, *epoch)),
+            _ => None,
+        };
+        #[cfg(debug_assertions)]
+        let section_audit = match &result {
+            pipeline::Done::Section {
+                pos, epoch, token, ..
+            } => Some((*pos, *epoch, *token)),
+            _ => None,
+        };
+        match result {
+            pipeline::Done::Column { col, chunks } => self.accept_column(col, chunks),
+            m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
+            l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
+            sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
+            pipeline::Done::Failed(key) => self.fail_job(*key),
+            pipeline::Done::Cancelled(keys) => {
+                for key in keys {
+                    self.cancel_job(key);
+                }
+            }
+        }
+        // A consumed CURRENT-epoch light result must have released its claim
+        // or transferred it into the apply queue.
+        #[cfg(debug_assertions)]
+        if let Some((coord, epoch)) = light_audit {
+            debug_assert!(
+                epoch != self.light_epoch
+                    || !self.light_inflight.contains(&coord)
+                    || self.light_apply_queue.iter().any(|(c, _)| *c == coord),
+                "light Done for {coord:?} left its claim neither released nor transferred"
+            );
+        }
+        // A current section result matching the live token must likewise have
+        // transferred to the upload queue.
+        #[cfg(debug_assertions)]
+        if let Some((pos, epoch, token)) = section_audit {
+            debug_assert!(
+                epoch != self.section_epoch
+                    || !matches!(self.sections.get(&pos),
+                        Some(SectionState::Meshing { token: t }) if *t == token)
+                    || self
+                        .section_upload_queue
+                        .iter()
+                        .any(|(p, t, _)| *p == pos && *t == token),
+                "section Done for {pos:?} matched the live claim but was not transferred"
+            );
         }
     }
 
@@ -712,7 +866,12 @@ impl World {
     ///   its coord (releasing can never steal a newer claim), while
     /// - a STALE-epoch result's claim was already wiped at the bump — an entry
     ///   present now belongs to a post-bump job and must not be touched.
-    pub(in crate::world) fn accept_light(&mut self, coord: Coord, epoch: u32, grid: light::LightGrid) {
+    pub(in crate::world) fn accept_light(
+        &mut self,
+        coord: Coord,
+        epoch: u32,
+        grid: light::LightGrid,
+    ) {
         if epoch != self.light_epoch {
             return;
         }
@@ -762,11 +921,15 @@ impl World {
         for coord in self.data_box(center).coords() {
             if self.chunks.contains_key(&coord)
                 || self.generating.contains(&coord)
-                || self.quarantined.contains(&FailKey::Column { col: (coord.x, coord.z) })
+                || self.quarantined.contains(&FailKey::Column {
+                    col: (coord.x, coord.z),
+                })
             {
                 continue;
             }
-            let entry = columns.entry((coord.x, coord.z)).or_insert((coord.y, coord.y));
+            let entry = columns
+                .entry((coord.x, coord.z))
+                .or_insert((coord.y, coord.y));
             entry.0 = entry.0.min(coord.y);
             entry.1 = entry.1.max(coord.y);
         }
@@ -774,16 +937,28 @@ impl World {
             return Progress::Idle;
         }
         let mut cols: Vec<((i32, i32), (i32, i32))> = columns.into_iter().collect();
-        cols.sort_by_key(|&((cx, cz), _)| (cx - center.x).abs().max((cz - center.z).abs()));
+        cols.sort_by_key(|&((cx, cz), _)| {
+            let dx = cx - center.x;
+            let dz = cz - center.z;
+            let ring = dx.abs().max(dz.abs()) as u64;
+            super::motion_biased_dist2(
+                ring.saturating_mul(ring).saturating_mul(1024),
+                self.section_vel,
+                f64::from(dx) * CHUNK_SIZE as f64,
+                f64::from(dz) * CHUNK_SIZE as f64,
+            )
+        });
         let mut admitted = 0usize;
         let mut remaining = 0usize;
+        let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
         for ((cx, cz), (cy_lo, cy_hi)) in cols {
-            if super::admission_exhausted(admitted, GEN_MIN_ADMIT, deadline) {
+            if super::admission_exhausted(admitted, min_admit, deadline) {
                 remaining += 1;
                 continue;
             }
             // Collect edits for the landing chunk to replay.
-            let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo..=cy_hi)
+            let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
+                ..=cy_hi)
                 .filter_map(|cy| {
                     let coord = ChunkCoord::new(cx, cy, cz);
                     self.edits
@@ -797,10 +972,7 @@ impl World {
                 generator: self.generator.clone(),
                 edits,
             };
-            let accepted = self
-                .workers
-                .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()))
-                .submit(job);
+            let accepted = self.worker_pool().submit(job);
             if accepted {
                 // Claim every missing coord in the span so it isn't re-requested.
                 for cy in cy_lo..=cy_hi {
@@ -817,7 +989,9 @@ impl World {
         }
         if remaining > 0 {
             self.pending_gen.set();
-            Progress::Partial { remaining: remaining as u32 }
+            Progress::Partial {
+                remaining: remaining as u32,
+            }
         } else {
             Progress::Idle
         }
@@ -825,7 +999,11 @@ impl World {
 
     /// Land a generated column: register each not-yet-loaded, in-range chunk
     /// (edits already replayed on the worker) and clear its generate claim.
-    pub(in crate::world) fn accept_column(&mut self, _col: (i32, i32), chunks: Vec<(Coord, Chunk)>) {
+    pub(in crate::world) fn accept_column(
+        &mut self,
+        _col: (i32, i32),
+        chunks: Vec<(Coord, Chunk)>,
+    ) {
         for (coord, chunk) in chunks {
             self.generating.remove(&coord);
             self.accept_chunk(coord, chunk);
@@ -964,8 +1142,14 @@ impl World {
         }
         // Uniform non-solid chunks produce no geometry, so start Air.
         // Check solidity, not AIR id, for future non-solid blocks.
-        let born_air = chunk.uniform().is_some_and(|id| !self.registry.is_solid(id));
-        let state = if born_air { MeshState::Air } else { MeshState::needs_mesh() };
+        let born_air = chunk
+            .uniform()
+            .is_some_and(|id| !self.registry.is_solid(id));
+        let state = if born_air {
+            MeshState::Air
+        } else {
+            MeshState::needs_mesh()
+        };
         // Born-air is already settled; a sky ring can complete without a
         // single upload.
         self.lod_clip_grow.raise(born_air);
@@ -976,7 +1160,16 @@ impl World {
             !self.generating.contains(&coord),
             "storing {coord:?} still claimed in generating — a stuck generate claim"
         );
-        self.chunks.insert(coord, Loaded { chunk: std::sync::Arc::clone(&chunk), state, rev: 0, connectivity: None, light: None });
+        self.chunks.insert(
+            coord,
+            Loaded {
+                chunk: std::sync::Arc::clone(&chunk),
+                state,
+                rev: 0,
+                connectivity: None,
+                light: None,
+            },
+        );
         // Ceiling-cache lifetime: the column's count drops its entry at zero.
         *self.column_chunks.entry((coord.x, coord.z)).or_insert(0) += 1;
         // Occlusion learns of the new chunk through the fill queue (bounded
@@ -1080,7 +1273,8 @@ impl World {
         // filtering every loaded chunk each frame the hint is up: during a
         // light flood that was an O(world) iteration per frame.
         let chunks = &self.chunks;
-        self.dirty_worklist.retain(|c| chunks.get(c).is_some_and(|l| l.state.is_dirty()));
+        self.dirty_worklist
+            .retain(|c| chunks.get(c).is_some_and(|l| l.state.is_dirty()));
         let mut dirty: Vec<Coord> = self.dirty_worklist.iter().copied().collect();
         dirty.sort_by_key(|&coord| Self::order(coord, center));
         // Leftovers past the budget stay `Dirty` (still in the fiber); re-arm
@@ -1096,7 +1290,9 @@ impl World {
             self.mesh_chunk(coord, eng);
         }
         if remaining > 0 {
-            Progress::Partial { remaining: remaining as u32 }
+            Progress::Partial {
+                remaining: remaining as u32,
+            }
         } else {
             Progress::Idle
         }
@@ -1116,7 +1312,9 @@ impl World {
                 uniform: loaded.chunk.uniform(),
                 // Lighting off omits the 18³ shell entirely — the mesher's
                 // unlit path reads constant full light instead.
-                light: self.lighting.then(|| self.capture_padded_light(coord, degraded)),
+                light: self
+                    .lighting
+                    .then(|| self.capture_padded_light(coord, degraded)),
                 tables: self.tables.get(),
             },
         )
@@ -1143,7 +1341,9 @@ impl World {
             return light::FaceShell::dark();
         }
         light::FaceShell::capture(|face| {
-            self.chunks.get(&coord.step(face)).and_then(|l| l.light.as_ref())
+            self.chunks
+                .get(&coord.step(face))
+                .and_then(|l| l.light.as_ref())
         })
     }
 
@@ -1254,13 +1454,18 @@ impl World {
     /// — the "still laggy seconds after stopping" stall. The sync path stays
     /// for player edits only, where same-frame response is the point.
     fn remesh_async(&mut self, coord: Coord) {
-        let Some(loaded) = self.chunks.get_mut(&coord) else { return };
+        let Some(loaded) = self.chunks.get_mut(&coord) else {
+            return;
+        };
         match &mut loaded.state {
             // Carry the drawn mesh into the rebuild state.
             MeshState::Ready(_) => {
                 let prev =
                     std::mem::replace(&mut loaded.state, MeshState::needs_mesh()).into_owned();
-                loaded.state = MeshState::NeedsMesh { building: false, prev };
+                loaded.state = MeshState::NeedsMesh {
+                    building: false,
+                    prev,
+                };
             }
             // Already awaiting/mid-build: the rev bump below strands the
             // in-flight result; its stale drop releases the claim and
@@ -1290,7 +1495,10 @@ impl World {
             None => (true, Face::ALL.to_vec()),
             Some(old) => (
                 *old != grid,
-                Face::ALL.into_iter().filter(|&f| light::border_changed(old, &grid, f)).collect(),
+                Face::ALL
+                    .into_iter()
+                    .filter(|&f| light::border_changed(old, &grid, f))
+                    .collect(),
             ),
         };
         self.chunks.get_mut(&coord).unwrap().light = Some(grid);
@@ -1346,7 +1554,11 @@ impl World {
         let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
         let cfg = &self.section_pyramid;
         EyeMetric::new(
-            DVec3::new(pcx as f64 + delta.x, self.section_eye_y + delta.y, pcz as f64 + delta.z),
+            DVec3::new(
+                pcx as f64 + delta.x,
+                self.section_eye_y + delta.y,
+                pcz as f64 + delta.z,
+            ),
             HeightEnvelope::new(
                 super::section::LOD_FLOOR_Y as f32,
                 super::section::LOD_CEIL_Y as f32,
@@ -1363,7 +1575,10 @@ impl World {
         match &self.section_mip {
             Some(mip) => {
                 let summary_at = |c: SectionPos| match self.section_overlay.get(&c) {
-                    Some(ov) => CellSummary { env: HeightEnvelope::new(ov.lo, ov.hi), err: CellError::from_metres(ov.hi - ov.lo) },
+                    Some(ov) => CellSummary {
+                        env: HeightEnvelope::new(ov.lo, ov.hi),
+                        err: CellError::from_metres(ov.hi - ov.lo),
+                    },
                     None => mip.summary(c),
                 };
                 quadtree::coarsen_by_error(radial, metric, cfg, &summary_at, &self.sse_budget())
@@ -1375,7 +1590,11 @@ impl World {
     /// Ladder-pinned SSE budget for current view radius. Rebuilt per query
     /// as `unit` tracks view distance.
     fn sse_budget(&self) -> SseBudget {
-        SseBudget::ladder(SSE_K, self.section_pyramid.unit, self.section_pyramid.finest.0)
+        SseBudget::ladder(
+            SSE_K,
+            self.section_pyramid.unit,
+            self.section_pyramid.finest.0,
+        )
     }
 
     /// Spawn background max-mip bake (idempotent: no-op if spawned or landed).
@@ -1401,12 +1620,12 @@ impl World {
     /// Install background bake if landed. Newly-arrived mip only coarsens
     /// far field, so just re-arm section pass to re-select.
     pub(in crate::world) fn poll_mip(&mut self) {
-        if let Some(rx) = &self.section_mip_rx {
-            if let Ok(mip) = rx.try_recv() {
-                self.section_mip = Some(mip);
-                self.section_mip_rx = None;
-                self.pending_sections.set();
-            }
+        if let Some(rx) = &self.section_mip_rx
+            && let Ok(mip) = rx.try_recv()
+        {
+            self.section_mip = Some(mip);
+            self.section_mip_rx = None;
+            self.pending_sections.set();
         }
     }
 
@@ -1441,7 +1660,12 @@ impl World {
             }
             let cell = *self.section_overlay_cache.get_or_recompute(pos, rev, || {
                 let colors = self.registry.color_snapshot();
-                Some(super::heightmip::resample_cell(pos, &*self.generator, &touched, &colors))
+                Some(super::heightmip::resample_cell(
+                    pos,
+                    &*self.generator,
+                    &touched,
+                    &colors,
+                ))
             });
             match cell {
                 Some(cell) => {
@@ -1508,7 +1732,7 @@ impl World {
     /// events) could go quiet with holes still open — flying far up left the
     /// covering permanently behind the live frontier, drawing a couple of
     /// stale coarse cubes over an otherwise missing far field.
-    pub(in crate::world) fn rebuild_section_visible(&mut self, mut eng: Option<&mut Engine>) {
+    pub(in crate::world) fn rebuild_section_visible(&mut self, eng: Option<&mut Engine>) {
         let Some(center) = self.center else {
             return;
         };
@@ -1530,7 +1754,7 @@ impl World {
         let changed = self.section_fade.update_now(&self.section_visible);
         // The mask is a projection of that decision, so it follows the same diff —
         // a region whose slots have not landed yet is caught by the upload site instead.
-        if let Some(eng) = eng.as_deref_mut() {
+        if let Some(eng) = eng {
             for (pos, mask) in changed {
                 if let Some(state) = self.sections.get(&pos) {
                     state.set_visible(eng, mask);
@@ -1613,7 +1837,9 @@ impl World {
 
     /// Six orthogonal neighbours have data loaded.
     pub(in crate::world) fn neighbours_have_data(&self, coord: Coord) -> bool {
-        Face::ALL.iter().all(|&f| self.chunks.contains_key(&coord.step(f)))
+        Face::ALL
+            .iter()
+            .all(|&f| self.chunks.contains_key(&coord.step(f)))
     }
 
     /// Light settled enough to mesh: chunk and face neighbours have grids, and the
@@ -1628,7 +1854,9 @@ impl World {
             && !self.light_inflight.contains(&coord)
             && self.chunks.get(&coord).is_some_and(|l| l.light.is_some())
             && Face::ALL.iter().all(|&f| {
-                self.chunks.get(&coord.step(f)).is_some_and(|l| l.light.is_some())
+                self.chunks
+                    .get(&coord.step(f))
+                    .is_some_and(|l| l.light.is_some())
             })
     }
 
@@ -1645,7 +1873,10 @@ impl World {
     /// Whether `coord` has waited on neighbour light past [`LIGHT_WAIT_DEGRADE`] —
     /// the mesh-lane predicate that admits a DEGRADED mesh.
     pub(in crate::world) fn light_wait_expired(&self, coord: Coord) -> bool {
-        self.light_gate.blocked_since.get(&coord).is_some_and(|t| t.elapsed() >= LIGHT_WAIT_DEGRADE)
+        self.light_gate
+            .blocked_since
+            .get(&coord)
+            .is_some_and(|t| t.elapsed() >= LIGHT_WAIT_DEGRADE)
     }
 
     /// Record (or clear) that `coord` is currently drawing a degraded, known-not-
@@ -1675,13 +1906,18 @@ impl World {
         // the predicates below read the chunk map.
         let mut gate = std::mem::take(&mut self.light_gate);
         gate.degraded.retain(|c| self.chunks.contains_key(c));
-        gate.blocked_since.retain(|c, _| self.chunk_light_blocked(*c));
+        gate.blocked_since
+            .retain(|c, _| self.chunk_light_blocked(*c));
         // Safety net: event-driven paths miss degraded chunks whose neighbour
         // light settled without moving the shared border. Sweep them: any now
         // light-ready gets its ASYNC rebuild scheduled (the old mesh keeps
         // drawing), clearing the degraded flag at the rebuild's submit.
-        let relit: Vec<Coord> =
-            gate.degraded.iter().copied().filter(|&c| self.light_ready(c)).collect();
+        let relit: Vec<Coord> = gate
+            .degraded
+            .iter()
+            .copied()
+            .filter(|&c| self.light_ready(c))
+            .collect();
         for c in relit {
             self.remesh_async(c);
         }
@@ -1767,7 +2003,9 @@ impl World {
     /// or in flight, and (under lod2) the section far field is covering-complete.
     /// Reads private streaming state — its home here.
     pub fn entry_complete(&self) -> bool {
-        let Some(center) = self.center else { return false };
+        let Some(center) = self.center else {
+            return false;
+        };
         // No near work queued or in flight, and nothing owed a final-light remesh.
         if !self.generating.is_empty()
             || !self.mesh_worklist.is_empty()
@@ -1793,7 +2031,11 @@ impl World {
             if !self.section_upload_queue.is_empty() {
                 return false;
             }
-            if self.desired_sections(center).into_iter().any(|c| !self.section_covered(c)) {
+            if self
+                .desired_sections(center)
+                .into_iter()
+                .any(|c| !self.section_covered(c))
+            {
                 return false;
             }
         }
@@ -1807,7 +2049,9 @@ impl World {
     /// The golden harness gates captures on this so blessed shots are the
     /// converged frame; gameplay never waits on it.
     pub fn far_field_refined(&self) -> bool {
-        let Some(center) = self.center else { return false };
+        let Some(center) = self.center else {
+            return false;
+        };
         if !self.lod2 {
             return true;
         }
@@ -1835,6 +2079,19 @@ impl World {
 
     /// Snapshot the streaming-queue depths (see [`super::StreamGauges`]).
     pub fn stream_gauges(&self) -> super::StreamGauges {
+        let (worker_near_queue, worker_far_queue, active_workers, worker_capacity) = self
+            .workers
+            .as_ref()
+            .map(|workers| {
+                let (near, far) = workers.queue_depths();
+                (
+                    near,
+                    far,
+                    workers.active_workers(),
+                    workers.worker_capacity(),
+                )
+            })
+            .unwrap_or_default();
         super::StreamGauges {
             chunks: self.chunks.len(),
             generating: self.generating.len(),
@@ -1843,6 +2100,12 @@ impl World {
             light_worklist: self.light_worklist.len(),
             light_inflight: self.light_inflight.len(),
             light_apply_queue: self.light_apply_queue.len(),
+            worker_near_queue,
+            worker_far_queue,
+            active_workers,
+            worker_capacity,
+            travel_speed_mps: self.stream_pacer.speed_mps(),
+            effort: self.stream_pacer.effort(),
         }
     }
 
@@ -1851,7 +2114,9 @@ impl World {
     /// streaming stage is stuck instead of hanging silently. Clause order mirrors
     /// [`entry_complete`](Self::entry_complete).
     pub fn entry_debug(&self) -> String {
-        let Some(center) = self.center else { return "no stream centre yet".into() };
+        let Some(center) = self.center else {
+            return "no stream centre yet".into();
+        };
         if !self.quarantined.is_empty() {
             return format!(
                 "{} claim(s) quarantined after repeated worker panics: {:?}",
@@ -1872,8 +2137,11 @@ impl World {
             ("degraded", self.light_gate.degraded.len()),
             ("light_blocked", self.light_gate.blocked_since.len()),
         ];
-        let pending: Vec<String> =
-            near.iter().filter(|(_, n)| *n != 0).map(|(k, n)| format!("{k}={n}")).collect();
+        let pending: Vec<String> = near
+            .iter()
+            .filter(|(_, n)| *n != 0)
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect();
         if !pending.is_empty() {
             let mut msg = format!("near work pending: {}", pending.join(", "));
             // If the fresh-mesh lane is the blocker, tally WHICH ready()-predicate the
@@ -1911,7 +2179,9 @@ impl World {
                 None => missing += 1,
                 Some(MeshState::Dirty { .. }) => dirty += 1,
                 Some(MeshState::NeedsMesh { building: true, .. }) => building += 1,
-                Some(MeshState::NeedsMesh { building: false, .. }) => {
+                Some(MeshState::NeedsMesh {
+                    building: false, ..
+                }) => {
                     if in_wl {
                         queued += 1;
                     } else {
@@ -1939,7 +2209,10 @@ impl World {
                 return format!("section_upload_queue = {}", self.section_upload_queue.len());
             }
             let desired = self.desired_sections(center);
-            let uncovered = desired.iter().filter(|&&c| !self.section_covered(c)).count();
+            let uncovered = desired
+                .iter()
+                .filter(|&&c| !self.section_covered(c))
+                .count();
             if uncovered != 0 {
                 return format!(
                     "column sections uncovered: {uncovered} of {} desired",
@@ -2004,10 +2277,11 @@ impl World {
         let count = self.registry.block_count();
         if self.textures_built != count {
             for i in self.texture_cache.len()..count {
-                self.texture_cache.push(crate::block::texture::build_block_texture(
-                    &self.registry,
-                    crate::block::registry::BlockId(i as u16),
-                ));
+                self.texture_cache
+                    .push(crate::block::texture::build_block_texture(
+                        &self.registry,
+                        crate::block::registry::BlockId(i as u16),
+                    ));
             }
             let visible = count.min(self.texture_layer_cap as usize);
             if count > visible && self.textures_built <= visible {
@@ -2016,7 +2290,10 @@ impl World {
                      ({visible}); further block textures wrap onto existing layers"
                 );
             }
-            eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, &self.texture_cache[..visible]);
+            eng.set_block_textures(
+                crate::block::texture::TEXTURE_SIZE,
+                &self.texture_cache[..visible],
+            );
             self.textures_built = count;
         }
     }
@@ -2024,8 +2301,35 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::StreamLane;
+    use super::*;
+
+    #[test]
+    fn stream_pacer_scales_with_useful_chunk_lifetime_and_recovers_gradually() {
+        assert_eq!(StreamPacer::target_effort(0.0), 1.0);
+        assert_eq!(StreamPacer::target_effort(FULL_EFFORT_SPEED_MPS), 1.0);
+        assert!((StreamPacer::target_effort(48.0) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(StreamPacer::target_effort(10_000.0), MIN_STREAM_EFFORT);
+        assert_eq!(StreamPacer::target_effort(f64::INFINITY), MIN_STREAM_EFFORT);
+        assert_eq!(StreamPacer::target_effort(f64::NAN), 1.0);
+
+        let mut pacer = StreamPacer::default();
+        pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
+        assert_eq!(pacer.effort(), MIN_STREAM_EFFORT, "shedding is immediate");
+        assert_eq!(pacer.active_workers(12), 2);
+        assert_eq!(pacer.floor(32), 5);
+        assert_eq!(pacer.section_uploads(), 1);
+
+        pacer.update(DVec3::ZERO, 0.1);
+        assert!(
+            pacer.effort() > MIN_STREAM_EFFORT && pacer.effort() < 1.0,
+            "recovery ramps instead of releasing a one-frame catch-up burst"
+        );
+        for _ in 0..100 {
+            pacer.update(DVec3::ZERO, 0.1);
+        }
+        assert_eq!(pacer.effort(), 1.0);
+    }
 
     /// A degraded drawn chunk whose neighbourhood becomes light-ready WITHOUT
     /// a border event (nothing re-seeds it) is promoted by the gate's relit
@@ -2037,8 +2341,7 @@ mod tests {
         let c = ChunkCoord::new(0, 0, 0);
         world.center = Some(c);
         for n in std::iter::once(c).chain(Face::ALL.iter().map(|&f| c.step(f))) {
-            world.chunks.get_mut(&n).expect("pregenerated").light =
-                Some(light::LightGrid::dark());
+            world.chunks.get_mut(&n).expect("pregenerated").light = Some(light::LightGrid::dark());
         }
         let h = voxel_engine::MeshHandle::from_raw_parts(21, 1);
         let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
@@ -2054,11 +2357,20 @@ mod tests {
 
         let state = &world.chunks[&c].state;
         assert!(
-            matches!(state, MeshState::NeedsMesh { building: false, prev: Some(_) }),
+            matches!(
+                state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
             "promoted through the async rebuild: {state:?}"
         );
         assert!(world.mesh_worklist.contains(&c), "seeded for the rebuild");
-        assert!(!world.pending_dirty.get(), "the sync dirty path is not involved");
+        assert!(
+            !world.pending_dirty.get(),
+            "the sync dirty path is not involved"
+        );
     }
 
     /// The admit loop evicts a light-blocked seed from `mesh_worklist` and
@@ -2078,13 +2390,19 @@ mod tests {
         // near spawn); C's own light stays unset so `light_ready(c)` is false
         // and `chunk_light_blocked(c)` holds without touching the light worklist.
         for n in std::iter::once(c).chain(crate::coord::Face::ALL.iter().map(|&f| c.step(f))) {
-            world.chunks.get_mut(&n).expect("neighbourhood pregenerated near spawn");
+            world
+                .chunks
+                .get_mut(&n)
+                .expect("neighbourhood pregenerated near spawn");
         }
         world.chunks.get_mut(&c).unwrap().light = None;
         world.chunks.get_mut(&c).unwrap().state = MeshState::needs_mesh();
         assert!(world.neighbours_have_data(c));
         assert!(world.in_mesh_box(c));
-        assert!(world.chunk_light_blocked(c), "no published light: c is light-blocked");
+        assert!(
+            world.chunk_light_blocked(c),
+            "no published light: c is light-blocked"
+        );
 
         // Seed C and run the REAL admission pass: it must evict the blocked
         // seed and start its wait timer through the `on_blocked` event.
@@ -2095,7 +2413,10 @@ mod tests {
             c,
             pipeline::Deadline::from_budget(Duration::from_millis(5)),
         );
-        assert!(!world.mesh_worklist.contains(&c), "the blocked seed is evicted");
+        assert!(
+            !world.mesh_worklist.contains(&c),
+            "the blocked seed is evicted"
+        );
         assert!(
             world.light_gate.blocked_since.contains_key(&c),
             "eviction must start the wait timer"
@@ -2113,8 +2434,14 @@ mod tests {
         // Back-date the timer past LIGHT_WAIT_DEGRADE without sleeping — the
         // gate's expiry is wall-clock, so this is the only deterministic way to
         // reach the expired state.
-        world.light_gate.blocked_since.insert(c, Instant::now() - LIGHT_WAIT_DEGRADE - Duration::from_millis(1));
-        assert!(world.light_wait_expired(c), "back-dated timer must read as expired");
+        world.light_gate.blocked_since.insert(
+            c,
+            Instant::now() - LIGHT_WAIT_DEGRADE - Duration::from_millis(1),
+        );
+        assert!(
+            world.light_wait_expired(c),
+            "back-dated timer must read as expired"
+        );
 
         // The next `tick_light_gate` must re-seed it purely from the expired
         // timer, with no dependency on `c` already being in the worklist.
@@ -2123,7 +2450,10 @@ mod tests {
             world.mesh_worklist.contains(&c),
             "eviction-stall regression: an expired-but-evicted chunk must be re-seeded"
         );
-        assert!(world.pending_fresh.get(), "re-armed: the fresh scan will pick it up");
+        assert!(
+            world.pending_fresh.get(),
+            "re-armed: the fresh scan will pick it up"
+        );
         assert!(
             <MeshLane as StreamLane>::ready(&world, c),
             "expired wait admits a degraded mesh even though light never settled"

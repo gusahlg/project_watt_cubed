@@ -65,6 +65,7 @@ All four rate lanes and the scheduler's `Cadence::Hz` producers run on ONE accum
 - The LOD ladder is configurable and transitions live (`World::set_render_config`): a change frees old GPU-owned sections exactly once, purges queued far jobs, clears derived frontier/cover state, re-arms the new ladder, and advances the section **epoch**. Every asynchronous section claim also carries a unique **token** (`SectionState::Meshing { token }`, `JobKey::Section { pos, epoch, token }`), validated at result integration AND at the moment of upload — an old result, cancellation, failure, or queued upload can never capture a same-position replacement after unload/re-admission.
 - The far-field frontier is retained across streaming passes until its exact eye, velocity, ladder, or relief-mip inputs change (`SectionFrontierKey`); edits force a recompute because relief coarsening consults the edit overlay. Per-section band selection uses bounded multiply/compare steps instead of logarithms, with the base-2 step cached in `PyramidCfg`.
 - Large camera discontinuities (implausible apparent speed, > 512 m/s) purge queued far work and cancel its exact claims, so obsolete jobs cannot monopolize workers; Ready sections stay resident.
+- Sustained travel is load-shed instead of treated as a backlog to overpower. Above 24 m/s one normalized `StreamPacer` scales effort approximately with useful chunk lifetime (`24 / speed`, floor 15%): admission deadlines and progress floors shrink together, near-queue lookahead stays at four jobs per active worker, background concurrency drops immediately, completed-result integration and chunk uploads are bounded, and section uploads no longer grow with queue depth. Leading-edge chunks are motion-prioritized. Capacity recovers exponentially after stopping (0.75 s time constant), preventing a one-frame catch-up avalanche while guaranteeing every lane forward progress.
 - Padded voxel/light snapshots and greedy-mesh outputs use bounded cross-thread pools (snapshots are captured on the main thread and dropped by workers — a thread-local pool stranded every buffer). Lighting-off snapshots omit the 18³ light shell entirely, and disabling both lighting and AO selects a culling-only face-sample path; a parity test pins the unlit mesher byte-identical to a full-bright shell.
 - Worker jobs share one immutable terrain generator through `Arc` instead of deep-cloning the compiled terrain per job, and skip per-job profiling labels/clocks when profiling is disabled.
 
@@ -82,7 +83,7 @@ These are caching and redundant-work removals, not a world-generation redesign. 
 
 The client/server message enums and their binary codec are generated from one `messages!` table over a per-field `Wire` trait ([`src/net/protocol.rs`](../src/net/protocol.rs)): the declaration is the wire format, so encode and decode cannot drift. The byte layout is unchanged (all round-trip, bit-exactness, trailing-byte, and forged-frame tests pass verbatim).
 
-## Future benchmark procedure
+## Benchmark procedure
 
 Use the release profile in [`Cargo.toml`](../Cargo.toml). Build once so compilation is outside every sample:
 
@@ -101,7 +102,11 @@ for run in 1 2 3 4 5; do
 done
 ```
 
-The harness performs a three-second warmup, slowly rotates the camera, and prints `frames`, `avg_fps`, `p1_fps`, `avg_ms`, and `rss_mb`. Use these scenarios:
+The harness performs at least a three-second warmup and then waits for `World::entry_complete` before sampling (bounded by `WATT_BENCH_READY_TIMEOUT`, 60 seconds by default). It slowly rotates the camera and emits both a compact `BENCH` summary and a schema-versioned `BENCH_JSON` record. The record includes CPU topology and power governor, RAM/cgroup limit, renderer-compatible Vulkan GPU and driver inventory, the likely selected GPU, window/render resolution, connected display EDID data, OS/kernel/session, game and renderer revisions, every relevant graphics/streaming setting, frame-time percentiles and hitch counts, RSS start/peak/end, and streaming queue/worker peaks.
+
+Set `WATT_BENCH_OUTPUT=benchmarks/results.jsonl` to append the JSON record. `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, and `WATT_BENCH_TAG` control the minimum warmup, readiness ceiling, and run label. On a multi-GPU machine where renderer selection is ambiguous without the window surface, set `WATT_BENCH_GPU` to the observed renderer device; the report records that it was an explicit override rather than silently guessing.
+
+Use these scenarios:
 
 1. **Minimum target:** `WATT_BENCH_PRESET=minimum`, seed 42, spawn position.
 2. **Fast target:** `WATT_BENCH_PRESET=fast`, otherwise identical.
@@ -110,9 +115,9 @@ The harness performs a three-second warmup, slowly rotates the camera, and print
 5. **LOD stress:** Custom profile with distant LOD enabled, record distance/vertical/levels/detail explicitly, then use the same seed and position.
 6. **Attribution only:** repeat a representative failure with `WATT_BENCH_PROFILE=1`. Never compare this run directly with the uninstrumented target.
 
-Keep `VOXEL_PROFILE` unset and `WATT_BENCH_PROFILE` absent for headline numbers. VSync must be off and the FPS cap zero. Also capture CPU/GPU model, clocks/power policy, RAM, OS, window resolution, render scale, backend, driver, commit IDs for both this repository and the sibling renderer, and whether the window was visible or occluded.
+Keep `VOXEL_PROFILE` unset and `WATT_BENCH_PROFILE` absent for headline numbers. The harness forces VSync off and the FPS cap to zero, and the JSON record captures the reproducibility metadata above. Compositor occlusion and thermal state remain external facts; put them in `WATT_BENCH_TAG` when they differ between samples.
 
-The current harness is a steady rotating-camera test, not a movement/streaming benchmark. Before claiming cold-start or traversal performance, add deterministic scenarios that cross chunk boundaries at fixed velocities and separately report startup-to-playable, convergence, hitch percentiles, upload backlog, and steady state. Validate frame semantics with render-thread/GPU counters.
+The `WATT_BENCH` harness is a steady rotating-camera test, not a traversal result. The separate `stress` binary deterministically crosses chunk boundaries at 64 and 200 m/s, reports flight/settle hitch percentiles, convergence time, upload/light/mesh and worker-queue peaks, plus the minimum adaptive effort/worker allowance. Run it with `cargo run --release --bin stress`. Validate frame semantics with render-thread/GPU counters before treating application-frame throughput as presentation throughput.
 
 ## Prioritized remaining opportunities
 
@@ -130,7 +135,6 @@ Unchanged from the original audit (`../voxel-engine`): stop cloning completed dr
 6. Batch terrain-noise evaluation across columns. SIMD or reassociation is allowed only if an authoritative byte-parity test proves it does not alter generated blocks.
 7. Cache name-tag text/measurement and share peer names (`Arc<str>`) for the models/tags-on multiplayer case.
 8. Budget mod edge bursts: a time budget with an ordered continuation would bound third-party hook cost without losing or reordering actions.
-9. Rekey or reprioritize accepted far jobs during continuous high-speed travel (teleports and ladder changes already purge; steady traversal can still leave valid-but-low-value jobs queued).
 
 ## Correctness constraints
 

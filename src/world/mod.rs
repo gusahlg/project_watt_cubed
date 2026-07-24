@@ -41,15 +41,15 @@ pub mod placement;
 pub mod pyramid;
 pub mod section;
 
+mod coverage;
 mod edits;
 mod heightmip;
+pub(crate) mod lanes;
 mod metric;
 mod quadtree;
 mod query;
 mod streaming;
 mod summary;
-mod coverage;
-pub(crate) mod lanes;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -128,8 +128,9 @@ const OCCLUSION_FILL_BUDGET: usize = 64;
 const OCCLUSION_DEBOUNCE: Duration = Duration::from_millis(100);
 /// The seed a default (`generate`) world uses when none is chosen.
 pub const DEFAULT_SEED: i64 = 1;
-/// Column-section uploads per frame; separate budget so a world-entry
-/// flood doesn't starve chunk uploads.
+/// Base column-section uploads per frame. Unlike the old queue-depth scaler,
+/// this is a hard ceiling: a backlog is evidence that producers should slow
+/// down, not permission to make the render thread do progressively more work.
 const SECTION_UPLOAD_BUDGET: usize = 2;
 
 /// A chunk-coordinate map key. The [`ChunkCoord`] newtype owns the
@@ -150,6 +151,15 @@ pub struct StreamGauges {
     pub light_worklist: usize,
     pub light_inflight: usize,
     pub light_apply_queue: usize,
+    /// Near/far jobs waiting in the shared worker queue (running jobs excluded).
+    pub worker_near_queue: usize,
+    pub worker_far_queue: usize,
+    /// Velocity-aware worker allowance and the pool's physical ceiling.
+    pub active_workers: usize,
+    pub worker_capacity: usize,
+    /// Current horizontal travel speed and normalized streaming effort.
+    pub travel_speed_mps: f64,
+    pub effort: f32,
 }
 use connectivity::{Connectivity, Occlusion};
 
@@ -178,7 +188,10 @@ impl ViewVolume {
     }
     /// Explicit anisotropic volume. Runtime setters clamp before construction.
     fn new(horizontal: i32, vertical: i32) -> Self {
-        Self { horizontal, vertical }
+        Self {
+            horizontal,
+            vertical,
+        }
     }
     /// The streamed volume for a horizontal view radius, with the vertical
     /// radius derived from it.
@@ -351,7 +364,9 @@ impl ChunkMeshes {
         any.then_some(Self(passes))
     }
     /// Wrap freshly uploaded per-pass handles, same "at least 1 present" rule as [`Self::new`].
-    pub(in crate::world) fn from_upload_handles(handles: ByPass<Option<MeshHandle>>) -> Option<Self> {
+    pub(in crate::world) fn from_upload_handles(
+        handles: ByPass<Option<MeshHandle>>,
+    ) -> Option<Self> {
         Self::new(ByPass::from_fn(|p| handles[p].map(OwnedMesh::new)))
     }
     /// Push far-material style onto each present pass's resident mesh (LOD
@@ -383,7 +398,9 @@ impl ChunkMeshes {
     /// Whether any pass draws `handle` — for the render/ownership tests.
     #[cfg(test)]
     fn draws(&self, handle: MeshHandle) -> bool {
-        self.0.iter().any(|(_, m)| m.as_ref().is_some_and(|o| o.id() == handle))
+        self.0
+            .iter()
+            .any(|(_, m)| m.as_ref().is_some_and(|o| o.id() == handle))
     }
 }
 
@@ -419,7 +436,11 @@ impl SectionState {
     /// Upload each quadrant's block meshes at their absolute world origin and
     /// detail (pinned once — the engine recovers camera-relative position). Empty
     /// quadrants upload to no handles.
-    fn from_upload(pos: SectionPos, meshes: [SectionMeshData; 4], eng: &mut Engine) -> SectionState {
+    fn from_upload(
+        pos: SectionPos,
+        meshes: [SectionMeshData; 4],
+        eng: &mut Engine,
+    ) -> SectionState {
         let cell = pos.cell_size();
         let detail = pos.detail;
         let quadrants = meshes.map(|quad| {
@@ -440,7 +461,10 @@ impl SectionState {
             }
             blocks
         });
-        SectionState::Ready { quadrants, last_style: None }
+        SectionState::Ready {
+            quadrants,
+            last_style: None,
+        }
     }
 
     fn is_ready(&self) -> bool {
@@ -518,7 +542,10 @@ enum MeshState {
     /// [`World::remesh_async`]): it keeps drawing until the fresh upload
     /// retires it, so an async relight never blanks the chunk. `None` for a
     /// never-meshed chunk.
-    NeedsMesh { building: bool, prev: Option<ChunkMeshes> },
+    NeedsMesh {
+        building: bool,
+        prev: Option<ChunkMeshes>,
+    },
     /// Drawable: owns the live GPU mesh(es) (up to one per pass).
     Ready(ChunkMeshes),
     /// Edited, awaiting the synchronous remesh. `prev` is the previously-drawn
@@ -578,7 +605,10 @@ impl MeshState {
     }
     /// A fresh never-meshed (or reset) state: not building, nothing carried.
     fn needs_mesh() -> MeshState {
-        MeshState::NeedsMesh { building: false, prev: None }
+        MeshState::NeedsMesh {
+            building: false,
+            prev: None,
+        }
     }
     /// Invalidate to `Dirty`, carrying the currently-drawn mesh forward as
     /// `prev` so it keeps drawing until the sync remesh. Nothing is freed here
@@ -685,9 +715,6 @@ pub struct World {
     /// vertical chunk and every re-settle instead of re-sampling 256 noise columns
     /// per settle. Pruned when a column fully unloads.
     ceilings: FastMap<(i32, i32), light::CeilingWindow>,
-    /// Reusable buffer for draining worker results, so the drain neither
-    /// borrows the channel across the processing loop nor allocates per frame.
-    done_scratch: Vec<pipeline::Done>,
     /// Panic counts per failed claim, for the bounded-retry policy in
     /// [`fail_job`](World::fail_job). Rare by construction (a strike is a
     /// worker panic), so the map stays tiny.
@@ -771,6 +798,10 @@ pub struct World {
     /// Eye velocity (m/s) from successive stream centres.
     /// Zero at rest or after teleport.
     section_vel: DVec3,
+    /// Velocity-aware load controller. Fast travel deliberately lowers worker,
+    /// admission, result-integration, and upload pressure; capacity recovers
+    /// gradually after stopping so the first stationary frame cannot hitch.
+    stream_pacer: streaming::StreamPacer,
     /// Per-cell relief drives error-driven LOD selection for the far field.
     /// `None` until the background bake lands; selection falls back to default LOD.
     section_mip: Option<HeightMip>,
@@ -940,7 +971,6 @@ impl World {
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
-            done_scratch: Vec::new(),
             job_strikes: FastMap::default(),
             quarantined: FastSet::default(),
             textures_built: 0,
@@ -966,6 +996,7 @@ impl World {
             section_eye_y: 0.0,
             section_eye_prev: None,
             section_vel: DVec3::ZERO,
+            stream_pacer: streaming::StreamPacer::default(),
             section_mip: None,
             section_mip_rx: None,
             sections: FastMap::default(),
@@ -1003,10 +1034,19 @@ impl World {
         Self::new(DEFAULT_SEED)
     }
 
+    /// The one lazily created worker pool. Keeping construction here prevents
+    /// direct lane/test entry points from each restating the spawn policy.
+    pub(in crate::world) fn worker_pool(&mut self) -> &mut pipeline::Workers {
+        self.workers
+            .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()))
+    }
+
     /// Whether `coord` is a loaded chunk awaiting its fresh mesh — dense data,
     /// no mesh, no job outstanding, not edited. The fresh-scan meshed-ness test.
     fn is_needs_mesh(&self, coord: Coord) -> bool {
-        self.chunks.get(&coord).is_some_and(|l| l.state.is_needs_mesh())
+        self.chunks
+            .get(&coord)
+            .is_some_and(|l| l.state.is_needs_mesh())
     }
 
     /// Sanity check: a coord claimed as a live generate job (`generating`)
@@ -1055,7 +1095,7 @@ impl World {
         f.set_lod_clip(self.lod_clip());
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.
-        use voxel_engine::profile::{gauge, Gauge};
+        use voxel_engine::profile::{Gauge, gauge};
         gauge(Gauge::WorldChunks, self.chunks.len() as u64);
     }
 
@@ -1068,7 +1108,10 @@ impl World {
     fn lod_clip(&self) -> CoverageVolume {
         let full = self.view.coverage();
         let radius_m = ((self.lod_clip_rings - 1).max(0) * CHUNK_SIZE as i32) as f32;
-        CoverageVolume { radius: radius_m.min(full.radius), half_height: full.half_height }
+        CoverageVolume {
+            radius: radius_m.min(full.radius),
+            half_height: full.half_height,
+        }
     }
 
     /// Fold a streaming-centre move into the settled-ring count WITHOUT
@@ -1126,15 +1169,19 @@ impl World {
     fn ring_settled(&self, center: Coord, ring: i32) -> bool {
         let v = self.view.vertical;
         let column = |cx: i32, cz: i32| {
-            (center.y - v..=center.y + v)
-                .all(|cy| self.chunks.get(&Coord::new(cx, cy, cz)).is_some_and(|l| l.state.settled()))
+            (center.y - v..=center.y + v).all(|cy| {
+                self.chunks
+                    .get(&Coord::new(cx, cy, cz))
+                    .is_some_and(|l| l.state.settled())
+            })
         };
         if ring == 0 {
             return column(center.x, center.z);
         }
         let r = ring;
         (-r..=r).all(|d| column(center.x + d, center.z - r) && column(center.x + d, center.z + r))
-            && (1 - r..r).all(|d| column(center.x - r, center.z + d) && column(center.x + r, center.z + d))
+            && (1 - r..r)
+                .all(|d| column(center.x - r, center.z + d) && column(center.x + r, center.z + d))
     }
 
     /// Far-material style: flat palette-average past [`FLAT_DETAIL`] if available,
@@ -1155,6 +1202,15 @@ impl World {
             ),
             None => (false, 0),
         }
+    }
+
+    /// Current vertical relief for one section footprint. Live edit-derived
+    /// data takes precedence over the immutable background bake.
+    fn section_relief_band(&self, key: SectionPos) -> Option<(f32, f32)> {
+        self.section_overlay
+            .get(&key)
+            .map(|cell| (cell.lo, cell.hi))
+            .or_else(|| self.section_mip.as_ref()?.relief_band(key))
     }
 
     /// Skip near-field LOD load if the section's footprint is provably inside the
@@ -1181,12 +1237,8 @@ impl World {
         // Vertical: the section's terrain must sit inside the eye's slab, else
         // clip draws the part that pokes out. If unbaked, can't prove, so don't skip.
         // An edited footprint prefers the fresh overlay over the (possibly stale) bake.
-        let (lo, hi) = if let Some(c) = self.section_overlay.get(&key) {
-            (c.lo, c.hi)
-        } else {
-            let Some(mip) = &self.section_mip else { return false };
-            let Some(band) = mip.relief_band(key) else { return false };
-            band
+        let Some((lo, hi)) = self.section_relief_band(key) else {
+            return false;
         };
         let ey = self.section_eye_y as f32;
         if lo < ey - v_lim || hi > ey + v_lim {
@@ -1206,21 +1258,22 @@ impl World {
         let cs = CHUNK_SIZE as i32;
         let span = key.span();
         let (x0, z0) = (key.min_x(), key.min_z());
-        let (lo, hi) = if let Some(c) = self.section_overlay.get(&key) {
-            (c.lo, c.hi)
-        } else {
-            let Some(mip) = &self.section_mip else { return false };
-            let Some(band) = mip.relief_band(key) else { return false };
-            band
+        let Some((lo, hi)) = self.section_relief_band(key) else {
+            return false;
         };
         let (cx_lo, cx_hi) = (x0.div_euclid(cs), (x0 + span - 1).div_euclid(cs));
         let (cz_lo, cz_hi) = (z0.div_euclid(cs), (z0 + span - 1).div_euclid(cs));
-        let (cy_lo, cy_hi) = ((lo.floor() as i32).div_euclid(cs), (hi.floor() as i32).div_euclid(cs));
+        let (cy_lo, cy_hi) = (
+            (lo.floor() as i32).div_euclid(cs),
+            (hi.floor() as i32).div_euclid(cs),
+        );
         for cy in cy_lo..=cy_hi {
             for cz in cz_lo..=cz_hi {
                 for cx in cx_lo..=cx_hi {
-                    let settled =
-                        self.chunks.get(&Coord::new(cx, cy, cz)).is_some_and(|l| l.state.settled());
+                    let settled = self
+                        .chunks
+                        .get(&Coord::new(cx, cy, cz))
+                        .is_some_and(|l| l.state.settled());
                     if !settled {
                         return false;
                     }
@@ -1250,7 +1303,8 @@ impl World {
     /// The registered stream-lane handles (panics if `stream` runs before
     /// `Game::new` wired them — see [`World::stream_lanes`]).
     fn lanes(&self) -> lanes::StreamLanes {
-        self.stream_lanes.expect("stream lanes registered by Game::new")
+        self.stream_lanes
+            .expect("stream lanes registered by Game::new")
     }
 
     /// Rebuild the occlusion visible set: lazily fill any missing per-chunk
@@ -1283,7 +1337,7 @@ impl World {
         let debounce_over = self
             .last_occlusion_rebuild
             .is_none_or(|t| t.elapsed() >= OCCLUSION_DEBOUNCE);
-        if !immediate && !(self.occlusion_topo_dirty.get() && debounce_over) {
+        if !(immediate || (self.occlusion_topo_dirty.get() && debounce_over)) {
             return Progress::Idle; // an undebounced topo flag is Sticky: it retries
         }
         self.occlusion_topo_dirty.take(); // any rebuild covers topology too
@@ -1296,8 +1350,11 @@ impl World {
         // connectivity scan, paid per activation instead of per rebuild.
         if !was_active {
             self.conn_fill_queue.clear();
-            let missing =
-                self.chunks.iter().filter(|(_, l)| l.connectivity.is_none()).map(|(&c, _)| c);
+            let missing = self
+                .chunks
+                .iter()
+                .filter(|(_, l)| l.connectivity.is_none())
+                .map(|(&c, _)| c);
             self.conn_fill_queue.extend(missing);
         }
         let registry = &self.registry;
@@ -1309,16 +1366,21 @@ impl World {
         // draws a few extra chunks — never a hole).
         let mut filled = 0;
         while filled < OCCLUSION_FILL_BUDGET {
-            let Some(coord) = self.conn_fill_queue.pop_front() else { break };
-            let Some(loaded) = self.chunks.get_mut(&coord) else { continue };
+            let Some(coord) = self.conn_fill_queue.pop_front() else {
+                break;
+            };
+            let Some(loaded) = self.chunks.get_mut(&coord) else {
+                continue;
+            };
             if loaded.connectivity.is_some() {
                 continue;
             }
             // Sightlines pass through anything not opaque — water/glass are
             // solid (collision) but see-through, so they must NOT seal chunks
             // behind them, or terrain under water gets occlusion-culled.
-            loaded.connectivity =
-                Some(Connectivity::compute(&loaded.chunk, |id| registry.is_opaque(id)));
+            loaded.connectivity = Some(Connectivity::compute(&loaded.chunk, |id| {
+                registry.is_opaque(id)
+            }));
             filled += 1;
         }
         // Leave the IMMEDIATE flag set on a partial fill so the gate re-runs
@@ -1333,11 +1395,15 @@ impl World {
         // culling a visible chunk. `None` stays reserved for genuinely unloaded
         // chunks, which bound the BFS frontier.
         self.occlusion.rebuild(origin, |c| {
-            self.chunks.get(&c).map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
+            self.chunks
+                .get(&c)
+                .map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
         });
         self.apply_occlusion_masks(eng);
         if capped {
-            Progress::Partial { remaining: self.conn_fill_queue.len() as u32 }
+            Progress::Partial {
+                remaining: self.conn_fill_queue.len() as u32,
+            }
         } else {
             Progress::Idle
         }
@@ -1428,8 +1494,10 @@ pub(in crate::world) trait StreamLane {
     fn seed_set(world: &mut World) -> Option<&mut FastSet<Self::Key>>;
     /// This lane's raise-then-consume "has pending work" gate.
     fn pending(world: &mut World) -> &mut Sticky;
-    /// Nearest-first ordering metric (lower is sooner).
-    fn order(center: Coord, key: Self::Key) -> i32;
+    /// Nearest-first ordering metric (lower is sooner). It receives the world
+    /// so travel-sensitive lanes can spend their reduced budget ahead of the
+    /// player rather than on equally near trailing work.
+    fn order(world: &World, center: Coord, key: Self::Key) -> u64;
     /// Whether `key` is already in flight.
     fn in_flight(world: &World, key: Self::Key) -> bool;
     /// Whether `key` can be submitted now. Default: always true.
@@ -1474,9 +1542,9 @@ pub(in crate::world) fn admit<S: StreamLane>(
     let worklist = S::seed_set(world).is_some();
     let candidates: Vec<S::Key> = match S::candidates(world, center) {
         Candidates::Geometry(v) => v,
-        Candidates::Worklist => {
-            S::seed_set(world).map(|s| s.iter().copied().collect()).unwrap_or_default()
-        }
+        Candidates::Worklist => S::seed_set(world)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default(),
     };
     // Partition into ready (not in-flight) and blocked. For worklist lanes, evict
     // blocked seeds since they'll be re-added when unblocked. This avoids
@@ -1505,13 +1573,13 @@ pub(in crate::world) fn admit<S: StreamLane>(
             S::on_blocked(world, k);
         }
     }
-    ready_keys.sort_by_key(|&k| S::order(center, k));
+    ready_keys.sort_by_key(|&k| S::order(world, center, k));
     // `exhausted` stays true only if all ready keys were processed before the
     // deadline stopped the loop (the floor lives in `admission_exhausted`).
     let mut exhausted = true;
     let mut admitted = 0usize;
     for key in ready_keys {
-        if admission_exhausted(admitted, S::MIN_ADMIT, deadline) {
+        if admission_exhausted(admitted, world.stream_pacer.floor(S::MIN_ADMIT), deadline) {
             exhausted = false;
             break;
         }
@@ -1525,9 +1593,7 @@ pub(in crate::world) fn admit<S: StreamLane>(
         // Far lanes use distance ordering; near lanes use FIFO.
         // Compute dist² before taking the mutable workers pool.
         let far = S::dist2(world, center, key);
-        let workers = world.workers.get_or_insert_with(|| {
-            pipeline::Workers::spawn(pipeline::Workers::default_threads())
-        });
+        let workers = world.worker_pool();
         let accepted = match far {
             Some(dist2) => workers.submit_far(job, dist2),
             None => workers.submit(job),
@@ -1542,7 +1608,7 @@ pub(in crate::world) fn admit<S: StreamLane>(
         }
     }
     // Clear the gate once all ready items are submitted and no seeds remain.
-    let drained = exhausted && S::seed_set(world).map_or(true, |set| set.is_empty());
+    let drained = exhausted && S::seed_set(world).is_none_or(|set| set.is_empty());
     if drained {
         S::pending(world).take();
     }
@@ -1552,7 +1618,11 @@ pub(in crate::world) fn admit<S: StreamLane>(
 fn player_dist2(center: Coord, wx: i64, wy: i64, wz: i64) -> u64 {
     let s = CHUNK_SIZE as i64;
     let half = s / 2;
-    let (px, py, pz) = (center.x as i64 * s + half, center.y as i64 * s + half, center.z as i64 * s + half);
+    let (px, py, pz) = (
+        center.x as i64 * s + half,
+        center.y as i64 * s + half,
+        center.z as i64 * s + half,
+    );
     let (dx, dy, dz) = (wx - px, wy - py, wz - pz);
     (dx * dx + dy * dy + dz * dz) as u64
 }
@@ -1574,6 +1644,21 @@ fn motion_biased_dist2(base: u64, vel: DVec3, dx: f64, dz: f64) -> u64 {
     (base as f64 * (1.0 - MOTION_BIAS_STRENGTH * align)).max(0.0) as u64
 }
 
+/// Near-lane ordering with the same leading-edge bias as the worker queue.
+/// Vertical distance remains encoded by [`World::order`]; velocity only
+/// breaks/reweights otherwise nearby candidates in the horizontal plane.
+fn near_motion_order(world: &World, center: Coord, key: Coord) -> u64 {
+    let ring = World::order(key, center).max(0) as u64;
+    let base = ring.saturating_mul(ring).saturating_mul(1024);
+    let scale = CHUNK_SIZE as f64;
+    motion_biased_dist2(
+        base,
+        world.section_vel,
+        (key.x - center.x) as f64 * scale,
+        (key.z - center.z) as f64 * scale,
+    )
+}
+
 /// Fresh full-res chunk meshing.
 pub(in crate::world) struct MeshLane;
 impl StreamLane for MeshLane {
@@ -1589,8 +1674,8 @@ impl StreamLane for MeshLane {
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.pending_fresh
     }
-    fn order(center: Coord, key: Coord) -> i32 {
-        World::order(key, center)
+    fn order(world: &World, center: Coord, key: Coord) -> u64 {
+        near_motion_order(world, center, key)
     }
     fn in_flight(world: &World, key: Coord) -> bool {
         matches!(
@@ -1613,7 +1698,9 @@ impl StreamLane for MeshLane {
         // is settled or wait timeout expired (then mesh degraded and remesh later).
         // Quarantined (repeatedly panicking) meshes are never ready.
         world.is_needs_mesh(key)
-            && !world.quarantined.contains(&streaming::FailKey::Mesh { coord: key })
+            && !world
+                .quarantined
+                .contains(&streaming::FailKey::Mesh { coord: key })
             && world.in_mesh_box(key)
             && world.neighbours_have_data(key)
             && (world.light_ready(key) || world.light_wait_expired(key))
@@ -1625,7 +1712,11 @@ impl StreamLane for MeshLane {
         let degraded = !world.light_ready(key);
         let (rev, snapshot) = world.snapshot(key, degraded);
         world.mark_degraded(key, degraded);
-        Some(pipeline::Job::Mesh { coord: key, rev, snapshot })
+        Some(pipeline::Job::Mesh {
+            coord: key,
+            rev,
+            snapshot,
+        })
     }
     fn claim(world: &mut World, key: Coord) {
         // Set the building flag IN PLACE to claim the mesh job — a whole-state
@@ -1634,7 +1725,10 @@ impl StreamLane for MeshLane {
         // it or a stale result releases it. Remove from worklist.
         world.mesh_worklist.remove(&key);
         if let Some(loaded) = world.chunks.get_mut(&key) {
-            debug_assert!(loaded.state.is_needs_mesh(), "mesh submit for non-NeedsMesh {key:?}");
+            debug_assert!(
+                loaded.state.is_needs_mesh(),
+                "mesh submit for non-NeedsMesh {key:?}"
+            );
             if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
                 *building = true;
             }
@@ -1665,7 +1759,9 @@ impl StreamLane for SectionLane {
                 .copied()
                 .filter(|s| {
                     !world.sections.contains_key(s)
-                        && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
+                        && !world
+                            .quarantined
+                            .contains(&streaming::FailKey::Section { pos: *s })
                         && !world.coverage_skips(center, *s)
                 })
                 .collect(),
@@ -1677,11 +1773,14 @@ impl StreamLane for SectionLane {
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.pending_sections
     }
-    fn order(center: Coord, key: SectionPos) -> i32 {
+    fn order(_world: &World, center: Coord, key: SectionPos) -> u64 {
         let cs = CHUNK_SIZE as i32;
         let span = key.span();
-        let (psx, psz) = ((center.x * cs).div_euclid(span), (center.z * cs).div_euclid(span));
-        (key.x - psx).abs().max((key.z - psz).abs())
+        let (psx, psz) = (
+            (center.x * cs).div_euclid(span),
+            (center.z * cs).div_euclid(span),
+        );
+        (key.x - psx).abs().max((key.z - psz).abs()) as u64
     }
     fn dist2(world: &World, center: Coord, key: SectionPos) -> Option<u64> {
         // 2-D far field: use player's Y to drop vertical term.
@@ -1692,7 +1791,12 @@ impl StreamLane for SectionLane {
         // Bias by motion direction so leading edge fills first.
         let cs = CHUNK_SIZE as i64;
         let (px, pz) = (center.x as i64 * cs + cs / 2, center.z as i64 * cs + cs / 2);
-        Some(motion_biased_dist2(base, world.section_vel, (cx - px) as f64, (cz - pz) as f64))
+        Some(motion_biased_dist2(
+            base,
+            world.section_vel,
+            (cx - px) as f64,
+            (cz - pz) as f64,
+        ))
     }
     fn in_flight(world: &World, key: SectionPos) -> bool {
         world.sections.contains_key(&key)
@@ -1717,7 +1821,10 @@ impl StreamLane for SectionLane {
         let token = match world.section_pending_claim.take() {
             Some((pos, token)) if pos == key => token,
             other => {
-                debug_assert!(false, "section claim for {key:?} without its submit ({other:?})");
+                debug_assert!(
+                    false,
+                    "section claim for {key:?} without its submit ({other:?})"
+                );
                 pipeline::ClaimToken(world.section_claim_seq)
             }
         };
@@ -1725,7 +1832,13 @@ impl StreamLane for SectionLane {
         world.sections.insert(key, SectionState::Meshing { token });
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
-        if let pipeline::Done::Section { pos, epoch, token, meshes } = done {
+        if let pipeline::Done::Section {
+            pos,
+            epoch,
+            token,
+            meshes,
+        } = done
+        {
             // A result from a retired ladder epoch, or for a claim replaced
             // after unload/re-admission, is dropped here — it must not queue an
             // upload that would capture a same-position replacement.
@@ -1754,8 +1867,8 @@ impl StreamLane for LightLane {
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.light_pending
     }
-    fn order(center: Coord, key: Coord) -> i32 {
-        World::order(key, center)
+    fn order(world: &World, center: Coord, key: Coord) -> u64 {
+        near_motion_order(world, center, key)
     }
     fn in_flight(world: &World, key: Coord) -> bool {
         world.light_inflight.contains(&key)
@@ -1763,7 +1876,9 @@ impl StreamLane for LightLane {
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         if !world.lighting
             || !world.chunks.contains_key(&key)
-            || world.quarantined.contains(&streaming::FailKey::Light { coord: key })
+            || world
+                .quarantined
+                .contains(&streaming::FailKey::Light { coord: key })
         {
             return None;
         }

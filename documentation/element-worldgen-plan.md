@@ -149,6 +149,10 @@ predicates. That is what makes the reachable set mechanically enumerable
 (C2), and it keeps every rule serializable, which the "mod manifest,
 eventually" vision note wants for the future wasm boundary.
 
+<!-- SPDX-SnippetBegin -->
+<!-- SPDX-SnippetCopyrightText: 2026 Project Watt Cubed contributors -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
 ```rust
 /// Where one element wants to exist. An element may own several rules.
 struct PlacementRule {
@@ -173,6 +177,8 @@ enum Kind {
     Scattered { rarity: u32, stream: Stream, host: ElementId },
 }
 ```
+
+<!-- SPDX-SnippetEnd -->
 
 Today's terrain, expressed as the builtin table (this is the parity target
 for Phase 1):

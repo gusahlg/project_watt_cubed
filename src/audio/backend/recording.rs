@@ -69,7 +69,12 @@ impl RecordingBackend {
     pub fn new() -> (Self, Recorder) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let backend = Self { log: log.clone(), alive: alive.clone(), next_voice: 0, next_clip: 0 };
+        let backend = Self {
+            log: log.clone(),
+            alive: alive.clone(),
+            next_voice: 0,
+            next_clip: 0,
+        };
         (backend, Recorder { log, alive })
     }
 
@@ -92,7 +97,10 @@ impl ClipStore for RecordingBackend {
     fn store(&mut self, _bytes: &[u8]) -> Result<StoredClip, String> {
         let id = ClipId(self.next_clip);
         self.next_clip += 1;
-        Ok(StoredClip { id, duration_s: 1.0 })
+        Ok(StoredClip {
+            id,
+            duration_s: 1.0,
+        })
     }
 }
 
@@ -109,7 +117,13 @@ impl Backend for RecordingBackend {
         if !self.is_alive() {
             return None; // dead backend is a total no-op
         }
-        self.record(Intent::PlayClip { clip, dsp, rate, looped, at: spatial });
+        self.record(Intent::PlayClip {
+            clip,
+            dsp,
+            rate,
+            looped,
+            at: spatial,
+        });
         Some(self.mint_voice())
     }
 
@@ -124,7 +138,10 @@ impl Backend for RecordingBackend {
         if !self.is_alive() {
             return None;
         }
-        self.record(Intent::PlayStream { at: spatial, jitter_target_ms });
+        self.record(Intent::PlayStream {
+            at: spatial,
+            jitter_target_ms,
+        });
         Some(self.mint_voice())
     }
 
@@ -132,7 +149,11 @@ impl Backend for RecordingBackend {
         if !self.is_alive() {
             return;
         }
-        self.record(Intent::Update { v, dsp, at: spatial });
+        self.record(Intent::Update {
+            v,
+            dsp,
+            at: spatial,
+        });
     }
 
     fn stop(&mut self, v: BackendVoice) {

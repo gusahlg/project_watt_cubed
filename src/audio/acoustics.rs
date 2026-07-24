@@ -4,6 +4,9 @@
 
 use glam::{DVec3, IVec3, UVec3};
 
+use crate::camera::direction_from_angles;
+use crate::math::BLOCK_METERS;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Response {
     World,
@@ -20,7 +23,7 @@ pub enum Medium {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Listener {
-    pub pos: DVec3, // eye position, world space (f64, 1 voxel = 1 m)
+    pub pos: DVec3, // eye position in world-space blocks; responses use metres
     pub yaw: f32,
     pub pitch: f32,
     pub medium: Medium,
@@ -55,7 +58,11 @@ impl AcousticWindow {
         if count != cells.len() {
             return Err(WindowError::SizeMismatch);
         }
-        Ok(Self { origin, size, cells })
+        Ok(Self {
+            origin,
+            size,
+            cells,
+        })
     }
 
     /// Cell at a world coordinate; outside the window it reads `Unloaded`.
@@ -103,7 +110,11 @@ pub struct SmoothedCoords(Coords);
 impl SmoothedCoords {
     /// Crate-visible so the runtime's smoother (the sole time-varying mint) can build one.
     pub(crate) fn new(distance: f32, occlusion: f32, medium: Medium) -> Self {
-        Self(Coords { distance, occlusion, medium })
+        Self(Coords {
+            distance,
+            occlusion,
+            medium,
+        })
     }
     /// Distance 0: smoothing is the identity, so this is a valid smoothed value
     /// with nothing to integrate (UI cues).
@@ -126,7 +137,7 @@ fn cell_absorption(cell: Cell) -> u32 {
 pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3, medium: Medium) -> Coords {
     let delta = to - from;
     let len = delta.length();
-    let distance = len as f32;
+    let distance = (len * BLOCK_METERS) as f32;
 
     // Degenerate or non-finite ray: no traversal, zero occlusion.
     if !len.is_finite() || len <= f64::EPSILON || !from.is_finite() || !to.is_finite() {
@@ -175,7 +186,7 @@ pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3, medium: Medium) -> Co
         let seg_end = t_max[axis].min(len);
         let thickness = seg_end - t;
         if thickness > 0.0 {
-            occ += cell_absorption(win.cell(cell)) as f64 * thickness / 255.0;
+            occ += cell_absorption(win.cell(cell)) as f64 * thickness * BLOCK_METERS / 255.0;
         }
         if t_max[axis] >= len {
             break;
@@ -233,25 +244,13 @@ fn is_water(m: Medium) -> bool {
     matches!(m, Medium::Water)
 }
 
-/// Yaw/pitch orthonormal basis: forward, right, up. Right-handed; +yaw turns
-/// toward +X, +pitch tilts toward +Y. Panning reads listener-local components.
+/// The camera's canonical yaw/pitch basis: yaw zero looks +X and positive yaw
+/// turns toward +Z. Panning reads listener-local components.
 fn listener_basis(l: &Listener) -> (DVec3, DVec3, DVec3) {
-    let (yaw, pitch) = (l.yaw as f64, l.pitch as f64);
-    let forward = DVec3::new(
-        pitch.cos() * yaw.sin(),
-        pitch.sin(),
-        pitch.cos() * yaw.cos(),
-    )
-    .normalize_or_zero();
-    // `forward × Y` collapses to 0 at pitch ±90° (forward ∥ Y), which would center
-    // every pan. Fall back to the yaw-only horizontal right vector (`forward_flat ×
-    // Y`, independent of pitch) so looking straight up/down still resolves L/R.
-    let cross = forward.cross(DVec3::Y);
-    let right = if cross.length_squared() < 1e-12 {
-        DVec3::new(-yaw.cos(), 0.0, yaw.sin())
-    } else {
-        cross.normalize()
-    };
+    let forward = direction_from_angles(l.yaw, l.pitch);
+    let (sin_yaw, cos_yaw) = (l.yaw as f64).sin_cos();
+    // Yaw-only right stays defined while looking straight up/down.
+    let right = DVec3::new(-sin_yaw, 0.0, cos_yaw);
     let up = right.cross(forward);
     (forward, right, up)
 }
@@ -270,9 +269,17 @@ fn spatial_base(r: Response, distance: f32, occlusion: f32) -> f32 {
 /// Fixed response curves per Response class. Takes [`SmoothedCoords`] by
 /// construction, so raw `trace` output can never reach it.
 pub fn respond(r: Response, sc: SmoothedCoords, listener: &Listener, source: Option<DVec3>) -> Dsp {
-    let Coords { distance, occlusion, medium } = sc.0;
+    let Coords {
+        distance,
+        occlusion,
+        medium,
+    } = sc.0;
     if let Response::Ui = r {
-        return Dsp { gain: 1.0, lowpass_hz: LP_MAX_HZ, pan: None };
+        return Dsp {
+            gain: 1.0,
+            lowpass_hz: LP_MAX_HZ,
+            pan: None,
+        };
     }
 
     let media_differ = is_water(listener.medium) != is_water(medium);
@@ -303,7 +310,11 @@ pub fn respond(r: Response, sc: SmoothedCoords, listener: &Listener, source: Opt
         ])
     });
 
-    Dsp { gain, lowpass_hz, pan }
+    Dsp {
+        gain,
+        lowpass_hz,
+        pan,
+    }
 }
 
 /// Cheap audibility upper bound for ranking: `spatial_base(r,c) * gain`, the
@@ -326,8 +337,12 @@ mod tests {
 
     fn window(size: u32, fill: Cell) -> AcousticWindow {
         let n = (size * size * size) as usize;
-        AcousticWindow::new(IVec3::ZERO, UVec3::splat(size), vec![fill; n].into_boxed_slice())
-            .unwrap()
+        AcousticWindow::new(
+            IVec3::ZERO,
+            UVec3::splat(size),
+            vec![fill; n].into_boxed_slice(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -336,7 +351,12 @@ mod tests {
         let open = window(4, Cell::Open);
 
         // All-Unloaded window: finite, non-negative occlusion.
-        let c = trace(&unloaded, DVec3::new(0.5, 0.5, 0.5), DVec3::new(3.5, 3.5, 3.5), Medium::Air);
+        let c = trace(
+            &unloaded,
+            DVec3::new(0.5, 0.5, 0.5),
+            DVec3::new(3.5, 3.5, 3.5),
+            Medium::Air,
+        );
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
         assert!(c.distance.is_finite());
 
@@ -346,21 +366,96 @@ mod tests {
         assert_eq!(c.occlusion, 0.0);
 
         // Corner-grazing exact diagonal (DDA tie on all three axes).
-        let c = trace(&unloaded, DVec3::ZERO, DVec3::new(4.0, 4.0, 4.0), Medium::Air);
+        let c = trace(
+            &unloaded,
+            DVec3::ZERO,
+            DVec3::new(4.0, 4.0, 4.0),
+            Medium::Air,
+        );
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
 
         // Endpoints far outside the window: still total, all cells read Unloaded.
-        let c = trace(&open, DVec3::new(-50.0, -50.0, -50.0), DVec3::new(50.0, 50.0, 50.0), Medium::Water);
+        let c = trace(
+            &open,
+            DVec3::new(-50.0, -50.0, -50.0),
+            DVec3::new(50.0, 50.0, 50.0),
+            Medium::Water,
+        );
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
         assert!(matches!(c.medium, Medium::Water));
+    }
+
+    #[test]
+    fn trace_reports_shared_world_scale_in_metres() {
+        let open = window(4, Cell::Open);
+        let c = trace(
+            &open,
+            DVec3::new(0.5, 0.5, 0.5),
+            DVec3::new(1.5, 0.5, 0.5),
+            Medium::Air,
+        );
+        assert!((c.distance - BLOCK_METERS as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panning_uses_the_camera_yaw_convention() {
+        fn pan(listener: Listener, source: DVec3) -> [f32; 3] {
+            respond(
+                Response::World,
+                SmoothedCoords::new(2.0, 0.0, Medium::Air),
+                &listener,
+                Some(source),
+            )
+            .pan
+            .expect("non-coincident source")
+        }
+
+        let listener = Listener {
+            pos: DVec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            medium: Medium::Air,
+        };
+        assert!(
+            pan(listener, DVec3::X)[0].abs() < 1e-6,
+            "front must be centered"
+        );
+        assert!(pan(listener, DVec3::Z)[0] > 0.99, "+Z is right at yaw zero");
+        assert!(
+            pan(listener, -DVec3::Z)[0] < -0.99,
+            "-Z is left at yaw zero"
+        );
+
+        let turned = Listener {
+            yaw: std::f32::consts::FRAC_PI_2,
+            ..listener
+        };
+        assert!(
+            pan(turned, DVec3::Z)[0].abs() < 1e-6,
+            "turned front must center"
+        );
+        assert!(
+            pan(turned, -DVec3::X)[0] > 0.99,
+            "-X is right after quarter-turn"
+        );
     }
 
     // audibility is an admissible upper bound on the applied level
     // (respond().gain * authored_gain), unconditionally over gain ∈ [0, 4].
     #[test]
     fn audibility_dominates_applied_gain() {
-        let listener = Listener { pos: DVec3::ZERO, yaw: 0.3, pitch: -0.2, medium: Medium::Air };
-        let responses = [Response::World, Response::Ambient, Response::Voice, Response::Ui];
+        let listener = Listener {
+            pos: DVec3::ZERO,
+            yaw: 0.3,
+            pitch: -0.2,
+            medium: Medium::Air,
+        };
+        let responses = [
+            Response::World,
+            Response::Ambient,
+            Response::Voice,
+            Response::Ui,
+        ];
         for &r in &responses {
             for &dist in &[0.0f32, 0.4, 2.0, 8.0, 40.0] {
                 for &occl in &[0.0f32, 1.0, 5.0, 25.0] {
@@ -369,7 +464,9 @@ mod tests {
                         for &g in &[0.0f32, 0.25, 1.0, 4.0] {
                             let ub = audibility(r, sc, g);
                             let applied =
-                                respond(r, sc, &listener, Some(DVec3::new(dist as f64, 0.0, 0.0))).gain * g;
+                                respond(r, sc, &listener, Some(DVec3::new(dist as f64, 0.0, 0.0)))
+                                    .gain
+                                    * g;
                             assert!(
                                 ub + 1e-5 >= applied,
                                 "audibility {ub} < applied gain {applied} (r={r:?}, d={dist}, o={occl}, g={g})"

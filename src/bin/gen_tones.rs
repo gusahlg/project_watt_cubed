@@ -1,9 +1,10 @@
 //! Placeholder audio asset generator. Writes short mono 48 kHz 16-bit WAVs into
-//! `assets/sounds/`, one family per cue, so the catalog loader has real files to
-//! decode before a proper audition track replaces them. Idempotent: every run
-//! overwrites.
+//! `assets/sounds/generated/`, one family per cue, so the catalog loader has real
+//! files to decode before proper recordings replace them.
 //!
-//! Run: `cargo run --bin gen_tones`.
+//! Existing files are protected unless `--force` is present.
+//!
+//! Run: `cargo run --features dev-tools --bin gen_tones -- --force`
 
 use std::f32::consts::TAU;
 use std::path::PathBuf;
@@ -11,10 +12,8 @@ use std::path::PathBuf;
 const SAMPLE_RATE: u32 = 48_000;
 
 fn main() {
-    let dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "assets", "sounds"]
-        .iter()
-        .collect();
-    std::fs::create_dir_all(&dir).expect("create assets/sounds");
+    let (dir, force) = arguments();
+    std::fs::create_dir_all(&dir).expect("create placeholder sound directory");
 
     let assets: Vec<(&str, Vec<i16>)> = vec![
         ("break_default_1.wav", noise_burst(0.15, 0.35, 1)),
@@ -26,14 +25,47 @@ fn main() {
         ("swing_1.wav", sweep_burst(600.0, 180.0, 0.20)),
         ("menu_click_1.wav", tone_burst(1000.0, 0.04, 0.60)),
         ("voicetest_1.wav", tone_burst(440.0, 0.40, 0.40)),
-        ("underwater_loop_1.wav", loop_noise(2.0, 0.20)),
+        ("underwater_loop_1.wav", loop_bed(2.0, 0.20)),
     ];
 
     for (name, samples) in &assets {
         let path = dir.join(name);
+        if path.exists() && !force {
+            println!("kept {} (pass --force to replace)", path.display());
+            continue;
+        }
         std::fs::write(&path, wav_bytes(samples)).expect("write wav");
         println!("wrote {} ({} samples)", path.display(), samples.len());
     }
+}
+
+fn arguments() -> (PathBuf, bool) {
+    let mut force = false;
+    let mut output = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--force") => force = true,
+            Some("--out") => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| usage("missing path after --out")),
+                );
+            }
+            _ => usage(&format!("unknown argument `{}`", arg.to_string_lossy())),
+        }
+    }
+    let default: PathBuf = [env!("CARGO_MANIFEST_DIR"), "assets", "sounds", "generated"]
+        .iter()
+        .collect();
+    (output.unwrap_or(default), force)
+}
+
+fn usage(reason: &str) -> ! {
+    eprintln!("{reason}");
+    eprintln!("usage: gen_tones [--force] [--out DIRECTORY]");
+    std::process::exit(2);
 }
 
 /// Deterministic white noise in [-1, 1] from a splitmix-style step (no rng dep).
@@ -88,23 +120,19 @@ fn sweep_burst(f0: f32, f1: f32, secs: f32) -> Vec<i16> {
         .collect()
 }
 
-/// Constant-amplitude low-passed noise with no end fades, so the buffer loops
-/// seamlessly (ambient beds are pulled as `ClipMode::Loop`).
-fn loop_noise(secs: f32, amp: f32) -> Vec<i16> {
+/// A periodic low bed. Every component completes an integer number of cycles,
+/// including its amplitude modulation, so the last→first jump is just another
+/// sample step rather than a random-noise discontinuity.
+fn loop_bed(secs: f32, amp: f32) -> Vec<i16> {
     let n = len_samples(secs);
-    let mut state = 0xABCD_1234_5678_9F01u64;
-    let mut lp = 0.0f32; // one-pole low-pass for a muffled underwater timbre
     (0..n)
         .map(|i| {
-            lp += 0.02 * (noise(&mut state) - lp);
-            // Blend the two ends over a short window to hide the seam entirely.
-            let cross = 4_800.min(n / 4);
-            let mix = if i < cross {
-                0.5 + 0.5 * (i as f32 / cross as f32)
-            } else {
-                1.0
-            };
-            quantize(amp * lp * mix)
+            let phase = TAU * i as f32 / n as f32;
+            let carrier = 0.55 * (phase * 74.0).sin()
+                + 0.30 * (phase * 107.0 + 0.4).sin()
+                + 0.15 * (phase * 151.0 + 1.1).sin();
+            let swell = 0.78 + 0.22 * (phase * 2.0).sin();
+            quantize(amp * swell * carrier)
         })
         .collect()
 }
@@ -135,4 +163,33 @@ fn wav_bytes(samples: &[i16]) -> Vec<u8> {
         out.extend_from_slice(&s.to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looping_bed_has_no_boundary_click() {
+        let samples = loop_bed(2.0, 0.2);
+        let boundary = (i32::from(samples[0]) - i32::from(samples[samples.len() - 1])).abs();
+        let largest_step = samples
+            .windows(2)
+            .map(|pair| (i32::from(pair[1]) - i32::from(pair[0])).abs())
+            .max()
+            .unwrap();
+        assert!(
+            boundary <= largest_step + 1,
+            "loop boundary jump {boundary} exceeds ordinary step {largest_step}"
+        );
+    }
+
+    #[test]
+    fn wav_header_matches_payload() {
+        let wav = wav_bytes(&[1, -2, 3]);
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 6);
+        assert_eq!(wav.len(), 50);
+    }
 }

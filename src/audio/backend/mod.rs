@@ -2,6 +2,7 @@
 //! state stays in `SoundSystem`; kira/oddio/a mock implement `Backend`.
 
 pub(crate) mod kira;
+pub(crate) mod null;
 #[cfg(test)]
 pub(crate) mod recording;
 
@@ -27,6 +28,7 @@ pub(crate) struct ClipId(pub u32);
 /// A decoded, retained clip. `duration_s` is the `max_duration` fold's clip term
 /// (content.rs computes `duration / min_rate`); without it zero-delay one-shots would
 /// fold to `max_duration = 0` and release instantly.
+#[derive(Clone, Copy)]
 pub(crate) struct StoredClip {
     pub id: ClipId,
     pub duration_s: f32,

@@ -26,6 +26,7 @@
 pub mod app;
 pub mod audio;
 pub mod avatar;
+pub mod benchmark;
 pub mod block;
 pub mod camera;
 pub mod command;

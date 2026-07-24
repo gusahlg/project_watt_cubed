@@ -13,15 +13,15 @@
 //! `EncodeCore`, `OutRing`) that the in-file tests exercise without a real device.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 
-use super::voice::{Seq, MAX_VOICE_PAYLOAD};
+use super::voice::{MAX_VOICE_PAYLOAD, Seq};
 
 /// Opus decode/encode operate at a fixed 48 kHz internally; we resample to it.
 const DST_HZ: u32 = 48_000;
@@ -41,6 +41,12 @@ const OUT_RING_FRAMES: usize = 50;
 /// pop, so a short park is the simplest correct wait.
 const ENCODER_NAP: Duration = Duration::from_millis(5);
 
+#[derive(Clone, Copy, Debug)]
+struct PcmSample {
+    value: f32,
+    epoch: u32,
+}
+
 /// One 20 ms Opus frame. `payload` is opaque codec bytes, `≤ MAX_VOICE_PAYLOAD`.
 pub struct EncodedFrame {
     pub seq: Seq,
@@ -48,6 +54,7 @@ pub struct EncodedFrame {
 }
 
 /// `None` device = system default input.
+#[derive(Default)]
 pub struct CaptureConfig {
     pub device: Option<String>,
 }
@@ -59,13 +66,35 @@ pub enum CaptureError {
     Encoder(String),
 }
 
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDevice => formatter.write_str("no matching input device"),
+            Self::Stream(reason) => write!(formatter, "input stream: {reason}"),
+            Self::Encoder(reason) => write!(formatter, "Opus encoder: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub struct Capture {
     // Declared first, but dropped explicitly-first in `Drop` so the callback
     // stops writing the PCM ring before the encoder thread is joined.
     stream: Option<cpal::Stream>,
     encoder: Option<JoinHandle<()>>,
     out: Arc<OutRing<EncodedFrame>>,
-    transmitting: Arc<AtomicBool>,
+    /// Zero while closed; each PTT rising edge publishes a fresh non-zero epoch.
+    /// Callback samples carry this tag so pre-PTT and prior-burst PCM cannot be
+    /// encoded into a later talk burst.
+    transmit_epoch: Arc<AtomicU32>,
+    next_epoch: u32,
     shutdown: Arc<AtomicBool>,
     /// Detailed encoder-thread faults (off the RT path — a worker thread, not the
     /// audio callback).
@@ -100,10 +129,10 @@ impl Capture {
         let format = supported.sample_format();
         let config = supported.config();
 
-        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(PCM_RING_SAMPLES);
+        let (producer, consumer) = rtrb::RingBuffer::<PcmSample>::new(PCM_RING_SAMPLES);
         let fault = Arc::new(Mutex::new(None));
         let out = Arc::new(OutRing::new(OUT_RING_FRAMES));
-        let transmitting = Arc::new(AtomicBool::new(false));
+        let transmit_epoch = Arc::new(AtomicU32::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
 
@@ -115,13 +144,50 @@ impl Capture {
             err_lost.store(true, Ordering::Relaxed);
         };
         let stream = match format {
-            SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, producer, error_cb),
-            SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, producer, error_cb),
-            SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, producer, error_cb),
-            SampleFormat::I32 => build_stream::<i32>(&device, &config, channels, producer, error_cb),
-            SampleFormat::F64 => build_stream::<f64>(&device, &config, channels, producer, error_cb),
+            SampleFormat::F32 => build_stream::<f32>(
+                &device,
+                &config,
+                channels,
+                producer,
+                transmit_epoch.clone(),
+                error_cb,
+            ),
+            SampleFormat::I16 => build_stream::<i16>(
+                &device,
+                &config,
+                channels,
+                producer,
+                transmit_epoch.clone(),
+                error_cb,
+            ),
+            SampleFormat::U16 => build_stream::<u16>(
+                &device,
+                &config,
+                channels,
+                producer,
+                transmit_epoch.clone(),
+                error_cb,
+            ),
+            SampleFormat::I32 => build_stream::<i32>(
+                &device,
+                &config,
+                channels,
+                producer,
+                transmit_epoch.clone(),
+                error_cb,
+            ),
+            SampleFormat::F64 => build_stream::<f64>(
+                &device,
+                &config,
+                channels,
+                producer,
+                transmit_epoch.clone(),
+                error_cb,
+            ),
             other => {
-                return Err(CaptureError::Stream(format!("unsupported sample format {other:?}")))
+                return Err(CaptureError::Stream(format!(
+                    "unsupported sample format {other:?}"
+                )));
             }
         }
         .map_err(|e| CaptureError::Stream(e.to_string()))?;
@@ -133,7 +199,7 @@ impl Capture {
             src_hz,
             consumer,
             out.clone(),
-            transmitting.clone(),
+            transmit_epoch.clone(),
             shutdown.clone(),
             fault.clone(),
         )?;
@@ -142,7 +208,8 @@ impl Capture {
             stream: Some(stream),
             encoder: Some(encoder),
             out,
-            transmitting,
+            transmit_epoch,
+            next_epoch: 0,
             shutdown,
             fault,
             lost,
@@ -151,7 +218,16 @@ impl Capture {
 
     /// PTT edge; while `false` the encoder idles (no frames minted, `Seq` frozen).
     pub fn set_transmitting(&mut self, on: bool) {
-        self.transmitting.store(on, Ordering::Relaxed);
+        let active = self.transmit_epoch.load(Ordering::Acquire) != 0;
+        match (on, active) {
+            (true, false) => {
+                self.next_epoch = self.next_epoch.wrapping_add(1).max(1);
+                self.transmit_epoch
+                    .store(self.next_epoch, Ordering::Release);
+            }
+            (false, true) => self.transmit_epoch.store(0, Ordering::Release),
+            _ => {}
+        }
     }
 
     /// Drain all pending frames; the bounded ring already dropped oldest on
@@ -166,7 +242,7 @@ impl Capture {
         if self.lost.swap(false, Ordering::Relaxed) {
             return Some(CaptureError::Stream("input stream error".into()));
         }
-        self.fault.lock().unwrap().take()
+        lock_recover(&self.fault).take()
     }
 }
 
@@ -188,7 +264,8 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     channels: usize,
-    mut producer: rtrb::Producer<f32>,
+    mut producer: rtrb::Producer<PcmSample>,
+    transmit_epoch: Arc<AtomicU32>,
     error_cb: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -199,9 +276,13 @@ where
     device.build_input_stream(
         *config,
         move |data: &[T], _| {
+            let epoch = transmit_epoch.load(Ordering::Acquire);
+            if epoch == 0 {
+                return;
+            }
             for frame in data.chunks_exact(channels) {
                 let mono: f32 = frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>() * inv;
-                let _ = producer.push(mono);
+                let _ = producer.push(PcmSample { value: mono, epoch });
             }
         },
         error_cb,
@@ -211,9 +292,9 @@ where
 
 fn spawn_encoder(
     src_hz: u32,
-    mut consumer: rtrb::Consumer<f32>,
+    mut consumer: rtrb::Consumer<PcmSample>,
     out: Arc<OutRing<EncodedFrame>>,
-    transmitting: Arc<AtomicBool>,
+    transmit_epoch: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     fault: Arc<Mutex<Option<CaptureError>>>,
 ) -> Result<JoinHandle<()>, CaptureError> {
@@ -228,24 +309,27 @@ fn spawn_encoder(
             let mut core = EncodeCore::new(src_hz, DST_HZ);
             let mut pcm: Vec<f32> = Vec::with_capacity(PCM_RING_SAMPLES);
             let mut obuf = [0u8; MAX_VOICE_PAYLOAD];
+            let mut encoding_epoch = 0;
             while !shutdown.load(Ordering::Relaxed) {
-                pcm.clear();
-                while let Ok(s) = consumer.pop() {
-                    pcm.push(s);
+                let active_epoch = transmit_epoch.load(Ordering::Acquire);
+                if active_epoch != encoding_epoch {
+                    core.reset();
+                    encoding_epoch = active_epoch;
                 }
+                pcm.clear();
+                drain_epoch(&mut consumer, active_epoch, &mut pcm);
                 if pcm.is_empty() {
                     std::thread::sleep(ENCODER_NAP);
                     continue;
                 }
-                let tx = transmitting.load(Ordering::Relaxed);
-                core.feed(&pcm, tx, |seq, frame| {
+                core.feed(&pcm, true, |seq, frame| {
                     match encoder.encode(frame, FRAME_SAMPLES, &mut obuf) {
                         Ok(n) => out.push(EncodedFrame {
                             seq: Seq(seq),
                             payload: obuf[..n].to_vec().into_boxed_slice(),
                         }),
                         Err(e) => {
-                            *fault.lock().unwrap() = Some(CaptureError::Encoder(e.to_string()));
+                            *lock_recover(&fault) = Some(CaptureError::Encoder(e.to_string()));
                         }
                     }
                 });
@@ -253,6 +337,14 @@ fn spawn_encoder(
         })
         .map_err(|e| CaptureError::Encoder(e.to_string()))?;
     Ok(handle)
+}
+
+fn drain_epoch(consumer: &mut rtrb::Consumer<PcmSample>, active_epoch: u32, pcm: &mut Vec<f32>) {
+    while let Ok(sample) = consumer.pop() {
+        if active_epoch != 0 && sample.epoch == active_epoch {
+            pcm.push(sample.value);
+        }
+    }
 }
 
 /// Continuous linear resampler (stateful across buffers via `frac`/`prev`).
@@ -317,13 +409,17 @@ impl EncodeCore {
         }
     }
 
+    fn reset(&mut self) {
+        self.resampler.reset();
+        self.buf.clear();
+    }
+
     /// Feed source-rate mono PCM. While `!transmitting`, input is discarded and
     /// all partial state is reset so the next talk burst starts clean and `Seq`
     /// does not advance. While transmitting, emit each completed frame.
     fn feed(&mut self, pcm: &[f32], transmitting: bool, mut emit: impl FnMut(u32, &[f32])) {
         if !transmitting {
-            self.resampler.reset();
-            self.buf.clear();
+            self.reset();
             return;
         }
         self.resampler.process(pcm, &mut self.buf);
@@ -356,7 +452,7 @@ impl<T> OutRing<T> {
     }
 
     fn push(&self, v: T) {
-        let mut q = self.q.lock().unwrap();
+        let mut q = lock_recover(&self.q);
         if q.len() >= self.cap {
             q.pop_front();
         }
@@ -364,7 +460,7 @@ impl<T> OutRing<T> {
     }
 
     fn drain(&self) -> VecDeque<T> {
-        std::mem::take(&mut *self.q.lock().unwrap())
+        std::mem::take(&mut *lock_recover(&self.q))
     }
 }
 
@@ -430,6 +526,39 @@ mod tests {
         // Turning on: a clean burst starts at seq 0 with no leftover from above.
         core.feed(&vec![1.0; FRAME_SAMPLES * 3], true, |s, _| minted.push(s));
         assert_eq!(minted, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn prior_ptt_epoch_samples_never_enter_the_next_burst() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8);
+        producer
+            .push(PcmSample {
+                value: -1.0,
+                epoch: 1,
+            })
+            .unwrap();
+        producer
+            .push(PcmSample {
+                value: 0.25,
+                epoch: 2,
+            })
+            .unwrap();
+        producer
+            .push(PcmSample {
+                value: -2.0,
+                epoch: 1,
+            })
+            .unwrap();
+        producer
+            .push(PcmSample {
+                value: 0.5,
+                epoch: 2,
+            })
+            .unwrap();
+
+        let mut pcm = Vec::new();
+        drain_epoch(&mut consumer, 2, &mut pcm);
+        assert_eq!(pcm, vec![0.25, 0.5]);
     }
 
     #[test]

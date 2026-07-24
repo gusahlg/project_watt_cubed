@@ -1,0 +1,645 @@
+//! Self-describing runtime benchmark recorder.
+//!
+//! `WATT_BENCH=<seconds>` remains the entry switch. A run now waits for both a
+//! minimum warmup and world readiness (with a bounded timeout), records frame
+//! and streaming distributions, inventories the machine without optional
+//! command-line tools, and emits one stable JSON record. Set
+//! `WATT_BENCH_OUTPUT=<path>` to append the same JSON as JSONL.
+
+mod json;
+mod system;
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use voxel_engine::{DVec3, Engine};
+
+use crate::settings::Settings;
+use crate::world::{StreamGauges, World};
+
+use json::Json;
+use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
+
+const DEFAULT_DURATION_SECS: f64 = 10.0;
+const DEFAULT_WARMUP_SECS: f64 = 3.0;
+const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;
+const MAX_DURATION_SECS: f64 = 600.0;
+const MAX_SAMPLE_RESERVE: usize = 2_000_000;
+const SCHEMA_VERSION: u32 = 2;
+
+/// What the app should do after advancing the recorder by one callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Warming,
+    Measuring,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    WaitingToStart,
+    Warming,
+    Measuring,
+}
+
+/// Complete state for one `WATT_BENCH` run.
+pub struct Benchmark {
+    duration: Duration,
+    min_warmup: Duration,
+    ready_timeout: Duration,
+    pos: Option<DVec3>,
+    output: Option<PathBuf>,
+    tag: Option<String>,
+    phase: Phase,
+    warmup_started: Option<Instant>,
+    measure_started: Option<Instant>,
+    ready_before_measure: bool,
+    warmup_elapsed: Duration,
+    samples: Vec<f32>,
+    first_gauges: Option<StreamGauges>,
+    last_gauges: StreamGauges,
+    peaks: StreamPeaks,
+    system: Option<SystemInfo>,
+    started_unix_ms: u128,
+    rss_start_bytes: Option<u64>,
+    rss_peak_bytes: Option<u64>,
+    last_rss_poll: Instant,
+}
+
+impl Benchmark {
+    /// Parse the environment. Invalid optional values warn and fall back; a
+    /// present `WATT_BENCH` always yields a finite, bounded run.
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var("WATT_BENCH").ok()?;
+        let duration = parse_seconds(
+            "WATT_BENCH",
+            &raw,
+            DEFAULT_DURATION_SECS,
+            0.05,
+            MAX_DURATION_SECS,
+        );
+        let min_warmup = env_seconds("WATT_BENCH_WARMUP", DEFAULT_WARMUP_SECS, 0.0, 300.0);
+        let ready_timeout = env_seconds(
+            "WATT_BENCH_READY_TIMEOUT",
+            DEFAULT_READY_TIMEOUT_SECS,
+            1.0,
+            600.0,
+        );
+        let pos = std::env::var("WATT_BENCH_POS").ok().and_then(|raw| {
+            parse_position(&raw).or_else(|| {
+                eprintln!("WATT_BENCH_POS={raw:?} is invalid; using the spawn position");
+                None
+            })
+        });
+        let output = std::env::var_os("WATT_BENCH_OUTPUT")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let tag = std::env::var("WATT_BENCH_TAG")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let reserve = ((duration.ceil() as usize).saturating_mul(25_000)).min(MAX_SAMPLE_RESERVE);
+        let now = Instant::now();
+        Some(Self {
+            duration: Duration::from_secs_f64(duration),
+            min_warmup: Duration::from_secs_f64(min_warmup),
+            ready_timeout: Duration::from_secs_f64(ready_timeout),
+            pos,
+            output,
+            tag,
+            phase: Phase::WaitingToStart,
+            warmup_started: None,
+            measure_started: None,
+            ready_before_measure: false,
+            warmup_elapsed: Duration::ZERO,
+            samples: Vec::with_capacity(reserve),
+            first_gauges: None,
+            last_gauges: StreamGauges::default(),
+            peaks: StreamPeaks::default(),
+            system: None,
+            started_unix_ms: unix_millis(),
+            rss_start_bytes: None,
+            rss_peak_bytes: None,
+            last_rss_poll: now,
+        })
+    }
+
+    pub fn has_started(&self) -> bool {
+        self.phase != Phase::WaitingToStart
+    }
+
+    pub fn position(&self) -> Option<DVec3> {
+        self.pos
+    }
+
+    /// Start metadata collection inside the already-created engine callback,
+    /// safely outside the measured interval.
+    pub fn begin(&mut self) {
+        debug_assert_eq!(self.phase, Phase::WaitingToStart);
+        self.phase = Phase::Warming;
+        self.warmup_started = Some(Instant::now());
+        self.system = Some(SystemInfo::collect());
+        self.rss_start_bytes = resident_bytes();
+        self.rss_peak_bytes = self.rss_start_bytes;
+    }
+
+    /// Far-coordinate setup does synchronous preparation, so retain the old
+    /// extra grace while still using the readiness gate.
+    pub fn add_warmup(&mut self, extra: Duration) {
+        self.min_warmup = self.min_warmup.saturating_add(extra);
+    }
+
+    /// Advance warmup/measurement using wall time for boundaries and the
+    /// engine's previous-frame duration for the sample itself.
+    pub fn step(&mut self, dt: f32, world_ready: bool, gauges: StreamGauges) -> Step {
+        self.last_gauges = gauges;
+        self.peaks.observe(gauges);
+        self.poll_rss();
+        match self.phase {
+            Phase::WaitingToStart => Step::Warming,
+            Phase::Warming => {
+                let elapsed = self
+                    .warmup_started
+                    .expect("begin sets warmup clock")
+                    .elapsed();
+                let minimum_met = elapsed >= self.min_warmup;
+                let timed_out = elapsed >= self.min_warmup.saturating_add(self.ready_timeout);
+                if !minimum_met || (!world_ready && !timed_out) {
+                    return Step::Warming;
+                }
+                self.ready_before_measure = world_ready;
+                self.warmup_elapsed = elapsed;
+                self.phase = Phase::Measuring;
+                self.measure_started = Some(Instant::now());
+                self.first_gauges = Some(gauges);
+                if timed_out && !world_ready {
+                    eprintln!(
+                        "benchmark: world did not become ready within {:.1}s; measuring with readiness=false",
+                        self.ready_timeout.as_secs_f64()
+                    );
+                }
+                // Do not count the final warmup frame as the first sample.
+                Step::Warming
+            }
+            Phase::Measuring => {
+                if dt.is_finite() && dt > 0.0 {
+                    self.samples.push(dt);
+                }
+                if self
+                    .measure_started
+                    .expect("measurement clock set")
+                    .elapsed()
+                    >= self.duration
+                {
+                    Step::Complete
+                } else {
+                    Step::Measuring
+                }
+            }
+        }
+    }
+
+    /// Build and emit the immutable report. This is called after sampling, so
+    /// hardware/filesystem probes cannot contaminate headline frame times.
+    pub fn finish(
+        &mut self,
+        settings: &Settings,
+        eng: &Engine,
+        world: &World,
+        actual_position: DVec3,
+    ) -> Report {
+        let rss_end_bytes = resident_bytes();
+        if let Some(rss) = rss_end_bytes {
+            self.rss_peak_bytes = Some(self.rss_peak_bytes.unwrap_or(0).max(rss));
+        }
+        let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
+        let stats = FrameStats::from_samples(&self.samples, wall);
+        let report = Json::object(vec![
+            ("schema_version", Json::from(SCHEMA_VERSION)),
+            ("kind", Json::from("project_watt_cubed.runtime_benchmark")),
+            ("started_unix_ms", Json::from(self.started_unix_ms)),
+            ("tag", Json::optional_str(self.tag.as_deref())),
+            ("software", software_json()),
+            (
+                "system",
+                self.system.as_ref().map_or(Json::Null, SystemInfo::to_json),
+            ),
+            ("display", display_json(eng, settings, self.system.as_ref())),
+            ("settings", settings_json(settings, eng)),
+            (
+                "scenario",
+                Json::object(vec![
+                    ("name", Json::from("steady_rotate")),
+                    ("seed", Json::from(world.seed())),
+                    ("requested_position", position_json(self.pos)),
+                    ("actual_position", position_json(Some(actual_position))),
+                    ("yaw_rate_rad_s", Json::number(0.4)),
+                    (
+                        "requested_duration_s",
+                        Json::number(self.duration.as_secs_f64()),
+                    ),
+                    (
+                        "minimum_warmup_s",
+                        Json::number(self.min_warmup.as_secs_f64()),
+                    ),
+                    (
+                        "actual_warmup_s",
+                        Json::number(self.warmup_elapsed.as_secs_f64()),
+                    ),
+                    (
+                        "ready_timeout_s",
+                        Json::number(self.ready_timeout.as_secs_f64()),
+                    ),
+                    (
+                        "ready_before_measure",
+                        Json::from(self.ready_before_measure),
+                    ),
+                    ("ready_at_end", Json::from(world.entry_complete())),
+                    (
+                        "profiling_enabled",
+                        Json::from(matches!(
+                            std::env::var("WATT_BENCH_PROFILE").as_deref(),
+                            Ok("1")
+                        )),
+                    ),
+                ]),
+            ),
+            ("frames", stats.to_json()),
+            (
+                "memory",
+                Json::object(vec![
+                    ("rss_start_bytes", Json::optional_u64(self.rss_start_bytes)),
+                    ("rss_peak_bytes", Json::optional_u64(self.rss_peak_bytes)),
+                    ("rss_end_bytes", Json::optional_u64(rss_end_bytes)),
+                ]),
+            ),
+            (
+                "streaming",
+                Json::object(vec![
+                    (
+                        "start",
+                        self.first_gauges.map_or(Json::Null, stream_gauges_json),
+                    ),
+                    ("end", stream_gauges_json(self.last_gauges)),
+                    ("peaks", self.peaks.to_json()),
+                ]),
+            ),
+        ]);
+        let json = report.render();
+        let summary = format!(
+            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} preset={} window={}x{} gpu={}",
+            stats.frames,
+            fmt_opt(stats.avg_fps, 0),
+            fmt_opt(stats.p1_fps, 0),
+            fmt_opt(stats.avg_ms, 3),
+            fmt_opt(stats.p99_ms, 3),
+            fmt_opt(stats.max_ms, 3),
+            stats.over_33ms,
+            rss_end_bytes.unwrap_or(0) / (1024 * 1024),
+            self.ready_before_measure,
+            settings.preset.label().to_ascii_lowercase(),
+            eng.screen_width(),
+            eng.screen_height(),
+            self.system.as_ref().map_or("unknown", SystemInfo::gpu_name),
+        );
+        Report {
+            summary,
+            json,
+            output: self.output.clone(),
+        }
+    }
+
+    fn poll_rss(&mut self) {
+        if self.last_rss_poll.elapsed() < Duration::from_secs(1) && self.rss_peak_bytes.is_some() {
+            return;
+        }
+        self.last_rss_poll = Instant::now();
+        if let Some(rss) = resident_bytes() {
+            self.rss_peak_bytes = Some(self.rss_peak_bytes.unwrap_or(0).max(rss));
+        }
+    }
+}
+
+pub struct Report {
+    summary: String,
+    json: String,
+    output: Option<PathBuf>,
+}
+
+impl Report {
+    pub fn emit(self) {
+        println!("{}", self.summary);
+        println!("BENCH_JSON {}", self.json);
+        let Some(path) = self.output else { return };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            eprintln!("benchmark: could not create {}: {err}", parent.display());
+            return;
+        }
+        let mut line = self.json;
+        line.push('\n');
+        let write = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                // One O_APPEND write keeps concurrent benchmark records from
+                // interleaving their JSON and newline halves.
+                file.write_all(line.as_bytes())?;
+                file.flush()
+            });
+        if let Err(err) = write {
+            eprintln!("benchmark: could not append {}: {err}", path.display());
+        } else {
+            eprintln!("benchmark: appended JSONL record to {}", path.display());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameStats {
+    frames: usize,
+    sampled_secs: f64,
+    wall_secs: f64,
+    avg_fps: Option<f64>,
+    throughput_fps: Option<f64>,
+    p1_fps: Option<f64>,
+    worst_1pct_avg_fps: Option<f64>,
+    avg_ms: Option<f64>,
+    min_ms: Option<f64>,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    p999_ms: Option<f64>,
+    max_ms: Option<f64>,
+    stddev_ms: Option<f64>,
+    over_16ms: usize,
+    over_33ms: usize,
+    over_50ms: usize,
+}
+
+impl FrameStats {
+    fn from_samples(samples: &[f32], wall: Duration) -> Self {
+        if samples.is_empty() {
+            return Self {
+                wall_secs: wall.as_secs_f64(),
+                ..Self::default()
+            };
+        }
+        let mut sorted: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
+        sorted.sort_by(f64::total_cmp);
+        let frames = sorted.len();
+        let total: f64 = sorted.iter().sum();
+        let mean = total / frames as f64;
+        let variance = sorted.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / frames as f64;
+        let p99 = percentile(&sorted, 0.99);
+        let worst_count = frames.div_ceil(100).max(1);
+        let worst_total: f64 = sorted[frames - worst_count..].iter().sum();
+        Self {
+            frames,
+            sampled_secs: total,
+            wall_secs: wall.as_secs_f64(),
+            avg_fps: Some(frames as f64 / total),
+            throughput_fps: (wall.as_secs_f64() > 0.0)
+                .then_some(frames as f64 / wall.as_secs_f64()),
+            p1_fps: Some(1.0 / p99),
+            worst_1pct_avg_fps: Some(worst_count as f64 / worst_total),
+            avg_ms: Some(mean * 1000.0),
+            min_ms: Some(sorted[0] * 1000.0),
+            p50_ms: Some(percentile(&sorted, 0.50) * 1000.0),
+            p95_ms: Some(percentile(&sorted, 0.95) * 1000.0),
+            p99_ms: Some(p99 * 1000.0),
+            p999_ms: Some(percentile(&sorted, 0.999) * 1000.0),
+            max_ms: Some(sorted[frames - 1] * 1000.0),
+            stddev_ms: Some(variance.sqrt() * 1000.0),
+            over_16ms: sorted.iter().filter(|&&s| s > 1.0 / 60.0).count(),
+            over_33ms: sorted.iter().filter(|&&s| s > 1.0 / 30.0).count(),
+            over_50ms: sorted.iter().filter(|&&s| s > 0.050).count(),
+        }
+    }
+
+    fn to_json(self) -> Json {
+        Json::object(vec![
+            ("count", Json::from(self.frames)),
+            ("sampled_seconds", Json::number(self.sampled_secs)),
+            ("wall_seconds", Json::number(self.wall_secs)),
+            ("average_fps", Json::optional_number(self.avg_fps)),
+            (
+                "wall_throughput_fps",
+                Json::optional_number(self.throughput_fps),
+            ),
+            ("p1_fps", Json::optional_number(self.p1_fps)),
+            (
+                "worst_1pct_average_fps",
+                Json::optional_number(self.worst_1pct_avg_fps),
+            ),
+            ("average_ms", Json::optional_number(self.avg_ms)),
+            ("minimum_ms", Json::optional_number(self.min_ms)),
+            ("p50_ms", Json::optional_number(self.p50_ms)),
+            ("p95_ms", Json::optional_number(self.p95_ms)),
+            ("p99_ms", Json::optional_number(self.p99_ms)),
+            ("p99_9_ms", Json::optional_number(self.p999_ms)),
+            ("maximum_ms", Json::optional_number(self.max_ms)),
+            ("stddev_ms", Json::optional_number(self.stddev_ms)),
+            ("frames_over_16_67ms", Json::from(self.over_16ms)),
+            ("frames_over_33_33ms", Json::from(self.over_33ms)),
+            ("frames_over_50ms", Json::from(self.over_50ms)),
+        ])
+    }
+}
+
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    let index = ((sorted.len() as f64 * q).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamPeaks {
+    max_chunks: usize,
+    max_generating: usize,
+    max_mesh_worklist: usize,
+    max_upload_queue: usize,
+    max_light_worklist: usize,
+    max_light_inflight: usize,
+    max_light_apply_queue: usize,
+    max_worker_near_queue: usize,
+    max_worker_far_queue: usize,
+    min_active_workers: usize,
+    max_worker_capacity: usize,
+    max_speed_mps: f64,
+    min_effort: f32,
+}
+
+impl Default for StreamPeaks {
+    fn default() -> Self {
+        Self {
+            max_chunks: 0,
+            max_generating: 0,
+            max_mesh_worklist: 0,
+            max_upload_queue: 0,
+            max_light_worklist: 0,
+            max_light_inflight: 0,
+            max_light_apply_queue: 0,
+            max_worker_near_queue: 0,
+            max_worker_far_queue: 0,
+            min_active_workers: usize::MAX,
+            max_worker_capacity: 0,
+            max_speed_mps: 0.0,
+            min_effort: 1.0,
+        }
+    }
+}
+
+impl StreamPeaks {
+    fn observe(&mut self, g: StreamGauges) {
+        self.max_chunks = self.max_chunks.max(g.chunks);
+        self.max_generating = self.max_generating.max(g.generating);
+        self.max_mesh_worklist = self.max_mesh_worklist.max(g.mesh_worklist);
+        self.max_upload_queue = self.max_upload_queue.max(g.upload_queue);
+        self.max_light_worklist = self.max_light_worklist.max(g.light_worklist);
+        self.max_light_inflight = self.max_light_inflight.max(g.light_inflight);
+        self.max_light_apply_queue = self.max_light_apply_queue.max(g.light_apply_queue);
+        self.max_worker_near_queue = self.max_worker_near_queue.max(g.worker_near_queue);
+        self.max_worker_far_queue = self.max_worker_far_queue.max(g.worker_far_queue);
+        if g.worker_capacity != 0 {
+            self.min_active_workers = self.min_active_workers.min(g.active_workers);
+        }
+        self.max_worker_capacity = self.max_worker_capacity.max(g.worker_capacity);
+        self.max_speed_mps = self.max_speed_mps.max(g.travel_speed_mps);
+        self.min_effort = self.min_effort.min(g.effort);
+    }
+
+    fn to_json(self) -> Json {
+        Json::object(vec![
+            ("chunks", Json::from(self.max_chunks)),
+            ("generating", Json::from(self.max_generating)),
+            ("mesh_worklist", Json::from(self.max_mesh_worklist)),
+            ("upload_queue", Json::from(self.max_upload_queue)),
+            ("light_worklist", Json::from(self.max_light_worklist)),
+            ("light_inflight", Json::from(self.max_light_inflight)),
+            ("light_apply_queue", Json::from(self.max_light_apply_queue)),
+            ("worker_near_queue", Json::from(self.max_worker_near_queue)),
+            ("worker_far_queue", Json::from(self.max_worker_far_queue)),
+            (
+                "minimum_active_workers",
+                if self.min_active_workers == usize::MAX {
+                    Json::Null
+                } else {
+                    Json::from(self.min_active_workers)
+                },
+            ),
+            ("worker_capacity", Json::from(self.max_worker_capacity)),
+            ("travel_speed_mps", Json::number(self.max_speed_mps)),
+            ("minimum_effort", Json::number(f64::from(self.min_effort))),
+        ])
+    }
+}
+
+fn stream_gauges_json(g: StreamGauges) -> Json {
+    Json::object(vec![
+        ("chunks", Json::from(g.chunks)),
+        ("generating", Json::from(g.generating)),
+        ("mesh_worklist", Json::from(g.mesh_worklist)),
+        ("upload_queue", Json::from(g.upload_queue)),
+        ("light_worklist", Json::from(g.light_worklist)),
+        ("light_inflight", Json::from(g.light_inflight)),
+        ("light_apply_queue", Json::from(g.light_apply_queue)),
+        ("worker_near_queue", Json::from(g.worker_near_queue)),
+        ("worker_far_queue", Json::from(g.worker_far_queue)),
+        ("active_workers", Json::from(g.active_workers)),
+        ("worker_capacity", Json::from(g.worker_capacity)),
+        ("travel_speed_mps", Json::number(g.travel_speed_mps)),
+        ("effort", Json::number(f64::from(g.effort))),
+    ])
+}
+
+fn position_json(pos: Option<DVec3>) -> Json {
+    pos.map_or(Json::Null, |p| {
+        Json::array(vec![
+            Json::number(p.x),
+            Json::number(p.y),
+            Json::number(p.z),
+        ])
+    })
+}
+
+fn parse_position(raw: &str) -> Option<DVec3> {
+    let mut parts = raw.split(',').map(|p| p.trim().parse::<f64>());
+    let position = DVec3::new(
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    (parts.next().is_none() && position.is_finite()).then_some(position)
+}
+
+fn parse_seconds(name: &str, raw: &str, default: f64, min: f64, max: f64) -> f64 {
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => {
+            let clamped = value.clamp(min, max);
+            if clamped != value {
+                eprintln!("{name}={value} is outside {min}..={max}; clamped to {clamped}");
+            }
+            clamped
+        }
+        _ => {
+            eprintln!("{name}={raw:?} is invalid; using {default}");
+            default
+        }
+    }
+}
+
+fn env_seconds(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    std::env::var(name)
+        .map(|raw| parse_seconds(name, &raw, default, min, max))
+        .unwrap_or(default)
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn fmt_opt(value: Option<f64>, decimals: usize) -> String {
+    value.map_or_else(|| "n/a".into(), |v| format!("{v:.decimals$}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_statistics_are_defined_and_percentiles_are_nearest_rank() {
+        let samples = [0.001, 0.002, 0.003, 0.004, 0.100];
+        let stats = FrameStats::from_samples(&samples, Duration::from_millis(110));
+        assert_eq!(stats.frames, 5);
+        assert!(stats.p50_ms.is_some_and(|ms| (ms - 3.0).abs() < 0.001));
+        assert!(stats.p99_ms.is_some_and(|ms| (ms - 100.0).abs() < 0.001));
+        assert_eq!(stats.over_50ms, 1);
+        assert!(stats.avg_fps.is_some_and(|fps| fps > 45.0 && fps < 46.0));
+    }
+
+    #[test]
+    fn empty_statistics_emit_nulls_instead_of_nan_or_infinity() {
+        let stats = FrameStats::from_samples(&[], Duration::ZERO);
+        let json = stats.to_json().render();
+        assert!(json.contains("\"average_fps\":null"));
+        assert!(!json.contains("NaN"));
+        assert!(!json.contains("inf"));
+    }
+
+    #[test]
+    fn json_escaping_and_position_validation_are_strict() {
+        assert_eq!(Json::from("a\n\"b").render(), "\"a\\n\\\"b\"");
+        assert!(parse_position("1,2,3").is_some());
+        assert!(parse_position("1,2,3,4").is_none());
+        assert!(parse_position("NaN,2,3").is_none());
+    }
+}

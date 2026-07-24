@@ -9,6 +9,7 @@
 
 use glam::DVec3;
 
+use super::acoustics::Medium;
 use super::backend::BackendVoice;
 
 /// Server-stamped per-player identity for a voice speaker. The server stamps
@@ -88,6 +89,7 @@ pub(crate) enum Session {
         /// Whether the voice is currently presented (false = muted, decoder alive).
         present: bool,
         last_at: Option<DVec3>,
+        last_medium: Medium,
         /// Per-session coordinate smoother: sessions smooth like clips/emitters.
         smooth: super::Smoothed,
     },
@@ -134,7 +136,9 @@ pub(crate) enum PushOutcome {
 
 impl JitterBuffer {
     pub fn new(jitter_target_ms: u32) -> Self {
-        let target = (jitter_target_ms / VOICE_FRAME_MS).max(JITTER_REORDER_WINDOW).max(1);
+        let target = (jitter_target_ms / VOICE_FRAME_MS)
+            .max(JITTER_REORDER_WINDOW)
+            .max(1);
         Self {
             buffer: Vec::with_capacity(target as usize + JITTER_REORDER_WINDOW as usize),
             play_seq: None,
@@ -171,9 +175,10 @@ impl JitterBuffer {
     }
 
     fn oldest_seq(&self) -> Option<Seq> {
-        self.buffer.iter().map(|p| p.seq).reduce(|acc, s| {
-            if acc.newer_than(s) { s } else { acc }
-        })
+        self.buffer
+            .iter()
+            .map(|p| p.seq)
+            .reduce(|acc, s| if acc.newer_than(s) { s } else { acc })
     }
 
     /// Advance the playout clock by one 20 ms frame. Total over the journal.
@@ -274,6 +279,13 @@ mod tests {
     }
 
     #[test]
+    fn target_ms_has_an_explicit_reorder_floor() {
+        assert_eq!(JitterBuffer::new(40).target_frames, JITTER_REORDER_WINDOW);
+        assert_eq!(JitterBuffer::new(80).target_frames, 4);
+        assert_eq!(JitterBuffer::new(1_000).target_frames, 50);
+    }
+
+    #[test]
     fn in_order_after_prefill() {
         let mut jb = jb();
         for s in 0..4 {
@@ -326,7 +338,10 @@ mod tests {
             jb.push(pkt(s));
         }
         pull(&mut jb, false); // establish play head at 0, advance to 1
-        assert_eq!(jb.push(pkt(1 + JITTER_STALE_WINDOW + 1)), PushOutcome::Stale);
+        assert_eq!(
+            jb.push(pkt(1 + JITTER_STALE_WINDOW + 1)),
+            PushOutcome::Stale
+        );
     }
 
     #[test]

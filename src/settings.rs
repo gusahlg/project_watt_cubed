@@ -383,7 +383,9 @@ impl Setting {
     /// `None` for personal controls. Scopes the change check to the one field
     /// instead of the whole-`Settings` clone + compare it used to run per edit.
     fn owned_value(&self, s: &Settings) -> Option<String> {
-        Settings::PROFILE_OWNED_KEYS.contains(&self.key).then(|| (self.write)(s))
+        Settings::PROFILE_OWNED_KEYS
+            .contains(&self.key)
+            .then(|| (self.write)(s))
     }
 
     /// The one place the "editing a field marks Custom" rule lives, so no UI
@@ -558,12 +560,22 @@ pub const SETTINGS: [Setting; 52] = [
         aliases: &["profile"],
         label: "Performance Preset",
         usage: "preset custom|minimum|fast|default",
-        confirm: |s| format!("performance preset {}", s.preset.label().to_ascii_lowercase()),
+        confirm: |s| {
+            format!(
+                "performance preset {}",
+                s.preset.label().to_ascii_lowercase()
+            )
+        },
         show: |s| s.preset.label().to_string(),
         parse_human: Settings::select_preset,
         step: |s, d| {
             // Cycle by persisted code order (Custom→Minimum→Fast→Default).
-            let order = [Preset::Custom, Preset::Minimum, Preset::Fast, Preset::Default];
+            let order = [
+                Preset::Custom,
+                Preset::Minimum,
+                Preset::Fast,
+                Preset::Default,
+            ];
             let code = cycle_list(&[0, 1, 2, 3], s.preset.code() as i32, d);
             s.apply_preset(order[code as usize]);
         },
@@ -628,7 +640,13 @@ pub const SETTINGS: [Setting; 52] = [
         aliases: &["lodlevels"],
         label: "LOD Range",
         usage: "lod_levels <1-8>",
-        confirm: |s| format!("LOD range {} levels (~{} m)", s.lod_levels, lod_range_metres(s)),
+        confirm: |s| {
+            format!(
+                "LOD range {} levels (~{} m)",
+                s.lod_levels,
+                lod_range_metres(s)
+            )
+        },
         show: |s| format!("{} levels (~{} m)", s.lod_levels, lod_range_metres(s)),
         parse_human: |s, v| {
             let parsed = set_parsed(&mut s.lod_levels, v);
@@ -751,11 +769,35 @@ pub const SETTINGS: [Setting; 52] = [
             None => false,
         },
     },
-    toggle_setting!(Category::Performance, simulation, "simulation", "Simulation", &["sim"]),
-    toggle_setting!(Category::Performance, mod_logic, "mod_logic", "Mod Updates", &["mods"]),
+    toggle_setting!(
+        Category::Performance,
+        simulation,
+        "simulation",
+        "Simulation",
+        &["sim"]
+    ),
+    toggle_setting!(
+        Category::Performance,
+        mod_logic,
+        "mod_logic",
+        "Mod Updates",
+        &["mods"]
+    ),
     toggle_setting!(Category::Performance, autosave, "autosave", "Autosave", &[]),
-    toggle_setting!(Category::Performance, minimap, "minimap", "Minimap", &["map"]),
-    toggle_setting!(Category::Performance, mod_hud, "mod_hud", "Mod HUD", &["modhud"]),
+    toggle_setting!(
+        Category::Performance,
+        minimap,
+        "minimap",
+        "Minimap",
+        &["map"]
+    ),
+    toggle_setting!(
+        Category::Performance,
+        mod_hud,
+        "mod_hud",
+        "Mod HUD",
+        &["modhud"]
+    ),
     toggle_setting!(
         Category::Performance,
         player_models,
@@ -763,55 +805,22 @@ pub const SETTINGS: [Setting; 52] = [
         "Player Models",
         &["models"]
     ),
-    toggle_setting!(Category::Performance, name_tags, "name_tags", "Name Tags", &["nametags"]),
-    Setting {
-        category: Category::Video,
-        menu_kind: MenuKind::Toggle,
-        fraction: |_| 0.0,
-        key: "fullscreen",
-        aliases: &[],
-        label: "Fullscreen",
-        usage: "fullscreen on|off",
-        confirm: |s| format!("fullscreen {}", on_off(s.fullscreen, false)),
-        show: |s| on_off(s.fullscreen, true).to_string(),
-        parse_human: |s, v| set_bool(&mut s.fullscreen, v),
-        step: |s, _| s.fullscreen = !s.fullscreen,
-        clamp: |_| {},
-        write: |s| s.fullscreen.to_string(),
-        read: |s, v| set_bool(&mut s.fullscreen, v),
-    },
-    Setting {
-        category: Category::Video,
-        menu_kind: MenuKind::Toggle,
-        fraction: |_| 0.0,
-        key: "vsync",
-        aliases: &[],
-        label: "VSync",
-        usage: "vsync on|off",
-        confirm: |s| format!("vsync {}", on_off(s.vsync, false)),
-        show: |s| on_off(s.vsync, true).to_string(),
-        parse_human: |s, v| set_bool(&mut s.vsync, v),
-        step: |s, _| s.vsync = !s.vsync,
-        clamp: |_| {},
-        write: |s| s.vsync.to_string(),
-        read: |s, v| set_bool(&mut s.vsync, v),
-    },
-    Setting {
-        category: Category::World,
-        menu_kind: MenuKind::Toggle,
-        fraction: |_| 0.0,
-        key: "lighting",
-        aliases: &["light"],
-        label: "Voxel Lighting",
-        usage: "lighting on|off",
-        confirm: |s| format!("lighting {}", on_off(s.lighting, false)),
-        show: |s| on_off(s.lighting, true).to_string(),
-        parse_human: |s, v| set_bool(&mut s.lighting, v),
-        step: |s, _| s.lighting = !s.lighting,
-        clamp: |_| {},
-        write: |s| s.lighting.to_string(),
-        read: |s, v| set_bool(&mut s.lighting, v),
-    },
+    toggle_setting!(
+        Category::Performance,
+        name_tags,
+        "name_tags",
+        "Name Tags",
+        &["nametags"]
+    ),
+    toggle_setting!(Category::Video, fullscreen, "fullscreen", "Fullscreen", &[]),
+    toggle_setting!(Category::Video, vsync, "vsync", "VSync", &[]),
+    toggle_setting!(
+        Category::World,
+        lighting,
+        "lighting",
+        "Voxel Lighting",
+        &["light"]
+    ),
     Setting {
         category: Category::Video,
         menu_kind: MenuKind::Choice,
@@ -870,7 +879,9 @@ pub const SETTINGS: [Setting; 52] = [
             fps_clamp(s);
             true
         },
-        step: |s, d| s.max_fps = cycle_list(&[0, 30, 60, 120, 144, 240], s.max_fps as i32, d) as u32,
+        step: |s, d| {
+            s.max_fps = cycle_list(&[0, 30, 60, 120, 144, 240], s.max_fps as i32, d) as u32
+        },
         clamp: fps_clamp,
         write: |s| s.max_fps.to_string(),
         read: |s, v| set_parsed(&mut s.max_fps, v),
@@ -879,7 +890,11 @@ pub const SETTINGS: [Setting; 52] = [
         category: Category::World,
         menu_kind: MenuKind::Bar,
         fraction: |s| {
-            frac(s.render_distance as f32, *VIEW_RADIUS_RANGE.start() as f32, *VIEW_RADIUS_RANGE.end() as f32)
+            frac(
+                s.render_distance as f32,
+                *VIEW_RADIUS_RANGE.start() as f32,
+                *VIEW_RADIUS_RANGE.end() as f32,
+            )
         },
         key: "render_distance",
         aliases: &["renderdist", "renderdistance"],
@@ -913,7 +928,7 @@ pub const SETTINGS: [Setting; 52] = [
         key: "fov",
         aliases: &[],
         label: "FOV",
-        usage: "fov <50-220>",
+        usage: "fov <60-220>",
         confirm: |s| format!("fov {:.0}", s.fov),
         // f32 Display prints whole values without a decimal point, exactly as the
         // old `format!("FOV: {}", s.fov)` screen did.
@@ -1011,11 +1026,33 @@ pub const SETTINGS: [Setting; 52] = [
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
     // Audio mix (see [`Settings::mix_change`]).
-    volume_bar!(master_volume, "master_volume", "Master Volume", &["volume", "master"]),
-    volume_bar!(effects_volume, "effects_volume", "Effects Volume", &["effects", "sfx"]),
+    volume_bar!(
+        master_volume,
+        "master_volume",
+        "Master Volume",
+        &["volume", "master"]
+    ),
+    volume_bar!(
+        effects_volume,
+        "effects_volume",
+        "Effects Volume",
+        &["effects", "sfx"]
+    ),
     volume_bar!(voice_volume, "voice_volume", "Voice Volume", &["voice_vol"]),
-    toggle_setting!(Category::Audio, voice_enabled, "voice_enabled", "Voice Chat", &["voice", "mic"]),
-    toggle_setting!(Category::Audio, voice_incoming, "voice_incoming", "Hear Voice", &["deafen_inverse", "hearvoice"]),
+    toggle_setting!(
+        Category::Audio,
+        voice_enabled,
+        "voice_enabled",
+        "Voice Chat",
+        &["voice", "mic"]
+    ),
+    toggle_setting!(
+        Category::Audio,
+        voice_incoming,
+        "voice_incoming",
+        "Hear Voice",
+        &["deafen_inverse", "hearvoice"]
+    ),
 ];
 
 /// The fields a named performance profile owns, as one declaration: generates
@@ -1112,21 +1149,50 @@ impl Settings {
         // omits `mod_logic`, keeping the default (mods stay live).
         let profile = match preset {
             Preset::Minimum => Settings {
-                vsync: false, msaa: 1, render_distance: 0, render_scale: 0.25, lighting: false,
-                vertical_distance: 1, lod_levels: 1, lod_detail: 6,
-                stream_hz: 15, physics_hz: 30, sky_hz: 15, mod_hz: 15,
-                simulation: false, mod_logic: false, autosave: false,
-                hud_mode: HudMode::Off, minimap: false, mod_hud: false,
-                player_models: false, name_tags: false, lod2: false,
+                vsync: false,
+                msaa: 1,
+                render_distance: 0,
+                render_scale: 0.25,
+                lighting: false,
+                vertical_distance: 1,
+                lod_levels: 1,
+                lod_detail: 6,
+                stream_hz: 15,
+                physics_hz: 30,
+                sky_hz: 15,
+                mod_hz: 15,
+                simulation: false,
+                mod_logic: false,
+                autosave: false,
+                hud_mode: HudMode::Off,
+                minimap: false,
+                mod_hud: false,
+                player_models: false,
+                name_tags: false,
+                lod2: false,
                 ..Self::stripped()
             },
             Preset::Fast => Settings {
-                vsync: false, msaa: 1, render_distance: 3, render_scale: 0.5, lighting: false,
-                vertical_distance: 2, lod_levels: 3, lod_detail: 4,
-                stream_hz: 60, physics_hz: 60, sky_hz: 60, mod_hz: 60,
-                simulation: true, autosave: true,
-                hud_mode: HudMode::Minimal, minimap: false, mod_hud: false,
-                player_models: true, name_tags: false, lod2: true,
+                vsync: false,
+                msaa: 1,
+                render_distance: 3,
+                render_scale: 0.5,
+                lighting: false,
+                vertical_distance: 2,
+                lod_levels: 3,
+                lod_detail: 4,
+                stream_hz: 60,
+                physics_hz: 60,
+                sky_hz: 60,
+                mod_hz: 60,
+                simulation: true,
+                autosave: true,
+                hud_mode: HudMode::Minimal,
+                minimap: false,
+                mod_hud: false,
+                player_models: true,
+                name_tags: false,
+                lod2: true,
                 ..Self::stripped()
             },
             Preset::Default => Self::default(),
@@ -1286,11 +1352,19 @@ fn disable_costly_lanes(s: &mut Settings) {
 }
 
 fn rate_name(rate: u32) -> String {
-    if rate == 0 { "Every frame".to_string() } else { format!("{rate} Hz") }
+    if rate == 0 {
+        "Every frame".to_string()
+    } else {
+        format!("{rate} Hz")
+    }
 }
 
 fn rate_confirm(kind: &str, rate: u32) -> String {
-    if rate == 0 { format!("{kind} every frame") } else { format!("{kind} {rate} Hz") }
+    if rate == 0 {
+        format!("{kind} every frame")
+    } else {
+        format!("{kind} {rate} Hz")
+    }
 }
 
 fn parse_rate(dst: &mut u32, value: &str, choices: &[i32]) -> bool {
@@ -1306,14 +1380,19 @@ fn parse_rate(dst: &mut u32, value: &str, choices: &[i32]) -> bool {
 }
 
 fn vertical_distance_clamp(s: &mut Settings) {
-    s.vertical_distance = s
-        .vertical_distance
-        .clamp(*VERTICAL_DISTANCE_RANGE.start(), *VERTICAL_DISTANCE_RANGE.end());
+    s.vertical_distance = s.vertical_distance.clamp(
+        *VERTICAL_DISTANCE_RANGE.start(),
+        *VERTICAL_DISTANCE_RANGE.end(),
+    );
 }
 
 fn lod_clamp(s: &mut Settings) {
-    s.lod_detail = s.lod_detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
-    s.lod_levels = s.lod_levels.clamp(*LOD_LEVELS_RANGE.start(), max_lod_levels(s.lod_detail));
+    s.lod_detail = s
+        .lod_detail
+        .clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
+    s.lod_levels = s
+        .lod_levels
+        .clamp(*LOD_LEVELS_RANGE.start(), max_lod_levels(s.lod_detail));
 }
 
 /// The approximate far-field outer range in metres for the confirm/show text.
@@ -1322,7 +1401,9 @@ fn lod_range_metres(s: &Settings) -> u64 {
         .render_distance
         .clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end())
         .max(1) as u64;
-    let levels = s.lod_levels.clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end());
+    let levels = s
+        .lod_levels
+        .clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end());
     radius * 16 * (1_u64 << levels)
 }
 
@@ -1438,8 +1519,9 @@ fn msaa_clamp(s: &mut Settings) {
 }
 
 fn dist_clamp(s: &mut Settings) {
-    s.render_distance =
-        s.render_distance.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
+    s.render_distance = s
+        .render_distance
+        .clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
 }
 
 /// Step an integer within a range, wrapping at ends.
@@ -1464,7 +1546,11 @@ fn cycle_list(list: &[i32], current: i32, dir: i32) -> i32 {
 
 /// Snap to the largest list entry <= v (or first entry if none found).
 fn snap_down(list: &[i32], v: i32) -> i32 {
-    list.iter().rev().copied().find(|&e| e <= v).unwrap_or(list[0])
+    list.iter()
+        .rev()
+        .copied()
+        .find(|&e| e <= v)
+        .unwrap_or(list[0])
 }
 
 /// Rate zero is the explicit every-frame mode. A malformed positive value must
@@ -1486,15 +1572,24 @@ fn snap_rate(list: &[i32], v: i32) -> i32 {
 mod tests {
     use super::*;
 
+    fn setting(key: &str) -> &'static Setting {
+        SETTINGS
+            .iter()
+            .find(|field| field.matches(key))
+            .unwrap_or_else(|| panic!("missing setting descriptor `{key}`"))
+    }
+
     #[test]
     fn roundtrip_through_text() {
-        let mut s = Settings::default();
-        s.fullscreen = true;
-        s.msaa = 4;
-        s.max_fps = 144;
-        s.render_distance = 8;
-        s.fov = 90.0;
-        s.render_scale = 0.75;
+        let s = Settings {
+            fullscreen: true,
+            msaa: 4,
+            max_fps: 144,
+            render_distance: 8,
+            fov: 90.0,
+            render_scale: 0.75,
+            ..Settings::default()
+        };
         // Same table-driven serialization as `save`, so this can't drift from
         // what `parse_from` reads.
         let text = s.to_text();
@@ -1547,16 +1642,20 @@ mod tests {
         // corrupt/garbage sentinel, so it resets to the field default; ±INF is a
         // genuine over/underflow and clamps to the near endpoint.
         let defaults = Settings::default();
-        let mut s = Settings::default();
-        s.fov = f32::NAN;
-        s.render_scale = f32::NAN;
+        let mut s = Settings {
+            fov: f32::NAN,
+            render_scale: f32::NAN,
+            ..Settings::default()
+        };
         s.clamp();
         assert_eq!(s.fov, defaults.fov);
         assert_eq!(s.render_scale, defaults.render_scale);
 
-        let mut s = Settings::default();
-        s.fov = f32::INFINITY;
-        s.render_scale = f32::NEG_INFINITY;
+        let mut s = Settings {
+            fov: f32::INFINITY,
+            render_scale: f32::NEG_INFINITY,
+            ..Settings::default()
+        };
         s.clamp();
         assert_eq!(s.fov, *FOV_RANGE.end());
         assert_eq!(s.render_scale, *RENDER_SCALE_RANGE.start());
@@ -1575,7 +1674,11 @@ mod tests {
             }
         }
         for v in 0..=12 {
-            assert_eq!(snap_down(&[1, 2, 4, 8], v), old_bucket(v as u32) as i32, "v={v}");
+            assert_eq!(
+                snap_down(&[1, 2, 4, 8], v),
+                old_bucket(v as u32) as i32,
+                "v={v}"
+            );
         }
     }
 
@@ -1625,7 +1728,11 @@ mod tests {
         };
         for field in &SETTINGS {
             let mut back = Settings::default();
-            assert!(field.read(&mut back, &field.write(&samples)), "{}", field.label());
+            assert!(
+                field.read(&mut back, &field.write(&samples)),
+                "{}",
+                field.label()
+            );
         }
         // The composed roundtrip lands the exact struct.
         let mut back = Settings::default();
@@ -1651,13 +1758,20 @@ mod tests {
         back.clamp();
         assert_eq!(back, s);
 
-        let mut over = Settings { master_volume: 200, ..Settings::default() };
+        let mut over = Settings {
+            master_volume: 200,
+            ..Settings::default()
+        };
         over.clamp();
         assert_eq!(over.master_volume, 100);
 
         // Percent maps to linear gain; deafen is the inverse of voice_incoming.
-        let mix = Settings { voice_incoming: false, master_volume: 50, ..Settings::default() }
-            .mix_change();
+        let mix = Settings {
+            voice_incoming: false,
+            master_volume: 50,
+            ..Settings::default()
+        }
+        .mix_change();
         assert_eq!(mix.master, 0.5);
         assert!(mix.deafen);
         assert!(!mix.muted);
@@ -1676,15 +1790,17 @@ mod tests {
 
     #[test]
     fn presets_apply_owned_fields_and_preserve_personal_controls() {
-        let preset = SETTINGS.iter().find(|f| f.matches("preset")).unwrap();
-        let mut s = Settings::default();
-        s.fullscreen = true;
-        s.max_fps = 777;
-        s.fov = 105.0;
-        s.ui_scale = 1.5;
-        s.menu_scale = 0.75;
-        s.shake = 0.25;
-        s.cull_faces = true;
+        let preset = setting("preset");
+        let mut s = Settings {
+            fullscreen: true,
+            max_fps: 777,
+            fov: 105.0,
+            ui_scale: 1.5,
+            menu_scale: 0.75,
+            shake: 0.25,
+            cull_faces: true,
+            ..Settings::default()
+        };
 
         assert!(preset.parse_human(&mut s, "minimum"));
         assert_eq!(s.preset, Preset::Minimum);
@@ -1693,8 +1809,15 @@ mod tests {
         assert_eq!((s.render_distance, s.vertical_distance), (0, 1));
         assert!(!s.lod2);
         assert_eq!((s.lod_levels, s.lod_detail), (1, 6));
-        assert_eq!(lod_range_metres(&s), 32, "zero near radius keeps one LOD unit");
-        assert_eq!((s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz), (15, 30, 15, 15));
+        assert_eq!(
+            lod_range_metres(&s),
+            32,
+            "zero near radius keeps one LOD unit"
+        );
+        assert_eq!(
+            (s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz),
+            (15, 30, 15, 15)
+        );
         assert_eq!(s.hud_mode, HudMode::Off);
         assert!(!s.simulation && !s.mod_logic && !s.autosave);
         assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
@@ -1710,7 +1833,10 @@ mod tests {
         assert!(s.lod2);
         assert_eq!((s.lod_levels, s.lod_detail), (3, 4));
         assert_eq!(lod_range_metres(&s), 384);
-        assert_eq!((s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz), (60, 60, 60, 60));
+        assert_eq!(
+            (s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz),
+            (60, 60, 60, 60)
+        );
         assert_eq!(s.hud_mode, HudMode::Minimal);
         assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
         assert!(!s.minimap && !s.mod_hud && !s.name_tags);
@@ -1730,20 +1856,25 @@ mod tests {
 
     #[test]
     fn lod_clamp_enforces_combined_detail_limit() {
-        let mut s = Settings::default();
-        s.lod_detail = 6;
-        s.lod_levels = 8;
+        let mut s = Settings {
+            lod_detail: 6,
+            lod_levels: 8,
+            ..Settings::default()
+        };
         s.clamp();
         assert_eq!((s.lod_detail, s.lod_levels), (6, 4));
-        assert!(s.lod_detail + s.lod_levels - 1 <= 9, "coarsest level within the ladder cap");
+        assert!(
+            s.lod_detail + s.lod_levels - 1 <= 9,
+            "coarsest level within the ladder cap"
+        );
 
         s.lod_detail = 255;
         s.lod_levels = 0;
         s.clamp();
         assert_eq!((s.lod_detail, s.lod_levels), (6, 1));
 
-        let detail = SETTINGS.iter().find(|f| f.matches("lod_detail")).unwrap();
-        let levels = SETTINGS.iter().find(|f| f.matches("lod_levels")).unwrap();
+        let detail = setting("lod_detail");
+        let levels = setting("lod_levels");
         s.lod_detail = 5;
         s.lod_levels = 5;
         detail.step(&mut s, 1);
@@ -1758,8 +1889,8 @@ mod tests {
 
     #[test]
     fn interactive_edits_mark_custom_but_persistence_does_not() {
-        let preset = SETTINGS.iter().find(|f| f.matches("preset")).unwrap();
-        let scale = SETTINGS.iter().find(|f| f.matches("render_scale")).unwrap();
+        let preset = setting("preset");
+        let scale = setting("render_scale");
 
         let mut s = Settings::default();
         assert!(preset.parse_human(&mut s, "fast"));
@@ -1774,7 +1905,7 @@ mod tests {
         assert_eq!(s.preset, Preset::Custom);
 
         // Personal controls are not profile-owned: editing them keeps the profile.
-        let fov = SETTINGS.iter().find(|f| f.matches("fov")).unwrap();
+        let fov = setting("fov");
         assert!(preset.parse_human(&mut s, "fast"));
         fov.step(&mut s, 1);
         assert_eq!(s.preset, Preset::Fast, "FOV is a personal control");
@@ -1795,8 +1926,8 @@ mod tests {
         // Aliases reach the same field...
         let mut a = Settings::default();
         let mut b = Settings::default();
-        let dist = SETTINGS.iter().find(|f| f.matches("renderdist")).unwrap();
-        let dist2 = SETTINGS.iter().find(|f| f.matches("renderdistance")).unwrap();
+        let dist = setting("renderdist");
+        let dist2 = setting("renderdistance");
         assert!(dist.parse_human(&mut a, "8"));
         assert!(dist2.parse_human(&mut b, "8"));
         assert_eq!(a.render_distance, 8);
