@@ -190,6 +190,38 @@ just fried but if we somehow could like put in a bit of stardust into a block to
 through it and that somehow elements can be pushed into place in the block and then the stardust signal thing is done and it kinda just says, ok I AM COMPLETE! and switches internal state
 and done. Something like this could maybe work. Please give some feedback lol.
 
+Ok I have to specify kinda exactly how this crafting thing should work now so that we can have a complete solution to one of the hardest problems in the game that we can then review and
+refine. Okay so lets set up the details of how this works. First of all how is a configuration submitted into a configuration block? I had this idea that maybe the elements would be pushed
+into the block that will be crafted and then craft signal leading to new block being made. Instead of a signal there could also be a condition that makes crafting trigger. And instead of
+physically pushing elements into the block there could instead by some sort of way to like put multiple blocks together into one new block in a certain way where the placement can be translated
+into element space. Or the third option is submitting a configuration and resources seperately. In a more organized format this could be expressed as:
+
+Crafting execution solutions:
+- Signals
+- Conditions
+
+Configuration and resources solutions:
+- Input confiugration and resources seperately
+- Somehow make it possible to put configuration into new block by surrounding it with other blocks that code for the configuration
+- physically move elments into the block
+
+A solution is to full on add in movement to all elements and not make movement block only. This makes me wonder whether we would want elements to be able to move though. Like the thing is
+If elements moved configuration blocks would not have to exist anyway and it would be super messy and annoying I think so what about just saying no to this. I have another idea though. What if we can
+push a natural block into a confiuration block and having it convert into elements. So that if we have a pure stone natural block pushing it into... wait I think I know how to do this. WHat if we have
+the signaling be for when to convert a natural block into elements in a configuratin block? So like what if a signal is inputted into the configuration block, the configuration block changes some
+state and then the next natural block that is pushed into it gets converted to elements in that block. Okay sure sure but how does one make precise things out of this? This gives little control over
+where the elements go, which is a problem since that is the whole other half of the problem, controling configuration. Maybe the signal that the block gets in before-hand can hold information about
+how the next elements are going to be placed? Yeah that might work. Maybe we can have an element called something cool. I think this idea is okay actuallly it is basically a sort of variation of the
+combination of having a sort of signal and inputting configuration and resources seperately. I like it. The only real problem is that we have to have a way of editing the configuration by a player and
+placing it out as a block. I am thinking it will look like a block made of element that are bluish transparent (kind of like a typical blueprint) this block should basically be its own kind of block
+called something like a bluepring block or something and it should be possible to walk through and it should have very simple core properties. It should be super easy to push it into a configuration
+block and it should then get deleted and update the place the next stuff go to in the configuration block. blueprint blocks take no resources to craft. I am thinking it would be good if they were
+also craftable without the player there as well somehow. It doesn't matter if that is a little tedious as much since it is not the primary method. I am thinking that it should be possible to
+automatically craft them by laying out natural blocks that are pure (made up of only one element) in a 30x30x30 configuration so that it is almost like a big block made out of blocks. Then there has
+to be some signal or something that makes the 30x30x30 blocks combine into a single block. The signal would have to be something specific or there could be a condition of some sort.
+
+OKAY so I want an alternative path because this is not purist enough to the original vision. THINKTHINKTHINK
+
 # Unresolved problems list
 There's probably a lot more here that is missing so just try adding in something whenever you come to think of something.
 - Crafting
