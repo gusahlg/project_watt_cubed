@@ -36,7 +36,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # Audio output/capture, realtime queues, voice codec, and cue manifests.
-cpal = "0.18"
+# Prefer cpal's native PulseAudio-protocol host on Linux (also served by
+# PipeWire's Pulse compatibility layer), then fall back to ALSA. This avoids
+# relying on distro-specific ALSA plugin configuration in portable bundles.
+cpal = { version = "0.18", features = ["pulseaudio"] }
 kira = "0.12"
 opus-rs = "0.1"
 rtrb = "0.3"

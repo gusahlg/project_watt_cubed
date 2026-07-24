@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -83,7 +84,13 @@ impl KiraBackend {
         // No kira listener/spatial track: the full spatial nonlinearity lives in
         // `respond()` upstream, so voices ride plain sub-tracks driven by `Dsp`. This also
         // keeps the backend free of glam→kira coupling (kira's mint APIs want glam 0.33).
-        let manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()).ok()?;
+        //
+        // cpal's platform `default_host()` currently panics when ALSA/CoreAudio cannot
+        // initialize, even though kira otherwise exposes fallible construction. Keep that
+        // third-party panic behind the same Option seam as ordinary device errors so the
+        // caller can select NullBackend and the game remains usable without audio.
+        let manager =
+            guarded_init(|| AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()))?;
         Some(Self {
             manager,
             clips: Vec::new(),
@@ -116,6 +123,15 @@ impl KiraBackend {
         let track = self.manager.add_sub_track(builder).ok()?;
         Some((track, filter, pan))
     }
+}
+
+/// Turn both an ordinary backend error and a dependency panic into the same
+/// unavailable-device result. `AssertUnwindSafe` is appropriate here: no state escapes
+/// the one-shot constructor unless it returns successfully.
+fn guarded_init<T, E>(init: impl FnOnce() -> Result<T, E>) -> Option<T> {
+    catch_unwind(AssertUnwindSafe(init))
+        .ok()
+        .and_then(Result::ok)
 }
 
 impl ClipStore for KiraBackend {
@@ -392,5 +408,20 @@ impl Decoder for VoiceDecoder {
 
     fn seek(&mut self, index: usize) -> Result<usize, VoiceFinished> {
         Ok(index) // voice is not seekable; kira issues no seeks without loop/seek commands
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guarded_init;
+
+    #[test]
+    fn backend_init_guard_normalizes_errors_and_panics() {
+        assert_eq!(guarded_init(|| Ok::<_, ()>(7)), Some(7));
+        assert_eq!(guarded_init(|| Err::<u8, _>("device unavailable")), None);
+        assert_eq!(
+            guarded_init(|| -> Result<u8, ()> { panic!("simulated cpal host panic") }),
+            None
+        );
     }
 }
