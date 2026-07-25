@@ -1268,7 +1268,10 @@ impl Settings {
     /// applied (e.g. 8x requested, 4x supported).
     pub fn apply(&mut self, eng: &mut Engine) {
         eng.set_fullscreen(self.fullscreen);
-        eng.set_vsync(self.vsync);
+        // Vsync is deliberately NOT pushed here: `App::frame` is the single
+        // writer, because the effective value also depends on the screen
+        // (menus force vsync on). Two writers disagreeing made the engine
+        // rebuild the swapchain every menu frame.
         self.msaa = eng.set_msaa(self.msaa);
         self.render_scale = eng.set_render_scale(self.render_scale);
         eng.set_target_fps(self.max_fps);
