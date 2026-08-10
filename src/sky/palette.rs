@@ -1,10 +1,10 @@
 //! Typed sky palette — the whole "what colour is the world's light" surface in
-//! one exhaustively-matched table, replacing MakeUp's ~200 `#define` sprawl
-//! with `Role × Anchor` enums.
+//! one exhaustively-matched table, replacing the reference shader's ~200
+//! `#define` sprawl with `Role × Anchor` enums.
 //!
 //! Three roles (what the colour is *for*) × three anchors (what time it
 //! belongs to). Blending between anchors keys off **sun elevation**, not a
-//! clock fraction: MakeUp's quadratic-in-worldTime mixers were an equilibrium
+//! clock fraction: the reference shader's quadratic-in-worldTime mixers were an equilibrium
 //! of Minecraft's clock; elevation is the quantity the blend is really *about*,
 //! and it stays correct if day length or the sun's arc ever changes.
 use voxel_engine::{Color, Vec3};
@@ -30,17 +30,18 @@ impl Rgb {
         Rgb(r, g, b)
     }
 
-    /// Decode an 8-bit sRGB (author-space) colour into linear.
+    /// Decode an 8-bit sRGB (author-space) colour into linear, via the
+    /// generated decode table — the same table the shaders `#include`, so the
+    /// authoring boundary cannot drift from the GPU's.
     ///
     /// The authoring boundary *in*: `from_srgb8(255, 255, 255) == linear(1, 1, 1)`.
-    // TODO: switch to the generated 256-entry decode table.
-    pub fn from_srgb8(r: u8, g: u8, b: u8) -> Rgb {
-        Rgb(srgb_decode(r), srgb_decode(g), srgb_decode(b))
+    pub const fn from_srgb8(r: u8, g: u8, b: u8) -> Rgb {
+        let t = &voxel_engine::genconst::SRGB8_TO_LINEAR;
+        Rgb(t[r as usize], t[g as usize], t[b as usize])
     }
 
     /// `0xRRGGBB` convenience over [`from_srgb8`](Rgb::from_srgb8).
-    // TODO: becomes `const fn` once the decode table is a const array.
-    pub fn from_srgb_hex(rgb: u32) -> Rgb {
+    pub const fn from_srgb_hex(rgb: u32) -> Rgb {
         Rgb::from_srgb8(
             ((rgb >> 16) & 0xff) as u8,
             ((rgb >> 8) & 0xff) as u8,
@@ -67,17 +68,6 @@ impl Rgb {
     /// sole 8-bit display exit; this is the sole linear engine-boundary exit.
     pub fn to_linear(self) -> voxel_engine::LinearRgb {
         voxel_engine::LinearRgb([self.0, self.1, self.2])
-    }
-
-    /// LEGACY look-compatibility exit — reproduces the pre-linear-invariant
-    /// display pipeline, which quantized linear values without sRGB encoding.
-    /// Every call site is a deliberate look-freeze.
-    // PROVISIONAL(A): retire by switching call sites to to_srgb8 under
-    // golden-diff once the harness lands (the switch is a real, global look
-    // change that must be evaluated, not inherited).
-    pub fn to_srgb8_legacy(self) -> Color {
-        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
-        Color::rgb(q(self.0), q(self.1), q(self.2))
     }
 
     /// Linear component accessors (for consumers outside this module).
@@ -108,32 +98,18 @@ impl Rgb {
         Rgb(self.0 * f, self.1 * f, self.2 * f)
     }
 
-    /// Decode a *display-space* float literal to linear via the sRGB EOTF,
-    /// extended with pow(x, 2.4) above 1.0 so HDR channels decode monotonically
-    /// instead of clamping.
-    pub fn from_display(r: f32, g: f32, b: f32) -> Rgb {
-        fn d(c: f32) -> f32 {
-            if c <= 0.04045 {
-                c / 12.92
-            } else if c <= 1.0 {
-                ((c + 0.055) / 1.055).powf(2.4)
-            } else {
-                c.powf(2.4)
-            }
-        }
-        Rgb(d(r), d(g), d(b))
+    /// Desaturate toward a rain tint by `strength` [0,1]: blend toward
+    /// `rain · luma(self)` — the rain colour at this colour's own brightness — so
+    /// a rainy sky greys out without changing overall exposure. (The rain
+    /// rule; see [`RAIN_ZENITH`]/[`RAIN_HORIZON`].)
+    pub fn rain_override(self, rain: Rgb, strength: f32) -> Rgb {
+        self.lerp(rain.scale(self.luma()), strength)
     }
 }
 
-/// sRGB EOTF: decode one 8-bit author-space channel to linear.
-fn srgb_decode(v: u8) -> f32 {
-    let c = v as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
+/// Rain sky overrides, imported as linear color. See [`Rgb::rain_override`].
+pub const RAIN_ZENITH: Rgb = Rgb::linear(0.7, 0.85, 1.0);
+pub const RAIN_HORIZON: Rgb = Rgb::linear(0.35, 0.425, 0.5);
 
 /// sRGB OETF: clamp a linear channel to [0, 1], encode, and quantise to 8-bit
 /// (round-to-nearest, so `from_srgb8`→`to_srgb8` is the identity on all 256
@@ -147,6 +123,43 @@ fn srgb_encode(c: f32) -> u8 {
     };
     (s * 255.0).round() as u8
 }
+
+/// A clamped Hermite smoothstep over one elevation band — the ONE shape every
+/// elevation→scalar blend uses, so all the named instances below stay
+/// comparable at a glance. A curve a shader must share migrates its edges
+/// into the generated constants table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Curve {
+    pub edge0: f32,
+    pub edge1: f32,
+}
+
+impl Curve {
+    pub const fn new(edge0: f32, edge1: f32) -> Curve {
+        Curve { edge0, edge1 }
+    }
+
+    pub fn eval(self, x: f32) -> f32 {
+        let t = ((x - self.edge0) / (self.edge1 - self.edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+}
+
+/// Sunset→Day palette blend band: full Day once the sun clears horizon effects.
+pub const DAY_BLEND: Curve = Curve::new(0.05, 0.35);
+/// Sunset→Night palette blend band (evaluated on `-elev`): full Night past a
+/// civil-twilight-ish cutoff.
+pub const NIGHT_BLEND: Curve = Curve::new(0.05, 0.25);
+/// Sunset-glow widening band: the sky sun-halo exponent lerps from a wide
+/// golden-hour halo at low sun to the tight noon halo above this band. CPU-side
+/// documentation/parity for the shader; the edges are mirrored into the generated
+/// `GLOW_EDGE0`/`GLOW_EDGE1` constants (with `GLOW_POW_SUNSET`/`GLOW_POW_DAY`) that
+/// `sky_radiance` consumes. Axis is sun elevation `sun_dir().y`.
+pub const GLOW: Curve = Curve::new(0.0, 0.4);
+/// Sun↔moon light-source mix band: crosses 0.5 exactly at the horizon; narrow
+/// so the flip hides inside the sunset colour wash. (The `dayNightMix`
+/// mixer re-derived onto elevation.)
+pub const DAY_NIGHT_MIX: Curve = Curve::new(-0.08, 0.08);
 
 /// What a palette colour is used for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,52 +206,30 @@ impl Palette {
     }
 
     /// The palette colour for `role` at sun elevation `elev` (`sun_dir().y`,
-    /// [-1, 1]). The blend shape is documented so the numbers have a "why":
-    /// - `elev ≥ 0.35`: full Day (sun clear of horizon effects).
-    /// - `elev ≈ 0`: full Sunset band (the eye's golden hour).
-    /// - `elev ≤ -0.25`: full Night (civil-twilight-ish cutoff).
-    /// Smoothsteps between, so the derivative is continuous at both joins.
+    /// [-1, 1]): Sunset at the horizon, blended to Day above ([`DAY_BLEND`])
+    /// and Night below ([`NIGHT_BLEND`]), derivative-continuous at both joins.
     pub fn at(&self, role: Role, elev: f32) -> Rgb {
         let sunset = self.get(role, Anchor::Sunset);
         let day = self.get(role, Anchor::Day);
         let night = self.get(role, Anchor::Night);
         if elev >= 0.0 {
-            sunset.lerp(day, smoothstep(0.05, 0.35, elev))
+            sunset.lerp(day, DAY_BLEND.eval(elev))
         } else {
-            sunset.lerp(night, smoothstep(0.05, 0.25, -elev))
+            sunset.lerp(night, NIGHT_BLEND.eval(-elev))
         }
     }
 
     /// Sun↔moon light-source mix in [0, 1]: 1 = sun is the light source,
-    /// 0 = moon. Crosses 0.5 exactly at the horizon; the narrow band keeps
-    /// the flip invisible inside the sunset colour wash. (MakeUp's
-    /// `dayNightMix` re-derived onto elevation.)
+    /// 0 = moon. See [`DAY_NIGHT_MIX`].
     pub fn day_night_mix(elev: f32) -> f32 {
-        smoothstep(-0.08, 0.08, elev)
+        DAY_NIGHT_MIX.eval(elev)
     }
 }
 
-/// The atmosphere colour table with its literal matrix re-read as
-/// display-space MakeUp constants and EOTF-decoded via [`Rgb::from_display`].
-pub fn new_shoka_v2() -> Palette {
-    Palette { colors: NEW_SHOKA.colors.map(|row| row.map(|c| Rgb::from_display(c.0, c.1, c.2))) }
-}
-
-/// Default palette: the engine's existing look, verbatim — `atmosphere.rs`
-/// anchors for Zenith/Horizon (Sunset row synthesized from its SUNSET glow
-/// constant) and `env.rs`'s warm/pale sun ramp for Light. Changing the
-/// default look is a data edit here, nowhere else.
-pub const CLASSIC: Palette = Palette::new([
-    // Light: sunset warm → day pale → night faint blue moon
-    [Rgb::linear(1.0, 0.72, 0.42), Rgb::linear(1.0, 0.98, 0.92), Rgb::linear(0.13, 0.14, 0.16)],
-    // Zenith
-    [Rgb::linear(0.30, 0.28, 0.35), Rgb::linear(0.28, 0.50, 0.88), Rgb::linear(0.02, 0.03, 0.09)],
-    // Horizon
-    [Rgb::linear(0.92, 0.46, 0.24), Rgb::linear(0.66, 0.80, 0.94), Rgb::linear(0.05, 0.07, 0.15)],
-]);
-
-/// MakeUp "New shoka" palette, converted from its sRGB-ish constants — an
-/// alternative preset proving the table is data, not code.
+/// Default palette: "New shoka", imported as LINEAR light.
+/// Sigmoid tonemap works well here. Changing the default look is a data edit here,
+/// nowhere else. Note the HDR horizon-day blue (1.3), which survives because
+/// the sky path carries linear f32 end-to-end.
 pub const NEW_SHOKA: Palette = Palette::new([
     [Rgb::linear(1.0, 0.588, 0.3555), Rgb::linear(0.90, 0.84, 0.79), Rgb::linear(0.048, 0.052, 0.061)],
     [Rgb::linear(0.143, 0.244, 0.365), Rgb::linear(0.143, 0.244, 0.365), Rgb::linear(0.014, 0.019, 0.025)],
@@ -248,11 +239,6 @@ pub const NEW_SHOKA: Palette = Palette::new([
 /// Convenience: elevation from a sun direction (`sun_dir().y`).
 pub fn elevation(sun: Vec3) -> f32 {
     sun.y
-}
-
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]
@@ -267,18 +253,18 @@ mod tests {
     #[test]
     fn anchors_are_pure_at_their_elevations() {
         for role in [Role::Light, Role::Zenith, Role::Horizon] {
-            assert!(close(CLASSIC.at(role, 0.9), CLASSIC.get(role, Anchor::Day)));
-            assert!(close(CLASSIC.at(role, 0.0), CLASSIC.get(role, Anchor::Sunset)));
-            assert!(close(CLASSIC.at(role, -0.9), CLASSIC.get(role, Anchor::Night)));
+            assert!(close(NEW_SHOKA.at(role, 0.9), NEW_SHOKA.get(role, Anchor::Day)));
+            assert!(close(NEW_SHOKA.at(role, 0.0), NEW_SHOKA.get(role, Anchor::Sunset)));
+            assert!(close(NEW_SHOKA.at(role, -0.9), NEW_SHOKA.get(role, Anchor::Night)));
         }
     }
 
     #[test]
     fn blend_is_continuous_across_the_horizon() {
         // Approaching elev=0 from both sides converges to the Sunset anchor.
-        let above = CLASSIC.at(Role::Horizon, 0.001);
-        let below = CLASSIC.at(Role::Horizon, -0.001);
-        let sunset = CLASSIC.get(Role::Horizon, Anchor::Sunset);
+        let above = NEW_SHOKA.at(Role::Horizon, 0.001);
+        let below = NEW_SHOKA.at(Role::Horizon, -0.001);
+        let sunset = NEW_SHOKA.get(Role::Horizon, Anchor::Sunset);
         for (got, want) in [(above, sunset), (below, sunset)] {
             assert!((got.0 - want.0).abs() < 0.02, "{got:?} vs {want:?}");
         }

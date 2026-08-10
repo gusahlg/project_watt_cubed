@@ -15,10 +15,10 @@ pub mod menu_default;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use voxel_engine::{Engine, Frame};
+use voxel_engine::Engine;
 
 use crate::block::ElementId;
-use crate::menu::{MenuEvent, MenuModel};
+use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::ui::HudElement;
 use crate::world::World;
@@ -105,6 +105,27 @@ impl ElementStash {
         true
     }
 
+    /// Take back elements, best-effort: each entry removes one of that element
+    /// if any are held. Unlike [`consume`](Self::consume) this is NOT
+    /// all-or-nothing — it is the rollback path for a server-rejected break,
+    /// where whatever was already spent elsewhere simply can't be revoked.
+    pub fn revoke(&mut self, elements: &[ElementId]) {
+        let mut removed = false;
+        for &element in elements {
+            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
+                if *count > 0 {
+                    *count -= 1;
+                    self.total -= 1;
+                    removed = true;
+                }
+            }
+        }
+        if removed {
+            self.counts.retain(|&(_, count)| count > 0);
+            self.rev += 1;
+        }
+    }
+
     /// Total elements held, across all kinds.
     pub fn total(&self) -> u32 {
         self.total
@@ -157,11 +178,16 @@ pub struct ModContext<'a> {
     pub world: &'a mut World,
     pub screen_w: i32,
     pub screen_h: i32,
-    /// True while the console or a menu is capturing keys, so mods leave input alone.
-    pub capturing_text: bool,
-    /// Whether the mouse is captured for aiming — world-affecting clicks
-    /// (breaking, placing) must only fire while it is.
-    pub mouse_locked: bool,
+    /// Keybind intents; `place` gated on mouse capture separately.
+    pub place: bool,
+    /// Placement cell resolved from the exact frame that raised `place`.
+    /// Fixed-cadence replay may run after the player has moved or looked away.
+    pub place_target: Option<(i32, i32, i32)>,
+    pub toggle_inventory: bool,
+    pub toggle_crafting: bool,
+    pub nav_up: bool,
+    pub nav_down: bool,
+    pub nav_confirm: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
     /// drains these after `mods.update` and applies each only if the cell is air
     /// and doesn't overlap the player — mods that spend resources on a placement
@@ -191,7 +217,9 @@ pub trait Mod {
     /// NOT touched — those persist across worlds.
     fn reset(&mut self) {}
 
-    /// Per-frame logic while enabled. Runs after movement, before rendering.
+    /// Cadence-controlled logic while enabled (the game's `mod_hz`). Runs
+    /// after movement, before rendering; edge inputs accumulated between
+    /// ticks are replayed in order without loss.
     fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
         let _ = (eng, ctx);
     }
@@ -200,6 +228,18 @@ pub trait Mod {
     /// to; a crafting or logging mod could too.
     fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
         let _ = (elements, world);
+    }
+
+    /// The server rejected a break this client predicted (someone else won the
+    /// cell): revoke the loot [`on_block_break`](Self::on_block_break) awarded.
+    fn on_break_rejected(&mut self, elements: &[ElementId]) {
+        let _ = elements;
+    }
+
+    /// The server rejected a placement this client predicted: refund whatever
+    /// was spent on placing a block of `id`.
+    fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
+        let _ = (id, world);
     }
 
     /// This mod's HUD contribution while enabled, as data — a list of
@@ -218,28 +258,9 @@ pub trait Mod {
         false
     }
 
-    /// Whether this mod drives and draws the out-of-game menus. A separate
-    /// discriminator so [`drive_menu`](Self::drive_menu) returning `None` keeps
-    /// meaning "no event this frame" rather than "not my job". The first
-    /// enabled mod with `handles_menus()` owns both input and visuals, so the
-    /// two can never split across mods.
-    fn handles_menus(&self) -> bool {
-        false
-    }
-
-    /// Interpret one frame of menu input against `menu`: move its cursor, edit
-    /// its text fields, and return at most one event. Only called on the mod
-    /// that [`handles_menus`](Self::handles_menus). Must never interpret what
-    /// the entries mean — that stays with the core.
-    fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
-        let _ = (eng, menu);
+    /// Optional theme override; fallback prevents breaking nav.
+    fn menu_theme(&self) -> Option<&dyn MenuTheme> {
         None
-    }
-
-    /// Draw a menu screen from its model. Only called on the mod that
-    /// [`handles_menus`](Self::handles_menus).
-    fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
-        let _ = (f, menu, screen_w, screen_h);
     }
 
     /// Serialise persistent state to a single line for the save file, or `None` if
@@ -326,6 +347,24 @@ impl Mods {
         }
     }
 
+    /// Fan a rejected-break rollback out to every enabled mod.
+    pub fn on_break_rejected(&mut self, elements: &[ElementId]) {
+        for entry in &mut self.entries {
+            if entry.enabled {
+                entry.module.on_break_rejected(elements);
+            }
+        }
+    }
+
+    /// Fan a rejected-placement refund out to every enabled mod.
+    pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
+        for entry in &mut self.entries {
+            if entry.enabled {
+                entry.module.on_place_rejected(id, world);
+            }
+        }
+    }
+
     /// Collect every enabled mod's HUD contribution, in install order (so a
     /// later mod draws over an earlier one).
     pub fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
@@ -345,37 +384,12 @@ impl Mods {
             .any(|entry| entry.module.close_overlay())
     }
 
-    /// Whether any enabled mod handles menus. When this is `false` the App
-    /// falls back to the built-in driver/renderer in [`crate::menu`] — the
-    /// guarantee that disabling the Menus mod can never brick navigation.
-    pub fn menu_driver_available(&self) -> bool {
+    /// Fallback theme ensures disabling menu mod never breaks nav.
+    pub fn menu_theme(&self) -> Option<&dyn MenuTheme> {
         self.entries
             .iter()
-            .any(|e| e.enabled && e.module.handles_menus())
-    }
-
-    /// Let the menu-handling mod interpret this frame's input. The first
-    /// enabled mod with [`Mod::handles_menus`] wins, in install order — the
-    /// same one [`draw_menu`](Self::draw_menu) picks, so input and visuals
-    /// always come from a single mod.
-    pub fn drive_menu(&mut self, eng: &Engine, menu: &mut MenuModel) -> Option<MenuEvent> {
-        for entry in &mut self.entries {
-            if entry.enabled && entry.module.handles_menus() {
-                return entry.module.drive_menu(eng, menu);
-            }
-        }
-        None
-    }
-
-    /// Let the menu-handling mod draw a menu screen (first enabled handler,
-    /// same pick as [`drive_menu`](Self::drive_menu)).
-    pub fn draw_menu(&mut self, f: &mut Frame, menu: &MenuModel, screen_w: i32, screen_h: i32) {
-        for entry in &mut self.entries {
-            if entry.enabled && entry.module.handles_menus() {
-                entry.module.draw_menu(f, menu, screen_w, screen_h);
-                return;
-            }
-        }
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.menu_theme())
     }
 
     /// Number of installed mods (for the mod menu).

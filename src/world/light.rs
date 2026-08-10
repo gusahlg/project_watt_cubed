@@ -27,6 +27,7 @@ use crate::block::registry::HotTables;
 use crate::coord::Face;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk};
+use super::neighborhood::Neighborhood;
 
 /// Maximum light level; the 4-bit domain the packed vertex stores.
 pub const MAX_LIGHT: u8 = 15;
@@ -34,26 +35,6 @@ pub const MAX_LIGHT: u8 = 15;
 pub const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
 /// Chunk size as a signed coordinate, for the `-1..=16` padded range.
 const CS: i32 = CHUNK_SIZE as i32;
-/// Padded light shell edge: the 16 chunk cells plus one shell cell each side.
-const PADL: usize = CHUNK_SIZE + 2;
-/// Cells in one [`PaddedLight`] buffer.
-const PADL_VOL: usize = PADL * PADL * PADL;
-
-// Thread-local free list of [`PaddedLight`] backing buffers. Every `PaddedLight`
-// constructor (`dark`/`full`/`open_sky`/`capture`) allocated a fresh
-// `PADL_VOL`-cell `Box<[Lumel]>` per call — the per-job light-shell churn the
-// LOD-tile mesher pays in [`build_tile_mesh`](crate::world::lod) (via
-// `open_sky`) and the streamer pays per remesh (via `capture`). Buffers are
-// reclaimed on [`Drop`] and reused. Bounded ([`PLIGHT_POOL_CAP`]) so the
-// cross-thread path (a `capture`d shell built on the main thread and dropped on
-// a worker) can only ever migrate a handful of buffers into a worker's list
-// rather than growing without bound.
-thread_local! {
-    static PLIGHT_POOL: RefCell<Vec<Box<[Lumel]>>> = const { RefCell::new(Vec::new()) };
-}
-/// Max buffers held per thread. Small: workers are long-lived and few (≤3), and a
-/// single job holds at most one live shell at a time.
-const PLIGHT_POOL_CAP: usize = 4;
 
 /// Light value: 4-bit clamped to 0..=15. Every constructor clamps or is const-checked.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -132,50 +113,46 @@ impl LightGrid {
     fn set(&mut self, idx: usize, v: Lumel) {
         self.cells[idx] = v;
     }
+    /// Copy the 16-cell x-row at `(y, z)` — cells are x-fastest, so this is
+    /// one contiguous slice copy (the shell capture's bulk read).
+    #[inline]
+    pub fn copy_row(&self, y: usize, z: usize, out: &mut [Lumel]) {
+        let base = Chunk::index(0, y, z);
+        out.copy_from_slice(&self.cells[base..base + CHUNK_SIZE]);
+    }
 }
 
 /// Light grid plus one-cell shell from 26 neighbours (coords -1..=16). Serves
 /// interior, border, and diagonal cells for smooth light across chunk borders.
-/// Settling reads only the six face layers; missing neighbours are dark.
+/// Settling reads only the six face layers; missing neighbours are dark. The
+/// light instantiation of [`Neighborhood`]: capture/index/pooling live there,
+/// shared with the mesh pass's [`Padded`](super::mesh::Padded).
 pub struct PaddedLight {
-    cells: Box<[Lumel]>, // PADL^3
+    inner: Neighborhood<Lumel>,
 }
 
 impl PaddedLight {
-    #[inline]
-    fn index(x: i32, y: i32, z: i32) -> usize {
-        (x + 1) as usize + (z + 1) as usize * PADL + (y + 1) as usize * PADL * PADL
-    }
-
-    /// A `PADL_VOL`-cell buffer, recycled from [`PLIGHT_POOL`] if one is available
-    /// (else freshly allocated). Contents are UNSPECIFIED — a recycled buffer
-    /// holds a previous job's light — so every caller must fully initialise it
-    /// (`fill` then, where partial, overwrite the touched cells) before use.
-    fn take_buf() -> Box<[Lumel]> {
-        PLIGHT_POOL
-            .with_borrow_mut(|p| p.pop())
-            .filter(|b| b.len() == PADL_VOL)
-            .unwrap_or_else(|| vec![Lumel::DARK; PADL_VOL].into_boxed_slice())
-    }
-
     /// Light at signed coord (x, y, z) in -1..=16.
     #[inline]
     pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> Lumel {
-        self.cells[Self::index(x, y, z)]
+        self.inner.at(x, y, z)
+    }
+
+    /// Flat-index read (same [`padded_index`](super::neighborhood::padded_index)
+    /// layout as [`Padded`](super::mesh::Padded)) — the sweep's stride walk.
+    #[inline]
+    pub(in crate::world) fn at_flat(&self, i: usize) -> Lumel {
+        self.inner.at_flat(i)
     }
 
     /// An all-dark shell (no neighbour light anywhere) — the neutral settle path.
     pub fn dark() -> Self {
-        let mut cells = Self::take_buf();
-        cells.fill(Lumel::DARK); // clears any recycled contents
-        Self { cells }
+        Self { inner: Neighborhood::filled(Lumel::DARK) }
     }
 
     /// An all-full-bright shell — the neutral mesher path (tests).
     pub fn full() -> Self {
-        let mut cells = Self::take_buf();
-        cells.fill(Lumel::FULL);
-        Self { cells }
+        Self { inner: Neighborhood::filled(Lumel::FULL) }
     }
 
     /// Full skylight, no blocklight — the shell equivalent of
@@ -183,80 +160,36 @@ impl PaddedLight {
     /// surface approximations open to the sky with no emitters, so their shading
     /// tracks day/night via skylight instead of clamping to a fake full emitter.
     pub fn open_sky() -> Self {
-        let mut cells = Self::take_buf();
-        cells.fill(Lumel { sky: LightLevel::FULL, block: LightLevel::DARK });
-        Self { cells }
+        Self { inner: Neighborhood::filled(Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }) }
     }
 
     /// A shell filled from a per-cell closure over signed coords `-1..=16` — for
     /// exercising the mesher's smooth-light sampling with a known field.
     #[cfg(test)]
     pub fn from_fn(f: impl Fn(i32, i32, i32) -> Lumel) -> Self {
-        let mut cells = Self::take_buf();
-        cells.fill(Lumel::DARK); // clear recycled contents; loop below covers every cell
-        for y in -1..=CS {
-            for z in -1..=CS {
-                for x in -1..=CS {
-                    cells[Self::index(x, y, z)] = f(x, y, z);
-                }
-            }
-        }
-        Self { cells }
+        Self { inner: Neighborhood::from_fn(f, Lumel::DARK) }
     }
 
     /// Copy the chunk and its shell out of the light field. `grid_at(dx, dy, dz)`
     /// yields the [`LightGrid`] at chunk-offset `(dx, dy, dz)` (each `∈ -1..=1`,
     /// `(0,0,0)` is the chunk itself), or `None` (→ dark). Mirrors
-    /// [`Padded::capture`] cell-for-cell.
+    /// [`Padded::capture`](super::mesh::Padded::capture) cell-for-cell; the
+    /// bulk fills through [`LightGrid::copy_row`]'s contiguous slice copies.
     pub fn capture<'a>(grid_at: impl Fn(i32, i32, i32) -> Option<&'a LightGrid>) -> Self {
-        let neigh: [Option<&LightGrid>; 27] =
-            std::array::from_fn(|k| grid_at(k as i32 % 3 - 1, k as i32 / 9 - 1, k as i32 / 3 % 3 - 1));
-        let get = |dx: i32, dy: i32, dz: i32| neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize];
-        let split = |c: i32| -> (i32, usize) {
-            if c < 0 {
-                (-1, CHUNK_SIZE - 1)
-            } else if c >= CS {
-                (1, 0)
-            } else {
-                (0, c as usize)
-            }
-        };
-        let mut cells = Self::take_buf();
-        // Missing neighbours must read DARK, and only present cells are written
-        // below, so a recycled buffer MUST be cleared first (else a prior job's
-        // light would leak into the unwritten shell cells — a silent visual bug).
-        cells.fill(Lumel::DARK);
-        for y in -1..=CS {
-            for z in -1..=CS {
-                for x in -1..=CS {
-                    let (dx, lx) = split(x);
-                    let (dy, ly) = split(y);
-                    let (dz, lz) = split(z);
-                    if let Some(g) = get(dx, dy, dz) {
-                        cells[Self::index(x, y, z)] = g.at(Chunk::index(lx, ly, lz));
-                    }
-                }
-            }
+        Self {
+            inner: Neighborhood::capture_rows(
+                Lumel::DARK,
+                grid_at,
+                |g: &LightGrid, lx, ly, lz| g.at(Chunk::index(lx, ly, lz)),
+                |g: &LightGrid, ly, lz, out| g.copy_row(ly, lz, out),
+            ),
         }
-        Self { cells }
     }
-}
 
-impl Drop for PaddedLight {
-    fn drop(&mut self) {
-        let buf = std::mem::take(&mut self.cells);
-        if buf.len() == PADL_VOL {
-            PLIGHT_POOL.with_borrow_mut(|p| {
-                if p.len() < PLIGHT_POOL_CAP {
-                    p.push(buf);
-                }
-            });
-        }
-    }
 }
 
 /// Six neighbour-light face layers (16x16 each) that settle reads. Interior
-/// floods locally; borders come from here. Replaces the old 18-cubed padding.
+/// floods locally; borders come from here.
 pub struct FaceShell {
     faces: [[Lumel; CHUNK_AREA]; 6], // indexed by Face as usize; near layer of each face neighbour
 }
@@ -306,8 +239,11 @@ impl FaceShell {
     }
 }
 
-/// Terrain surface height per column; determines skylight seeding. Pure function
-/// of generator (independent of chunk load order), so caves stay consistently dark.
+/// The skylight ceiling per column: the Y at and above which a column is open
+/// sky. Seeded from the generator's ground height (a pure function, so caves
+/// stay consistently dark regardless of chunk load order), then RAISED by
+/// edited opaque roofs ([`raise`](Self::raise)) so a player-built ceiling
+/// shadows every chunk below it instead of leaking full skylight.
 #[derive(Clone)]
 pub struct CeilingWindow {
     surface: [i32; CHUNK_AREA],
@@ -333,6 +269,19 @@ impl CeilingWindow {
     #[inline]
     pub(in crate::world) fn open_above(&self, lx: usize, lz: usize, world_y: i32) -> bool {
         world_y >= self.surface[lx + lz * CHUNK_SIZE]
+    }
+
+    /// Raise one column's ceiling to at least `surface` (a constructed opaque
+    /// roof: open sky begins at the cell ABOVE it). Never lowers — the
+    /// generator ground below stays the floor of the value.
+    pub(in crate::world) fn raise(&mut self, lx: usize, lz: usize, surface: i32) {
+        let cell = &mut self.surface[lx + lz * CHUNK_SIZE];
+        *cell = (*cell).max(surface);
+    }
+
+    /// The Y at which this column becomes open sky (see [`open_above`](Self::open_above)).
+    pub(in crate::world) fn surface_at(&self, lx: usize, lz: usize) -> i32 {
+        self.surface[lx + lz * CHUNK_SIZE]
     }
 }
 
@@ -378,14 +327,18 @@ pub fn propagate(
 ) {
     out.cells.fill(Lumel::DARK);
     let cs = CHUNK_SIZE as i32;
+    // Decode the opacity field ONCE (payload-specialized, ~a palette pass)
+    // into an L1-resident bitset: the flood probes it ~6 times per relaxed
+    // cell, and each probe used to be a payload dispatch + palette load.
+    let mut opaque_bits = [0u64; CHUNK_VOLUME / 64];
+    chunk.fill_opacity(|id| tables.opaque(id), &mut opaque_bits);
     let opaque_at = |x: i32, y: i32, z: i32| {
-        tables.opaque[chunk.get_local(x as usize, y as usize, z as usize).0 as usize]
+        let i = Chunk::index(x as usize, y as usize, z as usize);
+        (opaque_bits[i >> 6] >> (i & 63)) & 1 != 0
     };
 
-    // --- Skylight ---------------------------------------------------------
-    // Borrow the thread-local flood scratch out for the whole call (put back at
-    // the end). `sky`/`block` are reset to all-dark below; `queue` is emptied —
-    // so no stale flood state from a prior job survives.
+    // Skylight: borrow thread-local scratch, reset dark, seed and flood.
+    // No stale flood state from a prior job survives.
     let (mut sky, mut block, mut queue) = FLOOD.with_borrow_mut(|s| {
         (std::mem::take(&mut s.sky), std::mem::take(&mut s.block), std::mem::take(&mut s.queue))
     });
@@ -442,9 +395,7 @@ pub fn propagate(
         if z + 1 < cs { relax(x, y, z + 1, false); }
     }
 
-    // --- Blocklight -------------------------------------------------------
-    // `block` was reset to all-dark above; the sky flood drained `queue`, but
-    // clear defensively before reseeding.
+    // Blocklight: block was reset to all-dark; clear queue defensively, seed emitters, flood.
     queue.clear();
     for i in 0..CHUNK_VOLUME {
         let (x, y, z) = Chunk::local_of(i);
@@ -586,18 +537,57 @@ mod tests {
     use voxel_engine::Pass;
 
     fn tables() -> HotTables {
-        HotTables {
-            solid: vec![false, true, true].into(),
-            opaque: vec![false, true, false].into(), // id 1 opaque (stone), id 2 clear
-            layer: vec![Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
-            emission: vec![0, 0, 15].into(),         // id 2 emits 15
-        }
+        HotTables::from_parts(
+            &[false, true, true, true],
+            &[false, true, false, true], // id 1 stone, id 3 opaque emitter
+            &[false, false, false, false],
+            vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
+            vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
+            vec![0, 0, 0, 0].into(),
+        )
     }
 
     fn lit(chunk: &Chunk) -> LightGrid {
         let mut grid = LightGrid::dark();
         propagate(chunk, &FaceShell::dark(), &CeilingWindow::open(), 0, &tables(), &mut grid);
         grid
+    }
+
+    /// Full settle-flood cost for a surface-band chunk — the gauge for the
+    /// propagate opacity-bitset redesign. Ignored: a timing benchmark, not a
+    /// correctness gate. Run with
+    /// `cargo test --release light_propagate_throughput -- --ignored --nocapture`.
+    /// 2026-07-19 (12-core box), per-probe `get_local`: ~18.1k settles/s;
+    /// decoded opacity bitset: ~32.6k settles/s (1.8×).
+    #[test]
+    #[ignore]
+    fn light_propagate_throughput() {
+        use crate::block::registry::BlockRegistry;
+        use crate::world::generation::{SineHills, TerrainGenerator};
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 5);
+        // The surface chunk at the origin: the Dense band every load floods
+        // (deep/sky chunks take the analytic fast paths and never get here).
+        let cy = generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let chunk = Chunk::new(0, cy, 0, &generator);
+        let tables = registry.hot_tables();
+        let shell = FaceShell::dark();
+        let ceiling = CeilingWindow::from_heights(|lx, lz| generator.height(lx as i32, lz as i32));
+        let mut out = LightGrid::dark();
+
+        const N: usize = 4000;
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            propagate(&chunk, &shell, &ceiling, cy * CHUNK_SIZE as i32, &tables, &mut out);
+            std::hint::black_box(&out);
+        }
+        let dt = start.elapsed();
+        println!(
+            "{N} propagates in {:.3}s = {:.0} settles/s",
+            dt.as_secs_f64(),
+            N as f64 / dt.as_secs_f64()
+        );
     }
 
     #[test]
@@ -610,6 +600,20 @@ mod tests {
         let mut got = LightGrid::dark();
         propagate(&opaque, &FaceShell::dark(), &CeilingWindow::from_heights(|_, _| 100), -160, &tables, &mut got);
         assert!(got == LightGrid::dark(), "uniform opaque == dark()");
+        // Opaque does not imply dark: an opaque emitter must bypass the analytic
+        // shortcut and seed blocklight in the regular propagation path.
+        let emissive = Chunk::from_uniform(0, -10, 0, BlockId(3));
+        assert!(!emissive.is_uniform_opaque(&tables));
+        let mut got = LightGrid::dark();
+        propagate(
+            &emissive,
+            &FaceShell::dark(),
+            &CeilingWindow::from_heights(|_, _| 100),
+            -160,
+            &tables,
+            &mut got,
+        );
+        assert_eq!(got.at(Chunk::index(8, 8, 8)).block, LightLevel::FULL);
         // Uniform air fully open to the sky → full sky, no blocklight.
         let air = Chunk::from_uniform(0, 10, 0, BlockId(0));
         let mut got = LightGrid::dark();
@@ -622,13 +626,13 @@ mod tests {
         // A full opaque layer at y=5 seals the lower half: with no gap for the
         // horizontal skylight flood to leak through, everything below is dark,
         // while the open cells above are lit to the layer.
-        let mut cells = [0u8; CHUNK_VOLUME];
+        let mut cells = [BlockId(0); CHUNK_VOLUME];
         for z in 0..16 {
             for x in 0..16 {
-                cells[Chunk::index(x, 5, z)] = 1; // opaque floor across the chunk
+                cells[Chunk::index(x, 5, z)] = BlockId(1); // opaque floor across the chunk
             }
         }
-        let chunk = Chunk::from_dense(0, 0, 0, Box::new(cells));
+        let chunk = Chunk::from_cells(0, 0, 0, Box::new(cells));
         let grid = lit(&chunk);
 
         assert_eq!(grid.at(Chunk::index(4, 15, 4)).sky, LightLevel::FULL, "top lit");
@@ -637,12 +641,91 @@ mod tests {
         assert_eq!(grid.at(Chunk::index(0, 0, 0)).sky, LightLevel::DARK, "floor sealed dark");
     }
 
+    /// A player-built roof in the chunk above must stop the analytic per-column
+    /// skylight seed in the chunk below: the ceiling window is raised by edited
+    /// opaque cells and the edit invalidates the cached column.
+    #[test]
+    fn constructed_roof_in_upper_chunk_shadows_lower_chunk() {
+        use crate::coord::ChunkCoord;
+        use crate::world::World;
+
+        // Safely above terrain and the flying-island band, exactly on a chunk
+        // boundary so the roof occupies local y=0 of the upper chunk.
+        const ROOF_Y: i32 = 400;
+        let lower_cy = ROOF_Y.div_euclid(CS) - 1;
+        let lower_y0 = lower_cy * CS;
+        let lower_coord = ChunkCoord::new(0, lower_cy, 0);
+
+        let mut world = World::new(0x5EED);
+        let before = world.capture_ceiling(lower_coord);
+        assert!(before.open_above(8, 8, ROOF_Y), "fixture starts open to sky");
+
+        let stone = world.registry().id_by_name("Stone").expect("builtin Stone");
+        for z in 0..CS {
+            for x in 0..CS {
+                world.set_block(x, ROOF_Y, z, stone);
+            }
+        }
+
+        // The ceiling moved, so every LOADED chunk below the roof in this
+        // column is owed a re-settle (the roof chunk itself is unloaded here,
+        // so any worklist entry in the column proves the cascade fired).
+        assert!(
+            world.light_worklist.iter().any(|c| c.x == 0 && c.z == 0),
+            "raising a column's ceiling must re-seed the loaded chunks below it"
+        );
+
+        let ceiling = world.capture_ceiling(lower_coord);
+
+        // Settle the real upper neighbour containing the opaque roof.
+        let mut roof_cells = [BlockId(0); CHUNK_VOLUME];
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                roof_cells[Chunk::index(x, 0, z)] = BlockId(1);
+            }
+        }
+        let roof = Chunk::from_cells(0, lower_cy + 1, 0, Box::new(roof_cells));
+        let mut roof_light = LightGrid::dark();
+        propagate(
+            &roof,
+            &FaceShell::dark(),
+            &ceiling,
+            ROOF_Y,
+            &tables(),
+            &mut roof_light,
+        );
+        assert_eq!(
+            roof_light.at(Chunk::index(8, 0, 8)).sky,
+            LightLevel::DARK,
+            "the roof's lower face is dark",
+        );
+
+        let upper_shell =
+            FaceShell::capture(|face| (face == Face::PosY).then_some(&roof_light));
+        let lower = Chunk::from_uniform(0, lower_cy, 0, BlockId(0));
+        let mut lower_light = LightGrid::dark();
+        propagate(
+            &lower,
+            &upper_shell,
+            &ceiling,
+            lower_y0,
+            &tables(),
+            &mut lower_light,
+        );
+
+        assert_eq!(
+            lower_light.at(Chunk::index(8, CHUNK_SIZE - 1, 8)).sky,
+            LightLevel::DARK,
+            "the constructed roof must shadow the chunk directly below it",
+        );
+    }
+
     #[test]
     fn cave_in_a_deep_chunk_is_dark() {
         // A hollow chunk whose top is far below the terrain surface: the ceiling
         // reports the top as closed, so no skylight is seeded and the cavern is
         // dark — consistently, regardless of the 16-cell chunk alignment.
-        let chunk = Chunk::from_dense(0, -8, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let chunk = Chunk::from_cells(0, -8, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 40); // surface well above this chunk
         let mut grid = LightGrid::dark();
         propagate(&chunk, &FaceShell::dark(), &ceiling, -128, &tables(), &mut grid);
@@ -653,7 +736,7 @@ mod tests {
 
     #[test]
     fn blocklight_falls_off_by_one_per_step() {
-        let mut chunk = Chunk::from_dense(0, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let mut chunk = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         chunk.set_local(8, 8, 8, BlockId(2)); // emitter, level 15
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // fully underground: isolate blocklight
         let mut grid = LightGrid::dark();
@@ -710,9 +793,9 @@ mod tests {
     #[test]
     fn settle_reaches_a_fixpoint_across_a_border() {
         let tables = tables();
-        let mut left_c = Chunk::from_dense(0, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let mut left_c = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         left_c.set_local(14, 8, 8, BlockId(2)); // emitter near the +X border
-        let right_c = Chunk::from_dense(1, 0, 0, Box::new([0u8; CHUNK_VOLUME]));
+        let right_c = Chunk::from_cells(1, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         let ceiling = CeilingWindow::from_heights(|_, _| 100); // underground: isolate blocklight
 
         // Shell with one neighbour across face (dark elsewhere).
@@ -741,4 +824,5 @@ mod tests {
         // The torch light actually crossed the border (right chunk's near cell lit).
         assert!(right.at(Chunk::index(0, 8, 8)).block.get() > 0, "light crossed the seam");
     }
+
 }

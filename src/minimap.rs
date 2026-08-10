@@ -7,7 +7,7 @@
 //! throttle. The per-frame [`Minimap::draw`] is just one textured quad, so it
 //! costs two triangles regardless of the raster resolution.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use voxel_engine::{Color, Engine, Frame, IVec2, Vec2};
 
@@ -60,21 +60,17 @@ pub struct Minimap {
     /// Per-texel top-solid height, scratch for slope shading (`size²`).
     top_y: Vec<i32>,
     /// The block column the current raster is centered on (`None` = never built).
+    /// The recenter half of the refresh gate compares the player against this
+    /// directly; the throttle half rides the scheduler's interval gate, so no
+    /// `Instant` lives here.
     center: Option<IVec2>,
-    last_refresh: Option<Instant>,
 }
 
 impl Minimap {
     pub fn new(cfg: MinimapConfig) -> Self {
         assert_eq!(cfg.size, 256, "minimap size must match engine MINIMAP_SIZE");
         let texels = cfg.size as usize * cfg.size as usize;
-        Self {
-            cfg,
-            rgba: vec![0u8; texels * 4],
-            top_y: vec![i32::MIN; texels],
-            center: None,
-            last_refresh: None,
-        }
+        Self { cfg, rgba: vec![0u8; texels * 4], top_y: vec![i32::MIN; texels], center: None }
     }
 
     /// Toggle between north-up (fixed map, spinning marker) and heading-up
@@ -86,17 +82,32 @@ impl Minimap {
         };
     }
 
-    /// Throttled + recenter-gated rescan: when due, rebuilds `rgba` from the
-    /// world's top-solid columns (colour × slope-shade) and uploads it via
-    /// [`Engine::update_minimap`].
-    pub fn refresh(&mut self, eng: &mut Engine, world: &World, player_col: IVec2, now: Instant) {
-        // Gate: skip if we refreshed recently AND the raster is still centered
-        // close enough to the player.
-        if let (Some(t), Some(c)) = (self.last_refresh, self.center) {
-            let moved = (player_col.x - c.x).abs().max((player_col.y - c.y).abs());
-            if now - t < self.cfg.refresh_every && moved < self.cfg.recenter_after as i32 {
-                return;
+    /// Whether a rebuild is due: never built, OR the throttle elapsed, OR the
+    /// player moved past the recenter distance.
+    pub fn due(&self, player_col: IVec2, interval_elapsed: bool) -> bool {
+        match self.center {
+            None => true,
+            Some(c) => {
+                let moved = (player_col.x - c.x).abs().max((player_col.y - c.y).abs());
+                interval_elapsed || moved >= self.cfg.recenter_after as i32
             }
+        }
+    }
+
+    /// Throttled + recenter-gated rescan: when [`Self::due`], rebuilds `rgba`
+    /// from the world's top-solid columns (colour × slope-shade) and uploads it
+    /// via [`Engine::update_minimap`]. `interval_elapsed` is the scheduler's
+    /// throttle decision. Returns `true` when it rebuilt, so the caller resets
+    /// the scheduler's interval gate on the attempt.
+    pub fn refresh(
+        &mut self,
+        eng: &mut Engine,
+        world: &World,
+        player_col: IVec2,
+        interval_elapsed: bool,
+    ) -> bool {
+        if !self.due(player_col, interval_elapsed) {
+            return false;
         }
 
         let size = self.cfg.size as i32;
@@ -105,7 +116,6 @@ impl Minimap {
         let x1 = x0 + size - 1;
         let z1 = z0 + size - 1;
 
-        // Void-fill the raster and reset heights.
         let void = self.cfg.void;
         for px in self.rgba.chunks_exact_mut(4) {
             px.copy_from_slice(&[void.r, void.g, void.b, void.a]);
@@ -155,7 +165,7 @@ impl Minimap {
 
         eng.update_minimap(&self.rgba);
         self.center = Some(player_col);
-        self.last_refresh = Some(now);
+        true
     }
 
     /// Draw the map, border, and player marker. Between raster refreshes the
@@ -229,6 +239,28 @@ fn draw_player_marker(f: &mut Frame, center: Vec2, angle: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refresh gate is (never-built OR throttle-elapsed OR moved ≥ recenter).
+    #[test]
+    fn refresh_gate_is_the_dual_or_of_throttle_and_recenter() {
+        let mut map = Minimap::new(MinimapConfig::DEFAULT);
+        let recenter = MinimapConfig::DEFAULT.recenter_after as i32;
+
+        // Never built: always due, regardless of the throttle.
+        assert!(map.due(IVec2::new(0, 0), false), "never-built is always due");
+
+        // Pretend a rebuild happened centered at the origin.
+        map.center = Some(IVec2::new(0, 0));
+
+        // Built, throttle not elapsed, still close: skip.
+        assert!(!map.due(IVec2::new(recenter - 1, 0), false), "recent + close ⇒ skip");
+        // Built, throttle elapsed, still close: the interval half fires.
+        assert!(map.due(IVec2::new(recenter - 1, 0), true), "throttle elapsed ⇒ due");
+        // Built, throttle not elapsed, moved past recenter: the recenter half fires.
+        assert!(map.due(IVec2::new(recenter, 0), false), "moved ≥ recenter ⇒ due");
+        // Distance is the Chebyshev max of the two axes.
+        assert!(map.due(IVec2::new(0, recenter), false), "recenter checks either axis");
+    }
 
     #[test]
     fn heading_up_rotates_world_forward_to_screen_up() {

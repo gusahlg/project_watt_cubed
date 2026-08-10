@@ -2,9 +2,14 @@
 //! coordinate mapping, and the registry/seed accessors. Code motion only:
 //! these are `World` methods; the struct itself lives in `mod.rs`.
 
+use std::sync::Arc;
+
+use glam::{IVec3, UVec3};
+
+use crate::audio::acoustics::{AcousticWindow, Cell};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 use crate::coord::BlockCoord;
-use crate::math::{Aabb, block_coord};
+use crate::math::{Aabb, block_coord, block_coord_end};
 use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
@@ -15,6 +20,11 @@ impl World {
     /// The seed this world was generated from.
     pub fn seed(&self) -> i64 {
         self.generator.seed
+    }
+
+    /// Incremented when blocks are edited.
+    pub fn edit_generation(&self) -> u64 {
+        self.edit_generation
     }
 
     /// The block palette, for resolving ids to names, properties, and the hot
@@ -80,11 +90,8 @@ impl World {
         z1: i32,
         mut paint: impl FnMut(i32, i32, i32, Color),
     ) {
-        // Calls paint only for columns with top solid; caller pre-fills void.
         // Bucket the footprint's vertical stacks in one pass over `chunks` and
-        // one sort, keyed by dense grid cell — no hashing. The old loop
-        // rescanned every loaded chunk once for every x/z chunk column in the
-        // minimap footprint (hundreds of full map scans per refresh).
+        // one sort, keyed by dense grid cell — no hashing.
         let s = CHUNK_SIZE as i32;
         let (cx0, cx1) = (x0.div_euclid(s), x1.div_euclid(s));
         let (cz0, cz1) = (z0.div_euclid(s), z1.div_euclid(s));
@@ -165,16 +172,15 @@ impl World {
     /// box touches (1–8 for anything player-sized) instead of one per cell,
     /// and a uniform chunk answers for all its cells with one solidity load.
     pub fn collides(&self, aabb: &Aabb) -> bool {
-        // TODO Stage 1: dedupe with Aabb::voxel_cells — this re-derives the same
-        // cell range but needs it grouped-by-chunk (one map probe per chunk),
-        // which voxel_cells' flat per-cell iterator doesn't provide; routing
-        // through it would change the iteration order/perf, so defer.
-        // Same cell range as `Aabb::voxel_cells`: block_coord(min)..=block_coord(max)
-        // (the shared clamped floor, so a box at the world border stays in i32).
+        // Same cell range as `Aabb::voxel_cells` (shared clamped floor and
+        // exclusive-upper-edge helpers, so a box at the world border stays in
+        // i32 and exact face contact does not visit the touching next voxel),
+        // but grouped by owning chunk — voxel_cells' flat per-cell iterator
+        // can't provide the one-map-probe-per-chunk order this hot path needs.
         let (min, max) = (aabb.min(), aabb.max());
-        let (x0, x1) = (block_coord(min.x), block_coord(max.x));
-        let (y0, y1) = (block_coord(min.y), block_coord(max.y));
-        let (z0, z1) = (block_coord(min.z), block_coord(max.z));
+        let (x0, x1) = (block_coord(min.x), block_coord_end(max.x));
+        let (y0, y1) = (block_coord(min.y), block_coord_end(max.y));
+        let (z0, z1) = (block_coord(min.z), block_coord_end(max.z));
 
         let s = CHUNK_SIZE as i32;
         for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
@@ -208,6 +214,74 @@ impl World {
             }
         }
         false
+    }
+
+    /// An immutable acoustic snapshot of the cube `[center − r, center + r]³`, for
+    /// the audio kernel's occlusion DDA. `radius` is clamped so the window edge stays
+    /// within [`MAX_WINDOW_DIM`](crate::audio::acoustics::MAX_WINDOW_DIM): `dim =
+    /// 2r + 1 ≤ 96` ⇒ `r ≤ 47`.
+    ///
+    /// Cell mapping (one [`HotTables`](crate::block::registry::HotTables) snapshot at
+    /// entry — never per-voxel registry calls): a whole missing chunk reads
+    /// [`Unloaded`](Cell::Unloaded); otherwise a solid, non-passable block is
+    /// [`Solid`](Cell::Solid) with its derived absorption and everything else
+    /// (air, water) is [`Open`](Cell::Open). Passable liquids derive absorption `0`,
+    /// so `solid && absorption > 0` exactly selects occluding walls; water/air stay
+    /// Open for occlusion and the listener's medium is decided elsewhere.
+    ///
+    /// Cell layout is z-outer, y-mid, x-inner with `origin = center − r`:
+    /// `index = (dz · dim + dy) · dim + dx`, `d* = world − origin` — matching
+    /// [`AcousticWindow::cell`](crate::audio::acoustics::AcousticWindow::cell).
+    pub fn capture_acoustic_window(&self, center: IVec3, radius: u32) -> Arc<AcousticWindow> {
+        let r = radius.min(47) as i32;
+        let dim = (2 * r + 1) as usize;
+        let origin = center - IVec3::splat(r);
+        // Missing chunks stay Unloaded by leaving their cells untouched.
+        let mut cells = vec![Cell::Unloaded; dim * dim * dim].into_boxed_slice();
+
+        let hot = self.registry.hot_tables();
+        let occlude = |id: BlockId| {
+            let absorption = hot.absorption(id);
+            if hot.solid(id) && absorption > 0 {
+                Cell::Solid { absorption }
+            } else {
+                Cell::Open
+            }
+        };
+
+        let s = CHUNK_SIZE as i32;
+        let hi = origin + IVec3::splat(dim as i32 - 1); // inclusive far corner
+        for cx in origin.x.div_euclid(s)..=hi.x.div_euclid(s) {
+            for cy in origin.y.div_euclid(s)..=hi.y.div_euclid(s) {
+                for cz in origin.z.div_euclid(s)..=hi.z.div_euclid(s) {
+                    let Some(loaded) = self.chunks.get(&Coord::new(cx, cy, cz)) else {
+                        continue; // whole chunk unloaded → cells remain Unloaded
+                    };
+                    let uniform = loaded.chunk.uniform().map(&occlude);
+                    let xs = origin.x.max(cx * s)..=hi.x.min((cx + 1) * s - 1);
+                    let ys = origin.y.max(cy * s)..=hi.y.min((cy + 1) * s - 1);
+                    let zs = origin.z.max(cz * s)..=hi.z.min((cz + 1) * s - 1);
+                    for wz in zs {
+                        let dz = (wz - origin.z) as usize;
+                        for wy in ys.clone() {
+                            let dy = (wy - origin.y) as usize;
+                            for wx in xs.clone() {
+                                let dx = (wx - origin.x) as usize;
+                                let cell = uniform.unwrap_or_else(|| {
+                                    let (_, l) = BlockCoord::new(wx, wy, wz).split();
+                                    occlude(loaded.chunk.get_local(l.lx(), l.ly(), l.lz()))
+                                });
+                                cells[(dz * dim + dy) * dim + dx] = cell;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let win = AcousticWindow::new(origin, UVec3::splat(dim as u32), cells)
+            .expect("dim ≤ MAX_WINDOW_DIM and size·product == cells.len() by construction");
+        Arc::new(win)
     }
 
     /// The chunk coordinate an absolute world position falls in.

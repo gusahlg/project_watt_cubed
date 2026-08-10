@@ -10,9 +10,10 @@
 //! The editable line itself is a shared [`TextInput`], so cursor movement,
 //! history recall, word/line deletion, and Tab-completion all come for free and
 //! behave identically here and in any other text field.
-use voxel_engine::{Color, Engine, Frame, Key};
+use voxel_engine::{Color, Frame};
 
 use crate::command::COMMAND_NAMES;
+use crate::input::intent::EditKey;
 use crate::ui::{common_prefix, Completion, Line, Ring, Role, TextInput};
 
 /// Longest input line we accept.
@@ -37,13 +38,10 @@ impl Console {
         }
     }
 
-    /// Whether the console is open and capturing keystrokes.
     pub fn is_open(&self) -> bool {
         self.active
     }
 
-    /// Open the console. `slash` pre-fills a leading `/` (so pressing `/` starts a
-    /// command without the user retyping it).
     pub fn open(&mut self, slash: bool) {
         self.active = true;
         self.input.clear();
@@ -52,37 +50,28 @@ impl Console {
         }
     }
 
-    /// Close the console and discard the in-progress line (history is kept).
     pub fn close(&mut self) {
         self.active = false;
         self.input.clear();
     }
 
-    /// Append a system/status line (the default role).
     pub fn print(&mut self, line: impl Into<String>) {
         self.push(Line::of(Role::Dim, line));
     }
 
-    /// Echo a command the user submitted.
     pub fn echo(&mut self, line: impl Into<String>) {
         self.push(Line::of(Role::Accent, format!("> {}", line.into())));
     }
 
-    /// Append a pre-built line — the entry point for multi-colour lines (a
-    /// coloured player name, a highlighted value) that `print`/`echo` can't build.
     pub fn push(&mut self, line: Line) {
         self.log.push(line);
     }
 
-    /// Process this frame's input. Returns the submitted line when the user
-    /// presses Enter (trimmed and non-empty), otherwise `None`. Esc closes the
-    /// console; an ambiguous Tab prints its candidate list to the log.
-    pub fn handle_input(&mut self, eng: &Engine) -> Option<String> {
-        if eng.is_key_pressed(Key::Escape) {
-            self.close();
-            return None;
-        }
-        let submitted = self.input.handle(eng);
+    /// Process input characters and an edit key. Returns submitted line (trimmed,
+    /// non-empty), else `None`. Tab shows candidates; closing on Esc is the
+    /// caller's job (it owns the event).
+    pub fn handle_input(&mut self, chars: &[char], edit: Option<EditKey>) -> Option<String> {
+        let submitted = self.input.handle(chars, edit);
         if let Some(candidates) = self.input.take_notice() {
             self.print(candidates.join("   "));
         }
@@ -93,8 +82,6 @@ impl Console {
         None
     }
 
-    /// Draw the scrollback log (always, when non-empty) and, while open, the input
-    /// line with a caret at the cursor. Kept at the bottom of the screen.
     pub fn draw(&self, f: &mut Frame, screen_w: i32, screen_h: i32) {
         let fs = 20;
         let line_h = fs + 4;
@@ -135,9 +122,6 @@ impl Default for Console {
     }
 }
 
-/// Tab-completion source for the console: complete the command word (the first
-/// token) against [`COMMAND_NAMES`], preserving a leading `/`. Once a space has
-/// been typed the command is chosen, so we stop offering completions.
 fn complete_command(input: &str) -> Completion {
     let body = input.strip_prefix('/').unwrap_or(input);
     if body.is_empty() || body.contains(char::is_whitespace) {

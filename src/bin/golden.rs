@@ -16,25 +16,17 @@
 use std::time::Duration;
 
 use project_watt_cubed::harness::{
-    Acceptance, Criterion, GOLDEN_SEED, Phase, golden_shots, run_acceptance, run_verdict,
+    Acceptance, Criterion, GOLDEN_SEED, Phase, golden_shots, run_acceptance,
 };
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Verdict column: `golden verdict <v1|v2|v3>` captures the four verdict shots
-    // for that variant and exits — no criteria run. V3's tonemap half is selected
-    // here so the tag is the ONLY thing the operator varies.
-    if let Some(i) = args.iter().position(|a| a == "verdict") {
-        let tag = args.get(i + 1).map(String::as_str).unwrap_or("v1");
-        if tag == "v3" {
-            // SAFETY: single-threaded this early; read once at pipeline creation.
-            unsafe { std::env::set_var("WATT_TONEMAP", "makeup") };
-        }
-        let failed = run_verdict(tag);
-        std::process::exit(if failed == 0 { 0 } else { 1 });
-    }
-
+    // The harness's render lanes are a typed property of each stage
+    // (`RenderConfig::golden`): tiles ON (the far-field filler the `SkyHoleCount`
+    // detector needs — without it the chunk→tile handoff band reads as bare sky)
+    // and blocklight ON (`cave_interior`'s emitter; a no-op for the emitter-free
+    // shots). Threaded through `Game::scripted` / `scripted_config`, not env vars.
     let bless = args.iter().any(|a| a == "bless");
     // Phase advances as the project does; default to the latest implemented (E).
     // `--phase <pre-A|A|B|C|D|E>` overrides — the sweep is cumulative, so it

@@ -5,14 +5,20 @@
 //! or return to the menu.
 use std::time::Instant;
 
-use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Key, MouseButton, Vec2, Vec3};
+use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Key, Vec2};
 
+use crate::audio::{
+    AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
+};
 use crate::avatar::Pose;
 use crate::block::AIR;
+use crate::camera::{CameraMode, FlyAxes, GameCamera, ViewPose};
 use crate::command;
-use crate::harness::{CameraPose, DebugView};
 use crate::console::{self, Console};
-use crate::ui::{self, Anchor, Theme};
+use crate::derived::{Memo, Revision};
+use crate::harness::{CameraPose, DebugView};
+use crate::input::intent::{GameplayEvent, GameplayState, GlobalEvent, MenuEvent};
+use crate::input::router::{Context, Router, View};
 use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
@@ -21,16 +27,14 @@ use crate::mods::{ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
+use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility, WireAction};
 use crate::save;
+use crate::sched::{Ctx as SchedCtx, RateGate};
 use crate::settings::Settings;
 use crate::sim::Simulation;
-use crate::sky::Sky;
+use crate::sky::{Sky, SkyFrame};
+use crate::ui::{self, Anchor, HudMode, Theme};
 use crate::world::World;
-
-/// How far the player can reach to break a block, in world units.
-const REACH: f64 = 6.0;
-/// Peers past this distance get no floating name tag (it would be unreadable).
-const TAG_RANGE: f64 = 90.0;
 
 /// What a game update wants the app to do next.
 pub enum Signal {
@@ -40,65 +44,474 @@ pub enum Signal {
     ExitToMenu,
 }
 
+/// Everything [`Game::compose_phase`] decides before frame recording starts:
+/// the camera pose, the composed per-frame lighting truth, and peer render
+/// poses — handed read-only to the scene and HUD phases. HUD strings stay in
+/// their `Game`-side caches (no per-frame `String` clones into the scene).
+struct Scene {
+    pose: ViewPose,
+    camera: Camera3D,
+    /// The one clock sample every sun consumer shares this frame.
+    sky_frame: SkyFrame,
+    peers: Vec<PeerDraw>,
+    frame_uniforms: voxel_engine::skeleton::FrameUniformsGpu,
+    clear: voxel_engine::LinearRgb,
+    debug_flat: Option<Color>,
+    screen: (i32, i32),
+    dt: f32,
+}
+
+/// Lighting/clear state for a profile whose sky and animation inputs are
+/// frozen (weather, clouds, water animation, and exposure all disabled).
+/// Wrapped-water coordinates are cached independently so camera motion does
+/// not force the palette and lighting packet to be recomposed.
+#[derive(Clone, Copy)]
+struct StaticFrame {
+    uniforms: voxel_engine::skeleton::FrameUniformsGpu,
+    clear: voxel_engine::LinearRgb,
+}
+
+/// One frame's routed input, snapshotted into plain data by
+/// [`Game::input_phase`] so the router borrow ends before later phases take
+/// `&mut Engine`. Which fields are live depends on the frame's exclusive
+/// context: `is_text` carries the console's typing, everything else gameplay.
+#[derive(Default)]
+struct FrameInput {
+    is_text: bool,
+    text_chars: Vec<char>,
+    text_edit: Option<crate::input::intent::EditKey>,
+    move_input: Option<movement::MoveInput>,
+    look_delta: Vec2,
+    fly_axes: FlyAxes,
+    do_break: bool,
+    do_place: bool,
+    toggle_inventory: bool,
+    toggle_crafting: bool,
+    nav_up: bool,
+    nav_down: bool,
+    nav_confirm: bool,
+    open_console: bool,
+    open_chat: bool,
+    toggle_capture: bool,
+    /// Push-to-talk held this frame (level, not edge — see `GameplayState::PushToTalk`).
+    ptt: bool,
+    g_escape: bool,
+    g_hud: bool,
+    g_shot: bool,
+    g_minimap: bool,
+}
+
+/// Mutable adapters owned by the overlay phase. Grouping them makes the phase
+/// boundary explicit and prevents its call site from becoming an untyped list
+/// of unrelated mutable references.
+struct OverlayPhase<'a> {
+    input: &'a FrameInput,
+    eng: &'a mut Engine,
+    router: &'a mut Router,
+    mods: &'a mut Mods,
+    settings: &'a mut Settings,
+    sound: &'a mut SoundSystem,
+    events: &'a mut Vec<SoundEvent>,
+}
+
+/// Owned/read-only facts plus the two audio committers for the final update
+/// phase. In particular, `events` moves exactly once into the director.
+struct AudioPhase<'a> {
+    dt: f32,
+    input: &'a FrameInput,
+    sound: &'a mut SoundSystem,
+    audio: &'a mut AudioDirector,
+    settings: &'a Settings,
+    events: Vec<SoundEvent>,
+    active: bool,
+}
+
+/// Edge-triggered mod intents from one render frame, retained in order when
+/// mod updates run at a fixed cadence.
+#[derive(Clone, Copy, Default)]
+struct PendingModInput {
+    place: bool,
+    /// Cell selected by the edge frame's player pose. Cadence-delayed mod
+    /// replay must not re-raycast from a later camera direction.
+    place_target: Option<(i32, i32, i32)>,
+    toggle_inventory: bool,
+    toggle_crafting: bool,
+    nav_up: bool,
+    nav_down: bool,
+    nav_confirm: bool,
+}
+
+impl PendingModInput {
+    fn capture(
+        input: &FrameInput,
+        allow_place: bool,
+        allow_ui: bool,
+        place_target: Option<(i32, i32, i32)>,
+    ) -> Self {
+        let place = allow_place && input.do_place;
+        Self {
+            place,
+            place_target: place.then_some(place_target).flatten(),
+            toggle_inventory: allow_ui && input.toggle_inventory,
+            toggle_crafting: allow_ui && input.toggle_crafting,
+            nav_up: allow_ui && input.nav_up,
+            nav_down: allow_ui && input.nav_down,
+            nav_confirm: allow_ui && input.nav_confirm,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.place
+            || self.toggle_inventory
+            || self.toggle_crafting
+            || self.nav_up
+            || self.nav_down
+            || self.nav_confirm
+    }
+
+    fn clear_ui(&mut self) {
+        self.toggle_inventory = false;
+        self.toggle_crafting = false;
+        self.nav_up = false;
+        self.nav_down = false;
+        self.nav_confirm = false;
+    }
+}
+
+/// One optimistic edit awaiting the server's verdict: everything needed to
+/// undo it if the verdict is a rejection.
+struct PendingEdit {
+    cell: (i32, i32, i32),
+    /// What the cell held before the optimistic apply.
+    prev: crate::block::BlockId,
+    kind: PendingKind,
+}
+
+/// The economy side of a pending edit — what to give back on rejection.
+enum PendingKind {
+    /// Breaking awarded these elements; a rejection revokes them.
+    Break(Vec<crate::block::ElementId>),
+    /// Placing spent one crafted block of this id; a rejection refunds it.
+    Place(crate::block::BlockId),
+}
+
 /// The live world the player is in.
 pub struct Game {
     world: World,
     player: Player,
-    sim: Simulation,
+    /// First/third person and freecam modes, plus shake effects.
+    camera: GameCamera,
     console: Console,
-    /// When locked the mouse drives the camera and clicks break blocks; when
-    /// unlocked the cursor moves freely (for windows/menus).
-    mouse_locked: bool,
     /// The save slot this world belongs to.
     save_name: String,
     /// The live server connection when playing multiplayer; `None` in singleplayer.
     /// The player simulates locally and the server keeps everyone in sync.
     net: Option<Connection>,
-    /// Cached HUD coordinate line: the displayed values change far less often
-    /// than the frame rate, so the format!/measure pair runs only on change.
-    coord_cache: (i64, i64, i64, String),
+    /// Rollback bookkeeping for optimistic edits awaiting a server verdict,
+    /// keyed by the connection's request id: what the cell held before, and
+    /// what the economy optimistically did (loot gained, item spent).
+    pending_edits: std::collections::HashMap<u32, PendingEdit>,
+    /// Animation state for the player's own third-person body — the same
+    /// machine each remote player carries.
+    local_anim: presence::Animator,
+    /// The local walk-cycle phase, accumulated from horizontal travel, same as a peer's.
+    local_gait: f64,
+    /// Cached HUD coordinate line, keyed by the 0.1-block-quantized position —
+    /// `format!` reruns only when the quantized position changes.
+    coord_cache: Memo<[i64; 3], String>,
     /// In-world UI look and HUD visibility (see [`ui::Theme`]).
     theme: Theme,
     /// Day/night clock, atmosphere colour, weather, and the lighting edge into
     /// voxel shading (see [`crate::sky`]).
     sky: Sky,
     /// Top-down minimap: throttled terrain raster drawn in the HUD corner.
-    minimap: Minimap,
+    /// `None` when the minimap lane is disabled — no raster state retained,
+    /// no refresh clock read, no draw.
+    minimap: Option<Minimap>,
     /// What the app renders: `Normal` play, or `TerrainKey` for the
     /// harness's sky-hole detector (flat terrain key, sky/fog passes disabled).
     debug_view: DebugView,
-    /// Monotone frame counter driving the temporal (dither) sequence — the game
-    /// owns this truth; the engine exposes no frame index.
-    frame_index: u64,
+    /// Golden-harness capture mode: the pose is pinned by [`teleport`](Self::teleport)
+    /// and the clock by [`set_day`](Self::set_day), so `update` consumes NO live
+    /// input and does NOT advance the clock. Without this a stray desktop cursor
+    /// or keypress (the window has focus while the harness runs) rotates the
+    /// camera or drifts physics, and per-frame `sky.tick` walks the day off its
+    /// pin over the streaming frames before capture — either silently corrupts
+    /// the blessed shot.
+    scripted: bool,
+    /// The typed look/lane config this game draws with (was the `WATT_CLOUDS`/
+    /// `WATT_WEATHER` env reads). `compose` reads the per-frame look lanes from
+    /// it. The live path uses [`RenderConfig::default`]; the harness pins
+    /// [`RenderConfig::golden`] via [`scripted`](Self::scripted). Read per frame,
+    /// so live toggling is possible if ever wanted.
+    render: crate::render_config::RenderConfig,
+    /// The producer scheduler owns the fixed-tick
+    /// sim lane (registered in [`Game::new`]); other lanes still run directly
+    /// in `stream_phase` and migrate in one at a time.
+    sched: crate::sched::Scheduler,
+    /// The sim producer's id, kept so the `simulation` settings gate can
+    /// enable/disable the lane on the scheduler instead of tearing it out.
+    sim_source: voxel_engine::producer::SourceId,
+    /// The autosave interval gate on the scheduler's frame clock
+    /// (replaces the autosaver's `Instant` throttle). App reads
+    /// [`Game::autosave_due`] and clears it via [`Game::mark_autosave`]; the
+    /// save itself stays in `App` (its inputs — mods, meta, slot — live there).
+    autosave_interval: crate::sched::IntervalHandle,
+    /// The minimap throttle gate on the scheduler's frame clock
+    /// (replaces the minimap's `last_refresh: Instant`). The recenter half of
+    /// the gate stays a state comparison inside [`Minimap`].
+    minimap_interval: crate::sched::IntervalHandle,
+
+    // Independent bounded clocks for the throttled lanes (`stream_hz` etc.),
+    // all sharing sched::RateGate's catch-up bound and zero-is-every-frame
+    // convention. Each is reconfigured through `apply_settings`.
+    stream_gate: RateGate,
+    /// One-shot streaming override: teleports, freecam toggles, HUD/minimap
+    /// re-activation, and settings changes must refresh promptly even when
+    /// `stream_hz` throttles the steady cadence.
+    force_stream: bool,
+    physics_gate: RateGate,
+    sky_gate: RateGate,
+    mod_gate: RateGate,
+
+    /// Edge input must survive render frames that do not execute a physics
+    /// tick, so a tap between two 30 Hz ticks still flies/jumps.
+    pending_toggle_fly: bool,
+    pending_jump: bool,
+    /// Edge-bearing frames awaiting the next permitted mod tick, in order —
+    /// ordered replay preserves discrete actions across a throttled cadence.
+    pending_mod_input: Vec<PendingModInput>,
+    /// An open mod overlay must be force-closed once when its HUD lane is
+    /// hidden, so an invisible modal cannot keep consuming input.
+    pending_mod_overlay_close: bool,
+
+    // Settings-derived work gates: each stops its lane at the owning boundary
+    // instead of merely hiding output.
+    mod_logic: bool,
+    mod_hud: bool,
+    player_models: bool,
+    name_tags: bool,
+
+    // Per-frame memo caches (see derived::Memo): keyed by exact input bit
+    // patterns so steady frames skip trig, palette composition, and
+    // formatting entirely. Settings edits invalidate the affected ones.
+    /// `Camera3D` by (yaw, pitch, roll, fovy) bits; the f64 eye stays outside
+    /// so pure translation reuses the orientation basis.
+    camera_cache: Memo<[u32; 4], Camera3D>,
+    /// Clock sample by day value; day/night off pins fixed noon. Pure in the
+    /// day value (sun geometry only), so it needs no revision.
+    sky_frame_cache: Memo<u64, SkyFrame>,
+    /// Bumped whenever render config or palette changes — the single stamp
+    /// every render-dependent frame cache folds into its key, so a stale packet
+    /// is a key mismatch the compiler enforces rather than a forgotten
+    /// `invalidate` at each mutation site.
+    content_rev: Revision,
+    /// Composed lighting packet + clear colour, keyed by `(day, content_rev)`
+    /// and valid only while weather/clouds/water-anim/exposure are all disabled.
+    static_frame_cache: Memo<(u64, u64), StaticFrame>,
+    /// Wrapped camera-XZ animation coordinates by eye XZ bits.
+    anim_uv_cache: Memo<[u64; 2], [f32; 2]>,
+    /// FPS label by displayed integer, refreshed at [`FPS_LABEL_INTERVAL`].
+    fps_cache: Memo<i32, String>,
+    fps_refresh: RateGate,
+    /// Online-players label by (count, ping).
+    online_cache: Memo<(usize, Option<u32>), String>,
+
+    // Retained-capacity scratch (cleared, never shrunk): stable frames do no
+    // allocator work for these.
+    placement_scratch: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
+    peer_scratch: Vec<PeerDraw>,
+    peer_pose_scratch: Vec<PeerPose>,
 }
 
 impl Game {
-    pub fn new(world: World, player: Player, save_name: String) -> Self {
+    pub fn new(mut world: World, player: Player, save_name: String) -> Self {
+        let mut sched = crate::sched::Scheduler::new();
+        // The fixed-tick sim runs through the scheduler. A pure clock lane is
+        // never "starved", so its forward-progress floor is effectively infinite
+        // — it fires only when whole ticks are due.
+        let sim_id = sched.register(
+            Simulation::manifest(),
+            Box::new(Simulation::new()),
+            u32::MAX,
+        );
+        sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
+        // The autosave and minimap throttles are scheduler interval gates.
+        let autosave_interval =
+            sched.register_interval(crate::save::autosave::AUTOSAVE_INTERVAL.as_secs_f32());
+        let minimap_interval =
+            sched.register_interval(MinimapConfig::DEFAULT.refresh_every.as_secs_f32());
+        // The stream lanes are call-point-driven producers (see
+        // sched::Scheduler::manual); World drives them via run_manual at their
+        // exact positions in stream(). One registration point keeps the lane
+        // types private to crate::world.
+        let stream_lanes = crate::world::lanes::StreamLanes::register(&mut sched);
+        world.set_stream_lanes(stream_lanes);
         Self {
             world,
             player,
-            sim: Simulation::new(),
+            camera: GameCamera::new(),
             console: Console::new(),
-            mouse_locked: true,
             save_name,
             net: None,
-            coord_cache: (i64::MIN, i64::MIN, i64::MIN, String::new()),
+            pending_edits: std::collections::HashMap::new(),
+            local_anim: presence::Animator::default(),
+            local_gait: 0.0,
+            coord_cache: Memo::new(),
             theme: Theme::new(),
             sky: Sky::new(),
-            minimap: Minimap::new(MinimapConfig::DEFAULT),
+            // Constructed present so scripted/harness games keep the full
+            // historical presentation; `apply_settings` drops it when the
+            // minimap lane is disabled.
+            minimap: Some(Minimap::new(MinimapConfig::DEFAULT)),
             debug_view: DebugView::Normal,
-            frame_index: 0,
+            scripted: false,
+            render: crate::render_config::RenderConfig::default(),
+            sched,
+            sim_source: sim_id,
+            autosave_interval,
+            minimap_interval,
+            stream_gate: RateGate::from_hz(0),
+            force_stream: true,
+            physics_gate: RateGate::from_hz(0),
+            sky_gate: RateGate::from_hz(0),
+            mod_gate: RateGate::from_hz(0),
+            pending_toggle_fly: false,
+            pending_jump: false,
+            pending_mod_input: Vec::new(),
+            pending_mod_overlay_close: false,
+            mod_logic: true,
+            mod_hud: true,
+            player_models: true,
+            name_tags: true,
+            camera_cache: Memo::new(),
+            sky_frame_cache: Memo::new(),
+            content_rev: Revision::default(),
+            static_frame_cache: Memo::new(),
+            anim_uv_cache: Memo::new(),
+            fps_cache: Memo::new(),
+            fps_refresh: RateGate::from_hz(4),
+            online_cache: Memo::new(),
+            placement_scratch: Vec::new(),
+            peer_scratch: Vec::new(),
+            peer_pose_scratch: Vec::new(),
         }
+    }
+
+    /// Whether the autosave interval has elapsed on the scheduler's frame clock.
+    /// `App` gates a new save on this ∧ the world being dirty.
+    pub fn autosave_due(&self) -> bool {
+        self.sched.interval_due(self.autosave_interval)
+    }
+
+    /// Clear the autosave interval when a save is attempted — matches the old
+    /// `last_attempt` bump, so the next save is a full interval out.
+    pub fn mark_autosave(&mut self) {
+        self.sched.interval_reset(self.autosave_interval);
     }
 
     /// Build a headless, deterministic game for the golden-shot harness:
     /// a fresh world at `seed` and a player at the origin. The harness teleports
     /// the camera per shot ([`teleport`](Self::teleport)) and selects what to
     /// render with [`set_debug_view`](Self::set_debug_view).
-    pub fn scripted(seed: u64) -> Game {
-        let world = World::new(seed as i64);
+    /// Pushed at world entry and on each in-game `/gfx` edit to adopt new render config.
+    pub fn set_render_config(&mut self, render: crate::render_config::RenderConfig) {
+        self.render = render;
+        self.bump_content_rev();
+    }
+
+    /// Retire every render-dependent frame cache in one stamp bump. The single
+    /// place render config or palette changes announce themselves.
+    fn bump_content_rev(&mut self) {
+        self.content_rev.0 = self.content_rev.0.wrapping_add(1);
+    }
+
+    /// Push every live-applicable setting into this game: engine values, the
+    /// world's view volume and meshing lanes, the per-frame look config, HUD
+    /// mode, lane gates, and the throttled clocks. THE one path — world entry
+    /// and in-game `/gfx` edits both come through here, so they can never
+    /// drift apart. (World-construction lanes — occlusion/lod2 — stay
+    /// entry-only by design; see `App::enter_game`.)
+    pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
+        let mod_ui_was_active = self.mod_ui_active();
+        settings.apply(eng);
+        let render = settings.render_config();
+        // View volume BEFORE the render config: the far ladder's `unit`
+        // tracks the full-res radius, so the transition detector must see the
+        // new volume.
+        self.world
+            .set_view_distances(settings.render_distance, settings.vertical_distance);
+        self.world.set_render_config(render, eng);
+        self.world.set_lighting(settings.lighting, eng);
+        self.world.set_ao(settings.ao, eng);
+        self.render = render;
+        self.bump_content_rev();
+
+        self.theme.scale = settings.ui_scale;
+        self.theme.hud = settings.hud_mode;
+
+        self.stream_gate.set_hz(settings.stream_hz);
+        self.physics_gate.set_hz(settings.physics_hz);
+        self.sky_gate.set_hz(settings.sky_hz);
+        self.mod_gate.set_hz(settings.mod_hz);
+        self.force_stream = true;
+
+        // The sim lane stays registered on the scheduler; the gate merely
+        // stops it being ticked (no hidden periodic work while disabled).
+        self.sched.set_enabled(self.sim_source, settings.simulation);
+        if settings.minimap {
+            if self.minimap.is_none() {
+                self.minimap = Some(Minimap::new(MinimapConfig::DEFAULT));
+            }
+        } else {
+            self.minimap = None;
+        }
+
+        let mod_ui_will_be_active =
+            mod_ui_active(settings.mod_logic, settings.mod_hud, self.theme.hud);
+        if mod_ui_will_be_active {
+            // If visibility is restored before the next frame, the overlay is
+            // visible again and does not need to be force-closed.
+            self.pending_mod_overlay_close = false;
+        } else if mod_ui_was_active {
+            self.on_mod_ui_hidden();
+        }
+        self.mod_logic = settings.mod_logic;
+        if !self.mod_logic {
+            self.mod_gate.reset();
+            self.pending_mod_input.clear();
+        }
+        self.mod_hud = settings.mod_hud;
+        self.player_models = settings.player_models;
+        self.name_tags = settings.name_tags;
+    }
+
+    /// Whether a modal supplied by the mod layer can both be seen and receive
+    /// input. Keeping one predicate for routing and Escape prevents invisible
+    /// overlays when either the mod lane or the master HUD is disabled.
+    fn mod_ui_active(&self) -> bool {
+        mod_ui_active(self.mod_logic, self.mod_hud, self.theme.hud)
+    }
+
+    /// The mod UI just became invisible: force-close any open overlay once and
+    /// drop queued UI edges (an invisible modal must not consume or replay
+    /// input). The one implementation both the settings path and the HUD
+    /// hotkey use.
+    fn on_mod_ui_hidden(&mut self) {
+        self.pending_mod_overlay_close = true;
+        for pending in &mut self.pending_mod_input {
+            pending.clear_ui();
+        }
+        self.pending_mod_input.retain(|pending| pending.any());
+    }
+
+    pub fn scripted(seed: u64, render: crate::render_config::RenderConfig) -> Game {
+        let world = World::with_config(seed as i64, render);
         let player = Player::new(DVec3::new(0.0, 80.0, 0.0));
-        Game::new(world, player, "scripted".to_string())
+        let mut g = Game::new(world, player, "scripted".to_string());
+        g.scripted = true;
+        g.render = render;
+        g
     }
 
     /// Select what the app renders for a capture.
@@ -110,8 +523,8 @@ impl Game {
     /// drives the same `Player` → `camera_with_fov` path the game uses.
     pub fn teleport(&mut self, pose: CameraPose) {
         self.player.position = pose.pos;
-        self.player.yaw = pose.yaw;
-        self.player.pitch = pose.pitch;
+        self.player.orientation.yaw = pose.yaw;
+        self.player.orientation.pitch = pose.pitch;
     }
 
     /// Pin the day/night clock fraction (0.5 = noon, 0.0 = midnight). Fixes
@@ -124,6 +537,7 @@ impl Game {
     /// Swap the atmosphere colour table.
     pub fn set_palette(&mut self, palette: crate::sky::Palette) {
         self.sky.atmosphere.palette = palette;
+        self.bump_content_rev();
     }
 
     /// Attach a server connection, turning this into a multiplayer session.
@@ -134,6 +548,11 @@ impl Game {
 
     pub fn save_name(&self) -> &str {
         &self.save_name
+    }
+
+    /// Surface a status line in the in-world console (save/load notices).
+    pub fn notify(&mut self, line: impl Into<String>) {
+        self.console.print(line);
     }
 
     /// Whether this is a networked session (its world is a server mirror, not a
@@ -155,8 +574,8 @@ impl Game {
     }
 
     /// Capture the cursor when (re)entering play.
-    pub fn on_enter(&mut self, eng: &mut Engine) {
-        self.mouse_locked = true;
+    pub fn on_enter(&mut self, eng: &mut Engine, router: &mut Router) {
+        router.set_captured(true);
         eng.disable_cursor();
     }
 
@@ -166,154 +585,626 @@ impl Game {
         self.world.free_meshes(eng);
     }
 
-    /// Advance one frame. Returns [`Signal::ExitToMenu`] when the player leaves.
+    /// Advance one frame. Returns Signal::ExitToMenu when the player leaves.
+    /// One frame of in-world logic, as a sequence of named phases. Each phase
+    /// is a plain method — the flow reads top to bottom and any early Signal
+    /// short-circuits the rest of the frame, exactly as before the split.
     pub fn update(
         &mut self,
         eng: &mut Engine,
+        router: &mut Router,
         mods: &mut Mods,
         settings: &mut Settings,
+        sound: &mut SoundSystem,
+        audio: &mut AudioDirector,
     ) -> Signal {
         // Clamp dt so a stall (window minimized, world load hitch) becomes one
         // slightly-long step instead of a single giant physics step that would
         // tunnel the player through terrain.
         let dt = eng.frame_time().min(0.1);
 
+        // Scripted golden capture: pose pinned by `teleport`, clock pinned by
+        // `set_day`. Consume no live input and do not advance the clock — only
+        // step the deterministic world so terrain streams in before the frame is
+        // grabbed. See the `scripted` field for why this can't be optional.
+        if self.scripted {
+            self.world
+                .stream(self.player.position, eng, &mut self.sched);
+            let clocks = self.sched.clocks(dt);
+            let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
+            self.sched.tick(&mut sched_ctx, &clocks);
+            return Signal::Continue;
+        }
+
         // Advance the day/night clock (singleplayer drives it locally; a server
-        // sync overrides `day` on arrival).
-        self.sky.tick(dt as f64);
+        // sync overrides `day` on arrival), throttled by `sky_hz`. With the
+        // lane off, compose samples fixed noon without mutating authoritative
+        // clock state; re-enabling resumes the stored time instead of freezing
+        // a stripped profile at night.
+        if self.render.day_night {
+            let steps = self.sky_gate.steps(dt);
+            if steps != 0 {
+                self.sky
+                    .tick(steps as f64 * self.sky_gate.step_dt(dt) as f64);
+            }
+        } else {
+            self.sky_gate.reset();
+        }
 
-        // Keep the HUD text scale in sync with the persisted setting.
-        self.theme.scale = settings.ui_scale;
+        // This frame's unrecoverable audio facts, accumulated across the
+        // phases and folded by the director. Everything else — footsteps, splash, the
+        // underwater bed, voice sessions — the director DERIVES from the readout.
+        let mut events: Vec<SoundEvent> = Vec::new();
 
-        // Drain the server first so edits and chat keep flowing even while the
-        // console is open or the player stands still.
+        if let Some(signal) = self.net_phase(mods, &mut events) {
+            return signal;
+        }
+        let input = self.input_phase(eng, router, dt);
+        // The overlay may consume the frame (console typing, opening chat): movement,
+        // interaction and streaming run only on an unconsumed ("active") frame, exactly
+        // as before. Audio, though, commits EVERY frame so voice/emitters/faults — and
+        // the `/voicetest` cue submitted while the console is open — stay live; only a
+        // real exit short-circuits it.
+        let active = match self.overlay_phase(OverlayPhase {
+            input: &input,
+            eng,
+            router,
+            mods,
+            settings,
+            sound,
+            events: &mut events,
+        }) {
+            Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
+            Some(Signal::Continue) => false,
+            None => {
+                let detached = self.motion_phase(&input, dt);
+                self.interact_phase(&input, detached, dt, eng, mods, &mut events);
+                self.stream_phase(eng, dt);
+                true
+            }
+        };
+        self.commit_audio(AudioPhase {
+            dt,
+            input: &input,
+            sound,
+            audio,
+            settings,
+            events,
+            active,
+        });
+        Signal::Continue
+    }
+
+    /// Drain server events and send our heartbeat. `Some(ExitToMenu)` when the
+    /// server dropped us. Runs before input so edits and chat keep flowing even
+    /// while the console is open or the player stands still — and the move
+    /// report doubles as the keepalive, so it too runs unconditionally.
+    fn net_phase(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) -> Option<Signal> {
+        // The overwhelmingly common singleplayer path should not even enter a
+        // profiling scope or call through the event-poll seam.
+        self.net.as_ref()?;
         let net_disconnected = {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
-            self.apply_net_events()
+            self.apply_net_events(mods, events)
         };
         if net_disconnected {
             self.console.print("* disconnected from server".to_string());
-            return Signal::ExitToMenu;
+            return Some(Signal::ExitToMenu);
         }
-
-        // Report our own state to the server every frame — this doubles as the
-        // keepalive heartbeat, so it must run even while the console is open
-        // (otherwise the server's idle timeout kicks a chatting player).
         if let Some(net) = &mut self.net {
-            net.send_move(self.player.position, self.player.yaw, self.player.pitch);
+            net.send_move(
+                self.player.position,
+                self.player.orientation.yaw,
+                self.player.orientation.pitch,
+                Stance::of_player(&self.player),
+            );
+        }
+        None
+    }
+
+    /// The once-per-frame router transition: pick the exclusive context (Text
+    /// while the console captures typing) and snapshot every intent into plain
+    /// data, so the router borrow ends before any `&mut Engine` side effects
+    /// (screenshot, cursor grab, console open) run in later phases.
+    fn input_phase(&mut self, eng: &mut Engine, router: &mut Router, dt: f32) -> FrameInput {
+        router.set_context(if self.console.is_open() {
+            Context::Text
+        } else {
+            Context::Gameplay
+        });
+
+        let mut f = FrameInput::default();
+        let mod_ui = self.mod_ui_active();
+        let input = router.frame_filtered(eng, dt, self.mod_logic, mod_ui, self.minimap.is_some());
+        match input.view() {
+            View::Gameplay(gp) => {
+                let move_input = movement::MoveInput::from_view(&gp);
+                f.look_delta = gp.look();
+                // Same axes the player reads, reinterpreted by the freecam rig
+                // when the camera is detached (the two never both consume them).
+                let (forward, right, up, boost) = move_input.freecam_axes();
+                f.fly_axes = FlyAxes {
+                    forward,
+                    right,
+                    up,
+                    boost,
+                };
+                f.do_break = gp.event(GameplayEvent::Break);
+                if self.mod_logic {
+                    f.do_place = gp.event(GameplayEvent::Place);
+                }
+                if mod_ui {
+                    f.toggle_inventory = gp.event(GameplayEvent::ToggleInventory);
+                    f.toggle_crafting = gp.event(GameplayEvent::ToggleCrafting);
+                    f.nav_up = gp.overlay_nav(MenuEvent::Up);
+                    f.nav_down = gp.overlay_nav(MenuEvent::Down);
+                    f.nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
+                }
+                f.open_console = gp.event(GameplayEvent::OpenConsole);
+                f.open_chat = gp.event(GameplayEvent::OpenChat);
+                f.toggle_capture = gp.event(GameplayEvent::ToggleCapture);
+                f.ptt = gp.state(GameplayState::PushToTalk);
+                f.move_input = Some(move_input);
+            }
+            View::Text(t) => {
+                f.is_text = true;
+                f.text_chars = t.chars().collect();
+                f.text_edit = t.edit();
+            }
+            // The game never routes to Menu; treat it like Text (inert).
+            View::Menu(_) => f.is_text = true,
+        }
+        let global = input.global();
+        f.g_escape = global.event(GlobalEvent::Escape);
+        f.g_hud = global.event(GlobalEvent::CycleHud);
+        f.g_shot = global.event(GlobalEvent::Screenshot);
+        f.g_minimap = global.event(GlobalEvent::MinimapMode);
+        f
+    }
+
+    /// Console, escape routing, and the global toggles (mouse capture, HUD
+    /// cycle, screenshot, minimap, camera modes). `Some` consumes the frame:
+    /// while typing, nothing below the console runs.
+    fn overlay_phase(&mut self, phase: OverlayPhase<'_>) -> Option<Signal> {
+        let OverlayPhase {
+            input,
+            eng,
+            router,
+            mods,
+            settings,
+            sound,
+            events,
+        } = phase;
+        if std::mem::take(&mut self.pending_mod_overlay_close) {
+            mods.close_overlay();
         }
 
-        // While the console is open it captures all typing; the world is frozen
-        // (locally — other players keep moving over the network).
-        if self.console.is_open() {
-            if let Some(line) = self.console.handle_input(eng) {
-                self.submit_line(line, eng, settings);
+        // Text context: the console owns all input; nothing else runs. Esc is
+        // the game's call (the Text view has no bindable events), and here it
+        // means "close the console", never "leave the world".
+        if input.is_text {
+            self.drop_pending_edges();
+            if input.g_escape {
+                self.console.close();
+                return Some(Signal::Continue);
             }
-            return Signal::Continue;
+            if let Some(line) = self
+                .console
+                .handle_input(&input.text_chars, input.text_edit)
+            {
+                self.submit_line(line, eng, settings, sound, events);
+            }
+            return Some(Signal::Continue);
         }
 
         // Esc closes an in-world mod overlay before leaving the world.
-        if eng.is_key_pressed(Key::Escape) {
-            if mods.close_overlay() {
-                return Signal::Continue;
+        if input.g_escape {
+            self.drop_pending_edges();
+            if self.mod_ui_active() && mods.close_overlay() {
+                return Some(Signal::Continue);
             }
-            return Signal::ExitToMenu;
+            return Some(Signal::ExitToMenu);
         }
 
-        // Open the console with `T`, or `/` to start a command straight away.
-        let slash = eng.is_key_pressed(Key::Slash);
-        if slash || eng.is_key_pressed(Key::T) {
-            self.console.open(slash);
+        // Open the console: `/` (OpenConsole) pre-fills a slash, `T` (OpenChat)
+        // does not. Drain the char queue so the opening key isn't also typed.
+        if input.open_console || input.open_chat {
+            self.drop_pending_edges();
+            self.console.open(input.open_console);
             while eng.get_char_pressed().is_some() {}
-            return Signal::Continue;
+            return Some(Signal::Continue);
         }
 
-        if eng.is_key_pressed(Key::Tab) {
-            self.toggle_mouse(eng);
+        if input.toggle_capture {
+            // A placement edge captured before the cursor is released must not
+            // fire later after a throttled mod tick.
+            self.drop_pending_places();
+            toggle_mouse(eng, router);
         }
-
-        // F1 cycles HUD visibility: Full → Minimal → Off → …
-        if eng.is_key_pressed(Key::F1) {
+        if input.g_hud {
+            let mod_ui_was_active = self.mod_ui_active();
             self.theme.cycle_hud();
+            // The HUD hotkey and the settings row edit the same state; sync it
+            // back (marking Custom) so the menu, `/gfx`, and persistence agree.
+            settings.hud_mode = self.theme.hud;
+            settings.mark_custom();
+            settings.save();
+            if mod_ui_was_active && !self.mod_ui_active() {
+                self.on_mod_ui_hidden();
+            }
+            // Minimap/HUD re-activation must repaint promptly even at 15 Hz.
+            self.force_stream = true;
         }
-
-        // F2 saves a timestamped screenshot of the next presented frame.
-        if eng.is_key_pressed(Key::F2) {
+        if input.g_shot {
             match eng.screenshot() {
                 Some(path) => println!("screenshot queued: {}", path.display()),
                 None => eprintln!("screenshot could not be queued"),
             }
         }
-
-        // F3 toggles the minimap between north-up and heading-up orientation.
-        if eng.is_key_pressed(Key::F3) {
-            self.minimap.toggle_orientation();
-        }
-
-        if self.mouse_locked {
-            look::update(&mut self.player, eng);
-        }
-
-        let input = movement::MoveInput::from_input(eng);
+        if input.g_minimap
+            && let Some(minimap) = &mut self.minimap
         {
-            let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::Physics);
-            movement::update_player(&mut self.player, &self.world, &input, dt);
+            minimap.toggle_orientation();
         }
 
-        // Break the aimed-at block into its elements while actually aiming (cursor
-        // locked, not navigating a free cursor).
-        if self.mouse_locked && eng.is_mouse_button_pressed(MouseButton::Left) {
-            self.break_block(mods);
+        // F5 cycles first/third-back/third-front; F6 toggles freecam.
+        if eng.is_key_pressed(Key::F5) {
+            self.camera.cycle_person();
         }
-
-        // Mods run once per frame here — never inside the voxel loop.
-        let placements = {
-            let mut ctx = ModContext {
-                player: &mut self.player,
-                world: &mut self.world,
-                screen_w: eng.screen_width(),
-                screen_h: eng.screen_height(),
-                capturing_text: false,
-                mouse_locked: self.mouse_locked,
-                placements: Vec::new(),
-            };
-            mods.update(eng, &mut ctx);
-            ctx.placements
-        };
-        self.apply_placements(placements);
-
-        // Load/mesh/unload chunks around the player, then step physics.
-        self.world.stream(self.player.position, eng);
-
-        // Refresh minimap (throttled).
-        let p = self.player.position;
-        let player_col = IVec2::new(p.x.floor() as i32, p.z.floor() as i32);
-        self.minimap
-            .refresh(eng, &self.world, player_col, Instant::now());
-        self.sim.advance(&mut self.world, dt);
-        Signal::Continue
+        if eng.is_key_pressed(Key::F6) {
+            // Reattaching after the rig flew far away resumes physics at the
+            // frozen player, whose chunks may have streamed out (the centre
+            // followed the camera). Restore the collision halo synchronously
+            // BEFORE the toggle so the first reattached step never runs
+            // against unloaded air.
+            if self.camera.free_rig().is_some() {
+                self.world.prepare_around(self.player.position);
+            }
+            self.camera
+                .toggle_freecam(&self.player, &self.world, settings.fov);
+            self.force_stream = true;
+        }
+        None
     }
 
-    /// Drain queued server messages: apply world edits, surface chat, and report a
-    /// lost connection. Returns `true` if the server dropped us.
-    fn apply_net_events(&mut self) -> bool {
-        let events = match &mut self.net {
+    /// Drop every latched input edge — called when a modal (console, menu
+    /// exit) takes over the frame, so stale edges can't fire after it closes.
+    fn drop_pending_edges(&mut self) {
+        self.pending_mod_input.clear();
+        self.mod_gate.reset();
+        self.pending_toggle_fly = false;
+        self.pending_jump = false;
+    }
+
+    /// Drop only latched placement edges (aim is no longer meaningful), while
+    /// UI navigation edges stay queued.
+    fn drop_pending_places(&mut self) {
+        for pending in &mut self.pending_mod_input {
+            pending.place = false;
+            pending.place_target = None;
+        }
+        self.pending_mod_input.retain(|pending| pending.any());
+    }
+
+    /// Camera effects plus movement. Exactly one thing consumes look/move per
+    /// frame — the detached freecam rig (player frozen) or the player; returns
+    /// whether the rig had it (see `CameraMode`). Mouse look and camera
+    /// effects stay render-rate responsive; only the collision/velocity
+    /// integration runs at `physics_hz`, with edge input latched until a
+    /// physics tick consumes it.
+    fn motion_phase(&mut self, input: &FrameInput, dt: f32) -> bool {
+        self.camera.fx.update(dt);
+        if let Some(rig) = self.camera.free_rig() {
+            self.pending_toggle_fly = false;
+            self.pending_jump = false;
+            rig.look(input.look_delta);
+            rig.fly(input.fly_axes, dt);
+            true
+        } else {
+            // Look (inert while uncaptured — the query already zeroed the delta).
+            look::apply(&mut self.player, input.look_delta);
+
+            if let Some(mi) = &input.move_input {
+                self.pending_toggle_fly |= mi.toggle_fly();
+                self.pending_jump |= mi.jump();
+                let steps = self.physics_gate.steps(dt);
+                if steps != 0 {
+                    let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::Physics);
+                    let step_dt = self.physics_gate.step_dt(dt);
+                    for step in 0..steps {
+                        let mut tick_input = *mi;
+                        tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
+                        tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
+                        movement::update_player(
+                            &mut self.player,
+                            &self.world,
+                            &tick_input,
+                            step_dt,
+                        );
+                        // Advance the local walk cycle from horizontal travel so the
+                        // third-person body animates. The AUDIO gait (footstep
+                        // phase-crossings) is derived inside the director from the
+                        // same speed — this one drives rendering only.
+                        let v = self.player.velocity();
+                        let speed = (v.x * v.x + v.z * v.z).sqrt();
+                        self.local_gait += speed * step_dt as f64 * presence::STRIDE_FREQ;
+                    }
+                    self.pending_toggle_fly = false;
+                    self.pending_jump = false;
+                }
+            }
+            false
+        }
+    }
+
+    /// World edits: block breaking, then cadence-controlled mod hooks and
+    /// queued placements. Edge-bearing render frames are replayed in order at
+    /// the next permitted mod tick; hooks never run inside the voxel loop.
+    fn interact_phase(
+        &mut self,
+        input: &FrameInput,
+        detached: bool,
+        dt: f32,
+        eng: &mut Engine,
+        mods: &mut Mods,
+        events: &mut Vec<SoundEvent>,
+    ) {
+        // Break is capture-gated in the query; freecam additionally can't act
+        // on the world (the crosshair isn't where the player aims).
+        if input.do_break && !detached {
+            self.break_block(mods, events);
+        }
+
+        // Disabled mod logic performs no probe, no queueing, no dispatch.
+        if !self.mod_logic {
+            return;
+        }
+
+        // A detached camera cannot perform player-origin actions: its
+        // crosshair no longer represents the frozen player's aim — and any
+        // earlier latched placement aim is stale the moment it detaches.
+        if detached {
+            self.drop_pending_places();
+        }
+        let allow_ui = self.mod_ui_active();
+        let allow_place = !detached;
+        // Resolve the placement cell AT THE EDGE, from this exact frame's
+        // pose: cadence-delayed replay must not retarget from a later aim.
+        let place_target = if allow_place && input.do_place {
+            interact::raycast(
+                &self.world,
+                self.player.position,
+                self.player.forward(),
+                interact::REACH,
+            )
+            .map(|hit| hit.previous)
+        } else {
+            None
+        };
+        let current = PendingModInput::capture(input, allow_place, allow_ui, place_target);
+        if current.any() {
+            self.pending_mod_input.push(current);
+        }
+        if self.mod_gate.steps(dt) == 0 {
+            return;
+        }
+
+        let mut pending = std::mem::take(&mut self.pending_mod_input);
+        let mut placements = std::mem::take(&mut self.placement_scratch);
+        placements.clear();
+        let (screen_w, screen_h) = (eng.screen_width(), eng.screen_height());
+        // Preserve ordering and multiplicity for edge-bearing render frames.
+        // With no edge, one empty update keeps periodic work at `mod_hz`.
+        for index in 0..pending.len().max(1) {
+            let edges = pending.get(index).copied().unwrap_or_default();
+            placements = {
+                let mut ctx = ModContext {
+                    player: &mut self.player,
+                    world: &mut self.world,
+                    screen_w,
+                    screen_h,
+                    place: edges.place,
+                    place_target: edges.place_target,
+                    toggle_inventory: edges.toggle_inventory,
+                    toggle_crafting: edges.toggle_crafting,
+                    nav_up: edges.nav_up,
+                    nav_down: edges.nav_down,
+                    nav_confirm: edges.nav_confirm,
+                    placements,
+                };
+                mods.update(eng, &mut ctx);
+                ctx.placements
+            };
+            // Apply after each event frame so repeated placements observe the
+            // previous write and cannot spend twice against one empty cell.
+            self.apply_placements(&mut placements, events);
+        }
+        placements.clear();
+        self.placement_scratch = placements;
+        pending.clear();
+        self.pending_mod_input = pending;
+    }
+
+    /// Load/mesh/unload chunks around the camera (the player, unless the
+    /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
+    /// step the simulation.
+    fn stream_phase(&mut self, eng: &mut Engine, dt: f32) {
+        // The scheduler drives the fixed-tick sim lane. Its clock
+        // (fixed-tick accumulator + catch-up cap) is derived once per frame
+        // here; other lanes still run directly below until they migrate in.
+        let clocks = self.sched.clocks(dt);
+        let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
+        self.sched.tick(&mut sched_ctx, &clocks);
+
+        // Finished worker results, budgeted uploads, and edit remeshes land
+        // EVERY frame — visible latency never waits on the streaming clock.
+        self.world.pump(eng, &mut self.sched);
+
+        // The topology pass (selection/admission/unload) rides `stream_hz`;
+        // forced refreshes (teleports, freecam/HUD changes, settings) run out
+        // of band so correctness never waits on a 15 Hz clock.
+        let stream_due = if std::mem::take(&mut self.force_stream) {
+            self.stream_gate.reset();
+            true
+        } else {
+            self.stream_gate.steps(dt) != 0
+        };
+        if !stream_due {
+            return;
+        }
+
+        let stream_center = match &self.camera.mode {
+            CameraMode::Free { rig, .. } => rig.pos,
+            CameraMode::Person(_) => self.player.position,
+        };
+        self.world.stream(stream_center, eng, &mut self.sched);
+
+        // A hidden/minimal HUD does no minimap clock read or terrain raster
+        // work; refreshes share streaming's cadence instead of waking alone.
+        if self.theme.hud.shows_minimap()
+            && let Some(minimap) = &mut self.minimap
+        {
+            let p = self.player.position;
+            let player_col = IVec2::new(p.x.floor() as i32, p.z.floor() as i32);
+            // The minimap throttle rides the scheduler's interval gate (advanced in
+            // clocks() above); the recenter half stays inside Minimap::due. Reset
+            // the gate whenever a rebuild actually happens (either trigger).
+            let due = self.sched.interval_due(self.minimap_interval);
+            if minimap.refresh(eng, &self.world, player_col, due) {
+                self.sched.interval_reset(self.minimap_interval);
+            }
+        }
+    }
+
+    /// Hand this frame's readout to the audio director: it folds
+    /// the drained `events`, derives the rest from the trace (footsteps, splash,
+    /// underwater bed, voice sessions), commits the [`AudioFrame`], and services the
+    /// voice/capture path. The window, medium, gait and session bookkeeping that used
+    /// to live here are the director's now.
+    fn commit_audio(&mut self, phase: AudioPhase<'_>) {
+        let AudioPhase {
+            dt,
+            input,
+            sound,
+            audio,
+            settings,
+            events,
+            active,
+        } = phase;
+        // THE per-frame peer sample: one `Instant`, consumed by the director for
+        // both remote footsteps and voice sessions. `peer_draws` in draw() keeps its
+        // own richer sample — it runs in the separate draw() call, steps each peer's
+        // animator, and needs render fields absent from `PeerPose`. The scratch
+        // vector retains capacity so stable multiplayer frames allocate nothing.
+        let now = Instant::now();
+        let mut peers = std::mem::take(&mut self.peer_pose_scratch);
+        peers.clear();
+        if let Some(net) = &self.net {
+            peers.extend(net.peers().map(|p| {
+                let r = p.sample(now);
+                PeerPose {
+                    id: p.id(),
+                    at: r.pos.0,
+                    feet: r.pos.feet(r.stance).0,
+                    visible: p.visible(),
+                    phase: r.phase,
+                    speed: r.speed,
+                }
+            }));
+        }
+
+        // On a console-owned frame the player isn't stepped, so freeze the listener
+        // velocity: a stale walk speed would fire phantom footsteps in the director.
+        let velocity = if active {
+            self.player.velocity()
+        } else {
+            DVec3::ZERO
+        };
+        let player = PlayerPose {
+            pos: self.player.position,
+            feet: DVec3::new(
+                self.player.position.x,
+                self.player.feet_y(),
+                self.player.position.z,
+            ),
+            yaw: self.player.orientation.yaw,
+            pitch: self.player.orientation.pitch,
+            velocity,
+            on_ground: self.player.on_ground(),
+        };
+
+        let ctx = AudioCtx {
+            dt,
+            player,
+            ptt: input.ptt,
+            voice_enabled: settings.voice_enabled,
+            events,
+            peers: &peers,
+            world: &self.world,
+            net: self.net.as_mut(),
+            console: &mut self.console,
+        };
+        audio.frame(ctx, sound);
+        self.peer_pose_scratch = peers;
+    }
+
+    /// Drain queued server messages: apply world edits, resolve our own edit
+    /// verdicts (rolling back rejected predictions), surface chat, and report
+    /// a lost connection. Returns `true` if the server dropped us.
+    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) -> bool {
+        let incoming = match &mut self.net {
             Some(net) => net.poll(),
             None => return false,
         };
         let mut disconnected = false;
-        for event in events {
+        for event in incoming {
             match event {
                 Incoming::Edit { x, y, z, spec } => {
-                    // Resolve the portable spec against our own palette, then apply.
-                    // The server echoes our OWN edits back too (that server-ordered
-                    // echo is what converges racing edits on one cell); re-applying
-                    // an edit we already made locally is harmless, just a redundant
-                    // dirty-remesh per own edit — acceptable.
+                    // Resolve the portable spec against our own palette, then
+                    // apply. The connection already dropped stale revisions,
+                    // and our own edits come back as acks, not broadcasts.
+                    // Snapshot the cell first so a remote break names the block that
+                    // WAS there (its sound class), not a generic default.
+                    let prev = self.world.block_at(x, y, z);
                     let id = save::parse_block(&mut self.world, &spec);
                     self.world.set_block(x, y, z, id);
+                    let at = cell_center(x, y, z);
+                    events.push(if id == AIR {
+                        SoundEvent::BlockBroken { at, block: prev }
+                    } else {
+                        SoundEvent::BlockPlaced { at, block: id }
+                    });
                 }
-                Incoming::Chat { from_name, channel, text } => {
+                Incoming::EditAccepted { req } => {
+                    // Prediction confirmed: the optimistic apply IS the truth.
+                    self.pending_edits.remove(&req);
+                }
+                Incoming::EditRejected { req, restore } => {
+                    let Some(pending) = self.pending_edits.remove(&req) else {
+                        continue;
+                    };
+                    if restore {
+                        let (x, y, z) = pending.cell;
+                        self.world.set_block(x, y, z, pending.prev);
+                    }
+                    match pending.kind {
+                        PendingKind::Break(elements) => mods.on_break_rejected(&elements),
+                        PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
+                    }
+                }
+                Incoming::Position { pos } => {
+                    // Authoritative snap-back (refused teleport or implausible
+                    // move): land safely, exactly like a local teleport.
+                    self.world.prepare_around(pos);
+                    self.player.position = pos;
+                    self.player.cancel_fall();
+                    self.force_stream = true;
+                }
+                Incoming::Chat {
+                    from_name,
+                    channel,
+                    text,
+                } => {
                     // Colour the scope tag and name so chat scans at a glance: a gold
                     // [global] tag, a blue <name>, and the message body white.
                     let name = ui::Line::of(ui::Role::Accent, format!("<{from_name}> "));
@@ -323,10 +1214,36 @@ impl Game {
                     } else {
                         name
                     };
-                    self.console.push(line.then(ui::Role::Muted, text));
+                    self.console
+                        .push(line.then(ui::Role::Muted, text.to_string()));
                 }
-                Incoming::Time { day } => self.sky.clock.set_day(day as f64),
+                Incoming::Joined { name } => {
+                    self.console
+                        .push(ui::Line::of(ui::Role::Positive, format!("* {name} joined")));
+                }
+                Incoming::Left { name } => {
+                    self.console
+                        .push(ui::Line::of(ui::Role::Muted, format!("* {name} left")));
+                }
+                Incoming::Time { day, day_secs } => {
+                    // The server owns the shared clock: phase AND cycle length.
+                    self.sky.clock.set_day(day as f64);
+                    self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
+                }
                 Incoming::Disconnected => disconnected = true,
+                Incoming::PeerSwing { id } => {
+                    // The swing edge → a whoosh at the peer's current position. The
+                    // local animator update already happened in `Connection::apply`.
+                    if let Some(peer) = self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.peers().find(|p| p.id() == id))
+                    {
+                        events.push(SoundEvent::PeerSwing {
+                            at: peer.sample(Instant::now()).pos.0,
+                        });
+                    }
+                }
             }
         }
         disconnected
@@ -335,73 +1252,136 @@ impl Game {
     /// Handle one submitted console line. A leading `/` is always a local command; in
     /// multiplayer any other line is chat (a leading `!` sends it to global chat),
     /// while in singleplayer it stays a command as before.
-    fn submit_line(&mut self, line: String, eng: &mut Engine, settings: &mut Settings) {
-        if !line.starts_with('/') {
-            if let Some(net) = &mut self.net {
-                let (channel, text) = match line.strip_prefix('!') {
-                    Some(rest) => (chat::GLOBAL, rest.trim().to_string()),
-                    None => (chat::LOCAL, line),
-                };
-                if !text.is_empty() {
-                    // The server echoes chat back to us, so we don't print it here.
-                    net.send_chat(channel, text);
-                }
-                return;
+    fn submit_line(
+        &mut self,
+        line: String,
+        eng: &mut Engine,
+        settings: &mut Settings,
+        sound: &mut SoundSystem,
+        events: &mut Vec<SoundEvent>,
+    ) {
+        // `/voicetest` plays the canned UI cue; emit it as a fact and let the
+        // director route it (it runs this frame even though the console owns input).
+        // `execute` below prints the acknowledgement.
+        if line.trim() == "/voicetest" {
+            events.push(SoundEvent::Ui(UiSound::VoiceTest));
+        }
+        if !line.starts_with('/')
+            && let Some(net) = &mut self.net
+        {
+            let (channel, text) = match line.strip_prefix('!') {
+                Some(rest) => (chat::GLOBAL, rest.trim().to_string()),
+                None => (chat::LOCAL, line),
+            };
+            if !text.is_empty() {
+                // The server echoes chat back to us, so we don't print it here.
+                net.send_chat(channel, &text);
             }
+            return;
         }
         self.console.echo(&line);
         let before = settings.clone();
         let day_before = self.sky.clock.day();
+        let day_len_before = self.sky.day_length;
+        let pos_before = self.player.position;
         // Each output line already carries its role (System output vs Error
         // rejection), so there is nothing to guess — just show them.
-        for out in command::execute(&line, &mut self.player, &self.world, settings, &mut self.sky) {
+        for out in command::execute(
+            &line,
+            &mut self.player,
+            &mut self.world,
+            settings,
+            &mut self.sky,
+        ) {
             self.console.push(out);
         }
-        // A `/gfx` command edits settings; push the result to the engine and
-        // world, and persist it, only when something actually changed.
+        // A `/gfx` command edits settings; push the result through the one
+        // application path and persist it, only when something actually changed.
         if *settings != before {
-            settings.apply(eng);
-            self.world.set_view_radius(settings.render_distance);
-            self.world.set_lighting(settings.lighting, eng);
+            self.apply_settings(eng, settings);
             settings.save();
+            // Push the audio mix through the one committer whenever `/gfx`-style
+            // settings edits touch a volume/mute/deafen row.
+            sound.set_mix(settings.mix_change());
         }
         // A `/time` change is shared: tell the server so every client's clock
         // follows (the server relays it and hands it to future joiners).
-        if self.sky.clock.day() != day_before {
+        if self.sky.clock.day() != day_before
+            && let Some(net) = &mut self.net
+        {
+            net.send_set_time(self.sky.clock.day() as f32);
+        }
+        // The cycle LENGTH is server-owned in multiplayer: a local change
+        // would silently desync every clock's advance rate.
+        if self.sky.day_length != day_len_before && self.net.is_some() {
+            self.sky.day_length = day_len_before;
+            self.console
+                .print("* day length is set by the server".to_string());
+        }
+        // A `/tp` is a position discontinuity: ordinary moves are envelope-
+        // checked server-side, so report it as an explicit teleport (the
+        // server may still snap us back if teleports are disabled) — and
+        // stream out of band so the destination doesn't wait on `stream_hz`.
+        if self.player.position != pos_before {
+            self.force_stream = true;
             if let Some(net) = &mut self.net {
-                net.send_set_time(self.sky.clock.day() as f32);
+                net.send_teleport(self.player.position);
             }
         }
     }
 
     /// Break the block the player is looking at, handing its elements to the mods.
-    fn break_block(&mut self, mods: &mut Mods) {
-        let Some(hit) =
-            interact::raycast(&self.world, self.player.position, self.player.forward(), REACH)
-        else {
+    fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+        let Some(hit) = interact::raycast(
+            &self.world,
+            self.player.position,
+            self.player.forward(),
+            interact::REACH,
+        ) else {
             return;
         };
         let (x, y, z) = hit.block;
         let id = self.world.block_at(x, y, z);
         // Snapshot the block's elements before it's removed.
         let elements = self.world.registry().block(id).composition.elements();
+        // Report the broken block; the director derives its class-specific cue.
+        events.push(SoundEvent::BlockBroken {
+            at: cell_center(x, y, z),
+            block: id,
+        });
         self.world.set_block(x, y, z, AIR);
         mods.on_block_break(&elements, &self.world);
-        // Tell the server (it validates and relays to everyone else). We apply
-        // locally above for a responsive feel; the server is still authoritative.
+        self.local_anim.on_action(WireAction::Swing);
+        // Tell the server (it validates and relays to everyone else). The
+        // apply above is a PREDICTION for responsiveness: the ack rolls it
+        // back — cell and loot both — if we lose the race for this cell.
         if let Some(net) = &mut self.net {
-            net.send_edit(x, y, z, "air".to_string());
+            let req = net.send_edit(x, y, z, "air".into());
+            self.pending_edits.insert(
+                req,
+                PendingEdit {
+                    cell: (x, y, z),
+                    prev: id,
+                    kind: PendingKind::Break(elements.to_vec()),
+                },
+            );
+            net.send_swing();
         }
     }
 
-    /// Apply the block placements mods queued this frame. A placement lands only
-    /// in a non-obstacle cell (air, or a liquid it replaces) that doesn't overlap
+    /// Apply the block placements mods queued this tick, draining the buffer in
+    /// place so its capacity is retained. A placement lands only in a
+    /// non-obstacle cell (air, or a liquid it replaces) that doesn't overlap
     /// the player. Well-behaved mods (the crafting mod) ran an equivalent check
-    /// before queueing — and before spending a block on it — so within one frame
+    /// before queueing — and before spending a block on it — so within one tick
     /// the two always agree; re-checking here is a cheap guard against a mod that
     /// queues without validating.
-    fn apply_placements(&mut self, placements: Vec<(i32, i32, i32, crate::block::BlockId)>) {
-        for (x, y, z, id) in placements {
+    fn apply_placements(
+        &mut self,
+        placements: &mut Vec<(i32, i32, i32, crate::block::BlockId)>,
+        events: &mut Vec<SoundEvent>,
+    ) {
+        for (x, y, z, id) in placements.drain(..) {
             // Lands in any non-obstacle cell — air, or a passable liquid it replaces
             // (raycast hands back a liquid `previous` when aiming through water).
             if self.world.is_obstacle(x, y, z) {
@@ -416,22 +1396,30 @@ impl Game {
             if cell.intersects(&self.player.aabb()) {
                 continue;
             }
+            let prev = self.world.block_at(x, y, z);
+            // Report the placed block; the director derives its class-specific cue.
+            events.push(SoundEvent::BlockPlaced {
+                at: cell_center(x, y, z),
+                block: id,
+            });
             self.world.set_block(x, y, z, id);
+            self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
             // validates and relays, exactly like breaking does with "air".
+            // The spent crafted block is refunded if the server says no.
             if let Some(net) = &mut self.net {
                 let spec = save::block_spec(&self.world, id);
-                net.send_edit(x, y, z, spec);
+                let req = net.send_edit(x, y, z, spec.into());
+                self.pending_edits.insert(
+                    req,
+                    PendingEdit {
+                        cell: (x, y, z),
+                        prev,
+                        kind: PendingKind::Place(id),
+                    },
+                );
+                net.send_swing();
             }
-        }
-    }
-
-    fn toggle_mouse(&mut self, eng: &mut Engine) {
-        self.mouse_locked = !self.mouse_locked;
-        if self.mouse_locked {
-            eng.disable_cursor();
-        } else {
-            eng.enable_cursor();
         }
     }
 
@@ -440,27 +1428,41 @@ impl Game {
     /// The camera is at the origin looking along the view direction, and all
     /// 3D draws are camera-relative. Differences are computed at f64 precision
     /// before narrowing to f32 for the GPU, keeping far terrain stable.
-    pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32) {
-        let camera = self.player.camera_with_fov(fov);
-        let cam_pos = self.player.position;
+    pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32) {
+        let mut scene = self.compose_phase(eng, fov, shake);
+        let mut f = eng.begin_frame(scene.clear);
+        self.scene_phase(&mut f, &scene);
+        self.hud_phase(&mut f, mods, &scene);
+        // Reclaim peer capacity after both consumers finish with the immutable
+        // scene. Stable multiplayer frames allocate no new draw-record vector.
+        self.peer_scratch = std::mem::take(&mut scene.peers);
+        self.peer_scratch.clear();
+    }
 
-        let p = self.player.position;
-        // 0.1-block display resolution: only re-format when a shown digit moves.
-        let key = ((p.x * 10.0) as i64, (p.y * 10.0) as i64, (p.z * 10.0) as i64);
-        if (key.0, key.1, key.2) != (self.coord_cache.0, self.coord_cache.1, self.coord_cache.2) {
-            let text = format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z);
-            self.coord_cache = (key.0, key.1, key.2, text);
-        }
-        let coord_text = self.coord_cache.3.clone();
-        let fps_text = format!("{:2} FPS", eng.fps());
-        let screen_w = eng.screen_width();
-        let screen_h = eng.screen_height();
-        let screen = (screen_w, screen_h);
+    /// Everything a frame needs decided BEFORE recording starts: the camera
+    /// pose, the per-frame lighting truth (the engine UBO's single source),
+    /// peer render poses, and the refreshed HUD string caches.
+    fn compose_phase(&mut self, eng: &mut Engine, fov: f32, shake: f32) -> Scene {
+        let dt = eng.frame_time();
+        // The one pose this frame renders from: mode observation plus effects.
+        // Orientation is cached by exact angle/lens bit patterns — the f64 eye
+        // stays outside the key, so translation with unchanged orientation
+        // reuses the basis and repeats none of its trigonometry.
+        let pose = self.camera.pose(&self.player, &self.world, fov, shake);
+        let camera_key = [
+            pose.yaw.to_bits(),
+            pose.pitch.to_bits(),
+            pose.roll.to_bits(),
+            pose.fovy.to_bits(),
+        ];
+        let camera = *self.camera_cache.get_or(camera_key, || pose.camera3d());
 
-        // Gather the other players to draw (camera-relative), projecting a head
-        // point to screen space for the floating name tags.
-        let peers = self.peer_draws(eng, &camera);
-        let online = self.net.as_ref().map(|net| net.peers().count() + 1);
+        self.refresh_hud_text(eng, dt);
+        let screen = (eng.screen_width(), eng.screen_height());
+
+        // `dt` steps each peer's animator (body-yaw follow, stance blend, swing).
+        let want_tags = self.name_tags && self.theme.hud.shows_world_ui();
+        let peers = self.peer_draws(eng, &camera, &pose, dt, self.player_models, want_tags);
 
         // Compose the single per-frame lighting truth: the source for the
         // engine's per-frame UBO for sky/fog and avatar key lighting. The UBO is
@@ -469,142 +1471,433 @@ impl Game {
         // Exposure is the render thread's latest metered+smoothed value,
         // sourced through `Engine::exposure_for_compose`; temporal smoothing
         // already happened render-side, so frame delta is passed only for
-        // signature symmetry (unused there).
-        let dt = eng.frame_time();
-        let exposure = eng.exposure_for_compose(dt);
-        let snapshot = crate::frame_snapshot::compose(&self.sky, self.frame_index, exposure);
-        let frame_uniforms = voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot);
-        self.frame_index = self.frame_index.wrapping_add(1);
+        // signature symmetry (unused there). With the exposure lane off, the
+        // metered read is skipped entirely.
+        // Allow pinning exposure to a fixed default for stable bless/debug output.
+        static EXPOSURE_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            !matches!(std::env::var("WATT_EXPOSURE").as_deref(), Ok("0"))
+        });
+        let exposure = if self.render.exposure && *EXPOSURE_ON {
+            eng.exposure_for_compose(dt)
+        } else {
+            voxel_engine::skeleton::Exposure::DEFAULT
+        };
+
+        // ONE clock sample for lighting, clear colour, and sky geometry,
+        // cached by the day value. Day/night off renders fixed noon (cheap,
+        // readable stripped-profile lighting) while the authoritative clock
+        // keeps its stored time for networking and re-enables.
+        let sky_day = if self.render.day_night {
+            self.sky.clock.day()
+        } else {
+            0.5
+        };
+        let sky = &self.sky;
+        let sky_frame = *self
+            .sky_frame_cache
+            .get_or(sky_day.to_bits(), || sky.frame_at_day(sky_day));
+
+        // Wrapped-water coordinates recomputed only when the eye XZ changes.
+        let uv_key = [pose.eye.x.to_bits(), pose.eye.z.to_bits()];
+        let anim_uv = *self
+            .anim_uv_cache
+            .get_or(uv_key, || crate::frame_snapshot::animation_uv(pose.eye));
+
+        // With weather, clouds, water animation, and exposure all disabled the
+        // composed packet is a pure function of the day value: cache it and
+        // patch only the camera-anchored UV lanes. Minimum/Fast ride this path.
+        let cacheable_frame = !self.render.weather
+            && !self.render.clouds
+            && !self.render.water_anim
+            && !self.render.exposure;
+        let (mut frame_uniforms, cached_clear) = if cacheable_frame {
+            let render = &self.render;
+            // (day, content_rev): any render/palette change bumps the stamp, so
+            // the freeze predicate's own inputs invalidate the entry structurally.
+            let key = (sky_day.to_bits(), self.content_rev.0);
+            let cached = self.static_frame_cache.get_or(key, || {
+                let snapshot = crate::frame_snapshot::compose_at(
+                    sky, sky_frame, pose.eye, anim_uv, exposure, render,
+                );
+                StaticFrame {
+                    uniforms: voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
+                    clear: sky.clear_at(sky_frame),
+                }
+            });
+            (cached.uniforms, Some(cached.clear))
+        } else {
+            let snapshot = crate::frame_snapshot::compose_at(
+                sky,
+                sky_frame,
+                pose.eye,
+                anim_uv,
+                exposure,
+                &self.render,
+            );
+            (
+                voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
+                None,
+            )
+        };
+        if cacheable_frame {
+            // The camera-anchored UV lanes are the only inputs that can differ
+            // while lighting is frozen; exposure and jitter are fixed by the
+            // cache predicate.
+            frame_uniforms.anim[1] = anim_uv[0];
+            frame_uniforms.anim[2] = anim_uv[1];
+        }
 
         // TerrainKey: flat terrain, sky/fog disabled, magenta clear for the
         // sky-hole detector. Normal: real clear, no debug flat.
         let (clear, debug_flat) = match self.debug_view {
-            DebugView::Normal => (self.sky.clear(), None),
-            DebugView::TerrainKey => (crate::harness::SKY_KEY, Some(crate::harness::TERRAIN_KEY)),
+            DebugView::Normal => (
+                cached_clear.unwrap_or_else(|| self.sky.clear_at(sky_frame)),
+                None,
+            ),
+            // Pure-magenta endpoints (255/0) decode identically under sRGB and raw
+            // normalize, so the sky-hole detector's HDR key value is unchanged.
+            DebugView::TerrainKey => (
+                crate::harness::SKY_KEY.to_linear(),
+                Some(crate::harness::TERRAIN_KEY),
+            ),
         };
 
-        let mut f = eng.begin_frame(clear);
+        Scene {
+            pose,
+            camera,
+            sky_frame,
+            peers,
+            frame_uniforms,
+            clear,
+            debug_flat,
+            screen,
+            dt,
+        }
+    }
 
+    /// Refresh the cached HUD strings (coordinates, FPS, players-online) only
+    /// when their displayed value changes — and not at all below Full HUD.
+    fn refresh_hud_text(&mut self, eng: &Engine, dt: f32) {
+        if !self.theme.hud.shows_info() {
+            return;
+        }
+        let p = self.player.position;
+        // 0.1-block display resolution: only re-format when a shown digit moves.
+        let key = [
+            (p.x * 10.0) as i64,
+            (p.y * 10.0) as i64,
+            (p.z * 10.0) as i64,
+        ];
+        self.coord_cache.get_or(key, || {
+            format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z)
+        });
+        // Scripted (harness) frames pin the readout: a live FPS number is the
+        // one nondeterministic pixel region in an otherwise reproducible shot,
+        // and golden diffs must only ever see real rendering drift. Live FPS is
+        // sampled at human display cadence and re-formatted only when the
+        // displayed integer changes.
+        if self.scripted {
+            self.fps_cache.get_or(-1, || "-- FPS".to_string());
+        } else if self.fps_refresh.steps(dt) != 0 || self.fps_cache.get().is_none() {
+            let fps = eng.fps();
+            self.fps_cache.get_or(fps, || format!("{fps:2} FPS"));
+        }
+        if let Some(net) = &self.net {
+            let count = net.peers().count() + 1;
+            let ping = net.ping_ms();
+            self.online_cache.get_or((count, ping), || match ping {
+                Some(ms) => format!("players online: {count}   {ms} ms"),
+                None => format!("players online: {count}"),
+            });
+        }
+    }
+
+    /// The 3D scope: sky, world, and every humanoid, all camera-relative.
+    fn scene_phase(&mut self, f: &mut voxel_engine::Frame, scene: &Scene) {
+        let Scene {
+            pose,
+            camera,
+            peers,
+            dt,
+            ..
+        } = scene;
         {
-            // The player's f64 eye is the render-space origin for camera rebase:
+            // The pose's f64 eye is the render-space origin for camera rebase:
             // TAA's translation reprojection depends on this.
-            let mut f3 = f.begin_3d(&camera, self.player.position);
-            f3.set_debug_flat(debug_flat);
-            // The per-frame UBO carries the composed lighting truth in every mode
+            // Lighting is decided when the 3D scope opens (no post-hoc setter):
+            // the composed per-frame UBO carries the lighting truth in every mode
             // (the renderer overlays the debug-flat reserved key for TerrainKey).
-            f3.set_frame_uniforms(frame_uniforms);
+            let mut f3 = f.begin_3d(
+                camera,
+                pose.eye,
+                voxel_engine::Lighting::Composed(scene.frame_uniforms),
+            );
+            f3.set_debug_flat(scene.debug_flat);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
-                self.sky.draw(&mut f3);
+                self.sky.draw(&mut f3, scene.sky_frame);
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
-            self.world.render(&mut f3, cam_pos);
-            // Other players: a six-box humanoid facing their travel/look
-            // direction, arms and legs swinging with their gait. `peer.feet` is
-            // already camera-relative (see `peer_draws`).
-            for peer in &peers {
-                Pose::resolve(peer.feet, peer.yaw, peer.pitch, peer.phase, peer.amp)
-                    .draw(&mut f3, peer.color);
+            self.world.render(&mut f3, pose.eye);
+            // Other players: a six-box humanoid, head tracking their look and
+            // body lazily following, limbs swinging with their gait. Poses are
+            // already camera-relative (see peer_draws). A tags-only record
+            // carries no model at all — nothing composed, nothing to skip here.
+            for peer in peers {
+                if let Some((rp, rig)) = &peer.model {
+                    Pose::resolve(rp, rig).draw(&mut f3, peer.color, true);
+                }
+            }
+            // The player's own body — third person and freecam only. First
+            // person draws NOTHING of it (no pose, no animator step, no
+            // shadow): seeing your own torso from inside is noise, and the
+            // common first-person frame skips the whole block.
+            if self.camera.shows_body() {
+                let feet = Feet(DVec3::new(
+                    self.player.position.x,
+                    self.player.feet_y(),
+                    self.player.position.z,
+                ));
+                let v = self.player.velocity();
+                let speed = ((v.x * v.x + v.z * v.z).sqrt()) as f32;
+                let rp = RenderPose::new(
+                    feet,
+                    Eye(pose.eye),
+                    self.player.orientation.yaw,
+                    self.player.orientation.pitch,
+                    Stance::of_player(&self.player),
+                    Gait::new(self.local_gait as f32, speed),
+                );
+                let rig = self.local_anim.step(&rp, *dt);
+                Pose::resolve(&rp, &rig).draw(&mut f3, peer_color(&self.save_name), true);
             }
         }
+    }
 
+    /// Everything over the world: minimap, reticle, name tags, info text, the
+    /// mods' HUD data (rendered by the core — mods never touch the frame), and
+    /// the console on top.
+    fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
+        // HUD Off records nothing at all — unless the console is open, which
+        // must stay reachable in every mode.
+        if matches!(self.theme.hud, HudMode::Off) && !self.console.is_open() {
+            return;
+        }
+        let screen = scene.screen;
         let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
-        // Draw minimap.
-        let player_col = IVec2::new(
-            self.player.position.x.floor() as i32,
-            self.player.position.z.floor() as i32,
-        );
-        self.minimap.draw(&mut f, screen, player_col, self.player.yaw);
-
         let theme = &self.theme;
+
+        // Minimap: informational, so Full mode only (HUD Off must blank it too).
+        if theme.hud.shows_minimap()
+            && let Some(minimap) = &self.minimap
+        {
+            let player_col = IVec2::new(
+                self.player.position.x.floor() as i32,
+                self.player.position.z.floor() as i32,
+            );
+            minimap.draw(f, screen, player_col, self.player.orientation.yaw);
+        }
 
         // Reticle and world-space name tags: shown in every mode but fully-off.
         if theme.hud.shows_world_ui() {
-            theme.crosshair.draw(&mut f, screen);
+            theme.crosshair.draw(f, screen);
 
-            // Floating name tags over each visible player.
-            for peer in &peers {
-                if let Some(tag) = peer.tag {
+            // Floating name tags over each visible player, in the peer's own
+            // tint, fading with distance and dimming when terrain occludes the
+            // head (instead of drawing full-strength through walls).
+            for peer in &scene.peers {
+                if let Some(tag) = &peer.tag {
                     let fs = theme.fs(18);
-                    let tw = f.measure_text(&peer.name, fs);
+                    let tw = f.measure_text(&tag.name, fs);
+                    let c = peer.color;
                     console::shadowed(
-                        &mut f,
-                        &peer.name,
-                        tag.x as i32 - tw / 2,
-                        tag.y as i32,
+                        f,
+                        &tag.name,
+                        tag.screen.x as i32 - tw / 2,
+                        tag.screen.y as i32,
                         fs,
-                        ui::Role::Primary.color(),
+                        Color::new(c.r, c.g, c.b, (tag.alpha * 255.0) as u8),
                     );
                 }
             }
         }
 
-        // Informational HUD text: coords, help, FPS, player count. Full mode only.
+        // Informational HUD text: coords, help, FPS, player count. Full mode
+        // only — read from the `Game`-side caches `refresh_hud_text` maintains.
         if theme.hud.shows_info() {
-            ui::label(&mut f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), &coord_text);
-            ui::label(&mut f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), &fps_text);
-            if let Some(count) = online {
-                let text = format!("players online: {count}");
-                ui::label(&mut f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), &text);
+            if let Some(coord_text) = self.coord_cache.get() {
+                ui::label(
+                    f,
+                    theme,
+                    screen,
+                    Anchor::Top,
+                    (0, 12),
+                    26,
+                    ui::Role::Primary.color(),
+                    coord_text,
+                );
+            }
+            if let Some(fps_text) = self.fps_cache.get() {
+                ui::label(
+                    f,
+                    theme,
+                    screen,
+                    Anchor::TopLeft,
+                    (10, 12),
+                    20,
+                    ui::Role::Positive.color(),
+                    fps_text,
+                );
+            }
+            if self.net.is_some()
+                && let Some(online_text) = self.online_cache.get()
+            {
+                ui::label(
+                    f,
+                    theme,
+                    screen,
+                    Anchor::TopRight,
+                    (-12, 180),
+                    20,
+                    ui::Role::Positive.color(),
+                    online_text,
+                );
             }
         }
 
         // Enabled mods contribute their HUD as data; the core renders it over the
         // world, under the console. Mods never touch the frame themselves.
-        let hud = mods.hud(&self.world, screen);
-        ui::render_hud(&mut f, theme, screen, &hud);
-        self.console.draw(&mut f, screen_w, screen_h);
+        // Gameplay UI, so it follows the reticle: hidden only when HUD is Off
+        // or the mod-HUD lane itself is disabled.
+        if self.mod_hud && theme.hud.shows_mod_hud() {
+            let hud = mods.hud(&self.world, screen);
+            ui::render_hud(f, theme, screen, &hud);
+        }
+        // Minimal keeps the world readable: no closed-console scrollback.
+        if matches!(theme.hud, HudMode::Full) || self.console.is_open() {
+            self.console.draw(f, screen.0, screen.1);
+        }
     }
 
-    /// Build the per-frame draw data for other players, projecting a head point to
-    /// screen space for the name tag (only for peers in front and within range).
-    /// The in-front/range filters run in `f64`; the projection takes the
-    /// camera-relative head with the origin-based camera, matching the scene.
-    fn peer_draws(&self, eng: &Engine, camera: &Camera3D) -> Vec<PeerDraw> {
-        let Some(net) = &self.net else { return Vec::new() };
-        let eye = self.player.position;
-        let forward = self.player.forward();
+    /// Build the per-frame draw data for other players. `&mut self` because
+    /// animator state advances here. Disabled models skip animator and rig
+    /// composition entirely; disabled tags skip projection, occlusion
+    /// raycasts, and name cloning — each stops at its owning boundary.
+    fn peer_draws(
+        &mut self,
+        eng: &Engine,
+        camera: &Camera3D,
+        pose: &ViewPose,
+        dt: f32,
+        want_models: bool,
+        want_tags: bool,
+    ) -> Vec<PeerDraw> {
+        let mut draws = std::mem::take(&mut self.peer_scratch);
+        draws.clear();
+        if !want_models && !want_tags {
+            return draws;
+        }
+        let Some(net) = &mut self.net else {
+            return draws;
+        };
+        let world = &self.world;
+        let eye = pose.eye;
+        let forward = pose.forward();
         let now = Instant::now();
-        net.peers()
-            .map(|peer| {
-                let r = peer.sample(now);
-                let head = r.pos + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
+        // Outside interest range there is no live pose: drawing the last
+        // heard one would freeze a ghost in place.
+        for peer in net.peers_mut().filter(|peer| peer.visible()) {
+            let r = peer.sample(now);
+            let feet = r.pos.feet(r.stance);
+            let color = peer_color(&peer.name);
+            let model = want_models.then(|| {
+                let rp = RenderPose::new(
+                    feet,
+                    Eye(eye),
+                    r.yaw,
+                    r.pitch,
+                    r.stance,
+                    Gait::new(r.phase, r.speed),
+                );
+                let rig = peer.anim.step(&rp, dt);
+                (rp, rig)
+            });
+            let tag = if want_tags {
+                let head = feet.0 + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
                 let to_head = head - eye;
-                let visible = to_head.dot(forward) > 0.0 && to_head.length() <= TAG_RANGE;
-                let tag = visible.then(|| eng.world_to_screen(to_head.as_vec3(), camera));
-                // Map horizontal speed to a swing amplitude: none when idle,
-                // saturating for a natural stride at walking pace.
-                let amp = (r.speed * 0.22).min(0.9);
-                PeerDraw {
-                    feet: (r.pos - eye).as_vec3(),
-                    yaw: r.yaw,
-                    pitch: r.pitch,
-                    phase: r.phase,
-                    amp,
-                    color: peer_color(&peer.name),
-                    name: peer.name.clone(),
-                    tag,
+                let dist = to_head.length();
+                if to_head.dot(forward) > 0.0 && dist > 1e-6 {
+                    // Raycast to dim tag when terrain occludes the head.
+                    let occluded =
+                        interact::raycast(world, eye, to_head / dist, (dist - 0.5).max(0.0))
+                            .is_some();
+                    match TagVisibility::of(dist, occluded) {
+                        TagVisibility::Hidden => None,
+                        TagVisibility::Visible { alpha } => Some(PeerTag {
+                            screen: eng.world_to_screen(to_head.as_vec3(), camera),
+                            alpha,
+                            name: peer.name.clone(),
+                        }),
+                    }
+                } else {
+                    None
                 }
-            })
-            .collect()
+            } else {
+                None
+            };
+            // A tags-only peer that is entirely hidden needs no record at all.
+            if model.is_some() || tag.is_some() {
+                draws.push(PeerDraw { model, color, tag });
+            }
+        }
+        draws
     }
 }
 
 /// Everything needed to draw one other player this frame.
 struct PeerDraw {
-    /// Camera-relative feet position (world position minus the eye, subtracted
-    /// in f64, then narrowed) — safe to hand to the f32 immediate draws.
-    feet: Vec3,
-    /// Body facing and head look, interpolated from the network history.
-    yaw: f32,
-    pitch: f32,
-    /// Gait phase (radians) and speed-scaled swing amplitude.
-    phase: f32,
-    amp: f32,
+    /// Camera-relative render pose (world minus eye, subtracted in f64, then
+    /// narrowed) — safe to hand to the f32 immediate draws — plus this frame's
+    /// animator output. Absent in name-tags-only mode, so animator and
+    /// humanoid composition are skipped rather than merely hidden at draw time.
+    model: Option<(RenderPose, presence::RigParams)>,
     color: Color,
-    name: String,
-    /// Screen position for the name tag, or `None` when off-screen/behind us.
-    tag: Option<Vec2>,
+    /// The visible name tag, or `None` when off-screen, behind us, occluded
+    /// past range, or tags are disabled. Screen position, fade, and the shared
+    /// name travel together — they exist together by construction.
+    tag: Option<PeerTag>,
+}
+
+/// One on-screen name tag: everything the HUD pass draws for it.
+struct PeerTag {
+    screen: Vec2,
+    /// Distance/occlusion fade in `[0, 1]`.
+    alpha: f32,
+    /// Refcount bump of the connection's interned name, never a fresh String.
+    name: std::sync::Arc<str>,
+}
+
+/// Whether a mod-supplied modal can both be seen and receive input. Free over
+/// its inputs so the live predicate and the would-be-applied check in
+/// `apply_settings` share one rule instead of restating it.
+fn mod_ui_active(mod_logic: bool, mod_hud: bool, hud: HudMode) -> bool {
+    mod_logic && mod_hud && hud.shows_mod_hud()
+}
+
+/// The world-space centre of a voxel cell (occurrence position).
+fn cell_center(x: i32, y: i32, z: i32) -> DVec3 {
+    DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
+}
+
+/// Toggle capture and sync cursor grab with the OS.
+fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
+    let captured = !router.captured();
+    router.set_captured(captured);
+    if captured {
+        eng.disable_cursor();
+    } else {
+        eng.enable_cursor();
+    }
 }
 
 /// A stable, cheerful colour for a player, hashed from their name so the same player

@@ -12,20 +12,17 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use voxel_engine::{DVec3, Engine, Key, MouseButton};
+use voxel_engine::{DVec3, Engine};
 
 use crate::block::crafting::craft_natural;
 use crate::block::registry::BlockId;
 use crate::block::{AIR, ElementId};
-use crate::interact;
 use crate::math::{Aabb, Bounded};
 use crate::mods::inventory::{InventoryMod, PANEL_X, PANEL_Y};
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
 use crate::ui::{visible_window, HudElement, Panel, Role, Row};
 use crate::world::World;
 
-/// How far the player can reach to place a block — matches the break reach.
-const PLACE_REACH: f64 = 6.0;
 const PANEL_WIDTH: i32 = 360;
 const PANEL_PAD: i32 = 8;
 const FONT_SIZE: i32 = 18;
@@ -56,10 +53,18 @@ pub struct CraftingMod {
     crafted: Vec<Crafted>,
     /// Index into `crafted` of the block RMB places, if any.
     equipped: Option<usize>,
+    /// Held element ids mirrored from the stash only when its revision changes.
+    /// Stable gameplay frames therefore do no temporary-vector allocation.
+    held_elements: Vec<ElementId>,
+    seen_stash_rev: u64,
 }
 
 impl CraftingMod {
     pub(crate) fn new(stash: Rc<RefCell<ElementStash>>, ui: Rc<Cell<ItemUiState>>) -> Self {
+        let (seen_stash_rev, held_elements) = {
+            let held = stash.borrow();
+            (held.rev(), held.iter().map(|(element, _)| element).collect())
+        };
         Self {
             stash,
             ui,
@@ -67,6 +72,8 @@ impl CraftingMod {
             selected: Vec::new(),
             crafted: Vec::new(),
             equipped: None,
+            held_elements,
+            seen_stash_rev,
         }
     }
 
@@ -80,52 +87,55 @@ impl CraftingMod {
         self.ui.set(ui);
     }
 
-    /// The held element kinds in stash order — the navigable element rows. Read
-    /// live from the shared stash (small, changes rarely) so no cache can drift.
-    fn elements(&self) -> Vec<ElementId> {
-        self.stash.borrow().iter().map(|(e, _)| e).collect()
-    }
-
     /// Total rows the cursor can sit on: one per element kind, the Craft row,
     /// one per crafted block type. Always at least 1 (the Craft row).
     fn row_count(&self) -> usize {
-        self.elements().len() + 1 + self.crafted.len()
+        self.held_elements.len() + 1 + self.crafted.len()
     }
 
-    /// Drop selections whose element ran out, and keep the cursor on a real row.
-    fn refresh(&mut self) {
-        let present = self.elements();
-        self.selected.retain(|e| present.contains(e));
+    /// Refresh only after an actual stash mutation. The vector retains capacity,
+    /// so pickups/crafts rebuild it without turning stable frames into allocator work.
+    fn refresh(&mut self) -> bool {
+        let rev = self.stash.borrow().rev();
+        if rev == self.seen_stash_rev {
+            self.cursor = self.cursor.min(self.row_count() - 1);
+            return false;
+        }
+        self.held_elements.clear();
+        self.held_elements.extend(self.stash.borrow().iter().map(|(element, _)| element));
+        self.selected.retain(|element| self.held_elements.contains(element));
+        self.seen_stash_rev = rev;
         self.cursor = self.cursor.min(self.row_count() - 1);
+        true
     }
 
-    /// Panel-open key handling: move the cursor, toggle selections, craft, equip.
-    fn navigate(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        if eng.is_key_pressed(Key::Up) || eng.is_key_pressed(Key::K) {
+    /// Navigate panel using intent flags.
+    fn navigate(&mut self, ctx: &mut ModContext) {
+        if ctx.nav_up {
             self.cursor = self.cursor.saturating_sub(1);
         }
-        if eng.is_key_pressed(Key::Down) || eng.is_key_pressed(Key::J) {
+        if ctx.nav_down {
             self.cursor = (self.cursor + 1).min(self.row_count() - 1);
         }
-        if eng.is_key_pressed(Key::Enter) || eng.is_key_pressed(Key::L) {
+        if ctx.nav_confirm {
             self.activate(ctx);
         }
     }
 
     /// Enter/L on the current row.
     fn activate(&mut self, ctx: &mut ModContext) {
-        let elements = self.elements();
-        if self.cursor < elements.len() {
-            let element = elements[self.cursor];
+        let element_count = self.held_elements.len();
+        if self.cursor < element_count {
+            let element = self.held_elements[self.cursor];
             if let Some(at) = self.selected.iter().position(|&e| e == element) {
                 self.selected.remove(at);
             } else {
                 self.selected.push(element);
             }
-        } else if self.cursor == elements.len() {
+        } else if self.cursor == element_count {
             self.craft(ctx);
         } else {
-            self.equipped = Some(self.cursor - elements.len() - 1);
+            self.equipped = Some(self.cursor - element_count - 1);
         }
     }
 
@@ -165,8 +175,8 @@ impl CraftingMod {
         self.refresh();
     }
 
-    /// RMB while the panel is closed: place the equipped block against whatever
-    /// the player is aiming at.
+    /// RMB while the panel is closed: place the equipped block at the cell
+    /// resolved from the input edge's aim, even when mod replay is delayed.
     ///
     /// The actual world write happens in the game when it drains
     /// [`ModContext::placements`], guarded by "cell is air, doesn't overlap the
@@ -174,8 +184,8 @@ impl CraftingMod {
     /// and the queue is applied later in the same frame against the same world
     /// state — so a placement that costs a block always lands, and a rejected
     /// aim costs nothing.
-    fn try_place(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        if !eng.is_mouse_button_pressed(MouseButton::Right) || !ctx.mouse_locked {
+    fn try_place(&mut self, ctx: &mut ModContext) {
+        if !ctx.place {
             return;
         }
         let Some(equipped) = self.equipped else {
@@ -184,15 +194,9 @@ impl CraftingMod {
         if self.crafted[equipped].count == 0 {
             return;
         }
-        let Some(hit) = interact::raycast(
-            ctx.world,
-            ctx.player.position,
-            ctx.player.forward(),
-            PLACE_REACH,
-        ) else {
+        let Some((x, y, z)) = ctx.place_target else {
             return;
         };
-        let (x, y, z) = hit.previous;
         if ctx.world.block_at(x, y, z) != AIR || cell_aabb(x, y, z).intersects(&ctx.player.aabb()) {
             return;
         }
@@ -244,25 +248,30 @@ impl Mod for CraftingMod {
         self.selected.clear();
         self.crafted.clear();
         self.equipped = None;
+        self.held_elements.clear();
+        self.seen_stash_rev = self.stash.borrow().rev();
     }
 
     fn description(&self) -> &str {
         "Craft natural blocks from gathered elements and place them (press C)."
     }
 
-    fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
+    fn update(&mut self, _eng: &Engine, ctx: &mut ModContext) {
         self.refresh();
-        if ctx.capturing_text {
-            return;
-        }
-        if eng.is_key_pressed(Key::C) {
+        if ctx.toggle_crafting {
             self.set_open(!self.is_open());
         }
         if self.is_open() {
-            self.navigate(eng, ctx);
+            self.navigate(ctx);
         } else {
-            self.try_place(eng, ctx);
+            self.try_place(ctx);
         }
+    }
+
+    fn on_place_rejected(&mut self, id: BlockId, world: &World) {
+        // The server refused the placement: the spent block comes back to the
+        // pouch (re-listing it if the entry emptied meanwhile).
+        self.push_loaded(world, id, 1, false);
     }
 
     fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
@@ -475,6 +484,25 @@ mod tests {
         crafting.load_state("Copper+Glass=1", &mut world);
         let id = crafting.crafted[0].id;
         assert_eq!(world.registry().id_by_name("Copper+Glass"), Some(id));
+    }
+
+    #[test]
+    fn held_element_rows_rebuild_only_after_stash_mutation() {
+        let stash = Rc::new(RefCell::new(ElementStash::new(10)));
+        stash.borrow_mut().add(&[ElementId(1), ElementId(2), ElementId(2)]);
+        let mut crafting =
+            CraftingMod::new(stash.clone(), Rc::new(Cell::new(ItemUiState::default())));
+        assert_eq!(crafting.held_elements, vec![ElementId(1), ElementId(2)]);
+        assert!(!crafting.refresh(), "an unchanged stash is a constant-time no-op");
+
+        crafting.selected = vec![ElementId(1), ElementId(2)];
+        crafting.cursor = usize::MAX;
+        assert!(stash.borrow_mut().consume(&[ElementId(1)]));
+        assert!(crafting.refresh());
+        assert_eq!(crafting.held_elements, vec![ElementId(2)]);
+        assert_eq!(crafting.selected, vec![ElementId(2)]);
+        assert!(crafting.cursor < crafting.row_count());
+        assert!(!crafting.refresh());
     }
 
     #[test]

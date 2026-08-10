@@ -39,6 +39,18 @@ pub struct Reaction {
     pub effect: ReactionEffect,
 }
 
+/// Why a reaction recipe was rejected at registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactionError {
+    /// A reaction needs at least one reagent; zero reagents would make "all
+    /// present" vacuously true and divide by a zero ratio denominator.
+    NoReagents,
+    /// The same element appears twice in the reagent list.
+    DuplicateReagent,
+    /// Optimal shares must each be nonzero and sum to exactly 100.
+    BadShares,
+}
+
 /// A reaction that fired in a particular block, with the strength it reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveReaction {
@@ -57,14 +69,32 @@ pub struct ReactionRegistry {
 impl ReactionRegistry {
     /// A registry preloaded with the built-in reactions.
     pub fn with_builtins() -> Self {
-        Self {
-            reactions: builtin_reactions(),
+        let mut reg = Self { reactions: Vec::new() };
+        for reaction in builtin_reactions() {
+            reg.register(reaction).expect("builtin reactions are valid");
         }
+        reg
     }
 
-    /// Add a reaction recipe.
-    pub fn register(&mut self, reaction: Reaction) {
+    /// Add a reaction recipe. Rejects recipes that could never match sanely:
+    /// empty reagent lists, repeated reagents, and shares that don't form a
+    /// nonzero 100-percent split.
+    pub fn register(&mut self, reaction: Reaction) -> Result<(), ReactionError> {
+        if reaction.reagents.is_empty() {
+            return Err(ReactionError::NoReagents);
+        }
+        for (i, &(id, _)) in reaction.reagents.iter().enumerate() {
+            if reaction.reagents[..i].iter().any(|&(seen, _)| seen == id) {
+                return Err(ReactionError::DuplicateReagent);
+            }
+        }
+        if reaction.reagents.iter().any(|&(_, share)| share == 0)
+            || reaction.reagents.iter().map(|&(_, share)| share as u32).sum::<u32>() != 100
+        {
+            return Err(ReactionError::BadShares);
+        }
         self.reactions.push(reaction);
+        Ok(())
     }
 
     /// Every reaction whose reagents are all present in `comp`, each with its
@@ -96,10 +126,6 @@ impl ReactionRegistry {
                 continue;
             }
 
-            // Compare actual reagent ratios to the reaction's optimum: sum the
-            // absolute percent differences across reagents. Accumulate over the
-            // common denominator `reagent_total` in u64 and divide once at the
-            // end, to avoid rounding each term down individually.
             let total = reagent_total as u64;
             let distance: u64 = reaction
                 .reagents
@@ -197,9 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_element_ratio_matches_equivalent_mixture() {
-        // A natural block whose reagents repeat (3 copper : 2 iron) must match the
-        // ratio of the equivalent 60/40 mixture.
+    fn duplicated_naturals_react_as_their_set() {
+        // Naturals canonicalize to sets, so repeating an element cannot tilt a
+        // reaction ratio — a duplicated listing reacts exactly like the plain
+        // set (equal parts). Ratios belong to mixtures.
         let reg = ReactionRegistry::with_builtins();
         let dup = Composition::natural(&[
             El::Copper.id(),
@@ -208,15 +235,41 @@ mod tests {
             El::Iron.id(),
             El::Iron.id(),
         ]);
-        let mix = Composition::mixture(&[(El::Copper.id(), 60), (El::Iron.id(), 40)]).unwrap();
+        let set = Composition::natural(&[El::Copper.id(), El::Iron.id()]);
         let strength_of = |c: &Composition| {
             reg.active_for(c)
                 .iter()
                 .find(|r| r.name.as_ref() == "Alloy")
                 .map(|r| r.strength)
         };
-        assert_eq!(strength_of(&dup), Some(255), "3:2 hits the 60/40 optimum");
-        assert_eq!(strength_of(&dup), strength_of(&mix), "duplicate natural matches mixture ratio");
+        assert_eq!(strength_of(&dup), strength_of(&set), "duplicates reduce to the set");
+        // Equal parts is off the 60/40 optimum, so the alloy fires below peak.
+        let mix = Composition::mixture(&[(El::Copper.id(), 60), (El::Iron.id(), 40)]).unwrap();
+        assert!(strength_of(&dup).unwrap() < strength_of(&mix).unwrap());
+    }
+
+    #[test]
+    fn register_rejects_degenerate_recipes() {
+        let mut reg = ReactionRegistry::with_builtins();
+        let recipe = |reagents: &[(ElementId, u8)]| Reaction {
+            name: "x".into(),
+            reagents: Box::from(reagents),
+            effect: ReactionEffect::Emergent(EmergentKind::Reactive, 1),
+        };
+        assert_eq!(reg.register(recipe(&[])), Err(ReactionError::NoReagents));
+        assert_eq!(
+            reg.register(recipe(&[(El::Copper.id(), 50), (El::Copper.id(), 50)])),
+            Err(ReactionError::DuplicateReagent)
+        );
+        assert_eq!(
+            reg.register(recipe(&[(El::Copper.id(), 60), (El::Iron.id(), 60)])),
+            Err(ReactionError::BadShares)
+        );
+        assert_eq!(
+            reg.register(recipe(&[(El::Copper.id(), 100), (El::Iron.id(), 0)])),
+            Err(ReactionError::BadShares)
+        );
+        assert_eq!(reg.register(recipe(&[(El::Copper.id(), 100)])), Ok(()));
     }
 
     #[test]

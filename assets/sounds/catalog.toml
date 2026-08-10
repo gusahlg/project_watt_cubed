@@ -1,0 +1,74 @@
+# Short, eagerly decoded sound effects. Relative paths are confined below this
+# directory and duplicate file references are decoded only once.
+
+[cues.break_default]
+response = "world"
+[[cues.break_default.layers]]
+variants = ["generated/break_default_1.wav", "generated/break_default_2.wav"]
+gain = [0.78, 0.95]
+pitch = [-2.0, 2.0]
+delay = [0.0]
+mode = "one_shot"
+
+[cues.place_default]
+response = "world"
+[[cues.place_default.layers]]
+variants = ["generated/place_default_1.wav"]
+gain = [0.72, 0.88]
+pitch = [-1.0, 1.0]
+delay = [0.0]
+mode = "one_shot"
+
+[cues.step_default]
+response = "world"
+[[cues.step_default.layers]]
+variants = ["generated/step_default_1.wav", "generated/step_default_2.wav"]
+gain = [0.45, 0.62]
+pitch = [-2.0, 2.0]
+delay = [0.0]
+mode = "one_shot"
+
+[cues.splash]
+response = "world"
+[[cues.splash.layers]]
+variants = ["generated/splash_1.wav"]
+gain = [0.72, 0.9]
+pitch = [-1.0, 1.0]
+delay = [0.0]
+mode = "one_shot"
+
+[cues.swing]
+response = "world"
+[[cues.swing.layers]]
+variants = ["generated/swing_1.wav"]
+gain = [0.55, 0.72]
+pitch = [-1.5, 1.5]
+delay = [0.0]
+mode = "one_shot"
+
+[cues.underwater_loop]
+response = "ambient"
+[[cues.underwater_loop.layers]]
+variants = ["generated/underwater_loop_1.wav"]
+gain = [0.32]
+pitch = [0.0]
+delay = [0.0]
+mode = "loop"
+
+[cues.menu_click]
+response = "ui"
+[[cues.menu_click.layers]]
+variants = ["generated/menu_click_1.wav"]
+gain = [0.52]
+pitch = [0.0]
+delay = [0.0]
+mode = "one_shot"
+
+[cues.voicetest]
+response = "ui"
+[[cues.voicetest.layers]]
+variants = ["generated/voicetest_1.wav"]
+gain = [0.5]
+pitch = [0.0]
+delay = [0.0]
+mode = "one_shot"

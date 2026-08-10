@@ -32,6 +32,21 @@ pub struct SkyClock {
     day: f64,
 }
 
+/// One clock sample every sun consumer shares: direction, elevation, and
+/// daylight from a single trig evaluation, instead of each consumer
+/// re-deriving them per frame. Cached by the game keyed on the day value, so
+/// a frozen clock (day/night off, stripped profiles) performs no
+/// steady-frame sun trigonometry at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkyFrame {
+    /// Unit direction toward the sun (see [`SkyClock::sun_dir`]).
+    pub sun_dir: Vec3,
+    /// Sun elevation above the horizon, `[-1, 1]` (`sun_dir.y`).
+    pub elevation: f32,
+    /// Daylight amount in `[0, 1]` with smooth twilight (see [`SkyClock::daylight`]).
+    pub daylight: f32,
+}
+
 impl Default for SkyClock {
     fn default() -> Self {
         Self { day: 0.3 } // start a little after sunrise
@@ -73,6 +88,14 @@ impl SkyClock {
     /// smooth twilight either side of the horizon crossing.
     pub fn daylight(&self) -> f32 {
         smoothstep(-0.12, 0.18, self.sun_elevation())
+    }
+
+    /// Sample direction, elevation, and daylight once — the per-frame form
+    /// every consumer shares (lighting compose, clear colour, sky geometry).
+    pub fn frame(&self) -> SkyFrame {
+        let sun_dir = self.sun_dir();
+        let elevation = sun_dir.y;
+        SkyFrame { sun_dir, elevation, daylight: smoothstep(-0.12, 0.18, elevation) }
     }
 }
 

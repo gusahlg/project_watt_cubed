@@ -1,5 +1,6 @@
-//! Input handling: the keyboard-driven [`movement`] controller and the
-//! mouse-driven [`look`] controller. Both read engine input and mutate the
-//! [`Player`](crate::player::Player); nothing here draws.
+//! Routes device intents via stable per-frame observation pattern.
+pub mod bindings;
+pub mod intent;
 pub mod look;
 pub mod movement;
+pub mod router;

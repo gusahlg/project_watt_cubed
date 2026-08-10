@@ -35,4 +35,14 @@ impl Weather {
         };
         self.coverage * 0.003 + precip
     }
+
+    /// Rain strength [0,1] driving the sky palette overrides: the precip
+    /// `wetness`, zero unless it is actually raining. Snow leaves the (cool, wet)
+    /// rain sky tint untouched.
+    pub fn rain_strength(&self) -> f32 {
+        match self.precip {
+            Precip::Rain => self.wetness,
+            _ => 0.0,
+        }
+    }
 }

@@ -14,10 +14,10 @@ mod weather;
 
 pub use atmosphere::Atmosphere;
 pub use palette::{Anchor, Palette, Role};
-pub use clock::{DayLength, SkyClock};
+pub use clock::{DayLength, SkyClock, SkyFrame};
 pub use weather::{Precip, Weather};
 
-use voxel_engine::{Color, Frame3D, LinearRgb, SkyDesc};
+use voxel_engine::{Frame3D, LinearRgb, SkyDesc};
 
 use crate::sky::palette::Rgb;
 
@@ -51,21 +51,37 @@ impl Sky {
         self.clock.advance(dt, self.day_length);
     }
 
+    /// Sample the clock once for every sun consumer this frame.
+    pub fn frame(&self) -> SkyFrame {
+        self.clock.frame()
+    }
+
+    /// The clock sample at a pinned day fraction (stripped profiles render
+    /// fixed noon without mutating the authoritative clock).
+    pub fn frame_at_day(&self, day: f64) -> SkyFrame {
+        let mut clock = self.clock;
+        clock.set_day(day);
+        clock.frame()
+    }
+
     /// The flat clear colour for [`Engine::begin_frame`](voxel_engine::Engine::begin_frame).
-    pub fn clear(&self) -> Color {
-        self.atmosphere.clear(self.clock.sun_dir())
+    pub fn clear(&self) -> LinearRgb {
+        self.clear_at(self.frame())
+    }
+
+    /// [`clear`](Self::clear) against an already-sampled clock frame.
+    pub fn clear_at(&self, frame: SkyFrame) -> LinearRgb {
+        self.atmosphere.clear(frame.sun_dir)
     }
 
     /// Draw the procedural sky. Only sun geometry + disc tint cross here; the
     /// gradient/glow colours are read GPU-side from the shared per-frame UBO (the
     /// same linear source the terrain fog reads), so the sky and the fog
     /// it blends into cannot diverge.
-    pub fn draw(&self, f: &mut Frame3D) {
-        let sun = self.clock.sun_dir();
-        let daylight = self.clock.daylight();
+    pub fn draw(&self, f: &mut Frame3D, frame: SkyFrame) {
         f.set_sky(SkyDesc {
-            sun_dir: sun,
-            sun_tint: sun_tint(daylight),
+            sun_dir: frame.sun_dir,
+            sun_tint: sun_tint(frame.daylight),
             sun_angular_radius: 0.03,
         });
     }

@@ -1,12 +1,49 @@
 [package]
 name = "project_watt_cubed"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
+default-run = "project_watt_cubed"
+
+[features]
+# Keeps the placeholder asset writer out of release/Nix installations. Invoke
+# explicitly while developing audio content.
+dev-tools = []
+
+[[bin]]
+name = "gen_tones"
+path = "src/bin/gen_tones.rs"
+required-features = ["dev-tools"]
 
 [dependencies]
 # Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
-# types (glam Vec2/Vec3) and Color the game uses, so it is the only dependency.
-voxel_engine = { path = "../voxel-engine" }
+# types (glam Vec2/Vec3) and Color the game uses
+voxel_engine = { version = "0.1.0", path = "../voxel-engine" }
+
+# Benchmark metadata probes Vulkan directly so reports identify the actual
+# renderer-compatible GPU and driver without shelling out to optional tools.
+# This is the same version the renderer already uses, so it adds no duplicate.
+ash = "0.38"
+
+# Vector math, matching the engine's version so the re-exported `Vec3`/`Mat4`
+# and our direct `UVec3` (section block origins) are the same `glam` types.
+glam = "0.32.1"
+
+# Multiplayer transport and its async runtime/TLS setup.
+quinn = { version = "0.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Audio output/capture, realtime queues, voice codec, and cue manifests.
+# Prefer cpal's native PulseAudio-protocol host on Linux (also served by
+# PipeWire's Pulse compatibility layer), then fall back to ALSA. This avoids
+# relying on distro-specific ALSA plugin configuration in portable bundles.
+cpal = { version = "0.18", features = ["pulseaudio"] }
+kira = "0.12"
+opus-rs = "0.1"
+rtrb = "0.3"
+toml = "0.9"
 
 # Maximum-performance release build: aggressive inlining across the whole
 # dependency graph (fat LTO), a single codegen unit so the optimizer sees
@@ -17,3 +54,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Keep our own crates fast to compile in dev, but optimize dependencies
+# (glam, ash, winit, etc.) so debug runs aren't crippled by unoptimized math.
+[profile.dev.package."*"]
+opt-level = 2

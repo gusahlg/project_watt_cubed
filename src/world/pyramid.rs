@@ -1,212 +1,171 @@
-//! Phase D1 — the far-terrain LOD *pyramid*: a distance-driven ladder of
-//! coarse [`Lod`] tile rings between the full-res chunks and the Zone-3 skin.
-//!
-//! D1 is the ONE-new-level slice: exactly two rings, `Lod(2)` (today's tier) then
-//! `Lod(4)`, spaced by a log-falloff distance rule. The k-level generalisation is
-//! D2 — an explicit go/no-go gate, deliberately NOT built here.
-//!
-//! Two derivations live here, both "derived, not guessed":
-//! * [`level_for`] — the total, monotone distance→[`LodChoice`] map.
-//! * [`DroopTable`] — per-level geometric droop, *calibrated* by a deterministic
-//!   in-crate sweep of the generator, never a bare constant. Coarser levels
-//!   droop further into the ground, so where two rings overlap the finer one sits
-//!   higher and wins the depth test — the same trick the skin uses under the tiles
-//!   ([`SKIN_DROOP`](super::skin)), now a whole ladder.
+//! Distance-driven LOD selection: map XZ distance to LOD level and keep tolerance.
 use std::num::NonZeroU8;
 
-use super::generation::TerrainGenerator;
-use super::lod::Lod;
+use crate::ident::Detail;
+use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, max_lod_levels};
 
-/// What a given XZ distance from the player wants drawn there. `Option<Lod>`
-/// was underspecified — "no tile" meant two different things (chunks own it vs.
-/// the skin owns it), so it becomes three explicit cases.
+use super::metric::EyeDist;
+
+/// Number of LOD rings: 7 gives base-2 cells, reaching 256m at the farthest ring.
+pub(in crate::world) const SECTION_LEVELS: u8 = 7;
+
+/// LOD choice at a given XZ distance. No `Chunks` case because sections totally cover
+/// the plane; the near-field overlap with full-res chunks is handled by the clip volume.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LodChoice {
-    /// Nearer than the innermost ring: full-res chunks own it.
-    Chunks,
-    /// This ring's tile level owns it.
-    Level(Lod),
-    /// Beyond the outermost ring: the far skin owns it.
+    Level(Detail),
     BeyondHorizon,
 }
 
-/// D1 configuration. `unit` is the chunk view radius in
-/// metres (the innermost ring starts where the full-res box ends), `base` the
-/// distance falloff — the cell-size ratio between adjacent rings.
+/// LOD pyramid configuration. `unit`: ring 0 radius in meters; `base`: cell-size ratio per ring.
 pub struct PyramidCfg {
-    pub finest: Lod,
+    pub finest: Detail,
     pub levels: NonZeroU8,
     pub unit: f32,
-    /// ≥ 2.0 (log falloff — DH's load-bearing rule).
+    /// ≥ 2.0 for exponential falloff.
     pub base: f32,
+    /// Cached integer log2(base). Selection and covering query this for every
+    /// section, so deriving it once avoids repeated floating-point logarithms.
+    step: u8,
 }
 
 impl PyramidCfg {
-    /// The D1 slice: `finest = Lod(2)`, two rings, `base = 4.0` (a 4× cell-size
-    /// ratio ⇒ the second ring is `Lod(4)`), `unit` = the chunk view radius in m.
-    pub fn d1(unit: f32) -> PyramidCfg {
-        PyramidCfg { finest: Lod(2), levels: NonZeroU8::new(2).unwrap(), unit, base: 4.0 }
+    /// Standard config: base 2, 7 rings starting at finest LOD.
+    pub fn sections(unit: f32) -> PyramidCfg {
+        Self::sections_with(unit, SECTION_LEVELS, super::section::FINEST_DETAIL.0 as u8)
     }
 
-    /// LOD-value delta per ring: `log2(base)` (base 4 ⇒ 2 lod steps ⇒ Lod2→Lod4).
-    /// Floored at 1 so a degenerate `base < 4` still advances a level per ring.
+    /// Configurable section ladder. Inputs are clamped defensively even though
+    /// [`RenderConfig`](crate::render_config::RenderConfig) normalizes them at
+    /// the settings boundary: construction from tests and internal callers
+    /// must preserve the same coarsest-detail hierarchy invariant.
+    pub fn sections_with(unit: f32, levels: u8, detail: u8) -> PyramidCfg {
+        let detail = detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
+        let levels = levels
+            .clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end())
+            .min(max_lod_levels(detail));
+        PyramidCfg {
+            finest: Detail(detail as i8),
+            levels: NonZeroU8::new(levels).expect("levels clamped to a nonzero range"),
+            unit,
+            base: 2.0,
+            step: 1,
+        }
+    }
+
+    /// LOD value increment per ring (integer log2 of base, cached at construction).
     pub fn step(&self) -> u8 {
-        (self.base.log2().round() as i32).max(1) as u8
+        self.step
     }
 
-    /// The outermost ring's LOD value.
-    pub fn coarsest(&self) -> u8 {
-        self.finest.0 + (self.levels.get() - 1) * self.step()
+    pub fn coarsest(&self) -> Detail {
+        ringed_detail(self.finest, (self.levels.get() - 1) as u32, self.step())
     }
 
-    /// Every active ring's LOD, finest → coarsest (D1: `Lod(2)`, `Lod(4)`).
-    pub fn active_lods(&self) -> impl Iterator<Item = Lod> + '_ {
-        (0..self.levels.get()).map(move |r| Lod(self.finest.0 + r * self.step()))
+    pub fn active_lods(&self) -> impl Iterator<Item = Detail> + '_ {
+        (0..self.levels.get()).map(move |r| ringed_detail(self.finest, r as u32, self.step()))
     }
 
-    /// The pyramid's outer edge in metres (`unit·base^levels`) — the ONE
-    /// authority every dependent zone radius derives from: the last ring's
-    /// band ends here, the render's skin clip starts here, and the Zone-3 skin
-    /// ring is sized from here. Deriving them all from this method is what
-    /// keeps the zones from drifting apart (Zone 3 strictly outside Zone 2 by
-    /// construction, never by convention).
+    /// Pyramid's outer edge in metres — single authority for all zone boundaries.
     pub fn outer_m(&self) -> f32 {
         self.unit * self.base.powi(self.levels.get() as i32)
     }
 }
 
-/// The log-falloff rule. `ring = floor(log_base(dist/unit))`; the ring's
-/// level is `finest + ring·step`. `dist < unit` → [`Chunks`](LodChoice::Chunks);
-/// past the last ring → [`BeyondHorizon`](LodChoice::BeyondHorizon). TOTAL (every
-/// finite distance maps somewhere; NaN/negative fall to `Chunks`) and MONOTONE
-/// (never finer with distance) — see [`tests`].
-pub fn level_for(dist_xz: f32, cfg: &PyramidCfg) -> LodChoice {
-    // `!(>=)` catches NaN and negatives too — they resolve to the near case.
+/// `finest.0 + ring*step` widened to i64 before summing, then clamped into
+/// `Detail`'s i8 range — a large ring count (corrupt cfg, or `step` pushing the
+/// u8 product past 127) must saturate at the coarsest representable Detail,
+/// never silently wrap through `i8::MAX` into a negative (impossibly fine) one.
+fn ringed_detail(finest: Detail, ring: u32, step: u8) -> Detail {
+    let off = ring as i64 * step as i64;
+    Detail((finest.0 as i64 + off).clamp(i8::MIN as i64, i8::MAX as i64) as i8)
+}
+
+/// Select LOD for a given distance: log-falloff to rings, clamped near and far.
+/// Returns a Level or BeyondHorizon; NaN/negatives clamp to nearest ring.
+pub(in crate::world) fn level_for(dist: EyeDist, cfg: &PyramidCfg) -> LodChoice {
+    let dist_xz = dist.get();
+    // `!(>=)` catches NaN and negatives: clamp to finest ring.
     if !(dist_xz >= cfg.unit) {
-        return LodChoice::Chunks;
+        return LodChoice::Level(cfg.finest);
     }
-    let ring = (dist_xz / cfg.unit).log(cfg.base).floor();
-    // `ring >= 0` since `dist >= unit` and `base >= 2`; a non-finite ring (only
-    // reachable with a corrupt cfg) saturates past the horizon.
-    let ring = if ring.is_finite() { ring as u32 } else { u32::MAX };
-    if ring >= cfg.levels.get() as u32 {
-        LodChoice::BeyondHorizon
-    } else {
-        LodChoice::Level(Lod(cfg.finest.0 + ring as u8 * cfg.step()))
+    // At most eight multiply/compare steps beat a transcendental logarithm on
+    // the per-section visibility path, while preserving exact band boundaries.
+    // Bounded by the levels cap even for a degenerate (non-growing) base.
+    let mut ring = 0u32;
+    let mut upper = cfg.unit * cfg.base;
+    while dist_xz >= upper {
+        ring += 1;
+        if ring >= cfg.levels.get() as u32 {
+            return LodChoice::BeyondHorizon;
+        }
+        upper *= cfg.base;
     }
+    LodChoice::Level(ringed_detail(cfg.finest, ring, cfg.step()))
 }
 
-/// DH's `expected − 1` tolerance, in RINGS: may `lod` be DRAWN at this
-/// distance? True for the ring's own level and one *ring* finer (i.e. one
-/// `cfg.step()` of LOD value — with base 4 the rings step by 2, so a one-VALUE
-/// tolerance would only ever match a level that doesn't exist), so a ring
-/// breathes one step at its edges instead of thrashing. Outside the ring band
-/// (chunks / skin) no tile is acceptable.
-///
-/// KEEP-side predicate: loading is exact-band (`level_for` equality in
-/// `desired_tiles`) — this tolerance exists for unload/keep hysteresis, so a
-/// just-crossed ring edge doesn't immediately drop the one-ring-finer tile the
-/// player was looking at. Not yet consulted by an unload path.
-pub fn acceptable(dist_xz: f32, lod: Lod, cfg: &PyramidCfg) -> bool {
-    match level_for(dist_xz, cfg) {
+/// Keep-side tolerance for hysteresis: whether `lod` is drawable at this distance.
+/// Accepts the ring's level and one ring finer (one step() apart) to avoid thrashing edges.
+/// Past the horizon, nothing is acceptable.
+pub(in crate::world) fn acceptable(dist: EyeDist, lod: Detail, cfg: &PyramidCfg) -> bool {
+    match level_for(dist, cfg) {
         LodChoice::Level(expected) => {
-            lod.0 == expected.0 || lod.0 + cfg.step() == expected.0
+            // Widen to i32 for the compare: `lod.0` near `i8::MAX` plus `step`
+            // must not wrap through the i8 range and produce a false match.
+            lod.0 == expected.0 || lod.0 as i32 + cfg.step() as i32 == expected.0 as i32
         }
-        LodChoice::Chunks | LodChoice::BeyondHorizon => false,
+        LodChoice::BeyondHorizon => false,
     }
 }
 
-/// Ring overlap in COARSER-level tiles (≥ 1): the coarse parent is loaded one
-/// tile past the fine ring's outer edge so it draws *under* that edge —
-/// coarse-over-fine, never a hole — set to 1, acceptance-tested by
-/// `SkyHoleCount`.
-pub fn ring_overlap(_lod: Lod) -> i32 {
-    1
+/// The one quantized detail decision: folds the near-field full-res chunk
+/// radius and the far-field pyramid ladder into a
+/// single output in the engine's `Detail` type — the type the existing
+/// upload/draw pipeline already consumes (chunks upload at `Detail::FULL`,
+/// `streaming::chunk_placement`; sections draw at `Detail::new(pos.detail)`,
+/// `SectionState::draw`). `None` past the horizon: nothing is required there.
+///
+/// Chunks own everything nearer than `cfg.unit` (by construction — `unit` is
+/// kept equal to the streamed chunk-view radius every frame, `World::stream`).
+/// `level_for`'s own near branch returns the section pyramid's *finest ring*
+/// there instead (`Detail(2)`, coarser than `Detail::FULL`), which is correct
+/// for its own callers (`acceptable`'s hysteresis) but is NOT chunk resolution —
+/// so this near branch is a genuinely separate case, not a re-derivation of
+/// `level_for`'s existing clamp.
+///
+/// `affordable`: the coarsest `Detail` the current VRAM budget can afford — a
+/// floor; this never returns something FINER than it. Dormant by construction:
+/// the only caller today, [`vram_budget_floor`], always returns `Detail::FULL`
+/// (no floor), and every quantity `max`ed against `Detail::FULL` is unchanged,
+/// so this parameter is presently a no-op end to end.
+pub(in crate::world) fn required_detail(
+    dist: EyeDist,
+    cfg: &PyramidCfg,
+    affordable: Detail,
+) -> Option<Detail> {
+    if dist.get() < cfg.unit {
+        return Some(Detail::FULL.max(affordable));
+    }
+    let desired = match level_for(dist, cfg) {
+        LodChoice::Level(lod) => lod,
+        LodChoice::BeyondHorizon => return None,
+    };
+    Some(desired.max(affordable))
 }
 
-pub const CALIBRATION_COLUMNS: usize = 4096;
-/// Droop cap in METRES — the sweep measures height disagreement in world metres
-/// and `render` sinks tiles by world metres, so the cap lives in the same unit.
-/// Note: the cap is in metres, not cells — a per-cell cap would scale with LOD and mean nothing at render.
-/// A pathological generator saturates here and [`ring_overlap`] carries the
-/// residual; the worst-seed golden shot is the check.
-pub const DROOP_CAP: i32 = 32;
-
-/// Per-level geometric droop, generalising the skin's single `SKIN_DROOP`.
-/// "Derived, not guessed" is the API: the only constructors are
-/// [`calibrate`](Self::calibrate) (evidence from a sweep) and
-/// [`manual`](Self::manual) (evidence in writing).
-pub struct DroopTable {
-    /// Indexed by `lod.0 − finest.0`, so `Lod(2)`→`[0]`, `Lod(4)`→`[2]`; the
-    /// unused intermediate index (`Lod(3)`) is filled but never queried.
-    per_level: Vec<i32>,
-}
-
-impl DroopTable {
-    /// Sweep [`CALIBRATION_COLUMNS`] columns (a deterministic in-crate LCG,
-    /// seeded from `cfg` — no `rand`, no `Date::now`) across ±2²⁰ m. For each
-    /// active LOD value `k`, `droop(k)` is the max over the sweep of the height
-    /// disagreement between the generator sampled on the level-`k` cell grid and
-    /// on the grid it must sit UNDER at a ring seam — the next finer ACTIVE
-    /// level (`k − step`), or the exact per-block height for the finest ring
-    /// (its seam is against the full-res chunks). Comparing against `k−1` would
-    /// measure a grid no ring ever draws and so systematically under-droop the real seams.
-    /// Capped at [`DROOP_CAP`].
-    /// Run once at startup/config change and cached on the `World`.
-    pub fn calibrate<G: TerrainGenerator>(generator: &G, cfg: &PyramidCfg) -> DroopTable {
-        const RANGE: i64 = 1 << 20;
-        let coarsest = cfg.coarsest();
-        let span = (coarsest - cfg.finest.0) as usize + 1;
-        let mut per_level = vec![0i32; span];
-
-        // Seed the LCG from the cfg so calibration is reproducible per config.
-        let mut lcg: u64 = 0x2545_F491_4F6C_DD1D
-            ^ (cfg.unit.to_bits() as u64)
-            ^ ((cfg.base.to_bits() as u64) << 32);
-        let mut next = || {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            lcg
-        };
-        let rnd = |r: u64| ((r >> 11) as i64).rem_euclid(2 * RANGE) - RANGE;
-
-        for _ in 0..CALIBRATION_COLUMNS {
-            let (wx, wz) = (rnd(next()), rnd(next()));
-            for lod in cfg.active_lods() {
-                let k = lod.0;
-                // The height this level must not poke through: exact terrain
-                // for the finest ring, the next finer ring's grid otherwise.
-                let finer = if k == cfg.finest.0 {
-                    generator.height(wx as i32, wz as i32)
-                } else {
-                    sample_snapped(generator, wx, wz, k - cfg.step())
-                };
-                let d = (sample_snapped(generator, wx, wz, k) - finer).abs().min(DROOP_CAP);
-                let i = (k - cfg.finest.0) as usize;
-                per_level[i] = per_level[i].max(d);
-            }
-        }
-        DroopTable { per_level }
-    }
-
-    /// Escape hatch — demands its evidence in writing.
-    pub fn manual(per_level: Vec<i32>, _reason: &'static str) -> DroopTable {
-        DroopTable { per_level }
-    }
-
-    /// Metres of downward droop for `lod` (0 for levels below `finest`, e.g. the
-    /// full-res chunks, which never droop).
-    pub fn droop(&self, lod: Lod, cfg: &PyramidCfg) -> i32 {
-        let i = lod.0.saturating_sub(cfg.finest.0) as usize;
-        self.per_level.get(i).copied().unwrap_or(0)
-    }
-}
-
-/// The generator height at `(wx, wz)` snapped to the centre of its level-`k`
-/// (`2^k`-metre) cell — the coarse height a level-`k` tile would show.
-fn sample_snapped<G: TerrainGenerator>(generator: &G, wx: i64, wz: i64, k: u8) -> i32 {
-    let cell = 1i64 << k;
-    let snap = |v: i64| (v.div_euclid(cell) * cell + cell / 2) as i32;
-    generator.height(snap(wx), snap(wz))
+/// The coarsest `Detail` the current VRAM budget can afford. DORMANT — always
+/// `Detail::FULL` (no floor).
+///
+/// Activation needs TWO things neither landed here: a graphics-setting toggle
+/// (a behavioural default change is user-gated, never landed autonomously),
+/// AND a new engine-side public accessor. The engine's
+/// `VK_EXT_memory_budget` query (`vk::device::MemoryBudget::query`) exists but
+/// is `unsafe`, `vk`-module-private, and takes a raw `ash::Instance`/
+/// `PhysicalDevice` — there is no public `Engine` method reaching it today, so
+/// "reading the existing query" is not yet possible from app code without a
+/// small new engine-side API. Flagging that gap rather than papering over it.
+pub(in crate::world) fn vram_budget_floor() -> Detail {
+    Detail::FULL
 }
 
 #[cfg(test)]
@@ -214,32 +173,50 @@ mod tests {
     use super::*;
 
     fn d1() -> PyramidCfg {
-        PyramidCfg { finest: Lod(2), levels: NonZeroU8::new(2).unwrap(), unit: 256.0, base: 4.0 }
+        PyramidCfg {
+            finest: Detail(2),
+            levels: NonZeroU8::new(2).unwrap(),
+            unit: 256.0,
+            base: 4.0,
+            step: 2,
+        }
     }
 
-    /// Contract test (formerly `skeleton::pyramid::tests`):
-    /// `level_for` is total + monotone, and every chosen level plus one finer LOD
-    /// is `acceptable` at its own distance (rings breathe, never thrash).
+    /// The configurable constructor clamps into the supported ladder and
+    /// shortens levels so the coarsest ring never exceeds the hierarchy cap.
+    #[test]
+    fn configurable_ladder_clamps_and_respects_the_coarsest_cap() {
+        let cfg = PyramidCfg::sections_with(256.0, 8, 6);
+        assert_eq!(cfg.finest, Detail(6));
+        assert_eq!(cfg.levels.get(), 4, "detail 6 exposes only levels 6 through 9");
+        assert_eq!(cfg.coarsest(), Detail(9));
+
+        let default = PyramidCfg::sections_with(256.0, SECTION_LEVELS, 2);
+        assert_eq!(default.finest, super::super::section::FINEST_DETAIL);
+        assert_eq!(default.levels.get(), SECTION_LEVELS);
+        assert_eq!(default.step(), 1);
+    }
+
+    /// `level_for` is monotone and always returns a valid level; tolerance prevents thrashing.
     #[test]
     fn pyramid_selection_is_total_monotone_and_tolerant() {
         let cfg = d1();
-        let mut last_coarseness = 0u8;
+        let mut last_coarseness = 0i8;
         for m in 0..40_000u32 {
-            let d = m as f32;
+            let d = EyeDist::new(m as f32);
             let c = level_for(d, &cfg); // total: never panics
             if let LodChoice::Level(l) = c {
                 assert!(l.0 >= last_coarseness, "never finer with distance");
                 last_coarseness = l.0;
                 assert!(acceptable(d, l, &cfg), "chosen level acceptable at its distance");
-                // The tolerance is one RING finer (one cfg.step() of LOD value)
-                // — the level an adjacent ring actually draws.
+                // One ring finer (one step apart) is also acceptable.
                 if l.0 > cfg.finest.0 {
                     assert!(
-                        acceptable(d, Lod(l.0 - cfg.step()), &cfg),
+                        acceptable(d, Detail(l.0 - cfg.step() as i8), &cfg),
                         "one ring finer also acceptable"
                     );
                     assert!(
-                        !acceptable(d, Lod(l.0 + cfg.step()), &cfg),
+                        !acceptable(d, Detail(l.0 + cfg.step() as i8), &cfg),
                         "one ring coarser is not"
                     );
                 }
@@ -247,53 +224,90 @@ mod tests {
         }
     }
 
-    /// The D1 bands: chunks inside `unit`, `Lod(2)` in `[unit, unit·base)`,
-    /// `Lod(4)` in `[unit·base, unit·base²)`, skin past that.
+    /// Finest ring inside unit yields LOD2, then LOD4 beyond unit*base, then skin (horizon).
     #[test]
     fn d1_bands_are_lod2_then_lod4_then_horizon() {
         let cfg = d1();
-        assert_eq!(level_for(0.0, &cfg), LodChoice::Chunks);
-        assert_eq!(level_for(255.0, &cfg), LodChoice::Chunks);
-        assert_eq!(level_for(256.0, &cfg), LodChoice::Level(Lod(2)));
-        assert_eq!(level_for(1023.0, &cfg), LodChoice::Level(Lod(2)));
-        assert_eq!(level_for(1024.0, &cfg), LodChoice::Level(Lod(4)));
-        assert_eq!(level_for(4095.0, &cfg), LodChoice::Level(Lod(4)));
-        assert_eq!(level_for(4096.0, &cfg), LodChoice::BeyondHorizon);
-        assert_eq!(level_for(f32::INFINITY, &cfg), LodChoice::BeyondHorizon);
+        let d = EyeDist::new;
+        assert_eq!(level_for(d(0.0), &cfg), LodChoice::Level(Detail(2)));
+        assert_eq!(level_for(d(255.0), &cfg), LodChoice::Level(Detail(2)));
+        assert_eq!(level_for(d(256.0), &cfg), LodChoice::Level(Detail(2)));
+        assert_eq!(level_for(d(1023.0), &cfg), LodChoice::Level(Detail(2)));
+        assert_eq!(level_for(d(1024.0), &cfg), LodChoice::Level(Detail(4)));
+        assert_eq!(level_for(d(4095.0), &cfg), LodChoice::Level(Detail(4)));
+        assert_eq!(level_for(d(4096.0), &cfg), LodChoice::BeyondHorizon);
+        // Infinity clamps to finest ring (EyeDist enforces finite values).
+        assert_eq!(level_for(d(f32::INFINITY), &cfg), LodChoice::Level(Detail(2)));
     }
 
-    /// Calibration is deterministic, capped, and coarser-drooping-further. A flat
-    /// generator (no disagreement between grids) calibrates to zero droop.
+    /// Chunks own everything nearer than `unit`: `required_detail` returns
+    /// `Detail::FULL` there, strictly finer than `level_for`'s own near-clamp
+    /// (`Detail(2)`) — proving this is a genuinely separate case, not a duplicate.
     #[test]
-    fn droop_is_deterministic_capped_and_monotone() {
-        use crate::block::registry::{AIR, BlockId, BlockRegistry};
-
-        struct Flat;
-        impl TerrainGenerator for Flat {
-            fn height(&self, _: i32, _: i32) -> i32 {
-                40
-            }
-            fn surface_at(&self, _: i32, _: i32) -> BlockId {
-                AIR
-            }
-            fn deep(&self) -> BlockId {
-                AIR
-            }
-        }
+    fn required_detail_is_full_res_inside_the_chunk_radius() {
         let cfg = d1();
-        let t = DroopTable::calibrate(&Flat, &cfg);
-        assert_eq!(t.droop(Lod(2), &cfg), 0, "a flat generator never droops");
-        assert_eq!(t.droop(Lod(4), &cfg), 0);
-
-        // A real generator: droop is bounded by the cap and non-negative, and the
-        // sweep is reproducible run to run.
-        let generator =
-            crate::world::generation::SineHills::new(&BlockRegistry::with_builtins(), 20.0, 7);
-        let a = DroopTable::calibrate(&generator, &cfg);
-        let b = DroopTable::calibrate(&generator, &cfg);
-        for lod in cfg.active_lods() {
-            assert_eq!(a.droop(lod, &cfg), b.droop(lod, &cfg), "deterministic");
-            assert!((0..=DROOP_CAP).contains(&a.droop(lod, &cfg)), "within cap");
+        for d in [0.0f32, 100.0, 255.9] {
+            let dist = EyeDist::new(d);
+            assert_eq!(
+                required_detail(dist, &cfg, Detail::FULL),
+                Some(Detail::FULL),
+                "distance {d} is inside the chunk radius"
+            );
+            assert!(
+                Detail::FULL < Detail::new(2),
+                "chunk resolution must be strictly finer than the section's own finest ring"
+            );
         }
     }
+
+    /// Beyond `unit`, with the floor dormant (`Detail::FULL`, a no-op `max`),
+    /// `required_detail` matches `level_for` exactly: identical selections to the
+    /// pre-existing ladder, a fixed point required by the current design.
+    #[test]
+    fn required_detail_matches_level_for_beyond_the_chunk_radius_when_dormant() {
+        let cfg = d1();
+        for m in 256..40_000u32 {
+            let dist = EyeDist::new(m as f32);
+            let got = required_detail(dist, &cfg, vram_budget_floor());
+            let want = match level_for(dist, &cfg) {
+                LodChoice::Level(l) => Some(l),
+                LodChoice::BeyondHorizon => None,
+            };
+            assert_eq!(got, want, "distance {m} must match the pre-existing ladder exactly");
+        }
+    }
+
+    /// Never finer with distance, matching `level_for`'s own monotonicity.
+    #[test]
+    fn required_detail_never_refines_with_distance() {
+        let cfg = d1();
+        let mut last = Detail::FULL;
+        for m in 0..40_000u32 {
+            let Some(got) = required_detail(EyeDist::new(m as f32), &cfg, vram_budget_floor()) else {
+                continue;
+            };
+            assert!(got >= last, "detail coarsened then refined at distance {m}");
+            last = got;
+        }
+    }
+
+    /// The dormant floor is a true no-op: activating it with an artificially
+    /// coarse floor changes the result (proving the seam is live code, not dead
+    /// weight), while the real default (`Detail::FULL`) never does.
+    #[test]
+    fn affordable_floor_only_coarsens_when_actually_activated() {
+        let cfg = d1();
+        let dist = EyeDist::new(2000.0); // deep in the ladder, level_for gives Detail(4)
+        let unclamped = required_detail(dist, &cfg, Detail::FULL);
+        assert_eq!(unclamped, Some(Detail::new(4)), "sanity: matches level_for");
+        // Dormant default changes nothing.
+        assert_eq!(required_detail(dist, &cfg, vram_budget_floor()), unclamped);
+        // A hypothetical activated floor coarser than the desired level DOES win.
+        let coarse_floor = Detail::new(6);
+        assert_eq!(required_detail(dist, &cfg, coarse_floor), Some(coarse_floor));
+        // A floor finer than what's desired never refines past the ladder's own choice.
+        let fine_floor = Detail::new(1);
+        assert_eq!(required_detail(dist, &cfg, fine_floor), unclamped);
+    }
+
 }

@@ -1,3 +1,7 @@
 /target
 /result
 /saves
+/screenshots
+# Blessed goldens are per-machine references (GPU/driver-dependent pixels):
+# `cargo run --bin golden -- bless` regenerates them locally.
+/tests/golden

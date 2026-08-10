@@ -2,7 +2,7 @@
 //! depends on their exact bit output (terrain generation, procedural block
 //! textures, peer colours) shares one implementation and can never drift.
 
-/// FNV-1a hash over a byte slice (32-bit). Shared by peer-colour and
+/// FNV / FNV1a hash over a byte slice (32-bit). Shared by peer-colour and
 /// texture-seed so both use the same algorithm.
 pub fn fnv1a_32(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;

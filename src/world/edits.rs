@@ -7,10 +7,11 @@ use voxel_engine::Engine;
 
 use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
+use crate::render_config::RenderConfig;
 
 use super::chunk::Chunk;
-use super::lod::{Lod, Tile};
-use super::{Coord, MeshState, VIEW_RADIUS_RANGE, World};
+use super::generation::TerrainGenerator;
+use super::{Coord, MeshState, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
 
 impl World {
     /// Current render distance in chunk rings.
@@ -18,21 +19,36 @@ impl World {
         self.view.horizontal
     }
 
-    /// Change the render distance (clamped to 3..=10). Marks streaming dirty so
-    /// the next [`stream`](Self::stream) unloads past the new radius or resumes
-    /// meshing out to it.
+    /// Current vertical streaming distance in chunk layers above and below the eye.
+    pub fn vertical_radius(&self) -> i32 {
+        self.view.vertical
+    }
+
+    /// Compatibility setter for callers with a single render-distance value.
+    /// The vertical distance retains its historical half-horizontal derivation.
     pub fn set_view_radius(&mut self, radius: i32) {
-        let radius = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
-        if radius != self.view.horizontal {
-            let shrunk = radius < self.view.horizontal;
-            self.view = super::ViewVolume::cube(radius);
-            // The pyramid's innermost ring begins where the full-res box ends, so
-            // its `unit` tracks the render distance in metres. Droop needs no
-            // recalibration — it depends only on the LOD cell grids, not `unit`.
-            self.pyramid.unit = (radius * super::chunk::CHUNK_SIZE as i32) as f32;
-            // Invalidate the centre so the next stream reruns the full
+        let horizontal = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
+        let view = super::ViewVolume::view(horizontal);
+        self.set_view_distances(view.horizontal, view.vertical);
+    }
+
+    /// Set the anisotropic full-resolution streaming volume. Independent axes
+    /// let minimum mode keep only the collision-relevant vertical slab. Marks
+    /// streaming dirty so the next [`stream`](Self::stream) unloads past the
+    /// new radius or resumes meshing out to it.
+    pub fn set_view_distances(&mut self, horizontal: i32, vertical: i32) {
+        let horizontal = horizontal.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
+        let vertical =
+            vertical.clamp(*VERTICAL_RADIUS_RANGE.start(), *VERTICAL_RADIUS_RANGE.end());
+        if horizontal != self.view.horizontal || vertical != self.view.vertical {
+            let shrunk = horizontal < self.view.horizontal || vertical < self.view.vertical;
+            self.view = super::ViewVolume::new(horizontal, vertical);
+            // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
+            // The next full pass must probe the WHOLE new box (a grown radius
+            // exposes chunks the old shell diff would skip).
+            self.prev_mesh_box = None;
             self.pending_fresh.set();
             // On shrink, meshes between the new radius and the (also shrunk)
             // unload ring would otherwise stay drawn until the player moves;
@@ -42,6 +58,95 @@ impl World {
             // In-flight worker jobs are NOT cancelled: results now outside the
             // radius are dropped by the range checks when they drain.
         }
+    }
+
+    /// Set render lanes (occlusion/lod2). Entry-only; mesh teardown not needed.
+    /// Live settings must use [`set_render_config`](Self::set_render_config)
+    /// so GPU state is retired.
+    pub fn set_render_lanes(&mut self, occlusion: bool, lod2: bool) {
+        self.occlusion_forced = occlusion;
+        self.lod2 = lod2;
+    }
+
+    /// Apply the live world-owned subset of render settings. A far-field ladder
+    /// transition retires every old section allocation and all derived state;
+    /// enabling then re-arms streaming to build the new hierarchy.
+    pub fn set_render_config(&mut self, render: RenderConfig, eng: &mut Engine) {
+        if self.occlusion_forced != render.occlusion {
+            self.occlusion_forced = render.occlusion;
+            self.occlusion_dirty.set();
+            if !render.occlusion {
+                // Stop consulting an old visible set immediately, before the
+                // next mutable stream sync point.
+                self.occlusion_active = false;
+            }
+        }
+
+        if !self.section_config_changed(render) {
+            return;
+        }
+        let pyramid_changed = self.section_pyramid_changed(render);
+        let (levels, detail) = render.normalized_lod();
+        let unit = self.view.lod_unit();
+        // A pure on/off transition retires draw/claim state but preserves the
+        // immutable generator mip (and an in-flight bake). Ladder/range changes
+        // alter its extent and must rebuild it.
+        self.clear_section_lane(eng, pyramid_changed);
+        self.lod2 = render.lod2;
+        self.section_pyramid = super::pyramid::PyramidCfg::sections_with(unit, levels, detail);
+        if self.lod2 {
+            self.pending_sections.set();
+        }
+    }
+
+    /// Pure change detector kept separate so distance-only LOD invalidation is
+    /// regression-testable without constructing a renderer/Engine.
+    pub(in crate::world) fn section_config_changed(&self, render: RenderConfig) -> bool {
+        self.lod2 != render.lod2 || self.section_pyramid_changed(render)
+    }
+
+    pub(in crate::world) fn section_pyramid_changed(&self, render: RenderConfig) -> bool {
+        let (levels, detail) = render.normalized_lod();
+        let unit = self.view.lod_unit();
+        self.section_pyramid.levels.get() != levels
+            || self.section_pyramid.finest.0 != detail as i8
+            || self.section_pyramid.unit != unit
+    }
+
+    /// Retire the whole far-section lane: free every GPU allocation, drop all
+    /// derived selection/cover state, purge queued far jobs, and advance the
+    /// epoch so in-flight worker results from the old configuration can never
+    /// land. `reset_mip` additionally discards the relief bake (its extent
+    /// depends on the ladder).
+    pub(in crate::world) fn clear_section_lane(&mut self, eng: &mut Engine, reset_mip: bool) {
+        // Queued section snapshots belong to the old epoch/configuration. Drop
+        // them immediately instead of letting a queue of obsolete, heavyweight
+        // jobs monopolize workers after a live LOD change.
+        if let Some(workers) = &self.workers {
+            let _ = workers.clear_far();
+        }
+        self.section_epoch = self.section_epoch.wrapping_add(1);
+        self.section_pending_claim = None;
+        for (_, state) in self.sections.drain() {
+            state.free(eng);
+        }
+        self.section_upload_queue.clear();
+        self.pending_sections.take();
+        self.dirty_sections.clear();
+        self.section_desired.clear();
+        self.section_frontier_key = None;
+        self.section_visible.clear();
+        self.section_fade = Default::default();
+        self.section_cover_dirty.set();
+        if reset_mip {
+            // Ladder/distance changes alter the required bake extent and levels.
+            self.section_mip = None;
+            self.section_mip_rx = None;
+        }
+        self.section_eye_prev = None;
+        self.section_vel = voxel_engine::DVec3::ZERO;
+        self.job_strikes.retain(|key, _| !matches!(key, super::streaming::FailKey::Section { .. }));
+        self.quarantined.retain(|key| !matches!(key, super::streaming::FailKey::Section { .. }));
     }
 
     /// Whether cross-chunk lighting is currently enabled.
@@ -57,6 +162,17 @@ impl World {
         if !self.transition_lighting(on) {
             return;
         }
+        self.free_meshes(eng);
+    }
+
+    /// Toggle baked corner AO. A meshing input like lighting: the hot tables
+    /// restamp (epoch bump) and every mesh rebuilds with the new corners.
+    pub fn set_ao(&mut self, on: bool, eng: &mut Engine) {
+        if on == self.ao {
+            return;
+        }
+        self.ao = on;
+        self.tables_epoch = self.tables_epoch.wrapping_add(1);
         self.free_meshes(eng);
     }
 
@@ -118,14 +234,17 @@ impl World {
     /// `NeedsMesh` — rather than back to `Air` for born-air chunks — matches the
     /// old unconditional `meshed = false`; the next scan re-derives `Air`.)
     pub fn free_meshes(&mut self, eng: &mut Engine) {
+        // Every drawn mesh is going away: the settled-ring scan restarts.
+        self.lod_clip_shrunk.set();
         for loaded in self.chunks.values_mut() {
             // Any worker mesh captured before this reset must not be accepted if
             // it lands after the next stream establishes a new centre.
             loaded.rev = loaded.rev.wrapping_add(1);
-            loaded.retire(MeshState::NeedsMesh { building: false }, eng);
+            loaded.retire(MeshState::needs_mesh(), eng);
         }
-        // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop the
-        // stale hint (a raised `pending_dirty` would just scan an empty fiber).
+        // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop
+        // the membership set and the stale hint with it.
+        self.dirty_worklist.clear();
         self.pending_dirty.take();
         // Drop the pipeline bookkeeping too: buffered worker meshes are for a
         // world we are leaving, and in-flight jobs may re-run from scratch if
@@ -134,12 +253,14 @@ impl World {
         // coord gets generated or meshed twice, never wrongly.
         self.generating.clear();
         self.upload_queue.clear();
-        // Far LOD tiles belong to the world we are leaving; free them too.
-        for (_, state) in self.tiles.drain() {
+        // Sections belong to the world being left.
+        for (_, state) in self.sections.drain() {
             state.free(eng);
         }
-        self.tile_upload_queue.clear();
-        self.pending_tiles.take();
+        self.section_upload_queue.clear();
+        self.pending_sections.take();
+        self.dirty_sections.clear();
+        self.section_visible.clear();
         self.center = None;
         // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).
@@ -165,26 +286,69 @@ impl World {
         if previous == id && self.chunks.contains_key(&coord) {
             return previous;
         }
-        self.edits.entry(coord).or_default().insert(index, id);
-        // The edit also invalidates the far LOD tiles that cover this voxel (at
-        // every active pyramid level), so they remesh from the overlay.
-        self.mark_dirty_tiles_from_edit(x, y, z);
+        // Overlay compaction: a write that restores what generation would
+        // produce is pure weight in the overlay — regeneration yields it
+        // anyway. Drop the entry instead of storing it, so the overlay (and
+        // every save and join transfer built from it) stays proportional to
+        // the world's real difference from its seed. One generator query per
+        // edit: user-click/network rate, never the voxel hot path.
+        let old_edit = self.edits.get(&coord).and_then(|cells| cells.get(&index)).copied();
+        let generated = self.generator.block_at(x, y, z, self.generator.height(x, z));
+        let new_edit = if id == generated {
+            if let Some(cells) = self.edits.get_mut(&coord) {
+                cells.remove(&index);
+                if cells.is_empty() {
+                    self.edits.remove(&coord);
+                }
+            }
+            None
+        } else {
+            self.edits.entry(coord).or_default().insert(index, id);
+            Some(id)
+        };
+        self.edit_generation += 1;
+        // Skylight ceiling upkeep: a roof appearing above a column's
+        // current ceiling raises it; the topmost edited roof disappearing
+        // lowers it. Either way the cached window is stale, and every loaded
+        // chunk at or below the edit seeds skylight from it — re-settle them
+        // so a constructed roof actually darkens the world underneath.
+        if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
+            let cell = ceiling.surface_at(lx, lz);
+            let raises = new_edit.is_some_and(|id| self.registry.is_opaque(id)) && y + 1 > cell;
+            let lowers = old_edit.is_some_and(|id| self.registry.is_opaque(id)) && y + 1 == cell;
+            if raises || lowers {
+                self.ceilings.remove(&(coord.x, coord.z));
+                if self.lighting {
+                    let shadowed: Vec<Coord> = self
+                        .chunks
+                        .keys()
+                        .copied()
+                        .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
+                        .collect();
+                    for c in shadowed {
+                        self.light_worklist.insert(c);
+                    }
+                    self.light_pending.set();
+                }
+            }
+        }
+        // Invalidate section to re-extract from overlay.
+        if self.lod2 {
+            self.mark_dirty_sections_from_edit(coord, x, y, z);
+        }
 
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             std::sync::Arc::make_mut(&mut loaded.chunk).set_index(index, id);
             // Editing this chunk's own voxels can open or seal an interior pocket,
             // so its connectivity is stale — invalidate it (the occlusion rebuild
             // recomputes lazily if the gate is active) and flag the visible set.
+            // IMMEDIATE class: stale connectivity can hide a visible chunk.
             loaded.connectivity = None;
             self.occlusion_dirty.set();
-            // Keep whatever is currently drawn as `prev` so the old mesh shows
-            // until the sync remesh: Ready(m) → Dirty{Some(m)}, and re-editing
-            // an already-Dirty{Some} chunk preserves its mesh (the token MOVES,
-            // no free). NeedsMesh (building or not)/Air draw nothing → Dirty{None}.
-            loaded.state.invalidate();
-            // Any in-flight worker mesh of this chunk is now stale.
-            loaded.rev = loaded.rev.wrapping_add(1);
-            self.pending_dirty.set();
+            if self.occlusion_enabled() {
+                self.conn_fill_queue.push_back(coord);
+            }
+            self.invalidate_mesh(coord);
             self.pending_fresh.set();
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
@@ -204,16 +368,27 @@ impl World {
         previous
     }
 
+    /// Invalidate a chunk's mesh into the SYNC edit path: state → `Dirty`
+    /// (carrying the drawn mesh — see [`MeshState::invalidate`]), rev bump to
+    /// strand in-flight builds, dirty-worklist membership, and the hint. THE
+    /// one edit-class invalidation path, so `remesh_dirty` can drain the
+    /// membership set instead of filtering every loaded chunk.
+    pub(in crate::world) fn invalidate_mesh(&mut self, coord: Coord) {
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.state.invalidate();
+            loaded.rev = loaded.rev.wrapping_add(1);
+            self.dirty_worklist.insert(coord);
+            self.pending_dirty.set();
+        }
+    }
+
     /// Mark a loaded chunk stale so the next stream remeshes it.
     fn mark_dirty(&mut self, coord: Coord) {
-        if let Some(loaded) = self.chunks.get_mut(&coord) {
+        if self.chunks.contains_key(&coord) {
             // Same transition as `set_block`'s own chunk: carry the drawn mesh
-            // forward as `prev` (Ready → Dirty{Some}, already-Dirty keeps it).
-            loaded.state.invalidate();
-            // The neighbour's border edit changed this chunk's exposed faces,
-            // so any in-flight worker mesh of it is stale too.
-            loaded.rev = loaded.rev.wrapping_add(1);
-            self.pending_dirty.set();
+            // forward as `prev`, bump rev (the neighbour's border edit changed
+            // this chunk's exposed faces, so in-flight meshes are stale too).
+            self.invalidate_mesh(coord);
             // In case the dirty pass drops it (missing neighbour data), the
             // fresh scan must be able to pick it back up later.
             self.pending_fresh.set();
@@ -224,59 +399,32 @@ impl World {
         }
     }
 
-    /// Mark the far tile that contains world voxel `(x, y, z)` dirty at every
-    /// active pyramid level, PLUS the cardinal-neighbour tile whenever the edit
-    /// lies within one CELL of a tile face — a border cell feeds the neighbour
-    /// tile's padded shell, so that neighbour must remesh too. World→tile is
-    /// `div_euclid(lod.span())`; the within-a-cell test is on the in-tile remainder.
-    fn mark_dirty_tiles_from_edit(&mut self, x: i32, y: i32, z: i32) {
-        // Snapshot the active levels first: `active_lods` borrows `self.pyramid`,
-        // and marking borrows `self.dirty_tiles` mutably (two entries: Lod2, Lod4).
-        let lods: Vec<Lod> = self.pyramid.active_lods().collect();
-        for lod in lods {
-            let (span, cell) = (lod.span(), lod.cell());
-            let (tx, ty, tz) = (x.div_euclid(span), y.div_euclid(span), z.div_euclid(span));
-            self.dirty_tiles.mark(Tile { lod, x: tx, y: ty, z: tz });
-            let (rx, ry, rz) = (x.rem_euclid(span), y.rem_euclid(span), z.rem_euclid(span));
-            let mut border = |dx: i32, dy: i32, dz: i32| {
-                self.dirty_tiles.mark(Tile { lod, x: tx + dx, y: ty + dy, z: tz + dz });
-            };
-            if rx < cell {
-                border(-1, 0, 0);
-            }
-            if rx >= span - cell {
-                border(1, 0, 0);
-            }
-            if ry < cell {
-                border(0, -1, 0);
-            }
-            if ry >= span - cell {
-                border(0, 1, 0);
-            }
-            if rz < cell {
-                border(0, 0, -1);
-            }
-            if rz >= span - cell {
-                border(0, 0, 1);
-            }
+    /// Mark sections covering this voxel dirty at every active detail so they
+    /// re-extract from the edit overlay. Sections span the full vertical domain
+    /// (Y-independent), so edits outside [0, DOMAIN_H) don't touch any section.
+    fn mark_dirty_sections_from_edit(&mut self, chunk: Coord, x: i32, y: i32, z: i32) {
+        if !(0..super::section::DOMAIN_H).contains(&y) {
+            return;
         }
-    }
-
-    /// Project the edit overlay onto one tile — every edited chunk whose
-    /// coord lies in the tile's chunk span, in `GenerateColumn`-shaped form. The
-    /// far-tile mesher's coarse-cell reducer replays these onto the downsample.
-    pub(in crate::world) fn edits_for_tile(&self, tile: Tile) -> Vec<(Coord, Vec<(usize, BlockId)>)> {
-        let cps = tile.lod.chunks_per_side();
-        let (x0, y0, z0) = (tile.x * cps, tile.y * cps, tile.z * cps);
-        self.edits
-            .iter()
-            .filter(|(c, _)| {
-                (x0..x0 + cps).contains(&c.x)
-                    && (y0..y0 + cps).contains(&c.y)
-                    && (z0..z0 + cps).contains(&c.z)
-            })
-            .map(|(&c, cells)| (c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
-            .collect()
+        let details: Vec<_> = self.section_pyramid.active_lods().collect();
+        for detail in details {
+            let span = super::section::section_span(detail);
+            let pos = super::section::SectionPos {
+                detail,
+                x: x.div_euclid(span),
+                z: z.div_euclid(span),
+            };
+            self.dirty_sections.insert(pos);
+            // The heightmip edit overlay (streaming.rs `refresh_section_overlay`)
+            // keys its cache on this same per-section counter, so it re-derives
+            // exactly the cells this edit could have changed.
+            *self.section_edit_rev.entry(pos).or_insert(0) += 1;
+            // Index the edited chunk under every footprint that contains it,
+            // and queue the exact overlay re-derivation this edit requires.
+            self.section_edit_chunks.entry(pos).or_default().insert(chunk);
+            self.section_overlay_dirty.insert(pos);
+        }
+        self.pending_sections.set();
     }
 
     /// All edits as world coordinates and blocks for saving.

@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use voxel_engine::{Engine, Key};
+use voxel_engine::Engine;
 
 use crate::block::ElementId;
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
@@ -84,9 +84,8 @@ impl Mod for InventoryMod {
         "The bare-list inventory and a simple view of it (press I to toggle)."
     }
 
-    fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        // `I` shows/hides the list, but not while something else is capturing keys.
-        if !ctx.capturing_text && eng.is_key_pressed(Key::I) {
+    fn update(&mut self, _eng: &Engine, ctx: &mut ModContext) {
+        if ctx.toggle_inventory {
             let mut ui = self.ui.get();
             ui.inventory_visible = !ui.inventory_visible;
             self.ui.set(ui);
@@ -114,6 +113,13 @@ impl Mod for InventoryMod {
         if !self.stash.borrow_mut().add(elements) {
             self.overflow_at = Some(Instant::now());
         }
+    }
+
+    fn on_break_rejected(&mut self, elements: &[ElementId]) {
+        // The server refused the break this loot came from: take it back.
+        // Best-effort — anything already spent can't be revoked, which errs
+        // in the player's favour on a rare race rather than going negative.
+        self.stash.borrow_mut().revoke(elements);
     }
 
     fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {

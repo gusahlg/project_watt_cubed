@@ -17,14 +17,10 @@ use crate::sky::{DayLength, Sky};
 use crate::ui::{Line, Role};
 use crate::world::World;
 
-/// Normal command output: each string becomes one neutral [`Role::Dim`] line.
 fn shown(lines: Vec<String>) -> Vec<Line> {
     lines.into_iter().map(|l| Line::of(Role::Dim, l)).collect()
 }
 
-/// A rejection (bad args, unknown command, usage): [`Role::Danger`] lines. Because
-/// the handler that owns the rejection is the only place that names it an error,
-/// severity is carried in the type — the caller never guesses it from the text.
 fn rejected(lines: Vec<String>) -> Vec<Line> {
     lines.into_iter().map(|l| Line::of(Role::Danger, l)).collect()
 }
@@ -32,18 +28,20 @@ fn rejected(lines: Vec<String>) -> Vec<Line> {
 /// The primary command names, in the order `help` lists them. This is the single
 /// source of truth for Tab-completion (see [`crate::console`]); aliases like
 /// `teleport` are intentionally omitted so completion offers the canonical name.
-pub const COMMAND_NAMES: &[&str] =
-    &["tp", "pos", "inspect", "gfx", "time", "walkspeed", "flyspeed", "help"];
+pub const COMMAND_NAMES: &[&str] = &[
+    "tp", "pos", "inspect", "gfx", "time", "walkspeed", "flyspeed", "mute", "deafen", "audio",
+    "voicetest", "help",
+];
 
 /// Run a console line against the game state, returning output lines for the log.
 ///
-/// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. Commands
-/// that only read the world (like `inspect`) take it by shared reference, so the
-/// borrow sits happily alongside the `&mut Player`.
+/// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. The world
+/// is `&mut` for `tp` alone (it must prepare collision data at the destination);
+/// read-only commands like `inspect` reborrow it shared.
 pub fn execute(
     line: &str,
     player: &mut Player,
-    world: &World,
+    world: &mut World,
     settings: &mut Settings,
     sky: &mut Sky,
 ) -> Vec<Line> {
@@ -55,13 +53,17 @@ pub fn execute(
     let args: Vec<&str> = parts.collect();
 
     match cmd {
-        "tp" | "teleport" | "setpos" => teleport(&args, player),
+        "tp" | "teleport" | "setpos" => teleport(&args, player, world),
         "pos" | "where" => shown(vec![format!("position: {}", fmt_pos(player.position))]),
         "inspect" | "look" => inspect(&args, player, world),
         "gfx" | "graphics" => gfx(&args, settings),
         "time" => time(&args, sky),
         "walkspeed" => walkspeed(&args, player),
         "flyspeed" => flyspeed(&args, player),
+        "mute" => mute(settings),
+        "deafen" => deafen(settings),
+        "audio" | "volume" => audio(&args, settings),
+        "voicetest" => voicetest(),
         "help" | "?" => help(),
         other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
     }
@@ -129,15 +131,22 @@ fn clock_label(day: f64) -> String {
 /// to the ±[`WORLD_BORDER`] cube (the same clamp movement applies, so no code
 /// path can carry a position that would overflow i32 block math). The output
 /// reports the position actually landed on, clamp included.
-fn teleport(args: &[&str], player: &mut Player) -> Vec<Line> {
+///
+/// The discontinuity is transactional: collision data around the destination
+/// is generated synchronously BEFORE the player lands there, so the next
+/// physics step never runs against unloaded not-yet-generated air (falling
+/// through or embedding in terrain that streams in a moment later).
+fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
     if args.len() != 3 {
         return rejected(vec!["usage: tp <x> <y> <z>".to_string()]);
     }
     let parsed: Result<Vec<f64>, _> = args.iter().map(|a| a.parse::<f64>()).collect();
     match parsed.as_deref() {
         Ok([x, y, z]) if x.is_finite() && y.is_finite() && z.is_finite() => {
-            player.position = DVec3::new(*x, *y, *z)
+            let target = DVec3::new(*x, *y, *z)
                 .clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
+            world.prepare_around(target);
+            player.position = target;
             // Cancel any accumulated fall so the player doesn't rocket down on arrival.
             player.cancel_fall();
             shown(vec![format!("teleported to {}", fmt_pos(player.position))])
@@ -175,6 +184,48 @@ fn gfx_set(s: &mut Settings, key: &str, value: &str) -> Option<String> {
     field.parse_human(s, value).then(|| field.confirm(s))
 }
 
+/// `/mute` — toggle the transient master mute. Not persisted (resets each launch);
+/// the caller pushes the mutated [`Settings`] to the mixer via [`Settings::mix_change`].
+fn mute(settings: &mut Settings) -> Vec<Line> {
+    settings.muted = !settings.muted;
+    shown(vec![format!("audio {}", if settings.muted { "muted" } else { "unmuted" })])
+}
+
+/// `/deafen` — toggle whether incoming voice is heard. Flips the persisted
+/// `voice_incoming` gate (deafen is its inverse), so the caller saves the change.
+fn deafen(settings: &mut Settings) -> Vec<Line> {
+    settings.voice_incoming = !settings.voice_incoming;
+    let msg = if settings.voice_incoming { "undeafened (hearing voice)" } else { "deafened (voice muted)" };
+    shown(vec![msg.to_string()])
+}
+
+/// `/audio <master|effects|voice> <0-100>` — set one mix volume, clamped to 0..=100.
+/// The caller persists the mutated [`Settings`]; a bad channel or value changes nothing.
+fn audio(args: &[&str], settings: &mut Settings) -> Vec<Line> {
+    let usage = || rejected(vec!["usage: audio <master|effects|voice> <0-100>".to_string()]);
+    let [channel, value] = args else {
+        return usage();
+    };
+    let Ok(pct) = value.parse::<u8>() else {
+        return usage();
+    };
+    let field = match *channel {
+        "master" => &mut settings.master_volume,
+        "effects" | "sfx" => &mut settings.effects_volume,
+        "voice" => &mut settings.voice_volume,
+        _ => return usage(),
+    };
+    *field = pct.min(100);
+    shown(vec![format!("{channel} volume {}%", *field)])
+}
+
+/// `/voicetest` — play a local test cue so the user can check their voice path.
+fn voicetest() -> Vec<Line> {
+    // `execute` has no audio access (the `SoundSystem` handle lives in game.rs),
+    // so this only reports that the test was requested.
+    shown(vec!["queued a voice test cue".to_string()])
+}
+
 /// `walkspeed [n]` — show or set the player's ground walk speed, units/second.
 fn walkspeed(args: &[&str], player: &mut Player) -> Vec<Line> {
     set_speed(args, "walkspeed", player, |p| &mut p.speed)
@@ -206,9 +257,6 @@ fn set_speed(
     }
 }
 
-/// `inspect [x y z]` — describe the block at a cell (default: the block under the
-/// player's feet), showing what it's made of and the properties derived from that.
-/// The in-game window onto the element/block system.
 fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let cell = match args {
         [] => {
@@ -269,7 +317,6 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     shown(out)
 }
 
-/// Render a composition as a readable element list, resolving ids to names.
 fn describe_composition(world: &World, composition: &Composition) -> String {
     let elements = world.registry().elements();
     match composition {
@@ -279,13 +326,12 @@ fn describe_composition(world: &World, composition: &Composition) -> String {
             .map(|&e| elements.get(e).name.to_string())
             .collect::<Vec<_>>()
             .join(" + "),
-        Composition::Mixture(mix) | Composition::Configuration { mix, .. } => mix
+        Composition::Mixture(mix) => mix
             .parts()
             .iter()
             .map(|&(e, p)| format!("{}% {}", p, elements.get(e).name))
             .collect::<Vec<_>>()
             .join(", "),
-        Composition::Computational(_) => "logic-gate components".to_string(),
     }
 }
 
@@ -299,6 +345,10 @@ fn help() -> Vec<Line> {
         "  time [set|length]    show or set the day/night clock".to_string(),
         "  walkspeed [n]        show or set ground walk speed".to_string(),
         "  flyspeed [n]         show or set flying speed".to_string(),
+        "  mute                 toggle master mute (this session)".to_string(),
+        "  deafen               toggle hearing incoming voice".to_string(),
+        "  audio <chan> <0-100> set master/effects/voice volume".to_string(),
+        "  voicetest            play a local voice test cue".to_string(),
         "  help                 show this list".to_string(),
     ])
 }
@@ -321,7 +371,7 @@ mod tests {
         World::generate()
     }
 
-    fn run(line: &str, p: &mut Player, w: &World) -> Vec<Line> {
+    fn run(line: &str, p: &mut Player, w: &mut World) -> Vec<Line> {
         let mut s = Settings::default();
         let mut sky = Sky::new();
         execute(line, p, w, &mut s, &mut sky)
@@ -334,9 +384,9 @@ mod tests {
 
     #[test]
     fn tp_sets_position_and_clears_fall() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         p.motion = crate::player::Motion::Walking { velocity: DVec3::new(0.0, -50.0, 0.0), on_ground: false };
-        let out = run("tp 1.5 2 3", &mut p, &w);
+        let out = run("tp 1.5 2 3", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(1.5, 2.0, 3.0));
         assert_eq!(p.velocity().y, 0.0);
         assert!(out[0].text().contains("teleported"));
@@ -344,52 +394,69 @@ mod tests {
 
     #[test]
     fn tp_keeps_f64_precision_and_clamps_to_the_border() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         // Far coordinates parse as f64: no f32 quantisation on the way in.
-        run("tp 100000000.5 60 -7", &mut p, &w);
+        run("tp 100000000.5 60 -7", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(100_000_000.5, 60.0, -7.0));
 
         // Past the border: clamped, and the OUTPUT reports the clamped spot.
-        let out = run("tp 99999999999 60 -99999999999", &mut p, &w);
+        let out = run("tp 99999999999 60 -99999999999", &mut p, &mut w);
         assert_eq!(p.position.x, 1.0e9);
         assert_eq!(p.position.z, -1.0e9);
         assert!(out[0].text().contains("1000000000.0"), "reports the clamped position");
 
         // Non-finite input is refused outright.
         let before = p.position;
-        run("tp inf 0 0", &mut p, &w);
+        run("tp inf 0 0", &mut p, &mut w);
         assert_eq!(p.position, before);
     }
 
     #[test]
+    fn tp_prepares_collision_data_at_the_destination() {
+        let (mut p, mut w) = (player(), world());
+        // Far outside the pre-generated spawn region: without the prepare, the
+        // ground under the destination would be unloaded air and the next
+        // physics step would fall straight through.
+        let (x, z) = (5_000, 5_000);
+        let surface = w.surface_y(x, z);
+        run(&format!("tp {x} {} {z}", surface + 2), &mut p, &mut w);
+        // `is_solid` reads AIR for unloaded chunks, so this proves the ground
+        // cell (rock or seabed) was actually generated by the teleport.
+        assert!(
+            w.is_solid(x, surface, z),
+            "the destination's ground must be loaded before physics resumes"
+        );
+    }
+
+    #[test]
     fn leading_slash_is_optional() {
-        let (mut p, w) = (player(), world());
-        run("/tp 4 5 6", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        run("/tp 4 5 6", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(4.0, 5.0, 6.0));
     }
 
     #[test]
     fn bad_args_do_not_move_the_player() {
-        let (mut p, w) = (player(), world());
-        run("tp 1 two 3", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        run("tp 1 two 3", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(0.0, 0.0, 0.0));
-        run("tp 1 2", &mut p, &w);
+        run("tp 1 2", &mut p, &mut w);
         assert_eq!(p.position, DVec3::new(0.0, 0.0, 0.0));
     }
 
     #[test]
     fn unknown_command_reports_back() {
-        let (mut p, w) = (player(), world());
-        let out = run("fly-to-moon", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        let out = run("fly-to-moon", &mut p, &mut w);
         assert!(out[0].text().contains("unknown command"));
         assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
     }
 
     #[test]
     fn inspect_reports_elements_and_properties() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         // Deep underground is stone: a single Stone element with stone's properties.
-        let out = run("inspect 8 0 8", &mut p, &w);
+        let out = run("inspect 8 0 8", &mut p, &mut w);
         let text = joined(&out);
         assert!(text.contains("Stone"), "should name the block: {text}");
         assert!(text.contains("made of: Stone"), "should list elements: {text}");
@@ -398,29 +465,29 @@ mod tests {
 
     #[test]
     fn inspect_above_world_is_air() {
-        let (mut p, w) = (player(), world());
-        let out = run("inspect 8 60 8", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        let out = run("inspect 8 60 8", &mut p, &mut w);
         assert!(joined(&out).contains("air"));
     }
 
     #[test]
     fn gfx_updates_settings_with_clamping() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         let mut s = Settings::default();
         let mut sky = Sky::new();
-        execute("gfx msaa 4", &mut p, &w, &mut s, &mut sky);
+        execute("gfx msaa 4", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.msaa, 4);
-        execute("gfx fps 144", &mut p, &w, &mut s, &mut sky);
+        execute("gfx fps 144", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.max_fps, 144);
-        execute("gfx fps off", &mut p, &w, &mut s, &mut sky);
+        execute("gfx fps off", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.max_fps, 0);
-        execute("gfx renderdist 99", &mut p, &w, &mut s, &mut sky);
+        execute("gfx renderdist 99", &mut p, &mut w, &mut s, &mut sky);
         assert_eq!(s.render_distance, 20);
-        execute("gfx fullscreen on", &mut p, &w, &mut s, &mut sky);
+        execute("gfx fullscreen on", &mut p, &mut w, &mut s, &mut sky);
         assert!(s.fullscreen);
-        execute("gfx lighting off", &mut p, &w, &mut s, &mut sky);
+        execute("gfx lighting off", &mut p, &mut w, &mut s, &mut sky);
         assert!(!s.lighting);
-        let out = execute("gfx", &mut p, &w, &mut s, &mut sky);
+        let out = execute("gfx", &mut p, &mut w, &mut s, &mut sky);
         let text = joined(&out);
         assert!(text.contains("fullscreen on"));
         assert!(text.contains("lighting off"));
@@ -429,17 +496,72 @@ mod tests {
 
     #[test]
     fn gfx_bad_input_prints_usage_and_changes_nothing() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         let mut s = Settings::default();
         let mut sky = Sky::new();
         let before = s.clone();
-        let out = execute("gfx msaa lots", &mut p, &w, &mut s, &mut sky);
+        let out = execute("gfx msaa lots", &mut p, &mut w, &mut s, &mut sky);
         assert!(out[0].text().contains("usage"));
         let text = joined(&out);
         assert!(text.contains("lighting on|off"));
         assert!(text.contains("uiscale <50-200>"));
         assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
         assert_eq!(s, before);
+    }
+
+    /// Run a command against an explicit settings value (audio commands mutate it).
+    fn run_settings(line: &str, s: &mut Settings) -> Vec<Line> {
+        let (mut p, mut w) = (player(), world());
+        let mut sky = Sky::new();
+        execute(line, &mut p, &mut w, s, &mut sky)
+    }
+
+    #[test]
+    fn mute_toggles_transient_and_survives_no_save() {
+        let mut s = Settings::default();
+        assert!(!s.muted);
+        assert!(run_settings("mute", &mut s)[0].text().contains("muted"));
+        assert!(s.muted);
+        assert!(run_settings("mute", &mut s)[0].text().contains("unmuted"));
+        assert!(!s.muted);
+    }
+
+    #[test]
+    fn deafen_flips_the_persisted_incoming_gate() {
+        let mut s = Settings::default();
+        assert!(s.voice_incoming);
+        run_settings("deafen", &mut s);
+        assert!(!s.voice_incoming);
+        assert!(s.mix_change().deafen, "deafen is the inverse of voice_incoming");
+        run_settings("deafen", &mut s);
+        assert!(s.voice_incoming);
+    }
+
+    #[test]
+    fn audio_sets_and_clamps_each_channel() {
+        let mut s = Settings::default();
+        run_settings("audio master 45", &mut s);
+        assert_eq!(s.master_volume, 45);
+        run_settings("audio effects 200", &mut s); // over 100 clamps
+        assert_eq!(s.effects_volume, 100);
+        run_settings("audio voice 0", &mut s);
+        assert_eq!(s.voice_volume, 0);
+
+        // Bad channel or value is a Danger rejection that changes nothing.
+        let before = s.clone();
+        let out = run_settings("audio bass 50", &mut s);
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
+        let out = run_settings("audio master loud", &mut s);
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn voicetest_returns_a_placeholder_line() {
+        let mut s = Settings::default();
+        let out = run_settings("voicetest", &mut s);
+        assert!(out[0].text().contains("voice test"));
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Dim);
     }
 
     #[test]
@@ -459,26 +581,26 @@ mod tests {
 
     #[test]
     fn walkspeed_and_flyspeed_set_independently() {
-        let (mut p, w) = (player(), world());
-        let out = run("walkspeed 10", &mut p, &w);
+        let (mut p, mut w) = (player(), world());
+        let out = run("walkspeed 10", &mut p, &mut w);
         assert_eq!(p.speed, 10.0);
         assert!(out[0].text().contains("walkspeed set to 10.00"));
 
-        run("flyspeed 25", &mut p, &w);
+        run("flyspeed 25", &mut p, &mut w);
         assert_eq!(p.fly_speed, 25.0);
         // Setting one doesn't disturb the other.
         assert_eq!(p.speed, 10.0);
 
-        let out = run("walkspeed", &mut p, &w);
+        let out = run("walkspeed", &mut p, &mut w);
         assert!(out[0].text().contains("walkspeed: 10.00"));
     }
 
     #[test]
     fn speed_commands_reject_non_positive_and_non_finite() {
-        let (mut p, w) = (player(), world());
+        let (mut p, mut w) = (player(), world());
         let before = p.speed;
         for bad in ["0", "-5", "inf", "nan", "banana"] {
-            let out = run(&format!("walkspeed {bad}"), &mut p, &w);
+            let out = run(&format!("walkspeed {bad}"), &mut p, &mut w);
             assert_eq!(p.speed, before, "{bad} should not change speed");
             assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
         }

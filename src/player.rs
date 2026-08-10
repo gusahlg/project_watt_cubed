@@ -1,28 +1,25 @@
-//! player.rs holds the player's position and view orientation, and derives the
-//! render camera from them. Input modules mutate this; the world reads its
-//! [`Aabb`] for collision.
-//!
-//! Positions and velocities are `f64` so play stays precise out to the world
-//! border (see [`math`](crate::math)); view angles stay `f32` — a radian needs
-//! no more precision, only positions accumulate magnitude.
-use voxel_engine::{Camera3D, DVec3, Lens, Vec3, WarpStrength};
+//! Player state: position and orientation. Positions use `f64` for precision
+//! out to world borders; view angles use `f32` since rotation doesn't
+//! accumulate magnitude (see [`math`](crate::math)).
+use voxel_engine::DVec3;
 
-use crate::math::{Aabb, Bounded};
+use crate::camera::Orientation;
+use crate::math::{Aabb, Bounded, PER_METER};
 
 /// The player's collision half-width on the horizontal axes (x and z). Vertical
 /// extent is not a constant — it derives from [`Stance::height`] — so there is no
 /// `y` here to fall out of sync with the stance.
-pub const PLAYER_HALF_WIDTH: f64 = 0.3;
+pub const PLAYER_HALF_WIDTH: f64 = 0.3 * PER_METER;
 
 /// A fresh player's base ground walk speed, units/second. It lives on the player
 /// (see [`Player::speed`]) rather than in the movement module so it can vary per
 /// player; this is only the starting value.
-pub const DEFAULT_WALK_SPEED: f64 = 6.0;
+pub const DEFAULT_WALK_SPEED: f64 = 6.0 * PER_METER;
 
 /// A fresh player's flying speed, units/second. Lives on the player (see
 /// [`Player::fly_speed`]) for the same reason [`DEFAULT_WALK_SPEED`] does — so it
 /// can vary per player; this is only the starting value.
-pub const DEFAULT_FLY_SPEED: f64 = 14.0;
+pub const DEFAULT_FLY_SPEED: f64 = 14.0 * PER_METER;
 
 /// A fresh player's health, and the ceiling it's created at. Health is an intrinsic
 /// property the player carries but nothing yet reads or changes — see
@@ -36,7 +33,7 @@ pub const MAX_HEALTH: f32 = 20.0;
 ///
 /// The eye is anchored to the *feet*, not to the box centre: [`eye_offset`] is the
 /// eye's height above the feet, fixed at 90% of the stance height so the eyes sit
-/// just below the crown. `Standing` is 1.8 tall; `Sneaking` shrinks the box *and*
+/// just below the crown. `Standing` is 1.8 m tall; `Sneaking` shrinks the box *and*
 /// drops the eye proportionally, so crouching lowers both the head and the camera.
 ///
 /// [`eye_offset`]: Stance::eye_offset
@@ -47,13 +44,13 @@ pub enum Stance {
 }
 
 impl Stance {
-    /// Full standing (or crouching) height in blocks — the primitive from which
-    /// the box half-extent and eye height both derive, so they can't drift apart.
-    /// Sneaking lowers it.
+    /// Full standing (or crouching) height (1.8 m / 1.5 m in world units) — the
+    /// primitive from which the box half-extent and eye height both derive, so
+    /// they can't drift apart. Sneaking lowers it.
     pub fn height(self) -> f64 {
         match self {
-            Stance::Standing => 1.8,
-            Stance::Sneaking => 1.5,
+            Stance::Standing => 1.8 * PER_METER,
+            Stance::Sneaking => 1.5 * PER_METER,
         }
     }
 
@@ -79,7 +76,10 @@ pub enum Motion {
     /// this is its own variant rather than a flag on `Walking`.
     Swimming { velocity: DVec3 },
     /// Free flight: no gravity, no ground, velocity chases input on every axis.
-    Flying { velocity: DVec3 },
+    /// `noclip` additionally skips collision, letting the player pass through
+    /// solid geometry — meaningful only in flight, so it rides on this variant
+    /// rather than being a loose flag that could contradict walking/swimming.
+    Flying { velocity: DVec3, noclip: bool },
 }
 
 impl Motion {
@@ -88,7 +88,7 @@ impl Motion {
         match self {
             Motion::Walking { velocity, .. }
             | Motion::Swimming { velocity }
-            | Motion::Flying { velocity } => velocity,
+            | Motion::Flying { velocity, .. } => velocity,
         }
     }
 }
@@ -97,10 +97,8 @@ impl Motion {
 pub struct Player {
     /// Eye position in world space.
     pub position: DVec3,
-    /// Yaw in radians (rotation around the Y axis / left-right look).
-    pub yaw: f32,
-    /// Pitch in radians (up-down look), clamped by the look controller.
-    pub pitch: f32,
+    /// View angles — the one orientation; every camera mode is a function of it.
+    pub orientation: Orientation,
     /// How the player is moving — walking (with gravity) or flying.
     pub motion: Motion,
     /// Standing or sneaking — drives the player's height and eye offset.
@@ -120,8 +118,7 @@ impl Player {
     pub fn new(position: DVec3) -> Self {
         Self {
             position,
-            yaw: 0.0,
-            pitch: 0.0,
+            orientation: Orientation { yaw: 0.0, pitch: 0.0 },
             motion: Motion::Walking { velocity: DVec3::ZERO, on_ground: false },
             stance: Stance::Standing,
             speed: DEFAULT_WALK_SPEED,
@@ -145,6 +142,12 @@ impl Player {
         matches!(self.motion, Motion::Flying { .. })
     }
 
+    /// Whether the player is flying with collision disabled (passing through
+    /// solid geometry). False whenever not flying.
+    pub fn noclip(&self) -> bool {
+        matches!(self.motion, Motion::Flying { noclip: true, .. })
+    }
+
     /// Whether the player is swimming in a liquid.
     pub fn swimming(&self) -> bool {
         matches!(self.motion, Motion::Swimming { .. })
@@ -157,9 +160,24 @@ impl Player {
         let v = self.velocity();
         let velocity = DVec3::new(v.x, 0.0, v.z);
         self.motion = if flying {
-            Motion::Flying { velocity }
+            Motion::Flying { velocity, noclip: false }
         } else {
             Motion::Walking { velocity, on_ground: false }
+        };
+    }
+
+    /// Advance the flight state one step in the cycle
+    /// walking → flying → flying+noclip → walking, carrying horizontal momentum
+    /// across each switch (vertical is cleared, as in [`Player::set_flying`]).
+    /// Landing back to `Walking` lets [`reconcile_liquid`] promote to swimming
+    /// next frame if the feet are submerged, so no liquid special-case is needed.
+    pub fn cycle_fly(&mut self) {
+        let v = self.velocity();
+        let velocity = DVec3::new(v.x, 0.0, v.z);
+        self.motion = match self.motion {
+            Motion::Flying { noclip: false, .. } => Motion::Flying { velocity, noclip: true },
+            Motion::Flying { noclip: true, .. } => Motion::Walking { velocity, on_ground: false },
+            _ => Motion::Flying { velocity, noclip: false },
         };
     }
 
@@ -169,7 +187,7 @@ impl Player {
         match &mut self.motion {
             Motion::Walking { velocity, .. }
             | Motion::Swimming { velocity }
-            | Motion::Flying { velocity } => velocity.y = 0.0,
+            | Motion::Flying { velocity, .. } => velocity.y = 0.0,
         }
     }
 
@@ -179,63 +197,21 @@ impl Player {
         self.position.y - self.stance.eye_offset()
     }
 
-    /// Full view direction, including pitch. Built from `f64` trig of the
-    /// `f32` angles so adding it to an `f64` position loses nothing.
+    /// Full view direction, including pitch.
     pub fn forward(&self) -> DVec3 {
-        let (yaw, pitch) = (self.yaw as f64, self.pitch as f64);
-        DVec3::new(
-            yaw.cos() * pitch.cos(),
-            pitch.sin(),
-            yaw.sin() * pitch.cos(),
-        )
+        self.orientation.direction()
     }
 
     /// The forward and right basis vectors on the XZ plane, used for ground
     /// movement. Returned together because they share one `sin`/`cos` of the yaw,
     /// and both come out unit length already (no normalize needed).
     pub fn movement_basis(&self) -> (DVec3, DVec3) {
-        let (sin_yaw, cos_yaw) = (self.yaw as f64).sin_cos();
+        let (sin_yaw, cos_yaw) = (self.orientation.yaw as f64).sin_cos();
         let forward = DVec3::new(cos_yaw, 0.0, sin_yaw);
         let right = DVec3::new(-sin_yaw, 0.0, cos_yaw);
         (forward, right)
     }
 
-    /// Build the engine camera that looks out from the player's eye.
-    pub fn camera(&self) -> Camera3D {
-        self.camera_with_fov(70.0)
-    }
-
-    /// Like [`camera`](Self::camera) but with a caller-chosen vertical field of
-    /// view in degrees, so the FOV graphics setting can drive the render camera.
-    ///
-    /// CAMERA REBASE: the engine is `f32`, so instead of handing it a huge
-    /// world-space eye position (whose f32 rounding would make far terrain
-    /// jitter), the camera sits at the origin looking along the view
-    /// direction, and every 3D draw is made camera-relative (chunk meshes via
-    /// per-draw offsets, peers by subtracting the eye) — see
-    /// [`Game::draw`](crate::game::Game).
-    pub fn camera_with_fov(&self, fovy: f32) -> Camera3D {
-        // Two regimes, seam at 120°. Below, plain rectilinear at the dialed fovy.
-        // Above, the dial stops widening the *vertical* FOV — which would collapse
-        // and then flip the projection as it neared 180° — and instead buys
-        // *horizontal* reach through the wide lens: vertical pins at 120° and the
-        // 120→220 travel maps onto WarpStrength 0→MAX (2.0), edges compressing as
-        // it grows. At exactly 120 the two regimes coincide, so the seam is
-        // seamless.
-        let (fovy, lens) = if fovy > 120.0 {
-            let strength = WarpStrength::new((fovy - 120.0) / 50.0).unwrap();
-            (120.0, Lens::WideFov { strength })
-        } else {
-            (fovy, Lens::Rectilinear)
-        };
-        Camera3D {
-            position: Vec3::ZERO,
-            target: self.forward().as_vec3(),
-            up: Vec3::new(0.0, 1.0, 0.0),
-            fovy,
-            lens,
-        }
-    }
 }
 
 /// The collision box for an eye at `eye` in the given `stance`. Built from the

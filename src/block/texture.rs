@@ -25,23 +25,27 @@ pub const TEXTURE_SIZE: u32 = 16;
 const BLEND: f32 = 0.06;
 /// Maximum per-texel brightness jitter, as a +/- fraction.
 const JITTER: f32 = 0.08;
-/// Neutral gray base for compositions with no elements (Computational).
+/// Neutral gray base for compositions with no elements.
 const NEUTRAL_GRAY: [f32; 3] = [140.0, 140.0, 140.0];
 
 const BYTES_PER_LAYER: usize = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
 
-/// Build one 16x16 RGBA8 texture layer per registered block, indexed by block
-/// id. Block 0 (air) is pure white; every other layer is the element blend of
-/// that block's composition. Feed straight to `Engine::set_block_textures`.
+/// Build the 16x16 RGBA8 texture layer for one block id. Block 0 (air) is pure
+/// white; every other layer is the element blend of that block's composition.
+/// The world's incremental texture cache calls this per newly registered id.
+pub fn build_block_texture(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
+    if id.0 == 0 {
+        vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
+    } else {
+        layer_for(registry, id)
+    }
+}
+
+/// Build one texture layer per registered block, indexed by block id. Feed
+/// straight to `Engine::set_block_textures`.
 pub fn build_block_textures(registry: &BlockRegistry) -> Vec<Vec<u8>> {
     (0..registry.block_count())
-        .map(|i| {
-            if i == 0 {
-                vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
-            } else {
-                layer_for(registry, BlockId(i as u8))
-            }
-        })
+        .map(|i| build_block_texture(registry, BlockId(i as u16)))
         .collect()
 }
 
@@ -51,8 +55,8 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
     let parts = parts(&registry.block(id).composition);
     let seed = seed_of(&parts);
     let (colors, cuts): (Vec<[f32; 3]>, Vec<f32>) = if parts.is_empty() {
-        // Computational blocks (and any degenerate empty composition beyond
-        // air) get a neutral gray base with speckle only.
+        // Any degenerate empty composition beyond air gets a neutral gray base
+        // with speckle only.
         (vec![NEUTRAL_GRAY], vec![1.0])
     } else {
         let colors = parts
@@ -62,8 +66,6 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
                 [c.r as f32, c.g as f32, c.b as f32]
             })
             .collect();
-        // Weight thresholds partition the noise range across elements;
-        // last is clamped to 1.0 to absorb rounding.
         let mut acc = 0.0;
         let mut cuts: Vec<f32> = parts
             .iter()
@@ -79,10 +81,8 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
     let mut out = Vec::with_capacity(BYTES_PER_LAYER);
     for y in 0..TEXTURE_SIZE {
         for x in 0..TEXTURE_SIZE {
-            // Smooth tiling noise picks the texel's element...
             let n = tile_noise(seed, x as f32 + 0.5, y as f32 + 0.5);
             let rgb = pick_color(&colors, &cuts, n);
-            // ...and an uncorrelated per-texel hash speckles the brightness.
             let jitter = 1.0 + (hash01(seed, JITTER_CHANNEL, x, y) * 2.0 - 1.0) * JITTER;
             for c in rgb {
                 out.push((c * jitter).clamp(0.0, 255.0).round() as u8);
@@ -105,7 +105,7 @@ fn parts(composition: &Composition) -> Vec<(ElementId, f32)> {
         .collect()
 }
 
-/// FNV-1a over the sorted `(element id, whole percentage)` pairs. Composition
+/// FNV / FNV1a over the sorted `(element id, whole percentage)` pairs. Composition
 /// -> seed, so identical materials look identical everywhere.
 fn seed_of(parts: &[(ElementId, f32)]) -> u32 {
     let mut bytes = Vec::with_capacity(parts.len() * 5);
@@ -141,7 +141,7 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     ]
 }
 
-// ---- tiling value noise -------------------------------------------------
+// tiling value noise
 
 /// Octave 0: a 4x4 random lattice across the tile (one cell = 4 texels).
 const OCTAVE0_PERIOD: u32 = 4;
@@ -247,8 +247,8 @@ mod tests {
 
     #[test]
     fn two_element_natural_block_shows_both_element_colors() {
-        // Stone (128,128,128) + Organic (86,176,0): gray texels have high
-        // blue relative to organic's zero, green texels dominate in G.
+        // Stone (112,118,128 slate) + Organic (24,186,156 teal): slate texels
+        // are near-grey (R≈G≈B), teal texels have G far above R.
         let mut reg = BlockRegistry::with_builtins();
         let id = reg.natural(&[El::Stone.id(), El::Organic.id()]).unwrap();
         let layers = build_block_textures(&reg);
@@ -258,15 +258,15 @@ mod tests {
         let mut organicish = 0;
         for texel in layer.chunks_exact(4) {
             let (r, g, b) = (texel[0] as i32, texel[1] as i32, texel[2] as i32);
-            if b >= 100 && (r - g).abs() <= 30 {
+            if (r - g).abs() <= 25 && (g - b).abs() <= 25 && r >= 70 {
                 stoneish += 1;
             }
-            if g >= 140 && b <= 50 {
+            if g - r >= 60 && g >= 120 {
                 organicish += 1;
             }
         }
-        assert!(stoneish >= 5, "expected stone-dominant texels, got {stoneish}");
-        assert!(organicish >= 5, "expected organic-dominant texels, got {organicish}");
+        assert!(stoneish >= 5, "expected slate-dominant texels, got {stoneish}");
+        assert!(organicish >= 5, "expected teal-dominant texels, got {organicish}");
     }
 
     #[test]

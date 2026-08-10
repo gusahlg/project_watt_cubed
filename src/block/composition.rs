@@ -2,12 +2,8 @@
 //! everything observable about a block (solidity, colour, the nine core
 //! properties, specials, reactions) falls out of it.
 //!
-//! The four variants mirror the documented block hierarchy, from cheapest to most
-//! expressive. Only [`Natural`](Composition::Natural) and
-//! [`Mixture`](Composition::Mixture) are wired end-to-end today; `Configuration`
-//! and `Computational` exist so the type — and every call site keyed on
-//! [`BlockId`](crate::block::BlockId) — stays stable while their interiors are
-//! filled in later.
+//! [`Natural`](Composition::Natural) and [`Mixture`](Composition::Mixture)
+//! mirror the documented block hierarchy, from cheapest to most expressive.
 use crate::block::element::ElementId;
 
 /// Each distinct element paired with its total weight, sorted by
@@ -44,8 +40,7 @@ impl Weights {
 }
 
 /// An exact element mixture: each element paired with a whole-percent share. The
-/// shares always sum to 100 (enforced by [`Mix::new`]). Shared by `Mixture` and
-/// `Configuration`, which differ only in whether spatial layout matters.
+/// shares always sum to 100 (enforced by [`Mix::new`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mix(Box<[(ElementId, u8)]>);
 
@@ -73,8 +68,6 @@ impl std::fmt::Display for MixError {
 impl Mix {
     /// Build a mixture, validating that the shares sum to exactly 100.
     pub fn new(parts: &[(ElementId, u8)]) -> Result<Self, MixError> {
-        // Normalize first: merge duplicate ids (summing their shares), drop
-        // zero shares, and sort by id. Validation runs on the normalized form.
         let mut norm: Vec<(ElementId, u8)> = Vec::with_capacity(parts.len());
         for &(e, p) in parts {
             if p == 0 {
@@ -102,17 +95,6 @@ impl Mix {
     }
 }
 
-/// Opaque placeholder for a configuration block's spatial arrangement of elements.
-/// Arrangement only affects routing (e.g. directing electricity), which is
-/// deferred; derived *properties* ignore it, so today it carries no data.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Layout;
-
-/// Opaque placeholder for a computational block's logic-gate graph. Built in a
-/// special crafter; the gate model and signal routing are deferred.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Computer;
-
 /// What a block is made of, in increasing order of expressiveness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Composition {
@@ -122,17 +104,33 @@ pub enum Composition {
     /// Exact element percentages. The first craftable tier; supports specials and
     /// reactions.
     Mixture(Mix),
-    /// Exact percentages *and* a spatial arrangement. Derives like a mixture today;
-    /// `layout` drives routing later.
-    Configuration { mix: Mix, layout: Layout },
-    /// A graph of logic-gate components. Interior deferred.
-    Computational(Computer),
 }
 
 impl Composition {
     /// Convenience constructor for an equal-parts natural block.
+    ///
+    /// Naturals are SETS by design (unspecified, equal parts), so construction
+    /// canonicalizes: sorted by element id, duplicates dropped. Every path
+    /// that builds a natural — worldgen, crafting, save/network spec parsing —
+    /// therefore agrees on one composition per set, and a duplicated listing
+    /// can never mint a second registry block that fails to round-trip.
+    /// Ratios are what [`Mixture`](Composition::Mixture) is for.
     pub fn natural(elements: &[ElementId]) -> Self {
-        Composition::Natural(Box::from(elements))
+        let mut set: Vec<ElementId> = elements.to_vec();
+        set.sort_unstable_by_key(|e| e.0);
+        set.dedup();
+        Composition::Natural(set.into_boxed_slice())
+    }
+
+    /// [`natural`](Self::natural) for input the caller has ALREADY sorted by
+    /// id and deduplicated (crafting canonicalizes before the palette lookup)
+    /// — skips re-canonicalizing what is canonical by construction.
+    pub fn natural_sorted(elements: &[ElementId]) -> Self {
+        debug_assert!(
+            elements.windows(2).all(|w| w[0].0 < w[1].0),
+            "natural_sorted input must be strictly id-ascending"
+        );
+        Composition::Natural(elements.to_vec().into_boxed_slice())
     }
 
     /// Convenience constructor for a validated mixture.
@@ -147,14 +145,9 @@ impl Composition {
     pub fn weights(&self) -> Weights {
         let mut raw: Vec<(ElementId, u32)> = match self {
             Composition::Natural(els) => els.iter().map(|&e| (e, 1u32)).collect(),
-            Composition::Mixture(mix) | Composition::Configuration { mix, .. } => {
-                mix.0.iter().map(|&(e, p)| (e, p as u32)).collect()
-            }
-            // Computational blocks have no element composition to average yet.
-            Composition::Computational(_) => Vec::new(),
+            Composition::Mixture(mix) => mix.0.iter().map(|&(e, p)| (e, p as u32)).collect(),
         };
         raw.sort_by_key(|&(e, _)| e);
-        // Merge adjacent equal ids, summing their weights.
         raw.dedup_by(|&mut (e, w), &mut (pe, ref mut pw)| {
             if e == pe {
                 *pw += w;
@@ -176,9 +169,7 @@ impl Composition {
     pub fn is_empty(&self) -> bool {
         match self {
             Composition::Natural(els) => els.is_empty(),
-            Composition::Mixture(mix) | Composition::Configuration { mix, .. } => mix.0.is_empty(),
-            // A computational block is a built object — solid even with no elements.
-            Composition::Computational(_) => false,
+            Composition::Mixture(mix) => mix.0.is_empty(),
         }
     }
 }
@@ -204,17 +195,19 @@ mod tests {
     }
 
     #[test]
-    fn weights_aggregate_duplicates() {
-        // A natural block listing the same element more than once reduces to one
-        // entry with the summed weight, sorted by id.
+    fn naturals_canonicalize_to_sets() {
+        // Naturals are sets: duplicates drop and order never matters, so every
+        // spelling of one set IS one composition (registry lookup, saves, and
+        // network specs can't mint duplicate variants).
         let (copper, iron) = (ElementId(5), ElementId(2));
         let comp = Composition::natural(&[copper, copper, iron]);
+        assert_eq!(comp, Composition::natural(&[iron, copper]));
         let w = comp.weights();
-        assert_eq!(w.parts(), &[(iron, 1), (copper, 2)], "deduped and sorted by id");
-        assert_eq!(w.weight_of(copper), 2, "both occurrences summed");
+        assert_eq!(w.parts(), &[(iron, 1), (copper, 1)], "equal parts, sorted by id");
+        assert_eq!(w.weight_of(copper), 1);
         assert_eq!(w.weight_of(iron), 1);
         assert_eq!(w.weight_of(ElementId(99)), 0, "absent element weighs 0");
-        assert_eq!(w.total(), 3);
+        assert_eq!(w.total(), 2);
     }
 
     #[test]
