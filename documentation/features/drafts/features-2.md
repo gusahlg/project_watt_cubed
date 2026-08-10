@@ -2,7 +2,10 @@
 I am rewriting key parts of the features file entirely in a new draft that has more thought through and refined versions of the features described in the original
 feature file. After this I will write a new feature file that more extensively goes through the final versions of the core features of the game.
 
-## Core Properties
+## Elements
+Elements make up the blocks in the world. These are the different kinds of properties that define elements
+
+### Core Properties
 I think the core properties that any element should have are these:
 - Durability, how much damage it can take until it breaks
 - Hardness, how hard it is to damage it, acts as a floor for the least amount of damage it can take, if it is attacked with something lower it takes no damage
@@ -10,7 +13,17 @@ I think the core properties that any element should have are these:
 - Density, how heavy it is, will affect how easily it is moved
 - Friction, how much it grips to adjacent blocks, if the value is higher than an adjacent blocks density that blocks moves with it (if the pushing force is adequate)
 
-## Special Properties
+### Special Properties
+Special properties are properties that not every element has.
+
+### Reaction Properties
+Reaction properties are properties that do not belong to a single element, rather they come active when a certain combinations of elements are present at once in a block.
+
+## Blocks
+Blocks contain elements and inherit their properties in different ways depending on what kind of block it is. There are two different kinds of blocks that behave differently.
+
+### Natural Blocks
+Natural blocks are combinations between mutliple elemtns that 
 
 # Thoughts
 Random thoughts and debates that need to be resolved to be able to write another draft.
@@ -133,11 +146,88 @@ contraptions, not sure what I think about that. Maybe there should be a sort of 
 not a pressure system is fun or if we want something simpler and completely different, we can be original and totally unrealistic. Unrealistic does not mean unfun, Minecraft
 proves this and that game is a great inspiration for this game.
 
+## I think we might want to have a velocity system.
+So basically walnutty asked me if there should be automining with a tunnnel bore or something and I realised that there was no collision damage system and then I realised
+there is no velocity system at all and I want it to be possible to propell away a block due to an explosion or something and then have a collision with something else equal
+damage. I think we just got to have this in the game to be honest, thanks walnut. We will have some sort of air resistance system as well though so that blocks do not travel
+indefinitely.
+
+## Also I think we will have alloys in the game.
+So basically the concept of an alloy in the game is just the action of basically creating a new element (but instead of having the element label it has the alloy lable instead)
+the difference between an alloy and an element is that it has the average core properties of the elements it is made of - all special properties (of the elements it is made of)
++ any reaction properties that exist between the elements it is made of. The basic condition for an alloy to be created is that it would have one or more reaction properties and
+then every reaction property also has a specific environment condition that decides when it can be crafted. This condition can be for example reaching a certain temperature or
+pressure or both at the same time, or something more specific like it being surrounded by a certain kind of element or something like that.
+
+## Also I just realised we have to make it possible for elements to be moved around kind of like in a pipe.
+Currently we only have block movement meaning the block can have velocity and be moved around but elements themselves can in no way be propelled within blocks and from blocks to
+other blocks. Whilst this would be cool I think we gotta make some sort of decision around what is a block dynamic and element dynamic, is movement going to be only blocks or both?
+
+## Overall concern, what is an element in a confiutation block, exactly how is the block "configured"?
+As I have seen it so far I have thought of the configuration block basically being like a block with a bunch of small blocks in it being the elements. And configuration blocks can
+also have alloys in them but the blocks themselves can not have special or reaction properties. But the question is how detailed the grid of elements in the configuration block
+should be. If it is too detailed it will be tedious to edit it anyway and annoying + worse for memory and significantly harder to craft. It has to be simple, yet powerful, that
+is the main thing. I think something like a 30x30x30 within grid for elements within the block might be an ideal compromise.
+
+## Is there any way to simplify and go from blocks being one thing and elements inside of them being another dimension entirely and make some kind of shape generalisation?
+This is interesting since it could mean that we could maybe have sub block things be crafted. This would mean that instead of there being only elements and blocks there are instead
+instead inbetween things kind of. What I mean is that you can craft small fractions of blocks as well. This just means that the configuration block crafting should allow you to leave
+a bunch of air in the blocks as well. It also means that these components should be reusable when crafting a new block. So basically configuration blocks that fit inside of other
+configuration blocks can be placed there as well. I think the sub blocks should be nameable and reusable easily and that there should be a good interface for the configuration block
+crafting but most of that is up to modding I'd say. I also think that multy block things should also be nameable and reproducable in the same way kind of like schematics.
+
+## Maybe we should just have a crafting block or something?
+I am starting to think that that might be the most fun solution for configuration blocks at least. Since like configuration blocks are immmensely complex things creating a general
+crafting formula for them in a fun way seems like something close to an impossibiliy. I think we should maybe add in something like a crafting block for them that allows both player
+and machines to craft blocks. Player can do so through an interface (mod) and machines can autocraft things by basically sending in signals to it through electricity. We could like
+create some lore around this somehowk, saying that we got it from like an alien spaceship or somthing idk. Could be cool still. And it appeals to simplicity which after all is a major
+goal although adding in a specific block for it is non-preferable for some reasons. I am saying maybe we do this for now and then someone can have a stroke of genius later on and make
+something better
+
+## Ok genius moment
+What if we have an element called like stardust or whatever that acts as a determiner for how things are suppoesed to be crafted. Hmm idk this might be complex to I think my brain is
+just fried but if we somehow could like put in a bit of stardust into a block to signal.... WAIT what if configuration blocks start off as being empty explicitly letting other blocks move
+through it and that somehow elements can be pushed into place in the block and then the stardust signal thing is done and it kinda just says, ok I AM COMPLETE! and switches internal state
+and done. Something like this could maybe work. Please give some feedback lol.
+
+Ok I have to specify kinda exactly how this crafting thing should work now so that we can have a complete solution to one of the hardest problems in the game that we can then review and
+refine. Okay so lets set up the details of how this works. First of all how is a configuration submitted into a configuration block? I had this idea that maybe the elements would be pushed
+into the block that will be crafted and then craft signal leading to new block being made. Instead of a signal there could also be a condition that makes crafting trigger. And instead of
+physically pushing elements into the block there could instead by some sort of way to like put multiple blocks together into one new block in a certain way where the placement can be translated
+into element space. Or the third option is submitting a configuration and resources seperately. In a more organized format this could be expressed as:
+
+Crafting execution solutions:
+- Signals
+- Conditions
+
+Configuration and resources solutions:
+- Input confiugration and resources seperately
+- Somehow make it possible to put configuration into new block by surrounding it with other blocks that code for the configuration
+- physically move elments into the block
+
+A solution is to full on add in movement to all elements and not make movement block only. This makes me wonder whether we would want elements to be able to move though. Like the thing is
+If elements moved configuration blocks would not have to exist anyway and it would be super messy and annoying I think so what about just saying no to this. I have another idea though. What if we can
+push a natural block into a confiuration block and having it convert into elements. So that if we have a pure stone natural block pushing it into... wait I think I know how to do this. WHat if we have
+the signaling be for when to convert a natural block into elements in a configuratin block? So like what if a signal is inputted into the configuration block, the configuration block changes some
+state and then the next natural block that is pushed into it gets converted to elements in that block. Okay sure sure but how does one make precise things out of this? This gives little control over
+where the elements go, which is a problem since that is the whole other half of the problem, controling configuration. Maybe the signal that the block gets in before-hand can hold information about
+how the next elements are going to be placed? Yeah that might work. Maybe we can have an element called something cool. I think this idea is okay actuallly it is basically a sort of variation of the
+combination of having a sort of signal and inputting configuration and resources seperately. I like it. The only real problem is that we have to have a way of editing the configuration by a player and
+placing it out as a block. I am thinking it will look like a block made of element that are bluish transparent (kind of like a typical blueprint) this block should basically be its own kind of block
+called something like a bluepring block or something and it should be possible to walk through and it should have very simple core properties. It should be super easy to push it into a configuration
+block and it should then get deleted and update the place the next stuff go to in the configuration block. blueprint blocks take no resources to craft. I am thinking it would be good if they were
+also craftable without the player there as well somehow. It doesn't matter if that is a little tedious as much since it is not the primary method. I am thinking that it should be possible to
+automatically craft them by laying out natural blocks that are pure (made up of only one element) in a 30x30x30 configuration so that it is almost like a big block made out of blocks. Then there has
+to be some signal or something that makes the 30x30x30 blocks combine into a single block. The signal would have to be something specific or there could be a condition of some sort.
+
+OKAY so I want an alternative path because this is not purist enough to the original vision. THINKTHINKTHINK
+
 # Unresolved problems list
+There's probably a lot more here that is missing so just try adding in something whenever you come to think of something.
 - Crafting
     - Processes
 - Simulation
     - Electricity
     - Temperature
     - Block movement
-
+- Block breaking

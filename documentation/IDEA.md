@@ -17,7 +17,7 @@ The second half of the game is what makes it truly meaningful and fun: people.
 
 This includes:
 
-* Coöperation
+* Cooperation
 * Interaction
 * Being part of a large economy
 * Creating lore
