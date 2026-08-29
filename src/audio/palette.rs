@@ -47,7 +47,7 @@ const CLASSES: [SoundClass; 6] = [
     SoundClass::Wood,
     SoundClass::Glass,
     SoundClass::Foliage,
-    SoundClass::Water,
+    SoundClass::Open,
 ];
 
 const DEFAULT_GAIN: f32 = 1.0;

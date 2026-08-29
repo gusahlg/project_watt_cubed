@@ -1,4 +1,4 @@
-//! Canonical binary codec for the ident vocabulary.
+//! Canonical binary codec for shared primitive values.
 //!
 //! `save/format.rs` and `net/protocol.rs` frame this codec instead of hand-rolling
 //! their own bit-twiddling for the same primitives (integers, length-prefixed
@@ -9,46 +9,15 @@
 //! CANONICAL ENDIANNESS: little (matches save, the larger surface). Decoding never
 //! panics and never yields a partial value: every getter returns a typed
 //! [`CodecError`] on truncated or malformed input (parse-don't-validate).
-//!
-//! `Edit`/`Stamped`'s full domain-type encoding (this module's `edit`/`stamped`
-//! methods) is not yet wired into either `save/format.rs` (its v5 edit record is
-//! fixed-width, which its truncation-salvage arithmetic depends on; `Edit`'s `Data`
-//! variant is variable-width) or `net/protocol.rs` (its `Edit` messages carry a
-//! portable spec *string*, constructed in read-only `net/client.rs`/`server.rs`,
-//! not a numeric `BlockState`) — a future scope for the follow-up integration.
 
 use voxel_engine::DVec3;
-
-use crate::block::BlockId;
-
-use super::{
-    BlockState, CellPos, DataKey, Edit, EditSeq, EditSource, FieldKind, PlayerId, Stamped,
-    EDIT_TAG_CELL, EDIT_TAG_DATA, EDIT_TAG_FILL, EDIT_TAG_SPHERE,
-};
 
 /// A decode failure. Never a panic: every path through [`Reader`] returns this
 /// instead of indexing past the buffer or trusting an attacker-controlled length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecError {
     Truncated,
-    UnknownTag(u8),
-    /// Rejected before the byte count is trusted enough to allocate for.
-    DataTooLarge(u32),
 }
-
-/// Sanity cap on a single `Edit::Data` payload, so a corrupt length prefix can't
-/// balloon memory before the bytes are even read.
-pub const MAX_DATA_LEN: u32 = 1 << 20;
-
-// EditSource wire tags. Local to the codec (not part of the frozen `EDIT_TAG_*`
-// set, which is reserved for `Edit`'s own tagged union) — changing an existing
-// one is forbidden by the same "extend, never mutate" rule.
-const SOURCE_TAG_PLAYER: u8 = 0;
-const SOURCE_TAG_SIM: u8 = 1;
-const SOURCE_TAG_SYSTEM: u8 = 2;
-
-const FIELD_TAG_THERMAL: u8 = 0;
-const FIELD_TAG_ELECTRICAL: u8 = 1;
 
 /// The wire-shared subset of player state: position + orientation. Save's
 /// `flying`/`noclip` and net's `Stance` are framing-specific (persistence mode
@@ -120,69 +89,6 @@ impl Writer {
         self.vec3(p.pos);
         self.f32(p.yaw);
         self.f32(p.pitch);
-    }
-
-    pub fn cell_pos(&mut self, p: CellPos) {
-        self.i64(p.x);
-        self.i32(p.y);
-        self.i64(p.z);
-    }
-
-    pub fn block_state(&mut self, b: BlockState) {
-        self.u16(b.id.0);
-        self.u16(b.state);
-    }
-
-    pub fn source(&mut self, s: &EditSource) {
-        match s {
-            EditSource::Player(PlayerId(id)) => {
-                self.u8(SOURCE_TAG_PLAYER);
-                self.u32(*id);
-            }
-            EditSource::Sim(field) => {
-                self.u8(SOURCE_TAG_SIM);
-                self.u8(match field {
-                    FieldKind::Thermal => FIELD_TAG_THERMAL,
-                    FieldKind::Electrical => FIELD_TAG_ELECTRICAL,
-                });
-            }
-            EditSource::System => self.u8(SOURCE_TAG_SYSTEM),
-        }
-    }
-
-    pub fn edit(&mut self, e: &Edit) {
-        match e {
-            Edit::Cell { pos, block } => {
-                self.u8(EDIT_TAG_CELL);
-                self.cell_pos(*pos);
-                self.block_state(*block);
-            }
-            Edit::Fill { min, max, block } => {
-                self.u8(EDIT_TAG_FILL);
-                self.cell_pos(*min);
-                self.cell_pos(*max);
-                self.block_state(*block);
-            }
-            Edit::Sphere { center, radius_cells, block } => {
-                self.u8(EDIT_TAG_SPHERE);
-                self.cell_pos(*center);
-                self.u32(*radius_cells);
-                self.block_state(*block);
-            }
-            Edit::Data { pos, key, value } => {
-                self.u8(EDIT_TAG_DATA);
-                self.cell_pos(*pos);
-                self.u32(key.0);
-                self.u32(value.len() as u32);
-                self.raw(value);
-            }
-        }
-    }
-
-    pub fn stamped(&mut self, s: &Stamped) {
-        self.u64(s.seq.0);
-        self.source(&s.source);
-        self.edit(&s.edit);
     }
 }
 
@@ -276,110 +182,26 @@ impl<'a> Reader<'a> {
     }
 
     pub fn pose(&mut self) -> Result<Pose, CodecError> {
-        Ok(Pose { pos: self.vec3()?, yaw: self.f32()?, pitch: self.f32()? })
-    }
-
-    pub fn cell_pos(&mut self) -> Result<CellPos, CodecError> {
-        Ok(CellPos { x: self.i64()?, y: self.i32()?, z: self.i64()? })
-    }
-
-    pub fn block_state(&mut self) -> Result<BlockState, CodecError> {
-        Ok(BlockState { id: BlockId(self.u16()?), state: self.u16()? })
-    }
-
-    pub fn source(&mut self) -> Result<EditSource, CodecError> {
-        match self.u8()? {
-            SOURCE_TAG_PLAYER => Ok(EditSource::Player(PlayerId(self.u32()?))),
-            SOURCE_TAG_SIM => Ok(EditSource::Sim(match self.u8()? {
-                FIELD_TAG_THERMAL => FieldKind::Thermal,
-                FIELD_TAG_ELECTRICAL => FieldKind::Electrical,
-                other => return Err(CodecError::UnknownTag(other)),
-            })),
-            SOURCE_TAG_SYSTEM => Ok(EditSource::System),
-            other => Err(CodecError::UnknownTag(other)),
-        }
-    }
-
-    pub fn edit(&mut self) -> Result<Edit, CodecError> {
-        match self.u8()? {
-            EDIT_TAG_CELL => Ok(Edit::Cell { pos: self.cell_pos()?, block: self.block_state()? }),
-            EDIT_TAG_FILL => {
-                let min = self.cell_pos()?;
-                let max = self.cell_pos()?;
-                Ok(Edit::Fill { min, max, block: self.block_state()? })
-            }
-            EDIT_TAG_SPHERE => {
-                let center = self.cell_pos()?;
-                let radius_cells = self.u32()?;
-                Ok(Edit::Sphere { center, radius_cells, block: self.block_state()? })
-            }
-            EDIT_TAG_DATA => {
-                let pos = self.cell_pos()?;
-                let key = DataKey(self.u32()?);
-                let len = self.u32()?;
-                if len > MAX_DATA_LEN {
-                    return Err(CodecError::DataTooLarge(len));
-                }
-                let value = self.take(len as usize)?.to_vec().into_boxed_slice();
-                Ok(Edit::Data { pos, key, value })
-            }
-            other => Err(CodecError::UnknownTag(other)),
-        }
-    }
-
-    pub fn stamped(&mut self) -> Result<Stamped, CodecError> {
-        let seq = EditSeq(self.u64()?);
-        let source = self.source()?;
-        let edit = self.edit()?;
-        Ok(Stamped { seq, source, edit })
+        Ok(Pose {
+            pos: self.vec3()?,
+            yaw: self.f32()?,
+            pitch: self.f32()?,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::BlockId;
-
-    fn block(id: u16, state: u16) -> BlockState {
-        BlockState { id: BlockId(id), state }
-    }
-
-    fn cell(x: i64, y: i32, z: i64) -> CellPos {
-        CellPos { x, y, z }
-    }
-
-    #[test]
-    fn cell_pos_round_trips_extreme_coords() {
-        for p in [
-            cell(0, 0, 0),
-            cell(i64::MIN, i32::MIN, i64::MAX),
-            cell(i64::MAX, i32::MAX, i64::MIN),
-            cell(-1_000_000_000, -2048, 1_000_000_000),
-        ] {
-            let mut w = Writer::new();
-            w.cell_pos(p);
-            let bytes = w.into_inner();
-            let mut r = Reader::new(&bytes);
-            assert_eq!(r.cell_pos().unwrap(), p);
-            assert!(r.finished());
-        }
-    }
-
-    #[test]
-    fn block_state_round_trips() {
-        for b in [block(0, 0), block(u16::MAX, u16::MAX), block(1, 0), block(0, 1)] {
-            let mut w = Writer::new();
-            w.block_state(b);
-            let bytes = w.into_inner();
-            let mut r = Reader::new(&bytes);
-            assert_eq!(r.block_state().unwrap(), b);
-        }
-    }
 
     #[test]
     fn pose_round_trips_at_world_border() {
         let poses = [
-            Pose { pos: DVec3::new(0.0, 0.0, 0.0), yaw: 0.0, pitch: 0.0 },
+            Pose {
+                pos: DVec3::new(0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+            },
             Pose {
                 pos: DVec3::new(1.0e9 + 0.123456789, -3_000.25, -(1.0e9 - 0.75)),
                 yaw: 1.25,
@@ -400,84 +222,23 @@ mod tests {
         }
     }
 
-    fn edit_corpus() -> Vec<Edit> {
-        vec![
-            Edit::Cell { pos: cell(1, 60, -1), block: block(3, 0) },
-            Edit::Cell { pos: cell(i64::MIN, i32::MIN, i64::MAX), block: block(0, 0) },
-            Edit::Fill { min: cell(0, 0, 0), max: cell(15, 15, 15), block: block(7, 2) },
-            Edit::Sphere { center: cell(-5, 10, 5), radius_cells: 8, block: block(9, 0) },
-            Edit::Data { pos: cell(2, 1, 2), key: DataKey(5), value: Box::new([]) },
-            Edit::Data { pos: cell(2, 1, 2), key: DataKey(u32::MAX), value: Box::new([1, 2, 3, 4, 5]) },
-        ]
-    }
-
-    #[test]
-    fn edit_round_trips_every_variant() {
-        for e in edit_corpus() {
-            let mut w = Writer::new();
-            w.edit(&e);
-            let bytes = w.into_inner();
-            let mut r = Reader::new(&bytes);
-            assert_eq!(r.edit().unwrap(), e);
-            assert!(r.finished(), "decode left trailing bytes for {e:?}");
-        }
-    }
-
-    #[test]
-    fn stamped_round_trips_every_source() {
-        let sources = [
-            EditSource::Player(PlayerId(0)),
-            EditSource::Player(PlayerId(u32::MAX)),
-            EditSource::Sim(FieldKind::Thermal),
-            EditSource::Sim(FieldKind::Electrical),
-            EditSource::System,
-        ];
-        for (i, source) in sources.into_iter().enumerate() {
-            let s = Stamped { seq: EditSeq(i as u64), source, edit: edit_corpus()[i % 6].clone() };
-            let mut w = Writer::new();
-            w.stamped(&s);
-            let bytes = w.into_inner();
-            let mut r = Reader::new(&bytes);
-            assert_eq!(r.stamped().unwrap(), s);
-        }
-    }
-
-    #[test]
-    fn unknown_and_reserved_edit_tags_are_rejected_cleanly() {
-        for tag in [0x00u8, 0x05, 0x0f, 0x10, 0x7f, 0xff] {
-            let bytes = [tag];
-            let mut r = Reader::new(&bytes);
-            assert_eq!(r.edit(), Err(CodecError::UnknownTag(tag)));
-        }
-    }
-
-    #[test]
-    fn oversize_data_payload_is_rejected_before_reading_bytes() {
-        let mut w = Writer::new();
-        w.u8(EDIT_TAG_DATA);
-        w.cell_pos(cell(0, 0, 0));
-        w.u32(0); // key
-        w.u32(MAX_DATA_LEN + 1); // length prefix, but no actual payload follows
-        let bytes = w.into_inner();
-        let mut r = Reader::new(&bytes);
-        assert_eq!(r.edit(), Err(CodecError::DataTooLarge(MAX_DATA_LEN + 1)));
-    }
-
     #[test]
     fn truncated_input_errors_instead_of_panicking() {
         assert_eq!(Reader::new(&[]).u8(), Err(CodecError::Truncated));
         assert_eq!(Reader::new(&[1, 2, 3]).u64(), Err(CodecError::Truncated));
-        assert_eq!(Reader::new(&[EDIT_TAG_CELL]).edit(), Err(CodecError::Truncated));
     }
 
     #[test]
     fn trailing_bytes_are_visible_via_finished() {
         let mut w = Writer::new();
-        w.edit(&Edit::Cell { pos: cell(0, 0, 0), block: block(1, 0) });
+        w.u8(7);
         let mut bytes = w.into_inner();
         bytes.push(0xa5);
         let mut r = Reader::new(&bytes);
-        r.edit().unwrap();
-        assert!(!r.finished(), "reader should report the stray trailing byte");
+        assert_eq!(r.u8(), Ok(7));
+        assert!(
+            !r.finished(),
+            "reader should report the stray trailing byte"
+        );
     }
 }

@@ -586,6 +586,34 @@ mod tests {
         |_name: &str| Ok(vec![0u8])
     }
 
+    #[derive(Clone, Copy)]
+    struct LayerSpec<'a> {
+        variants: &'a str,
+        gain: &'a str,
+        pitch: &'a str,
+        delay: &'a str,
+        mode: &'a str,
+    }
+
+    const VALID_LAYER: LayerSpec<'static> = LayerSpec {
+        variants: r#"["a.wav"]"#,
+        gain: "[1.0]",
+        pitch: "[0.0]",
+        delay: "[0.0]",
+        mode: "one_shot",
+    };
+
+    fn manifest(response: &str, layers: &[LayerSpec<'_>]) -> String {
+        let mut out = format!("[cues.x]\nresponse = \"{response}\"\n");
+        for layer in layers {
+            out.push_str(&format!(
+                "[[cues.x.layers]]\nvariants = {}\ngain = {}\npitch = {}\ndelay = {}\nmode = \"{}\"\n",
+                layer.variants, layer.gain, layer.pitch, layer.delay, layer.mode
+            ));
+        }
+        out
+    }
+
     const HAPPY: &str = r#"
         [cues.break_default]
         response = "world"
@@ -648,35 +676,27 @@ mod tests {
         // Two one_shot layers; the fold must take the later-finishing one.
         //   A: 1 s clip, pitch 0 (rate 1), delay 0        -> end 1.0
         //   B: 2 s clip, pitch -12 (rate 0.5), delay 0.5  -> end 0.5 + 2/0.5 = 4.5
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot"
-            [[cues.x.layers]]
-            variants = ["b.wav"]
-            gain = [1.0]
-            pitch = [-12.0]
-            delay = [0.5]
-            mode = "one_shot""#;
+        let m = manifest("world", &[
+            VALID_LAYER,
+            LayerSpec {
+                variants: r#"["b.wav"]"#,
+                pitch: "[-12.0]",
+                delay: "[0.5]",
+                ..VALID_LAYER
+            },
+        ]);
         let mut clips = MockClips { next: 0 };
         // Byte length = seconds: a.wav -> 1 s, b.wav -> 2 s.
         let mut r = |name: &str| -> Result<Vec<u8>, PathBuf> {
             Ok(vec![0u8; if name == "b.wav" { 2 } else { 1 }])
         };
-        let (cat, syms) = Catalog::from_manifest(m, &mut r, &mut clips).unwrap();
+        let (cat, syms) = Catalog::from_manifest(&m, &mut r, &mut clips).unwrap();
         let c = cat.cue(cat.typed::<OneShot>(&syms, "x").unwrap());
         assert!((c.max_duration - 4.5).abs() < 1e-4);
     }
 
     fn expect_err(res: Result<(Catalog, CueSymbols), CatalogError>) -> CatalogError {
-        match res {
-            Ok(_) => panic!("expected a CatalogError"),
-            Err(e) => e,
-        }
+        res.err().expect("expected a CatalogError")
     }
 
     fn load_err(manifest: &str) -> CatalogError {
@@ -686,219 +706,106 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_cues_table() {
-        assert!(matches!(load_err("foo = 1\n"), CatalogError::Manifest(_)));
-    }
+    fn rejects_invalid_manifests_by_error_class() {
+        macro_rules! rejects {
+            ($case:literal, $input:expr, $pattern:pat) => {{
+                let got = load_err(&$input);
+                assert!(matches!(&got, $pattern), "{}: {}", $case, got);
+            }};
+        }
 
-    #[test]
-    fn rejects_bad_toml() {
-        assert!(matches!(
-            load_err("this is not = = toml"),
-            CatalogError::Manifest(_)
-        ));
-    }
-
-    #[test]
-    fn rejects_empty_cue() {
-        let m = r#"[cues.x]
-            response = "world""#;
-        assert!(matches!(load_err(m), CatalogError::EmptyCue(_)));
-    }
-
-    #[test]
-    fn rejects_empty_layer() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = []
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(m), CatalogError::EmptyLayer(_)));
-    }
-
-    #[test]
-    fn rejects_reversed_range() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0, 0.2]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(m), CatalogError::BadRange(_)));
-    }
-
-    #[test]
-    fn rejects_negative_delay_and_extreme_pitch() {
-        let negative_delay = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [-0.1]
-            mode = "one_shot""#;
-        assert!(matches!(
-            load_err(negative_delay),
+        rejects!("missing cues table", "foo = 1\n", CatalogError::Manifest(_));
+        rejects!("invalid toml", "this is not = = toml", CatalogError::Manifest(_));
+        rejects!("empty cue", manifest("world", &[]), CatalogError::EmptyCue(_));
+        rejects!(
+            "empty layer",
+            manifest("world", &[LayerSpec { variants: "[]", ..VALID_LAYER }]),
+            CatalogError::EmptyLayer(_)
+        );
+        rejects!(
+            "reversed gain",
+            manifest("world", &[LayerSpec { gain: "[1.0, 0.2]", ..VALID_LAYER }]),
             CatalogError::BadRange(_)
-        ));
-
-        let extreme_pitch = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [-1000.0]
-            delay = [0.0]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(extreme_pitch), CatalogError::BadRange(_)));
-    }
-
-    #[test]
-    fn ui_delay_is_rejected_instead_of_silently_ignored() {
-        let m = r#"[cues.x]
-            response = "ui"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.1]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(m), CatalogError::BadRange(_)));
+        );
+        rejects!(
+            "negative delay",
+            manifest("world", &[LayerSpec { delay: "[-0.1]", ..VALID_LAYER }]),
+            CatalogError::BadRange(_)
+        );
+        rejects!(
+            "extreme pitch",
+            manifest("world", &[LayerSpec { pitch: "[-1000.0]", ..VALID_LAYER }]),
+            CatalogError::BadRange(_)
+        );
+        rejects!(
+            "UI delay",
+            manifest("ui", &[LayerSpec { delay: "[0.1]", ..VALID_LAYER }]),
+            CatalogError::BadRange(_)
+        );
+        rejects!(
+            "non-finite pitch",
+            manifest("world", &[LayerSpec { pitch: "[nan]", ..VALID_LAYER }]),
+            CatalogError::BadRange(_)
+        );
+        rejects!(
+            "mixed modes",
+            manifest("world", &[
+                VALID_LAYER,
+                LayerSpec { variants: r#"["b.wav"]"#, mode: "loop", ..VALID_LAYER },
+            ]),
+            CatalogError::MixedMode(_)
+        );
+        rejects!(
+            "unknown response",
+            manifest("wobble", &[VALID_LAYER]),
+            CatalogError::Manifest(_)
+        );
+        rejects!(
+            "authored voice response",
+            manifest("voice", &[VALID_LAYER]),
+            CatalogError::Manifest(_)
+        );
     }
 
     #[test]
     fn rejects_paths_that_escape_the_catalog_root() {
         for path in ["../secret.wav", "/tmp/secret.wav", "./alias.wav", ""] {
-            let m = format!(
-                r#"[cues.x]
-                    response = "world"
-                    [[cues.x.layers]]
-                    variants = ["{path}"]
-                    gain = [1.0]
-                    pitch = [0.0]
-                    delay = [0.0]
-                    mode = "one_shot""#
-            );
+            let variants = format!(r#"["{path}"]"#);
+            let m = manifest("world", &[LayerSpec { variants: &variants, ..VALID_LAYER }]);
             assert!(matches!(load_err(&m), CatalogError::UnsafePath(_)));
         }
     }
 
     #[test]
     fn repeated_variant_file_is_decoded_once() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["shared.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot"
-            [[cues.x.layers]]
-            variants = ["shared.wav"]
-            gain = [0.5]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
+        let shared = LayerSpec { variants: r#"["shared.wav"]"#, ..VALID_LAYER };
+        let m = manifest("world", &[shared, LayerSpec { gain: "[0.5]", ..shared }]);
         let mut clips = MockClips { next: 0 };
         let mut resolve = ok_resolver();
-        let (catalog, symbols) = Catalog::from_manifest(m, &mut resolve, &mut clips).unwrap();
+        let (catalog, symbols) = Catalog::from_manifest(&m, &mut resolve, &mut clips).unwrap();
         let cue = catalog.cue(catalog.typed::<OneShot>(&symbols, "x").unwrap());
         assert_eq!(clips.next, 1);
         assert_eq!(cue.layers[0].variants[0], cue.layers[1].variants[0]);
     }
 
     #[test]
-    fn rejects_non_finite_range() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [nan]
-            delay = [0.0]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(m), CatalogError::BadRange(_)));
-    }
-
-    #[test]
-    fn rejects_mixed_mode() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot"
-            [[cues.x.layers]]
-            variants = ["b.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "loop""#;
-        assert!(matches!(load_err(m), CatalogError::MixedMode(_)));
-    }
-
-    #[test]
-    fn rejects_unknown_response() {
-        let m = r#"[cues.x]
-            response = "wobble"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(m), CatalogError::Manifest(_)));
-    }
-
-    #[test]
-    fn rejects_voice_response() {
-        // Voice cues are runtime-only; authoring one must fail.
-        let m = r#"[cues.x]
-            response = "voice"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
-        assert!(matches!(load_err(m), CatalogError::Manifest(_)));
-    }
-
-    #[test]
     fn rejects_unknown_file() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["ghost.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
+        let m = manifest(
+            "world",
+            &[LayerSpec { variants: r#"["ghost.wav"]"#, ..VALID_LAYER }],
+        );
         let mut clips = MockClips { next: 0 };
         let mut r = |name: &str| -> Result<Vec<u8>, PathBuf> { Err(PathBuf::from(name)) };
-        let err = expect_err(Catalog::from_manifest(m, &mut r, &mut clips));
+        let err = expect_err(Catalog::from_manifest(&m, &mut r, &mut clips));
         assert!(matches!(err, CatalogError::UnknownFile(_)));
     }
 
     #[test]
     fn rejects_decode_failure() {
-        let m = r#"[cues.x]
-            response = "world"
-            [[cues.x.layers]]
-            variants = ["a.wav"]
-            gain = [1.0]
-            pitch = [0.0]
-            delay = [0.0]
-            mode = "one_shot""#;
+        let m = manifest("world", &[VALID_LAYER]);
         let mut clips = FailClips;
         let mut r = ok_resolver();
-        let err = expect_err(Catalog::from_manifest(m, &mut r, &mut clips));
+        let err = expect_err(Catalog::from_manifest(&m, &mut r, &mut clips));
         assert!(matches!(err, CatalogError::Decode(_)));
     }
 }

@@ -408,14 +408,19 @@ impl Mod for CraftingMod {
             let Ok(count) = count.parse::<u32>() else {
                 continue;
             };
-            // A crafted composition can dedup into a BUILTIN block (e.g.
-            // Stone+Iron == IronVein), which saves under the builtin's name —
-            // resolve block names first, then fall back to the '+'-joined
-            // element form.
+            // Prefer current names so mods remain free to define their own `*Vein`.
             if let Some(id) = world.registry().id_by_name(name) {
                 self.push_loaded(world, id, count, equip);
                 continue;
             }
+            // Older natural Stone+ore blocks persisted aliases such as `IronVein`.
+            let migrated;
+            let name = if let Some(ore) = name.strip_suffix("Vein") {
+                migrated = format!("Stone+{ore}");
+                &migrated
+            } else {
+                name
+            };
             // A crafted name is its element names joined with '+'. Resolve them
             // all; if any element is unknown (a save from a modded install),
             // skip the whole entry rather than mint a wrong block.
@@ -450,8 +455,7 @@ mod tests {
     fn save_load_round_trips_crafted_counts_and_equipped() {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
-        // Copper+Glass has no builtin block: Stone+Iron would dedup into the
-        // builtin IronVein and come back under that name.
+        // Copper+Glass is reconstructed from its ordinary element names.
         crafting.load_state("Copper+Glass=2,*Stone=1", &mut world);
         assert_eq!(crafting.crafted.len(), 2);
         assert_eq!(crafting.crafted[0].name.as_ref(), "Copper+Glass");
@@ -484,6 +488,14 @@ mod tests {
         crafting.load_state("Copper+Glass=1", &mut world);
         let id = crafting.crafted[0].id;
         assert_eq!(world.registry().id_by_name("Copper+Glass"), Some(id));
+    }
+
+    #[test]
+    fn legacy_vein_names_migrate_to_compositions() {
+        let mut world = World::new(1);
+        let mut crafting = mod_with_stash();
+        crafting.load_state("*IronVein=2", &mut world);
+        assert_eq!(crafting.save_state(&world).as_deref(), Some("*Stone+Iron=2"));
     }
 
     #[test]

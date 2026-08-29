@@ -95,23 +95,11 @@ pub fn derive_emission(core: &CoreProperties) -> u8 {
     (core.light_emission as u16 * 15 / 255) as u8
 }
 
-/// A block's buoyancy strength (`0` when it carries no [`SpecialKind::Buoyancy`]),
-/// read from its already-derived specials. Non-zero marks the block as a passable
-/// liquid — collision's third axis, orthogonal to `solid`/`opaque`: a liquid still
-/// meshes (it stays solid to the mesher) but the player swims through it rather
-/// than standing on it. The value drives the buoyancy/drag the swimmer feels.
-pub fn derive_buoyancy(specials: &[(SpecialKind, u8)]) -> u8 {
-    specials
-        .iter()
-        .find_map(|&(kind, strength)| (kind == SpecialKind::Buoyancy).then_some(strength))
-        .unwrap_or(0)
-}
-
 /// The acoustic material class of a block — the single partition that drives BOTH
 /// sound-cue naming (`break_<class>`/`place_<class>`/`step_<class>`) and the
 /// occlusion DDA's per-cell absorption weight, so the two can never drift. Ordered
-/// hardest→softest; `Water` doubles as the open/no-wall class (non-solids and
-/// passable liquids), which never triggers a break/place/step cue.
+/// hardest→softest; `Open` covers non-solids and property-derived liquids, which
+/// never trigger a break/place/step cue.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoundClass {
     Stone,
@@ -119,7 +107,7 @@ pub enum SoundClass {
     Wood,
     Glass,
     Foliage,
-    Water,
+    Open,
 }
 
 impl SoundClass {
@@ -131,13 +119,14 @@ impl SoundClass {
             SoundClass::Wood => "wood",
             SoundClass::Glass => "glass",
             SoundClass::Foliage => "foliage",
-            SoundClass::Water => "water",
+            // The checked-in cue catalog retains its historical `water` stem.
+            SoundClass::Open => "water",
         }
     }
 
     /// Acoustic absorption per metre (`0..=255`) — how strongly sound is attenuated
-    /// crossing one voxel (the DDA's per-cell weight). `Water` (and every non-wall)
-    /// is acoustically Open (`0`); values are distinct per class so a block's class
+    /// crossing one voxel (the DDA's per-cell weight). `Open` is acoustically
+    /// transparent (`0`); values are distinct per class so a block's class
     /// and its absorption are mutually recoverable.
     pub fn absorption(self) -> u8 {
         match self {
@@ -146,18 +135,18 @@ impl SoundClass {
             SoundClass::Wood => 90,     // wood / organic aggregates / coal
             SoundClass::Glass => 60,    // glass / ice — transmit sound like light
             SoundClass::Foliage => 30,  // foliage / snow / very light matter
-            SoundClass::Water => 0,     // open: occlusion is a property of walls
+            SoundClass::Open => 0,      // occlusion is a property of walls
         }
     }
 }
 
 /// Classify a block acoustically from the same derived physics the rest of the
 /// block uses — density is the dominant proxy for sound absorption, with translucent
-/// solids (glass/ice) carved out low. Non-solids and passable liquids (water) are
-/// `Water` (open); the acoustics kernel handles the water *medium* separately.
-pub fn derive_sound_class(core: &CoreProperties, solid: bool, buoyant: bool) -> SoundClass {
-    if !solid || buoyant {
-        return SoundClass::Water;
+/// solids (glass/ice) carved out low. Non-solids and passable liquids are `Open`;
+/// the acoustics kernel handles the listener's liquid medium separately.
+pub fn derive_sound_class(core: &CoreProperties, solid: bool) -> SoundClass {
+    if !solid || core.buoyancy > 0 {
+        return SoundClass::Open;
     }
     if core.transparency >= 50 {
         return SoundClass::Glass;

@@ -1,15 +1,6 @@
-//! The simulation seam: where the world's *physics* will live — heat flowing along
-//! thermal conductivity, electricity along conductivity, and the rest of the
-//! documented systems that read the properties derived in [`block`](crate::block).
-//!
-//! None of that is implemented yet. What is real here is the *shape*: a [`Tick`]
-//! trait, a fixed-timestep [`Simulation`] driver, and the wiring into the app loop.
-//! The built-in systems are inert (gated off), so the game behaves exactly as
-//! before — but adding a real system later is implementing `Tick`, with the
-//! timestep and registration already in place and the hot block data already
-//! reachable through [`World`](crate::world::World).
-pub mod electrical;
-pub mod thermal;
+//! The fixed-timestep simulation seam. Systems implement [`Tick`] and register
+//! with [`Simulation`]; unfinished physics belongs in design notes until it has a
+//! real active-cell model and observable behaviour.
 
 use crate::sched::{Ctx, Run};
 use crate::world::World;
@@ -42,15 +33,9 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    /// A simulation preloaded with the built-in systems (currently inert).
+    /// An empty simulation ready for concrete systems to register.
     pub fn new() -> Self {
-        Self {
-            systems: vec![
-                Box::new(thermal::ThermalSystem::new()),
-                Box::new(electrical::ElectricalSystem::new()),
-            ],
-            ticks: 0,
-        }
+        Self { systems: Vec::new(), ticks: 0 }
     }
 
     /// Add a system. The registration seam for future physics and mods.

@@ -3,9 +3,9 @@
 //! startup and read-only afterwards.
 //!
 //! Layout is deliberately split hot from cold (the "performance ahead of
-//! readability" mandate). Two parallel arrays — `solid` and `color`, indexed by
-//! `BlockId` — are *all* the per-voxel mesh/collision path ever reads, so they stay
-//! small and cache-resident. Everything else (composition, derived properties,
+//! readability" mandate). Packed flags and compact property arrays indexed by
+//! `BlockId` are all the per-voxel mesh/collision path ever reads, so they stay
+//! cache-resident. Everything else (composition, derived properties,
 //! specials, reactions, names) lives in the cold `blocks` vector that only
 //! inspection, crafting, and the future simulation touch.
 use std::collections::HashMap;
@@ -15,9 +15,8 @@ use voxel_engine::{Color, Pass};
 use crate::block::composition::{Composition, MixError};
 use crate::block::derive;
 use crate::block::derive::SoundClass;
-use crate::block::element::{CoreProperties, El, ElementId, ElementRegistry, SpecialKind};
+use crate::block::element::{CoreProperties, ElementId, ElementRegistry, SpecialKind};
 use crate::block::reaction::{ActiveReaction, ReactionRegistry, apply_reactions};
-use crate::macros::blocks;
 
 /// A compact handle to a registered block. Chunks store these through per-chunk
 /// palettes (cells stay one byte — see [`ChunkData`](crate::world::chunk::ChunkData)),
@@ -51,9 +50,8 @@ pub struct BlockRegistry {
     elements: ElementRegistry,
     reactions: ReactionRegistry,
     blocks: Vec<Block>,   // cold records
-    solid: Vec<bool>,     // HOT, indexed by BlockId — collision key ("is there a block")
-    buoyancy: Vec<u8>,    // HOT — 0 = not a liquid; >0 = passable liquid + swim strength
-    opaque: Vec<bool>,    // HOT — mesher cull/AO key (solid & transparency == 0)
+    flags: Vec<u8>,       // HOT — packed collision/cull/liquid/material predicates
+    buoyancy: Vec<u8>,    // HOT — ordinary core property; 0 = not a liquid
     layer: Vec<Pass>,     // HOT — mesher routing key; Blend iff solid && !opaque (air's slot is inert)
     emission: Vec<u8>,    // HOT — blocklight seed, 0..=15
     sound: Vec<SoundClass>, // HOT — acoustic class; drives cue naming + absorption
@@ -65,18 +63,18 @@ pub struct BlockRegistry {
 /// A cache-resident snapshot of the registry's hot per-voxel tables, indexed by
 /// [`BlockId`]. Bundled so meshing and light propagation read one immutable view
 /// at one revision (the registry is append-only, so `block_count()` stamps it) —
-/// no window in which `solid` is fresh but `opaque` is stale. Handed to worker
+/// no window in which one property is fresh but another is stale. Handed to worker
 /// mesh jobs behind an `Arc` via [`crate::derived::Derived`].
 pub struct HotTables {
-    /// The three boolean properties the meshers probe per face — solid,
-    /// opaque, water — PACKED one byte per block (see the `FLAG_*` bits and
-    /// the [`solid`]/[`opaque`]/[`water`] accessors). One array means the
+    /// The boolean properties the meshers probe per face — solid,
+    /// opaque, fluid-surface — PACKED one byte per block (see the `FLAG_*` bits
+    /// and the [`solid`]/[`opaque`]/[`fluid_surface`] accessors). One array means the
     /// ~14 probes a face sample makes (cull + AO stencil) all hit the same
     /// L1-resident table instead of three parallel ones.
     ///
     /// [`solid`]: HotTables::solid
     /// [`opaque`]: HotTables::opaque
-    /// [`water`]: HotTables::water
+    /// [`fluid_surface`]: HotTables::fluid_surface
     flags: Box<[u8]>,
     /// Draw technique per block — the mesher's routing key. `layer[id] == Opaque`
     /// exactly when the opaque flag (both derived from `transparency`); the flag
@@ -100,31 +98,35 @@ pub struct HotTables {
 
 const FLAG_SOLID: u8 = 1 << 0;
 const FLAG_OPAQUE: u8 = 1 << 1;
-/// Liquid AND translucent (`Pass::Blend`) — the animated-water material bit.
-/// Water and glass share the pass; this flag is what distinguishes them.
-const FLAG_WATER: u8 = 1 << 2;
+const FLAG_LIQUID: u8 = 1 << 2;
+/// Liquid AND translucent (`Pass::Blend`) — the engine's animated fluid material.
+/// Transparent non-liquids share the pass without receiving this bit.
+const FLAG_FLUID_SURFACE: u8 = 1 << 3;
 
 impl HotTables {
     /// Pack one block's flag byte from its boolean properties.
-    fn pack(solid: bool, opaque: bool, water: bool) -> u8 {
-        (solid as u8) * FLAG_SOLID + (opaque as u8) * FLAG_OPAQUE + (water as u8) * FLAG_WATER
+    fn pack(solid: bool, opaque: bool, liquid: bool, fluid_surface: bool) -> u8 {
+        (solid as u8) * FLAG_SOLID
+            | (opaque as u8) * FLAG_OPAQUE
+            | (liquid as u8) * FLAG_LIQUID
+            | (fluid_surface as u8) * FLAG_FLUID_SURFACE
     }
 
     /// Build from parallel boolean tables (tests and the registry snapshot).
     pub fn from_parts(
         solid: &[bool],
         opaque: &[bool],
-        water: &[bool],
+        fluid_surface: &[bool],
         layer: Box<[Pass]>,
         emission: Box<[u8]>,
         absorption: Box<[u8]>,
     ) -> Self {
-        debug_assert!(solid.len() == opaque.len() && solid.len() == water.len());
+        debug_assert!(solid.len() == opaque.len() && solid.len() == fluid_surface.len());
         let flags = solid
             .iter()
             .zip(opaque)
-            .zip(water)
-            .map(|((&s, &o), &w)| Self::pack(s, o, w))
+            .zip(fluid_surface)
+            .map(|((&s, &o), &f)| Self::pack(s, o, f, f))
             .collect();
         Self { flags, layer, emission, absorption, layer_cap: u16::MAX, ao: true }
     }
@@ -141,10 +143,10 @@ impl HotTables {
         self.flags[id.0 as usize] & FLAG_OPAQUE != 0
     }
 
-    /// Whether `id` takes the animated-water material bit.
+    /// Whether `id` takes the animated fluid material bit.
     #[inline]
-    pub fn water(&self, id: BlockId) -> bool {
-        self.flags[id.0 as usize] & FLAG_WATER != 0
+    pub fn fluid_surface(&self, id: BlockId) -> bool {
+        self.flags[id.0 as usize] & FLAG_FLUID_SURFACE != 0
     }
 
     /// Acoustic absorption per metre (`0..=255`) for `id` — the occlusion
@@ -176,9 +178,8 @@ impl BlockRegistry {
             elements: ElementRegistry::with_builtins(),
             reactions: ReactionRegistry::with_builtins(),
             blocks: Vec::new(),
-            solid: Vec::new(),
+            flags: Vec::new(),
             buoyancy: Vec::new(),
-            opaque: Vec::new(),
             layer: Vec::new(),
             emission: Vec::new(),
             sound: Vec::new(),
@@ -186,7 +187,16 @@ impl BlockRegistry {
             dedup: HashMap::new(),
             names: HashMap::new(),
         };
-        register_builtins(&mut registry);
+        registry
+            .register("Air", Composition::natural(&[]))
+            .expect("air fits in an empty block palette");
+        for i in 0..registry.elements.len() {
+            let element = ElementId(i as u16);
+            let name = registry.elements.get(element).name.clone();
+            registry
+                .register(&name, Composition::natural(&[element]))
+                .expect("pure element blocks fit within the palette cap");
+        }
         registry
     }
 
@@ -194,7 +204,7 @@ impl BlockRegistry {
     /// every frame, neighbour culling while meshing) — one array load, no branch.
     #[inline]
     pub fn is_solid(&self, id: BlockId) -> bool {
-        self.solid[id.0 as usize]
+        self.flags[id.0 as usize] & FLAG_SOLID != 0
     }
 
     /// Whether the block is a passable liquid — collision's third axis. A liquid
@@ -203,7 +213,7 @@ impl BlockRegistry {
     /// it. One array load, like [`is_solid`](Self::is_solid).
     #[inline]
     pub fn is_liquid(&self, id: BlockId) -> bool {
-        self.buoyancy[id.0 as usize] > 0
+        self.flags[id.0 as usize] & FLAG_LIQUID != 0
     }
 
     /// The block's buoyancy strength (`0` for non-liquids) — the upward push and
@@ -227,7 +237,7 @@ impl BlockRegistry {
     /// still draw. One array load, no branch, like [`is_solid`](Self::is_solid).
     #[inline]
     pub fn is_opaque(&self, id: BlockId) -> bool {
-        self.opaque[id.0 as usize]
+        self.flags[id.0 as usize] & FLAG_OPAQUE != 0
     }
 
     /// The block's blocklight output, 0..=15. Read only during light propagation.
@@ -256,21 +266,12 @@ impl BlockRegistry {
     /// (three small array copies); rebuilt only when the palette grows, behind the
     /// [`Derived`](crate::derived::Derived) revision cache on the world.
     pub fn hot_tables(&self) -> HotTables {
-        // A liquid that is also translucent (⇒ `Pass::Blend`) takes the water
-        // material bit: the water shader assumes a see-through reflective
+        // A liquid that is also translucent (⇒ `Pass::Blend`) takes the engine's
+        // fluid material bit: that shader assumes a see-through reflective
         // surface, so an opaque liquid (e.g. lava, `transparency == 0` ⇒
         // `Pass::Opaque`) must NOT take it.
-        let flags = (0..self.solid.len())
-            .map(|i| {
-                HotTables::pack(
-                    self.solid[i],
-                    self.opaque[i],
-                    self.buoyancy[i] > 0 && self.layer[i] == Pass::Blend,
-                )
-            })
-            .collect();
         HotTables {
-            flags,
+            flags: self.flags.clone().into_boxed_slice(),
             layer: self.layer.clone().into_boxed_slice(),
             emission: self.emission.clone().into_boxed_slice(),
             absorption: self.sound.iter().map(|c| c.absorption()).collect(),
@@ -367,8 +368,10 @@ impl BlockRegistry {
         let layer = derive::derive_layer(&core, solid);
         let emission = derive::derive_emission(&core);
         let specials = derive::derive_specials_from(&self.elements, &weights);
-        let buoyancy = derive::derive_buoyancy(&specials);
-        let sound = derive::derive_sound_class(&core, solid, buoyancy > 0);
+        let buoyancy = core.buoyancy;
+        let liquid = buoyancy > 0;
+        let sound = derive::derive_sound_class(&core, solid);
+        let flags = HotTables::pack(solid, opaque, liquid, liquid && layer == Pass::Blend);
 
         let id = self.push_block(
             Block {
@@ -378,9 +381,8 @@ impl BlockRegistry {
                 specials,
                 reactions,
             },
-            solid,
+            flags,
             buoyancy,
-            opaque,
             layer,
             emission,
             sound,
@@ -396,15 +398,13 @@ impl BlockRegistry {
     }
 
     /// Append one block to the parallel SoA arrays in lockstep, returning its
-    /// freshly assigned [`BlockId`]. The single place the hot `solid`/`color`
-    /// arrays and the cold `blocks` vector grow together, so they can never
-    /// desync.
+    /// freshly assigned [`BlockId`]. The single place the hot flags/property
+    /// arrays and the cold `blocks` vector grow together, so they can never desync.
     fn push_block(
         &mut self,
         block: Block,
-        solid: bool,
+        flags: u8,
         buoyancy: u8,
-        opaque: bool,
         layer: Pass,
         emission: u8,
         sound: SoundClass,
@@ -412,9 +412,8 @@ impl BlockRegistry {
     ) -> BlockId {
         let id = BlockId(self.blocks.len() as u16);
         self.blocks.push(block);
-        self.solid.push(solid);
+        self.flags.push(flags);
         self.buoyancy.push(buoyancy);
-        self.opaque.push(opaque);
         self.layer.push(layer);
         self.emission.push(emission);
         self.sound.push(sound);
@@ -485,60 +484,6 @@ impl CompKey {
     }
 }
 
-// The built-in block palette. `AIR` must be first (id 0). Built-in blocks are
-// defined *as element compositions* — they dogfood the whole pipeline, so their
-// solidity and colour are derived, not hardcoded.
-blocks! {
-    // Empty space: the one block with no elements, hence the only non-solid one.
-    Air => Composition::natural(&[]),
-    // Solid rock: a single element, so it keeps stone's exact grey.
-    Stone => Composition::natural(&[El::Stone.id()]),
-    // Packed earth: mostly soil, bound with clay.
-    Dirt => Composition::mixture(&[(El::Soil.id(), 70), (El::Clay.id(), 30)])
-        .expect("builtin Dirt sums to 100"),
-    // Topsoil under a layer of growth: green over earthy brown.
-    Grass => Composition::mixture(&[(El::Organic.id(), 65), (El::Soil.id(), 35)])
-        .expect("builtin Grass sums to 100"),
-    // --- Ore veins: stone flecked with a payload element. Natural blocks, so
-    // the texture pipeline paints the flecks for free. Appended after the
-    // original palette — ids must never reorder. ---
-    // The starter fuel: shallow, common, and gone in a puff of smoke.
-    CoalVein => Composition::natural(&[El::Stone.id(), El::Coal.id()]),
-    // The workhorse metal, still wearing its rock.
-    IronVein => Composition::natural(&[El::Stone.id(), El::Iron.id()]),
-    // Wiring in the rough.
-    CopperVein => Composition::natural(&[El::Stone.id(), El::Copper.id()]),
-    // Deep glitter; heavy pockets for patient miners.
-    GoldVein => Composition::natural(&[El::Stone.id(), El::Gold.id()]),
-    // Dull grey seams that weigh more than they look.
-    LeadVein => Composition::natural(&[El::Stone.id(), El::Lead.id()]),
-    // Pale crystal veins with a charge-hoarding streak.
-    QuartzVein => Composition::natural(&[El::Stone.id(), El::Quartz.id()]),
-    // Yellow streaks best mined from a respectful distance.
-    SulfurVein => Composition::natural(&[El::Stone.id(), El::Sulfur.id()]),
-    // Rock with a faint glow seeping through the cracks.
-    LuminVein => Composition::natural(&[El::Stone.id(), El::Lumin.id()]),
-    // The deepest prize: aerospace-grade ore under miles of rock.
-    TitanVein => Composition::natural(&[El::Stone.id(), El::Titan.id()]),
-    // Sky-stone: only ever found up in the flying islands.
-    AeriumVein => Composition::natural(&[El::Stone.id(), El::Aerium.id()]),
-    // Pure volcanic glass pockets in the deep dark.
-    Obsidian => Composition::natural(&[El::Obsidian.id()]),
-    // Lowland beaches: what valleys have instead of grass.
-    Sand => Composition::natural(&[El::Sand.id()]),
-    // High-altitude island frosting.
-    Ice => Composition::natural(&[El::Ice.id()]),
-    // Oceans, rivers, and lakes: a translucent solid you can stand on (the glass
-    // render path), filling every column up to sea level.
-    Water => Composition::natural(&[El::Water.id()]),
-    // Biome dressing on cold or high ground.
-    Snow => Composition::natural(&[El::Snow.id()]),
-    // (Wood/Leaves were retired with Earth-style trees: every block terrain
-    // emits is now a natural union the placement table derives. Old saves that
-    // placed them still load — specs are compositional, so the mixtures simply
-    // re-register by their elements.)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,10 +492,9 @@ mod tests {
     #[test]
     fn air_is_zero_and_not_solid() {
         let reg = BlockRegistry::with_builtins();
-        assert_eq!(Blk::Air.id(), AIR);
         assert_eq!(AIR, BlockId(0));
         assert!(!reg.is_solid(AIR));
-        assert!(reg.is_solid(Blk::Stone.id()));
+        assert!(reg.is_solid(reg.id_by_name("Stone").unwrap()));
     }
 
     #[test]
@@ -574,30 +518,11 @@ mod tests {
     }
 
     #[test]
-    fn dump_colors() {
-        let reg = BlockRegistry::with_builtins();
-        for i in 0..reg.block_count() {
-            let id = BlockId(i as u16);
-            let c = reg.color(id);
-            let name = &reg.block(id).name;
-            eprintln!("id={i} name={name} rgba=({},{},{},{})", c.r, c.g, c.b, c.a);
-        }
-        for name in ["Sand", "Snow", "Grass", "Water", "Stone", "Dirt", "Air"] {
-            if let Some(id) = reg.id_by_name(name) {
-                let c = reg.color(id);
-                eprintln!("NAMED {name} rgba=({},{},{},{})", c.r, c.g, c.b, c.a);
-            } else {
-                eprintln!("NAMED {name} not found");
-            }
-        }
-    }
-
-    #[test]
     fn stone_keeps_its_slate() {
         // A pure single-element block carries its element's colour exactly —
         // the derivation adds nothing for a one-part composition.
         let reg = BlockRegistry::with_builtins();
-        assert_eq!(reg.color(Blk::Stone.id()), Color::new(112, 118, 128, 255));
+        assert_eq!(reg.color(reg.id_by_name("Stone").unwrap()), Color::new(112, 118, 128, 255));
     }
 
     #[test]
@@ -605,7 +530,7 @@ mod tests {
         let mut reg = BlockRegistry::with_builtins();
         let a = reg.natural(&[El::Stone.id()]).unwrap();
         // Same as the built-in Stone — must resolve to the existing id, not a new one.
-        assert_eq!(a, Blk::Stone.id());
+        assert_eq!(a, reg.id_by_name("Stone").unwrap());
         let before = reg.block_count();
         let b = reg.natural(&[El::Iron.id(), El::Copper.id()]).unwrap();
         let c = reg.natural(&[El::Copper.id(), El::Iron.id()]).unwrap(); // order-independent
@@ -621,7 +546,7 @@ mod tests {
         // so it dedups with the builtin instead of minting a duplicate block
         // that would fail to round-trip through save/network specs.
         let doubled = reg.natural(&[El::Stone.id(), El::Stone.id()]).unwrap();
-        assert_eq!(doubled, Blk::Stone.id());
+        assert_eq!(doubled, reg.id_by_name("Stone").unwrap());
         assert_eq!(reg.block_count(), before, "no duplicate variant registered");
     }
 
@@ -684,8 +609,9 @@ mod tests {
             }
         }
         // Spot-check the intended classes.
-        assert_eq!(reg.absorption(Blk::Stone.id()), 200); // dense
-        assert_eq!(reg.sound_class(Blk::Stone.id()), "stone");
+        let stone = reg.id_by_name("Stone").unwrap();
+        assert_eq!(reg.absorption(stone), 200); // dense
+        assert_eq!(reg.sound_class(stone), "stone");
         assert_eq!(reg.absorption(reg.id_by_name("Ice").unwrap()), 60); // translucent
         assert_eq!(reg.sound_class(reg.id_by_name("Ice").unwrap()), "glass");
         assert_eq!(reg.sound_class(AIR), "water"); // non-solid folds into the open class
@@ -701,8 +627,22 @@ mod tests {
 
     #[test]
     fn names_resolve() {
-        let reg = BlockRegistry::with_builtins();
-        assert_eq!(reg.id_by_name("Grass"), Some(Blk::Grass.id()));
+        let mut reg = BlockRegistry::with_builtins();
+        assert_eq!(reg.id_by_name("Stone"), reg.natural(&[El::Stone.id()]));
         assert_eq!(reg.id_by_name("Nonexistent"), None);
+    }
+
+    #[test]
+    fn liquid_behavior_is_an_averaged_core_property() {
+        let mut reg = BlockRegistry::with_builtins();
+        let water = reg.id_by_name("Water").unwrap();
+        let wet_stone = reg.natural(&[El::Stone.id(), El::Water.id()]).unwrap();
+        assert_eq!(reg.buoyancy(water), 200);
+        assert_eq!(reg.buoyancy(wet_stone), 100);
+        assert!(reg.is_liquid(wet_stone));
+        assert!(!reg.is_obstacle(wet_stone));
+        assert_eq!(reg.sound_class(wet_stone), "water");
+        assert!(reg.hot_tables().fluid_surface(wet_stone));
+        assert!(reg.block(wet_stone).specials.is_empty());
     }
 }

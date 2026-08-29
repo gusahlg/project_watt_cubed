@@ -23,6 +23,7 @@ These are the core properties:
 - Friction, how much it grips to adjacent blocks, if the value is higher than an adjacent blocks density that blocks moves with it (if the pushing force is adequate)
 - Light emission, the amount of light something gives out, also a 0 to u8::max range
 - Transparency, how much light travels through it, a range of 0% to 100%
+- Buoyancy, upward force and inverse viscosity; any non-zero average makes a block a passable liquid
 
 Then there are special properties that not all elements have. These properties are more complex and the strength of their effects are scaled with how big percentage
 that element is of the entire block. If two elements have the same special property then the strength of the property for the block is an average of the calculated

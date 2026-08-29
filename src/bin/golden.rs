@@ -8,15 +8,14 @@
 //! before a plain check can pass their ImageMatch — until then each fails LOUD
 //! (a "load golden … No such file" `Failure`, never a panic).
 //!
-//! A thin runner over `harness::check`: builds the phase-A acceptance set,
-//! prints the entry-time number on the golden seed, then runs every
-//! criterion (all live now — image match, sky-holes, entry/frame time, and
-//! the `NoProvisional` filesystem sweep).
+//! A thin runner over the live harness: builds the acceptance set, prints the
+//! entry-time number on the golden seed, then runs the image-match, sky-hole,
+//! entry-time, and frame-time criteria.
 
 use std::time::Duration;
 
 use project_watt_cubed::harness::{
-    Acceptance, Criterion, GOLDEN_SEED, Phase, golden_shots, run_acceptance,
+    Acceptance, Criterion, GOLDEN_SEED, golden_shots, run_acceptance,
 };
 
 fn main() {
@@ -28,20 +27,10 @@ fn main() {
     // and blocklight ON (`cave_interior`'s emitter; a no-op for the emitter-free
     // shots). Threaded through `Game::scripted` / `scripted_config`, not env vars.
     let bless = args.iter().any(|a| a == "bless");
-    // Phase advances as the project does; default to the latest implemented (E).
-    // `--phase <pre-A|A|B|C|D|E>` overrides — the sweep is cumulative, so it
-    // fails on any `PROVISIONAL(p)` marker for p at or below the given phase.
-    let phase = args
-        .iter()
-        .position(|a| a == "--phase")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| Phase::parse(s))
-        .unwrap_or(Phase::E);
-    let acc = default_acceptance(phase);
+    let acc = default_acceptance();
 
     println!(
-        "golden: phase {}, {} criteria{}",
-        acc.phase,
+        "golden: {} criteria{}",
         acc.criteria.len(),
         if bless { " (bless)" } else { "" }
     );
@@ -68,24 +57,35 @@ fn main() {
     }
 }
 
-/// The acceptance set for `phase`: an image match + sky-hole check on each golden
-/// shot, the entry-time ceiling, a frame-time ceiling on `spawn_forward`, and
-/// that phase's cumulative provisional-marker sweep.
-fn default_acceptance(phase: Phase) -> Acceptance {
+/// An image match + sky-hole check on each golden shot, the entry-time ceiling,
+/// and a frame-time ceiling on `spawn_forward`.
+fn default_acceptance() -> Acceptance {
     let shots = golden_shots();
     let mut criteria = Vec::new();
     for shot in &shots {
-        criteria.push(Criterion::ImageMatch { shot: *shot, max_pct_changed: 0.5 });
-        criteria.push(Criterion::SkyHoleCount { shot: *shot, max: 0 });
+        criteria.push(Criterion::ImageMatch {
+            shot: *shot,
+            max_pct_changed: 0.5,
+        });
+        criteria.push(Criterion::SkyHoleCount {
+            shot: *shot,
+            max: 0,
+        });
     }
     // Frame-time ceiling on the primary shot. 16.7 ms is the 60 fps budget.
-    let spawn_forward = shots.iter().find(|s| s.name == "spawn_forward").copied().expect("golden_shots always defines spawn_forward");
+    let spawn_forward = shots
+        .iter()
+        .find(|s| s.name == "spawn_forward")
+        .copied()
+        .expect("golden_shots always defines spawn_forward");
     criteria.push(Criterion::FrameTime {
         shot: spawn_forward,
         // First-cut ceiling; tighten after the first measured report.
         max_ms: 16.7,
     });
-    criteria.push(Criterion::EntryTime { seed: GOLDEN_SEED, max: Duration::from_secs(5) });
-    criteria.push(Criterion::NoProvisional { through: phase });
-    Acceptance { phase, criteria }
+    criteria.push(Criterion::EntryTime {
+        seed: GOLDEN_SEED,
+        max: Duration::from_secs(5),
+    });
+    Acceptance { criteria }
 }

@@ -118,6 +118,7 @@ impl<T: Pooled> Neighborhood<T> {
     }
 
     /// The cell at signed coord `(x, y, z)`, each `∈ -1..=16`.
+    #[cfg(test)]
     #[inline]
     pub fn at(&self, x: i32, y: i32, z: i32) -> T {
         self.buf[Self::index(x, y, z)]
@@ -152,6 +153,7 @@ impl<T: Pooled> Neighborhood<T> {
     /// lz)` reads one local cell (`∈ 0..CHUNK_SIZE`) out of a present source.
     /// Resolves the 27 offsets once, then fills 18³ cells with plain array
     /// reads. A missing neighbour's cells are left at `fill`.
+    #[cfg(test)]
     pub fn capture<S: Copy>(
         fill: T,
         src_at: impl Fn(i32, i32, i32) -> Option<S>,

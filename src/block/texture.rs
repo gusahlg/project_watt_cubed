@@ -345,7 +345,7 @@ mod tests {
         let id_a = reg_a.natural(&[El::Copper.id(), El::Glass.id()]).unwrap();
 
         let mut reg_b = BlockRegistry::with_builtins();
-        reg_b.natural(&[El::Sulfur.id()]).unwrap(); // shift subsequent ids
+        reg_b.natural(&[El::Sulfur.id(), El::Glass.id()]).unwrap(); // shift subsequent ids
         let id_b = reg_b.natural(&[El::Glass.id(), El::Copper.id()]).unwrap(); // order-independent
 
         assert_ne!(id_a, id_b, "test relies on differing ids");

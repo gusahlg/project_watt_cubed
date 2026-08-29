@@ -133,6 +133,7 @@ pub struct PaddedLight {
 
 impl PaddedLight {
     /// Light at signed coord (x, y, z) in -1..=16.
+    #[cfg(test)]
     #[inline]
     pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> Lumel {
         self.inner.at(x, y, z)

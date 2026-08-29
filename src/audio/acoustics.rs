@@ -18,7 +18,7 @@ pub enum Response {
 #[derive(Clone, Copy, Debug)]
 pub enum Medium {
     Air,
-    Water,
+    Liquid,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -215,8 +215,8 @@ const OCCL_K: f32 = 0.08;
 const LP_K: f32 = 0.12;
 const LP_MAX_HZ: f32 = 20_000.0;
 const LP_MIN_HZ: f32 = 200.0;
-const WATER_LP_HZ: f32 = 1_200.0;
-const WATER_GAIN: f32 = 0.7;
+const LIQUID_LP_HZ: f32 = 1_200.0;
+const LIQUID_GAIN: f32 = 0.7;
 
 fn ref_dist(r: Response) -> f32 {
     match r {
@@ -240,8 +240,8 @@ fn occl_lp(o: f32) -> f32 {
     (LP_MAX_HZ * (-LP_K * o).exp()).clamp(LP_MIN_HZ, LP_MAX_HZ)
 }
 
-fn is_water(m: Medium) -> bool {
-    matches!(m, Medium::Water)
+fn is_liquid(m: Medium) -> bool {
+    matches!(m, Medium::Liquid)
 }
 
 /// The camera's canonical yaw/pitch basis: yaw zero looks +X and positive yaw
@@ -282,15 +282,15 @@ pub fn respond(r: Response, sc: SmoothedCoords, listener: &Listener, source: Opt
         };
     }
 
-    let media_differ = is_water(listener.medium) != is_water(medium);
-    let any_water = is_water(listener.medium) || is_water(medium);
+    let media_differ = is_liquid(listener.medium) != is_liquid(medium);
+    let any_liquid = is_liquid(listener.medium) || is_liquid(medium);
 
-    let water_gain = if media_differ { WATER_GAIN } else { 1.0 };
-    let gain = (spatial_base(r, distance, occlusion) * water_gain).clamp(0.0, 1.0);
+    let medium_gain = if media_differ { LIQUID_GAIN } else { 1.0 };
+    let gain = (spatial_base(r, distance, occlusion) * medium_gain).clamp(0.0, 1.0);
 
     let mut lowpass_hz = occl_lp(occlusion);
-    if any_water {
-        lowpass_hz = lowpass_hz.min(WATER_LP_HZ);
+    if any_liquid {
+        lowpass_hz = lowpass_hz.min(LIQUID_LP_HZ);
     }
 
     // Pan is None when coincident (< 0.5 m) or non-spatial.
@@ -379,10 +379,10 @@ mod tests {
             &open,
             DVec3::new(-50.0, -50.0, -50.0),
             DVec3::new(50.0, 50.0, 50.0),
-            Medium::Water,
+            Medium::Liquid,
         );
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
-        assert!(matches!(c.medium, Medium::Water));
+        assert!(matches!(c.medium, Medium::Liquid));
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
         for &r in &responses {
             for &dist in &[0.0f32, 0.4, 2.0, 8.0, 40.0] {
                 for &occl in &[0.0f32, 1.0, 5.0, 25.0] {
-                    for &medium in &[Medium::Air, Medium::Water] {
+                    for &medium in &[Medium::Air, Medium::Liquid] {
                         let sc = SmoothedCoords::new(dist, occl, medium);
                         for &g in &[0.0f32, 0.25, 1.0, 4.0] {
                             let ub = audibility(r, sc, g);

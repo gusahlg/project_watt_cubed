@@ -118,56 +118,6 @@ pub(in crate::world) fn acceptable(dist: EyeDist, lod: Detail, cfg: &PyramidCfg)
     }
 }
 
-/// The one quantized detail decision: folds the near-field full-res chunk
-/// radius and the far-field pyramid ladder into a
-/// single output in the engine's `Detail` type — the type the existing
-/// upload/draw pipeline already consumes (chunks upload at `Detail::FULL`,
-/// `streaming::chunk_placement`; sections draw at `Detail::new(pos.detail)`,
-/// `SectionState::draw`). `None` past the horizon: nothing is required there.
-///
-/// Chunks own everything nearer than `cfg.unit` (by construction — `unit` is
-/// kept equal to the streamed chunk-view radius every frame, `World::stream`).
-/// `level_for`'s own near branch returns the section pyramid's *finest ring*
-/// there instead (`Detail(2)`, coarser than `Detail::FULL`), which is correct
-/// for its own callers (`acceptable`'s hysteresis) but is NOT chunk resolution —
-/// so this near branch is a genuinely separate case, not a re-derivation of
-/// `level_for`'s existing clamp.
-///
-/// `affordable`: the coarsest `Detail` the current VRAM budget can afford — a
-/// floor; this never returns something FINER than it. Dormant by construction:
-/// the only caller today, [`vram_budget_floor`], always returns `Detail::FULL`
-/// (no floor), and every quantity `max`ed against `Detail::FULL` is unchanged,
-/// so this parameter is presently a no-op end to end.
-pub(in crate::world) fn required_detail(
-    dist: EyeDist,
-    cfg: &PyramidCfg,
-    affordable: Detail,
-) -> Option<Detail> {
-    if dist.get() < cfg.unit {
-        return Some(Detail::FULL.max(affordable));
-    }
-    let desired = match level_for(dist, cfg) {
-        LodChoice::Level(lod) => lod,
-        LodChoice::BeyondHorizon => return None,
-    };
-    Some(desired.max(affordable))
-}
-
-/// The coarsest `Detail` the current VRAM budget can afford. DORMANT — always
-/// `Detail::FULL` (no floor).
-///
-/// Activation needs TWO things neither landed here: a graphics-setting toggle
-/// (a behavioural default change is user-gated, never landed autonomously),
-/// AND a new engine-side public accessor. The engine's
-/// `VK_EXT_memory_budget` query (`vk::device::MemoryBudget::query`) exists but
-/// is `unsafe`, `vk`-module-private, and takes a raw `ash::Instance`/
-/// `PhysicalDevice` — there is no public `Engine` method reaching it today, so
-/// "reading the existing query" is not yet possible from app code without a
-/// small new engine-side API. Flagging that gap rather than papering over it.
-pub(in crate::world) fn vram_budget_floor() -> Detail {
-    Detail::FULL
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,76 +188,6 @@ mod tests {
         assert_eq!(level_for(d(4096.0), &cfg), LodChoice::BeyondHorizon);
         // Infinity clamps to finest ring (EyeDist enforces finite values).
         assert_eq!(level_for(d(f32::INFINITY), &cfg), LodChoice::Level(Detail(2)));
-    }
-
-    /// Chunks own everything nearer than `unit`: `required_detail` returns
-    /// `Detail::FULL` there, strictly finer than `level_for`'s own near-clamp
-    /// (`Detail(2)`) — proving this is a genuinely separate case, not a duplicate.
-    #[test]
-    fn required_detail_is_full_res_inside_the_chunk_radius() {
-        let cfg = d1();
-        for d in [0.0f32, 100.0, 255.9] {
-            let dist = EyeDist::new(d);
-            assert_eq!(
-                required_detail(dist, &cfg, Detail::FULL),
-                Some(Detail::FULL),
-                "distance {d} is inside the chunk radius"
-            );
-            assert!(
-                Detail::FULL < Detail::new(2),
-                "chunk resolution must be strictly finer than the section's own finest ring"
-            );
-        }
-    }
-
-    /// Beyond `unit`, with the floor dormant (`Detail::FULL`, a no-op `max`),
-    /// `required_detail` matches `level_for` exactly: identical selections to the
-    /// pre-existing ladder, a fixed point required by the current design.
-    #[test]
-    fn required_detail_matches_level_for_beyond_the_chunk_radius_when_dormant() {
-        let cfg = d1();
-        for m in 256..40_000u32 {
-            let dist = EyeDist::new(m as f32);
-            let got = required_detail(dist, &cfg, vram_budget_floor());
-            let want = match level_for(dist, &cfg) {
-                LodChoice::Level(l) => Some(l),
-                LodChoice::BeyondHorizon => None,
-            };
-            assert_eq!(got, want, "distance {m} must match the pre-existing ladder exactly");
-        }
-    }
-
-    /// Never finer with distance, matching `level_for`'s own monotonicity.
-    #[test]
-    fn required_detail_never_refines_with_distance() {
-        let cfg = d1();
-        let mut last = Detail::FULL;
-        for m in 0..40_000u32 {
-            let Some(got) = required_detail(EyeDist::new(m as f32), &cfg, vram_budget_floor()) else {
-                continue;
-            };
-            assert!(got >= last, "detail coarsened then refined at distance {m}");
-            last = got;
-        }
-    }
-
-    /// The dormant floor is a true no-op: activating it with an artificially
-    /// coarse floor changes the result (proving the seam is live code, not dead
-    /// weight), while the real default (`Detail::FULL`) never does.
-    #[test]
-    fn affordable_floor_only_coarsens_when_actually_activated() {
-        let cfg = d1();
-        let dist = EyeDist::new(2000.0); // deep in the ladder, level_for gives Detail(4)
-        let unclamped = required_detail(dist, &cfg, Detail::FULL);
-        assert_eq!(unclamped, Some(Detail::new(4)), "sanity: matches level_for");
-        // Dormant default changes nothing.
-        assert_eq!(required_detail(dist, &cfg, vram_budget_floor()), unclamped);
-        // A hypothetical activated floor coarser than the desired level DOES win.
-        let coarse_floor = Detail::new(6);
-        assert_eq!(required_detail(dist, &cfg, coarse_floor), Some(coarse_floor));
-        // A floor finer than what's desired never refines past the ladder's own choice.
-        let fine_floor = Detail::new(1);
-        assert_eq!(required_detail(dist, &cfg, fine_floor), unclamped);
     }
 
 }

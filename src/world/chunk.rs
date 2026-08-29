@@ -357,7 +357,7 @@ mod tests {
     fn hills(seed: i64) -> (SineHills, BlockId, BlockId) {
         let mut registry = BlockRegistry::with_builtins();
         let stone = registry.id_by_name("Stone").unwrap();
-        let dirt = registry.id_by_name("Dirt").unwrap();
+        let dirt = registry.id_by_name("Soil").unwrap();
         (SineHills::new(&mut registry, 20.0, seed), stone, dirt)
     }
 

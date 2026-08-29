@@ -4,8 +4,8 @@
 //!
 //! - The sweep reads a [`Padded`] neighbourhood — the chunk's 16³ voxels plus a
 //!   one-voxel shell copied from its 26 neighbours — so face culling, the AO
-//!   stencil, and the own-cell reads are ALL a single uniform `Padded::at`, with
-//!   no interior/border branch and no per-direction axis remapping. The shell is
+//!   stencil, and own-cell reads are uniform flat-index stride walks, with no
+//!   interior/border branch or per-direction axis remapping. The shell is
 //!   what makes ambient occlusion seamless across chunk borders.
 //! - Only faces bordering see-through space are emitted. The cull key is
 //!   **opacity**, not solidity ([`covered`]): an opaque neighbour hides a face; a
@@ -58,13 +58,6 @@ pub struct Padded {
 }
 
 impl Padded {
-    /// The block at signed coord `(x, y, z)`, each `∈ -1..=16`. Shared with the
-    /// light pass, which reads the same padded interior.
-    #[inline]
-    pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> BlockId {
-        self.inner.at(x, y, z)
-    }
-
     /// Flat-index read — the sweep's stride walk.
     #[inline]
     fn at_flat(&self, i: usize) -> BlockId {
@@ -434,7 +427,7 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
             sample.id.0 % tables.layer_cap,
             Ao::new(sample.ao[i]),
             Light::new(sample.sky[i], sample.block[i]),
-            tables.water(sample.id),
+            tables.fluid_surface(sample.id),
         )
     });
 
