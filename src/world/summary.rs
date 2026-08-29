@@ -1,8 +1,6 @@
 //! Screen-space error budget for LOD selection: measured geometric error per cell
 //! and a test to decide if that error fits within the pixel tolerance at a given
 //! distance.
-#![allow(dead_code)]
-
 use crate::ident::Detail;
 
 use super::metric::{EyeDist, HeightEnvelope};

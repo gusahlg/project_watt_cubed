@@ -1,8 +1,8 @@
 //! interact.rs turns where the player looks into which block they act on: a voxel
-//! ray-march from the eye along the view direction, returning the first *obstacle*
-//! block within reach. Passable liquids are transparent to the ray — the same
-//! `solid && !liquid` predicate collision uses — so the aim reaches through water to
-//! the terrain behind it. Breaking and (later) placing are built on this one query.
+//! ray-march from the eye along the view direction. Ordinary clearance/placement
+//! rays return the first obstacle and pass through liquids; the mining variant
+//! returns the first solid block so Water can be broken consistently with every
+//! other material block.
 //!
 //! The march runs in `f64`: at far coordinates an `f32` origin can't even
 //! represent which cell the eye is in (ULP > 1 block past ~2^24), while `f64`
@@ -19,20 +19,38 @@ pub const REACH: f64 = 6.0 * crate::math::PER_METER;
 
 /// A block the aim ray struck.
 pub struct RayHit {
-    /// The obstacle block that was hit (solid, non-liquid).
+    /// The block selected by the ray's targeting policy.
     pub block: (i32, i32, i32),
     /// The last cell the ray passed through *before* the hit block — where a
-    /// placed block would go. If the ray starts inside a solid block, this is
-    /// the start cell itself.
+    /// placed block would go. If the ray starts inside a block selected by the
+    /// active targeting policy, this is the start cell itself.
     pub previous: (i32, i32, i32),
 }
 
 /// March a ray from `origin` along `dir` up to `reach` world units and return the
-/// first obstacle block (solid, non-liquid), using Amanatides–Woo grid traversal
-/// (each iteration crosses exactly one voxel face, so nothing is skipped or
-/// double-visited). Liquids are passed through, so a ray cast from inside water — or
-/// across a lake — reaches the terrain, not the water surface.
+/// first obstacle using Amanatides–Woo grid traversal (each iteration crosses
+/// exactly one voxel face, so nothing is skipped or double-visited). Passable
+/// liquids are transparent to this general-purpose ray.
 pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<RayHit> {
+    raycast_where(origin, dir, reach, |x, y, z| world.is_obstacle(x, y, z))
+}
+
+/// Target every material block, including physically passable liquids.
+pub(crate) fn raycast_solid(
+    world: &World,
+    origin: DVec3,
+    dir: DVec3,
+    reach: f64,
+) -> Option<RayHit> {
+    raycast_where(origin, dir, reach, |x, y, z| world.is_solid(x, y, z))
+}
+
+fn raycast_where(
+    origin: DVec3,
+    dir: DVec3,
+    reach: f64,
+    is_hit: impl Fn(i32, i32, i32) -> bool,
+) -> Option<RayHit> {
     let len = dir.length();
     if len == 0.0 {
         return None;
@@ -46,7 +64,7 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
         block_coord(origin.y),
         block_coord(origin.z),
     );
-    if world.is_obstacle(x, y, z) {
+    if is_hit(x, y, z) {
         return Some(RayHit {
             block: (x, y, z),
             previous: (x, y, z),
@@ -98,7 +116,7 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
         if t > reach {
             break;
         }
-        if world.is_obstacle(x, y, z) {
+        if is_hit(x, y, z) {
             return Some(RayHit {
                 block: (x, y, z),
                 previous,
@@ -130,6 +148,24 @@ mod tests {
         let world = World::generate();
         let origin = DVec3::new(8.5, 40.0, 8.5);
         assert!(raycast(&world, origin, DVec3::new(0.0, 1.0, 0.0), 20.0).is_none());
+    }
+
+    #[test]
+    fn liquid_is_mineable_but_remains_passable() {
+        let mut world = World::generate();
+        let (x, y, z) = (8, 40, 8);
+        world.prepare_around(DVec3::new(x as f64, y as f64, z as f64));
+        let water = world.registry().id_by_name("Water").unwrap();
+        world.set_block(x, y, z, water);
+        world.set_block(x, y + 1, z, crate::block::AIR);
+        let origin = DVec3::new(x as f64 + 0.5, y as f64 + 1.5, z as f64 + 0.5);
+
+        let down = DVec3::new(0.0, -1.0, 0.0);
+        assert_eq!(
+            raycast_solid(&world, origin, down, 1.0).unwrap().block,
+            (x, y, z)
+        );
+        assert!(raycast(&world, origin, down, 1.0).is_none());
     }
 
     #[test]

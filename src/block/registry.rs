@@ -224,9 +224,9 @@ impl BlockRegistry {
         self.buoyancy[id.0 as usize]
     }
 
-    /// Whether the block obstructs — the shared predicate for "stops the player and
-    /// stops the aim ray": a solid that is *not* a passable liquid. Collision and
-    /// interaction both key off this, so water blocks neither. Two array loads.
+    /// Whether the block obstructs movement and clearance rays: a solid that is
+    /// *not* a passable liquid. Mining deliberately keys off solidity instead, so
+    /// liquids can be broken without becoming collidable. Two array loads.
     #[inline]
     pub fn is_obstacle(&self, id: BlockId) -> bool {
         self.is_solid(id) && !self.is_liquid(id)

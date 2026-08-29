@@ -43,15 +43,15 @@ pub fn derive_color_from(els: &ElementRegistry, weights: &Weights) -> Color {
 }
 
 /// A block is solid unless it has no material in it. Air — the empty natural
-/// block — is the sole exception; it is the only thing the renderer culls and the
-/// only thing the player walks through.
+/// block — is the sole exception. Rendering and mining use this material-presence
+/// property; movement separately exempts liquids.
 pub fn derive_solid(comp: &Composition) -> bool {
     !comp.is_empty()
 }
 
 /// Whether a block hides the faces behind it — the mesher's cull key (distinct
-/// from [`derive_solid`], which is collision's key). A block is opaque when it is
-/// solid *and* lets no light through (`transparency == 0`); a translucent solid
+/// from [`derive_solid`], which is the material-presence key). A block is opaque
+/// when it is solid *and* lets no light through (`transparency == 0`); a translucent solid
 /// like glass is solid but NOT opaque, so faces behind it still draw. Air is
 /// non-solid, hence non-opaque.
 pub fn derive_opaque(core: &CoreProperties, solid: bool) -> bool {
@@ -98,8 +98,9 @@ pub fn derive_emission(core: &CoreProperties) -> u8 {
 /// The acoustic material class of a block — the single partition that drives BOTH
 /// sound-cue naming (`break_<class>`/`place_<class>`/`step_<class>`) and the
 /// occlusion DDA's per-cell absorption weight, so the two can never drift. Ordered
-/// hardest→softest; `Open` covers non-solids and property-derived liquids, which
-/// never trigger a break/place/step cue.
+/// hardest→softest; `Open` covers non-solids and property-derived liquids. A
+/// mineable liquid uses the liquid cue stem (or its catalog fallback) while
+/// remaining acoustically open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoundClass {
     Stone,

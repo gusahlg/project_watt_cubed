@@ -144,15 +144,16 @@ impl World {
         }
     }
 
-    /// Whether the block at a world voxel coordinate is solid. The per-frame
-    /// collision hot path: a fast-hashed chunk lookup plus one registry array load.
+    /// Whether the block at a world voxel coordinate contains material. Rendering
+    /// and mining use this query; movement uses [`is_obstacle`](Self::is_obstacle)
+    /// so liquids remain passable.
     pub fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
         self.registry.is_solid(self.block_at(x, y, z))
     }
 
-    /// Whether the block at a world voxel obstructs movement and the aim ray — a
-    /// solid that is not a passable liquid. The predicate collision and interaction
-    /// share, so water stops neither.
+    /// Whether the block at a world voxel obstructs movement and clearance rays: a
+    /// solid that is not a passable liquid. Mining uses [`is_solid`](Self::is_solid)
+    /// so liquids can still be broken.
     pub fn is_obstacle(&self, x: i32, y: i32, z: i32) -> bool {
         self.registry.is_obstacle(self.block_at(x, y, z))
     }

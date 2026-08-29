@@ -9,8 +9,6 @@
 //! No resampling per level — children fully determine parents where coverage overlaps.
 //!
 //! The bake is immutable once computed: edits are applied elsewhere as a runtime overlay.
-#![allow(dead_code)] // Used by LOD selection and occlusion queries.
-
 use voxel_engine::{Color, DVec3};
 
 use crate::block::registry::AIR;

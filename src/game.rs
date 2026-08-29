@@ -1332,7 +1332,7 @@ impl Game {
 
     /// Break the block the player is looking at, handing its elements to the mods.
     fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
-        let Some(hit) = interact::raycast(
+        let Some(hit) = interact::raycast_solid(
             &self.world,
             self.player.position,
             self.player.forward(),
