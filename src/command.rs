@@ -296,8 +296,8 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
         c.conductivity, c.thermal_conductivity, c.friction
     ));
     out.push(format!(
-        "  temp-resist {}  light {}  transparency {}%",
-        c.temperature_resistance, c.light_emission, c.transparency
+        "  temp-resist {}  light {}  transparency {}%  buoyancy {}",
+        c.temperature_resistance, c.light_emission, c.transparency, c.buoyancy
     ));
 
     if !block.specials.is_empty() {
@@ -461,6 +461,7 @@ mod tests {
         assert!(text.contains("Stone"), "should name the block: {text}");
         assert!(text.contains("made of: Stone"), "should list elements: {text}");
         assert!(text.contains("density"), "should show core properties: {text}");
+        assert!(text.contains("buoyancy"), "should show every core property: {text}");
     }
 
     #[test]

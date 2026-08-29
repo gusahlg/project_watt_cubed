@@ -1,15 +1,9 @@
 //! Golden-shot harness — the executable acceptance criteria for the voxel engine.
 //!
-//! Two halves:
-//!
-//! - The PURE detectors — [`diff`] and [`sky_hole_count`] — are ordinary
-//!   functions over a decoded [`Screenshot`]. They have no engine dependency
-//!   and their unit tests (below) are this package's acceptance contract.
-//! - The LIVE half — [`check`] and [`time_to_first_full_render`] — needs a
-//!   scripted `Game` and deterministic frame capture, which are other packages'
-//!   work in flight. Every path that would touch the engine funnels through the
-//!   single [`capture`] seam, which degrades with a clear error until that work
-//!   lands. Nothing here panics on the degraded path.
+//! The pure detectors — [`diff`] and [`sky_hole_count`] — operate on decoded
+//! [`Screenshot`]s. The live runner drives scripted [`Game`] instances through
+//! one event loop, captures deterministic frames, and evaluates those detectors
+//! together with entry- and frame-time criteria.
 //!
 
 use std::cell::RefCell;
@@ -186,8 +180,8 @@ fn is_key(px: &[u8], key: Color) -> bool {
         && px[2].abs_diff(key.b) <= KEY_TOL
 }
 
-/// Executable Phase-D criterion: on a [`DebugView::TerrainKey`] capture,
-/// for each pixel column find the topmost [`TERRAIN_KEY`] pixel; count
+/// On a [`DebugView::TerrainKey`] capture, for each pixel column find the
+/// topmost [`TERRAIN_KEY`] pixel; count
 /// [`SKY_KEY`] pixels BELOW it (sky showing through the terrain silhouette = a
 /// hole). Pure.
 ///
@@ -230,56 +224,6 @@ pub fn sky_hole_count(shot: &Screenshot) -> u32 {
 // Executable acceptance criteria
 // ============================================================================
 
-/// A phase of the rewrite ladder, ordered. `Display`/[`Phase::marker`] yields
-/// the literal that appears inside `PROVISIONAL(<marker>)` comments. The `Ord`
-/// derive follows declaration order (`PreA < A < … < E`), which is what makes
-/// the cumulative sweep (`p <= through`) meaningful.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Phase {
-    PreA,
-    A,
-    B,
-    C,
-    D,
-    E,
-}
-
-impl Phase {
-    /// Every phase in ascending order — the cumulative sweep filters this by
-    /// `<= through`.
-    pub const ALL: [Phase; 6] = [
-        Phase::PreA,
-        Phase::A,
-        Phase::B,
-        Phase::C,
-        Phase::D,
-        Phase::E,
-    ];
-
-    /// The literal inside the marker: "pre-A", "A", "B", "C", "D", "E".
-    pub fn marker(self) -> &'static str {
-        match self {
-            Phase::PreA => "pre-A",
-            Phase::A => "A",
-            Phase::B => "B",
-            Phase::C => "C",
-            Phase::D => "D",
-            Phase::E => "E",
-        }
-    }
-
-    /// Parse "pre-A" | "A" | … | "E" (the `golden --phase` argument).
-    pub fn parse(s: &str) -> Option<Phase> {
-        Phase::ALL.iter().copied().find(|p| p.marker() == s)
-    }
-}
-
-impl std::fmt::Display for Phase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.marker())
-    }
-}
-
 /// An acceptance criterion that EXECUTES (strings don't).
 pub enum Criterion {
     /// Capture `shot`, compare against its blessed golden.
@@ -289,19 +233,14 @@ pub enum Criterion {
     },
     /// Capture `shot` under [`DebugView::TerrainKey`]; `sky_hole_count ≤ max`.
     SkyHoleCount { shot: GoldenShot, max: u32 },
-    /// `time_to_first_full_render(seed) ≤ max`.
+    /// Time from world creation to the first fully streamed frame is at most
+    /// `max`.
     EntryTime { seed: u64, max: Duration },
     /// Mean frame time at `shot` over 120 frames ≤ `max_ms`.
     FrameTime { shot: GoldenShot, max_ms: f32 },
-    /// Walks `src/` + `voxel-engine/src` with `std::fs`; fails if ANY
-    /// `PROVISIONAL(p)` marker survives for a phase `p <= through`. The
-    /// sweep is cumulative: closing phase E must also clear every pre-A..D
-    /// marker left behind, not just the E ones.
-    NoProvisional { through: Phase },
 }
 
 pub struct Acceptance {
-    pub phase: Phase,
     pub criteria: Vec<Criterion>,
 }
 
@@ -691,7 +630,7 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
                     name: shot.name.to_string(),
                 },
             )),
-            Criterion::EntryTime { .. } | Criterion::NoProvisional { .. } => {}
+            Criterion::EntryTime { .. } => {}
         }
     }
     stages
@@ -1036,14 +975,6 @@ pub fn run_acceptance(acc: &Acceptance, bless: bool) -> Report {
     }
 }
 
-/// Frozen-contract wrapper (`check`): run the whole
-/// acceptance set and return only the pass/fail. `golden` uses
-/// [`run_acceptance`] directly so it gets the entry-time number from the SAME
-/// pass; standalone callers can use this. One `run` per call.
-pub fn check(a: &Acceptance, bless: bool) -> Result<(), Vec<Failure>> {
-    run_acceptance(a, bless).result
-}
-
 /// Evaluate every criterion over the captured artifacts (PURE — no engine).
 /// Aggregates all failures rather than stopping at the first.
 fn evaluate(acc: &Acceptance, bless: bool, out: &Outcomes) -> Result<(), Vec<Failure>> {
@@ -1193,127 +1124,7 @@ fn eval_criterion(c: &Criterion, bless: bool, out: &Outcomes) -> Result<(), Fail
             }
             Ok(())
         }
-
-        Criterion::NoProvisional { through } => no_provisional(*through),
     }
-}
-
-/// Walk `src/` and `voxel-engine/src` and fail if ANY `PROVISIONAL(p)` marker
-/// survives for a phase `p <= through` — cumulative, so a late phase also
-/// clears every earlier marker. Fully live (pure filesystem, no engine).
-fn no_provisional(through: Phase) -> Result<(), Failure> {
-    let targets: Vec<Phase> = Phase::ALL
-        .iter()
-        .copied()
-        .filter(|p| *p <= through)
-        .collect();
-    let mut hits: Vec<(Phase, String)> = Vec::new();
-    for root in ["src", "voxel-engine/src"] {
-        scan_dir(std::path::Path::new(root), &targets, &mut hits);
-    }
-    if hits.is_empty() {
-        return Ok(());
-    }
-    // Actionable detail: per-phase counts plus a handful of file:line examples,
-    // ordered by phase so the earliest un-cleared markers read first.
-    let mut detail = String::new();
-    for p in &targets {
-        let count = hits.iter().filter(|(hp, _)| hp == p).count();
-        if count == 0 {
-            continue;
-        }
-        let examples: Vec<&str> = hits
-            .iter()
-            .filter(|(hp, _)| hp == p)
-            .take(4)
-            .map(|(_, loc)| loc.as_str())
-            .collect();
-        detail.push_str(&format!(
-            "PROVISIONAL({}): {count} [{}]; ",
-            p.marker(),
-            examples.join(", ")
-        ));
-    }
-    Err(Failure {
-        what: format!("no_provisional(through {through})"),
-        detail: format!("{} surviving marker(s): {}", hits.len(), detail.trim_end()),
-    })
-}
-
-/// True for the two files this harness owns — `src/harness/mod.rs` and
-/// `src/bin/golden.rs` — which both spell `PROVISIONAL(...)` in their own doc
-/// comments (they DEFINE/illustrate the marker syntax). Skip them so the sweep
-/// never trips over its own contract text.
-fn is_owned_self_file(path: &std::path::Path) -> bool {
-    let matches = |dir: &str, file: &str| {
-        path.file_name().is_some_and(|n| n == file)
-            && path.parent().is_some_and(|p| p.ends_with(dir))
-    };
-    matches("harness", "mod.rs") || matches("bin", "golden.rs")
-}
-
-fn scan_dir(dir: &std::path::Path, targets: &[Phase], hits: &mut Vec<(Phase, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            scan_dir(&path, targets, hits);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            if is_owned_self_file(&path) {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                for (i, line) in text.lines().enumerate() {
-                    scan_line(line, targets, &path, i + 1, hits);
-                }
-            }
-        }
-    }
-}
-
-/// Record every `PROVISIONAL(<marker>)` on `line` whose phase is in `targets`.
-/// Anchors on the FULL token: extract the text between `PROVISIONAL(` and the
-/// next `)` and match it EXACTLY, so `PROVISIONAL(A)` never matches inside
-/// `PROVISIONAL(pre-A)`.
-fn scan_line(
-    line: &str,
-    targets: &[Phase],
-    path: &std::path::Path,
-    lineno: usize,
-    hits: &mut Vec<(Phase, String)>,
-) {
-    const OPEN: &str = "PROVISIONAL(";
-    let mut rest = line;
-    while let Some(start) = rest.find(OPEN) {
-        let after = &rest[start + OPEN.len()..];
-        let Some(end) = after.find(')') else { break };
-        let marker = &after[..end];
-        if let Some(p) = targets.iter().copied().find(|p| p.marker() == marker) {
-            hits.push((p, format!("{}:{}", path.display(), lineno)));
-        }
-        rest = &after[end + 1..];
-    }
-}
-
-/// Elapsed from world creation until the first frame where
-/// `World::entry_complete()` is true (no camera pose needed — entry completion
-/// is a property of streaming around the player's spawn, not of any particular shot).
-pub fn time_to_first_full_render(seed: u64) -> Duration {
-    // Standalone/contract path: drives its own single-`EntryTime`-stage `run`.
-    // `golden` does NOT call this — it reads the number from `run_acceptance`'s
-    // single pass — so the golden process still opens exactly one event loop.
-    let out = execute(vec![Stage::new(
-        seed,
-        None,
-        SCRIPTED_DEFAULT_DAY,
-        DebugView::Normal,
-        None,
-        crate::render_config::RenderConfig::golden(),
-        StageKind::EntryTime,
-    )]);
-    out.entry_times.get(&seed).copied().unwrap_or_default()
 }
 
 /// The canonical golden-shot list (fixed seed, a spread of poses). Extend as
@@ -1365,7 +1176,7 @@ pub fn golden_shots() -> Vec<GoldenShot> {
         },
         GoldenShot {
             seed: GOLDEN_SEED,
-            // PROVISIONAL(pre-A): pose reviewed at first capture. Primary-day pose (mirrors spawn_forward) at midnight.
+            // Pose reviewed at first capture. Primary-day pose (mirrors spawn_forward) at midnight.
             cam: CameraPose {
                 pos: DVec3::new(0.0, 80.0, 0.0),
                 yaw: 0.0,
@@ -1395,7 +1206,7 @@ pub fn golden_shots() -> Vec<GoldenShot> {
         },
         GoldenShot {
             seed: GOLDEN_SEED,
-            // PROVISIONAL(pre-A): pose reviewed at first capture. Golden pos
+            // Pose reviewed at first capture. Golden pos
             // +30 m, grazing down (~ −8°), yaw along the day-0.35 sun azimuth so
             // the 64/256 m splits + fade band sit mid-frame.
             cam: CameraPose {
@@ -1409,7 +1220,7 @@ pub fn golden_shots() -> Vec<GoldenShot> {
         },
         GoldenShot {
             seed: GOLDEN_SEED,
-            // PROVISIONAL(pre-A): pose reviewed at first capture. Near-surface,
+            // Pose reviewed at first capture. Near-surface,
             // near-level (~ −1°), yaw toward the day-0.30 sun azimuth so pure sky
             // sits over fog→1 terrain. `pos.y` is a stand-in for surface_y(0,0)+2,
             // to be re-pinned at first capture.
@@ -1424,7 +1235,7 @@ pub fn golden_shots() -> Vec<GoldenShot> {
         },
         GoldenShot {
             seed: GOLDEN_SEED,
-            // PROVISIONAL(pre-A): pose reviewed at first capture. Water shot: a
+            // Pose reviewed at first capture. Water shot: a
             // low camera (y≈72, a few blocks over the ~64 water surface) grazing
             // ACROSS the lakes that fill the origin basin (see the blessed
             // spawn_forward/tile_boundary captures) at a moderate down angle so a
@@ -1456,10 +1267,10 @@ pub fn golden_shots() -> Vec<GoldenShot> {
 /// generate already-carved.
 fn carve_cave(game: &mut Game) {
     let registry = game.world().registry();
-    // The one built-in light-emitting block (`El::Lumin`, block/registry).
+    // The ordinary element-derived stone/lumin composition.
     let emitter = registry
-        .id_by_name("LuminVein")
-        .expect("LuminVein is a built-in block");
+        .id_by_name("Stone+Lumin")
+        .expect("worldgen registers the Stone+Lumin composition");
     let stone = registry
         .id_by_name("Stone")
         .expect("Stone is a built-in block");
@@ -1626,11 +1437,8 @@ mod tests {
         assert_eq!(sky_hole_count(&img), 1);
     }
 
-    // Live-capture criteria (ImageMatch/SkyHoleCount/EntryTime/FrameTime) now
-    // drive a real windowed `Engine` via `drive_ready_frames` — no longer
-    // unit-testable headlessly here. `golden.rs` (`cargo run --bin golden`)
-    // is their acceptance run; `NoProvisional` and the pure detectors above
-    // stay covered by these `cargo test`-safe unit tests.
+    // Live-capture criteria (ImageMatch/SkyHoleCount/EntryTime/FrameTime) drive
+    // a real windowed `Engine` and are exercised by `cargo run --bin golden`.
 
     #[test]
     fn scripted_default_day_matches_clock() {
@@ -1638,48 +1446,5 @@ mod tests {
         // is a no-op for them; that only holds while it equals the scripted
         // clock's start. Guards note-1's by-construction no-op.
         assert_eq!(crate::sky::SkyClock::default().day(), SCRIPTED_DEFAULT_DAY);
-    }
-
-    #[test]
-    fn phase_order_and_roundtrip() {
-        // Declaration order is the ladder order, and marker/parse round-trips.
-        assert!(Phase::PreA < Phase::A && Phase::A < Phase::E);
-        for p in Phase::ALL {
-            assert_eq!(Phase::parse(p.marker()), Some(p));
-        }
-        assert_eq!(Phase::parse("nonsense"), None);
-    }
-
-    #[test]
-    fn scan_line_matches_exact_marker_only() {
-        // The `through = B` sweep targets pre-A, A, B — but NOT C.
-        let targets = [Phase::PreA, Phase::A, Phase::B];
-        let path = std::path::Path::new("x.rs");
-        let mut hits = Vec::new();
-        scan_line("// PROVISIONAL(A): a", &targets, path, 1, &mut hits);
-        scan_line("// PROVISIONAL(pre-A): b", &targets, path, 2, &mut hits);
-        scan_line(
-            "// PROVISIONAL(C): out of range",
-            &targets,
-            path,
-            3,
-            &mut hits,
-        );
-        let phases: Vec<Phase> = hits.iter().map(|(p, _)| *p).collect();
-        assert_eq!(phases, vec![Phase::A, Phase::PreA]);
-    }
-
-    #[test]
-    fn scan_line_a_does_not_match_inside_pre_a() {
-        // The `A` literal must anchor on the full token: `PROVISIONAL(pre-A)`
-        // yields ONLY a pre-A hit, never a spurious A hit.
-        let targets = Phase::ALL;
-        let path = std::path::Path::new("x.rs");
-        let mut hits = Vec::new();
-        scan_line("PROVISIONAL(pre-A)", &targets, path, 1, &mut hits);
-        assert_eq!(
-            hits.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
-            vec![Phase::PreA]
-        );
     }
 }

@@ -9,8 +9,9 @@
 use crate::block::composition::{Composition, Weights};
 use crate::block::element::{Core, CoreProperties, ElementId};
 
-/// An emergent property a reaction can grant that isn't one of the nine core
+/// An emergent property a reaction can grant that isn't one of the core
 /// properties. A tagged seam for behaviours later systems will read.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmergentKind {
     /// Conducts signals along a controlled path.

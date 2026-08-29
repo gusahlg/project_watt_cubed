@@ -303,8 +303,8 @@ fn emit(
     origin[dir.v_axis] = v0 as u32;
     let layer = sample.block.0;
     // Route water to opaque pass (no animated texturing at LOD range).
-    let is_water = tables.water(BlockId(layer));
-    let pass = if is_water { Pass::Opaque } else { tables.layer[layer as usize] };
+    let is_fluid = tables.fluid_surface(BlockId(layer));
+    let pass = if is_fluid { Pass::Opaque } else { tables.layer[layer as usize] };
     let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
         let cr = dir.corners[i];
         let mut pos = [0u32; 3];
@@ -506,8 +506,8 @@ mod tests {
         crate::world::placement::builtin().compile(&mut r);
         let id = |n: &str| r.id_by_name(n).unwrap();
         let blocks = Blocks {
-            grass: id("Grass"),
-            dirt: id("Dirt"),
+            grass: id("Soil+Organic"),
+            dirt: id("Soil+Clay"),
             stone: id("Stone"),
             sand: id("Sand"),
             water: id("Water"),
@@ -664,7 +664,7 @@ mod tests {
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
         let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
-        let is_water_quad = |q: &[MeshVertex]| tables.water(BlockId(q[0].layer()));
+        let is_water_quad = |q: &[MeshVertex]| tables.fluid_surface(BlockId(q[0].layer()));
         let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(q));
         assert!(opaque_water, "water surface meshes into the opaque pass");
         assert!(!all_quads(&mesh).any(|(_, _, q)| q[0].is_water()), "LOD water clears the water bit");

@@ -18,7 +18,7 @@
 //! - [`net`] — multiplayer: the authoritative server and the client connection.
 //! - [`save`] — saving and loading worlds.
 //! - [`settings`] — persistent graphics settings (settings menu + `/gfx`).
-//! - [`sim`] — the fixed-timestep simulation seam (thermal/electrical, inert for now).
+//! - [`sim`] — the fixed-timestep seam for registered simulation systems.
 //! - [`math`] — geometry shared across systems (the [`Aabb`](math::Aabb) and
 //!   [`Bounded`](math::Bounded) trait).
 //! - [`render`] — the [`Render`](render::Render) trait for drawable things.

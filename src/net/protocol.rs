@@ -356,9 +356,8 @@ pub async fn read_frame_async(r: &mut RecvStream, buf: &mut Vec<u8>) -> io::Resu
 mod tests {
     use super::*;
 
-    #[test]
-    fn client_messages_round_trip() {
-        let cases = [
+    fn client_cases() -> Vec<ClientMessage> {
+        vec![
             ClientMessage::Hello {
                 protocol: 1,
                 fingerprint: 0xDEAD_BEEF_1234_5678,
@@ -386,15 +385,11 @@ mod tests {
             ClientMessage::SetTime { day: 0.5 },
             ClientMessage::Voice { seq: 5, payload: vec![1, 2, 3, 4].try_into().unwrap() },
             ClientMessage::Voice { seq: 0, payload: Vec::new().try_into().unwrap() },
-        ];
-        for msg in cases {
-            assert_eq!(ClientMessage::decode(&msg.encode()), Some(msg));
-        }
+        ]
     }
 
-    #[test]
-    fn server_messages_round_trip() {
-        let cases = [
+    fn server_cases() -> Vec<ServerMessage> {
+        vec![
             ServerMessage::Welcome {
                 player_id: 42,
                 seed: -9_999,
@@ -432,9 +427,22 @@ mod tests {
             ServerMessage::Time { day: 0.75, day_secs: 600.0 },
             ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7].try_into().unwrap() },
             ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new().try_into().unwrap() },
-        ];
-        for msg in cases {
-            assert_eq!(ServerMessage::decode(&msg.encode()), Some(msg));
+        ]
+    }
+
+    #[test]
+    fn messages_obey_codec_contract() {
+        for message in client_cases() {
+            let mut payload = message.encode();
+            assert_eq!(ClientMessage::decode(&payload), Some(message.clone()));
+            payload.push(0xa5);
+            assert_eq!(ClientMessage::decode(&payload), None, "accepted suffix after {message:?}");
+        }
+        for message in server_cases() {
+            let mut payload = message.encode();
+            assert_eq!(ServerMessage::decode(&payload), Some(message.clone()));
+            payload.push(0x5a);
+            assert_eq!(ServerMessage::decode(&payload), None, "accepted suffix after {message:?}");
         }
     }
 
@@ -475,74 +483,6 @@ mod tests {
         // Chop the payload short: the reader must report failure, not panic.
         assert_eq!(ClientMessage::decode(&full[..full.len() - 2]), None);
         assert_eq!(ClientMessage::decode(&[]), None);
-    }
-
-    #[test]
-    fn trailing_bytes_are_rejected_for_every_message_direction() {
-        let client_cases = [
-            ClientMessage::Hello {
-                protocol: 1,
-                fingerprint: 7,
-                name: "player".into(),
-                password: "".into(),
-            },
-            ClientMessage::Move {
-                pos: DVec3::new(1.0, 2.0, 3.0),
-                yaw: 0.25,
-                pitch: -0.5,
-                stance: Stance::Standing,
-            },
-            ClientMessage::Teleport { pos: DVec3::new(1.0, 2.0, 3.0) },
-            ClientMessage::Swing,
-            ClientMessage::Ping { nonce: 9 },
-            ClientMessage::Edit { req: 1, x: 1, y: 2, z: 3, expect: 0, spec: "air".into() },
-            ClientMessage::Chat { channel: 0, text: "hi".into() },
-            ClientMessage::SetTime { day: 0.25 },
-            ClientMessage::Voice { seq: 3, payload: vec![7, 7].try_into().unwrap() },
-        ];
-        for message in client_cases {
-            let mut payload = message.encode();
-            payload.push(0xa5);
-            assert_eq!(ClientMessage::decode(&payload), None, "accepted suffix after {message:?}");
-        }
-
-        let server_cases = [
-            ServerMessage::Welcome {
-                player_id: 1,
-                seed: 2,
-                spawn: DVec3::new(3.0, 4.0, 5.0),
-            },
-            ServerMessage::Reject { reason: "no".into() },
-            ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] },
-            ServerMessage::PeerJoined { id: 2, name: "peer".into() },
-            ServerMessage::PeerLeft { id: 2 },
-            ServerMessage::PeerMove {
-                id: 2,
-                pos: DVec3::new(6.0, 7.0, 8.0),
-                yaw: 0.5,
-                pitch: -0.25,
-                stance: Stance::Sneaking,
-            },
-            ServerMessage::PeerExited { id: 2 },
-            ServerMessage::PeerSwing { id: 2 },
-            ServerMessage::Pong { nonce: 9 },
-            ServerMessage::Edit { x: 1, y: 2, z: 3, rev: 1, spec: "air".into() },
-            ServerMessage::EditAck { req: 4, accepted: false, rev: 0 },
-            ServerMessage::Position { pos: DVec3::new(1.0, 2.0, 3.0) },
-            ServerMessage::Chat {
-                from_id: 2,
-                from_name: "peer".into(),
-                channel: 0,
-                text: "hi".into(),
-            },
-            ServerMessage::Time { day: 0.5, day_secs: 600.0 },
-            ServerMessage::PeerVoice { id: 2, epoch: 1, seq: 4, payload: vec![5, 5].try_into().unwrap() },
-        ];
-        for message in server_cases {
-            let mut payload = message.encode();
-            payload.push(0x5a);
-            assert_eq!(ServerMessage::decode(&payload), None, "accepted suffix after {message:?}");
-        }
     }
 
     #[test]

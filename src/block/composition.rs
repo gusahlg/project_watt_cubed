@@ -1,5 +1,5 @@
 //! What a block is *made of*. Composition is the input to property derivation;
-//! everything observable about a block (solidity, colour, the nine core
+//! everything observable about a block (solidity, colour, the core
 //! properties, specials, reactions) falls out of it.
 //!
 //! [`Natural`](Composition::Natural) and [`Mixture`](Composition::Mixture)
@@ -18,11 +18,6 @@ impl Weights {
     /// The `(element, total weight)` pairs, sorted by id with duplicates merged.
     pub fn parts(&self) -> &[(ElementId, u32)] {
         &self.0
-    }
-
-    /// Whether the multiset carries no elements (only air / computational).
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     /// The sum of every element's weight — the divisor for the weighted mean.
@@ -185,13 +180,6 @@ mod tests {
         assert_eq!(Mix::new(&[(a, 70), (b, 30)]).is_ok(), true);
         assert_eq!(Mix::new(&[(a, 70), (b, 20)]), Err(MixError::NotHundred(90)));
         assert_eq!(Mix::new(&[]), Err(MixError::Empty));
-    }
-
-    #[test]
-    fn natural_weights_are_one_each() {
-        let comp = Composition::natural(&[ElementId(3), ElementId(5)]);
-        assert_eq!(comp.weights().parts(), &[(ElementId(3), 1), (ElementId(5), 1)]);
-        assert!(!comp.is_empty());
     }
 
     #[test]

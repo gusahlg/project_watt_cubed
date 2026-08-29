@@ -423,9 +423,8 @@ fn collision_grouped_lookup_matches_per_cell_path() {
 fn column_is_layered_grass_dirt_stone() {
     let mut world = World::generate();
     let reg = world.registry();
-    // Terrain speaks elements now: the crust blocks are the natural unions
-    // the placement table derives, not the authored Grass/Dirt mixtures
-    // (which remain registered for crafting and old saves).
+    // Terrain speaks elements: crust blocks are the natural unions derived by
+    // the placement table.
     let (grass, dirt, stone) = (
         reg.id_by_name("Soil+Organic").unwrap(),
         reg.id_by_name("Soil+Clay").unwrap(),

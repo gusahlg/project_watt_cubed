@@ -206,11 +206,37 @@ pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
         let element = elements.get(crate::block::ElementId(i as u16));
         eat(element.name.as_bytes());
         eat(&[0]); // name terminator so "ab"+"c" != "a"+"bc"
+        eat(&crate::block::element::Core::from(element.core).0);
+        eat(&[element.color.r, element.color.g, element.color.b, element.color.a]);
+        eat(&(element.specials.len() as u32).to_le_bytes());
+        for special in &element.specials {
+            eat(&[special.kind() as u8, special.strength()]);
+        }
     }
     eat(&(registry.block_count() as u32).to_le_bytes());
     for i in 0..registry.block_count() {
+        let block = registry.block(crate::block::BlockId(i as u16));
         eat(crate::save::registry_block_spec(registry, crate::block::BlockId(i as u16)).as_bytes());
         eat(&[0]);
+        eat(&crate::block::element::Core::from(block.core).0);
+        eat(&(block.specials.len() as u32).to_le_bytes());
+        for &(kind, strength) in &block.specials {
+            eat(&[kind as u8, strength]);
+        }
+        eat(&(block.reactions.len() as u32).to_le_bytes());
+        for reaction in &block.reactions {
+            eat(reaction.name.as_bytes());
+            eat(&[0, reaction.strength]);
+            match reaction.effect {
+                crate::block::reaction::ReactionEffect::CoreBonus(core) => {
+                    eat(&[0]);
+                    eat(&crate::block::element::Core::from(core).0);
+                }
+                crate::block::reaction::ReactionEffect::Emergent(kind, strength) => {
+                    eat(&[1, kind as u8, strength]);
+                }
+            }
+        }
     }
     hash
 }

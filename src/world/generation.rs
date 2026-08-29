@@ -1751,25 +1751,25 @@ mod tests {
             let id = |n: &str| reg.id_by_name(n).unwrap();
             let seam = |d: i32, r: u32, n: &str| (d, u32::MAX / r, id(n));
             Legacy {
-                grass: id("Grass"),
-                dirt: id("Dirt"),
+                grass: id("Soil+Organic"),
+                dirt: id("Soil+Clay"),
                 stone: id("Stone"),
                 sand: id("Sand"),
                 snow: id("Snow"),
                 ice: id("Ice"),
                 water: id("Water"),
-                aerium_vein: id("AeriumVein"),
-                quartz_vein: id("QuartzVein"),
+                aerium_vein: id("Stone+Aerium"),
+                quartz_vein: id("Stone+Quartz"),
                 seams: [
-                    seam(3, 90, "CoalVein"),
-                    seam(8, 110, "IronVein"),
-                    seam(8, 130, "CopperVein"),
-                    seam(20, 240, "SulfurVein"),
-                    seam(20, 200, "QuartzVein"),
-                    seam(20, 220, "LeadVein"),
-                    seam(32, 300, "GoldVein"),
-                    seam(32, 380, "LuminVein"),
-                    seam(48, 460, "TitanVein"),
+                    seam(3, 90, "Stone+Coal"),
+                    seam(8, 110, "Stone+Iron"),
+                    seam(8, 130, "Stone+Copper"),
+                    seam(20, 240, "Stone+Sulfur"),
+                    seam(20, 200, "Stone+Quartz"),
+                    seam(20, 220, "Stone+Lead"),
+                    seam(32, 300, "Stone+Gold"),
+                    seam(32, 380, "Stone+Lumin"),
+                    seam(48, 460, "Stone+Titan"),
                     seam(48, 240, "Obsidian"),
                 ],
             }
@@ -1979,7 +1979,7 @@ mod tests {
     #[test]
     fn cave_wall_lumin_hugs_carved_floors_and_ceilings() {
         let (reg, g) = terrain_with_registry(9);
-        let lumin = reg.id_by_name("LuminVein").unwrap();
+        let lumin = reg.id_by_name("Stone+Lumin").unwrap();
         let (mut found, mut scanned) = (0u64, 0u64);
         'scan: for cz in 0..96 {
             for cy in [-6i32, -7, -8] {

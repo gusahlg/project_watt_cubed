@@ -18,14 +18,19 @@ Deltas from this document as written:
 
 - The palette cap was lifted FIRST (BlockId u16, 16,384 ids, per-chunk
   palettes — the doc's "sanctioned future lift"), so C1's arithmetic relaxed:
-  `ENUM_CAP = 1024`. The builtin table enumerates 50 new naturals (45 ground
-  pairs, the island pair, {Soil,Organic}, {Soil,Clay}, {Soil,Sand},
-  {Stone,Obsidian}) — registry lands at 75 ids, inside the doc's estimate.
+  `ENUM_CAP = 1024`. Pure elements register directly and the placement table
+  adds 64 reachable naturals (45 ground pairs, 10 single seams, the island
+  pair, Stone+Aerium, five biome-crust unions, and two surface-scatter unions),
+  so the registry lands at 86 ids.
+- The old `blocks!` named-palette layer has now been retired. `Air` plus every
+  pure element register uniformly; placement registers all terrain unions.
+  Water is therefore just the pure Water composition, with liquid behaviour
+  derived from its averaged core properties rather than a block kind or special.
 - The generator had grown past the doc's parity table (snow, deserts, water
   tables, overhangs, ravines, trees). The vocabulary adapted: one
   `SurfaceKind` axis {Grassy, Shore, Snowy, Desert, BeachEdge}, plus `Flood`
   and `Overhang` contexts (Water is an element and floods via the table).
-  Trees stay a decoration overlay, as the doc intended.
+  Earth-style trees and their decoration overlay were retired in v3.
 - Stream B is DERIVED from the same authored rows (rarity ÷8), not a second
   stream field in the vocabulary. Arity ≤ 2 holds by the two-stream dedup.
 - Cave-wall Lumin (the vision-note idea) landed with VERTICAL adjacency only
@@ -337,12 +342,10 @@ constant we can raise the day the engine work lands.
   worldgen change; fold `worldgen_version` into the join handshake alongside
   the protocol version so the mismatch is an error message instead of
   silent divergence.
-- **Old named blocks**: Grass/Dirt (mixtures) stay registered — crafting and
-  saved edits may reference them; terrain just stops placing them. The
-  `*Vein` builtin entries become redundant *names* for compositions the
-  enumeration re-derives; keep them for now (free — they dedup), retire the
-  macro rows in a later cleanup if the pretty names stop mattering (see
-  sidenotes on naming).
+- **Old named blocks**: the later cleanup retired the redundant Grass/Dirt and
+  `*Vein` macro rows. Saved edits remain portable because they encode element
+  compositions, while crafted naturals reconstruct from their `+`-joined
+  element names. Display names now tell the truth about composition.
 
 ## Testing plan (house style: prove, census, bit-compare)
 
@@ -427,9 +430,8 @@ constant we can raise the day the engine work lands.
   reachable combo whose reaction set is non-empty, so a surprising world
   behaviour is a read of startup output, not a mystery.
 - **Naming.** `auto_name` yields "Stone+Iron+Coal" — fine for v1 and for
-  the inspection UI. The old pretty names (CoalVein) survive as aliases on
-  the deduped ids as long as the macro rows stay. A curated display-name
-  pass (e.g. "Iron-Coal Seam") is cosmetic, deferred.
+  the inspection UI. The redundant macro aliases have been retired; a curated
+  display-name pass (e.g. "Iron-Coal Seam") is cosmetic and remains deferred.
 - **Rarity semantics shifted one notch.** Today `ORE_MIN_DEPTH = 3` is
   documented but unreachable at depth 3 (that's dirt); the table writes
   depth 4 explicitly. Verify in test 2 that this is byte-identical in

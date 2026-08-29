@@ -460,7 +460,14 @@ mod tests {
     fn blocks() -> Blocks {
         let r = BlockRegistry::with_builtins();
         let id = |n: &str| r.id_by_name(n).unwrap();
-        Blocks { air: AIR, grass: id("Grass"), dirt: id("Dirt"), stone: id("Stone"), sand: id("Sand"), water: id("Water") }
+        Blocks {
+            air: AIR,
+            grass: id("Organic"),
+            dirt: id("Soil"),
+            stone: id("Stone"),
+            sand: id("Sand"),
+            water: id("Water"),
+        }
     }
 
     fn sine(seed: i64) -> SineHills {

@@ -624,12 +624,11 @@ mod tests {
         let baseline = BlockRegistry::with_builtins().block_count();
         let (reg, _) = compiled();
         let added = reg.block_count() - baseline;
-        // 45 ground ore pairs C(10,2) + 1 island pair + banded naturals
-        // {Organic,Soil}, {Soil,Clay}, {Sand,Soil}, {Sand,Clay} (desert crust),
-        // {Soil,Ice} (snowy crust) + {Stone,Obsidian} + surface scatter
-        // {Organic,Soil,Lumin} and {Sand,Phosphor}. Cave-wall Lumin dedups
-        // into LuminVein; everything else dedups into existing builtins.
-        assert_eq!(added, 45 + 1 + 5 + 1 + 2, "reachable set drifted — re-derive before accepting");
+        // 45 ground ore pairs C(10,2) + 10 single seams + 1 island pair +
+        // Stone+Aerium + five biome-crust unions + two surface-scatter unions.
+        // The island's Stone+Quartz and cave-wall Stone+Lumin dedup into ground
+        // seams; pure banded elements were registered with the element palette.
+        assert_eq!(added, 45 + 10 + 1 + 1 + 5 + 2, "reachable set drifted — re-derive before accepting");
         assert!(reg.block_count() <= ENUM_CAP);
     }
 
@@ -667,15 +666,15 @@ mod tests {
     fn seams_match_the_legacy_table() {
         let (reg, r) = compiled();
         let legacy: [(&str, i32, u32); 10] = [
-            ("CoalVein", 3, 90),
-            ("IronVein", 8, 110),
-            ("CopperVein", 8, 130),
-            ("SulfurVein", 20, 240),
-            ("QuartzVein", 20, 200),
-            ("LeadVein", 20, 220),
-            ("GoldVein", 32, 300),
-            ("LuminVein", 32, 380),
-            ("TitanVein", 48, 460),
+            ("Stone+Coal", 3, 90),
+            ("Stone+Iron", 8, 110),
+            ("Stone+Copper", 8, 130),
+            ("Stone+Sulfur", 20, 240),
+            ("Stone+Quartz", 20, 200),
+            ("Stone+Lead", 20, 220),
+            ("Stone+Gold", 32, 300),
+            ("Stone+Lumin", 32, 380),
+            ("Stone+Titan", 48, 460),
             // Obsidian semantics changed deliberately: {Stone, Obsidian}, no
             // longer the pure block (the one seam that was the odd one out).
             ("Obsidian", 48, 240),
@@ -723,8 +722,8 @@ mod tests {
         assert_eq!(r.island_ice, reg.id_by_name("Ice").unwrap());
         assert_eq!(r.island_grass, r.dress[SurfaceKind::Grassy as usize]);
         assert_eq!(r.island_crust, r.crust[SurfaceKind::Grassy as usize]);
-        // Cave-wall Lumin dedups into the LuminVein composition.
-        assert_eq!(r.cave_wall.unwrap().id, reg.id_by_name("LuminVein").unwrap());
+        // Cave-wall Lumin dedups into the ordinary Stone+Lumin composition.
+        assert_eq!(r.cave_wall.unwrap().id, reg.id_by_name("Stone+Lumin").unwrap());
         // Surface scatter: grassy plains grow Organic+Soil+Lumin tufts; the
         // ash desert grows Sand+Phosphor sparks; other kinds have none.
         assert_eq!(

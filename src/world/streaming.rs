@@ -1786,16 +1786,7 @@ impl World {
                 let span = s.span();
                 let (cx, cz) = (s.x * span + span / 2, s.z * span + span / 2);
                 let dist = metric.point(cx as f64, cz as f64);
-                if !pyramid::acceptable(dist, s.detail, cfg) {
-                    return true;
-                }
-                // Dormant VRAM floor: unload anything finer than the current
-                // affordable floor. `vram_budget_floor`
-                // always returns `Detail::FULL` today, and every section is
-                // coarser than that by construction (`FINEST_DETAIL` > 0), so
-                // this never fires until the floor is activated.
-                pyramid::required_detail(dist, cfg, pyramid::vram_budget_floor())
-                    .is_some_and(|req| s.detail < req)
+                !pyramid::acceptable(dist, s.detail, cfg)
             })
             .collect();
         for s in &stale {

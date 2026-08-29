@@ -359,7 +359,7 @@ impl AudioDirector {
 
         // --- Derived: splash on a listener medium transition (both directions) ---
         if let Some(prev) = self.prev_medium
-            && matches!(prev, Medium::Water) != matches!(medium, Medium::Water)
+            && matches!(prev, Medium::Liquid) != matches!(medium, Medium::Liquid)
             && let Some(sfx) = self.palette.splash()
         {
             self.push(&mut journal, Some(ctx.player.pos), medium, sfx);
@@ -368,14 +368,14 @@ impl AudioDirector {
 
         // --- Derived: emitter table (latest-wins), one underwater bed iff submerged ---
         let mut emitters: Vec<Emitter> = Vec::new();
-        if matches!(medium, Medium::Water)
+        if matches!(medium, Medium::Liquid)
             && let Some(sfx) = self.palette.underwater_loop()
         {
             emitters.push(Emitter {
                 id: EmitterId(0),
                 cue: sfx.cue,
                 at: ctx.player.pos,
-                medium: Medium::Water,
+                medium: Medium::Liquid,
                 gain: sfx.gain,
             });
         }
@@ -445,7 +445,7 @@ fn medium_at(world: &World, pos: DVec3) -> Medium {
         pos.z.floor() as i32,
     );
     if world.registry().buoyancy(id) > 0 {
-        Medium::Water
+        Medium::Liquid
     } else {
         Medium::Air
     }

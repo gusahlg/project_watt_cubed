@@ -22,7 +22,7 @@ pub struct ElementId(pub u16);
 /// both `From` impls together.
 macro_rules! core_properties {
     ($($(#[$doc:meta])* $field:ident),* $(,)?) => {
-        /// The nine properties every element has. A block inherits each one as the
+        /// The properties every element has. A block inherits each one as the
         /// weighted average of its elements (see [`derive_core`](crate::block::derive::derive_core)).
         ///
         /// All values are `0..=255` except `transparency`, which reads as a percentage
@@ -73,9 +73,13 @@ core_properties! {
     light_emission,
     /// Light transmission as a percentage, `0` (opaque) to `100` (clear).
     transparency,
+    /// Upward force and inverse viscosity, `0` for a non-liquid. Any non-zero
+    /// value makes the containing block a passable liquid through ordinary
+    /// composition averaging; it is not a named block-kind exception.
+    buoyancy,
 }
 
-/// The nine core fields as a fixed-order array, so property math can loop instead
+/// The core fields as a fixed-order array, so property math can loop instead
 /// of spelling out every field. Used by
 /// [`derive_core`](crate::block::derive::derive_core) and
 /// [`apply_reactions`](crate::block::reaction::apply_reactions).
@@ -98,60 +102,44 @@ impl Core {
     }
 }
 
-/// Extra behaviours only some elements carry. Each holds an intrinsic strength
-/// (`0..=255`); a block scales it by how much of the element it contains.
+/// Extra behaviours only some elements carry. A block scales their intrinsic
+/// strength (`0..=255`) by how much of the carrying element it contains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpecialProperty {
-    /// Releases an explosion when the block breaks.
-    ExplosionAtBreakage(u8),
-    /// Attracts/repels along magnetic lines.
-    Magnetism(u8),
-    /// Eats away at adjacent blocks over time.
-    Corrosion(u8),
-    /// Converts a heat differential into electricity.
-    HeatToElectricity(u8),
-    /// Acts as a battery.
-    ElectricityStorage(u8),
-    /// Passable liquid: buoys and drags anything moving through it. The strength
-    /// is the upward push (and, inversely, the viscosity) the player feels.
-    Buoyancy(u8),
+pub struct SpecialProperty {
+    kind: SpecialKind,
+    strength: u8,
 }
 
 /// The tag of a [`SpecialProperty`] without its strength — used to group and
 /// average contributions from several elements that share the same behaviour.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SpecialKind {
+    /// Releases an explosion when the block breaks.
     ExplosionAtBreakage,
+    /// Attracts or repels along magnetic lines.
     Magnetism,
+    /// Eats away at adjacent blocks over time.
     Corrosion,
+    /// Converts a heat differential into electricity.
     HeatToElectricity,
+    /// Acts as a battery.
     ElectricityStorage,
-    Buoyancy,
 }
 
 impl SpecialProperty {
+    pub const fn new(kind: SpecialKind, strength: u8) -> Self {
+        Self { kind, strength }
+    }
+
     /// Which behaviour this is, ignoring strength.
     pub fn kind(self) -> SpecialKind {
-        match self {
-            SpecialProperty::ExplosionAtBreakage(_) => SpecialKind::ExplosionAtBreakage,
-            SpecialProperty::Magnetism(_) => SpecialKind::Magnetism,
-            SpecialProperty::Corrosion(_) => SpecialKind::Corrosion,
-            SpecialProperty::HeatToElectricity(_) => SpecialKind::HeatToElectricity,
-            SpecialProperty::ElectricityStorage(_) => SpecialKind::ElectricityStorage,
-            SpecialProperty::Buoyancy(_) => SpecialKind::Buoyancy,
-        }
+        self.kind
     }
 
     /// The intrinsic strength of this behaviour.
     pub fn strength(self) -> u8 {
-        match self {
-            SpecialProperty::ExplosionAtBreakage(v)
-            | SpecialProperty::Magnetism(v)
-            | SpecialProperty::Corrosion(v)
-            | SpecialProperty::HeatToElectricity(v)
-            | SpecialProperty::ElectricityStorage(v)
-            | SpecialProperty::Buoyancy(v) => v,
-        }
+        self.strength
     }
 }
 
@@ -210,10 +198,6 @@ impl ElementRegistry {
         self.elements.len()
     }
 
-    /// Whether the registry holds no elements (only possible before built-ins load).
-    pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
-    }
 }
 
 // The built-in element palette. Adding a material is one row here; the macro
@@ -328,8 +312,7 @@ elements! {
     // translucent solids (the glass path) — the world's oceans, rivers, and lakes.
     Water => {
         color: (22, 118, 138),
-        core: { durability: 5, hardness: 5, density: 200, temperature_resistance: 100, friction: 20, thermal_conductivity: 60, transparency: 55 },
-        specials: [Buoyancy(200)],
+        core: { durability: 5, hardness: 5, density: 200, temperature_resistance: 100, friction: 20, thermal_conductivity: 60, transparency: 55, buoyancy: 200 },
     },
     // Fresh snow: soft, pale, and slick underfoot — the biome frosting on cold or
     // high ground.
@@ -344,8 +327,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_field_count_is_nine() {
-        assert_eq!(CORE_FIELD_COUNT, 9);
+    fn core_field_count_tracks_the_declaration() {
+        assert_eq!(CORE_FIELD_COUNT, 10);
     }
 
     #[test]

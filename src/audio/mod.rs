@@ -1264,11 +1264,11 @@ mod seam_tests {
     }
 
     #[test]
-    fn occurrence_source_medium_reaches_cross_water_response() {
+    fn occurrence_source_medium_reaches_cross_liquid_response() {
         let (mut sound, syms, rec) = system(32);
         let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
         let mut listener = origin_listener();
-        listener.medium = Medium::Water;
+        listener.medium = Medium::Liquid;
         let at = source(4.0);
         let occurrence = Occurrence {
             id: OccurrenceId(0),

@@ -76,10 +76,6 @@ impl<T> Derived<T> {
         Arc::clone(&self.value)
     }
 
-    /// The revision the cached value was built against.
-    pub fn revision(&self) -> Revision {
-        self.rev
-    }
 }
 
 impl<T: Default> Default for Derived<T> {
@@ -149,7 +145,6 @@ mod tests {
         // A build closure that would panic proves it is never called.
         let snap = d.sync(Revision::from_count(1), || panic!("must not rebuild"));
         assert_eq!(*snap, 10);
-        assert_eq!(d.revision(), Revision::from_count(1));
     }
 
     #[test]
@@ -163,7 +158,6 @@ mod tests {
         });
         assert_eq!(*snap, 42);
         assert_eq!(calls, 1);
-        assert_eq!(d.revision(), Revision::from_count(2));
 
         // Syncing again at the same revision must not rebuild.
         let snap2 = d.sync(Revision::from_count(2), || {
