@@ -20,9 +20,8 @@
 //! at least every visible chunk. Tighter optimizations are deferred.
 use super::brick::ChunkPayload;
 use super::chunk::{CHUNK_VOLUME, Chunk};
-use super::{FastMap, FastSet};
 use crate::block::registry::BlockId;
-use crate::coord::{ChunkCoord, Face};
+use crate::coord::{ChunkBox, ChunkCoord, Face};
 
 /// Which of a chunk's six faces a sightline can pass through. Encodes face pairs
 /// as bits in a `u16` for efficient connectivity checks.
@@ -175,36 +174,92 @@ fn orthogonal_neighbours(x: usize, y: usize, z: usize) -> impl Iterator<Item = (
     out.into_iter().take(n)
 }
 
+/// Dense occupancy for the occlusion BFS: bit 6 is visible, bits 0–5 are the
+/// entry faces already expanded. A loaded chunk outside the current unload box
+/// reports visible so it is never culled.
+const VISIBLE_BIT: u8 = 1 << 6;
+
 /// The occlusion pass: determines which chunks are visible from the camera.
-/// Rebuilt once per frame; buffers are cleared not reallocated for efficiency.
-#[derive(Default)]
+/// Rebuilt into a dense byte grid covering the unload box — one array lookup
+/// per query, no per-chunk hashing.
 pub struct Occlusion {
-    visible: FastSet<ChunkCoord>,
-    /// Per chunk, the entry faces already expanded (bit `f as usize`), so each
-    /// (chunk, entry) pair is processed at most once — bounds the BFS to six
-    /// visits per loaded chunk.
-    entered: FastMap<ChunkCoord, u8>,
+    origin: ChunkCoord,
+    nx: i32,
+    ny: i32,
+    nz: i32,
+    cells: Vec<u8>,
     /// Frontier of (chunk, entry-face); the root carries no entry face.
     queue: Vec<(ChunkCoord, Option<Face>)>,
 }
 
+impl Default for Occlusion {
+    fn default() -> Self {
+        Self {
+            origin: ChunkCoord::new(0, 0, 0),
+            nx: 0,
+            ny: 0,
+            nz: 0,
+            cells: Vec::new(),
+            queue: Vec::new(),
+        }
+    }
+}
+
 impl Occlusion {
+    #[inline]
+    fn index(&self, c: ChunkCoord) -> Option<usize> {
+        let dx = c.x.wrapping_sub(self.origin.x);
+        let dy = c.y.wrapping_sub(self.origin.y);
+        let dz = c.z.wrapping_sub(self.origin.z);
+        if dx < 0 || dy < 0 || dz < 0 || dx >= self.nx || dy >= self.ny || dz >= self.nz {
+            return None;
+        }
+        Some((dx + dz * self.nx + dy * self.nx * self.nz) as usize)
+    }
+
     /// Whether `coord` was reached from the camera in the last [`rebuild`](Self::rebuild).
+    /// Outside the current box reports visible — a loaded chunk past the unload
+    /// hysteresis must never be culled.
     #[inline]
     pub fn is_visible(&self, coord: ChunkCoord) -> bool {
-        self.visible.contains(&coord)
+        match self.index(coord) {
+            Some(i) => self.cells[i] & VISIBLE_BIT != 0,
+            None => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn visible_count(&self) -> usize {
+        self.cells.iter().filter(|c| *c & VISIBLE_BIT != 0).count()
     }
 
     /// Recompute the visible set using BFS from the camera's chunk. Each chunk
     /// is entered through a face and may exit through connected faces. The camera's
     /// chunk can see out of every face; other chunks are reached progressively.
-    pub fn rebuild(&mut self, origin: ChunkCoord, conn_of: impl Fn(ChunkCoord) -> Option<Connectivity>) {
-        self.visible.clear();
-        self.entered.clear();
+    pub fn rebuild(
+        &mut self,
+        volume: ChunkBox,
+        origin: ChunkCoord,
+        conn_of: impl Fn(ChunkCoord) -> Option<Connectivity>,
+    ) {
+        let (nx, ny, nz) = volume.size();
+        let n = (nx * ny * nz) as usize;
+        if self.nx != nx || self.ny != ny || self.nz != nz || self.cells.len() != n {
+            self.cells.resize(n, 0);
+            self.nx = nx;
+            self.ny = ny;
+            self.nz = nz;
+        } else {
+            self.cells.fill(0);
+        }
+        self.origin = volume.min();
         self.queue.clear();
         self.queue.push((origin, None));
 
         while let Some((coord, entry)) = self.queue.pop() {
+            let Some(idx) = self.index(coord) else {
+                continue;
+            };
             let conn = match entry {
                 // The camera's own chunk is the root: always expanded (and it is
                 // generated synchronously, so it is loaded in practice).
@@ -214,15 +269,15 @@ impl Occlusion {
                 // flood outward across infinite empty space and never terminate.
                 Some(face) => {
                     let Some(conn) = conn_of(coord) else { continue };
-                    let seen = self.entered.entry(coord).or_default();
-                    if *seen & (1 << face as usize) != 0 {
+                    let seen = self.cells[idx];
+                    if seen & (1 << face as usize) != 0 {
                         continue; // this entry face already expanded
                     }
-                    *seen |= 1 << face as usize;
+                    self.cells[idx] = seen | (1 << face as usize);
                     conn
                 }
             };
-            self.visible.insert(coord);
+            self.cells[idx] |= VISIBLE_BIT;
             for exit in Face::ALL {
                 let open = match entry {
                     None => true, // camera chunk sees out of every face
@@ -325,9 +380,12 @@ mod tests {
         let loaded: Vec<ChunkCoord> = (-2..=2)
             .flat_map(|x| (-2..=2).flat_map(move |y| (-2..=2).map(move |z| ChunkCoord::new(x, y, z))))
             .collect();
+        let origin = ChunkCoord::new(0, 0, 0);
         let mut occ = Occlusion::default();
-        occ.rebuild(ChunkCoord::new(0, 0, 0), |c| loaded.contains(&c).then_some(Connectivity::OPEN));
-        assert_eq!(occ.visible.len(), loaded.len());
+        occ.rebuild(ChunkBox::new(origin, 2, 2), origin, |c| {
+            loaded.contains(&c).then_some(Connectivity::OPEN)
+        });
+        assert_eq!(occ.visible_count(), loaded.len());
         assert!(loaded.iter().all(|&c| occ.is_visible(c)));
     }
 
@@ -337,8 +395,10 @@ mod tests {
         // unloaded neighbour instead of flooding outward forever.
         let origin = ChunkCoord::new(5, -3, 2);
         let mut occ = Occlusion::default();
-        occ.rebuild(origin, |c| (c == origin).then_some(Connectivity::OPEN));
-        assert_eq!(occ.visible.len(), 1);
+        occ.rebuild(ChunkBox::new(origin, 1, 1), origin, |c| {
+            (c == origin).then_some(Connectivity::OPEN)
+        });
+        assert_eq!(occ.visible_count(), 1);
         assert!(occ.is_visible(origin));
     }
 
@@ -349,7 +409,7 @@ mod tests {
         let b = ChunkCoord::new(1, 0, 0); // sealed wall
         let beyond = ChunkCoord::new(2, 0, 0);
         let mut occ = Occlusion::default();
-        occ.rebuild(a, |c| {
+        occ.rebuild(ChunkBox::new(a, 3, 3), a, |c| {
             if c == a {
                 Some(Connectivity::OPEN)
             } else if c == b {
@@ -362,5 +422,15 @@ mod tests {
         });
         assert!(occ.is_visible(a) && occ.is_visible(b), "the wall chunk itself is still drawn");
         assert!(!occ.is_visible(beyond), "sightline can't pass through the sealed wall");
+    }
+
+    #[test]
+    fn outside_the_box_reports_visible() {
+        let origin = ChunkCoord::new(0, 0, 0);
+        let mut occ = Occlusion::default();
+        occ.rebuild(ChunkBox::new(origin, 1, 1), origin, |c| {
+            (c.ring(origin) <= 1 && c.updown(origin) <= 1).then_some(Connectivity::OPEN)
+        });
+        assert!(occ.is_visible(ChunkCoord::new(8, 0, 0)));
     }
 }

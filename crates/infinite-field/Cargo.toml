@@ -1,0 +1,11 @@
+[package]
+name = "infinite-field"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "InfiniteDiffusion-style overlapping-window fields: seed-consistent, order-independent, lazily tiled."
+repository = "https://github.com/gusahlg/infinite-field"
+keywords = ["procedural", "diffusion", "terrain", "infinite"]
+categories = ["algorithms", "game-development"]
+
+[dependencies]

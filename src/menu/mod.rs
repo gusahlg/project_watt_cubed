@@ -173,6 +173,7 @@ pub enum AppEffect {
     Host(HostInfo),
     Join(JoinInfo),
     ToggleMod(usize),
+    StepModKnob { mod_index: usize, knob: usize, delta: i32 },
     Quit,
 }
 
@@ -181,6 +182,7 @@ pub struct ModRow {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub knobs: Vec<(String, String)>,
 }
 
 impl ModRow {
@@ -190,6 +192,11 @@ impl ModRow {
                 name: mods.name(i).to_string(),
                 description: mods.description(i).to_string(),
                 enabled: mods.is_enabled(i),
+                knobs: mods
+                    .knobs(i)
+                    .into_iter()
+                    .map(|k| (k.label.to_string(), k.value))
+                    .collect(),
             })
             .collect()
     }

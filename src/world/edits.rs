@@ -10,7 +10,6 @@ use crate::coord::{BlockCoord, Face, Local};
 use crate::render_config::RenderConfig;
 
 use super::chunk::Chunk;
-use super::generation::TerrainGenerator;
 use super::{Coord, MeshState, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
 
 impl World {

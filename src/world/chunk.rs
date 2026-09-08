@@ -108,7 +108,7 @@ pub struct Chunk {
 
 impl Chunk {
     /// Create a chunk at the given chunk coordinate and fill it using `generator`.
-    pub fn new<G: TerrainGenerator>(cx: i32, cy: i32, cz: i32, generator: &G) -> Self {
+    pub fn new<G: TerrainGenerator + ?Sized>(cx: i32, cy: i32, cz: i32, generator: &G) -> Self {
         Self { cx, cy, cz, data: chunk_data_to_brick(generator.generate(cx, cy, cz)) }
     }
 
@@ -197,24 +197,29 @@ impl Chunk {
         self.get_index(Self::index(x, y, z))
     }
 
-    /// Copy the 16-cell x-row at `(y, z)` into `out` — the snapshot capture's
-    /// bulk read. ONE payload dispatch per row instead of one per cell:
-    /// Uniform fills, Paletted runs 16 palette loads over its contiguous `u8`
-    /// row (x is the fastest axis in [`cell_index`](super::brick::cell_index)),
-    /// Dense strides its row directly.
+    /// Copy the full x-row at `(y, z)` into `out` for a mesh snapshot.
     #[inline]
     pub fn copy_row(&self, y: usize, z: usize, out: &mut [BlockId]) {
         debug_assert_eq!(out.len(), CHUNK_SIZE);
-        let base = Self::index(0, y, z);
+        self.copy_row_from(0, y, z, out);
+    }
+
+    /// Copy a partial x-row starting at `(x, y, z)` and ending within this chunk.
+    /// One storage dispatch per row; palette indices and dense cells are contiguous.
+    #[inline]
+    pub(crate) fn copy_row_from(&self, x: usize, y: usize, z: usize, out: &mut [BlockId]) {
+        debug_assert!(x <= CHUNK_SIZE && out.len() <= CHUNK_SIZE - x);
+        let base = Self::index(x, y, z);
+        let end = base + out.len();
         match &self.data.payload {
             ChunkPayload::Uniform(v) => out.fill(v.id),
             ChunkPayload::Paletted { palette, cells } => {
-                for (o, &idx) in out.iter_mut().zip(&cells[base..base + CHUNK_SIZE]) {
+                for (o, &idx) in out.iter_mut().zip(&cells[base..end]) {
                     *o = palette[idx as usize].id;
                 }
             }
             ChunkPayload::Dense(cells) => {
-                for (o, c) in out.iter_mut().zip(&cells[base..base + CHUNK_SIZE]) {
+                for (o, c) in out.iter_mut().zip(&cells[base..end]) {
                     *o = c.id;
                 }
             }

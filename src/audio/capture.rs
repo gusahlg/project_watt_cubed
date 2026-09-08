@@ -107,7 +107,7 @@ pub struct Capture {
 
 impl Capture {
     pub fn new(cfg: CaptureConfig) -> Result<Self, CaptureError> {
-        let host = cpal::default_host();
+        let host = crate::audio::host::host();
         let device = match cfg.device {
             Some(ref want) => host
                 .input_devices()

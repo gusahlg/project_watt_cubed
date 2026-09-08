@@ -291,7 +291,7 @@ impl Section {
     /// storage uses) then picks the payload variant. `rev` stamps every
     /// extracted brick: transient section bricks carry the edit_generation
     /// observed at extract time.
-    pub fn extract<G: TerrainGenerator>(
+    pub fn extract<G: TerrainGenerator + ?Sized>(
         pos: SectionPos,
         r#gen: &G,
         edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
@@ -434,7 +434,11 @@ mod tests {
         surf: BlockId,
         deep: BlockId,
     }
-    impl<H: Fn(i32, i32) -> i32, B: Fn(i32, i32, i32) -> BlockId> TerrainGenerator for FnGen<H, B> {
+    impl<H, B> TerrainGenerator for FnGen<H, B>
+    where
+        H: Fn(i32, i32) -> i32 + Send + Sync,
+        B: Fn(i32, i32, i32) -> BlockId + Send + Sync,
+    {
         fn height(&self, wx: i32, wz: i32) -> i32 {
             (self.h)(wx, wz)
         }
@@ -477,7 +481,7 @@ mod tests {
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
     const CELL: i32 = 1 << FINEST_DETAIL.0;
 
-    fn extract<G: TerrainGenerator>(pos: SectionPos, g: &G, edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Section {
+    fn extract<G: TerrainGenerator + ?Sized>(pos: SectionPos, g: &G, edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Section {
         Section::extract(pos, g, edits, voxel_engine::Rev::START)
     }
 
@@ -511,7 +515,7 @@ mod tests {
     }
 
     /// Reference: coarse-cell sweep per column from generator contract (parity oracle).
-    fn reference_cells<G: TerrainGenerator>(r#gen: &G, wx: i32, wz: i32, cell: i32) -> Vec<BlockId> {
+    fn reference_cells<G: TerrainGenerator + ?Sized>(r#gen: &G, wx: i32, wz: i32, cell: i32) -> Vec<BlockId> {
         let half = cell / 2;
         let ys: Vec<i32> = (0..DOMAIN_H / cell).map(|j| LOD_FLOOR_Y + j * cell + half).collect();
         let mut out = vec![AIR; ys.len()];

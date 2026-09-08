@@ -187,6 +187,24 @@ impl Connection {
     /// `Err` carries a human-readable reason (bad address, refused, wrong
     /// password, version mismatch).
     pub fn connect(host: &str, port: u16, name: &str, password: &str) -> Result<Self, String> {
+        Self::connect_kind(
+            host,
+            port,
+            name,
+            password,
+            crate::world::generation::WorldgenKind::Classic,
+            crate::world::diffusion::DiffusionCfg::default(),
+        )
+    }
+
+    pub fn connect_kind(
+        host: &str,
+        port: u16,
+        name: &str,
+        password: &str,
+        worldgen: crate::world::generation::WorldgenKind,
+        diffusion: crate::world::diffusion::DiffusionCfg,
+    ) -> Result<Self, String> {
         let addr = (host, port)
             .to_socket_addrs()
             .map_err(|e| format!("bad address: {e}"))?
@@ -215,7 +233,7 @@ impl Connection {
 
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
+            fingerprint: crate::net::content_fingerprint_kind_cfg(worldgen, diffusion),
             name: name.into(),
             password: password.into(),
         };

@@ -1,7 +1,6 @@
-//! Read-only queries: block lookups, solidity, box collision, surface height,
-//! coordinate mapping, and the registry/seed accessors. Code motion only:
-//! these are `World` methods; the struct itself lives in `mod.rs`.
+//! Read-only block, surface, collision, and acoustic queries over loaded chunks.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use glam::{IVec3, UVec3};
@@ -13,13 +12,26 @@ use crate::math::{Aabb, block_coord, block_coord_end};
 use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
-use super::generation::TerrainGenerator;
 use super::{Coord, World};
+
+/// Clip an inclusive world interval to a chunk and return its local cell range.
+/// The interval must intersect the chunk. Saturation keeps endpoint chunks valid
+/// even at the i32 world limits.
+fn local_range(min: i32, max: i32, chunk: i32) -> Range<usize> {
+    let origin = chunk * CHUNK_SIZE as i32;
+    min.saturating_sub(origin).max(0) as usize
+        ..max.saturating_sub(origin).min(CHUNK_SIZE as i32 - 1) as usize + 1
+}
 
 impl World {
     /// The seed this world was generated from.
     pub fn seed(&self) -> i64 {
-        self.generator.seed
+        self.generator.seed()
+    }
+
+    /// Worldgen algorithm id (`classic`, `diffusion`, …).
+    pub fn worldgen_kind(&self) -> &'static str {
+        self.generator.kind()
     }
 
     /// Incremented when blocks are edited.
@@ -197,14 +209,14 @@ impl World {
                         }
                         continue;
                     }
-                    let xs = x0.max(cx * s)..=x1.min((cx + 1) * s - 1);
-                    let ys = y0.max(cy * s)..=y1.min((cy + 1) * s - 1);
-                    let zs = z0.max(cz * s)..=z1.min((cz + 1) * s - 1);
-                    for x in xs {
+                    let xs = local_range(x0, x1, cx);
+                    let ys = local_range(y0, y1, cy);
+                    let zs = local_range(z0, z1, cz);
+                    // X is contiguous in chunk storage.
+                    for y in ys {
                         for z in zs.clone() {
-                            for y in ys.clone() {
-                                let (_, local) = BlockCoord::new(x, y, z).split();
-                                let id = loaded.chunk.get_local(local.lx(), local.ly(), local.lz());
+                            for x in xs.clone() {
+                                let id = loaded.chunk.get_local(x, y, z);
                                 if self.registry.is_obstacle(id) {
                                     return true;
                                 }
@@ -259,20 +271,27 @@ impl World {
                         continue; // whole chunk unloaded → cells remain Unloaded
                     };
                     let uniform = loaded.chunk.uniform().map(&occlude);
-                    let xs = origin.x.max(cx * s)..=hi.x.min((cx + 1) * s - 1);
-                    let ys = origin.y.max(cy * s)..=hi.y.min((cy + 1) * s - 1);
-                    let zs = origin.z.max(cz * s)..=hi.z.min((cz + 1) * s - 1);
-                    for wz in zs {
-                        let dz = (wz - origin.z) as usize;
-                        for wy in ys.clone() {
-                            let dy = (wy - origin.y) as usize;
-                            for wx in xs.clone() {
-                                let dx = (wx - origin.x) as usize;
-                                let cell = uniform.unwrap_or_else(|| {
-                                    let (_, l) = BlockCoord::new(wx, wy, wz).split();
-                                    occlude(loaded.chunk.get_local(l.lx(), l.ly(), l.lz()))
-                                });
-                                cells[(dz * dim + dy) * dim + dx] = cell;
+                    let xs = local_range(origin.x, hi.x, cx);
+                    let ys = local_range(origin.y, hi.y, cy);
+                    let zs = local_range(origin.z, hi.z, cz);
+                    let dx = (cx * s + xs.start as i32 - origin.x) as usize;
+                    let mut row = [AIR; CHUNK_SIZE];
+                    for z in zs {
+                        let dz = (cz * s + z as i32 - origin.z) as usize;
+                        for y in ys.clone() {
+                            let dy = (cy * s + y as i32 - origin.y) as usize;
+                            let start = (dz * dim + dy) * dim + dx;
+                            let out = &mut cells[start..start + xs.len()];
+                            if let Some(cell) = uniform {
+                                out.fill(cell);
+                            } else {
+                                // One storage dispatch per row, shared with mesh
+                                // snapshot capture, instead of one per voxel.
+                                let row = &mut row[..xs.len()];
+                                loaded.chunk.copy_row_from(xs.start, y, z, row);
+                                for (cell, &id) in out.iter_mut().zip(row.iter()) {
+                                    *cell = occlude(id);
+                                }
                             }
                         }
                     }
@@ -296,7 +315,126 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_config::RenderConfig;
+    use crate::world::chunk::{CHUNK_VOLUME, Chunk, ChunkData};
+    use crate::world::{Loaded, MeshState};
     use std::collections::BTreeMap;
+    use voxel_engine::DVec3;
+
+    fn insert_chunk(world: &mut World, chunk: Chunk) {
+        world.chunks.insert(
+            Coord::new(chunk.cx, chunk.cy, chunk.cz),
+            Loaded {
+                chunk: Arc::new(chunk),
+                state: MeshState::needs_mesh(),
+                rev: 0,
+                connectivity: None,
+                visible: true,
+                light: None,
+            },
+        );
+    }
+
+    fn query_world() -> World {
+        let mut world = World::with_config_lazy(73, RenderConfig::default());
+        let stone = world.registry.id_by_name("Stone").unwrap();
+        let water = world.registry.id_by_name("Water").unwrap();
+        let ice = world.registry.id_by_name("Ice").unwrap();
+        for (coord, id) in [
+            (Coord::new(-1, -1, -1), stone),
+            (Coord::new(0, -1, -1), AIR),
+            (Coord::new(-1, 0, -1), water),
+        ] {
+            insert_chunk(
+                &mut world,
+                Chunk::from_uniform(coord.x, coord.y, coord.z, id),
+            );
+        }
+        let ids = [AIR, stone, water, ice];
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        for (i, id) in cells.iter_mut().enumerate() {
+            let (x, y, z) = Chunk::local_of(i);
+            *id = ids[(x + 2 * y + 3 * z) % ids.len()];
+        }
+        insert_chunk(&mut world, Chunk::from_cells(0, 0, -1, cells.clone()));
+        insert_chunk(
+            &mut world,
+            Chunk::from_data(-1, 0, 0, ChunkData::Dense(cells)),
+        );
+        world
+    }
+
+    #[test]
+    fn acoustic_rows_match_per_cell_queries_for_every_storage_shape() {
+        let world = query_world();
+        for (center, radius) in [
+            (IVec3::new(-1, 0, -1), 17),
+            (IVec3::new(15, 15, -16), 1),
+            (IVec3::new(-16, 0, 15), 2),
+            (IVec3::new(1, 2, -3), 0),
+        ] {
+            let window = world.capture_acoustic_window(center, radius);
+            let r = radius as i32;
+            for z in center.z - r..=center.z + r {
+                for y in center.y - r..=center.y + r {
+                    for x in center.x - r..=center.x + r {
+                        let expected = if !world.chunks.contains_key(&World::chunk_of(x, y, z)) {
+                            Cell::Unloaded
+                        } else if world.is_obstacle(x, y, z) {
+                            Cell::Solid {
+                                absorption: world.registry.absorption(world.block_at(x, y, z)),
+                            }
+                        } else {
+                            Cell::Open
+                        };
+                        let pos = IVec3::new(x, y, z);
+                        assert_eq!(window.cell(pos), expected, "{pos:?} in {center:?}, r={r}");
+                    }
+                }
+            }
+            assert_eq!(window.cell(center + IVec3::X * (r + 1)), Cell::Unloaded);
+        }
+    }
+
+    #[test]
+    fn local_collision_walk_matches_per_cell_queries_across_chunk_edges() {
+        let world = query_world();
+        let positions = [-16.0, -0.1, 0.0, 15.9, 16.0];
+        for x in positions {
+            for y in positions {
+                for z in positions {
+                    for half in [DVec3::splat(0.5), DVec3::new(1.0, 0.75, 2.0)] {
+                        let aabb = Aabb::new(DVec3::new(x, y, z), half);
+                        let expected = aabb
+                            .voxel_cells()
+                            .any(|(x, y, z)| world.is_obstacle(x, y, z));
+                        assert_eq!(
+                            world.collides(&aabb),
+                            expected,
+                            "at ({x}, {y}, {z}), {half:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collision_local_ranges_include_world_border_cells() {
+        let mut world = World::with_config_lazy(73, RenderConfig::default());
+        let stone = world.registry.id_by_name("Stone").unwrap();
+        // Most-negative clamp cell (local 0) and most-positive `block_coord_end`
+        // cell (local 15): the reachable endpoints, where saturating clip matters.
+        for x in [block_coord(f64::NEG_INFINITY), block_coord_end(f64::INFINITY)] {
+            let (coord, local) = BlockCoord::new(x, 0, 0).split();
+            let mut chunk = Chunk::from_uniform(coord.x, coord.y, coord.z, AIR);
+            chunk.set_local(local.lx(), local.ly(), local.lz(), stone);
+            insert_chunk(&mut world, chunk);
+            let center = DVec3::new(f64::from(x) + 0.5, 0.5, 0.5);
+            assert!(world.collides(&Aabb::new(center, DVec3::splat(0.25))));
+            assert!(!world.collides(&Aabb::new(center + DVec3::Y, DVec3::splat(0.25))));
+        }
+    }
 
     #[test]
     fn indexed_surface_walk_matches_point_queries_across_chunk_edges() {

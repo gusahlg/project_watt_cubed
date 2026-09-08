@@ -1,6 +1,6 @@
 [package]
 name = "project_watt_cubed"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 default-run = "project_watt_cubed"
@@ -19,6 +19,7 @@ required-features = ["dev-tools"]
 # Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
 # types (glam Vec2/Vec3) and Color the game uses
 voxel_engine = { version = "0.1.0", path = "../voxel-engine" }
+infinite-field = { version = "0.1.0", path = "crates/infinite-field" }
 
 # Benchmark metadata probes Vulkan directly so reports identify the actual
 # renderer-compatible GPU and driver without shelling out to optional tools.
@@ -36,10 +37,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # Audio output/capture, realtime queues, voice codec, and cue manifests.
-# Prefer cpal's native PulseAudio-protocol host on Linux (also served by
-# PipeWire's Pulse compatibility layer), then fall back to ALSA. This avoids
-# relying on distro-specific ALSA plugin configuration in portable bundles.
-cpal = { version = "0.18", features = ["pulseaudio"] }
+# Do not enable cpal's native PulseAudio host: it disconnects in a loop
+# (`pulseaudio::client::reactor`) and delays one-shots by seconds. ALSA
+# (including PipeWire's ALSA plugin) is the playback/capture path.
+cpal = "0.18"
 kira = "0.12"
 opus-rs = "0.1"
 rtrb = "0.3"

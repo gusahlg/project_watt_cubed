@@ -51,7 +51,7 @@ const SWIM_FLOAT_SPEED: f64 = 3.0 * PER_METER;
 const SWIM_SETTLE_SPEED: f64 = 1.0 * PER_METER;
 
 /// The movement intent gathered for a single frame.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MoveInput {
     move_x: f32,
     move_y: f32,
@@ -249,8 +249,14 @@ fn horizontal_heading(player: &Player, input: &MoveInput) -> DVec3 {
 /// step. One law covers acceleration, braking, and all speed changes — no separate
 /// accel/decel clamps.
 fn approach(current: DVec3, target: DVec3, rate: f64, dt: f64) -> DVec3 {
+    let delta = target - current;
+    // Exponential never reaches the target; snap so idle X/Z hits the
+    // `delta == 0` collision fast path instead of three collides per tick.
+    if delta.length_squared() < 1e-8 {
+        return target;
+    }
     let blend = 1.0 - (-rate * dt).exp();
-    current + (target - current) * blend
+    current + delta * blend
 }
 
 /// Update the player's [`Stance`] from the sneak key. Crouching down is always

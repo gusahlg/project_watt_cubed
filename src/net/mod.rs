@@ -182,9 +182,20 @@ pub const MAX_VOICE_PAYLOAD: usize = 400;
 /// platforms, architectures, and Rust releases. The placement compile is
 /// seed-invariant, so one fingerprint speaks for every world a build can generate.
 pub fn content_fingerprint() -> u64 {
+    content_fingerprint_kind(crate::world::generation::WorldgenKind::Classic)
+}
+
+pub fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
+    content_fingerprint_kind_cfg(kind, crate::world::diffusion::DiffusionCfg::default())
+}
+
+pub fn content_fingerprint_kind_cfg(
+    kind: crate::world::generation::WorldgenKind,
+    cfg: crate::world::diffusion::DiffusionCfg,
+) -> u64 {
     let mut registry = crate::block::BlockRegistry::with_builtins();
     let _ = crate::world::placement::builtin().compile(&mut registry);
-    fingerprint_of(&registry)
+    fingerprint_kind_cfg(&registry, kind, cfg)
 }
 
 /// The fingerprint of an already-compiled registry — the server hashes the
@@ -239,6 +250,68 @@ pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
         }
     }
     hash
+}
+
+/// Same as [`fingerprint_of`], plus a worldgen kind so diffusion clients cannot
+/// join a classic server (or the reverse) and silently desync terrain.
+pub fn fingerprint_kind(
+    registry: &crate::block::BlockRegistry,
+    kind: crate::world::generation::WorldgenKind,
+) -> u64 {
+    fingerprint_kind_cfg(registry, kind, crate::world::diffusion::DiffusionCfg::default())
+}
+
+/// Same as [`fingerprint_kind`], plus diffusion knobs so two diffusion worlds
+/// with different tile/stride/phases/relief cannot silently desync.
+pub fn fingerprint_kind_cfg(
+    registry: &crate::block::BlockRegistry,
+    kind: crate::world::generation::WorldgenKind,
+    cfg: crate::world::diffusion::DiffusionCfg,
+) -> u64 {
+    let mut hash = fingerprint_of(registry);
+    if kind != crate::world::generation::WorldgenKind::Classic {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        };
+        eat(kind.id().as_bytes());
+        eat(&cfg.tile.to_le_bytes());
+        eat(&cfg.stride.to_le_bytes());
+        eat(&cfg.phases.to_le_bytes());
+        eat(&cfg.relief.to_bits().to_le_bytes());
+    }
+    hash
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use crate::world::diffusion::DiffusionCfg;
+    use crate::world::generation::WorldgenKind;
+
+    #[test]
+    fn classic_fingerprint_ignores_diffusion_knobs() {
+        let a = content_fingerprint();
+        let b = content_fingerprint_kind(WorldgenKind::Classic);
+        let mut cfg = DiffusionCfg::default();
+        cfg.tile = 64;
+        let c = content_fingerprint_kind_cfg(WorldgenKind::Classic, cfg);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn diffusion_fingerprint_differs_and_mixes_knobs() {
+        let classic = content_fingerprint();
+        let diff = content_fingerprint_kind(WorldgenKind::Diffusion);
+        assert_ne!(classic, diff);
+        let mut cfg = DiffusionCfg::default();
+        cfg.phases = 8;
+        assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
+    }
 }
 
 /// Chat channels. Local is proximity-limited; global reaches everyone.

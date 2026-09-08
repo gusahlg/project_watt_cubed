@@ -94,7 +94,7 @@ impl HeightMip {
     /// Each level is built by reducing four finer children (min/max bounds) where they exist,
     /// or sampling the generator at this level's stride for areas the finer level doesn't cover.
     /// Finer children on the boundary are included in the parent to preserve containment.
-    pub fn bake<G: TerrainGenerator>(terra: &G, colors: &[Color], extent: BakeExtent) -> HeightMip {
+    pub fn bake<G: TerrainGenerator + ?Sized>(terra: &G, colors: &[Color], extent: BakeExtent) -> HeightMip {
         let (finest, coarsest) = (extent.finest, extent.coarsest);
         let mut levels: Vec<MipLevel> = Vec::with_capacity((coarsest.0 - finest.0 + 1) as usize);
         for k in finest.0..=coarsest.0 {
@@ -204,7 +204,7 @@ const COLOR_STRIDE: i32 = 4;
 
 /// Build one level over its grid. Cells with all four children take min/max from them;
 /// cells without full coverage are sampled from the generator and merged with any existing children.
-fn build_level<G: TerrainGenerator>(
+fn build_level<G: TerrainGenerator + ?Sized>(
     terra: &G,
     colors: &[Color],
     detail: Detail,
@@ -241,7 +241,7 @@ fn build_level<G: TerrainGenerator>(
 
 /// Sample one section at absolute grid `(ax, az)`: max/min height and palette-average colour
 /// at the same points [`Section::extract`] samples, ensuring `hi` bounds drawable terrain.
-fn sample_section<G: TerrainGenerator>(
+fn sample_section<G: TerrainGenerator + ?Sized>(
     terra: &G,
     colors: &[Color],
     detail: Detail,
@@ -316,7 +316,7 @@ fn merge(kids: [MipCell; 4]) -> MipCell {
 ///
 /// Only called for edited cells (bounded, rare); the immutable bake covers
 /// everything else at zero cost.
-pub(in crate::world) fn resample_cell<G: TerrainGenerator>(
+pub(in crate::world) fn resample_cell<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     terra: &G,
     edits: &[(ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],

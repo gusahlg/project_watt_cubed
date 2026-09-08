@@ -14,6 +14,7 @@
 //! delegate to shared helpers ([`wrap_clamp`], [`cycle_list`], [`snap_down`]),
 //! so a field touches its own struct member directly — no common wire type to
 //! exclude the float fields.
+use std::fmt::Write;
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -240,8 +241,10 @@ pub struct Setting {
     step: fn(&mut Settings, i32),
     /// Force the value back into its valid range. Safe to call repeatedly.
     clamp: fn(&mut Settings),
-    /// The machine (persistence) text for the current value — save-compatible.
-    write: fn(&Settings) -> String,
+    /// Append the machine (persistence) text without allocating a value string.
+    write: fn(&Settings, &mut String),
+    /// Copy this field directly when applying a profile, without a text codec.
+    copy: fn(&mut Settings, &Settings),
     /// Read a persisted value into the field (no clamp — [`Settings::clamp`] runs
     /// after the whole file is parsed). `false` if it didn't parse.
     read: fn(&mut Settings, &str) -> bool,
@@ -299,11 +302,10 @@ impl Setting {
         parsed
     }
 
-    /// This field's serialized value, but only when it is profile-owned —
-    /// `None` for personal controls. Scopes the change check to the one field
-    /// instead of the whole-`Settings` clone + compare it used to run per edit.
+    /// Snapshot an owned field only while an edit could clear a named profile.
+    /// Comparing its persisted value preserves the codec's normalization rules.
     fn owned_value(&self, s: &Settings) -> Option<String> {
-        (self.profile != Profile::Personal).then(|| (self.write)(s))
+        (self.profile != Profile::Personal && s.preset != Preset::Custom).then(|| self.write(s))
     }
 
     /// The one place the "editing a field marks Custom" rule lives, so no UI
@@ -313,7 +315,7 @@ impl Setting {
     /// deliberately bypasses this — loading restores the saved marker.
     fn note_custom(&self, s: &mut Settings, before: Option<String>) {
         if let Some(before) = before
-            && (self.write)(s) != before
+            && self.write(s) != before
         {
             s.preset = Preset::Custom;
         }
@@ -329,7 +331,9 @@ impl Setting {
     }
 
     fn write(&self, s: &Settings) -> String {
-        (self.write)(s)
+        let mut value = String::new();
+        (self.write)(s, &mut value);
+        value
     }
 
     fn read(&self, s: &mut Settings, value: &str) -> bool {
@@ -355,7 +359,8 @@ macro_rules! toggle_setting {
             parse_human: |s, v| set_bool(&mut s.$field, v),
             step: |s, _| s.$field = !s.$field,
             clamp: |_| {},
-            write: |s| s.$field.to_string(),
+            write: |s, text| write_value(s.$field, text),
+            copy: |s, source| s.$field = source.$field,
             read: |s, v| set_bool(&mut s.$field, v),
         }
     };
@@ -395,7 +400,8 @@ macro_rules! volume_bar {
             },
             step: |s, d| s.$field = cycle_list(&[0, 25, 50, 75, 100], s.$field as i32, d) as u8,
             clamp: |s| vol_clamp(&mut s.$field),
-            write: |s| s.$field.to_string(),
+            write: |s, text| write_value(s.$field, text),
+            copy: |s, source| s.$field = source.$field,
             read: |s, v| set_parsed(&mut s.$field, v),
         }
     };
@@ -434,7 +440,8 @@ macro_rules! percent_bar {
                 s.$field = pct as f32 / 100.0;
             },
             clamp: |s| clamp_float(&mut s.$field, &$range, Settings::default().$field),
-            write: |s| s.$field.to_string(),
+            write: |s, text| write_value(s.$field, text),
+            copy: |s, source| s.$field = source.$field,
             read: |s, v| set_parsed(&mut s.$field, v),
         }
     };
@@ -460,7 +467,8 @@ macro_rules! rate_setting {
             parse_human: |s, v| parse_rate(&mut s.$field, v, $rates),
             step: |s, d| s.$field = cycle_list($rates, s.$field as i32, d) as u32,
             clamp: |s| s.$field = snap_rate($rates, s.$field.min(i32::MAX as u32) as i32) as u32,
-            write: |s| s.$field.to_string(),
+            write: |s, text| write_value(s.$field, text),
+            copy: |s, source| s.$field = source.$field,
             read: |s, v| set_parsed(&mut s.$field, v),
         }
     };
@@ -491,7 +499,8 @@ macro_rules! numeric_setting {
             },
             step: $step,
             clamp: $clamp,
-            write: |s| s.$field.to_string(),
+            write: |s, text| write_value(s.$field, text),
+            copy: |s, source| s.$field = source.$field,
             read: |s, v| set_parsed(&mut s.$field, v),
         }
     };
@@ -521,7 +530,8 @@ macro_rules! enum_setting {
                 let next = (at as i32 + d).rem_euclid(order.len() as i32) as usize;
                 enum_setting!(@set $set, s, $field, order[next]);
             },
-            clamp: |_| {}, write: |s| s.$field.code().to_string(),
+            clamp: |_| {}, write: |s, text| write_value(s.$field.code(), text),
+            copy: |s, source| s.$field = source.$field,
             read: |s, v| match <$ty>::parse(v) {
                 Some(value) => { s.$field = value; true }
                 None => false,
@@ -535,10 +545,8 @@ macro_rules! enum_setting {
 /// The MSAA sample counts offered — one list shared by its stepper and its
 /// "round down to a supported count" clamp bucket.
 const MSAA: &[i32] = &[1, 2, 4, 8];
-const STREAM_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
+const UPDATE_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
 const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
-const SKY_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
-const MOD_RATES: &[i32] = &[0, 15, 30, 60, 120, 240];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
@@ -589,7 +597,7 @@ pub const SETTINGS: [Setting; 52] = [
         "stream_hz",
         "Streaming Rate",
         "streaming",
-        STREAM_RATES,
+        UPDATE_RATES,
         "stream_hz every|15|30|60|120|240",
         &["streamrate"]
     ),
@@ -607,7 +615,7 @@ pub const SETTINGS: [Setting; 52] = [
         "sky_hz",
         "Sky Clock Rate",
         "sky clock",
-        SKY_RATES,
+        UPDATE_RATES,
         "sky_hz every|15|30|60|120|240",
         &["skyrate"]
     ),
@@ -616,7 +624,7 @@ pub const SETTINGS: [Setting; 52] = [
         "mod_hz",
         "Mod Update Rate",
         "mod updates",
-        MOD_RATES,
+        UPDATE_RATES,
         "mod_hz every|15|30|60|120|240",
         &["modrate"]
     ),
@@ -732,7 +740,8 @@ pub const SETTINGS: [Setting; 52] = [
             s.max_fps = cycle_list(&[0, 30, 60, 120, 144, 240], s.max_fps as i32, d) as u32
         },
         clamp: fps_clamp,
-        write: |s| s.max_fps.to_string(),
+        write: |s, text| write_value(s.max_fps, text),
+        copy: |s, source| s.max_fps = source.max_fps,
         read: |s, v| set_parsed(&mut s.max_fps, v),
     },
     numeric_setting!(
@@ -868,7 +877,7 @@ impl Settings {
             .iter()
             .filter(|field| field.profile != Profile::Personal)
         {
-            field.read(self, &field.write(profile));
+            (field.copy)(self, profile);
         }
     }
 
@@ -993,10 +1002,14 @@ impl Settings {
     ///
     /// [`save`]: Settings::save
     fn to_text(&self) -> String {
-        SETTINGS
-            .iter()
-            .map(|f| format!("{}={}\n", f.key, f.write(self)))
-            .collect()
+        let mut text = String::new();
+        for field in &SETTINGS {
+            text.push_str(field.key);
+            text.push('=');
+            (field.write)(self, &mut text);
+            text.push('\n');
+        }
+        text
     }
 
     /// Best-effort save (a failed write shouldn't crash the game).
@@ -1081,6 +1094,10 @@ impl Settings {
 }
 
 // Shared value helpers — the single definition each surface reuses.
+
+fn write_value(value: impl std::fmt::Display, text: &mut String) {
+    write!(text, "{value}").expect("writing settings to a String cannot fail");
+}
 
 fn rate_name(rate: u32) -> String {
     if rate == 0 {
@@ -1485,13 +1502,12 @@ mod tests {
 
     #[test]
     fn positive_rates_never_snap_to_every_frame() {
-        assert_eq!(snap_rate(STREAM_RATES, 0), 0);
-        assert_eq!(snap_rate(STREAM_RATES, 1), 15);
-        assert_eq!(snap_rate(STREAM_RATES, 14), 15);
-        assert_eq!(snap_rate(STREAM_RATES, 29), 15);
-        assert_eq!(snap_rate(STREAM_RATES, 59), 30);
+        assert_eq!(snap_rate(UPDATE_RATES, 0), 0);
+        assert_eq!(snap_rate(UPDATE_RATES, 1), 15);
+        assert_eq!(snap_rate(UPDATE_RATES, 14), 15);
+        assert_eq!(snap_rate(UPDATE_RATES, 29), 15);
+        assert_eq!(snap_rate(UPDATE_RATES, 59), 30);
         assert_eq!(snap_rate(PHYSICS_RATES, 999), 500);
-        assert_eq!(snap_rate(MOD_RATES, 1), 15);
     }
 
     #[test]
@@ -1625,6 +1641,35 @@ mod tests {
 
         loaded.mark_custom();
         assert_eq!(loaded.preset, Preset::Custom);
+    }
+
+    #[test]
+    fn normalized_and_invalid_edits_preserve_named_profiles() {
+        let mut s = Settings::default();
+        s.apply_preset(Preset::Minimum);
+
+        // Different input text can still clamp to the current field value.
+        for (key, value) in [
+            ("render_scale", "25.000"),
+            ("render_distance", "-1"),
+            ("stream_hz", "14"),
+            ("msaa", "0"),
+        ] {
+            assert!(setting(key).parse_human(&mut s, value));
+            assert_eq!(s.preset, Preset::Minimum, "{key}");
+        }
+
+        let scale = setting("render_scale");
+        scale.step(&mut s, 0);
+        assert_eq!(s.preset, Preset::Minimum);
+        assert!(!scale.parse_human(&mut s, "invalid"));
+        assert_eq!(s.preset, Preset::Minimum);
+
+        assert!(scale.parse_human(&mut s, "50"));
+        assert_eq!(s.preset, Preset::Custom);
+        assert!(scale.parse_human(&mut s, "75"));
+        assert_eq!(s.render_scale, 0.75);
+        assert_eq!(s.preset, Preset::Custom);
     }
 
     #[test]

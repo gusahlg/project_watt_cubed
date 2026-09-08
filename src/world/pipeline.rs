@@ -32,7 +32,9 @@ use std::time::{Duration, Instant};
 
 use super::Coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::generation::{SineHills, TerrainGenerator};
+use super::diffusion::Generator;
+#[cfg(test)]
+use super::generation::SineHills;
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
 use super::neighborhood::BoundedPool;
@@ -86,7 +88,7 @@ pub(in crate::world) enum Job {
     GenerateColumn {
         col: (i32, i32),
         cy: RangeInclusive<i32>,
-        generator: Arc<SineHills>,
+        generator: Generator,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
     },
     /// Greedy-mesh a snapshot taken at chunk revision `rev`.
@@ -110,7 +112,7 @@ pub(in crate::world) enum Job {
         pos: SectionPos,
         epoch: u32,
         token: ClaimToken,
-        generator: Arc<SineHills>,
+        generator: Generator,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
         tables: Arc<HotTables>,
     },
@@ -227,9 +229,10 @@ const _: () = assert!(size_of::<Done>() <= 128);
 /// allocating vertex and index buckets from scratch for every job.
 // The box is intentional: besides being recycled with the geometry, it keeps
 // `Done::Mesh` pointer-sized instead of inflating every result-channel message.
-// 64: enough for every worker of a 12-thread pool to hold one buffer with a
-// frame's worth queued behind the byte-budgeted upload drain.
-static MESH_OUTPUT_POOL: BoundedPool<Box<ChunkMeshData>> = BoundedPool::new(64);
+// Cover the upload backlog plus in-flight workers so a drain stall does not
+// force workers to allocate mesh buffers from zero.
+static MESH_OUTPUT_POOL: BoundedPool<Box<ChunkMeshData>> =
+    BoundedPool::new(super::UPLOAD_QUEUE_MAX + 12 + 16);
 
 /// A pooled `Box<ChunkMeshData>`: taken from [`MESH_OUTPUT_POOL`] at job start
 /// (workers), returned on drop wherever the result dies (upload or stale
@@ -365,6 +368,32 @@ impl ViewGate {
         let prev_radius = self.radius.swap(radius, Ordering::Relaxed);
         if prev_center != packed || prev_radius != radius {
             self.epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Load-first publish: skip atomic stores when the snapshot is unchanged.
+    fn publish(&self, cx: i32, cz: i32, radius: i32, far_m: f64, vel_x: f64, vel_z: f64) {
+        let packed = ((cx as u32 as u64) << 32) | (cz as u32 as u64);
+        let far_bits = far_m.to_bits();
+        let vx = vel_x.to_bits();
+        let vz = vel_z.to_bits();
+        let same_center = self.center.load(Ordering::Relaxed) == packed
+            && self.radius.load(Ordering::Relaxed) == radius;
+        let same_far = self.far_m.load(Ordering::Relaxed) == far_bits;
+        let same_vel = self.vel_x.load(Ordering::Relaxed) == vx
+            && self.vel_z.load(Ordering::Relaxed) == vz;
+        if same_center && same_far && same_vel {
+            return;
+        }
+        if !same_vel {
+            self.vel_x.store(vx, Ordering::Relaxed);
+            self.vel_z.store(vz, Ordering::Relaxed);
+        }
+        if !same_far {
+            self.far_m.store(far_bits, Ordering::Relaxed);
+        }
+        if !same_center {
+            self.set(cx, cz, radius);
         }
     }
 
@@ -821,10 +850,7 @@ impl Workers {
         vel_x: f64,
         vel_z: f64,
     ) {
-        // Publish every matching field before `set` releases the new epoch.
-        self.view.set_velocity(vel_x, vel_z);
-        self.view.set_far(far_m);
-        self.view.set(cx, cz, radius);
+        self.view.publish(cx, cz, radius, far_m, vel_x, vel_z);
     }
 
     /// Park/unpark workers to match the world's current effort signal. Both
@@ -1126,16 +1152,12 @@ mod tests {
     use voxel_engine::Pass;
 
     /// Mirrors `World::new`'s generator construction.
-    fn generator(seed: i64) -> Arc<SineHills> {
-        Arc::new(SineHills::new(
-            &mut BlockRegistry::with_builtins(),
-            20.0,
-            seed,
-        ))
+    fn generator(seed: i64) -> Generator {
+        crate::world::diffusion::classic(&mut BlockRegistry::with_builtins(), seed)
     }
 
     /// Create a far section job tagged by id for scheduler tests.
-    fn section_job(terrain: &Arc<SineHills>, id: i32) -> Job {
+    fn section_job(terrain: &Generator, id: i32) -> Job {
         Job::Section {
             pos: SectionPos {
                 detail: voxel_engine::Detail(2),

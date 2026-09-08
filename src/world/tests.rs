@@ -286,6 +286,7 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         state: MeshState::Air,
         rev: 0,
         connectivity: None,
+        visible: true,
         light: None,
     }
 }

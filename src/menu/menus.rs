@@ -107,34 +107,58 @@ impl Menu for MainMenu {
 
 // Mods menu.
 
-/// One toggle row per installed mod.
+/// One toggle row per installed mod, plus knobs for mods that have them.
 pub struct ModsMenu;
 
-impl Menu for ModsMenu {
-    type Action = usize;
+#[derive(Clone, Copy)]
+pub enum ModsAction {
+    Toggle(usize),
+    Knob { mod_index: usize, knob: usize },
+}
 
-    fn view(&self, ctx: &Ctx) -> View<usize> {
-        let rows = ctx
-            .mods
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                Row::value(m.name.clone(), ValueView::Toggle(m.enabled), i).detail(m.description.clone())
-            })
-            .collect();
+impl Menu for ModsMenu {
+    type Action = ModsAction;
+
+    fn view(&self, ctx: &Ctx) -> View<ModsAction> {
+        let mut rows = Vec::new();
+        for (i, m) in ctx.mods.iter().enumerate() {
+            rows.push(
+                Row::value(m.name.clone(), ValueView::Toggle(m.enabled), ModsAction::Toggle(i))
+                    .detail(m.description.clone()),
+            );
+            if m.enabled {
+                for (k, (label, value)) in m.knobs.iter().enumerate() {
+                    rows.push(Row::value(
+                        format!("  {label}"),
+                        ValueView::Choice(value.clone()),
+                        ModsAction::Knob { mod_index: i, knob: k },
+                    ));
+                }
+            }
+        }
         View {
             title: "MODS".to_string(),
             style: Style::Panel,
             rows,
             default: None,
-            hint: "Enter/Space toggle   Esc back".to_string(),
+            hint: "Enter toggle   Left/Right tune   Esc back".to_string(),
             notice: None,
         }
     }
 
-    fn update(&mut self, msg: Msg<usize>, _ctx: &mut Ctx) -> Command {
+    fn update(&mut self, msg: Msg<ModsAction>, _ctx: &mut Ctx) -> Command {
         match msg {
-            Msg::Step(i, _) | Msg::Pick(i) => Command::Effect(AppEffect::ToggleMod(i)),
+            Msg::Step(ModsAction::Toggle(i), _) | Msg::Pick(ModsAction::Toggle(i)) => {
+                Command::Effect(AppEffect::ToggleMod(i))
+            }
+            Msg::Step(ModsAction::Knob { mod_index, knob }, dir) => {
+                Command::Effect(AppEffect::StepModKnob {
+                    mod_index,
+                    knob,
+                    delta: dir.delta(),
+                })
+            }
+            Msg::Pick(ModsAction::Knob { .. }) => Command::Stay,
             Msg::Back => Command::Pop,
             _ => Command::Stay,
         }

@@ -19,9 +19,9 @@ const PAD_VOL: usize = PAD * PAD * PAD;
 /// dropped by workers, so a thread-local pool would strand every returned
 /// buffer on the wrong thread (the capturer's list stays empty and allocates
 /// forever). One bounded SHARED pool completes the ownership round trip;
-/// enough slack for a traversal burst across a 12-worker pool
-/// (64 × 18³ × 2 B ≈ 0.7 MiB per type).
-const POOL_CAP: usize = 64;
+/// enough slack for queued near jobs plus running workers
+/// (96 × 18³ × 2 B ≈ 1.1 MiB per type).
+const POOL_CAP: usize = 96;
 
 /// A bounded cross-thread free list. `take` hands back a retired value or
 /// `None` (the caller allocates fresh — a miss never blocks); `put` keeps a
