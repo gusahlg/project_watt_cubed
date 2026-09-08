@@ -173,11 +173,12 @@ impl<T: Pooled> Neighborhood<T> {
             }
         };
         let mut buf = Self::take_buf(fill);
-        // Missing neighbours must read `fill`, and only present cells are
-        // written below, so a recycled buffer MUST be cleared first (else a
-        // prior job's cells would leak into the unwritten shell — a silent
-        // visual bug).
-        buf.fill(fill);
+        // Recycled buffers hold a prior job's cells. Missing-neighbour holes
+        // stay at `fill` only if we clear first; skip the memset when every
+        // source is present (the loop writes the whole halo).
+        if neigh.iter().any(Option::is_none) {
+            buf.fill(fill);
+        }
         for y in -1..=CS {
             for z in -1..=CS {
                 for x in -1..=CS {
@@ -220,7 +221,9 @@ impl<T: Pooled> Neighborhood<T> {
             }
         };
         let mut buf = Self::take_buf(fill);
-        buf.fill(fill); // same recycled-buffer rule as `capture`
+        if neigh.iter().any(Option::is_none) {
+            buf.fill(fill);
+        }
         for y in -1..=CS {
             let (dy, ly) = split(y);
             for z in -1..=CS {

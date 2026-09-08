@@ -1549,6 +1549,7 @@ mod tests {
     /// a payload/regression guard rather than a measured speedup.
     /// 2026-07-19 (12-core box, 4 workers): 26.8k jobs/s pre-layout work;
     /// row-wise capture 30.3k; + stride-walk mesher 48.5k jobs/s.
+    /// 2026-09-08 (4 workers): before 52.8k jobs/s; after stencil/pack/edge-slice 62.3k jobs/s (median of 3).
     #[test]
     #[ignore]
     fn mesh_result_channel_throughput() {
@@ -1570,6 +1571,12 @@ mod tests {
 
         const JOBS: u32 = 4000;
         let workers = Workers::spawn(4);
+        // Spawn publishes a streaming lookahead cap; this probe floods the
+        // pool, so lift it. Does not affect production admission.
+        workers
+            .view
+            .near_queue_cap
+            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
         let start = std::time::Instant::now();
         for i in 0..JOBS {
             assert!(workers.submit(Job::Mesh {
