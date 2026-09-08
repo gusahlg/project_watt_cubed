@@ -12,7 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use voxel_engine::{DVec3, Engine};
+use voxel_engine::DVec3;
 
 use crate::block::crafting::craft_natural;
 use crate::block::registry::BlockId;
@@ -256,7 +256,7 @@ impl Mod for CraftingMod {
         "Craft natural blocks from gathered elements and place them (press C)."
     }
 
-    fn update(&mut self, _eng: &Engine, ctx: &mut ModContext) {
+    fn update(&mut self, ctx: &mut ModContext) {
         self.refresh();
         if ctx.toggle_crafting {
             self.set_open(!self.is_open());

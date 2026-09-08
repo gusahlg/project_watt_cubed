@@ -14,8 +14,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use voxel_engine::Engine;
-
 use crate::block::ElementId;
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
 use crate::ui::{Anchor, HudElement, Panel, Role, Row, PANEL_FONT};
@@ -84,7 +82,7 @@ impl Mod for InventoryMod {
         "The bare-list inventory and a simple view of it (press I to toggle)."
     }
 
-    fn update(&mut self, _eng: &Engine, ctx: &mut ModContext) {
+    fn update(&mut self, ctx: &mut ModContext) {
         if ctx.toggle_inventory {
             let mut ui = self.ui.get();
             ui.inventory_visible = !ui.inventory_visible;

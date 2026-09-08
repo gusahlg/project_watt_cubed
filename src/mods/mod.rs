@@ -17,8 +17,6 @@ pub mod visuals;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use voxel_engine::Engine;
-
 use crate::block::ElementId;
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
@@ -305,8 +303,8 @@ pub trait Mod {
     /// Cadence-controlled logic while enabled (the game's `mod_hz`). Runs
     /// after movement, before rendering; edge inputs accumulated between
     /// ticks are replayed in order without loss.
-    fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
-        let _ = (eng, ctx);
+    fn update(&mut self, ctx: &mut ModContext) {
+        let _ = ctx;
     }
 
     /// A block was broken into these elements. The event the inventory mod listens
@@ -443,10 +441,10 @@ impl Mods {
     }
 
     /// Run every enabled mod's per-frame logic.
-    pub fn update(&mut self, eng: &Engine, ctx: &mut ModContext) {
+    pub fn update(&mut self, ctx: &mut ModContext) {
         for entry in &mut self.entries {
             if entry.enabled {
-                entry.module.update(eng, ctx);
+                entry.module.update(ctx);
             }
         }
     }

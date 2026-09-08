@@ -992,7 +992,7 @@ impl Game {
                     nav_confirm: edges.nav_confirm,
                     placements,
                 };
-                mods.update(eng, &mut ctx);
+                mods.update(&mut ctx);
                 ctx.placements
             };
             // Apply after each event frame so repeated placements observe the
