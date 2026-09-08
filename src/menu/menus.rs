@@ -1,7 +1,7 @@
 //! The concrete screens as [`Menu`] impls. Each is a small state with a pure
 //! `view` and an `update` that returns a [`Command`]; the App owns the effects.
 use crate::menu::{
-    apply_text_op, parse_port, AppEffect, Command, Ctx, Framed, HostInfo, JoinInfo, Menu, Msg,
+    apply_text_op, parse_port, AppEffect, Command, Ctx, Dir, Framed, HostInfo, JoinInfo, Menu, Msg,
     Notice, Row, Style, ValueView, View, PORT_ERROR,
 };
 use crate::mods::{annotate_setting, VisualMask};
@@ -146,14 +146,22 @@ impl Menu for ModsMenu {
                     .detail(m.description.clone()),
             );
             if m.enabled {
-                for (k, (label, value)) in m.knobs.iter().enumerate() {
+                for (k, (label, value, hint)) in m.knobs.iter().enumerate() {
                     let mut row = Row::value(
                         format!("  {label}"),
                         ValueView::Choice(value.clone()),
                         ModsAction::Knob { mod_index: i, knob: k },
                     );
+                    let mut detail = hint.clone();
                     if m.worldgen {
-                        row = row.detail("next new world");
+                        detail = if detail.is_empty() {
+                            "next new world".to_string()
+                        } else {
+                            format!("{detail} · next new world")
+                        };
+                    }
+                    if !detail.is_empty() {
+                        row = row.detail(detail);
                     }
                     rows.push(row);
                 }
@@ -164,7 +172,7 @@ impl Menu for ModsMenu {
             style: Style::Panel,
             rows,
             default: None,
-            hint: "Enter toggle   Left/Right tune   Esc back".to_string(),
+            hint: "Enter toggle/cycle   Left/Right tune   Esc back".to_string(),
             notice: None,
         }
     }
@@ -181,7 +189,13 @@ impl Menu for ModsMenu {
                     delta: dir.delta(),
                 })
             }
-            Msg::Pick(ModsAction::Knob { .. }) => Command::Stay,
+            Msg::Pick(ModsAction::Knob { mod_index, knob }) => {
+                Command::Effect(AppEffect::StepModKnob {
+                    mod_index,
+                    knob,
+                    delta: Dir::Next.delta(),
+                })
+            }
             Msg::Back => Command::Pop,
             _ => Command::Stay,
         }
@@ -442,4 +456,96 @@ fn prefill<'a>(remembered: &'a str, default: &'a str) -> &'a str {
 /// Constructs a text row from an [`EditBuf`].
 fn text_row<A: Copy>(label: &str, buf: &EditBuf, masked: bool, tag: A) -> Row<A> {
     Row::text(label, buf.text().to_string(), buf.caret_chars(), masked, tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Session;
+    use crate::settings::Settings;
+
+    fn ctx<'a>(settings: &'a mut Settings, session: &'a Session) -> Ctx<'a> {
+        Ctx {
+            settings,
+            saves: &[],
+            mods: &[],
+            session,
+        }
+    }
+
+    #[test]
+    fn enter_on_a_knob_cycles_forward_like_right() {
+        let mut menu = ModsMenu;
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut ctx = ctx(&mut settings, &session);
+        let pick = menu.update(
+            Msg::Pick(ModsAction::Knob {
+                mod_index: 3,
+                knob: 1,
+            }),
+            &mut ctx,
+        );
+        let step = menu.update(
+            Msg::Step(
+                ModsAction::Knob {
+                    mod_index: 3,
+                    knob: 1,
+                },
+                Dir::Next,
+            ),
+            &mut ctx,
+        );
+        match (pick, step) {
+            (
+                Command::Effect(AppEffect::StepModKnob {
+                    mod_index: p_m,
+                    knob: p_k,
+                    delta: p_d,
+                }),
+                Command::Effect(AppEffect::StepModKnob {
+                    mod_index: s_m,
+                    knob: s_k,
+                    delta: s_d,
+                }),
+            ) => {
+                assert_eq!((p_m, p_k, p_d), (s_m, s_k, s_d));
+                assert_eq!(p_d, 1);
+            }
+            _ => panic!("expected StepModKnob from both Enter and Right"),
+        }
+    }
+
+    #[test]
+    fn settings_row_uses_the_same_forced_off_marker_as_gfx() {
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mods = vec![crate::menu::ModRow {
+            name: "Post".into(),
+            description: String::new(),
+            enabled: false,
+            knobs: vec![],
+            visual_group: Some(VisualGroup::Post),
+            worldgen: false,
+        }];
+        let ctx = Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &mods,
+            session: &session,
+        };
+        let view = SettingsPage::new(Category::Video).view(&ctx);
+        let bloom = view
+            .rows
+            .iter()
+            .find(|r| r.label == "Bloom")
+            .expect("bloom row");
+        let marker = crate::mods::forced_off_marker("Post");
+        match &bloom.kind {
+            crate::menu::RowKind::Value(ValueView::Choice(s)) => {
+                assert!(s.contains(&marker), "settings value {s:?} must include {marker}");
+            }
+            _ => panic!("expected annotated choice for a stripped bloom row"),
+        }
+    }
 }

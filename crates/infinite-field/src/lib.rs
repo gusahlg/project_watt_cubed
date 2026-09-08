@@ -24,13 +24,13 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// A compact default: 32² tiles, 50% overlap, 4 phases, 4 channels.
+    /// A compact default: 32² tiles, 50% overlap, 2 phases, 4 channels.
     pub fn new(seed: u64) -> Self {
         Self {
             seed,
             tile: 32,
             stride: 16,
-            phases: 4,
+            phases: 2,
             channels: 4,
         }
     }

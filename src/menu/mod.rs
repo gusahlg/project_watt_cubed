@@ -183,7 +183,8 @@ pub struct ModRow {
     pub name: String,
     pub description: String,
     pub enabled: bool,
-    pub knobs: Vec<(String, String)>,
+    /// `(label, value, hint)` per knob.
+    pub knobs: Vec<(String, String, String)>,
     pub visual_group: Option<VisualGroup>,
     pub worldgen: bool,
 }
@@ -198,7 +199,7 @@ impl ModRow {
                 knobs: mods
                     .knobs(i)
                     .into_iter()
-                    .map(|k| (k.label.to_string(), k.value))
+                    .map(|k| (k.label.to_string(), k.value, k.hint))
                     .collect(),
                 visual_group: mods.visual_group(i),
                 worldgen: mods.is_worldgen(i),
@@ -501,5 +502,31 @@ pub fn apply_text_op(buf: &mut crate::ui::EditBuf, op: TextOp) {
         TextOp::Right => buf.right(),
         TextOp::Home => buf.home(),
         TextOp::End => buf.end(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_on_a_choice_row_steps_forward_like_right() {
+        let view = View {
+            title: String::new(),
+            style: Style::Panel,
+            rows: vec![Row::value("Tile", ValueView::Choice("32".into()), 0)],
+            default: None,
+            hint: String::new(),
+            notice: None,
+        };
+        let mut cursor = Cursor::default();
+        assert_eq!(
+            drive(&[Intent::Confirm], &view, &mut cursor),
+            Some(Msg::Step(0, Dir::Next))
+        );
+        assert_eq!(
+            drive(&[Intent::Adjust(Dir::Next)], &view, &mut cursor),
+            Some(Msg::Step(0, Dir::Next))
+        );
     }
 }

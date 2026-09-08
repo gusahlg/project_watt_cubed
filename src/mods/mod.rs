@@ -23,6 +23,7 @@ use crate::block::ElementId;
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
+use crate::settings::Settings;
 use crate::ui::HudElement;
 use crate::world::diffusion::DiffusionCfg;
 use crate::world::generation::WorldgenKind;
@@ -33,6 +34,8 @@ use crate::world::World;
 pub struct Knob {
     pub label: &'static str,
     pub value: String,
+    /// Allowed range or choice list, shown as the row detail.
+    pub hint: String,
 }
 
 /// Which fancy visual groups are currently enabled.
@@ -54,10 +57,6 @@ impl Default for VisualMask {
 }
 
 impl VisualMask {
-    pub fn from_mods(mods: &Mods) -> Self {
-        mods.visual_mask()
-    }
-
     pub fn apply(self, mut cfg: RenderConfig) -> RenderConfig {
         if !self.atmosphere {
             cfg.strip_group(VisualGroup::Atmosphere);
@@ -69,6 +68,11 @@ impl VisualMask {
             cfg.strip_group(VisualGroup::Lighting);
         }
         cfg
+    }
+
+    /// Settings lanes with this mask's disabled groups stripped.
+    pub fn effective_render(self, settings: &Settings) -> RenderConfig {
+        self.apply(settings.render_config())
     }
 
     /// Name of the visual mod forcing `key` off, if any.
@@ -83,10 +87,16 @@ impl VisualMask {
     }
 }
 
-/// Append `(off: Post mod)` (etc.) when a visual group has stripped the lane.
+/// Marker appended when a visual group has stripped the lane. The settings
+/// menu, `/gfx`, and any HUD that prints lanes share this one string.
+pub fn forced_off_marker(mod_name: &str) -> String {
+    format!("(off: {mod_name} mod)")
+}
+
+/// Append [`forced_off_marker`] when a visual group has stripped the lane.
 pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
     match mask.forced_off(key) {
-        Some(name) => format!("{value} (off: {name} mod)"),
+        Some(name) => format!("{value} {}", forced_off_marker(name)),
         None => value,
     }
 }
@@ -269,6 +279,13 @@ pub struct ModContext<'a> {
 pub trait Mod {
     /// Short, stable name shown in the mod menu and used as a save key.
     fn name(&self) -> &str;
+
+    /// Lowercase-stable code id (env vars, worldgen kind). Equals [`name`]
+    /// unless the menu label is not itself a code identifier — e.g. the
+    /// InfiniteDiffusion display name vs the `diffusion` id.
+    fn id(&self) -> &str {
+        self.name()
+    }
 
     /// One-line description for the mod menu.
     fn description(&self) -> &str {
@@ -503,6 +520,11 @@ impl Mods {
         self.entries[index].module.name()
     }
 
+    /// The code id of the mod at `index`.
+    pub fn id(&self, index: usize) -> &str {
+        self.entries[index].module.id()
+    }
+
     /// The description of the mod at `index`.
     pub fn description(&self, index: usize) -> &str {
         self.entries[index].module.description()
@@ -576,64 +598,34 @@ impl Mods {
         mask
     }
 
-    /// Settings lanes with disabled visual groups stripped.
-    /// Enable or disable a mod by name (no-op if already in that state).
+    /// Enable or disable a mod by id or display name (no-op if already in that state).
     pub fn set_enabled(&mut self, name: &str, on: bool) {
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|e| e.module.name().eq_ignore_ascii_case(name))
-            && self.entries[i].enabled != on
+        if let Some(i) = self.entries.iter().position(|e| {
+            e.module.id().eq_ignore_ascii_case(name) || e.module.name().eq_ignore_ascii_case(name)
+        }) && self.entries[i].enabled != on
         {
             self.toggle(i);
         }
     }
 
-    /// Bench-only env: `WATT_BENCH_WORLDGEN=diffusion` and/or
-    /// `WATT_BENCH_VISUALS=off` so a harness run can pin worldgen and the
-    /// core-renderer look without persisting the mod menu.
-    pub fn apply_bench_env(&mut self) {
-        if let Ok(value) = std::env::var("WATT_BENCH_WORLDGEN") {
-            match parse_bench_worldgen(&value) {
-                Some(true) => self.set_enabled("InfiniteDiffusion", true),
-                Some(false) => self.set_enabled("InfiniteDiffusion", false),
-                None => eprintln!(
-                    "WATT_BENCH_WORLDGEN={value:?} not recognized; use classic|diffusion"
-                ),
-            }
+    /// Apply pins parsed by [`crate::benchmark::Benchmark::mod_pins_from_env`].
+    pub fn apply_bench_env(&mut self, worldgen_diffusion: Option<bool>, visuals_core: Option<bool>) {
+        match worldgen_diffusion {
+            Some(true) => self.set_enabled(WorldgenKind::Diffusion.id(), true),
+            Some(false) => self.set_enabled(WorldgenKind::Diffusion.id(), false),
+            None => {}
         }
-        if let Ok(value) = std::env::var("WATT_BENCH_VISUALS") {
-            match parse_bench_visuals(&value) {
-                Some(true) => {
-                    self.set_enabled("Atmosphere", false);
-                    self.set_enabled("Post", false);
-                    self.set_enabled("Lighting", false);
-                }
-                Some(false) => {}
-                None => eprintln!(
-                    "WATT_BENCH_VISUALS={value:?} not recognized; use off|core|on|full"
-                ),
-            }
+        if visuals_core == Some(true) {
+            self.set_enabled("Atmosphere", false);
+            self.set_enabled("Post", false);
+            self.set_enabled("Lighting", false);
         }
     }
 
-    pub fn mask_render(&self, mut cfg: RenderConfig) -> RenderConfig {
-        let mut on = [false; 3];
-        for entry in self.entries.iter().filter(|e| e.enabled) {
-            if let Some(g) = entry.module.visual_group() {
-                on[g as usize] = true;
-            }
-        }
-        if !on[VisualGroup::Atmosphere as usize] {
-            cfg.strip_group(VisualGroup::Atmosphere);
-        }
-        if !on[VisualGroup::Post as usize] {
-            cfg.strip_group(VisualGroup::Post);
-        }
-        if !on[VisualGroup::Lighting as usize] {
-            cfg.strip_group(VisualGroup::Lighting);
-        }
-        cfg
+    /// Settings lanes with disabled visual groups stripped. The one
+    /// composition world construction, `/gfx` apply, and the engine flags share.
+    pub fn effective_render(&self, settings: &Settings) -> RenderConfig {
+        self.visual_mask().effective_render(settings)
     }
 
     /// Persistent state of every mod that has any, as `(name, data)` lines.
@@ -654,24 +646,6 @@ impl Mods {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.module.name() == name) {
             entry.module.load_state(data, world);
         }
-    }
-}
-
-/// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
-fn parse_bench_worldgen(value: &str) -> Option<bool> {
-    match value {
-        "diffusion" => Some(true),
-        "classic" => Some(false),
-        _ => None,
-    }
-}
-
-/// `Some(true)` strips the visual mods (core look); `Some(false)` leaves them on.
-fn parse_bench_visuals(value: &str) -> Option<bool> {
-    match value {
-        "off" | "core" => Some(true),
-        "on" | "full" => Some(false),
-        _ => None,
     }
 }
 
@@ -733,20 +707,24 @@ mod tests {
     }
 
     #[test]
-    fn mask_render_strips_disabled_visual_groups() {
+    fn effective_render_strips_disabled_visual_groups() {
         let mut mods = Mods::with_defaults();
         mods.set_enabled("Atmosphere", false);
         mods.set_enabled("Post", false);
         mods.set_enabled("Lighting", false);
-        let stripped = mods.mask_render(RenderConfig::default());
+        let settings = Settings::default();
+        let stripped = mods.effective_render(&settings);
         assert!(!stripped.clouds);
         assert!(!stripped.bloom);
         assert!(!stripped.shadows);
         assert!(stripped.sunlight);
-        let full = Mods::with_defaults().mask_render(RenderConfig::default());
-        assert!(full.clouds);
-        assert!(full.bloom);
-        assert!(full.shadows);
+        let full = Mods::with_defaults().effective_render(&settings);
+        assert_eq!(full.clouds, settings.clouds);
+        assert_eq!(full.bloom, settings.bloom);
+        assert_eq!(full.shadows, settings.shadows);
+        let via_mask = mods.visual_mask().effective_render(&settings);
+        assert!(!via_mask.clouds && !via_mask.bloom && !via_mask.shadows);
+        assert_eq!(via_mask.sunlight, stripped.sunlight);
     }
 
     #[test]
@@ -754,37 +732,46 @@ mod tests {
         let mut mods = Mods::with_defaults();
         mods.set_enabled("Post", false);
         let mask = mods.visual_mask();
+        assert_eq!(forced_off_marker("Post"), "(off: Post mod)");
         assert_eq!(
             annotate_setting("On".to_string(), "bloom", mask),
-            "On (off: Post mod)"
+            format!("On {}", forced_off_marker("Post"))
         );
         assert_eq!(annotate_setting("On".to_string(), "shadows", mask), "On");
         mods.set_enabled("Lighting", false);
         let mask = mods.visual_mask();
         assert_eq!(
             annotate_setting("On".to_string(), "shadows", mask),
-            "On (off: Lighting mod)"
+            format!("On {}", forced_off_marker("Lighting"))
         );
     }
 
     #[test]
-    fn set_enabled_matches_display_name_case_insensitively() {
+    fn set_enabled_matches_id_and_display_name_case_insensitively() {
         let mut mods = Mods::with_defaults();
-        mods.set_enabled("infinitediffusion", true);
+        let i = (0..mods.len())
+            .find(|&i| mods.id(i) == WorldgenKind::Diffusion.id())
+            .expect("InfiniteDiffusion is installed");
+        assert_eq!(mods.name(i), "InfiniteDiffusion");
+        assert_ne!(mods.id(i), mods.name(i));
+        mods.set_enabled("diffusion", true);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
-        mods.set_enabled("INFINITEDiffusion", false);
+        mods.set_enabled("infinitediffusion", false);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        mods.set_enabled("INFINITEDiffusion", true);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
     }
 
     #[test]
-    fn bench_env_accepted_values() {
-        assert_eq!(parse_bench_worldgen("diffusion"), Some(true));
-        assert_eq!(parse_bench_worldgen("classic"), Some(false));
-        assert_eq!(parse_bench_worldgen("Diffusion"), None);
-        assert_eq!(parse_bench_visuals("off"), Some(true));
-        assert_eq!(parse_bench_visuals("core"), Some(true));
-        assert_eq!(parse_bench_visuals("on"), Some(false));
-        assert_eq!(parse_bench_visuals("full"), Some(false));
-        assert_eq!(parse_bench_visuals("pretty"), None);
+    fn apply_bench_env_pins_worldgen_and_visuals() {
+        let mut mods = Mods::with_defaults();
+        mods.apply_bench_env(Some(true), Some(true));
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+        let mask = mods.visual_mask();
+        assert!(!mask.atmosphere && !mask.post && !mask.lighting);
+        mods.apply_bench_env(Some(false), Some(false));
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        let mask = mods.visual_mask();
+        assert!(!mask.atmosphere && !mask.post && !mask.lighting);
     }
 }

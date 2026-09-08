@@ -391,7 +391,7 @@ impl Game {
     pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
         let mod_ui_was_active = self.mod_ui_active();
         settings.apply(eng);
-        let render = self.visual_mask.apply(settings.render_config());
+        let render = self.visual_mask.effective_render(settings);
         eng.set_flags(render.engine_flags());
         // View volume BEFORE the render config: the far ladder's `unit`
         // tracks the full-res radius, so the transition detector must see the

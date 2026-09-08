@@ -386,6 +386,7 @@ fn fmt_pos(p: DVec3) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mods::forced_off_marker;
 
     fn player() -> Player {
         Player::new(DVec3::new(0.0, 0.0, 0.0))
@@ -533,7 +534,7 @@ mod tests {
         let out = execute_with_visuals("gfx", &mut p, &mut w, &mut s, &mut sky, mask);
         let text = joined(&out);
         assert!(
-            text.contains("bloom on (off: Post mod)"),
+            text.contains(&format!("bloom on {}", forced_off_marker("Post"))),
             "effective /gfx must name the stripping mod: {text}"
         );
         assert!(
@@ -542,7 +543,7 @@ mod tests {
         );
         let set = execute_with_visuals("gfx bloom off", &mut p, &mut w, &mut s, &mut sky, mask);
         assert!(
-            joined(&set).contains("bloom off (off: Post mod)"),
+            joined(&set).contains(&format!("bloom off {}", forced_off_marker("Post"))),
             "a set confirmation must also show the strip: {}",
             joined(&set)
         );

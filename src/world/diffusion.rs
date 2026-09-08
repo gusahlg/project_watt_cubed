@@ -39,13 +39,45 @@ impl Default for DiffusionCfg {
 }
 
 impl DiffusionCfg {
+    /// Tile sizes the knob stepper cycles. [`clamp`](Self::clamp) snaps here.
+    pub const TILES: [u32; 3] = [16, 32, 64];
+    pub const MIN_STRIDE: u32 = 8;
+    pub const STRIDE_STEP: u32 = 8;
+    pub const PHASES_MIN: u32 = 2;
+    pub const PHASES_MAX: u32 = 8;
+    /// Relief values the knob stepper cycles. [`clamp`](Self::clamp) snaps here.
+    pub const RELIEFS: [f32; 5] = [0.5, 1.0, 1.5, 2.0, 4.0];
+
     pub fn clamp(mut self) -> Self {
-        self.tile = self.tile.clamp(16, 64);
-        self.stride = self.stride.clamp(8, self.tile);
-        self.phases = self.phases.clamp(2, 8);
-        self.relief = self.relief.clamp(0.25, 4.0);
+        self.tile = snap_u32(&Self::TILES, self.tile);
+        self.stride = snap_stride(self.stride, self.tile);
+        self.phases = self.phases.clamp(Self::PHASES_MIN, Self::PHASES_MAX);
+        self.relief = snap_f32(&Self::RELIEFS, self.relief);
         self
     }
+}
+
+fn snap_u32(list: &[u32], v: u32) -> u32 {
+    list.iter()
+        .copied()
+        .min_by_key(|&c| c.abs_diff(v))
+        .unwrap_or(v)
+}
+
+fn snap_stride(stride: u32, tile: u32) -> u32 {
+    let lo = DiffusionCfg::MIN_STRIDE;
+    let hi = tile.max(lo);
+    let v = stride.clamp(lo, hi);
+    let step = DiffusionCfg::STRIDE_STEP;
+    let snapped = ((v + step / 2) / step) * step;
+    snapped.clamp(lo, hi)
+}
+
+fn snap_f32(list: &[f32], v: f32) -> f32 {
+    list.iter()
+        .copied()
+        .min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
+        .unwrap_or(v)
 }
 
 struct TerrainScore {
@@ -391,6 +423,52 @@ mod tests {
         assert_eq!(cfg.stride, 64);
         assert_eq!(cfg.phases, 2);
         assert_eq!(cfg.relief, 4.0);
+    }
+
+    #[test]
+    fn clamp_snaps_to_values_the_knob_stepper_can_display() {
+        let cfg = DiffusionCfg {
+            tile: 48,
+            stride: 12,
+            phases: 1,
+            relief: 0.25,
+        }
+        .clamp();
+        assert!(
+            DiffusionCfg::TILES.contains(&cfg.tile),
+            "tile {} not in {:?}",
+            cfg.tile,
+            DiffusionCfg::TILES
+        );
+        assert_eq!(cfg.stride % DiffusionCfg::STRIDE_STEP, 0);
+        assert!(cfg.stride >= DiffusionCfg::MIN_STRIDE && cfg.stride <= cfg.tile);
+        assert!((DiffusionCfg::PHASES_MIN..=DiffusionCfg::PHASES_MAX).contains(&cfg.phases));
+        assert!(
+            DiffusionCfg::RELIEFS
+                .iter()
+                .any(|v| (*v - cfg.relief).abs() < f32::EPSILON),
+            "relief {} not in {:?}",
+            cfg.relief,
+            DiffusionCfg::RELIEFS
+        );
+    }
+
+    #[test]
+    fn default_matches_spec_new_and_is_stepper_reachable() {
+        let cfg = DiffusionCfg::default();
+        let spec = Spec::new(0);
+        assert_eq!(cfg.tile, spec.tile);
+        assert_eq!(cfg.stride, spec.stride);
+        assert_eq!(cfg.phases, spec.phases);
+        assert!(DiffusionCfg::TILES.contains(&cfg.tile));
+        assert_eq!(cfg.stride % DiffusionCfg::STRIDE_STEP, 0);
+        assert!((DiffusionCfg::PHASES_MIN..=DiffusionCfg::PHASES_MAX).contains(&cfg.phases));
+        assert!(
+            DiffusionCfg::RELIEFS
+                .iter()
+                .any(|v| (*v - cfg.relief).abs() < f32::EPSILON)
+        );
+        assert_eq!(cfg.clamp(), cfg);
     }
 
     #[test]

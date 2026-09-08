@@ -106,6 +106,10 @@ The harness performs at least a three-second warmup and then waits for `World::e
 
 Set `WATT_BENCH_OUTPUT=benchmarks/results.jsonl` to append the JSON record. `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, and `WATT_BENCH_TAG` control the minimum warmup, readiness ceiling, and run label. On a multi-GPU machine where renderer selection is ambiguous without the window surface, set `WATT_BENCH_GPU` to the observed renderer device; the report records that it was an explicit override rather than silently guessing.
 
+- `WATT_BENCH_MOVE`: +X flight speed in m/s (default 0, static camera).
+- `WATT_BENCH_WORLDGEN`: `classic` or `diffusion`; pins worldgen without persisting the mod menu.
+- `WATT_BENCH_VISUALS`: `off`/`core` strips Atmosphere/Post/Lighting (core look); `on`/`full` leaves them on.
+
 Use these scenarios:
 
 1. **Minimum target:** `WATT_BENCH_PRESET=minimum`, seed 42, spawn position.

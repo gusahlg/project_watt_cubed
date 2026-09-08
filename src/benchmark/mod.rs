@@ -46,6 +46,15 @@ enum Phase {
     Measuring,
 }
 
+/// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchModPins {
+    /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+    pub worldgen_diffusion: Option<bool>,
+    /// `Some(true)` strips visual mods (core look); `Some(false)` leaves them on.
+    pub visuals_core: Option<bool>,
+}
+
 /// Complete state for one `WATT_BENCH` run.
 pub struct Benchmark {
     duration: Duration,
@@ -57,6 +66,7 @@ pub struct Benchmark {
     move_mps: f64,
     output: Option<PathBuf>,
     tag: Option<String>,
+    visuals_raw: Option<String>,
     phase: Phase,
     warmup_started: Option<Instant>,
     measure_started: Option<Instant>,
@@ -107,6 +117,7 @@ impl Benchmark {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let visuals_raw = std::env::var("WATT_BENCH_VISUALS").ok();
         let reserve = ((duration.ceil() as usize).saturating_mul(25_000)).min(MAX_SAMPLE_RESERVE);
         let now = Instant::now();
         Some(Self {
@@ -117,6 +128,7 @@ impl Benchmark {
             move_mps,
             output,
             tag,
+            visuals_raw,
             phase: Phase::WaitingToStart,
             warmup_started: None,
             measure_started: None,
@@ -133,6 +145,40 @@ impl Benchmark {
             last_rss_poll: now,
             ready_wait_logs: 0,
         })
+    }
+
+    /// The only parser for `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
+    /// Applied even when `WATT_BENCH` itself is unset so a pin-and-play run
+    /// uses the same accepted values as a timed harness run.
+    pub fn mod_pins_from_env() -> BenchModPins {
+        let worldgen_diffusion = match std::env::var("WATT_BENCH_WORLDGEN") {
+            Ok(value) => match parse_bench_worldgen(&value) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    eprintln!(
+                        "WATT_BENCH_WORLDGEN={value:?} not recognized; use classic|diffusion"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let visuals_core = match std::env::var("WATT_BENCH_VISUALS") {
+            Ok(value) => match parse_bench_visuals(&value) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    eprintln!(
+                        "WATT_BENCH_VISUALS={value:?} not recognized; use off|core|on|full"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        BenchModPins {
+            worldgen_diffusion,
+            visuals_core,
+        }
     }
 
     pub fn has_started(&self) -> bool {
@@ -258,7 +304,7 @@ impl Benchmark {
         }
         let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
         let stats = FrameStats::from_samples(&self.samples, wall);
-        let visuals = std::env::var("WATT_BENCH_VISUALS").ok();
+        let visuals = self.visuals_raw.clone();
         let report = Json::object(vec![
             ("schema_version", Json::from(SCHEMA_VERSION)),
             ("kind", Json::from("project_watt_cubed.runtime_benchmark")),
@@ -621,6 +667,24 @@ fn position_json(pos: Option<DVec3>) -> Json {
     })
 }
 
+/// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+fn parse_bench_worldgen(value: &str) -> Option<bool> {
+    match value {
+        "diffusion" => Some(true),
+        "classic" => Some(false),
+        _ => None,
+    }
+}
+
+/// `Some(true)` strips the visual mods (core look); `Some(false)` leaves them on.
+fn parse_bench_visuals(value: &str) -> Option<bool> {
+    match value {
+        "off" | "core" => Some(true),
+        "on" | "full" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_position(raw: &str) -> Option<DVec3> {
     let mut parts = raw.split(',').map(|p| p.trim().parse::<f64>());
     let position = DVec3::new(
@@ -718,6 +782,7 @@ mod tests {
             move_mps: 0.0,
             output: None,
             tag: None,
+            visuals_raw: None,
             phase: Phase::WaitingToStart,
             warmup_started: None,
             measure_started: None,
@@ -758,5 +823,17 @@ mod tests {
         bench.warmup_started = Some(Instant::now() - Duration::from_secs(10));
         assert!(bench.wait_log_due());
         assert!(!bench.wait_log_due());
+    }
+
+    #[test]
+    fn bench_env_accepted_values() {
+        assert_eq!(parse_bench_worldgen("diffusion"), Some(true));
+        assert_eq!(parse_bench_worldgen("classic"), Some(false));
+        assert_eq!(parse_bench_worldgen("Diffusion"), None);
+        assert_eq!(parse_bench_visuals("off"), Some(true));
+        assert_eq!(parse_bench_visuals("core"), Some(true));
+        assert_eq!(parse_bench_visuals("on"), Some(false));
+        assert_eq!(parse_bench_visuals("full"), Some(false));
+        assert_eq!(parse_bench_visuals("pretty"), None);
     }
 }

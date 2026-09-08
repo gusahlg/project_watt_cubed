@@ -110,7 +110,8 @@ impl ActiveSlot {
 impl App {
     pub fn new() -> Self {
         let mut mods = Mods::with_defaults();
-        mods.apply_bench_env();
+        let pins = Benchmark::mod_pins_from_env();
+        mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
         let saves = save::list();
         let mut settings = Settings::load();
         let session = Session::load();
@@ -176,10 +177,8 @@ impl App {
             render_scale: app.settings.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
-            // Engine-side render lanes from the persisted settings (the single
-            // source; the world's own occlusion/lod2 lanes come from the same
-            // `Settings::render_config` at world entry).
-            flags: app.settings.render_config().engine_flags(),
+            // Engine-side render lanes from the effective (mod-masked) config.
+            flags: app.mods.effective_render(&app.settings).engine_flags(),
         };
         voxel_engine::run(config, move |eng| app.frame(eng));
     }
@@ -341,6 +340,7 @@ impl App {
         }
         // Apply every frame for immediate feedback and to show hardware clamps.
         self.settings.apply(eng);
+        eng.set_flags(self.mods.effective_render(&self.settings).engine_flags());
         // Persist whenever a step (or a hardware clamp) moved a value.
         if self.settings != before {
             self.settings.save();
@@ -448,7 +448,7 @@ impl App {
         // `enter_game`; streaming fills the remainder asynchronously.
         let world = World::with_kind_cfg(
             conn.seed(),
-            self.mods.mask_render(self.settings.render_config()),
+            self.mods.effective_render(&self.settings),
             conn.worldgen(),
             conn.diffusion(),
             false,
@@ -481,7 +481,7 @@ impl App {
         // spawn slab — the previous eager default-volume generation is avoided.
         let world = World::with_kind_cfg(
             seed,
-            self.mods.mask_render(self.settings.render_config()),
+            self.mods.effective_render(&self.settings),
             self.mods.worldgen_kind(),
             self.mods.diffusion_cfg(),
             false,
@@ -514,7 +514,7 @@ impl App {
             Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
         };
         self.mods.reset_state();
-        let render = self.mods.mask_render(self.settings.render_config());
+        let render = self.mods.effective_render(&self.settings);
         match save::load(&id, &mut self.mods, |seed, kind, cfg| {
             // The save header names the generator; the InfiniteDiffusion mod's
             // enabled flag only chooses the next *new* world.
@@ -542,8 +542,8 @@ impl App {
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
         // World-construction lanes apply on entry only, before streaming spins;
         // everything live-applicable goes through the same path `/gfx` uses.
-        let render = self.mods.mask_render(self.settings.render_config());
-        game.set_visual_mask(crate::mods::VisualMask::from_mods(&self.mods));
+        let render = self.mods.effective_render(&self.settings);
+        game.set_visual_mask(self.mods.visual_mask());
         game.world_mut()
             .set_render_lanes(render.occlusion, render.lod2);
         game.apply_settings(eng, &mut self.settings);
