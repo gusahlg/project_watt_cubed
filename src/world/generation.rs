@@ -31,6 +31,23 @@ use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
+/// Ground height per cell of a 16×16 chunk column — identical to [`TerrainGenerator::height`].
+pub type ColumnHeights = [i32; CHUNK_SIZE * CHUNK_SIZE];
+
+/// Sample [`TerrainGenerator::height`] across a chunk column. Used by the
+/// default [`TerrainGenerator::generate_column`] (test gens that do not batch).
+fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i32, cz: i32) -> ColumnHeights {
+    let x0 = cx * CHUNK_SIZE as i32;
+    let z0 = cz * CHUNK_SIZE as i32;
+    let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            heights[lx + lz * CHUNK_SIZE] = g.height(x0 + lx as i32, z0 + lz as i32);
+        }
+    }
+    heights
+}
+
 /// Which generator a world is built with. Folded into the content fingerprint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum WorldgenKind {
@@ -116,9 +133,19 @@ pub trait TerrainGenerator: Send + Sync {
         ChunkData::from_cells(cells)
     }
 
-    /// Generate vertical run of chunks; default loops per-chunk; Terrain batches.
-    fn generate_column(&self, cx: i32, cz: i32, cy: RangeInclusive<i32>) -> Vec<(i32, ChunkData)> {
-        cy.map(|cyy| (cyy, self.generate(cx, cyy, cz))).collect()
+    /// Generate a vertical run of chunks together with the column's 256 ground
+    /// heights (identical to [`height`](Self::height) at each cell). Heights
+    /// are produced even when `cy` is empty — the profile sample does not
+    /// depend on the chunk layers. Default loops per-chunk; Terrain and
+    /// Diffusion batch the profile.
+    fn generate_column(
+        &self,
+        cx: i32,
+        cz: i32,
+        cy: RangeInclusive<i32>,
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+        let chunks = cy.map(|cyy| (cyy, self.generate(cx, cyy, cz))).collect();
+        (chunks, sample_column_heights(self, cx, cz))
     }
 }
 
@@ -1336,30 +1363,41 @@ impl TerrainGenerator for Terrain {
     /// Column job cost (64 surface columns × 9 layers, `--release`):
     /// 0.924 ms/column before the reuse pass, 0.882 ms/column after
     /// (overhang column cache, cached surface kind/dress, carve-dormancy memo).
-    fn generate_column(&self, cx: i32, cz: i32, cy: RangeInclusive<i32>) -> Vec<(i32, ChunkData)> {
+    fn generate_column(
+        &self,
+        cx: i32,
+        cz: i32,
+        cy: RangeInclusive<i32>,
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
         let (x0, z0) = (cx * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32);
         let (profiles, h_min, h_max, w_min, w_max) = self.column_profiles(x0, z0);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for (i, p) in profiles.iter().enumerate() {
+            heights[i] = p.height;
+        }
         let cy_lo = *cy.start();
         let n = (*cy.end() as i64 - cy_lo as i64 + 3).max(0) as usize;
         let mut carve_dorm = vec![None; n];
         let base = cy_lo - 1;
-        cy.map(|cyy| {
-            (
-                cyy,
-                self.fill_chunk(
-                    x0,
-                    z0,
+        let chunks = cy
+            .map(|cyy| {
+                (
                     cyy,
-                    &profiles,
-                    h_min,
-                    h_max,
-                    w_min,
-                    w_max,
-                    Some((base, &mut carve_dorm)),
-                ),
-            )
-        })
-        .collect()
+                    self.fill_chunk(
+                        x0,
+                        z0,
+                        cyy,
+                        &profiles,
+                        h_min,
+                        h_max,
+                        w_min,
+                        w_max,
+                        Some((base, &mut carve_dorm)),
+                    ),
+                )
+            })
+            .collect();
+        (chunks, heights)
     }
 }
 
@@ -1556,6 +1594,30 @@ impl Terrain {
 }
 
 #[cfg(test)]
+pub(in crate::world) fn assert_generate_column_heights_match_height(
+    g: &impl TerrainGenerator,
+    cols: &[(i32, i32)],
+) {
+    for &(cx, cz) in cols {
+        let (_, heights) = g.generate_column(cx, cz, 0..=0);
+        let (_, empty) = g.generate_column(cx, cz, 1..=0);
+        let x0 = cx * CHUNK_SIZE as i32;
+        let z0 = cz * CHUNK_SIZE as i32;
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let i = lx + lz * CHUNK_SIZE;
+                assert_eq!(
+                    heights[i],
+                    g.height(x0 + lx as i32, z0 + lz as i32),
+                    "cx={cx} cz={cz} lx={lx} lz={lz}"
+                );
+                assert_eq!(empty[i], heights[i], "empty cy still reports height cx={cx} cz={cz}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod generate_column_tests {
     use super::*;
 
@@ -1567,12 +1629,20 @@ mod generate_column_tests {
         for (cx, cz) in [(0, 0), (2, -3), (-1, 7), (0, -4)] {
             let cy_lo = -3;
             let cy_hi = 5;
-            let column = g.generate_column(cx, cz, cy_lo..=cy_hi);
+            let (column, _) = g.generate_column(cx, cz, cy_lo..=cy_hi);
             assert_eq!(column.len() as i32, cy_hi - cy_lo + 1);
             for (cy, data) in column {
                 assert_eq!(data, g.generate(cx, cy, cz), "chunk ({cx}, {cy}, {cz})");
             }
         }
+    }
+
+    /// Heights returned with the column equal [`TerrainGenerator::height`] at
+    /// every cell — the skylight ceiling must not drift from the walkable ground.
+    #[test]
+    fn generate_column_heights_match_height() {
+        let g = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 7);
+        super::assert_generate_column_heights_match_height(&g, &[(0, 0), (2, -3), (-1, 7), (4, 4)]);
     }
 
     /// Column job cost: 64 surface columns × 9 layers. Ignored timing gauge.

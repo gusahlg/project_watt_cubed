@@ -7,7 +7,7 @@ use std::sync::Arc;
 use infinite_field::{InfiniteField, Score, Spec};
 
 use super::chunk::{CHUNK_SIZE, ChunkData};
-use super::generation::{cell_hash, TerrainGenerator};
+use super::generation::{cell_hash, ColumnHeights, TerrainGenerator};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
@@ -278,6 +278,7 @@ impl TerrainGenerator for DiffusionTerrain {
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         self.generate_column(cx, cz, cy..=cy)
+            .0
             .into_iter()
             .next()
             .map(|(_, data)| data)
@@ -289,7 +290,7 @@ impl TerrainGenerator for DiffusionTerrain {
         cx: i32,
         cz: i32,
         cy: std::ops::RangeInclusive<i32>,
-    ) -> Vec<(i32, ChunkData)> {
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
         let x0 = cx * CHUNK_SIZE as i32;
         let z0 = cz * CHUNK_SIZE as i32;
         let mut cols = [[Col {
@@ -304,40 +305,45 @@ impl TerrainGenerator for DiffusionTerrain {
                 cols[lz][lx] = self.column(x0 + lx as i32, z0 + lz as i32);
             }
         }
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         let mut max_top = i32::MIN;
         let mut min_h = i32::MAX;
-        for row in &cols {
-            for c in row {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let c = &cols[lz][lx];
+                heights[lx + lz * CHUNK_SIZE] = c.height;
                 max_top = max_top.max(c.height.max(c.water));
                 min_h = min_h.min(c.height);
             }
         }
         let deep_cut = min_h - self.mat.max_scattered_depth.max(48);
-        cy.map(|cyy| {
-            let y0 = cyy * CHUNK_SIZE as i32;
-            let y1 = y0 + CHUNK_SIZE as i32;
-            if y0 >= max_top {
-                return (cyy, ChunkData::Uniform(AIR));
-            }
-            if y1 <= deep_cut {
-                return (cyy, ChunkData::Uniform(self.mat.stone));
-            }
-            let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
-            for lz in 0..CHUNK_SIZE {
-                for lx in 0..CHUNK_SIZE {
-                    let c = &cols[lz][lx];
-                    let wx = x0 + lx as i32;
-                    let wz = z0 + lz as i32;
-                    for ly in 0..CHUNK_SIZE {
-                        let wy = y0 + ly as i32;
-                        cells[super::chunk::Chunk::index(lx, ly, lz)] =
-                            self.cell(c, wx, wy, wz);
+        let chunks = cy
+            .map(|cyy| {
+                let y0 = cyy * CHUNK_SIZE as i32;
+                let y1 = y0 + CHUNK_SIZE as i32;
+                if y0 >= max_top {
+                    return (cyy, ChunkData::Uniform(AIR));
+                }
+                if y1 <= deep_cut {
+                    return (cyy, ChunkData::Uniform(self.mat.stone));
+                }
+                let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let c = &cols[lz][lx];
+                        let wx = x0 + lx as i32;
+                        let wz = z0 + lz as i32;
+                        for ly in 0..CHUNK_SIZE {
+                            let wy = y0 + ly as i32;
+                            cells[super::chunk::Chunk::index(lx, ly, lz)] =
+                                self.cell(c, wx, wy, wz);
+                        }
                     }
                 }
-            }
-            (cyy, ChunkData::from_cells(cells))
-        })
-        .collect()
+                (cyy, ChunkData::from_cells(cells))
+            })
+            .collect();
+        (chunks, heights)
     }
 }
 
@@ -390,8 +396,17 @@ mod tests {
     fn generate_matches_generate_column() {
         let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 3);
         let a = g.generate(1, 0, -2);
-        let b = g.generate_column(1, -2, 0..=0);
+        let (b, _) = g.generate_column(1, -2, 0..=0);
         assert_eq!(a, b[0].1);
+    }
+
+    #[test]
+    fn generate_column_heights_match_height() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 7);
+        super::super::generation::assert_generate_column_heights_match_height(
+            &g,
+            &[(0, 0), (2, -3), (-1, 7), (4, 4)],
+        );
     }
 
     #[test]
