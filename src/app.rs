@@ -7,7 +7,7 @@
 //! closure to [`voxel_engine::run`], which is the moral equivalent of the old
 //! raylib `while !window_should_close()` loop.
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{Color, DVec3, Engine};
 
@@ -67,6 +67,8 @@ pub struct App {
     /// Gameplay reports facts, this decides sounds. Owns the mic and all
     /// trace-derived state.
     audio: AudioDirector,
+    /// Last stall-detector log, so a hung frame names itself once per window.
+    last_stall_log: Option<Instant>,
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -143,6 +145,7 @@ impl App {
             sound,
             cues,
             audio,
+            last_stall_log: None,
         }
     }
 
@@ -179,12 +182,17 @@ impl App {
             return false;
         }
 
+        let watch = cfg!(debug_assertions) || self.bench.is_some();
+        let t0 = watch.then(Instant::now);
+
         self.sound.service();
 
         if self.bench.is_some() && !self.bench_frame(eng) {
+            self.note_frame_stall(t0, Duration::ZERO);
             return false;
         }
 
+        let t_update = watch.then(Instant::now);
         let quit = match self.screen {
             Screen::Menus(_) => self.update_menus(eng),
             Screen::Playing(_) => {
@@ -192,11 +200,13 @@ impl App {
                 false
             }
         };
+        let update_dt = t_update.map(|t| t.elapsed()).unwrap_or_default();
         if quit {
             if self.bench.is_none() {
                 self.settings.save();
             }
             self.flush_save();
+            self.note_frame_stall(t0, update_dt);
             return false;
         }
         // Force vsync on whenever we're not in a live world (menus, loading):
@@ -210,7 +220,47 @@ impl App {
             eng.set_vsync(want_vsync);
         }
         self.draw(eng);
+        self.note_frame_stall(t0, update_dt);
         true
+    }
+
+    /// If this frame exceeded 250 ms, print `entry_debug` and phase timings
+    /// once per 5 s so the next stall names itself. Debug builds and
+    /// `WATT_BENCH` only.
+    fn note_frame_stall(&mut self, start: Option<Instant>, update_dt: Duration) {
+        let Some(start) = start else {
+            return;
+        };
+        let dt = start.elapsed();
+        if dt < Duration::from_millis(250) {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_stall_log
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.last_stall_log = Some(now);
+        let draw_ms = dt.saturating_sub(update_dt).as_secs_f64() * 1000.0;
+        let update_ms = update_dt.as_secs_f64() * 1000.0;
+        match &self.screen {
+            Screen::Playing(game) => {
+                eprintln!(
+                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms\n  {}\n  {}",
+                    dt.as_millis(),
+                    game.world().entry_debug(),
+                    game.phase_debug()
+                );
+            }
+            Screen::Menus(_) => {
+                eprintln!(
+                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms (menus)",
+                    dt.as_millis()
+                );
+            }
+        }
     }
 
     /// Drive one benchmark frame: enter a reproducible world, wait for both the
@@ -532,7 +582,7 @@ impl App {
             .set_render_lanes(render.occlusion, render.lod2);
         game.apply_settings(eng, &mut self.settings);
         // Saves and servers can place the player far from the pre-generated
-        // origin; make the ground under them real before physics runs.
+        // origin; request the collision slab (physics freezes until it lands).
         let pos = game.player().position;
         game.world_mut().prepare_around(pos);
         game.on_enter(eng, &mut self.router);
@@ -673,8 +723,14 @@ fn fresh_seed() -> i64 {
 /// land on solid ground instead of sinking into an ocean/lake column that
 /// happens to sit at (0, 0). Spirals outward from the origin for the first
 /// column above sea level, mirroring `net::server::spawn_point`.
+///
+/// Classic: up to 512 `height()` probes (~5 ms). Diffusion: 8 rings of 16×16
+/// tiles via [`World::heights_16`], so the field is sampled by rectangle.
 fn spawn_player(world: &World) -> Player {
     let sea = world.sea_level();
+    if world.worldgen_kind() == "diffusion" {
+        return spawn_player_diffusion(world, sea);
+    }
     for r in 0..64 {
         for (dx, dz) in [
             (r, 0),
@@ -695,4 +751,100 @@ fn spawn_player(world: &World) -> Player {
     }
     let h = world.surface_y(0, 0).max(sea);
     Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
+}
+
+fn spawn_player_diffusion(world: &World, sea: i32) -> Player {
+    let mut seen = std::collections::HashSet::new();
+    for r in 0i32..8 {
+        for (dx, dz) in [
+            (r, 0),
+            (0, r),
+            (-r, 0),
+            (0, -r),
+            (r, r),
+            (-r, -r),
+            (r, -r),
+            (-r, r),
+        ] {
+            let cx = (dx * 8).div_euclid(16);
+            let cz = (dz * 8).div_euclid(16);
+            if !seen.insert((cx, cz)) {
+                continue;
+            }
+            let heights = world.heights_16(cx, cz);
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let h = heights[lx + lz * 16];
+                    if h > sea {
+                        let x = cx * 16 + lx as i32;
+                        let z = cz * 16 + lz as i32;
+                        return Player::new(DVec3::new(
+                            x as f64 + 0.5,
+                            h as f64 + 3.0,
+                            z as f64 + 0.5,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let h = world.surface_y(0, 0).max(sea);
+    Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render_config::RenderConfig;
+    use crate::world::diffusion::DiffusionCfg;
+    use crate::world::generation::WorldgenKind;
+
+    #[test]
+    fn spawn_player_sits_above_the_surface() {
+        let world = World::with_config_lazy(7, RenderConfig::default());
+        let p = spawn_player(&world);
+        let ground = world.surface_y(
+            crate::math::block_coord(p.position.x),
+            crate::math::block_coord(p.position.z),
+        );
+        assert!(p.position.y > ground as f64);
+    }
+
+    #[test]
+    fn spawn_player_probe_cost() {
+        use std::hint::black_box;
+        let classic = World::with_kind_cfg(
+            1,
+            RenderConfig::default(),
+            WorldgenKind::Classic,
+            DiffusionCfg::default(),
+            false,
+        );
+        let _ = black_box(spawn_player(&classic));
+        let t = Instant::now();
+        let _ = black_box(spawn_player(&classic));
+        let classic_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let diffusion = World::with_kind_cfg(
+            1,
+            RenderConfig::default(),
+            WorldgenKind::Diffusion,
+            DiffusionCfg::default(),
+            false,
+        );
+        let _ = black_box(spawn_player(&diffusion));
+        let t = Instant::now();
+        let _ = black_box(spawn_player(&diffusion));
+        let diffusion_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        println!("spawn_player classic={classic_ms:.2}ms diffusion={diffusion_ms:.2}ms");
+        assert!(
+            classic_ms < 50.0,
+            "classic spawn probes should be a few ms, got {classic_ms:.2}"
+        );
+        assert!(
+            diffusion_ms < 250.0,
+            "diffusion spawn must stay under a frame, got {diffusion_ms:.2}"
+        );
+    }
 }

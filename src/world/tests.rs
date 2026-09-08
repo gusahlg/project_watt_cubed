@@ -1315,3 +1315,58 @@ fn light_settle_to_identical_grid_reseeds_evicted_mesh_seed() {
     assert!(world.mesh_worklist.contains(&c), "re-seeded: ready chunk restored to the seed set");
     assert!(world.pending_fresh.get(), "re-armed: the fresh scan will pick it up");
 }
+
+#[test]
+fn prepare_around_is_a_request_until_columns_land() {
+    let mut world = World::with_config_lazy(DEFAULT_SEED, RenderConfig::default());
+    let pos = DVec3::new(0.5, 40.0, 0.5);
+    assert!(world.spawn_ready(), "no slab outstanding");
+    world.prepare_around(pos);
+    assert!(!world.spawn_ready(), "jobs are in flight, not yet integrated");
+    let c = World::chunk_of(
+        crate::math::block_coord(pos.x),
+        crate::math::block_coord(pos.y),
+        crate::math::block_coord(pos.z),
+    );
+    assert!(
+        world.generating.iter().any(|g| g.x == c.x && g.z == c.z),
+        "column jobs must be claimed"
+    );
+    world.drive_spawn_ready();
+    assert!(world.spawn_ready());
+    assert!(
+        world.chunks.contains_key(&c),
+        "eye chunk is loaded once the slab lands"
+    );
+}
+
+#[test]
+fn physics_does_not_move_the_player_until_spawn_ready() {
+    let mut world = World::with_config_lazy(DEFAULT_SEED, RenderConfig::default());
+    let pos = DVec3::new(0.5, 80.0, 0.5);
+    world.prepare_around(pos);
+    assert!(!world.spawn_ready());
+    let mut player = crate::player::Player::new(pos);
+    let before = player.position;
+    if world.spawn_ready() {
+        crate::input::movement::update_player(
+            &mut player,
+            &world,
+            &crate::input::movement::MoveInput::default(),
+            0.05,
+        );
+    }
+    assert_eq!(player.position, before, "frozen while the slab is outstanding");
+    world.drive_spawn_ready();
+    assert!(world.spawn_ready());
+    crate::input::movement::update_player(
+        &mut player,
+        &world,
+        &crate::input::movement::MoveInput::default(),
+        0.05,
+    );
+    assert_ne!(
+        player.position, before,
+        "gravity applies once the collision slab has landed"
+    );
+}

@@ -55,6 +55,11 @@ impl World {
         self.generator.height(x, z)
     }
 
+    /// Ground height for every cell of a 16×16 chunk column.
+    pub fn heights_16(&self, cx: i32, cz: i32) -> super::generation::ColumnHeights {
+        self.generator.heights_16(cx, cz)
+    }
+
     /// Sea level, so spawn logic can tell dry land from seabed/ocean columns.
     pub fn sea_level(&self) -> i32 {
         self.generator.sea_level()

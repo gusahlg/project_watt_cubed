@@ -154,7 +154,7 @@ mod tests {
     fn liquid_is_mineable_but_remains_passable() {
         let mut world = World::generate();
         let (x, y, z) = (8, 40, 8);
-        world.prepare_around(DVec3::new(x as f64, y as f64, z as f64));
+        world.ensure_around(DVec3::new(x as f64, y as f64, z as f64));
         let water = world.registry().id_by_name("Water").unwrap();
         world.set_block(x, y, z, water);
         world.set_block(x, y + 1, z, crate::block::AIR);
@@ -178,7 +178,7 @@ mod tests {
         // ~49 at this column), so the ray enters from open air rather than
         // starting inside the ground and tripping the inside-a-block guard.
         let probe = DVec3::new(1.0e8 + 8.5, 40.0, 8.5);
-        world.prepare_around(probe);
+        world.ensure_around(probe);
         let top = world.surface_y(100_000_008, 8) as f64 + 5.0;
         let origin = DVec3::new(1.0e8 + 8.5, top, 8.5);
         let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)

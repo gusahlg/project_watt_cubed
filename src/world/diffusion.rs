@@ -238,6 +238,20 @@ impl TerrainGenerator for DiffusionTerrain {
         self.column(wx, wz).height
     }
 
+    fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
+        let x0 = cx * CHUNK_SIZE as i32;
+        let z0 = cz * CHUNK_SIZE as i32;
+        let mut ch0 = [0.0f32; CHUNK_SIZE * CHUNK_SIZE];
+        self.field
+            .fill_ch0(x0, z0, CHUNK_SIZE as u32, CHUNK_SIZE as u32, &mut ch0);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+            let elev = (ch0[i] * 2.0 - 1.0) * 36.0;
+            heights[i] = (self.sea as f32 + elev).round() as i32;
+        }
+        heights
+    }
+
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
         let c = self.column(wx, wz);
         self.dress(&c, wx, wz)
@@ -407,6 +421,25 @@ mod tests {
             &g,
             &[(0, 0), (2, -3), (-1, 7), (4, 4)],
         );
+    }
+
+    #[test]
+    fn heights_16_matches_height() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 11);
+        for &(cx, cz) in &[(0, 0), (2, -3), (-1, 7)] {
+            let batch = g.heights_16(cx, cz);
+            let x0 = cx * CHUNK_SIZE as i32;
+            let z0 = cz * CHUNK_SIZE as i32;
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    assert_eq!(
+                        batch[lx + lz * CHUNK_SIZE],
+                        g.height(x0 + lx as i32, z0 + lz as i32),
+                        "cx={cx} cz={cz} lx={lx} lz={lz}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

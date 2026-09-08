@@ -82,6 +82,13 @@ pub trait TerrainGenerator: Send + Sync {
     /// Topmost non-ground cell in this column.
     fn height(&self, wx: i32, wz: i32) -> i32;
 
+    /// Ground height for every cell of the 16×16 chunk column at `(cx, cz)`.
+    /// Default walks [`height`](Self::height); Diffusion fills the rectangle
+    /// from the field in one tile load.
+    fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
+        sample_column_heights(self, cx, cz)
+    }
+
     /// Surface block (biome-dependent).
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId;
 
