@@ -542,7 +542,7 @@ impl World {
             // ALL light work is quiescent, any chunk still degraded is owed a
             // remesh that no future light-arrival event will ever deliver (its
             // missing neighbour is already terminal). Promote it to final now.
-            self.flush_degraded_terminal(eng);
+            self.flush_degraded_terminal();
         }
         // LOD2 section far field: skipped entirely when disabled (zero cost). Visible
         // set rebuilt every pass because sections become Ready asynchronously.
@@ -1255,6 +1255,7 @@ impl World {
                 loaded.state.free_owned(eng);
             }
             self.dirty_worklist.remove(&coord);
+            self.light_terminal.remove(&coord);
             // Column refcount: the last chunk out drops the cached ceiling.
             if let Some(count) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
                 *count -= 1;
@@ -1906,6 +1907,7 @@ impl World {
             self.light_gate.degraded.insert(coord);
         } else {
             self.light_gate.degraded.remove(&coord);
+            self.light_terminal.remove(&coord);
         }
     }
 
@@ -1925,12 +1927,13 @@ impl World {
         // the predicates below read the chunk map.
         let mut gate = std::mem::take(&mut self.light_gate);
         gate.degraded.retain(|c| self.chunks.contains_key(c));
+        self.light_terminal.retain(|c| self.chunks.contains_key(c));
         gate.blocked_since
             .retain(|c, _| self.chunk_light_blocked(*c));
         // Safety net: event-driven paths miss degraded chunks whose neighbour
         // light settled without moving the shared border. Sweep them: any now
         // light-ready gets its ASYNC rebuild scheduled (the old mesh keeps
-        // drawing), clearing the degraded flag at the rebuild's submit.
+        // drawing), clearing the degraded flag at the rebuild's claim.
         let relit: Vec<Coord> = gate
             .degraded
             .iter()
@@ -1960,7 +1963,7 @@ impl World {
     /// Event-driven paths miss degraded chunks whose missing neighbour settled
     /// without moving shared border; this sweep promotes them to final at true
     /// rest so entry_complete doesn't hang.
-    fn flush_degraded_terminal(&mut self, eng: &mut Engine) {
+    fn flush_degraded_terminal(&mut self) {
         let quiescent = self.generating.is_empty()
             && self.mesh_worklist.is_empty()
             && self.light_worklist.is_empty()
@@ -1970,24 +1973,23 @@ impl World {
         if !quiescent {
             return;
         }
-        // Promote SETTLED degraded chunks, a few per frame: `remesh_terminal`
-        // is a synchronous main-thread mesh build (milliseconds each), so an
-        // unbudgeted pass over N stuck chunks would be one big hitch. The world
-        // is quiescent here (nothing else re-degrades), so the set drains
-        // monotonically across frames either way; a still-building/Dirty chunk
-        // is left for a later flush once its own path settles it.
-        const TERMINAL_FLUSH_BUDGET: usize = 2;
+        // Promote every SETTLED degraded chunk this frame: a rev bump plus a
+        // worklist seed is microseconds, so there is no per-frame budget. The
+        // world is quiescent (nothing else re-degrades). A still-building/Dirty
+        // chunk is left for a later flush once its own path settles it.
         let stuck: Vec<Coord> = self.light_gate.degraded.iter().copied().collect();
-        let mut promoted = 0usize;
         for coord in stuck {
-            if promoted >= TERMINAL_FLUSH_BUDGET {
-                break;
-            }
             match self.chunks.get(&coord).map(|l| &l.state) {
-                // Settled on a degraded mesh — the stuck case. Promote to final.
-                Some(MeshState::Ready(_) | MeshState::Air) => {
-                    self.remesh_terminal(coord, eng);
-                    promoted += 1;
+                // Nothing to draw: drop the degraded flag.
+                Some(MeshState::Air) => self.mark_degraded(coord, false),
+                // Settled on a degraded mesh — the stuck case. Rebuild async;
+                // if neighbour light is still missing it will never arrive, so
+                // the terminal set makes the snapshot read missing planes dark.
+                Some(MeshState::Ready(_)) => {
+                    if !self.light_ready(coord) {
+                        self.light_terminal.insert(coord);
+                    }
+                    self.remesh_async(coord);
                 }
                 // Unloaded out from under the set between marking and here.
                 None => self.mark_degraded(coord, false),
@@ -1998,22 +2000,6 @@ impl World {
                 Some(MeshState::NeedsMesh { .. } | MeshState::Dirty { .. }) => {}
             }
         }
-    }
-
-    /// Re-mesh degraded chunk at terminal light quiescence, mark final.
-    /// Forces degraded=false: at quiescence, missing planes are settled neighbours'
-    /// real light (possibly dark), so mesh is final.
-    fn remesh_terminal(&mut self, coord: Coord, eng: &mut Engine) {
-        self.refresh_tables();
-        let mut scratch = std::mem::replace(&mut self.scratch, mesh::new_chunk_mesh_data());
-        let tables = self.tables.get();
-        let uniform = self.chunks[&coord].chunk.uniform();
-        let padded = self.capture_padded(coord);
-        self.mark_degraded(coord, false);
-        let light = self.capture_padded_light(coord, false);
-        mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        self.upload_chunk(coord, &scratch, eng);
-        self.scratch = scratch;
     }
 
     /// World-entry completeness predicate: true once, within the view
@@ -2146,7 +2132,7 @@ impl World {
         // Share the one queue-depth source with the harness gauge, so the two
         // can never drift; the gate counters have no gauge field, so stay local.
         let g = self.stream_gauges();
-        let near: [(&str, usize); 8] = [
+        let near: [(&str, usize); 9] = [
             ("generating", g.generating),
             ("mesh_worklist", g.mesh_worklist),
             ("upload_queue", g.upload_queue),
@@ -2154,6 +2140,7 @@ impl World {
             ("light_inflight", g.light_inflight),
             ("light_apply_queue", g.light_apply_queue),
             ("degraded", self.light_gate.degraded.len()),
+            ("terminal", self.light_terminal.len()),
             ("light_blocked", self.light_gate.blocked_since.len()),
         ];
         let pending: Vec<String> = near
@@ -2174,7 +2161,10 @@ impl World {
                         out_box += 1;
                     } else if !self.neighbours_have_data(c) {
                         no_neigh += 1;
-                    } else if self.light_ready(c) || self.light_wait_expired(c) {
+                    } else if self.light_ready(c)
+                        || self.light_wait_expired(c)
+                        || self.light_terminal.contains(&c)
+                    {
                         lit_or_expired += 1;
                     }
                 }
@@ -2207,7 +2197,10 @@ impl World {
                         idle += 1;
                         if !self.neighbours_have_data(c) {
                             idle_no_neigh += 1;
-                        } else if !(self.light_ready(c) || self.light_wait_expired(c)) {
+                        } else if !(self.light_ready(c)
+                            || self.light_wait_expired(c)
+                            || self.light_terminal.contains(&c))
+                        {
                             idle_unlit += 1;
                         }
                     }
@@ -2476,6 +2469,101 @@ mod tests {
         assert!(
             <MeshLane as StreamLane>::ready(&world, c),
             "expired wait admits a degraded mesh even though light never settled"
+        );
+    }
+
+    /// A degraded `Ready` chunk whose neighbour light is permanently missing
+    /// is, at quiescence, rebuilt asynchronously: the drawn mesh is carried,
+    /// the terminal set records that missing planes are settled dark, and
+    /// `MeshLane::submit` snapshots non-degraded. Claim (not submit) drops
+    /// the degraded and terminal marks.
+    #[test]
+    fn degraded_ready_chunk_promotes_through_terminal_async_path() {
+        let mut world = World::generate();
+        let c = ChunkCoord::new(0, 0, 0);
+        world.center = Some(c);
+        let missing = c.step(Face::PosX);
+        for n in std::iter::once(c).chain(Face::ALL.iter().map(|&f| c.step(f))) {
+            let loaded = world.chunks.get_mut(&n).expect("pregenerated");
+            loaded.light = if n == missing {
+                None
+            } else {
+                Some(light::LightGrid::dark())
+            };
+        }
+        let h = voxel_engine::MeshHandle::from_raw_parts(21, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(c, true);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.pending_dirty.take();
+        assert!(!world.light_ready(c), "one neighbour grid is permanently missing");
+
+        world.flush_degraded_terminal();
+
+        let state = &world.chunks[&c].state;
+        assert!(
+            matches!(
+                state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "promoted through the async rebuild: {state:?}"
+        );
+        assert!(world.mesh_worklist.contains(&c), "seeded for the rebuild");
+        assert!(
+            world.light_terminal.contains(&c),
+            "missing neighbour light is terminal"
+        );
+        assert!(
+            world.light_gate.degraded.contains(&c),
+            "degraded flag stays until the rebuild is claimed"
+        );
+        assert!(
+            <MeshLane as StreamLane>::ready(&world, c),
+            "terminal membership admits the rebuild without another light wait"
+        );
+        assert!(
+            !world.pending_dirty.get(),
+            "the sync dirty path is not involved"
+        );
+
+        let job = <MeshLane as StreamLane>::submit(&mut world, c).expect("terminal mesh job");
+        let pipeline::Job::Mesh { snapshot, .. } = job else {
+            panic!("expected a mesh job");
+        };
+        let shell = snapshot.light.expect("lighting on");
+        assert_eq!(
+            shell.at(CHUNK_SIZE as i32, 8, 8),
+            light::Lumel::DARK,
+            "terminal snapshot reads the missing +X neighbour as settled dark"
+        );
+        assert!(
+            world.light_gate.degraded.contains(&c),
+            "submit must not mutate the degraded set"
+        );
+        assert!(
+            world.light_terminal.contains(&c),
+            "submit must not drop the terminal mark (a rejected submit retries)"
+        );
+
+        <MeshLane as StreamLane>::claim(&mut world, c);
+        assert!(
+            !world.light_gate.degraded.contains(&c),
+            "claim marks the snapshot non-degraded"
+        );
+        assert!(
+            world.light_terminal.is_empty(),
+            "claim consumes the terminal mark"
         );
     }
 }

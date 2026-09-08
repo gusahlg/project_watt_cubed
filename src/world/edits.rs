@@ -206,6 +206,7 @@ impl World {
         self.light_inflight.clear();
         self.light_apply_queue.clear();
         self.light_pending.take();
+        self.light_terminal.clear();
         // `light_gate` (degraded/blocked_since) is left untouched on purpose: the
         // per-frame `tick_light_gate` reconciles it against live predicates. With
         // lighting off, `light_ready` is data-only, so blocked timers drain and any
@@ -265,6 +266,7 @@ impl World {
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).
         self.mesh_worklist = self.chunks.keys().copied().collect();
         self.pending_fresh.set();
+        self.light_terminal.clear();
     }
 
     /// Set block at world coord; record in edit overlay and mark chunk(s) for remesh.

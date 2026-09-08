@@ -717,6 +717,12 @@ pub struct World {
     /// of chunks currently showing a degraded (known-not-final) mesh awaiting relight.
     /// Kept in one struct so the feature's footprint on `World` is a single field.
     light_gate: streaming::LightGate,
+    /// Chunks whose missing neighbour light will never arrive, so a mesh
+    /// snapshot must read missing planes as settled dark (not open-sky).
+    light_terminal: FastSet<Coord>,
+    /// Degraded-snapshot flag carried from mesh submit to claim, so a rejected
+    /// submit does not mutate the degraded or terminal sets.
+    mesh_pending_degraded: Option<(Coord, bool)>,
     /// Skylight ceiling per `(x, z)` chunk column — the surface heightmap the
     /// settle pass seeds skylight from. A pure generator function (independent of
     /// y and of edits), so it is computed once per column and reused across every
@@ -999,6 +1005,8 @@ impl World {
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
+            light_terminal: FastSet::default(),
+            mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
             quarantined: FastSet::default(),
             textures_built: 0,
@@ -1795,15 +1803,20 @@ impl StreamLane for MeshLane {
                 .quarantined
                 .contains(&streaming::FailKey::Mesh { coord: key })
             && world.neighbours_have_data(key)
-            && (world.light_ready(key) || world.light_wait_expired(key))
+            // Terminal: missing neighbour light will never arrive; admit now
+            // so the snapshot can read those planes as settled dark.
+            && (world.light_ready(key)
+                || world.light_wait_expired(key)
+                || world.light_terminal.contains(&key))
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         world.refresh_tables();
         // If light isn't ready, mesh degraded with assumed-lit neighbours,
-        // then remesh when real light arrives.
-        let degraded = !world.light_ready(key);
+        // then remesh when real light arrives — unless the chunk is terminal
+        // (missing neighbour light will never arrive: missing planes are dark).
+        let degraded = !world.light_ready(key) && !world.light_terminal.contains(&key);
         let (rev, snapshot) = world.snapshot(key, degraded);
-        world.mark_degraded(key, degraded);
+        world.mesh_pending_degraded = Some((key, degraded));
         Some(pipeline::Job::Mesh {
             coord: key,
             rev,
@@ -1811,6 +1824,21 @@ impl StreamLane for MeshLane {
         })
     }
     fn claim(world: &mut World, key: Coord) {
+        // Apply the snapshot's degraded flag now that the pool has accepted
+        // the job — submit must not mutate lane state (a rejected submit
+        // would otherwise park the chunk in `degraded` with nothing in flight,
+        // or drop a terminal mark that the retry still needs).
+        let degraded = match world.mesh_pending_degraded.take() {
+            Some((coord, degraded)) if coord == key => degraded,
+            pending => {
+                debug_assert!(
+                    pending.is_none(),
+                    "mesh claim for {key:?} with pending for {pending:?}"
+                );
+                !world.light_ready(key) && !world.light_terminal.contains(&key)
+            }
+        };
+        world.mark_degraded(key, degraded);
         // Set the building flag IN PLACE to claim the mesh job — a whole-state
         // overwrite would silently drop a carried `prev` mesh (leaking its GPU
         // handle and blanking the chunk mid-rebuild). Held until upload retires
