@@ -34,6 +34,16 @@ impl World {
         self.generator.kind()
     }
 
+    /// Which generator this world was built with.
+    pub fn worldgen(&self) -> super::generation::WorldgenKind {
+        self.kind
+    }
+
+    /// Diffusion knobs this world was built with (defaults on a classic world).
+    pub fn diffusion_cfg(&self) -> super::diffusion::DiffusionCfg {
+        self.diffusion
+    }
+
     /// Incremented when blocks are edited.
     pub fn edit_generation(&self) -> u64 {
         self.edit_generation

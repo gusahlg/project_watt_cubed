@@ -36,7 +36,7 @@ pub struct Knob {
 }
 
 /// Which fancy visual groups are currently enabled.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisualMask {
     pub atmosphere: bool,
     pub post: bool,
@@ -69,6 +69,25 @@ impl VisualMask {
             cfg.strip_group(VisualGroup::Lighting);
         }
         cfg
+    }
+
+    /// Name of the visual mod forcing `key` off, if any.
+    pub fn forced_off(self, key: &str) -> Option<&'static str> {
+        let group = crate::render_config::lane_group(key)?;
+        let on = match group {
+            VisualGroup::Atmosphere => self.atmosphere,
+            VisualGroup::Post => self.post,
+            VisualGroup::Lighting => self.lighting,
+        };
+        if on { None } else { Some(group.mod_name()) }
+    }
+}
+
+/// Append `(off: Post mod)` (etc.) when a visual group has stripped the lane.
+pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
+    match mask.forced_off(key) {
+        Some(name) => format!("{value} (off: {name} mod)"),
+        None => value,
     }
 }
 
@@ -494,6 +513,16 @@ impl Mods {
         self.entries[index].enabled
     }
 
+    /// Visual group owned by the mod at `index`, if it is a visual mod.
+    pub fn visual_group(&self, index: usize) -> Option<VisualGroup> {
+        self.entries[index].module.visual_group()
+    }
+
+    /// Whether the mod at `index` replaces worldgen when enabled.
+    pub fn is_worldgen(&self, index: usize) -> bool {
+        self.entries[index].module.worldgen().is_some()
+    }
+
     /// Flip the mod at `index` on or off, running the matching lifecycle hook.
     pub fn toggle(&mut self, index: usize) {
         let entry = &mut self.entries[index];
@@ -550,7 +579,10 @@ impl Mods {
     /// Settings lanes with disabled visual groups stripped.
     /// Enable or disable a mod by name (no-op if already in that state).
     pub fn set_enabled(&mut self, name: &str, on: bool) {
-        if let Some(i) = self.entries.iter().position(|e| e.module.name() == name)
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.module.name().eq_ignore_ascii_case(name))
             && self.entries[i].enabled != on
         {
             self.toggle(i);
@@ -561,19 +593,27 @@ impl Mods {
     /// `WATT_BENCH_VISUALS=off` so a harness run can pin worldgen and the
     /// core-renderer look without persisting the mod menu.
     pub fn apply_bench_env(&mut self) {
-        if matches!(
-            std::env::var("WATT_BENCH_WORLDGEN").as_deref(),
-            Ok("diffusion")
-        ) {
-            self.set_enabled("InfiniteDiffusion", true);
+        if let Ok(value) = std::env::var("WATT_BENCH_WORLDGEN") {
+            match parse_bench_worldgen(&value) {
+                Some(true) => self.set_enabled("InfiniteDiffusion", true),
+                Some(false) => self.set_enabled("InfiniteDiffusion", false),
+                None => eprintln!(
+                    "WATT_BENCH_WORLDGEN={value:?} not recognized; use classic|diffusion"
+                ),
+            }
         }
-        if matches!(
-            std::env::var("WATT_BENCH_VISUALS").as_deref(),
-            Ok("off") | Ok("core")
-        ) {
-            self.set_enabled("Atmosphere", false);
-            self.set_enabled("Post", false);
-            self.set_enabled("Lighting", false);
+        if let Ok(value) = std::env::var("WATT_BENCH_VISUALS") {
+            match parse_bench_visuals(&value) {
+                Some(true) => {
+                    self.set_enabled("Atmosphere", false);
+                    self.set_enabled("Post", false);
+                    self.set_enabled("Lighting", false);
+                }
+                Some(false) => {}
+                None => eprintln!(
+                    "WATT_BENCH_VISUALS={value:?} not recognized; use off|core|on|full"
+                ),
+            }
         }
     }
 
@@ -614,6 +654,24 @@ impl Mods {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.module.name() == name) {
             entry.module.load_state(data, world);
         }
+    }
+}
+
+/// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+fn parse_bench_worldgen(value: &str) -> Option<bool> {
+    match value {
+        "diffusion" => Some(true),
+        "classic" => Some(false),
+        _ => None,
+    }
+}
+
+/// `Some(true)` strips the visual mods (core look); `Some(false)` leaves them on.
+fn parse_bench_visuals(value: &str) -> Option<bool> {
+    match value {
+        "off" | "core" => Some(true),
+        "on" | "full" => Some(false),
+        _ => None,
     }
 }
 
@@ -689,5 +747,44 @@ mod tests {
         assert!(full.clouds);
         assert!(full.bloom);
         assert!(full.shadows);
+    }
+
+    #[test]
+    fn annotate_setting_names_the_mod_that_forced_the_lane_off() {
+        let mut mods = Mods::with_defaults();
+        mods.set_enabled("Post", false);
+        let mask = mods.visual_mask();
+        assert_eq!(
+            annotate_setting("On".to_string(), "bloom", mask),
+            "On (off: Post mod)"
+        );
+        assert_eq!(annotate_setting("On".to_string(), "shadows", mask), "On");
+        mods.set_enabled("Lighting", false);
+        let mask = mods.visual_mask();
+        assert_eq!(
+            annotate_setting("On".to_string(), "shadows", mask),
+            "On (off: Lighting mod)"
+        );
+    }
+
+    #[test]
+    fn set_enabled_matches_display_name_case_insensitively() {
+        let mut mods = Mods::with_defaults();
+        mods.set_enabled("infinitediffusion", true);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+        mods.set_enabled("INFINITEDiffusion", false);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+    }
+
+    #[test]
+    fn bench_env_accepted_values() {
+        assert_eq!(parse_bench_worldgen("diffusion"), Some(true));
+        assert_eq!(parse_bench_worldgen("classic"), Some(false));
+        assert_eq!(parse_bench_worldgen("Diffusion"), None);
+        assert_eq!(parse_bench_visuals("off"), Some(true));
+        assert_eq!(parse_bench_visuals("core"), Some(true));
+        assert_eq!(parse_bench_visuals("on"), Some(false));
+        assert_eq!(parse_bench_visuals("full"), Some(false));
+        assert_eq!(parse_bench_visuals("pretty"), None);
     }
 }

@@ -1027,7 +1027,8 @@ mod seam_tests {
     use super::backend::recording::{Intent, Recorder, RecordingBackend};
     use super::content::{Catalog, CueSymbols, Loop, OneShot};
     use super::{
-        AudioFrame, Emitter, EmitterId, Occurrence, OccurrenceId, SoundConfig, SoundSystem,
+        AudioFrame, Emitter, EmitterId, Epoch, MixChange, Occurrence, OccurrenceId, Seq,
+        SessionKey, SoundConfig, SoundSystem, VoicePacket,
     };
 
     // Shared catalog fixture: one one-shot, one loop bed, and a loud/quiet pair whose
@@ -1497,5 +1498,38 @@ mod seam_tests {
             1,
             "only the fresh id 6 plays; id 5 was past the dead-frame water mark"
         );
+    }
+
+    #[test]
+    fn mute_system_survives_a_failed_stream_and_stays_usable() {
+        let (mut sound, _) = SoundSystem::mute();
+        sound.ingest_voice(VoicePacket {
+            session: SessionKey(1),
+            epoch: Epoch(0),
+            seq: Seq(0),
+            payload: Box::new([0, 1, 2, 3]),
+        });
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], open_window()).unwrap(),
+        );
+        sound.set_mix(MixChange::default());
+        sound.leave_world();
+    }
+
+    #[test]
+    fn dead_recording_backend_ingest_does_not_panic() {
+        let (mut sound, _, rec) = system(4);
+        rec.set_alive(false);
+        sound.ingest_voice(VoicePacket {
+            session: SessionKey(9),
+            epoch: Epoch(1),
+            seq: Seq(0),
+            payload: Box::new([9]),
+        });
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], open_window()).unwrap(),
+        );
+        rec.set_alive(true);
+        sound.set_mix(MixChange::default());
     }
 }

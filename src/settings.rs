@@ -256,6 +256,11 @@ impl Setting {
         self.label
     }
 
+    /// Persistence / `/gfx` key for this field.
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+
     pub fn category(&self) -> Category {
         self.category
     }
@@ -1035,13 +1040,11 @@ impl Settings {
     /// applied (e.g. 8x requested, 4x supported).
     pub fn apply(&mut self, eng: &mut Engine) {
         eng.set_fullscreen(self.fullscreen);
-        // Vsync is deliberately NOT pushed here: `App::frame` is the single
-        // writer, because the effective value also depends on the screen
-        // (menus force vsync on). Two writers disagreeing made the engine
-        // rebuild the swapchain every menu frame.
+        // Vsync and the fps cap are not pushed here: `App::frame` is the
+        // single writer, because the effective values also depend on the
+        // screen (menus cap the frame rate, vsync off) and the benchmark.
         self.msaa = eng.set_msaa(self.msaa);
         self.render_scale = eng.set_render_scale(self.render_scale);
-        eng.set_target_fps(self.max_fps);
         eng.set_cull_faces(self.cull_faces);
         // Engine render lanes live-swap on both threads; occlusion/lod2 are world
         // inputs (applied on world entry) and aren't part of `engine_flags`.

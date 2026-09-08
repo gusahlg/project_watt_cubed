@@ -1264,12 +1264,13 @@ impl Game {
         let pos_before = self.player.position;
         // Each output line already carries its role (System output vs Error
         // rejection), so there is nothing to guess — just show them.
-        for out in command::execute(
+        for out in command::execute_with_visuals(
             &line,
             &mut self.player,
             &mut self.world,
             settings,
             &mut self.sky,
+            self.visual_mask,
         ) {
             self.console.push(out);
         }

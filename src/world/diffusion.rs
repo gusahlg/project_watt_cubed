@@ -378,6 +378,51 @@ mod tests {
     }
 
     #[test]
+    fn clamp_applies_tile_before_stride_so_stride_cannot_exceed_tile() {
+        let cfg = DiffusionCfg {
+            tile: 100,
+            stride: 80,
+            phases: 1,
+            relief: 9.0,
+        }
+        .clamp();
+        assert_eq!(cfg.tile, 64);
+        assert!(cfg.stride <= cfg.tile, "stride={} tile={}", cfg.stride, cfg.tile);
+        assert_eq!(cfg.stride, 64);
+        assert_eq!(cfg.phases, 2);
+        assert_eq!(cfg.relief, 4.0);
+    }
+
+    #[test]
+    fn lod_and_near_flood_to_the_same_sea() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 13);
+        let sea = g.sea_level();
+        assert_eq!(sea, 20);
+        let mut ocean = 0;
+        for z in -16..16 {
+            for x in -16..16 {
+                let h = g.height(x, z);
+                if h >= sea - 2 {
+                    continue;
+                }
+                ocean += 1;
+                let near_below = g.block_at(x, sea - 1, z, h);
+                let near_at = g.block_at(x, sea, z, h);
+                let lod_below = g.lod_block_at(x, sea - 1, z);
+                let lod_at = g.lod_block_at(x, sea, z);
+                assert_ne!(near_below, AIR, "ocean column ({x},{z}) must flood to sea");
+                assert_eq!(near_at, AIR, "ocean column ({x},{z}) must stop flooding at sea");
+                assert!(
+                    lod_at == AIR || lod_at == g.deep(),
+                    "LOD must not flood the sea cell at ({x},{z})"
+                );
+                assert_ne!(lod_below, AIR, "LOD must fill below sea at ({x},{z})");
+            }
+        }
+        assert!(ocean > 0, "seed 13 must have open-ocean columns in the sample");
+    }
+
+    #[test]
     fn diffusion_kind_is_distinct() {
         assert_eq!(
             DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 1)

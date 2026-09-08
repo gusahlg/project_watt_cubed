@@ -5,9 +5,11 @@ use voxel_engine::DVec3;
 
 use crate::mods::Mods;
 use crate::player::Player;
+use crate::world::diffusion::DiffusionCfg;
+use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
-use super::format::{self, Edit, PlayerState, SaveDoc};
+use super::format::{self, Edit, PlayerState, SaveDoc, WorldgenStamp};
 use super::slot::{SaveError, SaveMeta, SlotId};
 use super::store::{self, Source};
 use super::{block_spec, parse_block};
@@ -62,6 +64,7 @@ pub fn to_doc(
     Ok(SaveDoc {
         meta,
         worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+        worldgen: stamp_from_world(world),
         player: PlayerState {
             pos: [player.position.x, player.position.y, player.position.z],
             yaw: player.orientation.yaw,
@@ -75,17 +78,38 @@ pub fn to_doc(
     })
 }
 
+fn stamp_from_world(world: &World) -> WorldgenStamp {
+    let cfg = world.diffusion_cfg();
+    WorldgenStamp {
+        kind: world.worldgen().wire(),
+        tile: cfg.tile,
+        stride: cfg.stride,
+        phases: cfg.phases,
+        relief: cfg.relief,
+    }
+}
+
+fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
+    let kind = WorldgenKind::from_wire(stamp.kind).unwrap_or(WorldgenKind::Classic);
+    let cfg = DiffusionCfg {
+        tile: stamp.tile,
+        stride: stamp.stride,
+        phases: stamp.phases,
+        relief: stamp.relief,
+    }
+    .clamp();
+    (kind, cfg)
+}
+
 /// Rebuild a ready-to-play world and player from a doc, restoring mod state
 /// into `mods`. Unknown specs degrade to air, exactly like the network path.
-/// `make_world` is the caller's choice of `World` constructor — `World::new`
-/// for tests/headless callers, `|seed| World::with_config_lazy(seed, render)`
-/// for interactive sessions that want their render config installed before
-/// any terrain generates. One function instead of a config/no-config pair:
-/// the constructor closure already expresses the choice `World` itself offers.
+/// `make_world` is the caller's choice of `World` constructor — the header's
+/// seed, kind, and diffusion knobs are passed in so a loaded world rebuilds
+/// with the generator that wrote it, not the caller's current mod flags.
 pub fn from_doc(
     doc: SaveDoc,
     mods: &mut Mods,
-    make_world: impl FnOnce(i64) -> World,
+    make_world: impl FnOnce(i64, WorldgenKind, DiffusionCfg) -> World,
 ) -> (World, Player, SaveMeta) {
     // Warn, never reject: the seed regenerates terrain fine, but a save from
     // another worldgen replays its edits over terrain whose MATERIALS may have
@@ -100,7 +124,8 @@ pub fn from_doc(
             crate::world::placement::WORLDGEN_VERSION,
         );
     }
-    let mut world = make_world(doc.meta.seed);
+    let (kind, cfg) = kind_cfg_from_stamp(doc.worldgen);
+    let mut world = make_world(doc.meta.seed, kind, cfg);
 
     let mut player = Player::new(DVec3::new(
         doc.player.pos[0],
@@ -166,7 +191,7 @@ pub fn save(
 pub fn load(
     id: &SlotId,
     mods: &mut Mods,
-    make_world: impl FnOnce(i64) -> World,
+    make_world: impl FnOnce(i64, WorldgenKind, DiffusionCfg) -> World,
 ) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
     let (decoded, source) = store::read(id)?;
     let (doc, salvage) = match decoded {

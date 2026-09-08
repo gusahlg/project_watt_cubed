@@ -100,8 +100,25 @@ mod tests {
     use crate::block::element::El;
     use crate::mods::Mods;
     use crate::player::Player;
+    use crate::world::chunk::CHUNK_SIZE;
+    use crate::world::diffusion::DiffusionCfg;
+    use crate::world::generation::WorldgenKind;
     use std::fs;
     use voxel_engine::DVec3;
+
+    fn make_world(
+        seed: i64,
+        kind: WorldgenKind,
+        cfg: DiffusionCfg,
+    ) -> World {
+        World::with_kind_cfg(
+            seed,
+            crate::render_config::RenderConfig::default(),
+            kind,
+            cfg,
+            true,
+        )
+    }
 
     fn slot(name: &str) -> SlotId {
         let id = SlotId::new(name).unwrap();
@@ -179,7 +196,7 @@ mod tests {
 
         let mut fresh_mods = Mods::with_defaults();
         let (loaded_world, loaded_player, loaded_meta, report) =
-            load(&id, &mut fresh_mods, World::new).unwrap();
+            load(&id, &mut fresh_mods, make_world).unwrap();
 
         assert_eq!(loaded_world.seed(), 4242);
         assert_eq!(loaded_meta.seed, 4242, "seed is stamped into the header");
@@ -214,7 +231,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         save(&id, &world, &player, &mods, meta("far")).unwrap();
 
-        let (_, loaded, _, _) = load(&id, &mut mods, World::new).unwrap();
+        let (_, loaded, _, _) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(loaded.position.x.to_bits(), pos.x.to_bits());
         assert_eq!(loaded.position.y.to_bits(), pos.y.to_bits());
         assert_eq!(loaded.position.z.to_bits(), pos.z.to_bits());
@@ -233,7 +250,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         save(&id, &world, &player, &mods, meta("empty")).unwrap();
 
-        let (loaded_world, loaded_player, _, _) = load(&id, &mut mods, World::new).unwrap();
+        let (loaded_world, loaded_player, _, _) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(loaded_world.seed(), 1234);
         assert_eq!(loaded_player.position, DVec3::new(0.0, 40.0, 0.0));
         assert_eq!(loaded_world.edits().count(), 0);
@@ -253,10 +270,88 @@ mod tests {
         save(&id, &world, &player, &mods, meta("v2")).unwrap(); // rotates v1 to .bak
         fs::write(format!("saves/{id}.save"), b"NOPE not a save").unwrap();
 
-        let (loaded_world, _, loaded_meta, report) = load(&id, &mut mods, World::new).unwrap();
+        let (loaded_world, _, loaded_meta, report) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(report.source, Source::Backup);
         assert_eq!(loaded_meta.name, "v1");
         assert_eq!(loaded_world.block_at(1, 200, 1), AIR);
+
+        cleanup(&id);
+    }
+
+    fn dump_chunk(world: &World, cx: i32, cy: i32, cz: i32) -> Vec<crate::block::BlockId> {
+        let s = CHUNK_SIZE as i32;
+        let mut out = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+        for ly in 0..s {
+            for lz in 0..s {
+                for lx in 0..s {
+                    out.push(world.block_at(cx * s + lx, cy * s + ly, cz * s + lz));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn diffusion_world_round_trips_kind_cfg_and_generated_chunks() {
+        let id = slot("__unit_test_diffusion_round_trip__");
+        let cfg = DiffusionCfg {
+            tile: 64,
+            stride: 16,
+            phases: 4,
+            relief: 1.5,
+        };
+        let world = make_world(99, WorldgenKind::Diffusion, cfg);
+        assert_eq!(world.worldgen(), WorldgenKind::Diffusion);
+        let cy = world.surface_y(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let chunks = [(0, cy, 0), (1, cy, 0), (0, cy, 1)];
+        let before: Vec<_> = chunks
+            .iter()
+            .map(|&c| dump_chunk(&world, c.0, c.1, c.2))
+            .collect();
+        assert!(
+            before.iter().any(|c| c.iter().any(|&id| id != AIR)),
+            "pregenerated origin must contain terrain"
+        );
+
+        let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        // Diffusion mod stays OFF: the save header, not the mod flag, decides
+        // the generator on load.
+        let mut mods = Mods::with_defaults();
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        save(&id, &world, &player, &mods, meta("diffusion")).unwrap();
+
+        let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
+        assert_eq!(loaded.worldgen(), WorldgenKind::Diffusion);
+        assert_eq!(loaded.diffusion_cfg(), cfg.clamp());
+        assert_eq!(
+            mods.worldgen_kind(),
+            WorldgenKind::Classic,
+            "loading a diffusion world must not flip the mod's enabled flag"
+        );
+        for (i, &(cx, cy, cz)) in chunks.iter().enumerate() {
+            assert_eq!(
+                dump_chunk(&loaded, cx, cy, cz),
+                before[i],
+                "chunk {cx},{cy},{cz} must regenerate identically"
+            );
+        }
+
+        cleanup(&id);
+    }
+
+    #[test]
+    fn classic_save_still_loads_as_classic() {
+        let id = slot("__unit_test_classic_kind__");
+        let world = World::new(7);
+        assert_eq!(world.worldgen(), WorldgenKind::Classic);
+        let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut mods = Mods::with_defaults();
+        mods.set_enabled("InfiniteDiffusion", true);
+        save(&id, &world, &player, &mods, meta("classic")).unwrap();
+
+        let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
+        assert_eq!(loaded.worldgen(), WorldgenKind::Classic);
+        assert_eq!(loaded.worldgen_kind(), "classic");
 
         cleanup(&id);
     }

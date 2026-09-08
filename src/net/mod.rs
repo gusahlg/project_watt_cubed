@@ -151,7 +151,9 @@ pub(crate) mod quic {
 /// v8: voice chat — `ClientMessage::Voice` and `ServerMessage::PeerVoice`
 /// carry opaque opus frames. New message tags change the wire, so mixed v7/v8
 /// peers must not join.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: `Welcome` carries worldgen kind + diffusion knobs so a joiner adopts
+/// the server's generator instead of its local mod state.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 pub const DEFAULT_PORT: u16 = 5555;
 

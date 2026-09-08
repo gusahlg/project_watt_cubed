@@ -31,6 +31,21 @@ const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
 /// Background for every non-world screen.
 const MENU_CLEAR: Color = Color::new(18, 20, 28, 255);
+/// Menu frame cap. The engine sleeps until the deadline (`WaitUntil`), so
+/// 120 Hz is ~8 ms worst-case input-to-photon; a busy-wait cap would want 240.
+const MENU_FPS_CAP: u32 = 120;
+
+/// Vsync and fps cap for this screen. Bench is uncapped; menus cap at
+/// [`MENU_FPS_CAP`] with vsync off; in-world uses the saved settings.
+fn pacing(in_world: bool, bench: bool, settings: &Settings) -> (bool, u32) {
+    if bench {
+        (false, 0)
+    } else if in_world {
+        (settings.vsync, settings.max_fps)
+    } else {
+        (false, MENU_FPS_CAP)
+    }
+}
 
 enum Screen {
     Menus(MenuStack),
@@ -149,12 +164,14 @@ impl App {
     /// Open the window and run until the player quits (menu or close button).
     pub fn run(self) {
         let mut app = self;
+        // Starts on menus (or uncapped if this process is a bench).
+        let (vsync, target_fps) = pacing(false, app.bench.is_some(), &app.settings);
         let config = voxel_engine::Config {
             title: "Project Watt Cubed".into(),
             width: STARTING_WINDOW_WIDTH,
             height: STARTING_WINDOW_HEIGHT,
-            target_fps: app.settings.max_fps,
-            vsync: app.settings.vsync,
+            target_fps,
+            vsync,
             msaa: app.settings.msaa,
             render_scale: app.settings.render_scale,
             resizable: true,
@@ -199,15 +216,15 @@ impl App {
             self.flush_save();
             return false;
         }
-        // Force vsync on whenever we're not in a live world (menus, loading):
-        // there's nothing to gain from tearing/uncapped frames on a static
-        // screen, and it keeps the GPU quiet. In-world we honour the setting.
-        // Only send the command on change: a SetVsync every menu frame was
-        // waking the render thread even when the mode was already correct.
+        // Apply only on change: a SetVsync every menu frame was waking the
+        // render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
-        let want_vsync = !in_world || self.settings.vsync;
+        let (want_vsync, want_fps) = pacing(in_world, self.bench.is_some(), &self.settings);
         if eng.vsync() != want_vsync {
             eng.set_vsync(want_vsync);
+        }
+        if eng.target_fps() != want_fps {
+            eng.set_target_fps(want_fps);
         }
         self.draw(eng);
         true
@@ -257,10 +274,7 @@ impl App {
         // an optional flight along +X (`WATT_BENCH_MOVE`) exercises the paths a
         // static camera never touches (shadow-cascade re-render, streaming).
         game.player_mut().orientation.yaw += 0.4 * dt;
-        let move_mps = self.bench.as_ref().expect("bench exists").move_mps();
-        if move_mps > 0.0 {
-            game.player_mut().position.x += move_mps * dt as f64;
-        }
+        self.bench.as_ref().expect("bench exists").apply_move(game.player_mut(), dt);
 
         let bench = self.bench.as_mut().expect("bench exists");
         let step = bench.step(
@@ -435,8 +449,8 @@ impl App {
         let world = World::with_kind_cfg(
             conn.seed(),
             self.mods.mask_render(self.settings.render_config()),
-            self.mods.worldgen_kind(),
-            self.mods.diffusion_cfg(),
+            conn.worldgen(),
+            conn.diffusion(),
             false,
         );
         let player = Player::new(conn.spawn());
@@ -501,8 +515,10 @@ impl App {
         };
         self.mods.reset_state();
         let render = self.mods.mask_render(self.settings.render_config());
-        match save::load(&id, &mut self.mods, |seed| {
-            World::with_config_lazy(seed, render)
+        match save::load(&id, &mut self.mods, |seed, kind, cfg| {
+            // The save header names the generator; the InfiniteDiffusion mod's
+            // enabled flag only chooses the next *new* world.
+            World::with_kind_cfg(seed, render, kind, cfg, false)
         }) {
             Ok((world, player, meta, report)) => {
                 self.active = Some(ActiveSlot::new(id.clone(), meta));
@@ -695,4 +711,35 @@ fn spawn_player(world: &World) -> Player {
     }
     let h = world.surface_y(0, 0).max(sea);
     Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_menus_world_and_bench() {
+        let mut settings = Settings::default();
+        settings.vsync = true;
+        settings.max_fps = 60;
+        assert_eq!(
+            pacing(false, false, &settings),
+            (false, MENU_FPS_CAP),
+            "menus: vsync off, cap 120"
+        );
+        assert_eq!(
+            pacing(true, false, &settings),
+            (true, 60),
+            "in-world: saved vsync and max_fps"
+        );
+        assert_eq!(pacing(false, true, &settings), (false, 0), "bench: off, 0");
+        assert_eq!(pacing(true, true, &settings), (false, 0), "bench wins in-world too");
+
+        settings.vsync = false;
+        settings.max_fps = 0;
+        assert_eq!(pacing(false, false, &settings), (false, MENU_FPS_CAP));
+        assert_eq!(pacing(true, false, &settings), (false, 0));
+        settings.max_fps = 144;
+        assert_eq!(pacing(true, false, &settings), (false, 144));
+    }
 }

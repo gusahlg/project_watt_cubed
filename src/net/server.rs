@@ -129,6 +129,8 @@ struct Ctx {
     fingerprint: u64,
     day_secs: f32,
     allow_teleport: bool,
+    worldgen: WorldgenKind,
+    diffusion: DiffusionCfg,
     generator: crate::world::diffusion::Generator,
 }
 
@@ -358,6 +360,8 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         fingerprint: crate::net::fingerprint_kind_cfg(&registry, config.worldgen, config.diffusion),
         day_secs: config.day_secs,
         allow_teleport: config.allow_teleport,
+        worldgen: config.worldgen,
+        diffusion: config.diffusion,
         generator,
     });
     let shared = Arc::new(Mutex::new(State {
@@ -572,7 +576,16 @@ fn handle_client(
     // These sends BLOCK (we're on this client's own handler thread): a built-up
     // world or big roster can exceed the outbound queue, and dropping bootstrap
     // frames would ghost the join.
-    send_blocking(&out, &ServerMessage::Welcome { player_id: id, seed: ctx.seed, spawn });
+    send_blocking(
+        &out,
+        &ServerMessage::Welcome {
+            player_id: id,
+            seed: ctx.seed,
+            spawn,
+            worldgen: ctx.worldgen,
+            diffusion: ctx.diffusion,
+        },
+    );
     for batch in snapshot.chunks(SNAPSHOT_BATCH) {
         send_blocking(&out, &ServerMessage::Snapshot { edits: batch.to_vec() });
     }
@@ -1167,6 +1180,8 @@ mod tests {
             fingerprint: 0,
             day_secs: 600.0,
             allow_teleport,
+            worldgen: WorldgenKind::Classic,
+            diffusion: DiffusionCfg::default(),
             generator: test_generator(),
         }
     }
@@ -1573,6 +1588,72 @@ mod tests {
                 assert!(reason.contains("content"), "unexpected reason: {reason}")
             }
             other => panic!("expected a content-mismatch rejection, got {other:?}"),
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn classic_fingerprint_is_rejected_from_a_diffusion_server() {
+        let handle = spawn(
+            0,
+            Config {
+                password: String::new(),
+                seed: 3,
+                worldgen: WorldgenKind::Diffusion,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let hello = ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            fingerprint: crate::net::content_fingerprint(),
+            name: "classic".into(),
+            password: "".into(),
+        };
+        match raw_reply(handle.addr(), &hello) {
+            ServerMessage::Reject { reason } => {
+                assert!(reason.contains("content"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected a content-mismatch rejection, got {other:?}"),
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn welcome_carries_the_servers_worldgen_kind_and_cfg() {
+        let diffusion = DiffusionCfg::default();
+        let handle = spawn(
+            0,
+            Config {
+                password: String::new(),
+                seed: 11,
+                worldgen: WorldgenKind::Diffusion,
+                diffusion,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let hello = ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            fingerprint: crate::net::content_fingerprint_kind_cfg(
+                WorldgenKind::Diffusion,
+                diffusion,
+            ),
+            name: "guest".into(),
+            password: "".into(),
+        };
+        match raw_reply(handle.addr(), &hello) {
+            ServerMessage::Welcome {
+                worldgen,
+                diffusion: got,
+                seed,
+                ..
+            } => {
+                assert_eq!(seed, 11);
+                assert_eq!(worldgen, WorldgenKind::Diffusion);
+                assert_eq!(got, diffusion);
+            }
+            other => panic!("expected Welcome with diffusion kind, got {other:?}"),
         }
         handle.stop();
     }

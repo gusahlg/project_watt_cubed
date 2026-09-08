@@ -165,6 +165,8 @@ pub struct Connection {
     player_id: u32,
     seed: i64,
     spawn: DVec3,
+    worldgen: crate::world::generation::WorldgenKind,
+    diffusion: crate::world::diffusion::DiffusionCfg,
     peers: HashMap<u32, RemotePlayer>,
     alive: bool,
     // Throttling state for outbound moves.
@@ -248,8 +250,14 @@ impl Connection {
                 .map_err(|_| "no reply: timed out".to_string())?
                 .map_err(|e| format!("no reply: {e}"))
         })?;
-        let (player_id, seed, spawn) = match ServerMessage::decode(&frame) {
-            Some(ServerMessage::Welcome { player_id, seed, spawn }) => (player_id, seed, spawn),
+        let (player_id, seed, spawn, worldgen, diffusion) = match ServerMessage::decode(&frame) {
+            Some(ServerMessage::Welcome {
+                player_id,
+                seed,
+                spawn,
+                worldgen,
+                diffusion,
+            }) => (player_id, seed, spawn, worldgen, diffusion),
             Some(ServerMessage::Reject { reason }) => return Err(reason.to_string()),
             _ => return Err("unexpected reply from server".to_string()),
         };
@@ -290,6 +298,8 @@ impl Connection {
             player_id,
             seed,
             spawn,
+            worldgen,
+            diffusion,
             peers: HashMap::new(),
             alive: true,
             last_move: Instant::now(),
@@ -305,6 +315,12 @@ impl Connection {
 
     pub fn seed(&self) -> i64 {
         self.seed
+    }
+    pub fn worldgen(&self) -> crate::world::generation::WorldgenKind {
+        self.worldgen
+    }
+    pub fn diffusion(&self) -> crate::world::diffusion::DiffusionCfg {
+        self.diffusion
     }
     pub fn spawn(&self) -> DVec3 {
         self.spawn

@@ -176,10 +176,11 @@ mod tests {
     use std::fs;
 
     fn bytes() -> Result<Vec<u8>, SaveError> {
-        use super::super::format::{PlayerState, SaveDoc, encode};
+        use super::super::format::{PlayerState, SaveDoc, WorldgenStamp, encode};
         use super::super::slot::SaveMeta;
         encode(&SaveDoc {
             worldgen_version: 2,
+            worldgen: WorldgenStamp::default(),
             meta: SaveMeta {
                 name: "auto".to_string(),
                 seed: 1,

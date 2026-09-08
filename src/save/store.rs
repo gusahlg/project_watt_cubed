@@ -172,12 +172,13 @@ fn unused_id(base: &str) -> Result<SlotId, SaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::format::{Edit, PlayerState, SaveDoc};
+    use super::super::format::{Edit, PlayerState, SaveDoc, WorldgenStamp};
     use super::super::slot::SaveMeta;
 
     fn doc(name: &str, edits: u32) -> SaveDoc {
         SaveDoc {
             worldgen_version: 2,
+            worldgen: WorldgenStamp::default(),
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,

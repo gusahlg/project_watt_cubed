@@ -117,7 +117,32 @@ impl Mod for InfiniteDiffusionMod {
 }
 
 fn step_choice(list: &[u32], cur: i32, delta: i32) -> u32 {
-    let at = list.iter().position(|&v| v as i32 == cur).unwrap_or(0);
+    let at = list.iter().position(|&v| v as i32 == cur).unwrap_or_else(|| {
+        list.iter()
+            .enumerate()
+            .min_by_key(|(_, v)| (**v as i32 - cur).unsigned_abs())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    });
     let i = (at as i32 + delta).rem_euclid(list.len() as i32) as usize;
     list[i]
+}
+
+#[cfg(test)]
+mod knob_tests {
+    use super::*;
+    use crate::world::World;
+
+    #[test]
+    fn stepping_a_tile_not_in_the_choice_list_lands_on_a_neighbour() {
+        let mut m = InfiniteDiffusionMod::new();
+        let mut world = World::new(1);
+        m.load_state("tile=48,stride=16,phases=2,relief=1.00", &mut world);
+        assert_eq!(m.cfg().tile, 48);
+        m.step_knob(0, 1);
+        assert_eq!(m.cfg().tile, 64, "48 is nearest 32/64; +1 must take 64");
+        m.load_state("tile=48,stride=16,phases=2,relief=1.00", &mut world);
+        m.step_knob(0, -1);
+        assert_eq!(m.cfg().tile, 16, "48 nearest 32; -1 steps to 16");
+    }
 }

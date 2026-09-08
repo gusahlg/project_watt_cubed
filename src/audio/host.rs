@@ -29,3 +29,14 @@ pub fn output_device_and_config() -> Option<(cpal::Device, cpal::StreamConfig)> 
     config.buffer_size = cpal::BufferSize::Fixed(FRAMES);
     Some((device, config))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn host_probe_does_not_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            let _ = super::host();
+            super::output_device_and_config()
+        });
+    }
+}

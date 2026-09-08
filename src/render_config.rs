@@ -24,6 +24,28 @@ pub enum VisualGroup {
     Lighting,
 }
 
+impl VisualGroup {
+    pub fn mod_name(self) -> &'static str {
+        match self {
+            Self::Atmosphere => "Atmosphere",
+            Self::Post => "Post",
+            Self::Lighting => "Lighting",
+        }
+    }
+}
+
+/// Which visual-mod group owns a settings/`/gfx` lane key, if any.
+pub fn lane_group(key: &str) -> Option<VisualGroup> {
+    match key {
+        "clouds" | "weather" | "stars" | "day_night" | "fog" | "sky" | "water_anim" => {
+            Some(VisualGroup::Atmosphere)
+        }
+        "bloom" | "godrays" | "taa" | "exposure" | "vignette" | "vrs" => Some(VisualGroup::Post),
+        "shadows" | "ambient" | "blocklight" => Some(VisualGroup::Lighting),
+        _ => None,
+    }
+}
+
 /// Render lane toggles. `Copy` to thread freely.
 #[derive(Clone, Copy)]
 pub struct RenderConfig {
@@ -104,31 +126,19 @@ impl Default for RenderConfig {
 
 impl RenderConfig {
     /// Core look: sunlight on readable terrain, every fancy lane off.
-    /// Visual mods OR settings back onto this.
+    /// Visual groups are stripped via [`strip_group`] so the two cannot drift.
     pub fn core() -> Self {
-        Self {
+        let mut cfg = Self {
             occlusion: false,
             lod2: false,
             lod_levels: 1,
             lod_detail: 6,
-            blocklight: false,
-            exposure: false,
-            bloom: false,
-            godrays: false,
-            clouds: false,
-            weather: false,
-            stars: false,
-            day_night: false,
-            taa: false,
-            fog: false,
-            ambient: false,
-            sunlight: true,
-            shadows: false,
-            sky: false,
-            vrs: false,
-            water_anim: false,
-            vignette: false,
-        }
+            ..Self::default()
+        };
+        cfg.strip_group(VisualGroup::Atmosphere);
+        cfg.strip_group(VisualGroup::Post);
+        cfg.strip_group(VisualGroup::Lighting);
+        cfg
     }
 
     /// Golden harness config: defaults with blocklight and exposure for proper lighting.
@@ -205,6 +215,31 @@ pub fn max_lod_levels(detail: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_is_default_with_visual_groups_stripped() {
+        let mut expected = RenderConfig {
+            occlusion: false,
+            lod2: false,
+            lod_levels: 1,
+            lod_detail: 6,
+            ..RenderConfig::default()
+        };
+        expected.strip_group(VisualGroup::Atmosphere);
+        expected.strip_group(VisualGroup::Post);
+        expected.strip_group(VisualGroup::Lighting);
+        let core = RenderConfig::core();
+        assert!(!core.bloom && !expected.bloom);
+        assert!(!core.clouds && !expected.clouds);
+        assert!(!core.shadows && !expected.shadows);
+        assert!(core.sunlight && expected.sunlight);
+        assert_eq!(core.occlusion, expected.occlusion);
+        assert_eq!(core.lod2, expected.lod2);
+        assert_eq!(core.normalized_lod(), expected.normalized_lod());
+        assert_eq!(core.vrs, expected.vrs);
+        assert_eq!(core.water_anim, expected.water_anim);
+        assert_eq!(core.blocklight, expected.blocklight);
+    }
 
     #[test]
     fn lod_defaults_and_normalization_preserve_detail_cap() {

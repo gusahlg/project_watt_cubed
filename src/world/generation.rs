@@ -46,6 +46,29 @@ impl WorldgenKind {
             Self::Diffusion => "diffusion",
         }
     }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "classic" => Some(Self::Classic),
+            "diffusion" => Some(Self::Diffusion),
+            _ => None,
+        }
+    }
+
+    pub fn wire(self) -> u8 {
+        match self {
+            Self::Classic => 0,
+            Self::Diffusion => 1,
+        }
+    }
+
+    pub fn from_wire(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Classic),
+            1 => Some(Self::Diffusion),
+            _ => None,
+        }
+    }
 }
 
 /// Produces terrain for absolute world coordinates.

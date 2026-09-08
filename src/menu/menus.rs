@@ -4,10 +4,29 @@ use crate::menu::{
     apply_text_op, parse_port, AppEffect, Command, Ctx, Framed, HostInfo, JoinInfo, Menu, Msg,
     Notice, Row, Style, ValueView, View, PORT_ERROR,
 };
+use crate::mods::{annotate_setting, VisualMask};
 use crate::net::{DEFAULT_PORT, MAX_NAME};
+use crate::render_config::VisualGroup;
 use crate::session::Session;
 use crate::settings::{Category, MenuKind, SETTINGS};
 use crate::ui::EditBuf;
+
+fn visual_mask_from_ctx(ctx: &Ctx) -> VisualMask {
+    let mut mask = VisualMask {
+        atmosphere: false,
+        post: false,
+        lighting: false,
+    };
+    for row in ctx.mods {
+        match row.visual_group {
+            Some(VisualGroup::Atmosphere) => mask.atmosphere = row.enabled,
+            Some(VisualGroup::Post) => mask.post = row.enabled,
+            Some(VisualGroup::Lighting) => mask.lighting = row.enabled,
+            None => {}
+        }
+    }
+    mask
+}
 
 // Start menu.
 
@@ -128,11 +147,15 @@ impl Menu for ModsMenu {
             );
             if m.enabled {
                 for (k, (label, value)) in m.knobs.iter().enumerate() {
-                    rows.push(Row::value(
+                    let mut row = Row::value(
                         format!("  {label}"),
                         ValueView::Choice(value.clone()),
                         ModsAction::Knob { mod_index: i, knob: k },
-                    ));
+                    );
+                    if m.worldgen {
+                        row = row.detail("next new world");
+                    }
+                    rows.push(row);
                 }
             }
         }
@@ -319,16 +342,19 @@ impl Menu for SettingsPage {
             .find(|(c, _)| *c == self.category)
             .map_or("SETTINGS", |(_, n)| n)
             .to_uppercase();
+        let mask = visual_mask_from_ctx(ctx);
         let rows = SETTINGS
             .iter()
             .enumerate()
             .filter(|(_, s)| s.category() == self.category)
             .map(|(i, s)| {
+                let stored = s.show(ctx.settings);
+                let shown = annotate_setting(stored.clone(), s.key(), mask);
                 let value = match s.menu_kind() {
-                    MenuKind::Toggle => ValueView::Toggle(s.show(ctx.settings) == "On"),
-                    MenuKind::Choice => ValueView::Choice(s.show(ctx.settings)),
+                    MenuKind::Toggle if shown == stored => ValueView::Toggle(stored == "On"),
+                    MenuKind::Toggle | MenuKind::Choice => ValueView::Choice(shown),
                     MenuKind::Bar => {
-                        ValueView::Bar { t: s.fraction(ctx.settings), label: s.show(ctx.settings) }
+                        ValueView::Bar { t: s.fraction(ctx.settings), label: shown }
                     }
                 };
                 Row::value(s.label(), value, i)

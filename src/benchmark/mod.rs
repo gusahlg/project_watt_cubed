@@ -148,6 +148,16 @@ impl Benchmark {
         self.move_mps
     }
 
+    /// Translate the player along +X for a move-scenario run. Flight is forced
+    /// so gravity cannot embed the player in terrain the stream has not
+    /// prepared under the new x.
+    pub fn apply_move(&self, player: &mut crate::player::Player, dt: f32) {
+        if self.move_mps > 0.0 {
+            player.set_flying(true);
+            player.position.x += self.move_mps * dt as f64;
+        }
+    }
+
     /// Start metadata collection inside the already-created engine callback,
     /// safely outside the measured interval.
     pub fn begin(&mut self) {
@@ -676,6 +686,19 @@ mod tests {
         assert!(json.contains("\"average_fps\":null"));
         assert!(!json.contains("NaN"));
         assert!(!json.contains("inf"));
+    }
+
+    #[test]
+    fn apply_move_sets_flying_so_gravity_cannot_embed() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.move_mps = 40.0;
+        let mut player = crate::player::Player::new(DVec3::new(0.0, 40.0, 0.0));
+        assert!(!player.flying());
+        bench.apply_move(&mut player, 0.25);
+        assert!(player.flying(), "move scenario must fly rather than walk");
+        assert!((player.position.x - 10.0).abs() < 1e-9);
+        bench.apply_move(&mut player, 0.0);
+        assert!(player.flying());
     }
 
     #[test]
