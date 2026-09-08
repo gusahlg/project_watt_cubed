@@ -1,5 +1,6 @@
 //! Cross-chunk lighting (v2.1). A [`LightGrid`] holds skylight and blocklight
-//! (each `0..=15`) for every cell of one chunk. It is computed by [`propagate`]
+//! (each `0..=15`) for every cell of one chunk: `Uniform` when every cell
+//! agrees (open sky, solid rock), else a dense 16³ box. It is computed by [`propagate`]
 //! as a function of the chunk's own voxels, its six neighbour face light layers
 //! ([`FaceShell`]), and the column ceiling ([`CeilingWindow`], the skylight
 //! source). Settling is *decoupled* from meshing: a cheap main-thread
@@ -77,20 +78,30 @@ impl Lumel {
 }
 
 /// Per-cell light for one chunk. Compared for equality to detect settlement fixpoint.
-#[derive(PartialEq, Eq)]
-pub struct LightGrid {
-    cells: Box<[Lumel]>,
+/// Two representations: one lumel when every cell agrees, else a dense 16³ box.
+pub struct LightGrid(Repr);
+
+enum Repr {
+    Uniform(Lumel),
+    Cells(Box<[Lumel; CHUNK_VOLUME]>),
+}
+
+const _: () = assert!(std::mem::size_of::<LightGrid>() <= 16);
+
+/// Heap-allocate a filled cell box without staging the 8 KiB array on the stack.
+fn alloc_cells(fill: Lumel) -> Box<[Lumel; CHUNK_VOLUME]> {
+    vec![fill; CHUNK_VOLUME].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!())
 }
 
 impl LightGrid {
     /// An all-dark grid (also the reusable scratch the settle pass refills).
-    pub fn dark() -> Self {
-        Self { cells: vec![Lumel::DARK; CHUNK_VOLUME].into() }
+    pub const fn dark() -> Self {
+        Self(Repr::Uniform(Lumel::DARK))
     }
 
     /// An all-full-bright grid, for tests and the neutral mesher path.
-    pub fn full() -> Self {
-        Self { cells: vec![Lumel::FULL; CHUNK_VOLUME].into() }
+    pub const fn full() -> Self {
+        Self(Repr::Uniform(Lumel::FULL))
     }
 
     /// Full skylight, no blocklight — the settled light of a chunk fully open to
@@ -98,29 +109,117 @@ impl LightGrid {
     /// shell, open ceiling, …)`'s result, so the analytic light fast path
     /// ([`World::trivial_light`](crate::world::World)) can publish it without a
     /// flood.
-    pub fn open_sky() -> Self {
-        Self {
-            cells: vec![Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }; CHUNK_VOLUME]
-                .into(),
-        }
+    pub const fn open_sky() -> Self {
+        Self(Repr::Uniform(Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }))
     }
 
     #[inline]
     pub fn at(&self, idx: usize) -> Lumel {
-        self.cells[idx]
+        match &self.0 {
+            Repr::Uniform(v) => *v,
+            Repr::Cells(c) => c[idx],
+        }
     }
     #[inline]
     fn set(&mut self, idx: usize, v: Lumel) {
-        self.cells[idx] = v;
+        match &self.0 {
+            Repr::Cells(_) => {}
+            Repr::Uniform(u) if *u == v => return,
+            Repr::Uniform(_) => {
+                self.make_dense();
+            }
+        }
+        match &mut self.0 {
+            Repr::Cells(c) => c[idx] = v,
+            Repr::Uniform(_) => unreachable!(),
+        }
     }
     /// Copy the 16-cell x-row at `(y, z)` — cells are x-fastest, so this is
-    /// one contiguous slice copy (the shell capture's bulk read).
+    /// one contiguous slice copy (the shell capture's bulk read). Uniform
+    /// grids fill the row without a cell loop.
     #[inline]
     pub fn copy_row(&self, y: usize, z: usize, out: &mut [Lumel]) {
-        let base = Chunk::index(0, y, z);
-        out.copy_from_slice(&self.cells[base..base + CHUNK_SIZE]);
+        debug_assert_eq!(out.len(), CHUNK_SIZE);
+        match &self.0 {
+            Repr::Uniform(v) => out.fill(*v),
+            Repr::Cells(cells) => {
+                let base = Chunk::index(0, y, z);
+                out.copy_from_slice(&cells[base..base + CHUNK_SIZE]);
+            }
+        }
+    }
+
+    /// Near-border layer of `face` (0 for Pos, 15 for Neg) into a 16×16 face buffer.
+    /// Uniform fills once; Y/Z faces copy 16 x-rows; X is strided.
+    fn copy_face(&self, face: Face, out: &mut [Lumel]) {
+        debug_assert_eq!(out.len(), CHUNK_AREA);
+        match &self.0 {
+            Repr::Uniform(v) => out.fill(*v),
+            Repr::Cells(cells) => {
+                let n = FaceShell::near_layer(face);
+                match face {
+                    Face::PosY | Face::NegY => {
+                        for z in 0..CHUNK_SIZE {
+                            let base = Chunk::index(0, n, z);
+                            out[z * CHUNK_SIZE..z * CHUNK_SIZE + CHUNK_SIZE]
+                                .copy_from_slice(&cells[base..base + CHUNK_SIZE]);
+                        }
+                    }
+                    Face::PosZ | Face::NegZ => {
+                        for y in 0..CHUNK_SIZE {
+                            let base = Chunk::index(0, y, n);
+                            out[y * CHUNK_SIZE..y * CHUNK_SIZE + CHUNK_SIZE]
+                                .copy_from_slice(&cells[base..base + CHUNK_SIZE]);
+                        }
+                    }
+                    Face::PosX | Face::NegX => {
+                        for z in 0..CHUNK_SIZE {
+                            for y in 0..CHUNK_SIZE {
+                                out[y + z * CHUNK_SIZE] = cells[Chunk::index(n, y, z)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Densify in place and return the cell slice. Uniform expands to a filled box.
+    fn make_dense(&mut self) -> &mut [Lumel] {
+        if let Repr::Uniform(v) = &self.0 {
+            let v = *v;
+            self.0 = Repr::Cells(alloc_cells(v));
+        }
+        match &mut self.0 {
+            Repr::Cells(c) => &mut c[..],
+            Repr::Uniform(_) => unreachable!(),
+        }
+    }
+
+    /// Dense expansion of this grid — test helper so a Uniform grid and its
+    /// cell-wise equivalent can be meshed side by side.
+    #[cfg(test)]
+    pub fn to_dense(&self) -> Self {
+        match &self.0 {
+            Repr::Cells(c) => Self(Repr::Cells(c.clone())),
+            Repr::Uniform(v) => Self(Repr::Cells(alloc_cells(*v))),
+        }
     }
 }
+
+/// Value equality: Uniform and dense-all-equal grids holding the same lumel compare equal.
+impl PartialEq for LightGrid {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Uniform(a), Repr::Uniform(b)) => a == b,
+            (Repr::Cells(a), Repr::Cells(b)) => **a == **b,
+            (Repr::Uniform(v), Repr::Cells(c)) | (Repr::Cells(c), Repr::Uniform(v)) => {
+                c.iter().all(|cell| cell == v)
+            }
+        }
+    }
+}
+impl Eq for LightGrid {}
 
 /// Light grid plus one-cell shell from 26 neighbours (coords -1..=16). Serves
 /// interior, border, and diagonal cells for smooth light across chunk borders.
@@ -211,19 +310,7 @@ impl FaceShell {
         let mut faces = [[Lumel::DARK; CHUNK_AREA]; 6];
         for face in Face::ALL {
             let Some(g) = grid_at(face) else { continue };
-            let na = normal_axis(face);
-            let (au, av) = plane_axes(face);
-            let n = Self::near_layer(face);
-            let layer = &mut faces[face as usize];
-            for b in 0..CHUNK_SIZE {
-                for a in 0..CHUNK_SIZE {
-                    let mut lc = [0usize; 3];
-                    lc[na] = n;
-                    lc[au] = a;
-                    lc[av] = b;
-                    layer[a + b * CHUNK_SIZE] = g.at(Chunk::index(lc[0], lc[1], lc[2]));
-                }
-            }
+            g.copy_face(face, &mut faces[face as usize]);
         }
         Self { faces }
     }
@@ -296,11 +383,19 @@ struct FloodScratch {
     sky: Vec<LightLevel>,
     block: Vec<LightLevel>,
     queue: VecDeque<usize>,
+    /// Dense lumel box recycled across `propagate` calls on this thread.
+    /// Moved into the output grid when the flood stays dense.
+    cells: Option<Box<[Lumel; CHUNK_VOLUME]>>,
 }
 
 thread_local! {
     static FLOOD: RefCell<FloodScratch> = const {
-        RefCell::new(FloodScratch { sky: Vec::new(), block: Vec::new(), queue: VecDeque::new() })
+        RefCell::new(FloodScratch {
+            sky: Vec::new(),
+            block: Vec::new(),
+            queue: VecDeque::new(),
+            cells: None,
+        })
     };
 }
 
@@ -326,7 +421,6 @@ pub fn propagate(
     tables: &HotTables,
     out: &mut LightGrid,
 ) {
-    out.cells.fill(Lumel::DARK);
     let cs = CHUNK_SIZE as i32;
     // Decode the opacity field ONCE (payload-specialized, ~a palette pass)
     // into an L1-resident bitset: the flood probes it ~6 times per relaxed
@@ -340,9 +434,18 @@ pub fn propagate(
 
     // Skylight: borrow thread-local scratch, reset dark, seed and flood.
     // No stale flood state from a prior job survives.
-    let (mut sky, mut block, mut queue) = FLOOD.with_borrow_mut(|s| {
-        (std::mem::take(&mut s.sky), std::mem::take(&mut s.block), std::mem::take(&mut s.queue))
+    let (mut sky, mut block, mut queue, tls_cells) = FLOOD.with_borrow_mut(|s| {
+        (
+            std::mem::take(&mut s.sky),
+            std::mem::take(&mut s.block),
+            std::mem::take(&mut s.queue),
+            s.cells.take(),
+        )
     });
+    let (mut cells, leftover) = match std::mem::replace(&mut out.0, Repr::Uniform(Lumel::DARK)) {
+        Repr::Cells(c) => (c, tls_cells),
+        Repr::Uniform(_) => (tls_cells.unwrap_or_else(|| alloc_cells(Lumel::DARK)), None),
+    };
     reset_dark(&mut sky);
     reset_dark(&mut block);
     queue.clear();
@@ -439,14 +542,26 @@ pub fn propagate(
     }
 
     for i in 0..CHUNK_VOLUME {
-        out.set(i, Lumel { sky: sky[i], block: block[i] });
+        cells[i] = Lumel { sky: sky[i], block: block[i] };
     }
+
+    // Collapse only when voxels are uniform: a mixed chunk essentially never
+    // settles uniform, so the cell scan is skipped on the common dense path.
+    let first = cells[0];
+    let recycle = if chunk.uniform().is_some() && cells.iter().all(|&c| c == first) {
+        *out = LightGrid(Repr::Uniform(cells[0]));
+        Some(cells)
+    } else {
+        *out = LightGrid(Repr::Cells(cells));
+        leftover
+    };
 
     // Return the scratch buffers (with their capacity) for the next call.
     FLOOD.with_borrow_mut(|s| {
         s.sky = sky;
         s.block = block;
         s.queue = queue;
+        s.cells = recycle;
     });
 }
 
@@ -485,10 +600,13 @@ fn seed_from_shell(shell: &FaceShell, mut seed: impl FnMut(usize, Lumel)) {
 /// Whether border changed on a face. Used to enqueue neighbours only when their
 /// shared boundary moves (settling convergence detection).
 pub(in crate::world) fn border_changed(a: &LightGrid, b: &LightGrid, face: Face) -> bool {
-    face_cells(face).any(|(ci, _)| {
-        let i = Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize);
-        a.at(i) != b.at(i)
-    })
+    match (&a.0, &b.0) {
+        (Repr::Uniform(x), Repr::Uniform(y)) => x != y,
+        _ => face_cells(face).any(|(ci, _)| {
+            let i = Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize);
+            a.at(i) != b.at(i)
+        }),
+    }
 }
 
 #[inline]
@@ -601,6 +719,10 @@ mod tests {
         let mut got = LightGrid::dark();
         propagate(&opaque, &FaceShell::dark(), &CeilingWindow::from_heights(|_, _| 100), -160, &tables, &mut got);
         assert!(got == LightGrid::dark(), "uniform opaque == dark()");
+        assert!(
+            matches!(got.0, Repr::Uniform(v) if v == Lumel::DARK),
+            "uniform opaque collapses to Uniform(dark)"
+        );
         // Opaque does not imply dark: an opaque emitter must bypass the analytic
         // shortcut and seed blocklight in the regular propagation path.
         let emissive = Chunk::from_uniform(0, -10, 0, BlockId(3));
@@ -620,6 +742,13 @@ mod tests {
         let mut got = LightGrid::dark();
         propagate(&air, &FaceShell::dark(), &CeilingWindow::open(), 160, &tables, &mut got);
         assert!(got == LightGrid::open_sky(), "open-sky air == open_sky()");
+        assert!(
+            matches!(
+                got.0,
+                Repr::Uniform(v) if v == Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }
+            ),
+            "open-sky air collapses to Uniform(open sky lumel)"
+        );
     }
 
     #[test]
@@ -824,6 +953,98 @@ mod tests {
         }
         // The torch light actually crossed the border (right chunk's near cell lit).
         assert!(right.at(Chunk::index(0, 8, 8)).block.get() > 0, "light crossed the seam");
+    }
+
+    #[test]
+    fn uniform_and_dense_grids_compare_by_value() {
+        let uni = LightGrid::open_sky();
+        let dense = uni.to_dense();
+        assert!(std::mem::size_of::<LightGrid>() <= 16);
+        assert!(uni == dense, "Uniform equals its dense expansion");
+        assert!(dense == uni);
+        assert!(LightGrid::dark() == LightGrid::dark().to_dense());
+        assert!(LightGrid::full() == LightGrid::full().to_dense());
+        assert!(uni != LightGrid::dark());
+        assert!(uni != LightGrid::dark().to_dense());
+        assert!(uni.to_dense() != LightGrid::dark());
+
+        let mut mixed = LightGrid::open_sky().to_dense();
+        mixed.set(0, Lumel::DARK);
+        assert!(mixed != uni);
+        assert!(uni != mixed);
+
+        for face in Face::ALL {
+            assert!(!border_changed(&uni, &dense, face), "{face:?} same values");
+            assert!(!border_changed(&dense, &uni, face), "{face:?} same values swapped");
+            assert!(
+                border_changed(&uni, &LightGrid::dark(), face),
+                "{face:?} uniform vs different uniform"
+            );
+            assert!(
+                border_changed(&uni, &LightGrid::dark().to_dense(), face),
+                "{face:?} uniform vs different dense"
+            );
+            assert!(!border_changed(
+                &LightGrid::dark(),
+                &LightGrid::dark().to_dense(),
+                face
+            ));
+        }
+        // Cell 0 sits on NegX/NegY/NegZ; the opposite faces stay equal.
+        assert!(border_changed(&mixed, &uni, Face::NegX));
+        assert!(!border_changed(&mixed, &uni, Face::PosX));
+
+        let shell_u = FaceShell::capture(|_| Some(&uni));
+        let shell_d = FaceShell::capture(|_| Some(&dense));
+        for face in Face::ALL {
+            for b in 0..CHUNK_SIZE {
+                for a in 0..CHUNK_SIZE {
+                    assert_eq!(shell_u.at(face, a, b), shell_d.at(face, a, b), "face {face:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_and_dense_padded_light_meshes_byte_identically() {
+        use crate::world::mesh::{self, new_chunk_mesh_data};
+
+        let mut chunk = Chunk::from_uniform(0, 0, 0, BlockId(0));
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                chunk.set_local(x, 0, z, BlockId(1));
+            }
+        }
+        let padded = mesh::Padded::capture(|dx, dy, dz| {
+            (dx == 0 && dy == 0 && dz == 0).then_some(&chunk)
+        });
+
+        let uniform_grids: [LightGrid; 27] = std::array::from_fn(|k| match k % 3 {
+            0 => LightGrid::open_sky(),
+            1 => LightGrid::dark(),
+            _ => LightGrid::full(),
+        });
+        let dense_grids: [LightGrid; 27] = std::array::from_fn(|k| uniform_grids[k].to_dense());
+        let idx = |dx: i32, dy: i32, dz: i32| ((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize;
+        let uni_pad = PaddedLight::capture(|dx, dy, dz| Some(&uniform_grids[idx(dx, dy, dz)]));
+        let dense_pad = PaddedLight::capture(|dx, dy, dz| Some(&dense_grids[idx(dx, dy, dz)]));
+        for y in -1..=CS {
+            for z in -1..=CS {
+                for x in -1..=CS {
+                    assert_eq!(uni_pad.at(x, y, z), dense_pad.at(x, y, z), "padded ({x},{y},{z})");
+                }
+            }
+        }
+
+        let mut a = new_chunk_mesh_data();
+        let mut b = new_chunk_mesh_data();
+        mesh::build_chunk_mesh(&padded, chunk.uniform(), &tables(), &uni_pad, &mut a);
+        mesh::build_chunk_mesh(&padded, chunk.uniform(), &tables(), &dense_pad, &mut b);
+        for (pass, va) in a.iter() {
+            let vb = &b[pass];
+            assert_eq!(va.vertices(), vb.vertices(), "vertices {pass:?}");
+            assert_eq!(va.buckets(), vb.buckets(), "buckets {pass:?}");
+        }
     }
 
 }
