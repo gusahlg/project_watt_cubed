@@ -267,6 +267,18 @@ enum ClaimOutcome {
 /// [`super::StreamLane::MIN_ADMIT`] plays for the per-chunk lanes).
 const GEN_MIN_ADMIT: usize = 8;
 
+fn column_order(center: Coord, vel: DVec3, cx: i32, cz: i32) -> u64 {
+    let dx = cx - center.x;
+    let dz = cz - center.z;
+    let ring = dx.abs().max(dz.abs()) as u64;
+    super::motion_biased_dist2(
+        ring.saturating_mul(ring).saturating_mul(1024),
+        vel,
+        f64::from(dx) * CHUNK_SIZE as f64,
+        f64::from(dz) * CHUNK_SIZE as f64,
+    )
+}
+
 impl World {
     /// The mesh box: chunks meshed and drawn around `center`.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
@@ -942,27 +954,37 @@ impl World {
         if columns.is_empty() {
             return Progress::Idle;
         }
-        let mut cols: Vec<((i32, i32), (i32, i32))> = columns.into_iter().collect();
-        cols.sort_by_key(|&((cx, cz), _)| {
-            let dx = cx - center.x;
-            let dz = cz - center.z;
-            let ring = dx.abs().max(dz.abs()) as u64;
-            super::motion_biased_dist2(
-                ring.saturating_mul(ring).saturating_mul(1024),
-                self.section_vel,
-                f64::from(dx) * CHUNK_SIZE as f64,
-                f64::from(dz) * CHUNK_SIZE as f64,
-            )
-        });
-        let mut admitted = 0usize;
-        let mut remaining = 0usize;
+        let slots = match self.workers.as_ref() {
+            Some(w) => w.near_slots_free(),
+            None => usize::MAX,
+        };
+        if slots == 0 {
+            self.pending_gen.set();
+            return Progress::Partial {
+                remaining: columns.len() as u32,
+            };
+        }
+        self.gen_columns.clear();
+        self.gen_columns
+            .extend(columns.into_iter().map(|((cx, cz), range)| {
+                (column_order(center, self.section_vel, cx, cz), (cx, cz), range)
+            }));
+        let n = self.gen_columns.len();
         let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
-        for ((cx, cz), (cy_lo, cy_hi)) in cols {
+        let want = n.min(slots.max(min_admit));
+        if want < n {
+            self.gen_columns
+                .select_nth_unstable_by_key(want - 1, |e| e.0);
+            self.gen_columns[..want].sort_by_key(|e| e.0);
+        } else {
+            self.gen_columns.sort_by_key(|e| e.0);
+        }
+        let mut admitted = 0usize;
+        for i in 0..want {
             if super::admission_exhausted(admitted, min_admit, deadline) {
-                remaining += 1;
-                continue;
+                break;
             }
-            // Collect edits for the landing chunk to replay.
+            let ((cx, cz), (cy_lo, cy_hi)) = (self.gen_columns[i].1, self.gen_columns[i].2);
             let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
                 ..=cy_hi)
                 .filter_map(|cy| {
@@ -980,7 +1002,6 @@ impl World {
             };
             let accepted = self.worker_pool().submit(job);
             if accepted {
-                // Claim every missing coord in the span so it isn't re-requested.
                 for cy in cy_lo..=cy_hi {
                     let coord = ChunkCoord::new(cx, cy, cz);
                     if !self.chunks.contains_key(&coord) {
@@ -989,10 +1010,10 @@ impl World {
                 }
                 admitted += 1;
             } else {
-                // Pool shutting down: leave the rest for a later frame.
-                remaining += 1;
+                break;
             }
         }
+        let remaining = n - admitted;
         if remaining > 0 {
             self.pending_gen.set();
             Progress::Partial {

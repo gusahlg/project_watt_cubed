@@ -1315,3 +1315,79 @@ fn light_settle_to_identical_grid_reseeds_evicted_mesh_seed() {
     assert!(world.mesh_worklist.contains(&c), "re-seeded: ready chunk restored to the seed set");
     assert!(world.pending_fresh.get(), "re-armed: the fresh scan will pick it up");
 }
+
+/// `admit` claims a prefix of the nearest ready keys, not an arbitrary subset.
+#[test]
+fn admit_selects_the_nearest_ready_mesh_keys() {
+    use crate::world::chunk::{Chunk, ChunkData};
+
+    let mut world = World::with_config_lazy(1, RenderConfig::default());
+    world.transition_lighting(false);
+    world.set_view_distances(6, 3);
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    let stone = world.registry.id_by_name("Stone").unwrap();
+    for x in -5..=5 {
+        for z in -5..=5 {
+            for y in -2..=2 {
+                let coord = ChunkCoord::new(x, y, z);
+                world.chunks.insert(
+                    coord,
+                    Loaded {
+                        chunk: std::sync::Arc::new(Chunk::from_data(
+                            x,
+                            y,
+                            z,
+                            ChunkData::Uniform(stone),
+                        )),
+                        state: MeshState::needs_mesh(),
+                        rev: 0,
+                        connectivity: None,
+                        visible: true,
+                        light: None,
+                    },
+                );
+            }
+        }
+    }
+    let mut ready = Vec::new();
+    for x in -4..=4 {
+        for z in -4..=4 {
+            let coord = ChunkCoord::new(x, 0, z);
+            assert!(<MeshLane as StreamLane>::ready(&world, coord));
+            world.mesh_worklist.insert(coord);
+            ready.push(coord);
+        }
+    }
+    world.pending_fresh.set();
+    world.workers = Some(pipeline::Workers::spawn(2));
+    admit::<MeshLane>(
+        &mut world,
+        center,
+        pipeline::Deadline::from_budget(std::time::Duration::from_secs(1)),
+    );
+    let claimed: Vec<Coord> = ready
+        .iter()
+        .copied()
+        .filter(|&c| {
+            matches!(
+                world.chunks[&c].state,
+                MeshState::NeedsMesh { building: true, .. }
+            )
+        })
+        .collect();
+    assert!(
+        claimed.len() >= MeshLane::MIN_ADMIT,
+        "forward-progress floor: got {}",
+        claimed.len()
+    );
+    ready.sort_by_key(|&c| <MeshLane as StreamLane>::order(&world, center, c));
+    let nth = <MeshLane as StreamLane>::order(&world, center, ready[claimed.len() - 1]);
+    for c in &claimed {
+        assert!(
+            <MeshLane as StreamLane>::order(&world, center, *c) <= nth,
+            "{c:?} claimed beyond the nearest {}",
+            claimed.len()
+        );
+    }
+}

@@ -891,6 +891,21 @@ impl Workers {
         (queue.near.len(), queue.far.len())
     }
 
+    /// Free near-queue slots against the pacer cap. One lock; `0` means a
+    /// submit this pass will be declined.
+    pub(in crate::world) fn near_slots_free(&self) -> usize {
+        let (lock, _, _) = &*self.gate;
+        let queue = lock_queue(lock);
+        self.view.near_queue_cap().saturating_sub(queue.near.len())
+    }
+
+    /// Free far-queue slots against [`FAR_QUEUE_CAP`]. One lock.
+    pub(in crate::world) fn far_slots_free(&self) -> usize {
+        let (lock, _, _) = &*self.gate;
+        let queue = lock_queue(lock);
+        FAR_QUEUE_CAP.saturating_sub(queue.far.len())
+    }
+
     /// Queue a job at its scheduling class; returns whether it was accepted.
     /// `false` means shutdown or adaptive near-lookahead backpressure, so the
     /// caller must not claim it and the normal pending lane retries later.
@@ -1595,6 +1610,99 @@ mod tests {
             dt.as_secs_f64(),
             JOBS as f64 / dt.as_secs_f64()
         );
+    }
+
+    /// Mesh-lane admission at a 20k-seed worklist (world-entry shape).
+    /// Ignored timing benchmark. Run with
+    /// `cargo test --release admit_mesh_lane_20k_select -- --ignored --nocapture`.
+    /// 2026-09-08 before O(n) select: 2299.9 µs/pass
+    /// 2026-09-08 after O(n) select: 1421.9 µs/pass (1.6×; ready() scan dominates)
+    #[test]
+    #[ignore]
+    fn admit_mesh_lane_20k_select() {
+        use super::super::{Loaded, MeshLane, MeshState, StreamLane, World, admit};
+        use crate::coord::ChunkCoord;
+        use crate::render_config::RenderConfig;
+        use crate::world::chunk::{Chunk, ChunkData};
+
+        const N: usize = 20_000;
+        const PASSES: u32 = 100;
+
+        let mut world = World::with_config_lazy(1, RenderConfig::default());
+        world.transition_lighting(false);
+        world.set_view_distances(20, 10);
+        let center = ChunkCoord::new(0, 0, 0);
+        world.center = Some(center);
+
+        let stone = world.registry.id_by_name("Stone").unwrap();
+        // Halo so every seeded coord has 6 face neighbours; interior is in-box.
+        for x in -19..=19 {
+            for z in -19..=19 {
+                for y in -9..=9 {
+                    let coord = ChunkCoord::new(x, y, z);
+                    world.chunks.insert(
+                        coord,
+                        Loaded {
+                            chunk: Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(stone))),
+                            state: MeshState::needs_mesh(),
+                            rev: 0,
+                            connectivity: None,
+                            visible: true,
+                            light: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut seeds = Vec::with_capacity(N);
+        'fill: for x in -18..=18 {
+            for z in -18..=18 {
+                for y in -8..=8 {
+                    let coord = ChunkCoord::new(x, y, z);
+                    debug_assert!(<MeshLane as StreamLane>::ready(&world, coord));
+                    seeds.push(coord);
+                    if seeds.len() == N {
+                        break 'fill;
+                    }
+                }
+            }
+        }
+        assert_eq!(seeds.len(), N, "need {N} in-box ready seeds");
+        world.workers = Some(Workers::spawn(2));
+
+        let start = Instant::now();
+        for _ in 0..PASSES {
+            world.mesh_worklist.clear();
+            world.mesh_worklist.extend(seeds.iter().copied());
+            for &coord in &seeds {
+                if let Some(loaded) = world.chunks.get_mut(&coord) {
+                    if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
+                        *building = false;
+                    }
+                }
+            }
+            world.pending_fresh.set();
+            admit::<MeshLane>(
+                &mut world,
+                center,
+                Deadline::from_budget(Duration::from_millis(2)),
+            );
+        }
+        let dt = start.elapsed();
+        let us = dt.as_secs_f64() * 1_000_000.0 / f64::from(PASSES);
+        println!(
+            "admit::<MeshLane> {N} seeds × {PASSES} passes: {:.1} µs/pass ({:.3}s total)",
+            us,
+            dt.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn near_and_far_slots_free_track_caps() {
+        let workers = Workers::spawn(2);
+        assert_eq!(workers.near_slots_free(), 8, "active*4, floored at 8");
+        assert_eq!(workers.far_slots_free(), FAR_QUEUE_CAP);
     }
 
     /// The pool-size policy: reserve two cores, cap at 12, floor at 1.
