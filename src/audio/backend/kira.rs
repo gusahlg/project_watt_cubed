@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use glam::DVec3;
 use kira::{
     AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Frame, Panning, Tween,
+    backend::cpal::CpalBackendSettings,
     effect::{
         filter::{FilterBuilder, FilterHandle, FilterMode},
         panning_control::{PanningControlBuilder, PanningControlHandle},
@@ -89,8 +90,10 @@ impl KiraBackend {
         // initialize, even though kira otherwise exposes fallible construction. Keep that
         // third-party panic behind the same Option seam as ordinary device errors so the
         // caller can select NullBackend and the game remains usable without audio.
-        let manager =
-            guarded_init(|| AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()))?;
+        let manager = guarded_init(|| AudioManager::<DefaultBackend>::new(low_latency_settings()))
+            .or_else(|| {
+                guarded_init(|| AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()))
+            })?;
         Some(Self {
             manager,
             clips: Vec::new(),
@@ -128,6 +131,17 @@ impl KiraBackend {
 /// Turn both an ordinary backend error and a dependency panic into the same
 /// unavailable-device result. `AssertUnwindSafe` is appropriate here: no state escapes
 /// the one-shot constructor unless it returns successfully.
+fn low_latency_settings() -> AudioManagerSettings<DefaultBackend> {
+    let mut settings = AudioManagerSettings::default();
+    if let Some((device, config)) = crate::audio::host::output_device_and_config() {
+        settings.backend_settings = CpalBackendSettings {
+            device: Some(device),
+            config: Some(config),
+        };
+    }
+    settings
+}
+
 fn guarded_init<T, E>(init: impl FnOnce() -> Result<T, E>) -> Option<T> {
     catch_unwind(AssertUnwindSafe(init))
         .ok()

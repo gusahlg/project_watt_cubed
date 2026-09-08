@@ -285,6 +285,21 @@ impl ChunkBox {
         c.ring(self.center) <= self.rh && c.updown(self.center) <= self.rv
     }
 
+    #[inline]
+    pub fn min(self) -> ChunkCoord {
+        ChunkCoord::new(
+            self.center.x - self.rh,
+            self.center.y - self.rv,
+            self.center.z - self.rh,
+        )
+    }
+
+    /// Inclusive axis lengths: `(x, y, z)`.
+    #[inline]
+    pub fn size(self) -> (i32, i32, i32) {
+        (2 * self.rh + 1, 2 * self.rv + 1, 2 * self.rh + 1)
+    }
+
     /// Every chunk coord in the box, iterated x → z → y (matching the triple
     /// loops this replaced, so the enqueue order is unchanged).
     pub fn coords(self) -> impl Iterator<Item = ChunkCoord> {

@@ -94,7 +94,8 @@ impl ActiveSlot {
 
 impl App {
     pub fn new() -> Self {
-        let mods = Mods::with_defaults();
+        let mut mods = Mods::with_defaults();
+        mods.apply_bench_env();
         let saves = save::list();
         let mut settings = Settings::load();
         let session = Session::load();
@@ -201,8 +202,13 @@ impl App {
         // Force vsync on whenever we're not in a live world (menus, loading):
         // there's nothing to gain from tearing/uncapped frames on a static
         // screen, and it keeps the GPU quiet. In-world we honour the setting.
+        // Only send the command on change: a SetVsync every menu frame was
+        // waking the render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
-        eng.set_vsync(!in_world || self.settings.vsync);
+        let want_vsync = !in_world || self.settings.vsync;
+        if eng.vsync() != want_vsync {
+            eng.set_vsync(want_vsync);
+        }
         self.draw(eng);
         true
     }
@@ -229,14 +235,17 @@ impl App {
             self.settings.max_fps = 0;
             self.settings.apply(eng);
             self.start_new_world(eng);
-            // Far-coordinate bench: park the player at the requested position
-            // with the ground under them made real, and give streaming a
-            // little extra warmup to catch up before sampling starts.
-            if let (Some(pos), Screen::Playing(game)) = (pos, &mut self.screen) {
-                game.player_mut().position = pos;
-                game.world_mut().prepare_around(pos);
-                if let Some(bench) = &mut self.bench {
-                    bench.add_warmup(Duration::from_secs(2));
+            if let Screen::Playing(game) = &mut self.screen {
+                game.set_input_locked(true);
+                // Far-coordinate bench: park the player at the requested position
+                // with the ground under them made real, and give streaming a
+                // little extra warmup to catch up before sampling starts.
+                if let Some(pos) = pos {
+                    game.player_mut().position = pos;
+                    game.world_mut().prepare_around(pos);
+                    if let Some(bench) = &mut self.bench {
+                        bench.add_warmup(Duration::from_secs(2));
+                    }
                 }
             }
             return true;
@@ -244,8 +253,14 @@ impl App {
         let Screen::Playing(game) = &mut self.screen else {
             return true;
         };
-        // A slow spin sweeps the frustum across the terrain like a player would.
+        // A slow spin sweeps the frustum across the terrain like a player would;
+        // an optional flight along +X (`WATT_BENCH_MOVE`) exercises the paths a
+        // static camera never touches (shadow-cascade re-render, streaming).
         game.player_mut().orientation.yaw += 0.4 * dt;
+        let move_mps = self.bench.as_ref().expect("bench exists").move_mps();
+        if move_mps > 0.0 {
+            game.player_mut().position.x += move_mps * dt as f64;
+        }
 
         let bench = self.bench.as_mut().expect("bench exists");
         let step = bench.step(
@@ -253,8 +268,22 @@ impl App {
             game.world().entry_complete(),
             game.world().stream_gauges(),
         );
-        if step != BenchmarkStep::Complete {
-            return true;
+        match step {
+            BenchmarkStep::ReadyTimeout => {
+                eprintln!("{}", game.world().entry_debug());
+                return true;
+            }
+            BenchmarkStep::Warming => {
+                if !game.world().entry_complete() && bench.wait_log_due() {
+                    eprintln!(
+                        "benchmark: waiting for world ({})",
+                        game.world().entry_debug()
+                    );
+                }
+                return true;
+            }
+            BenchmarkStep::Measuring => return true,
+            BenchmarkStep::Complete => {}
         }
         let report = bench.finish(&self.settings, eng, game.world(), game.player().position);
         report.emit();
@@ -328,6 +357,11 @@ impl App {
                 self.start_join(eng, info);
             }
             AppEffect::ToggleMod(index) => self.mods.toggle(index),
+            AppEffect::StepModKnob {
+                mod_index,
+                knob,
+                delta,
+            } => self.mods.step_knob(mod_index, knob, delta),
             AppEffect::Quit => return true,
         }
         false
@@ -355,13 +389,22 @@ impl App {
         let config = Config {
             password: info.password.clone(),
             seed,
+            worldgen: self.mods.worldgen_kind(),
+            diffusion: self.mods.diffusion_cfg(),
             ..Config::default()
         };
         match server::spawn(info.port, config) {
             Ok(handle) => {
                 let port = handle.addr().port();
                 self.host = Some(handle);
-                match Connection::connect("127.0.0.1", port, &info.name, &info.password) {
+                match Connection::connect_kind(
+                    "127.0.0.1",
+                    port,
+                    &info.name,
+                    &info.password,
+                    self.mods.worldgen_kind(),
+                    self.mods.diffusion_cfg(),
+                ) {
                     Ok(conn) => self.enter_net_game(eng, conn),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
                 }
@@ -372,7 +415,14 @@ impl App {
 
     /// Connect to a remote server and enter its world.
     fn start_join(&mut self, eng: &mut Engine, info: JoinInfo) {
-        match Connection::connect(&info.host, info.port, &info.name, &info.password) {
+        match Connection::connect_kind(
+            &info.host,
+            info.port,
+            &info.name,
+            &info.password,
+            self.mods.worldgen_kind(),
+            self.mods.diffusion_cfg(),
+        ) {
             Ok(conn) => self.enter_net_game(eng, conn),
             Err(e) => self.fail_to_menu(format!("could not join: {e}")),
         }
@@ -382,7 +432,13 @@ impl App {
     fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection) {
         // Lazy construction: the collision-safe spawn slab is prepared in
         // `enter_game`; streaming fills the remainder asynchronously.
-        let world = World::with_config_lazy(conn.seed(), self.settings.render_config());
+        let world = World::with_kind_cfg(
+            conn.seed(),
+            self.mods.mask_render(self.settings.render_config()),
+            self.mods.worldgen_kind(),
+            self.mods.diffusion_cfg(),
+            false,
+        );
         let player = Player::new(conn.spawn());
         // A networked world is a live mirror, not a save — per-world mod state
         // starts clean, but the player's enable/disable choices persist.
@@ -409,7 +465,13 @@ impl App {
         // Lazy construction: `spawn_player` queries only a few surface columns
         // (generated on demand), and `enter_game` prepares the collision-safe
         // spawn slab — the previous eager default-volume generation is avoided.
-        let world = World::with_config_lazy(seed, self.settings.render_config());
+        let world = World::with_kind_cfg(
+            seed,
+            self.mods.mask_render(self.settings.render_config()),
+            self.mods.worldgen_kind(),
+            self.mods.diffusion_cfg(),
+            false,
+        );
         let player = spawn_player(&world);
         let id = save::fresh_id();
         let now = save::unix_now();
@@ -438,7 +500,7 @@ impl App {
             Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
         };
         self.mods.reset_state();
-        let render = self.settings.render_config();
+        let render = self.mods.mask_render(self.settings.render_config());
         match save::load(&id, &mut self.mods, |seed| {
             World::with_config_lazy(seed, render)
         }) {
@@ -464,7 +526,8 @@ impl App {
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
         // World-construction lanes apply on entry only, before streaming spins;
         // everything live-applicable goes through the same path `/gfx` uses.
-        let render = self.settings.render_config();
+        let render = self.mods.mask_render(self.settings.render_config());
+        game.set_visual_mask(crate::mods::VisualMask::from_mods(&self.mods));
         game.world_mut()
             .set_render_lanes(render.occlusion, render.lod2);
         game.apply_settings(eng, &mut self.settings);

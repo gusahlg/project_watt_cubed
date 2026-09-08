@@ -111,10 +111,10 @@ macro_rules! stream_lanes {
 stream_lanes! {
     /// Patches each drawable chunk's GPU visibility mask — CPU lane, needs the
     /// engine.
-    occlusion: new OcclusionLane("occlusion", Budget::Dispatches(super::OCCLUSION_FILL_BUDGET as u16))
-        => |ctx, _b| {
+    occlusion: new OcclusionLane("occlusion", Budget::Millis(0.5))
+        => |ctx, b| {
             let eng = ctx.eng.as_deref_mut().expect("occlusion patches masks; eng required");
-            ctx.world.rebuild_occlusion(eng)
+            ctx.world.rebuild_occlusion(eng, b)
         },
     /// Synchronous remesh of edited (`Dirty`) chunks (`World::remesh_dirty`).
     /// Uploads through the engine, so it needs `ctx.eng`.

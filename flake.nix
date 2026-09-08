@@ -33,9 +33,8 @@
           libxcursor
           libxrandr
           libxi
-          # cpal prefers its native PulseAudio-protocol host (also provided by
-          # PipeWire) and falls back to ALSA. Kira's realtime audio scheduling
-          # feature also talks to the system D-Bus daemon.
+          # cpal talks to ALSA (including PipeWire's ALSA plugin). Kira's
+          # realtime audio scheduling feature talks to the system D-Bus daemon.
           alsa-lib
           dbus
         ];

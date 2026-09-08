@@ -18,6 +18,7 @@ pub mod capture;
 pub mod content;
 pub mod director;
 pub mod frame;
+pub(crate) mod host;
 pub mod palette;
 pub mod voice;
 

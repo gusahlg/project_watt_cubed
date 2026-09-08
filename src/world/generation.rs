@@ -31,8 +31,37 @@ use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
+/// Which generator a world is built with. Folded into the content fingerprint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WorldgenKind {
+    #[default]
+    Classic,
+    Diffusion,
+}
+
+impl WorldgenKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Diffusion => "diffusion",
+        }
+    }
+}
+
 /// Produces terrain for absolute world coordinates.
-pub trait TerrainGenerator {
+pub trait TerrainGenerator: Send + Sync {
+    /// World seed this generator was built from.
+    fn seed(&self) -> i64 {
+        0
+    }
+    /// Sea level in blocks, for spawn and flooding.
+    fn sea_level(&self) -> i32 {
+        20
+    }
+    /// Stable id folded into the content fingerprint (`classic`, `diffusion`, …).
+    fn kind(&self) -> &'static str {
+        "classic"
+    }
     /// Topmost non-ground cell in this column.
     fn height(&self, wx: i32, wz: i32) -> i32;
 
@@ -612,7 +641,7 @@ fn octave2_sup(seed: u64, x0: i32, z0: i32, dx: i32, dz: i32, freq: f64) -> f32 
     hi
 }
 
-fn cell_hash(seed: i64, x: i32, y: i32, z: i32) -> u32 {
+pub(crate) fn cell_hash(seed: i64, x: i32, y: i32, z: i32) -> u32 {
     let h = (seed as u64 ^ 0x517C_C1B7_2722_0A95)
         ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
@@ -1180,6 +1209,13 @@ impl Terrain {
 }
 
 impl TerrainGenerator for Terrain {
+    fn seed(&self) -> i64 {
+        self.seed
+    }
+    fn sea_level(&self) -> i32 {
+        self.sea_level
+    }
+
     /// The LOD/spawn surface height — the topmost *ground* cell's column value.
     /// Caves never carve the top [`CAVE_MIN_DEPTH`] cells, so the topmost ground
     /// cell is always `height − 1`. Overhang shelves sit in the air above the surface

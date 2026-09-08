@@ -357,7 +357,7 @@ pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables
 /// production worker path. Skips the whole RLE brick round trip
 /// ([`Section::extract`]'s per-column run slicing plus this module's decode),
 /// which existed only because the temporary [`Section`] was built and dropped.
-pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator>(
+pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
@@ -477,7 +477,11 @@ mod tests {
         surf: BlockId,
         deep: BlockId,
     }
-    impl<H: Fn(i32, i32) -> i32, B: Fn(i32, i32, i32) -> BlockId> TerrainGenerator for FnGen<H, B> {
+    impl<H, B> TerrainGenerator for FnGen<H, B>
+    where
+        H: Fn(i32, i32) -> i32 + Send + Sync,
+        B: Fn(i32, i32, i32) -> BlockId + Send + Sync,
+    {
         fn height(&self, wx: i32, wz: i32) -> i32 {
             (self.h)(wx, wz)
         }

@@ -12,7 +12,6 @@ use crate::derived::Revision;
 use crate::math::block_coord;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::generation::TerrainGenerator;
 use super::heightmip::{BakeExtent, HeightMip};
 use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
@@ -282,7 +281,7 @@ impl World {
 
     /// The unload box: the mesh box plus the unload hysteresis, past which
     /// chunks are freed.
-    fn unload_box(&self, center: Coord) -> ChunkBox {
+    pub(in crate::world) fn unload_box(&self, center: Coord) -> ChunkBox {
         self.view.unload(center)
     }
 
@@ -558,10 +557,12 @@ impl World {
             let frontier_key = SectionFrontierKey {
                 center_xz: [center_chunk.x, center_chunk.z],
                 eye_y: self.section_eye_y.to_bits(),
+                // Quantise to 0.25 m/s so a continuously changing flight
+                // velocity does not recompute the frontier every pass.
                 velocity: [
-                    self.section_vel.x.to_bits(),
-                    self.section_vel.y.to_bits(),
-                    self.section_vel.z.to_bits(),
+                    (self.section_vel.x * 4.0).round().to_bits(),
+                    (self.section_vel.y * 4.0).round().to_bits(),
+                    (self.section_vel.z * 4.0).round().to_bits(),
                 ],
                 unit: self.section_pyramid.unit.to_bits(),
                 finest: self.section_pyramid.finest.0,
@@ -845,8 +846,13 @@ impl World {
     /// `retire` frees whatever the old state carried, exactly once.
     fn upload_chunk(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
         let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
+        let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             loaded.retire(MeshState::from_upload(handles), eng);
+            loaded.visible = vis;
+            if !vis && let Some(meshes) = loaded.state.live_meshes() {
+                meshes.set_visible(eng, false);
+            }
         }
     }
 
@@ -1167,6 +1173,7 @@ impl World {
                 state,
                 rev: 0,
                 connectivity: None,
+                visible: true,
                 light: None,
             },
         );

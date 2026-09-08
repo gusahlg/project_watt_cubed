@@ -16,6 +16,14 @@ pub const LOD_DETAIL_RANGE: RangeInclusive<u8> = 2..=6;
 /// throughout the quadtree assume a small, consecutive base-2 ladder.
 const LOD_COARSEST_DETAIL: u8 = 9;
 
+/// Fancy presentation groups owned by default-enabled visual mods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualGroup {
+    Atmosphere,
+    Post,
+    Lighting,
+}
+
 /// Render lane toggles. `Copy` to thread freely.
 #[derive(Clone, Copy)]
 pub struct RenderConfig {
@@ -95,9 +103,65 @@ impl Default for RenderConfig {
 }
 
 impl RenderConfig {
+    /// Core look: sunlight on readable terrain, every fancy lane off.
+    /// Visual mods OR settings back onto this.
+    pub fn core() -> Self {
+        Self {
+            occlusion: false,
+            lod2: false,
+            lod_levels: 1,
+            lod_detail: 6,
+            blocklight: false,
+            exposure: false,
+            bloom: false,
+            godrays: false,
+            clouds: false,
+            weather: false,
+            stars: false,
+            day_night: false,
+            taa: false,
+            fog: false,
+            ambient: false,
+            sunlight: true,
+            shadows: false,
+            sky: false,
+            vrs: false,
+            water_anim: false,
+            vignette: false,
+        }
+    }
+
     /// Golden harness config: defaults with blocklight and exposure for proper lighting.
     pub fn golden() -> Self {
         Self { blocklight: true, exposure: true, ..Self::default() }
+    }
+
+    /// Drop one visual group; used when that group's mod is disabled.
+    pub fn strip_group(&mut self, group: VisualGroup) {
+        match group {
+            VisualGroup::Atmosphere => {
+                self.clouds = false;
+                self.weather = false;
+                self.stars = false;
+                self.day_night = false;
+                self.fog = false;
+                self.sky = false;
+                self.water_anim = false;
+            }
+            VisualGroup::Post => {
+                self.bloom = false;
+                self.godrays = false;
+                self.taa = false;
+                self.exposure = false;
+                self.vignette = false;
+                self.vrs = false;
+            }
+            VisualGroup::Lighting => {
+                self.shadows = false;
+                self.ambient = false;
+                self.blocklight = false;
+            }
+        }
     }
 
     /// Clamp the requested LOD ladder to the supported ranges and shorten it

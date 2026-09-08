@@ -33,6 +33,8 @@ const SCHEMA_VERSION: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Warming,
+    /// Warmup ended without world readiness; measurement starts next frame.
+    ReadyTimeout,
     Measuring,
     Complete,
 }
@@ -50,6 +52,9 @@ pub struct Benchmark {
     min_warmup: Duration,
     ready_timeout: Duration,
     pos: Option<DVec3>,
+    /// Flight speed along +X during the run (`WATT_BENCH_MOVE`, m/s); zero
+    /// keeps the classic static steady-rotate scenario.
+    move_mps: f64,
     output: Option<PathBuf>,
     tag: Option<String>,
     phase: Phase,
@@ -66,6 +71,7 @@ pub struct Benchmark {
     rss_start_bytes: Option<u64>,
     rss_peak_bytes: Option<u64>,
     last_rss_poll: Instant,
+    ready_wait_logs: u32,
 }
 
 impl Benchmark {
@@ -93,6 +99,7 @@ impl Benchmark {
                 None
             })
         });
+        let move_mps = env_seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
         let output = std::env::var_os("WATT_BENCH_OUTPUT")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -107,6 +114,7 @@ impl Benchmark {
             min_warmup: Duration::from_secs_f64(min_warmup),
             ready_timeout: Duration::from_secs_f64(ready_timeout),
             pos,
+            move_mps,
             output,
             tag,
             phase: Phase::WaitingToStart,
@@ -123,6 +131,7 @@ impl Benchmark {
             rss_start_bytes: None,
             rss_peak_bytes: None,
             last_rss_poll: now,
+            ready_wait_logs: 0,
         })
     }
 
@@ -132,6 +141,11 @@ impl Benchmark {
 
     pub fn position(&self) -> Option<DVec3> {
         self.pos
+    }
+
+    /// Flight speed along +X (m/s); zero for the static scenario.
+    pub fn move_mps(&self) -> f64 {
+        self.move_mps
     }
 
     /// Start metadata collection inside the already-created engine callback,
@@ -149,6 +163,23 @@ impl Benchmark {
     /// extra grace while still using the readiness gate.
     pub fn add_warmup(&mut self, extra: Duration) {
         self.min_warmup = self.min_warmup.saturating_add(extra);
+    }
+
+    /// True at most once per 5 s of wall time while still warming.
+    pub fn wait_log_due(&mut self) -> bool {
+        if self.phase != Phase::Warming {
+            return false;
+        }
+        let Some(started) = self.warmup_started else {
+            return false;
+        };
+        let n = (started.elapsed().as_secs() / 5) as u32;
+        if n > self.ready_wait_logs {
+            self.ready_wait_logs = n;
+            true
+        } else {
+            false
+        }
     }
 
     /// Advance warmup/measurement using wall time for boundaries and the
@@ -179,6 +210,7 @@ impl Benchmark {
                         "benchmark: world did not become ready within {:.1}s; measuring with readiness=false",
                         self.ready_timeout.as_secs_f64()
                     );
+                    return Step::ReadyTimeout;
                 }
                 // Do not count the final warmup frame as the first sample.
                 Step::Warming
@@ -216,6 +248,7 @@ impl Benchmark {
         }
         let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
         let stats = FrameStats::from_samples(&self.samples, wall);
+        let visuals = std::env::var("WATT_BENCH_VISUALS").ok();
         let report = Json::object(vec![
             ("schema_version", Json::from(SCHEMA_VERSION)),
             ("kind", Json::from("project_watt_cubed.runtime_benchmark")),
@@ -231,8 +264,18 @@ impl Benchmark {
             (
                 "scenario",
                 Json::object(vec![
-                    ("name", Json::from("steady_rotate")),
+                    (
+                        "name",
+                        Json::from(if self.move_mps > 0.0 {
+                            "rotate_and_fly"
+                        } else {
+                            "steady_rotate"
+                        }),
+                    ),
+                    ("move_mps", Json::number(self.move_mps)),
                     ("seed", Json::from(world.seed())),
+                    ("worldgen", Json::from(world.worldgen_kind())),
+                    ("visuals", Json::optional_str(visuals.as_deref())),
                     ("requested_position", position_json(self.pos)),
                     ("actual_position", position_json(Some(actual_position))),
                     ("yaw_rate_rad_s", Json::number(0.4)),
@@ -641,5 +684,56 @@ mod tests {
         assert!(parse_position("1,2,3").is_some());
         assert!(parse_position("1,2,3,4").is_none());
         assert!(parse_position("NaN,2,3").is_none());
+    }
+
+    fn test_bench(min_warmup: Duration, ready_timeout: Duration) -> Benchmark {
+        Benchmark {
+            duration: Duration::from_secs(1),
+            min_warmup,
+            ready_timeout,
+            pos: None,
+            move_mps: 0.0,
+            output: None,
+            tag: None,
+            phase: Phase::WaitingToStart,
+            warmup_started: None,
+            measure_started: None,
+            ready_before_measure: false,
+            warmup_elapsed: Duration::ZERO,
+            samples: Vec::new(),
+            first_gauges: None,
+            last_gauges: StreamGauges::default(),
+            peaks: StreamPeaks::default(),
+            system: None,
+            started_unix_ms: 0,
+            rss_start_bytes: None,
+            rss_peak_bytes: None,
+            last_rss_poll: Instant::now(),
+            ready_wait_logs: 0,
+        }
+    }
+
+    #[test]
+    fn ready_timeout_is_signaled_once_then_measurement_starts() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.begin();
+        bench.warmup_started = Some(Instant::now() - Duration::from_secs(1));
+        let gauges = StreamGauges::default();
+        assert_eq!(bench.step(0.016, false, gauges), Step::ReadyTimeout);
+        assert!(!bench.ready_before_measure);
+        assert_eq!(bench.step(0.016, false, gauges), Step::Measuring);
+    }
+
+    #[test]
+    fn wait_log_due_fires_once_per_five_seconds_while_warming() {
+        let mut bench = test_bench(Duration::from_secs(60), Duration::from_secs(60));
+        bench.begin();
+        assert!(!bench.wait_log_due());
+        bench.warmup_started = Some(Instant::now() - Duration::from_secs(5));
+        assert!(bench.wait_log_due());
+        assert!(!bench.wait_log_due());
+        bench.warmup_started = Some(Instant::now() - Duration::from_secs(10));
+        assert!(bench.wait_log_due());
+        assert!(!bench.wait_log_due());
     }
 }

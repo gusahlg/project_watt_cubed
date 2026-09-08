@@ -123,7 +123,7 @@ impl PersonView {
 
 /// Continuous flight input for the detached rig, already resolved from
 /// bindings at the call site so this module never reads devices.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FlyAxes {
     pub forward: f64,
     pub right: f64,

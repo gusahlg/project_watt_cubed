@@ -16,7 +16,7 @@
 //! **Trust.** Joins are password-gated and version-checked; frames are size-capped
 //! by [`protocol`]; every client is rate-limited; every edit is bounds- and
 //! reach-validated against the sender's own reported position.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,7 +36,8 @@ use crate::block::registry::BlockRegistry;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
-use crate::world::generation::{SineHills, TerrainGenerator};
+use crate::world::diffusion::DiffusionCfg;
+use crate::world::generation::{TerrainGenerator, WorldgenKind};
 
 /// A client thread that panics while holding the state must not take the whole
 /// server down with it — [`State`] is plain data, valid at every point a panic
@@ -98,8 +99,6 @@ const MAX_SPEC_POOL: usize = 16_384;
 const SNAPSHOT_BATCH: usize = (crate::net::MAX_FRAME - 64) / (12 + 4 + 2 + MAX_SPEC);
 /// Matches the client's [`World`](crate::world::World::new) so server spawn
 /// heights land on real ground.
-const TERRAIN_BASE: f32 = 20.0;
-
 pub struct Config {
     /// Empty means no password is required.
     pub password: String,
@@ -107,6 +106,8 @@ pub struct Config {
     pub day_secs: f32,
     /// Off, a teleport is answered with an authoritative snap-back.
     pub allow_teleport: bool,
+    pub worldgen: WorldgenKind,
+    pub diffusion: DiffusionCfg,
 }
 
 impl Default for Config {
@@ -116,6 +117,8 @@ impl Default for Config {
             seed: 0,
             day_secs: 600.0, // matches the client's default DayLength
             allow_teleport: true,
+            worldgen: WorldgenKind::Classic,
+            diffusion: DiffusionCfg::default(),
         }
     }
 }
@@ -126,7 +129,7 @@ struct Ctx {
     fingerprint: u64,
     day_secs: f32,
     allow_teleport: bool,
-    generator: SineHills,
+    generator: crate::world::diffusion::Generator,
 }
 
 struct PlayerHandle {
@@ -142,7 +145,7 @@ struct PlayerHandle {
     /// Ids inside mutual interest range (`a.visible.contains(b) ==
     /// b.visible.contains(a)`). Maintained by [`on_move`]'s diff; drives
     /// PeerExited/re-entry pose events.
-    visible: std::collections::HashSet<u32>,
+    visible: HashSet<u32>,
     out: SyncSender<Arc<[u8]>>,
     /// Wakes a misbehaving client's reader out of its blocking read so cleanup
     /// runs. A `Notify` rather than `quinn::Connection` so it's cheap to
@@ -156,12 +159,24 @@ struct PlayerHandle {
     backlog: Vec<Arc<[u8]>>,
 }
 
+/// A recipient and its encoded frame, queued after releasing the state lock.
+type PendingSend = (u32, SyncSender<Arc<[u8]>>, Arc<[u8]>);
+
+impl PlayerHandle {
+    fn correct_position(&self, id: u32, sends: &mut Vec<PendingSend>) {
+        if self.ready {
+            let frame = ServerMessage::Position { pos: self.pos }.encode().into();
+            sends.push((id, self.out.clone(), frame));
+        }
+    }
+}
+
 /// Overflow marks a joiner slow (kicked) — matching the outbound-queue policy.
 const BOOTSTRAP_BACKLOG: usize = 256;
 
 /// The optimistic-concurrency token racing edits compare against.
 struct Cell {
-    spec: std::sync::Arc<str>,
+    spec: Arc<str>,
     rev: u32,
 }
 
@@ -172,7 +187,7 @@ struct State {
     /// allocation. Released once no live cell references them
     /// ([`State::release`]) and capped at [`MAX_SPEC_POOL`], so per-entry
     /// weight is bounded by real content, not attacker-minted strings.
-    spec_pool: std::collections::HashSet<std::sync::Arc<str>>,
+    spec_pool: HashSet<Arc<str>>,
     /// The same compiled palette clients build, so specs validate/canonicalize
     /// under EXACTLY the rules clients apply.
     registry: BlockRegistry,
@@ -214,28 +229,50 @@ impl State {
         }
     }
 
+    /// The grid narrows candidates; exact distance and readiness decide visibility.
+    fn visible_from(&self, id: u32, pos: DVec3) -> HashSet<u32> {
+        let at = bucket_of(pos);
+        let mut visible = HashSet::new();
+        for dx in -1..=1i32 {
+            for dz in -1..=1i32 {
+                let key = (at.0.wrapping_add(dx), at.1.wrapping_add(dz));
+                let Some(bucket) = self.grid.get(&key) else { continue };
+                for &pid in bucket {
+                    if pid == id {
+                        continue;
+                    }
+                    let Some(other) = self.players.get(&pid) else { continue };
+                    if other.ready && other.pos.distance_squared(pos) <= INTEREST_RADIUS_SQ {
+                        visible.insert(pid);
+                    }
+                }
+            }
+        }
+        visible
+    }
+
     fn day_now(&self, day_secs: f32) -> f32 {
         let elapsed = self.day_set.elapsed().as_secs_f32();
         (self.day + elapsed / day_secs.max(1.0)).rem_euclid(1.0)
     }
 
     /// `None` at the [`MAX_SPEC_POOL`] cap.
-    fn intern(&mut self, spec: &str) -> Option<std::sync::Arc<str>> {
+    fn intern(&mut self, spec: &str) -> Option<Arc<str>> {
         if let Some(shared) = self.spec_pool.get(spec) {
             return Some(shared.clone());
         }
         if self.spec_pool.len() >= MAX_SPEC_POOL {
             return None;
         }
-        let shared: std::sync::Arc<str> = std::sync::Arc::from(spec);
+        let shared: Arc<str> = Arc::from(spec);
         self.spec_pool.insert(shared.clone());
         Some(shared)
     }
 
     /// `old` is the reference just removed from the overlay: when the pool
     /// entry and `old` are the only two remaining owners, it's dead content.
-    fn release(&mut self, old: std::sync::Arc<str>) {
-        if std::sync::Arc::strong_count(&old) == 2 {
+    fn release(&mut self, old: Arc<str>) {
+        if Arc::strong_count(&old) == 2 {
             self.spec_pool.remove(&old);
         }
     }
@@ -247,6 +284,12 @@ impl State {
 /// insert and remove share this one mapping, so the grid stays consistent.
 fn bucket_of(pos: DVec3) -> (i32, i32) {
     (block_coord(pos.x / INTEREST_RADIUS), block_coord(pos.z / INTEREST_RADIUS))
+}
+
+fn outside_world(pos: DVec3) -> bool {
+    pos.x.abs() > crate::math::WORLD_BORDER
+        || pos.y.abs() > crate::math::WORLD_BORDER
+        || pos.z.abs() > crate::math::WORLD_BORDER
 }
 
 /// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
@@ -303,18 +346,23 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     // Doubles as spawn-height terrain, the content identity joins must match,
     // and the edit-spec validator.
     let mut registry = BlockRegistry::with_builtins();
-    let generator = SineHills::new(&mut registry, TERRAIN_BASE, config.seed);
+    let generator = match config.worldgen {
+        WorldgenKind::Classic => crate::world::diffusion::classic(&mut registry, config.seed),
+        WorldgenKind::Diffusion => {
+            crate::world::diffusion::diffusion(&mut registry, config.seed, config.diffusion)
+        }
+    };
     let ctx = Arc::new(Ctx {
         password: config.password,
         seed: config.seed,
-        fingerprint: crate::net::fingerprint_of(&registry),
+        fingerprint: crate::net::fingerprint_kind_cfg(&registry, config.worldgen, config.diffusion),
         day_secs: config.day_secs,
         allow_teleport: config.allow_teleport,
         generator,
     });
     let shared = Arc::new(Mutex::new(State {
         edits: HashMap::new(),
-        spec_pool: std::collections::HashSet::new(),
+        spec_pool: HashSet::new(),
         registry,
         players: HashMap::new(),
         grid: HashMap::new(),
@@ -465,7 +513,7 @@ fn handle_client(
         }
         id = state.next_id;
         state.next_id += 1;
-        spawn = spawn_point(&ctx.generator, id);
+        spawn = spawn_point(ctx.generator.as_ref(), id);
 
         // Roster only — poses flow through the visibility machinery once the
         // joiner reports their first move, so a far peer isn't a frozen ghost.
@@ -487,7 +535,7 @@ fn handle_client(
                 pitch: 0.0,
                 stance: Stance::Standing,
                 last_move: Instant::now(),
-                visible: std::collections::HashSet::new(),
+                visible: HashSet::new(),
                 out: out.clone(),
                 kick: kick.clone(),
                 ready: false,
@@ -676,7 +724,7 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32
     {
         return;
     }
-    let mut sends: Vec<(u32, SyncSender<Arc<[u8]>>, Arc<[u8]>)> = Vec::new();
+    let mut sends = Vec::new();
     {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
@@ -685,15 +733,8 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32
         // its authoritative position instead of silently diverging.
         let elapsed = h.last_move.elapsed().as_secs_f64().min(MOVE_WINDOW_CAP_SECS);
         let allowed = MAX_MOVE_SPEED * (elapsed + MOVE_SLACK_SECS);
-        let outside = pos.x.abs() > crate::math::WORLD_BORDER
-            || pos.y.abs() > crate::math::WORLD_BORDER
-            || pos.z.abs() > crate::math::WORLD_BORDER;
-        if outside || h.pos.distance_squared(pos) > allowed * allowed {
-            let correction: Arc<[u8]> =
-                ServerMessage::Position { pos: h.pos }.encode().into();
-            if h.ready {
-                sends.push((id, h.out.clone(), correction));
-            }
+        if outside_world(pos) || h.pos.distance_squared(pos) > allowed * allowed {
+            h.correct_position(id, &mut sends);
         } else {
             commit_pose(&mut state, id, pos, Some((yaw, pitch, stance)), &mut sends);
         }
@@ -708,19 +749,12 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
         return;
     }
-    let mut sends: Vec<(u32, SyncSender<Arc<[u8]>>, Arc<[u8]>)> = Vec::new();
+    let mut sends = Vec::new();
     {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
-        let outside = pos.x.abs() > crate::math::WORLD_BORDER
-            || pos.y.abs() > crate::math::WORLD_BORDER
-            || pos.z.abs() > crate::math::WORLD_BORDER;
-        if outside || !ctx.allow_teleport {
-            let correction: Arc<[u8]> =
-                ServerMessage::Position { pos: h.pos }.encode().into();
-            if h.ready {
-                sends.push((id, h.out.clone(), correction));
-            }
+        if outside_world(pos) || !ctx.allow_teleport {
+            h.correct_position(id, &mut sends);
         } else {
             commit_pose(&mut state, id, pos, None, &mut sends);
         }
@@ -738,7 +772,7 @@ fn commit_pose(
     id: u32,
     pos: DVec3,
     angles: Option<(f32, f32, Stance)>,
-    sends: &mut Vec<(u32, SyncSender<Arc<[u8]>>, Arc<[u8]>)>,
+    sends: &mut Vec<PendingSend>,
 ) {
     let Some(h) = state.players.get_mut(&id) else { return };
     let old = h.pos;
@@ -755,39 +789,13 @@ fn commit_pose(
         state.grid_remove(id, old);
         state.grid_insert(id, pos);
     }
-    let move_frame: Arc<[u8]> =
-        ServerMessage::PeerMove { id, pos, yaw, pitch, stance }.encode().into();
-
-    // Buckets are one INTEREST_RADIUS wide: the grid only narrows candidates
-    // (never the audience), so an exact distance check still gates below.
-    // `wrapping_add` so a hostile i32-edge position can't overflow.
-    let mut now_visible: Vec<u32> = Vec::new();
-    for dx in -1..=1i32 {
-        for dz in -1..=1i32 {
-            let key = (to.0.wrapping_add(dx), to.1.wrapping_add(dz));
-            let Some(bucket) = state.grid.get(&key) else { continue };
-            for &pid in bucket {
-                if pid == id {
-                    continue;
-                }
-                let Some(other) = state.players.get(&pid) else { continue };
-                if !other.ready {
-                    continue;
-                }
-                if other.pos.distance_squared(pos) > INTEREST_RADIUS_SQ {
-                    continue;
-                }
-                now_visible.push(pid);
-            }
-        }
-    }
-
+    // Set membership keeps the visibility diff linear in the nearby player count.
+    let now_visible = state.visible_from(id, pos);
     let mover_out = state.players[&id].out.clone();
     let departed: Vec<u32> = state.players[&id]
         .visible
-        .iter()
+        .difference(&now_visible)
         .copied()
-        .filter(|pid| !now_visible.contains(pid))
         .collect();
     for pid in departed {
         state.players.get_mut(&id).map(|h| h.visible.remove(&pid));
@@ -807,6 +815,11 @@ fn commit_pose(
     }
     // An arriving peer needs the mover's pose AND the mover needs theirs, or
     // the mover keeps hiding them until they next move.
+    if now_visible.is_empty() {
+        return;
+    }
+    let move_frame: Arc<[u8]> =
+        ServerMessage::PeerMove { id, pos, yaw, pitch, stance }.encode().into();
     for pid in now_visible {
         let entered = !state.players[&id].visible.contains(&pid);
         let Some(other) = state.players.get_mut(&pid) else { continue };
@@ -829,7 +842,7 @@ fn commit_pose(
 }
 
 /// A full (or hung-up) queue marks its owner for the kick pass.
-fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<(u32, SyncSender<Arc<[u8]>>, Arc<[u8]>)>) {
+fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<PendingSend>) {
     let mut slow = Vec::new();
     for (pid, out, frame) in sends {
         if out.try_send(frame).is_err() && !slow.contains(&pid) {
@@ -1004,7 +1017,7 @@ fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason:
 
 /// Scattered a little per id so players don't stack on the exact same block;
 /// scans outward for the first column above sea level.
-fn spawn_point(generator: &SineHills, id: u32) -> DVec3 {
+fn spawn_point(generator: &dyn TerrainGenerator, id: u32) -> DVec3 {
     let sx = (id % 8) as i32 - 3;
     let sz = ((id / 8) % 8) as i32 - 3;
     let sea = generator.sea_level();
@@ -1045,8 +1058,8 @@ mod tests {
 
     use super::*;
 
-    fn test_generator() -> SineHills {
-        SineHills::new(&mut BlockRegistry::with_builtins(), TERRAIN_BASE, 4242)
+    fn test_generator() -> crate::world::diffusion::Generator {
+        crate::world::diffusion::classic(&mut BlockRegistry::with_builtins(), 4242)
     }
 
     #[test]
@@ -1066,7 +1079,7 @@ mod tests {
     fn spawn_points_sit_above_the_surface() {
         let terrain = test_generator();
         for id in 1..20 {
-            let p = spawn_point(&terrain, id);
+            let p = spawn_point(terrain.as_ref(), id);
             let ground = terrain.height(block_coord(p.x), block_coord(p.z));
             assert!(p.y > ground as f64, "spawn should be above ground");
         }
@@ -1083,7 +1096,7 @@ mod tests {
             pitch: 0.0,
             stance: Stance::Standing,
             last_move: Instant::now() - Duration::from_secs(10),
-            visible: std::collections::HashSet::new(),
+            visible: HashSet::new(),
             out,
             kick,
             ready: true,
@@ -1129,7 +1142,7 @@ mod tests {
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
         State {
             edits: HashMap::new(),
-            spec_pool: std::collections::HashSet::new(),
+            spec_pool: HashSet::new(),
             registry: BlockRegistry::with_builtins(),
             players,
             grid: HashMap::new(),
@@ -1400,6 +1413,89 @@ mod tests {
             let s = shared.lock_recover();
             assert_eq!(s.grid.get(&(-1, -1)).map(Vec::len), Some(1));
             assert_eq!(s.grid.len(), 1);
+        }
+    }
+
+    #[test]
+    fn visibility_changes_match_full_roster_distance_checks() {
+        let radius = INTEREST_RADIUS;
+        let positions = [
+            DVec3::ZERO,
+            DVec3::new(radius, 0.0, 0.0),
+            DVec3::new(-radius, 0.0, 0.0),
+            DVec3::new(0.0, radius + 1.0, 0.0),
+            DVec3::new(4.0 * radius, 0.0, 0.0),
+            DVec3::new(0.0, 0.0, radius / 2.0),
+            DVec3::new(2.0 * radius, 0.0, 0.0),
+        ];
+        let (out, _rx) = sync_channel(OUT_CAPACITY);
+        let mut state = test_state(HashMap::new());
+        for (index, pos) in positions.into_iter().enumerate() {
+            let id = index as u32 + 1;
+            state.players.insert(id, test_player(pos, out.clone(), test_kick()));
+            state.grid_insert(id, pos);
+        }
+        // A nearby joiner must finish its snapshot before it receives poses.
+        state.players.get_mut(&6).unwrap().ready = false;
+
+        let mut previous = HashSet::new();
+        for pos in [
+            DVec3::ZERO,
+            DVec3::ZERO,
+            positions[1],
+            positions[4],
+            DVec3::ZERO,
+            DVec3::new(9.0 * radius, 0.0, 0.0),
+        ] {
+            let expected: HashSet<u32> = state.players
+                .iter()
+                .filter(|&(&id, player)| {
+                    id != 1 && player.ready && player.pos.distance_squared(pos) <= radius * radius
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            let mut expected_sends = Vec::new();
+            for &id in previous.difference(&expected) {
+                expected_sends.push((id, ServerMessage::PeerExited { id: 1 }));
+                expected_sends.push((1, ServerMessage::PeerExited { id }));
+            }
+            for &id in &expected {
+                expected_sends.push((
+                    id,
+                    ServerMessage::PeerMove {
+                        id: 1, pos, yaw: 0.0, pitch: 0.0, stance: Stance::Standing,
+                    },
+                ));
+                if !previous.contains(&id) {
+                    let player = &state.players[&id];
+                    expected_sends.push((
+                        1,
+                        ServerMessage::PeerMove {
+                            id,
+                            pos: player.pos,
+                            yaw: player.yaw,
+                            pitch: player.pitch,
+                            stance: player.stance,
+                        },
+                    ));
+                }
+            }
+
+            let mut sends = Vec::new();
+            commit_pose(&mut state, 1, pos, None, &mut sends);
+            assert_eq!(state.players[&1].visible, expected, "mover at {pos:?}");
+            for (&id, player) in &state.players {
+                assert_eq!(player.visible.contains(&1), expected.contains(&id), "peer {id}");
+            }
+            let actual: Vec<_> = sends
+                .into_iter()
+                .map(|(id, _, frame)| (id, ServerMessage::decode(&frame).unwrap()))
+                .collect();
+            assert_eq!(actual.len(), expected_sends.len());
+            for send in expected_sends {
+                assert!(actual.contains(&send), "missing {send:?} at {pos:?}");
+            }
+            previous = expected;
         }
     }
 

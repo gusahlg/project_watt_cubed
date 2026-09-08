@@ -9,8 +9,10 @@
 //! disabled mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
 pub mod crafting;
+pub mod diffusion;
 pub mod inventory;
 pub mod menu_default;
+pub mod visuals;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -20,8 +22,55 @@ use voxel_engine::Engine;
 use crate::block::ElementId;
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
+use crate::render_config::{RenderConfig, VisualGroup};
 use crate::ui::HudElement;
+use crate::world::diffusion::DiffusionCfg;
+use crate::world::generation::WorldgenKind;
 use crate::world::World;
+
+/// One tunable shown under a mod in the mods menu.
+#[derive(Clone, Debug)]
+pub struct Knob {
+    pub label: &'static str,
+    pub value: String,
+}
+
+/// Which fancy visual groups are currently enabled.
+#[derive(Clone, Copy, Debug)]
+pub struct VisualMask {
+    pub atmosphere: bool,
+    pub post: bool,
+    pub lighting: bool,
+}
+
+impl Default for VisualMask {
+    fn default() -> Self {
+        Self {
+            atmosphere: true,
+            post: true,
+            lighting: true,
+        }
+    }
+}
+
+impl VisualMask {
+    pub fn from_mods(mods: &Mods) -> Self {
+        mods.visual_mask()
+    }
+
+    pub fn apply(self, mut cfg: RenderConfig) -> RenderConfig {
+        if !self.atmosphere {
+            cfg.strip_group(VisualGroup::Atmosphere);
+        }
+        if !self.post {
+            cfg.strip_group(VisualGroup::Post);
+        }
+        if !self.lighting {
+            cfg.strip_group(VisualGroup::Lighting);
+        }
+        cfg
+    }
+}
 
 /// The element counts the player is carrying — the single source of truth shared
 /// by the inventory mod (which fills and displays it) and the crafting mod (which
@@ -276,6 +325,28 @@ pub trait Mod {
     fn load_state(&mut self, data: &str, world: &mut World) {
         let _ = (data, world);
     }
+
+    /// Which fancy render group this mod owns, if any.
+    fn visual_group(&self) -> Option<VisualGroup> {
+        None
+    }
+
+    /// If this mod replaces worldgen, the kind to use when it is enabled.
+    fn worldgen(&self) -> Option<WorldgenKind> {
+        None
+    }
+
+    fn knobs(&self) -> Vec<Knob> {
+        Vec::new()
+    }
+
+    fn step_knob(&mut self, index: usize, delta: i32) {
+        let _ = (index, delta);
+    }
+
+    fn diffusion_cfg(&self) -> Option<DiffusionCfg> {
+        None
+    }
 }
 
 /// One installed mod and whether it is currently active.
@@ -309,6 +380,12 @@ impl Mods {
             true,
         );
         mods.install(Box::new(crafting::CraftingMod::new(stash, item_ui)), true);
+        // Fancy lanes live in mods; disable any of these to get the core look.
+        mods.install(Box::new(visuals::AtmosphereMod), true);
+        mods.install(Box::new(visuals::PostMod), true);
+        mods.install(Box::new(visuals::LightingMod), true);
+        // Worldgen swap: off so classic noise remains the default substrate.
+        mods.install(Box::new(diffusion::InfiniteDiffusionMod::new()), false);
         mods
     }
 
@@ -428,6 +505,97 @@ impl Mods {
         }
     }
 
+    pub fn knobs(&self, index: usize) -> Vec<Knob> {
+        self.entries[index].module.knobs()
+    }
+
+    pub fn step_knob(&mut self, index: usize, knob: usize, delta: i32) {
+        self.entries[index].module.step_knob(knob, delta);
+    }
+
+    /// Worldgen used for the next world: diffusion if that mod is on, else classic.
+    pub fn worldgen_kind(&self) -> WorldgenKind {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.worldgen())
+            .unwrap_or(WorldgenKind::Classic)
+    }
+
+    pub fn diffusion_cfg(&self) -> DiffusionCfg {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.diffusion_cfg())
+            .unwrap_or_default()
+    }
+
+    pub fn visual_mask(&self) -> VisualMask {
+        let mut mask = VisualMask {
+            atmosphere: false,
+            post: false,
+            lighting: false,
+        };
+        for entry in self.entries.iter().filter(|e| e.enabled) {
+            match entry.module.visual_group() {
+                Some(VisualGroup::Atmosphere) => mask.atmosphere = true,
+                Some(VisualGroup::Post) => mask.post = true,
+                Some(VisualGroup::Lighting) => mask.lighting = true,
+                None => {}
+            }
+        }
+        mask
+    }
+
+    /// Settings lanes with disabled visual groups stripped.
+    /// Enable or disable a mod by name (no-op if already in that state).
+    pub fn set_enabled(&mut self, name: &str, on: bool) {
+        if let Some(i) = self.entries.iter().position(|e| e.module.name() == name)
+            && self.entries[i].enabled != on
+        {
+            self.toggle(i);
+        }
+    }
+
+    /// Bench-only env: `WATT_BENCH_WORLDGEN=diffusion` and/or
+    /// `WATT_BENCH_VISUALS=off` so a harness run can pin worldgen and the
+    /// core-renderer look without persisting the mod menu.
+    pub fn apply_bench_env(&mut self) {
+        if matches!(
+            std::env::var("WATT_BENCH_WORLDGEN").as_deref(),
+            Ok("diffusion")
+        ) {
+            self.set_enabled("InfiniteDiffusion", true);
+        }
+        if matches!(
+            std::env::var("WATT_BENCH_VISUALS").as_deref(),
+            Ok("off") | Ok("core")
+        ) {
+            self.set_enabled("Atmosphere", false);
+            self.set_enabled("Post", false);
+            self.set_enabled("Lighting", false);
+        }
+    }
+
+    pub fn mask_render(&self, mut cfg: RenderConfig) -> RenderConfig {
+        let mut on = [false; 3];
+        for entry in self.entries.iter().filter(|e| e.enabled) {
+            if let Some(g) = entry.module.visual_group() {
+                on[g as usize] = true;
+            }
+        }
+        if !on[VisualGroup::Atmosphere as usize] {
+            cfg.strip_group(VisualGroup::Atmosphere);
+        }
+        if !on[VisualGroup::Post as usize] {
+            cfg.strip_group(VisualGroup::Post);
+        }
+        if !on[VisualGroup::Lighting as usize] {
+            cfg.strip_group(VisualGroup::Lighting);
+        }
+        cfg
+    }
+
     /// Persistent state of every mod that has any, as `(name, data)` lines.
     pub fn save_states(&self, world: &World) -> Vec<(String, String)> {
         self.entries
@@ -495,5 +663,31 @@ mod tests {
         stash.add(&[El::Iron.id(), El::Stone.id(), El::Iron.id()]);
         let order: Vec<_> = stash.iter().collect();
         assert_eq!(order, vec![(El::Iron.id(), 2), (El::Stone.id(), 1)]);
+    }
+
+    #[test]
+    fn worldgen_kind_skips_non_worldgen_mods() {
+        let mods = Mods::with_defaults();
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        let mut on = Mods::with_defaults();
+        on.set_enabled("InfiniteDiffusion", true);
+        assert_eq!(on.worldgen_kind(), WorldgenKind::Diffusion);
+    }
+
+    #[test]
+    fn mask_render_strips_disabled_visual_groups() {
+        let mut mods = Mods::with_defaults();
+        mods.set_enabled("Atmosphere", false);
+        mods.set_enabled("Post", false);
+        mods.set_enabled("Lighting", false);
+        let stripped = mods.mask_render(RenderConfig::default());
+        assert!(!stripped.clouds);
+        assert!(!stripped.bloom);
+        assert!(!stripped.shadows);
+        assert!(stripped.sunlight);
+        let full = Mods::with_defaults().mask_render(RenderConfig::default());
+        assert!(full.clouds);
+        assert!(full.bloom);
+        assert!(full.shadows);
     }
 }
