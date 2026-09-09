@@ -189,6 +189,20 @@ mod tests {
         crate::paths::Paths::get().data.join(format!("{id}.save.bak"))
     }
 
+    fn load_world(
+        seed: i64,
+        kind: crate::world::generation::WorldgenKind,
+        cfg: crate::world::diffusion::DiffusionCfg,
+    ) -> crate::world::World {
+        crate::world::World::with_kind_cfg(
+            seed,
+            crate::render_config::RenderConfig::default(),
+            kind,
+            cfg,
+            true,
+        )
+    }
+
     fn empty_snap() -> SaveSnapshot {
         SaveSnapshot::empty(
             SaveMeta {
@@ -205,6 +219,7 @@ mod tests {
                 pitch: 0.0,
                 flying: false,
                 noclip: false,
+                stash: Some(vec![]),
             },
         )
     }
@@ -332,7 +347,7 @@ mod tests {
         ));
 
         wait_finished(&mut auto);
-        let (loaded, _, _, report) = save::load(&id, &mut mods, crate::world::World::new).unwrap();
+        let (loaded, _, _, report) = save::load(&id, &mut mods, load_world).unwrap();
         assert_eq!(report.source, Source::Live);
         assert_eq!(loaded.block_at(8, y0, 8), AIR, "first edit is in this snapshot");
         assert_ne!(
@@ -348,7 +363,7 @@ mod tests {
         ));
         wait_finished(&mut auto);
         let mut mods = Mods::with_defaults();
-        let (loaded, _, _, _) = save::load(&id, &mut mods, crate::world::World::new).unwrap();
+        let (loaded, _, _, _) = save::load(&id, &mut mods, load_world).unwrap();
         assert_eq!(loaded.block_at(9, y1, 8), AIR, "second edit lands in the next snapshot");
 
         let _ = fs::remove_file(save_file(&id));

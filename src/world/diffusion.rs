@@ -39,13 +39,75 @@ impl Default for DiffusionCfg {
 }
 
 impl DiffusionCfg {
+    /// Tile sizes the knob stepper cycles. [`clamp`](Self::clamp) snaps here.
+    pub const TILES: [u32; 3] = [16, 32, 64];
+    pub const MIN_STRIDE: u32 = 8;
+    pub const STRIDE_STEP: u32 = 8;
+    pub const PHASES_MIN: u32 = 2;
+    pub const PHASES_MAX: u32 = 8;
+    /// Relief values the knob stepper cycles. [`clamp`](Self::clamp) snaps here.
+    pub const RELIEFS: [f32; 5] = [0.5, 1.0, 1.5, 2.0, 4.0];
+
     pub fn clamp(mut self) -> Self {
-        self.tile = self.tile.clamp(16, 64);
-        self.stride = self.stride.clamp(8, self.tile);
-        self.phases = self.phases.clamp(2, 8);
-        self.relief = self.relief.clamp(0.25, 4.0);
+        self.tile = snap_u32(&Self::TILES, self.tile);
+        self.stride = snap_stride(self.stride, self.tile);
+        self.phases = self.phases.clamp(Self::PHASES_MIN, Self::PHASES_MAX);
+        self.relief = snap_f32(&Self::RELIEFS, self.relief);
         self
     }
+
+    /// Wire form of the diffusion worldgen payload (`tile=…,stride=…,…`).
+    pub fn to_text(self) -> String {
+        format!(
+            "tile={},stride={},phases={},relief={:.2}",
+            self.tile, self.stride, self.phases, self.relief
+        )
+    }
+
+    /// Parse a full or partial knob string, starting from the defaults.
+    pub fn from_text(data: &str) -> Self {
+        Self::default().overlay(data)
+    }
+
+    /// Overlay keys from `data` onto `self`, then clamp.
+    pub fn overlay(mut self, data: &str) -> Self {
+        for part in data.split(',') {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "tile" => self.tile = v.parse().unwrap_or(self.tile),
+                "stride" => self.stride = v.parse().unwrap_or(self.stride),
+                "phases" => self.phases = v.parse().unwrap_or(self.phases),
+                "relief" => self.relief = v.parse().unwrap_or(self.relief),
+                _ => {}
+            }
+        }
+        self.clamp()
+    }
+}
+
+fn snap_u32(list: &[u32], v: u32) -> u32 {
+    list.iter()
+        .copied()
+        .min_by_key(|&c| c.abs_diff(v))
+        .unwrap_or(v)
+}
+
+fn snap_stride(stride: u32, tile: u32) -> u32 {
+    let lo = DiffusionCfg::MIN_STRIDE;
+    let hi = tile.max(lo);
+    let v = stride.clamp(lo, hi);
+    let step = DiffusionCfg::STRIDE_STEP;
+    let snapped = ((v + step / 2) / step) * step;
+    snapped.clamp(lo, hi)
+}
+
+fn snap_f32(list: &[f32], v: f32) -> f32 {
+    list.iter()
+        .copied()
+        .min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
+        .unwrap_or(v)
 }
 
 struct TerrainScore {
@@ -396,6 +458,115 @@ mod tests {
         let ca = a.generate(0, 0, 0);
         let cb = b.generate(0, 0, 0);
         assert_eq!(ca, cb);
+    }
+
+    #[test]
+    fn from_text_round_trips_to_text() {
+        let cfg = DiffusionCfg {
+            tile: 64,
+            stride: 16,
+            phases: 4,
+            relief: 1.5,
+        }
+        .clamp();
+        assert_eq!(DiffusionCfg::from_text(&cfg.to_text()), cfg);
+        assert_eq!(DiffusionCfg::from_text(""), DiffusionCfg::default());
+        assert_eq!(
+            DiffusionCfg::from_text("tile=64").tile,
+            64,
+            "partial overlay on defaults"
+        );
+    }
+
+    #[test]
+    fn clamp_applies_tile_before_stride_so_stride_cannot_exceed_tile() {
+        let cfg = DiffusionCfg {
+            tile: 100,
+            stride: 80,
+            phases: 1,
+            relief: 9.0,
+        }
+        .clamp();
+        assert_eq!(cfg.tile, 64);
+        assert!(cfg.stride <= cfg.tile, "stride={} tile={}", cfg.stride, cfg.tile);
+        assert_eq!(cfg.stride, 64);
+        assert_eq!(cfg.phases, 2);
+        assert_eq!(cfg.relief, 4.0);
+    }
+
+    #[test]
+    fn clamp_snaps_to_values_the_knob_stepper_can_display() {
+        let cfg = DiffusionCfg {
+            tile: 48,
+            stride: 12,
+            phases: 1,
+            relief: 0.25,
+        }
+        .clamp();
+        assert!(
+            DiffusionCfg::TILES.contains(&cfg.tile),
+            "tile {} not in {:?}",
+            cfg.tile,
+            DiffusionCfg::TILES
+        );
+        assert_eq!(cfg.stride % DiffusionCfg::STRIDE_STEP, 0);
+        assert!(cfg.stride >= DiffusionCfg::MIN_STRIDE && cfg.stride <= cfg.tile);
+        assert!((DiffusionCfg::PHASES_MIN..=DiffusionCfg::PHASES_MAX).contains(&cfg.phases));
+        assert!(
+            DiffusionCfg::RELIEFS
+                .iter()
+                .any(|v| (*v - cfg.relief).abs() < f32::EPSILON),
+            "relief {} not in {:?}",
+            cfg.relief,
+            DiffusionCfg::RELIEFS
+        );
+    }
+
+    #[test]
+    fn default_matches_spec_new_and_is_stepper_reachable() {
+        let cfg = DiffusionCfg::default();
+        let spec = Spec::new(0);
+        assert_eq!(cfg.tile, spec.tile);
+        assert_eq!(cfg.stride, spec.stride);
+        assert_eq!(cfg.phases, spec.phases);
+        assert!(DiffusionCfg::TILES.contains(&cfg.tile));
+        assert_eq!(cfg.stride % DiffusionCfg::STRIDE_STEP, 0);
+        assert!((DiffusionCfg::PHASES_MIN..=DiffusionCfg::PHASES_MAX).contains(&cfg.phases));
+        assert!(
+            DiffusionCfg::RELIEFS
+                .iter()
+                .any(|v| (*v - cfg.relief).abs() < f32::EPSILON)
+        );
+        assert_eq!(cfg.clamp(), cfg);
+    }
+
+    #[test]
+    fn lod_and_near_flood_to_the_same_sea() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 13);
+        let sea = g.sea_level();
+        assert_eq!(sea, 20);
+        let mut ocean = 0;
+        for z in -16..16 {
+            for x in -16..16 {
+                let h = g.height(x, z);
+                if h >= sea - 2 {
+                    continue;
+                }
+                ocean += 1;
+                let near_below = g.block_at(x, sea - 1, z, h);
+                let near_at = g.block_at(x, sea, z, h);
+                let lod_below = g.lod_block_at(x, sea - 1, z);
+                let lod_at = g.lod_block_at(x, sea, z);
+                assert_ne!(near_below, AIR, "ocean column ({x},{z}) must flood to sea");
+                assert_eq!(near_at, AIR, "ocean column ({x},{z}) must stop flooding at sea");
+                assert!(
+                    lod_at == AIR || lod_at == g.deep(),
+                    "LOD must not flood the sea cell at ({x},{z})"
+                );
+                assert_ne!(lod_below, AIR, "LOD must fill below sea at ({x},{z})");
+            }
+        }
+        assert!(ocean > 0, "seed 13 must have open-ocean columns in the sample");
     }
 
     #[test]

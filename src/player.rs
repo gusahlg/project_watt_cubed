@@ -1,10 +1,11 @@
-//! Player state: position and orientation. Positions use `f64` for precision
-//! out to world borders; view angles use `f32` since rotation doesn't
-//! accumulate magnitude (see [`math`](crate::math)).
+//! Player state: position, orientation, and the elements they carry. Positions
+//! use `f64` for precision out to world borders; view angles use `f32` since
+//! rotation doesn't accumulate magnitude (see [`math`](crate::math)).
 use voxel_engine::DVec3;
 
 use crate::camera::Orientation;
 use crate::math::{Aabb, Bounded, PER_METER};
+use crate::stash::{ElementStash, START_CAPACITY};
 
 /// The player's collision half-width on the horizontal axes (x and z). Vertical
 /// extent is not a constant — it derives from [`Stance::height`] — so there is no
@@ -93,7 +94,7 @@ impl Motion {
     }
 }
 
-/// The player: where they are and where they're looking.
+/// The player: where they are, where they're looking, and what they carry.
 pub struct Player {
     /// Eye position in world space.
     pub position: DVec3,
@@ -112,6 +113,8 @@ pub struct Player {
     /// Current health. Intrinsic and carried on the player, but *not wired*: no
     /// system reads or mutates it yet, so it simply holds [`MAX_HEALTH`].
     pub health: f32,
+    /// Elements this player holds. Core-owned; mods present and spend it.
+    pub stash: ElementStash,
 }
 
 impl Player {
@@ -124,6 +127,7 @@ impl Player {
             speed: DEFAULT_WALK_SPEED,
             fly_speed: DEFAULT_FLY_SPEED,
             health: MAX_HEALTH,
+            stash: ElementStash::new(START_CAPACITY),
         }
     }
 

@@ -166,6 +166,8 @@ pub struct Connection {
     player_id: u32,
     seed: i64,
     spawn: DVec3,
+    worldgen: crate::world::generation::WorldgenKind,
+    diffusion: crate::world::diffusion::DiffusionCfg,
     peers: HashMap<u32, RemotePlayer>,
     alive: bool,
     // Throttling state for outbound moves.
@@ -254,7 +256,8 @@ impl Connection {
                 .map_err(|_| "no reply: timed out".to_string())?
                 .map_err(|e| format!("no reply: {e}"))
         })?;
-        let (player_id, seed, spawn) = welcome_from(ServerMessage::decode(&frame))?;
+        let (player_id, seed, spawn, worldgen, diffusion) =
+            welcome_from(ServerMessage::decode(&frame))?;
 
         let (tx, inbox) = mpsc::channel();
         let voice_in: Arc<Mutex<VecDeque<VoiceFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -292,6 +295,8 @@ impl Connection {
             player_id,
             seed,
             spawn,
+            worldgen,
+            diffusion,
             peers: HashMap::new(),
             alive: true,
             last_move: Instant::now(),
@@ -309,6 +314,12 @@ impl Connection {
 
     pub fn seed(&self) -> i64 {
         self.seed
+    }
+    pub fn worldgen(&self) -> crate::world::generation::WorldgenKind {
+        self.worldgen
+    }
+    pub fn diffusion(&self) -> crate::world::diffusion::DiffusionCfg {
+        self.diffusion
     }
     pub fn spawn(&self) -> DVec3 {
         self.spawn
@@ -376,9 +387,17 @@ impl Connection {
     }
 }
 
-fn welcome_from(msg: Option<ServerMessage>) -> Result<(u32, i64, DVec3), String> {
+fn welcome_from(
+    msg: Option<ServerMessage>,
+) -> Result<(u32, i64, DVec3, crate::world::generation::WorldgenKind, crate::world::diffusion::DiffusionCfg), String> {
     match msg {
-        Some(ServerMessage::Welcome { player_id, seed, spawn }) => Ok((player_id, seed, spawn)),
+        Some(ServerMessage::Welcome {
+            player_id,
+            seed,
+            spawn,
+            worldgen,
+            diffusion,
+        }) => Ok((player_id, seed, spawn, worldgen, diffusion)),
         Some(ServerMessage::Reject { reason }) => Err(reason.to_string()),
         _ => Err("unexpected reply from server".to_string()),
     }

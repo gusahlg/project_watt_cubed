@@ -9,6 +9,7 @@
 //! - [`world`] — the infinite streamed chunk field, terrain generation, collision,
 //!   and rendering.
 //! - [`player`] — player state and the camera derived from it.
+//! - [`stash`] — the elements a player carries (core-owned; mods present it).
 //! - [`input`] — keyboard movement and mouse look.
 //! - [`interact`] — the aim raycast that turns looking into breaking blocks.
 //! - [`console`] — the in-game console / chat line and its text input.
@@ -58,5 +59,6 @@ pub mod session;
 pub mod settings;
 pub mod sim;
 pub mod sky;
+pub mod stash;
 pub mod ui;
 pub mod world;

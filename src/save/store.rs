@@ -5,7 +5,7 @@
 //! Deletes move to trash/ under the data root instead of unlinking for cheap undo.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::format::{self, Decoded};
@@ -93,6 +93,26 @@ pub fn read(id: &SlotId) -> Result<(Decoded, Source), SaveError> {
     }
 }
 
+/// Write `bytes` to `path` via a sibling `.tmp`, `sync_all`, then rename.
+/// A crash mid-write leaves the previous file intact. Success leaves no `.tmp`.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Atomically replace a slot's bytes, rotating the previous file to `.bak`.
 pub fn write(id: &SlotId, bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(saves_dir())?;
@@ -100,7 +120,7 @@ pub fn write(id: &SlotId, bytes: &[u8]) -> io::Result<()> {
     let live = live_path(id);
     {
         let mut f = fs::File::create(&tmp)?;
-        io::Write::write_all(&mut f, bytes)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
     if live.exists() {
@@ -176,12 +196,13 @@ fn unused_id(base: &str) -> Result<SlotId, SaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::format::{Edit, PlayerState, SaveDoc};
+    use super::super::format::{Edit, PlayerState, SaveDoc, WorldgenStamp};
     use super::super::slot::SaveMeta;
 
     fn doc(name: &str, edits: u32) -> SaveDoc {
         SaveDoc {
             worldgen_version: 2,
+            worldgen: WorldgenStamp::default(),
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,
@@ -196,6 +217,7 @@ mod tests {
                 pitch: 0.0,
                 flying: false,
                 noclip: false,
+                stash: Some(vec![]),
             },
             specs: vec!["air".to_string()],
             edits: (0..edits as i32).map(|i| Edit { x: i, y: 200, z: -i, spec: 0 }).collect(),
@@ -381,6 +403,53 @@ mod tests {
             "fewer than HEADER_LEN bytes is not a save"
         );
         cleanup(&id);
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_tmp_on_success() {
+        let path = std::env::temp_dir().join(format!(
+            "watt-atomic-{}-{}.cfg",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let tmp = {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".tmp");
+            PathBuf::from(name)
+        };
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&tmp);
+        write_atomic(&path, b"ok\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ok\n");
+        assert!(!tmp.exists(), "successful write must consume the .tmp");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_atomic_into_unwritable_dir_is_err() {
+        let parent = std::env::temp_dir().join(format!(
+            "watt-atomic-notdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(1)
+        ));
+        let _ = fs::remove_file(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        fs::write(&parent, b"not a directory").unwrap();
+        let path = parent.join("mods.cfg");
+        assert!(write_atomic(&path, b"nope").is_err());
+        let tmp = {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".tmp");
+            PathBuf::from(name)
+        };
+        assert!(!tmp.exists(), "failed write must not leave a .tmp");
+        let _ = fs::remove_file(&parent);
     }
 
     #[test]

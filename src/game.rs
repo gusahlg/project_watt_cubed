@@ -34,7 +34,7 @@ use crate::sched::{Ctx as SchedCtx, RateGate};
 use crate::settings::Settings;
 use crate::sim::Simulation;
 use crate::sky::Sky;
-use crate::ui::{self, HudMode, Theme};
+use crate::ui::{self, HudElement, HudMode, Theme};
 use crate::world::World;
 
 /// What a game update wants the app to do next.
@@ -288,6 +288,7 @@ pub struct Game {
     peer_pose_scratch: Vec<PeerPose>,
     /// Last frame's named-phase durations, for the stall detector.
     phases: FramePhases,
+    hud_scratch: Vec<HudElement>,
 }
 
 /// Durations of `Game::update` phases, sampled every frame for stall logs.
@@ -310,7 +311,7 @@ impl Game {
         // — it fires only when whole ticks are due.
         let sim_id = sched.register(
             Simulation::manifest(),
-            Box::new(Simulation::new()),
+            Box::new(Simulation::with_systems(Vec::new())),
             u32::MAX,
         );
         sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
@@ -369,6 +370,7 @@ impl Game {
             placement_scratch: Vec::new(),
             peer_pose_scratch: Vec::new(),
             phases: FramePhases::default(),
+            hud_scratch: Vec::new(),
         }
     }
 
@@ -409,7 +411,7 @@ impl Game {
     pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
         let mod_ui_was_active = self.mod_ui_active();
         settings.apply(eng);
-        let render = self.visual_mask.apply(settings.render_config());
+        let render = self.visual_mask.effective_render(settings);
         eng.set_flags(render.engine_flags());
         // View volume BEFORE the render config: the far ladder's `unit`
         // tracks the full-res radius, so the transition detector must see the
@@ -1040,7 +1042,7 @@ impl Game {
                     nav_confirm: edges.nav_confirm,
                     placements,
                 };
-                mods.update(eng, &mut ctx);
+                mods.update(&mut ctx);
                 ctx.placements
             };
             // Apply after each event frame so repeated placements observe the
@@ -1222,7 +1224,10 @@ impl Game {
                         self.world.set_block(x, y, z, pending.prev);
                     }
                     match pending.kind {
-                        PendingKind::Break(elements) => mods.on_break_rejected(&elements),
+                        PendingKind::Break(elements) => {
+                            self.player.stash.revoke(&elements);
+                            mods.on_break_rejected(&elements);
+                        }
                         PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
                     }
                 }
@@ -1322,12 +1327,13 @@ impl Game {
         let pos_before = self.player.position;
         // Each output line already carries its role (System output vs Error
         // rejection), so there is nothing to guess — just show them.
-        for out in command::execute(
+        for out in command::execute_with_visuals(
             &line,
             &mut self.player,
             &mut self.world,
             settings,
             &mut self.sky,
+            self.visual_mask,
         ) {
             self.console.push(out);
         }
@@ -1366,7 +1372,8 @@ impl Game {
         }
     }
 
-    /// Break the block the player is looking at, handing its elements to the mods.
+    /// Break the block the player is looking at, depositing its elements into
+    /// the core stash before notifying mods.
     fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) = interact::raycast_solid(
             &self.world,
@@ -1386,7 +1393,8 @@ impl Game {
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
-        mods.on_block_break(&elements, &self.world);
+        let overflow = !self.player.stash.add(&elements);
+        mods.on_block_break(&elements, &self.world, overflow);
         self.local_anim.on_action(WireAction::Swing);
         // Tell the server (it validates and relays to everyone else). The
         // apply above is a PREDICTION for responsiveness: the ack rolls it

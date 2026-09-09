@@ -57,28 +57,7 @@ fn eval_event(
         return edged;
     };
     let held = chords.iter().any(|c| c.held(eng, mods));
-    if !held {
-        *timer = -1.0; // unprime
-        return edged;
-    }
-    if edged {
-        *timer = rep.delay;
-        return true;
-    }
-    if *timer < 0.0 {
-        // Held without ever seeing an edge (key was down when the context
-        // opened): don't autofire until a fresh press primes it.
-        return false;
-    }
-    *timer -= dt;
-    if *timer <= 0.0 {
-        *timer += rep.interval;
-        if *timer <= 0.0 {
-            *timer = rep.interval; // clamp to one fire per frame on a long dt
-        }
-        return true;
-    }
-    false
+    rep.advance(timer, edged, held, dt)
 }
 
 /// Input interpretation: maps device events to high-level intents and manages

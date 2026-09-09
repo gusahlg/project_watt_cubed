@@ -11,6 +11,7 @@ use voxel_engine::DVec3;
 
 use crate::block::Composition;
 use crate::math::{WORLD_BORDER, block_coord};
+use crate::mods::{annotate_setting, VisualMask};
 use crate::player::Player;
 use crate::settings::{SETTINGS, Settings};
 use crate::sky::{DayLength, Sky};
@@ -45,6 +46,18 @@ pub fn execute(
     settings: &mut Settings,
     sky: &mut Sky,
 ) -> Vec<Line> {
+    execute_with_visuals(line, player, world, settings, sky, VisualMask::default())
+}
+
+/// [`execute`] with the live visual-mod mask so `/gfx` reports effective lanes.
+pub fn execute_with_visuals(
+    line: &str,
+    player: &mut Player,
+    world: &mut World,
+    settings: &mut Settings,
+    sky: &mut Sky,
+    visuals: VisualMask,
+) -> Vec<Line> {
     let line = line.strip_prefix('/').unwrap_or(line);
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else {
@@ -56,7 +69,7 @@ pub fn execute(
         "tp" | "teleport" | "setpos" => teleport(&args, player, world),
         "pos" | "where" => shown(vec![format!("position: {}", fmt_pos(player.position))]),
         "inspect" | "look" => inspect(&args, player, world),
-        "gfx" | "graphics" => gfx(&args, settings),
+        "gfx" | "graphics" => gfx(&args, settings, visuals),
         "time" => time(&args, sky),
         "walkspeed" => walkspeed(&args, player),
         "flyspeed" => flyspeed(&args, player),
@@ -157,7 +170,7 @@ fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> 
 
 /// `gfx [setting value]` — show or change graphics settings at runtime.
 /// The caller applies the mutated [`Settings`] to the engine and persists it.
-fn gfx(args: &[&str], settings: &mut Settings) -> Vec<Line> {
+fn gfx(args: &[&str], settings: &mut Settings, visuals: VisualMask) -> Vec<Line> {
     let usage = || {
         std::iter::once("usage: gfx <setting> <value>".to_string())
             .chain(SETTINGS.iter().map(|field| format!("  gfx {}", field.usage())))
@@ -165,9 +178,21 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<Line> {
     };
 
     match args {
-        [] => shown(SETTINGS.iter().map(|field| field.confirm(settings)).collect()),
+        [] => shown(
+            SETTINGS
+                .iter()
+                .map(|field| annotate_setting(field.confirm(settings), field.key(), visuals))
+                .collect(),
+        ),
         [key, value] => match gfx_set(settings, key, value) {
-            Some(msg) => shown(vec![msg]),
+            Some(msg) => {
+                let field_key = SETTINGS
+                    .iter()
+                    .find(|f| f.matches(key))
+                    .map(|f| f.key())
+                    .unwrap_or(*key);
+                shown(vec![annotate_setting(msg, field_key, visuals)])
+            }
             None => rejected(usage()),
         },
         _ => rejected(usage()),
@@ -361,6 +386,8 @@ fn fmt_pos(p: DVec3) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mods::forced_off_marker;
+    use crate::render_config::VrsChoice;
 
     fn player() -> Player {
         Player::new(DVec3::new(0.0, 0.0, 0.0))
@@ -493,11 +520,57 @@ mod tests {
         assert!(s.fullscreen);
         execute("gfx lighting off", &mut p, &mut w, &mut s, &mut sky);
         assert!(!s.lighting);
+        execute("gfx vrs on", &mut p, &mut w, &mut s, &mut sky);
+        assert_eq!(s.vrs, VrsChoice::On);
+        execute("gfx vrs auto", &mut p, &mut w, &mut s, &mut sky);
+        assert_eq!(s.vrs, VrsChoice::Auto);
         let out = execute("gfx", &mut p, &mut w, &mut s, &mut sky);
         let text = joined(&out);
         assert!(text.contains("fullscreen on"));
         assert!(text.contains("lighting off"));
+        assert!(text.contains("vrs auto"));
         assert!(text.contains("ui scale"));
+    }
+
+    #[test]
+    fn gfx_lists_default_auto_render_scale() {
+        let (mut p, mut w) = (player(), world());
+        let mut s = Settings::default();
+        let mut sky = Sky::new();
+        s.note_render_extent(1920, 1080, 1.0);
+        let text = joined(&execute("gfx", &mut p, &mut w, &mut s, &mut sky));
+        assert!(
+            text.contains("render scale Auto (0.8)"),
+            "Default /gfx prints the effective Auto scale: {text}"
+        );
+    }
+
+    #[test]
+    fn gfx_lists_effective_visual_lanes_when_a_mod_strips_them() {
+        let (mut p, mut w) = (player(), world());
+        let mut s = Settings::default();
+        let mut sky = Sky::new();
+        let mask = VisualMask {
+            atmosphere: true,
+            post: false,
+            lighting: true,
+        };
+        let out = execute_with_visuals("gfx", &mut p, &mut w, &mut s, &mut sky, mask);
+        let text = joined(&out);
+        assert!(
+            text.contains(&format!("bloom on {}", forced_off_marker("Post"))),
+            "effective /gfx must name the stripping mod: {text}"
+        );
+        assert!(
+            !text.contains("shadows on (off:"),
+            "Lighting is still enabled: {text}"
+        );
+        let set = execute_with_visuals("gfx bloom off", &mut p, &mut w, &mut s, &mut sky, mask);
+        assert!(
+            joined(&set).contains(&format!("bloom off {}", forced_off_marker("Post"))),
+            "a set confirmation must also show the strip: {}",
+            joined(&set)
+        );
     }
 
     #[test]

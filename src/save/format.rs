@@ -2,12 +2,12 @@
 //! `World`/`Player`/`Mods` to and from `SaveDoc`, so this whole module is
 //! testable without constructing a world.
 //!
-//! Layout, version 5 (all integers little-endian):
+//! Layout, version 7 (all integers little-endian):
 //!
 //! ```text
-//! header (fixed 109 bytes, peekable without the body):
+//! header (fixed 126 bytes, peekable without the body):
 //!   magic        b"WATT"                                       4
-//!   version      u16 = 5                                       2
+//!   version      u16 = 7                                       2
 //!   name         u8 len + 64-byte field (utf8, zero padded)   65
 //!   seed         i64                                           8
 //!   created      u64 unix secs                                 8
@@ -15,8 +15,14 @@
 //!   playtime     u64 secs                                      8
 //!   edit_count   u32                                           4
 //!   worldgen     u16 (v5+; a v4 header ends here, worldgen 1)   2
+//!   kind         u8  (v6+; 0 = classic, 1 = diffusion)         1
+//!   tile         u32 (v6+; diffusion knobs, ignored classic)   4
+//!   stride       u32                                           4
+//!   phases       u32                                           4
+//!   relief       f32                                           4
 //! player         pos f64 x3, yaw f32, pitch f32,
 //!                flags u8 (bit 0 = fly, bit 1 = noclip)       33
+//!                stash (v7+): u16 len + utf8 "Name=count,..."  variable
 //! spec table     u16 count, then per spec: u16 len + utf8
 //! edits          edit_count records of i32 x, i32 y, i32 z, u16 spec index
 //! mods           u8 count, then per mod: u8 name-len + utf8,
@@ -27,6 +33,14 @@
 //! worldgen 1 and the loader WARNS rather than rejects: the seed regenerates
 //! terrain fine, but its materials may have moved under the edits.
 //!
+//! Version 5 files (no kind/knobs) still decode — kind defaults to classic
+//! and the diffusion knobs to their shipped defaults. A v5 diffusion world
+//! cannot exist: InfiniteDiffusion landed with v6.
+//!
+//! Version 6 files (no player stash) still decode — `PlayerState::stash` is
+//! `None`. The bridge then migrates an old Inventory mod-state line into the
+//! core stash.
+//!
 //! The edit count lives only in the header (no body prefix), and each record is
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
@@ -36,23 +50,31 @@ use crate::ident::codec;
 use super::slot::{SaveError, SaveMeta};
 
 pub const MAGIC: &[u8; 4] = b"WATT";
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 7;
 
 const NAME_FIELD: usize = 64;
 /// Offset of the name length byte, for in-place renames via [`set_name`].
 const NAME_OFF: usize = 6;
 /// The version-4 header, which the v5 header extends by the worldgen stamp.
 const HEADER_LEN_V4: usize = NAME_OFF + 1 + NAME_FIELD + 8 + 8 + 8 + 8 + 4;
-pub const HEADER_LEN: usize = HEADER_LEN_V4 + 2;
+/// The version-5 header, which the v6 header extends by kind + diffusion knobs.
+const HEADER_LEN_V5: usize = HEADER_LEN_V4 + 2;
+/// kind u8 + tile/stride/phases u32 + relief f32.
+const WORLDGEN_STAMP_LEN: usize = 1 + 4 + 4 + 4 + 4;
+pub const HEADER_LEN: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN;
 
 /// Header length for a supported on-disk version, or `BadVersion`.
 fn header_len(version: u16) -> Result<usize, SaveError> {
     match version {
         4 => Ok(HEADER_LEN_V4),
-        5 => Ok(HEADER_LEN),
+        5 => Ok(HEADER_LEN_V5),
+        6 | 7 => Ok(HEADER_LEN),
         v => Err(SaveError::BadVersion(v)),
     }
 }
+
+/// Pose (3×f64 + 2×f32) plus the flying/noclip flags byte.
+const PLAYER_POSE_LEN: usize = 32 + 1;
 
 const EDIT_BYTES: usize = 14;
 
@@ -71,6 +93,9 @@ pub struct SaveDoc {
     /// `placement::WORLDGEN_VERSION`. A mismatch on load WARNS (the seed still
     /// regenerates, but materials under old edits may have moved).
     pub worldgen_version: u16,
+    /// Generator kind and diffusion knobs captured from the live world.
+    /// `kind` is 0 = classic, 1 = diffusion (unknown values load as classic).
+    pub worldgen: WorldgenStamp,
     pub player: PlayerState,
     /// Deduplicated block-spec table; edits reference it by index.
     pub specs: Vec<String>,
@@ -87,6 +112,63 @@ pub struct PlayerState {
     pub pitch: f32,
     pub flying: bool,
     pub noclip: bool,
+    /// Held elements as `(name, count)` in first-seen order.
+    /// `None` means the field was absent (pre-v7); the bridge then migrates
+    /// from the Inventory mod-state line.
+    pub stash: Option<Vec<(String, u32)>>,
+}
+
+/// On-disk worldgen identity. Kept as raw integers so this codec stays free
+/// of game types; the bridge maps to `WorldgenKind` / `DiffusionCfg`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldgenStamp {
+    pub kind: u8,
+    pub tile: u32,
+    pub stride: u32,
+    pub phases: u32,
+    pub relief: f32,
+}
+
+impl Default for WorldgenStamp {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            tile: 32,
+            stride: 16,
+            phases: 2,
+            relief: 1.0,
+        }
+    }
+}
+
+fn encode_stash_payload(items: &[(String, u32)]) -> String {
+    let mut s = String::new();
+    for (i, (name, count)) in items.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(name);
+        s.push('=');
+        s.push_str(&count.to_string());
+    }
+    s
+}
+
+fn parse_stash_payload(s: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for entry in s.split(',').filter(|e| !e.is_empty()) {
+        let Some((name, count)) = entry.split_once('=') else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u32>() else {
+            continue;
+        };
+        if name.is_empty() || count == 0 {
+            continue;
+        }
+        out.push((name.to_string(), count));
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +223,11 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     out.extend_from_slice(&doc.meta.playtime_secs.to_le_bytes());
     out.extend_from_slice(&edit_count.to_le_bytes());
     out.extend_from_slice(&doc.worldgen_version.to_le_bytes());
+    out.push(doc.worldgen.kind);
+    out.extend_from_slice(&doc.worldgen.tile.to_le_bytes());
+    out.extend_from_slice(&doc.worldgen.stride.to_le_bytes());
+    out.extend_from_slice(&doc.worldgen.phases.to_le_bytes());
+    out.extend_from_slice(&doc.worldgen.relief.to_le_bytes());
     debug_assert_eq!(out.len(), HEADER_LEN);
 
     let mut pw = codec::Writer::new();
@@ -151,6 +238,14 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     });
     out.extend_from_slice(&pw.into_inner());
     out.push(doc.player.flying as u8 | (doc.player.noclip as u8) << 1);
+    debug_assert_eq!(out.len(), HEADER_LEN + PLAYER_POSE_LEN);
+    let stash = encode_stash_payload(doc.player.stash.as_deref().unwrap_or(&[]));
+    if u16::try_from(stash.len()).is_err() {
+        return Err(SaveError::Corrupt("player stash too long to save"));
+    }
+    let mut sw = codec::Writer::new();
+    sw.str16(&stash);
+    out.extend_from_slice(&sw.into_inner());
 
     out.extend_from_slice(&(doc.specs.len() as u16).to_le_bytes());
     for spec in &doc.specs {
@@ -290,9 +385,22 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
     // v4 predates the worldgen stamp: those worlds came from the legacy picker.
     let worldgen_version = if version >= 5 {
-        u16::from_le_bytes(bytes[HEADER_LEN - 2..HEADER_LEN].try_into().unwrap())
+        u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap())
     } else {
         1
+    };
+    // v5 predates kind + diffusion knobs: those worlds are classic.
+    let worldgen = if version >= 6 {
+        let off = HEADER_LEN_V5;
+        WorldgenStamp {
+            kind: bytes[off],
+            tile: u32::from_le_bytes(bytes[off + 1..off + 5].try_into().unwrap()),
+            stride: u32::from_le_bytes(bytes[off + 5..off + 9].try_into().unwrap()),
+            phases: u32::from_le_bytes(bytes[off + 9..off + 13].try_into().unwrap()),
+            relief: f32::from_le_bytes(bytes[off + 13..off + 17].try_into().unwrap()),
+        }
+    } else {
+        WorldgenStamp::default()
     };
     let mut r = Reader::with_pos(bytes, header_len(version)?);
 
@@ -305,9 +413,21 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
         pitch: pose.pitch,
         flying: false,
         noclip: false,
+        stash: None,
     };
     let flags = r.u8()?;
-    let player = PlayerState { flying: flags & 1 != 0, noclip: flags & 2 != 0, ..player };
+    let stash = if version >= 7 {
+        let len = r.u16()? as usize;
+        Some(parse_stash_payload(&r.string(len)?))
+    } else {
+        None
+    };
+    let player = PlayerState {
+        flying: flags & 1 != 0,
+        noclip: flags & 2 != 0,
+        stash,
+        ..player
+    };
     // Raw float bit patterns are not all valid game states: NaN/Infinity would
     // poison camera/physics on load, and a position outside the border breaks
     // the clamp every continuous writer maintains. Reject rather than repair —
@@ -372,7 +492,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
         .is_ok();
     }
 
-    let doc = SaveDoc { meta, worldgen_version, player, specs, edits, mods };
+    let doc = SaveDoc { meta, worldgen_version, worldgen, player, specs, edits, mods };
     Ok(if clean {
         Decoded::Intact(doc)
     } else {
@@ -387,6 +507,7 @@ mod tests {
     fn sample() -> SaveDoc {
         SaveDoc {
             worldgen_version: 2,
+            worldgen: WorldgenStamp::default(),
             meta: SaveMeta {
                 name: "My World".to_string(),
                 seed: -4242,
@@ -401,6 +522,7 @@ mod tests {
                 pitch: -0.5,
                 flying: true,
                 noclip: true,
+                stash: Some(vec![("Stone".into(), 2), ("Iron".into(), 1)]),
             },
             specs: vec!["air".to_string(), "natural:Stone".to_string()],
             edits: vec![
@@ -421,9 +543,34 @@ mod tests {
         }
     }
 
+    /// Drop the v7 stash blob so a current encode can be spliced into an older
+    /// version whose player record ends at the flags byte.
+    fn strip_stash(bytes: &[u8]) -> Vec<u8> {
+        let start = HEADER_LEN + PLAYER_POSE_LEN;
+        let len = u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(bytes.len() - 2 - len);
+        out.extend_from_slice(&bytes[..start]);
+        out.extend_from_slice(&bytes[start + 2 + len..]);
+        out
+    }
+
     #[test]
     fn round_trip_is_identity() {
         let doc = sample();
+        let bytes = encode(&doc).unwrap();
+        assert_eq!(expect_intact(decode(&bytes).unwrap()), doc);
+    }
+
+    #[test]
+    fn diffusion_stamp_round_trips() {
+        let mut doc = sample();
+        doc.worldgen = WorldgenStamp {
+            kind: 1,
+            tile: 64,
+            stride: 8,
+            phases: 6,
+            relief: 1.5,
+        };
         let bytes = encode(&doc).unwrap();
         assert_eq!(expect_intact(decode(&bytes).unwrap()), doc);
     }
@@ -505,32 +652,94 @@ mod tests {
         bytes[0] = b'W';
         bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(3))));
-        bytes[4..6].copy_from_slice(&6u16.to_le_bytes());
-        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(6))));
+        bytes[4..6].copy_from_slice(&8u16.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(8))));
     }
 
     #[test]
     fn version_4_files_still_decode_with_the_legacy_worldgen_stamp() {
-        // A v4 file is a v5 file minus the 2-byte worldgen stamp: build one by
-        // splicing it out and patching the version. It must decode INTACT with
-        // worldgen_version defaulting to 1 (the legacy picker era) and every
-        // other field bit-identical — old worlds load, they just warn.
+        // A v4 file is a current file minus the v5 worldgen stamp, the v6
+        // kind/knobs, and the v7 player stash: splice those out and patch the
+        // version. It must decode INTACT with worldgen_version defaulting to 1
+        // and kind classic.
         let doc = sample();
-        let v5 = encode(&doc).unwrap();
-        let mut v4 = Vec::with_capacity(v5.len() - 2);
-        v4.extend_from_slice(&v5[..HEADER_LEN - 2]);
-        v4.extend_from_slice(&v5[HEADER_LEN..]);
+        let current = encode(&doc).unwrap();
+        let body = strip_stash(&current);
+        let mut v4 = Vec::with_capacity(body.len() - (HEADER_LEN - HEADER_LEN_V4));
+        v4.extend_from_slice(&body[..HEADER_LEN_V4]);
+        v4.extend_from_slice(&body[HEADER_LEN..]);
         v4[4..6].copy_from_slice(&4u16.to_le_bytes());
 
         let got = expect_intact(decode(&v4).unwrap());
         assert_eq!(got.worldgen_version, 1, "v4 files predate the stamp");
+        assert_eq!(got.worldgen, WorldgenStamp::default());
         assert_eq!(got.meta, doc.meta);
-        assert_eq!(got.player, doc.player);
+        let mut player = doc.player.clone();
+        player.stash = None;
+        assert_eq!(got.player, player);
         assert_eq!(got.specs, doc.specs);
         assert_eq!(got.edits, doc.edits);
         assert_eq!(got.mods, doc.mods);
         // And the peek path (slot lists) accepts the shorter header too.
         assert_eq!(peek_meta(&v4).unwrap().name, doc.meta.name);
+    }
+
+    #[test]
+    fn version_5_files_still_decode_as_classic() {
+        // A v5 file is a v6 file minus the kind + diffusion knobs. Kind
+        // defaults to classic so pre-InfiniteDiffusion worlds keep their
+        // generator; knobs take the shipped defaults.
+        let mut doc = sample();
+        doc.worldgen = WorldgenStamp {
+            kind: 1,
+            tile: 64,
+            stride: 32,
+            phases: 4,
+            relief: 2.0,
+        };
+        let v7 = encode(&doc).unwrap();
+        let body = strip_stash(&v7);
+        let mut v5 = Vec::with_capacity(body.len() - WORLDGEN_STAMP_LEN);
+        v5.extend_from_slice(&body[..HEADER_LEN_V5]);
+        v5.extend_from_slice(&body[HEADER_LEN..]);
+        v5[4..6].copy_from_slice(&5u16.to_le_bytes());
+
+        let got = expect_intact(decode(&v5).unwrap());
+        assert_eq!(got.worldgen_version, doc.worldgen_version);
+        assert_eq!(got.worldgen, WorldgenStamp::default(), "v5 files predate kind");
+        assert_eq!(got.meta, doc.meta);
+        let mut player = doc.player.clone();
+        player.stash = None;
+        assert_eq!(got.player, player);
+        assert_eq!(got.specs, doc.specs);
+        assert_eq!(got.edits, doc.edits);
+        assert_eq!(got.mods, doc.mods);
+        assert_eq!(peek_meta(&v5).unwrap().name, doc.meta.name);
+    }
+
+    #[test]
+    fn empty_stash_round_trips() {
+        let mut doc = sample();
+        doc.player.stash = Some(vec![]);
+        let bytes = encode(&doc).unwrap();
+        assert_eq!(expect_intact(decode(&bytes).unwrap()), doc);
+    }
+
+    #[test]
+    fn version_6_files_still_decode_without_stash() {
+        let doc = sample();
+        let v7 = encode(&doc).unwrap();
+        let mut v6 = strip_stash(&v7);
+        v6[4..6].copy_from_slice(&6u16.to_le_bytes());
+
+        let got = expect_intact(decode(&v6).unwrap());
+        assert_eq!(got.worldgen, doc.worldgen);
+        let mut player = doc.player.clone();
+        player.stash = None;
+        assert_eq!(got.player, player, "v6 files predate the player stash field");
+        assert_eq!(got.specs, doc.specs);
+        assert_eq!(got.edits, doc.edits);
+        assert_eq!(got.mods, doc.mods);
     }
 
     #[test]

@@ -15,22 +15,39 @@ use crate::audio::{AudioDirector, CuePalette, CueSymbols, OneShot, SoundConfig, 
 use crate::benchmark::{Benchmark, Step as BenchmarkStep};
 use crate::game::{Game, Signal};
 use crate::input::router::{Context, Router, View};
-use crate::menu::menus::MainMenu;
+use crate::menu::menus::{ModsMenu, SettingsHub};
+use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::mods::Mods;
+use crate::mods::{ChoicesFlush, Mods};
 use crate::net::client::Connection;
 use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
 use crate::settings::Settings;
+use crate::world::diffusion::DiffusionCfg;
 use crate::world::World;
 
 const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
 /// Background for every non-world screen.
 const MENU_CLEAR: Color = Color::new(18, 20, 28, 255);
+/// Menu frame cap. The engine sleeps until the deadline (`WaitUntil`), so
+/// 120 Hz is ~8 ms worst-case input-to-photon; a busy-wait cap would want 240.
+const MENU_FPS_CAP: u32 = 120;
+
+/// Vsync and fps cap for this screen. Bench is uncapped; menus cap at
+/// [`MENU_FPS_CAP`] with vsync off; in-world uses the saved settings.
+fn pacing(in_world: bool, bench: bool, settings: &Settings) -> (bool, u32) {
+    if bench {
+        (false, 0)
+    } else if in_world {
+        (settings.vsync, settings.max_fps)
+    } else {
+        (false, MENU_FPS_CAP)
+    }
+}
 
 enum Screen {
     Menus(MenuStack),
@@ -69,6 +86,12 @@ pub struct App {
     audio: AudioDirector,
     /// Last stall-detector log, so a hung frame names itself once per window.
     last_stall_log: Option<Instant>,
+    /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
+    choices_flush: ChoicesFlush,
+    clock: Instant,
+    /// True while the Mods screen is on the menu stack.
+    mods_open: bool,
+    mods_save_error: Option<String>,
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -99,9 +122,12 @@ impl App {
         crate::paths::Paths::init(None);
         let mut mods = Mods::with_defaults();
         mods.load_choices();
-        mods.apply_bench_env();
+        let pins = Benchmark::mod_pins_from_env();
+        mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
         let saves = save::list();
         let mut settings = Settings::load();
+        let (caps, display) = crate::benchmark::graphics_caps();
+        settings.set_device_caps(caps, display);
         let session = Session::load();
         let bench = Benchmark::from_env();
         // A reproducible benchmark can pin a performance profile without
@@ -134,12 +160,13 @@ impl App {
             eprintln!("{w}");
         }
         let audio = AudioDirector::new(palette);
+        let screen = Screen::Menus(Self::start_stack(&mods, &saves, &session, None, false));
         Self {
             saves,
             active: None,
             router: Router::new(),
             mods,
-            screen: Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::new()))),
+            screen,
             host: None,
             settings,
             session,
@@ -148,26 +175,59 @@ impl App {
             cues,
             audio,
             last_stall_log: None,
+            choices_flush: ChoicesFlush::new(),
+            clock: Instant::now(),
+            mods_open: false,
+            mods_save_error: None,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64
+    }
+
+    fn persist_mod_choices(&mut self) {
+        match self.mods.save_choices() {
+            Ok(()) => self.mods_save_error = None,
+            Err(e) => self.mods_save_error = Some(e.to_string()),
+        }
+    }
+
+    fn flush_mod_choices_if_dirty(&mut self) {
+        if self.choices_flush.take() {
+            self.persist_mod_choices();
         }
     }
 
     /// Open the window and run until the player quits (menu or close button).
     pub fn run(self) {
         let mut app = self;
+        // Starts on menus (or uncapped if this process is a bench).
+        let (vsync, target_fps) = pacing(false, app.bench.is_some(), &app.settings);
+        let (extent_w, extent_h) = if app.settings.fullscreen {
+            (app.settings.startup_display_w, app.settings.startup_display_h)
+        } else {
+            (STARTING_WINDOW_WIDTH, STARTING_WINDOW_HEIGHT)
+        };
+        let session_gfx = app.settings.session_graphics(extent_w, extent_h);
+        if let Some(line) = session_gfx.notice.as_ref() {
+            eprintln!("{line}");
+            app.settings.vram_notice = session_gfx.notice.clone();
+        }
+        app.settings
+            .note_render_extent(extent_w, extent_h, session_gfx.render_scale);
         let config = voxel_engine::Config {
             title: "Project Watt Cubed".into(),
             width: STARTING_WINDOW_WIDTH,
             height: STARTING_WINDOW_HEIGHT,
-            target_fps: app.settings.max_fps,
-            vsync: app.settings.vsync,
-            msaa: app.settings.msaa,
-            render_scale: app.settings.render_scale,
+            target_fps,
+            vsync,
+            msaa: session_gfx.msaa,
+            render_scale: session_gfx.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
-            // Engine-side render lanes from the persisted settings (the single
-            // source; the world's own occlusion/lod2 lanes come from the same
-            // `Settings::render_config` at world entry).
-            flags: app.settings.render_config().engine_flags(),
+            // Engine-side render lanes from the effective (mod-masked) config.
+            flags: app.mods.effective_render(&app.settings).engine_flags(),
         };
         voxel_engine::run(config, move |eng| app.frame(eng));
     }
@@ -180,6 +240,7 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
+            self.flush_mod_choices_if_dirty();
             self.flush_save();
             return false;
         }
@@ -207,19 +268,24 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
+            self.flush_mod_choices_if_dirty();
             self.flush_save();
             self.note_frame_stall(t0, update_dt);
             return false;
         }
-        // Force vsync on whenever we're not in a live world (menus, loading):
-        // there's nothing to gain from tearing/uncapped frames on a static
-        // screen, and it keeps the GPU quiet. In-world we honour the setting.
-        // Only send the command on change: a SetVsync every menu frame was
-        // waking the render thread even when the mode was already correct.
+        // VRAM guard + live settings: one push per frame so a resize cannot
+        // allocate MSAA/scale the probe already refused.
+        self.settings.apply(eng);
+        eng.set_flags(self.mods.effective_render(&self.settings).engine_flags());
+        // Apply only on change: a SetVsync every menu frame was waking the
+        // render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
-        let want_vsync = !in_world || self.settings.vsync;
+        let (want_vsync, want_fps) = pacing(in_world, self.bench.is_some(), &self.settings);
         if eng.vsync() != want_vsync {
             eng.set_vsync(want_vsync);
+        }
+        if eng.target_fps() != want_fps {
+            eng.set_target_fps(want_fps);
         }
         self.draw(eng);
         self.note_frame_stall(t0, update_dt);
@@ -302,42 +368,82 @@ impl App {
             }
             return true;
         }
-        let Screen::Playing(game) = &mut self.screen else {
+        // One unsampled frame after Complete has presented; capture that image
+        // (blocking) before the report so the readback is outside the samples.
+        if self
+            .bench
+            .as_ref()
+            .expect("bench exists")
+            .measurement_complete()
+        {
+            return self.finish_bench(eng);
+        }
+        {
+            let Screen::Playing(game) = &mut self.screen else {
+                return true;
+            };
+            // A slow spin (`WATT_BENCH_YAW`, default 0.4 rad/s; 0 = static) sweeps
+            // the frustum; an optional flight along +X (`WATT_BENCH_MOVE`)
+            // exercises paths a parked camera never touches.
+            let yaw_rate = self.bench.as_ref().expect("bench exists").yaw_rate() as f32;
+            game.player_mut().orientation.yaw += yaw_rate * dt;
+            self.bench
+                .as_ref()
+                .expect("bench exists")
+                .apply_move(game.player_mut(), dt);
+
+            let (ready, gauges) = {
+                let bench = self.bench.as_mut().expect("bench exists");
+                bench.poll_world(game.world())
+            };
+            let step = self.bench.as_mut().expect("bench exists").step(dt, ready, gauges);
+            match step {
+                BenchmarkStep::ReadyTimeout => {
+                    eprintln!("{}", game.world().entry_debug());
+                    return true;
+                }
+                BenchmarkStep::Warming => {
+                    if !ready && self.bench.as_mut().expect("bench exists").wait_log_due()
+                    {
+                        eprintln!(
+                            "benchmark: waiting for world ({})",
+                            game.world().entry_debug()
+                        );
+                    }
+                    return true;
+                }
+                BenchmarkStep::Measuring => return true,
+                BenchmarkStep::Complete => {
+                    if self
+                        .bench
+                        .as_ref()
+                        .expect("bench exists")
+                        .screenshot_path()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.finish_bench(eng)
+    }
+
+    /// Capture the last presented frame if requested, then emit the report.
+    fn finish_bench(&mut self, eng: &mut Engine) -> bool {
+        let Screen::Playing(game) = &self.screen else {
             return true;
         };
-        // A slow spin sweeps the frustum across the terrain like a player would;
-        // an optional flight along +X (`WATT_BENCH_MOVE`) exercises the paths a
-        // static camera never touches (shadow-cascade re-render, streaming).
-        game.player_mut().orientation.yaw += 0.4 * dt;
-        let move_mps = self.bench.as_ref().expect("bench exists").move_mps();
-        if move_mps > 0.0 {
-            game.player_mut().position.x += move_mps * dt as f64;
-        }
-
-        let (ready, gauges) = {
-            let bench = self.bench.as_mut().expect("bench exists");
-            bench.poll_world(game.world())
-        };
-        let bench = self.bench.as_mut().expect("bench exists");
-        let step = bench.step(dt, ready, gauges);
-        match step {
-            BenchmarkStep::ReadyTimeout => {
-                eprintln!("{}", game.world().entry_debug());
-                return true;
-            }
-            BenchmarkStep::Warming => {
-                if !ready && bench.wait_log_due() {
-                    eprintln!(
-                        "benchmark: waiting for world ({})",
-                        game.world().entry_debug()
-                    );
-                }
-                return true;
-            }
-            BenchmarkStep::Measuring => return true,
-            BenchmarkStep::Complete => {}
-        }
-        let report = bench.finish(&self.settings, eng, game.world(), game.player().position);
+        self.bench
+            .as_ref()
+            .expect("bench exists")
+            .capture_screenshot(eng);
+        let report = self.bench.as_mut().expect("bench exists").finish(
+            &self.settings,
+            eng,
+            game.world(),
+            game.player().position,
+        );
         report.emit();
         false
     }
@@ -366,7 +472,13 @@ impl App {
         }
         // A per-frame snapshot so a menu never holds a live `&Mods`.
         let mods = ModRow::snapshot(&self.mods);
+        let mods_save_error = self.mods_save_error.clone();
         let before = self.settings.clone();
+        let depth_before = match &self.screen {
+            Screen::Menus(stack) => stack.depth(),
+            _ => 0,
+        };
+        let now_ms = self.now_ms();
         let mut effect = None;
         if let Screen::Menus(stack) = &mut self.screen {
             let mut ctx = Ctx {
@@ -374,27 +486,40 @@ impl App {
                 saves: &self.saves,
                 mods: &mods,
                 session: &self.session,
+                mods_save_error: mods_save_error.as_deref(),
             };
             effect = stack.update(&intents, &mut ctx);
         }
-        // Apply every frame for immediate feedback and to show hardware clamps.
-        self.settings.apply(eng);
         // Persist whenever a step (or a hardware clamp) moved a value.
         if self.settings != before {
             self.settings.save();
             self.sound.set_mix(self.settings.mix_change());
         }
-        match effect {
+        if self.mods_open {
+            let depth_after = match &self.screen {
+                Screen::Menus(stack) => stack.depth(),
+                _ => 0,
+            };
+            if depth_after < depth_before {
+                self.mods_open = false;
+                self.flush_mod_choices_if_dirty();
+            }
+        }
+        let quit = match effect {
             Some(effect) => self.handle_effect(eng, effect),
             None => false,
+        };
+        if self.choices_flush.poll(now_ms) {
+            self.persist_mod_choices();
         }
+        quit
     }
 
     /// Interpret one menu effect. Returns `true` only for Quit.
     fn handle_effect(&mut self, eng: &mut Engine, effect: AppEffect) -> bool {
         match effect {
             AppEffect::NewWorld => self.start_new_world(eng),
-            AppEffect::Load(name) => self.load_world(eng, &name),
+            AppEffect::Load(id) => self.load_world(eng, &id),
             AppEffect::Host(info) => {
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();
@@ -408,18 +533,60 @@ impl App {
                 self.session.save();
                 self.start_join(eng, info);
             }
+            AppEffect::Settings => {
+                if let Screen::Menus(stack) = &mut self.screen {
+                    stack.push(Framed::boxed(SettingsHub));
+                }
+            }
+            AppEffect::Mods => {
+                if let Screen::Menus(stack) = &mut self.screen {
+                    stack.push(Framed::boxed(ModsMenu));
+                    self.mods_open = true;
+                }
+            }
             AppEffect::ToggleMod(index) => {
                 self.mods.toggle(index);
-                self.mods.save_choices();
+                self.choices_flush.mark(self.now_ms());
             }
             AppEffect::StepModKnob {
                 mod_index,
                 knob,
                 delta,
-            } => self.mods.step_knob(mod_index, knob, delta),
-            AppEffect::Quit => return true,
+            } => {
+                self.mods.step_knob(mod_index, knob, delta);
+                self.choices_flush.mark(self.now_ms());
+            }
+            AppEffect::SetGroup { id, on } => {
+                self.mods.set_group_enabled(id, on);
+                self.choices_flush.mark(self.now_ms());
+            }
+            AppEffect::Quit => {
+                self.flush_mod_choices_if_dirty();
+                return true;
+            }
         }
         false
+    }
+
+    /// Open the start screen: first enabled start-screen mod, else the core fallback.
+    fn start_stack(
+        mods: &Mods,
+        saves: &[Slot],
+        session: &Session,
+        notice: Option<&str>,
+        hosting: bool,
+    ) -> MenuStack {
+        let facts = StartFacts {
+            saves,
+            session,
+            version: VERSION,
+            hosting,
+            notice,
+        };
+        let inner = mods
+            .start_screen(&facts)
+            .unwrap_or_else(|| crate::menu::start::fallback(&facts));
+        MenuStack::new(StartRoot::wrap(inner, hosting))
     }
 
     /// Return to the start menu with an optional notice (e.g. a failed connect).
@@ -430,7 +597,13 @@ impl App {
         self.audio.enter_world();
         self.active = None;
         self.saves = save::list();
-        self.screen = Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::with_notice(notice))));
+        self.screen = Screen::Menus(Self::start_stack(
+            &self.mods,
+            &self.saves,
+            &self.session,
+            notice.as_deref(),
+            self.host.is_some(),
+        ));
     }
 
     /// Spin up a fresh integrated server and join it on loopback. Any previous host
@@ -445,7 +618,7 @@ impl App {
             password: info.password.clone(),
             seed,
             worldgen: self.mods.worldgen_kind(),
-            diffusion: self.mods.diffusion_cfg(),
+            diffusion: diffusion_from_mods(&self.mods),
             ..Config::default()
         };
         match server::spawn(info.port, config) {
@@ -458,7 +631,7 @@ impl App {
                     &info.name,
                     &info.password,
                     self.mods.worldgen_kind(),
-                    self.mods.diffusion_cfg(),
+                    diffusion_from_mods(&self.mods),
                 ) {
                     Ok(conn) => self.enter_net_game(eng, conn),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
@@ -476,7 +649,7 @@ impl App {
             &info.name,
             &info.password,
             self.mods.worldgen_kind(),
-            self.mods.diffusion_cfg(),
+            diffusion_from_mods(&self.mods),
         ) {
             Ok(conn) => self.enter_net_game(eng, conn),
             Err(e) => self.fail_to_menu(format!("could not join: {e}")),
@@ -489,9 +662,9 @@ impl App {
         // `enter_game`; streaming fills the remainder asynchronously.
         let world = World::with_kind_cfg(
             conn.seed(),
-            self.mods.mask_render(self.settings.render_config()),
-            self.mods.worldgen_kind(),
-            self.mods.diffusion_cfg(),
+            self.mods.effective_render(&self.settings),
+            conn.worldgen(),
+            conn.diffusion(),
             false,
         );
         let player = Player::new(conn.spawn());
@@ -522,9 +695,9 @@ impl App {
         // spawn slab — the previous eager default-volume generation is avoided.
         let world = World::with_kind_cfg(
             seed,
-            self.mods.mask_render(self.settings.render_config()),
+            self.mods.effective_render(&self.settings),
             self.mods.worldgen_kind(),
-            self.mods.diffusion_cfg(),
+            diffusion_from_mods(&self.mods),
             false,
         );
         let player = spawn_player(&world);
@@ -549,15 +722,13 @@ impl App {
     }
 
     /// Load an existing save and enter it. Stays on the menu if loading fails.
-    fn load_world(&mut self, eng: &mut Engine, name: &str) {
-        let id = match SlotId::new(name) {
-            Ok(id) => id,
-            Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
-        };
+    fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
         self.mods.reset_state();
-        let render = self.mods.mask_render(self.settings.render_config());
-        match save::load(&id, &mut self.mods, |seed| {
-            World::with_config_lazy(seed, render)
+        let render = self.mods.effective_render(&self.settings);
+        match save::load(id, &mut self.mods, |seed, kind, cfg| {
+            // The save header names the generator; the InfiniteDiffusion mod's
+            // enabled flag only chooses the next *new* world.
+            World::with_kind_cfg(seed, render, kind, cfg, false)
         }) {
             Ok((world, player, meta, report)) => {
                 self.active = Some(ActiveSlot::new(id.clone(), meta));
@@ -573,7 +744,7 @@ impl App {
                 }
                 self.enter_game(eng, game)
             }
-            Err(e) => self.fail_to_menu(format!("could not load {name}: {e}")),
+            Err(e) => self.fail_to_menu(format!("could not load {id}: {e}")),
         }
     }
 
@@ -581,8 +752,8 @@ impl App {
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
         // World-construction lanes apply on entry only, before streaming spins;
         // everything live-applicable goes through the same path `/gfx` uses.
-        let render = self.mods.mask_render(self.settings.render_config());
-        game.set_visual_mask(crate::mods::VisualMask::from_mods(&self.mods));
+        let render = self.mods.effective_render(&self.settings);
+        game.set_visual_mask(self.mods.visual_mask());
         game.world_mut()
             .set_render_lanes(render.occlusion, render.lod2);
         game.apply_settings(eng, &mut self.settings);
@@ -706,6 +877,7 @@ impl App {
                 saves: &self.saves,
                 mods: &mods,
                 session: &self.session,
+                mods_save_error: self.mods_save_error.as_deref(),
             };
             stack.draw(&ctx, theme, &mut f, w, h);
         }
@@ -716,6 +888,14 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parse the winning worldgen payload as diffusion knobs (classic has none).
+fn diffusion_from_mods(mods: &Mods) -> DiffusionCfg {
+    mods.worldgen_config()
+        .as_deref()
+        .map(DiffusionCfg::from_text)
+        .unwrap_or_default()
 }
 
 /// A world seed from the wall clock, so each new world differs.
@@ -858,5 +1038,31 @@ mod tests {
             diffusion_ms < 250.0,
             "diffusion spawn must stay under a frame, got {diffusion_ms:.2}"
         );
+    }
+
+    #[test]
+    fn pacing_menus_world_and_bench() {
+        let mut settings = Settings::default();
+        settings.vsync = true;
+        settings.max_fps = 60;
+        assert_eq!(
+            pacing(false, false, &settings),
+            (false, MENU_FPS_CAP),
+            "menus: vsync off, cap 120"
+        );
+        assert_eq!(
+            pacing(true, false, &settings),
+            (true, 60),
+            "in-world: saved vsync and max_fps"
+        );
+        assert_eq!(pacing(false, true, &settings), (false, 0), "bench: off, 0");
+        assert_eq!(pacing(true, true, &settings), (false, 0), "bench wins in-world too");
+
+        settings.vsync = false;
+        settings.max_fps = 0;
+        assert_eq!(pacing(false, false, &settings), (false, MENU_FPS_CAP));
+        assert_eq!(pacing(true, false, &settings), (false, 0));
+        settings.max_fps = 144;
+        assert_eq!(pacing(true, false, &settings), (false, 144));
     }
 }

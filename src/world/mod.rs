@@ -737,6 +737,8 @@ pub struct World {
     /// Read-only block palette; meshing/collision read its hot solidity arrays.
     registry: BlockRegistry,
     generator: diffusion::Generator,
+    kind: WorldgenKind,
+    diffusion: diffusion::DiffusionCfg,
     chunks: FastMap<Coord, Loaded>,
     /// Player edits grouped by chunk (inner key: flat voxel index for replay on regenerate).
     edits: FastMap<Coord, FastMap<usize, BlockId>>,
@@ -1080,6 +1082,7 @@ impl World {
         field: diffusion::DiffusionCfg,
         pregenerate_origin: bool,
     ) -> Self {
+        let field = field.clamp();
         let mut registry = BlockRegistry::with_builtins();
         let generator = match kind {
             WorldgenKind::Classic => diffusion::classic(&mut registry, seed),
@@ -1093,6 +1096,8 @@ impl World {
         let mut world = Self {
             registry,
             generator,
+            kind,
+            diffusion: field,
             chunks: FastMap::default(),
             ceilings: FastMap::default(),
             edits: FastMap::default(),

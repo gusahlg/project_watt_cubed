@@ -17,6 +17,8 @@ use voxel_engine::DVec3;
 
 use crate::ident::codec;
 use crate::presence::Stance;
+use crate::world::diffusion::DiffusionCfg;
+use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
@@ -64,6 +66,32 @@ impl Wire for Stance {
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
         Stance::from_wire(r.u8().ok()?)
+    }
+}
+
+impl Wire for WorldgenKind {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u8(self.wire());
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        WorldgenKind::from_wire(r.u8().ok()?)
+    }
+}
+
+impl Wire for DiffusionCfg {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u32(self.tile);
+        w.u32(self.stride);
+        w.u32(self.phases);
+        w.f32(self.relief);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        Some(DiffusionCfg {
+            tile: r.u32().ok()?,
+            stride: r.u32().ok()?,
+            phases: r.u32().ok()?,
+            relief: r.f32().ok()?,
+        })
     }
 }
 
@@ -265,7 +293,13 @@ messages! {
 messages! {
     /// A message from the server to a client.
     pub enum ServerMessage {
-        Welcome = tag::WELCOME { player_id: u32, seed: i64, spawn: DVec3 },
+        Welcome = tag::WELCOME {
+            player_id: u32,
+            seed: i64,
+            spawn: DVec3,
+            worldgen: WorldgenKind,
+            diffusion: DiffusionCfg,
+        },
         /// The stream closes after this (bad password, version mismatch, server full).
         Reject = tag::REJECT { reason: Arc<str> },
         /// Sent once right after [`Welcome`](Self::Welcome). Each cell carries its
@@ -396,6 +430,20 @@ mod tests {
                 player_id: 42,
                 seed: -9_999,
                 spawn: DVec3::new(0.5, 40.0, 0.5),
+                worldgen: WorldgenKind::Classic,
+                diffusion: DiffusionCfg::default(),
+            },
+            ServerMessage::Welcome {
+                player_id: 7,
+                seed: 11,
+                spawn: DVec3::new(1.0, 20.0, 2.0),
+                worldgen: WorldgenKind::Diffusion,
+                diffusion: DiffusionCfg {
+                    tile: 64,
+                    stride: 8,
+                    phases: 4,
+                    relief: 1.5,
+                },
             },
             ServerMessage::Reject { reason: "bad password".into() },
             ServerMessage::Snapshot {
@@ -473,8 +521,29 @@ mod tests {
         }
         let pm = ServerMessage::PeerMove { id: 7, pos, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
         assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
-        let wl = ServerMessage::Welcome { player_id: 1, seed: 3, spawn: pos };
+        let wl = ServerMessage::Welcome {
+            player_id: 1,
+            seed: 3,
+            spawn: pos,
+            worldgen: WorldgenKind::Diffusion,
+            diffusion: DiffusionCfg::default(),
+        };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
+    }
+
+    #[test]
+    fn welcome_rejects_unknown_worldgen_kind() {
+        let mut payload = ServerMessage::Welcome {
+            player_id: 1,
+            seed: 3,
+            spawn: DVec3::ZERO,
+            worldgen: WorldgenKind::Classic,
+            diffusion: DiffusionCfg::default(),
+        }
+        .encode();
+        // kind sits after tag, player_id, seed, spawn (1+4+8+24 = 37).
+        payload[37] = 9;
+        assert_eq!(ServerMessage::decode(&payload), None);
     }
 
     #[test]
