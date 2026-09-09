@@ -109,6 +109,22 @@ const MIN_STREAM_EFFORT: f32 = 0.15;
 /// damped so the first stationary frame cannot release a catch-up avalanche.
 const STREAM_RECOVERY_SECS: f64 = 0.75;
 
+/// Last topology pass cheaper than this: leftover light/mesh work at rest may
+/// run at full worker/admission capacity. Half a 60 Hz frame — the post-flight
+/// frames on this branch sit well below it, while an already-expensive pass
+/// keeps travel shedding.
+const STREAM_HEADROOM_SECS: f64 = 0.008;
+
+/// Hysteresis: once rest-boosted, stay boosted until a pass exceeds this so a
+/// slightly heavier first stationary admit cannot immediately re-shed.
+const STREAM_HEADROOM_EXIT_SECS: f64 = 0.014;
+
+/// Near-queue cap at rest when leftover light/mesh work remains. Travel keeps
+/// `active * 4` because queued jobs go stale; at rest they will still be wanted,
+/// and cheap light jobs otherwise idle the pool for the rest of a 16 ms frame.
+/// Same order as [`pipeline::FAR_QUEUE_CAP`].
+const NEAR_REST_QUEUE_CAP: usize = 256;
+
 /// A real mesh upload always makes progress even when the scaled byte budget is
 /// tiny. Most chunks fit below this; an unusually large first mesh is allowed
 /// to overrun it once, just as it may overrun the normal byte budget once.
@@ -122,11 +138,14 @@ const RESULT_INTEGRATE_FLOOR: usize = 8;
 /// Velocity-aware streaming load controller. `effort` is the one normalized
 /// signal shared by worker concurrency, queue lookahead, admission deadlines,
 /// result integration, and GPU uploads, so those stages cannot fight each
-/// other by independently trying to catch up.
+/// other by independently trying to catch up. `boost` is the rest-time override:
+/// leftover light/mesh work on a frame with headroom runs at full capacity so
+/// the travel floor cannot idle the pool while tens of thousands of jobs wait.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::world) struct StreamPacer {
     speed_mps: f64,
     effort: f32,
+    boost: bool,
 }
 
 impl Default for StreamPacer {
@@ -134,6 +153,7 @@ impl Default for StreamPacer {
         Self {
             speed_mps: 0.0,
             effort: 1.0,
+            boost: false,
         }
     }
 }
@@ -169,6 +189,32 @@ impl StreamPacer {
         }
     }
 
+    /// Rest-time override: full workers and admission while light/mesh work
+    /// remains, the eye is at or below walking speed, and the last topology
+    /// pass had frame-time headroom. Travel still sheds — boosting during
+    /// flight would spend the frame-time win on stale work.
+    fn set_boost(&mut self, queued_near: bool, last_stream_secs: f64) {
+        let at_rest = self.speed_mps <= FULL_EFFORT_SPEED_MPS;
+        if !queued_near || !at_rest {
+            self.boost = false;
+            return;
+        }
+        if self.boost {
+            self.boost = last_stream_secs < STREAM_HEADROOM_EXIT_SECS;
+        } else {
+            self.boost = last_stream_secs < STREAM_HEADROOM_SECS;
+        }
+    }
+
+    pub(in crate::world) fn boosting(self) -> bool {
+        self.boost
+    }
+
+    /// Effort applied to workers, admission, drain, and uploads this pass.
+    fn applied_effort(self) -> f32 {
+        if self.boost { 1.0 } else { self.effort }
+    }
+
     pub(in crate::world) fn effort(self) -> f32 {
         self.effort
     }
@@ -178,24 +224,36 @@ impl StreamPacer {
     }
 
     pub(in crate::world) fn duration(self, base: Duration) -> Duration {
-        base.mul_f32(self.effort)
+        base.mul_f32(self.applied_effort())
     }
 
     pub(in crate::world) fn floor(self, base: usize) -> usize {
-        ((base as f32 * self.effort).ceil() as usize).clamp(1, base.max(1))
+        ((base as f32 * self.applied_effort()).ceil() as usize).clamp(1, base.max(1))
     }
 
     fn upload_bytes(self) -> usize {
-        ((UPLOAD_BUDGET_BYTES as f32 * self.effort) as usize).max(MIN_UPLOAD_BUDGET_BYTES)
+        ((UPLOAD_BUDGET_BYTES as f32 * self.applied_effort()) as usize).max(MIN_UPLOAD_BUDGET_BYTES)
     }
 
     fn section_uploads(self) -> usize {
-        ((SECTION_UPLOAD_BUDGET as f32 * self.effort).round() as usize)
+        ((SECTION_UPLOAD_BUDGET as f32 * self.applied_effort()).round() as usize)
             .clamp(1, SECTION_UPLOAD_BUDGET)
     }
 
     fn active_workers(self, capacity: usize) -> usize {
-        ((capacity as f32 * self.effort).ceil() as usize).clamp(1, capacity.max(1))
+        ((capacity as f32 * self.applied_effort()).ceil() as usize).clamp(1, capacity.max(1))
+    }
+
+    /// Near-queue lookahead. Travel keeps a short cap so queued jobs do not go
+    /// stale; at rest the deeper cap keeps cheap light jobs from idling the pool.
+    fn near_queue_cap(self, capacity: usize) -> usize {
+        let active = self.active_workers(capacity);
+        let travel = (active * 4).max(8);
+        if self.boost {
+            travel.max(NEAR_REST_QUEUE_CAP)
+        } else {
+            travel
+        }
     }
 }
 
@@ -376,6 +434,12 @@ impl World {
         };
         self.section_vel = section_vel;
         self.stream_pacer.update(pacing_vel, sample_dt);
+        let queued_near = !self.light_worklist.is_empty()
+            || !self.mesh_worklist.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.light_apply_queue.is_empty();
+        self.stream_pacer.set_boost(queued_near, self.last_stream_secs);
+        self.light_admitted_last = 0;
         self.section_eye_prev = center.is_finite().then_some((center, now));
         let s = CHUNK_SIZE as i32;
         let center_chunk = ChunkCoord::new(
@@ -410,7 +474,11 @@ impl World {
             velocity.x,
             velocity.z,
         );
-        workers.set_active_workers(pacer.active_workers(workers.worker_capacity()));
+        let capacity = workers.worker_capacity();
+        workers.set_pacing(
+            pacer.active_workers(capacity),
+            pacer.near_queue_cap(capacity),
+        );
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
         // The ring geometry is centred on the eye: a boundary cross SHIFTS the
@@ -626,6 +694,7 @@ impl World {
         self.refresh_lod_clip();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
+        self.last_stream_secs = now.elapsed().as_secs_f64();
     }
 
     /// Land finished worker results (non-blocking). Generate results clear
@@ -920,7 +989,7 @@ impl World {
             // settle against its own voxels.
             self.light_inflight.remove(&coord);
             if live_gen.is_some() && self.lighting {
-                self.light_worklist.insert(coord);
+                self.seed_light(coord);
                 self.light_pending.set();
             }
             return;
@@ -1152,7 +1221,7 @@ impl World {
                 self.light_inflight.remove(&coord);
                 if rearm {
                     // An unloaded chunk's seed is dropped by the lane's submit.
-                    self.light_worklist.insert(coord);
+                    self.seed_light(coord);
                     self.light_pending.set();
                 }
                 // Quarantined light: the chunk never settles, so the mesh
@@ -1413,13 +1482,13 @@ impl World {
                 // claim. Skip trivial publish (it would steal that claim via
                 // settle_light) and seed so we resettle after the stale Done
                 // is consumed against the old generation.
-                self.light_worklist.insert(coord);
+                self.seed_light(coord);
                 self.light_pending.set();
             } else {
                 match self.trivial_light(coord, &chunk) {
                     Some(grid) => self.settle_light(coord, grid),
                     None => {
-                        self.light_worklist.insert(coord);
+                        self.seed_light(coord);
                         self.light_pending.set();
                     }
                 }
@@ -1811,6 +1880,12 @@ impl World {
         self.pending_fresh.set();
     }
 
+    /// Count a light-worklist insert (the stress harness's seeds-per-chunk signal).
+    pub(in crate::world) fn seed_light(&mut self, coord: Coord) {
+        self.light_seed_inserts += 1;
+        self.light_worklist.insert(coord);
+    }
+
     /// Publish settled light, re-arm mesh readiness, and seed neighbours to re-settle.
     /// Shared by sync (trivial) and async settle paths.
     pub(in crate::world) fn settle_light(&mut self, coord: Coord, grid: light::LightGrid) {
@@ -1860,7 +1935,7 @@ impl World {
                 continue;
             }
             let n = coord.step(face);
-            self.light_worklist.insert(n);
+            self.seed_light(n);
             self.mesh_worklist.insert(n);
             // A DEGRADED neighbour meshed with fake open-sky light across this
             // border; now that real light has crossed it, schedule its ASYNC
@@ -2478,6 +2553,9 @@ impl World {
             worker_capacity,
             travel_speed_mps: self.stream_pacer.speed_mps(),
             effort: self.stream_pacer.effort(),
+            light_admitted: self.light_admitted,
+            light_admitted_last: self.light_admitted_last,
+            light_seed_inserts: self.light_seed_inserts,
         }
     }
 
@@ -2720,6 +2798,39 @@ mod tests {
             pacer.update(DVec3::ZERO, 0.1);
         }
         assert_eq!(pacer.effort(), 1.0);
+    }
+
+    #[test]
+    fn stream_pacer_runs_full_workers_for_queued_work_at_rest() {
+        let mut pacer = StreamPacer::default();
+        pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
+        assert_eq!(pacer.active_workers(12), 2, "travel still sheds");
+        pacer.set_boost(true, 0.001);
+        assert!(
+            !pacer.boosting(),
+            "queued work during travel must not lift the floor"
+        );
+        assert_eq!(pacer.active_workers(12), 2);
+        assert_eq!(pacer.near_queue_cap(12), 8);
+
+        pacer.update(DVec3::ZERO, 1.0 / 60.0);
+        pacer.set_boost(true, 0.001);
+        assert!(pacer.boosting(), "cheap rest frame with leftover work");
+        assert_eq!(pacer.active_workers(12), 12);
+        assert_eq!(pacer.near_queue_cap(12), NEAR_REST_QUEUE_CAP);
+        assert_eq!(pacer.floor(32), 32);
+        assert!(
+            pacer.duration(Duration::from_millis(1)) >= Duration::from_millis(1),
+            "rest boost restores the full admission window"
+        );
+
+        pacer.set_boost(true, 0.020);
+        assert!(
+            !pacer.boosting(),
+            "an already-expensive pass keeps the travel floor"
+        );
+        let expected = ((12.0 * pacer.effort()).ceil() as usize).clamp(1, 12);
+        assert_eq!(pacer.active_workers(12), expected);
     }
 
     /// A degraded drawn chunk whose neighbourhood becomes light-ready WITHOUT

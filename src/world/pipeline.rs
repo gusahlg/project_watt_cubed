@@ -418,11 +418,12 @@ impl ViewGate {
 
     fn set_active_workers(&self, active: usize) {
         let active = active.max(1);
-        self.active_workers.store(active, Ordering::Relaxed);
-        // A few queued jobs per active thread hide variance without admitting
-        // a whole view volume that will be stale before it runs.
-        self.near_queue_cap
-            .store((active * 4).max(8), Ordering::Relaxed);
+        self.set_pacing(active, (active * 4).max(8));
+    }
+
+    fn set_pacing(&self, active: usize, near_cap: usize) {
+        self.active_workers.store(active.max(1), Ordering::Relaxed);
+        self.near_queue_cap.store(near_cap.max(1), Ordering::Relaxed);
     }
 
     fn active_workers(&self) -> usize {
@@ -863,12 +864,12 @@ impl Workers {
         self.view.publish(cx, cz, radius, far_m, vel_x, vel_z);
     }
 
-    /// Park/unpark workers to match the world's current effort signal. Both
-    /// condition sets are notified on a transition so workers migrate to the
-    /// correct wait set before the next job notification.
-    pub(in crate::world) fn set_active_workers(&self, active: usize) {
+    /// Park/unpark workers and publish near-queue lookahead together. A cap-only
+    /// change does not wake parked workers; an active-count change does.
+    pub(in crate::world) fn set_pacing(&self, active: usize, near_cap: usize) {
         let active = active.clamp(1, self.capacity);
-        if self.view.active_workers() == active {
+        let near_cap = near_cap.max(1);
+        if self.view.active_workers() == active && self.view.near_queue_cap() == near_cap {
             return;
         }
         let (lock, work, pace) = &*self.gate;
@@ -878,13 +879,16 @@ impl Workers {
         let queue = lock_queue(lock);
         // Keep the in-lock check too: it makes the transition safe even if a
         // future caller publishes pacing from more than one thread.
-        if self.view.active_workers() == active {
+        if self.view.active_workers() == active && self.view.near_queue_cap() == near_cap {
             return;
         }
-        self.view.set_active_workers(active);
+        let workers_changed = self.view.active_workers() != active;
+        self.view.set_pacing(active, near_cap);
         drop(queue);
-        work.notify_all();
-        pace.notify_all();
+        if workers_changed {
+            work.notify_all();
+            pace.notify_all();
+        }
     }
 
     pub(in crate::world) fn active_workers(&self) -> usize {

@@ -624,6 +624,9 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("worker_capacity", Json::from(g.worker_capacity)),
         ("travel_speed_mps", Json::number(g.travel_speed_mps)),
         ("effort", Json::number(f64::from(g.effort))),
+        ("light_admitted", Json::from(g.light_admitted as u64)),
+        ("light_admitted_last", Json::from(g.light_admitted_last)),
+        ("light_seed_inserts", Json::from(g.light_seed_inserts as u64)),
     ])
 }
 

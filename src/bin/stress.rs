@@ -79,6 +79,23 @@ fn main() {
             "  adaptive floor: effort={:.2} active_workers={}",
             o.min_stream_effort, o.min_active_workers
         );
+        println!(
+            "  at stop: light_worklist={} chunks={} seeds={} seeds/chunk={:.2}",
+            o.light_worklist_at_stop,
+            o.chunks_at_stop,
+            o.light_seed_inserts_at_stop,
+            o.seeds_per_chunk
+        );
+        println!(
+            "  settle light admit/s={:.0}",
+            o.settle_light_admit_per_s
+        );
+        for s in &o.settle_samples {
+            println!(
+                "  t={}s admit/s={:.0} workers={} effort={:.2} light_worklist={}",
+                s.sec, s.light_admit_per_s, s.active_workers, s.effort, s.light_worklist
+            );
+        }
         if !o.stuck.is_empty() {
             println!("  STUCK: {}", o.stuck);
         }

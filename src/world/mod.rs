@@ -159,6 +159,12 @@ pub struct StreamGauges {
     /// Current horizontal travel speed and normalized streaming effort.
     pub travel_speed_mps: f64,
     pub effort: f32,
+    /// Cumulative light jobs admitted to the pool, and the count from the
+    /// most recent light-admit pass (0 if that pass did not run).
+    pub light_admitted: u64,
+    pub light_admitted_last: usize,
+    /// Cumulative `light_worklist` insert attempts (including already-queued).
+    pub light_seed_inserts: u64,
 }
 use connectivity::{Connectivity, Occlusion};
 
@@ -786,6 +792,12 @@ pub struct World {
     light_pending: Sticky,
     /// Chunks needing light settling (budgeted, seeded on load/edit/border moves).
     light_worklist: FastSet<Coord>,
+    /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
+    light_seed_inserts: u64,
+    /// Cumulative light jobs accepted by the worker pool.
+    light_admitted: u64,
+    /// Jobs accepted by the most recent [`admit`]`<LightLane>` pass.
+    light_admitted_last: usize,
     /// Chunks with a light-settle job in flight on the worker pool. A settle is
     /// claimed out of `light_worklist` at submit and released here when its grid
     /// lands, so at most one flood per chunk is in flight and the mesh gate
@@ -909,6 +921,9 @@ pub struct World {
     /// admission, result-integration, and upload pressure; capacity recovers
     /// gradually after stopping so the first stationary frame cannot hitch.
     stream_pacer: streaming::StreamPacer,
+    /// Wall time of the previous [`World::stream`] topology pass. The rest-time
+    /// worker boost uses it as the frame-headroom signal.
+    last_stream_secs: f64,
     /// Per-cell relief drives error-driven LOD selection for the far field.
     /// `None` until the background bake lands; selection falls back to default LOD.
     section_mip: Option<HeightMip>,
@@ -1099,6 +1114,9 @@ impl World {
             mesh_worklist: FastSet::default(),
             light_pending: Sticky::default(),
             light_worklist: FastSet::default(),
+            light_seed_inserts: 0,
+            light_admitted: 0,
+            light_admitted_last: 0,
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
@@ -1132,6 +1150,7 @@ impl World {
             section_eye_prev: None,
             section_vel: DVec3::ZERO,
             stream_pacer: streaming::StreamPacer::default(),
+            last_stream_secs: 0.0,
             section_mip: None,
             section_mip_rx: None,
             sections: FastMap::default(),
@@ -1704,6 +1723,11 @@ pub(in crate::world) trait StreamLane {
     fn claim(world: &mut World, key: Self::Key);
     /// Fold a finished result back into the world (upload a mesh, publish light).
     fn integrate(world: &mut World, done: pipeline::Done);
+    /// Record how many jobs this pass admitted. Light counts it for the stress
+    /// harness; everyone else is a no-op.
+    fn note_admitted(world: &mut World, n: usize) {
+        let _ = (world, n);
+    }
 }
 
 fn queue_slots<S: StreamLane>(world: &World) -> usize {
@@ -1793,9 +1817,12 @@ pub(in crate::world) fn admit<S: StreamLane>(
 
     let mut exhausted = want == n;
     let mut admitted = 0usize;
+    let fill_slots = world.stream_pacer.boosting();
     for i in 0..want {
         let key = scratch.keys[i].1;
-        if admission_exhausted(admitted, min_admit, deadline) {
+        if admission_exhausted(admitted, min_admit, deadline)
+            && !(fill_slots && admitted < slots)
+        {
             exhausted = false;
             break;
         }
@@ -1819,6 +1846,7 @@ pub(in crate::world) fn admit<S: StreamLane>(
             break;
         }
     }
+    S::note_admitted(world, admitted);
     let drained = exhausted && S::seed_set(world).is_none_or(|set| set.is_empty());
     if drained {
         S::pending(world).take();
@@ -2157,6 +2185,10 @@ impl StreamLane for LightLane {
     fn claim(world: &mut World, key: Coord) {
         world.light_worklist.remove(&key);
         world.light_inflight.insert(key);
+    }
+    fn note_admitted(world: &mut World, n: usize) {
+        world.light_admitted += n as u64;
+        world.light_admitted_last = n;
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
         // `accept_light` owns the claim rule (release-or-transfer on every

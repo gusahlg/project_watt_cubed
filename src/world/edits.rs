@@ -331,7 +331,7 @@ impl World {
                         .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
                         .collect();
                     for c in shadowed {
-                        self.light_worklist.insert(c);
+                        self.seed_light(c);
                     }
                     self.light_pending.set();
                 }
@@ -357,7 +357,7 @@ impl World {
             self.pending_fresh.set();
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
-            self.light_worklist.insert(coord);
+            self.seed_light(coord);
             self.light_pending.set();
         }
         // A block on a chunk face also changes that neighbour's exposed
@@ -401,7 +401,7 @@ impl World {
             self.pending_fresh.set();
             // A border edit can change this chunk's light directly (an emitter on
             // the shared face); re-settle it too.
-            self.light_worklist.insert(coord);
+            self.seed_light(coord);
             self.light_pending.set();
         }
     }
