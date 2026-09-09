@@ -528,6 +528,19 @@ mod tests {
     }
 
     #[test]
+    fn gfx_lists_default_auto_render_scale() {
+        let (mut p, mut w) = (player(), world());
+        let mut s = Settings::default();
+        let mut sky = Sky::new();
+        s.note_render_extent(1920, 1080, 1.0);
+        let text = joined(&execute("gfx", &mut p, &mut w, &mut s, &mut sky));
+        assert!(
+            text.contains("render scale Auto (0.8)"),
+            "Default /gfx prints the effective Auto scale: {text}"
+        );
+    }
+
+    #[test]
     fn gfx_lists_effective_visual_lanes_when_a_mod_strips_them() {
         let (mut p, mut w) = (player(), world());
         let mut s = Settings::default();

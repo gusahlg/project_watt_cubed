@@ -34,6 +34,11 @@ pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RA
 /// renderer can never disagree on the bound.
 pub use voxel_engine::RENDER_SCALE_RANGE;
 
+/// Default-preset internal scale when the window is above [`AUTO_RENDER_SCALE_THRESHOLD_PX`].
+pub const DEFAULT_AUTO_RENDER_SCALE: f32 = 0.8;
+/// Window-pixel count above which Default uses [`DEFAULT_AUTO_RENDER_SCALE`] (and TAA).
+pub const AUTO_RENDER_SCALE_THRESHOLD_PX: u32 = 1_500_000;
+
 const SETTINGS_PATH: &str = "saves/settings.cfg";
 
 /// Field-of-view clamp range, in degrees. Shared with the settings menu stepper.
@@ -184,6 +189,9 @@ settings_fields! {
     /// Largest connected display (fullscreen first allocation).
     startup_display_w: u32 = 1280,
     startup_display_h: u32 = 720,
+    /// Last window size used by Default Auto render scale.
+    window_w: u32 = 1280,
+    window_h: u32 = 720,
     /// Last render extent (window × session scale) used by Auto VRS.
     render_w: u32 = 1280,
     render_h: u32 = 720,
@@ -788,18 +796,34 @@ pub const SETTINGS: [Setting; 52] = [
         },
         fov_clamp
     ),
-    percent_bar!(
-        Profile::Owned,
-        Category::Video,
-        render_scale,
-        "render_scale",
-        "Render Scale",
-        RENDER_SCALE_RANGE,
-        &[25, 50, 75, 100, 125, 150, 200],
-        "renderscale <25-200>",
-        "render scale",
-        &["renderscale", "scale"]
-    ),
+    Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Bar,
+        profile: Profile::Owned,
+        fraction: |s| frac(s.render_scale, *RENDER_SCALE_RANGE.start(), *RENDER_SCALE_RANGE.end()),
+        key: "render_scale",
+        aliases: &["renderscale", "scale"],
+        label: "Render Scale",
+        usage: "renderscale <25-200>",
+        confirm: |s| format!("render scale {}", render_scale_show(s)),
+        show: render_scale_show,
+        parse_human: |s, v| match v.parse::<f32>() {
+            Ok(pct) => {
+                s.render_scale = pct / 100.0;
+                clamp_float(&mut s.render_scale, &RENDER_SCALE_RANGE, Settings::default().render_scale);
+                true
+            }
+            Err(_) => false,
+        },
+        step: |s, d| {
+            let pct = cycle_list(&[25, 50, 75, 100, 125, 150, 200], (s.render_scale * 100.0).round() as i32, d);
+            s.render_scale = pct as f32 / 100.0;
+        },
+        clamp: |s| clamp_float(&mut s.render_scale, &RENDER_SCALE_RANGE, Settings::default().render_scale),
+        write: |s, text| write_value(s.render_scale, text),
+        copy: |s, source| s.render_scale = source.render_scale,
+        read: |s, v| set_parsed(&mut s.render_scale, v),
+    },
     percent_bar!(
         Profile::Personal,
         Category::Interface,
@@ -1068,12 +1092,14 @@ impl Settings {
 
     /// Session MSAA/scale after the VRAM guard. Does not mutate persisted fields.
     pub fn session_graphics(&self, width: u32, height: u32) -> SessionGraphics {
-        let lanes = self.render_config();
+        let scale = self.effective_render_scale(width, height);
+        let mut lanes = self.render_config();
+        lanes.taa = self.effective_taa(scale);
         match self.vram_budget_bytes {
             Some(budget) => fit_render_targets(
                 width,
                 height,
-                self.render_scale,
+                scale,
                 self.msaa,
                 lanes,
                 budget,
@@ -1081,10 +1107,29 @@ impl Settings {
             ),
             None => SessionGraphics {
                 msaa: self.msaa.min(self.device_max_msaa).max(1),
-                render_scale: self.render_scale,
+                render_scale: scale,
                 notice: None,
             },
         }
+    }
+
+    /// Whether the Default Auto render-scale rule is live (not Custom/Minimum/Fast).
+    pub fn render_scale_auto(&self) -> bool {
+        self.preset == Preset::Default
+    }
+
+    /// Scale pushed to the engine for this window. Default picks 0.8 above the
+    /// pixel threshold and 1.0 otherwise; other profiles keep their stored value.
+    pub fn effective_render_scale(&self, window_w: u32, window_h: u32) -> f32 {
+        if self.render_scale_auto() {
+            auto_render_scale(window_w, window_h)
+        } else {
+            self.render_scale
+        }
+    }
+
+    fn effective_taa(&self, scale: f32) -> bool {
+        self.taa || (self.render_scale_auto() && scale < 1.0)
     }
 
     /// Push the current values to the engine. Cheap to call every frame: the
@@ -1109,9 +1154,12 @@ impl Settings {
         eng.set_flags(self.render_config().engine_flags());
     }
 
-    /// Record the live render extent so [`render_config`] can resolve Auto VRS.
+    /// Record the live window and render extent so [`render_config`] can resolve
+    /// Auto VRS and Default Auto render scale.
     pub fn note_render_extent(&mut self, window_w: u32, window_h: u32, scale: f32) {
         let scale = scale.max(0.0);
+        self.window_w = window_w.max(1);
+        self.window_h = window_h.max(1);
         self.render_w = ((window_w as f32 * scale) as u32).max(1);
         self.render_h = ((window_h as f32 * scale) as u32).max(1);
     }
@@ -1131,6 +1179,7 @@ impl Settings {
     /// golden harness keeps its own pinned
     /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
     pub fn render_config(&self) -> RenderConfig {
+        let scale = self.effective_render_scale(self.window_w, self.window_h);
         RenderConfig {
             occlusion: self.occlusion,
             lod2: self.lod2,
@@ -1144,7 +1193,7 @@ impl Settings {
             weather: self.weather,
             stars: self.stars,
             day_night: self.day_night,
-            taa: self.taa,
+            taa: self.effective_taa(scale),
             fog: self.fog,
             ambient: self.ambient,
             sunlight: self.sunlight,
@@ -1172,6 +1221,28 @@ impl Settings {
 }
 
 // Shared value helpers — the single definition each surface reuses.
+
+/// Default Auto scale for a window pixel count. One comparison so the menu,
+/// session apply, and tests cannot disagree.
+pub fn auto_render_scale(window_w: u32, window_h: u32) -> f32 {
+    let px = (window_w as u64).saturating_mul(window_h as u64);
+    if px > u64::from(AUTO_RENDER_SCALE_THRESHOLD_PX) {
+        DEFAULT_AUTO_RENDER_SCALE
+    } else {
+        1.0
+    }
+}
+
+fn render_scale_show(s: &Settings) -> String {
+    if s.render_scale_auto() {
+        format!(
+            "Auto ({:.1})",
+            s.effective_render_scale(s.window_w, s.window_h)
+        )
+    } else {
+        format!("{:.0}%", s.render_scale * 100.0)
+    }
+}
 
 fn write_value(value: impl std::fmt::Display, text: &mut String) {
     write!(text, "{value}").expect("writing settings to a String cannot fail");
@@ -1836,5 +1907,60 @@ mod tests {
         s.vrs = VrsChoice::Off;
         s.note_render_extent(3840, 2160, 1.0);
         assert!(!s.render_config().vrs);
+    }
+
+    #[test]
+    fn default_auto_render_scale_follows_window_pixels() {
+        let field = setting("render_scale");
+        let mut s = Settings::default();
+        assert_eq!(s.preset, Preset::Default);
+        assert!(s.render_scale_auto());
+        assert_eq!(s.render_scale, 1.0, "stored Default scale stays 1.0");
+
+        s.note_render_extent(1280, 720, 1.0);
+        assert_eq!(s.effective_render_scale(1280, 720), 1.0);
+        assert_eq!(s.session_graphics(1280, 720).render_scale, 1.0);
+        assert!(!s.render_config().taa, "720p leaves TAA at the stored value");
+        assert_eq!(field.show(&s), "Auto (1.0)");
+        assert_eq!(field.confirm(&s), "render scale Auto (1.0)");
+
+        s.note_render_extent(1920, 1080, 1.0);
+        assert_eq!(s.effective_render_scale(1920, 1080), DEFAULT_AUTO_RENDER_SCALE);
+        assert_eq!(s.session_graphics(1920, 1080).render_scale, DEFAULT_AUTO_RENDER_SCALE);
+        assert!(s.render_config().taa, "1080p Default forces TAA for the upsampler");
+        assert_eq!(field.show(&s), "Auto (0.8)");
+
+        s.note_render_extent(3440, 1440, 1.0);
+        assert_eq!(s.effective_render_scale(3440, 1440), DEFAULT_AUTO_RENDER_SCALE);
+        assert!(s.render_config().taa);
+
+        // Crossing the threshold via the live extent path (resize / fullscreen).
+        s.note_render_extent(1280, 720, 1.0);
+        assert_eq!(s.effective_render_scale(s.window_w, s.window_h), 1.0);
+        assert!(!s.render_config().taa);
+        s.note_render_extent(1920, 1080, 1.0);
+        assert_eq!(s.effective_render_scale(s.window_w, s.window_h), DEFAULT_AUTO_RENDER_SCALE);
+        assert!(s.render_config().taa);
+
+        let mut custom = Settings::default();
+        custom.mark_custom();
+        custom.render_scale = 1.0;
+        custom.note_render_extent(1920, 1080, 1.0);
+        assert!(!custom.render_scale_auto());
+        assert_eq!(custom.effective_render_scale(1920, 1080), 1.0);
+        assert_eq!(custom.session_graphics(1920, 1080).render_scale, 1.0);
+        assert!(!custom.render_config().taa);
+        assert_eq!(field.show(&custom), "100%");
+
+        let mut fast = Settings::default();
+        fast.apply_preset(Preset::Fast);
+        fast.note_render_extent(1920, 1080, 0.5);
+        assert_eq!(fast.effective_render_scale(1920, 1080), 0.5);
+        assert!(!fast.render_config().taa);
+
+        let mut min = Settings::default();
+        min.apply_preset(Preset::Minimum);
+        min.note_render_extent(1920, 1080, 0.25);
+        assert_eq!(min.effective_render_scale(1920, 1080), 0.25);
     }
 }

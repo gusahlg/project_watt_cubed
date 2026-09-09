@@ -639,6 +639,10 @@ pub(super) fn display_json(eng: &Engine, settings: &Settings, system: Option<&Sy
             Json::from(((height as f32 * scale) as u32).max(1)),
         ),
         ("render_scale", Json::number(f64::from(scale))),
+        (
+            "render_scale_auto",
+            Json::from(settings.render_scale_auto()),
+        ),
         ("fullscreen", Json::from(eng.fullscreen())),
         ("vsync", Json::from(eng.vsync())),
         ("target_fps", Json::from(eng.target_fps())),
@@ -894,7 +898,34 @@ fn glob_values(root: &str, prefix: &str, suffix: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_edid;
+    use super::{Json, parse_edid};
+    use crate::settings::{DEFAULT_AUTO_RENDER_SCALE, Preset, Settings};
+
+    #[test]
+    fn display_report_uses_effective_scale_and_auto_flag() {
+        let mut s = Settings::default();
+        s.note_render_extent(1920, 1080, 1.0);
+        let scale = s.effective_render_scale(1920, 1080);
+        assert_eq!(scale, DEFAULT_AUTO_RENDER_SCALE);
+        let text = Json::object(vec![
+            ("render_scale", Json::number(f64::from(scale))),
+            ("render_scale_auto", Json::from(s.render_scale_auto())),
+        ])
+        .render();
+        assert!(text.contains("\"render_scale\":0.8"), "{text}");
+        assert!(text.contains("\"render_scale_auto\":true"), "{text}");
+
+        s.preset = Preset::Custom;
+        s.render_scale = 1.0;
+        let scale = s.effective_render_scale(1920, 1080);
+        let text = Json::object(vec![
+            ("render_scale", Json::number(f64::from(scale))),
+            ("render_scale_auto", Json::from(s.render_scale_auto())),
+        ])
+        .render();
+        assert!(text.contains("\"render_scale\":1"), "{text}");
+        assert!(text.contains("\"render_scale_auto\":false"), "{text}");
+    }
 
     #[test]
     fn parses_a_minimal_edid_identity_and_timing() {
