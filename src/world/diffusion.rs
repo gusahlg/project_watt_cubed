@@ -314,20 +314,20 @@ impl TerrainGenerator for DiffusionTerrain {
             humid: 0.5,
             cave: 0.0,
         }; CHUNK_SIZE]; CHUNK_SIZE];
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                cols[lz][lx] = self.column(x0 + lx as i32, z0 + lz as i32);
-            }
-        }
+        let mut buf = [0.0f32; CHUNK_SIZE * CHUNK_SIZE * 4];
+        self.field
+            .fill_all(x0, z0, CHUNK_SIZE as u32, CHUNK_SIZE as u32, &mut buf);
         let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         let mut max_top = i32::MIN;
         let mut min_h = i32::MAX;
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
-                let c = &cols[lz][lx];
+                let i = (lz * CHUNK_SIZE + lx) * 4;
+                let c = self.col_from_ch(&buf[i..i + 4]);
                 heights[lx + lz * CHUNK_SIZE] = c.height;
                 max_top = max_top.max(c.height.max(c.water));
                 min_h = min_h.min(c.height);
+                cols[lz][lx] = c;
             }
         }
         let deep_cut = min_h - self.mat.max_scattered_depth.max(48);
@@ -467,6 +467,63 @@ mod tests {
         }
     }
 
+    fn chunk_data_bytes(data: &ChunkData) -> Vec<u8> {
+        match data {
+            ChunkData::Uniform(id) => {
+                let mut b = vec![0u8];
+                b.extend_from_slice(&id.0.to_le_bytes());
+                b
+            }
+            ChunkData::Paletted { palette, cells } => {
+                let mut b = vec![1u8];
+                b.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+                for p in palette {
+                    b.extend_from_slice(&p.0.to_le_bytes());
+                }
+                b.extend_from_slice(&cells[..]);
+                b
+            }
+            ChunkData::Dense(cells) => {
+                let mut b = vec![2u8];
+                for id in cells.iter() {
+                    b.extend_from_slice(&id.0.to_le_bytes());
+                }
+                b
+            }
+        }
+    }
+
+    /// Pin `fnv1a_32` over six fixed seed-42 chunks. Values locked before the
+    /// batch-sample pass; a mismatch means generated `ChunkData` bytes moved.
+    #[test]
+    fn diffusion_chunk_byte_pin() {
+        use crate::hash::fnv1a_32;
+        let g = DiffusionTerrain::new(
+            &mut BlockRegistry::with_builtins(),
+            DiffusionCfg::default(),
+            42,
+        );
+        // surface, lake column, cave band, deep, two far coords.
+        let pins: [(&str, i32, i32, i32, u32); 6] = [
+            ("surface", 0, 1, 0, 0x600ae405),
+            ("lake", -22, 1, -24, 0xb779cebf),
+            ("cave", -24, -3, -24, 0xafa3e00c),
+            ("deep", 0, -20, 0, 0x24ae7d4e),
+            ("far_a", 6_250_000, 0, 0, 0x1932d2a2),
+            ("far_b", -6_250_000, -2, 3, 0x24fd3019),
+        ];
+        for (name, cx, cy, cz, want) in pins {
+            assert_eq!(
+                fnv1a_32(&chunk_data_bytes(&g.generate(cx, cy, cz))),
+                want,
+                "{name} ({cx},{cy},{cz})"
+            );
+        }
+    }
+
+    /// Column generation cost, n=24 columns × 4 layers.
+    /// Before batching: classic=140.3ms diffusion=401.8ms ratio=2.86.
+    /// After batching: classic=141.8ms diffusion=176.7ms ratio=1.25 (2.27× vs before).
     #[test]
     #[ignore]
     fn worldgen_column_cost() {
