@@ -25,6 +25,7 @@ use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
 use crate::settings::Settings;
+use crate::world::diffusion::DiffusionCfg;
 use crate::world::World;
 
 const STARTING_WINDOW_WIDTH: u32 = 1280;
@@ -383,6 +384,10 @@ impl App {
                 self.mods.step_knob(mod_index, knob, delta);
                 self.mods.save_choices();
             }
+            AppEffect::SetGroup { id, on } => {
+                self.mods.set_group_enabled(id, on);
+                self.mods.save_choices();
+            }
             AppEffect::Quit => return true,
         }
         false
@@ -411,7 +416,7 @@ impl App {
             password: info.password.clone(),
             seed,
             worldgen: self.mods.worldgen_kind(),
-            diffusion: self.mods.diffusion_cfg(),
+            diffusion: diffusion_from_mods(&self.mods),
             ..Config::default()
         };
         match server::spawn(info.port, config) {
@@ -424,7 +429,7 @@ impl App {
                     &info.name,
                     &info.password,
                     self.mods.worldgen_kind(),
-                    self.mods.diffusion_cfg(),
+                    diffusion_from_mods(&self.mods),
                 ) {
                     Ok(conn) => self.enter_net_game(eng, conn),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
@@ -442,7 +447,7 @@ impl App {
             &info.name,
             &info.password,
             self.mods.worldgen_kind(),
-            self.mods.diffusion_cfg(),
+            diffusion_from_mods(&self.mods),
         ) {
             Ok(conn) => self.enter_net_game(eng, conn),
             Err(e) => self.fail_to_menu(format!("could not join: {e}")),
@@ -490,7 +495,7 @@ impl App {
             seed,
             self.mods.effective_render(&self.settings),
             self.mods.worldgen_kind(),
-            self.mods.diffusion_cfg(),
+            diffusion_from_mods(&self.mods),
             false,
         );
         let player = spawn_player(&world);
@@ -682,6 +687,14 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parse the winning worldgen payload as diffusion knobs (classic has none).
+fn diffusion_from_mods(mods: &Mods) -> DiffusionCfg {
+    mods.worldgen_config()
+        .as_deref()
+        .map(DiffusionCfg::from_text)
+        .unwrap_or_default()
 }
 
 /// A world seed from the wall clock, so each new world differs.

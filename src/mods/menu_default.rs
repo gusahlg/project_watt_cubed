@@ -37,6 +37,10 @@ impl Mod for MenuDefaultMod {
         "The standard menu look (title/panel screens, bars and toggles)."
     }
 
+    fn group(&self) -> &'static str {
+        crate::mods::ESSENTIALS
+    }
+
     fn menu_theme(&self) -> Option<&dyn MenuTheme> {
         Some(&self.theme)
     }

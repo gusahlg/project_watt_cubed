@@ -123,6 +123,16 @@ impl<A: Copy> Row<A> {
         self.detail = Some(detail.into());
         self
     }
+
+    /// Non-selectable section title.
+    pub fn heading(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: None,
+            kind: RowKind::Heading,
+            tag: None,
+        }
+    }
 }
 
 pub struct View<A: Copy> {
@@ -175,6 +185,8 @@ pub enum AppEffect {
     Join(JoinInfo),
     ToggleMod(usize),
     StepModKnob { mod_index: usize, knob: usize, delta: i32 },
+    /// Enable or disable every member of a group (persists as per-mod lines).
+    SetGroup { id: &'static str, on: bool },
     Quit,
 }
 
@@ -187,6 +199,8 @@ pub struct ModRow {
     pub knobs: Vec<(String, String, String)>,
     pub visual_group: Option<VisualGroup>,
     pub worldgen: bool,
+    /// Group id (`""` if ungrouped).
+    pub group: String,
 }
 
 impl ModRow {
@@ -203,6 +217,7 @@ impl ModRow {
                     .collect(),
                 visual_group: mods.visual_group(i),
                 worldgen: mods.is_worldgen(i),
+                group: mods.group(i).to_string(),
             })
             .collect()
     }

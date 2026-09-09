@@ -25,9 +25,20 @@ use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
 use crate::settings::Settings;
 use crate::ui::HudElement;
-use crate::world::diffusion::DiffusionCfg;
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
+
+/// Group id of the shipped built-in mods. Display name lives on [`Mods::GROUPS`].
+pub const ESSENTIALS: &str = "essentials";
+
+/// Named group of related mods. The id is the stable key; the display name
+/// can change here without touching every member.
+#[derive(Clone, Copy, Debug)]
+pub struct Group {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+}
 
 /// One tunable shown under a mod in the mods menu.
 #[derive(Clone, Debug)]
@@ -276,6 +287,16 @@ pub struct ModContext<'a> {
 /// A unit of layered-on functionality. Every method has a default, so a mod
 /// implements only the hooks it cares about. This is the public surface mod authors
 /// write against — kept small on purpose.
+///
+/// Arbitration when more than one enabled mod implements a hook:
+/// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
+///   `on_place_rejected`. `hud` uses the same order as z-order (later draws on top).
+/// - **First enabled wins**: `menu_theme`, `close_overlay` (first `true`),
+///   `worldgen`, `worldgen_config`.
+/// - **Compose**: `visual_group` bits OR into the render mask.
+///
+/// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
+/// opaque string; the winning worldgen kind parses it.
 pub trait Mod {
     /// Short name shown in the mod menu. Not a save key — see [`id`].
     fn name(&self) -> &str;
@@ -286,6 +307,11 @@ pub trait Mod {
 
     /// One-line description for the mod menu.
     fn description(&self) -> &str {
+        ""
+    }
+
+    /// Group id from [`Mods::GROUPS`], or `""` if ungrouped.
+    fn group(&self) -> &'static str {
         ""
     }
 
@@ -388,7 +414,9 @@ pub trait Mod {
         let _ = data;
     }
 
-    fn diffusion_cfg(&self) -> Option<DiffusionCfg> {
+    /// Opaque payload for the winning [`worldgen`] kind. `None` if this mod
+    /// does not replace worldgen. InfiniteDiffusion parses it as its knobs.
+    fn worldgen_config(&self) -> Option<String> {
         None
     }
 }
@@ -409,6 +437,13 @@ pub struct Mods {
 const CHOICES_PATH: &str = "saves/mods.cfg";
 
 impl Mods {
+    /// Groups shown as sections on the mods screen, in this order.
+    pub const GROUPS: &[Group] = &[Group {
+        id: ESSENTIALS,
+        name: "Essentials",
+        description: "The built-in mods that make the game playable as shipped: menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core.",
+    }];
+
     /// The default install: the menu mod (look/feel of every out-of-game
     /// screen) first, then the bare-list inventory mod and the crafting mod,
     /// all enabled. Inventory and crafting share one [`ElementStash`] —
@@ -541,6 +576,11 @@ impl Mods {
         self.entries[index].module.description()
     }
 
+    /// The group id of the mod at `index` (`""` if ungrouped).
+    pub fn group(&self, index: usize) -> &str {
+        self.entries[index].module.group()
+    }
+
     /// Whether the mod at `index` is enabled.
     pub fn is_enabled(&self, index: usize) -> bool {
         self.entries[index].enabled
@@ -577,19 +617,23 @@ impl Mods {
 
     /// Worldgen used for the next world: diffusion if that mod is on, else classic.
     pub fn worldgen_kind(&self) -> WorldgenKind {
-        self.entries
-            .iter()
-            .filter(|e| e.enabled)
-            .find_map(|e| e.module.worldgen())
+        self.first_worldgen()
+            .and_then(|m| m.worldgen())
             .unwrap_or(WorldgenKind::Classic)
     }
 
-    pub fn diffusion_cfg(&self) -> DiffusionCfg {
+    /// Opaque payload of the winning worldgen mod. The kind parses it
+    /// (`DiffusionCfg::from_text` for InfiniteDiffusion).
+    pub fn worldgen_config(&self) -> Option<String> {
+        self.first_worldgen().and_then(|m| m.worldgen_config())
+    }
+
+    fn first_worldgen(&self) -> Option<&dyn Mod> {
         self.entries
             .iter()
             .filter(|e| e.enabled)
-            .find_map(|e| e.module.diffusion_cfg())
-            .unwrap_or_default()
+            .find(|e| e.module.worldgen().is_some())
+            .map(|e| &*e.module)
     }
 
     pub fn visual_mask(&self) -> VisualMask {
@@ -609,13 +653,26 @@ impl Mods {
         mask
     }
 
-    /// Enable or disable a mod by id or display name (no-op if already in that state).
-    pub fn set_enabled(&mut self, name: &str, on: bool) {
-        if let Some(i) = self.entries.iter().position(|e| {
-            e.module.id().eq_ignore_ascii_case(name) || e.module.name().eq_ignore_ascii_case(name)
-        }) && self.entries[i].enabled != on
+    /// Enable or disable a mod by [`Mod::id`] (case-insensitive). No-op if
+    /// already in that state or the id is unknown.
+    pub fn set_enabled(&mut self, id: &str, on: bool) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.module.id().eq_ignore_ascii_case(id))
+            && self.entries[i].enabled != on
         {
             self.toggle(i);
+        }
+    }
+
+    /// Enable or disable every installed member of `group_id`. Persists as
+    /// each member's `id=on|off` line — there is no group-level key.
+    pub fn set_group_enabled(&mut self, group_id: &str, on: bool) {
+        for i in 0..self.entries.len() {
+            if self.entries[i].module.group() == group_id && self.entries[i].enabled != on {
+                self.toggle(i);
+            }
         }
     }
 
@@ -701,10 +758,12 @@ impl Mods {
         }
     }
 
-    fn apply_choice_state(&mut self, name: &str, data: &str) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| {
-            e.module.id().eq_ignore_ascii_case(name) || e.module.name().eq_ignore_ascii_case(name)
-        }) {
+    fn apply_choice_state(&mut self, id: &str, data: &str) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.module.id().eq_ignore_ascii_case(id))
+        {
             entry.module.load_choice_state(data);
         }
     }
@@ -753,9 +812,18 @@ fn split_mod_version(data: &str) -> (u16, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::element::El;
-    use crate::world::World;
     use super::split_mod_version;
+    use crate::block::element::El;
+    use crate::menu::Menu;
+    use crate::world::diffusion::DiffusionCfg;
+    use crate::world::World;
+
+    fn payload_cfg(mods: &Mods) -> DiffusionCfg {
+        mods.worldgen_config()
+            .as_deref()
+            .map(DiffusionCfg::from_text)
+            .unwrap_or_default()
+    }
 
     #[test]
     fn stash_add_respects_capacity_per_item() {
@@ -805,7 +873,7 @@ mod tests {
         let mods = Mods::with_defaults();
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
         let mut on = Mods::with_defaults();
-        on.set_enabled("InfiniteDiffusion", true);
+        on.set_enabled("diffusion", true);
         assert_eq!(on.worldgen_kind(), WorldgenKind::Diffusion);
     }
 
@@ -850,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn set_enabled_matches_id_and_display_name_case_insensitively() {
+    fn set_enabled_keys_on_id_case_insensitively() {
         let mut mods = Mods::with_defaults();
         let i = (0..mods.len())
             .find(|&i| mods.id(i) == WorldgenKind::Diffusion.id())
@@ -859,10 +927,14 @@ mod tests {
         assert_ne!(mods.id(i), mods.name(i));
         mods.set_enabled("diffusion", true);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
-        mods.set_enabled("infinitediffusion", false);
+        mods.set_enabled("DIFFUSION", false);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
-        mods.set_enabled("INFINITEDiffusion", true);
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+        mods.set_enabled("InfiniteDiffusion", true);
+        assert_eq!(
+            mods.worldgen_kind(),
+            WorldgenKind::Classic,
+            "display name is not a set_enabled key"
+        );
     }
 
     #[test]
@@ -985,7 +1057,7 @@ mod tests {
         mods.set_enabled("diffusion", true);
         let i = index_of(&mods, "diffusion");
         mods.step_knob(i, 0, 1);
-        let cfg = mods.diffusion_cfg();
+        let cfg = payload_cfg(&mods);
         assert_ne!(cfg.tile, DiffusionCfg::default().tile);
         let text = mods.choices_text();
         assert!(text.contains("lighting=off"));
@@ -1008,7 +1080,7 @@ mod tests {
             "malformed value must not change the default"
         );
         assert!(restored.contains("crafting=on"));
-        assert_eq!(fresh.diffusion_cfg().tile, 64);
+        assert_eq!(payload_cfg(&fresh).tile, 64);
     }
 
     #[test]
@@ -1020,7 +1092,7 @@ mod tests {
         mods.set_enabled("diffusion", true);
         mods.step_knob(i, 0, 1);
         mods.step_knob(i, 1, 1);
-        let cfg = mods.diffusion_cfg();
+        let cfg = payload_cfg(&mods);
         mods.save_choices_to(&path);
 
         let mut fresh = Mods::with_defaults();
@@ -1028,7 +1100,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert!(!fresh.is_enabled(index_of(&fresh, "lighting")));
         assert!(fresh.is_enabled(index_of(&fresh, "diffusion")));
-        assert_eq!(fresh.diffusion_cfg(), cfg);
+        assert_eq!(payload_cfg(&fresh), cfg);
     }
 
     #[test]
@@ -1087,5 +1159,127 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), on_disk);
         assert!(mods.choices_text().contains("diffusion=on"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn essentials_lists_every_builtin_in_install_order() {
+        let mods = Mods::with_defaults();
+        assert_eq!(Mods::GROUPS.len(), 1);
+        let g = &Mods::GROUPS[0];
+        assert_eq!(g.id, ESSENTIALS);
+        assert_eq!(g.name, "Essentials");
+        assert_eq!(
+            g.description,
+            "The built-in mods that make the game playable as shipped: menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core."
+        );
+        let members: Vec<&str> = (0..mods.len())
+            .filter(|&i| mods.group(i) == ESSENTIALS)
+            .map(|i| mods.id(i))
+            .collect();
+        assert_eq!(
+            members,
+            [
+                "menus",
+                "inventory",
+                "crafting",
+                "atmosphere",
+                "post",
+                "lighting",
+                "diffusion"
+            ]
+        );
+        assert_eq!(members.len(), mods.len(), "no ungrouped built-ins");
+    }
+
+    #[test]
+    fn group_toggle_persists_each_member_line() {
+        let path = temp_choices_path();
+        let mut mods = Mods::with_defaults();
+        mods.set_group_enabled(ESSENTIALS, false);
+        let text = mods.choices_text();
+        for id in [
+            "menus",
+            "inventory",
+            "crafting",
+            "atmosphere",
+            "post",
+            "lighting",
+            "diffusion",
+        ] {
+            assert!(
+                text.contains(&format!("{id}=off")),
+                "{id} should be off in:\n{text}"
+            );
+        }
+        assert!(
+            !text.lines().any(|l| l.starts_with("essentials=")),
+            "group toggle must not write a group-level key"
+        );
+        mods.save_choices_to(&path);
+
+        let mut fresh = Mods::with_defaults();
+        fresh.load_choices_from(&path);
+        let _ = fs::remove_file(&path);
+        for i in 0..fresh.len() {
+            assert!(!fresh.is_enabled(i), "{} still on", fresh.id(i));
+        }
+
+        fresh.set_group_enabled(ESSENTIALS, true);
+        let on_text = fresh.choices_text();
+        for id in [
+            "menus",
+            "inventory",
+            "crafting",
+            "atmosphere",
+            "post",
+            "lighting",
+            "diffusion",
+        ] {
+            assert!(
+                on_text.contains(&format!("{id}=on")),
+                "{id} should be on in:\n{on_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn worldgen_config_is_the_winning_kind_payload() {
+        let off = Mods::with_defaults();
+        assert_eq!(off.worldgen_kind(), WorldgenKind::Classic);
+        assert_eq!(off.worldgen_config(), None);
+        let mut on = Mods::with_defaults();
+        on.set_enabled("diffusion", true);
+        let text = on.worldgen_config().expect("payload");
+        assert_eq!(DiffusionCfg::from_text(&text), DiffusionCfg::default());
+        on.step_knob(index_of(&on, "diffusion"), 0, 1);
+        let cfg = DiffusionCfg::from_text(&on.worldgen_config().unwrap());
+        assert_ne!(cfg.tile, DiffusionCfg::default().tile);
+    }
+
+    #[test]
+    fn fallback_theme_with_essentials_disabled() {
+        let mut mods = Mods::with_defaults();
+        mods.set_group_enabled(ESSENTIALS, false);
+        assert!(mods.menu_theme().is_none());
+        let fallback = crate::menu::theme::DefaultTheme;
+        let theme: &dyn crate::menu::theme::MenuTheme = mods.menu_theme().unwrap_or(&fallback);
+        let snap = crate::menu::ModRow::snapshot(&mods);
+        let mut settings = crate::settings::Settings::default();
+        let session = crate::session::Session::default();
+        let ctx = crate::menu::Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &snap,
+            session: &session,
+        };
+        let view = crate::menu::menus::ModsMenu.view(&ctx);
+        let pv = crate::menu::present(&view, 1.0);
+        let rects = theme.layout(&pv, 1280, 720);
+        assert_eq!(rects.len(), view.rows.len());
+        assert!(matches!(view.rows[0].kind, crate::menu::RowKind::Heading));
+        let mut cursor = crate::menu::Cursor::default();
+        cursor.normalize(&view);
+        assert!(view.is_selectable(cursor.index));
+        assert_ne!(cursor.index, 0, "cursor must skip the group header");
     }
 }

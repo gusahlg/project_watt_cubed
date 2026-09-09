@@ -390,6 +390,10 @@ impl Mod for CraftingMod {
         "Craft natural blocks from gathered elements and place them (press C)."
     }
 
+    fn group(&self) -> &'static str {
+        crate::mods::ESSENTIALS
+    }
+
     fn update(&mut self, ctx: &mut ModContext) {
         self.refresh();
         if ctx.toggle_crafting {

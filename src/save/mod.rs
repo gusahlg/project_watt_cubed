@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(world.worldgen(), WorldgenKind::Classic);
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
         let mut mods = Mods::with_defaults();
-        mods.set_enabled("InfiniteDiffusion", true);
+        mods.set_enabled("diffusion", true);
         save(&id, &world, &player, &mods, meta("classic")).unwrap();
 
         let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();

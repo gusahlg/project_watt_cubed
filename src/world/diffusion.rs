@@ -55,6 +55,36 @@ impl DiffusionCfg {
         self.relief = snap_f32(&Self::RELIEFS, self.relief);
         self
     }
+
+    /// Wire form of the diffusion worldgen payload (`tile=…,stride=…,…`).
+    pub fn to_text(self) -> String {
+        format!(
+            "tile={},stride={},phases={},relief={:.2}",
+            self.tile, self.stride, self.phases, self.relief
+        )
+    }
+
+    /// Parse a full or partial knob string, starting from the defaults.
+    pub fn from_text(data: &str) -> Self {
+        Self::default().overlay(data)
+    }
+
+    /// Overlay keys from `data` onto `self`, then clamp.
+    pub fn overlay(mut self, data: &str) -> Self {
+        for part in data.split(',') {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "tile" => self.tile = v.parse().unwrap_or(self.tile),
+                "stride" => self.stride = v.parse().unwrap_or(self.stride),
+                "phases" => self.phases = v.parse().unwrap_or(self.phases),
+                "relief" => self.relief = v.parse().unwrap_or(self.relief),
+                _ => {}
+            }
+        }
+        self.clamp()
+    }
 }
 
 fn snap_u32(list: &[u32], v: u32) -> u32 {
@@ -407,6 +437,24 @@ mod tests {
         let ca = a.generate(0, 0, 0);
         let cb = b.generate(0, 0, 0);
         assert_eq!(ca, cb);
+    }
+
+    #[test]
+    fn from_text_round_trips_to_text() {
+        let cfg = DiffusionCfg {
+            tile: 64,
+            stride: 16,
+            phases: 4,
+            relief: 1.5,
+        }
+        .clamp();
+        assert_eq!(DiffusionCfg::from_text(&cfg.to_text()), cfg);
+        assert_eq!(DiffusionCfg::from_text(""), DiffusionCfg::default());
+        assert_eq!(
+            DiffusionCfg::from_text("tile=64").tile,
+            64,
+            "partial overlay on defaults"
+        );
     }
 
     #[test]

@@ -154,6 +154,10 @@ impl Mod for InventoryMod {
         "The bare-list inventory and a simple view of it (press I to toggle)."
     }
 
+    fn group(&self) -> &'static str {
+        crate::mods::ESSENTIALS
+    }
+
     fn update(&mut self, ctx: &mut ModContext) {
         if ctx.toggle_inventory {
             let mut ui = self.ui.get();

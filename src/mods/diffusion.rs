@@ -21,28 +21,8 @@ impl InfiniteDiffusionMod {
         self.cfg
     }
 
-    fn cfg_text(&self) -> String {
-        format!(
-            "tile={},stride={},phases={},relief={:.2}",
-            self.cfg.tile, self.cfg.stride, self.cfg.phases, self.cfg.relief
-        )
-    }
-
     fn apply_cfg_text(&mut self, data: &str) {
-        let mut cfg = self.cfg;
-        for part in data.split(',') {
-            let Some((k, v)) = part.split_once('=') else {
-                continue;
-            };
-            match k.trim() {
-                "tile" => cfg.tile = v.parse().unwrap_or(cfg.tile),
-                "stride" => cfg.stride = v.parse().unwrap_or(cfg.stride),
-                "phases" => cfg.phases = v.parse().unwrap_or(cfg.phases),
-                "relief" => cfg.relief = v.parse().unwrap_or(cfg.relief),
-                _ => {}
-            }
-        }
-        self.cfg = cfg.clamp();
+        self.cfg = self.cfg.overlay(data);
     }
 }
 
@@ -65,12 +45,16 @@ impl Mod for InfiniteDiffusionMod {
         "Replace fBm worldgen with overlapping-window InfiniteDiffusion fields (new worlds)."
     }
 
+    fn group(&self) -> &'static str {
+        crate::mods::ESSENTIALS
+    }
+
     fn worldgen(&self) -> Option<WorldgenKind> {
         Some(WorldgenKind::Diffusion)
     }
 
-    fn diffusion_cfg(&self) -> Option<DiffusionCfg> {
-        Some(self.cfg)
+    fn worldgen_config(&self) -> Option<String> {
+        Some(self.cfg.to_text())
     }
 
     fn knobs(&self) -> Vec<Knob> {
@@ -153,7 +137,7 @@ impl Mod for InfiniteDiffusionMod {
     }
 
     fn save_state(&self, _world: &World) -> Option<(u16, String)> {
-        Some((1, self.cfg_text()))
+        Some((1, self.cfg.to_text()))
     }
 
     fn load_state(&mut self, _version: u16, data: &str, _world: &mut World) {
@@ -161,7 +145,7 @@ impl Mod for InfiniteDiffusionMod {
     }
 
     fn save_choice_state(&self) -> Option<String> {
-        Some(self.cfg_text())
+        Some(self.cfg.to_text())
     }
 
     fn load_choice_state(&mut self, data: &str) {

@@ -4,7 +4,7 @@ use crate::menu::{
     apply_text_op, parse_port, AppEffect, Command, Ctx, Dir, Framed, HostInfo, JoinInfo, Menu, Msg,
     Notice, Row, Style, ValueView, View, PORT_ERROR,
 };
-use crate::mods::{annotate_setting, VisualMask};
+use crate::mods::{annotate_setting, Mods, VisualMask};
 use crate::net::{DEFAULT_PORT, MAX_NAME};
 use crate::render_config::VisualGroup;
 use crate::session::Session;
@@ -126,7 +126,7 @@ impl Menu for MainMenu {
 
 // Mods menu.
 
-/// One toggle row per installed mod, plus knobs for mods that have them.
+/// Grouped toggle rows per installed mod, plus knobs for mods that have them.
 pub struct ModsMenu;
 
 /// Persistent mods-screen notice: saved now, applied on the next world (visual)
@@ -138,6 +138,7 @@ const MODS_NOTICE: &str = "Saved immediately. Visual mods: next world. Worldgen:
 pub enum ModsAction {
     Toggle(usize),
     Knob { mod_index: usize, knob: usize },
+    SetGroup { id: &'static str, on: bool },
 }
 
 impl Menu for ModsMenu {
@@ -145,31 +146,45 @@ impl Menu for ModsMenu {
 
     fn view(&self, ctx: &Ctx) -> View<ModsAction> {
         let mut rows = Vec::new();
-        for (i, m) in ctx.mods.iter().enumerate() {
-            rows.push(
-                Row::value(m.name.clone(), ValueView::Toggle(m.enabled), ModsAction::Toggle(i))
-                    .detail(m.description.clone()),
-            );
-            if m.enabled {
-                for (k, (label, value, hint)) in m.knobs.iter().enumerate() {
-                    let mut row = Row::value(
-                        format!("  {label}"),
-                        ValueView::Choice(value.clone()),
-                        ModsAction::Knob { mod_index: i, knob: k },
-                    );
-                    let mut detail = hint.clone();
-                    if m.worldgen {
-                        detail = if detail.is_empty() {
-                            "next new world".to_string()
-                        } else {
-                            format!("{detail} · next new world")
-                        };
-                    }
-                    if !detail.is_empty() {
-                        row = row.detail(detail);
-                    }
-                    rows.push(row);
-                }
+        let mut placed = vec![false; ctx.mods.len()];
+        for g in Mods::GROUPS {
+            let members: Vec<usize> = ctx
+                .mods
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.group == g.id)
+                .map(|(i, _)| i)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            for &i in &members {
+                placed[i] = true;
+            }
+            rows.push(Row::heading(g.name).detail(g.description));
+            let all_on = members.iter().all(|&i| ctx.mods[i].enabled);
+            rows.push(Row::value(
+                "  Enable all / Disable all",
+                ValueView::Toggle(all_on),
+                ModsAction::SetGroup {
+                    id: g.id,
+                    on: !all_on,
+                },
+            ));
+            for i in members {
+                push_mod_rows(&mut rows, i, &ctx.mods[i]);
+            }
+        }
+        let other: Vec<usize> = placed
+            .iter()
+            .enumerate()
+            .filter(|(_, seen)| !**seen)
+            .map(|(i, _)| i)
+            .collect();
+        if !other.is_empty() {
+            rows.push(Row::heading("Other"));
+            for i in other {
+                push_mod_rows(&mut rows, i, &ctx.mods[i]);
             }
         }
         View {
@@ -186,6 +201,10 @@ impl Menu for ModsMenu {
         match msg {
             Msg::Step(ModsAction::Toggle(i), _) | Msg::Pick(ModsAction::Toggle(i)) => {
                 Command::Effect(AppEffect::ToggleMod(i))
+            }
+            Msg::Step(ModsAction::SetGroup { id, on }, _)
+            | Msg::Pick(ModsAction::SetGroup { id, on }) => {
+                Command::Effect(AppEffect::SetGroup { id, on })
             }
             Msg::Step(ModsAction::Knob { mod_index, knob }, dir) => {
                 Command::Effect(AppEffect::StepModKnob {
@@ -204,6 +223,42 @@ impl Menu for ModsMenu {
             Msg::Back => Command::Pop,
             _ => Command::Stay,
         }
+    }
+}
+
+fn push_mod_rows(rows: &mut Vec<Row<ModsAction>>, i: usize, m: &crate::menu::ModRow) {
+    rows.push(
+        Row::value(
+            format!("  {}", m.name),
+            ValueView::Toggle(m.enabled),
+            ModsAction::Toggle(i),
+        )
+        .detail(m.description.clone()),
+    );
+    if !m.enabled {
+        return;
+    }
+    for (k, (label, value, hint)) in m.knobs.iter().enumerate() {
+        let mut row = Row::value(
+            format!("    {label}"),
+            ValueView::Choice(value.clone()),
+            ModsAction::Knob {
+                mod_index: i,
+                knob: k,
+            },
+        );
+        let mut detail = hint.clone();
+        if m.worldgen {
+            detail = if detail.is_empty() {
+                "next new world".to_string()
+            } else {
+                format!("{detail} · next new world")
+            };
+        }
+        if !detail.is_empty() {
+            row = row.detail(detail);
+        }
+        rows.push(row);
     }
 }
 
@@ -549,6 +604,7 @@ mod tests {
             knobs: vec![],
             visual_group: Some(VisualGroup::Post),
             worldgen: false,
+            group: String::new(),
         }];
         let ctx = Ctx {
             settings: &mut settings,
@@ -568,6 +624,111 @@ mod tests {
                 assert!(s.contains(&marker), "settings value {s:?} must include {marker}");
             }
             _ => panic!("expected annotated choice for a stripped bloom row"),
+        }
+    }
+
+    #[test]
+    fn mods_menu_nests_essentials_under_group_header() {
+        let installed = crate::mods::Mods::with_defaults();
+        let snap = crate::menu::ModRow::snapshot(&installed);
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let ctx = Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &snap,
+            session: &session,
+        };
+        let view = ModsMenu.view(&ctx);
+        assert!(matches!(view.rows[0].kind, crate::menu::RowKind::Heading));
+        assert_eq!(view.rows[0].label, "Essentials");
+        assert!(view.rows[0].tag.is_none(), "group header is not selectable");
+        assert_eq!(view.rows[1].label.trim(), "Enable all / Disable all");
+        assert!(
+            view.rows[2].label.contains("Menus"),
+            "first member is indented under the group: {:?}",
+            view.rows[2].label
+        );
+        assert!(
+            !view.rows.iter().any(|r| r.label == "Other"),
+            "no ungrouped built-ins"
+        );
+        let names: Vec<&str> = view
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, crate::menu::RowKind::Value(ValueView::Toggle(_))))
+            .filter(|r| r.label.contains("Menus")
+                || r.label.contains("Inventory")
+                || r.label.contains("Crafting")
+                || r.label.contains("Atmosphere")
+                || r.label.contains("Post")
+                || r.label.contains("Lighting")
+                || r.label.contains("InfiniteDiffusion"))
+            .map(|r| r.label.trim())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Menus",
+                "Inventory",
+                "Crafting",
+                "Atmosphere",
+                "Post",
+                "Lighting",
+                "InfiniteDiffusion"
+            ]
+        );
+    }
+
+    #[test]
+    fn mods_menu_lists_ungrouped_under_other() {
+        let extra = crate::menu::ModRow {
+            name: "Extra".into(),
+            description: "future external".into(),
+            enabled: true,
+            knobs: vec![],
+            visual_group: None,
+            worldgen: false,
+            group: String::new(),
+        };
+        let installed = crate::mods::Mods::with_defaults();
+        let mut snap = crate::menu::ModRow::snapshot(&installed);
+        snap.push(extra);
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let ctx = Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &snap,
+            session: &session,
+        };
+        let view = ModsMenu.view(&ctx);
+        let other = view
+            .rows
+            .iter()
+            .position(|r| r.label == "Other" && matches!(r.kind, crate::menu::RowKind::Heading))
+            .expect("Other section");
+        assert!(view.rows[other + 1].label.contains("Extra"));
+    }
+
+    #[test]
+    fn group_toggle_row_emits_set_group() {
+        let mut menu = ModsMenu;
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut ctx = ctx(&mut settings, &session);
+        match menu.update(
+            Msg::Pick(ModsAction::SetGroup {
+                id: crate::mods::ESSENTIALS,
+                on: false,
+            }),
+            &mut ctx,
+        ) {
+            Command::Effect(AppEffect::SetGroup { id, on }) => {
+                assert_eq!(id, crate::mods::ESSENTIALS);
+                assert!(!on);
+            }
+            _ => panic!("expected SetGroup"),
         }
     }
 }

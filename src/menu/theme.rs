@@ -174,7 +174,8 @@ fn draw_panel(f: &mut Frame, v: &PresentedView, sel: usize, w: i32, h: i32) {
 fn row_body(row: &PresentedRow, selected: bool) -> String {
     let mark = if selected { ">" } else { " " };
     match &row.kind {
-        RowKind::Action | RowKind::Heading => format!("{} {}", mark, row.label),
+        RowKind::Heading => row.label.clone(),
+        RowKind::Action => format!("{} {}", mark, row.label),
         RowKind::Value(ValueView::Toggle(on)) => {
             format!("{} {} {}", mark, if *on { "[x]" } else { "[ ]" }, row.label)
         }
@@ -215,7 +216,9 @@ fn bar(t: f32) -> String {
 }
 
 fn row_color(row: &PresentedRow, selected: bool) -> Color {
-    if !row.selectable {
+    if matches!(row.kind, RowKind::Heading) {
+        Color::GOLD
+    } else if !row.selectable {
         Color::DARKGRAY
     } else if selected {
         Color::RAYWHITE

@@ -18,6 +18,9 @@ macro_rules! visual_mod {
             fn description(&self) -> &str {
                 $desc
             }
+            fn group(&self) -> &'static str {
+                crate::mods::ESSENTIALS
+            }
             fn visual_group(&self) -> Option<VisualGroup> {
                 Some(VisualGroup::$group)
             }
