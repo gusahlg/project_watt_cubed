@@ -287,7 +287,9 @@ messages! {
         /// Sent to everyone except the editor (who gets the ack).
         Edit = tag::S_EDIT { x: i32, y: i32, z: i32, rev: u32, spec: Arc<str> },
         /// `accepted` with the committed revision, or rejected (stale expectation,
-        /// out of reach, invalid spec) — the signal prediction rolls back on.
+        /// out of reach, invalid spec, or a server-mod `Deny`) — the signal
+        /// prediction rolls back on. A hook Deny does not advance the cell, so
+        /// the client's `restore` is the same as a lost race.
         EditAck = tag::EDIT_ACK { req: u32, accepted: bool, rev: u32 },
         /// Refused teleport or implausible movement: snap to it.
         Position = tag::POSITION { pos: DVec3 },
@@ -541,5 +543,166 @@ mod tests {
         hostile.push(0);
         let mut scratch = Vec::new();
         assert!(read_frame(&mut std::io::Cursor::new(hostile), &mut scratch).is_err());
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            self.next() as u8
+        }
+        fn len(&mut self, max_incl: usize) -> usize {
+            (self.next() as usize) % (max_incl + 1)
+        }
+    }
+
+    fn decode_must_not_panic(bytes: &[u8]) {
+        let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ClientMessage::decode(bytes)));
+        let server = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ServerMessage::decode(bytes)));
+        assert!(client.is_ok(), "ClientMessage::decode panicked on {bytes:?}");
+        assert!(server.is_ok(), "ServerMessage::decode panicked on {bytes:?}");
+    }
+
+    #[test]
+    fn random_frames_never_panic_the_decoder() {
+        let mut rng = XorShift::new(0xC0FF_EE42_D00D);
+        let mut buf = vec![0u8; MAX_FRAME];
+        for b in buf.iter_mut() {
+            *b = rng.byte();
+        }
+        for _ in 0..100_000 {
+            let len = rng.len(MAX_FRAME);
+            for _ in 0..16 {
+                let i = rng.len(MAX_FRAME.saturating_sub(1));
+                buf[i] = rng.byte();
+            }
+            decode_must_not_panic(&buf[..len]);
+        }
+    }
+
+    fn encoding_side_rejects_trailing_bytes<T>(
+        frame: Vec<u8>,
+        extra: u8,
+        decode: fn(&[u8]) -> Option<T>,
+        rng: &mut XorShift,
+    ) {
+        decode_must_not_panic(&frame);
+        for n in 0..frame.len() {
+            decode_must_not_panic(&frame[..n]);
+        }
+        let mut grown = frame.clone();
+        grown.push(extra);
+        assert!(decode(&grown).is_none(), "encoding side must reject a trailing byte");
+        decode_must_not_panic(&grown);
+        if frame.is_empty() {
+            return;
+        }
+        let i = rng.len(frame.len() - 1);
+        let mut flipped = frame.clone();
+        flipped[i] ^= rng.byte() | 1;
+        decode_must_not_panic(&flipped);
+    }
+
+    #[test]
+    fn structural_flips_and_truncations_never_panic_and_reject_trailing_bytes() {
+        let mut rng = XorShift::new(0xA11C_EDED);
+        for message in client_cases() {
+            encoding_side_rejects_trailing_bytes(message.encode(), rng.byte(), ClientMessage::decode, &mut rng);
+        }
+        for message in server_cases() {
+            encoding_side_rejects_trailing_bytes(message.encode(), rng.byte(), ServerMessage::decode, &mut rng);
+        }
+    }
+
+    #[test]
+    fn strings_at_the_cap_round_trip_and_overlong_invalid_and_nuls_never_panic() {
+        let cap_name: Arc<str> = "n".repeat(super::super::MAX_NAME).into();
+        let hello = ClientMessage::Hello {
+            protocol: 1,
+            fingerprint: 0,
+            name: cap_name.clone(),
+            password: "".into(),
+        };
+        assert_eq!(ClientMessage::decode(&hello.encode()), Some(hello));
+
+        let over: Arc<str> = "n".repeat(super::super::MAX_NAME + 1).into();
+        let hello_over = ClientMessage::Hello {
+            protocol: 1,
+            fingerprint: 0,
+            name: over,
+            password: "p".repeat(super::super::MAX_NAME + 1).into(),
+        };
+        decode_must_not_panic(&hello_over.encode());
+
+        let cap_spec: Arc<str> = "s".repeat(super::super::MAX_SPEC).into();
+        let edit = ClientMessage::Edit {
+            req: 1,
+            x: 0,
+            y: 0,
+            z: 0,
+            expect: 0,
+            spec: cap_spec,
+        };
+        assert_eq!(ClientMessage::decode(&edit.encode()), Some(edit.clone()));
+        let mut over_spec = edit.clone();
+        if let ClientMessage::Edit { spec, .. } = &mut over_spec {
+            *spec = "s".repeat(super::super::MAX_SPEC + 1).into();
+        }
+        decode_must_not_panic(&over_spec.encode());
+
+        let nuls = ClientMessage::Chat { channel: 0, text: "ok\0still".into() };
+        match ClientMessage::decode(&nuls.encode()) {
+            Some(ClientMessage::Chat { text, .. }) => assert!(text.contains('\0') || text.contains("ok")),
+            other => panic!("nul chat must decode or reject, got {other:?}"),
+        }
+
+        // Invalid UTF-8 in a length-prefixed string: forge the bytes.
+        let mut w = codec::Writer::new();
+        w.u8(super::tag::CHAT);
+        w.u8(0);
+        w.u16(2);
+        w.raw(&[0xff, 0xfe]);
+        decode_must_not_panic(&w.into_inner());
+    }
+
+    #[test]
+    fn frame_helpers_reject_hostile_lengths_and_accept_empty_and_cap() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[]).unwrap();
+        let mut got = Vec::new();
+        read_frame(&mut std::io::Cursor::new(&buf), &mut got).unwrap();
+        assert!(got.is_empty());
+
+        let payload = vec![0x5a; MAX_FRAME];
+        buf.clear();
+        write_frame(&mut buf, &payload).unwrap();
+        got.clear();
+        read_frame(&mut std::io::Cursor::new(&buf), &mut got).unwrap();
+        assert_eq!(got, payload);
+
+        let mut hostile = u32::MAX.to_be_bytes().to_vec();
+        hostile.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(read_frame(&mut std::io::Cursor::new(hostile), &mut got).is_err());
+
+        let mut at_cap = (MAX_FRAME as u32).to_be_bytes().to_vec();
+        at_cap.push(1); // body short of the claimed length
+        assert!(read_frame(&mut std::io::Cursor::new(at_cap), &mut got).is_err());
+
+        let mut zero = 0u32.to_be_bytes().to_vec();
+        got.clear();
+        read_frame(&mut std::io::Cursor::new(&zero), &mut got).unwrap();
+        assert!(got.is_empty());
+        zero.extend_from_slice(&[9]); // trailing unread bytes are the caller's problem
     }
 }

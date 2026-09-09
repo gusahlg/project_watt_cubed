@@ -177,7 +177,7 @@ mod tests {
     fn mixture_must_sum_to_one_hundred() {
         let a = ElementId(0);
         let b = ElementId(1);
-        assert_eq!(Mix::new(&[(a, 70), (b, 30)]).is_ok(), true);
+        assert!(Mix::new(&[(a, 70), (b, 30)]).is_ok());
         assert_eq!(Mix::new(&[(a, 70), (b, 20)]), Err(MixError::NotHundred(90)));
         assert_eq!(Mix::new(&[]), Err(MixError::Empty));
     }

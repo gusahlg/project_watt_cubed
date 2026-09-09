@@ -9,10 +9,10 @@
 //! z-fighting with adjacent sections at different detail levels.
 //!
 //! The mesher reads a DENSE column-major quadrant grid ([`DenseQuad`]): every
-//! neighbour/AO probe is one O(1) indexed load, where the old run-list walk
-//! paid an O(runs) linear scan per probe (~14 probes × 24k face positions per
-//! 16³ block adds up). The grid has two producers sharing one pooled
-//! worker-local buffer:
+//! neighbour/AO probe is one O(1) stride-add off a flat index, where the old
+//! run-list walk paid an O(runs) linear scan per probe (~14 probes × 24k face
+//! positions per 16³ block adds up). The grid has two producers sharing one
+//! pooled worker-local buffer:
 //! - [`build_section_mesh`] decodes a stored [`Section`]'s brick stacks — the
 //!   reference path, kept as the byte-parity oracle;
 //! - [`extract_section_mesh`] samples the generator (and folds edits) straight
@@ -46,11 +46,13 @@ const QUAD_N: usize = SECTION_N / 2;
 const BLOCKS_XZ: i32 = SECTION_N as i32 / BLOCK;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
 
-// One dense quadrant buffer per worker thread, reused across the four
-// quadrants of every job. Born and dropped on the same thread (unlike the
-// main-thread-captured mesh snapshots), so a lock-free thread-local is right.
+// One dense quadrant buffer and one mesh scratch per worker. Empty 16³
+// blocks reuse the scratch; only non-empty results move out. Born and
+// dropped on the same thread (unlike the main-thread-captured mesh
+// snapshots), so a lock-free thread-local is right.
 thread_local! {
     static DENSE_QUAD: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
+    static MESH_SCRATCH: RefCell<ChunkMeshData> = RefCell::new(new_chunk_mesh_data());
 }
 
 /// One quadrant's cells as a dense column-major grid: `QUAD_N × QUAD_N`
@@ -62,11 +64,23 @@ struct DenseQuad<'a> {
 }
 
 impl DenseQuad<'_> {
-    /// The cell at quadrant-local `(ix, iz, y)`; every coordinate must be in
-    /// range (callers bound-check against the quadrant/domain first).
+    /// Flat-index read — the sweep's stride walk.
     #[inline]
-    fn at(&self, ix: i32, iz: i32, y: i32) -> BlockId {
-        self.cells[(ix as usize + iz as usize * QUAD_N) * self.n_cells as usize + y as usize]
+    fn at_flat(&self, i: usize) -> BlockId {
+        self.cells[i]
+    }
+
+    /// Index delta of one step along world axis `axis` (0=X, 1=Y, 2=Z) in the
+    /// column-major `QUAD_N × QUAD_N × n_cells` layout — derived from the one
+    /// layout law rather than restated. The sweep walks flat indices with
+    /// these strides: every probe is `base ± s` where the coordinate form
+    /// paid three `[i32; 3]` writes through dynamic axis indices plus two
+    /// multiplies, per neighbour/AO sample.
+    #[inline]
+    fn axis_stride(&self, axis: usize) -> i32 {
+        let mut p = [0i32; 3];
+        p[axis] = 1;
+        (p[0] + p[2] * QUAD_N as i32) * self.n_cells + p[1]
     }
 }
 
@@ -81,6 +95,7 @@ struct FaceSample {
 
 /// Per-vertex AO level `0..=3` (`3` = unoccluded) from its three occluders;
 /// two touching sides fully occlude the corner. Same model as the chunk mesher.
+#[inline]
 fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
     if side1 && side2 {
         return 0;
@@ -91,6 +106,8 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
 /// Face direction with corner winding; micro-offset zero for verticals (never borders).
 struct Dir {
     normal: Normal,
+    /// +1 / -1 step along the normal axis to the cell a face borders.
+    step: i32,
     n_axis: usize,
     u_axis: usize,
     v_axis: usize,
@@ -101,6 +118,7 @@ struct Dir {
 const DIRS: [Dir; 6] = [
     Dir {
         normal: Normal::PosX,
+        step: 1,
         n_axis: 0,
         u_axis: 2,
         v_axis: 1,
@@ -109,6 +127,7 @@ const DIRS: [Dir; 6] = [
     },
     Dir {
         normal: Normal::NegX,
+        step: -1,
         n_axis: 0,
         u_axis: 2,
         v_axis: 1,
@@ -117,6 +136,7 @@ const DIRS: [Dir; 6] = [
     },
     Dir {
         normal: Normal::PosY,
+        step: 1,
         n_axis: 1,
         u_axis: 0,
         v_axis: 2,
@@ -125,6 +145,7 @@ const DIRS: [Dir; 6] = [
     },
     Dir {
         normal: Normal::NegY,
+        step: -1,
         n_axis: 1,
         u_axis: 0,
         v_axis: 2,
@@ -133,6 +154,7 @@ const DIRS: [Dir; 6] = [
     },
     Dir {
         normal: Normal::PosZ,
+        step: 1,
         n_axis: 2,
         u_axis: 0,
         v_axis: 1,
@@ -141,6 +163,7 @@ const DIRS: [Dir; 6] = [
     },
     Dir {
         normal: Normal::NegZ,
+        step: -1,
         n_axis: 2,
         u_axis: 0,
         v_axis: 1,
@@ -158,92 +181,142 @@ fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
 /// Opaque-occupancy probe for AO sampling: below-floor reads solid (matches the
 /// cull rule's "solid ground"), above-ceiling and outside the quadrant read air
 /// (matches the border-overdraw convention) — never data this quadrant lacks.
-fn occluder(quad: &DenseQuad<'_>, tables: &HotTables, p: [i32; 3]) -> bool {
-    let [px, py, pz] = p;
-    if py < 0 {
+/// `idx` is the probe's flat index; bounds are checked on `(x, y, z)` first
+/// because a stride step off the quadrant can land on a *different column's*
+/// in-range cell.
+#[inline]
+fn occluder(quad: &DenseQuad<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, z: i32) -> bool {
+    if y < 0 {
         return true;
     }
-    if py >= quad.n_cells || px < 0 || px >= QUAD_N as i32 || pz < 0 || pz >= QUAD_N as i32 {
+    if y >= quad.n_cells || x < 0 || x >= QUAD_N as i32 || z < 0 || z >= QUAD_N as i32 {
         return false;
     }
-    tables.opaque(quad.at(px, pz, py))
+    tables.opaque(quad.at_flat(idx as usize))
 }
 
 /// Sample a face: cull if covered by neighbor; overdraw section edges as air.
 /// Per-corner AO reads the two in-plane occluders plus the diagonal, in the
 /// layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
-/// uses, just backed by the dense quadrant grid instead of a padded voxel grid.
+/// uses. `idx` is the cell's flat index; every probe is a stride add off it.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // 3×3 stencil: du/dv are both indices and signed offsets
 fn face_sample(
     quad: &DenseQuad<'_>,
     tables: &HotTables,
     dir: &Dir,
-    s: [i32; 3],
+    s_n: i32,
+    s_u: i32,
+    s_v: i32,
+    idx: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    corner_uv: &[[i32; 2]; 4],
 ) -> Option<FaceSample> {
-    let [sx, sy, sz] = s;
-    if sy < 0 || sy >= quad.n_cells {
+    if y < 0 || y >= quad.n_cells {
         return None; // above the ceiling in the top block: no cell here
     }
-    let me = quad.at(sx, sz, sy);
+    let me = quad.at_flat(idx as usize);
     if me == AIR {
         return None;
     }
-    let d = dir.normal.direction();
-    let (nx, ny, nz) = (sx + d[0] as i32, sy + d[1] as i32, sz + d[2] as i32);
+    let open = idx + dir.step * s_n;
     let mut micro = [0i8; 3];
     let nbr = if dir.n_axis == 1 {
+        let ny = y + dir.step;
         if ny < 0 {
             return None; // below the floor: solid ground, never a silhouette
         } else if ny >= quad.n_cells {
             AIR // above the ceiling: open sky
         } else {
-            quad.at(sx, sz, ny)
+            quad.at_flat(open as usize)
         }
-    } else if nx < 0 || nx >= QUAD_N as i32 || nz < 0 || nz >= QUAD_N as i32 {
-        // Quadrant border: overdraw as air, nudge inward.
-        micro = dir.micro;
-        AIR
     } else {
-        quad.at(nx, nz, ny)
+        let n = if dir.n_axis == 0 { x } else { z };
+        if n + dir.step < 0 || n + dir.step >= QUAD_N as i32 {
+            // Quadrant border: overdraw as air, nudge inward.
+            micro = dir.micro;
+            AIR
+        } else {
+            quad.at_flat(open as usize)
+        }
     };
     if covered(me, nbr, tables) {
         return None;
     }
-    let o = [nx, ny, nz];
-    let occ = |eu: i32, ev: i32| {
-        let mut p = o;
-        p[dir.u_axis] += eu;
-        p[dir.v_axis] += ev;
-        occluder(quad, tables, p)
+    // Open-cell coordinates: one step along the normal. u/v of each Dir
+    // are fixed per n_axis (X: u=Z v=Y; Y: u=X v=Z; Z: u=X v=Y).
+    let (ox, oy, oz) = match dir.n_axis {
+        0 => (x + dir.step, y, z),
+        1 => (x, y + dir.step, z),
+        _ => (x, y, z + dir.step),
     };
+    // One 3×3 stencil in the OPEN layer — same layout as world/mesh.rs.
+    // Bounds live in `occluder`; a stride step off the quadrant can land
+    // on a different column's in-range cell.
+    let mut opaque = [[false; 3]; 3];
+    for dv in 0..3 {
+        let ev = dv as i32 - 1;
+        for du in 0..3 {
+            let eu = du as i32 - 1;
+            let pidx = open + eu * s_u + ev * s_v;
+            opaque[du][dv] = match dir.n_axis {
+                0 => occluder(quad, tables, pidx, ox, oy + ev, oz + eu),
+                1 => occluder(quad, tables, pidx, ox + eu, oy, oz + ev),
+                _ => occluder(quad, tables, pidx, ox + eu, oy + ev, oz),
+            };
+        }
+    }
     let ao = std::array::from_fn(|i| {
-        let eu = if dir.corners[i][1] > 0 { 1 } else { -1 };
-        let ev = if dir.corners[i][2] > 0 { 1 } else { -1 };
-        vertex_ao(occ(eu, 0), occ(0, ev), occ(eu, ev))
+        let ou = (corner_uv[i][0] + 1) as usize;
+        let ov = (corner_uv[i][1] + 1) as usize;
+        vertex_ao(opaque[ou][1], opaque[1][ov], opaque[ou][ov])
     });
     Some(FaceSample { block: me, micro, ao })
 }
 
 /// Greedy-mesh one block: merge adjacent quads with identical properties.
+/// `y_base` is the block's Y origin in quadrant cells (X and Z are 0).
 fn build_block(
     quad: &DenseQuad<'_>,
-    base: [i32; 3],
+    y_base: i32,
     tables: &HotTables,
     out: &mut ChunkMeshData,
 ) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
+    // Origin (0, y_base, 0); Y-stride is 1, so the flat base is y_base.
+    let base_idx = y_base;
 
     for dir in &DIRS {
-        for nslice in 0..BLOCK {
+        let (s_n, s_u, s_v) = (
+            quad.axis_stride(dir.n_axis),
+            quad.axis_stride(dir.u_axis),
+            quad.axis_stride(dir.v_axis),
+        );
+        let corner_uv: [[i32; 2]; 4] = std::array::from_fn(|i| {
+            [
+                if dir.corners[i][1] > 0 { 1 } else { -1 },
+                if dir.corners[i][2] > 0 { 1 } else { -1 },
+            ]
+        });
+
+        for n in 0..BLOCK {
             let mut any = false;
             for v in 0..BLOCK {
+                let row_idx = base_idx + n * s_n + v * s_v;
                 for u in 0..BLOCK {
-                    let mut local = [0i32; 3];
-                    local[dir.n_axis] = nslice;
-                    local[dir.u_axis] = u;
-                    local[dir.v_axis] = v;
-                    let s = [base[0] + local[0], base[1] + local[1], base[2] + local[2]];
-                    let cell = face_sample(quad, tables, dir, s);
+                    let idx = row_idx + u * s_u;
+                    let (x, y, z) = match dir.n_axis {
+                        0 => (n, y_base + v, u),
+                        1 => (u, y_base + n, v),
+                        _ => (u, y_base + v, n),
+                    };
+                    let cell = face_sample(
+                        quad, tables, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
+                    );
                     mask[(u + v * BLOCK) as usize] = cell;
                     any |= cell.is_some();
                 }
@@ -274,7 +347,7 @@ fn build_block(
                             mask[(u0 + du + row) as usize] = None;
                         }
                     }
-                    emit(out, dir, nslice, u0, v0, w, h, sample, tables);
+                    emit(out, dir, n, u0, v0, w, h, sample, tables);
                     emitted = true;
                 }
             }
@@ -451,13 +524,19 @@ fn mesh_quadrant(quad: &DenseQuad<'_>, tables: &HotTables, q: u8) -> SectionMesh
 
     // Section-space cell origin of the quadrant's XZ corner (0 or 16).
     let (ox, oz) = ((qx * QUAD_N) as u32, (qz * QUAD_N) as u32);
-    for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
-        let base = [0, by * BLOCK, 0];
-        let mut data = new_chunk_mesh_data();
-        if build_block(quad, base, tables, &mut data) {
-            result.push((UVec3::new(ox, (by * BLOCK) as u32, oz), data));
+    MESH_SCRATCH.with_borrow_mut(|scratch| {
+        for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
+            for (_, m) in scratch.iter_mut() {
+                m.clear();
+            }
+            if build_block(quad, by * BLOCK, tables, scratch) {
+                result.push((
+                    UVec3::new(ox, (by * BLOCK) as u32, oz),
+                    std::mem::replace(scratch, new_chunk_mesh_data()),
+                ));
+            }
         }
-    }
+    });
     result
 }
 
@@ -561,7 +640,7 @@ mod tests {
         build_section_mesh(section, tables)
     }
 
-    fn all_quads<'a>(mesh: &'a [SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &'a [MeshVertex])> {
+    fn all_quads(mesh: &[SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &[MeshVertex])> {
         mesh.iter().flatten().flat_map(|(origin, data)| {
             Pass::ALL.into_iter().flat_map(move |p| {
                 data[p].vertices().chunks_exact(4).map(move |q| (*origin, p, q))
@@ -586,7 +665,7 @@ mod tests {
                     let l = v.local_pos();
                     [l[0] + origin.x as f32, l[1] + origin.y as f32, l[2] + origin.z as f32]
                 })
-                .collect();
+                .collect::<Vec<_>>();
             let c = cross(sub(p[1], p[0]), sub(p[3], p[0]));
             let d = q[0].normal().direction();
             let dot = c[0] * d[0] as f32 + c[1] * d[1] as f32 + c[2] * d[2] as f32;
@@ -641,7 +720,7 @@ mod tests {
                     dirt
                 } else if y < 100 {
                     grass
-                } else if y >= 108 && y < 112 && x < 48 {
+                } else if (108..112).contains(&y) && x < 48 {
                     stone
                 } else {
                     AIR
@@ -750,7 +829,7 @@ mod tests {
     #[test]
     fn fused_extract_mesh_matches_the_storage_path_exactly() {
         let (_r, tables, b) = setup();
-        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+        let flatten = |m: &[SectionMeshData; 4]| {
             m.iter()
                 .flatten()
                 .flat_map(|(o, d)| {
@@ -758,7 +837,7 @@ mod tests {
                         (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
 
         // Edits inside the finest section footprint, exercising every
@@ -824,7 +903,7 @@ mod tests {
         let sec = extract(FINEST, &r#gen);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);
-        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+        let flatten = |m: &[SectionMeshData; 4]| {
             m.iter()
                 .flatten()
                 .flat_map(|(o, d)| {
@@ -832,7 +911,7 @@ mod tests {
                         (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
         assert_eq!(flatten(&a), flatten(&b), "same section must mesh bit-identically");
     }
@@ -870,5 +949,80 @@ mod tests {
             assert!(normals_present(&mesh, Normal::PosY), "detail {detail:?} lost the top surface");
             assert_winds_outward(&mesh);
         }
+    }
+
+    /// extract+mesh 16 fixed sections at detail 2, seed 42 — the gauge for the
+    /// stride-walk / pooled-output rewrite. Ignored: a timing benchmark, not a
+    /// correctness gate. Run with
+    /// `cargo test --release far_lod_section_mesh -- --ignored --nocapture`.
+    /// 2026-09-09: 9.34 ms/section (median of 3; before stride-walk/pooled-output 9.53).
+    #[test]
+    #[ignore]
+    fn far_lod_section_mesh() {
+        let mut registry = BlockRegistry::with_builtins();
+        let r#gen = SineHills::new(&mut registry, 20.0, 42);
+        let tables = registry.hot_tables();
+        let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos {
+            detail: FINEST_DETAIL,
+            x: (i % 4) as i32,
+            z: (i / 4) as i32,
+        });
+
+        // Warm the worker-local dense grid and the mesh scratch.
+        std::hint::black_box(extract_section_mesh(positions[0], &r#gen, &[], &tables));
+
+        let mut times = [0.0f64; 3];
+        for t in &mut times {
+            let start = std::time::Instant::now();
+            for &pos in &positions {
+                std::hint::black_box(extract_section_mesh(pos, &r#gen, &[], &tables));
+            }
+            *t = start.elapsed().as_secs_f64() * 1000.0 / positions.len() as f64;
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "far_lod_section_mesh 16 sections detail=2 seed=42: {:.3} {:.3} {:.3} ms/section (median {:.3})",
+            times[0], times[1], times[2], times[1]
+        );
+
+        // Fingerprint after the timed loops so a timing run also shows the
+        // output did not drift. FNV-1a over origins + decoded vertex fields.
+        let mut verts = 0usize;
+        let mut h = 0x811c9dc5u32;
+        let mix = |h: &mut u32, b: u8| {
+            *h ^= b as u32;
+            *h = h.wrapping_mul(0x01000193);
+        };
+        for &pos in &positions {
+            let mesh = extract_section_mesh(pos, &r#gen, &[], &tables);
+            for quad in &mesh {
+                for (origin, data) in quad {
+                    for c in origin.to_array() {
+                        for b in c.to_le_bytes() {
+                            mix(&mut h, b);
+                        }
+                    }
+                    for p in Pass::ALL {
+                        for v in data[p].vertices() {
+                            verts += 1;
+                            for c in v.local_pos() {
+                                for b in c.to_bits().to_le_bytes() {
+                                    mix(&mut h, b);
+                                }
+                            }
+                            mix(&mut h, v.normal() as u8);
+                            for b in v.layer().to_le_bytes() {
+                                mix(&mut h, b);
+                            }
+                            mix(&mut h, (0..=3).find(|&a| v.ao() == Ao::new(a)).expect("ao 0..=3"));
+                            for m in v.micro() {
+                                mix(&mut h, m as u8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("far_lod_section_mesh fingerprint verts={verts} fnv={h:#010x}");
     }
 }

@@ -110,5 +110,24 @@ mod tests {
         }
         let long = "x".repeat(65);
         assert!(SlotId::new(&long).is_err());
+        for name in ["世界", "åäö", "save_1"] {
+            assert!(SlotId::new(name).is_ok(), "{name:?} should be legal");
+        }
+    }
+
+    #[test]
+    fn store_never_writes_outside_saves() {
+        use std::fs;
+        use std::path::Path;
+        let id = SlotId::new("世界").unwrap();
+        let dir = crate::paths::Paths::get().data.as_path();
+        let path = dir.join(format!("{id}.save"));
+        assert!(path.starts_with(dir));
+        assert_eq!(path.parent(), Some(dir));
+        let _ = fs::remove_file(&path);
+        super::super::store::write(&id, b"x").unwrap();
+        assert!(path.exists());
+        assert!(!Path::new("世界.save").exists());
+        let _ = fs::remove_file(&path);
     }
 }

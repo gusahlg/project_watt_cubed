@@ -230,6 +230,7 @@ impl Default for Theme {
 
 /// Measure → resolve → shadowed-draw a line of HUD text in one call. Every HUD
 /// text site collapses to this: the alignment math and the drop shadow are hidden.
+#[allow(clippy::too_many_arguments)] // HUD label needs frame, theme, placement, and text independently
 pub fn label(
     f: &mut Frame,
     theme: &Theme,

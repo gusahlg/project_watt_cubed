@@ -1,7 +1,7 @@
 //! Persistent graphics settings.
 //!
-//! Stored as plain `key=value` lines in `saves/settings.cfg` (std-only, no
-//! dependencies). The settings menu and the `/gfx` console command both edit
+//! Stored as plain `key=value` lines in `settings.cfg` under the config root
+//! (std-only, no dependencies). The settings menu and the `/gfx` console command both edit
 //! a [`Settings`] value; [`Settings::apply`] pushes it to the engine, which
 //! no-ops for values that didn't change.
 //!
@@ -17,7 +17,7 @@
 use std::fmt::Write;
 use std::fs;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::PathBuf;
 
 use voxel_engine::Engine;
 
@@ -31,7 +31,9 @@ pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RA
 /// renderer can never disagree on the bound.
 pub use voxel_engine::RENDER_SCALE_RANGE;
 
-const SETTINGS_PATH: &str = "saves/settings.cfg";
+fn settings_path() -> PathBuf {
+    crate::paths::Paths::get().settings_file()
+}
 
 /// Field-of-view clamp range, in degrees. Shared with the settings menu stepper.
 pub const FOV_RANGE: RangeInclusive<f32> = 60.0..=220.0;
@@ -222,7 +224,7 @@ pub struct Setting {
     menu_kind: MenuKind,
     profile: Profile,
     fraction: fn(&Settings) -> f32,
-    /// The `key=` name used in `saves/settings.cfg` and the primary console name.
+    /// The `key=` name used in `settings.cfg` and the primary console name.
     key: &'static str,
     /// Extra names the `/gfx` console command accepts for this field.
     aliases: &'static [&'static str],
@@ -976,7 +978,7 @@ impl Settings {
     /// Load from disk, falling back to defaults for missing/invalid entries.
     pub fn load() -> Self {
         let mut settings = Self::default();
-        if let Ok(text) = fs::read_to_string(SETTINGS_PATH) {
+        if let Ok(text) = fs::read_to_string(settings_path()) {
             settings.parse_from(&text);
         }
         // Six-way cull is env-only (not in the persisted table): opt in with
@@ -1014,10 +1016,11 @@ impl Settings {
 
     /// Best-effort save (a failed write shouldn't crash the game).
     pub fn save(&self) {
-        if let Some(dir) = Path::new(SETTINGS_PATH).parent() {
+        let path = settings_path();
+        if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let _ = fs::write(SETTINGS_PATH, self.to_text());
+        let _ = fs::write(path, self.to_text());
     }
 
     /// Force every field into its valid range. Safe to call repeatedly, and
@@ -1320,6 +1323,19 @@ mod tests {
         loaded.parse_from(&text);
         loaded.clamp();
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn save_and_load_use_the_config_root() {
+        let path = settings_path();
+        assert!(path.starts_with(&crate::paths::Paths::get().config));
+        assert_ne!(path, PathBuf::from("saves/settings.cfg"));
+        let s = Settings { fov: 110.0, ..Default::default() };
+        s.save();
+        assert!(path.exists());
+        let loaded = Settings::load();
+        assert_eq!(loaded.fov, 110.0);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

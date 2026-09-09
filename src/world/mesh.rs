@@ -23,7 +23,7 @@
 use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::light::{MAX_LIGHT, PaddedLight};
+use super::light::{Lumel, MAX_LIGHT, PaddedLight};
 use super::neighborhood::{Neighborhood, padded_index};
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::coord::ByPass;
@@ -97,7 +97,7 @@ struct Dir {
     v_axis: usize,
     /// Quad corners as (normal, u, v) components (0/1); u/v scaled by the merged
     /// rectangle's extents. CCW seen from outside, matching engine backface cull.
-    corners: [[f32; 3]; 4],
+    corners: [[u8; 3]; 4],
     normal: Normal,
 }
 
@@ -107,7 +107,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 0,
         u_axis: 2,
         v_axis: 1,
-        corners: [[1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0]],
+        corners: [[1, 0, 0], [1, 0, 1], [1, 1, 1], [1, 1, 0]],
         normal: Normal::PosX,
     },
     Dir {
@@ -115,7 +115,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 0,
         u_axis: 2,
         v_axis: 1,
-        corners: [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],
+        corners: [[0, 1, 0], [0, 1, 1], [0, 0, 1], [0, 0, 0]],
         normal: Normal::NegX,
     },
     Dir {
@@ -123,7 +123,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 1,
         u_axis: 0,
         v_axis: 2,
-        corners: [[1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        corners: [[1, 0, 1], [1, 1, 1], [1, 1, 0], [1, 0, 0]],
         normal: Normal::PosY,
     },
     Dir {
@@ -131,7 +131,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 1,
         u_axis: 0,
         v_axis: 2,
-        corners: [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]],
+        corners: [[0, 0, 0], [0, 1, 0], [0, 1, 1], [0, 0, 1]],
         normal: Normal::NegY,
     },
     Dir {
@@ -139,7 +139,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 2,
         u_axis: 0,
         v_axis: 1,
-        corners: [[1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        corners: [[1, 1, 0], [1, 1, 1], [1, 0, 1], [1, 0, 0]],
         normal: Normal::PosZ,
     },
     Dir {
@@ -147,7 +147,7 @@ const DIRS: [Dir; 6] = [
         n_axis: 2,
         u_axis: 0,
         v_axis: 1,
-        corners: [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0]],
+        corners: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
         normal: Normal::NegZ,
     },
 ];
@@ -155,16 +155,55 @@ const DIRS: [Dir; 6] = [
 /// One slice of the sweep: 16 x 16 cells.
 const MASK_CAP: usize = CHUNK_SIZE * CHUNK_SIZE;
 
+/// Empty mask slot. Packed samples never use all 64 bits (56 used), so this
+/// sentinel cannot collide with a real face.
+const NO_FACE: u64 = u64::MAX;
+
 /// The greedy-merge key: two faces merge only when the whole sample matches —
 /// block id, per-corner AO, and per-corner sky/block light — so an AO or smooth-
-/// light gradient never merges into a flat quad. `ao[i]`/`sky[i]`/`block[i]`
-/// correspond to `Dir::corners[i]`. `PartialEq` (derived) is the merge rule.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// light gradient never merges into a flat quad. Packed into one `u64` in the
+/// slice mask (`NO_FACE` = empty). `ao[i]`/`sky[i]`/`block[i]` correspond to
+/// `Dir::corners[i]`.
+#[derive(Clone, Copy)]
 struct FaceSample {
     id: BlockId,
     ao: [u8; 4],
     sky: [u8; 4],
     block: [u8; 4],
+}
+
+/// `id` 16 + 4×2 AO + 4×4 sky + 4×4 block = 56 bits.
+#[inline]
+fn pack_sample(s: FaceSample) -> u64 {
+    let mut w = s.id.0 as u64;
+    for i in 0..4 {
+        w |= (s.ao[i] as u64) << (16 + 2 * i);
+        w |= (s.sky[i] as u64) << (24 + 4 * i);
+        w |= (s.block[i] as u64) << (40 + 4 * i);
+    }
+    w
+}
+
+#[inline]
+fn unpack_sample(w: u64) -> FaceSample {
+    FaceSample {
+        id: BlockId(w as u16),
+        ao: std::array::from_fn(|i| ((w >> (16 + 2 * i)) & 3) as u8),
+        sky: std::array::from_fn(|i| ((w >> (24 + 4 * i)) & 15) as u8),
+        block: std::array::from_fn(|i| ((w >> (40 + 4 * i)) & 15) as u8),
+    }
+}
+
+/// Integer mean of up to four 0..=15 light samples. `count ∈ 1..=4`; the
+/// power-of-two arms are bit-identical to `/ count`.
+#[inline]
+fn avg_light(sum: u32, count: u32) -> u8 {
+    (match count {
+        1 => sum,
+        2 => sum >> 1,
+        4 => sum >> 2,
+        _ => sum / 3,
+    }) as u8
 }
 
 /// A merged rectangle in a slice: normal-layer `n`, min corner `(u0, v0)`, size `w×h`.
@@ -244,28 +283,42 @@ fn sweep(
     light: Option<&PaddedLight>,
     out: &mut ChunkMeshData,
 ) {
-    let mut mask: [Option<FaceSample>; MASK_CAP] = [None; MASK_CAP];
+    let mut mask = [NO_FACE; MASK_CAP];
     let flat_origin = padded_index(0, 0, 0) as i32;
 
     for dir in &DIRS {
         let edge_n = if dir.step > 0 { CHUNK_SIZE - 1 } else { 0 };
         let (s_n, s_u, s_v) =
             (axis_stride(dir.n_axis), axis_stride(dir.u_axis), axis_stride(dir.v_axis));
+        let corner_uv: [[i32; 2]; 4] = std::array::from_fn(|i| {
+            [
+                if dir.corners[i][1] > 0 { 1 } else { -1 },
+                if dir.corners[i][2] > 0 { 1 } else { -1 },
+            ]
+        });
 
-        for n in 0..CHUNK_SIZE {
-            if edge_only && n != edge_n {
-                continue;
-            }
+        let ns = if edge_only { edge_n..edge_n + 1 } else { 0..CHUNK_SIZE };
+        for n in ns {
             let base_n = flat_origin + n as i32 * s_n;
 
-            // Phase 1: mask of exposed faces in this slice, as FaceSamples.
+            // Phase 1: mask of exposed faces in this slice, packed.
             let mut any = false;
             for v in 0..CHUNK_SIZE {
                 let base_v = base_n + v as i32 * s_v;
                 for u in 0..CHUNK_SIZE {
-                    mask[u + v * CHUNK_SIZE] =
-                        face_sample(padded, tables, light, dir, s_n, s_u, s_v, base_v + u as i32 * s_u);
-                    any |= mask[u + v * CHUNK_SIZE].is_some();
+                    let packed = face_sample(
+                        padded,
+                        tables,
+                        light,
+                        dir,
+                        s_n,
+                        s_u,
+                        s_v,
+                        base_v + u as i32 * s_u,
+                        &corner_uv,
+                    );
+                    mask[u + v * CHUNK_SIZE] = packed;
+                    any |= packed != NO_FACE;
                 }
             }
             if !any {
@@ -277,7 +330,9 @@ fn sweep(
             for v0 in 0..CHUNK_SIZE {
                 for u0 in 0..CHUNK_SIZE {
                     let key = mask[u0 + v0 * CHUNK_SIZE];
-                    let Some(sample) = key else { continue };
+                    if key == NO_FACE {
+                        continue;
+                    }
                     let mut w = 1;
                     while u0 + w < CHUNK_SIZE && mask[u0 + w + v0 * CHUNK_SIZE] == key {
                         w += 1;
@@ -294,22 +349,22 @@ fn sweep(
                     }
                     for dv in 0..h {
                         let row = (v0 + dv) * CHUNK_SIZE;
-                        mask[u0 + row..u0 + w + row].fill(None);
+                        mask[u0 + row..u0 + w + row].fill(NO_FACE);
                     }
-                    emit_rect(out, dir, Rect { n, u0, v0, w, h }, sample, tables);
+                    emit_rect(out, dir, Rect { n, u0, v0, w, h }, unpack_sample(key), tables);
                 }
             }
         }
     }
 }
 
-/// The [`FaceSample`] for one cell's face in `dir`, or `None` if the cell is
-/// non-solid or the face is culled. Reads the padded neighbourhood for the cull
-/// neighbour and for the in-plane occluders that bake ambient occlusion, and the
-/// settled light shell for the per-corner smooth sky/block light. `idx` is the
-/// cell's flat padded index; every probe is a stride add off it (`s_n`/`s_u`/
-/// `s_v` from [`axis_stride`]) — same cells, same order as the coordinate form.
+/// Packed [`FaceSample`] for one cell's face in `dir`, or [`NO_FACE`] if the
+/// cell is non-solid or the face is culled. Reads the padded neighbourhood for
+/// the cull neighbour and a 3×3 in-plane stencil (AO occluders + smooth light),
+/// and the settled light shell for per-corner sky/block. `idx` is the cell's
+/// flat padded index; every probe is a stride add off it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // 3×3 stencil: du/dv are both indices and signed offsets
 fn face_sample(
     padded: &Padded,
     tables: &HotTables,
@@ -319,78 +374,77 @@ fn face_sample(
     s_u: i32,
     s_v: i32,
     idx: i32,
-) -> Option<FaceSample> {
+    corner_uv: &[[i32; 2]; 4],
+) -> u64 {
     let id = padded.at_flat(idx as usize);
     if !tables.solid(id) {
-        return None;
+        return NO_FACE;
     }
     // The cell the face opens into: one step along the normal.
     let open = idx + dir.step * s_n;
     let nbr = padded.at_flat(open as usize);
     if covered(id, nbr, tables) {
-        return None;
+        return NO_FACE;
     }
 
     // Minimum/Fast disable both lighting and AO. Their merge key is constant,
-    // so none of the twelve neighbour probes or sixteen light reads/divisions
-    // can affect the result — culling alone decides the mesh.
+    // so none of the neighbour probes or light reads can affect the result —
+    // culling alone decides the mesh.
     if !tables.ao && light.is_none() {
-        return Some(FaceSample { id, ao: [3; 4], sky: [MAX_LIGHT; 4], block: [MAX_LIGHT; 4] });
+        return pack_sample(FaceSample { id, ao: [3; 4], sky: [MAX_LIGHT; 4], block: [MAX_LIGHT; 4] });
     }
 
-    // Ambient occlusion: for each of the four face corners, sample the three
-    // in-plane occluders (two edge-adjacent, one diagonal) in the OPEN layer
-    // (`open`'s normal coordinate). `Dir::corners[i]` gives this corner's
-    // (u,v) ∈ {0,1}²; step ±1 toward it. Classic per-vertex AO (Nolan / 0fps).
-    let occ = |du: i32, dv: i32| -> bool {
-        // Occlude on OPACITY, not solidity — matching cull (`covered`) and smooth
-        // light (`lum`). A transparent solid (glass/ice/water/leaves) must not cast
-        // AO, or it darkens the faces around it. (Old pre-rewrite AO used opaque.)
-        tables.opaque(padded.at_flat((open + du * s_u + dv * s_v) as usize))
-    };
+    // One 3×3 stencil in the OPEN layer: AO and smooth light share the nine
+    // cells. Light lumels load only on the lit path.
+    let mut opaque = [[false; 3]; 3];
+    let mut sky = [MAX_LIGHT; 4];
+    let mut block = [MAX_LIGHT; 4];
+    if let Some(light) = light {
+        let mut lumel = [[Lumel::DARK; 3]; 3];
+        for dv in 0..3 {
+            for du in 0..3 {
+                let p = (open + (du as i32 - 1) * s_u + (dv as i32 - 1) * s_v) as usize;
+                opaque[du][dv] = tables.opaque(padded.at_flat(p));
+                lumel[du][dv] = light.at_flat(p);
+            }
+        }
+        for i in 0..4 {
+            let ou = (corner_uv[i][0] + 1) as usize;
+            let ov = (corner_uv[i][1] + 1) as usize;
+            let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
+            for (u, v) in [(1, 1), (ou, 1), (1, ov), (ou, ov)] {
+                if opaque[u][v] {
+                    continue;
+                }
+                let l = lumel[u][v];
+                ssum += l.sky.get() as u32;
+                bsum += l.block.get() as u32;
+                count += 1;
+            }
+            sky[i] = avg_light(ssum, count);
+            block[i] = avg_light(bsum, count);
+        }
+    } else {
+        for dv in 0..3 {
+            for du in 0..3 {
+                let p = (open + (du as i32 - 1) * s_u + (dv as i32 - 1) * s_v) as usize;
+                opaque[du][dv] = tables.opaque(padded.at_flat(p));
+            }
+        }
+    }
+
     // AO off: every corner reads unoccluded (uniform 3) — a perf lever, and it
     // also merges quads a gradient would split (matches the pre-rewrite toggle).
     let ao = std::array::from_fn(|i| {
         if !tables.ao {
             return 3;
         }
-        let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
-        let ev = if dir.corners[i][2] > 0.5 { 1 } else { -1 };
-        vertex_ao(occ(eu, 0), occ(0, ev), occ(eu, ev))
+        let ou = (corner_uv[i][0] + 1) as usize;
+        let ov = (corner_uv[i][1] + 1) as usize;
+        vertex_ao(opaque[ou][1], opaque[1][ov], opaque[ou][ov])
     });
 
-    // Per-corner smooth light: average sky/block over the up-to-4 cells touching
-    // the corner in the OPEN layer, skipping opaque cells (they carry no
-    // light to a surface). The face cell `open` is never opaque here (an opaque
-    // neighbour would have culled the face), so the count is always ≥ 1.
-    // Without a light shell every corner reads constant full light — exactly
-    // what averaging a full shell would produce, minus the sixteen reads.
-    let mut sky = [MAX_LIGHT; 4];
-    let mut block = [MAX_LIGHT; 4];
-    if let Some(light) = light {
-        let lum = |du: i32, dv: i32| {
-            let p = (open + du * s_u + dv * s_v) as usize;
-            (tables.opaque(padded.at_flat(p)), light.at_flat(p))
-        };
-        for i in 0..4 {
-            let eu = if dir.corners[i][1] > 0.5 { 1 } else { -1 };
-            let ev = if dir.corners[i][2] > 0.5 { 1 } else { -1 };
-            let (mut ssum, mut bsum, mut count) = (0u32, 0u32, 0u32);
-            for (du, dv) in [(0, 0), (eu, 0), (0, ev), (eu, ev)] {
-                let (opaque, l) = lum(du, dv);
-                if opaque {
-                    continue;
-                }
-                ssum += l.sky.get() as u32;
-                bsum += l.block.get() as u32;
-                count += 1;
-            }
-            sky[i] = (ssum / count) as u8;
-            block[i] = (bsum / count) as u8;
-        }
-    }
-
-    Some(FaceSample { id, ao, sky, block })
+    pack_sample(FaceSample { id, ao, sky, block })
 }
 
 /// Per-vertex ambient-occlusion level `0..=3` (`3` = unoccluded) from its three
@@ -413,7 +467,7 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
     origin[dir.v_axis] = rect.v0 as u32;
 
     let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
-        let cr = &dir.corners[i];
+        let cr = dir.corners[i];
         let mut pos = [0u8; 3];
         pos[dir.n_axis] = (origin[dir.n_axis] + cr[0] as u32) as u8;
         pos[dir.u_axis] = (origin[dir.u_axis] + cr[1] as u32 * rect.w as u32) as u8;
@@ -445,8 +499,110 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
 mod tests {
     use super::*;
     use super::super::chunk::CHUNK_VOLUME;
+    use super::super::light::{LightLevel, Lumel};
     use crate::world::generation::TerrainGenerator;
     use voxel_engine::Pass;
+
+    /// FNV-1a over every pass's decoded vertex fields and index buckets.
+    /// MeshVertex's packed words are private to the engine, so this hashes the
+    /// public fields (pos/normal/layer/AO/light/water/micro) via `to_le_bytes`.
+    fn hash_mesh(data: &ChunkMeshData) -> u32 {
+        let mut bytes = Vec::new();
+        for (pass, mesh) in data.iter() {
+            bytes.push(pass as u8);
+            for v in mesh.vertices() {
+                for c in v.local_pos() {
+                    bytes.extend_from_slice(&c.to_le_bytes());
+                }
+                bytes.push(v.normal() as u8);
+                bytes.extend_from_slice(&v.layer().to_le_bytes());
+                bytes.push((0..=3).find(|&a| v.ao() == Ao::new(a)).expect("ao 0..=3"));
+                let l = v.light();
+                let (sky, block) = (0u8..=15)
+                    .flat_map(|s| (0u8..=15).map(move |b| (s, b)))
+                    .find(|&(s, b)| l == Light::new(s, b))
+                    .expect("light 0..=15");
+                bytes.push(sky);
+                bytes.push(block);
+                bytes.push(v.is_water() as u8);
+                for m in v.micro() {
+                    bytes.extend_from_slice(&m.to_le_bytes());
+                }
+            }
+            for bucket in mesh.buckets() {
+                bytes.extend_from_slice(&(bucket.len() as u32).to_le_bytes());
+                for i in bucket {
+                    bytes.extend_from_slice(&i.to_le_bytes());
+                }
+            }
+        }
+        crate::hash::fnv1a_32(&bytes)
+    }
+
+    /// A non-constant light shell: every padded cell differs from its
+    /// neighbours, so per-corner averaging and the merge key actually vary.
+    fn gradient_light() -> PaddedLight {
+        PaddedLight::from_fn(|x, y, z| Lumel {
+            sky: LightLevel::new(((x + y + 17) as u8) & 15),
+            block: LightLevel::new(((z * 3 + y + 17) as u8) & 15),
+        })
+    }
+
+    /// Vertex-byte pin: four seed-42 neighbourhoods, dense (non-uniform), meshed
+    /// unlit / full-bright / gradient-lit. Hashes must stay bit-identical across
+    /// mesher edits. Print with `--nocapture` to refresh the table.
+    #[test]
+    fn vertex_byte_pin() {
+        use crate::block::registry::BlockRegistry;
+        use crate::world::generation::SineHills;
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 42);
+        let tables = registry.hot_tables();
+        // (coord, unlit, full, gradient) — filled from the first `--nocapture` run.
+        // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
+        #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
+        let want: [((i32, i32, i32), u32, u32, u32); 4] = [
+            ((0, 1, 0), 0xb0e2c9fb, 0xb0e2c9fb, 0x897aa7e2),
+            ((3, 1, -2), 0x0e6322e1, 0x0e6322e1, 0x5302192d),
+            ((-5, 0, 4), 0x844d5350, 0x844d5350, 0xd8f141d4),
+            ((2, 1, 2), 0xc9d80078, 0xc9d80078, 0xf2649ff0),
+        ];
+
+        let mut got = [(0u32, 0u32, 0u32); 4];
+        for (i, ((cx, cy, cz), _, _, _)) in want.iter().copied().enumerate() {
+            let neigh: Vec<Chunk> = (0..27)
+                .map(|k| Chunk::new(cx + k % 3 - 1, cy + k / 9 - 1, cz + k / 3 % 3 - 1, &generator))
+                .collect();
+            let chunk = &neigh[1 + 3 + 9]; // (dx,dy,dz) = (0,0,0)
+            assert!(
+                chunk.uniform().is_none(),
+                "pin coord ({cx},{cy},{cz}) must be non-uniform"
+            );
+            let at = |dx: i32, dy: i32, dz: i32| -> Option<&Chunk> {
+                Some(&neigh[((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize])
+            };
+            let padded = Padded::capture(at);
+
+            let mut unlit = new_chunk_mesh_data();
+            build_chunk_mesh_unlit(&padded, chunk.uniform(), &tables, &mut unlit);
+            let mut full = new_chunk_mesh_data();
+            build_chunk_mesh(&padded, chunk.uniform(), &tables, &PaddedLight::full(), &mut full);
+            let mut grad = new_chunk_mesh_data();
+            build_chunk_mesh(&padded, chunk.uniform(), &tables, &gradient_light(), &mut grad);
+
+            got[i] = (hash_mesh(&unlit), hash_mesh(&full), hash_mesh(&grad));
+            println!(
+                "vertex_byte_pin ({cx},{cy},{cz}) unlit=0x{:08x} full=0x{:08x} grad=0x{:08x}",
+                got[i].0, got[i].1, got[i].2
+            );
+        }
+        for (i, ((cx, cy, cz), unlit_h, full_h, grad_h)) in want.iter().copied().enumerate() {
+            assert_eq!(got[i].0, unlit_h, "({cx},{cy},{cz}) unlit");
+            assert_eq!(got[i].1, full_h, "({cx},{cy},{cz}) full");
+            assert_eq!(got[i].2, grad_h, "({cx},{cy},{cz}) gradient");
+        }
+    }
 
     struct EmptyGen;
     impl TerrainGenerator for EmptyGen {
@@ -496,8 +652,8 @@ mod tests {
     /// gauge for the row-wise capture redesign. Ignored: a timing benchmark,
     /// not a correctness gate. Run with
     /// `cargo test --release padded_capture_throughput -- --ignored --nocapture`.
-    /// 2026-07-19 (12-core box), per-cell closure capture: ~26.7k captures/s;
-    /// row-wise (`capture_rows` + `copy_row`): ~337k captures/s (12.7×).
+    /// 2026-07-19: 337k captures/s (12-core box, row-wise capture_rows+copy_row; per-cell closure ~26.7k, 12.7×).
+    /// 2026-09-08: 468k captures/s (median of 3; before gated fill 456k).
     #[test]
     #[ignore]
     fn padded_capture_throughput() {
@@ -533,6 +689,170 @@ mod tests {
             dt.as_secs_f64(),
             N as f64 / dt.as_secs_f64()
         );
+    }
+
+    /// Vertex-byte histogram of every chunk mesh in the RD 8 / V 4 and
+    /// RD 12 / V 6 boxes around spawn, seed 42 — input for the engine's
+    /// staging-ring sizing. Ignored: a measurement, not a correctness gate.
+    /// Run with
+    /// `cargo test --release mesh_bytes_histogram -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn mesh_bytes_histogram() {
+        use super::super::chunk::CHUNK_SIZE;
+        use super::super::light::LightGrid;
+        use super::super::pipeline::Job;
+        use super::super::{LightLane, StreamLane, World};
+        use crate::coord::{ChunkBox, ChunkCoord};
+        use crate::render_config::RenderConfig;
+        use std::mem::size_of;
+        use voxel_engine::Pass;
+
+        const VERT_BYTES: usize = 8;
+        assert_eq!(size_of::<MeshVertex>(), VERT_BYTES);
+
+        fn pct(sorted: &[usize], p: usize) -> usize {
+            if sorted.is_empty() {
+                return 0;
+            }
+            let i = (sorted.len() - 1) * p / 100;
+            sorted[i]
+        }
+
+        fn report(rd: i32, vert: i32) {
+            let mut world = World::with_config(
+                42,
+                RenderConfig {
+                    lod2: false,
+                    occlusion: false,
+                    ..RenderConfig::default()
+                },
+            );
+            world.set_view_distances(rd, vert);
+            world.refresh_tables();
+            let cy = world.surface_y(0, 0).div_euclid(CHUNK_SIZE as i32);
+            let center = ChunkCoord::new(0, cy, 0);
+            world.ensure_region_data(center);
+
+            // Drain the light worklist with the same propagate + settle_light
+            // the streaming workers run, so mesh snapshots see settled shells.
+            let mut settles = 0u32;
+            loop {
+                let Some(coord) = LightLane::seed_set(&mut world)
+                    .and_then(|s| s.iter().copied().next())
+                else {
+                    break;
+                };
+                LightLane::seed_set(&mut world)
+                    .expect("worklist")
+                    .remove(&coord);
+                match LightLane::submit(&mut world, coord) {
+                    Some(Job::Light { snapshot, coord: c, .. }) => {
+                        let mut grid = LightGrid::dark();
+                        super::super::light::propagate(
+                            &snapshot.chunk,
+                            &snapshot.shell,
+                            &snapshot.ceiling,
+                            snapshot.world_y0,
+                            &snapshot.tables,
+                            &mut grid,
+                        );
+                        world.settle_light(c, grid);
+                        settles += 1;
+                    }
+                    _ => {}
+                }
+                assert!(
+                    settles < 1_000_000,
+                    "light worklist did not drain (RD {rd} V {vert})"
+                );
+            }
+
+            let mesh_box = ChunkBox::new(center, rd, vert);
+            let mut bytes_ne = Vec::new();
+            let mut quads_ne = Vec::new();
+            let mut empty = 0usize;
+            let mut pass_tot = [0usize; Pass::COUNT];
+            let mut total = 0usize;
+            let mut scratch = new_chunk_mesh_data();
+            for coord in mesh_box.coords() {
+                let (_, snap) = world.snapshot(coord, false);
+                match &snap.light {
+                    Some(light) => {
+                        build_chunk_mesh(
+                            &snap.padded,
+                            snap.uniform,
+                            &snap.tables,
+                            light,
+                            &mut scratch,
+                        );
+                    }
+                    None => {
+                        build_chunk_mesh_unlit(
+                            &snap.padded,
+                            snap.uniform,
+                            &snap.tables,
+                            &mut scratch,
+                        );
+                    }
+                }
+                let mut chunk_bytes = 0usize;
+                let mut chunk_quads = 0usize;
+                for p in Pass::ALL {
+                    let n = scratch[p].vertices().len();
+                    let b = n * VERT_BYTES;
+                    pass_tot[p as usize] += b;
+                    chunk_bytes += b;
+                    chunk_quads += n / 4;
+                }
+                total += chunk_bytes;
+                if chunk_bytes == 0 {
+                    empty += 1;
+                } else {
+                    bytes_ne.push(chunk_bytes);
+                    quads_ne.push(chunk_quads);
+                }
+            }
+            let chunks = mesh_box.coords().count();
+            bytes_ne.sort_unstable();
+            quads_ne.sort_unstable();
+            let mean = if bytes_ne.is_empty() {
+                0.0
+            } else {
+                bytes_ne.iter().sum::<usize>() as f64 / bytes_ne.len() as f64
+            };
+            println!(
+                "mesh_bytes_histogram seed=42 RD={rd} V={vert} spawn=({} {} {})",
+                center.x, center.y, center.z
+            );
+            println!(
+                "  chunks={chunks} empty={empty} non-empty={} light_settles={settles}",
+                bytes_ne.len()
+            );
+            println!(
+                "  vertex bytes/chunk (non-empty): min={} median={} mean={:.1} p95={} max={}",
+                bytes_ne.first().copied().unwrap_or(0),
+                pct(&bytes_ne, 50),
+                mean,
+                pct(&bytes_ne, 95),
+                bytes_ne.last().copied().unwrap_or(0)
+            );
+            println!(
+                "  quads/chunk (non-empty): median={} p95={}",
+                pct(&quads_ne, 50),
+                pct(&quads_ne, 95)
+            );
+            println!("  total vertex bytes={total}");
+            println!(
+                "  pass totals: opaque={} cutout={} blend={}",
+                pass_tot[Pass::Opaque as usize],
+                pass_tot[Pass::Cutout as usize],
+                pass_tot[Pass::Blend as usize]
+            );
+        }
+
+        report(8, 4);
+        report(12, 6);
     }
 
     /// The unlit path must be byte-identical to meshing against a full-bright

@@ -77,6 +77,9 @@ pub struct Benchmark {
     ready_wait_logs: u32,
     world_sampled_at: Option<Instant>,
     cached_ready: bool,
+    /// Wall seconds from [`Self::begin`] (first bench frame) to the first
+    /// `entry_complete` sample. `None` if the world never settled.
+    entry_seconds: Option<f64>,
     census_ready: Option<MemoryCensus>,
 }
 
@@ -140,8 +143,24 @@ impl Benchmark {
             ready_wait_logs: 0,
             world_sampled_at: None,
             cached_ready: false,
+            entry_seconds: None,
             census_ready: None,
         })
+    }
+
+    /// First time `world` reports `entry_complete`, stamp `entry_seconds` and
+    /// the ready-time census. Later calls are no-ops.
+    pub fn observe_ready(&mut self, world: &World) {
+        if self.entry_seconds.is_some() && self.census_ready.is_some() {
+            return;
+        }
+        if !world.entry_complete() {
+            return;
+        }
+        self.stamp_ready();
+        if self.census_ready.is_none() {
+            self.census_ready = Some(world.memory_census());
+        }
     }
 
     pub fn has_started(&self) -> bool {
@@ -203,8 +222,11 @@ impl Benchmark {
             self.world_sampled_at = Some(Instant::now());
             self.cached_ready = world.entry_complete();
             self.last_gauges = world.stream_gauges();
-            if self.cached_ready && self.census_ready.is_none() {
-                self.census_ready = Some(world.memory_census());
+            if self.cached_ready {
+                self.stamp_ready();
+                if self.census_ready.is_none() {
+                    self.census_ready = Some(world.memory_census());
+                }
             }
             self.poll_rss();
         }
@@ -216,6 +238,7 @@ impl Benchmark {
     pub fn step(&mut self, dt: f32, world_ready: bool, gauges: StreamGauges) -> Step {
         self.last_gauges = gauges;
         self.peaks.observe(gauges);
+        self.poll_rss();
         match self.phase {
             Phase::WaitingToStart => Step::Warming,
             Phase::Warming => {
@@ -225,6 +248,9 @@ impl Benchmark {
                     .elapsed();
                 let minimum_met = elapsed >= self.min_warmup;
                 let timed_out = elapsed >= self.min_warmup.saturating_add(self.ready_timeout);
+                if world_ready {
+                    self.stamp_ready();
+                }
                 if !minimum_met || (!world_ready && !timed_out) {
                     return Step::Warming;
                 }
@@ -244,6 +270,9 @@ impl Benchmark {
                 Step::Warming
             }
             Phase::Measuring => {
+                if world_ready {
+                    self.stamp_ready();
+                }
                 if dt.is_finite() && dt > 0.0 {
                     self.samples.push(dt);
                 }
@@ -330,6 +359,10 @@ impl Benchmark {
                     ),
                     ("ready_at_end", Json::from(world.entry_complete())),
                     (
+                        "entry_seconds",
+                        Json::optional_number(self.entry_seconds),
+                    ),
+                    (
                         "profiling_enabled",
                         Json::from(matches!(
                             std::env::var("WATT_BENCH_PROFILE").as_deref(),
@@ -367,7 +400,7 @@ impl Benchmark {
         ]);
         let json = report.render();
         let summary = format!(
-            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} preset={} window={}x{} gpu={}",
+            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} ready_s={} preset={} window={}x{} gpu={}",
             stats.frames,
             fmt_opt(stats.avg_fps, 0),
             fmt_opt(stats.p1_fps, 0),
@@ -377,6 +410,7 @@ impl Benchmark {
             stats.over_33ms,
             rss_end_bytes.unwrap_or(0) / (1024 * 1024),
             self.ready_before_measure,
+            fmt_opt(self.entry_seconds, 3),
             settings.preset.label().to_ascii_lowercase(),
             eng.screen_width(),
             eng.screen_height(),
@@ -404,6 +438,16 @@ impl Benchmark {
             json,
             output: self.output.clone(),
         }
+    }
+
+    fn stamp_ready(&mut self) {
+        if self.entry_seconds.is_some() {
+            return;
+        }
+        let Some(started) = self.warmup_started else {
+            return;
+        };
+        self.entry_seconds = Some(started.elapsed().as_secs_f64());
     }
 
     fn poll_rss(&mut self) {
@@ -544,6 +588,11 @@ impl FrameStats {
             ("frames_over_16_67ms", Json::from(self.over_16ms)),
             ("frames_over_33_33ms", Json::from(self.over_33ms)),
             ("frames_over_50ms", Json::from(self.over_50ms)),
+            // Engine::frames_rendered / frames_coalesced are not on this engine
+            // revision; filled when those accessors land.
+            ("rendered", Json::Null),
+            ("coalesced", Json::Null),
+            ("rendered_fps", Json::Null),
         ])
     }
 }
@@ -791,8 +840,26 @@ mod tests {
             ready_wait_logs: 0,
             world_sampled_at: None,
             cached_ready: false,
+            entry_seconds: None,
             census_ready: None,
         }
+    }
+
+    #[test]
+    fn entry_seconds_stamps_on_the_first_ready_frame() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_secs(60));
+        bench.begin();
+        bench.warmup_started = Some(Instant::now() - Duration::from_millis(250));
+        let gauges = StreamGauges::default();
+        assert_eq!(bench.step(0.016, false, gauges), Step::Warming);
+        assert!(bench.entry_seconds.is_none());
+        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        let secs = bench.entry_seconds.expect("ready frame stamps entry_seconds");
+        assert!(secs >= 0.25, "got {secs}");
+        assert!(secs < 2.0, "got {secs}");
+        assert_eq!(bench.step(0.016, true, gauges), Step::Measuring);
+        let again = bench.entry_seconds.expect("stays set");
+        assert_eq!(format!("{secs:.6}"), format!("{again:.6}"));
     }
 
     #[test]
@@ -807,9 +874,22 @@ mod tests {
         assert!(json.contains("\"chunk_uniform_bytes\":4"));
         assert!(json.contains("\"chunk_uniform_count\":1"));
         assert!(json.contains("\"light_uniform_count\":0"));
+        assert!(json.contains("\"light_uniform_bytes\":0"));
+        assert!(json.contains("\"light_cells_count\":0"));
         assert!(json.contains("\"light_cells_bytes\":0"));
         assert!(json.contains("\"mesh_cpu_bytes\":0"));
         assert!(json.contains("\"total\":4"));
+        let frames = FrameStats::from_samples(&[], Duration::ZERO).to_json().render();
+        assert!(frames.contains("\"rendered\":null"));
+        assert!(frames.contains("\"coalesced\":null"));
+        assert!(frames.contains("\"rendered_fps\":null"));
+        let scenario = Json::object(vec![
+            ("entry_seconds", Json::optional_number(Some(1.5))),
+        ])
+        .render();
+        assert!(scenario.contains("\"entry_seconds\":1.5"));
+        let missing = Json::object(vec![("entry_seconds", Json::optional_number(None))]).render();
+        assert!(missing.contains("\"entry_seconds\":null"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod menu_default;
 pub mod visuals;
 
 use std::cell::{Cell, RefCell};
+use std::fs;
 use std::rc::Rc;
 
 use voxel_engine::Engine;
@@ -161,12 +162,10 @@ impl ElementStash {
     pub fn revoke(&mut self, elements: &[ElementId]) {
         let mut removed = false;
         for &element in elements {
-            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
-                if *count > 0 {
-                    *count -= 1;
-                    self.total -= 1;
-                    removed = true;
-                }
+            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) && *count > 0 {
+                *count -= 1;
+                self.total -= 1;
+                removed = true;
             }
         }
         if removed {
@@ -355,9 +354,8 @@ struct Entry {
     enabled: bool,
 }
 
-/// The set of installed mods and their on/off state. Persists across worlds so the
-/// player's mod choices stick; per-world state (like inventory contents) is saved
-/// and restored through each mod's `save_state`/`load_state`.
+/// The set of installed mods and their on/off state. Enable/disable choices persist
+/// in `mods.cfg`; per-world state is saved through each mod's `save_state`/`load_state`.
 pub struct Mods {
     entries: Vec<Entry>,
 }
@@ -615,6 +613,39 @@ impl Mods {
             entry.module.load_state(data, world);
         }
     }
+
+    /// Restore enable/disable choices from `mods.cfg`. Missing/unknown keys keep
+    /// the install defaults; a later [`Self::apply_bench_env`] call still wins.
+    pub fn load_choices(&mut self) {
+        let Ok(text) = fs::read_to_string(crate::paths::Paths::get().mods_file()) else {
+            return;
+        };
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let Some(on) = crate::settings::parse_toggle(value.trim()) else {
+                continue;
+            };
+            self.set_enabled(key.trim(), on);
+        }
+    }
+
+    /// Best-effort save of enable/disable choices (a failed write shouldn't crash).
+    pub fn save_choices(&self) {
+        let path = crate::paths::Paths::get().mods_file();
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let mut text = String::new();
+        for entry in &self.entries {
+            text.push_str(entry.module.name());
+            text.push('=');
+            text.push_str(crate::settings::on_off(entry.enabled, false));
+            text.push('\n');
+        }
+        let _ = fs::write(path, text);
+    }
 }
 
 #[cfg(test)]
@@ -689,5 +720,38 @@ mod tests {
         assert!(full.clouds);
         assert!(full.bloom);
         assert!(full.shadows);
+    }
+
+    fn enabled(mods: &Mods, name: &str) -> bool {
+        (0..mods.len())
+            .find(|&i| mods.name(i) == name)
+            .map(|i| mods.is_enabled(i))
+            .expect("installed mod")
+    }
+
+    #[test]
+    fn choices_round_trip_through_the_config_root_and_ignore_unknown() {
+        let mut mods = Mods::with_defaults();
+        mods.set_enabled("InfiniteDiffusion", true);
+        mods.set_enabled("Atmosphere", false);
+        mods.save_choices();
+        let path = crate::paths::Paths::get().mods_file();
+        assert!(path.exists());
+        assert!(path.starts_with(&crate::paths::Paths::get().config));
+        assert_ne!(path, std::path::PathBuf::from("saves/mods.cfg"));
+
+        let mut loaded = Mods::with_defaults();
+        loaded.load_choices();
+        assert!(enabled(&loaded, "InfiniteDiffusion"));
+        assert!(!enabled(&loaded, "Atmosphere"));
+        assert!(enabled(&loaded, "Inventory"));
+
+        fs::write(&path, "no-such=on\nInventory=off\nnot-a-pair\nAtmosphere=true\n").unwrap();
+        let mut parsed = Mods::with_defaults();
+        parsed.load_choices();
+        assert!(!enabled(&parsed, "Inventory"));
+        assert!(enabled(&parsed, "Atmosphere"));
+        assert!(!enabled(&parsed, "InfiniteDiffusion"));
+        let _ = fs::remove_file(path);
     }
 }

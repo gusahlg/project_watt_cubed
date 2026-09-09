@@ -198,6 +198,11 @@ impl ElementRegistry {
         self.elements.len()
     }
 
+    /// Whether no elements are registered.
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
 }
 
 // The built-in element palette. Adding a material is one row here; the macro

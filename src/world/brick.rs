@@ -129,7 +129,7 @@ pub enum BrickPayload {
         columns: RleColumns,
     },
     /// >[`PALETTE_MAX`]-distinct-value escape hatch: one full [`BlockState`]
-    /// per cell, no palette indirection.
+    /// > per cell, no palette indirection.
     Dense(Box<[BlockState]>),
     // Per-face payloads deliberately excluded: this is the one traversal
     // structure, not one of several parallel representations.
@@ -336,8 +336,8 @@ mod tests {
     #[test]
     fn roundtrip_exactly_256_distinct_palette_stays_paletted_or_rle() {
         let mut cells = [bs(0); BRICK_VOLUME];
-        for i in 0..BRICK_VOLUME {
-            cells[i] = bs((i % PALETTE_MAX) as u16);
+        for (i, cell) in cells.iter_mut().enumerate() {
+            *cell = bs((i % PALETTE_MAX) as u16);
         }
         roundtrips(&cells, PackStrategy::Paletted);
         roundtrips(&cells, PackStrategy::Rle);
@@ -350,8 +350,8 @@ mod tests {
     #[test]
     fn roundtrip_257_distinct_palette_promotes_to_dense() {
         let mut cells = [bs(0); BRICK_VOLUME];
-        for i in 0..BRICK_VOLUME {
-            cells[i] = bs((i % (PALETTE_MAX + 1)) as u16);
+        for (i, cell) in cells.iter_mut().enumerate() {
+            *cell = bs((i % (PALETTE_MAX + 1)) as u16);
         }
         roundtrips(&cells, PackStrategy::Paletted);
         roundtrips(&cells, PackStrategy::Rle);

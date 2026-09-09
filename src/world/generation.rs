@@ -1178,10 +1178,8 @@ impl Terrain {
             AIR
         } else {
             let depth = height - wy;
-            if depth <= self.mat.max_scattered_depth {
-                if let Some(ore) = self.ore_at(wx, wy, wz, depth) {
-                    return ore;
-                }
+            if depth <= self.mat.max_scattered_depth && let Some(ore) = self.ore_at(wx, wy, wz, depth) {
+                return ore;
             }
             if let Some(id) = self.cave_wall_at(p, wx, wy, wz, depth) {
                 return id;
@@ -1487,6 +1485,7 @@ impl Terrain {
 
     /// One chunk's storage from shared column profiles — the `cy`-varying half of
     /// generation (height-band + region shortcuts, then a run fill).
+    #[allow(clippy::too_many_arguments)] // column stats stay unpacked so the fill can early-out per bound
     fn fill_chunk(
         &self,
         x0: i32,

@@ -407,10 +407,12 @@ impl ViewGate {
     }
 
     /// Publish the far-field horizon (metres from the eye).
+    #[cfg(test)]
     fn set_far(&self, metres: f64) {
         self.far_m.store(metres.to_bits(), Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn set_velocity(&self, x: f64, z: f64) {
         self.vel_x.store(x.to_bits(), Ordering::Relaxed);
         self.vel_z.store(z.to_bits(), Ordering::Relaxed);
@@ -1594,11 +1596,9 @@ mod tests {
     /// pool with real mesh jobs and reports jobs/second plus `size_of::<Done>()`.
     /// Ignored: a timing benchmark, not a correctness gate. Run with
     /// `cargo test --release mesh_result_channel_throughput -- --ignored --nocapture`.
-    /// 2026-07-13 (RTX 3070 box, 4 workers): 544 B inline ≈ 28.6k jobs/s;
-    /// boxed 112 B ≈ 29.2k jobs/s — throughput is meshing-bound, the boxing is
-    /// a payload/regression guard rather than a measured speedup.
-    /// 2026-07-19 (12-core box, 4 workers): 26.8k jobs/s pre-layout work;
-    /// row-wise capture 30.3k; + stride-walk mesher 48.5k jobs/s.
+    /// 2026-07-13: 29.2k jobs/s (RTX 3070 box, 4 workers, boxed 112 B; 544 B inline 28.6k; meshing-bound).
+    /// 2026-07-19: 48.5k jobs/s (12-core box, 4 workers; pre-layout 26.8k, row-wise capture 30.3k).
+    /// 2026-09-08: 62.3k jobs/s (4 workers, median of 3; before stencil/pack/edge-slice 52.8k).
     #[test]
     #[ignore]
     fn mesh_result_channel_throughput() {
@@ -1620,6 +1620,12 @@ mod tests {
 
         const JOBS: u32 = 4000;
         let workers = Workers::spawn(4);
+        // Spawn publishes a streaming lookahead cap; this probe floods the
+        // pool, so lift it. Does not affect production admission.
+        workers
+            .view
+            .near_queue_cap
+            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
         let start = std::time::Instant::now();
         for i in 0..JOBS {
             assert!(workers.submit(Job::Mesh {

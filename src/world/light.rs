@@ -463,6 +463,7 @@ fn reset_dark(v: &mut Vec<LightLevel>) {
 
 /// Recompute chunk light from scratch. Light removal needs no second pass:
 /// breaking emitters or placing blocks just lowers the grid. `world_y0` is chunk's Y origin.
+#[allow(clippy::needless_range_loop)] // `i` is the flood-queue key and the `block[]` slot
 pub fn propagate(
     chunk: &Chunk,
     shell: &FaceShell,

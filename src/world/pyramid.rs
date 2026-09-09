@@ -83,6 +83,7 @@ fn ringed_detail(finest: Detail, ring: u32, step: u8) -> Detail {
 
 /// Select LOD for a given distance: log-falloff to rings, clamped near and far.
 /// Returns a Level or BeyondHorizon; NaN/negatives clamp to nearest ring.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(>=)` is the NaN-and-negative clamp on the hot LOD path
 pub(in crate::world) fn level_for(dist: EyeDist, cfg: &PyramidCfg) -> LodChoice {
     let dist_xz = dist.get();
     // `!(>=)` catches NaN and negatives: clamp to finest ring.
