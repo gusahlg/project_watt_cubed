@@ -211,6 +211,13 @@ mod tests {
         assert_eq!(loaded_player.stash.total(), 3);
         assert_eq!(loaded_player.stash.count(El::Stone.id()), 2);
         assert_eq!(loaded_player.stash.count(El::Iron.id()), 1);
+        let saved_bytes = fs::read(format!("saves/{id}.save")).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(saved_bytes[4..6].try_into().unwrap()),
+            format::VERSION,
+            "new documents write save format v{}",
+            format::VERSION
+        );
         assert_eq!(loaded_world.block_at(bx, by, bz), AIR, "broken block stays broken");
         assert_eq!(report.source, Source::Live);
         assert!(report.salvage.is_none());
@@ -269,6 +276,32 @@ mod tests {
     }
 
     #[test]
+    fn v6_on_disk_inventory_line_migrates_through_decode() {
+        let mut doc = bare_doc();
+        doc.mods
+            .push(("inventory".into(), "v1;Stone,Stone,Soil".into()));
+        let v7 = format::encode(&doc).unwrap();
+        // v6 player records end at the flags byte; drop the v7 stash blob.
+        let start = format::HEADER_LEN + 33;
+        let len = u16::from_le_bytes(v7[start..start + 2].try_into().unwrap()) as usize;
+        let mut v6 = Vec::with_capacity(v7.len() - 2 - len);
+        v6.extend_from_slice(&v7[..start]);
+        v6.extend_from_slice(&v7[start + 2 + len..]);
+        v6[4..6].copy_from_slice(&6u16.to_le_bytes());
+
+        let decoded = match format::decode(&v6).unwrap() {
+            format::Decoded::Intact(doc) => doc,
+            format::Decoded::Salvaged { .. } => panic!("v6 splice must decode intact"),
+        };
+        assert!(decoded.player.stash.is_none());
+        let mut mods = Mods::with_defaults();
+        let (_, player, _) = from_doc(decoded, &mut mods, make_world);
+        assert_eq!(player.stash.total(), 3);
+        assert_eq!(player.stash.count(El::Stone.id()), 2);
+        assert_eq!(player.stash.count(El::Soil.id()), 1);
+    }
+
+    #[test]
     fn player_stash_field_wins_over_an_old_inventory_line() {
         let mut doc = bare_doc();
         doc.player.stash = Some(vec![("Copper".into(), 1)]);
@@ -316,6 +349,7 @@ mod tests {
         let (loaded_world, loaded_player, _, _) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(loaded_world.seed(), 1234);
         assert_eq!(loaded_player.position, DVec3::new(0.0, 40.0, 0.0));
+        assert_eq!(loaded_player.stash.total(), 0);
         assert_eq!(loaded_world.edits().count(), 0);
 
         cleanup(&id);

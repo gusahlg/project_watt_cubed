@@ -448,7 +448,7 @@ impl Mod for CraftingMod {
 
     fn save_state(&self, _world: &World) -> Option<(u16, String)> {
         // Persist by block *name* ("Stone+Iron"), the same portable choice the
-        // inventory makes for elements: names survive id reshuffles across
+        // core stash makes for elements: names survive id reshuffles across
         // sessions, and the equipped entry carries a `*` prefix.
         if self.crafted.is_empty() {
             return None;

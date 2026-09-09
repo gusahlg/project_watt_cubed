@@ -712,6 +712,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_stash_round_trips() {
+        let mut doc = sample();
+        doc.player.stash = Some(vec![]);
+        let bytes = encode(&doc).unwrap();
+        assert_eq!(expect_intact(decode(&bytes).unwrap()), doc);
+    }
+
+    #[test]
     fn version_6_files_still_decode_without_stash() {
         let doc = sample();
         let v7 = encode(&doc).unwrap();
