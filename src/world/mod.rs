@@ -841,11 +841,15 @@ pub struct World {
     /// bounded hole in the world, not an infinite resubmit-panic loop. Every
     /// scan that would re-request the work consults this set.
     quarantined: FastSet<streaming::FailKey>,
-    /// Block count last uploaded. Rebuilds/re-uploads when palette grows.
+    /// Block count last processed by [`Self::refresh_textures`].
     textures_built: usize,
     /// Built texture layers by id, kept so palette growth (crafting registers
     /// one block at a time) appends new layers instead of regenerating all.
     texture_cache: Vec<Vec<u8>>,
+    /// Layers last sent to the GPU (`set` on first upload, `append` after).
+    /// Existing layers never change: a layer is a pure function of composition
+    /// and ids are append-only, so growth never re-sends the prefix.
+    uploaded_len: usize,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
     /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
     /// stream pass reads the engine cap (identity in practice — ids start tiny).
@@ -1135,6 +1139,7 @@ impl World {
             quarantined: FastSet::default(),
             textures_built: 0,
             texture_cache: Vec::new(),
+            uploaded_len: 0,
             texture_layer_cap: u16::MAX,
             ao: true,
             tables_epoch: 0,
