@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn capture_rows_matches_capture_cell_for_cell() {
         let present = |dx: i32, dy: i32, dz: i32| {
-            !(dx == 1 && dy == 1 && dz == -1) && !(dx == -1 && dy == 0 && dz == 0)
+            !(dx == 1 && dy == 1 && dz == -1 || dx == -1 && dy == 0 && dz == 0)
         };
         let src_at = |dx: i32, dy: i32, dz: i32| present(dx, dy, dz).then_some((dx, dy, dz));
         let extract = |(dx, dy, dz): (i32, i32, i32), lx: usize, ly: usize, lz: usize| {
@@ -335,7 +335,7 @@ mod tests {
         // its own chunk offset and local coord, so a mismatch anywhere in the
         // 18³ halo is distinguishable.
         let present =
-            |dx: i32, dy: i32, dz: i32| !(dx == 1 && dy == 1 && dz == -1) && !(dx == -1 && dy == 0 && dz == 0);
+            |dx: i32, dy: i32, dz: i32| !(dx == 1 && dy == 1 && dz == -1 || dx == -1 && dy == 0 && dz == 0);
         let src_at = |dx: i32, dy: i32, dz: i32| present(dx, dy, dz).then_some((dx, dy, dz));
         let extract = |(dx, dy, dz): (i32, i32, i32), lx: usize, ly: usize, lz: usize| {
             dx * 10_000 + dy * 1_000 + dz * 100 + lx as i32 * 256 + ly as i32 * 16 + lz as i32

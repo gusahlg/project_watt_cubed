@@ -162,12 +162,10 @@ impl ElementStash {
     pub fn revoke(&mut self, elements: &[ElementId]) {
         let mut removed = false;
         for &element in elements {
-            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
-                if *count > 0 {
-                    *count -= 1;
-                    self.total -= 1;
-                    removed = true;
-                }
+            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) && *count > 0 {
+                *count -= 1;
+                self.total -= 1;
+                removed = true;
             }
         }
         if removed {

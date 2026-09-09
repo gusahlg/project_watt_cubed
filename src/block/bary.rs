@@ -45,12 +45,12 @@ impl Bary for Core {
     }
 
     fn axpy(&self, weight: u32, acc: &mut [u32; CORE_FIELD_COUNT]) {
-        for i in 0..CORE_FIELD_COUNT {
+        for (a, v) in acc.iter_mut().zip(self.0) {
             debug_assert!(
-                acc[i].checked_add(self.0[i] as u32 * weight).is_some(),
+                a.checked_add(v as u32 * weight).is_some(),
                 "barycenter channel overflow"
             );
-            acc[i] += self.0[i] as u32 * weight;
+            *a += v as u32 * weight;
         }
     }
 

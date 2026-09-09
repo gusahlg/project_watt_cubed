@@ -63,17 +63,15 @@ macro_rules! elements {
                             $($cf: $cv,)*
                             ..Default::default()
                         },
-                        specials: {
-                            #[allow(unused_mut)]
-                            let mut specials: Vec<$crate::block::element::SpecialProperty> = Vec::new();
-                            $( $( specials.push(
+                        specials: vec![
+                            $( $(
                                 $crate::block::element::SpecialProperty::new(
                                     $crate::block::element::SpecialKind::$svar,
                                     $sval,
-                                )
-                            ); )* )?
-                            specials.into_boxed_slice()
-                        },
+                                ),
+                            )* )?
+                        ]
+                        .into_boxed_slice(),
                     }
                 ),*
             ]

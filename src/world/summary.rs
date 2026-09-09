@@ -43,6 +43,7 @@ pub(in crate::world) struct SseBudget {
 }
 
 impl SseBudget {
+    #[cfg(test)]
     pub fn new(tau_px: f32, k: f32) -> SseBudget {
         SseBudget { tau_px, k }
     }

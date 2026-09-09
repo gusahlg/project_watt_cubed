@@ -1107,10 +1107,8 @@ impl Terrain {
             AIR
         } else {
             let depth = height - wy;
-            if depth <= self.mat.max_scattered_depth {
-                if let Some(ore) = self.ore_at(wx, wy, wz, depth) {
-                    return ore;
-                }
+            if depth <= self.mat.max_scattered_depth && let Some(ore) = self.ore_at(wx, wy, wz, depth) {
+                return ore;
             }
             if let Some(id) = self.cave_wall_at(p, wx, wy, wz, depth) {
                 return id;
@@ -1332,6 +1330,7 @@ impl Terrain {
 
     /// One chunk's storage from shared column profiles — the `cy`-varying half of
     /// generation (height-band + region shortcuts, then the dense fill).
+    #[allow(clippy::too_many_arguments)] // column stats stay unpacked so the fill can early-out per bound
     fn fill_chunk(
         &self,
         x0: i32,
@@ -1381,11 +1380,9 @@ impl Terrain {
                 let height = p.height;
 
                 isl = [false; CHUNK_SIZE + 4];
-                if islands_possible {
-                    if let Some(col) = self.islands.column(wx, wz, y0, y1 + 4) {
-                        for (k, cell) in isl.iter_mut().enumerate() {
-                            *cell = self.islands.solid_col(&col, y0 + k as i32);
-                        }
+                if islands_possible && let Some(col) = self.islands.column(wx, wz, y0, y1 + 4) {
+                    for (k, cell) in isl.iter_mut().enumerate() {
+                        *cell = self.islands.solid_col(&col, y0 + k as i32);
                     }
                 }
 

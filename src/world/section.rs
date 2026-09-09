@@ -596,8 +596,8 @@ mod tests {
     #[test]
     fn extraction_matches_the_generator_sweep_for_every_class() {
         let b = blocks();
-        let cases: [(&str, i32, i32, Option<(i32, i32)>); 6] = [
-            ("uniform-air", 0, 0, None),
+        let cases = [
+            ("uniform-air", 0, 0, None::<(i32, i32)>),
             ("deep-ground", 400, 0, None),
             ("water-covered", 30, 60, None),
             ("shore", 40, 40, None),
@@ -771,7 +771,7 @@ mod tests {
             deep: b.air,
         };
         let sec = extract(FINEST, &r#gen, &[]);
-        assert!(column_ids(&sec, 3, 11).iter().any(|&c| c == b.stone), "marker missing at its true column (3, 11)");
+        assert!(column_ids(&sec, 3, 11).contains(&b.stone), "marker missing at its true column (3, 11)");
         assert!(column_ids(&sec, 11, 3).iter().all(|&c| c == AIR), "marker leaked to the transposed column (11, 3)");
     }
 

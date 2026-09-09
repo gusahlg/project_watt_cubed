@@ -70,7 +70,7 @@ impl Mod for InfiniteDiffusionMod {
         match index {
             0 => {
                 let next = [16, 32, 64];
-                self.cfg.tile = step_choice(&next, self.cfg.tile as i32, delta) as u32;
+                self.cfg.tile = step_choice(&next, self.cfg.tile as i32, delta);
                 if self.cfg.stride > self.cfg.tile {
                     self.cfg.stride = self.cfg.tile / 2;
                 }

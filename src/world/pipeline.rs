@@ -398,10 +398,12 @@ impl ViewGate {
     }
 
     /// Publish the far-field horizon (metres from the eye).
+    #[cfg(test)]
     fn set_far(&self, metres: f64) {
         self.far_m.store(metres.to_bits(), Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn set_velocity(&self, x: f64, z: f64) {
         self.vel_x.store(x.to_bits(), Ordering::Relaxed);
         self.vel_z.store(z.to_bits(), Ordering::Relaxed);

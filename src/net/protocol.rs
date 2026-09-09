@@ -608,7 +608,7 @@ mod tests {
             }
             let mut grown = frame.clone();
             grown.push(rng.byte());
-            assert_eq!(ClientMessage::decode(&grown).is_some() && ServerMessage::decode(&grown).is_some(), false);
+            assert!(!(ClientMessage::decode(&grown).is_some() && ServerMessage::decode(&grown).is_some()));
             decode_must_not_panic(&grown);
             if frame.is_empty() {
                 continue;

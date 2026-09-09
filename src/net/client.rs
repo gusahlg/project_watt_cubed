@@ -410,6 +410,7 @@ fn coalesce_positions(out: &mut Vec<Incoming>) {
     });
 }
 
+#[allow(clippy::too_many_arguments)] // unpacks one server message into the session's live fields
 fn apply_server_message(
     msg: ServerMessage,
     spawn: DVec3,
@@ -520,10 +521,8 @@ fn apply_server_message(
                 out.push(Incoming::PeerSwing { id });
             }
             ServerMessage::Pong { nonce } => {
-                if let Some((sent_nonce, at)) = *ping_sent {
-                    if sent_nonce == nonce {
-                        *ping_ms = Some(at.elapsed().as_millis() as u32);
-                    }
+                if let Some((sent_nonce, at)) = *ping_sent && sent_nonce == nonce {
+                    *ping_ms = Some(at.elapsed().as_millis() as u32);
                 }
             }
             ServerMessage::Reject { reason: _ } => {
@@ -694,7 +693,7 @@ mod tests {
         );
 
         // Global chat reaches everyone regardless of distance.
-        a.send_chat(crate::net::chat::GLOBAL, "hello".into());
+        a.send_chat(crate::net::chat::GLOBAL, "hello");
         thread::sleep(Duration::from_millis(150));
         let events = b.poll();
         assert!(

@@ -87,6 +87,7 @@ impl SaveSnapshot {
 
     /// Empty overlay, air-only palette — writer-lifecycle tests that must not
     /// construct a `World`.
+    #[cfg(test)]
     pub(crate) fn empty(meta: SaveMeta, player: PlayerState) -> Self {
         Self {
             overlay: FastMap::default(),

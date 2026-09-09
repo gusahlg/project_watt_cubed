@@ -284,6 +284,7 @@ impl TerrainGenerator for DiffusionTerrain {
             .unwrap_or_else(|| ChunkData::from_cells(Box::new([AIR; super::chunk::CHUNK_VOLUME])))
     }
 
+    #[allow(clippy::needless_range_loop)] // lx/lz are world-space offsets, not just array indices
     fn generate_column(
         &self,
         cx: i32,
@@ -456,8 +457,7 @@ mod tests {
         use std::time::Instant;
         let n = 16i32;
         for phases in [2u32, 3, 4, 6] {
-            let mut cfg = DiffusionCfg::default();
-            cfg.phases = phases;
+            let cfg = DiffusionCfg { phases, ..Default::default() };
             let g = super::diffusion(&mut BlockRegistry::with_builtins(), 42, cfg);
             let t = Instant::now();
             for cz in 0..n {

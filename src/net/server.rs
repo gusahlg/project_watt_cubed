@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -615,14 +615,9 @@ fn handle_client(
             if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
                 return;
             }
-            loop {
-                match rx.try_recv() {
-                    Ok(frame) => {
-                        if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            while let Ok(frame) = rx.try_recv() {
+                if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+                    return;
                 }
             }
         }
@@ -935,6 +930,7 @@ fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<PendingSend>) {
 /// Hook bodies run **outside** the [`State`] lock: facts are collected under
 /// it, the lock is dropped, then the table is called. With no hooks installed
 /// the lock is never dropped, matching the pre-seam path.
+#[allow(clippy::too_many_arguments)] // edit validation takes each protocol field separately
 fn on_edit(
     shared: &Arc<Mutex<State>>,
     hooks: Option<&Mutex<hooks::Table>>,
@@ -1080,10 +1076,8 @@ fn on_voice(shared: &Arc<Mutex<State>>, id: u32, seq: u32, payload: protocol::Vo
     let Some(speaker) = state.players.get(&id) else { return };
     // `visible` IS the interest audience; no separate distance scan needed.
     for &pid in &speaker.visible {
-        if let Some(other) = state.players.get(&pid) {
-            if other.ready {
-                let _ = other.out.try_send(frame.clone());
-            }
+        if let Some(other) = state.players.get(&pid) && other.ready {
+            let _ = other.out.try_send(frame.clone());
         }
     }
 }

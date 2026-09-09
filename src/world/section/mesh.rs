@@ -201,6 +201,7 @@ fn occluder(quad: &DenseQuad<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, 
 /// uses. `idx` is the cell's flat index; every probe is a stride add off it.
 #[inline]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // 3×3 stencil: du/dv are both indices and signed offsets
 fn face_sample(
     quad: &DenseQuad<'_>,
     tables: &HotTables,
@@ -639,7 +640,7 @@ mod tests {
         build_section_mesh(section, tables)
     }
 
-    fn all_quads<'a>(mesh: &'a [SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &'a [MeshVertex])> {
+    fn all_quads(mesh: &[SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &[MeshVertex])> {
         mesh.iter().flatten().flat_map(|(origin, data)| {
             Pass::ALL.into_iter().flat_map(move |p| {
                 data[p].vertices().chunks_exact(4).map(move |q| (*origin, p, q))
@@ -664,7 +665,7 @@ mod tests {
                     let l = v.local_pos();
                     [l[0] + origin.x as f32, l[1] + origin.y as f32, l[2] + origin.z as f32]
                 })
-                .collect();
+                .collect::<Vec<_>>();
             let c = cross(sub(p[1], p[0]), sub(p[3], p[0]));
             let d = q[0].normal().direction();
             let dot = c[0] * d[0] as f32 + c[1] * d[1] as f32 + c[2] * d[2] as f32;
@@ -719,7 +720,7 @@ mod tests {
                     dirt
                 } else if y < 100 {
                     grass
-                } else if y >= 108 && y < 112 && x < 48 {
+                } else if (108..112).contains(&y) && x < 48 {
                     stone
                 } else {
                     AIR
@@ -828,7 +829,7 @@ mod tests {
     #[test]
     fn fused_extract_mesh_matches_the_storage_path_exactly() {
         let (_r, tables, b) = setup();
-        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+        let flatten = |m: &[SectionMeshData; 4]| {
             m.iter()
                 .flatten()
                 .flat_map(|(o, d)| {
@@ -836,7 +837,7 @@ mod tests {
                         (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
 
         // Edits inside the finest section footprint, exercising every
@@ -902,7 +903,7 @@ mod tests {
         let sec = extract(FINEST, &r#gen);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);
-        let flatten = |m: &[SectionMeshData; 4]| -> Vec<(u32, u32, u32, u8, Vec<MeshVertex>, [Vec<u32>; 6])> {
+        let flatten = |m: &[SectionMeshData; 4]| {
             m.iter()
                 .flatten()
                 .flat_map(|(o, d)| {
@@ -910,7 +911,7 @@ mod tests {
                         (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
         assert_eq!(flatten(&a), flatten(&b), "same section must mesh bit-identically");
     }

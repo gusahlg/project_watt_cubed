@@ -363,25 +363,19 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
         let tag = view.tag_at(sel);
         // Edit has priority so chars/backspace don't trigger nav.
         for i in intents {
-            if let Intent::Edit(op) = i {
-                if let Some(t) = tag {
-                    return Some(Msg::Edited(t, *op));
-                }
+            if let Intent::Edit(op) = i && let Some(t) = tag {
+                return Some(Msg::Edited(t, *op));
             }
         }
         // Adjust moves the caret.
         for i in intents {
-            if let Intent::Adjust(d) = i {
-                if let Some(t) = tag {
-                    let op = if *d == Dir::Prev { TextOp::Left } else { TextOp::Right };
-                    return Some(Msg::Edited(t, op));
-                }
+            if let Intent::Adjust(d) = i && let Some(t) = tag {
+                let op = if *d == Dir::Prev { TextOp::Left } else { TextOp::Right };
+                return Some(Msg::Edited(t, op));
             }
         }
-        if confirm(intents) {
-            if let Some(a) = view.default {
-                return Some(Msg::Pick(a));
-            }
+        if confirm(intents) && let Some(a) = view.default {
+            return Some(Msg::Pick(a));
         }
         if cancel(intents) {
             return Some(Msg::Back);
@@ -417,10 +411,8 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
                 return Some(Msg::Step(tag, Dir::Next));
             }
         }
-        Some(RowKind::Action) => {
-            if confirm(intents) {
-                return Some(Msg::Pick(tag));
-            }
+        Some(RowKind::Action) if confirm(intents) => {
+            return Some(Msg::Pick(tag));
         }
         _ => {}
     }

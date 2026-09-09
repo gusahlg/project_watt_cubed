@@ -298,8 +298,7 @@ mod fingerprint_tests {
     fn classic_fingerprint_ignores_diffusion_knobs() {
         let a = content_fingerprint();
         let b = content_fingerprint_kind(WorldgenKind::Classic);
-        let mut cfg = DiffusionCfg::default();
-        cfg.tile = 64;
+        let cfg = DiffusionCfg { tile: 64, ..Default::default() };
         let c = content_fingerprint_kind_cfg(WorldgenKind::Classic, cfg);
         assert_eq!(a, b);
         assert_eq!(a, c);
@@ -310,8 +309,7 @@ mod fingerprint_tests {
         let classic = content_fingerprint();
         let diff = content_fingerprint_kind(WorldgenKind::Diffusion);
         assert_ne!(classic, diff);
-        let mut cfg = DiffusionCfg::default();
-        cfg.phases = 8;
+        let cfg = DiffusionCfg { phases: 8, ..Default::default() };
         assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
     }
 }

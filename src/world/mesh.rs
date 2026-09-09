@@ -364,6 +364,7 @@ fn sweep(
 /// and the settled light shell for per-corner sky/block. `idx` is the cell's
 /// flat padded index; every probe is a stride add off it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // 3×3 stencil: du/dv are both indices and signed offsets
 fn face_sample(
     padded: &Padded,
     tables: &HotTables,
@@ -560,6 +561,7 @@ mod tests {
         let tables = registry.hot_tables();
         // (coord, unlit, full, gradient) — filled from the first `--nocapture` run.
         // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
+        #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
             ((0, 1, 0), 0xb0e2c9fb, 0xb0e2c9fb, 0x897aa7e2),
             ((3, 1, -2), 0x0e6322e1, 0x0e6322e1, 0x5302192d),

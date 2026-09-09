@@ -1330,8 +1330,7 @@ mod tests {
         let path = settings_path();
         assert!(path.starts_with(&crate::paths::Paths::get().config));
         assert_ne!(path, PathBuf::from("saves/settings.cfg"));
-        let mut s = Settings::default();
-        s.fov = 110.0;
+        let s = Settings { fov: 110.0, ..Default::default() };
         s.save();
         assert!(path.exists());
         let loaded = Settings::load();
