@@ -270,39 +270,83 @@ impl App {
             }
             return true;
         }
-        let Screen::Playing(game) = &mut self.screen else {
+        // One unsampled frame after Complete has presented; capture that image
+        // (blocking) before the report so the readback is outside the samples.
+        if self
+            .bench
+            .as_ref()
+            .expect("bench exists")
+            .measurement_complete()
+        {
+            return self.finish_bench(eng);
+        }
+        {
+            let Screen::Playing(game) = &mut self.screen else {
+                return true;
+            };
+            // A slow spin (`WATT_BENCH_YAW`, default 0.4 rad/s; 0 = static) sweeps
+            // the frustum; an optional flight along +X (`WATT_BENCH_MOVE`)
+            // exercises paths a parked camera never touches.
+            let yaw_rate = self.bench.as_ref().expect("bench exists").yaw_rate() as f32;
+            game.player_mut().orientation.yaw += yaw_rate * dt;
+            self.bench
+                .as_ref()
+                .expect("bench exists")
+                .apply_move(game.player_mut(), dt);
+
+            let step = self.bench.as_mut().expect("bench exists").step(
+                dt,
+                game.world().entry_complete(),
+                game.world().stream_gauges(),
+            );
+            match step {
+                BenchmarkStep::ReadyTimeout => {
+                    eprintln!("{}", game.world().entry_debug());
+                    return true;
+                }
+                BenchmarkStep::Warming => {
+                    if !game.world().entry_complete()
+                        && self.bench.as_mut().expect("bench exists").wait_log_due()
+                    {
+                        eprintln!(
+                            "benchmark: waiting for world ({})",
+                            game.world().entry_debug()
+                        );
+                    }
+                    return true;
+                }
+                BenchmarkStep::Measuring => return true,
+                BenchmarkStep::Complete => {
+                    if self
+                        .bench
+                        .as_ref()
+                        .expect("bench exists")
+                        .screenshot_path()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.finish_bench(eng)
+    }
+
+    /// Capture the last presented frame if requested, then emit the report.
+    fn finish_bench(&mut self, eng: &mut Engine) -> bool {
+        let Screen::Playing(game) = &self.screen else {
             return true;
         };
-        // A slow spin sweeps the frustum across the terrain like a player would;
-        // an optional flight along +X (`WATT_BENCH_MOVE`) exercises the paths a
-        // static camera never touches (shadow-cascade re-render, streaming).
-        game.player_mut().orientation.yaw += 0.4 * dt;
-        self.bench.as_ref().expect("bench exists").apply_move(game.player_mut(), dt);
-
-        let bench = self.bench.as_mut().expect("bench exists");
-        let step = bench.step(
-            dt,
-            game.world().entry_complete(),
-            game.world().stream_gauges(),
+        self.bench
+            .as_ref()
+            .expect("bench exists")
+            .capture_screenshot(eng);
+        let report = self.bench.as_mut().expect("bench exists").finish(
+            &self.settings,
+            eng,
+            game.world(),
+            game.player().position,
         );
-        match step {
-            BenchmarkStep::ReadyTimeout => {
-                eprintln!("{}", game.world().entry_debug());
-                return true;
-            }
-            BenchmarkStep::Warming => {
-                if !game.world().entry_complete() && bench.wait_log_due() {
-                    eprintln!(
-                        "benchmark: waiting for world ({})",
-                        game.world().entry_debug()
-                    );
-                }
-                return true;
-            }
-            BenchmarkStep::Measuring => return true,
-            BenchmarkStep::Complete => {}
-        }
-        let report = bench.finish(&self.settings, eng, game.world(), game.player().position);
         report.emit();
         false
     }

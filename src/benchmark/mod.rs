@@ -3,15 +3,25 @@
 //! `WATT_BENCH=<seconds>` remains the entry switch. A run now waits for both a
 //! minimum warmup and world readiness (with a bounded timeout), records frame
 //! and streaming distributions, inventories the machine without optional
-//! command-line tools, and emits one stable JSON record. Set
-//! `WATT_BENCH_OUTPUT=<path>` to append the same JSON as JSONL.
+//! command-line tools, and emits one stable JSON record.
+//!
+//! Environment:
+//! - `WATT_BENCH_OUTPUT=<path>` appends the same JSON as JSONL.
+//! - `WATT_BENCH_SCREENSHOT=<path.png>` writes the final presented frame after
+//!   the measured window (blocking engine capture; failure does not drop the report).
+//! - `WATT_BENCH_YAW=<rad/s>` steady-rotate rate (default 0.4; `0` = static camera).
+//! - `WATT_BENCH_MOVE=<m/s>` +X flight speed (default 0, static camera).
+//! - `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, `WATT_BENCH_TAG`,
+//!   `WATT_BENCH_POS`, `WATT_BENCH_PRESET`, `WATT_BENCH_SEED`,
+//!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_PROFILE`,
+//!   `WATT_BENCH_GPU` — see `documentation/performance.md`.
 
 mod json;
 mod system;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{DVec3, Engine};
@@ -25,6 +35,7 @@ use system::{SystemInfo, display_json, resident_bytes, settings_json, software_j
 const DEFAULT_DURATION_SECS: f64 = 10.0;
 const DEFAULT_WARMUP_SECS: f64 = 3.0;
 const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;
+const DEFAULT_YAW_RATE_RAD_S: f64 = 0.4;
 const MAX_DURATION_SECS: f64 = 600.0;
 const MAX_SAMPLE_RESERVE: usize = 2_000_000;
 const SCHEMA_VERSION: u32 = 2;
@@ -44,6 +55,7 @@ enum Phase {
     WaitingToStart,
     Warming,
     Measuring,
+    Complete,
 }
 
 /// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
@@ -64,6 +76,11 @@ pub struct Benchmark {
     /// Flight speed along +X during the run (`WATT_BENCH_MOVE`, m/s); zero
     /// keeps the classic static steady-rotate scenario.
     move_mps: f64,
+    /// Steady-rotate rate (`WATT_BENCH_YAW`, rad/s); zero holds the camera.
+    yaw_rate: f64,
+    /// Final presented-frame PNG (`WATT_BENCH_SCREENSHOT`); captured after
+    /// the last sample, never during it.
+    screenshot: Option<PathBuf>,
     output: Option<PathBuf>,
     tag: Option<String>,
     visuals_raw: Option<String>,
@@ -82,6 +99,9 @@ pub struct Benchmark {
     rss_peak_bytes: Option<u64>,
     last_rss_poll: Instant,
     ready_wait_logs: u32,
+    /// Wall time of the measured window, frozen at `Step::Complete` so a
+    /// later screenshot readback cannot inflate `wall_seconds`.
+    measured_wall: Option<Duration>,
 }
 
 impl Benchmark {
@@ -110,6 +130,8 @@ impl Benchmark {
             })
         });
         let move_mps = env_seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
+        let yaw_rate = env_seconds("WATT_BENCH_YAW", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0);
+        let screenshot = parse_screenshot(std::env::var_os("WATT_BENCH_SCREENSHOT"));
         let output = std::env::var_os("WATT_BENCH_OUTPUT")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -126,6 +148,8 @@ impl Benchmark {
             ready_timeout: Duration::from_secs_f64(ready_timeout),
             pos,
             move_mps,
+            yaw_rate,
+            screenshot,
             output,
             tag,
             visuals_raw,
@@ -144,6 +168,7 @@ impl Benchmark {
             rss_peak_bytes: None,
             last_rss_poll: now,
             ready_wait_logs: 0,
+            measured_wall: None,
         })
     }
 
@@ -192,6 +217,21 @@ impl Benchmark {
     /// Flight speed along +X (m/s); zero for the static scenario.
     pub fn move_mps(&self) -> f64 {
         self.move_mps
+    }
+
+    /// Steady-rotate rate (rad/s); zero holds yaw.
+    pub fn yaw_rate(&self) -> f64 {
+        self.yaw_rate
+    }
+
+    /// PNG path for the post-measure capture, if requested.
+    pub fn screenshot_path(&self) -> Option<&Path> {
+        self.screenshot.as_deref()
+    }
+
+    /// True after the last sample; the next `bench_frame` may capture then finish.
+    pub fn measurement_complete(&self) -> bool {
+        self.phase == Phase::Complete
     }
 
     /// Translate the player along +X for a move-scenario run. Flight is forced
@@ -281,11 +321,34 @@ impl Benchmark {
                     .elapsed()
                     >= self.duration
                 {
+                    self.measured_wall = Some(
+                        self.measure_started
+                            .expect("measurement clock set")
+                            .elapsed(),
+                    );
+                    self.phase = Phase::Complete;
                     Step::Complete
                 } else {
                     Step::Measuring
                 }
             }
+            Phase::Complete => Step::Complete,
+        }
+    }
+
+    /// Blocking capture of the last presented frame. No-op if unset. Prints one
+    /// line on failure; the caller still emits the report.
+    pub fn capture_screenshot(&self, eng: &mut Engine) {
+        let Some(path) = &self.screenshot else {
+            return;
+        };
+        let write = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| voxel_engine::skeleton::screenshot_to(eng, path));
+        if let Err(err) = write {
+            eprintln!("benchmark: screenshot failed: {err}");
         }
     }
 
@@ -302,7 +365,9 @@ impl Benchmark {
         if let Some(rss) = rss_end_bytes {
             self.rss_peak_bytes = Some(self.rss_peak_bytes.unwrap_or(0).max(rss));
         }
-        let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
+        let wall = self.measured_wall.unwrap_or_else(|| {
+            self.measure_started.map_or(Duration::ZERO, |t| t.elapsed())
+        });
         let stats = FrameStats::from_samples(&self.samples, wall);
         let visuals = self.visuals_raw.clone();
         let report = Json::object(vec![
@@ -334,7 +399,8 @@ impl Benchmark {
                     ("visuals", Json::optional_str(visuals.as_deref())),
                     ("requested_position", position_json(self.pos)),
                     ("actual_position", position_json(Some(actual_position))),
-                    ("yaw_rate_rad_s", Json::number(0.4)),
+                    ("yaw_rate_rad_s", Json::number(self.yaw_rate)),
+                    ("screenshot", path_json(self.screenshot.as_deref())),
                     (
                         "requested_duration_s",
                         Json::number(self.duration.as_secs_f64()),
@@ -667,6 +733,14 @@ fn position_json(pos: Option<DVec3>) -> Json {
     })
 }
 
+fn path_json(path: Option<&Path>) -> Json {
+    path.map_or(Json::Null, |p| Json::from(p.to_string_lossy().as_ref()))
+}
+
+fn parse_screenshot(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
 fn parse_bench_worldgen(value: &str) -> Option<bool> {
     match value {
@@ -780,6 +854,8 @@ mod tests {
             ready_timeout,
             pos: None,
             move_mps: 0.0,
+            yaw_rate: DEFAULT_YAW_RATE_RAD_S,
+            screenshot: None,
             output: None,
             tag: None,
             visuals_raw: None,
@@ -798,6 +874,7 @@ mod tests {
             rss_peak_bytes: None,
             last_rss_poll: Instant::now(),
             ready_wait_logs: 0,
+            measured_wall: None,
         }
     }
 
@@ -836,4 +913,158 @@ mod tests {
         assert_eq!(parse_bench_visuals("full"), Some(false));
         assert_eq!(parse_bench_visuals("pretty"), None);
     }
+
+    #[test]
+    fn move_and_yaw_parse_like_seconds() {
+        assert_eq!(parse_seconds("WATT_BENCH_MOVE", "0", 0.0, 0.0, 1000.0), 0.0);
+        assert_eq!(parse_seconds("WATT_BENCH_MOVE", "40", 0.0, 0.0, 1000.0), 40.0);
+        assert_eq!(parse_seconds("WATT_BENCH_MOVE", "-5", 0.0, 0.0, 1000.0), 0.0);
+        assert_eq!(
+            parse_seconds("WATT_BENCH_MOVE", "nope", 0.0, 0.0, 1000.0),
+            0.0
+        );
+        assert_eq!(
+            parse_seconds("WATT_BENCH_YAW", "0", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0),
+            0.0
+        );
+        assert_eq!(
+            parse_seconds(
+                "WATT_BENCH_YAW",
+                "0.4",
+                DEFAULT_YAW_RATE_RAD_S,
+                0.0,
+                1000.0
+            ),
+            0.4
+        );
+        assert_eq!(
+            parse_seconds(
+                "WATT_BENCH_YAW",
+                "not-a-number",
+                DEFAULT_YAW_RATE_RAD_S,
+                0.0,
+                1000.0
+            ),
+            DEFAULT_YAW_RATE_RAD_S
+        );
+        assert_eq!(
+            parse_seconds("WATT_BENCH_YAW", "1e9", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0),
+            1000.0
+        );
+    }
+
+    #[test]
+    fn screenshot_env_is_a_png_path_or_absent() {
+        assert_eq!(parse_screenshot(None), None);
+        assert_eq!(parse_screenshot(Some(std::ffi::OsString::from(""))), None);
+        assert_eq!(
+            parse_screenshot(Some(std::ffi::OsString::from("captures/final.png"))),
+            Some(PathBuf::from("captures/final.png"))
+        );
+    }
+
+    #[test]
+    fn scenario_report_includes_screenshot_and_live_yaw_rate() {
+        assert_eq!(path_json(None).render(), "null");
+        assert_eq!(
+            path_json(Some(Path::new("out.png"))).render(),
+            "\"out.png\""
+        );
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.yaw_rate = 0.0;
+        bench.screenshot = Some(PathBuf::from("shot.png"));
+        assert_eq!(
+            Json::object(vec![
+                ("yaw_rate_rad_s", Json::number(bench.yaw_rate)),
+                ("screenshot", path_json(bench.screenshot.as_deref())),
+            ])
+            .render(),
+            "{\"yaw_rate_rad_s\":0,\"screenshot\":\"shot.png\"}"
+        );
+        bench.screenshot = None;
+        bench.yaw_rate = DEFAULT_YAW_RATE_RAD_S;
+        assert_eq!(
+            Json::object(vec![
+                ("yaw_rate_rad_s", Json::number(bench.yaw_rate)),
+                ("screenshot", path_json(bench.screenshot.as_deref())),
+            ])
+            .render(),
+            "{\"yaw_rate_rad_s\":0.4,\"screenshot\":null}"
+        );
+    }
+
+    #[test]
+    fn complete_is_sticky_and_does_not_sample_further() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.begin();
+        bench.warmup_started = Some(Instant::now() - Duration::from_secs(1));
+        let gauges = StreamGauges::default();
+        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        bench.measure_started = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(bench.step(0.016, true, gauges), Step::Complete);
+        assert!(bench.measurement_complete());
+        assert_eq!(bench.samples.len(), 1);
+        assert!(bench.measured_wall.is_some());
+        assert_eq!(bench.step(0.016, true, gauges), Step::Complete);
+        assert_eq!(bench.samples.len(), 1);
+    }
+
+    #[test]
+    fn from_env_parses_screenshot_yaw_and_move() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let keys = [
+            "WATT_BENCH",
+            "WATT_BENCH_SCREENSHOT",
+            "WATT_BENCH_YAW",
+            "WATT_BENCH_MOVE",
+        ];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        unsafe {
+            std::env::set_var("WATT_BENCH", "1");
+            std::env::remove_var("WATT_BENCH_SCREENSHOT");
+            std::env::remove_var("WATT_BENCH_YAW");
+            std::env::remove_var("WATT_BENCH_MOVE");
+        }
+        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        assert!(bench.screenshot_path().is_none());
+        assert!((bench.yaw_rate() - DEFAULT_YAW_RATE_RAD_S).abs() < 1e-12);
+        assert_eq!(bench.move_mps(), 0.0);
+
+        unsafe {
+            std::env::set_var("WATT_BENCH_SCREENSHOT", "captures/final.png");
+            std::env::set_var("WATT_BENCH_YAW", "0");
+            std::env::set_var("WATT_BENCH_MOVE", "40");
+        }
+        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        assert_eq!(
+            bench.screenshot_path(),
+            Some(Path::new("captures/final.png"))
+        );
+        assert_eq!(bench.yaw_rate(), 0.0);
+        assert_eq!(bench.move_mps(), 40.0);
+
+        unsafe {
+            std::env::set_var("WATT_BENCH_SCREENSHOT", "");
+            std::env::set_var("WATT_BENCH_YAW", "not-a-number");
+            std::env::set_var("WATT_BENCH_MOVE", "-5");
+        }
+        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        assert!(bench.screenshot_path().is_none());
+        assert!((bench.yaw_rate() - DEFAULT_YAW_RATE_RAD_S).abs() < 1e-12);
+        assert_eq!(bench.move_mps(), 0.0);
+
+        for (k, v) in previous {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
