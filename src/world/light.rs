@@ -113,6 +113,23 @@ impl LightGrid {
         Self(Repr::Uniform(Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }))
     }
 
+    /// Any face-border lumel has blocklight `> 1` (level 1 attenuates to 0
+    /// crossing in, so it cannot seed a neighbour). Uniform is one compare;
+    /// dense scans the six faces.
+    pub(in crate::world) fn has_border_blocklight(&self) -> bool {
+        match &self.0 {
+            Repr::Uniform(v) => v.block.get() > 1,
+            Repr::Cells(cells) => Face::ALL.iter().any(|&face| {
+                face_cells(face).any(|(ci, _)| {
+                    cells[Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize)]
+                        .block
+                        .get()
+                        > 1
+                })
+            }),
+        }
+    }
+
     #[inline]
     pub fn at(&self, idx: usize) -> Lumel {
         match &self.0 {
@@ -337,23 +354,29 @@ impl FaceShell {
 #[derive(Clone)]
 pub struct CeilingWindow {
     surface: [i32; CHUNK_AREA],
+    /// Lowest world Y at which every column is open sky — `max` of `surface`.
+    /// `all_open` for a chunk at `world_y0` is the one compare `world_y0 >= min_surface`.
+    min_surface: i32,
 }
 
 impl CeilingWindow {
     /// Compute surface height per column via generator callback.
     pub fn from_heights(mut height: impl FnMut(usize, usize) -> i32) -> Self {
         let mut surface = [0i32; CHUNK_AREA];
+        let mut min_surface = i32::MIN;
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
-                surface[lx + lz * CHUNK_SIZE] = height(lx, lz);
+                let h = height(lx, lz);
+                surface[lx + lz * CHUNK_SIZE] = h;
+                min_surface = min_surface.max(h);
             }
         }
-        Self { surface }
+        Self { surface, min_surface }
     }
 
     /// Everything open to the sky — for tests and the neutral path.
     pub fn open() -> Self {
-        Self { surface: [i32::MIN; CHUNK_AREA] }
+        Self { surface: [i32::MIN; CHUNK_AREA], min_surface: i32::MIN }
     }
 
     #[inline]
@@ -361,12 +384,20 @@ impl CeilingWindow {
         world_y >= self.surface[lx + lz * CHUNK_SIZE]
     }
 
+    /// Lowest world Y at which every column is open sky.
+    #[inline]
+    pub(in crate::world) fn min_surface(&self) -> i32 {
+        self.min_surface
+    }
+
     /// Raise one column's ceiling to at least `surface` (a constructed opaque
     /// roof: open sky begins at the cell ABOVE it). Never lowers — the
-    /// generator ground below stays the floor of the value.
+    /// generator ground below stays the floor of the value. The all-open Y
+    /// can only stay or rise.
     pub(in crate::world) fn raise(&mut self, lx: usize, lz: usize, surface: i32) {
         let cell = &mut self.surface[lx + lz * CHUNK_SIZE];
         *cell = (*cell).max(surface);
+        self.min_surface = self.min_surface.max(*cell);
     }
 
     /// The Y at which this column becomes open sky (see [`open_above`](Self::open_above)).
@@ -708,6 +739,67 @@ mod tests {
             "{N} propagates in {:.3}s = {:.0} settles/s",
             dt.as_secs_f64(),
             N as f64 / dt.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn min_surface_is_the_all_open_y() {
+        let c = CeilingWindow::from_heights(|lx, lz| 10 + (lx + lz) as i32);
+        assert_eq!(c.min_surface(), 10 + 2 * (CHUNK_SIZE as i32 - 1));
+        let y0 = c.min_surface();
+        assert!(
+            (0..CHUNK_SIZE).all(|lz| (0..CHUNK_SIZE).all(|lx| c.open_above(lx, lz, y0))),
+            "y0 >= min_surface ⇒ every column is open"
+        );
+        assert!(
+            !(0..CHUNK_SIZE).all(|lz| (0..CHUNK_SIZE).all(|lx| c.open_above(lx, lz, y0 - 1))),
+            "one below min_surface is not all-open"
+        );
+        let mut raised = CeilingWindow::from_heights(|_, _| 10);
+        assert_eq!(raised.min_surface(), 10);
+        raised.raise(0, 0, 40);
+        assert_eq!(raised.min_surface(), 40);
+        raised.raise(1, 1, 20);
+        assert_eq!(raised.min_surface(), 40, "a lower raise must not drop the all-open Y");
+    }
+
+    #[test]
+    fn border_blocklight_ignores_interior_and_level_one() {
+        assert!(!LightGrid::dark().has_border_blocklight());
+        assert!(!LightGrid::open_sky().has_border_blocklight());
+        assert!(LightGrid::full().has_border_blocklight());
+        let mut g = LightGrid::dark();
+        g.set(
+            Chunk::index(0, 8, 8),
+            Lumel {
+                sky: LightLevel::DARK,
+                block: LightLevel::new(15),
+            },
+        );
+        assert!(g.has_border_blocklight());
+        let mut g = LightGrid::dark();
+        g.set(
+            Chunk::index(8, 8, 8),
+            Lumel {
+                sky: LightLevel::DARK,
+                block: LightLevel::new(15),
+            },
+        );
+        assert!(
+            !g.has_border_blocklight(),
+            "interior-only blocklight cannot seed a neighbour"
+        );
+        let mut g = LightGrid::dark();
+        g.set(
+            Chunk::index(0, 8, 8),
+            Lumel {
+                sky: LightLevel::DARK,
+                block: LightLevel::new(1),
+            },
+        );
+        assert!(
+            !g.has_border_blocklight(),
+            "level 1 attenuates to 0 crossing the border"
         );
     }
 

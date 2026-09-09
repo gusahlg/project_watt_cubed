@@ -48,6 +48,7 @@ impl World {
             // The next full pass must probe the WHOLE new box (a grown radius
             // exposes chunks the old shell diff would skip).
             self.prev_mesh_box = None;
+            self.prev_unload_box = None;
             self.pending_fresh.set();
             // On shrink, meshes between the new radius and the (also shrunk)
             // unload ring would otherwise stay drawn until the player moves;

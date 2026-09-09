@@ -28,6 +28,9 @@ const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;
 const MAX_DURATION_SECS: f64 = 600.0;
 const MAX_SAMPLE_RESERVE: usize = 2_000_000;
 const SCHEMA_VERSION: u32 = 2;
+/// Readiness, stream gauges, and RSS are sampled at this rate on the bench
+/// wall clock. Peak gauges are therefore 4 Hz samples, not per-frame maxima.
+const WORLD_SAMPLE_HZ: u32 = 4;
 
 /// What the app should do after advancing the recorder by one callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +75,8 @@ pub struct Benchmark {
     rss_peak_bytes: Option<u64>,
     last_rss_poll: Instant,
     ready_wait_logs: u32,
+    world_sampled_at: Option<Instant>,
+    cached_ready: bool,
 }
 
 impl Benchmark {
@@ -132,6 +137,8 @@ impl Benchmark {
             rss_peak_bytes: None,
             last_rss_poll: now,
             ready_wait_logs: 0,
+            world_sampled_at: None,
+            cached_ready: false,
         })
     }
 
@@ -182,12 +189,28 @@ impl Benchmark {
         }
     }
 
+    /// Sample world readiness and stream gauges at [`WORLD_SAMPLE_HZ`]. Peaks
+    /// recorded from these samples are 4 Hz, not per-frame maxima. Also
+    /// refreshes RSS on the same cadence so `/proc` is not read every frame.
+    pub fn poll_world(&mut self, world: &World) -> (bool, StreamGauges) {
+        let period = Duration::from_secs_f64(1.0 / f64::from(WORLD_SAMPLE_HZ));
+        let due = self
+            .world_sampled_at
+            .is_none_or(|t| t.elapsed() >= period);
+        if due {
+            self.world_sampled_at = Some(Instant::now());
+            self.cached_ready = world.entry_complete();
+            self.last_gauges = world.stream_gauges();
+            self.poll_rss();
+        }
+        (self.cached_ready, self.last_gauges)
+    }
+
     /// Advance warmup/measurement using wall time for boundaries and the
     /// engine's previous-frame duration for the sample itself.
     pub fn step(&mut self, dt: f32, world_ready: bool, gauges: StreamGauges) -> Step {
         self.last_gauges = gauges;
         self.peaks.observe(gauges);
-        self.poll_rss();
         match self.phase {
             Phase::WaitingToStart => Step::Warming,
             Phase::Warming => {
@@ -327,6 +350,7 @@ impl Benchmark {
                     ),
                     ("end", stream_gauges_json(self.last_gauges)),
                     ("peaks", self.peaks.to_json()),
+                    ("peaks_sample_hz", Json::from(WORLD_SAMPLE_HZ)),
                 ]),
             ),
         ]);
@@ -501,6 +525,8 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[index]
 }
 
+/// Peak stream gauges observed during the run. Values are 4 Hz wall-clock
+/// samples (see [`WORLD_SAMPLE_HZ`]), not per-frame maxima.
 #[derive(Clone, Copy, Debug)]
 struct StreamPeaks {
     max_chunks: usize,
@@ -710,6 +736,8 @@ mod tests {
             rss_peak_bytes: None,
             last_rss_poll: Instant::now(),
             ready_wait_logs: 0,
+            world_sampled_at: None,
+            cached_ready: false,
         }
     }
 

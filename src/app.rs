@@ -312,19 +312,19 @@ impl App {
             game.player_mut().position.x += move_mps * dt as f64;
         }
 
+        let (ready, gauges) = {
+            let bench = self.bench.as_mut().expect("bench exists");
+            bench.poll_world(game.world())
+        };
         let bench = self.bench.as_mut().expect("bench exists");
-        let step = bench.step(
-            dt,
-            game.world().entry_complete(),
-            game.world().stream_gauges(),
-        );
+        let step = bench.step(dt, ready, gauges);
         match step {
             BenchmarkStep::ReadyTimeout => {
                 eprintln!("{}", game.world().entry_debug());
                 return true;
             }
             BenchmarkStep::Warming => {
-                if !game.world().entry_complete() && bench.wait_log_due() {
+                if !ready && bench.wait_log_due() {
                     eprintln!(
                         "benchmark: waiting for world ({})",
                         game.world().entry_debug()

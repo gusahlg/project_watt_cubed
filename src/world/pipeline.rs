@@ -71,7 +71,7 @@ pub struct LightSnapshot {
     /// Near-face light of the 6 neighbour faces (snapshot at enqueue time).
     pub shell: FaceShell,
     /// The skylight ceiling (surface heightmap) for the chunk's column.
-    pub ceiling: CeilingWindow,
+    pub ceiling: Arc<CeilingWindow>,
     /// World-space Y of the chunk's bottom cell — seeds the open-sky column test.
     pub world_y0: i32,
     /// Hot tables (opaque/emission), shared by refcount like a mesh snapshot's.
@@ -541,11 +541,12 @@ impl Deadline {
 pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(2);
 
 // Each admission producer mints a FRESH `Deadline::from_budget(...)` from its
-// scheduler-provided budget at the instant its `run()` starts — never one
-// frame-start snapshot shared across lanes. The lanes run sequentially
-// (drain → light → mesh → LOD), so a single anchored instant would leave every
-// lane after the first ~1 ms pre-expired and admitting nothing (world-entry
-// starvation). Budgets are admission caps, so idle lanes still return immediately.
+// scheduler-provided budget after its pending gate — never one frame-start
+// snapshot shared across lanes, and never an `Instant::now` on an idle frame.
+// The lanes run sequentially (drain → light → mesh → LOD), so a single
+// anchored instant would leave every lane after the first ~1 ms pre-expired
+// and admitting nothing (world-entry starvation). Budgets are admission caps,
+// so idle lanes still return immediately.
 
 /// Far-queue cap. At the cap [`Workers::submit_far`] REJECTS
 /// the submit (returns `false`) and the lane simply does not claim the key, so
@@ -1668,6 +1669,7 @@ mod tests {
                             connectivity: None,
                             visible: true,
                             light: None,
+                            has_blocklight: false,
                         },
                     );
                 }
@@ -1705,7 +1707,7 @@ mod tests {
             admit::<MeshLane>(
                 &mut world,
                 center,
-                Deadline::from_budget(Duration::from_millis(2)),
+                voxel_engine::producer::Budget::Millis(2.0),
             );
         }
         let dt = start.elapsed();

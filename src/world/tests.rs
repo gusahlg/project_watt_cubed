@@ -288,6 +288,7 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         connectivity: None,
         visible: true,
         light: None,
+        has_blocklight: false,
     }
 }
 
@@ -1301,7 +1302,7 @@ fn light_settle_to_identical_grid_reseeds_evicted_mesh_seed() {
     admit::<MeshLane>(
         &mut world,
         c,
-        pipeline::Deadline::from_budget(std::time::Duration::from_secs(1)),
+        voxel_engine::producer::Budget::Millis(1000.0),
     );
     assert!(!world.mesh_worklist.contains(&c), "admit evicted the blocked seed");
 
@@ -1345,6 +1346,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                         connectivity: None,
                         visible: true,
                         light: None,
+                        has_blocklight: false,
                     },
                 );
             }
@@ -1364,7 +1366,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
     admit::<MeshLane>(
         &mut world,
         center,
-        pipeline::Deadline::from_budget(std::time::Duration::from_secs(1)),
+        voxel_engine::producer::Budget::Millis(1000.0),
     );
     let claimed: Vec<Coord> = ready
         .iter()

@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use voxel_engine::producer::Progress;
+use voxel_engine::producer::{Budget, Progress};
 use voxel_engine::{DVec3, Engine, FadeStyle};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
@@ -423,8 +423,8 @@ impl World {
         // Textures, worker results, and edit remeshes land through the ONE
         // owner of that trio — after the centre update above, so a
         // boundary-cross frame's results drain against the live centre, not
-        // the one they'd be discarded by. (When the game already pumped this
-        // frame, these self-gate down to flag checks.)
+        // the one they'd be discarded by. `stream_phase` pumps only on frames
+        // the topology pass does not run; this is the pump on stream-due frames.
         self.pump(eng, sched);
         if full_pass {
             self.unload_far(center_chunk, eng);
@@ -934,11 +934,12 @@ impl World {
     pub(in crate::world) fn request_region_data(
         &mut self,
         center: Coord,
-        deadline: pipeline::Deadline,
+        budget: Budget,
     ) -> Progress {
         if !self.pending_gen.take() {
             return Progress::Idle;
         }
+        let deadline = super::lanes::paced_deadline(self, budget);
         let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
         let mut consider = |coord: Coord| {
             if self.chunks.contains_key(&coord)
@@ -1357,6 +1358,7 @@ impl World {
                 connectivity: None,
                 visible: true,
                 light: None,
+                has_blocklight: false,
             },
         );
         // Ceiling-cache lifetime: the column's count drops its entry at zero.
@@ -1397,20 +1399,33 @@ impl World {
         self.pending_fresh.set();
     }
 
+    /// Coords in the previous unload box that have left `new_box`, or every
+    /// loaded chunk past `new_box` when there is no previous box (first pass
+    /// or a radius change). Spawn-slab chunks stay.
+    fn unload_leaving(&self, new_box: ChunkBox) -> Vec<Coord> {
+        let keep_spawn = |coord| self.spawn_slab.is_some_and(|slab| slab.contains(coord));
+        match self.prev_unload_box {
+            Some(prev) => prev
+                .coords()
+                .filter(|&coord| !new_box.contains(coord) && !keep_spawn(coord))
+                .filter(|&coord| self.chunks.contains_key(&coord))
+                .collect(),
+            None => self
+                .chunks
+                .keys()
+                .copied()
+                .filter(|&coord| !new_box.contains(coord) && !keep_spawn(coord))
+                .collect(),
+        }
+    }
+
     /// Free chunks past the unload box, releasing their GPU meshes.
     fn unload_far(&mut self, center: Coord, eng: &mut Engine) {
         let unload = self.unload_box(center);
         // Collect-then-remove instead of `retain`: freeing needs `&mut eng`,
         // which can't be borrowed inside a retain closure over `self.chunks`.
-        let far: Vec<Coord> = self
-            .chunks
-            .keys()
-            .copied()
-            .filter(|&coord| {
-                !unload.contains(coord)
-                    && !self.spawn_slab.is_some_and(|slab| slab.contains(coord))
-            })
-            .collect();
+        let far = self.unload_leaving(unload);
+        self.prev_unload_box = Some(unload);
         // A removed chunk changes what the BFS can reach — topology class.
         self.occlusion_topo_dirty.raise(!far.is_empty());
         for &coord in &far {
@@ -1498,19 +1513,46 @@ impl World {
         degraded: bool,
     ) -> (u32, pipeline::ChunkSnapshot) {
         let loaded = &self.chunks[&coord];
+        // One 3×3×3 lookup feeds both the voxel shell and the light shell.
+        let nhood = self.loaded_neighbourhood(coord);
+        let fallback = (self.lighting && degraded).then(light::LightGrid::open_sky);
         (
             loaded.rev,
             pipeline::ChunkSnapshot {
-                padded: self.capture_padded(coord),
+                padded: mesh::Padded::capture(|dx, dy, dz| {
+                    Self::nhood_at(&nhood, dx, dy, dz).map(|l| &*l.chunk)
+                }),
                 uniform: loaded.chunk.uniform(),
                 // Lighting off omits the 18³ shell entirely — the mesher's
-                // unlit path reads constant full light instead.
-                light: self
-                    .lighting
-                    .then(|| self.capture_padded_light(coord, degraded)),
+                // unlit path reads constant full light instead. `open_sky` is
+                // Uniform (task 05): the degraded fallback does not allocate.
+                light: self.lighting.then(|| {
+                    light::PaddedLight::capture(|dx, dy, dz| {
+                        Self::nhood_at(&nhood, dx, dy, dz)
+                            .and_then(|l| l.light.as_ref())
+                            .or(fallback.as_ref())
+                    })
+                }),
                 tables: self.tables.get(),
             },
         )
+    }
+
+    /// The 3×3×3 neighbourhood of `coord`, dx-fast then dy then dz.
+    fn loaded_neighbourhood(&self, coord: Coord) -> [Option<&Loaded>; 27] {
+        let mut nhood = [None; 27];
+        let mut i = 0;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    nhood[i] = self
+                        .chunks
+                        .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz));
+                    i += 1;
+                }
+            }
+        }
+        nhood
     }
 
     /// Settled light shell for chunk and 26 neighbours (18³). A missing grid reads
@@ -1554,16 +1596,20 @@ impl World {
     /// part of the ceiling: `height()` deliberately describes ground only, so
     /// they don't shadow the columns beneath them — a known model limit that
     /// needs a generator-side occupancy summary to lift.
-    pub(in crate::world) fn capture_ceiling(&mut self, coord: Coord) -> light::CeilingWindow {
+    pub(in crate::world) fn capture_ceiling(
+        &mut self,
+        coord: Coord,
+    ) -> std::sync::Arc<light::CeilingWindow> {
         if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
-            return ceiling.clone();
+            return std::sync::Arc::clone(ceiling);
         }
         // Empty `cy` range: both generators sample the 256 column profiles
         // before iterating the chunk layers, so this is the height field
         // without a voxel fill.
         let heights = self.generator.generate_column(coord.x, coord.z, 1..=0).1;
-        let ceiling = self.ceiling_from_heights((coord.x, coord.z), &heights);
-        self.ceilings.insert((coord.x, coord.z), ceiling.clone());
+        let ceiling = std::sync::Arc::new(self.ceiling_from_heights((coord.x, coord.z), &heights));
+        self.ceilings
+            .insert((coord.x, coord.z), std::sync::Arc::clone(&ceiling));
         ceiling
     }
 
@@ -1585,7 +1631,7 @@ impl World {
         if self.ceilings.contains_key(&col) {
             return;
         }
-        let ceiling = self.ceiling_from_heights(col, heights);
+        let ceiling = std::sync::Arc::new(self.ceiling_from_heights(col, heights));
         self.ceilings.insert(col, ceiling);
     }
 
@@ -1649,9 +1695,7 @@ impl World {
         if chunk.uniform() == Some(crate::block::registry::AIR) {
             let world_y0 = coord.y * CHUNK_SIZE as i32;
             let ceiling = self.capture_ceiling(coord);
-            let all_open = (0..CHUNK_SIZE)
-                .all(|lz| (0..CHUNK_SIZE).all(|lx| ceiling.open_above(lx, lz, world_y0)));
-            if all_open && !self.neighbour_blocklight_near(coord) {
+            if world_y0 >= ceiling.min_surface() && !self.neighbour_blocklight_near(coord) {
                 return Some(light::LightGrid::open_sky());
             }
         }
@@ -1663,9 +1707,10 @@ impl World {
     /// [`trivial_light`](Self::trivial_light) to reject the dark-shell fast path
     /// when a torch next door would actually bleed across the border.
     fn neighbour_blocklight_near(&self, coord: Coord) -> bool {
-        let shell = self.capture_face_shell(coord);
         Face::ALL.iter().any(|&face| {
-            (0..CHUNK_SIZE).any(|b| (0..CHUNK_SIZE).any(|a| shell.at(face, a, b).block.get() > 1))
+            self.chunks
+                .get(&coord.step(face))
+                .is_some_and(|l| l.has_blocklight)
         })
     }
 
@@ -1718,17 +1763,10 @@ impl World {
         if !self.chunks.contains_key(&coord) {
             return;
         }
-        let (self_changed, moved): (bool, Vec<Face>) = match &self.chunks[&coord].light {
-            None => (true, Face::ALL.to_vec()),
-            Some(old) => (
-                *old != grid,
-                Face::ALL
-                    .into_iter()
-                    .filter(|&f| light::border_changed(old, &grid, f))
-                    .collect(),
-            ),
-        };
-        self.chunks.get_mut(&coord).unwrap().light = Some(grid);
+        let self_changed = self.chunks[&coord]
+            .light
+            .as_ref()
+            .is_none_or(|old| *old != grid);
         // Re-arm mesh readiness unconditionally, even on identical grids.
         // A fixpoint re-settle that skipped this seed would strand the chunk
         // off the worklist forever (ready but unreachable, idle stall).
@@ -1737,11 +1775,33 @@ impl World {
         if !self_changed {
             return;
         }
+        // Face bitmask (bit = `Face` discriminant): first publish moves every
+        // face; later publishes scan borders only after the grid actually changed.
+        const ALL_FACES: u8 = (1 << Face::ALL.len()) - 1;
+        let moved = match &self.chunks[&coord].light {
+            None => ALL_FACES,
+            Some(old) => {
+                let mut bits = 0u8;
+                for &face in &Face::ALL {
+                    if light::border_changed(old, &grid, face) {
+                        bits |= 1 << (face as u8);
+                    }
+                }
+                bits
+            }
+        };
+        let has_blocklight = grid.has_border_blocklight();
+        let loaded = self.chunks.get_mut(&coord).unwrap();
+        loaded.light = Some(grid);
+        loaded.has_blocklight = has_blocklight;
         // A neighbour may now be meshable too (this chunk's FIRST grid completes
         // their neighbourhood — `moved` is all faces then); re-settle the
         // neighbours whose shared border moved.
-        for face in &moved {
-            let n = coord.step(*face);
+        for &face in &Face::ALL {
+            if moved & (1 << (face as u8)) == 0 {
+                continue;
+            }
+            let n = coord.step(face);
             self.light_worklist.insert(n);
             self.mesh_worklist.insert(n);
             // A DEGRADED neighbour meshed with fake open-sky light across this
@@ -1760,6 +1820,10 @@ impl World {
         // in-flight builds and stales queued uploads; a drawn mesh keeps
         // drawing as `prev`). Unmeshed chunks simply mesh fresh with new light.
         self.remesh_async(coord);
+    }
+
+    fn nhood_at<'a>(nhood: &[Option<&'a Loaded>; 27], dx: i32, dy: i32, dz: i32) -> Option<&'a Loaded> {
+        nhood[((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1)) as usize]
     }
 
     /// Chunk + 1-voxel neighbour shell for mesh build (shared by worker and sync paths).
@@ -2122,12 +2186,28 @@ impl World {
     /// unconditionally re-seeded every blocked chunk, every pass of a flood.
     fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
-        // the predicates below read the chunk map.
+        // the predicates below read the chunk map. Empty maps skip `retain`
+        // (it still walks capacity); a drained flood `shrink_to_fit`s once.
         let mut gate = std::mem::take(&mut self.light_gate);
-        gate.degraded.retain(|c| self.chunks.contains_key(c));
-        self.light_terminal.retain(|c| self.chunks.contains_key(c));
-        gate.blocked_since
-            .retain(|c, _| self.chunk_light_blocked(*c));
+        if !gate.degraded.is_empty() {
+            gate.degraded.retain(|c| self.chunks.contains_key(c));
+            if gate.degraded.is_empty() {
+                gate.degraded.shrink_to_fit();
+            }
+        }
+        if !self.light_terminal.is_empty() {
+            self.light_terminal.retain(|c| self.chunks.contains_key(c));
+            if self.light_terminal.is_empty() {
+                self.light_terminal.shrink_to_fit();
+            }
+        }
+        if !gate.blocked_since.is_empty() {
+            gate.blocked_since
+                .retain(|c, _| self.chunk_light_blocked(*c));
+            if gate.blocked_since.is_empty() {
+                gate.blocked_since.shrink_to_fit();
+            }
+        }
         // Safety net: event-driven paths miss degraded chunks whose neighbour
         // light settled without moving the shared border. Sweep them: any now
         // light-ready gets its ASYNC rebuild scheduled (the old mesh keeps
@@ -2235,9 +2315,9 @@ impl World {
                 return false;
             }
             if self
-                .desired_sections(center)
-                .into_iter()
-                .any(|c| !self.section_covered(c))
+                .section_desired
+                .iter()
+                .any(|&c| !self.section_covered(c))
             {
                 return false;
             }
@@ -2252,30 +2332,32 @@ impl World {
     /// The golden harness gates captures on this so blessed shots are the
     /// converged frame; gameplay never waits on it.
     pub fn far_field_refined(&self) -> bool {
-        let Some(center) = self.center else {
+        if self.center.is_none() {
             return false;
-        };
+        }
         if !self.lod2 {
             return true;
         }
         if !self.section_upload_queue.is_empty() {
             return false;
         }
-        self.desired_sections(center)
-            .into_iter()
-            .all(|c| self.sections.get(&c).is_some_and(|s| s.is_ready()))
+        self.section_desired
+            .iter()
+            .all(|c| self.sections.get(c).is_some_and(|s| s.is_ready()))
     }
 
     /// How many desired far-field sections still lack their own mesh — the
     /// harness's progress signal while it waits on
     /// [`far_field_refined`](Self::far_field_refined).
     pub fn far_field_pending(&self) -> usize {
-        let Some(center) = self.center else { return 0 };
+        if self.center.is_none() {
+            return 0;
+        }
         if !self.lod2 {
             return 0;
         }
-        self.desired_sections(center)
-            .into_iter()
+        self.section_desired
+            .iter()
             .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
             .count()
     }
@@ -2430,15 +2512,15 @@ impl World {
             if !self.section_upload_queue.is_empty() {
                 return format!("section_upload_queue = {}", self.section_upload_queue.len());
             }
-            let desired = self.desired_sections(center);
-            let uncovered = desired
+            let uncovered = self
+                .section_desired
                 .iter()
                 .filter(|&&c| !self.section_covered(c))
                 .count();
             if uncovered != 0 {
                 return format!(
                     "column sections uncovered: {uncovered} of {} desired",
-                    desired.len()
+                    self.section_desired.len()
                 );
             }
         }
@@ -2633,7 +2715,7 @@ mod tests {
         super::super::admit::<MeshLane>(
             &mut world,
             c,
-            pipeline::Deadline::from_budget(Duration::from_millis(5)),
+            voxel_engine::producer::Budget::Millis(5.0),
         );
         assert!(
             !world.mesh_worklist.contains(&c),
@@ -2838,7 +2920,7 @@ mod tests {
                 .ceilings
                 .get(&(coord.x, coord.z))
                 .expect("accept_column installs the ceiling before store");
-            assert_ceilings_eq(cached, &slow);
+            assert_ceilings_eq(cached.as_ref(), &slow);
             assert!(
                 cached.surface_at(3, 5) >= ROOF_Y + 1,
                 "edited roof must raise the cached ceiling"
@@ -2859,6 +2941,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn neighbour_blocklight_near_reads_the_settled_flag() {
+        let mut world = World::generate();
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let c = Coord::new(0, cy, 0);
+        let n = c.step(Face::PosX);
+        world.chunks.get(&c).expect("generate preloads the origin");
+        world
+            .chunks
+            .get(&n)
+            .expect("generate preloads the face neighbour");
+        world.settle_light(n, light::LightGrid::dark());
+        assert!(!world.chunks[&n].has_blocklight);
+        assert!(!world.neighbour_blocklight_near(c));
+        world.settle_light(n, light::LightGrid::full());
+        assert!(world.chunks[&n].has_blocklight);
+        assert!(world.neighbour_blocklight_near(c));
+        world.settle_light(n, light::LightGrid::full());
+        assert!(
+            world.chunks[&n].has_blocklight,
+            "identical re-settle keeps the flag"
+        );
+    }
+
+    #[test]
+    fn unload_leaving_is_the_old_minus_new_shell() {
+        let mut world = World::generate();
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let a = Coord::new(0, cy, 0);
+        world.center = Some(a);
+        world.prev_unload_box = Some(world.unload_box(a));
+        let b = Coord::new(2, 0, 0);
+        let leaving = world.unload_leaving(world.unload_box(b));
+        let old = world.unload_box(a);
+        let new = world.unload_box(b);
+        for &c in &leaving {
+            assert!(old.contains(c) && !new.contains(c), "{c:?} not in old∖new");
+        }
+        for c in old.coords() {
+            if new.contains(c)
+                || !world.chunks.contains_key(&c)
+                || world.spawn_slab.is_some_and(|s| s.contains(c))
+            {
+                continue;
+            }
+            assert!(leaving.contains(&c), "{c:?} loaded in old∖new must leave");
+        }
+    }
+
     /// Sync `ensure_data` (headless region, unclaimed boundary-cross centre)
     /// also installs from `generate_column` heights, so `trivial_light` never
     /// calls `height()`.
@@ -2874,7 +3005,7 @@ mod tests {
             .get(&(coord.x, coord.z))
             .expect("ensure_data installs the ceiling before store");
         let slow = world.capture_ceiling_slow(coord);
-        assert_ceilings_eq(cached, &slow);
+        assert_ceilings_eq(cached.as_ref(), &slow);
         assert!(
             world.chunks[&coord].light.as_ref() == Some(&light::LightGrid::open_sky()),
             "trivial light must be open_sky"

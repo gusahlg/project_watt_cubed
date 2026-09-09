@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 mod draw;
 
-use voxel_engine::{DVec3, Engine, IVec2, Key, Vec2};
+use voxel_engine::{Color, DVec3, Engine, IVec2, Key, Vec2};
 
 use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
@@ -184,6 +184,8 @@ pub struct Game {
     console: Console,
     /// The save slot this world belongs to.
     save_name: String,
+    /// Cached `peer_color(save_name)` — local third-person body tint.
+    local_color: Color,
     /// The live server connection when playing multiplayer; `None` in singleplayer.
     /// The player simulates locally and the server keeps everyone in sync.
     net: Option<Connection>,
@@ -328,6 +330,7 @@ impl Game {
             player,
             camera: GameCamera::new(),
             console: Console::new(),
+            local_color: draw::peer_color(&save_name),
             save_name,
             net: None,
             pending_edits: std::collections::HashMap::new(),

@@ -7,7 +7,8 @@
 //! share one loop (`world::admit` / `World::request_region_data`) over the
 //! per-lane accessor surface (`world::StreamLane`). They derive their per-frame
 //! `Deadline` from the `Budget::Millis` the scheduler hands `run()` — ONE budget
-//! locus, the manifest, never a private `pipeline::*_BUDGET` const — and share
+//! locus, the manifest, never a private `pipeline::*_BUDGET` const — minted after
+//! each lane's pending gate so an idle frame never samples the clock — and share
 //! the one forward-progress floor rule (`world::admission_exhausted`). There is
 //! no second scheduler here: budget and floor come from the scheduler that drives
 //! the producer.
@@ -51,7 +52,9 @@ fn duration(budget: Budget) -> Duration {
     Duration::from_secs_f32(ms / 1000.0)
 }
 
-fn paced_deadline(world: &World, budget: Budget) -> pipeline::Deadline {
+/// Mint the admission deadline from `budget` *after* the lane's pending gate.
+/// `Instant::now` lives here so an idle frame never samples the clock.
+pub(in crate::world) fn paced_deadline(world: &World, budget: Budget) -> pipeline::Deadline {
     pipeline::Deadline::from_budget(world.stream_pacer.duration(duration(budget)))
 }
 
@@ -168,31 +171,27 @@ stream_lanes! {
     generate: new GenerateLane("generate", Budget::Millis(2.0))
         => |ctx, b| {
             let center = stream_center(ctx.world);
-            let deadline = paced_deadline(ctx.world, b);
-            ctx.world.request_region_data(center, deadline)
+            ctx.world.request_region_data(center, b)
         },
     /// Cross-chunk light settling admission (the `world::LightLane` marker).
     light_admit: use LightLane("light_admit", Budget::Millis(1.0))
         => |ctx, b| {
             let center = stream_center(ctx.world);
-            let deadline = paced_deadline(ctx.world, b);
-            admit::<LightLane>(ctx.world, center, deadline);
+            admit::<LightLane>(ctx.world, center, b);
             Progress::Idle
         },
     /// Fresh full-res chunk meshing admission (the `world::MeshLane` marker).
     mesh_admit: use MeshLane("mesh_admit", Budget::Millis(2.0))
         => |ctx, b| {
             let center = stream_center(ctx.world);
-            let deadline = paced_deadline(ctx.world, b);
-            admit::<MeshLane>(ctx.world, center, deadline);
+            admit::<MeshLane>(ctx.world, center, b);
             Progress::Idle
         },
     /// LOD2 column-section admission (the `world::SectionLane` marker).
     section_admit: use SectionLane("section_admit", Budget::Millis(1.0))
         => |ctx, b| {
             let center = stream_center(ctx.world);
-            let deadline = paced_deadline(ctx.world, b);
-            admit::<SectionLane>(ctx.world, center, deadline);
+            admit::<SectionLane>(ctx.world, center, b);
             Progress::Idle
         },
 }

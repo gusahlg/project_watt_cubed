@@ -333,7 +333,7 @@ impl Game {
                     Gait::new(self.local_gait as f32, speed),
                 );
                 let rig = self.local_anim.step(&rp, *dt);
-                Pose::resolve(&rp, &rig).draw(&mut f3, peer_color(&self.save_name), true);
+                Pose::resolve(&rp, &rig).draw(&mut f3, self.local_color, true);
             }
         }
     }
@@ -564,7 +564,7 @@ fn tag_visibility(
 
 /// A stable, cheerful colour for a player, hashed from their name so the same player
 /// keeps the same tint across clients.
-fn peer_color(name: &str) -> Color {
+pub(super) fn peer_color(name: &str) -> Color {
     const PALETTE: [Color; 6] = [
         Color::new(230, 90, 90, 255),
         Color::new(90, 170, 230, 255),

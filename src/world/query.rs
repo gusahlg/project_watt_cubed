@@ -336,6 +336,7 @@ mod tests {
                 connectivity: None,
                 visible: true,
                 light: None,
+                has_blocklight: false,
             },
         );
     }

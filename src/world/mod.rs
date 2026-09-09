@@ -314,6 +314,10 @@ struct Loaded {
     /// chunk meshes or settles, and directly queryable for gameplay (mob spawns,
     /// plant growth) with no mesh. `None` until the chunk has first settled.
     light: Option<LightGrid>,
+    /// Any border lumel has blocklight `> 1`. Set at [`settle_light`](World::settle_light)
+    /// so a uniform-air neighbour can reject the analytic sky path by testing
+    /// six booleans instead of capturing a 3 KB face shell.
+    has_blocklight: bool,
 }
 
 impl Loaded {
@@ -731,7 +735,7 @@ pub struct World {
     /// y and of edits), so it is computed once per column and reused across every
     /// vertical chunk and every re-settle instead of re-sampling 256 noise columns
     /// per settle. Pruned when a column fully unloads.
-    ceilings: FastMap<(i32, i32), light::CeilingWindow>,
+    ceilings: FastMap<(i32, i32), Arc<light::CeilingWindow>>,
     /// Panic counts per failed claim, for the bounded-retry policy in
     /// [`fail_job`](World::fail_job). Rare by construction (a strike is a
     /// worker panic), so the map stays tiny.
@@ -783,6 +787,10 @@ pub struct World {
     /// the entered shell (new ∖ old) for NeedsMesh re-seeding. `None` after a
     /// radius change, so the next cross probes the whole box.
     prev_mesh_box: Option<ChunkBox>,
+    /// The unload box of the previous full pass: a boundary cross frees only
+    /// the left shell (old ∖ new). `None` after a radius change, so the next
+    /// cross scans every loaded chunk.
+    prev_unload_box: Option<ChunkBox>,
     /// Loaded-chunk count per `(x, z)` column — a column's cached ceiling
     /// drops exactly when its last chunk unloads (was: rebuild a live-column
     /// set over the WHOLE map per boundary cross).
@@ -1026,6 +1034,7 @@ impl World {
             conn_fill_queue: VecDeque::new(),
             dirty_worklist: FastSet::default(),
             prev_mesh_box: None,
+            prev_unload_box: None,
             column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
@@ -1614,16 +1623,18 @@ fn queue_slots<S: StreamLane>(world: &World) -> usize {
 /// The shared admission loop: gather, filter unready/in-flight, select the
 /// nearest `want` in O(n), submit until the deadline expires (checked between
 /// items, never mid-item, and never before `MIN_ADMIT`), then claim. Clears the
-/// lane's pending gate once the ready backlog drains. `deadline` comes from the
-/// scheduler's per-producer budget — this loop owns no budget of its own.
+/// lane's pending gate once the ready backlog drains. `budget` becomes a
+/// [`pipeline::Deadline`] only after the pending gate, so an idle frame never
+/// samples `Instant::now`.
 pub(in crate::world) fn admit<S: StreamLane>(
     world: &mut World,
     center: Coord,
-    deadline: pipeline::Deadline,
+    budget: Budget,
 ) {
     if !S::pending(world).get() {
         return;
     }
+    let deadline = lanes::paced_deadline(world, budget);
     let worklist = matches!(S::candidates(world, center), Candidates::Worklist);
     let slots = queue_slots::<S>(world);
     let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
