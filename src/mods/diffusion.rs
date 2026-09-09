@@ -33,7 +33,7 @@ impl Mod for InfiniteDiffusionMod {
         "InfiniteDiffusion"
     }
 
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         WorldgenKind::Diffusion.id()
     }
 
@@ -128,14 +128,17 @@ impl Mod for InfiniteDiffusionMod {
         self.cfg = self.cfg.clamp();
     }
 
-    fn save_state(&self, _world: &World) -> Option<String> {
-        Some(format!(
-            "tile={},stride={},phases={},relief={:.2}",
-            self.cfg.tile, self.cfg.stride, self.cfg.phases, self.cfg.relief
+    fn save_state(&self, _world: &World) -> Option<(u16, String)> {
+        Some((
+            1,
+            format!(
+                "tile={},stride={},phases={},relief={:.2}",
+                self.cfg.tile, self.cfg.stride, self.cfg.phases, self.cfg.relief
+            ),
         ))
     }
 
-    fn load_state(&mut self, data: &str, _world: &mut World) {
+    fn load_state(&mut self, _version: u16, data: &str, _world: &mut World) {
         let mut cfg = self.cfg;
         for part in data.split(',') {
             let Some((k, v)) = part.split_once('=') else { continue };
@@ -178,11 +181,11 @@ mod knob_tests {
     fn clamp_snaps_loaded_tile_to_a_stepper_choice() {
         let mut m = InfiniteDiffusionMod::new();
         let mut world = World::new(1);
-        m.load_state("tile=48,stride=16,phases=2,relief=1.00", &mut world);
+        m.load_state(0, "tile=48,stride=16,phases=2,relief=1.00", &mut world);
         assert_eq!(m.cfg().tile, 32, "48 snaps to nearest choice 32");
         m.step_knob(0, 1);
         assert_eq!(m.cfg().tile, 64);
-        m.load_state("tile=48,stride=16,phases=2,relief=1.00", &mut world);
+        m.load_state(0, "tile=48,stride=16,phases=2,relief=1.00", &mut world);
         m.step_knob(0, -1);
         assert_eq!(m.cfg().tile, 16);
     }

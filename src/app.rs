@@ -110,6 +110,7 @@ impl ActiveSlot {
 impl App {
     pub fn new() -> Self {
         let mut mods = Mods::with_defaults();
+        mods.load_choices();
         let pins = Benchmark::mod_pins_from_env();
         mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
         let saves = save::list();
@@ -370,7 +371,10 @@ impl App {
                 self.session.save();
                 self.start_join(eng, info);
             }
-            AppEffect::ToggleMod(index) => self.mods.toggle(index),
+            AppEffect::ToggleMod(index) => {
+                self.mods.toggle(index);
+                self.mods.save_choices();
+            }
             AppEffect::StepModKnob {
                 mod_index,
                 knob,

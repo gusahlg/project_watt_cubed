@@ -34,7 +34,7 @@ use crate::sched::{Ctx as SchedCtx, RateGate};
 use crate::settings::Settings;
 use crate::sim::Simulation;
 use crate::sky::Sky;
-use crate::ui::{self, HudMode, Theme};
+use crate::ui::{self, HudElement, HudMode, Theme};
 use crate::world::World;
 
 /// What a game update wants the app to do next.
@@ -284,6 +284,7 @@ pub struct Game {
     // allocator work for these.
     placement_scratch: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
     peer_pose_scratch: Vec<PeerPose>,
+    hud_scratch: Vec<HudElement>,
 }
 
 impl Game {
@@ -294,7 +295,7 @@ impl Game {
         // — it fires only when whole ticks are due.
         let sim_id = sched.register(
             Simulation::manifest(),
-            Box::new(Simulation::new()),
+            Box::new(Simulation::with_systems(Vec::new())),
             u32::MAX,
         );
         sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
@@ -351,6 +352,7 @@ impl Game {
             drawing: draw::DrawState::new(),
             placement_scratch: Vec::new(),
             peer_pose_scratch: Vec::new(),
+            hud_scratch: Vec::new(),
         }
     }
 

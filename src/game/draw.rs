@@ -434,8 +434,9 @@ impl Game {
         // Gameplay UI, so it follows the reticle: hidden only when HUD is Off
         // or the mod-HUD lane itself is disabled.
         if self.mod_hud && theme.hud.shows_mod_hud() {
-            let hud = mods.hud(&self.world, screen);
-            ui::render_hud(f, theme, screen, &hud);
+            self.hud_scratch.clear();
+            mods.hud(&self.world, screen, &mut self.hud_scratch);
+            ui::render_hud(f, theme, screen, &self.hud_scratch);
         }
         // Minimal keeps the world readable: no closed-console scrollback.
         if matches!(theme.hud, HudMode::Full) || self.console.is_open() {

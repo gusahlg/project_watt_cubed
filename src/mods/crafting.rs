@@ -17,6 +17,7 @@ use voxel_engine::DVec3;
 use crate::block::crafting::craft_natural;
 use crate::block::registry::BlockId;
 use crate::block::{AIR, ElementId};
+use crate::derived::Memo;
 use crate::math::{Aabb, Bounded};
 use crate::mods::inventory::{InventoryMod, PANEL_X, PANEL_Y};
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
@@ -57,6 +58,10 @@ pub struct CraftingMod {
     /// Stable gameplay frames therefore do no temporary-vector allocation.
     held_elements: Vec<ElementId>,
     seen_stash_rev: u64,
+    /// Bumped when cursor, selection, pouch, or open state change so the HUD
+    /// memo can stay keyed on Copy values.
+    hud_gen: Cell<u64>,
+    hud_cache: RefCell<Memo<(u64, u64, i32, i32, bool), Vec<HudElement>>>,
 }
 
 impl CraftingMod {
@@ -74,7 +79,13 @@ impl CraftingMod {
             equipped: None,
             held_elements,
             seen_stash_rev,
+            hud_gen: Cell::new(0),
+            hud_cache: RefCell::new(Memo::new()),
         }
+    }
+
+    fn bump_hud(&self) {
+        self.hud_gen.set(self.hud_gen.get().wrapping_add(1));
     }
 
     fn is_open(&self) -> bool {
@@ -83,8 +94,12 @@ impl CraftingMod {
 
     fn set_open(&self, open: bool) {
         let mut ui = self.ui.get();
+        if ui.crafting_open == open {
+            return;
+        }
         ui.crafting_open = open;
         self.ui.set(ui);
+        self.bump_hud();
     }
 
     /// Total rows the cursor can sit on: one per element kind, the Craft row,
@@ -98,7 +113,11 @@ impl CraftingMod {
     fn refresh(&mut self) -> bool {
         let rev = self.stash.borrow().rev();
         if rev == self.seen_stash_rev {
-            self.cursor = self.cursor.min(self.row_count() - 1);
+            let c = self.cursor.min(self.row_count() - 1);
+            if c != self.cursor {
+                self.cursor = c;
+                self.bump_hud();
+            }
             return false;
         }
         self.held_elements.clear();
@@ -106,11 +125,13 @@ impl CraftingMod {
         self.selected.retain(|element| self.held_elements.contains(element));
         self.seen_stash_rev = rev;
         self.cursor = self.cursor.min(self.row_count() - 1);
+        self.bump_hud();
         true
     }
 
     /// Navigate panel using intent flags.
     fn navigate(&mut self, ctx: &mut ModContext) {
+        let cursor = self.cursor;
         if ctx.nav_up {
             self.cursor = self.cursor.saturating_sub(1);
         }
@@ -119,6 +140,9 @@ impl CraftingMod {
         }
         if ctx.nav_confirm {
             self.activate(ctx);
+        }
+        if self.cursor != cursor {
+            self.bump_hud();
         }
     }
 
@@ -132,10 +156,12 @@ impl CraftingMod {
             } else {
                 self.selected.push(element);
             }
+            self.bump_hud();
         } else if self.cursor == element_count {
             self.craft(ctx);
         } else {
             self.equipped = Some(self.cursor - element_count - 1);
+            self.bump_hud();
         }
     }
 
@@ -172,6 +198,7 @@ impl CraftingMod {
                 count: 1,
             }),
         }
+        self.bump_hud();
         self.refresh();
     }
 
@@ -202,6 +229,7 @@ impl CraftingMod {
         }
         ctx.placements.push((x, y, z, self.crafted[equipped].id));
         self.crafted[equipped].count -= 1;
+        self.bump_hud();
     }
 }
 
@@ -237,9 +265,114 @@ impl CraftingMod {
     }
 }
 
+fn paint_crafting(
+    stash: &RefCell<ElementStash>,
+    ui: ItemUiState,
+    cursor: usize,
+    selected: &[ElementId],
+    crafted: &[Crafted],
+    equipped: Option<usize>,
+    world: &World,
+    screen_w: i32,
+    screen_h: i32,
+) -> Vec<HudElement> {
+    let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
+
+    if !ui.crafting_open {
+        let Some(equipped) = equipped else {
+            return Vec::new();
+        };
+        let entry = &crafted[equipped];
+        let kinds = stash.borrow().iter().count();
+        let y = if ui.inventory_visible {
+            InventoryMod::panel_bottom(screen_h, kinds) + 6
+        } else {
+            PANEL_Y
+        };
+        let hint = format!("Equipped: {} x{}", entry.name, entry.count);
+        let hint_w = (hint.chars().count() as i32 * FONT_SIZE + PANEL_PAD * 2).min(width);
+        return vec![HudElement::Panel(Panel {
+            at: (PANEL_X, y),
+            width: hint_w,
+            header: Vec::new().into(),
+            rows: vec![Row::new(Role::Muted, hint)].into(),
+        })];
+    }
+
+    let stash = stash.borrow();
+    let elements = world.registry().elements();
+    let held: Vec<(ElementId, u32)> = stash.iter().collect();
+    let element_count = held.len();
+    let total_rows = element_count + 1 + crafted.len();
+    let selected_names = selected
+        .iter()
+        .map(|&id| elements.get(id).name.as_ref())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let header_rows = 1 + usize::from(!selected_names.is_empty());
+    let content_y = PANEL_Y + PANEL_PAD + header_rows as i32 * LINE_HEIGHT + 2;
+    let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
+    let window = visible_window(total_rows, cursor, capacity);
+
+    let mut header = vec![Row::new(
+        Role::Warning,
+        format!("Crafting  {}/{}", selected.len(), element_count),
+    )];
+    if !selected_names.is_empty() {
+        header.push(Row::new(Role::Dim, selected_names));
+    }
+
+    let rows: Vec<Row> = window
+        .map(|row_index| {
+            let active = cursor == row_index;
+            let cursor_mark = if active { ">" } else { " " };
+            if row_index < element_count {
+                let (element, count) = held[row_index];
+                let mark = if selected.contains(&element) { "[x]" } else { "[ ]" };
+                Row::new(
+                    if active { Role::Accent } else { Role::Muted },
+                    format!("{cursor_mark} {mark} {count}x {}", elements.get(element).name),
+                )
+            } else if row_index == element_count {
+                let label = if selected.is_empty() { "select elements" } else { "craft selected" };
+                Row::new(
+                    if selected.is_empty() { Role::Disabled } else { Role::Warning },
+                    format!("{cursor_mark} [ {label} ]"),
+                )
+            } else {
+                let i = row_index - element_count - 1;
+                let entry = &crafted[i];
+                let equipped_mark = if equipped == Some(i) { "[E]" } else { "   " };
+                let role = if equipped == Some(i) {
+                    Role::Positive
+                } else if active {
+                    Role::Accent
+                } else {
+                    Role::Muted
+                };
+                Row::new(
+                    role,
+                    format!("{cursor_mark} {equipped_mark} {}x {}", entry.count, entry.name),
+                )
+            }
+        })
+        .collect();
+
+    vec![HudElement::Panel(Panel {
+        at: (PANEL_X, PANEL_Y),
+        width,
+        header: header.into(),
+        rows: rows.into(),
+    })]
+}
+
 impl Mod for CraftingMod {
     fn name(&self) -> &str {
         "Crafting"
+    }
+
+    fn id(&self) -> &'static str {
+        "crafting"
     }
 
     fn reset(&mut self) {
@@ -250,6 +383,7 @@ impl Mod for CraftingMod {
         self.equipped = None;
         self.held_elements.clear();
         self.seen_stash_rev = self.stash.borrow().rev();
+        self.bump_hud();
     }
 
     fn description(&self) -> &str {
@@ -272,97 +406,31 @@ impl Mod for CraftingMod {
         // The server refused the placement: the spent block comes back to the
         // pouch (re-listing it if the entry emptied meanwhile).
         self.push_loaded(world, id, 1, false);
+        self.bump_hud();
     }
 
-    fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
-        let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
-
-        if !self.is_open() {
-            // Closed: just a small reminder of what RMB will place.
-            let Some(equipped) = self.equipped else {
-                return Vec::new();
-            };
-            let entry = &self.crafted[equipped];
-            let kinds = self.stash.borrow().iter().count();
-            let ui = self.ui.get();
-            let y = if ui.inventory_visible {
-                InventoryMod::panel_bottom(screen_h, kinds) + 6
-            } else {
-                PANEL_Y
-            };
-            let hint = format!("Equipped: {} x{}", entry.name, entry.count);
-            let hint_w = (hint.chars().count() as i32 * FONT_SIZE + PANEL_PAD * 2).min(width);
-            return vec![HudElement::Panel(Panel {
-                at: (PANEL_X, y),
-                width: hint_w,
-                header: Vec::new(),
-                rows: vec![Row::new(Role::Muted, hint)],
-            })];
-        }
-
-        let stash = self.stash.borrow();
-        let elements = world.registry().elements();
-        let held: Vec<(ElementId, u32)> = stash.iter().collect();
-        let element_count = held.len();
-        let total_rows = element_count + 1 + self.crafted.len();
-        let selected_names = self
-            .selected
-            .iter()
-            .map(|&id| elements.get(id).name.as_ref())
-            .collect::<Vec<_>>()
-            .join(" + ");
-        let header_rows = 1 + usize::from(!selected_names.is_empty());
-        let content_y = PANEL_Y + PANEL_PAD + header_rows as i32 * LINE_HEIGHT + 2;
-        let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
-        let window = visible_window(total_rows, self.cursor, capacity);
-
-        let mut header = vec![Row::new(
-            Role::Warning,
-            format!("Crafting  {}/{}", self.selected.len(), element_count),
-        )];
-        if !selected_names.is_empty() {
-            header.push(Row::new(Role::Dim, selected_names));
-        }
-
-        let rows = window
-            .map(|row_index| {
-                let active = self.cursor == row_index;
-                let cursor = if active { ">" } else { " " };
-                if row_index < element_count {
-                    let (element, count) = held[row_index];
-                    let mark = if self.selected.contains(&element) { "[x]" } else { "[ ]" };
-                    Row::new(
-                        if active { Role::Accent } else { Role::Muted },
-                        format!("{cursor} {mark} {count}x {}", elements.get(element).name),
-                    )
-                } else if row_index == element_count {
-                    let label = if self.selected.is_empty() { "select elements" } else { "craft selected" };
-                    Row::new(
-                        if self.selected.is_empty() { Role::Disabled } else { Role::Warning },
-                        format!("{cursor} [ {label} ]"),
-                    )
-                } else {
-                    let i = row_index - element_count - 1;
-                    let entry = &self.crafted[i];
-                    let equipped = if self.equipped == Some(i) { "[E]" } else { "   " };
-                    let role = if self.equipped == Some(i) {
-                        Role::Positive
-                    } else if active {
-                        Role::Accent
-                    } else {
-                        Role::Muted
-                    };
-                    Row::new(role, format!("{cursor} {equipped} {}x {}", entry.count, entry.name))
-                }
-            })
-            .collect();
-
-        vec![HudElement::Panel(Panel {
-            at: (PANEL_X, PANEL_Y),
-            width,
-            header,
-            rows,
-        })]
+    fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32), out: &mut Vec<HudElement>) {
+        let ui = self.ui.get();
+        let rev = self.stash.borrow().rev();
+        let key = (
+            rev,
+            self.hud_gen.get(),
+            screen_w,
+            screen_h,
+            ui.inventory_visible,
+        );
+        let stash = &self.stash;
+        let cursor = self.cursor;
+        let selected = self.selected.as_slice();
+        let crafted = self.crafted.as_slice();
+        let equipped = self.equipped;
+        let mut cache = self.hud_cache.borrow_mut();
+        let cached = cache.get_or(key, || {
+            paint_crafting(
+                stash, ui, cursor, selected, crafted, equipped, world, screen_w, screen_h,
+            )
+        });
+        out.extend(cached.iter().cloned());
     }
 
     fn close_overlay(&mut self) -> bool {
@@ -374,7 +442,7 @@ impl Mod for CraftingMod {
         }
     }
 
-    fn save_state(&self, _world: &World) -> Option<String> {
+    fn save_state(&self, _world: &World) -> Option<(u16, String)> {
         // Persist by block *name* ("Stone+Iron"), the same portable choice the
         // inventory makes for elements: names survive id reshuffles across
         // sessions, and the equipped entry carries a `*` prefix.
@@ -390,10 +458,10 @@ impl Mod for CraftingMod {
                 format!("{star}{}={}", entry.name, entry.count)
             })
             .collect();
-        Some(entries.join(","))
+        Some((1, entries.join(",")))
     }
 
-    fn load_state(&mut self, data: &str, world: &mut World) {
+    fn load_state(&mut self, version: u16, data: &str, world: &mut World) {
         self.crafted.clear();
         self.equipped = None;
         self.cursor = 0;
@@ -415,9 +483,13 @@ impl Mod for CraftingMod {
             }
             // Older natural Stone+ore blocks persisted aliases such as `IronVein`.
             let migrated;
-            let name = if let Some(ore) = name.strip_suffix("Vein") {
-                migrated = format!("Stone+{ore}");
-                &migrated
+            let name = if version == 0 {
+                if let Some(ore) = name.strip_suffix("Vein") {
+                    migrated = format!("Stone+{ore}");
+                    &migrated
+                } else {
+                    name
+                }
             } else {
                 name
             };
@@ -437,6 +509,7 @@ impl Mod for CraftingMod {
             };
             self.push_loaded(world, id, count, equip);
         }
+        self.bump_hud();
     }
 }
 
@@ -456,14 +529,14 @@ mod tests {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
         // Copper+Glass is reconstructed from its ordinary element names.
-        crafting.load_state("Copper+Glass=2,*Stone=1", &mut world);
+        crafting.load_state(1, "Copper+Glass=2,*Stone=1", &mut world);
         assert_eq!(crafting.crafted.len(), 2);
         assert_eq!(crafting.crafted[0].name.as_ref(), "Copper+Glass");
         assert_eq!(crafting.crafted[0].count, 2);
         assert_eq!(crafting.equipped, Some(1));
         assert_eq!(
-            crafting.save_state(&world).as_deref(),
-            Some("Copper+Glass=2,*Stone=1")
+            crafting.save_state(&world),
+            Some((1, "Copper+Glass=2,*Stone=1".into()))
         );
     }
 
@@ -471,7 +544,7 @@ mod tests {
     fn unknown_element_names_skip_the_entry() {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
-        crafting.load_state("Stone+Unobtainium=5,Iron=3", &mut world);
+        crafting.load_state(1, "Stone+Unobtainium=5,Iron=3", &mut world);
         assert_eq!(
             crafting.crafted.len(),
             1,
@@ -485,7 +558,7 @@ mod tests {
     fn loaded_names_recraft_to_registry_ids() {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
-        crafting.load_state("Copper+Glass=1", &mut world);
+        crafting.load_state(1, "Copper+Glass=1", &mut world);
         let id = crafting.crafted[0].id;
         assert_eq!(world.registry().id_by_name("Copper+Glass"), Some(id));
     }
@@ -494,8 +567,19 @@ mod tests {
     fn legacy_vein_names_migrate_to_compositions() {
         let mut world = World::new(1);
         let mut crafting = mod_with_stash();
-        crafting.load_state("*IronVein=2", &mut world);
-        assert_eq!(crafting.save_state(&world).as_deref(), Some("*Stone+Iron=2"));
+        crafting.load_state(0, "*IronVein=2", &mut world);
+        assert_eq!(
+            crafting.save_state(&world),
+            Some((1, "*Stone+Iron=2".into()))
+        );
+    }
+
+    #[test]
+    fn vein_alias_is_not_rewritten_on_versioned_saves() {
+        let mut world = World::new(1);
+        let mut crafting = mod_with_stash();
+        crafting.load_state(1, "*IronVein=2", &mut world);
+        assert!(crafting.crafted.is_empty());
     }
 
     #[test]

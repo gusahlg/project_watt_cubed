@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::block::ElementId;
+use crate::derived::Memo;
 use crate::mods::{ElementStash, ItemUiState, Mod, ModContext};
 use crate::ui::{Anchor, HudElement, Panel, Role, Row, PANEL_FONT};
 use crate::world::World;
@@ -45,6 +46,9 @@ pub struct InventoryMod {
     /// When a break last overflowed the stash (elements were destroyed), if
     /// within the warning window. Drives the HUD's "elements lost" warning.
     overflow_at: Option<Instant>,
+    /// Formatted HUD rows, rebuilt only when the stash, screen, or visibility
+    /// flags change.
+    hud_cache: RefCell<Memo<(u64, i32, i32, bool, bool), Vec<HudElement>>>,
 }
 
 impl InventoryMod {
@@ -53,6 +57,7 @@ impl InventoryMod {
             stash,
             ui,
             overflow_at: None,
+            hud_cache: RefCell::new(Memo::new()),
         }
     }
 
@@ -73,9 +78,76 @@ fn visible_rows(screen_h: i32, kinds: usize) -> usize {
     kinds.min(row_capacity(screen_h))
 }
 
+fn paint_inventory(
+    stash: &RefCell<ElementStash>,
+    world: &World,
+    screen_w: i32,
+    screen_h: i32,
+    visible: bool,
+    overflow: bool,
+) -> Vec<HudElement> {
+    if !visible {
+        // The overflow warning outlives the list toggle: shown for a short
+        // window after the last overflowing break even while the list is
+        // closed, centred where the list's header would sit.
+        if overflow {
+            return vec![HudElement::Label {
+                at: Anchor::Top,
+                off: (0, PANEL_Y),
+                base_fs: PANEL_FONT,
+                role: Role::Danger,
+                text: "Inventory full - elements lost!".into(),
+            }];
+        }
+        return Vec::new();
+    }
+
+    let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
+    let stash = stash.borrow();
+    let elements = world.registry().elements();
+    let total = stash.total();
+    let kind_count = stash.iter().count();
+    let shown = visible_rows(screen_h, kind_count);
+
+    let header = if overflow {
+        Row::new(Role::Danger, "Inventory full - elements lost!")
+    } else {
+        Row::new(Role::Warning, format!("Inventory  {total}/{}", stash.capacity()))
+    };
+
+    let mut rows = Vec::new();
+    if total == 0 {
+        rows.push(Row::new(Role::Muted, "(empty)"));
+    } else {
+        // When the kinds overflow the panel, the last row slot becomes the
+        // "+N more" summary instead of an element row.
+        let listed = if kind_count > shown { shown - 1 } else { shown };
+        for (element, count) in stash.iter().take(listed) {
+            rows.push(Row::new(
+                Role::Muted,
+                format!("{count}x {}", elements.get(element).name),
+            ));
+        }
+        if kind_count > listed {
+            rows.push(Row::new(Role::Dim, format!("+{} more", kind_count - listed)));
+        }
+    }
+
+    vec![HudElement::Panel(Panel {
+        at: (PANEL_X, PANEL_Y),
+        width,
+        header: vec![header].into(),
+        rows: rows.into(),
+    })]
+}
+
 impl Mod for InventoryMod {
     fn name(&self) -> &str {
         "Inventory"
+    }
+
+    fn id(&self) -> &'static str {
+        "inventory"
     }
 
     fn description(&self) -> &str {
@@ -120,68 +192,23 @@ impl Mod for InventoryMod {
         self.stash.borrow_mut().revoke(elements);
     }
 
-    fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32)) -> Vec<HudElement> {
-        let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
+    fn hud(&self, world: &World, (screen_w, screen_h): (i32, i32), out: &mut Vec<HudElement>) {
         let overflow = self
             .overflow_at
             .is_some_and(|at| at.elapsed() <= OVERFLOW_WARNING);
-
         let ui = self.ui.get();
-        if !ui.inventory_visible || ui.crafting_open {
-            // The overflow warning outlives the list toggle: shown for a short
-            // window after the last overflowing break even while the list is
-            // closed, centred where the list's header would sit.
-            if overflow {
-                return vec![HudElement::Label {
-                    at: Anchor::Top,
-                    off: (0, PANEL_Y),
-                    base_fs: PANEL_FONT,
-                    role: Role::Danger,
-                    text: "Inventory full - elements lost!".into(),
-                }];
-            }
-            return Vec::new();
-        }
-
-        let stash = self.stash.borrow();
-        let elements = world.registry().elements();
-        let total = stash.total();
-        let kind_count = stash.iter().count();
-        let shown = visible_rows(screen_h, kind_count);
-
-        let header = if overflow {
-            Row::new(Role::Danger, "Inventory full - elements lost!")
-        } else {
-            Row::new(Role::Warning, format!("Inventory  {total}/{}", stash.capacity()))
-        };
-
-        let mut rows = Vec::new();
-        if total == 0 {
-            rows.push(Row::new(Role::Muted, "(empty)"));
-        } else {
-            // When the kinds overflow the panel, the last row slot becomes the
-            // "+N more" summary instead of an element row.
-            let listed = if kind_count > shown { shown - 1 } else { shown };
-            for (element, count) in stash.iter().take(listed) {
-                rows.push(Row::new(
-                    Role::Muted,
-                    format!("{count}x {}", elements.get(element).name),
-                ));
-            }
-            if kind_count > listed {
-                rows.push(Row::new(Role::Dim, format!("+{} more", kind_count - listed)));
-            }
-        }
-
-        vec![HudElement::Panel(Panel {
-            at: (PANEL_X, PANEL_Y),
-            width,
-            header: vec![header],
-            rows,
-        })]
+        let visible = ui.inventory_visible && !ui.crafting_open;
+        let rev = self.stash.borrow().rev();
+        let key = (rev, screen_w, screen_h, visible, overflow);
+        let stash = &self.stash;
+        let mut cache = self.hud_cache.borrow_mut();
+        let cached = cache.get_or(key, || {
+            paint_inventory(stash, world, screen_w, screen_h, visible, overflow)
+        });
+        out.extend(cached.iter().cloned());
     }
 
-    fn save_state(&self, world: &World) -> Option<String> {
+    fn save_state(&self, world: &World) -> Option<(u16, String)> {
         // Persist by element name so a save survives element-id changes (e.g. a mod
         // that adds elements ahead of these in the registry). One name per held
         // unit, exactly the pre-stash format, so old and new saves are one format.
@@ -192,10 +219,10 @@ impl Mod for InventoryMod {
             let name = elements.get(element).name.as_ref();
             names.extend(std::iter::repeat_n(name, count as usize));
         }
-        Some(names.join(","))
+        Some((1, names.join(",")))
     }
 
-    fn load_state(&mut self, data: &str, world: &mut World) {
+    fn load_state(&mut self, _version: u16, data: &str, world: &mut World) {
         let elements = world.registry().elements();
         {
             let mut stash = self.stash.borrow_mut();
@@ -221,7 +248,7 @@ mod tests {
             InventoryMod::new(stash.clone(), Rc::new(Cell::new(ItemUiState::default())));
         // A pre-stash save line: one element name per held unit, pickup order,
         // possibly interleaved. Unknown names are skipped, exactly as before.
-        inventory.load_state("Stone,Soil,Stone,Bogus", &mut world);
+        inventory.load_state(0, "Stone,Soil,Stone,Bogus", &mut world);
         assert_eq!(stash.borrow().total(), 3);
         assert_eq!(
             stash.borrow().count(crate::block::element::El::Stone.id()),
@@ -230,8 +257,8 @@ mod tests {
         // Re-saving emits the same one-name-per-unit format (grouped by
         // first-seen element, which the old grouped HUD view matched anyway).
         assert_eq!(
-            inventory.save_state(&world).as_deref(),
-            Some("Stone,Stone,Soil")
+            inventory.save_state(&world),
+            Some((1, "Stone,Stone,Soil".into()))
         );
     }
 
@@ -279,8 +306,8 @@ mod tests {
         let stash = Rc::new(RefCell::new(ElementStash::new(10)));
         let mut inventory =
             InventoryMod::new(stash.clone(), Rc::new(Cell::new(ItemUiState::default())));
-        inventory.load_state("Stone,Stone", &mut world);
-        inventory.load_state("Iron", &mut world);
+        inventory.load_state(0, "Stone,Stone", &mut world);
+        inventory.load_state(0, "Iron", &mut world);
         assert_eq!(stash.borrow().total(), 1);
         assert_eq!(
             stash.borrow().count(crate::block::element::El::Iron.id()),

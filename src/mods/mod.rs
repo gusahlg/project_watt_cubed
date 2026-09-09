@@ -15,6 +15,8 @@ pub mod menu_default;
 pub mod visuals;
 
 use std::cell::{Cell, RefCell};
+use std::fs;
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::block::ElementId;
@@ -275,15 +277,12 @@ pub struct ModContext<'a> {
 /// implements only the hooks it cares about. This is the public surface mod authors
 /// write against — kept small on purpose.
 pub trait Mod {
-    /// Short, stable name shown in the mod menu and used as a save key.
+    /// Short name shown in the mod menu. Not a save key — see [`id`].
     fn name(&self) -> &str;
 
-    /// Lowercase-stable code id (env vars, worldgen kind). Equals [`name`]
-    /// unless the menu label is not itself a code identifier — e.g. the
-    /// InfiniteDiffusion display name vs the `diffusion` id.
-    fn id(&self) -> &str {
-        self.name()
-    }
+    /// Stable lowercase code id. Persist, env pins, and lookups use this;
+    /// [`name`] is the display label and may change.
+    fn id(&self) -> &'static str;
 
     /// One-line description for the mod menu.
     fn description(&self) -> &str {
@@ -325,14 +324,14 @@ pub trait Mod {
         let _ = (id, world);
     }
 
-    /// This mod's HUD contribution while enabled, as data — a list of
-    /// [`HudElement`]s the core renders over the world and under the console. A
-    /// mod describes *what* to show and never draws, so panel chrome and layout
-    /// live in one place ([`crate::ui::render_hud`]). `world` gives read access to
-    /// the registry so names resolve at build time rather than being cached.
-    fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
-        let _ = (world, screen);
-        Vec::new()
+    /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
+    /// pushed into a caller-owned buffer the core renders over the world and
+    /// under the console. A mod describes *what* to show and never draws, so
+    /// panel chrome and layout live in one place ([`crate::ui::render_hud`]).
+    /// `world` gives read access to the registry so names resolve at build time
+    /// rather than being cached.
+    fn hud(&self, world: &World, screen: (i32, i32), out: &mut Vec<HudElement>) {
+        let _ = (world, screen, out);
     }
 
     /// Close a modal in-world overlay before the core interprets Escape as
@@ -346,18 +345,19 @@ pub trait Mod {
         None
     }
 
-    /// Serialise persistent state to a single line for the save file, or `None` if
-    /// the mod has nothing to persist. `world` resolves ids to portable names.
-    fn save_state(&self, world: &World) -> Option<String> {
+    /// Serialise persistent state, or `None` if the mod has nothing to persist.
+    /// The `u16` is the payload version; [`Mods::save_states`] encodes it as a
+    /// `v<N>;` prefix so the save codec stays a plain string.
+    fn save_state(&self, world: &World) -> Option<(u16, String)> {
         let _ = world;
         None
     }
 
-    /// Restore state produced by [`save_state`](Self::save_state). `world` is
-    /// mutable because restoring may need to re-register blocks (crafted blocks
-    /// are saved by name and re-crafted into the palette on load).
-    fn load_state(&mut self, data: &str, world: &mut World) {
-        let _ = (data, world);
+    /// Restore state produced by [`save_state`](Self::save_state). `version` is
+    /// 0 when the on-disk string had no prefix (old saves). `world` is mutable
+    /// because restoring may need to re-register blocks.
+    fn load_state(&mut self, version: u16, data: &str, world: &mut World) {
+        let _ = (version, data, world);
     }
 
     /// Which fancy render group this mod owns, if any.
@@ -395,6 +395,8 @@ struct Entry {
 pub struct Mods {
     entries: Vec<Entry>,
 }
+
+const CHOICES_PATH: &str = "saves/mods.cfg";
 
 impl Mods {
     /// The default install: the menu mod (look/feel of every out-of-game
@@ -476,14 +478,15 @@ impl Mods {
         }
     }
 
-    /// Collect every enabled mod's HUD contribution, in install order (so a
-    /// later mod draws over an earlier one).
-    pub fn hud(&self, world: &World, screen: (i32, i32)) -> Vec<HudElement> {
-        self.entries
-            .iter()
-            .filter(|e| e.enabled)
-            .flat_map(|e| e.module.hud(world, screen))
-            .collect()
+    /// Push every enabled mod's HUD contribution into `out`, in install order
+    /// (so a later mod draws over an earlier one). The caller owns `out` and
+    /// clears it per frame so capacity is retained.
+    pub fn hud(&self, world: &World, screen: (i32, i32), out: &mut Vec<HudElement>) {
+        for entry in &self.entries {
+            if entry.enabled {
+                entry.module.hud(world, screen, out);
+            }
+        }
     }
 
     /// Give enabled mods first refusal on Escape. The first open overlay closes
@@ -614,9 +617,9 @@ impl Mods {
             None => {}
         }
         if visuals_core == Some(true) {
-            self.set_enabled("Atmosphere", false);
-            self.set_enabled("Post", false);
-            self.set_enabled("Lighting", false);
+            self.set_enabled("atmosphere", false);
+            self.set_enabled("post", false);
+            self.set_enabled("lighting", false);
         }
     }
 
@@ -626,24 +629,85 @@ impl Mods {
         self.visual_mask().effective_render(settings)
     }
 
-    /// Persistent state of every mod that has any, as `(name, data)` lines.
+    /// Persistent state of every mod that has any, as `(id, data)` lines.
+    /// Version is encoded inside `data` as a leading `v<N>;` so the save
+    /// codec does not change; old unprefixed strings load as version 0.
     pub fn save_states(&self, world: &World) -> Vec<(String, String)> {
         self.entries
             .iter()
             .filter_map(|entry| {
-                entry
-                    .module
-                    .save_state(world)
-                    .map(|data| (entry.module.name().to_string(), data))
+                entry.module.save_state(world).map(|(version, data)| {
+                    (entry.module.id().to_string(), format!("v{version};{data}"))
+                })
             })
             .collect()
     }
 
-    /// Restore a mod's state by name (ignoring unknown names from other installs).
+    /// Restore a mod's state by id, or by display name for old saves.
     pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.module.name() == name) {
-            entry.module.load_state(data, world);
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.module.id() == name || e.module.name() == name) {
+            let (version, payload) = split_mod_version(data);
+            entry.module.load_state(version, payload, world);
         }
+    }
+
+    /// `id=on|off` lines, one per installed mod.
+    pub fn choices_text(&self) -> String {
+        let mut text = String::new();
+        for entry in &self.entries {
+            text.push_str(entry.module.id());
+            text.push('=');
+            text.push_str(if entry.enabled { "on" } else { "off" });
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Apply `id=on|off` lines. Unknown ids and malformed lines are ignored.
+    pub fn apply_choices_text(&mut self, text: &str) {
+        for line in text.lines() {
+            let Some((id, value)) = line.split_once('=') else {
+                continue;
+            };
+            let on = match value.trim() {
+                "on" => true,
+                "off" => false,
+                _ => continue,
+            };
+            self.set_enabled(id.trim(), on);
+        }
+    }
+
+    /// Load enable/disable choices from `saves/mods.cfg`. Missing or unreadable
+    /// file leaves the current defaults in place.
+    pub fn load_choices(&mut self) {
+        if let Ok(text) = fs::read_to_string(CHOICES_PATH) {
+            self.apply_choices_text(&text);
+        }
+    }
+
+    /// Best-effort write of enable/disable choices. Bench-env pins are not
+    /// written from startup; only a later toggle persists.
+    pub fn save_choices(&self) {
+        if let Some(dir) = Path::new(CHOICES_PATH).parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(CHOICES_PATH, self.choices_text());
+    }
+}
+
+/// Pull a leading `v<N>;` version prefix off a saved mod blob. No prefix
+/// (or a prefix that isn't a `u16`) is version 0, the pre-versioning format.
+fn split_mod_version(data: &str) -> (u16, &str) {
+    let Some(rest) = data.strip_prefix('v') else {
+        return (0, data);
+    };
+    let Some((n, payload)) = rest.split_once(';') else {
+        return (0, data);
+    };
+    match n.parse::<u16>() {
+        Ok(version) => (version, payload),
+        Err(_) => (0, data),
     }
 }
 
@@ -651,6 +715,8 @@ impl Mods {
 mod tests {
     use super::*;
     use crate::block::element::El;
+    use crate::world::World;
+    use super::split_mod_version;
 
     #[test]
     fn stash_add_respects_capacity_per_item() {
@@ -758,6 +824,127 @@ mod tests {
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
         mods.set_enabled("INFINITEDiffusion", true);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+    }
+
+    #[test]
+    fn split_mod_version_reads_prefix_and_treats_absent_as_zero() {
+        assert_eq!(split_mod_version("Stone,Iron"), (0, "Stone,Iron"));
+        assert_eq!(split_mod_version("v1;Stone,Iron"), (1, "Stone,Iron"));
+        assert_eq!(split_mod_version("v0;"), (0, ""));
+        assert_eq!(split_mod_version("v12;a=b"), (12, "a=b"));
+        assert_eq!(split_mod_version("v;nope"), (0, "v;nope"));
+        assert_eq!(split_mod_version("vx;nope"), (0, "vx;nope"));
+    }
+
+    #[test]
+    fn save_states_key_by_id_and_load_accepts_display_name() {
+        let mut world = World::new(1);
+        let mut mods = Mods::with_defaults();
+        mods.on_block_break(&[El::Stone.id(), El::Iron.id()], &world);
+        let saved = mods.save_states(&world);
+        assert!(
+            saved.iter().any(|(k, _)| k == "inventory"),
+            "save keys are stable ids, not display names"
+        );
+        assert!(!saved.iter().any(|(k, _)| k == "Inventory"));
+        let data = saved
+            .iter()
+            .find(|(k, _)| k == "inventory")
+            .map(|(_, d)| d.clone())
+            .expect("inventory persists");
+
+        let mut by_id = Mods::with_defaults();
+        by_id.load_state("inventory", &data, &mut world);
+        assert_eq!(
+            by_id
+                .save_states(&world)
+                .iter()
+                .find(|(k, _)| k == "inventory")
+                .map(|(_, d)| d.as_str()),
+            Some(data.as_str())
+        );
+
+        let mut by_name = Mods::with_defaults();
+        by_name.load_state("Inventory", &data, &mut world);
+        assert_eq!(
+            by_name
+                .save_states(&world)
+                .iter()
+                .find(|(k, _)| k == "inventory")
+                .map(|(_, d)| d.as_str()),
+            Some(data.as_str())
+        );
+    }
+
+    #[test]
+    fn mod_state_round_trips_version_prefix() {
+        let mut world = World::new(1);
+        let mut mods = Mods::with_defaults();
+        mods.on_block_break(&[El::Stone.id(), El::Iron.id()], &world);
+        mods.load_state("Crafting", "*IronVein=2", &mut world);
+        let saved = mods.save_states(&world);
+        let inv = saved
+            .iter()
+            .find(|(k, _)| k == "inventory")
+            .map(|(_, d)| d.as_str())
+            .expect("inventory");
+        assert!(inv.starts_with("v1;"), "new writes encode a version prefix: {inv}");
+        let craft = saved
+            .iter()
+            .find(|(k, _)| k == "crafting")
+            .map(|(_, d)| d.as_str())
+            .expect("crafting");
+        assert_eq!(craft, "v1;*Stone+Iron=2");
+
+        let mut fresh = Mods::with_defaults();
+        for (k, v) in &saved {
+            fresh.load_state(k, v, &mut world);
+        }
+        assert_eq!(fresh.save_states(&world), saved);
+
+        // Unprefixed display-name key is version 0 and still migrates veins.
+        let mut legacy = Mods::with_defaults();
+        legacy.load_state("Crafting", "*IronVein=1", &mut world);
+        let craft = legacy
+            .save_states(&world)
+            .into_iter()
+            .find(|(k, _)| k == "crafting")
+            .map(|(_, d)| d)
+            .expect("crafting");
+        assert_eq!(craft, "v1;*Stone+Iron=1");
+    }
+
+    #[test]
+    fn choices_text_round_trips_and_ignores_junk() {
+        let mut mods = Mods::with_defaults();
+        let defaults = mods.choices_text();
+        assert!(defaults.contains("menus=on"));
+        assert!(defaults.contains("inventory=on"));
+        assert!(defaults.contains("crafting=on"));
+        assert!(defaults.contains("atmosphere=on"));
+        assert!(defaults.contains("post=on"));
+        assert!(defaults.contains("lighting=on"));
+        assert!(defaults.contains("diffusion=off"));
+
+        mods.set_enabled("lighting", false);
+        mods.set_enabled("diffusion", true);
+        let text = mods.choices_text();
+        assert!(text.contains("lighting=off"));
+        assert!(text.contains("diffusion=on"));
+
+        let mut fresh = Mods::with_defaults();
+        fresh.apply_choices_text(
+            "lighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\n",
+        );
+        let restored = fresh.choices_text();
+        assert!(restored.contains("lighting=off"));
+        assert!(restored.contains("inventory=off"));
+        assert!(restored.contains("diffusion=on"));
+        assert!(
+            restored.contains("menus=on"),
+            "malformed value must not change the default"
+        );
+        assert!(restored.contains("crafting=on"));
     }
 
     #[test]
