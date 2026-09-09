@@ -122,22 +122,17 @@ fn pick(
     }
 }
 
+fn nonempty_path(val: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let val = val.filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(val))
+}
+
 fn env_override() -> Option<PathBuf> {
-    let val = std::env::var_os(ENV_DATA_DIR)?;
-    if val.is_empty() {
-        None
-    } else {
-        Some(absolutize(PathBuf::from(val)))
-    }
+    nonempty_path(std::env::var_os(ENV_DATA_DIR)).map(absolutize)
 }
 
 fn env_checkout() -> Option<PathBuf> {
-    let val = std::env::var_os(ENV_CHECKOUT_DIR)?;
-    if val.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(val))
-    }
+    nonempty_path(std::env::var_os(ENV_CHECKOUT_DIR))
 }
 
 fn resolve_checkout(dir: Option<&Path>) -> Option<PathBuf> {
@@ -198,6 +193,16 @@ fn isolated_test_paths() -> Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonempty_path_drops_empty_and_absent() {
+        assert_eq!(nonempty_path(None), None);
+        assert_eq!(nonempty_path(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            nonempty_path(Some(std::ffi::OsString::from("/x"))),
+            Some(PathBuf::from("/x"))
+        );
+    }
 
     #[test]
     fn override_wins_over_saves_and_xdg() {

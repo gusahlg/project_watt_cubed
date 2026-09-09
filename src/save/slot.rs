@@ -64,6 +64,24 @@ pub struct Slot {
     pub meta: Result<SaveMeta, SaveError>,
 }
 
+#[cfg(test)]
+impl Slot {
+    /// Menu-list fixture: a readable slot whose display name matches the id.
+    pub fn for_test(name: &str, playtime_secs: u64, edit_count: u32) -> Self {
+        Self {
+            id: SlotId::new(name).expect("legal slot id"),
+            meta: Ok(SaveMeta {
+                name: name.to_string(),
+                seed: 1,
+                created: 0,
+                last_played: 10,
+                playtime_secs,
+                edit_count,
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SaveError {
     Io(io::Error),
@@ -95,6 +113,19 @@ impl From<io::Error> for SaveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_test_pins_the_menu_fixture_fields() {
+        let slot = Slot::for_test("alpha", 90, 3);
+        assert_eq!(slot.id.as_str(), "alpha");
+        let meta = slot.meta.expect("readable");
+        assert_eq!(meta.name, "alpha");
+        assert_eq!(meta.seed, 1);
+        assert_eq!(meta.created, 0);
+        assert_eq!(meta.last_played, 10);
+        assert_eq!(meta.playtime_secs, 90);
+        assert_eq!(meta.edit_count, 3);
+    }
 
     #[test]
     fn accepts_ordinary_names() {

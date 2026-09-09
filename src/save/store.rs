@@ -93,14 +93,16 @@ pub fn read(id: &SlotId) -> Result<(Decoded, Source), SaveError> {
     }
 }
 
+fn sibling_tmp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// Write `bytes` to `path` via a sibling `.tmp`, `sync_all`, then rename.
 /// A crash mid-write leaves the previous file intact. Success leaves no `.tmp`.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(".tmp");
-        PathBuf::from(name)
-    };
+    let tmp = sibling_tmp(path);
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -111,6 +113,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Create parent directories, then [`write_atomic`]. Settings, session, and
+/// mods.cfg persist through this.
+pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    write_atomic(path, bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn test_temp_path(tag: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "watt-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 /// Atomically replace a slot's bytes, rotating the previous file to `.bak`.
@@ -407,19 +428,8 @@ mod tests {
 
     #[test]
     fn write_atomic_leaves_no_tmp_on_success() {
-        let path = std::env::temp_dir().join(format!(
-            "watt-atomic-{}-{}.cfg",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let tmp = {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(".tmp");
-            PathBuf::from(name)
-        };
+        let path = test_temp_path("atomic").with_extension("cfg");
+        let tmp = sibling_tmp(&path);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&tmp);
         write_atomic(&path, b"ok\n").unwrap();
@@ -430,26 +440,24 @@ mod tests {
 
     #[test]
     fn write_atomic_into_unwritable_dir_is_err() {
-        let parent = std::env::temp_dir().join(format!(
-            "watt-atomic-notdir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(1)
-        ));
+        let parent = test_temp_path("atomic-notdir");
         let _ = fs::remove_file(&parent);
         let _ = fs::remove_dir_all(&parent);
         fs::write(&parent, b"not a directory").unwrap();
         let path = parent.join("mods.cfg");
         assert!(write_atomic(&path, b"nope").is_err());
-        let tmp = {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(".tmp");
-            PathBuf::from(name)
-        };
-        assert!(!tmp.exists(), "failed write must not leave a .tmp");
+        assert!(!sibling_tmp(&path).exists(), "failed write must not leave a .tmp");
         let _ = fs::remove_file(&parent);
+    }
+
+    #[test]
+    fn write_atomic_file_creates_missing_parents() {
+        let path = test_temp_path("atomic-nested").join("cfg").join("mods.cfg");
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        write_atomic_file(&path, b"nested\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"nested\n");
+        assert!(!sibling_tmp(&path).exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]

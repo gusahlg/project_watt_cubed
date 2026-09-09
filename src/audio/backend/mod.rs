@@ -6,13 +6,24 @@ pub(crate) mod null;
 #[cfg(test)]
 pub(crate) mod recording;
 
+use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use ::kira::sound::static_sound::StaticSoundData;
 use voxel_engine::DVec3;
 
 use super::acoustics::{Dsp, Listener};
 use super::voice::VoicePacket;
+
+/// Decode catalog bytes into kira PCM. Null and kira both must reject corrupt
+/// clips at load, even when there is nowhere to play them.
+pub(crate) fn decode_static(bytes: &[u8]) -> Result<(StaticSoundData, f32), String> {
+    let data = StaticSoundData::from_cursor(Cursor::new(bytes.to_vec()))
+        .map_err(|e| format!("clip decode: {e:?}"))?;
+    let duration_s = data.duration().as_secs_f32();
+    Ok((data, duration_s))
+}
 
 /// Handle to a live backend voice (clip layer or stream): a bare monotone counter
 /// minted per voice and never reused. Staleness needs no generation field — an id
@@ -79,4 +90,16 @@ pub(crate) trait Backend: ClipStore {
     /// 0.12 owns cpal internally and exposes no device-error callback — so its
     /// `alive()` stays `true` for its lifetime (needs a kira API upstream).
     fn alive(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn decode_static_rejects_garbage() {
+        let err = super::decode_static(b"not a wav").expect_err("garbage must fail");
+        assert!(
+            err.starts_with("clip decode:"),
+            "shared error prefix, got {err}"
+        );
+    }
 }

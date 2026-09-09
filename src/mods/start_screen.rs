@@ -370,24 +370,10 @@ fn text_row<A: Copy>(label: &str, buf: &EditBuf, masked: bool, tag: A) -> Row<A>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::menu::start::{fallback, VERSION};
+    use crate::menu::start::fallback;
     use crate::menu::{Dir, TextOp};
     use crate::mods::Mods;
-    use crate::save::{SaveError, SaveMeta, Slot, SlotId};
-
-    fn slot(name: &str, playtime_secs: u64, edit_count: u32) -> Slot {
-        Slot {
-            id: SlotId::new(name).expect("legal slot id"),
-            meta: Ok(SaveMeta {
-                name: name.to_string(),
-                seed: 1,
-                created: 0,
-                last_played: 10,
-                playtime_secs,
-                edit_count,
-            }),
-        }
-    }
+    use crate::save::{SaveError, Slot, SlotId};
 
     fn damaged(id: &str) -> Slot {
         Slot {
@@ -396,14 +382,19 @@ mod tests {
         }
     }
 
-    fn facts<'a>(saves: &'a [Slot], session: &'a Session, notice: Option<&'a str>) -> StartFacts<'a> {
-        StartFacts {
-            saves,
-            session,
-            version: VERSION,
-            hosting: false,
-            notice,
+    fn remembered(address: &str, port: &str, name: &str) -> Session {
+        Session {
+            address: address.into(),
+            port: port.into(),
+            name: name.into(),
         }
+    }
+
+    fn submit_form<const JOIN: bool>(session: &Session) -> Command {
+        let mut menu = ConnectionMenu::<JOIN>::new(session);
+        let mut settings = Settings::default();
+        let mut ctx = ctx(&mut settings, session);
+        menu.update(Msg::Pick(ConnectionAction::Submit), &mut ctx)
     }
 
     fn ctx<'a>(settings: &'a mut Settings, session: &'a Session) -> Ctx<'a> {
@@ -425,8 +416,8 @@ mod tests {
     #[test]
     fn start_mod_main_menu_rows_match_today() {
         let session = Session::default();
-        let saves = [slot("alpha", 3661, 7), damaged("broken")];
-        let f = facts(&saves, &session, Some("could not join: refused"));
+        let saves = [Slot::for_test("alpha", 3661, 7), damaged("broken")];
+        let f = StartFacts::test(&saves, &session, Some("could not join: refused"));
         let screen = open(&f);
         let model = screen.view(&f);
         assert_eq!(
@@ -472,8 +463,8 @@ mod tests {
     #[test]
     fn start_mod_picks_emit_start_actions() {
         let session = Session::default();
-        let saves = [slot("alpha", 0, 0)];
-        let f = facts(&saves, &session, None);
+        let saves = [Slot::for_test("alpha", 0, 0)];
+        let f = StartFacts::test(&saves, &session, None);
         let mut screen = open(&f);
         assert_eq!(
             screen.update(&[Intent::Confirm], &f),
@@ -486,7 +477,7 @@ mod tests {
             Some(StartAction::Load(saves[0].id.clone()))
         );
         // No saves: New World, Host, Join, Mods, Settings, Quit.
-        let empty = facts(&[], &session, None);
+        let empty = StartFacts::test(&[], &session, None);
         let mut screen = open(&empty);
         for _ in 0..4 {
             screen.update(&[Intent::Nav(Dir::Next)], &empty);
@@ -515,15 +506,8 @@ mod tests {
 
     #[test]
     fn host_form_round_trips_session_into_host_info() {
-        let session = Session {
-            address: "10.0.0.2".into(),
-            port: "7777".into(),
-            name: "Ada".into(),
-        };
-        let mut menu = HostMenu::new(&session);
-        let mut settings = Settings::default();
-        let mut ctx = ctx(&mut settings, &session);
-        match menu.update(Msg::Pick(ConnectionAction::Submit), &mut ctx) {
+        let session = remembered("10.0.0.2", "7777", "Ada");
+        match submit_form::<false>(&session) {
             Command::Effect(AppEffect::Host(info)) => {
                 assert_eq!(
                     info,
@@ -540,15 +524,8 @@ mod tests {
 
     #[test]
     fn join_form_round_trips_session_into_join_info() {
-        let session = Session {
-            address: "10.0.0.2".into(),
-            port: "7777".into(),
-            name: "Ada".into(),
-        };
-        let mut menu = JoinMenu::new(&session);
-        let mut settings = Settings::default();
-        let mut ctx = ctx(&mut settings, &session);
-        match menu.update(Msg::Pick(ConnectionAction::Submit), &mut ctx) {
+        let session = remembered("10.0.0.2", "7777", "Ada");
+        match submit_form::<true>(&session) {
             Command::Effect(AppEffect::Join(info)) => {
                 assert_eq!(
                     info,
@@ -566,12 +543,8 @@ mod tests {
 
     #[test]
     fn host_form_via_start_screen_uses_remembered_session() {
-        let session = Session {
-            address: "ignored-for-host".into(),
-            port: "6000".into(),
-            name: "Sam".into(),
-        };
-        let f = facts(&[], &session, None);
+        let session = remembered("ignored-for-host", "6000", "Sam");
+        let f = StartFacts::test(&[], &session, None);
         let mut screen = open(&f);
         // New World -> Host Server
         screen.update(&[Intent::Nav(Dir::Next)], &f);
@@ -589,12 +562,8 @@ mod tests {
 
     #[test]
     fn join_form_via_start_screen_uses_remembered_session() {
-        let session = Session {
-            address: "8.8.8.8".into(),
-            port: "6000".into(),
-            name: "Sam".into(),
-        };
-        let f = facts(&[], &session, None);
+        let session = remembered("8.8.8.8", "6000", "Sam");
+        let f = StartFacts::test(&[], &session, None);
         let mut screen = open(&f);
         // New World -> Host -> Join
         screen.update(&[Intent::Nav(Dir::Next)], &f);
@@ -636,11 +605,7 @@ mod tests {
 
     #[test]
     fn empty_port_means_default_port() {
-        let session = Session {
-            address: String::new(),
-            port: String::new(),
-            name: String::new(),
-        };
+        let session = remembered("", "", "");
         let mut menu = HostMenu::new(&session);
         let mut settings = Settings::default();
         let mut ctx = ctx(&mut settings, &session);
@@ -660,7 +625,7 @@ mod tests {
     #[test]
     fn first_enabled_start_screen_wins_and_disabled_falls_back() {
         let session = Session::default();
-        let f = facts(&[], &session, None);
+        let f = StartFacts::test(&[], &session, None);
         let mods = Mods::with_defaults();
         let screen = mods.start_screen(&f).expect("default start mod is on");
         assert_eq!(screen.view(&f).labels()[0], "New World");

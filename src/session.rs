@@ -34,33 +34,23 @@ impl Session {
     pub fn load() -> Self {
         let mut s = Self::default();
         if let Ok(text) = fs::read_to_string(session_path()) {
-            for line in text.lines() {
-                let Some((key, value)) = line.split_once('=') else {
-                    continue;
-                };
-                let value = value.trim().to_string();
-                match key.trim() {
-                    "address" => s.address = value,
-                    "port" => s.port = value,
-                    "name" => s.name = value,
-                    _ => {}
-                }
-            }
+            crate::settings::each_kv_line(&text, |key, value| match key {
+                "address" => s.address = value.to_string(),
+                "port" => s.port = value.to_string(),
+                "name" => s.name = value.to_string(),
+                _ => {}
+            });
         }
         s
     }
 
     /// Best-effort save (a failed write shouldn't crash the game).
     pub fn save(&self) {
-        let path = session_path();
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
         let text = format!(
             "address={}\nport={}\nname={}\n",
             self.address, self.port, self.name
         );
-        let _ = crate::save::write_atomic(&path, text.as_bytes());
+        let _ = crate::save::write_atomic_file(&session_path(), text.as_bytes());
     }
 }
 

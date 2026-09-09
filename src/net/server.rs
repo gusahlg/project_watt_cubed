@@ -1378,6 +1378,22 @@ mod tests {
         })
     }
 
+    fn hello(name: &str, password: &str, protocol: u32, fingerprint: u64) -> ClientMessage {
+        ClientMessage::Hello {
+            protocol,
+            fingerprint,
+            name: name.into(),
+            password: password.into(),
+        }
+    }
+
+    fn reject_reason(addr: SocketAddr, msg: &ClientMessage) -> String {
+        match raw_reply(addr, msg) {
+            ServerMessage::Reject { reason } => reason.to_string(),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
         State {
             edits: HashMap::new(),
@@ -1807,18 +1823,16 @@ mod tests {
     #[test]
     fn mismatched_content_fingerprint_is_rejected() {
         let handle = spawn(0, Config { password: String::new(), seed: 3, ..Config::default() }).unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint() ^ 1,
-            name: "drifted".into(),
-            password: "".into(),
-        };
-        match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Reject { reason } => {
-                assert!(reason.contains("content"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected a content-mismatch rejection, got {other:?}"),
-        }
+        let reason = reject_reason(
+            handle.addr(),
+            &hello(
+                "drifted",
+                "",
+                PROTOCOL_VERSION,
+                crate::net::content_fingerprint() ^ 1,
+            ),
+        );
+        assert!(reason.contains("content"), "unexpected reason: {reason}");
         handle.stop();
     }
 
@@ -1834,18 +1848,16 @@ mod tests {
             },
         )
         .unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
-            name: "classic".into(),
-            password: "".into(),
-        };
-        match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Reject { reason } => {
-                assert!(reason.contains("content"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected a content-mismatch rejection, got {other:?}"),
-        }
+        let reason = reject_reason(
+            handle.addr(),
+            &hello(
+                "classic",
+                "",
+                PROTOCOL_VERSION,
+                crate::net::content_fingerprint(),
+            ),
+        );
+        assert!(reason.contains("content"), "unexpected reason: {reason}");
         handle.stop();
     }
 
@@ -1863,15 +1875,12 @@ mod tests {
             },
         )
         .unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint_kind_cfg(
-                WorldgenKind::Diffusion,
-                diffusion,
-            ),
-            name: "guest".into(),
-            password: "".into(),
-        };
+        let hello = hello(
+            "guest",
+            "",
+            PROTOCOL_VERSION,
+            crate::net::content_fingerprint_kind_cfg(WorldgenKind::Diffusion, diffusion),
+        );
         match raw_reply(handle.addr(), &hello) {
             ServerMessage::Welcome {
                 worldgen,
@@ -2235,36 +2244,16 @@ mod tests {
     fn refused_joins_release_the_pre_auth_slot() {
         let handle = spawn(0, Config { password: "pw".into(), seed: 1, ..Config::default() }).unwrap();
         let addr = handle.addr();
-        let bad_pw = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
-            name: "eve".into(),
-            password: "nope".into(),
-        };
-        match raw_reply(addr, &bad_pw) {
-            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("password")),
-            other => panic!("expected password reject, got {other:?}"),
-        }
-        let bad_proto = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION.wrapping_add(1),
-            fingerprint: crate::net::content_fingerprint(),
-            name: "eve".into(),
-            password: "pw".into(),
-        };
-        match raw_reply(addr, &bad_proto) {
-            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("protocol")),
-            other => panic!("expected protocol reject, got {other:?}"),
-        }
-        let bad_fp = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint() ^ 1,
-            name: "eve".into(),
-            password: "pw".into(),
-        };
-        match raw_reply(addr, &bad_fp) {
-            ServerMessage::Reject { reason } => assert!(reason.contains("content")),
-            other => panic!("expected fingerprint reject, got {other:?}"),
-        }
+        let fp = crate::net::content_fingerprint();
+        let reason = reject_reason(addr, &hello("eve", "nope", PROTOCOL_VERSION, fp));
+        assert!(reason.to_lowercase().contains("password"));
+        let reason = reject_reason(
+            addr,
+            &hello("eve", "pw", PROTOCOL_VERSION.wrapping_add(1), fp),
+        );
+        assert!(reason.to_lowercase().contains("protocol"));
+        let reason = reject_reason(addr, &hello("eve", "pw", PROTOCOL_VERSION, fp ^ 1));
+        assert!(reason.contains("content"));
         let deadline = Instant::now() + Duration::from_secs(5);
         while handle.handshake_slots() != 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
