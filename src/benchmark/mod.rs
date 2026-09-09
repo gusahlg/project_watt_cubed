@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voxel_engine::{DVec3, Engine};
 
 use crate::settings::Settings;
-use crate::world::{StreamGauges, World};
+use crate::world::{MemoryCensus, StreamGauges, World};
 
 use json::Json;
 use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
@@ -27,7 +27,7 @@ const DEFAULT_WARMUP_SECS: f64 = 3.0;
 const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;
 const MAX_DURATION_SECS: f64 = 600.0;
 const MAX_SAMPLE_RESERVE: usize = 2_000_000;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// What the app should do after advancing the recorder by one callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +72,10 @@ pub struct Benchmark {
     rss_peak_bytes: Option<u64>,
     last_rss_poll: Instant,
     ready_wait_logs: u32,
+    /// Wall seconds from [`Self::begin`] (first bench frame) to the first
+    /// `entry_complete` frame. `None` if the world never settled.
+    entry_seconds: Option<f64>,
+    census_ready: Option<MemoryCensus>,
 }
 
 impl Benchmark {
@@ -132,7 +136,21 @@ impl Benchmark {
             rss_peak_bytes: None,
             last_rss_poll: now,
             ready_wait_logs: 0,
+            entry_seconds: None,
+            census_ready: None,
         })
+    }
+
+    /// First time `world` reports `entry_complete`, stamp `entry_seconds` and
+    /// the ready-time census. Later calls are no-ops.
+    pub fn observe_ready(&mut self, world: &World) {
+        if !world.entry_complete() {
+            return;
+        }
+        self.stamp_ready();
+        if self.census_ready.is_none() {
+            self.census_ready = Some(world.memory_census());
+        }
     }
 
     pub fn has_started(&self) -> bool {
@@ -197,6 +215,9 @@ impl Benchmark {
                     .elapsed();
                 let minimum_met = elapsed >= self.min_warmup;
                 let timed_out = elapsed >= self.min_warmup.saturating_add(self.ready_timeout);
+                if world_ready {
+                    self.stamp_ready();
+                }
                 if !minimum_met || (!world_ready && !timed_out) {
                     return Step::Warming;
                 }
@@ -216,6 +237,9 @@ impl Benchmark {
                 Step::Warming
             }
             Phase::Measuring => {
+                if world_ready {
+                    self.stamp_ready();
+                }
                 if dt.is_finite() && dt > 0.0 {
                     self.samples.push(dt);
                 }
@@ -248,6 +272,7 @@ impl Benchmark {
         }
         let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
         let stats = FrameStats::from_samples(&self.samples, wall);
+        let census_end = world.memory_census();
         let visuals = std::env::var("WATT_BENCH_VISUALS").ok();
         let report = Json::object(vec![
             ("schema_version", Json::from(SCHEMA_VERSION)),
@@ -301,6 +326,10 @@ impl Benchmark {
                     ),
                     ("ready_at_end", Json::from(world.entry_complete())),
                     (
+                        "entry_seconds",
+                        Json::optional_number(self.entry_seconds),
+                    ),
+                    (
                         "profiling_enabled",
                         Json::from(matches!(
                             std::env::var("WATT_BENCH_PROFILE").as_deref(),
@@ -316,6 +345,11 @@ impl Benchmark {
                     ("rss_start_bytes", Json::optional_u64(self.rss_start_bytes)),
                     ("rss_peak_bytes", Json::optional_u64(self.rss_peak_bytes)),
                     ("rss_end_bytes", Json::optional_u64(rss_end_bytes)),
+                    (
+                        "census_ready",
+                        self.census_ready.map_or(Json::Null, census_json),
+                    ),
+                    ("census_end", census_json(census_end)),
                 ]),
             ),
             (
@@ -332,7 +366,7 @@ impl Benchmark {
         ]);
         let json = report.render();
         let summary = format!(
-            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} preset={} window={}x{} gpu={}",
+            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} ready_s={} preset={} window={}x{} gpu={}",
             stats.frames,
             fmt_opt(stats.avg_fps, 0),
             fmt_opt(stats.p1_fps, 0),
@@ -342,16 +376,41 @@ impl Benchmark {
             stats.over_33ms,
             rss_end_bytes.unwrap_or(0) / (1024 * 1024),
             self.ready_before_measure,
+            fmt_opt(self.entry_seconds, 3),
             settings.preset.label().to_ascii_lowercase(),
             eng.screen_width(),
             eng.screen_height(),
             self.system.as_ref().map_or("unknown", SystemInfo::gpu_name),
         );
+        let mem_line = format!(
+            "BENCH_MEM ready_total={} end_total={} chunks=u{}/p{}/d{} light_cells={} mesh={} edits={} lod={} queues={}",
+            self.census_ready.map_or_else(|| "n/a".into(), |c| c.total.to_string()),
+            census_end.total,
+            census_end.chunk_uniform_count,
+            census_end.chunk_paletted_count,
+            census_end.chunk_dense_count,
+            census_end.light_cells_count,
+            census_end.mesh_cpu_bytes,
+            census_end.edit_overlay_bytes,
+            census_end.section_lod_bytes,
+            census_end.worklist_bytes,
+        );
         Report {
             summary,
+            mem_line,
             json,
             output: self.output.clone(),
         }
+    }
+
+    fn stamp_ready(&mut self) {
+        if self.entry_seconds.is_some() {
+            return;
+        }
+        let Some(started) = self.warmup_started else {
+            return;
+        };
+        self.entry_seconds = Some(started.elapsed().as_secs_f64());
     }
 
     fn poll_rss(&mut self) {
@@ -367,6 +426,7 @@ impl Benchmark {
 
 pub struct Report {
     summary: String,
+    mem_line: String,
     json: String,
     output: Option<PathBuf>,
 }
@@ -374,6 +434,7 @@ pub struct Report {
 impl Report {
     pub fn emit(self) {
         println!("{}", self.summary);
+        println!("{}", self.mem_line);
         println!("BENCH_JSON {}", self.json);
         let Some(path) = self.output else { return };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
@@ -490,6 +551,11 @@ impl FrameStats {
             ("frames_over_16_67ms", Json::from(self.over_16ms)),
             ("frames_over_33_33ms", Json::from(self.over_33ms)),
             ("frames_over_50ms", Json::from(self.over_50ms)),
+            // Engine::frames_rendered / frames_coalesced are not on this engine
+            // revision; filled when those accessors land.
+            ("rendered", Json::Null),
+            ("coalesced", Json::Null),
+            ("rendered_fps", Json::Null),
         ])
     }
 }
@@ -581,6 +647,26 @@ impl StreamPeaks {
             ("minimum_effort", Json::number(f64::from(self.min_effort))),
         ])
     }
+}
+
+fn census_json(c: MemoryCensus) -> Json {
+    Json::object(vec![
+        ("chunk_uniform_bytes", Json::from(c.chunk_uniform_bytes)),
+        ("chunk_uniform_count", Json::from(c.chunk_uniform_count)),
+        ("chunk_paletted_bytes", Json::from(c.chunk_paletted_bytes)),
+        ("chunk_paletted_count", Json::from(c.chunk_paletted_count)),
+        ("chunk_dense_bytes", Json::from(c.chunk_dense_bytes)),
+        ("chunk_dense_count", Json::from(c.chunk_dense_count)),
+        ("light_uniform_bytes", Json::from(c.light_uniform_bytes)),
+        ("light_uniform_count", Json::from(c.light_uniform_count)),
+        ("light_cells_bytes", Json::from(c.light_cells_bytes)),
+        ("light_cells_count", Json::from(c.light_cells_count)),
+        ("mesh_cpu_bytes", Json::from(c.mesh_cpu_bytes)),
+        ("edit_overlay_bytes", Json::from(c.edit_overlay_bytes)),
+        ("section_lod_bytes", Json::from(c.section_lod_bytes)),
+        ("worklist_bytes", Json::from(c.worklist_bytes)),
+        ("total", Json::from(c.total)),
+    ])
 }
 
 fn stream_gauges_json(g: StreamGauges) -> Json {
@@ -710,7 +796,53 @@ mod tests {
             rss_peak_bytes: None,
             last_rss_poll: Instant::now(),
             ready_wait_logs: 0,
+            entry_seconds: None,
+            census_ready: None,
         }
+    }
+
+    #[test]
+    fn entry_seconds_stamps_on_the_first_ready_frame() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_secs(60));
+        bench.begin();
+        bench.warmup_started = Some(Instant::now() - Duration::from_millis(250));
+        let gauges = StreamGauges::default();
+        assert_eq!(bench.step(0.016, false, gauges), Step::Warming);
+        assert!(bench.entry_seconds.is_none());
+        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        let secs = bench.entry_seconds.expect("ready frame stamps entry_seconds");
+        assert!(secs >= 0.25, "got {secs}");
+        assert!(secs < 2.0, "got {secs}");
+        assert_eq!(bench.step(0.016, true, gauges), Step::Measuring);
+        let again = bench.entry_seconds.expect("stays set");
+        assert_eq!(format!("{secs:.6}"), format!("{again:.6}"));
+    }
+
+    #[test]
+    fn census_json_contains_the_new_fields() {
+        let json = census_json(MemoryCensus {
+            chunk_uniform_bytes: 4,
+            chunk_uniform_count: 1,
+            total: 4,
+            ..MemoryCensus::default()
+        })
+        .render();
+        assert!(json.contains("\"chunk_uniform_bytes\":4"));
+        assert!(json.contains("\"chunk_uniform_count\":1"));
+        assert!(json.contains("\"light_cells_bytes\":0"));
+        assert!(json.contains("\"mesh_cpu_bytes\":0"));
+        assert!(json.contains("\"total\":4"));
+        let frames = FrameStats::from_samples(&[], Duration::ZERO).to_json().render();
+        assert!(frames.contains("\"rendered\":null"));
+        assert!(frames.contains("\"coalesced\":null"));
+        assert!(frames.contains("\"rendered_fps\":null"));
+        let scenario = Json::object(vec![
+            ("entry_seconds", Json::optional_number(Some(1.5))),
+        ])
+        .render();
+        assert!(scenario.contains("\"entry_seconds\":1.5"));
+        let missing = Json::object(vec![("entry_seconds", Json::optional_number(None))]).render();
+        assert!(missing.contains("\"entry_seconds\":null"));
     }
 
     #[test]

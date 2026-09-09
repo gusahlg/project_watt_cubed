@@ -105,6 +105,11 @@ impl LightGrid {
         }
     }
 
+    /// Heap bytes of the dense cell array (always allocated today).
+    pub fn allocated_bytes(&self) -> usize {
+        std::mem::size_of_val(self.cells.as_ref())
+    }
+
     #[inline]
     pub fn at(&self, idx: usize) -> Lumel {
         self.cells[idx]

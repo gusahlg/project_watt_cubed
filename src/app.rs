@@ -265,6 +265,7 @@ impl App {
         }
 
         let bench = self.bench.as_mut().expect("bench exists");
+        bench.observe_ready(game.world());
         let step = bench.step(
             dt,
             game.world().entry_complete(),

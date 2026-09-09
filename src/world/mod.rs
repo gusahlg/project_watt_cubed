@@ -42,6 +42,7 @@ pub mod placement;
 pub mod pyramid;
 pub mod section;
 
+mod census;
 mod coverage;
 mod edits;
 mod heightmip;
@@ -160,6 +161,8 @@ pub struct StreamGauges {
     pub travel_speed_mps: f64,
     pub effort: f32,
 }
+
+pub use census::MemoryCensus;
 use connectivity::{Connectivity, Occlusion};
 
 /// The streamed chunk volume around the player: a horizontal ring radius and a
