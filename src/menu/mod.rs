@@ -10,9 +10,11 @@ use crate::settings::Settings;
 
 pub mod input;
 pub mod menus;
+pub mod start;
 pub mod theme;
 
 pub use input::gather;
+pub use start::{HostInfo, JoinInfo, MenuModel, StartAction, StartFacts, StartScreen, VERSION};
 pub use theme::{DefaultTheme, MenuTheme as _, PresentedRow, PresentedView, RowRect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,12 +179,17 @@ pub enum Command {
 }
 
 /// A side effect only the App can carry out. Menus emit these instead of
-/// touching app state.
+/// touching app state. Start-screen actions ([`StartAction`]) map 1:1 onto
+/// the start-related variants; the rest are mods-menu effects.
 pub enum AppEffect {
     NewWorld,
-    Load(String),
+    Load(crate::save::SlotId),
     Host(HostInfo),
     Join(JoinInfo),
+    /// Push the core Settings hub (start screens emit this instead of pushing).
+    Settings,
+    /// Push the core Mods screen (start screens emit this instead of pushing).
+    Mods,
     ToggleMod(usize),
     StepModKnob { mod_index: usize, knob: usize, delta: i32 },
     /// Enable or disable every member of a group (persists as per-mod lines).
@@ -316,6 +323,12 @@ impl<M: Menu> Framed<M> {
     {
         Box::new(Self::new(menu))
     }
+
+    pub fn view_sel(&self, ctx: &Ctx) -> (View<M::Action>, usize) {
+        let view = self.menu.view(ctx);
+        let sel = self.cursor.resolved(&view);
+        (view, sel)
+    }
 }
 
 impl<M: Menu> Screen for Framed<M> {
@@ -363,6 +376,10 @@ impl MenuStack {
             }
             Command::Effect(effect) => Some(effect),
         }
+    }
+
+    pub fn push(&mut self, screen: Box<dyn Screen>) {
+        self.frames.push(screen);
     }
 
     pub fn draw(&self, ctx: &Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {
@@ -475,19 +492,6 @@ pub fn present<A: Copy>(view: &View<A>, scale: f32) -> PresentedView {
         hint: view.hint.clone(),
         notice: view.notice.clone(),
     }
-}
-
-pub struct HostInfo {
-    pub port: u16,
-    pub password: String,
-    pub name: String,
-}
-
-pub struct JoinInfo {
-    pub host: String,
-    pub port: u16,
-    pub password: String,
-    pub name: String,
 }
 
 pub const PORT_ERROR: &str = "invalid port (1-65535)";

@@ -15,7 +15,8 @@ use crate::audio::{AudioDirector, CuePalette, CueSymbols, OneShot, SoundConfig, 
 use crate::benchmark::{Benchmark, Step as BenchmarkStep};
 use crate::game::{Game, Signal};
 use crate::input::router::{Context, Router, View};
-use crate::menu::menus::MainMenu;
+use crate::menu::menus::{ModsMenu, SettingsHub};
+use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
 use crate::mods::Mods;
@@ -148,12 +149,13 @@ impl App {
             eprintln!("{w}");
         }
         let audio = AudioDirector::new(palette);
+        let screen = Screen::Menus(Self::start_stack(&mods, &saves, &session, None, false));
         Self {
             saves,
             active: None,
             router: Router::new(),
             mods,
-            screen: Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::new()))),
+            screen,
             host: None,
             settings,
             session,
@@ -358,7 +360,7 @@ impl App {
     fn handle_effect(&mut self, eng: &mut Engine, effect: AppEffect) -> bool {
         match effect {
             AppEffect::NewWorld => self.start_new_world(eng),
-            AppEffect::Load(name) => self.load_world(eng, &name),
+            AppEffect::Load(id) => self.load_world(eng, &id),
             AppEffect::Host(info) => {
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();
@@ -371,6 +373,16 @@ impl App {
                 self.session.name = info.name.clone();
                 self.session.save();
                 self.start_join(eng, info);
+            }
+            AppEffect::Settings => {
+                if let Screen::Menus(stack) = &mut self.screen {
+                    stack.push(Framed::boxed(SettingsHub));
+                }
+            }
+            AppEffect::Mods => {
+                if let Screen::Menus(stack) = &mut self.screen {
+                    stack.push(Framed::boxed(ModsMenu));
+                }
             }
             AppEffect::ToggleMod(index) => {
                 self.mods.toggle(index);
@@ -393,6 +405,27 @@ impl App {
         false
     }
 
+    /// Open the start screen: first enabled start-screen mod, else the core fallback.
+    fn start_stack(
+        mods: &Mods,
+        saves: &[Slot],
+        session: &Session,
+        notice: Option<&str>,
+        hosting: bool,
+    ) -> MenuStack {
+        let facts = StartFacts {
+            saves,
+            session,
+            version: VERSION,
+            hosting,
+            notice,
+        };
+        let inner = mods
+            .start_screen(&facts)
+            .unwrap_or_else(|| crate::menu::start::fallback(&facts));
+        MenuStack::new(StartRoot::wrap(inner, hosting))
+    }
+
     /// Return to the start menu with an optional notice (e.g. a failed connect).
     fn return_to_menu(&mut self, notice: Option<String>) {
         self.sound.leave_world();
@@ -401,7 +434,13 @@ impl App {
         self.audio.enter_world();
         self.active = None;
         self.saves = save::list();
-        self.screen = Screen::Menus(MenuStack::new(Framed::boxed(MainMenu::with_notice(notice))));
+        self.screen = Screen::Menus(Self::start_stack(
+            &self.mods,
+            &self.saves,
+            &self.session,
+            notice.as_deref(),
+            self.host.is_some(),
+        ));
     }
 
     /// Spin up a fresh integrated server and join it on loopback. Any previous host
@@ -520,14 +559,10 @@ impl App {
     }
 
     /// Load an existing save and enter it. Stays on the menu if loading fails.
-    fn load_world(&mut self, eng: &mut Engine, name: &str) {
-        let id = match SlotId::new(name) {
-            Ok(id) => id,
-            Err(e) => return self.fail_to_menu(format!("could not load {name}: {e}")),
-        };
+    fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
         self.mods.reset_state();
         let render = self.mods.effective_render(&self.settings);
-        match save::load(&id, &mut self.mods, |seed, kind, cfg| {
+        match save::load(id, &mut self.mods, |seed, kind, cfg| {
             // The save header names the generator; the InfiniteDiffusion mod's
             // enabled flag only chooses the next *new* world.
             World::with_kind_cfg(seed, render, kind, cfg, false)
@@ -546,7 +581,7 @@ impl App {
                 }
                 self.enter_game(eng, game)
             }
-            Err(e) => self.fail_to_menu(format!("could not load {name}: {e}")),
+            Err(e) => self.fail_to_menu(format!("could not load {id}: {e}")),
         }
     }
 

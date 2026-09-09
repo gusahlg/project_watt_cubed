@@ -12,6 +12,7 @@ pub mod crafting;
 pub mod diffusion;
 pub mod inventory;
 pub mod menu_default;
+pub mod start_screen;
 pub mod visuals;
 
 use std::cell::{Cell, RefCell};
@@ -20,6 +21,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::block::ElementId;
+use crate::menu::start::{StartFacts, StartScreen};
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
@@ -291,7 +293,7 @@ pub struct ModContext<'a> {
 /// Arbitration when more than one enabled mod implements a hook:
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
 ///   `on_place_rejected`. `hud` uses the same order as z-order (later draws on top).
-/// - **First enabled wins**: `menu_theme`, `close_overlay` (first `true`),
+/// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` (first `true`),
 ///   `worldgen`, `worldgen_config`.
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
@@ -371,6 +373,14 @@ pub trait Mod {
         None
     }
 
+    /// Optional start screen. First enabled mod that returns `Some` wins;
+    /// the core fallback (New world / Load / Settings / Mods / Quit) is used
+    /// when every enabled mod returns `None`. Plain-data signatures only.
+    fn start_screen(&self, facts: &StartFacts) -> Option<Box<dyn StartScreen>> {
+        let _ = facts;
+        None
+    }
+
     /// Serialise persistent state, or `None` if the mod has nothing to persist.
     /// The `u16` is the payload version; [`Mods::save_states`] encodes it as a
     /// `v<N>;` prefix so the save codec stays a plain string.
@@ -441,14 +451,15 @@ impl Mods {
     pub const GROUPS: &[Group] = &[Group {
         id: ESSENTIALS,
         name: "Essentials",
-        description: "The built-in mods that make the game playable as shipped: menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core.",
+        description: "The built-in mods that make the game playable as shipped: the start screen, menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core.",
     }];
 
     /// The default install: the menu mod (look/feel of every out-of-game
-    /// screen) first, then the bare-list inventory mod and the crafting mod,
-    /// all enabled. Inventory and crafting share one [`ElementStash`] —
-    /// inventory fills it from broken blocks, crafting spends it. Menus goes
-    /// first so it wins the first-handler dispatch below by default.
+    /// screen) first, then the start-screen mod (main/load/host/join content),
+    /// then the bare-list inventory mod and the crafting mod, all enabled.
+    /// Inventory and crafting share one [`ElementStash`] — inventory fills it
+    /// from broken blocks, crafting spends it. Menus goes first so it wins
+    /// the first-handler dispatch below by default.
     pub fn with_defaults() -> Self {
         let mut mods = Self {
             entries: Vec::new(),
@@ -456,6 +467,7 @@ impl Mods {
         let stash = Rc::new(RefCell::new(ElementStash::new(inventory::START_CAPACITY)));
         let item_ui = Rc::new(Cell::new(ItemUiState::default()));
         mods.install(Box::new(menu_default::MenuDefaultMod::new()), true);
+        mods.install(Box::new(start_screen::StartScreenMod::new()), true);
         mods.install(
             Box::new(inventory::InventoryMod::new(stash.clone(), item_ui.clone())),
             true,
@@ -549,6 +561,15 @@ impl Mods {
             .iter()
             .filter(|e| e.enabled)
             .find_map(|e| e.module.menu_theme())
+    }
+
+    /// First enabled mod that returns a start screen wins. `None` means the
+    /// core fallback should be used.
+    pub fn start_screen(&self, facts: &StartFacts) -> Option<Box<dyn StartScreen>> {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.start_screen(facts))
     }
 
     /// Number of installed mods (for the mod menu).
@@ -1045,6 +1066,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         let defaults = mods.choices_text();
         assert!(defaults.contains("menus=on"));
+        assert!(defaults.contains("start=on"));
         assert!(defaults.contains("inventory=on"));
         assert!(defaults.contains("crafting=on"));
         assert!(defaults.contains("atmosphere=on"));
@@ -1170,7 +1192,7 @@ mod tests {
         assert_eq!(g.name, "Essentials");
         assert_eq!(
             g.description,
-            "The built-in mods that make the game playable as shipped: menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core."
+            "The built-in mods that make the game playable as shipped: the start screen, menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core."
         );
         let members: Vec<&str> = (0..mods.len())
             .filter(|&i| mods.group(i) == ESSENTIALS)
@@ -1180,6 +1202,7 @@ mod tests {
             members,
             [
                 "menus",
+                "start",
                 "inventory",
                 "crafting",
                 "atmosphere",
@@ -1199,6 +1222,7 @@ mod tests {
         let text = mods.choices_text();
         for id in [
             "menus",
+            "start",
             "inventory",
             "crafting",
             "atmosphere",
@@ -1228,6 +1252,7 @@ mod tests {
         let on_text = fresh.choices_text();
         for id in [
             "menus",
+            "start",
             "inventory",
             "crafting",
             "atmosphere",
