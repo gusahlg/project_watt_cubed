@@ -283,17 +283,9 @@ fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
 /// Apply `delta` one axis at a time so the player slides along walls instead of
 /// sticking, and detects when they land on the ground.
 ///
-/// Each axis clamps to ±[`WORLD_BORDER`] as it moves (every substep clamps):
-/// the world border IS the clamp. Movement (the only continuous position writer
-/// besides `/tp`, which clamps the same way) can therefore never carry a
-/// coordinate past ±1e9, the invariant
-/// [`block_coord`](crate::math::block_coord)'s overflow-free i32 block math
-/// rests on.
-///
-/// Axis deltas larger than [`MAX_COLLISION_STEP`] are applied in substeps (see
-/// [`step_axis`]) so a fast fall stops at the first solid cell it crosses
-/// instead of tunneling past thin terrain; a blocked axis leaves the position
-/// at the last collision-free substep.
+/// Every substep clamps to ±[`WORLD_BORDER`]. Positions stay inside the range
+/// [`math::block_coord`](crate::math::block_coord) assumes. Axis deltas larger
+/// than [`MAX_COLLISION_STEP`] go through [`step_axis`] substeps.
 fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 {
     let mut pos = player.position;
     let stance = player.stance;
@@ -358,16 +350,12 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 
 
 /// Move `pos` along one `axis` (0 = x, 1 = y, 2 = z) by `delta`, clamping to
 /// ±[`WORLD_BORDER`], and stop at the first colliding position. Returns `true`
-/// if the move hit something; `pos` is then the last collision-free point
-/// reached along the way.
+/// if the move hit something; `pos` is then the last collision-free point.
 ///
-/// Deltas of at most [`MAX_COLLISION_STEP`] take a fast path that is the exact
-/// historical single-endpoint test (same float ops), so ordinary per-frame
-/// movement is untouched. Larger deltas — a long fall, a dt spike — are split
-/// into `ceil(|delta| / 0.5)` substeps (≈ 12 at terminal velocity under the
-/// game's 0.1 s dt clamp) so no solid cell thicker than half a block can be
-/// jumped over. The final substep lands exactly on the single-step endpoint, so
-/// an unobstructed move is identical either way.
+/// `|delta| <= MAX_COLLISION_STEP`: one endpoint test. Larger deltas split into
+/// `ceil(|delta| / 0.5)` substeps (~12 at terminal velocity under the 0.1 s dt
+/// clamp). The last substep is the single-step endpoint, so an unobstructed
+/// move matches the one-step path.
 fn step_axis(
     pos: &mut DVec3,
     axis: usize,
@@ -383,9 +371,7 @@ fn step_axis(
     }
     let start = pos[axis];
 
-    // Fast path: the common per-frame case, identical to the pre-substepping
-    // behavior. Noclip clamps to the border but never consults geometry, so it
-    // always lands on the endpoint and reports unblocked.
+    // Fast path. Noclip clamps to the border and skips geometry.
     if noclip || delta.abs() <= MAX_COLLISION_STEP {
         pos[axis] = (start + delta).clamp(-WORLD_BORDER, WORLD_BORDER);
         if !noclip && world.collides(&collision_box(*pos, stance)) {
