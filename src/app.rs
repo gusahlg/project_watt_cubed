@@ -754,7 +754,10 @@ fn spawn_player(world: &World) -> Player {
 }
 
 fn spawn_player_diffusion(world: &World, sea: i32) -> Player {
-    let mut seen = std::collections::HashSet::new();
+    // Same 8-direction spiral as classic, bounded to 8 rings. Each unique
+    // 16×16 chunk column is one `heights_16` sample (one field tile).
+    let mut seen = [(i32::MAX, i32::MAX); 32];
+    let mut n = 0usize;
     for r in 0i32..8 {
         for (dx, dz) in [
             (r, 0),
@@ -768,9 +771,11 @@ fn spawn_player_diffusion(world: &World, sea: i32) -> Player {
         ] {
             let cx = (dx * 8).div_euclid(16);
             let cz = (dz * 8).div_euclid(16);
-            if !seen.insert((cx, cz)) {
+            if seen[..n].contains(&(cx, cz)) {
                 continue;
             }
+            seen[n] = (cx, cz);
+            n += 1;
             let heights = world.heights_16(cx, cz);
             for lz in 0..16 {
                 for lx in 0..16 {

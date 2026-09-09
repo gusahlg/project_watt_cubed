@@ -1071,13 +1071,19 @@ impl World {
         };
         match key {
             pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                // A cancelled spawn-slab column must be re-requested even when
+                // the pool dropped it as out-of-view: physics is frozen on it.
+                let in_slab = self.spawn_slab.is_some_and(|slab| {
+                    cy.clone()
+                        .any(|y| slab.contains(Coord::new(cx, y, cz)))
+                });
                 for cyy in cy {
                     self.generating.remove(&Coord::new(cx, cyy, cz));
                 }
                 // Freed generate claims are otherwise only re-requested on a
                 // boundary cross; a retryable failure re-arms the lane so a
                 // standing-still player still converges.
-                if rearm {
+                if rearm || in_slab {
                     self.pending_gen.set();
                 }
             }
@@ -1376,7 +1382,10 @@ impl World {
             .chunks
             .keys()
             .copied()
-            .filter(|&coord| !unload.contains(coord))
+            .filter(|&coord| {
+                !unload.contains(coord)
+                    && !self.spawn_slab.is_some_and(|slab| slab.contains(coord))
+            })
             .collect();
         // A removed chunk changes what the BFS can reach — topology class.
         self.occlusion_topo_dirty.raise(!far.is_empty());

@@ -1317,6 +1317,23 @@ fn light_settle_to_identical_grid_reseeds_evicted_mesh_seed() {
 }
 
 #[test]
+fn ensure_around_is_synchronous_for_headless_callers() {
+    let mut world = World::with_config_lazy(DEFAULT_SEED, RenderConfig::default());
+    let pos = DVec3::new(0.5, 40.0, 0.5);
+    world.ensure_around(pos);
+    assert!(world.spawn_ready(), "sync fallback never opens a spawn slab");
+    let c = World::chunk_of(
+        crate::math::block_coord(pos.x),
+        crate::math::block_coord(pos.y),
+        crate::math::block_coord(pos.z),
+    );
+    assert!(
+        world.chunks.contains_key(&c),
+        "ensure_around must have the eye chunk before return"
+    );
+}
+
+#[test]
 fn prepare_around_is_a_request_until_columns_land() {
     let mut world = World::with_config_lazy(DEFAULT_SEED, RenderConfig::default());
     let pos = DVec3::new(0.5, 40.0, 0.5);
