@@ -70,32 +70,44 @@ fn fit_fs(base: i32, scale: f32, cap: i32) -> i32 {
     ((base as f32 * scale) as i32).min(cap).max(8)
 }
 
-fn metrics(style: &Style, w: i32, h: i32, rows: usize, scale: f32) -> Metrics {
-    let n = rows.max(1) as i32;
-    match style {
+fn notice_line_count(v: &PresentedView) -> usize {
+    v.notice
+        .as_ref()
+        .map(|n| n.text.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn bottom_reserve(v: &PresentedView) -> i32 {
+    RESERVE + notice_line_count(v).saturating_sub(1) as i32 * 26
+}
+
+fn metrics(v: &PresentedView, w: i32, h: i32) -> Metrics {
+    let n = v.rows.len().max(1) as i32;
+    let reserve = bottom_reserve(v);
+    match &v.style {
         Style::Title { .. } => {
             // Rows hang from mid-screen; the cap keeps the last row above the
-            // hint strip: (n-2)·line_h + fs ≤ h/2 - RESERVE, line_h = 3·fs/2.
-            let cap = (h - 2 * RESERVE) / (3 * n.max(2) - 4);
-            let fs = fit_fs(28, scale, cap);
+            // hint strip: (n-2)·line_h + fs ≤ h/2 - reserve, line_h = 3·fs/2.
+            let cap = (h - 2 * reserve) / (3 * n.max(2) - 4);
+            let fs = fit_fs(28, v.scale, cap);
             let line_h = fs * 3 / 2;
             Metrics { fs, line_h, start_y: h / 2 - line_h, x: 0, centered: true }
         }
         Style::Panel => {
             // Rows are centred between the title zone (title_fs = fs + 14 at
             // h/8) and the hint strip; the cap solves n·(7·fs/4) ≤ that region.
-            let cap = (7 * h - 8 * (RESERVE + 26)) / (14 * n + 8);
-            let fs = fit_fs(26, scale, cap);
+            let cap = (7 * h - 8 * (reserve + 26)) / (14 * n + 8);
+            let fs = fit_fs(26, v.scale, cap);
             let line_h = fs * 7 / 4;
             let top = h / 8 + (fs + 14) + 12;
-            let start_y = top + (h - RESERVE - top - n * line_h).max(0) / 2;
+            let start_y = top + (h - reserve - top - n * line_h).max(0) / 2;
             Metrics { fs, line_h, start_y, x: w / 2 - fs * 10, centered: false }
         }
     }
 }
 
 fn default_layout(v: &PresentedView, w: i32, h: i32) -> Vec<RowRect> {
-    let m = metrics(&v.style, w, h, v.rows.len(), v.scale);
+    let m = metrics(v, w, h);
     v.rows
         .iter()
         .enumerate()
@@ -129,7 +141,7 @@ fn draw_title(f: &mut Frame, v: &PresentedView, subtitle: &str, sel: usize, w: i
     let sx = (w - f.measure_text(subtitle, sub_fs)) / 2;
     shadowed(f, subtitle, sx, h / 6 + title_fs + 8, sub_fs, Color::GRAY);
 
-    let m = metrics(&v.style, w, h, v.rows.len(), v.scale);
+    let m = metrics(v, w, h);
     for (i, row) in v.rows.iter().enumerate() {
         let selected = i == sel;
         let text = row_body(row, selected);
@@ -140,7 +152,7 @@ fn draw_title(f: &mut Frame, v: &PresentedView, subtitle: &str, sel: usize, w: i
 }
 
 fn draw_panel(f: &mut Frame, v: &PresentedView, sel: usize, w: i32, h: i32) {
-    let m = metrics(&v.style, w, h, v.rows.len(), v.scale);
+    let m = metrics(v, w, h);
     let title_fs = m.fs + 14;
     let tx = (w - f.measure_text(&v.title, title_fs)) / 2;
     shadowed(f, &v.title, tx, h / 8, title_fs, Color::GOLD);
@@ -228,7 +240,12 @@ fn draw_notice(f: &mut Frame, v: &PresentedView, w: i32, h: i32) {
             Level::Info => Color::SALMON,
             Level::Error => Color::RED,
         };
-        let x = (w - f.measure_text(&notice.text, fs)) / 2;
-        shadowed(f, &notice.text, x, h - 40 - (fs + 8), fs, color);
+        let lines: Vec<&str> = notice.text.lines().filter(|l| !l.is_empty()).collect();
+        let step = fs + 8;
+        for (i, line) in lines.iter().enumerate() {
+            let x = (w - f.measure_text(line, fs)) / 2;
+            let from_bottom = (lines.len() - i) as i32 * step;
+            shadowed(f, line, x, h - 40 - from_bottom, fs, color);
+        }
     }
 }

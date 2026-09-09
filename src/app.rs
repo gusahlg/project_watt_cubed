@@ -379,7 +379,10 @@ impl App {
                 mod_index,
                 knob,
                 delta,
-            } => self.mods.step_knob(mod_index, knob, delta),
+            } => {
+                self.mods.step_knob(mod_index, knob, delta);
+                self.mods.save_choices();
+            }
             AppEffect::Quit => return true,
         }
         false

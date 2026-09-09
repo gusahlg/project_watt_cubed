@@ -129,6 +129,11 @@ impl Menu for MainMenu {
 /// One toggle row per installed mod, plus knobs for mods that have them.
 pub struct ModsMenu;
 
+/// Persistent mods-screen notice: saved now, applied on the next world (visual)
+/// or the next new world (worldgen); a newly added mod still needs a rebuild.
+/// Each line stays under 70 glyphs so it fits the 1280-wide menu at notice size.
+const MODS_NOTICE: &str = "Saved immediately. Visual mods: next world. Worldgen: next new world.\nMods are compiled in: rebuild, then restart, for a new mod to appear.";
+
 #[derive(Clone, Copy)]
 pub enum ModsAction {
     Toggle(usize),
@@ -173,7 +178,7 @@ impl Menu for ModsMenu {
             rows,
             default: None,
             hint: "Enter toggle/cycle   Left/Right tune   Esc back".to_string(),
-            notice: None,
+            notice: Some(Notice::info(MODS_NOTICE.to_string())),
         }
     }
 
@@ -471,6 +476,23 @@ mod tests {
             mods: &[],
             session,
         }
+    }
+
+    #[test]
+    fn mods_menu_notice_says_when_changes_apply() {
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let ctx = ctx(&mut settings, &session);
+        let view = ModsMenu.view(&ctx);
+        let notice = view.notice.expect("mods screen has a persistent notice");
+        assert_eq!(notice.level, crate::menu::Level::Info);
+        assert_eq!(notice.text, MODS_NOTICE);
+        let lines: Vec<_> = notice.text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines.iter().all(|l| l.chars().count() <= 70),
+            "notice lines must fit the 1280-wide menu at 18px glyphs: {lines:?}"
+        );
     }
 
     #[test]

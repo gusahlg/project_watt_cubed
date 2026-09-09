@@ -378,6 +378,16 @@ pub trait Mod {
         let _ = (index, delta);
     }
 
+    /// Knob/config payload written as `id.state=` in `saves/mods.cfg`.
+    /// Per-world [`save_state`] is a different path and is not written here.
+    fn save_choice_state(&self) -> Option<String> {
+        None
+    }
+
+    fn load_choice_state(&mut self, data: &str) {
+        let _ = data;
+    }
+
     fn diffusion_cfg(&self) -> Option<DiffusionCfg> {
         None
     }
@@ -651,7 +661,7 @@ impl Mods {
         }
     }
 
-    /// `id=on|off` lines, one per installed mod.
+    /// `id=on|off` lines, plus `id.state=<payload>` for mods that persist knobs.
     pub fn choices_text(&self) -> String {
         let mut text = String::new();
         for entry in &self.entries {
@@ -659,40 +669,69 @@ impl Mods {
             text.push('=');
             text.push_str(if entry.enabled { "on" } else { "off" });
             text.push('\n');
+            if let Some(payload) = entry.module.save_choice_state() {
+                text.push_str(entry.module.id());
+                text.push_str(".state=");
+                text.push_str(&payload);
+                text.push('\n');
+            }
         }
         text
     }
 
-    /// Apply `id=on|off` lines. Unknown ids and malformed lines are ignored.
+    /// Apply `id=on|off` and `id.state=` lines. Unknown ids and malformed lines
+    /// are ignored; missing keys keep the current defaults.
     pub fn apply_choices_text(&mut self, text: &str) {
         for line in text.lines() {
-            let Some((id, value)) = line.split_once('=') else {
+            let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let on = match value.trim() {
+            let key = key.trim();
+            let value = value.trim();
+            if let Some(id) = key.strip_suffix(".state") {
+                self.apply_choice_state(id.trim(), value);
+                continue;
+            }
+            let on = match value {
                 "on" => true,
                 "off" => false,
                 _ => continue,
             };
-            self.set_enabled(id.trim(), on);
+            self.set_enabled(key, on);
         }
     }
 
-    /// Load enable/disable choices from `saves/mods.cfg`. Missing or unreadable
-    /// file leaves the current defaults in place.
+    fn apply_choice_state(&mut self, name: &str, data: &str) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| {
+            e.module.id().eq_ignore_ascii_case(name) || e.module.name().eq_ignore_ascii_case(name)
+        }) {
+            entry.module.load_choice_state(data);
+        }
+    }
+
+    /// Load enable/disable choices and knob payloads from `saves/mods.cfg`.
+    /// Missing or unreadable file leaves the current defaults in place.
     pub fn load_choices(&mut self) {
-        if let Ok(text) = fs::read_to_string(CHOICES_PATH) {
+        self.load_choices_from(Path::new(CHOICES_PATH));
+    }
+
+    fn load_choices_from(&mut self, path: &Path) {
+        if let Ok(text) = fs::read_to_string(path) {
             self.apply_choices_text(&text);
         }
     }
 
-    /// Best-effort write of enable/disable choices. Bench-env pins are not
-    /// written from startup; only a later toggle persists.
+    /// Best-effort write of enable/disable choices and knob payloads. Bench-env
+    /// pins are not written from startup; only a later toggle or knob step persists.
     pub fn save_choices(&self) {
-        if let Some(dir) = Path::new(CHOICES_PATH).parent() {
+        self.save_choices_to(Path::new(CHOICES_PATH));
+    }
+
+    fn save_choices_to(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let _ = fs::write(CHOICES_PATH, self.choices_text());
+        let _ = fs::write(path, self.choices_text());
     }
 }
 
@@ -914,6 +953,21 @@ mod tests {
         assert_eq!(craft, "v1;*Stone+Iron=1");
     }
 
+    fn index_of(mods: &Mods, id: &str) -> usize {
+        (0..mods.len())
+            .find(|&i| mods.id(i) == id)
+            .unwrap_or_else(|| panic!("missing mod {id}"))
+    }
+
+    fn temp_choices_path() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "watt-mods-{}-{}.cfg",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
     #[test]
     fn choices_text_round_trips_and_ignores_junk() {
         let mut mods = Mods::with_defaults();
@@ -925,16 +979,25 @@ mod tests {
         assert!(defaults.contains("post=on"));
         assert!(defaults.contains("lighting=on"));
         assert!(defaults.contains("diffusion=off"));
+        assert!(defaults.contains("diffusion.state=tile=32,stride=16,phases=2,relief=1.00"));
 
         mods.set_enabled("lighting", false);
         mods.set_enabled("diffusion", true);
+        let i = index_of(&mods, "diffusion");
+        mods.step_knob(i, 0, 1);
+        let cfg = mods.diffusion_cfg();
+        assert_ne!(cfg.tile, DiffusionCfg::default().tile);
         let text = mods.choices_text();
         assert!(text.contains("lighting=off"));
         assert!(text.contains("diffusion=on"));
+        assert!(text.contains(&format!(
+            "diffusion.state=tile={},stride={},phases={},relief={:.2}",
+            cfg.tile, cfg.stride, cfg.phases, cfg.relief
+        )));
 
         let mut fresh = Mods::with_defaults();
         fresh.apply_choices_text(
-            "lighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\n",
+            "lighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\ndiffusion.state=tile=64,stride=16,phases=2,relief=1.00\nunknown.state=tile=16\n",
         );
         let restored = fresh.choices_text();
         assert!(restored.contains("lighting=off"));
@@ -945,6 +1008,58 @@ mod tests {
             "malformed value must not change the default"
         );
         assert!(restored.contains("crafting=on"));
+        assert_eq!(fresh.diffusion_cfg().tile, 64);
+    }
+
+    #[test]
+    fn choices_file_round_trips_toggles_and_knobs() {
+        let path = temp_choices_path();
+        let mut mods = Mods::with_defaults();
+        let i = index_of(&mods, "diffusion");
+        mods.set_enabled("lighting", false);
+        mods.set_enabled("diffusion", true);
+        mods.step_knob(i, 0, 1);
+        mods.step_knob(i, 1, 1);
+        let cfg = mods.diffusion_cfg();
+        mods.save_choices_to(&path);
+
+        let mut fresh = Mods::with_defaults();
+        fresh.load_choices_from(&path);
+        let _ = fs::remove_file(&path);
+        assert!(!fresh.is_enabled(index_of(&fresh, "lighting")));
+        assert!(fresh.is_enabled(index_of(&fresh, "diffusion")));
+        assert_eq!(fresh.diffusion_cfg(), cfg);
+    }
+
+    #[test]
+    fn unknown_choice_ids_are_ignored() {
+        let mut mods = Mods::with_defaults();
+        let before = mods.choices_text();
+        mods.apply_choices_text("not-a-mod=on\nunknown.state=tile=64\nmenus=nope\n");
+        assert_eq!(mods.choices_text(), before);
+    }
+
+    #[test]
+    fn corrupt_choices_file_falls_back_to_defaults() {
+        let defaults = Mods::with_defaults().choices_text();
+
+        let bad_utf8 = temp_choices_path();
+        fs::write(&bad_utf8, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let mut mods = Mods::with_defaults();
+        mods.load_choices_from(&bad_utf8);
+        let _ = fs::remove_file(&bad_utf8);
+        assert_eq!(mods.choices_text(), defaults);
+
+        let garbage = temp_choices_path();
+        fs::write(&garbage, "{{{{ not a config\n!!!\n").unwrap();
+        let mut mods = Mods::with_defaults();
+        mods.load_choices_from(&garbage);
+        let _ = fs::remove_file(&garbage);
+        assert_eq!(mods.choices_text(), defaults);
+
+        let mut mods = Mods::with_defaults();
+        mods.load_choices_from(Path::new("/tmp/watt-mods-does-not-exist.cfg"));
+        assert_eq!(mods.choices_text(), defaults);
     }
 
     #[test]
@@ -958,5 +1073,19 @@ mod tests {
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
         let mask = mods.visual_mask();
         assert!(!mask.atmosphere && !mask.post && !mask.lighting);
+    }
+
+    #[test]
+    fn apply_bench_env_does_not_write_choices() {
+        let path = temp_choices_path();
+        let mut mods = Mods::with_defaults();
+        mods.save_choices_to(&path);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("diffusion=off"));
+        mods.apply_bench_env(Some(true), Some(true));
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+        assert_eq!(fs::read_to_string(&path).unwrap(), on_disk);
+        assert!(mods.choices_text().contains("diffusion=on"));
+        let _ = fs::remove_file(&path);
     }
 }
