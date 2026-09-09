@@ -183,6 +183,8 @@ impl App {
             eprintln!("{line}");
             app.settings.vram_notice = session_gfx.notice.clone();
         }
+        app.settings
+            .note_render_extent(extent_w, extent_h, session_gfx.render_scale);
         let config = voxel_engine::Config {
             title: "Project Watt Cubed".into(),
             width: STARTING_WINDOW_WIDTH,

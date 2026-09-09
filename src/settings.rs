@@ -22,8 +22,8 @@ use std::path::Path;
 use voxel_engine::Engine;
 
 use crate::render_config::{
-    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, fit_render_targets,
-    max_lod_levels,
+    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, VrsChoice,
+    fit_render_targets, max_lod_levels, vrs_effective,
 };
 use crate::ui::HudMode;
 
@@ -161,7 +161,7 @@ settings_fields! {
     sunlight: bool = true,
     shadows: bool = false,
     sky: bool = true,
-    vrs: bool = true,
+    vrs: VrsChoice = VrsChoice::Auto,
     water_anim: bool = true,
     /// Baked corner AO, another meshing input.
     ao: bool = true,
@@ -184,6 +184,9 @@ settings_fields! {
     /// Largest connected display (fullscreen first allocation).
     startup_display_w: u32 = 1280,
     startup_display_h: u32 = 720,
+    /// Last render extent (window × session scale) used by Auto VRS.
+    render_w: u32 = 1280,
+    render_h: u32 = 720,
 }
 
 // One `Setting` per field: behaviour folded over by every surface (persistence, menu, console).
@@ -528,10 +531,10 @@ macro_rules! numeric_setting {
 /// and stepping use the same ordered values; persistence restores the marker
 /// directly instead of triggering its interactive side effects.
 macro_rules! enum_setting {
-    ($set:ident, $profile:expr, $field:ident, $ty:ty, $label:literal,
+    ($set:ident, $profile:expr, $cat:expr, $field:ident, $ty:ty, $label:literal,
      $usage:literal, $aliases:expr, $confirm:literal, $order:expr) => {
         Setting {
-            category: Category::Performance,
+            category: $cat,
             menu_kind: MenuKind::Choice,
             profile: $profile,
             fraction: |_| 0.0,
@@ -570,7 +573,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
 pub const SETTINGS: [Setting; 52] = [
     enum_setting!(
-        apply, Profile::Personal, preset, Preset, "Performance Preset",
+        apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
         &[Preset::Custom, Preset::Minimum, Preset::Fast, Preset::Default]
     ),
@@ -647,7 +650,7 @@ pub const SETTINGS: [Setting; 52] = [
         &["modrate"]
     ),
     enum_setting!(
-        assign, Profile::Owned, hud_mode, HudMode, "HUD Mode",
+        assign, Profile::Owned, Category::Performance, hud_mode, HudMode, "HUD Mode",
         "hud_mode off|minimal|full", &["hud"], "HUD",
         &[HudMode::Off, HudMode::Minimal, HudMode::Full]
     ),
@@ -851,7 +854,11 @@ pub const SETTINGS: [Setting; 52] = [
     video_toggle!(godrays, "godrays", "Godrays"),
     video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
     video_toggle!(taa, "taa", "Temporal AA", &["aa"]),
-    video_toggle!(vrs, "vrs", "Variable-Rate Shading"),
+    enum_setting!(
+        assign, Profile::Stripped(false), Category::Video, vrs, VrsChoice, "Variable-Rate Shading",
+        "vrs auto|on|off", &[], "vrs",
+        &[VrsChoice::Auto, VrsChoice::On, VrsChoice::Off]
+    ),
     video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
@@ -1095,10 +1102,18 @@ impl Settings {
         self.adopt_vram_notice(session.notice.clone());
         let _ = eng.set_msaa(session.msaa);
         let _ = eng.set_render_scale(session.render_scale);
+        self.note_render_extent(w, h, session.render_scale);
         eng.set_cull_faces(self.cull_faces);
         // Engine render lanes live-swap on both threads; occlusion/lod2 are world
         // inputs (applied on world entry) and aren't part of `engine_flags`.
         eng.set_flags(self.render_config().engine_flags());
+    }
+
+    /// Record the live render extent so [`render_config`] can resolve Auto VRS.
+    pub fn note_render_extent(&mut self, window_w: u32, window_h: u32, scale: f32) {
+        let scale = scale.max(0.0);
+        self.render_w = ((window_w as f32 * scale) as u32).max(1);
+        self.render_h = ((window_h as f32 * scale) as u32).max(1);
     }
 
     fn adopt_vram_notice(&mut self, notice: Option<String>) {
@@ -1135,7 +1150,7 @@ impl Settings {
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
-            vrs: self.vrs,
+            vrs: vrs_effective(self.vrs, self.render_w, self.render_h),
             water_anim: self.water_anim,
             vignette: self.vignette,
         }
@@ -1622,7 +1637,8 @@ mod tests {
         assert_eq!(s.hud_mode, HudMode::Off);
         assert!(!s.simulation && !s.mod_logic && !s.autosave);
         assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
-        assert!(!s.lighting && !s.occlusion && !s.ao && !s.vrs);
+        assert!(!s.lighting && !s.occlusion && !s.ao);
+        assert_eq!(s.vrs, VrsChoice::Off);
         assert!(!s.sky && !s.bloom && !s.clouds && !s.water_anim);
         assert!(s.sunlight);
 
@@ -1641,6 +1657,7 @@ mod tests {
         assert_eq!(s.hud_mode, HudMode::Minimal);
         assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
         assert!(!s.minimap && !s.mod_hud && !s.name_tags);
+        assert_eq!(s.vrs, VrsChoice::Off);
 
         assert!(preset.parse_human(&mut s, "default"));
         let expected = Settings {
@@ -1765,5 +1782,59 @@ mod tests {
         // ...and the one on/off helper gives menu caps vs console lowercase.
         assert_eq!(on_off(true, true), "On");
         assert_eq!(on_off(true, false), "on");
+    }
+
+    #[test]
+    fn vrs_persists_choice_words_and_reads_legacy_bools() {
+        let field = setting("vrs");
+        let mut s = Settings::default();
+        assert_eq!(s.vrs, VrsChoice::Auto);
+        assert_eq!(field.write(&s), "auto");
+        assert_eq!(field.show(&s), "Auto");
+        assert_eq!(field.usage(), "vrs auto|on|off");
+        assert_eq!(field.confirm(&s), "vrs auto");
+
+        assert!(field.parse_human(&mut s, "on"));
+        assert_eq!(s.vrs, VrsChoice::On);
+        assert_eq!(s.preset, Preset::Custom);
+        assert_eq!(field.write(&s), "on");
+        assert!(field.parse_human(&mut s, "off"));
+        assert_eq!(s.vrs, VrsChoice::Off);
+        assert!(field.parse_human(&mut s, "auto"));
+        assert_eq!(s.vrs, VrsChoice::Auto);
+
+        let mut loaded = Settings::default();
+        loaded.parse_from("vrs=true\n");
+        assert_eq!(loaded.vrs, VrsChoice::On);
+        loaded.parse_from("vrs=false\n");
+        assert_eq!(loaded.vrs, VrsChoice::Off);
+        loaded.parse_from("vrs=auto\n");
+        assert_eq!(loaded.vrs, VrsChoice::Auto);
+        assert!(
+            loaded.to_text().lines().any(|line| line == "vrs=auto"),
+            "new files persist the word form"
+        );
+
+        let mut round = Settings::default();
+        round.parse_from(&loaded.to_text());
+        assert_eq!(round.vrs, VrsChoice::Auto);
+    }
+
+    #[test]
+    fn render_config_resolves_auto_vrs_from_extent() {
+        let mut s = Settings::default();
+        assert_eq!(s.vrs, VrsChoice::Auto);
+        assert!(!s.render_config().vrs, "1280×720 default is below Auto");
+        s.note_render_extent(3840, 2160, 1.0);
+        assert!(s.render_config().vrs);
+        s.note_render_extent(3440, 1440, 2.0);
+        assert!(s.render_config().vrs);
+        s.note_render_extent(1920, 1080, 1.0);
+        assert!(!s.render_config().vrs);
+        s.vrs = VrsChoice::On;
+        assert!(s.render_config().vrs);
+        s.vrs = VrsChoice::Off;
+        s.note_render_extent(3840, 2160, 1.0);
+        assert!(!s.render_config().vrs);
     }
 }

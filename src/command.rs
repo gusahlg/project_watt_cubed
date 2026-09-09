@@ -387,6 +387,7 @@ fn fmt_pos(p: DVec3) -> String {
 mod tests {
     use super::*;
     use crate::mods::forced_off_marker;
+    use crate::render_config::VrsChoice;
 
     fn player() -> Player {
         Player::new(DVec3::new(0.0, 0.0, 0.0))
@@ -514,10 +515,15 @@ mod tests {
         assert!(s.fullscreen);
         execute("gfx lighting off", &mut p, &mut w, &mut s, &mut sky);
         assert!(!s.lighting);
+        execute("gfx vrs on", &mut p, &mut w, &mut s, &mut sky);
+        assert_eq!(s.vrs, VrsChoice::On);
+        execute("gfx vrs auto", &mut p, &mut w, &mut s, &mut sky);
+        assert_eq!(s.vrs, VrsChoice::Auto);
         let out = execute("gfx", &mut p, &mut w, &mut s, &mut sky);
         let text = joined(&out);
         assert!(text.contains("fullscreen on"));
         assert!(text.contains("lighting off"));
+        assert!(text.contains("vrs auto"));
         assert!(text.contains("ui scale"));
     }
 

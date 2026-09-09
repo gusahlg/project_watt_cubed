@@ -16,6 +16,63 @@ pub const LOD_DETAIL_RANGE: RangeInclusive<u8> = 2..=6;
 /// throughout the quadtree assume a small, consecutive base-2 ladder.
 const LOD_COARSEST_DETAIL: u8 = 9;
 
+/// Auto enables VRS only when the render extent (window × render scale) has
+/// at least this many pixels. RTX 4060 @ 1920×1080 (2.07 Mpx) and RTX 3070 @
+/// 3440×1440 (4.95 Mpx) still lose with VRS on; it pays at 4K-class extents
+/// (3440×1440 at 200% render scale = 19.8 Mpx).
+pub const VRS_AUTO_MIN_PIXELS: u64 = 8_000_000;
+
+/// User choice for variable-rate shading. [`vrs_effective`] turns this into
+/// the engine bool; Auto keys off the live render extent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VrsChoice {
+    Auto,
+    On,
+    Off,
+}
+
+impl VrsChoice {
+    /// Persistence word (`auto` / `on` / `off`).
+    pub fn code(self) -> &'static str {
+        match self {
+            VrsChoice::Auto => "auto",
+            VrsChoice::On => "on",
+            VrsChoice::Off => "off",
+        }
+    }
+
+    /// Parse a persisted or console word. Legacy `true`/`false` keep their
+    /// forced On/Off choice so existing `settings.cfg` files stay put.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(VrsChoice::Auto),
+            "on" | "true" => Some(VrsChoice::On),
+            "off" | "false" => Some(VrsChoice::Off),
+            _ => None,
+        }
+    }
+
+    /// Capitalized display name for the menu row and confirm line.
+    pub fn label(self) -> &'static str {
+        match self {
+            VrsChoice::Auto => "Auto",
+            VrsChoice::On => "On",
+            VrsChoice::Off => "Off",
+        }
+    }
+}
+
+/// Engine VRS flag for a user choice at a render extent.
+pub fn vrs_effective(choice: VrsChoice, render_w: u32, render_h: u32) -> bool {
+    match choice {
+        VrsChoice::On => true,
+        VrsChoice::Off => false,
+        VrsChoice::Auto => {
+            (render_w as u64).saturating_mul(render_h as u64) >= VRS_AUTO_MIN_PIXELS
+        }
+    }
+}
+
 /// Fancy presentation groups owned by default-enabled visual mods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisualGroup {
@@ -85,8 +142,8 @@ pub struct RenderConfig {
     /// Cascade shadow map (off = fully lit).
     pub shadows: bool,
     pub sky: bool,
-    /// Variable-rate shading (`RenderFlags::vrs`): depth-classified coarse
-    /// fragment shading on distant/flat regions. Off shades full-rate everywhere.
+    /// Variable-rate shading (`RenderFlags::vrs`): the resolved engine flag
+    /// from [`vrs_effective`]. Off shades full-rate everywhere.
     pub vrs: bool,
     /// Water surface animation (`RenderFlags::water_anim`). Off freezes the
     /// phase — water renders, but still.
@@ -117,7 +174,7 @@ impl Default for RenderConfig {
             sunlight: true,
             shadows: true,
             sky: true,
-            vrs: true,
+            vrs: false,
             water_anim: true,
             vignette: false,
         }
@@ -437,6 +494,28 @@ fn vram_notice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vrs_effective_auto_turns_on_at_eight_million_pixels() {
+        assert!(!vrs_effective(VrsChoice::Auto, 0, 0));
+        assert!(!vrs_effective(VrsChoice::Auto, 1, 1));
+        assert!(!vrs_effective(VrsChoice::Auto, 1920, 1080));
+        assert!(!vrs_effective(VrsChoice::Auto, 3440, 1440));
+        assert!(!vrs_effective(
+            VrsChoice::Auto,
+            (VRS_AUTO_MIN_PIXELS - 1) as u32,
+            1
+        ));
+        assert!(vrs_effective(
+            VrsChoice::Auto,
+            VRS_AUTO_MIN_PIXELS as u32,
+            1
+        ));
+        assert!(vrs_effective(VrsChoice::Auto, 3840, 2160));
+        assert!(vrs_effective(VrsChoice::Auto, 6880, 2880));
+        assert!(vrs_effective(VrsChoice::On, 1, 1));
+        assert!(!vrs_effective(VrsChoice::Off, 6880, 2880));
+    }
 
     #[test]
     fn core_is_default_with_visual_groups_stripped() {

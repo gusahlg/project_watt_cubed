@@ -23,7 +23,7 @@ The settings menu and `/gfx` command share the persisted descriptor table in [`s
 | **Default** | restores the shipped mix: distance 6/3, 100% scale, every-frame streaming, physics, sky-clock, and mod advancement; distant LOD is off by default | full HUD and the shipped visual lanes | simulation, mods, minimap, models, tags, and autosave on |
 | **Custom** | exact individually selected values | exact individually selected values | exact individually selected values |
 
-“Costly lanes off” currently means occlusion, voxel/block lighting, baked AO, auto exposure, bloom, god rays, clouds, weather, stars, day/night animation, TAA, fog, ambient light, shadows, procedural sky, VRS, water animation, and vignette are disabled. Sunlight remains enabled so stripped terrain is still readable. Fast then re-enables its explicitly configured distant LOD lane.
+“Costly lanes off” currently means occlusion, voxel/block lighting, baked AO, auto exposure, bloom, god rays, clouds, weather, stars, day/night animation, TAA, fog, ambient light, shadows, procedural sky, VRS, water animation, and vignette are disabled. Sunlight remains enabled so stripped terrain is still readable. Fast then re-enables its explicitly configured distant LOD lane. Variable-rate shading is a three-way setting (`auto`/`on`/`off`, default `auto`): Auto turns it on only when the render extent (window × render scale) has at least 8,000,000 pixels, because the classify pass plus shading-rate attachment cost more than coarse shading saves at 1080p (RTX 4060: 3361 vs 5064 fps) and 3440×1440 (RTX 3070: 4236 vs 4495 fps); it pays at 4K-class extents (3440×1440 at 200% = 19.8 Mpx).
 
 The independent performance controls are:
 
