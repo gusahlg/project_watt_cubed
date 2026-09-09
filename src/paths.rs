@@ -3,26 +3,32 @@
 //! Worlds live under [`Paths::data`]; settings, session, and mod choices under
 //! [`Paths::config`]. Override with `WATT_DATA_DIR` (or `watt_server --data-dir`),
 //! else a launch-directory `saves/` folder is kept as-is, else XDG.
+//! `WATT_CHECKOUT_DIR` (`play.sh`) is the source checkout, kept only when it
+//! contains `Cargo.toml`.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const APP: &str = "project_watt_cubed";
 const ENV_DATA_DIR: &str = "WATT_DATA_DIR";
+const ENV_CHECKOUT_DIR: &str = "WATT_CHECKOUT_DIR";
 
 /// Worlds under `data`; `settings.cfg` / `session.cfg` / `mods.cfg` under `config`.
+/// Optional source checkout when `WATT_CHECKOUT_DIR` points at a `Cargo.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
     pub data: PathBuf,
     pub config: PathBuf,
+    checkout: Option<PathBuf>,
 }
 
 static PATHS: OnceLock<Paths> = OnceLock::new();
 
 impl Paths {
     /// Resolve override → existing launch `saves/` → XDG, without installing globally.
-    pub fn resolve(override_dir: Option<&Path>) -> Self {
-        pick(
+    /// `checkout_dir` is kept only when `<dir>/Cargo.toml` exists.
+    pub fn resolve(override_dir: Option<&Path>, checkout_dir: Option<&Path>) -> Self {
+        let mut paths = pick(
             override_dir
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| absolutize(p.to_path_buf()))
@@ -30,7 +36,9 @@ impl Paths {
             launch_saves(),
             xdg_dir("XDG_DATA_HOME", ".local/share"),
             xdg_dir("XDG_CONFIG_HOME", ".config"),
-        )
+        );
+        paths.checkout = resolve_checkout(checkout_dir);
+        paths
     }
 
     /// Install the process-wide roots and print them once. First caller wins.
@@ -38,11 +46,15 @@ impl Paths {
         PATHS.get_or_init(|| {
             let paths = startup(override_dir);
             #[cfg(not(test))]
-            println!(
-                "paths: data={} config={}",
-                paths.data.display(),
-                paths.config.display()
-            );
+            {
+                let checkout = paths.checkout_dir().unwrap_or(Path::new("-"));
+                println!(
+                    "paths: data={} config={} checkout={}",
+                    paths.data.display(),
+                    paths.config.display(),
+                    checkout.display()
+                );
+            }
             paths
         })
     }
@@ -63,6 +75,14 @@ impl Paths {
     pub fn mods_file(&self) -> PathBuf {
         self.config.join("mods.cfg")
     }
+
+    pub fn checkout_dir(&self) -> Option<&Path> {
+        self.checkout.as_deref()
+    }
+
+    pub fn mods_selection_file(&self) -> Option<PathBuf> {
+        Some(self.checkout_dir()?.join("mods.toml"))
+    }
 }
 
 fn startup(override_dir: Option<&Path>) -> Paths {
@@ -72,7 +92,7 @@ fn startup(override_dir: Option<&Path>) -> Paths {
             return isolated_test_paths();
         }
     }
-    Paths::resolve(override_dir)
+    Paths::resolve(override_dir, env_checkout().as_deref())
 }
 
 fn pick(
@@ -85,17 +105,20 @@ fn pick(
         return Paths {
             data: dir.clone(),
             config: dir,
+            checkout: None,
         };
     }
     if let Some(saves) = launch_saves {
         return Paths {
             data: saves.clone(),
             config: saves,
+            checkout: None,
         };
     }
     Paths {
         data: xdg_data,
         config: xdg_config,
+        checkout: None,
     }
 }
 
@@ -105,6 +128,29 @@ fn env_override() -> Option<PathBuf> {
         None
     } else {
         Some(absolutize(PathBuf::from(val)))
+    }
+}
+
+fn env_checkout() -> Option<PathBuf> {
+    let val = std::env::var_os(ENV_CHECKOUT_DIR)?;
+    if val.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(val))
+    }
+}
+
+fn resolve_checkout(dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir.filter(|p| !p.as_os_str().is_empty())?;
+    let dir = absolutize(dir.to_path_buf());
+    if dir.join("Cargo.toml").is_file() {
+        Some(dir)
+    } else {
+        println!(
+            "paths: WATT_CHECKOUT_DIR={} has no Cargo.toml; ignoring",
+            dir.display()
+        );
+        None
     }
 }
 
@@ -145,6 +191,7 @@ fn isolated_test_paths() -> Paths {
     Paths {
         data: dir.clone(),
         config: dir,
+        checkout: None,
     }
 }
 
@@ -194,9 +241,10 @@ mod tests {
 
     #[test]
     fn resolve_override_is_absolute_and_shared() {
-        let p = Paths::resolve(Some(Path::new("/tmp/watt-data-dir-test")));
+        let p = Paths::resolve(Some(Path::new("/tmp/watt-data-dir-test")), None);
         assert_eq!(p.data, PathBuf::from("/tmp/watt-data-dir-test"));
         assert_eq!(p.config, p.data);
+        assert_eq!(p.checkout_dir(), None);
     }
 
     #[test]
@@ -211,6 +259,7 @@ mod tests {
             assert_ne!(paths.data.as_path(), Path::new("saves"));
         }
         assert_eq!(paths.data, paths.config);
+        assert_eq!(paths.checkout_dir(), None);
         let checkout_root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/test-data"));
         assert_eq!(paths.data, checkout_root, "each checkout must have its own test data root");
         let marker = paths.data.join("__paths_isolation_marker__");
@@ -225,9 +274,42 @@ mod tests {
         let p = Paths {
             data: PathBuf::from("/data"),
             config: PathBuf::from("/config"),
+            checkout: None,
         };
         assert_eq!(p.settings_file(), PathBuf::from("/config/settings.cfg"));
         assert_eq!(p.session_file(), PathBuf::from("/config/session.cfg"));
         assert_eq!(p.mods_file(), PathBuf::from("/config/mods.cfg"));
+        assert_eq!(p.mods_selection_file(), None);
+    }
+
+    #[test]
+    fn checkout_dir_accepted_when_cargo_toml_exists() {
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let p = Paths::resolve(Some(Path::new("/tmp/watt-data-dir-test")), Some(&checkout));
+        assert_eq!(p.checkout_dir(), Some(checkout.as_path()));
+        assert_eq!(p.mods_selection_file(), Some(checkout.join("mods.toml")));
+    }
+
+    #[test]
+    fn checkout_dir_ignored_without_cargo_toml() {
+        let checkout = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/test-data"));
+        let _ = std::fs::create_dir_all(&checkout);
+        assert!(
+            !checkout.join("Cargo.toml").is_file(),
+            "test-data must not look like a crate root"
+        );
+        let p = Paths::resolve(Some(Path::new("/tmp/watt-data-dir-test")), Some(&checkout));
+        assert_eq!(p.checkout_dir(), None);
+        assert_eq!(p.mods_selection_file(), None);
+    }
+
+    #[test]
+    fn empty_checkout_dir_is_unset() {
+        let p = Paths::resolve(
+            Some(Path::new("/tmp/watt-data-dir-test")),
+            Some(Path::new("")),
+        );
+        assert_eq!(p.checkout_dir(), None);
+        assert_eq!(p.mods_selection_file(), None);
     }
 }

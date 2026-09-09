@@ -13,5 +13,7 @@ cd "$(dirname "$0")"
 # at the live asset tree so newly dropped-in music and replacement sounds are
 # visible immediately; an explicit caller override still wins.
 export WATT_ASSET_DIR="${WATT_ASSET_DIR:-$PWD/assets}"
+# The mods screen writes `mods.toml` in the checkout, not the data dir.
+export WATT_CHECKOUT_DIR="$PWD"
 nix flake update voxel-engine
 exec nix run . "$@"

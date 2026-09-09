@@ -74,6 +74,7 @@ persist in `settings.cfg` under the config root.
 Worlds are stored in the data root; `settings.cfg`, `session.cfg`, and `mods.cfg` in the config root.
 If the launch directory already contains `saves/`, both roots stay that folder (checkouts and existing installs).
 Otherwise `$XDG_DATA_HOME/project_watt_cubed` and `$XDG_CONFIG_HOME/project_watt_cubed`. Override with `WATT_DATA_DIR` or `watt_server --data-dir <dir>`.
+`WATT_CHECKOUT_DIR` is the source checkout (`play.sh` sets it to the repo root) and is ignored unless that directory contains `Cargo.toml`.
 
 ## Running on NixOS
 
