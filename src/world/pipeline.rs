@@ -33,8 +33,9 @@ use std::time::{Duration, Instant};
 use super::Coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::diffusion::Generator;
+use super::generation::ColumnHeights;
 #[cfg(test)]
-use super::generation::SineHills;
+use super::generation::Terrain;
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
 use super::neighborhood::BoundedPool;
@@ -70,7 +71,7 @@ pub struct LightSnapshot {
     /// Near-face light of the 6 neighbour faces (snapshot at enqueue time).
     pub shell: FaceShell,
     /// The skylight ceiling (surface heightmap) for the chunk's column.
-    pub ceiling: CeilingWindow,
+    pub ceiling: Arc<CeilingWindow>,
     /// World-space Y of the chunk's bottom cell — seeds the open-sky column test.
     pub world_y0: i32,
     /// Hot tables (opaque/emission), shared by refcount like a mesh snapshot's.
@@ -98,9 +99,13 @@ pub(in crate::world) enum Job {
         snapshot: ChunkSnapshot,
     },
     /// Relax the light grid for `coord` from a frozen neighbourhood snapshot.
+    /// `light_gen` is the [`Loaded::light_gen`](super::Loaded) the snapshot was
+    /// taken against: a later resident at the same coord (unload then
+    /// regenerate) must not consume this result.
     Light {
         coord: Coord,
         epoch: u32,
+        light_gen: u32,
         snapshot: Box<LightSnapshot>,
     },
     /// Extract and mesh a section's columns at its detail level. Pure computation
@@ -179,10 +184,13 @@ impl JobKey {
 /// Finished work returned to the main thread.
 pub(in crate::world) enum Done {
     /// A generated column: every chunk built for the requested `cy` range,
-    /// paired with its coord. Landed together and stored in one drain step.
+    /// paired with its coord, plus the 256 ground heights (boxed so
+    /// `size_of::<Done>()` stays ≤ 128). Landed together and stored in one
+    /// drain step.
     Column {
         col: (i32, i32),
         chunks: Vec<(Coord, Chunk)>,
+        heights: Box<ColumnHeights>,
     },
     /// Boxed: `ChunkMeshData` is ~530 B inline (three passes × Vec headers ×
     /// six index buckets), and it dominated the whole enum — every channel
@@ -196,6 +204,7 @@ pub(in crate::world) enum Done {
     Light {
         coord: Coord,
         epoch: u32,
+        light_gen: u32,
         grid: LightGrid,
     },
     Section {
@@ -398,10 +407,12 @@ impl ViewGate {
     }
 
     /// Publish the far-field horizon (metres from the eye).
+    #[cfg(test)]
     fn set_far(&self, metres: f64) {
         self.far_m.store(metres.to_bits(), Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn set_velocity(&self, x: f64, z: f64) {
         self.vel_x.store(x.to_bits(), Ordering::Relaxed);
         self.vel_z.store(z.to_bits(), Ordering::Relaxed);
@@ -409,11 +420,12 @@ impl ViewGate {
 
     fn set_active_workers(&self, active: usize) {
         let active = active.max(1);
-        self.active_workers.store(active, Ordering::Relaxed);
-        // A few queued jobs per active thread hide variance without admitting
-        // a whole view volume that will be stale before it runs.
-        self.near_queue_cap
-            .store((active * 4).max(8), Ordering::Relaxed);
+        self.set_pacing(active, (active * 4).max(8));
+    }
+
+    fn set_pacing(&self, active: usize, near_cap: usize) {
+        self.active_workers.store(active.max(1), Ordering::Relaxed);
+        self.near_queue_cap.store(near_cap.max(1), Ordering::Relaxed);
     }
 
     fn active_workers(&self) -> usize {
@@ -452,12 +464,7 @@ impl ViewGate {
         }
         let (px, pz) = self.center();
         let (dx, dz) = ((cx - px) as f64, (cz - pz) as f64);
-        let velocity = glam::DVec3::new(
-            f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
-            0.0,
-            f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
-        );
-        super::motion_biased_dist2(base, velocity, dx, dz)
+        super::motion_biased_dist2(base, self.velocity(), dx, dz)
     }
 
     /// Whether a job at this column is still worth running.
@@ -482,16 +489,18 @@ impl ViewGate {
         (dx * dx + dz * dz) as u64
     }
 
-    fn far_key(&self, wx: i64, wz: i64) -> u64 {
-        let (ex, ez) = self.eye_m();
-        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
-        let base = (dx * dx + dz * dz) as u64;
-        let vel = glam::DVec3::new(
+    fn velocity(&self) -> voxel_engine::DVec3 {
+        voxel_engine::DVec3::new(
             f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
             0.0,
             f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
-        );
-        super::motion_biased_dist2(base, vel, dx, dz)
+        )
+    }
+
+    fn far_key(&self, wx: i64, wz: i64) -> u64 {
+        let (ex, ez) = self.eye_m();
+        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
+        super::motion_biased_dist2(self.far_dist2_m(wx, wz), self.velocity(), dx, dz)
     }
 
     /// Whether a far entry with world-centre `(wx, wz)` and footprint `span`
@@ -537,11 +546,12 @@ impl Deadline {
 pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(2);
 
 // Each admission producer mints a FRESH `Deadline::from_budget(...)` from its
-// scheduler-provided budget at the instant its `run()` starts — never one
-// frame-start snapshot shared across lanes. The lanes run sequentially
-// (drain → light → mesh → LOD), so a single anchored instant would leave every
-// lane after the first ~1 ms pre-expired and admitting nothing (world-entry
-// starvation). Budgets are admission caps, so idle lanes still return immediately.
+// scheduler-provided budget after its pending gate — never one frame-start
+// snapshot shared across lanes, and never an `Instant::now` on an idle frame.
+// The lanes run sequentially (drain → light → mesh → LOD), so a single
+// anchored instant would leave every lane after the first ~1 ms pre-expired
+// and admitting nothing (world-entry starvation). Budgets are admission caps,
+// so idle lanes still return immediately.
 
 /// Far-queue cap. At the cap [`Workers::submit_far`] REJECTS
 /// the submit (returns `false`) and the lane simply does not claim the key, so
@@ -853,12 +863,12 @@ impl Workers {
         self.view.publish(cx, cz, radius, far_m, vel_x, vel_z);
     }
 
-    /// Park/unpark workers to match the world's current effort signal. Both
-    /// condition sets are notified on a transition so workers migrate to the
-    /// correct wait set before the next job notification.
-    pub(in crate::world) fn set_active_workers(&self, active: usize) {
+    /// Park/unpark workers and publish near-queue lookahead together. A cap-only
+    /// change does not wake parked workers; an active-count change does.
+    pub(in crate::world) fn set_pacing(&self, active: usize, near_cap: usize) {
         let active = active.clamp(1, self.capacity);
-        if self.view.active_workers() == active {
+        let near_cap = near_cap.max(1);
+        if self.view.active_workers() == active && self.view.near_queue_cap() == near_cap {
             return;
         }
         let (lock, work, pace) = &*self.gate;
@@ -868,13 +878,16 @@ impl Workers {
         let queue = lock_queue(lock);
         // Keep the in-lock check too: it makes the transition safe even if a
         // future caller publishes pacing from more than one thread.
-        if self.view.active_workers() == active {
+        if self.view.active_workers() == active && self.view.near_queue_cap() == near_cap {
             return;
         }
-        self.view.set_active_workers(active);
+        let workers_changed = self.view.active_workers() != active;
+        self.view.set_pacing(active, near_cap);
         drop(queue);
-        work.notify_all();
-        pace.notify_all();
+        if workers_changed {
+            work.notify_all();
+            pace.notify_all();
+        }
     }
 
     pub(in crate::world) fn active_workers(&self) -> usize {
@@ -889,6 +902,21 @@ impl Workers {
         let (lock, _, _) = &*self.gate;
         let queue = lock_queue(lock);
         (queue.near.len(), queue.far.len())
+    }
+
+    /// Free near-queue slots against the pacer cap. One lock; `0` means a
+    /// submit this pass will be declined.
+    pub(in crate::world) fn near_slots_free(&self) -> usize {
+        let (lock, _, _) = &*self.gate;
+        let queue = lock_queue(lock);
+        self.view.near_queue_cap().saturating_sub(queue.near.len())
+    }
+
+    /// Free far-queue slots against [`FAR_QUEUE_CAP`]. One lock.
+    pub(in crate::world) fn far_slots_free(&self) -> usize {
+        let (lock, _, _) = &*self.gate;
+        let queue = lock_queue(lock);
+        FAR_QUEUE_CAP.saturating_sub(queue.far.len())
     }
 
     /// Queue a job at its scheduling class; returns whether it was accepted.
@@ -1059,8 +1087,8 @@ fn run(job: Job) -> Done {
             let (cx, cz) = col;
             // Share the column profile across the whole run, then replay each
             // chunk's edit overlay — voxel-identical to per-chunk generation.
-            let chunks = generator
-                .generate_column(cx, cz, cy)
+            let (generated, heights) = generator.generate_column(cx, cz, cy);
+            let chunks = generated
                 .into_iter()
                 .map(|(cyy, data)| {
                     let coord = Coord::new(cx, cyy, cz);
@@ -1073,7 +1101,11 @@ fn run(job: Job) -> Done {
                     (coord, chunk)
                 })
                 .collect();
-            Done::Column { col, chunks }
+            Done::Column {
+                col,
+                chunks,
+                heights: Box::new(heights),
+            }
         }
         Job::Mesh {
             coord,
@@ -1103,6 +1135,7 @@ fn run(job: Job) -> Done {
         Job::Light {
             coord,
             epoch,
+            light_gen,
             snapshot,
         } => {
             // Pure flood: same `propagate` the sync path called, now on an owned
@@ -1116,7 +1149,12 @@ fn run(job: Job) -> Done {
                 &snapshot.tables,
                 &mut grid,
             );
-            Done::Light { coord, epoch, grid }
+            Done::Light {
+                coord,
+                epoch,
+                light_gen,
+                grid,
+            }
         }
         Job::Section {
             pos,
@@ -1160,7 +1198,7 @@ mod tests {
     fn section_job(terrain: &Generator, id: i32) -> Job {
         Job::Section {
             pos: SectionPos {
-                detail: voxel_engine::Detail(2),
+                detail: crate::ident::Detail(2),
                 x: id,
                 z: 0,
             },
@@ -1203,10 +1241,21 @@ mod tests {
             .results
             .recv_timeout(Duration::from_secs(10))
             .expect("worker finished");
-        let Done::Column { col, chunks } = done else {
+        let Done::Column { col, chunks, heights } = done else {
             panic!("expected a column result");
         };
         assert_eq!(col, (coord.x, coord.z));
+        let x0 = coord.x * CHUNK_SIZE as i32;
+        let z0 = coord.z * CHUNK_SIZE as i32;
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                assert_eq!(
+                    heights[lx + lz * CHUNK_SIZE],
+                    generator.height(x0 + lx as i32, z0 + lz as i32),
+                    "worker heights match height()"
+                );
+            }
+        }
         let chunk = &chunks
             .iter()
             .find(|(c, _)| *c == coord)
@@ -1218,7 +1267,7 @@ mod tests {
     #[test]
     fn worker_meshing_matches_the_sync_mesher() {
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 20.0, 5);
         // The chunk holding the surface at the origin, with all six neighbours
         // (below: solid ground, above: sky, sides: more surface).
         let chunk = Chunk::new(0, 1, 0, &generator);
@@ -1544,16 +1593,14 @@ mod tests {
     /// pool with real mesh jobs and reports jobs/second plus `size_of::<Done>()`.
     /// Ignored: a timing benchmark, not a correctness gate. Run with
     /// `cargo test --release mesh_result_channel_throughput -- --ignored --nocapture`.
-    /// 2026-07-13 (RTX 3070 box, 4 workers): 544 B inline ≈ 28.6k jobs/s;
-    /// boxed 112 B ≈ 29.2k jobs/s — throughput is meshing-bound, the boxing is
-    /// a payload/regression guard rather than a measured speedup.
-    /// 2026-07-19 (12-core box, 4 workers): 26.8k jobs/s pre-layout work;
-    /// row-wise capture 30.3k; + stride-walk mesher 48.5k jobs/s.
+    /// 2026-07-13: 29.2k jobs/s (RTX 3070 box, 4 workers, boxed 112 B; 544 B inline 28.6k; meshing-bound).
+    /// 2026-07-19: 48.5k jobs/s (12-core box, 4 workers; pre-layout 26.8k, row-wise capture 30.3k).
+    /// 2026-09-08: 62.3k jobs/s (4 workers, median of 3; before stencil/pack/edge-slice 52.8k).
     #[test]
     #[ignore]
     fn mesh_result_channel_throughput() {
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 20.0, 5);
         let neigh: Vec<Chunk> = (0..27)
             .map(|k| Chunk::new(k % 3 - 1, 1 + k / 9 - 1, k / 3 % 3 - 1, &generator))
             .collect();
@@ -1570,6 +1617,12 @@ mod tests {
 
         const JOBS: u32 = 4000;
         let workers = Workers::spawn(4);
+        // Spawn publishes a streaming lookahead cap; this probe floods the
+        // pool, so lift it. Does not affect production admission.
+        workers
+            .view
+            .near_queue_cap
+            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
         let start = std::time::Instant::now();
         for i in 0..JOBS {
             assert!(workers.submit(Job::Mesh {
@@ -1595,6 +1648,101 @@ mod tests {
             dt.as_secs_f64(),
             JOBS as f64 / dt.as_secs_f64()
         );
+    }
+
+    /// Mesh-lane admission at a 20k-seed worklist (world-entry shape).
+    /// Ignored timing benchmark. Run with
+    /// `cargo test --release admit_mesh_lane_20k_select -- --ignored --nocapture`.
+    /// 2026-09-08 before O(n) select: 2299.9 µs/pass
+    /// 2026-09-08 after O(n) select: 1421.9 µs/pass (1.6×; ready() scan dominates)
+    #[test]
+    #[ignore]
+    fn admit_mesh_lane_20k_select() {
+        use super::super::{Loaded, MeshLane, MeshState, StreamLane, World, admit};
+        use crate::coord::ChunkCoord;
+        use crate::render_config::RenderConfig;
+        use crate::world::chunk::{Chunk, ChunkData};
+
+        const N: usize = 20_000;
+        const PASSES: u32 = 100;
+
+        let mut world = World::with_config_lazy(1, RenderConfig::default());
+        world.transition_lighting(false);
+        world.set_view_distances(20, 10);
+        let center = ChunkCoord::new(0, 0, 0);
+        world.center = Some(center);
+
+        let stone = world.registry.id_by_name("Stone").unwrap();
+        // Halo so every seeded coord has 6 face neighbours; interior is in-box.
+        for x in -19..=19 {
+            for z in -19..=19 {
+                for y in -9..=9 {
+                    let coord = ChunkCoord::new(x, y, z);
+                    world.chunks.insert(
+                        coord,
+                        Loaded {
+                            chunk: Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(stone))),
+                            state: MeshState::needs_mesh(),
+                            rev: 0,
+                            connectivity: None,
+                            visible: true,
+                            light: None,
+                            has_blocklight: false,
+                            light_gen: 0,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut seeds = Vec::with_capacity(N);
+        'fill: for x in -18..=18 {
+            for z in -18..=18 {
+                for y in -8..=8 {
+                    let coord = ChunkCoord::new(x, y, z);
+                    debug_assert!(<MeshLane as StreamLane>::ready(&world, coord));
+                    seeds.push(coord);
+                    if seeds.len() == N {
+                        break 'fill;
+                    }
+                }
+            }
+        }
+        assert_eq!(seeds.len(), N, "need {N} in-box ready seeds");
+        world.workers = Some(Workers::spawn(2));
+
+        let start = Instant::now();
+        for _ in 0..PASSES {
+            world.mesh_worklist.clear();
+            world.mesh_worklist.extend(seeds.iter().copied());
+            for &coord in &seeds {
+                if let Some(loaded) = world.chunks.get_mut(&coord) {
+                    if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
+                        *building = false;
+                    }
+                }
+            }
+            world.pending_fresh.set();
+            admit::<MeshLane>(
+                &mut world,
+                center,
+                voxel_engine::producer::Budget::Millis(2.0),
+            );
+        }
+        let dt = start.elapsed();
+        let us = dt.as_secs_f64() * 1_000_000.0 / f64::from(PASSES);
+        println!(
+            "admit::<MeshLane> {N} seeds × {PASSES} passes: {:.1} µs/pass ({:.3}s total)",
+            us,
+            dt.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn near_and_far_slots_free_track_caps() {
+        let workers = Workers::spawn(2);
+        assert_eq!(workers.near_slots_free(), 8, "active*4, floored at 8");
+        assert_eq!(workers.far_slots_free(), FAR_QUEUE_CAP);
     }
 
     /// The pool-size policy: reserve two cores, cap at 12, floor at 1.
@@ -1630,7 +1778,7 @@ mod tests {
             },
             JobKey::Section {
                 pos: SectionPos {
-                    detail: voxel_engine::Detail(2),
+                    detail: crate::ident::Detail(2),
                     x: 5,
                     z: -5,
                 },
@@ -1695,5 +1843,20 @@ mod tests {
         check
             .recv_timeout(Duration::from_secs(10))
             .expect("Workers::drop hung");
+    }
+
+    #[test]
+    fn view_gate_wanted_roundtrips_negative_and_border_centres() {
+        let s = CHUNK_SIZE as i32;
+        let border = (crate::math::WORLD_BORDER as i32).div_euclid(s);
+        let gate = ViewGate::new();
+        for cx in [0, 1, -1, 7, -7, border, -border] {
+            gate.set(cx, -cx, 4);
+            assert_eq!(gate.center(), (cx, -cx), "packed centre round-trips");
+            assert!(gate.wanted(cx, -cx));
+            assert!(gate.wanted(cx + 4 + CANCEL_MARGIN, -cx));
+            assert!(!gate.wanted(cx + 4 + CANCEL_MARGIN + 1, -cx));
+            assert_eq!(gate.dist(cx, -cx), 0);
+        }
     }
 }

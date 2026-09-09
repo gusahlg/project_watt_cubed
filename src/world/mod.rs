@@ -42,6 +42,7 @@ pub mod placement;
 pub mod pyramid;
 pub mod section;
 
+mod census;
 mod coverage;
 mod edits;
 mod heightmip;
@@ -59,7 +60,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle};
+use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle};
+use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
@@ -159,7 +161,15 @@ pub struct StreamGauges {
     /// Current horizontal travel speed and normalized streaming effort.
     pub travel_speed_mps: f64,
     pub effort: f32,
+    /// Cumulative light jobs admitted to the pool, and the count from the
+    /// most recent light-admit pass (0 if that pass did not run).
+    pub light_admitted: u64,
+    pub light_admitted_last: usize,
+    /// Cumulative `light_worklist` insert attempts (including already-queued).
+    pub light_seed_inserts: u64,
 }
+
+pub use census::MemoryCensus;
 use connectivity::{Connectivity, Occlusion};
 
 /// The streamed chunk volume around the player: a horizontal ring radius and a
@@ -233,7 +243,7 @@ impl ViewVolume {
 
 /// Fast multiply-based hasher for well-distributed grid coordinate keys (chunk hot path).
 #[derive(Default)]
-pub(in crate::world) struct FastHasher(u64);
+pub(crate) struct FastHasher(u64);
 
 impl Hasher for FastHasher {
     fn finish(&self) -> u64 {
@@ -252,7 +262,7 @@ impl Hasher for FastHasher {
     }
 }
 
-pub(in crate::world) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 pub(in crate::world) type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 
 /// Raise-then-consume flag: can be raised or consumed, never lowered (so a queued
@@ -314,6 +324,25 @@ struct Loaded {
     /// chunk meshes or settles, and directly queryable for gameplay (mob spawns,
     /// plant growth) with no mesh. `None` until the chunk has first settled.
     light: Option<LightGrid>,
+    /// Any border lumel has blocklight `> 1`. Set at [`settle_light`](World::settle_light)
+    /// so a uniform-air neighbour can reject the analytic sky path by testing
+    /// six booleans instead of capturing a 3 KB face shell.
+    has_blocklight: bool,
+    /// Identity of this `Loaded` for light-claim matching. Bumped at store so
+    /// a `Done::Light` captured against a previous resident at the same coord
+    /// (unload then regenerate, same `light_epoch`) cannot publish onto the
+    /// new voxels.
+    light_gen: u32,
+}
+
+/// Keep an in-flight claim counter in step with a boolean flag, without
+/// borrowing the rest of `World` (so it can run while a chunk/section is held).
+pub(in crate::world) fn adjust_count(count: &mut usize, was: bool, now: bool) {
+    match (was, now) {
+        (false, true) => *count += 1,
+        (true, false) => *count = count.saturating_sub(1),
+        _ => {}
+    }
 }
 
 impl Loaded {
@@ -324,6 +353,11 @@ impl Loaded {
     /// for double frees or leaks.
     fn retire(&mut self, next: MeshState, eng: &mut Engine) {
         std::mem::replace(&mut self.state, next).free_owned(eng);
+    }
+    /// Engine-free retire for claim tests that count frees through the hook.
+    #[cfg(test)]
+    fn retire_logged(&mut self, next: MeshState) {
+        std::mem::replace(&mut self.state, next).free_logged();
     }
 }
 
@@ -347,7 +381,30 @@ impl OwnedMesh {
     }
     /// Release the GPU allocation. Consumes `self`, so it can't be double-freed.
     fn free(self, eng: &mut Engine) {
+        #[cfg(test)]
+        mesh_free_log::record(self.0);
         eng.free_mesh(self.0);
+    }
+}
+
+/// Test-only log of handles passing through [`OwnedMesh::free`] / the
+/// engine-free `free_logged` path, so claim tests can count each free once
+/// without wrapping [`Engine`].
+#[cfg(test)]
+pub(in crate::world) mod mesh_free_log {
+    use std::cell::RefCell;
+    use voxel_engine::MeshHandle;
+
+    thread_local! {
+        static FREED: RefCell<Vec<MeshHandle>> = RefCell::new(Vec::new());
+    }
+
+    pub fn record(h: MeshHandle) {
+        FREED.with(|f| f.borrow_mut().push(h));
+    }
+
+    pub fn take() -> Vec<MeshHandle> {
+        FREED.with(|f| std::mem::take(&mut *f.borrow_mut()))
     }
 }
 
@@ -403,6 +460,14 @@ impl ChunkMeshes {
         self.0
             .iter()
             .any(|(_, m)| m.as_ref().is_some_and(|o| o.id() == handle))
+    }
+    /// Live handle ids, for the one-free-per-handle claim tests.
+    #[cfg(test)]
+    fn handles(&self) -> Vec<MeshHandle> {
+        self.0
+            .iter()
+            .filter_map(|(_, m)| m.as_ref().map(|o| o.id()))
+            .collect()
     }
 }
 
@@ -630,16 +695,40 @@ impl MeshState {
     /// those states carry no claim. Called at every mesh-result-consumption
     /// site whose result did NOT apply, so a stale result (view moved, chunk
     /// left the box) can never wedge the claim.
-    fn release_build(&mut self) {
+    fn release_build(&mut self) -> bool {
         if let MeshState::NeedsMesh { building, .. } = self {
-            *building = false;
+            if *building {
+                *building = false;
+                return true;
+            }
         }
+        false
+    }
+    fn is_building(&self) -> bool {
+        matches!(self, MeshState::NeedsMesh { building: true, .. })
     }
     fn is_needs_mesh(&self) -> bool {
         matches!(self, MeshState::NeedsMesh { .. })
     }
     fn is_dirty(&self) -> bool {
         matches!(self, MeshState::Dirty { .. })
+    }
+    /// Live GPU handles this state currently carries (at most one `ChunkMeshes`).
+    #[cfg(test)]
+    fn live_handles(&self) -> Vec<MeshHandle> {
+        self.live_meshes()
+            .map(ChunkMeshes::handles)
+            .unwrap_or_default()
+    }
+    /// Record-and-drop the owned meshes without an [`Engine`] — fake test
+    /// handles never index GPU memory, so the engine free is skipped.
+    #[cfg(test)]
+    fn free_logged(self) {
+        if let Some(meshes) = self.into_owned() {
+            for h in meshes.handles() {
+                mesh_free_log::record(h);
+            }
+        }
     }
 }
 
@@ -649,6 +738,8 @@ pub struct World {
     /// Read-only block palette; meshing/collision read its hot solidity arrays.
     registry: BlockRegistry,
     generator: diffusion::Generator,
+    kind: WorldgenKind,
+    diffusion: diffusion::DiffusionCfg,
     chunks: FastMap<Coord, Loaded>,
     /// Player edits grouped by chunk (inner key: flat voxel index for replay on regenerate).
     edits: FastMap<Coord, FastMap<usize, BlockId>>,
@@ -674,12 +765,25 @@ pub struct World {
     tables: crate::derived::Derived<HotTables>,
     /// Background workers spawned lazily on first stream (headless worlds skip threads).
     workers: Option<pipeline::Workers>,
+    /// Reused by Coord admission lanes (mesh, light) so [`admit`] never allocates.
+    admit_coords: AdmitScratch<Coord>,
+    /// Reused by the section admission lane.
+    admit_sections: AdmitScratch<SectionPos>,
+    /// Reused column list for [`World::request_region_data`].
+    gen_columns: Vec<(u64, (i32, i32), (i32, i32))>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
+    /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
+    building_meshes: usize,
+    /// `SectionState::Meshing` claims. Counter so idle `pump` never scans sections.
+    meshing_sections: usize,
     /// The [`GenerateLane`](lanes::GenerateLane)'s raise-then-consume gate: the
     /// data box has columns to request. Raised on a boundary cross and by a
     /// generate strike-out re-request; drained when the box is fully requested.
     pending_gen: Sticky,
+    /// Outstanding spawn/teleport collision slab. `None` once every chunk has
+    /// loaded (or never requested). Physics waits on [`spawn_ready`](Self::spawn_ready).
+    spawn_slab: Option<ChunkBox>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
     upload_queue: VecDeque<(Coord, u32, pipeline::MeshOutput)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
@@ -694,6 +798,12 @@ pub struct World {
     light_pending: Sticky,
     /// Chunks needing light settling (budgeted, seeded on load/edit/border moves).
     light_worklist: FastSet<Coord>,
+    /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
+    light_seed_inserts: u64,
+    /// Cumulative light jobs accepted by the worker pool.
+    light_admitted: u64,
+    /// Jobs accepted by the most recent [`admit`]`<LightLane>` pass.
+    light_admitted_last: usize,
     /// Chunks with a light-settle job in flight on the worker pool. A settle is
     /// claimed out of `light_worklist` at submit and released here when its grid
     /// lands, so at most one flood per chunk is in flight and the mesh gate
@@ -711,12 +821,18 @@ pub struct World {
     /// of chunks currently showing a degraded (known-not-final) mesh awaiting relight.
     /// Kept in one struct so the feature's footprint on `World` is a single field.
     light_gate: streaming::LightGate,
+    /// Chunks whose missing neighbour light will never arrive, so a mesh
+    /// snapshot must read missing planes as settled dark (not open-sky).
+    light_terminal: FastSet<Coord>,
+    /// Degraded-snapshot flag carried from mesh submit to claim, so a rejected
+    /// submit does not mutate the degraded or terminal sets.
+    mesh_pending_degraded: Option<(Coord, bool)>,
     /// Skylight ceiling per `(x, z)` chunk column — the surface heightmap the
     /// settle pass seeds skylight from. A pure generator function (independent of
     /// y and of edits), so it is computed once per column and reused across every
     /// vertical chunk and every re-settle instead of re-sampling 256 noise columns
     /// per settle. Pruned when a column fully unloads.
-    ceilings: FastMap<(i32, i32), light::CeilingWindow>,
+    ceilings: FastMap<(i32, i32), Arc<light::CeilingWindow>>,
     /// Panic counts per failed claim, for the bounded-retry policy in
     /// [`fail_job`](World::fail_job). Rare by construction (a strike is a
     /// worker panic), so the map stays tiny.
@@ -768,10 +884,15 @@ pub struct World {
     /// the entered shell (new ∖ old) for NeedsMesh re-seeding. `None` after a
     /// radius change, so the next cross probes the whole box.
     prev_mesh_box: Option<ChunkBox>,
-    /// Loaded-chunk count per `(x, z)` column — a column's cached ceiling
-    /// drops exactly when its last chunk unloads (was: rebuild a live-column
-    /// set over the WHOLE map per boundary cross).
-    column_chunks: FastMap<(i32, i32), u16>,
+    /// The unload box of the previous full pass: a boundary cross frees only
+    /// the left shell (old ∖ new). `None` after a radius change, so the next
+    /// cross scans every loaded chunk.
+    prev_unload_box: Option<ChunkBox>,
+    /// Loaded chunk-Y layers per `(x, z)` column, highest first. Empty vec is
+    /// pruned so a column's cached ceiling drops exactly when its last chunk
+    /// unloads (was: rebuild a live-column set over the WHOLE map per boundary
+    /// cross).
+    column_chunks: FastMap<(i32, i32), Vec<i32>>,
     /// Whether occlusion was active last stream (render honours visible set if active).
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
@@ -787,6 +908,8 @@ pub struct World {
     /// Generation stamp for asynchronous light jobs. Toggling lighting advances
     /// it so a result captured under the previous mode cannot publish later.
     light_epoch: u32,
+    /// Per-`Loaded` light-claim identity (see [`Loaded::light_gen`]).
+    light_claim_seq: u32,
     /// LOD2 column-section far field enable.
     lod2: bool,
     /// LOD pyramid config with `unit` in metres.
@@ -804,6 +927,9 @@ pub struct World {
     /// admission, result-integration, and upload pressure; capacity recovers
     /// gradually after stopping so the first stationary frame cannot hitch.
     stream_pacer: streaming::StreamPacer,
+    /// Wall time of the previous [`World::stream`] topology pass. The rest-time
+    /// worker boost uses it as the frame-headroom signal.
+    last_stream_secs: f64,
     /// Per-cell relief drives error-driven LOD selection for the far field.
     /// `None` until the background bake lands; selection falls back to default LOD.
     section_mip: Option<HeightMip>,
@@ -925,10 +1051,11 @@ impl World {
 
     /// Construct without synchronously generating the full origin data box.
     /// Interactive startup uses this path and calls
-    /// [`prepare_around`](Self::prepare_around) for the small collision-safe
-    /// spawn slab; streaming fills the remainder asynchronously. Existing
-    /// constructors retain eager data for tests and headless callers that
-    /// query the origin before their first stream.
+    /// [`prepare_around`](Self::prepare_around) to *request* the collision-safe
+    /// spawn slab (worker-pool columns; [`spawn_ready`](Self::spawn_ready)
+    /// becomes true once they land). Streaming fills the remainder.
+    /// Existing constructors retain eager data for tests and headless callers
+    /// that query the origin before their first stream.
     pub fn with_config_lazy(seed: i64, render: crate::render_config::RenderConfig) -> Self {
         Self::with_kind(seed, render, WorldgenKind::Classic, false)
     }
@@ -956,6 +1083,7 @@ impl World {
         field: diffusion::DiffusionCfg,
         pregenerate_origin: bool,
     ) -> Self {
+        let field = field.clamp();
         let mut registry = BlockRegistry::with_builtins();
         let generator = match kind {
             WorldgenKind::Classic => diffusion::classic(&mut registry, seed),
@@ -969,6 +1097,8 @@ impl World {
         let mut world = Self {
             registry,
             generator,
+            kind,
+            diffusion: field,
             chunks: FastMap::default(),
             ceilings: FastMap::default(),
             edits: FastMap::default(),
@@ -981,15 +1111,26 @@ impl World {
             scratch: new_chunk_mesh_data(),
             tables: crate::derived::Derived::default(),
             workers: None,
+            admit_coords: AdmitScratch::default(),
+            admit_sections: AdmitScratch::default(),
+            gen_columns: Vec::new(),
             generating: FastSet::default(),
+            building_meshes: 0,
+            meshing_sections: 0,
             pending_gen: Sticky::default(),
+            spawn_slab: None,
             upload_queue: VecDeque::new(),
             mesh_worklist: FastSet::default(),
             light_pending: Sticky::default(),
             light_worklist: FastSet::default(),
+            light_seed_inserts: 0,
+            light_admitted: 0,
+            light_admitted_last: 0,
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
+            light_terminal: FastSet::default(),
+            mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
             quarantined: FastSet::default(),
             textures_built: 0,
@@ -1004,18 +1145,21 @@ impl World {
             conn_fill_queue: VecDeque::new(),
             dirty_worklist: FastSet::default(),
             prev_mesh_box: None,
+            prev_unload_box: None,
             column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
             stream_lanes: None,
             lighting: true,
             light_epoch: 0,
+            light_claim_seq: 0,
             lod2,
             section_pyramid: pyramid::PyramidCfg::sections_with(unit, lod_levels, lod_detail),
             section_eye_y: 0.0,
             section_eye_prev: None,
             section_vel: DVec3::ZERO,
             stream_pacer: streaming::StreamPacer::default(),
+            last_stream_secs: 0.0,
             section_mip: None,
             section_mip_rx: None,
             sections: FastMap::default(),
@@ -1319,6 +1463,18 @@ impl World {
         self.stream_lanes = Some(lanes);
     }
 
+    /// Any generate/mesh/light/section claim or upload still outstanding.
+    /// Counter reads only — idle `pump` uses this to skip the drain lane.
+    pub fn anything_in_flight(&self) -> bool {
+        self.building_meshes != 0
+            || self.meshing_sections != 0
+            || !self.generating.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.upload_queue.is_empty()
+            || !self.light_apply_queue.is_empty()
+            || !self.section_upload_queue.is_empty()
+    }
+
     /// The registered stream-lane handles (panics if `stream` runs before
     /// `Game::new` wired them — see [`World::stream_lanes`]).
     fn lanes(&self) -> lanes::StreamLanes {
@@ -1492,11 +1648,27 @@ pub(in crate::world) fn admission_exhausted(
 /// How a lane defines its work this frame. A geometry lane derives candidates
 /// from the player centre. A worklist lane reads an explicit dirty set
 /// accumulated on the `World` (mesh, light: coords marked dirty by loads/edits).
-pub(in crate::world) enum Candidates<K> {
-    /// The full candidate key list, recomputed from the centre this frame.
-    Geometry(Vec<K>),
+pub(in crate::world) enum Candidates {
+    /// Walk the frame's derived candidate keys (see [`StreamLane::for_each_geometry`]).
+    Geometry,
     /// Read the lane's seed set (`StreamLane::seed_set`) for candidates.
     Worklist,
+}
+
+/// Reused gather buffers for one [`admit`] pass. Held on [`World`] so the
+/// loop never allocates per pass.
+pub(in crate::world) struct AdmitScratch<K> {
+    keys: Vec<(u64, K)>,
+    blocked: Vec<K>,
+}
+
+impl<K> Default for AdmitScratch<K> {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            blocked: Vec::new(),
+        }
+    }
 }
 
 /// The accessor surface of one streaming lane. Zero-sized marker types
@@ -1515,10 +1687,15 @@ pub(in crate::world) trait StreamLane {
     /// under a tight budget. One value per lane; enforced once, in [`admit`].
     const MIN_ADMIT: usize;
 
+    /// Far LOD lanes enqueue through `submit_far`; everyone else is near.
+    const FAR: bool = false;
+
     /// The candidate keys for this frame (see [`Candidates`]).
-    fn candidates(world: &World, center: Coord) -> Candidates<Self::Key>;
+    fn candidates(world: &World, center: Coord) -> Candidates;
     /// The worklist seed set, for worklist lanes (`None` for geometry lanes).
     fn seed_set(world: &mut World) -> Option<&mut FastSet<Self::Key>>;
+    /// This lane's reusable gather buffers.
+    fn scratch(world: &mut World) -> &mut AdmitScratch<Self::Key>;
     /// This lane's raise-then-consume "has pending work" gate.
     fn pending(world: &mut World) -> &mut Sticky;
     /// Nearest-first ordering metric (lower is sooner). It receives the world
@@ -1544,6 +1721,10 @@ pub(in crate::world) trait StreamLane {
         let _ = (world, center, key);
         None
     }
+    /// Geometry-lane candidate visit. Worklist lanes leave this unused.
+    fn for_each_geometry(world: &World, center: Coord, visit: impl FnMut(Self::Key)) {
+        let _ = (world, center, visit);
+    }
     /// Build the worker job for `key`, or `None` to drop it.
     /// May warm caches but must not mutate lane state.
     fn submit(world: &mut World, key: Self::Key) -> Option<pipeline::Job>;
@@ -1551,74 +1732,115 @@ pub(in crate::world) trait StreamLane {
     fn claim(world: &mut World, key: Self::Key);
     /// Fold a finished result back into the world (upload a mesh, publish light).
     fn integrate(world: &mut World, done: pipeline::Done);
+    /// Record how many jobs this pass admitted. Light counts it for the stress
+    /// harness; everyone else is a no-op.
+    fn note_admitted(world: &mut World, n: usize) {
+        let _ = (world, n);
+    }
 }
 
-/// The shared admission loop: gather, filter unready/in-flight, sort
-/// nearest-first, submit until the deadline expires (checked between items,
-/// never mid-item, and never before `MIN_ADMIT`), then claim. Clears the lane's
-/// pending gate once the ready backlog drains. `deadline` comes from the
-/// scheduler's per-producer budget — this loop owns no budget of its own.
+fn queue_slots<S: StreamLane>(world: &World) -> usize {
+    let Some(workers) = world.workers.as_ref() else {
+        return usize::MAX;
+    };
+    if S::FAR {
+        workers.far_slots_free()
+    } else {
+        workers.near_slots_free()
+    }
+}
+
+/// The shared admission loop: gather, filter unready/in-flight, select the
+/// nearest `want` in O(n), submit until the deadline expires (checked between
+/// items, never mid-item, and never before `MIN_ADMIT`), then claim. Clears the
+/// lane's pending gate once the ready backlog drains. `budget` becomes a
+/// [`pipeline::Deadline`] only after the pending gate, so an idle frame never
+/// samples `Instant::now`.
 pub(in crate::world) fn admit<S: StreamLane>(
     world: &mut World,
     center: Coord,
-    deadline: pipeline::Deadline,
+    budget: Budget,
 ) {
     if !S::pending(world).get() {
         return;
     }
-    let worklist = S::seed_set(world).is_some();
-    let candidates: Vec<S::Key> = match S::candidates(world, center) {
-        Candidates::Geometry(v) => v,
-        Candidates::Worklist => S::seed_set(world)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default(),
-    };
-    // Partition into ready (not in-flight) and blocked. For worklist lanes, evict
-    // blocked seeds since they'll be re-added when unblocked. This avoids
-    // rescanning the accumulated backlog every frame.
-    let mut ready_keys = Vec::new();
-    let mut blocked = Vec::new();
-    for k in candidates {
-        if S::in_flight(world, k) {
-            continue;
-        }
-        if S::ready(world, k) {
-            ready_keys.push(k);
-        } else if worklist {
-            blocked.push(k);
-        }
-    }
+    let deadline = lanes::paced_deadline(world, budget);
+    let worklist = matches!(S::candidates(world, center), Candidates::Worklist);
+    let slots = queue_slots::<S>(world);
+    let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
+
+    let mut scratch = std::mem::take(S::scratch(world));
+    scratch.keys.clear();
+    scratch.blocked.clear();
+
     if worklist {
-        if let Some(set) = S::seed_set(world) {
-            for k in &blocked {
-                set.remove(k);
+        let mut set = std::mem::take(S::seed_set(world).expect("worklist"));
+        for &k in &set {
+            if S::in_flight(world, k) {
+                continue;
+            }
+            if S::ready(world, k) {
+                if slots > 0 {
+                    scratch.keys.push((S::order(world, center, k), k));
+                }
+            } else {
+                scratch.blocked.push(k);
             }
         }
-        // Each eviction is an EVENT the lane may need to time/track — the
-        // hook runs after the seed-set borrow ends.
-        for k in blocked {
+        for k in &scratch.blocked {
+            set.remove(k);
+        }
+        *S::seed_set(world).expect("worklist") = set;
+        for k in scratch.blocked.drain(..) {
             S::on_blocked(world, k);
         }
+    } else if slots > 0 {
+        S::for_each_geometry(world, center, |k| {
+            if S::in_flight(world, k) || !S::ready(world, k) {
+                return;
+            }
+            scratch.keys.push((S::order(world, center, k), k));
+        });
+    } else {
+        *S::scratch(world) = scratch;
+        return;
     }
-    ready_keys.sort_by_key(|&k| S::order(world, center, k));
-    // `exhausted` stays true only if all ready keys were processed before the
-    // deadline stopped the loop (the floor lives in `admission_exhausted`).
-    let mut exhausted = true;
+
+    let n = scratch.keys.len();
+    if n == 0 {
+        let drained = S::seed_set(world).is_none_or(|set| set.is_empty());
+        if drained {
+            S::pending(world).take();
+        }
+        *S::scratch(world) = scratch;
+        return;
+    }
+
+    let want = n.min(slots.max(min_admit));
+    if want < n {
+        scratch.keys.select_nth_unstable_by_key(want - 1, |e| e.0);
+        scratch.keys[..want].sort_by_key(|e| e.0);
+    } else {
+        scratch.keys.sort_by_key(|e| e.0);
+    }
+
+    let mut exhausted = want == n;
     let mut admitted = 0usize;
-    for key in ready_keys {
-        if admission_exhausted(admitted, world.stream_pacer.floor(S::MIN_ADMIT), deadline) {
+    let fill_slots = world.stream_pacer.boosting();
+    for i in 0..want {
+        let key = scratch.keys[i].1;
+        if admission_exhausted(admitted, min_admit, deadline)
+            && !(fill_slots && admitted < slots)
+        {
             exhausted = false;
             break;
         }
         let Some(job) = S::submit(world, key) else {
-            // Unloaded/covered: drop the stale seed so it isn't retried forever.
             if let Some(set) = S::seed_set(world) {
                 set.remove(&key);
             }
             continue;
         };
-        // Far lanes use distance ordering; near lanes use FIFO.
-        // Compute dist² before taking the mutable workers pool.
         let far = S::dist2(world, center, key);
         let workers = world.worker_pool();
         let accepted = match far {
@@ -1629,16 +1851,16 @@ pub(in crate::world) fn admit<S: StreamLane>(
             S::claim(world, key);
             admitted += 1;
         } else {
-            // Pool declined: stop and retry next frame instead of wasting work.
             exhausted = false;
             break;
         }
     }
-    // Clear the gate once all ready items are submitted and no seeds remain.
+    S::note_admitted(world, admitted);
     let drained = exhausted && S::seed_set(world).is_none_or(|set| set.is_empty());
     if drained {
         S::pending(world).take();
     }
+    *S::scratch(world) = scratch;
 }
 
 /// Squared distance in metres from player-chunk centre to a world point.
@@ -1692,11 +1914,14 @@ impl StreamLane for MeshLane {
     type Key = Coord;
     /// Low floor: admits are relatively cheap.
     const MIN_ADMIT: usize = 4;
-    fn candidates(_world: &World, _center: Coord) -> Candidates<Coord> {
+    fn candidates(_world: &World, _center: Coord) -> Candidates {
         Candidates::Worklist
     }
     fn seed_set(world: &mut World) -> Option<&mut FastSet<Coord>> {
         Some(&mut world.mesh_worklist)
+    }
+    fn scratch(world: &mut World) -> &mut AdmitScratch<Coord> {
+        &mut world.admit_coords
     }
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.pending_fresh
@@ -1721,24 +1946,29 @@ impl StreamLane for MeshLane {
         }
     }
     fn ready(world: &World, key: Coord) -> bool {
-        // Ready if needs mesh, in view, has all neighbour data, and either light
-        // is settled or wait timeout expired (then mesh degraded and remesh later).
-        // Quarantined (repeatedly panicking) meshes are never ready.
+        // Cheapest-first: hash, arithmetic, quarantine set, neighbours, light.
         world.is_needs_mesh(key)
+            && world.in_mesh_box(key)
             && !world
                 .quarantined
                 .contains(&streaming::FailKey::Mesh { coord: key })
-            && world.in_mesh_box(key)
-            && world.neighbours_have_data(key)
-            && (world.light_ready(key) || world.light_wait_expired(key))
+            // Terminal promotion is unconditional: missing neighbour planes
+            // read as dark/air, matching the old sync path. Snapshot already
+            // fills an absent neighbour that way (`Padded` → AIR, `PaddedLight`
+            // → DARK when not degraded).
+            && (world.neighbours_have_data(key) || world.light_terminal.contains(&key))
+            && (world.light_ready(key)
+                || world.light_wait_expired(key)
+                || world.light_terminal.contains(&key))
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         world.refresh_tables();
         // If light isn't ready, mesh degraded with assumed-lit neighbours,
-        // then remesh when real light arrives.
-        let degraded = !world.light_ready(key);
+        // then remesh when real light arrives — unless the chunk is terminal
+        // (missing neighbour light will never arrive: missing planes are dark).
+        let degraded = !world.light_ready(key) && !world.light_terminal.contains(&key);
         let (rev, snapshot) = world.snapshot(key, degraded);
-        world.mark_degraded(key, degraded);
+        world.mesh_pending_degraded = Some((key, degraded));
         Some(pipeline::Job::Mesh {
             coord: key,
             rev,
@@ -1746,6 +1976,24 @@ impl StreamLane for MeshLane {
         })
     }
     fn claim(world: &mut World, key: Coord) {
+        // Apply the snapshot's degraded flag now that the pool has accepted
+        // the job — submit must not mutate lane state (a rejected submit
+        // would otherwise park the chunk in `degraded` with nothing in flight,
+        // or drop a terminal mark that the retry still needs).
+        let degraded = match world.mesh_pending_degraded.take() {
+            Some((coord, degraded)) if coord == key => degraded,
+            pending => {
+                if let Some(leftover) = pending {
+                    world.mesh_pending_degraded = Some(leftover);
+                }
+                debug_assert!(
+                    pending.is_none(),
+                    "mesh claim for {key:?} with pending for {pending:?}"
+                );
+                !world.light_ready(key) && !world.light_terminal.contains(&key)
+            }
+        };
+        world.mark_degraded(key, degraded);
         // Set the building flag IN PLACE to claim the mesh job — a whole-state
         // overwrite would silently drop a carried `prev` mesh (leaking its GPU
         // handle and blanking the chunk mid-rebuild). Held until upload retires
@@ -1757,7 +2005,10 @@ impl StreamLane for MeshLane {
                 "mesh submit for non-NeedsMesh {key:?}"
             );
             if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
-                *building = true;
+                if !*building {
+                    *building = true;
+                    adjust_count(&mut world.building_meshes, false, true);
+                }
             }
         }
     }
@@ -1776,29 +2027,30 @@ impl StreamLane for SectionLane {
     type Key = SectionPos;
     /// Modest floor: heavy work runs off-thread.
     const MIN_ADMIT: usize = 4;
-    fn candidates(world: &World, center: Coord) -> Candidates<SectionPos> {
-        // Start with the frame's cached desired set, filter those already
-        // loaded and those provably inside the coverage clip (skip load).
-        Candidates::Geometry(
-            world
-                .section_desired
-                .iter()
-                .copied()
-                .filter(|s| {
-                    !world.sections.contains_key(s)
-                        && !world
-                            .quarantined
-                            .contains(&streaming::FailKey::Section { pos: *s })
-                        && !world.coverage_skips(center, *s)
-                })
-                .collect(),
-        )
+    const FAR: bool = true;
+    fn candidates(_world: &World, _center: Coord) -> Candidates {
+        Candidates::Geometry
     }
     fn seed_set(_world: &mut World) -> Option<&mut FastSet<SectionPos>> {
         None
     }
+    fn scratch(world: &mut World) -> &mut AdmitScratch<SectionPos> {
+        &mut world.admit_sections
+    }
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.pending_sections
+    }
+    fn for_each_geometry(world: &World, center: Coord, mut visit: impl FnMut(SectionPos)) {
+        for &s in &world.section_desired {
+            if !world.sections.contains_key(&s)
+                && !world
+                    .quarantined
+                    .contains(&streaming::FailKey::Section { pos: s })
+                && !world.coverage_skips(center, s)
+            {
+                visit(s);
+            }
+        }
     }
     fn order(_world: &World, center: Coord, key: SectionPos) -> u64 {
         let cs = CHUNK_SIZE as i32;
@@ -1848,6 +2100,11 @@ impl StreamLane for SectionLane {
         let token = match world.section_pending_claim.take() {
             Some((pos, token)) if pos == key => token,
             other => {
+                // A far-cap rejection leaves the pending token set; a later
+                // claim for a different key must not consume it.
+                if let Some(pending) = other {
+                    world.section_pending_claim = Some(pending);
+                }
                 debug_assert!(
                     false,
                     "section claim for {key:?} without its submit ({other:?})"
@@ -1856,7 +2113,12 @@ impl StreamLane for SectionLane {
             }
         };
         world.dirty_sections.remove(&key);
-        world.sections.insert(key, SectionState::Meshing { token });
+        let prev = world.sections.insert(key, SectionState::Meshing { token });
+        adjust_count(
+            &mut world.meshing_sections,
+            matches!(prev, Some(SectionState::Meshing { .. })),
+            true,
+        );
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
         if let pipeline::Done::Section {
@@ -1885,11 +2147,14 @@ impl StreamLane for LightLane {
     type Key = Coord;
     /// High floor: settle must drain fast so meshing can start.
     const MIN_ADMIT: usize = 32;
-    fn candidates(_world: &World, _center: Coord) -> Candidates<Coord> {
+    fn candidates(_world: &World, _center: Coord) -> Candidates {
         Candidates::Worklist
     }
     fn seed_set(world: &mut World) -> Option<&mut FastSet<Coord>> {
         Some(&mut world.light_worklist)
+    }
+    fn scratch(world: &mut World) -> &mut AdmitScratch<Coord> {
+        &mut world.admit_coords
     }
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.light_pending
@@ -1922,6 +2187,7 @@ impl StreamLane for LightLane {
         Some(pipeline::Job::Light {
             coord: key,
             epoch: world.light_epoch,
+            light_gen: world.chunks[&key].light_gen,
             snapshot: Box::new(snapshot),
         })
     }
@@ -1929,11 +2195,21 @@ impl StreamLane for LightLane {
         world.light_worklist.remove(&key);
         world.light_inflight.insert(key);
     }
+    fn note_admitted(world: &mut World, n: usize) {
+        world.light_admitted += n as u64;
+        world.light_admitted_last = n;
+    }
     fn integrate(world: &mut World, done: pipeline::Done) {
         // `accept_light` owns the claim rule (release-or-transfer on every
         // consumed result) — see its doc for the epoch soundness argument.
-        if let pipeline::Done::Light { coord, epoch, grid } = done {
-            world.accept_light(coord, epoch, grid);
+        if let pipeline::Done::Light {
+            coord,
+            epoch,
+            light_gen,
+            grid,
+        } = done
+        {
+            world.accept_light(coord, epoch, light_gen, grid);
         }
     }
 }

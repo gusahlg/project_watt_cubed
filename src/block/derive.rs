@@ -11,6 +11,7 @@ use crate::block::composition::{Composition, Weights};
 use crate::block::element::{Core, CoreProperties, ElementRegistry, SpecialKind};
 
 /// Blend each core property from its contributing elements, using their weights.
+#[cfg(test)]
 pub fn derive_core(els: &ElementRegistry, comp: &Composition) -> CoreProperties {
     derive_core_from(els, &comp.weights())
 }
@@ -28,6 +29,7 @@ pub fn derive_core_from(els: &ElementRegistry, weights: &Weights) -> CorePropert
 }
 
 /// Blend the block's colour from element tints using their weights.
+#[cfg(test)]
 pub fn derive_color(els: &ElementRegistry, comp: &Composition) -> Color {
     derive_color_from(els, &comp.weights())
 }
@@ -163,6 +165,7 @@ pub fn derive_sound_class(core: &CoreProperties, solid: bool) -> SoundClass {
 /// Special behaviours a block exhibits, each scaled by how much of the carrying
 /// element it contains and summed across carriers. Returned sorted by kind for a
 /// stable, inspectable order.
+#[cfg(test)]
 pub fn derive_specials(els: &ElementRegistry, comp: &Composition) -> Box<[(SpecialKind, u8)]> {
     derive_specials_from(els, &comp.weights())
 }

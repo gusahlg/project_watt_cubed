@@ -28,7 +28,8 @@ cargo run --release --bin watt_server -- --port 5555 --password hunter2 --seed 4
 ```
 
 All flags are optional: with no `--seed` a fresh one is chosen and printed; with no
-`--password` the server is open to anyone who can reach the port.
+`--password` the server is open to anyone who can reach the port. `--data-dir`
+sets the data/config root (same as `WATT_DATA_DIR`).
 
 ### Chat
 
@@ -53,6 +54,10 @@ but an active man-in-the-middle can impersonate the server and capture the
 application password. Use a trusted network or VPN until certificate pinning
 or trust-on-first-use is implemented.
 
+Server-side mods: install `ServerMod` values on `Config.hooks` (`validate_edit`, `on_join`/`on_leave`, `on_chat`) with plain-data arguments and no wire change.
+Hooks run in order outside the roster lock; the first `Deny` wins (an edit `Deny` is the same `EditRejected` path as a lost race).
+A panicking hook is logged once and treated as `Allow` so a broken mod cannot take the server down.
+
 ## Graphics
 
 Rendering runs on [voxel_engine](../voxel-engine), our own Vulkan 1.3 renderer
@@ -62,7 +67,14 @@ chunks, frustum culling, reversed-Z depth, and uncapped frame rates by default.
 Graphics are tunable at runtime from **Settings** on the start menu or the
 `/gfx` console command in game (`/gfx fullscreen on`, `/gfx vsync off`,
 `/gfx msaa 4`, `/gfx fps 144`, `/gfx renderdist 8`, `/gfx fov 90`). Settings
-persist in `saves/settings.cfg`.
+persist in `settings.cfg` under the config root.
+
+## State location
+
+Worlds are stored in the data root; `settings.cfg`, `session.cfg`, and `mods.cfg` in the config root.
+If the launch directory already contains `saves/`, both roots stay that folder (checkouts and existing installs).
+Otherwise `$XDG_DATA_HOME/project_watt_cubed` and `$XDG_CONFIG_HOME/project_watt_cubed`. Override with `WATT_DATA_DIR` or `watt_server --data-dir <dir>`.
+`WATT_CHECKOUT_DIR` is the source checkout (`play.sh` sets it to the repo root) and is ignored unless that directory contains `Cargo.toml`.
 
 ## Running on NixOS
 

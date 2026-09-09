@@ -19,12 +19,14 @@ impl World {
     }
 
     /// Current vertical streaming distance in chunk layers above and below the eye.
+    #[cfg(test)]
     pub fn vertical_radius(&self) -> i32 {
         self.view.vertical
     }
 
     /// Compatibility setter for callers with a single render-distance value.
     /// The vertical distance retains its historical half-horizontal derivation.
+    #[cfg(test)]
     pub fn set_view_radius(&mut self, radius: i32) {
         let horizontal = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
         let view = super::ViewVolume::view(horizontal);
@@ -48,6 +50,7 @@ impl World {
             // The next full pass must probe the WHOLE new box (a grown radius
             // exposes chunks the old shell diff would skip).
             self.prev_mesh_box = None;
+            self.prev_unload_box = None;
             self.pending_fresh.set();
             // On shrink, meshes between the new radius and the (also shrunk)
             // unload ring would otherwise stay drawn until the player moves;
@@ -129,6 +132,7 @@ impl World {
         for (_, state) in self.sections.drain() {
             state.free(eng);
         }
+        self.meshing_sections = 0;
         self.section_upload_queue.clear();
         self.pending_sections.take();
         self.dirty_sections.clear();
@@ -206,6 +210,7 @@ impl World {
         self.light_inflight.clear();
         self.light_apply_queue.clear();
         self.light_pending.take();
+        self.light_terminal.clear();
         // `light_gate` (degraded/blocked_since) is left untouched on purpose: the
         // per-frame `tick_light_gate` reconciles it against live predicates. With
         // lighting off, `light_ready` is data-only, so blocked timers drain and any
@@ -241,6 +246,7 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::needs_mesh(), eng);
         }
+        self.building_meshes = 0;
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop
         // the membership set and the stale hint with it.
         self.dirty_worklist.clear();
@@ -252,19 +258,15 @@ impl World {
         // coord gets generated or meshed twice, never wrongly.
         self.generating.clear();
         self.upload_queue.clear();
-        // Sections belong to the world being left.
-        for (_, state) in self.sections.drain() {
-            state.free(eng);
-        }
-        self.section_upload_queue.clear();
-        self.pending_sections.take();
-        self.dirty_sections.clear();
-        self.section_visible.clear();
+        // Sections belong to the world being left: epoch bump + far-job purge
+        // so in-flight results cannot land after we come back.
+        self.clear_section_lane(eng, false);
         self.center = None;
         // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).
         self.mesh_worklist = self.chunks.keys().copied().collect();
         self.pending_fresh.set();
+        self.light_terminal.clear();
     }
 
     /// Set block at world coord; record in edit overlay and mark chunk(s) for remesh.
@@ -325,7 +327,7 @@ impl World {
                         .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
                         .collect();
                     for c in shadowed {
-                        self.light_worklist.insert(c);
+                        self.seed_light(c);
                     }
                     self.light_pending.set();
                 }
@@ -351,7 +353,7 @@ impl World {
             self.pending_fresh.set();
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
-            self.light_worklist.insert(coord);
+            self.seed_light(coord);
             self.light_pending.set();
         }
         // A block on a chunk face also changes that neighbour's exposed
@@ -374,7 +376,9 @@ impl World {
     /// membership set instead of filtering every loaded chunk.
     pub(in crate::world) fn invalidate_mesh(&mut self, coord: Coord) {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
             loaded.state.invalidate();
+            super::adjust_count(&mut self.building_meshes, was, false);
             loaded.rev = loaded.rev.wrapping_add(1);
             self.dirty_worklist.insert(coord);
             self.pending_dirty.set();
@@ -393,7 +397,7 @@ impl World {
             self.pending_fresh.set();
             // A border edit can change this chunk's light directly (an emitter on
             // the shared face); re-settle it too.
-            self.light_worklist.insert(coord);
+            self.seed_light(coord);
             self.light_pending.set();
         }
     }
@@ -438,5 +442,33 @@ impl World {
                 (BlockCoord::join(coord, local).to_tuple(), id)
             })
         })
+    }
+
+    /// Cheap autosave snapshot of the overlay: a HashMap clone, no spec strings.
+    pub(crate) fn clone_edit_overlay(
+        &self,
+    ) -> super::FastMap<Coord, super::FastMap<usize, BlockId>> {
+        self.edits.clone()
+    }
+}
+
+#[cfg(test)]
+impl World {
+    /// Pack `n` overlay entries without going through [`World::set_block`] —
+    /// used by the autosave snapshot/encode timing probe.
+    pub(crate) fn test_fill_overlay(&mut self, n: usize, id: BlockId) {
+        use super::chunk::CHUNK_VOLUME;
+        let mut placed = 0;
+        let mut cx = 0i32;
+        while placed < n {
+            let inner = self.edits.entry(Coord::new(cx, 20, 0)).or_default();
+            let room = CHUNK_VOLUME.min(n - placed);
+            for index in 0..room {
+                inner.insert(index, id);
+            }
+            placed += room;
+            self.edit_generation += room as u64;
+            cx += 1;
+        }
     }
 }

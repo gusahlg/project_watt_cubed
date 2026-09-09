@@ -106,10 +106,10 @@ const FLAG_FLUID_SURFACE: u8 = 1 << 3;
 impl HotTables {
     /// Pack one block's flag byte from its boolean properties.
     fn pack(solid: bool, opaque: bool, liquid: bool, fluid_surface: bool) -> u8 {
-        (solid as u8) * FLAG_SOLID
-            | (opaque as u8) * FLAG_OPAQUE
-            | (liquid as u8) * FLAG_LIQUID
-            | (fluid_surface as u8) * FLAG_FLUID_SURFACE
+        ((solid as u8) * FLAG_SOLID)
+            | ((opaque as u8) * FLAG_OPAQUE)
+            | ((liquid as u8) * FLAG_LIQUID)
+            | ((fluid_surface as u8) * FLAG_FLUID_SURFACE)
     }
 
     /// Build from parallel boolean tables (tests and the registry snapshot).
@@ -400,6 +400,7 @@ impl BlockRegistry {
     /// Append one block to the parallel SoA arrays in lockstep, returning its
     /// freshly assigned [`BlockId`]. The single place the hot flags/property
     /// arrays and the cold `blocks` vector grow together, so they can never desync.
+    #[allow(clippy::too_many_arguments)] // SoA append keeps flags/properties in lockstep
     fn push_block(
         &mut self,
         block: Block,

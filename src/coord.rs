@@ -182,6 +182,22 @@ impl Face {
         Face::ALL[(self as usize) ^ 1]
     }
 
+    /// World axis this face is perpendicular to (0=X, 1=Y, 2=Z).
+    #[inline]
+    pub const fn axis(self) -> usize {
+        match self {
+            Face::NegX | Face::PosX => 0,
+            Face::NegY | Face::PosY => 1,
+            Face::NegZ | Face::PosZ => 2,
+        }
+    }
+
+    /// Whether this face points along the positive axis.
+    #[inline]
+    pub const fn positive(self) -> bool {
+        matches!(self, Face::PosX | Face::PosY | Face::PosZ)
+    }
+
     #[inline]
     pub fn touches(self, l: Local) -> bool {
         let edge = (CHUNK_SIZE - 1) as u8;
@@ -432,6 +448,30 @@ mod tests {
                 }
                 assert_eq!(got, want, "box coords differ at rh={rh} rv={rv} center={center:?}");
             }
+        }
+    }
+
+    #[test]
+    fn chunkbox_coords_at_world_border_do_not_wrap() {
+        let s = CHUNK_SIZE as i32;
+        let cx = (crate::math::WORLD_BORDER as i32).div_euclid(s);
+        for center in [
+            ChunkCoord::new(cx, 0, cx),
+            ChunkCoord::new(-cx, 0, -cx),
+            ChunkCoord::new(cx, cx / 4, -cx),
+        ] {
+            let b = ChunkBox::new(center, 3, 2);
+            let (sx, sy, sz) = b.size();
+            let coords: Vec<_> = b.coords().collect();
+            assert_eq!(
+                coords.len(),
+                (sx as usize) * (sy as usize) * (sz as usize),
+                "wrapped range at {center:?}"
+            );
+            assert!(
+                coords.iter().all(|&c| b.contains(c)),
+                "iterator emitted a coord the box does not contain"
+            );
         }
     }
 }

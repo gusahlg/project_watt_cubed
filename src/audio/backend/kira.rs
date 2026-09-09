@@ -25,7 +25,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 use kira::{
     AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Frame, Panning, Tween,
     backend::cpal::CpalBackendSettings,

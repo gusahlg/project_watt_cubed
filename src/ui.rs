@@ -9,7 +9,9 @@
 //! - [`TextInput`] — an editable line with a boundary-safe cursor, history
 //!   recall, word/line deletion, and optional Tab-completion. One `handle` per
 //!   frame drives every text field in the game the same way.
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use voxel_engine::{Color, Frame};
 
@@ -22,18 +24,20 @@ pub type Px = (i32, i32);
 /// Fit a label into a fixed-width monospace row without splitting Unicode.
 /// The renderer advances every glyph by one font-size unit, so character count
 /// is the exact layout metric here.
-pub fn ellipsize(text: &str, max_chars: usize) -> String {
+pub fn ellipsize(text: &str, max_chars: usize) -> Cow<'_, str> {
     let len = text.chars().count();
     if len <= max_chars {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if max_chars <= 3 {
-        return ".".repeat(max_chars);
+        return Cow::Owned(".".repeat(max_chars));
     }
-    text.chars()
-        .take(max_chars - 3)
-        .chain("...".chars())
-        .collect()
+    Cow::Owned(
+        text.chars()
+            .take(max_chars - 3)
+            .chain("...".chars())
+            .collect(),
+    )
 }
 
 /// A cursor-following slice of `0..total` containing at most `capacity` rows.
@@ -123,13 +127,14 @@ impl Crosshair {
     }
 }
 
-/// How much of the HUD is shown. A three-state cycle rather than a bool: `Minimal`
-/// keeps the reticle (and world-space name tags) but hides the informational text.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HudMode {
-    Full,
-    Minimal,
-    Off,
+crate::macros::code_enum! {
+    /// How much of the HUD is shown. A three-state cycle rather than a bool: `Minimal`
+    /// keeps the reticle (and world-space name tags) but hides the informational text.
+    pub enum HudMode {
+        Full = 2, ["full", "2"], "Full",
+        Minimal = 1, ["minimal", "min", "1"], "Minimal",
+        Off = 0, ["off", "0"], "Off",
+    }
 }
 
 impl HudMode {
@@ -163,35 +168,6 @@ impl HudMode {
         !matches!(self, HudMode::Off)
     }
 
-    /// Stable persistence/console code (`Off=0, Minimal=1, Full=2`), independent
-    /// of declaration order so the on-disk value never shifts if variants move.
-    pub fn code(self) -> u8 {
-        match self {
-            HudMode::Off => 0,
-            HudMode::Minimal => 1,
-            HudMode::Full => 2,
-        }
-    }
-
-    /// Parse a persisted code or a console word; the single source both the
-    /// settings `read` and `/gfx` parse fold through.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "off" | "0" => Some(HudMode::Off),
-            "minimal" | "min" | "1" => Some(HudMode::Minimal),
-            "full" | "2" => Some(HudMode::Full),
-            _ => None,
-        }
-    }
-
-    /// Capitalized display name for the menu row and confirm line.
-    pub fn label(self) -> &'static str {
-        match self {
-            HudMode::Off => "Off",
-            HudMode::Minimal => "Minimal",
-            HudMode::Full => "Full",
-        }
-    }
 }
 
 /// The whole in-world UI look, threaded through drawing. `scale` routes every font
@@ -230,6 +206,7 @@ impl Default for Theme {
 
 /// Measure → resolve → shadowed-draw a line of HUD text in one call. Every HUD
 /// text site collapses to this: the alignment math and the drop shadow are hidden.
+#[allow(clippy::too_many_arguments)] // HUD label needs frame, theme, placement, and text independently
 pub fn label(
     f: &mut Frame,
     theme: &Theme,
@@ -259,12 +236,12 @@ pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color
 /// colour and ellipsizes the text to the panel width.
 #[derive(Clone)]
 pub struct Row {
-    pub text: String,
+    pub text: Arc<str>,
     pub role: Role,
 }
 
 impl Row {
-    pub fn new(role: Role, text: impl Into<String>) -> Self {
+    pub fn new(role: Role, text: impl Into<Arc<str>>) -> Self {
         Self { text: text.into(), role }
     }
 }
@@ -280,11 +257,15 @@ pub const PANEL_BG: Color = Color::new(8, 10, 14, 200);
 /// A translucent HUD box at an absolute screen position: a background sized to
 /// its content, header line(s), a small gap, then body rows. Every row is
 /// ellipsized to fit `width`. The single owner of panel chrome.
+///
+/// Header/row lists are `Arc` so a cached panel can be pushed into the
+/// frame's HUD buffer without allocating on a stable frame.
+#[derive(Clone)]
 pub struct Panel {
     pub at: Px,
     pub width: i32,
-    pub header: Vec<Row>,
-    pub rows: Vec<Row>,
+    pub header: Arc<[Row]>,
+    pub rows: Arc<[Row]>,
 }
 
 impl Panel {
@@ -304,12 +285,12 @@ impl Panel {
         let mut row = |r: &Row, cy: i32| {
             shadowed(f, &ellipsize(&r.text, max_chars), text_x, cy, PANEL_FONT, r.role.color());
         };
-        for r in &self.header {
+        for r in self.header.iter() {
             row(r, cy);
             cy += PANEL_LINE;
         }
         cy += 2;
-        for r in &self.rows {
+        for r in self.rows.iter() {
             row(r, cy);
             cy += PANEL_LINE;
         }
@@ -319,6 +300,7 @@ impl Panel {
 /// One thing a mod contributes to the HUD. Closed on purpose (see the module
 /// note): a screen-anchored label or a boxed panel — nothing that lets a mod
 /// draw arbitrarily.
+#[derive(Clone)]
 pub enum HudElement {
     /// A screen-anchored line of text, scaled by the theme.
     Label {
@@ -326,7 +308,7 @@ pub enum HudElement {
         off: Px,
         base_fs: i32,
         role: Role,
-        text: String,
+        text: Arc<str>,
     },
     /// A translucent content box at an absolute position.
     Panel(Panel),

@@ -63,17 +63,15 @@ macro_rules! elements {
                             $($cf: $cv,)*
                             ..Default::default()
                         },
-                        specials: {
-                            #[allow(unused_mut)]
-                            let mut specials: Vec<$crate::block::element::SpecialProperty> = Vec::new();
-                            $( $( specials.push(
+                        specials: vec![
+                            $( $(
                                 $crate::block::element::SpecialProperty::new(
                                     $crate::block::element::SpecialKind::$svar,
                                     $sval,
-                                )
-                            ); )* )?
-                            specials.into_boxed_slice()
-                        },
+                                ),
+                            )* )?
+                        ]
+                        .into_boxed_slice(),
                     }
                 ),*
             ]
@@ -81,3 +79,41 @@ macro_rules! elements {
     };
 }
 pub(crate) use elements;
+
+/// Code/parse/label trio for small public enums persisted as a stable `u8`.
+macro_rules! code_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $var:ident = $code:literal, [$($alias:literal),+], $label:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        $vis enum $name {
+            $( $var, )+
+        }
+
+        impl $name {
+            pub fn code(self) -> u8 {
+                match self {
+                    $( $name::$var => $code, )+
+                }
+            }
+
+            pub fn parse(value: &str) -> Option<Self> {
+                match value {
+                    $( $($alias)|+ => Some($name::$var), )+
+                    _ => None,
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $( $name::$var => $label, )+
+                }
+            }
+        }
+    };
+}
+pub(crate) use code_enum;

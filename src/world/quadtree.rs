@@ -15,7 +15,7 @@ use super::metric::EyeMetric;
 use super::pyramid::PyramidCfg;
 use super::section::{Quadrant, SectionPos};
 use super::summary::{CellSummary, SseBudget};
-use super::FastMap;
+use super::{FastMap, FastSet};
 
 /// Which of a section's four quadrants to draw, as a 4-bit set. Bit `q` selects
 /// [`SectionPos::child`]'s [`Quadrant`], matching [`SectionPos::quadrant`] exactly.
@@ -129,7 +129,7 @@ pub(in crate::world) fn coarsen_by_error(
     summary: &impl Fn(SectionPos) -> CellSummary,
     budget: &SseBudget,
 ) -> Vec<SectionPos> {
-    let mut set: std::collections::HashSet<SectionPos> = frontier.into_iter().collect();
+    let mut set: FastSet<SectionPos> = frontier.into_iter().collect();
     // One detail level per pass to keep merges order-independent. Adjacent bands
     // can overlap (a cell and its parent both present), so level-by-level ensures
     // each pass is deterministic, with newly-formed parents reconsidered at the next level.
@@ -157,7 +157,7 @@ pub(in crate::world) fn coarsen_by_error(
             set.insert(p);
         }
     }
-    // Deterministic order: sort to avoid arbitrary HashSet iteration.
+    // Deterministic order: sort to avoid arbitrary set iteration.
     let mut out: Vec<SectionPos> = set.into_iter().collect();
     out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
     out
@@ -167,7 +167,7 @@ pub(in crate::world) fn coarsen_by_error(
 /// Result is a superset of each input, never dropping cells. Overlaps are pruned
 /// by [`resolve_covering`].
 pub(in crate::world) fn union_frontiers(a: Vec<SectionPos>, b: Vec<SectionPos>) -> Vec<SectionPos> {
-    let mut set: std::collections::HashSet<SectionPos> = a.into_iter().collect();
+    let mut set: FastSet<SectionPos> = a.into_iter().collect();
     set.extend(b);
     let mut out: Vec<SectionPos> = set.into_iter().collect();
     out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
@@ -650,7 +650,7 @@ mod tests {
 
     /// Budget pinned to the distance ladder.
     fn ladder(cfg: &PyramidCfg) -> SseBudget {
-        SseBudget::ladder(1.0, cfg.unit, cfg.finest.0)
+        SseBudget::ladder(cfg.unit, cfg.finest.0)
     }
     /// Worst-case relief per cell (2^detail fallback).
     fn worst(c: SectionPos) -> CellSummary {

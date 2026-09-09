@@ -171,6 +171,31 @@ impl Repeat {
     pub const fn new(delay: f32, interval: f32) -> Repeat {
         Repeat { delay, interval }
     }
+
+    /// Advance `timer` one frame. Fires on the press edge, then after `delay`,
+    /// then every `interval`, at most once per call. `timer < 0` is unprimed.
+    pub(crate) fn advance(self, timer: &mut f32, edged: bool, held: bool, dt: f32) -> bool {
+        if !held {
+            *timer = -1.0; // unprime
+            return edged;
+        }
+        if edged {
+            *timer = self.delay;
+            return true;
+        }
+        if *timer < 0.0 {
+            return false;
+        }
+        *timer -= dt;
+        if *timer <= 0.0 {
+            *timer += self.interval;
+            if *timer <= 0.0 {
+                *timer = self.interval; // one fire per frame even on a long dt
+            }
+            return true;
+        }
+        false
+    }
 }
 
 /// A continuous movement axis: a held key pair, positive wins if both held.
@@ -324,11 +349,14 @@ impl MenuEvent {
         MenuEvent::Toggle,
         MenuEvent::Delete,
     ];
+    /// Held navigation: first extra fire at 0.18s, then ~22 rows/s.
+    pub const REPEAT_DELAY: f32 = 0.18;
+    pub const REPEAT_INTERVAL: f32 = 0.045;
 
     pub const fn repeat(self) -> Option<Repeat> {
         match self {
             MenuEvent::Up | MenuEvent::Down | MenuEvent::Left | MenuEvent::Right | MenuEvent::Delete => {
-                Some(Repeat::new(0.35, 0.06))
+                Some(Repeat::new(MenuEvent::REPEAT_DELAY, MenuEvent::REPEAT_INTERVAL))
             }
             _ => None,
         }
@@ -342,15 +370,19 @@ pub enum GlobalEvent {
     CycleHud,
     Screenshot,
     MinimapMode,
+    CyclePerson,
+    ToggleFreecam,
 }
 
 impl GlobalEvent {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 6;
     pub const ALL: [GlobalEvent; Self::COUNT] = [
         GlobalEvent::Escape,
         GlobalEvent::CycleHud,
         GlobalEvent::Screenshot,
         GlobalEvent::MinimapMode,
+        GlobalEvent::CyclePerson,
+        GlobalEvent::ToggleFreecam,
     ];
 }
 
@@ -369,4 +401,92 @@ pub enum EditKey {
     HistoryDown,
     Complete,
     Submit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn menu_repeat() -> Repeat {
+        Repeat::new(MenuEvent::REPEAT_DELAY, MenuEvent::REPEAT_INTERVAL)
+    }
+
+    #[test]
+    fn menu_repeat_uses_named_timing_gameplay_unchanged() {
+        for e in [MenuEvent::Up, MenuEvent::Down, MenuEvent::Left, MenuEvent::Right, MenuEvent::Delete]
+        {
+            let r = e.repeat().expect("nav/delete auto-repeat");
+            assert_eq!(r.delay, MenuEvent::REPEAT_DELAY);
+            assert_eq!(r.interval, MenuEvent::REPEAT_INTERVAL);
+        }
+        assert!(MenuEvent::Confirm.repeat().is_none());
+        assert!(MenuEvent::Back.repeat().is_none());
+        let brk = GameplayEvent::Break.repeat().expect("break auto-repeat");
+        assert_eq!(brk.delay, 0.25);
+        assert_eq!(brk.interval, 0.20);
+        let place = GameplayEvent::Place.repeat().expect("place auto-repeat");
+        assert_eq!(place.delay, 0.25);
+        assert_eq!(place.interval, 0.20);
+    }
+
+    #[test]
+    fn held_key_repeats_after_delay_then_every_interval() {
+        let r = menu_repeat();
+        let mut timer = -1.0;
+        assert!(r.advance(&mut timer, true, true, 0.0), "press fires immediately");
+        assert!(
+            !r.advance(&mut timer, false, true, 0.0),
+            "zero-dt hold does not re-fire"
+        );
+        assert!(
+            r.advance(&mut timer, false, true, MenuEvent::REPEAT_DELAY),
+            "first extra fire after 0.18s"
+        );
+        assert!(!r.advance(&mut timer, false, true, 0.0));
+        assert!(
+            r.advance(&mut timer, false, true, MenuEvent::REPEAT_INTERVAL),
+            "then every 0.045s"
+        );
+        assert!(r.advance(&mut timer, false, true, MenuEvent::REPEAT_INTERVAL));
+    }
+
+    #[test]
+    fn release_unprimes_so_a_held_key_without_edge_does_not_fire() {
+        let r = menu_repeat();
+        let mut timer = -1.0;
+        assert!(r.advance(&mut timer, true, true, 0.016));
+        assert!(!r.advance(&mut timer, false, false, 0.016));
+        assert_eq!(timer, -1.0);
+        assert!(
+            !r.advance(&mut timer, false, true, 1.0),
+            "re-hold without a fresh edge must not autofire"
+        );
+    }
+
+    #[test]
+    fn long_dt_clamps_to_one_fire_per_frame() {
+        let r = menu_repeat();
+        let mut timer = -1.0;
+        assert!(r.advance(&mut timer, true, true, 0.016));
+        assert!(r.advance(&mut timer, false, true, 10.0), "the long frame fires once");
+        assert!(
+            timer > 0.0,
+            "timer is re-armed to one interval, not left due"
+        );
+        assert!(
+            !r.advance(&mut timer, false, true, 0.0),
+            "a zero-dt follow-up must not fire again"
+        );
+    }
+
+    #[test]
+    fn edge_and_due_tick_on_the_same_frame_count_once() {
+        let r = menu_repeat();
+        let mut timer = 0.0; // already due
+        assert!(r.advance(&mut timer, true, true, 1.0));
+        assert_eq!(
+            timer, MenuEvent::REPEAT_DELAY,
+            "edge primes delay; it does not also consume the due tick"
+        );
+    }
 }

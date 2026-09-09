@@ -422,6 +422,26 @@ pub struct StressOutcome {
     pub max_worker_far_queue: usize,
     pub min_active_workers: usize,
     pub min_stream_effort: f32,
+    /// Light worklist size and loaded-chunk count at the moment of stop.
+    pub light_worklist_at_stop: usize,
+    pub chunks_at_stop: usize,
+    /// Cumulative light-worklist inserts at stop, and inserts / chunks.
+    pub light_seed_inserts_at_stop: u64,
+    pub seeds_per_chunk: f32,
+    /// Mean light jobs admitted per second between stop and settle (or cap).
+    pub settle_light_admit_per_s: f32,
+    /// Per-second snapshots after stop: admit rate, workers, effort, worklist.
+    pub settle_samples: Vec<SettleSample>,
+}
+
+/// One second of post-stop streaming (the light-drain counters).
+#[derive(Clone, Copy, Debug)]
+pub struct SettleSample {
+    pub sec: u32,
+    pub light_admit_per_s: f32,
+    pub active_workers: usize,
+    pub effort: f32,
+    pub light_worklist: usize,
 }
 
 /// How long after stopping a stress run waits for `entry_complete` before
@@ -443,6 +463,14 @@ struct StressRun {
     max_worker_far: usize,
     min_active_workers: usize,
     min_effort: f32,
+    stop_admitted: u64,
+    stop_worklist: usize,
+    stop_chunks: usize,
+    stop_seeds: u64,
+    sample_sec: u32,
+    sample_admitted: u64,
+    end_admitted: u64,
+    samples: Vec<SettleSample>,
 }
 
 impl StressRun {
@@ -460,6 +488,14 @@ impl StressRun {
             max_worker_far: 0,
             min_active_workers: usize::MAX,
             min_effort: 1.0,
+            stop_admitted: 0,
+            stop_worklist: 0,
+            stop_chunks: 0,
+            stop_seeds: 0,
+            sample_sec: 0,
+            sample_admitted: 0,
+            end_admitted: 0,
+            samples: Vec::new(),
         }
     }
 
@@ -481,6 +517,23 @@ impl StressRun {
                 self.min_active_workers
             },
             min_stream_effort: self.min_effort,
+            light_worklist_at_stop: self.stop_worklist,
+            chunks_at_stop: self.stop_chunks,
+            light_seed_inserts_at_stop: self.stop_seeds,
+            seeds_per_chunk: if self.stop_chunks == 0 {
+                0.0
+            } else {
+                self.stop_seeds as f32 / self.stop_chunks as f32
+            },
+            settle_light_admit_per_s: {
+                let dt = settle_time.unwrap_or(STRESS_SETTLE_CAP).as_secs_f32();
+                if dt <= 0.0 {
+                    0.0
+                } else {
+                    (self.end_admitted.saturating_sub(self.stop_admitted)) as f32 / dt
+                }
+            },
+            settle_samples: self.samples,
         }
     }
 }
@@ -492,7 +545,7 @@ pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
         .iter()
         .map(|s| Stage {
             seed: GOLDEN_SEED,
-            // Above the SineHills band (amplitude 20 around ~64) so a straight
+            // Above the Terrain band (amplitude 20 around ~64) so a straight
             // +X flight stays airborne; scripted games run no physics, so the
             // height only affects which chunk layers stream.
             cam: Some(CameraPose {
@@ -790,12 +843,49 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
                     g.player_mut().position.x += speed_mps * dt;
                     if run.flight_start.elapsed().as_secs_f64() >= *secs {
                         run.stopped = Some(Instant::now());
-                        eprintln!("stress {name}: flight over — settling…");
+                        run.stop_admitted = gauges.light_admitted;
+                        run.stop_worklist = gauges.light_worklist;
+                        run.stop_chunks = gauges.chunks;
+                        run.stop_seeds = gauges.light_seed_inserts;
+                        run.sample_admitted = gauges.light_admitted;
+                        run.end_admitted = gauges.light_admitted;
+                        eprintln!(
+                            "stress {name}: flight over — settling… light_worklist={} chunks={} seeds/chunk={:.2}",
+                            gauges.light_worklist,
+                            gauges.chunks,
+                            if gauges.chunks == 0 {
+                                0.0
+                            } else {
+                                gauges.light_seed_inserts as f32 / gauges.chunks as f32
+                            }
+                        );
                     }
                     None
                 }
                 Some(stopped) => {
                     run.settle_ms.push(ms);
+                    let sec = stopped.elapsed().as_secs() as u32;
+                    if sec > run.sample_sec {
+                        let dt = (sec - run.sample_sec) as f32;
+                        let delta = gauges.light_admitted.saturating_sub(run.sample_admitted);
+                        let admit_per_s = delta as f32 / dt;
+                        run.samples.push(SettleSample {
+                            sec,
+                            light_admit_per_s: admit_per_s,
+                            active_workers: gauges.active_workers,
+                            effort: gauges.effort,
+                            light_worklist: gauges.light_worklist,
+                        });
+                        run.sample_admitted = gauges.light_admitted;
+                        run.sample_sec = sec;
+                        eprintln!(
+                            "stress {name}: t={sec}s admit/s={admit_per_s:.0} workers={} effort={:.2} light_worklist={}",
+                            gauges.active_workers,
+                            gauges.effort,
+                            gauges.light_worklist
+                        );
+                    }
+                    run.end_admitted = gauges.light_admitted;
                     if g.world().entry_complete() {
                         Some((Some(stopped.elapsed()), String::new()))
                     } else if stopped.elapsed() >= STRESS_SETTLE_CAP {

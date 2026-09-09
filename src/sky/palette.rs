@@ -7,7 +7,7 @@
 //! clock fraction: the reference shader's quadratic-in-worldTime mixers were an equilibrium
 //! of Minecraft's clock; elevation is the quantity the blend is really *about*,
 //! and it stays correct if day length or the sun's arc ever changes.
-use voxel_engine::{Color, Vec3};
+use voxel_engine::Color;
 
 /// A colour in **linear** RGB — the palette's working space and an invariant of
 /// the type, not just a convention. Fields are private so a value can only be
@@ -15,7 +15,7 @@ use voxel_engine::{Color, Vec3};
 /// linear space:
 ///
 /// - [`Rgb::linear`] — components already in linear space (the explicit ctor).
-/// - [`Rgb::from_srgb8`] / [`Rgb::from_srgb_hex`] — decode author-space sRGB.
+/// - [`Rgb::from_srgb8`] — decode author-space sRGB.
 ///
 /// All the arithmetic here (`lerp`, `scale`, `luma`) is therefore linear by
 /// construction. The space is **unclamped**: HDR palettes are legitimate
@@ -40,14 +40,7 @@ impl Rgb {
         Rgb(t[r as usize], t[g as usize], t[b as usize])
     }
 
-    /// `0xRRGGBB` convenience over [`from_srgb8`](Rgb::from_srgb8).
-    pub const fn from_srgb_hex(rgb: u32) -> Rgb {
-        Rgb::from_srgb8(
-            ((rgb >> 16) & 0xff) as u8,
-            ((rgb >> 8) & 0xff) as u8,
-            (rgb & 0xff) as u8,
-        )
-    }
+
 
     /// The **one** exit to 8-bit: clamp to displayable range, encode to sRGB,
     /// quantise. This is the only place HDR values are clamped and the only
@@ -140,8 +133,7 @@ impl Curve {
     }
 
     pub fn eval(self, x: f32) -> f32 {
-        let t = ((x - self.edge0) / (self.edge1 - self.edge0)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
+        crate::math::smooth_between(self.edge0, self.edge1, x)
     }
 }
 
@@ -150,12 +142,6 @@ pub const DAY_BLEND: Curve = Curve::new(0.05, 0.35);
 /// Sunset→Night palette blend band (evaluated on `-elev`): full Night past a
 /// civil-twilight-ish cutoff.
 pub const NIGHT_BLEND: Curve = Curve::new(0.05, 0.25);
-/// Sunset-glow widening band: the sky sun-halo exponent lerps from a wide
-/// golden-hour halo at low sun to the tight noon halo above this band. CPU-side
-/// documentation/parity for the shader; the edges are mirrored into the generated
-/// `GLOW_EDGE0`/`GLOW_EDGE1` constants (with `GLOW_POW_SUNSET`/`GLOW_POW_DAY`) that
-/// `sky_radiance` consumes. Axis is sun elevation `sun_dir().y`.
-pub const GLOW: Curve = Curve::new(0.0, 0.4);
 /// Sun↔moon light-source mix band: crosses 0.5 exactly at the horizon; narrow
 /// so the flip hides inside the sunset colour wash. (The `dayNightMix`
 /// mixer re-derived onto elevation.)
@@ -235,11 +221,6 @@ pub const NEW_SHOKA: Palette = Palette::new([
     [Rgb::linear(0.143, 0.244, 0.365), Rgb::linear(0.143, 0.244, 0.365), Rgb::linear(0.014, 0.019, 0.025)],
     [Rgb::linear(1.0, 0.648, 0.378), Rgb::linear(0.65, 0.91, 1.3), Rgb::linear(0.021, 0.031, 0.039)],
 ]);
-
-/// Convenience: elevation from a sun direction (`sun_dir().y`).
-pub fn elevation(sun: Vec3) -> f32 {
-    sun.y
-}
 
 #[cfg(test)]
 mod tests {

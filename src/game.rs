@@ -3,11 +3,11 @@
 //! The window and the menu/play state machine live one level up in [`app`](crate::app);
 //! a `Game` is handed the engine each frame and reports back whether to keep playing
 //! or return to the menu.
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod draw;
 
-use voxel_engine::{DVec3, Engine, IVec2, Key, Vec2};
+use voxel_engine::{Color, DVec3, Engine, IVec2, Vec2};
 
 use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
@@ -34,7 +34,7 @@ use crate::sched::{Ctx as SchedCtx, RateGate};
 use crate::settings::Settings;
 use crate::sim::Simulation;
 use crate::sky::Sky;
-use crate::ui::{self, HudMode, Theme};
+use crate::ui::{self, HudElement, HudMode, Theme};
 use crate::world::World;
 
 /// What a game update wants the app to do next.
@@ -73,6 +73,8 @@ struct FrameInput {
     g_hud: bool,
     g_shot: bool,
     g_minimap: bool,
+    g_person: bool,
+    g_freecam: bool,
 }
 
 impl FrameInput {
@@ -184,6 +186,8 @@ pub struct Game {
     console: Console,
     /// The save slot this world belongs to.
     save_name: String,
+    /// Cached `peer_color(save_name)` — local third-person body tint.
+    local_color: Color,
     /// The live server connection when playing multiplayer; `None` in singleplayer.
     /// The player simulates locally and the server keeps everyone in sync.
     net: Option<Connection>,
@@ -284,6 +288,21 @@ pub struct Game {
     // allocator work for these.
     placement_scratch: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
     peer_pose_scratch: Vec<PeerPose>,
+    /// Last frame's named-phase durations, for the stall detector.
+    phases: FramePhases,
+    hud_scratch: Vec<HudElement>,
+}
+
+/// Durations of `Game::update` phases, sampled every frame for stall logs.
+#[derive(Clone, Copy, Default)]
+struct FramePhases {
+    net: Duration,
+    input: Duration,
+    overlay: Duration,
+    motion: Duration,
+    interact: Duration,
+    stream: Duration,
+    audio: Duration,
 }
 
 impl Game {
@@ -294,7 +313,7 @@ impl Game {
         // — it fires only when whole ticks are due.
         let sim_id = sched.register(
             Simulation::manifest(),
-            Box::new(Simulation::new()),
+            Box::new(Simulation::with_systems(Vec::new())),
             u32::MAX,
         );
         sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
@@ -314,6 +333,7 @@ impl Game {
             player,
             camera: GameCamera::new(),
             console: Console::new(),
+            local_color: draw::peer_color(&save_name),
             save_name,
             net: None,
             pending_edits: std::collections::HashMap::new(),
@@ -351,6 +371,8 @@ impl Game {
             drawing: draw::DrawState::new(),
             placement_scratch: Vec::new(),
             peer_pose_scratch: Vec::new(),
+            phases: FramePhases::default(),
+            hud_scratch: Vec::new(),
         }
     }
 
@@ -391,7 +413,7 @@ impl Game {
     pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
         let mod_ui_was_active = self.mod_ui_active();
         settings.apply(eng);
-        let render = self.visual_mask.apply(settings.render_config());
+        let render = self.visual_mask.effective_render(settings);
         eng.set_flags(render.engine_flags());
         // View volume BEFORE the render config: the far ladder's `unit`
         // tracks the full-res radius, so the transition detector must see the
@@ -489,12 +511,6 @@ impl Game {
     /// `/time` command and net sync do.
     pub fn set_day(&mut self, day: f64) {
         self.sky.clock.set_day(day);
-    }
-
-    /// Swap the atmosphere colour table.
-    pub fn set_palette(&mut self, palette: crate::sky::Palette) {
-        self.sky.atmosphere.palette = palette;
-        self.bump_content_rev();
     }
 
     /// Attach a server connection, turning this into a multiplayer session.
@@ -601,16 +617,23 @@ impl Game {
         // underwater bed, voice sessions — the director DERIVES from the readout.
         let mut events: Vec<SoundEvent> = Vec::new();
 
+        self.phases = FramePhases::default();
+        let t = Instant::now();
         if let Some(signal) = self.net_phase(mods, &mut events) {
             return signal;
         }
+        self.phases.net = t.elapsed();
+        let t = Instant::now();
         let input = self.input_phase(eng, router, dt);
-        // The overlay may consume the frame (console typing, opening chat): movement,
-        // interaction and streaming run only on an unconsumed ("active") frame, exactly
-        // as before. Audio, though, commits EVERY frame so voice/emitters/faults — and
-        // the `/voicetest` cue submitted while the console is open — stay live; only a
-        // real exit short-circuits it.
-        let active = match self.overlay_phase(OverlayPhase {
+        self.phases.input = t.elapsed();
+        // The overlay may consume the frame (console typing, opening chat): movement
+        // and interaction run only on an unconsumed frame. Streaming still runs
+        // while a spawn/teleport slab is outstanding so loading progresses with
+        // the console open. Audio skips the director commit when nothing is
+        // sounding and the listener is still; only a real exit short-circuits
+        // the rest of the frame.
+        let t = Instant::now();
+        let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
             eng,
             router,
@@ -618,16 +641,29 @@ impl Game {
             settings,
             sound,
             events: &mut events,
-        }) {
+        });
+        self.phases.overlay = t.elapsed();
+        let consumed = match overlay {
             Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
-            Some(Signal::Continue) => false,
-            None => {
-                let detached = self.motion_phase(&input, dt);
-                self.interact_phase(&input, detached, dt, eng, mods, &mut events);
-                self.stream_phase(eng, dt);
-                true
-            }
+            Some(Signal::Continue) => true,
+            None => false,
         };
+        let ready = self.world.spawn_ready();
+        if !consumed && ready {
+            let t = Instant::now();
+            let detached = self.motion_phase(&input, dt);
+            self.phases.motion = t.elapsed();
+            let t = Instant::now();
+            self.interact_phase(&input, detached, dt, eng, mods, &mut events);
+            self.phases.interact = t.elapsed();
+        }
+        if !consumed || !ready {
+            let t = Instant::now();
+            self.stream_phase(eng, dt);
+            self.phases.stream = t.elapsed();
+        }
+        let active = !consumed;
+        let t = Instant::now();
         self.commit_audio(AudioPhase {
             dt,
             input: &input,
@@ -637,7 +673,23 @@ impl Game {
             events,
             active,
         });
+        self.phases.audio = t.elapsed();
         Signal::Continue
+    }
+
+    /// Last frame's named-phase timings, for the stall detector.
+    pub(crate) fn phase_debug(&self) -> String {
+        let p = &self.phases;
+        format!(
+            "net={:.1}ms input={:.1}ms overlay={:.1}ms motion={:.1}ms interact={:.1}ms stream={:.1}ms audio={:.1}ms",
+            p.net.as_secs_f64() * 1000.0,
+            p.input.as_secs_f64() * 1000.0,
+            p.overlay.as_secs_f64() * 1000.0,
+            p.motion.as_secs_f64() * 1000.0,
+            p.interact.as_secs_f64() * 1000.0,
+            p.stream.as_secs_f64() * 1000.0,
+            p.audio.as_secs_f64() * 1000.0,
+        )
     }
 
     /// Drain server events and send our heartbeat. `Some(ExitToMenu)` when the
@@ -679,13 +731,7 @@ impl Game {
         });
 
         if self.input_locked {
-            let _ = router.frame_filtered(
-                eng,
-                dt,
-                self.mod_logic,
-                self.mod_ui_active(),
-                self.minimap.is_some(),
-            );
+            router.drain_frame();
             return FrameInput::inert();
         }
 
@@ -735,6 +781,8 @@ impl Game {
         f.g_hud = global.event(GlobalEvent::CycleHud);
         f.g_shot = global.event(GlobalEvent::Screenshot);
         f.g_minimap = global.event(GlobalEvent::MinimapMode);
+        f.g_person = global.event(GlobalEvent::CyclePerson);
+        f.g_freecam = global.event(GlobalEvent::ToggleFreecam);
         f
     }
 
@@ -824,18 +872,17 @@ impl Game {
         if input.g_minimap
             && let Some(minimap) = &mut self.minimap
         {
-            minimap.toggle_orientation();
+            minimap.toggle_rotation();
         }
 
-        // F5 cycles first/third-back/third-front; F6 toggles freecam.
-        if eng.is_key_pressed(Key::F5) {
+        if input.g_person {
             self.camera.cycle_person();
         }
-        if eng.is_key_pressed(Key::F6) {
+        if input.g_freecam {
             // Reattaching after the rig flew far away resumes physics at the
             // frozen player, whose chunks may have streamed out (the centre
-            // followed the camera). Restore the collision halo synchronously
-            // BEFORE the toggle so the first reattached step never runs
+            // followed the camera). Request the collision slab and freeze
+            // physics until it lands so the first reattached step never runs
             // against unloaded air.
             if self.camera.free_rig().is_some() {
                 self.world.prepare_around(self.player.position);
@@ -895,12 +942,15 @@ impl Game {
                         let mut tick_input = *mi;
                         tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
                         tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
-                        movement::update_player(
+                        let trauma = movement::update_player(
                             &mut self.player,
                             &self.world,
                             &tick_input,
                             step_dt,
                         );
+                        if trauma > 0.0 {
+                            self.camera.fx.add_trauma(trauma);
+                        }
                         // Advance the local walk cycle from horizontal travel so the
                         // third-person body animates. The AUDIO gait (footstep
                         // phase-crossings) is derived inside the director from the
@@ -992,7 +1042,7 @@ impl Game {
                     nav_confirm: edges.nav_confirm,
                     placements,
                 };
-                mods.update(eng, &mut ctx);
+                mods.update(&mut ctx);
                 ctx.placements
             };
             // Apply after each event frame so repeated placements observe the
@@ -1069,6 +1119,14 @@ impl Game {
             events,
             active,
         } = phase;
+        // Singleplayer idle: skip pose/peer/director/mixer construction. Voice
+        // ingest and capture need the full path (a new session is not yet live).
+        if self.net.is_none()
+            && audio.can_skip_commit(sound, &events, self.player.position, input.ptt)
+        {
+            sound.poll_starvation();
+            return;
+        }
         // THE per-frame peer sample: one `Instant`, consumed by the director for
         // both remote footsteps and voice sessions. `peer_draws` in draw() keeps its
         // own richer sample — it runs in the separate draw() call, steps each peer's
@@ -1144,7 +1202,7 @@ impl Game {
                     // Snapshot the cell first so a remote break names the block that
                     // WAS there (its sound class), not a generic default.
                     let prev = self.world.block_at(x, y, z);
-                    let id = save::parse_block(&mut self.world, &spec);
+                    let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
                     let at = cell_center(x, y, z);
                     events.push(if id == AIR {
@@ -1166,13 +1224,18 @@ impl Game {
                         self.world.set_block(x, y, z, pending.prev);
                     }
                     match pending.kind {
-                        PendingKind::Break(elements) => mods.on_break_rejected(&elements),
+                        PendingKind::Break(elements) => {
+                            self.player.stash.revoke(&elements);
+                            mods.on_break_rejected(&elements);
+                        }
                         PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
                     }
                 }
                 Incoming::Position { pos } => {
                     // Authoritative snap-back (refused teleport or implausible
-                    // move): land safely, exactly like a local teleport.
+                    // move): request the collision slab and freeze until it
+                    // lands, exactly like a local teleport. The server's
+                    // MOVE_WINDOW_CAP_SECS envelope tolerates a brief pause.
                     self.world.prepare_around(pos);
                     self.player.position = pos;
                     self.player.cancel_fall();
@@ -1264,12 +1327,13 @@ impl Game {
         let pos_before = self.player.position;
         // Each output line already carries its role (System output vs Error
         // rejection), so there is nothing to guess — just show them.
-        for out in command::execute(
+        for out in command::execute_with_visuals(
             &line,
             &mut self.player,
             &mut self.world,
             settings,
             &mut self.sky,
+            self.visual_mask,
         ) {
             self.console.push(out);
         }
@@ -1308,7 +1372,8 @@ impl Game {
         }
     }
 
-    /// Break the block the player is looking at, handing its elements to the mods.
+    /// Break the block the player is looking at, depositing its elements into
+    /// the core stash before notifying mods.
     fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) = interact::raycast_solid(
             &self.world,
@@ -1328,7 +1393,9 @@ impl Game {
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
-        mods.on_block_break(&elements, &self.world);
+        let overflow = !self.player.stash.add(&elements);
+        mods.on_block_break(&elements, &self.world, overflow);
+        self.camera.fx.add_trauma(0.15);
         self.local_anim.on_action(WireAction::Swing);
         // Tell the server (it validates and relays to everyone else). The
         // apply above is a PREDICTION for responsiveness: the ack rolls it
@@ -1386,7 +1453,7 @@ impl Game {
             // validates and relays, exactly like breaking does with "air".
             // The spent crafted block is refunded if the server says no.
             if let Some(net) = &mut self.net {
-                let spec = save::block_spec(&self.world, id);
+                let spec = save::block_spec(self.world.registry(), id);
                 let req = net.send_edit(x, y, z, spec.into());
                 self.pending_edits.insert(
                     req,
@@ -1427,8 +1494,11 @@ fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameInput, PendingModInput};
-    use voxel_engine::Vec2;
+    use super::{FrameInput, Game, PendingModInput};
+    use crate::player::Player;
+    use crate::render_config::RenderConfig;
+    use crate::world::World;
+    use voxel_engine::{DVec3, Vec2};
 
     #[test]
     fn inert_frame_input_matches_default_and_carries_no_edges() {
@@ -1443,6 +1513,8 @@ mod tests {
         assert!(!inert.g_hud);
         assert!(!inert.g_shot);
         assert!(!inert.g_minimap);
+        assert!(!inert.g_person);
+        assert!(!inert.g_freecam);
         assert!(!inert.toggle_capture);
         assert!(!inert.do_break);
         assert!(!inert.do_place);
@@ -1455,5 +1527,118 @@ mod tests {
         // overlay_phase returns Some only for text, Escape, or console-open edges.
         let inert = FrameInput::inert();
         assert!(!inert.is_text && !inert.g_escape && !inert.open_console && !inert.open_chat);
+    }
+
+    #[test]
+    fn game_gates_physics_on_spawn_ready() {
+        let world = World::with_config_lazy(1, RenderConfig::default());
+        let pos = DVec3::new(0.5, 80.0, 0.5);
+        let mut game = Game::new(world, Player::new(pos), "gate".to_string());
+        game.world_mut().prepare_around(pos);
+        assert!(
+            !game.world().spawn_ready(),
+            "Game::update must not run motion/interact until the slab lands"
+        );
+        let before = game.player().position;
+        if game.world().spawn_ready() {
+            game.player_mut().position.y -= 1.0;
+        }
+        assert_eq!(game.player().position, before);
+    }
+
+    /// Quiet-frame micro-benchmark: the three remaining fixed costs at
+    /// Minimum/Fast. Reports ns/call for the idle predicates vs the work they
+    /// skip. Ignored: a timing run, not a correctness gate.
+    #[test]
+    #[ignore]
+    fn quiet_frame_fixed_costs() {
+        use crate::audio::{AudioCtx, AudioDirector, PlayerPose, SoundSystem};
+        use crate::audio::palette::CuePalette;
+        use crate::console::Console;
+        use crate::input::router::Router;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: u32 = 50_000;
+
+        let game = Game::scripted(1, RenderConfig::default());
+        let t0 = Instant::now();
+        for _ in 0..N {
+            black_box(game.world().anything_in_flight());
+        }
+        let in_flight_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        let mut router = Router::new();
+        let t0 = Instant::now();
+        for _ in 0..N {
+            router.drain_frame();
+        }
+        let drain_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut audio = AudioDirector::new(palette);
+        let world = World::generate();
+        let pos = DVec3::new(0.5, 80.0, 0.5);
+        let mut console = Console::new();
+        let player = PlayerPose {
+            pos,
+            feet: DVec3::new(pos.x, pos.y - 1.6, pos.z),
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: DVec3::ZERO,
+            on_ground: true,
+        };
+        audio.frame(
+            AudioCtx {
+                dt: 1.0 / 60.0,
+                player: PlayerPose { ..player },
+                ptt: false,
+                voice_enabled: false,
+                events: Vec::new(),
+                peers: &[],
+                world: &world,
+                net: None,
+                console: &mut console,
+            },
+            &mut sound,
+        );
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            black_box(audio.can_skip_commit(&sound, &[], pos, false));
+        }
+        let skip_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let mut console = Console::new();
+            audio.frame(
+                AudioCtx {
+                    dt: 1.0 / 60.0,
+                    player: PlayerPose { ..player },
+                    ptt: false,
+                    voice_enabled: false,
+                    events: Vec::new(),
+                    peers: &[],
+                    world: &world,
+                    net: None,
+                    console: &mut console,
+                },
+                &mut sound,
+            );
+        }
+        let director_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        println!("quiet_frame_fixed_costs ({N} iters):");
+        println!("  anything_in_flight:     {in_flight_ns:.1} ns");
+        println!("  Router::drain_frame:    {drain_ns:.1} ns");
+        println!("  can_skip_commit (idle): {skip_ns:.1} ns  [after]");
+        println!("  AudioDirector::frame:   {director_ns:.1} ns  [before, still silent]");
+        assert!(
+            audio.can_skip_commit(&sound, &[], pos, false),
+            "the skip predicate must hold on the idle pose used above"
+        );
+        assert!(!game.world().anything_in_flight());
     }
 }

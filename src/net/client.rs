@@ -4,6 +4,7 @@
 //! the render loop never stalls on the network. Sends happen inline from the
 //! game thread (tiny and infrequent). Position sends are throttled and
 //! heartbeat so a standing-still player still proves they are alive.
+//! Teleport echo (`Position` after `Teleport`) is part of protocol v9.
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -165,6 +166,8 @@ pub struct Connection {
     player_id: u32,
     seed: i64,
     spawn: DVec3,
+    worldgen: crate::world::generation::WorldgenKind,
+    diffusion: crate::world::diffusion::DiffusionCfg,
     peers: HashMap<u32, RemotePlayer>,
     alive: bool,
     // Throttling state for outbound moves.
@@ -181,6 +184,11 @@ pub struct Connection {
     /// own earlier requests will commit.
     pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
     next_req: u32,
+    /// Instant an in-flight `/tp` was sent. Movement is held until a `Position`
+    /// verdict lands, or one heartbeat elapses with no reply, so a dropped echo
+    /// cannot freeze the client.
+    pending_teleport: Option<Instant>,
+    disconnect_emitted: bool,
 }
 
 impl Connection {
@@ -248,11 +256,8 @@ impl Connection {
                 .map_err(|_| "no reply: timed out".to_string())?
                 .map_err(|e| format!("no reply: {e}"))
         })?;
-        let (player_id, seed, spawn) = match ServerMessage::decode(&frame) {
-            Some(ServerMessage::Welcome { player_id, seed, spawn }) => (player_id, seed, spawn),
-            Some(ServerMessage::Reject { reason }) => return Err(reason.to_string()),
-            _ => return Err("unexpected reply from server".to_string()),
-        };
+        let (player_id, seed, spawn, worldgen, diffusion) =
+            welcome_from(ServerMessage::decode(&frame))?;
 
         let (tx, inbox) = mpsc::channel();
         let voice_in: Arc<Mutex<VecDeque<VoiceFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -290,6 +295,8 @@ impl Connection {
             player_id,
             seed,
             spawn,
+            worldgen,
+            diffusion,
             peers: HashMap::new(),
             alive: true,
             last_move: Instant::now(),
@@ -300,11 +307,19 @@ impl Connection {
             cell_revs: HashMap::new(),
             pending_edits: Vec::new(),
             next_req: 0,
+            pending_teleport: None,
+            disconnect_emitted: false,
         })
     }
 
     pub fn seed(&self) -> i64 {
         self.seed
+    }
+    pub fn worldgen(&self) -> crate::world::generation::WorldgenKind {
+        self.worldgen
+    }
+    pub fn diffusion(&self) -> crate::world::diffusion::DiffusionCfg {
+        self.diffusion
     }
     pub fn spawn(&self) -> DVec3 {
         self.spawn
@@ -345,22 +360,95 @@ impl Connection {
                 Ok(msg) => self.apply(msg, &mut out),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if self.alive {
-                        self.alive = false;
-                        out.push(Incoming::Disconnected);
-                    }
+                    self.alive = false;
                     break;
                 }
             }
         }
+        emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &mut out);
+        coalesce_positions(&mut out);
         out
     }
 
     fn apply(&mut self, msg: ServerMessage, out: &mut Vec<Incoming>) {
-        match msg {
+        apply_server_message(
+            msg,
+            self.spawn,
+            &mut self.peers,
+            &mut self.cell_revs,
+            &mut self.pending_edits,
+            &mut self.pending_teleport,
+            &mut self.ping_sent,
+            &mut self.ping_ms,
+            &mut self.alive,
+            &mut self.disconnect_emitted,
+            out,
+        );
+    }
+}
+
+fn welcome_from(
+    msg: Option<ServerMessage>,
+) -> Result<(u32, i64, DVec3, crate::world::generation::WorldgenKind, crate::world::diffusion::DiffusionCfg), String> {
+    match msg {
+        Some(ServerMessage::Welcome {
+            player_id,
+            seed,
+            spawn,
+            worldgen,
+            diffusion,
+        }) => Ok((player_id, seed, spawn, worldgen, diffusion)),
+        Some(ServerMessage::Reject { reason }) => Err(reason.to_string()),
+        _ => Err("unexpected reply from server".to_string()),
+    }
+}
+
+fn emit_disconnect(alive: &mut bool, emitted: &mut bool, out: &mut Vec<Incoming>) {
+    if !*alive && !*emitted {
+        *emitted = true;
+        out.push(Incoming::Disconnected);
+    }
+}
+
+/// Several `Position` frames can land in one poll (stale snap-back, then the
+/// teleport echo). The last one is the server's current pose.
+fn coalesce_positions(out: &mut Vec<Incoming>) {
+    let mut last_idx = None;
+    for (i, e) in out.iter().enumerate() {
+        if matches!(e, Incoming::Position { .. }) {
+            last_idx = Some(i);
+        }
+    }
+    let Some(last_idx) = last_idx else { return };
+    let mut i = 0;
+    out.retain(|e| {
+        let keep = match e {
+            Incoming::Position { .. } => i == last_idx,
+            _ => true,
+        };
+        i += 1;
+        keep
+    });
+}
+
+#[allow(clippy::too_many_arguments)] // unpacks one server message into the session's live fields
+fn apply_server_message(
+    msg: ServerMessage,
+    spawn: DVec3,
+    peers: &mut HashMap<u32, RemotePlayer>,
+    cell_revs: &mut HashMap<(i32, i32, i32), u32>,
+    pending_edits: &mut Vec<(u32, (i32, i32, i32), u32)>,
+    pending_teleport: &mut Option<Instant>,
+    ping_sent: &mut Option<(u32, Instant)>,
+    ping_ms: &mut Option<u32>,
+    alive: &mut bool,
+    disconnect_emitted: &mut bool,
+    out: &mut Vec<Incoming>,
+) {
+    match msg {
             ServerMessage::Snapshot { edits } => {
                 for (x, y, z, rev, spec) in edits {
-                    self.cell_revs.insert((x, y, z), rev);
+                    cell_revs.insert((x, y, z), rev);
                     out.push(Incoming::Edit { x, y, z, spec });
                 }
             }
@@ -369,29 +457,33 @@ impl Connection {
                 // strictly newer content lands, so a stale or reordered frame
                 // can never revert a newer cell.
                 let cell = (x, y, z);
-                if rev > self.cell_revs.get(&cell).copied().unwrap_or(0) {
-                    self.cell_revs.insert(cell, rev);
+                if rev > cell_revs.get(&cell).copied().unwrap_or(0) {
+                    cell_revs.insert(cell, rev);
                     out.push(Incoming::Edit { x, y, z, spec });
                 }
             }
             ServerMessage::EditAck { req, accepted, rev } => {
-                let Some(at) = self.pending_edits.iter().position(|&(r, _, _)| r == req) else {
+                let Some(at) = pending_edits.iter().position(|&(r, _, _)| r == req) else {
                     return;
                 };
-                let (_, cell, expect) = self.pending_edits.remove(at);
+                let (_, cell, expect) = pending_edits.remove(at);
                 if accepted {
-                    let known = self.cell_revs.entry(cell).or_insert(0);
+                    let known = cell_revs.entry(cell).or_insert(0);
                     *known = (*known).max(rev);
                     out.push(Incoming::EditAccepted { req });
                 } else {
                     // Restore our optimistic apply only if nothing newer has
                     // confirmed on the cell meanwhile (the race winner's Edit
                     // broadcast may land before or after this ack).
-                    let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
+                    let confirmed = cell_revs.get(&cell).copied().unwrap_or(0);
                     out.push(Incoming::EditRejected { req, restore: confirmed <= expect });
                 }
             }
-            ServerMessage::Position { pos } => out.push(Incoming::Position { pos }),
+            ServerMessage::Position { pos } => {
+                *pending_teleport = None;
+                // TODO: echo a teleport request id so a snap-back Position from an earlier poll cannot still snap the player (wire change).
+                out.push(Incoming::Position { pos });
+            }
             ServerMessage::Chat { from_name, channel, text, .. } => {
                 out.push(Incoming::Chat { from_name, channel, text })
             }
@@ -401,9 +493,9 @@ impl Connection {
                 // Option<history> and no special-casing downstream. Hidden
                 // until their first PeerMove carries a real pose.
                 let spawn =
-                    Snapshot { pos: self.spawn, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
+                    Snapshot { pos: spawn, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
                 out.push(Incoming::Joined { name: name.clone() });
-                self.peers.entry(id).or_insert(RemotePlayer {
+                peers.entry(id).or_insert(RemotePlayer {
                     id,
                     name,
                     anim: presence::Animator::default(),
@@ -416,12 +508,12 @@ impl Connection {
                 });
             }
             ServerMessage::PeerLeft { id } => {
-                if let Some(p) = self.peers.remove(&id) {
+                if let Some(p) = peers.remove(&id) {
                     out.push(Incoming::Left { name: p.name });
                 }
             }
             ServerMessage::PeerMove { id, pos, yaw, pitch, stance } => {
-                if let Some(p) = self.peers.get_mut(&id) {
+                if let Some(p) = peers.get_mut(&id) {
                     let snapshot = Snapshot { pos, yaw, pitch, stance };
                     if p.visible {
                         p.interval = p.recv_at.elapsed();
@@ -440,26 +532,24 @@ impl Connection {
                 }
             }
             ServerMessage::PeerExited { id } => {
-                if let Some(p) = self.peers.get_mut(&id) {
+                if let Some(p) = peers.get_mut(&id) {
                     p.visible = false;
                 }
             }
             ServerMessage::PeerSwing { id } => {
-                if let Some(p) = self.peers.get_mut(&id) {
+                if let Some(p) = peers.get_mut(&id) {
                     p.anim.on_action(WireAction::Swing);
                 }
                 out.push(Incoming::PeerSwing { id });
             }
             ServerMessage::Pong { nonce } => {
-                if let Some((sent_nonce, at)) = self.ping_sent {
-                    if sent_nonce == nonce {
-                        self.ping_ms = Some(at.elapsed().as_millis() as u32);
-                    }
+                if let Some((sent_nonce, at)) = *ping_sent && sent_nonce == nonce {
+                    *ping_ms = Some(at.elapsed().as_millis() as u32);
                 }
             }
             ServerMessage::Reject { reason: _ } => {
-                self.alive = false;
-                out.push(Incoming::Disconnected);
+                *alive = false;
+                emit_disconnect(alive, disconnect_emitted, out);
             }
             // A second Welcome is meaningless mid-session.
             ServerMessage::Welcome { .. } => {}
@@ -468,12 +558,20 @@ impl Connection {
             // The arm exists only to keep the match exhaustive.
             ServerMessage::PeerVoice { .. } => {}
         }
-    }
+}
 
+/// True while an in-flight `/tp` still has a heartbeat left to hear a
+/// `Position` verdict. Past that the hold expires so a dropped echo cannot
+/// freeze the client; a later verdict still clears it.
+fn teleport_hold_active(pending: Option<Instant>, now: Instant) -> bool {
+    pending.is_some_and(|at| now.saturating_duration_since(at) < HEARTBEAT)
+}
+
+impl Connection {
     /// Cheap to call every frame; it only actually sends on the movement
     /// cadence or the heartbeat.
     pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
-        if !self.alive {
+        if !self.alive || teleport_hold_active(self.pending_teleport, Instant::now()) {
             return;
         }
         let elapsed = self.last_move.elapsed();
@@ -493,6 +591,7 @@ impl Connection {
     pub fn send_teleport(&mut self, pos: DVec3) {
         // So the next `send_move` reports the post-teleport position promptly.
         self.last_sent = None;
+        self.pending_teleport = Some(Instant::now());
         self.dispatch(&ClientMessage::Teleport { pos });
     }
 
@@ -623,7 +722,7 @@ mod tests {
         );
 
         // Global chat reaches everyone regardless of distance.
-        a.send_chat(crate::net::chat::GLOBAL, "hello".into());
+        a.send_chat(crate::net::chat::GLOBAL, "hello");
         thread::sleep(Duration::from_millis(150));
         let events = b.poll();
         assert!(
@@ -692,6 +791,229 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_lowercase().contains("password"), "got: {err}");
+        handle.stop();
+    }
+
+    struct View {
+        spawn: DVec3,
+        peers: HashMap<u32, RemotePlayer>,
+        cell_revs: HashMap<(i32, i32, i32), u32>,
+        pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
+        pending_teleport: Option<Instant>,
+        ping_sent: Option<(u32, Instant)>,
+        ping_ms: Option<u32>,
+        alive: bool,
+        disconnect_emitted: bool,
+    }
+
+    impl View {
+        fn new() -> Self {
+            Self {
+                spawn: DVec3::new(0.5, 40.0, 0.5),
+                peers: HashMap::new(),
+                cell_revs: HashMap::new(),
+                pending_edits: Vec::new(),
+                pending_teleport: None,
+                ping_sent: None,
+                ping_ms: None,
+                alive: true,
+                disconnect_emitted: false,
+            }
+        }
+
+        fn apply(&mut self, msg: ServerMessage) -> Vec<Incoming> {
+            let mut out = Vec::new();
+            apply_server_message(
+                msg,
+                self.spawn,
+                &mut self.peers,
+                &mut self.cell_revs,
+                &mut self.pending_edits,
+                &mut self.pending_teleport,
+                &mut self.ping_sent,
+                &mut self.ping_ms,
+                &mut self.alive,
+                &mut self.disconnect_emitted,
+                &mut out,
+            );
+            coalesce_positions(&mut out);
+            out
+        }
+
+        fn apply_all(&mut self, msgs: impl IntoIterator<Item = ServerMessage>) -> Vec<Incoming> {
+            let mut out = Vec::new();
+            for msg in msgs {
+                apply_server_message(
+                    msg,
+                    self.spawn,
+                    &mut self.peers,
+                    &mut self.cell_revs,
+                    &mut self.pending_edits,
+                    &mut self.pending_teleport,
+                    &mut self.ping_sent,
+                    &mut self.ping_ms,
+                    &mut self.alive,
+                    &mut self.disconnect_emitted,
+                    &mut out,
+                );
+            }
+            coalesce_positions(&mut out);
+            out
+        }
+    }
+
+    #[test]
+    fn snapshot_before_welcome_is_an_unexpected_handshake_reply() {
+        let snap = ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] };
+        let err = welcome_from(Some(snap)).unwrap_err();
+        assert!(err.contains("unexpected"));
+        let edit = ServerMessage::Edit { x: 0, y: 0, z: 0, rev: 1, spec: "air".into() };
+        assert!(welcome_from(Some(edit)).unwrap_err().contains("unexpected"));
+    }
+
+    #[test]
+    fn out_of_order_duplicate_peermove_and_unknown_exit_never_panic() {
+        let mut v = View::new();
+        let pose = |id, x| ServerMessage::PeerMove {
+            id,
+            pos: DVec3::new(x, 40.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            stance: Stance::Standing,
+        };
+        v.apply(pose(7, 3.0));
+        assert!(v.peers.is_empty(), "PeerMove for an unknown id is ignored");
+        v.apply(ServerMessage::PeerExited { id: 7 });
+        v.apply(ServerMessage::PeerJoined { id: 7, name: "x".into() });
+        v.apply(pose(7, 4.0));
+        v.apply(pose(7, 4.0));
+        v.apply(pose(7, 9.0));
+        let p = v.peers.get(&7).unwrap();
+        assert!(p.visible());
+        assert_eq!(p.target.pos.x, 9.0);
+        v.apply(ServerMessage::PeerExited { id: 99 });
+        v.apply(ServerMessage::PeerLeft { id: 99 });
+    }
+
+    #[test]
+    fn position_while_teleport_pending_keeps_the_last_authoritative_pose() {
+        let mut v = View::new();
+        let dest = DVec3::new(100.0, 40.0, 0.0);
+        let old = DVec3::new(0.5, 40.0, 0.5);
+        v.pending_teleport = Some(Instant::now());
+        let events = v.apply_all([
+            ServerMessage::Position { pos: old },
+            ServerMessage::Position { pos: dest },
+        ]);
+        match events.as_slice() {
+            [Incoming::Position { pos }] => assert_eq!(*pos, dest),
+            other => panic!("expected one coalesced Position(dest), got {} events", other.len()),
+        }
+        assert!(v.pending_teleport.is_none());
+
+        v.pending_teleport = Some(Instant::now());
+        let events = v.apply(ServerMessage::Position { pos: old });
+        match events.as_slice() {
+            [Incoming::Position { pos }] => assert_eq!(*pos, old, "a lone Position is the /tp verdict"),
+            other => panic!("expected refusal snap-back, got {} events", other.len()),
+        }
+        assert!(v.pending_teleport.is_none());
+    }
+
+    #[test]
+    fn dropped_teleport_reply_releases_moves_after_one_heartbeat() {
+        let t0 = Instant::now();
+        let pending = Some(t0);
+        assert!(teleport_hold_active(pending, t0), "a fresh hold must suppress moves");
+        assert!(
+            teleport_hold_active(pending, t0 + HEARTBEAT - Duration::from_nanos(1)),
+            "the hold lasts the full heartbeat"
+        );
+        assert!(
+            !teleport_hold_active(pending, t0 + HEARTBEAT),
+            "a dropped echo must resume moves after one heartbeat"
+        );
+        assert!(
+            !teleport_hold_active(None, t0),
+            "a Position verdict still clears the hold immediately"
+        );
+
+        let handle = server::spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
+        let mut a = Connection::connect("127.0.0.1", handle.addr().port(), "a", "").unwrap();
+        let pos = a.spawn();
+        a.last_move = Instant::now() - HEARTBEAT;
+        a.pending_teleport = Some(Instant::now());
+        a.send_move(pos, 0.0, 0.0, Stance::Standing);
+        assert!(a.last_sent.is_none(), "a fresh hold must not send Move");
+        a.pending_teleport = Some(Instant::now() - HEARTBEAT);
+        a.send_move(pos, 0.0, 0.0, Stance::Standing);
+        assert!(a.last_sent.is_some(), "an expired hold must let Move through");
+        handle.stop();
+    }
+
+    #[test]
+    fn snapshot_edits_record_revisions_even_if_fed_directly() {
+        let mut v = View::new();
+        let events = v.apply(ServerMessage::Snapshot {
+            edits: vec![(1, 2, 3, 4, "air".into())],
+        });
+        assert!(matches!(events.as_slice(), [Incoming::Edit { x: 1, y: 2, z: 3, .. }]));
+        assert_eq!(v.cell_revs.get(&(1, 2, 3)), Some(&4));
+    }
+
+    #[test]
+    fn inbox_disconnect_emits_disconnected_exactly_once() {
+        let (tx, inbox) = mpsc::channel::<ServerMessage>();
+        let mut alive = true;
+        let mut emitted = false;
+        drop(tx);
+        let mut drain = || {
+            let mut out = Vec::new();
+            loop {
+                match inbox.try_recv() {
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        alive = false;
+                        break;
+                    }
+                }
+            }
+            emit_disconnect(&mut alive, &mut emitted, &mut out);
+            out
+        };
+        let first = drain();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0], Incoming::Disconnected));
+        assert!(drain().is_empty(), "a second drain must not emit again");
+        assert!(!alive);
+    }
+
+    #[test]
+    fn dropped_connection_surfaces_disconnected_exactly_once() {
+        let handle = server::spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
+        let mut a = Connection::connect("127.0.0.1", handle.addr().port(), "a", "").unwrap();
+        a.conn.close(0u32.into(), b"bye");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = 0u32;
+        while Instant::now() < deadline {
+            for e in a.poll() {
+                if matches!(e, Incoming::Disconnected) {
+                    got += 1;
+                }
+            }
+            if got > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(got, 1, "the drop must surface Disconnected once");
+        for _ in 0..8 {
+            assert!(
+                !a.poll().iter().any(|e| matches!(e, Incoming::Disconnected)),
+                "subsequent polls must stay quiet"
+            );
+        }
         handle.stop();
     }
 }

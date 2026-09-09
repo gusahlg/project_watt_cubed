@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 
 use acoustics::{AcousticWindow, Coords, Dsp, SmoothedCoords, audibility, respond, trace};
 use backend::kira::KiraBackend;
@@ -374,6 +374,19 @@ impl SoundSystem {
         self.enter_world();
     }
 
+    /// True when a clip group, looping emitter, or voice session is live and
+    /// will read the acoustic window on the next submit.
+    pub fn has_live_sources(&self) -> bool {
+        !self.clip_voices.is_empty()
+            || !self.emitter_voices.is_empty()
+            || !self.sessions.is_empty()
+    }
+
+    /// A fire-and-forget UI one-shot is still playing (or waiting on expiry).
+    pub fn ui_pending(&self) -> bool {
+        !self.ui_voices.is_empty()
+    }
+
     pub fn submit(&mut self, frame: AudioFrame) {
         self.poll_starvation();
 
@@ -391,6 +404,13 @@ impl SoundSystem {
 
         let (dt, listener, occurrences, emitters, window) = frame.into_parts();
         self.last_listener = listener;
+        if !self.has_live_sources() && occurrences.is_empty() && emitters.is_empty() {
+            return;
+        }
+        let Some(window) = window else {
+            debug_assert!(false, "acoustic window required when sources are live");
+            return;
+        };
         let k = smoothing_factor(dt, self.cfg.smoothing_halflife_s);
 
         // --- Drop ≤ high_water, realize new occurrence groups ---
@@ -857,14 +877,16 @@ impl SoundSystem {
     /// `AudioFrame`, so menus and loading screens reclaim finished UI tracks and
     /// future music/device recovery has one lifecycle hook.
     pub fn service(&mut self) {
-        let now = Instant::now();
-        let mut index = 0;
-        while index < self.ui_voices.len() {
-            if self.ui_voices[index].1 <= now {
-                let (voice, _) = self.ui_voices.swap_remove(index);
-                self.backend.stop(voice);
-            } else {
-                index += 1;
+        if !self.ui_voices.is_empty() {
+            let now = Instant::now();
+            let mut index = 0;
+            while index < self.ui_voices.len() {
+                if self.ui_voices[index].1 <= now {
+                    let (voice, _) = self.ui_voices.swap_remove(index);
+                    self.backend.stop(voice);
+                } else {
+                    index += 1;
+                }
             }
         }
         if !self.backend.alive() {
@@ -914,7 +936,9 @@ impl SoundSystem {
     }
 
     /// Edge-trigger `Fault::Starved` once per starvation burst per session.
-    fn poll_starvation(&mut self) {
+    /// Game still calls this on a skipped director commit so a live session's
+    /// decoder thread can surface starvation without a mixer frame.
+    pub(crate) fn poll_starvation(&mut self) {
         for (key, (flag, last)) in self.session_starved.iter_mut() {
             let now = flag.load(Ordering::Relaxed);
             if now && !*last {
@@ -1018,7 +1042,8 @@ mod seam_tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use glam::{DVec3, IVec3, UVec3};
+    use glam::UVec3;
+    use voxel_engine::{DVec3, IVec3};
 
     use super::acoustics::{
         AcousticWindow, Cell, Dsp, Listener, Medium, Response, SmoothedCoords, respond,
@@ -1027,7 +1052,8 @@ mod seam_tests {
     use super::backend::recording::{Intent, Recorder, RecordingBackend};
     use super::content::{Catalog, CueSymbols, Loop, OneShot};
     use super::{
-        AudioFrame, Emitter, EmitterId, Occurrence, OccurrenceId, SoundConfig, SoundSystem,
+        AudioFrame, Emitter, EmitterId, Epoch, MixChange, Occurrence, OccurrenceId, Seq,
+        SessionKey, SoundConfig, SoundSystem, VoicePacket,
     };
 
     // Shared catalog fixture: one one-shot, one loop bed, and a loud/quiet pair whose
@@ -1110,10 +1136,12 @@ mod seam_tests {
 
     /// An all-`Open` window spanning x ∈ [-8, 88): any axis ray between in-range points
     /// reads occlusion 0, so trace distance is the plain euclidean gap.
-    fn open_window() -> Arc<AcousticWindow> {
+    fn open_window() -> Option<Arc<AcousticWindow>> {
         let size = UVec3::new(96, 16, 16);
         let cells = vec![Cell::Open; (96 * 16 * 16) as usize].into_boxed_slice();
-        Arc::new(AcousticWindow::new(IVec3::new(-8, -8, -8), size, cells).unwrap())
+        Some(Arc::new(
+            AcousticWindow::new(IVec3::new(-8, -8, -8), size, cells).unwrap(),
+        ))
     }
 
     fn origin_listener() -> Listener {
@@ -1497,5 +1525,111 @@ mod seam_tests {
             1,
             "only the fresh id 6 plays; id 5 was past the dead-frame water mark"
         );
+    }
+
+    #[test]
+    fn silent_submit_accepts_absent_window() {
+        let (mut sound, _, rec) = system(32);
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], None).unwrap(),
+        );
+        assert!(rec.intents().is_empty());
+        assert!(!sound.has_live_sources());
+    }
+
+    #[test]
+    fn live_sources_block_the_director_skip() {
+        use crate::audio::director::{AudioCtx, AudioDirector, PlayerPose};
+        use crate::audio::palette::CuePalette;
+        use crate::console::Console;
+        use crate::world::World;
+
+        let (mut sound, syms, _rec) = system(32);
+        let (palette, _) = CuePalette::build(&syms, sound.catalog());
+        let mut dir = AudioDirector::new(palette);
+        let world = World::generate();
+        let mut console = Console::new();
+        let pos = DVec3::ZERO;
+        dir.frame(
+            AudioCtx {
+                dt: 0.1,
+                player: PlayerPose {
+                    pos,
+                    feet: pos,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    velocity: DVec3::ZERO,
+                    on_ground: true,
+                },
+                ptt: false,
+                voice_enabled: false,
+                events: Vec::new(),
+                peers: &[],
+                world: &world,
+                net: None,
+                console: &mut console,
+            },
+            &mut sound,
+        );
+        assert!(
+            dir.can_skip_commit(&sound, &[], pos, false),
+            "a silent still frame arms the skip"
+        );
+
+        let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![Occurrence {
+                    id: OccurrenceId(1),
+                    cue,
+                    at: Some(source(4.0)),
+                    medium: Medium::Air,
+                    gain: 1.0,
+                }],
+                vec![],
+                open_window(),
+            )
+            .unwrap(),
+        );
+        assert!(sound.has_live_sources());
+        assert!(
+            !dir.can_skip_commit(&sound, &[], pos, false),
+            "a live clip voice must re-enable the commit"
+        );
+    }
+
+    #[test]
+    fn mute_system_survives_a_failed_stream_and_stays_usable() {
+        let (mut sound, _) = SoundSystem::mute();
+        sound.ingest_voice(VoicePacket {
+            session: SessionKey(1),
+            epoch: Epoch(0),
+            seq: Seq(0),
+            payload: Box::new([0, 1, 2, 3]),
+        });
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], open_window()).unwrap(),
+        );
+        sound.set_mix(MixChange::default());
+        sound.leave_world();
+    }
+
+    #[test]
+    fn dead_recording_backend_ingest_does_not_panic() {
+        let (mut sound, _, rec) = system(4);
+        rec.set_alive(false);
+        sound.ingest_voice(VoicePacket {
+            session: SessionKey(9),
+            epoch: Epoch(1),
+            seq: Seq(0),
+            payload: Box::new([9]),
+        });
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], open_window()).unwrap(),
+        );
+        rec.set_alive(true);
+        sound.set_mix(MixChange::default());
     }
 }

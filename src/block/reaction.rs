@@ -102,6 +102,7 @@ impl ReactionRegistry {
     /// computed strength. Strength compares the block's reagent ratios (ignoring
     /// any inert filler) to the reaction's optimum: an exact match gives `255`,
     /// tapering down to `0` the further the ratio drifts.
+    #[cfg(test)]
     pub fn active_for(&self, comp: &Composition) -> Box<[ActiveReaction]> {
         self.active_for_weights(&comp.weights())
     }

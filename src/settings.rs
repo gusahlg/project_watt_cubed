@@ -1,7 +1,7 @@
 //! Persistent graphics settings.
 //!
-//! Stored as plain `key=value` lines in `saves/settings.cfg` (std-only, no
-//! dependencies). The settings menu and the `/gfx` console command both edit
+//! Stored as plain `key=value` lines in `settings.cfg` under the config root
+//! (std-only, no dependencies). The settings menu and the `/gfx` console command both edit
 //! a [`Settings`] value; [`Settings::apply`] pushes it to the engine, which
 //! no-ops for values that didn't change.
 //!
@@ -17,11 +17,14 @@
 use std::fmt::Write;
 use std::fs;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::PathBuf;
 
 use voxel_engine::Engine;
 
-use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, max_lod_levels};
+use crate::render_config::{
+    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, VrsChoice,
+    fit_render_targets, max_lod_levels, vrs_effective,
+};
 use crate::ui::HudMode;
 
 pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RADIUS_RANGE};
@@ -31,7 +34,42 @@ pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RA
 /// renderer can never disagree on the bound.
 pub use voxel_engine::RENDER_SCALE_RANGE;
 
-const SETTINGS_PATH: &str = "saves/settings.cfg";
+fn settings_path() -> PathBuf {
+    crate::paths::Paths::get().settings_file()
+}
+
+/// Default-preset internal scale when the window is above [`AUTO_RENDER_SCALE_THRESHOLD_PX`].
+/// Raise to 0.8 once the engine's temporal upsampler (Catmull-Rom TAAU, engine wt/round4+)
+/// is in main and the TAA forcing below is verified in the bench path.
+pub const DEFAULT_AUTO_RENDER_SCALE: f32 = 1.0;
+/// Window-pixel count above which Default uses [`DEFAULT_AUTO_RENDER_SCALE`] (and TAA).
+pub const AUTO_RENDER_SCALE_THRESHOLD_PX: u32 = 1_500_000;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AUTO_RENDER_SCALE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The Auto scale Default actually applies (the shipped constant, or a test override).
+fn live_auto_render_scale() -> f32 {
+    #[cfg(test)]
+    if let Some(scale) = TEST_AUTO_RENDER_SCALE.with(|slot| slot.get()) {
+        return scale;
+    }
+    DEFAULT_AUTO_RENDER_SCALE
+}
+
+/// Run `f` with Default Auto scale temporarily set (proves TAA forcing while the
+/// shipped constant is 1.0).
+#[cfg(test)]
+pub fn with_auto_render_scale<R>(scale: f32, f: impl FnOnce() -> R) -> R {
+    TEST_AUTO_RENDER_SCALE.with(|slot| {
+        let prev = slot.replace(Some(scale));
+        let out = f();
+        slot.set(prev);
+        out
+    })
+}
 
 /// Field-of-view clamp range, in degrees. Shared with the settings menu stepper.
 pub const FOV_RANGE: RangeInclusive<f32> = 60.0..=220.0;
@@ -41,48 +79,15 @@ pub const UI_SCALE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
 
 pub const SHAKE_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
-/// Performance profile marker. Editing any profile-owned setting drops this to
-/// [`Preset::Custom`]; choosing a profile applies it atomically. Personal
-/// controls never touch it. Persisted by its stable [`Preset::code`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Preset {
-    Custom,
-    Minimum,
-    Fast,
-    Default,
-}
-
-impl Preset {
-    /// Stable persistence/console code (`Custom=0, Minimum=1, Fast=2, Default=3`).
-    pub fn code(self) -> u8 {
-        match self {
-            Preset::Custom => 0,
-            Preset::Minimum => 1,
-            Preset::Fast => 2,
-            Preset::Default => 3,
-        }
-    }
-
-    /// Parse a persisted code or a console word; the single source `/gfx`,
-    /// persistence `read`, and benchmark startup fold through.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "custom" | "0" => Some(Preset::Custom),
-            "minimum" | "min" | "1" => Some(Preset::Minimum),
-            "fast" | "2" => Some(Preset::Fast),
-            "default" | "3" => Some(Preset::Default),
-            _ => None,
-        }
-    }
-
-    /// Capitalized display name for the menu row and confirm line.
-    pub fn label(self) -> &'static str {
-        match self {
-            Preset::Custom => "Custom",
-            Preset::Minimum => "Minimum",
-            Preset::Fast => "Fast",
-            Preset::Default => "Default",
-        }
+crate::macros::code_enum! {
+    /// Performance profile marker. Editing any profile-owned setting drops this to
+    /// [`Preset::Custom`]; choosing a profile applies it atomically. Personal
+    /// controls never touch it. Persisted by its stable [`Preset::code`].
+    pub enum Preset {
+        Custom = 0, ["custom", "0"], "Custom",
+        Minimum = 1, ["minimum", "min", "1"], "Minimum",
+        Fast = 2, ["fast", "2"], "Fast",
+        Default = 3, ["default", "3"], "Default",
     }
 }
 
@@ -158,7 +163,7 @@ settings_fields! {
     sunlight: bool = true,
     shadows: bool = false,
     sky: bool = true,
-    vrs: bool = true,
+    vrs: VrsChoice = VrsChoice::Auto,
     water_anim: bool = true,
     /// Baked corner AO, another meshing input.
     ao: bool = true,
@@ -171,6 +176,22 @@ settings_fields! {
     voice_incoming: bool = true,
     /// Runtime-only `/mute` state; absent from [`SETTINGS`].
     muted: bool = false,
+
+    /// Device framebuffer MSAA ceiling from the startup probe; not persisted.
+    device_max_msaa: u32 = 8,
+    /// 60% of device-local heap; `None` skips the session VRAM guard.
+    vram_budget_bytes: Option<u64> = None,
+    /// Session-only VRAM-guard line for the console and settings menu.
+    vram_notice: Option<String> = None,
+    /// Largest connected display (fullscreen first allocation).
+    startup_display_w: u32 = 1280,
+    startup_display_h: u32 = 720,
+    /// Last window size used by Default Auto render scale.
+    window_w: u32 = 1280,
+    window_h: u32 = 720,
+    /// Last render extent (window × session scale) used by Auto VRS.
+    render_w: u32 = 1280,
+    render_h: u32 = 720,
 }
 
 // One `Setting` per field: behaviour folded over by every surface (persistence, menu, console).
@@ -222,7 +243,7 @@ pub struct Setting {
     menu_kind: MenuKind,
     profile: Profile,
     fraction: fn(&Settings) -> f32,
-    /// The `key=` name used in `saves/settings.cfg` and the primary console name.
+    /// The `key=` name used in `settings.cfg` and the primary console name.
     key: &'static str,
     /// Extra names the `/gfx` console command accepts for this field.
     aliases: &'static [&'static str],
@@ -254,6 +275,11 @@ impl Setting {
     /// The settings-menu row label.
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// Persistence / `/gfx` key for this field.
+    pub fn key(&self) -> &'static str {
+        self.key
     }
 
     pub fn category(&self) -> Category {
@@ -510,10 +536,10 @@ macro_rules! numeric_setting {
 /// and stepping use the same ordered values; persistence restores the marker
 /// directly instead of triggering its interactive side effects.
 macro_rules! enum_setting {
-    ($set:ident, $profile:expr, $field:ident, $ty:ty, $label:literal,
+    ($set:ident, $profile:expr, $cat:expr, $field:ident, $ty:ty, $label:literal,
      $usage:literal, $aliases:expr, $confirm:literal, $order:expr) => {
         Setting {
-            category: Category::Performance,
+            category: $cat,
             menu_kind: MenuKind::Choice,
             profile: $profile,
             fraction: |_| 0.0,
@@ -552,7 +578,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
 pub const SETTINGS: [Setting; 52] = [
     enum_setting!(
-        apply, Profile::Personal, preset, Preset, "Performance Preset",
+        apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
         &[Preset::Custom, Preset::Minimum, Preset::Fast, Preset::Default]
     ),
@@ -629,7 +655,7 @@ pub const SETTINGS: [Setting; 52] = [
         &["modrate"]
     ),
     enum_setting!(
-        assign, Profile::Owned, hud_mode, HudMode, "HUD Mode",
+        assign, Profile::Owned, Category::Performance, hud_mode, HudMode, "HUD Mode",
         "hud_mode off|minimal|full", &["hud"], "HUD",
         &[HudMode::Off, HudMode::Minimal, HudMode::Full]
     ),
@@ -767,18 +793,34 @@ pub const SETTINGS: [Setting; 52] = [
         },
         fov_clamp
     ),
-    percent_bar!(
-        Profile::Owned,
-        Category::Video,
-        render_scale,
-        "render_scale",
-        "Render Scale",
-        RENDER_SCALE_RANGE,
-        &[25, 50, 75, 100, 125, 150, 200],
-        "renderscale <25-200>",
-        "render scale",
-        &["renderscale", "scale"]
-    ),
+    Setting {
+        category: Category::Video,
+        menu_kind: MenuKind::Bar,
+        profile: Profile::Owned,
+        fraction: |s| frac(s.render_scale, *RENDER_SCALE_RANGE.start(), *RENDER_SCALE_RANGE.end()),
+        key: "render_scale",
+        aliases: &["renderscale", "scale"],
+        label: "Render Scale",
+        usage: "renderscale <25-200>",
+        confirm: |s| format!("render scale {}", render_scale_show(s)),
+        show: render_scale_show,
+        parse_human: |s, v| match v.parse::<f32>() {
+            Ok(pct) => {
+                s.render_scale = pct / 100.0;
+                clamp_float(&mut s.render_scale, &RENDER_SCALE_RANGE, Settings::default().render_scale);
+                true
+            }
+            Err(_) => false,
+        },
+        step: |s, d| {
+            let pct = cycle_list(&[25, 50, 75, 100, 125, 150, 200], (s.render_scale * 100.0).round() as i32, d);
+            s.render_scale = pct as f32 / 100.0;
+        },
+        clamp: |s| clamp_float(&mut s.render_scale, &RENDER_SCALE_RANGE, Settings::default().render_scale),
+        write: |s, text| write_value(s.render_scale, text),
+        copy: |s, source| s.render_scale = source.render_scale,
+        read: |s, v| set_parsed(&mut s.render_scale, v),
+    },
     percent_bar!(
         Profile::Personal,
         Category::Interface,
@@ -833,7 +875,11 @@ pub const SETTINGS: [Setting; 52] = [
     video_toggle!(godrays, "godrays", "Godrays"),
     video_toggle!(exposure, "exposure", "Auto Exposure", &["exp"]),
     video_toggle!(taa, "taa", "Temporal AA", &["aa"]),
-    video_toggle!(vrs, "vrs", "Variable-Rate Shading"),
+    enum_setting!(
+        assign, Profile::Stripped(false), Category::Video, vrs, VrsChoice, "Variable-Rate Shading",
+        "vrs auto|on|off", &[], "vrs",
+        &[VrsChoice::Auto, VrsChoice::On, VrsChoice::Off]
+    ),
     video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
@@ -976,7 +1022,7 @@ impl Settings {
     /// Load from disk, falling back to defaults for missing/invalid entries.
     pub fn load() -> Self {
         let mut settings = Self::default();
-        if let Ok(text) = fs::read_to_string(SETTINGS_PATH) {
+        if let Ok(text) = fs::read_to_string(settings_path()) {
             settings.parse_from(&text);
         }
         // Six-way cull is env-only (not in the persisted table): opt in with
@@ -1014,10 +1060,11 @@ impl Settings {
 
     /// Best-effort save (a failed write shouldn't crash the game).
     pub fn save(&self) {
-        if let Some(dir) = Path::new(SETTINGS_PATH).parent() {
+        let path = settings_path();
+        if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let _ = fs::write(SETTINGS_PATH, self.to_text());
+        let _ = crate::save::write_atomic(&path, self.to_text().as_bytes());
     }
 
     /// Force every field into its valid range. Safe to call repeatedly, and
@@ -1029,30 +1076,109 @@ impl Settings {
         }
     }
 
+    /// Install the one-shot GPU probe. MSAA above [`Self::device_max_msaa`]
+    /// is refused by [`Self::clamp`] (and persisted). VRAM over-budget
+    /// degrades are session-only and never written back to [`Self::msaa`] /
+    /// [`Self::render_scale`].
+    pub fn set_device_caps(&mut self, caps: DeviceCaps, display: (u32, u32)) {
+        self.device_max_msaa = caps.max_msaa.max(1);
+        self.vram_budget_bytes = caps.render_target_budget_bytes();
+        self.startup_display_w = display.0.max(1);
+        self.startup_display_h = display.1.max(1);
+        self.clamp();
+    }
+
+    /// Session MSAA/scale after the VRAM guard. Does not mutate persisted fields.
+    pub fn session_graphics(&self, width: u32, height: u32) -> SessionGraphics {
+        let scale = self.effective_render_scale(width, height);
+        let mut lanes = self.render_config();
+        lanes.taa = self.effective_taa(scale);
+        match self.vram_budget_bytes {
+            Some(budget) => fit_render_targets(
+                width,
+                height,
+                scale,
+                self.msaa,
+                lanes,
+                budget,
+                self.device_max_msaa,
+            ),
+            None => SessionGraphics {
+                msaa: self.msaa.min(self.device_max_msaa).max(1),
+                render_scale: scale,
+                notice: None,
+            },
+        }
+    }
+
+    /// Whether the Default Auto render-scale rule is live (not Custom/Minimum/Fast).
+    pub fn render_scale_auto(&self) -> bool {
+        self.preset == Preset::Default
+    }
+
+    /// Scale pushed to the engine for this window. Default picks
+    /// [`DEFAULT_AUTO_RENDER_SCALE`] above the pixel threshold and 1.0
+    /// otherwise; other profiles keep their stored value.
+    pub fn effective_render_scale(&self, window_w: u32, window_h: u32) -> f32 {
+        if self.render_scale_auto() {
+            auto_render_scale(window_w, window_h)
+        } else {
+            self.render_scale
+        }
+    }
+
+    fn effective_taa(&self, scale: f32) -> bool {
+        self.taa || (self.render_scale_auto() && scale < 1.0)
+    }
+
     /// Push the current values to the engine. Cheap to call every frame: the
-    /// engine ignores values that didn't change. MSAA is written back with
-    /// the hardware-clamped value so menus and `/gfx` show what actually
-    /// applied (e.g. 8x requested, 4x supported).
+    /// engine ignores values that didn't change. Hardware MSAA support is
+    /// already snapped in [`Self::clamp`]; VRAM-budget MSAA/scale cuts are
+    /// applied here without writing them back (they are this session only).
     pub fn apply(&mut self, eng: &mut Engine) {
         eng.set_fullscreen(self.fullscreen);
-        // Vsync is deliberately NOT pushed here: `App::frame` is the single
-        // writer, because the effective value also depends on the screen
-        // (menus force vsync on). Two writers disagreeing made the engine
-        // rebuild the swapchain every menu frame.
-        self.msaa = eng.set_msaa(self.msaa);
-        self.render_scale = eng.set_render_scale(self.render_scale);
-        eng.set_target_fps(self.max_fps);
+        // Vsync and the fps cap are not pushed here: `App::frame` is the
+        // single writer, because the effective values also depend on the
+        // screen (menus cap the frame rate, vsync off) and the benchmark.
+        let w = eng.screen_width().max(1) as u32;
+        let h = eng.screen_height().max(1) as u32;
+        let session = self.session_graphics(w, h);
+        self.adopt_vram_notice(session.notice.clone());
+        let _ = eng.set_msaa(session.msaa);
+        let _ = eng.set_render_scale(session.render_scale);
+        self.note_render_extent(w, h, session.render_scale);
         eng.set_cull_faces(self.cull_faces);
         // Engine render lanes live-swap on both threads; occlusion/lod2 are world
         // inputs (applied on world entry) and aren't part of `engine_flags`.
         eng.set_flags(self.render_config().engine_flags());
     }
 
-    /// The render lanes this settings state names — the single source the game's
-    /// world construction and per-frame [`compose`](crate::frame_snapshot::compose)
-    /// both derive from. (The golden harness keeps its own pinned
+    /// Record the live window and render extent so [`render_config`] can resolve
+    /// Auto VRS and Default Auto render scale.
+    pub fn note_render_extent(&mut self, window_w: u32, window_h: u32, scale: f32) {
+        let scale = scale.max(0.0);
+        self.window_w = window_w.max(1);
+        self.window_h = window_h.max(1);
+        self.render_w = ((window_w as f32 * scale) as u32).max(1);
+        self.render_h = ((window_h as f32 * scale) as u32).max(1);
+    }
+
+    fn adopt_vram_notice(&mut self, notice: Option<String>) {
+        if self.vram_notice != notice {
+            if let Some(line) = notice.as_ref() {
+                eprintln!("{line}");
+            }
+            self.vram_notice = notice;
+        }
+    }
+
+    /// The render lanes this settings state names, before visual-mod masking.
+    /// World construction, `/gfx` apply, and engine flags go through
+    /// [`Mods::effective_render`](crate::mods::Mods::effective_render). (The
+    /// golden harness keeps its own pinned
     /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
     pub fn render_config(&self) -> RenderConfig {
+        let scale = self.effective_render_scale(self.window_w, self.window_h);
         RenderConfig {
             occlusion: self.occlusion,
             lod2: self.lod2,
@@ -1066,13 +1192,13 @@ impl Settings {
             weather: self.weather,
             stars: self.stars,
             day_night: self.day_night,
-            taa: self.taa,
+            taa: self.effective_taa(scale),
             fog: self.fog,
             ambient: self.ambient,
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
-            vrs: self.vrs,
+            vrs: vrs_effective(self.vrs, self.render_w, self.render_h),
             water_anim: self.water_anim,
             vignette: self.vignette,
         }
@@ -1094,6 +1220,28 @@ impl Settings {
 }
 
 // Shared value helpers — the single definition each surface reuses.
+
+/// Default Auto scale for a window pixel count. One comparison so the menu,
+/// session apply, and tests cannot disagree.
+pub fn auto_render_scale(window_w: u32, window_h: u32) -> f32 {
+    let px = (window_w as u64).saturating_mul(window_h as u64);
+    if px > u64::from(AUTO_RENDER_SCALE_THRESHOLD_PX) {
+        live_auto_render_scale()
+    } else {
+        1.0
+    }
+}
+
+fn render_scale_show(s: &Settings) -> String {
+    if s.render_scale_auto() {
+        format!(
+            "Auto ({:.1})",
+            s.effective_render_scale(s.window_w, s.window_h)
+        )
+    } else {
+        format!("{:.0}%", s.render_scale * 100.0)
+    }
+}
 
 fn write_value(value: impl std::fmt::Display, text: &mut String) {
     write!(text, "{value}").expect("writing settings to a String cannot fail");
@@ -1239,6 +1387,9 @@ fn vol_clamp(v: &mut u8) {
 
 fn msaa_clamp(s: &mut Settings) {
     s.msaa = snap_down(MSAA, s.msaa as i32) as u32;
+    if s.msaa > s.device_max_msaa {
+        s.msaa = snap_down(MSAA, s.device_max_msaa as i32) as u32;
+    }
 }
 
 fn dist_clamp(s: &mut Settings) {
@@ -1323,6 +1474,19 @@ mod tests {
     }
 
     #[test]
+    fn save_and_load_use_the_config_root() {
+        let path = settings_path();
+        assert!(path.starts_with(&crate::paths::Paths::get().config));
+        assert_ne!(path, PathBuf::from("saves/settings.cfg"));
+        let s = Settings { fov: 110.0, ..Default::default() };
+        s.save();
+        assert!(path.exists());
+        let loaded = Settings::load();
+        assert_eq!(loaded.fov, 110.0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn invalid_lines_keep_defaults() {
         let mut s = Settings::default();
         s.parse_from("garbage\nmsaa=lots\nfov=\nrender_distance=7");
@@ -1357,6 +1521,19 @@ mod tests {
         assert_eq!(s.fov, 220.0);
         assert_eq!(s.render_scale, 2.0);
         assert_eq!(s.shake, 1.0);
+    }
+
+    #[test]
+    fn clamp_refuses_msaa_above_device_and_scale_above_two() {
+        let mut s = Settings {
+            msaa: 8,
+            device_max_msaa: 4,
+            render_scale: 9.0,
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.msaa, 4);
+        assert_eq!(s.render_scale, 2.0);
     }
 
     #[test]
@@ -1543,7 +1720,8 @@ mod tests {
         assert_eq!(s.hud_mode, HudMode::Off);
         assert!(!s.simulation && !s.mod_logic && !s.autosave);
         assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
-        assert!(!s.lighting && !s.occlusion && !s.ao && !s.vrs);
+        assert!(!s.lighting && !s.occlusion && !s.ao);
+        assert_eq!(s.vrs, VrsChoice::Off);
         assert!(!s.sky && !s.bloom && !s.clouds && !s.water_anim);
         assert!(s.sunlight);
 
@@ -1562,6 +1740,7 @@ mod tests {
         assert_eq!(s.hud_mode, HudMode::Minimal);
         assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
         assert!(!s.minimap && !s.mod_hud && !s.name_tags);
+        assert_eq!(s.vrs, VrsChoice::Off);
 
         assert!(preset.parse_human(&mut s, "default"));
         let expected = Settings {
@@ -1686,5 +1865,121 @@ mod tests {
         // ...and the one on/off helper gives menu caps vs console lowercase.
         assert_eq!(on_off(true, true), "On");
         assert_eq!(on_off(true, false), "on");
+    }
+
+    #[test]
+    fn vrs_persists_choice_words_and_reads_legacy_bools() {
+        let field = setting("vrs");
+        let mut s = Settings::default();
+        assert_eq!(s.vrs, VrsChoice::Auto);
+        assert_eq!(field.write(&s), "auto");
+        assert_eq!(field.show(&s), "Auto");
+        assert_eq!(field.usage(), "vrs auto|on|off");
+        assert_eq!(field.confirm(&s), "vrs auto");
+
+        assert!(field.parse_human(&mut s, "on"));
+        assert_eq!(s.vrs, VrsChoice::On);
+        assert_eq!(s.preset, Preset::Custom);
+        assert_eq!(field.write(&s), "on");
+        assert!(field.parse_human(&mut s, "off"));
+        assert_eq!(s.vrs, VrsChoice::Off);
+        assert!(field.parse_human(&mut s, "auto"));
+        assert_eq!(s.vrs, VrsChoice::Auto);
+
+        let mut loaded = Settings::default();
+        loaded.parse_from("vrs=true\n");
+        assert_eq!(loaded.vrs, VrsChoice::On);
+        loaded.parse_from("vrs=false\n");
+        assert_eq!(loaded.vrs, VrsChoice::Off);
+        loaded.parse_from("vrs=auto\n");
+        assert_eq!(loaded.vrs, VrsChoice::Auto);
+        assert!(
+            loaded.to_text().lines().any(|line| line == "vrs=auto"),
+            "new files persist the word form"
+        );
+
+        let mut round = Settings::default();
+        round.parse_from(&loaded.to_text());
+        assert_eq!(round.vrs, VrsChoice::Auto);
+    }
+
+    #[test]
+    fn render_config_resolves_auto_vrs_from_extent() {
+        let mut s = Settings::default();
+        assert_eq!(s.vrs, VrsChoice::Auto);
+        assert!(!s.render_config().vrs, "1280×720 default is below Auto");
+        s.note_render_extent(3840, 2160, 1.0);
+        assert!(s.render_config().vrs);
+        s.note_render_extent(3440, 1440, 2.0);
+        assert!(s.render_config().vrs);
+        s.note_render_extent(1920, 1080, 1.0);
+        assert!(!s.render_config().vrs);
+        s.vrs = VrsChoice::On;
+        assert!(s.render_config().vrs);
+        s.vrs = VrsChoice::Off;
+        s.note_render_extent(3840, 2160, 1.0);
+        assert!(!s.render_config().vrs);
+    }
+
+    #[test]
+    fn default_auto_render_scale_follows_window_pixels() {
+        let field = setting("render_scale");
+        let mut s = Settings::default();
+        assert_eq!(s.preset, Preset::Default);
+        assert!(s.render_scale_auto());
+        assert_eq!(s.render_scale, 1.0, "stored Default scale stays 1.0");
+
+        s.note_render_extent(1280, 720, 1.0);
+        assert_eq!(s.effective_render_scale(1280, 720), 1.0);
+        assert_eq!(s.session_graphics(1280, 720).render_scale, 1.0);
+        assert!(!s.render_config().taa, "720p leaves TAA at the stored value");
+        assert_eq!(field.show(&s), "Auto (1.0)");
+        assert_eq!(field.confirm(&s), "render scale Auto (1.0)");
+
+        s.note_render_extent(1920, 1080, 1.0);
+        assert_eq!(s.effective_render_scale(1920, 1080), DEFAULT_AUTO_RENDER_SCALE);
+        assert_eq!(s.session_graphics(1920, 1080).render_scale, DEFAULT_AUTO_RENDER_SCALE);
+        assert_eq!(
+            s.render_config().taa,
+            DEFAULT_AUTO_RENDER_SCALE < 1.0,
+            "TAA is forced only while Auto scale is below 1"
+        );
+        assert_eq!(
+            field.show(&s),
+            format!("Auto ({:.1})", DEFAULT_AUTO_RENDER_SCALE)
+        );
+
+        s.note_render_extent(3440, 1440, 1.0);
+        assert_eq!(s.effective_render_scale(3440, 1440), DEFAULT_AUTO_RENDER_SCALE);
+        assert_eq!(s.render_config().taa, DEFAULT_AUTO_RENDER_SCALE < 1.0);
+
+        // Crossing the threshold via the live extent path (resize / fullscreen).
+        s.note_render_extent(1280, 720, 1.0);
+        assert_eq!(s.effective_render_scale(s.window_w, s.window_h), 1.0);
+        assert!(!s.render_config().taa);
+        s.note_render_extent(1920, 1080, 1.0);
+        assert_eq!(s.effective_render_scale(s.window_w, s.window_h), DEFAULT_AUTO_RENDER_SCALE);
+        assert_eq!(s.render_config().taa, DEFAULT_AUTO_RENDER_SCALE < 1.0);
+
+        let mut custom = Settings::default();
+        custom.mark_custom();
+        custom.render_scale = 1.0;
+        custom.note_render_extent(1920, 1080, 1.0);
+        assert!(!custom.render_scale_auto());
+        assert_eq!(custom.effective_render_scale(1920, 1080), 1.0);
+        assert_eq!(custom.session_graphics(1920, 1080).render_scale, 1.0);
+        assert!(!custom.render_config().taa);
+        assert_eq!(field.show(&custom), "100%");
+
+        let mut fast = Settings::default();
+        fast.apply_preset(Preset::Fast);
+        fast.note_render_extent(1920, 1080, 0.5);
+        assert_eq!(fast.effective_render_scale(1920, 1080), 0.5);
+        assert!(!fast.render_config().taa);
+
+        let mut min = Settings::default();
+        min.apply_preset(Preset::Minimum);
+        min.note_render_extent(1920, 1080, 0.25);
+        assert_eq!(min.effective_render_scale(1920, 1080), 0.25);
     }
 }

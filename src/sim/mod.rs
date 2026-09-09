@@ -18,6 +18,10 @@ pub const TICK_SECONDS: f32 = 1.0 / 20.0;
 /// mutate the world. Implementors are the documented physics systems (thermal,
 /// electrical, …).
 pub trait Tick {
+    /// Stable name used to order systems. Install order must not decide tick
+    /// sequence across clients.
+    fn name(&self) -> &'static str;
+
     /// Advance this system by one fixed step of `dt` seconds.
     fn tick(&mut self, world: &mut World, dt: f32);
 }
@@ -35,12 +39,21 @@ pub struct Simulation {
 impl Simulation {
     /// An empty simulation ready for concrete systems to register.
     pub fn new() -> Self {
-        Self { systems: Vec::new(), ticks: 0 }
+        Self::with_systems(Vec::new())
     }
 
-    /// Add a system. The registration seam for future physics and mods.
+    /// Install `systems` in ascending-name order.
+    pub fn with_systems(mut systems: Vec<Box<dyn Tick>>) -> Self {
+        // Name order, not install order: two clients that register the same
+        // systems in different sequences still tick them identically.
+        systems.sort_by(|a, b| a.name().cmp(b.name()));
+        Self { systems, ticks: 0 }
+    }
+
+    /// Add a system, inserting it into the name-sorted sequence.
     pub fn add(&mut self, system: Box<dyn Tick>) {
-        self.systems.push(system);
+        let i = self.systems.partition_point(|s| s.name() <= system.name());
+        self.systems.insert(i, system);
     }
 
     /// A physics step may read and write any block in any chunk
@@ -77,5 +90,49 @@ impl Run for Simulation {
 impl Default for Simulation {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::World;
+
+    struct Named(&'static str);
+
+    impl Tick for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn tick(&mut self, _world: &mut World, _dt: f32) {}
+    }
+
+    fn names(sim: &Simulation) -> Vec<&'static str> {
+        sim.systems.iter().map(|s| s.name()).collect()
+    }
+
+    #[test]
+    fn add_in_any_order_yields_the_same_iteration_order() {
+        let mut added = Simulation::new();
+        added.add(Box::new(Named("thermal")));
+        added.add(Box::new(Named("electrical")));
+        added.add(Box::new(Named("fluid")));
+
+        let built = Simulation::with_systems(vec![
+            Box::new(Named("fluid")),
+            Box::new(Named("thermal")),
+            Box::new(Named("electrical")),
+        ]);
+
+        let expect = ["electrical", "fluid", "thermal"];
+        assert_eq!(names(&added), expect);
+        assert_eq!(names(&built), expect);
+
+        let mut reverse = Simulation::new();
+        reverse.add(Box::new(Named("fluid")));
+        reverse.add(Box::new(Named("electrical")));
+        reverse.add(Box::new(Named("thermal")));
+        assert_eq!(names(&reverse), expect);
     }
 }

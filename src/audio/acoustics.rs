@@ -2,7 +2,8 @@
 //! nonlinearity. No `&mut`, no statics, no authority — every function is total
 //! and depends only on its arguments.
 
-use glam::{DVec3, IVec3, UVec3};
+use glam::UVec3;
+use voxel_engine::{DVec3, IVec3};
 
 use crate::camera::direction_from_angles;
 use crate::math::BLOCK_METERS;
@@ -63,6 +64,11 @@ impl AcousticWindow {
             size,
             cells,
         })
+    }
+
+    /// Recover the cell buffer so a later capture can refill it in place.
+    pub(crate) fn into_cells(self) -> Box<[Cell]> {
+        self.cells
     }
 
     /// Cell at a world coordinate; outside the window it reads `Unloaded`.

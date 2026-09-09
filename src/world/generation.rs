@@ -31,6 +31,23 @@ use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
+/// Ground height per cell of a 16×16 chunk column — identical to [`TerrainGenerator::height`].
+pub type ColumnHeights = [i32; CHUNK_SIZE * CHUNK_SIZE];
+
+/// Sample [`TerrainGenerator::height`] across a chunk column. Used by the
+/// default [`TerrainGenerator::generate_column`] (test gens that do not batch).
+fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i32, cz: i32) -> ColumnHeights {
+    let x0 = cx * CHUNK_SIZE as i32;
+    let z0 = cz * CHUNK_SIZE as i32;
+    let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            heights[lx + lz * CHUNK_SIZE] = g.height(x0 + lx as i32, z0 + lz as i32);
+        }
+    }
+    heights
+}
+
 /// Which generator a world is built with. Folded into the content fingerprint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum WorldgenKind {
@@ -44,6 +61,29 @@ impl WorldgenKind {
         match self {
             Self::Classic => "classic",
             Self::Diffusion => "diffusion",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "classic" => Some(Self::Classic),
+            "diffusion" => Some(Self::Diffusion),
+            _ => None,
+        }
+    }
+
+    pub fn wire(self) -> u8 {
+        match self {
+            Self::Classic => 0,
+            Self::Diffusion => 1,
+        }
+    }
+
+    pub fn from_wire(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Classic),
+            1 => Some(Self::Diffusion),
+            _ => None,
         }
     }
 }
@@ -64,6 +104,13 @@ pub trait TerrainGenerator: Send + Sync {
     }
     /// Topmost non-ground cell in this column.
     fn height(&self, wx: i32, wz: i32) -> i32;
+
+    /// Ground height for every cell of the 16×16 chunk column at `(cx, cz)`.
+    /// Default walks [`height`](Self::height); Diffusion fills the rectangle
+    /// from the field in one tile load.
+    fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
+        sample_column_heights(self, cx, cz)
+    }
 
     /// Surface block (biome-dependent).
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId;
@@ -116,9 +163,19 @@ pub trait TerrainGenerator: Send + Sync {
         ChunkData::from_cells(cells)
     }
 
-    /// Generate vertical run of chunks; default loops per-chunk; Terrain batches.
-    fn generate_column(&self, cx: i32, cz: i32, cy: RangeInclusive<i32>) -> Vec<(i32, ChunkData)> {
-        cy.map(|cyy| (cyy, self.generate(cx, cyy, cz))).collect()
+    /// Generate a vertical run of chunks together with the column's 256 ground
+    /// heights (identical to [`height`](Self::height) at each cell). Heights
+    /// are produced even when `cy` is empty — the profile sample does not
+    /// depend on the chunk layers. Default loops per-chunk; Terrain and
+    /// Diffusion batch the profile.
+    fn generate_column(
+        &self,
+        cx: i32,
+        cz: i32,
+        cy: RangeInclusive<i32>,
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+        let chunks = cy.map(|cyy| (cyy, self.generate(cx, cyy, cz))).collect();
+        (chunks, sample_column_heights(self, cx, cz))
     }
 }
 
@@ -219,7 +276,14 @@ impl Fbm {
     }
 
     fn sup(&self, x0: i32, y0: i32, z0: i32) -> Unit {
-        Unit(self.bound(x0, y0, z0).hi)
+        let mut hi = 0.0;
+        let mut w = 1.0;
+        for o in 0..self.octaves {
+            let f = (1u32 << o) as f64 / self.cell;
+            hi += w * octave_sup(self.stream.octave(o as u64), x0, y0, z0, f);
+            w *= 0.5;
+        }
+        Unit(hi / self.norm)
     }
 
     /// 2D upper bound for island placement checks.
@@ -353,7 +417,7 @@ impl Islands {
             return None;
         }
         let t = (place - self.on) / (1.0 - self.on);
-        let s = t * t * (3.0 - 2.0 * t);
+        let s = crate::math::smooth(t);
         let core = self.core_floor + (1.0 - self.core_floor) * s;
         let center = self.band_lo + (self.lift.at(wx, wz).0 * self.band_span as f32).round() as i32;
         Some((core, center))
@@ -489,25 +553,35 @@ struct Column {
     water_level: i32,
     temperature: Unit,
     humidity: Unit,
+    /// Y-invariant surface class; cached so crust/dress don't recompute it.
+    kind: placement::SurfaceKind,
+    /// Surface block for this column (dress LUT + scatter).
+    dress: BlockId,
+}
+
+/// Per-column carve / overhang / island bits for one chunk layer.
+#[derive(Clone, Copy)]
+struct ColMask {
+    wx: i32,
+    wz: i32,
+    carved: u16,
+    overhang: u16,
+    island: u32,
 }
 
 // Value noise primitives. Uses f64 world coordinates for far-out stability.
 
 fn lattice(seed: u64, x: i32, y: i32, z: i32) -> f32 {
-    let h = seed
-        ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    let h = crate::hash::splitmix_finish(h);
+    let h = crate::hash::splitmix_finish(crate::hash::mix3(seed, x, y, z));
     (h >> 40) as f32 * (1.0 / (1u64 << 24) as f32)
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+    crate::math::lerp(a, b, t)
 }
 
 fn fade(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
+    crate::math::smooth(t)
 }
 
 fn reduce(w: i32, freq: f64) -> (i64, f32) {
@@ -573,6 +647,14 @@ impl OctaveColumn {
 }
 
 fn octave_bound(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
+    octave_range::<true>(seed, x0, y0, z0, freq)
+}
+
+fn octave_sup(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> f32 {
+    octave_range::<false>(seed, x0, y0, z0, freq).1
+}
+
+fn octave_range<const LO: bool>(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
     fn axis(w0: i32, freq: f64) -> (i64, usize, f32, f32) {
         let (c0, f0) = reduce(w0, freq);
         let (c1, f1) = reduce(w0 + CHUNK_SIZE as i32 - 1, freq);
@@ -600,7 +682,7 @@ fn octave_bound(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
     let ends = |i: usize, n: usize, f0: f32, f1: f32| -> [f32; 2] {
         [if i == 0 { f0 } else { 0.0 }, if i + 1 == n { f1 } else { 1.0 }]
     };
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut lo, mut hi) = (if LO { f32::INFINITY } else { 0.0 }, f32::NEG_INFINITY);
     for i in 0..xn {
         for j in 0..yn {
             for k in 0..zn {
@@ -616,7 +698,9 @@ fn octave_bound(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
                                 )
                             };
                             let v = lerp(plane(j), plane(j + 1), fy);
-                            lo = lo.min(v);
+                            if LO {
+                                lo = lo.min(v);
+                            }
                             hi = hi.max(v);
                         }
                     }
@@ -642,11 +726,12 @@ fn octave2_sup(seed: u64, x0: i32, z0: i32, dx: i32, dz: i32, freq: f64) -> f32 
 }
 
 pub(crate) fn cell_hash(seed: i64, x: i32, y: i32, z: i32) -> u32 {
-    let h = (seed as u64 ^ 0x517C_C1B7_2722_0A95)
-        ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    let h = crate::hash::splitmix_finish(h);
+    let h = crate::hash::splitmix_finish(crate::hash::mix3(
+        seed as u64 ^ 0x517C_C1B7_2722_0A95,
+        x,
+        y,
+        z,
+    ));
     (h >> 32) as u32
 }
 
@@ -806,8 +891,7 @@ const ISLAND_KEEL_H: f32 = 22.0;
 const ISLAND_DETAIL_AMP: f32 = 0.30;
 const ISLAND_BAND_SPAN: i32 = 120;
 
-// Terrain — the game's generator. `SineHills` kept as an alias so existing call
-// sites need no change.
+// Terrain — the game's generator.
 
 /// Natural terrain — oceans, coasts, mountains, plains, rivers, and biomes —
 /// expressed as data over the noise vocabulary, plus the flying-island and cave
@@ -853,9 +937,6 @@ pub struct Terrain {
     /// exists. No decoration overlay, no named blocks, no special cases.
     mat: placement::Resolved,
 }
-
-/// Kept for compatibility with existing call sites.
-pub type SineHills = Terrain;
 
 impl Terrain {
     /// Build the generator for a seed. `base` sets sea level.
@@ -971,7 +1052,7 @@ impl Terrain {
         let tmask = self.terraces.at(wx, wz).0;
         if base > RIVER_INLAND && tmask > TERRACE_ON {
             let t = (tmask - TERRACE_ON) / (1.0 - TERRACE_ON);
-            let s = t * t * (3.0 - 2.0 * t);
+            let s = crate::math::smooth(t);
             let stepped = (h / TERRACE_STEP).round() * TERRACE_STEP;
             h += (stepped - h) * s;
         }
@@ -982,7 +1063,7 @@ impl Terrain {
         let d = (w - 0.5).abs();
         if base > RIVER_INLAND && d < RIVER_HALF {
             let t = 1.0 - d / RIVER_HALF;
-            let s = t * t * (3.0 - 2.0 * t);
+            let s = crate::math::smooth(t);
             let target = (self.sea_level - RIVER_DEPTH) as f32;
             h += (target.min(h) - h) * s;
         }
@@ -996,7 +1077,7 @@ impl Terrain {
         let lake = self.lakes.at(wx, wz).0;
         if base > RIVER_INLAND && lake > LAKE_ON {
             let t = (lake - LAKE_ON) / (1.0 - LAKE_ON);
-            let s = t * t * (3.0 - 2.0 * t);
+            let s = crate::math::smooth(t);
             let floor = (self.sea_level + LAKE_RISE - LAKE_BOWL) as f32;
             h += (floor.min(h) - h) * s;
             water_level = self.sea_level + LAKE_RISE;
@@ -1004,12 +1085,17 @@ impl Terrain {
 
         // The climate axes share their warp pair by construction too.
         let (climate_x, climate_z) = self.temperature.coordinates(wx, wz);
-        Column {
+        let mut p = Column {
             height: (h.round() as i32).max(1),
             water_level,
             temperature: self.temperature.field.at(climate_x, climate_z),
             humidity: self.humidity.field.at(climate_x, climate_z),
-        }
+            kind: placement::SurfaceKind::Grassy,
+            dress: AIR,
+        };
+        p.kind = self.surface_kind(&p, wx, wz);
+        p.dress = self.dress(&p, wx, wz);
+        p
     }
 
     /// The ground column's surface dressing, classified from the shared context:
@@ -1045,7 +1131,7 @@ impl Terrain {
     /// that union plus a luminous payload (glow tufts on the plains, phosphor
     /// sparks in the desert). One hash stream, so surface finds stay singles.
     fn dress(&self, p: &Column, wx: i32, wz: i32) -> BlockId {
-        let kind = self.surface_kind(p, wx, wz);
+        let kind = p.kind;
         let slices = &self.mat.surface_scatter[kind as usize];
         if !slices.is_empty() {
             let roll = cell_hash(self.seed ^ SURFACE_SCATTER_SALT, wx, p.height, wz);
@@ -1064,6 +1150,7 @@ impl Terrain {
     /// walking the cumulative rarity slices (stream B's are ÷8), deduped —
     /// distinct hits on both streams yield the overlap pair, a multi-yield
     /// find. Stream A alone is byte-identical to the legacy distribution.
+    #[inline]
     fn ore_at(&self, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
         let hit = |slices: &[placement::Slice], roll: u32| -> Option<usize> {
             let mut cut = 0u32;
@@ -1100,17 +1187,15 @@ impl Terrain {
     fn ground(&self, p: &Column, wx: i32, wy: i32, wz: i32, carved: bool) -> BlockId {
         let height = p.height;
         if wy >= height - 1 {
-            self.dress(p, wx, wz)
+            p.dress
         } else if wy >= height - 3 {
-            self.mat.crust[self.surface_kind(p, wx, wz) as usize]
+            self.mat.crust[p.kind as usize]
         } else if carved {
             AIR
         } else {
             let depth = height - wy;
-            if depth <= self.mat.max_scattered_depth {
-                if let Some(ore) = self.ore_at(wx, wy, wz, depth) {
-                    return ore;
-                }
+            if depth <= self.mat.max_scattered_depth && let Some(ore) = self.ore_at(wx, wy, wz, depth) {
+                return ore;
             }
             if let Some(id) = self.cave_wall_at(p, wx, wy, wz, depth) {
                 return id;
@@ -1225,7 +1310,7 @@ impl TerrainGenerator for Terrain {
     }
 
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
-        self.dress(&self.profile(wx, wz), wx, wz)
+        self.profile(wx, wz).dress
     }
 
     fn deep(&self) -> BlockId {
@@ -1249,8 +1334,49 @@ impl TerrainGenerator for Terrain {
     /// single biggest cost drop for a far tile sample.
     fn lod_column(&self, wx: i32, wz: i32, ys: &[i32], out: &mut [BlockId]) {
         let p = self.profile(wx, wz);
+        let island = self.islands.core_center(wx, wz);
+        let mut isl: Vec<bool> = Vec::new();
+        let mut isl_lo = 0i32;
+        if let Some((core, center)) = island {
+            if let (Some(&y_min), Some(&y_max)) = (ys.iter().min(), ys.iter().max()) {
+                let lo = y_min.max(self.islands.band_bottom());
+                let hi = (y_max + 4).min(self.islands.band_top());
+                if lo <= hi {
+                    isl_lo = lo;
+                    isl.resize((hi - lo + 1) as usize, false);
+                    for (k, slot) in isl.iter_mut().enumerate() {
+                        let wy = lo + k as i32;
+                        *slot = self.islands.density(
+                            core,
+                            center,
+                            wy,
+                            self.islands.detail.at3(wx, wy, wz).0,
+                        ) > 0.0;
+                    }
+                }
+            }
+        }
+        let island_at = |wy: i32| -> bool {
+            let i = wy - isl_lo;
+            i >= 0 && (i as usize) < isl.len() && isl[i as usize]
+        };
         for (o, &wy) in out.iter_mut().zip(ys) {
-            *o = self.cell_base(&p, wx, wy, wz, false);
+            *o = if wy < p.height {
+                self.ground(&p, wx, wy, wz, false)
+            } else if wy < p.water_level {
+                self.mat.water
+            } else if self.overhang_solid(wx, wy, wz, p.height) {
+                self.mat.stone
+            } else if island_at(wy) {
+                self.island_block(wx, wy, wz, [
+                    island_at(wy + 1),
+                    island_at(wy + 2),
+                    island_at(wy + 3),
+                    island_at(wy + 4),
+                ])
+            } else {
+                AIR
+            };
         }
     }
 
@@ -1258,18 +1384,52 @@ impl TerrainGenerator for Terrain {
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let (x0, z0) = (cx * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32);
         let (profiles, h_min, h_max, w_min, w_max) = self.column_profiles(x0, z0);
-        self.fill_chunk(x0, z0, cy, &profiles, h_min, h_max, w_min, w_max)
+        self.fill_chunk(x0, z0, cy, &profiles, h_min, h_max, w_min, w_max, None)
     }
 
     /// Column-batched generation: the 256 column profiles are `cy`-invariant, so
     /// a whole vertical run shares one sampling instead of R× re-sampling — the
     /// single biggest load-time generation cost drop. Voxel-identical to looping
     /// generate over the range.
-    fn generate_column(&self, cx: i32, cz: i32, cy: RangeInclusive<i32>) -> Vec<(i32, ChunkData)> {
+    ///
+    /// Column job cost (64 surface columns × 9 layers, `--release`):
+    /// 1.008 ms/column before the run-fill pass, 0.616 ms/column after
+    /// (median of 3; per-column bands, y-outer contiguous writes).
+    fn generate_column(
+        &self,
+        cx: i32,
+        cz: i32,
+        cy: RangeInclusive<i32>,
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
         let (x0, z0) = (cx * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32);
         let (profiles, h_min, h_max, w_min, w_max) = self.column_profiles(x0, z0);
-        cy.map(|cyy| (cyy, self.fill_chunk(x0, z0, cyy, &profiles, h_min, h_max, w_min, w_max)))
-            .collect()
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for (i, p) in profiles.iter().enumerate() {
+            heights[i] = p.height;
+        }
+        let cy_lo = *cy.start();
+        let n = (*cy.end() as i64 - cy_lo as i64 + 3).max(0) as usize;
+        let mut carve_dorm = vec![None; n];
+        let base = cy_lo - 1;
+        let chunks = cy
+            .map(|cyy| {
+                (
+                    cyy,
+                    self.fill_chunk(
+                        x0,
+                        z0,
+                        cyy,
+                        &profiles,
+                        h_min,
+                        h_max,
+                        w_min,
+                        w_max,
+                        Some((base, &mut carve_dorm)),
+                    ),
+                )
+            })
+            .collect();
+        (chunks, heights)
     }
 }
 
@@ -1280,6 +1440,11 @@ impl Terrain {
     /// too, since its VERTICAL adjacency reads one cell past the chunk's rim
     /// (same columns, so the height extents carry over). The dense fill's
     /// collapse remains the correctness backstop; this is a CPU shortcut.
+    fn box_dormant(&self, x0: i32, y0: i32, z0: i32, h_max: i32) -> bool {
+        self.caves.dormant(x0, y0, z0, h_max - y0)
+            && self.ravines.dormant(x0, y0, z0, h_max - y0)
+    }
+
     fn deep_uniform_provable(
         &self,
         x0: i32,
@@ -1289,20 +1454,24 @@ impl Terrain {
         h_min: i32,
         h_max: i32,
     ) -> bool {
-        if y1 >= h_min - self.mat.max_scattered_depth
-            || !self.caves.dormant(x0, y0, z0, h_max - y0)
-            || !self.ravines.dormant(x0, y0, z0, h_max - y0)
-        {
+        self.deep_uniform_with(y0, y1, h_min, |ny0| self.box_dormant(x0, ny0, z0, h_max))
+    }
+
+    fn deep_uniform_with(
+        &self,
+        y0: i32,
+        y1: i32,
+        h_min: i32,
+        mut dormant: impl FnMut(i32) -> bool,
+    ) -> bool {
+        if y1 >= h_min - self.mat.max_scattered_depth || !dormant(y0) {
             return false;
         }
         if self.mat.cave_wall.is_none() {
             return true;
         }
         let cs = CHUNK_SIZE as i32;
-        [y0 - cs, y0 + cs].into_iter().all(|ny0| {
-            self.caves.dormant(x0, ny0, z0, h_max - ny0)
-                && self.ravines.dormant(x0, ny0, z0, h_max - ny0)
-        })
+        dormant(y0 - cs) && dormant(y0 + cs)
     }
 
     /// The 256 column profiles for a chunk column, plus the height/water extents
@@ -1331,7 +1500,8 @@ impl Terrain {
     }
 
     /// One chunk's storage from shared column profiles — the `cy`-varying half of
-    /// generation (height-band + region shortcuts, then the dense fill).
+    /// generation (height-band + region shortcuts, then a run fill).
+    #[allow(clippy::too_many_arguments)] // column stats stay unpacked so the fill can early-out per bound
     fn fill_chunk(
         &self,
         x0: i32,
@@ -1342,14 +1512,29 @@ impl Terrain {
         h_max: i32,
         w_min: i32,
         w_max: i32,
+        mut carve_dorm: Option<(i32, &mut [Option<bool>])>,
     ) -> ChunkData {
         let y0 = cy * CHUNK_SIZE as i32;
         let y1 = y0 + CHUNK_SIZE as i32 - 1;
+        let cs = CHUNK_SIZE as i32;
 
         // Deep below every scattered rule's reach and beyond either carve
         // field's: solid stone. The depth bound is derived from the placement
         // table, not a constant.
-        if self.deep_uniform_provable(x0, y0, z0, y1, h_min, h_max) {
+        let mut dormant_at = |ny0: i32| -> bool {
+            if let Some((base, slots)) = carve_dorm.as_mut() {
+                let i = (ny0 / cs - *base) as usize;
+                if let Some(v) = slots[i] {
+                    return v;
+                }
+                let v = self.box_dormant(x0, ny0, z0, h_max);
+                slots[i] = Some(v);
+                v
+            } else {
+                self.box_dormant(x0, ny0, z0, h_max)
+            }
+        };
+        if self.deep_uniform_with(y0, y1, h_min, &mut dormant_at) {
             return ChunkData::Uniform(self.mat.stone);
         }
         // Above every surface and below the island band: uniform sky. Fully below
@@ -1358,7 +1543,6 @@ impl Terrain {
         // collapses it anyway.)
         // Guarded past the overhang reach above the tallest surface, since a shelf
         // can place solid rock up to `OVERHANG_REACH` blocks over the ground.
-        let cs = CHUNK_SIZE as i32;
         if y0 >= h_max + OVERHANG_REACH
             && !self.islands.possible(x0, y0, z0, (cs, cs, cs))
         {
@@ -1370,60 +1554,204 @@ impl Terrain {
             }
         }
 
-        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
-        let islands_possible = y1 + 4 >= self.islands.band_bottom() && y0 <= self.islands.band_top();
-        let mut isl: [bool; CHUNK_SIZE + 4];
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let wx = x0 + lx as i32;
-                let wz = z0 + lz as i32;
-                let p = &profiles[lx + lz * CHUNK_SIZE];
-                let height = p.height;
+        let carve_dormant = dormant_at(y0);
+        let wall_lo_dormant = self.mat.cave_wall.is_none() || dormant_at(y0 - cs);
+        let wall_hi_dormant = self.mat.cave_wall.is_none() || dormant_at(y0 + cs);
 
-                isl = [false; CHUNK_SIZE + 4];
-                if islands_possible {
-                    if let Some(col) = self.islands.column(wx, wz, y0, y1 + 4) {
-                        for (k, cell) in isl.iter_mut().enumerate() {
-                            *cell = self.islands.solid_col(&col, y0 + k as i32);
+        let islands_possible = y1 + 4 >= self.islands.band_bottom() && y0 <= self.islands.band_top();
+        let any_carve = !carve_dormant && y0 <= h_max - CAVE_MIN_DEPTH;
+        let any_overhang = y1 >= h_min && y0 <= h_max + OVERHANG_REACH - 1;
+        let mut bands = [ColMask { wx: 0, wz: 0, carved: 0, overhang: 0, island: 0 }; CHUNK_SIZE * CHUNK_SIZE];
+        for (xz, band) in bands.iter_mut().enumerate() {
+            let lx = xz % CHUNK_SIZE;
+            let lz = xz / CHUNK_SIZE;
+            let wx = x0 + lx as i32;
+            let wz = z0 + lz as i32;
+            let height = profiles[xz].height;
+            let mut carved = 0u16;
+            let cave_top = height - CAVE_MIN_DEPTH;
+            let rav_top = height - RAVINE_MIN_DEPTH;
+            if any_carve && y0 <= cave_top {
+                let cave_hi = y1.min(cave_top);
+                let cave_col = self.caves.field.column(wx, wz, y0, cave_hi);
+                let rav_col = (y0 <= rav_top)
+                    .then(|| self.ravines.field.column(wx, wz, y0, cave_hi.min(rav_top)));
+                for ly in 0..CHUNK_SIZE {
+                    let wy = y0 + ly as i32;
+                    let cave = wy <= cave_top && self.caves.excess_col(&cave_col, wy, height) > 0.0;
+                    let rav = rav_col
+                        .as_ref()
+                        .is_some_and(|col| wy <= rav_top && self.ravines.excess_col(col, wy, height) > 0.0);
+                    if cave || rav {
+                        carved |= 1 << ly;
+                    }
+                }
+            }
+            let mut overhang = 0u16;
+            let oh_lo = height;
+            let oh_hi = height + OVERHANG_REACH - 1;
+            if any_overhang && y1 >= oh_lo && y0 <= oh_hi {
+                let col = self.overhangs.column(wx, wz, y0.max(oh_lo), y1.min(oh_hi));
+                for ly in 0..CHUNK_SIZE {
+                    let wy = y0 + ly as i32;
+                    let up = wy - height;
+                    if (0..OVERHANG_REACH).contains(&up)
+                        && col.sample(wy).0 > OVERHANG_THRESH + OVERHANG_FADE * up as f32
+                    {
+                        overhang |= 1 << ly;
+                    }
+                }
+            }
+            let mut island = 0u32;
+            if islands_possible {
+                if let Some(col) = self.islands.column(wx, wz, y0, y1 + 4) {
+                    for k in 0..(CHUNK_SIZE + 4) {
+                        if self.islands.solid_col(&col, y0 + k as i32) {
+                            island |= 1 << k;
                         }
                     }
                 }
+            }
+            *band = ColMask { wx, wz, carved, overhang, island };
+        }
 
-                // Carve mask: caves (depth ≥ CAVE_MIN_DEPTH) and ravines (depth ≥
-                // RAVINE_MIN_DEPTH) both bite here, folded together. `cave_top` is
-                // the shallower roof and bounds the cached column span for both.
-                let mut carved = [false; CHUNK_SIZE];
-                let cave_top = height - CAVE_MIN_DEPTH;
-                let rav_top = height - RAVINE_MIN_DEPTH;
-                if y0 <= cave_top {
-                    let cave_col = self.caves.field.column(wx, wz, y0, y1.min(cave_top));
-                    let rav_col = self.ravines.field.column(wx, wz, y0, y1.min(cave_top));
-                    for (k, cell) in carved.iter_mut().enumerate() {
-                        let wy = y0 + k as i32;
-                        let cave = wy <= cave_top && self.caves.excess_col(&cave_col, wy, height) > 0.0;
-                        let rav = wy <= rav_top && self.ravines.excess_col(&rav_col, wy, height) > 0.0;
-                        *cell = cave || rav;
-                    }
+        // Band values written y-outer / x-inner so a uniform plane is one
+        // contiguous run; only ore / cave-wall / island cells take a hash.
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        let plane = CHUNK_SIZE * CHUNK_SIZE;
+        let sky_lo = h_max + OVERHANG_REACH;
+        for ly in 0..CHUNK_SIZE {
+            let wy = y0 + ly as i32;
+            let dest = &mut cells[ly * plane..(ly + 1) * plane];
+            if wy >= sky_lo && !islands_possible {
+                if wy >= w_max {
+                    dest.fill(AIR);
+                    continue;
                 }
-
-                for ly in 0..CHUNK_SIZE {
-                    let wy = y0 + ly as i32;
-                    let id = if wy < height {
-                        self.ground(p, wx, wy, wz, carved[ly])
-                    } else if wy < p.water_level {
-                        self.mat.water
-                    } else if self.overhang_solid(wx, wy, wz, height) {
-                        self.mat.stone
-                    } else if isl[ly] {
-                        self.island_block(wx, wy, wz, [isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]])
-                    } else {
-                        AIR
-                    };
-                    cells[Chunk::index(lx, ly, lz)] = id;
+                if wy < w_min {
+                    dest.fill(self.mat.water);
+                    continue;
                 }
+            }
+            for xz in 0..plane {
+                dest[xz] = self.column_at(
+                    &profiles[xz],
+                    &bands[xz],
+                    ly,
+                    wy,
+                    wall_lo_dormant,
+                    wall_hi_dormant,
+                );
             }
         }
         ChunkData::from_cells(cells)
+    }
+
+    #[inline]
+    fn column_at(
+        &self,
+        p: &Column,
+        m: &ColMask,
+        ly: usize,
+        wy: i32,
+        lo_dormant: bool,
+        hi_dormant: bool,
+    ) -> BlockId {
+        let height = p.height;
+        if wy < height {
+            if wy >= height - 1 {
+                p.dress
+            } else if wy >= height - 3 {
+                self.mat.crust[p.kind as usize]
+            } else if m.carved & (1 << ly) != 0 {
+                AIR
+            } else {
+                let depth = height - wy;
+                if depth <= self.mat.max_scattered_depth {
+                    if let Some(ore) = self.ore_at(m.wx, wy, m.wz, depth) {
+                        return ore;
+                    }
+                }
+                if let Some(id) = self.wall_cell(p, m, ly, wy, depth, lo_dormant, hi_dormant) {
+                    return id;
+                }
+                self.mat.stone
+            }
+        } else if wy < p.water_level {
+            self.mat.water
+        } else if m.overhang & (1 << ly) != 0 {
+            self.mat.stone
+        } else if m.island & (1 << ly) != 0 {
+            let bit = |k: usize| m.island & (1u32 << k) != 0;
+            self.island_block(
+                m.wx,
+                wy,
+                m.wz,
+                [bit(ly + 1), bit(ly + 2), bit(ly + 3), bit(ly + 4)],
+            )
+        } else {
+            AIR
+        }
+    }
+
+    /// In-mask neighbour, or a rim whose neighbouring chunk box is not dormant.
+    #[inline]
+    fn wall_adjacent(m: &ColMask, ly: usize, lo_dormant: bool, hi_dormant: bool) -> bool {
+        (ly > 0 && m.carved & (1 << (ly - 1)) != 0)
+            || (ly + 1 < CHUNK_SIZE && m.carved & (1 << (ly + 1)) != 0)
+            || (ly == 0 && !lo_dormant)
+            || (ly + 1 == CHUNK_SIZE && !hi_dormant)
+    }
+
+    #[inline]
+    fn wall_cell(
+        &self,
+        p: &Column,
+        m: &ColMask,
+        ly: usize,
+        wy: i32,
+        depth: i32,
+        lo_dormant: bool,
+        hi_dormant: bool,
+    ) -> Option<BlockId> {
+        let cw = self.mat.cave_wall.as_ref()?;
+        if depth < cw.min_depth || !Self::wall_adjacent(m, ly, lo_dormant, hi_dormant) {
+            return None;
+        }
+        if cell_hash(self.seed ^ CAVE_WALL_SALT, m.wx, wy, m.wz) >= cw.width {
+            return None;
+        }
+        let in_mask = (ly > 0 && m.carved & (1 << (ly - 1)) != 0)
+            || (ly + 1 < CHUNK_SIZE && m.carved & (1 << (ly + 1)) != 0);
+        if in_mask {
+            return Some(cw.id);
+        }
+        let carved_v = |ny: i32| ny < p.height && self.carved(m.wx, ny, m.wz, p.height);
+        (carved_v(wy + 1) || carved_v(wy - 1)).then_some(cw.id)
+    }
+}
+
+#[cfg(test)]
+pub(in crate::world) fn assert_generate_column_heights_match_height(
+    g: &impl TerrainGenerator,
+    cols: &[(i32, i32)],
+) {
+    for &(cx, cz) in cols {
+        let (_, heights) = g.generate_column(cx, cz, 0..=0);
+        let (_, empty) = g.generate_column(cx, cz, 1..=0);
+        let x0 = cx * CHUNK_SIZE as i32;
+        let z0 = cz * CHUNK_SIZE as i32;
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let i = lx + lz * CHUNK_SIZE;
+                assert_eq!(
+                    heights[i],
+                    g.height(x0 + lx as i32, z0 + lz as i32),
+                    "cx={cx} cz={cz} lx={lx} lz={lz}"
+                );
+                assert_eq!(empty[i], heights[i], "empty cy still reports height cx={cx} cz={cz}");
+            }
+        }
     }
 }
 
@@ -1439,12 +1767,47 @@ mod generate_column_tests {
         for (cx, cz) in [(0, 0), (2, -3), (-1, 7), (0, -4)] {
             let cy_lo = -3;
             let cy_hi = 5;
-            let column = g.generate_column(cx, cz, cy_lo..=cy_hi);
+            let (column, _) = g.generate_column(cx, cz, cy_lo..=cy_hi);
             assert_eq!(column.len() as i32, cy_hi - cy_lo + 1);
             for (cy, data) in column {
                 assert_eq!(data, g.generate(cx, cy, cz), "chunk ({cx}, {cy}, {cz})");
             }
         }
+    }
+
+    /// Heights returned with the column equal [`TerrainGenerator::height`] at
+    /// every cell — the skylight ceiling must not drift from the walkable ground.
+    #[test]
+    fn generate_column_heights_match_height() {
+        let g = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 7);
+        super::assert_generate_column_heights_match_height(&g, &[(0, 0), (2, -3), (-1, 7), (4, 4)]);
+    }
+
+    /// Column job cost: 64 surface columns × 9 layers. Ignored timing gauge.
+    /// Run with `cargo test --release generate_column_ms -- --ignored --nocapture`.
+    ///
+    /// Median of 3 `--release` runs: 1.008 ms/column before the run-fill pass,
+    /// 0.616 ms/column after (1.64×).
+    #[test]
+    #[ignore]
+    fn generate_column_ms() {
+        use std::time::Instant;
+        let g = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 42);
+        let cols: [(i32, i32); 64] =
+            std::array::from_fn(|i| ((i as i32) % 8, (i as i32) / 8));
+        let cy = -3..=5;
+        for &(cx, cz) in &cols {
+            let _ = std::hint::black_box(g.generate_column(cx, cz, cy.clone()));
+        }
+        let t = Instant::now();
+        for &(cx, cz) in &cols {
+            let _ = std::hint::black_box(g.generate_column(cx, cz, cy.clone()));
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "generate_column: {ms:.2} ms total, {:.3} ms/column (64 columns × 9 layers)",
+            ms / 64.0
+        );
     }
 }
 
@@ -1467,7 +1830,7 @@ mod tests {
         // The generalized parity check: Fbm::column must be bit-identical to
         // Fbm::at3 for both region fields, including far out and deep down.
         let g = terrain(42);
-        for field in [&g.caves.field, &g.islands.detail] {
+        for field in [&g.caves.field, &g.islands.detail, &g.overhangs] {
             for (wx, wz) in [(0, 0), (13, -27), (-1000, 999), (300_000_000, -299_999_777)] {
                 for y_lo in [-2000, -64, 96, 999_999_966] {
                     let y_hi = y_lo + CHUNK_SIZE as i32 - 1;
@@ -1537,6 +1900,20 @@ mod tests {
         // A sub-interval straddling only the trough side stays tight.
         let (mn2, mx2) = s.image(0.35, 0.65);
         assert!(mn2 <= -0.69 && mx2 <= 0.21, "sub-interval image [{mn2},{mx2}]");
+    }
+
+    #[test]
+    fn lod_column_matches_lod_block_at() {
+        let g = terrain(42);
+        let columns = [(0, 0), (13, -27), (-8, -56), (100, -80 * 16 + 8)];
+        let ys: Vec<i32> = (0..64).map(|j| j * 4 + 2).collect();
+        let mut out = vec![AIR; ys.len()];
+        for &(wx, wz) in &columns {
+            g.lod_column(wx, wz, &ys, &mut out);
+            for (i, &wy) in ys.iter().enumerate() {
+                assert_eq!(out[i], g.lod_block_at(wx, wy, wz), "lod ({wx},{wy},{wz})");
+            }
+        }
     }
 
     #[test]
@@ -1653,8 +2030,8 @@ mod tests {
 
     #[test]
     fn surface_chunk_fill_matches_per_cell() {
-        // The chunk fast path must agree with the per-cell block_at, cell for
-        // cell, across surface chunks (crust, carve, overhangs, water).
+        // The chunk fast path (banded run fill) must agree with the per-cell
+        // block_at, cell for cell, across surface chunks (crust, carve, overhangs, water).
         let g = terrain(5);
         for (cx, cy, cz) in [(0, 1, 0), (3, 1, -2), (-5, 2, 4), (7, 1, 9)] {
             let chunk = Chunk::new(cx, cy, cz, &g);
@@ -2049,5 +2426,57 @@ mod tests {
             }
         }
         assert!(found > 0, "deep caverns must actually glow (scanned {scanned} cells)");
+    }
+
+    fn chunk_data_bytes(data: &ChunkData) -> Vec<u8> {
+        match data {
+            ChunkData::Uniform(id) => {
+                let mut b = vec![0u8];
+                b.extend_from_slice(&id.0.to_le_bytes());
+                b
+            }
+            ChunkData::Paletted { palette, cells } => {
+                let mut b = vec![1u8];
+                b.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+                for p in palette {
+                    b.extend_from_slice(&p.0.to_le_bytes());
+                }
+                b.extend_from_slice(&cells[..]);
+                b
+            }
+            ChunkData::Dense(cells) => {
+                let mut b = vec![2u8];
+                for id in cells.iter() {
+                    b.extend_from_slice(&id.0.to_le_bytes());
+                }
+                b
+            }
+        }
+    }
+
+    /// Pin `fnv1a_32` over eight fixed seed-42 chunks. Values locked before the
+    /// reuse pass; a mismatch means generated `ChunkData` bytes moved.
+    #[test]
+    fn chunk_byte_pin() {
+        use crate::hash::fnv1a_32;
+        let g = terrain(42);
+        // surface, deep, cave, island band, beach, snow crust, two far coords.
+        let pins: [(&str, i32, i32, i32, u32); 8] = [
+            ("surface", 0, 1, 0, 0xb25ac3be),
+            ("deep", 0, -20, 0, 0x24ae7d4e),
+            ("cave", 0, -3, 0, 0x148fc284),
+            ("island", -1, 9, -4, 0x2c77460e),
+            ("beach", 4, 0, -7, 0x1d670c00),
+            ("crust", 55, 1, -80, 0xe09b8252),
+            ("far_a", 6_250_000, 0, 0, 0x4b4d2cf9),
+            ("far_b", -6_250_000, -2, 3, 0xefed0476),
+        ];
+        for (name, cx, cy, cz, want) in pins {
+            assert_eq!(
+                fnv1a_32(&chunk_data_bytes(&g.generate(cx, cy, cz))),
+                want,
+                "{name} ({cx},{cy},{cz})"
+            );
+        }
     }
 }

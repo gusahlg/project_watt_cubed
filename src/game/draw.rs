@@ -74,6 +74,19 @@ struct StaticFrame {
     clear: voxel_engine::LinearRgb,
 }
 
+fn hud_label(
+    f: &mut voxel_engine::Frame,
+    theme: &crate::ui::Theme,
+    screen: (i32, i32),
+    at: Anchor,
+    off: (i32, i32),
+    base_fs: i32,
+    color: Color,
+    text: &str,
+) {
+    ui::label(f, theme, screen, at, off, base_fs, color, text);
+}
+
 impl Game {
     /// Render the world and HUD.
     ///
@@ -333,7 +346,7 @@ impl Game {
                     Gait::new(self.local_gait as f32, speed),
                 );
                 let rig = self.local_anim.step(&rp, *dt);
-                Pose::resolve(&rp, &rig).draw(&mut f3, peer_color(&self.save_name), true);
+                Pose::resolve(&rp, &rig).draw(&mut f3, self.local_color, true);
             }
         }
     }
@@ -388,44 +401,29 @@ impl Game {
 
         // Informational HUD text: coords, help, FPS, player count. Full mode
         // only — read from the `Game`-side caches `refresh_hud_text` maintains.
-        if theme.hud.shows_info() {
+        // Loading covers Full and Minimal (not Off) until the spawn slab lands.
+        if !self.world.spawn_ready() && theme.hud.shows_world_ui() {
+            ui::label(
+                f,
+                theme,
+                screen,
+                Anchor::Top,
+                (0, 12),
+                26,
+                ui::Role::Primary.color(),
+                "Loading terrain…",
+            );
+        } else if theme.hud.shows_info() {
             if let Some(coord_text) = self.drawing.coord_cache.get() {
-                ui::label(
-                    f,
-                    theme,
-                    screen,
-                    Anchor::Top,
-                    (0, 12),
-                    26,
-                    ui::Role::Primary.color(),
-                    coord_text,
-                );
+                hud_label(f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), coord_text);
             }
             if let Some(fps_text) = self.drawing.fps_cache.get() {
-                ui::label(
-                    f,
-                    theme,
-                    screen,
-                    Anchor::TopLeft,
-                    (10, 12),
-                    20,
-                    ui::Role::Positive.color(),
-                    fps_text,
-                );
+                hud_label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
             }
             if self.net.is_some()
                 && let Some(online_text) = self.drawing.online_cache.get()
             {
-                ui::label(
-                    f,
-                    theme,
-                    screen,
-                    Anchor::TopRight,
-                    (-12, 180),
-                    20,
-                    ui::Role::Positive.color(),
-                    online_text,
-                );
+                hud_label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
             }
         }
 
@@ -434,8 +432,9 @@ impl Game {
         // Gameplay UI, so it follows the reticle: hidden only when HUD is Off
         // or the mod-HUD lane itself is disabled.
         if self.mod_hud && theme.hud.shows_mod_hud() {
-            let hud = mods.hud(&self.world, screen);
-            ui::render_hud(f, theme, screen, &hud);
+            self.hud_scratch.clear();
+            mods.hud(&self.world, &self.player, screen, &mut self.hud_scratch);
+            ui::render_hud(f, theme, screen, &self.hud_scratch);
         }
         // Minimal keeps the world readable: no closed-console scrollback.
         if matches!(theme.hud, HudMode::Full) || self.console.is_open() {
@@ -552,7 +551,7 @@ fn tag_visibility(
 
 /// A stable, cheerful colour for a player, hashed from their name so the same player
 /// keeps the same tint across clients.
-fn peer_color(name: &str) -> Color {
+pub(super) fn peer_color(name: &str) -> Color {
     const PALETTE: [Color; 6] = [
         Color::new(230, 90, 90, 255),
         Color::new(90, 170, 230, 255),

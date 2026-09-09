@@ -9,6 +9,7 @@
 //! - [`world`] — the infinite streamed chunk field, terrain generation, collision,
 //!   and rendering.
 //! - [`player`] — player state and the camera derived from it.
+//! - [`stash`] — the elements a player carries (core-owned; mods present it).
 //! - [`input`] — keyboard movement and mouse look.
 //! - [`interact`] — the aim raycast that turns looking into breaking blocks.
 //! - [`console`] — the in-game console / chat line and its text input.
@@ -16,6 +17,7 @@
 //! - [`menu`] — the start menu and mod menu screens.
 //! - [`mods`] — the runtime-toggleable mod system and the default inventory mod.
 //! - [`net`] — multiplayer: the authoritative server and the client connection.
+//! - [`paths`] — data/config roots (worlds, settings, session, mod choices).
 //! - [`save`] — saving and loading worlds.
 //! - [`settings`] — persistent graphics settings (settings menu + `/gfx`).
 //! - [`sim`] — the fixed-timestep seam for registered simulation systems.
@@ -46,6 +48,7 @@ pub mod menu;
 pub mod minimap;
 pub mod mods;
 pub mod net;
+pub mod paths;
 pub mod player;
 pub mod presence;
 pub mod render;
@@ -56,5 +59,6 @@ pub mod session;
 pub mod settings;
 pub mod sim;
 pub mod sky;
+pub mod stash;
 pub mod ui;
 pub mod world;

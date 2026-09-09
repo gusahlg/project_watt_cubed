@@ -11,6 +11,7 @@ use voxel_engine::DVec3;
 
 use crate::block::Composition;
 use crate::math::{WORLD_BORDER, block_coord};
+use crate::mods::{annotate_setting, VisualMask};
 use crate::player::Player;
 use crate::settings::{SETTINGS, Settings};
 use crate::sky::{DayLength, Sky};
@@ -25,18 +26,58 @@ fn rejected(lines: Vec<String>) -> Vec<Line> {
     lines.into_iter().map(|l| Line::of(Role::Danger, l)).collect()
 }
 
-/// The primary command names, in the order `help` lists them. This is the single
-/// source of truth for Tab-completion (see [`crate::console`]); aliases like
-/// `teleport` are intentionally omitted so completion offers the canonical name.
-pub const COMMAND_NAMES: &[&str] = &[
-    "tp", "pos", "inspect", "gfx", "time", "walkspeed", "flyspeed", "mute", "deafen", "audio",
-    "voicetest", "help",
-];
+macro_rules! commands {
+    (
+        $cmd:ident, $args:ident, $player:ident, $world:ident, $settings:ident, $sky:ident, $visuals:ident;
+        $($canon:literal $(| $alias:literal)* , $help:literal => $body:expr);+ $(;)?
+    ) => {
+        /// The primary command names, in the order `help` lists them.
+        pub const COMMAND_NAMES: &[&str] = &[$($canon),+];
+
+        fn dispatch(
+            $cmd: &str,
+            $args: &[&str],
+            $player: &mut Player,
+            $world: &mut World,
+            $settings: &mut Settings,
+            $sky: &mut Sky,
+            $visuals: VisualMask,
+        ) -> Vec<Line> {
+            match $cmd {
+                $($canon $(| $alias)* => $body,)+
+                other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
+            }
+        }
+
+        fn help() -> Vec<Line> {
+            shown(vec![
+                "commands (a leading '/' is optional):".to_string(),
+                $($help.to_string(),)+
+            ])
+        }
+    };
+}
+
+commands! {
+    cmd, args, player, world, settings, sky, visuals;
+    "tp" | "teleport" | "setpos", "  tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
+    "pos" | "where", "  pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
+    "inspect" | "look", "  inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
+    "gfx" | "graphics", "  gfx [setting value]  show or change graphics settings" => gfx(args, settings, visuals);
+    "time", "  time [set|length]    show or set the day/night clock" => time(args, sky);
+    "walkspeed", "  walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
+    "flyspeed", "  flyspeed [n]         show or set flying speed" => flyspeed(args, player);
+    "mute", "  mute                 toggle master mute (this session)" => mute(settings);
+    "deafen", "  deafen               toggle hearing incoming voice" => deafen(settings);
+    "audio" | "volume", "  audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
+    "voicetest", "  voicetest            play a local voice test cue" => voicetest();
+    "help" | "?", "  help                 show this list" => help();
+}
 
 /// Run a console line against the game state, returning output lines for the log.
 ///
 /// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. The world
-/// is `&mut` for `tp` alone (it must prepare collision data at the destination);
+/// is `&mut` for `tp` alone (it requests the destination collision slab);
 /// read-only commands like `inspect` reborrow it shared.
 pub fn execute(
     line: &str,
@@ -45,6 +86,18 @@ pub fn execute(
     settings: &mut Settings,
     sky: &mut Sky,
 ) -> Vec<Line> {
+    execute_with_visuals(line, player, world, settings, sky, VisualMask::default())
+}
+
+/// [`execute`] with the live visual-mod mask so `/gfx` reports effective lanes.
+pub fn execute_with_visuals(
+    line: &str,
+    player: &mut Player,
+    world: &mut World,
+    settings: &mut Settings,
+    sky: &mut Sky,
+    visuals: VisualMask,
+) -> Vec<Line> {
     let line = line.strip_prefix('/').unwrap_or(line);
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else {
@@ -52,21 +105,7 @@ pub fn execute(
     };
     let args: Vec<&str> = parts.collect();
 
-    match cmd {
-        "tp" | "teleport" | "setpos" => teleport(&args, player, world),
-        "pos" | "where" => shown(vec![format!("position: {}", fmt_pos(player.position))]),
-        "inspect" | "look" => inspect(&args, player, world),
-        "gfx" | "graphics" => gfx(&args, settings),
-        "time" => time(&args, sky),
-        "walkspeed" => walkspeed(&args, player),
-        "flyspeed" => flyspeed(&args, player),
-        "mute" => mute(settings),
-        "deafen" => deafen(settings),
-        "audio" | "volume" => audio(&args, settings),
-        "voicetest" => voicetest(),
-        "help" | "?" => help(),
-        other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
-    }
+    dispatch(cmd, &args, player, world, settings, sky, visuals)
 }
 
 /// `/time` — show or set the day/night clock, or change the cycle length.
@@ -133,9 +172,9 @@ fn clock_label(day: f64) -> String {
 /// reports the position actually landed on, clamp included.
 ///
 /// The discontinuity is transactional: collision data around the destination
-/// is generated synchronously BEFORE the player lands there, so the next
-/// physics step never runs against unloaded not-yet-generated air (falling
-/// through or embedding in terrain that streams in a moment later).
+/// is *requested* before the player lands there, and physics stays frozen
+/// until [`World::spawn_ready`] is true, so the next physics step never runs
+/// against unloaded air.
 fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
     if args.len() != 3 {
         return rejected(vec!["usage: tp <x> <y> <z>".to_string()]);
@@ -157,7 +196,7 @@ fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> 
 
 /// `gfx [setting value]` — show or change graphics settings at runtime.
 /// The caller applies the mutated [`Settings`] to the engine and persists it.
-fn gfx(args: &[&str], settings: &mut Settings) -> Vec<Line> {
+fn gfx(args: &[&str], settings: &mut Settings, visuals: VisualMask) -> Vec<Line> {
     let usage = || {
         std::iter::once("usage: gfx <setting> <value>".to_string())
             .chain(SETTINGS.iter().map(|field| format!("  gfx {}", field.usage())))
@@ -165,9 +204,21 @@ fn gfx(args: &[&str], settings: &mut Settings) -> Vec<Line> {
     };
 
     match args {
-        [] => shown(SETTINGS.iter().map(|field| field.confirm(settings)).collect()),
+        [] => shown(
+            SETTINGS
+                .iter()
+                .map(|field| annotate_setting(field.confirm(settings), field.key(), visuals))
+                .collect(),
+        ),
         [key, value] => match gfx_set(settings, key, value) {
-            Some(msg) => shown(vec![msg]),
+            Some(msg) => {
+                let field_key = SETTINGS
+                    .iter()
+                    .find(|f| f.matches(key))
+                    .map(|f| f.key())
+                    .unwrap_or(*key);
+                shown(vec![annotate_setting(msg, field_key, visuals)])
+            }
             None => rejected(usage()),
         },
         _ => rejected(usage()),
@@ -335,24 +386,6 @@ fn describe_composition(world: &World, composition: &Composition) -> String {
     }
 }
 
-fn help() -> Vec<Line> {
-    shown(vec![
-        "commands (a leading '/' is optional):".to_string(),
-        "  tp <x> <y> <z>       teleport to coordinates".to_string(),
-        "  pos                  show current coordinates".to_string(),
-        "  inspect [x y z]      describe a block's elements & properties".to_string(),
-        "  gfx [setting value]  show or change graphics settings".to_string(),
-        "  time [set|length]    show or set the day/night clock".to_string(),
-        "  walkspeed [n]        show or set ground walk speed".to_string(),
-        "  flyspeed [n]         show or set flying speed".to_string(),
-        "  mute                 toggle master mute (this session)".to_string(),
-        "  deafen               toggle hearing incoming voice".to_string(),
-        "  audio <chan> <0-100> set master/effects/voice volume".to_string(),
-        "  voicetest            play a local voice test cue".to_string(),
-        "  help                 show this list".to_string(),
-    ])
-}
-
 /// Format a position the same way the on-screen coordinate readout does.
 fn fmt_pos(p: DVec3) -> String {
     format!("X {:.1}  Y {:.1}  Z {:.1}", p.x, p.y, p.z)
@@ -361,6 +394,8 @@ fn fmt_pos(p: DVec3) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mods::forced_off_marker;
+    use crate::render_config::VrsChoice;
 
     fn player() -> Player {
         Player::new(DVec3::new(0.0, 0.0, 0.0))
@@ -380,6 +415,26 @@ mod tests {
     /// All the lines' text joined — for asserting on multi-line output.
     fn joined(lines: &[Line]) -> String {
         lines.iter().map(Line::text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn help_text_is_stable() {
+        assert_eq!(
+            joined(&help()),
+            "commands (a leading '/' is optional):\n  \
+             tp <x> <y> <z>       teleport to coordinates\n  \
+             pos                  show current coordinates\n  \
+             inspect [x y z]      describe a block's elements & properties\n  \
+             gfx [setting value]  show or change graphics settings\n  \
+             time [set|length]    show or set the day/night clock\n  \
+             walkspeed [n]        show or set ground walk speed\n  \
+             flyspeed [n]         show or set flying speed\n  \
+             mute                 toggle master mute (this session)\n  \
+             deafen               toggle hearing incoming voice\n  \
+             audio <chan> <0-100> set master/effects/voice volume\n  \
+             voicetest            play a local voice test cue\n  \
+             help                 show this list"
+        );
     }
 
     #[test]
@@ -420,8 +475,13 @@ mod tests {
         let (x, z) = (5_000, 5_000);
         let surface = w.surface_y(x, z);
         run(&format!("tp {x} {} {z}", surface + 2), &mut p, &mut w);
+        assert!(
+            !w.spawn_ready(),
+            "a far teleport must wait on the async spawn slab"
+        );
+        w.drive_spawn_ready();
         // `is_solid` reads AIR for unloaded chunks, so this proves the ground
-        // cell (rock or seabed) was actually generated by the teleport.
+        // cell (rock or seabed) landed before physics would resume.
         assert!(
             w.is_solid(x, surface, z),
             "the destination's ground must be loaded before physics resumes"
@@ -488,11 +548,60 @@ mod tests {
         assert!(s.fullscreen);
         execute("gfx lighting off", &mut p, &mut w, &mut s, &mut sky);
         assert!(!s.lighting);
+        execute("gfx vrs on", &mut p, &mut w, &mut s, &mut sky);
+        assert_eq!(s.vrs, VrsChoice::On);
+        execute("gfx vrs auto", &mut p, &mut w, &mut s, &mut sky);
+        assert_eq!(s.vrs, VrsChoice::Auto);
         let out = execute("gfx", &mut p, &mut w, &mut s, &mut sky);
         let text = joined(&out);
         assert!(text.contains("fullscreen on"));
         assert!(text.contains("lighting off"));
+        assert!(text.contains("vrs auto"));
         assert!(text.contains("ui scale"));
+    }
+
+    #[test]
+    fn gfx_lists_default_auto_render_scale() {
+        let (mut p, mut w) = (player(), world());
+        let mut s = Settings::default();
+        let mut sky = Sky::new();
+        s.note_render_extent(1920, 1080, 1.0);
+        let text = joined(&execute("gfx", &mut p, &mut w, &mut s, &mut sky));
+        assert!(
+            text.contains(&format!(
+                "render scale Auto ({:.1})",
+                crate::settings::DEFAULT_AUTO_RENDER_SCALE
+            )),
+            "Default /gfx prints the effective Auto scale: {text}"
+        );
+    }
+
+    #[test]
+    fn gfx_lists_effective_visual_lanes_when_a_mod_strips_them() {
+        let (mut p, mut w) = (player(), world());
+        let mut s = Settings::default();
+        let mut sky = Sky::new();
+        let mask = VisualMask {
+            atmosphere: true,
+            post: false,
+            lighting: true,
+        };
+        let out = execute_with_visuals("gfx", &mut p, &mut w, &mut s, &mut sky, mask);
+        let text = joined(&out);
+        assert!(
+            text.contains(&format!("bloom on {}", forced_off_marker("Post"))),
+            "effective /gfx must name the stripping mod: {text}"
+        );
+        assert!(
+            !text.contains("shadows on (off:"),
+            "Lighting is still enabled: {text}"
+        );
+        let set = execute_with_visuals("gfx bloom off", &mut p, &mut w, &mut s, &mut sky, mask);
+        assert!(
+            joined(&set).contains(&format!("bloom off {}", forced_off_marker("Post"))),
+            "a set confirmation must also show the strip: {}",
+            joined(&set)
+        );
     }
 
     #[test]

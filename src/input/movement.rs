@@ -108,8 +108,9 @@ impl MoveInput {
 }
 
 /// Advance the player by one frame: build a movement delta from input + physics,
-/// then apply it with per-axis collision resolution.
-pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: f32) {
+/// then apply it with per-axis collision resolution. Returns landing trauma in
+/// `[0, 1]` (zero when the player did not land this tick).
+pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: f32) -> f32 {
     // The one f32 -> f64 physics boundary (see the module docs).
     let dt = dt as f64;
 
@@ -173,7 +174,7 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
         }
     };
 
-    move_with_collision(player, world, delta);
+    move_with_collision(player, world, delta)
 }
 
 /// The buoyancy the player is immersed in this frame, sampled at the feet and the
@@ -293,7 +294,7 @@ fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
 /// [`step_axis`]) so a fast fall stops at the first solid cell it crosses
 /// instead of tunneling past thin terrain; a blocked axis leaves the position
 /// at the last collision-free substep.
-fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
+fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 {
     let mut pos = player.position;
     let stance = player.stance;
     // Noclip flight skips the solidity test (but not the world-border clamp) so
@@ -326,10 +327,17 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
             if blocked_z {
                 velocity.z = 0.0;
             }
-            *on_ground = blocked_y && delta.y < 0.0;
+            let landed = blocked_y && delta.y < 0.0;
+            let trauma = if landed {
+                ((-velocity.y) / (-TERMINAL_VELOCITY)) as f32
+            } else {
+                0.0
+            };
+            *on_ground = landed;
             if blocked_y {
                 velocity.y = 0.0;
             }
+            return trauma.min(1.0);
         }
         // Swimming has no ground contact; a blocked axis just spends its velocity,
         // like flying into a wall.
@@ -345,6 +353,7 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) {
             }
         }
     }
+    0.0
 }
 
 /// Move `pos` along one `axis` (0 = x, 1 = y, 2 = z) by `delta`, clamping to
@@ -441,7 +450,7 @@ mod tests {
     /// geometry the walker can touch.
     fn player_on_runway(world: &mut World, x: f64, z: f64) -> Player {
         let floor_y = 40;
-        world.prepare_around(DVec3::new(x, floor_y as f64, z));
+        world.ensure_around(DVec3::new(x, floor_y as f64, z));
         let stone = world.registry().id_by_name("Stone").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
         for dx in -2..=14 {
@@ -524,7 +533,7 @@ mod tests {
         let mut world = World::generate();
         let (x, z) = (0.5, 0.5);
         let floor_y = 40; // above the hills, below the island band: open air
-        world.prepare_around(DVec3::new(x, floor_y as f64, z));
+        world.ensure_around(DVec3::new(x, floor_y as f64, z));
         let stone = world.registry().id_by_name("Stone").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
 

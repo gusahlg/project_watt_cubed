@@ -128,6 +128,15 @@ impl HeightMip {
         }
     }
 
+    pub(in crate::world) fn allocated_bytes(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|lvl| {
+                std::mem::size_of::<MipLevel>() + std::mem::size_of_val(lvl.cells.as_slice())
+            })
+            .sum()
+    }
+
     /// The palette-average colour of a baked cell, if inside the extent; `None` beyond the bake.
     pub fn color(&self, cell: SectionPos) -> Option<Color> {
         self.cell(cell).map(|c| c.color)
@@ -154,6 +163,7 @@ impl HeightMip {
     /// blocker's floor (`lo` height) intersects the line-of-sight. Reads blockers at
     /// the coarsest level (widest coverage), so error favors under-culling (safe but misses
     /// some occlusion). Finer-level blocking is possible future refinement.
+    #[allow(dead_code)] // draw-time occlusion culling, not yet wired to the renderer
     pub fn occludes(&self, eye: DVec3, cell: SectionPos) -> bool {
         let Some(target) = self.cell(cell) else { return false }; // unbaked, can't prove occlusion
         let span = cell.span() as f64;
@@ -175,10 +185,8 @@ impl HeightMip {
             let t = i as f64 / steps as f64;
             let (sx, sz) = (eye.x + dx * t, eye.z + dz * t);
             let y = eye.y + (top - eye.y) * t;
-            if let Some(lo) = self.coarse_lo(sx, sz) {
-                if lo as f64 >= y {
-                    return true;
-                }
+            if let Some(lo) = self.coarse_lo(sx, sz) && lo as f64 >= y {
+                return true;
             }
         }
         false
@@ -204,6 +212,7 @@ const COLOR_STRIDE: i32 = 4;
 
 /// Build one level over its grid. Cells with all four children take min/max from them;
 /// cells without full coverage are sampled from the generator and merged with any existing children.
+#[allow(clippy::too_many_arguments)] // mip level build takes grid bounds and optional child separately
 fn build_level<G: TerrainGenerator + ?Sized>(
     terra: &G,
     colors: &[Color],
@@ -390,7 +399,7 @@ mod tests {
         let cs = 16usize;
         let idx = |x: usize, y: usize, z: usize| x + z * cs + y * cs * cs;
         let stone = reg.id_by_name("Stone").unwrap();
-        let edits = vec![
+        let edits = [
             (crate::coord::ChunkCoord::new(0, 5, 0), vec![(idx(2, 6, 2), stone), (idx(3, 1, 5), crate::block::registry::AIR)]),
             (crate::coord::ChunkCoord::new(1, 8, 1), vec![(idx(9, 9, 9), stone)]),
         ];
@@ -551,7 +560,7 @@ mod tests {
     /// A wall between eye and target occludes the target.
     #[test]
     fn occlude_wall_hides_cell_behind() {
-        let span = section_span(OD) as i32;
+        let span = section_span(OD);
         // Wall at grid x==4 rises to 100; everything else is ground level 0.
         let mip = hand_mip(OD, 0, -4, 12, 8, |x, _| if x == 4 { (100.0, 100.0) } else { (0.0, 0.0) });
         let behind = SectionPos { detail: OD, x: 8, z: 0 };
@@ -563,7 +572,7 @@ mod tests {
     /// A cell whose top clears all blockers is never culled (no holes).
     #[test]
     fn occlude_no_false_positive_when_top_clears_ridge() {
-        let span = section_span(OD) as i32;
+        let span = section_span(OD);
         // Ridge floor 100 at x==4; a tall target at x==8 reaching 200.
         let mip = hand_mip(OD, 0, -4, 12, 8, |x, _| match x {
             4 => (100.0, 100.0),

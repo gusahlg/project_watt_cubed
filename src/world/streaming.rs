@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use voxel_engine::producer::Progress;
+use voxel_engine::producer::{Budget, Progress};
 use voxel_engine::{DVec3, Engine, FadeStyle};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
@@ -12,6 +12,7 @@ use crate::derived::Revision;
 use crate::math::block_coord;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
+use super::generation::ColumnHeights;
 use super::heightmip::{BakeExtent, HeightMip};
 use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
@@ -29,7 +30,7 @@ use super::{
 fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
     voxel_engine::MeshPlacement::terrain(
         voxel_engine::IVec3::new(coord.x, coord.y, coord.z) * CHUNK_SIZE as i32,
-        voxel_engine::Detail::FULL,
+        crate::ident::Detail::FULL,
     )
 }
 
@@ -73,10 +74,6 @@ pub(in crate::world) fn edits_in_footprint(
         .collect()
 }
 
-/// Screen-space-error gain at 90° fov and 1080-line viewport.
-/// Currently used only for documentation; `coarse_ok` cancels it out.
-const SSE_K: f32 = 1080.0 / 2.0; // tan(45°) = 1
-
 /// Velocity prediction horizon: pre-loads sections ahead of eye motion so they're
 /// ready by the time the eye reaches them. Conservative; tuning it larger preloads more
 /// (safer for fast motion, low cost) but never shrinks the view.
@@ -108,6 +105,22 @@ const MIN_STREAM_EFFORT: f32 = 0.15;
 /// damped so the first stationary frame cannot release a catch-up avalanche.
 const STREAM_RECOVERY_SECS: f64 = 0.75;
 
+/// Last topology pass cheaper than this: leftover light/mesh work at rest may
+/// run at full worker/admission capacity. Half a 60 Hz frame — the post-flight
+/// frames on this branch sit well below it, while an already-expensive pass
+/// keeps travel shedding.
+const STREAM_HEADROOM_SECS: f64 = 0.008;
+
+/// Hysteresis: once rest-boosted, stay boosted until a pass exceeds this so a
+/// slightly heavier first stationary admit cannot immediately re-shed.
+const STREAM_HEADROOM_EXIT_SECS: f64 = 0.014;
+
+/// Near-queue cap at rest when leftover light/mesh work remains. Travel keeps
+/// `active * 4` because queued jobs go stale; at rest they will still be wanted,
+/// and cheap light jobs otherwise idle the pool for the rest of a 16 ms frame.
+/// Same order as [`pipeline::FAR_QUEUE_CAP`].
+const NEAR_REST_QUEUE_CAP: usize = 256;
+
 /// A real mesh upload always makes progress even when the scaled byte budget is
 /// tiny. Most chunks fit below this; an unusually large first mesh is allowed
 /// to overrun it once, just as it may overrun the normal byte budget once.
@@ -121,11 +134,14 @@ const RESULT_INTEGRATE_FLOOR: usize = 8;
 /// Velocity-aware streaming load controller. `effort` is the one normalized
 /// signal shared by worker concurrency, queue lookahead, admission deadlines,
 /// result integration, and GPU uploads, so those stages cannot fight each
-/// other by independently trying to catch up.
+/// other by independently trying to catch up. `boost` is the rest-time override:
+/// leftover light/mesh work on a frame with headroom runs at full capacity so
+/// the travel floor cannot idle the pool while tens of thousands of jobs wait.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::world) struct StreamPacer {
     speed_mps: f64,
     effort: f32,
+    boost: bool,
 }
 
 impl Default for StreamPacer {
@@ -133,6 +149,7 @@ impl Default for StreamPacer {
         Self {
             speed_mps: 0.0,
             effort: 1.0,
+            boost: false,
         }
     }
 }
@@ -168,6 +185,32 @@ impl StreamPacer {
         }
     }
 
+    /// Rest-time override: full workers and admission while light/mesh work
+    /// remains, the eye is at or below walking speed, and the last topology
+    /// pass had frame-time headroom. Travel still sheds — boosting during
+    /// flight would spend the frame-time win on stale work.
+    fn set_boost(&mut self, queued_near: bool, last_stream_secs: f64) {
+        let at_rest = self.speed_mps <= FULL_EFFORT_SPEED_MPS;
+        if !queued_near || !at_rest {
+            self.boost = false;
+            return;
+        }
+        if self.boost {
+            self.boost = last_stream_secs < STREAM_HEADROOM_EXIT_SECS;
+        } else {
+            self.boost = last_stream_secs < STREAM_HEADROOM_SECS;
+        }
+    }
+
+    pub(in crate::world) fn boosting(self) -> bool {
+        self.boost
+    }
+
+    /// Effort applied to workers, admission, drain, and uploads this pass.
+    fn applied_effort(self) -> f32 {
+        if self.boost { 1.0 } else { self.effort }
+    }
+
     pub(in crate::world) fn effort(self) -> f32 {
         self.effort
     }
@@ -177,24 +220,36 @@ impl StreamPacer {
     }
 
     pub(in crate::world) fn duration(self, base: Duration) -> Duration {
-        base.mul_f32(self.effort)
+        base.mul_f32(self.applied_effort())
     }
 
     pub(in crate::world) fn floor(self, base: usize) -> usize {
-        ((base as f32 * self.effort).ceil() as usize).clamp(1, base.max(1))
+        ((base as f32 * self.applied_effort()).ceil() as usize).clamp(1, base.max(1))
     }
 
     fn upload_bytes(self) -> usize {
-        ((UPLOAD_BUDGET_BYTES as f32 * self.effort) as usize).max(MIN_UPLOAD_BUDGET_BYTES)
+        ((UPLOAD_BUDGET_BYTES as f32 * self.applied_effort()) as usize).max(MIN_UPLOAD_BUDGET_BYTES)
     }
 
     fn section_uploads(self) -> usize {
-        ((SECTION_UPLOAD_BUDGET as f32 * self.effort).round() as usize)
+        ((SECTION_UPLOAD_BUDGET as f32 * self.applied_effort()).round() as usize)
             .clamp(1, SECTION_UPLOAD_BUDGET)
     }
 
     fn active_workers(self, capacity: usize) -> usize {
-        ((capacity as f32 * self.effort).ceil() as usize).clamp(1, capacity.max(1))
+        ((capacity as f32 * self.applied_effort()).ceil() as usize).clamp(1, capacity.max(1))
+    }
+
+    /// Near-queue lookahead. Travel keeps a short cap so queued jobs do not go
+    /// stale; at rest the deeper cap keeps cheap light jobs from idling the pool.
+    fn near_queue_cap(self, capacity: usize) -> usize {
+        let active = self.active_workers(capacity);
+        let travel = (active * 4).max(8);
+        if self.boost {
+            travel.max(NEAR_REST_QUEUE_CAP)
+        } else {
+            travel
+        }
     }
 }
 
@@ -211,8 +266,8 @@ const LIGHT_WAIT_DEGRADE: Duration = Duration::from_millis(150);
 /// `degraded`: set of chunks currently drawing a degraded mesh, owed a remesh.
 #[derive(Default)]
 pub(in crate::world) struct LightGate {
-    blocked_since: FastMap<Coord, Instant>,
-    degraded: FastSet<Coord>,
+    pub(in crate::world) blocked_since: FastMap<Coord, Instant>,
+    pub(in crate::world) degraded: FastSet<Coord>,
 }
 
 impl LightGate {
@@ -267,6 +322,18 @@ enum ClaimOutcome {
 /// [`super::StreamLane::MIN_ADMIT`] plays for the per-chunk lanes).
 const GEN_MIN_ADMIT: usize = 8;
 
+fn column_order(center: Coord, vel: DVec3, cx: i32, cz: i32) -> u64 {
+    let dx = cx - center.x;
+    let dz = cz - center.z;
+    let ring = dx.abs().max(dz.abs()) as u64;
+    super::motion_biased_dist2(
+        ring.saturating_mul(ring).saturating_mul(1024),
+        vel,
+        f64::from(dx) * CHUNK_SIZE as f64,
+        f64::from(dz) * CHUNK_SIZE as f64,
+    )
+}
+
 impl World {
     /// The mesh box: chunks meshed and drawn around `center`.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
@@ -306,7 +373,9 @@ impl World {
         // Palette growth re-uploads the block texture array before any upload
         // this frame references a new layer.
         self.refresh_textures(eng);
-        {
+        // Idle: no claim can produce a `Done`, so skip try_recv and the
+        // deadline Instant. Dirty-remesh and lod-clip stay (flag checks).
+        if self.anything_in_flight() {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
             let drain_lane = self.lanes().drain;
             sched.run_manual(drain_lane, self, Some(&mut *eng));
@@ -361,6 +430,12 @@ impl World {
         };
         self.section_vel = section_vel;
         self.stream_pacer.update(pacing_vel, sample_dt);
+        let queued_near = !self.light_worklist.is_empty()
+            || !self.mesh_worklist.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.light_apply_queue.is_empty();
+        self.stream_pacer.set_boost(queued_near, self.last_stream_secs);
+        self.light_admitted_last = 0;
         self.section_eye_prev = center.is_finite().then_some((center, now));
         let s = CHUNK_SIZE as i32;
         let center_chunk = ChunkCoord::new(
@@ -395,7 +470,11 @@ impl World {
             velocity.x,
             velocity.z,
         );
-        workers.set_active_workers(pacer.active_workers(workers.worker_capacity()));
+        let capacity = workers.worker_capacity();
+        workers.set_pacing(
+            pacer.active_workers(capacity),
+            pacer.near_queue_cap(capacity),
+        );
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
         // The ring geometry is centred on the eye: a boundary cross SHIFTS the
@@ -410,16 +489,17 @@ impl World {
         // Textures, worker results, and edit remeshes land through the ONE
         // owner of that trio — after the centre update above, so a
         // boundary-cross frame's results drain against the live centre, not
-        // the one they'd be discarded by. (When the game already pumped this
-        // frame, these self-gate down to flag checks.)
+        // the one they'd be discarded by. `stream_phase` pumps only on frames
+        // the topology pass does not run; this is the pump on stream-due frames.
         self.pump(eng, sched);
         if full_pass {
             self.unload_far(center_chunk, eng);
             // Stale queued uploads (the trailing edge of fast movement) release
             // in ONE pass here instead of trickling through the drain budget.
             self.prune_upload_queue();
-            // Centre chunk synchronously for collision safety before async catches
-            // up; the rest of the data box is armed for the budgeted generate lane.
+            // Sync-generate the centre only when it is missing and not already
+            // claimed: a claimed job is imminent and the previous centre's
+            // collision halo still exists.
             self.ensure_data(center_chunk);
             self.pending_gen.set();
             // Mesh box moved: re-seed loaded NeedsMesh chunks that JUST
@@ -530,7 +610,7 @@ impl World {
             // ALL light work is quiescent, any chunk still degraded is owed a
             // remesh that no future light-arrival event will ever deliver (its
             // missing neighbour is already terminal). Promote it to final now.
-            self.flush_degraded_terminal(eng);
+            self.flush_degraded_terminal();
         }
         // LOD2 section far field: skipped entirely when disabled (zero cost). Visible
         // set rebuilt every pass because sections become Ready asynchronously.
@@ -610,6 +690,7 @@ impl World {
         self.refresh_lod_clip();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
+        self.last_stream_secs = now.elapsed().as_secs_f64();
     }
 
     /// Land finished worker results (non-blocking). Generate results clear
@@ -703,6 +784,7 @@ impl World {
             if let Some(state @ SectionState::Meshing { .. }) = self.sections.get_mut(&pos)
                 && matches!(state, SectionState::Meshing { token: t } if *t == token)
             {
+                super::adjust_count(&mut self.meshing_sections, true, false);
                 *state = SectionState::from_upload(pos, meshes, eng);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
@@ -727,7 +809,9 @@ impl World {
     fn integrate_worker_result(&mut self, result: pipeline::Done) {
         #[cfg(debug_assertions)]
         let light_audit = match &result {
-            pipeline::Done::Light { coord, epoch, .. } => Some((*coord, *epoch)),
+            pipeline::Done::Light { coord, epoch, light_gen, .. } => {
+                Some((*coord, *epoch, *light_gen))
+            }
             _ => None,
         };
         #[cfg(debug_assertions)]
@@ -738,7 +822,9 @@ impl World {
             _ => None,
         };
         match result {
-            pipeline::Done::Column { col, chunks } => self.accept_column(col, chunks),
+            pipeline::Done::Column { col, chunks, heights } => {
+                self.accept_column(col, chunks, heights)
+            }
             m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
             l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
             sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
@@ -752,9 +838,11 @@ impl World {
         // A consumed CURRENT-epoch light result must have released its claim
         // or transferred it into the apply queue.
         #[cfg(debug_assertions)]
-        if let Some((coord, epoch)) = light_audit {
+        if let Some((coord, epoch, light_gen)) = light_audit {
+            let live = self.chunks.get(&coord).map(|l| l.light_gen) == Some(light_gen);
             debug_assert!(
                 epoch != self.light_epoch
+                    || !live
                     || !self.light_inflight.contains(&coord)
                     || self.light_apply_queue.iter().any(|(c, _)| *c == coord),
                 "light Done for {coord:?} left its claim neither released nor transferred"
@@ -779,8 +867,7 @@ impl World {
 
     /// Generated chunk result: discard if out-of-range/already loaded; else store (replays edits).
     pub(in crate::world) fn accept_chunk(&mut self, coord: Coord, chunk: Chunk) {
-        let Some(center) = self.center else { return };
-        if !self.data_box(center).contains(coord) || self.chunks.contains_key(&coord) {
+        if !self.will_accept_chunk(coord) {
             return;
         }
         self.store_chunk(coord, chunk);
@@ -806,7 +893,9 @@ impl World {
     /// site, the pop-time re-validation, and the boundary-cross prune.
     fn drop_stale_upload(&mut self, coord: Coord) {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
-            loaded.state.release_build();
+            if loaded.state.release_build() {
+                super::adjust_count(&mut self.building_meshes, true, false);
+            }
         }
         self.pending_fresh.set();
         self.mesh_worklist.insert(coord);
@@ -848,7 +937,9 @@ impl World {
         let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
             loaded.retire(MeshState::from_upload(handles), eng);
+            super::adjust_count(&mut self.building_meshes, was, false);
             loaded.visible = vis;
             if !vis && let Some(meshes) = loaded.state.live_meshes() {
                 meshes.set_visible(eng, false);
@@ -865,27 +956,41 @@ impl World {
     /// stale claim as still-in-flight, the mesh lane skipped it as in-flight,
     /// and quiescence — degraded promotion, `entry_complete` — never came).
     ///
-    /// Epoch reasoning (what makes the unconditional release sound):
+    /// Epoch and generation reasoning (what makes the release sound):
     /// [`transition_lighting`](Self::transition_lighting) is the only
     /// `light_epoch` bump and it clears `light_inflight` in the same breath, so
     /// - a CURRENT-epoch result is the unique owner of any in-flight entry at
     ///   its coord (releasing can never steal a newer claim), while
     /// - a STALE-epoch result's claim was already wiped at the bump — an entry
     ///   present now belongs to a post-bump job and must not be touched.
+    /// `light_gen` is the per-`Loaded` stamp: unload then regenerate at the same
+    /// coord does not bump the epoch, so a current-epoch result for the *old*
+    /// resident must not publish onto the new voxels (and store skips trivial
+    /// settle while the old claim is still in flight, so this Done remains
+    /// that claim's unique owner).
     pub(in crate::world) fn accept_light(
         &mut self,
         coord: Coord,
         epoch: u32,
+        light_gen: u32,
         grid: light::LightGrid,
     ) {
         if epoch != self.light_epoch {
             return;
         }
-        if !self.lighting || !self.chunks.contains_key(&coord) {
-            // Unusable result — the chunk unloaded mid-flight (the common
-            // fast-flight case; `lighting` off with a matching epoch is
-            // unreachable today since the toggle bumps it, kept as a guard).
-            // Release the claim, drop the payload.
+        let live_gen = self.chunks.get(&coord).map(|l| l.light_gen);
+        if live_gen != Some(light_gen) {
+            // Unusable: unloaded, or a later Loaded at this coord. Release
+            // the leftover claim and re-seed the new resident so it can
+            // settle against its own voxels.
+            self.light_inflight.remove(&coord);
+            if live_gen.is_some() && self.lighting {
+                self.seed_light(coord);
+                self.light_pending.set();
+            }
+            return;
+        }
+        if !self.lighting {
             self.light_inflight.remove(&coord);
             return;
         }
@@ -913,86 +1018,83 @@ impl World {
     /// granularity means it keeps its own gather/claim rather than the per-chunk
     /// [`admit`](super::admit) loop, but the forward-progress floor + time budget
     /// are the one shared rule ([`admission_exhausted`](super::admission_exhausted)).
-    /// The centre chunk is generated synchronously in `stream` (collision safety);
-    /// `accept_column` lands these results. Leftover columns re-arm the gate.
+    /// The centre chunk is generated synchronously in `stream` only when it is
+    /// missing and not already claimed; `accept_column` lands these results.
+    /// Leftover columns re-arm the gate.
     pub(in crate::world) fn request_region_data(
         &mut self,
         center: Coord,
-        deadline: pipeline::Deadline,
+        budget: Budget,
     ) -> Progress {
         if !self.pending_gen.take() {
             return Progress::Idle;
         }
+        let deadline = super::lanes::paced_deadline(self, budget);
         let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
-        for coord in self.data_box(center).coords() {
+        let mut consider = |coord: Coord| {
             if self.chunks.contains_key(&coord)
                 || self.generating.contains(&coord)
                 || self.quarantined.contains(&FailKey::Column {
                     col: (coord.x, coord.z),
                 })
             {
-                continue;
+                return;
             }
             let entry = columns
                 .entry((coord.x, coord.z))
                 .or_insert((coord.y, coord.y));
             entry.0 = entry.0.min(coord.y);
             entry.1 = entry.1.max(coord.y);
+        };
+        for coord in self.data_box(center).coords() {
+            consider(coord);
+        }
+        if let Some(slab) = self.spawn_slab {
+            for coord in slab.coords() {
+                consider(coord);
+            }
         }
         if columns.is_empty() {
             return Progress::Idle;
         }
-        let mut cols: Vec<((i32, i32), (i32, i32))> = columns.into_iter().collect();
-        cols.sort_by_key(|&((cx, cz), _)| {
-            let dx = cx - center.x;
-            let dz = cz - center.z;
-            let ring = dx.abs().max(dz.abs()) as u64;
-            super::motion_biased_dist2(
-                ring.saturating_mul(ring).saturating_mul(1024),
-                self.section_vel,
-                f64::from(dx) * CHUNK_SIZE as f64,
-                f64::from(dz) * CHUNK_SIZE as f64,
-            )
-        });
-        let mut admitted = 0usize;
-        let mut remaining = 0usize;
-        let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
-        for ((cx, cz), (cy_lo, cy_hi)) in cols {
-            if super::admission_exhausted(admitted, min_admit, deadline) {
-                remaining += 1;
-                continue;
-            }
-            // Collect edits for the landing chunk to replay.
-            let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
-                ..=cy_hi)
-                .filter_map(|cy| {
-                    let coord = ChunkCoord::new(cx, cy, cz);
-                    self.edits
-                        .get(&coord)
-                        .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
-                })
-                .collect();
-            let job = pipeline::Job::GenerateColumn {
-                col: (cx, cz),
-                cy: cy_lo..=cy_hi,
-                generator: self.generator.clone(),
-                edits,
+        let slots = match self.workers.as_ref() {
+            Some(w) => w.near_slots_free(),
+            None => usize::MAX,
+        };
+        if slots == 0 {
+            self.pending_gen.set();
+            return Progress::Partial {
+                remaining: columns.len() as u32,
             };
-            let accepted = self.worker_pool().submit(job);
-            if accepted {
-                // Claim every missing coord in the span so it isn't re-requested.
-                for cy in cy_lo..=cy_hi {
-                    let coord = ChunkCoord::new(cx, cy, cz);
-                    if !self.chunks.contains_key(&coord) {
-                        self.generating.insert(coord);
-                    }
-                }
+        }
+        self.gen_columns.clear();
+        self.gen_columns
+            .extend(columns.into_iter().map(|((cx, cz), range)| {
+                (column_order(center, self.section_vel, cx, cz), (cx, cz), range)
+            }));
+        let n = self.gen_columns.len();
+        let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
+        let want = n.min(slots.max(min_admit));
+        if want < n {
+            self.gen_columns
+                .select_nth_unstable_by_key(want - 1, |e| e.0);
+            self.gen_columns[..want].sort_by_key(|e| e.0);
+        } else {
+            self.gen_columns.sort_by_key(|e| e.0);
+        }
+        let mut admitted = 0usize;
+        for i in 0..want {
+            if super::admission_exhausted(admitted, min_admit, deadline) {
+                break;
+            }
+            let ((cx, cz), (cy_lo, cy_hi)) = (self.gen_columns[i].1, self.gen_columns[i].2);
+            if self.try_submit_column(cx, cz, cy_lo, cy_hi) {
                 admitted += 1;
             } else {
-                // Pool shutting down: leave the rest for a later frame.
-                remaining += 1;
+                break;
             }
         }
+        let remaining = n - admitted;
         if remaining > 0 {
             self.pending_gen.set();
             Progress::Partial {
@@ -1003,17 +1105,41 @@ impl World {
         }
     }
 
-    /// Land a generated column: register each not-yet-loaded, in-range chunk
-    /// (edits already replayed on the worker) and clear its generate claim.
+    /// Land a generated column: install the skylight ceiling from the worker's
+    /// heights (plus any edited-roof raise) before storing, so `trivial_light`
+    /// hits the cache instead of sampling the generator on this thread.
     pub(in crate::world) fn accept_column(
         &mut self,
-        _col: (i32, i32),
+        col: (i32, i32),
         chunks: Vec<(Coord, Chunk)>,
+        heights: Box<ColumnHeights>,
     ) {
+        // Only cache when at least one chunk will actually land — an install
+        // with no `column_chunks` bump would leak in `ceilings` forever.
+        if chunks.iter().any(|(coord, _)| self.will_accept_chunk(*coord)) {
+            self.install_ceiling(col, &heights);
+        }
         for (coord, chunk) in chunks {
             self.generating.remove(&coord);
             self.accept_chunk(coord, chunk);
         }
+        self.refresh_spawn_slab();
+    }
+
+    /// `accept_chunk`'s store predicate: in the live data box or the requested
+    /// spawn slab, and not yet loaded.
+    fn will_accept_chunk(&self, coord: Coord) -> bool {
+        if self.chunks.contains_key(&coord) {
+            return false;
+        }
+        self.in_data_or_slab(coord)
+    }
+
+    fn in_data_or_slab(&self, coord: Coord) -> bool {
+        self.spawn_slab.is_some_and(|slab| slab.contains(coord))
+            || self
+                .center
+                .is_some_and(|center| self.data_box(center).contains(coord))
     }
 
     /// A queued job was DESCHEDULED at the pool: its region left the live view
@@ -1060,19 +1186,27 @@ impl World {
         };
         match key {
             pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                // A cancelled spawn-slab column must be re-requested even when
+                // the pool dropped it as out-of-view: physics is frozen on it.
+                let in_slab = self.spawn_slab.is_some_and(|slab| {
+                    cy.clone()
+                        .any(|y| slab.contains(Coord::new(cx, y, cz)))
+                });
                 for cyy in cy {
                     self.generating.remove(&Coord::new(cx, cyy, cz));
                 }
                 // Freed generate claims are otherwise only re-requested on a
                 // boundary cross; a retryable failure re-arms the lane so a
                 // standing-still player still converges.
-                if rearm {
+                if rearm || in_slab {
                     self.pending_gen.set();
                 }
             }
             pipeline::JobKey::Mesh { coord } => {
                 if let Some(loaded) = self.chunks.get_mut(&coord) {
-                    loaded.state.release_build();
+                    if loaded.state.release_build() {
+                        super::adjust_count(&mut self.building_meshes, true, false);
+                    }
                 }
                 if rearm {
                     self.mesh_worklist.insert(coord);
@@ -1083,7 +1217,7 @@ impl World {
                 self.light_inflight.remove(&coord);
                 if rearm {
                     // An unloaded chunk's seed is dropped by the lane's submit.
-                    self.light_worklist.insert(coord);
+                    self.seed_light(coord);
                     self.light_pending.set();
                 }
                 // Quarantined light: the chunk never settles, so the mesh
@@ -1098,6 +1232,7 @@ impl World {
                         Some(SectionState::Meshing { token: t }) if *t == token);
                 if held {
                     self.sections.remove(&pos);
+                    super::adjust_count(&mut self.meshing_sections, true, false);
                     self.section_cover_dirty.set();
                 }
                 if rearm {
@@ -1115,25 +1250,166 @@ impl World {
         }
     }
 
-    /// Sync-generate small box around spawn position (collision safety before async catches up).
+    /// Collision halo around an eye chunk: 3×3 columns, two layers below through two above.
+    fn collision_slab(center: Coord) -> ChunkBox {
+        ChunkBox::new(center, 1, 2)
+    }
+
+    /// Request the collision slab around `pos` from the worker pool. Does not
+    /// generate on this thread — [`spawn_ready`](Self::spawn_ready) is true
+    /// once every chunk of the box has loaded. Teleports and net snaps use
+    /// the same request (physics freezes until it lands).
     pub fn prepare_around(&mut self, pos: DVec3) {
         let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
-        for cx in (c.x - 1)..=(c.x + 1) {
-            for cz in (c.z - 1)..=(c.z + 1) {
-                for cy in (c.y - 2)..=(c.y + 1) {
-                    self.ensure_data(ChunkCoord::new(cx, cy, cz));
-                }
+        let slab = Self::collision_slab(c);
+        let far_m = f64::from(self.section_pyramid.outer_m());
+        let view_r = self.view.horizontal;
+        self.worker_pool()
+            .set_view(c.x, c.z, view_r, far_m, 0.0, 0.0);
+        self.submit_slab_columns(slab);
+        self.pending_gen.set();
+        if slab.coords().all(|coord| self.chunks.contains_key(&coord)) {
+            self.spawn_slab = None;
+        } else {
+            self.spawn_slab = Some(slab);
+        }
+    }
+
+    /// Synchronously generate the collision slab. Headless callers (tests,
+    /// anything that queries voxels before a stream pass).
+    pub fn ensure_around(&mut self, pos: DVec3) {
+        let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
+        for coord in Self::collision_slab(c).coords() {
+            self.ensure_data(coord);
+        }
+    }
+
+    /// True once every chunk of the requested spawn/teleport slab is loaded,
+    /// or no slab is outstanding.
+    pub fn spawn_ready(&self) -> bool {
+        match self.spawn_slab {
+            None => true,
+            Some(slab) => slab.coords().all(|c| self.chunks.contains_key(&c)),
+        }
+    }
+
+    /// Drive in-flight generate jobs until the spawn slab is loaded. Tests
+    /// only — the live path drains through [`stream`](Self::stream).
+    #[cfg(test)]
+    pub fn drive_spawn_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.spawn_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "spawn slab did not land: {}",
+                self.entry_debug()
+            );
+            if let Some(slab) = self.spawn_slab {
+                self.submit_slab_columns(slab);
+            }
+            let mut got = false;
+            while let Some(done) = self.workers.as_ref().and_then(pipeline::Workers::try_recv) {
+                self.integrate_worker_result(done);
+                got = true;
+            }
+            self.refresh_spawn_slab();
+            if !got {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
 
+    fn refresh_spawn_slab(&mut self) {
+        let Some(slab) = self.spawn_slab else {
+            return;
+        };
+        if slab.coords().all(|c| self.chunks.contains_key(&c)) {
+            self.spawn_slab = None;
+        }
+    }
+
+    fn submit_slab_columns(&mut self, slab: ChunkBox) {
+        let min = slab.min();
+        let (sx, sy, sz) = slab.size();
+        let cy_lo = min.y;
+        let cy_hi = min.y + sy - 1;
+        let mut remaining = false;
+        for cx in min.x..min.x + sx {
+            for cz in min.z..min.z + sz {
+                let mut need = false;
+                for cy in cy_lo..=cy_hi {
+                    let coord = ChunkCoord::new(cx, cy, cz);
+                    if !self.chunks.contains_key(&coord) && !self.generating.contains(&coord) {
+                        need = true;
+                        break;
+                    }
+                }
+                if !need {
+                    continue;
+                }
+                if !self.try_submit_column(cx, cz, cy_lo, cy_hi) {
+                    remaining = true;
+                }
+            }
+        }
+        if remaining {
+            self.pending_gen.set();
+        }
+    }
+
+    /// Submit one column job and claim its missing coords. `false` means the
+    /// pool rejected it (backpressure or shutdown) so the caller must retry.
+    fn try_submit_column(&mut self, cx: i32, cz: i32, cy_lo: i32, cy_hi: i32) -> bool {
+        if self.quarantined.contains(&FailKey::Column { col: (cx, cz) }) {
+            return false;
+        }
+        let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
+            ..=cy_hi)
+            .filter_map(|cy| {
+                let coord = ChunkCoord::new(cx, cy, cz);
+                self.edits
+                    .get(&coord)
+                    .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
+            })
+            .collect();
+        let job = pipeline::Job::GenerateColumn {
+            col: (cx, cz),
+            cy: cy_lo..=cy_hi,
+            generator: self.generator.clone(),
+            edits,
+        };
+        let accepted = self.worker_pool().submit(job);
+        if accepted {
+            for cy in cy_lo..=cy_hi {
+                let coord = ChunkCoord::new(cx, cy, cz);
+                if !self.chunks.contains_key(&coord) {
+                    self.generating.insert(coord);
+                }
+            }
+        }
+        accepted
+    }
+
     /// Generate a chunk's data if it isn't loaded, replaying any saved edits on it.
+    /// Uses `generate_column` so the ceiling heights come from the same sample
+    /// the voxels did — never a second `height()` walk on this thread.
+    /// Skips coords already claimed in `generating`: the async result is imminent.
     pub(in crate::world) fn ensure_data(&mut self, coord: Coord) {
-        if self.chunks.contains_key(&coord) {
+        if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
             return;
         }
-        let chunk = Chunk::new(coord.x, coord.y, coord.z, &*self.generator);
+        let (chunks, heights) =
+            self.generator
+                .generate_column(coord.x, coord.z, coord.y..=coord.y);
+        self.install_ceiling((coord.x, coord.z), &heights);
+        let data = chunks
+            .into_iter()
+            .next()
+            .map(|(_, data)| data)
+            .expect("generate_column emits the requested layer");
+        let chunk = Chunk::from_data(coord.x, coord.y, coord.z, data);
         self.store_chunk(coord, chunk);
+        self.refresh_spawn_slab();
     }
 
     /// Insert freshly generated data: replay the edit overlay, then register
@@ -1166,6 +1442,8 @@ impl World {
             !self.generating.contains(&coord),
             "storing {coord:?} still claimed in generating — a stuck generate claim"
         );
+        self.light_claim_seq = self.light_claim_seq.wrapping_add(1);
+        let light_gen = self.light_claim_seq;
         self.chunks.insert(
             coord,
             Loaded {
@@ -1175,10 +1453,16 @@ impl World {
                 connectivity: None,
                 visible: true,
                 light: None,
+                has_blocklight: false,
+                light_gen,
             },
         );
-        // Ceiling-cache lifetime: the column's count drops its entry at zero.
-        *self.column_chunks.entry((coord.x, coord.z)).or_insert(0) += 1;
+        // Ceiling-cache lifetime: the column's last layer out drops the entry.
+        let ys = self.column_chunks.entry((coord.x, coord.z)).or_default();
+        if !ys.contains(&coord.y) {
+            ys.push(coord.y);
+            ys.sort_unstable_by(|a, b| b.cmp(a));
+        }
         // Occlusion learns of the new chunk through the fill queue (bounded
         // drain per rebuild) — no per-rebuild missing-connectivity scan.
         if self.occlusion_enabled() {
@@ -1189,11 +1473,20 @@ impl World {
         // flood. A trivial grid publishes synchronously (which fans the border to
         // its neighbours); only the residual Dense band seeds the settle worklist.
         if self.lighting {
-            match self.trivial_light(coord, &chunk) {
-                Some(grid) => self.settle_light(coord, grid),
-                None => {
-                    self.light_worklist.insert(coord);
-                    self.light_pending.set();
+            if self.light_inflight.contains(&coord) {
+                // A previous Loaded at this coord still owns the inflight
+                // claim. Skip trivial publish (it would steal that claim via
+                // settle_light) and seed so we resettle after the stale Done
+                // is consumed against the old generation.
+                self.seed_light(coord);
+                self.light_pending.set();
+            } else {
+                match self.trivial_light(coord, &chunk) {
+                    Some(grid) => self.settle_light(coord, grid),
+                    None => {
+                        self.seed_light(coord);
+                        self.light_pending.set();
+                    }
                 }
             }
         }
@@ -1210,9 +1503,40 @@ impl World {
         // blocked waiting on this data even if itself uniform air.
         self.mesh_worklist.insert(coord);
         for face in Face::ALL {
-            self.mesh_worklist.insert(coord.step(face));
+            let n = coord.step(face);
+            self.mesh_worklist.insert(n);
+            // A Ready neighbour meshed without this chunk (terminal promotion
+            // at a load-set edge, or the neighbour unloaded after the mesh).
+            // Rebuild so the final look picks up the new border; worklist
+            // seeding alone cannot, since Ready fails `is_needs_mesh`.
+            if matches!(
+                self.chunks.get(&n).map(|l| &l.state),
+                Some(MeshState::Ready(_))
+            ) {
+                self.remesh_async(n);
+            }
         }
         self.pending_fresh.set();
+    }
+
+    /// Coords in the previous unload box that have left `new_box`, or every
+    /// loaded chunk past `new_box` when there is no previous box (first pass
+    /// or a radius change). Spawn-slab chunks stay.
+    fn unload_leaving(&self, new_box: ChunkBox) -> Vec<Coord> {
+        let keep_spawn = |coord| self.spawn_slab.is_some_and(|slab| slab.contains(coord));
+        match self.prev_unload_box {
+            Some(prev) => prev
+                .coords()
+                .filter(|&coord| !new_box.contains(coord) && !keep_spawn(coord))
+                .filter(|&coord| self.chunks.contains_key(&coord))
+                .collect(),
+            None => self
+                .chunks
+                .keys()
+                .copied()
+                .filter(|&coord| !new_box.contains(coord) && !keep_spawn(coord))
+                .collect(),
+        }
     }
 
     /// Free chunks past the unload box, releasing their GPU meshes.
@@ -1220,24 +1544,24 @@ impl World {
         let unload = self.unload_box(center);
         // Collect-then-remove instead of `retain`: freeing needs `&mut eng`,
         // which can't be borrowed inside a retain closure over `self.chunks`.
-        let far: Vec<Coord> = self
-            .chunks
-            .keys()
-            .copied()
-            .filter(|&coord| !unload.contains(coord))
-            .collect();
+        let far = self.unload_leaving(unload);
+        self.prev_unload_box = Some(unload);
         // A removed chunk changes what the BFS can reach — topology class.
         self.occlusion_topo_dirty.raise(!far.is_empty());
         for &coord in &far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             if let Some(loaded) = self.chunks.remove(&coord) {
+                super::adjust_count(&mut self.building_meshes, loaded.state.is_building(), false);
                 loaded.state.free_owned(eng);
             }
             self.dirty_worklist.remove(&coord);
-            // Column refcount: the last chunk out drops the cached ceiling.
-            if let Some(count) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
-                *count -= 1;
-                if *count == 0 {
+            self.light_terminal.remove(&coord);
+            // Column layers: the last chunk out drops the cached ceiling.
+            if let Some(ys) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
+                if let Some(i) = ys.iter().position(|&y| y == coord.y) {
+                    ys.remove(i);
+                }
+                if ys.is_empty() {
                     self.column_chunks.remove(&(coord.x, coord.z));
                     self.ceilings.remove(&(coord.x, coord.z));
                 }
@@ -1312,19 +1636,46 @@ impl World {
         degraded: bool,
     ) -> (u32, pipeline::ChunkSnapshot) {
         let loaded = &self.chunks[&coord];
+        // One 3×3×3 lookup feeds both the voxel shell and the light shell.
+        let nhood = self.loaded_neighbourhood(coord);
+        let fallback = (self.lighting && degraded).then(light::LightGrid::open_sky);
         (
             loaded.rev,
             pipeline::ChunkSnapshot {
-                padded: self.capture_padded(coord),
+                padded: mesh::Padded::capture(|dx, dy, dz| {
+                    Self::nhood_at(&nhood, dx, dy, dz).map(|l| &*l.chunk)
+                }),
                 uniform: loaded.chunk.uniform(),
                 // Lighting off omits the 18³ shell entirely — the mesher's
-                // unlit path reads constant full light instead.
-                light: self
-                    .lighting
-                    .then(|| self.capture_padded_light(coord, degraded)),
+                // unlit path reads constant full light instead. `open_sky` is
+                // Uniform (task 05): the degraded fallback does not allocate.
+                light: self.lighting.then(|| {
+                    light::PaddedLight::capture(|dx, dy, dz| {
+                        Self::nhood_at(&nhood, dx, dy, dz)
+                            .and_then(|l| l.light.as_ref())
+                            .or(fallback.as_ref())
+                    })
+                }),
                 tables: self.tables.get(),
             },
         )
+    }
+
+    /// The 3×3×3 neighbourhood of `coord`, dx-fast then dy then dz.
+    fn loaded_neighbourhood(&self, coord: Coord) -> [Option<&Loaded>; 27] {
+        let mut nhood = [None; 27];
+        let mut i = 0;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    nhood[i] = self
+                        .chunks
+                        .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz));
+                    i += 1;
+                }
+            }
+        }
+        nhood
     }
 
     /// Settled light shell for chunk and 26 neighbours (18³). A missing grid reads
@@ -1354,33 +1705,73 @@ impl World {
         })
     }
 
-    /// Skylight ceiling: ground height per column (pure generator fn, caves dark
-    /// consistently) RAISED by edited opaque roofs, so a player-built ceiling
-    /// shadows the chunks below it. Keyed by `(x, z)` chunk column and
-    /// cached — the generator half never changes and `set_block` invalidates
-    /// the entry when an edit moves a column's ceiling, so `capture_ceiling`
-    /// samples 256 noise columns once per column, not per settle.
+    /// Skylight ceiling: ground height per column (caves dark consistently)
+    /// RAISED by edited opaque roofs, so a player-built ceiling shadows the
+    /// chunks below it. Keyed by `(x, z)` chunk column and cached.
+    ///
+    /// Async columns install the window in [`accept_column`](Self::accept_column)
+    /// before store; [`ensure_data`](Self::ensure_data) does the same from the
+    /// synchronous `generate_column`. This miss path is the remainder (edit
+    /// invalidation, tests) and still reads heights from `generate_column`,
+    /// never `height()`.
     ///
     /// Generated volumetrics (overhang shelves, flying islands) are still NOT
     /// part of the ceiling: `height()` deliberately describes ground only, so
     /// they don't shadow the columns beneath them — a known model limit that
     /// needs a generator-side occupancy summary to lift.
-    pub(in crate::world) fn capture_ceiling(&mut self, coord: Coord) -> light::CeilingWindow {
+    pub(in crate::world) fn capture_ceiling(
+        &mut self,
+        coord: Coord,
+    ) -> std::sync::Arc<light::CeilingWindow> {
         if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
-            return ceiling.clone();
+            return std::sync::Arc::clone(ceiling);
         }
+        // Empty `cy` range: both generators sample the 256 column profiles
+        // before iterating the chunk layers, so this is the height field
+        // without a voxel fill.
+        let heights = self.generator.generate_column(coord.x, coord.z, 1..=0).1;
+        let ceiling = std::sync::Arc::new(self.ceiling_from_heights((coord.x, coord.z), &heights));
+        self.ceilings
+            .insert((coord.x, coord.z), std::sync::Arc::clone(&ceiling));
+        ceiling
+    }
+
+    /// Rebuild the ceiling from `height()` plus edited roofs, ignoring the
+    /// cache — equality check against production `generate_column` heights.
+    #[cfg(test)]
+    pub(in crate::world) fn capture_ceiling_slow(&self, coord: Coord) -> light::CeilingWindow {
         let x0 = coord.x * CHUNK_SIZE as i32;
         let z0 = coord.z * CHUNK_SIZE as i32;
         let generator = &self.generator;
         let mut ceiling = light::CeilingWindow::from_heights(|lx, lz| {
             generator.height(x0 + lx as i32, z0 + lz as i32)
         });
-        // Every edited opaque cell in this column is a potential roof: open
-        // sky begins above the topmost one. The overlay has no column index,
-        // so this scans edited chunks — once per cached column, off the voxel
-        // hot path.
+        self.raise_edited_roofs((coord.x, coord.z), &mut ceiling);
+        ceiling
+    }
+
+    fn install_ceiling(&mut self, col: (i32, i32), heights: &ColumnHeights) {
+        if self.ceilings.contains_key(&col) {
+            return;
+        }
+        let ceiling = std::sync::Arc::new(self.ceiling_from_heights(col, heights));
+        self.ceilings.insert(col, ceiling);
+    }
+
+    fn ceiling_from_heights(
+        &self,
+        col: (i32, i32),
+        heights: &ColumnHeights,
+    ) -> light::CeilingWindow {
+        let mut ceiling =
+            light::CeilingWindow::from_heights(|lx, lz| heights[lx + lz * CHUNK_SIZE]);
+        self.raise_edited_roofs(col, &mut ceiling);
+        ceiling
+    }
+
+    fn raise_edited_roofs(&self, col: (i32, i32), ceiling: &mut light::CeilingWindow) {
         for (&c, cells) in &self.edits {
-            if c.x != coord.x || c.z != coord.z {
+            if c.x != col.0 || c.z != col.1 {
                 continue;
             }
             for (&index, &id) in cells {
@@ -1391,8 +1782,6 @@ impl World {
                 ceiling.raise(lx, lz, c.y * CHUNK_SIZE as i32 + ly as i32 + 1);
             }
         }
-        self.ceilings.insert((coord.x, coord.z), ceiling.clone());
-        ceiling
     }
 
     /// The analytic light grid for a chunk whose settled light is provable
@@ -1429,9 +1818,7 @@ impl World {
         if chunk.uniform() == Some(crate::block::registry::AIR) {
             let world_y0 = coord.y * CHUNK_SIZE as i32;
             let ceiling = self.capture_ceiling(coord);
-            let all_open = (0..CHUNK_SIZE)
-                .all(|lz| (0..CHUNK_SIZE).all(|lx| ceiling.open_above(lx, lz, world_y0)));
-            if all_open && !self.neighbour_blocklight_near(coord) {
+            if world_y0 >= ceiling.min_surface() && !self.neighbour_blocklight_near(coord) {
                 return Some(light::LightGrid::open_sky());
             }
         }
@@ -1443,9 +1830,10 @@ impl World {
     /// [`trivial_light`](Self::trivial_light) to reject the dark-shell fast path
     /// when a torch next door would actually bleed across the border.
     fn neighbour_blocklight_near(&self, coord: Coord) -> bool {
-        let shell = self.capture_face_shell(coord);
         Face::ALL.iter().any(|&face| {
-            (0..CHUNK_SIZE).any(|b| (0..CHUNK_SIZE).any(|a| shell.at(face, a, b).block.get() > 1))
+            self.chunks
+                .get(&coord.step(face))
+                .is_some_and(|l| l.has_blocklight)
         })
     }
 
@@ -1488,6 +1876,12 @@ impl World {
         self.pending_fresh.set();
     }
 
+    /// Count a light-worklist insert (the stress harness's seeds-per-chunk signal).
+    pub(in crate::world) fn seed_light(&mut self, coord: Coord) {
+        self.light_seed_inserts += 1;
+        self.light_worklist.insert(coord);
+    }
+
     /// Publish settled light, re-arm mesh readiness, and seed neighbours to re-settle.
     /// Shared by sync (trivial) and async settle paths.
     pub(in crate::world) fn settle_light(&mut self, coord: Coord, grid: light::LightGrid) {
@@ -1498,17 +1892,10 @@ impl World {
         if !self.chunks.contains_key(&coord) {
             return;
         }
-        let (self_changed, moved): (bool, Vec<Face>) = match &self.chunks[&coord].light {
-            None => (true, Face::ALL.to_vec()),
-            Some(old) => (
-                *old != grid,
-                Face::ALL
-                    .into_iter()
-                    .filter(|&f| light::border_changed(old, &grid, f))
-                    .collect(),
-            ),
-        };
-        self.chunks.get_mut(&coord).unwrap().light = Some(grid);
+        let self_changed = self.chunks[&coord]
+            .light
+            .as_ref()
+            .is_none_or(|old| *old != grid);
         // Re-arm mesh readiness unconditionally, even on identical grids.
         // A fixpoint re-settle that skipped this seed would strand the chunk
         // off the worklist forever (ready but unreachable, idle stall).
@@ -1517,18 +1904,42 @@ impl World {
         if !self_changed {
             return;
         }
+        // Face bitmask (bit = `Face` discriminant): first publish moves every
+        // face; later publishes scan borders only after the grid actually changed.
+        const ALL_FACES: u8 = (1 << Face::ALL.len()) - 1;
+        let moved = match &self.chunks[&coord].light {
+            None => ALL_FACES,
+            Some(old) => {
+                let mut bits = 0u8;
+                for &face in &Face::ALL {
+                    if light::border_changed(old, &grid, face) {
+                        bits |= 1 << (face as u8);
+                    }
+                }
+                bits
+            }
+        };
+        let has_blocklight = grid.has_border_blocklight();
+        let loaded = self.chunks.get_mut(&coord).unwrap();
+        loaded.light = Some(grid);
+        loaded.has_blocklight = has_blocklight;
         // A neighbour may now be meshable too (this chunk's FIRST grid completes
         // their neighbourhood — `moved` is all faces then); re-settle the
         // neighbours whose shared border moved.
-        for face in &moved {
-            let n = coord.step(*face);
-            self.light_worklist.insert(n);
+        for &face in &Face::ALL {
+            if moved & (1 << (face as u8)) == 0 {
+                continue;
+            }
+            let n = coord.step(face);
+            self.seed_light(n);
             self.mesh_worklist.insert(n);
             // A DEGRADED neighbour meshed with fake open-sky light across this
             // border; now that real light has crossed it, schedule its ASYNC
             // rebuild — seeding the worklist alone can't, since the neighbour
             // is already `Ready` and so fails the mesh lane's `is_needs_mesh`
             // gate. The old mesh keeps drawing until the rebuild uploads.
+            // A terminal-promoted Ready neighbour is rebuilt from `store_chunk`
+            // when the missing neighbour's data arrives.
             if self.light_gate.degraded.contains(&n) {
                 self.remesh_async(n);
             }
@@ -1540,6 +1951,10 @@ impl World {
         // in-flight builds and stales queued uploads; a drawn mesh keeps
         // drawing as `prev`). Unmeshed chunks simply mesh fresh with new light.
         self.remesh_async(coord);
+    }
+
+    fn nhood_at<'a>(nhood: &[Option<&'a Loaded>; 27], dx: i32, dy: i32, dz: i32) -> Option<&'a Loaded> {
+        nhood[((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1)) as usize]
     }
 
     /// Chunk + 1-voxel neighbour shell for mesh build (shared by worker and sync paths).
@@ -1597,11 +2012,7 @@ impl World {
     /// Ladder-pinned SSE budget for current view radius. Rebuilt per query
     /// as `unit` tracks view distance.
     fn sse_budget(&self) -> SseBudget {
-        SseBudget::ladder(
-            SSE_K,
-            self.section_pyramid.unit,
-            self.section_pyramid.finest.0,
-        )
+        SseBudget::ladder(self.section_pyramid.unit, self.section_pyramid.finest.0)
     }
 
     /// Spawn background max-mip bake (idempotent: no-op if spawned or landed).
@@ -1778,7 +2189,7 @@ impl World {
         let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
         let visible: FastSet<SectionPos> = self.section_visible.iter().map(|(p, _)| *p).collect();
         // Fading sections still draw this frame. Keep meshes until fade completes
-        // or outgoing tile vanishes mid-fade.
+        // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
         let metric = self.section_metric(center, DVec3::ZERO);
         let cfg = &self.section_pyramid;
@@ -1798,6 +2209,11 @@ impl World {
             .collect();
         for s in &stale {
             if let Some(state) = self.sections.remove(s) {
+                super::adjust_count(
+                    &mut self.meshing_sections,
+                    matches!(state, SectionState::Meshing { .. }),
+                    false,
+                );
                 state.free(eng);
             }
         }
@@ -1885,6 +2301,7 @@ impl World {
             self.light_gate.degraded.insert(coord);
         } else {
             self.light_gate.degraded.remove(&coord);
+            self.light_terminal.remove(&coord);
         }
     }
 
@@ -1899,17 +2316,34 @@ impl World {
     /// `settle_light`, neighbour data via `store_chunk`). The old gate
     /// re-scanned the entire `mesh_worklist` (~15 hash probes per seed) and
     /// unconditionally re-seeded every blocked chunk, every pass of a flood.
-    fn tick_light_gate(&mut self) {
+    pub(in crate::world) fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
-        // the predicates below read the chunk map.
+        // the predicates below read the chunk map. Empty maps skip `retain`
+        // (it still walks capacity); a drained flood `shrink_to_fit`s once.
         let mut gate = std::mem::take(&mut self.light_gate);
-        gate.degraded.retain(|c| self.chunks.contains_key(c));
-        gate.blocked_since
-            .retain(|c, _| self.chunk_light_blocked(*c));
+        if !gate.degraded.is_empty() {
+            gate.degraded.retain(|c| self.chunks.contains_key(c));
+            if gate.degraded.is_empty() {
+                gate.degraded.shrink_to_fit();
+            }
+        }
+        if !self.light_terminal.is_empty() {
+            self.light_terminal.retain(|c| self.chunks.contains_key(c));
+            if self.light_terminal.is_empty() {
+                self.light_terminal.shrink_to_fit();
+            }
+        }
+        if !gate.blocked_since.is_empty() {
+            gate.blocked_since
+                .retain(|c, _| self.chunk_light_blocked(*c));
+            if gate.blocked_since.is_empty() {
+                gate.blocked_since.shrink_to_fit();
+            }
+        }
         // Safety net: event-driven paths miss degraded chunks whose neighbour
         // light settled without moving the shared border. Sweep them: any now
         // light-ready gets its ASYNC rebuild scheduled (the old mesh keeps
-        // drawing), clearing the degraded flag at the rebuild's submit.
+        // drawing), clearing the degraded flag at the rebuild's claim.
         let relit: Vec<Coord> = gate
             .degraded
             .iter()
@@ -1939,60 +2373,59 @@ impl World {
     /// Event-driven paths miss degraded chunks whose missing neighbour settled
     /// without moving shared border; this sweep promotes them to final at true
     /// rest so entry_complete doesn't hang.
-    fn flush_degraded_terminal(&mut self, eng: &mut Engine) {
-        let quiescent = self.generating.is_empty()
-            && self.mesh_worklist.is_empty()
-            && self.light_worklist.is_empty()
-            && self.light_inflight.is_empty()
-            && self.light_apply_queue.is_empty()
-            && !self.light_gate.degraded.is_empty();
-        if !quiescent {
+    pub(in crate::world) fn flush_degraded_terminal(&mut self) {
+        if !self.near_quiescent() || self.light_gate.degraded.is_empty() {
             return;
         }
-        // Promote SETTLED degraded chunks, a few per frame: `remesh_terminal`
-        // is a synchronous main-thread mesh build (milliseconds each), so an
-        // unbudgeted pass over N stuck chunks would be one big hitch. The world
-        // is quiescent here (nothing else re-degrades), so the set drains
-        // monotonically across frames either way; a still-building/Dirty chunk
-        // is left for a later flush once its own path settles it.
-        const TERMINAL_FLUSH_BUDGET: usize = 2;
+        // Promote every SETTLED degraded chunk this frame: a rev bump plus a
+        // worklist seed is microseconds, so there is no per-frame budget. The
+        // world is quiescent (nothing else re-degrades). A still-building/Dirty
+        // chunk is left for a later flush once its own path settles it.
         let stuck: Vec<Coord> = self.light_gate.degraded.iter().copied().collect();
-        let mut promoted = 0usize;
         for coord in stuck {
-            if promoted >= TERMINAL_FLUSH_BUDGET {
-                break;
-            }
             match self.chunks.get(&coord).map(|l| &l.state) {
-                // Settled on a degraded mesh — the stuck case. Promote to final.
-                Some(MeshState::Ready(_) | MeshState::Air) => {
-                    self.remesh_terminal(coord, eng);
-                    promoted += 1;
+                // Nothing to draw: drop the degraded flag.
+                Some(MeshState::Air) => self.mark_degraded(coord, false),
+                // Settled on a degraded mesh — the stuck case. Rebuild async;
+                // if neighbour light is still missing it will never arrive, so
+                // the terminal set makes the snapshot read missing planes dark.
+                Some(MeshState::Ready(_)) => {
+                    if !self.in_mesh_box(coord) {
+                        // Past the mesh box (unload hysteresis): not drawn,
+                        // and a rebuild would fail `in_mesh_box` / be dropped
+                        // at apply. Drop the flag so quiescence is not wedged.
+                        self.mark_degraded(coord, false);
+                    } else {
+                        if !self.light_ready(coord) {
+                            self.light_terminal.insert(coord);
+                        }
+                        self.remesh_async(coord);
+                    }
                 }
                 // Unloaded out from under the set between marking and here.
                 None => self.mark_degraded(coord, false),
-                // Still building (in-flight degraded result pending) or Dirty (a
-                // sync remesh owns it): another path is about to resolve it. Leave
-                // it in the set; a later frame's flush promotes it once settled, so
-                // the flush never races an in-flight upload for the same chunk.
-                Some(MeshState::NeedsMesh { .. } | MeshState::Dirty { .. }) => {}
+                // Admit evicted the seed (a missing neighbour used to fail
+                // `ready`, or this flush ran after that pass's admit). Re-seed
+                // in-box chunks; mark terminal if neighbour light will not
+                // arrive. Out-of-box: same as Ready — drop the flag.
+                Some(MeshState::NeedsMesh {
+                    building: false, ..
+                }) => {
+                    if !self.in_mesh_box(coord) {
+                        self.mark_degraded(coord, false);
+                    } else if !self.mesh_worklist.contains(&coord) {
+                        if !self.light_ready(coord) {
+                            self.light_terminal.insert(coord);
+                        }
+                        self.mesh_worklist.insert(coord);
+                        self.pending_fresh.set();
+                    }
+                }
+                // Still building (in-flight result pending) or Dirty (a sync
+                // remesh owns it): another path is about to resolve it.
+                Some(MeshState::NeedsMesh { building: true, .. } | MeshState::Dirty { .. }) => {}
             }
         }
-    }
-
-    /// Re-mesh degraded chunk at terminal light quiescence, mark final.
-    /// Forces degraded=false: at quiescence, missing planes are settled neighbours'
-    /// real light (possibly dark), so mesh is final.
-    fn remesh_terminal(&mut self, coord: Coord, eng: &mut Engine) {
-        self.refresh_tables();
-        let mut scratch = std::mem::replace(&mut self.scratch, mesh::new_chunk_mesh_data());
-        let tables = self.tables.get();
-        let uniform = self.chunks[&coord].chunk.uniform();
-        let padded = self.capture_padded(coord);
-        self.mark_degraded(coord, false);
-        let light = self.capture_padded_light(coord, false);
-        mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        self.upload_chunk(coord, &scratch, eng);
-        self.scratch = scratch;
     }
 
     /// World-entry completeness predicate: true once, within the view
@@ -2005,12 +2438,8 @@ impl World {
             return false;
         };
         // No near work queued or in flight, and nothing owed a final-light remesh.
-        if !self.generating.is_empty()
-            || !self.mesh_worklist.is_empty()
+        if !self.near_quiescent()
             || !self.upload_queue.is_empty()
-            || !self.light_worklist.is_empty()
-            || !self.light_inflight.is_empty()
-            || !self.light_apply_queue.is_empty()
             || !self.light_gate.degraded.is_empty()
             || !self.light_gate.blocked_since.is_empty()
         {
@@ -2025,19 +2454,42 @@ impl World {
         }
         // LOD2 far field: all desired cells covered and no uploads pending. Skipped
         // when disabled (no far field in near-only mode).
-        if self.lod2 {
+        if self.desired_unrefined().is_some() {
             if !self.section_upload_queue.is_empty() {
                 return false;
             }
             if self
-                .desired_sections(center)
-                .into_iter()
-                .any(|c| !self.section_covered(c))
+                .section_desired
+                .iter()
+                .any(|&c| !self.section_covered(c))
             {
                 return false;
             }
         }
         true
+    }
+
+    /// Near generate/mesh/light queues empty — the five-queue rest predicate.
+    fn near_quiescent(&self) -> bool {
+        self.generating.is_empty()
+            && self.mesh_worklist.is_empty()
+            && self.light_worklist.is_empty()
+            && self.light_inflight.is_empty()
+            && self.light_apply_queue.is_empty()
+    }
+
+    /// `None` when LOD2 is off. `Some(n)` is how many desired far cells lack
+    /// their own Ready mesh.
+    fn desired_unrefined(&self) -> Option<usize> {
+        if !self.lod2 {
+            return None;
+        }
+        Some(
+            self.section_desired
+                .iter()
+                .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
+                .count(),
+        )
     }
 
     /// Every desired far-field section is itself Ready — the strongest far-field
@@ -2047,32 +2499,23 @@ impl World {
     /// The golden harness gates captures on this so blessed shots are the
     /// converged frame; gameplay never waits on it.
     pub fn far_field_refined(&self) -> bool {
-        let Some(center) = self.center else {
-            return false;
-        };
-        if !self.lod2 {
-            return true;
-        }
-        if !self.section_upload_queue.is_empty() {
+        if self.center.is_none() {
             return false;
         }
-        self.desired_sections(center)
-            .into_iter()
-            .all(|c| self.sections.get(&c).is_some_and(|s| s.is_ready()))
+        match self.desired_unrefined() {
+            None => true,
+            Some(n) => self.section_upload_queue.is_empty() && n == 0,
+        }
     }
 
     /// How many desired far-field sections still lack their own mesh — the
     /// harness's progress signal while it waits on
     /// [`far_field_refined`](Self::far_field_refined).
     pub fn far_field_pending(&self) -> usize {
-        let Some(center) = self.center else { return 0 };
-        if !self.lod2 {
+        if self.center.is_none() {
             return 0;
         }
-        self.desired_sections(center)
-            .into_iter()
-            .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
-            .count()
+        self.desired_unrefined().unwrap_or(0)
     }
 
     /// Snapshot the streaming-queue depths (see [`super::StreamGauges`]).
@@ -2104,6 +2547,9 @@ impl World {
             worker_capacity,
             travel_speed_mps: self.stream_pacer.speed_mps(),
             effort: self.stream_pacer.effort(),
+            light_admitted: self.light_admitted,
+            light_admitted_last: self.light_admitted_last,
+            light_seed_inserts: self.light_seed_inserts,
         }
     }
 
@@ -2112,6 +2558,18 @@ impl World {
     /// streaming stage is stuck instead of hanging silently. Clause order mirrors
     /// [`entry_complete`](Self::entry_complete).
     pub fn entry_debug(&self) -> String {
+        if let Some(slab) = self.spawn_slab {
+            let missing = slab
+                .coords()
+                .filter(|c| !self.chunks.contains_key(c))
+                .count();
+            if missing > 0 {
+                return format!(
+                    "spawn slab loading: {missing} chunks, generating={}",
+                    self.generating.len()
+                );
+            }
+        }
         let Some(center) = self.center else {
             return "no stream centre yet".into();
         };
@@ -2125,7 +2583,7 @@ impl World {
         // Share the one queue-depth source with the harness gauge, so the two
         // can never drift; the gate counters have no gauge field, so stay local.
         let g = self.stream_gauges();
-        let near: [(&str, usize); 8] = [
+        let near: [(&str, usize); 9] = [
             ("generating", g.generating),
             ("mesh_worklist", g.mesh_worklist),
             ("upload_queue", g.upload_queue),
@@ -2133,6 +2591,7 @@ impl World {
             ("light_inflight", g.light_inflight),
             ("light_apply_queue", g.light_apply_queue),
             ("degraded", self.light_gate.degraded.len()),
+            ("terminal", self.light_terminal.len()),
             ("light_blocked", self.light_gate.blocked_since.len()),
         ];
         let pending: Vec<String> = near
@@ -2151,9 +2610,12 @@ impl World {
                         not_needs += 1;
                     } else if !self.in_mesh_box(c) {
                         out_box += 1;
-                    } else if !self.neighbours_have_data(c) {
+                    } else if !self.neighbours_have_data(c) && !self.light_terminal.contains(&c) {
                         no_neigh += 1;
-                    } else if self.light_ready(c) || self.light_wait_expired(c) {
+                    } else if self.light_ready(c)
+                        || self.light_wait_expired(c)
+                        || self.light_terminal.contains(&c)
+                    {
                         lit_or_expired += 1;
                     }
                 }
@@ -2184,9 +2646,12 @@ impl World {
                         queued += 1;
                     } else {
                         idle += 1;
-                        if !self.neighbours_have_data(c) {
+                        if !self.neighbours_have_data(c) && !self.light_terminal.contains(&c) {
                             idle_no_neigh += 1;
-                        } else if !(self.light_ready(c) || self.light_wait_expired(c)) {
+                        } else if !(self.light_ready(c)
+                            || self.light_wait_expired(c)
+                            || self.light_terminal.contains(&c))
+                        {
                             idle_unlit += 1;
                         }
                     }
@@ -2206,15 +2671,15 @@ impl World {
             if !self.section_upload_queue.is_empty() {
                 return format!("section_upload_queue = {}", self.section_upload_queue.len());
             }
-            let desired = self.desired_sections(center);
-            let uncovered = desired
+            let uncovered = self
+                .section_desired
                 .iter()
                 .filter(|&&c| !self.section_covered(c))
                 .count();
             if uncovered != 0 {
                 return format!(
                     "column sections uncovered: {uncovered} of {} desired",
-                    desired.len()
+                    self.section_desired.len()
                 );
             }
         }
@@ -2329,6 +2794,39 @@ mod tests {
         assert_eq!(pacer.effort(), 1.0);
     }
 
+    #[test]
+    fn stream_pacer_runs_full_workers_for_queued_work_at_rest() {
+        let mut pacer = StreamPacer::default();
+        pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
+        assert_eq!(pacer.active_workers(12), 2, "travel still sheds");
+        pacer.set_boost(true, 0.001);
+        assert!(
+            !pacer.boosting(),
+            "queued work during travel must not lift the floor"
+        );
+        assert_eq!(pacer.active_workers(12), 2);
+        assert_eq!(pacer.near_queue_cap(12), 8);
+
+        pacer.update(DVec3::ZERO, 1.0 / 60.0);
+        pacer.set_boost(true, 0.001);
+        assert!(pacer.boosting(), "cheap rest frame with leftover work");
+        assert_eq!(pacer.active_workers(12), 12);
+        assert_eq!(pacer.near_queue_cap(12), NEAR_REST_QUEUE_CAP);
+        assert_eq!(pacer.floor(32), 32);
+        assert!(
+            pacer.duration(Duration::from_millis(1)) >= Duration::from_millis(1),
+            "rest boost restores the full admission window"
+        );
+
+        pacer.set_boost(true, 0.020);
+        assert!(
+            !pacer.boosting(),
+            "an already-expensive pass keeps the travel floor"
+        );
+        let expected = ((12.0 * pacer.effort()).ceil() as usize).clamp(1, 12);
+        assert_eq!(pacer.active_workers(12), expected);
+    }
+
     /// A degraded drawn chunk whose neighbourhood becomes light-ready WITHOUT
     /// a border event (nothing re-seeds it) is promoted by the gate's relit
     /// sweep — through the ASYNC rebuild path: old mesh carried and drawing,
@@ -2409,7 +2907,7 @@ mod tests {
         super::super::admit::<MeshLane>(
             &mut world,
             c,
-            pipeline::Deadline::from_budget(Duration::from_millis(5)),
+            voxel_engine::producer::Budget::Millis(5.0),
         );
         assert!(
             !world.mesh_worklist.contains(&c),
@@ -2455,6 +2953,474 @@ mod tests {
         assert!(
             <MeshLane as StreamLane>::ready(&world, c),
             "expired wait admits a degraded mesh even though light never settled"
+        );
+    }
+
+    /// A degraded `Ready` chunk whose neighbour light is permanently missing
+    /// is, at quiescence, rebuilt asynchronously: the drawn mesh is carried,
+    /// the terminal set records that missing planes are settled dark, and
+    /// `MeshLane::submit` snapshots non-degraded. Claim (not submit) drops
+    /// the degraded and terminal marks.
+    #[test]
+    fn degraded_ready_chunk_promotes_through_terminal_async_path() {
+        let mut world = World::generate();
+        let c = ChunkCoord::new(0, 0, 0);
+        world.center = Some(c);
+        let missing = c.step(Face::PosX);
+        for n in std::iter::once(c).chain(Face::ALL.iter().map(|&f| c.step(f))) {
+            let loaded = world.chunks.get_mut(&n).expect("pregenerated");
+            loaded.light = if n == missing {
+                None
+            } else {
+                Some(light::LightGrid::dark())
+            };
+        }
+        let h = voxel_engine::MeshHandle::from_raw_parts(21, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(c, true);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.pending_dirty.take();
+        assert!(!world.light_ready(c), "one neighbour grid is permanently missing");
+
+        world.flush_degraded_terminal();
+
+        let state = &world.chunks[&c].state;
+        assert!(
+            matches!(
+                state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "promoted through the async rebuild: {state:?}"
+        );
+        assert!(world.mesh_worklist.contains(&c), "seeded for the rebuild");
+        assert!(
+            world.light_terminal.contains(&c),
+            "missing neighbour light is terminal"
+        );
+        assert!(
+            world.light_gate.degraded.contains(&c),
+            "degraded flag stays until the rebuild is claimed"
+        );
+        assert!(
+            <MeshLane as StreamLane>::ready(&world, c),
+            "terminal membership admits the rebuild without another light wait"
+        );
+        assert!(
+            !world.pending_dirty.get(),
+            "the sync dirty path is not involved"
+        );
+
+        let job = <MeshLane as StreamLane>::submit(&mut world, c).expect("terminal mesh job");
+        let pipeline::Job::Mesh { snapshot, .. } = job else {
+            panic!("expected a mesh job");
+        };
+        let shell = snapshot.light.expect("lighting on");
+        assert_eq!(
+            shell.at(CHUNK_SIZE as i32, 8, 8),
+            light::Lumel::DARK,
+            "terminal snapshot reads the missing +X neighbour as settled dark"
+        );
+        assert!(
+            world.light_gate.degraded.contains(&c),
+            "submit must not mutate the degraded set"
+        );
+        assert!(
+            world.light_terminal.contains(&c),
+            "submit must not drop the terminal mark (a rejected submit retries)"
+        );
+
+        <MeshLane as StreamLane>::claim(&mut world, c);
+        assert!(
+            !world.light_gate.degraded.contains(&c),
+            "claim marks the snapshot non-degraded"
+        );
+        assert!(
+            world.light_terminal.is_empty(),
+            "claim consumes the terminal mark"
+        );
+    }
+
+    /// One GPU-free stream pass: light-gate, mesh admit (submit + claim +
+    /// install the carried mesh as Ready — tests have no Engine), terminal
+    /// flush. Matches the live `stream` order so promotion completes in one
+    /// quiescence round after the seed.
+    fn pump_terminal_mesh(world: &mut World) {
+        world.tick_light_gate();
+        let seeds: Vec<Coord> = world.mesh_worklist.iter().copied().collect();
+        for key in seeds {
+            if <MeshLane as StreamLane>::in_flight(world, key) {
+                continue;
+            }
+            if !<MeshLane as StreamLane>::ready(world, key) {
+                world.mesh_worklist.remove(&key);
+                <MeshLane as StreamLane>::on_blocked(world, key);
+                continue;
+            }
+            let _job = <MeshLane as StreamLane>::submit(world, key).expect("mesh job");
+            <MeshLane as StreamLane>::claim(world, key);
+            if let Some(loaded) = world.chunks.get_mut(&key) {
+                if let MeshState::NeedsMesh {
+                    building: true,
+                    prev,
+                } = &mut loaded.state
+                {
+                    let next = match prev.take() {
+                        Some(m) => MeshState::Ready(m),
+                        None => MeshState::Air,
+                    };
+                    loaded.retire_logged(next);
+                    super::super::adjust_count(&mut world.building_meshes, true, false);
+                }
+            }
+        }
+        world.flush_degraded_terminal();
+    }
+
+    /// A degraded mesh whose face neighbour has unloaded (trailing-edge /
+    /// load-set-edge) still promotes at quiescence: the terminal mark admits
+    /// the rebuild without neighbour data, a stranded `NeedsMesh` is re-seeded,
+    /// and `entry_complete` becomes true with the centre set.
+    #[test]
+    fn degraded_chunk_promotes_when_a_neighbour_is_missing() {
+        let mut world = World::generate();
+        world.lod2 = false;
+        world.set_view_distances(2, 2);
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let center = ChunkCoord::new(0, cy, 0);
+        world.center = Some(center);
+        let edge = ChunkCoord::new(2, cy, 0);
+        let missing = edge.step(Face::PosX);
+        assert!(world.in_mesh_box(edge), "edge chunk is drawn");
+        assert!(
+            !world.in_mesh_box(missing),
+            "the unloaded neighbour sits outside the mesh box"
+        );
+
+        for coord in world.mesh_box(center).coords() {
+            if !world.chunks.contains_key(&coord) {
+                world.ensure_data(coord);
+            }
+            let loaded = world.chunks.get_mut(&coord).expect("in-box data");
+            loaded.state = MeshState::Air;
+            if loaded.light.is_none() {
+                loaded.light = Some(light::LightGrid::dark());
+            }
+        }
+
+        let h = voxel_engine::MeshHandle::from_raw_parts(77, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&edge).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(edge, true);
+        world.chunks.remove(&missing);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.light_gate.blocked_since.clear();
+        world.upload_queue.clear();
+        assert!(
+            !world.neighbours_have_data(edge),
+            "the face neighbour is gone"
+        );
+        assert!(!world.light_ready(edge));
+
+        world.flush_degraded_terminal();
+        assert!(
+            matches!(
+                world.chunks[&edge].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "Ready degraded promotes through the async path"
+        );
+        assert!(world.light_terminal.contains(&edge));
+        assert!(
+            <MeshLane as StreamLane>::ready(&world, edge),
+            "terminal admits without neighbour data"
+        );
+
+        // The live admit loop evicts a blocked seed; a later flush must
+        // re-seed the stranded NeedsMesh instead of assuming another path
+        // will resolve it.
+        world.mesh_worklist.remove(&edge);
+        world.pending_fresh.take();
+        world.flush_degraded_terminal();
+        assert!(
+            world.mesh_worklist.contains(&edge),
+            "stuck NeedsMesh is re-seeded"
+        );
+        assert!(world.pending_fresh.get());
+        assert!(world.light_terminal.contains(&edge));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !world.entry_complete() {
+            assert!(
+                Instant::now() < deadline,
+                "promotion did not settle: {}",
+                world.entry_debug()
+            );
+            pump_terminal_mesh(&mut world);
+        }
+        assert!(
+            !world.light_gate.degraded.contains(&edge),
+            "the rebuild claim cleared the degraded flag"
+        );
+        assert!(
+            matches!(world.chunks[&edge].state, MeshState::Ready(_)),
+            "the chunk shows a Ready mesh"
+        );
+        assert!(world.entry_complete(), "centre is set and the box is final");
+        assert!(world.chunks[&edge].state.live_meshes().unwrap().draws(h));
+
+        // A later real neighbour arrival must rebuild the promoted chunk so
+        // the dark-plane snapshot is not permanent.
+        world.ensure_data(missing);
+        assert!(
+            matches!(
+                world.chunks[&edge].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "storing the missing neighbour rebuilds the terminal-promoted chunk"
+        );
+        assert!(world.mesh_worklist.contains(&edge));
+    }
+
+    /// A degraded chunk that has left the mesh box (still loaded in the unload
+    /// hysteresis) cannot be admitted, so flush drops the flag instead of
+    /// re-seeding a seed admit will just evict.
+    #[test]
+    fn flush_drops_degraded_outside_the_mesh_box() {
+        let mut world = World::generate();
+        world.lod2 = false;
+        world.set_view_distances(2, 2);
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let center = ChunkCoord::new(0, cy, 0);
+        world.center = Some(center);
+        let outside = ChunkCoord::new(3, cy, 0);
+        assert!(!world.in_mesh_box(outside));
+        if !world.chunks.contains_key(&outside) {
+            world.ensure_data(outside);
+        }
+        for coord in world.mesh_box(center).coords() {
+            if !world.chunks.contains_key(&coord) {
+                world.ensure_data(coord);
+            }
+            world.chunks.get_mut(&coord).unwrap().state = MeshState::Air;
+        }
+        let h = voxel_engine::MeshHandle::from_raw_parts(78, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&outside).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(outside, true);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.light_gate.blocked_since.clear();
+
+        world.flush_degraded_terminal();
+        assert!(
+            !world.light_gate.degraded.contains(&outside),
+            "out-of-box degraded is not owed a remesh"
+        );
+        assert!(
+            !world.mesh_worklist.contains(&outside),
+            "must not re-seed a seed admit will evict"
+        );
+        assert!(
+            matches!(world.chunks[&outside].state, MeshState::Ready(_)),
+            "the drawn mesh is left in place"
+        );
+
+        world.chunks.get_mut(&outside).unwrap().state = MeshState::NeedsMesh {
+            building: false,
+            prev: Some(
+                super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                    (p == voxel_engine::Pass::Opaque).then_some(h)
+                }))
+                .expect("one pass present"),
+            ),
+        };
+        world.mark_degraded(outside, true);
+        world.mesh_worklist.clear();
+        world.flush_degraded_terminal();
+        assert!(!world.light_gate.degraded.contains(&outside));
+        assert!(!world.mesh_worklist.contains(&outside));
+    }
+
+    fn assert_ceilings_eq(got: &light::CeilingWindow, slow: &light::CeilingWindow) {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                assert_eq!(
+                    got.surface_at(lx, lz),
+                    slow.surface_at(lx, lz),
+                    "ceiling lx={lx} lz={lz}"
+                );
+            }
+        }
+    }
+
+    /// `accept_column` caches the skylight ceiling from worker heights (not
+    /// `height()`) and `trivial_light` publishes the same grid the slow path
+    /// would. Covers classic, diffusion, and an edited-roof raise.
+    #[test]
+    fn accept_column_caches_ceiling_and_trivial_light_matches_slow() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+
+        for kind in [WorldgenKind::Classic, WorldgenKind::Diffusion] {
+            let mut world = World::with_kind(7, RenderConfig::default(), kind, false);
+            // Above terrain and the flying-island band: uniform air, open sky.
+            let coord = Coord::new(1, 25, -2);
+            world.center = Some(coord);
+
+            let stone = world.registry.id_by_name("Stone").expect("builtin Stone");
+            // Roof in this column, below the stored chunk: raise before store.
+            const ROOF_Y: i32 = 200;
+            world.set_block(
+                coord.x * CHUNK_SIZE as i32 + 3,
+                ROOF_Y,
+                coord.z * CHUNK_SIZE as i32 + 5,
+                stone,
+            );
+
+            let slow = world.capture_ceiling_slow(coord);
+            assert!(
+                !world.ceilings.contains_key(&(coord.x, coord.z)),
+                "slow helper must not warm the cache"
+            );
+
+            let (datas, heights) =
+                world
+                    .generator
+                    .generate_column(coord.x, coord.z, coord.y..=coord.y);
+            let chunks: Vec<_> = datas
+                .into_iter()
+                .map(|(cy, data)| {
+                    (
+                        Coord::new(coord.x, cy, coord.z),
+                        Chunk::from_data(coord.x, cy, coord.z, data),
+                    )
+                })
+                .collect();
+            world.accept_column((coord.x, coord.z), chunks, Box::new(heights));
+
+            let cached = world
+                .ceilings
+                .get(&(coord.x, coord.z))
+                .expect("accept_column installs the ceiling before store");
+            assert_ceilings_eq(cached.as_ref(), &slow);
+            assert!(
+                cached.surface_at(3, 5) >= ROOF_Y + 1,
+                "edited roof must raise the cached ceiling"
+            );
+
+            let grid = world.chunks[&coord]
+                .light
+                .as_ref()
+                .expect("uniform-air above the surface publishes trivial light");
+            let world_y0 = coord.y * CHUNK_SIZE as i32;
+            let all_open = (0..CHUNK_SIZE)
+                .all(|lz| (0..CHUNK_SIZE).all(|lx| slow.open_above(lx, lz, world_y0)));
+            assert!(all_open, "fixture sits fully above the (raised) ceiling");
+            assert!(
+                grid == &light::LightGrid::open_sky(),
+                "trivial light must be open_sky"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbour_blocklight_near_reads_the_settled_flag() {
+        let mut world = World::generate();
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let c = Coord::new(0, cy, 0);
+        let n = c.step(Face::PosX);
+        world.chunks.get(&c).expect("generate preloads the origin");
+        world
+            .chunks
+            .get(&n)
+            .expect("generate preloads the face neighbour");
+        world.settle_light(n, light::LightGrid::dark());
+        assert!(!world.chunks[&n].has_blocklight);
+        assert!(!world.neighbour_blocklight_near(c));
+        world.settle_light(n, light::LightGrid::full());
+        assert!(world.chunks[&n].has_blocklight);
+        assert!(world.neighbour_blocklight_near(c));
+        world.settle_light(n, light::LightGrid::full());
+        assert!(
+            world.chunks[&n].has_blocklight,
+            "identical re-settle keeps the flag"
+        );
+    }
+
+    #[test]
+    fn unload_leaving_is_the_old_minus_new_shell() {
+        let mut world = World::generate();
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let a = Coord::new(0, cy, 0);
+        world.center = Some(a);
+        world.prev_unload_box = Some(world.unload_box(a));
+        let b = Coord::new(2, 0, 0);
+        let leaving = world.unload_leaving(world.unload_box(b));
+        let old = world.unload_box(a);
+        let new = world.unload_box(b);
+        for &c in &leaving {
+            assert!(old.contains(c) && !new.contains(c), "{c:?} not in old∖new");
+        }
+        for c in old.coords() {
+            if new.contains(c)
+                || !world.chunks.contains_key(&c)
+                || world.spawn_slab.is_some_and(|s| s.contains(c))
+            {
+                continue;
+            }
+            assert!(leaving.contains(&c), "{c:?} loaded in old∖new must leave");
+        }
+    }
+
+    /// Sync `ensure_data` (headless region, unclaimed boundary-cross centre)
+    /// also installs from `generate_column` heights, so `trivial_light` never
+    /// calls `height()`.
+    #[test]
+    fn ensure_data_caches_ceiling_matching_slow() {
+        use crate::render_config::RenderConfig;
+
+        let mut world = World::with_config_lazy(11, RenderConfig::default());
+        let coord = Coord::new(2, 25, 1);
+        world.ensure_data(coord);
+        let cached = world
+            .ceilings
+            .get(&(coord.x, coord.z))
+            .expect("ensure_data installs the ceiling before store");
+        let slow = world.capture_ceiling_slow(coord);
+        assert_ceilings_eq(cached.as_ref(), &slow);
+        assert!(
+            world.chunks[&coord].light.as_ref() == Some(&light::LightGrid::open_sky()),
+            "trivial light must be open_sky"
         );
     }
 }

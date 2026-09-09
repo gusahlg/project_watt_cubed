@@ -57,28 +57,7 @@ fn eval_event(
         return edged;
     };
     let held = chords.iter().any(|c| c.held(eng, mods));
-    if !held {
-        *timer = -1.0; // unprime
-        return edged;
-    }
-    if edged {
-        *timer = rep.delay;
-        return true;
-    }
-    if *timer < 0.0 {
-        // Held without ever seeing an edge (key was down when the context
-        // opened): don't autofire until a fresh press primes it.
-        return false;
-    }
-    *timer -= dt;
-    if *timer <= 0.0 {
-        *timer += rep.interval;
-        if *timer <= 0.0 {
-            *timer = rep.interval; // clamp to one fire per frame on a long dt
-        }
-        return true;
-    }
-    false
+    rep.advance(timer, edged, held, dt)
 }
 
 /// Input interpretation: maps device events to high-level intents and manages
@@ -127,6 +106,13 @@ impl Router {
     /// immutable view of the current input state.
     pub fn frame<'e>(&'e mut self, engine: &'e Engine, dt: f32) -> FrameInput<'e> {
         self.frame_filtered(engine, dt, true, true, true)
+    }
+
+    /// Locked-input frame: unprime repeat timers without evaluating any chord.
+    /// Engine press-edges and mouse delta still expire at the end of the engine
+    /// frame, so they cannot replay when input unlocks.
+    pub fn drain_frame(&mut self) {
+        self.timers.reset();
     }
 
     /// Gameplay variant that can structurally skip mod placement, mod UI, and
@@ -375,5 +361,20 @@ pub struct Global<'a> {
 impl Global<'_> {
     pub fn event(&self, e: GlobalEvent) -> bool {
         self.fi.global_fired[e as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_frame_unprimes_repeat_timers() {
+        let mut router = Router::new();
+        router.timers.gameplay[0] = 0.12;
+        router.timers.menu[0] = 0.08;
+        router.drain_frame();
+        assert!(router.timers.gameplay.iter().all(|&t| t < 0.0));
+        assert!(router.timers.menu.iter().all(|&t| t < 0.0));
     }
 }

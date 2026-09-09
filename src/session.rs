@@ -1,12 +1,15 @@
 //! Remembered connection details, so the Host/Join forms pre-fill what you used
 //! last time instead of the bare defaults.
 //!
-//! Stored as plain `key=value` lines in `saves/session.cfg` (std-only, mirroring
-//! [`settings`](crate::settings)). Passwords are deliberately never persisted.
+//! Stored as plain `key=value` lines in `session.cfg` under the config root
+//! (std-only, mirroring [`settings`](crate::settings)). Passwords are deliberately
+//! never persisted.
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
-const SESSION_PATH: &str = "saves/session.cfg";
+fn session_path() -> PathBuf {
+    crate::paths::Paths::get().session_file()
+}
 
 /// The last-used join address, port text, and player name. Values are the raw
 /// field text (so an empty port keeps its "use the default" meaning on reload).
@@ -30,7 +33,7 @@ impl Session {
     /// Load from disk, falling back to defaults for missing entries.
     pub fn load() -> Self {
         let mut s = Self::default();
-        if let Ok(text) = fs::read_to_string(SESSION_PATH) {
+        if let Ok(text) = fs::read_to_string(session_path()) {
             for line in text.lines() {
                 let Some((key, value)) = line.split_once('=') else {
                     continue;
@@ -49,13 +52,34 @@ impl Session {
 
     /// Best-effort save (a failed write shouldn't crash the game).
     pub fn save(&self) {
-        if let Some(dir) = Path::new(SESSION_PATH).parent() {
+        let path = session_path();
+        if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
         let text = format!(
             "address={}\nport={}\nname={}\n",
             self.address, self.port, self.name
         );
-        let _ = fs::write(SESSION_PATH, text);
+        let _ = crate::save::write_atomic(&path, text.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_uses_defaults_for_missing_and_unknown_keys() {
+        let path = session_path();
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(&path, "address = 10.0.0.2\nunknown=x\nnot-a-pair\nname=watt\n").unwrap();
+        assert!(path.starts_with(&crate::paths::Paths::get().config));
+        let s = Session::load();
+        assert_eq!(s.address, "10.0.0.2");
+        assert_eq!(s.name, "watt");
+        assert_eq!(s.port, "");
+        let _ = fs::remove_file(path);
     }
 }

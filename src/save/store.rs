@@ -2,17 +2,18 @@
 //! Writes use .tmp + sync_all + rename so a crash mid-save can't corrupt the
 //! only copy; successful writes rotate the old file to .bak. Reads ladder down
 //! (live intact → backup intact → salvage) and report which rung succeeded.
-//! Deletes move to saves/trash/ instead of unlinking for cheap undo.
+//! Deletes move to trash/ under the data root instead of unlinking for cheap undo.
 
 use std::fs;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use super::format::{self, Decoded};
 use super::slot::{SaveError, Slot, SlotId};
+use crate::paths::Paths;
 
-fn saves_dir() -> PathBuf {
-    PathBuf::from("saves")
+fn saves_dir() -> &'static Path {
+    Paths::get().data.as_path()
 }
 
 fn trash_dir() -> PathBuf {
@@ -64,10 +65,13 @@ pub fn list() -> Vec<Slot> {
 }
 
 fn peek_file(path: &std::path::Path) -> Result<super::slot::SaveMeta, SaveError> {
-    let mut f = fs::File::open(path)?;
-    let mut buf = [0u8; format::HEADER_LEN];
-    f.read_exact(&mut buf)?;
-    format::peek_meta(&buf)
+    let f = fs::File::open(path)?;
+    let mut v = Vec::with_capacity(format::HEADER_LEN);
+    f.take(format::HEADER_LEN as u64).read_to_end(&mut v)?;
+    if v.len() < format::HEADER_LEN {
+        return Err(SaveError::Corrupt("not a save"));
+    }
+    format::peek_meta(&v)
 }
 
 /// Prefers: intact live > intact backup > salvaged live > salvaged backup.
@@ -89,6 +93,26 @@ pub fn read(id: &SlotId) -> Result<(Decoded, Source), SaveError> {
     }
 }
 
+/// Write `bytes` to `path` via a sibling `.tmp`, `sync_all`, then rename.
+/// A crash mid-write leaves the previous file intact. Success leaves no `.tmp`.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Atomically replace a slot's bytes, rotating the previous file to `.bak`.
 pub fn write(id: &SlotId, bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(saves_dir())?;
@@ -96,7 +120,7 @@ pub fn write(id: &SlotId, bytes: &[u8]) -> io::Result<()> {
     let live = live_path(id);
     {
         let mut f = fs::File::create(&tmp)?;
-        io::Write::write_all(&mut f, bytes)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
     if live.exists() {
@@ -124,7 +148,7 @@ pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
     Ok(())
 }
 
-/// Move a slot (and its backup) into `saves/trash/` rather than unlinking.
+/// Move a slot (and its backup) into `trash/` under the data root rather than unlinking.
 pub fn delete(id: &SlotId) -> io::Result<()> {
     fs::create_dir_all(trash_dir())?;
     let dest = unused_trash_path(id);
@@ -172,12 +196,13 @@ fn unused_id(base: &str) -> Result<SlotId, SaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::format::{Edit, PlayerState, SaveDoc};
+    use super::super::format::{Edit, PlayerState, SaveDoc, WorldgenStamp};
     use super::super::slot::SaveMeta;
 
     fn doc(name: &str, edits: u32) -> SaveDoc {
         SaveDoc {
             worldgen_version: 2,
+            worldgen: WorldgenStamp::default(),
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,
@@ -192,6 +217,7 @@ mod tests {
                 pitch: 0.0,
                 flying: false,
                 noclip: false,
+                stash: Some(vec![]),
             },
             specs: vec!["air".to_string()],
             edits: (0..edits as i32).map(|i| Edit { x: i, y: 200, z: -i, spec: 0 }).collect(),
@@ -347,6 +373,83 @@ mod tests {
         assert!(trashed.exists());
 
         let _ = fs::remove_file(trashed);
+    }
+
+    #[test]
+    fn both_rungs_corrupt_errors_and_deletes_nothing() {
+        let id = SlotId::new("__store_both_bad__").unwrap();
+        cleanup(&id);
+        write(&id, &format::encode(&doc("v1", 1)).unwrap()).unwrap();
+        write(&id, &format::encode(&doc("v2", 2)).unwrap()).unwrap();
+        fs::write(live_path(&id), b"WATT garbage live").unwrap();
+        fs::write(bak_path(&id), b"WATT garbage bak").unwrap();
+        assert!(read(&id).is_err());
+        assert!(live_path(&id).exists(), "a failed ladder must not delete live");
+        assert!(bak_path(&id).exists(), "a failed ladder must not delete backup");
+        cleanup(&id);
+    }
+
+    #[test]
+    fn peek_file_reads_a_full_header_and_rejects_a_short_read() {
+        let id = SlotId::new("__store_peek__").unwrap();
+        cleanup(&id);
+        let bytes = format::encode(&doc("peeked", 1)).unwrap();
+        write(&id, &bytes).unwrap();
+        assert_eq!(peek_file(&live_path(&id)).unwrap().name, "peeked");
+
+        fs::write(live_path(&id), &bytes[..format::HEADER_LEN - 1]).unwrap();
+        assert!(
+            matches!(peek_file(&live_path(&id)), Err(SaveError::Corrupt("not a save"))),
+            "fewer than HEADER_LEN bytes is not a save"
+        );
+        cleanup(&id);
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_tmp_on_success() {
+        let path = std::env::temp_dir().join(format!(
+            "watt-atomic-{}-{}.cfg",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let tmp = {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".tmp");
+            PathBuf::from(name)
+        };
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&tmp);
+        write_atomic(&path, b"ok\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ok\n");
+        assert!(!tmp.exists(), "successful write must consume the .tmp");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_atomic_into_unwritable_dir_is_err() {
+        let parent = std::env::temp_dir().join(format!(
+            "watt-atomic-notdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(1)
+        ));
+        let _ = fs::remove_file(&parent);
+        let _ = fs::remove_dir_all(&parent);
+        fs::write(&parent, b"not a directory").unwrap();
+        let path = parent.join("mods.cfg");
+        assert!(write_atomic(&path, b"nope").is_err());
+        let tmp = {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".tmp");
+            PathBuf::from(name)
+        };
+        assert!(!tmp.exists(), "failed write must not leave a .tmp");
+        let _ = fs::remove_file(&parent);
     }
 
     #[test]

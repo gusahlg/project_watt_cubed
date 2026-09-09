@@ -3,31 +3,47 @@
 //! `WATT_BENCH=<seconds>` remains the entry switch. A run now waits for both a
 //! minimum warmup and world readiness (with a bounded timeout), records frame
 //! and streaming distributions, inventories the machine without optional
-//! command-line tools, and emits one stable JSON record. Set
-//! `WATT_BENCH_OUTPUT=<path>` to append the same JSON as JSONL.
+//! command-line tools, and emits one stable JSON record.
+//!
+//! Environment:
+//! - `WATT_BENCH_OUTPUT=<path>` appends the same JSON as JSONL.
+//! - `WATT_BENCH_SCREENSHOT=<path.png>` writes the final presented frame after
+//!   the measured window (blocking engine capture; failure does not drop the report).
+//! - `WATT_BENCH_YAW=<rad/s>` steady-rotate rate (default 0.4; `0` = static camera).
+//! - `WATT_BENCH_MOVE=<m/s>` +X flight speed (default 0, static camera).
+//! - `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, `WATT_BENCH_TAG`,
+//!   `WATT_BENCH_POS`, `WATT_BENCH_PRESET`, `WATT_BENCH_SEED`,
+//!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_PROFILE`,
+//!   `WATT_BENCH_GPU` — see `documentation/performance.md`.
 
 mod json;
 mod system;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{DVec3, Engine};
 
 use crate::settings::Settings;
-use crate::world::{StreamGauges, World};
+use crate::world::{MemoryCensus, StreamGauges, World};
 
 use json::Json;
 use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
 
+pub(crate) use system::graphics_caps;
+
 const DEFAULT_DURATION_SECS: f64 = 10.0;
 const DEFAULT_WARMUP_SECS: f64 = 3.0;
 const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;
+const DEFAULT_YAW_RATE_RAD_S: f64 = 0.4;
 const MAX_DURATION_SECS: f64 = 600.0;
 const MAX_SAMPLE_RESERVE: usize = 2_000_000;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+/// Readiness, stream gauges, and RSS are sampled at this rate on the bench
+/// wall clock. Peak gauges are therefore 4 Hz samples, not per-frame maxima.
+const WORLD_SAMPLE_HZ: u32 = 4;
 
 /// What the app should do after advancing the recorder by one callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +60,16 @@ enum Phase {
     WaitingToStart,
     Warming,
     Measuring,
+    Complete,
+}
+
+/// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchModPins {
+    /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+    pub worldgen_diffusion: Option<bool>,
+    /// `Some(true)` strips visual mods (core look); `Some(false)` leaves them on.
+    pub visuals_core: Option<bool>,
 }
 
 /// Complete state for one `WATT_BENCH` run.
@@ -55,8 +81,14 @@ pub struct Benchmark {
     /// Flight speed along +X during the run (`WATT_BENCH_MOVE`, m/s); zero
     /// keeps the classic static steady-rotate scenario.
     move_mps: f64,
+    /// Steady-rotate rate (`WATT_BENCH_YAW`, rad/s); zero holds the camera.
+    yaw_rate: f64,
+    /// Final presented-frame PNG (`WATT_BENCH_SCREENSHOT`); captured after
+    /// the last sample, never during it.
+    screenshot: Option<PathBuf>,
     output: Option<PathBuf>,
     tag: Option<String>,
+    visuals_raw: Option<String>,
     phase: Phase,
     warmup_started: Option<Instant>,
     measure_started: Option<Instant>,
@@ -72,6 +104,15 @@ pub struct Benchmark {
     rss_peak_bytes: Option<u64>,
     last_rss_poll: Instant,
     ready_wait_logs: u32,
+    world_sampled_at: Option<Instant>,
+    cached_ready: bool,
+    /// Wall seconds from [`Self::begin`] (first bench frame) to the first
+    /// `entry_complete` sample. `None` if the world never settled.
+    entry_seconds: Option<f64>,
+    census_ready: Option<MemoryCensus>,
+    /// Wall time of the measured window, frozen at `Step::Complete` so a
+    /// later screenshot readback cannot inflate `wall_seconds`.
+    measured_wall: Option<Duration>,
 }
 
 impl Benchmark {
@@ -100,6 +141,8 @@ impl Benchmark {
             })
         });
         let move_mps = env_seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
+        let yaw_rate = env_seconds("WATT_BENCH_YAW", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0);
+        let screenshot = parse_screenshot(std::env::var_os("WATT_BENCH_SCREENSHOT"));
         let output = std::env::var_os("WATT_BENCH_OUTPUT")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -107,6 +150,7 @@ impl Benchmark {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let visuals_raw = std::env::var("WATT_BENCH_VISUALS").ok();
         let reserve = ((duration.ceil() as usize).saturating_mul(25_000)).min(MAX_SAMPLE_RESERVE);
         let now = Instant::now();
         Some(Self {
@@ -115,8 +159,11 @@ impl Benchmark {
             ready_timeout: Duration::from_secs_f64(ready_timeout),
             pos,
             move_mps,
+            yaw_rate,
+            screenshot,
             output,
             tag,
+            visuals_raw,
             phase: Phase::WaitingToStart,
             warmup_started: None,
             measure_started: None,
@@ -132,7 +179,46 @@ impl Benchmark {
             rss_peak_bytes: None,
             last_rss_poll: now,
             ready_wait_logs: 0,
+            world_sampled_at: None,
+            cached_ready: false,
+            entry_seconds: None,
+            census_ready: None,
+            measured_wall: None,
         })
+    }
+
+    /// The only parser for `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
+    /// Applied even when `WATT_BENCH` itself is unset so a pin-and-play run
+    /// uses the same accepted values as a timed harness run.
+    pub fn mod_pins_from_env() -> BenchModPins {
+        let worldgen_diffusion = match std::env::var("WATT_BENCH_WORLDGEN") {
+            Ok(value) => match parse_bench_worldgen(&value) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    eprintln!(
+                        "WATT_BENCH_WORLDGEN={value:?} not recognized; use classic|diffusion"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let visuals_core = match std::env::var("WATT_BENCH_VISUALS") {
+            Ok(value) => match parse_bench_visuals(&value) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    eprintln!(
+                        "WATT_BENCH_VISUALS={value:?} not recognized; use off|core|on|full"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        BenchModPins {
+            worldgen_diffusion,
+            visuals_core,
+        }
     }
 
     pub fn has_started(&self) -> bool {
@@ -146,6 +232,31 @@ impl Benchmark {
     /// Flight speed along +X (m/s); zero for the static scenario.
     pub fn move_mps(&self) -> f64 {
         self.move_mps
+    }
+
+    /// Steady-rotate rate (rad/s); zero holds yaw.
+    pub fn yaw_rate(&self) -> f64 {
+        self.yaw_rate
+    }
+
+    /// PNG path for the post-measure capture, if requested.
+    pub fn screenshot_path(&self) -> Option<&Path> {
+        self.screenshot.as_deref()
+    }
+
+    /// True after the last sample; the next `bench_frame` may capture then finish.
+    pub fn measurement_complete(&self) -> bool {
+        self.phase == Phase::Complete
+    }
+
+    /// Translate the player along +X for a move-scenario run. Flight is forced
+    /// so gravity cannot embed the player in terrain the stream has not
+    /// prepared under the new x.
+    pub fn apply_move(&self, player: &mut crate::player::Player, dt: f32) {
+        if self.move_mps > 0.0 {
+            player.set_flying(true);
+            player.position.x += self.move_mps * dt as f64;
+        }
     }
 
     /// Start metadata collection inside the already-created engine callback,
@@ -182,6 +293,29 @@ impl Benchmark {
         }
     }
 
+    /// Sample world readiness and stream gauges at [`WORLD_SAMPLE_HZ`]. Peaks
+    /// recorded from these samples are 4 Hz, not per-frame maxima. Also
+    /// refreshes RSS on the same cadence so `/proc` is not read every frame.
+    pub fn poll_world(&mut self, world: &World) -> (bool, StreamGauges) {
+        let period = Duration::from_secs_f64(1.0 / f64::from(WORLD_SAMPLE_HZ));
+        let due = self
+            .world_sampled_at
+            .is_none_or(|t| t.elapsed() >= period);
+        if due {
+            self.world_sampled_at = Some(Instant::now());
+            self.cached_ready = world.entry_complete();
+            self.last_gauges = world.stream_gauges();
+            if self.cached_ready {
+                self.stamp_ready();
+                if self.census_ready.is_none() {
+                    self.census_ready = Some(world.memory_census());
+                }
+            }
+            self.poll_rss();
+        }
+        (self.cached_ready, self.last_gauges)
+    }
+
     /// Advance warmup/measurement using wall time for boundaries and the
     /// engine's previous-frame duration for the sample itself.
     pub fn step(&mut self, dt: f32, world_ready: bool, gauges: StreamGauges) -> Step {
@@ -197,6 +331,9 @@ impl Benchmark {
                     .elapsed();
                 let minimum_met = elapsed >= self.min_warmup;
                 let timed_out = elapsed >= self.min_warmup.saturating_add(self.ready_timeout);
+                if world_ready {
+                    self.stamp_ready();
+                }
                 if !minimum_met || (!world_ready && !timed_out) {
                     return Step::Warming;
                 }
@@ -216,6 +353,9 @@ impl Benchmark {
                 Step::Warming
             }
             Phase::Measuring => {
+                if world_ready {
+                    self.stamp_ready();
+                }
                 if dt.is_finite() && dt > 0.0 {
                     self.samples.push(dt);
                 }
@@ -225,11 +365,34 @@ impl Benchmark {
                     .elapsed()
                     >= self.duration
                 {
+                    self.measured_wall = Some(
+                        self.measure_started
+                            .expect("measurement clock set")
+                            .elapsed(),
+                    );
+                    self.phase = Phase::Complete;
                     Step::Complete
                 } else {
                     Step::Measuring
                 }
             }
+            Phase::Complete => Step::Complete,
+        }
+    }
+
+    /// Blocking capture of the last presented frame. No-op if unset. Prints one
+    /// line on failure; the caller still emits the report.
+    pub fn capture_screenshot(&self, eng: &mut Engine) {
+        let Some(path) = &self.screenshot else {
+            return;
+        };
+        let write = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| voxel_engine::skeleton::screenshot_to(eng, path));
+        if let Err(err) = write {
+            eprintln!("benchmark: screenshot failed: {err}");
         }
     }
 
@@ -246,9 +409,12 @@ impl Benchmark {
         if let Some(rss) = rss_end_bytes {
             self.rss_peak_bytes = Some(self.rss_peak_bytes.unwrap_or(0).max(rss));
         }
-        let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
+        let wall = self.measured_wall.unwrap_or_else(|| {
+            self.measure_started.map_or(Duration::ZERO, |t| t.elapsed())
+        });
         let stats = FrameStats::from_samples(&self.samples, wall);
-        let visuals = std::env::var("WATT_BENCH_VISUALS").ok();
+        let census_end = world.memory_census();
+        let visuals = self.visuals_raw.clone();
         let report = Json::object(vec![
             ("schema_version", Json::from(SCHEMA_VERSION)),
             ("kind", Json::from("project_watt_cubed.runtime_benchmark")),
@@ -278,7 +444,8 @@ impl Benchmark {
                     ("visuals", Json::optional_str(visuals.as_deref())),
                     ("requested_position", position_json(self.pos)),
                     ("actual_position", position_json(Some(actual_position))),
-                    ("yaw_rate_rad_s", Json::number(0.4)),
+                    ("yaw_rate_rad_s", Json::number(self.yaw_rate)),
+                    ("screenshot", path_json(self.screenshot.as_deref())),
                     (
                         "requested_duration_s",
                         Json::number(self.duration.as_secs_f64()),
@@ -301,6 +468,10 @@ impl Benchmark {
                     ),
                     ("ready_at_end", Json::from(world.entry_complete())),
                     (
+                        "entry_seconds",
+                        Json::optional_number(self.entry_seconds),
+                    ),
+                    (
                         "profiling_enabled",
                         Json::from(matches!(
                             std::env::var("WATT_BENCH_PROFILE").as_deref(),
@@ -316,6 +487,11 @@ impl Benchmark {
                     ("rss_start_bytes", Json::optional_u64(self.rss_start_bytes)),
                     ("rss_peak_bytes", Json::optional_u64(self.rss_peak_bytes)),
                     ("rss_end_bytes", Json::optional_u64(rss_end_bytes)),
+                    (
+                        "census_ready",
+                        self.census_ready.map_or(Json::Null, census_json),
+                    ),
+                    ("census_end", census_json(census_end)),
                 ]),
             ),
             (
@@ -327,12 +503,13 @@ impl Benchmark {
                     ),
                     ("end", stream_gauges_json(self.last_gauges)),
                     ("peaks", self.peaks.to_json()),
+                    ("peaks_sample_hz", Json::from(WORLD_SAMPLE_HZ)),
                 ]),
             ),
         ]);
         let json = report.render();
         let summary = format!(
-            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} preset={} window={}x{} gpu={}",
+            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} ready_s={} preset={} window={}x{} gpu={}",
             stats.frames,
             fmt_opt(stats.avg_fps, 0),
             fmt_opt(stats.p1_fps, 0),
@@ -342,16 +519,44 @@ impl Benchmark {
             stats.over_33ms,
             rss_end_bytes.unwrap_or(0) / (1024 * 1024),
             self.ready_before_measure,
+            fmt_opt(self.entry_seconds, 3),
             settings.preset.label().to_ascii_lowercase(),
             eng.screen_width(),
             eng.screen_height(),
             self.system.as_ref().map_or("unknown", SystemInfo::gpu_name),
         );
+        let mem_line = format!(
+            "BENCH_MEM ready_total={} end_total={} chunks=u{}/p{}/d{} light=u{}/c{} light_bytes=u{}/c{} mesh={} edits={} lod={} queues={}",
+            self.census_ready.map_or_else(|| "n/a".into(), |c| c.total.to_string()),
+            census_end.total,
+            census_end.chunk_uniform_count,
+            census_end.chunk_paletted_count,
+            census_end.chunk_dense_count,
+            census_end.light_uniform_count,
+            census_end.light_cells_count,
+            census_end.light_uniform_bytes,
+            census_end.light_cells_bytes,
+            census_end.mesh_cpu_bytes,
+            census_end.edit_overlay_bytes,
+            census_end.section_lod_bytes,
+            census_end.worklist_bytes,
+        );
         Report {
             summary,
+            mem_line,
             json,
             output: self.output.clone(),
         }
+    }
+
+    fn stamp_ready(&mut self) {
+        if self.entry_seconds.is_some() {
+            return;
+        }
+        let Some(started) = self.warmup_started else {
+            return;
+        };
+        self.entry_seconds = Some(started.elapsed().as_secs_f64());
     }
 
     fn poll_rss(&mut self) {
@@ -367,6 +572,7 @@ impl Benchmark {
 
 pub struct Report {
     summary: String,
+    mem_line: String,
     json: String,
     output: Option<PathBuf>,
 }
@@ -374,6 +580,7 @@ pub struct Report {
 impl Report {
     pub fn emit(self) {
         println!("{}", self.summary);
+        println!("{}", self.mem_line);
         println!("BENCH_JSON {}", self.json);
         let Some(path) = self.output else { return };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
@@ -490,6 +697,11 @@ impl FrameStats {
             ("frames_over_16_67ms", Json::from(self.over_16ms)),
             ("frames_over_33_33ms", Json::from(self.over_33ms)),
             ("frames_over_50ms", Json::from(self.over_50ms)),
+            // Engine::frames_rendered / frames_coalesced are not on this engine
+            // revision; filled when those accessors land.
+            ("rendered", Json::Null),
+            ("coalesced", Json::Null),
+            ("rendered_fps", Json::Null),
         ])
     }
 }
@@ -501,6 +713,8 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[index]
 }
 
+/// Peak stream gauges observed during the run. Values are 4 Hz wall-clock
+/// samples (see [`WORLD_SAMPLE_HZ`]), not per-frame maxima.
 #[derive(Clone, Copy, Debug)]
 struct StreamPeaks {
     max_chunks: usize,
@@ -583,6 +797,26 @@ impl StreamPeaks {
     }
 }
 
+fn census_json(c: MemoryCensus) -> Json {
+    Json::object(vec![
+        ("chunk_uniform_bytes", Json::from(c.chunk_uniform_bytes)),
+        ("chunk_uniform_count", Json::from(c.chunk_uniform_count)),
+        ("chunk_paletted_bytes", Json::from(c.chunk_paletted_bytes)),
+        ("chunk_paletted_count", Json::from(c.chunk_paletted_count)),
+        ("chunk_dense_bytes", Json::from(c.chunk_dense_bytes)),
+        ("chunk_dense_count", Json::from(c.chunk_dense_count)),
+        ("light_uniform_bytes", Json::from(c.light_uniform_bytes)),
+        ("light_uniform_count", Json::from(c.light_uniform_count)),
+        ("light_cells_bytes", Json::from(c.light_cells_bytes)),
+        ("light_cells_count", Json::from(c.light_cells_count)),
+        ("mesh_cpu_bytes", Json::from(c.mesh_cpu_bytes)),
+        ("edit_overlay_bytes", Json::from(c.edit_overlay_bytes)),
+        ("section_lod_bytes", Json::from(c.section_lod_bytes)),
+        ("worklist_bytes", Json::from(c.worklist_bytes)),
+        ("total", Json::from(c.total)),
+    ])
+}
+
 fn stream_gauges_json(g: StreamGauges) -> Json {
     Json::object(vec![
         ("chunks", Json::from(g.chunks)),
@@ -598,6 +832,9 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("worker_capacity", Json::from(g.worker_capacity)),
         ("travel_speed_mps", Json::number(g.travel_speed_mps)),
         ("effort", Json::number(f64::from(g.effort))),
+        ("light_admitted", Json::from(g.light_admitted as u64)),
+        ("light_admitted_last", Json::from(g.light_admitted_last)),
+        ("light_seed_inserts", Json::from(g.light_seed_inserts as u64)),
     ])
 }
 
@@ -609,6 +846,32 @@ fn position_json(pos: Option<DVec3>) -> Json {
             Json::number(p.z),
         ])
     })
+}
+
+fn path_json(path: Option<&Path>) -> Json {
+    path.map_or(Json::Null, |p| Json::from(p.to_string_lossy().as_ref()))
+}
+
+fn parse_screenshot(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+fn parse_bench_worldgen(value: &str) -> Option<bool> {
+    match value {
+        "diffusion" => Some(true),
+        "classic" => Some(false),
+        _ => None,
+    }
+}
+
+/// `Some(true)` strips the visual mods (core look); `Some(false)` leaves them on.
+fn parse_bench_visuals(value: &str) -> Option<bool> {
+    match value {
+        "off" | "core" => Some(true),
+        "on" | "full" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_position(raw: &str) -> Option<DVec3> {
@@ -679,6 +942,19 @@ mod tests {
     }
 
     #[test]
+    fn apply_move_sets_flying_so_gravity_cannot_embed() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.move_mps = 40.0;
+        let mut player = crate::player::Player::new(DVec3::new(0.0, 40.0, 0.0));
+        assert!(!player.flying());
+        bench.apply_move(&mut player, 0.25);
+        assert!(player.flying(), "move scenario must fly rather than walk");
+        assert!((player.position.x - 10.0).abs() < 1e-9);
+        bench.apply_move(&mut player, 0.0);
+        assert!(player.flying());
+    }
+
+    #[test]
     fn json_escaping_and_position_validation_are_strict() {
         assert_eq!(Json::from("a\n\"b").render(), "\"a\\n\\\"b\"");
         assert!(parse_position("1,2,3").is_some());
@@ -693,8 +969,11 @@ mod tests {
             ready_timeout,
             pos: None,
             move_mps: 0.0,
+            yaw_rate: DEFAULT_YAW_RATE_RAD_S,
+            screenshot: None,
             output: None,
             tag: None,
+            visuals_raw: None,
             phase: Phase::WaitingToStart,
             warmup_started: None,
             measure_started: None,
@@ -710,7 +989,59 @@ mod tests {
             rss_peak_bytes: None,
             last_rss_poll: Instant::now(),
             ready_wait_logs: 0,
+            world_sampled_at: None,
+            cached_ready: false,
+            entry_seconds: None,
+            census_ready: None,
+            measured_wall: None,
         }
+    }
+
+    #[test]
+    fn entry_seconds_stamps_on_the_first_ready_frame() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_secs(60));
+        bench.begin();
+        bench.warmup_started = Some(Instant::now() - Duration::from_millis(250));
+        let gauges = StreamGauges::default();
+        assert_eq!(bench.step(0.016, false, gauges), Step::Warming);
+        assert!(bench.entry_seconds.is_none());
+        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        let secs = bench.entry_seconds.expect("ready frame stamps entry_seconds");
+        assert!(secs >= 0.25, "got {secs}");
+        assert!(secs < 2.0, "got {secs}");
+        assert_eq!(bench.step(0.016, true, gauges), Step::Measuring);
+        let again = bench.entry_seconds.expect("stays set");
+        assert_eq!(format!("{secs:.6}"), format!("{again:.6}"));
+    }
+
+    #[test]
+    fn census_json_contains_the_new_fields() {
+        let json = census_json(MemoryCensus {
+            chunk_uniform_bytes: 4,
+            chunk_uniform_count: 1,
+            total: 4,
+            ..MemoryCensus::default()
+        })
+        .render();
+        assert!(json.contains("\"chunk_uniform_bytes\":4"));
+        assert!(json.contains("\"chunk_uniform_count\":1"));
+        assert!(json.contains("\"light_uniform_count\":0"));
+        assert!(json.contains("\"light_uniform_bytes\":0"));
+        assert!(json.contains("\"light_cells_count\":0"));
+        assert!(json.contains("\"light_cells_bytes\":0"));
+        assert!(json.contains("\"mesh_cpu_bytes\":0"));
+        assert!(json.contains("\"total\":4"));
+        let frames = FrameStats::from_samples(&[], Duration::ZERO).to_json().render();
+        assert!(frames.contains("\"rendered\":null"));
+        assert!(frames.contains("\"coalesced\":null"));
+        assert!(frames.contains("\"rendered_fps\":null"));
+        let scenario = Json::object(vec![
+            ("entry_seconds", Json::optional_number(Some(1.5))),
+        ])
+        .render();
+        assert!(scenario.contains("\"entry_seconds\":1.5"));
+        let missing = Json::object(vec![("entry_seconds", Json::optional_number(None))]).render();
+        assert!(missing.contains("\"entry_seconds\":null"));
     }
 
     #[test]
@@ -736,4 +1067,170 @@ mod tests {
         assert!(bench.wait_log_due());
         assert!(!bench.wait_log_due());
     }
+
+    #[test]
+    fn bench_env_accepted_values() {
+        assert_eq!(parse_bench_worldgen("diffusion"), Some(true));
+        assert_eq!(parse_bench_worldgen("classic"), Some(false));
+        assert_eq!(parse_bench_worldgen("Diffusion"), None);
+        assert_eq!(parse_bench_visuals("off"), Some(true));
+        assert_eq!(parse_bench_visuals("core"), Some(true));
+        assert_eq!(parse_bench_visuals("on"), Some(false));
+        assert_eq!(parse_bench_visuals("full"), Some(false));
+        assert_eq!(parse_bench_visuals("pretty"), None);
+    }
+
+    #[test]
+    fn move_and_yaw_parse_like_seconds() {
+        assert_eq!(parse_seconds("WATT_BENCH_MOVE", "0", 0.0, 0.0, 1000.0), 0.0);
+        assert_eq!(parse_seconds("WATT_BENCH_MOVE", "40", 0.0, 0.0, 1000.0), 40.0);
+        assert_eq!(parse_seconds("WATT_BENCH_MOVE", "-5", 0.0, 0.0, 1000.0), 0.0);
+        assert_eq!(
+            parse_seconds("WATT_BENCH_MOVE", "nope", 0.0, 0.0, 1000.0),
+            0.0
+        );
+        assert_eq!(
+            parse_seconds("WATT_BENCH_YAW", "0", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0),
+            0.0
+        );
+        assert_eq!(
+            parse_seconds(
+                "WATT_BENCH_YAW",
+                "0.4",
+                DEFAULT_YAW_RATE_RAD_S,
+                0.0,
+                1000.0
+            ),
+            0.4
+        );
+        assert_eq!(
+            parse_seconds(
+                "WATT_BENCH_YAW",
+                "not-a-number",
+                DEFAULT_YAW_RATE_RAD_S,
+                0.0,
+                1000.0
+            ),
+            DEFAULT_YAW_RATE_RAD_S
+        );
+        assert_eq!(
+            parse_seconds("WATT_BENCH_YAW", "1e9", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0),
+            1000.0
+        );
+    }
+
+    #[test]
+    fn screenshot_env_is_a_png_path_or_absent() {
+        assert_eq!(parse_screenshot(None), None);
+        assert_eq!(parse_screenshot(Some(std::ffi::OsString::from(""))), None);
+        assert_eq!(
+            parse_screenshot(Some(std::ffi::OsString::from("captures/final.png"))),
+            Some(PathBuf::from("captures/final.png"))
+        );
+    }
+
+    #[test]
+    fn scenario_report_includes_screenshot_and_live_yaw_rate() {
+        assert_eq!(path_json(None).render(), "null");
+        assert_eq!(
+            path_json(Some(Path::new("out.png"))).render(),
+            "\"out.png\""
+        );
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.yaw_rate = 0.0;
+        bench.screenshot = Some(PathBuf::from("shot.png"));
+        assert_eq!(
+            Json::object(vec![
+                ("yaw_rate_rad_s", Json::number(bench.yaw_rate)),
+                ("screenshot", path_json(bench.screenshot.as_deref())),
+            ])
+            .render(),
+            "{\"yaw_rate_rad_s\":0,\"screenshot\":\"shot.png\"}"
+        );
+        bench.screenshot = None;
+        bench.yaw_rate = DEFAULT_YAW_RATE_RAD_S;
+        assert_eq!(
+            Json::object(vec![
+                ("yaw_rate_rad_s", Json::number(bench.yaw_rate)),
+                ("screenshot", path_json(bench.screenshot.as_deref())),
+            ])
+            .render(),
+            "{\"yaw_rate_rad_s\":0.4,\"screenshot\":null}"
+        );
+    }
+
+    #[test]
+    fn complete_is_sticky_and_does_not_sample_further() {
+        let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
+        bench.begin();
+        bench.warmup_started = Some(Instant::now() - Duration::from_secs(1));
+        let gauges = StreamGauges::default();
+        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        bench.measure_started = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(bench.step(0.016, true, gauges), Step::Complete);
+        assert!(bench.measurement_complete());
+        assert_eq!(bench.samples.len(), 1);
+        assert!(bench.measured_wall.is_some());
+        assert_eq!(bench.step(0.016, true, gauges), Step::Complete);
+        assert_eq!(bench.samples.len(), 1);
+    }
+
+    #[test]
+    fn from_env_parses_screenshot_yaw_and_move() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let keys = [
+            "WATT_BENCH",
+            "WATT_BENCH_SCREENSHOT",
+            "WATT_BENCH_YAW",
+            "WATT_BENCH_MOVE",
+        ];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        unsafe {
+            std::env::set_var("WATT_BENCH", "1");
+            std::env::remove_var("WATT_BENCH_SCREENSHOT");
+            std::env::remove_var("WATT_BENCH_YAW");
+            std::env::remove_var("WATT_BENCH_MOVE");
+        }
+        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        assert!(bench.screenshot_path().is_none());
+        assert!((bench.yaw_rate() - DEFAULT_YAW_RATE_RAD_S).abs() < 1e-12);
+        assert_eq!(bench.move_mps(), 0.0);
+
+        unsafe {
+            std::env::set_var("WATT_BENCH_SCREENSHOT", "captures/final.png");
+            std::env::set_var("WATT_BENCH_YAW", "0");
+            std::env::set_var("WATT_BENCH_MOVE", "40");
+        }
+        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        assert_eq!(
+            bench.screenshot_path(),
+            Some(Path::new("captures/final.png"))
+        );
+        assert_eq!(bench.yaw_rate(), 0.0);
+        assert_eq!(bench.move_mps(), 40.0);
+
+        unsafe {
+            std::env::set_var("WATT_BENCH_SCREENSHOT", "");
+            std::env::set_var("WATT_BENCH_YAW", "not-a-number");
+            std::env::set_var("WATT_BENCH_MOVE", "-5");
+        }
+        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        assert!(bench.screenshot_path().is_none());
+        assert!((bench.yaw_rate() - DEFAULT_YAW_RATE_RAD_S).abs() < 1e-12);
+        assert_eq!(bench.move_mps(), 0.0);
+
+        for (k, v) in previous {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

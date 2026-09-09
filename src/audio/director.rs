@@ -10,11 +10,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use glam::{DVec3, IVec3};
+use voxel_engine::{DVec3, IVec3};
 
 use crate::block::registry::BlockId;
 use crate::console::Console;
-use crate::math::PER_METER;
 use crate::net::client::Connection;
 use crate::presence::STRIDE_FREQ;
 use crate::world::World;
@@ -29,9 +28,13 @@ use super::{
     SessionKey, SoundSystem, VoicePacket,
 };
 
-/// Radius of the acoustic window, authored as 32 metres and converted to whole
-/// world cells. Round outward so the advertised range is never truncated.
-const ACOUSTIC_RADIUS: u32 = (32.0 * PER_METER) as u32 + 1;
+/// Occlusion uses `OCCL_K = 0.08`; past ~16 m gain is at most `e^{-1.3}`.
+/// Radius 19 (dim 39, ~59k cells) covers that and is 7.7× cheaper than 38.
+const ACOUSTIC_RADIUS: u32 = 19;
+
+/// Squared metres. Below this the listener is treated as still, so an idle
+/// director can skip the frame without missing a footstep (those need >0.5 m/s).
+const LISTENER_STILL_EPS2: f64 = 1e-6;
 
 /// The unrecoverable facts: everything else the director derives from
 /// `AudioCtx`. Closed — its fold is one `match`, no bus/trait indirection.
@@ -43,6 +46,7 @@ pub enum SoundEvent {
 }
 
 /// The local listener pose, built once per frame from `Player`.
+#[derive(Clone, Copy)]
 pub struct PlayerPose {
     pub pos: DVec3,
     pub feet: DVec3,
@@ -109,8 +113,8 @@ fn phase_crossed(prev: f32, now: f32) -> bool {
     (now as f64 / std::f64::consts::PI).floor() != (prev as f64 / std::f64::consts::PI).floor()
 }
 
-/// The memoized acoustic window: recapture only when the world changed, the
-/// listener crossed a cell, or ~500 ms elapsed.
+/// The memoized acoustic window: recapture only when something will read it
+/// and the world changed, the listener crossed a cell, or ~500 ms elapsed.
 struct WindowCache {
     window: Option<Arc<AcousticWindow>>,
     edit_gen: u64,
@@ -128,7 +132,13 @@ impl WindowCache {
         }
     }
 
-    fn refresh(&mut self, world: &World, pos: DVec3, dt: f32) -> Option<Arc<AcousticWindow>> {
+    fn refresh(
+        &mut self,
+        world: &World,
+        pos: DVec3,
+        dt: f32,
+        needed: bool,
+    ) -> Option<Arc<AcousticWindow>> {
         self.timer += dt;
         let cell = IVec3::new(
             pos.x.floor() as i32,
@@ -140,8 +150,17 @@ impl WindowCache {
             || edit_gen != self.edit_gen
             || cell != self.cell
             || self.timer >= 0.5;
-        if stale {
-            self.window = Some(world.capture_acoustic_window(cell, ACOUSTIC_RADIUS));
+        if stale && needed {
+            let reuse = self
+                .window
+                .take()
+                .and_then(|arc| Arc::try_unwrap(arc).ok())
+                .map(AcousticWindow::into_cells);
+            self.window = Some(world.capture_acoustic_window_reuse(
+                cell,
+                ACOUSTIC_RADIUS,
+                reuse,
+            ));
             self.edit_gen = edit_gen;
             self.cell = cell;
             self.timer = 0.0;
@@ -216,6 +235,9 @@ pub struct AudioDirector {
     window: WindowCache,
     capture: CaptureLane,
     next_occurrence: u64,
+    /// Listener position of the last committed frame. `None` until the first
+    /// commit, which always runs so medium/gait start from a real pose.
+    last_commit: Option<DVec3>,
 }
 
 impl AudioDirector {
@@ -229,6 +251,7 @@ impl AudioDirector {
             window: WindowCache::new(),
             capture: CaptureLane::new(),
             next_occurrence: 0,
+            last_commit: None,
         }
     }
 
@@ -244,6 +267,26 @@ impl AudioDirector {
         self.voice_open.clear();
         self.window = WindowCache::new();
         self.capture = CaptureLane::new();
+        self.last_commit = None;
+    }
+
+    /// True when this frame would produce an empty journal and emitter table,
+    /// nothing is sounding, the listener has not moved, and no UI cue is waiting
+    /// — Game can skip building a pose and submitting an [`AudioFrame`].
+    pub fn can_skip_commit(
+        &self,
+        sound: &SoundSystem,
+        events: &[SoundEvent],
+        listener_pos: DVec3,
+        ptt: bool,
+    ) -> bool {
+        if ptt || !events.is_empty() || sound.has_live_sources() || sound.ui_pending() {
+            return false;
+        }
+        let Some(last) = self.last_commit else {
+            return false;
+        };
+        (listener_pos - last).length_squared() <= LISTENER_STILL_EPS2
     }
 
     fn mint(&mut self) -> OccurrenceId {
@@ -284,7 +327,6 @@ impl AudioDirector {
             pitch: ctx.player.pitch,
             medium,
         };
-        let window = self.window.refresh(ctx.world, ctx.player.pos, dt);
 
         let mut journal: Vec<Occurrence> = Vec::new();
 
@@ -400,12 +442,13 @@ impl AudioDirector {
             });
         }
 
+        let needed = sound.has_live_sources() || !journal.is_empty() || !emitters.is_empty();
+        let window = self.window.refresh(ctx.world, ctx.player.pos, dt, needed);
+
         // A rejected frame is a construction bug: debug-assert, never panic in release.
-        if let Some(window) = window {
-            match AudioFrame::new(dt.clamp(1e-4, 0.5), listener, journal, emitters, window) {
-                Ok(frame) => sound.submit(frame),
-                Err(e) => debug_assert!(false, "audio frame rejected: {e:?}"),
-            }
+        match AudioFrame::new(dt.clamp(1e-4, 0.5), listener, journal, emitters, window) {
+            Ok(frame) => sound.submit(frame),
+            Err(e) => debug_assert!(false, "audio frame rejected: {e:?}"),
         }
 
         // --- Ingest peer voice; record the key so the close-diff can retire it ---
@@ -433,6 +476,8 @@ impl AudioDirector {
                 ctx.console.print(format!("* audio: {fault:?}"));
             }
         }
+
+        self.last_commit = Some(ctx.player.pos);
     }
 }
 
@@ -460,4 +505,79 @@ fn sound_class_at_feet(world: &World, feet: DVec3) -> &'static str {
         feet.z.floor() as i32,
     );
     world.registry().sound_class(below)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::SoundSystem;
+    use crate::console::Console;
+    use crate::world::World;
+    use voxel_engine::DVec3;
+
+    fn pose(pos: DVec3) -> PlayerPose {
+        PlayerPose {
+            pos,
+            feet: DVec3::new(pos.x, pos.y - 1.6, pos.z),
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: DVec3::ZERO,
+            on_ground: true,
+        }
+    }
+
+    fn commit(dir: &mut AudioDirector, sound: &mut SoundSystem, world: &World, pos: DVec3) {
+        let mut console = Console::new();
+        dir.frame(
+            AudioCtx {
+                dt: 1.0 / 60.0,
+                player: pose(pos),
+                ptt: false,
+                voice_enabled: false,
+                events: Vec::new(),
+                peers: &[],
+                world,
+                net: None,
+                console: &mut console,
+            },
+            sound,
+        );
+    }
+
+    #[test]
+    fn acoustic_radius_matches_occlusion_falloff() {
+        assert_eq!(super::ACOUSTIC_RADIUS, 19);
+        assert_eq!(2 * super::ACOUSTIC_RADIUS + 1, 39);
+    }
+
+    #[test]
+    fn skip_commit_waits_for_the_first_frame() {
+        let (sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let dir = AudioDirector::new(palette);
+        assert!(!dir.can_skip_commit(&sound, &[], DVec3::ZERO, false));
+    }
+
+    #[test]
+    fn skip_commit_after_a_still_silent_frame() {
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut dir = AudioDirector::new(palette);
+        let world = World::generate();
+        let pos = DVec3::new(0.5, 80.0, 0.5);
+        commit(&mut dir, &mut sound, &world, pos);
+        assert!(dir.can_skip_commit(&sound, &[], pos, false));
+        assert!(
+            !dir.can_skip_commit(&sound, &[], pos + DVec3::X * 0.01, false),
+            "a centimetre of travel must re-enable the commit"
+        );
+        assert!(
+            !dir.can_skip_commit(&sound, &[SoundEvent::PeerSwing { at: pos }], pos, false),
+            "a pending event must re-enable the commit"
+        );
+        assert!(
+            !dir.can_skip_commit(&sound, &[], pos, true),
+            "push-to-talk must keep capture serviced"
+        );
+    }
 }

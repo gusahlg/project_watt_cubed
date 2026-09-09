@@ -17,6 +17,8 @@ use voxel_engine::DVec3;
 
 use crate::ident::codec;
 use crate::presence::Stance;
+use crate::world::diffusion::DiffusionCfg;
+use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
@@ -64,6 +66,32 @@ impl Wire for Stance {
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
         Stance::from_wire(r.u8().ok()?)
+    }
+}
+
+impl Wire for WorldgenKind {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u8(self.wire());
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        WorldgenKind::from_wire(r.u8().ok()?)
+    }
+}
+
+impl Wire for DiffusionCfg {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u32(self.tile);
+        w.u32(self.stride);
+        w.u32(self.phases);
+        w.f32(self.relief);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        Some(DiffusionCfg {
+            tile: r.u32().ok()?,
+            stride: r.u32().ok()?,
+            phases: r.u32().ok()?,
+            relief: r.f32().ok()?,
+        })
     }
 }
 
@@ -265,7 +293,13 @@ messages! {
 messages! {
     /// A message from the server to a client.
     pub enum ServerMessage {
-        Welcome = tag::WELCOME { player_id: u32, seed: i64, spawn: DVec3 },
+        Welcome = tag::WELCOME {
+            player_id: u32,
+            seed: i64,
+            spawn: DVec3,
+            worldgen: WorldgenKind,
+            diffusion: DiffusionCfg,
+        },
         /// The stream closes after this (bad password, version mismatch, server full).
         Reject = tag::REJECT { reason: Arc<str> },
         /// Sent once right after [`Welcome`](Self::Welcome). Each cell carries its
@@ -287,7 +321,9 @@ messages! {
         /// Sent to everyone except the editor (who gets the ack).
         Edit = tag::S_EDIT { x: i32, y: i32, z: i32, rev: u32, spec: Arc<str> },
         /// `accepted` with the committed revision, or rejected (stale expectation,
-        /// out of reach, invalid spec) — the signal prediction rolls back on.
+        /// out of reach, invalid spec, or a server-mod `Deny`) — the signal
+        /// prediction rolls back on. A hook Deny does not advance the cell, so
+        /// the client's `restore` is the same as a lost race.
         EditAck = tag::EDIT_ACK { req: u32, accepted: bool, rev: u32 },
         /// Refused teleport or implausible movement: snap to it.
         Position = tag::POSITION { pos: DVec3 },
@@ -303,12 +339,24 @@ messages! {
     }
 }
 
-/// Refuses to emit an over-cap frame so both ends share one hard size bound.
-pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+fn frame_header(payload: &[u8]) -> io::Result<[u8; 4]> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
     }
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
+    Ok((payload.len() as u32).to_be_bytes())
+}
+
+fn frame_len(header: [u8; 4]) -> io::Result<usize> {
+    let len = u32::from_be_bytes(header) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
+    }
+    Ok(len)
+}
+
+/// Refuses to emit an over-cap frame so both ends share one hard size bound.
+pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+    w.write_all(&frame_header(payload)?)?;
     w.write_all(payload)
 }
 
@@ -318,11 +366,7 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
 pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
-    }
-    buf.resize(len, 0);
+    buf.resize(frame_len(len_bytes)?, 0);
     r.read_exact(buf)
 }
 
@@ -330,10 +374,7 @@ pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
 /// and no `finish` — quinn transmits on its own, and finishing would close
 /// the multiplexed stream.
 pub async fn write_frame_async(s: &mut SendStream, payload: &[u8]) -> io::Result<()> {
-    if payload.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
-    }
-    s.write_all(&(payload.len() as u32).to_be_bytes()).await.map_err(io::Error::other)?;
+    s.write_all(&frame_header(payload)?).await.map_err(io::Error::other)?;
     s.write_all(payload).await.map_err(io::Error::other)
 }
 
@@ -341,11 +382,7 @@ pub async fn write_frame_async(s: &mut SendStream, payload: &[u8]) -> io::Result
 pub async fn read_frame_async(r: &mut RecvStream, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes).await.map_err(io::Error::other)?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
-    }
-    buf.resize(len, 0);
+    buf.resize(frame_len(len_bytes)?, 0);
     r.read_exact(buf).await.map_err(io::Error::other)
 }
 
@@ -394,6 +431,20 @@ mod tests {
                 player_id: 42,
                 seed: -9_999,
                 spawn: DVec3::new(0.5, 40.0, 0.5),
+                worldgen: WorldgenKind::Classic,
+                diffusion: DiffusionCfg::default(),
+            },
+            ServerMessage::Welcome {
+                player_id: 7,
+                seed: 11,
+                spawn: DVec3::new(1.0, 20.0, 2.0),
+                worldgen: WorldgenKind::Diffusion,
+                diffusion: DiffusionCfg {
+                    tile: 64,
+                    stride: 8,
+                    phases: 4,
+                    relief: 1.5,
+                },
             },
             ServerMessage::Reject { reason: "bad password".into() },
             ServerMessage::Snapshot {
@@ -471,8 +522,29 @@ mod tests {
         }
         let pm = ServerMessage::PeerMove { id: 7, pos, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
         assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
-        let wl = ServerMessage::Welcome { player_id: 1, seed: 3, spawn: pos };
+        let wl = ServerMessage::Welcome {
+            player_id: 1,
+            seed: 3,
+            spawn: pos,
+            worldgen: WorldgenKind::Diffusion,
+            diffusion: DiffusionCfg::default(),
+        };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
+    }
+
+    #[test]
+    fn welcome_rejects_unknown_worldgen_kind() {
+        let mut payload = ServerMessage::Welcome {
+            player_id: 1,
+            seed: 3,
+            spawn: DVec3::ZERO,
+            worldgen: WorldgenKind::Classic,
+            diffusion: DiffusionCfg::default(),
+        }
+        .encode();
+        // kind sits after tag, player_id, seed, spawn (1+4+8+24 = 37).
+        payload[37] = 9;
+        assert_eq!(ServerMessage::decode(&payload), None);
     }
 
     #[test]
@@ -541,5 +613,166 @@ mod tests {
         hostile.push(0);
         let mut scratch = Vec::new();
         assert!(read_frame(&mut std::io::Cursor::new(hostile), &mut scratch).is_err());
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            self.next() as u8
+        }
+        fn len(&mut self, max_incl: usize) -> usize {
+            (self.next() as usize) % (max_incl + 1)
+        }
+    }
+
+    fn decode_must_not_panic(bytes: &[u8]) {
+        let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ClientMessage::decode(bytes)));
+        let server = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ServerMessage::decode(bytes)));
+        assert!(client.is_ok(), "ClientMessage::decode panicked on {bytes:?}");
+        assert!(server.is_ok(), "ServerMessage::decode panicked on {bytes:?}");
+    }
+
+    #[test]
+    fn random_frames_never_panic_the_decoder() {
+        let mut rng = XorShift::new(0xC0FF_EE42_D00D);
+        let mut buf = vec![0u8; MAX_FRAME];
+        for b in buf.iter_mut() {
+            *b = rng.byte();
+        }
+        for _ in 0..100_000 {
+            let len = rng.len(MAX_FRAME);
+            for _ in 0..16 {
+                let i = rng.len(MAX_FRAME.saturating_sub(1));
+                buf[i] = rng.byte();
+            }
+            decode_must_not_panic(&buf[..len]);
+        }
+    }
+
+    fn encoding_side_rejects_trailing_bytes<T>(
+        frame: Vec<u8>,
+        extra: u8,
+        decode: fn(&[u8]) -> Option<T>,
+        rng: &mut XorShift,
+    ) {
+        decode_must_not_panic(&frame);
+        for n in 0..frame.len() {
+            decode_must_not_panic(&frame[..n]);
+        }
+        let mut grown = frame.clone();
+        grown.push(extra);
+        assert!(decode(&grown).is_none(), "encoding side must reject a trailing byte");
+        decode_must_not_panic(&grown);
+        if frame.is_empty() {
+            return;
+        }
+        let i = rng.len(frame.len() - 1);
+        let mut flipped = frame.clone();
+        flipped[i] ^= rng.byte() | 1;
+        decode_must_not_panic(&flipped);
+    }
+
+    #[test]
+    fn structural_flips_and_truncations_never_panic_and_reject_trailing_bytes() {
+        let mut rng = XorShift::new(0xA11C_EDED);
+        for message in client_cases() {
+            encoding_side_rejects_trailing_bytes(message.encode(), rng.byte(), ClientMessage::decode, &mut rng);
+        }
+        for message in server_cases() {
+            encoding_side_rejects_trailing_bytes(message.encode(), rng.byte(), ServerMessage::decode, &mut rng);
+        }
+    }
+
+    #[test]
+    fn strings_at_the_cap_round_trip_and_overlong_invalid_and_nuls_never_panic() {
+        let cap_name: Arc<str> = "n".repeat(super::super::MAX_NAME).into();
+        let hello = ClientMessage::Hello {
+            protocol: 1,
+            fingerprint: 0,
+            name: cap_name.clone(),
+            password: "".into(),
+        };
+        assert_eq!(ClientMessage::decode(&hello.encode()), Some(hello));
+
+        let over: Arc<str> = "n".repeat(super::super::MAX_NAME + 1).into();
+        let hello_over = ClientMessage::Hello {
+            protocol: 1,
+            fingerprint: 0,
+            name: over,
+            password: "p".repeat(super::super::MAX_NAME + 1).into(),
+        };
+        decode_must_not_panic(&hello_over.encode());
+
+        let cap_spec: Arc<str> = "s".repeat(super::super::MAX_SPEC).into();
+        let edit = ClientMessage::Edit {
+            req: 1,
+            x: 0,
+            y: 0,
+            z: 0,
+            expect: 0,
+            spec: cap_spec,
+        };
+        assert_eq!(ClientMessage::decode(&edit.encode()), Some(edit.clone()));
+        let mut over_spec = edit.clone();
+        if let ClientMessage::Edit { spec, .. } = &mut over_spec {
+            *spec = "s".repeat(super::super::MAX_SPEC + 1).into();
+        }
+        decode_must_not_panic(&over_spec.encode());
+
+        let nuls = ClientMessage::Chat { channel: 0, text: "ok\0still".into() };
+        match ClientMessage::decode(&nuls.encode()) {
+            Some(ClientMessage::Chat { text, .. }) => assert!(text.contains('\0') || text.contains("ok")),
+            other => panic!("nul chat must decode or reject, got {other:?}"),
+        }
+
+        // Invalid UTF-8 in a length-prefixed string: forge the bytes.
+        let mut w = codec::Writer::new();
+        w.u8(super::tag::CHAT);
+        w.u8(0);
+        w.u16(2);
+        w.raw(&[0xff, 0xfe]);
+        decode_must_not_panic(&w.into_inner());
+    }
+
+    #[test]
+    fn frame_helpers_reject_hostile_lengths_and_accept_empty_and_cap() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[]).unwrap();
+        let mut got = Vec::new();
+        read_frame(&mut std::io::Cursor::new(&buf), &mut got).unwrap();
+        assert!(got.is_empty());
+
+        let payload = vec![0x5a; MAX_FRAME];
+        buf.clear();
+        write_frame(&mut buf, &payload).unwrap();
+        got.clear();
+        read_frame(&mut std::io::Cursor::new(&buf), &mut got).unwrap();
+        assert_eq!(got, payload);
+
+        let mut hostile = u32::MAX.to_be_bytes().to_vec();
+        hostile.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(read_frame(&mut std::io::Cursor::new(hostile), &mut got).is_err());
+
+        let mut at_cap = (MAX_FRAME as u32).to_be_bytes().to_vec();
+        at_cap.push(1); // body short of the claimed length
+        assert!(read_frame(&mut std::io::Cursor::new(at_cap), &mut got).is_err());
+
+        let mut zero = 0u32.to_be_bytes().to_vec();
+        got.clear();
+        read_frame(&mut std::io::Cursor::new(&zero), &mut got).unwrap();
+        assert!(got.is_empty());
+        zero.extend_from_slice(&[9]); // trailing unread bytes are the caller's problem
     }
 }

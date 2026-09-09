@@ -4,14 +4,17 @@ use voxel_engine::Frame;
 
 use crate::menu::theme::MenuTheme;
 use crate::mods::Mods;
+use crate::render_config::VisualGroup;
 use crate::session::Session;
 use crate::settings::Settings;
 
 pub mod input;
 pub mod menus;
+pub mod start;
 pub mod theme;
 
 pub use input::gather;
+pub use start::{HostInfo, JoinInfo, MenuModel, StartAction, StartFacts, StartScreen, VERSION};
 pub use theme::{DefaultTheme, MenuTheme as _, PresentedRow, PresentedView, RowRect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +125,16 @@ impl<A: Copy> Row<A> {
         self.detail = Some(detail.into());
         self
     }
+
+    /// Non-selectable section title.
+    pub fn heading(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: None,
+            kind: RowKind::Heading,
+            tag: None,
+        }
+    }
 }
 
 pub struct View<A: Copy> {
@@ -166,14 +179,21 @@ pub enum Command {
 }
 
 /// A side effect only the App can carry out. Menus emit these instead of
-/// touching app state.
+/// touching app state. Start-screen actions ([`StartAction`]) map 1:1 onto
+/// the start-related variants; the rest are mods-menu effects.
 pub enum AppEffect {
     NewWorld,
-    Load(String),
+    Load(crate::save::SlotId),
     Host(HostInfo),
     Join(JoinInfo),
+    /// Push the core Settings hub (start screens emit this instead of pushing).
+    Settings,
+    /// Push the core Mods screen (start screens emit this instead of pushing).
+    Mods,
     ToggleMod(usize),
     StepModKnob { mod_index: usize, knob: usize, delta: i32 },
+    /// Enable or disable every member of a group (persists as per-mod lines).
+    SetGroup { id: &'static str, on: bool },
     Quit,
 }
 
@@ -182,7 +202,12 @@ pub struct ModRow {
     pub name: String,
     pub description: String,
     pub enabled: bool,
-    pub knobs: Vec<(String, String)>,
+    /// `(label, value, hint)` per knob.
+    pub knobs: Vec<(String, String, String)>,
+    pub visual_group: Option<VisualGroup>,
+    pub worldgen: bool,
+    /// Group id (`""` if ungrouped).
+    pub group: String,
 }
 
 impl ModRow {
@@ -195,8 +220,11 @@ impl ModRow {
                 knobs: mods
                     .knobs(i)
                     .into_iter()
-                    .map(|k| (k.label.to_string(), k.value))
+                    .map(|k| (k.label.to_string(), k.value, k.hint))
                     .collect(),
+                visual_group: mods.visual_group(i),
+                worldgen: mods.is_worldgen(i),
+                group: mods.group(i).to_string(),
             })
             .collect()
     }
@@ -209,6 +237,8 @@ pub struct Ctx<'a> {
     pub saves: &'a [crate::save::Slot],
     pub mods: &'a [ModRow],
     pub session: &'a Session,
+    /// Last `mods.cfg` write error, shown on the Mods screen.
+    pub mods_save_error: Option<&'a str>,
 }
 
 /// Pure view, effectful update.
@@ -295,6 +325,12 @@ impl<M: Menu> Framed<M> {
     {
         Box::new(Self::new(menu))
     }
+
+    pub fn view_sel(&self, ctx: &Ctx) -> (View<M::Action>, usize) {
+        let view = self.menu.view(ctx);
+        let sel = self.cursor.resolved(&view);
+        (view, sel)
+    }
 }
 
 impl<M: Menu> Screen for Framed<M> {
@@ -344,6 +380,14 @@ impl MenuStack {
         }
     }
 
+    pub fn push(&mut self, screen: Box<dyn Screen>) {
+        self.frames.push(screen);
+    }
+
+    pub fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
     pub fn draw(&self, ctx: &Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {
         self.frames.last().expect("non-empty stack").draw(ctx, theme, f, w, h);
     }
@@ -363,25 +407,19 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
         let tag = view.tag_at(sel);
         // Edit has priority so chars/backspace don't trigger nav.
         for i in intents {
-            if let Intent::Edit(op) = i {
-                if let Some(t) = tag {
-                    return Some(Msg::Edited(t, *op));
-                }
+            if let Intent::Edit(op) = i && let Some(t) = tag {
+                return Some(Msg::Edited(t, *op));
             }
         }
         // Adjust moves the caret.
         for i in intents {
-            if let Intent::Adjust(d) = i {
-                if let Some(t) = tag {
-                    let op = if *d == Dir::Prev { TextOp::Left } else { TextOp::Right };
-                    return Some(Msg::Edited(t, op));
-                }
+            if let Intent::Adjust(d) = i && let Some(t) = tag {
+                let op = if *d == Dir::Prev { TextOp::Left } else { TextOp::Right };
+                return Some(Msg::Edited(t, op));
             }
         }
-        if confirm(intents) {
-            if let Some(a) = view.default {
-                return Some(Msg::Pick(a));
-            }
+        if confirm(intents) && let Some(a) = view.default {
+            return Some(Msg::Pick(a));
         }
         if cancel(intents) {
             return Some(Msg::Back);
@@ -417,10 +455,8 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
                 return Some(Msg::Step(tag, Dir::Next));
             }
         }
-        Some(RowKind::Action) => {
-            if confirm(intents) {
-                return Some(Msg::Pick(tag));
-            }
+        Some(RowKind::Action) if confirm(intents) => {
+            return Some(Msg::Pick(tag));
         }
         _ => {}
     }
@@ -456,19 +492,6 @@ pub fn present<A: Copy>(view: &View<A>, scale: f32) -> PresentedView {
     }
 }
 
-pub struct HostInfo {
-    pub port: u16,
-    pub password: String,
-    pub name: String,
-}
-
-pub struct JoinInfo {
-    pub host: String,
-    pub port: u16,
-    pub password: String,
-    pub name: String,
-}
-
 pub const PORT_ERROR: &str = "invalid port (1-65535)";
 
 /// Parse a port field. Empty means DEFAULT_PORT; otherwise 1-65535.
@@ -496,5 +519,31 @@ pub fn apply_text_op(buf: &mut crate::ui::EditBuf, op: TextOp) {
         TextOp::Right => buf.right(),
         TextOp::Home => buf.home(),
         TextOp::End => buf.end(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_on_a_choice_row_steps_forward_like_right() {
+        let view = View {
+            title: String::new(),
+            style: Style::Panel,
+            rows: vec![Row::value("Tile", ValueView::Choice("32".into()), 0)],
+            default: None,
+            hint: String::new(),
+            notice: None,
+        };
+        let mut cursor = Cursor::default();
+        assert_eq!(
+            drive(&[Intent::Confirm], &view, &mut cursor),
+            Some(Msg::Step(0, Dir::Next))
+        );
+        assert_eq!(
+            drive(&[Intent::Adjust(Dir::Next)], &view, &mut cursor),
+            Some(Msg::Step(0, Dir::Next))
+        );
     }
 }

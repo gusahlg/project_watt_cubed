@@ -20,10 +20,18 @@ The settings menu and `/gfx` command share the persisted descriptor table in [`s
 | --- | --- | --- | --- |
 | **Minimum** | horizontal distance 0 (current chunk column only), vertical distance 1, 25% render scale, 1x MSAA, VSync off, streaming/sky/mod rates 15 Hz, physics 30 Hz, distant LOD off | HUD off; minimap, mod HUD, player models, name tags, sky and costly post/light lanes off | simulation, mod updates, and periodic autosave off |
 | **Fast** | horizontal distance 3, vertical distance 2, 50% render scale, 1x MSAA, VSync off, streaming, physics, sky, and mod rates 60 Hz; distant LOD on with 3 levels starting at detail 4 | minimal HUD, player models on; minimap, mod HUD, name tags, sky and costly post/light lanes off | simulation, mod updates, and autosave on |
-| **Default** | restores the shipped mix: distance 6/3, 100% scale, every-frame streaming, physics, sky-clock, and mod advancement; distant LOD is off by default | full HUD and the shipped visual lanes | simulation, mods, minimap, models, tags, and autosave on |
+| **Default** | restores the shipped mix: distance 6/3, Auto render scale (`DEFAULT_AUTO_RENDER_SCALE`, currently 1.0 — the threshold rule stays in code but is inert until TAAU), TAA forced on whenever the effective scale is below 1.0, every-frame streaming, physics, sky-clock, and mod advancement; distant LOD is off by default | full HUD and the shipped visual lanes | simulation, mods, minimap, models, tags, and autosave on |
 | **Custom** | exact individually selected values | exact individually selected values | exact individually selected values |
 
-“Costly lanes off” currently means occlusion, voxel/block lighting, baked AO, auto exposure, bloom, god rays, clouds, weather, stars, day/night animation, TAA, fog, ambient light, shadows, procedural sky, VRS, water animation, and vignette are disabled. Sunlight remains enabled so stripped terrain is still readable. Fast then re-enables its explicitly configured distant LOD lane.
+“Costly lanes off” currently means occlusion, voxel/block lighting, baked AO, auto exposure, bloom, god rays, clouds, weather, stars, day/night animation, TAA, fog, ambient light, shadows, procedural sky, VRS, water animation, and vignette are disabled. Sunlight remains enabled so stripped terrain is still readable. Fast then re-enables its explicitly configured distant LOD lane. Variable-rate shading is a three-way setting (`auto`/`on`/`off`, default `auto`): Auto turns it on only when the render extent (window × render scale) has at least 8,000,000 pixels, because the classify pass plus shading-rate attachment cost more than coarse shading saves at 1080p (RTX 4060: 3361 vs 5064 fps) and 3440×1440 (RTX 3070: 4236 vs 4495 fps); it pays at 4K-class extents (3440×1440 at 200% = 19.8 Mpx). Default Auto render scale is currently **1.0** (the `window_w × window_h > 1,500,000` rule remains, but the scale constant is 1.0 so it does not downscale). TAA is forced on whenever the *effective* scale is below 1.0; the bench JSON `render_lanes.taa` field is that effective lane, not the stored `taa` setting. Raise `DEFAULT_AUTO_RENDER_SCALE` to 0.8 only after the engine's Catmull-Rom TAAU (engine `wt/round4+`) is in main **and** TAA forcing is verified on the `WATT_BENCH_PRESET=default` path.
+
+Measured 2026-09-09 on louise-pc (RTX 4060, 1920×1080 fullscreen, engine main `e3adfc7`, two passes each):
+
+| preset | main 58ffbcd | this branch (cf39f09, Default at 0.8 without TAAU) |
+|---|---|---|
+| Default | 6396 / 6416 fps, p99 0.44 ms | 5448 / 5461 fps, p99 0.50–0.54 ms |
+
+That branch's Default rendered at 1536×864 (`render_scale_auto: true`, 0.8) but the bench JSON showed `"taa": false` — a plain 0.8 upscale that was ~15% slower than native on this GPU-light preset. Minimum and Fast are unchanged (no auto scale). Native 1.0 Default is the control until TAAU lands. Custom keeps the user's explicit scale and TAA.
 
 The independent performance controls are:
 
@@ -85,6 +93,9 @@ The client/server message enums and their binary codec are generated from one `m
 
 ## Benchmark procedure
 
+Headless `#[ignore]` unit throughput benches are driven by [`scripts/bench-unit.sh`](../scripts/bench-unit.sh): one release lib build, then each pinned bench three times with the median compared to the dated pin in its doc comment.
+Pass `--json` to also write the same rows as JSON lines to `benchmarks/unit.jsonl`.
+
 Use the release profile in [`Cargo.toml`](../Cargo.toml). Build once so compilation is outside every sample:
 
 ```sh
@@ -102,9 +113,17 @@ for run in 1 2 3 4 5; do
 done
 ```
 
-The harness performs at least a three-second warmup and then waits for `World::entry_complete` before sampling (bounded by `WATT_BENCH_READY_TIMEOUT`, 60 seconds by default). It slowly rotates the camera and emits both a compact `BENCH` summary and a schema-versioned `BENCH_JSON` record. The record includes CPU topology and power governor, RAM/cgroup limit, renderer-compatible Vulkan GPU and driver inventory, the likely selected GPU, window/render resolution, connected display EDID data, OS/kernel/session, game and renderer revisions, every relevant graphics/streaming setting, frame-time percentiles and hitch counts, RSS start/peak/end, and streaming queue/worker peaks.
+The harness performs at least a three-second warmup and then waits for `World::entry_complete` before sampling (bounded by `WATT_BENCH_READY_TIMEOUT`, 60 seconds by default). It slowly rotates the camera and emits a compact `BENCH` summary, a one-line `BENCH_MEM` census, and a schema-versioned `BENCH_JSON` record (`schema_version` 3). The record includes CPU topology and power governor, RAM/cgroup limit, renderer-compatible Vulkan GPU and driver inventory, the likely selected GPU, window/render resolution, connected display EDID data, OS/kernel/session, game and renderer revisions, every relevant graphics/streaming setting, frame-time percentiles and hitch counts, RSS start/peak/end, streaming queue/worker peaks, **time to ready** (`scenario.entry_seconds`, also `ready_s=` on `BENCH`; null if the world never settled), and a **memory census** at ready and at end (`memory.census_ready`, `memory.census_end`). Streaming peaks at ready time are the existing `streaming.peaks` object (observed continuously; the ready instant is included). `frames.rendered`, `frames.coalesced`, and `frames.rendered_fps` are reserved for `Engine::frames_rendered` / `Engine::frames_coalesced` and are `null` until those accessors exist on the engine.
+
+`World::memory_census` walks the loaded maps once (at most twice per run). It reports chunk payload bytes and counts split by uniform / paletted / dense, light-grid bytes (dense cell arrays today; uniform slots stay 0 until compact light storage exists), CPU mesh bytes still held on the world (scratch plus not-yet-uploaded queues — 0 after settle because upload returns `Vec`s to the mesh-output pool rather than keeping them on `World`), edit-overlay bytes, section/LOD bytes, and worklist/queue capacities. `total` is the sum of those byte fields. `scripts/bench-unit.sh` is unchanged.
 
 Set `WATT_BENCH_OUTPUT=benchmarks/results.jsonl` to append the JSON record. `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, and `WATT_BENCH_TAG` control the minimum warmup, readiness ceiling, and run label. On a multi-GPU machine where renderer selection is ambiguous without the window surface, set `WATT_BENCH_GPU` to the observed renderer device; the report records that it was an explicit override rather than silently guessing.
+
+- `WATT_BENCH_MOVE`: +X flight speed in m/s (default 0, static camera).
+- `WATT_BENCH_YAW`: steady-rotate rate in rad/s (default 0.4; `0` holds the camera). Reported as `yaw_rate_rad_s`.
+- `WATT_BENCH_SCREENSHOT`: `.png` path. After the last measured sample, one extra frame presents and the harness writes that image through the same blocking capture as the golden shots (`taa` stays whatever the run configured; goldens use `taa=false`). Failure prints `benchmark: screenshot failed: …` and the JSON still emits with `"screenshot": <path or null>`.
+- `WATT_BENCH_WORLDGEN`: `classic` or `diffusion`; pins worldgen without persisting the mod menu.
+- `WATT_BENCH_VISUALS`: `off`/`core` strips Atmosphere/Post/Lighting (core look); `on`/`full` leaves them on.
 
 Use these scenarios:
 

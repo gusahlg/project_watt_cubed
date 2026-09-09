@@ -349,7 +349,7 @@ pub(in crate::world) fn cell_centers(pos: SectionPos) -> Vec<i32> {
     (0..pos.n_cells()).map(|j| LOD_FLOOR_Y + j * cell + half).collect()
 }
 
-/// Flatten tile edits (per-chunk flat indices) to absolute world coordinates,
+/// Flatten section edits (per-chunk flat indices) to absolute world coordinates,
 /// sorted by ascending `(y, x, z)`. The sort is the determinism contract
 /// [`apply_edits`] relies on: edits originate in hash maps whose iteration
 /// order is arbitrary, but position is session-independent truth — so live
@@ -424,7 +424,7 @@ mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
     use crate::coord::BlockCoord;
-    use crate::world::generation::SineHills;
+    use crate::world::generation::Terrain;
 
     // Test fixtures
 
@@ -474,8 +474,8 @@ mod tests {
         }
     }
 
-    fn sine(seed: i64) -> SineHills {
-        SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
+    fn sine(seed: i64) -> Terrain {
+        Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
     }
 
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
@@ -596,8 +596,8 @@ mod tests {
     #[test]
     fn extraction_matches_the_generator_sweep_for_every_class() {
         let b = blocks();
-        let cases: [(&str, i32, i32, Option<(i32, i32)>); 6] = [
-            ("uniform-air", 0, 0, None),
+        let cases = [
+            ("uniform-air", 0, 0, None::<(i32, i32)>),
             ("deep-ground", 400, 0, None),
             ("water-covered", 30, 60, None),
             ("shore", 40, 40, None),
@@ -771,7 +771,7 @@ mod tests {
             deep: b.air,
         };
         let sec = extract(FINEST, &r#gen, &[]);
-        assert!(column_ids(&sec, 3, 11).iter().any(|&c| c == b.stone), "marker missing at its true column (3, 11)");
+        assert!(column_ids(&sec, 3, 11).contains(&b.stone), "marker missing at its true column (3, 11)");
         assert!(column_ids(&sec, 11, 3).iter().all(|&c| c == AIR), "marker leaked to the transposed column (11, 3)");
     }
 

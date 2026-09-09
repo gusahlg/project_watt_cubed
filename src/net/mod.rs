@@ -11,8 +11,10 @@
 //!
 //! **Trust:** the server is authoritative and never trusts a client. Frames are
 //! length-capped, joins are password-gated, and every edit and move is validated
-//! and rate-limited server-side ([`server`]).
+//! and rate-limited server-side ([`server`]). Communities add extra rules through
+//! the [`hooks`] seam (`ServerMod`) without changing the wire.
 pub mod client;
+pub mod hooks;
 pub mod protocol;
 
 // Deny a bare `.unwrap()` on production paths; server.rs's `lock_recover()`
@@ -151,7 +153,9 @@ pub(crate) mod quic {
 /// v8: voice chat — `ClientMessage::Voice` and `ServerMessage::PeerVoice`
 /// carry opaque opus frames. New message tags change the wire, so mixed v7/v8
 /// peers must not join.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: `Welcome` carries worldgen kind + diffusion knobs so a joiner adopts
+/// the server's generator instead of its local mod state.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -227,7 +231,7 @@ pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     eat(&(registry.block_count() as u32).to_le_bytes());
     for i in 0..registry.block_count() {
         let block = registry.block(crate::block::BlockId(i as u16));
-        eat(crate::save::registry_block_spec(registry, crate::block::BlockId(i as u16)).as_bytes());
+        eat(crate::save::block_spec(registry, crate::block::BlockId(i as u16)).as_bytes());
         eat(&[0]);
         eat(&crate::block::element::Core::from(block.core).0);
         eat(&(block.specials.len() as u32).to_le_bytes());
@@ -296,8 +300,7 @@ mod fingerprint_tests {
     fn classic_fingerprint_ignores_diffusion_knobs() {
         let a = content_fingerprint();
         let b = content_fingerprint_kind(WorldgenKind::Classic);
-        let mut cfg = DiffusionCfg::default();
-        cfg.tile = 64;
+        let cfg = DiffusionCfg { tile: 64, ..Default::default() };
         let c = content_fingerprint_kind_cfg(WorldgenKind::Classic, cfg);
         assert_eq!(a, b);
         assert_eq!(a, c);
@@ -308,8 +311,7 @@ mod fingerprint_tests {
         let classic = content_fingerprint();
         let diff = content_fingerprint_kind(WorldgenKind::Diffusion);
         assert_ne!(classic, diff);
-        let mut cfg = DiffusionCfg::default();
-        cfg.phases = 8;
+        let cfg = DiffusionCfg { phases: 8, ..Default::default() };
         assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
     }
 }

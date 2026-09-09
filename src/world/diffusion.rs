@@ -7,7 +7,7 @@ use std::sync::Arc;
 use infinite_field::{InfiniteField, Score, Spec};
 
 use super::chunk::{CHUNK_SIZE, ChunkData};
-use super::generation::{cell_hash, TerrainGenerator};
+use super::generation::{cell_hash, ColumnHeights, TerrainGenerator};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
@@ -39,13 +39,75 @@ impl Default for DiffusionCfg {
 }
 
 impl DiffusionCfg {
+    /// Tile sizes the knob stepper cycles. [`clamp`](Self::clamp) snaps here.
+    pub const TILES: [u32; 3] = [16, 32, 64];
+    pub const MIN_STRIDE: u32 = 8;
+    pub const STRIDE_STEP: u32 = 8;
+    pub const PHASES_MIN: u32 = 2;
+    pub const PHASES_MAX: u32 = 8;
+    /// Relief values the knob stepper cycles. [`clamp`](Self::clamp) snaps here.
+    pub const RELIEFS: [f32; 5] = [0.5, 1.0, 1.5, 2.0, 4.0];
+
     pub fn clamp(mut self) -> Self {
-        self.tile = self.tile.clamp(16, 64);
-        self.stride = self.stride.clamp(8, self.tile);
-        self.phases = self.phases.clamp(2, 8);
-        self.relief = self.relief.clamp(0.25, 4.0);
+        self.tile = snap_u32(&Self::TILES, self.tile);
+        self.stride = snap_stride(self.stride, self.tile);
+        self.phases = self.phases.clamp(Self::PHASES_MIN, Self::PHASES_MAX);
+        self.relief = snap_f32(&Self::RELIEFS, self.relief);
         self
     }
+
+    /// Wire form of the diffusion worldgen payload (`tile=…,stride=…,…`).
+    pub fn to_text(self) -> String {
+        format!(
+            "tile={},stride={},phases={},relief={:.2}",
+            self.tile, self.stride, self.phases, self.relief
+        )
+    }
+
+    /// Parse a full or partial knob string, starting from the defaults.
+    pub fn from_text(data: &str) -> Self {
+        Self::default().overlay(data)
+    }
+
+    /// Overlay keys from `data` onto `self`, then clamp.
+    pub fn overlay(mut self, data: &str) -> Self {
+        for part in data.split(',') {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "tile" => self.tile = v.parse().unwrap_or(self.tile),
+                "stride" => self.stride = v.parse().unwrap_or(self.stride),
+                "phases" => self.phases = v.parse().unwrap_or(self.phases),
+                "relief" => self.relief = v.parse().unwrap_or(self.relief),
+                _ => {}
+            }
+        }
+        self.clamp()
+    }
+}
+
+fn snap_u32(list: &[u32], v: u32) -> u32 {
+    list.iter()
+        .copied()
+        .min_by_key(|&c| c.abs_diff(v))
+        .unwrap_or(v)
+}
+
+fn snap_stride(stride: u32, tile: u32) -> u32 {
+    let lo = DiffusionCfg::MIN_STRIDE;
+    let hi = tile.max(lo);
+    let v = stride.clamp(lo, hi);
+    let step = DiffusionCfg::STRIDE_STEP;
+    let snapped = ((v + step / 2) / step) * step;
+    snapped.clamp(lo, hi)
+}
+
+fn snap_f32(list: &[f32], v: f32) -> f32 {
+    list.iter()
+        .copied()
+        .min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
+        .unwrap_or(v)
 }
 
 struct TerrainScore {
@@ -238,6 +300,20 @@ impl TerrainGenerator for DiffusionTerrain {
         self.column(wx, wz).height
     }
 
+    fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
+        let x0 = cx * CHUNK_SIZE as i32;
+        let z0 = cz * CHUNK_SIZE as i32;
+        let mut ch0 = [0.0f32; CHUNK_SIZE * CHUNK_SIZE];
+        self.field
+            .fill_ch0(x0, z0, CHUNK_SIZE as u32, CHUNK_SIZE as u32, &mut ch0);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+            let elev = (ch0[i] * 2.0 - 1.0) * 36.0;
+            heights[i] = (self.sea as f32 + elev).round() as i32;
+        }
+        heights
+    }
+
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
         let c = self.column(wx, wz);
         self.dress(&c, wx, wz)
@@ -278,18 +354,20 @@ impl TerrainGenerator for DiffusionTerrain {
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         self.generate_column(cx, cz, cy..=cy)
+            .0
             .into_iter()
             .next()
             .map(|(_, data)| data)
             .unwrap_or_else(|| ChunkData::from_cells(Box::new([AIR; super::chunk::CHUNK_VOLUME])))
     }
 
+    #[allow(clippy::needless_range_loop)] // lx/lz are world-space offsets, not just array indices
     fn generate_column(
         &self,
         cx: i32,
         cz: i32,
         cy: std::ops::RangeInclusive<i32>,
-    ) -> Vec<(i32, ChunkData)> {
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
         let x0 = cx * CHUNK_SIZE as i32;
         let z0 = cz * CHUNK_SIZE as i32;
         let mut cols = [[Col {
@@ -299,45 +377,50 @@ impl TerrainGenerator for DiffusionTerrain {
             humid: 0.5,
             cave: 0.0,
         }; CHUNK_SIZE]; CHUNK_SIZE];
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                cols[lz][lx] = self.column(x0 + lx as i32, z0 + lz as i32);
-            }
-        }
+        let mut buf = [0.0f32; CHUNK_SIZE * CHUNK_SIZE * 4];
+        self.field
+            .fill_all(x0, z0, CHUNK_SIZE as u32, CHUNK_SIZE as u32, &mut buf);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         let mut max_top = i32::MIN;
         let mut min_h = i32::MAX;
-        for row in &cols {
-            for c in row {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let i = (lz * CHUNK_SIZE + lx) * 4;
+                let c = self.col_from_ch(&buf[i..i + 4]);
+                heights[lx + lz * CHUNK_SIZE] = c.height;
                 max_top = max_top.max(c.height.max(c.water));
                 min_h = min_h.min(c.height);
+                cols[lz][lx] = c;
             }
         }
         let deep_cut = min_h - self.mat.max_scattered_depth.max(48);
-        cy.map(|cyy| {
-            let y0 = cyy * CHUNK_SIZE as i32;
-            let y1 = y0 + CHUNK_SIZE as i32;
-            if y0 >= max_top {
-                return (cyy, ChunkData::Uniform(AIR));
-            }
-            if y1 <= deep_cut {
-                return (cyy, ChunkData::Uniform(self.mat.stone));
-            }
-            let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
-            for lz in 0..CHUNK_SIZE {
-                for lx in 0..CHUNK_SIZE {
-                    let c = &cols[lz][lx];
-                    let wx = x0 + lx as i32;
-                    let wz = z0 + lz as i32;
-                    for ly in 0..CHUNK_SIZE {
-                        let wy = y0 + ly as i32;
-                        cells[super::chunk::Chunk::index(lx, ly, lz)] =
-                            self.cell(c, wx, wy, wz);
+        let chunks = cy
+            .map(|cyy| {
+                let y0 = cyy * CHUNK_SIZE as i32;
+                let y1 = y0 + CHUNK_SIZE as i32;
+                if y0 >= max_top {
+                    return (cyy, ChunkData::Uniform(AIR));
+                }
+                if y1 <= deep_cut {
+                    return (cyy, ChunkData::Uniform(self.mat.stone));
+                }
+                let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let c = &cols[lz][lx];
+                        let wx = x0 + lx as i32;
+                        let wz = z0 + lz as i32;
+                        for ly in 0..CHUNK_SIZE {
+                            let wy = y0 + ly as i32;
+                            cells[super::chunk::Chunk::index(lx, ly, lz)] =
+                                self.cell(c, wx, wy, wz);
+                        }
                     }
                 }
-            }
-            (cyy, ChunkData::from_cells(cells))
-        })
-        .collect()
+                (cyy, ChunkData::from_cells(cells))
+            })
+            .collect();
+        (chunks, heights)
     }
 }
 
@@ -345,7 +428,7 @@ impl TerrainGenerator for DiffusionTerrain {
 pub type Generator = Arc<dyn TerrainGenerator>;
 
 pub fn classic(registry: &mut BlockRegistry, seed: i64) -> Generator {
-    Arc::new(super::generation::SineHills::new(registry, 20.0, seed))
+    Arc::new(super::generation::Terrain::new(registry, 20.0, seed))
 }
 
 pub fn diffusion(registry: &mut BlockRegistry, seed: i64, cfg: DiffusionCfg) -> Generator {
@@ -378,6 +461,115 @@ mod tests {
     }
 
     #[test]
+    fn from_text_round_trips_to_text() {
+        let cfg = DiffusionCfg {
+            tile: 64,
+            stride: 16,
+            phases: 4,
+            relief: 1.5,
+        }
+        .clamp();
+        assert_eq!(DiffusionCfg::from_text(&cfg.to_text()), cfg);
+        assert_eq!(DiffusionCfg::from_text(""), DiffusionCfg::default());
+        assert_eq!(
+            DiffusionCfg::from_text("tile=64").tile,
+            64,
+            "partial overlay on defaults"
+        );
+    }
+
+    #[test]
+    fn clamp_applies_tile_before_stride_so_stride_cannot_exceed_tile() {
+        let cfg = DiffusionCfg {
+            tile: 100,
+            stride: 80,
+            phases: 1,
+            relief: 9.0,
+        }
+        .clamp();
+        assert_eq!(cfg.tile, 64);
+        assert!(cfg.stride <= cfg.tile, "stride={} tile={}", cfg.stride, cfg.tile);
+        assert_eq!(cfg.stride, 64);
+        assert_eq!(cfg.phases, 2);
+        assert_eq!(cfg.relief, 4.0);
+    }
+
+    #[test]
+    fn clamp_snaps_to_values_the_knob_stepper_can_display() {
+        let cfg = DiffusionCfg {
+            tile: 48,
+            stride: 12,
+            phases: 1,
+            relief: 0.25,
+        }
+        .clamp();
+        assert!(
+            DiffusionCfg::TILES.contains(&cfg.tile),
+            "tile {} not in {:?}",
+            cfg.tile,
+            DiffusionCfg::TILES
+        );
+        assert_eq!(cfg.stride % DiffusionCfg::STRIDE_STEP, 0);
+        assert!(cfg.stride >= DiffusionCfg::MIN_STRIDE && cfg.stride <= cfg.tile);
+        assert!((DiffusionCfg::PHASES_MIN..=DiffusionCfg::PHASES_MAX).contains(&cfg.phases));
+        assert!(
+            DiffusionCfg::RELIEFS
+                .iter()
+                .any(|v| (*v - cfg.relief).abs() < f32::EPSILON),
+            "relief {} not in {:?}",
+            cfg.relief,
+            DiffusionCfg::RELIEFS
+        );
+    }
+
+    #[test]
+    fn default_matches_spec_new_and_is_stepper_reachable() {
+        let cfg = DiffusionCfg::default();
+        let spec = Spec::new(0);
+        assert_eq!(cfg.tile, spec.tile);
+        assert_eq!(cfg.stride, spec.stride);
+        assert_eq!(cfg.phases, spec.phases);
+        assert!(DiffusionCfg::TILES.contains(&cfg.tile));
+        assert_eq!(cfg.stride % DiffusionCfg::STRIDE_STEP, 0);
+        assert!((DiffusionCfg::PHASES_MIN..=DiffusionCfg::PHASES_MAX).contains(&cfg.phases));
+        assert!(
+            DiffusionCfg::RELIEFS
+                .iter()
+                .any(|v| (*v - cfg.relief).abs() < f32::EPSILON)
+        );
+        assert_eq!(cfg.clamp(), cfg);
+    }
+
+    #[test]
+    fn lod_and_near_flood_to_the_same_sea() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 13);
+        let sea = g.sea_level();
+        assert_eq!(sea, 20);
+        let mut ocean = 0;
+        for z in -16..16 {
+            for x in -16..16 {
+                let h = g.height(x, z);
+                if h >= sea - 2 {
+                    continue;
+                }
+                ocean += 1;
+                let near_below = g.block_at(x, sea - 1, z, h);
+                let near_at = g.block_at(x, sea, z, h);
+                let lod_below = g.lod_block_at(x, sea - 1, z);
+                let lod_at = g.lod_block_at(x, sea, z);
+                assert_ne!(near_below, AIR, "ocean column ({x},{z}) must flood to sea");
+                assert_eq!(near_at, AIR, "ocean column ({x},{z}) must stop flooding at sea");
+                assert!(
+                    lod_at == AIR || lod_at == g.deep(),
+                    "LOD must not flood the sea cell at ({x},{z})"
+                );
+                assert_ne!(lod_below, AIR, "LOD must fill below sea at ({x},{z})");
+            }
+        }
+        assert!(ocean > 0, "seed 13 must have open-ocean columns in the sample");
+    }
+
+    #[test]
     fn diffusion_kind_is_distinct() {
         assert_eq!(
             DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 1)
@@ -390,8 +582,36 @@ mod tests {
     fn generate_matches_generate_column() {
         let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 3);
         let a = g.generate(1, 0, -2);
-        let b = g.generate_column(1, -2, 0..=0);
+        let (b, _) = g.generate_column(1, -2, 0..=0);
         assert_eq!(a, b[0].1);
+    }
+
+    #[test]
+    fn generate_column_heights_match_height() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 7);
+        super::super::generation::assert_generate_column_heights_match_height(
+            &g,
+            &[(0, 0), (2, -3), (-1, 7), (4, 4)],
+        );
+    }
+
+    #[test]
+    fn heights_16_matches_height() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 11);
+        for &(cx, cz) in &[(0, 0), (2, -3), (-1, 7)] {
+            let batch = g.heights_16(cx, cz);
+            let x0 = cx * CHUNK_SIZE as i32;
+            let z0 = cz * CHUNK_SIZE as i32;
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    assert_eq!(
+                        batch[lx + lz * CHUNK_SIZE],
+                        g.height(x0 + lx as i32, z0 + lz as i32),
+                        "cx={cx} cz={cz} lx={lx} lz={lz}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -419,6 +639,64 @@ mod tests {
         }
     }
 
+    fn chunk_data_bytes(data: &ChunkData) -> Vec<u8> {
+        match data {
+            ChunkData::Uniform(id) => {
+                let mut b = vec![0u8];
+                b.extend_from_slice(&id.0.to_le_bytes());
+                b
+            }
+            ChunkData::Paletted { palette, cells } => {
+                let mut b = vec![1u8];
+                b.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+                for p in palette {
+                    b.extend_from_slice(&p.0.to_le_bytes());
+                }
+                b.extend_from_slice(&cells[..]);
+                b
+            }
+            ChunkData::Dense(cells) => {
+                let mut b = vec![2u8];
+                for id in cells.iter() {
+                    b.extend_from_slice(&id.0.to_le_bytes());
+                }
+                b
+            }
+        }
+    }
+
+    /// Pin `fnv1a_32` over six fixed seed-42 chunks. Values locked before the
+    /// batch-sample pass; a mismatch means generated `ChunkData` bytes moved.
+    #[test]
+    fn diffusion_chunk_byte_pin() {
+        use crate::hash::fnv1a_32;
+        let g = DiffusionTerrain::new(
+            &mut BlockRegistry::with_builtins(),
+            DiffusionCfg::default(),
+            42,
+        );
+        // surface, lake column, cave band, deep, two far coords.
+        let pins: [(&str, i32, i32, i32, u32); 6] = [
+            ("surface", 0, 1, 0, 0x600ae405),
+            ("lake", -22, 1, -24, 0xb779cebf),
+            ("cave", -24, -3, -24, 0xafa3e00c),
+            ("deep", 0, -20, 0, 0x24ae7d4e),
+            ("far_a", 6_250_000, 0, 0, 0x1932d2a2),
+            ("far_b", -6_250_000, -2, 3, 0x24fd3019),
+        ];
+        for (name, cx, cy, cz, want) in pins {
+            assert_eq!(
+                fnv1a_32(&chunk_data_bytes(&g.generate(cx, cy, cz))),
+                want,
+                "{name} ({cx},{cy},{cz})"
+            );
+        }
+    }
+
+    /// Column generation cost, n=24 columns × 4 layers. Ignored timing gauge.
+    /// Before batching: classic=140.3ms diffusion=401.8ms ratio=2.86.
+    /// After batching: classic=141.8ms diffusion=176.7ms ratio=1.25 (2.27× vs before).
+    /// Run with `cargo test --release worldgen_column_cost -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn worldgen_column_cost() {
@@ -456,8 +734,7 @@ mod tests {
         use std::time::Instant;
         let n = 16i32;
         for phases in [2u32, 3, 4, 6] {
-            let mut cfg = DiffusionCfg::default();
-            cfg.phases = phases;
+            let cfg = DiffusionCfg { phases, ..Default::default() };
             let g = super::diffusion(&mut BlockRegistry::with_builtins(), 42, cfg);
             let t = Instant::now();
             for cz in 0..n {

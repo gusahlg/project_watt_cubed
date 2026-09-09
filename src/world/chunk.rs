@@ -226,35 +226,90 @@ impl Chunk {
         }
     }
 
-    /// Fill `out` with one opacity bit per cell (cell-index order), decoded
-    /// ONCE per light settle instead of a payload dispatch + palette load per
-    /// flood probe (~6 probes × up to 4096 relaxed cells). Uniform: one
-    /// probe; Paletted: one probe per palette entry then a linear cell pass;
-    /// Dense: one linear pass.
+    /// Fill `out` with one opacity bit per cell (cell-index order) and `col`
+    /// with one occupancy mask per (x, z) column (`col[x + 16z]`, bit y),
+    /// decoded ONCE per light settle. Uniform: one probe; Paletted: one probe
+    /// per palette entry then a linear cell pass; Dense: one linear pass.
     pub fn fill_opacity(
         &self,
         opaque: impl Fn(BlockId) -> bool,
         out: &mut [u64; CHUNK_VOLUME / 64],
+        col: &mut [u16; CHUNK_SIZE * CHUNK_SIZE],
     ) {
         match &self.data.payload {
-            ChunkPayload::Uniform(v) => out.fill(if opaque(v.id) { u64::MAX } else { 0 }),
+            ChunkPayload::Uniform(v) => {
+                if opaque(v.id) {
+                    out.fill(u64::MAX);
+                    col.fill(u16::MAX);
+                } else {
+                    out.fill(0);
+                    col.fill(0);
+                }
+            }
             ChunkPayload::Paletted { palette, cells } => {
                 let mut lut = [false; super::brick::PALETTE_MAX];
                 for (i, p) in palette.iter().enumerate() {
                     lut[i] = opaque(p.id);
                 }
                 out.fill(0);
+                col.fill(0);
                 for (i, &idx) in cells.iter().enumerate() {
                     if lut[idx as usize] {
                         out[i >> 6] |= 1 << (i & 63);
+                        col[i & 255] |= 1u16 << (i >> 8);
                     }
                 }
             }
             ChunkPayload::Dense(cells) => {
                 out.fill(0);
+                col.fill(0);
                 for (i, c) in cells.iter().enumerate() {
                     if opaque(c.id) {
                         out[i >> 6] |= 1 << (i & 63);
+                        col[i & 255] |= 1u16 << (i >> 8);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Call `emit(flat_index, level)` for every cell whose emission is `> 0`,
+    /// in cell-index order. Uniform: one probe (no walk when the fill is 0);
+    /// Paletted: one LUT over the palette, skip the cell walk when every
+    /// entry is 0; Dense: one linear pass.
+    pub fn for_each_emission(&self, emission: &[u8], mut emit: impl FnMut(usize, u8)) {
+        match &self.data.payload {
+            ChunkPayload::Uniform(v) => {
+                let em = emission[v.id.0 as usize];
+                if em > 0 {
+                    for i in 0..CHUNK_VOLUME {
+                        emit(i, em);
+                    }
+                }
+            }
+            ChunkPayload::Paletted { palette, cells } => {
+                let mut lut = [0u8; super::brick::PALETTE_MAX];
+                let mut any = false;
+                for (i, p) in palette.iter().enumerate() {
+                    let e = emission[p.id.0 as usize];
+                    lut[i] = e;
+                    any |= e > 0;
+                }
+                if !any {
+                    return;
+                }
+                for (i, &idx) in cells.iter().enumerate() {
+                    let e = lut[idx as usize];
+                    if e > 0 {
+                        emit(i, e);
+                    }
+                }
+            }
+            ChunkPayload::Dense(cells) => {
+                for (i, c) in cells.iter().enumerate() {
+                    let e = emission[c.id.0 as usize];
+                    if e > 0 {
+                        emit(i, e);
                     }
                 }
             }
@@ -356,14 +411,14 @@ fn gc_palette(palette: &mut Box<[BlockState]>, cells: &mut Box<[u8]>) -> bool {
 mod tests {
     use super::*;
     use crate::block::registry::{AIR, BlockRegistry};
-    use crate::world::generation::SineHills;
+    use crate::world::generation::Terrain;
 
     /// The generator plus the registry-resolved ids its terrain is made of.
-    fn hills(seed: i64) -> (SineHills, BlockId, BlockId) {
+    fn hills(seed: i64) -> (Terrain, BlockId, BlockId) {
         let mut registry = BlockRegistry::with_builtins();
         let stone = registry.id_by_name("Stone").unwrap();
         let dirt = registry.id_by_name("Soil").unwrap();
-        (SineHills::new(&mut registry, 20.0, seed), stone, dirt)
+        (Terrain::new(&mut registry, 20.0, seed), stone, dirt)
     }
 
     #[test]
@@ -571,13 +626,7 @@ mod tests {
 
         // splitmix64: deterministic PRNG, no rand dep.
         let mut state = 0xC0FFEEu64;
-        let mut next = move || {
-            state = state.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        };
+        let mut next = move || crate::hash::splitmix_next(&mut state);
 
         // 400 edits: enough to cross uniform->paletted, force a GC (bounded
         // id range keeps the palette saturating), and revisit indices so
@@ -613,5 +662,48 @@ mod tests {
                 assert_eq!(chunk.get_index(i), want_id, "cell {i} at ({cx},{cy},{cz})");
             }
         }
+    }
+
+    fn col_matches_bits(bits: &[u64; CHUNK_VOLUME / 64], col: &[u16; CHUNK_SIZE * CHUNK_SIZE]) {
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let mut want = 0u16;
+                for y in 0..CHUNK_SIZE {
+                    let i = Chunk::index(x, y, z);
+                    if (bits[i >> 6] >> (i & 63)) & 1 != 0 {
+                        want |= 1 << y;
+                    }
+                }
+                assert_eq!(col[x + z * CHUNK_SIZE], want, "column ({x},{z})");
+            }
+        }
+    }
+
+    #[test]
+    fn fill_opacity_column_mask_matches_bits() {
+        let opaque = |id: BlockId| id.0 != 0;
+        let check = |chunk: &Chunk| {
+            let mut bits = [0u64; CHUNK_VOLUME / 64];
+            let mut col = [0u16; CHUNK_SIZE * CHUNK_SIZE];
+            chunk.fill_opacity(opaque, &mut bits, &mut col);
+            col_matches_bits(&bits, &col);
+        };
+
+        check(&Chunk::from_uniform(0, 0, 0, BlockId(0)));
+        check(&Chunk::from_uniform(0, 0, 0, BlockId(1)));
+
+        let mut mixed = [BlockId(0); CHUNK_VOLUME];
+        mixed[Chunk::index(3, 7, 5)] = BlockId(1);
+        mixed[Chunk::index(0, 15, 0)] = BlockId(1);
+        mixed[Chunk::index(15, 0, 15)] = BlockId(2);
+        check(&Chunk::from_cells(0, 0, 0, Box::new(mixed)));
+
+        let mut dense = Chunk::from_uniform(0, 0, 0, BlockId(0));
+        for i in 0..300 {
+            dense.set_index(i, BlockId(1000 + i as u16));
+        }
+        dense.set_index(Chunk::index(8, 4, 2), BlockId(1));
+        assert!(matches!(&dense.data().payload, ChunkPayload::Dense(_)));
+        check(&dense);
     }
 }

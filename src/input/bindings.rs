@@ -69,6 +69,8 @@ impl Default for Bindings {
         global_event[GLE::CycleHud as usize] = vec![Chord::key(Key::F1)];
         global_event[GLE::Screenshot as usize] = vec![Chord::key(Key::F2)];
         global_event[GLE::MinimapMode as usize] = vec![Chord::key(Key::F3)];
+        global_event[GLE::CyclePerson as usize] = vec![Chord::key(Key::F5)];
+        global_event[GLE::ToggleFreecam as usize] = vec![Chord::key(Key::F6)];
 
         Self {
             gameplay_state,

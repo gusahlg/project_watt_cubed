@@ -3,7 +3,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use glam::{IVec3, UVec3};
+use glam::UVec3;
+use voxel_engine::IVec3;
 
 use crate::audio::acoustics::{AcousticWindow, Cell};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
@@ -34,6 +35,16 @@ impl World {
         self.generator.kind()
     }
 
+    /// Which generator this world was built with.
+    pub fn worldgen(&self) -> super::generation::WorldgenKind {
+        self.kind
+    }
+
+    /// Diffusion knobs this world was built with (defaults on a classic world).
+    pub fn diffusion_cfg(&self) -> super::diffusion::DiffusionCfg {
+        self.diffusion
+    }
+
     /// Incremented when blocks are edited.
     pub fn edit_generation(&self) -> u64 {
         self.edit_generation
@@ -55,18 +66,22 @@ impl World {
         self.generator.height(x, z)
     }
 
+    /// Ground height for every cell of a 16×16 chunk column.
+    pub fn heights_16(&self, cx: i32, cz: i32) -> super::generation::ColumnHeights {
+        self.generator.heights_16(cx, cz)
+    }
+
     /// Sea level, so spawn logic can tell dry land from seabed/ocean columns.
     pub fn sea_level(&self) -> i32 {
         self.generator.sea_level()
     }
 
     /// Highest solid block's Y in column (x, z) from loaded chunks, or None if empty.
+    #[cfg(test)]
     pub fn top_solid(&self, x: i32, z: i32) -> Option<i32> {
         let s = CHUNK_SIZE as i32;
         let (cx, cz) = (x.div_euclid(s), z.div_euclid(s));
         let (lx, lz) = (x.rem_euclid(s) as usize, z.rem_euclid(s) as usize);
-
-        // Scan loaded chunks top-down (Y unbounded).
         let mut cys: Vec<i32> = self
             .chunks
             .keys()
@@ -74,14 +89,13 @@ impl World {
             .map(|c| c.y)
             .collect();
         cys.sort_unstable_by(|a, b| b.cmp(a));
-
         for cy in cys {
             let loaded = &self.chunks[&Coord::new(cx, cy, cz)];
             if let Some(id) = loaded.chunk.uniform() {
                 if self.registry.is_solid(id) {
                     return Some(cy * s + s - 1);
                 }
-                continue; // uniform air
+                continue;
             }
             for ly in (0..s).rev() {
                 let id = loaded.chunk.get_local(lx, ly as usize, lz);
@@ -102,42 +116,25 @@ impl World {
         z1: i32,
         mut paint: impl FnMut(i32, i32, i32, Color),
     ) {
-        // Bucket the footprint's vertical stacks in one pass over `chunks` and
-        // one sort, keyed by dense grid cell — no hashing.
         let s = CHUNK_SIZE as i32;
         let (cx0, cx1) = (x0.div_euclid(s), x1.div_euclid(s));
         let (cz0, cz1) = (z0.div_euclid(s), z1.div_euclid(s));
-        let grid_w = cx1 - cx0 + 1;
-        let mut stacks: Vec<(i32, i32, &super::Loaded)> = Vec::new();
-        for (&coord, loaded) in &self.chunks {
-            if (cx0..=cx1).contains(&coord.x) && (cz0..=cz1).contains(&coord.z) {
-                let cell = (coord.z - cz0) * grid_w + (coord.x - cx0);
-                stacks.push((cell, coord.y, loaded));
-            }
-        }
-        // Group by cell, top chunk first within each stack.
-        stacks.sort_unstable_by_key(|&(cell, cy, _)| (cell, std::cmp::Reverse(cy)));
-
-        for stack in stacks.chunk_by(|a, b| a.0 == b.0) {
-            let (ccx, ccz) = (cx0 + stack[0].0 % grid_w, cz0 + stack[0].0 / grid_w);
-            let xs = x0.max(ccx * s)..=x1.min((ccx + 1) * s - 1);
-            let zs = z0.max(ccz * s)..=z1.min((ccz + 1) * s - 1);
-            for x in xs {
-                let lx = x.rem_euclid(s) as usize;
-                for z in zs.clone() {
-                    let lz = z.rem_euclid(s) as usize;
-                    for &(_, cy, loaded) in stack {
-                        let top = match loaded.chunk.uniform() {
-                            Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
-                            Some(_) => None,
-                            None => (0..s).rev().find_map(|ly| {
-                                let id = loaded.chunk.get_local(lx, ly as usize, lz);
-                                self.registry.is_solid(id).then_some((cy * s + ly, id))
-                            }),
-                        };
-                        if let Some((top_y, id)) = top {
-                            paint(x, z, top_y, self.registry.color(id));
-                            break; // topmost hit
+        for cx in cx0..=cx1 {
+            for cz in cz0..=cz1 {
+                let ys = self.column_chunks(cx, cz);
+                if ys.is_empty() {
+                    continue;
+                }
+                let xs = x0.max(cx * s)..=x1.min((cx + 1) * s - 1);
+                let zs = z0.max(cz * s)..=z1.min((cz + 1) * s - 1);
+                for x in xs {
+                    let lx = x.rem_euclid(s) as usize;
+                    for z in zs.clone() {
+                        let lz = z.rem_euclid(s) as usize;
+                        if let Some((top_y, color)) =
+                            self.top_solid_in_column(cx, cz, ys, lx, lz)
+                        {
+                            paint(x, z, top_y, color);
                         }
                     }
                 }
@@ -229,6 +226,50 @@ impl World {
         false
     }
 
+    /// Loaded chunk-Y layers in the `(cx, cz)` column, highest first. Empty when
+    /// the column has no loaded chunks.
+    pub fn column_chunks(&self, cx: i32, cz: i32) -> &[i32] {
+        self.column_chunks
+            .get(&(cx, cz))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The loaded chunk at `(cx, cy, cz)`, if any.
+    pub(crate) fn chunk_at(&self, cx: i32, cy: i32, cz: i32) -> Option<&super::chunk::Chunk> {
+        self.chunks
+            .get(&Coord::new(cx, cy, cz))
+            .map(|loaded| loaded.chunk.as_ref())
+    }
+
+    /// Top solid in one local column of a chunk column, walking `ys` (highest first).
+    pub(crate) fn top_solid_in_column(
+        &self,
+        cx: i32,
+        cz: i32,
+        ys: &[i32],
+        lx: usize,
+        lz: usize,
+    ) -> Option<(i32, Color)> {
+        let s = CHUNK_SIZE as i32;
+        for &cy in ys {
+            let Some(chunk) = self.chunk_at(cx, cy, cz) else {
+                continue;
+            };
+            let top = match chunk.uniform() {
+                Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
+                Some(_) => None,
+                None => (0..CHUNK_SIZE).rev().find_map(|ly| {
+                    let id = chunk.get_local(lx, ly, lz);
+                    self.registry.is_solid(id).then_some((cy * s + ly as i32, id))
+                }),
+            };
+            if let Some((top_y, id)) = top {
+                return Some((top_y, self.registry.color(id)));
+            }
+        }
+        None
+    }
+
     /// An immutable acoustic snapshot of the cube `[center − r, center + r]³`, for
     /// the audio kernel's occlusion DDA. `radius` is clamped so the window edge stays
     /// within [`MAX_WINDOW_DIM`](crate::audio::acoustics::MAX_WINDOW_DIM): `dim =
@@ -246,11 +287,29 @@ impl World {
     /// `index = (dz · dim + dy) · dim + dx`, `d* = world − origin` — matching
     /// [`AcousticWindow::cell`](crate::audio::acoustics::AcousticWindow::cell).
     pub fn capture_acoustic_window(&self, center: IVec3, radius: u32) -> Arc<AcousticWindow> {
+        self.capture_acoustic_window_reuse(center, radius, None)
+    }
+
+    /// [`capture_acoustic_window`](Self::capture_acoustic_window) that refills
+    /// `reuse` in place when its length matches the window volume.
+    pub(crate) fn capture_acoustic_window_reuse(
+        &self,
+        center: IVec3,
+        radius: u32,
+        reuse: Option<Box<[Cell]>>,
+    ) -> Arc<AcousticWindow> {
         let r = radius.min(47) as i32;
         let dim = (2 * r + 1) as usize;
         let origin = center - IVec3::splat(r);
         // Missing chunks stay Unloaded by leaving their cells untouched.
-        let mut cells = vec![Cell::Unloaded; dim * dim * dim].into_boxed_slice();
+        let n = dim * dim * dim;
+        let mut cells = match reuse {
+            Some(mut buf) if buf.len() == n => {
+                buf.fill(Cell::Unloaded);
+                buf
+            }
+            _ => vec![Cell::Unloaded; n].into_boxed_slice(),
+        };
 
         let hot = self.registry.hot_tables();
         let occlude = |id: BlockId| {
@@ -331,6 +390,8 @@ mod tests {
                 connectivity: None,
                 visible: true,
                 light: None,
+                has_blocklight: false,
+                light_gen: 0,
             },
         );
     }
@@ -393,6 +454,26 @@ mod tests {
                 }
             }
             assert_eq!(window.cell(center + IVec3::X * (r + 1)), Cell::Unloaded);
+        }
+    }
+
+    #[test]
+    fn acoustic_window_reuse_matches_fresh_capture() {
+        let world = query_world();
+        let center = IVec3::new(-1, 0, -1);
+        let radius = 19;
+        let fresh = world.capture_acoustic_window(center, radius);
+        let dim = (2 * radius + 1) as usize;
+        let dirty = vec![Cell::Open; dim * dim * dim].into_boxed_slice();
+        let reused = world.capture_acoustic_window_reuse(center, radius, Some(dirty));
+        let r = radius as i32;
+        for z in center.z - r..=center.z + r {
+            for y in center.y - r..=center.y + r {
+                for x in center.x - r..=center.x + r {
+                    let pos = IVec3::new(x, y, z);
+                    assert_eq!(fresh.cell(pos), reused.cell(pos), "{pos:?}");
+                }
+            }
         }
     }
 
