@@ -1428,7 +1428,18 @@ impl World {
         // blocked waiting on this data even if itself uniform air.
         self.mesh_worklist.insert(coord);
         for face in Face::ALL {
-            self.mesh_worklist.insert(coord.step(face));
+            let n = coord.step(face);
+            self.mesh_worklist.insert(n);
+            // A Ready neighbour meshed without this chunk (terminal promotion
+            // at a load-set edge, or the neighbour unloaded after the mesh).
+            // Rebuild so the final look picks up the new border; worklist
+            // seeding alone cannot, since Ready fails `is_needs_mesh`.
+            if matches!(
+                self.chunks.get(&n).map(|l| &l.state),
+                Some(MeshState::Ready(_))
+            ) {
+                self.remesh_async(n);
+            }
         }
         self.pending_fresh.set();
     }
@@ -1845,6 +1856,8 @@ impl World {
             // rebuild — seeding the worklist alone can't, since the neighbour
             // is already `Ready` and so fails the mesh lane's `is_needs_mesh`
             // gate. The old mesh keeps drawing until the rebuild uploads.
+            // A terminal-promoted Ready neighbour is rebuilt from `store_chunk`
+            // when the missing neighbour's data arrives.
             if self.light_gate.degraded.contains(&n) {
                 self.remesh_async(n);
             }
@@ -2300,18 +2313,40 @@ impl World {
                 // if neighbour light is still missing it will never arrive, so
                 // the terminal set makes the snapshot read missing planes dark.
                 Some(MeshState::Ready(_)) => {
-                    if !self.light_ready(coord) {
-                        self.light_terminal.insert(coord);
+                    if !self.in_mesh_box(coord) {
+                        // Past the mesh box (unload hysteresis): not drawn,
+                        // and a rebuild would fail `in_mesh_box` / be dropped
+                        // at apply. Drop the flag so quiescence is not wedged.
+                        self.mark_degraded(coord, false);
+                    } else {
+                        if !self.light_ready(coord) {
+                            self.light_terminal.insert(coord);
+                        }
+                        self.remesh_async(coord);
                     }
-                    self.remesh_async(coord);
                 }
                 // Unloaded out from under the set between marking and here.
                 None => self.mark_degraded(coord, false),
-                // Still building (in-flight degraded result pending) or Dirty (a
-                // sync remesh owns it): another path is about to resolve it. Leave
-                // it in the set; a later frame's flush promotes it once settled, so
-                // the flush never races an in-flight upload for the same chunk.
-                Some(MeshState::NeedsMesh { .. } | MeshState::Dirty { .. }) => {}
+                // Admit evicted the seed (a missing neighbour used to fail
+                // `ready`, or this flush ran after that pass's admit). Re-seed
+                // in-box chunks; mark terminal if neighbour light will not
+                // arrive. Out-of-box: same as Ready — drop the flag.
+                Some(MeshState::NeedsMesh {
+                    building: false, ..
+                }) => {
+                    if !self.in_mesh_box(coord) {
+                        self.mark_degraded(coord, false);
+                    } else if !self.mesh_worklist.contains(&coord) {
+                        if !self.light_ready(coord) {
+                            self.light_terminal.insert(coord);
+                        }
+                        self.mesh_worklist.insert(coord);
+                        self.pending_fresh.set();
+                    }
+                }
+                // Still building (in-flight result pending) or Dirty (a sync
+                // remesh owns it): another path is about to resolve it.
+                Some(MeshState::NeedsMesh { building: true, .. } | MeshState::Dirty { .. }) => {}
             }
         }
     }
@@ -2487,7 +2522,7 @@ impl World {
                         not_needs += 1;
                     } else if !self.in_mesh_box(c) {
                         out_box += 1;
-                    } else if !self.neighbours_have_data(c) {
+                    } else if !self.neighbours_have_data(c) && !self.light_terminal.contains(&c) {
                         no_neigh += 1;
                     } else if self.light_ready(c)
                         || self.light_wait_expired(c)
@@ -2523,7 +2558,7 @@ impl World {
                         queued += 1;
                     } else {
                         idle += 1;
-                        if !self.neighbours_have_data(c) {
+                        if !self.neighbours_have_data(c) && !self.light_terminal.contains(&c) {
                             idle_no_neigh += 1;
                         } else if !(self.light_ready(c)
                             || self.light_wait_expired(c)
@@ -2893,6 +2928,225 @@ mod tests {
             world.light_terminal.is_empty(),
             "claim consumes the terminal mark"
         );
+    }
+
+    /// One GPU-free stream pass: light-gate, mesh admit (submit + claim +
+    /// install the carried mesh as Ready — tests have no Engine), terminal
+    /// flush. Matches the live `stream` order so promotion completes in one
+    /// quiescence round after the seed.
+    fn pump_terminal_mesh(world: &mut World) {
+        world.tick_light_gate();
+        let seeds: Vec<Coord> = world.mesh_worklist.iter().copied().collect();
+        for key in seeds {
+            if <MeshLane as StreamLane>::in_flight(world, key) {
+                continue;
+            }
+            if !<MeshLane as StreamLane>::ready(world, key) {
+                world.mesh_worklist.remove(&key);
+                <MeshLane as StreamLane>::on_blocked(world, key);
+                continue;
+            }
+            let _job = <MeshLane as StreamLane>::submit(world, key).expect("mesh job");
+            <MeshLane as StreamLane>::claim(world, key);
+            if let Some(loaded) = world.chunks.get_mut(&key) {
+                if let MeshState::NeedsMesh {
+                    building: true,
+                    prev,
+                } = &mut loaded.state
+                {
+                    let next = match prev.take() {
+                        Some(m) => MeshState::Ready(m),
+                        None => MeshState::Air,
+                    };
+                    loaded.retire_logged(next);
+                }
+            }
+        }
+        world.flush_degraded_terminal();
+    }
+
+    /// A degraded mesh whose face neighbour has unloaded (trailing-edge /
+    /// load-set-edge) still promotes at quiescence: the terminal mark admits
+    /// the rebuild without neighbour data, a stranded `NeedsMesh` is re-seeded,
+    /// and `entry_complete` becomes true with the centre set.
+    #[test]
+    fn degraded_chunk_promotes_when_a_neighbour_is_missing() {
+        let mut world = World::generate();
+        world.lod2 = false;
+        world.set_view_distances(2, 2);
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let center = ChunkCoord::new(0, cy, 0);
+        world.center = Some(center);
+        let edge = ChunkCoord::new(2, cy, 0);
+        let missing = edge.step(Face::PosX);
+        assert!(world.in_mesh_box(edge), "edge chunk is drawn");
+        assert!(
+            !world.in_mesh_box(missing),
+            "the unloaded neighbour sits outside the mesh box"
+        );
+
+        for coord in world.mesh_box(center).coords() {
+            if !world.chunks.contains_key(&coord) {
+                world.ensure_data(coord);
+            }
+            let loaded = world.chunks.get_mut(&coord).expect("in-box data");
+            loaded.state = MeshState::Air;
+            if loaded.light.is_none() {
+                loaded.light = Some(light::LightGrid::dark());
+            }
+        }
+
+        let h = voxel_engine::MeshHandle::from_raw_parts(77, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&edge).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(edge, true);
+        world.chunks.remove(&missing);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.light_gate.blocked_since.clear();
+        world.upload_queue.clear();
+        assert!(
+            !world.neighbours_have_data(edge),
+            "the face neighbour is gone"
+        );
+        assert!(!world.light_ready(edge));
+
+        world.flush_degraded_terminal();
+        assert!(
+            matches!(
+                world.chunks[&edge].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "Ready degraded promotes through the async path"
+        );
+        assert!(world.light_terminal.contains(&edge));
+        assert!(
+            <MeshLane as StreamLane>::ready(&world, edge),
+            "terminal admits without neighbour data"
+        );
+
+        // The live admit loop evicts a blocked seed; a later flush must
+        // re-seed the stranded NeedsMesh instead of assuming another path
+        // will resolve it.
+        world.mesh_worklist.remove(&edge);
+        world.pending_fresh.take();
+        world.flush_degraded_terminal();
+        assert!(
+            world.mesh_worklist.contains(&edge),
+            "stuck NeedsMesh is re-seeded"
+        );
+        assert!(world.pending_fresh.get());
+        assert!(world.light_terminal.contains(&edge));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !world.entry_complete() {
+            assert!(
+                Instant::now() < deadline,
+                "promotion did not settle: {}",
+                world.entry_debug()
+            );
+            pump_terminal_mesh(&mut world);
+        }
+        assert!(
+            !world.light_gate.degraded.contains(&edge),
+            "the rebuild claim cleared the degraded flag"
+        );
+        assert!(
+            matches!(world.chunks[&edge].state, MeshState::Ready(_)),
+            "the chunk shows a Ready mesh"
+        );
+        assert!(world.entry_complete(), "centre is set and the box is final");
+        assert!(world.chunks[&edge].state.live_meshes().unwrap().draws(h));
+
+        // A later real neighbour arrival must rebuild the promoted chunk so
+        // the dark-plane snapshot is not permanent.
+        world.ensure_data(missing);
+        assert!(
+            matches!(
+                world.chunks[&edge].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "storing the missing neighbour rebuilds the terminal-promoted chunk"
+        );
+        assert!(world.mesh_worklist.contains(&edge));
+    }
+
+    /// A degraded chunk that has left the mesh box (still loaded in the unload
+    /// hysteresis) cannot be admitted, so flush drops the flag instead of
+    /// re-seeding a seed admit will just evict.
+    #[test]
+    fn flush_drops_degraded_outside_the_mesh_box() {
+        let mut world = World::generate();
+        world.lod2 = false;
+        world.set_view_distances(2, 2);
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let center = ChunkCoord::new(0, cy, 0);
+        world.center = Some(center);
+        let outside = ChunkCoord::new(3, cy, 0);
+        assert!(!world.in_mesh_box(outside));
+        if !world.chunks.contains_key(&outside) {
+            world.ensure_data(outside);
+        }
+        for coord in world.mesh_box(center).coords() {
+            if !world.chunks.contains_key(&coord) {
+                world.ensure_data(coord);
+            }
+            world.chunks.get_mut(&coord).unwrap().state = MeshState::Air;
+        }
+        let h = voxel_engine::MeshHandle::from_raw_parts(78, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        world.chunks.get_mut(&outside).unwrap().state = MeshState::Ready(meshes);
+        world.mark_degraded(outside, true);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.light_gate.blocked_since.clear();
+
+        world.flush_degraded_terminal();
+        assert!(
+            !world.light_gate.degraded.contains(&outside),
+            "out-of-box degraded is not owed a remesh"
+        );
+        assert!(
+            !world.mesh_worklist.contains(&outside),
+            "must not re-seed a seed admit will evict"
+        );
+        assert!(
+            matches!(world.chunks[&outside].state, MeshState::Ready(_)),
+            "the drawn mesh is left in place"
+        );
+
+        world.chunks.get_mut(&outside).unwrap().state = MeshState::NeedsMesh {
+            building: false,
+            prev: Some(
+                super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                    (p == voxel_engine::Pass::Opaque).then_some(h)
+                }))
+                .expect("one pass present"),
+            ),
+        };
+        world.mark_degraded(outside, true);
+        world.mesh_worklist.clear();
+        world.flush_degraded_terminal();
+        assert!(!world.light_gate.degraded.contains(&outside));
+        assert!(!world.mesh_worklist.contains(&outside));
     }
 
     fn assert_ceilings_eq(got: &light::CeilingWindow, slow: &light::CeilingWindow) {

@@ -1880,9 +1880,11 @@ impl StreamLane for MeshLane {
             && !world
                 .quarantined
                 .contains(&streaming::FailKey::Mesh { coord: key })
-            && world.neighbours_have_data(key)
-            // Terminal: missing neighbour light will never arrive; admit now
-            // so the snapshot can read those planes as settled dark.
+            // Terminal promotion is unconditional: missing neighbour planes
+            // read as dark/air, matching the old sync path. Snapshot already
+            // fills an absent neighbour that way (`Padded` → AIR, `PaddedLight`
+            // → DARK when not degraded).
+            && (world.neighbours_have_data(key) || world.light_terminal.contains(&key))
             && (world.light_ready(key)
                 || world.light_wait_expired(key)
                 || world.light_terminal.contains(&key))
