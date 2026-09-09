@@ -160,6 +160,7 @@ fn worklist_bytes(world: &World) -> usize {
         + set_cap::<Coord>(world.light_worklist.capacity())
         + set_cap::<Coord>(world.light_inflight.capacity())
         + set_cap::<Coord>(world.dirty_worklist.capacity())
+        + map_cap::<Coord, std::time::Instant>(world.light_gate.dirty.capacity())
         + set_cap::<SectionPos>(world.dirty_sections.capacity())
         + deque_cap::<(Coord, u32, pipeline::MeshOutput)>(world.upload_queue.capacity())
         + deque_cap::<(Coord, LightGrid)>(world.light_apply_queue.capacity())

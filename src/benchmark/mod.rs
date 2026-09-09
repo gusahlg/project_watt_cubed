@@ -835,6 +835,30 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("light_admitted", Json::from(g.light_admitted as u64)),
         ("light_admitted_last", Json::from(g.light_admitted_last)),
         ("light_seed_inserts", Json::from(g.light_seed_inserts as u64)),
+        ("remesh_async_calls", Json::from(g.remesh_async_calls)),
+        ("drop_stale_uploads", Json::from(g.drop_stale_uploads)),
+        ("drop_stale_this_frame", Json::from(g.drop_stale_this_frame as u64)),
+        (
+            "remesh_between_upload_mean",
+            Json::number(f64::from(g.remesh_between_upload_mean)),
+        ),
+        (
+            "remesh_between_upload_p95",
+            Json::number(f64::from(g.remesh_between_upload_p95)),
+        ),
+        ("remesh_between_upload_n", Json::from(g.remesh_between_upload_n)),
+        (
+            "mesh_jobs_before_fixpoint_mean",
+            Json::number(f64::from(g.mesh_jobs_before_fixpoint_mean)),
+        ),
+        (
+            "mesh_jobs_before_fixpoint_p95",
+            Json::number(f64::from(g.mesh_jobs_before_fixpoint_p95)),
+        ),
+        (
+            "mesh_jobs_before_fixpoint_n",
+            Json::from(g.mesh_jobs_before_fixpoint_n),
+        ),
     ])
 }
 

@@ -257,10 +257,13 @@ const LIGHT_WAIT_DEGRADE: Duration = Duration::from_millis(150);
 /// Tracks degraded meshes waiting for neighbour light to settle.
 /// `blocked_since`: per-chunk timer for when it became light-blocked.
 /// `degraded`: set of chunks currently drawing a degraded mesh, owed a remesh.
+/// `dirty`: changed-light chunks waiting for a 27-neighbourhood fixpoint (or
+/// the degrade timer) before their next mesh job.
 #[derive(Default)]
 pub(in crate::world) struct LightGate {
     pub(in crate::world) blocked_since: FastMap<Coord, Instant>,
     pub(in crate::world) degraded: FastSet<Coord>,
+    pub(in crate::world) dirty: FastMap<Coord, Instant>,
 }
 
 impl LightGate {
@@ -269,6 +272,90 @@ impl LightGate {
     pub(in crate::world) fn note_blocked(&mut self, coord: Coord) {
         self.blocked_since.entry(coord).or_insert_with(Instant::now);
     }
+
+    /// Mark a changed-light chunk; the first mark starts the degrade clock.
+    fn mark_dirty(&mut self, coord: Coord) {
+        self.dirty.entry(coord).or_insert_with(Instant::now);
+    }
+}
+
+/// Cap on per-chunk remesh/job samples kept for the stress mean/p95 gauges.
+const REMESH_SAMPLE_CAP: usize = 1 << 16;
+
+/// Flight counters for light-convergence remeshes (stress C3).
+#[derive(Default)]
+pub(in crate::world) struct RemeshStats {
+    pub remesh_async_calls: u64,
+    pub drop_stale_uploads: u64,
+    pub drop_stale_this_frame: u32,
+    remesh_since_upload: FastMap<Coord, u16>,
+    remesh_between_upload_samples: Vec<u16>,
+    mesh_jobs_until_fixpoint: FastMap<Coord, u16>,
+    mesh_jobs_fixpoint_done: FastSet<Coord>,
+    mesh_jobs_before_fixpoint_samples: Vec<u16>,
+}
+
+impl RemeshStats {
+    fn note_remesh(&mut self, coord: Coord) {
+        self.remesh_async_calls += 1;
+        let n = self.remesh_since_upload.entry(coord).or_insert(0);
+        *n = n.saturating_add(1);
+    }
+
+    fn note_upload(&mut self, coord: Coord) {
+        let n = self.remesh_since_upload.remove(&coord).unwrap_or(0);
+        if self.remesh_between_upload_samples.len() < REMESH_SAMPLE_CAP {
+            self.remesh_between_upload_samples.push(n);
+        }
+    }
+
+    fn note_drop_stale(&mut self) {
+        self.drop_stale_uploads += 1;
+        self.drop_stale_this_frame = self.drop_stale_this_frame.saturating_add(1);
+    }
+
+    pub(in crate::world) fn note_mesh_job(&mut self, coord: Coord, nhood_quiet: bool) {
+        if self.mesh_jobs_fixpoint_done.contains(&coord) {
+            return;
+        }
+        if nhood_quiet {
+            let n = self.mesh_jobs_until_fixpoint.remove(&coord).unwrap_or(0);
+            if self.mesh_jobs_before_fixpoint_samples.len() < REMESH_SAMPLE_CAP {
+                self.mesh_jobs_before_fixpoint_samples.push(n);
+            }
+            self.mesh_jobs_fixpoint_done.insert(coord);
+        } else {
+            let n = self.mesh_jobs_until_fixpoint.entry(coord).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+    }
+
+    fn forget(&mut self, coord: Coord) {
+        self.remesh_since_upload.remove(&coord);
+        self.mesh_jobs_until_fixpoint.remove(&coord);
+        self.mesh_jobs_fixpoint_done.remove(&coord);
+    }
+
+    fn between_upload_mean_p95(&self) -> (f32, f32, u64) {
+        sample_mean_p95(&self.remesh_between_upload_samples)
+    }
+
+    fn jobs_before_fixpoint_mean_p95(&self) -> (f32, f32, u64) {
+        sample_mean_p95(&self.mesh_jobs_before_fixpoint_samples)
+    }
+}
+
+fn sample_mean_p95(samples: &[u16]) -> (f32, f32, u64) {
+    let n = samples.len() as u64;
+    if samples.is_empty() {
+        return (0.0, 0.0, 0);
+    }
+    let sum: u64 = samples.iter().map(|&v| u64::from(v)).sum();
+    let mean = sum as f32 / n as f32;
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let p95 = sorted[((n - 1) as f32 * 0.95).round() as usize] as f32;
+    (mean, p95, n)
 }
 
 /// The strike/quarantine identity of a panicked job — the per-lane key
@@ -363,6 +450,7 @@ impl World {
     /// and a mined block still vanishes the same frame it was clicked.
     /// Steady-state cost is a channel poll and two sticky-flag checks.
     pub fn pump(&mut self, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+        self.remesh_stats.drop_stale_this_frame = 0;
         // Palette growth re-uploads the block texture array before any upload
         // this frame references a new layer.
         self.refresh_textures(eng);
@@ -895,6 +983,7 @@ impl World {
     /// can mesh again later — the one stale-drop path, shared by the accept
     /// site, the pop-time re-validation, and the boundary-cross prune.
     fn drop_stale_upload(&mut self, coord: Coord) {
+        self.remesh_stats.note_drop_stale();
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             if loaded.state.release_build() {
                 super::adjust_count(&mut self.building_meshes, true, false);
@@ -943,6 +1032,7 @@ impl World {
             let was = loaded.state.is_building();
             loaded.retire(MeshState::from_upload(handles), eng);
             super::adjust_count(&mut self.building_meshes, was, false);
+            self.remesh_stats.note_upload(coord);
             loaded.visible = vis;
             if !vis && let Some(meshes) = loaded.state.live_meshes() {
                 meshes.set_visible(eng, false);
@@ -1559,6 +1649,7 @@ impl World {
             }
             self.dirty_worklist.remove(&coord);
             self.light_terminal.remove(&coord);
+            self.remesh_stats.forget(coord);
             // Column layers: the last chunk out drops the cached ceiling.
             if let Some(ys) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
                 if let Some(i) = ys.iter().position(|&y| y == coord.y) {
@@ -1852,31 +1943,33 @@ impl World {
     /// — the "still laggy seconds after stopping" stall. The sync path stays
     /// for player edits only, where same-frame response is the point.
     fn remesh_async(&mut self, coord: Coord) {
+        let skip = match self.chunks.get(&coord).map(|l| &l.state) {
+            None => return,
+            Some(MeshState::Dirty { .. } | MeshState::Air) => true,
+            Some(_) => false,
+        };
+        if skip {
+            self.light_gate.dirty.remove(&coord);
+            return;
+        }
         let Some(loaded) = self.chunks.get_mut(&coord) else {
             return;
         };
-        match &mut loaded.state {
-            // Carry the drawn mesh into the rebuild state.
-            MeshState::Ready(_) => {
-                let prev =
-                    std::mem::replace(&mut loaded.state, MeshState::needs_mesh()).into_owned();
-                loaded.state = MeshState::NeedsMesh {
-                    building: false,
-                    prev,
-                };
-            }
-            // Already awaiting/mid-build: the rev bump below strands the
-            // in-flight result; its stale drop releases the claim and
-            // re-seeds, keeping the one-claim-one-Done discipline (never a
-            // second job for a still-claimed coord).
-            MeshState::NeedsMesh { .. } => {}
-            // Dirty: the sync edit remesh owns it and reads light at build
-            // time (its rev was already bumped by the edit). Air: no geometry.
-            MeshState::Dirty { .. } | MeshState::Air => return,
+        if let MeshState::Ready(_) = &loaded.state {
+            // Carry the drawn mesh into the rebuild. A NeedsMesh already
+            // awaiting/mid-build just takes the rev bump, which strands the
+            // in-flight result.
+            let prev = std::mem::replace(&mut loaded.state, MeshState::needs_mesh()).into_owned();
+            loaded.state = MeshState::NeedsMesh {
+                building: false,
+                prev,
+            };
         }
         loaded.rev = loaded.rev.wrapping_add(1);
         self.mesh_worklist.insert(coord);
         self.pending_fresh.set();
+        self.light_gate.dirty.remove(&coord);
+        self.remesh_stats.note_remesh(coord);
     }
 
     /// Count a light-worklist insert (the stress harness's seeds-per-chunk signal).
@@ -1923,12 +2016,17 @@ impl World {
             }
         };
         let has_blocklight = grid.has_border_blocklight();
-        let loaded = self.chunks.get_mut(&coord).unwrap();
-        loaded.light = Some(grid);
-        loaded.has_blocklight = has_blocklight;
+        {
+            let loaded = self.chunks.get_mut(&coord).unwrap();
+            loaded.light = Some(grid);
+            loaded.has_blocklight = has_blocklight;
+        }
         // A neighbour may now be meshable too (this chunk's FIRST grid completes
         // their neighbourhood — `moved` is all faces then); re-settle the
-        // neighbours whose shared border moved.
+        // neighbours whose shared border moved. Mark dirty instead of remeshing
+        // immediately: `tick_light_gate` promotes once the 27-neighbourhood
+        // has no pending light work (or the degrade timer expires).
+        self.light_gate.mark_dirty(coord);
         for &face in &Face::ALL {
             if moved & (1 << (face as u8)) == 0 {
                 continue;
@@ -1936,24 +2034,11 @@ impl World {
             let n = coord.step(face);
             self.seed_light(n);
             self.mesh_worklist.insert(n);
-            // A DEGRADED neighbour meshed with fake open-sky light across this
-            // border; now that real light has crossed it, schedule its ASYNC
-            // rebuild — seeding the worklist alone can't, since the neighbour
-            // is already `Ready` and so fails the mesh lane's `is_needs_mesh`
-            // gate. The old mesh keeps drawing until the rebuild uploads.
-            // A terminal-promoted Ready neighbour is rebuilt from `store_chunk`
-            // when the missing neighbour's data arrives.
-            if self.light_gate.degraded.contains(&n) {
-                self.remesh_async(n);
-            }
+            self.light_gate.mark_dirty(n);
         }
         if !self.light_worklist.is_empty() {
             self.light_pending.set();
         }
-        // Light changed: schedule the chunk's ASYNC rebuild (rev bump strands
-        // in-flight builds and stales queued uploads; a drawn mesh keeps
-        // drawing as `prev`). Unmeshed chunks simply mesh fresh with new light.
-        self.remesh_async(coord);
     }
 
     fn nhood_at<'a>(nhood: &[Option<&'a Loaded>; 27], dx: i32, dy: i32, dz: i32) -> Option<&'a Loaded> {
@@ -2277,6 +2362,62 @@ impl World {
             })
     }
 
+    /// True when the 27-neighbourhood has no pending light work. Apply-queue
+    /// coords keep their inflight claim until `settle_light`, so inflight
+    /// covers the queue; the empty-queue check is the cheap global fast path.
+    pub(in crate::world) fn light_nhood_quiet(&self, coord: Coord) -> bool {
+        if self.light_worklist.is_empty()
+            && self.light_inflight.is_empty()
+            && self.light_apply_queue.is_empty()
+        {
+            return true;
+        }
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let n = Coord::new(coord.x + dx, coord.y + dy, coord.z + dz);
+                    if self.light_worklist.contains(&n) || self.light_inflight.contains(&n) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Turn a `light_dirty` mark into a mesh job. Returns true if the mark
+    /// can drop. Skips an in-flight first mesh (no rev bump) so the early
+    /// degraded mesh still appears on the same clock as before.
+    fn promote_dirty_mesh(&mut self, coord: Coord) -> bool {
+        let Some(loaded) = self.chunks.get(&coord) else {
+            return true;
+        };
+        let action = match &loaded.state {
+            MeshState::Air | MeshState::Dirty { .. } => 0u8,
+            MeshState::NeedsMesh {
+                building: true, ..
+            } => 1,
+            MeshState::NeedsMesh {
+                building: false,
+                prev: None,
+            } => 2,
+            MeshState::Ready(_)
+            | MeshState::NeedsMesh {
+                building: false,
+                prev: Some(_),
+            } => 3,
+        };
+        match action {
+            0 => true,
+            1 => false,
+            2 => self.light_nhood_quiet(coord),
+            _ => {
+                self.remesh_async(coord);
+                true
+            }
+        }
+    }
+
     /// A chunk waiting purely on neighbour light: it has data and is in view and
     /// awaiting a fresh mesh, but its neighbourhood light has not settled. The
     /// [`LightGate`] times exactly these chunks.
@@ -2309,16 +2450,15 @@ impl World {
     }
 
     /// Advance the light-gate before the mesh lane runs: reap timers whose
-    /// chunk stopped waiting, drop degraded entries for unloaded chunks,
-    /// promote degraded chunks whose light became ready without a border
-    /// event, and re-seed exactly the chunks whose DEGRADE TIMER expired —
-    /// expiry raises no event of its own, so this sweep (over ONLY the timed
-    /// map, never the whole worklist) is what un-strands them. Timers START at
-    /// the admit loop's blocked-eviction event ([`MeshLane::on_blocked`]);
-    /// every pre-expiry re-seed comes from a real event (a grid landing via
-    /// `settle_light`, neighbour data via `store_chunk`). The old gate
-    /// re-scanned the entire `mesh_worklist` (~15 hash probes per seed) and
-    /// unconditionally re-seeded every blocked chunk, every pass of a flood.
+    /// chunk stopped waiting, drop degraded/dirty entries for unloaded chunks,
+    /// promote `light_dirty` (and relit-degraded) chunks whose 27-neighbourhood
+    /// has no pending light work or whose degrade timer expired, and re-seed
+    /// exactly the chunks whose DEGRADE TIMER expired — expiry raises no event
+    /// of its own, so this sweep (over ONLY the timed/dirty maps, never the
+    /// world) is what un-strands them. Timers START at the admit loop's
+    /// blocked-eviction event ([`MeshLane::on_blocked`]); every pre-expiry
+    /// re-seed comes from a real event (a grid landing via `settle_light`,
+    /// neighbour data via `store_chunk`).
     pub(in crate::world) fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
         // the predicates below read the chunk map. Empty maps skip `retain`
@@ -2328,6 +2468,12 @@ impl World {
             gate.degraded.retain(|c| self.chunks.contains_key(c));
             if gate.degraded.is_empty() {
                 gate.degraded.shrink_to_fit();
+            }
+        }
+        if !gate.dirty.is_empty() {
+            gate.dirty.retain(|c, _| self.chunks.contains_key(c));
+            if gate.dirty.is_empty() {
+                gate.dirty.shrink_to_fit();
             }
         }
         if !self.light_terminal.is_empty() {
@@ -2343,18 +2489,35 @@ impl World {
                 gate.blocked_since.shrink_to_fit();
             }
         }
-        // Safety net: event-driven paths miss degraded chunks whose neighbour
-        // light settled without moving the shared border. Sweep them: any now
-        // light-ready gets its ASYNC rebuild scheduled (the old mesh keeps
-        // drawing), clearing the degraded flag at the rebuild's claim.
-        let relit: Vec<Coord> = gate
-            .degraded
+        // Promote dirty (and relit-degraded) chunks once the 27-neighbourhood
+        // has no pending light work, or the degrade timer has expired. One
+        // pass over the dirty/degraded sets, never the world.
+        let mut promote: Vec<Coord> = gate
+            .dirty
             .iter()
-            .copied()
-            .filter(|&c| self.light_ready(c))
+            .filter(|(c, t)| self.light_nhood_quiet(**c) || t.elapsed() >= LIGHT_WAIT_DEGRADE)
+            .map(|(c, _)| *c)
             .collect();
-        for c in relit {
-            self.remesh_async(c);
+        for &c in &gate.degraded {
+            if gate.dirty.contains_key(&c) {
+                continue;
+            }
+            if self.light_ready(c)
+                && (self.light_nhood_quiet(c)
+                    || gate
+                        .blocked_since
+                        .get(&c)
+                        .is_some_and(|t| t.elapsed() >= LIGHT_WAIT_DEGRADE))
+            {
+                promote.push(c);
+            }
+        }
+        for c in promote {
+            if self.promote_dirty_mesh(c) {
+                gate.dirty.remove(&c);
+            } else {
+                gate.dirty.entry(c).or_insert_with(Instant::now);
+            }
         }
         // The expiry sweep: a chunk past LIGHT_WAIT_DEGRADE is mesh-ready via
         // `light_wait_expired` but was evicted from the worklist when it
@@ -2372,20 +2535,20 @@ impl World {
         self.light_gate = gate;
     }
 
-    /// Level-triggered backstop for degraded set: fires only at light quiescence.
-    /// Event-driven paths miss degraded chunks whose missing neighbour settled
-    /// without moving shared border; this sweep promotes them to final at true
-    /// rest so entry_complete doesn't hang.
+    /// Level-triggered backstop for the degraded set: per-coord, once that
+    /// chunk's 27-neighbourhood has no pending light work. Event-driven paths
+    /// miss degraded chunks whose missing neighbour settled without moving the
+    /// shared border; this sweep promotes them to final so entry_complete
+    /// doesn't hang. A still-building/Dirty chunk is left for a later flush.
     pub(in crate::world) fn flush_degraded_terminal(&mut self) {
-        if !self.near_quiescent() || self.light_gate.degraded.is_empty() {
+        if self.light_gate.degraded.is_empty() {
             return;
         }
-        // Promote every SETTLED degraded chunk this frame: a rev bump plus a
-        // worklist seed is microseconds, so there is no per-frame budget. The
-        // world is quiescent (nothing else re-degrades). A still-building/Dirty
-        // chunk is left for a later flush once its own path settles it.
         let stuck: Vec<Coord> = self.light_gate.degraded.iter().copied().collect();
         for coord in stuck {
+            if !self.light_nhood_quiet(coord) {
+                continue;
+            }
             match self.chunks.get(&coord).map(|l| &l.state) {
                 // Nothing to draw: drop the degraded flag.
                 Some(MeshState::Air) => self.mark_degraded(coord, false),
@@ -2444,6 +2607,7 @@ impl World {
         if !self.near_quiescent()
             || !self.upload_queue.is_empty()
             || !self.light_gate.degraded.is_empty()
+            || !self.light_gate.dirty.is_empty()
             || !self.light_gate.blocked_since.is_empty()
         {
             return false;
@@ -2536,6 +2700,8 @@ impl World {
                 )
             })
             .unwrap_or_default();
+        let (ru_mean, ru_p95, ru_n) = self.remesh_stats.between_upload_mean_p95();
+        let (jf_mean, jf_p95, jf_n) = self.remesh_stats.jobs_before_fixpoint_mean_p95();
         super::StreamGauges {
             chunks: self.chunks.len(),
             generating: self.generating.len(),
@@ -2553,6 +2719,15 @@ impl World {
             light_admitted: self.light_admitted,
             light_admitted_last: self.light_admitted_last,
             light_seed_inserts: self.light_seed_inserts,
+            remesh_async_calls: self.remesh_stats.remesh_async_calls,
+            drop_stale_uploads: self.remesh_stats.drop_stale_uploads,
+            drop_stale_this_frame: self.remesh_stats.drop_stale_this_frame,
+            remesh_between_upload_mean: ru_mean,
+            remesh_between_upload_p95: ru_p95,
+            remesh_between_upload_n: ru_n,
+            mesh_jobs_before_fixpoint_mean: jf_mean,
+            mesh_jobs_before_fixpoint_p95: jf_p95,
+            mesh_jobs_before_fixpoint_n: jf_n,
         }
     }
 
@@ -2586,7 +2761,7 @@ impl World {
         // Share the one queue-depth source with the harness gauge, so the two
         // can never drift; the gate counters have no gauge field, so stay local.
         let g = self.stream_gauges();
-        let near: [(&str, usize); 9] = [
+        let near: [(&str, usize); 10] = [
             ("generating", g.generating),
             ("mesh_worklist", g.mesh_worklist),
             ("upload_queue", g.upload_queue),
@@ -2594,6 +2769,7 @@ impl World {
             ("light_inflight", g.light_inflight),
             ("light_apply_queue", g.light_apply_queue),
             ("degraded", self.light_gate.degraded.len()),
+            ("light_dirty", self.light_gate.dirty.len()),
             ("terminal", self.light_terminal.len()),
             ("light_blocked", self.light_gate.blocked_since.len()),
         ];
@@ -2850,6 +3026,8 @@ mod tests {
         world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(meshes);
         world.mark_degraded(c, true);
         world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
         world.pending_dirty.take();
 
         world.tick_light_gate();
@@ -3272,6 +3450,186 @@ mod tests {
         world.flush_degraded_terminal();
         assert!(!world.light_gate.degraded.contains(&outside));
         assert!(!world.mesh_worklist.contains(&outside));
+    }
+
+    fn ready_handle(id: u32) -> super::super::ChunkMeshes {
+        let h = voxel_engine::MeshHandle::from_raw_parts(id, 1);
+        super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present")
+    }
+
+    /// Changed settles mark `light_dirty` and do not remesh while the
+    /// 27-neighbourhood still has pending light work; one tick after the
+    /// neighbourhood quiets issues a single async rebuild.
+    #[test]
+    fn changed_settle_remeshes_once_at_nhood_fixpoint() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.center = Some(c);
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(ready_handle(91));
+        world.chunks.get_mut(&c).unwrap().light = Some(light::LightGrid::open_sky());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.pending_dirty.take();
+        let pending = c.step(Face::PosX);
+        world.light_worklist.insert(pending);
+        let rev = world.chunks[&c].rev;
+
+        world.settle_light(c, light::LightGrid::dark());
+        world.settle_light(c, light::LightGrid::full());
+        world.settle_light(c, light::LightGrid::dark());
+        assert!(
+            matches!(world.chunks[&c].state, MeshState::Ready(_)),
+            "pending nhood light must not remesh"
+        );
+        assert_eq!(world.chunks[&c].rev, rev, "no rev bump while waiting");
+        assert!(world.light_gate.dirty.contains_key(&c));
+        assert_eq!(world.remesh_stats.remesh_async_calls, 0);
+
+        world.light_worklist.clear();
+        world.light_gate.dirty.retain(|&k, _| k == c);
+        world.tick_light_gate();
+        assert!(
+            matches!(
+                world.chunks[&c].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "quiet nhood promotes one async rebuild"
+        );
+        assert_eq!(world.remesh_stats.remesh_async_calls, 1);
+        assert!(!world.light_gate.dirty.contains_key(&c));
+    }
+
+    /// The degrade timer still promotes a dirty Ready chunk while its
+    /// neighbourhood has pending light work, so the first update is not
+    /// delayed past LIGHT_WAIT_DEGRADE.
+    #[test]
+    fn dirty_chunk_promotes_when_degrade_timer_expires() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.center = Some(c);
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(ready_handle(92));
+        world.chunks.get_mut(&c).unwrap().light = Some(light::LightGrid::open_sky());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.settle_light(c, light::LightGrid::dark());
+        world.light_worklist.insert(c.step(Face::PosY));
+        assert!(matches!(world.chunks[&c].state, MeshState::Ready(_)));
+
+        world.light_gate.dirty.insert(
+            c,
+            Instant::now() - LIGHT_WAIT_DEGRADE - Duration::from_millis(1),
+        );
+        world.tick_light_gate();
+        assert!(
+            matches!(
+                world.chunks[&c].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "expired dirty mark remeshes even with pending nhood light"
+        );
+    }
+
+    /// First mesh of a never-drawn chunk is not delayed: settle keeps it on
+    /// the worklist without a rev-bumping remesh_async.
+    #[test]
+    fn first_mesh_is_not_delayed_by_light_dirty() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.center = Some(c);
+        world.chunks.get_mut(&c).unwrap().state = MeshState::needs_mesh();
+        world.chunks.get_mut(&c).unwrap().light = Some(light::LightGrid::open_sky());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.mesh_worklist.clear();
+        let rev = world.chunks[&c].rev;
+        world.light_worklist.insert(c.step(Face::NegZ));
+        world.settle_light(c, light::LightGrid::dark());
+        assert_eq!(world.chunks[&c].rev, rev, "first mesh must not take a rev bump");
+        assert!(world.mesh_worklist.contains(&c), "still seeded for the first mesh");
+        assert!(
+            matches!(
+                world.chunks[&c].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: None
+                }
+            )
+        );
+        world.tick_light_gate();
+        assert_eq!(world.chunks[&c].rev, rev);
+        assert_eq!(world.remesh_stats.remesh_async_calls, 0);
+    }
+
+    /// `flush_degraded_terminal` promotes a per-coord-quiet degraded chunk
+    /// even while unrelated light work is still queued elsewhere.
+    #[test]
+    fn flush_degraded_is_per_coord_not_global() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.center = Some(c);
+        let missing = c.step(Face::PosX);
+        for n in std::iter::once(c).chain(Face::ALL.iter().map(|&f| c.step(f))) {
+            let loaded = world.chunks.get_mut(&n).expect("pregenerated");
+            loaded.light = if n == missing {
+                None
+            } else {
+                Some(light::LightGrid::dark())
+            };
+        }
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Ready(ready_handle(93));
+        world.mark_degraded(c, true);
+        world.generating.clear();
+        world.mesh_worklist.clear();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_apply_queue.clear();
+        world.pending_dirty.take();
+        let far = Coord::new(8, 0, 8);
+        world.light_worklist.insert(far);
+        assert!(!world.near_quiescent(), "global light work is still queued");
+        assert!(!world.light_ready(c));
+        assert!(world.light_nhood_quiet(c), "this coord's 27-nhood is idle");
+
+        world.flush_degraded_terminal();
+        assert!(
+            matches!(
+                world.chunks[&c].state,
+                MeshState::NeedsMesh {
+                    building: false,
+                    prev: Some(_)
+                }
+            ),
+            "per-coord quiet promotes without waiting for global quiescence"
+        );
+        assert!(world.light_terminal.contains(&c));
+    }
+
+    /// `LightLane::submit` must not skip a job just because `trivial_light`
+    /// would succeed — that decision was made at store time.
+    #[test]
+    fn light_lane_submit_does_not_recheck_trivial_light() {
+        let mut world = World::generate();
+        let coord = world
+            .chunks
+            .iter()
+            .find_map(|(&c, l)| l.light.as_ref().map(|_| c))
+            .expect("generate publishes at least one grid");
+        assert!(
+            <LightLane as StreamLane>::submit(&mut world, coord).is_some(),
+            "submit must not re-check trivial_light"
+        );
     }
 
     fn assert_ceilings_eq(got: &light::CeilingWindow, slow: &light::CeilingWindow) {

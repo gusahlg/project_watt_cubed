@@ -168,6 +168,20 @@ pub struct StreamGauges {
     pub light_admitted_last: usize,
     /// Cumulative `light_worklist` insert attempts (including already-queued).
     pub light_seed_inserts: u64,
+    /// `remesh_async` calls (rev-bumping rebuilds) this world has issued.
+    pub remesh_async_calls: u64,
+    /// Stale mesh drops (accept-time, pop-time, and prune).
+    pub drop_stale_uploads: u64,
+    /// Stale drops during the current stream/pump frame.
+    pub drop_stale_this_frame: u32,
+    /// `remesh_async` calls per coord between successful uploads.
+    pub remesh_between_upload_mean: f32,
+    pub remesh_between_upload_p95: f32,
+    pub remesh_between_upload_n: u64,
+    /// Mesh jobs claimed for a chunk before its 27-neighbourhood light fixpoint.
+    pub mesh_jobs_before_fixpoint_mean: f32,
+    pub mesh_jobs_before_fixpoint_p95: f32,
+    pub mesh_jobs_before_fixpoint_n: u64,
 }
 
 pub use census::MemoryCensus;
@@ -830,6 +844,8 @@ pub struct World {
     /// of chunks currently showing a degraded (known-not-final) mesh awaiting relight.
     /// Kept in one struct so the feature's footprint on `World` is a single field.
     light_gate: streaming::LightGate,
+    /// Remesh/stale-drop samples for the stress C3 gauges.
+    remesh_stats: streaming::RemeshStats,
     /// Chunks whose missing neighbour light will never arrive, so a mesh
     /// snapshot must read missing planes as settled dark (not open-sky).
     light_terminal: FastSet<Coord>,
@@ -1144,6 +1160,7 @@ impl World {
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
+            remesh_stats: streaming::RemeshStats::default(),
             light_terminal: FastSet::default(),
             mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
@@ -2105,6 +2122,8 @@ impl StreamLane for MeshLane {
             }
         };
         world.mark_degraded(key, degraded);
+        let nhood_quiet = world.light_nhood_quiet(key);
+        world.remesh_stats.note_mesh_job(key, nhood_quiet);
         // Set the building flag IN PLACE to claim the mesh job — a whole-state
         // overwrite would silently drop a carried `prev` mesh (leaking its GPU
         // handle and blanking the chunk mid-rebuild). Held until upload retires
@@ -2280,6 +2299,8 @@ impl StreamLane for LightLane {
         world.light_inflight.contains(&key)
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+        // `trivial_light` is decided at store time. A worklist seed here is a
+        // real re-settle (neighbour border / edit) and must run the flood.
         if !world.lighting
             || !world.chunks.contains_key(&key)
             || world

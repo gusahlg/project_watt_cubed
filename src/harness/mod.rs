@@ -380,6 +380,19 @@ pub struct FrameStats {
     pub max: f32,
 }
 
+fn mean_p95_u32(samples: &[u32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = samples.len();
+    let sum: u64 = samples.iter().map(|&v| u64::from(v)).sum();
+    let mean = sum as f32 / n as f32;
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let p95 = sorted[((n - 1) as f32 * 0.95).round() as usize] as f32;
+    (mean, p95)
+}
+
 impl FrameStats {
     /// Sorts `ms` in place and reads the nearest-rank percentiles.
     fn from_ms(ms: &mut [f32]) -> FrameStats {
@@ -432,6 +445,19 @@ pub struct StressOutcome {
     pub settle_light_admit_per_s: f32,
     /// Per-second snapshots after stop: admit rate, workers, effort, worklist.
     pub settle_samples: Vec<SettleSample>,
+    /// `remesh_async` calls per coord between uploads (whole run).
+    pub remesh_between_upload_mean: f32,
+    pub remesh_between_upload_p95: f32,
+    pub remesh_between_upload_n: u64,
+    /// Mesh jobs claimed per chunk before its 27-neighbourhood light fixpoint.
+    pub mesh_jobs_before_fixpoint_mean: f32,
+    pub mesh_jobs_before_fixpoint_p95: f32,
+    pub mesh_jobs_before_fixpoint_n: u64,
+    /// `drop_stale_upload` hits per flight frame.
+    pub drop_stale_per_frame_mean: f32,
+    pub drop_stale_per_frame_p95: f32,
+    pub remesh_async_calls: u64,
+    pub drop_stale_uploads: u64,
 }
 
 /// One second of post-stop streaming (the light-drain counters).
@@ -471,6 +497,15 @@ struct StressRun {
     sample_admitted: u64,
     end_admitted: u64,
     samples: Vec<SettleSample>,
+    drop_stale_flight: Vec<u32>,
+    remesh_between_upload_mean: f32,
+    remesh_between_upload_p95: f32,
+    remesh_between_upload_n: u64,
+    mesh_jobs_before_fixpoint_mean: f32,
+    mesh_jobs_before_fixpoint_p95: f32,
+    mesh_jobs_before_fixpoint_n: u64,
+    remesh_async_calls: u64,
+    drop_stale_uploads: u64,
 }
 
 impl StressRun {
@@ -496,10 +531,20 @@ impl StressRun {
             sample_admitted: 0,
             end_admitted: 0,
             samples: Vec::new(),
+            drop_stale_flight: Vec::new(),
+            remesh_between_upload_mean: 0.0,
+            remesh_between_upload_p95: 0.0,
+            remesh_between_upload_n: 0,
+            mesh_jobs_before_fixpoint_mean: 0.0,
+            mesh_jobs_before_fixpoint_p95: 0.0,
+            mesh_jobs_before_fixpoint_n: 0,
+            remesh_async_calls: 0,
+            drop_stale_uploads: 0,
         }
     }
 
     fn finish(mut self, settle_time: Option<Duration>, stuck: String) -> StressOutcome {
+        let (drop_mean, drop_p95) = mean_p95_u32(&self.drop_stale_flight);
         StressOutcome {
             flight: FrameStats::from_ms(&mut self.flight_ms),
             settle: FrameStats::from_ms(&mut self.settle_ms),
@@ -534,6 +579,16 @@ impl StressRun {
                 }
             },
             settle_samples: self.samples,
+            remesh_between_upload_mean: self.remesh_between_upload_mean,
+            remesh_between_upload_p95: self.remesh_between_upload_p95,
+            remesh_between_upload_n: self.remesh_between_upload_n,
+            mesh_jobs_before_fixpoint_mean: self.mesh_jobs_before_fixpoint_mean,
+            mesh_jobs_before_fixpoint_p95: self.mesh_jobs_before_fixpoint_p95,
+            mesh_jobs_before_fixpoint_n: self.mesh_jobs_before_fixpoint_n,
+            drop_stale_per_frame_mean: drop_mean,
+            drop_stale_per_frame_p95: drop_p95,
+            remesh_async_calls: self.remesh_async_calls,
+            drop_stale_uploads: self.drop_stale_uploads,
         }
     }
 }
@@ -833,9 +888,18 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
                 run.min_active_workers = run.min_active_workers.min(gauges.active_workers);
             }
             run.min_effort = run.min_effort.min(gauges.effort);
+            run.remesh_between_upload_mean = gauges.remesh_between_upload_mean;
+            run.remesh_between_upload_p95 = gauges.remesh_between_upload_p95;
+            run.remesh_between_upload_n = gauges.remesh_between_upload_n;
+            run.mesh_jobs_before_fixpoint_mean = gauges.mesh_jobs_before_fixpoint_mean;
+            run.mesh_jobs_before_fixpoint_p95 = gauges.mesh_jobs_before_fixpoint_p95;
+            run.mesh_jobs_before_fixpoint_n = gauges.mesh_jobs_before_fixpoint_n;
+            run.remesh_async_calls = gauges.remesh_async_calls;
+            run.drop_stale_uploads = gauges.drop_stale_uploads;
             let finished = match run.stopped {
                 None => {
                     run.flight_ms.push(ms);
+                    run.drop_stale_flight.push(gauges.drop_stale_this_frame);
                     // dt-based advance: constant speed at any frame rate. The
                     // clamp keeps one hitch from a teleport-sized jump (the
                     // streamer treats >0.5 s gaps as discontinuities).

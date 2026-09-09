@@ -706,6 +706,21 @@ fn light_arrival_schedules_async_rebuild_and_keeps_drawing() {
 
     world.pending_dirty.take();
     world.settle_light(coord, light::LightGrid::dark()); // a CHANGED grid
+    assert!(
+        world.light_gate.dirty.contains_key(&coord),
+        "changed settle marks light_dirty instead of remeshing immediately"
+    );
+    assert!(
+        matches!(world.chunks[&coord].state, MeshState::Ready(_)),
+        "no remesh until the neighbourhood is quiet"
+    );
+    // Neighbour seeds from the border move are pending light work; drop them
+    // so this test exercises the quiet-nhood promotion (the flood path is
+    // covered by `changed_settle_remeshes_once_at_nhood_fixpoint`).
+    world.light_worklist.clear();
+    world.light_inflight.clear();
+    world.light_apply_queue.clear();
+    world.tick_light_gate();
 
     let state = &world.chunks[&coord].state;
     assert!(

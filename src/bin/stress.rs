@@ -90,6 +90,23 @@ fn main() {
             "  settle light admit/s={:.0}",
             o.settle_light_admit_per_s
         );
+        println!(
+            "  remesh_async/coord between uploads: mean={:.2} p95={:.2} n={}",
+            o.remesh_between_upload_mean, o.remesh_between_upload_p95, o.remesh_between_upload_n
+        );
+        println!(
+            "  mesh jobs/chunk before light fixpoint: mean={:.2} p95={:.2} n={}",
+            o.mesh_jobs_before_fixpoint_mean,
+            o.mesh_jobs_before_fixpoint_p95,
+            o.mesh_jobs_before_fixpoint_n
+        );
+        println!(
+            "  drop_stale/frame (flight): mean={:.2} p95={:.2}  totals: remesh_async={} drop_stale={}",
+            o.drop_stale_per_frame_mean,
+            o.drop_stale_per_frame_p95,
+            o.remesh_async_calls,
+            o.drop_stale_uploads
+        );
         for s in &o.settle_samples {
             println!(
                 "  t={}s admit/s={:.0} workers={} effort={:.2} light_worklist={}",
