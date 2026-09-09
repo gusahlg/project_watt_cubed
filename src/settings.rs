@@ -179,8 +179,10 @@ settings_fields! {
 
     /// Device framebuffer MSAA ceiling from the startup probe; not persisted.
     device_max_msaa: u32 = 8,
-    /// 60% of device-local heap; `None` skips the session VRAM guard.
-    vram_budget_bytes: Option<u64> = None,
+    /// Device-local heap size from the startup probe; not persisted.
+    device_local_memory_bytes: Option<u64> = None,
+    /// Live free device-local bytes (`VK_EXT_memory_budget`); not persisted.
+    available_device_bytes: Option<u64> = None,
     /// Session-only VRAM-guard line for the console and settings menu.
     vram_notice: Option<String> = None,
     /// Largest connected display (fullscreen first allocation).
@@ -1082,7 +1084,8 @@ impl Settings {
     /// [`Self::render_scale`].
     pub fn set_device_caps(&mut self, caps: DeviceCaps, display: (u32, u32)) {
         self.device_max_msaa = caps.max_msaa.max(1);
-        self.vram_budget_bytes = caps.render_target_budget_bytes();
+        self.device_local_memory_bytes = caps.device_local_memory_bytes;
+        self.available_device_bytes = caps.available_device_bytes;
         self.startup_display_w = display.0.max(1);
         self.startup_display_h = display.1.max(1);
         self.clamp();
@@ -1093,22 +1096,18 @@ impl Settings {
         let scale = self.effective_render_scale(width, height);
         let mut lanes = self.render_config();
         lanes.taa = self.effective_taa(scale);
-        match self.vram_budget_bytes {
-            Some(budget) => fit_render_targets(
-                width,
-                height,
-                scale,
-                self.msaa,
-                lanes,
-                budget,
-                self.device_max_msaa,
-            ),
-            None => SessionGraphics {
-                msaa: self.msaa.min(self.device_max_msaa).max(1),
-                render_scale: scale,
-                notice: None,
+        fit_render_targets(
+            width,
+            height,
+            scale,
+            self.msaa,
+            lanes,
+            DeviceCaps {
+                device_local_memory_bytes: self.device_local_memory_bytes,
+                available_device_bytes: self.available_device_bytes,
+                max_msaa: self.device_max_msaa,
             },
-        }
+        )
     }
 
     /// Whether the Default Auto render-scale rule is live (not Custom/Minimum/Fast).
@@ -1981,5 +1980,39 @@ mod tests {
         min.apply_preset(Preset::Minimum);
         min.note_render_extent(1920, 1080, 0.25);
         assert_eq!(min.effective_render_scale(1920, 1080), 0.25);
+    }
+
+    #[test]
+    fn session_graphics_fits_live_available_budget() {
+        use crate::render_config::{VRAM_AVAILABLE_SAFETY_FRACTION, render_target_bytes};
+        let mut s = Settings::default();
+        s.mark_custom();
+        s.msaa = 8;
+        s.render_scale = 2.0;
+        s.taa = true;
+        s.bloom = true;
+        s.exposure = true;
+        s.set_device_caps(
+            DeviceCaps {
+                device_local_memory_bytes: Some(8_000_000_000),
+                available_device_bytes: Some(2_000_000_000),
+                max_msaa: 8,
+            },
+            (3440, 1440),
+        );
+        let g = s.session_graphics(3440, 1440);
+        let cost = render_target_bytes(3440, 1440, g.render_scale, g.msaa, s.render_config());
+        assert!(
+            cost <= 2_000_000_000 * VRAM_AVAILABLE_SAFETY_FRACTION / 100,
+            "session cost {cost} at {}x / {}",
+            g.msaa,
+            g.render_scale
+        );
+        let n = g.notice.expect("over-budget request prints a session notice");
+        assert!(
+            n.contains("2.0 GB of 8.0 GB is free (other processes hold 6.0 GB)"),
+            "{n}"
+        );
+        assert!(n.contains("running at"), "{n}");
     }
 }
