@@ -120,6 +120,7 @@ impl LightGrid {
             Repr::Cells(c) => c[idx],
         }
     }
+    #[cfg(test)]
     #[inline]
     fn set(&mut self, idx: usize, v: Lumel) {
         match &self.0 {
@@ -185,6 +186,7 @@ impl LightGrid {
     }
 
     /// Densify in place and return the cell slice. Uniform expands to a filled box.
+    #[cfg(test)]
     fn make_dense(&mut self) -> &mut [Lumel] {
         if let Repr::Uniform(v) = &self.0 {
             let v = *v;
