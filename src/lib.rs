@@ -1,30 +1,7 @@
-//! project_watt_cubed — a small voxel prototype.
+//! project_watt_cubed — a voxel game on `voxel-engine`.
 //!
-//! The crate is split into focused modules so each concern can evolve on its own:
-//!
-//! - [`app`] — owns the window and the menu/play/mods state machine.
-//! - [`game`] — the in-world state (world, player, physics, console) and its frame.
-//! - [`block`] — the element/block core: elements, compositions, property
-//!   derivation, reactions, and the block registry the world indexes into.
-//! - [`world`] — the infinite streamed chunk field, terrain generation, collision,
-//!   and rendering.
-//! - [`player`] — player state and the camera derived from it.
-//! - [`stash`] — the elements a player carries (core-owned; mods present it).
-//! - [`input`] — keyboard movement and mouse look.
-//! - [`interact`] — the aim raycast that turns looking into breaking blocks.
-//! - [`console`] — the in-game console / chat line and its text input.
-//! - [`command`] — parsing and dispatch for console commands.
-//! - [`menu`] — the start menu and mod menu screens.
-//! - [`mods`] — the runtime-toggleable mod system and the default inventory mod.
-//! - [`net`] — multiplayer: the authoritative server and the client connection.
-//! - [`paths`] — data/config roots (worlds, settings, session, mod choices).
-//! - [`save`] — saving and loading worlds.
-//! - [`settings`] — persistent graphics settings (settings menu + `/gfx`).
-//! - [`sim`] — the fixed-timestep seam for registered simulation systems.
-//! - [`math`] — geometry shared across systems (the [`Aabb`](math::Aabb) and
-//!   [`Bounded`](math::Bounded) trait).
-//! - [`render`] — the [`Render`](render::Render) trait for drawable things.
-//! - [`macros`] — declarative macros that generate repetitive code.
+//! One module per subsystem. Worldgen, save bytes, protocol bytes, and mesh
+//! vertices are bit-identical unless a change explicitly says otherwise.
 pub mod app;
 pub mod audio;
 pub mod avatar;

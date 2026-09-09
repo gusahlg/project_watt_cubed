@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use voxel_engine::Engine;
 
 use crate::render_config::{
-    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, VrsChoice,
+    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, VRS_AUTO_MIN_PIXELS,
+    VrsChoice, engine_applied_differs, engine_applied_notice, estimate_from_engine,
     fit_render_targets, max_lod_levels, vrs_effective,
 };
 use crate::ui::HudMode;
@@ -183,8 +184,17 @@ settings_fields! {
     device_local_memory_bytes: Option<u64> = None,
     /// Live free device-local bytes (`VK_EXT_memory_budget`); not persisted.
     available_device_bytes: Option<u64> = None,
-    /// Session-only VRAM-guard line for the console and settings menu.
+    /// Session-only VRAM-guard / engine-fallback line for the console and settings menu.
     vram_notice: Option<String> = None,
+    /// Engine-applied MSAA after render-target fallback; not persisted.
+    session_msaa: Option<u32> = None,
+    /// Engine-applied render scale after render-target fallback; not persisted.
+    session_render_scale: Option<f32> = None,
+    /// True when the engine allocated less MSAA/scale than the session request.
+    render_target_fallback: bool = false,
+    /// Fitted request the engine fallback was measured against.
+    fallback_request_msaa: Option<u32> = None,
+    fallback_request_scale: Option<f32> = None,
     /// Largest connected display (fullscreen first allocation).
     startup_display_w: u32 = 1280,
     startup_display_h: u32 = 720,
@@ -194,6 +204,8 @@ settings_fields! {
     /// Last render extent (window × session scale) used by Auto VRS.
     render_w: u32 = 1280,
     render_h: u32 = 720,
+    /// [`Engine::vrs_useful_above_pixels`] when the device reports one.
+    vrs_auto_min_pixels: Option<u64> = None,
 }
 
 // One `Setting` per field: behaviour folded over by every surface (persistence, menu, console).
@@ -1091,8 +1103,73 @@ impl Settings {
         self.clamp();
     }
 
+    /// Heap, max MSAA, and VRS Auto threshold from the live engine.
+    pub fn adopt_gpu_caps(&mut self, eng: &Engine) {
+        let caps = eng.gpu_caps();
+        self.device_max_msaa = caps.max_msaa.max(1);
+        self.device_local_memory_bytes = (caps.device_local_bytes > 0).then_some(caps.device_local_bytes);
+        self.available_device_bytes = None;
+        self.vrs_auto_min_pixels = eng.vrs_useful_above_pixels().map(|px| px as u64);
+        self.clamp();
+    }
+
+    /// Auto VRS pixel floor in effect (engine query, else [`VRS_AUTO_MIN_PIXELS`]).
+    pub fn vrs_auto_min_pixels(&self) -> u64 {
+        self.vrs_auto_min_pixels.unwrap_or(VRS_AUTO_MIN_PIXELS)
+    }
+
+    /// `/gfx` line for VRS, naming the Auto threshold source.
+    pub fn vrs_gfx_line(&self) -> String {
+        match self.vrs {
+            VrsChoice::Auto => {
+                if self.vrs_auto_min_pixels.is_some() {
+                    format!(
+                        "vrs auto (engine {} px)",
+                        self.vrs_auto_min_pixels()
+                    )
+                } else {
+                    format!("vrs auto (fallback {} px)", VRS_AUTO_MIN_PIXELS)
+                }
+            }
+            other => format!("vrs {}", other.label().to_ascii_lowercase()),
+        }
+    }
+
     /// Session MSAA/scale after the VRAM guard. Does not mutate persisted fields.
     pub fn session_graphics(&self, width: u32, height: u32) -> SessionGraphics {
+        self.session_graphics_with_estimate(width, height, |_, _, _, _, _| 0)
+    }
+
+    pub fn session_graphics_with_estimate(
+        &self,
+        width: u32,
+        height: u32,
+        estimate: impl Fn(u32, u32, f32, u32, RenderConfig) -> u64,
+    ) -> SessionGraphics {
+        let mut g = self.fitted_session_graphics(width, height, estimate);
+        if self.render_target_fallback
+            && self.fallback_request_msaa == Some(g.msaa)
+            && self
+                .fallback_request_scale
+                .is_some_and(|s| (s - g.render_scale).abs() <= 1e-3)
+            && let (Some(msaa), Some(scale)) = (self.session_msaa, self.session_render_scale)
+        {
+            g.msaa = msaa;
+            g.render_scale = scale;
+            if let Some(notice) = self.vram_notice.clone() {
+                g.notice = Some(notice);
+            }
+        }
+        g
+    }
+
+    /// VRAM-fitted request before any engine allocation fallback.
+    fn fitted_session_graphics(
+        &self,
+        width: u32,
+        height: u32,
+        estimate: impl Fn(u32, u32, f32, u32, RenderConfig) -> u64,
+    ) -> SessionGraphics {
         let scale = self.effective_render_scale(width, height);
         let mut lanes = self.render_config();
         lanes.taa = self.effective_taa(scale);
@@ -1107,7 +1184,58 @@ impl Settings {
                 available_device_bytes: self.available_device_bytes,
                 max_msaa: self.device_max_msaa,
             },
+            estimate,
         )
+    }
+
+    /// Adopt the MSAA / scale the engine actually allocated. Session-only:
+    /// persisted [`Self::msaa`] / [`Self::render_scale`] are left alone.
+    /// Equal values leave notice, JSON flag, and extent unchanged.
+    pub fn adopt_engine_applied(
+        &mut self,
+        requested: &SessionGraphics,
+        applied_msaa: u32,
+        applied_scale: f32,
+        width: u32,
+        height: u32,
+    ) {
+        if !engine_applied_differs(requested, applied_msaa, applied_scale) {
+            return;
+        }
+        let already = self.render_target_fallback
+            && self.session_msaa == Some(applied_msaa)
+            && self
+                .session_render_scale
+                .is_some_and(|s| (s - applied_scale).abs() <= 1e-3);
+        if already {
+            return;
+        }
+        self.session_msaa = Some(applied_msaa);
+        self.session_render_scale = Some(applied_scale);
+        self.render_target_fallback = true;
+        self.fallback_request_msaa = Some(requested.msaa);
+        self.fallback_request_scale = Some(requested.render_scale);
+        let notice = engine_applied_notice(applied_msaa, applied_scale);
+        eprintln!("graphics: {notice}");
+        self.vram_notice = Some(notice);
+        self.note_render_extent(width, height, applied_scale);
+    }
+
+    /// Read [`Engine::msaa`] / [`Engine::render_scale`] after create or recreate.
+    pub fn sync_engine_applied(&mut self, eng: &Engine) {
+        let w = eng.screen_width().max(1) as u32;
+        let h = eng.screen_height().max(1) as u32;
+        self.adopt_gpu_caps(eng);
+        let requested = self.fitted_session_graphics(w, h, |width, height, scale, msaa, lanes| {
+            estimate_from_engine(eng, width, height, scale, msaa, lanes)
+        });
+        self.adopt_engine_applied(
+            &requested,
+            eng.msaa(),
+            eng.render_scale(),
+            w,
+            h,
+        );
     }
 
     /// Whether the Default Auto render-scale rule is live (not Custom/Minimum/Fast).
@@ -1115,9 +1243,10 @@ impl Settings {
         self.preset == Preset::Default
     }
 
-    /// Scale pushed to the engine for this window. Default picks
+    /// Scale requested for this window. Default picks
     /// [`DEFAULT_AUTO_RENDER_SCALE`] above the pixel threshold and 1.0
-    /// otherwise; other profiles keep their stored value.
+    /// otherwise; other profiles keep their stored value. Engine allocation
+    /// fallbacks live on [`Self::session_graphics`], not here.
     pub fn effective_render_scale(&self, window_w: u32, window_h: u32) -> f32 {
         if self.render_scale_auto() {
             auto_render_scale(window_w, window_h)
@@ -1139,10 +1268,31 @@ impl Settings {
         // Vsync and the fps cap are not pushed here: `App::frame` is the
         // single writer, because the effective values also depend on the
         // screen (menus cap the frame rate, vsync off) and the benchmark.
+        self.adopt_gpu_caps(eng);
         let w = eng.screen_width().max(1) as u32;
         let h = eng.screen_height().max(1) as u32;
-        let session = self.session_graphics(w, h);
-        self.adopt_vram_notice(session.notice.clone());
+        let session = {
+            let estimate = |width, height, scale, msaa, lanes| {
+                estimate_from_engine(eng, width, height, scale, msaa, lanes)
+            };
+            let fitted = self.fitted_session_graphics(w, h, &estimate);
+            if self.render_target_fallback
+                && (self.fallback_request_msaa != Some(fitted.msaa)
+                    || !self
+                        .fallback_request_scale
+                        .is_some_and(|s| (s - fitted.render_scale).abs() <= 1e-3))
+            {
+                self.session_msaa = None;
+                self.session_render_scale = None;
+                self.render_target_fallback = false;
+                self.fallback_request_msaa = None;
+                self.fallback_request_scale = None;
+            }
+            self.session_graphics_with_estimate(w, h, &estimate)
+        };
+        if !self.render_target_fallback {
+            self.adopt_vram_notice(session.notice.clone());
+        }
         let _ = eng.set_msaa(session.msaa);
         let _ = eng.set_render_scale(session.render_scale);
         self.note_render_extent(w, h, session.render_scale);
@@ -1177,7 +1327,10 @@ impl Settings {
     /// golden harness keeps its own pinned
     /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
     pub fn render_config(&self) -> RenderConfig {
-        let scale = self.effective_render_scale(self.window_w, self.window_h);
+        let scale = self
+            .session_render_scale
+            .filter(|_| self.render_target_fallback)
+            .unwrap_or_else(|| self.effective_render_scale(self.window_w, self.window_h));
         RenderConfig {
             occlusion: self.occlusion,
             lod2: self.lod2,
@@ -1197,7 +1350,12 @@ impl Settings {
             sunlight: self.sunlight,
             shadows: self.shadows,
             sky: self.sky,
-            vrs: vrs_effective(self.vrs, self.render_w, self.render_h),
+            vrs: vrs_effective(
+                self.vrs,
+                self.render_w,
+                self.render_h,
+                self.vrs_auto_min_pixels(),
+            ),
             water_anim: self.water_anim,
             vignette: self.vignette,
         }
@@ -1984,7 +2142,20 @@ mod tests {
 
     #[test]
     fn session_graphics_fits_live_available_budget() {
-        use crate::render_config::{VRAM_AVAILABLE_SAFETY_FRACTION, render_target_bytes};
+        use crate::render_config::VRAM_AVAILABLE_SAFETY_FRACTION;
+        fn fake(
+            width: u32,
+            height: u32,
+            render_scale: f32,
+            msaa: u32,
+            _lanes: RenderConfig,
+        ) -> u64 {
+            let w = ((width as f32 * render_scale.max(0.0)) as u64).max(1);
+            let h = ((height as f32 * render_scale.max(0.0)) as u64).max(1);
+            w.saturating_mul(h)
+                .saturating_mul(msaa.max(1) as u64)
+                .saturating_mul(32)
+        }
         let mut s = Settings::default();
         s.mark_custom();
         s.msaa = 8;
@@ -2000,8 +2171,8 @@ mod tests {
             },
             (3440, 1440),
         );
-        let g = s.session_graphics(3440, 1440);
-        let cost = render_target_bytes(3440, 1440, g.render_scale, g.msaa, s.render_config());
+        let g = s.session_graphics_with_estimate(3440, 1440, fake);
+        let cost = fake(3440, 1440, g.render_scale, g.msaa, s.render_config());
         assert!(
             cost <= 2_000_000_000 * VRAM_AVAILABLE_SAFETY_FRACTION / 100,
             "session cost {cost} at {}x / {}",
@@ -2014,5 +2185,46 @@ mod tests {
             "{n}"
         );
         assert!(n.contains("running at"), "{n}");
+    }
+
+    #[test]
+    fn engine_applied_lower_updates_notice_json_flag_and_extent() {
+        let mut s = Settings::default();
+        s.mark_custom();
+        s.msaa = 8;
+        s.render_scale = 1.5;
+        s.note_render_extent(1920, 1080, 1.5);
+        let requested = s.session_graphics(1920, 1080);
+        assert_eq!(requested.msaa, 8);
+        assert!((requested.render_scale - 1.5).abs() < 1e-4);
+        s.adopt_engine_applied(&requested, 2, 1.5, 1920, 1080);
+        assert_eq!(
+            s.vram_notice.as_deref(),
+            Some("the renderer could only allocate 2x MSAA at 150% scale this session")
+        );
+        assert!(s.render_target_fallback);
+        assert_eq!(s.session_graphics(1920, 1080).msaa, 2);
+        assert_eq!(s.render_w, ((1920.0 * 1.5) as u32).max(1));
+        assert_eq!(s.render_h, ((1080.0 * 1.5) as u32).max(1));
+        assert_eq!(s.msaa, 8, "persisted MSAA is unchanged");
+        assert!((s.render_scale - 1.5).abs() < 1e-4, "persisted scale is unchanged");
+        let g = s.session_graphics(1920, 1080);
+        assert_eq!(g.msaa, 2);
+        assert!((g.render_scale - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn engine_applied_equal_leaves_session_untouched() {
+        let mut s = Settings::default();
+        s.mark_custom();
+        s.msaa = 4;
+        s.render_scale = 1.0;
+        s.note_render_extent(1280, 720, 1.0);
+        let before = s.clone();
+        let requested = s.session_graphics(1280, 720);
+        s.adopt_engine_applied(&requested, requested.msaa, requested.render_scale, 1280, 720);
+        assert_eq!(s, before);
+        assert!(!s.render_target_fallback);
+        assert!(s.vram_notice.is_none());
     }
 }

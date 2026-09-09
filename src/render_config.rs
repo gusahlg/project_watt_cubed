@@ -5,7 +5,7 @@
 
 use std::ops::RangeInclusive;
 
-use voxel_engine::RenderFlags;
+use voxel_engine::{Engine, RenderFlags, RenderTargetConfig};
 
 /// Number of active far-field LOD rings. Eight rings with the coarsest-detail
 /// guard below is the largest hierarchy the current section key can use.
@@ -63,12 +63,15 @@ impl VrsChoice {
 }
 
 /// Engine VRS flag for a user choice at a render extent.
-pub fn vrs_effective(choice: VrsChoice, render_w: u32, render_h: u32) -> bool {
+///
+/// `min_pixels` is [`Engine::vrs_useful_above_pixels`] when the device reports
+/// one; otherwise [`VRS_AUTO_MIN_PIXELS`].
+pub fn vrs_effective(choice: VrsChoice, render_w: u32, render_h: u32, min_pixels: u64) -> bool {
     match choice {
         VrsChoice::On => true,
         VrsChoice::Off => false,
         VrsChoice::Auto => {
-            (render_w as u64).saturating_mul(render_h as u64) >= VRS_AUTO_MIN_PIXELS
+            (render_w as u64).saturating_mul(render_h as u64) >= min_pixels
         }
     }
 }
@@ -285,24 +288,9 @@ const VRAM_SCALE_STEP: f32 = 0.25;
 /// Sample counts the engine will actually create, descending.
 const MSAA_STEPS: &[u32] = &[8, 4, 2, 1];
 
-/// Conservative colour bytes/pixel. Engine colour targets are
-/// `R16G16B16A16_SFLOAT` (8 B/px in `voxel-engine/src/vk/targets.rs`); the
-/// budget uses 16 B/px so image-memory rounding, padding, and uncounted
-/// attachments stay inside ±20%.
-const HDR_COLOR_BYTES: u64 = 16;
-/// Engine depth is `D32_SFLOAT` (or a 4-byte packed fallback).
-const DEPTH_BYTES: u64 = 4;
-/// `FRAMES_IN_FLIGHT` in `voxel-engine/src/vk/buffers.rs`.
-const FRAMES_IN_FLIGHT: u64 = 2;
-/// `SHADOW_RESOLUTION` / `SHADOW_CASCADES` / `D32_SFLOAT` in targets.rs.
-const SHADOW_RESOLUTION: u64 = 2048;
-const SHADOW_CASCADES: u64 = 2;
-/// `SKY_CLOUD_LUT_SIZE` (RGBA16F, budgeted at [`HDR_COLOR_BYTES`]).
-const SKY_CLOUD_LUT: u64 = 256;
-/// `BLOOM_MAX_MIPS` in targets.rs (half-res base + two more lods).
-const BLOOM_MIPS: u32 = 3;
-
-/// GPU facts probed once at startup (Vulkan heaps + framebuffer samples).
+/// GPU facts for the session VRAM guard (heap + MSAA from [`Engine::gpu_caps`]
+/// once the window exists; the startup probe fills the same fields so the
+/// first `Config` can snap MSAA).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceCaps {
     pub device_local_memory_bytes: Option<u64>,
@@ -335,85 +323,42 @@ impl DeviceCaps {
     }
 }
 
-/// Bytes the engine is expected to spend on swapchain-sized render targets
-/// (plus the fixed shadow map and sky LUT when those lanes are on).
-///
-/// Internal extent `W×H = (width·scale)×(height·scale)`:
-/// - 1× MSAA colour image at `msaa` samples (`HDR_COLOR_BYTES` each) when `msaa>1`
-/// - `FRAMES_IN_FLIGHT` depth images at `msaa` samples (`DEPTH_BYTES`)
-/// - `FRAMES_IN_FLIGHT` single-sample depth resolves when `msaa>1`
-/// - `FRAMES_IN_FLIGHT` single-sample HDR offscreen/history colour images
-/// - two extra HDR history images when `lanes.taa`
-/// - per-slot bloom pyramid (`BLOOM_MIPS` of a half-res RGBA16F image) when `lanes.bloom`
-/// - 2048² × 2 cascade D32 shadow map when `lanes.shadows`
-/// - 256² HDR cloud LUT × slots when `lanes.clouds` or `lanes.sky`
-pub fn render_target_bytes(
+/// Inputs for [`Engine::estimate_render_targets`].
+pub fn render_target_config(
+    width: u32,
+    height: u32,
+    render_scale: f32,
+    msaa: u32,
+    lanes: RenderConfig,
+) -> RenderTargetConfig {
+    RenderTargetConfig {
+        width,
+        height,
+        render_scale,
+        msaa,
+        taa: lanes.taa,
+        bloom: lanes.bloom,
+        vrs: lanes.vrs,
+        frames_in_flight: voxel_engine::rev::FRAMES_IN_FLIGHT as u32,
+    }
+}
+
+/// Device-local bytes the live engine would allocate for this combo.
+pub fn estimate_from_engine(
+    eng: &Engine,
     width: u32,
     height: u32,
     render_scale: f32,
     msaa: u32,
     lanes: RenderConfig,
 ) -> u64 {
-    let scale = render_scale.max(0.0);
-    let w = ((width as f32 * scale) as u64).max(1);
-    let h = ((height as f32 * scale) as u64).max(1);
-    let pixels = w.saturating_mul(h);
-    let samples = msaa.max(1) as u64;
-
-    let mut bytes = 0u64;
-    if samples > 1 {
-        bytes = bytes.saturating_add(pixels.saturating_mul(HDR_COLOR_BYTES).saturating_mul(samples));
-        bytes = bytes.saturating_add(
-            pixels.saturating_mul(DEPTH_BYTES).saturating_mul(FRAMES_IN_FLIGHT),
-        );
-    }
-    bytes = bytes.saturating_add(
-        pixels
-            .saturating_mul(DEPTH_BYTES)
-            .saturating_mul(samples)
-            .saturating_mul(FRAMES_IN_FLIGHT),
-    );
-    bytes = bytes.saturating_add(
-        pixels
-            .saturating_mul(HDR_COLOR_BYTES)
-            .saturating_mul(FRAMES_IN_FLIGHT),
-    );
-    if lanes.taa {
-        bytes = bytes.saturating_add(pixels.saturating_mul(HDR_COLOR_BYTES).saturating_mul(2));
-    }
-    if lanes.bloom {
-        let mut mw = w.div_ceil(2).max(1);
-        let mut mh = h.div_ceil(2).max(1);
-        for _ in 0..BLOOM_MIPS {
-            bytes = bytes.saturating_add(
-                mw.saturating_mul(mh)
-                    .saturating_mul(HDR_COLOR_BYTES)
-                    .saturating_mul(FRAMES_IN_FLIGHT),
-            );
-            if mw == 1 && mh == 1 {
-                break;
-            }
-            mw = mw.div_ceil(2).max(1);
-            mh = mh.div_ceil(2).max(1);
-        }
-    }
-    if lanes.shadows {
-        bytes = bytes.saturating_add(
-            SHADOW_RESOLUTION
-                .saturating_mul(SHADOW_RESOLUTION)
-                .saturating_mul(SHADOW_CASCADES)
-                .saturating_mul(DEPTH_BYTES),
-        );
-    }
-    if lanes.clouds || lanes.sky {
-        bytes = bytes.saturating_add(
-            SKY_CLOUD_LUT
-                .saturating_mul(SKY_CLOUD_LUT)
-                .saturating_mul(HDR_COLOR_BYTES)
-                .saturating_mul(FRAMES_IN_FLIGHT),
-        );
-    }
-    bytes
+    eng.estimate_render_targets(&render_target_config(
+        width,
+        height,
+        render_scale,
+        msaa,
+        lanes,
+    ))
 }
 
 /// Session-only graphics after the VRAM guard (never written to disk).
@@ -424,10 +369,21 @@ pub struct SessionGraphics {
     pub notice: Option<String>,
 }
 
+/// Settings-screen line when the engine allocated less than the session request.
+pub fn engine_applied_notice(msaa: u32, render_scale: f32) -> String {
+    let pct = (render_scale * 100.0).round() as i32;
+    format!("the renderer could only allocate {msaa}x MSAA at {pct}% scale this session")
+}
+
+/// True when the engine's applied MSAA / scale differ from the session request.
+pub fn engine_applied_differs(requested: &SessionGraphics, msaa: u32, render_scale: f32) -> bool {
+    msaa != requested.msaa || (render_scale - requested.render_scale).abs() > 1e-3
+}
+
 /// Drop MSAA to the next supported count, then `render_scale` in 0.25 steps
-/// (not below [`VRAM_SCALE_FLOOR`]), until [`render_target_bytes`] fits the
-/// budget from [`DeviceCaps::render_target_budget_bytes`]. If even the floor
-/// does not fit, start at 1× MSAA and [`VRAM_SCALE_FLOOR`] and say so.
+/// (not below [`VRAM_SCALE_FLOOR`]), until `estimate` fits the budget from
+/// [`DeviceCaps::render_target_budget_bytes`]. If even the floor does not
+/// fit, start at 1× MSAA and [`VRAM_SCALE_FLOOR`] and say so.
 pub fn fit_render_targets(
     width: u32,
     height: u32,
@@ -435,6 +391,7 @@ pub fn fit_render_targets(
     msaa: u32,
     lanes: RenderConfig,
     caps: DeviceCaps,
+    estimate: impl Fn(u32, u32, f32, u32, RenderConfig) -> u64,
 ) -> SessionGraphics {
     let requested_scale = render_scale;
     let Some(budget) = caps.render_target_budget_bytes() else {
@@ -445,7 +402,7 @@ pub fn fit_render_targets(
         };
     };
     let requested_msaa = snap_msaa(msaa, caps.max_msaa);
-    let needed = render_target_bytes(width, height, requested_scale, requested_msaa, lanes);
+    let needed = estimate(width, height, requested_scale, requested_msaa, lanes);
     if needed <= budget {
         return SessionGraphics {
             msaa: requested_msaa,
@@ -457,7 +414,7 @@ pub fn fit_render_targets(
     let mut chosen_msaa = requested_msaa;
     let mut chosen_scale = requested_scale;
     loop {
-        let cost = render_target_bytes(width, height, chosen_scale, chosen_msaa, lanes);
+        let cost = estimate(width, height, chosen_scale, chosen_msaa, lanes);
         if cost <= budget {
             break;
         }
@@ -475,7 +432,7 @@ pub fn fit_render_targets(
         chosen_scale = next_scale.max(VRAM_SCALE_FLOOR);
     }
 
-    let chosen_cost = render_target_bytes(width, height, chosen_scale, chosen_msaa, lanes);
+    let chosen_cost = estimate(width, height, chosen_scale, chosen_msaa, lanes);
     SessionGraphics {
         msaa: chosen_msaa,
         render_scale: chosen_scale,
@@ -558,24 +515,45 @@ mod tests {
 
     #[test]
     fn vrs_effective_auto_turns_on_at_eight_million_pixels() {
-        assert!(!vrs_effective(VrsChoice::Auto, 0, 0));
-        assert!(!vrs_effective(VrsChoice::Auto, 1, 1));
-        assert!(!vrs_effective(VrsChoice::Auto, 1920, 1080));
-        assert!(!vrs_effective(VrsChoice::Auto, 3440, 1440));
+        let min = VRS_AUTO_MIN_PIXELS;
+        assert!(!vrs_effective(VrsChoice::Auto, 0, 0, min));
+        assert!(!vrs_effective(VrsChoice::Auto, 1, 1, min));
+        assert!(!vrs_effective(VrsChoice::Auto, 1920, 1080, min));
+        assert!(!vrs_effective(VrsChoice::Auto, 3440, 1440, min));
         assert!(!vrs_effective(
             VrsChoice::Auto,
             (VRS_AUTO_MIN_PIXELS - 1) as u32,
-            1
+            1,
+            min
         ));
         assert!(vrs_effective(
             VrsChoice::Auto,
             VRS_AUTO_MIN_PIXELS as u32,
-            1
+            1,
+            min
         ));
-        assert!(vrs_effective(VrsChoice::Auto, 3840, 2160));
-        assert!(vrs_effective(VrsChoice::Auto, 6880, 2880));
-        assert!(vrs_effective(VrsChoice::On, 1, 1));
-        assert!(!vrs_effective(VrsChoice::Off, 6880, 2880));
+        assert!(vrs_effective(VrsChoice::Auto, 3840, 2160, min));
+        assert!(vrs_effective(VrsChoice::Auto, 6880, 2880, min));
+        assert!(vrs_effective(VrsChoice::On, 1, 1, min));
+        assert!(!vrs_effective(VrsChoice::Off, 6880, 2880, min));
+        let engine_min = 16u64 * 16 * 32768;
+        assert!(!vrs_effective(VrsChoice::Auto, 8_000_000, 1, engine_min));
+        assert!(vrs_effective(VrsChoice::Auto, 8_388_608, 1, engine_min));
+    }
+
+    #[test]
+    fn engine_applied_notice_names_allocated_msaa_and_scale() {
+        assert_eq!(
+            engine_applied_notice(2, 1.5),
+            "the renderer could only allocate 2x MSAA at 150% scale this session"
+        );
+        let requested = SessionGraphics {
+            msaa: 8,
+            render_scale: 1.5,
+            notice: None,
+        };
+        assert!(engine_applied_differs(&requested, 2, 1.5));
+        assert!(!engine_applied_differs(&requested, 8, 1.5));
     }
 
     #[test]
@@ -623,19 +601,20 @@ mod tests {
         RenderConfig { taa: true, bloom: true, exposure: true, ..RenderConfig::default() }
     }
 
-    #[test]
-    fn user_ultrawide_exceeds_48_gb_budget() {
-        let bytes = render_target_bytes(3440, 1440, 2.0, 8, user_ultrawide_lanes());
-        assert!(
-            bytes > 4_800_000_000,
-            "3440×1440 scale 2 8×MSAA TAA+bloom must exceed 4.8 GB, got {bytes}"
-        );
-    }
-
-    #[test]
-    fn full_hd_fits_48_gb_budget() {
-        let bytes = render_target_bytes(1920, 1080, 1.0, 4, RenderConfig::default());
-        assert!(bytes < 4_800_000_000, "1080p must fit 4.8 GB, got {bytes}");
+    /// Test-only cost that grows with MSAA then scale so policy tests do not
+    /// mirror engine formats.
+    fn fake_estimate(
+        width: u32,
+        height: u32,
+        render_scale: f32,
+        msaa: u32,
+        _lanes: RenderConfig,
+    ) -> u64 {
+        let w = ((width as f32 * render_scale.max(0.0)) as u64).max(1);
+        let h = ((height as f32 * render_scale.max(0.0)) as u64).max(1);
+        w.saturating_mul(h)
+            .saturating_mul(msaa.max(1) as u64)
+            .saturating_mul(32)
     }
 
     fn heap_caps(heap: u64, max_msaa: u32) -> DeviceCaps {
@@ -657,8 +636,8 @@ mod tests {
     #[test]
     fn degrade_drops_msaa_before_scale_and_respects_floor() {
         let lanes = user_ultrawide_lanes();
-        let needed_8 = render_target_bytes(3440, 1440, 2.0, 8, lanes);
-        let needed_4 = render_target_bytes(3440, 1440, 2.0, 4, lanes);
+        let needed_8 = fake_estimate(3440, 1440, 2.0, 8, lanes);
+        let needed_4 = fake_estimate(3440, 1440, 2.0, 4, lanes);
         assert!(needed_8 > needed_4);
 
         // Heap-only: 60% of heap sits in [needed_4, needed_8), so 4× fits and 8× does not.
@@ -667,7 +646,15 @@ mod tests {
             heap_caps(heap_for_4, 8).render_target_budget_bytes().unwrap() >= needed_4
                 && heap_caps(heap_for_4, 8).render_target_budget_bytes().unwrap() < needed_8
         );
-        let msaa_only = fit_render_targets(3440, 1440, 2.0, 8, lanes, heap_caps(heap_for_4, 8));
+        let msaa_only = fit_render_targets(
+            3440,
+            1440,
+            2.0,
+            8,
+            lanes,
+            heap_caps(heap_for_4, 8),
+            fake_estimate,
+        );
         assert_eq!(msaa_only.msaa, 4);
         assert!((msaa_only.render_scale - 2.0).abs() < 1e-4, "scale stays until MSAA is 1");
         let n = msaa_only.notice.as_ref().unwrap();
@@ -675,7 +662,7 @@ mod tests {
         assert!(!n.contains("% scale this session"));
         assert!(n.contains("budget"));
 
-        let tiny = fit_render_targets(3440, 1440, 2.0, 8, lanes, heap_caps(1, 8));
+        let tiny = fit_render_targets(3440, 1440, 2.0, 8, lanes, heap_caps(1, 8), fake_estimate);
         assert_eq!(tiny.msaa, 1);
         assert!((tiny.render_scale - VRAM_SCALE_FLOOR).abs() < 1e-4);
         let n = tiny.notice.unwrap();
@@ -692,11 +679,11 @@ mod tests {
         assert_eq!(budget, 2_000_000_000 * VRAM_AVAILABLE_SAFETY_FRACTION / 100);
         assert_eq!(budget, 1_700_000_000);
 
-        let needed_8 = render_target_bytes(3440, 1440, 2.0, 8, lanes);
+        let needed_8 = fake_estimate(3440, 1440, 2.0, 8, lanes);
         assert!(needed_8 > budget, "8× 200% must miss a 1.7 GB live budget, got {needed_8}");
 
-        let fitted = fit_render_targets(3440, 1440, 2.0, 8, lanes, caps);
-        let cost = render_target_bytes(3440, 1440, fitted.render_scale, fitted.msaa, lanes);
+        let fitted = fit_render_targets(3440, 1440, 2.0, 8, lanes, caps, fake_estimate);
+        let cost = fake_estimate(3440, 1440, fitted.render_scale, fitted.msaa, lanes);
         assert!(
             cost <= budget,
             "fitted {fitted:?} costs {cost}, budget {budget}"
@@ -716,8 +703,8 @@ mod tests {
         let lanes = user_ultrawide_lanes();
         let caps = heap_caps(8_000_000_000, 8);
         assert_eq!(caps.render_target_budget_bytes(), Some(4_800_000_000));
-        let fitted = fit_render_targets(3440, 1440, 2.0, 8, lanes, caps);
-        let cost = render_target_bytes(3440, 1440, fitted.render_scale, fitted.msaa, lanes);
+        let fitted = fit_render_targets(3440, 1440, 2.0, 8, lanes, caps, fake_estimate);
+        let cost = fake_estimate(3440, 1440, fitted.render_scale, fitted.msaa, lanes);
         assert!(cost <= 4_800_000_000, "heap fallback fitted cost {cost}");
         let n = fitted.notice.as_ref().expect("8× 200% exceeds 4.8 GB");
         assert!(n.contains("budget 4.8 GB"), "{n}");
