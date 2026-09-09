@@ -128,6 +128,15 @@ impl HeightMip {
         }
     }
 
+    pub(in crate::world) fn allocated_bytes(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|lvl| {
+                std::mem::size_of::<MipLevel>() + std::mem::size_of_val(lvl.cells.as_slice())
+            })
+            .sum()
+    }
+
     /// The palette-average colour of a baked cell, if inside the extent; `None` beyond the bake.
     pub fn color(&self, cell: SectionPos) -> Option<Color> {
         self.cell(cell).map(|c| c.color)

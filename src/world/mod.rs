@@ -42,6 +42,7 @@ pub mod placement;
 pub mod pyramid;
 pub mod section;
 
+mod census;
 mod coverage;
 mod edits;
 mod heightmip;
@@ -166,6 +167,7 @@ pub struct StreamGauges {
     /// Cumulative `light_worklist` insert attempts (including already-queued).
     pub light_seed_inserts: u64,
 }
+pub use census::MemoryCensus;
 use connectivity::{Connectivity, Occlusion};
 
 /// The streamed chunk volume around the player: a horizontal ring radius and a

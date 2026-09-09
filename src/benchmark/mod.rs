@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voxel_engine::{DVec3, Engine};
 
 use crate::settings::Settings;
-use crate::world::{StreamGauges, World};
+use crate::world::{MemoryCensus, StreamGauges, World};
 
 use json::Json;
 use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
@@ -27,7 +27,7 @@ const DEFAULT_WARMUP_SECS: f64 = 3.0;
 const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;
 const MAX_DURATION_SECS: f64 = 600.0;
 const MAX_SAMPLE_RESERVE: usize = 2_000_000;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 /// Readiness, stream gauges, and RSS are sampled at this rate on the bench
 /// wall clock. Peak gauges are therefore 4 Hz samples, not per-frame maxima.
 const WORLD_SAMPLE_HZ: u32 = 4;
@@ -77,6 +77,7 @@ pub struct Benchmark {
     ready_wait_logs: u32,
     world_sampled_at: Option<Instant>,
     cached_ready: bool,
+    census_ready: Option<MemoryCensus>,
 }
 
 impl Benchmark {
@@ -139,6 +140,7 @@ impl Benchmark {
             ready_wait_logs: 0,
             world_sampled_at: None,
             cached_ready: false,
+            census_ready: None,
         })
     }
 
@@ -201,6 +203,9 @@ impl Benchmark {
             self.world_sampled_at = Some(Instant::now());
             self.cached_ready = world.entry_complete();
             self.last_gauges = world.stream_gauges();
+            if self.cached_ready && self.census_ready.is_none() {
+                self.census_ready = Some(world.memory_census());
+            }
             self.poll_rss();
         }
         (self.cached_ready, self.last_gauges)
@@ -271,6 +276,7 @@ impl Benchmark {
         }
         let wall = self.measure_started.map_or(Duration::ZERO, |t| t.elapsed());
         let stats = FrameStats::from_samples(&self.samples, wall);
+        let census_end = world.memory_census();
         let visuals = std::env::var("WATT_BENCH_VISUALS").ok();
         let report = Json::object(vec![
             ("schema_version", Json::from(SCHEMA_VERSION)),
@@ -339,6 +345,11 @@ impl Benchmark {
                     ("rss_start_bytes", Json::optional_u64(self.rss_start_bytes)),
                     ("rss_peak_bytes", Json::optional_u64(self.rss_peak_bytes)),
                     ("rss_end_bytes", Json::optional_u64(rss_end_bytes)),
+                    (
+                        "census_ready",
+                        self.census_ready.map_or(Json::Null, census_json),
+                    ),
+                    ("census_end", census_json(census_end)),
                 ]),
             ),
             (
@@ -371,8 +382,25 @@ impl Benchmark {
             eng.screen_height(),
             self.system.as_ref().map_or("unknown", SystemInfo::gpu_name),
         );
+        let mem_line = format!(
+            "BENCH_MEM ready_total={} end_total={} chunks=u{}/p{}/d{} light=u{}/c{} light_bytes=u{}/c{} mesh={} edits={} lod={} queues={}",
+            self.census_ready.map_or_else(|| "n/a".into(), |c| c.total.to_string()),
+            census_end.total,
+            census_end.chunk_uniform_count,
+            census_end.chunk_paletted_count,
+            census_end.chunk_dense_count,
+            census_end.light_uniform_count,
+            census_end.light_cells_count,
+            census_end.light_uniform_bytes,
+            census_end.light_cells_bytes,
+            census_end.mesh_cpu_bytes,
+            census_end.edit_overlay_bytes,
+            census_end.section_lod_bytes,
+            census_end.worklist_bytes,
+        );
         Report {
             summary,
+            mem_line,
             json,
             output: self.output.clone(),
         }
@@ -391,6 +419,7 @@ impl Benchmark {
 
 pub struct Report {
     summary: String,
+    mem_line: String,
     json: String,
     output: Option<PathBuf>,
 }
@@ -398,6 +427,7 @@ pub struct Report {
 impl Report {
     pub fn emit(self) {
         println!("{}", self.summary);
+        println!("{}", self.mem_line);
         println!("BENCH_JSON {}", self.json);
         let Some(path) = self.output else { return };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
@@ -609,6 +639,26 @@ impl StreamPeaks {
     }
 }
 
+fn census_json(c: MemoryCensus) -> Json {
+    Json::object(vec![
+        ("chunk_uniform_bytes", Json::from(c.chunk_uniform_bytes)),
+        ("chunk_uniform_count", Json::from(c.chunk_uniform_count)),
+        ("chunk_paletted_bytes", Json::from(c.chunk_paletted_bytes)),
+        ("chunk_paletted_count", Json::from(c.chunk_paletted_count)),
+        ("chunk_dense_bytes", Json::from(c.chunk_dense_bytes)),
+        ("chunk_dense_count", Json::from(c.chunk_dense_count)),
+        ("light_uniform_bytes", Json::from(c.light_uniform_bytes)),
+        ("light_uniform_count", Json::from(c.light_uniform_count)),
+        ("light_cells_bytes", Json::from(c.light_cells_bytes)),
+        ("light_cells_count", Json::from(c.light_cells_count)),
+        ("mesh_cpu_bytes", Json::from(c.mesh_cpu_bytes)),
+        ("edit_overlay_bytes", Json::from(c.edit_overlay_bytes)),
+        ("section_lod_bytes", Json::from(c.section_lod_bytes)),
+        ("worklist_bytes", Json::from(c.worklist_bytes)),
+        ("total", Json::from(c.total)),
+    ])
+}
+
 fn stream_gauges_json(g: StreamGauges) -> Json {
     Json::object(vec![
         ("chunks", Json::from(g.chunks)),
@@ -741,7 +791,25 @@ mod tests {
             ready_wait_logs: 0,
             world_sampled_at: None,
             cached_ready: false,
+            census_ready: None,
         }
+    }
+
+    #[test]
+    fn census_json_contains_the_new_fields() {
+        let json = census_json(MemoryCensus {
+            chunk_uniform_bytes: 4,
+            chunk_uniform_count: 1,
+            total: 4,
+            ..MemoryCensus::default()
+        })
+        .render();
+        assert!(json.contains("\"chunk_uniform_bytes\":4"));
+        assert!(json.contains("\"chunk_uniform_count\":1"));
+        assert!(json.contains("\"light_uniform_count\":0"));
+        assert!(json.contains("\"light_cells_bytes\":0"));
+        assert!(json.contains("\"mesh_cpu_bytes\":0"));
+        assert!(json.contains("\"total\":4"));
     }
 
     #[test]

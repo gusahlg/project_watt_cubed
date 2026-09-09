@@ -223,6 +223,19 @@ impl LightGrid {
             Repr::Uniform(v) => Self(Repr::Cells(alloc_cells(*v))),
         }
     }
+
+    /// Heap bytes of the dense cell box; a Uniform grid holds no heap array.
+    pub fn allocated_bytes(&self) -> usize {
+        match &self.0 {
+            Repr::Uniform(_) => 0,
+            Repr::Cells(c) => std::mem::size_of_val(c.as_ref()),
+        }
+    }
+
+    /// `true` when every lumel is stored as one value (no 16³ box).
+    pub(in crate::world) fn is_uniform(&self) -> bool {
+        matches!(self.0, Repr::Uniform(_))
+    }
 }
 
 /// Value equality: Uniform and dense-all-equal grids holding the same lumel compare equal.
@@ -580,12 +593,13 @@ pub fn propagate(
         cells[i] = Lumel { sky: sky[i], block: block[i] };
     }
 
-    // Collapse only when voxels are uniform: a mixed chunk essentially never
-    // settles uniform, so the cell scan is skipped on the common dense path.
+    // One linear compare after the flood — not per frame. Deep rock and open
+    // sky both land here even when the voxel payload is paletted (a cave of
+    // air under a closed ceiling is uniformly dark).
     let first = cells[0];
-    let recycle = if chunk.uniform().is_some() && cells.iter().all(|&c| c == first) {
-        *out = LightGrid(Repr::Uniform(cells[0]));
-        Some(cells)
+    let recycle = if cells.chunks_exact(64).all(|row| row.iter().all(|&c| c == first)) {
+        *out = LightGrid(Repr::Uniform(first));
+        leftover.or(Some(cells))
     } else {
         *out = LightGrid(Repr::Cells(cells));
         leftover
@@ -1087,6 +1101,11 @@ mod tests {
 
         assert_eq!(grid.at(Chunk::index(4, 8, 4)).sky, LightLevel::DARK, "cavern dark");
         assert_eq!(grid.at(Chunk::index(0, 0, 0)).sky, LightLevel::DARK, "cavern floor dark");
+        assert!(
+            grid.is_uniform(),
+            "all-dark mixed-voxel (air) chunk collapses to Uniform"
+        );
+        assert!(grid == LightGrid::dark());
     }
 
     #[test]
@@ -1197,6 +1216,13 @@ mod tests {
         mixed.set(0, Lumel::DARK);
         assert!(mixed != uni);
         assert!(uni != mixed);
+
+        let mut written = LightGrid::dark();
+        assert!(written.is_uniform());
+        written.set(Chunk::index(8, 8, 8), Lumel::FULL);
+        assert!(!written.is_uniform(), "set densifies a Uniform grid");
+        assert_eq!(written.at(Chunk::index(8, 8, 8)), Lumel::FULL);
+        assert_eq!(written.at(0), Lumel::DARK);
 
         for face in Face::ALL {
             assert!(!border_changed(&uni, &dense, face), "{face:?} same values");
