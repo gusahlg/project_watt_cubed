@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn face_delta_touches_match_old_branches() {
-        // `delta` reproduces the old NEIGHBOR_OFFSETS set (order doesn't matter).
+        // `delta` is the six axis-aligned neighbour offsets (order doesn't matter).
         let old_offsets = [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)];
         let mut got: Vec<_> = Face::ALL.iter().map(|f| f.delta()).collect();
         got.sort_unstable();
@@ -403,8 +403,7 @@ mod tests {
         want.sort_unstable();
         assert_eq!(got, want, "Face deltas != NEIGHBOR_OFFSETS set");
 
-        // `touches` reproduces the old per-face `local[axis] == 0 / == last` test
-        // for every face at a spread of locals: interior, single-face, corner.
+        // `touches`: local[axis] == 0 / == last, at interior, face, and corner.
         let edge = (CHUNK_SIZE - 1) as u8;
         for &(lx, ly, lz) in &[(0u8, 0u8, 0u8), (edge, edge, edge), (5, 0, 9), (0, 7, edge), (8, 8, 8)] {
             let l = Local::new(lx, ly, lz).unwrap();
@@ -437,7 +436,7 @@ mod tests {
         for &(rh, rv) in &[(0, 0), (1, 1), (2, 3), (6, 4)] {
             for &center in &[ChunkCoord::new(0, 0, 0), ChunkCoord::new(-3, 5, 2)] {
                 let got: Vec<ChunkCoord> = ChunkBox::new(center, rh, rv).coords().collect();
-                // The exact x → z → y order the old streaming loops used.
+                // Iteration order is x → z → y.
                 let mut want = Vec::new();
                 for x in (center.x - rh)..=(center.x + rh) {
                     for z in (center.z - rh)..=(center.z + rh) {

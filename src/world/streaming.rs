@@ -363,7 +363,7 @@ impl World {
     /// and a mined block still vanishes the same frame it was clicked.
     /// Steady-state cost is a channel poll and two sticky-flag checks.
     pub fn pump(&mut self, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
-        // Palette growth re-uploads the block texture array before any upload
+        // Palette growth appends new block texture layers before any upload
         // this frame references a new layer.
         self.refresh_textures(eng);
         // Idle: no claim can produce a `Done`, so skip try_recv and the
@@ -441,6 +441,16 @@ impl World {
         let prev_center = self.center;
         let full_pass = Some(center_chunk) != self.center;
         self.center = Some(center_chunk);
+        // Re-bucket worklists around the live centre before any lane (or pump
+        // insert) runs. O(n) once per boundary cross; a no-op when the rings
+        // and centre already match.
+        if full_pass {
+            let rings = self.view.worklist_rings();
+            self.mesh_worklist.resize(rings);
+            self.mesh_worklist.recenter(center_chunk);
+            self.light_worklist.resize(rings);
+            self.light_worklist.recenter(center_chunk);
+        }
         // Publish the live view to the worker pool: queued jobs re-key toward
         // the player's CURRENT position on every view change, and entries left
         // behind by fast movement — far sections included — are descheduled
@@ -2726,39 +2736,122 @@ impl World {
     }
 
     /// Rebuild/upload block texture array on palette growth (rare: world entry or new block type).
-    /// The per-id layer cache makes growth O(new blocks), not O(palette).
+    /// The per-id layer cache makes growth O(new blocks), not O(palette). Existing
+    /// layers never change (pure function of composition; ids are append-only),
+    /// so only the first upload uses `set_block_textures`; later growth appends.
     fn refresh_textures(&mut self, eng: &mut Engine) {
         // Never zero (modulo divisor) and never past the vertex field's u16.
         self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
         let count = self.registry.block_count();
-        if self.textures_built != count {
-            for i in self.texture_cache.len()..count {
-                self.texture_cache
-                    .push(crate::block::texture::build_block_texture(
-                        &self.registry,
-                        crate::block::registry::BlockId(i as u16),
-                    ));
-            }
-            let visible = count.min(self.texture_layer_cap as usize);
-            if count > visible && self.textures_built <= visible {
-                eprintln!(
-                    "block palette ({count}) exceeds the device texture-layer cap \
-                     ({visible}); further block textures wrap onto existing layers"
-                );
-            }
-            eng.set_block_textures(
-                crate::block::texture::TEXTURE_SIZE,
-                &self.texture_cache[..visible],
-            );
-            self.textures_built = count;
+        if self.textures_built == count {
+            return;
         }
+        for i in self.texture_cache.len()..count {
+            self.texture_cache
+                .push(crate::block::texture::build_block_texture(
+                    &self.registry,
+                    crate::block::registry::BlockId(i as u16),
+                ));
+        }
+        let visible = count.min(self.texture_layer_cap as usize);
+        if count > visible && self.uploaded_len < visible {
+            eprintln!(
+                "block palette ({count}) exceeds the device texture-layer cap \
+                 ({visible}); further block textures wrap onto existing layers"
+            );
+        }
+        match plan_texture_upload(&self.texture_cache, self.uploaded_len, visible) {
+            Some(TextureUpload::Set(layers)) => {
+                eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, layers);
+            }
+            Some(TextureUpload::Append(layers)) => {
+                eng.append_block_textures(layers);
+            }
+            None => {}
+        }
+        self.uploaded_len = visible;
+        self.textures_built = count;
     }
+}
+
+/// GPU write for a palette-growth step. `Set` is the initial bind; `Append`
+/// is every later growth (ids above `uploaded_len`, in id order).
+#[derive(Debug)]
+enum TextureUpload<'a> {
+    Set(&'a [Vec<u8>]),
+    Append(&'a [Vec<u8>]),
+}
+
+/// Layers to send for the current cache vs last uploaded count, clamped to
+/// the device layer cap (`visible`). Prefix layers are never rewritten.
+fn plan_texture_upload(
+    cache: &[Vec<u8>],
+    uploaded_len: usize,
+    visible: usize,
+) -> Option<TextureUpload<'_>> {
+    if visible == 0 {
+        return None;
+    }
+    if uploaded_len == 0 {
+        return Some(TextureUpload::Set(&cache[..visible]));
+    }
+    if visible > uploaded_len {
+        return Some(TextureUpload::Append(&cache[uploaded_len..visible]));
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::StreamLane;
     use super::*;
+
+    #[test]
+    fn texture_growth_appends_only_new_layers_in_id_order() {
+        let layer = |id: u8| vec![id; 4];
+        let mut cache = vec![layer(0), layer(1), layer(2)];
+        let mut uploaded_len = 0usize;
+        let cap = 8usize;
+
+        let visible = cache.len().min(cap);
+        match plan_texture_upload(&cache, uploaded_len, visible) {
+            Some(TextureUpload::Set(layers)) => {
+                assert_eq!(layers.len(), 3);
+                assert_eq!(layers[0], layer(0));
+                assert_eq!(layers[1], layer(1));
+                assert_eq!(layers[2], layer(2));
+            }
+            other => panic!("initial upload must set, got {other:?}"),
+        }
+        uploaded_len = visible;
+        assert_eq!(uploaded_len, 3);
+
+        cache.push(layer(3));
+        cache.push(layer(4));
+        let visible = cache.len().min(cap);
+        match plan_texture_upload(&cache, uploaded_len, visible) {
+            Some(TextureUpload::Append(layers)) => {
+                assert_eq!(layers, &[layer(3), layer(4)]);
+                assert_eq!(
+                    uploaded_len + layers.len(),
+                    visible,
+                    "append is exactly the ids above uploaded_len"
+                );
+            }
+            other => panic!("growth must append, got {other:?}"),
+        }
+        uploaded_len = visible;
+        assert_eq!(uploaded_len, 5);
+
+        let cap = 5usize;
+        cache.push(layer(5));
+        let visible = cache.len().min(cap);
+        assert!(
+            plan_texture_upload(&cache, uploaded_len, visible).is_none(),
+            "past the layer cap, nothing is re-sent"
+        );
+        assert_eq!(uploaded_len, 5);
+    }
 
     #[test]
     fn stream_pacer_scales_with_useful_chunk_lifetime_and_recovers_gradually() {

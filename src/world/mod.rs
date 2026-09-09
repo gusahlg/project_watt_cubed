@@ -52,6 +52,7 @@ mod quadtree;
 mod query;
 mod streaming;
 mod summary;
+mod worklist;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -238,6 +239,14 @@ impl ViewVolume {
     /// uses the tighter [`UNLOAD_MARGIN_V`] to match the tighter vertical radius.
     fn unload(self, center: Coord) -> ChunkBox {
         self.box_at(center, UNLOAD_MARGIN, UNLOAD_MARGIN_V)
+    }
+
+    /// Ring-worklist bucket count: `order(data-box max corner) + 1`. Keys past
+    /// that ring clamp into the last bucket.
+    fn worklist_rings(self) -> usize {
+        let rh = self.horizontal + DATA_MARGIN;
+        let rv = self.vertical + DATA_MARGIN;
+        (rh.max(2 * rv) as usize).saturating_add(1)
     }
 }
 
@@ -791,13 +800,13 @@ pub struct World {
     /// neighbours), on a light publish that moved a border, and on an
     /// accept_mesh stale drop. Drained nearest-first by the mesh lane, so the
     /// enqueue scan is O(shell) not O(cube).
-    mesh_worklist: FastSet<Coord>,
+    mesh_worklist: worklist::RingWorklist,
     /// Whether the [`LightLane`] still has seeds/in-flight to drain (its
     /// `pending` gate — the [`StreamLane::pending`] accessor). Raised when the
     /// worklist or in-flight set is non-empty, cleared when both drain.
     light_pending: Sticky,
     /// Chunks needing light settling (budgeted, seeded on load/edit/border moves).
-    light_worklist: FastSet<Coord>,
+    light_worklist: worklist::RingWorklist,
     /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
     light_seed_inserts: u64,
     /// Cumulative light jobs accepted by the worker pool.
@@ -841,11 +850,15 @@ pub struct World {
     /// bounded hole in the world, not an infinite resubmit-panic loop. Every
     /// scan that would re-request the work consults this set.
     quarantined: FastSet<streaming::FailKey>,
-    /// Block count last uploaded. Rebuilds/re-uploads when palette grows.
+    /// Block count last processed by [`Self::refresh_textures`].
     textures_built: usize,
     /// Built texture layers by id, kept so palette growth (crafting registers
     /// one block at a time) appends new layers instead of regenerating all.
     texture_cache: Vec<Vec<u8>>,
+    /// Layers last sent to the GPU (`set` on first upload, `append` after).
+    /// Existing layers never change: a layer is a pure function of composition
+    /// and ids are append-only, so growth never re-sends the prefix.
+    uploaded_len: usize,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
     /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
     /// stream pass reads the engine cap (identity in practice — ids start tiny).
@@ -1120,9 +1133,15 @@ impl World {
             pending_gen: Sticky::default(),
             spawn_slab: None,
             upload_queue: VecDeque::new(),
-            mesh_worklist: FastSet::default(),
+            mesh_worklist: worklist::RingWorklist::new(
+                Coord::new(0, 0, 0),
+                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
+            ),
             light_pending: Sticky::default(),
-            light_worklist: FastSet::default(),
+            light_worklist: worklist::RingWorklist::new(
+                Coord::new(0, 0, 0),
+                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
+            ),
             light_seed_inserts: 0,
             light_admitted: 0,
             light_admitted_last: 0,
@@ -1135,6 +1154,7 @@ impl World {
             quarantined: FastSet::default(),
             textures_built: 0,
             texture_cache: Vec::new(),
+            uploaded_len: 0,
             texture_layer_cap: u16::MAX,
             ao: true,
             tables_epoch: 0,
@@ -1693,7 +1713,11 @@ pub(in crate::world) trait StreamLane {
     /// The candidate keys for this frame (see [`Candidates`]).
     fn candidates(world: &World, center: Coord) -> Candidates;
     /// The worklist seed set, for worklist lanes (`None` for geometry lanes).
-    fn seed_set(world: &mut World) -> Option<&mut FastSet<Self::Key>>;
+    fn seed_set(world: &mut World) -> Option<&mut worklist::RingWorklist>;
+    /// Worklist-lane admission. Geometry lanes leave the default (unreachable).
+    fn admit_worklist(_world: &mut World, _center: Coord, _budget: Budget) {
+        debug_assert!(false, "geometry lane has no worklist");
+    }
     /// This lane's reusable gather buffers.
     fn scratch(world: &mut World) -> &mut AdmitScratch<Self::Key>;
     /// This lane's raise-then-consume "has pending work" gate.
@@ -1751,11 +1775,12 @@ fn queue_slots<S: StreamLane>(world: &World) -> usize {
 }
 
 /// The shared admission loop: gather, filter unready/in-flight, select the
-/// nearest `want` in O(n), submit until the deadline expires (checked between
-/// items, never mid-item, and never before `MIN_ADMIT`), then claim. Clears the
-/// lane's pending gate once the ready backlog drains. `budget` becomes a
-/// [`pipeline::Deadline`] only after the pending gate, so an idle frame never
-/// samples `Instant::now`.
+/// nearest `want`, submit until the deadline expires (checked between items,
+/// never mid-item, and never before `MIN_ADMIT`), then claim. Worklist lanes
+/// walk ring buckets nearest-first and stop once they have `want` ready keys
+/// (far buckets are not visited). Clears the lane's pending gate once the
+/// ready backlog drains. `budget` becomes a [`pipeline::Deadline`] only after
+/// the pending gate, so an idle frame never samples `Instant::now`.
 pub(in crate::world) fn admit<S: StreamLane>(
     world: &mut World,
     center: Coord,
@@ -1764,8 +1789,16 @@ pub(in crate::world) fn admit<S: StreamLane>(
     if !S::pending(world).get() {
         return;
     }
+    match S::candidates(world, center) {
+        Candidates::Worklist => S::admit_worklist(world, center, budget),
+        Candidates::Geometry => admit_geometry::<S>(world, center, budget),
+    }
+}
+
+/// Geometry-lane admission: walk this frame's derived candidates, select the
+/// nearest `want` in O(n), submit.
+fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budget) {
     let deadline = lanes::paced_deadline(world, budget);
-    let worklist = matches!(S::candidates(world, center), Candidates::Worklist);
     let slots = queue_slots::<S>(world);
     let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
 
@@ -1773,45 +1806,20 @@ pub(in crate::world) fn admit<S: StreamLane>(
     scratch.keys.clear();
     scratch.blocked.clear();
 
-    if worklist {
-        let mut set = std::mem::take(S::seed_set(world).expect("worklist"));
-        for &k in &set {
-            if S::in_flight(world, k) {
-                continue;
-            }
-            if S::ready(world, k) {
-                if slots > 0 {
-                    scratch.keys.push((S::order(world, center, k), k));
-                }
-            } else {
-                scratch.blocked.push(k);
-            }
-        }
-        for k in &scratch.blocked {
-            set.remove(k);
-        }
-        *S::seed_set(world).expect("worklist") = set;
-        for k in scratch.blocked.drain(..) {
-            S::on_blocked(world, k);
-        }
-    } else if slots > 0 {
-        S::for_each_geometry(world, center, |k| {
-            if S::in_flight(world, k) || !S::ready(world, k) {
-                return;
-            }
-            scratch.keys.push((S::order(world, center, k), k));
-        });
-    } else {
+    if slots == 0 {
         *S::scratch(world) = scratch;
         return;
     }
+    S::for_each_geometry(world, center, |k| {
+        if S::in_flight(world, k) || !S::ready(world, k) {
+            return;
+        }
+        scratch.keys.push((S::order(world, center, k), k));
+    });
 
     let n = scratch.keys.len();
     if n == 0 {
-        let drained = S::seed_set(world).is_none_or(|set| set.is_empty());
-        if drained {
-            S::pending(world).take();
-        }
+        S::pending(world).take();
         *S::scratch(world) = scratch;
         return;
     }
@@ -1828,6 +1836,111 @@ pub(in crate::world) fn admit<S: StreamLane>(
     let mut admitted = 0usize;
     let fill_slots = world.stream_pacer.boosting();
     for i in 0..want {
+        let key = scratch.keys[i].1;
+        if admission_exhausted(admitted, min_admit, deadline)
+            && !(fill_slots && admitted < slots)
+        {
+            exhausted = false;
+            break;
+        }
+        let Some(job) = S::submit(world, key) else {
+            continue;
+        };
+        let far = S::dist2(world, center, key);
+        let workers = world.worker_pool();
+        let accepted = match far {
+            Some(dist2) => workers.submit_far(job, dist2),
+            None => workers.submit(job),
+        };
+        if accepted {
+            S::claim(world, key);
+            admitted += 1;
+        } else {
+            exhausted = false;
+            break;
+        }
+    }
+    S::note_admitted(world, admitted);
+    if exhausted {
+        S::pending(world).take();
+    }
+    *S::scratch(world) = scratch;
+}
+
+/// Worklist-lane admission: walk ring buckets nearest-first, evict blocked
+/// seeds only in visited buckets, stop once `want` ready keys are in hand.
+/// Motion bias is the tie-break within those buckets (it never reorders rings).
+fn admit_coord_worklist<S: StreamLane<Key = Coord>>(
+    world: &mut World,
+    center: Coord,
+    budget: Budget,
+) {
+    let deadline = lanes::paced_deadline(world, budget);
+    let slots = queue_slots::<S>(world);
+    let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
+    let rings = world.view.worklist_rings();
+
+    let mut list = std::mem::take(S::seed_set(world).expect("worklist"));
+    list.fit(center, rings);
+
+    if slots == 0 {
+        let empty = list.is_empty();
+        *S::seed_set(world).expect("worklist") = list;
+        if empty {
+            S::pending(world).take();
+        }
+        return;
+    }
+
+    let want = slots.max(min_admit);
+    let mut scratch = std::mem::take(S::scratch(world));
+    scratch.keys.clear();
+    scratch.blocked.clear();
+
+    let visited_all = list.walk_nearest(|bucket| {
+        if scratch.keys.len() >= want {
+            return false;
+        }
+        for &k in bucket {
+            if S::in_flight(world, k) {
+                continue;
+            }
+            if S::ready(world, k) {
+                scratch.keys.push((S::order(world, center, k), k));
+            } else {
+                scratch.blocked.push(k);
+            }
+        }
+        true
+    });
+    for k in scratch.blocked.drain(..) {
+        list.remove(&k);
+        S::on_blocked(world, k);
+    }
+    *S::seed_set(world).expect("worklist") = list;
+
+    let n = scratch.keys.len();
+    if n == 0 {
+        let drained = visited_all && S::seed_set(world).expect("worklist").is_empty();
+        if drained {
+            S::pending(world).take();
+        }
+        *S::scratch(world) = scratch;
+        return;
+    }
+
+    let take = n.min(want);
+    if take < n {
+        scratch.keys.select_nth_unstable_by_key(take - 1, |e| e.0);
+        scratch.keys[..take].sort_by_key(|e| e.0);
+    } else {
+        scratch.keys.sort_by_key(|e| e.0);
+    }
+
+    let mut exhausted = visited_all && take == n;
+    let mut admitted = 0usize;
+    let fill_slots = world.stream_pacer.boosting();
+    for i in 0..take {
         let key = scratch.keys[i].1;
         if admission_exhausted(admitted, min_admit, deadline)
             && !(fill_slots && admitted < slots)
@@ -1856,7 +1969,7 @@ pub(in crate::world) fn admit<S: StreamLane>(
         }
     }
     S::note_admitted(world, admitted);
-    let drained = exhausted && S::seed_set(world).is_none_or(|set| set.is_empty());
+    let drained = exhausted && S::seed_set(world).expect("worklist").is_empty();
     if drained {
         S::pending(world).take();
     }
@@ -1917,8 +2030,11 @@ impl StreamLane for MeshLane {
     fn candidates(_world: &World, _center: Coord) -> Candidates {
         Candidates::Worklist
     }
-    fn seed_set(world: &mut World) -> Option<&mut FastSet<Coord>> {
+    fn seed_set(world: &mut World) -> Option<&mut worklist::RingWorklist> {
         Some(&mut world.mesh_worklist)
+    }
+    fn admit_worklist(world: &mut World, center: Coord, budget: Budget) {
+        admit_coord_worklist::<Self>(world, center, budget);
     }
     fn scratch(world: &mut World) -> &mut AdmitScratch<Coord> {
         &mut world.admit_coords
@@ -2031,7 +2147,7 @@ impl StreamLane for SectionLane {
     fn candidates(_world: &World, _center: Coord) -> Candidates {
         Candidates::Geometry
     }
-    fn seed_set(_world: &mut World) -> Option<&mut FastSet<SectionPos>> {
+    fn seed_set(_world: &mut World) -> Option<&mut worklist::RingWorklist> {
         None
     }
     fn scratch(world: &mut World) -> &mut AdmitScratch<SectionPos> {
@@ -2150,8 +2266,11 @@ impl StreamLane for LightLane {
     fn candidates(_world: &World, _center: Coord) -> Candidates {
         Candidates::Worklist
     }
-    fn seed_set(world: &mut World) -> Option<&mut FastSet<Coord>> {
+    fn seed_set(world: &mut World) -> Option<&mut worklist::RingWorklist> {
         Some(&mut world.light_worklist)
+    }
+    fn admit_worklist(world: &mut World, center: Coord, budget: Budget) {
+        admit_coord_worklist::<Self>(world, center, budget);
     }
     fn scratch(world: &mut World) -> &mut AdmitScratch<Coord> {
         &mut world.admit_coords

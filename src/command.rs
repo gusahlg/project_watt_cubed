@@ -207,7 +207,14 @@ fn gfx(args: &[&str], settings: &mut Settings, visuals: VisualMask) -> Vec<Line>
         [] => shown(
             SETTINGS
                 .iter()
-                .map(|field| annotate_setting(field.confirm(settings), field.key(), visuals))
+                .map(|field| {
+                    let msg = if field.key() == "vrs" {
+                        settings.vrs_gfx_line()
+                    } else {
+                        field.confirm(settings)
+                    };
+                    annotate_setting(msg, field.key(), visuals)
+                })
                 .collect(),
         ),
         [key, value] => match gfx_set(settings, key, value) {
@@ -217,6 +224,11 @@ fn gfx(args: &[&str], settings: &mut Settings, visuals: VisualMask) -> Vec<Line>
                     .find(|f| f.matches(key))
                     .map(|f| f.key())
                     .unwrap_or(*key);
+                let msg = if field_key == "vrs" {
+                    settings.vrs_gfx_line()
+                } else {
+                    msg
+                };
                 shown(vec![annotate_setting(msg, field_key, visuals)])
             }
             None => rejected(usage()),

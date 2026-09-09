@@ -721,6 +721,10 @@ pub(super) fn display_json(eng: &Engine, settings: &Settings, system: Option<&Sy
         ("vsync", Json::from(eng.vsync())),
         ("target_fps", Json::from(eng.target_fps())),
         ("msaa", Json::from(eng.msaa())),
+        (
+            "render_target_fallback",
+            Json::from(settings.render_target_fallback),
+        ),
         ("fov_degrees", Json::number(f64::from(settings.fov))),
         ("monitor_connector", Json::optional_str(connector)),
         ("monitor_model", Json::optional_str(model)),
@@ -1006,6 +1010,31 @@ mod tests {
         .render();
         assert!(text.contains("\"render_scale\":1"), "{text}");
         assert!(text.contains("\"render_scale_auto\":false"), "{text}");
+    }
+
+    #[test]
+    fn display_report_includes_render_target_fallback_flag() {
+        let mut s = Settings::default();
+        s.mark_custom();
+        s.msaa = 8;
+        s.render_scale = 1.5;
+        let requested = s.session_graphics(1920, 1080);
+        s.adopt_engine_applied(&requested, 2, 1.5, 1920, 1080);
+        assert!(s.render_target_fallback);
+        let text = Json::object(vec![
+            ("msaa", Json::from(2u32)),
+            ("render_scale", Json::number(1.5)),
+            ("render_target_fallback", Json::from(s.render_target_fallback)),
+        ])
+        .render();
+        assert!(text.contains("\"msaa\":2"), "{text}");
+        assert!(text.contains("\"render_scale\":1.5"), "{text}");
+        assert!(text.contains("\"render_target_fallback\":true"), "{text}");
+        let equal = Json::object(vec![
+            ("render_target_fallback", Json::from(false)),
+        ])
+        .render();
+        assert!(equal.contains("\"render_target_fallback\":false"), "{equal}");
     }
 
     #[test]
