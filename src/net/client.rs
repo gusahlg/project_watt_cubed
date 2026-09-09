@@ -4,6 +4,7 @@
 //! the render loop never stalls on the network. Sends happen inline from the
 //! game thread (tiny and infrequent). Position sends are throttled and
 //! heartbeat so a standing-still player still proves they are alive.
+//! Teleport echo (`Position` after `Teleport`) is part of protocol v9.
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -181,9 +182,10 @@ pub struct Connection {
     /// own earlier requests will commit.
     pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
     next_req: u32,
-    /// Destination of an in-flight `/tp`. Movement is held until a `Position`
-    /// verdict lands so a stale snap-back cannot fight the teleport.
-    pending_teleport: Option<DVec3>,
+    /// Instant an in-flight `/tp` was sent. Movement is held until a `Position`
+    /// verdict lands, or one heartbeat elapses with no reply, so a dropped echo
+    /// cannot freeze the client.
+    pending_teleport: Option<Instant>,
     disconnect_emitted: bool,
 }
 
@@ -417,7 +419,7 @@ fn apply_server_message(
     peers: &mut HashMap<u32, RemotePlayer>,
     cell_revs: &mut HashMap<(i32, i32, i32), u32>,
     pending_edits: &mut Vec<(u32, (i32, i32, i32), u32)>,
-    pending_teleport: &mut Option<DVec3>,
+    pending_teleport: &mut Option<Instant>,
     ping_sent: &mut Option<(u32, Instant)>,
     ping_ms: &mut Option<u32>,
     alive: &mut bool,
@@ -460,6 +462,7 @@ fn apply_server_message(
             }
             ServerMessage::Position { pos } => {
                 *pending_teleport = None;
+                // TODO: echo a teleport request id so a snap-back Position from an earlier poll cannot still snap the player (wire change).
                 out.push(Incoming::Position { pos });
             }
             ServerMessage::Chat { from_name, channel, text, .. } => {
@@ -538,11 +541,18 @@ fn apply_server_message(
         }
 }
 
+/// True while an in-flight `/tp` still has a heartbeat left to hear a
+/// `Position` verdict. Past that the hold expires so a dropped echo cannot
+/// freeze the client; a later verdict still clears it.
+fn teleport_hold_active(pending: Option<Instant>, now: Instant) -> bool {
+    pending.is_some_and(|at| now.saturating_duration_since(at) < HEARTBEAT)
+}
+
 impl Connection {
     /// Cheap to call every frame; it only actually sends on the movement
     /// cadence or the heartbeat.
     pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
-        if !self.alive || self.pending_teleport.is_some() {
+        if !self.alive || teleport_hold_active(self.pending_teleport, Instant::now()) {
             return;
         }
         let elapsed = self.last_move.elapsed();
@@ -562,7 +572,7 @@ impl Connection {
     pub fn send_teleport(&mut self, pos: DVec3) {
         // So the next `send_move` reports the post-teleport position promptly.
         self.last_sent = None;
-        self.pending_teleport = Some(pos);
+        self.pending_teleport = Some(Instant::now());
         self.dispatch(&ClientMessage::Teleport { pos });
     }
 
@@ -770,7 +780,7 @@ mod tests {
         peers: HashMap<u32, RemotePlayer>,
         cell_revs: HashMap<(i32, i32, i32), u32>,
         pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
-        pending_teleport: Option<DVec3>,
+        pending_teleport: Option<Instant>,
         ping_sent: Option<(u32, Instant)>,
         ping_ms: Option<u32>,
         alive: bool,
@@ -871,7 +881,7 @@ mod tests {
         let mut v = View::new();
         let dest = DVec3::new(100.0, 40.0, 0.0);
         let old = DVec3::new(0.5, 40.0, 0.5);
-        v.pending_teleport = Some(dest);
+        v.pending_teleport = Some(Instant::now());
         let events = v.apply_all([
             ServerMessage::Position { pos: old },
             ServerMessage::Position { pos: dest },
@@ -882,13 +892,44 @@ mod tests {
         }
         assert!(v.pending_teleport.is_none());
 
-        v.pending_teleport = Some(dest);
+        v.pending_teleport = Some(Instant::now());
         let events = v.apply(ServerMessage::Position { pos: old });
         match events.as_slice() {
             [Incoming::Position { pos }] => assert_eq!(*pos, old, "a lone Position is the /tp verdict"),
             other => panic!("expected refusal snap-back, got {} events", other.len()),
         }
         assert!(v.pending_teleport.is_none());
+    }
+
+    #[test]
+    fn dropped_teleport_reply_releases_moves_after_one_heartbeat() {
+        let t0 = Instant::now();
+        let pending = Some(t0);
+        assert!(teleport_hold_active(pending, t0), "a fresh hold must suppress moves");
+        assert!(
+            teleport_hold_active(pending, t0 + HEARTBEAT - Duration::from_nanos(1)),
+            "the hold lasts the full heartbeat"
+        );
+        assert!(
+            !teleport_hold_active(pending, t0 + HEARTBEAT),
+            "a dropped echo must resume moves after one heartbeat"
+        );
+        assert!(
+            !teleport_hold_active(None, t0),
+            "a Position verdict still clears the hold immediately"
+        );
+
+        let handle = server::spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
+        let mut a = Connection::connect("127.0.0.1", handle.addr().port(), "a", "").unwrap();
+        let pos = a.spawn();
+        a.last_move = Instant::now() - HEARTBEAT;
+        a.pending_teleport = Some(Instant::now());
+        a.send_move(pos, 0.0, 0.0, Stance::Standing);
+        assert!(a.last_sent.is_none(), "a fresh hold must not send Move");
+        a.pending_teleport = Some(Instant::now() - HEARTBEAT);
+        a.send_move(pos, 0.0, 0.0, Stance::Standing);
+        assert!(a.last_sent.is_some(), "an expired hold must let Move through");
+        handle.stop();
     }
 
     #[test]

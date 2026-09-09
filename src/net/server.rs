@@ -349,6 +349,9 @@ pub struct ServerHandle {
     /// Test-only window into the shared state, for grid-leak assertions.
     #[cfg(test)]
     state: Arc<Mutex<State>>,
+    /// Test-only window into the pre-auth handshake slot counter.
+    #[cfg(test)]
+    handshake_pending: Arc<AtomicUsize>,
 }
 
 impl ServerHandle {
@@ -374,6 +377,12 @@ impl ServerHandle {
     #[cfg(test)]
     fn grid_buckets(&self) -> usize {
         self.state.lock_recover().grid.len()
+    }
+
+    /// Live pre-auth connections occupying a [`HANDSHAKE_CAP`] slot.
+    #[cfg(test)]
+    fn handshake_slots(&self) -> usize {
+        self.handshake_pending.load(Ordering::Relaxed)
     }
 }
 
@@ -424,9 +433,12 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
 
     #[cfg(test)]
     let state = shared.clone();
+    let pending = Arc::new(AtomicUsize::new(0));
+    #[cfg(test)]
+    let handshake_pending = pending.clone();
     let accept_shutdown = shutdown.clone();
     let accept_rt = rt.clone();
-    thread::spawn(move || accept_loop(endpoint, accept_rt, shared, ctx, accept_shutdown));
+    thread::spawn(move || accept_loop(endpoint, accept_rt, shared, ctx, accept_shutdown, pending));
 
     Ok(ServerHandle {
         shutdown,
@@ -434,6 +446,8 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         _rt: rt,
         #[cfg(test)]
         state,
+        #[cfg(test)]
+        handshake_pending,
     })
 }
 
@@ -463,8 +477,8 @@ fn accept_loop(
     shared: Arc<Mutex<State>>,
     ctx: Arc<Ctx>,
     shutdown: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
 ) {
-    let pending = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Relaxed) {
         // Bounded wait so `stop()` (which only flips the flag) is noticed
         // promptly between connections.
@@ -2103,6 +2117,11 @@ mod tests {
             ServerMessage::Reject { reason } => assert!(reason.contains("content")),
             other => panic!("expected fingerprint reject, got {other:?}"),
         }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.handshake_slots() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handle.handshake_slots(), 0, "refusals must release the pre-auth slot");
         use crate::net::client::Connection;
         Connection::connect("127.0.0.1", addr.port(), "late", "pw").expect("refusals must free the slot");
         handle.stop();

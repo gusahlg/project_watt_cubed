@@ -591,32 +591,37 @@ mod tests {
         }
     }
 
+    fn encoding_side_rejects_trailing_bytes<T>(
+        frame: Vec<u8>,
+        extra: u8,
+        decode: fn(&[u8]) -> Option<T>,
+        rng: &mut XorShift,
+    ) {
+        decode_must_not_panic(&frame);
+        for n in 0..frame.len() {
+            decode_must_not_panic(&frame[..n]);
+        }
+        let mut grown = frame.clone();
+        grown.push(extra);
+        assert!(decode(&grown).is_none(), "encoding side must reject a trailing byte");
+        decode_must_not_panic(&grown);
+        if frame.is_empty() {
+            return;
+        }
+        let i = rng.len(frame.len() - 1);
+        let mut flipped = frame.clone();
+        flipped[i] ^= rng.byte() | 1;
+        decode_must_not_panic(&flipped);
+    }
+
     #[test]
     fn structural_flips_and_truncations_never_panic_and_reject_trailing_bytes() {
         let mut rng = XorShift::new(0xA11C_EDED);
-        let mut frames = Vec::new();
         for message in client_cases() {
-            frames.push(message.encode());
+            encoding_side_rejects_trailing_bytes(message.encode(), rng.byte(), ClientMessage::decode, &mut rng);
         }
         for message in server_cases() {
-            frames.push(message.encode());
-        }
-        for frame in frames {
-            decode_must_not_panic(&frame);
-            for n in 0..frame.len() {
-                decode_must_not_panic(&frame[..n]);
-            }
-            let mut grown = frame.clone();
-            grown.push(rng.byte());
-            assert!(!(ClientMessage::decode(&grown).is_some() && ServerMessage::decode(&grown).is_some()));
-            decode_must_not_panic(&grown);
-            if frame.is_empty() {
-                continue;
-            }
-            let i = rng.len(frame.len() - 1);
-            let mut flipped = frame.clone();
-            flipped[i] ^= rng.byte() | 1;
-            decode_must_not_panic(&flipped);
+            encoding_side_rejects_trailing_bytes(message.encode(), rng.byte(), ServerMessage::decode, &mut rng);
         }
     }
 

@@ -65,11 +65,13 @@ pub fn list() -> Vec<Slot> {
 }
 
 fn peek_file(path: &std::path::Path) -> Result<super::slot::SaveMeta, SaveError> {
-    let mut f = fs::File::open(path)?;
-    let mut buf = [0u8; format::HEADER_LEN];
-    // v4 headers are 2 bytes shorter than v5; a short read still peeks.
-    let n = f.read(&mut buf)?;
-    format::peek_meta(&buf[..n])
+    let f = fs::File::open(path)?;
+    let mut v = Vec::with_capacity(format::HEADER_LEN);
+    f.take(format::HEADER_LEN as u64).read_to_end(&mut v)?;
+    if v.len() < format::HEADER_LEN {
+        return Err(SaveError::Corrupt("not a save"));
+    }
+    format::peek_meta(&v)
 }
 
 /// Prefers: intact live > intact backup > salvaged live > salvaged backup.
@@ -362,6 +364,22 @@ mod tests {
         assert!(read(&id).is_err());
         assert!(live_path(&id).exists(), "a failed ladder must not delete live");
         assert!(bak_path(&id).exists(), "a failed ladder must not delete backup");
+        cleanup(&id);
+    }
+
+    #[test]
+    fn peek_file_reads_a_full_header_and_rejects_a_short_read() {
+        let id = SlotId::new("__store_peek__").unwrap();
+        cleanup(&id);
+        let bytes = format::encode(&doc("peeked", 1)).unwrap();
+        write(&id, &bytes).unwrap();
+        assert_eq!(peek_file(&live_path(&id)).unwrap().name, "peeked");
+
+        fs::write(live_path(&id), &bytes[..format::HEADER_LEN - 1]).unwrap();
+        assert!(
+            matches!(peek_file(&live_path(&id)), Err(SaveError::Corrupt("not a save"))),
+            "fewer than HEADER_LEN bytes is not a save"
+        );
         cleanup(&id);
     }
 

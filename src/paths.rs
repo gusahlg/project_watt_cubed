@@ -139,7 +139,8 @@ fn absolutize(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 fn isolated_test_paths() -> Paths {
-    let dir = std::env::temp_dir().join("project_watt_cubed-lib-tests");
+    // Per-checkout so parallel worktree `cargo test` runs don't share fixed names.
+    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/test-data"));
     let _ = std::fs::create_dir_all(&dir);
     Paths {
         data: dir.clone(),
@@ -210,6 +211,8 @@ mod tests {
             assert_ne!(paths.data.as_path(), Path::new("saves"));
         }
         assert_eq!(paths.data, paths.config);
+        let checkout_root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/test-data"));
+        assert_eq!(paths.data, checkout_root, "each checkout must have its own test data root");
         let marker = paths.data.join("__paths_isolation_marker__");
         std::fs::write(&marker, b"ok").unwrap();
         assert!(marker.exists());
