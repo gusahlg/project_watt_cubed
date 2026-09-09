@@ -287,7 +287,9 @@ messages! {
         /// Sent to everyone except the editor (who gets the ack).
         Edit = tag::S_EDIT { x: i32, y: i32, z: i32, rev: u32, spec: Arc<str> },
         /// `accepted` with the committed revision, or rejected (stale expectation,
-        /// out of reach, invalid spec) — the signal prediction rolls back on.
+        /// out of reach, invalid spec, or a server-mod `Deny`) — the signal
+        /// prediction rolls back on. A hook Deny does not advance the cell, so
+        /// the client's `restore` is the same as a lost race.
         EditAck = tag::EDIT_ACK { req: u32, accepted: bool, rev: u32 },
         /// Refused teleport or implausible movement: snap to it.
         Position = tag::POSITION { pos: DVec3 },

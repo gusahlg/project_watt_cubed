@@ -11,8 +11,10 @@
 //!
 //! **Trust:** the server is authoritative and never trusts a client. Frames are
 //! length-capped, joins are password-gated, and every edit and move is validated
-//! and rate-limited server-side ([`server`]).
+//! and rate-limited server-side ([`server`]). Communities add extra rules through
+//! the [`hooks`] seam (`ServerMod`) without changing the wire.
 pub mod client;
+pub mod hooks;
 pub mod protocol;
 
 // Deny a bare `.unwrap()` on production paths; server.rs's `lock_recover()`

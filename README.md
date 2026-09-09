@@ -53,6 +53,10 @@ but an active man-in-the-middle can impersonate the server and capture the
 application password. Use a trusted network or VPN until certificate pinning
 or trust-on-first-use is implemented.
 
+Server-side mods: install `ServerMod` values on `Config.hooks` (`validate_edit`, `on_join`/`on_leave`, `on_chat`) with plain-data arguments and no wire change.
+Hooks run in order outside the roster lock; the first `Deny` wins (an edit `Deny` is the same `EditRejected` path as a lost race).
+A panicking hook is logged once and treated as `Allow` so a broken mod cannot take the server down.
+
 ## Graphics
 
 Rendering runs on [voxel_engine](../voxel-engine), our own Vulkan 1.3 renderer
