@@ -399,7 +399,13 @@ impl App {
                 let bench = self.bench.as_mut().expect("bench exists");
                 bench.poll_world(game.world())
             };
-            let step = self.bench.as_mut().expect("bench exists").step(dt, ready, gauges);
+            let rendered = eng.frames_rendered();
+            let coalesced = eng.frames_coalesced();
+            let step = self
+                .bench
+                .as_mut()
+                .expect("bench exists")
+                .step(dt, ready, gauges, rendered, coalesced);
             match step {
                 BenchmarkStep::ReadyTimeout => {
                     eprintln!("{}", game.world().entry_debug());

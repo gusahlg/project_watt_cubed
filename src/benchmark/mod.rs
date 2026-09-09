@@ -113,6 +113,10 @@ pub struct Benchmark {
     /// Wall time of the measured window, frozen at `Step::Complete` so a
     /// later screenshot readback cannot inflate `wall_seconds`.
     measured_wall: Option<Duration>,
+    /// `Engine::frames_rendered` / `frames_coalesced` at the first measured
+    /// frame (last warmup snapshot) and at `Step::Complete`.
+    engine_frames_start: Option<(u64, u64)>,
+    engine_frames_end: Option<(u64, u64)>,
 }
 
 impl Benchmark {
@@ -184,6 +188,8 @@ impl Benchmark {
             entry_seconds: None,
             census_ready: None,
             measured_wall: None,
+            engine_frames_start: None,
+            engine_frames_end: None,
         })
     }
 
@@ -318,7 +324,18 @@ impl Benchmark {
 
     /// Advance warmup/measurement using wall time for boundaries and the
     /// engine's previous-frame duration for the sample itself.
-    pub fn step(&mut self, dt: f32, world_ready: bool, gauges: StreamGauges) -> Step {
+    ///
+    /// `frames_rendered` / `frames_coalesced` are `Engine` counters sampled on
+    /// this callback (monotonic, main thread). The last warmup snapshot is the
+    /// measured-window start; the completing frame is the end.
+    pub fn step(
+        &mut self,
+        dt: f32,
+        world_ready: bool,
+        gauges: StreamGauges,
+        frames_rendered: u64,
+        frames_coalesced: u64,
+    ) -> Step {
         self.last_gauges = gauges;
         self.peaks.observe(gauges);
         self.poll_rss();
@@ -342,6 +359,7 @@ impl Benchmark {
                 self.phase = Phase::Measuring;
                 self.measure_started = Some(Instant::now());
                 self.first_gauges = Some(gauges);
+                self.engine_frames_start = Some((frames_rendered, frames_coalesced));
                 if timed_out && !world_ready {
                     eprintln!(
                         "benchmark: world did not become ready within {:.1}s; measuring with readiness=false",
@@ -370,6 +388,7 @@ impl Benchmark {
                             .expect("measurement clock set")
                             .elapsed(),
                     );
+                    self.engine_frames_end = Some((frames_rendered, frames_coalesced));
                     self.phase = Phase::Complete;
                     Step::Complete
                 } else {
@@ -412,7 +431,21 @@ impl Benchmark {
         let wall = self.measured_wall.unwrap_or_else(|| {
             self.measure_started.map_or(Duration::ZERO, |t| t.elapsed())
         });
-        let stats = FrameStats::from_samples(&self.samples, wall);
+        let engine_delta = match (self.engine_frames_start, self.engine_frames_end) {
+            (Some((rs, cs)), Some((re, ce))) => {
+                Some((re.saturating_sub(rs), ce.saturating_sub(cs)))
+            }
+            _ => {
+                // Finish without a completing `step` still has a live engine.
+                self.engine_frames_start.map(|(rs, cs)| {
+                    (
+                        eng.frames_rendered().saturating_sub(rs),
+                        eng.frames_coalesced().saturating_sub(cs),
+                    )
+                })
+            }
+        };
+        let stats = FrameStats::from_samples(&self.samples, wall, engine_delta);
         let census_end = world.memory_census();
         let visuals = self.visuals_raw.clone();
         let report = Json::object(vec![
@@ -508,8 +541,12 @@ impl Benchmark {
             ),
         ]);
         let json = report.render();
-        let summary = format!(
-            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} ready_s={} preset={} window={}x{} gpu={}",
+        let outran = matches!(
+            (stats.rendered_fps, stats.avg_fps),
+            (Some(rendered), Some(avg)) if rendered < avg
+        );
+        let mut summary = format!(
+            "BENCH frames={} avg_fps={} p1_fps={} avg_ms={} p99_ms={} max_ms={} hitches_33ms={} rss_mb={} ready={} ready_s={} preset={} window={}x{} gpu={} rendered_fps={} coalesced={}",
             stats.frames,
             fmt_opt(stats.avg_fps, 0),
             fmt_opt(stats.p1_fps, 0),
@@ -524,7 +561,12 @@ impl Benchmark {
             eng.screen_width(),
             eng.screen_height(),
             self.system.as_ref().map_or("unknown", SystemInfo::gpu_name),
+            fmt_opt(stats.rendered_fps, 0),
+            stats.coalesced.map_or_else(|| "n/a".into(), |n| n.to_string()),
         );
+        if outran {
+            summary.push_str(" (game frames outran rendered frames)");
+        }
         let mem_line = format!(
             "BENCH_MEM ready_total={} end_total={} chunks=u{}/p{}/d{} light=u{}/c{} light_bytes=u{}/c{} mesh={} edits={} lod={} queues={}",
             self.census_ready.map_or_else(|| "n/a".into(), |c| c.total.to_string()),
@@ -629,13 +671,31 @@ struct FrameStats {
     over_16ms: usize,
     over_33ms: usize,
     over_50ms: usize,
+    rendered: Option<u64>,
+    coalesced: Option<u64>,
+    rendered_fps: Option<f64>,
 }
 
 impl FrameStats {
-    fn from_samples(samples: &[f32], wall: Duration) -> Self {
+    fn from_samples(
+        samples: &[f32],
+        wall: Duration,
+        engine_delta: Option<(u64, u64)>,
+    ) -> Self {
+        let (rendered, coalesced) = match engine_delta {
+            Some((r, c)) => (Some(r), Some(c)),
+            None => (None, None),
+        };
+        let wall_secs = wall.as_secs_f64();
+        let rendered_fps = rendered.and_then(|n| {
+            (wall_secs > 0.0).then_some(n as f64 / wall_secs)
+        });
         if samples.is_empty() {
             return Self {
-                wall_secs: wall.as_secs_f64(),
+                wall_secs,
+                rendered,
+                coalesced,
+                rendered_fps,
                 ..Self::default()
             };
         }
@@ -668,6 +728,9 @@ impl FrameStats {
             over_16ms: sorted.iter().filter(|&&s| s > 1.0 / 60.0).count(),
             over_33ms: sorted.iter().filter(|&&s| s > 1.0 / 30.0).count(),
             over_50ms: sorted.iter().filter(|&&s| s > 0.050).count(),
+            rendered,
+            coalesced,
+            rendered_fps,
         }
     }
 
@@ -697,11 +760,9 @@ impl FrameStats {
             ("frames_over_16_67ms", Json::from(self.over_16ms)),
             ("frames_over_33_33ms", Json::from(self.over_33ms)),
             ("frames_over_50ms", Json::from(self.over_50ms)),
-            // Engine::frames_rendered / frames_coalesced are not on this engine
-            // revision; filled when those accessors land.
-            ("rendered", Json::Null),
-            ("coalesced", Json::Null),
-            ("rendered_fps", Json::Null),
+            ("rendered", Json::optional_u64(self.rendered)),
+            ("coalesced", Json::optional_u64(self.coalesced)),
+            ("rendered_fps", Json::optional_number(self.rendered_fps)),
         ])
     }
 }
@@ -924,7 +985,7 @@ mod tests {
     #[test]
     fn frame_statistics_are_defined_and_percentiles_are_nearest_rank() {
         let samples = [0.001, 0.002, 0.003, 0.004, 0.100];
-        let stats = FrameStats::from_samples(&samples, Duration::from_millis(110));
+        let stats = FrameStats::from_samples(&samples, Duration::from_millis(110), None);
         assert_eq!(stats.frames, 5);
         assert!(stats.p50_ms.is_some_and(|ms| (ms - 3.0).abs() < 0.001));
         assert!(stats.p99_ms.is_some_and(|ms| (ms - 100.0).abs() < 0.001));
@@ -934,7 +995,7 @@ mod tests {
 
     #[test]
     fn empty_statistics_emit_nulls_instead_of_nan_or_infinity() {
-        let stats = FrameStats::from_samples(&[], Duration::ZERO);
+        let stats = FrameStats::from_samples(&[], Duration::ZERO, None);
         let json = stats.to_json().render();
         assert!(json.contains("\"average_fps\":null"));
         assert!(!json.contains("NaN"));
@@ -994,6 +1055,8 @@ mod tests {
             entry_seconds: None,
             census_ready: None,
             measured_wall: None,
+            engine_frames_start: None,
+            engine_frames_end: None,
         }
     }
 
@@ -1003,13 +1066,13 @@ mod tests {
         bench.begin();
         bench.warmup_started = Some(Instant::now() - Duration::from_millis(250));
         let gauges = StreamGauges::default();
-        assert_eq!(bench.step(0.016, false, gauges), Step::Warming);
+        assert_eq!(bench.step(0.016, false, gauges, 0, 0), Step::Warming);
         assert!(bench.entry_seconds.is_none());
-        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        assert_eq!(bench.step(0.016, true, gauges, 0, 0), Step::Warming);
         let secs = bench.entry_seconds.expect("ready frame stamps entry_seconds");
         assert!(secs >= 0.25, "got {secs}");
         assert!(secs < 2.0, "got {secs}");
-        assert_eq!(bench.step(0.016, true, gauges), Step::Measuring);
+        assert_eq!(bench.step(0.016, true, gauges, 0, 0), Step::Measuring);
         let again = bench.entry_seconds.expect("stays set");
         assert_eq!(format!("{secs:.6}"), format!("{again:.6}"));
     }
@@ -1031,10 +1094,18 @@ mod tests {
         assert!(json.contains("\"light_cells_bytes\":0"));
         assert!(json.contains("\"mesh_cpu_bytes\":0"));
         assert!(json.contains("\"total\":4"));
-        let frames = FrameStats::from_samples(&[], Duration::ZERO).to_json().render();
+        let frames = FrameStats::from_samples(&[], Duration::ZERO, None)
+            .to_json()
+            .render();
         assert!(frames.contains("\"rendered\":null"));
         assert!(frames.contains("\"coalesced\":null"));
         assert!(frames.contains("\"rendered_fps\":null"));
+        let filled = FrameStats::from_samples(&[], Duration::from_secs(2), Some((100, 0)))
+            .to_json()
+            .render();
+        assert!(filled.contains("\"rendered\":100"));
+        assert!(filled.contains("\"coalesced\":0"));
+        assert!(filled.contains("\"rendered_fps\":50"));
         let scenario = Json::object(vec![
             ("entry_seconds", Json::optional_number(Some(1.5))),
         ])
@@ -1045,14 +1116,32 @@ mod tests {
     }
 
     #[test]
+    fn engine_frame_deltas_drive_rendered_fps_and_flag_outrunning() {
+        let stats = FrameStats::from_samples(
+            &[0.010, 0.010],
+            Duration::from_secs(1),
+            Some((40, 0)),
+        );
+        assert_eq!(stats.rendered, Some(40));
+        assert_eq!(stats.coalesced, Some(0));
+        assert!(stats.rendered_fps.is_some_and(|f| (f - 40.0).abs() < 1e-9));
+        let avg = stats.avg_fps.expect("samples");
+        let rendered = stats.rendered_fps.expect("engine");
+        assert!(
+            rendered < avg,
+            "game fps {avg} should outrun rendered fps {rendered}"
+        );
+    }
+
+    #[test]
     fn ready_timeout_is_signaled_once_then_measurement_starts() {
         let mut bench = test_bench(Duration::from_millis(1), Duration::from_millis(1));
         bench.begin();
         bench.warmup_started = Some(Instant::now() - Duration::from_secs(1));
         let gauges = StreamGauges::default();
-        assert_eq!(bench.step(0.016, false, gauges), Step::ReadyTimeout);
+        assert_eq!(bench.step(0.016, false, gauges, 0, 0), Step::ReadyTimeout);
         assert!(!bench.ready_before_measure);
-        assert_eq!(bench.step(0.016, false, gauges), Step::Measuring);
+        assert_eq!(bench.step(0.016, false, gauges, 0, 0), Step::Measuring);
     }
 
     #[test]
@@ -1165,14 +1254,17 @@ mod tests {
         bench.begin();
         bench.warmup_started = Some(Instant::now() - Duration::from_secs(1));
         let gauges = StreamGauges::default();
-        assert_eq!(bench.step(0.016, true, gauges), Step::Warming);
+        assert_eq!(bench.step(0.016, true, gauges, 10, 0), Step::Warming);
         bench.measure_started = Some(Instant::now() - Duration::from_secs(1));
-        assert_eq!(bench.step(0.016, true, gauges), Step::Complete);
+        assert_eq!(bench.step(0.016, true, gauges, 110, 0), Step::Complete);
         assert!(bench.measurement_complete());
         assert_eq!(bench.samples.len(), 1);
         assert!(bench.measured_wall.is_some());
-        assert_eq!(bench.step(0.016, true, gauges), Step::Complete);
+        assert_eq!(bench.engine_frames_start, Some((10, 0)));
+        assert_eq!(bench.engine_frames_end, Some((110, 0)));
+        assert_eq!(bench.step(0.016, true, gauges, 111, 0), Step::Complete);
         assert_eq!(bench.samples.len(), 1);
+        assert_eq!(bench.engine_frames_end, Some((110, 0)));
     }
 
     #[test]
