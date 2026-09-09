@@ -4,6 +4,20 @@
 //! A [`Score`] predicts a clean sample from a noisy one. [`InfiniteField`]
 //! runs that score through phased, overlapping tiles with linear blending so
 //! the result is seed-consistent, order-independent, and lazily cached.
+//!
+//! The v2 integer path ([`IntField`], [`inoise`]) sits beside this f32 API
+//! and is the one a GPU compute pass will mirror.
+
+pub mod inoise;
+pub mod intfield;
+
+pub use inoise::{
+    cellular_q16, clamp_q16, fbm_q16, gradient_q16, hash32, isqrt_u64, lerp_q16, mul_q16, rem_floor,
+    ridged_q16, smoothstep_q16, uniform_q16, value_noise_q16, warp_q16, HALF, ONE,
+};
+pub use intfield::{
+    CacheStats, IntField, IntHashScore, IntScore, IntSpec, Stencil, INT_TILE_CACHE_CAP,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
