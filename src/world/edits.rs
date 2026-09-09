@@ -439,4 +439,32 @@ impl World {
             })
         })
     }
+
+    /// Cheap autosave snapshot of the overlay: a HashMap clone, no spec strings.
+    pub(crate) fn clone_edit_overlay(
+        &self,
+    ) -> super::FastMap<Coord, super::FastMap<usize, BlockId>> {
+        self.edits.clone()
+    }
+}
+
+#[cfg(test)]
+impl World {
+    /// Pack `n` overlay entries without going through [`World::set_block`] —
+    /// used by the autosave snapshot/encode timing probe.
+    pub(crate) fn test_fill_overlay(&mut self, n: usize, id: BlockId) {
+        use super::chunk::CHUNK_VOLUME;
+        let mut placed = 0;
+        let mut cx = 0i32;
+        while placed < n {
+            let inner = self.edits.entry(Coord::new(cx, 20, 0)).or_default();
+            let room = CHUNK_VOLUME.min(n - placed);
+            for index in 0..room {
+                inner.insert(index, id);
+            }
+            placed += room;
+            self.edit_generation += room as u64;
+            cx += 1;
+        }
+    }
 }

@@ -12,16 +12,40 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{LoadReport, encode_current, load, save, unix_now};
+pub use bridge::{LoadReport, SaveSnapshot, encode_current, load, save, snapshot, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
 pub use store::{Source, fresh_id, list};
 
+use crate::block::element::ElementId;
 use crate::block::{AIR, BlockId, BlockRegistry, Composition};
 use crate::world::World;
 
 /// Serialize a block as portable element names shared with the network layer.
 pub(crate) fn block_spec(world: &World, id: BlockId) -> String {
     registry_block_spec(world.registry(), id)
+}
+
+/// Spec string from a composition and an element-name lookup. Shared by the
+/// live registry path and the autosave snapshot so both emit identical bytes.
+pub(crate) fn composition_spec<'a>(
+    composition: &Composition,
+    element_name: impl Fn(ElementId) -> &'a str,
+) -> String {
+    match composition {
+        Composition::Natural(els) if els.is_empty() => "air".to_string(),
+        Composition::Natural(els) => {
+            let names: Vec<&str> = els.iter().map(|&e| element_name(e)).collect();
+            format!("natural:{}", names.join(","))
+        }
+        Composition::Mixture(mix) => {
+            let parts: Vec<String> = mix
+                .parts()
+                .iter()
+                .map(|&(e, pct)| format!("{}={}", element_name(e), pct))
+                .collect();
+            format!("mixture:{}", parts.join(";"))
+        }
+    }
 }
 
 /// [`block_spec`] against a bare registry — the headless server and the
@@ -31,21 +55,7 @@ pub(crate) fn registry_block_spec(registry: &BlockRegistry, id: BlockId) -> Stri
         return "air".to_string();
     }
     let elements = registry.elements();
-    match &registry.block(id).composition {
-        Composition::Natural(els) if els.is_empty() => "air".to_string(),
-        Composition::Natural(els) => {
-            let names: Vec<String> = els.iter().map(|&e| elements.get(e).name.to_string()).collect();
-            format!("natural:{}", names.join(","))
-        }
-        Composition::Mixture(mix) => {
-            let parts: Vec<String> = mix
-                .parts()
-                .iter()
-                .map(|&(e, pct)| format!("{}={}", elements.get(e).name, pct))
-                .collect();
-            format!("mixture:{}", parts.join(";"))
-        }
-    }
+    composition_spec(&registry.block(id).composition, |e| elements.get(e).name.as_ref())
 }
 
 /// Deserialize a block spec, registering into palette; inverse of block_spec().
@@ -304,5 +314,80 @@ mod tests {
         let states = mods.save_states(&world);
         let inv = states.iter().find(|(n, _)| n == "Inventory").map(|(_, d)| d.as_str());
         assert_eq!(inv, Some(""), "empty payload clears the stash");
+    }
+
+    /// Independent of `SaveSnapshot::to_doc`: walk `World::edits` and
+    /// `block_spec` the way encode used to on the main thread.
+    fn doc_by_walking_overlay(
+        world: &World,
+        player: &Player,
+        mods: &Mods,
+        mut meta: SaveMeta,
+    ) -> super::format::SaveDoc {
+        use super::format::{Edit, PlayerState, SaveDoc};
+        let mut specs: Vec<String> = Vec::new();
+        let mut index_of: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        let mut edits: Vec<Edit> = Vec::new();
+        for ((x, y, z), id) in world.edits() {
+            let spec = block_spec(world, id);
+            let index = match index_of.get(&spec) {
+                Some(&index) => index,
+                None => {
+                    let index = u16::try_from(specs.len()).unwrap();
+                    index_of.insert(spec.clone(), index);
+                    specs.push(spec);
+                    index
+                }
+            };
+            edits.push(Edit { x, y, z, spec: index });
+        }
+        meta.edit_count = u32::try_from(edits.len()).unwrap();
+        SaveDoc {
+            meta,
+            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            player: PlayerState {
+                pos: [player.position.x, player.position.y, player.position.z],
+                yaw: player.orientation.yaw,
+                pitch: player.orientation.pitch,
+                flying: player.flying(),
+                noclip: player.noclip(),
+            },
+            specs,
+            edits,
+            mods: mods.save_states(world),
+        }
+    }
+
+    #[test]
+    fn snapshot_encodes_byte_identical_to_walking_the_overlay() {
+        let mut world = World::new(4242);
+        let (bx, bz) = (8, 8);
+        let by = (0..64)
+            .rev()
+            .find(|&y| world.is_solid(bx, y, bz))
+            .unwrap();
+        world.set_block(bx, by, bz, AIR);
+        let mix = world
+            .registry_mut()
+            .mixture(&[(El::Soil.id(), 70), (El::Clay.id(), 30)])
+            .unwrap();
+        world.set_block(bx, by + 1, bz, mix);
+
+        let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
+        player.orientation.yaw = 0.5;
+        player.orientation.pitch = -0.25;
+        player.set_flying(true);
+        let mut mods = Mods::with_defaults();
+        mods.on_block_break(&[El::Stone.id(), El::Iron.id(), El::Stone.id()], &world);
+
+        let snap = snapshot(&world, &player, &mods, meta("snap"));
+        let snap_doc = snap.to_doc().unwrap();
+        let walked = doc_by_walking_overlay(&world, &player, &mods, snap_doc.meta.clone());
+        assert_eq!(snap_doc, walked, "snapshot document must match the old overlay walk");
+        assert_eq!(
+            snap.encode().unwrap(),
+            super::format::encode(&walked).unwrap(),
+            "snapshot bytes must match the old overlay walk"
+        );
     }
 }

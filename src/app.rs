@@ -594,9 +594,11 @@ impl App {
         // failing write doesn't retry every frame.
         if autosaver.wants_write(game.world().edit_generation()) && game.autosave_due() {
             game.mark_autosave();
-            let started = autosaver.start(id, game.world().edit_generation(), || {
-                save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
-            });
+            let started = autosaver.start(
+                id,
+                game.world().edit_generation(),
+                save::snapshot(game.world(), game.player(), &self.mods, meta.clone()),
+            );
             if let Tick::Finished(Err(e)) = started {
                 game.notify(format!("* autosave failed: {e}"));
             }

@@ -233,7 +233,7 @@ impl ViewVolume {
 
 /// Fast multiply-based hasher for well-distributed grid coordinate keys (chunk hot path).
 #[derive(Default)]
-pub(in crate::world) struct FastHasher(u64);
+pub(crate) struct FastHasher(u64);
 
 impl Hasher for FastHasher {
     fn finish(&self) -> u64 {
@@ -252,7 +252,7 @@ impl Hasher for FastHasher {
     }
 }
 
-pub(in crate::world) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 pub(in crate::world) type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 
 /// Raise-then-consume flag: can be raised or consumed, never lowered (so a queued
