@@ -1407,6 +1407,66 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
     }
 }
 
+/// Once `want` ready keys are in hand, farther buckets are not visited, so a
+/// far blocked seed is left in the worklist (its re-seed event still fires).
+#[test]
+fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
+    use crate::world::chunk::{Chunk, ChunkData};
+
+    let mut world = World::with_config_lazy(1, RenderConfig::default());
+    world.transition_lighting(false);
+    world.set_view_distances(6, 3);
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    let stone = world.registry.id_by_name("Stone").unwrap();
+    for x in -5..=5 {
+        for z in -5..=5 {
+            for y in -2..=2 {
+                let coord = ChunkCoord::new(x, y, z);
+                world.chunks.insert(
+                    coord,
+                    Loaded {
+                        chunk: std::sync::Arc::new(Chunk::from_data(
+                            x,
+                            y,
+                            z,
+                            ChunkData::Uniform(stone),
+                        )),
+                        state: MeshState::needs_mesh(),
+                        rev: 0,
+                        connectivity: None,
+                        visible: true,
+                        light: None,
+                        has_blocklight: false,
+                        light_gen: 0,
+                    },
+                );
+            }
+        }
+    }
+    for x in -4..=4 {
+        for z in -4..=4 {
+            let coord = ChunkCoord::new(x, 0, z);
+            assert!(<MeshLane as StreamLane>::ready(&world, coord));
+            world.mesh_worklist.insert(coord);
+        }
+    }
+    let far = ChunkCoord::new(20, 0, 20);
+    world.mesh_worklist.insert(far);
+    assert!(!<MeshLane as StreamLane>::ready(&world, far), "out of box");
+    world.pending_fresh.set();
+    world.workers = Some(pipeline::Workers::spawn(2));
+    admit::<MeshLane>(
+        &mut world,
+        center,
+        voxel_engine::producer::Budget::Millis(1000.0),
+    );
+    assert!(
+        world.mesh_worklist.contains(&far),
+        "far blocked seed is not evicted: its bucket was never visited"
+    );
+}
+
 #[test]
 fn ensure_around_is_synchronous_for_headless_callers() {
     let mut world = World::with_config_lazy(DEFAULT_SEED, RenderConfig::default());

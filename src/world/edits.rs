@@ -44,6 +44,8 @@ impl World {
         if horizontal != self.view.horizontal || vertical != self.view.vertical {
             let shrunk = horizontal < self.view.horizontal || vertical < self.view.vertical;
             self.view = super::ViewVolume::new(horizontal, vertical);
+            self.mesh_worklist.resize(self.view.worklist_rings());
+            self.light_worklist.resize(self.view.worklist_rings());
             // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
@@ -264,7 +266,8 @@ impl World {
         self.center = None;
         // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).
-        self.mesh_worklist = self.chunks.keys().copied().collect();
+        self.mesh_worklist.clear();
+        self.mesh_worklist.extend(self.chunks.keys().copied());
         self.pending_fresh.set();
         self.light_terminal.clear();
     }
