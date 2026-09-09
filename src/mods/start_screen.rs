@@ -81,6 +81,7 @@ impl DefaultStart {
             saves: facts.saves,
             mods: &[],
             session: facts.session,
+            mods_save_error: None,
         }
     }
 }
@@ -92,26 +93,16 @@ impl StartScreen for DefaultStart {
         match &self.overlay {
             Some(Overlay::Host(frame)) => {
                 let (view, sel) = frame.view_sel(&ctx);
-                MenuModel::from_view(&view, sel, |_| None)
+                MenuModel::from_view(view, sel, |_| None)
             }
             Some(Overlay::Join(frame)) => {
                 let (view, sel) = frame.view_sel(&ctx);
-                MenuModel::from_view(&view, sel, |_| None)
+                MenuModel::from_view(view, sel, |_| None)
             }
             None => {
                 let view = self.main.view(facts);
                 let selected = self.cursor.resolved(&view);
-                MenuModel::from_view(&view, selected, |a| match a {
-                    MainAction::NewWorld => Some(StartAction::NewWorld),
-                    MainAction::Load(i) => facts
-                        .saves
-                        .get(*i)
-                        .map(|slot| StartAction::Load(slot.id.clone())),
-                    MainAction::Host | MainAction::Join => None,
-                    MainAction::Mods => Some(StartAction::Mods),
-                    MainAction::Settings => Some(StartAction::Settings),
-                    MainAction::Quit => Some(StartAction::Quit),
-                })
+                MenuModel::from_view(view, selected, |a| start_action(*a, facts))
             }
         }
     }
@@ -141,11 +132,6 @@ impl StartScreen for DefaultStart {
             Some(Msg::Pick(action)) => {
                 self.main.notice = None;
                 match action {
-                    MainAction::NewWorld => Some(StartAction::NewWorld),
-                    MainAction::Load(i) => facts
-                        .saves
-                        .get(i)
-                        .map(|slot| StartAction::Load(slot.id.clone())),
                     MainAction::Host => {
                         self.overlay = Some(Overlay::Host(Framed::new(HostMenu::new(facts.session))));
                         None
@@ -154,9 +140,7 @@ impl StartScreen for DefaultStart {
                         self.overlay = Some(Overlay::Join(Framed::new(JoinMenu::new(facts.session))));
                         None
                     }
-                    MainAction::Mods => Some(StartAction::Mods),
-                    MainAction::Settings => Some(StartAction::Settings),
-                    MainAction::Quit => Some(StartAction::Quit),
+                    other => start_action(other, facts),
                 }
             }
             Some(Msg::Back) => {
@@ -183,6 +167,20 @@ enum MainAction {
     Mods,
     Settings,
     Quit,
+}
+
+fn start_action(action: MainAction, facts: &StartFacts) -> Option<StartAction> {
+    match action {
+        MainAction::NewWorld => Some(StartAction::NewWorld),
+        MainAction::Load(i) => facts
+            .saves
+            .get(i)
+            .map(|slot| StartAction::Load(slot.id.clone())),
+        MainAction::Host | MainAction::Join => None,
+        MainAction::Mods => Some(StartAction::Mods),
+        MainAction::Settings => Some(StartAction::Settings),
+        MainAction::Quit => Some(StartAction::Quit),
+    }
 }
 
 impl MainMenu {
@@ -414,6 +412,7 @@ mod tests {
             saves: &[],
             mods: &[],
             session,
+            mods_save_error: None,
         }
     }
 

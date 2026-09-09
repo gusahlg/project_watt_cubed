@@ -100,48 +100,48 @@ pub struct ModelRow {
 
 impl MenuModel {
     pub fn from_view<A: Copy>(
-        view: &View<A>,
+        view: View<A>,
         selected: usize,
         mut to_action: impl FnMut(&A) -> Option<StartAction>,
     ) -> Self {
         let rows = view
             .rows
-            .iter()
+            .into_iter()
             .map(|r| ModelRow {
-                label: r.label.clone(),
-                detail: r.detail.clone(),
-                kind: r.kind.clone(),
+                label: r.label,
+                detail: r.detail,
+                kind: r.kind,
                 selectable: r.tag.is_some(),
                 action: r.tag.as_ref().and_then(&mut to_action),
             })
             .collect();
         Self {
-            title: view.title.clone(),
-            style: view.style.clone(),
+            title: view.title,
+            style: view.style,
             rows,
-            hint: view.hint.clone(),
-            notice: view.notice.clone(),
+            hint: view.hint,
+            notice: view.notice,
             selected,
         }
     }
 
-    pub fn to_presented(&self, scale: f32) -> PresentedView {
+    pub fn into_presented(self, scale: f32) -> PresentedView {
         PresentedView {
-            title: self.title.clone(),
-            style: self.style.clone(),
+            title: self.title,
+            style: self.style,
             rows: self
                 .rows
-                .iter()
+                .into_iter()
                 .map(|r| PresentedRow {
-                    label: r.label.clone(),
-                    detail: r.detail.clone(),
-                    kind: r.kind.clone(),
+                    label: r.label,
+                    detail: r.detail,
+                    kind: r.kind,
                     selectable: r.selectable,
                 })
                 .collect(),
             scale,
-            hint: self.hint.clone(),
-            notice: self.notice.clone(),
+            hint: self.hint,
+            notice: self.notice,
         }
     }
 
@@ -222,7 +222,7 @@ impl StartScreen for FallbackStart {
     fn view(&self, facts: &StartFacts) -> MenuModel {
         let view = self.page(facts);
         let selected = self.cursor.resolved(&view);
-        MenuModel::from_view(&view, selected, |a| self.commit(*a, facts))
+        MenuModel::from_view(view, selected, |a| self.commit(*a, facts))
     }
 
     fn update(&mut self, intents: &[Intent], facts: &StartFacts) -> Option<StartAction> {
@@ -279,8 +279,9 @@ impl Screen for StartRoot {
             notice: None,
         };
         let model = self.inner.view(&facts);
-        let pv = model.to_presented(ctx.settings.menu_scale);
-        theme.draw(f, &pv, model.selected, w, h);
+        let selected = model.selected;
+        let pv = model.into_presented(ctx.settings.menu_scale);
+        theme.draw(f, &pv, selected, w, h);
     }
 }
 

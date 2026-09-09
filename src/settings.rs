@@ -1066,7 +1066,7 @@ impl Settings {
         if let Some(dir) = Path::new(SETTINGS_PATH).parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let _ = fs::write(SETTINGS_PATH, self.to_text());
+        let _ = crate::save::write_atomic(Path::new(SETTINGS_PATH), self.to_text().as_bytes());
     }
 
     /// Force every field into its valid range. Safe to call repeatedly, and

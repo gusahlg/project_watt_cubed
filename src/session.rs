@@ -56,6 +56,6 @@ impl Session {
             "address={}\nport={}\nname={}\n",
             self.address, self.port, self.name
         );
-        let _ = fs::write(SESSION_PATH, text);
+        let _ = crate::save::write_atomic(Path::new(SESSION_PATH), text.as_bytes());
     }
 }

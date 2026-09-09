@@ -7,7 +7,7 @@
 //! closure to [`voxel_engine::run`], which is the moral equivalent of the old
 //! raylib `while !window_should_close()` loop.
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{Color, DVec3, Engine};
 
@@ -19,7 +19,7 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::mods::Mods;
+use crate::mods::{ChoicesFlush, Mods};
 use crate::net::client::Connection;
 use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
@@ -84,6 +84,12 @@ pub struct App {
     /// Gameplay reports facts, this decides sounds. Owns the mic and all
     /// trace-derived state.
     audio: AudioDirector,
+    /// Debounces `saves/mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
+    choices_flush: ChoicesFlush,
+    clock: Instant,
+    /// True while the Mods screen is on the menu stack.
+    mods_open: bool,
+    mods_save_error: Option<String>,
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -165,6 +171,27 @@ impl App {
             sound,
             cues,
             audio,
+            choices_flush: ChoicesFlush::new(),
+            clock: Instant::now(),
+            mods_open: false,
+            mods_save_error: None,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64
+    }
+
+    fn persist_mod_choices(&mut self) {
+        match self.mods.save_choices() {
+            Ok(()) => self.mods_save_error = None,
+            Err(e) => self.mods_save_error = Some(e.to_string()),
+        }
+    }
+
+    fn flush_mod_choices_if_dirty(&mut self) {
+        if self.choices_flush.take() {
+            self.persist_mod_choices();
         }
     }
 
@@ -209,6 +236,7 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
+            self.flush_mod_choices_if_dirty();
             self.flush_save();
             return false;
         }
@@ -230,6 +258,7 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
+            self.flush_mod_choices_if_dirty();
             self.flush_save();
             return false;
         }
@@ -393,7 +422,13 @@ impl App {
         }
         // A per-frame snapshot so a menu never holds a live `&Mods`.
         let mods = ModRow::snapshot(&self.mods);
+        let mods_save_error = self.mods_save_error.clone();
         let before = self.settings.clone();
+        let depth_before = match &self.screen {
+            Screen::Menus(stack) => stack.depth(),
+            _ => 0,
+        };
+        let now_ms = self.now_ms();
         let mut effect = None;
         if let Screen::Menus(stack) = &mut self.screen {
             let mut ctx = Ctx {
@@ -401,6 +436,7 @@ impl App {
                 saves: &self.saves,
                 mods: &mods,
                 session: &self.session,
+                mods_save_error: mods_save_error.as_deref(),
             };
             effect = stack.update(&intents, &mut ctx);
         }
@@ -409,10 +445,24 @@ impl App {
             self.settings.save();
             self.sound.set_mix(self.settings.mix_change());
         }
-        match effect {
+        if self.mods_open {
+            let depth_after = match &self.screen {
+                Screen::Menus(stack) => stack.depth(),
+                _ => 0,
+            };
+            if depth_after < depth_before {
+                self.mods_open = false;
+                self.flush_mod_choices_if_dirty();
+            }
+        }
+        let quit = match effect {
             Some(effect) => self.handle_effect(eng, effect),
             None => false,
+        };
+        if self.choices_flush.poll(now_ms) {
+            self.persist_mod_choices();
         }
+        quit
     }
 
     /// Interpret one menu effect. Returns `true` only for Quit.
@@ -441,11 +491,12 @@ impl App {
             AppEffect::Mods => {
                 if let Screen::Menus(stack) = &mut self.screen {
                     stack.push(Framed::boxed(ModsMenu));
+                    self.mods_open = true;
                 }
             }
             AppEffect::ToggleMod(index) => {
                 self.mods.toggle(index);
-                self.mods.save_choices();
+                self.choices_flush.mark(self.now_ms());
             }
             AppEffect::StepModKnob {
                 mod_index,
@@ -453,13 +504,16 @@ impl App {
                 delta,
             } => {
                 self.mods.step_knob(mod_index, knob, delta);
-                self.mods.save_choices();
+                self.choices_flush.mark(self.now_ms());
             }
             AppEffect::SetGroup { id, on } => {
                 self.mods.set_group_enabled(id, on);
-                self.mods.save_choices();
+                self.choices_flush.mark(self.now_ms());
             }
-            AppEffect::Quit => return true,
+            AppEffect::Quit => {
+                self.flush_mod_choices_if_dirty();
+                return true;
+            }
         }
         false
     }
@@ -771,6 +825,7 @@ impl App {
                 saves: &self.saves,
                 mods: &mods,
                 session: &self.session,
+                mods_save_error: self.mods_save_error.as_deref(),
             };
             stack.draw(&ctx, theme, &mut f, w, h);
         }

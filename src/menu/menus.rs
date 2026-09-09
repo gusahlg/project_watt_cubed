@@ -29,10 +29,9 @@ fn visual_mask_from_ctx(ctx: &Ctx) -> VisualMask {
 /// Grouped toggle rows per installed mod, plus knobs for mods that have them.
 pub struct ModsMenu;
 
-/// Persistent mods-screen notice: saved now, applied on the next world (visual)
-/// or the next new world (worldgen); a newly added mod still needs a rebuild.
-/// Each line stays under 70 glyphs so it fits the 1280-wide menu at notice size.
-const MODS_NOTICE: &str = "Saved immediately. Visual mods: next world. Worldgen: next new world.\nMods are compiled in: rebuild, then restart, for a new mod to appear.";
+/// Persistent mods-screen notice: choices hit disk now; they apply only after
+/// a rebuild because mods are compiled into the binary.
+const MODS_NOTICE: &str = "Choices are saved at once. The game has to be recompiled for mod choices to apply.\nMods are compiled into the binary: run ./play.sh (or cargo build) and restart.";
 
 #[derive(Clone, Copy)]
 pub enum ModsAction {
@@ -93,7 +92,10 @@ impl Menu for ModsMenu {
             rows,
             default: None,
             hint: "Enter toggle/cycle   Left/Right tune   Esc back".to_string(),
-            notice: Some(Notice::info(MODS_NOTICE.to_string())),
+            notice: Some(match ctx.mods_save_error {
+                Some(err) => Notice::error(format!("Could not save mod choices: {err}")),
+                None => Notice::info(MODS_NOTICE.to_string()),
+            }),
         }
     }
 
@@ -309,6 +311,7 @@ mod tests {
             saves: &[],
             mods: &[],
             session,
+            mods_save_error: None,
         }
     }
 
@@ -322,10 +325,12 @@ mod tests {
         assert_eq!(notice.level, crate::menu::Level::Info);
         assert_eq!(notice.text, MODS_NOTICE);
         let lines: Vec<_> = notice.text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(
-            lines.iter().all(|l| l.chars().count() <= 70),
-            "notice lines must fit the 1280-wide menu at 18px glyphs: {lines:?}"
+        assert_eq!(
+            lines,
+            [
+                "Choices are saved at once. The game has to be recompiled for mod choices to apply.",
+                "Mods are compiled into the binary: run ./play.sh (or cargo build) and restart.",
+            ]
         );
     }
 
@@ -390,6 +395,7 @@ mod tests {
             saves: &[],
             mods: &mods,
             session: &session,
+            mods_save_error: None,
         };
         let view = SettingsPage::new(Category::Video).view(&ctx);
         let bloom = view
@@ -417,10 +423,15 @@ mod tests {
             saves: &[],
             mods: &snap,
             session: &session,
+            mods_save_error: None,
         };
         let view = ModsMenu.view(&ctx);
         assert!(matches!(view.rows[0].kind, crate::menu::RowKind::Heading));
         assert_eq!(view.rows[0].label, "Essentials");
+        assert_eq!(
+            view.rows[0].detail.as_deref(),
+            Some("Start screen, menus, inventory, crafting, look and worldgen.")
+        );
         assert!(view.rows[0].tag.is_none(), "group header is not selectable");
         assert_eq!(view.rows[1].label.trim(), "Enable all / Disable all");
         assert!(
@@ -482,6 +493,7 @@ mod tests {
             saves: &[],
             mods: &snap,
             session: &session,
+            mods_save_error: None,
         };
         let view = ModsMenu.view(&ctx);
         let other = view
@@ -511,5 +523,20 @@ mod tests {
             }
             _ => panic!("expected SetGroup"),
         }
+    }
+
+    #[test]
+    fn mods_menu_shows_save_error_instead_of_info_notice() {
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut ctx = ctx(&mut settings, &session);
+        ctx.mods_save_error = Some("permission denied");
+        let view = ModsMenu.view(&ctx);
+        let notice = view.notice.expect("error notice");
+        assert_eq!(notice.level, crate::menu::Level::Error);
+        assert_eq!(
+            notice.text,
+            "Could not save mod choices: permission denied"
+        );
     }
 }

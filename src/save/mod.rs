@@ -14,7 +14,7 @@ pub mod store;
 pub use autosave::{Autosaver, Tick};
 pub use bridge::{LoadReport, encode_current, load, save, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
-pub use store::{Source, fresh_id, list};
+pub use store::{Source, fresh_id, list, write_atomic};
 
 use crate::block::{AIR, BlockId, BlockRegistry, Composition};
 use crate::world::World;

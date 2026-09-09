@@ -2,7 +2,7 @@
 use voxel_engine::{Color, Frame};
 
 use crate::menu::{Level, Notice, RowKind, Style, ValueView};
-use crate::ui::shadowed;
+use crate::ui::{ellipsize, shadowed};
 
 const MENU_BG: Color = Color::new(18, 20, 28, 255);
 
@@ -161,14 +161,23 @@ fn draw_panel(f: &mut Frame, v: &PresentedView, sel: usize, w: i32, h: i32) {
         shadowed(f, "  (nothing here)", m.x, m.start_y, m.fs, Color::GRAY);
     }
     let detail_fs = (m.line_h - m.fs - 2).clamp(8, 16);
+    let panel_w = m.fs * 20;
+    let indent = m.fs * 3 / 2;
     for (i, row) in v.rows.iter().enumerate() {
         let selected = i == sel;
         let y = m.start_y + m.line_h * i as i32;
         shadowed(f, &row_body(row, selected), m.x, y, m.fs, row_color(row, selected));
         if let Some(detail) = &row.detail {
-            shadowed(f, detail, m.x + m.fs * 3 / 2, y + m.fs + 2, detail_fs, Color::DARKGRAY);
+            let clipped = clip_detail(detail, panel_w, indent, detail_fs);
+            shadowed(f, &clipped, m.x + indent, y + m.fs + 2, detail_fs, Color::DARKGRAY);
         }
     }
+}
+
+/// Glyphs that fit in the panel after the detail indent (font advances `fs` px).
+fn clip_detail(detail: &str, panel_w: i32, indent: i32, detail_fs: i32) -> std::borrow::Cow<'_, str> {
+    let max = (panel_w.saturating_sub(indent).max(0) / detail_fs.max(1)) as usize;
+    ellipsize(detail, max)
 }
 
 fn row_body(row: &PresentedRow, selected: bool) -> String {
@@ -250,5 +259,22 @@ fn draw_notice(f: &mut Frame, v: &PresentedView, w: i32, h: i32) {
             let from_bottom = (lines.len() - i) as i32 * step;
             shadowed(f, line, x, h - 40 - from_bottom, fs, color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_detail;
+
+    #[test]
+    fn clip_detail_fits_panel_width() {
+        // 100px panel, 0 indent, 10px glyphs → 10 characters.
+        assert_eq!(clip_detail("short", 100, 0, 10), "short");
+        assert_eq!(clip_detail("abcdefghijk", 100, 0, 10), "abcdefg...");
+        let long = "Start screen, menus, inventory, crafting, look and worldgen.";
+        let clipped = clip_detail(long, 20 * 26, 26 * 3 / 2, 16);
+        let max = ((20 * 26 - 26 * 3 / 2) / 16) as usize;
+        assert!(clipped.chars().count() <= max);
+        assert!(clipped.ends_with("...") || clipped.chars().count() <= max);
     }
 }

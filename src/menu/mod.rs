@@ -237,6 +237,8 @@ pub struct Ctx<'a> {
     pub saves: &'a [crate::save::Slot],
     pub mods: &'a [ModRow],
     pub session: &'a Session,
+    /// Last `mods.cfg` write error, shown on the Mods screen.
+    pub mods_save_error: Option<&'a str>,
 }
 
 /// Pure view, effectful update.
@@ -380,6 +382,10 @@ impl MenuStack {
 
     pub fn push(&mut self, screen: Box<dyn Screen>) {
         self.frames.push(screen);
+    }
+
+    pub fn depth(&self) -> usize {
+        self.frames.len()
     }
 
     pub fn draw(&self, ctx: &Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {

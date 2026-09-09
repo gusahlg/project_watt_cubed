@@ -17,6 +17,7 @@ pub mod visuals;
 
 use std::cell::Cell;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -323,7 +324,7 @@ impl Mods {
     pub const GROUPS: &[Group] = &[Group {
         id: ESSENTIALS,
         name: "Essentials",
-        description: "The built-in mods that make the game playable as shipped: the start screen, menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core.",
+        description: "Start screen, menus, inventory, crafting, look and worldgen.",
     }];
 
     /// The default install: the menu mod (look/feel of every out-of-game
@@ -672,17 +673,56 @@ impl Mods {
         }
     }
 
-    /// Best-effort write of enable/disable choices and knob payloads. Bench-env
-    /// pins are not written from startup; only a later toggle or knob step persists.
-    pub fn save_choices(&self) {
-        self.save_choices_to(Path::new(CHOICES_PATH));
+    /// Write enable/disable choices and knob payloads. Bench-env pins are not
+    /// written from startup; only a later toggle or knob step persists.
+    pub fn save_choices(&self) -> io::Result<()> {
+        self.save_choices_to(Path::new(CHOICES_PATH))
     }
 
-    fn save_choices_to(&self, path: &Path) {
+    fn save_choices_to(&self, path: &Path) -> io::Result<()> {
         if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
+            fs::create_dir_all(dir)?;
         }
-        let _ = fs::write(path, self.choices_text());
+        crate::save::write_atomic(path, self.choices_text().as_bytes())
+    }
+}
+
+/// Debounces `mods.cfg` writes so a held Left/Right does not rewrite at key-repeat rate.
+pub struct ChoicesFlush {
+    last_ms: Option<u64>,
+}
+
+impl ChoicesFlush {
+    pub const IDLE_MS: u64 = 250;
+
+    pub fn new() -> Self {
+        Self { last_ms: None }
+    }
+
+    pub fn mark(&mut self, now_ms: u64) {
+        self.last_ms = Some(now_ms);
+    }
+
+    /// True (and clears) when [`IDLE_MS`] has passed with no further marks.
+    pub fn poll(&mut self, now_ms: u64) -> bool {
+        match self.last_ms {
+            Some(t) if now_ms.saturating_sub(t) >= Self::IDLE_MS => {
+                self.last_ms = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True (and clears) if a write is pending — leave Mods / quit.
+    pub fn take(&mut self) -> bool {
+        self.last_ms.take().is_some()
+    }
+}
+
+impl Default for ChoicesFlush {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -939,7 +979,13 @@ mod tests {
         mods.step_knob(i, 0, 1);
         mods.step_knob(i, 1, 1);
         let cfg = payload_cfg(&mods);
-        mods.save_choices_to(&path);
+        mods.save_choices_to(&path).unwrap();
+        let tmp = {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".tmp");
+            std::path::PathBuf::from(name)
+        };
+        assert!(!tmp.exists(), "atomic save must not leave a .tmp");
 
         let mut fresh = Mods::with_defaults();
         fresh.load_choices_from(&path);
@@ -997,7 +1043,7 @@ mod tests {
     fn apply_bench_env_does_not_write_choices() {
         let path = temp_choices_path();
         let mut mods = Mods::with_defaults();
-        mods.save_choices_to(&path);
+        mods.save_choices_to(&path).unwrap();
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("diffusion=off"));
         mods.apply_bench_env(Some(true), Some(true));
@@ -1016,7 +1062,12 @@ mod tests {
         assert_eq!(g.name, "Essentials");
         assert_eq!(
             g.description,
-            "The built-in mods that make the game playable as shipped: the start screen, menus, inventory, crafting, the shipped look, and the alternative worldgen. Disable any of them to see the bare core."
+            "Start screen, menus, inventory, crafting, look and worldgen."
+        );
+        assert!(
+            g.description.chars().count() <= 60,
+            "group description must fit the mods panel: {} chars",
+            g.description.chars().count()
         );
         let members: Vec<&str> = (0..mods.len())
             .filter(|&i| mods.group(i) == ESSENTIALS)
@@ -1063,7 +1114,7 @@ mod tests {
             !text.lines().any(|l| l.starts_with("essentials=")),
             "group toggle must not write a group-level key"
         );
-        mods.save_choices_to(&path);
+        mods.save_choices_to(&path).unwrap();
 
         let mut fresh = Mods::with_defaults();
         fresh.load_choices_from(&path);
@@ -1120,6 +1171,7 @@ mod tests {
             saves: &[],
             mods: &snap,
             session: &session,
+            mods_save_error: None,
         };
         let view = crate::menu::menus::ModsMenu.view(&ctx);
         let pv = crate::menu::present(&view, 1.0);
@@ -1130,5 +1182,25 @@ mod tests {
         cursor.normalize(&view);
         assert!(view.is_selectable(cursor.index));
         assert_ne!(cursor.index, 0, "cursor must skip the group header");
+    }
+
+    #[test]
+    fn choices_flush_waits_250ms_then_resets_on_mark() {
+        let mut flush = ChoicesFlush::new();
+        assert!(!flush.poll(0));
+        flush.mark(0);
+        assert!(!flush.poll(249));
+        assert!(flush.poll(250));
+        assert!(!flush.poll(500), "already flushed");
+
+        flush.mark(0);
+        flush.mark(200);
+        assert!(!flush.poll(449));
+        assert!(flush.poll(450));
+
+        flush.mark(10);
+        assert!(flush.take());
+        assert!(!flush.take());
+        assert!(!flush.poll(10 + ChoicesFlush::IDLE_MS));
     }
 }
