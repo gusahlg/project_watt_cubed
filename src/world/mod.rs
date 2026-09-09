@@ -686,6 +686,9 @@ pub struct World {
     /// data box has columns to request. Raised on a boundary cross and by a
     /// generate strike-out re-request; drained when the box is fully requested.
     pending_gen: Sticky,
+    /// Outstanding spawn/teleport collision slab. `None` once every chunk has
+    /// loaded (or never requested). Physics waits on [`spawn_ready`](Self::spawn_ready).
+    spawn_slab: Option<ChunkBox>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
     upload_queue: VecDeque<(Coord, u32, pipeline::MeshOutput)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
@@ -937,10 +940,11 @@ impl World {
 
     /// Construct without synchronously generating the full origin data box.
     /// Interactive startup uses this path and calls
-    /// [`prepare_around`](Self::prepare_around) for the small collision-safe
-    /// spawn slab; streaming fills the remainder asynchronously. Existing
-    /// constructors retain eager data for tests and headless callers that
-    /// query the origin before their first stream.
+    /// [`prepare_around`](Self::prepare_around) to *request* the collision-safe
+    /// spawn slab (worker-pool columns; [`spawn_ready`](Self::spawn_ready)
+    /// becomes true once they land). Streaming fills the remainder.
+    /// Existing constructors retain eager data for tests and headless callers
+    /// that query the origin before their first stream.
     pub fn with_config_lazy(seed: i64, render: crate::render_config::RenderConfig) -> Self {
         Self::with_kind(seed, render, WorldgenKind::Classic, false)
     }
@@ -998,6 +1002,7 @@ impl World {
             gen_columns: Vec::new(),
             generating: FastSet::default(),
             pending_gen: Sticky::default(),
+            spawn_slab: None,
             upload_queue: VecDeque::new(),
             mesh_worklist: FastSet::default(),
             light_pending: Sticky::default(),

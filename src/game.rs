@@ -3,7 +3,7 @@
 //! The window and the menu/play state machine live one level up in [`app`](crate::app);
 //! a `Game` is handed the engine each frame and reports back whether to keep playing
 //! or return to the menu.
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod draw;
 
@@ -284,6 +284,20 @@ pub struct Game {
     // allocator work for these.
     placement_scratch: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
     peer_pose_scratch: Vec<PeerPose>,
+    /// Last frame's named-phase durations, for the stall detector.
+    phases: FramePhases,
+}
+
+/// Durations of `Game::update` phases, sampled every frame for stall logs.
+#[derive(Clone, Copy, Default)]
+struct FramePhases {
+    net: Duration,
+    input: Duration,
+    overlay: Duration,
+    motion: Duration,
+    interact: Duration,
+    stream: Duration,
+    audio: Duration,
 }
 
 impl Game {
@@ -351,6 +365,7 @@ impl Game {
             drawing: draw::DrawState::new(),
             placement_scratch: Vec::new(),
             peer_pose_scratch: Vec::new(),
+            phases: FramePhases::default(),
         }
     }
 
@@ -601,16 +616,22 @@ impl Game {
         // underwater bed, voice sessions — the director DERIVES from the readout.
         let mut events: Vec<SoundEvent> = Vec::new();
 
+        self.phases = FramePhases::default();
+        let t = Instant::now();
         if let Some(signal) = self.net_phase(mods, &mut events) {
             return signal;
         }
+        self.phases.net = t.elapsed();
+        let t = Instant::now();
         let input = self.input_phase(eng, router, dt);
-        // The overlay may consume the frame (console typing, opening chat): movement,
-        // interaction and streaming run only on an unconsumed ("active") frame, exactly
-        // as before. Audio, though, commits EVERY frame so voice/emitters/faults — and
-        // the `/voicetest` cue submitted while the console is open — stay live; only a
-        // real exit short-circuits it.
-        let active = match self.overlay_phase(OverlayPhase {
+        self.phases.input = t.elapsed();
+        // The overlay may consume the frame (console typing, opening chat): movement
+        // and interaction run only on an unconsumed frame. Streaming still runs
+        // while a spawn/teleport slab is outstanding so loading progresses with
+        // the console open. Audio commits EVERY frame; only a real exit
+        // short-circuits it.
+        let t = Instant::now();
+        let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
             eng,
             router,
@@ -618,16 +639,29 @@ impl Game {
             settings,
             sound,
             events: &mut events,
-        }) {
+        });
+        self.phases.overlay = t.elapsed();
+        let consumed = match overlay {
             Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
-            Some(Signal::Continue) => false,
-            None => {
-                let detached = self.motion_phase(&input, dt);
-                self.interact_phase(&input, detached, dt, eng, mods, &mut events);
-                self.stream_phase(eng, dt);
-                true
-            }
+            Some(Signal::Continue) => true,
+            None => false,
         };
+        let ready = self.world.spawn_ready();
+        if !consumed && ready {
+            let t = Instant::now();
+            let detached = self.motion_phase(&input, dt);
+            self.phases.motion = t.elapsed();
+            let t = Instant::now();
+            self.interact_phase(&input, detached, dt, eng, mods, &mut events);
+            self.phases.interact = t.elapsed();
+        }
+        if !consumed || !ready {
+            let t = Instant::now();
+            self.stream_phase(eng, dt);
+            self.phases.stream = t.elapsed();
+        }
+        let active = !consumed;
+        let t = Instant::now();
         self.commit_audio(AudioPhase {
             dt,
             input: &input,
@@ -637,7 +671,23 @@ impl Game {
             events,
             active,
         });
+        self.phases.audio = t.elapsed();
         Signal::Continue
+    }
+
+    /// Last frame's named-phase timings, for the stall detector.
+    pub(crate) fn phase_debug(&self) -> String {
+        let p = &self.phases;
+        format!(
+            "net={:.1}ms input={:.1}ms overlay={:.1}ms motion={:.1}ms interact={:.1}ms stream={:.1}ms audio={:.1}ms",
+            p.net.as_secs_f64() * 1000.0,
+            p.input.as_secs_f64() * 1000.0,
+            p.overlay.as_secs_f64() * 1000.0,
+            p.motion.as_secs_f64() * 1000.0,
+            p.interact.as_secs_f64() * 1000.0,
+            p.stream.as_secs_f64() * 1000.0,
+            p.audio.as_secs_f64() * 1000.0,
+        )
     }
 
     /// Drain server events and send our heartbeat. `Some(ExitToMenu)` when the
@@ -834,8 +884,8 @@ impl Game {
         if eng.is_key_pressed(Key::F6) {
             // Reattaching after the rig flew far away resumes physics at the
             // frozen player, whose chunks may have streamed out (the centre
-            // followed the camera). Restore the collision halo synchronously
-            // BEFORE the toggle so the first reattached step never runs
+            // followed the camera). Request the collision slab and freeze
+            // physics until it lands so the first reattached step never runs
             // against unloaded air.
             if self.camera.free_rig().is_some() {
                 self.world.prepare_around(self.player.position);
@@ -1172,7 +1222,9 @@ impl Game {
                 }
                 Incoming::Position { pos } => {
                     // Authoritative snap-back (refused teleport or implausible
-                    // move): land safely, exactly like a local teleport.
+                    // move): request the collision slab and freeze until it
+                    // lands, exactly like a local teleport. The server's
+                    // MOVE_WINDOW_CAP_SECS envelope tolerates a brief pause.
                     self.world.prepare_around(pos);
                     self.player.position = pos;
                     self.player.cancel_fall();
@@ -1427,8 +1479,11 @@ fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameInput, PendingModInput};
-    use voxel_engine::Vec2;
+    use super::{FrameInput, Game, PendingModInput};
+    use crate::player::Player;
+    use crate::render_config::RenderConfig;
+    use crate::world::World;
+    use voxel_engine::{DVec3, Vec2};
 
     #[test]
     fn inert_frame_input_matches_default_and_carries_no_edges() {
@@ -1455,5 +1510,22 @@ mod tests {
         // overlay_phase returns Some only for text, Escape, or console-open edges.
         let inert = FrameInput::inert();
         assert!(!inert.is_text && !inert.g_escape && !inert.open_console && !inert.open_chat);
+    }
+
+    #[test]
+    fn game_gates_physics_on_spawn_ready() {
+        let world = World::with_config_lazy(1, RenderConfig::default());
+        let pos = DVec3::new(0.5, 80.0, 0.5);
+        let mut game = Game::new(world, Player::new(pos), "gate".to_string());
+        game.world_mut().prepare_around(pos);
+        assert!(
+            !game.world().spawn_ready(),
+            "Game::update must not run motion/interact until the slab lands"
+        );
+        let before = game.player().position;
+        if game.world().spawn_ready() {
+            game.player_mut().position.y -= 1.0;
+        }
+        assert_eq!(game.player().position, before);
     }
 }

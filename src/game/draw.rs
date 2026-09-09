@@ -388,7 +388,19 @@ impl Game {
 
         // Informational HUD text: coords, help, FPS, player count. Full mode
         // only — read from the `Game`-side caches `refresh_hud_text` maintains.
-        if theme.hud.shows_info() {
+        // Loading covers Full and Minimal (not Off) until the spawn slab lands.
+        if !self.world.spawn_ready() && theme.hud.shows_world_ui() {
+            ui::label(
+                f,
+                theme,
+                screen,
+                Anchor::Top,
+                (0, 12),
+                26,
+                ui::Role::Primary.color(),
+                "Loading terrain…",
+            );
+        } else if theme.hud.shows_info() {
             if let Some(coord_text) = self.drawing.coord_cache.get() {
                 ui::label(
                     f,

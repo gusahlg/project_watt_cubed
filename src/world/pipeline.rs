@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use super::Coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::diffusion::Generator;
+use super::generation::ColumnHeights;
 #[cfg(test)]
 use super::generation::SineHills;
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
@@ -179,10 +180,13 @@ impl JobKey {
 /// Finished work returned to the main thread.
 pub(in crate::world) enum Done {
     /// A generated column: every chunk built for the requested `cy` range,
-    /// paired with its coord. Landed together and stored in one drain step.
+    /// paired with its coord, plus the 256 ground heights (boxed so
+    /// `size_of::<Done>()` stays ≤ 128). Landed together and stored in one
+    /// drain step.
     Column {
         col: (i32, i32),
         chunks: Vec<(Coord, Chunk)>,
+        heights: Box<ColumnHeights>,
     },
     /// Boxed: `ChunkMeshData` is ~530 B inline (three passes × Vec headers ×
     /// six index buckets), and it dominated the whole enum — every channel
@@ -1074,8 +1078,8 @@ fn run(job: Job) -> Done {
             let (cx, cz) = col;
             // Share the column profile across the whole run, then replay each
             // chunk's edit overlay — voxel-identical to per-chunk generation.
-            let chunks = generator
-                .generate_column(cx, cz, cy)
+            let (generated, heights) = generator.generate_column(cx, cz, cy);
+            let chunks = generated
                 .into_iter()
                 .map(|(cyy, data)| {
                     let coord = Coord::new(cx, cyy, cz);
@@ -1088,7 +1092,11 @@ fn run(job: Job) -> Done {
                     (coord, chunk)
                 })
                 .collect();
-            Done::Column { col, chunks }
+            Done::Column {
+                col,
+                chunks,
+                heights: Box::new(heights),
+            }
         }
         Job::Mesh {
             coord,
@@ -1218,10 +1226,21 @@ mod tests {
             .results
             .recv_timeout(Duration::from_secs(10))
             .expect("worker finished");
-        let Done::Column { col, chunks } = done else {
+        let Done::Column { col, chunks, heights } = done else {
             panic!("expected a column result");
         };
         assert_eq!(col, (coord.x, coord.z));
+        let x0 = coord.x * CHUNK_SIZE as i32;
+        let z0 = coord.z * CHUNK_SIZE as i32;
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                assert_eq!(
+                    heights[lx + lz * CHUNK_SIZE],
+                    generator.height(x0 + lx as i32, z0 + lz as i32),
+                    "worker heights match height()"
+                );
+            }
+        }
         let chunk = &chunks
             .iter()
             .find(|(c, _)| *c == coord)

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use infinite_field::{InfiniteField, Score, Spec};
 
 use super::chunk::{CHUNK_SIZE, ChunkData};
-use super::generation::{cell_hash, TerrainGenerator};
+use super::generation::{cell_hash, ColumnHeights, TerrainGenerator};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
@@ -238,6 +238,20 @@ impl TerrainGenerator for DiffusionTerrain {
         self.column(wx, wz).height
     }
 
+    fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
+        let x0 = cx * CHUNK_SIZE as i32;
+        let z0 = cz * CHUNK_SIZE as i32;
+        let mut ch0 = [0.0f32; CHUNK_SIZE * CHUNK_SIZE];
+        self.field
+            .fill_ch0(x0, z0, CHUNK_SIZE as u32, CHUNK_SIZE as u32, &mut ch0);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+            let elev = (ch0[i] * 2.0 - 1.0) * 36.0;
+            heights[i] = (self.sea as f32 + elev).round() as i32;
+        }
+        heights
+    }
+
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
         let c = self.column(wx, wz);
         self.dress(&c, wx, wz)
@@ -278,6 +292,7 @@ impl TerrainGenerator for DiffusionTerrain {
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         self.generate_column(cx, cz, cy..=cy)
+            .0
             .into_iter()
             .next()
             .map(|(_, data)| data)
@@ -289,7 +304,7 @@ impl TerrainGenerator for DiffusionTerrain {
         cx: i32,
         cz: i32,
         cy: std::ops::RangeInclusive<i32>,
-    ) -> Vec<(i32, ChunkData)> {
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
         let x0 = cx * CHUNK_SIZE as i32;
         let z0 = cz * CHUNK_SIZE as i32;
         let mut cols = [[Col {
@@ -299,45 +314,50 @@ impl TerrainGenerator for DiffusionTerrain {
             humid: 0.5,
             cave: 0.0,
         }; CHUNK_SIZE]; CHUNK_SIZE];
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                cols[lz][lx] = self.column(x0 + lx as i32, z0 + lz as i32);
-            }
-        }
+        let mut buf = [0.0f32; CHUNK_SIZE * CHUNK_SIZE * 4];
+        self.field
+            .fill_all(x0, z0, CHUNK_SIZE as u32, CHUNK_SIZE as u32, &mut buf);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         let mut max_top = i32::MIN;
         let mut min_h = i32::MAX;
-        for row in &cols {
-            for c in row {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let i = (lz * CHUNK_SIZE + lx) * 4;
+                let c = self.col_from_ch(&buf[i..i + 4]);
+                heights[lx + lz * CHUNK_SIZE] = c.height;
                 max_top = max_top.max(c.height.max(c.water));
                 min_h = min_h.min(c.height);
+                cols[lz][lx] = c;
             }
         }
         let deep_cut = min_h - self.mat.max_scattered_depth.max(48);
-        cy.map(|cyy| {
-            let y0 = cyy * CHUNK_SIZE as i32;
-            let y1 = y0 + CHUNK_SIZE as i32;
-            if y0 >= max_top {
-                return (cyy, ChunkData::Uniform(AIR));
-            }
-            if y1 <= deep_cut {
-                return (cyy, ChunkData::Uniform(self.mat.stone));
-            }
-            let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
-            for lz in 0..CHUNK_SIZE {
-                for lx in 0..CHUNK_SIZE {
-                    let c = &cols[lz][lx];
-                    let wx = x0 + lx as i32;
-                    let wz = z0 + lz as i32;
-                    for ly in 0..CHUNK_SIZE {
-                        let wy = y0 + ly as i32;
-                        cells[super::chunk::Chunk::index(lx, ly, lz)] =
-                            self.cell(c, wx, wy, wz);
+        let chunks = cy
+            .map(|cyy| {
+                let y0 = cyy * CHUNK_SIZE as i32;
+                let y1 = y0 + CHUNK_SIZE as i32;
+                if y0 >= max_top {
+                    return (cyy, ChunkData::Uniform(AIR));
+                }
+                if y1 <= deep_cut {
+                    return (cyy, ChunkData::Uniform(self.mat.stone));
+                }
+                let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let c = &cols[lz][lx];
+                        let wx = x0 + lx as i32;
+                        let wz = z0 + lz as i32;
+                        for ly in 0..CHUNK_SIZE {
+                            let wy = y0 + ly as i32;
+                            cells[super::chunk::Chunk::index(lx, ly, lz)] =
+                                self.cell(c, wx, wy, wz);
+                        }
                     }
                 }
-            }
-            (cyy, ChunkData::from_cells(cells))
-        })
-        .collect()
+                (cyy, ChunkData::from_cells(cells))
+            })
+            .collect();
+        (chunks, heights)
     }
 }
 
@@ -390,8 +410,36 @@ mod tests {
     fn generate_matches_generate_column() {
         let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 3);
         let a = g.generate(1, 0, -2);
-        let b = g.generate_column(1, -2, 0..=0);
+        let (b, _) = g.generate_column(1, -2, 0..=0);
         assert_eq!(a, b[0].1);
+    }
+
+    #[test]
+    fn generate_column_heights_match_height() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 7);
+        super::super::generation::assert_generate_column_heights_match_height(
+            &g,
+            &[(0, 0), (2, -3), (-1, 7), (4, 4)],
+        );
+    }
+
+    #[test]
+    fn heights_16_matches_height() {
+        let g = DiffusionTerrain::new(&mut BlockRegistry::with_builtins(), DiffusionCfg::default(), 11);
+        for &(cx, cz) in &[(0, 0), (2, -3), (-1, 7)] {
+            let batch = g.heights_16(cx, cz);
+            let x0 = cx * CHUNK_SIZE as i32;
+            let z0 = cz * CHUNK_SIZE as i32;
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    assert_eq!(
+                        batch[lx + lz * CHUNK_SIZE],
+                        g.height(x0 + lx as i32, z0 + lz as i32),
+                        "cx={cx} cz={cz} lx={lx} lz={lz}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -419,6 +467,63 @@ mod tests {
         }
     }
 
+    fn chunk_data_bytes(data: &ChunkData) -> Vec<u8> {
+        match data {
+            ChunkData::Uniform(id) => {
+                let mut b = vec![0u8];
+                b.extend_from_slice(&id.0.to_le_bytes());
+                b
+            }
+            ChunkData::Paletted { palette, cells } => {
+                let mut b = vec![1u8];
+                b.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+                for p in palette {
+                    b.extend_from_slice(&p.0.to_le_bytes());
+                }
+                b.extend_from_slice(&cells[..]);
+                b
+            }
+            ChunkData::Dense(cells) => {
+                let mut b = vec![2u8];
+                for id in cells.iter() {
+                    b.extend_from_slice(&id.0.to_le_bytes());
+                }
+                b
+            }
+        }
+    }
+
+    /// Pin `fnv1a_32` over six fixed seed-42 chunks. Values locked before the
+    /// batch-sample pass; a mismatch means generated `ChunkData` bytes moved.
+    #[test]
+    fn diffusion_chunk_byte_pin() {
+        use crate::hash::fnv1a_32;
+        let g = DiffusionTerrain::new(
+            &mut BlockRegistry::with_builtins(),
+            DiffusionCfg::default(),
+            42,
+        );
+        // surface, lake column, cave band, deep, two far coords.
+        let pins: [(&str, i32, i32, i32, u32); 6] = [
+            ("surface", 0, 1, 0, 0x600ae405),
+            ("lake", -22, 1, -24, 0xb779cebf),
+            ("cave", -24, -3, -24, 0xafa3e00c),
+            ("deep", 0, -20, 0, 0x24ae7d4e),
+            ("far_a", 6_250_000, 0, 0, 0x1932d2a2),
+            ("far_b", -6_250_000, -2, 3, 0x24fd3019),
+        ];
+        for (name, cx, cy, cz, want) in pins {
+            assert_eq!(
+                fnv1a_32(&chunk_data_bytes(&g.generate(cx, cy, cz))),
+                want,
+                "{name} ({cx},{cy},{cz})"
+            );
+        }
+    }
+
+    /// Column generation cost, n=24 columns × 4 layers.
+    /// Before batching: classic=140.3ms diffusion=401.8ms ratio=2.86.
+    /// After batching: classic=141.8ms diffusion=176.7ms ratio=1.25 (2.27× vs before).
     #[test]
     #[ignore]
     fn worldgen_column_cost() {

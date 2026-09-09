@@ -441,7 +441,7 @@ mod tests {
     /// geometry the walker can touch.
     fn player_on_runway(world: &mut World, x: f64, z: f64) -> Player {
         let floor_y = 40;
-        world.prepare_around(DVec3::new(x, floor_y as f64, z));
+        world.ensure_around(DVec3::new(x, floor_y as f64, z));
         let stone = world.registry().id_by_name("Stone").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
         for dx in -2..=14 {
@@ -524,7 +524,7 @@ mod tests {
         let mut world = World::generate();
         let (x, z) = (0.5, 0.5);
         let floor_y = 40; // above the hills, below the island band: open air
-        world.prepare_around(DVec3::new(x, floor_y as f64, z));
+        world.ensure_around(DVec3::new(x, floor_y as f64, z));
         let stone = world.registry().id_by_name("Stone").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
 

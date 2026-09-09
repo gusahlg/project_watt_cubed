@@ -12,6 +12,7 @@ use crate::derived::Revision;
 use crate::math::block_coord;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
+use super::generation::ColumnHeights;
 use super::heightmip::{BakeExtent, HeightMip};
 use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
@@ -430,8 +431,9 @@ impl World {
             // Stale queued uploads (the trailing edge of fast movement) release
             // in ONE pass here instead of trickling through the drain budget.
             self.prune_upload_queue();
-            // Centre chunk synchronously for collision safety before async catches
-            // up; the rest of the data box is armed for the budgeted generate lane.
+            // Sync-generate the centre only when it is missing and not already
+            // claimed: a claimed job is imminent and the previous centre's
+            // collision halo still exists.
             self.ensure_data(center_chunk);
             self.pending_gen.set();
             // Mesh box moved: re-seed loaded NeedsMesh chunks that JUST
@@ -750,7 +752,9 @@ impl World {
             _ => None,
         };
         match result {
-            pipeline::Done::Column { col, chunks } => self.accept_column(col, chunks),
+            pipeline::Done::Column { col, chunks, heights } => {
+                self.accept_column(col, chunks, heights)
+            }
             m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
             l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
             sc @ pipeline::Done::Section { .. } => SectionLane::integrate(self, sc),
@@ -791,8 +795,7 @@ impl World {
 
     /// Generated chunk result: discard if out-of-range/already loaded; else store (replays edits).
     pub(in crate::world) fn accept_chunk(&mut self, coord: Coord, chunk: Chunk) {
-        let Some(center) = self.center else { return };
-        if !self.data_box(center).contains(coord) || self.chunks.contains_key(&coord) {
+        if !self.will_accept_chunk(coord) {
             return;
         }
         self.store_chunk(coord, chunk);
@@ -925,8 +928,9 @@ impl World {
     /// granularity means it keeps its own gather/claim rather than the per-chunk
     /// [`admit`](super::admit) loop, but the forward-progress floor + time budget
     /// are the one shared rule ([`admission_exhausted`](super::admission_exhausted)).
-    /// The centre chunk is generated synchronously in `stream` (collision safety);
-    /// `accept_column` lands these results. Leftover columns re-arm the gate.
+    /// The centre chunk is generated synchronously in `stream` only when it is
+    /// missing and not already claimed; `accept_column` lands these results.
+    /// Leftover columns re-arm the gate.
     pub(in crate::world) fn request_region_data(
         &mut self,
         center: Coord,
@@ -936,20 +940,28 @@ impl World {
             return Progress::Idle;
         }
         let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
-        for coord in self.data_box(center).coords() {
+        let mut consider = |coord: Coord| {
             if self.chunks.contains_key(&coord)
                 || self.generating.contains(&coord)
                 || self.quarantined.contains(&FailKey::Column {
                     col: (coord.x, coord.z),
                 })
             {
-                continue;
+                return;
             }
             let entry = columns
                 .entry((coord.x, coord.z))
                 .or_insert((coord.y, coord.y));
             entry.0 = entry.0.min(coord.y);
             entry.1 = entry.1.max(coord.y);
+        };
+        for coord in self.data_box(center).coords() {
+            consider(coord);
+        }
+        if let Some(slab) = self.spawn_slab {
+            for coord in slab.coords() {
+                consider(coord);
+            }
         }
         if columns.is_empty() {
             return Progress::Idle;
@@ -985,29 +997,7 @@ impl World {
                 break;
             }
             let ((cx, cz), (cy_lo, cy_hi)) = (self.gen_columns[i].1, self.gen_columns[i].2);
-            let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
-                ..=cy_hi)
-                .filter_map(|cy| {
-                    let coord = ChunkCoord::new(cx, cy, cz);
-                    self.edits
-                        .get(&coord)
-                        .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
-                })
-                .collect();
-            let job = pipeline::Job::GenerateColumn {
-                col: (cx, cz),
-                cy: cy_lo..=cy_hi,
-                generator: self.generator.clone(),
-                edits,
-            };
-            let accepted = self.worker_pool().submit(job);
-            if accepted {
-                for cy in cy_lo..=cy_hi {
-                    let coord = ChunkCoord::new(cx, cy, cz);
-                    if !self.chunks.contains_key(&coord) {
-                        self.generating.insert(coord);
-                    }
-                }
+            if self.try_submit_column(cx, cz, cy_lo, cy_hi) {
                 admitted += 1;
             } else {
                 break;
@@ -1024,17 +1014,41 @@ impl World {
         }
     }
 
-    /// Land a generated column: register each not-yet-loaded, in-range chunk
-    /// (edits already replayed on the worker) and clear its generate claim.
+    /// Land a generated column: install the skylight ceiling from the worker's
+    /// heights (plus any edited-roof raise) before storing, so `trivial_light`
+    /// hits the cache instead of sampling the generator on this thread.
     pub(in crate::world) fn accept_column(
         &mut self,
-        _col: (i32, i32),
+        col: (i32, i32),
         chunks: Vec<(Coord, Chunk)>,
+        heights: Box<ColumnHeights>,
     ) {
+        // Only cache when at least one chunk will actually land — an install
+        // with no `column_chunks` bump would leak in `ceilings` forever.
+        if chunks.iter().any(|(coord, _)| self.will_accept_chunk(*coord)) {
+            self.install_ceiling(col, &heights);
+        }
         for (coord, chunk) in chunks {
             self.generating.remove(&coord);
             self.accept_chunk(coord, chunk);
         }
+        self.refresh_spawn_slab();
+    }
+
+    /// `accept_chunk`'s store predicate: in the live data box or the requested
+    /// spawn slab, and not yet loaded.
+    fn will_accept_chunk(&self, coord: Coord) -> bool {
+        if self.chunks.contains_key(&coord) {
+            return false;
+        }
+        self.in_data_or_slab(coord)
+    }
+
+    fn in_data_or_slab(&self, coord: Coord) -> bool {
+        self.spawn_slab.is_some_and(|slab| slab.contains(coord))
+            || self
+                .center
+                .is_some_and(|center| self.data_box(center).contains(coord))
     }
 
     /// A queued job was DESCHEDULED at the pool: its region left the live view
@@ -1081,13 +1095,19 @@ impl World {
         };
         match key {
             pipeline::JobKey::Column { col: (cx, cz), cy } => {
+                // A cancelled spawn-slab column must be re-requested even when
+                // the pool dropped it as out-of-view: physics is frozen on it.
+                let in_slab = self.spawn_slab.is_some_and(|slab| {
+                    cy.clone()
+                        .any(|y| slab.contains(Coord::new(cx, y, cz)))
+                });
                 for cyy in cy {
                     self.generating.remove(&Coord::new(cx, cyy, cz));
                 }
                 // Freed generate claims are otherwise only re-requested on a
                 // boundary cross; a retryable failure re-arms the lane so a
                 // standing-still player still converges.
-                if rearm {
+                if rearm || in_slab {
                     self.pending_gen.set();
                 }
             }
@@ -1136,25 +1156,166 @@ impl World {
         }
     }
 
-    /// Sync-generate small box around spawn position (collision safety before async catches up).
+    /// Collision halo around an eye chunk: 3×3 columns, two layers below through two above.
+    fn collision_slab(center: Coord) -> ChunkBox {
+        ChunkBox::new(center, 1, 2)
+    }
+
+    /// Request the collision slab around `pos` from the worker pool. Does not
+    /// generate on this thread — [`spawn_ready`](Self::spawn_ready) is true
+    /// once every chunk of the box has loaded. Teleports and net snaps use
+    /// the same request (physics freezes until it lands).
     pub fn prepare_around(&mut self, pos: DVec3) {
         let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
-        for cx in (c.x - 1)..=(c.x + 1) {
-            for cz in (c.z - 1)..=(c.z + 1) {
-                for cy in (c.y - 2)..=(c.y + 1) {
-                    self.ensure_data(ChunkCoord::new(cx, cy, cz));
-                }
+        let slab = Self::collision_slab(c);
+        let far_m = f64::from(self.section_pyramid.outer_m());
+        let view_r = self.view.horizontal;
+        self.worker_pool()
+            .set_view(c.x, c.z, view_r, far_m, 0.0, 0.0);
+        self.submit_slab_columns(slab);
+        self.pending_gen.set();
+        if slab.coords().all(|coord| self.chunks.contains_key(&coord)) {
+            self.spawn_slab = None;
+        } else {
+            self.spawn_slab = Some(slab);
+        }
+    }
+
+    /// Synchronously generate the collision slab. Headless callers (tests,
+    /// anything that queries voxels before a stream pass).
+    pub fn ensure_around(&mut self, pos: DVec3) {
+        let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
+        for coord in Self::collision_slab(c).coords() {
+            self.ensure_data(coord);
+        }
+    }
+
+    /// True once every chunk of the requested spawn/teleport slab is loaded,
+    /// or no slab is outstanding.
+    pub fn spawn_ready(&self) -> bool {
+        match self.spawn_slab {
+            None => true,
+            Some(slab) => slab.coords().all(|c| self.chunks.contains_key(&c)),
+        }
+    }
+
+    /// Drive in-flight generate jobs until the spawn slab is loaded. Tests
+    /// only — the live path drains through [`stream`](Self::stream).
+    #[cfg(test)]
+    pub fn drive_spawn_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.spawn_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "spawn slab did not land: {}",
+                self.entry_debug()
+            );
+            if let Some(slab) = self.spawn_slab {
+                self.submit_slab_columns(slab);
+            }
+            let mut got = false;
+            while let Some(done) = self.workers.as_ref().and_then(pipeline::Workers::try_recv) {
+                self.integrate_worker_result(done);
+                got = true;
+            }
+            self.refresh_spawn_slab();
+            if !got {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
 
+    fn refresh_spawn_slab(&mut self) {
+        let Some(slab) = self.spawn_slab else {
+            return;
+        };
+        if slab.coords().all(|c| self.chunks.contains_key(&c)) {
+            self.spawn_slab = None;
+        }
+    }
+
+    fn submit_slab_columns(&mut self, slab: ChunkBox) {
+        let min = slab.min();
+        let (sx, sy, sz) = slab.size();
+        let cy_lo = min.y;
+        let cy_hi = min.y + sy - 1;
+        let mut remaining = false;
+        for cx in min.x..min.x + sx {
+            for cz in min.z..min.z + sz {
+                let mut need = false;
+                for cy in cy_lo..=cy_hi {
+                    let coord = ChunkCoord::new(cx, cy, cz);
+                    if !self.chunks.contains_key(&coord) && !self.generating.contains(&coord) {
+                        need = true;
+                        break;
+                    }
+                }
+                if !need {
+                    continue;
+                }
+                if !self.try_submit_column(cx, cz, cy_lo, cy_hi) {
+                    remaining = true;
+                }
+            }
+        }
+        if remaining {
+            self.pending_gen.set();
+        }
+    }
+
+    /// Submit one column job and claim its missing coords. `false` means the
+    /// pool rejected it (backpressure or shutdown) so the caller must retry.
+    fn try_submit_column(&mut self, cx: i32, cz: i32, cy_lo: i32, cy_hi: i32) -> bool {
+        if self.quarantined.contains(&FailKey::Column { col: (cx, cz) }) {
+            return false;
+        }
+        let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
+            ..=cy_hi)
+            .filter_map(|cy| {
+                let coord = ChunkCoord::new(cx, cy, cz);
+                self.edits
+                    .get(&coord)
+                    .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
+            })
+            .collect();
+        let job = pipeline::Job::GenerateColumn {
+            col: (cx, cz),
+            cy: cy_lo..=cy_hi,
+            generator: self.generator.clone(),
+            edits,
+        };
+        let accepted = self.worker_pool().submit(job);
+        if accepted {
+            for cy in cy_lo..=cy_hi {
+                let coord = ChunkCoord::new(cx, cy, cz);
+                if !self.chunks.contains_key(&coord) {
+                    self.generating.insert(coord);
+                }
+            }
+        }
+        accepted
+    }
+
     /// Generate a chunk's data if it isn't loaded, replaying any saved edits on it.
+    /// Uses `generate_column` so the ceiling heights come from the same sample
+    /// the voxels did — never a second `height()` walk on this thread.
+    /// Skips coords already claimed in `generating`: the async result is imminent.
     pub(in crate::world) fn ensure_data(&mut self, coord: Coord) {
-        if self.chunks.contains_key(&coord) {
+        if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
             return;
         }
-        let chunk = Chunk::new(coord.x, coord.y, coord.z, &*self.generator);
+        let (chunks, heights) =
+            self.generator
+                .generate_column(coord.x, coord.z, coord.y..=coord.y);
+        self.install_ceiling((coord.x, coord.z), &heights);
+        let data = chunks
+            .into_iter()
+            .next()
+            .map(|(_, data)| data)
+            .expect("generate_column emits the requested layer");
+        let chunk = Chunk::from_data(coord.x, coord.y, coord.z, data);
         self.store_chunk(coord, chunk);
+        self.refresh_spawn_slab();
     }
 
     /// Insert freshly generated data: replay the edit overlay, then register
@@ -1245,7 +1406,10 @@ impl World {
             .chunks
             .keys()
             .copied()
-            .filter(|&coord| !unload.contains(coord))
+            .filter(|&coord| {
+                !unload.contains(coord)
+                    && !self.spawn_slab.is_some_and(|slab| slab.contains(coord))
+            })
             .collect();
         // A removed chunk changes what the BFS can reach — topology class.
         self.occlusion_topo_dirty.raise(!far.is_empty());
@@ -1376,12 +1540,15 @@ impl World {
         })
     }
 
-    /// Skylight ceiling: ground height per column (pure generator fn, caves dark
-    /// consistently) RAISED by edited opaque roofs, so a player-built ceiling
-    /// shadows the chunks below it. Keyed by `(x, z)` chunk column and
-    /// cached — the generator half never changes and `set_block` invalidates
-    /// the entry when an edit moves a column's ceiling, so `capture_ceiling`
-    /// samples 256 noise columns once per column, not per settle.
+    /// Skylight ceiling: ground height per column (caves dark consistently)
+    /// RAISED by edited opaque roofs, so a player-built ceiling shadows the
+    /// chunks below it. Keyed by `(x, z)` chunk column and cached.
+    ///
+    /// Async columns install the window in [`accept_column`](Self::accept_column)
+    /// before store; [`ensure_data`](Self::ensure_data) does the same from the
+    /// synchronous `generate_column`. This miss path is the remainder (edit
+    /// invalidation, tests) and still reads heights from `generate_column`,
+    /// never `height()`.
     ///
     /// Generated volumetrics (overhang shelves, flying islands) are still NOT
     /// part of the ceiling: `height()` deliberately describes ground only, so
@@ -1391,18 +1558,51 @@ impl World {
         if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
             return ceiling.clone();
         }
+        // Empty `cy` range: both generators sample the 256 column profiles
+        // before iterating the chunk layers, so this is the height field
+        // without a voxel fill.
+        let heights = self.generator.generate_column(coord.x, coord.z, 1..=0).1;
+        let ceiling = self.ceiling_from_heights((coord.x, coord.z), &heights);
+        self.ceilings.insert((coord.x, coord.z), ceiling.clone());
+        ceiling
+    }
+
+    /// Rebuild the ceiling from `height()` plus edited roofs, ignoring the
+    /// cache — equality check against production `generate_column` heights.
+    #[cfg(test)]
+    pub(in crate::world) fn capture_ceiling_slow(&self, coord: Coord) -> light::CeilingWindow {
         let x0 = coord.x * CHUNK_SIZE as i32;
         let z0 = coord.z * CHUNK_SIZE as i32;
         let generator = &self.generator;
         let mut ceiling = light::CeilingWindow::from_heights(|lx, lz| {
             generator.height(x0 + lx as i32, z0 + lz as i32)
         });
-        // Every edited opaque cell in this column is a potential roof: open
-        // sky begins above the topmost one. The overlay has no column index,
-        // so this scans edited chunks — once per cached column, off the voxel
-        // hot path.
+        self.raise_edited_roofs((coord.x, coord.z), &mut ceiling);
+        ceiling
+    }
+
+    fn install_ceiling(&mut self, col: (i32, i32), heights: &ColumnHeights) {
+        if self.ceilings.contains_key(&col) {
+            return;
+        }
+        let ceiling = self.ceiling_from_heights(col, heights);
+        self.ceilings.insert(col, ceiling);
+    }
+
+    fn ceiling_from_heights(
+        &self,
+        col: (i32, i32),
+        heights: &ColumnHeights,
+    ) -> light::CeilingWindow {
+        let mut ceiling =
+            light::CeilingWindow::from_heights(|lx, lz| heights[lx + lz * CHUNK_SIZE]);
+        self.raise_edited_roofs(col, &mut ceiling);
+        ceiling
+    }
+
+    fn raise_edited_roofs(&self, col: (i32, i32), ceiling: &mut light::CeilingWindow) {
         for (&c, cells) in &self.edits {
-            if c.x != coord.x || c.z != coord.z {
+            if c.x != col.0 || c.z != col.1 {
                 continue;
             }
             for (&index, &id) in cells {
@@ -1413,8 +1613,6 @@ impl World {
                 ceiling.raise(lx, lz, c.y * CHUNK_SIZE as i32 + ly as i32 + 1);
             }
         }
-        self.ceilings.insert((coord.x, coord.z), ceiling.clone());
-        ceiling
     }
 
     /// The analytic light grid for a chunk whose settled light is provable
@@ -2119,6 +2317,18 @@ impl World {
     /// streaming stage is stuck instead of hanging silently. Clause order mirrors
     /// [`entry_complete`](Self::entry_complete).
     pub fn entry_debug(&self) -> String {
+        if let Some(slab) = self.spawn_slab {
+            let missing = slab
+                .coords()
+                .filter(|c| !self.chunks.contains_key(c))
+                .count();
+            if missing > 0 {
+                return format!(
+                    "spawn slab loading: {missing} chunks, generating={}",
+                    self.generating.len()
+                );
+            }
+        }
         let Some(center) = self.center else {
             return "no stream centre yet".into();
         };
@@ -2564,6 +2774,110 @@ mod tests {
         assert!(
             world.light_terminal.is_empty(),
             "claim consumes the terminal mark"
+        );
+    }
+
+    fn assert_ceilings_eq(got: &light::CeilingWindow, slow: &light::CeilingWindow) {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                assert_eq!(
+                    got.surface_at(lx, lz),
+                    slow.surface_at(lx, lz),
+                    "ceiling lx={lx} lz={lz}"
+                );
+            }
+        }
+    }
+
+    /// `accept_column` caches the skylight ceiling from worker heights (not
+    /// `height()`) and `trivial_light` publishes the same grid the slow path
+    /// would. Covers classic, diffusion, and an edited-roof raise.
+    #[test]
+    fn accept_column_caches_ceiling_and_trivial_light_matches_slow() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+
+        for kind in [WorldgenKind::Classic, WorldgenKind::Diffusion] {
+            let mut world = World::with_kind(7, RenderConfig::default(), kind, false);
+            // Above terrain and the flying-island band: uniform air, open sky.
+            let coord = Coord::new(1, 25, -2);
+            world.center = Some(coord);
+
+            let stone = world.registry.id_by_name("Stone").expect("builtin Stone");
+            // Roof in this column, below the stored chunk: raise before store.
+            const ROOF_Y: i32 = 200;
+            world.set_block(
+                coord.x * CHUNK_SIZE as i32 + 3,
+                ROOF_Y,
+                coord.z * CHUNK_SIZE as i32 + 5,
+                stone,
+            );
+
+            let slow = world.capture_ceiling_slow(coord);
+            assert!(
+                !world.ceilings.contains_key(&(coord.x, coord.z)),
+                "slow helper must not warm the cache"
+            );
+
+            let (datas, heights) =
+                world
+                    .generator
+                    .generate_column(coord.x, coord.z, coord.y..=coord.y);
+            let chunks: Vec<_> = datas
+                .into_iter()
+                .map(|(cy, data)| {
+                    (
+                        Coord::new(coord.x, cy, coord.z),
+                        Chunk::from_data(coord.x, cy, coord.z, data),
+                    )
+                })
+                .collect();
+            world.accept_column((coord.x, coord.z), chunks, Box::new(heights));
+
+            let cached = world
+                .ceilings
+                .get(&(coord.x, coord.z))
+                .expect("accept_column installs the ceiling before store");
+            assert_ceilings_eq(cached, &slow);
+            assert!(
+                cached.surface_at(3, 5) >= ROOF_Y + 1,
+                "edited roof must raise the cached ceiling"
+            );
+
+            let grid = world.chunks[&coord]
+                .light
+                .as_ref()
+                .expect("uniform-air above the surface publishes trivial light");
+            let world_y0 = coord.y * CHUNK_SIZE as i32;
+            let all_open = (0..CHUNK_SIZE)
+                .all(|lz| (0..CHUNK_SIZE).all(|lx| slow.open_above(lx, lz, world_y0)));
+            assert!(all_open, "fixture sits fully above the (raised) ceiling");
+            assert!(
+                grid == &light::LightGrid::open_sky(),
+                "trivial light must be open_sky"
+            );
+        }
+    }
+
+    /// Sync `ensure_data` (headless region, unclaimed boundary-cross centre)
+    /// also installs from `generate_column` heights, so `trivial_light` never
+    /// calls `height()`.
+    #[test]
+    fn ensure_data_caches_ceiling_matching_slow() {
+        use crate::render_config::RenderConfig;
+
+        let mut world = World::with_config_lazy(11, RenderConfig::default());
+        let coord = Coord::new(2, 25, 1);
+        world.ensure_data(coord);
+        let cached = world
+            .ceilings
+            .get(&(coord.x, coord.z))
+            .expect("ensure_data installs the ceiling before store");
+        let slow = world.capture_ceiling_slow(coord);
+        assert_ceilings_eq(cached, &slow);
+        assert!(
+            world.chunks[&coord].light.as_ref() == Some(&light::LightGrid::open_sky()),
+            "trivial light must be open_sky"
         );
     }
 }
