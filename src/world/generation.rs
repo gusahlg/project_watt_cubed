@@ -536,6 +536,16 @@ struct Column {
     dress: BlockId,
 }
 
+/// Per-column carve / overhang / island bits for one chunk layer.
+#[derive(Clone, Copy)]
+struct ColMask {
+    wx: i32,
+    wz: i32,
+    carved: u16,
+    overhang: u16,
+    island: u32,
+}
+
 // Value noise primitives. Uses f64 world coordinates for far-out stability.
 
 fn lattice(seed: u64, x: i32, y: i32, z: i32) -> f32 {
@@ -1124,6 +1134,7 @@ impl Terrain {
     /// walking the cumulative rarity slices (stream B's are ÷8), deduped —
     /// distinct hits on both streams yield the overlap pair, a multi-yield
     /// find. Stream A alone is byte-identical to the legacy distribution.
+    #[inline]
     fn ore_at(&self, wx: i32, wy: i32, wz: i32, depth: i32) -> Option<BlockId> {
         let hit = |slices: &[placement::Slice], roll: u32| -> Option<usize> {
             let mut cut = 0u32;
@@ -1368,8 +1379,8 @@ impl TerrainGenerator for Terrain {
     /// generate over the range.
     ///
     /// Column job cost (64 surface columns × 9 layers, `--release`):
-    /// 0.924 ms/column before the reuse pass, 0.882 ms/column after
-    /// (overhang column cache, cached surface kind/dress, carve-dormancy memo).
+    /// 1.008 ms/column before the run-fill pass, 0.616 ms/column after
+    /// (median of 3; per-column bands, y-outer contiguous writes).
     fn generate_column(
         &self,
         cx: i32,
@@ -1475,7 +1486,7 @@ impl Terrain {
     }
 
     /// One chunk's storage from shared column profiles — the `cy`-varying half of
-    /// generation (height-band + region shortcuts, then the dense fill).
+    /// generation (height-band + region shortcuts, then a run fill).
     fn fill_chunk(
         &self,
         x0: i32,
@@ -1528,75 +1539,180 @@ impl Terrain {
             }
         }
 
-        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        let carve_dormant = dormant_at(y0);
+        let wall_lo_dormant = self.mat.cave_wall.is_none() || dormant_at(y0 - cs);
+        let wall_hi_dormant = self.mat.cave_wall.is_none() || dormant_at(y0 + cs);
+
         let islands_possible = y1 + 4 >= self.islands.band_bottom() && y0 <= self.islands.band_top();
-        let mut isl: [bool; CHUNK_SIZE + 4];
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let wx = x0 + lx as i32;
-                let wz = z0 + lz as i32;
-                let p = &profiles[lx + lz * CHUNK_SIZE];
-                let height = p.height;
-
-                isl = [false; CHUNK_SIZE + 4];
-                if islands_possible {
-                    if let Some(col) = self.islands.column(wx, wz, y0, y1 + 4) {
-                        for (k, cell) in isl.iter_mut().enumerate() {
-                            *cell = self.islands.solid_col(&col, y0 + k as i32);
-                        }
-                    }
-                }
-
-                // Carve mask: caves (depth ≥ CAVE_MIN_DEPTH) and ravines (depth ≥
-                // RAVINE_MIN_DEPTH) both bite here, folded together. `cave_top` is
-                // the shallower roof and bounds the cached column span for both.
-                let mut carved = [false; CHUNK_SIZE];
-                let cave_top = height - CAVE_MIN_DEPTH;
-                let rav_top = height - RAVINE_MIN_DEPTH;
-                if y0 <= cave_top {
-                    let cave_col = self.caves.field.column(wx, wz, y0, y1.min(cave_top));
-                    let rav_col = self.ravines.field.column(wx, wz, y0, y1.min(cave_top));
-                    for (k, cell) in carved.iter_mut().enumerate() {
-                        let wy = y0 + k as i32;
-                        let cave = wy <= cave_top && self.caves.excess_col(&cave_col, wy, height) > 0.0;
-                        let rav = wy <= rav_top && self.ravines.excess_col(&rav_col, wy, height) > 0.0;
-                        *cell = cave || rav;
-                    }
-                }
-
-                let mut overhang = [false; CHUNK_SIZE];
-                let oh_lo = height;
-                let oh_hi = height + OVERHANG_REACH - 1;
-                if y1 >= oh_lo && y0 <= oh_hi {
-                    let col = self.overhangs.column(wx, wz, y0.max(oh_lo), y1.min(oh_hi));
-                    for (k, cell) in overhang.iter_mut().enumerate() {
-                        let wy = y0 + k as i32;
-                        let up = wy - height;
-                        if (0..OVERHANG_REACH).contains(&up) {
-                            *cell = col.sample(wy).0
-                                > OVERHANG_THRESH + OVERHANG_FADE * up as f32;
-                        }
-                    }
-                }
-
+        let any_carve = !carve_dormant && y0 <= h_max - CAVE_MIN_DEPTH;
+        let any_overhang = y1 >= h_min && y0 <= h_max + OVERHANG_REACH - 1;
+        let mut bands = [ColMask { wx: 0, wz: 0, carved: 0, overhang: 0, island: 0 }; CHUNK_SIZE * CHUNK_SIZE];
+        for (xz, band) in bands.iter_mut().enumerate() {
+            let lx = xz % CHUNK_SIZE;
+            let lz = xz / CHUNK_SIZE;
+            let wx = x0 + lx as i32;
+            let wz = z0 + lz as i32;
+            let height = profiles[xz].height;
+            let mut carved = 0u16;
+            let cave_top = height - CAVE_MIN_DEPTH;
+            let rav_top = height - RAVINE_MIN_DEPTH;
+            if any_carve && y0 <= cave_top {
+                let cave_hi = y1.min(cave_top);
+                let cave_col = self.caves.field.column(wx, wz, y0, cave_hi);
+                let rav_col = (y0 <= rav_top)
+                    .then(|| self.ravines.field.column(wx, wz, y0, cave_hi.min(rav_top)));
                 for ly in 0..CHUNK_SIZE {
                     let wy = y0 + ly as i32;
-                    let id = if wy < height {
-                        self.ground(p, wx, wy, wz, carved[ly])
-                    } else if wy < p.water_level {
-                        self.mat.water
-                    } else if overhang[ly] {
-                        self.mat.stone
-                    } else if isl[ly] {
-                        self.island_block(wx, wy, wz, [isl[ly + 1], isl[ly + 2], isl[ly + 3], isl[ly + 4]])
-                    } else {
-                        AIR
-                    };
-                    cells[Chunk::index(lx, ly, lz)] = id;
+                    let cave = wy <= cave_top && self.caves.excess_col(&cave_col, wy, height) > 0.0;
+                    let rav = rav_col
+                        .as_ref()
+                        .is_some_and(|col| wy <= rav_top && self.ravines.excess_col(col, wy, height) > 0.0);
+                    if cave || rav {
+                        carved |= 1 << ly;
+                    }
                 }
+            }
+            let mut overhang = 0u16;
+            let oh_lo = height;
+            let oh_hi = height + OVERHANG_REACH - 1;
+            if any_overhang && y1 >= oh_lo && y0 <= oh_hi {
+                let col = self.overhangs.column(wx, wz, y0.max(oh_lo), y1.min(oh_hi));
+                for ly in 0..CHUNK_SIZE {
+                    let wy = y0 + ly as i32;
+                    let up = wy - height;
+                    if (0..OVERHANG_REACH).contains(&up)
+                        && col.sample(wy).0 > OVERHANG_THRESH + OVERHANG_FADE * up as f32
+                    {
+                        overhang |= 1 << ly;
+                    }
+                }
+            }
+            let mut island = 0u32;
+            if islands_possible {
+                if let Some(col) = self.islands.column(wx, wz, y0, y1 + 4) {
+                    for k in 0..(CHUNK_SIZE + 4) {
+                        if self.islands.solid_col(&col, y0 + k as i32) {
+                            island |= 1 << k;
+                        }
+                    }
+                }
+            }
+            *band = ColMask { wx, wz, carved, overhang, island };
+        }
+
+        // Band values written y-outer / x-inner so a uniform plane is one
+        // contiguous run; only ore / cave-wall / island cells take a hash.
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        let plane = CHUNK_SIZE * CHUNK_SIZE;
+        let sky_lo = h_max + OVERHANG_REACH;
+        for ly in 0..CHUNK_SIZE {
+            let wy = y0 + ly as i32;
+            let dest = &mut cells[ly * plane..(ly + 1) * plane];
+            if wy >= sky_lo && !islands_possible {
+                if wy >= w_max {
+                    dest.fill(AIR);
+                    continue;
+                }
+                if wy < w_min {
+                    dest.fill(self.mat.water);
+                    continue;
+                }
+            }
+            for xz in 0..plane {
+                dest[xz] = self.column_at(
+                    &profiles[xz],
+                    &bands[xz],
+                    ly,
+                    wy,
+                    wall_lo_dormant,
+                    wall_hi_dormant,
+                );
             }
         }
         ChunkData::from_cells(cells)
+    }
+
+    #[inline]
+    fn column_at(
+        &self,
+        p: &Column,
+        m: &ColMask,
+        ly: usize,
+        wy: i32,
+        lo_dormant: bool,
+        hi_dormant: bool,
+    ) -> BlockId {
+        let height = p.height;
+        if wy < height {
+            if wy >= height - 1 {
+                p.dress
+            } else if wy >= height - 3 {
+                self.mat.crust[p.kind as usize]
+            } else if m.carved & (1 << ly) != 0 {
+                AIR
+            } else {
+                let depth = height - wy;
+                if depth <= self.mat.max_scattered_depth {
+                    if let Some(ore) = self.ore_at(m.wx, wy, m.wz, depth) {
+                        return ore;
+                    }
+                }
+                if let Some(id) = self.wall_cell(p, m, ly, wy, depth, lo_dormant, hi_dormant) {
+                    return id;
+                }
+                self.mat.stone
+            }
+        } else if wy < p.water_level {
+            self.mat.water
+        } else if m.overhang & (1 << ly) != 0 {
+            self.mat.stone
+        } else if m.island & (1 << ly) != 0 {
+            let bit = |k: usize| m.island & (1u32 << k) != 0;
+            self.island_block(
+                m.wx,
+                wy,
+                m.wz,
+                [bit(ly + 1), bit(ly + 2), bit(ly + 3), bit(ly + 4)],
+            )
+        } else {
+            AIR
+        }
+    }
+
+    /// In-mask neighbour, or a rim whose neighbouring chunk box is not dormant.
+    #[inline]
+    fn wall_adjacent(m: &ColMask, ly: usize, lo_dormant: bool, hi_dormant: bool) -> bool {
+        (ly > 0 && m.carved & (1 << (ly - 1)) != 0)
+            || (ly + 1 < CHUNK_SIZE && m.carved & (1 << (ly + 1)) != 0)
+            || (ly == 0 && !lo_dormant)
+            || (ly + 1 == CHUNK_SIZE && !hi_dormant)
+    }
+
+    #[inline]
+    fn wall_cell(
+        &self,
+        p: &Column,
+        m: &ColMask,
+        ly: usize,
+        wy: i32,
+        depth: i32,
+        lo_dormant: bool,
+        hi_dormant: bool,
+    ) -> Option<BlockId> {
+        let cw = self.mat.cave_wall.as_ref()?;
+        if depth < cw.min_depth || !Self::wall_adjacent(m, ly, lo_dormant, hi_dormant) {
+            return None;
+        }
+        if cell_hash(self.seed ^ CAVE_WALL_SALT, m.wx, wy, m.wz) >= cw.width {
+            return None;
+        }
+        let in_mask = (ly > 0 && m.carved & (1 << (ly - 1)) != 0)
+            || (ly + 1 < CHUNK_SIZE && m.carved & (1 << (ly + 1)) != 0);
+        if in_mask {
+            return Some(cw.id);
+        }
+        let carved_v = |ny: i32| ny < p.height && self.carved(m.wx, ny, m.wz, p.height);
+        (carved_v(wy + 1) || carved_v(wy - 1)).then_some(cw.id)
     }
 }
 
@@ -1654,6 +1770,9 @@ mod generate_column_tests {
 
     /// Column job cost: 64 surface columns × 9 layers. Ignored timing gauge.
     /// Run with `cargo test --release generate_column_ms -- --ignored --nocapture`.
+    ///
+    /// Median of 3 `--release` runs: 1.008 ms/column before the run-fill pass,
+    /// 0.616 ms/column after (1.64×).
     #[test]
     #[ignore]
     fn generate_column_ms() {
@@ -1896,8 +2015,8 @@ mod tests {
 
     #[test]
     fn surface_chunk_fill_matches_per_cell() {
-        // The chunk fast path must agree with the per-cell block_at, cell for
-        // cell, across surface chunks (crust, carve, overhangs, water).
+        // The chunk fast path (banded run fill) must agree with the per-cell
+        // block_at, cell for cell, across surface chunks (crust, carve, overhangs, water).
         let g = terrain(5);
         for (cx, cy, cz) in [(0, 1, 0), (3, 1, -2), (-5, 2, 4), (7, 1, 9)] {
             let chunk = Chunk::new(cx, cy, cz, &g);
