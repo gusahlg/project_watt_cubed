@@ -212,8 +212,8 @@ const LIGHT_WAIT_DEGRADE: Duration = Duration::from_millis(150);
 /// `degraded`: set of chunks currently drawing a degraded mesh, owed a remesh.
 #[derive(Default)]
 pub(in crate::world) struct LightGate {
-    blocked_since: FastMap<Coord, Instant>,
-    degraded: FastSet<Coord>,
+    pub(in crate::world) blocked_since: FastMap<Coord, Instant>,
+    pub(in crate::world) degraded: FastSet<Coord>,
 }
 
 impl LightGate {
@@ -741,7 +741,9 @@ impl World {
     fn integrate_worker_result(&mut self, result: pipeline::Done) {
         #[cfg(debug_assertions)]
         let light_audit = match &result {
-            pipeline::Done::Light { coord, epoch, .. } => Some((*coord, *epoch)),
+            pipeline::Done::Light { coord, epoch, light_gen, .. } => {
+                Some((*coord, *epoch, *light_gen))
+            }
             _ => None,
         };
         #[cfg(debug_assertions)]
@@ -768,9 +770,11 @@ impl World {
         // A consumed CURRENT-epoch light result must have released its claim
         // or transferred it into the apply queue.
         #[cfg(debug_assertions)]
-        if let Some((coord, epoch)) = light_audit {
+        if let Some((coord, epoch, light_gen)) = light_audit {
+            let live = self.chunks.get(&coord).map(|l| l.light_gen) == Some(light_gen);
             debug_assert!(
                 epoch != self.light_epoch
+                    || !live
                     || !self.light_inflight.contains(&coord)
                     || self.light_apply_queue.iter().any(|(c, _)| *c == coord),
                 "light Done for {coord:?} left its claim neither released nor transferred"
@@ -880,27 +884,41 @@ impl World {
     /// stale claim as still-in-flight, the mesh lane skipped it as in-flight,
     /// and quiescence — degraded promotion, `entry_complete` — never came).
     ///
-    /// Epoch reasoning (what makes the unconditional release sound):
+    /// Epoch and generation reasoning (what makes the release sound):
     /// [`transition_lighting`](Self::transition_lighting) is the only
     /// `light_epoch` bump and it clears `light_inflight` in the same breath, so
     /// - a CURRENT-epoch result is the unique owner of any in-flight entry at
     ///   its coord (releasing can never steal a newer claim), while
     /// - a STALE-epoch result's claim was already wiped at the bump — an entry
     ///   present now belongs to a post-bump job and must not be touched.
+    /// `light_gen` is the per-`Loaded` stamp: unload then regenerate at the same
+    /// coord does not bump the epoch, so a current-epoch result for the *old*
+    /// resident must not publish onto the new voxels (and store skips trivial
+    /// settle while the old claim is still in flight, so this Done remains
+    /// that claim's unique owner).
     pub(in crate::world) fn accept_light(
         &mut self,
         coord: Coord,
         epoch: u32,
+        light_gen: u32,
         grid: light::LightGrid,
     ) {
         if epoch != self.light_epoch {
             return;
         }
-        if !self.lighting || !self.chunks.contains_key(&coord) {
-            // Unusable result — the chunk unloaded mid-flight (the common
-            // fast-flight case; `lighting` off with a matching epoch is
-            // unreachable today since the toggle bumps it, kept as a guard).
-            // Release the claim, drop the payload.
+        let live_gen = self.chunks.get(&coord).map(|l| l.light_gen);
+        if live_gen != Some(light_gen) {
+            // Unusable: unloaded, or a later Loaded at this coord. Release
+            // the leftover claim and re-seed the new resident so it can
+            // settle against its own voxels.
+            self.light_inflight.remove(&coord);
+            if live_gen.is_some() && self.lighting {
+                self.light_worklist.insert(coord);
+                self.light_pending.set();
+            }
+            return;
+        }
+        if !self.lighting {
             self.light_inflight.remove(&coord);
             return;
         }
@@ -1349,6 +1367,8 @@ impl World {
             !self.generating.contains(&coord),
             "storing {coord:?} still claimed in generating — a stuck generate claim"
         );
+        self.light_claim_seq = self.light_claim_seq.wrapping_add(1);
+        let light_gen = self.light_claim_seq;
         self.chunks.insert(
             coord,
             Loaded {
@@ -1359,6 +1379,7 @@ impl World {
                 visible: true,
                 light: None,
                 has_blocklight: false,
+                light_gen,
             },
         );
         // Ceiling-cache lifetime: the column's last layer out drops the entry.
@@ -1377,11 +1398,20 @@ impl World {
         // flood. A trivial grid publishes synchronously (which fans the border to
         // its neighbours); only the residual Dense band seeds the settle worklist.
         if self.lighting {
-            match self.trivial_light(coord, &chunk) {
-                Some(grid) => self.settle_light(coord, grid),
-                None => {
-                    self.light_worklist.insert(coord);
-                    self.light_pending.set();
+            if self.light_inflight.contains(&coord) {
+                // A previous Loaded at this coord still owns the inflight
+                // claim. Skip trivial publish (it would steal that claim via
+                // settle_light) and seed so we resettle after the stale Done
+                // is consumed against the old generation.
+                self.light_worklist.insert(coord);
+                self.light_pending.set();
+            } else {
+                match self.trivial_light(coord, &chunk) {
+                    Some(grid) => self.settle_light(coord, grid),
+                    None => {
+                        self.light_worklist.insert(coord);
+                        self.light_pending.set();
+                    }
                 }
             }
         }
@@ -2190,7 +2220,7 @@ impl World {
     /// `settle_light`, neighbour data via `store_chunk`). The old gate
     /// re-scanned the entire `mesh_worklist` (~15 hash probes per seed) and
     /// unconditionally re-seeded every blocked chunk, every pass of a flood.
-    fn tick_light_gate(&mut self) {
+    pub(in crate::world) fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
         // the predicates below read the chunk map. Empty maps skip `retain`
         // (it still walks capacity); a drained flood `shrink_to_fit`s once.
@@ -2247,7 +2277,7 @@ impl World {
     /// Event-driven paths miss degraded chunks whose missing neighbour settled
     /// without moving shared border; this sweep promotes them to final at true
     /// rest so entry_complete doesn't hang.
-    fn flush_degraded_terminal(&mut self) {
+    pub(in crate::world) fn flush_degraded_terminal(&mut self) {
         let quiescent = self.generating.is_empty()
             && self.mesh_worklist.is_empty()
             && self.light_worklist.is_empty()

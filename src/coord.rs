@@ -434,4 +434,28 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn chunkbox_coords_at_world_border_do_not_wrap() {
+        let s = CHUNK_SIZE as i32;
+        let cx = (crate::math::WORLD_BORDER as i32).div_euclid(s);
+        for center in [
+            ChunkCoord::new(cx, 0, cx),
+            ChunkCoord::new(-cx, 0, -cx),
+            ChunkCoord::new(cx, cx / 4, -cx),
+        ] {
+            let b = ChunkBox::new(center, 3, 2);
+            let (sx, sy, sz) = b.size();
+            let coords: Vec<_> = b.coords().collect();
+            assert_eq!(
+                coords.len(),
+                (sx as usize) * (sy as usize) * (sz as usize),
+                "wrapped range at {center:?}"
+            );
+            assert!(
+                coords.iter().all(|&c| b.contains(c)),
+                "iterator emitted a coord the box does not contain"
+            );
+        }
+    }
 }

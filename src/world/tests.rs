@@ -289,6 +289,7 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         visible: true,
         light: None,
         has_blocklight: false,
+        light_gen: 0,
     }
 }
 
@@ -526,9 +527,15 @@ fn lighting_toggle_reseeds_only_stale_work_and_rejects_old_results() {
 
     // Results from old generation don't publish after re-enable.
     world.light_inflight.insert(coord);
+    let light_gen = world.chunks[&coord].light_gen;
     <LightLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Light { coord, epoch: off_epoch, grid: light::LightGrid::dark() },
+        pipeline::Done::Light {
+            coord,
+            epoch: off_epoch,
+            light_gen,
+            grid: light::LightGrid::dark(),
+        },
     );
     assert!(world.light_apply_queue.is_empty());
     let current_epoch = world.light_epoch;
@@ -537,6 +544,7 @@ fn lighting_toggle_reseeds_only_stale_work_and_rejects_old_results() {
         pipeline::Done::Light {
             coord,
             epoch: current_epoch,
+            light_gen,
             grid: light::LightGrid::dark(),
         },
     );
@@ -663,7 +671,12 @@ fn unloaded_light_result_releases_the_claim() {
 
     <LightLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Light { coord, epoch, grid: light::LightGrid::dark() },
+        pipeline::Done::Light {
+            coord,
+            epoch,
+            light_gen: 0,
+            grid: light::LightGrid::dark(),
+        },
     );
     assert!(world.light_apply_queue.is_empty(), "an unusable result never queues");
     assert!(!world.light_inflight.contains(&coord), "the claim must release");
@@ -869,9 +882,15 @@ fn stale_epoch_light_result_never_touches_a_newer_claim() {
 
     // A post-bump job holds the live claim.
     world.light_inflight.insert(coord);
+    let light_gen = world.chunks[&coord].light_gen;
     <LightLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Light { coord, epoch: stale, grid: light::LightGrid::dark() },
+        pipeline::Done::Light {
+            coord,
+            epoch: stale,
+            light_gen,
+            grid: light::LightGrid::dark(),
+        },
     );
     assert!(world.light_inflight.contains(&coord), "the newer claim survives");
     assert!(world.light_apply_queue.is_empty(), "the stale grid never publishes");
@@ -1347,6 +1366,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                         visible: true,
                         light: None,
                         has_blocklight: false,
+                        light_gen: 0,
                     },
                 );
             }
@@ -1464,4 +1484,655 @@ fn physics_does_not_move_the_player_until_spawn_ready() {
         player.position, before,
         "gravity applies once the collision slab has landed"
     );
+}
+
+/// A light job still in flight when its chunk unloads must not publish onto a
+/// later `Loaded` at the same coord (same epoch). The new voxels may differ
+/// via the edit overlay, and a leftover `light_inflight` entry would also
+/// block a fresh settle. `unload_far` only drops *queued* grids, so this is
+/// the in-flight case.
+#[test]
+fn stale_light_result_does_not_land_on_a_regenerated_chunk() {
+    let mut world = World::generate();
+    world.center = Some(ChunkCoord::new(0, 0, 0));
+    let coord = ChunkCoord::new(0, 0, 0);
+    let epoch = world.light_epoch;
+    let old_gen = world.chunks[&coord].light_gen;
+    world.light_inflight.insert(coord);
+    world.light_worklist.remove(&coord);
+    world.light_apply_queue.clear();
+    // Unload without releasing the in-flight claim — matches `unload_far`
+    // when the job has not yet landed in the apply queue.
+    world.chunks.remove(&coord).expect("origin pregenerated");
+    if let Some(ys) = world.column_chunks.get_mut(&(coord.x, coord.z)) {
+        ys.retain(|&y| y != coord.y);
+    }
+
+    let stone = world.registry.id_by_name("Stone").unwrap();
+    let (x, y, z) = (
+        coord.x * CHUNK_SIZE as i32 + 1,
+        coord.y * CHUNK_SIZE as i32 + 1,
+        coord.z * CHUNK_SIZE as i32 + 1,
+    );
+    world.set_block(x, y, z, stone);
+    world.ensure_data(coord);
+    assert!(world.chunks.contains_key(&coord), "regenerated");
+
+    <LightLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Light {
+            coord,
+            epoch,
+            light_gen: old_gen,
+            grid: light::LightGrid::full(),
+        },
+    );
+    let stale = light::LightGrid::full();
+    assert!(
+        world
+            .light_apply_queue
+            .iter()
+            .all(|(c, g)| *c != coord || *g != stale),
+        "stale grid must not transfer onto the new Loaded"
+    );
+    assert!(
+        world.chunks[&coord].light.as_ref() != Some(&stale),
+        "published light must not be the stale in-flight grid"
+    );
+    assert!(
+        !world.light_inflight.contains(&coord),
+        "the old claim must release so the new Loaded can settle"
+    );
+    assert!(
+        world.light_worklist.contains(&coord),
+        "the new Loaded is re-seeded for its own settle"
+    );
+    assert_ne!(
+        world.chunks[&coord].light_gen, old_gen,
+        "store mints a new per-Loaded generation"
+    );
+}
+
+/// `set_view_distances` clears `center` so the next stream is a full pass;
+/// `prune_upload_queue` then runs against the restored centre and releases
+/// queued uploads that left the new mesh box.
+#[test]
+fn view_shrink_prunes_uploads_outside_the_new_mesh_box() {
+    let mut world = World::generate();
+    let origin = ChunkCoord::new(0, 0, 0);
+    world.center = Some(origin);
+    world.set_view_radius(6);
+    world.center = Some(origin);
+    let inside = ChunkCoord::new(0, 0, 0);
+    let outside = ChunkCoord::new(5, 0, 0);
+    for &c in &[inside, outside] {
+        world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh {
+            building: true,
+            prev: None,
+        };
+        let rev = world.chunks[&c].rev;
+        world.upload_queue.push_back((c, rev, pipeline::MeshOutput::new()));
+    }
+    world.set_view_distances(1, 1);
+    assert!(world.center.is_none(), "shrink forces a full stream pass");
+    // Stream restores the centre before prune — mirror that order.
+    world.center = Some(origin);
+    world.pending_fresh.take();
+    world.mesh_worklist.clear();
+    world.prune_upload_queue();
+    assert_eq!(world.upload_queue.len(), 1, "only the in-box upload remains");
+    assert_eq!(world.upload_queue[0].0, inside);
+    assert!(
+        matches!(
+            world.chunks[&outside].state,
+            MeshState::NeedsMesh {
+                building: false,
+                ..
+            }
+        ),
+        "outside coord's mesh claim is released"
+    );
+    assert!(world.mesh_worklist.contains(&outside));
+    assert!(
+        matches!(
+            world.chunks[&inside].state,
+            MeshState::NeedsMesh {
+                building: true,
+                ..
+            }
+        ),
+        "in-box claim is untouched"
+    );
+}
+
+/// Old-epoch `Done::Light` must not touch a post-toggle claim, whether it
+/// arrives before or after the new claim is installed.
+#[test]
+fn transition_lighting_old_done_is_ignored_in_both_orders() {
+    let mut world = World::generate();
+    let coord = ChunkCoord::new(0, 0, 0);
+    let old_epoch = world.light_epoch;
+    let light_gen = world.chunks[&coord].light_gen;
+
+    assert!(world.transition_lighting(false));
+    // Order 1: old Done arrives while inflight is empty, then a new claim.
+    <LightLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Light {
+            coord,
+            epoch: old_epoch,
+            light_gen,
+            grid: light::LightGrid::dark(),
+        },
+    );
+    assert!(world.light_inflight.is_empty());
+    assert!(world.light_apply_queue.is_empty());
+    assert!(world.transition_lighting(true));
+    world.light_inflight.insert(coord);
+    <LightLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Light {
+            coord,
+            epoch: old_epoch,
+            light_gen,
+            grid: light::LightGrid::dark(),
+        },
+    );
+    assert!(
+        world.light_inflight.contains(&coord),
+        "order 1: new claim survives a late old-epoch Done"
+    );
+    assert!(world.light_apply_queue.is_empty());
+
+    // Order 2: new claim first (already installed), then old Done — the
+    // existing `stale_epoch_light_result_never_touches_a_newer_claim` case,
+    // re-checked after a full off/on cycle.
+    world.light_apply_queue.clear();
+    <LightLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Light {
+            coord,
+            epoch: old_epoch,
+            light_gen,
+            grid: light::LightGrid::full(),
+        },
+    );
+    assert!(world.light_inflight.contains(&coord));
+    assert!(world.light_apply_queue.is_empty());
+}
+
+/// A far-cap rejection leaves `section_pending_claim` set; the next accepted
+/// submit for a *different* key overwrites it, and claiming that key must
+/// install its own token — never the leftover.
+#[test]
+fn section_pending_claim_is_not_stolen_by_a_later_key() {
+    let mut world = lod2_world();
+    let a = SectionPos {
+        detail: section::FINEST_DETAIL,
+        x: 1,
+        z: 2,
+    };
+    let b = SectionPos {
+        detail: section::FINEST_DETAIL,
+        x: 3,
+        z: 4,
+    };
+    let job_a = <SectionLane as StreamLane>::submit(&mut world, a).expect("submit A");
+    let pipeline::Job::Section { token: token_a, .. } = job_a else {
+        panic!("expected a section job");
+    };
+    assert_eq!(world.section_pending_claim, Some((a, token_a)));
+    // Rejection: do not claim A. Submit B overwrites the leftover.
+    let job_b = <SectionLane as StreamLane>::submit(&mut world, b).expect("submit B");
+    let pipeline::Job::Section { token: token_b, .. } = job_b else {
+        panic!("expected a section job");
+    };
+    assert_ne!(token_a, token_b);
+    assert_eq!(world.section_pending_claim, Some((b, token_b)));
+    <SectionLane as StreamLane>::claim(&mut world, b);
+    assert!(world.section_pending_claim.is_none());
+    assert!(matches!(
+        world.sections.get(&b),
+        Some(SectionState::Meshing { token }) if *token == token_b
+    ));
+    assert!(!world.sections.contains_key(&a));
+}
+
+/// A late `Done::Section` from a retired epoch must not re-insert after the
+/// lane was drained (the `clear_section_lane` / `let _ = clear_far()` case).
+#[test]
+fn late_section_done_after_epoch_bump_does_not_reinsert() {
+    let mut world = lod2_world();
+    let pos = SectionPos {
+        detail: section::FINEST_DETAIL,
+        x: 2,
+        z: 2,
+    };
+    let token = pipeline::ClaimToken(9);
+    world.sections.insert(pos, SectionState::Meshing { token });
+    world.section_epoch = world.section_epoch.wrapping_add(1);
+    world.sections.clear();
+    world.section_upload_queue.clear();
+    world.section_pending_claim = None;
+    <SectionLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Section {
+            pos,
+            epoch: 0,
+            token,
+            meshes: Default::default(),
+        },
+    );
+    assert!(
+        world.sections.is_empty(),
+        "a retired-epoch result must not re-insert"
+    );
+    assert!(world.section_upload_queue.is_empty());
+}
+
+/// An edit landing on `NeedsMesh { building: true, prev: Some }` carries
+/// `prev` into `Dirty` and the in-flight result is dropped by rev.
+#[test]
+fn edit_mid_async_rebuild_keeps_prev_and_drops_the_orphan_by_rev() {
+    let mut world = World::generate();
+    world.center = Some(ChunkCoord::new(0, 0, 0));
+    let coord = ChunkCoord::new(0, 0, 0);
+    let h = MeshHandle::from_raw_parts(33, 1);
+    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh {
+        building: true,
+        prev: Some(meshes(h)),
+    };
+    let rev = world.chunks[&coord].rev;
+    world.set_block(2, 2, 2, AIR);
+    assert_eq!(
+        world.chunks[&coord].state,
+        MeshState::Dirty {
+            prev: Some(meshes(h))
+        }
+    );
+    assert_ne!(world.chunks[&coord].rev, rev);
+    world.pending_fresh.take();
+    world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
+    assert!(world.upload_queue.is_empty(), "orphan result dropped by rev");
+    assert_eq!(
+        world.chunks[&coord].state,
+        MeshState::Dirty {
+            prev: Some(meshes(h))
+        },
+        "the carried mesh keeps drawing through Dirty"
+    );
+}
+
+/// `flush_degraded_terminal` leaves a degraded in-flight build alone; the
+/// terminal mark is dropped on unload and on a lighting toggle.
+#[test]
+fn flush_degraded_leaves_inflight_and_terminal_clears_on_unload_or_toggle() {
+    let mut world = World::generate();
+    let c = ChunkCoord::new(0, 0, 0);
+    world.center = Some(c);
+    let h = MeshHandle::from_raw_parts(44, 1);
+    world.chunks.get_mut(&c).unwrap().state = MeshState::NeedsMesh {
+        building: true,
+        prev: Some(meshes(h)),
+    };
+    world.mark_degraded(c, true);
+    world.light_terminal.insert(c);
+    world.generating.clear();
+    world.mesh_worklist.clear();
+    world.light_worklist.clear();
+    world.light_inflight.clear();
+    world.light_apply_queue.clear();
+    world.flush_degraded_terminal();
+    assert!(
+        world.light_gate.degraded.contains(&c),
+        "in-flight degraded is left for its own Done"
+    );
+    assert!(matches!(
+        world.chunks[&c].state,
+        MeshState::NeedsMesh {
+            building: true,
+            prev: Some(_)
+        }
+    ));
+
+    world.chunks.remove(&c);
+    world.tick_light_gate();
+    assert!(
+        !world.light_terminal.contains(&c),
+        "tick reaps terminal marks for unloaded chunks"
+    );
+    assert!(!world.light_gate.degraded.contains(&c));
+
+    world.ensure_data(c);
+    world.light_terminal.insert(c);
+    assert!(world.transition_lighting(false));
+    assert!(
+        world.light_terminal.is_empty(),
+        "lighting toggle clears the terminal set"
+    );
+}
+
+/// `MeshLane::claim` is the only mutation of degraded/terminal; submit of a
+/// job that is never claimed leaves those marks intact.
+#[test]
+fn mesh_submit_without_claim_leaves_terminal_and_degraded_intact() {
+    let mut world = World::generate();
+    let c = ChunkCoord::new(0, 0, 0);
+    world.center = Some(c);
+    world.chunks.get_mut(&c).unwrap().state = MeshState::needs_mesh();
+    world.mark_degraded(c, true);
+    world.light_terminal.insert(c);
+    let _job = <MeshLane as StreamLane>::submit(&mut world, c).expect("job");
+    assert!(world.light_gate.degraded.contains(&c));
+    assert!(world.light_terminal.contains(&c));
+    assert_eq!(world.mesh_pending_degraded, Some((c, false)));
+    assert!(world.light_terminal.contains(&c));
+    assert!(world.light_gate.degraded.contains(&c));
+}
+
+/// Each handle is recorded exactly once through the free hook; carrying
+/// through invalidate does not free.
+#[test]
+fn mesh_free_hook_records_each_handle_once() {
+    let _ = mesh_free_log::take();
+    let h = MeshHandle::from_raw_parts(51, 1);
+    let mut state = ready(h);
+    state.invalidate();
+    assert!(mesh_free_log::take().is_empty(), "invalidate carries, does not free");
+    state.free_logged();
+    assert_eq!(mesh_free_log::take(), vec![h]);
+
+    let h2 = MeshHandle::from_raw_parts(52, 1);
+    let mut loaded = air_chunk(0, 0, 0);
+    loaded.state = ready(h2);
+    loaded.retire_logged(MeshState::Air);
+    assert_eq!(mesh_free_log::take(), vec![h2]);
+    loaded.retire_logged(MeshState::Air);
+    assert!(
+        mesh_free_log::take().is_empty(),
+        "a second retire of Air frees nothing"
+    );
+}
+
+#[test]
+fn player_dist2_is_non_wrapping_at_the_world_border() {
+    let s = CHUNK_SIZE as i64;
+    let border_cx = (crate::math::WORLD_BORDER as i32).div_euclid(CHUNK_SIZE as i32);
+    for cx in [0, 1, -1, border_cx, -border_cx] {
+        let center = ChunkCoord::new(cx, 0, cx);
+        let px = cx as i64 * s + s / 2;
+        assert_eq!(player_dist2(center, px, s / 2, px), 0);
+        let d = player_dist2(center, px + s, s / 2, px);
+        assert_eq!(d, (s * s) as u64, "one chunk east at cx={cx}");
+        let behind = player_dist2(center, px - s, s / 2, px);
+        assert_eq!(behind, (s * s) as u64, "one chunk west at cx={cx}");
+    }
+    let vel = DVec3::new(10.0, 0.0, 0.0);
+    let base = 1_000_000u64;
+    assert!(motion_biased_dist2(base, vel, 100.0, 0.0) < base);
+    assert!(motion_biased_dist2(base, vel, -100.0, 0.0) > base);
+    let extreme = motion_biased_dist2(base, vel, -1.0e9, 0.0);
+    assert!(extreme > base, "a trailing extreme still sorts farther");
+}
+
+/// Seeded random event sequences against a small world: after every step the
+/// claim invariants hold, and delivering every owed `Done` drains inflight
+/// claims.
+#[test]
+fn claim_invariants_hold_under_random_event_sequences() {
+    for seed in [1u64, 7, 99] {
+        claim_sequence(seed);
+    }
+}
+
+fn claim_sequence(seed: u64) {
+    let mut world = World::with_config_lazy(seed as i64, RenderConfig::default());
+    world.set_view_distances(2, 2);
+    let origin = ChunkCoord::new(0, 0, 0);
+    world.center = Some(origin);
+    world.ensure_region_data(origin);
+
+    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let next = |rng: &mut u64| {
+        *rng = rng.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(1);
+        *rng
+    };
+    let mut owed_light: FastMap<Coord, u32> = FastMap::default();
+    let mut owed_mesh: FastMap<Coord, u32> = FastMap::default();
+    let mut owed_section: FastMap<SectionPos, pipeline::ClaimToken> = FastMap::default();
+    let box_coords: Vec<Coord> = ChunkBox::new(origin, 2, 2).coords().collect();
+    let n = box_coords.len();
+
+    for _ in 0..80 {
+        let pick = (next(&mut rng) as usize) % 12;
+        let coord = box_coords[(next(&mut rng) as usize) % n];
+        match pick {
+            0 => {
+                if !world.chunks.contains_key(&coord) && !world.generating.contains(&coord) {
+                    world.ensure_data(coord);
+                }
+            }
+            1 => {
+                if world.chunks.contains_key(&coord) {
+                    world.chunks.remove(&coord);
+                    let drop_apply = world
+                        .light_apply_queue
+                        .iter()
+                        .any(|(c, _)| *c == coord);
+                    world.light_apply_queue.retain(|(c, _)| *c != coord);
+                    if drop_apply {
+                        world.light_inflight.remove(&coord);
+                        owed_light.remove(&coord);
+                    }
+                    world.light_terminal.remove(&coord);
+                    world.dirty_worklist.remove(&coord);
+                    world.mesh_worklist.remove(&coord);
+                }
+            }
+            2 => {
+                if matches!(
+                    world.chunks.get(&coord).map(|l| &l.state),
+                    Some(MeshState::NeedsMesh { building: false, .. })
+                ) {
+                    let rev = world.chunks[&coord].rev;
+                    <MeshLane as StreamLane>::claim(&mut world, coord);
+                    owed_mesh.insert(coord, rev);
+                }
+            }
+            3 => {
+                if let Some(&rev) = owed_mesh.get(&coord) {
+                    if next(&mut rng) % 3 == 0 {
+                        world.accept_mesh(coord, rev.wrapping_add(1), pipeline::MeshOutput::new());
+                    } else {
+                        world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
+                    }
+                    owed_mesh.remove(&coord);
+                }
+            }
+            4 => {
+                if owed_mesh.contains_key(&coord) {
+                    world.fail_job(pipeline::JobKey::Mesh { coord });
+                    owed_mesh.remove(&coord);
+                }
+            }
+            5 => {
+                if world.chunks.contains_key(&coord) && !world.light_inflight.contains(&coord) {
+                    let light_gen = world.chunks[&coord].light_gen;
+                    <LightLane as StreamLane>::claim(&mut world, coord);
+                    owed_light.insert(coord, light_gen);
+                }
+            }
+            6 => {
+                if let Some(&light_gen) = owed_light.get(&coord) {
+                    let epoch = world.light_epoch;
+                    let use_stale = next(&mut rng) % 4 == 0;
+                    <LightLane as StreamLane>::integrate(
+                        &mut world,
+                        pipeline::Done::Light {
+                            coord,
+                            epoch,
+                            light_gen: if use_stale {
+                                light_gen.wrapping_add(1)
+                            } else {
+                                light_gen
+                            },
+                            grid: light::LightGrid::dark(),
+                        },
+                    );
+                    owed_light.remove(&coord);
+                }
+            }
+            7 => {
+                if owed_light.contains_key(&coord) {
+                    world.cancel_job(pipeline::JobKey::Light { coord });
+                    owed_light.remove(&coord);
+                }
+            }
+            8 => {
+                if world.chunks.contains_key(&coord) {
+                    let (x, y, z) = (
+                        coord.x * CHUNK_SIZE as i32 + 1,
+                        coord.y * CHUNK_SIZE as i32 + 1,
+                        coord.z * CHUNK_SIZE as i32 + 1,
+                    );
+                    world.set_block(x, y, z, AIR);
+                    owed_mesh.remove(&coord);
+                }
+            }
+            9 => {
+                let on = !world.lighting();
+                world.transition_lighting(on);
+                owed_light.clear();
+            }
+            10 => {
+                let pos = SectionPos {
+                    detail: section::FINEST_DETAIL,
+                    x: coord.x,
+                    z: coord.z,
+                };
+                if !world.sections.contains_key(&pos) {
+                    if let Some(job) = <SectionLane as StreamLane>::submit(&mut world, pos) {
+                        let pipeline::Job::Section { token, .. } = job else {
+                            panic!("section");
+                        };
+                        <SectionLane as StreamLane>::claim(&mut world, pos);
+                        owed_section.insert(pos, token);
+                    }
+                } else if let Some(&token) = owed_section.get(&pos) {
+                    let epoch = world.section_epoch;
+                    <SectionLane as StreamLane>::integrate(
+                        &mut world,
+                        pipeline::Done::Section {
+                            pos,
+                            epoch,
+                            token,
+                            meshes: Default::default(),
+                        },
+                    );
+                    owed_section.remove(&pos);
+                }
+            }
+            _ => {
+                world.tick_light_gate();
+                world.flush_degraded_terminal();
+            }
+        }
+        world.debug_assert_liveness();
+        assert_claim_invariants(&world, &owed_light, &owed_mesh, &owed_section);
+    }
+
+    // Deliver every remaining owed Done and drain queues.
+    let mesh_left: Vec<_> = owed_mesh.iter().map(|(&c, &r)| (c, r)).collect();
+    for (coord, rev) in mesh_left {
+        world.accept_mesh(coord, rev, pipeline::MeshOutput::new());
+    }
+    let light_left: Vec<_> = owed_light.iter().map(|(&c, &g)| (c, g)).collect();
+    let light_epoch = world.light_epoch;
+    for (coord, light_gen) in light_left {
+        <LightLane as StreamLane>::integrate(
+            &mut world,
+            pipeline::Done::Light {
+                coord,
+                epoch: light_epoch,
+                light_gen,
+                grid: light::LightGrid::dark(),
+            },
+        );
+    }
+    let section_left: Vec<_> = owed_section.iter().map(|(&p, &t)| (p, t)).collect();
+    let section_epoch = world.section_epoch;
+    for (pos, token) in section_left {
+        <SectionLane as StreamLane>::integrate(
+            &mut world,
+            pipeline::Done::Section {
+                pos,
+                epoch: section_epoch,
+                token,
+                meshes: Default::default(),
+            },
+        );
+    }
+    world.light_apply_queue.clear();
+    world.light_inflight.clear();
+    world.upload_queue.clear();
+    world.section_upload_queue.clear();
+    for loaded in world.chunks.values_mut() {
+        if let MeshState::NeedsMesh { building: true, .. } = loaded.state {
+            loaded.state.release_build();
+        }
+    }
+    world.debug_assert_liveness();
+}
+
+fn assert_claim_invariants(
+    world: &World,
+    owed_light: &FastMap<Coord, u32>,
+    owed_mesh: &FastMap<Coord, u32>,
+    owed_section: &FastMap<SectionPos, pipeline::ClaimToken>,
+) {
+    for coord in &world.generating {
+        assert!(
+            !world.chunks.contains_key(coord),
+            "generating {coord:?} already has data"
+        );
+    }
+    for coord in &world.light_inflight {
+        let queued = world.light_apply_queue.iter().any(|(c, _)| c == coord);
+        assert!(
+            owed_light.contains_key(coord) || queued,
+            "{coord:?} in light_inflight with no owed Done and not queued"
+        );
+    }
+    for (coord, loaded) in &world.chunks {
+        if let MeshState::NeedsMesh { building: true, .. } = loaded.state {
+            let queued = world
+                .upload_queue
+                .iter()
+                .any(|(c, r, _)| c == coord && *r == loaded.rev);
+            assert!(
+                owed_mesh.contains_key(coord) || queued,
+                "{coord:?} building with no owed mesh Done and no matching upload"
+            );
+        }
+        let handles = loaded.state.live_handles();
+        let mut seen = FastSet::default();
+        for h in handles {
+            assert!(
+                seen.insert(h),
+                "{coord:?} carries the same handle twice"
+            );
+        }
+    }
+    for (pos, state) in &world.sections {
+        if let SectionState::Meshing { token } = state {
+            let queued = world
+                .section_upload_queue
+                .iter()
+                .any(|(p, t, _)| p == pos && t == token);
+            assert!(
+                owed_section.get(pos) == Some(token) || queued,
+                "{pos:?} meshing with no owed Done and not queued"
+            );
+        }
+    }
 }

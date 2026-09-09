@@ -99,9 +99,13 @@ pub(in crate::world) enum Job {
         snapshot: ChunkSnapshot,
     },
     /// Relax the light grid for `coord` from a frozen neighbourhood snapshot.
+    /// `light_gen` is the [`Loaded::light_gen`](super::Loaded) the snapshot was
+    /// taken against: a later resident at the same coord (unload then
+    /// regenerate) must not consume this result.
     Light {
         coord: Coord,
         epoch: u32,
+        light_gen: u32,
         snapshot: Box<LightSnapshot>,
     },
     /// Extract and mesh a section's columns at its detail level. Pure computation
@@ -200,6 +204,7 @@ pub(in crate::world) enum Done {
     Light {
         coord: Coord,
         epoch: u32,
+        light_gen: u32,
         grid: LightGrid,
     },
     Section {
@@ -1127,6 +1132,7 @@ fn run(job: Job) -> Done {
         Job::Light {
             coord,
             epoch,
+            light_gen,
             snapshot,
         } => {
             // Pure flood: same `propagate` the sync path called, now on an owned
@@ -1140,7 +1146,12 @@ fn run(job: Job) -> Done {
                 &snapshot.tables,
                 &mut grid,
             );
-            Done::Light { coord, epoch, grid }
+            Done::Light {
+                coord,
+                epoch,
+                light_gen,
+                grid,
+            }
         }
         Job::Section {
             pos,
@@ -1670,6 +1681,7 @@ mod tests {
                             visible: true,
                             light: None,
                             has_blocklight: false,
+                            light_gen: 0,
                         },
                     );
                 }
@@ -1824,5 +1836,20 @@ mod tests {
         check
             .recv_timeout(Duration::from_secs(10))
             .expect("Workers::drop hung");
+    }
+
+    #[test]
+    fn view_gate_wanted_roundtrips_negative_and_border_centres() {
+        let s = CHUNK_SIZE as i32;
+        let border = (crate::math::WORLD_BORDER as i32).div_euclid(s);
+        let gate = ViewGate::new();
+        for cx in [0, 1, -1, 7, -7, border, -border] {
+            gate.set(cx, -cx, 4);
+            assert_eq!(gate.center(), (cx, -cx), "packed centre round-trips");
+            assert!(gate.wanted(cx, -cx));
+            assert!(gate.wanted(cx + 4 + CANCEL_MARGIN, -cx));
+            assert!(!gate.wanted(cx + 4 + CANCEL_MARGIN + 1, -cx));
+            assert_eq!(gate.dist(cx, -cx), 0);
+        }
     }
 }

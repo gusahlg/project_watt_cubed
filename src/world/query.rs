@@ -382,6 +382,7 @@ mod tests {
                 visible: true,
                 light: None,
                 has_blocklight: false,
+                light_gen: 0,
             },
         );
     }

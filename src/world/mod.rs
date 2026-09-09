@@ -318,6 +318,11 @@ struct Loaded {
     /// so a uniform-air neighbour can reject the analytic sky path by testing
     /// six booleans instead of capturing a 3 KB face shell.
     has_blocklight: bool,
+    /// Identity of this `Loaded` for light-claim matching. Bumped at store so
+    /// a `Done::Light` captured against a previous resident at the same coord
+    /// (unload then regenerate, same `light_epoch`) cannot publish onto the
+    /// new voxels.
+    light_gen: u32,
 }
 
 impl Loaded {
@@ -328,6 +333,11 @@ impl Loaded {
     /// for double frees or leaks.
     fn retire(&mut self, next: MeshState, eng: &mut Engine) {
         std::mem::replace(&mut self.state, next).free_owned(eng);
+    }
+    /// Engine-free retire for claim tests that count frees through the hook.
+    #[cfg(test)]
+    fn retire_logged(&mut self, next: MeshState) {
+        std::mem::replace(&mut self.state, next).free_logged();
     }
 }
 
@@ -351,7 +361,30 @@ impl OwnedMesh {
     }
     /// Release the GPU allocation. Consumes `self`, so it can't be double-freed.
     fn free(self, eng: &mut Engine) {
+        #[cfg(test)]
+        mesh_free_log::record(self.0);
         eng.free_mesh(self.0);
+    }
+}
+
+/// Test-only log of handles passing through [`OwnedMesh::free`] / the
+/// engine-free `free_logged` path, so claim tests can count each free once
+/// without wrapping [`Engine`].
+#[cfg(test)]
+pub(in crate::world) mod mesh_free_log {
+    use std::cell::RefCell;
+    use voxel_engine::MeshHandle;
+
+    thread_local! {
+        static FREED: RefCell<Vec<MeshHandle>> = RefCell::new(Vec::new());
+    }
+
+    pub fn record(h: MeshHandle) {
+        FREED.with(|f| f.borrow_mut().push(h));
+    }
+
+    pub fn take() -> Vec<MeshHandle> {
+        FREED.with(|f| std::mem::take(&mut *f.borrow_mut()))
     }
 }
 
@@ -407,6 +440,14 @@ impl ChunkMeshes {
         self.0
             .iter()
             .any(|(_, m)| m.as_ref().is_some_and(|o| o.id() == handle))
+    }
+    /// Live handle ids, for the one-free-per-handle claim tests.
+    #[cfg(test)]
+    fn handles(&self) -> Vec<MeshHandle> {
+        self.0
+            .iter()
+            .filter_map(|(_, m)| m.as_ref().map(|o| o.id()))
+            .collect()
     }
 }
 
@@ -645,6 +686,23 @@ impl MeshState {
     fn is_dirty(&self) -> bool {
         matches!(self, MeshState::Dirty { .. })
     }
+    /// Live GPU handles this state currently carries (at most one `ChunkMeshes`).
+    #[cfg(test)]
+    fn live_handles(&self) -> Vec<MeshHandle> {
+        self.live_meshes()
+            .map(ChunkMeshes::handles)
+            .unwrap_or_default()
+    }
+    /// Record-and-drop the owned meshes without an [`Engine`] — fake test
+    /// handles never index GPU memory, so the engine free is skipped.
+    #[cfg(test)]
+    fn free_logged(self) {
+        if let Some(meshes) = self.into_owned() {
+            for h in meshes.handles() {
+                mesh_free_log::record(h);
+            }
+        }
+    }
 }
 
 /// The streamed world: the block palette, the terrain generator, the currently
@@ -811,6 +869,8 @@ pub struct World {
     /// Generation stamp for asynchronous light jobs. Toggling lighting advances
     /// it so a result captured under the previous mode cannot publish later.
     light_epoch: u32,
+    /// Per-`Loaded` light-claim identity (see [`Loaded::light_gen`]).
+    light_claim_seq: u32,
     /// LOD2 column-section far field enable.
     lod2: bool,
     /// LOD pyramid config with `unit` in metres.
@@ -1042,6 +1102,7 @@ impl World {
             stream_lanes: None,
             lighting: true,
             light_epoch: 0,
+            light_claim_seq: 0,
             lod2,
             section_pyramid: pyramid::PyramidCfg::sections_with(unit, lod_levels, lod_detail),
             section_eye_y: 0.0,
@@ -1848,6 +1909,9 @@ impl StreamLane for MeshLane {
         let degraded = match world.mesh_pending_degraded.take() {
             Some((coord, degraded)) if coord == key => degraded,
             pending => {
+                if let Some(leftover) = pending {
+                    world.mesh_pending_degraded = Some(leftover);
+                }
                 debug_assert!(
                     pending.is_none(),
                     "mesh claim for {key:?} with pending for {pending:?}"
@@ -1959,6 +2023,11 @@ impl StreamLane for SectionLane {
         let token = match world.section_pending_claim.take() {
             Some((pos, token)) if pos == key => token,
             other => {
+                // A far-cap rejection leaves the pending token set; a later
+                // claim for a different key must not consume it.
+                if let Some(pending) = other {
+                    world.section_pending_claim = Some(pending);
+                }
                 debug_assert!(
                     false,
                     "section claim for {key:?} without its submit ({other:?})"
@@ -2036,6 +2105,7 @@ impl StreamLane for LightLane {
         Some(pipeline::Job::Light {
             coord: key,
             epoch: world.light_epoch,
+            light_gen: world.chunks[&key].light_gen,
             snapshot: Box::new(snapshot),
         })
     }
@@ -2046,8 +2116,14 @@ impl StreamLane for LightLane {
     fn integrate(world: &mut World, done: pipeline::Done) {
         // `accept_light` owns the claim rule (release-or-transfer on every
         // consumed result) — see its doc for the epoch soundness argument.
-        if let pipeline::Done::Light { coord, epoch, grid } = done {
-            world.accept_light(coord, epoch, grid);
+        if let pipeline::Done::Light {
+            coord,
+            epoch,
+            light_gen,
+            grid,
+        } = done
+        {
+            world.accept_light(coord, epoch, light_gen, grid);
         }
     }
 }
