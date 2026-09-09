@@ -25,6 +25,10 @@ pub struct DiffusionCfg {
     pub phases: u32,
     /// Extra vertical relief scale (1 = default).
     pub relief: f32,
+    /// 1 = overlapping f32 field ([`DiffusionTerrain`]); 2 = integer v2
+    /// ([`super::diffusion_v2::DiffusionV2`]). Knob list is unchanged; v2 is
+    /// selected only through this field (W6 switches the mod over).
+    pub version: u8,
 }
 
 impl Default for DiffusionCfg {
@@ -34,6 +38,7 @@ impl Default for DiffusionCfg {
             stride: 16,
             phases: 2,
             relief: 1.0,
+            version: 1,
         }
     }
 }
@@ -53,15 +58,24 @@ impl DiffusionCfg {
         self.stride = snap_stride(self.stride, self.tile);
         self.phases = self.phases.clamp(Self::PHASES_MIN, Self::PHASES_MAX);
         self.relief = snap_f32(&Self::RELIEFS, self.relief);
+        self.version = self.version.clamp(1, 2);
         self
     }
 
     /// Wire form of the diffusion worldgen payload (`tile=…,stride=…,…`).
+    /// `version` is omitted at 1 so existing save / mod-state bytes stay put.
     pub fn to_text(self) -> String {
-        format!(
-            "tile={},stride={},phases={},relief={:.2}",
-            self.tile, self.stride, self.phases, self.relief
-        )
+        if self.version == 1 {
+            format!(
+                "tile={},stride={},phases={},relief={:.2}",
+                self.tile, self.stride, self.phases, self.relief
+            )
+        } else {
+            format!(
+                "tile={},stride={},phases={},relief={:.2},version={}",
+                self.tile, self.stride, self.phases, self.relief, self.version
+            )
+        }
     }
 
     /// Parse a full or partial knob string, starting from the defaults.
@@ -80,6 +94,7 @@ impl DiffusionCfg {
                 "stride" => self.stride = v.parse().unwrap_or(self.stride),
                 "phases" => self.phases = v.parse().unwrap_or(self.phases),
                 "relief" => self.relief = v.parse().unwrap_or(self.relief),
+                "version" => self.version = v.parse().unwrap_or(self.version),
                 _ => {}
             }
         }
@@ -435,6 +450,10 @@ pub fn diffusion(registry: &mut BlockRegistry, seed: i64, cfg: DiffusionCfg) -> 
     Arc::new(DiffusionTerrain::new(registry, cfg, seed))
 }
 
+pub fn diffusion_v2(registry: &mut BlockRegistry, seed: i64, cfg: DiffusionCfg) -> Generator {
+    Arc::new(super::diffusion_v2::DiffusionV2::new(registry, cfg, seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +486,7 @@ mod tests {
             stride: 16,
             phases: 4,
             relief: 1.5,
+            version: 1,
         }
         .clamp();
         assert_eq!(DiffusionCfg::from_text(&cfg.to_text()), cfg);
@@ -476,6 +496,14 @@ mod tests {
             64,
             "partial overlay on defaults"
         );
+        let v2 = DiffusionCfg {
+            version: 2,
+            ..DiffusionCfg::default()
+        }
+        .clamp();
+        assert_eq!(DiffusionCfg::from_text(&v2.to_text()), v2);
+        assert_eq!(DiffusionCfg::from_text("version=2").version, 2);
+        assert_eq!(DiffusionCfg::from_text("").version, 1);
     }
 
     #[test]
@@ -485,6 +513,7 @@ mod tests {
             stride: 80,
             phases: 1,
             relief: 9.0,
+            version: 1,
         }
         .clamp();
         assert_eq!(cfg.tile, 64);
@@ -501,6 +530,7 @@ mod tests {
             stride: 12,
             phases: 1,
             relief: 0.25,
+            version: 1,
         }
         .clamp();
         assert!(

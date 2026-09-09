@@ -222,6 +222,7 @@ fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
         stride: stamp.stride,
         phases: stamp.phases,
         relief: stamp.relief,
+        version: 1,
     }
     .clamp();
     (kind, cfg)

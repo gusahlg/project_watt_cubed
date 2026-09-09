@@ -91,6 +91,7 @@ impl Wire for DiffusionCfg {
             stride: r.u32().ok()?,
             phases: r.u32().ok()?,
             relief: r.f32().ok()?,
+            version: 1,
         })
     }
 }
@@ -444,6 +445,7 @@ mod tests {
                     stride: 8,
                     phases: 4,
                     relief: 1.5,
+                    version: 1,
                 },
             },
             ServerMessage::Reject { reason: "bad password".into() },

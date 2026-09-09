@@ -32,6 +32,7 @@ pub mod brick;
 pub mod chunk;
 pub mod connectivity;
 pub mod diffusion;
+pub mod diffusion_v2;
 pub mod generation;
 pub mod light;
 pub mod lod;
@@ -1087,7 +1088,13 @@ impl World {
         let mut registry = BlockRegistry::with_builtins();
         let generator = match kind {
             WorldgenKind::Classic => diffusion::classic(&mut registry, seed),
-            WorldgenKind::Diffusion => diffusion::diffusion(&mut registry, seed, field),
+            WorldgenKind::Diffusion => {
+                if field.version >= 2 {
+                    diffusion::diffusion_v2(&mut registry, seed, field)
+                } else {
+                    diffusion::diffusion(&mut registry, seed, field)
+                }
+            }
         };
         // The section ladder's innermost ring begins where the full-res box ends,
         // so its `unit` is the render distance in metres.
