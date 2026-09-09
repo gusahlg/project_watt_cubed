@@ -652,9 +652,8 @@ mod tests {
     /// gauge for the row-wise capture redesign. Ignored: a timing benchmark,
     /// not a correctness gate. Run with
     /// `cargo test --release padded_capture_throughput -- --ignored --nocapture`.
-    /// 2026-07-19 (12-core box), per-cell closure capture: ~26.7k captures/s;
-    /// row-wise (`capture_rows` + `copy_row`): ~337k captures/s (12.7×).
-    /// 2026-09-08: before 456k captures/s; after gated fill 468k captures/s (median of 3).
+    /// 2026-07-19: 337k captures/s (12-core box, row-wise capture_rows+copy_row; per-cell closure ~26.7k, 12.7×).
+    /// 2026-09-08: 468k captures/s (median of 3; before gated fill 456k).
     #[test]
     #[ignore]
     fn padded_capture_throughput() {

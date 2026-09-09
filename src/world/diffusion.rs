@@ -420,6 +420,8 @@ mod tests {
         }
     }
 
+    /// Column generation cost, n=24 × 4 layers. Ignored timing gauge.
+    /// Run with `cargo test --release worldgen_column_cost -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn worldgen_column_cost() {

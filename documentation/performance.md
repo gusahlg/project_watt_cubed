@@ -85,6 +85,9 @@ The client/server message enums and their binary codec are generated from one `m
 
 ## Benchmark procedure
 
+Headless `#[ignore]` unit throughput benches are driven by [`scripts/bench-unit.sh`](../scripts/bench-unit.sh): one release lib build, then each pinned bench three times with the median compared to the dated pin in its doc comment.
+Pass `--json` to also write the same rows as JSON lines to `benchmarks/unit.jsonl`.
+
 Use the release profile in [`Cargo.toml`](../Cargo.toml). Build once so compilation is outside every sample:
 
 ```sh

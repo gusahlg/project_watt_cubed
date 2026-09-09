@@ -559,8 +559,7 @@ mod tests {
     /// propagate opacity-bitset redesign. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release light_propagate_throughput -- --ignored --nocapture`.
-    /// 2026-07-19 (12-core box), per-probe `get_local`: ~18.1k settles/s;
-    /// decoded opacity bitset: ~32.6k settles/s (1.8×).
+    /// 2026-07-19: 32.6k settles/s (12-core box, decoded opacity bitset; per-probe get_local ~18.1k, 1.8×).
     #[test]
     #[ignore]
     fn light_propagate_throughput() {

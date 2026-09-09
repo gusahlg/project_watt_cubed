@@ -955,7 +955,7 @@ mod tests {
     /// stride-walk / pooled-output rewrite. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release far_lod_section_mesh -- --ignored --nocapture`.
-    /// 2026-09-09: before 9.53 ms/section; after 9.34 ms/section (median of 3).
+    /// 2026-09-09: 9.34 ms/section (median of 3; before stride-walk/pooled-output 9.53).
     #[test]
     #[ignore]
     fn far_lod_section_mesh() {

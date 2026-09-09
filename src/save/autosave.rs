@@ -358,8 +358,7 @@ mod tests {
     /// Main-thread snapshot vs writer-thread encode+write on a 100k-edit overlay.
     /// Ignored: a timing probe, not a correctness gate. Run with
     /// `cargo test -j 4 --release --lib autosave_snapshot_and_encode_at_100k_edits -- --ignored --nocapture`.
-    /// 2026-09-09 (this box, median of 5): snapshot 1.12 ms, encode 7.07 ms,
-    /// write 2.54 ms, encode+write 9.61 ms.
+    /// 2026-09-09: 1.12 ms (this box, median of 5; snapshot on caller; encode 7.07 ms, write 2.54 ms, encode+write 9.61 ms).
     #[test]
     #[ignore]
     fn autosave_snapshot_and_encode_at_100k_edits() {
