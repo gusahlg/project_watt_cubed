@@ -269,8 +269,13 @@ pub fn max_lod_levels(detail: u8) -> u8 {
     (LOD_COARSEST_DETAIL - detail + 1).min(*LOD_LEVELS_RANGE.end())
 }
 
-/// Fraction of [`DeviceCaps::device_local_memory_bytes`] reserved for render
-/// targets. The rest is for the driver, mesh arenas, and other processes.
+/// Percent of live free device-local bytes ([`DeviceCaps::available_device_bytes`])
+/// reserved for render targets. The rest is for meshes, textures, and the swapchain.
+pub const VRAM_AVAILABLE_SAFETY_FRACTION: u64 = 85;
+
+/// Percent of [`DeviceCaps::device_local_memory_bytes`] reserved for render
+/// targets when the live budget is unavailable. The rest is for the driver,
+/// mesh arenas, and other processes.
 pub const VRAM_SAFETY_FRACTION: u64 = 60;
 
 /// Floor used when dropping `render_scale` to fit the VRAM budget.
@@ -298,23 +303,35 @@ const SKY_CLOUD_LUT: u64 = 256;
 const BLOOM_MIPS: u32 = 3;
 
 /// GPU facts probed once at startup (Vulkan heaps + framebuffer samples).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceCaps {
     pub device_local_memory_bytes: Option<u64>,
+    /// `heapBudget - heapUsage` on device-local heaps when `VK_EXT_memory_budget`
+    /// is present; `None` falls back to the heap-size rule.
+    pub available_device_bytes: Option<u64>,
     pub max_msaa: u32,
 }
 
 impl Default for DeviceCaps {
     fn default() -> Self {
-        Self { device_local_memory_bytes: None, max_msaa: 8 }
+        Self {
+            device_local_memory_bytes: None,
+            available_device_bytes: None,
+            max_msaa: 8,
+        }
     }
 }
 
 impl DeviceCaps {
-    /// 60% of device-local heap, if the probe succeeded.
+    /// Live free × [`VRAM_AVAILABLE_SAFETY_FRACTION`], else heap ×
+    /// [`VRAM_SAFETY_FRACTION`]. `None` skips the session VRAM guard.
     pub fn render_target_budget_bytes(self) -> Option<u64> {
-        self.device_local_memory_bytes
-            .map(|bytes| bytes.saturating_mul(VRAM_SAFETY_FRACTION) / 100)
+        if let Some(available) = self.available_device_bytes {
+            Some(available.saturating_mul(VRAM_AVAILABLE_SAFETY_FRACTION) / 100)
+        } else {
+            self.device_local_memory_bytes
+                .map(|bytes| bytes.saturating_mul(VRAM_SAFETY_FRACTION) / 100)
+        }
     }
 }
 
@@ -408,18 +425,26 @@ pub struct SessionGraphics {
 }
 
 /// Drop MSAA to the next supported count, then `render_scale` in 0.25 steps
-/// (not below [`VRAM_SCALE_FLOOR`]), until [`render_target_bytes`] fits `budget`.
+/// (not below [`VRAM_SCALE_FLOOR`]), until [`render_target_bytes`] fits the
+/// budget from [`DeviceCaps::render_target_budget_bytes`]. If even the floor
+/// does not fit, start at 1× MSAA and [`VRAM_SCALE_FLOOR`] and say so.
 pub fn fit_render_targets(
     width: u32,
     height: u32,
     render_scale: f32,
     msaa: u32,
     lanes: RenderConfig,
-    budget: u64,
-    max_msaa: u32,
+    caps: DeviceCaps,
 ) -> SessionGraphics {
-    let requested_msaa = snap_msaa(msaa, max_msaa);
     let requested_scale = render_scale;
+    let Some(budget) = caps.render_target_budget_bytes() else {
+        return SessionGraphics {
+            msaa: msaa.min(caps.max_msaa).max(1),
+            render_scale: requested_scale,
+            notice: None,
+        };
+    };
+    let requested_msaa = snap_msaa(msaa, caps.max_msaa);
     let needed = render_target_bytes(width, height, requested_scale, requested_msaa, lanes);
     if needed <= budget {
         return SessionGraphics {
@@ -443,11 +468,14 @@ pub fn fit_render_targets(
         let snapped = (chosen_scale / VRAM_SCALE_STEP).round() * VRAM_SCALE_STEP;
         let next_scale = snapped - VRAM_SCALE_STEP;
         if next_scale + 1e-4 < VRAM_SCALE_FLOOR {
+            chosen_msaa = 1;
+            chosen_scale = VRAM_SCALE_FLOOR;
             break;
         }
         chosen_scale = next_scale.max(VRAM_SCALE_FLOOR);
     }
 
+    let chosen_cost = render_target_bytes(width, height, chosen_scale, chosen_msaa, lanes);
     SessionGraphics {
         msaa: chosen_msaa,
         render_scale: chosen_scale,
@@ -457,7 +485,10 @@ pub fn fit_render_targets(
             needed,
             chosen_msaa,
             chosen_scale,
+            chosen_cost,
+            chosen_cost > budget,
             budget,
+            caps,
         )),
     }
 }
@@ -467,18 +498,44 @@ fn snap_msaa(requested: u32, max_msaa: u32) -> u32 {
     MSAA_STEPS.iter().copied().find(|&n| n <= cap).unwrap_or(1)
 }
 
+fn gb(bytes: u64) -> f64 {
+    bytes as f64 / 1_000_000_000.0
+}
+
 fn vram_notice(
     req_msaa: u32,
     req_scale: f32,
     needed: u64,
     run_msaa: u32,
     run_scale: f32,
+    run_cost: u64,
+    floor_exceeded: bool,
     budget: u64,
+    caps: DeviceCaps,
 ) -> String {
-    let need_gb = needed as f64 / 1_000_000_000.0;
-    let budget_gb = budget as f64 / 1_000_000_000.0;
+    let need_gb = gb(needed);
     let req_pct = (req_scale * 100.0).round() as i32;
     let run_pct = (run_scale * 100.0).round() as i32;
+    let head = match (caps.available_device_bytes, caps.device_local_memory_bytes) {
+        (Some(available), Some(heap)) => {
+            let held = heap.saturating_sub(available);
+            format!(
+                "graphics: {req_msaa}x MSAA at {req_pct}% scale needs ~{need_gb:.1} GB; {avail:.1} GB of {heap:.1} GB is free (other processes hold {held:.1} GB)",
+                avail = gb(available),
+                heap = gb(heap),
+                held = gb(held),
+            )
+        }
+        _ => format!(
+            "graphics: {req_msaa}x MSAA at {req_pct}% scale needs ~{need_gb:.1} GB of VRAM for render targets"
+        ),
+    };
+    if floor_exceeded {
+        return format!(
+            "{head}; {run_msaa}x MSAA at {run_pct}% scale still needs ~{run:.1} GB; starting at that floor anyway",
+            run = gb(run_cost),
+        );
+    }
     let running = if run_msaa != req_msaa && (run_scale - req_scale).abs() > 1e-3 {
         format!("{run_msaa}x MSAA, {run_pct}% scale")
     } else if run_msaa != req_msaa {
@@ -486,9 +543,13 @@ fn vram_notice(
     } else {
         format!("{run_pct}% scale")
     };
-    format!(
-        "graphics: {req_msaa}x MSAA at {req_pct}% scale needs ~{need_gb:.1} GB of VRAM for render targets; running at {running} this session (budget {budget_gb:.1} GB)"
-    )
+    match caps.available_device_bytes {
+        Some(_) => format!("{head}; running at {running} this session"),
+        None => format!(
+            "{head}; running at {running} this session (budget {budget:.1} GB)",
+            budget = gb(budget),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +638,22 @@ mod tests {
         assert!(bytes < 4_800_000_000, "1080p must fit 4.8 GB, got {bytes}");
     }
 
+    fn heap_caps(heap: u64, max_msaa: u32) -> DeviceCaps {
+        DeviceCaps {
+            device_local_memory_bytes: Some(heap),
+            available_device_bytes: None,
+            max_msaa,
+        }
+    }
+
+    fn live_caps(heap: u64, available: u64, max_msaa: u32) -> DeviceCaps {
+        DeviceCaps {
+            device_local_memory_bytes: Some(heap),
+            available_device_bytes: Some(available),
+            max_msaa,
+        }
+    }
+
     #[test]
     fn degrade_drops_msaa_before_scale_and_respects_floor() {
         let lanes = user_ultrawide_lanes();
@@ -584,17 +661,66 @@ mod tests {
         let needed_4 = render_target_bytes(3440, 1440, 2.0, 4, lanes);
         assert!(needed_8 > needed_4);
 
-        let msaa_only = fit_render_targets(3440, 1440, 2.0, 8, lanes, needed_4, 8);
+        // Heap-only: 60% of heap sits in [needed_4, needed_8), so 4× fits and 8× does not.
+        let heap_for_4 = needed_4.div_ceil(VRAM_SAFETY_FRACTION).saturating_mul(100);
+        assert!(
+            heap_caps(heap_for_4, 8).render_target_budget_bytes().unwrap() >= needed_4
+                && heap_caps(heap_for_4, 8).render_target_budget_bytes().unwrap() < needed_8
+        );
+        let msaa_only = fit_render_targets(3440, 1440, 2.0, 8, lanes, heap_caps(heap_for_4, 8));
         assert_eq!(msaa_only.msaa, 4);
         assert!((msaa_only.render_scale - 2.0).abs() < 1e-4, "scale stays until MSAA is 1");
-        assert!(msaa_only.notice.as_ref().unwrap().contains("4x MSAA"));
-        assert!(!msaa_only.notice.as_ref().unwrap().contains("% scale this session"));
+        let n = msaa_only.notice.as_ref().unwrap();
+        assert!(n.contains("4x MSAA"));
+        assert!(!n.contains("% scale this session"));
+        assert!(n.contains("budget"));
 
-        let tiny = fit_render_targets(3440, 1440, 2.0, 8, lanes, 1, 8);
+        let tiny = fit_render_targets(3440, 1440, 2.0, 8, lanes, heap_caps(1, 8));
         assert_eq!(tiny.msaa, 1);
         assert!((tiny.render_scale - VRAM_SCALE_FLOOR).abs() < 1e-4);
         let n = tiny.notice.unwrap();
         assert!(n.contains("1x MSAA"));
         assert!(n.contains("50% scale"));
+        assert!(n.contains("starting at that floor anyway"));
+    }
+
+    #[test]
+    fn live_available_budget_beats_heap_size() {
+        let lanes = user_ultrawide_lanes();
+        let caps = live_caps(8_000_000_000, 2_000_000_000, 8);
+        let budget = caps.render_target_budget_bytes().unwrap();
+        assert_eq!(budget, 2_000_000_000 * VRAM_AVAILABLE_SAFETY_FRACTION / 100);
+        assert_eq!(budget, 1_700_000_000);
+
+        let needed_8 = render_target_bytes(3440, 1440, 2.0, 8, lanes);
+        assert!(needed_8 > budget, "8× 200% must miss a 1.7 GB live budget, got {needed_8}");
+
+        let fitted = fit_render_targets(3440, 1440, 2.0, 8, lanes, caps);
+        let cost = render_target_bytes(3440, 1440, fitted.render_scale, fitted.msaa, lanes);
+        assert!(
+            cost <= budget,
+            "fitted {fitted:?} costs {cost}, budget {budget}"
+        );
+        let n = fitted.notice.as_ref().expect("live over-budget request prints a notice");
+        assert!(
+            n.contains("2.0 GB of 8.0 GB is free (other processes hold 6.0 GB)"),
+            "{n}"
+        );
+        assert!(n.contains("8x MSAA at 200% scale needs"), "{n}");
+        assert!(n.contains("running at"), "{n}");
+        assert!(!n.contains("budget "), "{n}");
+    }
+
+    #[test]
+    fn heap_only_fallback_keeps_sixty_percent_rule() {
+        let lanes = user_ultrawide_lanes();
+        let caps = heap_caps(8_000_000_000, 8);
+        assert_eq!(caps.render_target_budget_bytes(), Some(4_800_000_000));
+        let fitted = fit_render_targets(3440, 1440, 2.0, 8, lanes, caps);
+        let cost = render_target_bytes(3440, 1440, fitted.render_scale, fitted.msaa, lanes);
+        assert!(cost <= 4_800_000_000, "heap fallback fitted cost {cost}");
+        let n = fitted.notice.as_ref().expect("8× 200% exceeds 4.8 GB");
+        assert!(n.contains("budget 4.8 GB"), "{n}");
+        assert!(!n.contains("is free"), "{n}");
     }
 }

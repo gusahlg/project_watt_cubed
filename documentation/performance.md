@@ -33,6 +33,14 @@ Measured 2026-09-09 on louise-pc (RTX 4060, 1920×1080 fullscreen, engine main `
 
 That branch's Default rendered at 1536×864 (`render_scale_auto: true`, 0.8) but the bench JSON showed `"taa": false` — a plain 0.8 upscale that was ~15% slower than native on this GPU-light preset. Minimum and Fast are unchanged (no auto scale). Native 1.0 Default is the control until TAAU lands. Custom keeps the user's explicit scale and TAA.
 
+## VRAM guard
+
+Startup probes Vulkan once (`src/benchmark/system.rs`, the same path as the benchmark GPU inventory). When the physical device lists `VK_EXT_memory_budget`, the probe enables that extension on a throwaway device and reads `VkPhysicalDeviceMemoryBudgetPropertiesEXT`: free device-local bytes are `heapBudget[i] - heapUsage[i]` summed over device-local heaps. Render-target MSAA and scale are then session-fitted against **that live free amount × 0.85** (`VRAM_AVAILABLE_SAFETY_FRACTION`), leaving headroom for meshes, textures, and the swapchain. If the extension is missing, the older rule is used: 60% of device-local heap size.
+
+The degrade ladder is MSAA 8→4→2→1, then render scale in −0.25 steps down to 0.5. Cuts are this session only (settings.cfg is not rewritten). A `graphics:` line names the request, the free/held split (or the heap budget when live data is absent), and what this session actually runs. The settings screen shows the same notice.
+
+If even 1× MSAA at 50% scale does not fit, the game still starts at that floor and prints why. The guard cannot re-fit after the engine process has already failed to allocate: an `ERROR_OUT_OF_DEVICE_MEMORY` (or similar) at render-target creation is the real failure. Close other GPU-heavy programs, then lower MSAA and render scale in settings before starting again.
+
 The independent performance controls are:
 
 - `render_distance`: 0–20 horizontal chunk rings; zero draws only the current chunk column while retaining an unmeshed collision/data halo. `vertical_distance`: 1–10 chunk layers above and below the eye. Separating them avoids loading tall columns of invisible sky and deep rock.
