@@ -117,6 +117,8 @@ impl App {
         mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
         let saves = save::list();
         let mut settings = Settings::load();
+        let (caps, display) = crate::benchmark::graphics_caps();
+        settings.set_device_caps(caps, display);
         let session = Session::load();
         let bench = Benchmark::from_env();
         // A reproducible benchmark can pin a performance profile without
@@ -171,14 +173,24 @@ impl App {
         let mut app = self;
         // Starts on menus (or uncapped if this process is a bench).
         let (vsync, target_fps) = pacing(false, app.bench.is_some(), &app.settings);
+        let (extent_w, extent_h) = if app.settings.fullscreen {
+            (app.settings.startup_display_w, app.settings.startup_display_h)
+        } else {
+            (STARTING_WINDOW_WIDTH, STARTING_WINDOW_HEIGHT)
+        };
+        let session_gfx = app.settings.session_graphics(extent_w, extent_h);
+        if let Some(line) = session_gfx.notice.as_ref() {
+            eprintln!("{line}");
+            app.settings.vram_notice = session_gfx.notice.clone();
+        }
         let config = voxel_engine::Config {
             title: "Project Watt Cubed".into(),
             width: STARTING_WINDOW_WIDTH,
             height: STARTING_WINDOW_HEIGHT,
             target_fps,
             vsync,
-            msaa: app.settings.msaa,
-            render_scale: app.settings.render_scale,
+            msaa: session_gfx.msaa,
+            render_scale: session_gfx.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
             // Engine-side render lanes from the effective (mod-masked) config.
@@ -219,6 +231,10 @@ impl App {
             self.flush_save();
             return false;
         }
+        // VRAM guard + live settings: one push per frame so a resize cannot
+        // allocate MSAA/scale the probe already refused.
+        self.settings.apply(eng);
+        eng.set_flags(self.mods.effective_render(&self.settings).engine_flags());
         // Apply only on change: a SetVsync every menu frame was waking the
         // render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
@@ -386,9 +402,6 @@ impl App {
             };
             effect = stack.update(&intents, &mut ctx);
         }
-        // Apply every frame for immediate feedback and to show hardware clamps.
-        self.settings.apply(eng);
-        eng.set_flags(self.mods.effective_render(&self.settings).engine_flags());
         // Persist whenever a step (or a hardware clamp) moved a value.
         if self.settings != before {
             self.settings.save();

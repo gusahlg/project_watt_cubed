@@ -187,6 +187,7 @@ struct GpuInfo {
     driver_info: Option<String>,
     driver_id: i32,
     local_memory_bytes: u64,
+    max_msaa: u32,
     engine_candidate: bool,
     likely_used: bool,
 }
@@ -276,6 +277,10 @@ fn probe_vulkan() -> Result<GpuProbe, String> {
                 .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
                 .map(|heap| heap.size)
                 .sum();
+            let max_msaa = max_sample_count(
+                properties.limits.framebuffer_color_sample_counts
+                    & properties.limits.framebuffer_depth_sample_counts,
+            );
             let engine_candidate = engine_feature_candidate(&instance, pd, properties.api_version);
             devices.push(GpuInfo {
                 name: c_char_string(&properties.device_name).unwrap_or_else(|| "unknown".into()),
@@ -287,6 +292,7 @@ fn probe_vulkan() -> Result<GpuProbe, String> {
                 driver_info: c_char_string(&driver.driver_info),
                 driver_id: driver.driver_id.as_raw(),
                 local_memory_bytes,
+                max_msaa,
                 engine_candidate,
                 likely_used: false,
             });
@@ -373,6 +379,50 @@ fn c_char_string<const N: usize>(raw: &[std::ffi::c_char; N]) -> Option<String> 
         .trim()
         .to_string();
     (!value.is_empty()).then_some(value)
+}
+
+fn max_sample_count(flags: vk::SampleCountFlags) -> u32 {
+    for (bit, n) in [
+        (vk::SampleCountFlags::TYPE_8, 8),
+        (vk::SampleCountFlags::TYPE_4, 4),
+        (vk::SampleCountFlags::TYPE_2, 2),
+    ] {
+        if flags.contains(bit) {
+            return n;
+        }
+    }
+    1
+}
+
+/// Device-local heap, framebuffer MSAA ceiling, and the largest connected
+/// display — the startup VRAM guard's one probe (same Vulkan path as the
+/// benchmark report).
+pub(crate) fn graphics_caps() -> (crate::render_config::DeviceCaps, (u32, u32)) {
+    let gpu = GpuProbe::collect();
+    let chosen = gpu
+        .devices
+        .iter()
+        .find(|d| d.likely_used)
+        .or_else(|| {
+            gpu.devices
+                .iter()
+                .filter(|d| d.engine_candidate)
+                .max_by_key(|d| d.local_memory_bytes)
+        })
+        .or_else(|| gpu.devices.iter().max_by_key(|d| d.local_memory_bytes));
+    let caps = crate::render_config::DeviceCaps {
+        device_local_memory_bytes: chosen.map(|d| d.local_memory_bytes),
+        max_msaa: chosen.map(|d| d.max_msaa).unwrap_or(8),
+    };
+    (caps, largest_display_extent())
+}
+
+fn largest_display_extent() -> (u32, u32) {
+    connected_monitors()
+        .iter()
+        .filter_map(|m| m.preferred_mode.map(|(w, h, _)| (w, h)))
+        .max_by_key(|&(w, h)| w.saturating_mul(h))
+        .unwrap_or((3840, 2160))
 }
 
 fn device_type_name(kind: vk::PhysicalDeviceType) -> &'static str {

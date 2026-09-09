@@ -212,6 +212,228 @@ pub fn max_lod_levels(detail: u8) -> u8 {
     (LOD_COARSEST_DETAIL - detail + 1).min(*LOD_LEVELS_RANGE.end())
 }
 
+/// Fraction of [`DeviceCaps::device_local_memory_bytes`] reserved for render
+/// targets. The rest is for the driver, mesh arenas, and other processes.
+pub const VRAM_SAFETY_FRACTION: u64 = 60;
+
+/// Floor used when dropping `render_scale` to fit the VRAM budget.
+pub const VRAM_SCALE_FLOOR: f32 = 0.5;
+const VRAM_SCALE_STEP: f32 = 0.25;
+
+/// Sample counts the engine will actually create, descending.
+const MSAA_STEPS: &[u32] = &[8, 4, 2, 1];
+
+/// Conservative colour bytes/pixel. Engine colour targets are
+/// `R16G16B16A16_SFLOAT` (8 B/px in `voxel-engine/src/vk/targets.rs`); the
+/// budget uses 16 B/px so image-memory rounding, padding, and uncounted
+/// attachments stay inside ±20%.
+const HDR_COLOR_BYTES: u64 = 16;
+/// Engine depth is `D32_SFLOAT` (or a 4-byte packed fallback).
+const DEPTH_BYTES: u64 = 4;
+/// `FRAMES_IN_FLIGHT` in `voxel-engine/src/vk/buffers.rs`.
+const FRAMES_IN_FLIGHT: u64 = 2;
+/// `SHADOW_RESOLUTION` / `SHADOW_CASCADES` / `D32_SFLOAT` in targets.rs.
+const SHADOW_RESOLUTION: u64 = 2048;
+const SHADOW_CASCADES: u64 = 2;
+/// `SKY_CLOUD_LUT_SIZE` (RGBA16F, budgeted at [`HDR_COLOR_BYTES`]).
+const SKY_CLOUD_LUT: u64 = 256;
+/// `BLOOM_MAX_MIPS` in targets.rs (half-res base + two more lods).
+const BLOOM_MIPS: u32 = 3;
+
+/// GPU facts probed once at startup (Vulkan heaps + framebuffer samples).
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceCaps {
+    pub device_local_memory_bytes: Option<u64>,
+    pub max_msaa: u32,
+}
+
+impl Default for DeviceCaps {
+    fn default() -> Self {
+        Self { device_local_memory_bytes: None, max_msaa: 8 }
+    }
+}
+
+impl DeviceCaps {
+    /// 60% of device-local heap, if the probe succeeded.
+    pub fn render_target_budget_bytes(self) -> Option<u64> {
+        self.device_local_memory_bytes
+            .map(|bytes| bytes.saturating_mul(VRAM_SAFETY_FRACTION) / 100)
+    }
+}
+
+/// Bytes the engine is expected to spend on swapchain-sized render targets
+/// (plus the fixed shadow map and sky LUT when those lanes are on).
+///
+/// Internal extent `W×H = (width·scale)×(height·scale)`:
+/// - 1× MSAA colour image at `msaa` samples (`HDR_COLOR_BYTES` each) when `msaa>1`
+/// - `FRAMES_IN_FLIGHT` depth images at `msaa` samples (`DEPTH_BYTES`)
+/// - `FRAMES_IN_FLIGHT` single-sample depth resolves when `msaa>1`
+/// - `FRAMES_IN_FLIGHT` single-sample HDR offscreen/history colour images
+/// - two extra HDR history images when `lanes.taa`
+/// - per-slot bloom pyramid (`BLOOM_MIPS` of a half-res RGBA16F image) when `lanes.bloom`
+/// - 2048² × 2 cascade D32 shadow map when `lanes.shadows`
+/// - 256² HDR cloud LUT × slots when `lanes.clouds` or `lanes.sky`
+pub fn render_target_bytes(
+    width: u32,
+    height: u32,
+    render_scale: f32,
+    msaa: u32,
+    lanes: RenderConfig,
+) -> u64 {
+    let scale = render_scale.max(0.0);
+    let w = ((width as f32 * scale) as u64).max(1);
+    let h = ((height as f32 * scale) as u64).max(1);
+    let pixels = w.saturating_mul(h);
+    let samples = msaa.max(1) as u64;
+
+    let mut bytes = 0u64;
+    if samples > 1 {
+        bytes = bytes.saturating_add(pixels.saturating_mul(HDR_COLOR_BYTES).saturating_mul(samples));
+        bytes = bytes.saturating_add(
+            pixels.saturating_mul(DEPTH_BYTES).saturating_mul(FRAMES_IN_FLIGHT),
+        );
+    }
+    bytes = bytes.saturating_add(
+        pixels
+            .saturating_mul(DEPTH_BYTES)
+            .saturating_mul(samples)
+            .saturating_mul(FRAMES_IN_FLIGHT),
+    );
+    bytes = bytes.saturating_add(
+        pixels
+            .saturating_mul(HDR_COLOR_BYTES)
+            .saturating_mul(FRAMES_IN_FLIGHT),
+    );
+    if lanes.taa {
+        bytes = bytes.saturating_add(pixels.saturating_mul(HDR_COLOR_BYTES).saturating_mul(2));
+    }
+    if lanes.bloom {
+        let mut mw = w.div_ceil(2).max(1);
+        let mut mh = h.div_ceil(2).max(1);
+        for _ in 0..BLOOM_MIPS {
+            bytes = bytes.saturating_add(
+                mw.saturating_mul(mh)
+                    .saturating_mul(HDR_COLOR_BYTES)
+                    .saturating_mul(FRAMES_IN_FLIGHT),
+            );
+            if mw == 1 && mh == 1 {
+                break;
+            }
+            mw = mw.div_ceil(2).max(1);
+            mh = mh.div_ceil(2).max(1);
+        }
+    }
+    if lanes.shadows {
+        bytes = bytes.saturating_add(
+            SHADOW_RESOLUTION
+                .saturating_mul(SHADOW_RESOLUTION)
+                .saturating_mul(SHADOW_CASCADES)
+                .saturating_mul(DEPTH_BYTES),
+        );
+    }
+    if lanes.clouds || lanes.sky {
+        bytes = bytes.saturating_add(
+            SKY_CLOUD_LUT
+                .saturating_mul(SKY_CLOUD_LUT)
+                .saturating_mul(HDR_COLOR_BYTES)
+                .saturating_mul(FRAMES_IN_FLIGHT),
+        );
+    }
+    bytes
+}
+
+/// Session-only graphics after the VRAM guard (never written to disk).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionGraphics {
+    pub msaa: u32,
+    pub render_scale: f32,
+    pub notice: Option<String>,
+}
+
+/// Drop MSAA to the next supported count, then `render_scale` in 0.25 steps
+/// (not below [`VRAM_SCALE_FLOOR`]), until [`render_target_bytes`] fits `budget`.
+pub fn fit_render_targets(
+    width: u32,
+    height: u32,
+    render_scale: f32,
+    msaa: u32,
+    lanes: RenderConfig,
+    budget: u64,
+    max_msaa: u32,
+) -> SessionGraphics {
+    let requested_msaa = snap_msaa(msaa, max_msaa);
+    let requested_scale = render_scale;
+    let needed = render_target_bytes(width, height, requested_scale, requested_msaa, lanes);
+    if needed <= budget {
+        return SessionGraphics {
+            msaa: requested_msaa,
+            render_scale: requested_scale,
+            notice: None,
+        };
+    }
+
+    let mut chosen_msaa = requested_msaa;
+    let mut chosen_scale = requested_scale;
+    loop {
+        let cost = render_target_bytes(width, height, chosen_scale, chosen_msaa, lanes);
+        if cost <= budget {
+            break;
+        }
+        if let Some(next) = MSAA_STEPS.iter().copied().find(|&n| n < chosen_msaa) {
+            chosen_msaa = next;
+            continue;
+        }
+        let snapped = (chosen_scale / VRAM_SCALE_STEP).round() * VRAM_SCALE_STEP;
+        let next_scale = snapped - VRAM_SCALE_STEP;
+        if next_scale + 1e-4 < VRAM_SCALE_FLOOR {
+            break;
+        }
+        chosen_scale = next_scale.max(VRAM_SCALE_FLOOR);
+    }
+
+    SessionGraphics {
+        msaa: chosen_msaa,
+        render_scale: chosen_scale,
+        notice: Some(vram_notice(
+            requested_msaa,
+            requested_scale,
+            needed,
+            chosen_msaa,
+            chosen_scale,
+            budget,
+        )),
+    }
+}
+
+fn snap_msaa(requested: u32, max_msaa: u32) -> u32 {
+    let cap = requested.min(max_msaa).max(1);
+    MSAA_STEPS.iter().copied().find(|&n| n <= cap).unwrap_or(1)
+}
+
+fn vram_notice(
+    req_msaa: u32,
+    req_scale: f32,
+    needed: u64,
+    run_msaa: u32,
+    run_scale: f32,
+    budget: u64,
+) -> String {
+    let need_gb = needed as f64 / 1_000_000_000.0;
+    let budget_gb = budget as f64 / 1_000_000_000.0;
+    let req_pct = (req_scale * 100.0).round() as i32;
+    let run_pct = (run_scale * 100.0).round() as i32;
+    let running = if run_msaa != req_msaa && (run_scale - req_scale).abs() > 1e-3 {
+        format!("{run_msaa}x MSAA, {run_pct}% scale")
+    } else if run_msaa != req_msaa {
+        format!("{run_msaa}x MSAA")
+    } else {
+        format!("{run_pct}% scale")
+    };
+    format!(
+        "graphics: {req_msaa}x MSAA at {req_pct}% scale needs ~{need_gb:.1} GB of VRAM for render targets; running at {running} this session (budget {budget_gb:.1} GB)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +477,45 @@ mod tests {
                 .normalized_lod(),
             (1, 2)
         );
+    }
+
+    fn user_ultrawide_lanes() -> RenderConfig {
+        RenderConfig { taa: true, bloom: true, exposure: true, ..RenderConfig::default() }
+    }
+
+    #[test]
+    fn user_ultrawide_exceeds_48_gb_budget() {
+        let bytes = render_target_bytes(3440, 1440, 2.0, 8, user_ultrawide_lanes());
+        assert!(
+            bytes > 4_800_000_000,
+            "3440×1440 scale 2 8×MSAA TAA+bloom must exceed 4.8 GB, got {bytes}"
+        );
+    }
+
+    #[test]
+    fn full_hd_fits_48_gb_budget() {
+        let bytes = render_target_bytes(1920, 1080, 1.0, 4, RenderConfig::default());
+        assert!(bytes < 4_800_000_000, "1080p must fit 4.8 GB, got {bytes}");
+    }
+
+    #[test]
+    fn degrade_drops_msaa_before_scale_and_respects_floor() {
+        let lanes = user_ultrawide_lanes();
+        let needed_8 = render_target_bytes(3440, 1440, 2.0, 8, lanes);
+        let needed_4 = render_target_bytes(3440, 1440, 2.0, 4, lanes);
+        assert!(needed_8 > needed_4);
+
+        let msaa_only = fit_render_targets(3440, 1440, 2.0, 8, lanes, needed_4, 8);
+        assert_eq!(msaa_only.msaa, 4);
+        assert!((msaa_only.render_scale - 2.0).abs() < 1e-4, "scale stays until MSAA is 1");
+        assert!(msaa_only.notice.as_ref().unwrap().contains("4x MSAA"));
+        assert!(!msaa_only.notice.as_ref().unwrap().contains("% scale this session"));
+
+        let tiny = fit_render_targets(3440, 1440, 2.0, 8, lanes, 1, 8);
+        assert_eq!(tiny.msaa, 1);
+        assert!((tiny.render_scale - VRAM_SCALE_FLOOR).abs() < 1e-4);
+        let n = tiny.notice.unwrap();
+        assert!(n.contains("1x MSAA"));
+        assert!(n.contains("50% scale"));
     }
 }

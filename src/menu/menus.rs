@@ -170,7 +170,7 @@ pub struct SettingsHub;
 impl Menu for SettingsHub {
     type Action = Category;
 
-    fn view(&self, _ctx: &Ctx) -> View<Category> {
+    fn view(&self, ctx: &Ctx) -> View<Category> {
         let rows = Category::ALL.iter().map(|(c, name)| Row::action(*name, *c)).collect();
         View {
             title: "SETTINGS".to_string(),
@@ -178,7 +178,7 @@ impl Menu for SettingsHub {
             rows,
             default: None,
             hint: "Enter open   Esc back".to_string(),
-            notice: None,
+            notice: ctx.settings.vram_notice.as_ref().map(|t| Notice::info(t.clone())),
         }
     }
 
@@ -235,7 +235,7 @@ impl Menu for SettingsPage {
             rows,
             default: None,
             hint: "Left/Right or h/l change   Esc back".to_string(),
-            notice: None,
+            notice: ctx.settings.vram_notice.as_ref().map(|t| Notice::info(t.clone())),
         }
     }
 

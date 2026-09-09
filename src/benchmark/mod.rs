@@ -32,6 +32,8 @@ use crate::world::{StreamGauges, World};
 use json::Json;
 use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
 
+pub(crate) use system::graphics_caps;
+
 const DEFAULT_DURATION_SECS: f64 = 10.0;
 const DEFAULT_WARMUP_SECS: f64 = 3.0;
 const DEFAULT_READY_TIMEOUT_SECS: f64 = 60.0;

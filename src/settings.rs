@@ -21,7 +21,10 @@ use std::path::Path;
 
 use voxel_engine::Engine;
 
-use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, max_lod_levels};
+use crate::render_config::{
+    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, fit_render_targets,
+    max_lod_levels,
+};
 use crate::ui::HudMode;
 
 pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RADIUS_RANGE};
@@ -171,6 +174,16 @@ settings_fields! {
     voice_incoming: bool = true,
     /// Runtime-only `/mute` state; absent from [`SETTINGS`].
     muted: bool = false,
+
+    /// Device framebuffer MSAA ceiling from the startup probe; not persisted.
+    device_max_msaa: u32 = 8,
+    /// 60% of device-local heap; `None` skips the session VRAM guard.
+    vram_budget_bytes: Option<u64> = None,
+    /// Session-only VRAM-guard line for the console and settings menu.
+    vram_notice: Option<String> = None,
+    /// Largest connected display (fullscreen first allocation).
+    startup_display_w: u32 = 1280,
+    startup_display_h: u32 = 720,
 }
 
 // One `Setting` per field: behaviour folded over by every surface (persistence, menu, console).
@@ -1034,21 +1047,67 @@ impl Settings {
         }
     }
 
+    /// Install the one-shot GPU probe. MSAA above [`Self::device_max_msaa`]
+    /// is refused by [`Self::clamp`] (and persisted). VRAM over-budget
+    /// degrades are session-only and never written back to [`Self::msaa`] /
+    /// [`Self::render_scale`].
+    pub fn set_device_caps(&mut self, caps: DeviceCaps, display: (u32, u32)) {
+        self.device_max_msaa = caps.max_msaa.max(1);
+        self.vram_budget_bytes = caps.render_target_budget_bytes();
+        self.startup_display_w = display.0.max(1);
+        self.startup_display_h = display.1.max(1);
+        self.clamp();
+    }
+
+    /// Session MSAA/scale after the VRAM guard. Does not mutate persisted fields.
+    pub fn session_graphics(&self, width: u32, height: u32) -> SessionGraphics {
+        let lanes = self.render_config();
+        match self.vram_budget_bytes {
+            Some(budget) => fit_render_targets(
+                width,
+                height,
+                self.render_scale,
+                self.msaa,
+                lanes,
+                budget,
+                self.device_max_msaa,
+            ),
+            None => SessionGraphics {
+                msaa: self.msaa.min(self.device_max_msaa).max(1),
+                render_scale: self.render_scale,
+                notice: None,
+            },
+        }
+    }
+
     /// Push the current values to the engine. Cheap to call every frame: the
-    /// engine ignores values that didn't change. MSAA is written back with
-    /// the hardware-clamped value so menus and `/gfx` show what actually
-    /// applied (e.g. 8x requested, 4x supported).
+    /// engine ignores values that didn't change. Hardware MSAA support is
+    /// already snapped in [`Self::clamp`]; VRAM-budget MSAA/scale cuts are
+    /// applied here without writing them back (they are this session only).
     pub fn apply(&mut self, eng: &mut Engine) {
         eng.set_fullscreen(self.fullscreen);
         // Vsync and the fps cap are not pushed here: `App::frame` is the
         // single writer, because the effective values also depend on the
         // screen (menus cap the frame rate, vsync off) and the benchmark.
-        self.msaa = eng.set_msaa(self.msaa);
-        self.render_scale = eng.set_render_scale(self.render_scale);
+        let w = eng.screen_width().max(1) as u32;
+        let h = eng.screen_height().max(1) as u32;
+        let session = self.session_graphics(w, h);
+        self.adopt_vram_notice(session.notice.clone());
+        let _ = eng.set_msaa(session.msaa);
+        let _ = eng.set_render_scale(session.render_scale);
         eng.set_cull_faces(self.cull_faces);
         // Engine render lanes live-swap on both threads; occlusion/lod2 are world
         // inputs (applied on world entry) and aren't part of `engine_flags`.
         eng.set_flags(self.render_config().engine_flags());
+    }
+
+    fn adopt_vram_notice(&mut self, notice: Option<String>) {
+        if self.vram_notice != notice {
+            if let Some(line) = notice.as_ref() {
+                eprintln!("{line}");
+            }
+            self.vram_notice = notice;
+        }
     }
 
     /// The render lanes this settings state names, before visual-mod masking.
@@ -1243,6 +1302,9 @@ fn vol_clamp(v: &mut u8) {
 
 fn msaa_clamp(s: &mut Settings) {
     s.msaa = snap_down(MSAA, s.msaa as i32) as u32;
+    if s.msaa > s.device_max_msaa {
+        s.msaa = snap_down(MSAA, s.device_max_msaa as i32) as u32;
+    }
 }
 
 fn dist_clamp(s: &mut Settings) {
@@ -1361,6 +1423,19 @@ mod tests {
         assert_eq!(s.fov, 220.0);
         assert_eq!(s.render_scale, 2.0);
         assert_eq!(s.shake, 1.0);
+    }
+
+    #[test]
+    fn clamp_refuses_msaa_above_device_and_scale_above_two() {
+        let mut s = Settings {
+            msaa: 8,
+            device_max_msaa: 4,
+            render_scale: 9.0,
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.msaa, 4);
+        assert_eq!(s.render_scale, 2.0);
     }
 
     #[test]
