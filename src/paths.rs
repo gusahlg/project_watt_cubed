@@ -27,7 +27,7 @@ static PATHS: OnceLock<Paths> = OnceLock::new();
 impl Paths {
     /// Resolve override → existing launch `saves/` → XDG, without installing globally.
     /// `checkout_dir` is kept only when `<dir>/Cargo.toml` exists.
-    pub fn resolve(override_dir: Option<&Path>, checkout_dir: Option<&Path>) -> Self {
+    pub(crate) fn resolve(override_dir: Option<&Path>, checkout_dir: Option<&Path>) -> Self {
         let mut paths = pick(
             override_dir
                 .filter(|p| !p.as_os_str().is_empty())
@@ -60,27 +60,27 @@ impl Paths {
     }
 
     /// The installed roots, resolving defaults on first use.
-    pub fn get() -> &'static Self {
+    pub(crate) fn get() -> &'static Self {
         Self::init(None)
     }
 
-    pub fn settings_file(&self) -> PathBuf {
+    pub(crate) fn settings_file(&self) -> PathBuf {
         self.config.join("settings.cfg")
     }
 
-    pub fn session_file(&self) -> PathBuf {
+    pub(crate) fn session_file(&self) -> PathBuf {
         self.config.join("session.cfg")
     }
 
-    pub fn mods_file(&self) -> PathBuf {
+    pub(crate) fn mods_file(&self) -> PathBuf {
         self.config.join("mods.cfg")
     }
 
-    pub fn checkout_dir(&self) -> Option<&Path> {
+    pub(crate) fn checkout_dir(&self) -> Option<&Path> {
         self.checkout.as_deref()
     }
 
-    pub fn mods_selection_file(&self) -> Option<PathBuf> {
+    pub(crate) fn mods_selection_file(&self) -> Option<PathBuf> {
         Some(self.checkout_dir()?.join("mods.toml"))
     }
 }

@@ -50,7 +50,10 @@ impl Session {
             "address={}\nport={}\nname={}\n",
             self.address, self.port, self.name
         );
-        let _ = crate::save::write_atomic_file(&session_path(), text.as_bytes());
+        let path = session_path();
+        if let Err(e) = crate::save::write_atomic_file(&path, text.as_bytes()) {
+            crate::save::log_fs_err("write", &path, &e);
+        }
     }
 }
 

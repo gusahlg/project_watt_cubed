@@ -1070,7 +1070,10 @@ impl Settings {
 
     /// Best-effort save (a failed write shouldn't crash the game).
     pub fn save(&self) {
-        let _ = crate::save::write_atomic_file(&settings_path(), self.to_text().as_bytes());
+        let path = settings_path();
+        if let Err(e) = crate::save::write_atomic_file(&path, self.to_text().as_bytes()) {
+            crate::save::log_fs_err("write", &path, &e);
+        }
     }
 
     /// Force every field into its valid range. Safe to call repeatedly, and

@@ -37,7 +37,7 @@ use crate::math::block_coord;
 
 use crate::block::registry::BlockRegistry;
 use crate::net::hooks;
-pub use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
+pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
@@ -341,7 +341,7 @@ fn outside_world(pos: DVec3) -> bool {
 
 /// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
 /// existing clients finish on their own.
-pub struct ServerHandle {
+pub(crate) struct ServerHandle {
     shutdown: Arc<AtomicBool>,
     addr: SocketAddr,
     /// The runtime hosting quinn, held so it outlives the handle. The accept loop
@@ -389,7 +389,7 @@ impl ServerHandle {
 }
 
 /// Bind to port 0 to let the OS pick a free port.
-pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
+pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let rt = Arc::new(Runtime::new()?);
     let endpoint = {
         // Must run inside the runtime: construction spawns quinn's UDP driver.

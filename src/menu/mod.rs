@@ -14,8 +14,8 @@ pub mod start;
 pub mod theme;
 
 pub use input::gather;
-pub use start::{HostInfo, JoinInfo, MenuModel, StartAction, StartFacts, StartScreen, VERSION};
-pub use theme::{DefaultTheme, MenuTheme as _, PresentedRow, PresentedView, RowRect};
+pub use start::{HostInfo, JoinInfo, StartScreen};
+pub use theme::{MenuTheme as _, PresentedRow, PresentedView};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {

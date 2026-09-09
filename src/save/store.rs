@@ -124,6 +124,11 @@ pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic(path, bytes)
 }
 
+/// Log a filesystem error instead of `let _ =`. Callers stay best-effort.
+pub(crate) fn log_fs_err(op: &str, path: &Path, err: &io::Error) {
+    eprintln!("could not {op} {}: {err}", path.display());
+}
+
 #[cfg(test)]
 pub(crate) fn test_temp_path(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -164,7 +169,12 @@ pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
     // and the old file becomes the new slot's backup.
     format::set_name(&mut bytes, to.as_str())?;
     write(to, &bytes)?;
-    let _ = fs::rename(bak_path(from), bak_path(to));
+    let from_bak = bak_path(from);
+    if let Err(e) = fs::rename(&from_bak, bak_path(to)) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log_fs_err("rename", &from_bak, &e);
+        }
+    }
     fs::remove_file(live_path(from))?;
     Ok(())
 }
@@ -478,5 +488,14 @@ mod tests {
 
         cleanup(&good);
         cleanup(&bad);
+    }
+
+    #[test]
+    fn log_fs_err_does_not_panic() {
+        log_fs_err(
+            "write",
+            Path::new("/watt-audit-no-such"),
+            &io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        );
     }
 }

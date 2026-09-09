@@ -12,10 +12,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use voxel_engine::skeleton::Screenshot;
-use voxel_engine::{Camera3D, Color, DVec3};
+use voxel_engine::{Color, DVec3};
 
-use crate::camera::ViewPose;
-use crate::game::Game;
+use crate::camera::CameraPose;
+use crate::game::{DebugView, Game, SKY_KEY, TERRAIN_KEY};
 use crate::mods::Mods;
 use crate::settings::Settings;
 
@@ -27,16 +27,10 @@ pub const GOLDEN_SEED: u64 = 0xC0FFEE;
 /// to THIS, making the runner's `set_day` a provable no-op for them (their look
 /// must not change). `scripted_default_day_matches_clock` guards the equality so
 /// a change to the clock default can't silently drift the goldens.
-pub const SCRIPTED_DEFAULT_DAY: f64 = 0.3;
+pub(crate) const SCRIPTED_DEFAULT_DAY: f64 = 0.3;
 
 /// Blessed goldens live here, one PNG per [`GoldenShot::name`].
-pub const GOLDEN_DIR: &str = "tests/golden";
-
-/// Clear/background key under [`DebugView::TerrainKey`] — anything showing this
-/// through the terrain silhouette is a hole.
-pub const SKY_KEY: Color = Color::rgb(255, 0, 255);
-/// Flat fill every terrain surface renders as under [`DebugView::TerrainKey`].
-pub const TERRAIN_KEY: Color = Color::rgb(0, 255, 0);
+pub(crate) const GOLDEN_DIR: &str = "tests/golden";
 
 /// Per-channel absolute delta a pixel must exceed to count as "changed" — the
 /// 8-bit noise floor. Dithered/tonemapped output wobbles by a couple of codes
@@ -55,30 +49,6 @@ const KEY_TOL: u8 = 24;
 // Camera pose / golden shot
 // ============================================================================
 
-/// A camera pose mirroring `Player` (position `DVec3`, yaw/pitch `f32`); the
-/// harness derives `Camera3D` through the SAME `ViewPose::camera3d` path the
-/// game uses.
-#[derive(Clone, Copy, Debug)]
-pub struct CameraPose {
-    pub pos: DVec3,
-    pub yaw: f32,
-    pub pitch: f32,
-}
-
-impl CameraPose {
-    /// Delegates camera derivation to the game's ViewPose path to avoid reimplementing projection math.
-    pub fn camera(&self, fovy: f32) -> Camera3D {
-        ViewPose {
-            eye: self.pos,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            roll: 0.0,
-            fovy,
-        }
-        .camera3d()
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct GoldenShot {
     pub seed: u64,
@@ -96,22 +66,12 @@ pub struct GoldenShot {
     pub setup: Option<fn(&mut Game)>,
 }
 
-/// What the app renders for a capture.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum DebugView {
-    #[default]
-    Normal,
-    /// ALL terrain flat [`TERRAIN_KEY`], sky/fog passes disabled, clear color
-    /// [`SKY_KEY`]. The sky-hole detector's input.
-    TerrainKey,
-}
-
 // ============================================================================
 // Pure detectors
 // ============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DiffStats {
+pub(crate) struct DiffStats {
     /// Largest per-channel absolute delta anywhere in the image.
     pub max_channel_delta: u8,
     /// Percent of pixels with any channel delta > [`NOISE_FLOOR`].
@@ -122,7 +82,7 @@ pub struct DiffStats {
 ///
 /// Mismatched dimensions can't be diffed pixel-for-pixel; rather than panic we
 /// report a total mismatch so callers surface it as a plain failure.
-pub fn diff(a: &Screenshot, b: &Screenshot) -> DiffStats {
+pub(crate) fn diff(a: &Screenshot, b: &Screenshot) -> DiffStats {
     if a.width != b.width || a.height != b.height || a.rgba.len() != b.rgba.len() {
         return DiffStats {
             max_channel_delta: u8::MAX,
@@ -165,7 +125,7 @@ pub fn diff(a: &Screenshot, b: &Screenshot) -> DiffStats {
 /// rendered scene is never uniform; a uniform capture means the frame was
 /// presented without being drawn. Used to refuse blessing a degenerate golden
 /// (the black-screenshot failure class). An empty image counts as uniform.
-pub fn is_uniform(shot: &Screenshot) -> bool {
+pub(crate) fn is_uniform(shot: &Screenshot) -> bool {
     let mut px = shot.rgba.chunks_exact(4);
     match px.next() {
         None => true,
@@ -188,7 +148,7 @@ fn is_key(px: &[u8], key: Color) -> bool {
 /// Rows run top-to-bottom (present orientation, per `Screenshot`), so "topmost"
 /// is the smallest `y` and "below" is a larger `y`. A column with no terrain
 /// pixel has no silhouette and so contributes no holes.
-pub fn sky_hole_count(shot: &Screenshot) -> u32 {
+pub(crate) fn sky_hole_count(shot: &Screenshot) -> u32 {
     let w = shot.width as usize;
     let h = shot.height as usize;
     if w == 0 || h == 0 {
@@ -1388,6 +1348,7 @@ fn carve_cave(game: &mut Game) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::{SKY_KEY, TERRAIN_KEY};
 
     /// Build a solid-color RGBA screenshot.
     fn filled(w: u32, h: u32, c: Color) -> Screenshot {
