@@ -46,16 +46,12 @@ const QUAD_N: usize = SECTION_N / 2;
 const BLOCKS_XZ: i32 = SECTION_N as i32 / BLOCK;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
 
-// One dense quadrant buffer per worker thread, reused across the four
-// quadrants of every job. Born and dropped on the same thread (unlike the
-// main-thread-captured mesh snapshots), so a lock-free thread-local is right.
+// One dense quadrant buffer and one mesh scratch per worker. Empty 16³
+// blocks reuse the scratch; only non-empty results move out. Born and
+// dropped on the same thread (unlike the main-thread-captured mesh
+// snapshots), so a lock-free thread-local is right.
 thread_local! {
     static DENSE_QUAD: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
-}
-
-// One ChunkMeshData scratch per worker: empty 16³ blocks reuse it, only
-// non-empty results move out. Same thread-local reason as DENSE_QUAD.
-thread_local! {
     static MESH_SCRATCH: RefCell<ChunkMeshData> = RefCell::new(new_chunk_mesh_data());
 }
 
@@ -99,6 +95,7 @@ struct FaceSample {
 
 /// Per-vertex AO level `0..=3` (`3` = unoccluded) from its three occluders;
 /// two touching sides fully occlude the corner. Same model as the chunk mesher.
+#[inline]
 fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
     if side1 && side2 {
         return 0;
@@ -255,18 +252,26 @@ fn face_sample(
         1 => (x, y + dir.step, z),
         _ => (x, y, z + dir.step),
     };
-    let occ = |eu: i32, ev: i32| {
-        let pidx = open + eu * s_u + ev * s_v;
-        match dir.n_axis {
-            0 => occluder(quad, tables, pidx, ox, oy + ev, oz + eu),
-            1 => occluder(quad, tables, pidx, ox + eu, oy, oz + ev),
-            _ => occluder(quad, tables, pidx, ox + eu, oy + ev, oz),
+    // One 3×3 stencil in the OPEN layer — same layout as world/mesh.rs.
+    // Bounds live in `occluder`; a stride step off the quadrant can land
+    // on a different column's in-range cell.
+    let mut opaque = [[false; 3]; 3];
+    for dv in 0..3 {
+        let ev = dv as i32 - 1;
+        for du in 0..3 {
+            let eu = du as i32 - 1;
+            let pidx = open + eu * s_u + ev * s_v;
+            opaque[du][dv] = match dir.n_axis {
+                0 => occluder(quad, tables, pidx, ox, oy + ev, oz + eu),
+                1 => occluder(quad, tables, pidx, ox + eu, oy, oz + ev),
+                _ => occluder(quad, tables, pidx, ox + eu, oy + ev, oz),
+            };
         }
-    };
+    }
     let ao = std::array::from_fn(|i| {
-        let eu = corner_uv[i][0];
-        let ev = corner_uv[i][1];
-        vertex_ao(occ(eu, 0), occ(0, ev), occ(eu, ev))
+        let ou = (corner_uv[i][0] + 1) as usize;
+        let ov = (corner_uv[i][1] + 1) as usize;
+        vertex_ao(opaque[ou][1], opaque[1][ov], opaque[ou][ov])
     });
     Some(FaceSample { block: me, micro, ao })
 }
@@ -520,6 +525,9 @@ fn mesh_quadrant(quad: &DenseQuad<'_>, tables: &HotTables, q: u8) -> SectionMesh
     let (ox, oz) = ((qx * QUAD_N) as u32, (qz * QUAD_N) as u32);
     MESH_SCRATCH.with_borrow_mut(|scratch| {
         for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
+            for (_, m) in scratch.iter_mut() {
+                m.clear();
+            }
             if build_block(quad, by * BLOCK, tables, scratch) {
                 result.push((
                     UVec3::new(ox, (by * BLOCK) as u32, oz),
@@ -946,7 +954,7 @@ mod tests {
     /// stride-walk / pooled-output rewrite. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release far_lod_section_mesh -- --ignored --nocapture`.
-    /// 2026-09-08: before ? ms/section; after ? ms/section (median of 3).
+    /// 2026-09-09: before 9.53 ms/section; after 9.34 ms/section (median of 3).
     #[test]
     #[ignore]
     fn far_lod_section_mesh() {
@@ -959,7 +967,7 @@ mod tests {
             z: (i / 4) as i32,
         });
 
-        // Warm the worker-local dense grid (and, after the rewrite, the mesh scratch).
+        // Warm the worker-local dense grid and the mesh scratch.
         std::hint::black_box(extract_section_mesh(positions[0], &r#gen, &[], &tables));
 
         let mut times = [0.0f64; 3];
@@ -975,5 +983,45 @@ mod tests {
             "far_lod_section_mesh 16 sections detail=2 seed=42: {:.3} {:.3} {:.3} ms/section (median {:.3})",
             times[0], times[1], times[2], times[1]
         );
+
+        // Fingerprint after the timed loops so a timing run also shows the
+        // output did not drift. FNV-1a over origins + decoded vertex fields.
+        let mut verts = 0usize;
+        let mut h = 0x811c9dc5u32;
+        let mix = |h: &mut u32, b: u8| {
+            *h ^= b as u32;
+            *h = h.wrapping_mul(0x01000193);
+        };
+        for &pos in &positions {
+            let mesh = extract_section_mesh(pos, &r#gen, &[], &tables);
+            for quad in &mesh {
+                for (origin, data) in quad {
+                    for c in origin.to_array() {
+                        for b in c.to_le_bytes() {
+                            mix(&mut h, b);
+                        }
+                    }
+                    for p in Pass::ALL {
+                        for v in data[p].vertices() {
+                            verts += 1;
+                            for c in v.local_pos() {
+                                for b in c.to_bits().to_le_bytes() {
+                                    mix(&mut h, b);
+                                }
+                            }
+                            mix(&mut h, v.normal() as u8);
+                            for b in v.layer().to_le_bytes() {
+                                mix(&mut h, b);
+                            }
+                            mix(&mut h, (0..=3).find(|&a| v.ao() == Ao::new(a)).expect("ao 0..=3"));
+                            for m in v.micro() {
+                                mix(&mut h, m as u8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("far_lod_section_mesh fingerprint verts={verts} fnv={h:#010x}");
     }
 }
