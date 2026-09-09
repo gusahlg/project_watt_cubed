@@ -66,8 +66,9 @@ pub fn list() -> Vec<Slot> {
 fn peek_file(path: &std::path::Path) -> Result<super::slot::SaveMeta, SaveError> {
     let mut f = fs::File::open(path)?;
     let mut buf = [0u8; format::HEADER_LEN];
-    f.read_exact(&mut buf)?;
-    format::peek_meta(&buf)
+    // v4 headers are 2 bytes shorter than v5; a short read still peeks.
+    let n = f.read(&mut buf)?;
+    format::peek_meta(&buf[..n])
 }
 
 /// Prefers: intact live > intact backup > salvaged live > salvaged backup.
@@ -347,6 +348,20 @@ mod tests {
         assert!(trashed.exists());
 
         let _ = fs::remove_file(trashed);
+    }
+
+    #[test]
+    fn both_rungs_corrupt_errors_and_deletes_nothing() {
+        let id = SlotId::new("__store_both_bad__").unwrap();
+        cleanup(&id);
+        write(&id, &format::encode(&doc("v1", 1)).unwrap()).unwrap();
+        write(&id, &format::encode(&doc("v2", 2)).unwrap()).unwrap();
+        fs::write(live_path(&id), b"WATT garbage live").unwrap();
+        fs::write(bak_path(&id), b"WATT garbage bak").unwrap();
+        assert!(read(&id).is_err());
+        assert!(live_path(&id).exists(), "a failed ladder must not delete live");
+        assert!(bak_path(&id).exists(), "a failed ladder must not delete backup");
+        cleanup(&id);
     }
 
     #[test]

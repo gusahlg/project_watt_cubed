@@ -121,6 +121,9 @@ impl Autosaver {
         generation: u64,
         encode: impl FnOnce() -> Result<Vec<u8>, SaveError>,
     ) -> Tick {
+        if self.in_flight {
+            return Tick::Idle;
+        }
         let bytes = match encode() {
             Ok(bytes) => bytes,
             Err(e) => return Tick::Finished(Err(e)),
@@ -256,6 +259,27 @@ mod tests {
         assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
         assert!(!auto.wants_write(2), "gen 2 saved by flush");
 
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+    }
+
+    #[test]
+    fn start_refuses_to_queue_a_second_write_while_one_is_in_flight() {
+        let id = SlotId::new("__autosave_no_interleave__").unwrap();
+        let _ = fs::remove_file(format!("saves/{id}.save"));
+        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let mut auto = Autosaver::new();
+        assert!(matches!(auto.start(&id, 1, bytes), Tick::Started));
+        assert!(matches!(auto.start(&id, 2, bytes), Tick::Idle));
+        loop {
+            match auto.poll() {
+                Tick::Finished(result) => {
+                    result.unwrap();
+                    break;
+                }
+                _ => thread::yield_now(),
+            }
+        }
         let _ = fs::remove_file(format!("saves/{id}.save"));
         let _ = fs::remove_file(format!("saves/{id}.save.bak"));
     }

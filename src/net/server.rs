@@ -16,7 +16,7 @@
 //! **Trust.** Joins are password-gated and version-checked; frames are size-capped
 //! by [`protocol`]; every client is rate-limited; every edit is bounds- and
 //! reach-validated against the sender's own reported position.
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -120,6 +120,37 @@ impl Default for Config {
             worldgen: WorldgenKind::Classic,
             diffusion: DiffusionCfg::default(),
         }
+    }
+}
+
+/// Same range the client clock uses (`DayLength::clamped`): never zero (which
+/// would stall or desync the shared sky) and never a multi-day real-time cycle.
+fn clamp_day_secs(s: f32) -> f32 {
+    if s.is_nan() { 600.0 } else { s.clamp(10.0, 86_400.0) }
+}
+
+/// Sliding 1-second window: a stamp ages out once a full second has passed, so
+/// dumping a full budget on both sides of a second boundary cannot double it.
+struct RateWindow {
+    stamps: VecDeque<Instant>,
+    limit: u32,
+}
+
+impl RateWindow {
+    fn new(limit: u32) -> Self {
+        Self { stamps: VecDeque::new(), limit }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        const PERIOD: Duration = Duration::from_secs(1);
+        while self.stamps.front().is_some_and(|t| now.saturating_duration_since(*t) >= PERIOD) {
+            self.stamps.pop_front();
+        }
+        if self.stamps.len() as u32 >= self.limit {
+            return false;
+        }
+        self.stamps.push_back(now);
+        true
     }
 }
 
@@ -253,7 +284,7 @@ impl State {
 
     fn day_now(&self, day_secs: f32) -> f32 {
         let elapsed = self.day_set.elapsed().as_secs_f32();
-        (self.day + elapsed / day_secs.max(1.0)).rem_euclid(1.0)
+        (self.day + elapsed / clamp_day_secs(day_secs)).rem_euclid(1.0)
     }
 
     /// `None` at the [`MAX_SPEC_POOL`] cap.
@@ -356,7 +387,7 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         password: config.password,
         seed: config.seed,
         fingerprint: crate::net::fingerprint_kind_cfg(&registry, config.worldgen, config.diffusion),
-        day_secs: config.day_secs,
+        day_secs: clamp_day_secs(config.day_secs),
         allow_teleport: config.allow_teleport,
         generator,
     });
@@ -606,10 +637,8 @@ fn handle_client(
 
     // Voice carries a second, tighter per-second budget of its own: it is far
     // chattier than any other message and must not eat a peer's general budget.
-    let mut window = Instant::now();
-    let mut count: u32 = 0;
-    let mut voice_window = Instant::now();
-    let mut voice_count: u32 = 0;
+    let mut rate = RateWindow::new(RATE_LIMIT);
+    let mut voice_rate = RateWindow::new(VOICE_RATE_LIMIT);
     loop {
         // A kick (slow client) wakes this out of the blocking read so cleanup
         // runs; the read future is only ever dropped on that teardown path, so
@@ -625,12 +654,8 @@ fn handle_client(
             _ => break, // EOF, a malformed length, or a kick: the client is gone.
         }
 
-        if window.elapsed() >= Duration::from_secs(1) {
-            window = Instant::now();
-            count = 0;
-        }
-        count += 1;
-        if count > RATE_LIMIT {
+        let now = Instant::now();
+        if !rate.allow(now) {
             continue; // Over budget this second — drop the frame rather than serve a flood.
         }
 
@@ -648,12 +673,7 @@ fn handle_client(
             ClientMessage::Chat { channel, text } => on_chat(&shared, id, channel, &text),
             ClientMessage::SetTime { day } => on_set_time(&shared, &ctx, day),
             ClientMessage::Voice { seq, payload } => {
-                if voice_window.elapsed() >= Duration::from_secs(1) {
-                    voice_window = Instant::now();
-                    voice_count = 0;
-                }
-                voice_count += 1;
-                if voice_count > VOICE_RATE_LIMIT {
+                if !voice_rate.allow(now) {
                     continue; // Over the voice budget this second — drop silently.
                 }
                 on_voice(&shared, id, seq, payload);
@@ -757,6 +777,11 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
             h.correct_position(id, &mut sends);
         } else {
             commit_pose(&mut state, id, pos, None, &mut sends);
+            // Echo so a client with an in-flight `/tp` can tell accept from a
+            // stale movement snap-back: the last Position is the committed pose.
+            if let Some(h) = state.players.get(&id) {
+                h.correct_position(id, &mut sends);
+            }
         }
     }
     dispatch(shared, sends);
@@ -871,6 +896,9 @@ fn on_edit(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32
         }
     };
     // Y is unbounded (infinite world height/depth); reach is the real gate.
+    // `as f64` so i32::MIN never hits signed-abs overflow; cells past the
+    // playable border are still reach-checked (a player AT the border can
+    // mine the slack column) but a forged i32::MAX coord is out of reach.
     let target = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
     if spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH {
         return reject(&state, ack_to);
@@ -1259,7 +1287,10 @@ mod tests {
 
         on_teleport(&shared, &test_ctx(true), 1, far);
         assert_eq!(shared.lock_recover().players[&1].pos, far, "allowed teleport commits");
-        assert!(rx.try_recv().is_err());
+        match ServerMessage::decode(&rx.try_recv().expect("accepted teleport echoes Position")) {
+            Some(ServerMessage::Position { pos }) => assert_eq!(pos, far),
+            other => panic!("expected a Position echo, got {other:?}"),
+        }
 
         on_teleport(&shared, &test_ctx(false), 1, start);
         assert_eq!(shared.lock_recover().players[&1].pos, far, "refused teleport is not committed");
@@ -1693,5 +1724,313 @@ mod tests {
         }
 
         handle.stop();
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn f64(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (self.next() as f64 / u64::MAX as f64) * (hi - lo)
+        }
+        fn u32(&mut self, max_excl: u32) -> u32 {
+            (self.next() as u32) % max_excl.max(1)
+        }
+    }
+
+    #[test]
+    fn spec_pool_is_bounded_under_unique_mints() {
+        let mut state = test_state(HashMap::new());
+        for i in 0..MAX_SPEC_POOL {
+            assert!(state.intern(&format!("spec-{i}")).is_some(), "slot {i} must intern");
+        }
+        assert!(state.intern("one-too-many").is_none(), "cap must refuse a new spec");
+        assert!(state.intern("spec-0").is_some(), "an already-interned spec still resolves");
+        let old = state.spec_pool.get("spec-1").cloned().unwrap();
+        state.release(old);
+        assert!(state.intern("fresh-after-release").is_some(), "release must free a slot");
+        assert_eq!(state.spec_pool.len(), MAX_SPEC_POOL);
+    }
+
+    #[test]
+    fn interest_at_the_radius_bucket_edges_wrap_and_three_bucket_hops() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let origin = DVec3::new(0.0, 20.0, 0.0);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(origin, out.clone(), test_kick()));
+        players.insert(2u32, test_player(DVec3::new(INTEREST_RADIUS, 20.0, 0.0), out.clone(), test_kick()));
+        let mut state = test_state(players);
+        state.grid_insert(1, origin);
+        state.grid_insert(2, DVec3::new(INTEREST_RADIUS, 20.0, 0.0));
+        let mut sends = Vec::new();
+        commit_pose(&mut state, 1, origin, None, &mut sends);
+        assert!(state.players[&1].visible.contains(&2), "exactly INTEREST_RADIUS is visible");
+        assert!(state.players[&2].visible.contains(&1));
+
+        // Bucket edge: INTEREST_RADIUS is the first point of bucket 1.
+        let on_edge = DVec3::new(INTEREST_RADIUS, 20.0, 0.0);
+        let just_inside = DVec3::new(INTEREST_RADIUS - 1.0, 20.0, 0.0);
+        assert_eq!(bucket_of(on_edge), (1, 0));
+        assert_eq!(bucket_of(just_inside), (0, 0));
+
+        // i32-wrap-like coordinates clamp through block_coord; membership stays 1:1.
+        age_move_state(&mut state, 1);
+        let wrap = DVec3::new(crate::math::WORLD_BORDER, 20.0, crate::math::WORLD_BORDER);
+        sends.clear();
+        commit_pose(&mut state, 1, wrap, None, &mut sends);
+        let entries: usize = state.grid.values().map(Vec::len).sum();
+        assert_eq!(entries, 2, "wrap-range move must not duplicate grid entries");
+        assert!(!state.players[&1].visible.contains(&2), "world-border hop leaves interest");
+        assert!(!state.players[&2].visible.contains(&1));
+        let exited: Vec<_> = sends
+            .iter()
+            .filter_map(|(_, _, f)| match ServerMessage::decode(f) {
+                Some(ServerMessage::PeerExited { id }) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert!(exited.contains(&1) && exited.contains(&2), "PeerExited reaches every peer");
+
+        // Three buckets in one message (teleport-sized hop).
+        let start = DVec3::new(10.0, 20.0, 10.0);
+        state.players.get_mut(&1).unwrap().pos = start;
+        state.grid.clear();
+        state.grid_insert(1, start);
+        state.grid_insert(2, DVec3::new(INTEREST_RADIUS, 20.0, 0.0));
+        let hop = DVec3::new(10.0 + 3.0 * INTEREST_RADIUS, 20.0, 10.0);
+        assert_ne!(bucket_of(start), bucket_of(hop));
+        sends.clear();
+        commit_pose(&mut state, 1, hop, None, &mut sends);
+        assert_eq!(state.grid.get(&bucket_of(hop)).map(Vec::as_slice), Some(&[1u32][..]));
+        assert!(!state.grid.contains_key(&bucket_of(start)), "emptied start bucket is dropped");
+        let _ = rx;
+    }
+
+    fn age_move_state(state: &mut State, id: u32) {
+        if let Some(h) = state.players.get_mut(&id) {
+            h.last_move = Instant::now() - Duration::from_secs(10);
+        }
+    }
+
+    #[test]
+    fn visible_stays_symmetric_across_random_moves_of_twenty_players() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut state = test_state(HashMap::new());
+        let mut rng = XorShift::new(0x0020_91A7);
+        let span = 6.0 * INTEREST_RADIUS;
+        for id in 1..=20u32 {
+            let pos = DVec3::new(rng.f64(-span, span), 20.0, rng.f64(-span, span));
+            state.players.insert(id, test_player(pos, out.clone(), test_kick()));
+            state.grid_insert(id, pos);
+        }
+        for _ in 0..80 {
+            let id = rng.u32(20) + 1;
+            let pos = DVec3::new(rng.f64(-span, span), 20.0, rng.f64(-span, span));
+            let mut sends = Vec::new();
+            commit_pose(&mut state, id, pos, None, &mut sends);
+            for (&a, ha) in &state.players {
+                for (&b, hb) in &state.players {
+                    if a >= b {
+                        continue;
+                    }
+                    assert_eq!(
+                        ha.visible.contains(&b),
+                        hb.visible.contains(&a),
+                        "visibility {a}↔{b} broke after moving {id} to {pos:?}"
+                    );
+                }
+            }
+            let entries: usize = state.grid.values().map(Vec::len).sum();
+            assert_eq!(entries, 20);
+        }
+    }
+
+    #[test]
+    fn burst_faster_than_cap_then_a_legal_move_corrects_once_then_accepts() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let start = DVec3::new(8.5, 20.0, 8.5);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let forged = DVec3::new(4000.0, 20.0, 4000.0);
+        for _ in 0..8 {
+            on_move(&shared, 1, forged, 0.0, 0.0, Stance::Standing);
+        }
+        assert_eq!(shared.lock_recover().players[&1].pos, start);
+        let mut corrections = 0;
+        while let Ok(frame) = rx.try_recv() {
+            match ServerMessage::decode(&frame) {
+                Some(ServerMessage::Position { pos }) => {
+                    assert_eq!(pos, start);
+                    corrections += 1;
+                }
+                other => panic!("expected Position, got {other:?}"),
+            }
+        }
+        assert!(corrections >= 1, "the burst must snap back at least once");
+        let legal = DVec3::new(10.5, 20.0, 8.5);
+        on_move(&shared, 1, legal, 0.0, 0.0, Stance::Standing);
+        assert_eq!(shared.lock_recover().players[&1].pos, legal);
+        assert!(rx.try_recv().is_err(), "a legal follow-up must not snap back");
+    }
+
+    #[test]
+    fn long_silence_then_a_legitimate_teleport_obeys_the_flag() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let start = DVec3::new(8.5, 20.0, 8.5);
+        let dest = DVec3::new(50_000.5, 30.0, -2_000.5);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        age_move(&shared, 1);
+        on_teleport(&shared, &test_ctx(true), 1, dest);
+        assert_eq!(shared.lock_recover().players[&1].pos, dest);
+        let _ = rx.try_recv();
+        on_teleport(&shared, &test_ctx(false), 1, start);
+        assert_eq!(shared.lock_recover().players[&1].pos, dest);
+        match ServerMessage::decode(&rx.try_recv().expect("refused /tp snaps back")) {
+            Some(ServerMessage::Position { pos }) => assert_eq!(pos, dest),
+            other => panic!("expected Position, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_at_exact_reach_is_accepted_and_extreme_coords_do_not_panic() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let center = DVec3::new(8.5, 20.5, 8.5);
+        // A hair inside the sphere so f64 rounding cannot push the construction past
+        // `>`; a hair outside must still miss.
+        let at_reach = DVec3::new(center.x + EDIT_REACH * 0.999, center.y, center.z);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(at_reach, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        on_edit(&shared, 1, 1, 8, 20, 8, 0, "air");
+        assert!(shared.lock_recover().edits.contains_key(&(8, 20, 8)), "exact REACH must land");
+
+        let just_out = DVec3::new(center.x + EDIT_REACH * 1.001, center.y, center.z);
+        shared.lock_recover().players.get_mut(&1).unwrap().pos = just_out;
+        on_edit(&shared, 1, 2, 8, 21, 8, 0, "air");
+        assert!(!shared.lock_recover().edits.contains_key(&(8, 21, 8)));
+
+        on_edit(&shared, 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
+        on_edit(&shared, 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
+        let far = crate::math::WORLD_BORDER as i32 + 64;
+        on_edit(&shared, 1, 5, far, 20, far, 0, "air");
+        assert!(!shared.lock_recover().edits.contains_key(&(far, 20, far)));
+        let _ = rx;
+    }
+
+    #[test]
+    fn bootstrap_backlog_overflow_kicks_without_poisoning_the_lock() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let kick = test_kick();
+        let mut players = HashMap::new();
+        let mut p = test_player(DVec3::new(0.0, 20.0, 0.0), out, kick.clone());
+        p.ready = false;
+        players.insert(1u32, p);
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        for i in 0..=BOOTSTRAP_BACKLOG {
+            broadcast_all(&shared, &ServerMessage::Pong { nonce: i as u32 }, None);
+        }
+        assert!(shared.lock().is_ok(), "kick must not poison the state lock");
+        assert!(shared.lock_recover().players.contains_key(&1), "overflow notifies, it does not drop the roster");
+        let notified = kick.notified();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(50), notified).await.expect("kick must notify")
+        });
+    }
+
+    #[test]
+    fn refused_joins_release_the_pre_auth_slot() {
+        let handle = spawn(0, Config { password: "pw".into(), seed: 1, ..Config::default() }).unwrap();
+        let addr = handle.addr();
+        let bad_pw = ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            fingerprint: crate::net::content_fingerprint(),
+            name: "eve".into(),
+            password: "nope".into(),
+        };
+        match raw_reply(addr, &bad_pw) {
+            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("password")),
+            other => panic!("expected password reject, got {other:?}"),
+        }
+        let bad_proto = ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION.wrapping_add(1),
+            fingerprint: crate::net::content_fingerprint(),
+            name: "eve".into(),
+            password: "pw".into(),
+        };
+        match raw_reply(addr, &bad_proto) {
+            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("protocol")),
+            other => panic!("expected protocol reject, got {other:?}"),
+        }
+        let bad_fp = ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            fingerprint: crate::net::content_fingerprint() ^ 1,
+            name: "eve".into(),
+            password: "pw".into(),
+        };
+        match raw_reply(addr, &bad_fp) {
+            ServerMessage::Reject { reason } => assert!(reason.contains("content")),
+            other => panic!("expected fingerprint reject, got {other:?}"),
+        }
+        use crate::net::client::Connection;
+        Connection::connect("127.0.0.1", addr.port(), "late", "pw").expect("refusals must free the slot");
+        handle.stop();
+    }
+
+    #[test]
+    fn rate_window_resets_across_the_second_and_cannot_be_gamed_at_the_boundary() {
+        let t0 = Instant::now();
+        let mut w = RateWindow::new(3);
+        assert!(w.allow(t0));
+        assert!(w.allow(t0 + Duration::from_millis(1)));
+        assert!(w.allow(t0 + Duration::from_millis(2)));
+        assert!(!w.allow(t0 + Duration::from_millis(3)), "over budget inside the second");
+        assert!(!w.allow(t0 + Duration::from_millis(999)), "boundary-1ms still in the window");
+        assert!(w.allow(t0 + Duration::from_secs(1)), "the oldest stamp ages out at +1s");
+        assert!(!w.allow(t0 + Duration::from_secs(1)), "aging one stamp frees one slot, not a full refill");
+        let mut fresh = RateWindow::new(3);
+        for i in 0..3 {
+            assert!(fresh.allow(t0 + Duration::from_millis(i)));
+        }
+        let mut gained = 0u32;
+        for ms in 1000..=1002 {
+            if fresh.allow(t0 + Duration::from_millis(ms)) {
+                gained += 1;
+            }
+        }
+        assert_eq!(gained, 3, "a full second later the budget is whole again");
+    }
+
+    #[test]
+    fn day_secs_clamps_zero_negative_and_huge() {
+        assert_eq!(clamp_day_secs(0.0), 10.0);
+        assert_eq!(clamp_day_secs(-40.0), 10.0);
+        assert_eq!(clamp_day_secs(f32::NAN), 600.0);
+        assert_eq!(clamp_day_secs(f32::INFINITY), 86_400.0);
+        assert_eq!(clamp_day_secs(1.0e20), 86_400.0);
+        assert_eq!(clamp_day_secs(600.0), 600.0);
+
+        let mut state = test_state(HashMap::new());
+        state.day = 0.0;
+        state.day_set = Instant::now() - Duration::from_secs(10);
+        let zero = state.day_now(0.0);
+        let neg = state.day_now(-5.0);
+        assert!((zero - 1.0).abs() < 0.05 || (zero - 0.0).abs() < 0.05, "10s of a 10s day wraps, got {zero}");
+        assert!((zero - neg).abs() < 1e-3, "zero and negative share the clamp");
+        let huge = state.day_now(f32::MAX);
+        assert!(huge.abs() < 0.01, "a huge cycle barely advances in 10s, got {huge}");
     }
 }

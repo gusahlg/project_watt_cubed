@@ -218,7 +218,13 @@ pub fn peek_meta(bytes: &[u8]) -> Result<SaveMeta, SaveError> {
         seed: word(base) as i64,
         created: word(base + 8),
         last_played: word(base + 16),
-        playtime_secs: word(base + 24),
+        playtime_secs: {
+            let raw = word(base + 24);
+            if raw > i64::MAX as u64 {
+                return Err(SaveError::Corrupt("playtime is negative"));
+            }
+            raw
+        },
         edit_count: u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap()),
     })
 }
@@ -572,5 +578,86 @@ mod tests {
         doc.edits.push(Edit { x: 0, y: 0, z: 0, spec: 7 });
         doc.meta.edit_count = doc.edits.len() as u32;
         assert!(encode(&doc).is_err());
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            self.next() as u8
+        }
+    }
+
+    fn decode_must_not_panic(bytes: &[u8]) -> Result<Decoded, SaveError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(bytes)))
+            .unwrap_or_else(|_| panic!("decode panicked"))
+    }
+
+    #[test]
+    fn truncate_and_flip_never_panic_and_salvage_keeps_the_maximal_prefix() {
+        let doc = sample();
+        let bytes = encode(&doc).unwrap();
+        let mods_len = 1 + 1 + "inventory".len() + 4 + "Stone,Iron".len();
+        let edits_end = bytes.len() - mods_len;
+        let edits_start = edits_end - EDIT_BYTES * doc.edits.len();
+
+        for n in 0..=bytes.len() {
+            let got = decode_must_not_panic(&bytes[..n]);
+            if n < HEADER_LEN {
+                assert!(got.is_err(), "prefix {n} must be a typed error");
+                continue;
+            }
+            if (edits_start..=edits_end).contains(&n) {
+                let complete = (n - edits_start) / EDIT_BYTES;
+                match got {
+                    Ok(Decoded::Salvaged { recovered, expected, .. }) => {
+                        assert_eq!(expected, 3);
+                        assert_eq!(recovered, complete as u32, "cut at {n}");
+                    }
+                    Ok(Decoded::Intact(got)) if complete == doc.edits.len() && n == bytes.len() => {
+                        assert_eq!(got.edits.len(), 3);
+                    }
+                    Ok(Decoded::Intact(got)) if complete == doc.edits.len() => {
+                        assert_eq!(got.edits.len(), 3, "edits intact at cut {n}");
+                    }
+                    other => panic!("cut at {n} (edits complete={complete}) -> {other:?}"),
+                }
+            }
+        }
+
+        let mut rng = XorShift::new(0x5A1E_F11E);
+        for i in 0..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[i] ^= rng.byte() | 1;
+            let _ = decode_must_not_panic(&flipped);
+        }
+    }
+
+    #[test]
+    fn unknown_future_version_is_a_clean_error() {
+        let mut bytes = encode(&sample()).unwrap();
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(99))));
+        assert!(matches!(peek_meta(&bytes), Err(SaveError::BadVersion(99))));
+    }
+
+    #[test]
+    fn negative_playtime_is_rejected() {
+        let mut bytes = encode(&sample()).unwrap();
+        let playtime_off = NAME_OFF + 1 + NAME_FIELD + 8 + 8 + 8;
+        bytes[playtime_off..playtime_off + 8].copy_from_slice(&(-1i64).to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
+        assert!(matches!(peek_meta(&bytes), Err(SaveError::Corrupt(_))));
     }
 }

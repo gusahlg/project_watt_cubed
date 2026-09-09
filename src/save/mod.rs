@@ -260,4 +260,49 @@ mod tests {
 
         cleanup(&id);
     }
+
+    #[test]
+    fn mod_state_unknown_ids_are_ignored_duplicates_last_win_empty_payload_clears() {
+        use crate::save::format::{PlayerState, SaveDoc};
+
+        let blank_player = PlayerState {
+            pos: [0.0, 40.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            flying: false,
+            noclip: false,
+        };
+        let doc = SaveDoc {
+            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            meta: meta("mods"),
+            player: blank_player.clone(),
+            specs: vec![],
+            edits: vec![],
+            mods: vec![
+                ("Inventory".into(), "Stone".into()),
+                ("no-such-mod".into(), "ignored".into()),
+                ("Inventory".into(), "Iron".into()),
+            ],
+        };
+        let mut mods = Mods::with_defaults();
+        let (world, _, _) = super::bridge::from_doc(doc, &mut mods, World::new);
+        let states = mods.save_states(&world);
+        let inv = states.iter().find(|(n, _)| n == "Inventory").map(|(_, d)| d.as_str());
+        assert_eq!(inv, Some("Iron"), "duplicate mod lines: last wins");
+        assert!(states.iter().all(|(n, _)| n != "no-such-mod"));
+
+        let cleared = SaveDoc {
+            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            meta: meta("mods"),
+            player: blank_player,
+            specs: vec![],
+            edits: vec![],
+            mods: vec![("Inventory".into(), "".into())],
+        };
+        let mut mods = Mods::with_defaults();
+        let (world, _, _) = super::bridge::from_doc(cleared, &mut mods, World::new);
+        let states = mods.save_states(&world);
+        let inv = states.iter().find(|(n, _)| n == "Inventory").map(|(_, d)| d.as_str());
+        assert_eq!(inv, Some(""), "empty payload clears the stash");
+    }
 }

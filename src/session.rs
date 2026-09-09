@@ -59,3 +59,27 @@ impl Session {
         let _ = fs::write(SESSION_PATH, text);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_uses_defaults_for_missing_and_unknown_keys() {
+        let prev = fs::read(SESSION_PATH).ok();
+        let _ = fs::create_dir_all("saves");
+        fs::write(SESSION_PATH, "address = 10.0.0.2\nunknown=x\nnot-a-pair\nname=watt\n").unwrap();
+        let s = Session::load();
+        assert_eq!(s.address, "10.0.0.2");
+        assert_eq!(s.name, "watt");
+        assert_eq!(s.port, "");
+        match prev {
+            Some(bytes) => {
+                let _ = fs::write(SESSION_PATH, bytes);
+            }
+            None => {
+                let _ = fs::remove_file(SESSION_PATH);
+            }
+        }
+    }
+}
