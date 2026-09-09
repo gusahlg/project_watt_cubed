@@ -35,7 +35,11 @@ pub const MAX_LIGHT: u8 = 15;
 /// Cells in one chunk face.
 pub const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
 /// Chunk size as a signed coordinate, for the `-1..=16` padded range.
+#[cfg(test)]
 const CS: i32 = CHUNK_SIZE as i32;
+/// Flat-index strides matching [`Chunk::index`]: x fastest, then z, then y.
+const STRIDE_Z: usize = CHUNK_SIZE;
+const STRIDE_Y: usize = CHUNK_SIZE * CHUNK_SIZE;
 
 /// Light value: 4-bit clamped to 0..=15. Every constructor clamps or is const-checked.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -120,12 +124,7 @@ impl LightGrid {
         match &self.0 {
             Repr::Uniform(v) => v.block.get() > 1,
             Repr::Cells(cells) => Face::ALL.iter().any(|&face| {
-                face_cells(face).any(|(ci, _)| {
-                    cells[Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize)]
-                        .block
-                        .get()
-                        > 1
-                })
+                FACE_INDEX[face as usize].iter().any(|&i| cells[i].block.get() > 1)
             }),
         }
     }
@@ -335,6 +334,7 @@ impl FaceShell {
     }
 
     /// Light value from neighbour across `face` at coords `(a, b)`.
+    #[cfg(test)]
     #[inline]
     pub(in crate::world) fn at(&self, face: Face, a: usize, b: usize) -> Lumel {
         self.faces[face as usize][a + b * CHUNK_SIZE]
@@ -419,6 +419,9 @@ struct FloodScratch {
     /// Dense lumel box recycled across `propagate` calls on this thread.
     /// Moved into the output grid when the flood stays dense.
     cells: Option<Box<[Lumel; CHUNK_VOLUME]>>,
+    /// Blocklight shell seeds applied after emitters so the queue is
+    /// emitters then faces.
+    shell_block: Vec<(usize, LightLevel)>,
 }
 
 thread_local! {
@@ -428,6 +431,7 @@ thread_local! {
             block: Vec::new(),
             queue: VecDeque::new(),
             cells: None,
+            shell_block: Vec::new(),
         })
     };
 }
@@ -454,25 +458,25 @@ pub fn propagate(
     tables: &HotTables,
     out: &mut LightGrid,
 ) {
-    let cs = CHUNK_SIZE as i32;
     // Decode the opacity field ONCE (payload-specialized, ~a palette pass)
-    // into an L1-resident bitset: the flood probes it ~6 times per relaxed
-    // cell, and each probe used to be a payload dispatch + palette load.
+    // into an L1-resident bitset plus per-column occupancy: the flood probes
+    // the bitset ~6 times per relaxed cell, and the sky seed is one
+    // `leading_zeros` per column.
     let mut opaque_bits = [0u64; CHUNK_VOLUME / 64];
-    chunk.fill_opacity(|id| tables.opaque(id), &mut opaque_bits);
-    let opaque_at = |x: i32, y: i32, z: i32| {
-        let i = Chunk::index(x as usize, y as usize, z as usize);
-        (opaque_bits[i >> 6] >> (i & 63)) & 1 != 0
-    };
+    let mut col = [0u16; CHUNK_AREA];
+    chunk.fill_opacity(|id| tables.opaque(id), &mut opaque_bits, &mut col);
+    let opaque_at = |i: usize| (opaque_bits[i >> 6] >> (i & 63)) & 1 != 0;
 
     // Skylight: borrow thread-local scratch, reset dark, seed and flood.
-    // No stale flood state from a prior job survives.
-    let (mut sky, mut block, mut queue, tls_cells) = FLOOD.with_borrow_mut(|s| {
+    // No stale flood state from a prior job survives. Output cells are
+    // overwritten at the end, so recycled boxes are not filled dark.
+    let (mut sky, mut block, mut queue, tls_cells, mut shell_block) = FLOOD.with_borrow_mut(|s| {
         (
             std::mem::take(&mut s.sky),
             std::mem::take(&mut s.block),
             std::mem::take(&mut s.queue),
             s.cells.take(),
+            std::mem::take(&mut s.shell_block),
         )
     });
     let (mut cells, leftover) = match std::mem::replace(&mut out.0, Repr::Uniform(Lumel::DARK)) {
@@ -482,72 +486,72 @@ pub fn propagate(
     reset_dark(&mut sky);
     reset_dark(&mut block);
     queue.clear();
+    shell_block.clear();
     // Seed 1: open sky floods down each column until the first opaque voxel
     // (classic heightmap seed, gated by ceiling). Deep chunks seed nothing here;
-    // their light arrives from the +Y halo.
+    // their light arrives from the +Y halo. `leading_zeros` of the occupancy
+    // mask is the empty run from y=15; push order is still y=15,14,.. per
+    // column, x-inner z-outer.
     let top_y = world_y0 + CHUNK_SIZE as i32;
     for z in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
             if !ceiling.open_above(x, z, top_y) {
                 continue;
             }
-            for y in (0..CHUNK_SIZE).rev() {
-                if opaque_at(x as i32, y as i32, z as i32) {
-                    break; // shadowed below the first opaque cell
-                }
-                let i = Chunk::index(x, y, z);
+            let n = col[x + z * CHUNK_SIZE].leading_zeros() as usize;
+            for k in 0..n {
+                let y = CHUNK_SIZE - 1 - k;
+                let i = x + z * STRIDE_Z + y * STRIDE_Y;
                 sky[i] = LightLevel::FULL;
                 queue.push_back(i);
             }
         }
     }
-    // Seed 2: the six neighbour boundaries (light crossing in loses one step).
-    seed_from_shell(shell, |i, lum| {
-        if lum.sky > sky[i] {
-            sky[i] = lum.sky;
+    // Seed 2: one 6×256 walk writes sky now and stashes blocklight for after
+    // the emitter scan, so both channels share the face-index table.
+    seed_from_shell(shell, |i, s| {
+        if s > sky[i] {
+            sky[i] = s;
             queue.push_back(i);
         }
+    }, |i, b| {
+        shell_block.push((i, b));
     });
     // Flood: -1 per step, except full skylight passes straight down (open columns stay lit).
     while let Some(i) = queue.pop_front() {
         let level = sky[i];
         let (x, y, z) = Chunk::local_of(i);
-        let (x, y, z) = (x as i32, y as i32, z as i32);
-        let mut relax = |nx: i32, ny: i32, nz: i32, down: bool| {
-            if opaque_at(nx, ny, nz) {
+        let mut relax = |ni: usize, down: bool| {
+            if opaque_at(ni) {
                 return;
             }
             let cand = if down && level == LightLevel::FULL { LightLevel::FULL } else { level.attenuated() };
-            let ni = Chunk::index(nx as usize, ny as usize, nz as usize);
             if cand > sky[ni] {
                 sky[ni] = cand;
                 queue.push_back(ni);
             }
         };
-        if x > 0 { relax(x - 1, y, z, false); }
-        if x + 1 < cs { relax(x + 1, y, z, false); }
-        if y > 0 { relax(x, y - 1, z, true); }
-        if y + 1 < cs { relax(x, y + 1, z, false); }
-        if z > 0 { relax(x, y, z - 1, false); }
-        if z + 1 < cs { relax(x, y, z + 1, false); }
+        if x > 0 { relax(i - 1, false); }
+        if x + 1 < CHUNK_SIZE { relax(i + 1, false); }
+        if y > 0 { relax(i - STRIDE_Y, true); }
+        if y + 1 < CHUNK_SIZE { relax(i + STRIDE_Y, false); }
+        if z > 0 { relax(i - STRIDE_Z, false); }
+        if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z, false); }
     }
 
-    // Blocklight: block was reset to all-dark; clear queue defensively, seed emitters, flood.
+    // Blocklight: block was reset to all-dark; clear queue, seed emitters, then
+    // the stashed shell (emitters then faces).
     queue.clear();
-    for i in 0..CHUNK_VOLUME {
-        let (x, y, z) = Chunk::local_of(i);
-        let em = tables.emission[chunk.get_local(x, y, z).0 as usize];
-        if em > 0 {
-            block[i] = LightLevel::new(em);
+    chunk.for_each_emission(&tables.emission, |i, em| {
+        block[i] = LightLevel::new(em);
+        queue.push_back(i);
+    });
+    for &(i, lvl) in &shell_block {
+        if lvl > block[i] {
+            block[i] = lvl;
             queue.push_back(i);
         }
     }
-    seed_from_shell(shell, |i, lum| {
-        if lum.block > block[i] {
-            block[i] = lum.block;
-            queue.push_back(i);
-        }
-    });
     while let Some(i) = queue.pop_front() {
         let level = block[i];
         if level <= LightLevel::new(1) {
@@ -555,23 +559,21 @@ pub fn propagate(
         }
         let cand = level.attenuated();
         let (x, y, z) = Chunk::local_of(i);
-        let (x, y, z) = (x as i32, y as i32, z as i32);
-        let mut relax = |nx: i32, ny: i32, nz: i32| {
-            if opaque_at(nx, ny, nz) {
+        let mut relax = |ni: usize| {
+            if opaque_at(ni) {
                 return;
             }
-            let ni = Chunk::index(nx as usize, ny as usize, nz as usize);
             if cand > block[ni] {
                 block[ni] = cand;
                 queue.push_back(ni);
             }
         };
-        if x > 0 { relax(x - 1, y, z); }
-        if x + 1 < cs { relax(x + 1, y, z); }
-        if y > 0 { relax(x, y - 1, z); }
-        if y + 1 < cs { relax(x, y + 1, z); }
-        if z > 0 { relax(x, y, z - 1); }
-        if z + 1 < cs { relax(x, y, z + 1); }
+        if x > 0 { relax(i - 1); }
+        if x + 1 < CHUNK_SIZE { relax(i + 1); }
+        if y > 0 { relax(i - STRIDE_Y); }
+        if y + 1 < CHUNK_SIZE { relax(i + STRIDE_Y); }
+        if z > 0 { relax(i - STRIDE_Z); }
+        if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z); }
     }
 
     for i in 0..CHUNK_VOLUME {
@@ -595,36 +597,74 @@ pub fn propagate(
         s.block = block;
         s.queue = queue;
         s.cells = recycle;
+        s.shell_block = shell_block;
     });
 }
 
-/// Seed border cells from neighbour shell faces (skylight full-strength from +Y).
-/// Dark shell cells (missing neighbours) don't seed.
-fn seed_from_shell(shell: &FaceShell, mut seed: impl FnMut(usize, Lumel)) {
-    for face in Face::ALL {
-        let na = normal_axis(face);
-        let (au, av) = plane_axes(face);
-        let inner = match face {
-            Face::PosX | Face::PosY | Face::PosZ => CS - 1,
-            _ => 0,
+/// Interior cell index of face slot `a + b*16` (a inner, b outer — the
+/// `seed_from_shell` walk). Built with the same (na, au, av, inner) as the
+/// old dynamic-axis loop.
+const fn face_index_table() -> [[usize; CHUNK_AREA]; 6] {
+    let mut t = [[0usize; CHUNK_AREA]; 6];
+    let mut f = 0;
+    while f < 6 {
+        let (na, au, av, inner): (usize, usize, usize, usize) = match f {
+            0 => (0, 1, 2, 0),
+            1 => (0, 1, 2, CHUNK_SIZE - 1),
+            2 => (2, 0, 1, 0),
+            3 => (2, 0, 1, CHUNK_SIZE - 1),
+            4 => (1, 0, 2, 0),
+            _ => (1, 0, 2, CHUNK_SIZE - 1),
         };
-        for b in 0..CHUNK_SIZE {
-            for a in 0..CHUNK_SIZE {
-                let src = shell.at(face, a, b);
-                let sky = if face == Face::PosY && src.sky == LightLevel::FULL {
-                    LightLevel::FULL
-                } else {
-                    src.sky.attenuated()
-                };
-                let seeded = Lumel { sky, block: src.block.attenuated() };
-                if seeded == Lumel::DARK {
-                    continue;
-                }
-                let mut ci = [0i32; 3];
-                ci[na] = inner;
-                ci[au] = a as i32;
-                ci[av] = b as i32;
-                seed(Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize), seeded);
+        let mut b = 0;
+        while b < CHUNK_SIZE {
+            let mut a = 0;
+            while a < CHUNK_SIZE {
+                let mut c = [0usize; 3];
+                c[na] = inner;
+                c[au] = a;
+                c[av] = b;
+                t[f][a + b * CHUNK_SIZE] = c[0] + c[2] * CHUNK_SIZE + c[1] * CHUNK_SIZE * CHUNK_SIZE;
+                a += 1;
+            }
+            b += 1;
+        }
+        f += 1;
+    }
+    t
+}
+
+const FACE_INDEX: [[usize; CHUNK_AREA]; 6] = face_index_table();
+
+/// Seed border cells from neighbour shell faces (skylight full-strength from +Y).
+/// Dark shell cells (missing neighbours) don't seed. One 6×256 walk; callers
+/// split sky (applied now) from block (stashed until after emitters).
+fn seed_from_shell(
+    shell: &FaceShell,
+    mut sky: impl FnMut(usize, LightLevel),
+    mut block: impl FnMut(usize, LightLevel),
+) {
+    for face in Face::ALL {
+        let layer = &shell.faces[face as usize];
+        let idx = &FACE_INDEX[face as usize];
+        let keep_full_sky = face == Face::PosY;
+        for slot in 0..CHUNK_AREA {
+            let src = layer[slot];
+            let sky_l = if keep_full_sky && src.sky == LightLevel::FULL {
+                LightLevel::FULL
+            } else {
+                src.sky.attenuated()
+            };
+            let block_l = src.block.attenuated();
+            if sky_l == LightLevel::DARK && block_l == LightLevel::DARK {
+                continue;
+            }
+            let i = idx[slot];
+            if sky_l != LightLevel::DARK {
+                sky(i, sky_l);
+            }
+            if block_l != LightLevel::DARK {
+                block(i, block_l);
             }
         }
     }
@@ -633,15 +673,16 @@ fn seed_from_shell(shell: &FaceShell, mut seed: impl FnMut(usize, Lumel)) {
 /// Whether border changed on a face. Used to enqueue neighbours only when their
 /// shared boundary moves (settling convergence detection).
 pub(in crate::world) fn border_changed(a: &LightGrid, b: &LightGrid, face: Face) -> bool {
+    let idx = &FACE_INDEX[face as usize];
     match (&a.0, &b.0) {
         (Repr::Uniform(x), Repr::Uniform(y)) => x != y,
-        _ => face_cells(face).any(|(ci, _)| {
-            let i = Chunk::index(ci[0] as usize, ci[1] as usize, ci[2] as usize);
-            a.at(i) != b.at(i)
-        }),
+        (Repr::Uniform(x), Repr::Cells(c)) => idx.iter().any(|&i| c[i] != *x),
+        (Repr::Cells(c), Repr::Uniform(y)) => idx.iter().any(|&i| c[i] != *y),
+        (Repr::Cells(ca), Repr::Cells(cb)) => idx.iter().any(|&i| ca[i] != cb[i]),
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn normal_axis(face: Face) -> usize {
     match face {
@@ -652,6 +693,7 @@ fn normal_axis(face: Face) -> usize {
 }
 
 /// The two in-face axes of `face`, ascending.
+#[cfg(test)]
 #[inline]
 fn plane_axes(face: Face) -> (usize, usize) {
     match normal_axis(face) {
@@ -659,27 +701,6 @@ fn plane_axes(face: Face) -> (usize, usize) {
         1 => (0, 2),
         _ => (0, 1),
     }
-}
-
-/// Map face's border cells to (interior, exterior) coords. Used by both seeding and diffing.
-fn face_cells(face: Face) -> impl Iterator<Item = ([i32; 3], [i32; 3])> {
-    let na = normal_axis(face);
-    let (au, av) = plane_axes(face);
-    let (inner, outer) = match face {
-        Face::PosX | Face::PosY | Face::PosZ => (CS - 1, CS),
-        _ => (0, -1),
-    };
-    (0..CHUNK_SIZE).flat_map(move |a| {
-        (0..CHUNK_SIZE).map(move |b| {
-            let mut ci = [0i32; 3];
-            ci[na] = inner;
-            ci[au] = a as i32;
-            ci[av] = b as i32;
-            let mut co = ci;
-            co[na] = outer;
-            (ci, co)
-        })
-    })
 }
 
 #[cfg(test)]
@@ -786,12 +807,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn face_index_table_matches_axis_walk() {
+        for face in Face::ALL {
+            let na = normal_axis(face);
+            let (au, av) = plane_axes(face);
+            let inner = match face {
+                Face::PosX | Face::PosY | Face::PosZ => CHUNK_SIZE - 1,
+                _ => 0,
+            };
+            for b in 0..CHUNK_SIZE {
+                for a in 0..CHUNK_SIZE {
+                    let mut ci = [0usize; 3];
+                    ci[na] = inner;
+                    ci[au] = a;
+                    ci[av] = b;
+                    assert_eq!(
+                        FACE_INDEX[face as usize][a + b * CHUNK_SIZE],
+                        Chunk::index(ci[0], ci[1], ci[2]),
+                        "{face:?} slot ({a},{b})"
+                    );
+                }
+            }
+        }
+    }
+
     /// Full settle-flood cost for a surface-band chunk — the gauge for the
     /// propagate opacity-bitset redesign. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release light_propagate_throughput -- --ignored --nocapture`.
     /// 2026-07-19 (12-core box), per-probe `get_local`: ~18.1k settles/s;
     /// decoded opacity bitset: ~32.6k settles/s (1.8×).
+    /// 2026-09-09, flood-path rewrite (skip empty emitter scan, column-mask
+    /// sky seed, flat-index relax, one-pass shell seed): before 34.3k
+    /// settles/s (median of 3: 33.4k / 34.3k / 34.8k); after 37.6k
+    /// settles/s (median of 3: 35.5k / 37.6k / 38.0k).
     #[test]
     #[ignore]
     fn light_propagate_throughput() {
