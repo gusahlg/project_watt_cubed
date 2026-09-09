@@ -654,6 +654,31 @@ pub(super) fn display_json(eng: &Engine, settings: &Settings, system: Option<&Sy
     ])
 }
 
+/// Lanes as the engine sees them: [`Settings::render_config`], not stored fields.
+fn render_lanes_json(s: &Settings) -> Json {
+    let lanes = s.render_config();
+    Json::object(vec![
+        ("taa", Json::from(lanes.taa)),
+        ("fog", Json::from(s.fog)),
+        ("blocklight", Json::from(s.blocklight)),
+        ("ambient", Json::from(s.ambient)),
+        ("sunlight", Json::from(s.sunlight)),
+        ("exposure", Json::from(s.exposure)),
+        ("bloom", Json::from(s.bloom)),
+        ("godrays", Json::from(s.godrays)),
+        ("shadows", Json::from(s.shadows)),
+        ("sky", Json::from(s.sky)),
+        ("clouds", Json::from(s.clouds)),
+        ("weather", Json::from(s.weather)),
+        ("stars", Json::from(s.stars)),
+        ("day_night", Json::from(s.day_night)),
+        ("vrs", Json::from(lanes.vrs)),
+        ("vrs_choice", Json::from(s.vrs.code())),
+        ("water_animation", Json::from(s.water_anim)),
+        ("vignette", Json::from(s.vignette)),
+    ])
+}
+
 pub(super) fn settings_json(s: &Settings, eng: &Engine) -> Json {
     Json::object(vec![
         ("preset", Json::from(s.preset.label().to_ascii_lowercase())),
@@ -681,29 +706,7 @@ pub(super) fn settings_json(s: &Settings, eng: &Engine) -> Json {
         ("mod_hud", Json::from(s.mod_hud)),
         ("player_models", Json::from(s.player_models)),
         ("name_tags", Json::from(s.name_tags)),
-        (
-            "render_lanes",
-            Json::object(vec![
-                ("taa", Json::from(s.taa)),
-                ("fog", Json::from(s.fog)),
-                ("blocklight", Json::from(s.blocklight)),
-                ("ambient", Json::from(s.ambient)),
-                ("sunlight", Json::from(s.sunlight)),
-                ("exposure", Json::from(s.exposure)),
-                ("bloom", Json::from(s.bloom)),
-                ("godrays", Json::from(s.godrays)),
-                ("shadows", Json::from(s.shadows)),
-                ("sky", Json::from(s.sky)),
-                ("clouds", Json::from(s.clouds)),
-                ("weather", Json::from(s.weather)),
-                ("stars", Json::from(s.stars)),
-                ("day_night", Json::from(s.day_night)),
-                ("vrs", Json::from(s.render_config().vrs)),
-                ("vrs_choice", Json::from(s.vrs.code())),
-                ("water_animation", Json::from(s.water_anim)),
-                ("vignette", Json::from(s.vignette)),
-            ]),
-        ),
+        ("render_lanes", render_lanes_json(s)),
     ])
 }
 
@@ -898,8 +901,8 @@ fn glob_values(root: &str, prefix: &str, suffix: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Json, parse_edid};
-    use crate::settings::{DEFAULT_AUTO_RENDER_SCALE, Preset, Settings};
+    use super::{Json, parse_edid, render_lanes_json};
+    use crate::settings::{DEFAULT_AUTO_RENDER_SCALE, Preset, Settings, with_auto_render_scale};
 
     #[test]
     fn display_report_uses_effective_scale_and_auto_flag() {
@@ -912,7 +915,11 @@ mod tests {
             ("render_scale_auto", Json::from(s.render_scale_auto())),
         ])
         .render();
-        assert!(text.contains("\"render_scale\":0.8"), "{text}");
+        let scale_json = Json::number(f64::from(DEFAULT_AUTO_RENDER_SCALE)).render();
+        assert!(
+            text.contains(&format!("\"render_scale\":{scale_json}")),
+            "{text}"
+        );
         assert!(text.contains("\"render_scale_auto\":true"), "{text}");
 
         s.preset = Preset::Custom;
@@ -925,6 +932,28 @@ mod tests {
         .render();
         assert!(text.contains("\"render_scale\":1"), "{text}");
         assert!(text.contains("\"render_scale_auto\":false"), "{text}");
+    }
+
+    #[test]
+    fn default_bench_lanes_force_taa_when_auto_scale_is_below_one() {
+        with_auto_render_scale(0.8, || {
+            let mut s = Settings::default();
+            s.note_render_extent(1920, 1080, 1.0);
+            assert_eq!(s.effective_render_scale(1920, 1080), 0.8);
+            let text = render_lanes_json(&s).render();
+            assert!(
+                text.contains("\"taa\":true"),
+                "effective scale < 1 must force TAA in the bench report: {text}"
+            );
+        });
+        let mut s = Settings::default();
+        s.note_render_extent(1920, 1080, 1.0);
+        assert_eq!(s.effective_render_scale(1920, 1080), DEFAULT_AUTO_RENDER_SCALE);
+        let text = render_lanes_json(&s).render();
+        assert!(
+            text.contains("\"taa\":false"),
+            "shipped 1.0 Auto scale leaves stored TAA: {text}"
+        );
     }
 
     #[test]

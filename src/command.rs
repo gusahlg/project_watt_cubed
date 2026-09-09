@@ -568,7 +568,10 @@ mod tests {
         s.note_render_extent(1920, 1080, 1.0);
         let text = joined(&execute("gfx", &mut p, &mut w, &mut s, &mut sky));
         assert!(
-            text.contains("render scale Auto (0.8)"),
+            text.contains(&format!(
+                "render scale Auto ({:.1})",
+                crate::settings::DEFAULT_AUTO_RENDER_SCALE
+            )),
             "Default /gfx prints the effective Auto scale: {text}"
         );
     }

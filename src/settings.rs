@@ -39,9 +39,37 @@ fn settings_path() -> PathBuf {
 }
 
 /// Default-preset internal scale when the window is above [`AUTO_RENDER_SCALE_THRESHOLD_PX`].
-pub const DEFAULT_AUTO_RENDER_SCALE: f32 = 0.8;
+/// Raise to 0.8 once the engine's temporal upsampler (Catmull-Rom TAAU, engine wt/round4+)
+/// is in main and the TAA forcing below is verified in the bench path.
+pub const DEFAULT_AUTO_RENDER_SCALE: f32 = 1.0;
 /// Window-pixel count above which Default uses [`DEFAULT_AUTO_RENDER_SCALE`] (and TAA).
 pub const AUTO_RENDER_SCALE_THRESHOLD_PX: u32 = 1_500_000;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AUTO_RENDER_SCALE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The Auto scale Default actually applies (the shipped constant, or a test override).
+fn live_auto_render_scale() -> f32 {
+    #[cfg(test)]
+    if let Some(scale) = TEST_AUTO_RENDER_SCALE.with(|slot| slot.get()) {
+        return scale;
+    }
+    DEFAULT_AUTO_RENDER_SCALE
+}
+
+/// Run `f` with Default Auto scale temporarily set (proves TAA forcing while the
+/// shipped constant is 1.0).
+#[cfg(test)]
+pub fn with_auto_render_scale<R>(scale: f32, f: impl FnOnce() -> R) -> R {
+    TEST_AUTO_RENDER_SCALE.with(|slot| {
+        let prev = slot.replace(Some(scale));
+        let out = f();
+        slot.set(prev);
+        out
+    })
+}
 
 /// Field-of-view clamp range, in degrees. Shared with the settings menu stepper.
 pub const FOV_RANGE: RangeInclusive<f32> = 60.0..=220.0;
@@ -1088,8 +1116,9 @@ impl Settings {
         self.preset == Preset::Default
     }
 
-    /// Scale pushed to the engine for this window. Default picks 0.8 above the
-    /// pixel threshold and 1.0 otherwise; other profiles keep their stored value.
+    /// Scale pushed to the engine for this window. Default picks
+    /// [`DEFAULT_AUTO_RENDER_SCALE`] above the pixel threshold and 1.0
+    /// otherwise; other profiles keep their stored value.
     pub fn effective_render_scale(&self, window_w: u32, window_h: u32) -> f32 {
         if self.render_scale_auto() {
             auto_render_scale(window_w, window_h)
@@ -1197,7 +1226,7 @@ impl Settings {
 pub fn auto_render_scale(window_w: u32, window_h: u32) -> f32 {
     let px = (window_w as u64).saturating_mul(window_h as u64);
     if px > u64::from(AUTO_RENDER_SCALE_THRESHOLD_PX) {
-        DEFAULT_AUTO_RENDER_SCALE
+        live_auto_render_scale()
     } else {
         1.0
     }
@@ -1910,12 +1939,19 @@ mod tests {
         s.note_render_extent(1920, 1080, 1.0);
         assert_eq!(s.effective_render_scale(1920, 1080), DEFAULT_AUTO_RENDER_SCALE);
         assert_eq!(s.session_graphics(1920, 1080).render_scale, DEFAULT_AUTO_RENDER_SCALE);
-        assert!(s.render_config().taa, "1080p Default forces TAA for the upsampler");
-        assert_eq!(field.show(&s), "Auto (0.8)");
+        assert_eq!(
+            s.render_config().taa,
+            DEFAULT_AUTO_RENDER_SCALE < 1.0,
+            "TAA is forced only while Auto scale is below 1"
+        );
+        assert_eq!(
+            field.show(&s),
+            format!("Auto ({:.1})", DEFAULT_AUTO_RENDER_SCALE)
+        );
 
         s.note_render_extent(3440, 1440, 1.0);
         assert_eq!(s.effective_render_scale(3440, 1440), DEFAULT_AUTO_RENDER_SCALE);
-        assert!(s.render_config().taa);
+        assert_eq!(s.render_config().taa, DEFAULT_AUTO_RENDER_SCALE < 1.0);
 
         // Crossing the threshold via the live extent path (resize / fullscreen).
         s.note_render_extent(1280, 720, 1.0);
@@ -1923,7 +1959,7 @@ mod tests {
         assert!(!s.render_config().taa);
         s.note_render_extent(1920, 1080, 1.0);
         assert_eq!(s.effective_render_scale(s.window_w, s.window_h), DEFAULT_AUTO_RENDER_SCALE);
-        assert!(s.render_config().taa);
+        assert_eq!(s.render_config().taa, DEFAULT_AUTO_RENDER_SCALE < 1.0);
 
         let mut custom = Settings::default();
         custom.mark_custom();
