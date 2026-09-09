@@ -382,6 +382,11 @@ impl SoundSystem {
             || !self.sessions.is_empty()
     }
 
+    /// A fire-and-forget UI one-shot is still playing (or waiting on expiry).
+    pub fn ui_pending(&self) -> bool {
+        !self.ui_voices.is_empty()
+    }
+
     pub fn submit(&mut self, frame: AudioFrame) {
         self.poll_starvation();
 
@@ -931,7 +936,9 @@ impl SoundSystem {
     }
 
     /// Edge-trigger `Fault::Starved` once per starvation burst per session.
-    fn poll_starvation(&mut self) {
+    /// Game still calls this on a skipped director commit so a live session's
+    /// decoder thread can surface starvation without a mixer frame.
+    pub(crate) fn poll_starvation(&mut self) {
         for (key, (flag, last)) in self.session_starved.iter_mut() {
             let now = flag.load(Ordering::Relaxed);
             if now && !*last {
@@ -1526,5 +1533,68 @@ mod seam_tests {
         );
         assert!(rec.intents().is_empty());
         assert!(!sound.has_live_sources());
+    }
+
+    #[test]
+    fn live_sources_block_the_director_skip() {
+        use crate::audio::director::{AudioCtx, AudioDirector, PlayerPose};
+        use crate::audio::palette::CuePalette;
+        use crate::console::Console;
+        use crate::world::World;
+
+        let (mut sound, syms, _rec) = system(32);
+        let (palette, _) = CuePalette::build(&syms, sound.catalog());
+        let mut dir = AudioDirector::new(palette);
+        let world = World::generate();
+        let mut console = Console::new();
+        let pos = DVec3::ZERO;
+        dir.frame(
+            AudioCtx {
+                dt: 0.1,
+                player: PlayerPose {
+                    pos,
+                    feet: pos,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    velocity: DVec3::ZERO,
+                    on_ground: true,
+                },
+                ptt: false,
+                voice_enabled: false,
+                events: Vec::new(),
+                peers: &[],
+                world: &world,
+                net: None,
+                console: &mut console,
+            },
+            &mut sound,
+        );
+        assert!(
+            dir.can_skip_commit(&sound, &[], pos, false),
+            "a silent still frame arms the skip"
+        );
+
+        let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
+        sound.submit(
+            AudioFrame::new(
+                0.1,
+                origin_listener(),
+                vec![Occurrence {
+                    id: OccurrenceId(1),
+                    cue,
+                    at: Some(source(4.0)),
+                    medium: Medium::Air,
+                    gain: 1.0,
+                }],
+                vec![],
+                open_window(),
+            )
+            .unwrap(),
+        );
+        assert!(sound.has_live_sources());
+        assert!(
+            !dir.can_skip_commit(&sound, &[], pos, false),
+            "a live clip voice must re-enable the commit"
+        );
     }
 }

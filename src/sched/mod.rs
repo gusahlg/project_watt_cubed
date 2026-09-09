@@ -282,6 +282,7 @@ impl Scheduler {
     /// converts it into whole `fixed_ticks_due` — the bounded catch-up count
     /// [`Scheduler::tick`] replays each `FixedTick` producer. The remainder
     /// stays banked for the next frame; the cap lives here, not in any lane.
+    /// Uses the engine's already-sampled `frame_dt`; does not call `Instant::now`.
     pub fn clocks(&mut self, frame_dt: f32) -> Clocks {
         for iv in &mut self.intervals {
             iv.accum = (iv.accum + frame_dt).min(iv.period);

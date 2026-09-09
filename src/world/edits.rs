@@ -130,6 +130,7 @@ impl World {
         for (_, state) in self.sections.drain() {
             state.free(eng);
         }
+        self.meshing_sections = 0;
         self.section_upload_queue.clear();
         self.pending_sections.take();
         self.dirty_sections.clear();
@@ -243,6 +244,7 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::needs_mesh(), eng);
         }
+        self.building_meshes = 0;
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop
         // the membership set and the stale hint with it.
         self.dirty_worklist.clear();
@@ -258,6 +260,7 @@ impl World {
         for (_, state) in self.sections.drain() {
             state.free(eng);
         }
+        self.meshing_sections = 0;
         self.section_upload_queue.clear();
         self.pending_sections.take();
         self.dirty_sections.clear();
@@ -377,7 +380,9 @@ impl World {
     /// membership set instead of filtering every loaded chunk.
     pub(in crate::world) fn invalidate_mesh(&mut self, coord: Coord) {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
             loaded.state.invalidate();
+            super::adjust_count(&mut self.building_meshes, was, false);
             loaded.rev = loaded.rev.wrapping_add(1);
             self.dirty_worklist.insert(coord);
             self.pending_dirty.set();

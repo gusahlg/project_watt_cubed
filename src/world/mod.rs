@@ -325,6 +325,16 @@ struct Loaded {
     light_gen: u32,
 }
 
+/// Keep an in-flight claim counter in step with a boolean flag, without
+/// borrowing the rest of `World` (so it can run while a chunk/section is held).
+pub(in crate::world) fn adjust_count(count: &mut usize, was: bool, now: bool) {
+    match (was, now) {
+        (false, true) => *count += 1,
+        (true, false) => *count = count.saturating_sub(1),
+        _ => {}
+    }
+}
+
 impl Loaded {
     /// Transition to `next`, freeing the mesh this chunk was drawing unless
     /// that mesh is carried into `next`. This is the single place that frees a
@@ -675,10 +685,17 @@ impl MeshState {
     /// those states carry no claim. Called at every mesh-result-consumption
     /// site whose result did NOT apply, so a stale result (view moved, chunk
     /// left the box) can never wedge the claim.
-    fn release_build(&mut self) {
+    fn release_build(&mut self) -> bool {
         if let MeshState::NeedsMesh { building, .. } = self {
-            *building = false;
+            if *building {
+                *building = false;
+                return true;
+            }
         }
+        false
+    }
+    fn is_building(&self) -> bool {
+        matches!(self, MeshState::NeedsMesh { building: true, .. })
     }
     fn is_needs_mesh(&self) -> bool {
         matches!(self, MeshState::NeedsMesh { .. })
@@ -744,6 +761,10 @@ pub struct World {
     gen_columns: Vec<(u64, (i32, i32), (i32, i32))>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
+    /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
+    building_meshes: usize,
+    /// `SectionState::Meshing` claims. Counter so idle `pump` never scans sections.
+    meshing_sections: usize,
     /// The [`GenerateLane`](lanes::GenerateLane)'s raise-then-consume gate: the
     /// data box has columns to request. Raised on a boundary cross and by a
     /// generate strike-out re-request; drained when the box is fully requested.
@@ -1070,6 +1091,8 @@ impl World {
             admit_sections: AdmitScratch::default(),
             gen_columns: Vec::new(),
             generating: FastSet::default(),
+            building_meshes: 0,
+            meshing_sections: 0,
             pending_gen: Sticky::default(),
             spawn_slab: None,
             upload_queue: VecDeque::new(),
@@ -1410,6 +1433,18 @@ impl World {
     /// Called once by `Game::new` after registering the producers.
     pub fn set_stream_lanes(&mut self, lanes: lanes::StreamLanes) {
         self.stream_lanes = Some(lanes);
+    }
+
+    /// Any generate/mesh/light/section claim or upload still outstanding.
+    /// Counter reads only — idle `pump` uses this to skip the drain lane.
+    pub fn anything_in_flight(&self) -> bool {
+        self.building_meshes != 0
+            || self.meshing_sections != 0
+            || !self.generating.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.upload_queue.is_empty()
+            || !self.light_apply_queue.is_empty()
+            || !self.section_upload_queue.is_empty()
     }
 
     /// The registered stream-lane handles (panics if `stream` runs before
@@ -1933,7 +1968,10 @@ impl StreamLane for MeshLane {
                 "mesh submit for non-NeedsMesh {key:?}"
             );
             if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
-                *building = true;
+                if !*building {
+                    *building = true;
+                    adjust_count(&mut world.building_meshes, false, true);
+                }
             }
         }
     }
@@ -2038,7 +2076,12 @@ impl StreamLane for SectionLane {
             }
         };
         world.dirty_sections.remove(&key);
-        world.sections.insert(key, SectionState::Meshing { token });
+        let prev = world.sections.insert(key, SectionState::Meshing { token });
+        adjust_count(
+            &mut world.meshing_sections,
+            matches!(prev, Some(SectionState::Meshing { .. })),
+            true,
+        );
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
         if let pipeline::Done::Section {

@@ -2077,8 +2077,8 @@ fn claim_sequence(seed: u64) {
     world.upload_queue.clear();
     world.section_upload_queue.clear();
     for loaded in world.chunks.values_mut() {
-        if let MeshState::NeedsMesh { building: true, .. } = loaded.state {
-            loaded.state.release_build();
+        if loaded.state.release_build() {
+            super::adjust_count(&mut world.building_meshes, true, false);
         }
     }
     world.debug_assert_liveness();
@@ -2135,4 +2135,35 @@ fn assert_claim_invariants(
             );
         }
     }
+}
+
+#[test]
+fn anything_in_flight_is_false_on_a_settled_headless_world() {
+    let world = World::generate();
+    assert!(!world.anything_in_flight());
+}
+
+#[test]
+fn anything_in_flight_tracks_claims_and_queues() {
+    let mut world = World::generate();
+    let c = ChunkCoord::new(99, 0, 99);
+    world.generating.insert(c);
+    assert!(world.anything_in_flight());
+    world.generating.clear();
+    assert!(!world.anything_in_flight());
+
+    world
+        .upload_queue
+        .push_back((c, 0, crate::world::pipeline::MeshOutput::new()));
+    assert!(world.anything_in_flight());
+    world.upload_queue.clear();
+    assert!(!world.anything_in_flight());
+
+    world
+        .light_apply_queue
+        .push_back((c, crate::world::light::LightGrid::dark()));
+    assert!(world.anything_in_flight());
+    world.light_apply_queue.clear();
+    world.light_inflight.insert(c);
+    assert!(world.anything_in_flight());
 }

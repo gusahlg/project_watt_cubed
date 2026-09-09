@@ -129,6 +129,13 @@ impl Router {
         self.frame_filtered(engine, dt, true, true, true)
     }
 
+    /// Locked-input frame: unprime repeat timers without evaluating any chord.
+    /// Engine press-edges and mouse delta still expire at the end of the engine
+    /// frame, so they cannot replay when input unlocks.
+    pub fn drain_frame(&mut self) {
+        self.timers.reset();
+    }
+
     /// Gameplay variant that can structurally skip mod placement, mod UI, and
     /// minimap physical probes independently — a disabled lane's chords are
     /// never evaluated and its repeat timer is unprimed, so a held key cannot
@@ -375,5 +382,20 @@ pub struct Global<'a> {
 impl Global<'_> {
     pub fn event(&self, e: GlobalEvent) -> bool {
         self.fi.global_fired[e as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_frame_unprimes_repeat_timers() {
+        let mut router = Router::new();
+        router.timers.gameplay[0] = 0.12;
+        router.timers.menu[0] = 0.08;
+        router.drain_frame();
+        assert!(router.timers.gameplay.iter().all(|&t| t < 0.0));
+        assert!(router.timers.menu.iter().all(|&t| t < 0.0));
     }
 }

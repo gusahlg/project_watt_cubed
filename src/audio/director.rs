@@ -32,6 +32,10 @@ use super::{
 /// Radius 19 (dim 39, ~59k cells) covers that and is 7.7× cheaper than 38.
 const ACOUSTIC_RADIUS: u32 = 19;
 
+/// Squared metres. Below this the listener is treated as still, so an idle
+/// director can skip the frame without missing a footstep (those need >0.5 m/s).
+const LISTENER_STILL_EPS2: f64 = 1e-6;
+
 /// The unrecoverable facts: everything else the director derives from
 /// `AudioCtx`. Closed — its fold is one `match`, no bus/trait indirection.
 pub enum SoundEvent {
@@ -42,6 +46,7 @@ pub enum SoundEvent {
 }
 
 /// The local listener pose, built once per frame from `Player`.
+#[derive(Clone, Copy)]
 pub struct PlayerPose {
     pub pos: DVec3,
     pub feet: DVec3,
@@ -230,6 +235,9 @@ pub struct AudioDirector {
     window: WindowCache,
     capture: CaptureLane,
     next_occurrence: u64,
+    /// Listener position of the last committed frame. `None` until the first
+    /// commit, which always runs so medium/gait start from a real pose.
+    last_commit: Option<DVec3>,
 }
 
 impl AudioDirector {
@@ -243,6 +251,7 @@ impl AudioDirector {
             window: WindowCache::new(),
             capture: CaptureLane::new(),
             next_occurrence: 0,
+            last_commit: None,
         }
     }
 
@@ -258,6 +267,26 @@ impl AudioDirector {
         self.voice_open.clear();
         self.window = WindowCache::new();
         self.capture = CaptureLane::new();
+        self.last_commit = None;
+    }
+
+    /// True when this frame would produce an empty journal and emitter table,
+    /// nothing is sounding, the listener has not moved, and no UI cue is waiting
+    /// — Game can skip building a pose and submitting an [`AudioFrame`].
+    pub fn can_skip_commit(
+        &self,
+        sound: &SoundSystem,
+        events: &[SoundEvent],
+        listener_pos: DVec3,
+        ptt: bool,
+    ) -> bool {
+        if ptt || !events.is_empty() || sound.has_live_sources() || sound.ui_pending() {
+            return false;
+        }
+        let Some(last) = self.last_commit else {
+            return false;
+        };
+        (listener_pos - last).length_squared() <= LISTENER_STILL_EPS2
     }
 
     fn mint(&mut self) -> OccurrenceId {
@@ -447,6 +476,8 @@ impl AudioDirector {
                 ctx.console.print(format!("* audio: {fault:?}"));
             }
         }
+
+        self.last_commit = Some(ctx.player.pos);
     }
 }
 
@@ -478,9 +509,75 @@ fn sound_class_at_feet(world: &World, feet: DVec3) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::audio::SoundSystem;
+    use crate::console::Console;
+    use crate::world::World;
+    use glam::DVec3;
+
+    fn pose(pos: DVec3) -> PlayerPose {
+        PlayerPose {
+            pos,
+            feet: DVec3::new(pos.x, pos.y - 1.6, pos.z),
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: DVec3::ZERO,
+            on_ground: true,
+        }
+    }
+
+    fn commit(dir: &mut AudioDirector, sound: &mut SoundSystem, world: &World, pos: DVec3) {
+        let mut console = Console::new();
+        dir.frame(
+            AudioCtx {
+                dt: 1.0 / 60.0,
+                player: pose(pos),
+                ptt: false,
+                voice_enabled: false,
+                events: Vec::new(),
+                peers: &[],
+                world,
+                net: None,
+                console: &mut console,
+            },
+            sound,
+        );
+    }
+
     #[test]
     fn acoustic_radius_matches_occlusion_falloff() {
         assert_eq!(super::ACOUSTIC_RADIUS, 19);
         assert_eq!(2 * super::ACOUSTIC_RADIUS + 1, 39);
+    }
+
+    #[test]
+    fn skip_commit_waits_for_the_first_frame() {
+        let (sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let dir = AudioDirector::new(palette);
+        assert!(!dir.can_skip_commit(&sound, &[], DVec3::ZERO, false));
+    }
+
+    #[test]
+    fn skip_commit_after_a_still_silent_frame() {
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut dir = AudioDirector::new(palette);
+        let world = World::generate();
+        let pos = DVec3::new(0.5, 80.0, 0.5);
+        commit(&mut dir, &mut sound, &world, pos);
+        assert!(dir.can_skip_commit(&sound, &[], pos, false));
+        assert!(
+            !dir.can_skip_commit(&sound, &[], pos + DVec3::X * 0.01, false),
+            "a centimetre of travel must re-enable the commit"
+        );
+        assert!(
+            !dir.can_skip_commit(&sound, &[SoundEvent::PeerSwing { at: pos }], pos, false),
+            "a pending event must re-enable the commit"
+        );
+        assert!(
+            !dir.can_skip_commit(&sound, &[], pos, true),
+            "push-to-talk must keep capture serviced"
+        );
     }
 }

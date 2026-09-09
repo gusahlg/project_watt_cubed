@@ -631,8 +631,9 @@ impl Game {
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
         // while a spawn/teleport slab is outstanding so loading progresses with
-        // the console open. Audio commits EVERY frame; only a real exit
-        // short-circuits it.
+        // the console open. Audio skips the director commit when nothing is
+        // sounding and the listener is still; only a real exit short-circuits
+        // the rest of the frame.
         let t = Instant::now();
         let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
@@ -732,13 +733,7 @@ impl Game {
         });
 
         if self.input_locked {
-            let _ = router.frame_filtered(
-                eng,
-                dt,
-                self.mod_logic,
-                self.mod_ui_active(),
-                self.minimap.is_some(),
-            );
+            router.drain_frame();
             return FrameInput::inert();
         }
 
@@ -1122,6 +1117,14 @@ impl Game {
             events,
             active,
         } = phase;
+        // Singleplayer idle: skip pose/peer/director/mixer construction. Voice
+        // ingest and capture need the full path (a new session is not yet live).
+        if self.net.is_none()
+            && audio.can_skip_commit(sound, &events, self.player.position, input.ptt)
+        {
+            sound.poll_starvation();
+            return;
+        }
         // THE per-frame peer sample: one `Instant`, consumed by the director for
         // both remote footsteps and voice sessions. `peer_draws` in draw() keeps its
         // own richer sample — it runs in the separate draw() call, steps each peer's
@@ -1530,5 +1533,101 @@ mod tests {
             game.player_mut().position.y -= 1.0;
         }
         assert_eq!(game.player().position, before);
+    }
+
+    /// Quiet-frame micro-benchmark: the three remaining fixed costs at
+    /// Minimum/Fast. Reports ns/call for the idle predicates vs the work they
+    /// skip. Ignored: a timing run, not a correctness gate.
+    #[test]
+    #[ignore]
+    fn quiet_frame_fixed_costs() {
+        use crate::audio::{AudioCtx, AudioDirector, PlayerPose, SoundSystem};
+        use crate::audio::palette::CuePalette;
+        use crate::console::Console;
+        use crate::input::router::Router;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: u32 = 50_000;
+
+        let game = Game::scripted(1, RenderConfig::default());
+        let t0 = Instant::now();
+        for _ in 0..N {
+            black_box(game.world().anything_in_flight());
+        }
+        let in_flight_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        let mut router = Router::new();
+        let t0 = Instant::now();
+        for _ in 0..N {
+            router.drain_frame();
+        }
+        let drain_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut audio = AudioDirector::new(palette);
+        let world = World::generate();
+        let pos = DVec3::new(0.5, 80.0, 0.5);
+        let mut console = Console::new();
+        let player = PlayerPose {
+            pos,
+            feet: DVec3::new(pos.x, pos.y - 1.6, pos.z),
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: DVec3::ZERO,
+            on_ground: true,
+        };
+        audio.frame(
+            AudioCtx {
+                dt: 1.0 / 60.0,
+                player: PlayerPose { ..player },
+                ptt: false,
+                voice_enabled: false,
+                events: Vec::new(),
+                peers: &[],
+                world: &world,
+                net: None,
+                console: &mut console,
+            },
+            &mut sound,
+        );
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            black_box(audio.can_skip_commit(&sound, &[], pos, false));
+        }
+        let skip_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let mut console = Console::new();
+            audio.frame(
+                AudioCtx {
+                    dt: 1.0 / 60.0,
+                    player: PlayerPose { ..player },
+                    ptt: false,
+                    voice_enabled: false,
+                    events: Vec::new(),
+                    peers: &[],
+                    world: &world,
+                    net: None,
+                    console: &mut console,
+                },
+                &mut sound,
+            );
+        }
+        let director_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+
+        println!("quiet_frame_fixed_costs ({N} iters):");
+        println!("  anything_in_flight:     {in_flight_ns:.1} ns");
+        println!("  Router::drain_frame:    {drain_ns:.1} ns");
+        println!("  can_skip_commit (idle): {skip_ns:.1} ns  [after]");
+        println!("  AudioDirector::frame:   {director_ns:.1} ns  [before, still silent]");
+        assert!(
+            audio.can_skip_commit(&sound, &[], pos, false),
+            "the skip predicate must hold on the idle pose used above"
+        );
+        assert!(!game.world().anything_in_flight());
     }
 }

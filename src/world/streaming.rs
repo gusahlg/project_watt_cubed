@@ -319,7 +319,9 @@ impl World {
         // Palette growth re-uploads the block texture array before any upload
         // this frame references a new layer.
         self.refresh_textures(eng);
-        {
+        // Idle: no claim can produce a `Done`, so skip try_recv and the
+        // deadline Instant. Dirty-remesh and lod-clip stay (flag checks).
+        if self.anything_in_flight() {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
             let drain_lane = self.lanes().drain;
             sched.run_manual(drain_lane, self, Some(&mut *eng));
@@ -717,6 +719,7 @@ impl World {
             if let Some(state @ SectionState::Meshing { .. }) = self.sections.get_mut(&pos)
                 && matches!(state, SectionState::Meshing { token: t } if *t == token)
             {
+                super::adjust_count(&mut self.meshing_sections, true, false);
                 *state = SectionState::from_upload(pos, meshes, eng);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
@@ -825,7 +828,9 @@ impl World {
     /// site, the pop-time re-validation, and the boundary-cross prune.
     fn drop_stale_upload(&mut self, coord: Coord) {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
-            loaded.state.release_build();
+            if loaded.state.release_build() {
+                super::adjust_count(&mut self.building_meshes, true, false);
+            }
         }
         self.pending_fresh.set();
         self.mesh_worklist.insert(coord);
@@ -867,7 +872,9 @@ impl World {
         let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
             loaded.retire(MeshState::from_upload(handles), eng);
+            super::adjust_count(&mut self.building_meshes, was, false);
             loaded.visible = vis;
             if !vis && let Some(meshes) = loaded.state.live_meshes() {
                 meshes.set_visible(eng, false);
@@ -1132,7 +1139,9 @@ impl World {
             }
             pipeline::JobKey::Mesh { coord } => {
                 if let Some(loaded) = self.chunks.get_mut(&coord) {
-                    loaded.state.release_build();
+                    if loaded.state.release_build() {
+                        super::adjust_count(&mut self.building_meshes, true, false);
+                    }
                 }
                 if rearm {
                     self.mesh_worklist.insert(coord);
@@ -1158,6 +1167,7 @@ impl World {
                         Some(SectionState::Meshing { token: t }) if *t == token);
                 if held {
                     self.sections.remove(&pos);
+                    super::adjust_count(&mut self.meshing_sections, true, false);
                     self.section_cover_dirty.set();
                 }
                 if rearm {
@@ -1476,6 +1486,7 @@ impl World {
         for &coord in &far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             if let Some(loaded) = self.chunks.remove(&coord) {
+                super::adjust_count(&mut self.building_meshes, loaded.state.is_building(), false);
                 loaded.state.free_owned(eng);
             }
             self.dirty_worklist.remove(&coord);
@@ -2131,6 +2142,11 @@ impl World {
             .collect();
         for s in &stale {
             if let Some(state) = self.sections.remove(s) {
+                super::adjust_count(
+                    &mut self.meshing_sections,
+                    matches!(state, SectionState::Meshing { .. }),
+                    false,
+                );
                 state.free(eng);
             }
         }
@@ -2959,6 +2975,7 @@ mod tests {
                         None => MeshState::Air,
                     };
                     loaded.retire_logged(next);
+                    super::super::adjust_count(&mut world.building_meshes, true, false);
                 }
             }
         }
