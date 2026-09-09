@@ -273,6 +273,9 @@ impl App {
             self.note_frame_stall(t0, update_dt);
             return false;
         }
+        // Applied MSAA/scale from engine create (and later recreates) before
+        // we push the session request, so a fallback cannot be overwritten.
+        self.settings.sync_engine_applied(eng);
         // VRAM guard + live settings: one push per frame so a resize cannot
         // allocate MSAA/scale the probe already refused.
         self.settings.apply(eng);

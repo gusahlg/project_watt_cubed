@@ -23,7 +23,8 @@ use voxel_engine::Engine;
 
 use crate::render_config::{
     DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, VrsChoice,
-    fit_render_targets, max_lod_levels, vrs_effective,
+    engine_applied_differs, engine_applied_notice, fit_render_targets, max_lod_levels,
+    vrs_effective,
 };
 use crate::ui::HudMode;
 
@@ -183,8 +184,17 @@ settings_fields! {
     device_local_memory_bytes: Option<u64> = None,
     /// Live free device-local bytes (`VK_EXT_memory_budget`); not persisted.
     available_device_bytes: Option<u64> = None,
-    /// Session-only VRAM-guard line for the console and settings menu.
+    /// Session-only VRAM-guard / engine-fallback line for the console and settings menu.
     vram_notice: Option<String> = None,
+    /// Engine-applied MSAA after render-target fallback; not persisted.
+    session_msaa: Option<u32> = None,
+    /// Engine-applied render scale after render-target fallback; not persisted.
+    session_render_scale: Option<f32> = None,
+    /// True when the engine allocated less MSAA/scale than the session request.
+    render_target_fallback: bool = false,
+    /// Fitted request the engine fallback was measured against.
+    fallback_request_msaa: Option<u32> = None,
+    fallback_request_scale: Option<f32> = None,
     /// Largest connected display (fullscreen first allocation).
     startup_display_w: u32 = 1280,
     startup_display_h: u32 = 720,
@@ -1093,6 +1103,25 @@ impl Settings {
 
     /// Session MSAA/scale after the VRAM guard. Does not mutate persisted fields.
     pub fn session_graphics(&self, width: u32, height: u32) -> SessionGraphics {
+        let mut g = self.fitted_session_graphics(width, height);
+        if self.render_target_fallback
+            && self.fallback_request_msaa == Some(g.msaa)
+            && self
+                .fallback_request_scale
+                .is_some_and(|s| (s - g.render_scale).abs() <= 1e-3)
+            && let (Some(msaa), Some(scale)) = (self.session_msaa, self.session_render_scale)
+        {
+            g.msaa = msaa;
+            g.render_scale = scale;
+            if let Some(notice) = self.vram_notice.clone() {
+                g.notice = Some(notice);
+            }
+        }
+        g
+    }
+
+    /// VRAM-fitted request before any engine allocation fallback.
+    fn fitted_session_graphics(&self, width: u32, height: u32) -> SessionGraphics {
         let scale = self.effective_render_scale(width, height);
         let mut lanes = self.render_config();
         lanes.taa = self.effective_taa(scale);
@@ -1110,14 +1139,62 @@ impl Settings {
         )
     }
 
+    /// Adopt the MSAA / scale the engine actually allocated. Session-only:
+    /// persisted [`Self::msaa`] / [`Self::render_scale`] are left alone.
+    /// Equal values leave notice, JSON flag, and extent unchanged.
+    pub fn adopt_engine_applied(
+        &mut self,
+        requested: &SessionGraphics,
+        applied_msaa: u32,
+        applied_scale: f32,
+        width: u32,
+        height: u32,
+    ) {
+        if !engine_applied_differs(requested, applied_msaa, applied_scale) {
+            return;
+        }
+        let already = self.render_target_fallback
+            && self.session_msaa == Some(applied_msaa)
+            && self
+                .session_render_scale
+                .is_some_and(|s| (s - applied_scale).abs() <= 1e-3);
+        if already {
+            return;
+        }
+        self.session_msaa = Some(applied_msaa);
+        self.session_render_scale = Some(applied_scale);
+        self.render_target_fallback = true;
+        self.fallback_request_msaa = Some(requested.msaa);
+        self.fallback_request_scale = Some(requested.render_scale);
+        let notice = engine_applied_notice(applied_msaa, applied_scale);
+        eprintln!("graphics: {notice}");
+        self.vram_notice = Some(notice);
+        self.note_render_extent(width, height, applied_scale);
+    }
+
+    /// Read [`Engine::msaa`] / [`Engine::render_scale`] after create or recreate.
+    pub fn sync_engine_applied(&mut self, eng: &Engine) {
+        let w = eng.screen_width().max(1) as u32;
+        let h = eng.screen_height().max(1) as u32;
+        let requested = self.fitted_session_graphics(w, h);
+        self.adopt_engine_applied(
+            &requested,
+            eng.msaa(),
+            eng.render_scale(),
+            w,
+            h,
+        );
+    }
+
     /// Whether the Default Auto render-scale rule is live (not Custom/Minimum/Fast).
     pub fn render_scale_auto(&self) -> bool {
         self.preset == Preset::Default
     }
 
-    /// Scale pushed to the engine for this window. Default picks
+    /// Scale requested for this window. Default picks
     /// [`DEFAULT_AUTO_RENDER_SCALE`] above the pixel threshold and 1.0
-    /// otherwise; other profiles keep their stored value.
+    /// otherwise; other profiles keep their stored value. Engine allocation
+    /// fallbacks live on [`Self::session_graphics`], not here.
     pub fn effective_render_scale(&self, window_w: u32, window_h: u32) -> f32 {
         if self.render_scale_auto() {
             auto_render_scale(window_w, window_h)
@@ -1141,8 +1218,23 @@ impl Settings {
         // screen (menus cap the frame rate, vsync off) and the benchmark.
         let w = eng.screen_width().max(1) as u32;
         let h = eng.screen_height().max(1) as u32;
+        let fitted = self.fitted_session_graphics(w, h);
+        if self.render_target_fallback
+            && (self.fallback_request_msaa != Some(fitted.msaa)
+                || !self
+                    .fallback_request_scale
+                    .is_some_and(|s| (s - fitted.render_scale).abs() <= 1e-3))
+        {
+            self.session_msaa = None;
+            self.session_render_scale = None;
+            self.render_target_fallback = false;
+            self.fallback_request_msaa = None;
+            self.fallback_request_scale = None;
+        }
         let session = self.session_graphics(w, h);
-        self.adopt_vram_notice(session.notice.clone());
+        if !self.render_target_fallback {
+            self.adopt_vram_notice(session.notice.clone());
+        }
         let _ = eng.set_msaa(session.msaa);
         let _ = eng.set_render_scale(session.render_scale);
         self.note_render_extent(w, h, session.render_scale);
@@ -1177,7 +1269,10 @@ impl Settings {
     /// golden harness keeps its own pinned
     /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
     pub fn render_config(&self) -> RenderConfig {
-        let scale = self.effective_render_scale(self.window_w, self.window_h);
+        let scale = self
+            .session_render_scale
+            .filter(|_| self.render_target_fallback)
+            .unwrap_or_else(|| self.effective_render_scale(self.window_w, self.window_h));
         RenderConfig {
             occlusion: self.occlusion,
             lod2: self.lod2,
@@ -2014,5 +2109,46 @@ mod tests {
             "{n}"
         );
         assert!(n.contains("running at"), "{n}");
+    }
+
+    #[test]
+    fn engine_applied_lower_updates_notice_json_flag_and_extent() {
+        let mut s = Settings::default();
+        s.mark_custom();
+        s.msaa = 8;
+        s.render_scale = 1.5;
+        s.note_render_extent(1920, 1080, 1.5);
+        let requested = s.session_graphics(1920, 1080);
+        assert_eq!(requested.msaa, 8);
+        assert!((requested.render_scale - 1.5).abs() < 1e-4);
+        s.adopt_engine_applied(&requested, 2, 1.5, 1920, 1080);
+        assert_eq!(
+            s.vram_notice.as_deref(),
+            Some("the renderer could only allocate 2x MSAA at 150% scale this session")
+        );
+        assert!(s.render_target_fallback);
+        assert_eq!(s.session_graphics(1920, 1080).msaa, 2);
+        assert_eq!(s.render_w, ((1920.0 * 1.5) as u32).max(1));
+        assert_eq!(s.render_h, ((1080.0 * 1.5) as u32).max(1));
+        assert_eq!(s.msaa, 8, "persisted MSAA is unchanged");
+        assert!((s.render_scale - 1.5).abs() < 1e-4, "persisted scale is unchanged");
+        let g = s.session_graphics(1920, 1080);
+        assert_eq!(g.msaa, 2);
+        assert!((g.render_scale - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn engine_applied_equal_leaves_session_untouched() {
+        let mut s = Settings::default();
+        s.mark_custom();
+        s.msaa = 4;
+        s.render_scale = 1.0;
+        s.note_render_extent(1280, 720, 1.0);
+        let before = s.clone();
+        let requested = s.session_graphics(1280, 720);
+        s.adopt_engine_applied(&requested, requested.msaa, requested.render_scale, 1280, 720);
+        assert_eq!(s, before);
+        assert!(!s.render_target_fallback);
+        assert!(s.vram_notice.is_none());
     }
 }

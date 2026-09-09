@@ -424,6 +424,17 @@ pub struct SessionGraphics {
     pub notice: Option<String>,
 }
 
+/// Settings-screen line when the engine allocated less than the session request.
+pub fn engine_applied_notice(msaa: u32, render_scale: f32) -> String {
+    let pct = (render_scale * 100.0).round() as i32;
+    format!("the renderer could only allocate {msaa}x MSAA at {pct}% scale this session")
+}
+
+/// True when the engine's applied MSAA / scale differ from the session request.
+pub fn engine_applied_differs(requested: &SessionGraphics, msaa: u32, render_scale: f32) -> bool {
+    msaa != requested.msaa || (render_scale - requested.render_scale).abs() > 1e-3
+}
+
 /// Drop MSAA to the next supported count, then `render_scale` in 0.25 steps
 /// (not below [`VRAM_SCALE_FLOOR`]), until [`render_target_bytes`] fits the
 /// budget from [`DeviceCaps::render_target_budget_bytes`]. If even the floor
@@ -576,6 +587,21 @@ mod tests {
         assert!(vrs_effective(VrsChoice::Auto, 6880, 2880));
         assert!(vrs_effective(VrsChoice::On, 1, 1));
         assert!(!vrs_effective(VrsChoice::Off, 6880, 2880));
+    }
+
+    #[test]
+    fn engine_applied_notice_names_allocated_msaa_and_scale() {
+        assert_eq!(
+            engine_applied_notice(2, 1.5),
+            "the renderer could only allocate 2x MSAA at 150% scale this session"
+        );
+        let requested = SessionGraphics {
+            msaa: 8,
+            render_scale: 1.5,
+            notice: None,
+        };
+        assert!(engine_applied_differs(&requested, 2, 1.5));
+        assert!(!engine_applied_differs(&requested, 8, 1.5));
     }
 
     #[test]
