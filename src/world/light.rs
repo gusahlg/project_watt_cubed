@@ -705,6 +705,87 @@ mod tests {
         grid
     }
 
+    fn grid_hash(grid: &LightGrid) -> u32 {
+        use crate::hash::fnv1a_32;
+        let mut bytes = [0u8; CHUNK_VOLUME * 2];
+        for i in 0..CHUNK_VOLUME {
+            let l = grid.at(i);
+            bytes[i * 2] = l.sky.get();
+            bytes[i * 2 + 1] = l.block.get();
+        }
+        fnv1a_32(&bytes)
+    }
+
+    /// Pin `fnv1a_32` over lumel bytes of four fixed seed-42 `propagate` results.
+    /// Values locked before the flood-path rewrite; a mismatch means settled
+    /// light bytes moved.
+    #[test]
+    fn light_byte_pin() {
+        use crate::block::registry::BlockRegistry;
+        use crate::world::generation::{SineHills, TerrainGenerator};
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = SineHills::new(&mut registry, 20.0, 42);
+        let tables = registry.hot_tables();
+        let lumin = registry.id_by_name("Lumin").expect("builtin Lumin");
+
+        let pin = |chunk: &Chunk, shell: &FaceShell, ceiling: &CeilingWindow, world_y0: i32| {
+            let mut grid = LightGrid::dark();
+            propagate(chunk, shell, ceiling, world_y0, &tables, &mut grid);
+            grid_hash(&grid)
+        };
+        let ceiling_at = |cx: i32, cz: i32| {
+            let x0 = cx * CHUNK_SIZE as i32;
+            let z0 = cz * CHUNK_SIZE as i32;
+            CeilingWindow::from_heights(|lx, lz| generator.height(x0 + lx as i32, z0 + lz as i32))
+        };
+
+        // Surface chunk at the origin column, real ceiling, dark neighbours.
+        let surface = Chunk::new(0, 1, 0, &generator);
+        let surface_hash = pin(&surface, &FaceShell::dark(), &ceiling_at(0, 0), CHUNK_SIZE as i32);
+
+        // Cave-band chunk, real ceiling (surface well above), dark neighbours.
+        let cave = Chunk::new(0, -3, 0, &generator);
+        let cave_hash = pin(&cave, &FaceShell::dark(), &ceiling_at(0, 0), -3 * CHUNK_SIZE as i32);
+
+        // Same cave chunk with a Lumin cell via `set_index`, closed ceiling so
+        // the pin is the blocklight field.
+        let mut emissive = Chunk::new(0, -3, 0, &generator);
+        emissive.set_index(Chunk::index(8, 8, 8), lumin);
+        let closed = CeilingWindow::from_heights(|_, _| 1000);
+        let emissive_hash = pin(&emissive, &FaceShell::dark(), &closed, -3 * CHUNK_SIZE as i32);
+
+        // All-air under a checkerboard ceiling, plus a patterned neighbour
+        // shell so the pin covers `seed_from_shell`.
+        let air = Chunk::from_uniform(0, 2, 0, BlockId(0));
+        let partial = CeilingWindow::from_heights(|lx, lz| {
+            if (lx + lz) % 2 == 0 { 100 } else { i32::MIN }
+        });
+        let mut nbr = LightGrid::dark();
+        for i in 0..CHUNK_VOLUME {
+            let (x, y, z) = Chunk::local_of(i);
+            nbr.set(
+                i,
+                Lumel {
+                    sky: LightLevel::new(((x + y) % 16) as u8),
+                    block: LightLevel::new(((z * 3) % 16) as u8),
+                },
+            );
+        }
+        let shell = FaceShell::capture(|_| Some(&nbr));
+        let air_hash = pin(&air, &shell, &partial, 2 * CHUNK_SIZE as i32);
+
+        let pins: [(&str, u32, u32); 4] = [
+            ("surface", surface_hash, 0xa8c2bd42),
+            ("cave", cave_hash, 0x521a1a53),
+            ("emissive", emissive_hash, 0xe87c04cc),
+            ("air", air_hash, 0x19839265),
+        ];
+        for (name, got, want) in pins {
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
     /// Full settle-flood cost for a surface-band chunk — the gauge for the
     /// propagate opacity-bitset redesign. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
