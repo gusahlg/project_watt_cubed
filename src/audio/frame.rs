@@ -41,7 +41,8 @@ pub struct AudioFrame {
     listener: Listener,
     occurrences: Vec<Occurrence>, // ordered; ids strictly increasing within the vec
     emitters: Vec<Emitter>,       // complete table; absence = ceased
-    window: Arc<AcousticWindow>,
+    /// `None` when nothing this frame (and no live voices) will trace it.
+    window: Option<Arc<AcousticWindow>>,
 }
 
 pub const MAX_OCCURRENCES: usize = 256;
@@ -67,13 +68,14 @@ fn gain_in_range(g: f32) -> bool {
 impl AudioFrame {
     /// Sole constructor. Checks: dt finite & (0, 0.5]; all positions/gains finite;
     /// gains in [0, 4]; occurrence ids strictly increasing; len bounds; no duplicate
-    /// EmitterId. Returns `FrameError` otherwise.
+    /// EmitterId. `window` may be `None` when nothing will trace it. Returns
+    /// `FrameError` otherwise.
     pub fn new(
         dt: f32,
         listener: Listener,
         occurrences: Vec<Occurrence>,
         emitters: Vec<Emitter>,
-        window: Arc<AcousticWindow>,
+        window: Option<Arc<AcousticWindow>>,
     ) -> Result<Self, FrameError> {
         if !dt.is_finite() {
             return Err(FrameError::NonFinite);
@@ -148,8 +150,8 @@ impl AudioFrame {
     pub fn emitters(&self) -> &[Emitter] {
         &self.emitters
     }
-    pub fn window(&self) -> &Arc<AcousticWindow> {
-        &self.window
+    pub fn window(&self) -> Option<&Arc<AcousticWindow>> {
+        self.window.as_ref()
     }
 
     /// Consume the frame, moving the owned journal and table out without cloning
@@ -161,7 +163,7 @@ impl AudioFrame {
         Listener,
         Vec<Occurrence>,
         Vec<Emitter>,
-        Arc<AcousticWindow>,
+        Option<Arc<AcousticWindow>>,
     ) {
         (
             self.dt,
@@ -180,11 +182,11 @@ mod tests {
     use super::super::acoustics::{Cell, Listener, Medium};
     use super::*;
 
-    fn window() -> Arc<AcousticWindow> {
-        Arc::new(
+    fn window() -> Option<Arc<AcousticWindow>> {
+        Some(Arc::new(
             AcousticWindow::new(IVec3::ZERO, UVec3::ONE, vec![Cell::Open].into_boxed_slice())
                 .unwrap(),
-        )
+        ))
     }
 
     fn listener() -> Listener {
@@ -295,5 +297,12 @@ mod tests {
             .collect();
         let f = AudioFrame::new(0.016, listener(), occs, vec![], window());
         assert!(matches!(f, Err(FrameError::OverLimit)));
+    }
+
+    #[test]
+    fn accepts_absent_window_when_nothing_traces() {
+        let f = AudioFrame::new(0.016, listener(), vec![], vec![], None);
+        assert!(f.is_ok());
+        assert!(f.unwrap().window().is_none());
     }
 }

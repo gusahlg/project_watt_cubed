@@ -33,8 +33,9 @@ pub struct MinimapConfig {
     pub margin: (i32, i32),
     /// Minimum wall-clock between CPU rebuilds.
     pub refresh_every: Duration,
-    /// Re-center (full rescan) once the player has moved this many blocks from
-    /// the raster's current center.
+    /// Re-center once the player has moved this many blocks from the raster's
+    /// current center. A move of `d < size` shifts and repaints the exposed
+    /// strip; `d ≥ size` (or the interval) does a full rescan.
     pub recenter_after: u16,
     /// Colour painted where a column has no loaded solid block.
     pub void: Color,
@@ -106,66 +107,182 @@ impl Minimap {
         player_col: IVec2,
         interval_elapsed: bool,
     ) -> bool {
+        if !self.rebuild(world, player_col, interval_elapsed) {
+            return false;
+        }
+        eng.update_minimap(&self.rgba);
+        true
+    }
+
+    /// CPU half of [`Self::refresh`]: full rebuild on the interval / first
+    /// build / `d ≥ size`, otherwise shift the raster and repaint exposed strips.
+    fn rebuild(&mut self, world: &World, player_col: IVec2, interval_elapsed: bool) -> bool {
         if !self.due(player_col, interval_elapsed) {
             return false;
         }
-
         let size = self.cfg.size as i32;
-        let x0 = player_col.x - size / 2;
-        let z0 = player_col.y - size / 2;
-        let x1 = x0 + size - 1;
-        let z1 = z0 + size - 1;
-
-        let void = self.cfg.void;
-        for px in self.rgba.chunks_exact_mut(4) {
-            px.copy_from_slice(&[void.r, void.g, void.b, void.a]);
-        }
-        self.top_y.fill(i32::MIN);
-
-        let (rgba, top_y) = (&mut self.rgba, &mut self.top_y);
-        world.for_surface_columns(x0, z0, x1, z1, |bx, bz, ty, color| {
-            let u = (bx - x0) as usize;
-            let v = (bz - z0) as usize;
-            let idx = v * size as usize + u;
-            top_y[idx] = ty;
-            rgba[idx * 4..idx * 4 + 4].copy_from_slice(&[color.r, color.g, color.b, color.a]);
-        });
-
-        // Slope shading: brighten uphill / darken downhill vs the north-west
-        // neighbour, reading heights (never shaded rgb) so the gradient stays clean.
-        let sz = size as usize;
-        for v in 0..sz {
-            for u in 0..sz {
-                let idx = v * sz + u;
-                let h = self.top_y[idx];
-                if h == i32::MIN {
-                    continue;
-                }
-                let nx = if u > 0 { self.top_y[idx - 1] } else { i32::MIN };
-                let nz = if v > 0 {
-                    self.top_y[idx - sz]
+        match self.center {
+            Some(prev) if !interval_elapsed => {
+                let dx = player_col.x - prev.x;
+                let dz = player_col.y - prev.y;
+                let d = dx.abs().max(dz.abs());
+                if d > 0 && d < size {
+                    self.rebuild_shift(world, player_col, dx, dz);
                 } else {
-                    i32::MIN
-                };
-                let neighbour = nx.max(nz);
-                if neighbour == i32::MIN {
-                    continue;
+                    self.rebuild_full(world, player_col);
                 }
-                let factor = match h.cmp(&neighbour) {
-                    std::cmp::Ordering::Greater => 1.15,
-                    std::cmp::Ordering::Less => 0.85,
-                    std::cmp::Ordering::Equal => continue,
-                };
-                let px = &mut self.rgba[idx * 4..idx * 4 + 3];
-                for c in px {
-                    *c = (*c as f32 * factor).round().clamp(0.0, 255.0) as u8;
+            }
+            _ => self.rebuild_full(world, player_col),
+        }
+        self.center = Some(player_col);
+        true
+    }
+
+    fn rebuild_full(&mut self, world: &World, player_col: IVec2) {
+        let sz = self.cfg.size as usize;
+        self.paint_rect(world, player_col, 0, 0, sz, sz);
+        self.shade_rect(0, 0, sz, sz);
+    }
+
+    fn rebuild_shift(&mut self, world: &World, player_col: IVec2, dx: i32, dz: i32) {
+        let sz = self.cfg.size as usize;
+        shift_heights(&mut self.top_y, sz, dx, dz);
+        shift_rgba(&mut self.rgba, sz, dx, dz);
+
+        if dx > 0 {
+            self.paint_rect(world, player_col, sz - dx as usize, 0, sz, sz);
+        } else if dx < 0 {
+            self.paint_rect(world, player_col, 0, 0, (-dx) as usize, sz);
+        }
+        if dz > 0 {
+            self.paint_rect(world, player_col, 0, sz - dz as usize, sz, sz);
+        } else if dz < 0 {
+            self.paint_rect(world, player_col, 0, 0, sz, (-dz) as usize);
+        }
+
+        // Shade the L without visiting the corner twice (in-place factor).
+        let (v_lo, v_hi) = kept_range(sz, dz);
+        if dx > 0 {
+            self.shade_rect(sz - dx as usize, v_lo, sz, v_hi);
+        } else if dx < 0 {
+            self.shade_rect(0, v_lo, (-dx) as usize, v_hi);
+        }
+        if dz > 0 {
+            self.shade_rect(0, sz - dz as usize, sz, sz);
+        } else if dz < 0 {
+            self.shade_rect(0, 0, sz, (-dz) as usize);
+        }
+
+        // Kept west/north edges whose neighbour set changed: restore unshaded colour then re-shade.
+        let (u_lo, u_hi) = kept_range(sz, dx);
+        let (v_lo, v_hi) = kept_range(sz, dz);
+        if dx != 0 {
+            let u = if dx > 0 { 0 } else { (-dx) as usize };
+            self.restore_unshaded(world, player_col, u, v_lo, u + 1, v_hi);
+            self.shade_rect(u, v_lo, u + 1, v_hi);
+        }
+        if dz != 0 {
+            let v = if dz > 0 { 0 } else { (-dz) as usize };
+            self.restore_unshaded(world, player_col, u_lo, v, u_hi, v + 1);
+            self.shade_rect(u_lo, v, u_hi, v + 1);
+        }
+    }
+
+    /// Paint texels `[u0, u1) × [v0, v1)` from loaded columns. Writes void only
+    /// for columns the scan does not overwrite — no full-buffer memset.
+    fn paint_rect(
+        &mut self,
+        world: &World,
+        player_col: IVec2,
+        u0: usize,
+        v0: usize,
+        u1: usize,
+        v1: usize,
+    ) {
+        if u0 >= u1 || v0 >= v1 {
+            return;
+        }
+        let size = self.cfg.size as i32;
+        let sz = size as usize;
+        let origin_x = player_col.x - size / 2;
+        let origin_z = player_col.y - size / 2;
+        let x0 = origin_x + u0 as i32;
+        let z0 = origin_z + v0 as i32;
+        let x1 = origin_x + u1 as i32 - 1;
+        let z1 = origin_z + v1 as i32 - 1;
+        let s = crate::world::chunk::CHUNK_SIZE as i32;
+        let void = self.cfg.void;
+
+        for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
+            for cz in z0.div_euclid(s)..=z1.div_euclid(s) {
+                let xs0 = x0.max(cx * s);
+                let xs1 = x1.min((cx + 1) * s - 1);
+                let zs0 = z0.max(cz * s);
+                let zs1 = z1.min((cz + 1) * s - 1);
+                let ys = world.column_chunks(cx, cz);
+                for x in xs0..=xs1 {
+                    let lx = x.rem_euclid(s) as usize;
+                    let u = (x - origin_x) as usize;
+                    for z in zs0..=zs1 {
+                        let lz = z.rem_euclid(s) as usize;
+                        let v = (z - origin_z) as usize;
+                        let idx = v * sz + u;
+                        match world.top_solid_in_column(cx, cz, ys, lx, lz) {
+                            Some((ty, color)) => {
+                                self.top_y[idx] = ty;
+                                self.rgba[idx * 4..idx * 4 + 4]
+                                    .copy_from_slice(&[color.r, color.g, color.b, color.a]);
+                            }
+                            None => {
+                                self.top_y[idx] = i32::MIN;
+                                self.rgba[idx * 4..idx * 4 + 4]
+                                    .copy_from_slice(&[void.r, void.g, void.b, void.a]);
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
 
-        eng.update_minimap(&self.rgba);
-        self.center = Some(player_col);
-        true
+    fn restore_unshaded(
+        &mut self,
+        world: &World,
+        player_col: IVec2,
+        u0: usize,
+        v0: usize,
+        u1: usize,
+        v1: usize,
+    ) {
+        let size = self.cfg.size as i32;
+        let sz = size as usize;
+        let origin_x = player_col.x - size / 2;
+        let origin_z = player_col.y - size / 2;
+        let void = self.cfg.void;
+        for v in v0..v1 {
+            for u in u0..u1 {
+                let idx = v * sz + u;
+                let ty = self.top_y[idx];
+                let color = if ty == i32::MIN {
+                    void
+                } else {
+                    world
+                        .registry()
+                        .color(world.block_at(origin_x + u as i32, ty, origin_z + v as i32))
+                };
+                self.rgba[idx * 4..idx * 4 + 4]
+                    .copy_from_slice(&[color.r, color.g, color.b, color.a]);
+            }
+        }
+    }
+
+    fn shade_rect(&mut self, u0: usize, v0: usize, u1: usize, v1: usize) {
+        let sz = self.cfg.size as usize;
+        for v in v0..v1 {
+            for u in u0..u1 {
+                shade_texel(&mut self.rgba, &self.top_y, sz, u, v);
+            }
+        }
     }
 
     /// Draw the map, border, and player marker. Between raster refreshes the
@@ -203,6 +320,98 @@ impl Minimap {
             Orientation::Heading => -std::f32::consts::FRAC_PI_2,
         };
         draw_player_marker(f, marker, marker_angle);
+    }
+}
+
+fn kept_range(sz: usize, delta: i32) -> (usize, usize) {
+    if delta > 0 {
+        (0, sz - delta as usize)
+    } else if delta < 0 {
+        ((-delta) as usize, sz)
+    } else {
+        (0, sz)
+    }
+}
+
+fn shift_heights(buf: &mut [i32], sz: usize, dx: i32, dz: i32) {
+    shift2d(sz, dx, dz, |u, v, su, sv| {
+        buf[v * sz + u] = buf[sv * sz + su];
+    });
+}
+
+fn shift_rgba(buf: &mut [u8], sz: usize, dx: i32, dz: i32) {
+    shift2d(sz, dx, dz, |u, v, su, sv| {
+        let dst = (v * sz + u) * 4;
+        let src = (sv * sz + su) * 4;
+        buf.copy_within(src..src + 4, dst);
+    });
+}
+
+fn shift2d(sz: usize, dx: i32, dz: i32, mut copy: impl FnMut(usize, usize, usize, usize)) {
+    if dz < 0 {
+        for v in (0..sz).rev() {
+            shift_row(sz, v, dx, dz, &mut copy);
+        }
+    } else {
+        for v in 0..sz {
+            shift_row(sz, v, dx, dz, &mut copy);
+        }
+    }
+}
+
+fn shift_row(
+    sz: usize,
+    v: usize,
+    dx: i32,
+    dz: i32,
+    copy: &mut impl FnMut(usize, usize, usize, usize),
+) {
+    if dx < 0 {
+        for u in (0..sz).rev() {
+            try_shift(sz, u, v, dx, dz, copy);
+        }
+    } else {
+        for u in 0..sz {
+            try_shift(sz, u, v, dx, dz, copy);
+        }
+    }
+}
+
+fn try_shift(
+    sz: usize,
+    u: usize,
+    v: usize,
+    dx: i32,
+    dz: i32,
+    copy: &mut impl FnMut(usize, usize, usize, usize),
+) {
+    let su = u as i32 + dx;
+    let sv = v as i32 + dz;
+    if su >= 0 && su < sz as i32 && sv >= 0 && sv < sz as i32 {
+        copy(u, v, su as usize, sv as usize);
+    }
+}
+
+fn shade_texel(rgba: &mut [u8], top_y: &[i32], sz: usize, u: usize, v: usize) {
+    let idx = v * sz + u;
+    let h = top_y[idx];
+    if h == i32::MIN {
+        return;
+    }
+    let nx = if u > 0 { top_y[idx - 1] } else { i32::MIN };
+    let nz = if v > 0 { top_y[idx - sz] } else { i32::MIN };
+    let neighbour = nx.max(nz);
+    if neighbour == i32::MIN {
+        return;
+    }
+    let factor = match h.cmp(&neighbour) {
+        std::cmp::Ordering::Greater => 1.15,
+        std::cmp::Ordering::Less => 0.85,
+        std::cmp::Ordering::Equal => return,
+    };
+    let px = &mut rgba[idx * 4..idx * 4 + 3];
+    for c in px {
+        *c = (*c as f32 * factor).round().clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -270,5 +479,37 @@ mod tests {
             assert!((screen_angle + std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         }
         assert_eq!(map_rotation(Orientation::NorthUp, 2.0), 0.0);
+    }
+
+    #[test]
+    fn shift_strip_matches_full_rebuild() {
+        let world = crate::world::World::new(73);
+        let offsets = [
+            IVec2::new(16, 0),
+            IVec2::new(0, 16),
+            IVec2::new(16, 8),
+            IVec2::new(-16, -8),
+            IVec2::new(-20, 24),
+        ];
+        for delta in offsets {
+            let origin = IVec2::new(0, 0);
+            let dest = IVec2::new(origin.x + delta.x, origin.y + delta.y);
+
+            let mut shifted = Minimap::new(MinimapConfig::DEFAULT);
+            assert!(shifted.rebuild(&world, origin, true));
+            assert!(shifted.rebuild(&world, dest, false));
+
+            let mut full = Minimap::new(MinimapConfig::DEFAULT);
+            assert!(full.rebuild(&world, dest, true));
+
+            assert_eq!(
+                shifted.rgba, full.rgba,
+                "rgba mismatch for delta {delta:?}"
+            );
+            assert_eq!(
+                shifted.top_y, full.top_y,
+                "height mismatch for delta {delta:?}"
+            );
+        }
     }
 }

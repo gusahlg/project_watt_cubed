@@ -14,7 +14,6 @@ use glam::{DVec3, IVec3};
 
 use crate::block::registry::BlockId;
 use crate::console::Console;
-use crate::math::PER_METER;
 use crate::net::client::Connection;
 use crate::presence::STRIDE_FREQ;
 use crate::world::World;
@@ -29,9 +28,9 @@ use super::{
     SessionKey, SoundSystem, VoicePacket,
 };
 
-/// Radius of the acoustic window, authored as 32 metres and converted to whole
-/// world cells. Round outward so the advertised range is never truncated.
-const ACOUSTIC_RADIUS: u32 = (32.0 * PER_METER) as u32 + 1;
+/// Occlusion uses `OCCL_K = 0.08`; past ~16 m gain is at most `e^{-1.3}`.
+/// Radius 19 (dim 39, ~59k cells) covers that and is 7.7× cheaper than 38.
+const ACOUSTIC_RADIUS: u32 = 19;
 
 /// The unrecoverable facts: everything else the director derives from
 /// `AudioCtx`. Closed — its fold is one `match`, no bus/trait indirection.
@@ -109,8 +108,8 @@ fn phase_crossed(prev: f32, now: f32) -> bool {
     (now as f64 / std::f64::consts::PI).floor() != (prev as f64 / std::f64::consts::PI).floor()
 }
 
-/// The memoized acoustic window: recapture only when the world changed, the
-/// listener crossed a cell, or ~500 ms elapsed.
+/// The memoized acoustic window: recapture only when something will read it
+/// and the world changed, the listener crossed a cell, or ~500 ms elapsed.
 struct WindowCache {
     window: Option<Arc<AcousticWindow>>,
     edit_gen: u64,
@@ -128,7 +127,13 @@ impl WindowCache {
         }
     }
 
-    fn refresh(&mut self, world: &World, pos: DVec3, dt: f32) -> Option<Arc<AcousticWindow>> {
+    fn refresh(
+        &mut self,
+        world: &World,
+        pos: DVec3,
+        dt: f32,
+        needed: bool,
+    ) -> Option<Arc<AcousticWindow>> {
         self.timer += dt;
         let cell = IVec3::new(
             pos.x.floor() as i32,
@@ -140,8 +145,17 @@ impl WindowCache {
             || edit_gen != self.edit_gen
             || cell != self.cell
             || self.timer >= 0.5;
-        if stale {
-            self.window = Some(world.capture_acoustic_window(cell, ACOUSTIC_RADIUS));
+        if stale && needed {
+            let reuse = self
+                .window
+                .take()
+                .and_then(|arc| Arc::try_unwrap(arc).ok())
+                .map(AcousticWindow::into_cells);
+            self.window = Some(world.capture_acoustic_window_reuse(
+                cell,
+                ACOUSTIC_RADIUS,
+                reuse,
+            ));
             self.edit_gen = edit_gen;
             self.cell = cell;
             self.timer = 0.0;
@@ -284,7 +298,6 @@ impl AudioDirector {
             pitch: ctx.player.pitch,
             medium,
         };
-        let window = self.window.refresh(ctx.world, ctx.player.pos, dt);
 
         let mut journal: Vec<Occurrence> = Vec::new();
 
@@ -400,12 +413,13 @@ impl AudioDirector {
             });
         }
 
+        let needed = sound.has_live_sources() || !journal.is_empty() || !emitters.is_empty();
+        let window = self.window.refresh(ctx.world, ctx.player.pos, dt, needed);
+
         // A rejected frame is a construction bug: debug-assert, never panic in release.
-        if let Some(window) = window {
-            match AudioFrame::new(dt.clamp(1e-4, 0.5), listener, journal, emitters, window) {
-                Ok(frame) => sound.submit(frame),
-                Err(e) => debug_assert!(false, "audio frame rejected: {e:?}"),
-            }
+        match AudioFrame::new(dt.clamp(1e-4, 0.5), listener, journal, emitters, window) {
+            Ok(frame) => sound.submit(frame),
+            Err(e) => debug_assert!(false, "audio frame rejected: {e:?}"),
         }
 
         // --- Ingest peer voice; record the key so the close-diff can retire it ---
@@ -460,4 +474,13 @@ fn sound_class_at_feet(world: &World, feet: DVec3) -> &'static str {
         feet.z.floor() as i32,
     );
     world.registry().sound_class(below)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn acoustic_radius_matches_occlusion_falloff() {
+        assert_eq!(super::ACOUSTIC_RADIUS, 19);
+        assert_eq!(2 * super::ACOUSTIC_RADIUS + 1, 39);
+    }
 }

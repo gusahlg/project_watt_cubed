@@ -374,6 +374,14 @@ impl SoundSystem {
         self.enter_world();
     }
 
+    /// True when a clip group, looping emitter, or voice session is live and
+    /// will read the acoustic window on the next submit.
+    pub fn has_live_sources(&self) -> bool {
+        !self.clip_voices.is_empty()
+            || !self.emitter_voices.is_empty()
+            || !self.sessions.is_empty()
+    }
+
     pub fn submit(&mut self, frame: AudioFrame) {
         self.poll_starvation();
 
@@ -391,6 +399,13 @@ impl SoundSystem {
 
         let (dt, listener, occurrences, emitters, window) = frame.into_parts();
         self.last_listener = listener;
+        if !self.has_live_sources() && occurrences.is_empty() && emitters.is_empty() {
+            return;
+        }
+        let Some(window) = window else {
+            debug_assert!(false, "acoustic window required when sources are live");
+            return;
+        };
         let k = smoothing_factor(dt, self.cfg.smoothing_halflife_s);
 
         // --- Drop ≤ high_water, realize new occurrence groups ---
@@ -857,14 +872,16 @@ impl SoundSystem {
     /// `AudioFrame`, so menus and loading screens reclaim finished UI tracks and
     /// future music/device recovery has one lifecycle hook.
     pub fn service(&mut self) {
-        let now = Instant::now();
-        let mut index = 0;
-        while index < self.ui_voices.len() {
-            if self.ui_voices[index].1 <= now {
-                let (voice, _) = self.ui_voices.swap_remove(index);
-                self.backend.stop(voice);
-            } else {
-                index += 1;
+        if !self.ui_voices.is_empty() {
+            let now = Instant::now();
+            let mut index = 0;
+            while index < self.ui_voices.len() {
+                if self.ui_voices[index].1 <= now {
+                    let (voice, _) = self.ui_voices.swap_remove(index);
+                    self.backend.stop(voice);
+                } else {
+                    index += 1;
+                }
             }
         }
         if !self.backend.alive() {
@@ -1110,10 +1127,12 @@ mod seam_tests {
 
     /// An all-`Open` window spanning x ∈ [-8, 88): any axis ray between in-range points
     /// reads occlusion 0, so trace distance is the plain euclidean gap.
-    fn open_window() -> Arc<AcousticWindow> {
+    fn open_window() -> Option<Arc<AcousticWindow>> {
         let size = UVec3::new(96, 16, 16);
         let cells = vec![Cell::Open; (96 * 16 * 16) as usize].into_boxed_slice();
-        Arc::new(AcousticWindow::new(IVec3::new(-8, -8, -8), size, cells).unwrap())
+        Some(Arc::new(
+            AcousticWindow::new(IVec3::new(-8, -8, -8), size, cells).unwrap(),
+        ))
     }
 
     fn origin_listener() -> Listener {
@@ -1497,5 +1516,15 @@ mod seam_tests {
             1,
             "only the fresh id 6 plays; id 5 was past the dead-frame water mark"
         );
+    }
+
+    #[test]
+    fn silent_submit_accepts_absent_window() {
+        let (mut sound, _, rec) = system(32);
+        sound.submit(
+            AudioFrame::new(0.1, origin_listener(), vec![], vec![], None).unwrap(),
+        );
+        assert!(rec.intents().is_empty());
+        assert!(!sound.has_live_sources());
     }
 }

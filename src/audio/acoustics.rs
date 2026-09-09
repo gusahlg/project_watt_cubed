@@ -65,6 +65,11 @@ impl AcousticWindow {
         })
     }
 
+    /// Recover the cell buffer so a later capture can refill it in place.
+    pub(crate) fn into_cells(self) -> Box<[Cell]> {
+        self.cells
+    }
+
     /// Cell at a world coordinate; outside the window it reads `Unloaded`.
     pub fn cell(&self, world: IVec3) -> Cell {
         let local = world - self.origin;

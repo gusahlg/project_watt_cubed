@@ -1361,8 +1361,12 @@ impl World {
                 has_blocklight: false,
             },
         );
-        // Ceiling-cache lifetime: the column's count drops its entry at zero.
-        *self.column_chunks.entry((coord.x, coord.z)).or_insert(0) += 1;
+        // Ceiling-cache lifetime: the column's last layer out drops the entry.
+        let ys = self.column_chunks.entry((coord.x, coord.z)).or_default();
+        if !ys.contains(&coord.y) {
+            ys.push(coord.y);
+            ys.sort_unstable_by(|a, b| b.cmp(a));
+        }
         // Occlusion learns of the new chunk through the fill queue (bounded
         // drain per rebuild) — no per-rebuild missing-connectivity scan.
         if self.occlusion_enabled() {
@@ -1435,10 +1439,12 @@ impl World {
             }
             self.dirty_worklist.remove(&coord);
             self.light_terminal.remove(&coord);
-            // Column refcount: the last chunk out drops the cached ceiling.
-            if let Some(count) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
-                *count -= 1;
-                if *count == 0 {
+            // Column layers: the last chunk out drops the cached ceiling.
+            if let Some(ys) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
+                if let Some(i) = ys.iter().position(|&y| y == coord.y) {
+                    ys.remove(i);
+                }
+                if ys.is_empty() {
                     self.column_chunks.remove(&(coord.x, coord.z));
                     self.ceilings.remove(&(coord.x, coord.z));
                 }

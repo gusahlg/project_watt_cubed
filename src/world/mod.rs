@@ -791,10 +791,11 @@ pub struct World {
     /// the left shell (old ∖ new). `None` after a radius change, so the next
     /// cross scans every loaded chunk.
     prev_unload_box: Option<ChunkBox>,
-    /// Loaded-chunk count per `(x, z)` column — a column's cached ceiling
-    /// drops exactly when its last chunk unloads (was: rebuild a live-column
-    /// set over the WHOLE map per boundary cross).
-    column_chunks: FastMap<(i32, i32), u16>,
+    /// Loaded chunk-Y layers per `(x, z)` column, highest first. Empty vec is
+    /// pruned so a column's cached ceiling drops exactly when its last chunk
+    /// unloads (was: rebuild a live-column set over the WHOLE map per boundary
+    /// cross).
+    column_chunks: FastMap<(i32, i32), Vec<i32>>,
     /// Whether occlusion was active last stream (render honours visible set if active).
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
