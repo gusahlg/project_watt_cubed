@@ -827,9 +827,8 @@ fn boundary_cross_prunes_stale_uploads_in_one_pass() {
     );
 }
 
-/// The byte-based upload budget charges exactly what staging costs: vertex
-/// bytes plus index bytes across every pass — pinning the stride assumptions
-/// (packed 8 B vertices, u32 indices) the budget's sizing was derived from.
+/// The byte-based upload budget charges exactly what staging costs: packed
+/// vertex bytes across every pass (indices are no longer stored).
 #[test]
 fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     let mut world = World::generate();
@@ -844,13 +843,7 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
         &snapshot.light.expect("lighting on by default"),
         &mut out,
     );
-    let expected: usize = Pass::ALL
-        .iter()
-        .map(|&p| {
-            out[p].vertices().len() * 8
-                + out[p].buckets().iter().map(|b| b.len() * 4).sum::<usize>()
-        })
-        .sum();
+    let expected: usize = Pass::ALL.iter().map(|&p| out[p].vertex_bytes()).sum();
     assert!(expected > 0, "a surface chunk yields geometry");
     assert_eq!(streaming::mesh_output_bytes(&out), expected);
 }

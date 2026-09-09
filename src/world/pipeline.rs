@@ -1295,11 +1295,7 @@ mod tests {
             &mut unculled,
         );
         let index_count = |d: &ChunkMeshData| {
-            d[Pass::Opaque]
-                .buckets()
-                .iter()
-                .map(|b| b.len())
-                .sum::<usize>()
+            d[Pass::Opaque].quad_counts().iter().sum::<u32>() as usize * 6
         };
         assert_ne!(
             index_count(&unculled),
@@ -1328,7 +1324,7 @@ mod tests {
         };
         assert_eq!((coord, rev), (Coord::new(0, 1, 0), 7));
         for p in Pass::ALL {
-            assert_eq!(data[p].buckets(), expected[p].buckets());
+            assert_eq!(data[p].quad_counts(), expected[p].quad_counts());
             assert_eq!(
                 data[p].vertices(),
                 expected[p].vertices(),

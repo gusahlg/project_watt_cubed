@@ -34,19 +34,12 @@ fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
     )
 }
 
-/// The GPU bytes a finished mesh will stage on upload (vertices + index
-/// buckets across every pass) — what the byte-based upload budget charges.
+/// The GPU bytes a finished mesh will stage on upload (direction-major
+/// vertices across every pass) — what the byte-based upload budget charges.
 pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshOutput) -> usize {
     voxel_engine::Pass::ALL
         .iter()
-        .map(|&p| {
-            std::mem::size_of_val(data[p].vertices())
-                + data[p]
-                    .buckets()
-                    .iter()
-                    .map(|b| std::mem::size_of_val(&b[..]))
-                    .sum::<usize>()
-        })
+        .map(|&p| data[p].vertex_bytes())
         .sum()
 }
 

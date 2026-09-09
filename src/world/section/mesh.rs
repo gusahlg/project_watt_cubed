@@ -566,10 +566,14 @@ mod tests {
         build_section_mesh(section, tables)
     }
 
-    fn all_quads(mesh: &[SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, &[MeshVertex])> {
+    fn all_quads(mesh: &[SectionMeshData; 4]) -> impl Iterator<Item = (UVec3, Pass, [MeshVertex; 4])> {
         mesh.iter().flatten().flat_map(|(origin, data)| {
             Pass::ALL.into_iter().flat_map(move |p| {
-                data[p].vertices().chunks_exact(4).map(move |q| (*origin, p, q))
+                data[p]
+                    .vertices()
+                    .chunks_exact(4)
+                    .map(|q| (*origin, p, [q[0], q[1], q[2], q[3]]))
+                    .collect::<Vec<_>>()
             })
         })
     }
@@ -674,7 +678,7 @@ mod tests {
         let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
         let is_water_quad = |q: &[MeshVertex]| tables.fluid_surface(BlockId(q[0].layer()));
-        let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(q));
+        let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(&q));
         assert!(opaque_water, "water surface meshes into the opaque pass");
         assert!(!all_quads(&mesh).any(|(_, _, q)| q[0].is_water()), "LOD water clears the water bit");
         assert!(
@@ -683,7 +687,7 @@ mod tests {
         );
         // Water-vs-water is suppressed; all water side faces are borders (micro != 0).
         for (_, _, q) in all_quads(&mesh) {
-            if !is_water_quad(q) {
+            if !is_water_quad(&q) {
                 continue;
             }
             let side = matches!(
@@ -760,7 +764,7 @@ mod tests {
                 .flatten()
                 .flat_map(|(o, d)| {
                     Pass::ALL.into_iter().map(move |p| {
-                        (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
+                        (o.x, o.y, o.z, p as u8, d[p].vertices(), d[p].quad_counts())
                     })
                 })
                 .collect::<Vec<_>>()
@@ -834,7 +838,7 @@ mod tests {
                 .flatten()
                 .flat_map(|(o, d)| {
                     Pass::ALL.into_iter().map(move |p| {
-                        (o.x, o.y, o.z, p as u8, d[p].vertices().to_vec(), d[p].buckets().clone())
+                        (o.x, o.y, o.z, p as u8, d[p].vertices(), d[p].quad_counts())
                     })
                 })
                 .collect::<Vec<_>>()

@@ -125,12 +125,7 @@ fn mesh_output_held(data: &pipeline::MeshOutput) -> usize {
 }
 
 fn mesh_data_held(data: &MeshData) -> usize {
-    std::mem::size_of_val(data.vertices())
-        + data
-            .buckets()
-            .iter()
-            .map(|b| std::mem::size_of_val(&b[..]))
-            .sum::<usize>()
+    data.vertex_bytes()
 }
 
 fn edit_bytes(edits: &super::FastMap<Coord, super::FastMap<usize, BlockId>>) -> usize {
