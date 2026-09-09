@@ -120,9 +120,10 @@ mod tests {
         use std::fs;
         use std::path::Path;
         let id = SlotId::new("世界").unwrap();
-        let path = Path::new("saves").join(format!("{id}.save"));
-        assert!(path.starts_with("saves"));
-        assert_eq!(path.parent(), Some(Path::new("saves")));
+        let dir = crate::paths::Paths::get().data.as_path();
+        let path = dir.join(format!("{id}.save"));
+        assert!(path.starts_with(dir));
+        assert_eq!(path.parent(), Some(dir));
         let _ = fs::remove_file(&path);
         super::super::store::write(&id, b"x").unwrap();
         assert!(path.exists());

@@ -181,6 +181,14 @@ mod tests {
     use super::super::slot::SaveMeta;
     use std::fs;
 
+    fn save_file(id: &SlotId) -> std::path::PathBuf {
+        crate::paths::Paths::get().data.join(format!("{id}.save"))
+    }
+
+    fn bak_file(id: &SlotId) -> std::path::PathBuf {
+        crate::paths::Paths::get().data.join(format!("{id}.save.bak"))
+    }
+
     fn empty_snap() -> SaveSnapshot {
         SaveSnapshot::empty(
             SaveMeta {
@@ -225,15 +233,15 @@ mod tests {
         // A synchronous exit save also needs no background worker.
         auto.flush_now(&id, 7, || empty_snap().encode()).unwrap();
         assert!(auto.writer.is_none());
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
     }
 
     #[test]
     fn dirty_state_writes_in_the_background() {
         let id = SlotId::new("__autosave_bg__").unwrap();
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
 
         let mut auto = Autosaver::new();
         assert!(!auto.wants_write(0), "gen 0 is clean");
@@ -241,40 +249,40 @@ mod tests {
         assert!(matches!(auto.start(&id, 1, empty_snap()), Tick::Started));
         assert!(!auto.wants_write(1), "no second write while one is in flight");
         wait_finished(&mut auto);
-        assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
+        assert!(fs::metadata(save_file(&id)).is_ok());
         assert!(!auto.wants_write(1), "gen 1 now saved");
 
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
     }
 
     #[test]
     fn flush_drains_in_flight_then_writes_synchronously() {
         let id = SlotId::new("__autosave_flush__").unwrap();
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
 
         let mut auto = Autosaver::new();
         assert!(matches!(auto.start(&id, 1, empty_snap()), Tick::Started));
         auto.flush_now(&id, 2, || empty_snap().encode()).unwrap();
-        assert!(fs::metadata(format!("saves/{id}.save")).is_ok());
+        assert!(fs::metadata(save_file(&id)).is_ok());
         assert!(!auto.wants_write(2), "gen 2 saved by flush");
 
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
     }
 
     #[test]
     fn start_refuses_to_queue_a_second_write_while_one_is_in_flight() {
         let id = SlotId::new("__autosave_no_interleave__").unwrap();
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
         let mut auto = Autosaver::new();
         assert!(matches!(auto.start(&id, 1, empty_snap()), Tick::Started));
         assert!(matches!(auto.start(&id, 2, empty_snap()), Tick::Idle));
         wait_finished(&mut auto);
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
     }
 
     fn surface(world: &crate::world::World, x: i32, z: i32) -> i32 {
@@ -290,8 +298,8 @@ mod tests {
         use voxel_engine::DVec3;
 
         let id = SlotId::new("__autosave_race__").unwrap();
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
 
         let mut world = crate::world::World::new(11);
         let y0 = surface(&world, 8, 8);
@@ -343,8 +351,8 @@ mod tests {
         let (loaded, _, _, _) = save::load(&id, &mut mods, crate::world::World::new).unwrap();
         assert_eq!(loaded.block_at(9, y1, 8), AIR, "second edit lands in the next snapshot");
 
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
     }
 
     /// Main-thread snapshot vs writer-thread encode+write on a 100k-edit overlay.
@@ -379,8 +387,8 @@ mod tests {
             edit_count: 0,
         };
         let id = SlotId::new("__autosave_100k__").unwrap();
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
 
         let mut snap_ns = Vec::with_capacity(LOOPS);
         let mut encode_ns = Vec::with_capacity(LOOPS);
@@ -408,7 +416,7 @@ mod tests {
             encode_us + write_us
         );
 
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
     }
 }

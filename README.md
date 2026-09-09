@@ -28,7 +28,8 @@ cargo run --release --bin watt_server -- --port 5555 --password hunter2 --seed 4
 ```
 
 All flags are optional: with no `--seed` a fresh one is chosen and printed; with no
-`--password` the server is open to anyone who can reach the port.
+`--password` the server is open to anyone who can reach the port. `--data-dir`
+sets the data/config root (same as `WATT_DATA_DIR`).
 
 ### Chat
 
@@ -66,7 +67,13 @@ chunks, frustum culling, reversed-Z depth, and uncapped frame rates by default.
 Graphics are tunable at runtime from **Settings** on the start menu or the
 `/gfx` console command in game (`/gfx fullscreen on`, `/gfx vsync off`,
 `/gfx msaa 4`, `/gfx fps 144`, `/gfx renderdist 8`, `/gfx fov 90`). Settings
-persist in `saves/settings.cfg`.
+persist in `settings.cfg` under the config root.
+
+## State location
+
+Worlds are stored in the data root; `settings.cfg`, `session.cfg`, and `mods.cfg` in the config root.
+If the launch directory already contains `saves/`, both roots stay that folder (checkouts and existing installs).
+Otherwise `$XDG_DATA_HOME/project_watt_cubed` and `$XDG_CONFIG_HOME/project_watt_cubed`. Override with `WATT_DATA_DIR` or `watt_server --data-dir <dir>`.
 
 ## Running on NixOS
 

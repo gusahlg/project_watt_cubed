@@ -53,9 +53,9 @@ pub struct App {
     /// The integrated server when hosting, kept alive for the session so friends can
     /// stay connected; stopping it frees the port for a later host.
     host: Option<ServerHandle>,
-    /// Graphics settings, persisted in `saves/settings.cfg`.
+    /// Graphics settings, persisted as `settings.cfg` under the config root.
     settings: Settings,
-    /// Last-used connection details, persisted in `saves/session.cfg`.
+    /// Last-used connection details, persisted as `session.cfg` under the config root.
     session: Session,
     /// Self-describing benchmark mode (`WATT_BENCH=<seconds>`).
     bench: Option<Benchmark>,
@@ -94,7 +94,9 @@ impl ActiveSlot {
 
 impl App {
     pub fn new() -> Self {
+        crate::paths::Paths::init(None);
         let mut mods = Mods::with_defaults();
+        mods.load_choices();
         mods.apply_bench_env();
         let saves = save::list();
         let mut settings = Settings::load();
@@ -356,7 +358,10 @@ impl App {
                 self.session.save();
                 self.start_join(eng, info);
             }
-            AppEffect::ToggleMod(index) => self.mods.toggle(index),
+            AppEffect::ToggleMod(index) => {
+                self.mods.toggle(index);
+                self.mods.save_choices();
+            }
             AppEffect::StepModKnob {
                 mod_index,
                 knob,

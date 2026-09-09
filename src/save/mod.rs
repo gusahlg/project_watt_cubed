@@ -113,16 +113,24 @@ mod tests {
     use std::fs;
     use voxel_engine::DVec3;
 
+    fn save_file(id: &SlotId) -> std::path::PathBuf {
+        crate::paths::Paths::get().data.join(format!("{id}.save"))
+    }
+
+    fn bak_file(id: &SlotId) -> std::path::PathBuf {
+        crate::paths::Paths::get().data.join(format!("{id}.save.bak"))
+    }
+
     fn slot(name: &str) -> SlotId {
         let id = SlotId::new(name).unwrap();
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(&id));
+        let _ = fs::remove_file(bak_file(&id));
         id
     }
 
     fn cleanup(id: &SlotId) {
-        let _ = fs::remove_file(format!("saves/{id}.save"));
-        let _ = fs::remove_file(format!("saves/{id}.save.bak"));
+        let _ = fs::remove_file(save_file(id));
+        let _ = fs::remove_file(bak_file(id));
     }
 
     fn meta(name: &str) -> SaveMeta {
@@ -261,7 +269,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         save(&id, &world, &player, &mods, meta("v1")).unwrap();
         save(&id, &world, &player, &mods, meta("v2")).unwrap(); // rotates v1 to .bak
-        fs::write(format!("saves/{id}.save"), b"NOPE not a save").unwrap();
+        fs::write(save_file(&id), b"NOPE not a save").unwrap();
 
         let (loaded_world, _, loaded_meta, report) = load(&id, &mut mods, World::new).unwrap();
         assert_eq!(report.source, Source::Backup);

@@ -16,6 +16,7 @@
 //! - [`menu`] — the start menu and mod menu screens.
 //! - [`mods`] — the runtime-toggleable mod system and the default inventory mod.
 //! - [`net`] — multiplayer: the authoritative server and the client connection.
+//! - [`paths`] — data/config roots (worlds, settings, session, mod choices).
 //! - [`save`] — saving and loading worlds.
 //! - [`settings`] — persistent graphics settings (settings menu + `/gfx`).
 //! - [`sim`] — the fixed-timestep seam for registered simulation systems.
@@ -46,6 +47,7 @@ pub mod menu;
 pub mod minimap;
 pub mod mods;
 pub mod net;
+pub mod paths;
 pub mod player;
 pub mod presence;
 pub mod render;

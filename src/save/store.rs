@@ -2,17 +2,18 @@
 //! Writes use .tmp + sync_all + rename so a crash mid-save can't corrupt the
 //! only copy; successful writes rotate the old file to .bak. Reads ladder down
 //! (live intact → backup intact → salvage) and report which rung succeeded.
-//! Deletes move to saves/trash/ instead of unlinking for cheap undo.
+//! Deletes move to trash/ under the data root instead of unlinking for cheap undo.
 
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::format::{self, Decoded};
 use super::slot::{SaveError, Slot, SlotId};
+use crate::paths::Paths;
 
-fn saves_dir() -> PathBuf {
-    PathBuf::from("saves")
+fn saves_dir() -> &'static Path {
+    Paths::get().data.as_path()
 }
 
 fn trash_dir() -> PathBuf {
@@ -125,7 +126,7 @@ pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
     Ok(())
 }
 
-/// Move a slot (and its backup) into `saves/trash/` rather than unlinking.
+/// Move a slot (and its backup) into `trash/` under the data root rather than unlinking.
 pub fn delete(id: &SlotId) -> io::Result<()> {
     fs::create_dir_all(trash_dir())?;
     let dest = unused_trash_path(id);
