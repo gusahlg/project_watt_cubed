@@ -421,9 +421,9 @@ mod tests {
     use crate::world::generation::TerrainGenerator;
     use voxel_engine::Pass;
 
-    /// FNV-1a over every pass's decoded vertex fields and index buckets.
-    /// MeshVertex's packed words are private to the engine, so this hashes the
-    /// public fields (pos/normal/layer/AO/light/water/micro) via `to_le_bytes`.
+    /// FNV-1a over every pass's decoded vertex fields (direction-major) and
+    /// per-face quad counts. MeshVertex's packed words are private to the
+    /// engine, so this hashes the public fields via `to_le_bytes`.
     fn hash_mesh(data: &ChunkMeshData) -> u32 {
         let mut bytes = Vec::new();
         for (pass, mesh) in data.iter() {
@@ -447,11 +447,8 @@ mod tests {
                     bytes.extend_from_slice(&m.to_le_bytes());
                 }
             }
-            for bucket in mesh.buckets() {
-                bytes.extend_from_slice(&(bucket.len() as u32).to_le_bytes());
-                for i in bucket {
-                    bytes.extend_from_slice(&i.to_le_bytes());
-                }
+            for n in mesh.quad_counts() {
+                bytes.extend_from_slice(&n.to_le_bytes());
             }
         }
         crate::hash::fnv1a_32(&bytes)
@@ -481,10 +478,10 @@ mod tests {
         // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            ((0, 1, 0), 0xb0e2c9fb, 0xb0e2c9fb, 0x897aa7e2),
-            ((3, 1, -2), 0x0e6322e1, 0x0e6322e1, 0x5302192d),
-            ((-5, 0, 4), 0x844d5350, 0x844d5350, 0xd8f141d4),
-            ((2, 1, 2), 0xc9d80078, 0xc9d80078, 0xf2649ff0),
+            ((0, 1, 0), 0x04d760f8, 0x04d760f8, 0xa9111135),
+            ((3, 1, -2), 0x667d9aa3, 0x667d9aa3, 0x12b4ebb3),
+            ((-5, 0, 4), 0x66cce89d, 0x66cce89d, 0x5c389261),
+            ((2, 1, 2), 0x0eea295e, 0x0eea295e, 0xbc0fe2ab),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
@@ -717,11 +714,10 @@ mod tests {
                 let mut chunk_bytes = 0usize;
                 let mut chunk_quads = 0usize;
                 for p in Pass::ALL {
-                    let n = scratch[p].vertices().len();
-                    let b = n * VERT_BYTES;
+                    let b = scratch[p].vertex_bytes();
                     pass_tot[p as usize] += b;
                     chunk_bytes += b;
-                    chunk_quads += n / 4;
+                    chunk_quads += scratch[p].quad_counts().iter().sum::<u32>() as usize;
                 }
                 total += chunk_bytes;
                 if chunk_bytes == 0 {
@@ -794,7 +790,7 @@ mod tests {
                 build_chunk_mesh_unlit(&padded, chunk.uniform(), &tables, &mut unlit);
                 for ((_, a), (_, b)) in lit.iter().zip(unlit.iter()) {
                     assert_eq!(a.vertices(), b.vertices(), "ao={ao}");
-                    assert_eq!(a.buckets(), b.buckets(), "ao={ao}");
+                    assert_eq!(a.quad_counts(), b.quad_counts(), "ao={ao}");
                 }
             }
         }
@@ -904,7 +900,7 @@ mod tests {
     }
 
     fn index_count(data: &MeshData) -> usize {
-        data.buckets().iter().map(|b| b.len()).sum()
+        data.quad_counts().iter().sum::<u32>() as usize * 6
     }
 
     fn quad_areas(data: &MeshData) -> Vec<f32> {
@@ -1059,7 +1055,7 @@ mod tests {
 
         let (a, b) = (build(&uniform), build(&dense));
         assert_eq!(total_area(&a), (6 * CHUNK_SIZE * CHUNK_SIZE) as f32, "6 full faces");
-        assert_eq!(a.buckets(), b.buckets());
+        assert_eq!(a.quad_counts(), b.quad_counts());
         assert_eq!(a.vertices(), b.vertices(), "uniform and dense paths mesh identically");
     }
 
@@ -1117,7 +1113,7 @@ mod tests {
             far.set_local(x, y, z, id);
         }
         let (a, b) = (build(&near), build(&far));
-        assert_eq!(a.buckets(), b.buckets());
+        assert_eq!(a.quad_counts(), b.quad_counts());
         assert_eq!(a.vertices(), b.vertices(), "far chunk meshes byte-identically");
     }
 

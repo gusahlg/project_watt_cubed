@@ -1285,7 +1285,7 @@ mod tests {
         for (pass, va) in a.iter() {
             let vb = &b[pass];
             assert_eq!(va.vertices(), vb.vertices(), "vertices {pass:?}");
-            assert_eq!(va.buckets(), vb.buckets(), "buckets {pass:?}");
+            assert_eq!(va.quad_counts(), vb.quad_counts(), "quad_counts {pass:?}");
         }
     }
 
