@@ -26,13 +26,53 @@ fn rejected(lines: Vec<String>) -> Vec<Line> {
     lines.into_iter().map(|l| Line::of(Role::Danger, l)).collect()
 }
 
-/// The primary command names, in the order `help` lists them. This is the single
-/// source of truth for Tab-completion (see [`crate::console`]); aliases like
-/// `teleport` are intentionally omitted so completion offers the canonical name.
-pub const COMMAND_NAMES: &[&str] = &[
-    "tp", "pos", "inspect", "gfx", "time", "walkspeed", "flyspeed", "mute", "deafen", "audio",
-    "voicetest", "help",
-];
+macro_rules! commands {
+    (
+        $cmd:ident, $args:ident, $player:ident, $world:ident, $settings:ident, $sky:ident, $visuals:ident;
+        $($canon:literal $(| $alias:literal)* , $help:literal => $body:expr);+ $(;)?
+    ) => {
+        /// The primary command names, in the order `help` lists them.
+        pub const COMMAND_NAMES: &[&str] = &[$($canon),+];
+
+        fn dispatch(
+            $cmd: &str,
+            $args: &[&str],
+            $player: &mut Player,
+            $world: &mut World,
+            $settings: &mut Settings,
+            $sky: &mut Sky,
+            $visuals: VisualMask,
+        ) -> Vec<Line> {
+            match $cmd {
+                $($canon $(| $alias)* => $body,)+
+                other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
+            }
+        }
+
+        fn help() -> Vec<Line> {
+            shown(vec![
+                "commands (a leading '/' is optional):".to_string(),
+                $($help.to_string(),)+
+            ])
+        }
+    };
+}
+
+commands! {
+    cmd, args, player, world, settings, sky, visuals;
+    "tp" | "teleport" | "setpos", "  tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
+    "pos" | "where", "  pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
+    "inspect" | "look", "  inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
+    "gfx" | "graphics", "  gfx [setting value]  show or change graphics settings" => gfx(args, settings, visuals);
+    "time", "  time [set|length]    show or set the day/night clock" => time(args, sky);
+    "walkspeed", "  walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
+    "flyspeed", "  flyspeed [n]         show or set flying speed" => flyspeed(args, player);
+    "mute", "  mute                 toggle master mute (this session)" => mute(settings);
+    "deafen", "  deafen               toggle hearing incoming voice" => deafen(settings);
+    "audio" | "volume", "  audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
+    "voicetest", "  voicetest            play a local voice test cue" => voicetest();
+    "help" | "?", "  help                 show this list" => help();
+}
 
 /// Run a console line against the game state, returning output lines for the log.
 ///
@@ -65,21 +105,7 @@ pub fn execute_with_visuals(
     };
     let args: Vec<&str> = parts.collect();
 
-    match cmd {
-        "tp" | "teleport" | "setpos" => teleport(&args, player, world),
-        "pos" | "where" => shown(vec![format!("position: {}", fmt_pos(player.position))]),
-        "inspect" | "look" => inspect(&args, player, world),
-        "gfx" | "graphics" => gfx(&args, settings, visuals),
-        "time" => time(&args, sky),
-        "walkspeed" => walkspeed(&args, player),
-        "flyspeed" => flyspeed(&args, player),
-        "mute" => mute(settings),
-        "deafen" => deafen(settings),
-        "audio" | "volume" => audio(&args, settings),
-        "voicetest" => voicetest(),
-        "help" | "?" => help(),
-        other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
-    }
+    dispatch(cmd, &args, player, world, settings, sky, visuals)
 }
 
 /// `/time` — show or set the day/night clock, or change the cycle length.
@@ -360,24 +386,6 @@ fn describe_composition(world: &World, composition: &Composition) -> String {
     }
 }
 
-fn help() -> Vec<Line> {
-    shown(vec![
-        "commands (a leading '/' is optional):".to_string(),
-        "  tp <x> <y> <z>       teleport to coordinates".to_string(),
-        "  pos                  show current coordinates".to_string(),
-        "  inspect [x y z]      describe a block's elements & properties".to_string(),
-        "  gfx [setting value]  show or change graphics settings".to_string(),
-        "  time [set|length]    show or set the day/night clock".to_string(),
-        "  walkspeed [n]        show or set ground walk speed".to_string(),
-        "  flyspeed [n]         show or set flying speed".to_string(),
-        "  mute                 toggle master mute (this session)".to_string(),
-        "  deafen               toggle hearing incoming voice".to_string(),
-        "  audio <chan> <0-100> set master/effects/voice volume".to_string(),
-        "  voicetest            play a local voice test cue".to_string(),
-        "  help                 show this list".to_string(),
-    ])
-}
-
 /// Format a position the same way the on-screen coordinate readout does.
 fn fmt_pos(p: DVec3) -> String {
     format!("X {:.1}  Y {:.1}  Z {:.1}", p.x, p.y, p.z)
@@ -407,6 +415,26 @@ mod tests {
     /// All the lines' text joined — for asserting on multi-line output.
     fn joined(lines: &[Line]) -> String {
         lines.iter().map(Line::text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn help_text_is_stable() {
+        assert_eq!(
+            joined(&help()),
+            "commands (a leading '/' is optional):\n  \
+             tp <x> <y> <z>       teleport to coordinates\n  \
+             pos                  show current coordinates\n  \
+             inspect [x y z]      describe a block's elements & properties\n  \
+             gfx [setting value]  show or change graphics settings\n  \
+             time [set|length]    show or set the day/night clock\n  \
+             walkspeed [n]        show or set ground walk speed\n  \
+             flyspeed [n]         show or set flying speed\n  \
+             mute                 toggle master mute (this session)\n  \
+             deafen               toggle hearing incoming voice\n  \
+             audio <chan> <0-100> set master/effects/voice volume\n  \
+             voicetest            play a local voice test cue\n  \
+             help                 show this list"
+        );
     }
 
     #[test]

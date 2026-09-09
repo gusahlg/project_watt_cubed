@@ -62,6 +62,18 @@ fn stream_center(world: &World) -> Coord {
     world.center.expect("stream lanes run after center is set")
 }
 
+fn eng<'a>(
+    slot: &'a mut Option<&mut voxel_engine::Engine>,
+    what: &'static str,
+) -> &'a mut voxel_engine::Engine {
+    slot.as_deref_mut().expect(what)
+}
+
+fn admit_run<L: super::StreamLane>(ctx: &mut Ctx<'_>, b: Budget) -> Progress {
+    admit::<L>(ctx.world, stream_center(ctx.world), b);
+    Progress::Idle
+}
+
 /// Declares a `new` row's marker struct (docs attach to it); a `use` row's
 /// marker already exists in `world::mod` (the `StreamLane` implementors).
 macro_rules! declare_lane {
@@ -70,6 +82,7 @@ macro_rules! declare_lane {
         pub struct $lane;
     };
     (use $(#[$doc:meta])* $lane:ident) => {};
+    (admit $(#[$doc:meta])* $lane:ident) => {};
 }
 
 /// The one lane table: `field: [new|use] Marker(name, budget) => |ctx, budget| { body }`.
@@ -116,14 +129,14 @@ stream_lanes! {
     /// engine.
     occlusion: new OcclusionLane("occlusion", Budget::Millis(0.5))
         => |ctx, b| {
-            let eng = ctx.eng.as_deref_mut().expect("occlusion patches masks; eng required");
+            let eng = eng(&mut ctx.eng, "occlusion patches masks; eng required");
             ctx.world.rebuild_occlusion(eng, b)
         },
     /// Synchronous remesh of edited (`Dirty`) chunks (`World::remesh_dirty`).
     /// Uploads through the engine, so it needs `ctx.eng`.
     dirty_remesh: new DirtyRemeshLane("dirty_remesh", Budget::Dispatches(super::DIRTY_BUDGET as u16))
         => |ctx, _b| {
-            let eng = ctx.eng.as_deref_mut().expect("dirty-remesh is a CPU lane; eng required");
+            let eng = eng(&mut ctx.eng, "dirty-remesh is a CPU lane; eng required");
             ctx.world.remesh_dirty(eng)
         },
     /// The far-field relief bake runs on a spawned thread; this only polls the
@@ -146,7 +159,7 @@ stream_lanes! {
     /// overlay. CPU lane — needs the engine.
     section_remesh: new SectionRemeshLane("lod_section_remesh", Budget::Millis(1.0))
         => |ctx, _b| {
-            let eng = ctx.eng.as_deref_mut().expect("section-remesh is a CPU lane; eng required");
+            let eng = eng(&mut ctx.eng, "section-remesh is a CPU lane; eng required");
             ctx.world.remesh_dirty_sections(eng);
             Progress::Idle
         },
@@ -161,7 +174,7 @@ stream_lanes! {
     /// to GPU is budgeted. CPU lane — needs the engine.
     drain: new DrainLane("drain", Budget::Millis(1.0))
         => |ctx, b| {
-            let eng = ctx.eng.as_deref_mut().expect("drain is a CPU lane; eng required");
+            let eng = eng(&mut ctx.eng, "drain is a CPU lane; eng required");
             ctx.world.drain_results(eng, duration(b));
             Progress::Idle
         },
@@ -174,24 +187,12 @@ stream_lanes! {
             ctx.world.request_region_data(center, b)
         },
     /// Cross-chunk light settling admission (the `world::LightLane` marker).
-    light_admit: use LightLane("light_admit", Budget::Millis(1.0))
-        => |ctx, b| {
-            let center = stream_center(ctx.world);
-            admit::<LightLane>(ctx.world, center, b);
-            Progress::Idle
-        },
+    light_admit: admit LightLane("light_admit", Budget::Millis(1.0))
+        => |ctx, b| { admit_run::<LightLane>(ctx, b) },
     /// Fresh full-res chunk meshing admission (the `world::MeshLane` marker).
-    mesh_admit: use MeshLane("mesh_admit", Budget::Millis(2.0))
-        => |ctx, b| {
-            let center = stream_center(ctx.world);
-            admit::<MeshLane>(ctx.world, center, b);
-            Progress::Idle
-        },
+    mesh_admit: admit MeshLane("mesh_admit", Budget::Millis(2.0))
+        => |ctx, b| { admit_run::<MeshLane>(ctx, b) },
     /// LOD2 column-section admission (the `world::SectionLane` marker).
-    section_admit: use SectionLane("section_admit", Budget::Millis(1.0))
-        => |ctx, b| {
-            let center = stream_center(ctx.world);
-            admit::<SectionLane>(ctx.world, center, b);
-            Progress::Idle
-        },
+    section_admit: admit SectionLane("section_admit", Budget::Millis(1.0))
+        => |ctx, b| { admit_run::<SectionLane>(ctx, b) },
 }

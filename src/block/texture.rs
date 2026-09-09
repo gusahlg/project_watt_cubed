@@ -177,7 +177,7 @@ fn lattice(seed: u32, octave: u32, period: u32, lx: u32, ly: u32) -> f32 {
 }
 
 fn smoothstep(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
+    crate::math::smooth(t)
 }
 
 /// Hash four values to a uniform float [0, 1) using xorshift-multiply.

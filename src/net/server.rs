@@ -992,11 +992,11 @@ fn on_edit(
     }
     // Anything unparseable resolves to AIR; only the literal "air" spec may
     // mean AIR, so junk is rejected instead of silently breaking a block.
-    let block = crate::save::registry_parse_block(&mut state.registry, spec);
+    let block = crate::save::parse_block(&mut state.registry, spec);
     if block == crate::block::AIR && spec != "air" {
         return reject(&state, ack_to.as_ref());
     }
-    let canonical = crate::save::registry_block_spec(&state.registry, block);
+    let canonical = crate::save::block_spec(&state.registry, block);
     if let (Some(hooks), Some(name)) = (hooks, name) {
         let intent = EditIntent {
             player: id,

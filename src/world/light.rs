@@ -697,21 +697,11 @@ pub(in crate::world) fn border_changed(a: &LightGrid, b: &LightGrid, face: Face)
     }
 }
 
-#[cfg(test)]
-#[inline]
-fn normal_axis(face: Face) -> usize {
-    match face {
-        Face::NegX | Face::PosX => 0,
-        Face::NegY | Face::PosY => 1,
-        Face::NegZ | Face::PosZ => 2,
-    }
-}
-
 /// The two in-face axes of `face`, ascending.
 #[cfg(test)]
 #[inline]
 fn plane_axes(face: Face) -> (usize, usize) {
-    match normal_axis(face) {
+    match face.axis() {
         0 => (1, 2),
         1 => (0, 2),
         _ => (0, 1),
@@ -758,10 +748,10 @@ mod tests {
     #[test]
     fn light_byte_pin() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::{SineHills, TerrainGenerator};
+        use crate::world::generation::{Terrain, TerrainGenerator};
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 42);
+        let generator = Terrain::new(&mut registry, 20.0, 42);
         let tables = registry.hot_tables();
         let lumin = registry.id_by_name("Lumin").expect("builtin Lumin");
 
@@ -825,7 +815,7 @@ mod tests {
     #[test]
     fn face_index_table_matches_axis_walk() {
         for face in Face::ALL {
-            let na = normal_axis(face);
+            let na = face.axis();
             let (au, av) = plane_axes(face);
             let inner = match face {
                 Face::PosX | Face::PosY | Face::PosZ => CHUNK_SIZE - 1,
@@ -861,10 +851,10 @@ mod tests {
     #[ignore]
     fn light_propagate_throughput() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::{SineHills, TerrainGenerator};
+        use crate::world::generation::{Terrain, TerrainGenerator};
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 20.0, 5);
         // The surface chunk at the origin: the Dense band every load floods
         // (deep/sky chunks take the analytic fast paths and never get here).
         let cy = generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
@@ -1139,7 +1129,7 @@ mod tests {
                 (nx == dx && ny == dy && nz == dz).then_some(&grid)
             });
             let shell = FaceShell::capture(|f| (f == face).then_some(&grid));
-            let na = normal_axis(face);
+            let na = face.axis();
             let (au, av) = plane_axes(face);
             let outer = match face {
                 Face::PosX | Face::PosY | Face::PosZ => CS,

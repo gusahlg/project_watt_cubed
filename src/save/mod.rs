@@ -18,12 +18,6 @@ pub use store::{Source, fresh_id, list, write_atomic};
 
 use crate::block::element::ElementId;
 use crate::block::{AIR, BlockId, BlockRegistry, Composition};
-use crate::world::World;
-
-/// Serialize a block as portable element names shared with the network layer.
-pub(crate) fn block_spec(world: &World, id: BlockId) -> String {
-    registry_block_spec(world.registry(), id)
-}
 
 /// Spec string from a composition and an element-name lookup. Shared by the
 /// live registry path and the autosave snapshot so both emit identical bytes.
@@ -48,9 +42,8 @@ pub(crate) fn composition_spec<'a>(
     }
 }
 
-/// [`block_spec`] against a bare registry — the headless server and the
-/// content fingerprint have no `World`.
-pub(crate) fn registry_block_spec(registry: &BlockRegistry, id: BlockId) -> String {
+/// Serialize a block as portable element names shared with the network layer.
+pub(crate) fn block_spec(registry: &BlockRegistry, id: BlockId) -> String {
     if id == AIR {
         return "air".to_string();
     }
@@ -59,15 +52,10 @@ pub(crate) fn registry_block_spec(registry: &BlockRegistry, id: BlockId) -> Stri
 }
 
 /// Deserialize a block spec, registering into palette; inverse of block_spec().
-pub(crate) fn parse_block(world: &mut World, spec: &str) -> BlockId {
-    registry_parse_block(world.registry_mut(), spec)
-}
-
-/// [`parse_block`] against a bare registry. The server uses this to VALIDATE
-/// and canonicalize incoming edit specs with the exact rules clients apply,
-/// then re-serializes via [`registry_block_spec`] — so an edit overlay never
-/// stores two strings for one block, and junk never interns at all.
-pub(crate) fn registry_parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
+/// The server uses this to VALIDATE and canonicalize incoming edit specs with
+/// the exact rules clients apply, then re-serializes via [`block_spec`] — so an
+/// edit overlay never stores two strings for one block, and junk never interns.
+pub(crate) fn parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
     if spec == "air" {
         return AIR;
     }
@@ -112,6 +100,7 @@ mod tests {
     use crate::block::element::El;
     use crate::mods::Mods;
     use crate::player::Player;
+    use crate::world::World;
     use crate::world::chunk::CHUNK_SIZE;
     use crate::world::diffusion::DiffusionCfg;
     use crate::world::generation::WorldgenKind;
@@ -177,9 +166,9 @@ mod tests {
 
         for i in 0..world.registry().block_count() {
             let id = BlockId(i as u16);
-            let spec = block_spec(&world, id);
+            let spec = block_spec(world.registry(), id);
             assert_eq!(
-                parse_block(&mut world, &spec),
+                parse_block(world.registry_mut(), &spec),
                 id,
                 "spec '{spec}' must parse back to block #{i}"
             );
@@ -433,7 +422,7 @@ mod tests {
         let mut index_of: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
         let mut edits: Vec<Edit> = Vec::new();
         for ((x, y, z), id) in world.edits() {
-            let spec = block_spec(world, id);
+            let spec = block_spec(world.registry(), id);
             let index = match index_of.get(&spec) {
                 Some(&index) => index,
                 None => {

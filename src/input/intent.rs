@@ -370,15 +370,19 @@ pub enum GlobalEvent {
     CycleHud,
     Screenshot,
     MinimapMode,
+    CyclePerson,
+    ToggleFreecam,
 }
 
 impl GlobalEvent {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 6;
     pub const ALL: [GlobalEvent; Self::COUNT] = [
         GlobalEvent::Escape,
         GlobalEvent::CycleHud,
         GlobalEvent::Screenshot,
         GlobalEvent::MinimapMode,
+        GlobalEvent::CyclePerson,
+        GlobalEvent::ToggleFreecam,
     ];
 }
 

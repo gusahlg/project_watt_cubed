@@ -51,6 +51,25 @@ const BLOCK_COORD_SLACK: f64 = 16.0;
 /// `as i32` cast of an unbounded float would saturate at `i32::MAX` and make
 /// that arithmetic wrap. `NaN` clamps to `NaN` and casts to 0 — a harmless
 /// origin cell rather than a poisoned coordinate.
+/// Hermite smoothstep on a unit interval: `t²(3−2t)`.
+#[inline]
+pub fn smooth(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Clamped Hermite smoothstep from `edge0` to `edge1`.
+#[inline]
+pub fn smooth_between(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    smooth(t)
+}
+
+/// Linear interpolate `a` toward `b` by `t`.
+#[inline]
+pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 #[inline]
 pub fn block_coord(v: f64) -> i32 {
     // Floor in f64 (exact for |v| <= 1e9 + 16, far below 2^53), then narrow

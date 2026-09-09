@@ -50,9 +50,13 @@ impl SseBudget {
 
     /// Calibrate the budget to match the old radial ladder exactly at worst case
     /// (error = 2^finest), so worst-case terrain stays bit-identical while flatter
-    /// terrain can coarsen further. `finest` is the raw level `k`.
-    pub fn ladder(k: f32, unit: f32, finest: i8) -> SseBudget {
-        SseBudget { tau_px: k * Detail(finest).scale() / unit, k }
+    /// terrain can coarsen further. `finest` is the raw level `k`. The
+    /// screen-space gain cancels in [`coarse_ok`], so it is pinned at 1.
+    pub fn ladder(unit: f32, finest: i8) -> SseBudget {
+        SseBudget {
+            tau_px: Detail(finest).scale() / unit,
+            k: 1.0,
+        }
     }
 
     /// Test if error at distance d fits within budget. Cross-multiplied to handle d=0 safely.

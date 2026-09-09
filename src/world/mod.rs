@@ -60,7 +60,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{CoverageVolume, DVec3, Detail, Engine, FadeStyle, Frame3D, MeshHandle};
+use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle};
+use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};

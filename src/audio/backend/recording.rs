@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 
 use super::super::acoustics::{Dsp, Listener};
 use super::super::voice::VoicePacket;

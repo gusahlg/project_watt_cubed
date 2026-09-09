@@ -428,7 +428,7 @@ impl TerrainGenerator for DiffusionTerrain {
 pub type Generator = Arc<dyn TerrainGenerator>;
 
 pub fn classic(registry: &mut BlockRegistry, seed: i64) -> Generator {
-    Arc::new(super::generation::SineHills::new(registry, 20.0, seed))
+    Arc::new(super::generation::Terrain::new(registry, 20.0, seed))
 }
 
 pub fn diffusion(registry: &mut BlockRegistry, seed: i64, cfg: DiffusionCfg) -> Generator {

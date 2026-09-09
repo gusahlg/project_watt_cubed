@@ -9,7 +9,7 @@ pub(crate) mod recording;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 
 use super::acoustics::{Dsp, Listener};
 use super::voice::VoicePacket;

@@ -545,7 +545,7 @@ pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
         .iter()
         .map(|s| Stage {
             seed: GOLDEN_SEED,
-            // Above the SineHills band (amplitude 20 around ~64) so a straight
+            // Above the Terrain band (amplitude 20 around ~64) so a straight
             // +X flight stays airborne; scripted games run no physics, so the
             // height only affects which chunk layers stream.
             cam: Some(CameraPose {

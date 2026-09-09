@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 
 use super::acoustics::AcousticWindow;
 use super::content::{CueId, Loop, OneShot};
@@ -177,7 +177,8 @@ impl AudioFrame {
 
 #[cfg(test)]
 mod tests {
-    use glam::{IVec3, UVec3};
+    use glam::UVec3;
+    use voxel_engine::IVec3;
 
     use super::super::acoustics::{Cell, Listener, Medium};
     use super::*;

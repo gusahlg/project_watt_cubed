@@ -35,7 +35,7 @@ use super::chunk::{CHUNK_SIZE, Chunk};
 use super::diffusion::Generator;
 use super::generation::ColumnHeights;
 #[cfg(test)]
-use super::generation::SineHills;
+use super::generation::Terrain;
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
 use super::neighborhood::BoundedPool;
@@ -464,12 +464,7 @@ impl ViewGate {
         }
         let (px, pz) = self.center();
         let (dx, dz) = ((cx - px) as f64, (cz - pz) as f64);
-        let velocity = glam::DVec3::new(
-            f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
-            0.0,
-            f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
-        );
-        super::motion_biased_dist2(base, velocity, dx, dz)
+        super::motion_biased_dist2(base, self.velocity(), dx, dz)
     }
 
     /// Whether a job at this column is still worth running.
@@ -494,16 +489,18 @@ impl ViewGate {
         (dx * dx + dz * dz) as u64
     }
 
-    fn far_key(&self, wx: i64, wz: i64) -> u64 {
-        let (ex, ez) = self.eye_m();
-        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
-        let base = (dx * dx + dz * dz) as u64;
-        let vel = glam::DVec3::new(
+    fn velocity(&self) -> voxel_engine::DVec3 {
+        voxel_engine::DVec3::new(
             f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
             0.0,
             f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
-        );
-        super::motion_biased_dist2(base, vel, dx, dz)
+        )
+    }
+
+    fn far_key(&self, wx: i64, wz: i64) -> u64 {
+        let (ex, ez) = self.eye_m();
+        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
+        super::motion_biased_dist2(self.far_dist2_m(wx, wz), self.velocity(), dx, dz)
     }
 
     /// Whether a far entry with world-centre `(wx, wz)` and footprint `span`
@@ -1201,7 +1198,7 @@ mod tests {
     fn section_job(terrain: &Generator, id: i32) -> Job {
         Job::Section {
             pos: SectionPos {
-                detail: voxel_engine::Detail(2),
+                detail: crate::ident::Detail(2),
                 x: id,
                 z: 0,
             },
@@ -1270,7 +1267,7 @@ mod tests {
     #[test]
     fn worker_meshing_matches_the_sync_mesher() {
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 20.0, 5);
         // The chunk holding the surface at the origin, with all six neighbours
         // (below: solid ground, above: sky, sides: more surface).
         let chunk = Chunk::new(0, 1, 0, &generator);
@@ -1603,7 +1600,7 @@ mod tests {
     #[ignore]
     fn mesh_result_channel_throughput() {
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 20.0, 5);
         let neigh: Vec<Chunk> = (0..27)
             .map(|k| Chunk::new(k % 3 - 1, 1 + k / 9 - 1, k / 3 % 3 - 1, &generator))
             .collect();
@@ -1781,7 +1778,7 @@ mod tests {
             },
             JobKey::Section {
                 pos: SectionPos {
-                    detail: voxel_engine::Detail(2),
+                    detail: crate::ident::Detail(2),
                     x: 5,
                     z: -5,
                 },

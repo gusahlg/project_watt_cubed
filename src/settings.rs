@@ -51,48 +51,15 @@ pub const UI_SCALE_RANGE: RangeInclusive<f32> = 0.5..=2.0;
 
 pub const SHAKE_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
-/// Performance profile marker. Editing any profile-owned setting drops this to
-/// [`Preset::Custom`]; choosing a profile applies it atomically. Personal
-/// controls never touch it. Persisted by its stable [`Preset::code`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Preset {
-    Custom,
-    Minimum,
-    Fast,
-    Default,
-}
-
-impl Preset {
-    /// Stable persistence/console code (`Custom=0, Minimum=1, Fast=2, Default=3`).
-    pub fn code(self) -> u8 {
-        match self {
-            Preset::Custom => 0,
-            Preset::Minimum => 1,
-            Preset::Fast => 2,
-            Preset::Default => 3,
-        }
-    }
-
-    /// Parse a persisted code or a console word; the single source `/gfx`,
-    /// persistence `read`, and benchmark startup fold through.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "custom" | "0" => Some(Preset::Custom),
-            "minimum" | "min" | "1" => Some(Preset::Minimum),
-            "fast" | "2" => Some(Preset::Fast),
-            "default" | "3" => Some(Preset::Default),
-            _ => None,
-        }
-    }
-
-    /// Capitalized display name for the menu row and confirm line.
-    pub fn label(self) -> &'static str {
-        match self {
-            Preset::Custom => "Custom",
-            Preset::Minimum => "Minimum",
-            Preset::Fast => "Fast",
-            Preset::Default => "Default",
-        }
+crate::macros::code_enum! {
+    /// Performance profile marker. Editing any profile-owned setting drops this to
+    /// [`Preset::Custom`]; choosing a profile applies it atomically. Personal
+    /// controls never touch it. Persisted by its stable [`Preset::code`].
+    pub enum Preset {
+        Custom = 0, ["custom", "0"], "Custom",
+        Minimum = 1, ["minimum", "min", "1"], "Minimum",
+        Fast = 2, ["fast", "2"], "Fast",
+        Default = 3, ["default", "3"], "Default",
     }
 }
 

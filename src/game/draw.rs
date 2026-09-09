@@ -74,6 +74,19 @@ struct StaticFrame {
     clear: voxel_engine::LinearRgb,
 }
 
+fn hud_label(
+    f: &mut voxel_engine::Frame,
+    theme: &crate::ui::Theme,
+    screen: (i32, i32),
+    at: Anchor,
+    off: (i32, i32),
+    base_fs: i32,
+    color: Color,
+    text: &str,
+) {
+    ui::label(f, theme, screen, at, off, base_fs, color, text);
+}
+
 impl Game {
     /// Render the world and HUD.
     ///
@@ -402,42 +415,15 @@ impl Game {
             );
         } else if theme.hud.shows_info() {
             if let Some(coord_text) = self.drawing.coord_cache.get() {
-                ui::label(
-                    f,
-                    theme,
-                    screen,
-                    Anchor::Top,
-                    (0, 12),
-                    26,
-                    ui::Role::Primary.color(),
-                    coord_text,
-                );
+                hud_label(f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), coord_text);
             }
             if let Some(fps_text) = self.drawing.fps_cache.get() {
-                ui::label(
-                    f,
-                    theme,
-                    screen,
-                    Anchor::TopLeft,
-                    (10, 12),
-                    20,
-                    ui::Role::Positive.color(),
-                    fps_text,
-                );
+                hud_label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
             }
             if self.net.is_some()
                 && let Some(online_text) = self.drawing.online_cache.get()
             {
-                ui::label(
-                    f,
-                    theme,
-                    screen,
-                    Anchor::TopRight,
-                    (-12, 180),
-                    20,
-                    ui::Role::Positive.color(),
-                    online_text,
-                );
+                hud_label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
             }
         }
 

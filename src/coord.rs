@@ -182,6 +182,22 @@ impl Face {
         Face::ALL[(self as usize) ^ 1]
     }
 
+    /// World axis this face is perpendicular to (0=X, 1=Y, 2=Z).
+    #[inline]
+    pub const fn axis(self) -> usize {
+        match self {
+            Face::NegX | Face::PosX => 0,
+            Face::NegY | Face::PosY => 1,
+            Face::NegZ | Face::PosZ => 2,
+        }
+    }
+
+    /// Whether this face points along the positive axis.
+    #[inline]
+    pub const fn positive(self) -> bool {
+        matches!(self, Face::PosX | Face::PosY | Face::PosZ)
+    }
+
     #[inline]
     pub fn touches(self, l: Local) -> bool {
         let edge = (CHUNK_SIZE - 1) as u8;

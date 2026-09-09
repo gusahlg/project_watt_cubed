@@ -30,7 +30,7 @@ use super::{
 fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
     voxel_engine::MeshPlacement::terrain(
         voxel_engine::IVec3::new(coord.x, coord.y, coord.z) * CHUNK_SIZE as i32,
-        voxel_engine::Detail::FULL,
+        crate::ident::Detail::FULL,
     )
 }
 
@@ -73,10 +73,6 @@ pub(in crate::world) fn edits_in_footprint(
         .map(|(&c, cells)| (c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
         .collect()
 }
-
-/// Screen-space-error gain at 90° fov and 1080-line viewport.
-/// Currently used only for documentation; `coarse_ok` cancels it out.
-const SSE_K: f32 = 1080.0 / 2.0; // tan(45°) = 1
 
 /// Velocity prediction horizon: pre-loads sections ahead of eye motion so they're
 /// ready by the time the eye reaches them. Conservative; tuning it larger preloads more
@@ -2016,11 +2012,7 @@ impl World {
     /// Ladder-pinned SSE budget for current view radius. Rebuilt per query
     /// as `unit` tracks view distance.
     fn sse_budget(&self) -> SseBudget {
-        SseBudget::ladder(
-            SSE_K,
-            self.section_pyramid.unit,
-            self.section_pyramid.finest.0,
-        )
+        SseBudget::ladder(self.section_pyramid.unit, self.section_pyramid.finest.0)
     }
 
     /// Spawn background max-mip bake (idempotent: no-op if spawned or landed).
@@ -2197,7 +2189,7 @@ impl World {
         let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
         let visible: FastSet<SectionPos> = self.section_visible.iter().map(|(p, _)| *p).collect();
         // Fading sections still draw this frame. Keep meshes until fade completes
-        // or outgoing tile vanishes mid-fade.
+        // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
         let metric = self.section_metric(center, DVec3::ZERO);
         let cfg = &self.section_pyramid;
@@ -2382,13 +2374,7 @@ impl World {
     /// without moving shared border; this sweep promotes them to final at true
     /// rest so entry_complete doesn't hang.
     pub(in crate::world) fn flush_degraded_terminal(&mut self) {
-        let quiescent = self.generating.is_empty()
-            && self.mesh_worklist.is_empty()
-            && self.light_worklist.is_empty()
-            && self.light_inflight.is_empty()
-            && self.light_apply_queue.is_empty()
-            && !self.light_gate.degraded.is_empty();
-        if !quiescent {
+        if !self.near_quiescent() || self.light_gate.degraded.is_empty() {
             return;
         }
         // Promote every SETTLED degraded chunk this frame: a rev bump plus a
@@ -2452,12 +2438,8 @@ impl World {
             return false;
         };
         // No near work queued or in flight, and nothing owed a final-light remesh.
-        if !self.generating.is_empty()
-            || !self.mesh_worklist.is_empty()
+        if !self.near_quiescent()
             || !self.upload_queue.is_empty()
-            || !self.light_worklist.is_empty()
-            || !self.light_inflight.is_empty()
-            || !self.light_apply_queue.is_empty()
             || !self.light_gate.degraded.is_empty()
             || !self.light_gate.blocked_since.is_empty()
         {
@@ -2472,7 +2454,7 @@ impl World {
         }
         // LOD2 far field: all desired cells covered and no uploads pending. Skipped
         // when disabled (no far field in near-only mode).
-        if self.lod2 {
+        if self.desired_unrefined().is_some() {
             if !self.section_upload_queue.is_empty() {
                 return false;
             }
@@ -2487,6 +2469,29 @@ impl World {
         true
     }
 
+    /// Near generate/mesh/light queues empty — the five-queue rest predicate.
+    fn near_quiescent(&self) -> bool {
+        self.generating.is_empty()
+            && self.mesh_worklist.is_empty()
+            && self.light_worklist.is_empty()
+            && self.light_inflight.is_empty()
+            && self.light_apply_queue.is_empty()
+    }
+
+    /// `None` when LOD2 is off. `Some(n)` is how many desired far cells lack
+    /// their own Ready mesh.
+    fn desired_unrefined(&self) -> Option<usize> {
+        if !self.lod2 {
+            return None;
+        }
+        Some(
+            self.section_desired
+                .iter()
+                .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
+                .count(),
+        )
+    }
+
     /// Every desired far-field section is itself Ready — the strongest far-field
     /// state. `entry_complete` accepts a Ready *ancestor* as covering (right for
     /// playability), but a coarse cover moves the horizon's pixels — and through
@@ -2497,15 +2502,10 @@ impl World {
         if self.center.is_none() {
             return false;
         }
-        if !self.lod2 {
-            return true;
+        match self.desired_unrefined() {
+            None => true,
+            Some(n) => self.section_upload_queue.is_empty() && n == 0,
         }
-        if !self.section_upload_queue.is_empty() {
-            return false;
-        }
-        self.section_desired
-            .iter()
-            .all(|c| self.sections.get(c).is_some_and(|s| s.is_ready()))
     }
 
     /// How many desired far-field sections still lack their own mesh — the
@@ -2515,13 +2515,7 @@ impl World {
         if self.center.is_none() {
             return 0;
         }
-        if !self.lod2 {
-            return 0;
-        }
-        self.section_desired
-            .iter()
-            .filter(|c| !self.sections.get(c).is_some_and(|s| s.is_ready()))
-            .count()
+        self.desired_unrefined().unwrap_or(0)
     }
 
     /// Snapshot the streaming-queue depths (see [`super::StreamGauges`]).

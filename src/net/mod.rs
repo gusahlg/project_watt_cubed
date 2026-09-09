@@ -231,7 +231,7 @@ pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     eat(&(registry.block_count() as u32).to_le_bytes());
     for i in 0..registry.block_count() {
         let block = registry.block(crate::block::BlockId(i as u16));
-        eat(crate::save::registry_block_spec(registry, crate::block::BlockId(i as u16)).as_bytes());
+        eat(crate::save::block_spec(registry, crate::block::BlockId(i as u16)).as_bytes());
         eat(&[0]);
         eat(&crate::block::element::Core::from(block.core).0);
         eat(&(block.specials.len() as u32).to_le_bytes());

@@ -35,6 +35,7 @@ use super::{BRICK_DIM, ChunkCoord, DOMAIN_H, SECTION_N, SectionPos};
 #[cfg(test)]
 use super::{BrickStack, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
+use super::super::mesh::face::{self, covered, vertex_ao, corner_uv};
 
 /// One block's mesh plus its origin in cells within the section. Only non-empty blocks appear.
 pub(in crate::world) type SectionMeshData = Vec<(UVec3, ChunkMeshData)>;
@@ -93,90 +94,20 @@ struct FaceSample {
     ao: [u8; 4],
 }
 
-/// Per-vertex AO level `0..=3` (`3` = unoccluded) from its three occluders;
-/// two touching sides fully occlude the corner. Same model as the chunk mesher.
-#[inline]
-fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
-    if side1 && side2 {
-        return 0;
-    }
-    3 - (side1 as u8 + side2 as u8 + corner as u8)
-}
-
 /// Face direction with corner winding; micro-offset zero for verticals (never borders).
 struct Dir {
-    normal: Normal,
-    /// +1 / -1 step along the normal axis to the cell a face borders.
-    step: i32,
-    n_axis: usize,
-    u_axis: usize,
-    v_axis: usize,
-    corners: [[u32; 3]; 4],
+    face: face::Dir,
     micro: [i8; 3],
 }
 
 const DIRS: [Dir; 6] = [
-    Dir {
-        normal: Normal::PosX,
-        step: 1,
-        n_axis: 0,
-        u_axis: 2,
-        v_axis: 1,
-        corners: [[1, 0, 0], [1, 0, 1], [1, 1, 1], [1, 1, 0]],
-        micro: [-1, 0, 0],
-    },
-    Dir {
-        normal: Normal::NegX,
-        step: -1,
-        n_axis: 0,
-        u_axis: 2,
-        v_axis: 1,
-        corners: [[0, 1, 0], [0, 1, 1], [0, 0, 1], [0, 0, 0]],
-        micro: [1, 0, 0],
-    },
-    Dir {
-        normal: Normal::PosY,
-        step: 1,
-        n_axis: 1,
-        u_axis: 0,
-        v_axis: 2,
-        corners: [[1, 0, 1], [1, 1, 1], [1, 1, 0], [1, 0, 0]],
-        micro: [0, 0, 0],
-    },
-    Dir {
-        normal: Normal::NegY,
-        step: -1,
-        n_axis: 1,
-        u_axis: 0,
-        v_axis: 2,
-        corners: [[0, 0, 0], [0, 1, 0], [0, 1, 1], [0, 0, 1]],
-        micro: [0, 0, 0],
-    },
-    Dir {
-        normal: Normal::PosZ,
-        step: 1,
-        n_axis: 2,
-        u_axis: 0,
-        v_axis: 1,
-        corners: [[1, 1, 0], [1, 1, 1], [1, 0, 1], [1, 0, 0]],
-        micro: [0, 0, -1],
-    },
-    Dir {
-        normal: Normal::NegZ,
-        step: -1,
-        n_axis: 2,
-        u_axis: 0,
-        v_axis: 1,
-        corners: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-        micro: [0, 0, 1],
-    },
+    Dir { face: face::DIRS[0], micro: [-1, 0, 0] },
+    Dir { face: face::DIRS[1], micro: [1, 0, 0] },
+    Dir { face: face::DIRS[2], micro: [0, 0, 0] },
+    Dir { face: face::DIRS[3], micro: [0, 0, 0] },
+    Dir { face: face::DIRS[4], micro: [0, 0, -1] },
+    Dir { face: face::DIRS[5], micro: [0, 0, 1] },
 ];
-
-/// Chunk mesher's cull rule: opaque or same-block faces hide.
-#[inline]
-fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
-    tables.opaque(nbr) || nbr == my
-}
 
 /// Opaque-occupancy probe for AO sampling: below-floor reads solid (matches the
 /// cull rule's "solid ground"), above-ceiling and outside the quadrant read air
@@ -222,10 +153,10 @@ fn face_sample(
     if me == AIR {
         return None;
     }
-    let open = idx + dir.step * s_n;
+    let open = idx + dir.face.step * s_n;
     let mut micro = [0i8; 3];
-    let nbr = if dir.n_axis == 1 {
-        let ny = y + dir.step;
+    let nbr = if dir.face.n_axis == 1 {
+        let ny = y + dir.face.step;
         if ny < 0 {
             return None; // below the floor: solid ground, never a silhouette
         } else if ny >= quad.n_cells {
@@ -234,8 +165,8 @@ fn face_sample(
             quad.at_flat(open as usize)
         }
     } else {
-        let n = if dir.n_axis == 0 { x } else { z };
-        if n + dir.step < 0 || n + dir.step >= QUAD_N as i32 {
+        let n = if dir.face.n_axis == 0 { x } else { z };
+        if n + dir.face.step < 0 || n + dir.face.step >= QUAD_N as i32 {
             // Quadrant border: overdraw as air, nudge inward.
             micro = dir.micro;
             AIR
@@ -248,10 +179,10 @@ fn face_sample(
     }
     // Open-cell coordinates: one step along the normal. u/v of each Dir
     // are fixed per n_axis (X: u=Z v=Y; Y: u=X v=Z; Z: u=X v=Y).
-    let (ox, oy, oz) = match dir.n_axis {
-        0 => (x + dir.step, y, z),
-        1 => (x, y + dir.step, z),
-        _ => (x, y, z + dir.step),
+    let (ox, oy, oz) = match dir.face.n_axis {
+        0 => (x + dir.face.step, y, z),
+        1 => (x, y + dir.face.step, z),
+        _ => (x, y, z + dir.face.step),
     };
     // One 3×3 stencil in the OPEN layer — same layout as world/mesh.rs.
     // Bounds live in `occluder`; a stride step off the quadrant can land
@@ -262,7 +193,7 @@ fn face_sample(
         for du in 0..3 {
             let eu = du as i32 - 1;
             let pidx = open + eu * s_u + ev * s_v;
-            opaque[du][dv] = match dir.n_axis {
+            opaque[du][dv] = match dir.face.n_axis {
                 0 => occluder(quad, tables, pidx, ox, oy + ev, oz + eu),
                 1 => occluder(quad, tables, pidx, ox + eu, oy, oz + ev),
                 _ => occluder(quad, tables, pidx, ox + eu, oy + ev, oz),
@@ -292,16 +223,11 @@ fn build_block(
 
     for dir in &DIRS {
         let (s_n, s_u, s_v) = (
-            quad.axis_stride(dir.n_axis),
-            quad.axis_stride(dir.u_axis),
-            quad.axis_stride(dir.v_axis),
+            quad.axis_stride(dir.face.n_axis),
+            quad.axis_stride(dir.face.u_axis),
+            quad.axis_stride(dir.face.v_axis),
         );
-        let corner_uv: [[i32; 2]; 4] = std::array::from_fn(|i| {
-            [
-                if dir.corners[i][1] > 0 { 1 } else { -1 },
-                if dir.corners[i][2] > 0 { 1 } else { -1 },
-            ]
-        });
+        let corner_uv = corner_uv(&dir.face.corners);
 
         for n in 0..BLOCK {
             let mut any = false;
@@ -309,7 +235,7 @@ fn build_block(
                 let row_idx = base_idx + n * s_n + v * s_v;
                 for u in 0..BLOCK {
                     let idx = row_idx + u * s_u;
-                    let (x, y, z) = match dir.n_axis {
+                    let (x, y, z) = match dir.face.n_axis {
                         0 => (n, y_base + v, u),
                         1 => (u, y_base + n, v),
                         _ => (u, y_base + v, n),
@@ -371,22 +297,22 @@ fn emit(
     tables: &HotTables,
 ) {
     let mut origin = [0u32; 3];
-    origin[dir.n_axis] = nslice as u32;
-    origin[dir.u_axis] = u0 as u32;
-    origin[dir.v_axis] = v0 as u32;
+    origin[dir.face.n_axis] = nslice as u32;
+    origin[dir.face.u_axis] = u0 as u32;
+    origin[dir.face.v_axis] = v0 as u32;
     let layer = sample.block.0;
     // Route water to opaque pass (no animated texturing at LOD range).
     let is_fluid = tables.fluid_surface(BlockId(layer));
     let pass = if is_fluid { Pass::Opaque } else { tables.layer[layer as usize] };
     let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
-        let cr = dir.corners[i];
+        let cr = dir.face.corners[i];
         let mut pos = [0u32; 3];
-        pos[dir.n_axis] = origin[dir.n_axis] + cr[0];
-        pos[dir.u_axis] = origin[dir.u_axis] + cr[1] * w as u32;
-        pos[dir.v_axis] = origin[dir.v_axis] + cr[2] * h as u32;
+        pos[dir.face.n_axis] = origin[dir.face.n_axis] + cr[0] as u32;
+        pos[dir.face.u_axis] = origin[dir.face.u_axis] + cr[1] as u32 * w as u32;
+        pos[dir.face.v_axis] = origin[dir.face.v_axis] + cr[2] as u32 * h as u32;
         MeshVertex::new(
             [pos[0] as u8, pos[1] as u8, pos[2] as u8],
-            dir.normal,
+            dir.face.normal,
             // Vertex layer only (tables above index by the true id); wraps
             // past the device texture-layer cap like the chunk mesher.
             layer % tables.layer_cap,
@@ -544,7 +470,7 @@ fn mesh_quadrant(quad: &DenseQuad<'_>, tables: &HotTables, q: u8) -> SectionMesh
 mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
-    use crate::world::generation::{SineHills, TerrainGenerator};
+    use crate::world::generation::{Terrain, TerrainGenerator};
     use voxel_engine::Pass;
     use crate::world::section::{FINEST_DETAIL, SectionPos};
 
@@ -885,13 +811,13 @@ mod tests {
                 }
             }
             // The real terrain generator, off-origin so warps/rivers vary.
-            let hills = SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
+            let hills = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
             let pos = SectionPos { detail, x: 3, z: -2 };
             let stored = Section::extract(pos, &hills, &edits, voxel_engine::Rev::START);
             assert_eq!(
                 flatten(&build_section_mesh(&stored, &tables)),
                 flatten(&extract_section_mesh(pos, &hills, &edits, &tables)),
-                "fused path diverged on SineHills at {detail:?}",
+                "fused path diverged on Terrain at {detail:?}",
             );
         }
     }
@@ -899,7 +825,7 @@ mod tests {
     #[test]
     fn meshing_is_deterministic() {
         let (_r, tables, _b) = setup();
-        let r#gen = SineHills::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
+        let r#gen = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
         let sec = extract(FINEST, &r#gen);
         let a = build_section_mesh(&sec, &tables);
         let b = build_section_mesh(&sec, &tables);
@@ -960,7 +886,7 @@ mod tests {
     #[ignore]
     fn far_lod_section_mesh() {
         let mut registry = BlockRegistry::with_builtins();
-        let r#gen = SineHills::new(&mut registry, 20.0, 42);
+        let r#gen = Terrain::new(&mut registry, 20.0, 42);
         let tables = registry.hot_tables();
         let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos {
             detail: FINEST_DETAIL,

@@ -7,7 +7,7 @@
 //! decoder, so the full state space is enumerable in unit tests. `backend/kira.rs`
 //! wraps it with the rtrb feed and the opus decode/PLC calls.
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 
 use super::acoustics::Medium;
 use super::backend::BackendVoice;

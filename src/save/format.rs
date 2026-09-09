@@ -359,26 +359,29 @@ impl<'a> Reader<'a> {
         self.0.remaining()
     }
 
-    fn u8(&mut self) -> Result<u8, SaveError> {
-        self.0.u8().or_else(truncated)
-    }
-    fn u16(&mut self) -> Result<u16, SaveError> {
-        self.0.u16().or_else(truncated)
-    }
-    fn u32(&mut self) -> Result<u32, SaveError> {
-        self.0.u32().or_else(truncated)
-    }
-    fn i32(&mut self) -> Result<i32, SaveError> {
-        self.0.i32().or_else(truncated)
-    }
     fn pose(&mut self) -> Result<codec::Pose, SaveError> {
         self.0.pose().or_else(truncated)
     }
+
     fn string(&mut self, len: usize) -> Result<String, SaveError> {
         String::from_utf8(self.0.take(len).or_else(truncated)?.to_vec())
             .map_err(|_| SaveError::Corrupt("invalid UTF-8 in save file"))
     }
 }
+
+macro_rules! save_le {
+    ($($name:ident -> $ty:ty),+ $(,)?) => {
+        impl Reader<'_> {
+            $(
+                fn $name(&mut self) -> Result<$ty, SaveError> {
+                    self.0.$name().or_else(truncated)
+                }
+            )+
+        }
+    };
+}
+
+save_le!(u8 -> u8, u16 -> u16, u32 -> u32, i32 -> i32);
 
 pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let meta = peek_meta(bytes)?;

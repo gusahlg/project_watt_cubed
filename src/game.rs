@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 mod draw;
 
-use voxel_engine::{Color, DVec3, Engine, IVec2, Key, Vec2};
+use voxel_engine::{Color, DVec3, Engine, IVec2, Vec2};
 
 use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
@@ -73,6 +73,8 @@ struct FrameInput {
     g_hud: bool,
     g_shot: bool,
     g_minimap: bool,
+    g_person: bool,
+    g_freecam: bool,
 }
 
 impl FrameInput {
@@ -511,12 +513,6 @@ impl Game {
         self.sky.clock.set_day(day);
     }
 
-    /// Swap the atmosphere colour table.
-    pub fn set_palette(&mut self, palette: crate::sky::Palette) {
-        self.sky.atmosphere.palette = palette;
-        self.bump_content_rev();
-    }
-
     /// Attach a server connection, turning this into a multiplayer session.
     pub fn with_net(mut self, net: Connection) -> Self {
         self.net = Some(net);
@@ -785,6 +781,8 @@ impl Game {
         f.g_hud = global.event(GlobalEvent::CycleHud);
         f.g_shot = global.event(GlobalEvent::Screenshot);
         f.g_minimap = global.event(GlobalEvent::MinimapMode);
+        f.g_person = global.event(GlobalEvent::CyclePerson);
+        f.g_freecam = global.event(GlobalEvent::ToggleFreecam);
         f
     }
 
@@ -874,14 +872,13 @@ impl Game {
         if input.g_minimap
             && let Some(minimap) = &mut self.minimap
         {
-            minimap.toggle_orientation();
+            minimap.toggle_rotation();
         }
 
-        // F5 cycles first/third-back/third-front; F6 toggles freecam.
-        if eng.is_key_pressed(Key::F5) {
+        if input.g_person {
             self.camera.cycle_person();
         }
-        if eng.is_key_pressed(Key::F6) {
+        if input.g_freecam {
             // Reattaching after the rig flew far away resumes physics at the
             // frozen player, whose chunks may have streamed out (the centre
             // followed the camera). Request the collision slab and freeze
@@ -945,12 +942,15 @@ impl Game {
                         let mut tick_input = *mi;
                         tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
                         tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
-                        movement::update_player(
+                        let trauma = movement::update_player(
                             &mut self.player,
                             &self.world,
                             &tick_input,
                             step_dt,
                         );
+                        if trauma > 0.0 {
+                            self.camera.fx.add_trauma(trauma);
+                        }
                         // Advance the local walk cycle from horizontal travel so the
                         // third-person body animates. The AUDIO gait (footstep
                         // phase-crossings) is derived inside the director from the
@@ -1202,7 +1202,7 @@ impl Game {
                     // Snapshot the cell first so a remote break names the block that
                     // WAS there (its sound class), not a generic default.
                     let prev = self.world.block_at(x, y, z);
-                    let id = save::parse_block(&mut self.world, &spec);
+                    let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
                     let at = cell_center(x, y, z);
                     events.push(if id == AIR {
@@ -1395,6 +1395,7 @@ impl Game {
         self.world.set_block(x, y, z, AIR);
         let overflow = !self.player.stash.add(&elements);
         mods.on_block_break(&elements, &self.world, overflow);
+        self.camera.fx.add_trauma(0.15);
         self.local_anim.on_action(WireAction::Swing);
         // Tell the server (it validates and relays to everyone else). The
         // apply above is a PREDICTION for responsiveness: the ack rolls it
@@ -1452,7 +1453,7 @@ impl Game {
             // validates and relays, exactly like breaking does with "air".
             // The spent crafted block is refunded if the server says no.
             if let Some(net) = &mut self.net {
-                let spec = save::block_spec(&self.world, id);
+                let spec = save::block_spec(self.world.registry(), id);
                 let req = net.send_edit(x, y, z, spec.into());
                 self.pending_edits.insert(
                     req,
@@ -1512,6 +1513,8 @@ mod tests {
         assert!(!inert.g_hud);
         assert!(!inert.g_shot);
         assert!(!inert.g_minimap);
+        assert!(!inert.g_person);
+        assert!(!inert.g_freecam);
         assert!(!inert.toggle_capture);
         assert!(!inert.do_break);
         assert!(!inert.do_place);

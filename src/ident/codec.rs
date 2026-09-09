@@ -43,27 +43,6 @@ impl Writer {
     pub fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
-    pub fn u16(&mut self, v: u16) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    pub fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    pub fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    pub fn i32(&mut self, v: i32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    pub fn i64(&mut self, v: i64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    pub fn f32(&mut self, v: f32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    pub fn f64(&mut self, v: f64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
 
     /// Raw bytes, no length prefix — caller manages framing.
     pub fn raw(&mut self, b: &[u8]) {
@@ -90,6 +69,27 @@ impl Writer {
         self.f32(p.yaw);
         self.f32(p.pitch);
     }
+}
+
+macro_rules! le_scalars {
+    ($($name:ident : $ty:ty),+ $(,)?) => {
+        impl Writer {
+            $(
+                pub fn $name(&mut self, v: $ty) {
+                    self.0.extend_from_slice(&v.to_le_bytes());
+                }
+            )+
+        }
+        impl Reader<'_> {
+            $(
+                pub fn $name(&mut self) -> Result<$ty, CodecError> {
+                    Ok(<$ty>::from_le_bytes(
+                        self.take(core::mem::size_of::<$ty>())?.try_into().unwrap(),
+                    ))
+                }
+            )+
+        }
+    };
 }
 
 impl Default for Writer {
@@ -140,27 +140,6 @@ impl<'a> Reader<'a> {
     pub fn u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.take(1)?[0])
     }
-    pub fn u16(&mut self) -> Result<u16, CodecError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    pub fn u32(&mut self) -> Result<u32, CodecError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    pub fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    pub fn i32(&mut self) -> Result<i32, CodecError> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    pub fn i64(&mut self) -> Result<i64, CodecError> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    pub fn f32(&mut self) -> Result<f32, CodecError> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    pub fn f64(&mut self) -> Result<f64, CodecError> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
 
     /// Strict UTF8: a `u16`-length-prefixed string that fails on invalid bytes
     /// (save's convention — corrupt text is a corrupt file, not a lossy repair).
@@ -189,6 +168,8 @@ impl<'a> Reader<'a> {
         })
     }
 }
+
+le_scalars!(u16: u16, u32: u32, u64: u64, i32: i32, i64: i64, f32: f32, f64: f64);
 
 #[cfg(test)]
 mod tests {

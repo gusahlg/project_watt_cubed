@@ -417,7 +417,7 @@ impl Islands {
             return None;
         }
         let t = (place - self.on) / (1.0 - self.on);
-        let s = t * t * (3.0 - 2.0 * t);
+        let s = crate::math::smooth(t);
         let core = self.core_floor + (1.0 - self.core_floor) * s;
         let center = self.band_lo + (self.lift.at(wx, wz).0 * self.band_span as f32).round() as i32;
         Some((core, center))
@@ -572,20 +572,16 @@ struct ColMask {
 // Value noise primitives. Uses f64 world coordinates for far-out stability.
 
 fn lattice(seed: u64, x: i32, y: i32, z: i32) -> f32 {
-    let h = seed
-        ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    let h = crate::hash::splitmix_finish(h);
+    let h = crate::hash::splitmix_finish(crate::hash::mix3(seed, x, y, z));
     (h >> 40) as f32 * (1.0 / (1u64 << 24) as f32)
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+    crate::math::lerp(a, b, t)
 }
 
 fn fade(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
+    crate::math::smooth(t)
 }
 
 fn reduce(w: i32, freq: f64) -> (i64, f32) {
@@ -730,11 +726,12 @@ fn octave2_sup(seed: u64, x0: i32, z0: i32, dx: i32, dz: i32, freq: f64) -> f32 
 }
 
 pub(crate) fn cell_hash(seed: i64, x: i32, y: i32, z: i32) -> u32 {
-    let h = (seed as u64 ^ 0x517C_C1B7_2722_0A95)
-        ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    let h = crate::hash::splitmix_finish(h);
+    let h = crate::hash::splitmix_finish(crate::hash::mix3(
+        seed as u64 ^ 0x517C_C1B7_2722_0A95,
+        x,
+        y,
+        z,
+    ));
     (h >> 32) as u32
 }
 
@@ -894,8 +891,7 @@ const ISLAND_KEEL_H: f32 = 22.0;
 const ISLAND_DETAIL_AMP: f32 = 0.30;
 const ISLAND_BAND_SPAN: i32 = 120;
 
-// Terrain — the game's generator. `SineHills` kept as an alias so existing call
-// sites need no change.
+// Terrain — the game's generator.
 
 /// Natural terrain — oceans, coasts, mountains, plains, rivers, and biomes —
 /// expressed as data over the noise vocabulary, plus the flying-island and cave
@@ -941,9 +937,6 @@ pub struct Terrain {
     /// exists. No decoration overlay, no named blocks, no special cases.
     mat: placement::Resolved,
 }
-
-/// Kept for compatibility with existing call sites.
-pub type SineHills = Terrain;
 
 impl Terrain {
     /// Build the generator for a seed. `base` sets sea level.
@@ -1059,7 +1052,7 @@ impl Terrain {
         let tmask = self.terraces.at(wx, wz).0;
         if base > RIVER_INLAND && tmask > TERRACE_ON {
             let t = (tmask - TERRACE_ON) / (1.0 - TERRACE_ON);
-            let s = t * t * (3.0 - 2.0 * t);
+            let s = crate::math::smooth(t);
             let stepped = (h / TERRACE_STEP).round() * TERRACE_STEP;
             h += (stepped - h) * s;
         }
@@ -1070,7 +1063,7 @@ impl Terrain {
         let d = (w - 0.5).abs();
         if base > RIVER_INLAND && d < RIVER_HALF {
             let t = 1.0 - d / RIVER_HALF;
-            let s = t * t * (3.0 - 2.0 * t);
+            let s = crate::math::smooth(t);
             let target = (self.sea_level - RIVER_DEPTH) as f32;
             h += (target.min(h) - h) * s;
         }
@@ -1084,7 +1077,7 @@ impl Terrain {
         let lake = self.lakes.at(wx, wz).0;
         if base > RIVER_INLAND && lake > LAKE_ON {
             let t = (lake - LAKE_ON) / (1.0 - LAKE_ON);
-            let s = t * t * (3.0 - 2.0 * t);
+            let s = crate::math::smooth(t);
             let floor = (self.sea_level + LAKE_RISE - LAKE_BOWL) as f32;
             h += (floor.min(h) - h) * s;
             water_level = self.sea_level + LAKE_RISE;

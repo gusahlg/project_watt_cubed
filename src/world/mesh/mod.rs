@@ -20,13 +20,16 @@
 //!   camera-relative offset, so far terrain never jitters.
 //! - Uniform fast paths: a uniform non-solid chunk is empty; a uniform solid one
 //!   only sweeps its six border slices.
-use voxel_engine::{Ao, Light, MeshData, MeshVertex, Normal};
+use voxel_engine::{Ao, Light, MeshData, MeshVertex};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::light::{Lumel, MAX_LIGHT, PaddedLight};
 use super::neighborhood::{Neighborhood, padded_index};
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::coord::ByPass;
+
+pub(in crate::world) mod face;
+use face::{DIRS, Dir, corner_uv, covered, vertex_ao};
 
 /// A chunk's greedy mesh, split by draw pass: the CPU dual of the resident
 /// `ChunkMeshes`. Either [`MeshData`] may be empty; the caller uploads only
@@ -80,77 +83,6 @@ impl Padded {
         }
     }
 }
-
-/// Opaque neighbour or same block hides a face (two glass blocks share a hidden internal face).
-#[inline]
-fn covered(my: BlockId, nbr: BlockId, tables: &HotTables) -> bool {
-    tables.opaque(nbr) || nbr == my
-}
-
-/// One face direction of the greedy sweep.
-struct Dir {
-    /// +1 / -1 step along the normal axis to the cell a face borders.
-    step: i32,
-    /// World axis indices (0=X,1=Y,2=Z) of the normal and the slice U/V axes.
-    n_axis: usize,
-    u_axis: usize,
-    v_axis: usize,
-    /// Quad corners as (normal, u, v) components (0/1); u/v scaled by the merged
-    /// rectangle's extents. CCW seen from outside, matching engine backface cull.
-    corners: [[u8; 3]; 4],
-    normal: Normal,
-}
-
-const DIRS: [Dir; 6] = [
-    Dir {
-        step: 1,
-        n_axis: 0,
-        u_axis: 2,
-        v_axis: 1,
-        corners: [[1, 0, 0], [1, 0, 1], [1, 1, 1], [1, 1, 0]],
-        normal: Normal::PosX,
-    },
-    Dir {
-        step: -1,
-        n_axis: 0,
-        u_axis: 2,
-        v_axis: 1,
-        corners: [[0, 1, 0], [0, 1, 1], [0, 0, 1], [0, 0, 0]],
-        normal: Normal::NegX,
-    },
-    Dir {
-        step: 1,
-        n_axis: 1,
-        u_axis: 0,
-        v_axis: 2,
-        corners: [[1, 0, 1], [1, 1, 1], [1, 1, 0], [1, 0, 0]],
-        normal: Normal::PosY,
-    },
-    Dir {
-        step: -1,
-        n_axis: 1,
-        u_axis: 0,
-        v_axis: 2,
-        corners: [[0, 0, 0], [0, 1, 0], [0, 1, 1], [0, 0, 1]],
-        normal: Normal::NegY,
-    },
-    Dir {
-        step: 1,
-        n_axis: 2,
-        u_axis: 0,
-        v_axis: 1,
-        corners: [[1, 1, 0], [1, 1, 1], [1, 0, 1], [1, 0, 0]],
-        normal: Normal::PosZ,
-    },
-    Dir {
-        step: -1,
-        n_axis: 2,
-        u_axis: 0,
-        v_axis: 1,
-        corners: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-        normal: Normal::NegZ,
-    },
-];
 
 /// One slice of the sweep: 16 x 16 cells.
 const MASK_CAP: usize = CHUNK_SIZE * CHUNK_SIZE;
@@ -290,12 +222,7 @@ fn sweep(
         let edge_n = if dir.step > 0 { CHUNK_SIZE - 1 } else { 0 };
         let (s_n, s_u, s_v) =
             (axis_stride(dir.n_axis), axis_stride(dir.u_axis), axis_stride(dir.v_axis));
-        let corner_uv: [[i32; 2]; 4] = std::array::from_fn(|i| {
-            [
-                if dir.corners[i][1] > 0 { 1 } else { -1 },
-                if dir.corners[i][2] > 0 { 1 } else { -1 },
-            ]
-        });
+        let corner_uv = corner_uv(&dir.corners);
 
         let ns = if edge_only { edge_n..edge_n + 1 } else { 0..CHUNK_SIZE };
         for n in ns {
@@ -447,15 +374,6 @@ fn face_sample(
     pack_sample(FaceSample { id, ao, sky, block })
 }
 
-/// Per-vertex ambient-occlusion level `0..=3` (`3` = unoccluded) from its three
-/// occluders. Two touching sides fully occlude the corner (the classic clamp).
-fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
-    if side1 && side2 {
-        return 0;
-    }
-    3 - (side1 as u8 + side2 as u8 + corner as u8)
-}
-
 /// Append one merged rectangle as a single [`MeshData::quad`], routed to its
 /// block's pass. Four chunk-local corners scaled from the direction's unit-quad
 /// table by the rectangle's extents; each vertex carries the sample's per-corner
@@ -554,10 +472,10 @@ mod tests {
     #[test]
     fn vertex_byte_pin() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::SineHills;
+        use crate::world::generation::Terrain;
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 42);
+        let generator = Terrain::new(&mut registry, 20.0, 42);
         let tables = registry.hot_tables();
         // (coord, unlit, full, gradient) — filled from the first `--nocapture` run.
         // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
@@ -658,11 +576,11 @@ mod tests {
     #[ignore]
     fn padded_capture_throughput() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::SineHills;
+        use crate::world::generation::Terrain;
         use crate::world::light::LightGrid;
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = SineHills::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 20.0, 5);
         // The SURFACE band (world y 48..96): mixed paletted chunks — the case
         // that actually reaches the pool (uniform chunks capture cheap).
         let neigh: Vec<Chunk> = (0..27)

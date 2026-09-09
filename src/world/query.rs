@@ -3,7 +3,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use glam::{IVec3, UVec3};
+use glam::UVec3;
+use voxel_engine::IVec3;
 
 use crate::audio::acoustics::{AcousticWindow, Cell};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
@@ -76,12 +77,11 @@ impl World {
     }
 
     /// Highest solid block's Y in column (x, z) from loaded chunks, or None if empty.
+    #[cfg(test)]
     pub fn top_solid(&self, x: i32, z: i32) -> Option<i32> {
         let s = CHUNK_SIZE as i32;
         let (cx, cz) = (x.div_euclid(s), z.div_euclid(s));
         let (lx, lz) = (x.rem_euclid(s) as usize, z.rem_euclid(s) as usize);
-
-        // Scan loaded chunks top-down (Y unbounded).
         let mut cys: Vec<i32> = self
             .chunks
             .keys()
@@ -89,14 +89,13 @@ impl World {
             .map(|c| c.y)
             .collect();
         cys.sort_unstable_by(|a, b| b.cmp(a));
-
         for cy in cys {
             let loaded = &self.chunks[&Coord::new(cx, cy, cz)];
             if let Some(id) = loaded.chunk.uniform() {
                 if self.registry.is_solid(id) {
                     return Some(cy * s + s - 1);
                 }
-                continue; // uniform air
+                continue;
             }
             for ly in (0..s).rev() {
                 let id = loaded.chunk.get_local(lx, ly as usize, lz);

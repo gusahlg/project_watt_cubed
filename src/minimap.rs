@@ -15,7 +15,7 @@ use crate::world::World;
 
 /// How the map is oriented relative to the world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Orientation {
+pub enum Rotation {
     /// North (−Z? +Z — the world's fixed axis) always points up; the map never
     /// rotates and the player marker spins instead.
     NorthUp,
@@ -39,7 +39,7 @@ pub struct MinimapConfig {
     pub recenter_after: u16,
     /// Colour painted where a column has no loaded solid block.
     pub void: Color,
-    pub orient: Orientation,
+    pub orient: Rotation,
 }
 
 impl MinimapConfig {
@@ -50,7 +50,7 @@ impl MinimapConfig {
         refresh_every: Duration::from_millis(500),
         recenter_after: 16,
         void: Color::rgb(18, 18, 24),
-        orient: Orientation::NorthUp,
+        orient: Rotation::NorthUp,
     };
 }
 
@@ -76,10 +76,10 @@ impl Minimap {
 
     /// Toggle between north-up (fixed map, spinning marker) and heading-up
     /// (rotating map, marker locked pointing up).
-    pub fn toggle_orientation(&mut self) {
+    pub fn toggle_rotation(&mut self) {
         self.cfg.orient = match self.cfg.orient {
-            Orientation::NorthUp => Orientation::Heading,
-            Orientation::Heading => Orientation::NorthUp,
+            Rotation::NorthUp => Rotation::Heading,
+            Rotation::Heading => Rotation::NorthUp,
         };
     }
 
@@ -316,8 +316,8 @@ impl Minimap {
             cy + map_offset.x * sin + map_offset.y * cos,
         );
         let marker_angle = match self.cfg.orient {
-            Orientation::NorthUp => yaw,
-            Orientation::Heading => -std::f32::consts::FRAC_PI_2,
+            Rotation::NorthUp => yaw,
+            Rotation::Heading => -std::f32::consts::FRAC_PI_2,
         };
         draw_player_marker(f, marker, marker_angle);
     }
@@ -417,10 +417,10 @@ fn shade_texel(rgba: &mut [u8], top_y: &[i32], sz: usize, u: usize, v: usize) {
 
 /// In heading-up mode yaw zero points along world +X (texture-right), so the
 /// map needs an additional quarter-turn to place that direction at screen-up.
-fn map_rotation(orientation: Orientation, yaw: f32) -> f32 {
+fn map_rotation(orientation: Rotation, yaw: f32) -> f32 {
     match orientation {
-        Orientation::NorthUp => 0.0,
-        Orientation::Heading => -yaw - std::f32::consts::FRAC_PI_2,
+        Rotation::NorthUp => 0.0,
+        Rotation::Heading => -yaw - std::f32::consts::FRAC_PI_2,
     }
 }
 
@@ -474,11 +474,11 @@ mod tests {
     #[test]
     fn heading_up_rotates_world_forward_to_screen_up() {
         for yaw in [-2.0, 0.0, 1.25] {
-            let rotation = map_rotation(Orientation::Heading, yaw);
+            let rotation = map_rotation(Rotation::Heading, yaw);
             let screen_angle = yaw + rotation;
             assert!((screen_angle + std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         }
-        assert_eq!(map_rotation(Orientation::NorthUp, 2.0), 0.0);
+        assert_eq!(map_rotation(Rotation::NorthUp, 2.0), 0.0);
     }
 
     #[test]

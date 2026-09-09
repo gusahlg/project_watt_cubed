@@ -273,7 +273,7 @@ pub fn from_doc(
     let block_ids: Vec<_> = doc
         .specs
         .iter()
-        .map(|spec| parse_block(&mut world, spec))
+        .map(|spec| parse_block(world.registry_mut(), spec))
         .collect();
     for edit in &doc.edits {
         // Index valid: decode drops out-of-range edits.

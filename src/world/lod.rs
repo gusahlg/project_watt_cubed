@@ -1,5 +1,5 @@
 //! Detail-level geometry: everything a level's cell size implies derives from
-//! `k`, the engine's signed [`Detail`]. One cell is `2^k` metres; a chunk tile
+//! `k`, the engine's signed [`Detail`]. One cell is `2^k` metres; a chunk section
 //! is `16·2^k`; a section is `32·2^k`.
 use crate::ident::Detail;
 

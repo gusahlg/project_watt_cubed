@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use glam::{DVec3, IVec3};
+use voxel_engine::{DVec3, IVec3};
 
 use crate::block::registry::BlockId;
 use crate::console::Console;
@@ -513,7 +513,7 @@ mod tests {
     use crate::audio::SoundSystem;
     use crate::console::Console;
     use crate::world::World;
-    use glam::DVec3;
+    use voxel_engine::DVec3;
 
     fn pose(pos: DVec3) -> PlayerPose {
         PlayerPose {

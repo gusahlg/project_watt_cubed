@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 
 use acoustics::{AcousticWindow, Coords, Dsp, SmoothedCoords, audibility, respond, trace};
 use backend::kira::KiraBackend;
@@ -1042,7 +1042,8 @@ mod seam_tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use glam::{DVec3, IVec3, UVec3};
+    use glam::UVec3;
+    use voxel_engine::{DVec3, IVec3};
 
     use super::acoustics::{
         AcousticWindow, Cell, Dsp, Listener, Medium, Response, SmoothedCoords, respond,

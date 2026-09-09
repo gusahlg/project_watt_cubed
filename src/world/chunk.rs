@@ -411,14 +411,14 @@ fn gc_palette(palette: &mut Box<[BlockState]>, cells: &mut Box<[u8]>) -> bool {
 mod tests {
     use super::*;
     use crate::block::registry::{AIR, BlockRegistry};
-    use crate::world::generation::SineHills;
+    use crate::world::generation::Terrain;
 
     /// The generator plus the registry-resolved ids its terrain is made of.
-    fn hills(seed: i64) -> (SineHills, BlockId, BlockId) {
+    fn hills(seed: i64) -> (Terrain, BlockId, BlockId) {
         let mut registry = BlockRegistry::with_builtins();
         let stone = registry.id_by_name("Stone").unwrap();
         let dirt = registry.id_by_name("Soil").unwrap();
-        (SineHills::new(&mut registry, 20.0, seed), stone, dirt)
+        (Terrain::new(&mut registry, 20.0, seed), stone, dirt)
     }
 
     #[test]
@@ -626,13 +626,7 @@ mod tests {
 
         // splitmix64: deterministic PRNG, no rand dep.
         let mut state = 0xC0FFEEu64;
-        let mut next = move || {
-            state = state.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        };
+        let mut next = move || crate::hash::splitmix_next(&mut state);
 
         // 400 edits: enough to cross uniform->paletted, force a GC (bounded
         // id range keeps the palette saturating), and revisit indices so

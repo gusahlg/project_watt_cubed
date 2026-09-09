@@ -19,12 +19,14 @@ impl World {
     }
 
     /// Current vertical streaming distance in chunk layers above and below the eye.
+    #[cfg(test)]
     pub fn vertical_radius(&self) -> i32 {
         self.view.vertical
     }
 
     /// Compatibility setter for callers with a single render-distance value.
     /// The vertical distance retains its historical half-horizontal derivation.
+    #[cfg(test)]
     pub fn set_view_radius(&mut self, radius: i32) {
         let horizontal = radius.clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end());
         let view = super::ViewVolume::view(horizontal);
@@ -256,15 +258,9 @@ impl World {
         // coord gets generated or meshed twice, never wrongly.
         self.generating.clear();
         self.upload_queue.clear();
-        // Sections belong to the world being left.
-        for (_, state) in self.sections.drain() {
-            state.free(eng);
-        }
-        self.meshing_sections = 0;
-        self.section_upload_queue.clear();
-        self.pending_sections.take();
-        self.dirty_sections.clear();
-        self.section_visible.clear();
+        // Sections belong to the world being left: epoch bump + far-job purge
+        // so in-flight results cannot land after we come back.
+        self.clear_section_lane(eng, false);
         self.center = None;
         // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).

@@ -368,40 +368,32 @@ impl Mods {
         }
     }
 
-    /// Run every enabled mod's per-frame logic.
-    pub fn update(&mut self, ctx: &mut ModContext) {
+    fn each_enabled(&mut self, mut f: impl FnMut(&mut dyn Mod)) {
         for entry in &mut self.entries {
             if entry.enabled {
-                entry.module.update(ctx);
+                f(&mut *entry.module);
             }
         }
+    }
+
+    /// Run every enabled mod's per-frame logic.
+    pub fn update(&mut self, ctx: &mut ModContext) {
+        self.each_enabled(|m| m.update(ctx));
     }
 
     /// Fan a block-break event out to every enabled mod.
     pub fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
-        for entry in &mut self.entries {
-            if entry.enabled {
-                entry.module.on_block_break(elements, world, overflow);
-            }
-        }
+        self.each_enabled(|m| m.on_block_break(elements, world, overflow));
     }
 
     /// Fan a rejected-break rollback out to every enabled mod.
     pub fn on_break_rejected(&mut self, elements: &[ElementId]) {
-        for entry in &mut self.entries {
-            if entry.enabled {
-                entry.module.on_break_rejected(elements);
-            }
-        }
+        self.each_enabled(|m| m.on_break_rejected(elements));
     }
 
     /// Fan a rejected-placement refund out to every enabled mod.
     pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
-        for entry in &mut self.entries {
-            if entry.enabled {
-                entry.module.on_place_rejected(id, world);
-            }
-        }
+        self.each_enabled(|m| m.on_place_rejected(id, world));
     }
 
     /// Push every enabled mod's HUD contribution into `out`, in install order

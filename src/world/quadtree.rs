@@ -650,7 +650,7 @@ mod tests {
 
     /// Budget pinned to the distance ladder.
     fn ladder(cfg: &PyramidCfg) -> SseBudget {
-        SseBudget::ladder(1.0, cfg.unit, cfg.finest.0)
+        SseBudget::ladder(cfg.unit, cfg.finest.0)
     }
     /// Worst-case relief per cell (2^detail fallback).
     fn worst(c: SectionPos) -> CellSummary {

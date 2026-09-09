@@ -339,12 +339,24 @@ messages! {
     }
 }
 
-/// Refuses to emit an over-cap frame so both ends share one hard size bound.
-pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+fn frame_header(payload: &[u8]) -> io::Result<[u8; 4]> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
     }
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
+    Ok((payload.len() as u32).to_be_bytes())
+}
+
+fn frame_len(header: [u8; 4]) -> io::Result<usize> {
+    let len = u32::from_be_bytes(header) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
+    }
+    Ok(len)
+}
+
+/// Refuses to emit an over-cap frame so both ends share one hard size bound.
+pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+    w.write_all(&frame_header(payload)?)?;
     w.write_all(payload)
 }
 
@@ -354,11 +366,7 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
 pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
-    }
-    buf.resize(len, 0);
+    buf.resize(frame_len(len_bytes)?, 0);
     r.read_exact(buf)
 }
 
@@ -366,10 +374,7 @@ pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
 /// and no `finish` — quinn transmits on its own, and finishing would close
 /// the multiplexed stream.
 pub async fn write_frame_async(s: &mut SendStream, payload: &[u8]) -> io::Result<()> {
-    if payload.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
-    }
-    s.write_all(&(payload.len() as u32).to_be_bytes()).await.map_err(io::Error::other)?;
+    s.write_all(&frame_header(payload)?).await.map_err(io::Error::other)?;
     s.write_all(payload).await.map_err(io::Error::other)
 }
 
@@ -377,11 +382,7 @@ pub async fn write_frame_async(s: &mut SendStream, payload: &[u8]) -> io::Result
 pub async fn read_frame_async(r: &mut RecvStream, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes).await.map_err(io::Error::other)?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
-    }
-    buf.resize(len, 0);
+    buf.resize(frame_len(len_bytes)?, 0);
     r.read_exact(buf).await.map_err(io::Error::other)
 }
 

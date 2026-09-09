@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use glam::DVec3;
+use voxel_engine::DVec3;
 use kira::sound::static_sound::StaticSoundData;
 
 use super::{Backend, BackendVoice, ClipId, ClipStore, StoredClip};
