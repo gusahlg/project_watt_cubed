@@ -691,6 +691,170 @@ mod tests {
         );
     }
 
+    /// Vertex-byte histogram of every chunk mesh in the RD 8 / V 4 and
+    /// RD 12 / V 6 boxes around spawn, seed 42 — input for the engine's
+    /// staging-ring sizing. Ignored: a measurement, not a correctness gate.
+    /// Run with
+    /// `cargo test --release mesh_bytes_histogram -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn mesh_bytes_histogram() {
+        use super::super::chunk::CHUNK_SIZE;
+        use super::super::light::LightGrid;
+        use super::super::pipeline::Job;
+        use super::super::{LightLane, StreamLane, World};
+        use crate::coord::{ChunkBox, ChunkCoord};
+        use crate::render_config::RenderConfig;
+        use std::mem::size_of;
+        use voxel_engine::Pass;
+
+        const VERT_BYTES: usize = 8;
+        assert_eq!(size_of::<MeshVertex>(), VERT_BYTES);
+
+        fn pct(sorted: &[usize], p: usize) -> usize {
+            if sorted.is_empty() {
+                return 0;
+            }
+            let i = (sorted.len() - 1) * p / 100;
+            sorted[i]
+        }
+
+        fn report(rd: i32, vert: i32) {
+            let mut world = World::with_config(
+                42,
+                RenderConfig {
+                    lod2: false,
+                    occlusion: false,
+                    ..RenderConfig::default()
+                },
+            );
+            world.set_view_distances(rd, vert);
+            world.refresh_tables();
+            let cy = world.surface_y(0, 0).div_euclid(CHUNK_SIZE as i32);
+            let center = ChunkCoord::new(0, cy, 0);
+            world.ensure_region_data(center);
+
+            // Drain the light worklist with the same propagate + settle_light
+            // the streaming workers run, so mesh snapshots see settled shells.
+            let mut settles = 0u32;
+            loop {
+                let Some(coord) = LightLane::seed_set(&mut world)
+                    .and_then(|s| s.iter().copied().next())
+                else {
+                    break;
+                };
+                LightLane::seed_set(&mut world)
+                    .expect("worklist")
+                    .remove(&coord);
+                match LightLane::submit(&mut world, coord) {
+                    Some(Job::Light { snapshot, coord: c, .. }) => {
+                        let mut grid = LightGrid::dark();
+                        super::super::light::propagate(
+                            &snapshot.chunk,
+                            &snapshot.shell,
+                            &snapshot.ceiling,
+                            snapshot.world_y0,
+                            &snapshot.tables,
+                            &mut grid,
+                        );
+                        world.settle_light(c, grid);
+                        settles += 1;
+                    }
+                    _ => {}
+                }
+                assert!(
+                    settles < 1_000_000,
+                    "light worklist did not drain (RD {rd} V {vert})"
+                );
+            }
+
+            let mesh_box = ChunkBox::new(center, rd, vert);
+            let mut bytes_ne = Vec::new();
+            let mut quads_ne = Vec::new();
+            let mut empty = 0usize;
+            let mut pass_tot = [0usize; Pass::COUNT];
+            let mut total = 0usize;
+            let mut scratch = new_chunk_mesh_data();
+            for coord in mesh_box.coords() {
+                let (_, snap) = world.snapshot(coord, false);
+                match &snap.light {
+                    Some(light) => {
+                        build_chunk_mesh(
+                            &snap.padded,
+                            snap.uniform,
+                            &snap.tables,
+                            light,
+                            &mut scratch,
+                        );
+                    }
+                    None => {
+                        build_chunk_mesh_unlit(
+                            &snap.padded,
+                            snap.uniform,
+                            &snap.tables,
+                            &mut scratch,
+                        );
+                    }
+                }
+                let mut chunk_bytes = 0usize;
+                let mut chunk_quads = 0usize;
+                for p in Pass::ALL {
+                    let n = scratch[p].vertices().len();
+                    let b = n * VERT_BYTES;
+                    pass_tot[p as usize] += b;
+                    chunk_bytes += b;
+                    chunk_quads += n / 4;
+                }
+                total += chunk_bytes;
+                if chunk_bytes == 0 {
+                    empty += 1;
+                } else {
+                    bytes_ne.push(chunk_bytes);
+                    quads_ne.push(chunk_quads);
+                }
+            }
+            let chunks = mesh_box.coords().count();
+            bytes_ne.sort_unstable();
+            quads_ne.sort_unstable();
+            let mean = if bytes_ne.is_empty() {
+                0.0
+            } else {
+                bytes_ne.iter().sum::<usize>() as f64 / bytes_ne.len() as f64
+            };
+            println!(
+                "mesh_bytes_histogram seed=42 RD={rd} V={vert} spawn=({} {} {})",
+                center.x, center.y, center.z
+            );
+            println!(
+                "  chunks={chunks} empty={empty} non-empty={} light_settles={settles}",
+                bytes_ne.len()
+            );
+            println!(
+                "  vertex bytes/chunk (non-empty): min={} median={} mean={:.1} p95={} max={}",
+                bytes_ne.first().copied().unwrap_or(0),
+                pct(&bytes_ne, 50),
+                mean,
+                pct(&bytes_ne, 95),
+                bytes_ne.last().copied().unwrap_or(0)
+            );
+            println!(
+                "  quads/chunk (non-empty): median={} p95={}",
+                pct(&quads_ne, 50),
+                pct(&quads_ne, 95)
+            );
+            println!("  total vertex bytes={total}");
+            println!(
+                "  pass totals: opaque={} cutout={} blend={}",
+                pass_tot[Pass::Opaque as usize],
+                pass_tot[Pass::Cutout as usize],
+                pass_tot[Pass::Blend as usize]
+            );
+        }
+
+        report(8, 4);
+        report(12, 6);
+    }
+
     /// The unlit path must be byte-identical to meshing against a full-bright
     /// shell — it is the same computation minus the reads. Checked with AO on
     /// AND off (off additionally takes the constant-sample early return).
