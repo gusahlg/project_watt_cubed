@@ -441,6 +441,16 @@ impl World {
         let prev_center = self.center;
         let full_pass = Some(center_chunk) != self.center;
         self.center = Some(center_chunk);
+        // Re-bucket worklists around the live centre before any lane (or pump
+        // insert) runs. O(n) once per boundary cross; a no-op when the rings
+        // and centre already match.
+        if full_pass {
+            let rings = self.view.worklist_rings();
+            self.mesh_worklist.resize(rings);
+            self.mesh_worklist.recenter(center_chunk);
+            self.light_worklist.resize(rings);
+            self.light_worklist.recenter(center_chunk);
+        }
         // Publish the live view to the worker pool: queued jobs re-key toward
         // the player's CURRENT position on every view change, and entries left
         // behind by fast movement — far sections included — are descheduled

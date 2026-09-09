@@ -1646,72 +1646,102 @@ mod tests {
         );
     }
 
-    /// Mesh-lane admission at a 20k-seed worklist (world-entry shape).
+    /// Worklist-lane admission at world-entry sizes (mesh ~20k, light ~47k).
     /// Ignored timing benchmark. Run with
     /// `cargo test --release admit_mesh_lane_20k_select -- --ignored --nocapture`.
     /// 2026-09-08 before O(n) select: 2299.9 µs/pass
     /// 2026-09-08 after O(n) select: 1421.9 µs/pass (1.6×; ready() scan dominates)
+    /// 2026-09-09 ring buckets (release, 200 passes):
+    ///   mesh  20k slots=40:  96.93 µs/pass   slots=0: 0.27 µs/pass
+    ///   mesh  47k slots=40: 111.41 µs/pass   slots=0: 0.25 µs/pass
+    ///   light 20k slots=40:  41.02 µs/pass   slots=0: 0.10 µs/pass
+    ///   light 47k slots=40:  50.52 µs/pass   slots=0: 0.15 µs/pass
     #[test]
     #[ignore]
     fn admit_mesh_lane_20k_select() {
-        use super::super::{Loaded, MeshLane, MeshState, StreamLane, World, admit};
+        use super::super::{LightLane, Loaded, MeshLane, MeshState, World, admit};
         use crate::coord::ChunkCoord;
         use crate::render_config::RenderConfig;
         use crate::world::chunk::{Chunk, ChunkData};
 
-        const N: usize = 20_000;
-        const PASSES: u32 = 100;
+        const PASSES: u32 = 200;
 
-        let mut world = World::with_config_lazy(1, RenderConfig::default());
-        world.transition_lighting(false);
-        world.set_view_distances(20, 10);
-        let center = ChunkCoord::new(0, 0, 0);
-        world.center = Some(center);
-
-        let stone = world.registry.id_by_name("Stone").unwrap();
-        // Halo so every seeded coord has 6 face neighbours; interior is in-box.
-        for x in -19..=19 {
-            for z in -19..=19 {
-                for y in -9..=9 {
-                    let coord = ChunkCoord::new(x, y, z);
-                    world.chunks.insert(
-                        coord,
-                        Loaded {
-                            chunk: Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(stone))),
-                            state: MeshState::needs_mesh(),
-                            rev: 0,
-                            connectivity: None,
-                            visible: true,
-                            light: None,
-                            has_blocklight: false,
-                            light_gen: 0,
-                        },
-                    );
-                }
-            }
-        }
-
-        let mut seeds = Vec::with_capacity(N);
-        'fill: for x in -18..=18 {
-            for z in -18..=18 {
-                for y in -8..=8 {
-                    let coord = ChunkCoord::new(x, y, z);
-                    debug_assert!(<MeshLane as StreamLane>::ready(&world, coord));
-                    seeds.push(coord);
-                    if seeds.len() == N {
-                        break 'fill;
+        fn populate(world: &mut World, rh: i32, rv: i32, needs_mesh: bool) {
+            let stone = world.registry.id_by_name("Stone").unwrap();
+            let chunk = Arc::new(Chunk::from_data(0, 0, 0, ChunkData::Uniform(stone)));
+            for x in -rh..=rh {
+                for z in -rh..=rh {
+                    for y in -rv..=rv {
+                        let coord = ChunkCoord::new(x, y, z);
+                        world.chunks.insert(
+                            coord,
+                            Loaded {
+                                chunk: Arc::clone(&chunk),
+                                state: if needs_mesh {
+                                    MeshState::needs_mesh()
+                                } else {
+                                    MeshState::Air
+                                },
+                                rev: 0,
+                                connectivity: None,
+                                visible: true,
+                                light: None,
+                                has_blocklight: false,
+                                light_gen: 0,
+                            },
+                        );
                     }
                 }
             }
         }
-        assert_eq!(seeds.len(), N, "need {N} in-box ready seeds");
-        world.workers = Some(Workers::spawn(2));
 
-        let start = Instant::now();
-        for _ in 0..PASSES {
+        fn take_seeds(n: usize, rh: i32, rv: i32) -> Vec<Coord> {
+            let mut seeds = Vec::with_capacity(n);
+            'fill: for x in -rh..=rh {
+                for z in -rh..=rh {
+                    for y in -rv..=rv {
+                        seeds.push(ChunkCoord::new(x, y, z));
+                        if seeds.len() == n {
+                            break 'fill;
+                        }
+                    }
+                }
+            }
+            assert_eq!(seeds.len(), n, "need {n} seeds in ±{rh}/±{rv}");
+            seeds
+        }
+
+        fn dummy(terrain: &Generator, col: i32) -> Job {
+            Job::GenerateColumn {
+                col: (col, 0),
+                cy: 0..=0,
+                generator: terrain.clone(),
+                edits: Vec::new(),
+            }
+        }
+
+        fn ensure_slots(workers: &Workers, free: usize, terrain: &Generator, col: &mut i32) {
+            let (near, _) = workers.queue_depths();
+            if free == 0 {
+                workers.set_pacing(workers.active_workers(), near.max(1));
+                while workers.near_slots_free() > 0 {
+                    *col += 1;
+                    if !workers.submit(dummy(terrain, *col)) {
+                        break;
+                    }
+                }
+            } else {
+                workers.set_pacing(
+                    workers.active_workers(),
+                    near.saturating_add(free).max(1),
+                );
+            }
+        }
+
+        fn restore_mesh(world: &mut World, seeds: &[Coord]) {
             world.mesh_worklist.clear();
             world.mesh_worklist.extend(seeds.iter().copied());
-            for &coord in &seeds {
+            for &coord in seeds {
                 if let Some(loaded) = world.chunks.get_mut(&coord) {
                     if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
                         *building = false;
@@ -1719,19 +1749,145 @@ mod tests {
                 }
             }
             world.pending_fresh.set();
+        }
+
+        fn restore_light(world: &mut World, seeds: &[Coord]) {
+            world.light_worklist.clear();
+            world.light_worklist.extend(seeds.iter().copied());
+            world.light_inflight.clear();
+            world.light_pending.set();
+        }
+
+        fn time_mesh(
+            world: &mut World,
+            center: Coord,
+            seeds: &[Coord],
+            free: usize,
+            terrain: &Generator,
+            col: &mut i32,
+        ) -> f64 {
+            world.workers = Some(Workers::spawn(10));
+            restore_mesh(world, seeds);
+            ensure_slots(world.workers.as_ref().unwrap(), free, terrain, col);
             admit::<MeshLane>(
-                &mut world,
+                world,
                 center,
                 voxel_engine::producer::Budget::Millis(2.0),
             );
+            let mut total = Duration::ZERO;
+            for _ in 0..PASSES {
+                restore_mesh(world, seeds);
+                ensure_slots(world.workers.as_ref().unwrap(), free, terrain, col);
+                let t = Instant::now();
+                admit::<MeshLane>(
+                    world,
+                    center,
+                    voxel_engine::producer::Budget::Millis(2.0),
+                );
+                total += t.elapsed();
+            }
+            total.as_secs_f64() * 1_000_000.0 / f64::from(PASSES)
         }
-        let dt = start.elapsed();
-        let us = dt.as_secs_f64() * 1_000_000.0 / f64::from(PASSES);
-        println!(
-            "admit::<MeshLane> {N} seeds × {PASSES} passes: {:.1} µs/pass ({:.3}s total)",
-            us,
-            dt.as_secs_f64()
+
+        fn time_light(
+            world: &mut World,
+            center: Coord,
+            seeds: &[Coord],
+            free: usize,
+            terrain: &Generator,
+            col: &mut i32,
+        ) -> f64 {
+            world.workers = Some(Workers::spawn(10));
+            restore_light(world, seeds);
+            ensure_slots(world.workers.as_ref().unwrap(), free, terrain, col);
+            admit::<LightLane>(
+                world,
+                center,
+                voxel_engine::producer::Budget::Millis(1.0),
+            );
+            let mut total = Duration::ZERO;
+            for _ in 0..PASSES {
+                restore_light(world, seeds);
+                ensure_slots(world.workers.as_ref().unwrap(), free, terrain, col);
+                let t = Instant::now();
+                admit::<LightLane>(
+                    world,
+                    center,
+                    voxel_engine::producer::Budget::Millis(1.0),
+                );
+                total += t.elapsed();
+            }
+            total.as_secs_f64() * 1_000_000.0 / f64::from(PASSES)
+        }
+
+        let terrain = generator(1);
+        let center = ChunkCoord::new(0, 0, 0);
+
+        // Mesh: lighting off so ready() is data-only. Halo around the mesh box
+        // so every in-box seed has 6 face neighbours.
+        let mut mesh_world = World::with_config_lazy(1, RenderConfig::default());
+        mesh_world.transition_lighting(false);
+        mesh_world.set_view_distances(20, 10);
+        mesh_world.center = Some(center);
+        populate(&mut mesh_world, 21, 11, true);
+        let mesh_20k = take_seeds(20_000, 18, 8);
+        // In-box ready first (mesh box ~35k), then far blocked seeds so the
+        // worklist is 47k but `want` still fills from inner rings.
+        let mut mesh_47k = take_seeds(35_000, 20, 10);
+        mesh_47k.extend(
+            take_seeds(60_000, 24, 12)
+                .into_iter()
+                .filter(|c| c.x.abs() > 20 || c.z.abs() > 20 || c.y.abs() > 10),
         );
+        mesh_47k.truncate(47_000);
+        assert_eq!(mesh_47k.len(), 47_000);
+
+        // Light: lighting on, ready() is always true; 47k loaded chunks.
+        let mut light_world = World::with_config_lazy(1, RenderConfig::default());
+        light_world.set_view_distances(20, 10);
+        light_world.center = Some(center);
+        populate(&mut light_world, 24, 12, false);
+        let light_20k = take_seeds(20_000, 18, 8);
+        let light_47k = take_seeds(47_000, 24, 12);
+
+        let mut col = 50_000i32;
+        let cases: [(&str, f64); 8] = [
+            (
+                "mesh  20k slots=40",
+                time_mesh(&mut mesh_world, center, &mesh_20k, 40, &terrain, &mut col),
+            ),
+            (
+                "mesh  20k slots=0",
+                time_mesh(&mut mesh_world, center, &mesh_20k, 0, &terrain, &mut col),
+            ),
+            (
+                "mesh  47k slots=40",
+                time_mesh(&mut mesh_world, center, &mesh_47k, 40, &terrain, &mut col),
+            ),
+            (
+                "mesh  47k slots=0",
+                time_mesh(&mut mesh_world, center, &mesh_47k, 0, &terrain, &mut col),
+            ),
+            (
+                "light 20k slots=40",
+                time_light(&mut light_world, center, &light_20k, 40, &terrain, &mut col),
+            ),
+            (
+                "light 20k slots=0",
+                time_light(&mut light_world, center, &light_20k, 0, &terrain, &mut col),
+            ),
+            (
+                "light 47k slots=40",
+                time_light(&mut light_world, center, &light_47k, 40, &terrain, &mut col),
+            ),
+            (
+                "light 47k slots=0",
+                time_light(&mut light_world, center, &light_47k, 0, &terrain, &mut col),
+            ),
+        ];
+        for (label, us) in cases {
+            println!("admit {label}: {us:.2} µs/pass");
+        }
     }
 
     #[test]
