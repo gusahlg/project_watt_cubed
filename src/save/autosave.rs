@@ -195,6 +195,7 @@ mod tests {
                 pitch: 0.0,
                 flying: false,
                 noclip: false,
+                stash: Some(vec![]),
             },
             specs: vec![],
             edits: vec![],

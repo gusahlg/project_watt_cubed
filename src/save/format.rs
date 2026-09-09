@@ -2,12 +2,12 @@
 //! `World`/`Player`/`Mods` to and from `SaveDoc`, so this whole module is
 //! testable without constructing a world.
 //!
-//! Layout, version 6 (all integers little-endian):
+//! Layout, version 7 (all integers little-endian):
 //!
 //! ```text
 //! header (fixed 126 bytes, peekable without the body):
 //!   magic        b"WATT"                                       4
-//!   version      u16 = 6                                       2
+//!   version      u16 = 7                                       2
 //!   name         u8 len + 64-byte field (utf8, zero padded)   65
 //!   seed         i64                                           8
 //!   created      u64 unix secs                                 8
@@ -22,6 +22,7 @@
 //!   relief       f32                                           4
 //! player         pos f64 x3, yaw f32, pitch f32,
 //!                flags u8 (bit 0 = fly, bit 1 = noclip)       33
+//!                stash (v7+): u16 len + utf8 "Name=count,..."  variable
 //! spec table     u16 count, then per spec: u16 len + utf8
 //! edits          edit_count records of i32 x, i32 y, i32 z, u16 spec index
 //! mods           u8 count, then per mod: u8 name-len + utf8,
@@ -36,6 +37,10 @@
 //! and the diffusion knobs to their shipped defaults. A v5 diffusion world
 //! cannot exist: InfiniteDiffusion landed with v6.
 //!
+//! Version 6 files (no player stash) still decode — `PlayerState::stash` is
+//! `None`. The bridge then migrates an old Inventory mod-state line into the
+//! core stash.
+//!
 //! The edit count lives only in the header (no body prefix), and each record is
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
@@ -45,7 +50,7 @@ use crate::ident::codec;
 use super::slot::{SaveError, SaveMeta};
 
 pub const MAGIC: &[u8; 4] = b"WATT";
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 
 const NAME_FIELD: usize = 64;
 /// Offset of the name length byte, for in-place renames via [`set_name`].
@@ -63,10 +68,13 @@ fn header_len(version: u16) -> Result<usize, SaveError> {
     match version {
         4 => Ok(HEADER_LEN_V4),
         5 => Ok(HEADER_LEN_V5),
-        6 => Ok(HEADER_LEN),
+        6 | 7 => Ok(HEADER_LEN),
         v => Err(SaveError::BadVersion(v)),
     }
 }
+
+/// Pose (3×f64 + 2×f32) plus the flying/noclip flags byte.
+const PLAYER_POSE_LEN: usize = 32 + 1;
 
 const EDIT_BYTES: usize = 14;
 
@@ -104,6 +112,10 @@ pub struct PlayerState {
     pub pitch: f32,
     pub flying: bool,
     pub noclip: bool,
+    /// Held elements as `(name, count)` in first-seen order.
+    /// `None` means the field was absent (pre-v7); the bridge then migrates
+    /// from the Inventory mod-state line.
+    pub stash: Option<Vec<(String, u32)>>,
 }
 
 /// On-disk worldgen identity. Kept as raw integers so this codec stays free
@@ -127,6 +139,36 @@ impl Default for WorldgenStamp {
             relief: 1.0,
         }
     }
+}
+
+fn encode_stash_payload(items: &[(String, u32)]) -> String {
+    let mut s = String::new();
+    for (i, (name, count)) in items.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(name);
+        s.push('=');
+        s.push_str(&count.to_string());
+    }
+    s
+}
+
+fn parse_stash_payload(s: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for entry in s.split(',').filter(|e| !e.is_empty()) {
+        let Some((name, count)) = entry.split_once('=') else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u32>() else {
+            continue;
+        };
+        if name.is_empty() || count == 0 {
+            continue;
+        }
+        out.push((name.to_string(), count));
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +238,14 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     });
     out.extend_from_slice(&pw.into_inner());
     out.push(doc.player.flying as u8 | (doc.player.noclip as u8) << 1);
+    debug_assert_eq!(out.len(), HEADER_LEN + PLAYER_POSE_LEN);
+    let stash = encode_stash_payload(doc.player.stash.as_deref().unwrap_or(&[]));
+    if u16::try_from(stash.len()).is_err() {
+        return Err(SaveError::Corrupt("player stash too long to save"));
+    }
+    let mut sw = codec::Writer::new();
+    sw.str16(&stash);
+    out.extend_from_slice(&sw.into_inner());
 
     out.extend_from_slice(&(doc.specs.len() as u16).to_le_bytes());
     for spec in &doc.specs {
@@ -357,9 +407,21 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
         pitch: pose.pitch,
         flying: false,
         noclip: false,
+        stash: None,
     };
     let flags = r.u8()?;
-    let player = PlayerState { flying: flags & 1 != 0, noclip: flags & 2 != 0, ..player };
+    let stash = if version >= 7 {
+        let len = r.u16()? as usize;
+        Some(parse_stash_payload(&r.string(len)?))
+    } else {
+        None
+    };
+    let player = PlayerState {
+        flying: flags & 1 != 0,
+        noclip: flags & 2 != 0,
+        stash,
+        ..player
+    };
     // Raw float bit patterns are not all valid game states: NaN/Infinity would
     // poison camera/physics on load, and a position outside the border breaks
     // the clamp every continuous writer maintains. Reject rather than repair —
@@ -454,6 +516,7 @@ mod tests {
                 pitch: -0.5,
                 flying: true,
                 noclip: true,
+                stash: Some(vec![("Stone".into(), 2), ("Iron".into(), 1)]),
             },
             specs: vec!["air".to_string(), "natural:Stone".to_string()],
             edits: vec![
@@ -472,6 +535,17 @@ mod tests {
                 panic!("expected intact, got salvage {recovered}/{expected}")
             }
         }
+    }
+
+    /// Drop the v7 stash blob so a current encode can be spliced into an older
+    /// version whose player record ends at the flags byte.
+    fn strip_stash(bytes: &[u8]) -> Vec<u8> {
+        let start = HEADER_LEN + PLAYER_POSE_LEN;
+        let len = u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(bytes.len() - 2 - len);
+        out.extend_from_slice(&bytes[..start]);
+        out.extend_from_slice(&bytes[start + 2 + len..]);
+        out
     }
 
     #[test]
@@ -572,27 +646,31 @@ mod tests {
         bytes[0] = b'W';
         bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(3))));
-        bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
-        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(7))));
+        bytes[4..6].copy_from_slice(&8u16.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(8))));
     }
 
     #[test]
     fn version_4_files_still_decode_with_the_legacy_worldgen_stamp() {
-        // A v4 file is a current file minus the v5 worldgen stamp and the v6
-        // kind/knobs: splice both out and patch the version. It must decode
-        // INTACT with worldgen_version defaulting to 1 and kind classic.
+        // A v4 file is a current file minus the v5 worldgen stamp, the v6
+        // kind/knobs, and the v7 player stash: splice those out and patch the
+        // version. It must decode INTACT with worldgen_version defaulting to 1
+        // and kind classic.
         let doc = sample();
         let current = encode(&doc).unwrap();
-        let mut v4 = Vec::with_capacity(current.len() - (HEADER_LEN - HEADER_LEN_V4));
-        v4.extend_from_slice(&current[..HEADER_LEN_V4]);
-        v4.extend_from_slice(&current[HEADER_LEN..]);
+        let body = strip_stash(&current);
+        let mut v4 = Vec::with_capacity(body.len() - (HEADER_LEN - HEADER_LEN_V4));
+        v4.extend_from_slice(&body[..HEADER_LEN_V4]);
+        v4.extend_from_slice(&body[HEADER_LEN..]);
         v4[4..6].copy_from_slice(&4u16.to_le_bytes());
 
         let got = expect_intact(decode(&v4).unwrap());
         assert_eq!(got.worldgen_version, 1, "v4 files predate the stamp");
         assert_eq!(got.worldgen, WorldgenStamp::default());
         assert_eq!(got.meta, doc.meta);
-        assert_eq!(got.player, doc.player);
+        let mut player = doc.player.clone();
+        player.stash = None;
+        assert_eq!(got.player, player);
         assert_eq!(got.specs, doc.specs);
         assert_eq!(got.edits, doc.edits);
         assert_eq!(got.mods, doc.mods);
@@ -613,21 +691,41 @@ mod tests {
             phases: 4,
             relief: 2.0,
         };
-        let v6 = encode(&doc).unwrap();
-        let mut v5 = Vec::with_capacity(v6.len() - WORLDGEN_STAMP_LEN);
-        v5.extend_from_slice(&v6[..HEADER_LEN_V5]);
-        v5.extend_from_slice(&v6[HEADER_LEN..]);
+        let v7 = encode(&doc).unwrap();
+        let body = strip_stash(&v7);
+        let mut v5 = Vec::with_capacity(body.len() - WORLDGEN_STAMP_LEN);
+        v5.extend_from_slice(&body[..HEADER_LEN_V5]);
+        v5.extend_from_slice(&body[HEADER_LEN..]);
         v5[4..6].copy_from_slice(&5u16.to_le_bytes());
 
         let got = expect_intact(decode(&v5).unwrap());
         assert_eq!(got.worldgen_version, doc.worldgen_version);
         assert_eq!(got.worldgen, WorldgenStamp::default(), "v5 files predate kind");
         assert_eq!(got.meta, doc.meta);
-        assert_eq!(got.player, doc.player);
+        let mut player = doc.player.clone();
+        player.stash = None;
+        assert_eq!(got.player, player);
         assert_eq!(got.specs, doc.specs);
         assert_eq!(got.edits, doc.edits);
         assert_eq!(got.mods, doc.mods);
         assert_eq!(peek_meta(&v5).unwrap().name, doc.meta.name);
+    }
+
+    #[test]
+    fn version_6_files_still_decode_without_stash() {
+        let doc = sample();
+        let v7 = encode(&doc).unwrap();
+        let mut v6 = strip_stash(&v7);
+        v6[4..6].copy_from_slice(&6u16.to_le_bytes());
+
+        let got = expect_intact(decode(&v6).unwrap());
+        assert_eq!(got.worldgen, doc.worldgen);
+        let mut player = doc.player.clone();
+        player.stash = None;
+        assert_eq!(got.player, player, "v6 files predate the player stash field");
+        assert_eq!(got.specs, doc.specs);
+        assert_eq!(got.edits, doc.edits);
+        assert_eq!(got.mods, doc.mods);
     }
 
     #[test]

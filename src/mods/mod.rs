@@ -15,7 +15,7 @@ pub mod menu_default;
 pub mod start_screen;
 pub mod visuals;
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -114,136 +114,6 @@ pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
     }
 }
 
-/// The element counts the player is carrying — the single source of truth shared
-/// by the inventory mod (which fills and displays it) and the crafting mod (which
-/// spends it). Shared as `Rc<RefCell<ElementStash>>`: the game is single-threaded
-/// and mods run strictly one after another, so `Rc`/`RefCell` is exactly enough —
-/// no locking, and any accidental nested borrow would panic loudly in development.
-pub struct ElementStash {
-    /// Per-element counts in first-seen order, so display rows are stable as
-    /// counts change (matching the old inventory's grouped view).
-    counts: Vec<(ElementId, u32)>,
-    /// Cached sum of `counts`; pickups and crafting read it every frame.
-    total: u32,
-    /// Soft cap on total held elements — the old inventory capacity, upgradeable.
-    capacity: usize,
-    /// Bumped on every content change; caches (like the inventory's display rows)
-    /// rebuild when they see a rev they haven't.
-    rev: u64,
-}
-
-impl ElementStash {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            counts: Vec::new(),
-            total: 0,
-            capacity,
-            rev: 0,
-        }
-    }
-
-    /// Add elements one by one while there is room, exactly like the old
-    /// inventory's per-item add: elements past the capacity are dropped, and the
-    /// return value is `false` if any were. Bumps `rev` when anything landed.
-    pub fn add(&mut self, elements: &[ElementId]) -> bool {
-        let mut all = true;
-        let mut added = false;
-        for &element in elements {
-            if self.total as usize >= self.capacity {
-                all = false;
-                continue;
-            }
-            match self.counts.iter_mut().find(|(e, _)| *e == element) {
-                Some((_, count)) => *count += 1,
-                None => self.counts.push((element, 1)),
-            }
-            self.total += 1;
-            added = true;
-        }
-        if added {
-            self.rev += 1;
-        }
-        all
-    }
-
-    /// How many of one element are held.
-    pub fn count(&self, element: ElementId) -> u32 {
-        self.counts
-            .iter()
-            .find(|(e, _)| *e == element)
-            .map_or(0, |&(_, c)| c)
-    }
-
-    /// Spend elements, all or nothing: `elements` is consumed only if every entry
-    /// is covered (listing an element twice requires two of it). Emptied elements
-    /// drop out of the display order. Bumps `rev` on success.
-    pub fn consume(&mut self, elements: &[ElementId]) -> bool {
-        // Check the full multiplicity first so a failure changes nothing.
-        for &element in elements {
-            let needed = elements.iter().filter(|&&e| e == element).count() as u32;
-            if self.count(element) < needed {
-                return false;
-            }
-        }
-        for &element in elements {
-            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
-                *count -= 1;
-                self.total -= 1;
-            }
-        }
-        self.counts.retain(|&(_, count)| count > 0);
-        self.rev += 1;
-        true
-    }
-
-    /// Take back elements, best-effort: each entry removes one of that element
-    /// if any are held. Unlike [`consume`](Self::consume) this is NOT
-    /// all-or-nothing — it is the rollback path for a server-rejected break,
-    /// where whatever was already spent elsewhere simply can't be revoked.
-    pub fn revoke(&mut self, elements: &[ElementId]) {
-        let mut removed = false;
-        for &element in elements {
-            if let Some((_, count)) = self.counts.iter_mut().find(|(e, _)| *e == element) {
-                if *count > 0 {
-                    *count -= 1;
-                    self.total -= 1;
-                    removed = true;
-                }
-            }
-        }
-        if removed {
-            self.counts.retain(|&(_, count)| count > 0);
-            self.rev += 1;
-        }
-    }
-
-    /// Total elements held, across all kinds.
-    pub fn total(&self) -> u32 {
-        self.total
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// The current content revision (see the field docs).
-    pub fn rev(&self) -> u64 {
-        self.rev
-    }
-
-    /// The held `(element, count)` pairs in stable first-seen order.
-    pub fn iter(&self) -> impl Iterator<Item = (ElementId, u32)> + '_ {
-        self.counts.iter().copied()
-    }
-
-    /// Drop everything (used when loading a save into this stash).
-    pub fn clear(&mut self) {
-        self.counts.clear();
-        self.total = 0;
-        self.rev += 1;
-    }
-}
-
 /// Shared visibility state for the inventory/crafting pair. Crafting replaces
 /// the compact inventory panel while open, so two independently toggleable mods
 /// never draw over one another.
@@ -322,9 +192,9 @@ pub trait Mod {
     /// Called when the mod is switched off.
     fn on_disable(&mut self) {}
 
-    /// Clear per-world state (inventory contents, crafted blocks, open
-    /// panels) when entering a different world. Enable/disable choices are
-    /// NOT touched — those persist across worlds.
+    /// Clear per-world state (crafted blocks, open panels) when entering a
+    /// different world. Enable/disable choices are NOT touched — those persist
+    /// across worlds. The element stash lives on the player, not here.
     fn reset(&mut self) {}
 
     /// Cadence-controlled logic while enabled (the game's `mod_hz`). Runs
@@ -334,14 +204,16 @@ pub trait Mod {
         let _ = ctx;
     }
 
-    /// A block was broken into these elements. The event the inventory mod listens
-    /// to; a crafting or logging mod could too.
-    fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
-        let _ = (elements, world);
+    /// A block was broken into these elements. The core has already deposited
+    /// them into the player stash; this is a notification. `overflow` is true
+    /// when the stash dropped any of them (capacity).
+    fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
+        let _ = (elements, world, overflow);
     }
 
     /// The server rejected a break this client predicted (someone else won the
-    /// cell): revoke the loot [`on_block_break`](Self::on_block_break) awarded.
+    /// cell). The core has already revoked the loot from the stash; this is a
+    /// notification.
     fn on_break_rejected(&mut self, elements: &[ElementId]) {
         let _ = elements;
     }
@@ -357,9 +229,9 @@ pub trait Mod {
     /// under the console. A mod describes *what* to show and never draws, so
     /// panel chrome and layout live in one place ([`crate::ui::render_hud`]).
     /// `world` gives read access to the registry so names resolve at build time
-    /// rather than being cached.
-    fn hud(&self, world: &World, screen: (i32, i32), out: &mut Vec<HudElement>) {
-        let _ = (world, screen, out);
+    /// rather than being cached. `player` is the one path to the core stash.
+    fn hud(&self, world: &World, player: &Player, screen: (i32, i32), out: &mut Vec<HudElement>) {
+        let _ = (world, player, screen, out);
     }
 
     /// Close a modal in-world overlay before the core interprets Escape as
@@ -438,7 +310,7 @@ struct Entry {
 }
 
 /// The set of installed mods and their on/off state. Persists across worlds so the
-/// player's mod choices stick; per-world state (like inventory contents) is saved
+/// player's mod choices stick; per-world state (like crafted blocks) is saved
 /// and restored through each mod's `save_state`/`load_state`.
 pub struct Mods {
     entries: Vec<Entry>,
@@ -457,22 +329,21 @@ impl Mods {
     /// The default install: the menu mod (look/feel of every out-of-game
     /// screen) first, then the start-screen mod (main/load/host/join content),
     /// then the bare-list inventory mod and the crafting mod, all enabled.
-    /// Inventory and crafting share one [`ElementStash`] — inventory fills it
-    /// from broken blocks, crafting spends it. Menus goes first so it wins
-    /// the first-handler dispatch below by default.
+    /// The element stash lives on the player; these two mods share only
+    /// [`ItemUiState`] so their panels don't overlap. Menus goes first so it
+    /// wins the first-handler dispatch below by default.
     pub fn with_defaults() -> Self {
         let mut mods = Self {
             entries: Vec::new(),
         };
-        let stash = Rc::new(RefCell::new(ElementStash::new(inventory::START_CAPACITY)));
         let item_ui = Rc::new(Cell::new(ItemUiState::default()));
         mods.install(Box::new(menu_default::MenuDefaultMod::new()), true);
         mods.install(Box::new(start_screen::StartScreenMod::new()), true);
         mods.install(
-            Box::new(inventory::InventoryMod::new(stash.clone(), item_ui.clone())),
+            Box::new(inventory::InventoryMod::new(item_ui.clone())),
             true,
         );
-        mods.install(Box::new(crafting::CraftingMod::new(stash, item_ui)), true);
+        mods.install(Box::new(crafting::CraftingMod::new(item_ui)), true);
         // Fancy lanes live in mods; disable any of these to get the core look.
         mods.install(Box::new(visuals::AtmosphereMod), true);
         mods.install(Box::new(visuals::PostMod), true);
@@ -509,10 +380,10 @@ impl Mods {
     }
 
     /// Fan a block-break event out to every enabled mod.
-    pub fn on_block_break(&mut self, elements: &[ElementId], world: &World) {
+    pub fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
         for entry in &mut self.entries {
             if entry.enabled {
-                entry.module.on_block_break(elements, world);
+                entry.module.on_block_break(elements, world, overflow);
             }
         }
     }
@@ -538,10 +409,10 @@ impl Mods {
     /// Push every enabled mod's HUD contribution into `out`, in install order
     /// (so a later mod draws over an earlier one). The caller owns `out` and
     /// clears it per frame so capacity is retained.
-    pub fn hud(&self, world: &World, screen: (i32, i32), out: &mut Vec<HudElement>) {
+    pub fn hud(&self, world: &World, player: &Player, screen: (i32, i32), out: &mut Vec<HudElement>) {
         for entry in &self.entries {
             if entry.enabled {
-                entry.module.hud(world, screen, out);
+                entry.module.hud(world, player, screen, out);
             }
         }
     }
@@ -817,7 +688,7 @@ impl Mods {
 
 /// Pull a leading `v<N>;` version prefix off a saved mod blob. No prefix
 /// (or a prefix that isn't a `u16`) is version 0, the pre-versioning format.
-fn split_mod_version(data: &str) -> (u16, &str) {
+pub(crate) fn split_mod_version(data: &str) -> (u16, &str) {
     let Some(rest) = data.strip_prefix('v') else {
         return (0, data);
     };
@@ -834,7 +705,6 @@ fn split_mod_version(data: &str) -> (u16, &str) {
 mod tests {
     use super::*;
     use super::split_mod_version;
-    use crate::block::element::El;
     use crate::menu::Menu;
     use crate::world::diffusion::DiffusionCfg;
     use crate::world::World;
@@ -844,49 +714,6 @@ mod tests {
             .as_deref()
             .map(DiffusionCfg::from_text)
             .unwrap_or_default()
-    }
-
-    #[test]
-    fn stash_add_respects_capacity_per_item() {
-        let mut stash = ElementStash::new(3);
-        assert!(stash.add(&[El::Stone.id(), El::Soil.id()]));
-        // Room for one more: the first lands, the second is dropped.
-        assert!(!stash.add(&[El::Stone.id(), El::Clay.id()]));
-        assert_eq!(stash.total(), 3);
-        assert_eq!(stash.count(El::Stone.id()), 2);
-        assert_eq!(stash.count(El::Clay.id()), 0);
-    }
-
-    #[test]
-    fn stash_consume_is_all_or_nothing() {
-        let mut stash = ElementStash::new(10);
-        stash.add(&[El::Stone.id(), El::Stone.id(), El::Iron.id()]);
-        let rev = stash.rev();
-        assert!(!stash.consume(&[El::Stone.id(), El::Copper.id()]));
-        assert_eq!(stash.rev(), rev, "a failed consume changes nothing");
-        assert_eq!(stash.total(), 3);
-        assert!(stash.consume(&[El::Stone.id(), El::Iron.id()]));
-        assert_eq!(stash.count(El::Stone.id()), 1);
-        assert_eq!(stash.count(El::Iron.id()), 0);
-        assert!(stash.rev() > rev);
-    }
-
-    #[test]
-    fn stash_consume_counts_multiplicity() {
-        let mut stash = ElementStash::new(10);
-        stash.add(&[El::Stone.id()]);
-        // Listing Stone twice needs two Stones; only one is held.
-        assert!(!stash.consume(&[El::Stone.id(), El::Stone.id()]));
-        assert!(stash.consume(&[El::Stone.id()]));
-        assert_eq!(stash.total(), 0);
-    }
-
-    #[test]
-    fn stash_iteration_keeps_first_seen_order() {
-        let mut stash = ElementStash::new(10);
-        stash.add(&[El::Iron.id(), El::Stone.id(), El::Iron.id()]);
-        let order: Vec<_> = stash.iter().collect();
-        assert_eq!(order, vec![(El::Iron.id(), 2), (El::Stone.id(), 1)]);
     }
 
     #[test]
@@ -972,37 +799,37 @@ mod tests {
     fn save_states_key_by_id_and_load_accepts_display_name() {
         let mut world = World::new(1);
         let mut mods = Mods::with_defaults();
-        mods.on_block_break(&[El::Stone.id(), El::Iron.id()], &world);
+        mods.load_state("Crafting", "*IronVein=2", &mut world);
         let saved = mods.save_states(&world);
         assert!(
-            saved.iter().any(|(k, _)| k == "inventory"),
+            saved.iter().any(|(k, _)| k == "crafting"),
             "save keys are stable ids, not display names"
         );
-        assert!(!saved.iter().any(|(k, _)| k == "Inventory"));
+        assert!(!saved.iter().any(|(k, _)| k == "Crafting"));
         let data = saved
             .iter()
-            .find(|(k, _)| k == "inventory")
+            .find(|(k, _)| k == "crafting")
             .map(|(_, d)| d.clone())
-            .expect("inventory persists");
+            .expect("crafting persists");
 
         let mut by_id = Mods::with_defaults();
-        by_id.load_state("inventory", &data, &mut world);
+        by_id.load_state("crafting", &data, &mut world);
         assert_eq!(
             by_id
                 .save_states(&world)
                 .iter()
-                .find(|(k, _)| k == "inventory")
+                .find(|(k, _)| k == "crafting")
                 .map(|(_, d)| d.as_str()),
             Some(data.as_str())
         );
 
         let mut by_name = Mods::with_defaults();
-        by_name.load_state("Inventory", &data, &mut world);
+        by_name.load_state("Crafting", &data, &mut world);
         assert_eq!(
             by_name
                 .save_states(&world)
                 .iter()
-                .find(|(k, _)| k == "inventory")
+                .find(|(k, _)| k == "crafting")
                 .map(|(_, d)| d.as_str()),
             Some(data.as_str())
         );
@@ -1012,15 +839,12 @@ mod tests {
     fn mod_state_round_trips_version_prefix() {
         let mut world = World::new(1);
         let mut mods = Mods::with_defaults();
-        mods.on_block_break(&[El::Stone.id(), El::Iron.id()], &world);
         mods.load_state("Crafting", "*IronVein=2", &mut world);
         let saved = mods.save_states(&world);
-        let inv = saved
-            .iter()
-            .find(|(k, _)| k == "inventory")
-            .map(|(_, d)| d.as_str())
-            .expect("inventory");
-        assert!(inv.starts_with("v1;"), "new writes encode a version prefix: {inv}");
+        assert!(
+            saved.iter().all(|(k, _)| k != "inventory"),
+            "the stash is core state, not an inventory save line"
+        );
         let craft = saved
             .iter()
             .find(|(k, _)| k == "crafting")

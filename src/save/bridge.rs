@@ -3,7 +3,7 @@
 
 use voxel_engine::DVec3;
 
-use crate::mods::Mods;
+use crate::mods::{self, Mods};
 use crate::player::Player;
 use crate::world::diffusion::DiffusionCfg;
 use crate::world::generation::WorldgenKind;
@@ -71,6 +71,9 @@ pub fn to_doc(
             pitch: player.orientation.pitch,
             flying: player.flying(),
             noclip: player.noclip(),
+            stash: Some(player.stash.to_portable(|id| {
+                world.registry().elements().get(id).name.as_ref()
+            })),
         },
         specs,
         edits,
@@ -86,6 +89,24 @@ fn stamp_from_world(world: &World) -> WorldgenStamp {
         stride: cfg.stride,
         phases: cfg.phases,
         relief: cfg.relief,
+    }
+}
+
+fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &World) {
+    let elements = world.registry().elements();
+    match &doc.player.stash {
+        Some(items) => player.stash.load_portable(items, |n| elements.id_by_name(n)),
+        None => {
+            // Pre-v7: the inventory mod owned the counts.
+            if let Some((_, data)) = doc
+                .mods
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("inventory"))
+            {
+                let (_, payload) = mods::split_mod_version(data);
+                player.stash.load_names(payload, |n| elements.id_by_name(n));
+            }
+        }
     }
 }
 
@@ -141,6 +162,8 @@ pub fn from_doc(
             player.cycle_fly();
         }
     }
+
+    restore_stash(&mut player, &doc, &world);
 
     let block_ids: Vec<_> = doc
         .specs

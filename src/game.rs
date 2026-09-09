@@ -1168,7 +1168,10 @@ impl Game {
                         self.world.set_block(x, y, z, pending.prev);
                     }
                     match pending.kind {
-                        PendingKind::Break(elements) => mods.on_break_rejected(&elements),
+                        PendingKind::Break(elements) => {
+                            self.player.stash.revoke(&elements);
+                            mods.on_break_rejected(&elements);
+                        }
                         PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
                     }
                 }
@@ -1311,7 +1314,8 @@ impl Game {
         }
     }
 
-    /// Break the block the player is looking at, handing its elements to the mods.
+    /// Break the block the player is looking at, depositing its elements into
+    /// the core stash before notifying mods.
     fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) = interact::raycast_solid(
             &self.world,
@@ -1331,7 +1335,8 @@ impl Game {
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
-        mods.on_block_break(&elements, &self.world);
+        let overflow = !self.player.stash.add(&elements);
+        mods.on_block_break(&elements, &self.world, overflow);
         self.local_anim.on_action(WireAction::Swing);
         // Tell the server (it validates and relays to everyone else). The
         // apply above is a PREDICTION for responsiveness: the ack rolls it

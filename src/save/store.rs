@@ -193,6 +193,7 @@ mod tests {
                 pitch: 0.0,
                 flying: false,
                 noclip: false,
+                stash: Some(vec![]),
             },
             specs: vec!["air".to_string()],
             edits: (0..edits as i32).map(|i| Edit { x: i, y: 200, z: -i, spec: 0 }).collect(),

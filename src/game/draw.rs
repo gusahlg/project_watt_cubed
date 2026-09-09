@@ -435,7 +435,7 @@ impl Game {
         // or the mod-HUD lane itself is disabled.
         if self.mod_hud && theme.hud.shows_mod_hud() {
             self.hud_scratch.clear();
-            mods.hud(&self.world, screen, &mut self.hud_scratch);
+            mods.hud(&self.world, &self.player, screen, &mut self.hud_scratch);
             ui::render_hud(f, theme, screen, &self.hud_scratch);
         }
         // Minimal keeps the world readable: no closed-console scrollback.

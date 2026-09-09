@@ -97,6 +97,8 @@ pub(crate) fn registry_parse_block(registry: &mut BlockRegistry, spec: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::bridge::from_doc;
+    use super::format::{PlayerState, SaveDoc, WorldgenStamp};
     use crate::block::element::El;
     use crate::mods::Mods;
     use crate::player::Player;
@@ -187,9 +189,9 @@ mod tests {
         player.orientation.pitch = -0.25;
         player.set_flying(true);
 
-        // Give the mods some state to persist (elements land in the inventory).
+        player.stash.add(&[El::Stone.id(), El::Iron.id(), El::Stone.id()]);
         let mut mods = Mods::with_defaults();
-        mods.on_block_break(&[El::Stone.id(), El::Iron.id(), El::Stone.id()], &world);
+        mods.load_state("Crafting", "*Stone=1", &mut world);
         let states_before = mods.save_states(&world);
 
         save(&id, &world, &player, &mods, meta("round trip")).unwrap();
@@ -206,6 +208,9 @@ mod tests {
         assert_eq!(loaded_player.orientation.yaw, 0.5);
         assert_eq!(loaded_player.orientation.pitch, -0.25);
         assert!(loaded_player.flying());
+        assert_eq!(loaded_player.stash.total(), 3);
+        assert_eq!(loaded_player.stash.count(El::Stone.id()), 2);
+        assert_eq!(loaded_player.stash.count(El::Iron.id()), 1);
         assert_eq!(loaded_world.block_at(bx, by, bz), AIR, "broken block stays broken");
         assert_eq!(report.source, Source::Live);
         assert!(report.salvage.is_none());
@@ -214,8 +219,66 @@ mod tests {
             states_before,
             "mod state survives the round trip"
         );
+        assert!(
+            states_before.iter().all(|(k, _)| k != "inventory"),
+            "the stash is core player state, not an inventory save line"
+        );
 
         cleanup(&id);
+    }
+
+    fn bare_doc() -> SaveDoc {
+        SaveDoc {
+            meta: meta("stash"),
+            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            worldgen: WorldgenStamp::default(),
+            player: PlayerState {
+                pos: [0.0, 40.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                flying: false,
+                noclip: false,
+                stash: None,
+            },
+            specs: vec![],
+            edits: vec![],
+            mods: vec![],
+        }
+    }
+
+    #[test]
+    fn old_inventory_mod_line_migrates_into_the_core_stash() {
+        let mut doc = bare_doc();
+        doc.mods
+            .push(("inventory".into(), "v1;Stone,Stone,Soil".into()));
+        let mut mods = Mods::with_defaults();
+        let (_, player, _) = from_doc(doc, &mut mods, make_world);
+        assert_eq!(player.stash.total(), 3);
+        assert_eq!(player.stash.count(El::Stone.id()), 2);
+        assert_eq!(player.stash.count(El::Soil.id()), 1);
+    }
+
+    #[test]
+    fn unprefixed_inventory_line_still_migrates() {
+        let mut doc = bare_doc();
+        doc.mods.push(("Inventory".into(), "Iron,Iron".into()));
+        let mut mods = Mods::with_defaults();
+        let (_, player, _) = from_doc(doc, &mut mods, make_world);
+        assert_eq!(player.stash.total(), 2);
+        assert_eq!(player.stash.count(El::Iron.id()), 2);
+    }
+
+    #[test]
+    fn player_stash_field_wins_over_an_old_inventory_line() {
+        let mut doc = bare_doc();
+        doc.player.stash = Some(vec![("Copper".into(), 1)]);
+        doc.mods
+            .push(("inventory".into(), "v1;Stone,Stone".into()));
+        let mut mods = Mods::with_defaults();
+        let (_, player, _) = from_doc(doc, &mut mods, make_world);
+        assert_eq!(player.stash.total(), 1);
+        assert_eq!(player.stash.count(El::Copper.id()), 1);
+        assert_eq!(player.stash.count(El::Stone.id()), 0);
     }
 
     #[test]
