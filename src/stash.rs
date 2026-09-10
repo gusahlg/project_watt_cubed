@@ -134,21 +134,26 @@ impl ElementStash {
 
     /// Replace contents from portable `(spec, count)` pairs. Unknown specs are
     /// skipped. Capacity still applies, so overflow is dropped the same as [`add`].
+    /// Returns how many entries were skipped as unknown.
     pub fn load_portable(
         &mut self,
         items: &[(String, u32)],
         mut parse: impl FnMut(&str) -> Option<BlockId>,
-    ) {
+    ) -> u32 {
         let mut pairs = Vec::new();
+        let mut skipped = 0u32;
         for (spec, count) in items {
             if let Some(id) = parse(spec) {
                 pairs.push((id, *count));
+            } else {
+                skipped += 1;
             }
         }
         self.clear();
         for (id, count) in pairs {
             self.add(id, count);
         }
+        skipped
     }
 }
 
@@ -234,6 +239,25 @@ mod tests {
         assert_eq!(stash.total(), 1);
         assert_eq!(stash.count(soil), 1);
         assert_eq!(stash.count(rock), 0);
+    }
+
+    #[test]
+    fn load_portable_counts_unknown_specs() {
+        let mut world = World::new(1);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let spec = world.registry().spec(rock);
+        let mut stash = ElementStash::new(10);
+        let skipped = stash.load_portable(
+            &[
+                ("natural:Stone".into(), 2),
+                (spec, 1),
+                ("nope".into(), 3),
+            ],
+            |s| world.registry_mut().parse_spec(s),
+        );
+        assert_eq!(skipped, 2);
+        assert_eq!(stash.count(rock), 1);
+        assert_eq!(stash.total(), 1);
     }
 
     #[test]

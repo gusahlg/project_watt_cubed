@@ -374,10 +374,11 @@ impl Mod for CraftingMod {
         Some((1, entries.join(",")))
     }
 
-    fn load_state(&mut self, _version: u16, data: &str, world: &mut World) {
+    fn load_state(&mut self, _version: u16, data: &str, world: &mut World) -> u32 {
         self.crafted.clear();
         self.equipped = None;
         self.cursor = 0;
+        let mut skipped = 0u32;
         for raw in data.split(',').filter(|s| !s.is_empty()) {
             let (equip, entry) = match raw.strip_prefix('*') {
                 Some(rest) => (true, rest),
@@ -390,11 +391,13 @@ impl Mod for CraftingMod {
                 continue;
             };
             let Some(id) = world.registry_mut().parse_spec(spec) else {
+                skipped += 1;
                 continue;
             };
             self.push_loaded(world, id, count, equip);
         }
         self.bump_hud();
+        skipped
     }
 }
 
@@ -430,10 +433,62 @@ mod tests {
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
         let mut crafting = test_mod();
-        crafting.load_state(1, &format!("natural:Stone=5,*{spec}=3"), &mut world);
+        let skipped = crafting.load_state(1, &format!("natural:Stone=5,*{spec}=3"), &mut world);
+        assert_eq!(skipped, 1);
         assert_eq!(crafting.crafted.len(), 1);
         assert_eq!(crafting.crafted[0].id, rock);
         assert_eq!(crafting.crafted[0].count, 3);
+    }
+
+    #[test]
+    fn held_element_rows_rebuild_only_after_stash_mutation() {
+        let world = World::new(1);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let soil = world.registry().id_by_label("soil").unwrap();
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        player.stash.add(rock, 2);
+        let mut crafting = test_mod();
+        crafting.set_open(true);
+        assert!(crafting.refresh(&player.stash));
+        let held = crafting.held.clone();
+        assert_eq!(held, vec![rock]);
+
+        let mut hud1 = Vec::new();
+        crafting.hud(&world, &player, (800, 600), &mut hud1);
+        let text1 = hud_text(&hud1);
+        assert!(!crafting.refresh(&player.stash), "no stash change: rows stay");
+        assert_eq!(crafting.held, held);
+        let mut hud2 = Vec::new();
+        crafting.hud(&world, &player, (800, 600), &mut hud2);
+        assert_eq!(hud_text(&hud2), text1, "HUD cache is reused until a stash/pouch mutation");
+
+        player.stash.add(soil, 1);
+        assert!(crafting.refresh(&player.stash));
+        assert_eq!(crafting.held, vec![rock, soil]);
+        let mut hud3 = Vec::new();
+        crafting.hud(&world, &player, (800, 600), &mut hud3);
+        assert_ne!(hud_text(&hud3), text1, "a stash mutation rebuilds the held rows");
+    }
+
+    #[test]
+    fn escape_close_consumes_only_an_open_panel() {
+        let mut crafting = test_mod();
+        assert!(!crafting.is_open());
+        assert!(
+            !crafting.close_overlay(),
+            "Escape on a closed panel is not consumed"
+        );
+        assert!(!crafting.is_open());
+        crafting.set_open(true);
+        assert!(
+            crafting.close_overlay(),
+            "Escape closes an open panel and is consumed"
+        );
+        assert!(!crafting.is_open());
+        assert!(
+            !crafting.close_overlay(),
+            "a second Escape is not consumed"
+        );
     }
 
     #[test]
@@ -462,5 +517,24 @@ mod tests {
         assert_eq!(ctx.player.stash.count(rock), 1);
         assert_eq!(crafting.crafted[0].count, 1);
         assert_eq!(crafting.crafted[0].id, rock);
+    }
+
+    fn hud_text(elements: &[HudElement]) -> String {
+        let mut out = String::new();
+        for el in elements {
+            match el {
+                HudElement::Label { text, .. } => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                HudElement::Panel(panel) => {
+                    for row in panel.header.iter().chain(panel.rows.iter()) {
+                        out.push_str(&row.text);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
     }
 }

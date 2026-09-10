@@ -273,9 +273,11 @@ pub trait Mod {
 
     /// Restore state produced by [`save_state`](Self::save_state). `version` is
     /// 0 when the on-disk string had no prefix (old saves). `world` is mutable
-    /// because restoring may need to re-register blocks.
-    fn load_state(&mut self, version: u16, data: &str, world: &mut World) {
+    /// because restoring may need to re-register blocks. Returns how many
+    /// holdings were dropped as unknown specs.
+    fn load_state(&mut self, version: u16, data: &str, world: &mut World) -> u32 {
         let _ = (version, data, world);
+        0
     }
 
     /// Which fancy render group this mod owns, if any.
@@ -602,11 +604,13 @@ impl Mods {
     }
 
     /// Restore a mod's state by id, or by display name for old saves.
-    pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) {
+    /// Returns how many holdings that mod dropped as unknown specs.
+    pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) -> u32 {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.module.id() == name || e.module.name() == name) {
             let (version, payload) = split_mod_version(data);
-            entry.module.load_state(version, payload, world);
+            return entry.module.load_state(version, payload, world);
         }
+        0
     }
 
     /// `id=on|off` lines, plus `id.state=<payload>` for mods that persist knobs.

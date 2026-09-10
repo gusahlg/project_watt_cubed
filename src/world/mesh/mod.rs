@@ -522,12 +522,13 @@ mod tests {
         let tables = registry.hot_tables();
         // (coord, unlit, full, gradient) — filled from the first `--nocapture` run.
         // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
+        // (1,1,0) replaced (-5,0,4), whose enclosed empty mesh hashed identically.
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            ((0, 1, 0), 0xad7d2918, 0xad7d2918, 0x8ea03195),
-            ((3, 1, -2), 0x667d9aa3, 0x667d9aa3, 0x12b4ebb3),
-            ((-5, 0, 4), 0xe9281008, 0xe9281008, 0xe9281008),
-            ((2, 1, 2), 0xd4f5436e, 0xd4f5436e, 0x98d2d991),
+            ((0, 1, 0), 0x44467eeb, 0x44467eeb, 0x46f2b392),
+            ((3, 1, -2), 0xc5121175, 0xc5121175, 0x76e5b603),
+            ((1, 1, 0), 0x5d1faa35, 0x5d1faa35, 0xcf5b4303),
+            ((2, 1, 2), 0xd16f666c, 0xd16f666c, 0xdc8830b3),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
@@ -557,6 +558,10 @@ mod tests {
                 "vertex_byte_pin ({cx},{cy},{cz}) unlit=0x{:08x} full=0x{:08x} grad=0x{:08x}",
                 got[i].0, got[i].1, got[i].2
             );
+            if (cx, cy, cz) == (1, 1, 0) {
+                assert_ne!(got[i].0, got[i].2, "({cx},{cy},{cz}) unlit vs gradient");
+                assert_ne!(got[i].1, got[i].2, "({cx},{cy},{cz}) full vs gradient");
+            }
         }
         for (i, ((cx, cy, cz), unlit_h, full_h, grad_h)) in want.iter().copied().enumerate() {
             assert_eq!(got[i].0, unlit_h, "({cx},{cy},{cz}) unlit");

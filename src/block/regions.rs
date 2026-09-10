@@ -19,6 +19,9 @@ pub struct Region {
 }
 
 const SPREAD: u8 = 8;
+/// Tried in order when filling a family's six variants. Rest is monotone in
+/// event strength, so a larger jitter is preferred when it still sits at rest.
+const SPREADS: [u8; 3] = [SPREAD, 4, 1];
 const SEARCH_CAP: u32 = 100_000;
 
 const LABELS: [&str; 10] = [
@@ -48,7 +51,8 @@ pub fn builtin(law: &Law) -> Vec<Region> {
     find_all(law)
 }
 
-/// True when no pair of family members of `regions` changes under `NewContact`.
+/// True when no pair of family members of `regions` changes under `Collision`
+/// (the strongest event; rest there implies rest under every weaker kind).
 pub fn families_at_rest(law: &Law, regions: &[Region]) -> bool {
     let members: Vec<Configuration> = regions.iter().flat_map(|r| r.family(law)).collect();
     pair_rest(law, &members)
@@ -68,23 +72,7 @@ fn find_all(law: &Law) -> Vec<Region> {
             if !stable_with(law, c, &centres) {
                 continue;
             }
-            let mut members = [c; 7];
-            // One-axis ±1 (within `spread`) so variants stay in the NewContact
-            // quantum of the centre; a variant that fails observation or rest
-            // with the centre / previous centres collapses to the centre.
-            let jitters = jitters(c, 1);
-            for (k, v) in jitters.iter().copied().enumerate() {
-                let ok = fits(law, label, v)
-                    && stable_with(law, v, &centres)
-                    && stable_with(law, v, &[c]);
-                members[k + 1] = if ok { v } else { c };
-            }
-            chosen = Some(Region {
-                label,
-                centre: c,
-                spread: SPREAD,
-                members,
-            });
+            chosen = Some(family_at(law, label, c, &centres));
             break;
         }
         let Some(region) = chosen else {
@@ -97,8 +85,40 @@ fn find_all(law: &Law) -> Vec<Region> {
     found
 }
 
+/// One-axis jitters at `spread`, collapsing any that fail observation or rest
+/// with the centre / previous centres. Prefers SPREAD, then 4, then 1, and
+/// records whichever amplitude actually filled six stable variants.
+fn family_at(law: &Law, label: &'static str, c: Element, centres: &[Element]) -> Region {
+    let mut fallback = None;
+    for &spread in &SPREADS {
+        let mut members = [c; 7];
+        let mut filled = 0u8;
+        for (k, v) in jitters(c, spread).iter().copied().enumerate() {
+            let ok = v != c
+                && fits(law, label, v)
+                && stable_with(law, v, centres)
+                && stable_with(law, v, &[c]);
+            if ok {
+                members[k + 1] = v;
+                filled += 1;
+            }
+        }
+        let region = Region {
+            label,
+            centre: c,
+            spread,
+            members,
+        };
+        if filled == 6 {
+            return region;
+        }
+        fallback = Some(region);
+    }
+    fallback.expect("SPREADS is non-empty")
+}
+
 /// Drop any variant that is not at rest with the whole family, so a world built
-/// from all members stays still under NewContact.
+/// from all members stays still under Collision.
 fn collapse_unstable(law: &Law, regions: &mut [Region]) {
     loop {
         let members: Vec<Element> = regions.iter().flat_map(|r| r.members).collect();
@@ -143,13 +163,13 @@ fn matches_label(label: &str, o: &Observation) -> bool {
 
 fn stable_with(law: &Law, e: Element, others: &[Element]) -> bool {
     let c = Configuration::single(e);
-    if interact(law, &c, &c, EventKind::NewContact).changed {
+    if interact(law, &c, &c, EventKind::Collision).changed {
         return false;
     }
     for &o in others {
         let d = Configuration::single(o);
-        if interact(law, &c, &d, EventKind::NewContact).changed
-            || interact(law, &d, &c, EventKind::NewContact).changed
+        if interact(law, &c, &d, EventKind::Collision).changed
+            || interact(law, &d, &c, EventKind::Collision).changed
         {
             return false;
         }
@@ -160,8 +180,8 @@ fn stable_with(law: &Law, e: Element, others: &[Element]) -> bool {
 fn pair_rest(law: &Law, members: &[Configuration]) -> bool {
     for (i, a) in members.iter().enumerate() {
         for b in members.iter().skip(i) {
-            if interact(law, a, b, EventKind::NewContact).changed
-                || interact(law, b, a, EventKind::NewContact).changed
+            if interact(law, a, b, EventKind::Collision).changed
+                || interact(law, b, a, EventKind::Collision).changed
             {
                 return false;
             }
@@ -217,7 +237,12 @@ mod tests {
         assert_eq!(regions.len(), LABELS.len());
         for (i, r) in regions.iter().enumerate() {
             assert_eq!(r.label, LABELS[i]);
-            assert_eq!(r.spread, SPREAD);
+            assert!(
+                SPREADS.contains(&r.spread),
+                "{} spread {} is not in {SPREADS:?}",
+                r.label,
+                r.spread
+            );
             assert_eq!(r.centre, r.members[0]);
             assert!(
                 matches_label(r.label, &observe(&law, &Configuration::single(r.centre))),
@@ -234,7 +259,36 @@ mod tests {
                 );
             }
         }
-        assert!(families_at_rest(&law, &regions), "a family member pair reacted under NewContact");
+        assert!(families_at_rest(&law, &regions), "a family member pair reacted under Collision");
+    }
+
+    #[test]
+    fn spread_is_the_jitter_amplitude() {
+        let law = Law::v0();
+        let regions = builtin(&law);
+        for r in &regions {
+            for i in 1..7 {
+                let v = r.members[i];
+                if v == r.centre {
+                    continue;
+                }
+                let axes: Vec<_> = (0..4).filter(|&a| v.0[a] != r.centre.0[a]).collect();
+                assert_eq!(axes.len(), 1, "{}#{} is not a one-axis jitter", r.label, i);
+                let a = axes[0];
+                let d = (v.0[a] as i16 - r.centre.0[a] as i16).unsigned_abs() as u8;
+                let unclamped = r.centre.0[a] as i16
+                    + if v.0[a] > r.centre.0[a] {
+                        r.spread as i16
+                    } else {
+                        -(r.spread as i16)
+                    };
+                if (0..=255).contains(&unclamped) {
+                    assert_eq!(d, r.spread, "{}#{} jitter is {d}, spread is {}", r.label, i, r.spread);
+                } else {
+                    assert!(d <= r.spread, "{}#{} clamped jitter {d} exceeds spread {}", r.label, i, r.spread);
+                }
+            }
+        }
     }
 
     #[test]

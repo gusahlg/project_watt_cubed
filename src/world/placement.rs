@@ -23,7 +23,8 @@ pub const ENUM_CAP: usize = 1024;
 /// protocol version (mixed peers get an error instead of silent divergence).
 /// v1: the legacy hand-written picker. v2: element-first placement.
 /// v3: the alien pass. v4: emergent material table (regions, not named elements).
-pub const WORLDGEN_VERSION: u16 = 4;
+/// v5: Collision-rest families with recorded jitter spread.
+pub const WORLDGEN_VERSION: u16 = 5;
 
 /// Scattered stream B rarities are stream A's scaled down by this — pairs stay
 /// genuine finds (P(pair) ~ p²/8 per stone cell), singles move by ~+12%.
@@ -276,6 +277,7 @@ impl PlacementTable {
     /// Intern every configuration terrain can emit, in canonical order, and
     /// resolve the generator's LUTs. Runs at startup on the main thread.
     pub fn compile(&self, registry: &mut BlockRegistry) -> Resolved {
+        let before = registry.block_count();
         let law = *registry.law();
         let regions = regions::builtin(&law);
         intern_families(registry, &regions);
@@ -390,13 +392,13 @@ impl PlacementTable {
         };
 
         assert!(
-            registry.block_count() <= ENUM_CAP,
+            registry.block_count() - before <= ENUM_CAP,
             "placement table interned {} configurations (cap {ENUM_CAP})",
-            registry.block_count()
+            registry.block_count() - before
         );
         debug_assert!(
             regions::families_at_rest(&law, &regions),
-            "worldgen families are not at rest under NewContact"
+            "worldgen families are not at rest under Collision"
         );
         resolved
     }
@@ -508,6 +510,7 @@ fn intern_families(registry: &mut BlockRegistry, regions: &[Region]) {
 }
 
 fn intern_union(registry: &mut BlockRegistry, regions: &[Region], specs: &[&str]) -> BlockId {
+    assert!(!specs.is_empty(), "placement union is empty");
     let mut elems: Vec<Element> = specs.iter().map(|s| resolve_element(regions, s)).collect();
     // Canonical intern order: region table index, then variant index, so rule
     // authoring order cannot reshuffle ids. Multiplicity is kept.
@@ -573,6 +576,22 @@ mod tests {
         assert_eq!(first.stone, again.stone);
         assert_eq!(first.dress, again.dress);
         assert_eq!(first.pairs, again.pairs);
+    }
+
+    #[test]
+    fn compile_interns_within_enum_cap() {
+        let mut reg = BlockRegistry::with_builtins();
+        let before = reg.block_count();
+        builtin().compile(&mut reg);
+        assert!(reg.block_count() - before <= ENUM_CAP);
+    }
+
+    #[test]
+    #[should_panic(expected = "placement union is empty")]
+    fn intern_union_rejects_empty() {
+        let mut reg = BlockRegistry::with_builtins();
+        let regions = regions::builtin(reg.law());
+        intern_union(&mut reg, &regions, &[]);
     }
 
     #[test]
