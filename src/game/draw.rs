@@ -652,6 +652,7 @@ fn tag_draw(
 }
 
 /// Reject tags by direction and distance before querying terrain occlusion.
+#[cfg(test)]
 fn tag_visibility(
     to_head: DVec3,
     forward: DVec3,

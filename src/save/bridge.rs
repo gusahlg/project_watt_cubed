@@ -302,7 +302,9 @@ pub fn encode_current(
 }
 
 /// Save synchronously (exit paths; the in-game path goes through the
-/// Autosaver instead).
+/// Autosaver instead). Tests pin the encode+write pairing; production
+/// writes via [`encode_current`] + the autosaver.
+#[cfg(test)]
 pub fn save(
     id: &SlotId,
     world: &World,

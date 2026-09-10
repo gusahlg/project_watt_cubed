@@ -53,6 +53,7 @@ impl Default for SectionMeshData {
 }
 
 impl SectionMeshData {
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         Pass::ALL.iter().all(|&p| self.data[p].is_empty())
     }

@@ -1,8 +1,9 @@
 //! Console command parsing and dispatch.
 //!
-//! [`execute`] takes one submitted line and returns the lines of output to show
-//! in the console log. Adding a command is a single `match` arm — the dispatch is
-//! deliberately tiny so it can grow into a richer command (or chat) system later.
+//! [`execute_with_visuals`] takes one submitted line and returns the lines of
+//! output to show in the console log. Adding a command is a single `match`
+//! arm — the dispatch is deliberately tiny so it can grow into a richer
+//! command (or chat) system later.
 //!
 //! `/gfx` edits the [`Settings`] value only; the caller applies it to the engine
 //! (and the world's render distance) after the command returns. That keeps every
@@ -80,6 +81,7 @@ commands! {
 /// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. The world
 /// is `&mut` for `tp` alone (it requests the destination collision slab);
 /// read-only commands like `inspect` reborrow it shared.
+#[cfg(test)]
 pub fn execute(
     line: &str,
     player: &mut Player,

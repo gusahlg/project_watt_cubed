@@ -116,10 +116,6 @@ impl<'a> Reader<'a> {
         Self { bytes, pos }
     }
 
-    pub fn pos(&self) -> usize {
-        self.pos
-    }
-
     pub fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
     }
@@ -139,13 +135,6 @@ impl<'a> Reader<'a> {
 
     pub fn u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.take(1)?[0])
-    }
-
-    /// Strict UTF8: a `u16`-length-prefixed string that fails on invalid bytes
-    /// (save's convention — corrupt text is a corrupt file, not a lossy repair).
-    pub fn str16(&mut self) -> Result<String, CodecError> {
-        let len = self.u16()? as usize;
-        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| CodecError::Truncated)
     }
 
     /// Lossy UTF8: a `u16`-length-prefixed string that never fails on invalid

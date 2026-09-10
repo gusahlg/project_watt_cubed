@@ -7,6 +7,7 @@ use crate::render_config::{LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, max_lod_levels};
 use super::metric::EyeDist;
 
 /// Number of LOD rings: 7 gives base-2 cells, reaching 256m at the farthest ring.
+#[cfg(test)]
 pub(in crate::world) const SECTION_LEVELS: u8 = 7;
 
 /// LOD choice at a given XZ distance. No `Chunks` case because sections totally cover
@@ -31,6 +32,7 @@ pub struct PyramidCfg {
 
 impl PyramidCfg {
     /// Standard config: base 2, 7 rings starting at finest LOD.
+    #[cfg(test)]
     pub fn sections(unit: f32) -> PyramidCfg {
         Self::sections_with(unit, SECTION_LEVELS, super::section::FINEST_DETAIL.0 as u8)
     }

@@ -116,6 +116,7 @@ impl<K: PartialEq, V> Memo<K, V> {
     }
 
     /// Empty the slot: the next [`get_or`](Self::get_or) rebuilds.
+    #[cfg(test)]
     pub fn invalidate(&mut self) {
         self.slot = None;
     }

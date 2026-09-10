@@ -158,20 +158,22 @@ pub(crate) const MAX_SPEC: usize = 256;
 /// cap, and callers guard outbound.
 pub(crate) const MAX_VOICE_PAYLOAD: usize = 400;
 
+#[cfg(test)]
+pub(crate) fn content_fingerprint() -> u64 {
+    content_fingerprint_kind(crate::world::generation::WorldgenKind::Classic)
+}
+
+#[cfg(test)]
+pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
+    content_fingerprint_kind_cfg(kind, crate::world::diffusion::DiffusionCfg::default())
+}
+
 /// A stable 64-bit digest of everything that determines what a seed GENERATES:
 /// the worldgen version, the law fingerprint, and every builtin region centre.
 /// Seed-only multiplayer never ships voxels, so two builds whose generation
 /// differs in ANY of these would silently build different worlds from one seed
 /// — the handshake compares fingerprints and rejects the join instead. Protocol
 /// changes are versioned separately by [`PROTOCOL_VERSION`].
-pub(crate) fn content_fingerprint() -> u64 {
-    content_fingerprint_kind(crate::world::generation::WorldgenKind::Classic)
-}
-
-pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
-    content_fingerprint_kind_cfg(kind, crate::world::diffusion::DiffusionCfg::default())
-}
-
 pub(crate) fn content_fingerprint_kind_cfg(
     kind: crate::world::generation::WorldgenKind,
     cfg: crate::world::diffusion::DiffusionCfg,

@@ -53,6 +53,7 @@ pub fn animation_uv(cam_world: DVec3) -> [f32; 2] {
 
 /// Compute per-frame lighting state from sky conditions and time.
 /// Single source for direct light, ambient, and fog; combines sky, weather, and time.
+#[cfg(test)]
 pub fn compose(
     sky: &Sky,
     cam_world: DVec3,

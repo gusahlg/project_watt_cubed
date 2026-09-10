@@ -545,10 +545,6 @@ impl EditBuf {
         self.text[..self.cursor].chars().count()
     }
 
-    pub fn max(&self) -> usize {
-        self.max
-    }
-
     /// Replace the whole value (truncated to the cap), caret to the end.
     pub fn set(&mut self, s: &str) {
         let mut s = s.to_string();
