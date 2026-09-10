@@ -167,6 +167,48 @@ fn observations_are_bounded_and_air_is_air() {
 }
 
 #[test]
+fn observe_element_matches_observe_of_a_single() {
+    let law = Law::v0();
+    let mut rng = Rng(0x0b5e_e1e0);
+    for _ in 0..2_000 {
+        let e = rng.element();
+        let boxed = observe(&law, &Configuration::single(e));
+        assert_eq!(observe_element(&law, e), boxed);
+        let p = &law.probes;
+        assert_eq!(
+            Observation::from_responses(
+                &law,
+                element_response(&law, e, p.contact),
+                element_response(&law, e, p.light),
+                element_response(&law, e, p.flow),
+                element_response(&law, e, p.glow),
+                element_response(&law, e, p.friction),
+            ),
+            boxed
+        );
+    }
+}
+
+#[test]
+fn element_changes_matches_interact_on_singles() {
+    let law = Law::v0();
+    let mut rng = Rng(0x51e1);
+    for _ in 0..2_000 {
+        let a = rng.element();
+        let b = rng.element();
+        let kind = EventKind::ALL[(rng.next() as usize) % EventKind::ALL.len()];
+        let boxed = interact(
+            &law,
+            &Configuration::single(a),
+            &Configuration::single(b),
+            kind,
+        )
+        .changed;
+        assert_eq!(element_changes(&law, a, b, kind), boxed);
+    }
+}
+
+#[test]
 fn visuals_are_local_and_quantization_round_trips() {
     let law = Law::v0();
     let mut rng = Rng(11);

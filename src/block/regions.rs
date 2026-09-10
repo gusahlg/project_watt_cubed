@@ -1,9 +1,13 @@
 //! Worldgen starting regions: a labelled centre element, a small family of
 //! variants, and three geological strata, computed from the law.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use material::{interact, observe, Configuration, Element, EventKind, Law, Observation};
+use material::{
+    element_changes, element_response, interact, observe_element, Configuration, Element, EventKind,
+    Law, Observation,
+};
 
 /// One worldgen family: a centre that observes as the labelled kind, six
 /// one-axis jitters (failing jitters collapse to the centre), and three
@@ -78,9 +82,6 @@ pub fn builtin(law: &Law) -> Vec<Region> {
     find_all(law)
 }
 
-/// Presentation name of a configuration: its attached label, else the nearest
-/// worldgen region's label plus `"-like"` when the mean element is within twice
-
 /// True when no pair of family members or strata of `regions` changes under
 /// `Collision` (the strongest event; rest there implies rest under every weaker
 /// kind).
@@ -102,8 +103,35 @@ pub fn pair_rest(law: &Law, members: &[Configuration], kind: EventKind) -> bool 
     true
 }
 
+/// Counters for the region-search cost test. Cheap increments, no clocks.
+#[derive(Clone, Copy, Debug, Default)]
+struct SearchCost {
+    candidates: u32,
+    obs_early: u32,
+    obs_full: u32,
+    rest: u32,
+    rest_skip: u32,
+}
+
+struct Search {
+    law: Law,
+    /// Elements that are not at rest with themselves under Collision. A later
+    /// variant of the same centre is the same element and can be skipped.
+    failed: HashSet<Element>,
+    cost: SearchCost,
+}
+
 fn find_all(law: &Law) -> Vec<Region> {
+    search(law).0
+}
+
+fn search(law: &Law) -> (Vec<Region>, SearchCost) {
     let fp = law.fingerprint();
+    let mut s = Search {
+        law: *law,
+        failed: HashSet::new(),
+        cost: SearchCost::default(),
+    };
     let mut found: Vec<Region> = Vec::with_capacity(LABELS.len());
     let mut centres: Vec<Element> = Vec::new();
     for &label in &SEARCH_ORDER {
@@ -111,11 +139,12 @@ fn find_all(law: &Law) -> Vec<Region> {
         let mut best: Option<(u32, u32, Element)> = None;
         for n in 0..SEARCH_CAP {
             let c = candidate(fp, label_i as u32, n);
-            let Some(obs) = fits_obs(law, label, c) else { continue };
+            s.cost.candidates += 1;
+            let Some(obs) = s.fits_obs(label, c) else { continue };
             if !distinct(c, &centres) || !axis_inert_with(c, &centres) {
                 continue;
             }
-            if !stable_with(law, c, &centres) {
+            if !s.stable_with(c, &centres) {
                 continue;
             }
             let score = band_score(label, &obs);
@@ -130,148 +159,261 @@ fn find_all(law: &Law) -> Vec<Region> {
         let Some((_, _, c)) = best else {
             panic!("law cannot host region {label}: no candidate in {SEARCH_CAP}");
         };
-        let region = family_at(law, label, c, &centres);
+        let region = s.family_at(label, c, &centres);
         centres.push(region.centre);
         found.push(region);
     }
     found.sort_by_key(|r| LABELS.iter().position(|&l| l == r.label).unwrap_or(99));
-    collapse_unstable(law, &mut found);
-    fill_strata(law, &mut found);
-    found
+    s.collapse_unstable(&mut found);
+    s.fill_strata(&mut found);
+    (found, s.cost)
 }
 
-/// One-axis jitters at `spread`, collapsing any that fail observation or rest
-/// with the centre / previous centres. Prefers SPREAD, then 4, then 1, and
-/// records whichever amplitude actually filled six stable variants.
-fn family_at(law: &Law, label: &'static str, c: Element, centres: &[Element]) -> Region {
-    let mut fallback = None;
-    for &spread in &SPREADS {
-        let mut members = [c; 7];
-        let mut filled = 0u8;
-        for (k, v) in jitters(c, spread).iter().copied().enumerate() {
-            let ok = v != c
-                && fits(law, label, v)
-                && distinct(v, centres)
-                && axis_inert_with(v, centres)
-                && axis_inert_with(v, &[c])
-                && stable_with(law, v, centres)
-                && stable_with(law, v, &[c]);
-            if ok {
-                members[k + 1] = v;
-                filled += 1;
-            }
-        }
-        let region = Region {
-            label,
-            centre: c,
-            spread,
-            members,
-            strata: [c; 3],
-        };
-        if filled == 6 {
-            return region;
-        }
-        fallback = Some(region);
+impl Search {
+    fn fits_obs(&mut self, label: &str, e: Element) -> Option<Observation> {
+        observe_if_fits(&self.law, label, e, &mut self.cost)
     }
-    fallback.expect("SPREADS is non-empty")
-}
 
-/// Three sub-centres per region, picked after variant collapse so the rest
-/// filter sees the matter the world actually emits. ±12 first, then smaller
-/// dead-zone offsets; one axis each.
-fn fill_strata(law: &Law, regions: &mut [Region]) {
-    for i in 0..regions.len() {
-        let label = regions[i].label;
-        let c = regions[i].centre;
-        let mut out = [c; 3];
-        let mut filled = 0usize;
-        let mut used_axis = [false; 4];
-        let others: Vec<Element> = regions
-            .iter()
-            .enumerate()
-            .flat_map(|(j, r)| {
-                if j == i {
-                    r.members.iter().copied().collect::<Vec<_>>()
-                } else {
-                    r.matter().collect()
-                }
-            })
-            .collect();
-        for &delta in &STRATUM_DELTAS {
-            if filled == 3 {
-                break;
+    fn fits(&mut self, label: &str, e: Element) -> bool {
+        self.fits_obs(label, e).is_some()
+    }
+
+    fn stable_with(&mut self, e: Element, others: &[Element]) -> bool {
+        if self.failed.contains(&e) {
+            self.cost.rest_skip += 1;
+            return false;
+        }
+        self.cost.rest += 1;
+        if element_changes(&self.law, e, e, EventKind::Collision) {
+            self.failed.insert(e);
+            return false;
+        }
+        for &o in others {
+            if element_changes(&self.law, e, o, EventKind::Collision)
+                || element_changes(&self.law, o, e, EventKind::Collision)
+            {
+                return false;
             }
-            for axis in [3usize, 0, 1, 2] {
+        }
+        true
+    }
+
+    /// One-axis jitters at `spread`, collapsing any that fail observation or rest
+    /// with the centre / previous centres. Prefers SPREAD, then 4, then 1, and
+    /// records whichever amplitude actually filled six stable variants.
+    fn family_at(&mut self, label: &'static str, c: Element, centres: &[Element]) -> Region {
+        let mut fallback = None;
+        for &spread in &SPREADS {
+            let mut members = [c; 7];
+            let mut filled = 0u8;
+            for (k, v) in jitters(c, spread).iter().copied().enumerate() {
+                let ok = v != c
+                    && self.fits(label, v)
+                    && distinct(v, centres)
+                    && axis_inert_with(v, centres)
+                    && axis_inert_with(v, &[c])
+                    && self.stable_with(v, centres)
+                    && self.stable_with(v, &[c]);
+                if ok {
+                    members[k + 1] = v;
+                    filled += 1;
+                }
+            }
+            let region = Region {
+                label,
+                centre: c,
+                spread,
+                members,
+                strata: [c; 3],
+            };
+            if filled == 6 {
+                return region;
+            }
+            fallback = Some(region);
+        }
+        fallback.expect("SPREADS is non-empty")
+    }
+
+    /// Three sub-centres per region, picked after variant collapse so the rest
+    /// filter sees the matter the world actually emits. ±12 first, then smaller
+    /// dead-zone offsets; one axis each.
+    fn fill_strata(&mut self, regions: &mut [Region]) {
+        for i in 0..regions.len() {
+            let label = regions[i].label;
+            let c = regions[i].centre;
+            let mut out = [c; 3];
+            let mut filled = 0usize;
+            let mut used_axis = [false; 4];
+            let others: Vec<Element> = regions
+                .iter()
+                .enumerate()
+                .flat_map(|(j, r)| {
+                    if j == i {
+                        r.members.iter().copied().collect::<Vec<_>>()
+                    } else {
+                        r.matter().collect()
+                    }
+                })
+                .collect();
+            for &delta in &STRATUM_DELTAS {
                 if filled == 3 {
                     break;
                 }
-                if used_axis[axis] {
-                    continue;
-                }
-                for &sign in &[1i16, -1] {
-                    let v = c.0[axis] as i16 + sign * delta as i16;
-                    if !(0..=255).contains(&v) {
+                for axis in [3usize, 0, 1, 2] {
+                    if filled == 3 {
+                        break;
+                    }
+                    if used_axis[axis] {
                         continue;
                     }
-                    let mut e = c;
-                    e.0[axis] = v as u8;
-                    if e == c || (0..filled).any(|k| out[k] == e) {
-                        continue;
+                    for &sign in &[1i16, -1] {
+                        let v = c.0[axis] as i16 + sign * delta as i16;
+                        if !(0..=255).contains(&v) {
+                            continue;
+                        }
+                        let mut e = c;
+                        e.0[axis] = v as u8;
+                        if e == c || (0..filled).any(|k| out[k] == e) {
+                            continue;
+                        }
+                        if !self.fits(label, e) {
+                            continue;
+                        }
+                        if !axis_inert(e, c) {
+                            continue;
+                        }
+                        if !axis_inert_with(e, &out[..filled]) {
+                            continue;
+                        }
+                        if !self.stable_with(e, &others) || !self.stable_with(e, &out[..filled]) {
+                            continue;
+                        }
+                        out[filled] = e;
+                        used_axis[axis] = true;
+                        filled += 1;
+                        break;
                     }
-                    if !fits(law, label, e) {
-                        continue;
-                    }
-                    if !axis_inert(e, c) {
-                        continue;
-                    }
-                    if !axis_inert_with(e, &out[..filled]) {
-                        continue;
-                    }
-                    if !stable_with(law, e, &others) || !stable_with(law, e, &out[..filled]) {
-                        continue;
-                    }
-                    out[filled] = e;
-                    used_axis[axis] = true;
-                    filled += 1;
-                    break;
                 }
             }
+            regions[i].strata = out;
         }
-        regions[i].strata = out;
+    }
+
+    /// Drop any variant that is not at rest with the whole family, so a world
+    /// built from all members stays still under Collision. Strata are filled
+    /// afterwards against this collapsed set.
+    fn collapse_unstable(&mut self, regions: &mut [Region]) {
+        loop {
+            let members: Vec<Element> = regions.iter().flat_map(|r| r.members).collect();
+            let mut changed = false;
+            for r in regions.iter_mut() {
+                for i in 1..7 {
+                    if r.members[i] == r.centre {
+                        continue;
+                    }
+                    if !self.stable_with(r.members[i], &members) {
+                        r.members[i] = r.centre;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 }
 
-/// Drop any variant that is not at rest with the whole family, so a world
-/// built from all members stays still under Collision. Strata are filled
-/// afterwards against this collapsed set.
-fn collapse_unstable(law: &Law, regions: &mut [Region]) {
-    loop {
-        let members: Vec<Element> = regions.iter().flat_map(|r| r.members).collect();
-        let mut changed = false;
-        for r in regions.iter_mut() {
-            for i in 1..7 {
-                if r.members[i] == r.centre {
-                    continue;
-                }
-                if !stable_with(law, r.members[i], &members) {
-                    r.members[i] = r.centre;
-                    changed = true;
-                }
+/// Reject on the cheapest probes the label needs. A full five-probe
+/// [`observe_element`] runs only for a survivor (band_score). Same accept set
+/// as `observe_element` + [`matches_label`].
+fn observe_if_fits(law: &Law, label: &str, e: Element, cost: &mut SearchCost) -> Option<Observation> {
+    let p = &law.probes;
+    let flow = element_response(law, e, p.flow);
+    let liquid = flow >= p.liquid_min;
+    let o = match label {
+        "water" => {
+            if !liquid {
+                cost.obs_early += 1;
+                return None;
             }
+            let light = element_response(law, e, p.light);
+            Observation::from_responses(law, 0, light, flow, 0, 0)
         }
-        if !changed {
-            break;
+        "lamp" => {
+            if liquid {
+                cost.obs_early += 1;
+                return None;
+            }
+            let glow = element_response(law, e, p.glow);
+            Observation::from_responses(law, 0, 0, flow, glow, 0)
         }
+        "glass" => {
+            if liquid {
+                cost.obs_early += 1;
+                return None;
+            }
+            let light = element_response(law, e, p.light);
+            Observation::from_responses(law, 0, light, flow, 0, 0)
+        }
+        "ice" => {
+            if liquid {
+                cost.obs_early += 1;
+                return None;
+            }
+            let light = element_response(law, e, p.light);
+            let contact = element_response(law, e, p.contact);
+            Observation::from_responses(law, contact, light, flow, 0, 0)
+        }
+        "sand" | "clay" => {
+            if liquid {
+                cost.obs_early += 1;
+                return None;
+            }
+            let contact = element_response(law, e, p.contact);
+            let hardness = 255 - contact;
+            if label == "sand" {
+                if !(60..=120).contains(&hardness) {
+                    cost.obs_early += 1;
+                    return None;
+                }
+            } else if !(100..=160).contains(&hardness) {
+                cost.obs_early += 1;
+                return None;
+            }
+            let light = element_response(law, e, p.light);
+            let friction = element_response(law, e, p.friction);
+            Observation::from_responses(law, contact, light, flow, 0, friction)
+        }
+        _ => {
+            // rock, soil, organic, snow: solid + opaque + a hardness band.
+            if liquid {
+                cost.obs_early += 1;
+                return None;
+            }
+            let contact = element_response(law, e, p.contact);
+            let hardness = 255 - contact;
+            let hardness_ok = match label {
+                "rock" => hardness >= 160,
+                "soil" => (90..=150).contains(&hardness),
+                "organic" => (30..=130).contains(&hardness),
+                "snow" => hardness < 60,
+                _ => false,
+            };
+            if !hardness_ok {
+                cost.obs_early += 1;
+                return None;
+            }
+            let light = element_response(law, e, p.light);
+            Observation::from_responses(law, contact, light, flow, 0, 0)
+        }
+    };
+    if !matches_label(label, &o) {
+        cost.obs_early += 1;
+        return None;
     }
-}
-
-fn fits(law: &Law, label: &str, e: Element) -> bool {
-    fits_obs(law, label, e).is_some()
-}
-
-fn fits_obs(law: &Law, label: &str, e: Element) -> Option<Observation> {
-    let o = observe(law, &Configuration::single(e));
-    matches_label(label, &o).then_some(o)
+    cost.obs_full += 1;
+    Some(o)
 }
 
 fn matches_label(label: &str, o: &Observation) -> bool {
@@ -325,22 +467,6 @@ fn axis_inert_with(e: Element, others: &[Element]) -> bool {
     others.iter().all(|&o| axis_inert(e, o))
 }
 
-fn stable_with(law: &Law, e: Element, others: &[Element]) -> bool {
-    let c = Configuration::single(e);
-    if interact(law, &c, &c, EventKind::Collision).changed {
-        return false;
-    }
-    for &o in others {
-        let d = Configuration::single(o);
-        if interact(law, &c, &d, EventKind::Collision).changed
-            || interact(law, &d, &c, EventKind::Collision).changed
-        {
-            return false;
-        }
-    }
-    true
-}
-
 /// Six one-axis jitters: axes 0..=2 × {+spread, −spread}, clamped to the lattice.
 fn jitters(centre: Element, spread: u8) -> [Element; 6] {
     let mut out = [centre; 6];
@@ -380,6 +506,7 @@ fn candidate(fp: u64, label: u32, n: u32) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use material::observe;
 
     #[test]
     fn builtin_regions_observe_as_required_and_sit_at_rest() {
@@ -522,6 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn fresh_search_matches_cached_v0() {
+        let law = Law::v0();
+        let (fresh, _) = search(&law);
+        assert_eq!(fresh, builtin(&law));
+    }
+
+    #[test]
+    fn observation_early_reject_matches_full_observe() {
+        let law = Law::v0();
+        let mut s = Search {
+            law,
+            failed: HashSet::new(),
+            cost: SearchCost::default(),
+        };
+        let mut h = 0xC0FF_EE00_u64;
+        for &label in &LABELS {
+            for _ in 0..1_200 {
+                h ^= h << 13;
+                h ^= h >> 7;
+                h ^= h << 17;
+                let e = Element::new([
+                    h as u8,
+                    (h >> 8) as u8,
+                    (h >> 16) as u8,
+                    (h >> 24) as u8,
+                ]);
+                let full = matches_label(label, &observe_element(&law, e));
+                assert_eq!(
+                    s.fits_obs(label, e).is_some(),
+                    full,
+                    "{label} early-reject disagreed for {:?}",
+                    e.0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lamp_centre_emits_at_least_eight() {
         let law = Law::v0();
         let lamp = builtin(&law).into_iter().find(|r| r.label == "lamp").unwrap();
@@ -581,12 +746,92 @@ mod tests {
         times.sort_unstable();
         let mid = times[times.len() / 2];
         println!(
-            "region compile first {} µs (v0 search+intern) median {} µs (samples {times:?})",
+            "region compile first {} µs (v0 intern, OnceLock warm) median {} µs (samples {times:?})",
             first, mid
         );
         assert!(
             mid < 5_000,
             "region compile median {mid} µs must stay under 5 ms"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn region_search_cold_under_forty_ms() {
+        use std::time::Instant;
+        let law = Law::v0();
+        let fp = law.fingerprint();
+        const N: u32 = 20_000;
+
+        let t0 = Instant::now();
+        for n in 0..N {
+            let e = candidate(fp, 0, n);
+            let _ = observe(&law, &Configuration::single(e));
+        }
+        let alloc_obs = t0.elapsed();
+
+        let t0 = Instant::now();
+        for n in 0..N {
+            let e = candidate(fp, 0, n);
+            let _ = observe_element(&law, e);
+        }
+        let fast_obs = t0.elapsed();
+
+        let t0 = Instant::now();
+        for n in 0..N {
+            let a = candidate(fp, 1, n);
+            let b = candidate(fp, 2, n);
+            let _ = interact(
+                &law,
+                &Configuration::single(a),
+                &Configuration::single(b),
+                EventKind::Collision,
+            )
+            .changed;
+        }
+        let alloc_rest = t0.elapsed();
+
+        let t0 = Instant::now();
+        for n in 0..N {
+            let a = candidate(fp, 1, n);
+            let b = candidate(fp, 2, n);
+            let _ = element_changes(&law, a, b, EventKind::Collision);
+        }
+        let fast_rest = t0.elapsed();
+
+        let t0 = Instant::now();
+        let (regions, cost) = search(&law);
+        let cold = t0.elapsed();
+
+        let _ = builtin(&law);
+        let t0 = Instant::now();
+        let cached = builtin(&law);
+        let warm = t0.elapsed();
+
+        println!(
+            "region search {N} alloc-observe {:?}  observe_element {:?}  alloc-rest {:?}  element_changes {:?}",
+            alloc_obs, fast_obs, alloc_rest, fast_rest
+        );
+        println!(
+            "region search cold {:?} warm {:?}  candidates={} obs_early={} obs_full={} rest={} rest_skip={}",
+            cold,
+            warm,
+            cost.candidates,
+            cost.obs_early,
+            cost.obs_full,
+            cost.rest,
+            cost.rest_skip
+        );
+        assert_eq!(regions, cached);
+        assert!(
+            cold.as_millis() < 40,
+            "cold region search {:?} must stay under 40 ms",
+            cold
+        );
+        assert!(
+            warm.as_millis() < 10,
+            "warm region search {:?} must stay under 10 ms",
+            warm
         );
     }
 }

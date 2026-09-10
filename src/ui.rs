@@ -334,6 +334,28 @@ pub enum HudElement {
     Panel(Panel),
 }
 
+/// Flatten HUD labels and panel rows to text. Test helper: one place for the
+/// inventory and crafting mods to assert on what they painted.
+#[cfg(test)]
+pub(crate) fn hud_text(elements: &[HudElement]) -> String {
+    let mut out = String::new();
+    for el in elements {
+        match el {
+            HudElement::Label { text, .. } => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            HudElement::Panel(panel) => {
+                for row in panel.header.iter().chain(panel.rows.iter()) {
+                    out.push_str(&row.text);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Draw every mod's contributed HUD. The only place mod HUD reaches the frame.
 pub fn render_hud(f: &mut Frame, theme: &Theme, screen: Px, elements: &[HudElement]) {
     for el in elements {
@@ -812,6 +834,26 @@ mod tests {
         assert_eq!(Anchor::TopRight.origin(screen, size, (-12, 12)), (800 - 100 - 12, 12));
         // Top-centre: horizontally centred, offset ignored horizontally here.
         assert_eq!(Anchor::Top.origin(screen, size, (0, 12)), ((800 - 100) / 2, 12));
+    }
+
+    #[test]
+    fn hud_text_joins_labels_and_panel_rows() {
+        let elements = [
+            HudElement::Label {
+                at: Anchor::TopLeft,
+                off: (0, 0),
+                base_fs: 16,
+                role: Role::Primary,
+                text: "hello".into(),
+            },
+            HudElement::Panel(Panel {
+                at: (0, 0),
+                width: 100,
+                header: vec![Row::new(Role::Primary, "head")].into(),
+                rows: vec![Row::new(Role::Muted, "body")].into(),
+            }),
+        ];
+        assert_eq!(hud_text(&elements), "hello\nhead\nbody\n");
     }
 
     #[test]

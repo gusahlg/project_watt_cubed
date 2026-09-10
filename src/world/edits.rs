@@ -517,6 +517,8 @@ impl CellStore for World {
     /// without loading, so a cascade reads the same cells whatever the streaming state (the server's
     /// store does the same).
     fn block_at(&self, pos: Pos) -> Option<BlockId> {
+        #[cfg(test)]
+        crate::alloc_count::note_cell_read();
         let (chunk, local) = BlockCoord::new(pos.0, pos.1, pos.2).split();
         if let Some(loaded) = self.chunks.get(&chunk) {
             return Some(loaded.chunk.get_local(local.lx(), local.ly(), local.lz()));
@@ -532,6 +534,8 @@ impl CellStore for World {
         // `World::set_block` reports an unloaded cell as AIR; the scheduler wants the true previous
         // material (overlay or generated), which the read above defines.
         let prev = CellStore::block_at(self, pos)?;
+        #[cfg(test)]
+        crate::alloc_count::note_cell_write();
         World::set_block(self, pos.0, pos.1, pos.2, id);
         Some(prev)
     }

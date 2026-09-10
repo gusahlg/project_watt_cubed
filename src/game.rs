@@ -1896,4 +1896,80 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn quiet_minimum_frame_after_draining_the_scheduler_allocates_nothing() {
+        use crate::alloc_count;
+        use crate::audio::palette::CuePalette;
+        use crate::audio::SoundSystem;
+        use crate::input::router::Router;
+        use crate::mods::Mods;
+        use crate::settings::Settings;
+        use material::EventKind;
+
+        let mut settings = Settings::default();
+        assert!(settings.select_preset("minimum"));
+        let render = settings.render_config();
+        let mut game = Game::scripted(1, render);
+        game.scripted = false;
+        game.set_input_locked(true);
+        game.world_mut()
+            .set_view_distances(settings.render_distance, settings.vertical_distance);
+        game.world_mut().transition_lighting(settings.lighting);
+        game.world_mut().set_ao_flag(settings.ao);
+        game.world_mut()
+            .set_render_lanes(settings.occlusion, settings.lod2);
+        game.adopt_gameplay_settings(&settings, render);
+        let pos = game.player().position;
+        game.world_mut().settle_around(pos);
+        assert!(
+            game.world().entry_complete(),
+            "settled: {}",
+            game.world().entry_debug()
+        );
+
+        let (x, y, z) = (
+            pos.x.floor() as i32,
+            pos.y.floor() as i32,
+            pos.z.floor() as i32,
+        );
+        game.world_mut()
+            .push_material_event((x, y, z), EventKind::Collision);
+        game.world_mut()
+            .push_material_event((x + 1, y, z), EventKind::NewContact);
+        assert!(
+            game.world().reactions().pending() > 0,
+            "draining test needs a non-empty pending set"
+        );
+        while game.world().reactions().pending() > 0 {
+            let _ = game.world_mut().tick_reactions();
+        }
+        game.world_mut().settle_around(pos);
+        assert!(
+            game.world().entry_complete(),
+            "settled after drain: {}",
+            game.world().entry_debug()
+        );
+
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut audio = crate::audio::AudioDirector::new(palette);
+        let mut router = Router::new();
+        let mut mods = Mods::with_defaults();
+        const DT: f32 = 1.0 / 60.0;
+        for i in 0..10 {
+            alloc_count::reset();
+            crate::sched::reset_clock();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            if i >= 5 {
+                assert_eq!(
+                    alloc_count::alloc_bytes(),
+                    0,
+                    "quiet frame {i} after drain allocated {} times / {} bytes",
+                    alloc_count::alloc_count(),
+                    alloc_count::alloc_bytes()
+                );
+            }
+        }
+    }
 }

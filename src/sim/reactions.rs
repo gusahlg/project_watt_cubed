@@ -812,6 +812,43 @@ mod tests {
     }
 
     #[test]
+    fn quiet_sim_tick_empty_scheduler_allocates_nothing_and_touches_no_chunk() {
+        use crate::alloc_count;
+        struct PanicStore(BlockRegistry);
+        impl CellStore for PanicStore {
+            fn block_at(&self, pos: Pos) -> Option<BlockId> {
+                panic!("empty scheduler tick read cell {pos:?}");
+            }
+            fn set_block(&mut self, pos: Pos, _id: BlockId) -> Option<BlockId> {
+                panic!("empty scheduler tick wrote cell {pos:?}");
+            }
+            fn registry(&self) -> &BlockRegistry {
+                &self.0
+            }
+            fn registry_mut(&mut self) -> &mut BlockRegistry {
+                &mut self.0
+            }
+        }
+        let mut store = PanicStore(BlockRegistry::with_builtins());
+        let mut s = ReactionScheduler::new();
+        crate::alloc_count::reset();
+        let out = s.tick(&mut store, &Law::v0(), Budget::DEFAULT);
+        assert!(out.is_empty());
+        assert_eq!(alloc_count::alloc_count(), 0);
+        assert_eq!(alloc_count::alloc_bytes(), 0);
+        assert_eq!(s.generations, 0);
+
+        let mut world = World::with_config(1, RenderConfig::default());
+        assert_eq!(world.reactions().pending(), 0);
+        alloc_count::reset();
+        assert!(world.tick_reactions().is_empty());
+        assert_eq!(alloc_count::alloc_count(), 0);
+        assert_eq!(alloc_count::alloc_bytes(), 0);
+        assert_eq!(alloc_count::cell_reads(), 0);
+        assert_eq!(alloc_count::cell_writes(), 0);
+    }
+
+    #[test]
     #[ignore]
     fn scheduler_tick_cost_at_budget() {
         let mut m = map();

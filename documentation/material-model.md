@@ -30,7 +30,7 @@ Code: `crates/material` (pure kernel). Game intern table: `src/block/registry.rs
 
 ## Probes and observations
 
-`Probes` are fixed reference elements (constants of the universe): contact, light, flow, glow, friction. `observe(law, C)` is the bounded response of `C` to each probe, mapped through law thresholds:
+`Probes` are fixed reference elements (constants of the universe): contact, light, flow, glow, friction. `observe(law, C)` (`observe_element` for a single element) is the bounded response of `C` to each probe, mapped through `Observation::from_responses`:
 
 - `solid` = non-empty and not liquid; `liquid` = flow ≥ `liquid_min`
 - `transparency` = light response; `emission` = glow above `glow_min`
@@ -46,7 +46,7 @@ Core fallback: `src/block/appearance.rs` (`FlatAppearance`). A texture mod paint
 
 ## Scheduler
 
-`src/sim/reactions.rs`. Gameplay events → neighbour pairs → `interact` on a snapshot → mutations commit in position order → follow-up events for the next generation. The queue is keyed by `(arrival generation, position, kind)`: a generation evaluates its budget of the **oldest** events first (ties in position order), and follow-ups are deferred, never dropped; a generation defines simultaneity (targets see the mean of every origin acting in it), so the batch size is part of the dynamics and every peer runs `Budget::DEFAULT`; a scheduler refuses new events only at its capacity (`DEFAULT_CAPACITY`, the `dropped` gauge). Cells are read through the overlay and the generator when no chunk is loaded, so results never depend on streaming state. A store that refuses a write commits nothing for that cell. Runs on the sim tick. Multiplayer: **server only**; clients receive snapshot cells (`Incoming::Mutation`, applied without place/break cues). Chunk load, gen, mesh, and save never emit.
+`src/sim/reactions.rs`. Gameplay events → neighbour pairs → `interact_many` on a snapshot → `Mutation { pos, from, to }` commits in position order → follow-up events for the next generation. The queue is keyed by `(arrival generation, position, kind)`: a generation evaluates its budget of the **oldest** events first (ties in position order), and follow-ups are deferred, never dropped; a generation defines simultaneity (targets see the mean of every origin acting in it), so the batch size is part of the dynamics and every peer runs `Budget::DEFAULT`; a scheduler refuses new events only at its capacity (`DEFAULT_CAPACITY`, the `dropped` gauge). Cells are read through the overlay and the generator when no chunk is loaded, so results never depend on streaming state. A store that refuses a write commits nothing for that cell. Runs on the sim tick. Multiplayer: **server only**; clients receive snapshot cells (`Incoming::Mutation`, applied without place/break cues) as `ServerMessage::Snapshot` batches (and `ServerMessage::Edit` for a single cell). Chunk load, gen, mesh, and save never emit.
 
 | Gameplay | Event |
 |---|---|
@@ -61,13 +61,13 @@ Core fallback: `src/block/appearance.rs` (`FlatAppearance`). A texture mod paint
 
 ## Holdings and the workbench
 
-Stash entries are `(BlockId, count)` (`src/stash.rs`). Breaking yields that configuration. Inventory shows the visual swatch and words read off the observation (`BlockRegistry::display_name` → `describe`: phase, hardness band, clarity, glow, grip — e.g. "glowing clear hard solid"); materials have no authored names, and the names players give their own products are journal knowledge. Crafting (`src/mods/crafting.rs`) applies an event between two held configurations through `interact` (repeat 1..16); discovered procedures are journal knowledge. On a server the client sends `Craft` and never trusts its own result. The workbench acts only between two HELD units (the target is consumed, the origin must be present; slots naming a spent row are cleared). The server evaluates a `Craft` only from a ready player, at most `CRAFT_RATE_LIMIT` per second per connection, and resolves the specs without growing its table: a configuration it knows resolves by lookup, a novel one is interned only while `CLIENT_INTERN_RESERVE` ids stay free for the world's own products (`resolve_client_spec`, also the `Edit` path) — no client can exhaust the material table. A rejected placement whose refund no longer fits the pouch is counted and shown, never silently destroyed.
+Stash entries are `(BlockId, count)` (`src/stash.rs`). Breaking yields that configuration. Inventory shows the visual swatch and words read off the observation (`BlockRegistry::display_name` → `describe`: phase, hardness band, clarity, glow, grip — e.g. "glowing clear hard solid"); materials have no authored names, and the names players give their own products are journal knowledge. Crafting (`src/mods/crafting.rs`) applies an event between two held configurations through `interact` / `interact_repeat` (repeat 1..16); discovered procedures are journal knowledge. On a server the client sends `ClientMessage::Craft` and never trusts its own result. The workbench acts only between two HELD units (the target is consumed, the origin must be present; slots naming a spent row are cleared). The server evaluates a `Craft` only from a ready player, at most `CRAFT_RATE_LIMIT` per second per connection, and resolves the specs without growing its table: a configuration it knows resolves by lookup, a novel one is interned only while `CLIENT_INTERN_RESERVE` ids stay free for the world's own products (`resolve_client_spec`, also the `Edit` path) — no client can exhaust the material table. A rejected placement whose refund no longer fits the pouch is counted and shown, never silently destroyed.
 
 ## Saves and protocol
 
 Save **v8** (`src/save/format.rs`): spec table = encodings; `law_stamp` = the law. Reaction mutations are ordinary overlay edits attributed to the scheduler.
 
-Protocol **v10**: `Welcome` carries the law stamp; fingerprint folds `WORLDGEN_VERSION`, `Law::fingerprint()`, and builtin region centres. `ConfigDefinition { id, encoding }` then `CellMutation { pos, id }`. Mixed laws do not join.
+Protocol **v10** (`PROTOCOL_VERSION` in `src/net/mod.rs`): `ServerMessage::Welcome` carries `law` (`Law::stamp()`); `content_fingerprint` folds `WORLDGEN_VERSION`, `Law::fingerprint()`, and builtin region centres. Cell changes travel as `ServerMessage::Snapshot { edits: Vec<(x, y, z, rev, spec)> }` (join and reaction batches) and `ServerMessage::Edit { x, y, z, rev, spec }` (one cell). Specs are `BlockRegistry::spec` (`air` / `c:<hex>`). Mixed laws do not join.
 
 ## The lab
 
