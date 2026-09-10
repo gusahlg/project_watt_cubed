@@ -9,7 +9,9 @@
 //!
 //! Positions travel as 3x f64 (24 bytes): the game plays out to ±1e9 blocks,
 //! where f32 cannot even represent adjacent positions.
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(test)]
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
@@ -406,6 +408,7 @@ fn frame_len(header: [u8; 4]) -> io::Result<usize> {
 }
 
 /// Refuses to emit an over-cap frame so both ends share one hard size bound.
+#[cfg(test)]
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     w.write_all(&frame_header(payload)?)?;
     w.write_all(payload)
@@ -414,6 +417,7 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
 /// `buf` is caller-owned scratch, reused so steady-state traffic never
 /// allocates per frame. Rejects a length past [`MAX_FRAME`] before growing
 /// the buffer, so a malicious header can't trigger a huge or endless read.
+#[cfg(test)]
 pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;

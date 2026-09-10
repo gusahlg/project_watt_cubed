@@ -80,12 +80,14 @@ impl SkyClock {
 
     /// Sun elevation above the horizon, `[-1, 1]` (`sun_dir().y`). The single
     /// scalar the atmosphere and lighting blend day↔night on.
+    #[cfg(test)]
     pub fn sun_elevation(&self) -> f32 {
         self.sun_dir().y
     }
 
     /// Daylight amount in `[0, 1]`: 0 through the night, 1 in full day, with a
     /// smooth twilight either side of the horizon crossing.
+    #[cfg(test)]
     pub fn daylight(&self) -> f32 {
         smoothstep(-0.12, 0.18, self.sun_elevation())
     }

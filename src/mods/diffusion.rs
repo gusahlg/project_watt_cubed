@@ -17,6 +17,7 @@ impl InfiniteDiffusionMod {
         }
     }
 
+    #[cfg(test)]
     pub fn cfg(&self) -> DiffusionCfg {
         self.cfg
     }

@@ -2,7 +2,7 @@
 //! world block coordinate and a `(chunk, local)` pair.
 //!
 //! This module owns the coordinate split and join logic, chunk-space regions
-//! ([`ChunkBox`]), and chunk face helpers ([`Face`], [`ByFace`]) used by
+//! ([`ChunkBox`]), and chunk face helpers ([`Face`], [`ByPass`]) used by
 //! streaming and meshing. [`Local`]'s fields are private; the only way to
 //! create a valid local coordinate is through split or [`Local::new`].
 
@@ -111,6 +111,7 @@ impl ChunkCoord {
         Self { x, y, z }
     }
 
+    #[cfg(test)]
     #[inline]
     pub fn to_tuple(self) -> (i32, i32, i32) {
         (self.x, self.y, self.z)
@@ -141,9 +142,9 @@ impl From<(i32, i32, i32)> for ChunkCoord {
 }
 
 /// The six axis-aligned chunk-face directions. The discriminant doubles as
-/// the index into the mesher's border planes ([`ByFace`]), so a face's
-/// neighbour offset and its border slice always line up without a separate
-/// index to keep in sync.
+/// the index into the mesher's border planes, so a face's neighbour offset
+/// and its border slice always line up without a separate index to keep in
+/// sync.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum Face {
@@ -183,6 +184,7 @@ impl Face {
     }
 
     /// World axis this face is perpendicular to (0=X, 1=Y, 2=Z).
+    #[cfg(test)]
     #[inline]
     pub const fn axis(self) -> usize {
         match self {
@@ -190,12 +192,6 @@ impl Face {
             Face::NegY | Face::PosY => 1,
             Face::NegZ | Face::PosZ => 2,
         }
-    }
-
-    /// Whether this face points along the positive axis.
-    #[inline]
-    pub const fn positive(self) -> bool {
-        matches!(self, Face::PosX | Face::PosY | Face::PosZ)
     }
 
     #[inline]
@@ -212,32 +208,8 @@ impl Face {
     }
 }
 
-pub struct ByFace<T>([T; 6]);
-
-impl<T> ByFace<T> {
-    #[inline]
-    pub fn from_fn(f: impl FnMut(Face) -> T) -> Self {
-        ByFace(Face::ALL.map(f))
-    }
-}
-
-impl<T> Index<Face> for ByFace<T> {
-    type Output = T;
-    #[inline]
-    fn index(&self, f: Face) -> &T {
-        &self.0[f as usize]
-    }
-}
-
-impl<T> IndexMut<Face> for ByFace<T> {
-    #[inline]
-    fn index_mut(&mut self, f: Face) -> &mut T {
-        &mut self.0[f as usize]
-    }
-}
-
-/// A value per draw [`Pass`], keyed by `Pass` instead of a loose index — the
-/// per-pass analogue of [`ByFace`]. Slot `k` always belongs to `Pass` with
+/// A value per draw [`Pass`], keyed by `Pass` instead of a loose index.
+/// Slot `k` always belongs to `Pass` with
 /// discriminant `k`, and the width is [`Pass::COUNT`](voxel_engine::Pass::COUNT),
 /// so the container follows the enum by construction — adding a pass never widens
 /// this type by hand. Used for the per-technique mesh product on both its CPU side
@@ -262,6 +234,7 @@ impl<T> ByPass<T> {
     pub fn into_iter_passes(self) -> impl Iterator<Item = (voxel_engine::Pass, T)> {
         voxel_engine::Pass::ALL.into_iter().zip(self.0)
     }
+    #[cfg(test)]
     #[inline]
     pub fn into_slots(self) -> [T; voxel_engine::Pass::COUNT] {
         self.0
@@ -383,18 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn byface_index_matches_all_order() {
-        // A `ByFace` built by `from_fn` should read back each slot as the
-        // face that produced it.
-        let by = ByFace::from_fn(|f| f);
+    fn face_delta_touches_match_old_branches() {
         for (k, &f) in Face::ALL.iter().enumerate() {
             assert_eq!(f as usize, k, "Face::ALL not in discriminant order");
-            assert_eq!(by[f], f, "ByFace slot disagrees with its Face key");
         }
-    }
-
-    #[test]
-    fn face_delta_touches_match_old_branches() {
         // `delta` is the six axis-aligned neighbour offsets (order doesn't matter).
         let old_offsets = [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)];
         let mut got: Vec<_> = Face::ALL.iter().map(|f| f.delta()).collect();

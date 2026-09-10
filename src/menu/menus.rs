@@ -253,52 +253,6 @@ impl Menu for SettingsPage {
     }
 }
 
-// A generic yes/no dialog (provided for callers that need a confirmation).
-
-#[derive(Clone, Copy)]
-pub enum Choice {
-    Yes,
-    No,
-}
-
-/// Confirmation dialog with a stored effect for Yes.
-pub struct ConfirmDialog {
-    message: String,
-    on_yes: Option<AppEffect>,
-}
-
-impl ConfirmDialog {
-    pub fn new(message: impl Into<String>, on_yes: AppEffect) -> Self {
-        Self { message: message.into(), on_yes: Some(on_yes) }
-    }
-}
-
-impl Menu for ConfirmDialog {
-    type Action = Choice;
-
-    fn view(&self, _ctx: &Ctx) -> View<Choice> {
-        View {
-            title: self.message.clone(),
-            style: Style::Panel,
-            rows: vec![Row::action("Yes", Choice::Yes), Row::action("No", Choice::No)],
-            default: None,
-            hint: "Enter choose   Esc cancel".to_string(),
-            notice: None,
-        }
-    }
-
-    fn update(&mut self, msg: Msg<Choice>, _ctx: &mut Ctx) -> Command {
-        match msg {
-            Msg::Pick(Choice::Yes) => match self.on_yes.take() {
-                Some(effect) => Command::Effect(effect),
-                None => Command::Pop,
-            },
-            Msg::Pick(Choice::No) | Msg::Back => Command::Pop,
-            _ => Command::Stay,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

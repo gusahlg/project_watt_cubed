@@ -12,8 +12,12 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{encode_current, load, save, snapshot, unix_now};
-pub use slot::{SaveError, SaveMeta, Slot, SlotId};
+pub use bridge::{encode_current, load, snapshot, unix_now};
+pub use slot::{SaveMeta, Slot, SlotId};
+#[cfg(test)]
+pub use bridge::save;
+#[cfg(test)]
+pub use slot::SaveError;
 pub use store::{Source, fresh_id, list, write_atomic_file};
 pub(crate) use store::log_fs_err;
 

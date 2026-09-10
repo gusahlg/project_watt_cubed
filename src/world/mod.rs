@@ -67,7 +67,6 @@ use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
-use crate::render::Render;
 use chunk::{CHUNK_SIZE, Chunk};
 use generation::WorldgenKind;
 use heightmip::HeightMip;
@@ -2525,12 +2524,6 @@ impl StreamLane for LightLane {
         {
             world.accept_light(coord, epoch, light_gen, grid);
         }
-    }
-}
-
-impl Render for World {
-    fn render(&self, f: &mut Frame3D, cam: DVec3) {
-        World::render(self, f, cam);
     }
 }
 

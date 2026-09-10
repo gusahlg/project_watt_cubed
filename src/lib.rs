@@ -33,7 +33,6 @@ pub mod net;
 pub mod paths;
 pub(crate) mod player;
 pub(crate) mod presence;
-pub(crate) mod render;
 pub(crate) mod render_config;
 pub(crate) mod save;
 pub(crate) mod sched;

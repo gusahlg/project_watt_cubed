@@ -6,11 +6,11 @@
 use crate::ident::{BlockState, Detail};
 
 /// A brick: 16³ cells at `level`. World extent = 16·2^level. The payload
-/// packing is a type parameter: sections use the full [`BrickPayload`]
-/// (default), chunks the Rle-free [`ChunkPayload`], so "an Rle chunk" is
-/// unrepresentable rather than a guarded-against runtime state.
+/// packing is a type parameter: production chunks use [`ChunkPayload`];
+/// section tests use the full [`BrickPayload`] (Rle included), so "an Rle
+/// chunk" is unrepresentable rather than a guarded-against runtime state.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Brick<P = BrickPayload> {
+pub struct Brick<P = ChunkPayload> {
     pub level: Detail,
     pub rev: voxel_engine::Rev,
     pub payload: P,
@@ -18,15 +18,19 @@ pub struct Brick<P = BrickPayload> {
 
 /// Brick edge length: frozen — every payload variant and cross-chunk seam
 /// logic assumes 16³.
+#[cfg(test)]
 pub const BRICK_DIM: usize = 16;
-/// Cells per brick (16³).
+/// Cells per brick (16³). Section extract and the payload packer (test-only
+/// since the fused mesh path landed) index by this.
+#[cfg(test)]
 pub const BRICK_VOLUME: usize = BRICK_DIM * BRICK_DIM * BRICK_DIM;
-/// Per-brick palette cap: index fits `u8`; above this, [`BrickPayload::Dense`].
+/// Per-brick palette cap: index fits `u8`; above this, [`ChunkPayload::Dense`].
 pub const PALETTE_MAX: usize = 256;
 
 /// Cell index within a brick's flat `[BlockState; BRICK_VOLUME]` arrays: x
 /// fastest, then z, then y. All payload variants and `cells()`/`from_cells()`
 /// must agree on this ordering.
+#[cfg(test)]
 #[inline]
 pub const fn cell_index(x: usize, y: usize, z: usize) -> usize {
     x + z * BRICK_DIM + y * BRICK_DIM * BRICK_DIM
@@ -36,12 +40,14 @@ pub const fn cell_index(x: usize, y: usize, z: usize) -> usize {
 /// (x, z) column) at `palette_index`. Fields are private — [`Run::new`] is
 /// the only constructor, so `count == 0` or `count > 16` (both outside a
 /// brick column's height) are unrepresentable.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Run {
     palette_index: u8,
     count: u8,
 }
 
+#[cfg(test)]
 impl Run {
     /// `count` must be in `1..=16` — a run is never empty and never taller
     /// than one brick column. `pub(crate)`: section extraction/downsample
@@ -67,6 +73,7 @@ impl Run {
 /// as the only constructor keep the canonical-form invariants (each column's
 /// counts sum to exactly 16, adjacent runs differ in `palette_index`)
 /// unrepresentable to violate from outside this module.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RleColumns {
     runs: Box<[Run]>,
@@ -76,6 +83,7 @@ pub struct RleColumns {
     column_ends: Box<[u16; BRICK_DIM * BRICK_DIM]>,
 }
 
+#[cfg(test)]
 impl RleColumns {
     /// Builds from one run list per column, `column_runs[x + z*16]`,
     /// x-major. Panics if a column's counts don't sum to 16 or adjacent
@@ -109,12 +117,14 @@ impl RleColumns {
 /// A hint rather than a heuristic keeps the choice deterministic by
 /// construction: the caller's hint is part of the input, so equal
 /// `(cells, strategy)` pairs always produce equal payloads.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PackStrategy {
     Paletted,
     Rle,
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum BrickPayload {
     Uniform(BlockState),
@@ -148,6 +158,7 @@ pub enum ChunkPayload {
     Dense(Box<[BlockState]>),
 }
 
+#[cfg(test)]
 impl BrickPayload {
     /// Canonical constructor: `cells` is exactly [`BRICK_VOLUME`] values
     /// indexed by [`cell_index`] (x-fastest, then z, then y). Picks the

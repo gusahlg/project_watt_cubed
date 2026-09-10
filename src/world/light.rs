@@ -58,16 +58,6 @@ impl LightLevel {
     pub const fn get(self) -> u8 {
         self.0
     }
-    /// One flood step of attenuation; saturates at [`DARK`](Self::DARK).
-    #[inline]
-    pub const fn attenuated(self) -> Self {
-        Self(self.0.saturating_sub(1))
-    }
-    /// Returns the brighter of the two values.
-    #[inline]
-    pub fn brighter(self, o: Self) -> Self {
-        Self(self.0.max(o.0))
-    }
 }
 
 /// Skylight and blocklight paired; prevents channel desyncs.
@@ -79,6 +69,7 @@ pub struct Lumel {
 
 impl Lumel {
     pub const DARK: Self = Self { sky: LightLevel::DARK, block: LightLevel::DARK };
+    #[cfg(test)]
     pub const FULL: Self = Self { sky: LightLevel::FULL, block: LightLevel::FULL };
 
     /// Dense-grid storage byte: `sky << 4 | block`.
@@ -101,6 +92,7 @@ pub(in crate::world) struct PackedLumel(u8);
 
 impl PackedLumel {
     const DARK: Self = Self(0);
+    #[cfg(test)]
     const FULL: Self = Self((MAX_LIGHT << 4) | MAX_LIGHT);
     const OPEN_SKY: Self = Self(MAX_LIGHT << 4);
 
@@ -158,6 +150,7 @@ impl LightGrid {
     }
 
     /// An all-full-bright grid, for tests and the neutral mesher path.
+    #[cfg(test)]
     pub const fn full() -> Self {
         Self(Repr::Uniform(Lumel::FULL))
     }
@@ -191,6 +184,7 @@ impl LightGrid {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub fn at(&self, idx: usize) -> Lumel {
         self.packed_at(idx).unpack()
@@ -336,22 +330,10 @@ impl PaddedLight {
         self.inner.at_flat(i).unpack()
     }
 
-    /// An all-dark shell (no neighbour light anywhere) — the neutral settle path.
-    pub fn dark() -> Self {
-        Self { inner: Neighborhood::filled(PackedLumel::DARK) }
-    }
-
     /// An all-full-bright shell — the neutral mesher path (tests).
+    #[cfg(test)]
     pub fn full() -> Self {
         Self { inner: Neighborhood::filled(PackedLumel::FULL) }
-    }
-
-    /// Full skylight, no blocklight — the shell equivalent of
-    /// [`LightGrid::open_sky`]. Used to mesh coarse LOD tiles, which are top-down
-    /// surface approximations open to the sky with no emitters, so their shading
-    /// tracks day/night via skylight instead of clamping to a fake full emitter.
-    pub fn open_sky() -> Self {
-        Self { inner: Neighborhood::filled(PackedLumel::OPEN_SKY) }
     }
 
     /// A shell filled from a per-cell closure over signed coords `-1..=16` — for
@@ -450,6 +432,7 @@ impl CeilingWindow {
     }
 
     /// Everything open to the sky — for tests and the neutral path.
+    #[cfg(test)]
     pub fn open() -> Self {
         Self { surface: [i32::MIN; CHUNK_AREA], min_surface: i32::MIN }
     }

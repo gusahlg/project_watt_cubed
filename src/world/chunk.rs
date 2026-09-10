@@ -8,6 +8,7 @@
 use crate::block::registry::{AIR, BlockId, HotTables};
 use crate::ident::{BlockState, Detail};
 use crate::world::brick::{Brick, ChunkPayload, PALETTE_MAX};
+#[cfg(test)]
 use crate::world::generation::TerrainGenerator;
 
 /// Chunk edge length along every world axis (chunks are cubes).
@@ -97,28 +98,20 @@ fn chunk_data_to_brick(data: ChunkData) -> Brick<ChunkPayload> {
 /// per-frame hot path.
 #[derive(Clone)]
 pub struct Chunk {
-    /// Chunk coordinate on the X axis (world X = cx * CHUNK_SIZE + local x).
-    pub cx: i32,
-    /// Chunk coordinate on the Y axis (world Y = cy * CHUNK_SIZE + local y).
-    pub cy: i32,
-    /// Chunk coordinate on the Z axis (world Z = cz * CHUNK_SIZE + local z).
-    pub cz: i32,
     data: Brick<ChunkPayload>,
 }
 
 impl Chunk {
     /// Create a chunk at the given chunk coordinate and fill it using `generator`.
+    #[cfg(test)]
     pub fn new<G: TerrainGenerator + ?Sized>(cx: i32, cy: i32, cz: i32, generator: &G) -> Self {
-        Self { cx, cy, cz, data: chunk_data_to_brick(generator.generate(cx, cy, cz)) }
+        Self { data: chunk_data_to_brick(generator.generate(cx, cy, cz)) }
     }
 
     /// Build a uniform chunk of one block — for tests that place voxels by hand.
     #[cfg(test)]
-    pub fn from_uniform(cx: i32, cy: i32, cz: i32, id: BlockId) -> Self {
+    pub fn from_uniform(_cx: i32, _cy: i32, _cz: i32, id: BlockId) -> Self {
         Self {
-            cx,
-            cy,
-            cz,
             data: Brick { level: Detail(0), rev: voxel_engine::Rev::START, payload: ChunkPayload::Uniform(BlockState { id, state: 0 }) },
         }
     }
@@ -127,15 +120,15 @@ impl Chunk {
     /// real [`ChunkData::from_cells`] path, so fixtures exercise the shipped
     /// representation.
     #[cfg(test)]
-    pub fn from_cells(cx: i32, cy: i32, cz: i32, cells: Box<[BlockId; CHUNK_VOLUME]>) -> Self {
-        Self { cx, cy, cz, data: chunk_data_to_brick(ChunkData::from_cells(cells)) }
+    pub fn from_cells(_cx: i32, _cy: i32, _cz: i32, cells: Box<[BlockId; CHUNK_VOLUME]>) -> Self {
+        Self { data: chunk_data_to_brick(ChunkData::from_cells(cells)) }
     }
 
     /// Wrap pre-generated storage at a chunk coordinate — used by the column
     /// generation worker, which produces [`ChunkData`] from `generate_column`
     /// and pairs it with its coord.
-    pub fn from_data(cx: i32, cy: i32, cz: i32, data: ChunkData) -> Self {
-        Self { cx, cy, cz, data: chunk_data_to_brick(data) }
+    pub fn from_data(_cx: i32, _cy: i32, _cz: i32, data: ChunkData) -> Self {
+        Self { data: chunk_data_to_brick(data) }
     }
 
     /// Flat index from chunk-local coordinates.
@@ -317,6 +310,7 @@ impl Chunk {
     }
 
     /// Write a voxel using chunk-local coordinates.
+    #[cfg(test)]
     pub fn set_local(&mut self, x: usize, y: usize, z: usize, v: BlockId) {
         self.set_index(Self::index(x, y, z), v);
     }

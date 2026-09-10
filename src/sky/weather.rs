@@ -5,7 +5,13 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precip {
     Clear,
+    /// Distinct fog/tint arms in [`Weather::fog_bonus`] / [`Weather::rain_strength`].
+    /// Producers arrive with the precipitation sim (later sky phase).
+    #[allow(dead_code)] // sky/weather.rs later precipitation phase
     Rain,
+    /// Distinct fog arm in [`Weather::fog_bonus`]. Producers arrive with the
+    /// precipitation sim (later sky phase).
+    #[allow(dead_code)] // sky/weather.rs later precipitation phase
     Snow,
 }
 
