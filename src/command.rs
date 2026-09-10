@@ -345,7 +345,9 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let registry = world.registry();
     let cfg = registry.configuration(id);
     let obs = registry.observation(id);
-    let label = registry.label(id).unwrap_or("unknown material");
+    let words = registry.display_name(id);
+    // Labels are worldgen roles ("rock:1"), an internal annotation; the console shows them as such.
+    let role = registry.label(id).map(|l| format!(", worldgen role {l}")).unwrap_or_default();
     let elems: Vec<String> = cfg
         .elements()
         .iter()
@@ -357,7 +359,7 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
         elems.join(" + ")
     };
     shown(vec![
-        format!("block at {x} {y} {z}: {label} (#{}) ", id.0),
+        format!("block at {x} {y} {z}: {words} (#{}{role})", id.0),
         format!("  made of: {made}"),
         format!(
             "  solid {}  liquid {}  transparency {}  emission {}",

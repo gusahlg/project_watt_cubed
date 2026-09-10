@@ -147,8 +147,11 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 /// Peer presence and movement are applied inside [`Connection::poll`]; these
 /// are what the game still has to handle.
 pub enum Incoming {
-    /// Stale revisions were already filtered out by the connection.
+    /// A player's edit (stale revisions were already filtered out by the connection).
     Edit { x: i32, y: i32, z: i32, spec: Arc<str> },
+    /// World state from a snapshot: the bootstrap ledger or a reaction commit. Applied
+    /// like an edit but nobody placed or broke anything, so no block cue is played.
+    Mutation { x: i32, y: i32, z: i32, spec: Arc<str> },
     /// The server accepted our own edit `req`: prediction can forget it.
     EditAccepted { req: u32 },
     /// `restore` is set when no newer authoritative content has landed on the
@@ -478,9 +481,11 @@ fn apply_server_message(
 ) {
     match msg {
             ServerMessage::Snapshot { edits } => {
+                // Authoritative world state (bootstrap ledger, reaction commits): not a
+                // player's act, so it carries no place/break semantics or cue.
                 for (x, y, z, rev, spec) in edits {
                     cell_revs.insert((x, y, z), rev);
-                    out.push(Incoming::Edit { x, y, z, spec });
+                    out.push(Incoming::Mutation { x, y, z, spec });
                 }
             }
             ServerMessage::Edit { x, y, z, rev, spec } => {
@@ -1001,7 +1006,10 @@ mod tests {
         let events = v.apply(ServerMessage::Snapshot {
             edits: vec![(1, 2, 3, 4, "air".into())],
         });
-        assert!(matches!(events.as_slice(), [Incoming::Edit { x: 1, y: 2, z: 3, .. }]));
+        assert!(
+            matches!(events.as_slice(), [Incoming::Mutation { x: 1, y: 2, z: 3, .. }]),
+            "snapshot cells are world state, not a player's edit"
+        );
         assert_eq!(v.cell_revs.get(&(1, 2, 3)), Some(&4));
     }
 

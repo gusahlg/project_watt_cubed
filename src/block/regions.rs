@@ -80,36 +80,6 @@ pub fn builtin(law: &Law) -> Vec<Region> {
 
 /// Presentation name of a configuration: its attached label, else the nearest
 /// worldgen region's label plus `"-like"` when the mean element is within twice
-/// that region's spread, else `"unknown material"`. Never a simulation input.
-pub fn display_name(law: &Law, labelled: Option<&str>, c: &Configuration) -> String {
-    if let Some(label) = labelled {
-        return label.to_string();
-    }
-    match nearest_like(law, c) {
-        Some(label) => format!("{label}-like"),
-        None => "unknown material".to_string(),
-    }
-}
-
-fn nearest_like(law: &Law, c: &Configuration) -> Option<&'static str> {
-    let mean = mean_element(c)?;
-    let mut best: Option<(u32, &'static str)> = None;
-    for r in builtin(law) {
-        let d = mean.distance(r.centre);
-        if d <= 2 * r.spread as u32 {
-            match best {
-                Some((bd, _)) if bd <= d => {}
-                _ => best = Some((d, r.label)),
-            }
-        }
-    }
-    best.map(|(_, label)| label)
-}
-
-fn mean_element(c: &Configuration) -> Option<Element> {
-    let q = c.mean_q8()?;
-    Some(Element::new(q.map(|v| (v / 256) as u8)))
-}
 
 /// True when no pair of family members or strata of `regions` changes under
 /// `Collision` (the strongest event; rest there implies rest under every weaker
@@ -618,36 +588,5 @@ mod tests {
             mid < 5_000,
             "region compile median {mid} µs must stay under 5 ms"
         );
-    }
-
-    #[test]
-    fn display_name_uses_label_then_like_then_unknown() {
-        let law = Law::v0();
-        let regions = builtin(&law);
-        let rock = &regions[0];
-        assert_eq!(
-            display_name(&law, Some("rock"), &Configuration::single(rock.centre)),
-            "rock"
-        );
-        let mut near = rock.centre;
-        near.0[3] = near.0[3].saturating_add(rock.spread);
-        if near == rock.centre {
-            near.0[3] = near.0[3].saturating_sub(rock.spread);
-        }
-        assert_ne!(near, rock.centre, "axis-3 jitter is not a family member");
-        assert_eq!(
-            display_name(&law, None, &Configuration::single(near)),
-            format!("{}-like", rock.label)
-        );
-        let far = Element::new([0, 255, 0, 255]);
-        let within = regions
-            .iter()
-            .any(|r| far.distance(r.centre) <= 2 * r.spread as u32);
-        if !within {
-            assert_eq!(
-                display_name(&law, None, &Configuration::single(far)),
-                "unknown material"
-            );
-        }
     }
 }

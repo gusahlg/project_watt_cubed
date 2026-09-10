@@ -1343,6 +1343,13 @@ impl Game {
                         SoundEvent::BlockPlaced { at, block: id }
                     });
                 }
+                Incoming::Mutation { x, y, z, spec } => {
+                    // Snapshot content: apply silently. A client is never the reaction
+                    // authority, so there is nothing to note; a cascade of a thousand
+                    // cells must not play a thousand block cues.
+                    let id = save::parse_block(self.world.registry_mut(), &spec);
+                    self.world.set_block(x, y, z, id);
+                }
                 Incoming::EditAccepted { req } => {
                     // Prediction confirmed: the optimistic apply IS the truth.
                     self.pending_edits.remove(&req);

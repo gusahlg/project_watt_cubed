@@ -46,7 +46,7 @@ Core fallback: `src/block/appearance.rs` (`FlatAppearance`). A texture mod paint
 
 ## Scheduler
 
-`src/sim/reactions.rs`. Gameplay events → neighbour pairs → `interact` on a snapshot → mutations commit in position order → follow-up events, budgeted per generation. Runs on the sim tick. Multiplayer: **server only**; clients receive `CellMutation`. Chunk load, gen, mesh, and save never emit.
+`src/sim/reactions.rs`. Gameplay events → neighbour pairs → `interact` on a snapshot → mutations commit in position order → follow-up events for the next generation. The queue is keyed by `(arrival generation, position, kind)`: a generation evaluates its budget of the **oldest** events first (ties in position order), and follow-ups are deferred, never dropped; a generation defines simultaneity (targets see the mean of every origin acting in it), so the batch size is part of the dynamics and every peer runs `Budget::DEFAULT`; a scheduler refuses new events only at its capacity (`DEFAULT_CAPACITY`, the `dropped` gauge). Cells are read through the overlay and the generator when no chunk is loaded, so results never depend on streaming state. A store that refuses a write commits nothing for that cell. Runs on the sim tick. Multiplayer: **server only**; clients receive snapshot cells (`Incoming::Mutation`, applied without place/break cues). Chunk load, gen, mesh, and save never emit.
 
 | Gameplay | Event |
 |---|---|
@@ -57,11 +57,11 @@ Core fallback: `src/block/appearance.rs` (`FlatAppearance`). A texture mod paint
 
 ## Regions (worldgen)
 
-`src/block/regions.rs` + `src/world/placement.rs`. Starting families: centre element + variants + strata + a **label used only for debug/HUD**. Placement rules name regions, not materials. At world start each family is interned (deterministic from the law); columns pick a member. Generator output is stable under self-contact. `WORLDGEN_VERSION` (currently 5) folds into the content fingerprint.
+`src/block/regions.rs` + `src/world/placement.rs`. Starting families: centre element + variants + strata + a **label used only by placement rules and the `inspect` console command** — never shown to a player. Placement rules name regions, not materials. At world start each family is interned (deterministic from the law); columns pick a member. Generator output is stable under self-contact. `WORLDGEN_VERSION` (currently 5) folds into the content fingerprint.
 
 ## Holdings and the workbench
 
-Stash entries are `(BlockId, count)` (`src/stash.rs`). Breaking yields that configuration. Inventory shows the visual swatch and an optional region label (else "unknown"). Crafting (`src/mods/crafting.rs`) applies an event between two held configurations through `interact` (repeat 1..16); discovered procedures are journal knowledge. On a server the client sends `Craft` and never trusts its own result.
+Stash entries are `(BlockId, count)` (`src/stash.rs`). Breaking yields that configuration. Inventory shows the visual swatch and words read off the observation (`BlockRegistry::display_name` → `describe`: phase, hardness band, clarity, glow, grip — e.g. "glowing clear hard solid"); materials have no authored names, and the names players give their own products are journal knowledge. Crafting (`src/mods/crafting.rs`) applies an event between two held configurations through `interact` (repeat 1..16); discovered procedures are journal knowledge. On a server the client sends `Craft` and never trusts its own result. The workbench acts only between two HELD units (the target is consumed, the origin must be present; slots naming a spent row are cleared). The server evaluates a `Craft` only from a ready player, at most `CRAFT_RATE_LIMIT` per second per connection, and resolves the specs without growing its table: a configuration it knows resolves by lookup, a novel one is interned only while `CLIENT_INTERN_RESERVE` ids stay free for the world's own products (`resolve_client_spec`, also the `Edit` path) — no client can exhaust the material table. A rejected placement whose refund no longer fits the pouch is counted and shown, never silently destroyed.
 
 ## Saves and protocol
 

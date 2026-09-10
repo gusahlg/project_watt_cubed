@@ -307,9 +307,11 @@ impl BlockRegistry {
         self.apply_interaction(&origin, &target, event, repeat)
     }
 
-    /// Presentation name: attached label, else nearest region `"-like"`, else `"unknown material"`.
+    /// What a player is told about a material: a description read off the law (its observed
+    /// properties), never an authored name. Labels are worldgen annotations and stay internal; the
+    /// names players give their own products live in their journals.
     pub fn display_name(&self, id: BlockId) -> String {
-        crate::block::regions::display_name(self.law(), self.label(id), &self.configs[id.0 as usize])
+        describe(&self.observation(id))
     }
 
     /// Intern a configuration: the existing id if it was seen, else a new one with its readings and
@@ -560,6 +562,40 @@ impl BlockRegistry {
     }
 }
 
+/// Words for an observation: phase, hardness band, clarity, glow, grip — each a threshold on a probe
+/// response, so two configurations that read alike are described alike and a law change re-words
+/// the world by itself. The void is "air".
+pub fn describe(obs: &Observation) -> String {
+    if !obs.solid && !obs.liquid {
+        return "air".to_string();
+    }
+    let mut words: Vec<&str> = Vec::with_capacity(5);
+    if obs.emission > 0 {
+        words.push("glowing");
+    }
+    match obs.transparency {
+        200..=255 => words.push("clear"),
+        100..=199 => words.push("hazy"),
+        _ => {}
+    }
+    if obs.liquid {
+        words.push(if obs.flow >= 200 { "thin liquid" } else { "liquid" });
+    } else {
+        words.push(match obs.hardness {
+            200..=255 => "hard",
+            100..=199 => "firm",
+            _ => "soft",
+        });
+        match obs.friction {
+            192..=255 => words.push("rough"),
+            0..=63 => words.push("slick"),
+            _ => {}
+        }
+        words.push("solid");
+    }
+    words.join(" ")
+}
+
 /// `air` or `c:<hex of the encoding>`. `None` for legacy names, odd nibbles, non-ASCII, or
 /// a truncated/oversize payload — hostile wire/save input must not panic.
 fn decode_spec(spec: &str) -> Option<Configuration> {
@@ -686,6 +722,41 @@ mod tests {
         assert_eq!(r.id_by_label("rock-like"), Some(id));
         assert_eq!(r.label(id), Some("rock-like"));
         assert!(r.spec(id).starts_with("c:"), "the spec never carries the label");
+        assert!(
+            !r.display_name(id).contains("rock"),
+            "a label is a worldgen annotation, never shown to the player: {}",
+            r.display_name(id)
+        );
+    }
+
+    #[test]
+    fn display_names_are_read_off_the_observation() {
+        let r = BlockRegistry::with_builtins();
+        assert_eq!(r.display_name(AIR), "air");
+        let mut obs = Observation::AIR;
+        obs.solid = true;
+        obs.transparency = 0;
+        obs.hardness = 230;
+        obs.friction = 128;
+        assert_eq!(describe(&obs), "hard solid");
+        obs.emission = 9;
+        obs.transparency = 210;
+        obs.friction = 20;
+        assert_eq!(describe(&obs), "glowing clear hard slick solid");
+        let mut liq = Observation::AIR;
+        liq.liquid = true;
+        liq.transparency = 60;
+        liq.flow = 240;
+        assert_eq!(describe(&liq), "thin liquid");
+        liq.transparency = 230;
+        assert_eq!(describe(&liq), "clear thin liquid");
+        // Two configurations with equal readings get equal words: the description is a reading.
+        let mut r = BlockRegistry::with_builtins();
+        let a = r.intern(&cfg(&[[120, 130, 140, 150]])).unwrap();
+        let b = r.intern(&cfg(&[[121, 130, 140, 150]])).unwrap();
+        if r.observation(a) == r.observation(b) {
+            assert_eq!(r.display_name(a), r.display_name(b));
+        }
     }
 
     #[test]
