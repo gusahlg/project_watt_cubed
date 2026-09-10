@@ -75,6 +75,7 @@ fn response_curve_is_odd_continuous_and_zero_at_rest() {
     assert_eq!(kernel::response(&k, 5), 0, "dead zone: near-identical matter does not react");
     assert!(kernel::response(&k, 16) < 0, "repulsive just outside the dead zone");
     assert!(kernel::response(&k, 40) > 0, "attractive at middle range");
+    assert_eq!(kernel::response(&k, 24), 0, "the rest band: no force at the bond length");
     assert_eq!(kernel::response(&k, 100), 0, "inert when very different");
     assert_eq!(kernel::response(&k, 255), 0);
 }

@@ -123,8 +123,9 @@ impl Law {
     /// attraction 24..64 (peak at 40) and NOTHING beyond 64 (very different matter is inert, so a world
     /// of well-separated regions is at rest); identity mixing plus a quarter cyclic coupling, six units
     /// of maximum step, clamped boundaries, no quantization. Reactions therefore happen between
-    /// moderately similar materials — chemistry among relatives — and products settle at the ring
-    /// where repulsion and attraction balance (24 units).
+    /// moderately similar materials — chemistry among relatives — and products settle in the flat
+    /// band 22..26 where repulsion and attraction balance (a zero-slope band, so integer steps cannot
+    /// oscillate across it: pairs come to rest instead of hopping around the ring forever).
     pub const fn v0() -> Law {
         Law {
             version: 0,
@@ -134,11 +135,11 @@ impl Law {
                     (0, 0),
                     (10, 0),
                     (16, -8),
-                    (24, 0),
+                    (22, 0),
+                    (26, 0),
                     (40, 10),
                     (56, 4),
                     (64, 0),
-                    (160, 0),
                     (255, 0),
                 ],
                 mixing: [[16, 4, 0, 0], [0, 16, 4, 0], [0, 0, 16, 4], [4, 0, 0, 16]],
