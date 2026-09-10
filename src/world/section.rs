@@ -23,9 +23,8 @@ use crate::coord::ChunkCoord;
 use crate::ident::BlockState;
 use crate::ident::Detail;
 
-use super::brick::BRICK_DIM;
 #[cfg(test)]
-use super::brick::{BRICK_VOLUME, Brick, BrickPayload, PackStrategy, cell_index};
+use super::brick::{BRICK_DIM, BRICK_VOLUME, Brick, BrickPayload, PackStrategy, cell_index};
 use super::chunk::{CHUNK_SIZE, Chunk};
 #[cfg(test)]
 use super::generation::TerrainGenerator;
@@ -179,16 +178,16 @@ pub(in crate::world) struct DecodedRun {
 /// `n_cells` (the mesher) or by the stack's own brick count (`column_runs`,
 /// self-bounding).
 #[cfg(test)]
-pub(in crate::world) struct BrickStack(Box<[Brick]>);
+pub(in crate::world) struct BrickStack(Box<[Brick<BrickPayload>]>);
 
 #[cfg(test)]
 impl BrickStack {
-    fn from_bricks(bricks: Vec<Brick>) -> Self {
+    fn from_bricks(bricks: Vec<Brick<BrickPayload>>) -> Self {
         BrickStack(bricks.into_boxed_slice())
     }
 
     /// Decode one brick's column (x, z) into resolved (BlockId, count) runs.
-    fn brick_column(brick: &Brick, x: usize, z: usize) -> Vec<(BlockId, u8)> {
+    fn brick_column(brick: &Brick<BrickPayload>, x: usize, z: usize) -> Vec<(BlockId, u8)> {
         match &brick.payload {
             BrickPayload::Uniform(v) => vec![(v.id, BRICK_DIM as u8)],
             BrickPayload::Rle { palette, columns } => {
@@ -461,7 +460,7 @@ mod tests {
     }
     fn blocks() -> Blocks {
         let mut r = BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r);
+        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
         let id = |n: &str| r.id_by_label(n).unwrap();
         Blocks {
             air: AIR,

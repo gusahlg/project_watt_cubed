@@ -29,8 +29,11 @@ pub const CH_TEMP: u32 = 1;
 pub const CH_HUMID: u32 = 2;
 pub const CH_GEOL: u32 = 3;
 pub const CH_WATER: u32 = 4;
+#[allow(dead_code)] // WORLDGEN-DIFFUSION-V2-DESIGN-2026-09-10.md §2.2 (W3/W4)
 pub const CH_CAVES: u32 = 5;
+#[allow(dead_code)] // WORLDGEN-DIFFUSION-V2-DESIGN-2026-09-10.md §2.2 (W3/W4)
 pub const CH_SKY: u32 = 6;
+#[allow(dead_code)] // WORLDGEN-DIFFUSION-V2-DESIGN-2026-09-10.md §2.2 (W3/W4)
 pub const CH_DETAIL: u32 = 7;
 
 /// Geology packing (one i32):
@@ -397,7 +400,7 @@ pub struct DiffusionV2 {
 impl DiffusionV2 {
     pub fn new(registry: &mut BlockRegistry, cfg: DiffusionCfg, seed: i64) -> Self {
         let cfg = cfg.clamp();
-        let mat = placement::builtin().compile(registry);
+        let mat = placement::builtin().compile(registry).expect("v0 hosts the placement table");
         let iseed = seed as u32;
         let spec = IntSpec {
             seed: iseed,

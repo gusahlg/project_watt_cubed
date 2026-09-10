@@ -1,8 +1,9 @@
-//! Command-line front of the material lab: scorecard, find-regions, sweep.
+//! Command-line front of the material lab: scorecard, find-regions, sweep, explain.
 
 use material::Law;
 use material_lab::{
-    find_regions, law_from_hex, render, run_scorecard, sweep, Scale, LABELS,
+    explain_text, find_regions, law_from_hex, render, render_hit, run_scorecard, sweep, Scale,
+    LABELS,
 };
 
 fn usage() -> ! {
@@ -11,7 +12,8 @@ fn usage() -> ! {
 usage:
   lab scorecard <seed> [--law-stamp <hex>]
   lab find-regions <seed> <count>
-  lab sweep <seed> <n>"
+  lab sweep <seed> <n>
+  lab explain <stamp-hex>"
     );
     std::process::exit(2);
 }
@@ -33,6 +35,7 @@ fn main() {
         "scorecard" => cmd_scorecard(&args),
         "find-regions" => cmd_find_regions(&args),
         "sweep" => cmd_sweep(&args),
+        "explain" => cmd_explain(&args),
         _ => usage(),
     }
 }
@@ -99,14 +102,23 @@ fn cmd_sweep(args: &[String]) {
     let seed = parse_u64(&args[0], "seed");
     let n = parse_u64(&args[1], "n") as u32;
     let hits = sweep(seed, n);
-    println!("sweep seed={seed} n={n}  (from Law::v0(), reduced scorecard)");
+    println!(
+        "sweep seed={seed} n={n}  (v0-shaped: rest 20..30, peak, fade, coupling 0..=8, max_step 4..=8, event strengths; reduced scorecard)"
+    );
+    println!("rank: quiescent% , family-target (8-200, mean>=20) , native sublinear , PASS");
     for (i, h) in hits.iter().enumerate() {
-        println!(
-            "#{}  PASS {}/7  families={}  stamp={}",
-            i + 1,
-            h.passes,
-            h.families,
-            h.stamp_hex
-        );
+        println!("{}", render_hit(i + 1, h));
+        println!();
     }
+}
+
+fn cmd_explain(args: &[String]) {
+    if args.len() != 1 {
+        usage();
+    }
+    let law = law_from_hex(&args[0]).unwrap_or_else(|e| {
+        eprintln!("law stamp: {e}");
+        std::process::exit(1);
+    });
+    println!("{}", explain_text(&law));
 }

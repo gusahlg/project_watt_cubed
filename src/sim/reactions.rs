@@ -4,7 +4,7 @@
 //! only gameplay hands in events. In multiplayer the server owns the scheduler and broadcasts the
 //! committed mutations; a client never evaluates reactions itself.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use material::{interact_many, EventKind, Law};
 
@@ -30,8 +30,9 @@ pub struct MaterialEvent {
 pub trait CellStore {
     /// The material at a position. `None` for unloaded space, which never reacts.
     fn block_at(&self, pos: Pos) -> Option<BlockId>;
-    /// Overwrite a cell; returns the previous id.
-    fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId;
+    /// Overwrite a cell; returns the previous id, or `None` when the store refused the write (nothing
+    /// changed — the scheduler then commits nothing for that cell).
+    fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId>;
     /// The material table.
     fn registry(&self) -> &BlockRegistry;
     /// The material table, for interning results.
@@ -49,15 +50,14 @@ pub struct Mutation {
     pub to: BlockId,
 }
 
-/// Budget per generation and per tick, so a rule cannot cascade unboundedly in one frame.
+/// Budget per generation and per tick, so a rule cannot cascade unboundedly in one frame. Events
+/// beyond the budget are not dropped: they wait, oldest first, for the next generation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Budget {
     /// Events evaluated per generation (the rest wait for the next generation).
     pub events_per_generation: usize,
     /// Generations run per tick.
     pub generations_per_tick: u32,
-    /// Follow-up events a single generation may emit (cells that changed re-enter the queue).
-    pub max_followups: usize,
 }
 
 impl Budget {
@@ -65,9 +65,12 @@ impl Budget {
     pub const DEFAULT: Budget = Budget {
         events_per_generation: 256,
         generations_per_tick: 2,
-        max_followups: 512,
     };
 }
+
+/// Distinct pending events a scheduler holds before it refuses more (a memory guard for a law that
+/// never comes to rest on an infinite world; the count of refusals is the `dropped` gauge).
+pub const DEFAULT_CAPACITY: usize = 16_384;
 
 const FACES: [(i32, i32, i32); 6] = [
     (1, 0, 0),
@@ -96,63 +99,114 @@ pub fn on_broken(sched: &mut ReactionScheduler, at: Pos) {
     }
 }
 
+/// `EventKind` from its `repr(u8)` value (the queue keys on the byte so it orders without `Ord`).
+fn kind_from_u8(k: u8) -> EventKind {
+    const KINDS: [EventKind; 4] = [
+        EventKind::Moved,
+        EventKind::NewContact,
+        EventKind::Collision,
+        EventKind::ExternallyChanged,
+    ];
+    KINDS[k as usize]
+}
+
 /// The scheduler state: pending events (deduplicated per position and kind) and counters.
-#[derive(Default)]
+///
+/// The queue is keyed by `(arrival generation, position, kind)`: a generation evaluates the OLDEST
+/// events first and breaks ties in position order. Follow-ups of a generation arrive for the next
+/// one, so a cascade larger than the budget is worked through in arrival order instead of being
+/// truncated by coordinate. A generation defines simultaneity (its targets see the mean of every
+/// origin acting in it), so the batch size is part of the dynamics: every peer runs
+/// [`Budget::DEFAULT`], which keeps results identical across machines.
 pub struct ReactionScheduler {
-    pending: Vec<MaterialEvent>,
+    queue: BTreeSet<(u64, Pos, u8)>,
     seen: HashSet<(Pos, u8)>,
+    capacity: usize,
     /// Generations run so far (a clock for tests and gauges).
     pub generations: u64,
     /// Mutations committed so far.
     pub mutations: u64,
+    /// Events refused because the queue was full (a gauge for the console and the lab).
+    pub dropped: u64,
+}
+
+impl Default for ReactionScheduler {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
 }
 
 impl ReactionScheduler {
-    /// An empty scheduler.
+    /// An empty scheduler holding at most [`DEFAULT_CAPACITY`] distinct pending events.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// An empty scheduler holding at most `capacity` distinct pending events.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            queue: BTreeSet::new(),
+            seen: HashSet::new(),
+            capacity,
+            generations: 0,
+            mutations: 0,
+            dropped: 0,
+        }
+    }
+
     /// Hand in a gameplay event. Duplicates (same position and kind) collapse until they are evaluated.
     pub fn push(&mut self, ev: MaterialEvent) {
-        if self.seen.insert((ev.at, ev.kind as u8)) {
-            self.pending.push(ev);
+        self.push_at(self.generations, ev);
+    }
+
+    fn push_at(&mut self, arrival: u64, ev: MaterialEvent) {
+        let key = (ev.at, ev.kind as u8);
+        if self.seen.contains(&key) {
+            return;
         }
+        if self.queue.len() >= self.capacity {
+            self.dropped += 1;
+            return;
+        }
+        self.seen.insert(key);
+        self.queue.insert((arrival, ev.at, ev.kind as u8));
     }
 
     /// Events waiting for evaluation.
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.queue.len()
     }
 
-    /// Run up to `budget.generations_per_tick` generations. Each generation: take a batch of events,
-    /// gather for every face neighbour (target) of every event cell (origin) the origins acting on it,
-    /// evaluate each target ONCE with all its origins at the state at the START of the generation
+    /// Run up to `budget.generations_per_tick` generations. Each generation: take the oldest batch of
+    /// events, gather for every face neighbour (target) of every event cell (origin) the origins acting
+    /// on it, evaluate each target ONCE with all its origins at the state at the START of the generation
     /// (`interact_many`: order-independent), commit the mutations in position order, then queue an
-    /// `ExternallyChanged` follow-up for every changed cell's neighbours (bounded). Returns the commits.
+    /// `ExternallyChanged` follow-up for every changed cell's neighbours, for the next generation.
+    /// A store that refuses a write (returns `None`) commits nothing for that cell: no mutation, no
+    /// follow-ups. Returns the commits.
     pub fn tick<S: CellStore>(&mut self, store: &mut S, law: &Law, budget: Budget) -> Vec<Mutation> {
         let mut committed = Vec::new();
         for _ in 0..budget.generations_per_tick {
-            if self.pending.is_empty() {
+            if self.queue.is_empty() {
                 break;
             }
-            // Sort before the budget cut so push-order cannot choose the batch.
-            self.pending.sort_by_key(|e| (e.at, e.kind as u8));
-            let n = self.pending.len().min(budget.events_per_generation);
-            let batch: Vec<MaterialEvent> = self.pending.drain(..n).collect();
-            for ev in &batch {
-                self.seen.remove(&(ev.at, ev.kind as u8));
+            let batch: Vec<(u64, Pos, u8)> =
+                self.queue.iter().take(budget.events_per_generation).copied().collect();
+            for key in &batch {
+                self.queue.remove(key);
+                self.seen.remove(&(key.1, key.2));
             }
             // Gather phase: every target with the origins acting on it, all read from the
             // generation's starting state.
             let mut acting: BTreeMap<Pos, (BlockId, Vec<(BlockId, EventKind)>)> = BTreeMap::new();
-            for ev in &batch {
-                let Some(origin_id) = store.block_at(ev.at) else { continue };
+            for &(_, at, kind) in &batch {
+                let Some(origin_id) = store.block_at(at) else { continue };
                 if origin_id == AIR {
                     continue;
                 }
+                let kind = kind_from_u8(kind);
                 for f in FACES {
-                    let tp = (ev.at.0 + f.0, ev.at.1 + f.1, ev.at.2 + f.2);
+                    let tp = (at.0 + f.0, at.1 + f.1, at.2 + f.2);
                     let Some(target_id) = store.block_at(tp) else { continue };
                     if target_id == AIR {
                         continue;
@@ -161,7 +215,7 @@ impl ReactionScheduler {
                         .entry(tp)
                         .or_insert_with(|| (target_id, Vec::new()))
                         .1
-                        .push((origin_id, ev.kind));
+                        .push((origin_id, kind));
                 }
             }
             // Evaluate phase: one interaction per target.
@@ -181,23 +235,21 @@ impl ReactionScheduler {
                     results.insert(tp, (target_id, new_id));
                 }
             }
-            // Write phase: position order.
-            let mut followups = 0usize;
+            // Write phase: position order; follow-ups arrive for the next generation.
+            let next = self.generations + 1;
             for (pos, (from, to)) in results {
-                let prev = store.set_block(pos, to);
+                let Some(prev) = store.set_block(pos, to) else { continue };
                 debug_assert_eq!(prev, from, "generation read a stale cell");
                 committed.push(Mutation { pos, from, to });
                 self.mutations += 1;
                 for f in FACES {
-                    if followups >= budget.max_followups {
-                        break;
-                    }
-                    let np = (pos.0 + f.0, pos.1 + f.1, pos.2 + f.2);
-                    self.push(MaterialEvent {
-                        at: np,
-                        kind: EventKind::ExternallyChanged,
-                    });
-                    followups += 1;
+                    self.push_at(
+                        next,
+                        MaterialEvent {
+                            at: (pos.0 + f.0, pos.1 + f.1, pos.2 + f.2),
+                            kind: EventKind::ExternallyChanged,
+                        },
+                    );
                 }
             }
             self.generations += 1;
@@ -213,10 +265,9 @@ pub struct Reactions;
 /// worldgen regions (or a 40-unit one-axis shift of the first centre).
 #[cfg(test)]
 pub(crate) fn reactive_region_pair(reg: &mut BlockRegistry) -> (BlockId, BlockId) {
-    use crate::block::regions;
     use material::{interact, Configuration};
     let law = *reg.law();
-    let regions = regions::builtin(&law);
+    let regions = reg.regions().to_vec();
     for ra in &regions {
         for rb in &regions {
             let ca = Configuration::single(ra.centre);
@@ -316,9 +367,9 @@ mod tests {
             }
             Some(*self.cells.get(&pos).unwrap_or(&AIR))
         }
-        fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+        fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
             self.loaded.insert(pos);
-            self.cells.insert(pos, id).unwrap_or(AIR)
+            Some(self.cells.insert(pos, id).unwrap_or(AIR))
         }
         fn registry(&self) -> &BlockRegistry {
             &self.reg
@@ -463,7 +514,6 @@ mod tests {
         let budget = Budget {
             events_per_generation: 8,
             generations_per_tick: 1,
-            max_followups: 12,
         };
         let _ = s.tick(&mut m, &law, budget);
         assert!(s.pending() >= 56, "unevaluated events stay queued");
@@ -512,13 +562,14 @@ mod tests {
     }
 
     #[test]
-    fn world_cell_store_returns_none_for_unloaded_chunks() {
+    fn world_cell_store_defines_unloaded_chunks_from_the_generator() {
         let world = World::with_config_lazy(1, RenderConfig::default());
-        assert!(
-            CellStore::block_at(&world, (0, 0, 0)).is_none(),
-            "lazy world has no origin chunks"
-        );
-        assert_eq!(world.block_at(0, 0, 0), AIR);
+        let y = world.surface_y(0, 0);
+        let below = CellStore::block_at(&world, (0, y - 4, 0));
+        assert!(below.is_some_and(|id| id != AIR), "generated ground reads without a chunk");
+        assert_eq!(CellStore::block_at(&world, (0, y + 40, 0)), Some(AIR), "generated sky");
+        // The world's own query keeps its contract: unloaded space reads as AIR for gameplay.
+        assert_eq!(world.block_at(0, y - 4, 0), AIR);
     }
 
     #[test]
@@ -526,7 +577,7 @@ mod tests {
         let mut world = World::with_config(1, RenderConfig::default());
         let (a, _) = reactive_region_pair(world.registry_mut());
         let y = world.surface_y(8, 8);
-        let prev = CellStore::set_block(&mut world, (8, y, 8), a);
+        let prev = CellStore::set_block(&mut world, (8, y, 8), a).expect("a world never refuses");
         assert_ne!(prev, a);
         assert_eq!(world.block_at(8, y, 8), a);
         assert!(
@@ -546,6 +597,28 @@ mod tests {
         world.push_material_event((0, y, 0), EventKind::Collision);
         assert_eq!(world.reactions().pending(), 0);
         assert!(world.tick_reactions().is_empty());
+    }
+
+    #[test]
+    fn cascades_read_unloaded_cells_through_the_overlay_and_generator() {
+        // No chunk is loaded: the pair lives in the overlay only, yet the scheduler must see it —
+        // the world is defined without loading, so results never depend on streaming state.
+        let mut world = World::with_config_lazy(1, RenderConfig::default());
+        let (a, b) = reactive_region_pair(world.registry_mut());
+        let y = 200; // well above any terrain: generated space there is air
+        world.set_block(0, y, 0, a);
+        world.set_block(1, y, 0, b);
+        assert_eq!(CellStore::block_at(&world, (0, y, 0)), Some(a), "overlay read without a chunk");
+        assert_eq!(CellStore::block_at(&world, (1, y, 0)), Some(b));
+        assert_eq!(CellStore::block_at(&world, (0, y - 1, 0)), Some(AIR), "generated read");
+        world.push_material_event((0, y, 0), EventKind::Collision);
+        world.push_material_event((1, y, 0), EventKind::Collision);
+        let out = world.tick_reactions();
+        assert!(!out.is_empty(), "the pair reacts even though no chunk is loaded");
+        for m in &out {
+            assert_eq!(CellStore::block_at(&world, m.pos), Some(m.to), "the commit is readable");
+            assert_ne!(m.from, AIR);
+        }
     }
 
     fn shuffle_events(events: &mut [MaterialEvent], seed: u64) {
@@ -584,7 +657,6 @@ mod tests {
             let budget = Budget {
                 events_per_generation: 5,
                 generations_per_tick: 8,
-                max_followups: 24,
             };
             let mut committed = Vec::new();
             for _ in 0..8 {
@@ -607,34 +679,115 @@ mod tests {
         );
     }
 
-    #[test]
-    fn followups_never_exceed_the_budget() {
-        let mut m = map();
+    /// Alternating reactive cells along +x with Collision on every one.
+    fn reactive_line(m: &mut Map, s: &mut ReactionScheduler, len: i32) {
         let a = single(&mut m.reg, [40, 40, 40, 40]);
         let b = single(&mut m.reg, [90, 40, 40, 40]);
-        for x in 0..32 {
+        for x in 0..len {
             m.set_block((x, 0, 0), if x % 2 == 0 { a } else { b });
         }
-        let mut s = ReactionScheduler::new();
-        for x in 0..32 {
+        for x in 0..len {
             s.push(MaterialEvent {
                 at: (x, 0, 0),
                 kind: EventKind::Collision,
             });
         }
-        let pending_before = s.pending();
+    }
+
+    #[test]
+    fn followups_are_deferred_never_dropped() {
+        let mut m = map();
+        let mut s = ReactionScheduler::new();
+        reactive_line(&mut m, &mut s, 32);
         let budget = Budget {
-            events_per_generation: 32,
+            events_per_generation: 4,
             generations_per_tick: 1,
-            max_followups: 7,
         };
-        let _ = s.tick(&mut m, &Law::v0(), budget);
-        let new_events = s.pending().saturating_sub(pending_before.saturating_sub(32));
+        let mut committed = 0;
+        for _ in 0..400 {
+            committed += s.tick(&mut m, &Law::v0(), budget).len();
+            if s.pending() == 0 {
+                break;
+            }
+        }
+        assert!(committed > 0, "the line must react");
+        assert_eq!(s.dropped, 0, "a budget spreads work over generations, it never loses causality");
+        assert_eq!(s.pending(), 0, "the cascade came to rest within 400 generations");
+    }
+
+    #[test]
+    fn oldest_events_go_first_whatever_their_position() {
+        // Two reactive pairs far apart: (100,101) queued first, (0,1) queued in the same generation
+        // by a later push; with one event per generation the first generation evaluates x=0 (position
+        // order within an arrival generation) and its follow-ups arrive for generation 2 — the still
+        // older event at x=100 must be evaluated before them even though 0..2 < 100.
+        let mut m = map();
+        let a = single(&mut m.reg, [40, 40, 40, 40]);
+        let b = single(&mut m.reg, [90, 40, 40, 40]);
+        for base in [0, 100] {
+            m.set_block((base, 0, 0), a);
+            m.set_block((base + 1, 0, 0), b);
+        }
+        let mut s = ReactionScheduler::new();
+        s.push(MaterialEvent {
+            at: (100, 0, 0),
+            kind: EventKind::Collision,
+        });
+        s.push(MaterialEvent {
+            at: (0, 0, 0),
+            kind: EventKind::Collision,
+        });
+        let budget = Budget {
+            events_per_generation: 1,
+            generations_per_tick: 1,
+        };
+        let law = Law::v0();
+        let g1 = s.tick(&mut m, &law, budget);
+        assert!(g1.iter().all(|mu| mu.pos.0 <= 2), "generation 1 works the x=0 pair: {g1:?}");
+        assert!(!g1.is_empty(), "the pair must react");
+        let g2 = s.tick(&mut m, &law, budget);
         assert!(
-            new_events <= budget.max_followups,
-            "follow-ups {new_events} exceeded max {}",
-            budget.max_followups
+            g2.iter().all(|mu| mu.pos.0 >= 99),
+            "generation 2 works the older x=100 event before the newer follow-ups: {g2:?}"
         );
+    }
+
+    #[test]
+    fn capacity_refuses_and_counts_instead_of_growing() {
+        let mut m = map();
+        let mut s = ReactionScheduler::with_capacity(7);
+        reactive_line(&mut m, &mut s, 32);
+        assert_eq!(s.pending(), 7);
+        assert_eq!(s.dropped, 25);
+        let _ = s.tick(&mut m, &Law::v0(), Budget::DEFAULT);
+        assert!(s.pending() <= 7, "follow-ups respect the capacity too");
+    }
+
+    #[test]
+    fn a_refused_write_commits_nothing_and_queues_nothing() {
+        struct Refusing(Map);
+        impl CellStore for Refusing {
+            fn block_at(&self, pos: Pos) -> Option<BlockId> {
+                self.0.block_at(pos)
+            }
+            fn set_block(&mut self, _pos: Pos, _id: BlockId) -> Option<BlockId> {
+                None
+            }
+            fn registry(&self) -> &BlockRegistry {
+                &self.0.reg
+            }
+            fn registry_mut(&mut self) -> &mut BlockRegistry {
+                &mut self.0.reg
+            }
+        }
+        let mut m = map();
+        let mut s = ReactionScheduler::new();
+        reactive_line(&mut m, &mut s, 8);
+        let mut r = Refusing(m);
+        let out = s.tick(&mut r, &Law::v0(), Budget::DEFAULT);
+        assert!(out.is_empty());
+        assert_eq!(s.mutations, 0);
+        assert_eq!(s.pending(), 0, "no follow-ups for changes that did not happen");
     }
 
     #[test]
@@ -655,6 +808,43 @@ mod tests {
         assert!(world.tick_reactions().is_empty());
         assert_eq!(world.registry().block_count(), before);
         assert_eq!(world.reactions().pending(), 0);
+    }
+
+    #[test]
+    fn quiet_sim_tick_empty_scheduler_allocates_nothing_and_touches_no_chunk() {
+        use crate::alloc_count;
+        struct PanicStore(BlockRegistry);
+        impl CellStore for PanicStore {
+            fn block_at(&self, pos: Pos) -> Option<BlockId> {
+                panic!("empty scheduler tick read cell {pos:?}");
+            }
+            fn set_block(&mut self, pos: Pos, _id: BlockId) -> Option<BlockId> {
+                panic!("empty scheduler tick wrote cell {pos:?}");
+            }
+            fn registry(&self) -> &BlockRegistry {
+                &self.0
+            }
+            fn registry_mut(&mut self) -> &mut BlockRegistry {
+                &mut self.0
+            }
+        }
+        let mut store = PanicStore(BlockRegistry::with_builtins());
+        let mut s = ReactionScheduler::new();
+        crate::alloc_count::reset();
+        let out = s.tick(&mut store, &Law::v0(), Budget::DEFAULT);
+        assert!(out.is_empty());
+        assert_eq!(alloc_count::alloc_count(), 0);
+        assert_eq!(alloc_count::alloc_bytes(), 0);
+        assert_eq!(s.generations, 0);
+
+        let mut world = World::with_config(1, RenderConfig::default());
+        assert_eq!(world.reactions().pending(), 0);
+        alloc_count::reset();
+        assert!(world.tick_reactions().is_empty());
+        assert_eq!(alloc_count::alloc_count(), 0);
+        assert_eq!(alloc_count::alloc_bytes(), 0);
+        assert_eq!(alloc_count::cell_reads(), 0);
+        assert_eq!(alloc_count::cell_writes(), 0);
     }
 
     #[test]

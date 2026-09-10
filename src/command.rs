@@ -1,8 +1,9 @@
 //! Console command parsing and dispatch.
 //!
-//! [`execute`] takes one submitted line and returns the lines of output to show
-//! in the console log. Adding a command is a single `match` arm — the dispatch is
-//! deliberately tiny so it can grow into a richer command (or chat) system later.
+//! [`execute_with_visuals`] takes one submitted line and returns the lines of
+//! output to show in the console log. Adding a command is a single `match`
+//! arm — the dispatch is deliberately tiny so it can grow into a richer
+//! command (or chat) system later.
 //!
 //! `/gfx` edits the [`Settings`] value only; the caller applies it to the engine
 //! (and the world's render distance) after the command returns. That keeps every
@@ -80,6 +81,7 @@ commands! {
 /// A leading `/` is optional, so both `tp 1 2 3` and `/tp 1 2 3` work. The world
 /// is `&mut` for `tp` alone (it requests the destination collision slab);
 /// read-only commands like `inspect` reborrow it shared.
+#[cfg(test)]
 pub fn execute(
     line: &str,
     player: &mut Player,
@@ -345,7 +347,9 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let registry = world.registry();
     let cfg = registry.configuration(id);
     let obs = registry.observation(id);
-    let label = registry.label(id).unwrap_or("unknown material");
+    let words = registry.display_name(id);
+    // Labels are worldgen roles ("rock:1"), an internal annotation; the console shows them as such.
+    let role = registry.label(id).map(|l| format!(", worldgen role {l}")).unwrap_or_default();
     let elems: Vec<String> = cfg
         .elements()
         .iter()
@@ -357,7 +361,7 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
         elems.join(" + ")
     };
     shown(vec![
-        format!("block at {x} {y} {z}: {label} (#{}) ", id.0),
+        format!("block at {x} {y} {z}: {words} (#{}{role})", id.0),
         format!("  made of: {made}"),
         format!(
             "  solid {}  liquid {}  transparency {}  emission {}",

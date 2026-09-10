@@ -113,6 +113,30 @@ fn main() {
             o.remesh_async_calls,
             o.drop_stale_uploads
         );
+        let mesh_jobs = o.mesh_staged + o.mesh_fallback;
+        let section_jobs = o.section_staged + o.section_fallback;
+        let mesh_full = if mesh_jobs == 0 {
+            0.0
+        } else {
+            100.0 * o.mesh_ring_full as f64 / mesh_jobs as f64
+        };
+        let section_full = if section_jobs == 0 {
+            0.0
+        } else {
+            100.0 * o.section_ring_full as f64 / section_jobs as f64
+        };
+        println!(
+            "  mesh staging: staged={} fallback={} ring_full={} ({:.2}%)",
+            o.mesh_staged, o.mesh_fallback, o.mesh_ring_full, mesh_full
+        );
+        println!(
+            "  section staging: staged={} fallback={} ring_full={} ({:.2}%)",
+            o.section_staged, o.section_fallback, o.section_ring_full, section_full
+        );
+        println!(
+            "  peak drain upload bytes/frame: {}",
+            o.max_drain_upload_bytes
+        );
         for s in &o.settle_samples {
             println!(
                 "  t={}s admit/s={:.0} workers={} effort={:.2} light_worklist={}",

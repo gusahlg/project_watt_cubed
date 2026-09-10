@@ -380,9 +380,9 @@ mod tests {
     use std::collections::BTreeMap;
     use voxel_engine::DVec3;
 
-    fn insert_chunk(world: &mut World, chunk: Chunk) {
+    fn insert_chunk(world: &mut World, coord: Coord, chunk: Chunk) {
         world.chunks.insert(
-            Coord::new(chunk.cx, chunk.cy, chunk.cz),
+            coord,
             Loaded {
                 chunk: Arc::new(chunk),
                 state: MeshState::needs_mesh(),
@@ -410,6 +410,7 @@ mod tests {
         ] {
             insert_chunk(
                 &mut world,
+                coord,
                 Chunk::from_uniform(coord.x, coord.y, coord.z, id),
             );
         }
@@ -419,9 +420,10 @@ mod tests {
             let (x, y, z) = Chunk::local_of(i);
             *id = ids[(x + 2 * y + 3 * z) % ids.len()];
         }
-        insert_chunk(&mut world, Chunk::from_cells(0, 0, -1, cells.clone()));
+        insert_chunk(&mut world, Coord::new(0, 0, -1), Chunk::from_cells(0, 0, -1, cells.clone()));
         insert_chunk(
             &mut world,
+            Coord::new(-1, 0, 0),
             Chunk::from_data(-1, 0, 0, ChunkData::Dense(cells)),
         );
         world
@@ -512,7 +514,7 @@ mod tests {
             let (coord, local) = BlockCoord::new(x, 0, 0).split();
             let mut chunk = Chunk::from_uniform(coord.x, coord.y, coord.z, AIR);
             chunk.set_local(local.lx(), local.ly(), local.lz(), stone);
-            insert_chunk(&mut world, chunk);
+            insert_chunk(&mut world, coord, chunk);
             let center = DVec3::new(f64::from(x) + 0.5, 0.5, 0.5);
             assert!(world.collides(&Aabb::new(center, DVec3::splat(0.25))));
             assert!(!world.collides(&Aabb::new(center + DVec3::Y, DVec3::splat(0.25))));

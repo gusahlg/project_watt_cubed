@@ -236,6 +236,7 @@ impl Benchmark {
     }
 
     /// Flight speed along +X (m/s); zero for the static scenario.
+    #[cfg(test)]
     pub fn move_mps(&self) -> f64 {
         self.move_mps
     }

@@ -79,6 +79,7 @@ impl Autosaver {
 
     /// Note a freshly loaded/created world so its current state doesn't count
     /// as dirty.
+    #[cfg(test)]
     pub fn reset(&mut self, generation: u64) {
         self.saved_gen = generation;
     }

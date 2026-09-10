@@ -126,6 +126,7 @@ impl<T: Pooled> Neighborhood<T> {
 
     /// A halo filled uniformly with `value` — the neutral / full-bright /
     /// all-dark constructors of the mesh and light instantiations.
+    #[cfg(test)]
     pub fn filled(value: T) -> Self {
         let mut buf = Self::take_buf(value);
         buf.fill(value);

@@ -89,6 +89,7 @@ impl RateGate {
     }
 
     /// Whether this gate is in the every-frame mode.
+    #[cfg(test)]
     pub fn every_frame(&self) -> bool {
         self.interval == 0.0
     }

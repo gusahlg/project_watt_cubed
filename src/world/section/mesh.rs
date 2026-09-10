@@ -53,6 +53,7 @@ impl Default for SectionMeshData {
 }
 
 impl SectionMeshData {
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         Pass::ALL.iter().all(|&p| self.data[p].is_empty())
     }
@@ -573,7 +574,7 @@ mod tests {
         // Compile the placement table so the hot tables cover every id the
         // real generator can emit (the fixtures below use builtin names only).
         let mut r = BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r);
+        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
         let id = |n: &str| r.id_by_label(n).unwrap();
         let blocks = Blocks {
             grass: id("organic+soil"),

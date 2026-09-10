@@ -331,6 +331,7 @@ pub fn peek_meta(bytes: &[u8]) -> Result<SaveMeta, SaveError> {
 /// Rewrite the display name in an already-encoded save, in place. The fixed
 /// header layout makes this a pure byte patch — used by duplicate/rename so
 /// they never need to decode a body.
+#[cfg(test)]
 pub fn set_name(bytes: &mut [u8], name: &str) -> Result<(), SaveError> {
     peek_meta(&bytes[..bytes.len().min(HEADER_LEN)])?;
     let name = clamp_name(name);

@@ -188,7 +188,7 @@ pub struct DiffusionTerrain {
 impl DiffusionTerrain {
     pub fn new(registry: &mut BlockRegistry, cfg: DiffusionCfg, seed: i64) -> Self {
         let cfg = cfg.clamp();
-        let mat = placement::builtin().compile(registry);
+        let mat = placement::builtin().compile(registry).expect("v0 hosts the placement table");
         let spec = Spec {
             seed: seed as u64,
             tile: cfg.tile,

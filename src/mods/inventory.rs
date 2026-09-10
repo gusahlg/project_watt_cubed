@@ -194,7 +194,6 @@ impl Mod for InventoryMod {
 mod tests {
     use super::*;
     use crate::mods::Mods;
-    use crate::ui::HudElement;
     use voxel_engine::DVec3;
 
     #[test]
@@ -242,23 +241,25 @@ mod tests {
         assert_eq!(player.stash.count(rock), 2);
         assert_eq!(player.stash.count(soil), 1);
 
+        let rock_words = world.registry().display_name(rock);
+        let soil_words = world.registry().display_name(soil);
         let mut hidden = Vec::new();
         mods.hud(&world, &player, (800, 600), &mut hidden);
         assert!(
-            !hud_text(&hidden).contains("rock"),
+            !crate::ui::hud_text(&hidden).contains(&format!("2x {rock_words}")),
             "disabled inventory must not present the list"
         );
 
         mods.set_enabled("inventory", true);
         let mut shown = Vec::new();
         mods.hud(&world, &player, (800, 600), &mut shown);
-        let text = hud_text(&shown);
+        let text = crate::ui::hud_text(&shown);
         assert!(
-            text.contains("2x rock"),
+            text.contains(&format!("2x {rock_words}")),
             "re-enabled HUD lists the held rock: {text}"
         );
         assert!(
-            text.contains("1x soil"),
+            text.contains(&format!("1x {soil_words}")),
             "re-enabled HUD lists the held soil: {text}"
         );
     }
@@ -266,9 +267,7 @@ mod tests {
     #[test]
     fn unknown_configurations_use_like_or_unknown_material() {
         let mut world = World::new(1);
-        let law = *world.registry().law();
-        let regions = crate::block::regions::builtin(&law);
-        let rock = &regions[0];
+        let rock = world.registry().regions()[0];
         let mut near = rock.centre;
         near.0[3] = near.0[3].saturating_add(rock.spread);
         if near == rock.centre {
@@ -289,38 +288,18 @@ mod tests {
         let inventory = InventoryMod::new(Rc::new(Cell::new(ItemUiState::default())));
         let mut shown = Vec::new();
         inventory.hud(&world, &player, (800, 600), &mut shown);
-        let text = hud_text(&shown);
+        let text = crate::ui::hud_text(&shown);
+        let near_words = world.registry().display_name(near_id);
+        let far_words = world.registry().display_name(far_id);
         assert!(
-            text.contains(&format!("1x {}-like", rock.label)),
-            "near an unlabelled centre reads as -like: {text}"
+            text.contains(&format!("1x {near_words}")),
+            "a held material is described by its readings: {text}"
         );
-        let far_within = regions
-            .iter()
-            .any(|r| far.distance(r.centre) <= 2 * r.spread as u32);
-        if !far_within {
-            assert!(
-                text.contains("1x unknown material"),
-                "a far unlabelled config stays unknown: {text}"
-            );
-        }
+        assert!(text.contains(&format!("1x {far_words}")), "{text}");
+        assert!(
+            !text.contains(rock.label) && !text.contains("-like") && !text.contains("unknown"),
+            "no worldgen label or authored name reaches the player: {text}"
+        );
     }
 
-    fn hud_text(elements: &[HudElement]) -> String {
-        let mut out = String::new();
-        for el in elements {
-            match el {
-                HudElement::Label { text, .. } => {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-                HudElement::Panel(panel) => {
-                    for row in panel.header.iter().chain(panel.rows.iter()) {
-                        out.push_str(&row.text);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-        out
-    }
 }

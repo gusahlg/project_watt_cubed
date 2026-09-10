@@ -9,7 +9,9 @@
 //!
 //! Positions travel as 3x f64 (24 bytes): the game plays out to ±1e9 blocks,
 //! where f32 cannot even represent adjacent positions.
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(test)]
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
@@ -21,6 +23,10 @@ use crate::world::diffusion::DiffusionCfg;
 use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
+
+/// Times a workbench apply may repeat the interaction: the wire, the server and the crafting
+/// mod share this one bound.
+pub const WORKBENCH_REPEAT: std::ops::RangeInclusive<u8> = 1..=16;
 
 /// Workbench events only: `Moved` / `NewContact` / `Collision`. Other bytes are not well-formed.
 pub(crate) fn workbench_event(v: u8) -> Option<material::EventKind> {
@@ -37,6 +43,22 @@ pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
     let mut a = [0u8; material::STAMP_LEN];
     a.copy_from_slice(&v);
     a
+}
+
+/// `Ok` iff `stamp` is law v0. A different valid law is refused with
+/// [`ServerMessage::Reject`] (region-search errors included); never panics.
+pub fn handshake_law(stamp: &[u8]) -> Result<(), ServerMessage> {
+    if stamp == material::Law::v0().stamp() {
+        return Ok(());
+    }
+    let reason: Arc<str> = match material::Law::from_stamp(stamp) {
+        Ok(law) => match crate::block::regions::builtin(&law) {
+            Ok(_) => "law stamp is not this game's law".into(),
+            Err(e) => e.to_string().into(),
+        },
+        Err(_) => "law stamp is not this game's law".into(),
+    };
+    Err(ServerMessage::Reject { reason })
 }
 
 /// One field's wire codec: how it is written to and read back from a message
@@ -406,6 +428,7 @@ fn frame_len(header: [u8; 4]) -> io::Result<usize> {
 }
 
 /// Refuses to emit an over-cap frame so both ends share one hard size bound.
+#[cfg(test)]
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     w.write_all(&frame_header(payload)?)?;
     w.write_all(payload)
@@ -414,6 +437,7 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
 /// `buf` is caller-owned scratch, reused so steady-state traffic never
 /// allocates per frame. Rejects a length past [`MAX_FRAME`] before growing
 /// the buffer, so a malicious header can't trigger a huge or endless read.
+#[cfg(test)]
 pub fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
@@ -551,7 +575,7 @@ mod tests {
     #[test]
     fn spec_round_trips_through_the_wire() {
         let mut r = crate::block::BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r);
+        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
         let id = r.id_by_label("rock").unwrap();
         let spec = r.spec(id);
         let msg = ClientMessage::Edit {
@@ -722,6 +746,28 @@ mod tests {
             law: law_stamp(),
         };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
+    }
+
+    #[test]
+    fn handshake_refuses_a_perturbed_law_without_panic() {
+        assert!(handshake_law(&law_stamp()).is_ok());
+        let mut law = material::Law::v0();
+        law.kernel.knots[2].1 = -law.kernel.knots[2].1;
+        let stamp = law.stamp();
+        match handshake_law(&stamp) {
+            Err(ServerMessage::Reject { reason }) => {
+                assert!(!reason.is_empty(), "reject names the reason");
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        let encoded = match handshake_law(&stamp) {
+            Err(msg) => msg.encode(),
+            Ok(()) => panic!("perturbed law was accepted"),
+        };
+        match ServerMessage::decode(&encoded) {
+            Some(ServerMessage::Reject { reason }) => assert!(!reason.is_empty()),
+            other => panic!("Reject must round-trip, got {other:?}"),
+        }
     }
 
     #[test]

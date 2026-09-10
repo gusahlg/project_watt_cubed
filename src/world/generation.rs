@@ -266,6 +266,7 @@ impl Fbm {
         FbmColumn { cols, norm: self.norm }
     }
 
+    #[cfg(test)]
     fn bound(&self, x0: i32, y0: i32, z0: i32) -> Interval {
         let (mut lo, mut hi) = (0.0, 0.0);
         let mut w = 1.0;
@@ -304,6 +305,7 @@ impl Fbm {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Interval {
     lo: f32,
@@ -653,6 +655,7 @@ impl OctaveColumn {
     }
 }
 
+#[cfg(test)]
 fn octave_bound(seed: u64, x0: i32, y0: i32, z0: i32, freq: f64) -> (f32, f32) {
     octave_range::<true>(seed, x0, y0, z0, freq)
 }
@@ -973,7 +976,7 @@ impl Terrain {
     pub fn new(registry: &mut BlockRegistry, base: f32, seed: i64) -> Self {
         // Terrain speaks only the placement table now — no named block is ever
         // resolved by hand; every material is an enumerated element union.
-        let mat = placement::builtin().compile(registry);
+        let mat = placement::builtin().compile(registry).expect("v0 hosts the placement table");
         let s = Seed(seed);
         let fbm = |salt: u64, cell: f64, octaves: u8| Fbm::new(s.stream(salt), cell, octaves);
         // Shared height-warp offsets (like the biome axes share theirs), so
@@ -1037,11 +1040,6 @@ impl Terrain {
             },
             mat,
         }
-    }
-
-    /// Sea level — spawn logic keeps players off the seabed.
-    pub fn sea_level(&self) -> i32 {
-        self.sea_level
     }
 
     /// Everything a column needs, sampled once. `height` folds continentalness
@@ -1483,6 +1481,7 @@ impl Terrain {
             && self.ravines.dormant(x0, y0, z0, h_max - y0)
     }
 
+    #[cfg(test)]
     fn deep_uniform_provable(
         &self,
         x0: i32,

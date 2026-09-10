@@ -11,7 +11,7 @@ use std::ops::RangeInclusive;
 
 use material::{Configuration, Element};
 
-use crate::block::regions::{self, Region};
+use crate::block::regions::{self, Region, RegionError};
 use crate::block::registry::{BlockId, BlockRegistry};
 
 /// Loud tripwire for a table whose reachable set explodes (a mod authoring
@@ -294,10 +294,13 @@ pub fn builtin() -> PlacementTable {
 impl PlacementTable {
     /// Intern every configuration terrain can emit, in canonical order, and
     /// resolve the generator's LUTs. Runs at startup on the main thread.
-    pub fn compile(&self, registry: &mut BlockRegistry) -> Resolved {
+    pub fn compile(&self, registry: &mut BlockRegistry) -> Result<Resolved, RegionError> {
+        if let Some(e) = registry.region_error() {
+            return Err(e.clone());
+        }
         let before = registry.block_count();
         let law = *registry.law();
-        let regions = regions::builtin(&law);
+        let regions = registry.regions().to_vec();
         intern_families(registry, &regions);
 
         let intern = |specs: &[&str], registry: &mut BlockRegistry| -> BlockId {
@@ -311,10 +314,10 @@ impl PlacementTable {
             intern(&self.ground_banded_specs(2, k), registry)
         });
         let stone = intern(&self.ground_banded_specs(4, SurfaceKind::Grassy), registry);
-        let rock = regions
-            .iter()
-            .find(|r| r.label == "rock")
-            .expect("builtin regions include rock");
+        let rock = regions.iter().find(|r| r.label == "rock").ok_or(RegionError {
+            label: "rock",
+            why: "missing".into(),
+        })?;
         let stone_strata = [0, 1, 2].map(|i| {
             intern_elements(
                 registry,
@@ -351,8 +354,8 @@ impl PlacementTable {
             .collect();
         let island_depths: Vec<i32> = island_seams.iter().map(|_| 48).collect();
         let mut used: Vec<Element> = Vec::new();
-        let ground_guests = pick_guests(&regions, rock.centre, &ground_depths, &mut used);
-        let island_guests = pick_guests(&regions, rock.centre, &island_depths, &mut used);
+        let ground_guests = pick_guests(&regions, rock.centre, &ground_depths, &mut used)?;
+        let island_guests = pick_guests(&regions, rock.centre, &island_depths, &mut used)?;
 
         let slices = |seams: &[&PlacementRule],
                       guests: &[(String, Element)],
@@ -459,7 +462,7 @@ impl PlacementTable {
             regions::families_at_rest(&law, &regions),
             "worldgen families are not at rest under Collision"
         );
-        resolved
+        Ok(resolved)
     }
 
     fn ground_banded_specs(&self, depth: i32, kind: SurfaceKind) -> Vec<&'static str> {
@@ -617,7 +620,7 @@ fn pick_guests(
     rock: Element,
     depths: &[i32],
     used: &mut Vec<Element>,
-) -> Vec<(String, Element)> {
+) -> Result<Vec<(String, Element)>, RegionError> {
     let mut cands: Vec<(String, Element, u32)> = Vec::new();
     for r in regions {
         if r.label == "rock" || r.label == "water" {
@@ -636,7 +639,12 @@ fn pick_guests(
             cands.push((spec, e, e.distance(rock)));
         }
     }
-    assert!(!cands.is_empty(), "no ore-guest candidates in the region table");
+    if cands.is_empty() {
+        return Err(RegionError {
+            label: "rock",
+            why: "no ore-guest candidates".into(),
+        });
+    }
     let d_min = cands.iter().map(|c| c.2).min().unwrap();
     let d_max = cands.iter().map(|c| c.2).max().unwrap().max(d_min + 1);
     const LO: i32 = 3;
@@ -667,7 +675,7 @@ fn pick_guests(
     }
     ensure_guest(&mut out, regions, rock, "lamp");
     ensure_guest(&mut out, regions, rock, "glass");
-    out
+    Ok(out)
 }
 
 fn ensure_guest(out: &mut [(String, Element)], regions: &[Region], rock: Element, label: &str) {
@@ -723,7 +731,7 @@ mod tests {
 
     fn compiled() -> (BlockRegistry, Resolved) {
         let mut reg = BlockRegistry::with_builtins();
-        let resolved = builtin().compile(&mut reg);
+        let resolved = builtin().compile(&mut reg).expect("v0 hosts the placement table");
         (reg, resolved)
     }
 
@@ -731,7 +739,7 @@ mod tests {
     fn compile_is_idempotent_and_canonical() {
         let (mut reg, first) = compiled();
         let count = reg.block_count();
-        let again = builtin().compile(&mut reg);
+        let again = builtin().compile(&mut reg).expect("v0 hosts the placement table");
         assert_eq!(reg.block_count(), count, "recompile registers nothing new");
         assert_eq!(first.stone, again.stone);
         assert_eq!(first.stone_strata, again.stone_strata);
@@ -743,7 +751,7 @@ mod tests {
     fn compile_interns_within_enum_cap() {
         let mut reg = BlockRegistry::with_builtins();
         let before = reg.block_count();
-        builtin().compile(&mut reg);
+        builtin().compile(&mut reg).expect("v0 hosts the placement table");
         assert!(reg.block_count() - before <= ENUM_CAP);
     }
 
@@ -751,7 +759,7 @@ mod tests {
     #[should_panic(expected = "placement union is empty")]
     fn intern_union_rejects_empty() {
         let mut reg = BlockRegistry::with_builtins();
-        let regions = regions::builtin(reg.law());
+        let regions = reg.regions().to_vec();
         intern_union(&mut reg, &regions, &[]);
     }
 
@@ -780,7 +788,7 @@ mod tests {
         banded.extend(scattered);
         table.rules = banded;
         let mut reg = BlockRegistry::with_builtins();
-        let b = table.compile(&mut reg);
+        let b = table.compile(&mut reg).expect("v0 hosts the placement table");
         assert_eq!(a.dress, b.dress);
         assert_eq!(a.crust, b.crust);
         assert_eq!(a.pairs, b.pairs);
@@ -922,7 +930,7 @@ mod tests {
         use material::EventKind;
         let (reg, r) = compiled();
         let law = *reg.law();
-        let regions = regions::builtin(&law);
+        let regions = reg.regions();
         let mut members: Vec<Configuration> = regions.iter().flat_map(|g| g.matter().map(Configuration::single)).collect();
         for slice in r
             .seams
@@ -962,8 +970,8 @@ mod tests {
             fn block_at(&self, pos: Pos) -> Option<BlockId> {
                 Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
             }
-            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
-                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
+                Some(self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR))
             }
             fn registry(&self) -> &BlockRegistry {
                 &self.reg
@@ -1006,7 +1014,6 @@ mod tests {
             Budget {
                 events_per_generation: CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE,
                 generations_per_tick: 20,
-                max_followups: CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE * 6,
             },
         );
         assert!(out.is_empty(), "generated matter mutated under ExternallyChanged: {} edits", out.len());
@@ -1029,8 +1036,8 @@ mod tests {
             fn block_at(&self, pos: Pos) -> Option<BlockId> {
                 Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
             }
-            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
-                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
+                Some(self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR))
             }
             fn registry(&self) -> &BlockRegistry {
                 &self.reg
@@ -1086,7 +1093,6 @@ mod tests {
             Budget {
                 events_per_generation: (BOX * BOX * BOX) as usize,
                 generations_per_tick: 20,
-                max_followups: (BOX * BOX * BOX * 6) as usize,
             },
         );
         assert!(

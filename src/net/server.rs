@@ -79,6 +79,13 @@ const RATE_LIMIT: u32 = 300;
 /// bursts while capping a voice flood under [`RATE_LIMIT`]. Excess frames are
 /// dropped silently — voice is loss-tolerant, never a kick trigger.
 const VOICE_RATE_LIMIT: u32 = 100;
+/// Workbench applies one connection may send per second: each one evaluates the law and may intern a
+/// configuration under the [`State`] lock, so the budget is a human's click rate, not a flood.
+const CRAFT_RATE_LIMIT: u32 = 10;
+/// Ids the material table keeps for the world's own products (reactions, generation): a spec a
+/// CLIENT sends is interned only while at least this many ids are free, so no client can exhaust
+/// the table (see [`resolve_client_spec`]).
+const CLIENT_INTERN_RESERVE: usize = crate::block::registry::MAX_BLOCK_TYPES / 4;
 /// Player ids come from a strictly-incrementing `next_id` and are NEVER
 /// reused, so each id has exactly one incarnation and a constant epoch is
 /// sound. Reopen if ids ever become reusable: this must become a per-id join
@@ -355,20 +362,20 @@ impl CellStore for ServerCells<'_> {
         Some(server_block(self.state, self.generator, pos))
     }
 
-    fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+    /// `None` when the spec pool is full: the cell keeps its material and the
+    /// scheduler records no mutation for it (a refused write is not a change).
+    fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
         let prev = server_block(self.state, self.generator, pos);
         if prev == id {
-            return prev;
+            return Some(prev);
         }
         let canonical = crate::save::block_spec(&self.state.registry, id);
-        let Some(spec) = self.state.intern(&canonical) else {
-            return prev;
-        };
+        let spec = self.state.intern(&canonical)?;
         let rev = self.state.edits.get(&pos).map_or(0, |c| c.rev).saturating_add(1);
         if let Some(old) = self.state.edits.insert(pos, Cell { spec, rev }) {
             self.state.release(old.spec);
         }
-        prev
+        Some(prev)
     }
 
     fn registry(&self) -> &BlockRegistry {
@@ -414,14 +421,24 @@ fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
 }
 
 /// Authoritative overlay edits from one scheduler tick, as snapshot batches
-/// (the client applies [`ServerMessage::Snapshot`] after bootstrap). One
-/// `S_Edit` per mutation would overflow [`OUT_CAPACITY`] on two full ticks.
+/// (the client applies [`ServerMessage::Snapshot`] after bootstrap), one entry
+/// per distinct cell. One `S_Edit` per mutation would overflow [`OUT_CAPACITY`]
+/// on two full ticks.
 fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
     if mutations.is_empty() {
         return;
     }
-    let mut edits = Vec::with_capacity(mutations.len());
-    for m in mutations {
+    // A cell committed in both generations of one tick is sent once, with its
+    // final content, at the point of its last commit (order is preserved).
+    let mut last: HashMap<Pos, usize> = HashMap::with_capacity(mutations.len());
+    for (i, m) in mutations.iter().enumerate() {
+        last.insert(m.pos, i);
+    }
+    let mut edits = Vec::with_capacity(last.len());
+    for (i, m) in mutations.iter().enumerate() {
+        if last[&m.pos] != i {
+            continue;
+        }
         let Some(cell) = state.edits.get(&m.pos) else { continue };
         edits.push((m.pos.0, m.pos.1, m.pos.2, cell.rev, cell.spec.clone()));
     }
@@ -874,6 +891,7 @@ fn client_loop(
     // chattier than any other message and must not eat a peer's general budget.
     let mut rate = RateWindow::new(RATE_LIMIT);
     let mut voice_rate = RateWindow::new(VOICE_RATE_LIMIT);
+    let mut craft_rate = RateWindow::new(CRAFT_RATE_LIMIT);
     loop {
         // A kick (slow client) wakes this out of the blocking read so cleanup
         // runs; the read future is only ever dropped on that teardown path, so
@@ -934,7 +952,12 @@ fn client_loop(
                 target_spec,
                 event,
                 repeat,
-            } => on_craft(shared, id, &origin_spec, &target_spec, event, repeat),
+            } => {
+                if !craft_rate.allow(now) {
+                    continue; // Over the workbench budget this second — drop silently.
+                }
+                on_craft(shared, id, &origin_spec, &target_spec, event, repeat)
+            }
         }
     }
 }
@@ -1142,6 +1165,35 @@ fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<PendingSend>) {
     }
 }
 
+/// Resolve a spec a client sent. A configuration the server already knows resolves without
+/// growing the table; a novel one (a client's offline product) is interned only while the table
+/// keeps [`CLIENT_INTERN_RESERVE`] ids free for the world's own products. `None` = malformed, or
+/// novel above the reserve line — the caller refuses the message.
+fn resolve_client_spec(registry: &mut BlockRegistry, spec: &str) -> Option<BlockId> {
+    resolve_client_spec_within(
+        registry,
+        spec,
+        crate::block::registry::MAX_BLOCK_TYPES - CLIENT_INTERN_RESERVE,
+    )
+}
+
+/// [`resolve_client_spec`] with an explicit line: novel specs intern only while `block_count()`
+/// is below `limit`.
+fn resolve_client_spec_within(
+    registry: &mut BlockRegistry,
+    spec: &str,
+    limit: usize,
+) -> Option<BlockId> {
+    if let Some(id) = registry.lookup_spec(spec) {
+        return Some(id);
+    }
+    if registry.block_count() >= limit {
+        return None;
+    }
+    registry.parse_spec(spec)
+}
+
+
 /// Gates, in order: reach (against the sender's last ACCEPTED position, per
 /// [`on_move`]'s envelope), spec validity (parsed/canonicalized by the same
 /// rules clients apply), installed [`ServerMod::validate_edit`] hooks, then the
@@ -1189,9 +1241,13 @@ fn on_edit(
     if spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH {
         return reject(&state, ack_to.as_ref());
     }
-    // Anything unparseable resolves to AIR; only the literal "air" spec may
-    // mean AIR, so junk is rejected instead of silently breaking a block.
-    let block = crate::save::parse_block(&mut state.registry, spec);
+    // Known configurations resolve without growing the table; a novel one is
+    // interned only below the reserve line. Only the literal "air" spec may
+    // mean AIR, so junk (and the void spelled as a configuration) is rejected
+    // instead of silently breaking a block.
+    let Some(block) = resolve_client_spec(&mut state.registry, spec) else {
+        return reject(&state, ack_to.as_ref());
+    };
     if block == crate::block::AIR && spec != "air" {
         return reject(&state, ack_to.as_ref());
     }
@@ -1241,9 +1297,12 @@ fn on_edit(
     broadcast(&mut state, &msg, |pid, _| pid != id);
 }
 
-/// Workbench apply: well-formedness only (specs parse, event is a workbench
-/// kind, repeat in 1..=16). There is no holdings ledger (task 67 has not
-/// landed), so the server does not check that the sender owns the materials.
+/// Workbench apply. The server checks the shape (specs resolve, event is a
+/// workbench kind, repeat in [`protocol::WORKBENCH_REPEAT`]), that the sender is
+/// ready, and that the specs are configurations it knows (or, below the reserve
+/// line, may learn) — see [`resolve_client_spec`]. There is no holdings ledger
+/// (task 67 has not landed), so it does not check that the sender owns the
+/// materials. The result is interned only below the same reserve line.
 fn on_craft(
     shared: &Arc<Mutex<State>>,
     id: u32,
@@ -1255,7 +1314,7 @@ fn on_craft(
     if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
         return;
     }
-    if !(1..=16).contains(&repeat) {
+    if !protocol::WORKBENCH_REPEAT.contains(&repeat) {
         return;
     }
     let Some(event) = protocol::workbench_event(event) else {
@@ -1264,28 +1323,41 @@ fn on_craft(
     let mut state = shared.lock_recover();
     let out = {
         let Some(h) = state.players.get(&id) else { return };
-        h.ready.then(|| h.out.clone())
+        if !h.ready {
+            return;
+        }
+        h.out.clone()
     };
-    let Some(result_id) = state
-        .registry
-        .apply_specs(origin_spec, target_spec, event, repeat)
-    else {
+    let Some(origin_id) = resolve_client_spec(&mut state.registry, origin_spec) else {
+        return;
+    };
+    let Some(target_id) = resolve_client_spec(&mut state.registry, target_spec) else {
+        return;
+    };
+    if origin_id == AIR || target_id == AIR {
+        return; // The void is not a material to work.
+    }
+    let limit = crate::block::registry::MAX_BLOCK_TYPES - CLIENT_INTERN_RESERVE;
+    if state.registry.block_count() >= limit {
+        return; // A novel product would eat into the world's reserve.
+    }
+    let origin = state.registry.configuration(origin_id).clone();
+    let target = state.registry.configuration(target_id).clone();
+    let Some(result_id) = state.registry.apply_interaction(&origin, &target, event, repeat) else {
         return;
     };
     let result_spec: Arc<str> = state.registry.spec(result_id).into();
-    if let Some(out) = out {
-        let _ = out.try_send(
-            ServerMessage::CraftResult {
-                origin_spec: origin_spec.into(),
-                target_spec: target_spec.into(),
-                event: event as u8,
-                repeat,
-                result_spec,
-            }
-            .encode()
-            .into(),
-        );
-    }
+    let _ = out.try_send(
+        ServerMessage::CraftResult {
+            origin_spec: origin_spec.into(),
+            target_spec: target_spec.into(),
+            event: event as u8,
+            repeat,
+            result_spec,
+        }
+        .encode()
+        .into(),
+    );
 }
 
 /// A [`Verdict::Deny`] drops the broadcast and delivers `reason` only to the
@@ -1627,6 +1699,80 @@ mod tests {
         assert_eq!(WORLD_PLAYER, 0);
         let state = test_state(HashMap::new());
         assert!(state.next_id > WORLD_PLAYER);
+    }
+
+    #[test]
+    fn client_specs_resolve_known_ids_without_growing_the_table() {
+        let mut r = BlockRegistry::with_builtins();
+        let known = r
+            .intern(&material::Configuration::single(material::Element::new([40, 80, 120, 160])))
+            .unwrap();
+        let spec = r.spec(known);
+        let count = r.block_count();
+        // A known configuration resolves even with the table "full" (limit at the current count).
+        assert_eq!(resolve_client_spec_within(&mut r, &spec, count), Some(known));
+        assert_eq!(resolve_client_spec_within(&mut r, "air", 0), Some(AIR));
+        assert_eq!(r.block_count(), count);
+        // A novel one interns only below the line, and never more than once.
+        let novel = "c:0105060708";
+        assert_eq!(resolve_client_spec_within(&mut r, novel, count), None, "at the line: refused");
+        assert_eq!(r.block_count(), count, "a refusal does not grow the table");
+        let id = resolve_client_spec_within(&mut r, novel, count + 1).expect("below the line");
+        assert_eq!(r.block_count(), count + 1);
+        assert_eq!(resolve_client_spec_within(&mut r, novel, 0), Some(id), "now known");
+        assert_eq!(resolve_client_spec_within(&mut r, "c:zz", usize::MAX), None, "malformed");
+        assert_eq!(r.block_count(), count + 1);
+    }
+
+    #[test]
+    fn a_craft_from_an_unready_player_is_not_evaluated() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        let mut p = test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick());
+        p.ready = false;
+        players.insert(1u32, p);
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let count = shared.lock_recover().registry.block_count();
+        on_craft(&shared, 1, "c:0105060708", "c:0109090909", 2, 1);
+        assert_eq!(shared.lock_recover().registry.block_count(), count, "nothing interned");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_craft_of_the_void_is_refused() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let rock = rock_spec();
+        on_craft(&shared, 1, "air", &rock, 2, 1);
+        on_craft(&shared, 1, &rock, "air", 2, 1);
+        assert!(rx.try_recv().is_err(), "air is not a material to work");
+    }
+
+    #[test]
+    fn reaction_snapshots_carry_each_cell_once_with_its_final_content() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let mut state = test_state(players);
+        let rock = state.registry.lookup_spec(&rock_spec()).or_else(|| state.registry.parse_spec(&rock_spec())).unwrap();
+        let spec = state.intern(&state.registry.spec(rock)).unwrap();
+        state.edits.insert((1, 2, 3), Cell { spec: spec.clone(), rev: 2 });
+        state.edits.insert((4, 5, 6), Cell { spec, rev: 1 });
+        let muts = [
+            Mutation { pos: (1, 2, 3), from: AIR, to: rock },
+            Mutation { pos: (4, 5, 6), from: AIR, to: rock },
+            Mutation { pos: (1, 2, 3), from: rock, to: rock },
+        ];
+        send_reaction_mutations(&mut state, &muts);
+        let frame = rx.try_recv().expect("one snapshot batch");
+        let ServerMessage::Snapshot { edits } = ServerMessage::decode(&frame).unwrap() else {
+            panic!("expected a Snapshot");
+        };
+        let cells: Vec<(i32, i32, i32, u32)> = edits.iter().map(|e| (e.0, e.1, e.2, e.3)).collect();
+        assert_eq!(cells, vec![(4, 5, 6, 1), (1, 2, 3, 2)], "each cell once, at its last commit");
+        assert!(rx.try_recv().is_err(), "no second batch");
     }
 
     #[test]

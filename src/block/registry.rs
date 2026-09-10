@@ -13,6 +13,8 @@ use material::{
 };
 use voxel_engine::{Color, Pass};
 
+use super::regions::{self, Region, RegionError};
+
 /// Compact per-voxel material id: the index of a configuration in the world's table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct BlockId(pub u16);
@@ -122,8 +124,8 @@ pub struct HotTables {
     pub absorption: Box<[u8]>,
     /// Render descriptor (texture-array layer) per block.
     render_layer: Box<[u16]>,
-    /// The device's texture-array layer ceiling; `render_layer(id)` is reduced modulo it. Never zero:
-    /// defaults to `u16::MAX` and the world stamps the real cap when it refreshes tables.
+    /// The device's texture-array layer ceiling; `render_layer(id)` saturates at `cap - 1`.
+    /// Never zero: defaults to `u16::MAX` and the world stamps the real cap when it refreshes tables.
     pub layer_cap: u16,
     /// Baked corner ambient occlusion — a meshing input the world stamps from its settings.
     pub ao: bool,
@@ -181,10 +183,13 @@ impl HotTables {
         self.absorption[id.0 as usize]
     }
 
-    /// The vertex layer for `id`: its render descriptor, reduced modulo the device cap.
+    /// The vertex layer for `id`: its render descriptor, saturating at the device cap.
     #[inline]
     pub fn render_layer(&self, id: BlockId) -> u16 {
-        self.render_layer[id.0 as usize] % self.layer_cap
+        let layer = self.render_layer[id.0 as usize];
+        let cap = self.layer_cap;
+        debug_assert!(layer < cap, "descriptor {layer} exceeds layer cap {cap}");
+        layer.min(cap.saturating_sub(1))
     }
 
     /// Number of blocks covered.
@@ -236,11 +241,21 @@ pub struct BlockRegistry {
     // render identity
     descriptors: Vec<Visual>,
     descriptor_intern: HashMap<DescriptorKey, u16>,
+    descriptor_cap: usize,
+    descriptor_cap_set: bool,
+    regions: Vec<Region>,
+    region_err: Option<RegionError>,
 }
 
 impl BlockRegistry {
-    /// An empty table under `law`, holding only the void as [`AIR`].
+    /// An empty table under `law`, holding only the void as [`AIR`]. Computes
+    /// and stores the worldgen regions once; a law that cannot host them keeps
+    /// the error for [`region_error`](Self::region_error) / placement compile.
     pub fn new(law: Law) -> Self {
+        let (regions, region_err) = match regions::builtin(&law) {
+            Ok(r) => (r, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
         let mut r = Self {
             law,
             configs: Vec::new(),
@@ -260,6 +275,10 @@ impl BlockRegistry {
             render_layer: Vec::new(),
             descriptors: Vec::new(),
             descriptor_intern: HashMap::new(),
+            descriptor_cap: MAX_DESCRIPTORS,
+            descriptor_cap_set: false,
+            regions,
+            region_err,
         };
         let air = r.intern(&Configuration::void()).expect("empty table has room");
         debug_assert_eq!(air, AIR);
@@ -275,6 +294,27 @@ impl BlockRegistry {
     /// The physics this table observes under.
     pub fn law(&self) -> &Law {
         &self.law
+    }
+
+    /// Worldgen regions computed once at construction. Empty when
+    /// [`region_error`](Self::region_error) is set.
+    pub fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    /// Why region search failed under this law, if it did.
+    pub fn region_error(&self) -> Option<&RegionError> {
+        self.region_err.as_ref()
+    }
+
+    /// Set the render-descriptor ceiling to `min(MAX_DESCRIPTORS, cap)`. First call wins;
+    /// later calls are ignored. Default is [`MAX_DESCRIPTORS`] (tests and the server).
+    pub fn set_descriptor_cap(&mut self, cap: u16) {
+        if self.descriptor_cap_set {
+            return;
+        }
+        self.descriptor_cap_set = true;
+        self.descriptor_cap = (cap as usize).clamp(1, MAX_DESCRIPTORS);
     }
 
     /// Apply `event` from `origin` onto `target`, `repeat` times, and intern the result.
@@ -307,9 +347,11 @@ impl BlockRegistry {
         self.apply_interaction(&origin, &target, event, repeat)
     }
 
-    /// Presentation name: attached label, else nearest region `"-like"`, else `"unknown material"`.
+    /// What a player is told about a material: a description read off the law (its observed
+    /// properties), never an authored name. Labels are worldgen annotations and stay internal; the
+    /// names players give their own products live in their journals.
     pub fn display_name(&self, id: BlockId) -> String {
-        crate::block::regions::display_name(self.law(), self.label(id), &self.configs[id.0 as usize])
+        describe(&self.observation(id))
     }
 
     /// Intern a configuration: the existing id if it was seen, else a new one with its readings and
@@ -356,7 +398,7 @@ impl BlockRegistry {
         if let Some(&d) = self.descriptor_intern.get(&key) {
             return d;
         }
-        if self.descriptors.len() < MAX_DESCRIPTORS {
+        if self.descriptors.len() < self.descriptor_cap {
             let d = self.descriptors.len() as u16;
             self.descriptors.push(Visual::dequantize(key));
             self.descriptor_intern.insert(key, d);
@@ -548,26 +590,101 @@ impl BlockRegistry {
     }
 
     /// Inverse of [`BlockRegistry::spec`]: interns the configuration. `None` for malformed or legacy
-    /// (named) specs and when the table is full.
+    /// (named) specs, for `c:00` (only `air` spells the void), and when the table is full.
     pub fn parse_spec(&mut self, spec: &str) -> Option<BlockId> {
-        self.intern(&decode_spec(spec)?)
+        match self.read_spec(spec) {
+            SpecKind::Ok(id) => Some(id),
+            _ => None,
+        }
     }
 
     /// Look up a spec already in the table without interning. `None` if the spec is
-    /// malformed or the configuration has not been interned yet.
+    /// malformed, `c:00`, or the configuration has not been interned yet.
     pub fn lookup_spec(&self, spec: &str) -> Option<BlockId> {
-        self.lookup(&decode_spec(spec)?)
+        let c = decode_spec(spec)?;
+        if c.is_void() {
+            return (spec == "air").then_some(AIR);
+        }
+        self.lookup(&c)
+    }
+
+    /// Classify a spec so the save loader can word its notice by cause.
+    pub(crate) fn read_spec(&mut self, spec: &str) -> SpecKind {
+        if spec == "air" {
+            return SpecKind::Ok(AIR);
+        }
+        match decode_spec(spec) {
+            None => {
+                if spec.starts_with("c:") {
+                    SpecKind::Bad
+                } else {
+                    SpecKind::Legacy
+                }
+            }
+            Some(c) if c.is_void() => SpecKind::Bad,
+            Some(c) => match self.intern(&c) {
+                Some(id) => SpecKind::Ok(id),
+                None => SpecKind::Full,
+            },
+        }
     }
 }
 
-/// `air` or `c:<hex of the encoding>`. `None` for legacy names, odd nibbles, non-ASCII, or
-/// a truncated/oversize payload — hostile wire/save input must not panic.
+/// Why [`BlockRegistry::read_spec`] could not intern a spec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecKind {
+    Ok(BlockId),
+    /// Named form from before the material model (`natural:Stone`, …).
+    Legacy,
+    /// Well-formed encoding that could not be interned (id space full).
+    Full,
+    /// Malformed (`c:00`, a leading `+`, odd nibble, …).
+    Bad,
+}
+
+/// Words for an observation: phase, hardness band, clarity, glow, grip — each a threshold on a probe
+/// response, so two configurations that read alike are described alike and a law change re-words
+/// the world by itself. The void is "air".
+pub fn describe(obs: &Observation) -> String {
+    if !obs.solid && !obs.liquid {
+        return "air".to_string();
+    }
+    let mut words: Vec<&str> = Vec::with_capacity(5);
+    if obs.emission > 0 {
+        words.push("glowing");
+    }
+    match obs.transparency {
+        200..=255 => words.push("clear"),
+        100..=199 => words.push("hazy"),
+        _ => {}
+    }
+    if obs.liquid {
+        words.push(if obs.flow >= 200 { "thin liquid" } else { "liquid" });
+    } else {
+        words.push(match obs.hardness {
+            200..=255 => "hard",
+            100..=199 => "firm",
+            _ => "soft",
+        });
+        match obs.friction {
+            192..=255 => words.push("rough"),
+            0..=63 => words.push("slick"),
+            _ => {}
+        }
+        words.push("solid");
+    }
+    words.join(" ")
+}
+
+/// `air` or `c:<hex of the encoding>`. `None` for legacy names, odd nibbles, non-hex
+/// (including a leading `+`), non-ASCII, or a truncated/oversize payload — hostile
+/// wire/save input must not panic.
 fn decode_spec(spec: &str) -> Option<Configuration> {
     if spec == "air" {
         return Some(Configuration::void());
     }
     let hex = spec.strip_prefix("c:")?;
-    if !hex.is_ascii() || hex.len() % 2 != 0 {
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let bytes: Option<Vec<u8>> = hex
@@ -581,7 +698,7 @@ fn decode_spec(spec: &str) -> Option<Configuration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use material::{observe, Element, Visual};
+    use material::{observe, Element, Law, Visual};
 
     fn cfg(elems: &[[u8; 4]]) -> Configuration {
         Configuration::new(elems.iter().map(|c| Element::new(*c)).collect::<Vec<_>>()).unwrap()
@@ -686,6 +803,41 @@ mod tests {
         assert_eq!(r.id_by_label("rock-like"), Some(id));
         assert_eq!(r.label(id), Some("rock-like"));
         assert!(r.spec(id).starts_with("c:"), "the spec never carries the label");
+        assert!(
+            !r.display_name(id).contains("rock"),
+            "a label is a worldgen annotation, never shown to the player: {}",
+            r.display_name(id)
+        );
+    }
+
+    #[test]
+    fn display_names_are_read_off_the_observation() {
+        let r = BlockRegistry::with_builtins();
+        assert_eq!(r.display_name(AIR), "air");
+        let mut obs = Observation::AIR;
+        obs.solid = true;
+        obs.transparency = 0;
+        obs.hardness = 230;
+        obs.friction = 128;
+        assert_eq!(describe(&obs), "hard solid");
+        obs.emission = 9;
+        obs.transparency = 210;
+        obs.friction = 20;
+        assert_eq!(describe(&obs), "glowing clear hard slick solid");
+        let mut liq = Observation::AIR;
+        liq.liquid = true;
+        liq.transparency = 60;
+        liq.flow = 240;
+        assert_eq!(describe(&liq), "thin liquid");
+        liq.transparency = 230;
+        assert_eq!(describe(&liq), "clear thin liquid");
+        // Two configurations with equal readings get equal words: the description is a reading.
+        let mut r = BlockRegistry::with_builtins();
+        let a = r.intern(&cfg(&[[120, 130, 140, 150]])).unwrap();
+        let b = r.intern(&cfg(&[[121, 130, 140, 150]])).unwrap();
+        if r.observation(a) == r.observation(b) {
+            assert_eq!(r.display_name(a), r.display_name(b));
+        }
     }
 
     #[test]
@@ -811,7 +963,24 @@ mod tests {
         assert_eq!(r.parse_spec("air\0"), None);
         let upper = format!("c:{}", hex.to_ascii_uppercase());
         assert_eq!(r.parse_spec(&upper), Some(id), "uppercase hex is still a configuration");
-        assert_eq!(r.parse_spec("c:00"), Some(AIR), "void encoding is air");
+        assert_eq!(r.parse_spec("c:00"), None, "only air spells the void");
+        assert_eq!(r.parse_spec("c:01+f+f+f+f"), None, "leading + is not a hex digit");
+        assert_eq!(r.lookup_spec("c:00"), None);
+        assert_eq!(r.read_spec("natural:Stone"), SpecKind::Legacy);
+        assert_eq!(r.read_spec("c:00"), SpecKind::Bad);
+        assert_eq!(r.read_spec("c:01+f+f+f+f"), SpecKind::Bad);
+    }
+
+    #[test]
+    fn registry_stores_regions_once() {
+        let r = BlockRegistry::with_builtins();
+        let a = r.regions();
+        let b = r.regions();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 10);
+        assert!(r.region_error().is_none());
+        assert_eq!(a, super::regions::builtin(&Law::v0()).expect("v0 hosts all regions"));
+        assert_eq!(a.as_ptr(), b.as_ptr(), "regions() is the stored slice, not a rescan");
     }
 
     #[test]
@@ -833,6 +1002,49 @@ mod tests {
         let extra = cfg(&[[9, 8, 7, 6], [1, 2, 3, 4]]);
         assert!(r.intern(&extra).is_none(), "id space is exhausted");
         assert_eq!(r.parse_spec(&format!("c:{:02x}0908070601020304", 2)), None);
+    }
+
+    #[test]
+    fn ninth_descriptor_falls_back_not_onto_zero() {
+        let mut r = BlockRegistry::with_builtins();
+        r.set_descriptor_cap(8);
+        r.set_descriptor_cap(16);
+        assert_eq!(r.render_layer(AIR), 0);
+        // Air is white; fill the remaining 7 slots with colours far from white.
+        let colors = [
+            [0x00, 0x00, 0x00],
+            [0x00, 0xFF, 0x00],
+            [0x00, 0x00, 0xFF],
+            [0xFF, 0x00, 0x00],
+            [0x00, 0xFF, 0xFF],
+            [0xFF, 0x00, 0xFF],
+            [0xFF, 0xFF, 0x00],
+        ];
+        for rgb in colors {
+            let vis = Visual {
+                rgb,
+                rgb2: [0, 0, 0],
+                frequency: 0,
+                roughness: 0,
+                alpha: 255,
+                glow: 0,
+            };
+            let _ = r.descriptor_for(vis);
+        }
+        assert_eq!(r.descriptor_count(), 8, "cap 8 holds air plus 7 colours");
+        // Near black, far from air's white — nearest fallback must not alias to 0.
+        let vis = Visual {
+            rgb: [0x11, 0x11, 0x11],
+            rgb2: [0, 0, 0],
+            frequency: 0,
+            roughness: 0,
+            alpha: 255,
+            glow: 0,
+        };
+        let d = r.descriptor_for(vis);
+        assert_eq!(r.descriptor_count(), 8, "the 9th distinct descriptor reuses a slot");
+        assert_ne!(d, 0, "fallback must not alias onto layer 0");
+        assert!((d as usize) < 8);
     }
 
     #[test]

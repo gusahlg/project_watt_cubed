@@ -513,15 +513,31 @@ impl World {
 }
 
 impl CellStore for World {
+    /// Loaded chunk, else the edit overlay, else the generator: the infinite world is defined
+    /// without loading, so a cascade reads the same cells whatever the streaming state (the server's
+    /// store does the same).
     fn block_at(&self, pos: Pos) -> Option<BlockId> {
+        #[cfg(test)]
+        crate::alloc_count::note_cell_read();
         let (chunk, local) = BlockCoord::new(pos.0, pos.1, pos.2).split();
-        self.chunks
-            .get(&chunk)
-            .map(|loaded| loaded.chunk.get_local(local.lx(), local.ly(), local.lz()))
+        if let Some(loaded) = self.chunks.get(&chunk) {
+            return Some(loaded.chunk.get_local(local.lx(), local.ly(), local.lz()));
+        }
+        let index = Chunk::index(local.lx(), local.ly(), local.lz());
+        if let Some(id) = self.edits.get(&chunk).and_then(|cells| cells.get(&index)) {
+            return Some(*id);
+        }
+        Some(self.generator.block_at(pos.0, pos.1, pos.2, self.generator.height(pos.0, pos.2)))
     }
 
-    fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
-        World::set_block(self, pos.0, pos.1, pos.2, id)
+    fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
+        // `World::set_block` reports an unloaded cell as AIR; the scheduler wants the true previous
+        // material (overlay or generated), which the read above defines.
+        let prev = CellStore::block_at(self, pos)?;
+        #[cfg(test)]
+        crate::alloc_count::note_cell_write();
+        World::set_block(self, pos.0, pos.1, pos.2, id);
+        Some(prev)
     }
 
     fn registry(&self) -> &crate::block::BlockRegistry {

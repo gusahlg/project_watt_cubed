@@ -40,7 +40,7 @@ pub(crate) fn axis_delta(boundary: Boundary, a: u8, b: u8) -> i32 {
 }
 
 /// Odd response curve: piecewise linear through the kernel's knots over |δ|, sign of δ.
-pub(crate) fn response(kernel: &Kernel, delta: i32) -> i32 {
+pub fn response(kernel: &Kernel, delta: i32) -> i32 {
     let mag = delta.unsigned_abs().min(255) as i32;
     let mut r = kernel.knots[kernel.knots.len() - 1].1 as i32;
     for w in kernel.knots.windows(2) {
@@ -60,7 +60,7 @@ pub(crate) fn response(kernel: &Kernel, delta: i32) -> i32 {
 }
 
 /// Unscaled influence of element `a` on element `b` (before event strength and step bound), Q0.
-fn influence_q0(law: &Law, a: Element, b: Element) -> [i32; D] {
+pub(crate) fn influence_q0(law: &Law, a: Element, b: Element) -> [i32; D] {
     let mut r = [0i32; D];
     for i in 0..D {
         r[i] = response(&law.kernel, axis_delta(law.boundary, a.0[i], b.0[i]));
@@ -74,6 +74,21 @@ fn influence_q0(law: &Law, a: Element, b: Element) -> [i32; D] {
         out[i] = acc / 16;
     }
     out
+}
+
+/// True when single-element `origin` acting on single-element `target` under `event` would change
+/// `target`. Same bytes as [`interact`] on `Configuration::single` of each, without allocating.
+pub fn element_changes(law: &Law, origin: Element, target: Element, event: EventKind) -> bool {
+    let strength = law.events.0[event as usize] as i32;
+    let max_step = law.kernel.max_step as i32;
+    let raw = influence_q0(law, origin, target);
+    for i in 0..D {
+        let step = (raw[i] * strength / 256).clamp(-max_step, max_step);
+        if apply_axis(law, target.0[i], step) != target.0[i] {
+            return true;
+        }
+    }
+    false
 }
 
 /// F(δ) → Δ: the elementary law for one origin element acting on one target element, bounded by the

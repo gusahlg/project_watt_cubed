@@ -3,19 +3,23 @@
 //! Runs many local interactions of a [`material::Law`] and reports a scorecard
 //! (similarity, determinism, fixed points, cascades, proliferation, families,
 //! observations); searches resource space for stable worldgen regions; mutates
-//! the v0 knots to explore the rule space. Simulation math is 32-bit integer;
-//! f64 appears only in printed statistics.
+//! the v0-shaped knobs to explore the rule space; prints a stamp as a curve.
+//! Simulation math is 32-bit integer; f64 appears only in printed statistics.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 mod cascade;
+mod explain;
 mod regions;
 mod rng;
 mod score;
 mod sweep;
 
 pub use cascade::{run_one as run_cascade, CascadeRun, Grid};
+pub use explain::{
+    explain, explain_text, regimes_of, render_explain, Explain, Regime, EXPLAIN_PAIRS, EXPLAIN_SEED,
+};
 pub use regions::{compatible, find_regions, Region, LABELS};
 pub use rng::Rng;
 pub use score::{
@@ -24,7 +28,10 @@ pub use score::{
     Cascades, Determinism, Families, FixedPoints, Growth, Observations, Proliferation, Scale,
     Scorecard, Similarity, Verdict,
 };
-pub use sweep::{mutate_law, sweep, SweepHit};
+pub use sweep::{
+    family_target, mutate_law, named, rank_key, rank_tuple, render_hit, sweep, sweep_at, Named,
+    SweepHit,
+};
 
 use material::{Element, Law, LawError};
 

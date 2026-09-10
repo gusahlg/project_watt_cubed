@@ -80,6 +80,7 @@ impl Paths {
         self.checkout.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn mods_selection_file(&self) -> Option<PathBuf> {
         Some(self.checkout_dir()?.join("mods.toml"))
     }

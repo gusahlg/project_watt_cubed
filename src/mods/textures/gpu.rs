@@ -5,10 +5,11 @@
 
 use material::Visual;
 
-use crate::block::appearance::{
-    procedural_material_desc, BlockAppearance, FlatAppearance, LAYER_BYTES,
-};
+use crate::block::appearance::{BlockAppearance, FlatAppearance, LAYER_BYTES};
 use crate::mods::Mod;
+#[cfg(test)]
+use crate::block::appearance::procedural_material_desc;
+#[cfg(test)]
 use voxel_engine::MaterialDesc;
 
 /// Engine `Engine::set_material_descs` / `append_material_descs` landed with
@@ -25,6 +26,7 @@ impl GpuMaterialsMod {
     }
 
     /// Visual bytes mapped 1:1 with [`crate::block::appearance::procedural_material_desc`].
+    #[cfg(test)]
     pub fn desc(vis: &Visual) -> MaterialDesc {
         procedural_material_desc(vis)
     }

@@ -23,8 +23,8 @@ const PANEL_PAD: i32 = 8;
 const FONT_SIZE: i32 = 18;
 const LINE_HEIGHT: i32 = FONT_SIZE + 4;
 const BOTTOM_RESERVE: i32 = 190;
-const REPEAT_MIN: u8 = 1;
-const REPEAT_MAX: u8 = 16;
+const REPEAT_MIN: u8 = *crate::net::protocol::WORKBENCH_REPEAT.start();
+const REPEAT_MAX: u8 = *crate::net::protocol::WORKBENCH_REPEAT.end();
 
 const EVENTS: [(EventKind, &str); 3] = [
     (EventKind::NewContact, "touch"),
@@ -67,6 +67,8 @@ pub struct CraftingMod {
     journal: Vec<Procedure>,
     /// Held block ids mirrored from the stash only when its revision changes.
     held: Vec<BlockId>,
+    /// Units destroyed because a refund (a rejected placement) found the pouch full.
+    lost: u32,
     seen_stash_rev: u64,
     hud_gen: Cell<u64>,
     hud_cache: RefCell<Memo<(u64, u64, i32, i32, bool), Vec<HudElement>>>,
@@ -86,6 +88,7 @@ impl CraftingMod {
             repeat: REPEAT_MIN,
             journal: Vec::new(),
             held: Vec::new(),
+            lost: 0,
             seen_stash_rev: 0,
             hud_gen: Cell::new(0),
             hud_cache: RefCell::new(Memo::new()),
@@ -300,7 +303,9 @@ impl CraftingMod {
     fn apply(&mut self, ctx: &mut ModContext) {
         let Some(oid) = self.origin else { return };
         let Some(tid) = self.target else { return };
-        if self.pouch.count(tid) < 1 {
+        // Both slots name held units: the target is consumed, the origin must be present to act.
+        if self.pouch.count(oid) < 1 || self.pouch.count(tid) < 1 {
+            self.prune_slots();
             return;
         }
         let origin_spec: Arc<str> = ctx.world.registry().spec(oid).into();
@@ -335,32 +340,42 @@ impl CraftingMod {
         repeat: u8,
         result_spec: Option<&str>,
     ) {
-        let Some(tid) = world.registry_mut().parse_spec(target_spec) else {
+        // Held configurations are always known to the registry, so a lookup suffices; an unknown
+        // spec cannot be held and is refused without interning it.
+        let Some(oid) = world.registry().lookup_spec(origin_spec) else {
             return;
         };
-        if self.pouch.count(tid) < 1 {
+        let Some(tid) = world.registry().lookup_spec(target_spec) else {
+            return;
+        };
+        if self.pouch.count(oid) < 1 || self.pouch.count(tid) < 1 {
+            self.prune_slots();
             return;
         }
-        let (rid, was_new) = if let Some(spec) = result_spec {
-            let was_new = world.registry().lookup_spec(spec).is_none();
+        let rid = if let Some(spec) = result_spec {
             let Some(id) = world.registry_mut().parse_spec(spec) else {
                 return;
             };
-            (id, was_new)
+            id
         } else {
-            let Some(oid) = world.registry_mut().parse_spec(origin_spec) else {
-                return;
-            };
             let origin = world.registry().configuration(oid).clone();
             let target = world.registry().configuration(tid).clone();
             let law = *world.registry().law();
             let result = interact_repeat(&law, &origin, &target, event, repeat);
-            let was_new = world.registry().lookup(&result).is_none();
             let Some(id) = world.registry_mut().intern(&result) else {
                 return;
             };
-            (id, was_new)
+            id
         };
+        // A procedure is knowledge this player discovered: new when this journal has no entry for
+        // it and it changed something (a fixed point teaches nothing).
+        let was_new = rid != tid
+            && !self.journal.iter().any(|p| {
+                &*p.origin_spec == origin_spec
+                    && &*p.target_spec == target_spec
+                    && p.event == event
+                    && p.repeat == repeat
+            });
         self.finish_commit(
             world,
             origin_spec,
@@ -392,9 +407,7 @@ impl CraftingMod {
             self.pouch.add(tid, 1);
             return;
         }
-        if self.equipped == Some(tid) && self.pouch.count(tid) == 0 {
-            self.equipped = None;
-        }
+        self.prune_slots();
         if was_new {
             self.journal.push(Procedure {
                 origin_spec: origin_spec.into(),
@@ -426,10 +439,18 @@ impl CraftingMod {
         }
         ctx.placements.push((x, y, z, equipped));
         self.pouch.consume(equipped, 1);
-        if self.pouch.count(equipped) == 0 {
-            self.equipped = None;
-        }
+        self.prune_slots();
         self.bump_hud();
+    }
+
+    /// Slots (equipped, origin, target) only ever name held units: clear any whose pouch row ran out.
+    fn prune_slots(&mut self) {
+        let pouch = &self.pouch;
+        for slot in [&mut self.equipped, &mut self.origin, &mut self.target] {
+            if slot.is_some_and(|id| pouch.count(id) == 0) {
+                *slot = None;
+            }
+        }
     }
 
     fn push_loaded(&mut self, _world: &World, id: BlockId, count: u32, equip: bool) {
@@ -824,8 +845,12 @@ impl Mod for CraftingMod {
         }
     }
 
-    fn on_place_rejected(&mut self, id: BlockId, world: &World) {
-        self.push_loaded(world, id, 1, false);
+    fn on_place_rejected(&mut self, id: BlockId, _world: &World) {
+        // The unit left the pouch a moment ago; if its slot was taken meanwhile the refund cannot
+        // fit and the unit is lost — counted, so the HUD can say so instead of hiding it.
+        if !self.pouch.add(id, 1) {
+            self.lost += 1;
+        }
         self.bump_hud();
     }
 
@@ -895,6 +920,15 @@ impl Mod for CraftingMod {
             )
         });
         out.extend(cached.iter().cloned());
+        if self.lost > 0 {
+            out.push(HudElement::Label {
+                at: crate::ui::Anchor::Top,
+                off: (0, PANEL_Y + LINE_HEIGHT),
+                base_fs: FONT_SIZE,
+                role: Role::Danger,
+                text: format!("Pouch full - {} refunded unit(s) lost!", self.lost).into(),
+            });
+        }
     }
 
     fn close_overlay(&mut self) -> bool {
@@ -1034,19 +1068,19 @@ mod tests {
 
         let mut hud1 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud1);
-        let text1 = hud_text(&hud1);
+        let text1 = crate::ui::hud_text(&hud1);
         assert!(!crafting.refresh(&player.stash), "no stash change: rows stay");
         assert_eq!(crafting.held, held);
         let mut hud2 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud2);
-        assert_eq!(hud_text(&hud2), text1, "HUD cache is reused until a stash/pouch mutation");
+        assert_eq!(crate::ui::hud_text(&hud2), text1, "HUD cache is reused until a stash/pouch mutation");
 
         player.stash.add(soil, 1);
         assert!(crafting.refresh(&player.stash));
         assert_eq!(crafting.held, vec![rock, soil]);
         let mut hud3 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud3);
-        assert_ne!(hud_text(&hud3), text1, "a stash mutation rebuilds the held rows");
+        assert_ne!(crate::ui::hud_text(&hud3), text1, "a stash mutation rebuilds the held rows");
 
         crafting.cursor = usize::MAX;
         assert!(player.stash.consume(rock, 2), "spend the rock stack");
@@ -1281,6 +1315,72 @@ mod tests {
     }
 
     #[test]
+    fn apply_requires_the_origin_to_be_held() {
+        let mut world = World::new(1);
+        let (origin, target, _, _) = reactive_pair(&mut world);
+        let mut crafting = test_mod();
+        assert!(crafting.pouch.add(target, 2));
+        crafting.origin = Some(origin); // named, but no unit of it in the pouch
+        crafting.target = Some(target);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::Collision).unwrap();
+        crafting.repeat = 1;
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+        crafting.apply(&mut ctx);
+        assert_eq!(crafting.pouch.count(target), 2, "nothing is consumed without the origin");
+        assert_eq!(crafting.origin, None, "an unheld origin slot is cleared");
+        ctx.networked = true;
+        crafting.origin = Some(origin);
+        crafting.apply(&mut ctx);
+        assert!(ctx.crafts.is_empty(), "no request leaves for an unheld origin");
+        // The authoritative reply path is held to the same rule.
+        let ospec = ctx.world.registry().spec(origin);
+        let tspec = ctx.world.registry().spec(target);
+        let rspec = ctx.world.registry().spec(origin);
+        crafting.on_craft_result(&ospec, &tspec, EventKind::Collision as u8, 1, &rspec, ctx.world);
+        assert_eq!(crafting.pouch.count(target), 2, "a result for an unheld origin does not commit");
+    }
+
+    #[test]
+    fn a_refund_that_cannot_fit_is_counted_not_hidden() {
+        let mut world = World::new(1);
+        let (origin, target, _, _) = reactive_pair(&mut world);
+        let mut crafting = test_mod();
+        assert!(crafting.pouch.add(target, START_CAPACITY as u32));
+        crafting.on_place_rejected(origin, &world);
+        assert_eq!(crafting.pouch.total(), START_CAPACITY as u32);
+        assert_eq!(crafting.lost, 1);
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut shown = Vec::new();
+        crafting.hud(&world, &player, (800, 600), &mut shown);
+        assert!(
+            crate::ui::hud_text(&shown).contains("lost"),
+            "{}",
+            crate::ui::hud_text(&shown)
+        );
+        player.stash.add(origin, 1);
+    }
+
+    #[test]
+    fn a_fixed_point_is_not_a_discovery() {
+        let mut world = World::new(1);
+        let rock = world
+            .registry_mut()
+            .intern(&Configuration::single(Element::new([120, 130, 140, 150])))
+            .unwrap();
+        let mut crafting = test_mod();
+        assert!(crafting.pouch.add(rock, 2));
+        crafting.origin = Some(rock);
+        crafting.target = Some(rock);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::NewContact).unwrap();
+        crafting.repeat = 1;
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+        crafting.apply(&mut ctx);
+        assert!(crafting.journal.is_empty(), "rock on rock at rest teaches nothing");
+    }
+
+    #[test]
     fn networked_apply_queues_craft_and_result_commits() {
         let mut world = World::new(1);
         let (origin, target, ca, cb) = reactive_pair(&mut world);
@@ -1318,22 +1418,4 @@ mod tests {
         assert_eq!(crafting.pouch.count(rid), 1);
     }
 
-    fn hud_text(elements: &[HudElement]) -> String {
-        let mut out = String::new();
-        for el in elements {
-            match el {
-                HudElement::Label { text, .. } => {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-                HudElement::Panel(panel) => {
-                    for row in panel.header.iter().chain(panel.rows.iter()) {
-                        out.push_str(&row.text);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-        out
-    }
 }

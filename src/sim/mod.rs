@@ -53,6 +53,7 @@ impl Simulation {
     }
 
     /// Add a system, inserting it into the name-sorted sequence.
+    #[cfg(test)]
     pub fn add(&mut self, system: Box<dyn Tick>) {
         let i = self.systems.partition_point(|s| s.name() <= system.name());
         self.systems.insert(i, system);

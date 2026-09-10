@@ -80,6 +80,7 @@ impl RingWorklist {
         self.buckets.iter().flat_map(|b| b.iter())
     }
 
+    #[cfg(test)]
     pub fn retain(&mut self, mut f: impl FnMut(&Coord) -> bool) {
         let mut n = 0;
         for b in &mut self.buckets {

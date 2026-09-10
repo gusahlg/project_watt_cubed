@@ -5,7 +5,7 @@
 //! Only two things are inputs the world shares: [`SkyClock`] (the "when") and
 //! [`Weather`]. Everything else derives. The lighting edge into voxel shading is
 //! [`crate::frame_snapshot::compose`] → the per-frame UBO; this module
-//! owns [`Sky::clear`] (flat clear) and [`Sky::draw`] (the procedural
+//! owns [`Sky::clear_at`] (flat clear) and [`Sky::draw`] (the procedural
 //! background pass).
 mod atmosphere;
 mod clock;
@@ -14,7 +14,9 @@ mod weather;
 
 pub use atmosphere::Atmosphere;
 pub use clock::{DayLength, SkyClock, SkyFrame};
-pub use weather::{Precip, Weather};
+#[cfg(test)]
+pub use weather::Precip;
+pub use weather::Weather;
 
 use voxel_engine::{Frame3D, LinearRgb, SkyDesc};
 
@@ -51,6 +53,7 @@ impl Sky {
     }
 
     /// Sample the clock once for every sun consumer this frame.
+    #[cfg(test)]
     pub fn frame(&self) -> SkyFrame {
         self.clock.frame()
     }
@@ -63,12 +66,7 @@ impl Sky {
         clock.frame()
     }
 
-    /// The flat clear colour for [`Engine::begin_frame`](voxel_engine::Engine::begin_frame).
-    pub fn clear(&self) -> LinearRgb {
-        self.clear_at(self.frame())
-    }
-
-    /// [`clear`](Self::clear) against an already-sampled clock frame.
+    /// Flat clear colour against an already-sampled clock frame.
     pub fn clear_at(&self, frame: SkyFrame) -> LinearRgb {
         self.atmosphere.clear(frame.sun_dir)
     }

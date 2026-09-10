@@ -880,7 +880,7 @@ fn boundary_cross_prunes_stale_uploads_in_one_pass() {
         world.chunks.get_mut(&c).unwrap().state =
             MeshState::NeedsMesh { building: true, prev: None };
         let rev = world.chunks[&c].rev;
-        world.upload_queue.push_back((c, rev, pipeline::MeshOutput::new()));
+        world.upload_queue.push_back((c, rev, pipeline::MeshOutput::new().into()));
     }
     // An edit landed while the first entry sat queued.
     world.chunks.get_mut(&stale_coord).unwrap().rev =
@@ -922,7 +922,35 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     );
     let expected: usize = Pass::ALL.iter().map(|&p| out[p].vertex_bytes()).sum();
     assert!(expected > 0, "a surface chunk yields geometry");
-    assert_eq!(streaming::mesh_output_bytes(&out), expected);
+    assert_eq!(
+        streaming::mesh_output_bytes(&pipeline::MeshPayload::from(out)),
+        expected
+    );
+}
+
+/// Staged upload accounting is the same vertex-byte charge as CPU `MeshData`.
+#[test]
+fn staged_upload_bytes_match_quad_counts() {
+    let mut world = World::generate();
+    world.refresh_tables();
+    let coord = ChunkCoord::new(0, 0, 0);
+    let (_, snapshot) = world.snapshot(coord, true);
+    let mut out = pipeline::MeshOutput::new();
+    mesh::build_chunk_mesh(
+        &snapshot.padded,
+        snapshot.uniform,
+        &snapshot.tables,
+        &snapshot.light.expect("lighting on by default"),
+        &mut out,
+    );
+    for p in Pass::ALL {
+        let data = &out[p];
+        assert_eq!(
+            pipeline::vertex_bytes_from_quads(data.quad_counts()),
+            data.vertex_bytes(),
+            "pass {p:?}"
+        );
+    }
 }
 
 /// Section uploads charge the same vertex-byte accounting as chunks, stored
@@ -948,7 +976,7 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
             pos,
             epoch: 0,
             token: pipeline::ClaimToken(7),
-            meshes: Box::new(meshes),
+            meshes: meshes.into(),
         },
     );
     assert_eq!(world.section_upload_queue.len(), 1);
@@ -968,7 +996,7 @@ fn upload_backlog_pauses_mesh_admission_at_the_cap() {
     let mut world = World::generate();
     assert!(!world.upload_backlogged());
     for i in 0..96 {
-        world.upload_queue.push_back((ChunkCoord::new(i, 0, 0), 0, pipeline::MeshOutput::new()));
+        world.upload_queue.push_back((ChunkCoord::new(i, 0, 0), 0, pipeline::MeshOutput::new().into()));
     }
     assert!(world.upload_backlogged(), "at the cap admission pauses");
     world.upload_queue.pop_front();
@@ -1742,7 +1770,7 @@ fn view_shrink_prunes_uploads_outside_the_new_mesh_box() {
             prev: None,
         };
         let rev = world.chunks[&c].rev;
-        world.upload_queue.push_back((c, rev, pipeline::MeshOutput::new()));
+        world.upload_queue.push_back((c, rev, pipeline::MeshOutput::new().into()));
     }
     world.set_view_distances(1, 1);
     assert!(world.center.is_none(), "shrink forces a full stream pass");
@@ -2325,7 +2353,7 @@ fn anything_in_flight_tracks_claims_and_queues() {
 
     world
         .upload_queue
-        .push_back((c, 0, crate::world::pipeline::MeshOutput::new()));
+        .push_back((c, 0, crate::world::pipeline::MeshOutput::new().into()));
     assert!(world.anything_in_flight());
     world.upload_queue.clear();
     assert!(!world.anything_in_flight());

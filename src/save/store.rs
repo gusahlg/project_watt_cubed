@@ -16,6 +16,7 @@ fn saves_dir() -> &'static Path {
     Paths::get().data.as_path()
 }
 
+#[cfg(test)]
 fn trash_dir() -> PathBuf {
     saves_dir().join("trash")
 }
@@ -158,6 +159,7 @@ pub fn write(id: &SlotId, bytes: &[u8]) -> io::Result<()> {
 
 /// Move a slot to a new id. The display name in the header is patched to
 /// match; the backup follows best-effort.
+#[cfg(test)]
 pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
     if live_path(to).exists() {
         return Err(SaveError::Io(io::Error::new(
@@ -181,6 +183,7 @@ pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
 }
 
 /// Move a slot (and its backup) into `trash/` under the data root rather than unlinking.
+#[cfg(test)]
 pub fn delete(id: &SlotId) -> io::Result<()> {
     fs::create_dir_all(trash_dir())?;
     let dest = unused_trash_path(id);
@@ -189,6 +192,7 @@ pub fn delete(id: &SlotId) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn unused_trash_path(id: &SlotId) -> PathBuf {
     let first = trash_dir().join(format!("{id}.save"));
     if !first.exists() {
@@ -201,6 +205,7 @@ fn unused_trash_path(id: &SlotId) -> PathBuf {
 }
 
 /// Copy a slot to a fresh id, patching the display name for disambiguation.
+#[cfg(test)]
 pub fn duplicate(id: &SlotId) -> Result<SlotId, SaveError> {
     let mut bytes = fs::read(live_path(id))?;
     let new_id = unused_id(&format!("{id}-copy"))?;
