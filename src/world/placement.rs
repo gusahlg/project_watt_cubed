@@ -962,8 +962,8 @@ mod tests {
             fn block_at(&self, pos: Pos) -> Option<BlockId> {
                 Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
             }
-            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
-                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
+                Some(self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR))
             }
             fn registry(&self) -> &BlockRegistry {
                 &self.reg
@@ -1006,7 +1006,6 @@ mod tests {
             Budget {
                 events_per_generation: CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE,
                 generations_per_tick: 20,
-                max_followups: CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE * 6,
             },
         );
         assert!(out.is_empty(), "generated matter mutated under ExternallyChanged: {} edits", out.len());
@@ -1029,8 +1028,8 @@ mod tests {
             fn block_at(&self, pos: Pos) -> Option<BlockId> {
                 Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
             }
-            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
-                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {
+                Some(self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR))
             }
             fn registry(&self) -> &BlockRegistry {
                 &self.reg
@@ -1086,7 +1085,6 @@ mod tests {
             Budget {
                 events_per_generation: (BOX * BOX * BOX) as usize,
                 generations_per_tick: 20,
-                max_followups: (BOX * BOX * BOX * 6) as usize,
             },
         );
         assert!(

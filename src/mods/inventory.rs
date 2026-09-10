@@ -242,10 +242,12 @@ mod tests {
         assert_eq!(player.stash.count(rock), 2);
         assert_eq!(player.stash.count(soil), 1);
 
+        let rock_words = world.registry().display_name(rock);
+        let soil_words = world.registry().display_name(soil);
         let mut hidden = Vec::new();
         mods.hud(&world, &player, (800, 600), &mut hidden);
         assert!(
-            !hud_text(&hidden).contains("rock"),
+            !hud_text(&hidden).contains(&format!("2x {rock_words}")),
             "disabled inventory must not present the list"
         );
 
@@ -254,11 +256,11 @@ mod tests {
         mods.hud(&world, &player, (800, 600), &mut shown);
         let text = hud_text(&shown);
         assert!(
-            text.contains("2x rock"),
+            text.contains(&format!("2x {rock_words}")),
             "re-enabled HUD lists the held rock: {text}"
         );
         assert!(
-            text.contains("1x soil"),
+            text.contains(&format!("1x {soil_words}")),
             "re-enabled HUD lists the held soil: {text}"
         );
     }
@@ -290,19 +292,18 @@ mod tests {
         let mut shown = Vec::new();
         inventory.hud(&world, &player, (800, 600), &mut shown);
         let text = hud_text(&shown);
+        let near_words = world.registry().display_name(near_id);
+        let far_words = world.registry().display_name(far_id);
         assert!(
-            text.contains(&format!("1x {}-like", rock.label)),
-            "near an unlabelled centre reads as -like: {text}"
+            text.contains(&format!("1x {near_words}")),
+            "a held material is described by its readings: {text}"
         );
-        let far_within = regions
-            .iter()
-            .any(|r| far.distance(r.centre) <= 2 * r.spread as u32);
-        if !far_within {
-            assert!(
-                text.contains("1x unknown material"),
-                "a far unlabelled config stays unknown: {text}"
-            );
-        }
+        assert!(text.contains(&format!("1x {far_words}")), "{text}");
+        assert!(
+            !text.contains(rock.label) && !text.contains("-like") && !text.contains("unknown"),
+            "no worldgen label or authored name reaches the player: {text}"
+        );
+        let _ = regions;
     }
 
     fn hud_text(elements: &[HudElement]) -> String {

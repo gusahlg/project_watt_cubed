@@ -22,6 +22,10 @@ use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
+/// Times a workbench apply may repeat the interaction: the wire, the server and the crafting
+/// mod share this one bound.
+pub const WORKBENCH_REPEAT: std::ops::RangeInclusive<u8> = 1..=16;
+
 /// Workbench events only: `Moved` / `NewContact` / `Collision`. Other bytes are not well-formed.
 pub(crate) fn workbench_event(v: u8) -> Option<material::EventKind> {
     match v {
