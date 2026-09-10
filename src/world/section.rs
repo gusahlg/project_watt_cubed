@@ -1,12 +1,13 @@
 //! Section: a quadtree node backed by four brick stacks.
 //!
 //! A section is `pos` (detail + grid coords) plus four [`BrickStack`]s, one
-//! per intra-section mesh quadrant (bit 0 = +X, bit 1 = +Z — same convention
+//! per 16×16 column band (bit 0 = +X, bit 1 = +Z — same convention
 //! [`Quadrant`] uses for the UNRELATED inter-section quadtree-child concept;
 //! the two "quadrant" notions share a bit layout by coincidence, not by
-//! design, so this file never reuses [`Quadrant`] for the intra-section
-//! split). Each stack is a vertical run of [`Brick`]s (16³ cells) built
-//! directly from RLE column data.
+//! design, so this file never reuses [`Quadrant`] for the brick-band split).
+//! Each stack is a vertical run of [`Brick`]s (16³ cells) built directly from
+//! RLE column data. The GPU mesh is one packed tile per section per pass,
+//! not one mesh per band.
 //!
 //! Each detail level is independently re-sampled from the generator; there is
 //! no 4-to-1 merge between levels.
@@ -80,9 +81,6 @@ impl Quadrant {
     }
     pub const fn get(self) -> u8 {
         self.0
-    }
-    pub const fn index(self) -> usize {
-        self.0 as usize
     }
     /// The +X bit as an offset (0 or 1).
     pub const fn dx(self) -> i32 {
@@ -462,15 +460,16 @@ mod tests {
         water: BlockId,
     }
     fn blocks() -> Blocks {
-        let r = BlockRegistry::with_builtins();
-        let id = |n: &str| r.id_by_name(n).unwrap();
+        let mut r = BlockRegistry::with_builtins();
+        crate::world::placement::builtin().compile(&mut r);
+        let id = |n: &str| r.id_by_label(n).unwrap();
         Blocks {
             air: AIR,
-            grass: id("Organic"),
-            dirt: id("Soil"),
-            stone: id("Stone"),
-            sand: id("Sand"),
-            water: id("Water"),
+            grass: id("organic+soil"),
+            dirt: id("clay+soil"),
+            stone: id("rock"),
+            sand: id("sand"),
+            water: id("water"),
         }
     }
 

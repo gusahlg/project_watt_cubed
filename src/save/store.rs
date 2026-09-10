@@ -68,10 +68,11 @@ fn peek_file(path: &std::path::Path) -> Result<super::slot::SaveMeta, SaveError>
     let f = fs::File::open(path)?;
     let mut v = Vec::with_capacity(format::HEADER_LEN);
     f.take(format::HEADER_LEN as u64).read_to_end(&mut v)?;
-    if v.len() < format::HEADER_LEN {
-        return Err(SaveError::Corrupt("not a save"));
+    match format::peek_meta(&v) {
+        Ok(meta) => Ok(meta),
+        Err(_) if v.len() < format::HEADER_LEN => Err(SaveError::Corrupt("not a save")),
+        Err(e) => Err(e),
     }
-    format::peek_meta(&v)
 }
 
 /// Prefers: intact live > intact backup > salvaged live > salvaged backup.
@@ -93,14 +94,16 @@ pub fn read(id: &SlotId) -> Result<(Decoded, Source), SaveError> {
     }
 }
 
+fn sibling_tmp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// Write `bytes` to `path` via a sibling `.tmp`, `sync_all`, then rename.
 /// A crash mid-write leaves the previous file intact. Success leaves no `.tmp`.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(".tmp");
-        PathBuf::from(name)
-    };
+    let tmp = sibling_tmp(path);
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -111,6 +114,30 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Create parent directories, then [`write_atomic`]. Settings, session, and
+/// mods.cfg persist through this.
+pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    write_atomic(path, bytes)
+}
+
+/// Log a filesystem error instead of `let _ =`. Callers stay best-effort.
+pub(crate) fn log_fs_err(op: &str, path: &Path, err: &io::Error) {
+    eprintln!("could not {op} {}: {err}", path.display());
+}
+
+#[cfg(test)]
+pub(crate) fn test_temp_path(tag: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "watt-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 /// Atomically replace a slot's bytes, rotating the previous file to `.bak`.
@@ -143,7 +170,12 @@ pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
     // and the old file becomes the new slot's backup.
     format::set_name(&mut bytes, to.as_str())?;
     write(to, &bytes)?;
-    let _ = fs::rename(bak_path(from), bak_path(to));
+    let from_bak = bak_path(from);
+    if let Err(e) = fs::rename(&from_bak, bak_path(to)) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log_fs_err("rename", &from_bak, &e);
+        }
+    }
     fs::remove_file(live_path(from))?;
     Ok(())
 }
@@ -203,6 +235,7 @@ mod tests {
         SaveDoc {
             worldgen_version: 2,
             worldgen: WorldgenStamp::default(),
+            law_stamp: material::Law::v0().stamp(),
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,
@@ -399,27 +432,51 @@ mod tests {
 
         fs::write(live_path(&id), &bytes[..format::HEADER_LEN - 1]).unwrap();
         assert!(
-            matches!(peek_file(&live_path(&id)), Err(SaveError::Corrupt("not a save"))),
-            "fewer than HEADER_LEN bytes is not a save"
+            matches!(
+                peek_file(&live_path(&id)),
+                Err(SaveError::Corrupt("not a save"))
+            ),
+            "a v8 prefix shorter than header_len(8) is not a save"
         );
+        cleanup(&id);
+    }
+
+    /// A v7 document can be 164–205 bytes (header 126 + a tiny body). Peek
+    /// must not demand the v8 header length; `peek_meta` enforces `header_len(7)`.
+    fn v7_bytes(doc: &SaveDoc) -> Vec<u8> {
+        let current = format::encode(doc).unwrap();
+        let mut v7 = Vec::with_capacity(current.len() - material::STAMP_LEN);
+        v7.extend_from_slice(&current[..format::HEADER_LEN_V7]);
+        v7.extend_from_slice(&current[format::HEADER_LEN..]);
+        v7[4..6].copy_from_slice(&7u16.to_le_bytes());
+        v7
+    }
+
+    #[test]
+    fn peek_lists_a_minimal_v7_save() {
+        let id = SlotId::new("__store_peek_v7__").unwrap();
+        cleanup(&id);
+        let bytes = v7_bytes(&doc("v7tiny", 0));
+        assert!(
+            bytes.len() < format::HEADER_LEN,
+            "fixture must be shorter than the v8 header ({})",
+            bytes.len()
+        );
+        assert!(bytes.len() >= format::HEADER_LEN_V7);
+        fs::write(live_path(&id), &bytes).unwrap();
+
+        assert_eq!(peek_file(&live_path(&id)).unwrap().name, "v7tiny");
+        let slots = list();
+        let listed = slots.iter().find(|s| s.id == id).expect("v7 slot listed");
+        assert_eq!(listed.meta.as_ref().unwrap().name, "v7tiny");
+
         cleanup(&id);
     }
 
     #[test]
     fn write_atomic_leaves_no_tmp_on_success() {
-        let path = std::env::temp_dir().join(format!(
-            "watt-atomic-{}-{}.cfg",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let tmp = {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(".tmp");
-            PathBuf::from(name)
-        };
+        let path = test_temp_path("atomic").with_extension("cfg");
+        let tmp = sibling_tmp(&path);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&tmp);
         write_atomic(&path, b"ok\n").unwrap();
@@ -430,26 +487,24 @@ mod tests {
 
     #[test]
     fn write_atomic_into_unwritable_dir_is_err() {
-        let parent = std::env::temp_dir().join(format!(
-            "watt-atomic-notdir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(1)
-        ));
+        let parent = test_temp_path("atomic-notdir");
         let _ = fs::remove_file(&parent);
         let _ = fs::remove_dir_all(&parent);
         fs::write(&parent, b"not a directory").unwrap();
         let path = parent.join("mods.cfg");
         assert!(write_atomic(&path, b"nope").is_err());
-        let tmp = {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(".tmp");
-            PathBuf::from(name)
-        };
-        assert!(!tmp.exists(), "failed write must not leave a .tmp");
+        assert!(!sibling_tmp(&path).exists(), "failed write must not leave a .tmp");
         let _ = fs::remove_file(&parent);
+    }
+
+    #[test]
+    fn write_atomic_file_creates_missing_parents() {
+        let path = test_temp_path("atomic-nested").join("cfg").join("mods.cfg");
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        write_atomic_file(&path, b"nested\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"nested\n");
+        assert!(!sibling_tmp(&path).exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
@@ -470,5 +525,14 @@ mod tests {
 
         cleanup(&good);
         cleanup(&bad);
+    }
+
+    #[test]
+    fn log_fs_err_does_not_panic() {
+        log_fs_err(
+            "write",
+            Path::new("/watt-audit-no-such"),
+            &io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        );
     }
 }

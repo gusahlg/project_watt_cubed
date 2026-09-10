@@ -3,10 +3,9 @@
 
 use voxel_engine::DVec3;
 
-use crate::block::element::ElementId;
-use crate::block::{AIR, BlockId, Composition};
+use crate::block::{AIR, BlockId};
 use crate::coord::{BlockCoord, ChunkCoord, Local};
-use crate::mods::{self, Mods};
+use crate::mods::Mods;
 use crate::player::Player;
 use crate::world::chunk::Chunk;
 use crate::world::diffusion::DiffusionCfg;
@@ -16,7 +15,7 @@ use crate::world::{FastMap, World};
 use super::format::{self, Edit, PlayerState, SaveDoc, WorldgenStamp};
 use super::slot::{SaveError, SaveMeta, SlotId};
 use super::store::{self, Source};
-use super::{composition_spec, parse_block};
+use super::parse_block;
 
 /// How a load actually went; the menu formats whichever fields are set
 /// ("restored from backup", "recovered 48,112 of 48,300 edits").
@@ -35,17 +34,6 @@ pub fn unix_now() -> u64 {
 }
 
 /// Cheap main-thread snapshot of everything a save needs to encode.
-///
-/// Clones the compact edit overlay (`FastMap` memcpy, no spec strings) plus
-/// player pose, mod-state records, and the small palette/element tables the
-/// writer uses to build spec strings. Encode and disk write happen on the
-/// autosave worker; see [`SaveSnapshot::encode`] and [`Autosaver::start`].
-///
-/// 100k-edit overlay (this box, 2026-09-09, release
-/// `autosave_snapshot_and_encode_at_100k_edits`, median of 5): snapshot
-/// 1.12 ms; encode 7.07 ms; write 2.54 ms; encode+write 9.61 ms.
-///
-/// [`Autosaver::start`]: super::autosave::Autosaver::start
 pub struct SaveSnapshot {
     overlay: FastMap<ChunkCoord, FastMap<usize, BlockId>>,
     player: PlayerState,
@@ -53,23 +41,19 @@ pub struct SaveSnapshot {
     meta: SaveMeta,
     worldgen_version: u16,
     worldgen: WorldgenStamp,
-    compositions: Vec<Composition>,
-    element_names: Vec<Box<str>>,
+    law_stamp: Vec<u8>,
+    specs: Vec<String>,
 }
 
 impl SaveSnapshot {
-    /// Capture live game state. O(edits) overlay clone plus O(palette) composition
-    /// copies; spec strings are not built here.
+    /// Capture live game state. O(edits) overlay clone plus O(palette) spec
+    /// strings.
     pub fn capture(world: &World, player: &Player, mods: &Mods, mut meta: SaveMeta) -> Self {
         meta.seed = world.seed();
         meta.last_played = unix_now();
         let registry = world.registry();
-        let compositions = (0..registry.block_count())
-            .map(|i| registry.block(BlockId(i as u16)).composition.clone())
-            .collect();
-        let elements = registry.elements();
-        let element_names = (0..elements.len())
-            .map(|i| elements.get(ElementId(i as u16)).name.clone())
+        let specs = (0..registry.block_count())
+            .map(|i| registry.spec(BlockId(i as u16)))
             .collect();
         Self {
             overlay: world.clone_edit_overlay(),
@@ -79,16 +63,14 @@ impl SaveSnapshot {
                 pitch: player.orientation.pitch,
                 flying: player.flying(),
                 noclip: player.noclip(),
-                stash: Some(player.stash.to_portable(|id| {
-                    world.registry().elements().get(id).name.as_ref()
-                })),
+                stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
             },
             mods: mods.save_states(world),
             meta,
             worldgen_version: crate::world::placement::WORLDGEN_VERSION,
             worldgen: stamp_from_world(world),
-            compositions,
-            element_names,
+            law_stamp: world.registry().law().stamp(),
+            specs,
         }
     }
 
@@ -103,8 +85,8 @@ impl SaveSnapshot {
             meta,
             worldgen_version: crate::world::placement::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
-            compositions: vec![Composition::Natural(Box::new([]))],
-            element_names: Vec::new(),
+            law_stamp: material::Law::v0().stamp(),
+            specs: vec!["air".into()],
         }
     }
 
@@ -112,9 +94,10 @@ impl SaveSnapshot {
         if id == AIR {
             return "air".to_string();
         }
-        composition_spec(&self.compositions[id.0 as usize], |e| {
-            self.element_names[e.0 as usize].as_ref()
-        })
+        self.specs
+            .get(id.0 as usize)
+            .cloned()
+            .unwrap_or_else(|| "air".into())
     }
 
     fn edits(&self) -> impl Iterator<Item = ((i32, i32, i32), BlockId)> + '_ {
@@ -156,6 +139,7 @@ impl SaveSnapshot {
             meta,
             worldgen_version: self.worldgen_version,
             worldgen: self.worldgen,
+            law_stamp: self.law_stamp.clone(),
             player: self.player.clone(),
             specs,
             edits,
@@ -197,21 +181,33 @@ fn stamp_from_world(world: &World) -> WorldgenStamp {
     }
 }
 
-fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &World) {
-    let elements = world.registry().elements();
-    match &doc.player.stash {
-        Some(items) => player.stash.load_portable(items, |n| elements.id_by_name(n)),
-        None => {
-            // Pre-v7: the inventory mod owned the counts.
-            if let Some((_, data)) = doc
-                .mods
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("inventory"))
-            {
-                let (_, payload) = mods::split_mod_version(data);
-                player.stash.load_names(payload, |n| elements.id_by_name(n));
-            }
-        }
+fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> u32 {
+    let Some(items) = &doc.player.stash else {
+        return 0;
+    };
+    player.stash.load_portable(items, |s| world.registry_mut().parse_spec(s))
+}
+
+/// One load notice covering unknown edits and unknown stash/pouch holdings.
+pub(crate) fn unknown_material_notice(unknown_edits: u32, unknown_holdings: u32) -> Option<String> {
+    match (unknown_edits, unknown_holdings) {
+        (0, 0) => None,
+        (e, 0) => Some(format!(
+            "save predates the material model; {e} edits of unknown materials became air"
+        )),
+        (0, h) => Some(format!("{h} holdings of unknown materials were dropped")),
+        (e, h) => Some(format!(
+            "save predates the material model; {e} edits of unknown materials became air; {h} holdings of unknown materials were dropped"
+        )),
+    }
+}
+
+/// Pre-v8 documents carry no law stamp; the load assumes law v0.
+pub(crate) fn v7_law_notice(law_stamp: &[u8]) -> Option<String> {
+    if law_stamp.is_empty() {
+        Some("save predates the law stamp (v7); assuming law v0".into())
+    } else {
+        None
     }
 }
 
@@ -222,25 +218,26 @@ fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
         stride: stamp.stride,
         phases: stamp.phases,
         relief: stamp.relief,
+        version: 1,
     }
     .clamp();
     (kind, cfg)
 }
 
 /// Rebuild a ready-to-play world and player from a doc, restoring mod state
-/// into `mods`. Unknown specs degrade to air, exactly like the network path.
-/// `make_world` is the caller's choice of `World` constructor — the header's
-/// seed, kind, and diffusion knobs are passed in so a loaded world rebuilds
-/// with the generator that wrote it, not the caller's current mod flags.
+/// into `mods`. Unknown specs degrade to air. A law stamp that does not match
+/// this game's law is a different universe and is refused.
 pub fn from_doc(
     doc: SaveDoc,
     mods: &mut Mods,
     make_world: impl FnOnce(i64, WorldgenKind, DiffusionCfg) -> World,
-) -> (World, Player, SaveMeta) {
-    // Warn, never reject: the seed regenerates terrain fine, but a save from
-    // another worldgen replays its edits over terrain whose MATERIALS may have
-    // moved (a mined-out iron vein may now sit in coal). Geometry never moves
-    // across worldgen versions — that invariant is what keeps old saves sane.
+) -> Result<(World, Player, SaveMeta), SaveError> {
+    if !doc.law_stamp.is_empty() && doc.law_stamp != material::Law::v0().stamp() {
+        return Err(SaveError::LawMismatch);
+    }
+    if let Some(msg) = v7_law_notice(&doc.law_stamp) {
+        eprintln!("{msg}");
+    }
     if doc.worldgen_version != crate::world::placement::WORLDGEN_VERSION {
         eprintln!(
             "save '{}' was written by worldgen v{} (current v{}): terrain materials \
@@ -262,30 +259,35 @@ pub fn from_doc(
     player.orientation.pitch = doc.player.pitch;
     if doc.player.flying {
         player.set_flying(true);
-        // Noclip is only reachable through the fly cycle (fly → fly+noclip).
         if doc.player.noclip {
             player.cycle_fly();
         }
     }
 
-    restore_stash(&mut player, &doc, &world);
+    let mut unknown_holdings = restore_stash(&mut player, &doc, &mut world);
 
+    let mut unknown_edits = 0u32;
     let block_ids: Vec<_> = doc
         .specs
         .iter()
         .map(|spec| parse_block(world.registry_mut(), spec))
         .collect();
     for edit in &doc.edits {
-        // Index valid: decode drops out-of-range edits.
-        world.set_block(edit.x, edit.y, edit.z, block_ids[usize::from(edit.spec)]);
+        let id = block_ids[usize::from(edit.spec)];
+        if id == AIR && doc.specs[usize::from(edit.spec)] != "air" {
+            unknown_edits += 1;
+        }
+        world.set_block(edit.x, edit.y, edit.z, id);
     }
 
     for (name, data) in &doc.mods {
-        // Mutable world: restoring crafted blocks re-registers them by name.
-        mods.load_state(name, data, &mut world);
+        unknown_holdings += mods.load_state(name, data, &mut world);
+    }
+    if let Some(msg) = unknown_material_notice(unknown_edits, unknown_holdings) {
+        eprintln!("{msg}");
     }
 
-    (world, player, doc.meta)
+    Ok((world, player, doc.meta))
 }
 
 /// Snapshot straight to bytes — the synchronous encode the exit-flush path
@@ -327,6 +329,6 @@ pub fn load(
             (doc, Some((recovered, expected)))
         }
     };
-    let (world, player, meta) = from_doc(doc, mods, make_world);
+    let (world, player, meta) = from_doc(doc, mods, make_world)?;
     Ok((world, player, meta, LoadReport { source, salvage }))
 }

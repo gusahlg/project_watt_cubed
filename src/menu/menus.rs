@@ -439,9 +439,15 @@ mod tests {
             "first member is indented under the group: {:?}",
             view.rows[2].label
         );
+        let other = view
+            .rows
+            .iter()
+            .position(|r| r.label == "Other")
+            .expect("gpu_materials is ungrouped");
         assert!(
-            !view.rows.iter().any(|r| r.label == "Other"),
-            "no ungrouped built-ins"
+            view.rows[other + 1].label.contains("GPU materials"),
+            "ungrouped built-in under Other: {:?}",
+            view.rows[other + 1].label
         );
         let names: Vec<&str> = view
             .rows
@@ -454,6 +460,7 @@ mod tests {
                 || r.label.contains("Atmosphere")
                 || r.label.contains("Post")
                 || r.label.contains("Lighting")
+                || r.label.contains("Procedural textures")
                 || r.label.contains("InfiniteDiffusion"))
             .map(|r| r.label.trim())
             .collect();
@@ -467,6 +474,7 @@ mod tests {
                 "Atmosphere",
                 "Post",
                 "Lighting",
+                "Procedural textures",
                 "InfiniteDiffusion"
             ]
         );
@@ -501,7 +509,14 @@ mod tests {
             .iter()
             .position(|r| r.label == "Other" && matches!(r.kind, crate::menu::RowKind::Heading))
             .expect("Other section");
-        assert!(view.rows[other + 1].label.contains("Extra"));
+        assert!(
+            view.rows[other + 1].label.contains("GPU materials"),
+            "built-in ungrouped mod is first under Other"
+        );
+        assert!(
+            view.rows.iter().any(|r| r.label.contains("Extra")),
+            "appended ungrouped mod is listed under Other"
+        );
     }
 
     #[test]

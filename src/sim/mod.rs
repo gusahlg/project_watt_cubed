@@ -2,6 +2,8 @@
 //! with [`Simulation`]; unfinished physics belongs in design notes until it has a
 //! real active-cell model and observable behaviour.
 
+pub mod reactions;
+
 use crate::sched::{Ctx, Run};
 use crate::world::World;
 use voxel_engine::Rev;

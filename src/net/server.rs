@@ -35,9 +35,10 @@ use voxel_engine::DVec3;
 
 use crate::math::block_coord;
 
-use crate::block::registry::BlockRegistry;
+use crate::block::registry::{BlockId, BlockRegistry, AIR};
 use crate::net::hooks;
-pub use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
+use crate::sim::reactions::{self, CellStore, Mutation, Pos, ReactionScheduler};
+pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
@@ -59,6 +60,9 @@ impl<T> LockRecover<T> for Mutex<T> {
 
 /// Hard bound so a flood of connects can't spawn unbounded threads.
 const MAX_PLAYERS: usize = 256;
+/// Reserved player id for scheduler mutations attributed to the world, not a player.
+/// `next_id` starts at 1 so this id is never assigned to a joiner.
+const WORLD_PLAYER: u32 = 0;
 /// `MAX_PLAYERS` bounds the roster only AFTER a handshake; without this cap a
 /// flood of silent connects would squat a thread+fd each for the whole
 /// [`HANDSHAKE_TIMEOUT`]. Refused in the accept loop, before any thread spawns.
@@ -256,6 +260,8 @@ struct State {
     /// CURRENT phase rather than whatever `/time` last set.
     day: f32,
     day_set: Instant,
+    /// Server-authoritative reaction scheduler. Clients never run one.
+    reactions: ReactionScheduler,
 }
 
 impl State {
@@ -325,6 +331,111 @@ impl State {
     }
 }
 
+/// Ledger + generator as a [`CellStore`]: a cell not in the ledger reads from
+/// the generator, so the infinite world is defined without loading chunks.
+struct ServerCells<'a> {
+    state: &'a mut State,
+    generator: &'a crate::world::diffusion::Generator,
+}
+
+fn server_block(
+    state: &State,
+    generator: &crate::world::diffusion::Generator,
+    pos: Pos,
+) -> BlockId {
+    if let Some(cell) = state.edits.get(&pos) {
+        state.registry.lookup_spec(&cell.spec).unwrap_or(AIR)
+    } else {
+        generator.voxel_at(pos.0, pos.1, pos.2)
+    }
+}
+
+impl CellStore for ServerCells<'_> {
+    fn block_at(&self, pos: Pos) -> Option<BlockId> {
+        Some(server_block(self.state, self.generator, pos))
+    }
+
+    fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+        let prev = server_block(self.state, self.generator, pos);
+        if prev == id {
+            return prev;
+        }
+        let canonical = crate::save::block_spec(&self.state.registry, id);
+        let Some(spec) = self.state.intern(&canonical) else {
+            return prev;
+        };
+        let rev = self.state.edits.get(&pos).map_or(0, |c| c.rev).saturating_add(1);
+        if let Some(old) = self.state.edits.insert(pos, Cell { spec, rev }) {
+            self.state.release(old.spec);
+        }
+        prev
+    }
+
+    fn registry(&self) -> &BlockRegistry {
+        &self.state.registry
+    }
+
+    fn registry_mut(&mut self) -> &mut BlockRegistry {
+        &mut self.state.registry
+    }
+}
+
+fn reactions_loop(shared: Arc<Mutex<State>>, ctx: Arc<Ctx>, shutdown: Arc<AtomicBool>) {
+    let period = Duration::from_millis(50);
+    while !shutdown.load(Ordering::Relaxed) {
+        let start = Instant::now();
+        run_reactions(&shared, &ctx);
+        if let Some(rest) = period.checked_sub(start.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
+}
+
+/// One sim tick of the scheduler. Committed mutations are [`ServerMessage::Snapshot`]
+/// batches attributed to [`WORLD_PLAYER`], broadcast to every ready client. The
+/// scheduler budget already bounds the count; every commit is sent.
+fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
+    let mut state = shared.lock_recover();
+    if state.reactions.pending() == 0 {
+        return;
+    }
+    let law = *state.registry.law();
+    let budget = reactions::Budget::DEFAULT;
+    let mut sched = std::mem::take(&mut state.reactions);
+    let mutations = {
+        let mut cells = ServerCells {
+            state: &mut state,
+            generator: &ctx.generator,
+        };
+        sched.tick(&mut cells, &law, budget)
+    };
+    state.reactions = sched;
+    send_reaction_mutations(&mut state, &mutations);
+}
+
+/// Authoritative overlay edits from one scheduler tick, as snapshot batches
+/// (the client applies [`ServerMessage::Snapshot`] after bootstrap). One
+/// `S_Edit` per mutation would overflow [`OUT_CAPACITY`] on two full ticks.
+fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
+    if mutations.is_empty() {
+        return;
+    }
+    let mut edits = Vec::with_capacity(mutations.len());
+    for m in mutations {
+        let Some(cell) = state.edits.get(&m.pos) else { continue };
+        edits.push((m.pos.0, m.pos.1, m.pos.2, cell.rev, cell.spec.clone()));
+    }
+    for batch in edits.chunks(SNAPSHOT_BATCH) {
+        broadcast(
+            state,
+            &ServerMessage::Snapshot {
+                edits: batch.to_vec(),
+            },
+            |pid, _| pid != WORLD_PLAYER,
+        );
+    }
+}
+
 /// The interest-grid bucket containing `pos`. Goes through [`block_coord`]'s
 /// clamped floor (not truncation) so negative coordinates bucket consistently
 /// and a hostile-but-finite huge coordinate can't overflow the i32 key —
@@ -341,7 +452,7 @@ fn outside_world(pos: DVec3) -> bool {
 
 /// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
 /// existing clients finish on their own.
-pub struct ServerHandle {
+pub(crate) struct ServerHandle {
     shutdown: Arc<AtomicBool>,
     addr: SocketAddr,
     /// The runtime hosting quinn, held so it outlives the handle. The accept loop
@@ -389,7 +500,7 @@ impl ServerHandle {
 }
 
 /// Bind to port 0 to let the OS pick a free port.
-pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
+pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let rt = Arc::new(Runtime::new()?);
     let endpoint = {
         // Must run inside the runtime: construction spawns quinn's UDP driver.
@@ -405,7 +516,15 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let generator = match config.worldgen {
         WorldgenKind::Classic => crate::world::diffusion::classic(&mut registry, config.seed),
         WorldgenKind::Diffusion => {
-            crate::world::diffusion::diffusion(&mut registry, config.seed, config.diffusion)
+            if config.diffusion.version >= 2 {
+                crate::world::diffusion::diffusion_v2(
+                    &mut registry,
+                    config.seed,
+                    config.diffusion,
+                )
+            } else {
+                crate::world::diffusion::diffusion(&mut registry, config.seed, config.diffusion)
+            }
         }
     };
     let hooks = if config.hooks.is_empty() {
@@ -433,7 +552,9 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         next_id: 1,
         day: 0.3,
         day_set: Instant::now(),
+        reactions: ReactionScheduler::new(),
     }));
+    debug_assert_ne!(WORLD_PLAYER, 1, "player ids start at 1; 0 is the world");
 
     #[cfg(test)]
     let state = shared.clone();
@@ -442,6 +563,10 @@ pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let handshake_pending = pending.clone();
     let accept_shutdown = shutdown.clone();
     let accept_rt = rt.clone();
+    let tick_shutdown = shutdown.clone();
+    let tick_shared = shared.clone();
+    let tick_ctx = ctx.clone();
+    thread::spawn(move || reactions_loop(tick_shared, tick_ctx, tick_shutdown));
     thread::spawn(move || accept_loop(endpoint, accept_rt, shared, ctx, accept_shutdown, pending));
 
     Ok(ServerHandle {
@@ -544,6 +669,7 @@ fn handle_client(
             spawn,
             worldgen: ctx.worldgen,
             diffusion: ctx.diffusion,
+            law: crate::net::protocol::law_stamp(),
         },
     );
     for batch in snapshot.chunks(SNAPSHOT_BATCH) {
@@ -803,6 +929,12 @@ fn client_loop(
                 }
             }
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
+            ClientMessage::Craft {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+            } => on_craft(shared, id, &origin_spec, &target_spec, event, repeat),
         }
     }
 }
@@ -1095,6 +1227,11 @@ fn on_edit(
     if let Some(old) = state.edits.insert((x, y, z), Cell { spec: spec.clone(), rev }) {
         state.release(old.spec);
     }
+    if block == AIR {
+        reactions::on_broken(&mut state.reactions, (x, y, z));
+    } else {
+        reactions::on_placed(&mut state.reactions, (x, y, z));
+    }
     if let Some(out) = ack_to {
         let _ = out
             .try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
@@ -1102,6 +1239,53 @@ fn on_edit(
     // The broadcast carries the SAME pooled Arc the ledger stores.
     let msg = ServerMessage::Edit { x, y, z, rev, spec };
     broadcast(&mut state, &msg, |pid, _| pid != id);
+}
+
+/// Workbench apply: well-formedness only (specs parse, event is a workbench
+/// kind, repeat in 1..=16). There is no holdings ledger (task 67 has not
+/// landed), so the server does not check that the sender owns the materials.
+fn on_craft(
+    shared: &Arc<Mutex<State>>,
+    id: u32,
+    origin_spec: &str,
+    target_spec: &str,
+    event: u8,
+    repeat: u8,
+) {
+    if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
+        return;
+    }
+    if !(1..=16).contains(&repeat) {
+        return;
+    }
+    let Some(event) = protocol::workbench_event(event) else {
+        return;
+    };
+    let mut state = shared.lock_recover();
+    let out = {
+        let Some(h) = state.players.get(&id) else { return };
+        h.ready.then(|| h.out.clone())
+    };
+    let Some(result_id) = state
+        .registry
+        .apply_specs(origin_spec, target_spec, event, repeat)
+    else {
+        return;
+    };
+    let result_spec: Arc<str> = state.registry.spec(result_id).into();
+    if let Some(out) = out {
+        let _ = out.try_send(
+            ServerMessage::CraftResult {
+                origin_spec: origin_spec.into(),
+                target_spec: target_spec.into(),
+                event: event as u8,
+                repeat,
+                result_spec,
+            }
+            .encode()
+            .into(),
+        );
+    }
 }
 
 /// A [`Verdict::Deny`] drops the broadcast and delivers `reason` only to the
@@ -1378,6 +1562,30 @@ mod tests {
         })
     }
 
+    fn hello(name: &str, password: &str, protocol: u32, fingerprint: u64) -> ClientMessage {
+        ClientMessage::Hello {
+            protocol,
+            fingerprint,
+            name: name.into(),
+            password: password.into(),
+        }
+    }
+
+    fn reject_reason(addr: SocketAddr, msg: &ClientMessage) -> String {
+        match raw_reply(addr, msg) {
+            ServerMessage::Reject { reason } => reason.to_string(),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    fn rock_spec() -> String {
+        let mut r = BlockRegistry::with_builtins();
+        let id = r
+            .intern(&material::Configuration::single(material::Element::new([40, 80, 120, 160])))
+            .unwrap();
+        r.spec(id)
+    }
+
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
         State {
             edits: HashMap::new(),
@@ -1388,6 +1596,7 @@ mod tests {
             next_id: 2,
             day: 0.3,
             day_set: Instant::now(),
+            reactions: ReactionScheduler::new(),
         }
     }
 
@@ -1411,6 +1620,79 @@ mod tests {
             generator: test_generator(),
             hooks: None,
         }
+    }
+
+    #[test]
+    fn player_ids_never_use_the_reserved_world_id() {
+        assert_eq!(WORLD_PLAYER, 0);
+        let state = test_state(HashMap::new());
+        assert!(state.next_id > WORLD_PLAYER);
+    }
+
+    #[test]
+    fn a_client_craft_does_not_commit_world_reactions() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let pending_before = shared.lock_recover().reactions.pending();
+        on_craft(&shared, 1, "air", "air", 3, 1);
+        on_craft(&shared, 1, "air", "air", 99, 1);
+        let state = shared.lock_recover();
+        assert_eq!(
+            state.reactions.pending(),
+            pending_before,
+            "ExternallyChanged craft must not queue scheduler events"
+        );
+        assert!(state.edits.is_empty(), "craft must not write the overlay");
+        drop(state);
+        assert!(rx.try_recv().is_err(), "malformed craft is silent");
+    }
+
+    #[test]
+    fn on_edit_queues_place_and_break_events() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let rock = rock_spec();
+        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
+        {
+            let state = shared.lock_recover();
+            assert_eq!(state.reactions.pending(), 1, "place emits NewContact at the cell");
+        }
+        on_edit(&shared, None, 1, 2, 8, 20, 8, 1, "air");
+        let state = shared.lock_recover();
+        assert!(
+            state.reactions.pending() >= 6,
+            "break emits ExternallyChanged on six neighbours: {}",
+            state.reactions.pending()
+        );
+    }
+
+    #[test]
+    fn scripted_reactions_match_a_local_world() {
+        use crate::render_config::RenderConfig;
+        use crate::sim::reactions::{reactive_region_pair, scripted_run, ReactionScheduler};
+        use crate::world::World;
+
+        let mut world = World::with_config(42, RenderConfig::default());
+        let (wa, wb) = reactive_region_pair(world.registry_mut());
+        let y = world.surface_y(0, 0);
+        let local = scripted_run(&mut world, &mut ReactionScheduler::new(), wa, wb, y);
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = crate::world::diffusion::classic(&mut registry, 42);
+        let (sa, sb) = reactive_region_pair(&mut registry);
+        let mut state = test_state(HashMap::new());
+        state.registry = registry;
+        let mut cells = ServerCells {
+            state: &mut state,
+            generator: &generator,
+        };
+        let server = scripted_run(&mut cells, &mut ReactionScheduler::new(), sa, sb, y);
+        assert_eq!(local, server);
+        assert!(!local.is_empty(), "scripted pair must react");
     }
 
     /// An out-of-reach edit must be rejected; an in-reach one must be recorded.
@@ -1540,13 +1822,14 @@ mod tests {
         assert_eq!(ack(&rx), (11, false, 1));
 
         // Building on the current revision succeeds.
-        on_edit(&shared, None, 1, 12, 8, 20, 8, 1, "natural:Stone");
+        let rock = rock_spec();
+        on_edit(&shared, None, 1, 12, 8, 20, 8, 1, &rock);
         assert_eq!(ack(&rx), (12, true, 2));
 
         // Junk specs are rejected before touching the overlay or the pool.
         on_edit(&shared, None, 1, 13, 8, 20, 8, 2, "banana:zzz");
         assert_eq!(ack(&rx), (13, false, 2));
-        assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), "natural:Stone");
+        assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), rock.as_str());
     }
 
     /// Equivalent spec spellings collapse to ONE canonical pool entry, and a
@@ -1558,9 +1841,10 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        // Two spellings of the same composition: one canonical entry.
-        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, "natural:Iron,Stone");
-        on_edit(&shared, None, 1, 2, 8, 21, 8, 0, "natural:Stone,Iron");
+        // The same spec interned twice: one canonical entry.
+        let rock = rock_spec();
+        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, 1, 2, 8, 21, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "equivalent spellings share one entry");
@@ -1807,18 +2091,16 @@ mod tests {
     #[test]
     fn mismatched_content_fingerprint_is_rejected() {
         let handle = spawn(0, Config { password: String::new(), seed: 3, ..Config::default() }).unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint() ^ 1,
-            name: "drifted".into(),
-            password: "".into(),
-        };
-        match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Reject { reason } => {
-                assert!(reason.contains("content"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected a content-mismatch rejection, got {other:?}"),
-        }
+        let reason = reject_reason(
+            handle.addr(),
+            &hello(
+                "drifted",
+                "",
+                PROTOCOL_VERSION,
+                crate::net::content_fingerprint() ^ 1,
+            ),
+        );
+        assert!(reason.contains("content"), "unexpected reason: {reason}");
         handle.stop();
     }
 
@@ -1834,18 +2116,16 @@ mod tests {
             },
         )
         .unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
-            name: "classic".into(),
-            password: "".into(),
-        };
-        match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Reject { reason } => {
-                assert!(reason.contains("content"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected a content-mismatch rejection, got {other:?}"),
-        }
+        let reason = reject_reason(
+            handle.addr(),
+            &hello(
+                "classic",
+                "",
+                PROTOCOL_VERSION,
+                crate::net::content_fingerprint(),
+            ),
+        );
+        assert!(reason.contains("content"), "unexpected reason: {reason}");
         handle.stop();
     }
 
@@ -1863,15 +2143,12 @@ mod tests {
             },
         )
         .unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint_kind_cfg(
-                WorldgenKind::Diffusion,
-                diffusion,
-            ),
-            name: "guest".into(),
-            password: "".into(),
-        };
+        let hello = hello(
+            "guest",
+            "",
+            PROTOCOL_VERSION,
+            crate::net::content_fingerprint_kind_cfg(WorldgenKind::Diffusion, diffusion),
+        );
         match raw_reply(handle.addr(), &hello) {
             ServerMessage::Welcome {
                 worldgen,
@@ -2235,36 +2512,16 @@ mod tests {
     fn refused_joins_release_the_pre_auth_slot() {
         let handle = spawn(0, Config { password: "pw".into(), seed: 1, ..Config::default() }).unwrap();
         let addr = handle.addr();
-        let bad_pw = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
-            name: "eve".into(),
-            password: "nope".into(),
-        };
-        match raw_reply(addr, &bad_pw) {
-            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("password")),
-            other => panic!("expected password reject, got {other:?}"),
-        }
-        let bad_proto = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION.wrapping_add(1),
-            fingerprint: crate::net::content_fingerprint(),
-            name: "eve".into(),
-            password: "pw".into(),
-        };
-        match raw_reply(addr, &bad_proto) {
-            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("protocol")),
-            other => panic!("expected protocol reject, got {other:?}"),
-        }
-        let bad_fp = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint() ^ 1,
-            name: "eve".into(),
-            password: "pw".into(),
-        };
-        match raw_reply(addr, &bad_fp) {
-            ServerMessage::Reject { reason } => assert!(reason.contains("content")),
-            other => panic!("expected fingerprint reject, got {other:?}"),
-        }
+        let fp = crate::net::content_fingerprint();
+        let reason = reject_reason(addr, &hello("eve", "nope", PROTOCOL_VERSION, fp));
+        assert!(reason.to_lowercase().contains("password"));
+        let reason = reject_reason(
+            addr,
+            &hello("eve", "pw", PROTOCOL_VERSION.wrapping_add(1), fp),
+        );
+        assert!(reason.to_lowercase().contains("protocol"));
+        let reason = reject_reason(addr, &hello("eve", "pw", PROTOCOL_VERSION, fp ^ 1));
+        assert!(reason.contains("content"));
         let deadline = Instant::now() + Duration::from_secs(5);
         while handle.handshake_slots() != 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -2325,6 +2582,58 @@ mod tests {
             out.push(ServerMessage::decode(&frame).unwrap());
         }
         out
+    }
+
+    #[test]
+    fn craft_is_evaluated_on_the_server_and_matches_interact() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let origin = material::Configuration::single(material::Element::new([40, 80, 120, 160]));
+        let target = material::Configuration::single(material::Element::new([80, 40, 160, 120]));
+        let (origin_spec, target_spec, expected) = {
+            let mut state = shared.lock_recover();
+            let oid = state.registry.intern(&origin).unwrap();
+            let tid = state.registry.intern(&target).unwrap();
+            let os = state.registry.spec(oid);
+            let ts = state.registry.spec(tid);
+            let law = *state.registry.law();
+            let result = crate::block::registry::interact_repeat(
+                &law,
+                &origin,
+                &target,
+                material::EventKind::Collision,
+                3,
+            );
+            let rid = state.registry.intern(&result).unwrap();
+            let rs = state.registry.spec(rid);
+            (os, ts, rs)
+        };
+        on_craft(&shared, 1, &origin_spec, &target_spec, 2, 3);
+        match drain_msgs(&rx).as_slice() {
+            [ServerMessage::CraftResult {
+                origin_spec: o,
+                target_spec: t,
+                event,
+                repeat,
+                result_spec,
+            }] => {
+                assert_eq!(&**o, origin_spec);
+                assert_eq!(&**t, target_spec);
+                assert_eq!(*event, 2);
+                assert_eq!(*repeat, 3);
+                assert_eq!(&**result_spec, expected);
+            }
+            other => panic!("expected one CraftResult, got {other:?}"),
+        }
+        on_craft(&shared, 1, &origin_spec, &target_spec, 9, 3);
+        on_craft(&shared, 1, &origin_spec, &target_spec, 2, 0);
+        on_craft(&shared, 1, "nope", &target_spec, 2, 1);
+        assert!(
+            drain_msgs(&rx).is_empty(),
+            "malformed craft is dropped (well-formedness only; no holdings ledger)"
+        );
     }
 
     /// A hook Deny is the same `EditAck { accepted: false }` a lost race sends:
@@ -2458,6 +2767,98 @@ mod tests {
                 "leave 1 alice".to_string(),
                 "leave 2 bob".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn six_hundred_reaction_mutations_reach_the_client_in_order() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let spec = {
+            let mut state = shared.lock_recover();
+            state.intern(&rock_spec()).expect("spec pool")
+        };
+        let mutations: Vec<Mutation> = (0..600)
+            .map(|i| Mutation {
+                pos: (i, 20, 0),
+                from: AIR,
+                to: AIR,
+            })
+            .collect();
+        {
+            let mut state = shared.lock_recover();
+            for m in &mutations {
+                state.edits.insert(
+                    m.pos,
+                    Cell {
+                        spec: spec.clone(),
+                        rev: (m.pos.0 as u32) + 1,
+                    },
+                );
+            }
+            send_reaction_mutations(&mut state, &mutations);
+        }
+        let mut got = Vec::new();
+        for msg in drain_msgs(&rx) {
+            match msg {
+                ServerMessage::Snapshot { edits } => got.extend(edits),
+                other => panic!("expected Snapshot batches, got {other:?}"),
+            }
+        }
+        assert_eq!(got.len(), 600, "every committed mutation must reach the client");
+        for (i, (x, y, z, rev, s)) in got.into_iter().enumerate() {
+            assert_eq!((x, y, z), (i as i32, 20, 0));
+            assert_eq!(rev, i as u32 + 1);
+            assert_eq!(&*s, &*spec);
+        }
+    }
+
+    #[test]
+    fn server_block_evaluates_the_column_once_per_probe() {
+        use std::hint::black_box;
+
+        let mut registry = BlockRegistry::with_builtins();
+        let g = crate::world::diffusion::classic(&mut registry, 4242);
+        let probes: Vec<Pos> = (0..60)
+            .flat_map(|x| (0..60).map(move |z| (x, 16, z)))
+            .collect();
+        assert_eq!(probes.len(), 3600);
+
+        let naive = |g: &crate::world::diffusion::Generator| {
+            for &(x, y, z) in &probes {
+                black_box(g.block_at(x, y, z, g.height(x, z)));
+            }
+        };
+        let once = |g: &crate::world::diffusion::Generator| {
+            for &(x, y, z) in &probes {
+                black_box(g.voxel_at(x, y, z));
+            }
+        };
+        naive(&g);
+        once(&g);
+        let mut before = Duration::ZERO;
+        let mut after = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            naive(&g);
+            before += t0.elapsed();
+            let t1 = Instant::now();
+            once(&g);
+            after += t1.elapsed();
+        }
+        println!("server_block column eval: before={before:?} after={after:?}");
+        for &(x, y, z) in &probes {
+            assert_eq!(
+                g.block_at(x, y, z, g.height(x, z)),
+                g.voxel_at(x, y, z),
+                "voxel_at must match height+block_at at ({x},{y},{z})"
+            );
+        }
+        assert!(
+            after < before,
+            "one column eval per probe must beat height+block_at ({after:?} vs {before:?})"
         );
     }
 }

@@ -20,7 +20,6 @@
 //!    is why modulation lives on the per-voice track + effects rather than the sound.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,9 +149,7 @@ fn guarded_init<T, E>(init: impl FnOnce() -> Result<T, E>) -> Option<T> {
 
 impl ClipStore for KiraBackend {
     fn store(&mut self, bytes: &[u8]) -> Result<StoredClip, String> {
-        let data = StaticSoundData::from_cursor(Cursor::new(bytes.to_vec()))
-            .map_err(|e| format!("clip decode: {e:?}"))?;
-        let duration_s = data.duration().as_secs_f32();
+        let (data, duration_s) = super::decode_static(bytes)?;
         let id = ClipId(
             u32::try_from(self.clips.len())
                 .map_err(|_| "too many decoded audio clips".to_owned())?,

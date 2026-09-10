@@ -19,6 +19,7 @@ use voxel_engine::DVec3;
 use crate::net::protocol::{self, ClientMessage, ServerMessage, VoicePayload};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
+use crate::sched::RateGate;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MOVE_INTERVAL: Duration = Duration::from_millis(33);
@@ -59,6 +60,10 @@ pub struct RemotePlayer {
     recv_at: Instant,
     interval: Duration,
     distance: f64,
+    /// Occlusion raycast cadence for the name tag (10 Hz is enough; the
+    /// result is reused between due steps).
+    tag_gate: RateGate,
+    tag_occluded: Option<bool>,
 }
 
 impl RemotePlayer {
@@ -68,6 +73,18 @@ impl RemotePlayer {
 
     pub fn visible(&self) -> bool {
         self.visible
+    }
+
+    /// Cached terrain-occlusion bit for the floating name tag. Raycasts on
+    /// the first sample and whenever [`RateGate`] says a step is due.
+    pub(crate) fn cached_tag_occlusion(&mut self, dt: f32, raycast: impl FnOnce() -> bool) -> bool {
+        if self.tag_occluded.is_none() || self.tag_gate.steps(dt) != 0 {
+            let hit = raycast();
+            self.tag_occluded = Some(hit);
+            hit
+        } else {
+            self.tag_occluded.expect("filled above")
+        }
     }
 }
 
@@ -145,6 +162,14 @@ pub enum Incoming {
     /// update already applied in `apply()`.
     PeerSwing { id: u32 },
     Time { day: f32, day_secs: f32 },
+    /// Authoritative workbench result; the client intern/consume/adds this spec.
+    CraftResult {
+        origin_spec: Arc<str>,
+        target_spec: Arc<str>,
+        event: u8,
+        repeat: u8,
+        result_spec: Arc<str>,
+    },
     Disconnected,
 }
 
@@ -397,7 +422,13 @@ fn welcome_from(
             spawn,
             worldgen,
             diffusion,
-        }) => Ok((player_id, seed, spawn, worldgen, diffusion)),
+            law,
+        }) => {
+            if law != crate::net::protocol::law_stamp() {
+                return Err("server law does not match this client".to_string());
+            }
+            Ok((player_id, seed, spawn, worldgen, diffusion))
+        }
         Some(ServerMessage::Reject { reason }) => Err(reason.to_string()),
         _ => Err("unexpected reply from server".to_string()),
     }
@@ -505,6 +536,8 @@ fn apply_server_message(
                     recv_at: Instant::now(),
                     interval: Duration::from_millis(0),
                     distance: 0.0,
+                    tag_gate: RateGate::from_hz(10),
+                    tag_occluded: None,
                 });
             }
             ServerMessage::PeerLeft { id } => {
@@ -557,6 +590,19 @@ fn apply_server_message(
             // the dedicated ring (see `connect`), not the `inbox` this drains.
             // The arm exists only to keep the match exhaustive.
             ServerMessage::PeerVoice { .. } => {}
+            ServerMessage::CraftResult {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+                result_spec,
+            } => out.push(Incoming::CraftResult {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+                result_spec,
+            }),
         }
 }
 
@@ -638,6 +684,19 @@ impl Connection {
 
     pub fn send_set_time(&mut self, day: f32) {
         self.dispatch(&ClientMessage::SetTime { day });
+    }
+
+    /// Workbench apply. The server evaluates and replies with [`Incoming::CraftResult`].
+    pub fn send_craft(&mut self, origin_spec: Arc<str>, target_spec: Arc<str>, event: u8, repeat: u8) {
+        if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
+            return;
+        }
+        self.dispatch(&ClientMessage::Craft {
+            origin_spec,
+            target_spec,
+            event,
+            repeat,
+        });
     }
 
     /// Blocks the game thread on the client runtime — sends are tiny and
@@ -822,22 +881,7 @@ mod tests {
         }
 
         fn apply(&mut self, msg: ServerMessage) -> Vec<Incoming> {
-            let mut out = Vec::new();
-            apply_server_message(
-                msg,
-                self.spawn,
-                &mut self.peers,
-                &mut self.cell_revs,
-                &mut self.pending_edits,
-                &mut self.pending_teleport,
-                &mut self.ping_sent,
-                &mut self.ping_ms,
-                &mut self.alive,
-                &mut self.disconnect_emitted,
-                &mut out,
-            );
-            coalesce_positions(&mut out);
-            out
+            self.apply_all(std::iter::once(msg))
         }
 
         fn apply_all(&mut self, msgs: impl IntoIterator<Item = ServerMessage>) -> Vec<Incoming> {

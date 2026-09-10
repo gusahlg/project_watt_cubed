@@ -13,11 +13,10 @@ use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
 };
 use crate::block::AIR;
-use crate::camera::{CameraMode, FlyAxes, GameCamera};
+use crate::camera::{CameraMode, CameraPose, FlyAxes, GameCamera};
 use crate::command;
 use crate::console::Console;
 use crate::derived::Revision;
-use crate::harness::{CameraPose, DebugView};
 use crate::input::intent::{GameplayEvent, GameplayState, GlobalEvent, MenuEvent};
 use crate::input::router::{Context, Router, View};
 use crate::input::{look, movement};
@@ -45,6 +44,21 @@ pub enum Signal {
     ExitToMenu,
 }
 
+/// Magenta clear under [`DebugView::TerrainKey`] — sky-hole detector background.
+pub const SKY_KEY: Color = Color::rgb(255, 0, 255);
+/// Flat terrain fill under [`DebugView::TerrainKey`].
+pub const TERRAIN_KEY: Color = Color::rgb(0, 255, 0);
+
+/// What the app renders for a capture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DebugView {
+    #[default]
+    Normal,
+    /// ALL terrain flat [`TERRAIN_KEY`], sky/fog passes disabled, clear color
+    /// [`SKY_KEY`]. The sky-hole detector's input.
+    TerrainKey,
+}
+
 /// One frame's routed input, snapshotted into plain data by
 /// [`Game::input_phase`] so the router borrow ends before later phases take
 /// `&mut Engine`. Which fields are live depends on the frame's exclusive
@@ -63,6 +77,9 @@ struct FrameInput {
     toggle_crafting: bool,
     nav_up: bool,
     nav_down: bool,
+    nav_left: bool,
+    nav_right: bool,
+    nav_tab: bool,
     nav_confirm: bool,
     open_console: bool,
     open_chat: bool,
@@ -120,6 +137,9 @@ struct PendingModInput {
     toggle_crafting: bool,
     nav_up: bool,
     nav_down: bool,
+    nav_left: bool,
+    nav_right: bool,
+    nav_tab: bool,
     nav_confirm: bool,
 }
 
@@ -138,6 +158,9 @@ impl PendingModInput {
             toggle_crafting: allow_ui && input.toggle_crafting,
             nav_up: allow_ui && input.nav_up,
             nav_down: allow_ui && input.nav_down,
+            nav_left: allow_ui && input.nav_left,
+            nav_right: allow_ui && input.nav_right,
+            nav_tab: allow_ui && input.nav_tab,
             nav_confirm: allow_ui && input.nav_confirm,
         }
     }
@@ -148,6 +171,9 @@ impl PendingModInput {
             || self.toggle_crafting
             || self.nav_up
             || self.nav_down
+            || self.nav_left
+            || self.nav_right
+            || self.nav_tab
             || self.nav_confirm
     }
 
@@ -156,6 +182,9 @@ impl PendingModInput {
         self.toggle_crafting = false;
         self.nav_up = false;
         self.nav_down = false;
+        self.nav_left = false;
+        self.nav_right = false;
+        self.nav_tab = false;
         self.nav_confirm = false;
     }
 }
@@ -171,8 +200,8 @@ struct PendingEdit {
 
 /// The economy side of a pending edit — what to give back on rejection.
 enum PendingKind {
-    /// Breaking awarded these elements; a rejection revokes them.
-    Break(Vec<crate::block::ElementId>),
+    /// Breaking awarded this configuration; a rejection revokes it.
+    Break(crate::block::BlockId),
     /// Placing spent one crafted block of this id; a rejection refunds it.
     Place(crate::block::BlockId),
 }
@@ -313,7 +342,9 @@ impl Game {
         // — it fires only when whole ticks are due.
         let sim_id = sched.register(
             Simulation::manifest(),
-            Box::new(Simulation::with_systems(Vec::new())),
+            Box::new(Simulation::with_systems(vec![Box::new(
+                crate::sim::reactions::Reactions,
+            )])),
             u32::MAX,
         );
         sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
@@ -411,7 +442,6 @@ impl Game {
     /// drift apart. (World-construction lanes — occlusion/lod2 — stay
     /// entry-only by design; see `App::enter_game`.)
     pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
-        let mod_ui_was_active = self.mod_ui_active();
         settings.apply(eng);
         let render = self.visual_mask.effective_render(settings);
         eng.set_flags(render.engine_flags());
@@ -423,6 +453,17 @@ impl Game {
         self.world.set_render_config(render, eng);
         self.world.set_lighting(settings.lighting, eng);
         self.world.set_ao(settings.ao, eng);
+        self.adopt_gameplay_settings(settings, render);
+    }
+
+    /// Gameplay/HUD/clock half of [`apply_settings`] — no engine. Headless
+    /// tests and the live path share this so they cannot drift.
+    fn adopt_gameplay_settings(
+        &mut self,
+        settings: &Settings,
+        render: crate::render_config::RenderConfig,
+    ) {
+        let mod_ui_was_active = self.mod_ui_active();
         self.render = render;
         self.bump_content_rev();
 
@@ -449,8 +490,6 @@ impl Game {
         let mod_ui_will_be_active =
             mod_ui_active(settings.mod_logic, settings.mod_hud, self.theme.hud);
         if mod_ui_will_be_active {
-            // If visibility is restored before the next frame, the overlay is
-            // visible again and does not need to be force-closed.
             self.pending_mod_overlay_close = false;
         } else if mod_ui_was_active {
             self.on_mod_ui_hidden();
@@ -516,6 +555,7 @@ impl Game {
     /// Attach a server connection, turning this into a multiplayer session.
     pub fn with_net(mut self, net: Connection) -> Self {
         self.net = Some(net);
+        self.world.set_reactions_authority(false);
         self
     }
 
@@ -589,8 +629,12 @@ impl Game {
         // step the deterministic world so terrain streams in before the frame is
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
-            self.world
-                .stream(self.player.position, eng, &mut self.sched);
+            self.world.stream(
+                self.player.position,
+                Some(&mut *eng),
+                &mut self.sched,
+                mods.appearance(),
+            );
             let clocks = self.sched.clocks(dt);
             let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
             self.sched.tick(&mut sched_ctx, &clocks);
@@ -659,7 +703,7 @@ impl Game {
         }
         if !consumed || !ready {
             let t = Instant::now();
-            self.stream_phase(eng, dt);
+            self.stream_phase(eng, dt, mods);
             self.phases.stream = t.elapsed();
         }
         let active = !consumed;
@@ -760,6 +804,9 @@ impl Game {
                     f.toggle_crafting = gp.event(GameplayEvent::ToggleCrafting);
                     f.nav_up = gp.overlay_nav(MenuEvent::Up);
                     f.nav_down = gp.overlay_nav(MenuEvent::Down);
+                    f.nav_left = gp.overlay_nav(MenuEvent::Left);
+                    f.nav_right = gp.overlay_nav(MenuEvent::Right);
+                    f.nav_tab = gp.overlay_nav(MenuEvent::NextTab);
                     f.nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
                 }
                 f.open_console = gp.event(GameplayEvent::OpenConsole);
@@ -820,7 +867,7 @@ impl Game {
                 .console
                 .handle_input(&input.text_chars, input.text_edit)
             {
-                self.submit_line(line, eng, settings, sound, events);
+                self.submit_line(line, eng, settings, sound, events, mods);
             }
             return Some(Signal::Continue);
         }
@@ -1027,7 +1074,8 @@ impl Game {
         // With no edge, one empty update keeps periodic work at `mod_hz`.
         for index in 0..pending.len().max(1) {
             let edges = pending.get(index).copied().unwrap_or_default();
-            placements = {
+            let networked = self.net.is_some();
+            let (next_placements, crafts) = {
                 let mut ctx = ModContext {
                     player: &mut self.player,
                     world: &mut self.world,
@@ -1039,12 +1087,23 @@ impl Game {
                     toggle_crafting: edges.toggle_crafting,
                     nav_up: edges.nav_up,
                     nav_down: edges.nav_down,
+                    nav_left: edges.nav_left,
+                    nav_right: edges.nav_right,
+                    nav_tab: edges.nav_tab,
                     nav_confirm: edges.nav_confirm,
+                    networked,
                     placements,
+                    crafts: Vec::new(),
                 };
                 mods.update(&mut ctx);
-                ctx.placements
+                (ctx.placements, ctx.crafts)
             };
+            placements = next_placements;
+            if let Some(net) = &mut self.net {
+                for c in crafts {
+                    net.send_craft(c.origin_spec, c.target_spec, c.event, c.repeat);
+                }
+            }
             // Apply after each event frame so repeated placements observe the
             // previous write and cannot spend twice against one empty cell.
             self.apply_placements(&mut placements, events);
@@ -1058,7 +1117,7 @@ impl Game {
     /// Load/mesh/unload chunks around the camera (the player, unless the
     /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
     /// step the simulation.
-    fn stream_phase(&mut self, eng: &mut Engine, dt: f32) {
+    fn stream_phase(&mut self, eng: &mut Engine, dt: f32, mods: &Mods) {
         // The scheduler drives the fixed-tick sim lane. Its clock
         // (fixed-tick accumulator + catch-up cap) is derived once per frame
         // here; other lanes still run directly below until they migrate in.
@@ -1077,7 +1136,8 @@ impl Game {
             self.stream_gate.steps(dt) != 0
         };
         if !stream_due {
-            self.world.pump(eng, &mut self.sched);
+            self.world
+                .pump(Some(&mut *eng), &mut self.sched, mods.appearance());
             return;
         }
 
@@ -1085,7 +1145,12 @@ impl Game {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
-        self.world.stream(stream_center, eng, &mut self.sched);
+        self.world.stream(
+            stream_center,
+            Some(&mut *eng),
+            &mut self.sched,
+            mods.appearance(),
+        );
 
         // A hidden/minimal HUD does no minimap clock read or terrain raster
         // work; refreshes share streaming's cadence instead of waking alone.
@@ -1102,6 +1167,68 @@ impl Game {
                 self.sched.interval_reset(self.minimap_interval);
             }
         }
+    }
+
+    /// Headless quiet frame: input drain, motion (inert), scheduler, stream/pump,
+    /// silent audio, HUD/lighting caches — the pieces `update` + `draw` run, in
+    /// order, without an Engine.
+    #[cfg(test)]
+    fn tick_quiet(
+        &mut self,
+        dt: f32,
+        router: &mut Router,
+        sound: &mut SoundSystem,
+        audio: &mut AudioDirector,
+        settings: &Settings,
+        mods: &mut Mods,
+    ) {
+        if self.render.day_night {
+            let steps = self.sky_gate.steps(dt);
+            if steps != 0 {
+                self.sky
+                    .tick(steps as f64 * self.sky_gate.step_dt(dt) as f64);
+            }
+        } else {
+            self.sky_gate.reset();
+        }
+        let events: Vec<SoundEvent> = Vec::new();
+        if self.input_locked {
+            router.drain_frame();
+        }
+        let input = FrameInput::inert();
+        if self.world.spawn_ready() {
+            let _ = self.motion_phase(&input, dt);
+        }
+        let clocks = self.sched.clocks(dt);
+        let mut sched_ctx = SchedCtx::new(&mut self.world, None);
+        self.sched.tick(&mut sched_ctx, &clocks);
+        let stream_due = if std::mem::take(&mut self.force_stream) {
+            self.stream_gate.reset();
+            true
+        } else {
+            self.stream_gate.steps(dt) != 0
+        };
+        let stream_center = match &self.camera.mode {
+            CameraMode::Free { rig, .. } => rig.pos,
+            CameraMode::Person(_) => self.player.position,
+        };
+        if stream_due {
+            self.world
+                .stream(stream_center, None, &mut self.sched, mods.appearance());
+        } else {
+            self.world
+                .pump(None, &mut self.sched, mods.appearance());
+        }
+        self.commit_audio(AudioPhase {
+            dt,
+            input: &input,
+            sound,
+            audio,
+            settings,
+            events,
+            active: true,
+        });
+        self.compose_quiet(mods);
     }
 
     /// Hand this frame's readout to the audio director: it folds
@@ -1132,7 +1259,7 @@ impl Game {
         // own richer sample — it runs in the separate draw() call, steps each peer's
         // animator, and needs render fields absent from `PeerPose`. The scratch
         // vector retains capacity so stable multiplayer frames allocate nothing.
-        let now = Instant::now();
+        let now = crate::sched::now();
         let mut peers = std::mem::take(&mut self.peer_pose_scratch);
         peers.clear();
         if let Some(net) = &self.net {
@@ -1204,6 +1331,11 @@ impl Game {
                     let prev = self.world.block_at(x, y, z);
                     let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
+                    if id == AIR {
+                        self.world.note_block_broken(x, y, z);
+                    } else {
+                        self.world.note_block_placed(x, y, z);
+                    }
                     let at = cell_center(x, y, z);
                     events.push(if id == AIR {
                         SoundEvent::BlockBroken { at, block: prev }
@@ -1224,9 +1356,9 @@ impl Game {
                         self.world.set_block(x, y, z, pending.prev);
                     }
                     match pending.kind {
-                        PendingKind::Break(elements) => {
-                            self.player.stash.revoke(&elements);
-                            mods.on_break_rejected(&elements);
+                        PendingKind::Break(id) => {
+                            self.player.stash.revoke(id, 1);
+                            mods.on_break_rejected(id);
                         }
                         PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
                     }
@@ -1272,6 +1404,22 @@ impl Game {
                     self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
                 }
                 Incoming::Disconnected => disconnected = true,
+                Incoming::CraftResult {
+                    origin_spec,
+                    target_spec,
+                    event,
+                    repeat,
+                    result_spec,
+                } => {
+                    mods.on_craft_result(
+                        &origin_spec,
+                        &target_spec,
+                        event,
+                        repeat,
+                        &result_spec,
+                        &mut self.world,
+                    );
+                }
                 Incoming::PeerSwing { id } => {
                     // The swing edge → a whoosh at the peer's current position. The
                     // local animator update already happened in `Connection::apply`.
@@ -1300,6 +1448,7 @@ impl Game {
         settings: &mut Settings,
         sound: &mut SoundSystem,
         events: &mut Vec<SoundEvent>,
+        mods: &mut Mods,
     ) {
         // `/voicetest` plays the canned UI cue; emit it as a fact and let the
         // director route it (it runs this frame even though the console owns input).
@@ -1321,6 +1470,19 @@ impl Game {
             return;
         }
         self.console.echo(&line);
+        {
+            let stripped = line.strip_prefix('/').unwrap_or(line.as_str());
+            let mut parts = stripped.split_whitespace();
+            if let Some(cmd) = parts.next() {
+                let args: Vec<&str> = parts.collect();
+                if let Some(out) = mods.command(cmd, &args) {
+                    for line in out {
+                        self.console.push(line);
+                    }
+                    return;
+                }
+            }
+        }
         let before = settings.clone();
         let day_before = self.sky.clock.day();
         let day_len_before = self.sky.day_length;
@@ -1372,8 +1534,8 @@ impl Game {
         }
     }
 
-    /// Break the block the player is looking at, depositing its elements into
-    /// the core stash before notifying mods.
+    /// Break the block the player is looking at, depositing its configuration
+    /// into the core stash before notifying mods.
     fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) = interact::raycast_solid(
             &self.world,
@@ -1385,16 +1547,14 @@ impl Game {
         };
         let (x, y, z) = hit.block;
         let id = self.world.block_at(x, y, z);
-        // Snapshot the block's elements before it's removed.
-        let elements = self.world.registry().block(id).composition.elements();
-        // Report the broken block; the director derives its class-specific cue.
         events.push(SoundEvent::BlockBroken {
             at: cell_center(x, y, z),
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
-        let overflow = !self.player.stash.add(&elements);
-        mods.on_block_break(&elements, &self.world, overflow);
+        self.world.note_block_broken(x, y, z);
+        let overflow = !self.player.stash.add(id, 1);
+        mods.on_block_break(id, &self.world, overflow);
         self.camera.fx.add_trauma(0.15);
         self.local_anim.on_action(WireAction::Swing);
         // Tell the server (it validates and relays to everyone else). The
@@ -1407,7 +1567,7 @@ impl Game {
                 PendingEdit {
                     cell: (x, y, z),
                     prev: id,
-                    kind: PendingKind::Break(elements.to_vec()),
+                    kind: PendingKind::Break(id),
                 },
             );
             net.send_swing();
@@ -1448,6 +1608,7 @@ impl Game {
                 block: id,
             });
             self.world.set_block(x, y, z, id);
+            self.world.note_block_placed(x, y, z);
             self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
             // validates and relays, exactly like breaking does with "air".
@@ -1640,5 +1801,92 @@ mod tests {
             "the skip predicate must hold on the idle pose used above"
         );
         assert!(!game.world().anything_in_flight());
+    }
+
+    #[test]
+    fn quiet_minimum_frame_allocates_nothing_and_reads_the_clock_once() {
+        use crate::alloc_count;
+        use crate::audio::palette::CuePalette;
+        use crate::audio::SoundSystem;
+        use crate::input::router::Router;
+        use crate::mods::Mods;
+        use crate::settings::Settings;
+        use crate::ui::HudMode;
+
+        let mut settings = Settings::default();
+        assert!(settings.select_preset("minimum"));
+        let render = settings.render_config();
+        let mut game = Game::scripted(1, render);
+        game.scripted = false;
+        game.set_input_locked(true);
+        game.world_mut()
+            .set_view_distances(settings.render_distance, settings.vertical_distance);
+        game.world_mut().transition_lighting(settings.lighting);
+        game.world_mut().set_ao_flag(settings.ao);
+        game.world_mut()
+            .set_render_lanes(settings.occlusion, settings.lod2);
+        game.adopt_gameplay_settings(&settings, render);
+        let pos = game.player().position;
+        game.world_mut().settle_around(pos);
+        assert!(
+            game.world().entry_complete(),
+            "settled: {}",
+            game.world().entry_debug()
+        );
+
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut audio = crate::audio::AudioDirector::new(palette);
+        let mut router = Router::new();
+        let mut mods = Mods::with_defaults();
+        const DT: f32 = 1.0 / 60.0;
+
+        let mut last_allocs = u64::MAX;
+        let mut last_bytes = u64::MAX;
+        let mut last_clocks = u32::MAX;
+        let mut last_calls = alloc_count::EngineCalls {
+            set_sky: 0,
+            uniforms: 0,
+            settings_apply: 0,
+            tex_layers: 0,
+        };
+        for i in 0..10 {
+            alloc_count::reset();
+            crate::sched::reset_clock();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            if i >= 5 {
+                last_allocs = alloc_count::alloc_count();
+                last_bytes = alloc_count::alloc_bytes();
+                last_clocks = crate::sched::clock();
+                last_calls = alloc_count::engine_calls();
+                assert_eq!(
+                    last_bytes, 0,
+                    "quiet frame {i} allocated {last_allocs} times / {last_bytes} bytes; engine={last_calls:?}"
+                );
+                assert!(
+                    last_clocks <= 1,
+                    "quiet frame {i} read the clock {last_clocks} times"
+                );
+            }
+        }
+        println!(
+            "quiet minimum frame (last of 10): allocs={last_allocs} bytes={last_bytes} clocks={last_clocks} engine={last_calls:?}"
+        );
+
+        // HUD strings: an unchanged snapshot must not allocate after the cache fills.
+        game.theme.hud = HudMode::Full;
+        for i in 0..4 {
+            alloc_count::reset();
+            crate::sched::reset_clock();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            if i >= 2 {
+                assert_eq!(
+                    alloc_count::alloc_bytes(),
+                    0,
+                    "HUD snapshot frame {i} allocated {} bytes",
+                    alloc_count::alloc_bytes()
+                );
+            }
+        }
     }
 }

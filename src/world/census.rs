@@ -71,12 +71,8 @@ impl World {
         for (_, _, out) in &self.upload_queue {
             c.mesh_cpu_bytes += mesh_output_held(out);
         }
-        for (_, _, quads) in &self.section_upload_queue {
-            for quad in quads {
-                for (_, data) in quad {
-                    c.mesh_cpu_bytes += mesh_held(data);
-                }
-            }
+        for (_, _, _, mesh) in &self.section_upload_queue {
+            c.mesh_cpu_bytes += mesh_held(&mesh.data);
         }
         c.edit_overlay_bytes = edit_bytes(&self.edits);
         c.section_lod_bytes = section_lod_bytes(self);
@@ -160,12 +156,16 @@ fn worklist_bytes(world: &World) -> usize {
         + set_cap::<Coord>(world.light_worklist.capacity())
         + set_cap::<Coord>(world.light_inflight.capacity())
         + set_cap::<Coord>(world.dirty_worklist.capacity())
+        + map_cap::<Coord, std::time::Instant>(world.light_gate.dirty.capacity())
         + set_cap::<SectionPos>(world.dirty_sections.capacity())
         + deque_cap::<(Coord, u32, pipeline::MeshOutput)>(world.upload_queue.capacity())
         + deque_cap::<(Coord, LightGrid)>(world.light_apply_queue.capacity())
-        + deque_cap::<(SectionPos, pipeline::ClaimToken, [super::section::SectionMeshData; 4])>(
-            world.section_upload_queue.capacity(),
-        )
+        + deque_cap::<(
+            SectionPos,
+            pipeline::ClaimToken,
+            usize,
+            Box<super::section::SectionMeshData>,
+        )>(world.section_upload_queue.capacity())
         + deque_cap::<Coord>(world.conn_fill_queue.capacity())
 }
 
@@ -213,6 +213,13 @@ mod tests {
             a.light_uniform_count > 0,
             "origin box publishes trivial Uniform light (sky/rock)"
         );
+        if a.light_cells_count > 0 {
+            assert_eq!(
+                a.light_cells_bytes / a.light_cells_count,
+                crate::world::chunk::CHUNK_VOLUME,
+                "dense light grids are nibble-packed (4 KiB)"
+            );
+        }
         eprintln!(
             "CENSUS origin chunks=u{}/p{}/d{} light=u{}/c{} light_bytes=u{}/c{} total={}",
             a.chunk_uniform_count,

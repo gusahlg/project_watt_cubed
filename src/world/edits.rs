@@ -8,6 +8,8 @@ use voxel_engine::Engine;
 use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
 use crate::render_config::RenderConfig;
+use crate::sim::reactions::{self, CellStore, MaterialEvent, Mutation, Pos, ReactionScheduler};
+use material::EventKind;
 
 use super::chunk::Chunk;
 use super::{Coord, MeshState, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
@@ -173,18 +175,26 @@ impl World {
     /// Toggle baked corner AO. A meshing input like lighting: the hot tables
     /// restamp (epoch bump) and every mesh rebuilds with the new corners.
     pub fn set_ao(&mut self, on: bool, eng: &mut Engine) {
-        if on == self.ao {
+        if !self.set_ao_flag(on) {
             return;
+        }
+        self.free_meshes(eng);
+    }
+
+    /// Stamp AO without freeing GPU meshes (headless tests, already-empty worlds).
+    pub(crate) fn set_ao_flag(&mut self, on: bool) -> bool {
+        if on == self.ao {
+            return false;
         }
         self.ao = on;
         self.tables_epoch = self.tables_epoch.wrapping_add(1);
-        self.free_meshes(eng);
+        true
     }
 
     /// Move the CPU lighting pipeline between enabled and full-bright modes.
     /// Kept separate from GPU mesh retirement so the asynchronous state machine
     /// can be tested without constructing an engine.
-    pub(in crate::world) fn transition_lighting(&mut self, on: bool) -> bool {
+    pub(crate) fn transition_lighting(&mut self, on: bool) -> bool {
         if on == self.lighting {
             return false;
         }
@@ -330,7 +340,7 @@ impl World {
                         .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
                         .collect();
                     for c in shadowed {
-                        self.seed_light(c);
+                        self.seed_light(c, super::LightSeed::Edit);
                     }
                     self.light_pending.set();
                 }
@@ -356,7 +366,7 @@ impl World {
             self.pending_fresh.set();
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
-            self.seed_light(coord);
+            self.seed_light(coord, super::LightSeed::Edit);
             self.light_pending.set();
         }
         // A block on a chunk face also changes that neighbour's exposed
@@ -400,7 +410,7 @@ impl World {
             self.pending_fresh.set();
             // A border edit can change this chunk's light directly (an emitter on
             // the shared face); re-settle it too.
-            self.seed_light(coord);
+            self.seed_light(coord, super::LightSeed::Edit);
             self.light_pending.set();
         }
     }
@@ -452,6 +462,74 @@ impl World {
         &self,
     ) -> super::FastMap<Coord, super::FastMap<usize, BlockId>> {
         self.edits.clone()
+    }
+
+    /// Hand a gameplay event to the scheduler. No-op when this instance is not
+    /// the authority (a client connected to a server).
+    pub fn push_material_event(&mut self, at: (i32, i32, i32), kind: EventKind) {
+        if self.reactions_authority {
+            self.reactions.push(MaterialEvent { at, kind });
+        }
+    }
+
+    /// Place rule: `NewContact` at the placed cell.
+    pub fn note_block_placed(&mut self, x: i32, y: i32, z: i32) {
+        if self.reactions_authority {
+            reactions::on_placed(&mut self.reactions, (x, y, z));
+        }
+    }
+
+    /// Break rule: `ExternallyChanged` on the six neighbours of the broken cell.
+    pub fn note_block_broken(&mut self, x: i32, y: i32, z: i32) {
+        if self.reactions_authority {
+            reactions::on_broken(&mut self.reactions, (x, y, z));
+        }
+    }
+
+    /// One budgeted scheduler step. Empty when this instance is not the authority.
+    pub fn tick_reactions(&mut self) -> Vec<Mutation> {
+        if !self.reactions_authority {
+            return Vec::new();
+        }
+        let law = *self.registry.law();
+        let mut sched = std::mem::take(&mut self.reactions);
+        let out = sched.tick(self, &law, reactions::Budget::DEFAULT);
+        self.reactions = sched;
+        out
+    }
+
+    /// Single-player and the hosting server are the authority; a connected client is not.
+    pub fn set_reactions_authority(&mut self, yes: bool) {
+        self.reactions_authority = yes;
+        if !yes {
+            self.reactions = ReactionScheduler::new();
+        }
+    }
+
+    /// Scheduler counters for the console and bench gauges.
+    pub fn reactions(&self) -> &ReactionScheduler {
+        &self.reactions
+    }
+}
+
+impl CellStore for World {
+    fn block_at(&self, pos: Pos) -> Option<BlockId> {
+        let (chunk, local) = BlockCoord::new(pos.0, pos.1, pos.2).split();
+        self.chunks
+            .get(&chunk)
+            .map(|loaded| loaded.chunk.get_local(local.lx(), local.ly(), local.lz()))
+    }
+
+    fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+        World::set_block(self, pos.0, pos.1, pos.2, id)
+    }
+
+    fn registry(&self) -> &crate::block::BlockRegistry {
+        &self.registry
+    }
+
+    fn registry_mut(&mut self) -> &mut crate::block::BlockRegistry {
+        &mut self.registry
     }
 }
 

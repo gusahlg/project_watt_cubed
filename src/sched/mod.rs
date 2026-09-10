@@ -10,11 +10,39 @@
 //! was always plain registration order in practice. See
 //! [`Scheduler::register_manual`] for how real lanes are actually driven.
 
+use std::time::Instant;
+
 use voxel_engine::producer::{Budget, Cadence, Clocks, Producer, Progress, SourceId, TickReport};
 use voxel_engine::profile::{self, Meter};
 use voxel_engine::{Engine, Rev};
 
 use crate::world::World;
+
+#[cfg(test)]
+thread_local! {
+    static CLOCK_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The one wall-clock sample the game-side frame is allowed. Tests count
+/// calls so a quiet frame can assert it reads the clock at most once.
+#[inline]
+pub fn now() -> Instant {
+    #[cfg(test)]
+    CLOCK_READS.with(|c| c.set(c.get() + 1));
+    Instant::now()
+}
+
+/// Wall-clock samples through [`now`] since the last [`reset_clock`].
+#[cfg(test)]
+pub fn clock() -> u32 {
+    CLOCK_READS.with(std::cell::Cell::get)
+}
+
+/// Zero the [`now`] counter for this thread.
+#[cfg(test)]
+pub fn reset_clock() {
+    CLOCK_READS.with(|c| c.set(0));
+}
 
 /// The [`Cadence::FixedTick`] period, in seconds — one definition of the tick
 /// rate, shared with the sim systems that step at it (`sim::TICK_SECONDS`).

@@ -1,7 +1,7 @@
 //! The one padded halo (18³): a chunk's 16³ cells plus a one-cell shell
 //! copied from its 26 neighbours, indexed by signed coords `x, y, z ∈
 //! -1..=16`. Mesh ([`Padded`](super::mesh::Padded), over `BlockId`) and light
-//! ([`PaddedLight`](super::light::PaddedLight), over `Lumel`) are
+//! ([`PaddedLight`](super::light::PaddedLight), over packed lumel bytes) are
 //! instantiations of this one capture/index/pool machinery, not separate
 //! implementations — they differ only in cell type and how a local
 //! cell is read out of their respective source grid.
@@ -20,7 +20,7 @@ const PAD_VOL: usize = PAD * PAD * PAD;
 /// buffer on the wrong thread (the capturer's list stays empty and allocates
 /// forever). One bounded SHARED pool completes the ownership round trip;
 /// enough slack for queued near jobs plus running workers
-/// (96 × 18³ × 2 B ≈ 1.1 MiB per type).
+/// (96 × 18³ × cell-size; packed lumels are 1 B, BlockId is 2 B).
 const POOL_CAP: usize = 96;
 
 /// A bounded cross-thread free list. `take` hands back a retired value or
@@ -52,7 +52,7 @@ impl<T> BoundedPool<T> {
 /// A cell type that owns a shared free list of halo buffers. A `static`
 /// cannot name a generic `T`, so the per-type pool lives behind this trait —
 /// one concrete monomorphic [`BoundedPool`] per implementor, keeping BlockId
-/// and Lumel free lists isolated. Written by `pooled_cell!`.
+/// and packed-lumel free lists isolated. Written by `pooled_cell!`.
 pub trait Pooled: Copy + Send + 'static {
     fn pool() -> &'static BoundedPool<Box<[Self]>>;
 }
@@ -73,7 +73,7 @@ macro_rules! pooled_cell {
 }
 
 pooled_cell!(crate::block::registry::BlockId);
-pooled_cell!(super::light::Lumel);
+pooled_cell!(super::light::PackedLumel);
 
 /// A padded halo buffer over cell type `T`. Backing storage is pooled
 /// per-thread, per `T` ([`Pooled`] gives each type its own free list), so

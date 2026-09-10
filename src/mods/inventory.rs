@@ -5,12 +5,12 @@
 //! plus a minimal on-screen view of it. The counts live on the player
 //! ([`crate::stash::ElementStash`]); this mod displays them and can be switched
 //! off in the mod menu, at which point the inventory is once again inaccessible
-//! — the elements stay on the player.
+//! — the configurations stay on the player.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::block::ElementId;
+use crate::block::BlockId;
 use crate::derived::Memo;
 use crate::mods::{ItemUiState, Mod, ModContext};
 use crate::player::Player;
@@ -35,7 +35,7 @@ const BOTTOM_RESERVE: i32 = 234;
 pub struct InventoryMod {
     /// Shared with crafting so its expanded panel replaces this compact list.
     ui: Rc<Cell<ItemUiState>>,
-    /// When a break last overflowed the stash (elements were destroyed), if
+    /// When a break last overflowed the stash (units were destroyed), if
     /// within the warning window. Drives the HUD's "elements lost" warning.
     overflow_at: Option<Instant>,
     /// Formatted HUD rows, rebuilt only when the stash, screen, or visibility
@@ -78,9 +78,6 @@ fn paint_inventory(
     overflow: bool,
 ) -> Vec<HudElement> {
     if !visible {
-        // The overflow warning outlives the list toggle: shown for a short
-        // window after the last overflowing break even while the list is
-        // closed, centred where the list's header would sit.
         if overflow {
             return vec![HudElement::Label {
                 at: Anchor::Top,
@@ -94,7 +91,6 @@ fn paint_inventory(
     }
 
     let width = PANEL_WIDTH.min((screen_w - PANEL_X * 2).max(1));
-    let elements = world.registry().elements();
     let total = stash.total();
     let kind_count = stash.iter().count();
     let shown = visible_rows(screen_h, kind_count);
@@ -109,14 +105,13 @@ fn paint_inventory(
     if total == 0 {
         rows.push(Row::new(Role::Muted, "(empty)"));
     } else {
-        // When the kinds overflow the panel, the last row slot becomes the
-        // "+N more" summary instead of an element row.
         let listed = if kind_count > shown { shown - 1 } else { shown };
-        for (element, count) in stash.iter().take(listed) {
-            rows.push(Row::new(
-                Role::Muted,
-                format!("{count}x {}", elements.get(element).name),
-            ));
+        for (id, count) in stash.iter().take(listed) {
+            let name = world.registry().display_name(id);
+            rows.push(
+                Row::new(Role::Muted, format!("{count}x {name}"))
+                    .with_swatch(world.registry().color(id)),
+            );
         }
         if kind_count > listed {
             rows.push(Row::new(Role::Dim, format!("+{} more", kind_count - listed)));
@@ -154,8 +149,6 @@ impl Mod for InventoryMod {
             ui.inventory_visible = !ui.inventory_visible;
             self.ui.set(ui);
         }
-        // Expire the overflow warning once its window has passed (drawing no
-        // longer mutates state, so the clock is advanced here).
         if self.overflow_at.is_some_and(|at| at.elapsed() > OVERFLOW_WARNING) {
             self.overflow_at = None;
         }
@@ -168,10 +161,7 @@ impl Mod for InventoryMod {
         self.overflow_at = None;
     }
 
-    fn on_block_break(&mut self, _elements: &[ElementId], _world: &World, overflow: bool) {
-        // The core already deposited. Arm the HUD warning when anything was
-        // dropped — silently destroying elements is the one thing this list
-        // must never do quietly.
+    fn on_block_break(&mut self, _id: BlockId, _world: &World, overflow: bool) {
         if overflow {
             self.overflow_at = Some(Instant::now());
         }
@@ -203,7 +193,6 @@ impl Mod for InventoryMod {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::element::El;
     use crate::mods::Mods;
     use crate::ui::HudElement;
     use voxel_engine::DVec3;
@@ -212,18 +201,18 @@ mod tests {
     fn overflowing_break_notification_arms_the_warning() {
         let world = World::new(1);
         let mut inventory = InventoryMod::new(Rc::new(Cell::new(ItemUiState::default())));
-        let stone = El::Stone.id();
+        let rock = world.registry().id_by_label("rock").unwrap();
 
-        inventory.on_block_break(&[stone], &world, false);
+        inventory.on_block_break(rock, &world, false);
         assert!(
             inventory.overflow_at.is_none(),
             "no warning while everything fits"
         );
 
-        inventory.on_block_break(&[stone], &world, true);
+        inventory.on_block_break(rock, &world, true);
         let armed = inventory
             .overflow_at
-            .expect("dropping elements must arm the warning");
+            .expect("dropping units must arm the warning");
         assert!(
             armed.elapsed() <= OVERFLOW_WARNING,
             "freshly armed: inside the window"
@@ -237,26 +226,26 @@ mod tests {
     }
 
     #[test]
-    fn disabling_inventory_does_not_destroy_mined_elements() {
+    fn disabling_inventory_does_not_destroy_mined_blocks() {
         let world = World::new(1);
         let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
         let mut mods = Mods::with_defaults();
         mods.set_enabled("inventory", false);
 
-        let stone = El::Stone.id();
-        let elements = [stone, stone, El::Soil.id()];
-        let overflow = !player.stash.add(&elements);
-        mods.on_block_break(&elements, &world, overflow);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let soil = world.registry().id_by_label("soil").unwrap();
+        assert!(player.stash.add(rock, 2));
+        assert!(player.stash.add(soil, 1));
+        mods.on_block_break(rock, &world, false);
 
-        assert!(!overflow);
-        assert_eq!(player.stash.total(), 3, "core keeps the elements");
-        assert_eq!(player.stash.count(stone), 2);
-        assert_eq!(player.stash.count(El::Soil.id()), 1);
+        assert_eq!(player.stash.total(), 3, "core keeps the configurations");
+        assert_eq!(player.stash.count(rock), 2);
+        assert_eq!(player.stash.count(soil), 1);
 
         let mut hidden = Vec::new();
         mods.hud(&world, &player, (800, 600), &mut hidden);
         assert!(
-            !hud_text(&hidden).contains("Stone"),
+            !hud_text(&hidden).contains("rock"),
             "disabled inventory must not present the list"
         );
 
@@ -265,13 +254,55 @@ mod tests {
         mods.hud(&world, &player, (800, 600), &mut shown);
         let text = hud_text(&shown);
         assert!(
-            text.contains("2x Stone"),
-            "re-enabled HUD lists the held stone: {text}"
+            text.contains("2x rock"),
+            "re-enabled HUD lists the held rock: {text}"
         );
         assert!(
-            text.contains("1x Soil"),
+            text.contains("1x soil"),
             "re-enabled HUD lists the held soil: {text}"
         );
+    }
+
+    #[test]
+    fn unknown_configurations_use_like_or_unknown_material() {
+        let mut world = World::new(1);
+        let law = *world.registry().law();
+        let regions = crate::block::regions::builtin(&law);
+        let rock = &regions[0];
+        let mut near = rock.centre;
+        near.0[3] = near.0[3].saturating_add(rock.spread);
+        if near == rock.centre {
+            near.0[3] = near.0[3].saturating_sub(rock.spread);
+        }
+        let near_id = world
+            .registry_mut()
+            .intern(&material::Configuration::single(near))
+            .unwrap();
+        let far = material::Element::new([0, 255, 0, 255]);
+        let far_id = world
+            .registry_mut()
+            .intern(&material::Configuration::single(far))
+            .unwrap();
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        assert!(player.stash.add(near_id, 1));
+        assert!(player.stash.add(far_id, 1));
+        let inventory = InventoryMod::new(Rc::new(Cell::new(ItemUiState::default())));
+        let mut shown = Vec::new();
+        inventory.hud(&world, &player, (800, 600), &mut shown);
+        let text = hud_text(&shown);
+        assert!(
+            text.contains(&format!("1x {}-like", rock.label)),
+            "near an unlabelled centre reads as -like: {text}"
+        );
+        let far_within = regions
+            .iter()
+            .any(|r| far.distance(r.centre) <= 2 * r.spread as u32);
+        if !far_within {
+            assert!(
+                text.contains("1x unknown material"),
+                "a far unlabelled config stays unknown: {text}"
+            );
+        }
     }
 
     fn hud_text(elements: &[HudElement]) -> String {

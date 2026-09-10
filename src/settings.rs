@@ -182,7 +182,7 @@ settings_fields! {
     device_max_msaa: u32 = 8,
     /// Device-local heap size from the startup probe; not persisted.
     device_local_memory_bytes: Option<u64> = None,
-    /// Live free device-local bytes (`VK_EXT_memory_budget`); not persisted.
+    /// Live free device-local bytes from [`Engine::gpu_caps`]; not persisted.
     available_device_bytes: Option<u64> = None,
     /// Session-only VRAM-guard / engine-fallback line for the console and settings menu.
     vram_notice: Option<String> = None,
@@ -1047,15 +1047,11 @@ impl Settings {
     }
 
     fn parse_from(&mut self, text: &str) {
-        for line in text.lines() {
-            let Some((key, value)) = line.trim().split_once('=') else {
-                continue;
-            };
-            let (key, value) = (key.trim(), value.trim());
+        each_kv_line(text, |key, value| {
             if let Some(field) = SETTINGS.iter().find(|f| f.matches(key)) {
                 field.read(self, value);
             }
-        }
+        });
     }
 
     /// Serialize every field to `key=value` lines — the exact text [`save`] writes.
@@ -1075,10 +1071,9 @@ impl Settings {
     /// Best-effort save (a failed write shouldn't crash the game).
     pub fn save(&self) {
         let path = settings_path();
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
+        if let Err(e) = crate::save::write_atomic_file(&path, self.to_text().as_bytes()) {
+            crate::save::log_fs_err("write", &path, &e);
         }
-        let _ = crate::save::write_atomic(&path, self.to_text().as_bytes());
     }
 
     /// Force every field into its valid range. Safe to call repeatedly, and
@@ -1103,12 +1098,13 @@ impl Settings {
         self.clamp();
     }
 
-    /// Heap, max MSAA, and VRS Auto threshold from the live engine.
+    /// Heap, live free VRAM, max MSAA, and VRS Auto threshold from the live engine.
     pub fn adopt_gpu_caps(&mut self, eng: &Engine) {
         let caps = eng.gpu_caps();
         self.device_max_msaa = caps.max_msaa.max(1);
         self.device_local_memory_bytes = (caps.device_local_bytes > 0).then_some(caps.device_local_bytes);
-        self.available_device_bytes = None;
+        self.available_device_bytes =
+            crate::render_config::available_from_engine_budget(caps.device_local_budget, caps.device_local_usage);
         self.vrs_auto_min_pixels = eng.vrs_useful_above_pixels().map(|px| px as u64);
         self.clamp();
     }
@@ -1464,6 +1460,17 @@ fn lod_cell_metres(detail: u8) -> u32 {
     1_u32 << detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end())
 }
 
+/// Walk `key=value` lines, skipping malformed ones. Shared by settings.cfg,
+/// session.cfg, and mods.cfg.
+pub(crate) fn each_kv_line(text: &str, mut visit: impl FnMut(&str, &str)) {
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        visit(key.trim(), value.trim());
+    }
+}
+
 /// Parse an on/off word. The one toggle parser (persistence AND `/gfx`).
 pub fn parse_toggle(value: &str) -> Option<bool> {
     match value {
@@ -1641,6 +1648,24 @@ mod tests {
         let loaded = Settings::load();
         assert_eq!(loaded.fov, 110.0);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn each_kv_line_skips_malformed_and_trims() {
+        let mut got = Vec::new();
+        each_kv_line(
+            "address = 10.0.0.2\nunknown=x\nnot-a-pair\nname=watt\n  k = v  \n",
+            |k, v| got.push((k.to_string(), v.to_string())),
+        );
+        assert_eq!(
+            got,
+            [
+                ("address".into(), "10.0.0.2".into()),
+                ("unknown".into(), "x".into()),
+                ("name".into(), "watt".into()),
+                ("k".into(), "v".into()),
+            ]
+        );
     }
 
     #[test]

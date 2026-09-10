@@ -12,92 +12,30 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{LoadReport, SaveSnapshot, encode_current, load, save, snapshot, unix_now};
+pub use bridge::{encode_current, load, save, snapshot, unix_now};
 pub use slot::{SaveError, SaveMeta, Slot, SlotId};
-pub use store::{Source, fresh_id, list, write_atomic};
+pub use store::{Source, fresh_id, list, write_atomic_file};
+pub(crate) use store::log_fs_err;
 
-use crate::block::element::ElementId;
-use crate::block::{AIR, BlockId, BlockRegistry, Composition};
+use crate::block::{AIR, BlockId, BlockRegistry};
 
-/// Spec string from a composition and an element-name lookup. Shared by the
-/// live registry path and the autosave snapshot so both emit identical bytes.
-pub(crate) fn composition_spec<'a>(
-    composition: &Composition,
-    element_name: impl Fn(ElementId) -> &'a str,
-) -> String {
-    match composition {
-        Composition::Natural(els) if els.is_empty() => "air".to_string(),
-        Composition::Natural(els) => {
-            let names: Vec<&str> = els.iter().map(|&e| element_name(e)).collect();
-            format!("natural:{}", names.join(","))
-        }
-        Composition::Mixture(mix) => {
-            let parts: Vec<String> = mix
-                .parts()
-                .iter()
-                .map(|&(e, pct)| format!("{}={}", element_name(e), pct))
-                .collect();
-            format!("mixture:{}", parts.join(";"))
-        }
-    }
-}
-
-/// Serialize a block as portable element names shared with the network layer.
+/// Serialize a block as the registry's portable spec, shared with the network.
 pub(crate) fn block_spec(registry: &BlockRegistry, id: BlockId) -> String {
-    if id == AIR {
-        return "air".to_string();
-    }
-    let elements = registry.elements();
-    composition_spec(&registry.block(id).composition, |e| elements.get(e).name.as_ref())
+    registry.spec(id)
 }
 
-/// Deserialize a block spec, registering into palette; inverse of block_spec().
-/// The server uses this to VALIDATE and canonicalize incoming edit specs with
-/// the exact rules clients apply, then re-serializes via [`block_spec`] — so an
-/// edit overlay never stores two strings for one block, and junk never interns.
+/// Deserialize a block spec, interning into the table; inverse of [`block_spec`].
+/// Unknown or legacy specs become [`AIR`] — the caller (save load, the wire)
+/// decides whether that is a notice or a reject.
 pub(crate) fn parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
-    if spec == "air" {
-        return AIR;
-    }
-    if let Some(rest) = spec.strip_prefix("natural:") {
-        // Any unknown element rejects the spec to prevent mismatches with the sender.
-        let mut ids = Vec::new();
-        for name in rest.split(',') {
-            match registry.elements().id_by_name(name) {
-                Some(id) => ids.push(id),
-                None => return AIR,
-            }
-        }
-        return crate::block::crafting::craft_natural(registry, &ids).unwrap_or(AIR);
-    }
-    if let Some(rest) = spec.strip_prefix("mixture:") {
-        let mut parts = Vec::new();
-        for entry in rest.split(';') {
-            let Some((name, pct)) = entry.split_once('=') else { return AIR };
-            let Some(id) = registry.elements().id_by_name(name) else { return AIR };
-            let Ok(pct) = pct.parse::<u8>() else { return AIR };
-            parts.push((id, pct));
-        }
-        let Ok(composition) = crate::block::Composition::mixture(&parts) else {
-            return AIR;
-        };
-        if let Some(existing) = registry.lookup(&composition) {
-            return existing;
-        }
-        if registry.at_capacity() {
-            return AIR;
-        }
-        return registry.mixture(&parts).unwrap_or(AIR);
-    }
-    AIR
+    registry.parse_spec(spec).unwrap_or(AIR)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::bridge::from_doc;
+    use super::bridge::{from_doc, unknown_material_notice, v7_law_notice};
     use super::format::{PlayerState, SaveDoc, WorldgenStamp};
-    use crate::block::element::El;
     use crate::mods::Mods;
     use crate::player::Player;
     use crate::world::World;
@@ -154,15 +92,13 @@ mod tests {
     #[test]
     fn block_specs_round_trip_for_every_supported_composition() {
         let mut world = World::new(11);
-        // Add a crafted natural (duplicated listing) and a mixture on top of
-        // the compiled palette.
-        let dup = crate::block::crafting::craft_natural(
-            world.registry_mut(),
-            &[El::Copper.id(), El::Copper.id(), El::Glass.id()],
-        )
+        let extra = material::Configuration::new(vec![
+            material::Element::new([1, 2, 3, 4]),
+            material::Element::new([1, 2, 3, 4]),
+            material::Element::new([9, 8, 7, 6]),
+        ])
         .unwrap();
-        let mix = world.registry_mut().mixture(&[(El::Soil.id(), 70), (El::Clay.id(), 30)]).unwrap();
-        let _ = (dup, mix);
+        world.registry_mut().intern(&extra).unwrap();
 
         for i in 0..world.registry().block_count() {
             let id = BlockId(i as u16);
@@ -192,9 +128,13 @@ mod tests {
         player.orientation.pitch = -0.25;
         player.set_flying(true);
 
-        player.stash.add(&[El::Stone.id(), El::Iron.id(), El::Stone.id()]);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let soil = world.registry().id_by_label("soil").unwrap();
+        player.stash.add(rock, 2);
+        player.stash.add(soil, 1);
         let mut mods = Mods::with_defaults();
-        mods.load_state("Crafting", "*Stone=1", &mut world);
+        let rock_spec = world.registry().spec(rock);
+        mods.load_state("Crafting", &format!("*{rock_spec}=1"), &mut world);
         let states_before = mods.save_states(&world);
 
         save(&id, &world, &player, &mods, meta("round trip")).unwrap();
@@ -212,8 +152,8 @@ mod tests {
         assert_eq!(loaded_player.orientation.pitch, -0.25);
         assert!(loaded_player.flying());
         assert_eq!(loaded_player.stash.total(), 3);
-        assert_eq!(loaded_player.stash.count(El::Stone.id()), 2);
-        assert_eq!(loaded_player.stash.count(El::Iron.id()), 1);
+        assert_eq!(loaded_player.stash.count(rock), 2);
+        assert_eq!(loaded_player.stash.count(soil), 1);
         let saved_bytes = fs::read(save_file(&id)).unwrap();
         assert_eq!(
             u16::from_le_bytes(saved_bytes[4..6].try_into().unwrap()),
@@ -242,6 +182,7 @@ mod tests {
             meta: meta("stash"),
             worldgen_version: crate::world::placement::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
+            law_stamp: material::Law::v0().stamp(),
             player: PlayerState {
                 pos: [0.0, 40.0, 0.0],
                 yaw: 0.0,
@@ -257,64 +198,104 @@ mod tests {
     }
 
     #[test]
-    fn old_inventory_mod_line_migrates_into_the_core_stash() {
+    fn legacy_inventory_mod_line_is_ignored() {
         let mut doc = bare_doc();
         doc.mods
             .push(("inventory".into(), "v1;Stone,Stone,Soil".into()));
         let mut mods = Mods::with_defaults();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world);
-        assert_eq!(player.stash.total(), 3);
-        assert_eq!(player.stash.count(El::Stone.id()), 2);
-        assert_eq!(player.stash.count(El::Soil.id()), 1);
+        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(player.stash.total(), 0);
     }
 
     #[test]
-    fn unprefixed_inventory_line_still_migrates() {
+    fn unknown_stash_specs_are_skipped() {
         let mut doc = bare_doc();
-        doc.mods.push(("Inventory".into(), "Iron,Iron".into()));
+        doc.player.stash = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
         let mut mods = Mods::with_defaults();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world);
-        assert_eq!(player.stash.total(), 2);
-        assert_eq!(player.stash.count(El::Iron.id()), 2);
-    }
-
-    #[test]
-    fn v6_on_disk_inventory_line_migrates_through_decode() {
-        let mut doc = bare_doc();
-        doc.mods
-            .push(("inventory".into(), "v1;Stone,Stone,Soil".into()));
-        let v7 = format::encode(&doc).unwrap();
-        // v6 player records end at the flags byte; drop the v7 stash blob.
-        let start = format::HEADER_LEN + 33;
-        let len = u16::from_le_bytes(v7[start..start + 2].try_into().unwrap()) as usize;
-        let mut v6 = Vec::with_capacity(v7.len() - 2 - len);
-        v6.extend_from_slice(&v7[..start]);
-        v6.extend_from_slice(&v7[start + 2 + len..]);
-        v6[4..6].copy_from_slice(&6u16.to_le_bytes());
-
-        let decoded = match format::decode(&v6).unwrap() {
-            format::Decoded::Intact(doc) => doc,
-            format::Decoded::Salvaged { .. } => panic!("v6 splice must decode intact"),
-        };
-        assert!(decoded.player.stash.is_none());
-        let mut mods = Mods::with_defaults();
-        let (_, player, _) = from_doc(decoded, &mut mods, make_world);
-        assert_eq!(player.stash.total(), 3);
-        assert_eq!(player.stash.count(El::Stone.id()), 2);
-        assert_eq!(player.stash.count(El::Soil.id()), 1);
-    }
-
-    #[test]
-    fn player_stash_field_wins_over_an_old_inventory_line() {
-        let mut doc = bare_doc();
-        doc.player.stash = Some(vec![("Copper".into(), 1)]);
-        doc.mods
-            .push(("inventory".into(), "v1;Stone,Stone".into()));
-        let mut mods = Mods::with_defaults();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world);
+        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
         assert_eq!(player.stash.total(), 1);
-        assert_eq!(player.stash.count(El::Copper.id()), 1);
-        assert_eq!(player.stash.count(El::Stone.id()), 0);
+        assert_eq!(player.stash.count(AIR), 1);
+    }
+
+    #[test]
+    fn unknown_holdings_fold_into_one_load_notice() {
+        assert_eq!(unknown_material_notice(0, 0), None);
+        assert_eq!(
+            unknown_material_notice(3, 0).as_deref(),
+            Some("save predates the material model; 3 edits of unknown materials became air")
+        );
+        assert_eq!(
+            unknown_material_notice(0, 2).as_deref(),
+            Some("2 holdings of unknown materials were dropped")
+        );
+        assert_eq!(
+            unknown_material_notice(4, 1).as_deref(),
+            Some(
+                "save predates the material model; 4 edits of unknown materials became air; 1 holdings of unknown materials were dropped"
+            )
+        );
+
+        let mut doc = bare_doc();
+        doc.player.stash = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
+        doc.mods
+            .push(("crafting".into(), "v1;natural:Iron=4".into()));
+        let mut mods = Mods::with_defaults();
+        let (world, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(player.stash.total(), 1);
+        assert!(
+            mods.save_states(&world)
+                .iter()
+                .all(|(n, d)| n != "crafting" || !d.contains("Iron")),
+            "unknown pouch specs are dropped"
+        );
+    }
+
+    #[test]
+    fn stash_specs_round_trip_through_save() {
+        let world = World::new(3);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let spec = world.registry().spec(rock);
+        let mut doc = bare_doc();
+        doc.player.stash = Some(vec![(spec, 4)]);
+        let mut mods = Mods::with_defaults();
+        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(player.stash.count(rock), 4);
+    }
+
+    #[test]
+    fn unknown_edit_specs_become_air() {
+        let mut doc = bare_doc();
+        doc.specs = vec!["natural:Stone".into()];
+        doc.edits = vec![super::format::Edit { x: 1, y: 40, z: 1, spec: 0 }];
+        doc.meta.edit_count = 1;
+        let mut mods = Mods::with_defaults();
+        let (world, _, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(world.block_at(1, 40, 1), AIR);
+    }
+
+    #[test]
+    fn law_mismatch_is_refused() {
+        let mut doc = bare_doc();
+        doc.law_stamp[0] ^= 0xff;
+        let mut mods = Mods::with_defaults();
+        assert!(matches!(
+            from_doc(doc, &mut mods, make_world),
+            Err(SaveError::LawMismatch)
+        ));
+    }
+
+    #[test]
+    fn v7_save_emits_a_migration_notice_and_loads() {
+        assert_eq!(
+            v7_law_notice(&[]).as_deref(),
+            Some("save predates the law stamp (v7); assuming law v0")
+        );
+        assert_eq!(v7_law_notice(&material::Law::v0().stamp()), None);
+        let mut doc = bare_doc();
+        doc.law_stamp.clear();
+        let mut mods = Mods::with_defaults();
+        let (world, _, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(world.registry().law(), &material::Law::v0());
     }
 
     #[test]
@@ -391,21 +372,22 @@ mod tests {
         let doc = SaveDoc {
             worldgen_version: crate::world::placement::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
+            law_stamp: material::Law::v0().stamp(),
             meta: meta("mods"),
             player: blank_player.clone(),
             specs: vec![],
             edits: vec![],
             mods: vec![
-                ("Crafting".into(), "*IronVein=1".into()),
+                ("Crafting".into(), "*natural:Stone=1".into()),
                 ("no-such-mod".into(), "ignored".into()),
-                ("Crafting".into(), "*IronVein=2".into()),
+                ("Crafting".into(), "air=2".into()),
             ],
         };
         let mut mods = Mods::with_defaults();
-        let (world, _, _) = super::bridge::from_doc(doc, &mut mods, make_world);
+        let (world, _, _) = super::bridge::from_doc(doc, &mut mods, make_world).unwrap();
         let states = mods.save_states(&world);
         let craft = states.iter().find(|(n, _)| n == "crafting").map(|(_, d)| d.as_str());
-        assert_eq!(craft, Some("v1;*Stone+Iron=2"), "duplicate mod lines: last wins");
+        assert_eq!(craft, Some("v1;air=2"), "duplicate mod lines: last wins");
         assert!(states.iter().all(|(n, _)| n != "no-such-mod"));
     }
 
@@ -445,15 +427,14 @@ mod tests {
                 phases: world.diffusion_cfg().phases,
                 relief: world.diffusion_cfg().relief,
             },
+            law_stamp: world.registry().law().stamp(),
             player: PlayerState {
                 pos: [player.position.x, player.position.y, player.position.z],
                 yaw: player.orientation.yaw,
                 pitch: player.orientation.pitch,
                 flying: player.flying(),
                 noclip: player.noclip(),
-                stash: Some(player.stash.to_portable(|id| {
-                    world.registry().elements().get(id).name.as_ref()
-                })),
+                stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
             },
             specs,
             edits,
@@ -470,19 +451,19 @@ mod tests {
             .find(|&y| world.is_solid(bx, y, bz))
             .unwrap();
         world.set_block(bx, by, bz, AIR);
-        let mix = world
-            .registry_mut()
-            .mixture(&[(El::Soil.id(), 70), (El::Clay.id(), 30)])
-            .unwrap();
-        world.set_block(bx, by + 1, bz, mix);
+        let soil = world.registry().id_by_label("soil").unwrap();
+        world.set_block(bx, by + 1, bz, soil);
 
         let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
         player.orientation.yaw = 0.5;
         player.orientation.pitch = -0.25;
         player.set_flying(true);
-        player.stash.add(&[El::Stone.id(), El::Iron.id(), El::Stone.id()]);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        player.stash.add(rock, 2);
+        player.stash.add(soil, 1);
         let mut mods = Mods::with_defaults();
-        mods.load_state("Crafting", "*Stone=1", &mut world);
+        let rock_spec = world.registry().spec(rock);
+        mods.load_state("Crafting", &format!("*{rock_spec}=1"), &mut world);
 
         let snap = snapshot(&world, &player, &mods, meta("snap"));
         let snap_doc = snap.to_doc().unwrap();
@@ -516,6 +497,7 @@ mod tests {
             stride: 16,
             phases: 4,
             relief: 1.5,
+            version: 1,
         };
         let world = make_world(99, WorldgenKind::Diffusion, cfg);
         assert_eq!(world.worldgen(), WorldgenKind::Diffusion);

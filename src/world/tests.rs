@@ -74,7 +74,7 @@ fn lod2_world() -> World {
 #[test]
 fn indexed_section_edits_match_the_footprint_scan() {
     let mut world = lod2_world();
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     // Edits across several chunk columns and heights, one out of domain.
     world.set_block(3, 50, 4, stone);
     world.set_block(200, 90, -150, stone);
@@ -109,6 +109,60 @@ fn indexed_section_edits_match_the_footprint_scan() {
             "an out-of-domain edit leaked into the section index"
         );
     }
+}
+
+#[test]
+fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
+    let mut world = lod2_world();
+    world.slot_ceiling = 1024;
+    world.gpu_live_slots = 6000;
+    let pos = SectionPos {
+        detail: section::FINEST_DETAIL,
+        x: 0,
+        z: 0,
+    };
+    assert!(
+        <SectionLane as StreamLane>::ready(&world, pos),
+        "6000 near slots against cpu_cull_max=1024 must not starve the far lane"
+    );
+    world.meshing_sections = SECTION_SLOT_FLOOR;
+    assert!(
+        !<SectionLane as StreamLane>::ready(&world, pos),
+        "the section floor is the far lane's own cap, not the near field's"
+    );
+    world.meshing_sections = SECTION_SLOT_FLOOR - 1;
+    assert!(<SectionLane as StreamLane>::ready(&world, pos));
+}
+
+/// At the user's max view (RD 20 / V 10 / 8 LOD rings) the far field still
+/// fits the section-slot floor, so covering-complete — and `entry_complete` —
+/// stays reachable when the near field has already eaten the CPU-cull knob.
+#[test]
+fn far_field_at_max_view_fits_the_section_slot_floor() {
+    let mut world = World::with_config(
+        DEFAULT_SEED,
+        RenderConfig {
+            lod_levels: 8,
+            lod_detail: 2,
+            ..RenderConfig::default()
+        },
+    );
+    world.set_view_distances(20, 10);
+    world.section_pyramid.unit = world.view.lod_unit();
+    world.slot_ceiling = 1024;
+    world.gpu_live_slots = 6000;
+    let center = ChunkCoord::new(0, 0, 0);
+    let desired = world.desired_sections(center);
+    assert!(!desired.is_empty(), "max view still wants a far field");
+    assert!(
+        desired.len() <= SECTION_SLOT_FLOOR,
+        "over the section floor: {} desired cells",
+        desired.len()
+    );
+    assert!(
+        <SectionLane as StreamLane>::ready(&world, desired[0]),
+        "the far lane must still admit under 6000 near slots"
+    );
 }
 
 #[test]
@@ -157,7 +211,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = ChunkCoord::new(0, 0, 0);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { quadrants: Default::default(), last_style: None };
+    let empty_ready = || SectionState::Ready { meshes: None, last_style: None };
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -194,7 +248,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { quadrants: Default::default(), last_style: None });
+        world.sections.insert(cell, SectionState::Ready { meshes: None, last_style: None });
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -289,7 +343,9 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         visible: true,
         light: None,
         has_blocklight: false,
+        light_reseed: false,
         light_gen: 0,
+        mesh_hash: None,
     }
 }
 
@@ -428,17 +484,23 @@ fn column_is_layered_grass_dirt_stone() {
     let reg = world.registry();
     // Terrain speaks elements: crust blocks are the natural unions derived by
     // the placement table.
-    let (grass, dirt, stone) = (
-        reg.id_by_name("Soil+Organic").unwrap(),
-        reg.id_by_name("Soil+Clay").unwrap(),
-        reg.id_by_name("Stone").unwrap(),
+    let (grass, dirt) = (
+        reg.id_by_label("organic+soil").unwrap(),
+        reg.id_by_label("clay+soil").unwrap(),
     );
+    let stone_ids: [BlockId; 4] = [
+        reg.id_by_label("rock").unwrap(),
+        reg.id_by_label("rock:0").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
+        reg.id_by_label("rock:1").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
+        reg.id_by_label("rock:2").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
+    ];
+    let is_stone = |id| stone_ids.contains(&id);
 
     let (x, z, h) = (0..64)
         .flat_map(|x| (0..64).map(move |z| (x, z)))
         .find_map(|(x, z)| {
             let h = (0..96).rev().find(|&y| world.is_solid(x, y, z))?;
-            (world.block_at(x, h, z) == grass && world.block_at(x, h - 3, z) == stone)
+            (world.block_at(x, h, z) == grass && is_stone(world.block_at(x, h - 3, z)))
                 .then_some((x, z, h))
         })
         .expect("a grass-topped column with clean shallow stone near spawn");
@@ -446,10 +508,10 @@ fn column_is_layered_grass_dirt_stone() {
     assert_eq!(world.block_at(x, h + 1, z), AIR);
     assert_eq!(world.block_at(x, h, z), grass);
     assert_eq!(world.block_at(x, h - 1, z), dirt);
-    assert_eq!(world.block_at(x, h - 3, z), stone);
+    assert!(is_stone(world.block_at(x, h - 3, z)));
     // Deep stone persists below y = 0.
     world.ensure_data(World::chunk_of(x, h - 70, z));
-    assert_eq!(world.block_at(x, h - 70, z), stone);
+    assert!(is_stone(world.block_at(x, h - 70, z)));
 }
 
 #[test]
@@ -478,7 +540,7 @@ fn edits_persist_across_unload() {
         .unwrap();
     world.set_block(x, h, z, AIR);
     assert_eq!(world.block_at(x, h, z), AIR);
-    let stone = world.registry().id_by_name("Stone").unwrap();
+    let stone = world.registry().id_by_label("rock").unwrap();
     world.set_block(x, 70, z, stone);
 
     world.chunks.clear();
@@ -514,7 +576,7 @@ fn lighting_toggle_reseeds_only_stale_work_and_rejects_old_results() {
     assert!(world.chunks[&coord].light.is_none());
 
     let old = world.block_at(3, 3, 3);
-    let stone = world.registry().id_by_name("Stone").unwrap();
+    let stone = world.registry().id_by_label("rock").unwrap();
     world.set_block(3, 3, 3, if old == AIR { stone } else { AIR });
     world.chunks.get_mut(&missing).unwrap().light = None;
     assert!(world.light_worklist.contains(&coord));
@@ -706,6 +768,21 @@ fn light_arrival_schedules_async_rebuild_and_keeps_drawing() {
 
     world.pending_dirty.take();
     world.settle_light(coord, light::LightGrid::dark()); // a CHANGED grid
+    assert!(
+        world.light_gate.dirty.contains_key(&coord),
+        "changed settle marks light_dirty instead of remeshing immediately"
+    );
+    assert!(
+        matches!(world.chunks[&coord].state, MeshState::Ready(_)),
+        "no remesh until the neighbourhood is quiet"
+    );
+    // Neighbour seeds from the border move are pending light work; drop them
+    // so this test exercises the quiet-nhood promotion (the flood path is
+    // covered by `changed_settle_remeshes_once_at_nhood_fixpoint`).
+    world.light_worklist.clear();
+    world.light_inflight.clear();
+    world.light_apply_queue.clear();
+    world.tick_light_gate();
 
     let state = &world.chunks[&coord].state;
     assert!(
@@ -848,6 +925,43 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     assert_eq!(streaming::mesh_output_bytes(&out), expected);
 }
 
+/// Section uploads charge the same vertex-byte accounting as chunks, stored
+/// on the queue entry at enqueue so the drain never walks the mesh again.
+#[test]
+fn section_upload_byte_accounting_matches_vertex_sizes() {
+    let mut world = lod2_world();
+    world.refresh_tables();
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    let pos = world.desired_sections(center)[0];
+    let tables = world.tables.get();
+    let meshes = section::extract_section_mesh(pos, &*world.generator, &[], &tables);
+    let expected: usize = Pass::ALL.iter().map(|&p| meshes.data[p].vertex_bytes()).sum();
+    assert!(expected > 0, "a default-seed section yields geometry");
+    assert_eq!(streaming::section_output_bytes(&meshes), expected);
+
+    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
+    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Section {
+            pos,
+            epoch: 0,
+            token: pipeline::ClaimToken(7),
+            meshes: Box::new(meshes),
+        },
+    );
+    assert_eq!(world.section_upload_queue.len(), 1);
+    assert_eq!(world.section_upload_queue[0].2, expected);
+}
+
+/// Empty pooled section output is a zero-byte charge (stale/default jobs).
+#[test]
+fn empty_section_mesh_charges_zero_upload_bytes() {
+    let meshes = section::SectionMeshData::default();
+    assert_eq!(streaming::section_output_bytes(&meshes), 0);
+}
+
 /// Mesh admission pauses at the upload-queue cap and resumes below it.
 #[test]
 fn upload_backlog_pauses_mesh_admission_at_the_cap() {
@@ -928,7 +1042,7 @@ fn neighbour_edits_bump_the_bordering_chunks_rev() {
     assert_eq!(world.chunks[&ChunkCoord::new(1, 0, 0)].rev, 0, "far side untouched");
 
     // Vertical borders also bump rev on the neighbour below.
-    let stone = world.registry().id_by_name("Stone").unwrap();
+    let stone = world.registry().id_by_label("rock").unwrap();
     let other =
         if world.block_at(8, 16, 8) == crate::block::AIR { stone } else { crate::block::AIR };
     let below = world.chunks[&ChunkCoord::new(0, 0, 0)].rev;
@@ -1265,11 +1379,11 @@ fn lod2_far_field_drives_to_covering_complete() {
         if !got {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        while let Some((pos, token, _meshes)) = world.section_upload_queue.pop_front() {
+        while let Some((pos, token, _bytes, _meshes)) = world.section_upload_queue.pop_front() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { quadrants: Default::default(), last_style: None };
+                *s = SectionState::Ready { meshes: None, last_style: None };
             }
         }
     }
@@ -1339,7 +1453,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
     world.set_view_distances(6, 3);
     let center = ChunkCoord::new(0, 0, 0);
     world.center = Some(center);
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     for x in -5..=5 {
         for z in -5..=5 {
             for y in -2..=2 {
@@ -1359,7 +1473,9 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                         visible: true,
                         light: None,
                         has_blocklight: false,
+                        light_reseed: false,
                         light_gen: 0,
+                        mesh_hash: None,
                     },
                 );
             }
@@ -1418,7 +1534,7 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
     world.set_view_distances(6, 3);
     let center = ChunkCoord::new(0, 0, 0);
     world.center = Some(center);
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     for x in -5..=5 {
         for z in -5..=5 {
             for y in -2..=2 {
@@ -1438,7 +1554,9 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
                         visible: true,
                         light: None,
                         has_blocklight: false,
+                        light_reseed: false,
                         light_gen: 0,
+                        mesh_hash: None,
                     },
                 );
             }
@@ -1561,7 +1679,7 @@ fn stale_light_result_does_not_land_on_a_regenerated_chunk() {
         ys.retain(|&y| y != coord.y);
     }
 
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     let (x, y, z) = (
         coord.x * CHUNK_SIZE as i32 + 1,
         coord.y * CHUNK_SIZE as i32 + 1,
@@ -2181,7 +2299,7 @@ fn assert_claim_invariants(
             let queued = world
                 .section_upload_queue
                 .iter()
-                .any(|(p, t, _)| p == pos && t == token);
+                .any(|(p, t, _, _)| p == pos && t == token);
             assert!(
                 owed_section.get(pos) == Some(token) || queued,
                 "{pos:?} meshing with no owed Done and not queued"

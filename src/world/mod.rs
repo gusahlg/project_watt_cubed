@@ -32,6 +32,7 @@ pub mod brick;
 pub mod chunk;
 pub mod connectivity;
 pub mod diffusion;
+pub mod diffusion_v2;
 pub mod generation;
 pub mod light;
 pub mod lod;
@@ -73,8 +74,16 @@ use heightmip::HeightMip;
 use light::LightGrid;
 use mesh::{ChunkMeshData, new_chunk_mesh_data};
 use quadtree::QuadrantMask;
-use section::Quadrant;
 use section::{SectionMeshData, SectionPos};
+
+/// Engine CPU-cull live-count threshold (`mesh_stats().cpu_cull_max` fallback).
+/// Above this the engine uses its GPU cull dispatch (~10 µs); it is a cost
+/// knob, not a hard slot limit. The far lane budgets section slots against
+/// `max(SECTION_SLOT_FLOOR, cpu_cull_max - near_chunk_slots)`.
+const CPU_CULL_MAX: u32 = 1024;
+/// Floor on the far lane's section-slot budget so a large near field cannot
+/// starve covering: chunks never count against sections.
+pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 512;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -168,6 +177,71 @@ pub struct StreamGauges {
     pub light_admitted_last: usize,
     /// Cumulative `light_worklist` insert attempts (including already-queued).
     pub light_seed_inserts: u64,
+    /// Live GPU mesh slots (engine gauge when streamed, else a local handle count).
+    pub mesh_slots: usize,
+    /// CPU-cull live-count ceiling (`cpu_cull_max`); a cost knob, not a hard cap.
+    pub slot_ceiling: usize,
+    /// Ready far-LOD sections (each is one mesh per pass).
+    pub section_ready: usize,
+    /// Insert attempts split by `seed_light` source (stress report at stop).
+    pub light_seed_split: LightSeedSplit,
+    /// `remesh_async` calls (rev-bumping rebuilds) this world has issued.
+    pub remesh_async_calls: u64,
+    /// Vertex bytes of section (LOD tile) meshes uploaded this stream pass.
+    pub section_upload_bytes: usize,
+    /// Stale mesh drops (accept-time, pop-time, and prune).
+    pub drop_stale_uploads: u64,
+    /// Stale drops during the current stream/pump frame.
+    pub drop_stale_this_frame: u32,
+    /// `remesh_async` calls per coord between successful uploads.
+    pub remesh_between_upload_mean: f32,
+    pub remesh_between_upload_p95: f32,
+    pub remesh_between_upload_n: u64,
+    /// Mesh jobs claimed for a chunk before its 27-neighbourhood light fixpoint.
+    pub mesh_jobs_before_fixpoint_mean: f32,
+    pub mesh_jobs_before_fixpoint_p95: f32,
+    pub mesh_jobs_before_fixpoint_n: u64,
+    /// Reaction-event scheduler queue depth at sample time.
+    pub reactions_pending: usize,
+    /// Cumulative reaction mutations committed by the scheduler.
+    pub reactions_mutations: u64,
+}
+
+/// `seed_light` insert attempts by source. Degrade / terminal / neighbour-remesh
+/// stay zero unless those paths start seeding the light worklist.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LightSeedSplit {
+    pub store: u64,
+    pub border: u64,
+    pub edit: u64,
+    pub degrade: u64,
+    pub terminal: u64,
+    pub remesh: u64,
+}
+
+/// Why a coord was inserted into `light_worklist`.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Degrade/Terminal/Remesh are report buckets; tests construct them.
+pub(in crate::world) enum LightSeed {
+    Store,
+    Border,
+    Edit,
+    Degrade,
+    Terminal,
+    Remesh,
+}
+
+impl LightSeedSplit {
+    pub(in crate::world) fn add(&mut self, kind: LightSeed) {
+        *match kind {
+            LightSeed::Store => &mut self.store,
+            LightSeed::Border => &mut self.border,
+            LightSeed::Edit => &mut self.edit,
+            LightSeed::Degrade => &mut self.degrade,
+            LightSeed::Terminal => &mut self.terminal,
+            LightSeed::Remesh => &mut self.remesh,
+        } += 1;
+    }
 }
 
 pub use census::MemoryCensus;
@@ -337,11 +411,17 @@ struct Loaded {
     /// so a uniform-air neighbour can reject the analytic sky path by testing
     /// six booleans instead of capturing a 3 KB face shell.
     has_blocklight: bool,
+    /// Neighbour face moved while this chunk's flood was in flight. Re-seed
+    /// when the result integrates so the wave costs at most one extra flood.
+    light_reseed: bool,
     /// Identity of this `Loaded` for light-claim matching. Bumped at store so
     /// a `Done::Light` captured against a previous resident at the same coord
     /// (unload then regenerate, same `light_epoch`) cannot publish onto the
     /// new voxels.
     light_gen: u32,
+    /// Content hash of the last *sync* remesh. Async uploads store `None` so
+    /// they never hash on the main thread; an identical edit remesh then uploads.
+    mesh_hash: Option<u64>,
 }
 
 /// Keep an in-flight claim counter in step with a boolean flag, without
@@ -361,12 +441,20 @@ impl Loaded {
     /// remesh, world-leave — routes through here, so there's one place to check
     /// for double frees or leaks.
     fn retire(&mut self, next: MeshState, eng: &mut Engine) {
+        let carrying = next.live_meshes().is_some();
         std::mem::replace(&mut self.state, next).free_owned(eng);
+        if !carrying {
+            self.mesh_hash = None;
+        }
     }
     /// Engine-free retire for claim tests that count frees through the hook.
     #[cfg(test)]
     fn retire_logged(&mut self, next: MeshState) {
+        let carrying = next.live_meshes().is_some();
         std::mem::replace(&mut self.state, next).free_logged();
+        if !carrying {
+            self.mesh_hash = None;
+        }
     }
 }
 
@@ -417,6 +505,30 @@ pub(in crate::world) mod mesh_free_log {
     }
 }
 
+/// Test-only log of [`ChunkMeshes::set_visible`] calls, so visibility tests
+/// can record a fake engine without constructing one.
+#[cfg(test)]
+pub(in crate::world) mod vis_log {
+    use std::cell::RefCell;
+    use voxel_engine::MeshHandle;
+
+    thread_local! {
+        static CALLS: RefCell<Vec<(MeshHandle, bool)>> = RefCell::new(Vec::new());
+    }
+
+    pub fn record(handles: impl IntoIterator<Item = MeshHandle>, on: bool) {
+        CALLS.with(|c| {
+            for h in handles {
+                c.borrow_mut().push((h, on));
+            }
+        });
+    }
+
+    pub fn take() -> Vec<(MeshHandle, bool)> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+}
+
 /// The GPU meshes of one chunk, split by draw pass — the resident dual of
 /// [`ChunkMeshData`]. A chunk yields an opaque mesh, a transparent mesh, or both;
 /// the smart constructor enforces **at least one present** (an all-empty chunk is
@@ -463,6 +575,9 @@ impl ChunkMeshes {
             }
         }
     }
+    fn slot_count(&self) -> usize {
+        self.0.iter().filter(|(_, m)| m.is_some()).count()
+    }
     /// Whether any pass draws `handle` — for the render/ownership tests.
     #[cfg(test)]
     fn draws(&self, handle: MeshHandle) -> bool {
@@ -495,13 +610,12 @@ pub(in crate::world) enum SectionState {
     /// presents a different token belongs to a superseded claim and must not
     /// touch this entry.
     Meshing { token: pipeline::ClaimToken },
-    /// Block meshes grouped by quadrant (indexed by [`SectionPos::quadrant`]).
-    /// Position and detail (cell size `2^detail`, from the map key `pos.detail`)
-    /// are pinned into each resident mesh at upload; visibility is a per-quadrant
-    /// `set_visible` mask and style a `set_style` push, so nothing per-block is
-    /// stored beyond the meshes themselves.
+    /// One mesh per pass for the whole section. Position and packed detail
+    /// (`pos.detail + shift`) are pinned at upload; visibility is a single
+    /// `set_visible` (partial covering draws the whole tile — overlap is
+    /// depth-biased) and style a `set_style` push.
     Ready {
-        quadrants: [Vec<ChunkMeshes>; 4],
+        meshes: Option<ChunkMeshes>,
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
         /// re-observed next frame (the steady case) sends nothing.
         last_style: Option<(FadeStyle, u32)>,
@@ -509,36 +623,21 @@ pub(in crate::world) enum SectionState {
 }
 
 impl SectionState {
-    /// Upload each quadrant's block meshes at their absolute world origin and
-    /// detail (pinned once — the engine recovers camera-relative position). Empty
-    /// quadrants upload to no handles.
+    /// Upload the section's one mesh per pass at the packed origin and detail.
     fn from_upload(
         pos: SectionPos,
-        meshes: [SectionMeshData; 4],
+        mesh: SectionMeshData,
         eng: &mut Engine,
     ) -> SectionState {
         let cell = pos.cell_size();
-        let detail = pos.detail;
-        let quadrants = meshes.map(|quad| {
-            let mut blocks = Vec::new();
-            for (block_origin, data) in quad {
-                let placement = voxel_engine::MeshPlacement::terrain(
-                    voxel_engine::IVec3::new(
-                        pos.min_x() + block_origin.x as i32 * cell,
-                        block_origin.y as i32 * cell,
-                        pos.min_z() + block_origin.z as i32 * cell,
-                    ),
-                    detail,
-                );
-                let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement));
-                if let Some(meshes) = ChunkMeshes::from_upload_handles(handles) {
-                    blocks.push(meshes);
-                }
-            }
-            blocks
-        });
+        let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let placement = voxel_engine::MeshPlacement::terrain(
+            voxel_engine::IVec3::new(pos.min_x(), mesh.origin_y as i32 * cell, pos.min_z()),
+            detail,
+        );
+        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&mesh.data[p], placement));
         SectionState::Ready {
-            quadrants,
+            meshes: ChunkMeshes::from_upload_handles(handles),
             last_style: None,
         }
     }
@@ -547,31 +646,22 @@ impl SectionState {
         matches!(self, SectionState::Ready { .. })
     }
 
-    /// Project `mask` onto this region's slots: the quadrants it selects are
-    /// visible, the rest not. `None` draws nothing. Walks EVERY quadrant, so a
-    /// quadrant leaving the mask is cleared rather than stranded at its last value.
+    /// Project `mask` onto this region's slots. One mesh covers the whole
+    /// section: any non-empty mask draws it (overlap with finer children is
+    /// depth-biased); `None` / empty hides it.
     fn set_visible(&self, eng: &mut Engine, mask: Option<QuadrantMask>) {
-        let SectionState::Ready { quadrants, .. } = self else {
+        let SectionState::Ready { meshes: Some(meshes), .. } = self else {
             return;
         };
-        for q in Quadrant::ALL {
-            let on = mask.is_some_and(|m| m.contains(q));
-            for meshes in &quadrants[q.index()] {
-                meshes.set_visible(eng, on);
-            }
-        }
+        meshes.set_visible(eng, mask.is_some_and(|m| !m.is_empty()));
     }
-    /// Push the far-material style onto every block mesh of this section
+    /// Push the far-material style onto this section's mesh
     /// (visibility decides which actually draw). The engine delta-gates unchanged style.
     fn set_style(&self, eng: &mut Engine, style: FadeStyle, flat_rgba: u32) {
-        let SectionState::Ready { quadrants, .. } = self else {
+        let SectionState::Ready { meshes: Some(meshes), .. } = self else {
             return;
         };
-        for quad in quadrants {
-            for meshes in quad {
-                meshes.set_style(eng, style, flat_rgba);
-            }
-        }
+        meshes.set_style(eng, style, flat_rgba);
     }
     /// [`Self::set_style`], gated on the pushed tuple actually changing since last
     /// time — the DrawDyn contract ("at rest, zero writes"): the engine delta-gates
@@ -588,13 +678,55 @@ impl SectionState {
         self.set_style(eng, style, flat_rgba);
     }
     fn free(self, eng: &mut Engine) {
-        if let SectionState::Ready { quadrants, .. } = self {
-            for quad in quadrants {
-                for meshes in quad {
-                    meshes.free(eng);
-                }
-            }
+        if let SectionState::Ready { meshes: Some(meshes), .. } = self {
+            meshes.free(eng);
         }
+    }
+
+    fn slot_count(&self) -> usize {
+        match self {
+            SectionState::Ready { meshes: Some(m), .. } => m.slot_count(),
+            _ => 0,
+        }
+    }
+}
+
+impl World {
+    fn section_slot_count(&self) -> usize {
+        self.sections.values().map(SectionState::slot_count).sum()
+    }
+
+    fn local_chunk_slots(&self) -> usize {
+        self.chunks
+            .values()
+            .filter_map(|l| l.state.live_meshes())
+            .map(ChunkMeshes::slot_count)
+            .sum()
+    }
+
+    /// Near-field GPU slots. When the engine has sampled `live_slots`, that
+    /// total minus the live section slots; otherwise the local chunk count.
+    /// Chunks never count against the far lane's section budget.
+    fn near_chunk_slots(&self) -> usize {
+        if self.gpu_live_slots != 0 {
+            (self.gpu_live_slots as usize).saturating_sub(self.section_slot_count())
+        } else {
+            self.local_chunk_slots()
+        }
+    }
+
+    /// Section slots the far lane may occupy: at least [`SECTION_SLOT_FLOOR`],
+    /// else whatever remains under the CPU-cull knob after near chunks.
+    pub(in crate::world) fn sections_allowed(&self) -> usize {
+        SECTION_SLOT_FLOOR.max((self.slot_ceiling as usize).saturating_sub(self.near_chunk_slots()))
+    }
+
+    fn section_budget_used(&self) -> usize {
+        self.section_slot_count() + self.meshing_sections + self.section_upload_queue.len()
+    }
+
+    fn local_mesh_slots(&self) -> usize {
+        self.local_chunk_slots() + self.section_slot_count()
     }
 }
 
@@ -809,6 +941,7 @@ pub struct World {
     light_worklist: worklist::RingWorklist,
     /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
     light_seed_inserts: u64,
+    light_seed_split: LightSeedSplit,
     /// Cumulative light jobs accepted by the worker pool.
     light_admitted: u64,
     /// Jobs accepted by the most recent [`admit`]`<LightLane>` pass.
@@ -830,6 +963,8 @@ pub struct World {
     /// of chunks currently showing a degraded (known-not-final) mesh awaiting relight.
     /// Kept in one struct so the feature's footprint on `World` is a single field.
     light_gate: streaming::LightGate,
+    /// Remesh/stale-drop samples for the stress C3 gauges.
+    remesh_stats: streaming::RemeshStats,
     /// Chunks whose missing neighbour light will never arrive, so a mesh
     /// snapshot must read missing planes as settled dark (not open-sky).
     light_terminal: FastSet<Coord>,
@@ -850,19 +985,30 @@ pub struct World {
     /// bounded hole in the world, not an infinite resubmit-panic loop. Every
     /// scan that would re-request the work consults this set.
     quarantined: FastSet<streaming::FailKey>,
-    /// Block count last processed by [`Self::refresh_textures`].
+    /// Descriptor count last processed by [`Self::refresh_textures`].
     textures_built: usize,
     /// Built texture layers by id, kept so palette growth (crafting registers
     /// one block at a time) appends new layers instead of regenerating all.
+    /// Cleared when the appearance `revision` (or GPU-descriptor flag) changes.
     texture_cache: Vec<Vec<u8>>,
     /// Layers last sent to the GPU (`set` on first upload, `append` after).
-    /// Existing layers never change: a layer is a pure function of composition
-    /// and ids are append-only, so growth never re-sends the prefix.
+    /// Existing layers never change: a layer is a pure function of the visual
+    /// at one revision, and ids are append-only, so growth never re-sends the
+    /// prefix unless the appearance revision moved.
     uploaded_len: usize,
+    /// Appearance revision last used to fill [`Self::texture_cache`].
+    appearance_revision: u32,
+    /// Whether the last fill uploaded GPU material descriptors.
+    appearance_gpu: bool,
+    /// True after a `set_material_descs` of procedural entries; cleared by
+    /// uploading an empty table so the engine returns to ARRAY_LAYER.
+    gpu_descs_uploaded: bool,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
-    /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
-    /// stream pass reads the engine cap (identity in practice — ids start tiny).
+    /// so the meshers wrap vertex layers past it. Construction uses `u16::MAX`
+    /// (identity wrap); the first engine contact overwrites it once.
     texture_layer_cap: u16,
+    /// True after [`World::pump`] has read `Engine::max_texture_array_layers`.
+    texture_cap_from_device: bool,
     /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
     /// input like `lighting`: toggling remeshes the world.
     ao: bool,
@@ -952,8 +1098,19 @@ pub struct World {
     /// Loaded sections.
     sections: FastMap<SectionPos, SectionState>,
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
-    /// token that produced them (re-validated at the moment of upload).
-    section_upload_queue: VecDeque<(SectionPos, pipeline::ClaimToken, [SectionMeshData; 4])>,
+    /// token that produced them (re-validated at the moment of upload) and the
+    /// vertex-byte charge computed at queue time.
+    section_upload_queue:
+        VecDeque<(SectionPos, pipeline::ClaimToken, usize, Box<SectionMeshData>)>,
+    /// Last engine `mesh_stats().live_slots` sampled at `stream`. Zero until
+    /// the first stream (tests without a GPU).
+    gpu_live_slots: u32,
+    /// CPU-cull live-count ceiling (`mesh_stats().cpu_cull_max`, else 1024).
+    /// Cost knob for the engine's GPU cull dispatch; the far lane's section
+    /// budget is [`sections_allowed`](Self::sections_allowed), not this raw value.
+    slot_ceiling: u32,
+    /// Vertex bytes uploaded for sections in the current drain (harness peak).
+    section_upload_bytes: usize,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -1028,6 +1185,12 @@ pub struct World {
     /// freshly minted token from the lane's `submit` to its `claim`.
     section_claim_seq: u64,
     section_pending_claim: Option<(SectionPos, pipeline::ClaimToken)>,
+    /// Gameplay reaction events. Ticked by the sim `reactions` system when this
+    /// instance is the authority (single-player or the dedicated server).
+    reactions: crate::sim::reactions::ReactionScheduler,
+    /// Single-player (and a hosting server) run the scheduler; a client connected
+    /// to a server does not.
+    reactions_authority: bool,
 }
 
 /// The exact inputs the desired-section frontier depends on, as cheap bit
@@ -1044,6 +1207,8 @@ struct SectionFrontierKey {
     levels: u8,
     step: u8,
     mip_ready: bool,
+    /// Far-lane section-slot budget the selection coarsens to.
+    allowed: u32,
 }
 
 impl World {
@@ -1100,7 +1265,13 @@ impl World {
         let mut registry = BlockRegistry::with_builtins();
         let generator = match kind {
             WorldgenKind::Classic => diffusion::classic(&mut registry, seed),
-            WorldgenKind::Diffusion => diffusion::diffusion(&mut registry, seed, field),
+            WorldgenKind::Diffusion => {
+                if field.version >= 2 {
+                    diffusion::diffusion_v2(&mut registry, seed, field)
+                } else {
+                    diffusion::diffusion(&mut registry, seed, field)
+                }
+            }
         };
         // The section ladder's innermost ring begins where the full-res box ends,
         // so its `unit` is the render distance in metres.
@@ -1143,11 +1314,13 @@ impl World {
                 ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
             ),
             light_seed_inserts: 0,
+            light_seed_split: LightSeedSplit::default(),
             light_admitted: 0,
             light_admitted_last: 0,
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
+            remesh_stats: streaming::RemeshStats::default(),
             light_terminal: FastSet::default(),
             mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
@@ -1155,7 +1328,11 @@ impl World {
             textures_built: 0,
             texture_cache: Vec::new(),
             uploaded_len: 0,
+            appearance_revision: 0,
+            appearance_gpu: false,
+            gpu_descs_uploaded: false,
             texture_layer_cap: u16::MAX,
+            texture_cap_from_device: false,
             ao: true,
             tables_epoch: 0,
             occlusion: Occlusion::default(),
@@ -1184,6 +1361,9 @@ impl World {
             section_mip_rx: None,
             sections: FastMap::default(),
             section_upload_queue: VecDeque::new(),
+            gpu_live_slots: 0,
+            slot_ceiling: CPU_CULL_MAX,
+            section_upload_bytes: 0,
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_edit_rev: FastMap::default(),
@@ -1202,6 +1382,8 @@ impl World {
             section_epoch: 0,
             section_claim_seq: 0,
             section_pending_claim: None,
+            reactions: crate::sim::reactions::ReactionScheduler::new(),
+            reactions_authority: true,
         };
         if pregenerate_origin {
             // Centre the pre-generated box on the origin's surface chunk, the
@@ -1588,7 +1770,7 @@ impl World {
             };
         }
         self.occlusion_topo_dirty.take();
-        self.last_occlusion_rebuild = Some(Instant::now());
+        self.last_occlusion_rebuild = Some(crate::sched::now());
         let Some(origin) = self.center else {
             return Progress::Idle;
         };
@@ -2110,6 +2292,8 @@ impl StreamLane for MeshLane {
             }
         };
         world.mark_degraded(key, degraded);
+        let nhood_quiet = world.light_nhood_quiet(key);
+        world.remesh_stats.note_mesh_job(key, nhood_quiet);
         // Set the building flag IN PLACE to claim the mesh job — a whole-state
         // overwrite would silently drop a carried `prev` mesh (leaking its GPU
         // handle and blanking the chunk mid-rebuild). Held until upload retires
@@ -2196,6 +2380,12 @@ impl StreamLane for SectionLane {
     fn in_flight(world: &World, key: SectionPos) -> bool {
         world.sections.contains_key(&key)
     }
+    fn ready(world: &World, _key: SectionPos) -> bool {
+        // Section slots only. Near-field chunks never consume this budget;
+        // a large view must not starve covering. In-flight claims and the
+        // upload queue land as slots, so they count now.
+        world.section_budget_used() < world.sections_allowed()
+    }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
         world.refresh_tables();
         // Mint the claim token here; `claim` (which always follows an accepted
@@ -2251,7 +2441,10 @@ impl StreamLane for SectionLane {
                 && matches!(world.sections.get(&pos),
                     Some(SectionState::Meshing { token: t }) if *t == token);
             if live {
-                world.section_upload_queue.push_back((pos, token, meshes));
+                let bytes = streaming::section_output_bytes(&meshes);
+                world
+                    .section_upload_queue
+                    .push_back((pos, token, bytes, meshes));
             }
         }
     }
@@ -2285,6 +2478,8 @@ impl StreamLane for LightLane {
         world.light_inflight.contains(&key)
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+        // `trivial_light` is decided at store time. A worklist seed here is a
+        // real re-settle (neighbour border / edit) and must run the flood.
         if !world.lighting
             || !world.chunks.contains_key(&key)
             || world

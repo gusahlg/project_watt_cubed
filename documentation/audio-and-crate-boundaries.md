@@ -50,9 +50,11 @@ Two dependencies must be corrected before extraction:
   acoustic snapshot vocabulary to a neutral leaf, or let a game-side adapter
   build it from a generic world occupancy query. `world` must not depend on the
   output system consuming the snapshot.
-- [`audio/palette.rs`](../src/audio/palette.rs) imports the block
-  `SoundClass`. Either move that stable value type into the domain/content
-  layer, or hand audio an audio-neutral material key.
+- [`audio/palette.rs`](../src/audio/palette.rs) imports block `SoundClass`.
+  That enum is a presentation of `Observation` (`SoundClass::of` in
+  [`block/registry.rs`](../src/block/registry.rs)): hardness, liquid, and
+  transparency — not authored per-element stats. Either keep the class next
+  to observations in content, or hand audio an audio-neutral material key.
 
 Settings may still produce an audio mix at the client composition root, but a
 future audio runtime should not know about `Settings`.
@@ -89,7 +91,7 @@ watt-tools  --> client, never the reverse
 | Working crate | Owns | Must not own |
 | --- | --- | --- |
 | `watt-domain` | coordinates, stable IDs, portable pose/stance values, bounded primitive codec | renderer types, devices, app state |
-| `watt-content` | elements, compositions, canonical block specs, content fingerprint, placement and deterministic world generation | GPU tables and resident meshes |
+| `watt-content` | law, configurations, encodings, observations, content fingerprint, region placement and deterministic world generation | GPU tables and resident meshes |
 | `watt-protocol` | message schema and pure encode/decode | QUIC endpoints, client interpolation, server authority |
 | `watt-save` | save document, codec, salvage, slot/store policy | `World`, `Player`, mods, renderer |
 | `watt-audio` | catalog, acoustic kernel, runtime mixer, capture/voice decode, backend | `World`, network connection, console, settings |
@@ -153,10 +155,9 @@ Do not move files mechanically until these upward dependencies are removed:
 - [`ident`](../src/ident/mod.rs) imports both `BlockId` and the renderer's
   `Detail`.
 - [`block/registry.rs`](../src/block/registry.rs) stores renderer `Color` and
-  `Pass` alongside semantic and physical block facts.
-- [`macros.rs`](../src/macros.rs) hardcodes both block paths and
-  `voxel_engine::Color`; the built-in content macros should move with content
-  and emit domain values.
+  `Pass` alongside interned configurations and observed hot tables.
+- [`macros.rs`](../src/macros.rs) still mixes content paths with
+  `voxel_engine::Color`; built-in content should emit domain values.
 - [`world/generation.rs`](../src/world/generation.rs) returns the runtime
   `ChunkData`. A neutral generated volume/cell sink, or a lower-level chunk
   value, is needed before worldgen can stand alone.

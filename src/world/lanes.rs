@@ -129,13 +129,18 @@ stream_lanes! {
     /// engine.
     occlusion: new OcclusionLane("occlusion", Budget::Millis(0.5))
         => |ctx, b| {
-            let eng = eng(&mut ctx.eng, "occlusion patches masks; eng required");
+            let Some(eng) = ctx.eng.as_deref_mut() else {
+                return Progress::Idle;
+            };
             ctx.world.rebuild_occlusion(eng, b)
         },
     /// Synchronous remesh of edited (`Dirty`) chunks (`World::remesh_dirty`).
     /// Uploads through the engine, so it needs `ctx.eng`.
     dirty_remesh: new DirtyRemeshLane("dirty_remesh", Budget::Dispatches(super::DIRTY_BUDGET as u16))
         => |ctx, _b| {
+            if !ctx.world.dirty_pending() {
+                return Progress::Idle;
+            }
             let eng = eng(&mut ctx.eng, "dirty-remesh is a CPU lane; eng required");
             ctx.world.remesh_dirty(eng)
         },

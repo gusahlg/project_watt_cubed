@@ -4,12 +4,10 @@
 //! matters on headless CI: a missing audio device must not let corrupt packaged
 //! assets pass validation merely because there is nowhere to play them.
 
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use voxel_engine::DVec3;
-use kira::sound::static_sound::StaticSoundData;
 
 use super::{Backend, BackendVoice, ClipId, ClipStore, StoredClip};
 use crate::audio::acoustics::{Dsp, Listener};
@@ -27,11 +25,10 @@ impl NullBackend {
 
 impl ClipStore for NullBackend {
     fn store(&mut self, bytes: &[u8]) -> Result<StoredClip, String> {
-        let data = StaticSoundData::from_cursor(Cursor::new(bytes.to_vec()))
-            .map_err(|error| format!("clip decode: {error:?}"))?;
+        let (_data, duration_s) = super::decode_static(bytes)?;
         let stored = StoredClip {
             id: ClipId(self.next_clip),
-            duration_s: data.duration().as_secs_f32(),
+            duration_s,
         };
         self.next_clip = self
             .next_clip

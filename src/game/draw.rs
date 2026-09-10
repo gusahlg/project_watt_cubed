@@ -1,14 +1,12 @@
 //! Frame composition, world rendering, and HUD presentation for the live game.
-use std::time::Instant;
-
-use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Vec2};
+use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, SkyDesc, Vec2};
 
 use super::Game;
 use crate::avatar::Pose;
 use crate::camera::ViewPose;
 use crate::console;
 use crate::derived::Memo;
-use crate::harness::DebugView;
+use super::{DebugView, SKY_KEY, TERRAIN_KEY};
 use crate::interact;
 use crate::mods::Mods;
 use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility};
@@ -29,6 +27,10 @@ pub(super) struct DrawState {
     fps_refresh: RateGate,
     online_cache: Memo<(usize, Option<u32>), String>,
     peer_scratch: Vec<PeerDraw>,
+    /// Last sky descriptor pushed to the engine; skip `set_sky` while equal.
+    last_sky: Option<SkyDesc>,
+    /// Last composed frame uniforms handed to `begin_3d`.
+    last_uniforms: Option<voxel_engine::skeleton::FrameUniformsGpu>,
 }
 
 impl DrawState {
@@ -43,6 +45,8 @@ impl DrawState {
             fps_refresh: RateGate::from_hz(4),
             online_cache: Memo::new(),
             peer_scratch: Vec::new(),
+            last_sky: None,
+            last_uniforms: None,
         }
     }
 }
@@ -125,7 +129,7 @@ impl Game {
             .camera_cache
             .get_or(camera_key, || pose.camera3d());
 
-        self.refresh_hud_text(eng, dt);
+        self.refresh_hud_text(eng.fps(), dt);
         let screen = (eng.screen_width(), eng.screen_height());
 
         // `dt` steps each peer's animator (body-yaw follow, stance blend, swing).
@@ -218,6 +222,11 @@ impl Game {
             frame_uniforms.anim[1] = anim_uv[0];
             frame_uniforms.anim[2] = anim_uv[1];
         }
+        if self.drawing.last_uniforms != Some(frame_uniforms) {
+            self.drawing.last_uniforms = Some(frame_uniforms);
+            #[cfg(test)]
+            crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
+        }
 
         // TerrainKey: flat terrain, sky/fog disabled, magenta clear for the
         // sky-hole detector. Normal: real clear, no debug flat.
@@ -229,8 +238,8 @@ impl Game {
             // Pure-magenta endpoints (255/0) decode identically under sRGB and raw
             // normalize, so the sky-hole detector's HDR key value is unchanged.
             DebugView::TerrainKey => (
-                crate::harness::SKY_KEY.to_linear(),
-                Some(crate::harness::TERRAIN_KEY),
+                SKY_KEY.to_linear(),
+                Some(TERRAIN_KEY),
             ),
         };
 
@@ -249,7 +258,7 @@ impl Game {
 
     /// Refresh the cached HUD strings (coordinates, FPS, players-online) only
     /// when their displayed value changes — and not at all below Full HUD.
-    fn refresh_hud_text(&mut self, eng: &Engine, dt: f32) {
+    fn refresh_hud_text(&mut self, fps: i32, dt: f32) {
         if !self.theme.hud.shows_info() {
             return;
         }
@@ -272,7 +281,6 @@ impl Game {
             self.drawing.fps_cache.get_or(-1, || "-- FPS".to_string());
         } else if self.drawing.fps_refresh.steps(dt) != 0 || self.drawing.fps_cache.get().is_none()
         {
-            let fps = eng.fps();
             self.drawing
                 .fps_cache
                 .get_or(fps, || format!("{fps:2} FPS"));
@@ -312,7 +320,7 @@ impl Game {
             f3.set_debug_flat(scene.debug_flat);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
-                self.sky.draw(&mut f3, scene.sky_frame);
+                self.sky.draw(&mut f3, scene.sky_frame, &mut self.drawing.last_sky);
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
             self.world.render(&mut f3, pose.eye);
@@ -442,6 +450,78 @@ impl Game {
         }
     }
 
+    /// Lighting + HUD string caches for a headless quiet frame (no Engine).
+    #[cfg(test)]
+    pub(super) fn compose_quiet(&mut self, mods: &mut Mods) {
+        const DT: f32 = 1.0 / 60.0;
+        self.refresh_hud_text(0, DT);
+        let pose = self.camera.pose(&self.player, &self.world, 90.0, 0.0);
+        let sky_day = if self.render.day_night {
+            (self.sky.clock.day() * 4096.0).round() / 4096.0
+        } else {
+            0.5
+        };
+        let sky_frame = {
+            let sky = &self.sky;
+            *self
+                .drawing
+                .sky_frame_cache
+                .get_or(sky_day.to_bits(), || sky.frame_at_day(sky_day))
+        };
+        let uv_key = [pose.eye.x.to_bits(), pose.eye.z.to_bits()];
+        let anim_uv = *self
+            .drawing
+            .anim_uv_cache
+            .get_or(uv_key, || crate::frame_snapshot::animation_uv(pose.eye));
+        let cacheable = !self.render.weather
+            && !self.render.clouds
+            && !self.render.water_anim
+            && !self.render.exposure;
+        if cacheable {
+            let key = (sky_day.to_bits(), self.content_rev.0);
+            let uniforms = {
+                let sky = &self.sky;
+                let render = &self.render;
+                let cached = self.drawing.static_frame_cache.get_or(key, || {
+                    let snapshot = crate::frame_snapshot::compose_at(
+                        sky,
+                        sky_frame,
+                        pose.eye,
+                        anim_uv,
+                        voxel_engine::skeleton::Exposure::DEFAULT,
+                        render,
+                    );
+                    StaticFrame {
+                        uniforms: voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
+                        clear: sky.clear_at(sky_frame),
+                    }
+                });
+                let mut uniforms = cached.uniforms;
+                uniforms.anim[1] = anim_uv[0];
+                uniforms.anim[2] = anim_uv[1];
+                uniforms
+            };
+            if self.drawing.last_uniforms != Some(uniforms) {
+                self.drawing.last_uniforms = Some(uniforms);
+                crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
+            }
+        }
+        let desc = self.sky.desc(sky_frame);
+        if self.drawing.last_sky != Some(desc) {
+            self.drawing.last_sky = Some(desc);
+            crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SetSky);
+        }
+        if self.mod_hud && self.theme.hud.shows_mod_hud() {
+            self.hud_scratch.clear();
+            mods.hud(
+                &self.world,
+                &self.player,
+                (1280, 720),
+                &mut self.hud_scratch,
+            );
+        }
+    }
+
     /// Build the per-frame draw data for other players. `&mut self` because
     /// animator state advances here. Disabled models skip animator and rig
     /// composition entirely; disabled tags skip projection, occlusion
@@ -466,7 +546,9 @@ impl Game {
         let world = &self.world;
         let eye = pose.eye;
         let forward = pose.forward();
-        let now = Instant::now();
+        let now = crate::sched::now();
+        let screen_w = eng.screen_width() as f32;
+        let screen_h = eng.screen_height() as f32;
         // Outside interest range there is no live pose: drawing the last
         // heard one would freeze a ghost in place.
         for peer in net.peers_mut().filter(|peer| peer.visible()) {
@@ -488,17 +570,7 @@ impl Game {
             let tag = if want_tags {
                 let head = feet.0 + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
                 let to_head = head - eye;
-                let visibility = tag_visibility(to_head, forward, |dist| {
-                    interact::raycast(world, eye, to_head / dist, (dist - 0.5).max(0.0)).is_some()
-                });
-                match visibility {
-                    TagVisibility::Hidden => None,
-                    TagVisibility::Visible { alpha } => Some(PeerTag {
-                        screen: eng.world_to_screen(to_head.as_vec3(), camera),
-                        alpha,
-                        name: peer.name.clone(),
-                    }),
-                }
+                tag_draw(world, eye, forward, to_head, camera, screen_w, screen_h, dt, peer)
             } else {
                 None
             };
@@ -534,18 +606,60 @@ struct PeerTag {
     name: std::sync::Arc<str>,
 }
 
+/// Distance if the tag is in front and inside range; `None` is a cheap reject.
+fn tag_candidate(to_head: DVec3, forward: DVec3) -> Option<f64> {
+    let distance = to_head.length();
+    if !(to_head.dot(forward) > 0.0 && distance > 1e-6)
+        || matches!(TagVisibility::of(distance, false), TagVisibility::Hidden)
+    {
+        return None;
+    }
+    Some(distance)
+}
+
+/// Screen-space reject before the occlusion raycast.
+fn tag_on_screen(screen: Vec2, w: f32, h: f32) -> bool {
+    screen.x >= 0.0 && screen.y >= 0.0 && screen.x <= w && screen.y <= h
+}
+
+fn tag_draw(
+    world: &crate::world::World,
+    eye: DVec3,
+    forward: DVec3,
+    to_head: DVec3,
+    camera: &Camera3D,
+    screen_w: f32,
+    screen_h: f32,
+    dt: f32,
+    peer: &mut crate::net::client::RemotePlayer,
+) -> Option<PeerTag> {
+    let distance = tag_candidate(to_head, forward)?;
+    let screen = voxel_engine::world_to_screen(to_head.as_vec3(), camera, screen_w, screen_h);
+    if !tag_on_screen(screen, screen_w, screen_h) {
+        return None;
+    }
+    let occluded = peer.cached_tag_occlusion(dt, || {
+        interact::raycast(world, eye, to_head / distance, (distance - 0.5).max(0.0)).is_some()
+    });
+    match TagVisibility::of(distance, occluded) {
+        TagVisibility::Hidden => None,
+        TagVisibility::Visible { alpha } => Some(PeerTag {
+            screen,
+            alpha,
+            name: peer.name.clone(),
+        }),
+    }
+}
+
 /// Reject tags by direction and distance before querying terrain occlusion.
 fn tag_visibility(
     to_head: DVec3,
     forward: DVec3,
     occluded: impl FnOnce(f64) -> bool,
 ) -> TagVisibility {
-    let distance = to_head.length();
-    if !(to_head.dot(forward) > 0.0 && distance > 1e-6)
-        || matches!(TagVisibility::of(distance, false), TagVisibility::Hidden)
-    {
+    let Some(distance) = tag_candidate(to_head, forward) else {
         return TagVisibility::Hidden;
-    }
+    };
     TagVisibility::of(distance, occluded(distance))
 }
 
@@ -608,5 +722,16 @@ mod tests {
                 assert_eq!(queries, 1);
             }
         }
+    }
+
+    #[test]
+    fn off_screen_tags_are_rejected_by_bounds() {
+        assert!(!tag_on_screen(Vec2::new(-1.0, 10.0), 100.0, 100.0));
+        assert!(!tag_on_screen(Vec2::new(10.0, -1.0), 100.0, 100.0));
+        assert!(!tag_on_screen(Vec2::new(101.0, 10.0), 100.0, 100.0));
+        assert!(!tag_on_screen(Vec2::new(10.0, 101.0), 100.0, 100.0));
+        assert!(tag_on_screen(Vec2::new(0.0, 0.0), 100.0, 100.0));
+        assert!(tag_on_screen(Vec2::new(100.0, 100.0), 100.0, 100.0));
+        assert!(tag_on_screen(Vec2::new(50.0, 50.0), 100.0, 100.0));
     }
 }

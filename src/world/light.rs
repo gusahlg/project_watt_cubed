@@ -1,6 +1,7 @@
 //! Cross-chunk lighting (v2.1). A [`LightGrid`] holds skylight and blocklight
 //! (each `0..=15`) for every cell of one chunk: `Uniform` when every cell
-//! agrees (open sky, solid rock), else a dense 16³ box. It is computed by [`propagate`]
+//! agrees (open sky, solid rock), else a dense 16³ box of packed bytes
+//! (`sky << 4 | block`, 4 KiB). It is computed by [`propagate`]
 //! as a function of the chunk's own voxels, its six neighbour face light layers
 //! ([`FaceShell`]), and the column ceiling ([`CeilingWindow`], the skylight
 //! source). Settling is *decoupled* from meshing: a cheap main-thread
@@ -79,21 +80,74 @@ pub struct Lumel {
 impl Lumel {
     pub const DARK: Self = Self { sky: LightLevel::DARK, block: LightLevel::DARK };
     pub const FULL: Self = Self { sky: LightLevel::FULL, block: LightLevel::FULL };
+
+    /// Dense-grid storage byte: `sky << 4 | block`.
+    #[inline]
+    pub const fn pack(self) -> u8 {
+        (self.sky.get() << 4) | self.block.get()
+    }
+
+    /// Inverse of [`pack`](Self::pack).
+    #[inline]
+    pub const fn unpack(b: u8) -> Self {
+        Self { sky: LightLevel::new(b >> 4), block: LightLevel::new(b & 0x0f) }
+    }
+}
+
+/// Packed lumel byte (`sky << 4 | block`). Dense [`LightGrid`], [`FaceShell`],
+/// and [`PaddedLight`] storage; [`Lumel`] is decoded at the public read boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::world) struct PackedLumel(u8);
+
+impl PackedLumel {
+    const DARK: Self = Self(0);
+    const FULL: Self = Self((MAX_LIGHT << 4) | MAX_LIGHT);
+    const OPEN_SKY: Self = Self(MAX_LIGHT << 4);
+
+    #[inline]
+    const fn pack(l: Lumel) -> Self {
+        Self(l.pack())
+    }
+
+    #[inline]
+    const fn unpack(self) -> Lumel {
+        Lumel::unpack(self.0)
+    }
+
+    #[inline]
+    const fn sky(self) -> u8 {
+        self.0 >> 4
+    }
+
+    #[inline]
+    const fn block(self) -> u8 {
+        self.0 & 0x0f
+    }
+
+    #[inline]
+    const fn with_sky(self, sky: u8) -> Self {
+        Self((sky << 4) | (self.0 & 0x0f))
+    }
+
+    #[inline]
+    const fn with_block(self, block: u8) -> Self {
+        Self((self.0 & 0xf0) | block)
+    }
 }
 
 /// Per-cell light for one chunk. Compared for equality to detect settlement fixpoint.
-/// Two representations: one lumel when every cell agrees, else a dense 16³ box.
+/// Two representations: one lumel when every cell agrees, else a dense packed 16³ box.
 pub struct LightGrid(Repr);
 
 enum Repr {
     Uniform(Lumel),
-    Cells(Box<[Lumel; CHUNK_VOLUME]>),
+    Cells(Box<[PackedLumel; CHUNK_VOLUME]>),
 }
 
 const _: () = assert!(std::mem::size_of::<LightGrid>() <= 16);
 
-/// Heap-allocate a filled cell box without staging the 8 KiB array on the stack.
-fn alloc_cells(fill: Lumel) -> Box<[Lumel; CHUNK_VOLUME]> {
+/// Heap-allocate a filled cell box without staging the 4 KiB array on the stack.
+fn alloc_cells(fill: PackedLumel) -> Box<[PackedLumel; CHUNK_VOLUME]> {
     vec![fill; CHUNK_VOLUME].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!())
 }
 
@@ -124,21 +178,26 @@ impl LightGrid {
         match &self.0 {
             Repr::Uniform(v) => v.block.get() > 1,
             Repr::Cells(cells) => Face::ALL.iter().any(|&face| {
-                FACE_INDEX[face as usize].iter().any(|&i| cells[i].block.get() > 1)
+                FACE_INDEX[face as usize].iter().any(|&i| cells[i].block() > 1)
             }),
         }
     }
 
     #[inline]
-    pub fn at(&self, idx: usize) -> Lumel {
+    fn packed_at(&self, idx: usize) -> PackedLumel {
         match &self.0 {
-            Repr::Uniform(v) => *v,
+            Repr::Uniform(v) => PackedLumel::pack(*v),
             Repr::Cells(c) => c[idx],
         }
     }
+
+    #[inline]
+    pub fn at(&self, idx: usize) -> Lumel {
+        self.packed_at(idx).unpack()
+    }
     #[cfg(test)]
     #[inline]
-    fn set(&mut self, idx: usize, v: Lumel) {
+    pub(in crate::world) fn set(&mut self, idx: usize, v: Lumel) {
         match &self.0 {
             Repr::Cells(_) => {}
             Repr::Uniform(u) if *u == v => return,
@@ -147,7 +206,7 @@ impl LightGrid {
             }
         }
         match &mut self.0 {
-            Repr::Cells(c) => c[idx] = v,
+            Repr::Cells(c) => c[idx] = PackedLumel::pack(v),
             Repr::Uniform(_) => unreachable!(),
         }
     }
@@ -155,10 +214,10 @@ impl LightGrid {
     /// one contiguous slice copy (the shell capture's bulk read). Uniform
     /// grids fill the row without a cell loop.
     #[inline]
-    pub fn copy_row(&self, y: usize, z: usize, out: &mut [Lumel]) {
+    pub(in crate::world) fn copy_row(&self, y: usize, z: usize, out: &mut [PackedLumel]) {
         debug_assert_eq!(out.len(), CHUNK_SIZE);
         match &self.0 {
-            Repr::Uniform(v) => out.fill(*v),
+            Repr::Uniform(v) => out.fill(PackedLumel::pack(*v)),
             Repr::Cells(cells) => {
                 let base = Chunk::index(0, y, z);
                 out.copy_from_slice(&cells[base..base + CHUNK_SIZE]);
@@ -168,10 +227,10 @@ impl LightGrid {
 
     /// Near-border layer of `face` (0 for Pos, 15 for Neg) into a 16×16 face buffer.
     /// Uniform fills once; Y/Z faces copy 16 x-rows; X is strided.
-    fn copy_face(&self, face: Face, out: &mut [Lumel]) {
+    fn copy_face(&self, face: Face, out: &mut [PackedLumel]) {
         debug_assert_eq!(out.len(), CHUNK_AREA);
         match &self.0 {
-            Repr::Uniform(v) => out.fill(*v),
+            Repr::Uniform(v) => out.fill(PackedLumel::pack(*v)),
             Repr::Cells(cells) => {
                 let n = FaceShell::near_layer(face);
                 match face {
@@ -203,10 +262,10 @@ impl LightGrid {
 
     /// Densify in place and return the cell slice. Uniform expands to a filled box.
     #[cfg(test)]
-    fn make_dense(&mut self) -> &mut [Lumel] {
+    fn make_dense(&mut self) -> &mut [PackedLumel] {
         if let Repr::Uniform(v) = &self.0 {
-            let v = *v;
-            self.0 = Repr::Cells(alloc_cells(v));
+            let p = PackedLumel::pack(*v);
+            self.0 = Repr::Cells(alloc_cells(p));
         }
         match &mut self.0 {
             Repr::Cells(c) => &mut c[..],
@@ -220,7 +279,7 @@ impl LightGrid {
     pub fn to_dense(&self) -> Self {
         match &self.0 {
             Repr::Cells(c) => Self(Repr::Cells(c.clone())),
-            Repr::Uniform(v) => Self(Repr::Cells(alloc_cells(*v))),
+            Repr::Uniform(v) => Self(Repr::Cells(alloc_cells(PackedLumel::pack(*v)))),
         }
     }
 
@@ -245,7 +304,8 @@ impl PartialEq for LightGrid {
             (Repr::Uniform(a), Repr::Uniform(b)) => a == b,
             (Repr::Cells(a), Repr::Cells(b)) => **a == **b,
             (Repr::Uniform(v), Repr::Cells(c)) | (Repr::Cells(c), Repr::Uniform(v)) => {
-                c.iter().all(|cell| cell == v)
+                let p = PackedLumel::pack(*v);
+                c.iter().all(|&cell| cell == p)
             }
         }
     }
@@ -258,7 +318,7 @@ impl Eq for LightGrid {}
 /// light instantiation of [`Neighborhood`]: capture/index/pooling live there,
 /// shared with the mesh pass's [`Padded`](super::mesh::Padded).
 pub struct PaddedLight {
-    inner: Neighborhood<Lumel>,
+    inner: Neighborhood<PackedLumel>,
 }
 
 impl PaddedLight {
@@ -266,24 +326,24 @@ impl PaddedLight {
     #[cfg(test)]
     #[inline]
     pub(in crate::world) fn at(&self, x: i32, y: i32, z: i32) -> Lumel {
-        self.inner.at(x, y, z)
+        self.inner.at(x, y, z).unpack()
     }
 
     /// Flat-index read (same [`padded_index`](super::neighborhood::padded_index)
     /// layout as [`Padded`](super::mesh::Padded)) — the sweep's stride walk.
     #[inline]
     pub(in crate::world) fn at_flat(&self, i: usize) -> Lumel {
-        self.inner.at_flat(i)
+        self.inner.at_flat(i).unpack()
     }
 
     /// An all-dark shell (no neighbour light anywhere) — the neutral settle path.
     pub fn dark() -> Self {
-        Self { inner: Neighborhood::filled(Lumel::DARK) }
+        Self { inner: Neighborhood::filled(PackedLumel::DARK) }
     }
 
     /// An all-full-bright shell — the neutral mesher path (tests).
     pub fn full() -> Self {
-        Self { inner: Neighborhood::filled(Lumel::FULL) }
+        Self { inner: Neighborhood::filled(PackedLumel::FULL) }
     }
 
     /// Full skylight, no blocklight — the shell equivalent of
@@ -291,27 +351,29 @@ impl PaddedLight {
     /// surface approximations open to the sky with no emitters, so their shading
     /// tracks day/night via skylight instead of clamping to a fake full emitter.
     pub fn open_sky() -> Self {
-        Self { inner: Neighborhood::filled(Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }) }
+        Self { inner: Neighborhood::filled(PackedLumel::OPEN_SKY) }
     }
 
     /// A shell filled from a per-cell closure over signed coords `-1..=16` — for
     /// exercising the mesher's smooth-light sampling with a known field.
     #[cfg(test)]
     pub fn from_fn(f: impl Fn(i32, i32, i32) -> Lumel) -> Self {
-        Self { inner: Neighborhood::from_fn(f, Lumel::DARK) }
+        Self {
+            inner: Neighborhood::from_fn(|x, y, z| PackedLumel::pack(f(x, y, z)), PackedLumel::DARK),
+        }
     }
 
     /// Copy the chunk and its shell out of the light field. `grid_at(dx, dy, dz)`
     /// yields the [`LightGrid`] at chunk-offset `(dx, dy, dz)` (each `∈ -1..=1`,
     /// `(0,0,0)` is the chunk itself), or `None` (→ dark). Mirrors
     /// [`Padded::capture`](super::mesh::Padded::capture) cell-for-cell; the
-    /// bulk fills through [`LightGrid::copy_row`]'s contiguous slice copies.
+    /// bulk fills through [`LightGrid::copy_row`]'s contiguous packed-byte copies.
     pub fn capture<'a>(grid_at: impl Fn(i32, i32, i32) -> Option<&'a LightGrid>) -> Self {
         Self {
             inner: Neighborhood::capture_rows(
-                Lumel::DARK,
+                PackedLumel::DARK,
                 grid_at,
-                |g: &LightGrid, lx, ly, lz| g.at(Chunk::index(lx, ly, lz)),
+                |g: &LightGrid, lx, ly, lz| g.packed_at(Chunk::index(lx, ly, lz)),
                 |g: &LightGrid, ly, lz, out| g.copy_row(ly, lz, out),
             ),
         }
@@ -322,7 +384,7 @@ impl PaddedLight {
 /// Six neighbour-light face layers (16x16 each) that settle reads. Interior
 /// floods locally; borders come from here.
 pub struct FaceShell {
-    faces: [[Lumel; CHUNK_AREA]; 6], // indexed by Face as usize; near layer of each face neighbour
+    faces: [[PackedLumel; CHUNK_AREA]; 6], // indexed by Face as usize; near layer of each face neighbour
 }
 
 impl FaceShell {
@@ -338,7 +400,7 @@ impl FaceShell {
     /// Capture light grids from neighbours (or None for dark). Reads the near
     /// border layer of each neighbour.
     pub fn capture<'a>(grid_at: impl Fn(Face) -> Option<&'a LightGrid>) -> Self {
-        let mut faces = [[Lumel::DARK; CHUNK_AREA]; 6];
+        let mut faces = [[PackedLumel::DARK; CHUNK_AREA]; 6];
         for face in Face::ALL {
             let Some(g) = grid_at(face) else { continue };
             g.copy_face(face, &mut faces[face as usize]);
@@ -350,12 +412,12 @@ impl FaceShell {
     #[cfg(test)]
     #[inline]
     pub(in crate::world) fn at(&self, face: Face, a: usize, b: usize) -> Lumel {
-        self.faces[face as usize][a + b * CHUNK_SIZE]
+        self.faces[face as usize][a + b * CHUNK_SIZE].unpack()
     }
 
     /// All-dark shell (no neighbours).
     pub fn dark() -> Self {
-        Self { faces: [[Lumel::DARK; CHUNK_AREA]; 6] }
+        Self { faces: [[PackedLumel::DARK; CHUNK_AREA]; 6] }
     }
 }
 
@@ -419,29 +481,25 @@ impl CeilingWindow {
     }
 }
 
-/// Reusable flood scratch for [`propagate`]: the two per-channel level grids and
-/// the BFS frontier. Held thread-local so a worker's repeated `propagate` calls
-/// reuse one allocation each instead of allocating two `CHUNK_VOLUME` boxes and a
+/// Reusable flood scratch for [`propagate`]: the packed working grid and the
+/// BFS frontier. Held thread-local so a worker's repeated `propagate` calls
+/// reuse one allocation each instead of allocating a `CHUNK_VOLUME` box and a
 /// growing `VecDeque` per job (the light-settle churn). Never shared or sent
 /// across threads (borrowed only for the duration of one `propagate` call), so it
 /// is sound to key on the calling worker.
 struct FloodScratch {
-    sky: Vec<LightLevel>,
-    block: Vec<LightLevel>,
     queue: VecDeque<usize>,
-    /// Dense lumel box recycled across `propagate` calls on this thread.
+    /// Dense packed box recycled across `propagate` calls on this thread.
     /// Moved into the output grid when the flood stays dense.
-    cells: Option<Box<[Lumel; CHUNK_VOLUME]>>,
+    cells: Option<Box<[PackedLumel; CHUNK_VOLUME]>>,
     /// Blocklight shell seeds applied after emitters so the queue is
     /// emitters then faces.
-    shell_block: Vec<(usize, LightLevel)>,
+    shell_block: Vec<(usize, u8)>,
 }
 
 thread_local! {
     static FLOOD: RefCell<FloodScratch> = const {
         RefCell::new(FloodScratch {
-            sky: Vec::new(),
-            block: Vec::new(),
             queue: VecDeque::new(),
             cells: None,
             shell_block: Vec::new(),
@@ -449,21 +507,8 @@ thread_local! {
     };
 }
 
-/// Reset a channel grid to the all-dark initial state (every unseeded cell must
-/// read `DARK`), sizing it on first use. `fill` reuses the existing allocation
-/// when the length already matches — the common (post-warmup) case.
-fn reset_dark(v: &mut Vec<LightLevel>) {
-    if v.len() != CHUNK_VOLUME {
-        v.clear();
-        v.resize(CHUNK_VOLUME, LightLevel::DARK);
-    } else {
-        v.fill(LightLevel::DARK);
-    }
-}
-
 /// Recompute chunk light from scratch. Light removal needs no second pass:
 /// breaking emitters or placing blocks just lowers the grid. `world_y0` is chunk's Y origin.
-#[allow(clippy::needless_range_loop)] // `i` is the flood-queue key and the `block[]` slot
 pub fn propagate(
     chunk: &Chunk,
     shell: &FaceShell,
@@ -481,24 +526,16 @@ pub fn propagate(
     chunk.fill_opacity(|id| tables.opaque(id), &mut opaque_bits, &mut col);
     let opaque_at = |i: usize| (opaque_bits[i >> 6] >> (i & 63)) & 1 != 0;
 
-    // Skylight: borrow thread-local scratch, reset dark, seed and flood.
-    // No stale flood state from a prior job survives. Output cells are
-    // overwritten at the end, so recycled boxes are not filled dark.
-    let (mut sky, mut block, mut queue, tls_cells, mut shell_block) = FLOOD.with_borrow_mut(|s| {
-        (
-            std::mem::take(&mut s.sky),
-            std::mem::take(&mut s.block),
-            std::mem::take(&mut s.queue),
-            s.cells.take(),
-            std::mem::take(&mut s.shell_block),
-        )
+    // Borrow thread-local scratch. Recycled cells are filled dark below so no
+    // stale flood state from a prior job survives.
+    let (mut queue, tls_cells, mut shell_block) = FLOOD.with_borrow_mut(|s| {
+        (std::mem::take(&mut s.queue), s.cells.take(), std::mem::take(&mut s.shell_block))
     });
     let (mut cells, leftover) = match std::mem::replace(&mut out.0, Repr::Uniform(Lumel::DARK)) {
         Repr::Cells(c) => (c, tls_cells),
-        Repr::Uniform(_) => (tls_cells.unwrap_or_else(|| alloc_cells(Lumel::DARK)), None),
+        Repr::Uniform(_) => (tls_cells.unwrap_or_else(|| alloc_cells(PackedLumel::DARK)), None),
     };
-    reset_dark(&mut sky);
-    reset_dark(&mut block);
+    cells.fill(PackedLumel::DARK);
     queue.clear();
     shell_block.clear();
     // Seed 1: open sky floods down each column until the first opaque voxel
@@ -516,7 +553,7 @@ pub fn propagate(
             for k in 0..n {
                 let y = CHUNK_SIZE - 1 - k;
                 let i = x + z * STRIDE_Z + y * STRIDE_Y;
-                sky[i] = LightLevel::FULL;
+                cells[i] = PackedLumel::OPEN_SKY;
                 queue.push_back(i);
             }
         }
@@ -524,8 +561,8 @@ pub fn propagate(
     // Seed 2: one 6×256 walk writes sky now and stashes blocklight for after
     // the emitter scan, so both channels share the face-index table.
     seed_from_shell(shell, |i, s| {
-        if s > sky[i] {
-            sky[i] = s;
+        if s > cells[i].sky() {
+            cells[i] = cells[i].with_sky(s);
             queue.push_back(i);
         }
     }, |i, b| {
@@ -533,15 +570,15 @@ pub fn propagate(
     });
     // Flood: -1 per step, except full skylight passes straight down (open columns stay lit).
     while let Some(i) = queue.pop_front() {
-        let level = sky[i];
+        let level = cells[i].sky();
         let (x, y, z) = Chunk::local_of(i);
         let mut relax = |ni: usize, down: bool| {
             if opaque_at(ni) {
                 return;
             }
-            let cand = if down && level == LightLevel::FULL { LightLevel::FULL } else { level.attenuated() };
-            if cand > sky[ni] {
-                sky[ni] = cand;
+            let cand = if down && level == MAX_LIGHT { MAX_LIGHT } else { level.saturating_sub(1) };
+            if cand > cells[ni].sky() {
+                cells[ni] = cells[ni].with_sky(cand);
                 queue.push_back(ni);
             }
         };
@@ -553,32 +590,33 @@ pub fn propagate(
         if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z, false); }
     }
 
-    // Blocklight: block was reset to all-dark; clear queue, seed emitters, then
+    // Blocklight: low nibble is still dark except where we write emitters, then
     // the stashed shell (emitters then faces).
     queue.clear();
     chunk.for_each_emission(&tables.emission, |i, em| {
-        block[i] = LightLevel::new(em);
+        let em = if em > MAX_LIGHT { MAX_LIGHT } else { em };
+        cells[i] = cells[i].with_block(em);
         queue.push_back(i);
     });
     for &(i, lvl) in &shell_block {
-        if lvl > block[i] {
-            block[i] = lvl;
+        if lvl > cells[i].block() {
+            cells[i] = cells[i].with_block(lvl);
             queue.push_back(i);
         }
     }
     while let Some(i) = queue.pop_front() {
-        let level = block[i];
-        if level <= LightLevel::new(1) {
+        let level = cells[i].block();
+        if level <= 1 {
             continue;
         }
-        let cand = level.attenuated();
+        let cand = level - 1;
         let (x, y, z) = Chunk::local_of(i);
         let mut relax = |ni: usize| {
             if opaque_at(ni) {
                 return;
             }
-            if cand > block[ni] {
-                block[ni] = cand;
+            if cand > cells[ni].block() {
+                cells[ni] = cells[ni].with_block(cand);
                 queue.push_back(ni);
             }
         };
@@ -590,16 +628,12 @@ pub fn propagate(
         if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z); }
     }
 
-    for i in 0..CHUNK_VOLUME {
-        cells[i] = Lumel { sky: sky[i], block: block[i] };
-    }
-
     // One linear compare after the flood — not per frame. Deep rock and open
     // sky both land here even when the voxel payload is paletted (a cave of
     // air under a closed ceiling is uniformly dark).
     let first = cells[0];
     let recycle = if cells.chunks_exact(64).all(|row| row.iter().all(|&c| c == first)) {
-        *out = LightGrid(Repr::Uniform(first));
+        *out = LightGrid(Repr::Uniform(first.unpack()));
         leftover.or(Some(cells))
     } else {
         *out = LightGrid(Repr::Cells(cells));
@@ -608,8 +642,6 @@ pub fn propagate(
 
     // Return the scratch buffers (with their capacity) for the next call.
     FLOOD.with_borrow_mut(|s| {
-        s.sky = sky;
-        s.block = block;
         s.queue = queue;
         s.cells = recycle;
         s.shell_block = shell_block;
@@ -656,8 +688,8 @@ const FACE_INDEX: [[usize; CHUNK_AREA]; 6] = face_index_table();
 /// split sky (applied now) from block (stashed until after emitters).
 fn seed_from_shell(
     shell: &FaceShell,
-    mut sky: impl FnMut(usize, LightLevel),
-    mut block: impl FnMut(usize, LightLevel),
+    mut sky: impl FnMut(usize, u8),
+    mut block: impl FnMut(usize, u8),
 ) {
     for face in Face::ALL {
         let layer = &shell.faces[face as usize];
@@ -665,20 +697,21 @@ fn seed_from_shell(
         let keep_full_sky = face == Face::PosY;
         for slot in 0..CHUNK_AREA {
             let src = layer[slot];
-            let sky_l = if keep_full_sky && src.sky == LightLevel::FULL {
-                LightLevel::FULL
+            let sky_raw = src.sky();
+            let sky_l = if keep_full_sky && sky_raw == MAX_LIGHT {
+                MAX_LIGHT
             } else {
-                src.sky.attenuated()
+                sky_raw.saturating_sub(1)
             };
-            let block_l = src.block.attenuated();
-            if sky_l == LightLevel::DARK && block_l == LightLevel::DARK {
+            let block_l = src.block().saturating_sub(1);
+            if sky_l == 0 && block_l == 0 {
                 continue;
             }
             let i = idx[slot];
-            if sky_l != LightLevel::DARK {
+            if sky_l != 0 {
                 sky(i, sky_l);
             }
-            if block_l != LightLevel::DARK {
+            if block_l != 0 {
                 block(i, block_l);
             }
         }
@@ -691,8 +724,14 @@ pub(in crate::world) fn border_changed(a: &LightGrid, b: &LightGrid, face: Face)
     let idx = &FACE_INDEX[face as usize];
     match (&a.0, &b.0) {
         (Repr::Uniform(x), Repr::Uniform(y)) => x != y,
-        (Repr::Uniform(x), Repr::Cells(c)) => idx.iter().any(|&i| c[i] != *x),
-        (Repr::Cells(c), Repr::Uniform(y)) => idx.iter().any(|&i| c[i] != *y),
+        (Repr::Uniform(x), Repr::Cells(c)) => {
+            let p = PackedLumel::pack(*x);
+            idx.iter().any(|&i| c[i] != p)
+        }
+        (Repr::Cells(c), Repr::Uniform(y)) => {
+            let p = PackedLumel::pack(*y);
+            idx.iter().any(|&i| c[i] != p)
+        }
         (Repr::Cells(ca), Repr::Cells(cb)) => idx.iter().any(|&i| ca[i] != cb[i]),
     }
 }
@@ -722,6 +761,7 @@ mod tests {
             vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
             vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
             vec![0, 0, 0, 0].into(),
+            vec![0, 1, 2, 3].into(),
         )
     }
 
@@ -742,6 +782,24 @@ mod tests {
         fnv1a_32(&bytes)
     }
 
+    #[test]
+    fn dense_grid_is_one_byte_per_cell() {
+        assert_eq!(std::mem::size_of::<PackedLumel>(), 1);
+        assert_eq!(LightGrid::dark().allocated_bytes(), 0);
+        let dense = LightGrid::open_sky().to_dense();
+        assert_eq!(dense.allocated_bytes(), CHUNK_VOLUME);
+        assert_eq!(
+            dense.at(0),
+            Lumel { sky: LightLevel::FULL, block: LightLevel::DARK }
+        );
+        for sky in 0..=MAX_LIGHT {
+            for block in 0..=MAX_LIGHT {
+                let l = Lumel { sky: LightLevel::new(sky), block: LightLevel::new(block) };
+                assert_eq!(Lumel::unpack(l.pack()), l);
+            }
+        }
+    }
+
     /// Pin `fnv1a_32` over lumel bytes of four fixed seed-42 `propagate` results.
     /// Values locked before the flood-path rewrite; a mismatch means settled
     /// light bytes moved.
@@ -752,8 +810,44 @@ mod tests {
 
         let mut registry = BlockRegistry::with_builtins();
         let generator = Terrain::new(&mut registry, 20.0, 42);
+        // The pin is the blocklight field of a cell that actually emits — not
+        // whatever the "lamp" label happens to intern (a rest-stable centre can
+        // still observe as dark). Intern a configuration and assert emission.
+        let lumin = {
+            use crate::block::regions;
+            use material::Configuration;
+            let law = *registry.law();
+            let mut found = None;
+            for r in regions::builtin(&law) {
+                let id = registry.intern(&Configuration::single(r.centre)).unwrap();
+                if registry.emission(id) >= 8 {
+                    found = Some(id);
+                    break;
+                }
+            }
+            if found.is_none() {
+                for n in 0u32..40_000 {
+                    let e = material::Element::new([
+                        n as u8,
+                        (n >> 8) as u8,
+                        (n >> 16) as u8,
+                        (n >> 24) as u8,
+                    ]);
+                    let id = registry.intern(&Configuration::single(e)).unwrap();
+                    if registry.emission(id) >= 8 {
+                        found = Some(id);
+                        break;
+                    }
+                }
+            }
+            found.expect("observe must reach glow_min for some solid element")
+        };
+        assert!(
+            registry.emission(lumin) >= 8,
+            "emissive pin block emission {}",
+            registry.emission(lumin)
+        );
         let tables = registry.hot_tables();
-        let lumin = registry.id_by_name("Lumin").expect("builtin Lumin");
 
         let pin = |chunk: &Chunk, shell: &FaceShell, ceiling: &CeilingWindow, world_y0: i32| {
             let mut grid = LightGrid::dark();
@@ -803,8 +897,8 @@ mod tests {
 
         let pins: [(&str, u32, u32); 4] = [
             ("surface", surface_hash, 0xa8c2bd42),
-            ("cave", cave_hash, 0x521a1a53),
-            ("emissive", emissive_hash, 0xe87c04cc),
+            ("cave", cave_hash, 0xbcc31dc5),
+            ("emissive", emissive_hash, 0x63b9ebf0),
             ("air", air_hash, 0x19839265),
         ];
         for (name, got, want) in pins {
@@ -1020,7 +1114,7 @@ mod tests {
         let before = world.capture_ceiling(lower_coord);
         assert!(before.open_above(8, 8, ROOF_Y), "fixture starts open to sky");
 
-        let stone = world.registry().id_by_name("Stone").expect("builtin Stone");
+        let stone = world.registry().id_by_label("rock").expect("builtin Stone");
         for z in 0..CS {
             for x in 0..CS {
                 world.set_block(x, ROOF_Y, z, stone);

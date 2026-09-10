@@ -140,8 +140,9 @@ impl Mod for InfiniteDiffusionMod {
         Some((1, self.cfg.to_text()))
     }
 
-    fn load_state(&mut self, _version: u16, data: &str, _world: &mut World) {
+    fn load_state(&mut self, _version: u16, data: &str, _world: &mut World) -> u32 {
         self.apply_cfg_text(data);
+        0
     }
 
     fn save_choice_state(&self) -> Option<String> {

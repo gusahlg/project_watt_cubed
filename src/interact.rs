@@ -155,7 +155,7 @@ mod tests {
         let mut world = World::generate();
         let (x, y, z) = (8, 40, 8);
         world.ensure_around(DVec3::new(x as f64, y as f64, z as f64));
-        let water = world.registry().id_by_name("Water").unwrap();
+        let water = world.registry().id_by_label("water").expect("water region");
         world.set_block(x, y, z, water);
         world.set_block(x, y + 1, z, crate::block::AIR);
         let origin = DVec3::new(x as f64 + 0.5, y as f64 + 1.5, z as f64 + 0.5);
@@ -199,5 +199,23 @@ mod tests {
             .expect("slanted far ray hits");
         assert!(world.is_obstacle(hit.block.0, hit.block.1, hit.block.2));
         assert!(!world.is_obstacle(hit.previous.0, hit.previous.1, hit.previous.2));
+    }
+
+    #[test]
+    fn breaking_a_block_yields_its_configuration() {
+        let mut world = World::generate();
+        world.ensure_around(DVec3::new(8.5, 20.0, 8.5));
+        let (x, z) = (8, 8);
+        let y = (0..96)
+            .rev()
+            .find(|&y| world.is_solid(x, y, z))
+            .expect("a solid cell near spawn");
+        let id = world.block_at(x, y, z);
+        assert_ne!(id, crate::block::AIR);
+        world.set_block(x, y, z, crate::block::AIR);
+        let mut stash = crate::stash::ElementStash::new(10);
+        assert!(stash.add(id, 1));
+        assert_eq!(stash.count(id), 1);
+        assert_eq!(world.block_at(x, y, z), crate::block::AIR);
     }
 }

@@ -416,9 +416,10 @@ mod tests {
     /// The generator plus the registry-resolved ids its terrain is made of.
     fn hills(seed: i64) -> (Terrain, BlockId, BlockId) {
         let mut registry = BlockRegistry::with_builtins();
-        let stone = registry.id_by_name("Stone").unwrap();
-        let dirt = registry.id_by_name("Soil").unwrap();
-        (Terrain::new(&mut registry, 20.0, seed), stone, dirt)
+        let g = Terrain::new(&mut registry, 20.0, seed);
+        let stone = g.mat.stone_strata[0];
+        let dirt = registry.id_by_label("soil").unwrap();
+        (g, stone, dirt)
     }
 
     #[test]
@@ -443,13 +444,14 @@ mod tests {
 
     #[test]
     fn uniform_promotes_to_paletted_on_first_differing_write() {
-        let (g, stone, _) = hills(7);
+        let (g, _, _) = hills(7);
         // Deep rock — but caves can hollow deep chunks now, so scan along +z
         // for one the generator still proves (or collapses) to uniform stone.
         let mut chunk = (0..64)
             .map(|cz| Chunk::new(0, -10, cz, &g))
-            .find(|c| c.uniform() == Some(stone))
+            .find(|c| c.uniform().is_some_and(|id| g.mat.stone_strata.contains(&id)))
             .expect("a cave-free deep chunk within 64 along +z");
+        let stone = chunk.uniform().unwrap();
 
         // Writing the same block keeps the cheap representation.
         chunk.set_local(0, 0, 0, stone);
@@ -469,11 +471,12 @@ mod tests {
 
     #[test]
     fn mixed_chunk_recompacts_to_uniform_when_edited_back() {
-        let (g, stone, _) = hills(7);
+        let (g, _, _) = hills(7);
         let mut chunk = (0..64)
             .map(|cz| Chunk::new(0, -10, cz, &g))
-            .find(|c| c.uniform() == Some(stone))
+            .find(|c| c.uniform().is_some_and(|id| g.mat.stone_strata.contains(&id)))
             .expect("a cave-free deep chunk within 64 along +z");
+        let stone = chunk.uniform().unwrap();
 
         // Dig a hole: promotes to paletted.
         chunk.set_local(8, 8, 8, AIR);

@@ -187,7 +187,6 @@ struct GpuInfo {
     driver_info: Option<String>,
     driver_id: i32,
     local_memory_bytes: u64,
-    available_device_bytes: Option<u64>,
     max_msaa: u32,
     engine_candidate: bool,
     likely_used: bool,
@@ -248,10 +247,6 @@ impl GpuInfo {
                 "device_local_memory_bytes",
                 Json::from(self.local_memory_bytes),
             ),
-            (
-                "available_device_bytes",
-                Json::optional_u64(self.available_device_bytes),
-            ),
             ("engine_candidate", Json::from(self.engine_candidate)),
             ("likely_used", Json::from(self.likely_used)),
         ])
@@ -282,7 +277,6 @@ fn probe_vulkan() -> Result<GpuProbe, String> {
                 .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
                 .map(|heap| heap.size)
                 .sum();
-            let available_device_bytes = available_device_local_bytes(&instance, pd, &memory);
             let max_msaa = max_sample_count(
                 properties.limits.framebuffer_color_sample_counts
                     & properties.limits.framebuffer_depth_sample_counts,
@@ -298,7 +292,6 @@ fn probe_vulkan() -> Result<GpuProbe, String> {
                 driver_info: c_char_string(&driver.driver_info),
                 driver_id: driver.driver_id.as_raw(),
                 local_memory_bytes,
-                available_device_bytes,
                 max_msaa,
                 engine_candidate,
                 likely_used: false,
@@ -380,72 +373,6 @@ fn engine_feature_candidate(instance: &ash::Instance, pd: vk::PhysicalDevice, ap
     graphics && has(ash::khr::swapchain::NAME) && has(ash::khr::push_descriptor::NAME)
 }
 
-fn device_has_extension(instance: &ash::Instance, pd: vk::PhysicalDevice, wanted: &CStr) -> bool {
-    let Ok(extensions) = (unsafe { instance.enumerate_device_extension_properties(pd) }) else {
-        return false;
-    };
-    extensions.iter().any(|ext| {
-        ext.extension_name_as_c_str()
-            .is_ok_and(|name| name == wanted)
-    })
-}
-
-/// Live free device-local bytes (`heapBudget - heapUsage`) when
-/// `VK_EXT_memory_budget` is supported. A throwaway logical device enables
-/// the extension so the query is defined; if create fails the properties2
-/// query still runs (NVIDIA/Mesa fill it from the physical device).
-fn available_device_local_bytes(
-    instance: &ash::Instance,
-    pd: vk::PhysicalDevice,
-    memory: &vk::PhysicalDeviceMemoryProperties,
-) -> Option<u64> {
-    if !device_has_extension(instance, pd, ash::ext::memory_budget::NAME) {
-        return None;
-    }
-    let dummy = dummy_device_with_memory_budget(instance, pd);
-    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut mem2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-    unsafe { instance.get_physical_device_memory_properties2(pd, &mut mem2) };
-    if let Some(device) = dummy {
-        unsafe { device.destroy_device(None) };
-    }
-    let mut available = 0u64;
-    let mut any_local = false;
-    for i in 0..memory.memory_heap_count as usize {
-        if !memory.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        {
-            continue;
-        }
-        any_local = true;
-        available =
-            available.saturating_add(budget.heap_budget[i].saturating_sub(budget.heap_usage[i]));
-    }
-    any_local.then_some(available)
-}
-
-fn dummy_device_with_memory_budget(
-    instance: &ash::Instance,
-    pd: vk::PhysicalDevice,
-) -> Option<ash::Device> {
-    let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-    let family = families.iter().position(|q| {
-        q.queue_flags.intersects(
-            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
-        )
-    })?;
-    let priorities = [0.0f32];
-    let queue_infos = [vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(family as u32)
-        .queue_priorities(&priorities)];
-    let extension_names = [ash::ext::memory_budget::NAME.as_ptr()];
-    let create_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(&queue_infos)
-        .enabled_extension_names(&extension_names);
-    unsafe { instance.create_device(pd, &create_info, None) }.ok()
-}
-
 fn c_char_string<const N: usize>(raw: &[std::ffi::c_char; N]) -> Option<String> {
     let value = unsafe { CStr::from_ptr(raw.as_ptr()) }
         .to_string_lossy()
@@ -467,9 +394,9 @@ fn max_sample_count(flags: vk::SampleCountFlags) -> u32 {
     1
 }
 
-/// Device-local heap, live free bytes (`VK_EXT_memory_budget`), framebuffer
-/// MSAA ceiling, and the largest connected display — the startup VRAM guard's
-/// one probe (same Vulkan path as the benchmark report).
+/// Device-local heap size, framebuffer MSAA ceiling, and the largest connected
+/// display — the pre-window VRAM guard. Live `VK_EXT_memory_budget` numbers
+/// come from [`voxel_engine::Engine::gpu_caps`] once the window exists.
 pub(crate) fn graphics_caps() -> (crate::render_config::DeviceCaps, (u32, u32)) {
     let gpu = GpuProbe::collect();
     let chosen = gpu
@@ -485,7 +412,7 @@ pub(crate) fn graphics_caps() -> (crate::render_config::DeviceCaps, (u32, u32)) 
         .or_else(|| gpu.devices.iter().max_by_key(|d| d.local_memory_bytes));
     let caps = crate::render_config::DeviceCaps {
         device_local_memory_bytes: chosen.map(|d| d.local_memory_bytes),
-        available_device_bytes: chosen.and_then(|d| d.available_device_bytes),
+        available_device_bytes: None,
         max_msaa: chosen.map(|d| d.max_msaa).unwrap_or(8),
     };
     (caps, largest_display_extent())

@@ -9,7 +9,6 @@
 //! command testable without a window.
 use voxel_engine::DVec3;
 
-use crate::block::Composition;
 use crate::math::{WORLD_BORDER, block_coord};
 use crate::mods::{annotate_setting, VisualMask};
 use crate::player::Player;
@@ -63,6 +62,7 @@ commands! {
     "tp" | "teleport" | "setpos", "  tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
     "pos" | "where", "  pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
     "inspect" | "look", "  inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
+    "reactions", "  reactions            show pending reaction events" => reactions(world);
     "gfx" | "graphics", "  gfx [setting value]  show or change graphics settings" => gfx(args, settings, visuals);
     "time", "  time [set|length]    show or set the day/night clock" => time(args, sky);
     "walkspeed", "  walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
@@ -71,6 +71,7 @@ commands! {
     "deafen", "  deafen               toggle hearing incoming voice" => deafen(settings);
     "audio" | "volume", "  audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
     "voicetest", "  voicetest            play a local voice test cue" => voicetest();
+    "name", "  name <n> <text>      name a recorded crafting procedure" => rejected(vec!["name: no procedure journal (is the crafting mod enabled?)".to_string()]);
     "help" | "?", "  help                 show this list" => help();
 }
 
@@ -342,60 +343,43 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let (x, y, z) = cell;
     let id = world.block_at(x, y, z);
     let registry = world.registry();
-    let block = registry.block(id);
-
-    let mut out = vec![
-        format!("block at {x} {y} {z}: {} (#{}) ", block.name, id.0),
-        format!("  made of: {}", describe_composition(world, &block.composition)),
-    ];
-
-    let c = &block.core;
-    out.push(format!(
-        "  durability {}  hardness {}  density {}",
-        c.durability, c.hardness, c.density
-    ));
-    out.push(format!(
-        "  conductivity {}  thermal {}  friction {}",
-        c.conductivity, c.thermal_conductivity, c.friction
-    ));
-    out.push(format!(
-        "  temp-resist {}  light {}  transparency {}%  buoyancy {}",
-        c.temperature_resistance, c.light_emission, c.transparency, c.buoyancy
-    ));
-
-    if !block.specials.is_empty() {
-        let specials: Vec<String> = block
-            .specials
-            .iter()
-            .map(|(kind, strength)| format!("{kind:?} {strength}"))
-            .collect();
-        out.push(format!("  special: {}", specials.join(", ")));
-    }
-    for reaction in &block.reactions {
-        out.push(format!(
-            "  reaction: {} (strength {})",
-            reaction.name, reaction.strength
-        ));
-    }
-    shown(out)
+    let cfg = registry.configuration(id);
+    let obs = registry.observation(id);
+    let label = registry.label(id).unwrap_or("unknown material");
+    let elems: Vec<String> = cfg
+        .elements()
+        .iter()
+        .map(|e| format!("[{},{},{},{}]", e.0[0], e.0[1], e.0[2], e.0[3]))
+        .collect();
+    let made = if elems.is_empty() {
+        "void".to_string()
+    } else {
+        elems.join(" + ")
+    };
+    shown(vec![
+        format!("block at {x} {y} {z}: {label} (#{}) ", id.0),
+        format!("  made of: {made}"),
+        format!(
+            "  solid {}  liquid {}  transparency {}  emission {}",
+            obs.solid as u8, obs.liquid as u8, obs.transparency, obs.emission
+        ),
+        format!(
+            "  hardness {}  friction {}  flow {}",
+            obs.hardness, obs.friction, obs.flow
+        ),
+        format!("  descriptor {}", registry.render_layer(id)),
+    ])
 }
 
-fn describe_composition(world: &World, composition: &Composition) -> String {
-    let elements = world.registry().elements();
-    match composition {
-        Composition::Natural(els) if els.is_empty() => "nothing (air)".to_string(),
-        Composition::Natural(els) => els
-            .iter()
-            .map(|&e| elements.get(e).name.to_string())
-            .collect::<Vec<_>>()
-            .join(" + "),
-        Composition::Mixture(mix) => mix
-            .parts()
-            .iter()
-            .map(|&(e, p)| format!("{}% {}", p, elements.get(e).name))
-            .collect::<Vec<_>>()
-            .join(", "),
-    }
+/// `/reactions` — pending queue, generations run, mutations committed.
+fn reactions(world: &World) -> Vec<Line> {
+    let r = world.reactions();
+    shown(vec![format!(
+        "reactions: pending={} generations={} mutations={}",
+        r.pending(),
+        r.generations,
+        r.mutations
+    )])
 }
 
 /// Format a position the same way the on-screen coordinate readout does.
@@ -437,6 +421,7 @@ mod tests {
              tp <x> <y> <z>       teleport to coordinates\n  \
              pos                  show current coordinates\n  \
              inspect [x y z]      describe a block's elements & properties\n  \
+             reactions            show pending reaction events\n  \
              gfx [setting value]  show or change graphics settings\n  \
              time [set|length]    show or set the day/night clock\n  \
              walkspeed [n]        show or set ground walk speed\n  \
@@ -445,6 +430,7 @@ mod tests {
              deafen               toggle hearing incoming voice\n  \
              audio <chan> <0-100> set master/effects/voice volume\n  \
              voicetest            play a local voice test cue\n  \
+             name <n> <text>      name a recorded crafting procedure\n  \
              help                 show this list"
         );
     }
@@ -527,13 +513,13 @@ mod tests {
     #[test]
     fn inspect_reports_elements_and_properties() {
         let (mut p, mut w) = (player(), world());
-        // Deep underground is stone: a single Stone element with stone's properties.
+        // Deep underground is rock: a labelled configuration with observation readings.
         let out = run("inspect 8 0 8", &mut p, &mut w);
         let text = joined(&out);
-        assert!(text.contains("Stone"), "should name the block: {text}");
-        assert!(text.contains("made of: Stone"), "should list elements: {text}");
-        assert!(text.contains("density"), "should show core properties: {text}");
-        assert!(text.contains("buoyancy"), "should show every core property: {text}");
+        assert!(text.contains("rock"), "should name the block: {text}");
+        assert!(text.contains("made of:"), "should list elements: {text}");
+        assert!(text.contains("hardness"), "should show observation readings: {text}");
+        assert!(text.contains("descriptor"), "should show the render descriptor: {text}");
     }
 
     #[test]
@@ -541,6 +527,13 @@ mod tests {
         let (mut p, mut w) = (player(), world());
         let out = run("inspect 8 60 8", &mut p, &mut w);
         assert!(joined(&out).contains("air"));
+    }
+
+    #[test]
+    fn reactions_prints_pending_generations_mutations() {
+        let (mut p, mut w) = (player(), world());
+        let out = run("reactions", &mut p, &mut w);
+        assert_eq!(joined(&out), "reactions: pending=0 generations=0 mutations=0");
     }
 
     #[test]

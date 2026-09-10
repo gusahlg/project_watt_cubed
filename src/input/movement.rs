@@ -437,7 +437,7 @@ mod tests {
     fn player_on_runway(world: &mut World, x: f64, z: f64) -> Player {
         let floor_y = 40;
         world.ensure_around(DVec3::new(x, floor_y as f64, z));
-        let stone = world.registry().id_by_name("Stone").unwrap();
+        let stone = world.registry().id_by_label("rock").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
         for dx in -2..=14 {
             for dz in -2..=2 {
@@ -520,7 +520,7 @@ mod tests {
         let (x, z) = (0.5, 0.5);
         let floor_y = 40; // above the hills, below the island band: open air
         world.ensure_around(DVec3::new(x, floor_y as f64, z));
-        let stone = world.registry().id_by_name("Stone").unwrap();
+        let stone = world.registry().id_by_label("rock").unwrap();
         let (bx, bz) = (block_coord(x), block_coord(z));
 
         // Feet start 158 blocks up: freefall reaches terminal velocity after

@@ -13,6 +13,7 @@ pub mod diffusion;
 pub mod inventory;
 pub mod menu_default;
 pub mod start_screen;
+pub mod textures;
 pub mod visuals;
 
 use std::cell::Cell;
@@ -20,14 +21,16 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use crate::block::ElementId;
+use crate::block::appearance::{BlockAppearance, FLAT};
+use crate::block::BlockId;
 use crate::menu::start::{StartFacts, StartScreen};
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
 use crate::settings::Settings;
-use crate::ui::HudElement;
+use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
@@ -149,12 +152,37 @@ pub struct ModContext<'a> {
     pub toggle_crafting: bool,
     pub nav_up: bool,
     pub nav_down: bool,
+    pub nav_left: bool,
+    pub nav_right: bool,
+    pub nav_tab: bool,
     pub nav_confirm: bool,
+    /// True when a server owns evaluation; the crafting mod queues [`crafts`]
+    /// instead of applying `interact` locally.
+    pub networked: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
     /// drains these after `mods.update` and applies each only if the cell is air
     /// and doesn't overlap the player — mods that spend resources on a placement
     /// should pre-check the same so their accounting stays exact.
     pub placements: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
+    /// Workbench applies to send; the server evaluates and replies with the result spec.
+    pub crafts: Vec<CraftRequest>,
+}
+
+/// One workbench apply the client asks the server to evaluate.
+pub struct CraftRequest {
+    pub origin_spec: Arc<str>,
+    pub target_spec: Arc<str>,
+    pub event: u8,
+    pub repeat: u8,
+}
+
+impl ModContext<'_> {
+    /// Queue a material event at `pos` for the reaction scheduler. Machines emit
+    /// through this hook; chunk load/gen/mesh/save never do. No-op on a client
+    /// connected to a server (the authority runs the scheduler).
+    pub fn emit_material_event(&mut self, pos: (i32, i32, i32), kind: material::EventKind) {
+        self.world.push_material_event(pos, kind);
+    }
 }
 
 /// A unit of layered-on functionality. Every method has a default, so a mod
@@ -165,7 +193,7 @@ pub struct ModContext<'a> {
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
 ///   `on_place_rejected`. `hud` uses the same order as z-order (later draws on top).
 /// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` (first `true`),
-///   `worldgen`, `worldgen_config`.
+///   `worldgen`, `worldgen_config`, `appearance`.
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
@@ -205,24 +233,44 @@ pub trait Mod {
         let _ = ctx;
     }
 
-    /// A block was broken into these elements. The core has already deposited
-    /// them into the player stash; this is a notification. `overflow` is true
-    /// when the stash dropped any of them (capacity).
-    fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
-        let _ = (elements, world, overflow);
+    /// A block was broken into this configuration. The core has already deposited
+    /// it into the player stash; this is a notification. `overflow` is true
+    /// when the stash dropped it (capacity).
+    fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
+        let _ = (id, world, overflow);
     }
 
     /// The server rejected a break this client predicted (someone else won the
     /// cell). The core has already revoked the loot from the stash; this is a
     /// notification.
-    fn on_break_rejected(&mut self, elements: &[ElementId]) {
-        let _ = elements;
+    fn on_break_rejected(&mut self, id: BlockId) {
+        let _ = id;
     }
 
     /// The server rejected a placement this client predicted: refund whatever
     /// was spent on placing a block of `id`.
     fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
         let _ = (id, world);
+    }
+
+    /// Authoritative workbench result. The client intern/consume/adds `result_spec`
+    /// and must not re-evaluate the law.
+    fn on_craft_result(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: u8,
+        repeat: u8,
+        result_spec: &str,
+        world: &mut World,
+    ) {
+        let _ = (origin_spec, target_spec, event, repeat, result_spec, world);
+    }
+
+    /// First enabled mod that returns `Some` handles the console command.
+    fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        let _ = (cmd, args);
+        None
     }
 
     /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
@@ -264,9 +312,11 @@ pub trait Mod {
 
     /// Restore state produced by [`save_state`](Self::save_state). `version` is
     /// 0 when the on-disk string had no prefix (old saves). `world` is mutable
-    /// because restoring may need to re-register blocks.
-    fn load_state(&mut self, version: u16, data: &str, world: &mut World) {
+    /// because restoring may need to re-register blocks. Returns how many
+    /// holdings were dropped as unknown specs.
+    fn load_state(&mut self, version: u16, data: &str, world: &mut World) -> u32 {
         let _ = (version, data, world);
+        0
     }
 
     /// Which fancy render group this mod owns, if any.
@@ -300,6 +350,13 @@ pub trait Mod {
     /// Opaque payload for the winning [`worldgen`] kind. `None` if this mod
     /// does not replace worldgen. InfiniteDiffusion parses it as its knobs.
     fn worldgen_config(&self) -> Option<String> {
+        None
+    }
+
+    /// Optional block appearance. First enabled mod that returns `Some` wins;
+    /// [`FlatAppearance`](crate::block::appearance::FlatAppearance) is used
+    /// when every enabled mod returns `None`.
+    fn appearance(&self) -> Option<&dyn BlockAppearance> {
         None
     }
 }
@@ -346,9 +403,23 @@ impl Mods {
         mods.install(Box::new(visuals::AtmosphereMod), true);
         mods.install(Box::new(visuals::PostMod), true);
         mods.install(Box::new(visuals::LightingMod), true);
+        mods.install(
+            Box::new(textures::procedural::ProceduralTexturesMod::new()),
+            true,
+        );
         // Worldgen swap: off so classic noise remains the default substrate.
         mods.install(Box::new(diffusion::InfiniteDiffusionMod::new()), false);
+        // GPU descriptors replace the CPU generator; off so ARRAY_LAYER (the
+        // engine default) stays bit-identical to a table that was never set.
+        mods.install(Box::new(textures::gpu::GpuMaterialsMod::new()), false);
         mods
+    }
+
+    /// No mods installed. Appearance is [`FLAT`].
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Install a mod, running its enable hook if it starts on.
@@ -382,18 +453,46 @@ impl Mods {
     }
 
     /// Fan a block-break event out to every enabled mod.
-    pub fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
-        self.each_enabled(|m| m.on_block_break(elements, world, overflow));
+    pub fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
+        self.each_enabled(|m| m.on_block_break(id, world, overflow));
     }
 
     /// Fan a rejected-break rollback out to every enabled mod.
-    pub fn on_break_rejected(&mut self, elements: &[ElementId]) {
-        self.each_enabled(|m| m.on_break_rejected(elements));
+    pub fn on_break_rejected(&mut self, id: BlockId) {
+        self.each_enabled(|m| m.on_break_rejected(id));
     }
 
     /// Fan a rejected-placement refund out to every enabled mod.
     pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
         self.each_enabled(|m| m.on_place_rejected(id, world));
+    }
+
+    /// Fan an authoritative workbench result out to every enabled mod.
+    pub fn on_craft_result(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: u8,
+        repeat: u8,
+        result_spec: &str,
+        world: &mut World,
+    ) {
+        self.each_enabled(|m| {
+            m.on_craft_result(origin_spec, target_spec, event, repeat, result_spec, world)
+        });
+    }
+
+    /// First enabled mod that handles `cmd` wins.
+    pub fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        for entry in &mut self.entries {
+            if !entry.enabled {
+                continue;
+            }
+            if let Some(out) = entry.module.command(cmd, args) {
+                return Some(out);
+            }
+        }
+        None
     }
 
     /// Push every enabled mod's HUD contribution into `out`, in install order
@@ -518,6 +617,15 @@ impl Mods {
             .map(|e| &*e.module)
     }
 
+    /// First enabled appearance mod, or the core flat fallback.
+    pub fn appearance(&self) -> &dyn BlockAppearance {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.appearance())
+            .unwrap_or(&FLAT)
+    }
+
     pub fn visual_mask(&self) -> VisualMask {
         let mut mask = VisualMask {
             atmosphere: false,
@@ -593,11 +701,13 @@ impl Mods {
     }
 
     /// Restore a mod's state by id, or by display name for old saves.
-    pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) {
+    /// Returns how many holdings that mod dropped as unknown specs.
+    pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) -> u32 {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.module.id() == name || e.module.name() == name) {
             let (version, payload) = split_mod_version(data);
-            entry.module.load_state(version, payload, world);
+            return entry.module.load_state(version, payload, world);
         }
+        0
     }
 
     /// `id=on|off` lines, plus `id.state=<payload>` for mods that persist knobs.
@@ -621,21 +731,16 @@ impl Mods {
     /// Apply `id=on|off` and `id.state=` lines. Unknown ids and malformed lines
     /// are ignored; missing keys keep the current defaults.
     pub fn apply_choices_text(&mut self, text: &str) {
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let value = value.trim();
+        crate::settings::each_kv_line(text, |key, value| {
             if let Some(id) = key.strip_suffix(".state") {
                 self.apply_choice_state(id.trim(), value);
-                continue;
+                return;
             }
             let Some(on) = crate::settings::parse_toggle(value) else {
-                continue;
+                return;
             };
             self.set_enabled(key, on);
-        }
+        });
     }
 
     fn apply_choice_state(&mut self, id: &str, data: &str) {
@@ -667,10 +772,7 @@ impl Mods {
     }
 
     fn save_choices_to(&self, path: &Path) -> io::Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        crate::save::write_atomic(path, self.choices_text().as_bytes())
+        crate::save::write_atomic_file(path, self.choices_text().as_bytes())
     }
 }
 
@@ -826,7 +928,9 @@ mod tests {
     fn save_states_key_by_id_and_load_accepts_display_name() {
         let mut world = World::new(1);
         let mut mods = Mods::with_defaults();
-        mods.load_state("Crafting", "*IronVein=2", &mut world);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let spec = world.registry().spec(rock);
+        mods.load_state("Crafting", &format!("*{spec}=2"), &mut world);
         let saved = mods.save_states(&world);
         assert!(
             saved.iter().any(|(k, _)| k == "crafting"),
@@ -866,7 +970,9 @@ mod tests {
     fn mod_state_round_trips_version_prefix() {
         let mut world = World::new(1);
         let mut mods = Mods::with_defaults();
-        mods.load_state("Crafting", "*IronVein=2", &mut world);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let spec = world.registry().spec(rock);
+        mods.load_state("Crafting", &format!("*{spec}=2"), &mut world);
         let saved = mods.save_states(&world);
         assert!(
             saved.iter().all(|(k, _)| k != "inventory"),
@@ -877,7 +983,7 @@ mod tests {
             .find(|(k, _)| k == "crafting")
             .map(|(_, d)| d.as_str())
             .expect("crafting");
-        assert_eq!(craft, "v1;*Stone+Iron=2");
+        assert_eq!(craft, format!("v1;*{spec}=2"));
 
         let mut fresh = Mods::with_defaults();
         for (k, v) in &saved {
@@ -885,16 +991,15 @@ mod tests {
         }
         assert_eq!(fresh.save_states(&world), saved);
 
-        // Unprefixed display-name key is version 0 and still migrates veins.
         let mut legacy = Mods::with_defaults();
-        legacy.load_state("Crafting", "*IronVein=1", &mut world);
+        legacy.load_state("Crafting", &format!("*{spec}=1"), &mut world);
         let craft = legacy
             .save_states(&world)
             .into_iter()
             .find(|(k, _)| k == "crafting")
             .map(|(_, d)| d)
             .expect("crafting");
-        assert_eq!(craft, "v1;*Stone+Iron=1");
+        assert_eq!(craft, format!("v1;*{spec}=1"));
     }
 
     fn index_of(mods: &Mods, id: &str) -> usize {
@@ -904,12 +1009,7 @@ mod tests {
     }
 
     fn temp_choices_path() -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "watt-mods-{}-{}.cfg",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+        crate::save::store::test_temp_path("mods").with_extension("cfg")
     }
 
     #[test]
@@ -923,8 +1023,11 @@ mod tests {
         assert!(defaults.contains("atmosphere=on"));
         assert!(defaults.contains("post=on"));
         assert!(defaults.contains("lighting=on"));
+        assert!(defaults.contains("procedural_textures=on"));
+        assert!(defaults.contains("procedural_textures.state=grain=1.00,contrast=1.00"));
         assert!(defaults.contains("diffusion=off"));
         assert!(defaults.contains("diffusion.state=tile=32,stride=16,phases=2,relief=1.00"));
+        assert!(defaults.contains("gpu_materials=off"));
 
         mods.set_enabled("lighting", false);
         mods.set_enabled("diffusion", true);
@@ -1070,10 +1173,15 @@ mod tests {
                 "atmosphere",
                 "post",
                 "lighting",
+                "procedural_textures",
                 "diffusion"
             ]
         );
-        assert_eq!(members.len(), mods.len(), "no ungrouped built-ins");
+        let ungrouped: Vec<&str> = (0..mods.len())
+            .filter(|&i| mods.group(i).is_empty())
+            .map(|i| mods.id(i))
+            .collect();
+        assert_eq!(ungrouped, ["gpu_materials"]);
     }
 
     #[test]
@@ -1090,6 +1198,7 @@ mod tests {
             "atmosphere",
             "post",
             "lighting",
+            "procedural_textures",
             "diffusion",
         ] {
             assert!(
@@ -1120,6 +1229,7 @@ mod tests {
             "atmosphere",
             "post",
             "lighting",
+            "procedural_textures",
             "diffusion",
         ] {
             assert!(

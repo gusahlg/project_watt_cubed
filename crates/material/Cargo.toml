@@ -1,0 +1,8 @@
+[package]
+name = "material"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Emergent material model: resource-lattice elements, configurations, the universal interaction law, probes and presentation. Pure, integer-only, deterministic."
+
+[dependencies]

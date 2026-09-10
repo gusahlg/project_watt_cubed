@@ -211,7 +211,7 @@ pub(in crate::world) enum Done {
         pos: SectionPos,
         epoch: u32,
         token: ClaimToken,
-        meshes: [SectionMeshData; 4],
+        meshes: Box<SectionMeshData>,
     },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
     /// and apply the bounded retry/quarantine policy — without this, a single
@@ -228,8 +228,8 @@ pub(in crate::world) enum Done {
     Cancelled(Box<[JobKey]>),
 }
 
-// Keep the result channel payload small: the largest variant should be the
-// `Section` mesh array, not an inlined per-chunk mesh (see structural
+// Keep the result channel payload small: the largest variant should be a
+// boxed section mesh, not an inlined per-chunk mesh (see structural
 // opportunity #8 — this was 544 B with `ChunkMeshData` inline).
 const _: () = assert!(size_of::<Done>() <= 128);
 
@@ -527,11 +527,11 @@ pub struct Deadline(Instant);
 impl Deadline {
     /// A deadline `budget` from now.
     pub fn from_budget(budget: Duration) -> Deadline {
-        Deadline(Instant::now() + budget)
+        Deadline(crate::sched::now() + budget)
     }
     #[must_use]
     pub fn expired(self) -> bool {
-        Instant::now() >= self.0
+        crate::sched::now() >= self.0
     }
 }
 
@@ -1165,7 +1165,7 @@ fn run(job: Job) -> Done {
             tables,
         } => {
             // Fused extract+mesh on owned data: the generator samples straight
-            // into the dense quadrant grid — no RLE brick storage is built for
+            // into the dense section grid — no RLE brick storage is built for
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
@@ -1174,7 +1174,7 @@ fn run(job: Job) -> Done {
                 pos,
                 epoch,
                 token,
-                meshes,
+                meshes: Box::new(meshes),
             }
         }
         #[cfg(test)]
@@ -1667,7 +1667,7 @@ mod tests {
         const PASSES: u32 = 200;
 
         fn populate(world: &mut World, rh: i32, rv: i32, needs_mesh: bool) {
-            let stone = world.registry.id_by_name("Stone").unwrap();
+            let stone = world.registry.id_by_label("rock").unwrap();
             let chunk = Arc::new(Chunk::from_data(0, 0, 0, ChunkData::Uniform(stone)));
             for x in -rh..=rh {
                 for z in -rh..=rh {
@@ -1687,7 +1687,9 @@ mod tests {
                                 visible: true,
                                 light: None,
                                 has_blocklight: false,
+                                light_reseed: false,
                                 light_gen: 0,
+                                mesh_hash: None,
                             },
                         );
                     }
