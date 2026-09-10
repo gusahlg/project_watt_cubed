@@ -1034,19 +1034,19 @@ mod tests {
 
         let mut hud1 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud1);
-        let text1 = hud_text(&hud1);
+        let text1 = crate::ui::hud_text(&hud1);
         assert!(!crafting.refresh(&player.stash), "no stash change: rows stay");
         assert_eq!(crafting.held, held);
         let mut hud2 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud2);
-        assert_eq!(hud_text(&hud2), text1, "HUD cache is reused until a stash/pouch mutation");
+        assert_eq!(crate::ui::hud_text(&hud2), text1, "HUD cache is reused until a stash/pouch mutation");
 
         player.stash.add(soil, 1);
         assert!(crafting.refresh(&player.stash));
         assert_eq!(crafting.held, vec![rock, soil]);
         let mut hud3 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud3);
-        assert_ne!(hud_text(&hud3), text1, "a stash mutation rebuilds the held rows");
+        assert_ne!(crate::ui::hud_text(&hud3), text1, "a stash mutation rebuilds the held rows");
 
         crafting.cursor = usize::MAX;
         assert!(player.stash.consume(rock, 2), "spend the rock stack");
@@ -1318,22 +1318,4 @@ mod tests {
         assert_eq!(crafting.pouch.count(rid), 1);
     }
 
-    fn hud_text(elements: &[HudElement]) -> String {
-        let mut out = String::new();
-        for el in elements {
-            match el {
-                HudElement::Label { text, .. } => {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-                HudElement::Panel(panel) => {
-                    for row in panel.header.iter().chain(panel.rows.iter()) {
-                        out.push_str(&row.text);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-        out
-    }
 }

@@ -13,6 +13,8 @@ thread_local! {
     static UNIFORMS: Cell<u32> = const { Cell::new(0) };
     static SETTINGS_APPLY: Cell<u32> = const { Cell::new(0) };
     static TEX_LAYERS: Cell<u32> = const { Cell::new(0) };
+    static CELL_READS: Cell<u64> = const { Cell::new(0) };
+    static CELL_WRITES: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Allocations since the last [`reset`].
@@ -33,6 +35,28 @@ pub fn reset() {
     UNIFORMS.with(|c| c.set(0));
     SETTINGS_APPLY.with(|c| c.set(0));
     TEX_LAYERS.with(|c| c.set(0));
+    CELL_READS.with(|c| c.set(0));
+    CELL_WRITES.with(|c| c.set(0));
+}
+
+/// A `CellStore::block_at` on a loaded world (scheduler → chunk).
+pub fn note_cell_read() {
+    CELL_READS.with(|c| c.set(c.get() + 1));
+}
+
+/// A `CellStore::set_block` on a loaded world (scheduler → chunk).
+pub fn note_cell_write() {
+    CELL_WRITES.with(|c| c.set(c.get() + 1));
+}
+
+/// Chunk reads since the last [`reset`].
+pub fn cell_reads() -> u64 {
+    CELL_READS.with(Cell::get)
+}
+
+/// Chunk writes since the last [`reset`].
+pub fn cell_writes() -> u64 {
+    CELL_WRITES.with(Cell::get)
 }
 
 fn bump(layout: Layout) {

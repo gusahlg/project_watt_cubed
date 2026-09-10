@@ -194,7 +194,6 @@ impl Mod for InventoryMod {
 mod tests {
     use super::*;
     use crate::mods::Mods;
-    use crate::ui::HudElement;
     use voxel_engine::DVec3;
 
     #[test]
@@ -245,14 +244,14 @@ mod tests {
         let mut hidden = Vec::new();
         mods.hud(&world, &player, (800, 600), &mut hidden);
         assert!(
-            !hud_text(&hidden).contains("rock"),
+            !crate::ui::hud_text(&hidden).contains("rock"),
             "disabled inventory must not present the list"
         );
 
         mods.set_enabled("inventory", true);
         let mut shown = Vec::new();
         mods.hud(&world, &player, (800, 600), &mut shown);
-        let text = hud_text(&shown);
+        let text = crate::ui::hud_text(&shown);
         assert!(
             text.contains("2x rock"),
             "re-enabled HUD lists the held rock: {text}"
@@ -289,7 +288,7 @@ mod tests {
         let inventory = InventoryMod::new(Rc::new(Cell::new(ItemUiState::default())));
         let mut shown = Vec::new();
         inventory.hud(&world, &player, (800, 600), &mut shown);
-        let text = hud_text(&shown);
+        let text = crate::ui::hud_text(&shown);
         assert!(
             text.contains(&format!("1x {}-like", rock.label)),
             "near an unlabelled centre reads as -like: {text}"
@@ -305,22 +304,4 @@ mod tests {
         }
     }
 
-    fn hud_text(elements: &[HudElement]) -> String {
-        let mut out = String::new();
-        for el in elements {
-            match el {
-                HudElement::Label { text, .. } => {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-                HudElement::Panel(panel) => {
-                    for row in panel.header.iter().chain(panel.rows.iter()) {
-                        out.push_str(&row.text);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-        out
-    }
 }

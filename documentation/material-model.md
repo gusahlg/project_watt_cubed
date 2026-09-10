@@ -30,7 +30,7 @@ Code: `crates/material` (pure kernel). Game intern table: `src/block/registry.rs
 
 ## Probes and observations
 
-`Probes` are fixed reference elements (constants of the universe): contact, light, flow, glow, friction. `observe(law, C)` is the bounded response of `C` to each probe, mapped through law thresholds:
+`Probes` are fixed reference elements (constants of the universe): contact, light, flow, glow, friction. `observe(law, C)` (`observe_element` for a single element) is the bounded response of `C` to each probe, mapped through `Observation::from_responses`:
 
 - `solid` = non-empty and not liquid; `liquid` = flow ≥ `liquid_min`
 - `transparency` = light response; `emission` = glow above `glow_min`
@@ -46,7 +46,7 @@ Core fallback: `src/block/appearance.rs` (`FlatAppearance`). A texture mod paint
 
 ## Scheduler
 
-`src/sim/reactions.rs`. Gameplay events → neighbour pairs → `interact` on a snapshot → mutations commit in position order → follow-up events, budgeted per generation. Runs on the sim tick. Multiplayer: **server only**; clients receive `CellMutation`. Chunk load, gen, mesh, and save never emit.
+`src/sim/reactions.rs`. Gameplay events → neighbour pairs → `interact_many` on a snapshot → `Mutation { pos, from, to }` commits in position order → follow-up events, budgeted per generation (`Budget`). Runs on the sim tick (`Reactions` implements `Tick`). Multiplayer: **server only**; clients receive `ServerMessage::Snapshot` batches (and `ServerMessage::Edit` for a single cell). Chunk load, gen, mesh, and save never emit.
 
 | Gameplay | Event |
 |---|---|
@@ -61,13 +61,13 @@ Core fallback: `src/block/appearance.rs` (`FlatAppearance`). A texture mod paint
 
 ## Holdings and the workbench
 
-Stash entries are `(BlockId, count)` (`src/stash.rs`). Breaking yields that configuration. Inventory shows the visual swatch and an optional region label (else "unknown"). Crafting (`src/mods/crafting.rs`) applies an event between two held configurations through `interact` (repeat 1..16); discovered procedures are journal knowledge. On a server the client sends `Craft` and never trusts its own result.
+Stash entries are `(BlockId, count)` (`src/stash.rs`). Breaking yields that configuration. Inventory shows the visual swatch and an optional region label (else `"unknown material"` from `display_name`). Crafting (`src/mods/crafting.rs`) applies an event between two held configurations through `interact` / `interact_repeat` (repeat 1..16); discovered procedures are journal knowledge. On a server the client sends `ClientMessage::Craft` and never trusts its own result.
 
 ## Saves and protocol
 
 Save **v8** (`src/save/format.rs`): spec table = encodings; `law_stamp` = the law. Reaction mutations are ordinary overlay edits attributed to the scheduler.
 
-Protocol **v10**: `Welcome` carries the law stamp; fingerprint folds `WORLDGEN_VERSION`, `Law::fingerprint()`, and builtin region centres. `ConfigDefinition { id, encoding }` then `CellMutation { pos, id }`. Mixed laws do not join.
+Protocol **v10** (`PROTOCOL_VERSION` in `src/net/mod.rs`): `ServerMessage::Welcome` carries `law` (`Law::stamp()`); `content_fingerprint` folds `WORLDGEN_VERSION`, `Law::fingerprint()`, and builtin region centres. Cell changes travel as `ServerMessage::Snapshot { edits: Vec<(x, y, z, rev, spec)> }` (join and reaction batches) and `ServerMessage::Edit { x, y, z, rev, spec }` (one cell). Specs are `BlockRegistry::spec` (`air` / `c:<hex>`). Mixed laws do not join.
 
 ## The lab
 

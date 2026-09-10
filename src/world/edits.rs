@@ -514,6 +514,8 @@ impl World {
 
 impl CellStore for World {
     fn block_at(&self, pos: Pos) -> Option<BlockId> {
+        #[cfg(test)]
+        crate::alloc_count::note_cell_read();
         let (chunk, local) = BlockCoord::new(pos.0, pos.1, pos.2).split();
         self.chunks
             .get(&chunk)
@@ -521,6 +523,8 @@ impl CellStore for World {
     }
 
     fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+        #[cfg(test)]
+        crate::alloc_count::note_cell_write();
         World::set_block(self, pos.0, pos.1, pos.2, id)
     }
 
