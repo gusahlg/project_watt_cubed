@@ -791,6 +791,9 @@ struct StreamPeaks {
     max_worker_capacity: usize,
     max_speed_mps: f64,
     min_effort: f32,
+    max_mesh_slots: usize,
+    max_section_ready: usize,
+    slot_ceiling: usize,
 }
 
 impl Default for StreamPeaks {
@@ -809,6 +812,9 @@ impl Default for StreamPeaks {
             max_worker_capacity: 0,
             max_speed_mps: 0.0,
             min_effort: 1.0,
+            max_mesh_slots: 0,
+            max_section_ready: 0,
+            slot_ceiling: 0,
         }
     }
 }
@@ -830,6 +836,9 @@ impl StreamPeaks {
         self.max_worker_capacity = self.max_worker_capacity.max(g.worker_capacity);
         self.max_speed_mps = self.max_speed_mps.max(g.travel_speed_mps);
         self.min_effort = self.min_effort.min(g.effort);
+        self.max_mesh_slots = self.max_mesh_slots.max(g.mesh_slots);
+        self.max_section_ready = self.max_section_ready.max(g.section_ready);
+        self.slot_ceiling = self.slot_ceiling.max(g.slot_ceiling);
     }
 
     fn to_json(self) -> Json {
@@ -854,6 +863,9 @@ impl StreamPeaks {
             ("worker_capacity", Json::from(self.max_worker_capacity)),
             ("travel_speed_mps", Json::number(self.max_speed_mps)),
             ("minimum_effort", Json::number(f64::from(self.min_effort))),
+            ("mesh_slots", Json::from(self.max_mesh_slots)),
+            ("section_ready", Json::from(self.max_section_ready)),
+            ("slot_ceiling", Json::from(self.slot_ceiling)),
         ])
     }
 }
@@ -896,6 +908,9 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("light_admitted", Json::from(g.light_admitted as u64)),
         ("light_admitted_last", Json::from(g.light_admitted_last)),
         ("light_seed_inserts", Json::from(g.light_seed_inserts as u64)),
+        ("mesh_slots", Json::from(g.mesh_slots)),
+        ("section_ready", Json::from(g.section_ready)),
+        ("slot_ceiling", Json::from(g.slot_ceiling)),
     ])
 }
 

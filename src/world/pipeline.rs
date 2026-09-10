@@ -211,7 +211,7 @@ pub(in crate::world) enum Done {
         pos: SectionPos,
         epoch: u32,
         token: ClaimToken,
-        meshes: [SectionMeshData; 4],
+        meshes: Box<SectionMeshData>,
     },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
     /// and apply the bounded retry/quarantine policy — without this, a single
@@ -228,8 +228,8 @@ pub(in crate::world) enum Done {
     Cancelled(Box<[JobKey]>),
 }
 
-// Keep the result channel payload small: the largest variant should be the
-// `Section` mesh array, not an inlined per-chunk mesh (see structural
+// Keep the result channel payload small: the largest variant should be a
+// boxed section mesh, not an inlined per-chunk mesh (see structural
 // opportunity #8 — this was 544 B with `ChunkMeshData` inline).
 const _: () = assert!(size_of::<Done>() <= 128);
 
@@ -1174,7 +1174,7 @@ fn run(job: Job) -> Done {
                 pos,
                 epoch,
                 token,
-                meshes,
+                meshes: Box::new(meshes),
             }
         }
         #[cfg(test)]

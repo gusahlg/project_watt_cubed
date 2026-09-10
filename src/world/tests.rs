@@ -112,6 +112,27 @@ fn indexed_section_edits_match_the_footprint_scan() {
 }
 
 #[test]
+fn section_admit_stops_at_the_cpu_cull_ceiling() {
+    let mut world = lod2_world();
+    world.slot_ceiling = 4;
+    world.gpu_live_slots = 4;
+    assert!(
+        !<SectionLane as StreamLane>::ready(&world, SectionPos {
+            detail: section::FINEST_DETAIL,
+            x: 0,
+            z: 0,
+        }),
+        "at the CPU-cull ceiling the far lane must not split further"
+    );
+    world.gpu_live_slots = 3;
+    assert!(<SectionLane as StreamLane>::ready(&world, SectionPos {
+        detail: section::FINEST_DETAIL,
+        x: 0,
+        z: 0,
+    }));
+}
+
+#[test]
 fn lod2_is_the_default_and_near_only_leaves_sections_dormant() {
     assert!(World::generate().lod2, "lod2 far field on by default");
     let d = World::with_config(DEFAULT_SEED, RenderConfig { lod2: false, ..RenderConfig::default() });
@@ -157,7 +178,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = ChunkCoord::new(0, 0, 0);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { quadrants: Default::default(), last_style: None };
+    let empty_ready = || SectionState::Ready { meshes: None, last_style: None };
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -194,7 +215,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { quadrants: Default::default(), last_style: None });
+        world.sections.insert(cell, SectionState::Ready { meshes: None, last_style: None });
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -1269,7 +1290,7 @@ fn lod2_far_field_drives_to_covering_complete() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { quadrants: Default::default(), last_style: None };
+                *s = SectionState::Ready { meshes: None, last_style: None };
             }
         }
     }

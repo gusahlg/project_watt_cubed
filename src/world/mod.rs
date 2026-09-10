@@ -73,8 +73,12 @@ use heightmip::HeightMip;
 use light::LightGrid;
 use mesh::{ChunkMeshData, new_chunk_mesh_data};
 use quadtree::QuadrantMask;
-use section::Quadrant;
 use section::{SectionMeshData, SectionPos};
+
+/// Engine CPU-cull live-count threshold. Section admission stays under this
+/// when the view would otherwise overflow it (chunks already over is a
+/// near-field issue, not a reason to split far tiles).
+const CPU_CULL_MAX: u32 = 1024;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -168,6 +172,12 @@ pub struct StreamGauges {
     pub light_admitted_last: usize,
     /// Cumulative `light_worklist` insert attempts (including already-queued).
     pub light_seed_inserts: u64,
+    /// Live GPU mesh slots (engine gauge when streamed, else a local handle count).
+    pub mesh_slots: usize,
+    /// CPU-cull live-count ceiling the far field budgets against.
+    pub slot_ceiling: usize,
+    /// Ready far-LOD sections (each is one mesh per pass).
+    pub section_ready: usize,
 }
 
 pub use census::MemoryCensus;
@@ -463,6 +473,9 @@ impl ChunkMeshes {
             }
         }
     }
+    fn slot_count(&self) -> usize {
+        self.0.iter().filter(|(_, m)| m.is_some()).count()
+    }
     /// Whether any pass draws `handle` — for the render/ownership tests.
     #[cfg(test)]
     fn draws(&self, handle: MeshHandle) -> bool {
@@ -495,13 +508,12 @@ pub(in crate::world) enum SectionState {
     /// presents a different token belongs to a superseded claim and must not
     /// touch this entry.
     Meshing { token: pipeline::ClaimToken },
-    /// Block meshes grouped by quadrant (indexed by [`SectionPos::quadrant`]).
-    /// Position and detail (cell size `2^detail`, from the map key `pos.detail`)
-    /// are pinned into each resident mesh at upload; visibility is a per-quadrant
-    /// `set_visible` mask and style a `set_style` push, so nothing per-block is
-    /// stored beyond the meshes themselves.
+    /// One mesh per pass for the whole section. Position and packed detail
+    /// (`pos.detail + shift`) are pinned at upload; visibility is a single
+    /// `set_visible` (partial covering draws the whole tile — overlap is
+    /// depth-biased) and style a `set_style` push.
     Ready {
-        quadrants: [Vec<ChunkMeshes>; 4],
+        meshes: Option<ChunkMeshes>,
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
         /// re-observed next frame (the steady case) sends nothing.
         last_style: Option<(FadeStyle, u32)>,
@@ -509,36 +521,21 @@ pub(in crate::world) enum SectionState {
 }
 
 impl SectionState {
-    /// Upload each quadrant's block meshes at their absolute world origin and
-    /// detail (pinned once — the engine recovers camera-relative position). Empty
-    /// quadrants upload to no handles.
+    /// Upload the section's one mesh per pass at the packed origin and detail.
     fn from_upload(
         pos: SectionPos,
-        meshes: [SectionMeshData; 4],
+        mesh: SectionMeshData,
         eng: &mut Engine,
     ) -> SectionState {
         let cell = pos.cell_size();
-        let detail = pos.detail;
-        let quadrants = meshes.map(|quad| {
-            let mut blocks = Vec::new();
-            for (block_origin, data) in quad {
-                let placement = voxel_engine::MeshPlacement::terrain(
-                    voxel_engine::IVec3::new(
-                        pos.min_x() + block_origin.x as i32 * cell,
-                        block_origin.y as i32 * cell,
-                        pos.min_z() + block_origin.z as i32 * cell,
-                    ),
-                    detail,
-                );
-                let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement));
-                if let Some(meshes) = ChunkMeshes::from_upload_handles(handles) {
-                    blocks.push(meshes);
-                }
-            }
-            blocks
-        });
+        let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let placement = voxel_engine::MeshPlacement::terrain(
+            voxel_engine::IVec3::new(pos.min_x(), mesh.origin_y as i32 * cell, pos.min_z()),
+            detail,
+        );
+        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&mesh.data[p], placement));
         SectionState::Ready {
-            quadrants,
+            meshes: ChunkMeshes::from_upload_handles(handles),
             last_style: None,
         }
     }
@@ -547,31 +544,22 @@ impl SectionState {
         matches!(self, SectionState::Ready { .. })
     }
 
-    /// Project `mask` onto this region's slots: the quadrants it selects are
-    /// visible, the rest not. `None` draws nothing. Walks EVERY quadrant, so a
-    /// quadrant leaving the mask is cleared rather than stranded at its last value.
+    /// Project `mask` onto this region's slots. One mesh covers the whole
+    /// section: any non-empty mask draws it (overlap with finer children is
+    /// depth-biased); `None` / empty hides it.
     fn set_visible(&self, eng: &mut Engine, mask: Option<QuadrantMask>) {
-        let SectionState::Ready { quadrants, .. } = self else {
+        let SectionState::Ready { meshes: Some(meshes), .. } = self else {
             return;
         };
-        for q in Quadrant::ALL {
-            let on = mask.is_some_and(|m| m.contains(q));
-            for meshes in &quadrants[q.index()] {
-                meshes.set_visible(eng, on);
-            }
-        }
+        meshes.set_visible(eng, mask.is_some_and(|m| !m.is_empty()));
     }
-    /// Push the far-material style onto every block mesh of this section
+    /// Push the far-material style onto this section's mesh
     /// (visibility decides which actually draw). The engine delta-gates unchanged style.
     fn set_style(&self, eng: &mut Engine, style: FadeStyle, flat_rgba: u32) {
-        let SectionState::Ready { quadrants, .. } = self else {
+        let SectionState::Ready { meshes: Some(meshes), .. } = self else {
             return;
         };
-        for quad in quadrants {
-            for meshes in quad {
-                meshes.set_style(eng, style, flat_rgba);
-            }
-        }
+        meshes.set_style(eng, style, flat_rgba);
     }
     /// [`Self::set_style`], gated on the pushed tuple actually changing since last
     /// time — the DrawDyn contract ("at rest, zero writes"): the engine delta-gates
@@ -588,13 +576,29 @@ impl SectionState {
         self.set_style(eng, style, flat_rgba);
     }
     fn free(self, eng: &mut Engine) {
-        if let SectionState::Ready { quadrants, .. } = self {
-            for quad in quadrants {
-                for meshes in quad {
-                    meshes.free(eng);
-                }
-            }
+        if let SectionState::Ready { meshes: Some(meshes), .. } = self {
+            meshes.free(eng);
         }
+    }
+
+    fn slot_count(&self) -> usize {
+        match self {
+            SectionState::Ready { meshes: Some(m), .. } => m.slot_count(),
+            _ => 0,
+        }
+    }
+}
+
+impl World {
+    fn local_mesh_slots(&self) -> usize {
+        let chunks = self
+            .chunks
+            .values()
+            .filter_map(|l| l.state.live_meshes())
+            .map(ChunkMeshes::slot_count)
+            .sum::<usize>();
+        let sections = self.sections.values().map(SectionState::slot_count).sum::<usize>();
+        chunks + sections
     }
 }
 
@@ -953,7 +957,12 @@ pub struct World {
     sections: FastMap<SectionPos, SectionState>,
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
     /// token that produced them (re-validated at the moment of upload).
-    section_upload_queue: VecDeque<(SectionPos, pipeline::ClaimToken, [SectionMeshData; 4])>,
+    section_upload_queue: VecDeque<(SectionPos, pipeline::ClaimToken, Box<SectionMeshData>)>,
+    /// Last engine `mesh_stats().live_slots` sampled at `stream`. Zero until
+    /// the first stream (tests without a GPU).
+    gpu_live_slots: u32,
+    /// CPU-cull live-count ceiling (`mesh_stats().cpu_cull_max`, else 1024).
+    slot_ceiling: u32,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -1184,6 +1193,8 @@ impl World {
             section_mip_rx: None,
             sections: FastMap::default(),
             section_upload_queue: VecDeque::new(),
+            gpu_live_slots: 0,
+            slot_ceiling: CPU_CULL_MAX,
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_edit_rev: FastMap::default(),
@@ -2195,6 +2206,13 @@ impl StreamLane for SectionLane {
     }
     fn in_flight(world: &World, key: SectionPos) -> bool {
         world.sections.contains_key(&key)
+    }
+    fn ready(world: &World, _key: SectionPos) -> bool {
+        // Prefer merging (one mesh/section already) over splitting when the
+        // live slot count is at the CPU-cull ceiling: do not admit more
+        // far tiles. In-flight claims and the upload queue will land as slots.
+        let pending = world.meshing_sections + world.section_upload_queue.len();
+        (world.gpu_live_slots as usize).saturating_add(pending) < world.slot_ceiling as usize
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
         world.refresh_tables();

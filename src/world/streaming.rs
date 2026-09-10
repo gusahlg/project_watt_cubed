@@ -387,6 +387,9 @@ impl World {
     /// the drain/dirty lanes here are second-run no-ops on a pumped frame.
     /// Steady-state zero cost: one channel poll, lazy unload/generate on boundary cross.
     pub fn stream(&mut self, center: DVec3, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+        let stats = eng.mesh_stats();
+        self.gpu_live_slots = stats.live_slots;
+        self.slot_ceiling = stats.cpu_cull_max.max(1);
         // Capture eye altitude; section metric measures dy from it.
         self.section_eye_y = center.y;
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
@@ -788,7 +791,7 @@ impl World {
                 && matches!(state, SectionState::Meshing { token: t } if *t == token)
             {
                 super::adjust_count(&mut self.meshing_sections, true, false);
-                *state = SectionState::from_upload(pos, meshes, eng);
+                *state = SectionState::from_upload(pos, *meshes, eng);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
                 // in part — must be corrected here, at the transition that gave it slots
@@ -2553,6 +2556,13 @@ impl World {
             light_admitted: self.light_admitted,
             light_admitted_last: self.light_admitted_last,
             light_seed_inserts: self.light_seed_inserts,
+            mesh_slots: if self.gpu_live_slots != 0 {
+                self.gpu_live_slots as usize
+            } else {
+                self.local_mesh_slots()
+            },
+            slot_ceiling: self.slot_ceiling as usize,
+            section_ready: self.sections.values().filter(|s| s.is_ready()).count(),
         }
     }
 
