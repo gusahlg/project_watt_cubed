@@ -86,6 +86,11 @@ fn main() {
             o.light_seed_inserts_at_stop,
             o.seeds_per_chunk
         );
+        let s = o.light_seed_split_at_stop;
+        println!(
+            "  seeds: store={} border={} edit={} degrade={} terminal={} remesh={}",
+            s.store, s.border, s.edit, s.degrade, s.terminal, s.remesh
+        );
         println!(
             "  settle light admit/s={:.0}",
             o.settle_light_admit_per_s

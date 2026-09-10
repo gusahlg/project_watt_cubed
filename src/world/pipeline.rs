@@ -1687,6 +1687,7 @@ mod tests {
                                 visible: true,
                                 light: None,
                                 has_blocklight: false,
+                                light_reseed: false,
                                 light_gen: 0,
                             },
                         );

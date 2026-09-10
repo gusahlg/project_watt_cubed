@@ -168,6 +168,8 @@ pub struct StreamGauges {
     pub light_admitted_last: usize,
     /// Cumulative `light_worklist` insert attempts (including already-queued).
     pub light_seed_inserts: u64,
+    /// Insert attempts split by `seed_light` source (stress report at stop).
+    pub light_seed_split: LightSeedSplit,
     /// `remesh_async` calls (rev-bumping rebuilds) this world has issued.
     pub remesh_async_calls: u64,
     /// Stale mesh drops (accept-time, pop-time, and prune).
@@ -182,6 +184,43 @@ pub struct StreamGauges {
     pub mesh_jobs_before_fixpoint_mean: f32,
     pub mesh_jobs_before_fixpoint_p95: f32,
     pub mesh_jobs_before_fixpoint_n: u64,
+}
+
+/// `seed_light` insert attempts by source. Degrade / terminal / neighbour-remesh
+/// stay zero unless those paths start seeding the light worklist.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LightSeedSplit {
+    pub store: u64,
+    pub border: u64,
+    pub edit: u64,
+    pub degrade: u64,
+    pub terminal: u64,
+    pub remesh: u64,
+}
+
+/// Why a coord was inserted into `light_worklist`.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Degrade/Terminal/Remesh are report buckets; tests construct them.
+pub(in crate::world) enum LightSeed {
+    Store,
+    Border,
+    Edit,
+    Degrade,
+    Terminal,
+    Remesh,
+}
+
+impl LightSeedSplit {
+    pub(in crate::world) fn add(&mut self, kind: LightSeed) {
+        *match kind {
+            LightSeed::Store => &mut self.store,
+            LightSeed::Border => &mut self.border,
+            LightSeed::Edit => &mut self.edit,
+            LightSeed::Degrade => &mut self.degrade,
+            LightSeed::Terminal => &mut self.terminal,
+            LightSeed::Remesh => &mut self.remesh,
+        } += 1;
+    }
 }
 
 pub use census::MemoryCensus;
@@ -351,6 +390,9 @@ struct Loaded {
     /// so a uniform-air neighbour can reject the analytic sky path by testing
     /// six booleans instead of capturing a 3 KB face shell.
     has_blocklight: bool,
+    /// Neighbour face moved while this chunk's flood was in flight. Re-seed
+    /// when the result integrates so the wave costs at most one extra flood.
+    light_reseed: bool,
     /// Identity of this `Loaded` for light-claim matching. Bumped at store so
     /// a `Done::Light` captured against a previous resident at the same coord
     /// (unload then regenerate, same `light_epoch`) cannot publish onto the
@@ -823,6 +865,7 @@ pub struct World {
     light_worklist: worklist::RingWorklist,
     /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
     light_seed_inserts: u64,
+    light_seed_split: LightSeedSplit,
     /// Cumulative light jobs accepted by the worker pool.
     light_admitted: u64,
     /// Jobs accepted by the most recent [`admit`]`<LightLane>` pass.
@@ -1155,6 +1198,7 @@ impl World {
                 ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
             ),
             light_seed_inserts: 0,
+            light_seed_split: LightSeedSplit::default(),
             light_admitted: 0,
             light_admitted_last: 0,
             light_inflight: FastSet::default(),

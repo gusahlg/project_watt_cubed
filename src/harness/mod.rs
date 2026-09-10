@@ -441,6 +441,8 @@ pub struct StressOutcome {
     /// Cumulative light-worklist inserts at stop, and inserts / chunks.
     pub light_seed_inserts_at_stop: u64,
     pub seeds_per_chunk: f32,
+    /// Insert attempts by source at stop.
+    pub light_seed_split_at_stop: crate::world::LightSeedSplit,
     /// Mean light jobs admitted per second between stop and settle (or cap).
     pub settle_light_admit_per_s: f32,
     /// Per-second snapshots after stop: admit rate, workers, effort, worklist.
@@ -493,6 +495,7 @@ struct StressRun {
     stop_worklist: usize,
     stop_chunks: usize,
     stop_seeds: u64,
+    stop_split: crate::world::LightSeedSplit,
     sample_sec: u32,
     sample_admitted: u64,
     end_admitted: u64,
@@ -527,6 +530,7 @@ impl StressRun {
             stop_worklist: 0,
             stop_chunks: 0,
             stop_seeds: 0,
+            stop_split: crate::world::LightSeedSplit::default(),
             sample_sec: 0,
             sample_admitted: 0,
             end_admitted: 0,
@@ -570,6 +574,7 @@ impl StressRun {
             } else {
                 self.stop_seeds as f32 / self.stop_chunks as f32
             },
+            light_seed_split_at_stop: self.stop_split,
             settle_light_admit_per_s: {
                 let dt = settle_time.unwrap_or(STRESS_SETTLE_CAP).as_secs_f32();
                 if dt <= 0.0 {
@@ -911,6 +916,7 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
                         run.stop_worklist = gauges.light_worklist;
                         run.stop_chunks = gauges.chunks;
                         run.stop_seeds = gauges.light_seed_inserts;
+                        run.stop_split = gauges.light_seed_split;
                         run.sample_admitted = gauges.light_admitted;
                         run.end_admitted = gauges.light_admitted;
                         eprintln!(

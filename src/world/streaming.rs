@@ -1078,7 +1078,7 @@ impl World {
             // settle against its own voxels.
             self.light_inflight.remove(&coord);
             if live_gen.is_some() && self.lighting {
-                self.seed_light(coord);
+                self.seed_light(coord, super::LightSeed::Store);
                 self.light_pending.set();
             }
             return;
@@ -1310,7 +1310,7 @@ impl World {
                 self.light_inflight.remove(&coord);
                 if rearm {
                     // An unloaded chunk's seed is dropped by the lane's submit.
-                    self.seed_light(coord);
+                    self.seed_light(coord, super::LightSeed::Store);
                     self.light_pending.set();
                 }
                 // Quarantined light: the chunk never settles, so the mesh
@@ -1547,6 +1547,7 @@ impl World {
                 visible: true,
                 light: None,
                 has_blocklight: false,
+                light_reseed: false,
                 light_gen,
             },
         );
@@ -1571,13 +1572,13 @@ impl World {
                 // claim. Skip trivial publish (it would steal that claim via
                 // settle_light) and seed so we resettle after the stale Done
                 // is consumed against the old generation.
-                self.seed_light(coord);
+                self.seed_light(coord, super::LightSeed::Store);
                 self.light_pending.set();
             } else {
                 match self.trivial_light(coord, &chunk) {
                     Some(grid) => self.settle_light(coord, grid),
                     None => {
-                        self.seed_light(coord);
+                        self.seed_light(coord, super::LightSeed::Store);
                         self.light_pending.set();
                     }
                 }
@@ -1972,9 +1973,27 @@ impl World {
         self.remesh_stats.note_remesh(coord);
     }
 
+    /// Faces whose border lumels differ. A first publish compares against dark
+    /// (the shell missing neighbours already assumed).
+    fn face_moves(prev: Option<&light::LightGrid>, grid: &light::LightGrid) -> u8 {
+        let dark = light::LightGrid::dark();
+        let old = prev.unwrap_or(&dark);
+        let mut bits = 0u8;
+        for &face in &Face::ALL {
+            if light::border_changed(old, grid, face) {
+                bits |= 1 << (face as u8);
+            }
+        }
+        bits
+    }
+
     /// Count a light-worklist insert (the stress harness's seeds-per-chunk signal).
-    pub(in crate::world) fn seed_light(&mut self, coord: Coord) {
+    pub(in crate::world) fn seed_light(&mut self, coord: Coord, source: super::LightSeed) {
         self.light_seed_inserts += 1;
+        self.light_seed_split.add(source);
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.light_reseed = false;
+        }
         self.light_worklist.insert(coord);
     }
 
@@ -1985,9 +2004,14 @@ impl World {
         // absorbs async removal, keeping settled/inflight state consistent.
         self.light_inflight.remove(&coord);
         // Unloaded while the flood flew (or before a trivial publish): drop it.
-        if !self.chunks.contains_key(&coord) {
-            return;
-        }
+        let reseed = match self.chunks.get_mut(&coord) {
+            Some(loaded) => {
+                let r = loaded.light_reseed;
+                loaded.light_reseed = false;
+                r
+            }
+            None => return,
+        };
         let self_changed = self.chunks[&coord]
             .light
             .as_ref()
@@ -1998,43 +2022,52 @@ impl World {
         self.pending_fresh.set();
         self.mesh_worklist.insert(coord);
         if !self_changed {
+            if reseed {
+                self.seed_light(coord, super::LightSeed::Border);
+                self.light_pending.set();
+            }
             return;
         }
-        // Face bitmask (bit = `Face` discriminant): first publish moves every
-        // face; later publishes scan borders only after the grid actually changed.
-        const ALL_FACES: u8 = (1 << Face::ALL.len()) - 1;
-        let moved = match &self.chunks[&coord].light {
-            None => ALL_FACES,
-            Some(old) => {
-                let mut bits = 0u8;
-                for &face in &Face::ALL {
-                    if light::border_changed(old, &grid, face) {
-                        bits |= 1 << (face as u8);
-                    }
-                }
-                bits
-            }
-        };
+        // Face bitmask (bit = `Face` discriminant). First publish compares
+        // against dark — missing neighbours already assumed that shell for the
+        // flood. Neighbours still need a *mesh* seed: first publish is what
+        // makes `light_ready` true for them.
+        let first = self.chunks[&coord].light.is_none();
+        let moved = Self::face_moves(self.chunks[&coord].light.as_ref(), &grid);
         let has_blocklight = grid.has_border_blocklight();
         {
             let loaded = self.chunks.get_mut(&coord).unwrap();
             loaded.light = Some(grid);
             loaded.has_blocklight = has_blocklight;
         }
-        // A neighbour may now be meshable too (this chunk's FIRST grid completes
-        // their neighbourhood — `moved` is all faces then); re-settle the
-        // neighbours whose shared border moved. Mark dirty instead of remeshing
+        // Light-seed only neighbours whose shared border moved and that already
+        // have data. An in-flight neighbour is marked, not re-inserted: at most
+        // one extra flood when its result integrates. Mesh-seed on first publish
+        // too (waiting neighbours become ready). Mark dirty instead of remeshing
         // immediately: `tick_light_gate` promotes once the 27-neighbourhood
         // has no pending light work (or the degrade timer expires).
         self.light_gate.mark_dirty(coord);
         for &face in &Face::ALL {
-            if moved & (1 << (face as u8)) == 0 {
+            let face_moved = moved & (1 << (face as u8)) != 0;
+            if !face_moved && !first {
                 continue;
             }
             let n = coord.step(face);
-            self.seed_light(n);
+            if !self.chunks.contains_key(&n) {
+                continue;
+            }
+            if face_moved {
+                if self.light_inflight.contains(&n) {
+                    self.chunks.get_mut(&n).unwrap().light_reseed = true;
+                } else {
+                    self.seed_light(n, super::LightSeed::Border);
+                }
+            }
             self.mesh_worklist.insert(n);
             self.light_gate.mark_dirty(n);
+        }
+        if reseed {
+            self.seed_light(coord, super::LightSeed::Border);
         }
         if !self.light_worklist.is_empty() {
             self.light_pending.set();
@@ -2719,6 +2752,7 @@ impl World {
             light_admitted: self.light_admitted,
             light_admitted_last: self.light_admitted_last,
             light_seed_inserts: self.light_seed_inserts,
+            light_seed_split: self.light_seed_split,
             remesh_async_calls: self.remesh_stats.remesh_async_calls,
             drop_stale_uploads: self.remesh_stats.drop_stale_uploads,
             drop_stale_this_frame: self.remesh_stats.drop_stale_this_frame,
@@ -3735,6 +3769,124 @@ mod tests {
         assert!(
             world.chunks[&n].has_blocklight,
             "identical re-settle keeps the flag"
+        );
+    }
+
+    /// First publish of a dark grid matches the missing-neighbour shell, so
+    /// no face moved and no neighbour is seeded.
+    #[test]
+    fn dark_first_publish_seeds_no_neighbour() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.chunks.get_mut(&c).unwrap().light = None;
+        world.chunks.get_mut(&c.step(Face::PosX)).unwrap().state = MeshState::needs_mesh();
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.mesh_worklist.clear();
+        world.settle_light(c, light::LightGrid::dark());
+        for &face in &Face::ALL {
+            assert!(
+                !world.light_worklist.contains(&c.step(face)),
+                "dark first publish must not seed {face:?}"
+            );
+        }
+        let n = c.step(Face::PosX);
+        assert!(
+            world.mesh_worklist.contains(&n),
+            "first publish still re-seeds a waiting neighbour's mesh"
+        );
+    }
+
+    /// A moved face seeds only neighbours that already have data; missing
+    /// neighbours are not inserted (store_chunk / first-publish constraint).
+    #[test]
+    fn settle_seeds_only_neighbours_that_have_data() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        let missing = c.step(Face::PosY);
+        world.chunks.remove(&missing);
+        world.chunks.get_mut(&c).unwrap().light = None;
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.settle_light(c, light::LightGrid::open_sky());
+        assert!(
+            !world.light_worklist.contains(&missing),
+            "must not seed a neighbour without data"
+        );
+        let present = c.step(Face::PosX);
+        assert!(
+            world.chunks.contains_key(&present),
+            "generate preloads a lateral neighbour"
+        );
+        assert!(
+            world.light_worklist.contains(&present),
+            "a loaded neighbour whose shared face moved must be seeded"
+        );
+    }
+
+    /// An in-flight neighbour is marked, not re-inserted; the seed lands when
+    /// its result integrates — even if that grid equals the one it already had.
+    #[test]
+    fn inflight_neighbour_reseeds_after_landing() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        let n = c.step(Face::PosX);
+        world.chunks.get_mut(&c).unwrap().light = Some(light::LightGrid::dark());
+        world.chunks.get_mut(&n).unwrap().light = Some(light::LightGrid::dark());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_inflight.insert(n);
+        world.settle_light(c, light::LightGrid::open_sky());
+        assert!(
+            !world.light_worklist.contains(&n),
+            "in-flight neighbour must not be re-inserted immediately"
+        );
+        assert!(world.chunks[&n].light_reseed);
+        world.settle_light(n, light::LightGrid::dark());
+        assert!(!world.chunks[&n].light_reseed);
+        assert!(
+            world.light_worklist.contains(&n),
+            "re-seed after landing so the wave costs one extra flood"
+        );
+    }
+
+    /// `store_chunk` (via `ensure_data`) must not seed neighbours that have
+    /// no data, even when the stored chunk publishes a non-dark first grid.
+    #[test]
+    fn store_chunk_does_not_seed_neighbours_without_data() {
+        use crate::render_config::RenderConfig;
+        let mut world = World::with_config_lazy(1, RenderConfig::default());
+        let c = Coord::new(2, 25, -3);
+        world.center = Some(c);
+        world.ensure_data(c);
+        assert!(world.chunks.contains_key(&c));
+        for &face in &Face::ALL {
+            let n = c.step(face);
+            assert!(
+                !world.light_worklist.contains(&n),
+                "store must not seed neighbour {face:?} that has no data"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_light_counts_each_source() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.light_worklist.clear();
+        world.light_seed_inserts = 0;
+        world.light_seed_split = super::super::LightSeedSplit::default();
+        world.seed_light(c, super::super::LightSeed::Store);
+        world.seed_light(c, super::super::LightSeed::Border);
+        world.seed_light(c, super::super::LightSeed::Edit);
+        world.seed_light(c, super::super::LightSeed::Degrade);
+        world.seed_light(c, super::super::LightSeed::Terminal);
+        world.seed_light(c, super::super::LightSeed::Remesh);
+        assert_eq!(world.light_seed_inserts, 6);
+        let s = world.light_seed_split;
+        assert_eq!(
+            (s.store, s.border, s.edit, s.degrade, s.terminal, s.remesh),
+            (1, 1, 1, 1, 1, 1)
         );
     }
 
