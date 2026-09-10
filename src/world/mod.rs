@@ -857,15 +857,24 @@ pub struct World {
     /// bounded hole in the world, not an infinite resubmit-panic loop. Every
     /// scan that would re-request the work consults this set.
     quarantined: FastSet<streaming::FailKey>,
-    /// Block count last processed by [`Self::refresh_textures`].
+    /// Descriptor count last processed by [`Self::refresh_textures`].
     textures_built: usize,
     /// Built texture layers by id, kept so palette growth (crafting registers
     /// one block at a time) appends new layers instead of regenerating all.
+    /// Cleared when the appearance `revision` (or GPU-descriptor flag) changes.
     texture_cache: Vec<Vec<u8>>,
     /// Layers last sent to the GPU (`set` on first upload, `append` after).
-    /// Existing layers never change: a layer is a pure function of composition
-    /// and ids are append-only, so growth never re-sends the prefix.
+    /// Existing layers never change: a layer is a pure function of the visual
+    /// at one revision, and ids are append-only, so growth never re-sends the
+    /// prefix unless the appearance revision moved.
     uploaded_len: usize,
+    /// Appearance revision last used to fill [`Self::texture_cache`].
+    appearance_revision: u32,
+    /// Whether the last fill uploaded GPU material descriptors.
+    appearance_gpu: bool,
+    /// True after a `set_material_descs` of procedural entries; cleared by
+    /// uploading an empty table so the engine returns to ARRAY_LAYER.
+    gpu_descs_uploaded: bool,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
     /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
     /// stream pass reads the engine cap (identity in practice — ids start tiny).
@@ -1162,6 +1171,9 @@ impl World {
             textures_built: 0,
             texture_cache: Vec::new(),
             uploaded_len: 0,
+            appearance_revision: 0,
+            appearance_gpu: false,
+            gpu_descs_uploaded: false,
             texture_layer_cap: u16::MAX,
             ao: true,
             tables_epoch: 0,

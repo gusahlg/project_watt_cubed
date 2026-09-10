@@ -606,8 +606,12 @@ impl Game {
         // step the deterministic world so terrain streams in before the frame is
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
-            self.world
-                .stream(self.player.position, eng, &mut self.sched);
+            self.world.stream(
+                self.player.position,
+                eng,
+                &mut self.sched,
+                mods.appearance(),
+            );
             let clocks = self.sched.clocks(dt);
             let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
             self.sched.tick(&mut sched_ctx, &clocks);
@@ -676,7 +680,7 @@ impl Game {
         }
         if !consumed || !ready {
             let t = Instant::now();
-            self.stream_phase(eng, dt);
+            self.stream_phase(eng, dt, mods);
             self.phases.stream = t.elapsed();
         }
         let active = !consumed;
@@ -1075,7 +1079,7 @@ impl Game {
     /// Load/mesh/unload chunks around the camera (the player, unless the
     /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
     /// step the simulation.
-    fn stream_phase(&mut self, eng: &mut Engine, dt: f32) {
+    fn stream_phase(&mut self, eng: &mut Engine, dt: f32, mods: &Mods) {
         // The scheduler drives the fixed-tick sim lane. Its clock
         // (fixed-tick accumulator + catch-up cap) is derived once per frame
         // here; other lanes still run directly below until they migrate in.
@@ -1094,7 +1098,7 @@ impl Game {
             self.stream_gate.steps(dt) != 0
         };
         if !stream_due {
-            self.world.pump(eng, &mut self.sched);
+            self.world.pump(eng, &mut self.sched, mods.appearance());
             return;
         }
 
@@ -1102,7 +1106,8 @@ impl Game {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
-        self.world.stream(stream_center, eng, &mut self.sched);
+        self.world
+            .stream(stream_center, eng, &mut self.sched, mods.appearance());
 
         // A hidden/minimal HUD does no minimap clock read or terrain raster
         // work; refreshes share streaming's cadence instead of waking alone.

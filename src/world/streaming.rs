@@ -5,7 +5,12 @@
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{DVec3, Engine, FadeStyle};
+use voxel_engine::{DVec3, Engine, FadeStyle, MaterialDesc};
+
+use crate::block::appearance::{
+    fill_descriptor_layer, placeholder_layer, procedural_material_desc, BlockAppearance,
+    LAYER_BYTES, TEXTURE_SIZE,
+};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
 use crate::derived::Revision;
@@ -362,10 +367,15 @@ impl World {
     /// Minimum profile still publishes finished terrain the frame it lands
     /// and a mined block still vanishes the same frame it was clicked.
     /// Steady-state cost is a channel poll and two sticky-flag checks.
-    pub fn pump(&mut self, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+    pub fn pump(
+        &mut self,
+        eng: &mut Engine,
+        sched: &mut crate::sched::Scheduler,
+        appearance: &dyn BlockAppearance,
+    ) {
         // Palette growth appends new block texture layers before any upload
         // this frame references a new layer.
-        self.refresh_textures(eng);
+        self.refresh_textures(eng, appearance);
         // Idle: no claim can produce a `Done`, so skip try_recv and the
         // deadline Instant. Dirty-remesh and lod-clip stay (flag checks).
         if self.anything_in_flight() {
@@ -386,7 +396,13 @@ impl World {
     /// refreshes). [`pump`](Self::pump) covers the every-frame latency half;
     /// the drain/dirty lanes here are second-run no-ops on a pumped frame.
     /// Steady-state zero cost: one channel poll, lazy unload/generate on boundary cross.
-    pub fn stream(&mut self, center: DVec3, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+    pub fn stream(
+        &mut self,
+        center: DVec3,
+        eng: &mut Engine,
+        sched: &mut crate::sched::Scheduler,
+        appearance: &dyn BlockAppearance,
+    ) {
         // Capture eye altitude; section metric measures dy from it.
         self.section_eye_y = center.y;
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
@@ -484,7 +500,7 @@ impl World {
         // boundary-cross frame's results drain against the live centre, not
         // the one they'd be discarded by. `stream_phase` pumps only on frames
         // the topology pass does not run; this is the pump on stream-due frames.
-        self.pump(eng, sched);
+        self.pump(eng, sched, appearance);
         if full_pass {
             self.unload_far(center_chunk, eng);
             // Stale queued uploads (the trailing edge of fast movement) release
@@ -2758,22 +2774,38 @@ impl World {
     }
 
     /// Rebuild/upload block texture array on descriptor growth (rare: world entry
-    /// or a newly interned look). Existing layers never change (pure function of
-    /// the visual; descriptor ids are append-only), so only the first upload uses
-    /// `set_block_textures`; later growth appends.
-    fn refresh_textures(&mut self, eng: &mut Engine) {
+    /// or a newly interned look) or an appearance `revision` change. Existing
+    /// layers never change at one revision (pure function of the visual;
+    /// descriptor ids are append-only), so only the first upload / a revision
+    /// rebuild uses `set_block_textures`; later growth appends.
+    fn refresh_textures(&mut self, eng: &mut Engine, appearance: &dyn BlockAppearance) {
         // Never zero (modulo divisor) and never past the vertex field's u16.
         self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
         let count = self.registry.descriptor_count();
+        let rev = appearance.revision();
+        let gpu = appearance.wants_gpu_descriptors();
+        if self.appearance_revision != rev || self.appearance_gpu != gpu {
+            self.texture_cache.clear();
+            self.uploaded_len = 0;
+            self.textures_built = 0;
+            self.appearance_revision = rev;
+            self.appearance_gpu = gpu;
+        }
         if self.textures_built == count {
             return;
         }
-        for i in self.texture_cache.len()..count {
-            self.texture_cache
-                .push(crate::block::texture::build_descriptor_texture(
-                    &self.registry,
-                    i as u16,
-                ));
+        if gpu {
+            for i in self.texture_cache.len()..count {
+                let vis = self.registry.descriptor(i as u16);
+                self.texture_cache
+                    .push(placeholder_layer(&vis, i as u16));
+            }
+        } else {
+            for i in self.texture_cache.len()..count {
+                let mut buf = [0u8; LAYER_BYTES];
+                fill_descriptor_layer(appearance, &self.registry, i as u16, &mut buf);
+                self.texture_cache.push(buf.to_vec());
+            }
         }
         let visible = count.min(self.texture_layer_cap as usize);
         if count > visible && self.uploaded_len < visible {
@@ -2782,14 +2814,42 @@ impl World {
                  ({visible}); further textures wrap onto existing layers"
             );
         }
-        match plan_texture_upload(&self.texture_cache, self.uploaded_len, visible) {
+        let texel = if gpu { 1 } else { TEXTURE_SIZE };
+        let upload = plan_texture_upload(&self.texture_cache, self.uploaded_len, visible);
+        let desc_range = match &upload {
+            Some(TextureUpload::Set(_)) => Some((0, visible)),
+            Some(TextureUpload::Append(_)) => Some((self.uploaded_len, visible)),
+            None => None,
+        };
+        let descs: Option<Vec<MaterialDesc>> = if gpu {
+            desc_range.map(|(lo, hi)| {
+                (lo..hi)
+                    .map(|i| procedural_material_desc(&self.registry.descriptor(i as u16)))
+                    .collect()
+            })
+        } else {
+            None
+        };
+        match upload {
             Some(TextureUpload::Set(layers)) => {
-                eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, layers);
+                eng.set_block_textures(texel, layers);
             }
             Some(TextureUpload::Append(layers)) => {
                 eng.append_block_textures(layers);
             }
             None => {}
+        }
+        if let Some(descs) = descs {
+            match desc_range {
+                Some((0, _)) => eng.set_material_descs(&descs),
+                Some(_) => eng.append_material_descs(&descs),
+                None => {}
+            }
+            self.gpu_descs_uploaded = true;
+        } else if self.gpu_descs_uploaded {
+            // Engine default is ARRAY_LAYER per slot; an empty set restores it.
+            eng.set_material_descs(&[]);
+            self.gpu_descs_uploaded = false;
         }
         self.uploaded_len = visible;
         self.textures_built = count;
@@ -2873,6 +2933,15 @@ mod tests {
             "past the layer cap, nothing is re-sent"
         );
         assert_eq!(uploaded_len, 5);
+    }
+
+    #[test]
+    fn revision_rebuild_resets_to_a_set() {
+        let cache = vec![vec![1u8; 4], vec![2; 4], vec![3; 4]];
+        match plan_texture_upload(&cache, 0, cache.len()) {
+            Some(TextureUpload::Set(layers)) => assert_eq!(layers.len(), 3),
+            other => panic!("revision rebuild must set, got {other:?}"),
+        }
     }
 
     #[test]

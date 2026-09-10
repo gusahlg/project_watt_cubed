@@ -13,6 +13,7 @@ pub mod diffusion;
 pub mod inventory;
 pub mod menu_default;
 pub mod start_screen;
+pub mod textures;
 pub mod visuals;
 
 use std::cell::Cell;
@@ -21,6 +22,7 @@ use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::block::appearance::{BlockAppearance, FLAT};
 use crate::block::BlockId;
 use crate::menu::start::{StartFacts, StartScreen};
 use crate::menu::theme::MenuTheme;
@@ -174,7 +176,7 @@ impl ModContext<'_> {
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
 ///   `on_place_rejected`. `hud` uses the same order as z-order (later draws on top).
 /// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` (first `true`),
-///   `worldgen`, `worldgen_config`.
+///   `worldgen`, `worldgen_config`, `appearance`.
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
@@ -313,6 +315,13 @@ pub trait Mod {
     fn worldgen_config(&self) -> Option<String> {
         None
     }
+
+    /// Optional block appearance. First enabled mod that returns `Some` wins;
+    /// [`FlatAppearance`](crate::block::appearance::FlatAppearance) is used
+    /// when every enabled mod returns `None`.
+    fn appearance(&self) -> Option<&dyn BlockAppearance> {
+        None
+    }
 }
 
 /// One installed mod and whether it is currently active.
@@ -357,9 +366,23 @@ impl Mods {
         mods.install(Box::new(visuals::AtmosphereMod), true);
         mods.install(Box::new(visuals::PostMod), true);
         mods.install(Box::new(visuals::LightingMod), true);
+        mods.install(
+            Box::new(textures::procedural::ProceduralTexturesMod::new()),
+            true,
+        );
         // Worldgen swap: off so classic noise remains the default substrate.
         mods.install(Box::new(diffusion::InfiniteDiffusionMod::new()), false);
+        // GPU descriptors replace the CPU generator; off so ARRAY_LAYER (the
+        // engine default) stays bit-identical to a table that was never set.
+        mods.install(Box::new(textures::gpu::GpuMaterialsMod::new()), false);
         mods
+    }
+
+    /// No mods installed. Appearance is [`FLAT`].
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Install a mod, running its enable hook if it starts on.
@@ -527,6 +550,15 @@ impl Mods {
             .filter(|e| e.enabled)
             .find(|e| e.module.worldgen().is_some())
             .map(|e| &*e.module)
+    }
+
+    /// First enabled appearance mod, or the core flat fallback.
+    pub fn appearance(&self) -> &dyn BlockAppearance {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.appearance())
+            .unwrap_or(&FLAT)
     }
 
     pub fn visual_mask(&self) -> VisualMask {
@@ -926,8 +958,11 @@ mod tests {
         assert!(defaults.contains("atmosphere=on"));
         assert!(defaults.contains("post=on"));
         assert!(defaults.contains("lighting=on"));
+        assert!(defaults.contains("procedural_textures=on"));
+        assert!(defaults.contains("procedural_textures.state=grain=1.00,contrast=1.00"));
         assert!(defaults.contains("diffusion=off"));
         assert!(defaults.contains("diffusion.state=tile=32,stride=16,phases=2,relief=1.00"));
+        assert!(defaults.contains("gpu_materials=off"));
 
         mods.set_enabled("lighting", false);
         mods.set_enabled("diffusion", true);
@@ -1073,10 +1108,15 @@ mod tests {
                 "atmosphere",
                 "post",
                 "lighting",
+                "procedural_textures",
                 "diffusion"
             ]
         );
-        assert_eq!(members.len(), mods.len(), "no ungrouped built-ins");
+        let ungrouped: Vec<&str> = (0..mods.len())
+            .filter(|&i| mods.group(i).is_empty())
+            .map(|i| mods.id(i))
+            .collect();
+        assert_eq!(ungrouped, ["gpu_materials"]);
     }
 
     #[test]
@@ -1093,6 +1133,7 @@ mod tests {
             "atmosphere",
             "post",
             "lighting",
+            "procedural_textures",
             "diffusion",
         ] {
             assert!(
@@ -1123,6 +1164,7 @@ mod tests {
             "atmosphere",
             "post",
             "lighting",
+            "procedural_textures",
             "diffusion",
         ] {
             assert!(
