@@ -178,4 +178,22 @@ mod tests {
         assert_eq!(d._pad, [0; 4]);
         assert_eq!(std::mem::size_of_val(&d), 16);
     }
+
+    #[test]
+    #[ignore]
+    fn texture_layer_build_per_descriptor() {
+        use crate::mods::textures::procedural::ProceduralTexturesMod;
+        let mut r = BlockRegistry::with_builtins();
+        crate::world::placement::builtin().compile(&mut r);
+        let n = r.descriptor_count().max(1);
+        let proc = ProceduralTexturesMod::new();
+        let mut buf = [0u8; LAYER_BYTES];
+        let t0 = std::time::Instant::now();
+        for layer in 0..n as u16 {
+            fill_descriptor_layer(&proc, &r, layer, &mut buf);
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+        println!("texture layer build per descriptor: {us:.2} µs ({n} layers)");
+        assert!(us < 2_000.0, "layer build {us:.1} µs is past the sanity ceiling");
+    }
 }

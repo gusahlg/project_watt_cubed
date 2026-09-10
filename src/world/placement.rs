@@ -1012,4 +1012,88 @@ mod tests {
         assert!(out.is_empty(), "generated matter mutated under ExternallyChanged: {} edits", out.len());
         assert_eq!(m.cells, before, "16³ placement fill drifted after 20 generations");
     }
+
+    #[test]
+    fn generated_32_cube_stays_still_under_external_change() {
+        use crate::sim::reactions::{Budget, CellStore, MaterialEvent, Pos, ReactionScheduler};
+        use crate::world::chunk::{Chunk, CHUNK_SIZE};
+        use crate::world::generation::Terrain;
+        use material::EventKind;
+        use std::collections::HashMap;
+
+        struct Map {
+            cells: HashMap<Pos, BlockId>,
+            reg: BlockRegistry,
+        }
+        impl CellStore for Map {
+            fn block_at(&self, pos: Pos) -> Option<BlockId> {
+                Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
+            }
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            }
+            fn registry(&self) -> &BlockRegistry {
+                &self.reg
+            }
+            fn registry_mut(&mut self) -> &mut BlockRegistry {
+                &mut self.reg
+            }
+        }
+
+        let mut reg = BlockRegistry::with_builtins();
+        let g = Terrain::new(&mut reg, 20.0, 42);
+        let mut m = Map {
+            cells: HashMap::new(),
+            reg,
+        };
+        const BOX: i32 = 32;
+        for cz in 0..2 {
+            for cy in 0..2 {
+                for cx in 0..2 {
+                    let chunk = Chunk::new(cx, cy, cz, &g);
+                    let x0 = cx * CHUNK_SIZE as i32;
+                    let y0 = cy * CHUNK_SIZE as i32;
+                    let z0 = cz * CHUNK_SIZE as i32;
+                    for z in 0..CHUNK_SIZE {
+                        for y in 0..CHUNK_SIZE {
+                            for x in 0..CHUNK_SIZE {
+                                m.set_block(
+                                    (x0 + x as i32, y0 + y as i32, z0 + z as i32),
+                                    chunk.get_local(x, y, z),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let before = m.cells.clone();
+        let mut sched = ReactionScheduler::new();
+        for z in 0..BOX {
+            for y in 0..BOX {
+                for x in 0..BOX {
+                    sched.push(MaterialEvent {
+                        at: (x, y, z),
+                        kind: EventKind::ExternallyChanged,
+                    });
+                }
+            }
+        }
+        let law = *m.registry().law();
+        let out = sched.tick(
+            &mut m,
+            &law,
+            Budget {
+                events_per_generation: (BOX * BOX * BOX) as usize,
+                generations_per_tick: 20,
+                max_followups: (BOX * BOX * BOX * 6) as usize,
+            },
+        );
+        assert!(
+            out.is_empty(),
+            "generated 32³ mutated under ExternallyChanged: {} edits",
+            out.len()
+        );
+        assert_eq!(m.cells, before, "32³ generated box drifted after 20 generations");
+    }
 }

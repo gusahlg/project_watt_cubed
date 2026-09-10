@@ -136,13 +136,13 @@ impl ReactionScheduler {
             if self.pending.is_empty() {
                 break;
             }
+            // Sort before the budget cut so push-order cannot choose the batch.
+            self.pending.sort_by_key(|e| (e.at, e.kind as u8));
             let n = self.pending.len().min(budget.events_per_generation);
-            let mut batch: Vec<MaterialEvent> = self.pending.drain(..n).collect();
+            let batch: Vec<MaterialEvent> = self.pending.drain(..n).collect();
             for ev in &batch {
                 self.seen.remove(&(ev.at, ev.kind as u8));
             }
-            // Deterministic evaluation order: by origin position, then kind.
-            batch.sort_by_key(|e| (e.at, e.kind as u8));
             // Gather phase: every target with the origins acting on it, all read from the
             // generation's starting state.
             let mut acting: BTreeMap<Pos, (BlockId, Vec<(BlockId, EventKind)>)> = BTreeMap::new();
@@ -188,15 +188,16 @@ impl ReactionScheduler {
                 debug_assert_eq!(prev, from, "generation read a stale cell");
                 committed.push(Mutation { pos, from, to });
                 self.mutations += 1;
-                if followups < budget.max_followups {
-                    for f in FACES {
-                        let np = (pos.0 + f.0, pos.1 + f.1, pos.2 + f.2);
-                        self.push(MaterialEvent {
-                            at: np,
-                            kind: EventKind::ExternallyChanged,
-                        });
+                for f in FACES {
+                    if followups >= budget.max_followups {
+                        break;
                     }
-                    followups += 6;
+                    let np = (pos.0 + f.0, pos.1 + f.1, pos.2 + f.2);
+                    self.push(MaterialEvent {
+                        at: np,
+                        kind: EventKind::ExternallyChanged,
+                    });
+                    followups += 1;
                 }
             }
             self.generations += 1;
@@ -545,5 +546,141 @@ mod tests {
         world.push_material_event((0, y, 0), EventKind::Collision);
         assert_eq!(world.reactions().pending(), 0);
         assert!(world.tick_reactions().is_empty());
+    }
+
+    fn shuffle_events(events: &mut [MaterialEvent], seed: u64) {
+        let mut s = seed | 1;
+        for i in (1..events.len()).rev() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            events.swap(i, (s as usize) % (i + 1));
+        }
+    }
+
+    #[test]
+    fn scheduler_is_order_independent_under_shuffle() {
+        let mut events = Vec::new();
+        for x in 0..16 {
+            events.push(MaterialEvent {
+                at: (x, 0, 0),
+                kind: EventKind::Collision,
+            });
+        }
+        let run = |seed: u64| {
+            let mut m = map();
+            let a = single(&mut m.reg, [40, 40, 40, 40]);
+            let b = single(&mut m.reg, [90, 40, 40, 40]);
+            for x in 0..16 {
+                m.set_block((x, 0, 0), if x % 2 == 0 { a } else { b });
+            }
+            let mut evs = events.clone();
+            shuffle_events(&mut evs, seed);
+            let mut s = ReactionScheduler::new();
+            for e in evs {
+                s.push(e);
+            }
+            let law = Law::v0();
+            let budget = Budget {
+                events_per_generation: 5,
+                generations_per_tick: 8,
+                max_followups: 24,
+            };
+            let mut committed = Vec::new();
+            for _ in 0..8 {
+                committed.extend(s.tick(&mut m, &law, budget));
+            }
+            committed.sort_by_key(|mu| (mu.pos, mu.from.0, mu.to.0));
+            let world: Vec<_> = (0..16)
+                .map(|x| (x, m.block_at((x, 0, 0)).unwrap()))
+                .collect();
+            (committed, world)
+        };
+        let a = run(1);
+        let b = run(0x9E37_79B1);
+        let c = run(0xA5A5_A5A5);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert!(
+            !a.0.is_empty(),
+            "the shuffled pair must actually react so the check is not vacuous"
+        );
+    }
+
+    #[test]
+    fn followups_never_exceed_the_budget() {
+        let mut m = map();
+        let a = single(&mut m.reg, [40, 40, 40, 40]);
+        let b = single(&mut m.reg, [90, 40, 40, 40]);
+        for x in 0..32 {
+            m.set_block((x, 0, 0), if x % 2 == 0 { a } else { b });
+        }
+        let mut s = ReactionScheduler::new();
+        for x in 0..32 {
+            s.push(MaterialEvent {
+                at: (x, 0, 0),
+                kind: EventKind::Collision,
+            });
+        }
+        let pending_before = s.pending();
+        let budget = Budget {
+            events_per_generation: 32,
+            generations_per_tick: 1,
+            max_followups: 7,
+        };
+        let _ = s.tick(&mut m, &Law::v0(), budget);
+        let new_events = s.pending().saturating_sub(pending_before.saturating_sub(32));
+        assert!(
+            new_events <= budget.max_followups,
+            "follow-ups {new_events} exceeded max {}",
+            budget.max_followups
+        );
+    }
+
+    #[test]
+    fn empty_pending_tick_is_a_noop() {
+        let mut m = map();
+        let before = m.reg.block_count();
+        let mut s = ReactionScheduler::new();
+        let out = s.tick(&mut m, &Law::v0(), Budget::DEFAULT);
+        assert!(out.is_empty());
+        assert_eq!(s.generations, 0);
+        assert_eq!(m.reg.block_count(), before);
+    }
+
+    #[test]
+    fn world_quiet_tick_interns_nothing() {
+        let mut world = World::with_config(1, RenderConfig::default());
+        let before = world.registry().block_count();
+        assert!(world.tick_reactions().is_empty());
+        assert_eq!(world.registry().block_count(), before);
+        assert_eq!(world.reactions().pending(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn scheduler_tick_cost_at_budget() {
+        let mut m = map();
+        let a = single(&mut m.reg, [40, 40, 40, 40]);
+        let b = single(&mut m.reg, [90, 40, 40, 40]);
+        for x in 0..256 {
+            m.set_block((x, 0, 0), if x % 2 == 0 { a } else { b });
+        }
+        let mut s = ReactionScheduler::new();
+        for x in 0..256 {
+            s.push(MaterialEvent {
+                at: (x, 0, 0),
+                kind: EventKind::Collision,
+            });
+        }
+        let law = Law::v0();
+        let t0 = std::time::Instant::now();
+        let _ = s.tick(&mut m, &law, Budget::DEFAULT);
+        let us = t0.elapsed().as_secs_f64() * 1e6;
+        println!(
+            "scheduler tick at default budget: {us:.0} µs (pending left {})",
+            s.pending()
+        );
+        assert!(us < 50_000.0, "tick {us:.0} µs is past the sanity ceiling");
     }
 }

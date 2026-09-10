@@ -248,6 +248,33 @@ mod fingerprint_tests {
         let cfg = DiffusionCfg { phases: 8, ..Default::default() };
         assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
     }
+
+    #[test]
+    fn fingerprint_survives_a_reaction_the_client_never_saw() {
+        use crate::block::BlockRegistry;
+        use crate::world::placement;
+        use material::{Configuration, Element};
+
+        let mut server = BlockRegistry::with_builtins();
+        placement::builtin().compile(&mut server);
+        let before = fingerprint_of(&server);
+        let novel = Configuration::new(vec![
+            Element::new([3, 9, 27, 81]),
+            Element::new([4, 16, 64, 1]),
+        ])
+        .unwrap();
+        let sid = server.intern(&novel).unwrap();
+        let spec = server.spec(sid);
+        assert_eq!(fingerprint_of(&server), before, "interning does not change the handshake");
+
+        let mut client = BlockRegistry::with_builtins();
+        placement::builtin().compile(&mut client);
+        assert!(client.lookup(&novel).is_none(), "client has not seen the product");
+        let cid = client.parse_spec(&spec).unwrap();
+        assert_eq!(client.configuration(cid), server.configuration(sid));
+        assert_eq!(fingerprint_of(&client), fingerprint_of(&server));
+        assert_eq!(fingerprint_of(&client), before);
+    }
 }
 
 /// Chat channels. Local is proximity-limited; global reaches everyone.

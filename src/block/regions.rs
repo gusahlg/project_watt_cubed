@@ -552,6 +552,75 @@ mod tests {
     }
 
     #[test]
+    fn lamp_centre_emits_at_least_eight() {
+        let law = Law::v0();
+        let lamp = builtin(&law).into_iter().find(|r| r.label == "lamp").unwrap();
+        let obs = observe(&law, &Configuration::single(lamp.centre));
+        assert!(
+            obs.emission >= 8,
+            "lamp centre {:?} emission {} (glow_min={})",
+            lamp.centre.0,
+            obs.emission,
+            law.probes.glow_min
+        );
+        assert!(obs.solid, "lamp centre must be solid");
+    }
+
+    #[test]
+    fn similarity_holds_on_region_families() {
+        let law = Law::v0();
+        let regions = builtin(&law);
+        let mut worst = 0i32;
+        for r in &regions {
+            for e in r.matter() {
+                for axis in 0..4 {
+                    if e.0[axis] == 255 {
+                        continue;
+                    }
+                    let mut e2 = e;
+                    e2.0[axis] += 1;
+                    for t in r.matter() {
+                        let f1 = material::element_influence(&law, e, t).0;
+                        let f2 = material::element_influence(&law, e2, t).0;
+                        for i in 0..4 {
+                            worst = worst.max((f1[i] as i32 - f2[i] as i32).abs());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst <= 6,
+            "one lattice step on a region family changed an influence by {worst}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn region_compile_stays_under_five_ms() {
+        use crate::block::BlockRegistry;
+        use crate::world::placement;
+        let mut times = [0u128; 8];
+        for t in times.iter_mut() {
+            let mut r = BlockRegistry::with_builtins();
+            let t0 = std::time::Instant::now();
+            let _ = placement::builtin().compile(&mut r);
+            *t = t0.elapsed().as_micros();
+        }
+        let first = times[0];
+        times.sort_unstable();
+        let mid = times[times.len() / 2];
+        println!(
+            "region compile first {} µs (v0 search+intern) median {} µs (samples {times:?})",
+            first, mid
+        );
+        assert!(
+            mid < 5_000,
+            "region compile median {mid} µs must stay under 5 ms"
+        );
+    }
+
+    #[test]
     fn display_name_uses_label_then_like_then_unknown() {
         let law = Law::v0();
         let regions = builtin(&law);

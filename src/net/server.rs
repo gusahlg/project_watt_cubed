@@ -1622,6 +1622,26 @@ mod tests {
     }
 
     #[test]
+    fn a_client_craft_does_not_commit_world_reactions() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let pending_before = shared.lock_recover().reactions.pending();
+        on_craft(&shared, 1, "air", "air", 3, 1);
+        on_craft(&shared, 1, "air", "air", 99, 1);
+        let state = shared.lock_recover();
+        assert_eq!(
+            state.reactions.pending(),
+            pending_before,
+            "ExternallyChanged craft must not queue scheduler events"
+        );
+        assert!(state.edits.is_empty(), "craft must not write the overlay");
+        drop(state);
+        assert!(rx.try_recv().is_err(), "malformed craft is silent");
+    }
+
+    #[test]
     fn on_edit_queues_place_and_break_events() {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();

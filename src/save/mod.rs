@@ -34,7 +34,7 @@ pub(crate) fn parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::bridge::{from_doc, unknown_material_notice};
+    use super::bridge::{from_doc, unknown_material_notice, v7_law_notice};
     use super::format::{PlayerState, SaveDoc, WorldgenStamp};
     use crate::mods::Mods;
     use crate::player::Player;
@@ -282,6 +282,20 @@ mod tests {
             from_doc(doc, &mut mods, make_world),
             Err(SaveError::LawMismatch)
         ));
+    }
+
+    #[test]
+    fn v7_save_emits_a_migration_notice_and_loads() {
+        assert_eq!(
+            v7_law_notice(&[]).as_deref(),
+            Some("save predates the law stamp (v7); assuming law v0")
+        );
+        assert_eq!(v7_law_notice(&material::Law::v0().stamp()), None);
+        let mut doc = bare_doc();
+        doc.law_stamp.clear();
+        let mut mods = Mods::with_defaults();
+        let (world, _, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(world.registry().law(), &material::Law::v0());
     }
 
     #[test]

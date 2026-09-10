@@ -202,6 +202,15 @@ pub(crate) fn unknown_material_notice(unknown_edits: u32, unknown_holdings: u32)
     }
 }
 
+/// Pre-v8 documents carry no law stamp; the load assumes law v0.
+pub(crate) fn v7_law_notice(law_stamp: &[u8]) -> Option<String> {
+    if law_stamp.is_empty() {
+        Some("save predates the law stamp (v7); assuming law v0".into())
+    } else {
+        None
+    }
+}
+
 fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
     let kind = WorldgenKind::from_wire(stamp.kind).unwrap_or(WorldgenKind::Classic);
     let cfg = DiffusionCfg {
@@ -224,6 +233,9 @@ pub fn from_doc(
 ) -> Result<(World, Player, SaveMeta), SaveError> {
     if !doc.law_stamp.is_empty() && doc.law_stamp != material::Law::v0().stamp() {
         return Err(SaveError::LawMismatch);
+    }
+    if let Some(msg) = v7_law_notice(&doc.law_stamp) {
+        eprintln!("{msg}");
     }
     if doc.worldgen_version != crate::world::placement::WORLDGEN_VERSION {
         eprintln!(
