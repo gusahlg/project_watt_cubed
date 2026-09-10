@@ -544,6 +544,7 @@ fn handle_client(
             spawn,
             worldgen: ctx.worldgen,
             diffusion: ctx.diffusion,
+            law: crate::net::protocol::law_stamp(),
         },
     );
     for batch in snapshot.chunks(SNAPSHOT_BATCH) {
@@ -1394,6 +1395,14 @@ mod tests {
         }
     }
 
+    fn rock_spec() -> String {
+        let mut r = BlockRegistry::with_builtins();
+        let id = r
+            .intern(&material::Configuration::single(material::Element::new([40, 80, 120, 160])))
+            .unwrap();
+        r.spec(id)
+    }
+
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
         State {
             edits: HashMap::new(),
@@ -1556,13 +1565,14 @@ mod tests {
         assert_eq!(ack(&rx), (11, false, 1));
 
         // Building on the current revision succeeds.
-        on_edit(&shared, None, 1, 12, 8, 20, 8, 1, "natural:Stone");
+        let rock = rock_spec();
+        on_edit(&shared, None, 1, 12, 8, 20, 8, 1, &rock);
         assert_eq!(ack(&rx), (12, true, 2));
 
         // Junk specs are rejected before touching the overlay or the pool.
         on_edit(&shared, None, 1, 13, 8, 20, 8, 2, "banana:zzz");
         assert_eq!(ack(&rx), (13, false, 2));
-        assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), "natural:Stone");
+        assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), rock.as_str());
     }
 
     /// Equivalent spec spellings collapse to ONE canonical pool entry, and a
@@ -1574,9 +1584,10 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        // Two spellings of the same composition: one canonical entry.
-        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, "natural:Iron,Stone");
-        on_edit(&shared, None, 1, 2, 8, 21, 8, 0, "natural:Stone,Iron");
+        // The same spec interned twice: one canonical entry.
+        let rock = rock_spec();
+        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, 1, 2, 8, 21, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "equivalent spellings share one entry");

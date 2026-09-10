@@ -74,7 +74,7 @@ fn lod2_world() -> World {
 #[test]
 fn indexed_section_edits_match_the_footprint_scan() {
     let mut world = lod2_world();
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     // Edits across several chunk columns and heights, one out of domain.
     world.set_block(3, 50, 4, stone);
     world.set_block(200, 90, -150, stone);
@@ -450,9 +450,9 @@ fn column_is_layered_grass_dirt_stone() {
     // Terrain speaks elements: crust blocks are the natural unions derived by
     // the placement table.
     let (grass, dirt, stone) = (
-        reg.id_by_name("Soil+Organic").unwrap(),
-        reg.id_by_name("Soil+Clay").unwrap(),
-        reg.id_by_name("Stone").unwrap(),
+        reg.id_by_label("organic+soil").unwrap(),
+        reg.id_by_label("clay+soil").unwrap(),
+        reg.id_by_label("rock").unwrap(),
     );
 
     let (x, z, h) = (0..64)
@@ -499,7 +499,7 @@ fn edits_persist_across_unload() {
         .unwrap();
     world.set_block(x, h, z, AIR);
     assert_eq!(world.block_at(x, h, z), AIR);
-    let stone = world.registry().id_by_name("Stone").unwrap();
+    let stone = world.registry().id_by_label("rock").unwrap();
     world.set_block(x, 70, z, stone);
 
     world.chunks.clear();
@@ -535,7 +535,7 @@ fn lighting_toggle_reseeds_only_stale_work_and_rejects_old_results() {
     assert!(world.chunks[&coord].light.is_none());
 
     let old = world.block_at(3, 3, 3);
-    let stone = world.registry().id_by_name("Stone").unwrap();
+    let stone = world.registry().id_by_label("rock").unwrap();
     world.set_block(3, 3, 3, if old == AIR { stone } else { AIR });
     world.chunks.get_mut(&missing).unwrap().light = None;
     assert!(world.light_worklist.contains(&coord));
@@ -949,7 +949,7 @@ fn neighbour_edits_bump_the_bordering_chunks_rev() {
     assert_eq!(world.chunks[&ChunkCoord::new(1, 0, 0)].rev, 0, "far side untouched");
 
     // Vertical borders also bump rev on the neighbour below.
-    let stone = world.registry().id_by_name("Stone").unwrap();
+    let stone = world.registry().id_by_label("rock").unwrap();
     let other =
         if world.block_at(8, 16, 8) == crate::block::AIR { stone } else { crate::block::AIR };
     let below = world.chunks[&ChunkCoord::new(0, 0, 0)].rev;
@@ -1360,7 +1360,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
     world.set_view_distances(6, 3);
     let center = ChunkCoord::new(0, 0, 0);
     world.center = Some(center);
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     for x in -5..=5 {
         for z in -5..=5 {
             for y in -2..=2 {
@@ -1582,7 +1582,7 @@ fn stale_light_result_does_not_land_on_a_regenerated_chunk() {
         ys.retain(|&y| y != coord.y);
     }
 
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     let (x, y, z) = (
         coord.x * CHUNK_SIZE as i32 + 1,
         coord.y * CHUNK_SIZE as i32 + 1,

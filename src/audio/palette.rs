@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::block::derive::SoundClass;
+use crate::block::SoundClass;
 
 use super::acoustics::Response;
 use super::content::{Catalog, CueId, CueMode, CueSymbols, Loop, OneShot};

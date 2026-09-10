@@ -185,8 +185,8 @@ struct PendingEdit {
 
 /// The economy side of a pending edit — what to give back on rejection.
 enum PendingKind {
-    /// Breaking awarded these elements; a rejection revokes them.
-    Break(Vec<crate::block::ElementId>),
+    /// Breaking awarded this configuration; a rejection revokes it.
+    Break(crate::block::BlockId),
     /// Placing spent one crafted block of this id; a rejection refunds it.
     Place(crate::block::BlockId),
 }
@@ -1238,9 +1238,9 @@ impl Game {
                         self.world.set_block(x, y, z, pending.prev);
                     }
                     match pending.kind {
-                        PendingKind::Break(elements) => {
-                            self.player.stash.revoke(&elements);
-                            mods.on_break_rejected(&elements);
+                        PendingKind::Break(id) => {
+                            self.player.stash.revoke(id, 1);
+                            mods.on_break_rejected(id);
                         }
                         PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
                     }
@@ -1386,8 +1386,8 @@ impl Game {
         }
     }
 
-    /// Break the block the player is looking at, depositing its elements into
-    /// the core stash before notifying mods.
+    /// Break the block the player is looking at, depositing its configuration
+    /// into the core stash before notifying mods.
     fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) = interact::raycast_solid(
             &self.world,
@@ -1399,16 +1399,13 @@ impl Game {
         };
         let (x, y, z) = hit.block;
         let id = self.world.block_at(x, y, z);
-        // Snapshot the block's elements before it's removed.
-        let elements = self.world.registry().block(id).composition.elements();
-        // Report the broken block; the director derives its class-specific cue.
         events.push(SoundEvent::BlockBroken {
             at: cell_center(x, y, z),
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
-        let overflow = !self.player.stash.add(&elements);
-        mods.on_block_break(&elements, &self.world, overflow);
+        let overflow = !self.player.stash.add(id, 1);
+        mods.on_block_break(id, &self.world, overflow);
         self.camera.fx.add_trauma(0.15);
         self.local_anim.on_action(WireAction::Swing);
         // Tell the server (it validates and relays to everyone else). The
@@ -1421,7 +1418,7 @@ impl Game {
                 PendingEdit {
                     cell: (x, y, z),
                     prev: id,
-                    kind: PendingKind::Break(elements.to_vec()),
+                    kind: PendingKind::Break(id),
                 },
             );
             net.send_swing();

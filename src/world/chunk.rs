@@ -416,9 +416,10 @@ mod tests {
     /// The generator plus the registry-resolved ids its terrain is made of.
     fn hills(seed: i64) -> (Terrain, BlockId, BlockId) {
         let mut registry = BlockRegistry::with_builtins();
-        let stone = registry.id_by_name("Stone").unwrap();
-        let dirt = registry.id_by_name("Soil").unwrap();
-        (Terrain::new(&mut registry, 20.0, seed), stone, dirt)
+        let g = Terrain::new(&mut registry, 20.0, seed);
+        let stone = registry.id_by_label("rock").unwrap();
+        let dirt = registry.id_by_label("soil").unwrap();
+        (g, stone, dirt)
     }
 
     #[test]

@@ -19,3 +19,6 @@ carry opaque opus frames. New message tags change the wire, so mixed v7/v8
 peers must not join.
 v9: `Welcome` carries worldgen kind + diffusion knobs so a joiner adopts
 the server's generator instead of its local mod state.
+v10: `Welcome` carries the law stamp; the content fingerprint folds
+`WORLDGEN_VERSION`, `Law::fingerprint()` and every builtin region centre.
+Edits use `parse_spec` (`c:<hex>` / `air`). Mixed laws refuse to share a world.

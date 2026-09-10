@@ -320,7 +320,7 @@ fn emit(
             dir.face.normal,
             // Vertex layer only (tables above index by the true id); wraps
             // past the device texture-layer cap like the chunk mesher.
-            layer % tables.layer_cap,
+            tables.render_layer(BlockId(layer)),
             Ao::new(sample.ao[i]),
             // Coarse LOD tiles have no smooth-light field — neutral daylight so
             // their shading tracks day/night via skylight rather than clamping.
@@ -574,13 +574,13 @@ mod tests {
         // real generator can emit (the fixtures below use builtin names only).
         let mut r = BlockRegistry::with_builtins();
         crate::world::placement::builtin().compile(&mut r);
-        let id = |n: &str| r.id_by_name(n).unwrap();
+        let id = |n: &str| r.id_by_label(n).unwrap();
         let blocks = Blocks {
-            grass: id("Soil+Organic"),
-            dirt: id("Soil+Clay"),
-            stone: id("Stone"),
-            sand: id("Sand"),
-            water: id("Water"),
+            grass: id("organic+soil"),
+            dirt: id("clay+soil"),
+            stone: id("rock"),
+            sand: id("sand"),
+            water: id("water"),
         };
         let tables = r.hot_tables();
         (r, tables, blocks)
@@ -732,8 +732,17 @@ mod tests {
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
         let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
+<<<<<<< HEAD
         let is_water_quad = |q: &[MeshVertex]| tables.fluid_surface(BlockId(q[0].layer()));
         let opaque_water = all_quads(&mesh).any(|(p, q)| p == Pass::Opaque && is_water_quad(&q));
+=======
+        let water_layers: std::collections::HashSet<u16> = (0..tables.len())
+            .filter(|&i| tables.fluid_surface(BlockId(i as u16)))
+            .map(|i| tables.render_layer(BlockId(i as u16)))
+            .collect();
+        let is_water_quad = |q: &[MeshVertex]| water_layers.contains(&q[0].layer());
+        let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(&q));
+>>>>>>> pm/w-b
         assert!(opaque_water, "water surface meshes into the opaque pass");
         assert!(!all_quads(&mesh).any(|(_, q)| q[0].is_water()), "LOD water clears the water bit");
         assert!(

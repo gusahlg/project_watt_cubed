@@ -398,7 +398,7 @@ mod tests {
         let colors = reg.color_snapshot();
         let cs = 16usize;
         let idx = |x: usize, y: usize, z: usize| x + z * cs + y * cs * cs;
-        let stone = reg.id_by_name("Stone").unwrap();
+        let stone = reg.id_by_label("rock").unwrap();
         let edits = [
             (crate::coord::ChunkCoord::new(0, 5, 0), vec![(idx(2, 6, 2), stone), (idx(3, 1, 5), crate::block::registry::AIR)]),
             (crate::coord::ChunkCoord::new(1, 8, 1), vec![(idx(9, 9, 9), stone)]),
@@ -661,7 +661,7 @@ mod tests {
         use crate::world::chunk::Chunk;
 
         let (reg, g) = terra(23);
-        let stone = reg.id_by_name("Stone").unwrap();
+        let stone = reg.id_by_label("rock").unwrap();
         let colors = reg.color_snapshot();
         let pos = SectionPos { detail: FINEST_DETAIL, x: 100, z: -50 };
         let cell = pos.cell_size();

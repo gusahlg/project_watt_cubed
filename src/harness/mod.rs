@@ -1319,10 +1319,10 @@ fn carve_cave(game: &mut Game) {
     let registry = game.world().registry();
     // The ordinary element-derived stone/lumin composition.
     let emitter = registry
-        .id_by_name("Stone+Lumin")
+        .id_by_label("lamp+rock")
         .expect("worldgen registers the Stone+Lumin composition");
     let stone = registry
-        .id_by_name("Stone")
+        .id_by_label("rock")
         .expect("Stone is a built-in block");
     let air = crate::block::registry::AIR;
     let p = game.player().position;

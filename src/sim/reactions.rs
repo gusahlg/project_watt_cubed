@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use material::{interact_many, EventKind, Law};
 
-use crate::block::materials::{BlockId, BlockRegistry, AIR};
+use crate::block::{BlockId, BlockRegistry, AIR};
 
 /// A world position of one voxel.
 pub type Pos = (i32, i32, i32);

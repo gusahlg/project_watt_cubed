@@ -234,6 +234,7 @@ mod tests {
         SaveDoc {
             worldgen_version: 2,
             worldgen: WorldgenStamp::default(),
+            law_stamp: material::Law::v0().stamp(),
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,

@@ -22,6 +22,13 @@ use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
+pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
+    let v = material::Law::v0().stamp();
+    let mut a = [0u8; material::STAMP_LEN];
+    a.copy_from_slice(&v);
+    a
+}
+
 /// One field's wire codec: how it is written to and read back from a message
 /// payload. The [`messages!`] table below pairs every enum field with exactly
 /// one of these impls, so the field's Rust type IS its wire format — encode
@@ -30,6 +37,18 @@ trait Wire: Sized {
     fn put(&self, w: &mut codec::Writer);
     /// `None` on malformed or truncated input (the whole message is rejected).
     fn get(r: &mut codec::Reader) -> Option<Self>;
+}
+
+impl Wire for [u8; material::STAMP_LEN] {
+    fn put(&self, w: &mut codec::Writer) {
+        w.raw(self);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let s = r.take(material::STAMP_LEN).ok()?;
+        let mut a = [0u8; material::STAMP_LEN];
+        a.copy_from_slice(s);
+        Some(a)
+    }
 }
 
 /// Plain fixed-width fields whose `Writer`/`Reader` method pair share a name.
@@ -299,6 +318,7 @@ messages! {
             spawn: DVec3,
             worldgen: WorldgenKind,
             diffusion: DiffusionCfg,
+            law: [u8; material::STAMP_LEN],
         },
         /// The stream closes after this (bad password, version mismatch, server full).
         Reject = tag::REJECT { reason: Arc<str> },
@@ -433,6 +453,7 @@ mod tests {
                 spawn: DVec3::new(0.5, 40.0, 0.5),
                 worldgen: WorldgenKind::Classic,
                 diffusion: DiffusionCfg::default(),
+                law: law_stamp(),
             },
             ServerMessage::Welcome {
                 player_id: 7,
@@ -445,6 +466,7 @@ mod tests {
                     phases: 4,
                     relief: 1.5,
                 },
+                law: law_stamp(),
             },
             ServerMessage::Reject { reason: "bad password".into() },
             ServerMessage::Snapshot {
@@ -479,6 +501,29 @@ mod tests {
             ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7].try_into().unwrap() },
             ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new().try_into().unwrap() },
         ]
+    }
+
+    #[test]
+    fn spec_round_trips_through_the_wire() {
+        let mut r = crate::block::BlockRegistry::with_builtins();
+        crate::world::placement::builtin().compile(&mut r);
+        let id = r.id_by_label("rock").unwrap();
+        let spec = r.spec(id);
+        let msg = ClientMessage::Edit {
+            req: 1,
+            x: 0,
+            y: 1,
+            z: 2,
+            expect: 0,
+            spec: spec.clone().into(),
+        };
+        match ClientMessage::decode(&msg.encode()) {
+            Some(ClientMessage::Edit { spec: got, .. }) => assert_eq!(&*got, spec),
+            other => panic!("bad decode: {other:?}"),
+        }
+        let mut r2 = crate::block::BlockRegistry::with_builtins();
+        let id2 = r2.parse_spec(&spec).unwrap();
+        assert_eq!(r2.configuration(id2), r.configuration(id));
     }
 
     #[test]
@@ -528,6 +573,7 @@ mod tests {
             spawn: pos,
             worldgen: WorldgenKind::Diffusion,
             diffusion: DiffusionCfg::default(),
+            law: law_stamp(),
         };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
     }
@@ -540,6 +586,7 @@ mod tests {
             spawn: DVec3::ZERO,
             worldgen: WorldgenKind::Classic,
             diffusion: DiffusionCfg::default(),
+            law: law_stamp(),
         }
         .encode();
         // kind sits after tag, player_id, seed, spawn (1+4+8+24 = 37).

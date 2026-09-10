@@ -21,7 +21,7 @@ use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::block::ElementId;
+use crate::block::BlockId;
 use crate::menu::start::{StartFacts, StartScreen};
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
@@ -205,18 +205,18 @@ pub trait Mod {
         let _ = ctx;
     }
 
-    /// A block was broken into these elements. The core has already deposited
-    /// them into the player stash; this is a notification. `overflow` is true
-    /// when the stash dropped any of them (capacity).
-    fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
-        let _ = (elements, world, overflow);
+    /// A block was broken into this configuration. The core has already deposited
+    /// it into the player stash; this is a notification. `overflow` is true
+    /// when the stash dropped it (capacity).
+    fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
+        let _ = (id, world, overflow);
     }
 
     /// The server rejected a break this client predicted (someone else won the
     /// cell). The core has already revoked the loot from the stash; this is a
     /// notification.
-    fn on_break_rejected(&mut self, elements: &[ElementId]) {
-        let _ = elements;
+    fn on_break_rejected(&mut self, id: BlockId) {
+        let _ = id;
     }
 
     /// The server rejected a placement this client predicted: refund whatever
@@ -382,13 +382,13 @@ impl Mods {
     }
 
     /// Fan a block-break event out to every enabled mod.
-    pub fn on_block_break(&mut self, elements: &[ElementId], world: &World, overflow: bool) {
-        self.each_enabled(|m| m.on_block_break(elements, world, overflow));
+    pub fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
+        self.each_enabled(|m| m.on_block_break(id, world, overflow));
     }
 
     /// Fan a rejected-break rollback out to every enabled mod.
-    pub fn on_break_rejected(&mut self, elements: &[ElementId]) {
-        self.each_enabled(|m| m.on_break_rejected(elements));
+    pub fn on_break_rejected(&mut self, id: BlockId) {
+        self.each_enabled(|m| m.on_break_rejected(id));
     }
 
     /// Fan a rejected-placement refund out to every enabled mod.
@@ -818,7 +818,9 @@ mod tests {
     fn save_states_key_by_id_and_load_accepts_display_name() {
         let mut world = World::new(1);
         let mut mods = Mods::with_defaults();
-        mods.load_state("Crafting", "*IronVein=2", &mut world);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let spec = world.registry().spec(rock);
+        mods.load_state("Crafting", &format!("*{spec}=2"), &mut world);
         let saved = mods.save_states(&world);
         assert!(
             saved.iter().any(|(k, _)| k == "crafting"),
@@ -858,7 +860,9 @@ mod tests {
     fn mod_state_round_trips_version_prefix() {
         let mut world = World::new(1);
         let mut mods = Mods::with_defaults();
-        mods.load_state("Crafting", "*IronVein=2", &mut world);
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let spec = world.registry().spec(rock);
+        mods.load_state("Crafting", &format!("*{spec}=2"), &mut world);
         let saved = mods.save_states(&world);
         assert!(
             saved.iter().all(|(k, _)| k != "inventory"),
@@ -869,7 +873,7 @@ mod tests {
             .find(|(k, _)| k == "crafting")
             .map(|(_, d)| d.as_str())
             .expect("crafting");
-        assert_eq!(craft, "v1;*Stone+Iron=2");
+        assert_eq!(craft, format!("v1;*{spec}=2"));
 
         let mut fresh = Mods::with_defaults();
         for (k, v) in &saved {
@@ -877,16 +881,15 @@ mod tests {
         }
         assert_eq!(fresh.save_states(&world), saved);
 
-        // Unprefixed display-name key is version 0 and still migrates veins.
         let mut legacy = Mods::with_defaults();
-        legacy.load_state("Crafting", "*IronVein=1", &mut world);
+        legacy.load_state("Crafting", &format!("*{spec}=1"), &mut world);
         let craft = legacy
             .save_states(&world)
             .into_iter()
             .find(|(k, _)| k == "crafting")
             .map(|(_, d)| d)
             .expect("crafting");
-        assert_eq!(craft, "v1;*Stone+Iron=1");
+        assert_eq!(craft, format!("v1;*{spec}=1"));
     }
 
     fn index_of(mods: &Mods, id: &str) -> usize {
