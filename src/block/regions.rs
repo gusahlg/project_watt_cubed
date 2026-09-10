@@ -506,6 +506,7 @@ fn candidate(fp: u64, label: u32, n: u32) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use material::observe_element;
     use material::observe;
 
     #[test]
