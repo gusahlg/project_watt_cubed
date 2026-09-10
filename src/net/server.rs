@@ -35,8 +35,9 @@ use voxel_engine::DVec3;
 
 use crate::math::block_coord;
 
-use crate::block::registry::BlockRegistry;
+use crate::block::registry::{BlockId, BlockRegistry, AIR};
 use crate::net::hooks;
+use crate::sim::reactions::{self, CellStore, Pos, ReactionScheduler};
 pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
@@ -59,6 +60,9 @@ impl<T> LockRecover<T> for Mutex<T> {
 
 /// Hard bound so a flood of connects can't spawn unbounded threads.
 const MAX_PLAYERS: usize = 256;
+/// Reserved player id for scheduler mutations attributed to the world, not a player.
+/// `next_id` starts at 1 so this id is never assigned to a joiner.
+const WORLD_PLAYER: u32 = 0;
 /// `MAX_PLAYERS` bounds the roster only AFTER a handshake; without this cap a
 /// flood of silent connects would squat a thread+fd each for the whole
 /// [`HANDSHAKE_TIMEOUT`]. Refused in the accept loop, before any thread spawns.
@@ -256,6 +260,8 @@ struct State {
     /// CURRENT phase rather than whatever `/time` last set.
     day: f32,
     day_set: Instant,
+    /// Server-authoritative reaction scheduler. Clients never run one.
+    reactions: ReactionScheduler,
 }
 
 impl State {
@@ -322,6 +328,101 @@ impl State {
         if Arc::strong_count(&old) == 2 {
             self.spec_pool.remove(&old);
         }
+    }
+}
+
+/// Ledger + generator as a [`CellStore`]: a cell not in the ledger reads from
+/// the generator, so the infinite world is defined without loading chunks.
+struct ServerCells<'a> {
+    state: &'a mut State,
+    generator: &'a crate::world::diffusion::Generator,
+}
+
+fn server_block(
+    state: &State,
+    generator: &crate::world::diffusion::Generator,
+    pos: Pos,
+) -> BlockId {
+    if let Some(cell) = state.edits.get(&pos) {
+        state.registry.lookup_spec(&cell.spec).unwrap_or(AIR)
+    } else {
+        generator.block_at(pos.0, pos.1, pos.2, generator.height(pos.0, pos.2))
+    }
+}
+
+impl CellStore for ServerCells<'_> {
+    fn block_at(&self, pos: Pos) -> Option<BlockId> {
+        Some(server_block(self.state, self.generator, pos))
+    }
+
+    fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+        let prev = server_block(self.state, self.generator, pos);
+        if prev == id {
+            return prev;
+        }
+        let canonical = crate::save::block_spec(&self.state.registry, id);
+        let Some(spec) = self.state.intern(&canonical) else {
+            return prev;
+        };
+        let rev = self.state.edits.get(&pos).map_or(0, |c| c.rev).saturating_add(1);
+        if let Some(old) = self.state.edits.insert(pos, Cell { spec, rev }) {
+            self.state.release(old.spec);
+        }
+        prev
+    }
+
+    fn registry(&self) -> &BlockRegistry {
+        &self.state.registry
+    }
+
+    fn registry_mut(&mut self) -> &mut BlockRegistry {
+        &mut self.state.registry
+    }
+}
+
+fn reactions_loop(shared: Arc<Mutex<State>>, ctx: Arc<Ctx>, shutdown: Arc<AtomicBool>) {
+    let period = Duration::from_millis(50);
+    while !shutdown.load(Ordering::Relaxed) {
+        let start = Instant::now();
+        run_reactions(&shared, &ctx);
+        if let Some(rest) = period.checked_sub(start.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
+}
+
+/// One sim tick of the scheduler. Each committed mutation is an `S_Edit`
+/// attributed to [`WORLD_PLAYER`], broadcast to every ready client, bounded by
+/// the same [`reactions::Budget`] that bounded the rule evaluation.
+fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
+    let mut state = shared.lock_recover();
+    if state.reactions.pending() == 0 {
+        return;
+    }
+    let law = *state.registry.law();
+    let budget = reactions::Budget::DEFAULT;
+    let mut sched = std::mem::take(&mut state.reactions);
+    let mutations = {
+        let mut cells = ServerCells {
+            state: &mut state,
+            generator: &ctx.generator,
+        };
+        sched.tick(&mut cells, &law, budget)
+    };
+    state.reactions = sched;
+    let cap = budget.events_per_generation.saturating_mul(budget.generations_per_tick as usize);
+    for m in mutations.into_iter().take(cap) {
+        let Some(cell) = state.edits.get(&m.pos) else { continue };
+        let msg = ServerMessage::Edit {
+            x: m.pos.0,
+            y: m.pos.1,
+            z: m.pos.2,
+            rev: cell.rev,
+            spec: cell.spec.clone(),
+        };
+        // Attributed to the reserved world player: broadcast to everyone
+        // (no client predicted these cells).
+        broadcast(&mut state, &msg, |pid, _| pid != WORLD_PLAYER);
     }
 }
 
@@ -433,7 +534,9 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         next_id: 1,
         day: 0.3,
         day_set: Instant::now(),
+        reactions: ReactionScheduler::new(),
     }));
+    debug_assert_ne!(WORLD_PLAYER, 1, "player ids start at 1; 0 is the world");
 
     #[cfg(test)]
     let state = shared.clone();
@@ -442,6 +545,10 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let handshake_pending = pending.clone();
     let accept_shutdown = shutdown.clone();
     let accept_rt = rt.clone();
+    let tick_shutdown = shutdown.clone();
+    let tick_shared = shared.clone();
+    let tick_ctx = ctx.clone();
+    thread::spawn(move || reactions_loop(tick_shared, tick_ctx, tick_shutdown));
     thread::spawn(move || accept_loop(endpoint, accept_rt, shared, ctx, accept_shutdown, pending));
 
     Ok(ServerHandle {
@@ -1096,6 +1203,11 @@ fn on_edit(
     if let Some(old) = state.edits.insert((x, y, z), Cell { spec: spec.clone(), rev }) {
         state.release(old.spec);
     }
+    if block == AIR {
+        reactions::on_broken(&mut state.reactions, (x, y, z));
+    } else {
+        reactions::on_placed(&mut state.reactions, (x, y, z));
+    }
     if let Some(out) = ack_to {
         let _ = out
             .try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
@@ -1413,6 +1525,7 @@ mod tests {
             next_id: 2,
             day: 0.3,
             day_set: Instant::now(),
+            reactions: ReactionScheduler::new(),
         }
     }
 
@@ -1436,6 +1549,59 @@ mod tests {
             generator: test_generator(),
             hooks: None,
         }
+    }
+
+    #[test]
+    fn player_ids_never_use_the_reserved_world_id() {
+        assert_eq!(WORLD_PLAYER, 0);
+        let state = test_state(HashMap::new());
+        assert!(state.next_id > WORLD_PLAYER);
+    }
+
+    #[test]
+    fn on_edit_queues_place_and_break_events() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let rock = rock_spec();
+        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
+        {
+            let state = shared.lock_recover();
+            assert_eq!(state.reactions.pending(), 1, "place emits NewContact at the cell");
+        }
+        on_edit(&shared, None, 1, 2, 8, 20, 8, 1, "air");
+        let state = shared.lock_recover();
+        assert!(
+            state.reactions.pending() >= 6,
+            "break emits ExternallyChanged on six neighbours: {}",
+            state.reactions.pending()
+        );
+    }
+
+    #[test]
+    fn scripted_reactions_match_a_local_world() {
+        use crate::render_config::RenderConfig;
+        use crate::sim::reactions::{reactive_region_pair, scripted_run, ReactionScheduler};
+        use crate::world::World;
+
+        let mut world = World::with_config(42, RenderConfig::default());
+        let (wa, wb) = reactive_region_pair(world.registry_mut());
+        let y = world.surface_y(0, 0);
+        let local = scripted_run(&mut world, &mut ReactionScheduler::new(), wa, wb, y);
+
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = crate::world::diffusion::classic(&mut registry, 42);
+        let (sa, sb) = reactive_region_pair(&mut registry);
+        let mut state = test_state(HashMap::new());
+        state.registry = registry;
+        let mut cells = ServerCells {
+            state: &mut state,
+            generator: &generator,
+        };
+        let server = scripted_run(&mut cells, &mut ReactionScheduler::new(), sa, sb, y);
+        assert_eq!(local, server);
+        assert!(!local.is_empty(), "scripted pair must react");
     }
 
     /// An out-of-reach edit must be rejected; an in-reach one must be recorded.

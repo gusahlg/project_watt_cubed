@@ -927,11 +927,40 @@ impl World {
     /// async drain, the sync edit remesh, and the terminal degraded promotion.
     /// `retire` frees whatever the old state carried, exactly once.
     fn upload_chunk(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
+        let hash = mesh::content_hash(data);
+        if self.chunks.get(&coord).is_some_and(|l| l.mesh_hash == Some(hash)) {
+            self.keep_resident_mesh(coord, eng);
+            return;
+        }
         let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             let was = loaded.state.is_building();
             loaded.retire(MeshState::from_upload(handles), eng);
+            loaded.mesh_hash = Some(hash);
+            super::adjust_count(&mut self.building_meshes, was, false);
+            loaded.visible = vis;
+            if !vis && let Some(meshes) = loaded.state.live_meshes() {
+                meshes.set_visible(eng, false);
+            }
+        }
+    }
+
+    /// An edit remesh whose vertex bytes match the resident GPU mesh: keep the
+    /// existing handles and drop the Dirty/NeedsMesh claim, no upload.
+    fn keep_resident_mesh(&mut self, coord: Coord, eng: &mut Engine) {
+        let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
+            let next = match std::mem::replace(&mut loaded.state, MeshState::Air) {
+                MeshState::Ready(m)
+                | MeshState::Dirty { prev: Some(m) }
+                | MeshState::NeedsMesh { prev: Some(m), .. } => MeshState::Ready(m),
+                MeshState::Dirty { prev: None }
+                | MeshState::NeedsMesh { prev: None, .. }
+                | MeshState::Air => MeshState::Air,
+            };
+            loaded.state = next;
             super::adjust_count(&mut self.building_meshes, was, false);
             loaded.visible = vis;
             if !vis && let Some(meshes) = loaded.state.live_meshes() {
@@ -1448,6 +1477,7 @@ impl World {
                 light: None,
                 has_blocklight: false,
                 light_gen,
+                mesh_hash: None,
             },
         );
         // Ceiling-cache lifetime: the column's last layer out drops the entry.
@@ -2543,6 +2573,8 @@ impl World {
             light_admitted: self.light_admitted,
             light_admitted_last: self.light_admitted_last,
             light_seed_inserts: self.light_seed_inserts,
+            reactions_pending: self.reactions.pending(),
+            reactions_mutations: self.reactions.mutations,
         }
     }
 

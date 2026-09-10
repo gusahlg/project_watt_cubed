@@ -62,6 +62,7 @@ commands! {
     "tp" | "teleport" | "setpos", "  tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
     "pos" | "where", "  pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
     "inspect" | "look", "  inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
+    "reactions", "  reactions            show pending reaction events" => reactions(world);
     "gfx" | "graphics", "  gfx [setting value]  show or change graphics settings" => gfx(args, settings, visuals);
     "time", "  time [set|length]    show or set the day/night clock" => time(args, sky);
     "walkspeed", "  walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
@@ -369,6 +370,17 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     ])
 }
 
+/// `/reactions` — pending queue, generations run, mutations committed.
+fn reactions(world: &World) -> Vec<Line> {
+    let r = world.reactions();
+    shown(vec![format!(
+        "reactions: pending={} generations={} mutations={}",
+        r.pending(),
+        r.generations,
+        r.mutations
+    )])
+}
+
 /// Format a position the same way the on-screen coordinate readout does.
 fn fmt_pos(p: DVec3) -> String {
     format!("X {:.1}  Y {:.1}  Z {:.1}", p.x, p.y, p.z)
@@ -408,6 +420,7 @@ mod tests {
              tp <x> <y> <z>       teleport to coordinates\n  \
              pos                  show current coordinates\n  \
              inspect [x y z]      describe a block's elements & properties\n  \
+             reactions            show pending reaction events\n  \
              gfx [setting value]  show or change graphics settings\n  \
              time [set|length]    show or set the day/night clock\n  \
              walkspeed [n]        show or set ground walk speed\n  \
@@ -512,6 +525,13 @@ mod tests {
         let (mut p, mut w) = (player(), world());
         let out = run("inspect 8 60 8", &mut p, &mut w);
         assert!(joined(&out).contains("air"));
+    }
+
+    #[test]
+    fn reactions_prints_pending_generations_mutations() {
+        let (mut p, mut w) = (player(), world());
+        let out = run("reactions", &mut p, &mut w);
+        assert_eq!(joined(&out), "reactions: pending=0 generations=0 mutations=0");
     }
 
     #[test]

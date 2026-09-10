@@ -791,6 +791,8 @@ struct StreamPeaks {
     max_worker_capacity: usize,
     max_speed_mps: f64,
     min_effort: f32,
+    max_reactions_pending: usize,
+    max_reactions_mutations: u64,
 }
 
 impl Default for StreamPeaks {
@@ -809,6 +811,8 @@ impl Default for StreamPeaks {
             max_worker_capacity: 0,
             max_speed_mps: 0.0,
             min_effort: 1.0,
+            max_reactions_pending: 0,
+            max_reactions_mutations: 0,
         }
     }
 }
@@ -830,6 +834,8 @@ impl StreamPeaks {
         self.max_worker_capacity = self.max_worker_capacity.max(g.worker_capacity);
         self.max_speed_mps = self.max_speed_mps.max(g.travel_speed_mps);
         self.min_effort = self.min_effort.min(g.effort);
+        self.max_reactions_pending = self.max_reactions_pending.max(g.reactions_pending);
+        self.max_reactions_mutations = self.max_reactions_mutations.max(g.reactions_mutations);
     }
 
     fn to_json(self) -> Json {
@@ -854,6 +860,8 @@ impl StreamPeaks {
             ("worker_capacity", Json::from(self.max_worker_capacity)),
             ("travel_speed_mps", Json::number(self.max_speed_mps)),
             ("minimum_effort", Json::number(f64::from(self.min_effort))),
+            ("reactions.pending", Json::from(self.max_reactions_pending)),
+            ("reactions.mutations", Json::from(self.max_reactions_mutations)),
         ])
     }
 }
@@ -896,6 +904,8 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("light_admitted", Json::from(g.light_admitted as u64)),
         ("light_admitted_last", Json::from(g.light_admitted_last)),
         ("light_seed_inserts", Json::from(g.light_seed_inserts as u64)),
+        ("reactions.pending", Json::from(g.reactions_pending)),
+        ("reactions.mutations", Json::from(g.reactions_mutations)),
     ])
 }
 

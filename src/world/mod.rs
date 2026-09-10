@@ -167,6 +167,10 @@ pub struct StreamGauges {
     pub light_admitted_last: usize,
     /// Cumulative `light_worklist` insert attempts (including already-queued).
     pub light_seed_inserts: u64,
+    /// Reaction-event scheduler queue depth at sample time.
+    pub reactions_pending: usize,
+    /// Cumulative reaction mutations committed by the scheduler.
+    pub reactions_mutations: u64,
 }
 
 pub use census::MemoryCensus;
@@ -333,6 +337,10 @@ struct Loaded {
     /// (unload then regenerate, same `light_epoch`) cannot publish onto the
     /// new voxels.
     light_gen: u32,
+    /// Content hash of the GPU mesh currently resident (the hash of the last
+    /// uploaded vertex bytes). Compared before a remesh upload so an edit that
+    /// did not change the mesh skips the GPU transfer.
+    mesh_hash: Option<u64>,
 }
 
 /// Keep an in-flight claim counter in step with a boolean flag, without
@@ -352,12 +360,20 @@ impl Loaded {
     /// remesh, world-leave — routes through here, so there's one place to check
     /// for double frees or leaks.
     fn retire(&mut self, next: MeshState, eng: &mut Engine) {
+        let carrying = next.live_meshes().is_some();
         std::mem::replace(&mut self.state, next).free_owned(eng);
+        if !carrying {
+            self.mesh_hash = None;
+        }
     }
     /// Engine-free retire for claim tests that count frees through the hook.
     #[cfg(test)]
     fn retire_logged(&mut self, next: MeshState) {
+        let carrying = next.live_meshes().is_some();
         std::mem::replace(&mut self.state, next).free_logged();
+        if !carrying {
+            self.mesh_hash = None;
+        }
     }
 }
 
@@ -1019,6 +1035,12 @@ pub struct World {
     /// freshly minted token from the lane's `submit` to its `claim`.
     section_claim_seq: u64,
     section_pending_claim: Option<(SectionPos, pipeline::ClaimToken)>,
+    /// Gameplay reaction events. Ticked by the sim `reactions` system when this
+    /// instance is the authority (single-player or the dedicated server).
+    reactions: crate::sim::reactions::ReactionScheduler,
+    /// Single-player (and a hosting server) run the scheduler; a client connected
+    /// to a server does not.
+    reactions_authority: bool,
 }
 
 /// The exact inputs the desired-section frontier depends on, as cheap bit
@@ -1187,6 +1209,8 @@ impl World {
             section_epoch: 0,
             section_claim_seq: 0,
             section_pending_claim: None,
+            reactions: crate::sim::reactions::ReactionScheduler::new(),
+            reactions_authority: true,
         };
         if pregenerate_origin {
             // Centre the pre-generated box on the origin's surface chunk, the

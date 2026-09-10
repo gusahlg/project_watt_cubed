@@ -42,6 +42,45 @@ pub fn new_chunk_mesh_data() -> ChunkMeshData {
     ByPass::from_fn(MeshData::new)
 }
 
+/// FNV-1a 64 over every pass's decoded vertex fields. MeshVertex packed words
+/// are private to the engine, so this hashes the public fields.
+pub(in crate::world) fn content_hash(data: &ChunkMeshData) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    };
+    for (pass, mesh) in data.iter() {
+        mix(&mut h, pass as u8);
+        for v in mesh.vertices() {
+            for c in v.local_pos() {
+                for b in c.to_le_bytes() {
+                    mix(&mut h, b);
+                }
+            }
+            mix(&mut h, v.normal() as u8);
+            for b in v.layer().to_le_bytes() {
+                mix(&mut h, b);
+            }
+            mix(&mut h, (0..=3).find(|&a| v.ao() == Ao::new(a)).expect("ao 0..=3"));
+            let l = v.light();
+            let sky = (0u8..=15)
+                .find(|&s| (0u8..=15).any(|b| l == Light::new(s, b)))
+                .expect("sky 0..=15");
+            let block = (0u8..=15)
+                .find(|&b| l == Light::new(sky, b))
+                .expect("block 0..=15");
+            mix(&mut h, sky);
+            mix(&mut h, block);
+            mix(&mut h, v.is_water() as u8);
+            for m in v.micro() {
+                mix(&mut h, m as u8);
+            }
+        }
+    }
+    h
+}
+
 /// Chunk size as a signed coordinate, for the `-1..=16` padded range (tests).
 #[cfg(test)]
 const CS: i32 = CHUNK_SIZE as i32;
@@ -420,6 +459,13 @@ mod tests {
     use super::super::light::{LightLevel, Lumel};
     use crate::world::generation::TerrainGenerator;
     use voxel_engine::Pass;
+
+    #[test]
+    fn content_hash_is_stable_for_identical_meshes() {
+        let a = new_chunk_mesh_data();
+        let b = new_chunk_mesh_data();
+        assert_eq!(content_hash(&a), content_hash(&b));
+    }
 
     /// FNV-1a over every pass's decoded vertex fields (direction-major) and
     /// per-face quad counts. MeshVertex's packed words are private to the

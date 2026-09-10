@@ -327,7 +327,9 @@ impl Game {
         // — it fires only when whole ticks are due.
         let sim_id = sched.register(
             Simulation::manifest(),
-            Box::new(Simulation::with_systems(Vec::new())),
+            Box::new(Simulation::with_systems(vec![Box::new(
+                crate::sim::reactions::Reactions,
+            )])),
             u32::MAX,
         );
         sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
@@ -530,6 +532,7 @@ impl Game {
     /// Attach a server connection, turning this into a multiplayer session.
     pub fn with_net(mut self, net: Connection) -> Self {
         self.net = Some(net);
+        self.world.set_reactions_authority(false);
         self
     }
 
@@ -1218,6 +1221,11 @@ impl Game {
                     let prev = self.world.block_at(x, y, z);
                     let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
+                    if id == AIR {
+                        self.world.note_block_broken(x, y, z);
+                    } else {
+                        self.world.note_block_placed(x, y, z);
+                    }
                     let at = cell_center(x, y, z);
                     events.push(if id == AIR {
                         SoundEvent::BlockBroken { at, block: prev }
@@ -1404,6 +1412,7 @@ impl Game {
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
+        self.world.note_block_broken(x, y, z);
         let overflow = !self.player.stash.add(id, 1);
         mods.on_block_break(id, &self.world, overflow);
         self.camera.fx.add_trauma(0.15);
@@ -1459,6 +1468,7 @@ impl Game {
                 block: id,
             });
             self.world.set_block(x, y, z, id);
+            self.world.note_block_placed(x, y, z);
             self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
             // validates and relays, exactly like breaking does with "air".

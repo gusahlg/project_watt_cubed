@@ -290,6 +290,7 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         light: None,
         has_blocklight: false,
         light_gen: 0,
+        mesh_hash: None,
     }
 }
 
@@ -1360,6 +1361,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                         light: None,
                         has_blocklight: false,
                         light_gen: 0,
+                        mesh_hash: None,
                     },
                 );
             }

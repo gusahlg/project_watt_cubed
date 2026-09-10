@@ -157,6 +157,15 @@ pub struct ModContext<'a> {
     pub placements: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
 }
 
+impl ModContext<'_> {
+    /// Queue a material event at `pos` for the reaction scheduler. Machines emit
+    /// through this hook; chunk load/gen/mesh/save never do. No-op on a client
+    /// connected to a server (the authority runs the scheduler).
+    pub fn emit_material_event(&mut self, pos: (i32, i32, i32), kind: material::EventKind) {
+        self.world.push_material_event(pos, kind);
+    }
+}
+
 /// A unit of layered-on functionality. Every method has a default, so a mod
 /// implements only the hooks it cares about. This is the public surface mod authors
 /// write against — kept small on purpose.
