@@ -58,10 +58,12 @@ fn families_on_tiny_input() {
     if f.stable == 0 {
         assert_eq!(f.families, 0);
         assert_eq!(f.largest, 0);
+        assert_eq!(f.mean, 0.0);
     } else {
         assert!(f.families >= 1);
         assert!(f.largest >= 1);
         assert!(f.largest <= f.stable);
+        assert!((f.mean - f.stable as f64 / f.families as f64).abs() < 1e-9);
     }
 }
 
@@ -202,7 +204,163 @@ fn tiny_scorecard_renders() {
     assert!(text.contains("cascades"));
     assert!(text.contains("proliferation"));
     assert!(text.contains("families"));
+    assert!(text.contains("mean="));
     assert!(text.contains("observations"));
     assert!(text.contains("VERDICT"));
     assert!(card.pass_count() <= 7);
+}
+
+#[test]
+fn mutate_law_searches_named_dimensions() {
+    let base = Law::v0();
+    let v0 = named(&base);
+    assert_eq!(v0.rest_lo, 22);
+    assert_eq!(v0.rest_hi, 26);
+    assert_eq!(v0.peak_d, 40);
+    assert_eq!(v0.fade, 64);
+    assert_eq!(v0.coupling, 4);
+    assert_eq!(v0.max_step, 6);
+
+    let mut rng = Rng::new(1);
+    let mut rest = std::collections::HashSet::new();
+    let mut peaks = std::collections::HashSet::new();
+    let mut fades = std::collections::HashSet::new();
+    let mut couplings = std::collections::HashSet::new();
+    let mut steps = std::collections::HashSet::new();
+    for _ in 0..80 {
+        let law = mutate_law(&base, &mut rng);
+        law.validate().unwrap();
+        let n = named(&law);
+        assert!(n.rest_lo >= 20, "rest_lo {}", n.rest_lo);
+        assert!(n.rest_hi <= 30, "rest_hi {}", n.rest_hi);
+        assert!(n.rest_lo + 1 < n.rest_hi);
+        assert_eq!(law.kernel.knots[3].1, 0);
+        assert_eq!(law.kernel.knots[4].1, 0);
+        assert!(n.peak_d > n.rest_hi);
+        assert!(n.fade > n.peak_d);
+        assert!(n.peak_r > 0);
+        assert!(law.kernel.knots[2].1 < 0);
+        assert_eq!(law.kernel.knots[7].1, 0);
+        assert!((0..=8).contains(&n.coupling), "coupling {}", n.coupling);
+        for i in 0..material::D {
+            assert_eq!(law.kernel.mixing[i][i], 16);
+            assert_eq!(law.kernel.mixing[i][(i + 1) % material::D], n.coupling);
+            for j in 0..material::D {
+                if j != i && j != (i + 1) % material::D {
+                    assert_eq!(law.kernel.mixing[i][j], 0);
+                }
+            }
+        }
+        assert!((4..=8).contains(&n.max_step), "max_step {}", n.max_step);
+        rest.insert((n.rest_lo, n.rest_hi));
+        peaks.insert(n.peak_d);
+        fades.insert(n.fade);
+        couplings.insert(n.coupling);
+        steps.insert(n.max_step);
+        assert_eq!(law_from_hex(&stamp_hex(&law)).unwrap(), law);
+        assert_ne!(law, base, "a mutation must differ from v0");
+    }
+    assert!(rest.len() >= 5, "rest-band variety {}", rest.len());
+    assert!(peaks.len() >= 3, "peak variety {}", peaks.len());
+    assert!(fades.len() >= 3, "fade variety {}", fades.len());
+    assert!(couplings.len() >= 3, "coupling variety {}", couplings.len());
+    assert!(steps.len() >= 3, "max_step variety {}", steps.len());
+}
+
+#[test]
+fn sweep_rank_orders_named_goals() {
+    let a = rank_tuple(4, 5, 10, 300, true, 3);
+    let b = rank_tuple(3, 5, 10, 300, true, 7);
+    assert!(a > b, "quiescent % outranks PASS count");
+
+    let in_band = rank_tuple(4, 5, 10, 300, true, 3);
+    let out_band = rank_tuple(4, 5, 5_000, 5_000, true, 3);
+    assert!(in_band > out_band, "family count in 8-200 outranks a swarm");
+
+    let mean_ok = rank_tuple(4, 5, 10, 300, true, 3);
+    let mean_small = rank_tuple(4, 5, 10, 100, true, 3);
+    assert!(mean_ok > mean_small, "mean size >= 20 outranks tiny families");
+    assert!(family_target(10, 300));
+    assert!(!family_target(10, 100));
+    assert!(!family_target(5_000, 5_000));
+
+    let native = rank_tuple(4, 5, 10, 300, true, 3);
+    let quantum = rank_tuple(4, 5, 10, 300, false, 3);
+    assert!(native > quantum, "native sub-linear outranks quantum-only");
+
+    let more_pass = rank_tuple(4, 5, 10, 300, true, 5);
+    let fewer_pass = rank_tuple(4, 5, 10, 300, true, 4);
+    assert!(more_pass > fewer_pass);
+}
+
+#[test]
+fn sweep_returns_top_five_sorted_by_new_rank() {
+    let hits = sweep_at(123, 6, Scale::tiny());
+    assert!(hits.len() <= 5);
+    assert!(!hits.is_empty());
+    for w in hits.windows(2) {
+        assert!(rank_key(&w[0].card) >= rank_key(&w[1].card));
+    }
+    for h in &hits {
+        assert_eq!(h.stamp_hex, stamp_hex(&h.law));
+        assert_eq!(h.passes, h.card.pass_count());
+        assert_eq!(h.families, h.card.families.families);
+        h.law.validate().unwrap();
+        let n = named(&h.law);
+        assert!((4..=8).contains(&n.max_step));
+        assert!((0..=8).contains(&n.coupling));
+        assert!(n.rest_lo >= 20 && n.rest_hi <= 30);
+        let text = render_hit(1, h);
+        assert!(text.contains("quiescent="));
+        assert!(text.contains("family-target="));
+        assert!(text.contains("native-sublinear="));
+        assert!(text.contains("stamp="));
+    }
+}
+
+#[test]
+fn explain_v0_curve_has_four_regimes() {
+    let law = Law::v0();
+    let e = explain(&law, 1, 4_000);
+    assert_eq!(e.pairs, 4_000);
+    assert_eq!(e.axes, 4_000 * material::D as u32);
+    assert_eq!(e.inert + e.repulsive + e.rest + e.attractive, e.axes);
+    assert!(e.inert > 0 && e.repulsive > 0 && e.rest > 0 && e.attractive > 0);
+    assert_eq!(e.regime[0], Regime::Inert);
+    assert_eq!(e.regime[5], Regime::Inert);
+    assert_eq!(e.regime[16], Regime::Repulsive);
+    assert_eq!(e.regime[24], Regime::Rest);
+    assert_eq!(e.regime[40], Regime::Attractive);
+    assert_eq!(e.regime[100], Regime::Inert);
+    assert_eq!(e.curve[0], 0);
+    assert!(e.curve[16] < 0);
+    assert_eq!(e.curve[24], 0);
+    assert!(e.curve[40] > 0);
+    assert_eq!(e.curve[100], 0);
+
+    let text = render_explain(&law, &e);
+    assert!(text.contains("inert"));
+    assert!(text.contains("repulsive"));
+    assert!(text.contains("rest"));
+    assert!(text.contains("attractive"));
+    assert!(text.contains("g(|δ|)"));
+    assert!(text.contains("rest"));
+    assert!(text.contains(&stamp_hex(&law)));
+    assert!(text.contains("K"));
+    let full = explain_text(&law);
+    assert!(full.contains("random pairs"));
+    assert!(full.contains("mixing"));
+}
+
+#[test]
+fn explain_regimes_mark_interior_zeros_as_rest() {
+    let mut curve = [0i32; 256];
+    curve[10] = -4;
+    curve[40] = 6;
+    let r = regimes_of(&curve);
+    assert_eq!(r[0], Regime::Inert);
+    assert_eq!(r[10], Regime::Repulsive);
+    assert_eq!(r[20], Regime::Rest);
+    assert_eq!(r[40], Regime::Attractive);
+    assert_eq!(r[80], Regime::Inert);
 }

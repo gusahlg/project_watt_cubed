@@ -206,6 +206,8 @@ pub struct Families {
     pub families: u32,
     /// Size of the largest cluster.
     pub largest: u32,
+    /// Mean cluster size (`stable / families`); 0 when there are no families.
+    pub mean: f64,
     /// `stable / sample` as a percentage of the sampled lattice.
     pub coverage: f64,
     /// Verdict: family count in 8–200.
@@ -586,11 +588,17 @@ pub fn measure_families(law: &Law, rng: &mut Rng, n: u32) -> Families {
         cluster_l1(&mut stable, 24)
     };
     let coverage = pct(ns as u32, n);
+    let mean = if families == 0 {
+        0.0
+    } else {
+        ns as f64 / families as f64
+    };
     Families {
         sample: n,
         stable: ns as u32,
         families,
         largest,
+        mean,
         coverage,
         verdict: pass((8..=200).contains(&families)),
     }
@@ -782,11 +790,12 @@ impl fmt::Display for Scorecard {
         )?;
         writeln!(
             f,
-            "families     sample={}  stable={}  families={}  largest={}  coverage={:.1}%  [{}] 8-200",
+            "families     sample={}  stable={}  families={}  largest={}  mean={:.1}  coverage={:.1}%  [{}] 8-200",
             self.families.sample,
             self.families.stable,
             self.families.families,
             self.families.largest,
+            self.families.mean,
             self.families.coverage,
             self.families.verdict
         )?;
