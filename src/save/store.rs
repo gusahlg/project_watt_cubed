@@ -68,7 +68,11 @@ fn peek_file(path: &std::path::Path) -> Result<super::slot::SaveMeta, SaveError>
     let f = fs::File::open(path)?;
     let mut v = Vec::with_capacity(format::HEADER_LEN);
     f.take(format::HEADER_LEN as u64).read_to_end(&mut v)?;
-    format::peek_meta(&v)
+    match format::peek_meta(&v) {
+        Ok(meta) => Ok(meta),
+        Err(_) if v.len() < format::HEADER_LEN => Err(SaveError::Corrupt("not a save")),
+        Err(e) => Err(e),
+    }
 }
 
 /// Prefers: intact live > intact backup > salvaged live > salvaged backup.
@@ -428,7 +432,10 @@ mod tests {
 
         fs::write(live_path(&id), &bytes[..format::HEADER_LEN - 1]).unwrap();
         assert!(
-            peek_file(&live_path(&id)).is_err(),
+            matches!(
+                peek_file(&live_path(&id)),
+                Err(SaveError::Corrupt("not a save"))
+            ),
             "a v8 prefix shorter than header_len(8) is not a save"
         );
         cleanup(&id);

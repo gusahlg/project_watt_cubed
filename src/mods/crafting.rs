@@ -468,6 +468,16 @@ mod tests {
         let mut hud3 = Vec::new();
         crafting.hud(&world, &player, (800, 600), &mut hud3);
         assert_ne!(hud_text(&hud3), text1, "a stash mutation rebuilds the held rows");
+
+        crafting.cursor = usize::MAX;
+        assert!(player.stash.consume(rock, 2), "spend the rock stack");
+        assert!(crafting.refresh(&player.stash));
+        assert_eq!(crafting.held, vec![soil], "consumed kinds drop out of held rows");
+        assert!(
+            crafting.cursor < crafting.row_count(),
+            "cursor clamps after rows shrink"
+        );
+        assert!(!crafting.refresh(&player.stash), "an unchanged stash is a no-op");
     }
 
     #[test]

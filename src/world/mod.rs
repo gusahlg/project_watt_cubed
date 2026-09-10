@@ -337,9 +337,8 @@ struct Loaded {
     /// (unload then regenerate, same `light_epoch`) cannot publish onto the
     /// new voxels.
     light_gen: u32,
-    /// Content hash of the GPU mesh currently resident (the hash of the last
-    /// uploaded vertex bytes). Compared before a remesh upload so an edit that
-    /// did not change the mesh skips the GPU transfer.
+    /// Content hash of the last *sync* remesh. Async uploads store `None` so
+    /// they never hash on the main thread; an identical edit remesh then uploads.
     mesh_hash: Option<u64>,
 }
 
@@ -421,6 +420,30 @@ pub(in crate::world) mod mesh_free_log {
 
     pub fn take() -> Vec<MeshHandle> {
         FREED.with(|f| std::mem::take(&mut *f.borrow_mut()))
+    }
+}
+
+/// Test-only log of [`ChunkMeshes::set_visible`] calls, so visibility tests
+/// can record a fake engine without constructing one.
+#[cfg(test)]
+pub(in crate::world) mod vis_log {
+    use std::cell::RefCell;
+    use voxel_engine::MeshHandle;
+
+    thread_local! {
+        static CALLS: RefCell<Vec<(MeshHandle, bool)>> = RefCell::new(Vec::new());
+    }
+
+    pub fn record(handles: impl IntoIterator<Item = MeshHandle>, on: bool) {
+        CALLS.with(|c| {
+            for h in handles {
+                c.borrow_mut().push((h, on));
+            }
+        });
+    }
+
+    pub fn take() -> Vec<(MeshHandle, bool)> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 }
 

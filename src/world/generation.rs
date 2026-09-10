@@ -129,6 +129,11 @@ pub trait TerrainGenerator: Send + Sync {
         }
     }
 
+    /// Block at a world cell, sampling the column once (not `height` then `block_at`).
+    fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
+        self.block_at(wx, wy, wz, self.height(wx, wz))
+    }
+
     /// The block a coarse far-LOD tile shows at a cell. Distinct from
     /// [`block_at`](Self::block_at) because a tile samples at a `2^k`-metre stride
     /// where sub-cell detail would alias to noise: only the volumetric
@@ -1318,6 +1323,10 @@ impl TerrainGenerator for Terrain {
     }
 
     fn block_at(&self, wx: i32, wy: i32, wz: i32, _height: i32) -> BlockId {
+        self.cell_base(&self.profile(wx, wz), wx, wy, wz, true)
+    }
+
+    fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
         self.cell_base(&self.profile(wx, wz), wx, wy, wz, true)
     }
 

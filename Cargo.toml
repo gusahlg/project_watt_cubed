@@ -31,6 +31,9 @@ ash = "0.38"
 # and our direct `UVec3` (section block origins) are the same `glam` types.
 glam = "0.32.1"
 
+# MeshVertex is engine `Pod`; content hashes its packed 8 bytes without probing.
+bytemuck = { version = "1.23", default-features = false }
+
 # Multiplayer transport and its async runtime/TLS setup.
 quinn = { version = "0.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"

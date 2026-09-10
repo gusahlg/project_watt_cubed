@@ -37,7 +37,7 @@ use crate::math::block_coord;
 
 use crate::block::registry::{BlockId, BlockRegistry, AIR};
 use crate::net::hooks;
-use crate::sim::reactions::{self, CellStore, Pos, ReactionScheduler};
+use crate::sim::reactions::{self, CellStore, Mutation, Pos, ReactionScheduler};
 pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
@@ -346,7 +346,7 @@ fn server_block(
     if let Some(cell) = state.edits.get(&pos) {
         state.registry.lookup_spec(&cell.spec).unwrap_or(AIR)
     } else {
-        generator.block_at(pos.0, pos.1, pos.2, generator.height(pos.0, pos.2))
+        generator.voxel_at(pos.0, pos.1, pos.2)
     }
 }
 
@@ -391,9 +391,9 @@ fn reactions_loop(shared: Arc<Mutex<State>>, ctx: Arc<Ctx>, shutdown: Arc<Atomic
     }
 }
 
-/// One sim tick of the scheduler. Each committed mutation is an `S_Edit`
-/// attributed to [`WORLD_PLAYER`], broadcast to every ready client, bounded by
-/// the same [`reactions::Budget`] that bounded the rule evaluation.
+/// One sim tick of the scheduler. Committed mutations are [`ServerMessage::Snapshot`]
+/// batches attributed to [`WORLD_PLAYER`], broadcast to every ready client. The
+/// scheduler budget already bounds the count; every commit is sent.
 fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
     let mut state = shared.lock_recover();
     if state.reactions.pending() == 0 {
@@ -410,19 +410,29 @@ fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
         sched.tick(&mut cells, &law, budget)
     };
     state.reactions = sched;
-    let cap = budget.events_per_generation.saturating_mul(budget.generations_per_tick as usize);
-    for m in mutations.into_iter().take(cap) {
+    send_reaction_mutations(&mut state, &mutations);
+}
+
+/// Authoritative overlay edits from one scheduler tick, as snapshot batches
+/// (the client applies [`ServerMessage::Snapshot`] after bootstrap). One
+/// `S_Edit` per mutation would overflow [`OUT_CAPACITY`] on two full ticks.
+fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
+    if mutations.is_empty() {
+        return;
+    }
+    let mut edits = Vec::with_capacity(mutations.len());
+    for m in mutations {
         let Some(cell) = state.edits.get(&m.pos) else { continue };
-        let msg = ServerMessage::Edit {
-            x: m.pos.0,
-            y: m.pos.1,
-            z: m.pos.2,
-            rev: cell.rev,
-            spec: cell.spec.clone(),
-        };
-        // Attributed to the reserved world player: broadcast to everyone
-        // (no client predicted these cells).
-        broadcast(&mut state, &msg, |pid, _| pid != WORLD_PLAYER);
+        edits.push((m.pos.0, m.pos.1, m.pos.2, cell.rev, cell.spec.clone()));
+    }
+    for batch in edits.chunks(SNAPSHOT_BATCH) {
+        broadcast(
+            state,
+            &ServerMessage::Snapshot {
+                edits: batch.to_vec(),
+            },
+            |pid, _| pid != WORLD_PLAYER,
+        );
     }
 }
 
@@ -2624,6 +2634,98 @@ mod tests {
                 "leave 1 alice".to_string(),
                 "leave 2 bob".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn six_hundred_reaction_mutations_reach_the_client_in_order() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let spec = {
+            let mut state = shared.lock_recover();
+            state.intern(&rock_spec()).expect("spec pool")
+        };
+        let mutations: Vec<Mutation> = (0..600)
+            .map(|i| Mutation {
+                pos: (i, 20, 0),
+                from: AIR,
+                to: AIR,
+            })
+            .collect();
+        {
+            let mut state = shared.lock_recover();
+            for m in &mutations {
+                state.edits.insert(
+                    m.pos,
+                    Cell {
+                        spec: spec.clone(),
+                        rev: (m.pos.0 as u32) + 1,
+                    },
+                );
+            }
+            send_reaction_mutations(&mut state, &mutations);
+        }
+        let mut got = Vec::new();
+        for msg in drain_msgs(&rx) {
+            match msg {
+                ServerMessage::Snapshot { edits } => got.extend(edits),
+                other => panic!("expected Snapshot batches, got {other:?}"),
+            }
+        }
+        assert_eq!(got.len(), 600, "every committed mutation must reach the client");
+        for (i, (x, y, z, rev, s)) in got.into_iter().enumerate() {
+            assert_eq!((x, y, z), (i as i32, 20, 0));
+            assert_eq!(rev, i as u32 + 1);
+            assert_eq!(&*s, &*spec);
+        }
+    }
+
+    #[test]
+    fn server_block_evaluates_the_column_once_per_probe() {
+        use std::hint::black_box;
+
+        let mut registry = BlockRegistry::with_builtins();
+        let g = crate::world::diffusion::classic(&mut registry, 4242);
+        let probes: Vec<Pos> = (0..60)
+            .flat_map(|x| (0..60).map(move |z| (x, 16, z)))
+            .collect();
+        assert_eq!(probes.len(), 3600);
+
+        let naive = |g: &crate::world::diffusion::Generator| {
+            for &(x, y, z) in &probes {
+                black_box(g.block_at(x, y, z, g.height(x, z)));
+            }
+        };
+        let once = |g: &crate::world::diffusion::Generator| {
+            for &(x, y, z) in &probes {
+                black_box(g.voxel_at(x, y, z));
+            }
+        };
+        naive(&g);
+        once(&g);
+        let mut before = Duration::ZERO;
+        let mut after = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            naive(&g);
+            before += t0.elapsed();
+            let t1 = Instant::now();
+            once(&g);
+            after += t1.elapsed();
+        }
+        println!("server_block column eval: before={before:?} after={after:?}");
+        for &(x, y, z) in &probes {
+            assert_eq!(
+                g.block_at(x, y, z, g.height(x, z)),
+                g.voxel_at(x, y, z),
+                "voxel_at must match height+block_at at ({x},{y},{z})"
+            );
+        }
+        assert!(
+            after < before,
+            "one column eval per probe must beat height+block_at ({after:?} vs {before:?})"
         );
     }
 }

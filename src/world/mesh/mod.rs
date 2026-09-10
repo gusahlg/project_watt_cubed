@@ -42,9 +42,10 @@ pub fn new_chunk_mesh_data() -> ChunkMeshData {
     ByPass::from_fn(MeshData::new)
 }
 
-/// FNV-1a 64 over every pass's decoded vertex fields. MeshVertex packed words
-/// are private to the engine, so this hashes the public fields.
+/// FNV-1a 64 over every pass's packed `MeshVertex` bytes (`Pod`, 8 bytes each).
 pub(in crate::world) fn content_hash(data: &ChunkMeshData) -> u64 {
+    #[cfg(test)]
+    HASH_CALLS.with(|c| c.set(c.get() + 1));
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mix = |h: &mut u64, b: u8| {
         *h ^= b as u64;
@@ -53,32 +54,27 @@ pub(in crate::world) fn content_hash(data: &ChunkMeshData) -> u64 {
     for (pass, mesh) in data.iter() {
         mix(&mut h, pass as u8);
         for v in mesh.vertices() {
-            for c in v.local_pos() {
-                for b in c.to_le_bytes() {
-                    mix(&mut h, b);
-                }
-            }
-            mix(&mut h, v.normal() as u8);
-            for b in v.layer().to_le_bytes() {
-                mix(&mut h, b);
-            }
-            mix(&mut h, (0..=3).find(|&a| v.ao() == Ao::new(a)).expect("ao 0..=3"));
-            let l = v.light();
-            let sky = (0u8..=15)
-                .find(|&s| (0u8..=15).any(|b| l == Light::new(s, b)))
-                .expect("sky 0..=15");
-            let block = (0u8..=15)
-                .find(|&b| l == Light::new(sky, b))
-                .expect("block 0..=15");
-            mix(&mut h, sky);
-            mix(&mut h, block);
-            mix(&mut h, v.is_water() as u8);
-            for m in v.micro() {
-                mix(&mut h, m as u8);
+            for b in bytemuck::bytes_of(&v) {
+                mix(&mut h, *b);
             }
         }
     }
     h
+}
+
+#[cfg(test)]
+thread_local! {
+    static HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::world) fn content_hash_calls() -> usize {
+    HASH_CALLS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(in crate::world) fn reset_content_hash_calls() {
+    HASH_CALLS.with(|c| c.set(0));
 }
 
 /// Chunk size as a signed coordinate, for the `-1..=16` padded range (tests).

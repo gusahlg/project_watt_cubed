@@ -328,6 +328,11 @@ impl TerrainGenerator for DiffusionTerrain {
         self.cell(&c, wx, wy, wz)
     }
 
+    fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
+        let c = self.column(wx, wz);
+        self.cell(&c, wx, wy, wz)
+    }
+
     fn lod_block_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
         let h = self.lod_height(wx, wz);
         if wy < h {
