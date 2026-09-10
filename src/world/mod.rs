@@ -1045,8 +1045,8 @@ pub struct World {
     /// uploading an empty table so the engine returns to ARRAY_LAYER.
     gpu_descs_uploaded: bool,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
-    /// so the meshers wrap vertex layers past it. Construction uses `u16::MAX`
-    /// (identity wrap); the first engine contact overwrites it once.
+    /// so the meshers saturate vertex layers at it. Construction uses `u16::MAX`
+    /// (identity); the first engine contact overwrites it once.
     texture_layer_cap: u16,
     /// True after [`World::pump`] has read `Engine::max_texture_array_layers`.
     texture_cap_from_device: bool,

@@ -879,31 +879,31 @@ mod tests {
     }
 
     #[test]
-    fn vertex_layers_wrap_at_the_device_texture_cap() {
-        // Past the device's texture-layer ceiling the mesher wraps the VERTEX
-        // layer only (tables still index the true id) — crafting keeps working
-        // on min-spec GPUs, textures just repeat.
-        let high = BlockId(300);
+    fn vertex_layers_stay_under_the_device_texture_cap() {
+        // The registry's nearest-descriptor fallback keeps layers in range, so
+        // the mesher writes the stored layer (debug-asserted < cap). A HotTables
+        // built by hand still saturates in release if a layer slips past.
+        let high = BlockId(200);
         let mut chunk = Chunk::from_uniform(0, 0, 0, AIR);
         chunk.set_local(8, 8, 8, high);
         // Air (id 0) stays non-solid/clear or the lone block's faces get culled.
-        let mut bools = vec![true; 301];
+        let mut bools = vec![true; 201];
         bools[0] = false;
         let mut t = HotTables::from_parts(
             &bools,
             &bools,
-            &vec![false; 301],
-            vec![Pass::Opaque; 301].into(),
-            vec![0; 301].into(),
-            vec![0; 301].into(),
-            (0..301u16).collect::<Vec<_>>().into(),
+            &vec![false; 201],
+            vec![Pass::Opaque; 201].into(),
+            vec![0; 201].into(),
+            vec![0; 201].into(),
+            (0..201u16).collect::<Vec<_>>().into(),
         );
         t.layer_cap = 256; // a min-spec-ish ceiling
         let mut out = new_chunk_mesh_data();
         build_chunk_mesh(&solo(&chunk), None, &t, &PaddedLight::full(), &mut out);
         let layers: Vec<u16> = out[Pass::Opaque].vertices().iter().map(|v| v.layer()).collect();
         assert!(!layers.is_empty());
-        assert!(layers.iter().all(|&l| l == 300 % 256), "vertex layer wraps, id stays true");
+        assert!(layers.iter().all(|&l| l == 200), "in-range layer is unchanged");
     }
 
     /// A padded neighbourhood holding just `chunk` (air shell).

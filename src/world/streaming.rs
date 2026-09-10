@@ -3159,8 +3159,10 @@ impl World {
         // Never zero (modulo divisor) and never past the vertex field's u16.
         // Construction caches `u16::MAX`; the device cap is read once.
         if !self.texture_cap_from_device {
-            self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
+            let device = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
+            self.texture_layer_cap = device.min(crate::block::MAX_DESCRIPTORS as u16);
             self.texture_cap_from_device = true;
+            self.registry.set_descriptor_cap(self.texture_layer_cap);
             #[cfg(test)]
             crate::alloc_count::note_engine(crate::alloc_count::EngineCall::TexLayers);
         }
@@ -3194,7 +3196,7 @@ impl World {
         if count > visible && self.uploaded_len < visible {
             eprintln!(
                 "render descriptors ({count}) exceed the device texture-layer cap \
-                 ({visible}); further textures wrap onto existing layers"
+                 ({visible}); further textures use the nearest existing layer"
             );
         }
         let texel = if gpu { 1 } else { TEXTURE_SIZE };

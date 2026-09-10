@@ -166,19 +166,19 @@ mod tests {
 
     fn rock() -> BlockId {
         let mut reg = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut reg);
+        placement::builtin().compile(&mut reg).expect("v0 hosts the placement table");
         reg.id_by_label("rock").unwrap()
     }
 
     fn soil() -> BlockId {
         let mut reg = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut reg);
+        placement::builtin().compile(&mut reg).expect("v0 hosts the placement table");
         reg.id_by_label("soil").unwrap()
     }
 
     fn clay() -> BlockId {
         let mut reg = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut reg);
+        placement::builtin().compile(&mut reg).expect("v0 hosts the placement table");
         reg.id_by_label("clay").unwrap()
     }
 

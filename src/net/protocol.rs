@@ -45,6 +45,22 @@ pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
     a
 }
 
+/// `Ok` iff `stamp` is law v0. A different valid law is refused with
+/// [`ServerMessage::Reject`] (region-search errors included); never panics.
+pub fn handshake_law(stamp: &[u8]) -> Result<(), ServerMessage> {
+    if stamp == material::Law::v0().stamp() {
+        return Ok(());
+    }
+    let reason: Arc<str> = match material::Law::from_stamp(stamp) {
+        Ok(law) => match crate::block::regions::builtin(&law) {
+            Ok(_) => "law stamp is not this game's law".into(),
+            Err(e) => e.to_string().into(),
+        },
+        Err(_) => "law stamp is not this game's law".into(),
+    };
+    Err(ServerMessage::Reject { reason })
+}
+
 /// One field's wire codec: how it is written to and read back from a message
 /// payload. The [`messages!`] table below pairs every enum field with exactly
 /// one of these impls, so the field's Rust type IS its wire format — encode
@@ -559,7 +575,7 @@ mod tests {
     #[test]
     fn spec_round_trips_through_the_wire() {
         let mut r = crate::block::BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r);
+        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
         let id = r.id_by_label("rock").unwrap();
         let spec = r.spec(id);
         let msg = ClientMessage::Edit {
@@ -730,6 +746,28 @@ mod tests {
             law: law_stamp(),
         };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
+    }
+
+    #[test]
+    fn handshake_refuses_a_perturbed_law_without_panic() {
+        assert!(handshake_law(&law_stamp()).is_ok());
+        let mut law = material::Law::v0();
+        law.kernel.knots[2].1 = -law.kernel.knots[2].1;
+        let stamp = law.stamp();
+        match handshake_law(&stamp) {
+            Err(ServerMessage::Reject { reason }) => {
+                assert!(!reason.is_empty(), "reject names the reason");
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        let encoded = match handshake_law(&stamp) {
+            Err(msg) => msg.encode(),
+            Ok(()) => panic!("perturbed law was accepted"),
+        };
+        match ServerMessage::decode(&encoded) {
+            Some(ServerMessage::Reject { reason }) => assert!(!reason.is_empty()),
+            other => panic!("Reject must round-trip, got {other:?}"),
+        }
     }
 
     #[test]

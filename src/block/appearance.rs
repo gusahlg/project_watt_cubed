@@ -184,7 +184,7 @@ mod tests {
     fn texture_layer_build_per_descriptor() {
         use crate::mods::textures::procedural::ProceduralTexturesMod;
         let mut r = BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r);
+        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
         let n = r.descriptor_count().max(1);
         let proc = ProceduralTexturesMod::new();
         let mut buf = [0u8; LAYER_BYTES];

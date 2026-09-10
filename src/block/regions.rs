@@ -2,12 +2,28 @@
 //! variants, and three geological strata, computed from the law.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::OnceLock;
 
 use material::{
     element_changes, element_response, interact, Configuration, Element, EventKind,
     Law, Observation,
 };
+
+/// A law that cannot host the builtin worldgen: which label failed, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionError {
+    pub label: &'static str,
+    pub why: String,
+}
+
+impl fmt::Display for RegionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "law cannot host region {}: {}", self.label, self.why)
+    }
+}
+
+impl std::error::Error for RegionError {}
 
 /// One worldgen family: a centre that observes as the labelled kind, six
 /// one-axis jitters (failing jitters collapse to the centre), and three
@@ -72,12 +88,12 @@ impl Region {
     }
 }
 
-/// The builtin worldgen regions under `law`. Panic if a label finds nothing
+/// The builtin worldgen regions under `law`. `Err` if a label finds nothing
 /// within [`SEARCH_CAP`] candidates — that law cannot host this generator.
-pub fn builtin(law: &Law) -> Vec<Region> {
+pub fn builtin(law: &Law) -> Result<Vec<Region>, RegionError> {
     if *law == Law::v0() {
         static V0: OnceLock<Vec<Region>> = OnceLock::new();
-        return V0.get_or_init(|| find_all(&Law::v0())).clone();
+        return Ok(V0.get_or_init(|| find_all(&Law::v0()).expect("v0 hosts all regions")).clone());
     }
     find_all(law)
 }
@@ -121,11 +137,11 @@ struct Search {
     cost: SearchCost,
 }
 
-fn find_all(law: &Law) -> Vec<Region> {
-    search(law).0
+fn find_all(law: &Law) -> Result<Vec<Region>, RegionError> {
+    search(law).map(|(regions, _)| regions)
 }
 
-fn search(law: &Law) -> (Vec<Region>, SearchCost) {
+fn search(law: &Law) -> Result<(Vec<Region>, SearchCost), RegionError> {
     let fp = law.fingerprint();
     let mut s = Search {
         law: *law,
@@ -157,7 +173,10 @@ fn search(law: &Law) -> (Vec<Region>, SearchCost) {
             }
         }
         let Some((_, _, c)) = best else {
-            panic!("law cannot host region {label}: no candidate in {SEARCH_CAP}");
+            return Err(RegionError {
+                label,
+                why: format!("no candidate in {SEARCH_CAP}"),
+            });
         };
         let region = s.family_at(label, c, &centres);
         centres.push(region.centre);
@@ -166,7 +185,7 @@ fn search(law: &Law) -> (Vec<Region>, SearchCost) {
     found.sort_by_key(|r| LABELS.iter().position(|&l| l == r.label).unwrap_or(99));
     s.collapse_unstable(&mut found);
     s.fill_strata(&mut found);
-    (found, s.cost)
+    Ok((found, s.cost))
 }
 
 impl Search {
@@ -512,7 +531,7 @@ mod tests {
     #[test]
     fn builtin_regions_observe_as_required_and_sit_at_rest() {
         let law = Law::v0();
-        let regions = builtin(&law);
+        let regions = builtin(&law).expect("v0 hosts all regions");
         assert_eq!(regions.len(), LABELS.len());
         for (i, r) in regions.iter().enumerate() {
             assert_eq!(r.label, LABELS[i]);
@@ -560,7 +579,7 @@ mod tests {
     #[test]
     fn centres_are_distinct_and_cross_inert() {
         let law = Law::v0();
-        let regions = builtin(&law);
+        let regions = builtin(&law).expect("v0 hosts all regions");
         for (i, a) in regions.iter().enumerate() {
             for b in regions.iter().skip(i + 1) {
                 assert!(
@@ -587,7 +606,7 @@ mod tests {
     #[test]
     fn each_region_has_three_strata() {
         let law = Law::v0();
-        let regions = builtin(&law);
+        let regions = builtin(&law).expect("v0 hosts all regions");
         let mut rock_soil_variety = 0;
         for r in &regions {
             let distinct = r.strata.iter().filter(|s| **s != r.centre).count();
@@ -616,7 +635,7 @@ mod tests {
     #[test]
     fn spread_is_the_jitter_amplitude() {
         let law = Law::v0();
-        let regions = builtin(&law);
+        let regions = builtin(&law).expect("v0 hosts all regions");
         for r in &regions {
             for i in 1..7 {
                 let v = r.members[i];
@@ -644,16 +663,16 @@ mod tests {
 
     #[test]
     fn two_scans_agree() {
-        let a = builtin(&Law::v0());
-        let b = builtin(&Law::v0());
+        let a = builtin(&Law::v0()).expect("v0 hosts all regions");
+        let b = builtin(&Law::v0()).expect("v0 hosts all regions");
         assert_eq!(a, b);
     }
 
     #[test]
     fn fresh_search_matches_cached_v0() {
         let law = Law::v0();
-        let (fresh, _) = search(&law);
-        assert_eq!(fresh, builtin(&law));
+        let (fresh, _) = search(&law).expect("v0 hosts all regions");
+        assert_eq!(fresh, builtin(&law).expect("v0 hosts all regions"));
     }
 
     #[test]
@@ -690,7 +709,7 @@ mod tests {
     #[test]
     fn lamp_centre_emits_at_least_eight() {
         let law = Law::v0();
-        let lamp = builtin(&law).into_iter().find(|r| r.label == "lamp").unwrap();
+        let lamp = builtin(&law).expect("v0 hosts all regions").into_iter().find(|r| r.label == "lamp").unwrap();
         let obs = observe(&law, &Configuration::single(lamp.centre));
         assert!(
             obs.emission >= 8,
@@ -705,7 +724,7 @@ mod tests {
     #[test]
     fn similarity_holds_on_region_families() {
         let law = Law::v0();
-        let regions = builtin(&law);
+        let regions = builtin(&law).expect("v0 hosts all regions");
         let mut worst = 0i32;
         for r in &regions {
             for e in r.matter() {
@@ -731,6 +750,41 @@ mod tests {
         );
     }
 
+    fn flipped_knot() -> Law {
+        let mut law = Law::v0();
+        law.kernel.knots[2].1 = -law.kernel.knots[2].1;
+        law
+    }
+
+    #[test]
+    fn perturbed_law_compiles_or_errors_without_panic() {
+        let law = flipped_knot();
+        assert_ne!(law, Law::v0());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builtin(&law)));
+        assert!(outcome.is_ok(), "region search panics on a non-v0 law");
+        match outcome.unwrap() {
+            Ok(regions) => {
+                assert_eq!(regions.len(), LABELS.len());
+                let mut r = crate::block::BlockRegistry::new(law);
+                assert!(r.region_error().is_none());
+                crate::world::placement::builtin()
+                    .compile(&mut r)
+                    .expect("a law that found every label compiles");
+            }
+            Err(e) => {
+                assert!(
+                    LABELS.contains(&e.label),
+                    "failed label {} is not a worldgen label",
+                    e.label
+                );
+                assert!(!e.why.is_empty(), "error names why {e}");
+                let mut r = crate::block::BlockRegistry::new(law);
+                assert!(r.region_error().is_some());
+                assert!(crate::world::placement::builtin().compile(&mut r).is_err());
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn region_compile_stays_under_five_ms() {
@@ -740,7 +794,7 @@ mod tests {
         for t in times.iter_mut() {
             let mut r = BlockRegistry::with_builtins();
             let t0 = std::time::Instant::now();
-            let _ = placement::builtin().compile(&mut r);
+            placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
             *t = t0.elapsed().as_micros();
         }
         let first = times[0];
@@ -801,12 +855,12 @@ mod tests {
         let fast_rest = t0.elapsed();
 
         let t0 = Instant::now();
-        let (regions, cost) = search(&law);
+        let (regions, cost) = search(&law).expect("v0 hosts all regions");
         let cold = t0.elapsed();
 
         let _ = builtin(&law);
         let t0 = Instant::now();
-        let cached = builtin(&law);
+        let cached = builtin(&law).expect("v0 hosts all regions");
         let warm = t0.elapsed();
 
         println!(

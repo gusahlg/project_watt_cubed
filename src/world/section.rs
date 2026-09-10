@@ -460,7 +460,7 @@ mod tests {
     }
     fn blocks() -> Blocks {
         let mut r = BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r);
+        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
         let id = |n: &str| r.id_by_label(n).unwrap();
         Blocks {
             air: AIR,

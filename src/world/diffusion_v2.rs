@@ -400,7 +400,7 @@ pub struct DiffusionV2 {
 impl DiffusionV2 {
     pub fn new(registry: &mut BlockRegistry, cfg: DiffusionCfg, seed: i64) -> Self {
         let cfg = cfg.clamp();
-        let mat = placement::builtin().compile(registry);
+        let mat = placement::builtin().compile(registry).expect("v0 hosts the placement table");
         let iseed = seed as u32;
         let spec = IntSpec {
             seed: iseed,

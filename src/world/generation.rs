@@ -976,7 +976,7 @@ impl Terrain {
     pub fn new(registry: &mut BlockRegistry, base: f32, seed: i64) -> Self {
         // Terrain speaks only the placement table now — no named block is ever
         // resolved by hand; every material is an enumerated element union.
-        let mat = placement::builtin().compile(registry);
+        let mat = placement::builtin().compile(registry).expect("v0 hosts the placement table");
         let s = Seed(seed);
         let fbm = |salt: u64, cell: f64, octaves: u8| Fbm::new(s.stream(salt), cell, octaves);
         // Shared height-warp offsets (like the biome axes share theirs), so

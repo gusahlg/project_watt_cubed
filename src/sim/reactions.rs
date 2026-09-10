@@ -265,10 +265,9 @@ pub struct Reactions;
 /// worldgen regions (or a 40-unit one-axis shift of the first centre).
 #[cfg(test)]
 pub(crate) fn reactive_region_pair(reg: &mut BlockRegistry) -> (BlockId, BlockId) {
-    use crate::block::regions;
     use material::{interact, Configuration};
     let law = *reg.law();
-    let regions = regions::builtin(&law);
+    let regions = reg.regions().to_vec();
     for ra in &regions {
         for rb in &regions {
             let ca = Configuration::single(ra.centre);
