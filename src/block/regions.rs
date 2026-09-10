@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use material::{
-    element_changes, element_response, interact, observe_element, Configuration, Element, EventKind,
+    element_changes, element_response, interact, Configuration, Element, EventKind,
     Law, Observation,
 };
 

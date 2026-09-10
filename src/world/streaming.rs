@@ -47,6 +47,7 @@ pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshPayload) -> usize
 }
 
 /// Vertex bytes a finished section mesh will stage (one packed mesh × passes).
+#[cfg(test)]
 pub(in crate::world) fn section_output_bytes(data: &super::SectionMeshData) -> usize {
     voxel_engine::Pass::ALL
         .iter()
