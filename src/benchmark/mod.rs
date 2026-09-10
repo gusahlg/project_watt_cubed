@@ -794,6 +794,7 @@ struct StreamPeaks {
     max_mesh_slots: usize,
     max_section_ready: usize,
     slot_ceiling: usize,
+    max_section_upload_bytes: usize,
 }
 
 impl Default for StreamPeaks {
@@ -815,6 +816,7 @@ impl Default for StreamPeaks {
             max_mesh_slots: 0,
             max_section_ready: 0,
             slot_ceiling: 0,
+            max_section_upload_bytes: 0,
         }
     }
 }
@@ -839,6 +841,7 @@ impl StreamPeaks {
         self.max_mesh_slots = self.max_mesh_slots.max(g.mesh_slots);
         self.max_section_ready = self.max_section_ready.max(g.section_ready);
         self.slot_ceiling = self.slot_ceiling.max(g.slot_ceiling);
+        self.max_section_upload_bytes = self.max_section_upload_bytes.max(g.section_upload_bytes);
     }
 
     fn to_json(self) -> Json {
@@ -866,6 +869,7 @@ impl StreamPeaks {
             ("mesh_slots", Json::from(self.max_mesh_slots)),
             ("section_ready", Json::from(self.max_section_ready)),
             ("slot_ceiling", Json::from(self.slot_ceiling)),
+            ("section_upload_bytes", Json::from(self.max_section_upload_bytes)),
         ])
     }
 }
@@ -911,6 +915,37 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("mesh_slots", Json::from(g.mesh_slots)),
         ("section_ready", Json::from(g.section_ready)),
         ("slot_ceiling", Json::from(g.slot_ceiling)),
+        ("light_seed_store", Json::from(g.light_seed_split.store)),
+        ("light_seed_border", Json::from(g.light_seed_split.border)),
+        ("light_seed_edit", Json::from(g.light_seed_split.edit)),
+        ("light_seed_degrade", Json::from(g.light_seed_split.degrade)),
+        ("light_seed_terminal", Json::from(g.light_seed_split.terminal)),
+        ("light_seed_remesh", Json::from(g.light_seed_split.remesh)),
+        ("remesh_async_calls", Json::from(g.remesh_async_calls)),
+        ("drop_stale_uploads", Json::from(g.drop_stale_uploads)),
+        ("drop_stale_this_frame", Json::from(g.drop_stale_this_frame as u64)),
+        (
+            "remesh_between_upload_mean",
+            Json::number(f64::from(g.remesh_between_upload_mean)),
+        ),
+        (
+            "remesh_between_upload_p95",
+            Json::number(f64::from(g.remesh_between_upload_p95)),
+        ),
+        ("remesh_between_upload_n", Json::from(g.remesh_between_upload_n)),
+        (
+            "mesh_jobs_before_fixpoint_mean",
+            Json::number(f64::from(g.mesh_jobs_before_fixpoint_mean)),
+        ),
+        (
+            "mesh_jobs_before_fixpoint_p95",
+            Json::number(f64::from(g.mesh_jobs_before_fixpoint_p95)),
+        ),
+        (
+            "mesh_jobs_before_fixpoint_n",
+            Json::from(g.mesh_jobs_before_fixpoint_n),
+        ),
+        ("section_upload_bytes", Json::from(g.section_upload_bytes)),
     ])
 }
 

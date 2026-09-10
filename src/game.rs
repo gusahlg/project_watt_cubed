@@ -425,7 +425,6 @@ impl Game {
     /// drift apart. (World-construction lanes — occlusion/lod2 — stay
     /// entry-only by design; see `App::enter_game`.)
     pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
-        let mod_ui_was_active = self.mod_ui_active();
         settings.apply(eng);
         let render = self.visual_mask.effective_render(settings);
         eng.set_flags(render.engine_flags());
@@ -437,6 +436,17 @@ impl Game {
         self.world.set_render_config(render, eng);
         self.world.set_lighting(settings.lighting, eng);
         self.world.set_ao(settings.ao, eng);
+        self.adopt_gameplay_settings(settings, render);
+    }
+
+    /// Gameplay/HUD/clock half of [`apply_settings`] — no engine. Headless
+    /// tests and the live path share this so they cannot drift.
+    fn adopt_gameplay_settings(
+        &mut self,
+        settings: &Settings,
+        render: crate::render_config::RenderConfig,
+    ) {
+        let mod_ui_was_active = self.mod_ui_active();
         self.render = render;
         self.bump_content_rev();
 
@@ -463,8 +473,6 @@ impl Game {
         let mod_ui_will_be_active =
             mod_ui_active(settings.mod_logic, settings.mod_hud, self.theme.hud);
         if mod_ui_will_be_active {
-            // If visibility is restored before the next frame, the overlay is
-            // visible again and does not need to be force-closed.
             self.pending_mod_overlay_close = false;
         } else if mod_ui_was_active {
             self.on_mod_ui_hidden();
@@ -604,7 +612,7 @@ impl Game {
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
             self.world
-                .stream(self.player.position, eng, &mut self.sched);
+                .stream(self.player.position, Some(&mut *eng), &mut self.sched);
             let clocks = self.sched.clocks(dt);
             let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
             self.sched.tick(&mut sched_ctx, &clocks);
@@ -631,22 +639,16 @@ impl Game {
         // underwater bed, voice sessions — the director DERIVES from the readout.
         let mut events: Vec<SoundEvent> = Vec::new();
 
-        self.phases = FramePhases::default();
-        let t = Instant::now();
         if let Some(signal) = self.net_phase(mods, &mut events) {
             return signal;
         }
-        self.phases.net = t.elapsed();
-        let t = Instant::now();
         let input = self.input_phase(eng, router, dt);
-        self.phases.input = t.elapsed();
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
         // while a spawn/teleport slab is outstanding so loading progresses with
         // the console open. Audio skips the director commit when nothing is
         // sounding and the listener is still; only a real exit short-circuits
         // the rest of the frame.
-        let t = Instant::now();
         let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
             eng,
@@ -656,7 +658,6 @@ impl Game {
             sound,
             events: &mut events,
         });
-        self.phases.overlay = t.elapsed();
         let consumed = match overlay {
             Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
             Some(Signal::Continue) => true,
@@ -664,20 +665,13 @@ impl Game {
         };
         let ready = self.world.spawn_ready();
         if !consumed && ready {
-            let t = Instant::now();
             let detached = self.motion_phase(&input, dt);
-            self.phases.motion = t.elapsed();
-            let t = Instant::now();
             self.interact_phase(&input, detached, dt, eng, mods, &mut events);
-            self.phases.interact = t.elapsed();
         }
         if !consumed || !ready {
-            let t = Instant::now();
             self.stream_phase(eng, dt);
-            self.phases.stream = t.elapsed();
         }
         let active = !consumed;
-        let t = Instant::now();
         self.commit_audio(AudioPhase {
             dt,
             input: &input,
@@ -687,7 +681,6 @@ impl Game {
             events,
             active,
         });
-        self.phases.audio = t.elapsed();
         Signal::Continue
     }
 
@@ -1091,7 +1084,7 @@ impl Game {
             self.stream_gate.steps(dt) != 0
         };
         if !stream_due {
-            self.world.pump(eng, &mut self.sched);
+            self.world.pump(Some(&mut *eng), &mut self.sched);
             return;
         }
 
@@ -1099,7 +1092,8 @@ impl Game {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
-        self.world.stream(stream_center, eng, &mut self.sched);
+        self.world
+            .stream(stream_center, Some(&mut *eng), &mut self.sched);
 
         // A hidden/minimal HUD does no minimap clock read or terrain raster
         // work; refreshes share streaming's cadence instead of waking alone.
@@ -1116,6 +1110,66 @@ impl Game {
                 self.sched.interval_reset(self.minimap_interval);
             }
         }
+    }
+
+    /// Headless quiet frame: input drain, motion (inert), scheduler, stream/pump,
+    /// silent audio, HUD/lighting caches — the pieces `update` + `draw` run, in
+    /// order, without an Engine.
+    #[cfg(test)]
+    fn tick_quiet(
+        &mut self,
+        dt: f32,
+        router: &mut Router,
+        sound: &mut SoundSystem,
+        audio: &mut AudioDirector,
+        settings: &Settings,
+        mods: &mut Mods,
+    ) {
+        if self.render.day_night {
+            let steps = self.sky_gate.steps(dt);
+            if steps != 0 {
+                self.sky
+                    .tick(steps as f64 * self.sky_gate.step_dt(dt) as f64);
+            }
+        } else {
+            self.sky_gate.reset();
+        }
+        let events: Vec<SoundEvent> = Vec::new();
+        if self.input_locked {
+            router.drain_frame();
+        }
+        let input = FrameInput::inert();
+        if self.world.spawn_ready() {
+            let _ = self.motion_phase(&input, dt);
+        }
+        let clocks = self.sched.clocks(dt);
+        let mut sched_ctx = SchedCtx::new(&mut self.world, None);
+        self.sched.tick(&mut sched_ctx, &clocks);
+        let stream_due = if std::mem::take(&mut self.force_stream) {
+            self.stream_gate.reset();
+            true
+        } else {
+            self.stream_gate.steps(dt) != 0
+        };
+        let stream_center = match &self.camera.mode {
+            CameraMode::Free { rig, .. } => rig.pos,
+            CameraMode::Person(_) => self.player.position,
+        };
+        if stream_due {
+            self.world.stream(stream_center, None, &mut self.sched);
+        } else {
+            self.world.pump(None, &mut self.sched);
+        }
+        self.commit_audio(AudioPhase {
+            dt,
+            input: &input,
+            sound,
+            audio,
+            settings,
+            events,
+            active: true,
+        });
+        self.compose_quiet(mods);
     }
 
     /// Hand this frame's readout to the audio director: it folds
@@ -1146,7 +1200,7 @@ impl Game {
         // own richer sample — it runs in the separate draw() call, steps each peer's
         // animator, and needs render fields absent from `PeerPose`. The scratch
         // vector retains capacity so stable multiplayer frames allocate nothing.
-        let now = Instant::now();
+        let now = crate::sched::now();
         let mut peers = std::mem::take(&mut self.peer_pose_scratch);
         peers.clear();
         if let Some(net) = &self.net {
@@ -1651,5 +1705,92 @@ mod tests {
             "the skip predicate must hold on the idle pose used above"
         );
         assert!(!game.world().anything_in_flight());
+    }
+
+    #[test]
+    fn quiet_minimum_frame_allocates_nothing_and_reads_the_clock_once() {
+        use crate::alloc_count;
+        use crate::audio::palette::CuePalette;
+        use crate::audio::SoundSystem;
+        use crate::input::router::Router;
+        use crate::mods::Mods;
+        use crate::settings::Settings;
+        use crate::ui::HudMode;
+
+        let mut settings = Settings::default();
+        assert!(settings.select_preset("minimum"));
+        let render = settings.render_config();
+        let mut game = Game::scripted(1, render);
+        game.scripted = false;
+        game.set_input_locked(true);
+        game.world_mut()
+            .set_view_distances(settings.render_distance, settings.vertical_distance);
+        game.world_mut().transition_lighting(settings.lighting);
+        game.world_mut().set_ao_flag(settings.ao);
+        game.world_mut()
+            .set_render_lanes(settings.occlusion, settings.lod2);
+        game.adopt_gameplay_settings(&settings, render);
+        let pos = game.player().position;
+        game.world_mut().settle_around(pos);
+        assert!(
+            game.world().entry_complete(),
+            "settled: {}",
+            game.world().entry_debug()
+        );
+
+        let (mut sound, symbols) = SoundSystem::mute();
+        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
+        let mut audio = crate::audio::AudioDirector::new(palette);
+        let mut router = Router::new();
+        let mut mods = Mods::with_defaults();
+        const DT: f32 = 1.0 / 60.0;
+
+        let mut last_allocs = u64::MAX;
+        let mut last_bytes = u64::MAX;
+        let mut last_clocks = u32::MAX;
+        let mut last_calls = alloc_count::EngineCalls {
+            set_sky: 0,
+            uniforms: 0,
+            settings_apply: 0,
+            tex_layers: 0,
+        };
+        for i in 0..10 {
+            alloc_count::reset();
+            crate::sched::reset_clock();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            if i >= 5 {
+                last_allocs = alloc_count::alloc_count();
+                last_bytes = alloc_count::alloc_bytes();
+                last_clocks = crate::sched::clock();
+                last_calls = alloc_count::engine_calls();
+                assert_eq!(
+                    last_bytes, 0,
+                    "quiet frame {i} allocated {last_allocs} times / {last_bytes} bytes; engine={last_calls:?}"
+                );
+                assert!(
+                    last_clocks <= 1,
+                    "quiet frame {i} read the clock {last_clocks} times"
+                );
+            }
+        }
+        println!(
+            "quiet minimum frame (last of 10): allocs={last_allocs} bytes={last_bytes} clocks={last_clocks} engine={last_calls:?}"
+        );
+
+        // HUD strings: an unchanged snapshot must not allocate after the cache fills.
+        game.theme.hud = HudMode::Full;
+        for i in 0..4 {
+            alloc_count::reset();
+            crate::sched::reset_clock();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            if i >= 2 {
+                assert_eq!(
+                    alloc_count::alloc_bytes(),
+                    0,
+                    "HUD snapshot frame {i} allocated {} bytes",
+                    alloc_count::alloc_bytes()
+                );
+            }
+        }
     }
 }

@@ -343,6 +343,7 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         visible: true,
         light: None,
         has_blocklight: false,
+        light_reseed: false,
         light_gen: 0,
     }
 }
@@ -760,6 +761,21 @@ fn light_arrival_schedules_async_rebuild_and_keeps_drawing() {
 
     world.pending_dirty.take();
     world.settle_light(coord, light::LightGrid::dark()); // a CHANGED grid
+    assert!(
+        world.light_gate.dirty.contains_key(&coord),
+        "changed settle marks light_dirty instead of remeshing immediately"
+    );
+    assert!(
+        matches!(world.chunks[&coord].state, MeshState::Ready(_)),
+        "no remesh until the neighbourhood is quiet"
+    );
+    // Neighbour seeds from the border move are pending light work; drop them
+    // so this test exercises the quiet-nhood promotion (the flood path is
+    // covered by `changed_settle_remeshes_once_at_nhood_fixpoint`).
+    world.light_worklist.clear();
+    world.light_inflight.clear();
+    world.light_apply_queue.clear();
+    world.tick_light_gate();
 
     let state = &world.chunks[&coord].state;
     assert!(
@@ -900,6 +916,43 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     let expected: usize = Pass::ALL.iter().map(|&p| out[p].vertex_bytes()).sum();
     assert!(expected > 0, "a surface chunk yields geometry");
     assert_eq!(streaming::mesh_output_bytes(&out), expected);
+}
+
+/// Section uploads charge the same vertex-byte accounting as chunks, stored
+/// on the queue entry at enqueue so the drain never walks the mesh again.
+#[test]
+fn section_upload_byte_accounting_matches_vertex_sizes() {
+    let mut world = lod2_world();
+    world.refresh_tables();
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    let pos = world.desired_sections(center)[0];
+    let tables = world.tables.get();
+    let meshes = section::extract_section_mesh(pos, &*world.generator, &[], &tables);
+    let expected: usize = Pass::ALL.iter().map(|&p| meshes.data[p].vertex_bytes()).sum();
+    assert!(expected > 0, "a default-seed section yields geometry");
+    assert_eq!(streaming::section_output_bytes(&meshes), expected);
+
+    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
+    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Section {
+            pos,
+            epoch: 0,
+            token: pipeline::ClaimToken(7),
+            meshes: Box::new(meshes),
+        },
+    );
+    assert_eq!(world.section_upload_queue.len(), 1);
+    assert_eq!(world.section_upload_queue[0].2, expected);
+}
+
+/// Empty pooled section output is a zero-byte charge (stale/default jobs).
+#[test]
+fn empty_section_mesh_charges_zero_upload_bytes() {
+    let meshes = section::SectionMeshData::default();
+    assert_eq!(streaming::section_output_bytes(&meshes), 0);
 }
 
 /// Mesh admission pauses at the upload-queue cap and resumes below it.
@@ -1319,7 +1372,7 @@ fn lod2_far_field_drives_to_covering_complete() {
         if !got {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        while let Some((pos, token, _meshes)) = world.section_upload_queue.pop_front() {
+        while let Some((pos, token, _bytes, _meshes)) = world.section_upload_queue.pop_front() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
@@ -1413,6 +1466,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                         visible: true,
                         light: None,
                         has_blocklight: false,
+                        light_reseed: false,
                         light_gen: 0,
                     },
                 );
@@ -1492,6 +1546,7 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
                         visible: true,
                         light: None,
                         has_blocklight: false,
+                        light_reseed: false,
                         light_gen: 0,
                     },
                 );
@@ -2235,7 +2290,7 @@ fn assert_claim_invariants(
             let queued = world
                 .section_upload_queue
                 .iter()
-                .any(|(p, t, _)| p == pos && t == token);
+                .any(|(p, t, _, _)| p == pos && t == token);
             assert!(
                 owed_section.get(pos) == Some(token) || queued,
                 "{pos:?} meshing with no owed Done and not queued"

@@ -173,18 +173,26 @@ impl World {
     /// Toggle baked corner AO. A meshing input like lighting: the hot tables
     /// restamp (epoch bump) and every mesh rebuilds with the new corners.
     pub fn set_ao(&mut self, on: bool, eng: &mut Engine) {
-        if on == self.ao {
+        if !self.set_ao_flag(on) {
             return;
+        }
+        self.free_meshes(eng);
+    }
+
+    /// Stamp AO without freeing GPU meshes (headless tests, already-empty worlds).
+    pub(crate) fn set_ao_flag(&mut self, on: bool) -> bool {
+        if on == self.ao {
+            return false;
         }
         self.ao = on;
         self.tables_epoch = self.tables_epoch.wrapping_add(1);
-        self.free_meshes(eng);
+        true
     }
 
     /// Move the CPU lighting pipeline between enabled and full-bright modes.
     /// Kept separate from GPU mesh retirement so the asynchronous state machine
     /// can be tested without constructing an engine.
-    pub(in crate::world) fn transition_lighting(&mut self, on: bool) -> bool {
+    pub(crate) fn transition_lighting(&mut self, on: bool) -> bool {
         if on == self.lighting {
             return false;
         }
@@ -330,7 +338,7 @@ impl World {
                         .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
                         .collect();
                     for c in shadowed {
-                        self.seed_light(c);
+                        self.seed_light(c, super::LightSeed::Edit);
                     }
                     self.light_pending.set();
                 }
@@ -356,7 +364,7 @@ impl World {
             self.pending_fresh.set();
             // The edited voxels are a changed light source/occluder: re-settle
             // this chunk (border diffs then fan the change to neighbours).
-            self.seed_light(coord);
+            self.seed_light(coord, super::LightSeed::Edit);
             self.light_pending.set();
         }
         // A block on a chunk face also changes that neighbour's exposed
@@ -400,7 +408,7 @@ impl World {
             self.pending_fresh.set();
             // A border edit can change this chunk's light directly (an emitter on
             // the shared face); re-settle it too.
-            self.seed_light(coord);
+            self.seed_light(coord, super::LightSeed::Edit);
             self.light_pending.set();
         }
     }

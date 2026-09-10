@@ -527,11 +527,11 @@ pub struct Deadline(Instant);
 impl Deadline {
     /// A deadline `budget` from now.
     pub fn from_budget(budget: Duration) -> Deadline {
-        Deadline(Instant::now() + budget)
+        Deadline(crate::sched::now() + budget)
     }
     #[must_use]
     pub fn expired(self) -> bool {
-        Instant::now() >= self.0
+        crate::sched::now() >= self.0
     }
 }
 
@@ -1165,7 +1165,7 @@ fn run(job: Job) -> Done {
             tables,
         } => {
             // Fused extract+mesh on owned data: the generator samples straight
-            // into the dense quadrant grid — no RLE brick storage is built for
+            // into the dense section grid — no RLE brick storage is built for
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
@@ -1687,6 +1687,7 @@ mod tests {
                                 visible: true,
                                 light: None,
                                 has_blocklight: false,
+                                light_reseed: false,
                                 light_gen: 0,
                             },
                         );

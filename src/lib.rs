@@ -2,6 +2,11 @@
 //!
 //! One module per subsystem. Worldgen, save bytes, protocol bytes, and mesh
 //! vertices are bit-identical unless a change explicitly says otherwise.
+#[cfg(test)]
+mod alloc_count;
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: alloc_count::Counting = alloc_count::Counting;
 pub mod app;
 pub(crate) mod audio;
 pub(crate) mod avatar;

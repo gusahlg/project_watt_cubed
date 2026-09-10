@@ -67,13 +67,14 @@ fn main() {
             o.settle.frames, o.settle.p50, o.settle.p95, o.settle.p99, o.settle.max
         );
         println!(
-            "  peaks: upload_queue={} light_apply={} mesh_worklist={} worker_near={} worker_far={} chunks={}",
+            "  peaks: upload_queue={} light_apply={} mesh_worklist={} worker_near={} worker_far={} chunks={} section_upload_bytes={}",
             o.max_upload_queue,
             o.max_light_apply,
             o.max_mesh_worklist,
             o.max_worker_near_queue,
             o.max_worker_far_queue,
-            o.max_chunks
+            o.max_chunks,
+            o.max_section_upload_bytes
         );
         println!(
             "  adaptive floor: effort={:.2} active_workers={}",
@@ -86,9 +87,31 @@ fn main() {
             o.light_seed_inserts_at_stop,
             o.seeds_per_chunk
         );
+        let s = o.light_seed_split_at_stop;
+        println!(
+            "  seeds: store={} border={} edit={} degrade={} terminal={} remesh={}",
+            s.store, s.border, s.edit, s.degrade, s.terminal, s.remesh
+        );
         println!(
             "  settle light admit/s={:.0}",
             o.settle_light_admit_per_s
+        );
+        println!(
+            "  remesh_async/coord between uploads: mean={:.2} p95={:.2} n={}",
+            o.remesh_between_upload_mean, o.remesh_between_upload_p95, o.remesh_between_upload_n
+        );
+        println!(
+            "  mesh jobs/chunk before light fixpoint: mean={:.2} p95={:.2} n={}",
+            o.mesh_jobs_before_fixpoint_mean,
+            o.mesh_jobs_before_fixpoint_p95,
+            o.mesh_jobs_before_fixpoint_n
+        );
+        println!(
+            "  drop_stale/frame (flight): mean={:.2} p95={:.2}  totals: remesh_async={} drop_stale={}",
+            o.drop_stale_per_frame_mean,
+            o.drop_stale_per_frame_p95,
+            o.remesh_async_calls,
+            o.drop_stale_uploads
         );
         for s in &o.settle_samples {
             println!(

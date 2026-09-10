@@ -182,6 +182,61 @@ pub struct StreamGauges {
     pub slot_ceiling: usize,
     /// Ready far-LOD sections (each is one mesh per pass).
     pub section_ready: usize,
+    /// Insert attempts split by `seed_light` source (stress report at stop).
+    pub light_seed_split: LightSeedSplit,
+    /// `remesh_async` calls (rev-bumping rebuilds) this world has issued.
+    pub remesh_async_calls: u64,
+    /// Vertex bytes of section (LOD tile) meshes uploaded this stream pass.
+    pub section_upload_bytes: usize,
+    /// Stale mesh drops (accept-time, pop-time, and prune).
+    pub drop_stale_uploads: u64,
+    /// Stale drops during the current stream/pump frame.
+    pub drop_stale_this_frame: u32,
+    /// `remesh_async` calls per coord between successful uploads.
+    pub remesh_between_upload_mean: f32,
+    pub remesh_between_upload_p95: f32,
+    pub remesh_between_upload_n: u64,
+    /// Mesh jobs claimed for a chunk before its 27-neighbourhood light fixpoint.
+    pub mesh_jobs_before_fixpoint_mean: f32,
+    pub mesh_jobs_before_fixpoint_p95: f32,
+    pub mesh_jobs_before_fixpoint_n: u64,
+}
+
+/// `seed_light` insert attempts by source. Degrade / terminal / neighbour-remesh
+/// stay zero unless those paths start seeding the light worklist.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LightSeedSplit {
+    pub store: u64,
+    pub border: u64,
+    pub edit: u64,
+    pub degrade: u64,
+    pub terminal: u64,
+    pub remesh: u64,
+}
+
+/// Why a coord was inserted into `light_worklist`.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Degrade/Terminal/Remesh are report buckets; tests construct them.
+pub(in crate::world) enum LightSeed {
+    Store,
+    Border,
+    Edit,
+    Degrade,
+    Terminal,
+    Remesh,
+}
+
+impl LightSeedSplit {
+    pub(in crate::world) fn add(&mut self, kind: LightSeed) {
+        *match kind {
+            LightSeed::Store => &mut self.store,
+            LightSeed::Border => &mut self.border,
+            LightSeed::Edit => &mut self.edit,
+            LightSeed::Degrade => &mut self.degrade,
+            LightSeed::Terminal => &mut self.terminal,
+            LightSeed::Remesh => &mut self.remesh,
+        } += 1;
+    }
 }
 
 pub use census::MemoryCensus;
@@ -351,6 +406,9 @@ struct Loaded {
     /// so a uniform-air neighbour can reject the analytic sky path by testing
     /// six booleans instead of capturing a 3 KB face shell.
     has_blocklight: bool,
+    /// Neighbour face moved while this chunk's flood was in flight. Re-seed
+    /// when the result integrates so the wave costs at most one extra flood.
+    light_reseed: bool,
     /// Identity of this `Loaded` for light-claim matching. Bumped at store so
     /// a `Done::Light` captured against a previous resident at the same coord
     /// (unload then regenerate, same `light_epoch`) cannot publish onto the
@@ -843,6 +901,7 @@ pub struct World {
     light_worklist: worklist::RingWorklist,
     /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
     light_seed_inserts: u64,
+    light_seed_split: LightSeedSplit,
     /// Cumulative light jobs accepted by the worker pool.
     light_admitted: u64,
     /// Jobs accepted by the most recent [`admit`]`<LightLane>` pass.
@@ -864,6 +923,8 @@ pub struct World {
     /// of chunks currently showing a degraded (known-not-final) mesh awaiting relight.
     /// Kept in one struct so the feature's footprint on `World` is a single field.
     light_gate: streaming::LightGate,
+    /// Remesh/stale-drop samples for the stress C3 gauges.
+    remesh_stats: streaming::RemeshStats,
     /// Chunks whose missing neighbour light will never arrive, so a mesh
     /// snapshot must read missing planes as settled dark (not open-sky).
     light_terminal: FastSet<Coord>,
@@ -894,9 +955,11 @@ pub struct World {
     /// and ids are append-only, so growth never re-sends the prefix.
     uploaded_len: usize,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
-    /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
-    /// stream pass reads the engine cap (identity in practice — ids start tiny).
+    /// so the meshers wrap vertex layers past it. Construction uses `u16::MAX`
+    /// (identity wrap); the first engine contact overwrites it once.
     texture_layer_cap: u16,
+    /// True after [`World::pump`] has read `Engine::max_texture_array_layers`.
+    texture_cap_from_device: bool,
     /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
     /// input like `lighting`: toggling remeshes the world.
     ao: bool,
@@ -986,8 +1049,10 @@ pub struct World {
     /// Loaded sections.
     sections: FastMap<SectionPos, SectionState>,
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
-    /// token that produced them (re-validated at the moment of upload).
-    section_upload_queue: VecDeque<(SectionPos, pipeline::ClaimToken, Box<SectionMeshData>)>,
+    /// token that produced them (re-validated at the moment of upload) and the
+    /// vertex-byte charge computed at queue time.
+    section_upload_queue:
+        VecDeque<(SectionPos, pipeline::ClaimToken, usize, Box<SectionMeshData>)>,
     /// Last engine `mesh_stats().live_slots` sampled at `stream`. Zero until
     /// the first stream (tests without a GPU).
     gpu_live_slots: u32,
@@ -995,6 +1060,8 @@ pub struct World {
     /// Cost knob for the engine's GPU cull dispatch; the far lane's section
     /// budget is [`sections_allowed`](Self::sections_allowed), not this raw value.
     slot_ceiling: u32,
+    /// Vertex bytes uploaded for sections in the current drain (harness peak).
+    section_upload_bytes: usize,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -1186,11 +1253,13 @@ impl World {
                 ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
             ),
             light_seed_inserts: 0,
+            light_seed_split: LightSeedSplit::default(),
             light_admitted: 0,
             light_admitted_last: 0,
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
+            remesh_stats: streaming::RemeshStats::default(),
             light_terminal: FastSet::default(),
             mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
@@ -1199,6 +1268,7 @@ impl World {
             texture_cache: Vec::new(),
             uploaded_len: 0,
             texture_layer_cap: u16::MAX,
+            texture_cap_from_device: false,
             ao: true,
             tables_epoch: 0,
             occlusion: Occlusion::default(),
@@ -1229,6 +1299,7 @@ impl World {
             section_upload_queue: VecDeque::new(),
             gpu_live_slots: 0,
             slot_ceiling: CPU_CULL_MAX,
+            section_upload_bytes: 0,
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_edit_rev: FastMap::default(),
@@ -1633,7 +1704,7 @@ impl World {
             };
         }
         self.occlusion_topo_dirty.take();
-        self.last_occlusion_rebuild = Some(Instant::now());
+        self.last_occlusion_rebuild = Some(crate::sched::now());
         let Some(origin) = self.center else {
             return Progress::Idle;
         };
@@ -2155,6 +2226,8 @@ impl StreamLane for MeshLane {
             }
         };
         world.mark_degraded(key, degraded);
+        let nhood_quiet = world.light_nhood_quiet(key);
+        world.remesh_stats.note_mesh_job(key, nhood_quiet);
         // Set the building flag IN PLACE to claim the mesh job — a whole-state
         // overwrite would silently drop a carried `prev` mesh (leaking its GPU
         // handle and blanking the chunk mid-rebuild). Held until upload retires
@@ -2302,7 +2375,10 @@ impl StreamLane for SectionLane {
                 && matches!(world.sections.get(&pos),
                     Some(SectionState::Meshing { token: t }) if *t == token);
             if live {
-                world.section_upload_queue.push_back((pos, token, meshes));
+                let bytes = streaming::section_output_bytes(&meshes);
+                world
+                    .section_upload_queue
+                    .push_back((pos, token, bytes, meshes));
             }
         }
     }
@@ -2336,6 +2412,8 @@ impl StreamLane for LightLane {
         world.light_inflight.contains(&key)
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+        // `trivial_light` is decided at store time. A worklist seed here is a
+        // real re-settle (neighbour border / edit) and must run the flood.
         if !world.lighting
             || !world.chunks.contains_key(&key)
             || world
