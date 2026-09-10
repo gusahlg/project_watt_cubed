@@ -217,6 +217,13 @@ mod tests {
             a.light_uniform_count > 0,
             "origin box publishes trivial Uniform light (sky/rock)"
         );
+        if a.light_cells_count > 0 {
+            assert_eq!(
+                a.light_cells_bytes / a.light_cells_count,
+                crate::world::chunk::CHUNK_VOLUME,
+                "dense light grids are nibble-packed (4 KiB)"
+            );
+        }
         eprintln!(
             "CENSUS origin chunks=u{}/p{}/d{} light=u{}/c{} light_bytes=u{}/c{} total={}",
             a.chunk_uniform_count,
