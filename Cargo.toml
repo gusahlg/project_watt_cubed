@@ -1,6 +1,6 @@
 [package]
 name = "project_watt_cubed"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 default-run = "project_watt_cubed"
@@ -25,7 +25,7 @@ required-features = ["dev-tools"]
 [dependencies]
 # Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
 # types (glam Vec2/Vec3) and Color the game uses
-voxel_engine = { version = "1.0.0", path = "../voxel-engine" }
+voxel_engine = { version = "1.1.0", path = "../voxel-engine" }
 infinite-field = { version = "0.1.0", path = "crates/infinite-field" }
 material = { version = "0.1.0", path = "crates/material" }
 
