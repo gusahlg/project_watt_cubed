@@ -112,24 +112,57 @@ fn indexed_section_edits_match_the_footprint_scan() {
 }
 
 #[test]
-fn section_admit_stops_at_the_cpu_cull_ceiling() {
+fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
     let mut world = lod2_world();
-    world.slot_ceiling = 4;
-    world.gpu_live_slots = 4;
-    assert!(
-        !<SectionLane as StreamLane>::ready(&world, SectionPos {
-            detail: section::FINEST_DETAIL,
-            x: 0,
-            z: 0,
-        }),
-        "at the CPU-cull ceiling the far lane must not split further"
-    );
-    world.gpu_live_slots = 3;
-    assert!(<SectionLane as StreamLane>::ready(&world, SectionPos {
+    world.slot_ceiling = 1024;
+    world.gpu_live_slots = 6000;
+    let pos = SectionPos {
         detail: section::FINEST_DETAIL,
         x: 0,
         z: 0,
-    }));
+    };
+    assert!(
+        <SectionLane as StreamLane>::ready(&world, pos),
+        "6000 near slots against cpu_cull_max=1024 must not starve the far lane"
+    );
+    world.meshing_sections = SECTION_SLOT_FLOOR;
+    assert!(
+        !<SectionLane as StreamLane>::ready(&world, pos),
+        "the section floor is the far lane's own cap, not the near field's"
+    );
+    world.meshing_sections = SECTION_SLOT_FLOOR - 1;
+    assert!(<SectionLane as StreamLane>::ready(&world, pos));
+}
+
+/// At the user's max view (RD 20 / V 10 / 8 LOD rings) the far field still
+/// fits the section-slot floor, so covering-complete — and `entry_complete` —
+/// stays reachable when the near field has already eaten the CPU-cull knob.
+#[test]
+fn far_field_at_max_view_fits_the_section_slot_floor() {
+    let mut world = World::with_config(
+        DEFAULT_SEED,
+        RenderConfig {
+            lod_levels: 8,
+            lod_detail: 2,
+            ..RenderConfig::default()
+        },
+    );
+    world.set_view_distances(20, 10);
+    world.section_pyramid.unit = world.view.lod_unit();
+    world.slot_ceiling = 1024;
+    world.gpu_live_slots = 6000;
+    let center = ChunkCoord::new(0, 0, 0);
+    let desired = world.desired_sections(center);
+    assert!(!desired.is_empty(), "max view still wants a far field");
+    assert!(
+        desired.len() <= SECTION_SLOT_FLOOR,
+        "over the section floor: {} desired cells",
+        desired.len()
+    );
+    assert!(
+        <SectionLane as StreamLane>::ready(&world, desired[0]),
+        "the far lane must still admit under 6000 near slots"
+    );
 }
 
 #[test]

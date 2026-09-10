@@ -655,6 +655,7 @@ impl World {
                 levels: self.section_pyramid.levels.get(),
                 step: self.section_pyramid.step(),
                 mip_ready: self.section_mip.is_some(),
+                allowed: self.sections_allowed() as u32,
             };
             if self.section_frontier_key != Some(frontier_key) || !self.dirty_sections.is_empty() {
                 self.section_desired = self.desired_sections(center_chunk);
@@ -2000,7 +2001,7 @@ impl World {
     fn frontier(&self, metric: &EyeMetric) -> Vec<SectionPos> {
         let cfg = &self.section_pyramid;
         let radial = quadtree::desired_sections(metric, cfg);
-        match &self.section_mip {
+        let selected = match &self.section_mip {
             Some(mip) => {
                 let summary_at = |c: SectionPos| match self.section_overlay.get(&c) {
                     Some(ov) => CellSummary {
@@ -2012,7 +2013,10 @@ impl World {
                 quadtree::coarsen_by_error(radial, metric, cfg, &summary_at, &self.sse_budget())
             }
             None => radial,
-        }
+        };
+        // Prefer coarser tiles over dropping coverage when the far field
+        // would exceed its section-slot budget (outermost ring first).
+        quadtree::coarsen_to_budget(selected, self.sections_allowed(), cfg)
     }
 
     /// Ladder-pinned SSE budget for current view radius. Rebuilt per query
@@ -2117,7 +2121,7 @@ impl World {
 
     /// True if the cell or a Ready ancestor covers it.
     pub(in crate::world) fn section_covered(&self, cell: SectionPos) -> bool {
-        let max = self.section_pyramid.coarsest();
+        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
         quadtree::drawable_cover(cell, max, &ready).is_some()
     }
@@ -2161,7 +2165,7 @@ impl World {
             return;
         };
         let desired = std::mem::take(&mut self.section_desired);
-        let max = self.section_pyramid.coarsest();
+        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
         let cut = quadtree::resolve_covering(&desired, max, &ready);
         let backlog = desired.iter().any(|&c| {

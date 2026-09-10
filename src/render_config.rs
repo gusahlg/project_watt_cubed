@@ -14,7 +14,7 @@ pub const LOD_LEVELS_RANGE: RangeInclusive<u8> = 1..=8;
 pub const LOD_DETAIL_RANGE: RangeInclusive<u8> = 2..=6;
 /// The section hierarchy is deliberately capped here: coordinates and shifts
 /// throughout the quadtree assume a small, consecutive base-2 ladder.
-const LOD_COARSEST_DETAIL: u8 = 9;
+pub(crate) const LOD_COARSEST_DETAIL: u8 = 9;
 
 /// Auto enables VRS only when the render extent (window × render scale) has
 /// at least this many pixels. RTX 4060 @ 1920×1080 (2.07 Mpx) and RTX 3070 @

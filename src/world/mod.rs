@@ -75,10 +75,14 @@ use mesh::{ChunkMeshData, new_chunk_mesh_data};
 use quadtree::QuadrantMask;
 use section::{SectionMeshData, SectionPos};
 
-/// Engine CPU-cull live-count threshold. Section admission stays under this
-/// when the view would otherwise overflow it (chunks already over is a
-/// near-field issue, not a reason to split far tiles).
+/// Engine CPU-cull live-count threshold (`mesh_stats().cpu_cull_max` fallback).
+/// Above this the engine uses its GPU cull dispatch (~10 µs); it is a cost
+/// knob, not a hard slot limit. The far lane budgets section slots against
+/// `max(SECTION_SLOT_FLOOR, cpu_cull_max - near_chunk_slots)`.
 const CPU_CULL_MAX: u32 = 1024;
+/// Floor on the far lane's section-slot budget so a large near field cannot
+/// starve covering: chunks never count against sections.
+pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 512;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -174,7 +178,7 @@ pub struct StreamGauges {
     pub light_seed_inserts: u64,
     /// Live GPU mesh slots (engine gauge when streamed, else a local handle count).
     pub mesh_slots: usize,
-    /// CPU-cull live-count ceiling the far field budgets against.
+    /// CPU-cull live-count ceiling (`cpu_cull_max`); a cost knob, not a hard cap.
     pub slot_ceiling: usize,
     /// Ready far-LOD sections (each is one mesh per pass).
     pub section_ready: usize,
@@ -590,15 +594,41 @@ impl SectionState {
 }
 
 impl World {
-    fn local_mesh_slots(&self) -> usize {
-        let chunks = self
-            .chunks
+    fn section_slot_count(&self) -> usize {
+        self.sections.values().map(SectionState::slot_count).sum()
+    }
+
+    fn local_chunk_slots(&self) -> usize {
+        self.chunks
             .values()
             .filter_map(|l| l.state.live_meshes())
             .map(ChunkMeshes::slot_count)
-            .sum::<usize>();
-        let sections = self.sections.values().map(SectionState::slot_count).sum::<usize>();
-        chunks + sections
+            .sum()
+    }
+
+    /// Near-field GPU slots. When the engine has sampled `live_slots`, that
+    /// total minus the live section slots; otherwise the local chunk count.
+    /// Chunks never count against the far lane's section budget.
+    fn near_chunk_slots(&self) -> usize {
+        if self.gpu_live_slots != 0 {
+            (self.gpu_live_slots as usize).saturating_sub(self.section_slot_count())
+        } else {
+            self.local_chunk_slots()
+        }
+    }
+
+    /// Section slots the far lane may occupy: at least [`SECTION_SLOT_FLOOR`],
+    /// else whatever remains under the CPU-cull knob after near chunks.
+    pub(in crate::world) fn sections_allowed(&self) -> usize {
+        SECTION_SLOT_FLOOR.max((self.slot_ceiling as usize).saturating_sub(self.near_chunk_slots()))
+    }
+
+    fn section_budget_used(&self) -> usize {
+        self.section_slot_count() + self.meshing_sections + self.section_upload_queue.len()
+    }
+
+    fn local_mesh_slots(&self) -> usize {
+        self.local_chunk_slots() + self.section_slot_count()
     }
 }
 
@@ -962,6 +992,8 @@ pub struct World {
     /// the first stream (tests without a GPU).
     gpu_live_slots: u32,
     /// CPU-cull live-count ceiling (`mesh_stats().cpu_cull_max`, else 1024).
+    /// Cost knob for the engine's GPU cull dispatch; the far lane's section
+    /// budget is [`sections_allowed`](Self::sections_allowed), not this raw value.
     slot_ceiling: u32,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
@@ -1053,6 +1085,8 @@ struct SectionFrontierKey {
     levels: u8,
     step: u8,
     mip_ready: bool,
+    /// Far-lane section-slot budget the selection coarsens to.
+    allowed: u32,
 }
 
 impl World {
@@ -2208,11 +2242,10 @@ impl StreamLane for SectionLane {
         world.sections.contains_key(&key)
     }
     fn ready(world: &World, _key: SectionPos) -> bool {
-        // Prefer merging (one mesh/section already) over splitting when the
-        // live slot count is at the CPU-cull ceiling: do not admit more
-        // far tiles. In-flight claims and the upload queue will land as slots.
-        let pending = world.meshing_sections + world.section_upload_queue.len();
-        (world.gpu_live_slots as usize).saturating_add(pending) < world.slot_ceiling as usize
+        // Section slots only. Near-field chunks never consume this budget;
+        // a large view must not starve covering. In-flight claims and the
+        // upload queue land as slots, so they count now.
+        world.section_budget_used() < world.sections_allowed()
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
         world.refresh_tables();

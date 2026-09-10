@@ -163,6 +163,62 @@ pub(in crate::world) fn coarsen_by_error(
     out
 }
 
+/// Merge sibling quads, outermost (coarsest) ring first, until `frontier` fits
+/// in `budget` cells. Never drops coverage: a merge replaces children with their
+/// parent (parent ≤ hierarchy cap). Identity when already under budget.
+pub(in crate::world) fn coarsen_to_budget(
+    frontier: Vec<SectionPos>,
+    budget: usize,
+    cfg: &PyramidCfg,
+) -> Vec<SectionPos> {
+    if frontier.len() <= budget {
+        return frontier;
+    }
+    let mut set: FastSet<SectionPos> = frontier.into_iter().collect();
+    // Outermost ring may step past the configured coarsest, up to the
+    // hierarchy cap, so a tight slot budget still covers instead of holing.
+    let cap = crate::render_config::LOD_COARSEST_DETAIL as i8;
+    let finest = cfg.finest.0;
+    while set.len() > budget {
+        let mut merged = false;
+        // Outermost first: coarsest children that still have a parent in-ladder.
+        for child_d in (finest..cap).rev() {
+            if set.len() <= budget {
+                break;
+            }
+            let mut kids: FastMap<SectionPos, u8> = FastMap::default();
+            for &c in &set {
+                if c.detail.0 == child_d {
+                    *kids.entry(c.parent()).or_insert(0) += 1;
+                }
+            }
+            let mut parents: Vec<(SectionPos, u8)> = kids.into_iter().filter(|&(_, n)| n >= 2).collect();
+            parents.sort_unstable_by_key(|(p, n)| (std::cmp::Reverse(*n), p.x, p.z));
+            for (p, _) in parents {
+                if set.len() <= budget {
+                    break;
+                }
+                let mut removed = 0u8;
+                for q in Quadrant::ALL {
+                    if set.remove(&p.child(q)) {
+                        removed += 1;
+                    }
+                }
+                if removed > 0 {
+                    set.insert(p);
+                    merged = true;
+                }
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+    let mut out: Vec<SectionPos> = set.into_iter().collect();
+    out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
+    out
+}
+
 /// Merge two frontiers for velocity prediction (real eye + predicted eye).
 /// Result is a superset of each input, never dropping cells. Overlaps are pruned
 /// by [`resolve_covering`].
@@ -875,6 +931,50 @@ mod tests {
             assert!(coarsened.len() <= last, "climbing to y={y} refined the field ({} > {last})", coarsened.len());
             last = coarsened.len();
         }
+    }
+
+    /// Under budget the cut is identity (bit-identical, sorted the same).
+    #[test]
+    fn coarsen_to_budget_is_identity_when_under_budget() {
+        let cfg = cfg();
+        let radial = desired_sections(&eye(0, 0, &cfg), &cfg);
+        assert_eq!(coarsen_to_budget(radial.clone(), radial.len(), &cfg), radial);
+        assert_eq!(coarsen_to_budget(radial.clone(), usize::MAX, &cfg), radial);
+    }
+
+    /// A tight budget coarsens instead of dropping cells: every original
+    /// cell has an ancestor-or-self in the result, and the count fits.
+    #[test]
+    fn coarsen_to_budget_covers_without_holes() {
+        let cfg = cfg();
+        let radial = desired_sections(&eye(0, 0, &cfg), &cfg);
+        let budget = 64.min(radial.len().saturating_sub(1)).max(1);
+        let out = coarsen_to_budget(radial.clone(), budget, &cfg);
+        assert!(out.len() <= budget, "over budget: {} cells for budget {budget}", out.len());
+        let set: HashSet<_> = out.into_iter().collect();
+        let cap = Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
+        assert!(
+            is_coarsening_of(&radial, &set, cap),
+            "a coarsened cut must tile every original cell"
+        );
+    }
+
+    /// A small trim merges the outermost ring first: the finest (inner)
+    /// ring's count is unchanged.
+    #[test]
+    fn coarsen_to_budget_raises_outer_rings_first() {
+        let cfg = cfg();
+        let radial = desired_sections(&eye(0, 0, &cfg), &cfg);
+        let finest_n = radial.iter().filter(|c| c.detail == cfg.finest).count();
+        assert!(finest_n > 0 && radial.len() > finest_n, "need both inner and outer rings");
+        let budget = radial.len() - 4;
+        let out = coarsen_to_budget(radial, budget, &cfg);
+        let finest_after = out.iter().filter(|c| c.detail == cfg.finest).count();
+        assert_eq!(
+            finest_after, finest_n,
+            "inner finest ring must survive a small outer trim"
+        );
+        assert!(out.len() <= budget);
     }
 
     /// Mixed-detail altitude-coarsened cut yields an exact partition via
