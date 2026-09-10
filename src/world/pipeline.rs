@@ -1666,9 +1666,8 @@ mod tests {
 
         const PASSES: u32 = 200;
 
-<<<<<<< HEAD
         fn populate(world: &mut World, rh: i32, rv: i32, needs_mesh: bool) {
-            let stone = world.registry.id_by_name("Stone").unwrap();
+            let stone = world.registry.id_by_label("rock").unwrap();
             let chunk = Arc::new(Chunk::from_data(0, 0, 0, ChunkData::Uniform(stone)));
             for x in -rh..=rh {
                 for z in -rh..=rh {
@@ -1691,46 +1690,6 @@ mod tests {
                                 light_gen: 0,
                             },
                         );
-=======
-        let mut world = World::with_config_lazy(1, RenderConfig::default());
-        world.transition_lighting(false);
-        world.set_view_distances(20, 10);
-        let center = ChunkCoord::new(0, 0, 0);
-        world.center = Some(center);
-
-        let stone = world.registry.id_by_label("rock").unwrap();
-        // Halo so every seeded coord has 6 face neighbours; interior is in-box.
-        for x in -19..=19 {
-            for z in -19..=19 {
-                for y in -9..=9 {
-                    let coord = ChunkCoord::new(x, y, z);
-                    world.chunks.insert(
-                        coord,
-                        Loaded {
-                            chunk: Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(stone))),
-                            state: MeshState::needs_mesh(),
-                            rev: 0,
-                            connectivity: None,
-                            visible: true,
-                            light: None,
-                            has_blocklight: false,
-                            light_gen: 0,
-                        },
-                    );
-                }
-            }
-        }
-
-        let mut seeds = Vec::with_capacity(N);
-        'fill: for x in -18..=18 {
-            for z in -18..=18 {
-                for y in -8..=8 {
-                    let coord = ChunkCoord::new(x, y, z);
-                    debug_assert!(<MeshLane as StreamLane>::ready(&world, coord));
-                    seeds.push(coord);
-                    if seeds.len() == N {
-                        break 'fill;
->>>>>>> pm/w-b
                     }
                 }
             }

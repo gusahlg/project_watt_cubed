@@ -1439,7 +1439,7 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
     world.set_view_distances(6, 3);
     let center = ChunkCoord::new(0, 0, 0);
     world.center = Some(center);
-    let stone = world.registry.id_by_name("Stone").unwrap();
+    let stone = world.registry.id_by_label("rock").unwrap();
     for x in -5..=5 {
         for z in -5..=5 {
             for y in -2..=2 {

@@ -732,17 +732,8 @@ mod tests {
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
         let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
-<<<<<<< HEAD
         let is_water_quad = |q: &[MeshVertex]| tables.fluid_surface(BlockId(q[0].layer()));
         let opaque_water = all_quads(&mesh).any(|(p, q)| p == Pass::Opaque && is_water_quad(&q));
-=======
-        let water_layers: std::collections::HashSet<u16> = (0..tables.len())
-            .filter(|&i| tables.fluid_surface(BlockId(i as u16)))
-            .map(|i| tables.render_layer(BlockId(i as u16)))
-            .collect();
-        let is_water_quad = |q: &[MeshVertex]| water_layers.contains(&q[0].layer());
-        let opaque_water = all_quads(&mesh).any(|(_, p, q)| p == Pass::Opaque && is_water_quad(&q));
->>>>>>> pm/w-b
         assert!(opaque_water, "water surface meshes into the opaque pass");
         assert!(!all_quads(&mesh).any(|(_, q)| q[0].is_water()), "LOD water clears the water bit");
         assert!(

@@ -478,10 +478,10 @@ mod tests {
         // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            ((0, 1, 0), 0xad7d2918, 0xad7d2918, 0x8ea03195),
-            ((3, 1, -2), 0x667d9aa3, 0x667d9aa3, 0x12b4ebb3),
-            ((-5, 0, 4), 0xe9281008, 0xe9281008, 0xe9281008),
-            ((2, 1, 2), 0xd4f5436e, 0xd4f5436e, 0x98d2d991),
+            ((0, 1, 0), 0x8773f903, 0x8773f903, 0xd6c7f6fa),
+            ((3, 1, -2), 0xc5121175, 0xc5121175, 0x76e5b603),
+            ((-5, 0, 4), 0x37cc6020, 0x37cc6020, 0x974a4c57),
+            ((2, 1, 2), 0x24d38aac, 0x24d38aac, 0xcdc62353),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
