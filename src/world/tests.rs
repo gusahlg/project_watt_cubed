@@ -429,17 +429,23 @@ fn column_is_layered_grass_dirt_stone() {
     let reg = world.registry();
     // Terrain speaks elements: crust blocks are the natural unions derived by
     // the placement table.
-    let (grass, dirt, stone) = (
+    let (grass, dirt) = (
         reg.id_by_label("organic+soil").unwrap(),
         reg.id_by_label("clay+soil").unwrap(),
-        reg.id_by_label("rock").unwrap(),
     );
+    let stone_ids: [BlockId; 4] = [
+        reg.id_by_label("rock").unwrap(),
+        reg.id_by_label("rock:0").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
+        reg.id_by_label("rock:1").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
+        reg.id_by_label("rock:2").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
+    ];
+    let is_stone = |id| stone_ids.contains(&id);
 
     let (x, z, h) = (0..64)
         .flat_map(|x| (0..64).map(move |z| (x, z)))
         .find_map(|(x, z)| {
             let h = (0..96).rev().find(|&y| world.is_solid(x, y, z))?;
-            (world.block_at(x, h, z) == grass && world.block_at(x, h - 3, z) == stone)
+            (world.block_at(x, h, z) == grass && is_stone(world.block_at(x, h - 3, z)))
                 .then_some((x, z, h))
         })
         .expect("a grass-topped column with clean shallow stone near spawn");
@@ -447,10 +453,10 @@ fn column_is_layered_grass_dirt_stone() {
     assert_eq!(world.block_at(x, h + 1, z), AIR);
     assert_eq!(world.block_at(x, h, z), grass);
     assert_eq!(world.block_at(x, h - 1, z), dirt);
-    assert_eq!(world.block_at(x, h - 3, z), stone);
+    assert!(is_stone(world.block_at(x, h - 3, z)));
     // Deep stone persists below y = 0.
     world.ensure_data(World::chunk_of(x, h - 70, z));
-    assert_eq!(world.block_at(x, h - 70, z), stone);
+    assert!(is_stone(world.block_at(x, h - 70, z)));
 }
 
 #[test]

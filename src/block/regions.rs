@@ -1,12 +1,13 @@
-//! Worldgen starting regions: a labelled centre element and a small family of
-//! variants, computed from the law rather than authored constants.
+//! Worldgen starting regions: a labelled centre element, a small family of
+//! variants, and three geological strata, computed from the law.
 
 use std::sync::OnceLock;
 
 use material::{interact, observe, Configuration, Element, EventKind, Law, Observation};
 
-/// One worldgen family: a centre that observes as the labelled kind, plus six
-/// one-axis jitters (failing jitters collapse to the centre).
+/// One worldgen family: a centre that observes as the labelled kind, six
+/// one-axis jitters (failing jitters collapse to the centre), and three
+/// strata sub-centres the generator picks by geology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region {
     /// Debug/semantic name. Never a simulation input.
@@ -16,16 +17,32 @@ pub struct Region {
     /// Jitter amplitude along one axis, in lattice units.
     pub spread: u8,
     members: [Element; 7],
+    strata: [Element; 3],
 }
 
 const SPREAD: u8 = 8;
 /// Tried in order when filling a family's six variants. Rest is monotone in
 /// event strength, so a larger jitter is preferred when it still sits at rest.
 const SPREADS: [u8; 3] = [SPREAD, 4, 1];
-const SEARCH_CAP: u32 = 100_000;
+/// Strata try ±12 first (visibly off the centre), then the dead-zone edge, then
+/// the family spread — only offsets that stay in-band and at rest are kept.
+const STRATUM_DELTAS: [u8; 5] = [12, 10, 8, 4, 1];
+const SEARCH_CAP: u32 = 40_000;
+/// L1 separation required between two region centres (same element must not
+/// serve two labels).
+const DISTINCT_L1: u32 = 48;
+/// Kernel dead zone (inclusive) and far inert floor: an axis is inert when
+/// its absolute difference is in this set.
+const DEAD_ZONE: u32 = 10;
+const FAR_INERT: u32 = 64;
 
 const LABELS: [&str; 10] = [
     "rock", "soil", "sand", "clay", "organic", "water", "ice", "snow", "glass", "lamp",
+];
+/// Rare observation classes first so the cross-stability filter cannot starve
+/// them of the few centres they have.
+const SEARCH_ORDER: [&str; 10] = [
+    "water", "glass", "lamp", "ice", "clay", "organic", "sand", "snow", "soil", "rock",
 ];
 
 impl Region {
@@ -38,6 +55,16 @@ impl Region {
     /// variant equals the centre).
     pub fn member(&self, i: usize) -> Element {
         self.members[i]
+    }
+
+    /// Geological sub-centre `0..=2` (a collapsed stratum equals the centre).
+    pub fn stratum(&self, i: usize) -> Element {
+        self.strata[i]
+    }
+
+    /// Centre, variants and strata — every element this family can emit.
+    pub fn matter(&self) -> impl Iterator<Item = Element> + '_ {
+        self.members.iter().copied().chain(self.strata.iter().copied())
     }
 }
 
@@ -84,37 +111,62 @@ fn mean_element(c: &Configuration) -> Option<Element> {
     Some(Element::new(q.map(|v| (v / 256) as u8)))
 }
 
-/// True when no pair of family members of `regions` changes under `Collision`
-/// (the strongest event; rest there implies rest under every weaker kind).
+/// True when no pair of family members or strata of `regions` changes under
+/// `Collision` (the strongest event; rest there implies rest under every weaker
+/// kind).
 pub fn families_at_rest(law: &Law, regions: &[Region]) -> bool {
-    let members: Vec<Configuration> = regions.iter().flat_map(|r| r.family(law)).collect();
-    pair_rest(law, &members)
+    let mut members: Vec<Configuration> = regions.iter().flat_map(|r| r.family(law)).collect();
+    members.extend(regions.iter().flat_map(|r| r.strata.map(Configuration::single)));
+    pair_rest(law, &members, EventKind::Collision)
+}
+
+/// True when no ordered pair of `members` changes under `kind`.
+pub fn pair_rest(law: &Law, members: &[Configuration], kind: EventKind) -> bool {
+    for (i, a) in members.iter().enumerate() {
+        for b in members.iter().skip(i) {
+            if interact(law, a, b, kind).changed || interact(law, b, a, kind).changed {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn find_all(law: &Law) -> Vec<Region> {
     let fp = law.fingerprint();
     let mut found: Vec<Region> = Vec::with_capacity(LABELS.len());
     let mut centres: Vec<Element> = Vec::new();
-    for (label_i, &label) in LABELS.iter().enumerate() {
-        let mut chosen: Option<Region> = None;
+    for &label in &SEARCH_ORDER {
+        let label_i = LABELS.iter().position(|&l| l == label).expect("SEARCH_ORDER ⊆ LABELS");
+        let mut best: Option<(u32, u32, Element)> = None;
         for n in 0..SEARCH_CAP {
             let c = candidate(fp, label_i as u32, n);
-            if !fits(law, label, c) {
+            let Some(obs) = fits_obs(law, label, c) else { continue };
+            if !distinct(c, &centres) || !axis_inert_with(c, &centres) {
                 continue;
             }
             if !stable_with(law, c, &centres) {
                 continue;
             }
-            chosen = Some(family_at(law, label, c, &centres));
-            break;
+            let score = band_score(label, &obs);
+            match best {
+                Some((bs, bn, _)) if (score, n) >= (bs, bn) => {}
+                _ => best = Some((score, n, c)),
+            }
+            if score == 0 {
+                break;
+            }
         }
-        let Some(region) = chosen else {
+        let Some((_, _, c)) = best else {
             panic!("law cannot host region {label}: no candidate in {SEARCH_CAP}");
         };
+        let region = family_at(law, label, c, &centres);
         centres.push(region.centre);
         found.push(region);
     }
+    found.sort_by_key(|r| LABELS.iter().position(|&l| l == r.label).unwrap_or(99));
     collapse_unstable(law, &mut found);
+    fill_strata(law, &mut found);
     found
 }
 
@@ -129,6 +181,9 @@ fn family_at(law: &Law, label: &'static str, c: Element, centres: &[Element]) ->
         for (k, v) in jitters(c, spread).iter().copied().enumerate() {
             let ok = v != c
                 && fits(law, label, v)
+                && distinct(v, centres)
+                && axis_inert_with(v, centres)
+                && axis_inert_with(v, &[c])
                 && stable_with(law, v, centres)
                 && stable_with(law, v, &[c]);
             if ok {
@@ -141,6 +196,7 @@ fn family_at(law: &Law, label: &'static str, c: Element, centres: &[Element]) ->
             centre: c,
             spread,
             members,
+            strata: [c; 3],
         };
         if filled == 6 {
             return region;
@@ -150,8 +206,74 @@ fn family_at(law: &Law, label: &'static str, c: Element, centres: &[Element]) ->
     fallback.expect("SPREADS is non-empty")
 }
 
-/// Drop any variant that is not at rest with the whole family, so a world built
-/// from all members stays still under Collision.
+/// Three sub-centres per region, picked after variant collapse so the rest
+/// filter sees the matter the world actually emits. ±12 first, then smaller
+/// dead-zone offsets; one axis each.
+fn fill_strata(law: &Law, regions: &mut [Region]) {
+    for i in 0..regions.len() {
+        let label = regions[i].label;
+        let c = regions[i].centre;
+        let mut out = [c; 3];
+        let mut filled = 0usize;
+        let mut used_axis = [false; 4];
+        let others: Vec<Element> = regions
+            .iter()
+            .enumerate()
+            .flat_map(|(j, r)| {
+                if j == i {
+                    r.members.iter().copied().collect::<Vec<_>>()
+                } else {
+                    r.matter().collect()
+                }
+            })
+            .collect();
+        for &delta in &STRATUM_DELTAS {
+            if filled == 3 {
+                break;
+            }
+            for axis in [3usize, 0, 1, 2] {
+                if filled == 3 {
+                    break;
+                }
+                if used_axis[axis] {
+                    continue;
+                }
+                for &sign in &[1i16, -1] {
+                    let v = c.0[axis] as i16 + sign * delta as i16;
+                    if !(0..=255).contains(&v) {
+                        continue;
+                    }
+                    let mut e = c;
+                    e.0[axis] = v as u8;
+                    if e == c || (0..filled).any(|k| out[k] == e) {
+                        continue;
+                    }
+                    if !fits(law, label, e) {
+                        continue;
+                    }
+                    if !axis_inert(e, c) {
+                        continue;
+                    }
+                    if !axis_inert_with(e, &out[..filled]) {
+                        continue;
+                    }
+                    if !stable_with(law, e, &others) || !stable_with(law, e, &out[..filled]) {
+                        continue;
+                    }
+                    out[filled] = e;
+                    used_axis[axis] = true;
+                    filled += 1;
+                    break;
+                }
+            }
+        }
+        regions[i].strata = out;
+    }
+}
+
+/// Drop any variant that is not at rest with the whole family, so a world
+/// built from all members stays still under Collision. Strata are filled
+/// afterwards against this collapsed set.
 fn collapse_unstable(law: &Law, regions: &mut [Region]) {
     loop {
         let members: Vec<Element> = regions.iter().flat_map(|r| r.members).collect();
@@ -174,7 +296,12 @@ fn collapse_unstable(law: &Law, regions: &mut [Region]) {
 }
 
 fn fits(law: &Law, label: &str, e: Element) -> bool {
-    matches_label(label, &observe(law, &Configuration::single(e)))
+    fits_obs(law, label, e).is_some()
+}
+
+fn fits_obs(law: &Law, label: &str, e: Element) -> Option<Observation> {
+    let o = observe(law, &Configuration::single(e));
+    matches_label(label, &o).then_some(o)
 }
 
 fn matches_label(label: &str, o: &Observation) -> bool {
@@ -183,15 +310,49 @@ fn matches_label(label: &str, o: &Observation) -> bool {
         "rock" => o.solid && opaque && o.hardness >= 160,
         "soil" => o.solid && opaque && (90..=150).contains(&o.hardness),
         "sand" => o.solid && opaque && (60..=120).contains(&o.hardness) && o.friction < 100,
-        "clay" => o.solid && opaque && (100..=160).contains(&o.hardness) && o.friction >= 140,
-        "organic" => o.solid && opaque && (40..=110).contains(&o.hardness),
+        "clay" => o.solid && opaque && (100..=160).contains(&o.hardness) && o.friction >= 120,
+        "organic" => o.solid && opaque && (30..=130).contains(&o.hardness),
         "water" => o.liquid && o.transparency >= 120,
-        "ice" => o.solid && (60..=160).contains(&o.transparency) && o.hardness >= 120,
+        "ice" => o.solid && (40..=180).contains(&o.transparency) && o.hardness >= 100,
         "snow" => o.solid && opaque && o.hardness < 60,
         "glass" => o.solid && o.transparency >= 160,
         "lamp" => o.solid && o.emission >= 8,
         _ => false,
     }
+}
+
+/// Distance from the middle of the class band — lower is better.
+fn band_score(label: &str, o: &Observation) -> u32 {
+    let mid = |v: u8, lo: u8, hi: u8| (v as i32 - (lo as i32 + hi as i32) / 2).unsigned_abs();
+    match label {
+        "rock" => mid(o.hardness, 160, 255),
+        "soil" => mid(o.hardness, 90, 150),
+        "sand" => mid(o.hardness, 60, 120) + o.friction as u32,
+        "clay" => mid(o.hardness, 100, 160) + mid(o.friction, 120, 255),
+        "organic" => mid(o.hardness, 30, 130),
+        "water" => mid(o.transparency, 120, 255),
+        "ice" => mid(o.transparency, 40, 180),
+        "snow" => mid(o.hardness, 0, 59),
+        "glass" => mid(o.transparency, 160, 255),
+        "lamp" => mid(o.emission, 8, 15),
+        _ => 0,
+    }
+}
+
+fn distinct(e: Element, others: &[Element]) -> bool {
+    others.iter().all(|&o| e.distance(o) >= DISTINCT_L1)
+}
+
+/// Every axis difference is in the dead zone or past the far inert floor.
+fn axis_inert(a: Element, b: Element) -> bool {
+    (0..4).all(|i| {
+        let d = (a.0[i] as i32 - b.0[i] as i32).unsigned_abs();
+        d <= DEAD_ZONE || d >= FAR_INERT
+    })
+}
+
+fn axis_inert_with(e: Element, others: &[Element]) -> bool {
+    others.iter().all(|&o| axis_inert(e, o))
 }
 
 fn stable_with(law: &Law, e: Element, others: &[Element]) -> bool {
@@ -205,19 +366,6 @@ fn stable_with(law: &Law, e: Element, others: &[Element]) -> bool {
             || interact(law, &d, &c, EventKind::Collision).changed
         {
             return false;
-        }
-    }
-    true
-}
-
-fn pair_rest(law: &Law, members: &[Configuration]) -> bool {
-    for (i, a) in members.iter().enumerate() {
-        for b in members.iter().skip(i) {
-            if interact(law, a, b, EventKind::Collision).changed
-                || interact(law, b, a, EventKind::Collision).changed
-            {
-                return false;
-            }
         }
     }
     true
@@ -277,22 +425,94 @@ mod tests {
                 r.spread
             );
             assert_eq!(r.centre, r.members[0]);
+            let obs = observe(&law, &Configuration::single(r.centre));
+            println!(
+                "region {:>8} centre=[{:3},{:3},{:3},{:3}] spread={}  solid={} liquid={} t={:3} e={:2} h={:3} f={:3}",
+                r.label,
+                r.centre.0[0],
+                r.centre.0[1],
+                r.centre.0[2],
+                r.centre.0[3],
+                r.spread,
+                obs.solid,
+                obs.liquid,
+                obs.transparency,
+                obs.emission,
+                obs.hardness,
+                obs.friction,
+            );
             assert!(
-                matches_label(r.label, &observe(&law, &Configuration::single(r.centre))),
+                matches_label(r.label, &obs),
                 "{} centre does not observe as required: {:?}",
                 r.label,
-                observe(&law, &Configuration::single(r.centre))
+                obs
             );
-            for m in r.family(&law) {
+            for m in r.matter() {
                 assert!(
-                    matches_label(r.label, &observe(&law, &m)),
-                    "{} family member {:?} does not observe as required",
+                    matches_label(r.label, &observe(&law, &Configuration::single(m))),
+                    "{} family/stratum {:?} does not observe as required",
                     r.label,
-                    m.elements()
+                    m.0
                 );
             }
         }
         assert!(families_at_rest(&law, &regions), "a family member pair reacted under Collision");
+    }
+
+    #[test]
+    fn centres_are_distinct_and_cross_inert() {
+        let law = Law::v0();
+        let regions = builtin(&law);
+        for (i, a) in regions.iter().enumerate() {
+            for b in regions.iter().skip(i + 1) {
+                assert!(
+                    a.centre.distance(b.centre) >= DISTINCT_L1,
+                    "{} and {} centres are L1 {} < {DISTINCT_L1}",
+                    a.label,
+                    b.label,
+                    a.centre.distance(b.centre)
+                );
+                assert!(
+                    axis_inert(a.centre, b.centre),
+                    "{} and {} are not axis-inert",
+                    a.label,
+                    b.label
+                );
+            }
+        }
+        let lamp = regions.iter().find(|r| r.label == "lamp").unwrap();
+        let rock = regions.iter().find(|r| r.label == "rock").unwrap();
+        assert_ne!(lamp.centre, rock.centre, "lamp must not collapse onto rock");
+        assert!(lamp.centre.distance(rock.centre) >= DISTINCT_L1);
+    }
+
+    #[test]
+    fn each_region_has_three_strata() {
+        let law = Law::v0();
+        let regions = builtin(&law);
+        let mut rock_soil_variety = 0;
+        for r in &regions {
+            let distinct = r.strata.iter().filter(|s| **s != r.centre).count();
+            if matches!(r.label, "rock" | "soil") && distinct >= 1 {
+                rock_soil_variety += 1;
+            }
+            let axes: Vec<_> = r
+                .strata
+                .iter()
+                .filter(|s| **s != r.centre)
+                .map(|s| {
+                    let d: Vec<_> = (0..4).filter(|&a| s.0[a] != r.centre.0[a]).collect();
+                    assert_eq!(d.len(), 1, "{} stratum is not a one-axis offset", r.label);
+                    d[0]
+                })
+                .collect();
+            let mut seen = [false; 4];
+            for a in axes {
+                assert!(!seen[a], "{} reused axis {a} for two strata", r.label);
+                seen[a] = true;
+            }
+        }
+        assert_eq!(rock_soil_variety, 2, "rock and soil must each have a geological stratum");
     }
 
     #[test]

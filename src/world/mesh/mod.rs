@@ -521,10 +521,10 @@ mod tests {
         // (1,1,0) replaced (-5,0,4), whose enclosed empty mesh hashed identically.
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            ((0, 1, 0), 0x44467eeb, 0x44467eeb, 0x46f2b392),
-            ((3, 1, -2), 0xc5121175, 0xc5121175, 0x76e5b603),
-            ((1, 1, 0), 0x5d1faa35, 0x5d1faa35, 0xcf5b4303),
-            ((2, 1, 2), 0xd16f666c, 0xd16f666c, 0xdc8830b3),
+            ((0, 1, 0), 0x95aab61d, 0x95aab61d, 0x0203517e),
+            ((3, 1, -2), 0xfc09abcb, 0xfc09abcb, 0x1f5b0cdd),
+            ((1, 1, 0), 0xa3f083f5, 0xa3f083f5, 0xdf005b14),
+            ((2, 1, 2), 0x2db63ee3, 0x2db63ee3, 0x66f6de12),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
