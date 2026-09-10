@@ -89,6 +89,8 @@ pub enum SaveError {
     Corrupt(&'static str),
     BadVersion(u16),
     BadName(&'static str),
+    /// The document's law stamp is not this game's law — a different universe.
+    LawMismatch,
 }
 
 impl fmt::Display for SaveError {
@@ -98,6 +100,10 @@ impl fmt::Display for SaveError {
             SaveError::Corrupt(what) => write!(f, "corrupt save: {what}"),
             SaveError::BadVersion(v) => write!(f, "unsupported save version {v}"),
             SaveError::BadName(why) => write!(f, "bad save name: {why}"),
+            SaveError::LawMismatch => write!(
+                f,
+                "save belongs to a different universe (law stamp mismatch)"
+            ),
         }
     }
 }

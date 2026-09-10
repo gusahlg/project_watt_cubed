@@ -118,9 +118,14 @@ pub enum LawError {
 pub const STAMP_LEN: usize = 2 + 1 + KNOTS * 3 + D * D + 1 + EVENT_KINDS + 5 * D + 4 + 4 + 1;
 
 impl Law {
-    /// The provisional law of version 0: a Lennard-Jones-like curve (repulsive under 12 lattice units,
-    /// attractive to ~160, fading by 255), identity mixing plus a quarter cyclic coupling, six units of
-    /// maximum step, clamped boundaries, no quantization.
+    /// The provisional law of version 0. Per axis: a DEAD ZONE up to 10 units (near-identical matter
+    /// does not react — families and drifted variants stay themselves), repulsion 10..24 (peak at 16),
+    /// attraction 24..64 (peak at 40) and NOTHING beyond 64 (very different matter is inert, so a world
+    /// of well-separated regions is at rest); identity mixing plus a quarter cyclic coupling, six units
+    /// of maximum step, clamped boundaries, no quantization. Reactions therefore happen between
+    /// moderately similar materials — chemistry among relatives — and products settle in the flat
+    /// band 22..26 where repulsion and attraction balance (a zero-slope band, so integer steps cannot
+    /// oscillate across it: pairs come to rest instead of hopping around the ring forever).
     pub const fn v0() -> Law {
         Law {
             version: 0,
@@ -128,13 +133,13 @@ impl Law {
             kernel: Kernel {
                 knots: [
                     (0, 0),
-                    (4, -8),
-                    (8, -7),
-                    (12, 0),
-                    (24, 10),
-                    (48, 14),
-                    (96, 10),
-                    (160, 4),
+                    (10, 0),
+                    (16, -8),
+                    (22, 0),
+                    (26, 0),
+                    (40, 10),
+                    (56, 4),
+                    (64, 0),
                     (255, 0),
                 ],
                 mixing: [[16, 4, 0, 0], [0, 16, 4, 0], [0, 0, 16, 4], [4, 0, 0, 16]],
@@ -148,9 +153,9 @@ impl Law {
                 glow: Element::new([160, 240, 32, 120]),
                 friction: Element::new([64, 128, 192, 240]),
                 strength: 255,
-                liquid_min: 135,
-                glow_min: 145,
-                transparent_min: 135,
+                liquid_min: 172,
+                glow_min: 180,
+                transparent_min: 140,
             },
             visual_seed: 0x5ee_d5eed,
             quantum: 1,

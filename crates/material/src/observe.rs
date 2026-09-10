@@ -55,9 +55,9 @@ impl Observation {
     };
 }
 
-/// Largest plausible per-element response magnitude for the scale mapping (sum over axes of the
-/// largest knot response after mixing); responses beyond it saturate at 255.
-const RESPONSE_FULL: i32 = 64;
+/// Per-element response magnitude that reads as 255 (the sum over axes of the largest knot response
+/// after mixing is ~16 under law v0's band-limited curve); larger responses saturate.
+const RESPONSE_FULL: i32 = 16;
 
 /// Mean per-element response magnitude of `c` to `probe`, 0..255. Void → 0.
 pub(crate) fn response(law: &Law, c: &Configuration, probe: Element) -> u8 {

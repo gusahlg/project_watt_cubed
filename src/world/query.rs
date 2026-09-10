@@ -398,9 +398,9 @@ mod tests {
 
     fn query_world() -> World {
         let mut world = World::with_config_lazy(73, RenderConfig::default());
-        let stone = world.registry.id_by_name("Stone").unwrap();
-        let water = world.registry.id_by_name("Water").unwrap();
-        let ice = world.registry.id_by_name("Ice").unwrap();
+        let stone = world.registry.id_by_label("rock").unwrap();
+        let water = world.registry.id_by_label("water").unwrap();
+        let ice = world.registry.id_by_label("ice").unwrap();
         for (coord, id) in [
             (Coord::new(-1, -1, -1), stone),
             (Coord::new(0, -1, -1), AIR),
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn collision_local_ranges_include_world_border_cells() {
         let mut world = World::with_config_lazy(73, RenderConfig::default());
-        let stone = world.registry.id_by_name("Stone").unwrap();
+        let stone = world.registry.id_by_label("rock").unwrap();
         // Most-negative clamp cell (local 0) and most-positive `block_coord_end`
         // cell (local 15): the reachable endpoints, where saturating clip matters.
         for x in [block_coord(f64::NEG_INFINITY), block_coord_end(f64::INFINITY)] {

@@ -72,8 +72,11 @@ fn response_curve_is_odd_continuous_and_zero_at_rest() {
             assert!((kernel::response(&k, d) - kernel::response(&k, d + 1)).abs() <= 5, "slope at {d}");
         }
     }
-    assert!(kernel::response(&k, 3) < 0, "repulsive up close");
-    assert!(kernel::response(&k, 48) > 0, "attractive at middle range");
+    assert_eq!(kernel::response(&k, 5), 0, "dead zone: near-identical matter does not react");
+    assert!(kernel::response(&k, 16) < 0, "repulsive just outside the dead zone");
+    assert!(kernel::response(&k, 40) > 0, "attractive at middle range");
+    assert_eq!(kernel::response(&k, 24), 0, "the rest band: no force at the bond length");
+    assert_eq!(kernel::response(&k, 100), 0, "inert when very different");
     assert_eq!(kernel::response(&k, 255), 0);
 }
 
@@ -212,4 +215,25 @@ fn print_probe_quantiles() {
         let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
         println!("{name:9} p05={} p25={} p50={} p75={} p85={} p92={} p98={} max={}", q(0.05), q(0.25), q(0.5), q(0.75), q(0.85), q(0.92), q(0.98), v[v.len() - 1]);
     }
+}
+
+#[test]
+fn interact_many_is_order_independent_and_matches_single_origin() {
+    let law = Law::v0();
+    let mut rng = Rng(21);
+    for _ in 0..2_000 {
+        let a = rng.config(4);
+        let b = rng.config(4);
+        let t = rng.config(4);
+        let ab = interact_many(&law, &[(&a, EventKind::Collision), (&b, EventKind::Moved)], &t);
+        let ba = interact_many(&law, &[(&b, EventKind::Moved), (&a, EventKind::Collision)], &t);
+        assert_eq!(ab, ba);
+        assert_eq!(interact_many(&law, &[(&a, EventKind::Moved)], &t), interact(&law, &a, &t, EventKind::Moved));
+        for (x, y) in ab.target.elements().iter().zip(t.elements()) {
+            assert!(x.max_axis_distance(*y) <= law.kernel.max_step as u32);
+        }
+    }
+    let t = rng.config(3);
+    assert!(!interact_many(&law, &[], &t).changed);
+    assert!(!interact_many(&law, &[(&Configuration::void(), EventKind::Collision)], &t).changed);
 }

@@ -2725,29 +2725,29 @@ impl World {
         });
     }
 
-    /// Rebuild/upload block texture array on palette growth (rare: world entry or new block type).
-    /// The per-id layer cache makes growth O(new blocks), not O(palette). Existing
-    /// layers never change (pure function of composition; ids are append-only),
-    /// so only the first upload uses `set_block_textures`; later growth appends.
+    /// Rebuild/upload block texture array on descriptor growth (rare: world entry
+    /// or a newly interned look). Existing layers never change (pure function of
+    /// the visual; descriptor ids are append-only), so only the first upload uses
+    /// `set_block_textures`; later growth appends.
     fn refresh_textures(&mut self, eng: &mut Engine) {
         // Never zero (modulo divisor) and never past the vertex field's u16.
         self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
-        let count = self.registry.block_count();
+        let count = self.registry.descriptor_count();
         if self.textures_built == count {
             return;
         }
         for i in self.texture_cache.len()..count {
             self.texture_cache
-                .push(crate::block::texture::build_block_texture(
+                .push(crate::block::texture::build_descriptor_texture(
                     &self.registry,
-                    crate::block::registry::BlockId(i as u16),
+                    i as u16,
                 ));
         }
         let visible = count.min(self.texture_layer_cap as usize);
         if count > visible && self.uploaded_len < visible {
             eprintln!(
-                "block palette ({count}) exceeds the device texture-layer cap \
-                 ({visible}); further block textures wrap onto existing layers"
+                "render descriptors ({count}) exceed the device texture-layer cap \
+                 ({visible}); further textures wrap onto existing layers"
             );
         }
         match plan_texture_upload(&self.texture_cache, self.uploaded_len, visible) {
@@ -3373,7 +3373,7 @@ mod tests {
             let coord = Coord::new(1, 25, -2);
             world.center = Some(coord);
 
-            let stone = world.registry.id_by_name("Stone").expect("builtin Stone");
+            let stone = world.registry.id_by_label("rock").expect("builtin Stone");
             // Roof in this column, below the stored chunk: raise before store.
             const ROOF_Y: i32 = 200;
             world.set_block(

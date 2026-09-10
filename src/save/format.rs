@@ -2,12 +2,12 @@
 //! `World`/`Player`/`Mods` to and from `SaveDoc`, so this whole module is
 //! testable without constructing a world.
 //!
-//! Layout, version 7 (all integers little-endian):
+//! Layout, version 8 (all integers little-endian):
 //!
 //! ```text
-//! header (fixed 126 bytes, peekable without the body):
+//! header (fixed 126 + STAMP_LEN bytes, peekable without the body):
 //!   magic        b"WATT"                                       4
-//!   version      u16 = 7                                       2
+//!   version      u16 = 8                                       2
 //!   name         u8 len + 64-byte field (utf8, zero padded)   65
 //!   seed         i64                                           8
 //!   created      u64 unix secs                                 8
@@ -20,9 +20,10 @@
 //!   stride       u32                                           4
 //!   phases       u32                                           4
 //!   relief       f32                                           4
+//!   law stamp    STAMP_LEN bytes (v8+; Law::stamp)            80
 //! player         pos f64 x3, yaw f32, pitch f32,
 //!                flags u8 (bit 0 = fly, bit 1 = noclip)       33
-//!                stash (v7+): u16 len + utf8 "Name=count,..."  variable
+//!                stash (v7+): u16 len + utf8 "spec=count,..."  variable
 //! spec table     u16 count, then per spec: u16 len + utf8
 //! edits          edit_count records of i32 x, i32 y, i32 z, u16 spec index
 //! mods           u8 count, then per mod: u8 name-len + utf8,
@@ -42,7 +43,7 @@ use crate::ident::codec;
 use super::slot::{SaveError, SaveMeta};
 
 pub const MAGIC: &[u8; 4] = b"WATT";
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 
 const NAME_FIELD: usize = 64;
 /// Offset of the name length byte, for in-place renames via [`set_name`].
@@ -53,14 +54,17 @@ const HEADER_LEN_V4: usize = NAME_OFF + 1 + NAME_FIELD + 8 + 8 + 8 + 8 + 4;
 const HEADER_LEN_V5: usize = HEADER_LEN_V4 + 2;
 /// kind u8 + tile/stride/phases u32 + relief f32.
 const WORLDGEN_STAMP_LEN: usize = 1 + 4 + 4 + 4 + 4;
-pub const HEADER_LEN: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN;
+/// v6 and v7 share this header; v8 appends the law stamp.
+pub const HEADER_LEN_V7: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN;
+pub const HEADER_LEN: usize = HEADER_LEN_V7 + material::STAMP_LEN;
 
 /// Header length for a supported on-disk version, or `BadVersion`.
 fn header_len(version: u16) -> Result<usize, SaveError> {
     match version {
         4 => Ok(HEADER_LEN_V4),
         5 => Ok(HEADER_LEN_V5),
-        6 | 7 => Ok(HEADER_LEN),
+        6 | 7 => Ok(HEADER_LEN_V7),
+        8 => Ok(HEADER_LEN),
         v => Err(SaveError::BadVersion(v)),
     }
 }
@@ -88,6 +92,8 @@ pub struct SaveDoc {
     /// Generator kind and diffusion knobs captured from the live world.
     /// `kind` is 0 = classic, 1 = diffusion (unknown values load as classic).
     pub worldgen: WorldgenStamp,
+    /// Canonical law bytes (`Law::stamp`). Empty on pre-v8 documents.
+    pub law_stamp: Vec<u8>,
     pub player: PlayerState,
     /// Deduplicated block-spec table; edits reference it by index.
     pub specs: Vec<String>,
@@ -104,9 +110,8 @@ pub struct PlayerState {
     pub pitch: f32,
     pub flying: bool,
     pub noclip: bool,
-    /// Held elements as `(name, count)` in first-seen order.
-    /// `None` means the field was absent (pre-v7); the bridge then migrates
-    /// from the Inventory mod-state line.
+    /// Held configurations as `(spec, count)` in first-seen order.
+    /// `None` means the field was absent (pre-v7).
     pub stash: Option<Vec<(String, u32)>>,
 }
 
@@ -220,6 +225,14 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     out.extend_from_slice(&doc.worldgen.stride.to_le_bytes());
     out.extend_from_slice(&doc.worldgen.phases.to_le_bytes());
     out.extend_from_slice(&doc.worldgen.relief.to_le_bytes());
+    debug_assert_eq!(out.len(), HEADER_LEN_V7);
+    let fallback = material::Law::v0().stamp();
+    let stamp = if doc.law_stamp.len() == material::STAMP_LEN {
+        doc.law_stamp.as_slice()
+    } else {
+        fallback.as_slice()
+    };
+    out.extend_from_slice(stamp);
     debug_assert_eq!(out.len(), HEADER_LEN);
 
     let mut pw = codec::Writer::new();
@@ -397,6 +410,11 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     } else {
         WorldgenStamp::default()
     };
+    let law_stamp = if version >= 8 {
+        bytes[HEADER_LEN_V7..HEADER_LEN].to_vec()
+    } else {
+        Vec::new()
+    };
     let mut r = Reader::with_pos(bytes, header_len(version)?);
 
     // Header through spec table must be intact — there's no way to regenerate
@@ -487,7 +505,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
         .is_ok();
     }
 
-    let doc = SaveDoc { meta, worldgen_version, worldgen, player, specs, edits, mods };
+    let doc = SaveDoc { meta, worldgen_version, worldgen, law_stamp, player, specs, edits, mods };
     Ok(if clean {
         Decoded::Intact(doc)
     } else {
@@ -503,6 +521,7 @@ mod tests {
         SaveDoc {
             worldgen_version: 2,
             worldgen: WorldgenStamp::default(),
+            law_stamp: material::Law::v0().stamp(),
             meta: SaveMeta {
                 name: "My World".to_string(),
                 seed: -4242,
@@ -546,6 +565,14 @@ mod tests {
         let mut out = Vec::with_capacity(bytes.len() - 2 - len);
         out.extend_from_slice(&bytes[..start]);
         out.extend_from_slice(&bytes[start + 2 + len..]);
+        out
+    }
+
+    /// Drop the v8 law stamp so a current encode can be spliced into a v7- header.
+    fn strip_law(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() - material::STAMP_LEN);
+        out.extend_from_slice(&bytes[..HEADER_LEN_V7]);
+        out.extend_from_slice(&bytes[HEADER_LEN..]);
         out
     }
 
@@ -647,8 +674,8 @@ mod tests {
         bytes[0] = b'W';
         bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(3))));
-        bytes[4..6].copy_from_slice(&8u16.to_le_bytes());
-        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(8))));
+        bytes[4..6].copy_from_slice(&9u16.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(9))));
     }
 
     #[test]
@@ -692,8 +719,8 @@ mod tests {
             phases: 4,
             relief: 2.0,
         };
-        let v7 = encode(&doc).unwrap();
-        let body = strip_stash(&v7);
+        let v8 = encode(&doc).unwrap();
+        let body = strip_stash(&v8);
         let mut v5 = Vec::with_capacity(body.len() - WORLDGEN_STAMP_LEN);
         v5.extend_from_slice(&body[..HEADER_LEN_V5]);
         v5.extend_from_slice(&body[HEADER_LEN..]);
@@ -723,8 +750,8 @@ mod tests {
     #[test]
     fn version_6_files_still_decode_without_stash() {
         let doc = sample();
-        let v7 = encode(&doc).unwrap();
-        let mut v6 = strip_stash(&v7);
+        let v8 = encode(&doc).unwrap();
+        let mut v6 = strip_law(&strip_stash(&v8));
         v6[4..6].copy_from_slice(&6u16.to_le_bytes());
 
         let got = expect_intact(decode(&v6).unwrap());

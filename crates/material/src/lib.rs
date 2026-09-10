@@ -20,8 +20,10 @@ mod visual;
 
 pub use configuration::{Configuration, ConfigError, DecodeError, Encoding, CONFIG_MAX};
 pub use element::{Element, D};
-pub use kernel::{element_influence, interact, Delta, ReactionResult};
-pub use law::{Boundary, EventKind, EventStrengths, Kernel, Law, LawError, Probes, EVENT_KINDS, KNOTS};
+pub use kernel::{element_influence, interact, interact_many, Delta, ReactionResult};
+pub use law::{
+    Boundary, EventKind, EventStrengths, Kernel, Law, LawError, Probes, EVENT_KINDS, KNOTS, STAMP_LEN,
+};
 pub use observe::{observe, Acoustic, Observation};
 pub use visual::{visual, DescriptorKey, Visual};
 

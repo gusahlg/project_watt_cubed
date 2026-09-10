@@ -1977,7 +1977,7 @@ mod tests {
     #[test]
     fn oceans_fill_with_water() {
         let (reg, g) = terrain_with_registry(5);
-        let water = reg.id_by_name("Water").unwrap();
+        let water = reg.id_by_label("water").unwrap();
         let sea = g.sea_level();
         // Find an ocean column and confirm the cell just under sea level is water.
         let mut found = false;
@@ -2012,7 +2012,7 @@ mod tests {
         // the water table is a field, so inland lake blobs hold standing water
         // above sea level — a cell at the lake surface (y = height > sea) is water.
         let (reg, g) = terrain_with_registry(5);
-        let water = reg.id_by_name("Water").unwrap();
+        let water = reg.id_by_label("water").unwrap();
         let sea = g.sea_level();
         let mut found = false;
         'scan: for x in -700..700 {
@@ -2058,7 +2058,7 @@ mod tests {
         // overhang shelves put solid rock strictly above a column's heightfield
         // surface — relief the pure heightfield could never express.
         let (reg, g) = terrain_with_registry(5);
-        let stone = reg.id_by_name("Stone").unwrap();
+        let stone = reg.id_by_label("rock").unwrap();
         let mut found = false;
         'scan: for x in -300..300 {
             for z in -300..300 {
@@ -2105,7 +2105,7 @@ mod tests {
     #[test]
     fn deep_chunks_are_uniform_stone() {
         let (reg, g) = terrain_with_registry(11);
-        let stone = reg.id_by_name("Stone").unwrap();
+        let stone = reg.id_by_label("rock").unwrap();
         // Scan +z for a deep chunk the cave bound clears.
         let cy = -20;
         let y0 = cy * 16;
@@ -2161,29 +2161,29 @@ mod tests {
 
     impl Legacy {
         fn resolve(reg: &BlockRegistry) -> Legacy {
-            let id = |n: &str| reg.id_by_name(n).unwrap();
+            let id = |n: &str| reg.id_by_label(n).unwrap_or_else(|| panic!("no label {n}"));
             let seam = |d: i32, r: u32, n: &str| (d, u32::MAX / r, id(n));
             Legacy {
-                grass: id("Soil+Organic"),
-                dirt: id("Soil+Clay"),
-                stone: id("Stone"),
-                sand: id("Sand"),
-                snow: id("Snow"),
-                ice: id("Ice"),
-                water: id("Water"),
-                aerium_vein: id("Stone+Aerium"),
-                quartz_vein: id("Stone+Quartz"),
+                grass: id("organic+soil"),
+                dirt: id("clay+soil"),
+                stone: id("rock"),
+                sand: id("sand"),
+                snow: id("snow"),
+                ice: id("ice"),
+                water: id("water"),
+                aerium_vein: id("lamp#5+rock"),
+                quartz_vein: id("glass#4+rock"),
                 seams: [
-                    seam(3, 90, "Stone+Coal"),
-                    seam(8, 110, "Stone+Iron"),
-                    seam(8, 130, "Stone+Copper"),
-                    seam(20, 240, "Stone+Sulfur"),
-                    seam(20, 200, "Stone+Quartz"),
-                    seam(20, 220, "Stone+Lead"),
-                    seam(32, 300, "Stone+Gold"),
-                    seam(32, 380, "Stone+Lumin"),
-                    seam(48, 460, "Stone+Titan"),
-                    seam(48, 240, "Obsidian"),
+                    seam(3, 90, "lamp#1+rock"),
+                    seam(8, 110, "clay#1+rock"),
+                    seam(8, 130, "glass#1+rock"),
+                    seam(20, 240, "lamp#2+rock"),
+                    seam(20, 200, "glass#2+rock"),
+                    seam(20, 220, "clay#2+rock"),
+                    seam(32, 300, "lamp#3+rock"),
+                    seam(32, 380, "lamp#4+rock"),
+                    seam(48, 460, "glass#3+rock"),
+                    seam(48, 240, "clay#3+rock"),
                 ],
             }
         }
@@ -2272,7 +2272,7 @@ mod tests {
     fn placement_rewiring_is_geometry_identical() {
         let (reg, g) = terrain_with_registry(3);
         let legacy = Legacy::resolve(&reg);
-        let stone = reg.id_by_name("Stone").unwrap();
+        let stone = reg.id_by_label("rock").unwrap();
 
         let chunks: Vec<(i32, i32, i32)> = [
             // Spawn area: surface band with crust, ores, water, carve.
@@ -2360,7 +2360,7 @@ mod tests {
     #[test]
     fn beach_edge_dither_holds_its_band_and_rates() {
         let (reg, g) = terrain_with_registry(3);
-        let beach = reg.id_by_name("Soil+Sand").unwrap();
+        let beach = reg.id_by_label("sand+soil").unwrap();
         let mut rim = [[0u64; 2]; 3]; // [rim-1, rim-2, rim-3+ grassy][total, beach]
         for wx in -512..512 {
             for wz in -512..512 {
@@ -2392,7 +2392,7 @@ mod tests {
     #[test]
     fn cave_wall_lumin_hugs_carved_floors_and_ceilings() {
         let (reg, g) = terrain_with_registry(9);
-        let lumin = reg.id_by_name("Stone+Lumin").unwrap();
+        let lumin = reg.id_by_label("lamp+rock").unwrap();
         let (mut found, mut scanned) = (0u64, 0u64);
         'scan: for cz in 0..96 {
             for cy in [-6i32, -7, -8] {
@@ -2462,14 +2462,14 @@ mod tests {
         let g = terrain(42);
         // surface, deep, cave, island band, beach, snow crust, two far coords.
         let pins: [(&str, i32, i32, i32, u32); 8] = [
-            ("surface", 0, 1, 0, 0xb25ac3be),
+            ("surface", 0, 1, 0, 0x90a776f8),
             ("deep", 0, -20, 0, 0x24ae7d4e),
-            ("cave", 0, -3, 0, 0x148fc284),
-            ("island", -1, 9, -4, 0x2c77460e),
-            ("beach", 4, 0, -7, 0x1d670c00),
-            ("crust", 55, 1, -80, 0xe09b8252),
-            ("far_a", 6_250_000, 0, 0, 0x4b4d2cf9),
-            ("far_b", -6_250_000, -2, 3, 0xefed0476),
+            ("cave", 0, -3, 0, 0xe4154f42),
+            ("island", -1, 9, -4, 0xa668fbfd),
+            ("beach", 4, 0, -7, 0xb44b5d88),
+            ("crust", 55, 1, -80, 0xedaf50b0),
+            ("far_a", 6_250_000, 0, 0, 0x854475c6),
+            ("far_b", -6_250_000, -2, 3, 0x5cd1829f),
         ];
         for (name, cx, cy, cz, want) in pins {
             assert_eq!(

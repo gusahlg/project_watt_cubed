@@ -722,6 +722,7 @@ mod tests {
             vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
             vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
             vec![0, 0, 0, 0].into(),
+            vec![0, 1, 2, 3].into(),
         )
     }
 
@@ -753,7 +754,7 @@ mod tests {
         let mut registry = BlockRegistry::with_builtins();
         let generator = Terrain::new(&mut registry, 20.0, 42);
         let tables = registry.hot_tables();
-        let lumin = registry.id_by_name("Lumin").expect("builtin Lumin");
+        let lumin = registry.id_by_label("lamp").expect("builtin Lumin");
 
         let pin = |chunk: &Chunk, shell: &FaceShell, ceiling: &CeilingWindow, world_y0: i32| {
             let mut grid = LightGrid::dark();
@@ -803,8 +804,8 @@ mod tests {
 
         let pins: [(&str, u32, u32); 4] = [
             ("surface", surface_hash, 0xa8c2bd42),
-            ("cave", cave_hash, 0x521a1a53),
-            ("emissive", emissive_hash, 0xe87c04cc),
+            ("cave", cave_hash, 0xbcc31dc5),
+            ("emissive", emissive_hash, 0x63b9ebf0),
             ("air", air_hash, 0x19839265),
         ];
         for (name, got, want) in pins {
@@ -1020,7 +1021,7 @@ mod tests {
         let before = world.capture_ceiling(lower_coord);
         assert!(before.open_above(8, 8, ROOF_Y), "fixture starts open to sky");
 
-        let stone = world.registry().id_by_name("Stone").expect("builtin Stone");
+        let stone = world.registry().id_by_label("rock").expect("builtin Stone");
         for z in 0..CS {
             for x in 0..CS {
                 world.set_block(x, ROOF_Y, z, stone);

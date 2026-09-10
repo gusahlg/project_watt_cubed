@@ -1,0 +1,246 @@
+//! Worldgen starting regions: a labelled centre element and a small family of
+//! variants, computed from the law rather than authored constants.
+
+use std::sync::OnceLock;
+
+use material::{interact, observe, Configuration, Element, EventKind, Law, Observation};
+
+/// One worldgen family: a centre that observes as the labelled kind, plus six
+/// one-axis jitters (failing jitters collapse to the centre).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    /// Debug/semantic name. Never a simulation input.
+    pub label: &'static str,
+    /// The family's centre element.
+    pub centre: Element,
+    /// Jitter amplitude along one axis, in lattice units.
+    pub spread: u8,
+    members: [Element; 7],
+}
+
+const SPREAD: u8 = 8;
+const SEARCH_CAP: u32 = 100_000;
+
+const LABELS: [&str; 10] = [
+    "rock", "soil", "sand", "clay", "organic", "water", "ice", "snow", "glass", "lamp",
+];
+
+impl Region {
+    /// Centre plus the six variants, as configurations.
+    pub fn family(&self, _law: &Law) -> [Configuration; 7] {
+        self.members.map(Configuration::single)
+    }
+
+    /// Family member `0` is the centre; `1..=6` are the variants (a collapsed
+    /// variant equals the centre).
+    pub fn member(&self, i: usize) -> Element {
+        self.members[i]
+    }
+}
+
+/// The builtin worldgen regions under `law`. Panic if a label finds nothing
+/// within [`SEARCH_CAP`] candidates — that law cannot host this generator.
+pub fn builtin(law: &Law) -> Vec<Region> {
+    if *law == Law::v0() {
+        static V0: OnceLock<Vec<Region>> = OnceLock::new();
+        return V0.get_or_init(|| find_all(&Law::v0())).clone();
+    }
+    find_all(law)
+}
+
+/// True when no pair of family members of `regions` changes under `NewContact`.
+pub fn families_at_rest(law: &Law, regions: &[Region]) -> bool {
+    let members: Vec<Configuration> = regions.iter().flat_map(|r| r.family(law)).collect();
+    pair_rest(law, &members)
+}
+
+fn find_all(law: &Law) -> Vec<Region> {
+    let fp = law.fingerprint();
+    let mut found: Vec<Region> = Vec::with_capacity(LABELS.len());
+    let mut centres: Vec<Element> = Vec::new();
+    for (label_i, &label) in LABELS.iter().enumerate() {
+        let mut chosen: Option<Region> = None;
+        for n in 0..SEARCH_CAP {
+            let c = candidate(fp, label_i as u32, n);
+            if !fits(law, label, c) {
+                continue;
+            }
+            if !stable_with(law, c, &centres) {
+                continue;
+            }
+            let mut members = [c; 7];
+            // One-axis ±1 (within `spread`) so variants stay in the NewContact
+            // quantum of the centre; a variant that fails observation or rest
+            // with the centre / previous centres collapses to the centre.
+            let jitters = jitters(c, 1);
+            for (k, v) in jitters.iter().copied().enumerate() {
+                let ok = fits(law, label, v)
+                    && stable_with(law, v, &centres)
+                    && stable_with(law, v, &[c]);
+                members[k + 1] = if ok { v } else { c };
+            }
+            chosen = Some(Region {
+                label,
+                centre: c,
+                spread: SPREAD,
+                members,
+            });
+            break;
+        }
+        let Some(region) = chosen else {
+            panic!("law cannot host region {label}: no candidate in {SEARCH_CAP}");
+        };
+        centres.push(region.centre);
+        found.push(region);
+    }
+    collapse_unstable(law, &mut found);
+    found
+}
+
+/// Drop any variant that is not at rest with the whole family, so a world built
+/// from all members stays still under NewContact.
+fn collapse_unstable(law: &Law, regions: &mut [Region]) {
+    loop {
+        let members: Vec<Element> = regions.iter().flat_map(|r| r.members).collect();
+        let mut changed = false;
+        for r in regions.iter_mut() {
+            for i in 1..7 {
+                if r.members[i] == r.centre {
+                    continue;
+                }
+                if !stable_with(law, r.members[i], &members) {
+                    r.members[i] = r.centre;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn fits(law: &Law, label: &str, e: Element) -> bool {
+    matches_label(label, &observe(law, &Configuration::single(e)))
+}
+
+fn matches_label(label: &str, o: &Observation) -> bool {
+    let opaque = o.solid && o.transparency == 0;
+    match label {
+        "rock" => o.solid && opaque && o.hardness >= 160,
+        "soil" => o.solid && opaque && (90..=150).contains(&o.hardness),
+        "sand" => o.solid && opaque && (60..=120).contains(&o.hardness) && o.friction < 100,
+        "clay" => o.solid && opaque && (100..=160).contains(&o.hardness) && o.friction >= 140,
+        "organic" => o.solid && opaque && (40..=110).contains(&o.hardness),
+        "water" => o.liquid && o.transparency >= 120,
+        "ice" => o.solid && (60..=160).contains(&o.transparency) && o.hardness >= 120,
+        "snow" => o.solid && opaque && o.hardness < 60,
+        "glass" => o.solid && o.transparency >= 160,
+        "lamp" => o.solid && o.emission >= 8,
+        _ => false,
+    }
+}
+
+fn stable_with(law: &Law, e: Element, others: &[Element]) -> bool {
+    let c = Configuration::single(e);
+    if interact(law, &c, &c, EventKind::NewContact).changed {
+        return false;
+    }
+    for &o in others {
+        let d = Configuration::single(o);
+        if interact(law, &c, &d, EventKind::NewContact).changed
+            || interact(law, &d, &c, EventKind::NewContact).changed
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn pair_rest(law: &Law, members: &[Configuration]) -> bool {
+    for (i, a) in members.iter().enumerate() {
+        for b in members.iter().skip(i) {
+            if interact(law, a, b, EventKind::NewContact).changed
+                || interact(law, b, a, EventKind::NewContact).changed
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Six one-axis jitters: axes 0..=2 × {+spread, −spread}, clamped to the lattice.
+fn jitters(centre: Element, spread: u8) -> [Element; 6] {
+    let mut out = [centre; 6];
+    let mut i = 0;
+    for axis in 0..3 {
+        for &sign in &[1i16, -1] {
+            let mut e = centre;
+            let v = centre.0[axis] as i16 + sign * spread as i16;
+            e.0[axis] = v.clamp(0, 255) as u8;
+            out[i] = e;
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `inoise`-style mixer over (law fingerprint, label index, candidate n).
+fn hash32(fp: u64, label: u32, n: u32) -> u32 {
+    let mut h = (fp as u32) ^ (fp >> 32) as u32;
+    h ^= label.wrapping_mul(0x9E37_79B1);
+    h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xE654_6B64);
+    h ^= n.wrapping_mul(0x85EB_CA77);
+    h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xE654_6B64);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xC2B2_AE35);
+    h ^= h >> 16;
+    h
+}
+
+fn candidate(fp: u64, label: u32, n: u32) -> Element {
+    let h = hash32(fp, label, n);
+    Element::new([h as u8, (h >> 8) as u8, (h >> 16) as u8, (h >> 24) as u8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_regions_observe_as_required_and_sit_at_rest() {
+        let law = Law::v0();
+        let regions = builtin(&law);
+        assert_eq!(regions.len(), LABELS.len());
+        for (i, r) in regions.iter().enumerate() {
+            assert_eq!(r.label, LABELS[i]);
+            assert_eq!(r.spread, SPREAD);
+            assert_eq!(r.centre, r.members[0]);
+            assert!(
+                matches_label(r.label, &observe(&law, &Configuration::single(r.centre))),
+                "{} centre does not observe as required: {:?}",
+                r.label,
+                observe(&law, &Configuration::single(r.centre))
+            );
+            for m in r.family(&law) {
+                assert!(
+                    matches_label(r.label, &observe(&law, &m)),
+                    "{} family member {:?} does not observe as required",
+                    r.label,
+                    m.elements()
+                );
+            }
+        }
+        assert!(families_at_rest(&law, &regions), "a family member pair reacted under NewContact");
+    }
+
+    #[test]
+    fn two_scans_agree() {
+        let a = builtin(&Law::v0());
+        let b = builtin(&Law::v0());
+        assert_eq!(a, b);
+    }
+}

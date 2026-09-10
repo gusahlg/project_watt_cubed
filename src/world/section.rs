@@ -462,15 +462,16 @@ mod tests {
         water: BlockId,
     }
     fn blocks() -> Blocks {
-        let r = BlockRegistry::with_builtins();
-        let id = |n: &str| r.id_by_name(n).unwrap();
+        let mut r = BlockRegistry::with_builtins();
+        crate::world::placement::builtin().compile(&mut r);
+        let id = |n: &str| r.id_by_label(n).unwrap();
         Blocks {
             air: AIR,
-            grass: id("Organic"),
-            dirt: id("Soil"),
-            stone: id("Stone"),
-            sand: id("Sand"),
-            water: id("Water"),
+            grass: id("organic+soil"),
+            dirt: id("clay+soil"),
+            stone: id("rock"),
+            sand: id("sand"),
+            water: id("water"),
         }
     }
 

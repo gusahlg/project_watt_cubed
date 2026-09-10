@@ -1,91 +1,54 @@
-//! Procedural block textures: one 16x16 RGBA8 layer per block id, blended
-//! from the colours of the elements in the block's composition.
+//! Procedural block textures: one 16×16 RGBA8 layer per *render descriptor*.
 //!
-//! Layer index == block id == engine texture-array layer, which the mesher
-//! carries as a dedicated per-vertex layer index. Each texel's alpha is the
-//! block's derived opacity ([`derive::derive_texel_alpha`]), so a translucent
-//! block (`transparency > 0`, routed to the blend pass) composites see-through
-//! while opaque blocks stay solid. Layer 0 (air) is all white, satisfying the
-//! engine's layer-0-white contract (immediate cubes and flat-colored vertices
-//! sample it).
+//! Layer index == descriptor id == engine texture-array layer, which the mesher
+//! carries as a dedicated per-vertex layer index. Many configurations share one
+//! descriptor, so the 14-bit vertex field never caps the number of materials.
+//! Layer 0 (air's descriptor) is all white, satisfying the engine's
+//! layer-0-white contract (immediate cubes and flat-colored vertices sample it).
 //!
-//! Everything here is a *deterministic function of the composition*, never of
-//! the block id, so multiplayer clients whose palettes grew in different
-//! orders still render identical materials. Textures are computed once per
-//! palette growth (world entry, crafting a new block type) — never per frame.
-use crate::block::composition::Composition;
-use crate::block::derive;
-use crate::block::element::ElementId;
-use crate::block::registry::{BlockId, BlockRegistry};
+//! Everything here is a *deterministic function of the [`Visual`]* — two colours
+//! blended by tiling value noise, grain from roughness, alpha from the visual
+//! (floor 40 for translucent, 255 opaque), glow a lightening of `glow/4`.
+use material::Visual;
+
+use crate::block::registry::BlockRegistry;
 
 /// Edge length of every block texture layer, in texels.
 pub const TEXTURE_SIZE: u32 = 16;
 
-/// Soft transition band around element boundaries, in noise units.
+/// Soft transition band around the two-colour cutoff, in noise units.
 const BLEND: f32 = 0.06;
-/// Maximum per-texel brightness jitter, as a +/- fraction.
-const JITTER: f32 = 0.08;
-/// Neutral gray base for compositions with no elements.
-const NEUTRAL_GRAY: [f32; 3] = [140.0, 140.0, 140.0];
 
 const BYTES_PER_LAYER: usize = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
 
-/// Build the 16x16 RGBA8 texture layer for one block id. Block 0 (air) is pure
-/// white; every other layer is the element blend of that block's composition.
-/// The world's incremental texture cache calls this per newly registered id.
-pub fn build_block_texture(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
-    if id.0 == 0 {
-        vec![255u8; BYTES_PER_LAYER] // air: engine's layer-0-white contract
-    } else {
-        layer_for(registry, id)
-    }
-}
+/// ~16 % — the minimum opacity a translucent layer renders at.
+const MIN_ALPHA: u8 = 40;
 
-/// Build one texture layer per registered block, indexed by block id. Feed
-/// straight to `Engine::set_block_textures`.
-pub fn build_block_textures(registry: &BlockRegistry) -> Vec<Vec<u8>> {
-    (0..registry.block_count())
-        .map(|i| build_block_texture(registry, BlockId(i as u16)))
-        .collect()
-}
+/// Channel index reserved for the brightness jitter hash (octaves use 0/1).
+const JITTER_CHANNEL: u32 = 0xdead_beef;
 
-/// Build one texture layer by blending element colours across the texture.
-fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
-    let alpha = derive::derive_texel_alpha(&registry.block(id).core);
-    let parts = parts(&registry.block(id).composition);
-    let seed = seed_of(&parts);
-    let (colors, cuts): (Vec<[f32; 3]>, Vec<f32>) = if parts.is_empty() {
-        // Any degenerate empty composition beyond air gets a neutral gray base
-        // with speckle only.
-        (vec![NEUTRAL_GRAY], vec![1.0])
-    } else {
-        let colors = parts
-            .iter()
-            .map(|&(e, _)| {
-                let c = registry.elements().get(e).color;
-                [c.r as f32, c.g as f32, c.b as f32]
-            })
-            .collect();
-        let mut acc = 0.0;
-        let mut cuts: Vec<f32> = parts
-            .iter()
-            .map(|&(_, w)| {
-                acc += w;
-                acc
-            })
-            .collect();
-        *cuts.last_mut().expect("parts is non-empty") = 1.0;
-        (colors, cuts)
-    };
+/// Build the 16×16 RGBA8 layer for one visual. Deterministic in `vis`.
+pub fn build_layer(vis: &Visual) -> Vec<u8> {
+    let seed = seed_of(vis);
+    let colors = [
+        vis.rgb.map(|c| c as f32),
+        vis.rgb2.map(|c| c as f32),
+    ];
+    let cuts = [0.5_f32, 1.0];
+    let cell = noise_cell(vis.frequency);
+    let jitter_amp = vis.roughness as f32 / 255.0 * 0.16;
+    let lift = vis.glow / 4;
+    let alpha = texel_alpha(vis.alpha);
 
     let mut out = Vec::with_capacity(BYTES_PER_LAYER);
     for y in 0..TEXTURE_SIZE {
         for x in 0..TEXTURE_SIZE {
-            let n = tile_noise(seed, x as f32 + 0.5, y as f32 + 0.5);
-            let rgb = pick_color(&colors, &cuts, n);
-            let jitter = 1.0 + (hash01(seed, JITTER_CHANNEL, x, y) * 2.0 - 1.0) * JITTER;
-            for c in rgb {
-                out.push((c * jitter).clamp(0.0, 255.0).round() as u8);
+            let n = tile_noise(seed, cell, x as f32 + 0.5, y as f32 + 0.5);
+            let mut rgb = pick_color(&colors, &cuts, n);
+            let jitter = 1.0 + (hash01(seed, JITTER_CHANNEL, x, y) * 2.0 - 1.0) * jitter_amp;
+            for c in rgb.iter_mut() {
+                *c = (*c * jitter).clamp(0.0, 255.0);
+                out.push(((*c).round() as u8).saturating_add(lift));
             }
             out.push(alpha);
         }
@@ -93,30 +56,44 @@ fn layer_for(registry: &BlockRegistry, id: BlockId) -> Vec<u8> {
     out
 }
 
-/// The composition as `(element, fraction)` pairs: fractions summing to 1,
-/// sorted by element id so the seed and cutoff order are deterministic.
-fn parts(composition: &Composition) -> Vec<(ElementId, f32)> {
-    let weights = composition.weights();
-    let total = weights.total() as f32;
-    weights
-        .parts()
-        .iter()
-        .map(|&(e, w)| (e, if total > 0.0 { w as f32 / total } else { w as f32 }))
-        .collect()
-}
-
-/// FNV / FNV1a over the sorted `(element id, whole percentage)` pairs. Composition
-/// -> seed, so identical materials look identical everywhere.
-fn seed_of(parts: &[(ElementId, f32)]) -> u32 {
-    let mut bytes = Vec::with_capacity(parts.len() * 5);
-    for &(e, frac) in parts {
-        bytes.extend_from_slice(&e.0.to_le_bytes());
-        bytes.push((frac * 100.0).round() as u8);
+/// Build the texture layer for one render descriptor. Layer 0 is all white.
+pub fn build_descriptor_texture(registry: &BlockRegistry, layer: u16) -> Vec<u8> {
+    if layer == 0 {
+        vec![255u8; BYTES_PER_LAYER]
+    } else {
+        build_layer(&registry.descriptor(layer))
     }
-    crate::hash::fnv1a_32(&bytes)
 }
 
-/// Pick a colour for a noise value, blending between elements near boundaries.
+fn texel_alpha(alpha: u8) -> u8 {
+    if alpha == 255 {
+        255
+    } else {
+        alpha.max(MIN_ALPHA)
+    }
+}
+
+/// Frequency 0 → cell 16 (one cell across the tile); 255 → cell 2.
+fn noise_cell(frequency: u8) -> f32 {
+    16.0 - frequency as f32 * 14.0 / 255.0
+}
+
+fn seed_of(vis: &Visual) -> u32 {
+    crate::hash::fnv1a_32(&[
+        vis.rgb[0],
+        vis.rgb[1],
+        vis.rgb[2],
+        vis.rgb2[0],
+        vis.rgb2[1],
+        vis.rgb2[2],
+        vis.frequency,
+        vis.roughness,
+        vis.alpha,
+        vis.glow,
+    ])
+}
+
+/// Pick a colour for a noise value, blending between the two colours near the cut.
 fn pick_color(colors: &[[f32; 3]], cuts: &[f32], n: f32) -> [f32; 3] {
     let i = cuts
         .iter()
@@ -141,23 +118,14 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     ]
 }
 
-// tiling value noise
-
-/// Octave 0: a 4x4 random lattice across the tile (one cell = 4 texels).
-const OCTAVE0_PERIOD: u32 = 4;
-/// Octave 1: an 8x8 lattice at half amplitude (one cell = 2 texels).
-const OCTAVE1_PERIOD: u32 = 8;
-/// Channel index reserved for the brightness jitter hash (octaves use 0/1).
-const JITTER_CHANNEL: u32 = 0xdead_beef;
-
 /// Tiling noise that repeats seamlessly across texture boundaries.
-fn tile_noise(seed: u32, x: f32, y: f32) -> f32 {
-    (octave_noise(seed, 0, OCTAVE0_PERIOD, x, y) + 0.5 * octave_noise(seed, 1, OCTAVE1_PERIOD, x, y))
-        / 1.5
+fn tile_noise(seed: u32, cell: f32, x: f32, y: f32) -> f32 {
+    (octave_noise(seed, 0, cell, x, y) + 0.5 * octave_noise(seed, 1, cell * 0.5, x, y)) / 1.5
 }
 
-/// Generate one octave of seamless noise via interpolated lattice.
-fn octave_noise(seed: u32, octave: u32, period: u32, x: f32, y: f32) -> f32 {
+fn octave_noise(seed: u32, octave: u32, cell: f32, x: f32, y: f32) -> f32 {
+    let cell = cell.max(1.0);
+    let period = (TEXTURE_SIZE as f32 / cell).round().max(1.0) as u32;
     let cell = TEXTURE_SIZE as f32 / period as f32;
     let (fx, fy) = (x / cell, y / cell);
     let (x0, y0) = (fx.floor(), fy.floor());
@@ -180,7 +148,6 @@ fn smoothstep(t: f32) -> f32 {
     crate::math::smooth(t)
 }
 
-/// Hash four values to a uniform float [0, 1) using xorshift-multiply.
 fn hash01(seed: u32, a: u32, b: u32, c: u32) -> f32 {
     let h = mix(
         seed ^ mix(
@@ -202,155 +169,117 @@ fn mix(mut h: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::element::El;
+    use crate::block::registry::BlockRegistry;
+    use material::{visual, Configuration, Element, Law};
+
+    fn vis(e: [u8; 4]) -> Visual {
+        visual(&Law::v0(), &Configuration::single(Element::new(e)))
+    }
 
     #[test]
     fn build_is_deterministic() {
-        let mut reg = BlockRegistry::with_builtins();
-        reg.natural(&[El::Iron.id(), El::Sulfur.id()]).unwrap();
-        let a = build_block_textures(&reg);
-        let b = build_block_textures(&reg);
-        assert_eq!(a, b, "two builds over the same palette are identical");
+        let v = vis([40, 80, 120, 160]);
+        assert_eq!(build_layer(&v), build_layer(&v));
     }
 
     #[test]
-    fn one_layer_per_block_of_the_right_size() {
-        let reg = BlockRegistry::with_builtins();
-        let layers = build_block_textures(&reg);
-        assert_eq!(layers.len(), reg.block_count());
-        assert!(layers.iter().all(|l| l.len() == BYTES_PER_LAYER));
+    fn layer_is_the_right_size() {
+        let v = vis([10, 20, 30, 40]);
+        assert_eq!(build_layer(&v).len(), BYTES_PER_LAYER);
     }
 
     #[test]
-    fn air_layer_is_all_white() {
+    fn air_descriptor_layer_is_all_white() {
         let reg = BlockRegistry::with_builtins();
-        let layers = build_block_textures(&reg);
+        let layer = build_descriptor_texture(&reg, 0);
         assert!(
-            layers[0].iter().all(|&b| b == 255),
+            layer.iter().all(|&b| b == 255),
             "layer 0 must satisfy the engine's layer-0-white contract"
         );
     }
 
     #[test]
-    fn translucent_block_layer_carries_sub_opaque_alpha() {
-        // Glass (transparency 90) routes to the blend pass; its texels must carry
-        // its derived opacity so the pipeline has real alpha to composite, while an
-        // opaque block stays fully opaque.
-        let mut reg = BlockRegistry::with_builtins();
-        let glass = reg.natural(&[El::Glass.id()]).unwrap();
-        let stone = reg.natural(&[El::Stone.id()]).unwrap();
-        let layers = build_block_textures(&reg);
-        let alpha = |id: BlockId| layers[id.0 as usize][3];
-        assert!(alpha(glass) < 255, "glass layer must be translucent, got {}", alpha(glass));
-        assert_eq!(alpha(stone), 255, "opaque block stays fully opaque");
+    fn translucent_visual_carries_sub_opaque_alpha() {
+        let mut glass = vis([200, 10, 180, 40]);
+        glass.alpha = 80;
+        let mut stone = vis([120, 130, 140, 150]);
+        stone.alpha = 255;
+        assert!(build_layer(&glass)[3] < 255);
+        assert_eq!(build_layer(&stone)[3], 255);
+        let mut clear = glass;
+        clear.alpha = 0;
+        assert_eq!(build_layer(&clear)[3], MIN_ALPHA);
     }
 
     #[test]
-    fn two_element_natural_block_shows_both_element_colors() {
-        // Stone (112,118,128 slate) + Organic (24,186,156 teal): slate texels
-        // are near-grey (R≈G≈B), teal texels have G far above R.
-        let mut reg = BlockRegistry::with_builtins();
-        let id = reg.natural(&[El::Stone.id(), El::Organic.id()]).unwrap();
-        let layers = build_block_textures(&reg);
-        let layer = &layers[id.0 as usize];
-
-        let mut stoneish = 0;
-        let mut organicish = 0;
+    fn two_colours_both_appear() {
+        let v = Visual {
+            rgb: [200, 40, 40],
+            rgb2: [40, 200, 40],
+            frequency: 180,
+            roughness: 40,
+            alpha: 255,
+            glow: 0,
+        };
+        let layer = build_layer(&v);
+        let mut redish = 0;
+        let mut greenish = 0;
         for texel in layer.chunks_exact(4) {
-            let (r, g, b) = (texel[0] as i32, texel[1] as i32, texel[2] as i32);
-            if (r - g).abs() <= 25 && (g - b).abs() <= 25 && r >= 70 {
-                stoneish += 1;
+            if texel[0] > texel[1] + 40 {
+                redish += 1;
             }
-            if g - r >= 60 && g >= 120 {
-                organicish += 1;
+            if texel[1] > texel[0] + 40 {
+                greenish += 1;
             }
         }
-        assert!(stoneish >= 5, "expected slate-dominant texels, got {stoneish}");
-        assert!(organicish >= 5, "expected teal-dominant texels, got {organicish}");
+        assert!(redish >= 5, "expected red-dominant texels, got {redish}");
+        assert!(greenish >= 5, "expected green-dominant texels, got {greenish}");
     }
 
     #[test]
     fn noise_lattice_wraps_at_the_tile_period() {
-        // Seamless REPEAT tiling: the noise at x=0 must use the same lattice
-        // points x=16 would (and likewise for y), for every octave at once.
-        for seed in [0u32, 0xabcd_ef01, seed_of(&[(El::Clay.id(), 1.0)])] {
-            for i in 0..=32 {
-                let t = i as f32 * 0.5;
-                assert_eq!(
-                    tile_noise(seed, 0.0, t),
-                    tile_noise(seed, 16.0, t),
-                    "x seam, seed {seed:#x}, t {t}"
-                );
-                assert_eq!(
-                    tile_noise(seed, t, 0.0),
-                    tile_noise(seed, t, 16.0),
-                    "y seam, seed {seed:#x}, t {t}"
-                );
+        for seed in [0u32, 0xabcd_ef01, 42] {
+            for cell in [16.0, 8.0, 4.0, 2.0] {
+                for i in 0..=32 {
+                    let t = i as f32 * 0.5;
+                    assert_eq!(
+                        tile_noise(seed, cell, 0.0, t),
+                        tile_noise(seed, cell, 16.0, t),
+                        "x seam, seed {seed:#x}, cell {cell}, t {t}"
+                    );
+                    assert_eq!(
+                        tile_noise(seed, cell, t, 0.0),
+                        tile_noise(seed, cell, t, 16.0),
+                        "y seam, seed {seed:#x}, cell {cell}, t {t}"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn pick_color_is_continuous_across_a_cutoff() {
-        // Three distinct colours, one cutoff per colour (matches `layer_for`'s
-        // convention of forcing the last cutoff to 1.0). Check that a texel
-        // exactly on a cutoff sits at the midpoint, and that colors don't jump
-        // stepping across a cutoff.
-        let colors = [[0.0, 0.0, 0.0], [100.0, 100.0, 100.0], [200.0, 200.0, 200.0]];
-        let cuts = [0.5, 0.9, 1.0];
-        let eps = 1e-4;
-
-        // (a) exactly on the first cutoff: midpoint of colors[0] and colors[1].
+        let colors = [[0.0, 0.0, 0.0], [100.0, 100.0, 100.0]];
+        let cuts = [0.5, 1.0];
         let at_cutoff = pick_color(&colors, &cuts, cuts[0]);
         for (c, want) in at_cutoff.iter().zip([50.0, 50.0, 50.0]) {
-            assert!((c - want).abs() < eps, "expected midpoint at cutoff, got {at_cutoff:?}");
-        }
-
-        // (b) no jump: sampling a few epsilons either side of each cutoff
-        // must differ by a tiny amount per channel, not a colour swap.
-        for &cut in &cuts {
-            let mut prev = pick_color(&colors, &cuts, cut - 4.0 * 1e-4);
-            for k in 1..=4 {
-                let d = 4.0 - k as f32;
-                let n = cut - d * 1e-4;
-                let cur = pick_color(&colors, &cuts, n);
-                for i in 0..3 {
-                    assert!(
-                        (cur[i] - prev[i]).abs() < 1.0,
-                        "discontinuity near cutoff {cut} at n={n}: {prev:?} -> {cur:?}"
-                    );
-                }
-                prev = cur;
-            }
-            let mut prev = pick_color(&colors, &cuts, cut + 1e-4);
-            for k in 2..=4 {
-                let n = cut + k as f32 * 1e-4;
-                let cur = pick_color(&colors, &cuts, n);
-                for i in 0..3 {
-                    assert!(
-                        (cur[i] - prev[i]).abs() < 1.0,
-                        "discontinuity near cutoff {cut} at n={n}: {prev:?} -> {cur:?}"
-                    );
-                }
-                prev = cur;
-            }
+            assert!((c - want).abs() < 1e-4, "expected midpoint at cutoff, got {at_cutoff:?}");
         }
     }
 
     #[test]
-    fn seed_depends_on_composition_not_registration_order() {
-        // The same material registered in two registries (different ids if
-        // other blocks landed first) must produce byte-identical layers.
-        let mut reg_a = BlockRegistry::with_builtins();
-        let id_a = reg_a.natural(&[El::Copper.id(), El::Glass.id()]).unwrap();
-
-        let mut reg_b = BlockRegistry::with_builtins();
-        reg_b.natural(&[El::Sulfur.id(), El::Glass.id()]).unwrap(); // shift subsequent ids
-        let id_b = reg_b.natural(&[El::Glass.id(), El::Copper.id()]).unwrap(); // order-independent
-
-        assert_ne!(id_a, id_b, "test relies on differing ids");
-        let layers_a = build_block_textures(&reg_a);
-        let layers_b = build_block_textures(&reg_b);
-        assert_eq!(layers_a[id_a.0 as usize], layers_b[id_b.0 as usize]);
+    fn same_visual_same_bytes_regardless_of_descriptor_id() {
+        let mut a = BlockRegistry::with_builtins();
+        let mut b = BlockRegistry::with_builtins();
+        let c = Configuration::single(Element::new([90, 100, 110, 120]));
+        let ia = a.intern(&c).unwrap();
+        b.intern(&Configuration::single(Element::new([1, 2, 3, 4]))).unwrap();
+        let ib = b.intern(&c).unwrap();
+        let la = a.render_layer(ia);
+        let lb = b.render_layer(ib);
+        assert_eq!(
+            build_descriptor_texture(&a, la),
+            build_descriptor_texture(&b, lb)
+        );
     }
 }

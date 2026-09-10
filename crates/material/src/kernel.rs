@@ -145,3 +145,48 @@ pub fn interact(law: &Law, origin: &Configuration, target: &Configuration, event
     let target = Configuration::new(out).expect("target length unchanged");
     ReactionResult { target, origin: None, changed, magnitude }
 }
+
+/// Simultaneous aggregate of several origins against one target. Order of `origins` does not
+/// matter: each target element takes the mean of the per-origin steps, then the same `max_step`
+/// bound as [`interact`]. Void origins and an empty list change nothing.
+pub fn interact_many(
+    law: &Law,
+    origins: &[(&Configuration, EventKind)],
+    target: &Configuration,
+) -> ReactionResult {
+    let max_step = law.kernel.max_step as i32;
+    let live: Vec<_> = origins.iter().copied().filter(|(o, _)| !o.is_void()).collect();
+    let mut out = Vec::with_capacity(target.len());
+    let mut magnitude = 0u32;
+    let mut changed = false;
+    for b in target.elements() {
+        let mut nb = *b;
+        if !live.is_empty() {
+            let mut acc = [0i32; D];
+            let mut n = 0i32;
+            for (origin, event) in &live {
+                if let Some(raw) = raw_influence(law, origin, *b) {
+                    let strength = law.events.0[*event as usize] as i32;
+                    for i in 0..D {
+                        acc[i] = acc[i].wrapping_add(raw[i] * strength / 256);
+                    }
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                for i in 0..D {
+                    let step = (acc[i] / n).clamp(-max_step, max_step);
+                    let v = apply_axis(law, b.0[i], step);
+                    magnitude += (v as i32 - b.0[i] as i32).unsigned_abs();
+                    if v != b.0[i] {
+                        changed = true;
+                    }
+                    nb.0[i] = v;
+                }
+            }
+        }
+        out.push(nb);
+    }
+    let target = Configuration::new(out).expect("target length unchanged");
+    ReactionResult { target, origin: None, changed, magnitude }
+}

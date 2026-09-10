@@ -397,7 +397,13 @@ fn welcome_from(
             spawn,
             worldgen,
             diffusion,
-        }) => Ok((player_id, seed, spawn, worldgen, diffusion)),
+            law,
+        }) => {
+            if law != crate::net::protocol::law_stamp() {
+                return Err("server law does not match this client".to_string());
+            }
+            Ok((player_id, seed, spawn, worldgen, diffusion))
+        }
         Some(ServerMessage::Reject { reason }) => Err(reason.to_string()),
         _ => Err("unexpected reply from server".to_string()),
     }

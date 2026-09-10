@@ -1668,7 +1668,7 @@ mod tests {
         let center = ChunkCoord::new(0, 0, 0);
         world.center = Some(center);
 
-        let stone = world.registry.id_by_name("Stone").unwrap();
+        let stone = world.registry.id_by_label("rock").unwrap();
         // Halo so every seeded coord has 6 face neighbours; interior is in-box.
         for x in -19..=19 {
             for z in -19..=19 {

@@ -396,7 +396,7 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
             // Vertex layer only — table lookups stay on the true id. Wraps
             // once the palette outgrows the device's texture-layer cap
             // (identity below it; the growth path logs the crossing once).
-            sample.id.0 % tables.layer_cap,
+            tables.render_layer(sample.id),
             Ao::new(sample.ao[i]),
             Light::new(sample.sky[i], sample.block[i]),
             tables.fluid_surface(sample.id),
@@ -478,10 +478,10 @@ mod tests {
         // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            ((0, 1, 0), 0x04d760f8, 0x04d760f8, 0xa9111135),
+            ((0, 1, 0), 0xad7d2918, 0xad7d2918, 0x8ea03195),
             ((3, 1, -2), 0x667d9aa3, 0x667d9aa3, 0x12b4ebb3),
-            ((-5, 0, 4), 0x66cce89d, 0x66cce89d, 0x5c389261),
-            ((2, 1, 2), 0x0eea295e, 0x0eea295e, 0xbc0fe2ab),
+            ((-5, 0, 4), 0xe9281008, 0xe9281008, 0xe9281008),
+            ((2, 1, 2), 0xd4f5436e, 0xd4f5436e, 0x98d2d991),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
@@ -556,6 +556,7 @@ mod tests {
             vec![Pass::Opaque, Pass::Opaque, Pass::Opaque].into(),
             vec![0, 0, 0].into(),
             vec![0, 0, 0].into(),
+            vec![0, 1, 2].into(),
         )
     }
 
@@ -797,23 +798,23 @@ mod tests {
     }
 
     #[test]
-    fn blocks_past_the_old_u8_cap_mesh_with_their_own_layer() {
-        // A block id above 255 must reach the vertex intact — the whole point
-        // of the 14-bit layer field. Real registry, grown past the old cap.
+    fn blocks_past_the_old_u8_cap_mesh_with_their_render_layer() {
+        // A block id above 255 must mesh; the vertex carries the render
+        // descriptor, not the material id.
         let mut reg = crate::block::registry::BlockRegistry::with_builtins();
-        let els = 0..reg.elements().len() as u16;
         let mut high = AIR;
-        'grow: for i in els.clone() {
-            for j in els.clone().filter(|&j| j > i) {
-                for p in 1..=99u8 {
-                    use crate::block::element::ElementId;
-                    high = reg
-                        .mixture(&[(ElementId(i), p), (ElementId(j), 100 - p)])
-                        .expect("mixture registers below the cap");
-                    if reg.block_count() > 300 {
-                        break 'grow;
-                    }
-                }
+        for i in 0..400u16 {
+            let id = reg
+                .intern(&material::Configuration::single(material::Element::new([
+                    (i % 256) as u8,
+                    (i / 3) as u8,
+                    (i / 7) as u8,
+                    (i / 11) as u8,
+                ])))
+                .expect("id space holds 400 configurations");
+            if id.0 > 255 && reg.is_solid(id) && !reg.is_liquid(id) {
+                high = id;
+                break;
             }
         }
         assert!(high.0 > 255, "registry grew past the old u8 cap");
@@ -826,7 +827,8 @@ mod tests {
         let pass = real.layer[high.0 as usize];
         let layers: Vec<u16> = out[pass].vertices().iter().map(|v| v.layer()).collect();
         assert!(!layers.is_empty(), "the lone block meshed");
-        assert!(layers.iter().all(|&l| l == high.0), "vertex carries the full 14-bit id");
+        let want = real.render_layer(high);
+        assert!(layers.iter().all(|&l| l == want), "vertex carries the descriptor layer");
     }
 
     #[test]
@@ -847,6 +849,7 @@ mod tests {
             vec![Pass::Opaque; 301].into(),
             vec![0; 301].into(),
             vec![0; 301].into(),
+            (0..301u16).collect::<Vec<_>>().into(),
         );
         t.layer_cap = 256; // a min-spec-ish ceiling
         let mut out = new_chunk_mesh_data();
@@ -1069,6 +1072,7 @@ mod tests {
             vec![Pass::Opaque, Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             vec![0, 0, 0, 0].into(),
             vec![0, 0, 0, 0].into(),
+            vec![0, 1, 2, 3].into(),
         );
         let mut chunk = empty_chunk();
         chunk.set_local(5, 5, 5, GLASS);

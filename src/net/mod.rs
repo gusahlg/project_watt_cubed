@@ -139,7 +139,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 9;
+pub(crate) const PROTOCOL_VERSION: u32 = 10;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -159,16 +159,11 @@ pub(crate) const MAX_SPEC: usize = 256;
 pub(crate) const MAX_VOICE_PAYLOAD: usize = 400;
 
 /// A stable 64-bit digest of everything that determines what a seed GENERATES:
-/// the worldgen version, the element table, and the full compiled placement
-/// palette (canonical portable spec per block). Seed-only multiplayer never
-/// ships voxels, so two builds whose generation differs in ANY of these would
-/// silently build different worlds from one seed — the handshake compares
-/// fingerprints and rejects the join instead. Protocol changes are versioned
-/// separately by [`PROTOCOL_VERSION`].
-///
-/// Uses FNV hash (not the std hasher) so the value is identical across
-/// platforms, architectures, and Rust releases. The placement compile is
-/// seed-invariant, so one fingerprint speaks for every world a build can generate.
+/// the worldgen version, the law fingerprint, and every builtin region centre.
+/// Seed-only multiplayer never ships voxels, so two builds whose generation
+/// differs in ANY of these would silently build different worlds from one seed
+/// — the handshake compares fingerprints and rejects the join instead. Protocol
+/// changes are versioned separately by [`PROTOCOL_VERSION`].
 pub(crate) fn content_fingerprint() -> u64 {
     content_fingerprint_kind(crate::world::generation::WorldgenKind::Classic)
 }
@@ -181,13 +176,11 @@ pub(crate) fn content_fingerprint_kind_cfg(
     kind: crate::world::generation::WorldgenKind,
     cfg: crate::world::diffusion::DiffusionCfg,
 ) -> u64 {
-    let mut registry = crate::block::BlockRegistry::with_builtins();
-    let _ = crate::world::placement::builtin().compile(&mut registry);
+    let registry = crate::block::BlockRegistry::with_builtins();
     fingerprint_kind_cfg(&registry, kind, cfg)
 }
 
-/// The fingerprint of an already-compiled registry — the server hashes the
-/// one it built for spawn heights instead of compiling twice.
+/// The fingerprint of a registry's law and the builtin region centres.
 pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -199,43 +192,9 @@ pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
         }
     };
     eat(&crate::world::placement::WORLDGEN_VERSION.to_le_bytes());
-    let elements = registry.elements();
-    eat(&(elements.len() as u32).to_le_bytes());
-    for i in 0..elements.len() {
-        let element = elements.get(crate::block::ElementId(i as u16));
-        eat(element.name.as_bytes());
-        eat(&[0]); // name terminator so "ab"+"c" != "a"+"bc"
-        eat(&crate::block::element::Core::from(element.core).0);
-        eat(&[element.color.r, element.color.g, element.color.b, element.color.a]);
-        eat(&(element.specials.len() as u32).to_le_bytes());
-        for special in &element.specials {
-            eat(&[special.kind() as u8, special.strength()]);
-        }
-    }
-    eat(&(registry.block_count() as u32).to_le_bytes());
-    for i in 0..registry.block_count() {
-        let block = registry.block(crate::block::BlockId(i as u16));
-        eat(crate::save::block_spec(registry, crate::block::BlockId(i as u16)).as_bytes());
-        eat(&[0]);
-        eat(&crate::block::element::Core::from(block.core).0);
-        eat(&(block.specials.len() as u32).to_le_bytes());
-        for &(kind, strength) in &block.specials {
-            eat(&[kind as u8, strength]);
-        }
-        eat(&(block.reactions.len() as u32).to_le_bytes());
-        for reaction in &block.reactions {
-            eat(reaction.name.as_bytes());
-            eat(&[0, reaction.strength]);
-            match reaction.effect {
-                crate::block::reaction::ReactionEffect::CoreBonus(core) => {
-                    eat(&[0]);
-                    eat(&crate::block::element::Core::from(core).0);
-                }
-                crate::block::reaction::ReactionEffect::Emergent(kind, strength) => {
-                    eat(&[1, kind as u8, strength]);
-                }
-            }
-        }
+    eat(&registry.law().fingerprint().to_le_bytes());
+    for region in crate::block::regions::builtin(registry.law()) {
+        eat(&region.centre.0);
     }
     hash
 }
