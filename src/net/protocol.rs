@@ -22,6 +22,16 @@ use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
+/// Workbench events only: `Moved` / `NewContact` / `Collision`. Other bytes are not well-formed.
+pub(crate) fn workbench_event(v: u8) -> Option<material::EventKind> {
+    match v {
+        0 => Some(material::EventKind::Moved),
+        1 => Some(material::EventKind::NewContact),
+        2 => Some(material::EventKind::Collision),
+        _ => None,
+    }
+}
+
 pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
     let v = material::Law::v0().stamp();
     let mut a = [0u8; material::STAMP_LEN];
@@ -260,6 +270,7 @@ mod tag {
     pub const PING: u8 = 6;
     pub const TELEPORT: u8 = 7;
     pub const VOICE: u8 = 8;
+    pub const CRAFT: u8 = 9;
 
     pub const WELCOME: u8 = 0;
     pub const REJECT: u8 = 1;
@@ -276,6 +287,7 @@ mod tag {
     pub const POSITION: u8 = 12;
     pub const PEER_EXITED: u8 = 13;
     pub const PEER_VOICE: u8 = 14;
+    pub const CRAFT_RESULT: u8 = 15;
 }
 
 messages! {
@@ -307,6 +319,15 @@ messages! {
         /// stamps speaker id + epoch on relay; the client never mints those.
         /// `payload` is bounded by [`MAX_VOICE_PAYLOAD`](super::MAX_VOICE_PAYLOAD).
         Voice = tag::VOICE { seq: u32, payload: VoicePayload },
+        /// Workbench apply: the server evaluates `interact` and replies with
+        /// [`ServerMessage::CraftResult`]. `event` is [`material::EventKind`] as u8
+        /// (`Moved`/`NewContact`/`Collision`); `repeat` is 1..=16.
+        Craft = tag::CRAFT {
+            origin_spec: Arc<str>,
+            target_spec: Arc<str>,
+            event: u8,
+            repeat: u8,
+        },
     }
 }
 
@@ -357,6 +378,15 @@ messages! {
         /// constant `0` here because the server never reuses ids. `seq` and
         /// `payload` are the sender's own [`ClientMessage::Voice`] values, unchanged.
         PeerVoice = tag::PEER_VOICE { id: u32, epoch: u32, seq: u32, payload: VoicePayload },
+        /// Authoritative workbench result. Echoes the request so the client can
+        /// consume/add without evaluating the law itself.
+        CraftResult = tag::CRAFT_RESULT {
+            origin_spec: Arc<str>,
+            target_spec: Arc<str>,
+            event: u8,
+            repeat: u8,
+            result_spec: Arc<str>,
+        },
     }
 }
 
@@ -443,6 +473,12 @@ mod tests {
             ClientMessage::SetTime { day: 0.5 },
             ClientMessage::Voice { seq: 5, payload: vec![1, 2, 3, 4].try_into().unwrap() },
             ClientMessage::Voice { seq: 0, payload: Vec::new().try_into().unwrap() },
+            ClientMessage::Craft {
+                origin_spec: "c:010203".into(),
+                target_spec: "air".into(),
+                event: 2,
+                repeat: 4,
+            },
         ]
     }
 
@@ -502,6 +538,13 @@ mod tests {
             ServerMessage::Time { day: 0.75, day_secs: 600.0 },
             ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7].try_into().unwrap() },
             ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new().try_into().unwrap() },
+            ServerMessage::CraftResult {
+                origin_spec: "c:010203".into(),
+                target_spec: "air".into(),
+                event: 2,
+                repeat: 4,
+                result_spec: "c:aabb".into(),
+            },
         ]
     }
 
@@ -526,6 +569,107 @@ mod tests {
         let mut r2 = crate::block::BlockRegistry::with_builtins();
         let id2 = r2.parse_spec(&spec).unwrap();
         assert_eq!(r2.configuration(id2), r.configuration(id));
+    }
+
+    #[test]
+    fn spec_round_trips_through_save_and_wire_for_random_configs() {
+        use crate::save::format::{self, PlayerState, SaveDoc, WorldgenStamp};
+        use crate::save::slot::SaveMeta;
+        let mut r = crate::block::BlockRegistry::with_builtins();
+        let mut s = 0xDEAD_BEEFu64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut ids = Vec::new();
+        for _ in 0..40 {
+            let n = 1 + (next() as usize % 4);
+            let elems: Vec<_> = (0..n)
+                .map(|_| {
+                    let x = next();
+                    material::Element::new([
+                        x as u8,
+                        (x >> 8) as u8,
+                        (x >> 16) as u8,
+                        (x >> 24) as u8,
+                    ])
+                })
+                .collect();
+            let c = material::Configuration::new(elems).unwrap();
+            ids.push(r.intern(&c).unwrap());
+        }
+        for id in ids {
+            let spec = r.spec(id);
+            let msg = ClientMessage::Edit {
+                req: 9,
+                x: -4,
+                y: 20,
+                z: 7,
+                expect: 1,
+                spec: spec.clone().into(),
+            };
+            match ClientMessage::decode(&msg.encode()) {
+                Some(ClientMessage::Edit { spec: got, .. }) => assert_eq!(&*got, spec),
+                other => panic!("wire lost spec: {other:?}"),
+            }
+            let doc = SaveDoc {
+                meta: SaveMeta {
+                    name: "t".into(),
+                    seed: 1,
+                    created: 0,
+                    last_played: 0,
+                    playtime_secs: 0,
+                    edit_count: 1,
+                },
+                worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+                worldgen: WorldgenStamp::default(),
+                law_stamp: material::Law::v0().stamp(),
+                player: PlayerState {
+                    pos: [0.0, 0.0, 0.0],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    flying: false,
+                    noclip: false,
+                    stash: Some(vec![(spec.clone(), 1)]),
+                },
+                specs: vec![spec.clone()],
+                edits: vec![format::Edit { x: 1, y: 2, z: 3, spec: 0 }],
+                mods: vec![],
+            };
+            let bytes = format::encode(&doc).unwrap();
+            let back = match format::decode(&bytes).unwrap() {
+                format::Decoded::Intact(d) => d,
+                other => panic!("save lost spec: {other:?}"),
+            };
+            assert_eq!(back.specs, vec![spec.clone()]);
+            assert_eq!(back.player.stash.unwrap()[0].0, spec);
+            let mut r2 = crate::block::BlockRegistry::with_builtins();
+            let id2 = r2.parse_spec(&spec).unwrap();
+            assert_eq!(r2.configuration(id2), r.configuration(id));
+        }
+    }
+
+    #[test]
+    fn a_client_cannot_send_reaction_results() {
+        // Multi-cell Snapshot (the server's reaction broadcast) is not a ClientMessage.
+        let snap = ServerMessage::Snapshot {
+            edits: vec![
+                (1, 2, 3, 4, "c:0101020304".into()),
+                (5, 6, 7, 8, "c:0101020304".into()),
+            ],
+        };
+        assert_eq!(
+            ClientMessage::decode(&snap.encode()),
+            None,
+            "a reaction Snapshot must not decode as a client edit"
+        );
+        assert!(
+            workbench_event(3).is_none(),
+            "ExternallyChanged is not a workbench event"
+        );
+        assert!(workbench_event(2).is_some());
     }
 
     #[test]

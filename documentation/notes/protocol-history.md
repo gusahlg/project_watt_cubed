@@ -4,9 +4,9 @@ Moved verbatim from `src/net/mod.rs` (`PROTOCOL_VERSION`). Client and server
 must match exactly, checked at join.
 
 v2: positions are 3x f64 on the wire (far-coordinate correctness).
-v4: element-first worldgen (worldgen v2) — chunk materials are a pure
-function of (seed, worldgen), so any worldgen change MUST bump this: mixed
-peers would silently desync on terrain contents otherwise.
+v4: worldgen v2 — chunk materials are a pure function of (seed, worldgen),
+so any worldgen change MUST bump this: mixed peers would silently desync
+on terrain contents otherwise.
 v5: worldgen v3 (alien pass — trees gone, per-biome crust, surface glow).
 v6: authoritative edits (request id + expected cell revision + ack),
 content fingerprint in `Hello`, explicit `Teleport`, `Position`
@@ -19,6 +19,7 @@ carry opaque opus frames. New message tags change the wire, so mixed v7/v8
 peers must not join.
 v9: `Welcome` carries worldgen kind + diffusion knobs so a joiner adopts
 the server's generator instead of its local mod state.
-v10: `Welcome` carries the law stamp; the content fingerprint folds
-`WORLDGEN_VERSION`, `Law::fingerprint()` and every builtin region centre.
-Edits use `parse_spec` (`c:<hex>` / `air`). Mixed laws refuse to share a world.
+v10: `Welcome` carries the law stamp. Fingerprint folds `WORLDGEN_VERSION`,
+`Law::fingerprint()`, and builtin region centres. Specs are `c:<hex>` / `air`.
+`ConfigDefinition` then `CellMutation`. `Craft` is a workbench apply the
+server evaluates. Mixed laws refuse to share a world.

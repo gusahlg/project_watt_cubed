@@ -1794,6 +1794,7 @@ name = "project_watt_cubed"
 version = "0.3.2"
 dependencies = [
  "ash",
+ "bytemuck",
  "cpal",
  "glam 0.32.1",
  "infinite-field",

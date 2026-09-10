@@ -2,10 +2,11 @@
 //! exist, as data.
 //!
 //! Terrain picks REGION LABELS, not authored element names. At compile the
-//! builtin regions contribute a centre plus six variants; columns pick a
-//! family member through the existing hash stream. Every configuration the
-//! generator can emit is interned here, in canonical order, before any worker
-//! thread exists.
+//! builtin regions contribute a centre, six variants and three strata;
+//! columns pick a stratum by geology. Ores are `[rock, guest]` with the guest
+//! drawn from a nearby region at shallow depth and a far one when deep.
+//! Every configuration the generator can emit is interned here, in canonical
+//! order, before any worker thread exists.
 use std::ops::RangeInclusive;
 
 use material::{Configuration, Element};
@@ -23,8 +24,13 @@ pub const ENUM_CAP: usize = 1024;
 /// protocol version (mixed peers get an error instead of silent divergence).
 /// v1: the legacy hand-written picker. v2: element-first placement.
 /// v3: the alien pass. v4: emergent material table (regions, not named elements).
-/// v5: Collision-rest families with recorded jitter spread.
+/// v5: Collision-rest families, recorded jitter, geological strata, neighbourhood ores.
 pub const WORLDGEN_VERSION: u16 = 5;
+
+/// Geology cells are `1 << GEOLOGY_SHIFT` blocks on a side. A 16³ chunk sits
+/// inside one cell except on the 64-block seams, so the deep Uniform(stone)
+/// shortcut survives for most columns.
+pub const GEOLOGY_SHIFT: i32 = 6;
 
 /// Scattered stream B rarities are stream A's scaled down by this — pairs stay
 /// genuine finds (P(pair) ~ p²/8 per stone cell), singles move by ~+12%.
@@ -147,8 +153,10 @@ pub struct Resolved {
     pub crust: [BlockId; SurfaceKind::COUNT],
     /// Surface (depth 1) scatter by [`SurfaceKind`].
     pub surface_scatter: Vec<Vec<Slice>>,
-    /// Ground depth ≥ 4, overhang shelves, island interiors.
+    /// Ground depth ≥ 4, overhang shelves, island interiors (region centre).
     pub stone: BlockId,
+    /// Three rock strata the generator picks by geology index 0..=2.
+    pub stone_strata: [BlockId; 3],
     /// Flooded cells.
     pub water: BlockId,
     /// Ground ore slices, stream A — byte-identical walk to the legacy seams.
@@ -174,25 +182,35 @@ pub struct Resolved {
     pub cave_wall: Option<Slice>,
 }
 
+impl Resolved {
+    /// Rock stratum the column at `(wx, wz)` wears. `index` is 0..=2.
+    pub fn stone_at(&self, index: usize) -> BlockId {
+        self.stone_strata[index % 3]
+    }
+}
+
 /// Guest mapping for the ore table. Depth bands and rarities match the
-/// pre-material seams; names are region variants, not elements:
+/// pre-material seams; the guest is chosen at compile from a region near
+/// rock (shallow) or far from rock (deep) in lattice distance. Lamp-like
+/// guests glow; glass-like guests are see-through veins.
 ///
-/// | legacy   | depth   | rarity | guest   |
-/// |----------|---------|--------|---------|
-/// | Coal     | 3..=64  | 90     | lamp#1  |
-/// | Iron     | 8..=64  | 110    | clay#1  |
-/// | Copper   | 8..=64  | 130    | glass#1 |
-/// | Sulfur   | 20..=64 | 240    | lamp#2  |
-/// | Quartz   | 20..=64 | 200    | glass#2 |
-/// | Lead     | 20..=64 | 220    | clay#2  |
-/// | Gold     | 32..=64 | 300    | lamp#3  |
-/// | Lumin    | 32..=64 | 380    | lamp#4  |
-/// | Titan    | 48..=64 | 460    | glass#3 |
-/// | Obsidian | 48..=64 | 240    | clay#3  |
+/// | legacy   | depth   | rarity |
+/// |----------|---------|--------|
+/// | Coal     | 3..=64  | 90     |
+/// | Iron     | 8..=64  | 110    |
+/// | Copper   | 8..=64  | 130    |
+/// | Sulfur   | 20..=64 | 240    |
+/// | Quartz   | 20..=64 | 200    |
+/// | Lead     | 20..=64 | 220    |
+/// | Gold     | 32..=64 | 300    |
+/// | Lumin    | 32..=64 | 380    |
+/// | Titan    | 48..=64 | 460    |
+/// | Obsidian | 48..=64 | 240    |
 ///
-/// Island: Aerium r45 → lamp#5, Quartz r160 → glass#4.
-/// Surface: grassy Lumin r700 → lamp#6 on [organic, soil]; desert Phosphor
-/// r900 → glass#5 on [sand]. Cave-wall: lamp (centre) on rock, r40, depth 32..
+/// Island: two far guests, r45 and r160. Surface: grassy lamp on [organic,
+/// soil] r700; desert glass on [sand] r900. Cave-wall: lamp on rock, r40,
+/// depth 32.. The `"ore"` material on a ground/island seam is a slot the
+/// compiler rewrites to the neighbourhood guest.
 pub fn builtin() -> PlacementTable {
     let ground = |depth: RangeInclusive<i32>, surface: SurfaceMask| Context::Ground { depth, surface };
     let island = |below: RangeInclusive<i32>, surface: IslandSurface| Context::Island { below, surface };
@@ -202,12 +220,12 @@ pub fn builtin() -> PlacementTable {
         kind,
     };
     let banded = |material: &'static str, context: Context| rule(material, context, Kind::Banded);
-    let seam = |guest: &'static str, depth: RangeInclusive<i32>, rarity: u32| {
-        rule(guest, ground(depth, SurfaceMask::ANY), Kind::Scattered { rarity, host: "rock" })
+    let seam = |depth: RangeInclusive<i32>, rarity: u32| {
+        rule("ore", ground(depth, SurfaceMask::ANY), Kind::Scattered { rarity, host: "rock" })
     };
-    let island_seam = |guest: &'static str, rarity: u32| {
+    let island_seam = |rarity: u32| {
         rule(
-            guest,
+            "ore",
             island(4..=i32::MAX, IslandSurface::Any),
             Kind::Scattered { rarity, host: "rock" },
         )
@@ -233,16 +251,16 @@ pub fn builtin() -> PlacementTable {
             // --- Water fills to the table.
             banded("water", Context::Flood),
             // --- Ground ores: depth bands and rarities of the legacy seams table.
-            seam("lamp#1", 3..=64, 90),
-            seam("clay#1", 8..=64, 110),
-            seam("glass#1", 8..=64, 130),
-            seam("lamp#2", 20..=64, 240),
-            seam("glass#2", 20..=64, 200),
-            seam("clay#2", 20..=64, 220),
-            seam("lamp#3", 32..=64, 300),
-            seam("lamp#4", 32..=64, 380),
-            seam("glass#3", 48..=64, 460),
-            seam("clay#3", 48..=64, 240),
+            seam(3..=64, 90),
+            seam(8..=64, 110),
+            seam(8..=64, 130),
+            seam(20..=64, 240),
+            seam(20..=64, 200),
+            seam(20..=64, 220),
+            seam(32..=64, 300),
+            seam(32..=64, 380),
+            seam(48..=64, 460),
+            seam(48..=64, 240),
             // --- Flying islands.
             banded("organic", island(0..=0, IslandSurface::NotIcy)),
             banded("soil", island(0..=0, IslandSurface::NotIcy)),
@@ -250,16 +268,16 @@ pub fn builtin() -> PlacementTable {
             banded("soil", island(1..=3, IslandSurface::Any)),
             banded("clay", island(1..=3, IslandSurface::Any)),
             banded("rock", island(4..=i32::MAX, IslandSurface::Any)),
-            island_seam("lamp#5", 45),
-            island_seam("glass#4", 160),
+            island_seam(45),
+            island_seam(160),
             // --- Surface glow.
             rule(
-                "lamp#6",
+                "lamp",
                 ground(1..=1, SurfaceMask::GRASSY),
                 Kind::Scattered { rarity: 700, host: "soil" },
             ),
             rule(
-                "glass#5",
+                "glass",
                 ground(1..=1, SurfaceMask::DESERT),
                 Kind::Scattered { rarity: 900, host: "sand" },
             ),
@@ -293,6 +311,18 @@ impl PlacementTable {
             intern(&self.ground_banded_specs(2, k), registry)
         });
         let stone = intern(&self.ground_banded_specs(4, SurfaceKind::Grassy), registry);
+        let rock = regions
+            .iter()
+            .find(|r| r.label == "rock")
+            .expect("builtin regions include rock");
+        let stone_strata = [0, 1, 2].map(|i| {
+            intern_elements(
+                registry,
+                &regions,
+                &[rock.stratum(i)],
+                &format!("rock:{}", i),
+            )
+        });
 
         let surface_scatter: Vec<Vec<Slice>> = SurfaceKind::ALL
             .iter()
@@ -315,19 +345,36 @@ impl PlacementTable {
 
         let ground_seams = self.ore_seams();
         let island_seams = self.scattered(|c| matches!(c, Context::Island { .. }));
+        let ground_depths: Vec<i32> = ground_seams
+            .iter()
+            .map(|r| *r.scatter_parts().2.start())
+            .collect();
+        let island_depths: Vec<i32> = island_seams.iter().map(|_| 48).collect();
+        let mut used: Vec<Element> = Vec::new();
+        let ground_guests = pick_guests(&regions, rock.centre, &ground_depths, &mut used);
+        let island_guests = pick_guests(&regions, rock.centre, &island_depths, &mut used);
 
-        let slices = |seams: &[&PlacementRule], scale: u32, registry: &mut BlockRegistry| -> Vec<Slice> {
+        let slices = |seams: &[&PlacementRule],
+                      guests: &[(String, Element)],
+                      scale: u32,
+                      registry: &mut BlockRegistry|
+         -> Vec<Slice> {
             let mut min_depth = i32::MIN;
             seams
                 .iter()
-                .map(|r| {
-                    let (host, guest, range) = r.scatter_parts();
+                .enumerate()
+                .map(|(i, r)| {
+                    let (host, range) = {
+                        let (h, _, range) = r.scatter_parts();
+                        (h, range)
+                    };
                     assert!(
                         *range.start() >= min_depth,
                         "scattered rules must be authored shallow-to-deep: the cumulative \
                          slice walk breaks at the first ineligible depth"
                     );
                     min_depth = *range.start();
+                    let guest = guests[i].0.as_str();
                     Slice {
                         min_depth: *range.start(),
                         width: u32::MAX / (r.rarity() * scale),
@@ -336,13 +383,24 @@ impl PlacementTable {
                 })
                 .collect()
         };
-        let pair_matrix = |seams: &[&PlacementRule], registry: &mut BlockRegistry| -> Vec<Vec<BlockId>> {
+        let pair_matrix = |seams: &[&PlacementRule],
+                           guests: &[(String, Element)],
+                           registry: &mut BlockRegistry|
+         -> Vec<Vec<BlockId>> {
             (0..seams.len())
                 .map(|i| {
-                    let (host, ei, ri) = seams[i].scatter_parts();
+                    let (host, ri) = {
+                        let (h, _, ri) = seams[i].scatter_parts();
+                        (h, ri)
+                    };
+                    let ei = guests[i].0.as_str();
                     (0..i)
                         .map(|j| {
-                            let (_, ej, rj) = seams[j].scatter_parts();
+                            let (_, rj) = {
+                                let (_, _, rj) = seams[j].scatter_parts();
+                                ((), rj)
+                            };
+                            let ej = guests[j].0.as_str();
                             if ranges_overlap(&ri, &rj) {
                                 intern(&[host, ei, ej], registry)
                             } else {
@@ -377,16 +435,17 @@ impl PlacementTable {
             crust,
             surface_scatter,
             stone,
+            stone_strata,
             water: intern(&self.banded_specs(|c| matches!(c, Context::Flood)), registry),
-            seams: slices(&ground_seams, 1, registry),
-            seams_b: slices(&ground_seams, STREAM_B_SCALE, registry),
-            pairs: pair_matrix(&ground_seams, registry),
+            seams: slices(&ground_seams, &ground_guests, 1, registry),
+            seams_b: slices(&ground_seams, &ground_guests, STREAM_B_SCALE, registry),
+            pairs: pair_matrix(&ground_seams, &ground_guests, registry),
             island_grass: intern(&self.island_banded_specs(0, IslandSurface::NotIcy), registry),
             island_ice: intern(&self.island_banded_specs(0, IslandSurface::OnlyIcy), registry),
             island_crust: intern(&self.island_banded_specs(1, IslandSurface::Any), registry),
-            island_seams: slices(&island_seams, 1, registry),
-            island_seams_b: slices(&island_seams, STREAM_B_SCALE, registry),
-            island_pairs: pair_matrix(&island_seams, registry),
+            island_seams: slices(&island_seams, &island_guests, 1, registry),
+            island_seams_b: slices(&island_seams, &island_guests, STREAM_B_SCALE, registry),
+            island_pairs: pair_matrix(&island_seams, &island_guests, registry),
             max_scattered_depth,
             cave_wall,
         };
@@ -506,26 +565,127 @@ fn intern_families(registry: &mut BlockRegistry, regions: &[Region]) {
             };
             registry.set_label(id, &label);
         }
+        for i in 0..3 {
+            let id = registry
+                .intern(&Configuration::single(r.stratum(i)))
+                .expect("block palette cannot hold a region stratum");
+            registry.set_label(id, &format!("{}:{i}", r.label));
+        }
     }
 }
 
 fn intern_union(registry: &mut BlockRegistry, regions: &[Region], specs: &[&str]) -> BlockId {
     assert!(!specs.is_empty(), "placement union is empty");
-    let mut elems: Vec<Element> = specs.iter().map(|s| resolve_element(regions, s)).collect();
-    // Canonical intern order: region table index, then variant index, so rule
-    // authoring order cannot reshuffle ids. Multiplicity is kept.
-    elems.sort_by_key(|e| {
-        regions
-            .iter()
-            .enumerate()
-            .find_map(|(ri, r)| (0..7).find(|&vi| r.member(vi) == *e).map(|vi| (ri, vi)))
-            .unwrap_or((usize::MAX, 0))
-    });
+    let elems: Vec<Element> = specs.iter().map(|s| resolve_element(regions, s)).collect();
+    intern_elements(registry, regions, &elems, &specs_label(specs))
+}
+
+fn intern_elements(
+    registry: &mut BlockRegistry,
+    regions: &[Region],
+    elems: &[Element],
+    label: &str,
+) -> BlockId {
+    assert!(!elems.is_empty(), "placement union is empty");
+    let mut elems = elems.to_vec();
+    // Canonical intern order: region table index, then variant/stratum index, so
+    // rule authoring order cannot reshuffle ids. Multiplicity is kept.
+    elems.sort_by_key(|e| element_rank(regions, *e));
     let cfg = Configuration::new(elems).expect("union fits CONFIG_MAX");
     let id = registry.intern(&cfg).expect("block palette cannot hold a placement union");
-    let label = specs_label(specs);
-    registry.set_label(id, &label);
+    registry.set_label(id, label);
     id
+}
+
+fn element_rank(regions: &[Region], e: Element) -> (usize, usize) {
+    regions
+        .iter()
+        .enumerate()
+        .find_map(|(ri, r)| {
+            (0..7)
+                .find(|&vi| r.member(vi) == e)
+                .map(|vi| (ri, vi))
+                .or_else(|| (0..3).find(|&si| r.stratum(si) == e).map(|si| (ri, 7 + si)))
+        })
+        .unwrap_or((usize::MAX, 0))
+}
+
+/// Guest elements for `depths`, near rock when shallow and far when deep.
+/// Already-used elements are skipped so neighbouring bands stay distinct.
+fn pick_guests(
+    regions: &[Region],
+    rock: Element,
+    depths: &[i32],
+    used: &mut Vec<Element>,
+) -> Vec<(String, Element)> {
+    let mut cands: Vec<(String, Element, u32)> = Vec::new();
+    for r in regions {
+        if r.label == "rock" || r.label == "water" {
+            continue;
+        }
+        for i in 0..7 {
+            let e = r.member(i);
+            if e == rock || cands.iter().any(|(_, x, _)| *x == e) {
+                continue;
+            }
+            let spec = if i == 0 {
+                r.label.to_string()
+            } else {
+                format!("{}#{i}", r.label)
+            };
+            cands.push((spec, e, e.distance(rock)));
+        }
+    }
+    assert!(!cands.is_empty(), "no ore-guest candidates in the region table");
+    let d_min = cands.iter().map(|c| c.2).min().unwrap();
+    let d_max = cands.iter().map(|c| c.2).max().unwrap().max(d_min + 1);
+    const LO: i32 = 3;
+    const HI: i32 = 48;
+    let span = (HI - LO) as u32;
+    let mut out = Vec::with_capacity(depths.len());
+    for &depth in depths {
+        let t = (depth - LO).clamp(0, HI - LO) as u32;
+        let want = d_min + (d_max - d_min) * t / span;
+        let unused = cands.iter().enumerate().filter(|(_, (_, e, _))| !used.contains(e));
+        let mut best: Option<(u32, u32, usize)> = None;
+        let pool: Vec<(usize, u32)> = if unused.clone().next().is_some() {
+            unused.map(|(i, (_, _, d))| (i, *d)).collect()
+        } else {
+            cands.iter().enumerate().map(|(i, (_, _, d))| (i, *d)).collect()
+        };
+        for (i, dist) in pool {
+            let key = (dist.abs_diff(want), dist);
+            match best {
+                Some((bd, br, _)) if (key.0, key.1) >= (bd, br) => {}
+                _ => best = Some((key.0, key.1, i)),
+            }
+        }
+        let i = best.expect("ore-guest pool is non-empty").2;
+        let (spec, e, _) = cands[i].clone();
+        used.push(e);
+        out.push((spec, e));
+    }
+    ensure_guest(&mut out, regions, rock, "lamp");
+    ensure_guest(&mut out, regions, rock, "glass");
+    out
+}
+
+fn ensure_guest(out: &mut [(String, Element)], regions: &[Region], rock: Element, label: &str) {
+    if out.iter().any(|(s, _)| s == label || s.starts_with(&format!("{label}#"))) {
+        return;
+    }
+    let Some(r) = regions.iter().find(|r| r.label == label) else { return };
+    if out.is_empty() {
+        return;
+    }
+    let want = r.centre.distance(rock);
+    let slot = out
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, e))| e.distance(rock).abs_diff(want))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    out[slot] = (label.to_string(), r.centre);
 }
 
 fn specs_label(specs: &[&str]) -> String {
@@ -574,6 +734,7 @@ mod tests {
         let again = builtin().compile(&mut reg);
         assert_eq!(reg.block_count(), count, "recompile registers nothing new");
         assert_eq!(first.stone, again.stone);
+        assert_eq!(first.stone_strata, again.stone_strata);
         assert_eq!(first.dress, again.dress);
         assert_eq!(first.pairs, again.pairs);
     }
@@ -639,6 +800,11 @@ mod tests {
         assert_eq!(r.crust[SurfaceKind::Desert as usize], id("clay+sand"));
         assert_eq!(r.crust[SurfaceKind::Snowy as usize], id("ice+soil"));
         assert_eq!(r.stone, id("rock"));
+        assert_eq!(r.stone_strata.len(), 3);
+        for s in r.stone_strata {
+            let els = reg.configuration(s).elements();
+            assert_eq!(els.len(), 1, "a stone stratum is a single rock-family element");
+        }
         assert_eq!(r.water, id("water"));
         assert_eq!(r.island_ice, id("ice"));
         assert_eq!(r.island_grass, r.dress[SurfaceKind::Grassy as usize]);
@@ -646,41 +812,82 @@ mod tests {
         assert_eq!(r.cave_wall.unwrap().id, id("lamp+rock"));
         assert_eq!(
             r.surface_scatter[SurfaceKind::Grassy as usize][0].id,
-            id("lamp#6+organic+soil")
+            id("lamp+organic+soil")
         );
         assert_eq!(
             r.surface_scatter[SurfaceKind::Desert as usize][0].id,
-            id("glass#5+sand")
+            id("glass+sand")
         );
         assert!(r.surface_scatter[SurfaceKind::Shore as usize].is_empty());
     }
 
     #[test]
     fn seams_keep_the_legacy_depth_bands() {
-        let (reg, r) = compiled();
-        let legacy: [(&str, i32, u32); 10] = [
-            ("lamp#1+rock", 3, 90),
-            ("clay#1+rock", 8, 110),
-            ("glass#1+rock", 8, 130),
-            ("lamp#2+rock", 20, 240),
-            ("glass#2+rock", 20, 200),
-            ("clay#2+rock", 20, 220),
-            ("lamp#3+rock", 32, 300),
-            ("lamp#4+rock", 32, 380),
-            ("glass#3+rock", 48, 460),
-            ("clay#3+rock", 48, 240),
+        let (_reg, r) = compiled();
+        let legacy: [(i32, u32); 10] = [
+            (3, 90),
+            (8, 110),
+            (8, 130),
+            (20, 240),
+            (20, 200),
+            (20, 220),
+            (32, 300),
+            (32, 380),
+            (48, 460),
+            (48, 240),
         ];
         assert_eq!(r.seams.len(), legacy.len());
-        for (slice, (name, min_depth, rarity)) in r.seams.iter().zip(legacy) {
-            assert_eq!(slice.min_depth, min_depth, "{name}");
-            assert_eq!(slice.width, u32::MAX / rarity, "{name}");
-            assert_eq!(slice.id, reg.id_by_label(name).unwrap(), "{name}");
+        for (slice, (min_depth, rarity)) in r.seams.iter().zip(legacy) {
+            assert_eq!(slice.min_depth, min_depth);
+            assert_eq!(slice.width, u32::MAX / rarity);
         }
         for (a, b) in r.seams.iter().zip(&r.seams_b) {
             assert_eq!(a.id, b.id);
             assert_eq!(b.width, u32::MAX / ((u32::MAX / a.width) * STREAM_B_SCALE));
         }
         assert_eq!(r.max_scattered_depth, 64);
+    }
+
+    #[test]
+    fn ore_guests_recede_from_rock_with_depth() {
+        let (reg, r) = compiled();
+        let rock = *reg.configuration(r.stone).elements().first().unwrap();
+        let mut last = 0u32;
+        for slice in &r.seams {
+            let els = reg.configuration(slice.id).elements();
+            assert!(els.contains(&rock), "ore {} is not [rock, guest]", slice.min_depth);
+            let guest = els.iter().copied().find(|e| *e != rock).expect("ore has a guest");
+            let d = guest.distance(rock);
+            assert!(
+                d + 32 >= last,
+                "ore depth {} is closer to rock ({d}) than a shallower seam ({last})",
+                slice.min_depth
+            );
+            last = last.max(d);
+        }
+        let mut saw_lamp = false;
+        let mut saw_glass = false;
+        let mut check = |id: BlockId| {
+            for &e in reg.configuration(id).elements() {
+                let o = material::observe(reg.law(), &Configuration::single(e));
+                if o.emission >= 8 {
+                    saw_lamp = true;
+                }
+                if o.transparency >= 160 {
+                    saw_glass = true;
+                }
+            }
+        };
+        for slice in r.seams.iter().chain(r.island_seams.iter()).chain(r.cave_wall.iter()) {
+            check(slice.id);
+        }
+        for row in r.surface_scatter.iter() {
+            for s in row {
+                check(s.id);
+            }
+        }
+        assert!(saw_lamp, "a lamp-like guest must glow (crystal caves)");
+        assert!(saw_glass, "a glass-like guest must be see-through");
     }
 
     #[test]
@@ -705,6 +912,188 @@ mod tests {
         for label in ["rock", "soil", "sand", "clay", "organic", "water", "ice", "snow", "glass", "lamp"] {
             assert!(reg.id_by_label(label).is_some(), "missing {label}");
             assert!(reg.id_by_label(&format!("{label}#1")).is_some(), "missing {label}#1");
+            assert!(reg.id_by_label(&format!("{label}:0")).is_some(), "missing {label}:0");
         }
+    }
+
+    #[test]
+    fn families_and_ores_rest_under_contact_and_collision() {
+        use crate::block::regions::pair_rest;
+        use material::EventKind;
+        let (reg, r) = compiled();
+        let law = *reg.law();
+        let regions = regions::builtin(&law);
+        let mut members: Vec<Configuration> = regions.iter().flat_map(|g| g.matter().map(Configuration::single)).collect();
+        for slice in r
+            .seams
+            .iter()
+            .chain(r.seams_b.iter())
+            .chain(r.island_seams.iter())
+            .chain(r.cave_wall.iter())
+            .chain(r.surface_scatter.iter().flatten())
+        {
+            members.push(reg.configuration(slice.id).clone());
+        }
+        for row in r.pairs.iter().chain(r.island_pairs.iter()) {
+            for &id in row {
+                members.push(reg.configuration(id).clone());
+            }
+        }
+        for s in r.stone_strata {
+            members.push(reg.configuration(s).clone());
+        }
+        assert!(pair_rest(&law, &members, EventKind::NewContact), "a pair reacted under NewContact");
+        assert!(pair_rest(&law, &members, EventKind::Collision), "a pair reacted under Collision");
+    }
+
+    #[test]
+    fn generated_chunk_stays_still_under_external_change() {
+        use crate::sim::reactions::{Budget, CellStore, MaterialEvent, Pos, ReactionScheduler};
+        use crate::world::chunk::{Chunk, CHUNK_SIZE};
+        use crate::world::generation::Terrain;
+        use material::EventKind;
+        use std::collections::HashMap;
+
+        struct Map {
+            cells: HashMap<Pos, BlockId>,
+            reg: BlockRegistry,
+        }
+        impl CellStore for Map {
+            fn block_at(&self, pos: Pos) -> Option<BlockId> {
+                Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
+            }
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            }
+            fn registry(&self) -> &BlockRegistry {
+                &self.reg
+            }
+            fn registry_mut(&mut self) -> &mut BlockRegistry {
+                &mut self.reg
+            }
+        }
+
+        let mut reg = BlockRegistry::with_builtins();
+        let g = Terrain::new(&mut reg, 20.0, 42);
+        let chunk = Chunk::new(0, 1, 0, &g);
+        let mut m = Map {
+            cells: HashMap::new(),
+            reg,
+        };
+        for z in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    m.set_block((x as i32, y as i32, z as i32), chunk.get_local(x, y, z));
+                }
+            }
+        }
+        let before = m.cells.clone();
+        let mut sched = ReactionScheduler::new();
+        for z in 0..CHUNK_SIZE as i32 {
+            for y in 0..CHUNK_SIZE as i32 {
+                for x in 0..CHUNK_SIZE as i32 {
+                    sched.push(MaterialEvent {
+                        at: (x, y, z),
+                        kind: EventKind::ExternallyChanged,
+                    });
+                }
+            }
+        }
+        let law = *m.registry().law();
+        let out = sched.tick(
+            &mut m,
+            &law,
+            Budget {
+                events_per_generation: CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE,
+                generations_per_tick: 20,
+                max_followups: CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE * 6,
+            },
+        );
+        assert!(out.is_empty(), "generated matter mutated under ExternallyChanged: {} edits", out.len());
+        assert_eq!(m.cells, before, "16³ placement fill drifted after 20 generations");
+    }
+
+    #[test]
+    fn generated_32_cube_stays_still_under_external_change() {
+        use crate::sim::reactions::{Budget, CellStore, MaterialEvent, Pos, ReactionScheduler};
+        use crate::world::chunk::{Chunk, CHUNK_SIZE};
+        use crate::world::generation::Terrain;
+        use material::EventKind;
+        use std::collections::HashMap;
+
+        struct Map {
+            cells: HashMap<Pos, BlockId>,
+            reg: BlockRegistry,
+        }
+        impl CellStore for Map {
+            fn block_at(&self, pos: Pos) -> Option<BlockId> {
+                Some(*self.cells.get(&pos).unwrap_or(&crate::block::registry::AIR))
+            }
+            fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+                self.cells.insert(pos, id).unwrap_or(crate::block::registry::AIR)
+            }
+            fn registry(&self) -> &BlockRegistry {
+                &self.reg
+            }
+            fn registry_mut(&mut self) -> &mut BlockRegistry {
+                &mut self.reg
+            }
+        }
+
+        let mut reg = BlockRegistry::with_builtins();
+        let g = Terrain::new(&mut reg, 20.0, 42);
+        let mut m = Map {
+            cells: HashMap::new(),
+            reg,
+        };
+        const BOX: i32 = 32;
+        for cz in 0..2 {
+            for cy in 0..2 {
+                for cx in 0..2 {
+                    let chunk = Chunk::new(cx, cy, cz, &g);
+                    let x0 = cx * CHUNK_SIZE as i32;
+                    let y0 = cy * CHUNK_SIZE as i32;
+                    let z0 = cz * CHUNK_SIZE as i32;
+                    for z in 0..CHUNK_SIZE {
+                        for y in 0..CHUNK_SIZE {
+                            for x in 0..CHUNK_SIZE {
+                                m.set_block(
+                                    (x0 + x as i32, y0 + y as i32, z0 + z as i32),
+                                    chunk.get_local(x, y, z),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let before = m.cells.clone();
+        let mut sched = ReactionScheduler::new();
+        for z in 0..BOX {
+            for y in 0..BOX {
+                for x in 0..BOX {
+                    sched.push(MaterialEvent {
+                        at: (x, y, z),
+                        kind: EventKind::ExternallyChanged,
+                    });
+                }
+            }
+        }
+        let law = *m.registry().law();
+        let out = sched.tick(
+            &mut m,
+            &law,
+            Budget {
+                events_per_generation: (BOX * BOX * BOX) as usize,
+                generations_per_tick: 20,
+                max_followups: (BOX * BOX * BOX * 6) as usize,
+            },
+        );
+        assert!(
+            out.is_empty(),
+            "generated 32³ mutated under ExternallyChanged: {} edits",
+            out.len()
+        );
+        assert_eq!(m.cells, before, "32³ generated box drifted after 20 generations");
     }
 }

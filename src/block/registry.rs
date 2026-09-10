@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
-use material::{observe, visual, Configuration, DescriptorKey, Encoding, Law, Observation, Visual};
+use material::{
+    interact, observe, visual, Configuration, DescriptorKey, Encoding, EventKind, Law, Observation,
+    Visual,
+};
 use voxel_engine::{Color, Pass};
 
 /// Compact per-voxel material id: the index of a configuration in the world's table.
@@ -16,6 +19,21 @@ pub struct BlockId(pub u16);
 
 /// The void configuration: always id 0.
 pub const AIR: BlockId = BlockId(0);
+
+/// Repeat `interact` `repeat` times; origin is unchanged (law v0).
+pub fn interact_repeat(
+    law: &Law,
+    origin: &Configuration,
+    target: &Configuration,
+    event: EventKind,
+    repeat: u8,
+) -> Configuration {
+    let mut t = target.clone();
+    for _ in 0..repeat {
+        t = interact(law, origin, &t, event).target;
+    }
+    t
+}
 
 /// Configurations one world can hold (the id width).
 pub const MAX_BLOCK_TYPES: usize = u16::MAX as usize;
@@ -259,6 +277,41 @@ impl BlockRegistry {
         &self.law
     }
 
+    /// Apply `event` from `origin` onto `target`, `repeat` times, and intern the result.
+    /// Origin is unchanged (law v0). `None` when the id space is exhausted.
+    pub fn apply_interaction(
+        &mut self,
+        origin: &Configuration,
+        target: &Configuration,
+        event: EventKind,
+        repeat: u8,
+    ) -> Option<BlockId> {
+        let law = self.law;
+        let result = interact_repeat(&law, origin, target, event, repeat);
+        self.intern(&result)
+    }
+
+    /// Parse origin/target specs, apply [`apply_interaction`], return the interned result.
+    /// `None` when a spec is malformed or the table is full.
+    pub fn apply_specs(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: EventKind,
+        repeat: u8,
+    ) -> Option<BlockId> {
+        let origin_id = self.parse_spec(origin_spec)?;
+        let target_id = self.parse_spec(target_spec)?;
+        let origin = self.configs[origin_id.0 as usize].clone();
+        let target = self.configs[target_id.0 as usize].clone();
+        self.apply_interaction(&origin, &target, event, repeat)
+    }
+
+    /// Presentation name: attached label, else nearest region `"-like"`, else `"unknown material"`.
+    pub fn display_name(&self, id: BlockId) -> String {
+        crate::block::regions::display_name(self.law(), self.label(id), &self.configs[id.0 as usize])
+    }
+
     /// Intern a configuration: the existing id if it was seen, else a new one with its readings and
     /// render descriptor computed once. `None` when the id space is exhausted.
     pub fn intern(&mut self, c: &Configuration) -> Option<BlockId> {
@@ -316,6 +369,8 @@ impl BlockRegistry {
                 best = (dist, i as u16);
             }
         }
+        // Remember the miss so a later intern of the same visual is O(1).
+        self.descriptor_intern.insert(key, best.1);
         best.1
     }
 
@@ -495,48 +550,38 @@ impl BlockRegistry {
     /// Inverse of [`BlockRegistry::spec`]: interns the configuration. `None` for malformed or legacy
     /// (named) specs and when the table is full.
     pub fn parse_spec(&mut self, spec: &str) -> Option<BlockId> {
-        if spec == "air" {
-            return Some(AIR);
-        }
-        let hex = spec.strip_prefix("c:")?;
-        // Byte-wise: a non-ASCII spec (wire, save or console input) must be a `None`, never a panic
-        // from slicing inside a multi-byte character.
-        if !hex.is_ascii() || hex.len() % 2 != 0 {
-            return None;
-        }
-        let bytes: Option<Vec<u8>> = hex
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
-            .collect();
-        let c = Configuration::decode(&bytes?).ok()?;
-        self.intern(&c)
+        self.intern(&decode_spec(spec)?)
     }
 
     /// Look up a spec already in the table without interning. `None` if the spec is
     /// malformed or the configuration has not been interned yet.
     pub fn lookup_spec(&self, spec: &str) -> Option<BlockId> {
-        if spec == "air" {
-            return Some(AIR);
-        }
-        let hex = spec.strip_prefix("c:")?;
-        if !hex.is_ascii() || hex.len() % 2 != 0 {
-            return None;
-        }
-        let bytes: Option<Vec<u8>> = hex
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
-            .collect();
-        let c = Configuration::decode(&bytes?).ok()?;
-        self.lookup(&c)
+        self.lookup(&decode_spec(spec)?)
     }
+}
+
+/// `air` or `c:<hex of the encoding>`. `None` for legacy names, odd nibbles, non-ASCII, or
+/// a truncated/oversize payload — hostile wire/save input must not panic.
+fn decode_spec(spec: &str) -> Option<Configuration> {
+    if spec == "air" {
+        return Some(Configuration::void());
+    }
+    let hex = spec.strip_prefix("c:")?;
+    if !hex.is_ascii() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
+        .collect();
+    Configuration::decode(&bytes?).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use material::Element;
+    use material::{observe, Element, Visual};
 
     fn cfg(elems: &[[u8; 4]]) -> Configuration {
         Configuration::new(elems.iter().map(|c| Element::new(*c)).collect::<Vec<_>>()).unwrap()
@@ -641,5 +686,217 @@ mod tests {
         assert_eq!(r.id_by_label("rock-like"), Some(id));
         assert_eq!(r.label(id), Some("rock-like"));
         assert!(r.spec(id).starts_with("c:"), "the spec never carries the label");
+    }
+
+    #[test]
+    fn apply_interaction_matches_interact_and_interns_once() {
+        let mut r = BlockRegistry::with_builtins();
+        let law = *r.law();
+        let origin = cfg(&[[40, 80, 120, 160]]);
+        let target = cfg(&[[80, 40, 160, 120]]);
+        let once = interact(&law, &origin, &target, EventKind::Collision).target;
+        assert_eq!(
+            interact_repeat(&law, &origin, &target, EventKind::Collision, 1),
+            once
+        );
+        let twice = interact(&law, &origin, &once, EventKind::Collision).target;
+        assert_eq!(
+            interact_repeat(&law, &origin, &target, EventKind::Collision, 2),
+            twice
+        );
+        let before = r.block_count();
+        let a = r
+            .apply_interaction(&origin, &target, EventKind::Collision, 1)
+            .unwrap();
+        let after_first = r.block_count();
+        let b = r
+            .apply_interaction(&origin, &target, EventKind::Collision, 1)
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(r.configuration(a), &once);
+        assert_eq!(r.block_count(), after_first, "the same result interned once");
+        assert!(after_first == before || after_first == before + 1);
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+        fn config(&mut self) -> Configuration {
+            let n = 1 + (self.next() as usize % 6);
+            cfg(&(0..n)
+                .map(|_| {
+                    let x = self.next();
+                    [
+                        x as u8,
+                        (x >> 8) as u8,
+                        (x >> 16) as u8,
+                        (x >> 24) as u8,
+                    ]
+                })
+                .collect::<Vec<_>>())
+        }
+    }
+
+    #[test]
+    fn intern_is_a_bijection_on_encodings() {
+        let mut r = BlockRegistry::with_builtins();
+        let mut rng = Rng(0xC0FF_EE42);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..400 {
+            let c = rng.config();
+            let enc = c.encode();
+            let id = r.intern(&c).unwrap();
+            assert_eq!(r.encoding(id).as_bytes(), enc.as_bytes());
+            assert_eq!(r.lookup(&c), Some(id));
+            assert_eq!(r.configuration(id), &c);
+            assert_eq!(
+                Configuration::decode(enc.as_bytes()).unwrap(),
+                c,
+                "encode/decode is the intern key"
+            );
+            assert_eq!(r.intern(&c), Some(id), "second intern is identity");
+            seen.insert(enc.as_bytes().to_vec());
+        }
+        assert_eq!(r.block_count(), seen.len() + 1, "air plus each distinct encoding");
+    }
+
+    #[test]
+    fn hot_tables_agree_with_observe() {
+        let mut r = BlockRegistry::with_builtins();
+        let law = *r.law();
+        let mut rng = Rng(11);
+        let mut ids = Vec::new();
+        for _ in 0..80 {
+            ids.push(r.intern(&rng.config()).unwrap());
+        }
+        let hot = r.hot_tables();
+        for id in ids {
+            let obs = observe(&law, r.configuration(id));
+            assert_eq!(r.emission(id), obs.emission);
+            assert_eq!(hot.emission[id.0 as usize], obs.emission);
+            assert_eq!(r.is_liquid(id), obs.liquid);
+            assert_eq!(r.is_opaque(id), obs.solid && obs.transparency == 0);
+            assert_eq!(hot.opaque(id), r.is_opaque(id));
+            assert_eq!(r.hardness(id), obs.hardness);
+            assert_eq!(r.friction(id), obs.friction);
+            assert_eq!(r.transparency(id), obs.transparency);
+            // Liquids mesh (FLAG_SOLID) but observe as non-solid.
+            assert_eq!(r.is_solid(id), obs.solid || obs.liquid);
+            assert_eq!(hot.solid(id), r.is_solid(id));
+        }
+    }
+
+    #[test]
+    fn parse_spec_rejects_hostile_wire_and_save_input() {
+        let mut r = BlockRegistry::with_builtins();
+        let c = cfg(&[[1, 2, 3, 4]]);
+        let id = r.intern(&c).unwrap();
+        let spec = r.spec(id);
+        assert!(spec.starts_with("c:"));
+        let hex = spec.trim_start_matches("c:");
+        assert_eq!(r.parse_spec(&format!("C:{hex}")), None, "uppercase prefix");
+        assert_eq!(r.parse_spec(&format!(" {spec}")), None, "leading space");
+        assert_eq!(r.parse_spec(&format!("{spec} ")), None, "trailing space");
+        assert_eq!(r.parse_spec("c:0"), None, "odd nibble");
+        assert_eq!(r.parse_spec("c:gg"), None);
+        assert_eq!(r.parse_spec("c:\0"), None);
+        assert_eq!(r.parse_spec("c:00ff"), None, "trailing byte on void");
+        assert_eq!(r.parse_spec("c:11"), None, "len 17 > CONFIG_MAX");
+        assert_eq!(r.parse_spec("natural:Stone"), None);
+        assert_eq!(r.parse_spec("air\0"), None);
+        let upper = format!("c:{}", hex.to_ascii_uppercase());
+        assert_eq!(r.parse_spec(&upper), Some(id), "uppercase hex is still a configuration");
+        assert_eq!(r.parse_spec("c:00"), Some(AIR), "void encoding is air");
+    }
+
+    #[test]
+    fn intern_returns_none_at_u16_cap() {
+        let mut r = BlockRegistry::with_builtins();
+        let mut n = 1u32;
+        while r.block_count() < MAX_BLOCK_TYPES {
+            let e = Element::new([
+                n as u8,
+                (n >> 8) as u8,
+                (n >> 16) as u8,
+                (n >> 24) as u8,
+            ]);
+            assert!(r.intern(&Configuration::single(e)).is_some(), "slot {n}");
+            n += 1;
+        }
+        assert!(r.at_capacity());
+        assert_eq!(r.block_count(), MAX_BLOCK_TYPES);
+        let extra = cfg(&[[9, 8, 7, 6], [1, 2, 3, 4]]);
+        assert!(r.intern(&extra).is_none(), "id space is exhausted");
+        assert_eq!(r.parse_spec(&format!("c:{:02x}0908070601020304", 2)), None);
+    }
+
+    #[test]
+    fn nearest_descriptor_fallback_at_layer_cap() {
+        let mut r = BlockRegistry::with_builtins();
+        // Occupy the 14-bit layer space with unique quantized visuals.
+        let mut n = 0usize;
+        for red in 0..16u8 {
+            for green in 0..16u8 {
+                for blue in 0..16u8 {
+                    for alpha in 0..16u8 {
+                        if n >= MAX_DESCRIPTORS {
+                            break;
+                        }
+                        let vis = Visual {
+                            rgb: [red << 4 | red, green << 4 | green, blue << 4 | blue],
+                            rgb2: [0, 0, 0],
+                            frequency: 0,
+                            roughness: 0,
+                            alpha: alpha << 4 | alpha,
+                            glow: 0,
+                        };
+                        let _ = r.descriptor_for(vis);
+                        n += 1;
+                    }
+                    if n >= MAX_DESCRIPTORS {
+                        break;
+                    }
+                }
+                if n >= MAX_DESCRIPTORS {
+                    break;
+                }
+            }
+            if n >= MAX_DESCRIPTORS {
+                break;
+            }
+        }
+        assert_eq!(r.descriptor_count(), MAX_DESCRIPTORS);
+        let before = r.descriptor_count();
+        let id = r.intern(&cfg(&[[7, 9, 11, 13], [200, 10, 30, 40]])).unwrap();
+        assert_eq!(r.descriptor_count(), before, "material identity grows; render identity does not");
+        assert!((r.render_layer(id) as usize) < MAX_DESCRIPTORS);
+        let again = r.intern(&cfg(&[[7, 9, 11, 13], [200, 10, 30, 40]])).unwrap();
+        assert_eq!(again, id);
+        assert_eq!(r.render_layer(again), r.render_layer(id));
+    }
+
+    #[test]
+    #[ignore]
+    fn intern_observe_cost_per_new_configuration() {
+        let mut r = BlockRegistry::with_builtins();
+        let mut rng = Rng(99);
+        let warmup = (0..32).map(|_| rng.config()).collect::<Vec<_>>();
+        for c in &warmup {
+            let _ = r.intern(c);
+        }
+        const N: u32 = 2_000;
+        let configs: Vec<_> = (0..N).map(|_| rng.config()).collect();
+        let t0 = std::time::Instant::now();
+        for c in &configs {
+            let _ = r.intern(c);
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+        println!("intern+observe per new configuration: {us:.2} µs");
+        assert!(us < 500.0, "intern+observe {us:.1} µs is past the sanity ceiling");
     }
 }

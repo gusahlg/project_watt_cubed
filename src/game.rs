@@ -77,6 +77,9 @@ struct FrameInput {
     toggle_crafting: bool,
     nav_up: bool,
     nav_down: bool,
+    nav_left: bool,
+    nav_right: bool,
+    nav_tab: bool,
     nav_confirm: bool,
     open_console: bool,
     open_chat: bool,
@@ -134,6 +137,9 @@ struct PendingModInput {
     toggle_crafting: bool,
     nav_up: bool,
     nav_down: bool,
+    nav_left: bool,
+    nav_right: bool,
+    nav_tab: bool,
     nav_confirm: bool,
 }
 
@@ -152,6 +158,9 @@ impl PendingModInput {
             toggle_crafting: allow_ui && input.toggle_crafting,
             nav_up: allow_ui && input.nav_up,
             nav_down: allow_ui && input.nav_down,
+            nav_left: allow_ui && input.nav_left,
+            nav_right: allow_ui && input.nav_right,
+            nav_tab: allow_ui && input.nav_tab,
             nav_confirm: allow_ui && input.nav_confirm,
         }
     }
@@ -162,6 +171,9 @@ impl PendingModInput {
             || self.toggle_crafting
             || self.nav_up
             || self.nav_down
+            || self.nav_left
+            || self.nav_right
+            || self.nav_tab
             || self.nav_confirm
     }
 
@@ -170,6 +182,9 @@ impl PendingModInput {
         self.toggle_crafting = false;
         self.nav_up = false;
         self.nav_down = false;
+        self.nav_left = false;
+        self.nav_right = false;
+        self.nav_tab = false;
         self.nav_confirm = false;
     }
 }
@@ -789,6 +804,9 @@ impl Game {
                     f.toggle_crafting = gp.event(GameplayEvent::ToggleCrafting);
                     f.nav_up = gp.overlay_nav(MenuEvent::Up);
                     f.nav_down = gp.overlay_nav(MenuEvent::Down);
+                    f.nav_left = gp.overlay_nav(MenuEvent::Left);
+                    f.nav_right = gp.overlay_nav(MenuEvent::Right);
+                    f.nav_tab = gp.overlay_nav(MenuEvent::NextTab);
                     f.nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
                 }
                 f.open_console = gp.event(GameplayEvent::OpenConsole);
@@ -849,7 +867,7 @@ impl Game {
                 .console
                 .handle_input(&input.text_chars, input.text_edit)
             {
-                self.submit_line(line, eng, settings, sound, events);
+                self.submit_line(line, eng, settings, sound, events, mods);
             }
             return Some(Signal::Continue);
         }
@@ -1056,7 +1074,8 @@ impl Game {
         // With no edge, one empty update keeps periodic work at `mod_hz`.
         for index in 0..pending.len().max(1) {
             let edges = pending.get(index).copied().unwrap_or_default();
-            placements = {
+            let networked = self.net.is_some();
+            let (next_placements, crafts) = {
                 let mut ctx = ModContext {
                     player: &mut self.player,
                     world: &mut self.world,
@@ -1068,12 +1087,23 @@ impl Game {
                     toggle_crafting: edges.toggle_crafting,
                     nav_up: edges.nav_up,
                     nav_down: edges.nav_down,
+                    nav_left: edges.nav_left,
+                    nav_right: edges.nav_right,
+                    nav_tab: edges.nav_tab,
                     nav_confirm: edges.nav_confirm,
+                    networked,
                     placements,
+                    crafts: Vec::new(),
                 };
                 mods.update(&mut ctx);
-                ctx.placements
+                (ctx.placements, ctx.crafts)
             };
+            placements = next_placements;
+            if let Some(net) = &mut self.net {
+                for c in crafts {
+                    net.send_craft(c.origin_spec, c.target_spec, c.event, c.repeat);
+                }
+            }
             // Apply after each event frame so repeated placements observe the
             // previous write and cannot spend twice against one empty cell.
             self.apply_placements(&mut placements, events);
@@ -1374,6 +1404,22 @@ impl Game {
                     self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
                 }
                 Incoming::Disconnected => disconnected = true,
+                Incoming::CraftResult {
+                    origin_spec,
+                    target_spec,
+                    event,
+                    repeat,
+                    result_spec,
+                } => {
+                    mods.on_craft_result(
+                        &origin_spec,
+                        &target_spec,
+                        event,
+                        repeat,
+                        &result_spec,
+                        &mut self.world,
+                    );
+                }
                 Incoming::PeerSwing { id } => {
                     // The swing edge → a whoosh at the peer's current position. The
                     // local animator update already happened in `Connection::apply`.
@@ -1402,6 +1448,7 @@ impl Game {
         settings: &mut Settings,
         sound: &mut SoundSystem,
         events: &mut Vec<SoundEvent>,
+        mods: &mut Mods,
     ) {
         // `/voicetest` plays the canned UI cue; emit it as a fact and let the
         // director route it (it runs this frame even though the console owns input).
@@ -1423,6 +1470,19 @@ impl Game {
             return;
         }
         self.console.echo(&line);
+        {
+            let stripped = line.strip_prefix('/').unwrap_or(line.as_str());
+            let mut parts = stripped.split_whitespace();
+            if let Some(cmd) = parts.next() {
+                let args: Vec<&str> = parts.collect();
+                if let Some(out) = mods.command(cmd, &args) {
+                    for line in out {
+                        self.console.push(line);
+                    }
+                    return;
+                }
+            }
+        }
         let before = settings.clone();
         let day_before = self.sky.clock.day();
         let day_len_before = self.sky.day_length;

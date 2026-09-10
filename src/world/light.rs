@@ -810,8 +810,44 @@ mod tests {
 
         let mut registry = BlockRegistry::with_builtins();
         let generator = Terrain::new(&mut registry, 20.0, 42);
+        // The pin is the blocklight field of a cell that actually emits — not
+        // whatever the "lamp" label happens to intern (a rest-stable centre can
+        // still observe as dark). Intern a configuration and assert emission.
+        let lumin = {
+            use crate::block::regions;
+            use material::Configuration;
+            let law = *registry.law();
+            let mut found = None;
+            for r in regions::builtin(&law) {
+                let id = registry.intern(&Configuration::single(r.centre)).unwrap();
+                if registry.emission(id) >= 8 {
+                    found = Some(id);
+                    break;
+                }
+            }
+            if found.is_none() {
+                for n in 0u32..40_000 {
+                    let e = material::Element::new([
+                        n as u8,
+                        (n >> 8) as u8,
+                        (n >> 16) as u8,
+                        (n >> 24) as u8,
+                    ]);
+                    let id = registry.intern(&Configuration::single(e)).unwrap();
+                    if registry.emission(id) >= 8 {
+                        found = Some(id);
+                        break;
+                    }
+                }
+            }
+            found.expect("observe must reach glow_min for some solid element")
+        };
+        assert!(
+            registry.emission(lumin) >= 8,
+            "emissive pin block emission {}",
+            registry.emission(lumin)
+        );
         let tables = registry.hot_tables();
-        let lumin = registry.id_by_label("lamp").expect("builtin Lumin");
 
         let pin = |chunk: &Chunk, shell: &FaceShell, ceiling: &CeilingWindow, world_y0: i32| {
             let mut grid = LightGrid::dark();
@@ -862,7 +898,7 @@ mod tests {
         let pins: [(&str, u32, u32); 4] = [
             ("surface", surface_hash, 0xa8c2bd42),
             ("cave", cave_hash, 0xbcc31dc5),
-            ("emissive", emissive_hash, 0x75888f81),
+            ("emissive", emissive_hash, 0x63b9ebf0),
             ("air", air_hash, 0x19839265),
         ];
         for (name, got, want) in pins {

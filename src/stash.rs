@@ -271,6 +271,25 @@ mod tests {
     }
 
     #[test]
+    fn stash_overflow_with_many_configurations() {
+        let mut world = World::new(1);
+        let mut ids = Vec::new();
+        for i in 0..8u8 {
+            let c = material::Configuration::single(material::Element::new([i, 10, 20, 30]));
+            ids.push(world.registry_mut().intern(&c).unwrap());
+        }
+        let mut stash = ElementStash::new(5);
+        for &id in &ids {
+            let _ = stash.add(id, 1);
+        }
+        assert_eq!(stash.total(), 5);
+        assert_eq!(stash.iter().count(), 5, "capacity is units, first-seen kinds");
+        assert!(!stash.add(ids[7], 1));
+        assert_eq!(stash.total(), 5);
+        assert_eq!(stash.count(ids[7]), 0);
+    }
+
+    #[test]
     fn portable_round_trips_through_specs() {
         let mut world = World::new(1);
         let rock = world.registry().id_by_label("rock").unwrap();

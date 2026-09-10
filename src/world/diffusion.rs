@@ -7,7 +7,7 @@ use std::sync::Arc;
 use infinite_field::{InfiniteField, Score, Spec};
 
 use super::chunk::{CHUNK_SIZE, ChunkData};
-use super::generation::{cell_hash, ColumnHeights, TerrainGenerator};
+use super::generation::{cell_hash, geology_index, geology_uniform_chunk, ColumnHeights, TerrainGenerator};
 use super::placement;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
@@ -214,10 +214,10 @@ impl DiffusionTerrain {
     fn column(&self, wx: i32, wz: i32) -> Col {
         let mut ch = [0.0f32; 4];
         self.field.sample_all(wx, wz, &mut ch);
-        self.col_from_ch(&ch)
+        self.col_from_ch(&ch, wx, wz)
     }
 
-    fn col_from_ch(&self, ch: &[f32]) -> Col {
+    fn col_from_ch(&self, ch: &[f32], wx: i32, wz: i32) -> Col {
         let elev = (ch[0] * 2.0 - 1.0) * 36.0;
         let height = (self.sea as f32 + elev).round() as i32;
         let lake = ch[2] > 0.78 && elev > 2.0 && elev < 18.0;
@@ -227,7 +227,16 @@ impl DiffusionTerrain {
             temp: ch[1],
             humid: ch[2],
             cave: ch[3],
+            stratum: geology_index(self.seed, wx, wz) as u8,
         }
+    }
+
+    fn stone_of(&self, c: &Col) -> BlockId {
+        self.mat.stone_at(c.stratum as usize)
+    }
+
+    fn stone_at(&self, wx: i32, wz: i32) -> BlockId {
+        self.mat.stone_at(geology_index(self.seed, wx, wz))
     }
 
     /// Coarse silhouette for far LOD — hash height, not the overlapping field.
@@ -281,7 +290,7 @@ impl DiffusionTerrain {
                         }
                     }
                 }
-                self.mat.stone
+                self.stone_of(c)
             }
         } else if wy < c.water {
             self.mat.water
@@ -298,6 +307,7 @@ struct Col {
     temp: f32,
     humid: f32,
     cave: f32,
+    stratum: u8,
 }
 
 impl TerrainGenerator for DiffusionTerrain {
@@ -339,6 +349,11 @@ impl TerrainGenerator for DiffusionTerrain {
     }
 
     fn block_at(&self, wx: i32, wy: i32, wz: i32, _height: i32) -> BlockId {
+        let c = self.column(wx, wz);
+        self.cell(&c, wx, wy, wz)
+    }
+
+    fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
         let c = self.column(wx, wz);
         self.cell(&c, wx, wy, wz)
     }
@@ -391,6 +406,7 @@ impl TerrainGenerator for DiffusionTerrain {
             temp: 0.5,
             humid: 0.5,
             cave: 0.0,
+            stratum: 0,
         }; CHUNK_SIZE]; CHUNK_SIZE];
         let mut buf = [0.0f32; CHUNK_SIZE * CHUNK_SIZE * 4];
         self.field
@@ -401,7 +417,7 @@ impl TerrainGenerator for DiffusionTerrain {
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 let i = (lz * CHUNK_SIZE + lx) * 4;
-                let c = self.col_from_ch(&buf[i..i + 4]);
+                let c = self.col_from_ch(&buf[i..i + 4], x0 + lx as i32, z0 + lz as i32);
                 heights[lx + lz * CHUNK_SIZE] = c.height;
                 max_top = max_top.max(c.height.max(c.water));
                 min_h = min_h.min(c.height);
@@ -416,8 +432,8 @@ impl TerrainGenerator for DiffusionTerrain {
                 if y0 >= max_top {
                     return (cyy, ChunkData::Uniform(AIR));
                 }
-                if y1 <= deep_cut {
-                    return (cyy, ChunkData::Uniform(self.mat.stone));
+                if y1 <= deep_cut && geology_uniform_chunk(x0, z0) {
+                    return (cyy, ChunkData::Uniform(self.stone_at(x0, z0)));
                 }
                 let mut cells = Box::new([AIR; super::chunk::CHUNK_VOLUME]);
                 for lz in 0..CHUNK_SIZE {
@@ -707,12 +723,12 @@ mod tests {
         );
         // surface, lake column, cave band, deep, two far coords.
         let pins: [(&str, i32, i32, i32, u32); 6] = [
-            ("surface", 0, 1, 0, 0x9b39f240),
-            ("lake", -22, 1, -24, 0x1b5636d6),
-            ("cave", -24, -3, -24, 0x24dfb131),
-            ("deep", 0, -20, 0, 0x24ae7d4e),
-            ("far_a", 6_250_000, 0, 0, 0x7f5a5a13),
-            ("far_b", -6_250_000, -2, 3, 0x9f993f6c),
+            ("surface", 0, 1, 0, 0x7ce32bf4),
+            ("lake", -22, 1, -24, 0xd8a70dc1),
+            ("cave", -24, -3, -24, 0x0ef35a75),
+            ("deep", 0, -20, 0, 0xce982f9d),
+            ("far_a", 6_250_000, 0, 0, 0x14d12cd7),
+            ("far_b", -6_250_000, -2, 3, 0x8b1f1d89),
         ];
         for (name, cx, cy, cz, want) in pins {
             assert_eq!(

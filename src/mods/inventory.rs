@@ -107,11 +107,11 @@ fn paint_inventory(
     } else {
         let listed = if kind_count > shown { shown - 1 } else { shown };
         for (id, count) in stash.iter().take(listed) {
-            let name = world
-                .registry()
-                .label(id)
-                .unwrap_or("unknown material");
-            rows.push(Row::new(Role::Muted, format!("{count}x {name}")));
+            let name = world.registry().display_name(id);
+            rows.push(
+                Row::new(Role::Muted, format!("{count}x {name}"))
+                    .with_swatch(world.registry().color(id)),
+            );
         }
         if kind_count > listed {
             rows.push(Row::new(Role::Dim, format!("+{} more", kind_count - listed)));
@@ -261,6 +261,48 @@ mod tests {
             text.contains("1x soil"),
             "re-enabled HUD lists the held soil: {text}"
         );
+    }
+
+    #[test]
+    fn unknown_configurations_use_like_or_unknown_material() {
+        let mut world = World::new(1);
+        let law = *world.registry().law();
+        let regions = crate::block::regions::builtin(&law);
+        let rock = &regions[0];
+        let mut near = rock.centre;
+        near.0[3] = near.0[3].saturating_add(rock.spread);
+        if near == rock.centre {
+            near.0[3] = near.0[3].saturating_sub(rock.spread);
+        }
+        let near_id = world
+            .registry_mut()
+            .intern(&material::Configuration::single(near))
+            .unwrap();
+        let far = material::Element::new([0, 255, 0, 255]);
+        let far_id = world
+            .registry_mut()
+            .intern(&material::Configuration::single(far))
+            .unwrap();
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        assert!(player.stash.add(near_id, 1));
+        assert!(player.stash.add(far_id, 1));
+        let inventory = InventoryMod::new(Rc::new(Cell::new(ItemUiState::default())));
+        let mut shown = Vec::new();
+        inventory.hud(&world, &player, (800, 600), &mut shown);
+        let text = hud_text(&shown);
+        assert!(
+            text.contains(&format!("1x {}-like", rock.label)),
+            "near an unlabelled centre reads as -like: {text}"
+        );
+        let far_within = regions
+            .iter()
+            .any(|r| far.distance(r.centre) <= 2 * r.spread as u32);
+        if !far_within {
+            assert!(
+                text.contains("1x unknown material"),
+                "a far unlabelled config stays unknown: {text}"
+            );
+        }
     }
 
     fn hud_text(elements: &[HudElement]) -> String {

@@ -889,7 +889,7 @@ impl World {
             // settled shell in its snapshot, so this is a pure GPU handoff —
             // every chunk, all distances, uploads the same plain way. (The rev
             // check above guarantees the state is NeedsMesh { building: true }.)
-            self.upload_chunk(coord, &data, eng);
+            self.upload_chunk(coord, &data, None, eng);
             // A newly drawn chunk may complete a settled ring.
             self.lod_clip_grow.set();
         }
@@ -1085,29 +1085,53 @@ impl World {
     /// to the fresh `Ready`/`Air` — the one upload+install step shared by the
     /// async drain, the sync edit remesh, and the terminal degraded promotion.
     /// `retire` frees whatever the old state carried, exactly once.
-    fn upload_chunk(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
-        let hash = mesh::content_hash(data);
-        if self.chunks.get(&coord).is_some_and(|l| l.mesh_hash == Some(hash)) {
-            self.keep_resident_mesh(coord, eng);
+    /// `hash` is `Some` only on the sync edit path; async passes `None` and
+    /// clears `mesh_hash` (no `content_hash` on the main thread).
+    fn upload_chunk(
+        &mut self,
+        coord: Coord,
+        data: &mesh::ChunkMeshData,
+        hash: Option<u64>,
+        eng: &mut Engine,
+    ) {
+        self.upload_chunk_inner(coord, Some((data, eng)), hash);
+    }
+
+    fn upload_chunk_inner(
+        &mut self,
+        coord: Coord,
+        gpu: Option<(&mesh::ChunkMeshData, &mut Engine)>,
+        hash: Option<u64>,
+    ) {
+        if let Some(h) = hash
+            && self.chunks.get(&coord).is_some_and(|l| l.mesh_hash == Some(h))
+        {
+            self.keep_resident_mesh(coord, gpu.map(|(_, eng)| eng));
             return;
         }
-        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
-        let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
-        if let Some(loaded) = self.chunks.get_mut(&coord) {
-            let was = loaded.state.is_building();
-            loaded.retire(MeshState::from_upload(handles), eng);
-            loaded.mesh_hash = Some(hash);
-            super::adjust_count(&mut self.building_meshes, was, false);
-            loaded.visible = vis;
-            if !vis && let Some(meshes) = loaded.state.live_meshes() {
-                meshes.set_visible(eng, false);
+        if let Some((data, eng)) = gpu {
+            let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
+            let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
+            if let Some(loaded) = self.chunks.get_mut(&coord) {
+                let was = loaded.state.is_building();
+                loaded.retire(MeshState::from_upload(handles), eng);
+                loaded.mesh_hash = hash;
+                super::adjust_count(&mut self.building_meshes, was, false);
+                loaded.visible = vis;
+                if !vis && let Some(meshes) = loaded.state.live_meshes() {
+                    meshes.set_visible(eng, false);
+                }
             }
+            return;
+        }
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.mesh_hash = hash;
         }
     }
 
     /// An edit remesh whose vertex bytes match the resident GPU mesh: keep the
     /// existing handles and drop the Dirty/NeedsMesh claim, no upload.
-    fn keep_resident_mesh(&mut self, coord: Coord, eng: &mut Engine) {
+    fn keep_resident_mesh(&mut self, coord: Coord, eng: Option<&mut Engine>) {
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             let was = loaded.state.is_building();
@@ -1122,11 +1146,22 @@ impl World {
             loaded.state = next;
             super::adjust_count(&mut self.building_meshes, was, false);
             self.remesh_stats.note_upload(coord);
-            loaded.visible = vis;
-            if !vis && let Some(meshes) = loaded.state.live_meshes() {
-                meshes.set_visible(eng, false);
+            if vis != loaded.visible {
+                loaded.visible = vis;
+                if let Some(meshes) = loaded.state.live_meshes() {
+                    #[cfg(test)]
+                    super::vis_log::record(meshes.handles(), vis);
+                    if let Some(eng) = eng {
+                        meshes.set_visible(eng, vis);
+                    }
+                }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn upload_chunk_without_gpu(&mut self, coord: Coord, hash: Option<u64>) {
+        self.upload_chunk_inner(coord, None, hash);
     }
 
     /// Light result at `epoch`: release-or-transfer the claim, then queue the
@@ -3034,7 +3069,8 @@ impl World {
         );
         // `upload_chunk`'s retire frees the edited-Ready chunk's old mesh
         // (`Dirty.prev`) exactly once and installs the fresh `Ready`/`Air`.
-        self.upload_chunk(coord, &scratch, eng);
+        let hash = mesh::content_hash(&scratch);
+        self.upload_chunk(coord, &scratch, Some(hash), eng);
         self.scratch = scratch;
     }
 
@@ -4309,6 +4345,79 @@ mod tests {
         assert!(
             world.chunks[&coord].light.as_ref() == Some(&light::LightGrid::open_sky()),
             "trivial light must be open_sky"
+        );
+    }
+
+    #[test]
+    fn async_upload_does_not_hash_and_identical_edit_skips_remesh() {
+        mesh::reset_content_hash_calls();
+        let data = mesh::new_chunk_mesh_data();
+        let hash = mesh::content_hash(&data);
+        assert_eq!(mesh::content_hash_calls(), 1);
+
+        let mut world = World::generate();
+        let c = *world.chunks.keys().next().expect("spawn chunks");
+        let h = voxel_engine::MeshHandle::from_raw_parts(91, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        {
+            let loaded = world.chunks.get_mut(&c).unwrap();
+            loaded.state = MeshState::Dirty {
+                prev: Some(meshes),
+            };
+            loaded.mesh_hash = Some(hash);
+            loaded.visible = true;
+        }
+
+        mesh::reset_content_hash_calls();
+        world.upload_chunk_without_gpu(c, Some(hash));
+        assert_eq!(mesh::content_hash_calls(), 0, "upload_chunk never hashes");
+        assert!(
+            matches!(world.chunks[&c].state, MeshState::Ready(_)),
+            "identical edit remesh keeps the resident mesh"
+        );
+        assert_eq!(world.chunks[&c].mesh_hash, Some(hash));
+
+        mesh::reset_content_hash_calls();
+        world.upload_chunk_without_gpu(c, None);
+        assert_eq!(mesh::content_hash_calls(), 0, "async drain passes None, no hash");
+        assert_eq!(world.chunks[&c].mesh_hash, None);
+    }
+
+    #[test]
+    fn skipped_remesh_pushes_visibility_when_the_chunk_was_hidden() {
+        let mut world = World::generate();
+        let c = *world.chunks.keys().next().expect("spawn chunks");
+        let h = voxel_engine::MeshHandle::from_raw_parts(92, 1);
+        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+            (p == voxel_engine::Pass::Opaque).then_some(h)
+        }))
+        .expect("one pass present");
+        {
+            let loaded = world.chunks.get_mut(&c).unwrap();
+            loaded.state = MeshState::Dirty {
+                prev: Some(meshes),
+            };
+            loaded.visible = false;
+        }
+        world.occlusion_active = false;
+        super::super::vis_log::take();
+        world.keep_resident_mesh(c, None);
+        assert_eq!(
+            super::super::vis_log::take(),
+            vec![(h, true)],
+            "a hidden resident mesh must be shown when vis becomes true"
+        );
+        assert!(world.chunks[&c].visible);
+        assert!(matches!(world.chunks[&c].state, MeshState::Ready(_)));
+
+        super::super::vis_log::take();
+        world.keep_resident_mesh(c, None);
+        assert!(
+            super::super::vis_log::take().is_empty(),
+            "unchanged vis must not push set_visible"
         );
     }
 }

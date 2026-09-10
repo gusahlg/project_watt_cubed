@@ -21,6 +21,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::block::appearance::{BlockAppearance, FLAT};
 use crate::block::BlockId;
@@ -29,7 +30,7 @@ use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
 use crate::settings::Settings;
-use crate::ui::HudElement;
+use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
@@ -151,12 +152,28 @@ pub struct ModContext<'a> {
     pub toggle_crafting: bool,
     pub nav_up: bool,
     pub nav_down: bool,
+    pub nav_left: bool,
+    pub nav_right: bool,
+    pub nav_tab: bool,
     pub nav_confirm: bool,
+    /// True when a server owns evaluation; the crafting mod queues [`crafts`]
+    /// instead of applying `interact` locally.
+    pub networked: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
     /// drains these after `mods.update` and applies each only if the cell is air
     /// and doesn't overlap the player — mods that spend resources on a placement
     /// should pre-check the same so their accounting stays exact.
     pub placements: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
+    /// Workbench applies to send; the server evaluates and replies with the result spec.
+    pub crafts: Vec<CraftRequest>,
+}
+
+/// One workbench apply the client asks the server to evaluate.
+pub struct CraftRequest {
+    pub origin_spec: Arc<str>,
+    pub target_spec: Arc<str>,
+    pub event: u8,
+    pub repeat: u8,
 }
 
 impl ModContext<'_> {
@@ -234,6 +251,26 @@ pub trait Mod {
     /// was spent on placing a block of `id`.
     fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
         let _ = (id, world);
+    }
+
+    /// Authoritative workbench result. The client intern/consume/adds `result_spec`
+    /// and must not re-evaluate the law.
+    fn on_craft_result(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: u8,
+        repeat: u8,
+        result_spec: &str,
+        world: &mut World,
+    ) {
+        let _ = (origin_spec, target_spec, event, repeat, result_spec, world);
+    }
+
+    /// First enabled mod that returns `Some` handles the console command.
+    fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        let _ = (cmd, args);
+        None
     }
 
     /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
@@ -428,6 +465,34 @@ impl Mods {
     /// Fan a rejected-placement refund out to every enabled mod.
     pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
         self.each_enabled(|m| m.on_place_rejected(id, world));
+    }
+
+    /// Fan an authoritative workbench result out to every enabled mod.
+    pub fn on_craft_result(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: u8,
+        repeat: u8,
+        result_spec: &str,
+        world: &mut World,
+    ) {
+        self.each_enabled(|m| {
+            m.on_craft_result(origin_spec, target_spec, event, repeat, result_spec, world)
+        });
+    }
+
+    /// First enabled mod that handles `cmd` wins.
+    pub fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        for entry in &mut self.entries {
+            if !entry.enabled {
+                continue;
+            }
+            if let Some(out) = entry.module.command(cmd, args) {
+                return Some(out);
+            }
+        }
+        None
     }
 
     /// Push every enabled mod's HUD contribution into `out`, in install order

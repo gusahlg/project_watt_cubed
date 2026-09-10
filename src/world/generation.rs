@@ -129,6 +129,11 @@ pub trait TerrainGenerator: Send + Sync {
         }
     }
 
+    /// Block at a world cell, sampling the column once (not `height` then `block_at`).
+    fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
+        self.block_at(wx, wy, wz, self.height(wx, wz))
+    }
+
     /// The block a coarse far-LOD tile shows at a cell. Distinct from
     /// [`block_at`](Self::block_at) because a tile samples at a `2^k`-metre stride
     /// where sub-cell detail would alias to noise: only the volumetric
@@ -557,6 +562,8 @@ struct Column {
     kind: placement::SurfaceKind,
     /// Surface block for this column (dress LUT + scatter).
     dress: BlockId,
+    /// Geology stratum 0..=2, constant for the column.
+    stratum: u8,
 }
 
 /// Per-column carve / overhang / island bits for one chunk layer.
@@ -784,6 +791,24 @@ const BEACH_SALT: i64 = 0x6B14_D8F3_2A79_C40Du64 as i64;
 /// The surface-growth scatter roll — luminous tufts on the top ground cell,
 /// its own stream so surface glow never correlates with beach dither or ores.
 const SURFACE_SCATTER_SALT: i64 = 0x3E7A_1B96_D4C8_205Fu64 as i64;
+/// Geology-cell hash — picks a rock/soil stratum per `GEOLOGY_SHIFT` cell.
+const GEOLOGY_SALT: i64 = 0x5A17_C3E8_90B2_46DFu64 as i64;
+
+/// Stratum index 0..=2 for the geology cell containing `(wx, wz)`.
+pub(crate) fn geology_index(seed: i64, wx: i32, wz: i32) -> usize {
+    (cell_hash(
+        seed ^ GEOLOGY_SALT,
+        wx >> placement::GEOLOGY_SHIFT,
+        0,
+        wz >> placement::GEOLOGY_SHIFT,
+    ) % 3) as usize
+}
+
+pub(crate) fn geology_uniform_chunk(x0: i32, z0: i32) -> bool {
+    let s = placement::GEOLOGY_SHIFT;
+    let last = CHUNK_SIZE as i32 - 1;
+    x0 >> s == (x0 + last) >> s && z0 >> s == (z0 + last) >> s
+}
 
 /// Continentalness → base height offset from sea level: deep ocean floors, coastal
 /// shelves, inland plains, and high interiors.
@@ -935,7 +960,7 @@ pub struct Terrain {
     /// Terrain speaks elements: every material is the union of the elements
     /// whose placement rules want the cell (see [`placement`]) — nothing else
     /// exists. No decoration overlay, no named blocks, no special cases.
-    mat: placement::Resolved,
+    pub(crate) mat: placement::Resolved,
 }
 
 impl Terrain {
@@ -1092,10 +1117,19 @@ impl Terrain {
             humidity: self.humidity.field.at(climate_x, climate_z),
             kind: placement::SurfaceKind::Grassy,
             dress: AIR,
+            stratum: geology_index(self.seed, wx, wz) as u8,
         };
         p.kind = self.surface_kind(&p, wx, wz);
         p.dress = self.dress(&p, wx, wz);
         p
+    }
+
+    fn stone_of(&self, p: &Column) -> BlockId {
+        self.mat.stone_at(p.stratum as usize)
+    }
+
+    fn stone_at(&self, wx: i32, wz: i32) -> BlockId {
+        self.mat.stone_at(geology_index(self.seed, wx, wz))
     }
 
     /// The ground column's surface dressing, classified from the shared context:
@@ -1200,7 +1234,7 @@ impl Terrain {
             if let Some(id) = self.cave_wall_at(p, wx, wy, wz, depth) {
                 return id;
             }
-            self.mat.stone
+            self.stone_of(p)
         }
     }
 
@@ -1247,7 +1281,7 @@ impl Terrain {
                     self.mat.island_pairs[hi][lo]
                 }
                 (Some(i), _) | (None, Some(i)) => self.mat.island_seams[i].id,
-                (None, None) => self.mat.stone,
+                (None, None) => self.stone_at(wx, wz),
             }
         }
     }
@@ -1278,7 +1312,7 @@ impl Terrain {
         } else if wy < p.water_level {
             self.mat.water
         } else if self.overhang_solid(wx, wy, wz, p.height) {
-            self.mat.stone
+            self.stone_at(wx, wz)
         } else if self.islands.solid(wx, wy, wz) {
             self.island_block(wx, wy, wz, [
                 self.islands.solid(wx, wy + 1, wz),
@@ -1318,6 +1352,10 @@ impl TerrainGenerator for Terrain {
     }
 
     fn block_at(&self, wx: i32, wy: i32, wz: i32, _height: i32) -> BlockId {
+        self.cell_base(&self.profile(wx, wz), wx, wy, wz, true)
+    }
+
+    fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
         self.cell_base(&self.profile(wx, wz), wx, wy, wz, true)
     }
 
@@ -1366,7 +1404,7 @@ impl TerrainGenerator for Terrain {
             } else if wy < p.water_level {
                 self.mat.water
             } else if self.overhang_solid(wx, wy, wz, p.height) {
-                self.mat.stone
+                self.stone_at(wx, wz)
             } else if island_at(wy) {
                 self.island_block(wx, wy, wz, [
                     island_at(wy + 1),
@@ -1534,8 +1572,8 @@ impl Terrain {
                 self.box_dormant(x0, ny0, z0, h_max)
             }
         };
-        if self.deep_uniform_with(y0, y1, h_min, &mut dormant_at) {
-            return ChunkData::Uniform(self.mat.stone);
+        if self.deep_uniform_with(y0, y1, h_min, &mut dormant_at) && geology_uniform_chunk(x0, z0) {
+            return ChunkData::Uniform(self.stone_at(x0, z0));
         }
         // Above every surface and below the island band: uniform sky. Fully below
         // the lowest water table → water; fully at/above the highest → air. (A
@@ -1675,12 +1713,12 @@ impl Terrain {
                 if let Some(id) = self.wall_cell(p, m, ly, wy, depth, lo_dormant, hi_dormant) {
                     return id;
                 }
-                self.mat.stone
+                self.stone_of(p)
             }
         } else if wy < p.water_level {
             self.mat.water
         } else if m.overhang & (1 << ly) != 0 {
-            self.mat.stone
+            self.stone_of(p)
         } else if m.island & (1 << ly) != 0 {
             let bit = |k: usize| m.island & (1u32 << k) != 0;
             self.island_block(
@@ -2057,15 +2095,14 @@ mod tests {
     fn overhangs_place_solid_rock_above_the_surface() {
         // overhang shelves put solid rock strictly above a column's heightfield
         // surface — relief the pure heightfield could never express.
-        let (reg, g) = terrain_with_registry(5);
-        let stone = reg.id_by_label("rock").unwrap();
+        let (_reg, g) = terrain_with_registry(5);
         let mut found = false;
         'scan: for x in -300..300 {
             for z in -300..300 {
                 let (wx, wz) = (x * 2, z * 2);
                 let h = g.height(wx, wz);
                 for up in 1..OVERHANG_REACH {
-                    if g.block_at(wx, h + up, wz, h) == stone {
+                    if g.mat.stone_strata.contains(&g.block_at(wx, h + up, wz, h)) {
                         found = true;
                         break 'scan;
                     }
@@ -2104,9 +2141,8 @@ mod tests {
 
     #[test]
     fn deep_chunks_are_uniform_stone() {
-        let (reg, g) = terrain_with_registry(11);
-        let stone = reg.id_by_label("rock").unwrap();
-        // Scan +z for a deep chunk the cave bound clears.
+        let (_reg, g) = terrain_with_registry(11);
+        // Scan +z for a deep chunk the cave bound clears, inside one geology cell.
         let cy = -20;
         let y0 = cy * 16;
         let mut proven = None;
@@ -2121,12 +2157,16 @@ mod tests {
                     h_min = h_min.min(h);
                 }
             }
-            if g.deep_uniform_provable(x0, y0, z0, y0 + 15, h_min, h_max) {
+            if g.deep_uniform_provable(x0, y0, z0, y0 + 15, h_min, h_max)
+                && geology_uniform_chunk(x0, z0)
+            {
                 proven = Some(cz);
                 break;
             }
         }
         let cz = proven.expect("a bound-cleared deep chunk within 128");
+        let stone = g.stone_at(0, cz * 16);
+        assert!(g.mat.stone_strata.contains(&stone));
         assert_eq!(g.generate(0, cy, cz), ChunkData::Uniform(stone));
         // Proof soundness: the per-cell path agrees with the shortcut on every
         // cell — the proof is a CPU shortcut, never a semantic gate.
@@ -2160,9 +2200,12 @@ mod tests {
     }
 
     impl Legacy {
-        fn resolve(reg: &BlockRegistry) -> Legacy {
+        fn resolve(reg: &BlockRegistry, mat: &placement::Resolved) -> Legacy {
             let id = |n: &str| reg.id_by_label(n).unwrap_or_else(|| panic!("no label {n}"));
-            let seam = |d: i32, r: u32, n: &str| (d, u32::MAX / r, id(n));
+            let seams = std::array::from_fn(|i| {
+                let s = &mat.seams[i];
+                (s.min_depth, s.width, s.id)
+            });
             Legacy {
                 grass: id("organic+soil"),
                 dirt: id("clay+soil"),
@@ -2171,20 +2214,9 @@ mod tests {
                 snow: id("snow"),
                 ice: id("ice"),
                 water: id("water"),
-                aerium_vein: id("lamp#5+rock"),
-                quartz_vein: id("glass#4+rock"),
-                seams: [
-                    seam(3, 90, "lamp#1+rock"),
-                    seam(8, 110, "clay#1+rock"),
-                    seam(8, 130, "glass#1+rock"),
-                    seam(20, 240, "lamp#2+rock"),
-                    seam(20, 200, "glass#2+rock"),
-                    seam(20, 220, "clay#2+rock"),
-                    seam(32, 300, "lamp#3+rock"),
-                    seam(32, 380, "lamp#4+rock"),
-                    seam(48, 460, "glass#3+rock"),
-                    seam(48, 240, "clay#3+rock"),
-                ],
+                aerium_vein: mat.island_seams[0].id,
+                quartz_vein: mat.island_seams[1].id,
+                seams,
             }
         }
 
@@ -2271,8 +2303,8 @@ mod tests {
     #[test]
     fn placement_rewiring_is_geometry_identical() {
         let (reg, g) = terrain_with_registry(3);
-        let legacy = Legacy::resolve(&reg);
-        let stone = reg.id_by_label("rock").unwrap();
+        let legacy = Legacy::resolve(&reg, &g.mat);
+        let stone_ids = g.mat.stone_strata;
 
         let chunks: Vec<(i32, i32, i32)> = [
             // Spawn area: surface band with crust, ores, water, carve.
@@ -2308,7 +2340,10 @@ mod tests {
                         // Deep uncarved stone below every scattered band stays
                         // pure Stone — no crust/scatter/ore reaches here.
                         if old == legacy.stone && p.height - wy > 64 {
-                            assert_eq!(new, stone, "deep stone drifted at ({wx},{wy},{wz})");
+                            assert!(
+                                stone_ids.contains(&new),
+                                "deep stone drifted at ({wx},{wy},{wz})"
+                            );
                         }
                     }
                 }
@@ -2462,14 +2497,14 @@ mod tests {
         let g = terrain(42);
         // surface, deep, cave, island band, beach, snow crust, two far coords.
         let pins: [(&str, i32, i32, i32, u32); 8] = [
-            ("surface", 0, 1, 0, 0x9cb960cd),
-            ("deep", 0, -20, 0, 0x24ae7d4e),
-            ("cave", 0, -3, 0, 0x00247390),
-            ("island", -1, 9, -4, 0xc79ff8ee),
-            ("beach", 4, 0, -7, 0xc55167f9),
-            ("crust", 55, 1, -80, 0x5fecf1c3),
-            ("far_a", 6_250_000, 0, 0, 0x8ebc0e38),
-            ("far_b", -6_250_000, -2, 3, 0x35281b26),
+            ("surface", 0, 1, 0, 0x1ea9770e),
+            ("deep", 0, -20, 0, 0xce982f9d),
+            ("cave", 0, -3, 0, 0x3c047ef4),
+            ("island", -1, 9, -4, 0x275fc005),
+            ("beach", 4, 0, -7, 0x9c440d29),
+            ("crust", 55, 1, -80, 0x68f49eb4),
+            ("far_a", 6_250_000, 0, 0, 0x9416c5c3),
+            ("far_b", -6_250_000, -2, 3, 0xb576e846),
         ];
         for (name, cx, cy, cz, want) in pins {
             assert_eq!(
@@ -2478,5 +2513,38 @@ mod tests {
                 "{name} ({cx},{cy},{cz})"
             );
         }
+    }
+
+    /// Family map: 256×256 at 4 m/pixel, coloured by the rock stratum the
+    /// geology cell picks. Ignored so the default suite writes no image.
+    /// `cargo test -j 4 --lib worldgen_families_map_ppm -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn worldgen_families_map_ppm() {
+        use material::visual;
+        let (reg, g) = terrain_with_registry(42);
+        const N: usize = 256;
+        const STEP: i32 = 4;
+        let mut pix = vec![0u8; N * N * 3];
+        for z in 0..N {
+            for x in 0..N {
+                let wx = (x as i32 - N as i32 / 2) * STEP;
+                let wz = (z as i32 - N as i32 / 2) * STEP;
+                let id = g.stone_at(wx, wz);
+                let vis = visual(reg.law(), reg.configuration(id));
+                let o = (z * N + x) * 3;
+                pix[o] = vis.rgb[0];
+                pix[o + 1] = vis.rgb[1];
+                pix[o + 2] = vis.rgb[2];
+            }
+        }
+        let path = std::path::Path::new("target/worldgen-families-map-42.ppm");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut out = format!("P6\n{N} {N}\n255\n").into_bytes();
+        out.extend_from_slice(&pix);
+        std::fs::write(path, out).expect("write family map");
+        println!("wrote {}", path.display());
     }
 }
