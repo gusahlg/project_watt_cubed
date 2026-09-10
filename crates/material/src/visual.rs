@@ -25,44 +25,45 @@ pub struct Visual {
     pub glow: u8,
 }
 
-/// The quantized key a descriptor is interned by (rgb 5-6-5, rgb2 5-6-5, frequency 3 bits,
-/// roughness 3, alpha 4, glow 4 = 46 bits). Many configurations share one key.
+/// The quantized key a descriptor is interned by (rgb 4-4-4, rgb2 4-4-4, frequency 3 bits,
+/// roughness 3, alpha 4, glow 4 = 38 bits). Many configurations share one key: a material family
+/// (a region centre and its variants) lands on a handful of descriptors.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct DescriptorKey(pub u64);
 
-fn q565(c: [u8; 3]) -> u64 {
-    ((c[0] as u64 >> 3) << 11) | ((c[1] as u64 >> 2) << 5) | (c[2] as u64 >> 3)
+fn q444(c: [u8; 3]) -> u64 {
+    ((c[0] as u64 >> 4) << 8) | ((c[1] as u64 >> 4) << 4) | (c[2] as u64 >> 4)
 }
 
-fn dq565(v: u64) -> [u8; 3] {
-    let r = ((v >> 11) & 31) as u8;
-    let g = ((v >> 5) & 63) as u8;
-    let b = (v & 31) as u8;
-    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+fn dq444(v: u64) -> [u8; 3] {
+    let r = ((v >> 8) & 15) as u8;
+    let g = ((v >> 4) & 15) as u8;
+    let b = (v & 15) as u8;
+    [(r << 4) | r, (g << 4) | g, (b << 4) | b]
 }
 
 impl Visual {
     /// Quantize into the intern key.
     pub fn quantize(&self) -> DescriptorKey {
-        let k = q565(self.rgb)
-            | (q565(self.rgb2) << 16)
-            | (((self.frequency >> 5) as u64) << 32)
-            | (((self.roughness >> 5) as u64) << 35)
-            | (((self.alpha >> 4) as u64) << 38)
-            | (((self.glow >> 4) as u64) << 42);
+        let k = q444(self.rgb)
+            | (q444(self.rgb2) << 12)
+            | (((self.frequency >> 5) as u64) << 24)
+            | (((self.roughness >> 5) as u64) << 27)
+            | (((self.alpha >> 4) as u64) << 30)
+            | (((self.glow >> 4) as u64) << 34);
         DescriptorKey(k)
     }
 
     /// The representative descriptor of a key (the centre of its quantization cell).
     pub fn dequantize(key: DescriptorKey) -> Visual {
         let k = key.0;
-        let f = ((k >> 32) & 7) as u8;
-        let r = ((k >> 35) & 7) as u8;
-        let a = ((k >> 38) & 15) as u8;
-        let g = ((k >> 42) & 15) as u8;
+        let f = ((k >> 24) & 7) as u8;
+        let r = ((k >> 27) & 7) as u8;
+        let a = ((k >> 30) & 15) as u8;
+        let g = ((k >> 34) & 15) as u8;
         Visual {
-            rgb: dq565(k & 0xffff),
-            rgb2: dq565((k >> 16) & 0xffff),
+            rgb: dq444(k & 0xfff),
+            rgb2: dq444((k >> 12) & 0xfff),
             frequency: (f << 5) | (f << 2) | (f >> 1),
             roughness: (r << 5) | (r << 2) | (r >> 1),
             alpha: (a << 4) | a,

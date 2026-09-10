@@ -20,6 +20,7 @@ pub mod element;
 pub mod reaction;
 pub mod registry;
 pub mod texture;
+pub mod materials;
 
 pub use composition::Composition;
 pub use element::ElementId;

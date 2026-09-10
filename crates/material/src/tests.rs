@@ -179,7 +179,7 @@ fn visuals_are_local_and_quantization_round_trips() {
         worst = worst.max(d);
         let k = v1.quantize();
         let back = Visual::dequantize(k);
-        assert!((back.rgb[0] as i32 - v1.rgb[0] as i32).abs() <= 8);
+        assert!((back.rgb[0] as i32 - v1.rgb[0] as i32).abs() <= 16);
         assert_eq!(back.quantize(), k, "dequantize is a fixed point of quantize");
     }
     assert!(worst <= 32, "one lattice step moved the colour by {worst} (of 765; pinned bound for law v0)");

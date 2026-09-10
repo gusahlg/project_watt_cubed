@@ -35,6 +35,8 @@ pub struct Observation {
     pub hardness: u8,
     /// The friction response.
     pub friction: u8,
+    /// The raw flow response (buoyancy strength for liquids).
+    pub flow: u8,
     /// Sound class.
     pub acoustic: Acoustic,
 }
@@ -48,6 +50,7 @@ impl Observation {
         emission: 0,
         hardness: 0,
         friction: 0,
+        flow: 0,
         acoustic: Acoustic::Void,
     };
 }
@@ -114,6 +117,7 @@ pub fn observe(law: &Law, c: &Configuration) -> Observation {
         emission,
         hardness,
         friction,
+        flow,
         acoustic,
     }
 }
