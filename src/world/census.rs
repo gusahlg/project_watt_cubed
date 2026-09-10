@@ -71,8 +71,8 @@ impl World {
         for (_, _, out) in &self.upload_queue {
             c.mesh_cpu_bytes += mesh_output_held(out);
         }
-        for (_, _, quads) in &self.section_upload_queue {
-            for quad in quads {
+        for (_, _, _, quads) in &self.section_upload_queue {
+            for quad in quads.iter() {
                 for (_, data) in quad {
                     c.mesh_cpu_bytes += mesh_held(data);
                 }
@@ -164,9 +164,12 @@ fn worklist_bytes(world: &World) -> usize {
         + set_cap::<SectionPos>(world.dirty_sections.capacity())
         + deque_cap::<(Coord, u32, pipeline::MeshOutput)>(world.upload_queue.capacity())
         + deque_cap::<(Coord, LightGrid)>(world.light_apply_queue.capacity())
-        + deque_cap::<(SectionPos, pipeline::ClaimToken, [super::section::SectionMeshData; 4])>(
-            world.section_upload_queue.capacity(),
-        )
+        + deque_cap::<(
+            SectionPos,
+            pipeline::ClaimToken,
+            usize,
+            pipeline::SectionMeshOutput,
+        )>(world.section_upload_queue.capacity())
         + deque_cap::<Coord>(world.conn_fill_queue.capacity())
 }
 

@@ -730,6 +730,7 @@ struct StreamPeaks {
     max_worker_capacity: usize,
     max_speed_mps: f64,
     min_effort: f32,
+    max_section_upload_bytes: usize,
 }
 
 impl Default for StreamPeaks {
@@ -748,6 +749,7 @@ impl Default for StreamPeaks {
             max_worker_capacity: 0,
             max_speed_mps: 0.0,
             min_effort: 1.0,
+            max_section_upload_bytes: 0,
         }
     }
 }
@@ -769,6 +771,7 @@ impl StreamPeaks {
         self.max_worker_capacity = self.max_worker_capacity.max(g.worker_capacity);
         self.max_speed_mps = self.max_speed_mps.max(g.travel_speed_mps);
         self.min_effort = self.min_effort.min(g.effort);
+        self.max_section_upload_bytes = self.max_section_upload_bytes.max(g.section_upload_bytes);
     }
 
     fn to_json(self) -> Json {
@@ -793,6 +796,7 @@ impl StreamPeaks {
             ("worker_capacity", Json::from(self.max_worker_capacity)),
             ("travel_speed_mps", Json::number(self.max_speed_mps)),
             ("minimum_effort", Json::number(f64::from(self.min_effort))),
+            ("section_upload_bytes", Json::from(self.max_section_upload_bytes)),
         ])
     }
 }
@@ -865,6 +869,7 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
             "mesh_jobs_before_fixpoint_n",
             Json::from(g.mesh_jobs_before_fixpoint_n),
         ),
+        ("section_upload_bytes", Json::from(g.section_upload_bytes)),
     ])
 }
 

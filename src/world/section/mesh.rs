@@ -362,11 +362,25 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
     tables: &HotTables,
 ) -> [SectionMeshData; 4] {
+    let mut out = std::array::from_fn(|_| SectionMeshData::new());
+    extract_section_mesh_into(pos, r#gen, edits, tables, &mut out);
+    out
+}
+
+/// Production worker path: fill a pooled `[SectionMeshData; 4]`, reusing each
+/// quadrant's `Vec` and inner `ChunkMeshData` capacities.
+pub(in crate::world) fn extract_section_mesh_into<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+    out: &mut [SectionMeshData; 4],
+) {
     let cell = pos.cell_size();
     let n_cells = (DOMAIN_H / cell) as usize;
     let ys = super::cell_centers(pos);
     let flat = super::flatten_edits(edits);
-    mesh_section_with(n_cells, tables, |dense, q| {
+    mesh_section_into(n_cells, tables, out, |dense, q| {
         let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
         for lz in 0..BRICK_DIM {
             for lx in 0..BRICK_DIM {
@@ -380,7 +394,7 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
                 super::apply_edits(column, &flat, fx, fz, cell);
             }
         }
-    })
+    });
 }
 
 /// The one section-mesh driver both producers share: for each quadrant, `fill`
@@ -391,15 +405,34 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
 fn mesh_section_with(
     n_cells: usize,
     tables: &HotTables,
-    mut fill: impl FnMut(&mut [BlockId], u8),
+    fill: impl FnMut(&mut [BlockId], u8),
 ) -> [SectionMeshData; 4] {
+    let mut out = std::array::from_fn(|_| SectionMeshData::new());
+    mesh_section_into(n_cells, tables, &mut out, fill);
+    out
+}
+
+fn mesh_section_into(
+    n_cells: usize,
+    tables: &HotTables,
+    out: &mut [SectionMeshData; 4],
+    mut fill: impl FnMut(&mut [BlockId], u8),
+) {
     DENSE_QUAD.with_borrow_mut(|dense| {
         dense.resize(QUAD_N * QUAD_N * n_cells, AIR);
-        std::array::from_fn(|q| {
+        for q in 0..4 {
             fill(dense, q as u8);
-            mesh_quadrant(&DenseQuad { cells: dense, n_cells: n_cells as i32 }, tables, q as u8)
-        })
-    })
+            mesh_quadrant(
+                &DenseQuad {
+                    cells: dense,
+                    n_cells: n_cells as i32,
+                },
+                tables,
+                q as u8,
+                &mut out[q],
+            );
+        }
+    });
 }
 
 /// Decode one quadrant's [`BrickStack`] into the dense grid (column-major).
@@ -427,7 +460,12 @@ fn fill_from_stack(dense: &mut [BlockId], n_cells: usize, stack: &BrickStack) {
 /// Mesh one quadrant `q` (its 16×16 column sub-grid) into section-space block
 /// origins. Block origins are in CELLS relative to the section min-corner, so the
 /// caller positions them the same way regardless of quadrant.
-fn mesh_quadrant(quad: &DenseQuad<'_>, tables: &HotTables, q: u8) -> SectionMeshData {
+fn mesh_quadrant(
+    quad: &DenseQuad<'_>,
+    tables: &HotTables,
+    q: u8,
+    out: &mut SectionMeshData,
+) {
     let (qx, qz) = ((q & 1) as usize, (q >> 1) as usize);
     let n_cells = quad.n_cells;
 
@@ -443,27 +481,32 @@ fn mesh_quadrant(quad: &DenseQuad<'_>, tables: &HotTables, q: u8) -> SectionMesh
             yhi = yhi.max(last as i32 + 1);
         }
     }
-    let mut result = SectionMeshData::new();
     if yhi <= ylo {
-        return result; // no solid geometry in this quadrant
+        out.clear();
+        return;
     }
 
     // Section-space cell origin of the quadrant's XZ corner (0 or 16).
     let (ox, oz) = ((qx * QUAD_N) as u32, (qz * QUAD_N) as u32);
+    let mut used = 0usize;
     MESH_SCRATCH.with_borrow_mut(|scratch| {
         for by in ylo / BLOCK..=(yhi - 1) / BLOCK {
             for (_, m) in scratch.iter_mut() {
                 m.clear();
             }
             if build_block(quad, by * BLOCK, tables, scratch) {
-                result.push((
-                    UVec3::new(ox, (by * BLOCK) as u32, oz),
-                    std::mem::replace(scratch, new_chunk_mesh_data()),
-                ));
+                let origin = UVec3::new(ox, (by * BLOCK) as u32, oz);
+                if used < out.len() {
+                    out[used].0 = origin;
+                    std::mem::swap(&mut out[used].1, scratch);
+                } else {
+                    out.push((origin, std::mem::replace(scratch, new_chunk_mesh_data())));
+                }
+                used += 1;
             }
         }
     });
-    result
+    out.truncate(used);
 }
 
 #[cfg(test)]

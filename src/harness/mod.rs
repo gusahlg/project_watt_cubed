@@ -433,6 +433,8 @@ pub struct StressOutcome {
     pub max_chunks: usize,
     pub max_worker_near_queue: usize,
     pub max_worker_far_queue: usize,
+    /// Peak per-frame section (LOD tile) upload vertex bytes.
+    pub max_section_upload_bytes: usize,
     pub min_active_workers: usize,
     pub min_stream_effort: f32,
     /// Light worklist size and loaded-chunk count at the moment of stop.
@@ -489,6 +491,7 @@ struct StressRun {
     max_chunks: usize,
     max_worker_near: usize,
     max_worker_far: usize,
+    max_section_upload_bytes: usize,
     min_active_workers: usize,
     min_effort: f32,
     stop_admitted: u64,
@@ -524,6 +527,7 @@ impl StressRun {
             max_chunks: 0,
             max_worker_near: 0,
             max_worker_far: 0,
+            max_section_upload_bytes: 0,
             min_active_workers: usize::MAX,
             min_effort: 1.0,
             stop_admitted: 0,
@@ -560,6 +564,7 @@ impl StressRun {
             max_chunks: self.max_chunks,
             max_worker_near_queue: self.max_worker_near,
             max_worker_far_queue: self.max_worker_far,
+            max_section_upload_bytes: self.max_section_upload_bytes,
             min_active_workers: if self.min_active_workers == usize::MAX {
                 0
             } else {
@@ -889,6 +894,8 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             run.max_chunks = run.max_chunks.max(gauges.chunks);
             run.max_worker_near = run.max_worker_near.max(gauges.worker_near_queue);
             run.max_worker_far = run.max_worker_far.max(gauges.worker_far_queue);
+            run.max_section_upload_bytes =
+                run.max_section_upload_bytes.max(gauges.section_upload_bytes);
             if gauges.worker_capacity != 0 {
                 run.min_active_workers = run.min_active_workers.min(gauges.active_workers);
             }

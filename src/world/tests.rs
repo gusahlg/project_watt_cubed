@@ -864,6 +864,48 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     assert_eq!(streaming::mesh_output_bytes(&out), expected);
 }
 
+/// Section uploads charge the same vertex-byte accounting as chunks, stored
+/// on the queue entry at enqueue so the drain never walks the mesh again.
+#[test]
+fn section_upload_byte_accounting_matches_vertex_sizes() {
+    let mut world = lod2_world();
+    world.refresh_tables();
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    let pos = world.desired_sections(center)[0];
+    let mut meshes = pipeline::SectionMeshOutput::new();
+    let tables = world.tables.get();
+    section::extract_section_mesh_into(pos, &*world.generator, &[], &tables, &mut meshes);
+    let expected: usize = meshes
+        .iter()
+        .flat_map(|quad| quad.iter())
+        .map(|(_, mesh)| Pass::ALL.iter().map(|&p| mesh[p].vertex_bytes()).sum::<usize>())
+        .sum();
+    assert!(expected > 0, "a default-seed section yields geometry");
+    assert_eq!(streaming::section_output_bytes(&meshes), expected);
+
+    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
+    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::integrate(
+        &mut world,
+        pipeline::Done::Section {
+            pos,
+            epoch: 0,
+            token: pipeline::ClaimToken(7),
+            meshes,
+        },
+    );
+    assert_eq!(world.section_upload_queue.len(), 1);
+    assert_eq!(world.section_upload_queue[0].2, expected);
+}
+
+/// Empty pooled section output is a zero-byte charge (stale/default jobs).
+#[test]
+fn empty_section_mesh_charges_zero_upload_bytes() {
+    let meshes = pipeline::SectionMeshOutput::new();
+    assert_eq!(streaming::section_output_bytes(&meshes), 0);
+}
+
 /// Mesh admission pauses at the upload-queue cap and resumes below it.
 #[test]
 fn upload_backlog_pauses_mesh_admission_at_the_cap() {
@@ -1281,7 +1323,7 @@ fn lod2_far_field_drives_to_covering_complete() {
         if !got {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        while let Some((pos, token, _meshes)) = world.section_upload_queue.pop_front() {
+        while let Some((pos, token, _bytes, _meshes)) = world.section_upload_queue.pop_front() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
@@ -2199,7 +2241,7 @@ fn assert_claim_invariants(
             let queued = world
                 .section_upload_queue
                 .iter()
-                .any(|(p, t, _)| p == pos && t == token);
+                .any(|(p, t, _, _)| p == pos && t == token);
             assert!(
                 owed_section.get(pos) == Some(token) || queued,
                 "{pos:?} meshing with no owed Done and not queued"

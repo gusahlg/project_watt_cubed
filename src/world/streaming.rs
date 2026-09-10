@@ -43,6 +43,19 @@ pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshOutput) -> usize 
         .sum()
 }
 
+/// Vertex bytes a finished section mesh will stage: 4 quadrants × blocks × passes.
+pub(in crate::world) fn section_output_bytes(data: &[super::SectionMeshData; 4]) -> usize {
+    data.iter()
+        .flat_map(|quad| quad.iter())
+        .map(|(_, mesh)| {
+            voxel_engine::Pass::ALL
+                .iter()
+                .map(|&p| mesh[p].vertex_bytes())
+                .sum::<usize>()
+        })
+        .sum()
+}
+
 /// Edits whose chunk falls inside `pos`'s footprint and height domain. Free
 /// function (not a `World` method) so callers needing only `&self.edits` — the
 /// heightmip overlay refresh among them — don't have to borrow the rest of `World`.
@@ -802,6 +815,7 @@ impl World {
             integrated += 1;
         }
 
+        self.section_upload_bytes = 0;
         if self.upload_queue.is_empty()
             && self.section_upload_queue.is_empty()
             && self.light_apply_queue.is_empty()
@@ -856,18 +870,25 @@ impl World {
             light_applied += 1;
         }
 
-        // Section uploads, on their own budget. Re-validated by claim token at
-        // the moment of upload: an entry that sat queued across an unload or a
-        // re-admission must not capture the replacement claim. The budget
-        // is a hard, velocity-scaled ceiling. Backlog no longer increases the
-        // render thread's per-frame work — that positive feedback loop was the
-        // exact high-speed hitch this pacer is designed to avoid.
+        // Section uploads share the chunk byte counter. A section is binary
+        // (`SectionState` Ready-or-not), so the byte gate sits before the pop:
+        // the next whole tile lands only while the counter has room. The count
+        // cap stays as a secondary ceiling. Re-validated by claim token at the
+        // moment of upload: an entry that sat queued across an unload or a
+        // re-admission must not capture the replacement claim.
         let section_budget = pacer.section_uploads();
         let mut section_uploads = 0;
         while section_uploads < section_budget {
-            let Some((pos, token, meshes)) = self.section_upload_queue.pop_front() else {
+            let Some((_, _, _, _)) = self.section_upload_queue.front() else {
                 break;
             };
+            if upload_bytes >= upload_budget {
+                break;
+            }
+            let (pos, token, bytes, meshes) = self
+                .section_upload_queue
+                .pop_front()
+                .expect("front was Some");
             section_uploads += 1;
             // `section_material` borrows all of `self`, so it must run before
             // `self.sections.get_mut` below takes an overlapping mutable borrow.
@@ -876,7 +897,9 @@ impl World {
                 && matches!(state, SectionState::Meshing { token: t } if *t == token)
             {
                 super::adjust_count(&mut self.meshing_sections, true, false);
-                *state = SectionState::from_upload(pos, meshes, eng);
+                upload_bytes += bytes;
+                self.section_upload_bytes += bytes;
+                *state = SectionState::from_upload(pos, &meshes, eng);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
                 // in part — must be corrected here, at the transition that gave it slots
@@ -950,7 +973,7 @@ impl World {
                     || self
                         .section_upload_queue
                         .iter()
-                        .any(|(p, t, _)| *p == pos && *t == token),
+                        .any(|(p, t, _, _)| *p == pos && *t == token),
                 "section Done for {pos:?} matched the live claim but was not transferred"
             );
         }
@@ -2771,6 +2794,7 @@ impl World {
             mesh_jobs_before_fixpoint_mean: jf_mean,
             mesh_jobs_before_fixpoint_p95: jf_p95,
             mesh_jobs_before_fixpoint_n: jf_n,
+            section_upload_bytes: self.section_upload_bytes,
         }
     }
 

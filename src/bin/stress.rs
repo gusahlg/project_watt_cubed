@@ -67,13 +67,14 @@ fn main() {
             o.settle.frames, o.settle.p50, o.settle.p95, o.settle.p99, o.settle.max
         );
         println!(
-            "  peaks: upload_queue={} light_apply={} mesh_worklist={} worker_near={} worker_far={} chunks={}",
+            "  peaks: upload_queue={} light_apply={} mesh_worklist={} worker_near={} worker_far={} chunks={} section_upload_bytes={}",
             o.max_upload_queue,
             o.max_light_apply,
             o.max_mesh_worklist,
             o.max_worker_near_queue,
             o.max_worker_far_queue,
-            o.max_chunks
+            o.max_chunks,
+            o.max_section_upload_bytes
         );
         println!(
             "  adaptive floor: effort={:.2} active_workers={}",

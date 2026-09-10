@@ -172,6 +172,8 @@ pub struct StreamGauges {
     pub light_seed_split: LightSeedSplit,
     /// `remesh_async` calls (rev-bumping rebuilds) this world has issued.
     pub remesh_async_calls: u64,
+    /// Vertex bytes of section (LOD tile) meshes uploaded this stream pass.
+    pub section_upload_bytes: usize,
     /// Stale mesh drops (accept-time, pop-time, and prune).
     pub drop_stale_uploads: u64,
     /// Stale drops during the current stream/pump frame.
@@ -570,14 +572,14 @@ impl SectionState {
     /// quadrants upload to no handles.
     fn from_upload(
         pos: SectionPos,
-        meshes: [SectionMeshData; 4],
+        meshes: &[SectionMeshData; 4],
         eng: &mut Engine,
     ) -> SectionState {
         let cell = pos.cell_size();
         let detail = pos.detail;
-        let quadrants = meshes.map(|quad| {
+        let quadrants = std::array::from_fn(|qi| {
             let mut blocks = Vec::new();
-            for (block_origin, data) in quad {
+            for &(block_origin, ref data) in &meshes[qi] {
                 let placement = voxel_engine::MeshPlacement::terrain(
                     voxel_engine::IVec3::new(
                         pos.min_x() + block_origin.x as i32 * cell,
@@ -1007,8 +1009,12 @@ pub struct World {
     /// Loaded sections.
     sections: FastMap<SectionPos, SectionState>,
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
-    /// token that produced them (re-validated at the moment of upload).
-    section_upload_queue: VecDeque<(SectionPos, pipeline::ClaimToken, [SectionMeshData; 4])>,
+    /// token that produced them (re-validated at the moment of upload) and the
+    /// vertex-byte charge computed at queue time.
+    section_upload_queue:
+        VecDeque<(SectionPos, pipeline::ClaimToken, usize, pipeline::SectionMeshOutput)>,
+    /// Vertex bytes uploaded for sections in the current drain (harness peak).
+    section_upload_bytes: usize,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -1240,6 +1246,7 @@ impl World {
             section_mip_rx: None,
             sections: FastMap::default(),
             section_upload_queue: VecDeque::new(),
+            section_upload_bytes: 0,
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_edit_rev: FastMap::default(),
@@ -2309,7 +2316,10 @@ impl StreamLane for SectionLane {
                 && matches!(world.sections.get(&pos),
                     Some(SectionState::Meshing { token: t }) if *t == token);
             if live {
-                world.section_upload_queue.push_back((pos, token, meshes));
+                let bytes = streaming::section_output_bytes(&meshes);
+                world
+                    .section_upload_queue
+                    .push_back((pos, token, bytes, meshes));
             }
         }
     }

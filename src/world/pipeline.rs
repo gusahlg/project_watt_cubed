@@ -211,7 +211,7 @@ pub(in crate::world) enum Done {
         pos: SectionPos,
         epoch: u32,
         token: ClaimToken,
-        meshes: [SectionMeshData; 4],
+        meshes: SectionMeshOutput,
     },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
     /// and apply the bounded retry/quarantine policy — without this, a single
@@ -275,6 +275,59 @@ impl Drop for MeshOutput {
     fn drop(&mut self) {
         if let Some(data) = self.0.take() {
             MESH_OUTPUT_POOL.put(data);
+        }
+    }
+}
+
+/// Cross-thread pool for section (LOD tile) mesh output. Quadrant `Vec`s and
+/// their inner `ChunkMeshData` keep capacity after upload/stale rejection.
+static SECTION_MESH_POOL: BoundedPool<Box<[SectionMeshData; 4]>> =
+    BoundedPool::new(12 + 16);
+
+/// A pooled `[SectionMeshData; 4]`: taken at section-job start, returned on
+/// drop after GPU upload or stale rejection.
+pub(in crate::world) struct SectionMeshOutput(Option<Box<[SectionMeshData; 4]>>);
+
+impl SectionMeshOutput {
+    pub(in crate::world) fn new() -> Self {
+        let data = SECTION_MESH_POOL
+            .take()
+            .unwrap_or_else(|| Box::new(std::array::from_fn(|_| SectionMeshData::new())));
+        Self(Some(data))
+    }
+}
+
+impl Default for SectionMeshOutput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for SectionMeshOutput {
+    type Target = [SectionMeshData; 4];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("live pooled section mesh output")
+    }
+}
+
+impl std::ops::DerefMut for SectionMeshOutput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_deref_mut().expect("live pooled section mesh output")
+    }
+}
+
+impl Drop for SectionMeshOutput {
+    fn drop(&mut self) {
+        if let Some(mut data) = self.0.take() {
+            for quad in data.iter_mut() {
+                for (_, mesh) in quad.iter_mut() {
+                    for (_, m) in mesh.iter_mut() {
+                        m.clear();
+                    }
+                }
+            }
+            SECTION_MESH_POOL.put(data);
         }
     }
 }
@@ -1169,7 +1222,8 @@ fn run(job: Job) -> Done {
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
-            let meshes = section::extract_section_mesh(pos, &*generator, &edits, &tables);
+            let mut meshes = SectionMeshOutput::new();
+            section::extract_section_mesh_into(pos, &*generator, &edits, &tables, &mut meshes);
             Done::Section {
                 pos,
                 epoch,
