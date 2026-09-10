@@ -273,6 +273,9 @@ impl App {
             self.note_frame_stall(t0, update_dt);
             return false;
         }
+        // Applied MSAA/scale from engine create (and later recreates) before
+        // we push the session request, so a fallback cannot be overwritten.
+        self.settings.sync_engine_applied(eng);
         // VRAM guard + live settings: one push per frame so a resize cannot
         // allocate MSAA/scale the probe already refused.
         self.settings.apply(eng);
@@ -396,7 +399,13 @@ impl App {
                 let bench = self.bench.as_mut().expect("bench exists");
                 bench.poll_world(game.world())
             };
-            let step = self.bench.as_mut().expect("bench exists").step(dt, ready, gauges);
+            let rendered = eng.frames_rendered();
+            let coalesced = eng.frames_coalesced();
+            let step = self
+                .bench
+                .as_mut()
+                .expect("bench exists")
+                .step(dt, ready, gauges, rendered, coalesced);
             match step {
                 BenchmarkStep::ReadyTimeout => {
                     eprintln!("{}", game.world().entry_debug());

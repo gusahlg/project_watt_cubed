@@ -13,11 +13,10 @@ use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
 };
 use crate::block::AIR;
-use crate::camera::{CameraMode, FlyAxes, GameCamera};
+use crate::camera::{CameraMode, CameraPose, FlyAxes, GameCamera};
 use crate::command;
 use crate::console::Console;
 use crate::derived::Revision;
-use crate::harness::{CameraPose, DebugView};
 use crate::input::intent::{GameplayEvent, GameplayState, GlobalEvent, MenuEvent};
 use crate::input::router::{Context, Router, View};
 use crate::input::{look, movement};
@@ -43,6 +42,21 @@ pub enum Signal {
     Continue,
     /// Leave to the start menu (the app saves on the way out).
     ExitToMenu,
+}
+
+/// Magenta clear under [`DebugView::TerrainKey`] — sky-hole detector background.
+pub const SKY_KEY: Color = Color::rgb(255, 0, 255);
+/// Flat terrain fill under [`DebugView::TerrainKey`].
+pub const TERRAIN_KEY: Color = Color::rgb(0, 255, 0);
+
+/// What the app renders for a capture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DebugView {
+    #[default]
+    Normal,
+    /// ALL terrain flat [`TERRAIN_KEY`], sky/fog passes disabled, clear color
+    /// [`SKY_KEY`]. The sky-hole detector's input.
+    TerrainKey,
 }
 
 /// One frame's routed input, snapshotted into plain data by

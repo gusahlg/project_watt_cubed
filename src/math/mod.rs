@@ -24,33 +24,11 @@ pub const BLOCK_METERS: f64 = 0.85;
 /// take it — they live in the time domain.
 pub const PER_METER: f64 = 1.0 / BLOCK_METERS;
 
-/// Slack past ±[`WORLD_BORDER`] within which [`block_coord`] still resolves a
-/// true cell instead of clamping. Player *positions* are clamped to exactly
-/// ±`WORLD_BORDER` (movement and `/tp`, the only continuous writers), but the
-/// AABBs built *around* a position extend up to their half-extents beyond it —
-/// clamping the conversion at the border itself collapsed those outer corners
-/// onto the border column (e.g. an AABB min of `-1e9 - 0.3` skipped its true
-/// column `-1_000_000_001`, so the outermost cells never collided and the
-/// player interpenetrated terrain at the negative border). 16 blocks covers
-/// any in-game AABB by a wide margin while staying light-years inside `i32`
-/// block math: `(1e9 + 16) / 16` chunks of 16 blocks fits `i32` fine.
+/// Slack past ±[`WORLD_BORDER`] so [`block_coord`] still resolves cells of an
+/// AABB whose half-extents stick past a position clamped to the border.
+/// 16 covers any in-game AABB; `(1e9 + 16) / 16` chunks still fit `i32`.
 const BLOCK_COORD_SLACK: f64 = 16.0;
 
-/// The one conversion from an `f64` world coordinate to an integer block
-/// coordinate: clamp to ±([`WORLD_BORDER`] + [`BLOCK_COORD_SLACK`]), then
-/// floor. Together with movement/`/tp` clamping positions to exactly
-/// ±`WORLD_BORDER`, the slack makes every AABB reachable in play — including
-/// one straddling the border — resolve its true cells.
-///
-/// Everything that turns a position into a cell goes through here (collision
-/// cell ranges, chunk lookup, the interact raycast's start cell, placement,
-/// interest buckets) because i32 block math must never overflow: downstream
-/// code multiplies block coords by [`CHUNK_SIZE`](crate::world::chunk::CHUNK_SIZE)
-/// scale factors, offsets them by ±1 for neighbours, and squares differences —
-/// all safe only while the input is bounded well inside `i32` range. A raw
-/// `as i32` cast of an unbounded float would saturate at `i32::MAX` and make
-/// that arithmetic wrap. `NaN` clamps to `NaN` and casts to 0 — a harmless
-/// origin cell rather than a poisoned coordinate.
 /// Hermite smoothstep on a unit interval: `t²(3−2t)`.
 #[inline]
 pub fn smooth(t: f32) -> f32 {
@@ -70,6 +48,11 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// `f64` world coordinate → block: clamp to ±([`WORLD_BORDER`] + [`BLOCK_COORD_SLACK`]),
+/// then floor. Downstream i32 math (chunk scale, ±1 neighbours, squared diffs)
+/// is overflow-free only while the input stays well inside `i32`. Unbounded
+/// `as i32` saturates at `i32::MAX` and wraps later. `NaN` clamps to `NaN` and
+/// casts to 0 (origin), not a poisoned coordinate.
 #[inline]
 pub fn block_coord(v: f64) -> i32 {
     // Floor in f64 (exact for |v| <= 1e9 + 16, far below 2^53), then narrow
@@ -78,13 +61,10 @@ pub fn block_coord(v: f64) -> i32 {
         as i32
 }
 
-/// The exclusive-upper-edge partner of [`block_coord`]: the last cell an
-/// interval ending at `v` still overlaps. A voxel spans `[x, x+1)`, so a box
-/// whose maximum lands exactly on an integer boundary touches — but does not
-/// overlap — the next cell: `ceil(v) - 1`, not `floor(v)`. Matches the strict
-/// overlap rule of [`Aabb::intersects`]. `NaN` resolves to cell 0 like
-/// [`block_coord`] (subtraction happens in f64, so the NaN survives to the
-/// saturating cast).
+/// Exclusive-upper partner of [`block_coord`]: last cell an interval ending at
+/// `v` still overlaps. A voxel is `[x, x+1)`, so an integer max touches but
+/// does not overlap the next cell — `ceil(v) - 1`, matching [`Aabb::intersects`].
+/// `NaN` → cell 0 like [`block_coord`].
 #[inline]
 pub fn block_coord_end(v: f64) -> i32 {
     (v.clamp(-(WORLD_BORDER + BLOCK_COORD_SLACK), WORLD_BORDER + BLOCK_COORD_SLACK).ceil() - 1.0)

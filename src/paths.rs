@@ -27,7 +27,7 @@ static PATHS: OnceLock<Paths> = OnceLock::new();
 impl Paths {
     /// Resolve override → existing launch `saves/` → XDG, without installing globally.
     /// `checkout_dir` is kept only when `<dir>/Cargo.toml` exists.
-    pub fn resolve(override_dir: Option<&Path>, checkout_dir: Option<&Path>) -> Self {
+    pub(crate) fn resolve(override_dir: Option<&Path>, checkout_dir: Option<&Path>) -> Self {
         let mut paths = pick(
             override_dir
                 .filter(|p| !p.as_os_str().is_empty())
@@ -60,27 +60,27 @@ impl Paths {
     }
 
     /// The installed roots, resolving defaults on first use.
-    pub fn get() -> &'static Self {
+    pub(crate) fn get() -> &'static Self {
         Self::init(None)
     }
 
-    pub fn settings_file(&self) -> PathBuf {
+    pub(crate) fn settings_file(&self) -> PathBuf {
         self.config.join("settings.cfg")
     }
 
-    pub fn session_file(&self) -> PathBuf {
+    pub(crate) fn session_file(&self) -> PathBuf {
         self.config.join("session.cfg")
     }
 
-    pub fn mods_file(&self) -> PathBuf {
+    pub(crate) fn mods_file(&self) -> PathBuf {
         self.config.join("mods.cfg")
     }
 
-    pub fn checkout_dir(&self) -> Option<&Path> {
+    pub(crate) fn checkout_dir(&self) -> Option<&Path> {
         self.checkout.as_deref()
     }
 
-    pub fn mods_selection_file(&self) -> Option<PathBuf> {
+    pub(crate) fn mods_selection_file(&self) -> Option<PathBuf> {
         Some(self.checkout_dir()?.join("mods.toml"))
     }
 }
@@ -122,22 +122,17 @@ fn pick(
     }
 }
 
+fn nonempty_path(val: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let val = val.filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(val))
+}
+
 fn env_override() -> Option<PathBuf> {
-    let val = std::env::var_os(ENV_DATA_DIR)?;
-    if val.is_empty() {
-        None
-    } else {
-        Some(absolutize(PathBuf::from(val)))
-    }
+    nonempty_path(std::env::var_os(ENV_DATA_DIR)).map(absolutize)
 }
 
 fn env_checkout() -> Option<PathBuf> {
-    let val = std::env::var_os(ENV_CHECKOUT_DIR)?;
-    if val.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(val))
-    }
+    nonempty_path(std::env::var_os(ENV_CHECKOUT_DIR))
 }
 
 fn resolve_checkout(dir: Option<&Path>) -> Option<PathBuf> {
@@ -198,6 +193,16 @@ fn isolated_test_paths() -> Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonempty_path_drops_empty_and_absent() {
+        assert_eq!(nonempty_path(None), None);
+        assert_eq!(nonempty_path(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            nonempty_path(Some(std::ffi::OsString::from("/x"))),
+            Some(PathBuf::from("/x"))
+        );
+    }
 
     #[test]
     fn override_wins_over_saves_and_xdg() {

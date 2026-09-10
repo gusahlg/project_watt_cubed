@@ -76,6 +76,19 @@ pub struct StartFacts<'a> {
     pub notice: Option<&'a str>,
 }
 
+#[cfg(test)]
+impl<'a> StartFacts<'a> {
+    pub(crate) fn test(saves: &'a [Slot], session: &'a Session, notice: Option<&'a str>) -> Self {
+        Self {
+            saves,
+            session,
+            version: VERSION,
+            hosting: false,
+            notice,
+        }
+    }
+}
+
 /// One start-screen page as data. Core presents it through the theme; the
 /// start screen owns meaning and interaction.
 pub struct MenuModel {
@@ -253,17 +266,21 @@ impl StartRoot {
     pub fn wrap(inner: Box<dyn StartScreen>, hosting: bool) -> Box<dyn Screen> {
         Box::new(Self { inner, hosting })
     }
+
+    fn facts<'c>(hosting: bool, ctx: &'c super::Ctx<'_>) -> StartFacts<'c> {
+        StartFacts {
+            saves: ctx.saves,
+            session: ctx.session,
+            version: VERSION,
+            hosting,
+            notice: None,
+        }
+    }
 }
 
 impl Screen for StartRoot {
     fn update(&mut self, intents: &[Intent], ctx: &mut super::Ctx) -> Command {
-        let facts = StartFacts {
-            saves: ctx.saves,
-            session: ctx.session,
-            version: VERSION,
-            hosting: self.hosting,
-            notice: None,
-        };
+        let facts = Self::facts(self.hosting, ctx);
         match self.inner.update(intents, &facts) {
             Some(action) => Command::Effect(action.into()),
             None => Command::Stay,
@@ -271,14 +288,7 @@ impl Screen for StartRoot {
     }
 
     fn draw(&self, ctx: &super::Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {
-        let facts = StartFacts {
-            saves: ctx.saves,
-            session: ctx.session,
-            version: VERSION,
-            hosting: self.hosting,
-            notice: None,
-        };
-        let model = self.inner.view(&facts);
+        let model = self.inner.view(&Self::facts(self.hosting, ctx));
         let selected = model.selected;
         let pv = model.into_presented(ctx.settings.menu_scale);
         theme.draw(f, &pv, selected, w, h);
@@ -289,38 +299,14 @@ impl Screen for StartRoot {
 mod tests {
     use super::*;
     use crate::menu::Dir;
-    use crate::save::{SaveMeta, Slot, SlotId};
+    use crate::save::{Slot, SlotId};
     use crate::session::Session;
-
-    fn slot(name: &str, playtime_secs: u64, edit_count: u32) -> Slot {
-        Slot {
-            id: SlotId::new(name).expect("legal slot id"),
-            meta: Ok(SaveMeta {
-                name: name.to_string(),
-                seed: 1,
-                created: 0,
-                last_played: 10,
-                playtime_secs,
-                edit_count,
-            }),
-        }
-    }
-
-    fn facts<'a>(saves: &'a [Slot], session: &'a Session, notice: Option<&'a str>) -> StartFacts<'a> {
-        StartFacts {
-            saves,
-            session,
-            version: VERSION,
-            hosting: false,
-            notice,
-        }
-    }
 
     #[test]
     fn fallback_model_contains_the_core_actions() {
         let session = Session::default();
-        let saves = [slot("alpha", 90, 3)];
-        let f = facts(&saves, &session, None);
+        let saves = [Slot::for_test("alpha", 90, 3)];
+        let f = StartFacts::test(&saves, &session, None);
         let screen = fallback(&f);
         let model = screen.view(&f);
         assert_eq!(
@@ -343,7 +329,7 @@ mod tests {
     #[test]
     fn fallback_load_without_saves_is_present_but_inert() {
         let session = Session::default();
-        let f = facts(&[], &session, None);
+        let f = StartFacts::test(&[], &session, None);
         let mut screen = fallback(&f);
         let model = screen.view(&f);
         assert_eq!(
@@ -372,8 +358,8 @@ mod tests {
     #[test]
     fn fallback_picks_map_to_start_actions() {
         let session = Session::default();
-        let saves = [slot("alpha", 0, 0)];
-        let f = facts(&saves, &session, Some("could not join: x"));
+        let saves = [Slot::for_test("alpha", 0, 0)];
+        let f = StartFacts::test(&saves, &session, Some("could not join: x"));
         let mut screen = fallback(&f);
         let model = screen.view(&f);
         assert_eq!(

@@ -37,7 +37,7 @@ use crate::math::block_coord;
 
 use crate::block::registry::BlockRegistry;
 use crate::net::hooks;
-pub use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
+pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
@@ -341,7 +341,7 @@ fn outside_world(pos: DVec3) -> bool {
 
 /// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
 /// existing clients finish on their own.
-pub struct ServerHandle {
+pub(crate) struct ServerHandle {
     shutdown: Arc<AtomicBool>,
     addr: SocketAddr,
     /// The runtime hosting quinn, held so it outlives the handle. The accept loop
@@ -389,7 +389,7 @@ impl ServerHandle {
 }
 
 /// Bind to port 0 to let the OS pick a free port.
-pub fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
+pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let rt = Arc::new(Runtime::new()?);
     let endpoint = {
         // Must run inside the runtime: construction spawns quinn's UDP driver.
@@ -528,126 +528,17 @@ fn handle_client(
     ctx: Arc<Ctx>,
     slot: HandshakeSlot,
 ) -> io::Result<()> {
-    // The scratch Vec is reused for every frame this client ever sends.
-    let conn = rt.block_on(async { incoming.await }).map_err(io::Error::other)?;
-    let addr = conn.remote_address();
-    let (mut send, mut recv) = rt
-        .block_on(async { tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()).await })
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))?
-        .map_err(io::Error::other)?;
-
-    let mut frame = Vec::new();
-    rt.block_on(async {
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, protocol::read_frame_async(&mut recv, &mut frame)).await
-    })
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
-
-    let name = match ClientMessage::decode(&frame) {
-        Some(ClientMessage::Hello { protocol, fingerprint, name, password }) => {
-            if protocol != PROTOCOL_VERSION {
-                reject(&rt, &mut send, &conn, "protocol version mismatch");
-                return Ok(());
-            }
-            if fingerprint != ctx.fingerprint {
-                // Same protocol, different generated content: a join would
-                // silently build a DIFFERENT world from the shared seed.
-                reject(&rt, &mut send, &conn, "world content mismatch (different game/content versions)");
-                return Ok(());
-            }
-            if *password != *ctx.password {
-                reject(&rt, &mut send, &conn, "wrong password");
-                return Ok(());
-            }
-            clean_name(&name)
-        }
-        _ => {
-            reject(&rt, &mut send, &conn, "expected hello");
-            return Ok(());
-        }
+    let Some((conn, mut send, mut recv, mut frame, name, addr)) =
+        handshake(incoming, &rt, &ctx, slot)?
+    else {
+        return Ok(());
     };
-    // Pre-auth window is over; the roster's own MAX_PLAYERS bound takes over.
-    drop(slot);
-
-    // Made before the lock, and the writer spawned only after a slot is
-    // secured, so the still-owned `send` handles a "server full" reject
-    // directly and reliably.
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-    let kick = Arc::new(Notify::new());
-
-    // One locked scope so the id, spawn, and roster snapshot are consistent.
-    let id;
-    let spawn;
-    let world_day;
-    let existing: Vec<(u32, Arc<str>)>;
-    let snapshot: Vec<(i32, i32, i32, u32, Arc<str>)>;
-    {
-        let mut state = shared.lock_recover();
-        world_day = state.day_now(ctx.day_secs);
-        if state.players.len() >= MAX_PLAYERS {
-            drop(state);
-            reject(&rt, &mut send, &conn, "server full");
-            return Ok(());
-        }
-        id = state.next_id;
-        state.next_id += 1;
-        spawn = spawn_point(ctx.generator.as_ref(), id);
-
-        // Roster only — poses flow through the visibility machinery once the
-        // joiner reports their first move, so a far peer isn't a frozen ghost.
-        existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
-        // The pooled `Arc<str>` spec goes straight onto the wire message: a
-        // built-up world's join snapshot clones refcounts, not strings.
-        snapshot = state
-            .edits
-            .iter()
-            .map(|(&(x, y, z), cell)| (x, y, z, cell.rev, cell.spec.clone()))
-            .collect();
-
-        state.players.insert(
-            id,
-            PlayerHandle {
-                name: name.clone(),
-                pos: spawn,
-                yaw: 0.0,
-                pitch: 0.0,
-                stance: Stance::Standing,
-                last_move: Instant::now(),
-                visible: HashSet::new(),
-                out: out.clone(),
-                kick: kick.clone(),
-                ready: false,
-                backlog: Vec::new(),
-            },
-        );
-        // Same lock hold as the roster insert, so the grid never lags the roster.
-        state.grid_insert(id, spawn);
-    }
-    if let Some(hooks) = ctx.hooks.as_ref() {
-        hooks.lock_recover().on_join(&JoinFacts {
-            player: id,
-            name: name.clone(),
-            x: block_coord(spawn.x),
-            y: block_coord(spawn.y),
-            z: block_coord(spawn.z),
-        });
-    }
-
-    // A write error ends the writer; the connection close at cleanup unblocks
-    // one stuck on a slow client's flow-control window. QUIC has no user
-    // flush — quinn transmits.
-    let writer_rt = rt.clone();
-    let writer = thread::spawn(move || {
-        while let Ok(frame) = rx.recv() {
-            if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
-                return;
-            }
-            while let Ok(frame) = rx.try_recv() {
-                if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
-                    return;
-                }
-            }
-        }
-    });
+    let Some((id, spawn, world_day, existing, snapshot, out, rx, kick)) =
+        admit_player(&shared, &ctx, &rt, &mut send, &conn, &name)
+    else {
+        return Ok(());
+    };
+    let writer = spawn_writer(rt.clone(), send, rx);
     println!("[+] {name} joined as #{id} from {addr} ({} online)", online(&shared));
 
     // These sends BLOCK (we're on this client's own handler thread): a built-up
@@ -694,6 +585,173 @@ fn handle_client(
 
     broadcast_all(&shared, &ServerMessage::PeerJoined { id, name: name.clone() }, Some(id));
 
+    client_loop(&rt, &mut recv, &mut frame, &kick, &shared, &ctx, id);
+    depart(&shared, &ctx, conn, out, writer, id, &name);
+    Ok(())
+}
+
+fn handshake(
+    incoming: Incoming,
+    rt: &Runtime,
+    ctx: &Ctx,
+    slot: HandshakeSlot,
+) -> io::Result<Option<(quinn::Connection, SendStream, quinn::RecvStream, Vec<u8>, Arc<str>, SocketAddr)>> {
+    // The scratch Vec is reused for every frame this client ever sends.
+    let conn = rt.block_on(async { incoming.await }).map_err(io::Error::other)?;
+    let addr = conn.remote_address();
+    let (mut send, mut recv) = rt
+        .block_on(async { tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()).await })
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))?
+        .map_err(io::Error::other)?;
+
+    let mut frame = Vec::new();
+    rt.block_on(async {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, protocol::read_frame_async(&mut recv, &mut frame)).await
+    })
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
+
+    let name = match ClientMessage::decode(&frame) {
+        Some(ClientMessage::Hello { protocol, fingerprint, name, password }) => {
+            if protocol != PROTOCOL_VERSION {
+                reject(rt, &mut send, &conn, "protocol version mismatch");
+                return Ok(None);
+            }
+            if fingerprint != ctx.fingerprint {
+                // Same protocol, different generated content: a join would
+                // silently build a DIFFERENT world from the shared seed.
+                reject(rt, &mut send, &conn, "world content mismatch (different game/content versions)");
+                return Ok(None);
+            }
+            if *password != *ctx.password {
+                reject(rt, &mut send, &conn, "wrong password");
+                return Ok(None);
+            }
+            clean_name(&name)
+        }
+        _ => {
+            reject(rt, &mut send, &conn, "expected hello");
+            return Ok(None);
+        }
+    };
+    // Pre-auth window is over; the roster's own MAX_PLAYERS bound takes over.
+    drop(slot);
+    Ok(Some((conn, send, recv, frame, name, addr)))
+}
+
+fn admit_player(
+    shared: &Arc<Mutex<State>>,
+    ctx: &Ctx,
+    rt: &Runtime,
+    send: &mut SendStream,
+    conn: &quinn::Connection,
+    name: &Arc<str>,
+) -> Option<(
+    u32,
+    DVec3,
+    f32,
+    Vec<(u32, Arc<str>)>,
+    Vec<(i32, i32, i32, u32, Arc<str>)>,
+    SyncSender<Arc<[u8]>>,
+    std::sync::mpsc::Receiver<Arc<[u8]>>,
+    Arc<Notify>,
+)> {
+    // Made before the lock, and the writer spawned only after a slot is
+    // secured, so the still-owned `send` handles a "server full" reject
+    // directly and reliably.
+    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+    let kick = Arc::new(Notify::new());
+
+    // One locked scope so the id, spawn, and roster snapshot are consistent.
+    let id;
+    let spawn;
+    let world_day;
+    let existing: Vec<(u32, Arc<str>)>;
+    let snapshot: Vec<(i32, i32, i32, u32, Arc<str>)>;
+    {
+        let mut state = shared.lock_recover();
+        world_day = state.day_now(ctx.day_secs);
+        if state.players.len() >= MAX_PLAYERS {
+            drop(state);
+            reject(rt, send, conn, "server full");
+            return None;
+        }
+        id = state.next_id;
+        state.next_id += 1;
+        spawn = spawn_point(ctx.generator.as_ref(), id);
+
+        // Roster only — poses flow through the visibility machinery once the
+        // joiner reports their first move, so a far peer isn't a frozen ghost.
+        existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
+        // The pooled `Arc<str>` spec goes straight onto the wire message: a
+        // built-up world's join snapshot clones refcounts, not strings.
+        snapshot = state
+            .edits
+            .iter()
+            .map(|(&(x, y, z), cell)| (x, y, z, cell.rev, cell.spec.clone()))
+            .collect();
+
+        state.players.insert(
+            id,
+            PlayerHandle {
+                name: name.clone(),
+                pos: spawn,
+                yaw: 0.0,
+                pitch: 0.0,
+                stance: Stance::Standing,
+                last_move: Instant::now(),
+                visible: HashSet::new(),
+                out: out.clone(),
+                kick: kick.clone(),
+                ready: false,
+                backlog: Vec::new(),
+            },
+        );
+        // Same lock hold as the roster insert, so the grid never lags the roster.
+        state.grid_insert(id, spawn);
+    }
+    if let Some(hooks) = ctx.hooks.as_ref() {
+        hooks.lock_recover().on_join(&JoinFacts {
+            player: id,
+            name: name.clone(),
+            x: block_coord(spawn.x),
+            y: block_coord(spawn.y),
+            z: block_coord(spawn.z),
+        });
+    }
+    Some((id, spawn, world_day, existing, snapshot, out, rx, kick))
+}
+
+fn spawn_writer(
+    writer_rt: Arc<Runtime>,
+    mut send: SendStream,
+    rx: std::sync::mpsc::Receiver<Arc<[u8]>>,
+) -> thread::JoinHandle<()> {
+    // A write error ends the writer; the connection close at cleanup unblocks
+    // one stuck on a slow client's flow-control window. QUIC has no user
+    // flush — quinn transmits.
+    thread::spawn(move || {
+        while let Ok(frame) = rx.recv() {
+            if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+                return;
+            }
+            while let Ok(frame) = rx.try_recv() {
+                if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+fn client_loop(
+    rt: &Runtime,
+    recv: &mut quinn::RecvStream,
+    frame: &mut Vec<u8>,
+    kick: &Notify,
+    shared: &Arc<Mutex<State>>,
+    ctx: &Ctx,
+    id: u32,
+) {
     // Voice carries a second, tighter per-second budget of its own: it is far
     // chattier than any other message and must not eat a peer's general budget.
     let mut rate = RateWindow::new(RATE_LIMIT);
@@ -704,7 +762,7 @@ fn handle_client(
         // no partial frame desyncs a live stream.
         let read = rt.block_on(async {
             tokio::select! {
-                r = protocol::read_frame_async(&mut recv, &mut frame) => Some(r),
+                r = protocol::read_frame_async(recv, frame) => Some(r),
                 _ = kick.notified() => None,
             }
         });
@@ -718,31 +776,31 @@ fn handle_client(
             continue; // Over budget this second — drop the frame rather than serve a flood.
         }
 
-        let Some(msg) = ClientMessage::decode(&frame) else {
+        let Some(msg) = ClientMessage::decode(frame) else {
             continue;
         };
         match msg {
             ClientMessage::Move { pos, yaw, pitch, stance } => {
-                on_move(&shared, id, pos, yaw, pitch, stance)
+                on_move(shared, id, pos, yaw, pitch, stance)
             }
-            ClientMessage::Teleport { pos } => on_teleport(&shared, &ctx, id, pos),
+            ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
-                on_edit(&shared, ctx.hooks.as_ref(), id, req, x, y, z, expect, &spec)
+                on_edit(shared, ctx.hooks.as_ref(), id, req, x, y, z, expect, &spec)
             }
             ClientMessage::Chat { channel, text } => {
-                on_chat(&shared, ctx.hooks.as_ref(), id, channel, &text)
+                on_chat(shared, ctx.hooks.as_ref(), id, channel, &text)
             }
-            ClientMessage::SetTime { day } => on_set_time(&shared, &ctx, day),
+            ClientMessage::SetTime { day } => on_set_time(shared, ctx, day),
             ClientMessage::Voice { seq, payload } => {
                 if !voice_rate.allow(now) {
                     continue; // Over the voice budget this second — drop silently.
                 }
-                on_voice(&shared, id, seq, payload);
+                on_voice(shared, id, seq, payload);
             }
             // Clients ignore swings for unknown peers, so broadcast to
             // everyone-but-sender is safe.
             ClientMessage::Swing => {
-                broadcast_all(&shared, &ServerMessage::PeerSwing { id }, Some(id))
+                broadcast_all(shared, &ServerMessage::PeerSwing { id }, Some(id))
             }
             ClientMessage::Ping { nonce } => {
                 let state = shared.lock_recover();
@@ -755,7 +813,17 @@ fn handle_client(
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
         }
     }
+}
 
+fn depart(
+    shared: &Arc<Mutex<State>>,
+    ctx: &Ctx,
+    conn: quinn::Connection,
+    out: SyncSender<Arc<[u8]>>,
+    writer: thread::JoinHandle<()>,
+    id: u32,
+    name: &Arc<str>,
+) {
     let mut left: Option<JoinFacts> = None;
     {
         let mut state = shared.lock_recover();
@@ -786,9 +854,8 @@ fn handle_client(
     conn.close(0u32.into(), b"bye");
     drop(out);
     let _ = writer.join();
-    broadcast_all(&shared, &ServerMessage::PeerLeft { id }, None);
-    println!("[-] {name} (#{id}) left ({} online)", online(&shared));
-    Ok(())
+    broadcast_all(shared, &ServerMessage::PeerLeft { id }, None);
+    println!("[-] {name} (#{id}) left ({} online)", online(shared));
 }
 
 /// Validation is a plausibility ENVELOPE, not full physics: a move may cover
@@ -1319,6 +1386,22 @@ mod tests {
         })
     }
 
+    fn hello(name: &str, password: &str, protocol: u32, fingerprint: u64) -> ClientMessage {
+        ClientMessage::Hello {
+            protocol,
+            fingerprint,
+            name: name.into(),
+            password: password.into(),
+        }
+    }
+
+    fn reject_reason(addr: SocketAddr, msg: &ClientMessage) -> String {
+        match raw_reply(addr, msg) {
+            ServerMessage::Reject { reason } => reason.to_string(),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
         State {
             edits: HashMap::new(),
@@ -1748,18 +1831,16 @@ mod tests {
     #[test]
     fn mismatched_content_fingerprint_is_rejected() {
         let handle = spawn(0, Config { password: String::new(), seed: 3, ..Config::default() }).unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint() ^ 1,
-            name: "drifted".into(),
-            password: "".into(),
-        };
-        match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Reject { reason } => {
-                assert!(reason.contains("content"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected a content-mismatch rejection, got {other:?}"),
-        }
+        let reason = reject_reason(
+            handle.addr(),
+            &hello(
+                "drifted",
+                "",
+                PROTOCOL_VERSION,
+                crate::net::content_fingerprint() ^ 1,
+            ),
+        );
+        assert!(reason.contains("content"), "unexpected reason: {reason}");
         handle.stop();
     }
 
@@ -1775,18 +1856,16 @@ mod tests {
             },
         )
         .unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
-            name: "classic".into(),
-            password: "".into(),
-        };
-        match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Reject { reason } => {
-                assert!(reason.contains("content"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected a content-mismatch rejection, got {other:?}"),
-        }
+        let reason = reject_reason(
+            handle.addr(),
+            &hello(
+                "classic",
+                "",
+                PROTOCOL_VERSION,
+                crate::net::content_fingerprint(),
+            ),
+        );
+        assert!(reason.contains("content"), "unexpected reason: {reason}");
         handle.stop();
     }
 
@@ -1804,15 +1883,12 @@ mod tests {
             },
         )
         .unwrap();
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint_kind_cfg(
-                WorldgenKind::Diffusion,
-                diffusion,
-            ),
-            name: "guest".into(),
-            password: "".into(),
-        };
+        let hello = hello(
+            "guest",
+            "",
+            PROTOCOL_VERSION,
+            crate::net::content_fingerprint_kind_cfg(WorldgenKind::Diffusion, diffusion),
+        );
         match raw_reply(handle.addr(), &hello) {
             ServerMessage::Welcome {
                 worldgen,
@@ -2176,36 +2252,16 @@ mod tests {
     fn refused_joins_release_the_pre_auth_slot() {
         let handle = spawn(0, Config { password: "pw".into(), seed: 1, ..Config::default() }).unwrap();
         let addr = handle.addr();
-        let bad_pw = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint(),
-            name: "eve".into(),
-            password: "nope".into(),
-        };
-        match raw_reply(addr, &bad_pw) {
-            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("password")),
-            other => panic!("expected password reject, got {other:?}"),
-        }
-        let bad_proto = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION.wrapping_add(1),
-            fingerprint: crate::net::content_fingerprint(),
-            name: "eve".into(),
-            password: "pw".into(),
-        };
-        match raw_reply(addr, &bad_proto) {
-            ServerMessage::Reject { reason } => assert!(reason.to_lowercase().contains("protocol")),
-            other => panic!("expected protocol reject, got {other:?}"),
-        }
-        let bad_fp = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint() ^ 1,
-            name: "eve".into(),
-            password: "pw".into(),
-        };
-        match raw_reply(addr, &bad_fp) {
-            ServerMessage::Reject { reason } => assert!(reason.contains("content")),
-            other => panic!("expected fingerprint reject, got {other:?}"),
-        }
+        let fp = crate::net::content_fingerprint();
+        let reason = reject_reason(addr, &hello("eve", "nope", PROTOCOL_VERSION, fp));
+        assert!(reason.to_lowercase().contains("password"));
+        let reason = reject_reason(
+            addr,
+            &hello("eve", "pw", PROTOCOL_VERSION.wrapping_add(1), fp),
+        );
+        assert!(reason.to_lowercase().contains("protocol"));
+        let reason = reject_reason(addr, &hello("eve", "pw", PROTOCOL_VERSION, fp ^ 1));
+        assert!(reason.contains("content"));
         let deadline = Instant::now() + Duration::from_secs(5);
         while handle.handshake_slots() != 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));

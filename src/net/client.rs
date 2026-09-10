@@ -822,22 +822,7 @@ mod tests {
         }
 
         fn apply(&mut self, msg: ServerMessage) -> Vec<Incoming> {
-            let mut out = Vec::new();
-            apply_server_message(
-                msg,
-                self.spawn,
-                &mut self.peers,
-                &mut self.cell_revs,
-                &mut self.pending_edits,
-                &mut self.pending_teleport,
-                &mut self.ping_sent,
-                &mut self.ping_ms,
-                &mut self.alive,
-                &mut self.disconnect_emitted,
-                &mut out,
-            );
-            coalesce_positions(&mut out);
-            out
+            self.apply_all(std::iter::once(msg))
         }
 
         fn apply_all(&mut self, msgs: impl IntoIterator<Item = ServerMessage>) -> Vec<Incoming> {

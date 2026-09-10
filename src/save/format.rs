@@ -29,17 +29,9 @@
 //!                                        u32 state-len + utf8
 //! ```
 //!
-//! Version 4 files (no worldgen stamp) still decode — the field defaults to
-//! worldgen 1 and the loader WARNS rather than rejects: the seed regenerates
-//! terrain fine, but its materials may have moved under the edits.
-//!
-//! Version 5 files (no kind/knobs) still decode — kind defaults to classic
-//! and the diffusion knobs to their shipped defaults. A v5 diffusion world
-//! cannot exist: InfiniteDiffusion landed with v6.
-//!
-//! Version 6 files (no player stash) still decode — `PlayerState::stash` is
-//! `None`. The bridge then migrates an old Inventory mod-state line into the
-//! core stash.
+//! Older headers still decode: v4 defaults worldgen 1 (warn, do not reject);
+//! v5 defaults kind classic and shipped diffusion knobs; v6 has no stash
+//! (`None`; the bridge may lift an Inventory mod-state line into the core stash).
 //!
 //! The edit count lives only in the header (no body prefix), and each record is
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix

@@ -621,21 +621,16 @@ impl Mods {
     /// Apply `id=on|off` and `id.state=` lines. Unknown ids and malformed lines
     /// are ignored; missing keys keep the current defaults.
     pub fn apply_choices_text(&mut self, text: &str) {
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let value = value.trim();
+        crate::settings::each_kv_line(text, |key, value| {
             if let Some(id) = key.strip_suffix(".state") {
                 self.apply_choice_state(id.trim(), value);
-                continue;
+                return;
             }
             let Some(on) = crate::settings::parse_toggle(value) else {
-                continue;
+                return;
             };
             self.set_enabled(key, on);
-        }
+        });
     }
 
     fn apply_choice_state(&mut self, id: &str, data: &str) {
@@ -667,10 +662,7 @@ impl Mods {
     }
 
     fn save_choices_to(&self, path: &Path) -> io::Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        crate::save::write_atomic(path, self.choices_text().as_bytes())
+        crate::save::write_atomic_file(path, self.choices_text().as_bytes())
     }
 }
 
@@ -904,12 +896,7 @@ mod tests {
     }
 
     fn temp_choices_path() -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "watt-mods-{}-{}.cfg",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+        crate::save::store::test_temp_path("mods").with_extension("cfg")
     }
 
     #[test]
