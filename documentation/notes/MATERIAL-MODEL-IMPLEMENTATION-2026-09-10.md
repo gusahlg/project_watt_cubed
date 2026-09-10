@@ -38,9 +38,12 @@ pub fn distance(a: Element, b: Element) -> u32; pub fn config_distance(a: &Confi
 ```
 ### 1.1 Kernel v0 (`element_influence`)
 δ_i = a_i − b_i (i32, −255..255 under Clamp). Per-dimension response r_i = g(δ_i) where g is an ODD
-piecewise-linear curve over |δ| given by 9 integer knots `(dist u8, response i16)` in the law (v0 shape:
-repulsive at short range (< 12), attractive at middle range (12..96), fading to 0 by 200 — a
-Lennard-Jones-like profile so elements form families without collapsing onto each other). Then
+piecewise-linear curve over |δ| given by 9 integer knots `(dist u8, response i16)` in the law. v0 shape
+(chosen after a stability scan showed a Lennard-Jones-like profile left no stable families and made
+every material boundary reactive): a DEAD ZONE up to 10 units (near-identical matter is inert, so
+families and drifted variants stay themselves), repulsion 10..24, attraction 24..64, and NOTHING beyond
+64 (very different matter is inert, so a world of well-separated regions is at rest). Reactions happen
+between moderately similar materials and products settle at the 24-unit ring. Then
 Δ = M·r with `M: [[i8; D]; D]` in Q4 (identity plus small couplings: v0 M = I + 0.25·cyclic shift),
 scaled by the event strength (`EventStrengths: [u8; 4]`, Q8), and bounded by `max_step` (v0 = 6 units
 per event). Smoothness: |δ − δ'| ≤ 1 ⇒ |g(δ) − g(δ')| ≤ max knot slope (the lab measures the
