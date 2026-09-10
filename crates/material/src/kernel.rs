@@ -122,16 +122,36 @@ fn apply_axis(law: &Law, b: u8, step: i32) -> u8 {
 /// influence is scaled by the event's strength and bounded per axis by `max_step`, then applied under
 /// the boundary rule (and the quantum, if any). Void on either side changes nothing.
 pub fn interact(law: &Law, origin: &Configuration, target: &Configuration, event: EventKind) -> ReactionResult {
-    let strength = law.events.0[event as usize] as i32;
+    interact_many(law, &[(origin, event)], target)
+}
+
+/// Several origins acting on one target at once (one generation of the scheduler): each origin's mean
+/// influence is scaled by its own event strength, the origins are averaged (so the result does not
+/// depend on their order), then bounded and applied exactly as [`interact`]. Void origins are skipped;
+/// no origins or a void target changes nothing.
+pub fn interact_many(law: &Law, origins: &[(&Configuration, EventKind)], target: &Configuration) -> ReactionResult {
     let max_step = law.kernel.max_step as i32;
+    let live: Vec<(&Configuration, i32)> = origins
+        .iter()
+        .filter(|(o, _)| !o.is_void())
+        .map(|(o, e)| (*o, law.events.0[*e as usize] as i32))
+        .collect();
     let mut out = Vec::with_capacity(target.len());
     let mut magnitude = 0u32;
     let mut changed = false;
     for b in target.elements() {
         let mut nb = *b;
-        if let Some(raw) = raw_influence(law, origin, *b) {
+        if !live.is_empty() {
+            let mut acc = [0i32; D];
+            for (origin, strength) in &live {
+                if let Some(raw) = raw_influence(law, origin, *b) {
+                    for i in 0..D {
+                        acc[i] = acc[i].wrapping_add(raw[i] * strength / 256);
+                    }
+                }
+            }
             for i in 0..D {
-                let step = (raw[i] * strength / 256).clamp(-max_step, max_step);
+                let step = (acc[i] / live.len() as i32).clamp(-max_step, max_step);
                 let v = apply_axis(law, b.0[i], step);
                 magnitude += (v as i32 - b.0[i] as i32).unsigned_abs();
                 if v != b.0[i] {

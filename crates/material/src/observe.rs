@@ -35,6 +35,8 @@ pub struct Observation {
     pub hardness: u8,
     /// The friction response.
     pub friction: u8,
+    /// The raw flow response (buoyancy strength for liquids).
+    pub flow: u8,
     /// Sound class.
     pub acoustic: Acoustic,
 }
@@ -48,13 +50,14 @@ impl Observation {
         emission: 0,
         hardness: 0,
         friction: 0,
+        flow: 0,
         acoustic: Acoustic::Void,
     };
 }
 
-/// Largest plausible per-element response magnitude for the scale mapping (sum over axes of the
-/// largest knot response after mixing); responses beyond it saturate at 255.
-const RESPONSE_FULL: i32 = 64;
+/// Per-element response magnitude that reads as 255 (the sum over axes of the largest knot response
+/// after mixing is ~16 under law v0's band-limited curve); larger responses saturate.
+const RESPONSE_FULL: i32 = 16;
 
 /// Mean per-element response magnitude of `c` to `probe`, 0..255. Void → 0.
 pub(crate) fn response(law: &Law, c: &Configuration, probe: Element) -> u8 {
@@ -114,6 +117,7 @@ pub fn observe(law: &Law, c: &Configuration) -> Observation {
         emission,
         hardness,
         friction,
+        flow,
         acoustic,
     }
 }
