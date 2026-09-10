@@ -422,6 +422,15 @@ pub struct StressOutcome {
     pub drop_stale_per_frame_p95: f32,
     pub remesh_async_calls: u64,
     pub drop_stale_uploads: u64,
+    /// Worker mesh jobs that wrote into the staging ring vs the Vec fallback.
+    pub mesh_staged: u64,
+    pub mesh_fallback: u64,
+    pub mesh_ring_full: u64,
+    pub section_staged: u64,
+    pub section_fallback: u64,
+    pub section_ring_full: u64,
+    /// Peak per-frame chunk+section upload vertex bytes (drain).
+    pub max_drain_upload_bytes: usize,
 }
 
 /// One second of post-stop streaming (the light-drain counters).
@@ -472,6 +481,13 @@ struct StressRun {
     mesh_jobs_before_fixpoint_n: u64,
     remesh_async_calls: u64,
     drop_stale_uploads: u64,
+    mesh_staged: u64,
+    mesh_fallback: u64,
+    mesh_ring_full: u64,
+    section_staged: u64,
+    section_fallback: u64,
+    section_ring_full: u64,
+    max_drain_upload_bytes: usize,
 }
 
 impl StressRun {
@@ -508,6 +524,13 @@ impl StressRun {
             mesh_jobs_before_fixpoint_n: 0,
             remesh_async_calls: 0,
             drop_stale_uploads: 0,
+            mesh_staged: 0,
+            mesh_fallback: 0,
+            mesh_ring_full: 0,
+            section_staged: 0,
+            section_fallback: 0,
+            section_ring_full: 0,
+            max_drain_upload_bytes: 0,
         }
     }
 
@@ -559,6 +582,13 @@ impl StressRun {
             drop_stale_per_frame_p95: drop_p95,
             remesh_async_calls: self.remesh_async_calls,
             drop_stale_uploads: self.drop_stale_uploads,
+            mesh_staged: self.mesh_staged,
+            mesh_fallback: self.mesh_fallback,
+            mesh_ring_full: self.mesh_ring_full,
+            section_staged: self.section_staged,
+            section_fallback: self.section_fallback,
+            section_ring_full: self.section_ring_full,
+            max_drain_upload_bytes: self.max_drain_upload_bytes,
         }
     }
 }
@@ -868,6 +898,13 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
             run.mesh_jobs_before_fixpoint_n = gauges.mesh_jobs_before_fixpoint_n;
             run.remesh_async_calls = gauges.remesh_async_calls;
             run.drop_stale_uploads = gauges.drop_stale_uploads;
+            run.mesh_staged = gauges.mesh_staged;
+            run.mesh_fallback = gauges.mesh_fallback;
+            run.mesh_ring_full = gauges.mesh_ring_full;
+            run.section_staged = gauges.section_staged;
+            run.section_fallback = gauges.section_fallback;
+            run.section_ring_full = gauges.section_ring_full;
+            run.max_drain_upload_bytes = run.max_drain_upload_bytes.max(gauges.drain_upload_bytes);
             let finished = match run.stopped {
                 None => {
                     run.flight_ms.push(ms);
