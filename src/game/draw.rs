@@ -8,7 +8,7 @@ use crate::avatar::Pose;
 use crate::camera::ViewPose;
 use crate::console;
 use crate::derived::Memo;
-use crate::harness::DebugView;
+use super::{DebugView, SKY_KEY, TERRAIN_KEY};
 use crate::interact;
 use crate::mods::Mods;
 use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility};
@@ -229,8 +229,8 @@ impl Game {
             // Pure-magenta endpoints (255/0) decode identically under sRGB and raw
             // normalize, so the sky-hole detector's HDR key value is unchanged.
             DebugView::TerrainKey => (
-                crate::harness::SKY_KEY.to_linear(),
-                Some(crate::harness::TERRAIN_KEY),
+                SKY_KEY.to_linear(),
+                Some(TERRAIN_KEY),
             ),
         };
 

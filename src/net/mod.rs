@@ -13,9 +13,9 @@
 //! length-capped, joins are password-gated, and every edit and move is validated
 //! and rate-limited server-side ([`server`]). Communities add extra rules through
 //! the [`hooks`] seam (`ServerMod`) without changing the wire.
-pub mod client;
-pub mod hooks;
-pub mod protocol;
+pub(crate) mod client;
+pub(crate) mod hooks;
+pub(crate) mod protocol;
 
 // Deny a bare `.unwrap()` on production paths; server.rs's `lock_recover()`
 // is the one sanctioned recovery point. The tests module carries its own
@@ -139,24 +139,24 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub(crate) const PROTOCOL_VERSION: u32 = 9;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
 /// Hard cap on a single wire frame (bytes). A frame claiming more is rejected
 /// before a byte of its body is read, so a hostile peer can't force a huge alloc.
-pub const MAX_FRAME: usize = 64 * 1024;
+pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
-pub const MAX_NAME: usize = 24;
-pub const MAX_CHAT: usize = 256;
-pub const MAX_SPEC: usize = 256;
+pub(crate) const MAX_NAME: usize = 24;
+pub(crate) const MAX_CHAT: usize = 256;
+pub(crate) const MAX_SPEC: usize = 256;
 
 /// Largest accepted voice payload (bytes): one 20 ms opus frame at up to
 /// ~64 kbps with margin. `net` owns its own copy of the cap rather than
 /// depending on the `audio` crate: the two modules fan out in parallel and net
 /// must compile without it. The codec rejects any inbound voice frame past this
 /// cap, and callers guard outbound.
-pub const MAX_VOICE_PAYLOAD: usize = 400;
+pub(crate) const MAX_VOICE_PAYLOAD: usize = 400;
 
 /// A stable 64-bit digest of everything that determines what a seed GENERATES:
 /// the worldgen version, the element table, and the full compiled placement
@@ -169,15 +169,15 @@ pub const MAX_VOICE_PAYLOAD: usize = 400;
 /// Uses FNV hash (not the std hasher) so the value is identical across
 /// platforms, architectures, and Rust releases. The placement compile is
 /// seed-invariant, so one fingerprint speaks for every world a build can generate.
-pub fn content_fingerprint() -> u64 {
+pub(crate) fn content_fingerprint() -> u64 {
     content_fingerprint_kind(crate::world::generation::WorldgenKind::Classic)
 }
 
-pub fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
+pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
     content_fingerprint_kind_cfg(kind, crate::world::diffusion::DiffusionCfg::default())
 }
 
-pub fn content_fingerprint_kind_cfg(
+pub(crate) fn content_fingerprint_kind_cfg(
     kind: crate::world::generation::WorldgenKind,
     cfg: crate::world::diffusion::DiffusionCfg,
 ) -> u64 {
@@ -188,7 +188,7 @@ pub fn content_fingerprint_kind_cfg(
 
 /// The fingerprint of an already-compiled registry — the server hashes the
 /// one it built for spawn heights instead of compiling twice.
-pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
+pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -240,18 +240,9 @@ pub fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     hash
 }
 
-/// Same as [`fingerprint_of`], plus a worldgen kind so diffusion clients cannot
-/// join a classic server (or the reverse) and silently desync terrain.
-pub fn fingerprint_kind(
-    registry: &crate::block::BlockRegistry,
-    kind: crate::world::generation::WorldgenKind,
-) -> u64 {
-    fingerprint_kind_cfg(registry, kind, crate::world::diffusion::DiffusionCfg::default())
-}
-
-/// Same as [`fingerprint_kind`], plus diffusion knobs so two diffusion worlds
-/// with different tile/stride/phases/relief cannot silently desync.
-pub fn fingerprint_kind_cfg(
+/// Same as [`fingerprint_of`], plus worldgen kind and diffusion knobs so two
+/// worlds that would generate different terrain cannot silently desync.
+pub(crate) fn fingerprint_kind_cfg(
     registry: &crate::block::BlockRegistry,
     kind: crate::world::generation::WorldgenKind,
     cfg: crate::world::diffusion::DiffusionCfg,
@@ -301,7 +292,7 @@ mod fingerprint_tests {
 }
 
 /// Chat channels. Local is proximity-limited; global reaches everyone.
-pub mod chat {
+pub(crate) mod chat {
     pub const LOCAL: u8 = 0;
     pub const GLOBAL: u8 = 1;
     /// How far local (proximity) chat carries.

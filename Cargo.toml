@@ -20,6 +20,7 @@ required-features = ["dev-tools"]
 # types (glam Vec2/Vec3) and Color the game uses
 voxel_engine = { version = "0.2.1", path = "../voxel-engine" }
 infinite-field = { version = "0.1.0", path = "crates/infinite-field" }
+material = { version = "0.1.0", path = "crates/material" }
 
 # Benchmark metadata probes Vulkan directly so reports identify the actual
 # renderer-compatible GPU and driver without shelling out to optional tools.

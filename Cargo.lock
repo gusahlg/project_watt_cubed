@@ -1147,6 +1147,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "material"
+version = "0.1.0"
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1787,6 +1791,7 @@ dependencies = [
  "glam 0.32.1",
  "infinite-field",
  "kira",
+ "material",
  "opus-rs",
  "quinn",
  "rcgen",
@@ -2704,8 +2709,13 @@ dependencies = [
  "log",
  "png",
  "raw-window-handle",
+ "voxel_slang_build",
  "winit",
 ]
+
+[[package]]
+name = "voxel_slang_build"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"

@@ -13,7 +13,6 @@ pub mod palette;
 mod weather;
 
 pub use atmosphere::Atmosphere;
-pub use palette::{Anchor, Palette, Role};
 pub use clock::{DayLength, SkyClock, SkyFrame};
 pub use weather::{Precip, Weather};
 

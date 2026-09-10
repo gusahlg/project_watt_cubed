@@ -98,6 +98,29 @@ impl ViewPose {
     }
 }
 
+/// Scripted camera pose (position + yaw/pitch). The harness and `Game::teleport`
+/// share this so both go through [`ViewPose::camera3d`].
+#[derive(Clone, Copy, Debug)]
+pub struct CameraPose {
+    pub pos: DVec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl CameraPose {
+    /// Delegates camera derivation to [`ViewPose::camera3d`].
+    pub fn camera(&self, fovy: f32) -> Camera3D {
+        ViewPose {
+            eye: self.pos,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            roll: 0.0,
+            fovy,
+        }
+        .camera3d()
+    }
+}
+
 /// The player-anchored views. Third person is one variant with a `front` flag
 /// rather than two variants: the flag only mirrors the boom and angles, and the
 /// F5-style cycle (first → back → front → first) stays a three-line match.
@@ -349,4 +372,30 @@ fn boom_clamp(world: &World, eye: DVec3, dir: DVec3, max: f64) -> f64 {
         }
     }
     (t_enter - BOOM_MARGIN).clamp(0.0, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_pose_uses_view_pose_path() {
+        let pose = CameraPose {
+            pos: DVec3::new(1.0, 2.0, 3.0),
+            yaw: 0.4,
+            pitch: -0.2,
+        };
+        let a = pose.camera(70.0);
+        let b = ViewPose {
+            eye: pose.pos,
+            yaw: pose.yaw,
+            pitch: pose.pitch,
+            roll: 0.0,
+            fovy: 70.0,
+        }
+        .camera3d();
+        assert_eq!(a.position, b.position);
+        assert_eq!(a.target, b.target);
+        assert_eq!(a.fovy, b.fovy);
+    }
 }

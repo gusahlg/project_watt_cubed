@@ -321,7 +321,15 @@ fn parse_cue(
         .as_table()
         .ok_or_else(|| CatalogError::Manifest(format!("cue `{name}` is not a table")))?;
 
-    let response = parse_response(name, tbl.get("response"))?;
+    // Voice cues are synthesized from live sessions, never authored.
+    let response = parse_choice(name, tbl.get("response"), "response", "world|ui|ambient", |s| {
+        match s {
+            "world" => Some(Response::World),
+            "ui" => Some(Response::Ui),
+            "ambient" => Some(Response::Ambient),
+            _ => None,
+        }
+    })?;
 
     let layers_val = tbl
         .get("layers")
@@ -389,17 +397,21 @@ fn parse_cue(
     })
 }
 
-fn parse_response(cue: &str, val: Option<&toml::Value>) -> Result<Response, CatalogError> {
+fn parse_choice<T>(
+    cue: &str,
+    val: Option<&toml::Value>,
+    field: &str,
+    expected: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, CatalogError> {
     match val.and_then(toml::Value::as_str) {
-        Some("world") => Ok(Response::World),
-        Some("ui") => Ok(Response::Ui),
-        Some("ambient") => Ok(Response::Ambient),
-        // Voice cues are synthesized from live sessions, never authored.
-        Some(other) => Err(CatalogError::Manifest(format!(
-            "cue `{cue}`: unknown response `{other}` (expected world|ui|ambient)"
-        ))),
+        Some(s) => parse(s).ok_or_else(|| {
+            CatalogError::Manifest(format!(
+                "cue `{cue}`: unknown {field} `{s}` (expected {expected})"
+            ))
+        }),
         None => Err(CatalogError::Manifest(format!(
-            "cue `{cue}`: missing string `response`"
+            "cue `{cue}`: missing string `{field}`"
         ))),
     }
 }
@@ -477,7 +489,11 @@ fn parse_layer(
             "cue `{cue}`: `delay` must be within [0, {MAX_DELAY_SECONDS}] seconds"
         )));
     }
-    let mode = parse_mode(cue, tbl.get("mode"))?;
+    let mode = parse_choice(cue, tbl.get("mode"), "mode", "one_shot|loop", |s| match s {
+        "one_shot" => Some(ClipMode::OneShot),
+        "loop" => Some(ClipMode::Loop),
+        _ => None,
+    })?;
 
     Ok((
         Layer {
@@ -489,19 +505,6 @@ fn parse_layer(
         },
         max_variant_s,
     ))
-}
-
-fn parse_mode(cue: &str, val: Option<&toml::Value>) -> Result<ClipMode, CatalogError> {
-    match val.and_then(toml::Value::as_str) {
-        Some("one_shot") => Ok(ClipMode::OneShot),
-        Some("loop") => Ok(ClipMode::Loop),
-        Some(other) => Err(CatalogError::Manifest(format!(
-            "cue `{cue}`: unknown mode `{other}` (expected one_shot|loop)"
-        ))),
-        None => Err(CatalogError::Manifest(format!(
-            "cue `{cue}`: missing string `mode`"
-        ))),
-    }
 }
 
 /// A single-element array is a fixed value; two elements are `[lo, hi]`. Any
@@ -630,6 +633,38 @@ mod tests {
         delay = [0.0]
         mode = "loop"
     "#;
+
+    #[test]
+    fn parse_choice_pins_unknown_and_missing_copy() {
+        match parse_choice::<u8>("break", None, "response", "world|ui|ambient", |_| None) {
+            Err(CatalogError::Manifest(s)) => {
+                assert_eq!(s, "cue `break`: missing string `response`")
+            }
+            other => panic!("expected missing-string Manifest, got {other:?}"),
+        }
+        let val = toml::Value::String("wobble".into());
+        match parse_choice::<u8>(
+            "break",
+            Some(&val),
+            "response",
+            "world|ui|ambient",
+            |_| None,
+        ) {
+            Err(CatalogError::Manifest(s)) => {
+                assert_eq!(
+                    s,
+                    "cue `break`: unknown response `wobble` (expected world|ui|ambient)"
+                )
+            }
+            other => panic!("expected unknown-value Manifest, got {other:?}"),
+        }
+        match parse_choice("x", Some(&toml::Value::String("loop".into())), "mode", "one_shot|loop", |s| {
+            (s == "loop").then_some(ClipMode::Loop)
+        }) {
+            Ok(ClipMode::Loop) => {}
+            other => panic!("expected Loop, got {other:?}"),
+        }
+    }
 
     #[test]
     fn happy_path_parse() {
