@@ -1689,6 +1689,7 @@ mod tests {
                                 has_blocklight: false,
                                 light_reseed: false,
                                 light_gen: 0,
+                                mesh_hash: None,
                             },
                         );
                     }

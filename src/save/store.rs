@@ -68,9 +68,6 @@ fn peek_file(path: &std::path::Path) -> Result<super::slot::SaveMeta, SaveError>
     let f = fs::File::open(path)?;
     let mut v = Vec::with_capacity(format::HEADER_LEN);
     f.take(format::HEADER_LEN as u64).read_to_end(&mut v)?;
-    if v.len() < format::HEADER_LEN {
-        return Err(SaveError::Corrupt("not a save"));
-    }
     format::peek_meta(&v)
 }
 
@@ -431,9 +428,41 @@ mod tests {
 
         fs::write(live_path(&id), &bytes[..format::HEADER_LEN - 1]).unwrap();
         assert!(
-            matches!(peek_file(&live_path(&id)), Err(SaveError::Corrupt("not a save"))),
-            "fewer than HEADER_LEN bytes is not a save"
+            peek_file(&live_path(&id)).is_err(),
+            "a v8 prefix shorter than header_len(8) is not a save"
         );
+        cleanup(&id);
+    }
+
+    /// A v7 document can be 164–205 bytes (header 126 + a tiny body). Peek
+    /// must not demand the v8 header length; `peek_meta` enforces `header_len(7)`.
+    fn v7_bytes(doc: &SaveDoc) -> Vec<u8> {
+        let current = format::encode(doc).unwrap();
+        let mut v7 = Vec::with_capacity(current.len() - material::STAMP_LEN);
+        v7.extend_from_slice(&current[..format::HEADER_LEN_V7]);
+        v7.extend_from_slice(&current[format::HEADER_LEN..]);
+        v7[4..6].copy_from_slice(&7u16.to_le_bytes());
+        v7
+    }
+
+    #[test]
+    fn peek_lists_a_minimal_v7_save() {
+        let id = SlotId::new("__store_peek_v7__").unwrap();
+        cleanup(&id);
+        let bytes = v7_bytes(&doc("v7tiny", 0));
+        assert!(
+            bytes.len() < format::HEADER_LEN,
+            "fixture must be shorter than the v8 header ({})",
+            bytes.len()
+        );
+        assert!(bytes.len() >= format::HEADER_LEN_V7);
+        fs::write(live_path(&id), &bytes).unwrap();
+
+        assert_eq!(peek_file(&live_path(&id)).unwrap().name, "v7tiny");
+        let slots = list();
+        let listed = slots.iter().find(|s| s.id == id).expect("v7 slot listed");
+        assert_eq!(listed.meta.as_ref().unwrap().name, "v7tiny");
+
         cleanup(&id);
     }
 

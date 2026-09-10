@@ -200,6 +200,10 @@ pub struct StreamGauges {
     pub mesh_jobs_before_fixpoint_mean: f32,
     pub mesh_jobs_before_fixpoint_p95: f32,
     pub mesh_jobs_before_fixpoint_n: u64,
+    /// Reaction-event scheduler queue depth at sample time.
+    pub reactions_pending: usize,
+    /// Cumulative reaction mutations committed by the scheduler.
+    pub reactions_mutations: u64,
 }
 
 /// `seed_light` insert attempts by source. Degrade / terminal / neighbour-remesh
@@ -414,6 +418,10 @@ struct Loaded {
     /// (unload then regenerate, same `light_epoch`) cannot publish onto the
     /// new voxels.
     light_gen: u32,
+    /// Content hash of the GPU mesh currently resident (the hash of the last
+    /// uploaded vertex bytes). Compared before a remesh upload so an edit that
+    /// did not change the mesh skips the GPU transfer.
+    mesh_hash: Option<u64>,
 }
 
 /// Keep an in-flight claim counter in step with a boolean flag, without
@@ -433,12 +441,20 @@ impl Loaded {
     /// remesh, world-leave — routes through here, so there's one place to check
     /// for double frees or leaks.
     fn retire(&mut self, next: MeshState, eng: &mut Engine) {
+        let carrying = next.live_meshes().is_some();
         std::mem::replace(&mut self.state, next).free_owned(eng);
+        if !carrying {
+            self.mesh_hash = None;
+        }
     }
     /// Engine-free retire for claim tests that count frees through the hook.
     #[cfg(test)]
     fn retire_logged(&mut self, next: MeshState) {
+        let carrying = next.live_meshes().is_some();
         std::mem::replace(&mut self.state, next).free_logged();
+        if !carrying {
+            self.mesh_hash = None;
+        }
     }
 }
 
@@ -945,15 +961,24 @@ pub struct World {
     /// bounded hole in the world, not an infinite resubmit-panic loop. Every
     /// scan that would re-request the work consults this set.
     quarantined: FastSet<streaming::FailKey>,
-    /// Block count last processed by [`Self::refresh_textures`].
+    /// Descriptor count last processed by [`Self::refresh_textures`].
     textures_built: usize,
     /// Built texture layers by id, kept so palette growth (crafting registers
     /// one block at a time) appends new layers instead of regenerating all.
+    /// Cleared when the appearance `revision` (or GPU-descriptor flag) changes.
     texture_cache: Vec<Vec<u8>>,
     /// Layers last sent to the GPU (`set` on first upload, `append` after).
-    /// Existing layers never change: a layer is a pure function of composition
-    /// and ids are append-only, so growth never re-sends the prefix.
+    /// Existing layers never change: a layer is a pure function of the visual
+    /// at one revision, and ids are append-only, so growth never re-sends the
+    /// prefix unless the appearance revision moved.
     uploaded_len: usize,
+    /// Appearance revision last used to fill [`Self::texture_cache`].
+    appearance_revision: u32,
+    /// Whether the last fill uploaded GPU material descriptors.
+    appearance_gpu: bool,
+    /// True after a `set_material_descs` of procedural entries; cleared by
+    /// uploading an empty table so the engine returns to ARRAY_LAYER.
+    gpu_descs_uploaded: bool,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
     /// so the meshers wrap vertex layers past it. Construction uses `u16::MAX`
     /// (identity wrap); the first engine contact overwrites it once.
@@ -1136,6 +1161,12 @@ pub struct World {
     /// freshly minted token from the lane's `submit` to its `claim`.
     section_claim_seq: u64,
     section_pending_claim: Option<(SectionPos, pipeline::ClaimToken)>,
+    /// Gameplay reaction events. Ticked by the sim `reactions` system when this
+    /// instance is the authority (single-player or the dedicated server).
+    reactions: crate::sim::reactions::ReactionScheduler,
+    /// Single-player (and a hosting server) run the scheduler; a client connected
+    /// to a server does not.
+    reactions_authority: bool,
 }
 
 /// The exact inputs the desired-section frontier depends on, as cheap bit
@@ -1267,6 +1298,9 @@ impl World {
             textures_built: 0,
             texture_cache: Vec::new(),
             uploaded_len: 0,
+            appearance_revision: 0,
+            appearance_gpu: false,
+            gpu_descs_uploaded: false,
             texture_layer_cap: u16::MAX,
             texture_cap_from_device: false,
             ao: true,
@@ -1318,6 +1352,8 @@ impl World {
             section_epoch: 0,
             section_claim_seq: 0,
             section_pending_claim: None,
+            reactions: crate::sim::reactions::ReactionScheduler::new(),
+            reactions_authority: true,
         };
         if pregenerate_origin {
             // Centre the pre-generated box on the origin's surface chunk, the

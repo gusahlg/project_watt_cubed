@@ -795,6 +795,8 @@ struct StreamPeaks {
     max_section_ready: usize,
     slot_ceiling: usize,
     max_section_upload_bytes: usize,
+    max_reactions_pending: usize,
+    max_reactions_mutations: u64,
 }
 
 impl Default for StreamPeaks {
@@ -817,6 +819,8 @@ impl Default for StreamPeaks {
             max_section_ready: 0,
             slot_ceiling: 0,
             max_section_upload_bytes: 0,
+            max_reactions_pending: 0,
+            max_reactions_mutations: 0,
         }
     }
 }
@@ -842,6 +846,8 @@ impl StreamPeaks {
         self.max_section_ready = self.max_section_ready.max(g.section_ready);
         self.slot_ceiling = self.slot_ceiling.max(g.slot_ceiling);
         self.max_section_upload_bytes = self.max_section_upload_bytes.max(g.section_upload_bytes);
+        self.max_reactions_pending = self.max_reactions_pending.max(g.reactions_pending);
+        self.max_reactions_mutations = self.max_reactions_mutations.max(g.reactions_mutations);
     }
 
     fn to_json(self) -> Json {
@@ -870,6 +876,8 @@ impl StreamPeaks {
             ("section_ready", Json::from(self.max_section_ready)),
             ("slot_ceiling", Json::from(self.slot_ceiling)),
             ("section_upload_bytes", Json::from(self.max_section_upload_bytes)),
+            ("reactions.pending", Json::from(self.max_reactions_pending)),
+            ("reactions.mutations", Json::from(self.max_reactions_mutations)),
         ])
     }
 }
@@ -946,6 +954,8 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
             Json::from(g.mesh_jobs_before_fixpoint_n),
         ),
         ("section_upload_bytes", Json::from(g.section_upload_bytes)),
+        ("reactions.pending", Json::from(g.reactions_pending)),
+        ("reactions.mutations", Json::from(g.reactions_mutations)),
     ])
 }
 

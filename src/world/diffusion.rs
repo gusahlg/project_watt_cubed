@@ -677,12 +677,12 @@ mod tests {
         );
         // surface, lake column, cave band, deep, two far coords.
         let pins: [(&str, i32, i32, i32, u32); 6] = [
-            ("surface", 0, 1, 0, 0x3cea1883),
-            ("lake", -22, 1, -24, 0x593efb54),
-            ("cave", -24, -3, -24, 0xabfed64c),
+            ("surface", 0, 1, 0, 0x9b39f240),
+            ("lake", -22, 1, -24, 0x1b5636d6),
+            ("cave", -24, -3, -24, 0x24dfb131),
             ("deep", 0, -20, 0, 0x24ae7d4e),
-            ("far_a", 6_250_000, 0, 0, 0xd5f6e126),
-            ("far_b", -6_250_000, -2, 3, 0xf8789bae),
+            ("far_a", 6_250_000, 0, 0, 0x7f5a5a13),
+            ("far_b", -6_250_000, -2, 3, 0x9f993f6c),
         ];
         for (name, cx, cy, cz, want) in pins {
             assert_eq!(

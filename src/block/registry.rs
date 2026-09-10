@@ -512,6 +512,25 @@ impl BlockRegistry {
         let c = Configuration::decode(&bytes?).ok()?;
         self.intern(&c)
     }
+
+    /// Look up a spec already in the table without interning. `None` if the spec is
+    /// malformed or the configuration has not been interned yet.
+    pub fn lookup_spec(&self, spec: &str) -> Option<BlockId> {
+        if spec == "air" {
+            return Some(AIR);
+        }
+        let hex = spec.strip_prefix("c:")?;
+        if !hex.is_ascii() || hex.len() % 2 != 0 {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
+            .collect();
+        let c = Configuration::decode(&bytes?).ok()?;
+        self.lookup(&c)
+    }
 }
 
 #[cfg(test)]

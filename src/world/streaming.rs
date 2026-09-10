@@ -5,7 +5,12 @@
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{DVec3, Engine, FadeStyle};
+use voxel_engine::{DVec3, Engine, FadeStyle, MaterialDesc};
+
+use crate::block::appearance::{
+    fill_descriptor_layer, placeholder_layer, procedural_material_desc, BlockAppearance,
+    LAYER_BYTES, TEXTURE_SIZE,
+};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
 use crate::derived::Revision;
@@ -463,12 +468,17 @@ impl World {
     /// and a mined block still vanishes the same frame it was clicked.
     /// Steady-state cost is a channel poll and two sticky-flag checks.
     /// `eng` is `None` only in headless tests; GPU work panics without it.
-    pub fn pump(&mut self, mut eng: Option<&mut Engine>, sched: &mut crate::sched::Scheduler) {
+    pub fn pump(
+        &mut self,
+        mut eng: Option<&mut Engine>,
+        sched: &mut crate::sched::Scheduler,
+        appearance: &dyn BlockAppearance,
+    ) {
         self.remesh_stats.drop_stale_this_frame = 0;
         // Palette growth appends new block texture layers before any upload
         // this frame references a new layer.
         if let Some(eng) = eng.as_deref_mut() {
-            self.refresh_textures(eng);
+            self.refresh_textures(eng, appearance);
         }
         // Idle: no claim can produce a `Done`, so skip try_recv and the
         // deadline Instant. Dirty-remesh and lod-clip stay (flag checks).
@@ -495,6 +505,7 @@ impl World {
         center: DVec3,
         mut eng: Option<&mut Engine>,
         sched: &mut crate::sched::Scheduler,
+        appearance: &dyn BlockAppearance,
     ) {
         if let Some(eng) = eng.as_deref() {
             let stats = eng.mesh_stats();
@@ -608,7 +619,7 @@ impl World {
         // boundary-cross frame's results drain against the live centre, not
         // the one they'd be discarded by. `stream_phase` pumps only on frames
         // the topology pass does not run; this is the pump on stream-due frames.
-        self.pump(eng.as_deref_mut(), sched);
+        self.pump(eng.as_deref_mut(), sched, appearance);
         if full_pass {
             self.unload_far(
                 center_chunk,
@@ -1075,11 +1086,40 @@ impl World {
     /// async drain, the sync edit remesh, and the terminal degraded promotion.
     /// `retire` frees whatever the old state carried, exactly once.
     fn upload_chunk(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
+        let hash = mesh::content_hash(data);
+        if self.chunks.get(&coord).is_some_and(|l| l.mesh_hash == Some(hash)) {
+            self.keep_resident_mesh(coord, eng);
+            return;
+        }
         let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             let was = loaded.state.is_building();
             loaded.retire(MeshState::from_upload(handles), eng);
+            loaded.mesh_hash = Some(hash);
+            super::adjust_count(&mut self.building_meshes, was, false);
+            loaded.visible = vis;
+            if !vis && let Some(meshes) = loaded.state.live_meshes() {
+                meshes.set_visible(eng, false);
+            }
+        }
+    }
+
+    /// An edit remesh whose vertex bytes match the resident GPU mesh: keep the
+    /// existing handles and drop the Dirty/NeedsMesh claim, no upload.
+    fn keep_resident_mesh(&mut self, coord: Coord, eng: &mut Engine) {
+        let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
+            let next = match std::mem::replace(&mut loaded.state, MeshState::Air) {
+                MeshState::Ready(m)
+                | MeshState::Dirty { prev: Some(m) }
+                | MeshState::NeedsMesh { prev: Some(m), .. } => MeshState::Ready(m),
+                MeshState::Dirty { prev: None }
+                | MeshState::NeedsMesh { prev: None, .. }
+                | MeshState::Air => MeshState::Air,
+            };
+            loaded.state = next;
             super::adjust_count(&mut self.building_meshes, was, false);
             self.remesh_stats.note_upload(coord);
             loaded.visible = vis;
@@ -1598,6 +1638,7 @@ impl World {
                 has_blocklight: false,
                 light_reseed: false,
                 light_gen,
+                mesh_hash: None,
             },
         );
         // Ceiling-cache lifetime: the column's last layer out drops the entry.
@@ -2831,6 +2872,8 @@ impl World {
             mesh_jobs_before_fixpoint_p95: jf_p95,
             mesh_jobs_before_fixpoint_n: jf_n,
             section_upload_bytes: self.section_upload_bytes,
+            reactions_pending: self.reactions.pending(),
+            reactions_mutations: self.reactions.mutations,
         }
     }
 
@@ -3015,10 +3058,11 @@ impl World {
     }
 
     /// Rebuild/upload block texture array on descriptor growth (rare: world entry
-    /// or a newly interned look). Existing layers never change (pure function of
-    /// the visual; descriptor ids are append-only), so only the first upload uses
-    /// `set_block_textures`; later growth appends.
-    fn refresh_textures(&mut self, eng: &mut Engine) {
+    /// or a newly interned look) or an appearance `revision` change. Existing
+    /// layers never change at one revision (pure function of the visual;
+    /// descriptor ids are append-only), so only the first upload / a revision
+    /// rebuild uses `set_block_textures`; later growth appends.
+    fn refresh_textures(&mut self, eng: &mut Engine, appearance: &dyn BlockAppearance) {
         // Never zero (modulo divisor) and never past the vertex field's u16.
         // Construction caches `u16::MAX`; the device cap is read once.
         if !self.texture_cap_from_device {
@@ -3028,15 +3072,30 @@ impl World {
             crate::alloc_count::note_engine(crate::alloc_count::EngineCall::TexLayers);
         }
         let count = self.registry.descriptor_count();
+        let rev = appearance.revision();
+        let gpu = appearance.wants_gpu_descriptors();
+        if self.appearance_revision != rev || self.appearance_gpu != gpu {
+            self.texture_cache.clear();
+            self.uploaded_len = 0;
+            self.textures_built = 0;
+            self.appearance_revision = rev;
+            self.appearance_gpu = gpu;
+        }
         if self.textures_built == count {
             return;
         }
-        for i in self.texture_cache.len()..count {
-            self.texture_cache
-                .push(crate::block::texture::build_descriptor_texture(
-                    &self.registry,
-                    i as u16,
-                ));
+        if gpu {
+            for i in self.texture_cache.len()..count {
+                let vis = self.registry.descriptor(i as u16);
+                self.texture_cache
+                    .push(placeholder_layer(&vis, i as u16));
+            }
+        } else {
+            for i in self.texture_cache.len()..count {
+                let mut buf = [0u8; LAYER_BYTES];
+                fill_descriptor_layer(appearance, &self.registry, i as u16, &mut buf);
+                self.texture_cache.push(buf.to_vec());
+            }
         }
         let visible = count.min(self.texture_layer_cap as usize);
         if count > visible && self.uploaded_len < visible {
@@ -3045,14 +3104,42 @@ impl World {
                  ({visible}); further textures wrap onto existing layers"
             );
         }
-        match plan_texture_upload(&self.texture_cache, self.uploaded_len, visible) {
+        let texel = if gpu { 1 } else { TEXTURE_SIZE };
+        let upload = plan_texture_upload(&self.texture_cache, self.uploaded_len, visible);
+        let desc_range = match &upload {
+            Some(TextureUpload::Set(_)) => Some((0, visible)),
+            Some(TextureUpload::Append(_)) => Some((self.uploaded_len, visible)),
+            None => None,
+        };
+        let descs: Option<Vec<MaterialDesc>> = if gpu {
+            desc_range.map(|(lo, hi)| {
+                (lo..hi)
+                    .map(|i| procedural_material_desc(&self.registry.descriptor(i as u16)))
+                    .collect()
+            })
+        } else {
+            None
+        };
+        match upload {
             Some(TextureUpload::Set(layers)) => {
-                eng.set_block_textures(crate::block::texture::TEXTURE_SIZE, layers);
+                eng.set_block_textures(texel, layers);
             }
             Some(TextureUpload::Append(layers)) => {
                 eng.append_block_textures(layers);
             }
             None => {}
+        }
+        if let Some(descs) = descs {
+            match desc_range {
+                Some((0, _)) => eng.set_material_descs(&descs),
+                Some(_) => eng.append_material_descs(&descs),
+                None => {}
+            }
+            self.gpu_descs_uploaded = true;
+        } else if self.gpu_descs_uploaded {
+            // Engine default is ARRAY_LAYER per slot; an empty set restores it.
+            eng.set_material_descs(&[]);
+            self.gpu_descs_uploaded = false;
         }
         self.uploaded_len = visible;
         self.textures_built = count;
@@ -3174,6 +3261,15 @@ mod tests {
             "past the layer cap, nothing is re-sent"
         );
         assert_eq!(uploaded_len, 5);
+    }
+
+    #[test]
+    fn revision_rebuild_resets_to_a_set() {
+        let cache = vec![vec![1u8; 4], vec![2; 4], vec![3; 4]];
+        match plan_texture_upload(&cache, 0, cache.len()) {
+            Some(TextureUpload::Set(layers)) => assert_eq!(layers.len(), 3),
+            other => panic!("revision rebuild must set, got {other:?}"),
+        }
     }
 
     #[test]

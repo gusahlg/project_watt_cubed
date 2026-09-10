@@ -75,9 +75,8 @@ const PLAYER_POSE_LEN: usize = 32 + 1;
 const EDIT_BYTES: usize = 14;
 
 /// Sanity caps while reading, so a corrupt length prefix can't balloon memory.
-/// Specs track the block palette cap — a long-played world can legitimately
-/// reference one spec per registered block type.
-const MAX_SPECS: usize = 16_384;
+/// The spec-table count is a u16, so the table can hold every `u16` index.
+const MAX_SPECS: usize = 65_535;
 const MAX_EDITS: u32 = 50_000_000;
 const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
 
@@ -809,6 +808,19 @@ mod tests {
         doc.edits.push(Edit { x: 0, y: 0, z: 0, spec: 7 });
         doc.meta.edit_count = doc.edits.len() as u32;
         assert!(encode(&doc).is_err());
+    }
+
+    #[test]
+    fn twenty_thousand_specs_round_trip() {
+        let mut doc = sample();
+        doc.edits.clear();
+        doc.meta.edit_count = 0;
+        doc.specs = (0..20_000).map(|i| format!("s{i}")).collect();
+        let bytes = encode(&doc).unwrap();
+        let got = expect_intact(decode(&bytes).unwrap());
+        assert_eq!(got.specs.len(), 20_000);
+        assert_eq!(got.specs[0], "s0");
+        assert_eq!(got.specs[19_999], "s19999");
     }
 
     struct XorShift(u64);

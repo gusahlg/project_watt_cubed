@@ -2462,14 +2462,14 @@ mod tests {
         let g = terrain(42);
         // surface, deep, cave, island band, beach, snow crust, two far coords.
         let pins: [(&str, i32, i32, i32, u32); 8] = [
-            ("surface", 0, 1, 0, 0x8efec601),
+            ("surface", 0, 1, 0, 0x9cb960cd),
             ("deep", 0, -20, 0, 0x24ae7d4e),
-            ("cave", 0, -3, 0, 0x5b7a3898),
-            ("island", -1, 9, -4, 0x8f26084d),
-            ("beach", 4, 0, -7, 0x7306ad36),
-            ("crust", 55, 1, -80, 0xd64493e3),
-            ("far_a", 6_250_000, 0, 0, 0xea1eb8c3),
-            ("far_b", -6_250_000, -2, 3, 0xf0001585),
+            ("cave", 0, -3, 0, 0x00247390),
+            ("island", -1, 9, -4, 0xc79ff8ee),
+            ("beach", 4, 0, -7, 0xc55167f9),
+            ("crust", 55, 1, -80, 0x5fecf1c3),
+            ("far_a", 6_250_000, 0, 0, 0x8ebc0e38),
+            ("far_b", -6_250_000, -2, 3, 0x35281b26),
         ];
         for (name, cx, cy, cz, want) in pins {
             assert_eq!(

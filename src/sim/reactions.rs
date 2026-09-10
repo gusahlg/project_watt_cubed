@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, HashSet};
 use material::{interact_many, EventKind, Law};
 
 use crate::block::{BlockId, BlockRegistry, AIR};
+use crate::world::World;
+
+use super::Tick;
 
 /// A world position of one voxel.
 pub type Pos = (i32, i32, i32);
@@ -25,7 +28,7 @@ pub struct MaterialEvent {
 /// What the scheduler needs from the world: read/write cells and intern configurations. Keeping this a
 /// trait makes the generation semantics testable on a plain map.
 pub trait CellStore {
-    /// The material at a position (AIR when unloaded: unloaded space never reacts).
+    /// The material at a position. `None` for unloaded space, which never reacts.
     fn block_at(&self, pos: Pos) -> Option<BlockId>;
     /// Overwrite a cell; returns the previous id.
     fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId;
@@ -59,10 +62,39 @@ pub struct Budget {
 
 impl Budget {
     /// Provisional defaults: small, so gameplay stays responsive while the law is explored.
-    pub const DEFAULT: Budget = Budget { events_per_generation: 256, generations_per_tick: 2, max_followups: 512 };
+    pub const DEFAULT: Budget = Budget {
+        events_per_generation: 256,
+        generations_per_tick: 2,
+        max_followups: 512,
+    };
 }
 
-const FACES: [(i32, i32, i32); 6] = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+const FACES: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
+/// Place → `NewContact` at the placed cell. The one gameplay place rule.
+pub fn on_placed(sched: &mut ReactionScheduler, at: Pos) {
+    sched.push(MaterialEvent {
+        at,
+        kind: EventKind::NewContact,
+    });
+}
+
+/// Break → `ExternallyChanged` on the six neighbours of the broken cell. The one gameplay break rule.
+pub fn on_broken(sched: &mut ReactionScheduler, at: Pos) {
+    for f in FACES {
+        sched.push(MaterialEvent {
+            at: (at.0 + f.0, at.1 + f.1, at.2 + f.2),
+            kind: EventKind::ExternallyChanged,
+        });
+    }
+}
 
 /// The scheduler state: pending events (deduplicated per position and kind) and counters.
 #[derive(Default)]
@@ -125,7 +157,11 @@ impl ReactionScheduler {
                     if target_id == AIR {
                         continue;
                     }
-                    acting.entry(tp).or_insert_with(|| (target_id, Vec::new())).1.push((origin_id, ev.kind));
+                    acting
+                        .entry(tp)
+                        .or_insert_with(|| (target_id, Vec::new()))
+                        .1
+                        .push((origin_id, ev.kind));
                 }
             }
             // Evaluate phase: one interaction per target.
@@ -155,7 +191,10 @@ impl ReactionScheduler {
                 if followups < budget.max_followups {
                     for f in FACES {
                         let np = (pos.0 + f.0, pos.1 + f.1, pos.2 + f.2);
-                        self.push(MaterialEvent { at: np, kind: EventKind::ExternallyChanged });
+                        self.push(MaterialEvent {
+                            at: np,
+                            kind: EventKind::ExternallyChanged,
+                        });
                     }
                     followups += 6;
                 }
@@ -166,21 +205,118 @@ impl ReactionScheduler {
     }
 }
 
+/// Sim system `Tick("reactions")`: one budgeted scheduler step at the 20 Hz sim tick.
+pub struct Reactions;
+
+/// Two interned configurations that change under Collision, drawn from the
+/// worldgen regions (or a 40-unit one-axis shift of the first centre).
+#[cfg(test)]
+pub(crate) fn reactive_region_pair(reg: &mut BlockRegistry) -> (BlockId, BlockId) {
+    use crate::block::regions;
+    use material::{interact, Configuration};
+    let law = *reg.law();
+    let regions = regions::builtin(&law);
+    for ra in &regions {
+        for rb in &regions {
+            let ca = Configuration::single(ra.centre);
+            let cb = Configuration::single(rb.centre);
+            if interact(&law, &ca, &cb, EventKind::Collision).changed
+                || interact(&law, &cb, &ca, EventKind::Collision).changed
+            {
+                return (reg.intern(&ca).unwrap(), reg.intern(&cb).unwrap());
+            }
+        }
+    }
+    let centre = regions[0].centre;
+    let ca = Configuration::single(centre);
+    for axis in 0..4 {
+        for &delta in &[40u8, 16, 50, 30] {
+            let mut e = centre;
+            e.0[axis] = if centre.0[axis] <= 255 - delta {
+                centre.0[axis] + delta
+            } else {
+                centre.0[axis].saturating_sub(delta)
+            };
+            if e == centre {
+                continue;
+            }
+            let cb = Configuration::single(e);
+            if interact(&law, &ca, &cb, EventKind::Collision).changed
+                || interact(&law, &cb, &ca, EventKind::Collision).changed
+            {
+                return (reg.intern(&ca).unwrap(), reg.intern(&cb).unwrap());
+            }
+        }
+    }
+    panic!("no reactive pair from the worldgen regions under Collision");
+}
+
+/// Place `a` and `b` at `(0, y, 0)` / `(1, y, 0)`, Collision both, tick 10 times.
+#[cfg(test)]
+pub(crate) fn scripted_run<S: CellStore>(
+    store: &mut S,
+    sched: &mut ReactionScheduler,
+    a: BlockId,
+    b: BlockId,
+    y: i32,
+) -> Vec<(Pos, Vec<u8>, Vec<u8>)> {
+    store.set_block((0, y, 0), a);
+    store.set_block((1, y, 0), b);
+    sched.push(MaterialEvent {
+        at: (0, y, 0),
+        kind: EventKind::Collision,
+    });
+    sched.push(MaterialEvent {
+        at: (1, y, 0),
+        kind: EventKind::Collision,
+    });
+    let law = *store.registry().law();
+    let mut keys = Vec::new();
+    for _ in 0..10 {
+        for m in sched.tick(store, &law, Budget::DEFAULT) {
+            keys.push((
+                m.pos,
+                store.registry().encoding(m.from).as_bytes().to_vec(),
+                store.registry().encoding(m.to).as_bytes().to_vec(),
+            ));
+        }
+    }
+    keys
+}
+
+impl Tick for Reactions {
+    fn name(&self) -> &'static str {
+        "reactions"
+    }
+
+    fn tick(&mut self, world: &mut World, _dt: f32) {
+        let _ = world.tick_reactions();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use material::{Configuration, Element};
+    use crate::render_config::RenderConfig;
+    use crate::world::World;
+    use material::{interact_many, Configuration, Element};
     use std::collections::HashMap;
 
     struct Map {
         cells: HashMap<Pos, BlockId>,
+        loaded: HashSet<Pos>,
+        all_loaded: bool,
         reg: BlockRegistry,
     }
     impl CellStore for Map {
         fn block_at(&self, pos: Pos) -> Option<BlockId> {
+            if !self.all_loaded && !self.loaded.contains(&pos) {
+                return None;
+            }
             Some(*self.cells.get(&pos).unwrap_or(&AIR))
         }
         fn set_block(&mut self, pos: Pos, id: BlockId) -> BlockId {
+            self.loaded.insert(pos);
             self.cells.insert(pos, id).unwrap_or(AIR)
         }
         fn registry(&self) -> &BlockRegistry {
@@ -191,7 +327,12 @@ mod tests {
         }
     }
     fn map() -> Map {
-        Map { cells: HashMap::new(), reg: BlockRegistry::with_builtins() }
+        Map {
+            cells: HashMap::new(),
+            loaded: HashSet::new(),
+            all_loaded: true,
+            reg: BlockRegistry::with_builtins(),
+        }
     }
     fn single(reg: &mut BlockRegistry, c: [u8; 4]) -> BlockId {
         reg.intern(&Configuration::single(Element::new(c))).unwrap()
@@ -205,7 +346,10 @@ mod tests {
             m.set_block((x, 0, 0), rock);
         }
         let mut s = ReactionScheduler::new();
-        s.push(MaterialEvent { at: (1, 0, 0), kind: EventKind::Collision });
+        s.push(MaterialEvent {
+            at: (1, 0, 0),
+            kind: EventKind::Collision,
+        });
         let law = Law::v0();
         let out = s.tick(&mut m, &law, Budget::DEFAULT);
         assert!(out.is_empty());
@@ -221,9 +365,19 @@ mod tests {
         m.set_block((1, 0, 0), b);
         m.set_block((-1, 0, 0), b);
         let mut s = ReactionScheduler::new();
-        s.push(MaterialEvent { at: (0, 0, 0), kind: EventKind::Collision });
+        s.push(MaterialEvent {
+            at: (0, 0, 0),
+            kind: EventKind::Collision,
+        });
         let law = Law::v0();
-        let out = s.tick(&mut m, &law, Budget { generations_per_tick: 1, ..Budget::DEFAULT });
+        let out = s.tick(
+            &mut m,
+            &law,
+            Budget {
+                generations_per_tick: 1,
+                ..Budget::DEFAULT
+            },
+        );
         assert_eq!(out.len(), 2);
         assert!(out[0].pos < out[1].pos, "position order");
         assert!(out.iter().all(|mu| mu.from == b && mu.to != b));
@@ -236,7 +390,10 @@ mod tests {
         let mut m = map();
         let mut s = ReactionScheduler::new();
         for _ in 0..10 {
-            s.push(MaterialEvent { at: (5, 5, 5), kind: EventKind::Moved });
+            s.push(MaterialEvent {
+                at: (5, 5, 5),
+                kind: EventKind::Moved,
+            });
         }
         assert_eq!(s.pending(), 1);
         let law = Law::v0();
@@ -255,10 +412,23 @@ mod tests {
         m.set_block((1, 0, 0), o1);
         m.set_block((0, 1, 0), o2);
         let mut s = ReactionScheduler::new();
-        s.push(MaterialEvent { at: (1, 0, 0), kind: EventKind::Collision });
-        s.push(MaterialEvent { at: (0, 1, 0), kind: EventKind::Collision });
+        s.push(MaterialEvent {
+            at: (1, 0, 0),
+            kind: EventKind::Collision,
+        });
+        s.push(MaterialEvent {
+            at: (0, 1, 0),
+            kind: EventKind::Collision,
+        });
         let law = Law::v0();
-        let out = s.tick(&mut m, &law, Budget { generations_per_tick: 1, ..Budget::DEFAULT });
+        let out = s.tick(
+            &mut m,
+            &law,
+            Budget {
+                generations_per_tick: 1,
+                ..Budget::DEFAULT
+            },
+        );
         // The target changed at most once this generation, from its original id, by both origins.
         assert!(out.len() <= 1);
         if let Some(mu) = out.first() {
@@ -266,7 +436,9 @@ mod tests {
             let c1 = m.reg.configuration(o1).clone();
             let c2 = m.reg.configuration(o2).clone();
             let orig = Configuration::single(Element::new([80, 40, 40, 60]));
-            let expect = interact_many(&law, &[(&c1, EventKind::Collision), (&c2, EventKind::Collision)], &orig).target;
+            let expect =
+                interact_many(&law, &[(&c1, EventKind::Collision), (&c2, EventKind::Collision)], &orig)
+                    .target;
             assert_eq!(m.reg.configuration(mu.to), &expect);
         }
     }
@@ -281,11 +453,97 @@ mod tests {
         }
         let mut s = ReactionScheduler::new();
         for x in 0..64 {
-            s.push(MaterialEvent { at: (x, 0, 0), kind: EventKind::Collision });
+            s.push(MaterialEvent {
+                at: (x, 0, 0),
+                kind: EventKind::Collision,
+            });
         }
         let law = Law::v0();
-        let budget = Budget { events_per_generation: 8, generations_per_tick: 1, max_followups: 12 };
+        let budget = Budget {
+            events_per_generation: 8,
+            generations_per_tick: 1,
+            max_followups: 12,
+        };
         let _ = s.tick(&mut m, &law, budget);
         assert!(s.pending() >= 56, "unevaluated events stay queued");
+    }
+
+    #[test]
+    fn unloaded_space_never_reacts() {
+        let mut m = map();
+        m.all_loaded = false;
+        let a = single(&mut m.reg, [40, 40, 40, 40]);
+        let b = single(&mut m.reg, [90, 40, 40, 40]);
+        m.set_block((0, 0, 0), a);
+        // Neighbour is not in `loaded`, so block_at returns None even if we stuffed the map.
+        m.cells.insert((1, 0, 0), b);
+        let mut s = ReactionScheduler::new();
+        s.push(MaterialEvent {
+            at: (0, 0, 0),
+            kind: EventKind::Collision,
+        });
+        let out = s.tick(&mut m, &Law::v0(), Budget::DEFAULT);
+        assert!(out.is_empty());
+        assert_eq!(m.cells.get(&(1, 0, 0)).copied(), Some(b));
+    }
+
+    #[test]
+    fn reactions_tick_is_named_reactions() {
+        assert_eq!(Reactions.name(), "reactions");
+    }
+
+    fn scripted_world_mutations() -> Vec<(Pos, Vec<u8>, Vec<u8>)> {
+        let mut world = World::with_config(42, RenderConfig::default());
+        let (a, b) = reactive_region_pair(world.registry_mut());
+        let y = world.surface_y(0, 0);
+        scripted_run(&mut world, &mut ReactionScheduler::new(), a, b, y)
+    }
+
+    #[test]
+    fn scripted_world_mutations_are_bit_identical_across_runs() {
+        let a = scripted_world_mutations();
+        let b = scripted_world_mutations();
+        assert_eq!(a, b);
+        assert!(
+            !a.is_empty(),
+            "the scripted pair must actually react so the determinism check is not vacuously empty"
+        );
+    }
+
+    #[test]
+    fn world_cell_store_returns_none_for_unloaded_chunks() {
+        let world = World::with_config_lazy(1, RenderConfig::default());
+        assert!(
+            CellStore::block_at(&world, (0, 0, 0)).is_none(),
+            "lazy world has no origin chunks"
+        );
+        assert_eq!(world.block_at(0, 0, 0), AIR);
+    }
+
+    #[test]
+    fn world_cell_store_set_block_goes_through_the_overlay() {
+        let mut world = World::with_config(1, RenderConfig::default());
+        let (a, _) = reactive_region_pair(world.registry_mut());
+        let y = world.surface_y(8, 8);
+        let prev = CellStore::set_block(&mut world, (8, y, 8), a);
+        assert_ne!(prev, a);
+        assert_eq!(world.block_at(8, y, 8), a);
+        assert!(
+            world.edits().any(|(p, id)| p == (8, y, 8) && id == a),
+            "mutation must persist in the edit overlay"
+        );
+    }
+
+    #[test]
+    fn a_client_does_not_run_the_scheduler() {
+        let mut world = World::with_config(1, RenderConfig::default());
+        let (a, b) = reactive_region_pair(world.registry_mut());
+        let y = world.surface_y(0, 0);
+        world.set_block(0, y, 0, a);
+        world.set_block(1, y, 0, b);
+        world.set_reactions_authority(false);
+        world.push_material_event((0, y, 0), EventKind::Collision);
+        assert_eq!(world.reactions().pending(), 0);
+        assert!(world.tick_reactions().is_empty());
     }
 }

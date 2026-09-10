@@ -34,7 +34,7 @@ pub(crate) fn parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::bridge::from_doc;
+    use super::bridge::{from_doc, unknown_material_notice};
     use super::format::{PlayerState, SaveDoc, WorldgenStamp};
     use crate::mods::Mods;
     use crate::player::Player;
@@ -215,6 +215,39 @@ mod tests {
         let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
         assert_eq!(player.stash.total(), 1);
         assert_eq!(player.stash.count(AIR), 1);
+    }
+
+    #[test]
+    fn unknown_holdings_fold_into_one_load_notice() {
+        assert_eq!(unknown_material_notice(0, 0), None);
+        assert_eq!(
+            unknown_material_notice(3, 0).as_deref(),
+            Some("save predates the material model; 3 edits of unknown materials became air")
+        );
+        assert_eq!(
+            unknown_material_notice(0, 2).as_deref(),
+            Some("2 holdings of unknown materials were dropped")
+        );
+        assert_eq!(
+            unknown_material_notice(4, 1).as_deref(),
+            Some(
+                "save predates the material model; 4 edits of unknown materials became air; 1 holdings of unknown materials were dropped"
+            )
+        );
+
+        let mut doc = bare_doc();
+        doc.player.stash = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
+        doc.mods
+            .push(("crafting".into(), "v1;natural:Iron=4".into()));
+        let mut mods = Mods::with_defaults();
+        let (world, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        assert_eq!(player.stash.total(), 1);
+        assert!(
+            mods.save_states(&world)
+                .iter()
+                .all(|(n, d)| n != "crafting" || !d.contains("Iron")),
+            "unknown pouch specs are dropped"
+        );
     }
 
     #[test]

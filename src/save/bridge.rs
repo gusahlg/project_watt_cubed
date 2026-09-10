@@ -181,11 +181,25 @@ fn stamp_from_world(world: &World) -> WorldgenStamp {
     }
 }
 
-fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) {
+fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> u32 {
     let Some(items) = &doc.player.stash else {
-        return;
+        return 0;
     };
-    player.stash.load_portable(items, |s| world.registry_mut().parse_spec(s));
+    player.stash.load_portable(items, |s| world.registry_mut().parse_spec(s))
+}
+
+/// One load notice covering unknown edits and unknown stash/pouch holdings.
+pub(crate) fn unknown_material_notice(unknown_edits: u32, unknown_holdings: u32) -> Option<String> {
+    match (unknown_edits, unknown_holdings) {
+        (0, 0) => None,
+        (e, 0) => Some(format!(
+            "save predates the material model; {e} edits of unknown materials became air"
+        )),
+        (0, h) => Some(format!("{h} holdings of unknown materials were dropped")),
+        (e, h) => Some(format!(
+            "save predates the material model; {e} edits of unknown materials became air; {h} holdings of unknown materials were dropped"
+        )),
+    }
 }
 
 fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
@@ -237,7 +251,7 @@ pub fn from_doc(
         }
     }
 
-    restore_stash(&mut player, &doc, &mut world);
+    let mut unknown_holdings = restore_stash(&mut player, &doc, &mut world);
 
     let mut unknown_edits = 0u32;
     let block_ids: Vec<_> = doc
@@ -252,14 +266,12 @@ pub fn from_doc(
         }
         world.set_block(edit.x, edit.y, edit.z, id);
     }
-    if unknown_edits > 0 {
-        eprintln!(
-            "save predates the material model; {unknown_edits} edits of unknown materials became air"
-        );
-    }
 
     for (name, data) in &doc.mods {
-        mods.load_state(name, data, &mut world);
+        unknown_holdings += mods.load_state(name, data, &mut world);
+    }
+    if let Some(msg) = unknown_material_notice(unknown_edits, unknown_holdings) {
+        eprintln!("{msg}");
     }
 
     Ok((world, player, doc.meta))

@@ -345,6 +345,7 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
         has_blocklight: false,
         light_reseed: false,
         light_gen: 0,
+        mesh_hash: None,
     }
 }
 
@@ -1468,6 +1469,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                         has_blocklight: false,
                         light_reseed: false,
                         light_gen: 0,
+                        mesh_hash: None,
                     },
                 );
             }
@@ -1548,6 +1550,7 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
                         has_blocklight: false,
                         light_reseed: false,
                         light_gen: 0,
+                        mesh_hash: None,
                     },
                 );
             }

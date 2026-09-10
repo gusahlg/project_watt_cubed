@@ -327,7 +327,9 @@ impl Game {
         // — it fires only when whole ticks are due.
         let sim_id = sched.register(
             Simulation::manifest(),
-            Box::new(Simulation::with_systems(Vec::new())),
+            Box::new(Simulation::with_systems(vec![Box::new(
+                crate::sim::reactions::Reactions,
+            )])),
             u32::MAX,
         );
         sched.set_meter(sim_id, voxel_engine::profile::Meter::Physics);
@@ -538,6 +540,7 @@ impl Game {
     /// Attach a server connection, turning this into a multiplayer session.
     pub fn with_net(mut self, net: Connection) -> Self {
         self.net = Some(net);
+        self.world.set_reactions_authority(false);
         self
     }
 
@@ -611,8 +614,12 @@ impl Game {
         // step the deterministic world so terrain streams in before the frame is
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
-            self.world
-                .stream(self.player.position, Some(&mut *eng), &mut self.sched);
+            self.world.stream(
+                self.player.position,
+                Some(&mut *eng),
+                &mut self.sched,
+                mods.appearance(),
+            );
             let clocks = self.sched.clocks(dt);
             let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
             self.sched.tick(&mut sched_ctx, &clocks);
@@ -639,16 +646,22 @@ impl Game {
         // underwater bed, voice sessions — the director DERIVES from the readout.
         let mut events: Vec<SoundEvent> = Vec::new();
 
+        self.phases = FramePhases::default();
+        let t = Instant::now();
         if let Some(signal) = self.net_phase(mods, &mut events) {
             return signal;
         }
+        self.phases.net = t.elapsed();
+        let t = Instant::now();
         let input = self.input_phase(eng, router, dt);
+        self.phases.input = t.elapsed();
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
         // while a spawn/teleport slab is outstanding so loading progresses with
         // the console open. Audio skips the director commit when nothing is
         // sounding and the listener is still; only a real exit short-circuits
         // the rest of the frame.
+        let t = Instant::now();
         let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
             eng,
@@ -658,6 +671,7 @@ impl Game {
             sound,
             events: &mut events,
         });
+        self.phases.overlay = t.elapsed();
         let consumed = match overlay {
             Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
             Some(Signal::Continue) => true,
@@ -665,13 +679,20 @@ impl Game {
         };
         let ready = self.world.spawn_ready();
         if !consumed && ready {
+            let t = Instant::now();
             let detached = self.motion_phase(&input, dt);
+            self.phases.motion = t.elapsed();
+            let t = Instant::now();
             self.interact_phase(&input, detached, dt, eng, mods, &mut events);
+            self.phases.interact = t.elapsed();
         }
         if !consumed || !ready {
-            self.stream_phase(eng, dt);
+            let t = Instant::now();
+            self.stream_phase(eng, dt, mods);
+            self.phases.stream = t.elapsed();
         }
         let active = !consumed;
+        let t = Instant::now();
         self.commit_audio(AudioPhase {
             dt,
             input: &input,
@@ -681,6 +702,7 @@ impl Game {
             events,
             active,
         });
+        self.phases.audio = t.elapsed();
         Signal::Continue
     }
 
@@ -1065,7 +1087,7 @@ impl Game {
     /// Load/mesh/unload chunks around the camera (the player, unless the
     /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
     /// step the simulation.
-    fn stream_phase(&mut self, eng: &mut Engine, dt: f32) {
+    fn stream_phase(&mut self, eng: &mut Engine, dt: f32, mods: &Mods) {
         // The scheduler drives the fixed-tick sim lane. Its clock
         // (fixed-tick accumulator + catch-up cap) is derived once per frame
         // here; other lanes still run directly below until they migrate in.
@@ -1084,7 +1106,8 @@ impl Game {
             self.stream_gate.steps(dt) != 0
         };
         if !stream_due {
-            self.world.pump(Some(&mut *eng), &mut self.sched);
+            self.world
+                .pump(Some(&mut *eng), &mut self.sched, mods.appearance());
             return;
         }
 
@@ -1092,8 +1115,12 @@ impl Game {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
-        self.world
-            .stream(stream_center, Some(&mut *eng), &mut self.sched);
+        self.world.stream(
+            stream_center,
+            Some(&mut *eng),
+            &mut self.sched,
+            mods.appearance(),
+        );
 
         // A hidden/minimal HUD does no minimap clock read or terrain raster
         // work; refreshes share streaming's cadence instead of waking alone.
@@ -1156,9 +1183,11 @@ impl Game {
             CameraMode::Person(_) => self.player.position,
         };
         if stream_due {
-            self.world.stream(stream_center, None, &mut self.sched);
+            self.world
+                .stream(stream_center, None, &mut self.sched, mods.appearance());
         } else {
-            self.world.pump(None, &mut self.sched);
+            self.world
+                .pump(None, &mut self.sched, mods.appearance());
         }
         self.commit_audio(AudioPhase {
             dt,
@@ -1272,6 +1301,11 @@ impl Game {
                     let prev = self.world.block_at(x, y, z);
                     let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
+                    if id == AIR {
+                        self.world.note_block_broken(x, y, z);
+                    } else {
+                        self.world.note_block_placed(x, y, z);
+                    }
                     let at = cell_center(x, y, z);
                     events.push(if id == AIR {
                         SoundEvent::BlockBroken { at, block: prev }
@@ -1458,6 +1492,7 @@ impl Game {
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
+        self.world.note_block_broken(x, y, z);
         let overflow = !self.player.stash.add(id, 1);
         mods.on_block_break(id, &self.world, overflow);
         self.camera.fx.add_trauma(0.15);
@@ -1513,6 +1548,7 @@ impl Game {
                 block: id,
             });
             self.world.set_block(x, y, z, id);
+            self.world.note_block_placed(x, y, z);
             self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
             // validates and relays, exactly like breaking does with "air".
