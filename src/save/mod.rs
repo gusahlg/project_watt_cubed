@@ -483,6 +483,7 @@ mod tests {
             stride: 16,
             phases: 4,
             relief: 1.5,
+            version: 1,
         };
         let world = make_world(99, WorldgenKind::Diffusion, cfg);
         assert_eq!(world.worldgen(), WorldgenKind::Diffusion);

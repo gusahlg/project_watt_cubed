@@ -506,7 +506,15 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let generator = match config.worldgen {
         WorldgenKind::Classic => crate::world::diffusion::classic(&mut registry, config.seed),
         WorldgenKind::Diffusion => {
-            crate::world::diffusion::diffusion(&mut registry, config.seed, config.diffusion)
+            if config.diffusion.version >= 2 {
+                crate::world::diffusion::diffusion_v2(
+                    &mut registry,
+                    config.seed,
+                    config.diffusion,
+                )
+            } else {
+                crate::world::diffusion::diffusion(&mut registry, config.seed, config.diffusion)
+            }
         }
     };
     let hooks = if config.hooks.is_empty() {

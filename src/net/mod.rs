@@ -220,6 +220,9 @@ pub(crate) fn fingerprint_kind_cfg(
         eat(&cfg.stride.to_le_bytes());
         eat(&cfg.phases.to_le_bytes());
         eat(&cfg.relief.to_bits().to_le_bytes());
+        if cfg.version != 1 {
+            eat(&[cfg.version]);
+        }
     }
     hash
 }
