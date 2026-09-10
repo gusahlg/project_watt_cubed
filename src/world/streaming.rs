@@ -2035,6 +2035,7 @@ impl World {
         let first = self.chunks[&coord].light.is_none();
         let moved = Self::face_moves(self.chunks[&coord].light.as_ref(), &grid);
         let has_blocklight = grid.has_border_blocklight();
+        let open_sky = grid == light::LightGrid::open_sky();
         {
             let loaded = self.chunks.get_mut(&coord).unwrap();
             loaded.light = Some(grid);
@@ -2057,9 +2058,17 @@ impl World {
                 continue;
             }
             if face_moved {
+                // Open-sky next to open-sky cannot change. Mesh-seed only:
+                // this publish can complete their light_ready.
+                let n_sky = self.chunks[&n].light.as_ref() == Some(&light::LightGrid::open_sky());
+                if open_sky && n_sky {
+                    self.mesh_worklist.insert(n);
+                    continue;
+                }
                 if self.light_inflight.contains(&n) {
                     self.chunks.get_mut(&n).unwrap().light_reseed = true;
-                } else {
+                } else if !self.light_worklist.contains(&n) {
+                    // Pending floods read live neighbour grids at admit.
                     self.seed_light(n, super::LightSeed::Border);
                 }
             }
@@ -3804,19 +3813,20 @@ mod tests {
         let mut world = World::generate();
         let c = Coord::new(0, 0, 0);
         let missing = c.step(Face::PosY);
+        let present = c.step(Face::PosX);
         world.chunks.remove(&missing);
         world.chunks.get_mut(&c).unwrap().light = None;
+        assert!(
+            world.chunks.contains_key(&present),
+            "generate preloads a lateral neighbour"
+        );
+        world.chunks.get_mut(&present).unwrap().light = Some(light::LightGrid::dark());
         world.light_worklist.clear();
         world.light_inflight.clear();
         world.settle_light(c, light::LightGrid::open_sky());
         assert!(
             !world.light_worklist.contains(&missing),
             "must not seed a neighbour without data"
-        );
-        let present = c.step(Face::PosX);
-        assert!(
-            world.chunks.contains_key(&present),
-            "generate preloads a lateral neighbour"
         );
         assert!(
             world.light_worklist.contains(&present),
@@ -3847,6 +3857,88 @@ mod tests {
         assert!(
             world.light_worklist.contains(&n),
             "re-seed after landing so the wave costs one extra flood"
+        );
+    }
+
+    /// Interior-only change: faces match the previous grid, so no neighbour
+    /// is light-seeded (the `border_changed` cut).
+    #[test]
+    fn settle_unchanged_faces_seeds_no_neighbour() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        world.chunks.get_mut(&c).unwrap().light = Some(light::LightGrid::dark());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.mesh_worklist.clear();
+        let mut interior = light::LightGrid::dark();
+        interior.set(
+            Chunk::index(8, 8, 8),
+            light::Lumel {
+                sky: light::LightLevel::FULL,
+                block: light::LightLevel::DARK,
+            },
+        );
+        world.settle_light(c, interior);
+        for &face in &Face::ALL {
+            assert!(
+                !world.light_worklist.contains(&c.step(face)),
+                "unchanged face {face:?} must not seed its neighbour"
+            );
+        }
+        assert!(
+            world.mesh_worklist.contains(&c),
+            "self is still mesh-seeded on a changed grid"
+        );
+    }
+
+    /// A neighbour already on the worklist is not counted again: the pending
+    /// flood reads live neighbour grids at admit.
+    #[test]
+    fn settle_does_not_recount_already_queued_neighbour() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        let n = c.step(Face::PosX);
+        world.chunks.get_mut(&c).unwrap().light = Some(light::LightGrid::dark());
+        for &face in &Face::ALL {
+            if let Some(loaded) = world.chunks.get_mut(&c.step(face)) {
+                loaded.light = Some(light::LightGrid::dark());
+            }
+        }
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.light_worklist.insert(n);
+        world.light_seed_inserts = 0;
+        world.light_seed_split = super::super::LightSeedSplit::default();
+        world.settle_light(c, light::LightGrid::open_sky());
+        assert!(world.light_worklist.contains(&n));
+        let other_loaded = Face::ALL
+            .iter()
+            .filter(|&&f| {
+                let n2 = c.step(f);
+                n2 != n && world.chunks.contains_key(&n2)
+            })
+            .count() as u64;
+        assert_eq!(
+            world.light_seed_split.border, other_loaded,
+            "already-queued neighbour is not a counted insert"
+        );
+    }
+
+    /// Two open-sky grids: the neighbour is already at the analytic result, so
+    /// a first-publish face move against dark is a no-op flood.
+    #[test]
+    fn open_sky_does_not_reseed_open_sky_neighbour() {
+        let mut world = World::generate();
+        let c = Coord::new(0, 0, 0);
+        let n = c.step(Face::PosX);
+        world.chunks.get_mut(&c).unwrap().light = None;
+        world.chunks.get_mut(&n).unwrap().light = Some(light::LightGrid::open_sky());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.settle_light(c, light::LightGrid::open_sky());
+        assert!(
+            !world.light_worklist.contains(&n),
+            "open-sky neighbour cannot change when this chunk publishes open sky"
         );
     }
 

@@ -138,7 +138,7 @@ impl LightGrid {
     }
     #[cfg(test)]
     #[inline]
-    fn set(&mut self, idx: usize, v: Lumel) {
+    pub(in crate::world) fn set(&mut self, idx: usize, v: Lumel) {
         match &self.0 {
             Repr::Cells(_) => {}
             Repr::Uniform(u) if *u == v => return,
