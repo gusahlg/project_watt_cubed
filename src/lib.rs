@@ -25,6 +25,11 @@
 //!   [`Bounded`](math::Bounded) trait).
 //! - [`render`] — the [`Render`](render::Render) trait for drawable things.
 //! - [`macros`] — declarative macros that generate repetitive code.
+#[cfg(test)]
+mod alloc_count;
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: alloc_count::Counting = alloc_count::Counting;
 pub mod app;
 pub mod audio;
 pub mod avatar;

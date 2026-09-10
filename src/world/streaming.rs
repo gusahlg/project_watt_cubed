@@ -283,12 +283,12 @@ impl LightGate {
     /// Start the wait timer for a light-blocked chunk (keeps an existing
     /// timer — re-eviction must not push the degrade horizon out).
     pub(in crate::world) fn note_blocked(&mut self, coord: Coord) {
-        self.blocked_since.entry(coord).or_insert_with(Instant::now);
+        self.blocked_since.entry(coord).or_insert_with(crate::sched::now);
     }
 
     /// Mark a changed-light chunk; the first mark starts the degrade clock.
     fn mark_dirty(&mut self, coord: Coord) {
-        self.dirty.entry(coord).or_insert_with(Instant::now);
+        self.dirty.entry(coord).or_insert_with(crate::sched::now);
     }
 }
 
@@ -455,6 +455,11 @@ impl World {
             .is_some_and(|c| self.mesh_box(c).contains(coord))
     }
 
+    /// Peek the dirty-remesh hint without consuming it.
+    pub(in crate::world) fn dirty_pending(&self) -> bool {
+        self.pending_dirty.get()
+    }
+
     /// The every-frame half of streaming: land finished worker results, run
     /// the budgeted uploads, and remesh edited chunks — everything whose
     /// LATENCY the player sees directly. The game runs this every frame no
@@ -462,22 +467,25 @@ impl World {
     /// Minimum profile still publishes finished terrain the frame it lands
     /// and a mined block still vanishes the same frame it was clicked.
     /// Steady-state cost is a channel poll and two sticky-flag checks.
-    pub fn pump(&mut self, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+    /// `eng` is `None` only in headless tests; GPU work panics without it.
+    pub fn pump(&mut self, mut eng: Option<&mut Engine>, sched: &mut crate::sched::Scheduler) {
         self.remesh_stats.drop_stale_this_frame = 0;
         // Palette growth re-uploads the block texture array before any upload
         // this frame references a new layer.
-        self.refresh_textures(eng);
+        if let Some(eng) = eng.as_deref_mut() {
+            self.refresh_textures(eng);
+        }
         // Idle: no claim can produce a `Done`, so skip try_recv and the
         // deadline Instant. Dirty-remesh and lod-clip stay (flag checks).
         if self.anything_in_flight() {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
             let drain_lane = self.lanes().drain;
-            sched.run_manual(drain_lane, self, Some(&mut *eng));
+            sched.run_manual(drain_lane, self, eng.as_deref_mut());
         }
         // The synchronous edit remesh: self-gates on `pending_dirty`, so an
-        // editless frame pays one flag check.
+        // editless frame pays one flag check and does not need the engine.
         let dirty_lane = self.lanes().dirty_remesh;
-        sched.run_manual(dirty_lane, self, Some(&mut *eng));
+        sched.run_manual(dirty_lane, self, eng.as_deref_mut());
         // Fold any settle events into the LOD clip the moment they land.
         self.refresh_lod_clip();
     }
@@ -487,12 +495,17 @@ impl World {
     /// refreshes). [`pump`](Self::pump) covers the every-frame latency half;
     /// the drain/dirty lanes here are second-run no-ops on a pumped frame.
     /// Steady-state zero cost: one channel poll, lazy unload/generate on boundary cross.
-    pub fn stream(&mut self, center: DVec3, eng: &mut Engine, sched: &mut crate::sched::Scheduler) {
+    pub fn stream(
+        &mut self,
+        center: DVec3,
+        mut eng: Option<&mut Engine>,
+        sched: &mut crate::sched::Scheduler,
+    ) {
         // Capture eye altitude; section metric measures dy from it.
         self.section_eye_y = center.y;
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
         // or teleport-sized gaps, so prediction never fires on garbage input.
-        let now = Instant::now();
+        let now = crate::sched::now();
         let (section_vel, pacing_vel, sample_dt) = match self.section_eye_prev {
             Some((prev, t)) => {
                 let dt = now.duration_since(t).as_secs_f64();
@@ -595,9 +608,13 @@ impl World {
         // boundary-cross frame's results drain against the live centre, not
         // the one they'd be discarded by. `stream_phase` pumps only on frames
         // the topology pass does not run; this is the pump on stream-due frames.
-        self.pump(eng, sched);
+        self.pump(eng.as_deref_mut(), sched);
         if full_pass {
-            self.unload_far(center_chunk, eng);
+            self.unload_far(
+                center_chunk,
+                eng.as_deref_mut()
+                    .expect("unload on a boundary cross needs the engine"),
+            );
             // Stale queued uploads (the trailing edge of fast movement) release
             // in ONE pass here instead of trickling through the drain budget.
             self.prune_upload_queue();
@@ -660,7 +677,11 @@ impl World {
                     _ => continue,
                 };
                 let stays_dirty = matches!(next, MeshState::Dirty { .. });
-                loaded.retire(next, eng);
+                loaded.retire(
+                    next,
+                    eng.as_deref_mut()
+                        .expect("radius shrink frees GPU meshes"),
+                );
                 // A retired `Dirty` chunk (its drawn mesh just freed) still needs
                 // the same-frame dirty pass to remesh it — which only runs when
                 // `pending_dirty` is set. Set it explicitly here rather than
@@ -696,7 +717,7 @@ impl World {
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamMesh);
             let dirty_lane = self.lanes().dirty_remesh;
-            sched.run_manual(dirty_lane, self, Some(&mut *eng));
+            sched.run_manual(dirty_lane, self, eng.as_deref_mut());
             // Advance the light-gate degrade timers and keep still-waiting chunks on
             // the worklist (their degrade fires on the clock, which raises no re-seed
             // event) BEFORE the mesh lane reads them.
@@ -760,13 +781,17 @@ impl World {
                 self.section_cover_dirty.set();
             }
             if full_pass {
-                self.unload_sections(center_chunk, eng);
+                self.unload_sections(
+                    center_chunk,
+                    eng.as_deref_mut()
+                        .expect("section unload on a boundary cross needs the engine"),
+                );
                 self.pending_sections.set();
             }
             // Section dirty-remesh lane: free GPU meshes of edited sections so
             // they re-extract from the updated generator overlay.
             let section_remesh_lane = self.lanes().section_remesh;
-            sched.run_manual(section_remesh_lane, self, Some(&mut *eng));
+            sched.run_manual(section_remesh_lane, self, eng.as_deref_mut());
             let section_lane = self.lanes().section_admit;
             sched.run_manual(section_lane, self, None);
             // Section visible-set lane: re-resolve the covering only when an
@@ -776,7 +801,7 @@ impl World {
             // A converged, still far field pays a flag check, no covering walk.
             if self.section_cover_dirty.take() || self.pending_sections.get() {
                 let visible_lane = self.lanes().section_visible;
-                sched.run_manual(visible_lane, self, Some(&mut *eng));
+                sched.run_manual(visible_lane, self, eng.as_deref_mut());
             }
         }
         // Occlusion is derived state, rebuilt here at the `&mut` sync point (never
@@ -787,14 +812,14 @@ impl World {
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamOcclusion);
             let occ_lane = self.lanes().occlusion;
-            sched.run_manual(occ_lane, self, Some(&mut *eng));
+            sched.run_manual(occ_lane, self, eng.as_deref_mut());
         }
         // Unloads/boundary crossings above may have shrunk the settled rings;
         // fold them in before this frame renders.
         self.refresh_lod_clip();
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
-        self.last_stream_secs = now.elapsed().as_secs_f64();
+        self.last_stream_secs = sample_dt;
     }
 
     /// Land finished worker results (non-blocking). Generate results clear
@@ -2581,7 +2606,7 @@ impl World {
             if self.promote_dirty_mesh(c) {
                 gate.dirty.remove(&c);
             } else {
-                gate.dirty.entry(c).or_insert_with(Instant::now);
+                gate.dirty.entry(c).or_insert_with(crate::sched::now);
             }
         }
         // The expiry sweep: a chunk past LIGHT_WAIT_DEGRADE is mesh-ready via
@@ -2982,7 +3007,13 @@ impl World {
     /// The per-id layer cache makes growth O(new blocks), not O(palette).
     fn refresh_textures(&mut self, eng: &mut Engine) {
         // Never zero (modulo divisor) and never past the vertex field's u16.
-        self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
+        // Construction caches `u16::MAX`; the device cap is read once.
+        if !self.texture_cap_from_device {
+            self.texture_layer_cap = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
+            self.texture_cap_from_device = true;
+            #[cfg(test)]
+            crate::alloc_count::note_engine(crate::alloc_count::EngineCall::TexLayers);
+        }
         let count = self.registry.block_count();
         if self.textures_built != count {
             for i in self.texture_cache.len()..count {
@@ -3005,6 +3036,44 @@ impl World {
             );
             self.textures_built = count;
         }
+    }
+
+    /// Headless settle: centre on `pos`, fill the mesh box with data, mark every
+    /// in-view chunk as a final Air mesh, and drain worklists so
+    /// [`entry_complete`](Self::entry_complete) holds without an Engine.
+    #[cfg(test)]
+    pub fn settle_around(&mut self, pos: DVec3) {
+        let s = CHUNK_SIZE as i32;
+        let center = ChunkCoord::new(
+            block_coord(pos.x).div_euclid(s),
+            block_coord(pos.y).div_euclid(s),
+            block_coord(pos.z).div_euclid(s),
+        );
+        self.center = Some(center);
+        for coord in self.mesh_box(center).coords() {
+            self.ensure_data(coord);
+            if let Some(loaded) = self.chunks.get_mut(&coord)
+                && !matches!(loaded.state, MeshState::Air | MeshState::Ready(_))
+            {
+                loaded.state = MeshState::Air;
+            }
+        }
+        self.mesh_worklist.clear();
+        self.light_worklist.clear();
+        self.generating.clear();
+        self.light_inflight.clear();
+        self.upload_queue.clear();
+        self.light_apply_queue.clear();
+        self.section_upload_queue.clear();
+        self.section_desired.clear();
+        self.light_gate.degraded.clear();
+        self.light_gate.dirty.clear();
+        self.light_gate.blocked_since.clear();
+        self.pending_fresh.take();
+        self.pending_gen.take();
+        self.pending_dirty.take();
+        self.pending_sections.take();
+        let _ = self.worker_pool();
     }
 }
 

@@ -19,6 +19,7 @@ use voxel_engine::DVec3;
 use crate::net::protocol::{self, ClientMessage, ServerMessage, VoicePayload};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
+use crate::sched::RateGate;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MOVE_INTERVAL: Duration = Duration::from_millis(33);
@@ -59,6 +60,10 @@ pub struct RemotePlayer {
     recv_at: Instant,
     interval: Duration,
     distance: f64,
+    /// Occlusion raycast cadence for the name tag (10 Hz is enough; the
+    /// result is reused between due steps).
+    tag_gate: RateGate,
+    tag_occluded: Option<bool>,
 }
 
 impl RemotePlayer {
@@ -68,6 +73,18 @@ impl RemotePlayer {
 
     pub fn visible(&self) -> bool {
         self.visible
+    }
+
+    /// Cached terrain-occlusion bit for the floating name tag. Raycasts on
+    /// the first sample and whenever [`RateGate`] says a step is due.
+    pub(crate) fn cached_tag_occlusion(&mut self, dt: f32, raycast: impl FnOnce() -> bool) -> bool {
+        if self.tag_occluded.is_none() || self.tag_gate.steps(dt) != 0 {
+            let hit = raycast();
+            self.tag_occluded = Some(hit);
+            hit
+        } else {
+            self.tag_occluded.expect("filled above")
+        }
     }
 }
 
@@ -505,6 +522,8 @@ fn apply_server_message(
                     recv_at: Instant::now(),
                     interval: Duration::from_millis(0),
                     distance: 0.0,
+                    tag_gate: RateGate::from_hz(10),
+                    tag_occluded: None,
                 });
             }
             ServerMessage::PeerLeft { id } => {

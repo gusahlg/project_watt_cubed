@@ -580,11 +580,11 @@ pub struct Deadline(Instant);
 impl Deadline {
     /// A deadline `budget` from now.
     pub fn from_budget(budget: Duration) -> Deadline {
-        Deadline(Instant::now() + budget)
+        Deadline(crate::sched::now() + budget)
     }
     #[must_use]
     pub fn expired(self) -> bool {
-        Instant::now() >= self.0
+        crate::sched::now() >= self.0
     }
 }
 

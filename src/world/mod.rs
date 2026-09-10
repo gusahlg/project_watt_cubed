@@ -917,9 +917,11 @@ pub struct World {
     /// one block at a time) appends new layers instead of regenerating all.
     texture_cache: Vec<Vec<u8>>,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
-    /// so the meshers wrap vertex layers past it. `u16::MAX` until the first
-    /// stream pass reads the engine cap (identity in practice — ids start tiny).
+    /// so the meshers wrap vertex layers past it. Construction uses `u16::MAX`
+    /// (identity wrap); the first engine contact overwrites it once.
     texture_layer_cap: u16,
+    /// True after [`World::pump`] has read `Engine::max_texture_array_layers`.
+    texture_cap_from_device: bool,
     /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
     /// input like `lighting`: toggling remeshes the world.
     ao: bool,
@@ -1218,6 +1220,7 @@ impl World {
             textures_built: 0,
             texture_cache: Vec::new(),
             texture_layer_cap: u16::MAX,
+            texture_cap_from_device: false,
             ao: true,
             tables_epoch: 0,
             occlusion: Occlusion::default(),
@@ -1651,7 +1654,7 @@ impl World {
             };
         }
         self.occlusion_topo_dirty.take();
-        self.last_occlusion_rebuild = Some(Instant::now());
+        self.last_occlusion_rebuild = Some(crate::sched::now());
         let Some(origin) = self.center else {
             return Progress::Idle;
         };

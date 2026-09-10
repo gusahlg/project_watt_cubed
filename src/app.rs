@@ -92,6 +92,21 @@ pub struct App {
     /// True while the Mods screen is on the menu stack.
     mods_open: bool,
     mods_save_error: Option<String>,
+    /// Last graphics stamp pushed to the engine; `apply` runs only on change.
+    gfx_applied: Option<GfxKey>,
+}
+
+/// Values [`Settings::apply`] and `set_flags` actually push. Compared so a
+/// quiet/menu frame with unchanged settings does not touch the engine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GfxKey {
+    w: u32,
+    h: u32,
+    fullscreen: bool,
+    msaa: u32,
+    scale_bits: u32,
+    cull_faces: bool,
+    flags: voxel_engine::RenderFlags,
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -179,6 +194,7 @@ impl App {
             clock: Instant::now(),
             mods_open: false,
             mods_save_error: None,
+            gfx_applied: None,
         }
     }
 
@@ -273,10 +289,9 @@ impl App {
             self.note_frame_stall(t0, update_dt);
             return false;
         }
-        // VRAM guard + live settings: one push per frame so a resize cannot
-        // allocate MSAA/scale the probe already refused.
-        self.settings.apply(eng);
-        eng.set_flags(self.mods.effective_render(&self.settings).engine_flags());
+        // VRAM guard + live settings: push only when the stamp moves so a
+        // quiet frame or an idle menu does not wake the render thread.
+        self.push_gfx(eng);
         // Apply only on change: a SetVsync every menu frame was waking the
         // render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
@@ -329,6 +344,33 @@ impl App {
                 );
             }
         }
+    }
+
+    fn gfx_key(&self, w: u32, h: u32) -> GfxKey {
+        let session = self.settings.session_graphics(w, h);
+        GfxKey {
+            w,
+            h,
+            fullscreen: self.settings.fullscreen,
+            msaa: session.msaa,
+            scale_bits: session.render_scale.to_bits(),
+            cull_faces: self.settings.cull_faces,
+            flags: self.mods.effective_render(&self.settings).engine_flags(),
+        }
+    }
+
+    fn push_gfx(&mut self, eng: &mut Engine) {
+        let w = eng.screen_width().max(1) as u32;
+        let h = eng.screen_height().max(1) as u32;
+        let key = self.gfx_key(w, h);
+        if self.gfx_applied.as_ref() == Some(&key) {
+            return;
+        }
+        self.settings.apply(eng);
+        eng.set_flags(key.flags);
+        self.gfx_applied = Some(key);
+        #[cfg(test)]
+        crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SettingsApply);
     }
 
     /// Drive one benchmark frame: enter a reproducible world, wait for both the
