@@ -1,5 +1,9 @@
 A super awesome game, trust.
 
+A voxel is a **configuration** of points on a 4-D resource lattice; one integer
+**law** decides how neighbouring matter changes. Names are presentation only —
+see [documentation/material-model.md](documentation/material-model.md).
+
 ## Multiplayer
 
 The world is procedural, so multiplayer stays cheap: the network never ships voxel

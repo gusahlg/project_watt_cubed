@@ -4,6 +4,10 @@ A mod is a compiled-in layer on the thin core: menus, inventory, crafting, the
 shipped look, block appearance, and optional worldgen. Toggle them on the Mods
 screen. Adding a new mod still needs a rebuild and a restart.
 
+Matter itself is not a mod. The law, intern table, and scheduler live in core
+(`documentation/material-model.md`). Mods present matter, place it, and (for
+machines) emit events into the scheduler.
+
 ## Hooks
 
 `Mod` methods default to no-ops. When several enabled mods implement a hook:
@@ -16,6 +20,10 @@ screen. Adding a new mod still needs a rebuild and a restart.
 
 `worldgen_config` is an opaque string. The winning worldgen kind parses it
 (InfiniteDiffusion reads its own knobs). `knobs` / `step_knob` are per-mod.
+
+Machines queue reactions with `ModContext::emit_material_event`. Chunk load,
+gen, mesh, and save never emit. On a client connected to a server the call is a
+no-op — the authority runs the scheduler.
 
 ## Appearance
 
@@ -47,6 +55,25 @@ To write your own: implement `BlockAppearance` (`layer`, `revision`,
 engine `MaterialDesc`s; the cache will then send 1×1 placeholders instead of
 16×16 CPU layers. With no appearance mod (`Mods::empty()`) the game renders
 flat colours.
+
+## Worldgen regions
+
+Terrain is a modding surface of **regions**, not named blocks. A region is a
+centre element, a small family of variants, geological strata, and a label used
+only for HUD/debug (`src/block/regions.rs`). Placement rules
+(`src/world/placement.rs`) name those labels. The generator intern the family's
+configurations once at world start; columns pick a member. A worldgen mod wins
+`worldgen` / `worldgen_config` and must keep the same contract: bounded palette,
+stable under self-contact, deterministic from (seed, law, coord).
+
+InfiniteDiffusion is the shipped generator; it still paints through the region
+table.
+
+## Naming (future)
+
+The simulation has no names. A future naming mod may map configurations to
+words (region labels, discovered procedures, player tags). It must not feed
+those strings back into `interact`, worldgen, saves, or the protocol.
 
 ## Groups
 

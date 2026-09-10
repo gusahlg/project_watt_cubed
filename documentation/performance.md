@@ -165,6 +165,16 @@ Unchanged from the original audit (`../voxel-engine`): stop cloning completed dr
 7. Cache name-tag text/measurement and share peer names (`Arc<str>`) for the models/tags-on multiplayer case.
 8. Budget mod edge bursts: a time budget with an ordered continuation would bound third-party hook cost without losing or reordering actions.
 
+## Palette and texture contract
+
+Voxels store `BlockId` (interned configuration, up to 65 535 per world). The
+mesher stamps a **render descriptor** layer (≤ 16 384, 14-bit vertex field),
+not the block id: many configurations share one quantized `Visual`. CPU
+appearance is one 16×16 RGBA8 layer per descriptor (`src/block/appearance.rs`);
+the GPU-materials mod may replace that with engine `MaterialDesc`s. Do not
+assume one texture layer per `BlockId`, and do not put material identity in
+the vertex colour.
+
 ## Correctness constraints
 
 - **World generation is authoritative.** For a fixed worldgen version, seed, registry, and coordinate, generated blocks must remain identical. Caching may remove duplicate evaluation but must not change hash streams, sample coordinates, floating-point ordering, placement precedence, save replay, or server/client agreement.
