@@ -1,7 +1,8 @@
 //! Default start screen, as a disableable mod.
 //!
-//! Builds the screens the player sees today — main menu, load list, host form,
-//! join form — as [`MenuModel`]s from [`StartFacts`] and returns [`StartAction`]s.
+//! Builds the screens the player sees today — main menu, the worlds page (one
+//! row per saved world), host form, join form — as [`MenuModel`]s from
+//! [`StartFacts`] and returns [`StartAction`]s.
 //! Settings and Mods stay core so they exist even if every mod is off. Disable
 //! this mod and the core fallback (New world / Load / Settings / Mods / Quit)
 //! takes over.
@@ -54,7 +55,7 @@ impl Mod for StartScreenMod {
     }
 }
 
-/// The screens the player sees today: main (with inline load rows), host, join.
+/// The screens the player sees today: main, worlds (the saved-world list), host, join.
 struct DefaultStart {
     main: MainMenu,
     cursor: Cursor,
@@ -62,6 +63,7 @@ struct DefaultStart {
 }
 
 enum Overlay {
+    Worlds(Framed<WorldsMenu>),
     Host(Framed<HostMenu>),
     Join(Framed<JoinMenu>),
 }
@@ -91,6 +93,13 @@ impl StartScreen for DefaultStart {
         let mut settings = Settings::default();
         let ctx = Self::dummy_ctx(facts, &mut settings);
         match &self.overlay {
+            Some(Overlay::Worlds(frame)) => {
+                let (view, sel) = frame.view_sel(&ctx);
+                MenuModel::from_view(view, sel, |a| match a {
+                    WorldsAction::Load(i) => facts.saves.get(*i).map(|slot| StartAction::Load(slot.id.clone())),
+                    WorldsAction::Back => None,
+                })
+            }
             Some(Overlay::Host(frame)) => {
                 let (view, sel) = frame.view_sel(&ctx);
                 MenuModel::from_view(view, sel, |_| None)
@@ -112,6 +121,7 @@ impl StartScreen for DefaultStart {
         let mut ctx = Self::dummy_ctx(facts, &mut settings);
         if let Some(overlay) = &mut self.overlay {
             let cmd = match overlay {
+                Overlay::Worlds(frame) => frame.update(intents, &mut ctx),
                 Overlay::Host(frame) => frame.update(intents, &mut ctx),
                 Overlay::Join(frame) => frame.update(intents, &mut ctx),
             };
@@ -120,6 +130,7 @@ impl StartScreen for DefaultStart {
                     self.overlay = None;
                     None
                 }
+                Command::Effect(AppEffect::Load(id)) => Some(StartAction::Load(id)),
                 Command::Effect(AppEffect::Host(info)) => Some(StartAction::Host(info)),
                 Command::Effect(AppEffect::Join(info)) => Some(StartAction::Join(info)),
                 _ => None,
@@ -132,6 +143,10 @@ impl StartScreen for DefaultStart {
             Some(Msg::Pick(action)) => {
                 self.main.notice = None;
                 match action {
+                    MainAction::Worlds => {
+                        self.overlay = Some(Overlay::Worlds(Framed::new(WorldsMenu)));
+                        None
+                    }
                     MainAction::Host => {
                         self.overlay = Some(Overlay::Host(Framed::new(HostMenu::new(facts.session))));
                         None
@@ -152,8 +167,8 @@ impl StartScreen for DefaultStart {
     }
 }
 
-/// The start menu: New World, one Load row per save, then Host/Join/Mods/
-/// Settings/Quit.
+/// The start menu: New World, Worlds (the saved-world page), then Host/Join/
+/// Mods/Settings/Quit. Saves are not listed inline so the menu stays short.
 struct MainMenu {
     notice: Option<String>,
 }
@@ -161,7 +176,7 @@ struct MainMenu {
 #[derive(Clone, Copy)]
 enum MainAction {
     NewWorld,
-    Load(usize),
+    Worlds,
     Host,
     Join,
     Mods,
@@ -169,14 +184,10 @@ enum MainAction {
     Quit,
 }
 
-fn start_action(action: MainAction, facts: &StartFacts) -> Option<StartAction> {
+fn start_action(action: MainAction, _facts: &StartFacts) -> Option<StartAction> {
     match action {
         MainAction::NewWorld => Some(StartAction::NewWorld),
-        MainAction::Load(i) => facts
-            .saves
-            .get(i)
-            .map(|slot| StartAction::Load(slot.id.clone())),
-        MainAction::Host | MainAction::Join => None,
+        MainAction::Worlds | MainAction::Host | MainAction::Join => None,
         MainAction::Mods => Some(StartAction::Mods),
         MainAction::Settings => Some(StartAction::Settings),
         MainAction::Quit => Some(StartAction::Quit),
@@ -189,20 +200,15 @@ impl MainMenu {
     }
 
     fn view(&self, facts: &StartFacts) -> View<MainAction> {
-        let mut rows = vec![Row::action("New World", MainAction::NewWorld)];
-        for (i, slot) in facts.saves.iter().enumerate() {
-            let row = match &slot.meta {
-                Ok(meta) => Row::action(format!("Load: {}", meta.name), MainAction::Load(i))
-                    .detail(format!(
-                        "{} · {} edits",
-                        fmt_playtime(meta.playtime_secs),
-                        meta.edit_count
-                    )),
-                Err(_) => Row::action(format!("Load: {} (damaged)", slot.id), MainAction::Load(i))
-                    .detail("unreadable — a backup may still load"),
-            };
-            rows.push(row);
-        }
+        let worlds_detail = match facts.saves.len() {
+            0 => "none saved yet".to_string(),
+            1 => "1 saved".to_string(),
+            n => format!("{n} saved"),
+        };
+        let mut rows = vec![
+            Row::action("New World", MainAction::NewWorld),
+            Row::action("Worlds", MainAction::Worlds).detail(worlds_detail),
+        ];
         rows.push(Row::action("Host Server", MainAction::Host));
         rows.push(Row::action("Join Server", MainAction::Join));
         rows.push(Row::action("Mods", MainAction::Mods));
@@ -217,6 +223,60 @@ impl MainMenu {
             default: None,
             hint: "Up/Down select   Enter choose".to_string(),
             notice: self.notice.clone().map(Notice::info),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorldsAction {
+    Load(usize),
+    Back,
+}
+
+/// The worlds page: one row per saved world (newest first, as the save store
+/// lists them), then Back. Enter loads; Esc goes back to the main menu.
+struct WorldsMenu;
+
+impl Menu for WorldsMenu {
+    type Action = WorldsAction;
+
+    fn view(&self, ctx: &Ctx) -> View<WorldsAction> {
+        let mut rows: Vec<Row<WorldsAction>> = Vec::with_capacity(ctx.saves.len() + 1);
+        if ctx.saves.is_empty() {
+            rows.push(Row::heading("No saved worlds yet — pick New World on the main menu"));
+        }
+        for (i, slot) in ctx.saves.iter().enumerate() {
+            let row = match &slot.meta {
+                Ok(meta) => Row::action(format!("Load: {}", meta.name), WorldsAction::Load(i))
+                    .detail(format!(
+                        "{} · {} edits",
+                        fmt_playtime(meta.playtime_secs),
+                        meta.edit_count
+                    )),
+                Err(_) => Row::action(format!("Load: {} (damaged)", slot.id), WorldsAction::Load(i))
+                    .detail("unreadable — a backup may still load"),
+            };
+            rows.push(row);
+        }
+        rows.push(Row::action("Back", WorldsAction::Back));
+        View {
+            title: "WORLDS".to_string(),
+            style: Style::Panel,
+            rows,
+            default: None,
+            hint: "Up/Down select   Enter load   Esc back".to_string(),
+            notice: None,
+        }
+    }
+
+    fn update(&mut self, msg: Msg<WorldsAction>, ctx: &mut Ctx) -> Command {
+        match msg {
+            Msg::Pick(WorldsAction::Load(i)) => match ctx.saves.get(i) {
+                Some(slot) => Command::Effect(AppEffect::Load(slot.id.clone())),
+                None => Command::Stay,
+            },
+            Msg::Pick(WorldsAction::Back) | Msg::Back => Command::Pop,
+            _ => Command::Stay,
         }
     }
 }
@@ -414,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn start_mod_main_menu_rows_match_today() {
+    fn start_mod_main_menu_is_short_and_lists_worlds_behind_one_row() {
         let session = Session::default();
         let saves = [Slot::for_test("alpha", 3661, 7), damaged("broken")];
         let f = StartFacts::test(&saves, &session, Some("could not join: refused"));
@@ -422,35 +482,12 @@ mod tests {
         let model = screen.view(&f);
         assert_eq!(
             model.labels(),
-            [
-                "New World",
-                "Load: alpha",
-                "Load: broken (damaged)",
-                "Host Server",
-                "Join Server",
-                "Mods",
-                "Settings",
-                "Quit",
-            ]
+            ["New World", "Worlds", "Host Server", "Join Server", "Mods", "Settings", "Quit"]
         );
-        assert_eq!(
-            model.rows[1].detail.as_deref(),
-            Some("1h 1m played · 7 edits")
-        );
-        assert_eq!(
-            model.rows[2].detail.as_deref(),
-            Some("unreadable — a backup may still load")
-        );
+        assert_eq!(model.rows[1].detail.as_deref(), Some("2 saved"));
         assert_eq!(
             model.actions(),
-            [
-                StartAction::NewWorld,
-                StartAction::Load(saves[0].id.clone()),
-                StartAction::Load(saves[1].id.clone()),
-                StartAction::Mods,
-                StartAction::Settings,
-                StartAction::Quit,
-            ]
+            [StartAction::NewWorld, StartAction::Mods, StartAction::Settings, StartAction::Quit]
         );
         assert_eq!(
             model.notice.as_ref().map(|n| n.text.as_str()),
@@ -458,6 +495,83 @@ mod tests {
         );
         assert!(matches!(model.style, Style::Title { .. }));
         assert_eq!(model.title, "PROJECT WATT CUBED");
+        let one = [Slot::for_test("alpha", 0, 0)];
+        let f1 = StartFacts::test(&one, &session, None);
+        assert_eq!(open(&f1).view(&f1).rows[1].detail.as_deref(), Some("1 saved"));
+        let none = StartFacts::test(&[], &session, None);
+        assert_eq!(open(&none).view(&none).rows[1].detail.as_deref(), Some("none saved yet"));
+    }
+
+    #[test]
+    fn worlds_page_lists_saves_loads_on_enter_and_backs_out() {
+        let session = Session::default();
+        let saves = [Slot::for_test("alpha", 3661, 7), damaged("broken")];
+        let f = StartFacts::test(&saves, &session, None);
+        let mut screen = open(&f);
+        // New World -> Worlds, open the page.
+        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        assert_eq!(screen.update(&[Intent::Confirm], &f), None);
+        let page = screen.view(&f);
+        assert_eq!(page.title, "WORLDS");
+        assert_eq!(page.labels(), ["Load: alpha", "Load: broken (damaged)", "Back"]);
+        assert_eq!(page.rows[0].detail.as_deref(), Some("1h 1m played · 7 edits"));
+        assert_eq!(
+            page.rows[1].detail.as_deref(),
+            Some("unreadable — a backup may still load")
+        );
+        assert_eq!(
+            page.actions(),
+            [
+                StartAction::Load(saves[0].id.clone()),
+                StartAction::Load(saves[1].id.clone())
+            ]
+        );
+        assert!(matches!(page.style, Style::Panel));
+        // Esc returns to the main menu without an action.
+        assert_eq!(screen.update(&[Intent::Cancel], &f), None);
+        assert_eq!(screen.view(&f).title, "PROJECT WATT CUBED");
+        // Back in, Enter on the first world loads it.
+        assert_eq!(screen.update(&[Intent::Confirm], &f), None);
+        assert_eq!(screen.view(&f).title, "WORLDS");
+        assert_eq!(
+            screen.update(&[Intent::Confirm], &f),
+            Some(StartAction::Load(saves[0].id.clone()))
+        );
+        // The second world, and the Back row.
+        let mut screen = open(&f);
+        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        screen.update(&[Intent::Confirm], &f);
+        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        assert_eq!(
+            screen.update(&[Intent::Confirm], &f),
+            Some(StartAction::Load(saves[1].id.clone()))
+        );
+        let mut screen = open(&f);
+        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        screen.update(&[Intent::Confirm], &f);
+        screen.update(&[Intent::Nav(Dir::Next), Intent::Nav(Dir::Next)], &f);
+        assert_eq!(screen.update(&[Intent::Confirm], &f), None, "Back pops the page");
+        assert_eq!(screen.view(&f).title, "PROJECT WATT CUBED");
+    }
+
+    #[test]
+    fn worlds_page_without_saves_explains_and_backs_out() {
+        let session = Session::default();
+        let f = StartFacts::test(&[], &session, None);
+        let mut screen = open(&f);
+        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        assert_eq!(screen.update(&[Intent::Confirm], &f), None);
+        let page = screen.view(&f);
+        assert_eq!(page.title, "WORLDS");
+        assert_eq!(
+            page.labels(),
+            ["No saved worlds yet — pick New World on the main menu", "Back"]
+        );
+        assert!(!page.rows[0].selectable);
+        assert!(page.actions().is_empty());
+        // The cursor lands on Back; Enter pops.
+        assert_eq!(screen.update(&[Intent::Confirm], &f), None);
+        assert_eq!(screen.view(&f).title, "PROJECT WATT CUBED");
     }
 
     #[test]
@@ -470,38 +584,15 @@ mod tests {
             screen.update(&[Intent::Confirm], &f),
             Some(StartAction::NewWorld)
         );
-        let mut screen = open(&f);
-        screen.update(&[Intent::Nav(Dir::Next)], &f);
-        assert_eq!(
-            screen.update(&[Intent::Confirm], &f),
-            Some(StartAction::Load(saves[0].id.clone()))
-        );
-        // No saves: New World, Host, Join, Mods, Settings, Quit.
+        // With or without saves: New World, Worlds, Host, Join, Mods, Settings, Quit.
         let empty = StartFacts::test(&[], &session, None);
-        let mut screen = open(&empty);
-        for _ in 0..4 {
-            screen.update(&[Intent::Nav(Dir::Next)], &empty);
+        for (steps, expected) in [(4, StartAction::Mods), (5, StartAction::Settings), (6, StartAction::Quit)] {
+            let mut screen = open(&empty);
+            for _ in 0..steps {
+                screen.update(&[Intent::Nav(Dir::Next)], &empty);
+            }
+            assert_eq!(screen.update(&[Intent::Confirm], &empty), Some(expected));
         }
-        assert_eq!(
-            screen.update(&[Intent::Confirm], &empty),
-            Some(StartAction::Settings)
-        );
-        let mut screen = open(&empty);
-        for _ in 0..3 {
-            screen.update(&[Intent::Nav(Dir::Next)], &empty);
-        }
-        assert_eq!(
-            screen.update(&[Intent::Confirm], &empty),
-            Some(StartAction::Mods)
-        );
-        let mut screen = open(&empty);
-        for _ in 0..5 {
-            screen.update(&[Intent::Nav(Dir::Next)], &empty);
-        }
-        assert_eq!(
-            screen.update(&[Intent::Confirm], &empty),
-            Some(StartAction::Quit)
-        );
     }
 
     #[test]
@@ -546,8 +637,8 @@ mod tests {
         let session = remembered("ignored-for-host", "6000", "Sam");
         let f = StartFacts::test(&[], &session, None);
         let mut screen = open(&f);
-        // New World -> Host Server
-        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        // New World -> Worlds -> Host Server
+        screen.update(&[Intent::Nav(Dir::Next), Intent::Nav(Dir::Next)], &f);
         assert_eq!(screen.update(&[Intent::Confirm], &f), None);
         assert_eq!(screen.view(&f).title, "HOST SERVER");
         assert_eq!(
@@ -565,9 +656,10 @@ mod tests {
         let session = remembered("8.8.8.8", "6000", "Sam");
         let f = StartFacts::test(&[], &session, None);
         let mut screen = open(&f);
-        // New World -> Host -> Join
-        screen.update(&[Intent::Nav(Dir::Next)], &f);
-        screen.update(&[Intent::Nav(Dir::Next)], &f);
+        // New World -> Worlds -> Host -> Join
+        for _ in 0..3 {
+            screen.update(&[Intent::Nav(Dir::Next)], &f);
+        }
         assert_eq!(screen.update(&[Intent::Confirm], &f), None);
         assert_eq!(screen.view(&f).title, "JOIN SERVER");
         assert_eq!(
