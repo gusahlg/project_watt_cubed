@@ -1,45 +1,70 @@
-//! The default crafting mod: take configurations from the stash into a pouch
-//! and place them. Natural mixing is gone; the manipulation workbench is a
-//! later task.
+//! The default crafting mod: take configurations from the stash into a pouch,
+//! apply physical events at a workbench, and place the result.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
+use material::EventKind;
 use voxel_engine::DVec3;
 
-use crate::block::registry::BlockId;
+use crate::block::registry::{interact_repeat, BlockId};
 use crate::block::AIR;
 use crate::derived::Memo;
 use crate::math::{Aabb, Bounded};
 use crate::mods::inventory::{InventoryMod, PANEL_X, PANEL_Y};
-use crate::mods::{ItemUiState, Mod, ModContext};
+use crate::mods::{CraftRequest, ItemUiState, Mod, ModContext};
 use crate::player::Player;
-use crate::stash::ElementStash;
-use crate::ui::{visible_window, HudElement, Panel, Role, Row};
+use crate::stash::{ElementStash, START_CAPACITY};
+use crate::ui::{visible_window, HudElement, Line, Panel, Role, Row};
 use crate::world::World;
 
-const PANEL_WIDTH: i32 = 360;
+const PANEL_WIDTH: i32 = 400;
 const PANEL_PAD: i32 = 8;
 const FONT_SIZE: i32 = 18;
 const LINE_HEIGHT: i32 = FONT_SIZE + 4;
 const BOTTOM_RESERVE: i32 = 190;
+const REPEAT_MIN: u8 = 1;
+const REPEAT_MAX: u8 = 16;
 
-/// One pouch entry: its id, its portable spec, and how many are left to place.
-struct Crafted {
-    id: BlockId,
-    spec: Box<str>,
-    count: u32,
+const EVENTS: [(EventKind, &str); 3] = [
+    (EventKind::NewContact, "touch"),
+    (EventKind::Collision, "strike"),
+    (EventKind::Moved, "shake"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Workbench,
+    Journal,
 }
 
-/// The crafting panel, the pouch, and right-click placement.
+/// A recorded apply that produced a new configuration id for this player.
+/// Never consulted by the simulation.
+struct Procedure {
+    origin_spec: Box<str>,
+    target_spec: Box<str>,
+    event: EventKind,
+    repeat: u8,
+    result_spec: Box<str>,
+    name: Option<Box<str>>,
+}
+
+/// The crafting panel, the pouch, the workbench, and right-click placement.
 pub struct CraftingMod {
     /// Shared with inventory so this expanded panel replaces its compact view.
     ui: Rc<Cell<ItemUiState>>,
-    /// Cursor over the panel rows: stash kinds, then pouch entries.
+    /// Cursor over the panel rows.
     cursor: usize,
-    /// Pouch holdings, in first-taken order.
-    crafted: Vec<Crafted>,
-    /// Index into `crafted` of the block RMB places, if any.
-    equipped: Option<usize>,
+    tab: Tab,
+    /// Pouch holdings, in first-taken order. Capacity matches the stash.
+    pouch: ElementStash,
+    /// Index into the pouch of the block RMB places, if any — stored as id.
+    equipped: Option<BlockId>,
+    origin: Option<BlockId>,
+    target: Option<BlockId>,
+    event: usize,
+    repeat: u8,
+    journal: Vec<Procedure>,
     /// Held block ids mirrored from the stash only when its revision changes.
     held: Vec<BlockId>,
     seen_stash_rev: u64,
@@ -52,8 +77,14 @@ impl CraftingMod {
         Self {
             ui,
             cursor: 0,
-            crafted: Vec::new(),
+            tab: Tab::Workbench,
+            pouch: ElementStash::new(START_CAPACITY),
             equipped: None,
+            origin: None,
+            target: None,
+            event: 0,
+            repeat: REPEAT_MIN,
+            journal: Vec::new(),
             held: Vec::new(),
             seen_stash_rev: 0,
             hud_gen: Cell::new(0),
@@ -79,8 +110,15 @@ impl CraftingMod {
         self.bump_hud();
     }
 
+    fn event_kind(&self) -> EventKind {
+        EVENTS[self.event].0
+    }
+
     fn row_count(&self) -> usize {
-        self.held.len() + self.crafted.len()
+        match self.tab {
+            Tab::Workbench => 1 + self.held.len() + self.pouch.iter().count() + 5,
+            Tab::Journal => 1 + self.journal.len().max(1),
+        }
     }
 
     fn refresh(&mut self, stash: &ElementStash) -> bool {
@@ -111,36 +149,263 @@ impl CraftingMod {
 
     fn navigate(&mut self, ctx: &mut ModContext) {
         let cursor = self.cursor;
+        let tab = self.tab;
+        let event = self.event;
+        let repeat = self.repeat;
         if ctx.nav_up {
             self.cursor = self.cursor.saturating_sub(1);
         }
         if ctx.nav_down && self.row_count() > 0 {
             self.cursor = (self.cursor + 1).min(self.row_count() - 1);
         }
+        if ctx.nav_tab {
+            self.toggle_tab();
+        }
+        if ctx.nav_left {
+            self.nudge(-1);
+        }
+        if ctx.nav_right {
+            self.nudge(1);
+        }
         if ctx.nav_confirm {
             self.activate(ctx);
         }
-        if self.cursor != cursor {
+        if self.cursor != cursor
+            || self.tab != tab
+            || self.event != event
+            || self.repeat != repeat
+        {
             self.bump_hud();
         }
     }
 
-    /// Confirm on a stash row takes one unit into the pouch; on a pouch row, equips it.
-    fn activate(&mut self, ctx: &mut ModContext) {
+    fn toggle_tab(&mut self) {
+        self.tab = match self.tab {
+            Tab::Workbench => Tab::Journal,
+            Tab::Journal => Tab::Workbench,
+        };
+        self.cursor = 0;
+    }
+
+    fn nudge(&mut self, delta: i32) {
+        if self.tab != Tab::Workbench {
+            if self.cursor == 0 {
+                self.toggle_tab();
+            }
+            return;
+        }
+        let layout = self.workbench_layout();
+        if self.cursor == layout.tab {
+            self.toggle_tab();
+        } else if self.cursor == layout.event {
+            let n = EVENTS.len() as i32;
+            self.event = (self.event as i32 + delta).rem_euclid(n) as usize;
+        } else if self.cursor == layout.repeat {
+            let v = self.repeat as i32 + delta;
+            self.repeat = v.clamp(REPEAT_MIN as i32, REPEAT_MAX as i32) as u8;
+        }
+    }
+
+    fn workbench_layout(&self) -> WorkbenchLayout {
         let held = self.held.len();
-        if self.cursor < held {
-            let id = self.held[self.cursor];
+        let pouch = self.pouch.iter().count();
+        let stash_start = 1;
+        let pouch_start = stash_start + held;
+        let origin = pouch_start + pouch;
+        WorkbenchLayout {
+            tab: 0,
+            stash_start,
+            pouch_start,
+            origin,
+            target: origin + 1,
+            event: origin + 2,
+            repeat: origin + 3,
+            apply: origin + 4,
+        }
+    }
+
+    /// Confirm on a stash row takes one unit into the pouch; on a pouch row, equips
+    /// it and fills the next workbench slot; on Apply, runs the law.
+    fn activate(&mut self, ctx: &mut ModContext) {
+        if self.tab == Tab::Journal {
+            if self.cursor == 0 {
+                self.toggle_tab();
+                self.bump_hud();
+            }
+            return;
+        }
+        let layout = self.workbench_layout();
+        if self.cursor == layout.tab {
+            self.toggle_tab();
+            self.bump_hud();
+            return;
+        }
+        if self.cursor >= layout.stash_start && self.cursor < layout.pouch_start {
+            let id = self.held[self.cursor - layout.stash_start];
             if !ctx.player.stash.consume(id, 1) {
                 self.refresh(&ctx.player.stash);
                 return;
             }
-            self.push_loaded(ctx.world, id, 1, false);
+            if !self.pouch.add(id, 1) {
+                ctx.player.stash.add(id, 1);
+                self.refresh(&ctx.player.stash);
+                return;
+            }
             self.bump_hud();
             self.refresh(&ctx.player.stash);
-        } else if !self.crafted.is_empty() {
-            self.equipped = Some(self.cursor - held);
-            self.bump_hud();
+            return;
         }
+        if self.cursor >= layout.pouch_start && self.cursor < layout.origin {
+            let i = self.cursor - layout.pouch_start;
+            if let Some((id, _)) = self.pouch.iter().nth(i) {
+                self.equipped = Some(id);
+                if self.origin.is_none() {
+                    self.origin = Some(id);
+                } else {
+                    self.target = Some(id);
+                }
+                self.bump_hud();
+            }
+            return;
+        }
+        if self.cursor == layout.origin {
+            self.origin = None;
+            self.bump_hud();
+            return;
+        }
+        if self.cursor == layout.target {
+            self.target = None;
+            self.bump_hud();
+            return;
+        }
+        if self.cursor == layout.event {
+            self.event = (self.event + 1) % EVENTS.len();
+            self.bump_hud();
+            return;
+        }
+        if self.cursor == layout.repeat {
+            self.repeat = if self.repeat == REPEAT_MAX {
+                REPEAT_MIN
+            } else {
+                self.repeat + 1
+            };
+            self.bump_hud();
+            return;
+        }
+        if self.cursor == layout.apply {
+            self.apply(ctx);
+        }
+    }
+
+    fn apply(&mut self, ctx: &mut ModContext) {
+        let Some(oid) = self.origin else { return };
+        let Some(tid) = self.target else { return };
+        if self.pouch.count(tid) < 1 {
+            return;
+        }
+        let origin_spec: Arc<str> = ctx.world.registry().spec(oid).into();
+        let target_spec: Arc<str> = ctx.world.registry().spec(tid).into();
+        let event = self.event_kind() as u8;
+        let repeat = self.repeat;
+        if ctx.networked {
+            ctx.crafts.push(CraftRequest {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+            });
+            return;
+        }
+        self.commit(
+            ctx.world,
+            &origin_spec,
+            &target_spec,
+            self.event_kind(),
+            repeat,
+            None,
+        );
+    }
+
+    fn commit(
+        &mut self,
+        world: &mut World,
+        origin_spec: &str,
+        target_spec: &str,
+        event: EventKind,
+        repeat: u8,
+        result_spec: Option<&str>,
+    ) {
+        let Some(tid) = world.registry_mut().parse_spec(target_spec) else {
+            return;
+        };
+        if self.pouch.count(tid) < 1 {
+            return;
+        }
+        let (rid, was_new) = if let Some(spec) = result_spec {
+            let was_new = world.registry().lookup_spec(spec).is_none();
+            let Some(id) = world.registry_mut().parse_spec(spec) else {
+                return;
+            };
+            (id, was_new)
+        } else {
+            let Some(oid) = world.registry_mut().parse_spec(origin_spec) else {
+                return;
+            };
+            let origin = world.registry().configuration(oid).clone();
+            let target = world.registry().configuration(tid).clone();
+            let law = *world.registry().law();
+            let result = interact_repeat(&law, &origin, &target, event, repeat);
+            let was_new = world.registry().lookup(&result).is_none();
+            let Some(id) = world.registry_mut().intern(&result) else {
+                return;
+            };
+            (id, was_new)
+        };
+        self.finish_commit(
+            world,
+            origin_spec,
+            target_spec,
+            event,
+            repeat,
+            tid,
+            rid,
+            was_new,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_commit(
+        &mut self,
+        world: &World,
+        origin_spec: &str,
+        target_spec: &str,
+        event: EventKind,
+        repeat: u8,
+        tid: BlockId,
+        rid: BlockId,
+        was_new: bool,
+    ) {
+        if !self.pouch.consume(tid, 1) {
+            return;
+        }
+        if !self.pouch.add(rid, 1) {
+            self.pouch.add(tid, 1);
+            return;
+        }
+        if self.equipped == Some(tid) && self.pouch.count(tid) == 0 {
+            self.equipped = None;
+        }
+        if was_new {
+            self.journal.push(Procedure {
+                origin_spec: origin_spec.into(),
+                target_spec: target_spec.into(),
+                event,
+                repeat,
+                result_spec: world.registry().spec(rid).into(),
+                name: None,
+            });
+        }
+        self.bump_hud();
     }
 
     fn try_place(&mut self, ctx: &mut ModContext) {
@@ -150,7 +415,7 @@ impl CraftingMod {
         let Some(equipped) = self.equipped else {
             return;
         };
-        if self.crafted[equipped].count == 0 {
+        if self.pouch.count(equipped) == 0 {
             return;
         }
         let Some((x, y, z)) = ctx.place_target else {
@@ -159,30 +424,47 @@ impl CraftingMod {
         if ctx.world.block_at(x, y, z) != AIR || cell_aabb(x, y, z).intersects(&ctx.player.aabb()) {
             return;
         }
-        ctx.placements.push((x, y, z, self.crafted[equipped].id));
-        self.crafted[equipped].count -= 1;
+        ctx.placements.push((x, y, z, equipped));
+        self.pouch.consume(equipped, 1);
+        if self.pouch.count(equipped) == 0 {
+            self.equipped = None;
+        }
         self.bump_hud();
     }
 
-    fn push_loaded(&mut self, world: &World, id: BlockId, count: u32, equip: bool) {
-        let at = match self.crafted.iter().position(|c| c.id == id) {
-            Some(at) => {
-                self.crafted[at].count += count;
-                at
-            }
-            None => {
-                self.crafted.push(Crafted {
-                    id,
-                    spec: world.registry().spec(id).into(),
-                    count,
-                });
-                self.crafted.len() - 1
-            }
-        };
+    fn push_loaded(&mut self, _world: &World, id: BlockId, count: u32, equip: bool) {
+        self.pouch.add(id, count);
         if equip {
-            self.equipped = Some(at);
+            self.equipped = Some(id);
         }
     }
+
+    fn name_procedure(&mut self, args: &[&str]) -> Vec<Line> {
+        let Some(n) = args.first().and_then(|s| s.parse::<usize>().ok()) else {
+            return vec![Line::of(Role::Danger, "usage: name <n> <text>")];
+        };
+        if n == 0 || n > self.journal.len() {
+            return vec![Line::of(Role::Danger, "name: no such procedure")];
+        }
+        let text = args[1..].join(" ");
+        if text.is_empty() {
+            return vec![Line::of(Role::Danger, "usage: name <n> <text>")];
+        }
+        self.journal[n - 1].name = Some(text.into());
+        self.bump_hud();
+        vec![Line::of(Role::Positive, format!("procedure {n} named"))]
+    }
+}
+
+struct WorkbenchLayout {
+    tab: usize,
+    stash_start: usize,
+    pouch_start: usize,
+    origin: usize,
+    target: usize,
+    event: usize,
+    repeat: usize,
+    apply: usize,
 }
 
 fn cell_aabb(x: i32, y: i32, z: i32) -> Aabb {
@@ -192,12 +474,33 @@ fn cell_aabb(x: i32, y: i32, z: i32) -> Aabb {
     )
 }
 
+fn event_name(kind: EventKind) -> &'static str {
+    EVENTS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, n)| *n)
+        .unwrap_or("?")
+}
+
+fn slot_name(world: &World, id: Option<BlockId>) -> String {
+    match id {
+        Some(id) => world.registry().display_name(id),
+        None => "(empty)".into(),
+    }
+}
+
 fn paint_crafting(
     stash: &ElementStash,
     ui: ItemUiState,
     cursor: usize,
-    crafted: &[Crafted],
-    equipped: Option<usize>,
+    tab: Tab,
+    pouch: &ElementStash,
+    equipped: Option<BlockId>,
+    origin: Option<BlockId>,
+    target: Option<BlockId>,
+    event: usize,
+    repeat: u8,
+    journal: &[Procedure],
     world: &World,
     screen_w: i32,
     screen_h: i32,
@@ -208,67 +511,42 @@ fn paint_crafting(
         let Some(equipped) = equipped else {
             return Vec::new();
         };
-        let entry = &crafted[equipped];
+        if pouch.count(equipped) == 0 {
+            return Vec::new();
+        }
         let kinds = stash.iter().count();
         let y = if ui.inventory_visible {
             InventoryMod::panel_bottom(screen_h, kinds) + 6
         } else {
             PANEL_Y
         };
-        let name = world.registry().label(entry.id).unwrap_or("unknown material");
-        let hint = format!("Equipped: {name} x{}", entry.count);
+        let name = world.registry().display_name(equipped);
+        let hint = format!("Equipped: {name} x{}", pouch.count(equipped));
         let hint_w = (hint.chars().count() as i32 * FONT_SIZE + PANEL_PAD * 2).min(width);
         return vec![HudElement::Panel(Panel {
             at: (PANEL_X, y),
             width: hint_w,
             header: Vec::new().into(),
-            rows: vec![Row::new(Role::Muted, hint)].into(),
+            rows: vec![Row::new(Role::Muted, hint)
+                .with_swatch(world.registry().color(equipped))]
+            .into(),
         })];
     }
 
-    let held: Vec<(BlockId, u32)> = stash.iter().collect();
-    let held_n = held.len();
-    let total_rows = held_n + crafted.len();
-    let header_rows = 1;
-    let content_y = PANEL_Y + PANEL_PAD + header_rows as i32 * LINE_HEIGHT + 2;
-    let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
-    let window = visible_window(total_rows, cursor, capacity);
-
     let header = vec![Row::new(
         Role::Warning,
-        format!("Pouch  take from stash / place from pouch"),
+        match tab {
+            Tab::Workbench => "Workbench  take / slot / apply",
+            Tab::Journal => "Journal  /name <n> <text>",
+        },
     )];
 
-    let rows: Vec<Row> = window
-        .map(|row_index| {
-            let active = cursor == row_index;
-            let cursor_mark = if active { ">" } else { " " };
-            if row_index < held_n {
-                let (id, count) = held[row_index];
-                let name = world.registry().label(id).unwrap_or("unknown material");
-                Row::new(
-                    if active { Role::Accent } else { Role::Muted },
-                    format!("{cursor_mark} {count}x {name}"),
-                )
-            } else {
-                let i = row_index - held_n;
-                let entry = &crafted[i];
-                let name = world.registry().label(entry.id).unwrap_or("unknown material");
-                let equipped_mark = if equipped == Some(i) { "[E]" } else { "   " };
-                let role = if equipped == Some(i) {
-                    Role::Positive
-                } else if active {
-                    Role::Accent
-                } else {
-                    Role::Muted
-                };
-                Row::new(
-                    role,
-                    format!("{cursor_mark} {equipped_mark} {}x {name}", entry.count),
-                )
-            }
-        })
-        .collect();
+    let rows = match tab {
+        Tab::Workbench => paint_workbench(
+            stash, cursor, pouch, equipped, origin, target, event, repeat, world, screen_h,
+        ),
+        Tab::Journal => paint_journal(cursor, journal, world, screen_h),
+    };
 
     vec![HudElement::Panel(Panel {
         at: (PANEL_X, PANEL_Y),
@@ -276,6 +554,229 @@ fn paint_crafting(
         header: header.into(),
         rows: rows.into(),
     })]
+}
+
+fn paint_workbench(
+    stash: &ElementStash,
+    cursor: usize,
+    pouch: &ElementStash,
+    equipped: Option<BlockId>,
+    origin: Option<BlockId>,
+    target: Option<BlockId>,
+    event: usize,
+    repeat: u8,
+    world: &World,
+    screen_h: i32,
+) -> Vec<Row> {
+    let held: Vec<(BlockId, u32)> = stash.iter().collect();
+    let pouch_entries: Vec<(BlockId, u32)> = pouch.iter().collect();
+    let held_n = held.len();
+    let pouch_n = pouch_entries.len();
+    let total = 1 + held_n + pouch_n + 5;
+    let content_y = PANEL_Y + PANEL_PAD + LINE_HEIGHT + 2;
+    let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
+    let window = visible_window(total, cursor, capacity);
+
+    window
+        .map(|row_index| {
+            let active = cursor == row_index;
+            let mark = if active { ">" } else { " " };
+            let role = if active { Role::Accent } else { Role::Muted };
+            if row_index == 0 {
+                return Row::new(role, format!("{mark} [Workbench]  Journal"));
+            }
+            let i = row_index - 1;
+            if i < held_n {
+                let (id, count) = held[i];
+                let name = world.registry().display_name(id);
+                return Row::new(role, format!("{mark} {count}x {name}"))
+                    .with_swatch(world.registry().color(id));
+            }
+            let i = i - held_n;
+            if i < pouch_n {
+                let (id, count) = pouch_entries[i];
+                let name = world.registry().display_name(id);
+                let eq = if equipped == Some(id) { "[E]" } else { "   " };
+                let role = if equipped == Some(id) {
+                    Role::Positive
+                } else {
+                    role
+                };
+                return Row::new(role, format!("{mark} {eq} {count}x {name}"))
+                    .with_swatch(world.registry().color(id));
+            }
+            let i = i - pouch_n;
+            match i {
+                0 => {
+                    let name = slot_name(world, origin);
+                    let mut row = Row::new(role, format!("{mark} Origin: {name}"));
+                    if let Some(id) = origin {
+                        row = row.with_swatch(world.registry().color(id));
+                    }
+                    row
+                }
+                1 => {
+                    let name = slot_name(world, target);
+                    let mut row = Row::new(role, format!("{mark} Target: {name}"));
+                    if let Some(id) = target {
+                        row = row.with_swatch(world.registry().color(id));
+                    }
+                    row
+                }
+                2 => Row::new(role, format!("{mark} Event: {}", EVENTS[event].1)),
+                3 => Row::new(role, format!("{mark} Repeat: {repeat}")),
+                _ => Row::new(
+                    if active { Role::Positive } else { Role::Muted },
+                    format!("{mark} Apply"),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn paint_journal(cursor: usize, journal: &[Procedure], world: &World, screen_h: i32) -> Vec<Row> {
+    let body = journal.len().max(1);
+    let total = 1 + body;
+    let content_y = PANEL_Y + PANEL_PAD + LINE_HEIGHT + 2;
+    let capacity = ((screen_h - BOTTOM_RESERVE - content_y) / LINE_HEIGHT).max(1) as usize;
+    let window = visible_window(total, cursor, capacity);
+    window
+        .map(|row_index| {
+            let active = cursor == row_index;
+            let mark = if active { ">" } else { " " };
+            let role = if active { Role::Accent } else { Role::Muted };
+            if row_index == 0 {
+                return Row::new(role, format!("{mark} Workbench  [Journal]"));
+            }
+            if journal.is_empty() {
+                return Row::new(Role::Dim, format!("{mark} (empty)"));
+            }
+            let i = row_index - 1;
+            let p = &journal[i];
+            let title = p.name.as_deref().unwrap_or("unnamed");
+            let origin = spec_name(world, &p.origin_spec);
+            let target = spec_name(world, &p.target_spec);
+            let result = spec_name(world, &p.result_spec);
+            Row::new(
+                role,
+                format!(
+                    "{mark} {}. {title}  {origin} + {target} {} x{} → {result}",
+                    i + 1,
+                    event_name(p.event),
+                    p.repeat
+                ),
+            )
+        })
+        .collect()
+}
+
+fn spec_name(world: &World, spec: &str) -> String {
+    world
+        .registry()
+        .lookup_spec(spec)
+        .map(|id| world.registry().display_name(id))
+        .unwrap_or_else(|| "unknown material".into())
+}
+
+fn encode_pouch(pouch: &ElementStash, equipped: Option<BlockId>, world: &World) -> String {
+    pouch
+        .iter()
+        .map(|(id, count)| {
+            let star = if equipped == Some(id) { "*" } else { "" };
+            format!("{star}{}={count}", world.registry().spec(id))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_pouch(mod_: &mut CraftingMod, data: &str, world: &mut World) -> u32 {
+    let mut skipped = 0u32;
+    for raw in data.split(',').filter(|s| !s.is_empty()) {
+        let (equip, entry) = match raw.strip_prefix('*') {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        let Some((spec, count)) = entry.rsplit_once('=') else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u32>() else {
+            continue;
+        };
+        let Some(id) = world.registry_mut().parse_spec(spec) else {
+            skipped += 1;
+            continue;
+        };
+        mod_.push_loaded(world, id, count, equip);
+    }
+    skipped
+}
+
+fn encode_journal(journal: &[Procedure]) -> String {
+    journal
+        .iter()
+        .map(|p| {
+            let name = p
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .replace('\t', " ")
+                .replace('\n', " ");
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{name}",
+                p.origin_spec,
+                p.target_spec,
+                p.event as u8,
+                p.repeat,
+                p.result_spec
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_journal(data: &str, world: &mut World) -> Vec<Procedure> {
+    let mut out = Vec::new();
+    for line in data.lines().filter(|s| !s.is_empty()) {
+        let mut parts = line.splitn(6, '\t');
+        let Some(origin_spec) = parts.next() else { continue };
+        let Some(target_spec) = parts.next() else { continue };
+        let Some(event) = parts.next().and_then(|s| s.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(repeat) = parts.next().and_then(|s| s.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(result_spec) = parts.next() else { continue };
+        let name = parts.next().unwrap_or("");
+        let Some(event) = crate::net::protocol::workbench_event(event) else {
+            continue;
+        };
+        if !(REPEAT_MIN..=REPEAT_MAX).contains(&repeat) {
+            continue;
+        }
+        if world.registry_mut().parse_spec(origin_spec).is_none() {
+            continue;
+        }
+        if world.registry_mut().parse_spec(target_spec).is_none() {
+            continue;
+        }
+        if world.registry_mut().parse_spec(result_spec).is_none() {
+            continue;
+        }
+        out.push(Procedure {
+            origin_spec: origin_spec.into(),
+            target_spec: target_spec.into(),
+            event,
+            repeat,
+            result_spec: result_spec.into(),
+            name: if name.is_empty() {
+                None
+            } else {
+                Some(name.into())
+            },
+        });
+    }
+    out
 }
 
 impl Mod for CraftingMod {
@@ -290,15 +791,21 @@ impl Mod for CraftingMod {
     fn reset(&mut self) {
         self.set_open(false);
         self.cursor = 0;
-        self.crafted.clear();
+        self.tab = Tab::Workbench;
+        self.pouch.clear();
         self.equipped = None;
+        self.origin = None;
+        self.target = None;
+        self.event = 0;
+        self.repeat = REPEAT_MIN;
+        self.journal.clear();
         self.held.clear();
         self.seen_stash_rev = 0;
         self.bump_hud();
     }
 
     fn description(&self) -> &str {
-        "Take blocks from the stash into a pouch and place them (press C)."
+        "Take configurations into a pouch, apply events at the workbench, and place them (press C)."
     }
 
     fn group(&self) -> &'static str {
@@ -322,6 +829,38 @@ impl Mod for CraftingMod {
         self.bump_hud();
     }
 
+    fn on_craft_result(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: u8,
+        repeat: u8,
+        result_spec: &str,
+        world: &mut World,
+    ) {
+        let Some(kind) = crate::net::protocol::workbench_event(event) else {
+            return;
+        };
+        if result_spec.is_empty() || !(REPEAT_MIN..=REPEAT_MAX).contains(&repeat) {
+            return;
+        }
+        self.commit(
+            world,
+            origin_spec,
+            target_spec,
+            kind,
+            repeat,
+            Some(result_spec),
+        );
+    }
+
+    fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        if cmd != "name" {
+            return None;
+        }
+        Some(self.name_procedure(args))
+    }
+
     fn hud(
         &self,
         world: &World,
@@ -340,11 +879,20 @@ impl Mod for CraftingMod {
         );
         let stash = &player.stash;
         let cursor = self.cursor;
-        let crafted = self.crafted.as_slice();
+        let tab = self.tab;
+        let pouch = &self.pouch;
         let equipped = self.equipped;
+        let origin = self.origin;
+        let target = self.target;
+        let event = self.event;
+        let repeat = self.repeat;
+        let journal = self.journal.as_slice();
         let mut cache = self.hud_cache.borrow_mut();
         let cached = cache.get_or(key, || {
-            paint_crafting(stash, ui, cursor, crafted, equipped, world, screen_w, screen_h)
+            paint_crafting(
+                stash, ui, cursor, tab, pouch, equipped, origin, target, event, repeat, journal,
+                world, screen_w, screen_h,
+            )
         });
         out.extend(cached.iter().cloned());
     }
@@ -358,44 +906,36 @@ impl Mod for CraftingMod {
         }
     }
 
-    fn save_state(&self, _world: &World) -> Option<(u16, String)> {
-        if self.crafted.is_empty() {
-            return None;
+    fn save_state(&self, world: &World) -> Option<(u16, String)> {
+        let pouch = encode_pouch(&self.pouch, self.equipped, world);
+        if self.journal.is_empty() {
+            if pouch.is_empty() {
+                return None;
+            }
+            return Some((1, pouch));
         }
-        let entries: Vec<String> = self
-            .crafted
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let star = if self.equipped == Some(i) { "*" } else { "" };
-                format!("{star}{}={}", entry.spec, entry.count)
-            })
-            .collect();
-        Some((1, entries.join(",")))
+        Some((2, format!("{pouch}\nJ\n{}", encode_journal(&self.journal))))
     }
 
-    fn load_state(&mut self, _version: u16, data: &str, world: &mut World) -> u32 {
-        self.crafted.clear();
+    fn load_state(&mut self, version: u16, data: &str, world: &mut World) -> u32 {
+        self.pouch.clear();
         self.equipped = None;
+        self.origin = None;
+        self.target = None;
+        self.journal.clear();
         self.cursor = 0;
-        let mut skipped = 0u32;
-        for raw in data.split(',').filter(|s| !s.is_empty()) {
-            let (equip, entry) = match raw.strip_prefix('*') {
-                Some(rest) => (true, rest),
-                None => (false, raw),
-            };
-            let Some((spec, count)) = entry.rsplit_once('=') else {
-                continue;
-            };
-            let Ok(count) = count.parse::<u32>() else {
-                continue;
-            };
-            let Some(id) = world.registry_mut().parse_spec(spec) else {
-                skipped += 1;
-                continue;
-            };
-            self.push_loaded(world, id, count, equip);
-        }
+        let skipped = if version >= 2 {
+            match data.split_once("\nJ\n") {
+                Some((pouch, journal)) => {
+                    let skipped = decode_pouch(self, pouch, world);
+                    self.journal = decode_journal(journal, world);
+                    skipped
+                }
+                None => decode_pouch(self, data, world),
+            }
+        } else {
+            decode_pouch(self, data, world)
+        };
         self.bump_hud();
         skipped
     }
@@ -404,9 +944,49 @@ impl Mod for CraftingMod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::registry::BlockRegistry;
+    use material::{interact, Configuration, Element};
 
     fn test_mod() -> CraftingMod {
         CraftingMod::new(Rc::new(Cell::new(ItemUiState::default())))
+    }
+
+    fn mod_ctx<'a>(
+        player: &'a mut Player,
+        world: &'a mut World,
+        placements: Vec<(i32, i32, i32, BlockId)>,
+    ) -> ModContext<'a> {
+        ModContext {
+            player,
+            world,
+            screen_w: 800,
+            screen_h: 600,
+            place: false,
+            place_target: None,
+            toggle_inventory: false,
+            toggle_crafting: false,
+            nav_up: false,
+            nav_down: false,
+            nav_left: false,
+            nav_right: false,
+            nav_tab: false,
+            nav_confirm: false,
+            networked: false,
+            placements,
+            crafts: Vec::new(),
+        }
+    }
+
+    fn reactive_pair(world: &mut World) -> (BlockId, BlockId, Configuration, Configuration) {
+        let (a, b) = crate::sim::reactions::reactive_region_pair(world.registry_mut());
+        let law = *world.registry().law();
+        let ca = world.registry().configuration(a).clone();
+        let cb = world.registry().configuration(b).clone();
+        if interact(&law, &ca, &cb, EventKind::Collision).changed {
+            (a, b, ca, cb)
+        } else {
+            (b, a, cb, ca)
+        }
     }
 
     #[test]
@@ -418,9 +998,9 @@ mod tests {
         let rock_spec = world.registry().spec(rock);
         let soil_spec = world.registry().spec(soil);
         crafting.load_state(1, &format!("{soil_spec}=2,*{rock_spec}=1"), &mut world);
-        assert_eq!(crafting.crafted.len(), 2);
-        assert_eq!(crafting.crafted[0].count, 2);
-        assert_eq!(crafting.equipped, Some(1));
+        assert_eq!(crafting.pouch.total(), 3);
+        assert_eq!(crafting.pouch.count(soil), 2);
+        assert_eq!(crafting.equipped, Some(rock));
         assert_eq!(
             crafting.save_state(&world),
             Some((1, format!("{soil_spec}=2,*{rock_spec}=1")))
@@ -435,9 +1015,8 @@ mod tests {
         let mut crafting = test_mod();
         let skipped = crafting.load_state(1, &format!("natural:Stone=5,*{spec}=3"), &mut world);
         assert_eq!(skipped, 1);
-        assert_eq!(crafting.crafted.len(), 1);
-        assert_eq!(crafting.crafted[0].id, rock);
-        assert_eq!(crafting.crafted[0].count, 3);
+        assert_eq!(crafting.pouch.total(), 3);
+        assert_eq!(crafting.pouch.count(rock), 3);
     }
 
     #[test]
@@ -503,30 +1082,240 @@ mod tests {
 
     #[test]
     fn take_moves_one_unit_stash_to_pouch() {
-        let world = World::new(1);
+        let mut world = World::new(1);
         let rock = world.registry().id_by_label("rock").unwrap();
         let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
         player.stash.add(rock, 2);
         let mut crafting = test_mod();
         crafting.refresh(&player.stash);
-        let mut ctx = ModContext {
-            player: &mut player,
-            world: &mut World::new(1),
-            screen_w: 800,
-            screen_h: 600,
-            place: false,
-            place_target: None,
-            toggle_inventory: false,
-            toggle_crafting: false,
-            nav_up: false,
-            nav_down: false,
-            nav_confirm: false,
-            placements: Vec::new(),
-        };
+        crafting.tab = Tab::Workbench;
+        crafting.cursor = 1;
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
         crafting.activate(&mut ctx);
         assert_eq!(ctx.player.stash.count(rock), 1);
-        assert_eq!(crafting.crafted[0].count, 1);
-        assert_eq!(crafting.crafted[0].id, rock);
+        assert_eq!(crafting.pouch.count(rock), 1);
+    }
+
+    #[test]
+    fn apply_is_deterministic_and_equals_interact() {
+        let mut world = World::new(1);
+        let (origin, target, ca, cb) = reactive_pair(&mut world);
+        let law = *world.registry().law();
+        let expected = interact(&law, &ca, &cb, EventKind::Collision).target;
+        let mut crafting = test_mod();
+        crafting.pouch.add(origin, 1);
+        crafting.pouch.add(target, 1);
+        crafting.origin = Some(origin);
+        crafting.target = Some(target);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::Collision).unwrap();
+        crafting.repeat = 1;
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+        crafting.apply(&mut ctx);
+        assert_eq!(crafting.pouch.count(target), 0);
+        assert_eq!(crafting.pouch.count(origin), 1, "origin is the tool");
+        let rid = ctx.world.registry().lookup(&expected).expect("result interned");
+        assert_eq!(crafting.pouch.count(rid), 1);
+        assert_eq!(ctx.world.registry().configuration(rid), &expected);
+        let origin_spec = ctx.world.registry().spec(origin);
+        let target_spec = ctx.world.registry().spec(target);
+        let result_spec = ctx.world.registry().spec(rid);
+
+        let mut world2 = World::new(1);
+        let o2 = world2.registry_mut().parse_spec(&origin_spec).unwrap();
+        let t2 = world2.registry_mut().parse_spec(&target_spec).unwrap();
+        let mut r2 = test_mod();
+        r2.pouch.add(o2, 1);
+        r2.pouch.add(t2, 1);
+        r2.origin = Some(o2);
+        r2.target = Some(t2);
+        r2.event = crafting.event;
+        r2.repeat = 1;
+        let mut player2 = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut ctx2 = mod_ctx(&mut player2, &mut world2, Vec::new());
+        r2.apply(&mut ctx2);
+        let rid2 = ctx2.world.registry_mut().parse_spec(&result_spec).unwrap();
+        assert_eq!(ctx2.world.registry().spec(rid2), result_spec);
+        assert_eq!(ctx2.world.registry().configuration(rid2), &expected);
+    }
+
+    #[test]
+    fn result_is_interned_once() {
+        let mut world = World::new(1);
+        let (origin, target, ca, cb) = reactive_pair(&mut world);
+        let law = *world.registry().law();
+        let expected = interact_repeat(&law, &ca, &cb, EventKind::Collision, 2);
+        let mut crafting = test_mod();
+        crafting.pouch.add(origin, 1);
+        crafting.pouch.add(target, 2);
+        crafting.origin = Some(origin);
+        crafting.target = Some(target);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::Collision).unwrap();
+        crafting.repeat = 2;
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+        let before = ctx.world.registry().block_count();
+        crafting.apply(&mut ctx);
+        let after_first = ctx.world.registry().block_count();
+        crafting.apply(&mut ctx);
+        let after_second = ctx.world.registry().block_count();
+        assert_eq!(after_second, after_first, "second apply reuses the interned id");
+        assert!(after_first == before || after_first == before + 1);
+        let rid = ctx.world.registry().lookup(&expected).unwrap();
+        assert_eq!(crafting.pouch.count(rid), 2);
+    }
+
+    #[test]
+    fn journal_round_trips_and_name_command() {
+        let mut world = World::new(1);
+        let (origin, target, _, _) = reactive_pair(&mut world);
+        let mut crafting = test_mod();
+        crafting.pouch.add(origin, 1);
+        crafting.pouch.add(target, 1);
+        crafting.origin = Some(origin);
+        crafting.target = Some(target);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::Collision).unwrap();
+        crafting.repeat = 1;
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        {
+            let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+            crafting.apply(&mut ctx);
+        }
+        assert_eq!(crafting.journal.len(), 1, "a new configuration is recorded");
+        let saved = crafting.save_state(&world).expect("journal persists");
+        assert_eq!(saved.0, 2);
+
+        let mut loaded = test_mod();
+        loaded.load_state(saved.0, &saved.1, &mut world);
+        assert_eq!(loaded.journal.len(), 1);
+        assert_eq!(loaded.journal[0].event, EventKind::Collision);
+        assert_eq!(loaded.journal[0].repeat, 1);
+        assert!(loaded.journal[0].name.is_none());
+
+        let out = loaded.command("name", &["1", "spark", "mix"]).unwrap();
+        assert!(out[0].text().contains("named"));
+        assert_eq!(loaded.journal[0].name.as_deref(), Some("spark mix"));
+        let saved2 = loaded.save_state(&world).unwrap();
+        let mut named = test_mod();
+        named.load_state(saved2.0, &saved2.1, &mut world);
+        assert_eq!(named.journal[0].name.as_deref(), Some("spark mix"));
+
+        let before = named.journal.len();
+        named.origin = Some(origin);
+        named.target = Some(target);
+        named.event = crafting.event;
+        named.repeat = 1;
+        named.pouch.add(origin, 1);
+        named.pouch.add(target, 1);
+        {
+            let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+            named.apply(&mut ctx);
+        }
+        assert_eq!(
+            named.journal.len(),
+            before,
+            "a known result id is not recorded again"
+        );
+    }
+
+    #[test]
+    fn server_evaluation_matches_client_expectation() {
+        let mut client = BlockRegistry::with_builtins();
+        let mut server = BlockRegistry::with_builtins();
+        let origin = Configuration::single(Element::new([40, 80, 120, 160]));
+        let target = Configuration::single(Element::new([80, 40, 160, 120]));
+        let oid = client.intern(&origin).unwrap();
+        let tid = client.intern(&target).unwrap();
+        let os = client.spec(oid);
+        let ts = client.spec(tid);
+        let law = *client.law();
+        let expected = interact_repeat(&law, &origin, &target, EventKind::Collision, 4);
+        let client_id = client
+            .apply_specs(&os, &ts, EventKind::Collision, 4)
+            .unwrap();
+        let server_id = server
+            .apply_specs(&os, &ts, EventKind::Collision, 4)
+            .unwrap();
+        assert_eq!(client.configuration(client_id), &expected);
+        assert_eq!(server.configuration(server_id), &expected);
+        assert_eq!(client.spec(client_id), server.spec(server_id));
+    }
+
+    #[test]
+    fn pouch_capacity_overflow_drops_extra_and_apply_at_cap_keeps_the_result() {
+        let mut world = World::new(1);
+        let (origin, target, _, _) = reactive_pair(&mut world);
+        let mut crafting = test_mod();
+        assert!(crafting.pouch.add(target, START_CAPACITY as u32 - 1));
+        assert!(crafting.pouch.add(origin, 1));
+        assert_eq!(crafting.pouch.total(), START_CAPACITY as u32);
+        assert!(!crafting.pouch.add(origin, 1), "pouch uses stash capacity");
+        assert_eq!(crafting.pouch.total(), START_CAPACITY as u32);
+
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        player.stash.add(origin, 1);
+        crafting.held = vec![origin];
+        crafting.tab = Tab::Workbench;
+        crafting.cursor = 1;
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+        let stash_before = ctx.player.stash.count(origin);
+        crafting.activate(&mut ctx);
+        assert_eq!(
+            ctx.player.stash.count(origin),
+            stash_before,
+            "a full pouch restores the taken unit"
+        );
+
+        crafting.origin = Some(origin);
+        crafting.target = Some(target);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::Collision).unwrap();
+        crafting.repeat = 1;
+        let total_before = crafting.pouch.total();
+        crafting.apply(&mut ctx);
+        assert_eq!(
+            crafting.pouch.total(),
+            total_before,
+            "consume-then-add at capacity does not drop the result"
+        );
+        assert!(crafting.pouch.total() > 0);
+    }
+
+    #[test]
+    fn networked_apply_queues_craft_and_result_commits() {
+        let mut world = World::new(1);
+        let (origin, target, ca, cb) = reactive_pair(&mut world);
+        let law = *world.registry().law();
+        let expected = interact(&law, &ca, &cb, EventKind::Collision).target;
+        let mut crafting = test_mod();
+        crafting.pouch.add(origin, 1);
+        crafting.pouch.add(target, 1);
+        crafting.origin = Some(origin);
+        crafting.target = Some(target);
+        crafting.event = EVENTS.iter().position(|(k, _)| *k == EventKind::Collision).unwrap();
+        crafting.repeat = 1;
+        let mut player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+        let mut ctx = mod_ctx(&mut player, &mut world, Vec::new());
+        ctx.networked = true;
+        crafting.apply(&mut ctx);
+        assert_eq!(ctx.crafts.len(), 1);
+        assert_eq!(crafting.pouch.count(target), 1, "client waits for the server");
+        let result_spec = {
+            let mut r = BlockRegistry::with_builtins();
+            let id = r.intern(&expected).unwrap();
+            r.spec(id)
+        };
+        let req = &ctx.crafts[0];
+        crafting.on_craft_result(
+            &req.origin_spec,
+            &req.target_spec,
+            req.event,
+            req.repeat,
+            &result_spec,
+            ctx.world,
+        );
+        let rid = ctx.world.registry().lookup(&expected).unwrap();
+        assert_eq!(crafting.pouch.count(target), 0);
+        assert_eq!(crafting.pouch.count(rid), 1);
     }
 
     fn hud_text(elements: &[HudElement]) -> String {

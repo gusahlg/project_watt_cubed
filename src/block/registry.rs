@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
-use material::{observe, visual, Configuration, DescriptorKey, Encoding, Law, Observation, Visual};
+use material::{
+    interact, observe, visual, Configuration, DescriptorKey, Encoding, EventKind, Law, Observation,
+    Visual,
+};
 use voxel_engine::{Color, Pass};
 
 /// Compact per-voxel material id: the index of a configuration in the world's table.
@@ -16,6 +19,21 @@ pub struct BlockId(pub u16);
 
 /// The void configuration: always id 0.
 pub const AIR: BlockId = BlockId(0);
+
+/// Repeat `interact` `repeat` times; origin is unchanged (law v0).
+pub fn interact_repeat(
+    law: &Law,
+    origin: &Configuration,
+    target: &Configuration,
+    event: EventKind,
+    repeat: u8,
+) -> Configuration {
+    let mut t = target.clone();
+    for _ in 0..repeat {
+        t = interact(law, origin, &t, event).target;
+    }
+    t
+}
 
 /// Configurations one world can hold (the id width).
 pub const MAX_BLOCK_TYPES: usize = u16::MAX as usize;
@@ -257,6 +275,41 @@ impl BlockRegistry {
     /// The physics this table observes under.
     pub fn law(&self) -> &Law {
         &self.law
+    }
+
+    /// Apply `event` from `origin` onto `target`, `repeat` times, and intern the result.
+    /// Origin is unchanged (law v0). `None` when the id space is exhausted.
+    pub fn apply_interaction(
+        &mut self,
+        origin: &Configuration,
+        target: &Configuration,
+        event: EventKind,
+        repeat: u8,
+    ) -> Option<BlockId> {
+        let law = self.law;
+        let result = interact_repeat(&law, origin, target, event, repeat);
+        self.intern(&result)
+    }
+
+    /// Parse origin/target specs, apply [`apply_interaction`], return the interned result.
+    /// `None` when a spec is malformed or the table is full.
+    pub fn apply_specs(
+        &mut self,
+        origin_spec: &str,
+        target_spec: &str,
+        event: EventKind,
+        repeat: u8,
+    ) -> Option<BlockId> {
+        let origin_id = self.parse_spec(origin_spec)?;
+        let target_id = self.parse_spec(target_spec)?;
+        let origin = self.configs[origin_id.0 as usize].clone();
+        let target = self.configs[target_id.0 as usize].clone();
+        self.apply_interaction(&origin, &target, event, repeat)
+    }
+
+    /// Presentation name: attached label, else nearest region `"-like"`, else `"unknown material"`.
+    pub fn display_name(&self, id: BlockId) -> String {
+        crate::block::regions::display_name(self.law(), self.label(id), &self.configs[id.0 as usize])
     }
 
     /// Intern a configuration: the existing id if it was seen, else a new one with its readings and
@@ -641,5 +694,35 @@ mod tests {
         assert_eq!(r.id_by_label("rock-like"), Some(id));
         assert_eq!(r.label(id), Some("rock-like"));
         assert!(r.spec(id).starts_with("c:"), "the spec never carries the label");
+    }
+
+    #[test]
+    fn apply_interaction_matches_interact_and_interns_once() {
+        let mut r = BlockRegistry::with_builtins();
+        let law = *r.law();
+        let origin = cfg(&[[40, 80, 120, 160]]);
+        let target = cfg(&[[80, 40, 160, 120]]);
+        let once = interact(&law, &origin, &target, EventKind::Collision).target;
+        assert_eq!(
+            interact_repeat(&law, &origin, &target, EventKind::Collision, 1),
+            once
+        );
+        let twice = interact(&law, &origin, &once, EventKind::Collision).target;
+        assert_eq!(
+            interact_repeat(&law, &origin, &target, EventKind::Collision, 2),
+            twice
+        );
+        let before = r.block_count();
+        let a = r
+            .apply_interaction(&origin, &target, EventKind::Collision, 1)
+            .unwrap();
+        let after_first = r.block_count();
+        let b = r
+            .apply_interaction(&origin, &target, EventKind::Collision, 1)
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(r.configuration(a), &once);
+        assert_eq!(r.block_count(), after_first, "the same result interned once");
+        assert!(after_first == before || after_first == before + 1);
     }
 }

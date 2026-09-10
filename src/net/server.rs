@@ -921,6 +921,12 @@ fn client_loop(
                 }
             }
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
+            ClientMessage::Craft {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+            } => on_craft(shared, id, &origin_spec, &target_spec, event, repeat),
         }
     }
 }
@@ -1225,6 +1231,53 @@ fn on_edit(
     // The broadcast carries the SAME pooled Arc the ledger stores.
     let msg = ServerMessage::Edit { x, y, z, rev, spec };
     broadcast(&mut state, &msg, |pid, _| pid != id);
+}
+
+/// Workbench apply: well-formedness only (specs parse, event is a workbench
+/// kind, repeat in 1..=16). There is no holdings ledger (task 67 has not
+/// landed), so the server does not check that the sender owns the materials.
+fn on_craft(
+    shared: &Arc<Mutex<State>>,
+    id: u32,
+    origin_spec: &str,
+    target_spec: &str,
+    event: u8,
+    repeat: u8,
+) {
+    if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
+        return;
+    }
+    if !(1..=16).contains(&repeat) {
+        return;
+    }
+    let Some(event) = protocol::workbench_event(event) else {
+        return;
+    };
+    let mut state = shared.lock_recover();
+    let out = {
+        let Some(h) = state.players.get(&id) else { return };
+        h.ready.then(|| h.out.clone())
+    };
+    let Some(result_id) = state
+        .registry
+        .apply_specs(origin_spec, target_spec, event, repeat)
+    else {
+        return;
+    };
+    let result_spec: Arc<str> = state.registry.spec(result_id).into();
+    if let Some(out) = out {
+        let _ = out.try_send(
+            ServerMessage::CraftResult {
+                origin_spec: origin_spec.into(),
+                target_spec: target_spec.into(),
+                event: event as u8,
+                repeat,
+                result_spec,
+            }
+            .encode()
+            .into(),
+        );
+    }
 }
 
 /// A [`Verdict::Deny`] drops the broadcast and delivers `reason` only to the
@@ -2501,6 +2554,58 @@ mod tests {
             out.push(ServerMessage::decode(&frame).unwrap());
         }
         out
+    }
+
+    #[test]
+    fn craft_is_evaluated_on_the_server_and_matches_interact() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let origin = material::Configuration::single(material::Element::new([40, 80, 120, 160]));
+        let target = material::Configuration::single(material::Element::new([80, 40, 160, 120]));
+        let (origin_spec, target_spec, expected) = {
+            let mut state = shared.lock_recover();
+            let oid = state.registry.intern(&origin).unwrap();
+            let tid = state.registry.intern(&target).unwrap();
+            let os = state.registry.spec(oid);
+            let ts = state.registry.spec(tid);
+            let law = *state.registry.law();
+            let result = crate::block::registry::interact_repeat(
+                &law,
+                &origin,
+                &target,
+                material::EventKind::Collision,
+                3,
+            );
+            let rid = state.registry.intern(&result).unwrap();
+            let rs = state.registry.spec(rid);
+            (os, ts, rs)
+        };
+        on_craft(&shared, 1, &origin_spec, &target_spec, 2, 3);
+        match drain_msgs(&rx).as_slice() {
+            [ServerMessage::CraftResult {
+                origin_spec: o,
+                target_spec: t,
+                event,
+                repeat,
+                result_spec,
+            }] => {
+                assert_eq!(&**o, origin_spec);
+                assert_eq!(&**t, target_spec);
+                assert_eq!(*event, 2);
+                assert_eq!(*repeat, 3);
+                assert_eq!(&**result_spec, expected);
+            }
+            other => panic!("expected one CraftResult, got {other:?}"),
+        }
+        on_craft(&shared, 1, &origin_spec, &target_spec, 9, 3);
+        on_craft(&shared, 1, &origin_spec, &target_spec, 2, 0);
+        on_craft(&shared, 1, "nope", &target_spec, 2, 1);
+        assert!(
+            drain_msgs(&rx).is_empty(),
+            "malformed craft is dropped (well-formedness only; no holdings ledger)"
+        );
     }
 
     /// A hook Deny is the same `EditAck { accepted: false }` a lost race sends:

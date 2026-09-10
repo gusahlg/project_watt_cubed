@@ -145,6 +145,14 @@ pub enum Incoming {
     /// update already applied in `apply()`.
     PeerSwing { id: u32 },
     Time { day: f32, day_secs: f32 },
+    /// Authoritative workbench result; the client intern/consume/adds this spec.
+    CraftResult {
+        origin_spec: Arc<str>,
+        target_spec: Arc<str>,
+        event: u8,
+        repeat: u8,
+        result_spec: Arc<str>,
+    },
     Disconnected,
 }
 
@@ -563,6 +571,19 @@ fn apply_server_message(
             // the dedicated ring (see `connect`), not the `inbox` this drains.
             // The arm exists only to keep the match exhaustive.
             ServerMessage::PeerVoice { .. } => {}
+            ServerMessage::CraftResult {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+                result_spec,
+            } => out.push(Incoming::CraftResult {
+                origin_spec,
+                target_spec,
+                event,
+                repeat,
+                result_spec,
+            }),
         }
 }
 
@@ -644,6 +665,19 @@ impl Connection {
 
     pub fn send_set_time(&mut self, day: f32) {
         self.dispatch(&ClientMessage::SetTime { day });
+    }
+
+    /// Workbench apply. The server evaluates and replies with [`Incoming::CraftResult`].
+    pub fn send_craft(&mut self, origin_spec: Arc<str>, target_spec: Arc<str>, event: u8, repeat: u8) {
+        if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
+            return;
+        }
+        self.dispatch(&ClientMessage::Craft {
+            origin_spec,
+            target_spec,
+            event,
+            repeat,
+        });
     }
 
     /// Blocks the game thread on the client runtime — sends are tiny and

@@ -233,16 +233,28 @@ pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color
 // HUD widget vocabulary: mods describe what to show as data, [`render_hud`] draws it.
 
 /// One panel row's text plus its emphasis. The panel resolves the role to a
-/// colour and ellipsizes the text to the panel width.
+/// colour and ellipsizes the text to the panel width. `swatch` is an optional
+/// material colour chip drawn before the text.
 #[derive(Clone)]
 pub struct Row {
     pub text: Arc<str>,
     pub role: Role,
+    pub swatch: Option<Color>,
 }
 
 impl Row {
     pub fn new(role: Role, text: impl Into<Arc<str>>) -> Self {
-        Self { text: text.into(), role }
+        Self {
+            text: text.into(),
+            role,
+            swatch: None,
+        }
+    }
+
+    /// Colour chip for a configuration row.
+    pub fn with_swatch(mut self, color: Color) -> Self {
+        self.swatch = Some(color);
+        self
     }
 }
 
@@ -280,10 +292,18 @@ impl Panel {
         let (x, y) = self.at;
         f.draw_rect(x, y, self.width, self.height(), PANEL_BG);
         let text_x = x + PANEL_PAD;
-        let max_chars = ((self.width - PANEL_PAD * 2) / PANEL_FONT).max(1) as usize;
         let mut cy = y + PANEL_PAD;
         let mut row = |r: &Row, cy: i32| {
-            shadowed(f, &ellipsize(&r.text, max_chars), text_x, cy, PANEL_FONT, r.role.color());
+            let mut tx = text_x;
+            let mut width = self.width - PANEL_PAD * 2;
+            if let Some(color) = r.swatch {
+                let chip = PANEL_FONT - 4;
+                f.draw_rect(tx, cy + 2, chip, chip, color);
+                tx += PANEL_FONT;
+                width -= PANEL_FONT;
+            }
+            let max_chars = (width / PANEL_FONT).max(1) as usize;
+            shadowed(f, &ellipsize(&r.text, max_chars), tx, cy, PANEL_FONT, r.role.color());
         };
         for r in self.header.iter() {
             row(r, cy);

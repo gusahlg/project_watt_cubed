@@ -22,3 +22,5 @@ the server's generator instead of its local mod state.
 v10: `Welcome` carries the law stamp; the content fingerprint folds
 `WORLDGEN_VERSION`, `Law::fingerprint()` and every builtin region centre.
 Edits use `parse_spec` (`c:<hex>` / `air`). Mixed laws refuse to share a world.
+`Craft` / `CraftResult` carry a workbench apply; the server evaluates `interact`
+and the client never trusts its own result.

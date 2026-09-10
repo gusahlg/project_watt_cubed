@@ -71,6 +71,7 @@ commands! {
     "deafen", "  deafen               toggle hearing incoming voice" => deafen(settings);
     "audio" | "volume", "  audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
     "voicetest", "  voicetest            play a local voice test cue" => voicetest();
+    "name", "  name <n> <text>      name a recorded crafting procedure" => rejected(vec!["name: no procedure journal (is the crafting mod enabled?)".to_string()]);
     "help" | "?", "  help                 show this list" => help();
 }
 
@@ -429,6 +430,7 @@ mod tests {
              deafen               toggle hearing incoming voice\n  \
              audio <chan> <0-100> set master/effects/voice volume\n  \
              voicetest            play a local voice test cue\n  \
+             name <n> <text>      name a recorded crafting procedure\n  \
              help                 show this list"
         );
     }
