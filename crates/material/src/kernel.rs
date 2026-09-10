@@ -40,7 +40,7 @@ pub(crate) fn axis_delta(boundary: Boundary, a: u8, b: u8) -> i32 {
 }
 
 /// Odd response curve: piecewise linear through the kernel's knots over |δ|, sign of δ.
-pub(crate) fn response(kernel: &Kernel, delta: i32) -> i32 {
+pub fn response(kernel: &Kernel, delta: i32) -> i32 {
     let mag = delta.unsigned_abs().min(255) as i32;
     let mut r = kernel.knots[kernel.knots.len() - 1].1 as i32;
     for w in kernel.knots.windows(2) {
