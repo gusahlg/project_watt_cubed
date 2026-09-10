@@ -182,7 +182,7 @@ settings_fields! {
     device_max_msaa: u32 = 8,
     /// Device-local heap size from the startup probe; not persisted.
     device_local_memory_bytes: Option<u64> = None,
-    /// Live free device-local bytes (`VK_EXT_memory_budget`); not persisted.
+    /// Live free device-local bytes from [`Engine::gpu_caps`]; not persisted.
     available_device_bytes: Option<u64> = None,
     /// Session-only VRAM-guard / engine-fallback line for the console and settings menu.
     vram_notice: Option<String> = None,
@@ -1098,12 +1098,13 @@ impl Settings {
         self.clamp();
     }
 
-    /// Heap, max MSAA, and VRS Auto threshold from the live engine.
+    /// Heap, live free VRAM, max MSAA, and VRS Auto threshold from the live engine.
     pub fn adopt_gpu_caps(&mut self, eng: &Engine) {
         let caps = eng.gpu_caps();
         self.device_max_msaa = caps.max_msaa.max(1);
         self.device_local_memory_bytes = (caps.device_local_bytes > 0).then_some(caps.device_local_bytes);
-        self.available_device_bytes = None;
+        self.available_device_bytes =
+            crate::render_config::available_from_engine_budget(caps.device_local_budget, caps.device_local_usage);
         self.vrs_auto_min_pixels = eng.vrs_useful_above_pixels().map(|px| px as u64);
         self.clamp();
     }

@@ -35,7 +35,7 @@ That branch's Default rendered at 1536×864 (`render_scale_auto: true`, 0.8) but
 
 ## VRAM guard
 
-Startup probes Vulkan once (`src/benchmark/system.rs`, the same path as the benchmark GPU inventory) for the largest display and a first-pass heap/MSAA snap; once the window exists, session fit asks `Engine::estimate_render_targets` and budgets from `gpu_caps()` (device-local heap × 60%, or live free × 0.85 when the probe still has `VK_EXT_memory_budget`).
+Startup probes Vulkan once (`src/benchmark/system.rs`, the same path as the benchmark GPU inventory) for the largest display and a first-pass heap/MSAA snap (heap × 60%). Once the window exists, session fit asks `Engine::estimate_render_targets` and budgets from `gpu_caps()` (live `VK_EXT_memory_budget` remaining × 0.85, else heap × 60%).
 
 The degrade ladder is MSAA 8→4→2→1, then render scale in −0.25 steps down to 0.5. Cuts are this session only (settings.cfg is not rewritten). A `graphics:` line names the request, the free/held split (or the heap budget when live data is absent), and what this session actually runs. The settings screen shows the same notice.
 

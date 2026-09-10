@@ -289,15 +289,25 @@ const VRAM_SCALE_STEP: f32 = 0.25;
 const MSAA_STEPS: &[u32] = &[8, 4, 2, 1];
 
 /// GPU facts for the session VRAM guard (heap + MSAA from [`Engine::gpu_caps`]
-/// once the window exists; the startup probe fills the same fields so the
-/// first `Config` can snap MSAA).
+/// once the window exists; the startup probe fills heap/MSAA so the first
+/// `Config` can snap MSAA, with live budget arriving after the window exists).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceCaps {
     pub device_local_memory_bytes: Option<u64>,
-    /// `heapBudget - heapUsage` on device-local heaps when `VK_EXT_memory_budget`
-    /// is present; `None` falls back to the heap-size rule.
+    /// `heapBudget - heapUsage` for the largest device-local heap from
+    /// [`Engine::gpu_caps`]; `None` (pre-window, or no `VK_EXT_memory_budget`)
+    /// falls back to the heap-size rule.
     pub available_device_bytes: Option<u64>,
     pub max_msaa: u32,
+}
+
+/// Map engine [`voxel_engine::GpuCaps`] budget/usage to live free bytes.
+pub fn available_from_engine_budget(budget: Option<u64>, usage: Option<u64>) -> Option<u64> {
+    match (budget, usage) {
+        (Some(budget), Some(usage)) => Some(budget.saturating_sub(usage)),
+        (Some(budget), None) => Some(budget),
+        _ => None,
+    }
 }
 
 impl Default for DeviceCaps {
@@ -623,6 +633,21 @@ mod tests {
             available_device_bytes: None,
             max_msaa,
         }
+    }
+
+    #[test]
+    fn available_from_engine_budget_subtracts_usage() {
+        assert_eq!(
+            available_from_engine_budget(Some(8_000_000_000), Some(6_000_000_000)),
+            Some(2_000_000_000)
+        );
+        assert_eq!(
+            available_from_engine_budget(Some(1_000), Some(2_000)),
+            Some(0)
+        );
+        assert_eq!(available_from_engine_budget(Some(4_000), None), Some(4_000));
+        assert_eq!(available_from_engine_budget(None, Some(1)), None);
+        assert_eq!(available_from_engine_budget(None, None), None);
     }
 
     fn live_caps(heap: u64, available: u64, max_msaa: u32) -> DeviceCaps {
