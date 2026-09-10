@@ -177,6 +177,8 @@ pub(crate) fn content_fingerprint_kind_cfg(
     cfg: crate::world::diffusion::DiffusionCfg,
 ) -> u64 {
     let registry = crate::block::BlockRegistry::with_builtins();
+    // v0 is hostable: a non-v0 stamp is refused with Reject, never a panic.
+    let _ = protocol::handshake_law(&protocol::law_stamp());
     fingerprint_kind_cfg(&registry, kind, cfg)
 }
 
@@ -193,7 +195,7 @@ pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     };
     eat(&crate::world::placement::WORLDGEN_VERSION.to_le_bytes());
     eat(&registry.law().fingerprint().to_le_bytes());
-    for region in crate::block::regions::builtin(registry.law()) {
+    for region in registry.regions() {
         eat(&region.centre.0);
     }
     hash
@@ -259,7 +261,7 @@ mod fingerprint_tests {
         use material::{Configuration, Element};
 
         let mut server = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut server);
+        placement::builtin().compile(&mut server).expect("v0 hosts the placement table");
         let before = fingerprint_of(&server);
         let novel = Configuration::new(vec![
             Element::new([3, 9, 27, 81]),
@@ -271,7 +273,7 @@ mod fingerprint_tests {
         assert_eq!(fingerprint_of(&server), before, "interning does not change the handshake");
 
         let mut client = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut client);
+        placement::builtin().compile(&mut client).expect("v0 hosts the placement table");
         assert!(client.lookup(&novel).is_none(), "client has not seen the product");
         let cid = client.parse_spec(&spec).unwrap();
         assert_eq!(client.configuration(cid), server.configuration(sid));

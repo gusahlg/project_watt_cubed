@@ -34,7 +34,7 @@ pub(crate) fn parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::bridge::{from_doc, unknown_material_notice, v7_law_notice};
+    use super::bridge::{from_doc, unknown_material_notice, v7_law_notice, UnknownMaterials};
     use super::format::{PlayerState, SaveDoc, WorldgenStamp};
     use crate::mods::Mods;
     use crate::player::Player;
@@ -219,20 +219,33 @@ mod tests {
 
     #[test]
     fn unknown_holdings_fold_into_one_load_notice() {
-        assert_eq!(unknown_material_notice(0, 0), None);
+        assert_eq!(unknown_material_notice(UnknownMaterials::default()), None);
         assert_eq!(
-            unknown_material_notice(3, 0).as_deref(),
+            unknown_material_notice(UnknownMaterials { legacy_edits: 3, ..UnknownMaterials::default() }).as_deref(),
             Some("save predates the material model; 3 edits of unknown materials became air")
         );
         assert_eq!(
-            unknown_material_notice(0, 2).as_deref(),
+            unknown_material_notice(UnknownMaterials { legacy_holdings: 2, ..UnknownMaterials::default() }).as_deref(),
             Some("2 holdings of unknown materials were dropped")
         );
         assert_eq!(
-            unknown_material_notice(4, 1).as_deref(),
+            unknown_material_notice(UnknownMaterials {
+                legacy_edits: 4,
+                legacy_holdings: 1,
+                ..UnknownMaterials::default()
+            })
+            .as_deref(),
             Some(
                 "save predates the material model; 4 edits of unknown materials became air; 1 holdings of unknown materials were dropped"
             )
+        );
+        assert_eq!(
+            unknown_material_notice(UnknownMaterials { full_edits: 3, ..UnknownMaterials::default() }).as_deref(),
+            Some("the material table is full; 3 edits of unknown materials became air")
+        );
+        assert_eq!(
+            unknown_material_notice(UnknownMaterials { full_holdings: 2, ..UnknownMaterials::default() }).as_deref(),
+            Some("2 holdings could not be interned (table full)")
         );
 
         let mut doc = bare_doc();
@@ -282,6 +295,24 @@ mod tests {
             from_doc(doc, &mut mods, make_world),
             Err(SaveError::LawMismatch)
         ));
+    }
+
+    #[test]
+    fn perturbed_law_stamp_is_refused_without_panic() {
+        let mut law = material::Law::v0();
+        law.kernel.knots[2].1 = -law.kernel.knots[2].1;
+        let mut doc = bare_doc();
+        doc.law_stamp = law.stamp();
+        let mut mods = Mods::with_defaults();
+        match from_doc(doc, &mut mods, make_world) {
+            Err(SaveError::CannotHost { label, why }) => {
+                assert!(!label.is_empty());
+                assert!(!why.is_empty());
+            }
+            Err(SaveError::LawMismatch) => {}
+            Ok(_) => panic!("expected refusal, got a loaded world"),
+            Err(e) => panic!("expected refusal, got {e}"),
+        }
     }
 
     #[test]

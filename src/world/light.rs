@@ -814,12 +814,11 @@ mod tests {
         // whatever the "lamp" label happens to intern (a rest-stable centre can
         // still observe as dark). Intern a configuration and assert emission.
         let lumin = {
-            use crate::block::regions;
             use material::Configuration;
-            let law = *registry.law();
             let mut found = None;
-            for r in regions::builtin(&law) {
-                let id = registry.intern(&Configuration::single(r.centre)).unwrap();
+            let centres: Vec<_> = registry.regions().iter().map(|r| r.centre).collect();
+            for centre in centres {
+                let id = registry.intern(&Configuration::single(centre)).unwrap();
                 if registry.emission(id) >= 8 {
                     found = Some(id);
                     break;

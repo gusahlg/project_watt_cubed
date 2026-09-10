@@ -3,6 +3,7 @@
 
 use voxel_engine::DVec3;
 
+use crate::block::registry::SpecKind;
 use crate::block::{AIR, BlockId};
 use crate::coord::{BlockCoord, ChunkCoord, Local};
 use crate::mods::Mods;
@@ -15,7 +16,6 @@ use crate::world::{FastMap, World};
 use super::format::{self, Edit, PlayerState, SaveDoc, WorldgenStamp};
 use super::slot::{SaveError, SaveMeta, SlotId};
 use super::store::{self, Source};
-use super::parse_block;
 
 /// How a load actually went; the menu formats whichever fields are set
 /// ("restored from backup", "recovered 48,112 of 48,300 edits").
@@ -181,24 +181,68 @@ fn stamp_from_world(world: &World) -> WorldgenStamp {
     }
 }
 
-fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> u32 {
+fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> UnknownMaterials {
     let Some(items) = &doc.player.stash else {
-        return 0;
+        return UnknownMaterials::default();
     };
-    player.stash.load_portable(items, |s| world.registry_mut().parse_spec(s))
+    let mut u = UnknownMaterials::default();
+    let mut pairs = Vec::new();
+    for (spec, count) in items {
+        match world.registry_mut().read_spec(spec) {
+            SpecKind::Ok(id) => pairs.push((id, *count)),
+            SpecKind::Legacy => u.legacy_holdings += 1,
+            SpecKind::Full => u.full_holdings += 1,
+            SpecKind::Bad => {}
+        }
+    }
+    player.stash.clear();
+    for (id, count) in pairs {
+        player.stash.add(id, count);
+    }
+    u
+}
+
+/// Counts of specs the loader could not intern, split by cause so the notice
+/// can say "legacy names" versus "the material table is full".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnknownMaterials {
+    pub legacy_edits: u32,
+    pub full_edits: u32,
+    pub legacy_holdings: u32,
+    pub full_holdings: u32,
 }
 
 /// One load notice covering unknown edits and unknown stash/pouch holdings.
-pub(crate) fn unknown_material_notice(unknown_edits: u32, unknown_holdings: u32) -> Option<String> {
-    match (unknown_edits, unknown_holdings) {
-        (0, 0) => None,
-        (e, 0) => Some(format!(
-            "save predates the material model; {e} edits of unknown materials became air"
-        )),
-        (0, h) => Some(format!("{h} holdings of unknown materials were dropped")),
-        (e, h) => Some(format!(
-            "save predates the material model; {e} edits of unknown materials became air; {h} holdings of unknown materials were dropped"
-        )),
+pub(crate) fn unknown_material_notice(u: UnknownMaterials) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if u.legacy_edits > 0 {
+        parts.push(format!(
+            "save predates the material model; {} edits of unknown materials became air",
+            u.legacy_edits
+        ));
+    }
+    if u.full_edits > 0 {
+        parts.push(format!(
+            "the material table is full; {} edits of unknown materials became air",
+            u.full_edits
+        ));
+    }
+    if u.legacy_holdings > 0 {
+        parts.push(format!(
+            "{} holdings of unknown materials were dropped",
+            u.legacy_holdings
+        ));
+    }
+    if u.full_holdings > 0 {
+        parts.push(format!(
+            "{} holdings could not be interned (table full)",
+            u.full_holdings
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
     }
 }
 
@@ -226,13 +270,19 @@ fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
 
 /// Rebuild a ready-to-play world and player from a doc, restoring mod state
 /// into `mods`. Unknown specs degrade to air. A law stamp that does not match
-/// this game's law is a different universe and is refused.
+/// this game's law is a different universe and is refused — region search
+/// errors become [`SaveError::CannotHost`], never a panic.
 pub fn from_doc(
     doc: SaveDoc,
     mods: &mut Mods,
     make_world: impl FnOnce(i64, WorldgenKind, DiffusionCfg) -> World,
 ) -> Result<(World, Player, SaveMeta), SaveError> {
     if !doc.law_stamp.is_empty() && doc.law_stamp != material::Law::v0().stamp() {
+        if let Ok(law) = material::Law::from_stamp(&doc.law_stamp) {
+            if let Err(e) = crate::block::regions::builtin(&law) {
+                return Err(SaveError::CannotHost { label: e.label, why: e.why });
+            }
+        }
         return Err(SaveError::LawMismatch);
     }
     if let Some(msg) = v7_law_notice(&doc.law_stamp) {
@@ -264,26 +314,34 @@ pub fn from_doc(
         }
     }
 
-    let mut unknown_holdings = restore_stash(&mut player, &doc, &mut world);
+    let mut unknown = restore_stash(&mut player, &doc, &mut world);
 
-    let mut unknown_edits = 0u32;
-    let block_ids: Vec<_> = doc
+    let kinds: Vec<SpecKind> = doc
         .specs
         .iter()
-        .map(|spec| parse_block(world.registry_mut(), spec))
+        .map(|spec| world.registry_mut().read_spec(spec))
+        .collect();
+    let block_ids: Vec<BlockId> = kinds
+        .iter()
+        .map(|k| match k {
+            SpecKind::Ok(id) => *id,
+            _ => AIR,
+        })
         .collect();
     for edit in &doc.edits {
-        let id = block_ids[usize::from(edit.spec)];
-        if id == AIR && doc.specs[usize::from(edit.spec)] != "air" {
-            unknown_edits += 1;
+        match kinds[usize::from(edit.spec)] {
+            SpecKind::Ok(_) => {}
+            SpecKind::Legacy => unknown.legacy_edits += 1,
+            SpecKind::Full => unknown.full_edits += 1,
+            SpecKind::Bad => {}
         }
-        world.set_block(edit.x, edit.y, edit.z, id);
+        world.set_block(edit.x, edit.y, edit.z, block_ids[usize::from(edit.spec)]);
     }
 
     for (name, data) in &doc.mods {
-        unknown_holdings += mods.load_state(name, data, &mut world);
+        unknown.legacy_holdings += mods.load_state(name, data, &mut world);
     }
-    if let Some(msg) = unknown_material_notice(unknown_edits, unknown_holdings) {
+    if let Some(msg) = unknown_material_notice(unknown) {
         eprintln!("{msg}");
     }
 

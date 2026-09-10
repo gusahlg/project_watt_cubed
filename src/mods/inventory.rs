@@ -268,9 +268,7 @@ mod tests {
     #[test]
     fn unknown_configurations_use_like_or_unknown_material() {
         let mut world = World::new(1);
-        let law = *world.registry().law();
-        let regions = crate::block::regions::builtin(&law);
-        let rock = &regions[0];
+        let rock = world.registry().regions()[0];
         let mut near = rock.centre;
         near.0[3] = near.0[3].saturating_add(rock.spread);
         if near == rock.centre {
@@ -303,7 +301,6 @@ mod tests {
             !text.contains(rock.label) && !text.contains("-like") && !text.contains("unknown"),
             "no worldgen label or authored name reaches the player: {text}"
         );
-        let _ = regions;
     }
 
     fn hud_text(elements: &[HudElement]) -> String {
