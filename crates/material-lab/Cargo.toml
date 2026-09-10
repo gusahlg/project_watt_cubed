@@ -1,0 +1,14 @@
+[package]
+name = "material-lab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Empirical search framework for the universal material law: scorecards, region search, law sweeps."
+publish = false
+
+[dependencies]
+material = { version = "0.1.0", path = "../material" }
+
+[[bin]]
+name = "lab"
+path = "src/bin/lab.rs"

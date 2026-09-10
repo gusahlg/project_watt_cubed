@@ -5,6 +5,13 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 default-run = "project_watt_cubed"
 
+# The lab is not a game dependency. It is a workspace member so `-p material-lab`
+# works from the repo root without linking the lab into the game crate.
+[workspace]
+resolver = "2"
+members = ["crates/material-lab"]
+default-members = ["."]
+
 [features]
 # Keeps the placeholder asset writer out of release/Nix installations. Invoke
 # explicitly while developing audio content.
@@ -18,7 +25,7 @@ required-features = ["dev-tools"]
 [dependencies]
 # Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
 # types (glam Vec2/Vec3) and Color the game uses
-voxel_engine = { version = "0.2.1", path = "../voxel-engine" }
+voxel_engine = { version = "1.0.0", path = "../voxel-engine" }
 infinite-field = { version = "0.1.0", path = "crates/infinite-field" }
 material = { version = "0.1.0", path = "crates/material" }
 
