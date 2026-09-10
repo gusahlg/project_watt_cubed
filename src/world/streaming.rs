@@ -36,11 +36,9 @@ fn chunk_placement(coord: Coord) -> voxel_engine::MeshPlacement {
 
 /// The GPU bytes a finished mesh will stage on upload (direction-major
 /// vertices across every pass) — what the byte-based upload budget charges.
-pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshOutput) -> usize {
-    voxel_engine::Pass::ALL
-        .iter()
-        .map(|&p| data[p].vertex_bytes())
-        .sum()
+/// Counts both staged regions and the `Vec` fallback.
+pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshPayload) -> usize {
+    data.vertex_bytes()
 }
 
 /// Vertex bytes a finished section mesh will stage: 4 quadrants × blocks × passes.
@@ -578,7 +576,11 @@ impl World {
         let pacer = self.stream_pacer;
         let velocity = self.section_vel;
         let view_radius = self.view.horizontal;
+        let stager = eng.as_ref().map(|e| e.mesh_stager());
         let workers = self.worker_pool();
+        if let Some(stager) = stager {
+            workers.set_stager(stager);
+        }
         workers.set_view(
             center_chunk.x,
             center_chunk.z,
@@ -841,6 +843,7 @@ impl World {
         }
 
         self.section_upload_bytes = 0;
+        self.drain_upload_bytes = 0;
         if self.upload_queue.is_empty()
             && self.section_upload_queue.is_empty()
             && self.light_apply_queue.is_empty()
@@ -867,17 +870,17 @@ impl World {
             pops += 1;
             if !self.mesh_result_applies(coord, rev) {
                 // Stale while queued: edit made it Dirty or it left the box.
+                data.release_staging(eng);
                 self.drop_stale_upload(coord);
                 continue;
             }
             upload_bytes += mesh_output_bytes(&data);
             uploads += 1;
             // Both passes upload together under one budget charge (same rev).
-            // The worker baked per-vertex sky/block light into `data` from the
-            // settled shell in its snapshot, so this is a pure GPU handoff —
-            // every chunk, all distances, uploads the same plain way. (The rev
+            // Staged payloads install through the worker-written ring; the
+            // Vec fallback uses the existing main-thread copy. (The rev
             // check above guarantees the state is NeedsMesh { building: true }.)
-            self.upload_chunk(coord, &data, eng);
+            self.upload_chunk(coord, data, eng);
             // A newly drawn chunk may complete a settled ring.
             self.lod_clip_grow.set();
         }
@@ -924,7 +927,7 @@ impl World {
                 super::adjust_count(&mut self.meshing_sections, true, false);
                 upload_bytes += bytes;
                 self.section_upload_bytes += bytes;
-                *state = SectionState::from_upload(pos, &meshes, eng);
+                *state = SectionState::from_upload_payload(pos, meshes, eng);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
                 // in part — must be corrected here, at the transition that gave it slots
@@ -937,8 +940,11 @@ impl World {
                 // any refinement it exposes loads immediately.
                 self.pending_sections.set();
                 self.section_cover_dirty.set();
+            } else {
+                meshes.release_staging(eng);
             }
         }
+        self.drain_upload_bytes = upload_bytes;
     }
 
     /// Route one completed worker payload through its owning lane. This is the
@@ -1013,16 +1019,18 @@ impl World {
     }
 
     /// Mesh result at `rev`: queue for upload if still applies; else drop and re-arm scan.
+    /// Staged regions release on drop of a rejected payload.
     pub(in crate::world) fn accept_mesh(
         &mut self,
         coord: Coord,
         rev: u32,
-        data: pipeline::MeshOutput,
+        data: impl Into<pipeline::MeshPayload>,
     ) {
+        let data = data.into();
         if self.mesh_result_applies(coord, rev) {
             self.upload_queue.push_back((coord, rev, data));
         } else {
-            // Stale: chunk edited (Dirty) or left box.
+            // Stale: chunk edited (Dirty) or left box. Staging Drop releases.
             self.drop_stale_upload(coord);
         }
     }
@@ -1073,8 +1081,33 @@ impl World {
     /// to the fresh `Ready`/`Air` — the one upload+install step shared by the
     /// async drain, the sync edit remesh, and the terminal degraded promotion.
     /// `retire` frees whatever the old state carried, exactly once.
-    fn upload_chunk(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
+    fn upload_chunk(&mut self, coord: Coord, data: pipeline::MeshPayload, eng: &mut Engine) {
+        let placement = chunk_placement(coord);
+        let handles = match data {
+            pipeline::MeshPayload::Cpu(data) => {
+                ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement))
+            }
+            pipeline::MeshPayload::Staged(mut staged) => ByPass::from_fn(|p| {
+                staged.passes[p].take().and_then(|pass| {
+                    eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement)
+                })
+            }),
+        };
+        self.install_chunk_handles(coord, handles, eng);
+    }
+
+    /// Sync remesh: main-thread `MeshData` still uploads through the legacy path.
+    fn upload_chunk_cpu(&mut self, coord: Coord, data: &mesh::ChunkMeshData, eng: &mut Engine) {
         let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
+        self.install_chunk_handles(coord, handles, eng);
+    }
+
+    fn install_chunk_handles(
+        &mut self,
+        coord: Coord,
+        handles: ByPass<Option<voxel_engine::MeshHandle>>,
+        eng: &mut Engine,
+    ) {
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             let was = loaded.state.is_building();
@@ -2790,6 +2823,11 @@ impl World {
                 )
             })
             .unwrap_or_default();
+        let staging = self
+            .workers
+            .as_ref()
+            .map(pipeline::Workers::staging_snapshot)
+            .unwrap_or_default();
         let (ru_mean, ru_p95, ru_n) = self.remesh_stats.between_upload_mean_p95();
         let (jf_mean, jf_p95, jf_n) = self.remesh_stats.jobs_before_fixpoint_mean_p95();
         super::StreamGauges {
@@ -2820,6 +2858,13 @@ impl World {
             mesh_jobs_before_fixpoint_p95: jf_p95,
             mesh_jobs_before_fixpoint_n: jf_n,
             section_upload_bytes: self.section_upload_bytes,
+            drain_upload_bytes: self.drain_upload_bytes,
+            mesh_staged: staging.chunk_staged,
+            mesh_fallback: staging.chunk_fallback,
+            mesh_ring_full: staging.chunk_ring_full,
+            section_staged: staging.section_staged,
+            section_fallback: staging.section_fallback,
+            section_ring_full: staging.section_ring_full,
         }
     }
 
@@ -2980,7 +3025,7 @@ impl World {
         );
         // `upload_chunk`'s retire frees the edited-Ready chunk's old mesh
         // (`Dirty.prev`) exactly once and installs the fresh `Ready`/`Air`.
-        self.upload_chunk(coord, &scratch, eng);
+        self.upload_chunk_cpu(coord, &scratch, eng);
         self.scratch = scratch;
     }
 

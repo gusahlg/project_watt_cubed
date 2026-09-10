@@ -174,6 +174,15 @@ pub struct StreamGauges {
     pub remesh_async_calls: u64,
     /// Vertex bytes of section (LOD tile) meshes uploaded this stream pass.
     pub section_upload_bytes: usize,
+    /// Vertex bytes of chunk + section meshes uploaded this drain (harness peak).
+    pub drain_upload_bytes: usize,
+    /// Worker staging vs CPU-fallback counts (cumulative for the world).
+    pub mesh_staged: u64,
+    pub mesh_fallback: u64,
+    pub mesh_ring_full: u64,
+    pub section_staged: u64,
+    pub section_fallback: u64,
+    pub section_ring_full: u64,
     /// Stale mesh drops (accept-time, pop-time, and prune).
     pub drop_stale_uploads: u64,
     /// Stale drops during the current stream/pump frame.
@@ -580,14 +589,7 @@ impl SectionState {
         let quadrants = std::array::from_fn(|qi| {
             let mut blocks = Vec::new();
             for &(block_origin, ref data) in &meshes[qi] {
-                let placement = voxel_engine::MeshPlacement::terrain(
-                    voxel_engine::IVec3::new(
-                        pos.min_x() + block_origin.x as i32 * cell,
-                        block_origin.y as i32 * cell,
-                        pos.min_z() + block_origin.z as i32 * cell,
-                    ),
-                    detail,
-                );
+                let placement = Self::block_placement(pos, block_origin, cell, detail);
                 let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement));
                 if let Some(meshes) = ChunkMeshes::from_upload_handles(handles) {
                     blocks.push(meshes);
@@ -599,6 +601,61 @@ impl SectionState {
             quadrants,
             last_style: None,
         }
+    }
+
+    fn from_upload_payload(
+        pos: SectionPos,
+        meshes: pipeline::SectionPayload,
+        eng: &mut Engine,
+    ) -> SectionState {
+        match meshes {
+            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, &data, eng),
+            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng),
+        }
+    }
+
+    fn from_upload_staged(
+        pos: SectionPos,
+        mut staged: pipeline::StagedSection,
+        eng: &mut Engine,
+    ) -> SectionState {
+        let cell = pos.cell_size();
+        let detail = pos.detail;
+        let quadrants = std::array::from_fn(|qi| {
+            let mut blocks = Vec::new();
+            for mut block in std::mem::take(&mut staged.quadrants[qi]) {
+                let placement = Self::block_placement(pos, block.origin, cell, detail);
+                let handles = ByPass::from_fn(|p| {
+                    block.passes[p].take().and_then(|pass| {
+                        eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement)
+                    })
+                });
+                if let Some(meshes) = ChunkMeshes::from_upload_handles(handles) {
+                    blocks.push(meshes);
+                }
+            }
+            blocks
+        });
+        SectionState::Ready {
+            quadrants,
+            last_style: None,
+        }
+    }
+
+    fn block_placement(
+        pos: SectionPos,
+        block_origin: glam::UVec3,
+        cell: i32,
+        detail: Detail,
+    ) -> voxel_engine::MeshPlacement {
+        voxel_engine::MeshPlacement::terrain(
+            voxel_engine::IVec3::new(
+                pos.min_x() + block_origin.x as i32 * cell,
+                block_origin.y as i32 * cell,
+                pos.min_z() + block_origin.z as i32 * cell,
+            ),
+            detail,
+        )
     }
 
     fn is_ready(&self) -> bool {
@@ -852,7 +909,7 @@ pub struct World {
     /// loaded (or never requested). Physics waits on [`spawn_ready`](Self::spawn_ready).
     spawn_slab: Option<ChunkBox>,
     /// Finished meshes awaiting budgeted upload (re-validated at upload time for staleness).
-    upload_queue: VecDeque<(Coord, u32, pipeline::MeshOutput)>,
+    upload_queue: VecDeque<(Coord, u32, pipeline::MeshPayload)>,
     /// Chunks needing a *fresh* mesh (the [`MeshLane`] seed set — replaces the
     /// old whole-map rescan `pending_fresh` armed). Seeded on load (self + 6
     /// neighbours), on a light publish that moved a border, and on an
@@ -1014,9 +1071,11 @@ pub struct World {
     /// token that produced them (re-validated at the moment of upload) and the
     /// vertex-byte charge computed at queue time.
     section_upload_queue:
-        VecDeque<(SectionPos, pipeline::ClaimToken, usize, pipeline::SectionMeshOutput)>,
+        VecDeque<(SectionPos, pipeline::ClaimToken, usize, pipeline::SectionPayload)>,
     /// Vertex bytes uploaded for sections in the current drain (harness peak).
     section_upload_bytes: usize,
+    /// Chunk + section vertex bytes uploaded in the current drain (harness peak).
+    drain_upload_bytes: usize,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -1250,6 +1309,7 @@ impl World {
             sections: FastMap::default(),
             section_upload_queue: VecDeque::new(),
             section_upload_bytes: 0,
+            drain_upload_bytes: 0,
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_edit_rev: FastMap::default(),
@@ -2319,7 +2379,7 @@ impl StreamLane for SectionLane {
                 && matches!(world.sections.get(&pos),
                     Some(SectionState::Meshing { token: t }) if *t == token);
             if live {
-                let bytes = streaming::section_output_bytes(&meshes);
+                let bytes = meshes.vertex_bytes();
                 world
                     .section_upload_queue
                     .push_back((pos, token, bytes, meshes));

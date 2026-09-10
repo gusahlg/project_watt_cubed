@@ -8,9 +8,11 @@
 //!   lock only while dequeuing (or waiting); every job runs unlocked. The
 //!   velocity-aware pacer may park a suffix of the pool during fast travel.
 //! - Jobs carry owned value data only (a generator clone, a voxel snapshot,
-//!   border planes, an `Arc`'d solidity table). Workers never touch the GPU,
-//!   the `World`, or the live chunk map, so there is nothing to contend on
-//!   and nothing that can deadlock against the render thread.
+//!   border planes, an `Arc`'d solidity table). Workers never submit GPU
+//!   commands, touch the `World`, or the live chunk map — they may write
+//!   finished vertices into the engine's host-mapped staging ring. There is
+//!   nothing to contend on and nothing that can deadlock against the render
+//!   thread.
 //! - Priority is two-class, near-preferred: near work (generate/mesh/light)
 //!   dequeues before far LOD work (tile/skin), so a burst of slow tile jobs
 //!   can never make the chunk under the player wait behind them. Within a class
@@ -26,7 +28,7 @@
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -41,6 +43,9 @@ use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
 use super::neighborhood::BoundedPool;
 use super::section::{self, SectionMeshData, SectionPos};
 use crate::block::registry::{BlockId, HotTables};
+use crate::coord::ByPass;
+use glam::UVec3;
+use voxel_engine::{Engine, MeshData, MeshStager, MeshStaging, Pass};
 
 /// Mesh job snapshot: pure mesher state (light pre-settled, no live chunk map sharing).
 pub struct ChunkSnapshot {
@@ -196,10 +201,12 @@ pub(in crate::world) enum Done {
     /// six index buckets), and it dominated the whole enum — every channel
     /// send/recv and match memcpy'd it. One box per mesh job is noise next to
     /// the meshing itself; the Box rides untouched into `upload_queue`.
+    /// `data` is either a worker-written staging region or the pooled `Vec`
+    /// fallback when the ring was full (or no stager is bound).
     Mesh {
         coord: Coord,
         rev: u32,
-        data: MeshOutput,
+        data: MeshPayload,
     },
     Light {
         coord: Coord,
@@ -211,7 +218,7 @@ pub(in crate::world) enum Done {
         pos: SectionPos,
         epoch: u32,
         token: ClaimToken,
-        meshes: SectionMeshOutput,
+        meshes: SectionPayload,
     },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
     /// and apply the bounded retry/quarantine policy — without this, a single
@@ -328,6 +335,301 @@ impl Drop for SectionMeshOutput {
                 }
             }
             SECTION_MESH_POOL.put(data);
+        }
+    }
+}
+
+/// Packed vertex bytes for `quads` (4 verts/quad, engine stride).
+pub(in crate::world) fn vertex_bytes_from_quads(quads: [u32; 6]) -> usize {
+    quads.iter().sum::<u32>() as usize * 4 * std::mem::size_of::<voxel_engine::MeshVertex>()
+}
+
+/// One pass written into a worker-acquired staging region.
+pub(in crate::world) struct StagedPass {
+    pub staging: MeshStaging,
+    pub quad_counts: [u32; 6],
+}
+
+impl StagedPass {
+    fn vertex_bytes(&self) -> usize {
+        vertex_bytes_from_quads(self.quad_counts)
+    }
+}
+
+/// Per-pass staging for one chunk job. Empty passes are `None`.
+pub(in crate::world) struct StagedChunk {
+    pub passes: ByPass<Option<StagedPass>>,
+}
+
+impl StagedChunk {
+    fn vertex_bytes(&self) -> usize {
+        self.passes
+            .iter()
+            .map(|(_, p)| p.as_ref().map_or(0, StagedPass::vertex_bytes))
+            .sum()
+    }
+}
+
+/// Worker mesh result: staging ring when acquire succeeded, pooled `MeshData`
+/// when the ring was full (or no [`MeshStager`] is bound). Choice is per job.
+pub(in crate::world) enum MeshPayload {
+    Cpu(MeshOutput),
+    Staged(Box<StagedChunk>),
+}
+
+impl From<MeshOutput> for MeshPayload {
+    fn from(data: MeshOutput) -> Self {
+        Self::Cpu(data)
+    }
+}
+
+impl MeshPayload {
+    pub(in crate::world) fn vertex_bytes(&self) -> usize {
+        match self {
+            Self::Cpu(data) => Pass::ALL.iter().map(|&p| data[p].vertex_bytes()).sum(),
+            Self::Staged(data) => data.vertex_bytes(),
+        }
+    }
+
+    /// Explicit release of a stale staged region; same as drop. Cpu payloads
+    /// return their pooled `MeshData` the way they always have.
+    pub(in crate::world) fn release_staging(self, eng: &Engine) {
+        if let Self::Staged(data) = self {
+            for (_, pass) in data.passes.into_iter_passes() {
+                if let Some(pass) = pass {
+                    eng.release_mesh_staging(pass.staging);
+                }
+            }
+        }
+    }
+}
+
+/// One LOD-tile block written into staging, keyed by the same cell origin
+/// [`SectionMeshData`] uses.
+pub(in crate::world) struct StagedBlock {
+    pub origin: UVec3,
+    pub passes: ByPass<Option<StagedPass>>,
+}
+
+impl StagedBlock {
+    fn vertex_bytes(&self) -> usize {
+        self.passes
+            .iter()
+            .map(|(_, p)| p.as_ref().map_or(0, StagedPass::vertex_bytes))
+            .sum()
+    }
+}
+
+/// Per-quadrant staging for one section job.
+pub(in crate::world) struct StagedSection {
+    pub quadrants: [Vec<StagedBlock>; 4],
+}
+
+impl StagedSection {
+    fn vertex_bytes(&self) -> usize {
+        self.quadrants
+            .iter()
+            .flatten()
+            .map(StagedBlock::vertex_bytes)
+            .sum()
+    }
+}
+
+/// Worker section result: same per-job staged-or-cpu choice as [`MeshPayload`].
+pub(in crate::world) enum SectionPayload {
+    Cpu(SectionMeshOutput),
+    Staged(Box<StagedSection>),
+}
+
+impl From<SectionMeshOutput> for SectionPayload {
+    fn from(meshes: SectionMeshOutput) -> Self {
+        Self::Cpu(meshes)
+    }
+}
+
+impl Default for SectionPayload {
+    fn default() -> Self {
+        Self::Cpu(SectionMeshOutput::new())
+    }
+}
+
+fn cpu_section_bytes(data: &[SectionMeshData; 4]) -> usize {
+    data.iter()
+        .flat_map(|quad| quad.iter())
+        .map(|(_, mesh)| Pass::ALL.iter().map(|&p| mesh[p].vertex_bytes()).sum::<usize>())
+        .sum()
+}
+
+impl SectionPayload {
+    pub(in crate::world) fn vertex_bytes(&self) -> usize {
+        match self {
+            Self::Cpu(data) => cpu_section_bytes(data),
+            Self::Staged(data) => data.vertex_bytes(),
+        }
+    }
+
+    pub(in crate::world) fn release_staging(self, eng: &Engine) {
+        if let Self::Staged(data) = self {
+            for quad in data.quadrants {
+                for block in quad {
+                    for (_, pass) in block.passes.into_iter_passes() {
+                        if let Some(pass) = pass {
+                            eng.release_mesh_staging(pass.staging);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Worker-side staging counters (stress report). Atomically updated as each
+/// mesh/section job finishes; the main thread snapshots them into gauges.
+pub(in crate::world) struct StagingStats {
+    pub chunk_staged: AtomicU64,
+    pub chunk_fallback: AtomicU64,
+    pub chunk_ring_full: AtomicU64,
+    pub section_staged: AtomicU64,
+    pub section_fallback: AtomicU64,
+    pub section_ring_full: AtomicU64,
+}
+
+impl StagingStats {
+    const fn new() -> Self {
+        Self {
+            chunk_staged: AtomicU64::new(0),
+            chunk_fallback: AtomicU64::new(0),
+            chunk_ring_full: AtomicU64::new(0),
+            section_staged: AtomicU64::new(0),
+            section_fallback: AtomicU64::new(0),
+            section_ring_full: AtomicU64::new(0),
+        }
+    }
+
+    pub(in crate::world) fn snapshot(&self) -> StagingSnapshot {
+        StagingSnapshot {
+            chunk_staged: self.chunk_staged.load(Ordering::Relaxed),
+            chunk_fallback: self.chunk_fallback.load(Ordering::Relaxed),
+            chunk_ring_full: self.chunk_ring_full.load(Ordering::Relaxed),
+            section_staged: self.section_staged.load(Ordering::Relaxed),
+            section_fallback: self.section_fallback.load(Ordering::Relaxed),
+            section_ring_full: self.section_ring_full.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Copy of [`StagingStats`] for [`super::StreamGauges`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::world) struct StagingSnapshot {
+    pub chunk_staged: u64,
+    pub chunk_fallback: u64,
+    pub chunk_ring_full: u64,
+    pub section_staged: u64,
+    pub section_fallback: u64,
+    pub section_ring_full: u64,
+}
+
+/// Copy one [`MeshData`] into a staging region via [`MeshStaging::vertex_writer`]
+/// (AABB tracked as vertices land). `None` if the ring is full or the write
+/// would not fit — caller falls back to the `Vec` payload.
+fn stage_pass(stager: &MeshStager, data: &MeshData) -> Option<StagedPass> {
+    let bytes = data.vertex_bytes();
+    if bytes == 0 {
+        return None;
+    }
+    let mut staging = stager.acquire(bytes)?;
+    let verts = data.vertices();
+    if !staging.vertex_writer().write(&verts) {
+        return None;
+    }
+    Some(StagedPass {
+        staging,
+        quad_counts: data.quad_counts(),
+    })
+}
+
+/// Stage every non-empty pass. First failed acquire drops any regions already
+/// taken (via [`MeshStaging`] drop) and returns `None` so the job sends CPU.
+fn try_stage_chunk(stager: &MeshStager, data: &ChunkMeshData) -> Option<Box<StagedChunk>> {
+    let mut passes = ByPass::from_fn(|_| None);
+    for p in Pass::ALL {
+        if data[p].is_empty() {
+            continue;
+        }
+        passes[p] = Some(stage_pass(stager, &data[p])?);
+    }
+    Some(Box::new(StagedChunk { passes }))
+}
+
+fn try_stage_section(
+    stager: &MeshStager,
+    data: &[SectionMeshData; 4],
+) -> Option<Box<StagedSection>> {
+    let mut quadrants: [Vec<StagedBlock>; 4] = std::array::from_fn(|_| Vec::new());
+    for (qi, quad) in data.iter().enumerate() {
+        quadrants[qi].reserve(quad.len());
+        for &(origin, ref mesh) in quad {
+            let mut passes = ByPass::from_fn(|_| None);
+            for p in Pass::ALL {
+                if mesh[p].is_empty() {
+                    continue;
+                }
+                passes[p] = Some(stage_pass(stager, &mesh[p])?);
+            }
+            quadrants[qi].push(StagedBlock { origin, passes });
+        }
+    }
+    Some(Box::new(StagedSection { quadrants }))
+}
+
+fn mesh_payload_from_output(
+    stager: Option<&MeshStager>,
+    stats: &StagingStats,
+    data: MeshOutput,
+) -> MeshPayload {
+    let empty = Pass::ALL.iter().all(|&p| data[p].is_empty());
+    if empty {
+        return MeshPayload::Cpu(data);
+    }
+    let Some(stager) = stager else {
+        stats.chunk_fallback.fetch_add(1, Ordering::Relaxed);
+        return MeshPayload::Cpu(data);
+    };
+    match try_stage_chunk(stager, &data) {
+        Some(staged) => {
+            stats.chunk_staged.fetch_add(1, Ordering::Relaxed);
+            MeshPayload::Staged(staged)
+        }
+        None => {
+            stats.chunk_ring_full.fetch_add(1, Ordering::Relaxed);
+            stats.chunk_fallback.fetch_add(1, Ordering::Relaxed);
+            MeshPayload::Cpu(data)
+        }
+    }
+}
+
+fn section_payload_from_output(
+    stager: Option<&MeshStager>,
+    stats: &StagingStats,
+    meshes: SectionMeshOutput,
+) -> SectionPayload {
+    let empty = cpu_section_bytes(&meshes) == 0;
+    if empty {
+        return SectionPayload::Cpu(meshes);
+    }
+    let Some(stager) = stager else {
+        stats.section_fallback.fetch_add(1, Ordering::Relaxed);
+        return SectionPayload::Cpu(meshes);
+    };
+    match try_stage_section(stager, &meshes) {
+        Some(staged) => {
+            stats.section_staged.fetch_add(1, Ordering::Relaxed);
+            SectionPayload::Staged(staged)
+        }
+        None => {
+            stats.section_ring_full.fetch_add(1, Ordering::Relaxed);
+            stats.section_fallback.fetch_add(1, Ordering::Relaxed);
+            SectionPayload::Cpu(meshes)
         }
     }
 }
@@ -847,6 +1149,10 @@ pub struct Workers {
     results: Receiver<Done>,
     handles: Vec<JoinHandle<()>>,
     capacity: usize,
+    /// Bound on the first stream that has an [`Engine`]. Headless tests leave
+    /// this unset and every mesh job takes the CPU fallback.
+    stager: Arc<OnceLock<MeshStager>>,
+    staging: Arc<StagingStats>,
 }
 
 impl Workers {
@@ -884,12 +1190,16 @@ impl Workers {
         ));
         let view = Arc::new(ViewGate::new());
         view.set_active_workers(capacity);
+        let stager = Arc::new(OnceLock::new());
+        let staging = Arc::new(StagingStats::new());
         let handles = (0..capacity)
             .map(|worker_id| {
                 let gate = Arc::clone(&gate);
                 let view = Arc::clone(&view);
                 let done = done.clone();
-                thread::spawn(move || worker_loop(worker_id, &gate, &view, &done))
+                let stager = Arc::clone(&stager);
+                let staging = Arc::clone(&staging);
+                thread::spawn(move || worker_loop(worker_id, &gate, &view, &done, &stager, &staging))
             })
             .collect();
         Self {
@@ -898,7 +1208,19 @@ impl Workers {
             results,
             handles,
             capacity,
+            stager,
+            staging,
         }
+    }
+
+    /// Bind the engine's staging handle. First call wins; later calls are
+    /// no-ops (the pool is process-wide for the renderer).
+    pub(in crate::world) fn set_stager(&self, stager: MeshStager) {
+        let _ = self.stager.set(stager);
+    }
+
+    pub(in crate::world) fn staging_snapshot(&self) -> StagingSnapshot {
+        self.staging.snapshot()
     }
 
     /// Publish the live streaming centre, horizontal radius (chunks), and the
@@ -1061,6 +1383,8 @@ fn worker_loop(
     gate: &(Mutex<JobQueue>, Condvar, Condvar),
     view: &ViewGate,
     done: &Sender<Done>,
+    stager: &OnceLock<MeshStager>,
+    stats: &StagingStats,
 ) {
     let (lock, work, pace) = gate;
     // Reused across iterations: descheduling is bursty (one epoch rebuild can
@@ -1111,7 +1435,9 @@ fn worker_loop(
         // to the main thread so `fail_job` can release it and retry/quarantine —
         // a claimed key is owed exactly one `Done`, panic or not. The key
         // names the culprit so it stops being invisible.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(job, stager.get(), stats)
+        }));
         if let Some((meter, start)) = profile_start {
             voxel_engine::profile::add(meter, start.elapsed());
         }
@@ -1128,8 +1454,10 @@ fn worker_loop(
     }
 }
 
-/// Pure CPU on owned data (same code as sync paths for determinism).
-fn run(job: Job) -> Done {
+/// Pure CPU on owned data (same code as sync paths for determinism). After
+/// meshing, the worker copies direction-major vertices into a staging region
+/// when one is free; otherwise the pooled `MeshData` rides to the main thread.
+fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
     match job {
         Job::GenerateColumn {
             col,
@@ -1183,7 +1511,11 @@ fn run(job: Job) -> Done {
                     &mut data,
                 ),
             }
-            Done::Mesh { coord, rev, data }
+            Done::Mesh {
+                coord,
+                rev,
+                data: mesh_payload_from_output(stager, stats, data),
+            }
         }
         Job::Light {
             coord,
@@ -1228,7 +1560,7 @@ fn run(job: Job) -> Done {
                 pos,
                 epoch,
                 token,
-                meshes,
+                meshes: section_payload_from_output(stager, stats, meshes),
             }
         }
         #[cfg(test)]
@@ -1377,6 +1709,9 @@ mod tests {
             panic!("expected a mesh result");
         };
         assert_eq!((coord, rev), (Coord::new(0, 1, 0), 7));
+        let MeshPayload::Cpu(data) = data else {
+            panic!("headless workers send the CPU payload");
+        };
         for p in Pass::ALL {
             assert_eq!(data[p].quad_counts(), expected[p].quad_counts());
             assert_eq!(

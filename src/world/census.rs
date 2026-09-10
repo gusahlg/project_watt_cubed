@@ -72,11 +72,7 @@ impl World {
             c.mesh_cpu_bytes += mesh_output_held(out);
         }
         for (_, _, _, quads) in &self.section_upload_queue {
-            for quad in quads.iter() {
-                for (_, data) in quad {
-                    c.mesh_cpu_bytes += mesh_held(data);
-                }
-            }
+            c.mesh_cpu_bytes += section_payload_held(quads);
         }
         c.edit_overlay_bytes = edit_bytes(&self.edits);
         c.section_lod_bytes = section_lod_bytes(self);
@@ -120,8 +116,24 @@ fn mesh_held(data: &ChunkMeshData) -> usize {
         .sum()
 }
 
-fn mesh_output_held(data: &pipeline::MeshOutput) -> usize {
-    super::streaming::mesh_output_bytes(data)
+fn mesh_output_held(data: &pipeline::MeshPayload) -> usize {
+    match data {
+        pipeline::MeshPayload::Cpu(_) => data.vertex_bytes(),
+        pipeline::MeshPayload::Staged(_) => 0,
+    }
+}
+
+fn section_payload_held(data: &pipeline::SectionPayload) -> usize {
+    match data {
+        pipeline::SectionPayload::Cpu(quads) => {
+            quads
+                .iter()
+                .flat_map(|quad| quad.iter())
+                .map(|(_, mesh)| mesh_held(mesh))
+                .sum()
+        }
+        pipeline::SectionPayload::Staged(_) => 0,
+    }
 }
 
 fn mesh_data_held(data: &MeshData) -> usize {
@@ -162,13 +174,13 @@ fn worklist_bytes(world: &World) -> usize {
         + set_cap::<Coord>(world.dirty_worklist.capacity())
         + map_cap::<Coord, std::time::Instant>(world.light_gate.dirty.capacity())
         + set_cap::<SectionPos>(world.dirty_sections.capacity())
-        + deque_cap::<(Coord, u32, pipeline::MeshOutput)>(world.upload_queue.capacity())
+        + deque_cap::<(Coord, u32, pipeline::MeshPayload)>(world.upload_queue.capacity())
         + deque_cap::<(Coord, LightGrid)>(world.light_apply_queue.capacity())
         + deque_cap::<(
             SectionPos,
             pipeline::ClaimToken,
             usize,
-            pipeline::SectionMeshOutput,
+            pipeline::SectionPayload,
         )>(world.section_upload_queue.capacity())
         + deque_cap::<Coord>(world.conn_fill_queue.capacity())
 }
