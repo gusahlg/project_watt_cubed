@@ -499,12 +499,15 @@ impl BlockRegistry {
             return Some(AIR);
         }
         let hex = spec.strip_prefix("c:")?;
-        if hex.len() % 2 != 0 {
+        // Byte-wise: a non-ASCII spec (wire, save or console input) must be a `None`, never a panic
+        // from slicing inside a multi-byte character.
+        if !hex.is_ascii() || hex.len() % 2 != 0 {
             return None;
         }
-        let bytes: Option<Vec<u8>> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        let bytes: Option<Vec<u8>> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
             .collect();
         let c = Configuration::decode(&bytes?).ok()?;
         self.intern(&c)
@@ -606,6 +609,9 @@ mod tests {
         assert_eq!(r2.parse_spec("natural:Stone,Iron"), None);
         assert_eq!(r2.parse_spec("c:zz"), None);
         assert_eq!(r2.parse_spec("c:0201020304"), None, "truncated");
+        assert_eq!(r2.parse_spec("c:aéa"), None, "non-ASCII must not panic (wire/save input)");
+        assert_eq!(r2.parse_spec("c:é"), None);
+        assert_eq!(r2.parse_spec("c:"), None, "no bytes at all");
     }
 
     #[test]

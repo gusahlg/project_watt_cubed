@@ -87,7 +87,9 @@ pub struct Probes {
 /// with different stamps do not share a world.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Law {
-    /// Law format version.
+    /// Law version: bumped whenever the stamp's fields OR any value-path constant of this crate
+    /// changes meaning (e.g. the probe response scale), so two peers computing different readings from
+    /// the same bytes can never share a world. History: 0 = initial; 1 = response scale ×4 (2026-09-10).
     pub version: u16,
     /// Lattice edge behaviour.
     pub boundary: Boundary,
@@ -128,7 +130,7 @@ impl Law {
     /// oscillate across it: pairs come to rest instead of hopping around the ring forever).
     pub const fn v0() -> Law {
         Law {
-            version: 0,
+            version: 1,
             boundary: Boundary::Clamp,
             kernel: Kernel {
                 knots: [
@@ -231,7 +233,7 @@ impl Law {
             s
         };
         let version = u16::from_le_bytes([take(1)[0], take(1)[0]]);
-        if version != 0 {
+        if version != 1 {
             return Err(LawError::Version(version));
         }
         let boundary = match take(1)[0] {
