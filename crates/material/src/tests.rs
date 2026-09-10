@@ -213,3 +213,24 @@ fn print_probe_quantiles() {
         println!("{name:9} p05={} p25={} p50={} p75={} p85={} p92={} p98={} max={}", q(0.05), q(0.25), q(0.5), q(0.75), q(0.85), q(0.92), q(0.98), v[v.len() - 1]);
     }
 }
+
+#[test]
+fn interact_many_is_order_independent_and_matches_single_origin() {
+    let law = Law::v0();
+    let mut rng = Rng(21);
+    for _ in 0..2_000 {
+        let a = rng.config(4);
+        let b = rng.config(4);
+        let t = rng.config(4);
+        let ab = interact_many(&law, &[(&a, EventKind::Collision), (&b, EventKind::Moved)], &t);
+        let ba = interact_many(&law, &[(&b, EventKind::Moved), (&a, EventKind::Collision)], &t);
+        assert_eq!(ab, ba);
+        assert_eq!(interact_many(&law, &[(&a, EventKind::Moved)], &t), interact(&law, &a, &t, EventKind::Moved));
+        for (x, y) in ab.target.elements().iter().zip(t.elements()) {
+            assert!(x.max_axis_distance(*y) <= law.kernel.max_step as u32);
+        }
+    }
+    let t = rng.config(3);
+    assert!(!interact_many(&law, &[], &t).changed);
+    assert!(!interact_many(&law, &[(&Configuration::void(), EventKind::Collision)], &t).changed);
+}
