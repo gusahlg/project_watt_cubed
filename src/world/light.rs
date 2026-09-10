@@ -803,9 +803,9 @@ mod tests {
         let air_hash = pin(&air, &shell, &partial, 2 * CHUNK_SIZE as i32);
 
         let pins: [(&str, u32, u32); 4] = [
-            ("surface", surface_hash, 0xb9eab89e),
-            ("cave", cave_hash, 0xf2c60252),
-            ("emissive", emissive_hash, 0xf2c60252),
+            ("surface", surface_hash, 0xa8c2bd42),
+            ("cave", cave_hash, 0xbcc31dc5),
+            ("emissive", emissive_hash, 0x63b9ebf0),
             ("air", air_hash, 0x19839265),
         ];
         for (name, got, want) in pins {

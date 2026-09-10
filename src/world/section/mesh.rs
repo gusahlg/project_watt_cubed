@@ -732,7 +732,9 @@ mod tests {
         // Shore at 40 with water up to 80: a deep water table over sand/stone.
         let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
         let mesh = mesh_of(&sec, &tables);
-        let is_water_quad = |q: &[MeshVertex]| tables.fluid_surface(BlockId(q[0].layer()));
+        // The vertex layer is the render DESCRIPTOR of the material, not its block id.
+        let water_layer = tables.render_layer(b.water);
+        let is_water_quad = |q: &[MeshVertex]| q[0].layer() == water_layer;
         let opaque_water = all_quads(&mesh).any(|(p, q)| p == Pass::Opaque && is_water_quad(&q));
         assert!(opaque_water, "water surface meshes into the opaque pass");
         assert!(!all_quads(&mesh).any(|(_, q)| q[0].is_water()), "LOD water clears the water bit");
