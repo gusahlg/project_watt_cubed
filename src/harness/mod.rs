@@ -1397,26 +1397,6 @@ pub fn golden_shots() -> Vec<GoldenShot> {
             day: 0.30,
             setup: None,
         },
-        GoldenShot {
-            seed: GOLDEN_SEED,
-            // Pose reviewed at first capture. Water shot: a
-            // low camera (y≈72, a few blocks over the ~64 water surface) grazing
-            // ACROSS the lakes that fill the origin basin (see the blessed
-            // spawn_forward/tile_boundary captures) at a moderate down angle so a
-            // wide sheet of water fills mid-frame — the grazing view maximizes
-            // fresnel/sky reflection. Yaw is pinned along the day-0.3 sun azimuth
-            // (as shadow_boundary reasons) so the sun's specular GLINT lands on the
-            // water. Pinned day ⇒ pinned `anim` phase ⇒ deterministic wave
-            // geometry. This is the golden that protects every WATER_* tunable.
-            cam: CameraPose {
-                pos: DVec3::new(0.0, 72.0, 0.0),
-                yaw: 0.24,
-                pitch: -0.12,
-            },
-            name: "water",
-            day: SCRIPTED_DEFAULT_DAY,
-            setup: None,
-        },
     ]
 }
 
@@ -1431,10 +1411,10 @@ pub fn golden_shots() -> Vec<GoldenShot> {
 /// generate already-carved.
 fn carve_cave(game: &mut Game) {
     let registry = game.world().registry();
-    // The ordinary element-derived stone/lumin composition.
+    // The generator's mine lamp: a glowing configuration found in the law.
     let emitter = registry
-        .id_by_label("lamp+rock")
-        .expect("worldgen registers the Stone+Lumin composition");
+        .id_by_label("lamp")
+        .expect("worldgen registers the mine lamp");
     let stone = registry
         .id_by_label("rock")
         .expect("Stone is a built-in block");

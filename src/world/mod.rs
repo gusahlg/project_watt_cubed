@@ -31,17 +31,15 @@
 pub mod brick;
 pub mod chunk;
 pub mod connectivity;
-pub mod diffusion;
-pub mod diffusion_v2;
 pub mod generation;
 pub mod light;
 pub mod lod;
 pub mod mesh;
 mod neighborhood;
 pub mod pipeline;
-pub mod placement;
 pub mod pyramid;
 pub mod section;
+pub mod terrain;
 
 mod census;
 mod coverage;
@@ -618,12 +616,13 @@ pub(in crate::world) enum SectionState {
     /// presents a different token belongs to a superseded claim and must not
     /// touch this entry.
     Meshing { token: pipeline::ClaimToken },
-    /// One mesh per pass for the whole section. Position and packed detail
-    /// (`pos.detail + shift`) are pinned at upload; visibility is a single
-    /// `set_visible` (partial covering draws the whole tile — overlap is
-    /// depth-biased) and style a `set_style` push.
+    /// One mesh per pass for each of the section's stacked slabs (none for an
+    /// empty section). Positions and packed detail (`pos.detail + shift`) are
+    /// pinned at upload; visibility is one `set_visible` over all of them
+    /// (partial covering draws the whole tile — overlap is depth-biased) and
+    /// style a `set_style` push.
     Ready {
-        meshes: Option<ChunkMeshes>,
+        meshes: Vec<ChunkMeshes>,
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
         /// re-observed next frame (the steady case) sends nothing.
         last_style: Option<(FadeStyle, u32)>,
@@ -631,23 +630,29 @@ pub(in crate::world) enum SectionState {
 }
 
 impl SectionState {
-    /// Upload the section's one mesh per pass at the packed origin and detail.
+    /// Upload each slab's mesh per pass at its packed origin and the section's detail.
     fn from_upload(
         pos: SectionPos,
         mesh: SectionMeshData,
         eng: &mut Engine,
     ) -> SectionState {
-        let cell = pos.cell_size();
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
-        let placement = voxel_engine::MeshPlacement::terrain(
-            voxel_engine::IVec3::new(pos.min_x(), mesh.origin_y as i32 * cell, pos.min_z()),
+        let meshes = mesh
+            .slabs
+            .iter()
+            .filter_map(|slab| {
+                let placement = Self::slab_placement(pos, slab.origin_y, detail);
+                ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| eng.upload_mesh_placed(&slab.data[p], placement)))
+            })
+            .collect();
+        SectionState::Ready { meshes, last_style: None }
+    }
+
+    fn slab_placement(pos: SectionPos, origin_y: u32, detail: Detail) -> voxel_engine::MeshPlacement {
+        voxel_engine::MeshPlacement::terrain(
+            voxel_engine::IVec3::new(pos.min_x(), origin_y as i32 * pos.cell_size(), pos.min_z()),
             detail,
-        );
-        let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&mesh.data[p], placement));
-        SectionState::Ready {
-            meshes: ChunkMeshes::from_upload_handles(handles),
-            last_style: None,
-        }
+        )
     }
 
     fn from_upload_payload(
@@ -663,46 +668,50 @@ impl SectionState {
 
     fn from_upload_staged(
         pos: SectionPos,
-        mut staged: pipeline::StagedSection,
+        staged: pipeline::StagedSection,
         eng: &mut Engine,
     ) -> SectionState {
-        let cell = pos.cell_size();
         let detail = Detail(pos.detail.0.saturating_add(staged.shift as i8));
-        let placement = voxel_engine::MeshPlacement::terrain(
-            voxel_engine::IVec3::new(pos.min_x(), staged.origin_y as i32 * cell, pos.min_z()),
-            detail,
-        );
-        let handles = ByPass::from_fn(|p| {
-            staged.passes[p].take().and_then(|pass| {
-                eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement)
+        let meshes = staged
+            .slabs
+            .into_iter()
+            .filter_map(|mut slab| {
+                let placement = Self::slab_placement(pos, slab.origin_y, detail);
+                ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                    slab.passes[p]
+                        .take()
+                        .and_then(|pass| eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement))
+                }))
             })
-        });
-        SectionState::Ready {
-            meshes: ChunkMeshes::from_upload_handles(handles),
-            last_style: None,
-        }
+            .collect();
+        SectionState::Ready { meshes, last_style: None }
     }
 
     fn is_ready(&self) -> bool {
         matches!(self, SectionState::Ready { .. })
     }
 
-    /// Project `mask` onto this region's slots. One mesh covers the whole
-    /// section: any non-empty mask draws it (overlap with finer children is
-    /// depth-biased); `None` / empty hides it.
+    /// Project `mask` onto this region's slots. The slabs cover the whole
+    /// section: any non-empty mask draws them (overlap with finer children is
+    /// depth-biased); `None` / empty hides them.
     fn set_visible(&self, eng: &mut Engine, mask: Option<QuadrantMask>) {
-        let SectionState::Ready { meshes: Some(meshes), .. } = self else {
+        let SectionState::Ready { meshes, .. } = self else {
             return;
         };
-        meshes.set_visible(eng, mask.is_some_and(|m| !m.is_empty()));
+        let on = mask.is_some_and(|m| !m.is_empty());
+        for m in meshes {
+            m.set_visible(eng, on);
+        }
     }
     /// Push the far-material style onto this section's mesh
     /// (visibility decides which actually draw). The engine delta-gates unchanged style.
     fn set_style(&self, eng: &mut Engine, style: FadeStyle, flat_rgba: u32) {
-        let SectionState::Ready { meshes: Some(meshes), .. } = self else {
+        let SectionState::Ready { meshes, .. } = self else {
             return;
         };
-        meshes.set_style(eng, style, flat_rgba);
+        for m in meshes {
+            m.set_style(eng, style, flat_rgba);
+        }
     }
     /// [`Self::set_style`], gated on the pushed tuple actually changing since last
     /// time — the DrawDyn contract ("at rest, zero writes"): the engine delta-gates
@@ -719,14 +728,16 @@ impl SectionState {
         self.set_style(eng, style, flat_rgba);
     }
     fn free(self, eng: &mut Engine) {
-        if let SectionState::Ready { meshes: Some(meshes), .. } = self {
-            meshes.free(eng);
+        if let SectionState::Ready { meshes, .. } = self {
+            for m in meshes {
+                m.free(eng);
+            }
         }
     }
 
     fn slot_count(&self) -> usize {
         match self {
-            SectionState::Ready { meshes: Some(m), .. } => m.slot_count(),
+            SectionState::Ready { meshes, .. } => meshes.iter().map(ChunkMeshes::slot_count).sum(),
             _ => 0,
         }
     }
@@ -919,9 +930,9 @@ impl MeshState {
 pub struct World {
     /// Read-only block palette; meshing/collision read its hot solidity arrays.
     registry: BlockRegistry,
-    generator: diffusion::Generator,
+    generator: terrain::Generator,
     kind: WorldgenKind,
-    diffusion: diffusion::DiffusionCfg,
+    terrain_cfg: terrain::TerrainCfg,
     chunks: FastMap<Coord, Loaded>,
     /// Player edits grouped by chunk (inner key: flat voxel index for replay on regenerate).
     edits: FastMap<Coord, FastMap<usize, BlockId>>,
@@ -1039,11 +1050,6 @@ pub struct World {
     uploaded_len: usize,
     /// Appearance revision last used to fill [`Self::texture_cache`].
     appearance_revision: u32,
-    /// Whether the last fill uploaded GPU material descriptors.
-    appearance_gpu: bool,
-    /// True after a `set_material_descs` of procedural entries; cleared by
-    /// uploading an empty table so the engine returns to ARRAY_LAYER.
-    gpu_descs_uploaded: bool,
     /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
     /// so the meshers saturate vertex layers at it. Construction uses `u16::MAX`
     /// (identity); the first engine contact overwrites it once.
@@ -1255,9 +1261,11 @@ struct SectionFrontierKey {
 }
 
 impl World {
-    /// A fresh world for `seed`, with the region around the origin pre-generated
-    /// (data only — no GPU) so spawning and headless queries work before the first
-    /// [`stream`](Self::stream).
+    /// A fresh FLAT world for `seed` (the core fallback generator: ground at
+    /// [`generation::FLAT_HEIGHT`]), with the region around the origin pre-generated
+    /// (data only — no GPU) so headless queries work before the first
+    /// [`stream`](Self::stream). The plain world tests and tools build on; the game builds
+    /// its worlds with [`with_kind_cfg`](Self::with_kind_cfg).
     pub fn new(seed: i64) -> Self {
         Self::with_config(seed, crate::render_config::RenderConfig::default())
     }
@@ -1267,7 +1275,7 @@ impl World {
     ///
     /// [`RenderConfig`]: crate::render_config::RenderConfig
     pub fn with_config(seed: i64, render: crate::render_config::RenderConfig) -> Self {
-        Self::with_kind(seed, render, WorldgenKind::Classic, true)
+        Self::with_kind(seed, render, WorldgenKind::Flat, true)
     }
 
     /// Construct without synchronously generating the full origin data box.
@@ -1278,43 +1286,31 @@ impl World {
     /// Existing constructors retain eager data for tests and headless callers
     /// that query the origin before their first stream.
     pub fn with_config_lazy(seed: i64, render: crate::render_config::RenderConfig) -> Self {
-        Self::with_kind(seed, render, WorldgenKind::Classic, false)
+        Self::with_kind(seed, render, WorldgenKind::Flat, false)
     }
 
-    /// Construct with an explicit worldgen kind (classic noise or InfiniteDiffusion).
+    /// Construct with an explicit worldgen kind (flat or InfiniteDiffusion) and default knobs.
     pub fn with_kind(
         seed: i64,
         render: crate::render_config::RenderConfig,
         kind: WorldgenKind,
         pregenerate_origin: bool,
     ) -> Self {
-        Self::with_kind_cfg(
-            seed,
-            render,
-            kind,
-            diffusion::DiffusionCfg::default(),
-            pregenerate_origin,
-        )
+        Self::with_kind_cfg(seed, render, kind, terrain::TerrainCfg::default(), pregenerate_origin)
     }
 
     pub fn with_kind_cfg(
         seed: i64,
         render: crate::render_config::RenderConfig,
         kind: WorldgenKind,
-        field: diffusion::DiffusionCfg,
+        cfg: terrain::TerrainCfg,
         pregenerate_origin: bool,
     ) -> Self {
-        let field = field.clamp();
+        let cfg = cfg.clamp();
         let mut registry = BlockRegistry::with_builtins();
-        let generator = match kind {
-            WorldgenKind::Classic => diffusion::classic(&mut registry, seed),
-            WorldgenKind::Diffusion => {
-                if field.version >= 2 {
-                    diffusion::diffusion_v2(&mut registry, seed, field)
-                } else {
-                    diffusion::diffusion(&mut registry, seed, field)
-                }
-            }
+        let generator: terrain::Generator = match kind {
+            WorldgenKind::Flat => Arc::new(generation::FlatTerrain::new(&mut registry, seed)),
+            WorldgenKind::Diffusion => terrain::generator(&mut registry, seed, cfg),
         };
         // The section ladder's innermost ring begins where the full-res box ends,
         // so its `unit` is the render distance in metres.
@@ -1325,7 +1321,7 @@ impl World {
             registry,
             generator,
             kind,
-            diffusion: field,
+            terrain_cfg: cfg,
             chunks: FastMap::default(),
             ceilings: FastMap::default(),
             edits: FastMap::default(),
@@ -1372,8 +1368,6 @@ impl World {
             texture_cache: Vec::new(),
             uploaded_len: 0,
             appearance_revision: 0,
-            appearance_gpu: false,
-            gpu_descs_uploaded: false,
             texture_layer_cap: u16::MAX,
             texture_cap_from_device: false,
             ao: true,

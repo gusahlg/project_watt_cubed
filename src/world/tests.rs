@@ -63,8 +63,11 @@ fn lod_clip_tracks_the_settled_rings() {
     assert_eq!(world.lod_clip().radius, world.view.coverage().radius);
 }
 
+/// InfiniteDiffusion at a quarter of its relief: real hills (so LOD selection has error to
+/// refine) that still fit inside the near slab the coverage tests reason about.
 fn lod2_world() -> World {
-    World::with_config(DEFAULT_SEED, RenderConfig::default())
+    let gentle = crate::world::terrain::TerrainCfg { relief: 25, ..Default::default() };
+    World::with_kind_cfg(DEFAULT_SEED, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, gentle, true)
 }
 
 /// The `section_edit_chunks` index must return exactly what the reference
@@ -211,7 +214,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = ChunkCoord::new(0, 0, 0);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { meshes: None, last_style: None };
+    let empty_ready = || SectionState::Ready { meshes: Vec::new(), last_style: None };
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -248,7 +251,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { meshes: None, last_style: None });
+        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), last_style: None });
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -473,7 +476,7 @@ fn collision_grouped_lookup_matches_per_cell_path() {
     ] {
         let aabb = Aabb::new(center, DVec3::new(0.4, 0.9, 0.4));
         // Collision skips liquids (solid to mesher, passable to collision).
-        let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_obstacle(x, y, z));
+        let reference = aabb.voxel_cells().any(|(x, y, z)| world.is_solid(x, y, z));
         assert_eq!(world.collides(&aabb), reference, "at {center:?}");
     }
 }
@@ -482,12 +485,8 @@ fn collision_grouped_lookup_matches_per_cell_path() {
 fn column_is_layered_grass_dirt_stone() {
     let mut world = World::generate();
     let reg = world.registry();
-    // Terrain speaks elements: crust blocks are the natural unions derived by
-    // the placement table.
-    let (grass, dirt) = (
-        reg.id_by_label("organic+soil").unwrap(),
-        reg.id_by_label("clay+soil").unwrap(),
-    );
+    // The flat world's layers: grass over soil over rock.
+    let (grass, dirt) = (reg.id_by_label("grass").unwrap(), reg.id_by_label("soil").unwrap());
     let stone_ids: [BlockId; 4] = [
         reg.id_by_label("rock").unwrap(),
         reg.id_by_label("rock:0").unwrap_or_else(|| reg.id_by_label("rock").unwrap()),
@@ -552,8 +551,10 @@ fn edits_persist_across_unload() {
 
 #[test]
 fn distinct_seeds_differ() {
-    let a = World::new(1);
-    let b = World::new(9_999);
+    use crate::render_config::RenderConfig;
+    use crate::world::generation::WorldgenKind;
+    let a = World::with_kind(1, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let b = World::with_kind(9_999, RenderConfig::default(), WorldgenKind::Diffusion, false);
     let ha: Vec<i32> = (0..16).map(|x| a.surface_y(x, 0)).collect();
     let hb: Vec<i32> = (0..16).map(|x| b.surface_y(x, 0)).collect();
     assert_ne!(ha, hb, "different seeds should sculpt different terrain");
@@ -964,7 +965,8 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
     let pos = world.desired_sections(center)[0];
     let tables = world.tables.get();
     let meshes = section::extract_section_mesh(pos, &*world.generator, &[], &tables);
-    let expected: usize = Pass::ALL.iter().map(|&p| meshes.data[p].vertex_bytes()).sum();
+    let expected: usize =
+        meshes.slabs.iter().flat_map(|s| Pass::ALL.iter().map(move |&p| s.data[p].vertex_bytes())).sum();
     assert!(expected > 0, "a default-seed section yields geometry");
     assert_eq!(streaming::section_output_bytes(&meshes), expected);
 
@@ -1411,7 +1413,7 @@ fn lod2_far_field_drives_to_covering_complete() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { meshes: None, last_style: None };
+                *s = SectionState::Ready { meshes: Vec::new(), last_style: None };
             }
         }
     }

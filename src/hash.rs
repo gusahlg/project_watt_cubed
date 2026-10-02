@@ -30,11 +30,3 @@ pub fn splitmix_next(state: &mut u64) -> u64 {
     splitmix_finish(*state)
 }
 
-/// Three-multiplier lattice mix used by terrain hashes.
-#[inline]
-pub fn mix3(seed: u64, x: i32, y: i32, z: i32) -> u64 {
-    seed
-        ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9)
-}

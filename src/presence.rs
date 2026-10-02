@@ -19,21 +19,17 @@ pub const STRIDE_FREQ: f64 = 2.0;
 
 /// Movement stance, networked per snapshot. Distinct from
 /// [`player::Stance`] (which owns collision/eye heights): this is the closed
-/// *broadcast* set, including swimming, which the local player models as
-/// [`Motion::Swimming`](crate::player::Motion) rather than a stance.
+/// *broadcast* set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Stance {
     #[default]
     Standing,
     Sneaking,
-    Swimming,
 }
 
 impl Stance {
     pub fn of_player(p: &Player) -> Self {
-        if p.swimming() {
-            Stance::Swimming
-        } else if p.stance == player::Stance::Sneaking {
+        if p.stance == player::Stance::Sneaking {
             Stance::Sneaking
         } else {
             Stance::Standing
@@ -42,40 +38,34 @@ impl Stance {
 
     pub fn height_scale(self) -> f32 {
         match self {
-            Stance::Standing | Stance::Swimming => 1.0,
+            Stance::Standing => 1.0,
             Stance::Sneaking => 0.82,
         }
     }
 
-    pub fn prone(self) -> bool {
-        matches!(self, Stance::Swimming)
-    }
-
     /// Eye height above the feet for a broadcast stance. Reuses [`player::Stance`]'s
-    /// offset so the eye/feet gap can't drift from the local player's; swimming
-    /// keeps the standing eye height (the local swimmer's box is still upright).
+    /// offset so the eye/feet gap can't drift from the local player's.
     pub fn eye_offset(self) -> f64 {
         match self {
             Stance::Sneaking => player::Stance::Sneaking,
-            Stance::Standing | Stance::Swimming => player::Stance::Standing,
+            Stance::Standing => player::Stance::Standing,
         }
         .eye_offset()
     }
 
     /// Wire codec: one byte, closed set. `from_wire` rejects unknown values so
-    /// a hostile byte can't smuggle an out-of-enum stance.
+    /// a hostile byte can't smuggle an out-of-enum stance. Byte 2 was the
+    /// retired swimming stance and is now rejected like any other unknown value.
     pub fn wire(self) -> u8 {
         match self {
             Stance::Standing => 0,
             Stance::Sneaking => 1,
-            Stance::Swimming => 2,
         }
     }
     pub fn from_wire(v: u8) -> Option<Self> {
         Some(match v {
             0 => Stance::Standing,
             1 => Stance::Sneaking,
-            2 => Stance::Swimming,
             _ => return None,
         })
     }
@@ -273,7 +263,7 @@ mod tests {
     #[test]
     fn eye_to_feet_uses_the_broadcast_stance_height() {
         let eye = Eye(DVec3::new(17.25, 93.0, -8.5));
-        for stance in [Stance::Standing, Stance::Sneaking, Stance::Swimming] {
+        for stance in [Stance::Standing, Stance::Sneaking] {
             let feet = eye.feet(stance);
             assert_eq!(feet.0.x.to_bits(), eye.0.x.to_bits());
             assert_eq!(feet.0.z.to_bits(), eye.0.z.to_bits());
@@ -305,9 +295,10 @@ mod tests {
 
     #[test]
     fn wire_stance_is_a_closed_round_trip() {
-        for stance in [Stance::Standing, Stance::Sneaking, Stance::Swimming] {
+        for stance in [Stance::Standing, Stance::Sneaking] {
             assert_eq!(Stance::from_wire(stance.wire()), Some(stance));
         }
+        assert_eq!(Stance::from_wire(2), None, "retired swimming byte");
         assert_eq!(Stance::from_wire(3), None);
         assert_eq!(Stance::from_wire(u8::MAX), None);
     }

@@ -139,7 +139,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 10;
+pub(crate) const PROTOCOL_VERSION: u32 = 11;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -160,31 +160,27 @@ pub(crate) const MAX_VOICE_PAYLOAD: usize = 400;
 
 #[cfg(test)]
 pub(crate) fn content_fingerprint() -> u64 {
-    content_fingerprint_kind(crate::world::generation::WorldgenKind::Classic)
+    content_fingerprint_kind(crate::world::generation::WorldgenKind::Diffusion)
 }
 
 #[cfg(test)]
 pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
-    content_fingerprint_kind_cfg(kind, crate::world::diffusion::DiffusionCfg::default())
+    content_fingerprint_kind_cfg(kind, crate::world::terrain::TerrainCfg::default())
 }
 
-/// A stable 64-bit digest of everything that determines what a seed GENERATES:
-/// the worldgen version, the law fingerprint, and every builtin region centre.
-/// Seed-only multiplayer never ships voxels, so two builds whose generation
-/// differs in ANY of these would silently build different worlds from one seed
-/// — the handshake compares fingerprints and rejects the join instead. Protocol
-/// changes are versioned separately by [`PROTOCOL_VERSION`].
+/// A stable 64-bit digest of everything that determines what a seed GENERATES: the generator
+/// version, the law, every palette configuration, the worldgen kind and its knobs. Seed-only
+/// multiplayer never ships voxels, so two builds whose generation differs in ANY of these would
+/// silently build different worlds from one seed — the handshake compares fingerprints and rejects
+/// the join instead. Protocol changes are versioned separately by [`PROTOCOL_VERSION`].
 pub(crate) fn content_fingerprint_kind_cfg(
     kind: crate::world::generation::WorldgenKind,
-    cfg: crate::world::diffusion::DiffusionCfg,
+    cfg: crate::world::terrain::TerrainCfg,
 ) -> u64 {
-    let registry = crate::block::BlockRegistry::with_builtins();
-    // v0 is hostable: a non-v0 stamp is refused with Reject, never a panic.
-    let _ = protocol::handshake_law(&protocol::law_stamp());
-    fingerprint_kind_cfg(&registry, kind, cfg)
+    fingerprint_kind_cfg(&crate::block::BlockRegistry::with_builtins(), kind, cfg)
 }
 
-/// The fingerprint of a registry's law and the builtin region centres.
+/// The fingerprint of a registry's law and the generator's palette.
 pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -195,37 +191,33 @@ pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
             hash = hash.wrapping_mul(FNV_PRIME);
         }
     };
-    eat(&crate::world::placement::WORLDGEN_VERSION.to_le_bytes());
+    eat(&crate::world::terrain::WORLDGEN_VERSION.to_le_bytes());
     eat(&registry.law().fingerprint().to_le_bytes());
-    for region in registry.regions() {
-        eat(&region.centre.0);
+    for entry in crate::world::terrain::palette::of(registry.law()) {
+        eat(entry.config.encode().as_bytes());
     }
     hash
 }
 
-/// Same as [`fingerprint_of`], plus worldgen kind and diffusion knobs so two
-/// worlds that would generate different terrain cannot silently desync.
+/// Same as [`fingerprint_of`], plus the worldgen kind and its knobs, so two worlds that would
+/// generate different terrain cannot silently desync.
 pub(crate) fn fingerprint_kind_cfg(
     registry: &crate::block::BlockRegistry,
     kind: crate::world::generation::WorldgenKind,
-    cfg: crate::world::diffusion::DiffusionCfg,
+    cfg: crate::world::terrain::TerrainCfg,
 ) -> u64 {
     let mut hash = fingerprint_of(registry);
-    if kind != crate::world::generation::WorldgenKind::Classic {
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut eat = |bytes: &[u8]| {
-            for &b in bytes {
-                hash ^= b as u64;
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-        };
-        eat(kind.id().as_bytes());
-        eat(&cfg.tile.to_le_bytes());
-        eat(&cfg.stride.to_le_bytes());
-        eat(&cfg.phases.to_le_bytes());
-        eat(&cfg.relief.to_bits().to_le_bytes());
-        if cfg.version != 1 {
-            eat(&[cfg.version]);
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    };
+    eat(kind.id().as_bytes());
+    if kind == crate::world::generation::WorldgenKind::Diffusion {
+        for v in cfg.clamp().to_wire() {
+            eat(&v.to_le_bytes());
         }
     }
     hash
@@ -234,52 +226,48 @@ pub(crate) fn fingerprint_kind_cfg(
 #[cfg(test)]
 mod fingerprint_tests {
     use super::*;
-    use crate::world::diffusion::DiffusionCfg;
     use crate::world::generation::WorldgenKind;
+    use crate::world::terrain::TerrainCfg;
 
     #[test]
-    fn classic_fingerprint_ignores_diffusion_knobs() {
-        let a = content_fingerprint();
-        let b = content_fingerprint_kind(WorldgenKind::Classic);
-        let cfg = DiffusionCfg { tile: 64, ..Default::default() };
-        let c = content_fingerprint_kind_cfg(WorldgenKind::Classic, cfg);
-        assert_eq!(a, b);
-        assert_eq!(a, c);
+    fn flat_fingerprint_ignores_knobs_and_differs_from_diffusion() {
+        let flat = content_fingerprint_kind(WorldgenKind::Flat);
+        let cfg = TerrainCfg { relief: 150, ..Default::default() };
+        assert_eq!(flat, content_fingerprint_kind_cfg(WorldgenKind::Flat, cfg));
+        assert_ne!(flat, content_fingerprint());
     }
 
     #[test]
-    fn diffusion_fingerprint_differs_and_mixes_knobs() {
-        let classic = content_fingerprint();
+    fn diffusion_fingerprint_mixes_knobs() {
         let diff = content_fingerprint_kind(WorldgenKind::Diffusion);
-        assert_ne!(classic, diff);
-        let cfg = DiffusionCfg { phases: 8, ..Default::default() };
-        assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
+        for cfg in [
+            TerrainCfg { relief: 150, ..Default::default() },
+            TerrainCfg { caves: 50, ..Default::default() },
+            TerrainCfg { mines: 0, ..Default::default() },
+            TerrainCfg { space: 200, ..Default::default() },
+        ] {
+            assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
+        }
     }
 
     #[test]
     fn fingerprint_survives_a_reaction_the_client_never_saw() {
         use crate::block::BlockRegistry;
-        use crate::world::placement;
         use material::{Configuration, Element};
 
         let mut server = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut server).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut server);
         let before = fingerprint_of(&server);
-        let novel = Configuration::new(vec![
-            Element::new([3, 9, 27, 81]),
-            Element::new([4, 16, 64, 1]),
-        ])
-        .unwrap();
+        let novel = Configuration::new(vec![Element::new([3, 9, 27, 81]), Element::new([4, 16, 64, 1])]).unwrap();
         let sid = server.intern(&novel).unwrap();
         let spec = server.spec(sid);
         assert_eq!(fingerprint_of(&server), before, "interning does not change the handshake");
 
         let mut client = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut client).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut client);
         assert!(client.lookup(&novel).is_none(), "client has not seen the product");
         let cid = client.parse_spec(&spec).unwrap();
         assert_eq!(client.configuration(cid), server.configuration(sid));
-        assert_eq!(fingerprint_of(&client), fingerprint_of(&server));
         assert_eq!(fingerprint_of(&client), before);
     }
 }

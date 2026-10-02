@@ -161,25 +161,24 @@ impl ElementStash {
 mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
-    use crate::world::placement;
     use crate::world::World;
 
     fn rock() -> BlockId {
         let mut reg = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut reg).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut reg);
         reg.id_by_label("rock").unwrap()
     }
 
     fn soil() -> BlockId {
         let mut reg = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut reg).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut reg);
         reg.id_by_label("soil").unwrap()
     }
 
     fn clay() -> BlockId {
         let mut reg = BlockRegistry::with_builtins();
-        placement::builtin().compile(&mut reg).expect("v0 hosts the placement table");
-        reg.id_by_label("clay").unwrap()
+        crate::world::terrain::Materials::intern(&mut reg);
+        reg.id_by_label("gravel").unwrap()
     }
 
     #[test]

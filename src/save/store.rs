@@ -238,9 +238,9 @@ mod tests {
 
     fn doc(name: &str, edits: u32) -> SaveDoc {
         SaveDoc {
-            worldgen_version: 2,
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
-            law_stamp: material::Law::v0().stamp(),
+            law_stamp: material::Law::current().stamp(),
             meta: SaveMeta {
                 name: name.to_string(),
                 seed: 7,
@@ -260,6 +260,7 @@ mod tests {
             specs: vec!["air".to_string()],
             edits: (0..edits as i32).map(|i| Edit { x: i, y: 200, z: -i, spec: 0 }).collect(),
             mods: vec![],
+            pending: vec![],
         }
     }
 
@@ -443,38 +444,6 @@ mod tests {
             ),
             "a v8 prefix shorter than header_len(8) is not a save"
         );
-        cleanup(&id);
-    }
-
-    /// A v7 document can be 164–205 bytes (header 126 + a tiny body). Peek
-    /// must not demand the v8 header length; `peek_meta` enforces `header_len(7)`.
-    fn v7_bytes(doc: &SaveDoc) -> Vec<u8> {
-        let current = format::encode(doc).unwrap();
-        let mut v7 = Vec::with_capacity(current.len() - material::STAMP_LEN);
-        v7.extend_from_slice(&current[..format::HEADER_LEN_V7]);
-        v7.extend_from_slice(&current[format::HEADER_LEN..]);
-        v7[4..6].copy_from_slice(&7u16.to_le_bytes());
-        v7
-    }
-
-    #[test]
-    fn peek_lists_a_minimal_v7_save() {
-        let id = SlotId::new("__store_peek_v7__").unwrap();
-        cleanup(&id);
-        let bytes = v7_bytes(&doc("v7tiny", 0));
-        assert!(
-            bytes.len() < format::HEADER_LEN,
-            "fixture must be shorter than the v8 header ({})",
-            bytes.len()
-        );
-        assert!(bytes.len() >= format::HEADER_LEN_V7);
-        fs::write(live_path(&id), &bytes).unwrap();
-
-        assert_eq!(peek_file(&live_path(&id)).unwrap().name, "v7tiny");
-        let slots = list();
-        let listed = slots.iter().find(|s| s.id == id).expect("v7 slot listed");
-        assert_eq!(listed.meta.as_ref().unwrap().name, "v7tiny");
-
         cleanup(&id);
     }
 

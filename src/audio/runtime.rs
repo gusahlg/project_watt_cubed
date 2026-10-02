@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use voxel_engine::DVec3;
 
 use super::acoustics::{AcousticWindow, Coords, Dsp, SmoothedCoords, audibility, respond, trace};
-use super::acoustics::{Listener, Medium, Response};
+use super::acoustics::{Listener, Response};
 use super::assets::SoundConfig;
 use super::backend::kira::KiraBackend;
 use super::backend::null::NullBackend;
@@ -104,7 +104,6 @@ impl std::error::Error for SoundInitError {
 pub(crate) struct Smoothed {
     distance: f32,
     occlusion: f32,
-    medium: Medium,
     init: bool,
 }
 
@@ -113,7 +112,6 @@ impl Smoothed {
         Self {
             distance: 0.0,
             occlusion: 0.0,
-            medium: Medium::Air,
             init: false,
         }
     }
@@ -129,13 +127,12 @@ impl Smoothed {
             self.distance += (raw.distance - self.distance) * k;
             self.occlusion += (raw.occlusion - self.occlusion) * k;
         }
-        self.medium = raw.medium;
-        SmoothedCoords::new(self.distance, self.occlusion, raw.medium)
+        SmoothedCoords::new(self.distance, self.occlusion)
     }
     /// The already-integrated value without advancing — the apply passes read this
     /// after ranking observed once this frame.
     fn current(&self) -> SmoothedCoords {
-        SmoothedCoords::new(self.distance, self.occlusion, self.medium)
+        SmoothedCoords::new(self.distance, self.occlusion)
     }
 }
 
@@ -144,7 +141,6 @@ impl Smoothed {
 struct GroupState {
     cue: CueId<OneShot>,
     at: Option<DVec3>,
-    medium: Medium,
     gain: f32,
     smooth: Smoothed,
     layers: Box<[LayerState]>,
@@ -298,7 +294,6 @@ impl SoundSystem {
                 pos: DVec3::ZERO,
                 yaw: 0.0,
                 pitch: 0.0,
-                medium: Medium::Air,
             },
             ui_counter: 0,
             ui_voices: Vec::new(),
@@ -444,7 +439,6 @@ impl SoundSystem {
                 GroupState {
                     cue: occ.cue,
                     at: occ.at,
-                    medium: occ.medium,
                     gain: occ.gain,
                     smooth: Smoothed::new(),
                     layers,
@@ -517,7 +511,7 @@ impl SoundSystem {
         let mut cands: Vec<(f32, GroupKey, usize)> = Vec::new();
 
         for (id, group) in self.clip_voices.iter_mut() {
-            let raw = raw_coords(window, listener, group.at, group.medium);
+            let raw = raw_coords(window, listener, group.at);
             let sc = group.smooth.observe(&raw, k);
             let cue = self.catalog.cue(group.cue);
             // Rank with the group's loudest possible layer gain so the bound covers
@@ -538,7 +532,7 @@ impl SoundSystem {
         }
         for (id, ev) in self.emitter_voices.iter_mut() {
             let e = table[id];
-            let raw = raw_coords(window, listener, Some(e.at), e.medium);
+            let raw = raw_coords(window, listener, Some(e.at));
             let sc = ev.smooth.observe(&raw, k);
             let cue = self.catalog.cue(ev.cue);
             let max_lgain = ev
@@ -555,12 +549,11 @@ impl SoundSystem {
             if let Session::Streaming {
                 present: true,
                 last_at,
-                last_medium,
                 smooth,
                 ..
             } = session
             {
-                let raw = raw_coords(window, listener, *last_at, *last_medium);
+                let raw = raw_coords(window, listener, *last_at);
                 let sc = smooth.observe(&raw, k);
                 let aud = audibility(Response::Voice, sc, 1.0);
                 cands.push((aud, GroupKey::Voice(*id), 1));
@@ -800,7 +793,6 @@ impl SoundSystem {
                         voice,
                         present: false,
                         last_at: None,
-                        last_medium: self.last_listener.medium,
                         smooth: Smoothed::new(),
                     },
                 );
@@ -817,24 +809,16 @@ impl SoundSystem {
     }
 
     /// Presentation control, decoupled from the decoder lifetime. Never stops.
-    pub fn set_session_present(
-        &mut self,
-        session: SessionKey,
-        present: bool,
-        at: Option<DVec3>,
-        medium: Medium,
-    ) {
+    pub fn set_session_present(&mut self, session: SessionKey, present: bool, at: Option<DVec3>) {
         if let Some(Session::Streaming {
             present: p,
             last_at,
-            last_medium,
             ..
         }) = self.sessions.get_mut(&session)
         {
             *p = present;
             if at.is_some() {
                 *last_at = at;
-                *last_medium = medium;
             }
         }
     }
@@ -901,7 +885,7 @@ impl SoundSystem {
         // Ui is non-spatial: coincident smoothed coords (nothing to integrate).
         let ui_dsp = respond(
             Response::Ui,
-            SmoothedCoords::coincident(Medium::Air),
+            SmoothedCoords::coincident(),
             &self.last_listener,
             None,
         );
@@ -950,18 +934,12 @@ fn smoothing_factor(dt: f32, halflife_s: f32) -> f32 {
 }
 
 /// Raw (unsmoothed) coords for a source. A non-spatial source is coincident.
-fn raw_coords(
-    window: &AcousticWindow,
-    listener: &Listener,
-    at: Option<DVec3>,
-    medium: Medium,
-) -> Coords {
+fn raw_coords(window: &AcousticWindow, listener: &Listener, at: Option<DVec3>) -> Coords {
     match at {
-        Some(pos) => trace(window, listener.pos, pos, medium),
+        Some(pos) => trace(window, listener.pos, pos),
         None => Coords {
             distance: 0.0,
             occlusion: 0.0,
-            medium: listener.medium,
         },
     }
 }
@@ -1033,7 +1011,7 @@ mod seam_tests {
     use voxel_engine::{DVec3, IVec3};
 
     use super::super::acoustics::{
-        AcousticWindow, Cell, Dsp, Listener, Medium, Response, SmoothedCoords, respond,
+        AcousticWindow, Cell, Dsp, Listener, Response, SmoothedCoords, respond,
     };
     use super::super::backend::ClipId;
     use super::super::backend::recording::{Intent, Recorder, RecordingBackend};
@@ -1136,7 +1114,6 @@ mod seam_tests {
             pos: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
-            medium: Medium::Air,
         }
     }
 
@@ -1196,7 +1173,6 @@ mod seam_tests {
             id: EmitterId(0),
             cue: bed,
             at: source(x),
-            medium: Medium::Air,
             gain: 1.0,
         };
 
@@ -1227,7 +1203,7 @@ mod seam_tests {
         // What a NO-smoothing path would emit at the new 50 m distance.
         let unsmoothed = respond(
             Response::Ambient,
-            SmoothedCoords::new(50.0, 0.0, Medium::Air),
+            SmoothedCoords::new(50.0, 0.0),
             &origin_listener(),
             Some(source(50.0)),
         )
@@ -1258,14 +1234,12 @@ mod seam_tests {
                 id: OccurrenceId(1),
                 cue: quiet,
                 at,
-                medium: Medium::Air,
                 gain: 1.0,
             },
             Occurrence {
                 id: OccurrenceId(2),
                 cue: loud,
                 at,
-                medium: Medium::Air,
                 gain: 1.0,
             },
         ];
@@ -1276,38 +1250,6 @@ mod seam_tests {
         assert_eq!(
             clips[0], loud_clip,
             "the louder group (higher layer gain) must win, not the lower id"
-        );
-    }
-
-    #[test]
-    fn occurrence_source_medium_reaches_cross_liquid_response() {
-        let (mut sound, syms, rec) = system(32);
-        let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
-        let mut listener = origin_listener();
-        listener.medium = Medium::Liquid;
-        let at = source(4.0);
-        let occurrence = Occurrence {
-            id: OccurrenceId(0),
-            cue,
-            at: Some(at),
-            medium: Medium::Air,
-            gain: 1.0,
-        };
-        sound.submit(
-            AudioFrame::new(0.1, listener, vec![occurrence], vec![], open_window()).unwrap(),
-        );
-
-        let actual = played_dsps(&rec)[0].gain;
-        let expected = respond(
-            Response::World,
-            SmoothedCoords::new(4.0 * crate::math::BLOCK_METERS as f32, 0.0, Medium::Air),
-            &listener,
-            Some(at),
-        )
-        .gain;
-        assert!(
-            (actual - expected).abs() < 1e-5,
-            "actual={actual} expected={expected}"
         );
     }
 
@@ -1322,7 +1264,6 @@ mod seam_tests {
             id: OccurrenceId(0),
             cue,
             at: Some(source(4.0)),
-            medium: Medium::Air,
             gain: 1.0,
         };
 
@@ -1371,7 +1312,6 @@ mod seam_tests {
             id: EmitterId(0),
             cue: bed,
             at: source(5.0),
-            medium: Medium::Air,
             gain: 1.0,
         };
 
@@ -1398,7 +1338,6 @@ mod seam_tests {
             id: EmitterId(4),
             cue,
             at: source(4.0),
-            medium: Medium::Air,
             gain: 1.0,
         };
 
@@ -1415,7 +1354,7 @@ mod seam_tests {
 
         let spatial = respond(
             Response::World,
-            SmoothedCoords::new(4.0 * crate::math::BLOCK_METERS as f32, 0.0, Medium::Air),
+            SmoothedCoords::new(4.0 * crate::math::BLOCK_METERS as f32, 0.0),
             &origin_listener(),
             Some(source(4.0)),
         )
@@ -1433,7 +1372,6 @@ mod seam_tests {
             id: EmitterId(9),
             cue,
             at: source(3.0),
-            medium: Medium::Air,
             gain: 1.0,
         };
 
@@ -1483,7 +1421,6 @@ mod seam_tests {
             id: OccurrenceId(id),
             cue,
             at: Some(source(4.0)),
-            medium: Medium::Air,
             gain: 1.0,
         };
 
@@ -1572,7 +1509,6 @@ mod seam_tests {
                     id: OccurrenceId(1),
                     cue,
                     at: Some(source(4.0)),
-                    medium: Medium::Air,
                     gain: 1.0,
                 }],
                 vec![],

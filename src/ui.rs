@@ -318,8 +318,8 @@ impl Panel {
 }
 
 /// One thing a mod contributes to the HUD. Closed on purpose (see the module
-/// note): a screen-anchored label or a boxed panel — nothing that lets a mod
-/// draw arbitrarily.
+/// note): a screen-anchored label, a boxed panel or a filled rectangle — nothing
+/// that lets a mod draw arbitrarily.
 #[derive(Clone)]
 pub enum HudElement {
     /// A screen-anchored line of text, scaled by the theme.
@@ -332,6 +332,8 @@ pub enum HudElement {
     },
     /// A translucent content box at an absolute position.
     Panel(Panel),
+    /// A filled rectangle anchored on the screen (slot frames, swatches, bars).
+    Rect { at: Anchor, off: Px, size: Px, color: Color },
 }
 
 /// Flatten HUD labels and panel rows to text. Test helper: one place for the
@@ -351,6 +353,7 @@ pub(crate) fn hud_text(elements: &[HudElement]) -> String {
                     out.push('\n');
                 }
             }
+            HudElement::Rect { .. } => {}
         }
     }
     out
@@ -364,6 +367,10 @@ pub fn render_hud(f: &mut Frame, theme: &Theme, screen: Px, elements: &[HudEleme
                 label(f, theme, screen, *at, *off, *base_fs, role.color(), text)
             }
             HudElement::Panel(p) => p.draw(f),
+            HudElement::Rect { at, off, size, color } => {
+                let (x, y) = at.origin(screen, *size, *off);
+                f.draw_rect(x, y, size.0, size.1, *color);
+            }
         }
     }
 }

@@ -125,7 +125,7 @@ fn mesh_output_held(data: &pipeline::MeshPayload) -> usize {
 
 fn section_payload_held(data: &pipeline::SectionPayload) -> usize {
     match data {
-        pipeline::SectionPayload::Cpu(mesh) => mesh_held(&mesh.data),
+        pipeline::SectionPayload::Cpu(mesh) => mesh.slabs.iter().map(|s| mesh_held(&s.data)).sum(),
         pipeline::SectionPayload::Staged(_) => 0,
     }
 }

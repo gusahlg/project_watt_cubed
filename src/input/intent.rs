@@ -281,12 +281,26 @@ pub enum GameplayEvent {
     OpenConsole,
     OpenChat,
     ToggleInventory,
-    ToggleCrafting,
     ToggleCapture,
+    /// Hotbar: the bare hand (key 0).
+    Hand,
+    /// Hotbar slots 1-9.
+    Slot1,
+    Slot2,
+    Slot3,
+    Slot4,
+    Slot5,
+    Slot6,
+    Slot7,
+    Slot8,
+    Slot9,
+    /// Hotbar: next / previous slot (mouse wheel).
+    HotbarNext,
+    HotbarPrev,
 }
 
 impl GameplayEvent {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 19;
     pub const ALL: [GameplayEvent; Self::COUNT] = [
         GameplayEvent::ToggleFly,
         GameplayEvent::Break,
@@ -294,8 +308,32 @@ impl GameplayEvent {
         GameplayEvent::OpenConsole,
         GameplayEvent::OpenChat,
         GameplayEvent::ToggleInventory,
-        GameplayEvent::ToggleCrafting,
         GameplayEvent::ToggleCapture,
+        GameplayEvent::Hand,
+        GameplayEvent::Slot1,
+        GameplayEvent::Slot2,
+        GameplayEvent::Slot3,
+        GameplayEvent::Slot4,
+        GameplayEvent::Slot5,
+        GameplayEvent::Slot6,
+        GameplayEvent::Slot7,
+        GameplayEvent::Slot8,
+        GameplayEvent::Slot9,
+        GameplayEvent::HotbarNext,
+        GameplayEvent::HotbarPrev,
+    ];
+
+    /// The nine slot events in order (index 0 = slot 1).
+    pub const SLOTS: [GameplayEvent; 9] = [
+        GameplayEvent::Slot1,
+        GameplayEvent::Slot2,
+        GameplayEvent::Slot3,
+        GameplayEvent::Slot4,
+        GameplayEvent::Slot5,
+        GameplayEvent::Slot6,
+        GameplayEvent::Slot7,
+        GameplayEvent::Slot8,
+        GameplayEvent::Slot9,
     ];
 
     /// Break and Place autofire; others don't.
@@ -304,6 +342,25 @@ impl GameplayEvent {
             GameplayEvent::Break | GameplayEvent::Place => Some(Repeat::new(0.25, 0.20)),
             _ => None,
         }
+    }
+
+    /// Hotbar selection events (gated with mod logic).
+    pub const fn is_hotbar(self) -> bool {
+        matches!(
+            self,
+            GameplayEvent::Hand
+                | GameplayEvent::Slot1
+                | GameplayEvent::Slot2
+                | GameplayEvent::Slot3
+                | GameplayEvent::Slot4
+                | GameplayEvent::Slot5
+                | GameplayEvent::Slot6
+                | GameplayEvent::Slot7
+                | GameplayEvent::Slot8
+                | GameplayEvent::Slot9
+                | GameplayEvent::HotbarNext
+                | GameplayEvent::HotbarPrev
+        )
     }
 }
 

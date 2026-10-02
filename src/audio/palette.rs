@@ -2,15 +2,15 @@
 //! its `(CueId, gain)` here, once, at load. Gameplay never names a cue string —
 //! it reports facts and the palette decides the cue. All gains are data
 //! (currently 1.0); mode is checked against the `Cue.mode` invariant at build so
-//! a Loop role that resolves to a OneShot cue (or vice versa) degrades to silence
-//! with a warning instead of leaking a voice at runtime.
+//! a role that resolves to a cue of the wrong mode degrades to silence with a
+//! warning instead of leaking a voice at runtime.
 
 use std::collections::BTreeMap;
 
 use crate::block::SoundClass;
 
 use super::acoustics::Response;
-use super::content::{Catalog, CueId, CueMode, CueSymbols, Loop, OneShot};
+use super::content::{Catalog, CueId, CueMode, CueSymbols, OneShot};
 
 /// In-game UI cues routed through the director (`SoundEvent::Ui`). Menu cues
 /// (`menu_click`) stay a direct `SoundSystem::play_ui` on App and are NOT here.
@@ -58,9 +58,7 @@ pub struct CuePalette {
     step: BTreeMap<&'static str, Sfx<OneShot>>,
     break_: BTreeMap<&'static str, Sfx<OneShot>>,
     place: BTreeMap<&'static str, Sfx<OneShot>>,
-    splash: Option<Sfx<OneShot>>,
     swing: Option<Sfx<OneShot>>,
-    underwater_loop: Option<Sfx<Loop>>,
     voicetest: Option<Sfx<OneShot>>, // UI
 }
 
@@ -74,25 +72,9 @@ impl CuePalette {
             step: class_map::<OneShot>("step", Response::World, symbols, catalog, &mut warnings),
             break_: class_map::<OneShot>("break", Response::World, symbols, catalog, &mut warnings),
             place: class_map::<OneShot>("place", Response::World, symbols, catalog, &mut warnings),
-            splash: checked::<OneShot>(
-                "splash",
-                Response::World,
-                symbols,
-                catalog,
-                &mut warnings,
-                true,
-            ),
             swing: checked::<OneShot>(
                 "swing",
                 Response::World,
-                symbols,
-                catalog,
-                &mut warnings,
-                true,
-            ),
-            underwater_loop: checked::<Loop>(
-                "underwater_loop",
-                Response::Ambient,
                 symbols,
                 catalog,
                 &mut warnings,
@@ -119,14 +101,8 @@ impl CuePalette {
     pub fn place(&self, class: &str) -> Option<Sfx<OneShot>> {
         self.place.get(class).copied()
     }
-    pub fn splash(&self) -> Option<Sfx<OneShot>> {
-        self.splash
-    }
     pub fn swing(&self) -> Option<Sfx<OneShot>> {
         self.swing
-    }
-    pub fn underwater_loop(&self) -> Option<Sfx<Loop>> {
-        self.underwater_loop
     }
     pub fn ui(&self, sound: UiSound) -> Option<Sfx<OneShot>> {
         match sound {

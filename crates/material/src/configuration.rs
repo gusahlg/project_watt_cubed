@@ -1,19 +1,19 @@
-//! A block's material content: an ordered list of elements with multiplicity. The representation keeps
-//! every bit of information (order and repeats) because the model has not yet proved either irrelevant.
+//! A block's material content: an unordered multiset of element occurrences. Storage is sorted, so
+//! equal multisets have equal bytes; multiplicity is kept (`[x, x, y]` is not `[x, y]`).
 
 use crate::element::{Element, D};
 
-/// Maximum number of elements one configuration may hold.
-pub const CONFIG_MAX: usize = 16;
+/// At most this many occurrences fit in one voxel (law constant).
+pub const CAPACITY: usize = 32;
 
-/// A configuration of elements. `[A, B] != [B, A]` and `[A, A] != [A]` by design (see the spec §3.2).
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// A configuration of elements: the canonical (sorted) multiset. Empty is the void (air).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Configuration(Box<[Element]>);
 
 /// Why a configuration could not be built.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfigError {
-    /// More than [`CONFIG_MAX`] elements.
+    /// More than [`CAPACITY`] occurrences.
     TooLarge(usize),
 }
 
@@ -22,7 +22,7 @@ pub enum ConfigError {
 pub enum DecodeError {
     /// Empty input.
     Empty,
-    /// The length byte exceeds [`CONFIG_MAX`].
+    /// The length byte exceeds [`CAPACITY`].
     TooLarge(usize),
     /// Fewer bytes than the length byte promises.
     Truncated,
@@ -30,8 +30,8 @@ pub enum DecodeError {
     Trailing,
 }
 
-/// The canonical bytes of a configuration: `len` then `len × D` coordinates. The intern key, the save
-/// and wire form. Equal configurations have equal encodings and vice versa.
+/// The canonical bytes of a configuration: `len` then `len × D` coordinates in sorted order. The intern
+/// key, the save and the wire form.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Encoding(Box<[u8]>);
 
@@ -43,38 +43,52 @@ impl Encoding {
 }
 
 impl Configuration {
-    /// The empty configuration: void / air. Observes as passable and transparent.
+    /// The empty configuration: void / air.
     pub fn void() -> Self {
         Self(Box::new([]))
     }
 
-    /// A configuration of exactly one element.
+    /// A configuration of exactly one occurrence.
     pub fn single(e: Element) -> Self {
         Self(Box::new([e]))
     }
 
-    /// Build from elements, in the given order, keeping repeats.
+    /// Build from occurrences in any order (storage order is not meaning).
     pub fn new(elements: impl Into<Box<[Element]>>) -> Result<Self, ConfigError> {
-        let elements = elements.into();
-        if elements.len() > CONFIG_MAX {
+        let mut elements = elements.into();
+        if elements.len() > CAPACITY {
             return Err(ConfigError::TooLarge(elements.len()));
         }
+        elements.sort_unstable();
         Ok(Self(elements))
     }
 
-    /// The elements, in order.
+    /// The occurrences, sorted.
     pub fn elements(&self) -> &[Element] {
         &self.0
     }
 
-    /// Number of elements.
+    /// Number of occurrences.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// True for the void configuration.
-    pub fn is_void(&self) -> bool {
+    /// True for the void configuration (no occurrences).
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Distinct elements with their multiplicities, in element order.
+    pub fn counts(&self) -> impl Iterator<Item = (Element, usize)> + '_ {
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            let e = *self.0.get(i)?;
+            let start = i;
+            while i < self.0.len() && self.0[i] == e {
+                i += 1;
+            }
+            Some((e, i - start))
+        })
     }
 
     /// Canonical bytes.
@@ -87,11 +101,12 @@ impl Configuration {
         Encoding(v.into_boxed_slice())
     }
 
-    /// Inverse of [`Configuration::encode`]; rejects malformed input instead of guessing.
+    /// Inverse of [`Configuration::encode`]. Occurrence order in the input does not matter (it is
+    /// re-sorted); malformed input is rejected instead of guessed.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let (&len, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
         let len = len as usize;
-        if len > CONFIG_MAX {
+        if len > CAPACITY {
             return Err(DecodeError::TooLarge(len));
         }
         if rest.len() < len * D {
@@ -106,36 +121,23 @@ impl Configuration {
             c.copy_from_slice(chunk);
             elements.push(Element(c));
         }
+        elements.sort_unstable();
         Ok(Self(elements.into_boxed_slice()))
     }
 
-    /// Mean coordinate in 1/256 units (`None` for the void). Smooth in every element.
-    pub fn mean_q8(&self) -> Option<[u32; D]> {
-        if self.0.is_empty() {
-            return None;
-        }
-        let n = self.0.len() as u32;
-        let mut sum = [0u32; D];
+    /// A 64-bit hash of the canonical bytes (FNV-1a): a stable seed for presentation and naming.
+    pub fn digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        eat(self.0.len() as u8);
         for e in self.0.iter() {
-            for i in 0..D {
-                sum[i] += e.0[i] as u32;
+            for b in e.0 {
+                eat(b);
             }
         }
-        Some(sum.map(|s| s * 256 / n))
-    }
-
-    /// Mean L1 distance of the elements to their mean, in 1/256 lattice units (0 for ≤ 1 element).
-    pub fn spread_q8(&self) -> u32 {
-        let Some(mean) = self.mean_q8() else { return 0 };
-        if self.0.len() < 2 {
-            return 0;
-        }
-        let mut acc = 0u32;
-        for e in self.0.iter() {
-            for i in 0..D {
-                acc += (e.0[i] as i32 * 256 - mean[i] as i32).unsigned_abs();
-            }
-        }
-        acc / self.0.len() as u32
+        h
     }
 }

@@ -10,10 +10,12 @@ path = [
   ".github/**",
   "Cargo.lock",
   "Cargo.toml",
+  "crates/**",
   "deny.toml",
   "flake.lock",
   "flake.nix",
   "play.sh",
+  "reaction-guide/*.zip",
   "scripts/**",
   "src/**",
 ]
@@ -32,6 +34,7 @@ path = [
   "assets/sounds/catalog.toml",
   "documentation/**",
   "issues/**",
+  "reaction-guide/*.md",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors <https://github.com/gusahlg/project_watt_cubed/blob/main/CONTRIBUTORS.md>"

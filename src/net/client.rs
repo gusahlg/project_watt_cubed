@@ -165,14 +165,9 @@ pub enum Incoming {
     /// update already applied in `apply()`.
     PeerSwing { id: u32 },
     Time { day: f32, day_secs: f32 },
-    /// Authoritative workbench result; the client intern/consume/adds this spec.
-    CraftResult {
-        origin_spec: Arc<str>,
-        target_spec: Arc<str>,
-        event: u8,
-        repeat: u8,
-        result_spec: Arc<str>,
-    },
+    /// The server's verdict on our tool use `req` at `cell`: the cell's and the tool's
+    /// configurations afterwards (the cell is already applied when `reacted`).
+    ToolResult { req: u32, reacted: bool, cell: (i32, i32, i32), cell_spec: Arc<str>, tool_spec: Arc<str> },
     Disconnected,
 }
 
@@ -195,7 +190,7 @@ pub struct Connection {
     seed: i64,
     spawn: DVec3,
     worldgen: crate::world::generation::WorldgenKind,
-    diffusion: crate::world::diffusion::DiffusionCfg,
+    terrain: crate::world::terrain::TerrainCfg,
     peers: HashMap<u32, RemotePlayer>,
     alive: bool,
     // Throttling state for outbound moves.
@@ -228,8 +223,8 @@ impl Connection {
             port,
             name,
             password,
-            crate::world::generation::WorldgenKind::Classic,
-            crate::world::diffusion::DiffusionCfg::default(),
+            crate::world::generation::WorldgenKind::Diffusion,
+            crate::world::terrain::TerrainCfg::default(),
         )
     }
 
@@ -239,7 +234,7 @@ impl Connection {
         name: &str,
         password: &str,
         worldgen: crate::world::generation::WorldgenKind,
-        diffusion: crate::world::diffusion::DiffusionCfg,
+        terrain: crate::world::terrain::TerrainCfg,
     ) -> Result<Self, String> {
         let addr = (host, port)
             .to_socket_addrs()
@@ -269,7 +264,7 @@ impl Connection {
 
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint_kind_cfg(worldgen, diffusion),
+            fingerprint: crate::net::content_fingerprint_kind_cfg(worldgen, terrain),
             name: name.into(),
             password: password.into(),
         };
@@ -284,7 +279,7 @@ impl Connection {
                 .map_err(|_| "no reply: timed out".to_string())?
                 .map_err(|e| format!("no reply: {e}"))
         })?;
-        let (player_id, seed, spawn, worldgen, diffusion) =
+        let (player_id, seed, spawn, worldgen, terrain) =
             welcome_from(ServerMessage::decode(&frame))?;
 
         let (tx, inbox) = mpsc::channel();
@@ -324,7 +319,7 @@ impl Connection {
             seed,
             spawn,
             worldgen,
-            diffusion,
+            terrain,
             peers: HashMap::new(),
             alive: true,
             last_move: Instant::now(),
@@ -346,8 +341,8 @@ impl Connection {
     pub fn worldgen(&self) -> crate::world::generation::WorldgenKind {
         self.worldgen
     }
-    pub fn diffusion(&self) -> crate::world::diffusion::DiffusionCfg {
-        self.diffusion
+    pub fn terrain(&self) -> crate::world::terrain::TerrainCfg {
+        self.terrain
     }
     pub fn spawn(&self) -> DVec3 {
         self.spawn
@@ -417,20 +412,13 @@ impl Connection {
 
 fn welcome_from(
     msg: Option<ServerMessage>,
-) -> Result<(u32, i64, DVec3, crate::world::generation::WorldgenKind, crate::world::diffusion::DiffusionCfg), String> {
+) -> Result<(u32, i64, DVec3, crate::world::generation::WorldgenKind, crate::world::terrain::TerrainCfg), String> {
     match msg {
-        Some(ServerMessage::Welcome {
-            player_id,
-            seed,
-            spawn,
-            worldgen,
-            diffusion,
-            law,
-        }) => {
-            if law != crate::net::protocol::law_stamp() {
-                return Err("server law does not match this client".to_string());
+        Some(ServerMessage::Welcome { player_id, seed, spawn, worldgen, terrain, law }) => {
+            if let Err(ServerMessage::Reject { reason }) = crate::net::protocol::handshake_law(&law) {
+                return Err(reason.to_string());
             }
-            Ok((player_id, seed, spawn, worldgen, diffusion))
+            Ok((player_id, seed, spawn, worldgen, terrain))
         }
         Some(ServerMessage::Reject { reason }) => Err(reason.to_string()),
         _ => Err("unexpected reply from server".to_string()),
@@ -595,19 +583,17 @@ fn apply_server_message(
             // the dedicated ring (see `connect`), not the `inbox` this drains.
             // The arm exists only to keep the match exhaustive.
             ServerMessage::PeerVoice { .. } => {}
-            ServerMessage::CraftResult {
-                origin_spec,
-                target_spec,
-                event,
-                repeat,
-                result_spec,
-            } => out.push(Incoming::CraftResult {
-                origin_spec,
-                target_spec,
-                event,
-                repeat,
-                result_spec,
-            }),
+            ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec } => {
+                let Some(at) = pending_edits.iter().position(|&(r, _, _)| r == req) else {
+                    return;
+                };
+                let (_, cell, _) = pending_edits.remove(at);
+                if reacted {
+                    let known = cell_revs.entry(cell).or_insert(0);
+                    *known = (*known).max(rev);
+                }
+                out.push(Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec });
+            }
         }
 }
 
@@ -691,17 +677,22 @@ impl Connection {
         self.dispatch(&ClientMessage::SetTime { day });
     }
 
-    /// Workbench apply. The server evaluates and replies with [`Incoming::CraftResult`].
-    pub fn send_craft(&mut self, origin_spec: Arc<str>, target_spec: Arc<str>, event: u8, repeat: u8) {
-        if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
-            return;
+    /// Use the held configuration as a tool on a cell; the server runs the law and answers with
+    /// [`Incoming::ToolResult`] for the returned request id. Nothing is predicted: the law's
+    /// outcome is the server's to decide.
+    pub fn send_tool_use(&mut self, x: i32, y: i32, z: i32, tool_spec: Arc<str>) -> Option<u32> {
+        if tool_spec.len() > MAX_SPEC {
+            return None;
         }
-        self.dispatch(&ClientMessage::Craft {
-            origin_spec,
-            target_spec,
-            event,
-            repeat,
-        });
+        let cell = (x, y, z);
+        let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
+        let in_flight = self.pending_edits.iter().filter(|&&(_, c, _)| c == cell).count() as u32;
+        let expect = confirmed + in_flight;
+        self.next_req = self.next_req.wrapping_add(1);
+        let req = self.next_req;
+        self.pending_edits.push((req, cell, expect));
+        self.dispatch(&ClientMessage::ToolUse { req, x, y, z, expect, tool_spec });
+        Some(req)
     }
 
     /// Blocks the game thread on the client runtime — sends are tiny and

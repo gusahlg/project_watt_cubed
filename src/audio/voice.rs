@@ -9,7 +9,6 @@
 
 use voxel_engine::DVec3;
 
-use super::acoustics::Medium;
 use super::backend::BackendVoice;
 
 /// Server-stamped per-player identity for a voice speaker. The server stamps
@@ -89,7 +88,6 @@ pub(crate) enum Session {
         /// Whether the voice is currently presented (false = muted, decoder alive).
         present: bool,
         last_at: Option<DVec3>,
-        last_medium: Medium,
         /// Per-session coordinate smoother: sessions smooth like clips/emitters.
         smooth: super::Smoothed,
     },

@@ -28,15 +28,6 @@ pitch = [-2.0, 2.0]
 delay = [0.0]
 mode = "one_shot"
 
-[cues.splash]
-response = "world"
-[[cues.splash.layers]]
-variants = ["generated/splash_1.wav"]
-gain = [0.72, 0.9]
-pitch = [-1.0, 1.0]
-delay = [0.0]
-mode = "one_shot"
-
 [cues.swing]
 response = "world"
 [[cues.swing.layers]]
@@ -45,15 +36,6 @@ gain = [0.55, 0.72]
 pitch = [-1.5, 1.5]
 delay = [0.0]
 mode = "one_shot"
-
-[cues.underwater_loop]
-response = "ambient"
-[[cues.underwater_loop.layers]]
-variants = ["generated/underwater_loop_1.wav"]
-gain = [0.32]
-pitch = [0.0]
-delay = [0.0]
-mode = "loop"
 
 [cues.menu_click]
 response = "ui"

@@ -21,11 +21,9 @@ fn main() {
         ("place_default_1.wav", tone_burst(140.0, 0.12, 0.30)),
         ("step_default_1.wav", noise_burst(0.07, 0.20, 3)),
         ("step_default_2.wav", noise_burst(0.07, 0.20, 4)),
-        ("splash_1.wav", noise_burst(0.30, 0.18, 5)),
         ("swing_1.wav", sweep_burst(600.0, 180.0, 0.20)),
         ("menu_click_1.wav", tone_burst(1000.0, 0.04, 0.60)),
         ("voicetest_1.wav", tone_burst(440.0, 0.40, 0.40)),
-        ("underwater_loop_1.wav", loop_bed(2.0, 0.20)),
     ];
 
     for (name, samples) in &assets {
@@ -117,23 +115,6 @@ fn sweep_burst(f0: f32, f1: f32, secs: f32) -> Vec<i16> {
         .collect()
 }
 
-/// A periodic low bed. Every component completes an integer number of cycles,
-/// including its amplitude modulation, so the last→first jump is just another
-/// sample step rather than a random-noise discontinuity.
-fn loop_bed(secs: f32, amp: f32) -> Vec<i16> {
-    let n = len_samples(secs);
-    (0..n)
-        .map(|i| {
-            let phase = TAU * i as f32 / n as f32;
-            let carrier = 0.55 * (phase * 74.0).sin()
-                + 0.30 * (phase * 107.0 + 0.4).sin()
-                + 0.15 * (phase * 151.0 + 1.1).sin();
-            let swell = 0.78 + 0.22 * (phase * 2.0).sin();
-            quantize(amp * swell * carrier)
-        })
-        .collect()
-}
-
 fn quantize(x: f32) -> i16 {
     (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
@@ -165,21 +146,6 @@ fn wav_bytes(samples: &[i16]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn looping_bed_has_no_boundary_click() {
-        let samples = loop_bed(2.0, 0.2);
-        let boundary = (i32::from(samples[0]) - i32::from(samples[samples.len() - 1])).abs();
-        let largest_step = samples
-            .windows(2)
-            .map(|pair| (i32::from(pair[1]) - i32::from(pair[0])).abs())
-            .max()
-            .unwrap();
-        assert!(
-            boundary <= largest_step + 1,
-            "loop boundary jump {boundary} exceeds ordinary step {largest_step}"
-        );
-    }
 
     #[test]
     fn wav_header_matches_payload() {

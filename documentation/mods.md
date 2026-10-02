@@ -1,93 +1,104 @@
 # Mods
 
-A mod is a compiled-in layer on the thin core: menus, inventory, crafting, the
-shipped look, block appearance, and optional worldgen. Toggle them on the Mods
-screen. Adding a new mod still needs a rebuild and a restart.
+A mod is a compiled-in layer on the thin core: menus, the inventory and hotbar, block textures,
+material names, and the world generator. Toggle them on the Mods screen. Adding a new mod still
+needs a rebuild and a restart.
 
-Matter itself is not a mod. The law, intern table, and scheduler live in core
-(`documentation/material-model.md`). Mods present matter, place it, and (for
-machines) emit events into the scheduler.
+Matter itself is not a mod. The law, the intern table and the reaction scheduler live in core
+(`documentation/material-model.md`). Mods present matter, place it, hold it, and (for machines)
+change cells, which wakes their reactions.
 
 ## Hooks
 
 `Mod` methods default to no-ops. When several enabled mods implement a hook:
 
-- Fan-out, install order: `update`, `on_block_break`, `on_break_rejected`,
-  `on_place_rejected`. `hud` uses the same order as z-order (later draws on top).
-- First enabled wins: `menu_theme`, `close_overlay` (first `true`), `worldgen`,
-  `worldgen_config`, `appearance`.
+- Fan-out, install order: `update`, `on_block_break`, `on_break_rejected`, `on_place_rejected`,
+  `on_tool_changed`. `hud` uses the same order as z-order (later draws on top).
+- First enabled wins: `menu_theme`, `start_screen`, `close_overlay` (first `true`), `held`,
+  `namer`, `appearance`, `worldgen`, `worldgen_config`.
 - Compose: `visual_group` bits OR into the render mask.
 
-`worldgen_config` is an opaque string. The winning worldgen kind parses it
-(InfiniteDiffusion reads its own knobs). `knobs` / `step_knob` are per-mod.
+`held` names the block the player holds (what a left click uses as a tool and a right click
+places); with no mod answering, the hand is bare. `on_tool_changed(old, new)` tells every mod that
+a tool reaction turned the held unit into another configuration (the hotbar slot follows it).
 
-Machines queue reactions with `ModContext::emit_material_event`. Chunk load,
-gen, mesh, and save never emit. On a client connected to a server the call is a
-no-op — the authority runs the scheduler.
+A machine changes a cell through `ModContext::world` with `set_block`, then wakes its contacts in
+the reaction scheduler with `note_cell_changed` (or `note_block_moved(from, to)` for a move, which
+wakes both places). Chunk load, gen, mesh and save never wake anything. On a client connected to a
+server the authority runs the scheduler.
 
-## Appearance
+HUD output is data (`HudElement::Label` / `Panel` / `Rect`), drawn by the core theme.
 
-`BlockAppearance` turns a render descriptor (`Visual`) into one 16×16 RGBA8
-layer. The world's texture cache asks `Mods::appearance()` — the first enabled
-mod that returns `Some`, else core `FlatAppearance` (every texel is `rgb` with
-`alpha`). A `revision` change rebuilds every layer; otherwise the cache is
-append-only per descriptor.
+## Shipped mods (group **Essentials**, all on)
 
-Shipped appearance mods:
+| Id | What it does |
+|---|---|
+| `menus`, `start` | Pause/settings menus and the start screen (Worlds page). |
+| `inventory` | Press I: the core stash as a list. ↑/↓ choose, 1-9 equip into that hotbar slot, Enter equips into the selected slot. |
+| `hotbar` | Nine slots plus the bare hand along the bottom. 1-9 / wheel select, 0 the hand. The selected slot is the held tool; new materials drop into the first free slot. |
+| `atmosphere`, `post`, `lighting` | The shipped look (sky/fog/clouds, bloom/TAA/exposure, shadows/AO/blocklight). |
+| `neural_textures` | Paints every configuration's texture with a CPPN grown from it (below). |
+| `material_names` | Names every configuration and its tool (below). |
+| `diffusion` | InfiniteDiffusion, the world generator (below). Off: a flat world. |
 
-- **Procedural textures** (`procedural_textures`, Essentials, on). The
-  two-colour value-noise generator (frequency, roughness, alpha, glow). Knobs
-  `grain` and `contrast` (0..2, default 1) scale grain and colour separation;
-  stepping either bumps `revision`. Disable this to let another appearance mod
-  win, or to get flat colours with no appearance mod enabled.
-- **GPU materials** (`gpu_materials`, ungrouped, off). Uploads one engine
-  `MaterialDesc` per layer (`Visual` bytes 1:1, `MATERIAL_FLAG_PROCEDURAL` set)
-  and a 1×1 placeholder so the array index exists. The GPU paints the pattern.
-  With this mod off the game never calls `set_material_descs`; the engine
-  table stays the default `ARRAY_LAYER` per slot (bit-identical to a renderer
-  that has no descriptor table). Enable it and disable `procedural_textures`
-  so it wins the first-enabled-wins seam.
+## Appearance: neural textures
 
-To write your own: implement `BlockAppearance` (`layer`, `revision`,
-`wants_gpu_descriptors`) and return `Some(self)` from `Mod::appearance`.
-`layer` must be a deterministic function of `Visual` (and your knobs). Bump
-`revision` when knobs change. Set `wants_gpu_descriptors` only if you upload
-engine `MaterialDesc`s; the cache will then send 1×1 placeholders instead of
-16×16 CPU layers. With no appearance mod (`Mods::empty()`) the game renders
-flat colours.
+`BlockAppearance::layer(src, out)` paints one 32×32 RGBA8 layer from an `AppearanceSource` (the
+law, the configuration's `Block`, its `Visual` and observation). The world's texture cache asks
+`Mods::appearance()` — the first enabled mod that returns `Some`, else core `FlatAppearance`
+(every texel the base colour). A `revision` change repaints every layer.
 
-## Worldgen regions
+`neural_textures` (`src/mods/textures/neural.rs`) grows a small compositional pattern-producing
+network **from the configuration**: each distinct element contributes a first-layer neuron (weights,
+frequency and activation hashed from its coordinates, gain from its multiplicity); the second layer
+is wired from the configuration's digest. Blocks that share elements share structure; a block that
+gains a constituent grows a neuron, so every distinct configuration gets its own texture. Hardness
+draws veins, weak cohesion grain, glow lights the crests, clarity sets alpha. Inputs are periodic,
+so the tiles are seamless. Knobs: `detail`, `contrast`.
 
-Terrain is a modding surface of **regions**, not named blocks. A region is a
-centre element, a small family of variants, geological strata, and a label used
-only for HUD/debug (`src/block/regions.rs`). Placement rules
-(`src/world/placement.rs`) name those labels. The generator intern the family's
-configurations once at world start; columns pick a member. A worldgen mod wins
-`worldgen` / `worldgen_config` and must keep the same contract: bounded palette,
-stable under self-contact, deterministic from (seed, law, coord).
+## Naming: material names
 
-InfiniteDiffusion is the shipped generator; it still paints through the region
-table.
+`MaterialNamer::names(src)` returns a block name and a tool name, computed once per interned
+configuration and kept by the registry as presentation. With no namer enabled the core describes
+the observation ("glowing clear hard solid").
 
-## Naming (future)
+`material_names` (`src/mods/naming.rs`) speaks through a character-level Markov model (orders 3→1
+with back-off) trained on real mineral, rock and element names, driven by a generator seeded from
+the configuration — every peer names everything alike. The root comes from the most abundant
+element (near-twins share a family name); the suffix says how it reads (`-ine` clear, `-ium`
+glowing, `-ite` hard, `-ate` firm, `-ash` soft); a qualifier names a strong second element or a
+busy mixture ("Banded", "Veined", "Brittle"); the tool noun follows mass and look (shard, chisel,
+pick, maul, sledge; lens or lantern). Knob: `style`. Names never reach the law, worldgen, saves or
+the wire.
 
-The simulation has no names. A future naming mod may map configurations to
-words (region labels, discovered procedures, player tags). It must not feed
-those strings back into `interact`, worldgen, saves, or the protocol.
+## Worldgen: InfiniteDiffusion
+
+`src/world/terrain` — one pure function of `(seed, coordinate)`, three realms:
+
+- **Surface**: continents of basins, hills and great ranges; ridged crests over eroded slopes, long
+  carved valleys, mesas in arid belts, banded strata on every cliff; biomes by altitude,
+  temperature and moisture (meadow, forests, desert, scree, snow).
+- **Underground**: tunnels and caverns, glowing fungus and crystal in the deep, ore and reagent
+  veins, and abandoned **mines** — timbered corridors on several levels, rails, rare lamps,
+  collapses, rooms and shafts.
+- **Space** above `SPACE_FLOOR` (640): planets (rocky, icy, verdant, desert, crystal, molten) with
+  crusts, mantles and glowing cores, rings and moons, asteroids and stars. The sky turns black and
+  starry as the camera climbs out of the atmosphere.
+
+Materials come from the palette search in the law (`material-model.md`). Knobs (new worlds):
+`relief`, `caves`, `mines`, `space` (percent). The batch chunk path and the per-voxel path share one
+definition, so workers, clients and reactions reading unloaded cells agree.
 
 ## Groups
 
-`Mod::group` returns a group id (`""` = ungrouped). `Mods::GROUPS` holds id,
-display name, and description. Built-ins use `essentials` (**Essentials**): the
-layers that make the game playable as shipped. The Mods screen shows each group
-as a section title, an Enable all / Disable all row, then its mods indented.
-Ungrouped mods follow under Other.
+`Mod::group` returns a group id (`""` = ungrouped). Built-ins use `essentials`. The Mods screen
+shows each group as a section, an Enable all / Disable all row, then its mods.
 
 ## Persistence
 
-`saves/mods.cfg` stores `id=on|off` and optional `id.state=` knob payloads.
-A group toggle writes each member's line; there is no group-level key.
-Per-world state (`save_state`) lives in the world save, keyed by id.
+`mods.cfg` stores a `version=` marker, `id=on|off` lines and optional `id.state=` knob payloads.
+Files from before version 2 recorded `diffusion=off` as the default of an old experiment; those
+lines are ignored so the world generator stays on. Per-world state (`save_state`, e.g. the hotbar
+slots) lives in the world save, keyed by id.
 
-Enable/disable is runtime. Visual mods apply on the next world; worldgen on the
-next new world. New mods are compiled in: rebuild, then restart, to see them.
+Enable/disable is runtime. Visual mods apply on the next world; worldgen on the next new world.

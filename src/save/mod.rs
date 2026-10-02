@@ -38,13 +38,13 @@ pub(crate) fn parse_block(registry: &mut BlockRegistry, spec: &str) -> BlockId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::bridge::{from_doc, unknown_material_notice, v7_law_notice, UnknownMaterials};
+    use super::bridge::{from_doc, unknown_material_notice, UnknownMaterials};
     use super::format::{PlayerState, SaveDoc, WorldgenStamp};
     use crate::mods::Mods;
     use crate::player::Player;
     use crate::world::World;
     use crate::world::chunk::CHUNK_SIZE;
-    use crate::world::diffusion::DiffusionCfg;
+    use crate::world::terrain::TerrainCfg;
     use crate::world::generation::WorldgenKind;
     use std::fs;
     use voxel_engine::DVec3;
@@ -57,7 +57,7 @@ mod tests {
         crate::paths::Paths::get().data.join(format!("{id}.save.bak"))
     }
 
-    fn make_world(seed: i64, kind: WorldgenKind, cfg: DiffusionCfg) -> World {
+    fn make_world(seed: i64, kind: WorldgenKind, cfg: TerrainCfg) -> World {
         World::with_kind_cfg(
             seed,
             crate::render_config::RenderConfig::default(),
@@ -121,10 +121,7 @@ mod tests {
 
         let mut world = World::new(4242);
         let (bx, bz) = (8, 8);
-        let by = (0..64)
-            .rev()
-            .find(|&y| world.is_solid(bx, y, bz))
-            .unwrap();
+        let by = world.surface_y(bx, bz) - 1;
         world.set_block(bx, by, bz, AIR);
 
         let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
@@ -138,7 +135,7 @@ mod tests {
         player.stash.add(soil, 1);
         let mut mods = Mods::with_defaults();
         let rock_spec = world.registry().spec(rock);
-        mods.load_state("Crafting", &format!("*{rock_spec}=1"), &mut world);
+        mods.load_state("hotbar", &format!("v1;sel=2;2={rock_spec}"), &mut world);
         let states_before = mods.save_states(&world);
 
         save(&id, &world, &player, &mods, meta("round trip")).unwrap();
@@ -184,9 +181,9 @@ mod tests {
     fn bare_doc() -> SaveDoc {
         SaveDoc {
             meta: meta("stash"),
-            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
-            law_stamp: material::Law::v0().stamp(),
+            law_stamp: material::Law::current().stamp(),
             player: PlayerState {
                 pos: [0.0, 40.0, 0.0],
                 yaw: 0.0,
@@ -198,6 +195,7 @@ mod tests {
             specs: vec![],
             edits: vec![],
             mods: vec![],
+            pending: vec![],
         }
     }
 
@@ -254,17 +252,9 @@ mod tests {
 
         let mut doc = bare_doc();
         doc.player.stash = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
-        doc.mods
-            .push(("crafting".into(), "v1;natural:Iron=4".into()));
         let mut mods = Mods::with_defaults();
-        let (world, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
         assert_eq!(player.stash.total(), 1);
-        assert!(
-            mods.save_states(&world)
-                .iter()
-                .all(|(n, d)| n != "crafting" || !d.contains("Iron")),
-            "unknown pouch specs are dropped"
-        );
     }
 
     #[test]
@@ -303,34 +293,30 @@ mod tests {
 
     #[test]
     fn perturbed_law_stamp_is_refused_without_panic() {
-        let mut law = material::Law::v0();
-        law.kernel.knots[2].1 = -law.kernel.knots[2].1;
-        let mut doc = bare_doc();
-        doc.law_stamp = law.stamp();
-        let mut mods = Mods::with_defaults();
-        match from_doc(doc, &mut mods, make_world) {
-            Err(SaveError::CannotHost { label, why }) => {
-                assert!(!label.is_empty());
-                assert!(!why.is_empty());
-            }
-            Err(SaveError::LawMismatch) => {}
-            Ok(_) => panic!("expected refusal, got a loaded world"),
-            Err(e) => panic!("expected refusal, got {e}"),
+        let mut law = material::Law::current();
+        law.probes.light = material::Element::new([1, 2, 3, 4]);
+        for stamp in [law.stamp(), Vec::new(), vec![0u8; 80]] {
+            let mut doc = bare_doc();
+            doc.law_stamp = stamp;
+            let mut mods = Mods::with_defaults();
+            assert!(matches!(from_doc(doc, &mut mods, make_world), Err(SaveError::LawMismatch)));
         }
     }
 
     #[test]
-    fn v7_save_emits_a_migration_notice_and_loads() {
-        assert_eq!(
-            v7_law_notice(&[]).as_deref(),
-            Some("save predates the law stamp (v7); assuming law v0")
-        );
-        assert_eq!(v7_law_notice(&material::Law::v0().stamp()), None);
-        let mut doc = bare_doc();
-        doc.law_stamp.clear();
+    fn pending_reactions_survive_save_and_load() {
+        let id = slot("__unit_test_pending_reactions__");
+        let mut world = World::with_kind(5, crate::render_config::RenderConfig::default(), WorldgenKind::Flat, true);
+        world.note_cell_changed(3, 64, 3);
+        world.note_cell_changed(9, 70, -2);
+        let before = world.reactions().snapshot();
+        assert_eq!(before.len(), 12);
+        let player = Player::new(DVec3::new(0.0, 70.0, 0.0));
         let mut mods = Mods::with_defaults();
-        let (world, _, _) = from_doc(doc, &mut mods, make_world).unwrap();
-        assert_eq!(world.registry().law(), &material::Law::v0());
+        save(&id, &world, &player, &mods, meta("pending")).unwrap();
+        let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
+        assert_eq!(loaded.reactions().snapshot(), before, "the queue resumes in order, nothing invented");
+        cleanup(&id);
     }
 
     #[test]
@@ -405,24 +391,25 @@ mod tests {
             stash: Some(vec![]),
         };
         let doc = SaveDoc {
-            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
-            law_stamp: material::Law::v0().stamp(),
+            law_stamp: material::Law::current().stamp(),
             meta: meta("mods"),
             player: blank_player.clone(),
             specs: vec![],
             edits: vec![],
             mods: vec![
-                ("Crafting".into(), "*natural:Stone=1".into()),
+                ("Hotbar".into(), "sel=4".into()),
                 ("no-such-mod".into(), "ignored".into()),
-                ("Crafting".into(), "air=2".into()),
+                ("hotbar".into(), "v1;sel=2".into()),
             ],
+            pending: vec![],
         };
         let mut mods = Mods::with_defaults();
         let (world, _, _) = super::bridge::from_doc(doc, &mut mods, make_world).unwrap();
         let states = mods.save_states(&world);
-        let craft = states.iter().find(|(n, _)| n == "crafting").map(|(_, d)| d.as_str());
-        assert_eq!(craft, Some("v1;air=2"), "duplicate mod lines: last wins");
+        let bar = states.iter().find(|(n, _)| n == "hotbar").map(|(_, d)| d.as_str());
+        assert_eq!(bar, Some("v1;sel=2"), "duplicate mod lines: last wins");
         assert!(states.iter().all(|(n, _)| n != "no-such-mod"));
     }
 
@@ -454,14 +441,8 @@ mod tests {
         meta.edit_count = u32::try_from(edits.len()).unwrap();
         SaveDoc {
             meta,
-            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
-            worldgen: WorldgenStamp {
-                kind: world.worldgen().wire(),
-                tile: world.diffusion_cfg().tile,
-                stride: world.diffusion_cfg().stride,
-                phases: world.diffusion_cfg().phases,
-                relief: world.diffusion_cfg().relief,
-            },
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
+            worldgen: WorldgenStamp { kind: world.worldgen().wire(), knobs: world.terrain_cfg().to_wire() },
             law_stamp: world.registry().law().stamp(),
             player: PlayerState {
                 pos: [player.position.x, player.position.y, player.position.z],
@@ -474,6 +455,7 @@ mod tests {
             specs,
             edits,
             mods: mods.save_states(world),
+            pending: Vec::new(),
         }
     }
 
@@ -481,10 +463,7 @@ mod tests {
     fn snapshot_encodes_byte_identical_to_walking_the_overlay() {
         let mut world = World::new(4242);
         let (bx, bz) = (8, 8);
-        let by = (0..64)
-            .rev()
-            .find(|&y| world.is_solid(bx, y, bz))
-            .unwrap();
+        let by = world.surface_y(bx, bz) - 1;
         world.set_block(bx, by, bz, AIR);
         let soil = world.registry().id_by_label("soil").unwrap();
         world.set_block(bx, by + 1, bz, soil);
@@ -498,7 +477,7 @@ mod tests {
         player.stash.add(soil, 1);
         let mut mods = Mods::with_defaults();
         let rock_spec = world.registry().spec(rock);
-        mods.load_state("Crafting", &format!("*{rock_spec}=1"), &mut world);
+        mods.load_state("hotbar", &format!("v1;sel=1;1={rock_spec}"), &mut world);
 
         let snap = snapshot(&world, &player, &mods, meta("snap"));
         let snap_doc = snap.to_doc().unwrap();
@@ -527,66 +506,41 @@ mod tests {
     #[test]
     fn diffusion_world_round_trips_kind_cfg_and_generated_chunks() {
         let id = slot("__unit_test_diffusion_round_trip__");
-        let cfg = DiffusionCfg {
-            tile: 64,
-            stride: 16,
-            phases: 4,
-            relief: 1.5,
-            version: 1,
-        };
+        let cfg = TerrainCfg { relief: 150, caves: 50, mines: 200, space: 0 };
         let world = make_world(99, WorldgenKind::Diffusion, cfg);
         assert_eq!(world.worldgen(), WorldgenKind::Diffusion);
         let cy = world.surface_y(0, 0).div_euclid(CHUNK_SIZE as i32);
         let chunks = [(0, cy, 0), (1, cy, 0), (0, cy, 1)];
-        let before: Vec<_> = chunks
-            .iter()
-            .map(|&c| dump_chunk(&world, c.0, c.1, c.2))
-            .collect();
-        assert!(
-            before.iter().any(|c| c.iter().any(|&id| id != AIR)),
-            "pregenerated origin must contain terrain"
-        );
+        let before: Vec<_> = chunks.iter().map(|&c| dump_chunk(&world, c.0, c.1, c.2)).collect();
+        assert!(before.iter().any(|c| c.iter().any(|&id| id != AIR)), "pregenerated origin must contain terrain");
 
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        // Diffusion mod stays OFF: the save header, not the mod flag, decides
-        // the generator on load.
+        // The diffusion mod OFF: the save header, not the mod flag, decides the generator on load.
         let mut mods = Mods::with_defaults();
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        mods.set_enabled("diffusion", false);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
         save(&id, &world, &player, &mods, meta("diffusion")).unwrap();
 
         let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(loaded.worldgen(), WorldgenKind::Diffusion);
-        assert_eq!(loaded.diffusion_cfg(), cfg.clamp());
-        assert_eq!(
-            mods.worldgen_kind(),
-            WorldgenKind::Classic,
-            "loading a diffusion world must not flip the mod's enabled flag"
-        );
+        assert_eq!(loaded.terrain_cfg(), cfg.clamp());
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat, "loading must not flip the mod's enabled flag");
         for (i, &(cx, cy, cz)) in chunks.iter().enumerate() {
-            assert_eq!(
-                dump_chunk(&loaded, cx, cy, cz),
-                before[i],
-                "chunk {cx},{cy},{cz} must regenerate identically"
-            );
+            assert_eq!(dump_chunk(&loaded, cx, cy, cz), before[i], "chunk {cx},{cy},{cz} must regenerate identically");
         }
-
         cleanup(&id);
     }
 
     #[test]
-    fn classic_save_still_loads_as_classic() {
-        let id = slot("__unit_test_classic_kind__");
-        let world = World::new(7);
-        assert_eq!(world.worldgen(), WorldgenKind::Classic);
-        let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
+    fn flat_save_still_loads_as_flat() {
+        let id = slot("__unit_test_flat_kind__");
+        let world = World::with_kind(7, crate::render_config::RenderConfig::default(), WorldgenKind::Flat, true);
+        let player = Player::new(DVec3::new(0.0, 70.0, 0.0));
         let mut mods = Mods::with_defaults();
-        mods.set_enabled("diffusion", true);
-        save(&id, &world, &player, &mods, meta("classic")).unwrap();
-
+        save(&id, &world, &player, &mods, meta("flat")).unwrap();
         let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
-        assert_eq!(loaded.worldgen(), WorldgenKind::Classic);
-        assert_eq!(loaded.worldgen_kind(), "classic");
-
+        assert_eq!(loaded.worldgen(), WorldgenKind::Flat);
+        assert_eq!(loaded.worldgen_kind(), "flat");
         cleanup(&id);
     }
 }

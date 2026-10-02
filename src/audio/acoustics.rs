@@ -17,17 +17,10 @@ pub enum Response {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum Medium {
-    Air,
-    Liquid,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct Listener {
     pub pos: DVec3, // eye position in world-space blocks; responses use metres
     pub yaw: f32,
     pub pitch: f32,
-    pub medium: Medium,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -103,7 +96,6 @@ pub enum WindowError {
 pub struct Coords {
     pub distance: f32,
     pub occlusion: f32,
-    pub medium: Medium,
 }
 
 /// Coordinates that have already passed smoothing. `respond`/`audibility` accept
@@ -115,17 +107,16 @@ pub struct SmoothedCoords(Coords);
 
 impl SmoothedCoords {
     /// Crate-visible so the runtime's smoother (the sole time-varying mint) can build one.
-    pub(crate) fn new(distance: f32, occlusion: f32, medium: Medium) -> Self {
+    pub(crate) fn new(distance: f32, occlusion: f32) -> Self {
         Self(Coords {
             distance,
             occlusion,
-            medium,
         })
     }
     /// Distance 0: smoothing is the identity, so this is a valid smoothed value
     /// with nothing to integrate (UI cues).
-    pub(crate) fn coincident(medium: Medium) -> Self {
-        Self::new(0.0, 0.0, medium)
+    pub(crate) fn coincident() -> Self {
+        Self::new(0.0, 0.0)
     }
 }
 
@@ -140,7 +131,7 @@ fn cell_absorption(cell: Cell) -> u32 {
 /// Amanatides–Woo DDA from listener to source accumulating absorption × thickness.
 /// `occlusion` is in full-absorption-metres: Σ (absorption/255) × (metres spent in
 /// that cell). Total on `Unloaded` and on degenerate rays — never panics.
-pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3, medium: Medium) -> Coords {
+pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3) -> Coords {
     let delta = to - from;
     let len = delta.length();
     let distance = (len * BLOCK_METERS) as f32;
@@ -150,7 +141,6 @@ pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3, medium: Medium) -> Co
         return Coords {
             distance: if distance.is_finite() { distance } else { 0.0 },
             occlusion: 0.0,
-            medium,
         };
     }
 
@@ -205,7 +195,6 @@ pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3, medium: Medium) -> Co
     Coords {
         distance,
         occlusion: occ as f32,
-        medium,
     }
 }
 
@@ -221,8 +210,6 @@ const OCCL_K: f32 = 0.08;
 const LP_K: f32 = 0.12;
 const LP_MAX_HZ: f32 = 20_000.0;
 const LP_MIN_HZ: f32 = 200.0;
-const LIQUID_LP_HZ: f32 = 1_200.0;
-const LIQUID_GAIN: f32 = 0.7;
 
 fn ref_dist(r: Response) -> f32 {
     match r {
@@ -246,10 +233,6 @@ fn occl_lp(o: f32) -> f32 {
     (LP_MAX_HZ * (-LP_K * o).exp()).clamp(LP_MIN_HZ, LP_MAX_HZ)
 }
 
-fn is_liquid(m: Medium) -> bool {
-    matches!(m, Medium::Liquid)
-}
-
 /// The camera's canonical yaw/pitch basis: yaw zero looks +X and positive yaw
 /// turns toward +Z. Panning reads listener-local components.
 fn listener_basis(l: &Listener) -> (DVec3, DVec3, DVec3) {
@@ -262,7 +245,7 @@ fn listener_basis(l: &Listener) -> (DVec3, DVec3, DVec3) {
 }
 
 /// The spatial gain base shared by `respond` and `audibility`: the
-/// distance×occlusion attenuation before any authored/water/clamp factors. Because
+/// distance×occlusion attenuation before any authored/clamp factors. Because
 /// both the ranking bound and the applied level read the SAME curve here, the
 /// audibility quantifier cannot drift off the response curve. Ui is non-spatial (1).
 fn spatial_base(r: Response, distance: f32, occlusion: f32) -> f32 {
@@ -278,7 +261,6 @@ pub fn respond(r: Response, sc: SmoothedCoords, listener: &Listener, source: Opt
     let Coords {
         distance,
         occlusion,
-        medium,
     } = sc.0;
     if let Response::Ui = r {
         return Dsp {
@@ -288,16 +270,8 @@ pub fn respond(r: Response, sc: SmoothedCoords, listener: &Listener, source: Opt
         };
     }
 
-    let media_differ = is_liquid(listener.medium) != is_liquid(medium);
-    let any_liquid = is_liquid(listener.medium) || is_liquid(medium);
-
-    let medium_gain = if media_differ { LIQUID_GAIN } else { 1.0 };
-    let gain = (spatial_base(r, distance, occlusion) * medium_gain).clamp(0.0, 1.0);
-
-    let mut lowpass_hz = occl_lp(occlusion);
-    if any_liquid {
-        lowpass_hz = lowpass_hz.min(LIQUID_LP_HZ);
-    }
+    let gain = spatial_base(r, distance, occlusion).clamp(0.0, 1.0);
+    let lowpass_hz = occl_lp(occlusion);
 
     // Pan is None when coincident (< 0.5 m) or non-spatial.
     let pan = source.and_then(|s| {
@@ -327,7 +301,7 @@ pub fn respond(r: Response, sc: SmoothedCoords, listener: &Listener, source: Opt
 /// SAME `spatial_base` `respond` uses, so the ranking curve can't drift off the
 /// applied curve. Admissibility: a clip layer's applied level is
 /// `respond().gain · occ_gain · lgain`, where `respond().gain ≤ spatial_base`
-/// (water ≤ 1, clamp only lowers). The caller passes `gain = occ_gain · max_lgain`
+/// (the clamp only lowers). The caller passes `gain = occ_gain · max_lgain`
 /// with `max_lgain = max` over the cue's layer-gain ranges, and every layer's
 /// `lgain ≤ max_lgain` (authored gain is bounded to (0, 4] at load), so
 /// `applied ≤ spatial_base · occ_gain · max_lgain = audibility`. Emitters/voice
@@ -361,23 +335,17 @@ mod tests {
             &unloaded,
             DVec3::new(0.5, 0.5, 0.5),
             DVec3::new(3.5, 3.5, 3.5),
-            Medium::Air,
         );
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
         assert!(c.distance.is_finite());
 
         // from == to (zero length): zero occlusion, zero distance.
-        let c = trace(&open, DVec3::splat(1.5), DVec3::splat(1.5), Medium::Air);
+        let c = trace(&open, DVec3::splat(1.5), DVec3::splat(1.5));
         assert_eq!(c.distance, 0.0);
         assert_eq!(c.occlusion, 0.0);
 
         // Corner-grazing exact diagonal (DDA tie on all three axes).
-        let c = trace(
-            &unloaded,
-            DVec3::ZERO,
-            DVec3::new(4.0, 4.0, 4.0),
-            Medium::Air,
-        );
+        let c = trace(&unloaded, DVec3::ZERO, DVec3::new(4.0, 4.0, 4.0));
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
 
         // Endpoints far outside the window: still total, all cells read Unloaded.
@@ -385,21 +353,14 @@ mod tests {
             &open,
             DVec3::new(-50.0, -50.0, -50.0),
             DVec3::new(50.0, 50.0, 50.0),
-            Medium::Liquid,
         );
         assert!(c.occlusion.is_finite() && c.occlusion >= 0.0);
-        assert!(matches!(c.medium, Medium::Liquid));
     }
 
     #[test]
     fn trace_reports_shared_world_scale_in_metres() {
         let open = window(4, Cell::Open);
-        let c = trace(
-            &open,
-            DVec3::new(0.5, 0.5, 0.5),
-            DVec3::new(1.5, 0.5, 0.5),
-            Medium::Air,
-        );
+        let c = trace(&open, DVec3::new(0.5, 0.5, 0.5), DVec3::new(1.5, 0.5, 0.5));
         assert!((c.distance - BLOCK_METERS as f32).abs() < 1e-6);
     }
 
@@ -408,7 +369,7 @@ mod tests {
         fn pan(listener: Listener, source: DVec3) -> [f32; 3] {
             respond(
                 Response::World,
-                SmoothedCoords::new(2.0, 0.0, Medium::Air),
+                SmoothedCoords::new(2.0, 0.0),
                 &listener,
                 Some(source),
             )
@@ -420,7 +381,6 @@ mod tests {
             pos: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
-            medium: Medium::Air,
         };
         assert!(
             pan(listener, DVec3::X)[0].abs() < 1e-6,
@@ -454,7 +414,6 @@ mod tests {
             pos: DVec3::ZERO,
             yaw: 0.3,
             pitch: -0.2,
-            medium: Medium::Air,
         };
         let responses = [
             Response::World,
@@ -465,19 +424,16 @@ mod tests {
         for &r in &responses {
             for &dist in &[0.0f32, 0.4, 2.0, 8.0, 40.0] {
                 for &occl in &[0.0f32, 1.0, 5.0, 25.0] {
-                    for &medium in &[Medium::Air, Medium::Liquid] {
-                        let sc = SmoothedCoords::new(dist, occl, medium);
-                        for &g in &[0.0f32, 0.25, 1.0, 4.0] {
-                            let ub = audibility(r, sc, g);
-                            let applied =
-                                respond(r, sc, &listener, Some(DVec3::new(dist as f64, 0.0, 0.0)))
-                                    .gain
-                                    * g;
-                            assert!(
-                                ub + 1e-5 >= applied,
-                                "audibility {ub} < applied gain {applied} (r={r:?}, d={dist}, o={occl}, g={g})"
-                            );
-                        }
+                    let sc = SmoothedCoords::new(dist, occl);
+                    for &g in &[0.0f32, 0.25, 1.0, 4.0] {
+                        let ub = audibility(r, sc, g);
+                        let applied =
+                            respond(r, sc, &listener, Some(DVec3::new(dist as f64, 0.0, 0.0))).gain
+                                * g;
+                        assert!(
+                            ub + 1e-5 >= applied,
+                            "audibility {ub} < applied gain {applied} (r={r:?}, d={dist}, o={occl}, g={g})"
+                        );
                     }
                 }
             }

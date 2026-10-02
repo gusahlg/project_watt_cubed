@@ -364,25 +364,25 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
         format!("block at {x} {y} {z}: {words} (#{}{role})", id.0),
         format!("  made of: {made}"),
         format!(
-            "  solid {}  liquid {}  transparency {}  emission {}",
-            obs.solid as u8, obs.liquid as u8, obs.transparency, obs.emission
+            "  solid {}  transparency {}  emission {}",
+            obs.solid as u8, obs.transparency, obs.emission
         ),
         format!(
-            "  hardness {}  friction {}  flow {}",
-            obs.hardness, obs.friction, obs.flow
+            "  hardness {}  friction {}  cohesion {}",
+            obs.hardness, obs.friction, obs.cohesion
         ),
         format!("  descriptor {}", registry.render_layer(id)),
     ])
 }
 
-/// `/reactions` — pending queue, generations run, mutations committed.
+/// `/reactions` — active contacts, turns run, law operations committed.
 fn reactions(world: &World) -> Vec<Line> {
     let r = world.reactions();
     shown(vec![format!(
-        "reactions: pending={} generations={} mutations={}",
+        "reactions: active={} turns={} operations={}",
         r.pending(),
-        r.generations,
-        r.mutations
+        r.turns,
+        r.operations
     )])
 }
 
@@ -483,9 +483,9 @@ mod tests {
         );
         w.drive_spawn_ready();
         // `is_solid` reads AIR for unloaded chunks, so this proves the ground
-        // cell (rock or seabed) landed before physics would resume.
+        // cell under the surface landed before physics would resume.
         assert!(
-            w.is_solid(x, surface, z),
+            w.is_solid(x, surface - 1, z),
             "the destination's ground must be loaded before physics resumes"
         );
     }
@@ -534,10 +534,10 @@ mod tests {
     }
 
     #[test]
-    fn reactions_prints_pending_generations_mutations() {
+    fn reactions_prints_active_turns_operations() {
         let (mut p, mut w) = (player(), world());
         let out = run("reactions", &mut p, &mut w);
-        assert_eq!(joined(&out), "reactions: pending=0 generations=0 mutations=0");
+        assert_eq!(joined(&out), "reactions: active=0 turns=0 operations=0");
     }
 
     #[test]

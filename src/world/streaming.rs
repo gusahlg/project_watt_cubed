@@ -5,12 +5,9 @@
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{DVec3, Engine, FadeStyle, MaterialDesc};
+use voxel_engine::{DVec3, Engine, FadeStyle};
 
-use crate::block::appearance::{
-    fill_descriptor_layer, placeholder_layer, procedural_material_desc, BlockAppearance,
-    LAYER_BYTES, TEXTURE_SIZE,
-};
+use crate::block::appearance::{fill_layer, BlockAppearance, LAYER_BYTES, TEXTURE_SIZE};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
 use crate::derived::Revision;
@@ -46,13 +43,10 @@ pub(in crate::world) fn mesh_output_bytes(data: &pipeline::MeshPayload) -> usize
     data.vertex_bytes()
 }
 
-/// Vertex bytes a finished section mesh will stage (one packed mesh × passes).
+/// Vertex bytes a finished section mesh will stage (every slab × pass).
 #[cfg(test)]
 pub(in crate::world) fn section_output_bytes(data: &super::SectionMeshData) -> usize {
-    voxel_engine::Pass::ALL
-        .iter()
-        .map(|&p| data.data[p].vertex_bytes())
-        .sum()
+    data.vertex_bytes()
 }
 
 /// Edits whose chunk falls inside `pos`'s footprint and height domain. Free
@@ -2965,7 +2959,7 @@ impl World {
             section_fallback: staging.section_fallback,
             section_ring_full: staging.section_ring_full,
             reactions_pending: self.reactions.pending(),
-            reactions_mutations: self.reactions.mutations,
+            reactions_mutations: self.reactions.operations,
         }
     }
 
@@ -3150,14 +3144,13 @@ impl World {
         });
     }
 
-    /// Rebuild/upload block texture array on descriptor growth (rare: world entry
-    /// or a newly interned look) or an appearance `revision` change. Existing
-    /// layers never change at one revision (pure function of the visual;
-    /// descriptor ids are append-only), so only the first upload / a revision
-    /// rebuild uses `set_block_textures`; later growth appends.
+    /// Rebuild/upload the block texture array when configurations gain layers (world entry, a newly
+    /// interned configuration) or the appearance `revision` changes. Existing layers never change at
+    /// one revision (a pure function of the configuration; layer ids are append-only), so only the
+    /// first upload / a revision rebuild uses `set_block_textures`; later growth appends.
     fn refresh_textures(&mut self, eng: &mut Engine, appearance: &dyn BlockAppearance) {
-        // Never zero (modulo divisor) and never past the vertex field's u16.
-        // Construction caches `u16::MAX`; the device cap is read once.
+        // Never zero and never past the vertex field's 14 bits. Construction caches `u16::MAX`; the
+        // device cap is read once.
         if !self.texture_cap_from_device {
             let device = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
             self.texture_layer_cap = device.min(crate::block::MAX_DESCRIPTORS as u16);
@@ -3168,73 +3161,25 @@ impl World {
         }
         let count = self.registry.descriptor_count();
         let rev = appearance.revision();
-        let gpu = appearance.wants_gpu_descriptors();
-        if self.appearance_revision != rev || self.appearance_gpu != gpu {
+        if self.appearance_revision != rev {
             self.texture_cache.clear();
             self.uploaded_len = 0;
             self.textures_built = 0;
             self.appearance_revision = rev;
-            self.appearance_gpu = gpu;
         }
         if self.textures_built == count {
             return;
         }
-        if gpu {
-            for i in self.texture_cache.len()..count {
-                let vis = self.registry.descriptor(i as u16);
-                self.texture_cache
-                    .push(placeholder_layer(&vis, i as u16));
-            }
-        } else {
-            for i in self.texture_cache.len()..count {
-                let mut buf = [0u8; LAYER_BYTES];
-                fill_descriptor_layer(appearance, &self.registry, i as u16, &mut buf);
-                self.texture_cache.push(buf.to_vec());
-            }
+        for i in self.texture_cache.len()..count {
+            let mut buf = [0u8; LAYER_BYTES];
+            fill_layer(appearance, &self.registry, i as u16, &mut buf);
+            self.texture_cache.push(buf.to_vec());
         }
         let visible = count.min(self.texture_layer_cap as usize);
-        if count > visible && self.uploaded_len < visible {
-            eprintln!(
-                "render descriptors ({count}) exceed the device texture-layer cap \
-                 ({visible}); further textures use the nearest existing layer"
-            );
-        }
-        let texel = if gpu { 1 } else { TEXTURE_SIZE };
-        let upload = plan_texture_upload(&self.texture_cache, self.uploaded_len, visible);
-        let desc_range = match &upload {
-            Some(TextureUpload::Set(_)) => Some((0, visible)),
-            Some(TextureUpload::Append(_)) => Some((self.uploaded_len, visible)),
-            None => None,
-        };
-        let descs: Option<Vec<MaterialDesc>> = if gpu {
-            desc_range.map(|(lo, hi)| {
-                (lo..hi)
-                    .map(|i| procedural_material_desc(&self.registry.descriptor(i as u16)))
-                    .collect()
-            })
-        } else {
-            None
-        };
-        match upload {
-            Some(TextureUpload::Set(layers)) => {
-                eng.set_block_textures(texel, layers);
-            }
-            Some(TextureUpload::Append(layers)) => {
-                eng.append_block_textures(layers);
-            }
+        match plan_texture_upload(&self.texture_cache, self.uploaded_len, visible) {
+            Some(TextureUpload::Set(layers)) => eng.set_block_textures(TEXTURE_SIZE, layers),
+            Some(TextureUpload::Append(layers)) => eng.append_block_textures(layers),
             None => {}
-        }
-        if let Some(descs) = descs {
-            match desc_range {
-                Some((0, _)) => eng.set_material_descs(&descs),
-                Some(_) => eng.append_material_descs(&descs),
-                None => {}
-            }
-            self.gpu_descs_uploaded = true;
-        } else if self.gpu_descs_uploaded {
-            // Engine default is ARRAY_LAYER per slot; an empty set restores it.
-            eng.set_material_descs(&[]);
-            self.gpu_descs_uploaded = false;
         }
         self.uploaded_len = visible;
         self.textures_built = count;
@@ -4067,16 +4012,16 @@ mod tests {
 
     /// `accept_column` caches the skylight ceiling from worker heights (not
     /// `height()`) and `trivial_light` publishes the same grid the slow path
-    /// would. Covers classic, diffusion, and an edited-roof raise.
+    /// would. Covers the flat world, diffusion, and an edited-roof raise.
     #[test]
     fn accept_column_caches_ceiling_and_trivial_light_matches_slow() {
         use crate::render_config::RenderConfig;
         use crate::world::generation::WorldgenKind;
 
-        for kind in [WorldgenKind::Classic, WorldgenKind::Diffusion] {
+        for kind in [WorldgenKind::Flat, WorldgenKind::Diffusion] {
             let mut world = World::with_kind(7, RenderConfig::default(), kind, false);
-            // Above terrain and the flying-island band: uniform air, open sky.
-            let coord = Coord::new(1, 25, -2);
+            // Above every mountain and below space: uniform air, open sky.
+            let coord = Coord::new(1, 31, -2);
             world.center = Some(coord);
 
             let stone = world.registry.id_by_label("rock").expect("builtin Stone");

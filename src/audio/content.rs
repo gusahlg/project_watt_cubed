@@ -624,10 +624,10 @@ mod tests {
         delay = [0.0, 0.1]
         mode = "one_shot"
 
-        [cues.underwater_loop]
+        [cues.loop_bed]
         response = "ambient"
-        [[cues.underwater_loop.layers]]
-        variants = ["u.wav"]
+        [[cues.loop_bed.layers]]
+        variants = ["bed.wav"]
         gain = [0.5]
         pitch = [0.0]
         delay = [0.0]
@@ -673,10 +673,10 @@ mod tests {
         let (cat, syms) = Catalog::from_manifest(HAPPY, &mut r, &mut clips).unwrap();
 
         let brk = cat.typed::<OneShot>(&syms, "break_default").unwrap();
-        let uw = cat.typed::<Loop>(&syms, "underwater_loop").unwrap();
-        // Sorted-name assignment: break_default < underwater_loop.
+        let bed = cat.typed::<Loop>(&syms, "loop_bed").unwrap();
+        // Sorted-name assignment: break_default < loop_bed.
         assert_eq!(brk.index(), 0);
-        assert_eq!(uw.index(), 1);
+        assert_eq!(bed.index(), 1);
 
         let c = cat.cue(brk);
         assert_eq!(c.response, Response::World);
@@ -687,7 +687,7 @@ mod tests {
         let expect = 0.1 + 1.0 / 2.0_f32.powf(-2.0 / 12.0);
         assert!((c.max_duration - expect).abs() < 1e-4);
 
-        let l = cat.cue(uw);
+        let l = cat.cue(bed);
         assert_eq!(l.response, Response::Ambient);
         assert!(l.max_duration.is_infinite());
         assert!(syms.raw("missing").is_none());

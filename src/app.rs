@@ -26,7 +26,7 @@ use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
 use crate::settings::Settings;
-use crate::world::diffusion::DiffusionCfg;
+use crate::world::terrain::TerrainCfg;
 use crate::world::World;
 
 const STARTING_WINDOW_WIDTH: u32 = 1280;
@@ -389,10 +389,10 @@ impl App {
             .expect("bench_frame without bench")
             .has_started()
         {
-            let pos = {
+            let (pos, look) = {
                 let bench = self.bench.as_mut().expect("bench exists");
                 bench.begin();
-                bench.position()
+                (bench.position(), bench.look())
             };
             // Uncapped and unsynced, or the bench measures the throttle.
             self.settings.vsync = false;
@@ -404,8 +404,13 @@ impl App {
                 // Far-coordinate bench: park the player at the requested position
                 // with the ground under them made real, and give streaming a
                 // little extra warmup to catch up before sampling starts.
+                if let Some((yaw, pitch)) = look {
+                    game.player_mut().orientation.yaw = yaw;
+                    game.player_mut().orientation.pitch = pitch;
+                }
                 if let Some(pos) = pos {
                     game.player_mut().position = pos;
+                    game.player_mut().set_flying(true);
                     game.world_mut().prepare_around(pos);
                     if let Some(bench) = &mut self.bench {
                         bench.add_warmup(Duration::from_secs(2));
@@ -670,7 +675,7 @@ impl App {
             password: info.password.clone(),
             seed,
             worldgen: self.mods.worldgen_kind(),
-            diffusion: diffusion_from_mods(&self.mods),
+            terrain: terrain_cfg_from_mods(&self.mods),
             ..Config::default()
         };
         match server::spawn(info.port, config) {
@@ -683,7 +688,7 @@ impl App {
                     &info.name,
                     &info.password,
                     self.mods.worldgen_kind(),
-                    diffusion_from_mods(&self.mods),
+                    terrain_cfg_from_mods(&self.mods),
                 ) {
                     Ok(conn) => self.enter_net_game(eng, conn),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
@@ -701,7 +706,7 @@ impl App {
             &info.name,
             &info.password,
             self.mods.worldgen_kind(),
-            diffusion_from_mods(&self.mods),
+            terrain_cfg_from_mods(&self.mods),
         ) {
             Ok(conn) => self.enter_net_game(eng, conn),
             Err(e) => self.fail_to_menu(format!("could not join: {e}")),
@@ -716,7 +721,7 @@ impl App {
             conn.seed(),
             self.mods.effective_render(&self.settings),
             conn.worldgen(),
-            conn.diffusion(),
+            conn.terrain(),
             false,
         );
         let player = Player::new(conn.spawn());
@@ -749,7 +754,7 @@ impl App {
             seed,
             self.mods.effective_render(&self.settings),
             self.mods.worldgen_kind(),
-            diffusion_from_mods(&self.mods),
+            terrain_cfg_from_mods(&self.mods),
             false,
         );
         let player = spawn_player(&world);
@@ -942,12 +947,9 @@ impl Default for App {
     }
 }
 
-/// Parse the winning worldgen payload as diffusion knobs (classic has none).
-fn diffusion_from_mods(mods: &Mods) -> DiffusionCfg {
-    mods.worldgen_config()
-        .as_deref()
-        .map(DiffusionCfg::from_text)
-        .unwrap_or_default()
+/// Parse the winning worldgen payload as generator knobs.
+fn terrain_cfg_from_mods(mods: &Mods) -> TerrainCfg {
+    mods.worldgen_config().as_deref().map(TerrainCfg::from_text).unwrap_or_default()
 }
 
 /// A world seed from the wall clock, so each new world differs.
@@ -958,81 +960,37 @@ fn fresh_seed() -> i64 {
         .unwrap_or(1)
 }
 
-/// Spawn the player just above dry land near the world origin, so they drop and
-/// land on solid ground instead of sinking into an ocean/lake column that
-/// happens to sit at (0, 0). Spirals outward from the origin for the first
-/// column above sea level, mirroring `net::server::spawn_point`.
-///
-/// Classic: up to 512 `height()` probes (~5 ms). Diffusion: 8 rings of 16×16
-/// tiles via [`World::heights_16`], so the field is sampled by rectangle.
+/// Spawn the player just above level ground near the world origin, so they land on a meadow or a
+/// valley floor rather than a cliff edge. Spirals outward over whole 16×16 chunk columns
+/// ([`World::heights_16`], one batch each) for the first cell whose 3×3 neighbourhood is flat.
 fn spawn_player(world: &World) -> Player {
-    let sea = world.sea_level();
-    if world.worldgen_kind() == "diffusion" {
-        return spawn_player_diffusion(world, sea);
-    }
-    for r in 0..64 {
-        for (dx, dz) in [
-            (r, 0),
-            (0, r),
-            (-r, 0),
-            (0, -r),
-            (r, r),
-            (-r, -r),
-            (r, -r),
-            (-r, r),
-        ] {
-            let (x, z) = (dx * 8, dz * 8);
-            let h = world.surface_y(x, z);
-            if h > sea {
-                return Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
-            }
-        }
-    }
-    let h = world.surface_y(0, 0).max(sea);
-    Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
-}
-
-fn spawn_player_diffusion(world: &World, sea: i32) -> Player {
-    // Same 8-direction spiral as classic, bounded to 8 rings. Each unique
-    // 16×16 chunk column is one `heights_16` sample (one field tile).
     let mut seen = [(i32::MAX, i32::MAX); 32];
     let mut n = 0usize;
     for r in 0i32..8 {
-        for (dx, dz) in [
-            (r, 0),
-            (0, r),
-            (-r, 0),
-            (0, -r),
-            (r, r),
-            (-r, -r),
-            (r, -r),
-            (-r, r),
-        ] {
-            let cx = (dx * 8).div_euclid(16);
-            let cz = (dz * 8).div_euclid(16);
+        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
+            let (cx, cz) = ((dx * 8).div_euclid(16), (dz * 8).div_euclid(16));
             if seen[..n].contains(&(cx, cz)) {
                 continue;
             }
             seen[n] = (cx, cz);
             n += 1;
             let heights = world.heights_16(cx, cz);
-            for lz in 0..16 {
-                for lx in 0..16 {
+            for lz in 1..15 {
+                for lx in 1..15 {
                     let h = heights[lx + lz * 16];
-                    if h > sea {
-                        let x = cx * 16 + lx as i32;
-                        let z = cz * 16 + lz as i32;
-                        return Player::new(DVec3::new(
-                            x as f64 + 0.5,
-                            h as f64 + 3.0,
-                            z as f64 + 0.5,
-                        ));
+                    let flat = (0..9).all(|k| {
+                        let (ox, oz) = (lx + k % 3 - 1, lz + k / 3 - 1);
+                        (heights[ox + oz * 16] - h).abs() <= 1
+                    });
+                    if flat {
+                        let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+                        return Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
                     }
                 }
             }
         }
     }
-    let h = world.surface_y(0, 0).max(sea);
+    let h = world.surface_y(0, 0);
     Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
 }
 
@@ -1040,7 +998,6 @@ fn spawn_player_diffusion(world: &World, sea: i32) -> Player {
 mod tests {
     use super::*;
     use crate::render_config::RenderConfig;
-    use crate::world::diffusion::DiffusionCfg;
     use crate::world::generation::WorldgenKind;
 
     #[test]
@@ -1057,39 +1014,13 @@ mod tests {
     #[test]
     fn spawn_player_probe_cost() {
         use std::hint::black_box;
-        let classic = World::with_kind_cfg(
-            1,
-            RenderConfig::default(),
-            WorldgenKind::Classic,
-            DiffusionCfg::default(),
-            false,
-        );
-        let _ = black_box(spawn_player(&classic));
+        let world = World::with_kind_cfg(1, RenderConfig::default(), WorldgenKind::Diffusion, TerrainCfg::default(), false);
+        let _ = black_box(spawn_player(&world));
         let t = Instant::now();
-        let _ = black_box(spawn_player(&classic));
-        let classic_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-        let diffusion = World::with_kind_cfg(
-            1,
-            RenderConfig::default(),
-            WorldgenKind::Diffusion,
-            DiffusionCfg::default(),
-            false,
-        );
-        let _ = black_box(spawn_player(&diffusion));
-        let t = Instant::now();
-        let _ = black_box(spawn_player(&diffusion));
-        let diffusion_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-        println!("spawn_player classic={classic_ms:.2}ms diffusion={diffusion_ms:.2}ms");
-        assert!(
-            classic_ms < 50.0,
-            "classic spawn probes should be a few ms, got {classic_ms:.2}"
-        );
-        assert!(
-            diffusion_ms < 250.0,
-            "diffusion spawn must stay under a frame, got {diffusion_ms:.2}"
-        );
+        let _ = black_box(spawn_player(&world));
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("spawn_player {ms:.2}ms");
+        assert!(ms < 250.0, "spawn must stay under a frame, got {ms:.2}");
     }
 
     #[test]

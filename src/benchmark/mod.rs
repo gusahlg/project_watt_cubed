@@ -11,6 +11,8 @@
 //!   the measured window (blocking engine capture; failure does not drop the report).
 //! - `WATT_BENCH_YAW=<rad/s>` steady-rotate rate (default 0.4; `0` = static camera).
 //! - `WATT_BENCH_MOVE=<m/s>` +X flight speed (default 0, static camera).
+//! - `WATT_BENCH_LOOK=<yaw°>,<pitch°>` initial camera orientation (with `WATT_BENCH_POS` the
+//!   player also flies, so a camera parked in the sky or a cave stays put).
 //! - `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, `WATT_BENCH_TAG`,
 //!   `WATT_BENCH_POS`, `WATT_BENCH_PRESET`, `WATT_BENCH_SEED`,
 //!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_PROFILE`,
@@ -66,7 +68,7 @@ enum Phase {
 /// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BenchModPins {
-    /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+    /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins the flat core world.
     pub worldgen_diffusion: Option<bool>,
     /// `Some(true)` strips visual mods (core look); `Some(false)` leaves them on.
     pub visuals_core: Option<bool>,
@@ -78,6 +80,8 @@ pub struct Benchmark {
     min_warmup: Duration,
     ready_timeout: Duration,
     pos: Option<DVec3>,
+    /// Initial camera (yaw, pitch) in radians.
+    look: Option<(f32, f32)>,
     /// Flight speed along +X during the run (`WATT_BENCH_MOVE`, m/s); zero
     /// keeps the classic static steady-rotate scenario.
     move_mps: f64,
@@ -144,6 +148,10 @@ impl Benchmark {
                 None
             })
         });
+        let look = std::env::var("WATT_BENCH_LOOK").ok().and_then(|raw| {
+            let (y, p) = raw.split_once(',')?;
+            Some((y.trim().parse::<f32>().ok()?.to_radians(), p.trim().parse::<f32>().ok()?.to_radians()))
+        });
         let move_mps = env_seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
         let yaw_rate = env_seconds("WATT_BENCH_YAW", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0);
         let screenshot = parse_screenshot(std::env::var_os("WATT_BENCH_SCREENSHOT"));
@@ -162,6 +170,7 @@ impl Benchmark {
             min_warmup: Duration::from_secs_f64(min_warmup),
             ready_timeout: Duration::from_secs_f64(ready_timeout),
             pos,
+            look,
             move_mps,
             yaw_rate,
             screenshot,
@@ -202,7 +211,7 @@ impl Benchmark {
                 Some(parsed) => Some(parsed),
                 None => {
                     eprintln!(
-                        "WATT_BENCH_WORLDGEN={value:?} not recognized; use classic|diffusion"
+                        "WATT_BENCH_WORLDGEN={value:?} not recognized; use flat|diffusion"
                     );
                     None
                 }
@@ -233,6 +242,11 @@ impl Benchmark {
 
     pub fn position(&self) -> Option<DVec3> {
         self.pos
+    }
+
+    /// Initial camera (yaw, pitch), radians.
+    pub fn look(&self) -> Option<(f32, f32)> {
+        self.look
     }
 
     /// Flight speed along +X (m/s); zero for the static scenario.
@@ -978,11 +992,11 @@ fn parse_screenshot(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-/// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins classic.
+/// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins the flat core world.
 fn parse_bench_worldgen(value: &str) -> Option<bool> {
     match value {
         "diffusion" => Some(true),
-        "classic" => Some(false),
+        "flat" | "classic" => Some(false),
         _ => None,
     }
 }
@@ -1090,6 +1104,7 @@ mod tests {
             min_warmup,
             ready_timeout,
             pos: None,
+            look: None,
             move_mps: 0.0,
             yaw_rate: DEFAULT_YAW_RATE_RAD_S,
             screenshot: None,
@@ -1221,7 +1236,7 @@ mod tests {
     #[test]
     fn bench_env_accepted_values() {
         assert_eq!(parse_bench_worldgen("diffusion"), Some(true));
-        assert_eq!(parse_bench_worldgen("classic"), Some(false));
+        assert_eq!(parse_bench_worldgen("flat"), Some(false));
         assert_eq!(parse_bench_worldgen("Diffusion"), None);
         assert_eq!(parse_bench_visuals("off"), Some(true));
         assert_eq!(parse_bench_visuals("core"), Some(true));

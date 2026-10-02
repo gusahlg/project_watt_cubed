@@ -740,7 +740,6 @@ mod tests {
         HotTables::from_parts(
             &[false, true, true, true],
             &[false, true, false, true], // id 1 stone, id 3 opaque emitter
-            &[false, false, false, false],
             vec![Pass::Opaque, Pass::Opaque, Pass::Blend, Pass::Opaque].into(),
             vec![0, 0, 15, 15].into(), // ids 2 and 3 emit 15
             vec![0, 0, 0, 0].into(),
@@ -789,23 +788,19 @@ mod tests {
     #[test]
     fn light_byte_pin() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::{Terrain, TerrainGenerator};
+        use crate::world::generation::TerrainGenerator;
+        use crate::world::terrain::Terrain;
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&mut registry, 20.0, 42);
+        let generator = Terrain::new(&mut registry, 42);
         // The pin is the blocklight field of a cell that actually emits — not
         // whatever the "lamp" label happens to intern (a rest-stable centre can
         // still observe as dark). Intern a configuration and assert emission.
         let lumin = {
             use material::Configuration;
             let mut found = None;
-            let centres: Vec<_> = registry.regions().iter().map(|r| r.centre).collect();
-            for centre in centres {
-                let id = registry.intern(&Configuration::single(centre)).unwrap();
-                if registry.emission(id) >= 8 {
-                    found = Some(id);
-                    break;
-                }
+            if let Some(lamp) = registry.id_by_label("lamp").filter(|&id| registry.emission(id) >= 8) {
+                found = Some(lamp);
             }
             if found.is_none() {
                 for n in 0u32..40_000 {
@@ -843,8 +838,9 @@ mod tests {
         };
 
         // Surface chunk at the origin column, real ceiling, dark neighbours.
-        let surface = Chunk::new(0, 1, 0, &generator);
-        let surface_hash = pin(&surface, &FaceShell::dark(), &ceiling_at(0, 0), CHUNK_SIZE as i32);
+        let cy = generator.height(8, 8).div_euclid(CHUNK_SIZE as i32);
+        let surface = Chunk::new(0, cy, 0, &generator);
+        let surface_hash = pin(&surface, &FaceShell::dark(), &ceiling_at(0, 0), cy * CHUNK_SIZE as i32);
 
         // Cave-band chunk, real ceiling (surface well above), dark neighbours.
         let cave = Chunk::new(0, -3, 0, &generator);
@@ -878,11 +874,14 @@ mod tests {
         let air_hash = pin(&air, &shell, &partial, 2 * CHUNK_SIZE as i32);
 
         let pins: [(&str, u32, u32); 4] = [
-            ("surface", surface_hash, 0xa8c2bd42),
-            ("cave", cave_hash, 0xbcc31dc5),
-            ("emissive", emissive_hash, 0x63b9ebf0),
+            ("surface", surface_hash, 0xf5c30be2),
+            ("cave", cave_hash, 0xb4ffde98),
+            ("emissive", emissive_hash, 0x40686e77),
             ("air", air_hash, 0x19839265),
         ];
+        for (name, got, _) in pins {
+            println!("light_byte_pin {name}=0x{got:08x}");
+        }
         for (name, got, want) in pins {
             assert_eq!(got, want, "{name}");
         }
@@ -927,10 +926,11 @@ mod tests {
     #[ignore]
     fn light_propagate_throughput() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::{Terrain, TerrainGenerator};
+        use crate::world::generation::TerrainGenerator;
+        use crate::world::terrain::Terrain;
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 5);
         // The surface chunk at the origin: the Dense band every load floods
         // (deep/sky chunks take the analytic fast paths and never get here).
         let cy = generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);

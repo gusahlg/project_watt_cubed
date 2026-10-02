@@ -364,7 +364,7 @@ pub(in crate::world) fn resample_cell<G: TerrainGenerator + ?Sized>(
 mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
-    use crate::world::generation::Terrain;
+    use crate::world::terrain::Terrain;
     use crate::world::section::Section;
 
     /// The extract-based reference `resample_cell` replaced: build the full
@@ -421,7 +421,7 @@ mod tests {
 
     fn terra(seed: i64) -> (BlockRegistry, Terrain) {
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 20.0, seed);
+        let terrain = Terrain::new(&mut registry, seed);
         (registry, terrain)
     }
 

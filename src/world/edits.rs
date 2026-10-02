@@ -8,8 +8,7 @@ use voxel_engine::Engine;
 use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
 use crate::render_config::RenderConfig;
-use crate::sim::reactions::{self, CellStore, MaterialEvent, Mutation, Pos, ReactionScheduler};
-use material::EventKind;
+use crate::sim::reactions::{self, CellStore, Mutation, Pos, ReactionScheduler};
 
 use super::chunk::Chunk;
 use super::{Coord, MeshState, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
@@ -464,38 +463,39 @@ impl World {
         self.edits.clone()
     }
 
-    /// Hand a gameplay event to the scheduler. No-op when this instance is not
-    /// the authority (a client connected to a server).
-    pub fn push_material_event(&mut self, at: (i32, i32, i32), kind: EventKind) {
+    /// Contact or material state changed at a cell (placed, removed, configuration changed): wake
+    /// its six contacts. No-op when this instance is not the authority (a client connected to a
+    /// server).
+    pub fn note_cell_changed(&mut self, x: i32, y: i32, z: i32) {
         if self.reactions_authority {
-            self.reactions.push(MaterialEvent { at, kind });
+            self.reactions.wake_cell((x, y, z));
         }
     }
 
-    /// Place rule: `NewContact` at the placed cell.
-    pub fn note_block_placed(&mut self, x: i32, y: i32, z: i32) {
+    /// A block moved: wake the contacts of both locations.
+    #[allow(dead_code)] // no gameplay moves blocks yet; machines and physics will
+    pub fn note_block_moved(&mut self, from: (i32, i32, i32), to: (i32, i32, i32)) {
         if self.reactions_authority {
-            reactions::on_placed(&mut self.reactions, (x, y, z));
+            self.reactions.wake_move(from, to);
         }
     }
 
-    /// Break rule: `ExternallyChanged` on the six neighbours of the broken cell.
-    pub fn note_block_broken(&mut self, x: i32, y: i32, z: i32) {
-        if self.reactions_authority {
-            reactions::on_broken(&mut self.reactions, (x, y, z));
-        }
-    }
-
-    /// One budgeted scheduler step. Empty when this instance is not the authority.
+    /// One budgeted scheduler turn. Empty when this instance is not the authority.
     pub fn tick_reactions(&mut self) -> Vec<Mutation> {
         if !self.reactions_authority {
             return Vec::new();
         }
-        let law = *self.registry.law();
         let mut sched = std::mem::take(&mut self.reactions);
-        let out = sched.tick(self, &law, reactions::Budget::DEFAULT);
+        let out = sched.tick(self, reactions::Budget::DEFAULT);
         self.reactions = sched;
         out
+    }
+
+    /// Resume saved reaction work (`(age, contact)` in processing order). Authority only.
+    pub fn restore_reactions(&mut self, pending: &[(u32, reactions::Contact)]) {
+        if self.reactions_authority {
+            self.reactions.restore(pending);
+        }
     }
 
     /// Single-player and the hosting server are the authority; a connected client is not.

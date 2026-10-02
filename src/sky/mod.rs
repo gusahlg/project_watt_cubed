@@ -83,15 +83,10 @@ impl Sky {
     /// Draw the procedural sky. Only sun geometry + disc tint cross here; the
     /// gradient/glow colours are read GPU-side from the shared per-frame UBO (the
     /// same linear source the terrain fog reads), so the sky and the fog
-    /// it blends into cannot diverge. Skipped when `last` already holds `desc`.
-    pub fn draw(&self, f: &mut Frame3D, frame: SkyFrame, last: &mut Option<SkyDesc>) {
-        let desc = self.desc(frame);
-        if last.as_ref() == Some(&desc) {
-            return;
-        }
-        *last = Some(desc);
-        f.set_sky(desc);
-        #[cfg(test)]
-        crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SetSky);
+    /// it blends into cannot diverge. The engine clears its draw lists every
+    /// frame, so the descriptor is pushed every frame (a 40-byte copy): skipping
+    /// an unchanged one left every frame after the first without a sky pass.
+    pub fn draw(&self, f: &mut Frame3D, frame: SkyFrame) {
+        f.set_sky(self.desc(frame));
     }
 }

@@ -17,6 +17,23 @@ const AVOID_DARK_LEVEL: f32 = 0.030;
 /// Tuned so terrain fades at the view horizon instead of cutting off abruptly.
 const FOG_BASE: f32 = 0.00023;
 
+/// Camera altitudes over which the atmosphere thins into space: the sky darkens, the stars come
+/// out by day and the haze clears, from just above the highest mountains to a little above the
+/// floor of the space realm (`crate::world::terrain::SPACE_FLOOR`).
+const SPACE_FADE: (f64, f64) = (500.0, 820.0);
+/// The sky overhead in space, and the atmosphere's limb below the horizon (where far ground fades).
+const SPACE_ZENITH: Rgb = Rgb::linear(0.0004, 0.0006, 0.0016);
+const SPACE_HORIZON: Rgb = Rgb::linear(0.0015, 0.003, 0.009);
+/// Turbidity in space: the sun's halo is atmospheric scatter, so it all but vanishes
+/// (the engine scales the halo by `0.5 + turbidity`).
+const SPACE_TURBIDITY: f32 = -0.46;
+
+/// How far into space a camera at `y` is: 0 in the atmosphere, 1 above it (smoothstep).
+pub fn space_factor(y: f64) -> f32 {
+    let t = ((y - SPACE_FADE.0) / (SPACE_FADE.1 - SPACE_FADE.0)).clamp(0.0, 1.0) as f32;
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Per-frame rendering state (linear colour, unclamped).
 pub struct FrameSnapshot {
     pub sun_dir: Vec3,
@@ -30,6 +47,8 @@ pub struct FrameSnapshot {
     pub ambient_floor: f32,
     pub fog_density: f32,
     pub turbidity: f32,
+    /// The least night factor the starfield renders at: 0 in the atmosphere, 1 in space.
+    pub star_floor: f32,
     /// Live autoexposure value from the render thread.
     pub exposure: Exposure,
     /// `JitterOffset::ZERO` until Phase E.
@@ -113,6 +132,14 @@ pub fn compose_at(
     // currently disabled by default, so fog is inert until that flag is turned on.
     let fog_density = FOG_BASE + fog_bonus;
 
+    // Above the atmosphere the sky goes black and starry and the haze thins. Only the sky lanes
+    // fade: the ambient above was taken from the atmosphere's zenith, and the GPU luma-matches
+    // its zenith tints, so planets stay lit by the sun and the near-sky bounce.
+    let space = space_factor(cam_world.y);
+    let zenith = zenith.lerp(SPACE_ZENITH, space);
+    let horizon = horizon.lerp(SPACE_HORIZON, space);
+    let fog_density = fog_density * (1.0 - 0.75 * space);
+
     // Wrap time in f64 before downcast to preserve f32 phase precision.
     let period = genconst::ANIM_PERIOD as f64;
     let anim_time = (clock.day() * sky.day_length.0).rem_euclid(period) as f32;
@@ -128,7 +155,8 @@ pub fn compose_at(
         candle: Rgb::linear(0.27475, 0.17392, 0.0899),
         ambient_floor,
         fog_density,
-        turbidity: atm.turbidity,
+        turbidity: atm.turbidity + (SPACE_TURBIDITY - atm.turbidity) * space,
+        star_floor: space,
         exposure,
         jitter: JitterOffset::ZERO,
         anim_time,
@@ -147,8 +175,8 @@ impl From<&FrameSnapshot> for FrameUniformsGpu {
             zenith: [s.zenith.r(), s.zenith.g(), s.zenith.b(), s.turbidity],
             horizon: [s.horizon.r(), s.horizon.g(), s.horizon.b(), s.fog_density],
             candle: [s.candle.r(), s.candle.g(), s.candle.b(), s.ambient_floor],
-            // .y is a reserved zero (post-effect dither removed); .zw carry TAA jitter.
-            exposure_dither: [s.exposure.0, 0.0, s.jitter.0.x, s.jitter.0.y],
+            // .y is the star floor (stars by day in space); .zw carry TAA jitter.
+            exposure_dither: [s.exposure.0, s.star_floor, s.jitter.0.x, s.jitter.0.y],
             // x = stars gain: always composed ON; the engine's RenderFlags::stars
             // gate (frame::gate_uniforms) zeroes it, like every other lane gate.
             extras: [1.0, 0.0, 0.0, 0.0],
@@ -169,8 +197,7 @@ mod tests {
     #[test]
     fn disabled_weather_removes_every_weather_derived_lane() {
         let mut sky = Sky::new();
-        let render =
-            RenderConfig { weather: false, clouds: false, water_anim: false, ..RenderConfig::default() };
+        let render = RenderConfig { weather: false, clouds: false, ..RenderConfig::default() };
         sky.weather.coverage = 1.0;
         sky.weather.precip = Precip::Rain;
         sky.weather.wetness = 1.0;
@@ -190,7 +217,7 @@ mod tests {
     #[test]
     fn composed_snapshot_keeps_world_anchoring_when_clouds_are_off() {
         let sky = Sky::new();
-        let render = RenderConfig { clouds: false, water_anim: false, ..RenderConfig::default() };
+        let render = RenderConfig { clouds: false, ..RenderConfig::default() };
         let snapshot =
             compose(&sky, DVec3::new(12_345.0, 80.0, -54_321.0), Exposure::DEFAULT, &render);
         assert_ne!(snapshot.anim_uv, [0.0; 2], "wrapped camera-XZ anchoring survives");

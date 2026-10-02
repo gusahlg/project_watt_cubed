@@ -65,6 +65,25 @@ impl ChunkData {
         }
         ChunkData::Paletted { palette, cells: out }
     }
+
+    /// The block at flat index `i` ([`Chunk::index`]).
+    #[cfg(test)]
+    pub fn get(&self, i: usize) -> BlockId {
+        match self {
+            ChunkData::Uniform(id) => *id,
+            ChunkData::Paletted { palette, cells } => palette[cells[i] as usize],
+            ChunkData::Dense(cells) => cells[i],
+        }
+    }
+
+    /// The block filling every cell, if the chunk is uniform.
+    #[cfg(test)]
+    pub fn uniform(&self) -> Option<BlockId> {
+        match self {
+            ChunkData::Uniform(id) => Some(*id),
+            _ => None,
+        }
+    }
 }
 
 /// Widen a construction-vocabulary [`ChunkData`] into the real storage
@@ -405,16 +424,19 @@ fn gc_palette(palette: &mut Box<[BlockState]>, cells: &mut Box<[u8]>) -> bool {
 mod tests {
     use super::*;
     use crate::block::registry::{AIR, BlockRegistry};
-    use crate::world::generation::Terrain;
+    use crate::world::generation::{FlatTerrain, FLAT_HEIGHT};
 
-    /// The generator plus the registry-resolved ids its terrain is made of.
-    fn hills(seed: i64) -> (Terrain, BlockId, BlockId) {
+    /// The flat generator (deep chunks are uniform rock, the surface chunk is mixed) plus the ids
+    /// its terrain is made of.
+    fn hills(seed: i64) -> (FlatTerrain, BlockId, BlockId) {
         let mut registry = BlockRegistry::with_builtins();
-        let g = Terrain::new(&mut registry, 20.0, seed);
-        let stone = g.mat.stone_strata[0];
+        let g = FlatTerrain::new(&mut registry, seed);
+        let stone = registry.id_by_label("rock").unwrap();
         let dirt = registry.id_by_label("soil").unwrap();
         (g, stone, dirt)
     }
+
+    const GROUND_CY: i32 = (FLAT_HEIGHT - 1) / 16;
 
     #[test]
     fn index_and_local_of_are_inverses() {
@@ -428,7 +450,7 @@ mod tests {
     #[test]
     fn get_set_roundtrip_on_mixed() {
         let (g, _, dirt) = hills(7);
-        let mut chunk = Chunk::new(0, 0, 0, &g); // ground chunk: mixed cells
+        let mut chunk = Chunk::new(0, GROUND_CY, 0, &g); // ground chunk: mixed cells
         assert!(chunk.uniform().is_none(), "surface chunks hold mixed cells");
         chunk.set_local(3, 4, 5, dirt);
         assert_eq!(chunk.get_local(3, 4, 5), dirt);
@@ -438,14 +460,9 @@ mod tests {
 
     #[test]
     fn uniform_promotes_to_paletted_on_first_differing_write() {
-        let (g, _, _) = hills(7);
-        // Deep rock — but caves can hollow deep chunks now, so scan along +z
-        // for one the generator still proves (or collapses) to uniform stone.
-        let mut chunk = (0..64)
-            .map(|cz| Chunk::new(0, -10, cz, &g))
-            .find(|c| c.uniform().is_some_and(|id| g.mat.stone_strata.contains(&id)))
-            .expect("a cave-free deep chunk within 64 along +z");
-        let stone = chunk.uniform().unwrap();
+        let (g, stone, _) = hills(7);
+        let mut chunk = Chunk::new(0, -10, 0, &g);
+        assert_eq!(chunk.uniform(), Some(stone), "deep flat ground is uniform rock");
 
         // Writing the same block keeps the cheap representation.
         chunk.set_local(0, 0, 0, stone);
@@ -465,12 +482,9 @@ mod tests {
 
     #[test]
     fn mixed_chunk_recompacts_to_uniform_when_edited_back() {
-        let (g, _, _) = hills(7);
-        let mut chunk = (0..64)
-            .map(|cz| Chunk::new(0, -10, cz, &g))
-            .find(|c| c.uniform().is_some_and(|id| g.mat.stone_strata.contains(&id)))
-            .expect("a cave-free deep chunk within 64 along +z");
-        let stone = chunk.uniform().unwrap();
+        let (g, stone, _) = hills(7);
+        let mut chunk = Chunk::new(0, -10, 0, &g);
+        assert_eq!(chunk.uniform(), Some(stone));
 
         // Dig a hole: promotes to paletted.
         chunk.set_local(8, 8, 8, AIR);

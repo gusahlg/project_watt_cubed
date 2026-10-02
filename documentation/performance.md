@@ -48,8 +48,8 @@ The independent performance controls are:
 - `stream_hz`: every frame, 15, 30, 60, 120, or 240 Hz. Forced refreshes still occur after teleports, net snap-backs, freecam changes, HUD/minimap activation, and settings changes.
 - `physics_hz`: every frame, 30, 60, 120, 240, 500, or 1000 Hz. Mouse look and camera effects remain render-rate responsive; edge-triggered flight/jump input is latched until a physics tick consumes it.
 - `sky_hz`: every frame, 15, 30, 60, 120, or 240 Hz. It throttles local day/night-clock advancement; `day_night=off` renders fixed noon while preserving the authoritative clock for networking and future re-enables.
-- `mod_hz`: every frame, 15, 30, 60, 120, or 240 Hz. It schedules enabled mod-hook batches without losing placement, inventory, crafting, or navigation edges between ticks; one permitted batch replays every queued edge-bearing frame in order, and a delayed placement keeps its exact edge-time raycast cell (`ModContext::place_target`).
-- `simulation`, `mod_logic`, and `autosave`: independently remove simulation ticks (the producer stays registered on the scheduler; `Scheduler::set_enabled` gates it), mod hooks, and periodic save serialization. Core movement, mining, and an explicit save on clean world exit remain available. Crafted-block placement requires `mod_logic`; inventory/crafting input additionally requires `mod_hud` and a visible master HUD, preventing hidden modal input.
+- `mod_hz`: every frame, 15, 30, 60, 120, or 240 Hz. It schedules enabled mod-hook batches without losing placement, inventory, hotbar, or navigation edges between ticks; one permitted batch replays every queued edge-bearing frame in order, and a delayed placement keeps its exact edge-time raycast cell (`ModContext::place_target`).
+- `simulation`, `mod_logic`, and `autosave`: independently remove simulation ticks (the producer stays registered on the scheduler; `Scheduler::set_enabled` gates it), mod hooks, and periodic save serialization. Core movement, mining, and an explicit save on clean world exit remain available. Placement from the hotbar requires `mod_logic`; inventory input additionally requires `mod_hud` and a visible master HUD, preventing hidden modal input.
 - `hud_mode`: Off, Minimal, or Full, plus independent `minimap`, `mod_hud`, `player_models`, and `name_tags` gates.
 
 All four rate lanes and the scheduler's `Cadence::Hz` producers run on ONE accumulator implementation, [`sched::RateGate`](../src/sched/mod.rs): a bounded bank (0.25 s cap — a pause replays a bounded burst, never an unbounded one) with `0` as the explicit every-frame mode.
@@ -68,14 +68,14 @@ All four rate lanes and the scheduler's `Cadence::Hz` producers run on ONE accum
 ### Game update and presentation
 
 - Physics, world streaming, sky-clock advancement, and mod dispatch have independent `RateGate` clocks; the fixed-tick simulation already runs at 20 Hz on the scheduler. Singleplayer returns from the net phase before any polling or profiling scope.
-- Input routing snapshots movement axes once and reuses them for movement and freecam (`MoveInput::freecam_axes`). Disabled mod logic skips placement probes at the router (`Router::frame_filtered`), disabled mod UI skips inventory/crafting/navigation probes, a disabled minimap skips its mode key, and an overlay is closed once when its HUD lane is hidden so an invisible modal cannot consume input.
+- Input routing snapshots movement axes once and reuses them for movement and freecam (`MoveInput::freecam_axes`). Disabled mod logic skips placement probes at the router (`Router::frame_filtered`), disabled mod UI skips inventory/hotbar/navigation probes, a disabled minimap skips its mode key, and an overlay is closed once when its HUD lane is hidden so an invisible modal cannot consume input.
 - HUD Off records nothing unless the console is open; Minimal does not draw closed console scrollback. Full-HUD coordinates are reformatted only when the rounded tenth changes; FPS is sampled at 4 Hz and reformatted only when its displayed integer changes; online text changes only with count or ping. All ride one keyed-memo primitive ([`derived::Memo`](../src/derived.rs)).
 - Camera orientation is cached by exact yaw/pitch/roll/FOV bit patterns (the f64 eye stays outside the key, so translation rebuilds nothing). Sun direction/elevation/daylight are sampled once per frame ([`SkyFrame`](../src/sky/clock.rs)) and cached by clock value; `day_night=off` uses cached fixed-noon lighting and performs no steady-frame trigonometry.
 - With weather, clouds, water animation, and auto exposure disabled, the composed lighting packet and clear colour are cached by clock value; wrapped camera-XZ animation coordinates are recomputed only when the eye XZ changes and patched into the cached packet. Minimum and Fast use this stripped path. The exposure read itself is skipped when the lane is off.
 - Disabling weather removes every weather-derived input before uniform composition: coverage, rain palette overrides, and fog bonus all become zero.
 - Peer draw records, the audio peer sample, and mod-placement buffers retain capacity across frames. Disabling models avoids animator/rig composition; disabling tags avoids projection, occlusion raycasts, text measurement, and name cloning — a fully hidden peer produces no record at all.
 - Idle collision axes return before building an AABB or querying the world; view-direction trig uses fused `sin_cos`.
-- The crafting mod mirrors held elements only when the shared stash revision changes and retains the mirror vector's capacity.
+- The inventory and hotbar HUDs rebuild only when the stash revision, the slots or the screen change (`Memo`), so a quiet frame formats nothing.
 
 ### World streaming and LOD
 
@@ -131,8 +131,9 @@ Set `WATT_BENCH_OUTPUT=benchmarks/results.jsonl` to append the JSON record. `WAT
 
 - `WATT_BENCH_MOVE`: +X flight speed in m/s (default 0, static camera).
 - `WATT_BENCH_YAW`: steady-rotate rate in rad/s (default 0.4; `0` holds the camera). Reported as `yaw_rate_rad_s`.
+- `WATT_BENCH_LOOK`: `<yaw°>,<pitch°>` initial camera orientation. With `WATT_BENCH_POS` the player also flies, so a camera parked in the sky, in space or in a mine corridor stays put (pair with `WATT_BENCH_YAW=0` for a fixed shot).
 - `WATT_BENCH_SCREENSHOT`: `.png` path. After the last measured sample, one extra frame presents and the harness writes that image through the same blocking capture as the golden shots (`taa` stays whatever the run configured; goldens use `taa=false`). Failure prints `benchmark: screenshot failed: …` and the JSON still emits with `"screenshot": <path or null>`.
-- `WATT_BENCH_WORLDGEN`: `classic` or `diffusion`; pins worldgen without persisting the mod menu.
+- `WATT_BENCH_WORLDGEN`: `flat` or `diffusion`; pins worldgen without persisting the mod menu.
 - `WATT_BENCH_VISUALS`: `off`/`core` strips Atmosphere/Post/Lighting (core look); `on`/`full` leaves them on.
 
 Use these scenarios:

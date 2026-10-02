@@ -919,10 +919,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "infinite-field"
-version = "0.1.0"
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1149,13 +1145,6 @@ dependencies = [
 [[package]]
 name = "material"
 version = "0.1.0"
-
-[[package]]
-name = "material-lab"
-version = "0.1.0"
-dependencies = [
- "material",
-]
 
 [[package]]
 name = "memchr"
@@ -1791,13 +1780,12 @@ dependencies = [
 
 [[package]]
 name = "project_watt_cubed"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "ash",
  "bytemuck",
  "cpal",
  "glam 0.32.1",
- "infinite-field",
  "kira",
  "material",
  "opus-rs",
@@ -2707,7 +2695,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxel_engine"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ash",
  "ash-window",

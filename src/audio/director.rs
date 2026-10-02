@@ -1,9 +1,8 @@
 //! Gameplay reports facts, the director decides sounds. It keeps just enough
-//! per-frame state (previous medium, previous speed, previous roster, ...) to
-//! derive cues like splash (medium changed), footsteps (speed crossed a
-//! threshold), underwater bed (current medium), and session join/leave (roster
-//! diff) without gameplay having to push explicit events for them. Only facts
-//! that can't be derived this way cross as events (`SoundEvent`).
+//! per-frame state (gait phase, previous roster, ...) to derive cues like
+//! footsteps (gait phase crossed a stride boundary) and session join/leave
+//! (roster diff) without gameplay having to push explicit events for them. Only
+//! facts that can't be derived this way cross as events (`SoundEvent`).
 //!
 //! Lives on App beside `SoundSystem`; App feeds it one `AudioCtx` per frame.
 
@@ -24,8 +23,8 @@ use super::content::OneShot;
 use super::frame::MAX_OCCURRENCES;
 use super::palette::{CuePalette, Sfx, UiSound};
 use super::{
-    AudioFrame, Emitter, EmitterId, Epoch, Fault, Listener, Medium, Occurrence, OccurrenceId, Seq,
-    SessionKey, SoundSystem, VoicePacket,
+    AudioFrame, Epoch, Fault, Listener, Occurrence, OccurrenceId, Seq, SessionKey, SoundSystem,
+    VoicePacket,
 };
 
 /// Occlusion uses `OCCL_K = 0.08`; past ~16 m gain is at most `e^{-1.3}`.
@@ -228,7 +227,6 @@ impl CaptureLane {
 /// worlds, while `SoundSystem::enter_world` resets its high-water to 0.
 pub struct AudioDirector {
     palette: CuePalette,
-    prev_medium: Option<Medium>,
     gait: Gait,
     peer_gait: HashMap<u32, f32>,
     voice_open: HashSet<u32>,
@@ -236,7 +234,7 @@ pub struct AudioDirector {
     capture: CaptureLane,
     next_occurrence: u64,
     /// Listener position of the last committed frame. `None` until the first
-    /// commit, which always runs so medium/gait start from a real pose.
+    /// commit, which always runs so the gait starts from a real pose.
     last_commit: Option<DVec3>,
 }
 
@@ -244,7 +242,6 @@ impl AudioDirector {
     pub fn new(palette: CuePalette) -> Self {
         Self {
             palette,
-            prev_medium: None,
             gait: Gait::new(),
             peer_gait: HashMap::new(),
             voice_open: HashSet::new(),
@@ -261,7 +258,6 @@ impl AudioDirector {
     /// process-monotone and deliberately survives (coupled with
     /// `SoundSystem::enter_world`, which resets its high-water to 0).
     pub fn enter_world(&mut self) {
-        self.prev_medium = None;
         self.gait = Gait::new();
         self.peer_gait.clear();
         self.voice_open.clear();
@@ -270,7 +266,7 @@ impl AudioDirector {
         self.last_commit = None;
     }
 
-    /// True when this frame would produce an empty journal and emitter table,
+    /// True when this frame would produce an empty journal,
     /// nothing is sounding, the listener has not moved, and no UI cue is waiting
     /// — Game can skip building a pose and submitting an [`AudioFrame`].
     pub fn can_skip_commit(
@@ -298,13 +294,7 @@ impl AudioDirector {
     /// Push one occurrence, bounded like `Game::emit` so `AudioFrame::new` never
     /// rejects the whole frame for overflow. Ids are minted in push order, so the
     /// journal is strictly increasing by construction.
-    fn push(
-        &mut self,
-        journal: &mut Vec<Occurrence>,
-        at: Option<DVec3>,
-        medium: Medium,
-        sfx: Sfx<OneShot>,
-    ) {
+    fn push(&mut self, journal: &mut Vec<Occurrence>, at: Option<DVec3>, sfx: Sfx<OneShot>) {
         if journal.len() >= MAX_OCCURRENCES {
             return;
         }
@@ -313,19 +303,16 @@ impl AudioDirector {
             id,
             cue: sfx.cue,
             at,
-            medium,
             gain: sfx.gain,
         });
     }
 
     pub fn frame(&mut self, mut ctx: AudioCtx<'_>, sound: &mut SoundSystem) {
         let dt = ctx.dt;
-        let medium = medium_at(ctx.world, ctx.player.pos);
         let listener = Listener {
             pos: ctx.player.pos,
             yaw: ctx.player.yaw,
             pitch: ctx.player.pitch,
-            medium,
         };
 
         let mut journal: Vec<Occurrence> = Vec::new();
@@ -338,18 +325,18 @@ impl AudioDirector {
                         .palette
                         .break_block(ctx.world.registry().sound_class(*block))
                     {
-                        self.push(&mut journal, Some(*at), medium_at(ctx.world, *at), sfx);
+                        self.push(&mut journal, Some(*at), sfx);
                     }
                 }
                 SoundEvent::BlockPlaced { at, block } => {
                     if let Some(sfx) = self.palette.place(ctx.world.registry().sound_class(*block))
                     {
-                        self.push(&mut journal, Some(*at), medium_at(ctx.world, *at), sfx);
+                        self.push(&mut journal, Some(*at), sfx);
                     }
                 }
                 SoundEvent::PeerSwing { at } => {
                     if let Some(sfx) = self.palette.swing() {
-                        self.push(&mut journal, Some(*at), medium_at(ctx.world, *at), sfx);
+                        self.push(&mut journal, Some(*at), sfx);
                     }
                 }
                 // UI is fire-and-forget outside the journal (the menus path).
@@ -367,12 +354,7 @@ impl AudioDirector {
         if self.gait.advance(speed, dt) && speed > 0.5 && ctx.player.on_ground {
             let feet = ctx.player.feet;
             if let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, feet)) {
-                self.push(
-                    &mut journal,
-                    Some(feet),
-                    medium_at(ctx.world, ctx.player.pos),
-                    sfx,
-                );
+                self.push(&mut journal, Some(feet), sfx);
             }
         }
 
@@ -387,51 +369,18 @@ impl AudioDirector {
                 && peer.speed > 0.5
                 && let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, peer.feet))
             {
-                self.push(
-                    &mut journal,
-                    Some(peer.feet),
-                    medium_at(ctx.world, peer.at),
-                    sfx,
-                );
+                self.push(&mut journal, Some(peer.feet), sfx);
             }
         }
         let peers = ctx.peers;
         self.peer_gait
             .retain(|id, _| peers.iter().any(|p| p.id == *id));
 
-        // --- Derived: splash on a listener medium transition (both directions) ---
-        if let Some(prev) = self.prev_medium
-            && matches!(prev, Medium::Liquid) != matches!(medium, Medium::Liquid)
-            && let Some(sfx) = self.palette.splash()
-        {
-            self.push(&mut journal, Some(ctx.player.pos), medium, sfx);
-        }
-        self.prev_medium = Some(medium);
-
-        // --- Derived: emitter table (latest-wins), one underwater bed iff submerged ---
-        let mut emitters: Vec<Emitter> = Vec::new();
-        if matches!(medium, Medium::Liquid)
-            && let Some(sfx) = self.palette.underwater_loop()
-        {
-            emitters.push(Emitter {
-                id: EmitterId(0),
-                cue: sfx.cue,
-                at: ctx.player.pos,
-                medium: Medium::Liquid,
-                gain: sfx.gain,
-            });
-        }
-
         // --- Voice sessions: present per visible peer, close on roster exit.
         // Consumes the one peer sample instead of resampling net. ---
         if ctx.net.is_some() {
             for peer in ctx.peers {
-                sound.set_session_present(
-                    SessionKey(peer.id),
-                    peer.visible,
-                    Some(peer.at),
-                    medium_at(ctx.world, peer.at),
-                );
+                sound.set_session_present(SessionKey(peer.id), peer.visible, Some(peer.at));
             }
             self.voice_open.retain(|&id| {
                 let present = peers.iter().any(|p| p.id == id);
@@ -442,11 +391,12 @@ impl AudioDirector {
             });
         }
 
-        let needed = sound.has_live_sources() || !journal.is_empty() || !emitters.is_empty();
+        let needed = sound.has_live_sources() || !journal.is_empty();
         let window = self.window.refresh(ctx.world, ctx.player.pos, dt, needed);
 
         // A rejected frame is a construction bug: debug-assert, never panic in release.
-        match AudioFrame::new(dt.clamp(1e-4, 0.5), listener, journal, emitters, window) {
+        // Gameplay derives no looping emitters, so the emitter table is empty.
+        match AudioFrame::new(dt.clamp(1e-4, 0.5), listener, journal, Vec::new(), window) {
             Ok(frame) => sound.submit(frame),
             Err(e) => debug_assert!(false, "audio frame rejected: {e:?}"),
         }
@@ -478,21 +428,6 @@ impl AudioDirector {
         }
 
         self.last_commit = Some(ctx.player.pos);
-    }
-}
-
-/// The listener's medium, read from the block occupying the eye cell (buoyant
-/// blocks are water for acoustics).
-fn medium_at(world: &World, pos: DVec3) -> Medium {
-    let id = world.block_at(
-        pos.x.floor() as i32,
-        pos.y.floor() as i32,
-        pos.z.floor() as i32,
-    );
-    if world.registry().buoyancy(id) > 0 {
-        Medium::Liquid
-    } else {
-        Medium::Air
     }
 }
 

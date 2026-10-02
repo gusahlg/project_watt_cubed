@@ -91,8 +91,9 @@ pub enum SaveError {
     BadName(&'static str),
     /// The document's law stamp is not this game's law — a different universe.
     LawMismatch,
-    /// The document's law cannot host the worldgen regions.
-    CannotHost { label: &'static str, why: String },
+    /// Written before the selective-transfer law (save versions 4-8): its materials have no
+    /// meaning under the current law.
+    Outdated(u16),
 }
 
 impl fmt::Display for SaveError {
@@ -106,9 +107,10 @@ impl fmt::Display for SaveError {
                 f,
                 "save belongs to a different universe (law stamp mismatch)"
             ),
-            SaveError::CannotHost { label, why } => {
-                write!(f, "law cannot host region {label}: {why}")
-            }
+            SaveError::Outdated(v) => write!(
+                f,
+                "save v{v} was made under the old material law; worlds from before selective transfer cannot be loaded"
+            ),
         }
     }
 }

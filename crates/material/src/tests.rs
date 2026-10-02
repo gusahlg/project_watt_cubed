@@ -1,281 +1,108 @@
+//! Crate-level checks: canonical multisets and their bytes, the law stamp, and observations.
+
 use crate::*;
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 32) as u32
-    }
-    fn element(&mut self) -> Element {
-        let mut c = [0u8; D];
-        for x in c.iter_mut() {
-            *x = self.next() as u8;
-        }
-        Element(c)
-    }
-    fn config(&mut self, max: usize) -> Configuration {
-        let n = 1 + (self.next() as usize % max);
-        Configuration::new((0..n).map(|_| self.element()).collect::<Vec<_>>()).unwrap()
-    }
+fn el(c: [u8; 4]) -> Element {
+    Element::new(c)
+}
+
+fn cfg(c: &[[u8; 4]]) -> Configuration {
+    Configuration::new(c.iter().map(|&c| el(c)).collect::<Vec<_>>()).unwrap()
 }
 
 #[test]
-fn encoding_round_trips_and_keeps_order_and_multiplicity() {
-    let a = Element([1, 2, 3, 4]);
-    let b = Element([9, 8, 7, 6]);
-    let ab = Configuration::new(vec![a, b]).unwrap();
-    let ba = Configuration::new(vec![b, a]).unwrap();
-    let aab = Configuration::new(vec![a, a, b]).unwrap();
-    assert_ne!(ab, ba);
-    assert_ne!(aab, ab);
-    for c in [&ab, &ba, &aab, &Configuration::void()] {
-        assert_eq!(&Configuration::decode(c.encode().as_bytes()).unwrap(), c);
-    }
+fn configurations_are_multisets_with_canonical_bytes() {
+    let a = cfg(&[[9, 9, 9, 9], [1, 2, 3, 4], [9, 9, 9, 9]]);
+    let b = cfg(&[[1, 2, 3, 4], [9, 9, 9, 9], [9, 9, 9, 9]]);
+    assert_eq!(a, b, "storage order is not meaning");
+    assert_eq!(a.encode(), b.encode());
+    assert_ne!(a, cfg(&[[1, 2, 3, 4], [9, 9, 9, 9]]), "multiplicity is meaning");
+    assert_eq!(Configuration::decode(a.encode().as_bytes()).unwrap(), a);
+    assert_eq!(a.counts().collect::<Vec<_>>(), vec![(el([1, 2, 3, 4]), 1), (el([9, 9, 9, 9]), 2)]);
+    // Unsorted bytes (an older save) decode to the same multiset.
+    assert_eq!(Configuration::decode(&[2, 9, 9, 9, 9, 1, 2, 3, 4]).unwrap(), cfg(&[[1, 2, 3, 4], [9, 9, 9, 9]]));
     assert_eq!(Configuration::decode(&[]), Err(DecodeError::Empty));
-    assert_eq!(Configuration::decode(&[2, 1, 2, 3, 4]), Err(DecodeError::Truncated));
-    assert_eq!(Configuration::decode(&[1, 1, 2, 3, 4, 5]), Err(DecodeError::Trailing));
-    assert_eq!(Configuration::decode(&[99]), Err(DecodeError::TooLarge(99)));
-    assert_eq!(Configuration::new(vec![a; CONFIG_MAX + 1]), Err(ConfigError::TooLarge(CONFIG_MAX + 1)));
+    assert_eq!(Configuration::decode(&[33]), Err(DecodeError::TooLarge(33)));
+    assert_eq!(Configuration::decode(&[1, 1, 2]), Err(DecodeError::Truncated));
+    assert_eq!(Configuration::decode(&[0, 1]), Err(DecodeError::Trailing));
+    assert!(Configuration::new(vec![el([0; 4]); CAPACITY]).is_ok());
+    assert_eq!(Configuration::new(vec![el([0; 4]); CAPACITY + 1]), Err(ConfigError::TooLarge(33)));
 }
 
 #[test]
-fn law_stamp_round_trips_and_fingerprint_is_stable() {
-    let law = Law::v0();
-    law.validate().unwrap();
+fn block_of_a_configuration_round_trips() {
+    let c = cfg(&[[200, 1, 2, 3], [4, 5, 6, 7], [4, 5, 6, 7]]);
+    let b = Block::of(&c);
+    assert_eq!(b.configuration(), c);
+    assert_eq!(b.internal_fit() * 2, b.holding().iter().map(|&h| h as i64).sum::<i64>());
+}
+
+#[test]
+fn law_stamp_round_trips_and_refuses_other_functions() {
+    let law = Law::current();
     let stamp = law.stamp();
-    assert_eq!(stamp.len(), law::STAMP_LEN);
-    assert_eq!(Law::from_stamp(&stamp).unwrap(), law);
-    assert_eq!(law.fingerprint(), Law::v0().fingerprint());
-    let mut other = law;
-    other.kernel.max_step = 7;
-    assert_ne!(other.fingerprint(), law.fingerprint());
-    assert_eq!(Law::from_stamp(&stamp[..10]), Err(LawError::Length(10)));
+    assert_eq!(stamp.len(), STAMP_LEN);
+    assert_eq!(Law::from_stamp(&stamp), Ok(law));
+    let mut bad = stamp.clone();
+    bad[3] ^= 1;
+    assert_eq!(Law::from_stamp(&bad), Err(LawError::Function), "a different fit table");
+    let mut v1 = stamp.clone();
+    v1[0] = 1;
+    assert_eq!(Law::from_stamp(&v1), Err(LawError::Version(1)));
+    assert_eq!(Law::from_stamp(&stamp[1..]), Err(LawError::Length(STAMP_LEN - 1)));
+    assert_ne!(law.fingerprint(), 0);
 }
 
 #[test]
-fn deltas_respect_the_boundary_rule() {
-    assert_eq!(kernel::axis_delta(Boundary::Clamp, 250, 5), 245);
-    assert_eq!(kernel::axis_delta(Boundary::Wrap, 250, 5), -11);
-    assert_eq!(kernel::axis_delta(Boundary::Wrap, 5, 250), 11);
-    assert_eq!(kernel::axis_delta(Boundary::Wrap, 100, 40), 60);
+fn observations_read_the_fit_function() {
+    let law = Law::current();
+    assert_eq!(observe(&law, &Block::default()), Observation::AIR);
+    // The cohesive configuration of the reference suite holds together: hard.
+    let a = Block::of(&cfg(&crate::kernel::tests::A));
+    let o = observe(&law, &a);
+    assert!(o.solid && o.cohesion > 0 && o.hardness >= 170, "{o:?}");
+    // A repulsive mixture reads as weakly held.
+    let r = Block::of(&cfg(&[[0; 4], [128; 4]]));
+    let o = observe(&law, &r);
+    assert!(o.cohesion < 0 && o.hardness < 96, "{o:?}");
+    // Identical occurrences have zero pair fit.
+    assert_eq!(cohesion(&Block::of(&cfg(&[[7; 4]; 5]))), 0);
 }
 
 #[test]
-fn response_curve_is_odd_continuous_and_zero_at_rest() {
-    let k = Law::v0().kernel;
-    assert_eq!(kernel::response(&k, 0), 0);
-    for d in -255..=255 {
-        assert_eq!(kernel::response(&k, d), -kernel::response(&k, -d));
-        if d < 255 {
-            assert!((kernel::response(&k, d) - kernel::response(&k, d + 1)).abs() <= 5, "slope at {d}");
-        }
+fn observation_census_over_random_configurations() {
+    // Clarity and glow are rare properties; most matter is opaque and dark.
+    let law = Law::current();
+    let mut x: u64 = 0x1234_5678_9abc_def1;
+    let mut byte = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 32) as u8
+    };
+    let (mut clear, mut glow, n) = (0, 0, 4000);
+    for i in 0..n {
+        let len = 2 + i % 7;
+        let elems: Vec<Element> = (0..len).map(|_| el([byte(), byte(), byte(), byte()])).collect();
+        let o = observe(&law, &Block::new(&elems).unwrap());
+        clear += (o.transparency > 0) as u32;
+        glow += (o.emission > 0) as u32;
     }
-    assert_eq!(kernel::response(&k, 5), 0, "dead zone: near-identical matter does not react");
-    assert!(kernel::response(&k, 16) < 0, "repulsive just outside the dead zone");
-    assert!(kernel::response(&k, 40) > 0, "attractive at middle range");
-    assert_eq!(kernel::response(&k, 24), 0, "the rest band: no force at the bond length");
-    assert_eq!(kernel::response(&k, 100), 0, "inert when very different");
-    assert_eq!(kernel::response(&k, 255), 0);
+    assert!(clear * 100 < n * 15 && clear > 0, "clear {clear}/{n}");
+    assert!(glow * 100 < n * 15 && glow > 0, "glow {glow}/{n}");
 }
 
 #[test]
-fn similarity_invariant_holds_statistically() {
-    // ‖a − a'‖₁ = 1 ⇒ ‖F(a,b) − F(a',b)‖∞ ≤ K for the v0 law (K measured, pinned here).
-    let law = Law::v0();
-    let mut rng = Rng(0x1234_5678_9abc_def1);
-    let mut worst = 0i32;
-    for _ in 0..20_000 {
-        let a = rng.element();
-        let b = rng.element();
-        let axis = (rng.next() as usize) % D;
-        if a.0[axis] == 255 {
-            continue; // 255 → 0 is not a one-unit step under the Clamp boundary
-        }
-        let mut a2 = a;
-        a2.0[axis] += 1;
-        let f1 = element_influence(&law, a, b).0;
-        let f2 = element_influence(&law, a2, b).0;
-        for i in 0..D {
-            worst = worst.max((f1[i] as i32 - f2[i] as i32).abs());
-        }
-    }
-    assert!(worst <= 6, "one lattice step changed an influence by {worst} (pinned bound for law v0)");
-}
-
-#[test]
-fn interact_is_deterministic_bounded_and_void_safe() {
-    let law = Law::v0();
-    let mut rng = Rng(7);
-    for _ in 0..5_000 {
-        let a = rng.config(6);
-        let b = rng.config(6);
-        let r1 = interact(&law, &a, &b, EventKind::Collision);
-        let r2 = interact(&law, &a, &b, EventKind::Collision);
-        assert_eq!(r1, r2);
-        assert_eq!(r1.target.len(), b.len());
-        for (x, y) in r1.target.elements().iter().zip(b.elements()) {
-            assert!(x.max_axis_distance(*y) <= law.kernel.max_step as u32);
-        }
-        assert_eq!(r1.changed, r1.magnitude > 0);
-        assert_eq!(r1.changed, r1.target != b);
-    }
-    let void = Configuration::void();
-    let c = rng.config(4);
-    assert!(!interact(&law, &void, &c, EventKind::Collision).changed);
-    assert!(interact(&law, &c, &void, EventKind::Collision).target.is_void());
-    // Weaker events move less.
-    let a = rng.config(5);
-    let b = rng.config(5);
-    let strong = interact(&law, &a, &b, EventKind::Collision).magnitude;
-    let weak = interact(&law, &a, &b, EventKind::ExternallyChanged).magnitude;
-    assert!(weak <= strong);
-}
-
-#[test]
-fn identical_elements_are_fixed_points_under_self_contact() {
-    // δ = 0 on every axis ⇒ no influence: a uniform configuration never changes by touching itself.
-    let law = Law::v0();
-    let mut rng = Rng(99);
-    for _ in 0..500 {
-        let e = rng.element();
-        let c = Configuration::new(vec![e; 1 + rng.next() as usize % 4]).unwrap();
-        assert!(!interact(&law, &c, &c, EventKind::Collision).changed);
-    }
-}
-
-#[test]
-fn observations_are_bounded_and_air_is_air() {
-    let law = Law::v0();
-    assert_eq!(observe(&law, &Configuration::void()), Observation::AIR);
-    let mut rng = Rng(3);
-    let mut liquids = 0;
-    let mut glows = 0;
-    for _ in 0..5_000 {
-        let c = rng.config(5);
-        let o = observe(&law, &c);
-        assert_eq!(o.solid, !o.liquid);
-        assert!(o.emission <= 15);
-        assert_ne!(o.acoustic, Acoustic::Void);
-        liquids += o.liquid as u32;
-        glows += (o.emission > 0) as u32;
-    }
-    // The universe has liquids and lights, but is mostly solid and dark.
-    assert!(liquids > 50 && liquids < 1_500, "liquids: {liquids} of 5000");
-    assert!(glows > 25 && glows < 1_000, "glows: {glows} of 5000");
-}
-
-#[test]
-fn observe_element_matches_observe_of_a_single() {
-    let law = Law::v0();
-    let mut rng = Rng(0x0b5e_e1e0);
-    for _ in 0..2_000 {
-        let e = rng.element();
-        let boxed = observe(&law, &Configuration::single(e));
-        assert_eq!(observe_element(&law, e), boxed);
-        let p = &law.probes;
-        assert_eq!(
-            Observation::from_responses(
-                &law,
-                element_response(&law, e, p.contact),
-                element_response(&law, e, p.light),
-                element_response(&law, e, p.flow),
-                element_response(&law, e, p.glow),
-                element_response(&law, e, p.friction),
-            ),
-            boxed
-        );
-    }
-}
-
-#[test]
-fn element_changes_matches_interact_on_singles() {
-    let law = Law::v0();
-    let mut rng = Rng(0x51e1);
-    for _ in 0..2_000 {
-        let a = rng.element();
-        let b = rng.element();
-        let kind = EventKind::ALL[(rng.next() as usize) % EventKind::ALL.len()];
-        let boxed = interact(
-            &law,
-            &Configuration::single(a),
-            &Configuration::single(b),
-            kind,
-        )
-        .changed;
-        assert_eq!(element_changes(&law, a, b, kind), boxed);
-    }
-}
-
-#[test]
-fn visuals_are_local_and_quantization_round_trips() {
-    let law = Law::v0();
-    let mut rng = Rng(11);
-    let mut worst = 0u32;
-    for _ in 0..3_000 {
-        let e = rng.element();
-        let mut e2 = e;
-        let axis = (rng.next() as usize) % D;
-        e2.0[axis] = e2.0[axis].saturating_add(1);
-        let v1 = visual(&law, &Configuration::single(e));
-        let v2 = visual(&law, &Configuration::single(e2));
-        let d: u32 = (0..3).map(|i| (v1.rgb[i] as i32 - v2.rgb[i] as i32).unsigned_abs()).sum();
-        worst = worst.max(d);
-        let k = v1.quantize();
-        let back = Visual::dequantize(k);
-        assert!((back.rgb[0] as i32 - v1.rgb[0] as i32).abs() <= 16);
-        assert_eq!(back.quantize(), k, "dequantize is a fixed point of quantize");
-    }
-    assert!(worst <= 32, "one lattice step moved the colour by {worst} (of 765; pinned bound for law v0)");
-    let void = visual(&law, &Configuration::void());
-    assert_eq!(void.alpha, 0);
-}
-
-#[test]
-fn spread_and_mean_behave() {
-    let a = Element([0, 0, 0, 0]);
-    let b = Element([255, 255, 255, 255]);
-    let c = Configuration::new(vec![a, b]).unwrap();
-    assert_eq!(c.mean_q8().unwrap(), [255 * 128; D]);
-    assert!(c.spread_q8() > 0);
-    assert_eq!(Configuration::single(a).spread_q8(), 0);
-    assert_eq!(Configuration::void().mean_q8(), None);
-}
-
-#[test]
-#[ignore]
-fn print_probe_quantiles() {
-    // Calibration aid for the law's thresholds: run with --ignored --nocapture.
-    let law = Law::v0();
-    let mut rng = Rng(5);
-    let names = ["contact", "light", "flow", "glow", "friction"];
-    let probes = [law.probes.contact, law.probes.light, law.probes.flow, law.probes.glow, law.probes.friction];
-    for (name, p) in names.iter().zip(probes) {
-        let mut v: Vec<u8> = (0..20_000).map(|_| observe::response(&law, &rng.config(5), p)).collect();
-        v.sort_unstable();
-        let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
-        println!("{name:9} p05={} p25={} p50={} p75={} p85={} p92={} p98={} max={}", q(0.05), q(0.25), q(0.5), q(0.75), q(0.85), q(0.92), q(0.98), v[v.len() - 1]);
-    }
-}
-
-#[test]
-fn interact_many_is_order_independent_and_matches_single_origin() {
-    let law = Law::v0();
-    let mut rng = Rng(21);
-    for _ in 0..2_000 {
-        let a = rng.config(4);
-        let b = rng.config(4);
-        let t = rng.config(4);
-        let ab = interact_many(&law, &[(&a, EventKind::Collision), (&b, EventKind::Moved)], &t);
-        let ba = interact_many(&law, &[(&b, EventKind::Moved), (&a, EventKind::Collision)], &t);
-        assert_eq!(ab, ba);
-        assert_eq!(interact_many(&law, &[(&a, EventKind::Moved)], &t), interact(&law, &a, &t, EventKind::Moved));
-        for (x, y) in ab.target.elements().iter().zip(t.elements()) {
-            assert!(x.max_axis_distance(*y) <= law.kernel.max_step as u32);
-        }
-    }
-    let t = rng.config(3);
-    assert!(!interact_many(&law, &[], &t).changed);
-    assert!(!interact_many(&law, &[(&Configuration::void(), EventKind::Collision)], &t).changed);
+fn visual_takes_the_centroid_colour() {
+    let law = Law::current();
+    let x = el([10, 20, 30, 40]);
+    let pure = visual(&law, &Block::of(&Configuration::single(x)));
+    assert_eq!(pure.rgb, element_colour(&law, x));
+    // The centroid wraps the short way round the ring: 250 and 10 average to 2, not 130.
+    let c = centroid_q8(&[el([250, 0, 0, 0]), el([10, 0, 0, 0])]).unwrap();
+    assert_eq!(c[0], 2 * 256);
+    let y = el([14, 24, 34, 44]);
+    let mixed = visual(&law, &Block::of(&cfg(&[x.0, y.0])));
+    assert_eq!(mixed.rgb, colour_at(&law, [12 * 256, 22 * 256, 32 * 256, 42 * 256]));
+    assert_eq!(visual(&law, &Block::default()), Visual::VOID);
 }

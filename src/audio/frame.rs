@@ -10,7 +10,7 @@ use voxel_engine::DVec3;
 use super::acoustics::AcousticWindow;
 use super::content::{CueId, Loop, OneShot};
 
-pub use super::acoustics::{Listener, Medium};
+pub use super::acoustics::Listener;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct OccurrenceId(pub u64); // monotone per world session; minted by Game
@@ -23,8 +23,7 @@ pub struct Occurrence {
     pub cue: CueId<OneShot>, // one-shot by type: max_duration is finite, so the
     // journal release guard can never leak a never-ending voice
     pub at: Option<DVec3>, // None = non-spatial (UI)
-    pub medium: Medium,
-    pub gain: f32, // authored scale, finite, [0, 4]
+    pub gain: f32,         // authored scale, finite, [0, 4]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +31,6 @@ pub struct Emitter {
     pub id: EmitterId,
     pub cue: CueId<Loop>, // Loop-capable by type, not a submit-time check
     pub at: DVec3,
-    pub medium: Medium,
     pub gain: f32,
 }
 
@@ -180,7 +178,7 @@ mod tests {
     use glam::UVec3;
     use voxel_engine::IVec3;
 
-    use super::super::acoustics::{Cell, Listener, Medium};
+    use super::super::acoustics::{Cell, Listener};
     use super::*;
 
     fn window() -> Option<Arc<AcousticWindow>> {
@@ -195,7 +193,6 @@ mod tests {
             pos: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
-            medium: Medium::Air,
         }
     }
 
@@ -204,7 +201,6 @@ mod tests {
             id: OccurrenceId(id),
             cue: CueId::TEST,
             at: None,
-            medium: Medium::Air,
             gain,
         }
     }
@@ -214,7 +210,6 @@ mod tests {
             id: EmitterId(id),
             cue: CueId::TEST,
             at: DVec3::ZERO,
-            medium: Medium::Air,
             gain,
         }
     }
@@ -240,7 +235,6 @@ mod tests {
             id: OccurrenceId(1),
             cue: CueId::TEST,
             at: Some(DVec3::new(f64::NAN, 0.0, 0.0)),
-            medium: Medium::Air,
             gain: 1.0,
         };
         let f = AudioFrame::new(0.016, listener(), vec![bad], vec![], window());

@@ -52,7 +52,7 @@ Two dependencies must be corrected before extraction:
   output system consuming the snapshot.
 - [`audio/palette.rs`](../src/audio/palette.rs) imports block `SoundClass`.
   That enum is a presentation of `Observation` (`SoundClass::of` in
-  [`block/registry.rs`](../src/block/registry.rs)): hardness, liquid, and
+  [`block/registry.rs`](../src/block/registry.rs)): hardness and
   transparency — not authored per-element stats. Either keep the class next
   to observations in content, or hand audio an audio-neutral material key.
 

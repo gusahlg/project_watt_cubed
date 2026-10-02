@@ -42,11 +42,6 @@ pub fn smooth_between(edge0: f32, edge1: f32, x: f32) -> f32 {
     smooth(t)
 }
 
-/// Linear interpolate `a` toward `b` by `t`.
-#[inline]
-pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
 
 /// `f64` world coordinate → block: clamp to ±([`WORLD_BORDER`] + [`BLOCK_COORD_SLACK`]),
 /// then floor. Downstream i32 math (chunk scale, ±1 neighbours, squared diffs)

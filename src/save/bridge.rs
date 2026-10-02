@@ -9,11 +9,11 @@ use crate::coord::{BlockCoord, ChunkCoord, Local};
 use crate::mods::Mods;
 use crate::player::Player;
 use crate::world::chunk::Chunk;
-use crate::world::diffusion::DiffusionCfg;
+use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
 use crate::world::{FastMap, World};
 
-use super::format::{self, Edit, PlayerState, SaveDoc, WorldgenStamp};
+use super::format::{self, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
 use super::slot::{SaveError, SaveMeta, SlotId};
 use super::store::{self, Source};
 
@@ -43,6 +43,7 @@ pub struct SaveSnapshot {
     worldgen: WorldgenStamp,
     law_stamp: Vec<u8>,
     specs: Vec<String>,
+    pending: Vec<PendingContact>,
 }
 
 impl SaveSnapshot {
@@ -67,10 +68,16 @@ impl SaveSnapshot {
             },
             mods: mods.save_states(world),
             meta,
-            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: stamp_from_world(world),
             law_stamp: world.registry().law().stamp(),
             specs,
+            pending: world
+                .reactions()
+                .snapshot()
+                .into_iter()
+                .map(|(age, c)| PendingContact { x: c.lo.0, y: c.lo.1, z: c.lo.2, axis: c.axis, age })
+                .collect(),
         }
     }
 
@@ -83,10 +90,11 @@ impl SaveSnapshot {
             player,
             mods: Vec::new(),
             meta,
-            worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
-            law_stamp: material::Law::v0().stamp(),
+            law_stamp: material::Law::current().stamp(),
             specs: vec!["air".into()],
+            pending: Vec::new(),
         }
     }
 
@@ -144,6 +152,7 @@ impl SaveSnapshot {
             specs,
             edits,
             mods: self.mods.clone(),
+            pending: self.pending.clone(),
         })
     }
 
@@ -171,14 +180,7 @@ pub fn snapshot(world: &World, player: &Player, mods: &Mods, meta: SaveMeta) -> 
 }
 
 fn stamp_from_world(world: &World) -> WorldgenStamp {
-    let cfg = world.diffusion_cfg();
-    WorldgenStamp {
-        kind: world.worldgen().wire(),
-        tile: cfg.tile,
-        stride: cfg.stride,
-        phases: cfg.phases,
-        relief: cfg.relief,
-    }
+    WorldgenStamp { kind: world.worldgen().wire(), knobs: world.terrain_cfg().to_wire() }
 }
 
 fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> UnknownMaterials {
@@ -247,54 +249,30 @@ pub(crate) fn unknown_material_notice(u: UnknownMaterials) -> Option<String> {
 }
 
 /// Pre-v8 documents carry no law stamp; the load assumes law v0.
-pub(crate) fn v7_law_notice(law_stamp: &[u8]) -> Option<String> {
-    if law_stamp.is_empty() {
-        Some("save predates the law stamp (v7); assuming law v0".into())
-    } else {
-        None
-    }
-}
-
-fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, DiffusionCfg) {
-    let kind = WorldgenKind::from_wire(stamp.kind).unwrap_or(WorldgenKind::Classic);
-    let cfg = DiffusionCfg {
-        tile: stamp.tile,
-        stride: stamp.stride,
-        phases: stamp.phases,
-        relief: stamp.relief,
-        version: 1,
-    }
-    .clamp();
-    (kind, cfg)
+fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, TerrainCfg) {
+    let kind = WorldgenKind::from_wire(stamp.kind).unwrap_or_default();
+    (kind, TerrainCfg::from_wire(stamp.knobs))
 }
 
 /// Rebuild a ready-to-play world and player from a doc, restoring mod state
-/// into `mods`. Unknown specs degrade to air. A law stamp that does not match
-/// this game's law is a different universe and is refused — region search
-/// errors become [`SaveError::CannotHost`], never a panic.
+/// into `mods` and the pending reaction work into the world's scheduler.
+/// Unknown specs degrade to air. A law stamp that does not match this game's
+/// law is a different universe and is refused, never a panic.
 pub fn from_doc(
     doc: SaveDoc,
     mods: &mut Mods,
-    make_world: impl FnOnce(i64, WorldgenKind, DiffusionCfg) -> World,
+    make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
 ) -> Result<(World, Player, SaveMeta), SaveError> {
-    if !doc.law_stamp.is_empty() && doc.law_stamp != material::Law::v0().stamp() {
-        if let Ok(law) = material::Law::from_stamp(&doc.law_stamp) {
-            if let Err(e) = crate::block::regions::builtin(&law) {
-                return Err(SaveError::CannotHost { label: e.label, why: e.why });
-            }
-        }
+    if doc.law_stamp != material::Law::current().stamp() {
         return Err(SaveError::LawMismatch);
     }
-    if let Some(msg) = v7_law_notice(&doc.law_stamp) {
-        eprintln!("{msg}");
-    }
-    if doc.worldgen_version != crate::world::placement::WORLDGEN_VERSION {
+    if doc.worldgen_version != crate::world::terrain::WORLDGEN_VERSION {
         eprintln!(
             "save '{}' was written by worldgen v{} (current v{}): terrain materials \
              may differ under old edits",
             doc.meta.name,
             doc.worldgen_version,
-            crate::world::placement::WORLDGEN_VERSION,
+            crate::world::terrain::WORLDGEN_VERSION,
         );
     }
     let (kind, cfg) = kind_cfg_from_stamp(doc.worldgen);
@@ -341,6 +319,12 @@ pub fn from_doc(
     for (name, data) in &doc.mods {
         unknown.legacy_holdings += mods.load_state(name, data, &mut world);
     }
+    let pending: Vec<(u32, crate::sim::reactions::Contact)> = doc
+        .pending
+        .iter()
+        .map(|c| (c.age, crate::sim::reactions::Contact { lo: (c.x, c.y, c.z), axis: c.axis }))
+        .collect();
+    world.restore_reactions(&pending);
     if let Some(msg) = unknown_material_notice(unknown) {
         eprintln!("{msg}");
     }
@@ -380,7 +364,7 @@ pub fn save(
 pub fn load(
     id: &SlotId,
     mods: &mut Mods,
-    make_world: impl FnOnce(i64, WorldgenKind, DiffusionCfg) -> World,
+    make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
 ) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
     let (decoded, source) = store::read(id)?;
     let (doc, salvage) = match decoded {

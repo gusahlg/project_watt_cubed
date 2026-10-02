@@ -97,7 +97,7 @@ impl VisualGroup {
 /// Which visual-mod group owns a settings/`/gfx` lane key, if any.
 pub fn lane_group(key: &str) -> Option<VisualGroup> {
     match key {
-        "clouds" | "weather" | "stars" | "day_night" | "fog" | "sky" | "water_anim" => {
+        "clouds" | "weather" | "stars" | "day_night" | "fog" | "sky" => {
             Some(VisualGroup::Atmosphere)
         }
         "bloom" | "godrays" | "taa" | "exposure" | "vignette" | "vrs" => Some(VisualGroup::Post),
@@ -123,7 +123,9 @@ pub struct RenderConfig {
     pub exposure: bool,
     /// HDR bloom effect.
     pub bloom: bool,
-    /// Volumetric clouds (per-frame lookup, no engine gate).
+    /// Volumetric clouds (per-frame lookup). Also drives the engine's
+    /// animation-clock gate (`RenderFlags::water_anim`): off freezes the
+    /// cloud-drift time so the sky LUT key holds still while clouds are hidden.
     pub clouds: bool,
     /// Weather coverage (per-frame lookup, no engine gate).
     pub weather: bool,
@@ -148,9 +150,6 @@ pub struct RenderConfig {
     /// Variable-rate shading (`RenderFlags::vrs`): the resolved engine flag
     /// from [`vrs_effective`]. Off shades full-rate everywhere.
     pub vrs: bool,
-    /// Water surface animation (`RenderFlags::water_anim`). Off freezes the
-    /// phase — water renders, but still.
-    pub water_anim: bool,
     pub vignette: bool,
 }
 
@@ -178,7 +177,6 @@ impl Default for RenderConfig {
             shadows: true,
             sky: true,
             vrs: false,
-            water_anim: true,
             vignette: false,
         }
     }
@@ -216,7 +214,6 @@ impl RenderConfig {
                 self.day_night = false;
                 self.fog = false;
                 self.sky = false;
-                self.water_anim = false;
             }
             VisualGroup::Post => {
                 self.bloom = false;
@@ -257,7 +254,11 @@ impl RenderConfig {
             shadows: self.shadows,
             sky: self.sky,
             vrs: self.vrs,
-            water_anim: self.water_anim,
+            // The engine's `water_anim` gate zeroes the shared animation clock
+            // (`anim.x`), which only cloud drift reads now that there is no
+            // water. Tie it to the clouds lane: clouds on animate, clouds off
+            // freeze the clock (and the sky LUT key) exactly as before.
+            water_anim: self.clouds,
             vignette: self.vignette,
             stars: self.stars,
         }
@@ -587,7 +588,6 @@ mod tests {
         assert_eq!(core.lod2, expected.lod2);
         assert_eq!(core.normalized_lod(), expected.normalized_lod());
         assert_eq!(core.vrs, expected.vrs);
-        assert_eq!(core.water_anim, expected.water_anim);
         assert_eq!(core.blocklight, expected.blocklight);
     }
 

@@ -354,7 +354,7 @@ fn person_pose(view: PersonView, player: &Player, world: &World, base_fov: f32) 
     }
 }
 
-/// Liquids passable so the camera doesn't snap into water.
+/// Pull the third-person boom in to the first solid block along `dir`.
 fn boom_clamp(world: &World, eye: DVec3, dir: DVec3, max: f64) -> f64 {
     let Some(hit) = interact::raycast(world, eye, dir, max) else {
         return max;

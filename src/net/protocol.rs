@@ -19,43 +19,27 @@ use voxel_engine::DVec3;
 
 use crate::ident::codec;
 use crate::presence::Stance;
-use crate::world::diffusion::DiffusionCfg;
+use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
 
 use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
 
-/// Times a workbench apply may repeat the interaction: the wire, the server and the crafting
-/// mod share this one bound.
-pub const WORKBENCH_REPEAT: std::ops::RangeInclusive<u8> = 1..=16;
-
-/// Workbench events only: `Moved` / `NewContact` / `Collision`. Other bytes are not well-formed.
-pub(crate) fn workbench_event(v: u8) -> Option<material::EventKind> {
-    match v {
-        0 => Some(material::EventKind::Moved),
-        1 => Some(material::EventKind::NewContact),
-        2 => Some(material::EventKind::Collision),
-        _ => None,
-    }
-}
-
 pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
-    let v = material::Law::v0().stamp();
+    let v = material::Law::current().stamp();
     let mut a = [0u8; material::STAMP_LEN];
     a.copy_from_slice(&v);
     a
 }
 
-/// `Ok` iff `stamp` is law v0. A different valid law is refused with
-/// [`ServerMessage::Reject`] (region-search errors included); never panics.
+/// `Ok` iff `stamp` is this build's law. Anything else (an older law, another reaction function,
+/// garbage) is refused with [`ServerMessage::Reject`]; never panics.
 pub fn handshake_law(stamp: &[u8]) -> Result<(), ServerMessage> {
-    if stamp == material::Law::v0().stamp() {
+    if stamp == material::Law::current().stamp() {
         return Ok(());
     }
     let reason: Arc<str> = match material::Law::from_stamp(stamp) {
-        Ok(law) => match crate::block::regions::builtin(&law) {
-            Ok(_) => "law stamp is not this game's law".into(),
-            Err(e) => e.to_string().into(),
-        },
+        Ok(_) => "law stamp differs from this game's law".into(),
+        Err(material::LawError::Version(v)) => format!("world uses law version {v}; this game runs {}", material::LAW_ID).into(),
         Err(_) => "law stamp is not this game's law".into(),
     };
     Err(ServerMessage::Reject { reason })
@@ -129,21 +113,18 @@ impl Wire for WorldgenKind {
     }
 }
 
-impl Wire for DiffusionCfg {
+impl Wire for TerrainCfg {
     fn put(&self, w: &mut codec::Writer) {
-        w.u32(self.tile);
-        w.u32(self.stride);
-        w.u32(self.phases);
-        w.f32(self.relief);
+        for v in self.to_wire() {
+            w.u32(v as u32);
+        }
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
-        Some(DiffusionCfg {
-            tile: r.u32().ok()?,
-            stride: r.u32().ok()?,
-            phases: r.u32().ok()?,
-            relief: r.f32().ok()?,
-            version: 1,
-        })
+        let mut v = [0u16; 4];
+        for x in v.iter_mut() {
+            *x = u16::try_from(r.u32().ok()?).ok()?;
+        }
+        Some(TerrainCfg::from_wire(v))
     }
 }
 
@@ -292,7 +273,7 @@ mod tag {
     pub const PING: u8 = 6;
     pub const TELEPORT: u8 = 7;
     pub const VOICE: u8 = 8;
-    pub const CRAFT: u8 = 9;
+    pub const TOOL_USE: u8 = 9;
 
     pub const WELCOME: u8 = 0;
     pub const REJECT: u8 = 1;
@@ -309,7 +290,7 @@ mod tag {
     pub const POSITION: u8 = 12;
     pub const PEER_EXITED: u8 = 13;
     pub const PEER_VOICE: u8 = 14;
-    pub const CRAFT_RESULT: u8 = 15;
+    pub const TOOL_RESULT: u8 = 15;
 }
 
 messages! {
@@ -341,15 +322,10 @@ messages! {
         /// stamps speaker id + epoch on relay; the client never mints those.
         /// `payload` is bounded by [`MAX_VOICE_PAYLOAD`](super::MAX_VOICE_PAYLOAD).
         Voice = tag::VOICE { seq: u32, payload: VoicePayload },
-        /// Workbench apply: the server evaluates `interact` and replies with
-        /// [`ServerMessage::CraftResult`]. `event` is [`material::EventKind`] as u8
-        /// (`Moved`/`NewContact`/`Collision`); `repeat` is 1..=16.
-        Craft = tag::CRAFT {
-            origin_spec: Arc<str>,
-            target_spec: Arc<str>,
-            event: u8,
-            repeat: u8,
-        },
+        /// Use the held configuration `tool_spec` as a tool on the cell: the server runs ONE
+        /// operation of the law between the cell (A) and the tool (B) and answers with
+        /// [`ServerMessage::ToolResult`]. `req`/`expect` as for [`Edit`](Self::Edit).
+        ToolUse = tag::TOOL_USE { req: u32, x: i32, y: i32, z: i32, expect: u32, tool_spec: Arc<str> },
     }
 }
 
@@ -361,7 +337,7 @@ messages! {
             seed: i64,
             spawn: DVec3,
             worldgen: WorldgenKind,
-            diffusion: DiffusionCfg,
+            terrain: TerrainCfg,
             law: [u8; material::STAMP_LEN],
         },
         /// The stream closes after this (bad password, version mismatch, server full).
@@ -400,15 +376,10 @@ messages! {
         /// constant `0` here because the server never reuses ids. `seq` and
         /// `payload` are the sender's own [`ClientMessage::Voice`] values, unchanged.
         PeerVoice = tag::PEER_VOICE { id: u32, epoch: u32, seq: u32, payload: VoicePayload },
-        /// Authoritative workbench result. Echoes the request so the client can
-        /// consume/add without evaluating the law itself.
-        CraftResult = tag::CRAFT_RESULT {
-            origin_spec: Arc<str>,
-            target_spec: Arc<str>,
-            event: u8,
-            repeat: u8,
-            result_spec: Arc<str>,
-        },
+        /// The outcome of the sender's [`ClientMessage::ToolUse`] `req`: whether the law moved
+        /// anything, the cell's committed revision, and both configurations afterwards (unchanged
+        /// specs when nothing reacted or the request was refused).
+        ToolResult = tag::TOOL_RESULT { req: u32, reacted: bool, rev: u32, cell_spec: Arc<str>, tool_spec: Arc<str> },
     }
 }
 
@@ -497,12 +468,7 @@ mod tests {
             ClientMessage::SetTime { day: 0.5 },
             ClientMessage::Voice { seq: 5, payload: vec![1, 2, 3, 4].try_into().unwrap() },
             ClientMessage::Voice { seq: 0, payload: Vec::new().try_into().unwrap() },
-            ClientMessage::Craft {
-                origin_spec: "c:010203".into(),
-                target_spec: "air".into(),
-                event: 2,
-                repeat: 4,
-            },
+            ClientMessage::ToolUse { req: 3, x: 5, y: -60, z: 9, expect: 2, tool_spec: "c:0101020304".into() },
         ]
     }
 
@@ -512,8 +478,8 @@ mod tests {
                 player_id: 42,
                 seed: -9_999,
                 spawn: DVec3::new(0.5, 40.0, 0.5),
-                worldgen: WorldgenKind::Classic,
-                diffusion: DiffusionCfg::default(),
+                worldgen: WorldgenKind::Flat,
+                terrain: TerrainCfg::default(),
                 law: law_stamp(),
             },
             ServerMessage::Welcome {
@@ -521,13 +487,7 @@ mod tests {
                 seed: 11,
                 spawn: DVec3::new(1.0, 20.0, 2.0),
                 worldgen: WorldgenKind::Diffusion,
-                diffusion: DiffusionCfg {
-                    tile: 64,
-                    stride: 8,
-                    phases: 4,
-                    relief: 1.5,
-                    version: 1,
-                },
+                terrain: TerrainCfg { relief: 150, caves: 50, mines: 0, space: 200 },
                 law: law_stamp(),
             },
             ServerMessage::Reject { reason: "bad password".into() },
@@ -544,7 +504,7 @@ mod tests {
                 pos: DVec3::new(9.0, 8.0, 7.0),
                 yaw: 1.0,
                 pitch: 0.1,
-                stance: Stance::Swimming,
+                stance: Stance::Sneaking,
             },
             ServerMessage::PeerExited { id: 3 },
             ServerMessage::PeerSwing { id: 3 },
@@ -562,12 +522,12 @@ mod tests {
             ServerMessage::Time { day: 0.75, day_secs: 600.0 },
             ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7].try_into().unwrap() },
             ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new().try_into().unwrap() },
-            ServerMessage::CraftResult {
-                origin_spec: "c:010203".into(),
-                target_spec: "air".into(),
-                event: 2,
-                repeat: 4,
-                result_spec: "c:aabb".into(),
+            ServerMessage::ToolResult {
+                req: 3,
+                reacted: true,
+                rev: 7,
+                cell_spec: "air".into(),
+                tool_spec: "c:0201020304aabbccdd".into(),
             },
         ]
     }
@@ -575,7 +535,7 @@ mod tests {
     #[test]
     fn spec_round_trips_through_the_wire() {
         let mut r = crate::block::BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut r);
         let id = r.id_by_label("rock").unwrap();
         let spec = r.spec(id);
         let msg = ClientMessage::Edit {
@@ -647,9 +607,9 @@ mod tests {
                     playtime_secs: 0,
                     edit_count: 1,
                 },
-                worldgen_version: crate::world::placement::WORLDGEN_VERSION,
+                worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
                 worldgen: WorldgenStamp::default(),
-                law_stamp: material::Law::v0().stamp(),
+                law_stamp: material::Law::current().stamp(),
                 player: PlayerState {
                     pos: [0.0, 0.0, 0.0],
                     yaw: 0.0,
@@ -661,6 +621,7 @@ mod tests {
                 specs: vec![spec.clone()],
                 edits: vec![format::Edit { x: 1, y: 2, z: 3, spec: 0 }],
                 mods: vec![],
+                pending: vec![],
             };
             let bytes = format::encode(&doc).unwrap();
             let back = match format::decode(&bytes).unwrap() {
@@ -689,11 +650,6 @@ mod tests {
             None,
             "a reaction Snapshot must not decode as a client edit"
         );
-        assert!(
-            workbench_event(3).is_none(),
-            "ExternallyChanged is not a workbench event"
-        );
-        assert!(workbench_event(2).is_some());
     }
 
     #[test]
@@ -742,7 +698,7 @@ mod tests {
             seed: 3,
             spawn: pos,
             worldgen: WorldgenKind::Diffusion,
-            diffusion: DiffusionCfg::default(),
+            terrain: TerrainCfg::default(),
             law: law_stamp(),
         };
         assert_eq!(ServerMessage::decode(&wl.encode()), Some(wl));
@@ -751,22 +707,39 @@ mod tests {
     #[test]
     fn handshake_refuses_a_perturbed_law_without_panic() {
         assert!(handshake_law(&law_stamp()).is_ok());
-        let mut law = material::Law::v0();
-        law.kernel.knots[2].1 = -law.kernel.knots[2].1;
-        let stamp = law.stamp();
-        match handshake_law(&stamp) {
-            Err(ServerMessage::Reject { reason }) => {
-                assert!(!reason.is_empty(), "reject names the reason");
+        let mut law = material::Law::current();
+        law.probes.glow = material::Element::new([1, 2, 3, 4]);
+        let mut old_version = law_stamp();
+        old_version[0] = 1;
+        for stamp in [law.stamp(), old_version.to_vec(), vec![0u8; 3]] {
+            let encoded = match handshake_law(&stamp) {
+                Err(ServerMessage::Reject { reason }) => {
+                    assert!(!reason.is_empty(), "reject names the reason");
+                    ServerMessage::Reject { reason }.encode()
+                }
+                other => panic!("expected Reject, got {other:?}"),
+            };
+            match ServerMessage::decode(&encoded) {
+                Some(ServerMessage::Reject { reason }) => assert!(!reason.is_empty()),
+                other => panic!("Reject must round-trip, got {other:?}"),
             }
-            other => panic!("expected Reject, got {other:?}"),
         }
-        let encoded = match handshake_law(&stamp) {
-            Err(msg) => msg.encode(),
-            Ok(()) => panic!("perturbed law was accepted"),
+    }
+
+    #[test]
+    fn welcome_carries_every_terrain_knob() {
+        let terrain = TerrainCfg { relief: 175, caves: 25, mines: 200, space: 0 };
+        let wl = ServerMessage::Welcome {
+            player_id: 1,
+            seed: 3,
+            spawn: DVec3::ZERO,
+            worldgen: WorldgenKind::Diffusion,
+            terrain,
+            law: law_stamp(),
         };
-        match ServerMessage::decode(&encoded) {
-            Some(ServerMessage::Reject { reason }) => assert!(!reason.is_empty()),
-            other => panic!("Reject must round-trip, got {other:?}"),
+        match ServerMessage::decode(&wl.encode()) {
+            Some(ServerMessage::Welcome { terrain: got, .. }) => assert_eq!(got, terrain),
+            other => panic!("bad decode: {other:?}"),
         }
     }
 
@@ -776,8 +749,8 @@ mod tests {
             player_id: 1,
             seed: 3,
             spawn: DVec3::ZERO,
-            worldgen: WorldgenKind::Classic,
-            diffusion: DiffusionCfg::default(),
+            worldgen: WorldgenKind::Flat,
+            terrain: TerrainCfg::default(),
             law: law_stamp(),
         }
         .encode();

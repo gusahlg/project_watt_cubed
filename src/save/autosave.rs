@@ -193,7 +193,7 @@ mod tests {
     fn load_world(
         seed: i64,
         kind: crate::world::generation::WorldgenKind,
-        cfg: crate::world::diffusion::DiffusionCfg,
+        cfg: crate::world::terrain::TerrainCfg,
     ) -> crate::world::World {
         crate::world::World::with_kind_cfg(
             seed,

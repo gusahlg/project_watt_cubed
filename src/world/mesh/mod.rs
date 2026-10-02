@@ -434,7 +434,7 @@ fn emit_rect(out: &mut ChunkMeshData, dir: &Dir, rect: Rect, sample: FaceSample,
             tables.render_layer(sample.id),
             Ao::new(sample.ao[i]),
             Light::new(sample.sky[i], sample.block[i]),
-            tables.fluid_surface(sample.id),
+            false,
         )
     });
 
@@ -511,20 +511,21 @@ mod tests {
     #[test]
     fn vertex_byte_pin() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::Terrain;
+        use crate::world::terrain::Terrain;
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&mut registry, 20.0, 42);
+        let generator = Terrain::new(&mut registry, 42);
         let tables = registry.hot_tables();
-        // (coord, unlit, full, gradient) — filled from the first `--nocapture` run.
-        // (2,2,2) is uniform sky at seed 42; (2,1,2) is the dense surface stand-in.
-        // (1,1,0) replaced (-5,0,4), whose enclosed empty mesh hashed identically.
+        // (column, unlit, full, gradient) — filled from a `--nocapture` run. Each pin chunk is the
+        // surface chunk of its column (its cy follows the generator's height there), so the pins
+        // always cover real surface geometry: grass, strata, trees.
+        let surface = |cx: i32, cz: i32| (cx, generator.height(cx * 16 + 8, cz * 16 + 8).div_euclid(16), cz);
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            ((0, 1, 0), 0xa5fcebb8, 0xa5fcebb8, 0x61ea494d),
-            ((3, 1, -2), 0xc53db1bb, 0xc53db1bb, 0xac3c21d7),
-            ((1, 1, 0), 0x701d10bb, 0x701d10bb, 0xb923fba1),
-            ((2, 1, 2), 0xd0801ace, 0xd0801ace, 0xaccf2c85),
+            (surface(0, 0), 0xdbaa1825, 0xdbaa1825, 0x3f8a2a82),
+            (surface(3, -2), 0x05465b97, 0x05465b97, 0x8c7e77aa),
+            (surface(1, 0), 0x01b3394c, 0x01b3394c, 0x0a46e7fa),
+            (surface(2, 2), 0xee616ae2, 0xee616ae2, 0x70fccc81),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
@@ -554,7 +555,7 @@ mod tests {
                 "vertex_byte_pin ({cx},{cy},{cz}) unlit=0x{:08x} full=0x{:08x} grad=0x{:08x}",
                 got[i].0, got[i].1, got[i].2
             );
-            if (cx, cy, cz) == (1, 1, 0) {
+            if i == 2 {
                 assert_ne!(got[i].0, got[i].2, "({cx},{cy},{cz}) unlit vs gradient");
                 assert_ne!(got[i].1, got[i].2, "({cx},{cy},{cz}) full vs gradient");
             }
@@ -599,7 +600,6 @@ mod tests {
         HotTables::from_parts(
             &[false, true, true],
             &[false, true, true],
-            &[false, false, false],
             vec![Pass::Opaque, Pass::Opaque, Pass::Opaque].into(),
             vec![0, 0, 0].into(),
             vec![0, 0, 0].into(),
@@ -621,11 +621,11 @@ mod tests {
     #[ignore]
     fn padded_capture_throughput() {
         use crate::block::registry::BlockRegistry;
-        use crate::world::generation::Terrain;
+        use crate::world::terrain::Terrain;
         use crate::world::light::LightGrid;
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 5);
         // The SURFACE band (world y 48..96): mixed paletted chunks — the case
         // that actually reaches the pool (uniform chunks capture cheap).
         let neigh: Vec<Chunk> = (0..27)
@@ -859,7 +859,7 @@ mod tests {
                     (i / 11) as u8,
                 ])))
                 .expect("id space holds 400 configurations");
-            if id.0 > 255 && reg.is_solid(id) && !reg.is_liquid(id) {
+            if id.0 > 255 && reg.is_solid(id) {
                 high = id;
                 break;
             }
@@ -892,7 +892,6 @@ mod tests {
         let mut t = HotTables::from_parts(
             &bools,
             &bools,
-            &vec![false; 201],
             vec![Pass::Opaque; 201].into(),
             vec![0; 201].into(),
             vec![0; 201].into(),
@@ -1115,7 +1114,6 @@ mod tests {
         let t = HotTables::from_parts(
             &[false, true, true, true],
             &[false, true, true, false],
-            &[false, false, false, false],
             vec![Pass::Opaque, Pass::Opaque, Pass::Opaque, Pass::Blend].into(),
             vec![0, 0, 0, 0].into(),
             vec![0, 0, 0, 0].into(),

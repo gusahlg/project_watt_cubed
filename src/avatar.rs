@@ -99,21 +99,13 @@ impl Pose {
     pub const HEAD_TOP: f32 = 1.9 * SCALE;
 
     pub fn resolve(pose: &RenderPose, rig: &RigParams) -> Self {
-        /// Tips body forward in prone stance.
-        const PRONE_ANGLE: f32 = -1.3;
         const ACTION_AMP: f32 = 1.6;
-        const HIP: Vec3 = Vec3::new(0.0, 0.9, 0.0);
 
         // Negate yaw to flip rotation sense; -pi/2 offset aligns body-local -Z forward with world +X.
         let body_rot = Mat3::from_rotation_y(-rig.body_yaw - PI / 2.0);
         let head_yaw = Mat3::from_rotation_y(-wrap_pi(pose.yaw - rig.body_yaw));
         let h = 1.0 + (pose.stance.height_scale() - 1.0) * rig.stance_blend;
         let squash = |v: Vec3| Vec3::new(v.x, v.y * h, v.z);
-        let prone_rot = if pose.stance.prone() {
-            Mat3::from_rotation_x(PRONE_ANGLE * rig.stance_blend)
-        } else {
-            Mat3::IDENTITY
-        };
 
         let (phase, amp) = (pose.gait.phase, pose.gait.amp());
         let mut parts = [(Vec3::ZERO, Mat3::IDENTITY); 6];
@@ -131,9 +123,7 @@ impl Pose {
             };
             let pivot = squash(part.pivot);
             let local = pivot + swing_rot * (squash(part.rest) - pivot);
-            let hip = squash(HIP);
-            let local = hip + prone_rot * (local - hip);
-            parts[i] = (pose.feet + body_rot * (local * SCALE), body_rot * prone_rot * swing_rot);
+            parts[i] = (pose.feet + body_rot * (local * SCALE), body_rot * swing_rot);
         }
         Self { feet: pose.feet, parts }
     }

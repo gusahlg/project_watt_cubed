@@ -1,17 +1,18 @@
 //! The mod system: the game's "minimal core, layers on top" made real. Core
-//! gameplay owns the world and physics; everything player-facing that isn't
-//! essential — the inventory, crafting UIs, HUD widgets — is a [`Mod`] that can be
-//! toggled at runtime from the mod menu.
+//! gameplay owns the world, the law and physics; everything player-facing that
+//! isn't essential — the inventory, the hotbar, block looks and names, HUD
+//! widgets — is a [`Mod`] that can be toggled at runtime from the mod menu.
 //!
 //! **Performance:** mod hooks fire only at frame and event granularity —
 //! `update`/`draw` once per frame, `on_block_break` once per broken block. Nothing
 //! here is ever called from the voxel hot path (meshing, collision, streaming), and
 //! disabled mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
-pub mod crafting;
 pub mod diffusion;
+pub mod hotbar;
 pub mod inventory;
 pub mod menu_default;
+pub mod naming;
 pub mod start_screen;
 pub mod textures;
 pub mod visuals;
@@ -21,9 +22,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::block::appearance::{BlockAppearance, FLAT};
+use crate::block::naming::MaterialNamer;
 use crate::block::BlockId;
 use crate::menu::start::{StartFacts, StartScreen};
 use crate::menu::theme::MenuTheme;
@@ -118,21 +119,16 @@ pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
     }
 }
 
-/// Shared visibility state for the inventory/crafting pair. Crafting replaces
-/// the compact inventory panel while open, so two independently toggleable mods
-/// never draw over one another.
+/// Shared state of the inventory and the hotbar: whether the inventory panel is open (it then
+/// owns the number keys and the wheel, to equip into hotbar slots).
 #[derive(Clone, Copy)]
 pub(crate) struct ItemUiState {
     pub inventory_visible: bool,
-    pub crafting_open: bool,
 }
 
 impl Default for ItemUiState {
     fn default() -> Self {
-        Self {
-            inventory_visible: true,
-            crafting_open: false,
-        }
+        Self { inventory_visible: false }
     }
 }
 
@@ -149,39 +145,31 @@ pub struct ModContext<'a> {
     /// Fixed-cadence replay may run after the player has moved or looked away.
     pub place_target: Option<(i32, i32, i32)>,
     pub toggle_inventory: bool,
-    pub toggle_crafting: bool,
     pub nav_up: bool,
     pub nav_down: bool,
     pub nav_left: bool,
     pub nav_right: bool,
     pub nav_tab: bool,
     pub nav_confirm: bool,
-    /// True when a server owns evaluation; the crafting mod queues [`crafts`]
-    /// instead of applying `interact` locally.
+    /// A hotbar key this frame: `Some(0)` = the bare hand (key 0), `Some(1..=9)` = a slot.
+    pub hotbar_key: Option<u8>,
+    /// Wheel steps this frame: +1 next slot, −1 previous.
+    pub hotbar_cycle: i8,
+    /// True when a server owns evaluation (reactions and tool use run there).
     pub networked: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
     /// drains these after `mods.update` and applies each only if the cell is air
     /// and doesn't overlap the player — mods that spend resources on a placement
     /// should pre-check the same so their accounting stays exact.
     pub placements: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
-    /// Workbench applies to send; the server evaluates and replies with the result spec.
-    pub crafts: Vec<CraftRequest>,
-}
-
-/// One workbench apply the client asks the server to evaluate.
-pub struct CraftRequest {
-    pub origin_spec: Arc<str>,
-    pub target_spec: Arc<str>,
-    pub event: u8,
-    pub repeat: u8,
 }
 
 impl ModContext<'_> {
-    /// Queue a material event at `pos` for the reaction scheduler. Machines emit
-    /// through this hook; chunk load/gen/mesh/save never do. No-op on a client
-    /// connected to a server (the authority runs the scheduler).
-    pub fn emit_material_event(&mut self, pos: (i32, i32, i32), kind: material::EventKind) {
-        self.world.push_material_event(pos, kind);
+    /// A machine changed matter at `pos`: wake that cell's contacts in the reaction scheduler.
+    /// Chunk load/gen/mesh/save never do this. No-op on a client connected to a server (the
+    /// authority runs the scheduler).
+    pub fn wake_cell(&mut self, pos: (i32, i32, i32)) {
+        self.world.note_cell_changed(pos.0, pos.1, pos.2);
     }
 }
 
@@ -191,9 +179,10 @@ impl ModContext<'_> {
 ///
 /// Arbitration when more than one enabled mod implements a hook:
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
-///   `on_place_rejected`. `hud` uses the same order as z-order (later draws on top).
+///   `on_place_rejected`, `on_tool_changed`. `hud` uses the same order as z-order (later
+///   draws on top).
 /// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` (first `true`),
-///   `worldgen`, `worldgen_config`, `appearance`.
+///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `held`.
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
@@ -253,18 +242,25 @@ pub trait Mod {
         let _ = (id, world);
     }
 
-    /// Authoritative workbench result. The client intern/consume/adds `result_spec`
-    /// and must not re-evaluate the law.
-    fn on_craft_result(
-        &mut self,
-        origin_spec: &str,
-        target_spec: &str,
-        event: u8,
-        repeat: u8,
-        result_spec: &str,
-        world: &mut World,
-    ) {
-        let _ = (origin_spec, target_spec, event, repeat, result_spec, world);
+    /// The configuration the player holds as a tool, if any (first enabled mod that answers
+    /// wins; `None` everywhere = the bare hand, which breaks blocks). The core runs the law
+    /// between this configuration and the targeted block on a left click.
+    fn held(&self, player: &Player) -> Option<BlockId> {
+        let _ = player;
+        None
+    }
+
+    /// A held unit changed configuration through a tool reaction: one unit of `old` became one
+    /// unit of `new` (`AIR` when the tool was used up). The core already updated the stash; a
+    /// hotbar follows the unit here.
+    fn on_tool_changed(&mut self, old: BlockId, new: BlockId) {
+        let _ = (old, new);
+    }
+
+    /// Optional material namer. First enabled mod that returns `Some` names every
+    /// configuration; without one the core describes materials by their readings.
+    fn namer(&self) -> Option<&dyn MaterialNamer> {
+        None
     }
 
     /// First enabled mod that returns `Some` handles the console command.
@@ -378,40 +374,30 @@ impl Mods {
     pub const GROUPS: &[Group] = &[Group {
         id: ESSENTIALS,
         name: "Essentials",
-        description: "Start screen, menus, inventory, crafting, look and worldgen.",
+        description: "Menus, inventory, hotbar, looks, names and worldgen.",
     }];
 
-    /// The default install: the menu mod (look/feel of every out-of-game
-    /// screen) first, then the start-screen mod (main/load/host/join content),
-    /// then the bare-list inventory mod and the crafting mod, all enabled.
-    /// The element stash lives on the player; these two mods share only
-    /// [`ItemUiState`] so their panels don't overlap. Menus goes first so it
-    /// wins the first-handler dispatch below by default.
+    /// The default install, all enabled: the menu mod (look/feel of every out-of-game screen)
+    /// first so it wins first-handler dispatch, the start-screen mod, the inventory and the
+    /// hotbar (sharing [`ItemUiState`]), the fancy visual lanes, neural textures, material names,
+    /// and InfiniteDiffusion worldgen.
     pub fn with_defaults() -> Self {
         let mut mods = Self {
             entries: Vec::new(),
         };
         let item_ui = Rc::new(Cell::new(ItemUiState::default()));
+        let bar = Rc::new(Cell::new(hotbar::HotbarState::default()));
         mods.install(Box::new(menu_default::MenuDefaultMod::new()), true);
         mods.install(Box::new(start_screen::StartScreenMod::new()), true);
-        mods.install(
-            Box::new(inventory::InventoryMod::new(item_ui.clone())),
-            true,
-        );
-        mods.install(Box::new(crafting::CraftingMod::new(item_ui)), true);
+        mods.install(Box::new(inventory::InventoryMod::new(item_ui.clone(), bar.clone())), true);
+        mods.install(Box::new(hotbar::HotbarMod::new(item_ui, bar)), true);
         // Fancy lanes live in mods; disable any of these to get the core look.
         mods.install(Box::new(visuals::AtmosphereMod), true);
         mods.install(Box::new(visuals::PostMod), true);
         mods.install(Box::new(visuals::LightingMod), true);
-        mods.install(
-            Box::new(textures::procedural::ProceduralTexturesMod::new()),
-            true,
-        );
-        // Worldgen swap: off so classic noise remains the default substrate.
-        mods.install(Box::new(diffusion::InfiniteDiffusionMod::new()), false);
-        // GPU descriptors replace the CPU generator; off so ARRAY_LAYER (the
-        // engine default) stays bit-identical to a table that was never set.
-        mods.install(Box::new(textures::gpu::GpuMaterialsMod::new()), false);
+        mods.install(Box::new(textures::neural::NeuralTexturesMod::new()), true);
+        mods.install(Box::new(naming::NamingMod::new()), true);
+        mods.install(Box::new(diffusion::InfiniteDiffusionMod::new()), true);
         mods
     }
 
@@ -467,19 +453,19 @@ impl Mods {
         self.each_enabled(|m| m.on_place_rejected(id, world));
     }
 
-    /// Fan an authoritative workbench result out to every enabled mod.
-    pub fn on_craft_result(
-        &mut self,
-        origin_spec: &str,
-        target_spec: &str,
-        event: u8,
-        repeat: u8,
-        result_spec: &str,
-        world: &mut World,
-    ) {
-        self.each_enabled(|m| {
-            m.on_craft_result(origin_spec, target_spec, event, repeat, result_spec, world)
-        });
+    /// Fan a held unit's change of configuration out to every enabled mod.
+    pub fn on_tool_changed(&mut self, old: BlockId, new: BlockId) {
+        self.each_enabled(|m| m.on_tool_changed(old, new));
+    }
+
+    /// What the player holds as a tool: the first enabled mod that answers.
+    pub fn held(&self, player: &Player) -> Option<BlockId> {
+        self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.held(player))
+    }
+
+    /// The first enabled namer, if any.
+    pub fn namer(&self) -> Option<&dyn MaterialNamer> {
+        self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.namer())
     }
 
     /// First enabled mod that handles `cmd` wins.
@@ -596,15 +582,16 @@ impl Mods {
         self.entries[index].module.step_knob(knob, delta);
     }
 
-    /// Worldgen used for the next world: diffusion if that mod is on, else classic.
+    /// Worldgen used for the next world: InfiniteDiffusion if that mod is on, else the flat
+    /// core fallback.
     pub fn worldgen_kind(&self) -> WorldgenKind {
         self.first_worldgen()
             .and_then(|m| m.worldgen())
-            .unwrap_or(WorldgenKind::Classic)
+            .unwrap_or(WorldgenKind::Flat)
     }
 
     /// Opaque payload of the winning worldgen mod. The kind parses it
-    /// (`DiffusionCfg::from_text` for InfiniteDiffusion).
+    /// (`TerrainCfg::from_text` for InfiniteDiffusion).
     pub fn worldgen_config(&self) -> Option<String> {
         self.first_worldgen().and_then(|m| m.worldgen_config())
     }
@@ -710,9 +697,10 @@ impl Mods {
         0
     }
 
-    /// `id=on|off` lines, plus `id.state=<payload>` for mods that persist knobs.
+    /// `id=on|off` lines, plus `id.state=<payload>` for mods that persist knobs,
+    /// under a `version=` marker.
     pub fn choices_text(&self) -> String {
-        let mut text = String::new();
+        let mut text = format!("version={CHOICES_VERSION}\n");
         for entry in &self.entries {
             text.push_str(entry.module.id());
             text.push('=');
@@ -729,9 +717,20 @@ impl Mods {
     }
 
     /// Apply `id=on|off` and `id.state=` lines. Unknown ids and malformed lines
-    /// are ignored; missing keys keep the current defaults.
+    /// are ignored; missing keys keep the current defaults. A file from before
+    /// [`CHOICES_VERSION`] 2 recorded `diffusion=off` as the then-default of an
+    /// experiment; that mod is the world generator now, so those lines are dropped.
     pub fn apply_choices_text(&mut self, text: &str) {
+        let mut version = 1;
         crate::settings::each_kv_line(text, |key, value| {
+            if key == "version" {
+                version = value.trim().parse().unwrap_or(1);
+            }
+        });
+        crate::settings::each_kv_line(text, |key, value| {
+            if key == "version" || (version < 2 && key.starts_with("diffusion")) {
+                return;
+            }
             if let Some(id) = key.strip_suffix(".state") {
                 self.apply_choice_state(id.trim(), value);
                 return;
@@ -775,6 +774,9 @@ impl Mods {
         crate::save::write_atomic_file(path, self.choices_text().as_bytes())
     }
 }
+
+/// `mods.cfg` format: 2 since the diffusion mod became the default world generator.
+const CHOICES_VERSION: u32 = 2;
 
 /// Debounces `mods.cfg` writes so a held Left/Right does not rewrite at key-repeat rate.
 pub struct ChoicesFlush {
@@ -835,23 +837,37 @@ mod tests {
     use super::*;
     use super::split_mod_version;
     use crate::menu::Menu;
-    use crate::world::diffusion::DiffusionCfg;
+    use crate::world::terrain::TerrainCfg;
     use crate::world::World;
 
-    fn payload_cfg(mods: &Mods) -> DiffusionCfg {
+    fn payload_cfg(mods: &Mods) -> TerrainCfg {
         mods.worldgen_config()
             .as_deref()
-            .map(DiffusionCfg::from_text)
+            .map(TerrainCfg::from_text)
             .unwrap_or_default()
     }
+
+    /// Every built-in, in install order.
+    const BUILTINS: [&str; 10] = [
+        "menus",
+        "start",
+        "inventory",
+        "hotbar",
+        "atmosphere",
+        "post",
+        "lighting",
+        "neural_textures",
+        "material_names",
+        "diffusion",
+    ];
 
     #[test]
     fn worldgen_kind_skips_non_worldgen_mods() {
         let mods = Mods::with_defaults();
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
-        let mut on = Mods::with_defaults();
-        on.set_enabled("diffusion", true);
-        assert_eq!(on.worldgen_kind(), WorldgenKind::Diffusion);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion, "InfiniteDiffusion is on by default");
+        let mut off = Mods::with_defaults();
+        off.set_enabled("diffusion", false);
+        assert_eq!(off.worldgen_kind(), WorldgenKind::Flat, "the core fallback is the flat world");
     }
 
     #[test]
@@ -905,11 +921,11 @@ mod tests {
         mods.set_enabled("diffusion", true);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
         mods.set_enabled("DIFFUSION", false);
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
         mods.set_enabled("InfiniteDiffusion", true);
         assert_eq!(
             mods.worldgen_kind(),
-            WorldgenKind::Classic,
+            WorldgenKind::Flat,
             "display name is not a set_enabled key"
         );
     }
@@ -930,40 +946,19 @@ mod tests {
         let mut mods = Mods::with_defaults();
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
-        mods.load_state("Crafting", &format!("*{spec}=2"), &mut world);
+        mods.load_state("Hotbar", &format!("sel=2;2={spec}"), &mut world);
         let saved = mods.save_states(&world);
-        assert!(
-            saved.iter().any(|(k, _)| k == "crafting"),
-            "save keys are stable ids, not display names"
-        );
-        assert!(!saved.iter().any(|(k, _)| k == "Crafting"));
-        let data = saved
-            .iter()
-            .find(|(k, _)| k == "crafting")
-            .map(|(_, d)| d.clone())
-            .expect("crafting persists");
-
-        let mut by_id = Mods::with_defaults();
-        by_id.load_state("crafting", &data, &mut world);
-        assert_eq!(
-            by_id
-                .save_states(&world)
-                .iter()
-                .find(|(k, _)| k == "crafting")
-                .map(|(_, d)| d.as_str()),
-            Some(data.as_str())
-        );
-
-        let mut by_name = Mods::with_defaults();
-        by_name.load_state("Crafting", &data, &mut world);
-        assert_eq!(
-            by_name
-                .save_states(&world)
-                .iter()
-                .find(|(k, _)| k == "crafting")
-                .map(|(_, d)| d.as_str()),
-            Some(data.as_str())
-        );
+        assert!(saved.iter().any(|(k, _)| k == "hotbar"), "save keys are stable ids, not display names");
+        assert!(!saved.iter().any(|(k, _)| k == "Hotbar"));
+        let data = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.clone()).expect("hotbar persists");
+        for key in ["hotbar", "Hotbar"] {
+            let mut fresh = Mods::with_defaults();
+            fresh.load_state(key, &data, &mut world);
+            assert_eq!(
+                fresh.save_states(&world).iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()),
+                Some(data.as_str())
+            );
+        }
     }
 
     #[test]
@@ -972,34 +967,16 @@ mod tests {
         let mut mods = Mods::with_defaults();
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
-        mods.load_state("Crafting", &format!("*{spec}=2"), &mut world);
+        mods.load_state("hotbar", &format!("v1;sel=1;1={spec}"), &mut world);
         let saved = mods.save_states(&world);
-        assert!(
-            saved.iter().all(|(k, _)| k != "inventory"),
-            "the stash is core state, not an inventory save line"
-        );
-        let craft = saved
-            .iter()
-            .find(|(k, _)| k == "crafting")
-            .map(|(_, d)| d.as_str())
-            .expect("crafting");
-        assert_eq!(craft, format!("v1;*{spec}=2"));
-
+        assert!(saved.iter().all(|(k, _)| k != "inventory"), "the stash is core state, not an inventory save line");
+        let bar = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()).expect("hotbar");
+        assert_eq!(bar, format!("v1;sel=1;1={spec}"));
         let mut fresh = Mods::with_defaults();
         for (k, v) in &saved {
             fresh.load_state(k, v, &mut world);
         }
         assert_eq!(fresh.save_states(&world), saved);
-
-        let mut legacy = Mods::with_defaults();
-        legacy.load_state("Crafting", &format!("*{spec}=1"), &mut world);
-        let craft = legacy
-            .save_states(&world)
-            .into_iter()
-            .find(|(k, _)| k == "crafting")
-            .map(|(_, d)| d)
-            .expect("crafting");
-        assert_eq!(craft, format!("v1;*{spec}=1"));
     }
 
     fn index_of(mods: &Mods, id: &str) -> usize {
@@ -1016,47 +993,47 @@ mod tests {
     fn choices_text_round_trips_and_ignores_junk() {
         let mut mods = Mods::with_defaults();
         let defaults = mods.choices_text();
-        assert!(defaults.contains("menus=on"));
-        assert!(defaults.contains("start=on"));
-        assert!(defaults.contains("inventory=on"));
-        assert!(defaults.contains("crafting=on"));
-        assert!(defaults.contains("atmosphere=on"));
-        assert!(defaults.contains("post=on"));
-        assert!(defaults.contains("lighting=on"));
-        assert!(defaults.contains("procedural_textures=on"));
-        assert!(defaults.contains("procedural_textures.state=grain=1.00,contrast=1.00"));
-        assert!(defaults.contains("diffusion=off"));
-        assert!(defaults.contains("diffusion.state=tile=32,stride=16,phases=2,relief=1.00"));
-        assert!(defaults.contains("gpu_materials=off"));
+        for id in BUILTINS {
+            assert!(defaults.contains(&format!("{id}=on")), "{id} is on by default:\n{defaults}");
+        }
+        assert!(defaults.contains("neural_textures.state=detail=1.0,contrast=1.0"));
+        assert!(defaults.contains("material_names.state=style=mineral"));
+        assert!(defaults.contains("diffusion.state=relief=100,caves=100,mines=100,space=100"));
 
         mods.set_enabled("lighting", false);
-        mods.set_enabled("diffusion", true);
         let i = index_of(&mods, "diffusion");
         mods.step_knob(i, 0, 1);
         let cfg = payload_cfg(&mods);
-        assert_ne!(cfg.tile, DiffusionCfg::default().tile);
+        assert_eq!(cfg.relief, 125);
         let text = mods.choices_text();
         assert!(text.contains("lighting=off"));
-        assert!(text.contains("diffusion=on"));
-        assert!(text.contains(&format!(
-            "diffusion.state=tile={},stride={},phases={},relief={:.2}",
-            cfg.tile, cfg.stride, cfg.phases, cfg.relief
-        )));
+        assert!(text.contains(&format!("diffusion.state={}", cfg.to_text())));
 
         let mut fresh = Mods::with_defaults();
         fresh.apply_choices_text(
-            "lighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\ndiffusion.state=tile=64,stride=16,phases=2,relief=1.00\nunknown.state=tile=16\n",
+            "version=2\nlighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\ndiffusion.state=relief=150\nunknown.state=tile=16\n",
         );
         let restored = fresh.choices_text();
         assert!(restored.contains("lighting=off"));
         assert!(restored.contains("inventory=off"));
         assert!(restored.contains("diffusion=on"));
-        assert!(
-            restored.contains("menus=on"),
-            "malformed value must not change the default"
-        );
-        assert!(restored.contains("crafting=on"));
-        assert_eq!(payload_cfg(&fresh).tile, 64);
+        assert!(restored.contains("menus=on"), "malformed value must not change the default");
+        assert_eq!(payload_cfg(&fresh).relief, 150);
+    }
+
+    /// A pre-marker file wrote `diffusion=off` (and an unrelated knob payload) for everyone:
+    /// it must not switch off the world generator, while its other choices still apply.
+    #[test]
+    fn version_one_choices_keep_the_world_generator() {
+        let mut mods = Mods::with_defaults();
+        mods.apply_choices_text("lighting=off\ndiffusion=off\ndiffusion.state=tile=16,stride=16,phases=8,relief=1.00\ncrafting=on\n");
+        let text = mods.choices_text();
+        assert!(text.starts_with("version=2\n"));
+        assert!(text.contains("lighting=off"));
+        assert!(text.contains("diffusion=on"), "{text}");
+        assert_eq!(payload_cfg(&mods).relief, 100);
+        mods.apply_choices_text(&text.replace("diffusion=on", "diffusion=off"));
+        assert!(mods.choices_text().contains("diffusion=off"), "a current file's choice applies");
     }
 
     #[test]
@@ -1065,9 +1042,8 @@ mod tests {
         let mut mods = Mods::with_defaults();
         let i = index_of(&mods, "diffusion");
         mods.set_enabled("lighting", false);
-        mods.set_enabled("diffusion", true);
         mods.step_knob(i, 0, 1);
-        mods.step_knob(i, 1, 1);
+        mods.step_knob(i, 1, -1);
         let cfg = payload_cfg(&mods);
         mods.save_choices_to(&path).unwrap();
         let tmp = {
@@ -1124,7 +1100,7 @@ mod tests {
         let mask = mods.visual_mask();
         assert!(!mask.atmosphere && !mask.post && !mask.lighting);
         mods.apply_bench_env(Some(false), Some(false));
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Classic);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
         let mask = mods.visual_mask();
         assert!(!mask.atmosphere && !mask.post && !mask.lighting);
     }
@@ -1135,11 +1111,11 @@ mod tests {
         let mut mods = Mods::with_defaults();
         mods.save_choices_to(&path).unwrap();
         let on_disk = fs::read_to_string(&path).unwrap();
-        assert!(on_disk.contains("diffusion=off"));
-        mods.apply_bench_env(Some(true), Some(true));
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+        assert!(on_disk.contains("diffusion=on"));
+        mods.apply_bench_env(Some(false), Some(true));
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
         assert_eq!(fs::read_to_string(&path).unwrap(), on_disk);
-        assert!(mods.choices_text().contains("diffusion=on"));
+        assert!(mods.choices_text().contains("diffusion=off"));
         let _ = fs::remove_file(&path);
     }
 
@@ -1152,7 +1128,7 @@ mod tests {
         assert_eq!(g.name, "Essentials");
         assert_eq!(
             g.description,
-            "Start screen, menus, inventory, crafting, look and worldgen."
+            "Menus, inventory, hotbar, looks, names and worldgen."
         );
         assert!(
             g.description.chars().count() <= 60,
@@ -1163,25 +1139,8 @@ mod tests {
             .filter(|&i| mods.group(i) == ESSENTIALS)
             .map(|i| mods.id(i))
             .collect();
-        assert_eq!(
-            members,
-            [
-                "menus",
-                "start",
-                "inventory",
-                "crafting",
-                "atmosphere",
-                "post",
-                "lighting",
-                "procedural_textures",
-                "diffusion"
-            ]
-        );
-        let ungrouped: Vec<&str> = (0..mods.len())
-            .filter(|&i| mods.group(i).is_empty())
-            .map(|i| mods.id(i))
-            .collect();
-        assert_eq!(ungrouped, ["gpu_materials"]);
+        assert_eq!(members, BUILTINS);
+        assert!((0..mods.len()).all(|i| !mods.group(i).is_empty()), "every built-in is an Essential");
     }
 
     #[test]
@@ -1190,17 +1149,7 @@ mod tests {
         let mut mods = Mods::with_defaults();
         mods.set_group_enabled(ESSENTIALS, false);
         let text = mods.choices_text();
-        for id in [
-            "menus",
-            "start",
-            "inventory",
-            "crafting",
-            "atmosphere",
-            "post",
-            "lighting",
-            "procedural_textures",
-            "diffusion",
-        ] {
+        for id in BUILTINS {
             assert!(
                 text.contains(&format!("{id}=off")),
                 "{id} should be off in:\n{text}"
@@ -1221,17 +1170,7 @@ mod tests {
 
         fresh.set_group_enabled(ESSENTIALS, true);
         let on_text = fresh.choices_text();
-        for id in [
-            "menus",
-            "start",
-            "inventory",
-            "crafting",
-            "atmosphere",
-            "post",
-            "lighting",
-            "procedural_textures",
-            "diffusion",
-        ] {
+        for id in BUILTINS {
             assert!(
                 on_text.contains(&format!("{id}=on")),
                 "{id} should be on in:\n{on_text}"
@@ -1241,16 +1180,16 @@ mod tests {
 
     #[test]
     fn worldgen_config_is_the_winning_kind_payload() {
-        let off = Mods::with_defaults();
-        assert_eq!(off.worldgen_kind(), WorldgenKind::Classic);
+        let mut off = Mods::with_defaults();
+        off.set_enabled("diffusion", false);
+        assert_eq!(off.worldgen_kind(), WorldgenKind::Flat);
         assert_eq!(off.worldgen_config(), None);
         let mut on = Mods::with_defaults();
-        on.set_enabled("diffusion", true);
         let text = on.worldgen_config().expect("payload");
-        assert_eq!(DiffusionCfg::from_text(&text), DiffusionCfg::default());
-        on.step_knob(index_of(&on, "diffusion"), 0, 1);
-        let cfg = DiffusionCfg::from_text(&on.worldgen_config().unwrap());
-        assert_ne!(cfg.tile, DiffusionCfg::default().tile);
+        assert_eq!(TerrainCfg::from_text(&text), TerrainCfg::default());
+        on.step_knob(index_of(&on, "diffusion"), 3, 1);
+        let cfg = TerrainCfg::from_text(&on.worldgen_config().unwrap());
+        assert_eq!(cfg.space, 125);
     }
 
     #[test]
@@ -1330,7 +1269,7 @@ mod tests {
         parsed.load_choices();
         assert!(!enabled(&parsed, "Inventory"));
         assert!(enabled(&parsed, "Atmosphere"));
-        assert!(!enabled(&parsed, "InfiniteDiffusion"));
+        assert!(enabled(&parsed, "InfiniteDiffusion"), "an unmentioned mod keeps its default (on)");
         let _ = fs::remove_file(path);
     }
 }

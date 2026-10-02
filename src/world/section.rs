@@ -421,7 +421,7 @@ mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
     use crate::coord::BlockCoord;
-    use crate::world::generation::Terrain;
+    use crate::world::terrain::Terrain;
 
     // Test fixtures
 
@@ -460,20 +460,20 @@ mod tests {
     }
     fn blocks() -> Blocks {
         let mut r = BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut r);
         let id = |n: &str| r.id_by_label(n).unwrap();
         Blocks {
             air: AIR,
-            grass: id("organic+soil"),
-            dirt: id("clay+soil"),
+            grass: id("grass"),
+            dirt: id("soil"),
             stone: id("rock"),
             sand: id("sand"),
-            water: id("water"),
+            water: id("ice"),
         }
     }
 
     fn sine(seed: i64) -> Terrain {
-        Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, seed)
+        Terrain::new(&mut BlockRegistry::with_builtins(), seed)
     }
 
     const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };

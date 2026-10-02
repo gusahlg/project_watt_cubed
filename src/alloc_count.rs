@@ -9,7 +9,6 @@ pub struct Counting;
 thread_local! {
     static ALLOCS: Cell<u64> = const { Cell::new(0) };
     static BYTES: Cell<u64> = const { Cell::new(0) };
-    static SET_SKY: Cell<u32> = const { Cell::new(0) };
     static UNIFORMS: Cell<u32> = const { Cell::new(0) };
     static SETTINGS_APPLY: Cell<u32> = const { Cell::new(0) };
     static TEX_LAYERS: Cell<u32> = const { Cell::new(0) };
@@ -31,7 +30,6 @@ pub fn alloc_bytes() -> u64 {
 pub fn reset() {
     ALLOCS.with(|c| c.set(0));
     BYTES.with(|c| c.set(0));
-    SET_SKY.with(|c| c.set(0));
     UNIFORMS.with(|c| c.set(0));
     SETTINGS_APPLY.with(|c| c.set(0));
     TEX_LAYERS.with(|c| c.set(0));
@@ -89,7 +87,6 @@ unsafe impl GlobalAlloc for Counting {
 /// Engine entry points a quiet frame must not keep hitting.
 #[derive(Clone, Copy, Debug)]
 pub enum EngineCall {
-    SetSky,
     FrameUniforms,
     SettingsApply,
     TexLayers,
@@ -98,7 +95,6 @@ pub enum EngineCall {
 /// Record one game-side engine push (skipped cache hits do not call this).
 pub fn note_engine(call: EngineCall) {
     match call {
-        EngineCall::SetSky => SET_SKY.with(|c| c.set(c.get() + 1)),
         EngineCall::FrameUniforms => UNIFORMS.with(|c| c.set(c.get() + 1)),
         EngineCall::SettingsApply => SETTINGS_APPLY.with(|c| c.set(c.get() + 1)),
         EngineCall::TexLayers => TEX_LAYERS.with(|c| c.set(c.get() + 1)),
@@ -108,7 +104,6 @@ pub fn note_engine(call: EngineCall) {
 /// Engine-call counts since the last [`reset`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineCalls {
-    pub set_sky: u32,
     pub uniforms: u32,
     pub settings_apply: u32,
     pub tex_layers: u32,
@@ -117,7 +112,6 @@ pub struct EngineCalls {
 /// Snapshot of [`note_engine`] tallies for this thread.
 pub fn engine_calls() -> EngineCalls {
     EngineCalls {
-        set_sky: SET_SKY.with(Cell::get),
         uniforms: UNIFORMS.with(Cell::get),
         settings_apply: SETTINGS_APPLY.with(Cell::get),
         tex_layers: TEX_LAYERS.with(Cell::get),

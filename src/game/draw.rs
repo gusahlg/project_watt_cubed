@@ -1,5 +1,5 @@
 //! Frame composition, world rendering, and HUD presentation for the live game.
-use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, SkyDesc, Vec2};
+use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Vec2};
 
 use super::Game;
 use crate::avatar::Pose;
@@ -20,15 +20,13 @@ pub(super) struct DrawState {
     camera_cache: Memo<[u32; 4], Camera3D>,
     sky_frame_cache: Memo<u64, SkyFrame>,
     /// Frozen lighting by day and the game's render/palette revision.
-    static_frame_cache: Memo<(u64, u64), StaticFrame>,
+    static_frame_cache: Memo<(u64, u64, u32), StaticFrame>,
     anim_uv_cache: Memo<[u64; 2], [f32; 2]>,
     coord_cache: Memo<[i64; 3], String>,
     fps_cache: Memo<i32, String>,
     fps_refresh: RateGate,
     online_cache: Memo<(usize, Option<u32>), String>,
     peer_scratch: Vec<PeerDraw>,
-    /// Last sky descriptor pushed to the engine; skip `set_sky` while equal.
-    last_sky: Option<SkyDesc>,
     /// Last composed frame uniforms handed to `begin_3d`.
     last_uniforms: Option<voxel_engine::skeleton::FrameUniformsGpu>,
 }
@@ -45,7 +43,6 @@ impl DrawState {
             fps_refresh: RateGate::from_hz(4),
             online_cache: Memo::new(),
             peer_scratch: Vec::new(),
-            last_sky: None,
             last_uniforms: None,
         }
     }
@@ -69,9 +66,9 @@ struct Scene {
 }
 
 /// Lighting/clear state for a profile whose sky and animation inputs are
-/// frozen (weather, clouds, water animation, and exposure all disabled).
-/// Wrapped-water coordinates are cached independently so camera motion does
-/// not force the palette and lighting packet to be recomposed.
+/// frozen (weather, clouds, and exposure all disabled).
+/// Wrapped camera-XZ animation coordinates are cached independently so camera
+/// motion does not force the palette and lighting packet to be recomposed.
 #[derive(Clone, Copy)]
 struct StaticFrame {
     uniforms: voxel_engine::skeleton::FrameUniformsGpu,
@@ -172,25 +169,25 @@ impl Game {
             .sky_frame_cache
             .get_or(sky_day.to_bits(), || sky.frame_at_day(sky_day));
 
-        // Wrapped-water coordinates recomputed only when the eye XZ changes.
+        // Wrapped camera-XZ animation coordinates recomputed only when the eye XZ changes.
         let uv_key = [pose.eye.x.to_bits(), pose.eye.z.to_bits()];
         let anim_uv = *self
             .drawing
             .anim_uv_cache
             .get_or(uv_key, || crate::frame_snapshot::animation_uv(pose.eye));
 
-        // With weather, clouds, water animation, and exposure all disabled the
-        // composed packet is a pure function of the day value: cache it and
-        // patch only the camera-anchored UV lanes. Minimum/Fast ride this path.
-        let cacheable_frame = !self.render.weather
-            && !self.render.clouds
-            && !self.render.water_anim
-            && !self.render.exposure;
+        // With weather, clouds, and exposure all disabled the composed packet is
+        // a pure function of the day value (clouds off also freezes the engine's
+        // animation clock): cache it and patch only the camera-anchored UV lanes.
+        // Minimum/Fast ride this path.
+        let cacheable_frame = !self.render.weather && !self.render.clouds && !self.render.exposure;
         let (mut frame_uniforms, cached_clear) = if cacheable_frame {
             let render = &self.render;
-            // (day, content_rev): any render/palette change bumps the stamp, so
-            // the freeze predicate's own inputs invalidate the entry structurally.
-            let key = (sky_day.to_bits(), self.content_rev.0);
+            // (day, content_rev, altitude's space fade): any render/palette change
+            // bumps the stamp, so the freeze predicate's own inputs invalidate the
+            // entry structurally.
+            let space = crate::frame_snapshot::space_factor(pose.eye.y).to_bits();
+            let key = (sky_day.to_bits(), self.content_rev.0, space);
             let cached = self.drawing.static_frame_cache.get_or(key, || {
                 let snapshot = crate::frame_snapshot::compose_at(
                     sky, sky_frame, pose.eye, anim_uv, exposure, render,
@@ -320,7 +317,7 @@ impl Game {
             f3.set_debug_flat(scene.debug_flat);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
-                self.sky.draw(&mut f3, scene.sky_frame, &mut self.drawing.last_sky);
+                self.sky.draw(&mut f3, scene.sky_frame);
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
             self.world.render(&mut f3, pose.eye);
@@ -443,6 +440,12 @@ impl Game {
             self.hud_scratch.clear();
             mods.hud(&self.world, &self.player, screen, &mut self.hud_scratch);
             ui::render_hud(f, theme, screen, &self.hud_scratch);
+            // The last tool use's outcome, above the hotbar for a moment.
+            if let Some((note, at)) = &self.tool_note
+                && at.elapsed().as_secs_f32() < 1.6
+            {
+                hud_label(f, theme, screen, Anchor::Bottom, (0, -112), 18, ui::Role::Muted.color(), note);
+            }
         }
         // Minimal keeps the world readable: no closed-console scrollback.
         if matches!(theme.hud, HudMode::Full) || self.console.is_open() {
@@ -473,12 +476,10 @@ impl Game {
             .drawing
             .anim_uv_cache
             .get_or(uv_key, || crate::frame_snapshot::animation_uv(pose.eye));
-        let cacheable = !self.render.weather
-            && !self.render.clouds
-            && !self.render.water_anim
-            && !self.render.exposure;
+        let cacheable = !self.render.weather && !self.render.clouds && !self.render.exposure;
         if cacheable {
-            let key = (sky_day.to_bits(), self.content_rev.0);
+            let space = crate::frame_snapshot::space_factor(pose.eye.y).to_bits();
+            let key = (sky_day.to_bits(), self.content_rev.0, space);
             let uniforms = {
                 let sky = &self.sky;
                 let render = &self.render;
@@ -505,11 +506,6 @@ impl Game {
                 self.drawing.last_uniforms = Some(uniforms);
                 crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
             }
-        }
-        let desc = self.sky.desc(sky_frame);
-        if self.drawing.last_sky != Some(desc) {
-            self.drawing.last_sky = Some(desc);
-            crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SetSky);
         }
         if self.mod_hud && self.theme.hud.shows_mod_hud() {
             self.hud_scratch.clear();

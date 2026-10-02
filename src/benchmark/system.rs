@@ -679,7 +679,6 @@ fn render_lanes_json(s: &Settings) -> Json {
         ("day_night", Json::from(s.day_night)),
         ("vrs", Json::from(lanes.vrs)),
         ("vrs_choice", Json::from(s.vrs.code())),
-        ("water_animation", Json::from(s.water_anim)),
         ("vignette", Json::from(s.vignette)),
     ])
 }

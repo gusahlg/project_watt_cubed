@@ -12,7 +12,7 @@ use voxel_engine::{Color, DVec3, Engine, IVec2, Vec2};
 use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
 };
-use crate::block::AIR;
+use crate::block::{BlockId, AIR};
 use crate::camera::{CameraMode, CameraPose, FlyAxes, GameCamera};
 use crate::command;
 use crate::console::Console;
@@ -74,7 +74,10 @@ struct FrameInput {
     do_break: bool,
     do_place: bool,
     toggle_inventory: bool,
-    toggle_crafting: bool,
+    /// Hotbar key this frame: 0 = hand, 1..=9 = slot.
+    hotbar_key: Option<u8>,
+    /// Wheel steps this frame (+1 next, −1 previous).
+    hotbar_cycle: i8,
     nav_up: bool,
     nav_down: bool,
     nav_left: bool,
@@ -134,7 +137,8 @@ struct PendingModInput {
     /// replay must not re-raycast from a later camera direction.
     place_target: Option<(i32, i32, i32)>,
     toggle_inventory: bool,
-    toggle_crafting: bool,
+    hotbar_key: Option<u8>,
+    hotbar_cycle: i8,
     nav_up: bool,
     nav_down: bool,
     nav_left: bool,
@@ -155,7 +159,8 @@ impl PendingModInput {
             place,
             place_target: place.then_some(place_target).flatten(),
             toggle_inventory: allow_ui && input.toggle_inventory,
-            toggle_crafting: allow_ui && input.toggle_crafting,
+            hotbar_key: input.hotbar_key,
+            hotbar_cycle: input.hotbar_cycle,
             nav_up: allow_ui && input.nav_up,
             nav_down: allow_ui && input.nav_down,
             nav_left: allow_ui && input.nav_left,
@@ -168,7 +173,8 @@ impl PendingModInput {
     fn any(self) -> bool {
         self.place
             || self.toggle_inventory
-            || self.toggle_crafting
+            || self.hotbar_key.is_some()
+            || self.hotbar_cycle != 0
             || self.nav_up
             || self.nav_down
             || self.nav_left
@@ -179,7 +185,8 @@ impl PendingModInput {
 
     fn clear_ui(&mut self) {
         self.toggle_inventory = false;
-        self.toggle_crafting = false;
+        self.hotbar_key = None;
+        self.hotbar_cycle = 0;
         self.nav_up = false;
         self.nav_down = false;
         self.nav_left = false;
@@ -224,6 +231,10 @@ pub struct Game {
     /// keyed by the connection's request id: what the cell held before, and
     /// what the economy optimistically did (loot gained, item spent).
     pending_edits: std::collections::HashMap<u32, PendingEdit>,
+    /// Tool uses awaiting the server's verdict: request id → the held configuration sent.
+    pending_tools: std::collections::HashMap<u32, BlockId>,
+    /// The last tool use's outcome, shown briefly above the hotbar.
+    tool_note: Option<(String, Instant)>,
     /// Animation state for the player's own third-person body — the same
     /// machine each remote player carries.
     local_anim: presence::Animator,
@@ -368,6 +379,8 @@ impl Game {
             save_name,
             net: None,
             pending_edits: std::collections::HashMap::new(),
+            pending_tools: std::collections::HashMap::new(),
+            tool_note: None,
             local_anim: presence::Animator::default(),
             local_gait: 0.0,
             theme: Theme::new(),
@@ -523,9 +536,12 @@ impl Game {
         self.pending_mod_input.retain(|pending| pending.any());
     }
 
+    /// A scripted game over the real InfiniteDiffusion terrain (benchmarks, goldens), the
+    /// player standing on the surface at the origin.
     pub fn scripted(seed: u64, render: crate::render_config::RenderConfig) -> Game {
-        let world = World::with_config(seed as i64, render);
-        let player = Player::new(DVec3::new(0.0, 80.0, 0.0));
+        let world = World::with_kind(seed as i64, render, crate::world::generation::WorldgenKind::Diffusion, true);
+        let ground = world.surface_y(0, 0);
+        let player = Player::new(DVec3::new(0.5, ground as f64 + 3.0, 0.5));
         let mut g = Game::new(world, player, "scripted".to_string());
         g.scripted = true;
         g.render = render;
@@ -798,10 +814,18 @@ impl Game {
                 f.do_break = gp.event(GameplayEvent::Break);
                 if self.mod_logic {
                     f.do_place = gp.event(GameplayEvent::Place);
+                    if gp.event(GameplayEvent::Hand) {
+                        f.hotbar_key = Some(0);
+                    }
+                    for (i, e) in GameplayEvent::SLOTS.into_iter().enumerate() {
+                        if gp.event(e) {
+                            f.hotbar_key = Some(i as u8 + 1);
+                        }
+                    }
+                    f.hotbar_cycle = gp.event(GameplayEvent::HotbarNext) as i8 - gp.event(GameplayEvent::HotbarPrev) as i8;
                 }
                 if mod_ui {
                     f.toggle_inventory = gp.event(GameplayEvent::ToggleInventory);
-                    f.toggle_crafting = gp.event(GameplayEvent::ToggleCrafting);
                     f.nav_up = gp.overlay_nav(MenuEvent::Up);
                     f.nav_down = gp.overlay_nav(MenuEvent::Down);
                     f.nav_left = gp.overlay_nav(MenuEvent::Left);
@@ -1029,7 +1053,7 @@ impl Game {
         // Break is capture-gated in the query; freecam additionally can't act
         // on the world (the crosshair isn't where the player aims).
         if input.do_break && !detached {
-            self.break_block(mods, events);
+            self.primary_action(mods, events);
         }
 
         // Disabled mod logic performs no probe, no queueing, no dispatch.
@@ -1075,7 +1099,7 @@ impl Game {
         for index in 0..pending.len().max(1) {
             let edges = pending.get(index).copied().unwrap_or_default();
             let networked = self.net.is_some();
-            let (next_placements, crafts) = {
+            placements = {
                 let mut ctx = ModContext {
                     player: &mut self.player,
                     world: &mut self.world,
@@ -1084,26 +1108,20 @@ impl Game {
                     place: edges.place,
                     place_target: edges.place_target,
                     toggle_inventory: edges.toggle_inventory,
-                    toggle_crafting: edges.toggle_crafting,
                     nav_up: edges.nav_up,
                     nav_down: edges.nav_down,
                     nav_left: edges.nav_left,
                     nav_right: edges.nav_right,
                     nav_tab: edges.nav_tab,
                     nav_confirm: edges.nav_confirm,
+                    hotbar_key: edges.hotbar_key,
+                    hotbar_cycle: edges.hotbar_cycle,
                     networked,
                     placements,
-                    crafts: Vec::new(),
                 };
                 mods.update(&mut ctx);
-                (ctx.placements, ctx.crafts)
+                ctx.placements
             };
-            placements = next_placements;
-            if let Some(net) = &mut self.net {
-                for c in crafts {
-                    net.send_craft(c.origin_spec, c.target_spec, c.event, c.repeat);
-                }
-            }
             // Apply after each event frame so repeated placements observe the
             // previous write and cannot spend twice against one empty cell.
             self.apply_placements(&mut placements, events);
@@ -1118,6 +1136,8 @@ impl Game {
     /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
     /// step the simulation.
     fn stream_phase(&mut self, eng: &mut Engine, dt: f32, mods: &Mods) {
+        // Name configurations interned since the last frame (presentation only; O(new)).
+        self.world.registry_mut().refresh_names(mods.namer());
         // The scheduler drives the fixed-tick sim lane. Its clock
         // (fixed-tick accumulator + catch-up cap) is derived once per frame
         // here; other lanes still run directly below until they migrate in.
@@ -1331,11 +1351,7 @@ impl Game {
                     let prev = self.world.block_at(x, y, z);
                     let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
-                    if id == AIR {
-                        self.world.note_block_broken(x, y, z);
-                    } else {
-                        self.world.note_block_placed(x, y, z);
-                    }
+                    self.world.note_cell_changed(x, y, z);
                     let at = cell_center(x, y, z);
                     events.push(if id == AIR {
                         SoundEvent::BlockBroken { at, block: prev }
@@ -1367,7 +1383,10 @@ impl Game {
                             self.player.stash.revoke(id, 1);
                             mods.on_break_rejected(id);
                         }
-                        PendingKind::Place(id) => mods.on_place_rejected(id, &self.world),
+                        PendingKind::Place(id) => {
+                            self.player.stash.add(id, 1);
+                            mods.on_place_rejected(id, &self.world);
+                        }
                     }
                 }
                 Incoming::Position { pos } => {
@@ -1411,21 +1430,19 @@ impl Game {
                     self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
                 }
                 Incoming::Disconnected => disconnected = true,
-                Incoming::CraftResult {
-                    origin_spec,
-                    target_spec,
-                    event,
-                    repeat,
-                    result_spec,
-                } => {
-                    mods.on_craft_result(
-                        &origin_spec,
-                        &target_spec,
-                        event,
-                        repeat,
-                        &result_spec,
-                        &mut self.world,
-                    );
+                Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec } => {
+                    let Some(tool) = self.pending_tools.remove(&req) else { continue };
+                    if !reacted {
+                        self.note_tool("no reaction");
+                        continue;
+                    }
+                    let (x, y, z) = cell;
+                    let target = self.world.block_at(x, y, z);
+                    let new_cell = save::parse_block(self.world.registry_mut(), &cell_spec);
+                    let new_tool = save::parse_block(self.world.registry_mut(), &tool_spec);
+                    self.world.set_block(x, y, z, new_cell);
+                    self.finish_tool_change(tool, new_tool, target, new_cell, mods);
+                    events.push(SoundEvent::BlockBroken { at: cell_center(x, y, z), block: target });
                 }
                 Incoming::PeerSwing { id } => {
                     // The swing edge → a whoosh at the peer's current position. The
@@ -1543,23 +1560,86 @@ impl Game {
 
     /// Break the block the player is looking at, depositing its configuration
     /// into the core stash before notifying mods.
-    fn break_block(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
-        let Some(hit) = interact::raycast_solid(
-            &self.world,
-            self.player.position,
-            self.player.forward(),
-            interact::REACH,
-        ) else {
+    /// Left click: with a held tool, a reaction between the tool and the targeted block; with
+    /// the bare hand, breaking the block into the stash.
+    fn primary_action(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+        let Some(hit) = interact::raycast(&self.world, self.player.position, self.player.forward(), interact::REACH)
+        else {
             return;
         };
-        let (x, y, z) = hit.block;
+        match mods.held(&self.player) {
+            Some(tool) => self.use_tool(tool, hit.block, mods, events),
+            None => self.break_block(hit.block, mods, events),
+        }
+    }
+
+    /// Use the held configuration `tool` on the block at `cell`: ONE operation of the law between
+    /// the block (A, the world cell) and the tool (B). Elements move between them; the block may
+    /// empty (the tool has absorbed it) and the tool may grow, shrink or change entirely. The
+    /// changed cell wakes its contacts, so a disturbed block can start a cascade. On a server the
+    /// law is the server's to run: the request goes out and [`Incoming::ToolResult`] applies it.
+    fn use_tool(&mut self, tool: BlockId, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+        let (x, y, z) = cell;
+        let target = self.world.block_at(x, y, z);
+        self.local_anim.on_action(WireAction::Swing);
+        if let Some(net) = &mut self.net {
+            let spec = save::block_spec(self.world.registry(), tool);
+            if let Some(req) = net.send_tool_use(x, y, z, spec.into()) {
+                self.pending_tools.insert(req, tool);
+            }
+            net.send_swing();
+            return;
+        }
+        match self.world.registry_mut().react(target, tool) {
+            Some((_, new_cell, new_tool)) => {
+                self.world.set_block(x, y, z, new_cell);
+                self.world.note_cell_changed(x, y, z);
+                self.finish_tool_change(tool, new_tool, target, new_cell, mods);
+                events.push(SoundEvent::BlockBroken { at: cell_center(x, y, z), block: target });
+                self.camera.fx.add_trauma(0.08);
+            }
+            None => self.note_tool("no reaction"),
+        }
+    }
+
+    /// One held unit of `tool` became `new_tool` (the cell went `target` → `new_cell`): update the
+    /// stash, tell the mods (the hotbar follows the unit), and say what happened.
+    fn finish_tool_change(&mut self, tool: BlockId, new_tool: BlockId, target: BlockId, new_cell: BlockId, mods: &mut Mods) {
+        if self.player.stash.consume(tool, 1) && new_tool != AIR {
+            self.player.stash.add(new_tool, 1);
+        }
+        mods.on_tool_changed(tool, new_tool);
+        let reg = self.world.registry();
+        let (before, after) = (reg.configuration(tool).len(), reg.configuration(new_tool).len());
+        let note = if new_cell == AIR {
+            format!("{} dissolved into the tool", reg.display_name(target))
+        } else if new_tool == AIR {
+            "the tool dissolved into the block".to_string()
+        } else if after > before {
+            format!("drew an element from {}", reg.display_name(target))
+        } else if after < before {
+            format!("gave an element to {}", reg.display_name(target))
+        } else {
+            format!("exchanged elements with {}", reg.display_name(target))
+        };
+        self.note_tool(&note);
+    }
+
+    /// A short line above the hotbar about the last tool use.
+    fn note_tool(&mut self, text: &str) {
+        self.tool_note = Some((text.into(), Instant::now()));
+    }
+
+    /// Bare hand: break the block at `cell` into the stash.
+    fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+        let (x, y, z) = cell;
         let id = self.world.block_at(x, y, z);
         events.push(SoundEvent::BlockBroken {
             at: cell_center(x, y, z),
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
-        self.world.note_block_broken(x, y, z);
+        self.world.note_cell_changed(x, y, z);
         let overflow = !self.player.stash.add(id, 1);
         mods.on_block_break(id, &self.world, overflow);
         self.camera.fx.add_trauma(0.15);
@@ -1594,18 +1674,16 @@ impl Game {
         events: &mut Vec<SoundEvent>,
     ) {
         for (x, y, z, id) in placements.drain(..) {
-            // Lands in any non-obstacle cell — air, or a passable liquid it replaces
-            // (raycast hands back a liquid `previous` when aiming through water).
-            if self.world.is_obstacle(x, y, z) {
-                continue;
-            }
             // Overlap check in f64: at far coordinates an f32 cell centre
             // would land whole blocks away from the real cell.
             let cell = Aabb::new(
                 DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
                 DVec3::splat(0.5),
             );
-            if cell.intersects(&self.player.aabb()) {
+            // Lands only in empty space clear of the player; a refused placement gives the
+            // spent unit back.
+            if self.world.is_solid(x, y, z) || cell.intersects(&self.player.aabb()) {
+                self.player.stash.add(id, 1);
                 continue;
             }
             let prev = self.world.block_at(x, y, z);
@@ -1615,11 +1693,11 @@ impl Game {
                 block: id,
             });
             self.world.set_block(x, y, z, id);
-            self.world.note_block_placed(x, y, z);
+            self.world.note_cell_changed(x, y, z);
             self.local_anim.on_action(WireAction::Swing);
             // Tell the server in the same portable spec form saves use; it
             // validates and relays, exactly like breaking does with "air".
-            // The spent crafted block is refunded if the server says no.
+            // The spent unit is refunded if the server says no.
             if let Some(net) = &mut self.net {
                 let spec = save::block_spec(self.world.registry(), id);
                 let req = net.send_edit(x, y, z, spec.into());
@@ -1852,7 +1930,6 @@ mod tests {
         let mut last_bytes = u64::MAX;
         let mut last_clocks = u32::MAX;
         let mut last_calls = alloc_count::EngineCalls {
-            set_sky: 0,
             uniforms: 0,
             settings_apply: 0,
             tex_layers: 0,
@@ -1905,7 +1982,6 @@ mod tests {
         use crate::input::router::Router;
         use crate::mods::Mods;
         use crate::settings::Settings;
-        use material::EventKind;
 
         let mut settings = Settings::default();
         assert!(settings.select_preset("minimum"));
@@ -1933,10 +2009,8 @@ mod tests {
             pos.y.floor() as i32,
             pos.z.floor() as i32,
         );
-        game.world_mut()
-            .push_material_event((x, y, z), EventKind::Collision);
-        game.world_mut()
-            .push_material_event((x + 1, y, z), EventKind::NewContact);
+        game.world_mut().note_cell_changed(x, y, z);
+        game.world_mut().note_cell_changed(x + 1, y, z);
         assert!(
             game.world().reactions().pending() > 0,
             "draining test needs a non-empty pending set"

@@ -42,7 +42,7 @@ pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, 
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
-use crate::world::diffusion::DiffusionCfg;
+use crate::world::terrain::TerrainCfg;
 use crate::world::generation::{TerrainGenerator, WorldgenKind};
 
 /// A client thread that panics while holding the state must not take the whole
@@ -79,9 +79,9 @@ const RATE_LIMIT: u32 = 300;
 /// bursts while capping a voice flood under [`RATE_LIMIT`]. Excess frames are
 /// dropped silently — voice is loss-tolerant, never a kick trigger.
 const VOICE_RATE_LIMIT: u32 = 100;
-/// Workbench applies one connection may send per second: each one evaluates the law and may intern a
-/// configuration under the [`State`] lock, so the budget is a human's click rate, not a flood.
-const CRAFT_RATE_LIMIT: u32 = 10;
+/// Tool uses one connection may send per second: each one evaluates the law and may intern two
+/// configurations under the [`State`] lock, so the budget is a human's swing rate, not a flood.
+const TOOL_RATE_LIMIT: u32 = 12;
 /// Ids the material table keeps for the world's own products (reactions, generation): a spec a
 /// CLIENT sends is interned only while at least this many ids are free, so no client can exhaust
 /// the table (see [`resolve_client_spec`]).
@@ -123,7 +123,7 @@ pub struct Config {
     /// Off, a teleport is answered with an authoritative snap-back.
     pub allow_teleport: bool,
     pub worldgen: WorldgenKind,
-    pub diffusion: DiffusionCfg,
+    pub terrain: TerrainCfg,
     /// Server-side mods (`validate_edit`, join/leave, `on_chat`). Empty by
     /// default — this crate ships no implementations. Hook bodies run outside
     /// the roster lock.
@@ -137,8 +137,8 @@ impl Default for Config {
             seed: 0,
             day_secs: 600.0, // matches the client's default DayLength
             allow_teleport: true,
-            worldgen: WorldgenKind::Classic,
-            diffusion: DiffusionCfg::default(),
+            worldgen: WorldgenKind::Diffusion,
+            terrain: TerrainCfg::default(),
             hooks: Vec::new(),
         }
     }
@@ -182,8 +182,8 @@ struct Ctx {
     day_secs: f32,
     allow_teleport: bool,
     worldgen: WorldgenKind,
-    diffusion: DiffusionCfg,
-    generator: crate::world::diffusion::Generator,
+    terrain: TerrainCfg,
+    generator: crate::world::terrain::Generator,
     /// `None` when [`Config::hooks`] is empty so the default server never
     /// touches a second lock. When `Some`, hook calls happen *outside* the
     /// [`State`] lock: collect facts under it, drop it, then run the table.
@@ -342,12 +342,12 @@ impl State {
 /// the generator, so the infinite world is defined without loading chunks.
 struct ServerCells<'a> {
     state: &'a mut State,
-    generator: &'a crate::world::diffusion::Generator,
+    generator: &'a crate::world::terrain::Generator,
 }
 
 fn server_block(
     state: &State,
-    generator: &crate::world::diffusion::Generator,
+    generator: &crate::world::terrain::Generator,
     pos: Pos,
 ) -> BlockId {
     if let Some(cell) = state.edits.get(&pos) {
@@ -406,7 +406,6 @@ fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
     if state.reactions.pending() == 0 {
         return;
     }
-    let law = *state.registry.law();
     let budget = reactions::Budget::DEFAULT;
     let mut sched = std::mem::take(&mut state.reactions);
     let mutations = {
@@ -414,7 +413,7 @@ fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
             state: &mut state,
             generator: &ctx.generator,
         };
-        sched.tick(&mut cells, &law, budget)
+        sched.tick(&mut cells, budget)
     };
     state.reactions = sched;
     send_reaction_mutations(&mut state, &mutations);
@@ -428,7 +427,7 @@ fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
     if mutations.is_empty() {
         return;
     }
-    // A cell committed in both generations of one tick is sent once, with its
+    // A cell committed by several contacts in one turn is sent once, with its
     // final content, at the point of its last commit (order is preserved).
     let mut last: HashMap<Pos, usize> = HashMap::with_capacity(mutations.len());
     for (i, m) in mutations.iter().enumerate() {
@@ -530,19 +529,9 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     // Doubles as spawn-height terrain, the content identity joins must match,
     // and the edit-spec validator.
     let mut registry = BlockRegistry::with_builtins();
-    let generator = match config.worldgen {
-        WorldgenKind::Classic => crate::world::diffusion::classic(&mut registry, config.seed),
-        WorldgenKind::Diffusion => {
-            if config.diffusion.version >= 2 {
-                crate::world::diffusion::diffusion_v2(
-                    &mut registry,
-                    config.seed,
-                    config.diffusion,
-                )
-            } else {
-                crate::world::diffusion::diffusion(&mut registry, config.seed, config.diffusion)
-            }
-        }
+    let generator: crate::world::terrain::Generator = match config.worldgen {
+        WorldgenKind::Flat => Arc::new(crate::world::generation::FlatTerrain::new(&mut registry, config.seed)),
+        WorldgenKind::Diffusion => crate::world::terrain::generator(&mut registry, config.seed, config.terrain),
     };
     let hooks = if config.hooks.is_empty() {
         None
@@ -552,11 +541,11 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let ctx = Arc::new(Ctx {
         password: config.password,
         seed: config.seed,
-        fingerprint: crate::net::fingerprint_kind_cfg(&registry, config.worldgen, config.diffusion),
+        fingerprint: crate::net::fingerprint_kind_cfg(&registry, config.worldgen, config.terrain),
         day_secs: clamp_day_secs(config.day_secs),
         allow_teleport: config.allow_teleport,
         worldgen: config.worldgen,
-        diffusion: config.diffusion,
+        terrain: config.terrain.clamp(),
         generator,
         hooks,
     });
@@ -685,7 +674,7 @@ fn handle_client(
             seed: ctx.seed,
             spawn,
             worldgen: ctx.worldgen,
-            diffusion: ctx.diffusion,
+            terrain: ctx.terrain,
             law: crate::net::protocol::law_stamp(),
         },
     );
@@ -891,7 +880,7 @@ fn client_loop(
     // chattier than any other message and must not eat a peer's general budget.
     let mut rate = RateWindow::new(RATE_LIMIT);
     let mut voice_rate = RateWindow::new(VOICE_RATE_LIMIT);
-    let mut craft_rate = RateWindow::new(CRAFT_RATE_LIMIT);
+    let mut tool_rate = RateWindow::new(TOOL_RATE_LIMIT);
     loop {
         // A kick (slow client) wakes this out of the blocking read so cleanup
         // runs; the read future is only ever dropped on that teardown path, so
@@ -947,16 +936,13 @@ fn client_loop(
                 }
             }
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
-            ClientMessage::Craft {
-                origin_spec,
-                target_spec,
-                event,
-                repeat,
-            } => {
-                if !craft_rate.allow(now) {
-                    continue; // Over the workbench budget this second — drop silently.
+            ClientMessage::ToolUse { req, x, y, z, expect, tool_spec } => {
+                if !tool_rate.allow(now) {
+                    // Over the tool budget this second: refuse, so the client's swing resolves.
+                    refuse_tool(shared, id, req, x, y, z, &tool_spec);
+                    continue;
                 }
-                on_craft(shared, id, &origin_spec, &target_spec, event, repeat)
+                on_tool_use(shared, &ctx.generator, id, req, x, y, z, expect, &tool_spec)
             }
         }
     }
@@ -1283,11 +1269,8 @@ fn on_edit(
     if let Some(old) = state.edits.insert((x, y, z), Cell { spec: spec.clone(), rev }) {
         state.release(old.spec);
     }
-    if block == AIR {
-        reactions::on_broken(&mut state.reactions, (x, y, z));
-    } else {
-        reactions::on_placed(&mut state.reactions, (x, y, z));
-    }
+    // Placed or removed: the cell's contacts wake.
+    state.reactions.wake_cell((x, y, z));
     if let Some(out) = ack_to {
         let _ = out
             .try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
@@ -1297,67 +1280,81 @@ fn on_edit(
     broadcast(&mut state, &msg, |pid, _| pid != id);
 }
 
-/// Workbench apply. The server checks the shape (specs resolve, event is a
-/// workbench kind, repeat in [`protocol::WORKBENCH_REPEAT`]), that the sender is
-/// ready, and that the specs are configurations it knows (or, below the reserve
-/// line, may learn) — see [`resolve_client_spec`]. There is no holdings ledger
-/// (task 67 has not landed), so it does not check that the sender owns the
-/// materials. The result is interned only below the same reserve line.
-fn on_craft(
+/// Answer a tool use with "nothing happened": the cell's current content and the tool unchanged.
+fn refuse_tool(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32, tool_spec: &str) {
+    let state = shared.lock_recover();
+    let Some(h) = state.players.get(&id) else { return };
+    let cell = state.edits.get(&(x, y, z));
+    let (rev, cell_spec) = cell.map_or((0, Arc::from("")), |c| (c.rev, c.spec.clone()));
+    let msg = ServerMessage::ToolResult { req, reacted: false, rev, cell_spec, tool_spec: tool_spec.into() };
+    let _ = h.out.try_send(msg.encode().into());
+}
+
+/// A player uses a held configuration as a tool on a cell. Gates: ready, reach, the tool spec
+/// resolves (known, or novel below the reserve line), the cell revision is the one the client
+/// expected. Then ONE operation of the law runs between the cell (A) and the tool (B); on a
+/// change the cell is written, its contacts wake, the sender gets both results and everyone else
+/// the cell edit. There is no holdings ledger, so the server trusts the client about what it holds
+/// (as for placement).
+#[allow(clippy::too_many_arguments)]
+fn on_tool_use(
     shared: &Arc<Mutex<State>>,
+    generator: &crate::world::terrain::Generator,
     id: u32,
-    origin_spec: &str,
-    target_spec: &str,
-    event: u8,
-    repeat: u8,
+    req: u32,
+    x: i32,
+    y: i32,
+    z: i32,
+    expect: u32,
+    tool_spec: &str,
 ) {
-    if origin_spec.len() > MAX_SPEC || target_spec.len() > MAX_SPEC {
-        return;
-    }
-    if !protocol::WORKBENCH_REPEAT.contains(&repeat) {
-        return;
-    }
-    let Some(event) = protocol::workbench_event(event) else {
-        return;
-    };
     let mut state = shared.lock_recover();
-    let out = {
-        let Some(h) = state.players.get(&id) else { return };
-        if !h.ready {
-            return;
-        }
-        h.out.clone()
-    };
-    let Some(origin_id) = resolve_client_spec(&mut state.registry, origin_spec) else {
+    let Some(h) = state.players.get(&id) else { return };
+    if !h.ready {
         return;
+    }
+    let out = h.out.clone();
+    let target = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+    let pos = (x, y, z);
+    let current = state.edits.get(&pos).map_or(0, |c| c.rev);
+    let reply = |state: &State, reacted: bool, rev: u32, tool: Arc<str>| {
+        let cell_spec: Arc<str> = state.edits.get(&pos).map_or_else(
+            || crate::save::block_spec(&state.registry, generator.voxel_at(x, y, z)).into(),
+            |c| c.spec.clone(),
+        );
+        let msg = ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec: tool };
+        let _ = out.try_send(msg.encode().into());
     };
-    let Some(target_id) = resolve_client_spec(&mut state.registry, target_spec) else {
-        return;
+    let unchanged: Arc<str> = tool_spec.into();
+    if tool_spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH || expect != current {
+        return reply(&state, false, current, unchanged);
+    }
+    let Some(tool) = resolve_client_spec(&mut state.registry, tool_spec) else {
+        return reply(&state, false, current, unchanged);
     };
-    if origin_id == AIR || target_id == AIR {
-        return; // The void is not a material to work.
+    let cell = server_block(&state, generator, pos);
+    if tool == AIR || cell == AIR {
+        return reply(&state, false, current, unchanged);
     }
     let limit = crate::block::registry::MAX_BLOCK_TYPES - CLIENT_INTERN_RESERVE;
-    if state.registry.block_count() >= limit {
-        return; // A novel product would eat into the world's reserve.
+    if state.registry.block_count() + 2 > limit {
+        return reply(&state, false, current, unchanged); // products would eat the world's reserve
     }
-    let origin = state.registry.configuration(origin_id).clone();
-    let target = state.registry.configuration(target_id).clone();
-    let Some(result_id) = state.registry.apply_interaction(&origin, &target, event, repeat) else {
-        return;
+    let Some((_, new_cell, new_tool)) = state.registry.react(cell, tool) else {
+        return reply(&state, false, current, unchanged);
     };
-    let result_spec: Arc<str> = state.registry.spec(result_id).into();
-    let _ = out.try_send(
-        ServerMessage::CraftResult {
-            origin_spec: origin_spec.into(),
-            target_spec: target_spec.into(),
-            event: event as u8,
-            repeat,
-            result_spec,
-        }
-        .encode()
-        .into(),
-    );
+    let canonical = crate::save::block_spec(&state.registry, new_cell);
+    let Some(spec) = state.intern(&canonical) else {
+        return reply(&state, false, current, unchanged);
+    };
+    let rev = current + 1;
+    if let Some(old) = state.edits.insert(pos, Cell { spec: spec.clone(), rev }) {
+        state.release(old.spec);
+    }
+    state.reactions.wake_cell(pos);
+    let tool_out: Arc<str> = state.registry.spec(new_tool).into();
+    reply(&state, true, rev, tool_out);
+    broadcast(&mut state, &ServerMessage::Edit { x, y, z, rev, spec }, |pid, _| pid != id);
 }
 
 /// A [`Verdict::Deny`] drops the broadcast and delivers `reason` only to the
@@ -1510,23 +1507,24 @@ fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason:
     println!("[x] rejected a connection: {reason}");
 }
 
-/// Scattered a little per id so players don't stack on the exact same block;
-/// scans outward for the first column above sea level.
+/// Scattered a little per id so players don't stack on the exact same block; scans outward for
+/// the first level column (its four neighbours within one block), like the single-player spawn.
 fn spawn_point(generator: &dyn TerrainGenerator, id: u32) -> DVec3 {
     let sx = (id % 8) as i32 - 3;
     let sz = ((id / 8) % 8) as i32 - 3;
-    let sea = generator.sea_level();
     for r in 0..64 {
         for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
             let (x, z) = (sx + dx * 8, sz + dz * 8);
             let h = generator.height(x, z);
-            if h > sea {
+            let flat = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                .iter()
+                .all(|&(ox, oz)| (generator.height(x + ox, z + oz) - h).abs() <= 1);
+            if flat {
                 return DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5);
             }
         }
     }
-    // Fallback: sit on the water surface at the scattered origin.
-    let h = generator.height(sx, sz).max(sea);
+    let h = generator.height(sx, sz);
     DVec3::new(sx as f64 + 0.5, h as f64 + 3.0, sz as f64 + 0.5)
 }
 
@@ -1553,8 +1551,8 @@ mod tests {
 
     use super::*;
 
-    fn test_generator() -> crate::world::diffusion::Generator {
-        crate::world::diffusion::classic(&mut BlockRegistry::with_builtins(), 4242)
+    fn test_generator() -> crate::world::terrain::Generator {
+        crate::world::terrain::generator(&mut BlockRegistry::with_builtins(), 4242, Default::default())
     }
 
     #[test]
@@ -1659,10 +1657,13 @@ mod tests {
     }
 
     fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
+        // The palette first, exactly as `spawn` builds it, so generator ids mean the same here.
+        let mut registry = BlockRegistry::with_builtins();
+        crate::world::terrain::Materials::intern(&mut registry);
         State {
             edits: HashMap::new(),
             spec_pool: HashSet::new(),
-            registry: BlockRegistry::with_builtins(),
+            registry,
             players,
             grid: HashMap::new(),
             next_id: 2,
@@ -1687,8 +1688,8 @@ mod tests {
             fingerprint: 0,
             day_secs: 600.0,
             allow_teleport,
-            worldgen: WorldgenKind::Classic,
-            diffusion: DiffusionCfg::default(),
+            worldgen: WorldgenKind::Diffusion,
+            terrain: TerrainCfg::default(),
             generator: test_generator(),
             hooks: None,
         }
@@ -1724,30 +1725,64 @@ mod tests {
         assert_eq!(r.block_count(), count + 1);
     }
 
+    /// The reference destructive pair as specs, with the target written into the ledger at `cell`.
+    fn place_pair(shared: &Arc<Mutex<State>>, cell: Pos) -> (String, String) {
+        let mut state = shared.lock_recover();
+        let (a, e) = crate::sim::reactions::destructive_pair(&mut state.registry);
+        let (sa, se) = (state.registry.spec(a), state.registry.spec(e));
+        let spec = state.intern(&sa).unwrap();
+        state.edits.insert(cell, Cell { spec, rev: 1 });
+        (sa, se)
+    }
+
     #[test]
-    fn a_craft_from_an_unready_player_is_not_evaluated() {
+    fn a_tool_use_from_an_unready_player_is_not_evaluated() {
         let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
         let mut p = test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick());
         p.ready = false;
         players.insert(1u32, p);
         let shared = Arc::new(Mutex::new(test_state(players)));
+        let (_, tool) = place_pair(&shared, (8, 20, 8));
         let count = shared.lock_recover().registry.block_count();
-        on_craft(&shared, 1, "c:0105060708", "c:0109090909", 2, 1);
+        on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &tool);
         assert_eq!(shared.lock_recover().registry.block_count(), count, "nothing interned");
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn a_craft_of_the_void_is_refused() {
+    fn a_tool_use_runs_one_operation_of_the_law_on_the_server() {
         let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let (peer_out, peer_rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        players.insert(2u32, test_player(DVec3::new(9.5, 20.0, 8.5), peer_out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        let rock = rock_spec();
-        on_craft(&shared, 1, "air", &rock, 2, 1);
-        on_craft(&shared, 1, &rock, "air", 2, 1);
-        assert!(rx.try_recv().is_err(), "air is not a material to work");
+        let (_, tool) = place_pair(&shared, (8, 20, 8));
+        on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &tool);
+        let replies = drain_msgs(&rx);
+        let [ServerMessage::ToolResult { req: 7, reacted: true, rev: 2, cell_spec, tool_spec }] = replies.as_slice() else {
+            panic!("expected one ToolResult, got {replies:?}");
+        };
+        let state = shared.lock_recover();
+        let cell = state.registry.lookup_spec(cell_spec).unwrap();
+        let new_tool = state.registry.lookup_spec(tool_spec).unwrap();
+        assert_eq!(state.registry.configuration(cell).len(), 3, "one element left the block");
+        assert_eq!(state.registry.configuration(new_tool).len(), 5, "and joined the tool");
+        assert_eq!(state.edits[&(8, 20, 8)].rev, 2);
+        assert_eq!(state.reactions.pending(), 6, "the changed cell woke its contacts");
+        drop(state);
+        assert!(
+            matches!(drain_msgs(&peer_rx).as_slice(), [ServerMessage::Edit { x: 8, y: 20, z: 8, rev: 2, .. }]),
+            "peers see the cell change"
+        );
+        // A stale revision, a void tool and a tool out of reach are refused with `reacted: false`.
+        on_tool_use(&shared, &test_generator(), 1, 8, 8, 20, 8, 1, &tool);
+        on_tool_use(&shared, &test_generator(), 1, 9, 8, 20, 8, 2, "air");
+        on_tool_use(&shared, &test_generator(), 1, 10, 80, 20, 8, 0, &tool);
+        let refused = drain_msgs(&rx);
+        assert_eq!(refused.len(), 3);
+        assert!(refused.iter().all(|m| matches!(m, ServerMessage::ToolResult { reacted: false, .. })));
     }
 
     #[test]
@@ -1776,26 +1811,6 @@ mod tests {
     }
 
     #[test]
-    fn a_client_craft_does_not_commit_world_reactions() {
-        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-        let mut players = HashMap::new();
-        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
-        let shared = Arc::new(Mutex::new(test_state(players)));
-        let pending_before = shared.lock_recover().reactions.pending();
-        on_craft(&shared, 1, "air", "air", 3, 1);
-        on_craft(&shared, 1, "air", "air", 99, 1);
-        let state = shared.lock_recover();
-        assert_eq!(
-            state.reactions.pending(),
-            pending_before,
-            "ExternallyChanged craft must not queue scheduler events"
-        );
-        assert!(state.edits.is_empty(), "craft must not write the overlay");
-        drop(state);
-        assert!(rx.try_recv().is_err(), "malformed craft is silent");
-    }
-
-    #[test]
     fn on_edit_queues_place_and_break_events() {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
@@ -1805,40 +1820,48 @@ mod tests {
         on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
         {
             let state = shared.lock_recover();
-            assert_eq!(state.reactions.pending(), 1, "place emits NewContact at the cell");
+            assert_eq!(state.reactions.pending(), 6, "a placement wakes the cell's six contacts");
         }
         on_edit(&shared, None, 1, 2, 8, 20, 8, 1, "air");
         let state = shared.lock_recover();
-        assert!(
-            state.reactions.pending() >= 6,
-            "break emits ExternallyChanged on six neighbours: {}",
-            state.reactions.pending()
-        );
+        assert_eq!(state.reactions.pending(), 6, "a removal wakes the same six (deduplicated)");
     }
 
     #[test]
     fn scripted_reactions_match_a_local_world() {
         use crate::render_config::RenderConfig;
-        use crate::sim::reactions::{reactive_region_pair, scripted_run, ReactionScheduler};
+        use crate::sim::reactions::{destructive_pair, Budget, ReactionScheduler};
         use crate::world::World;
 
-        let mut world = World::with_config(42, RenderConfig::default());
-        let (wa, wb) = reactive_region_pair(world.registry_mut());
-        let y = world.surface_y(0, 0);
-        let local = scripted_run(&mut world, &mut ReactionScheduler::new(), wa, wb, y);
+        fn run<S: CellStore>(store: &mut S, a: BlockId, e: BlockId, y: i32) -> Vec<(Pos, Vec<u8>, Vec<u8>)> {
+            store.set_block((0, y, 0), a);
+            store.set_block((1, y, 0), e);
+            let mut s = ReactionScheduler::new();
+            s.wake_cell((1, y, 0));
+            let mut out = Vec::new();
+            for _ in 0..50 {
+                for m in s.tick(store, Budget::DEFAULT) {
+                    let r = store.registry();
+                    out.push((m.pos, r.encoding(m.from).as_bytes().to_vec(), r.encoding(m.to).as_bytes().to_vec()));
+                }
+            }
+            out
+        }
+
+        let mut world = World::with_kind(42, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, true);
+        let (wa, we) = destructive_pair(world.registry_mut());
+        let y = world.surface_y(0, 0) + 3;
+        let local = run(&mut world, wa, we, y);
 
         let mut registry = BlockRegistry::with_builtins();
-        let generator = crate::world::diffusion::classic(&mut registry, 42);
-        let (sa, sb) = reactive_region_pair(&mut registry);
+        let generator = crate::world::terrain::generator(&mut registry, 42, Default::default());
+        let (sa, se) = destructive_pair(&mut registry);
         let mut state = test_state(HashMap::new());
         state.registry = registry;
-        let mut cells = ServerCells {
-            state: &mut state,
-            generator: &generator,
-        };
-        let server = scripted_run(&mut cells, &mut ReactionScheduler::new(), sa, sb, y);
+        let mut cells = ServerCells { state: &mut state, generator: &generator };
+        let server = run(&mut cells, sa, se, y);
         assert_eq!(local, server);
-        assert!(!local.is_empty(), "scripted pair must react");
+        assert!(!local.is_empty(), "the pair must react");
     }
 
     /// An out-of-reach edit must be rejected; an in-reach one must be recorded.
@@ -1871,7 +1894,7 @@ mod tests {
 
         let attempted = DVec3::new(9.5, 20.0, 8.5);
         on_move(&shared, 1, attempted, f32::NAN, 0.0, Stance::Sneaking);
-        on_move(&shared, 1, attempted, 0.0, f32::INFINITY, Stance::Swimming);
+        on_move(&shared, 1, attempted, 0.0, f32::INFINITY, Stance::Sneaking);
 
         let state = shared.lock_recover();
         let player = &state.players[&1];
@@ -2251,7 +2274,7 @@ mod tests {
     }
 
     #[test]
-    fn classic_fingerprint_is_rejected_from_a_diffusion_server() {
+    fn flat_fingerprint_is_rejected_from_a_diffusion_server() {
         let handle = spawn(
             0,
             Config {
@@ -2265,10 +2288,10 @@ mod tests {
         let reason = reject_reason(
             handle.addr(),
             &hello(
-                "classic",
+                "flat",
                 "",
                 PROTOCOL_VERSION,
-                crate::net::content_fingerprint(),
+                crate::net::content_fingerprint_kind(WorldgenKind::Flat),
             ),
         );
         assert!(reason.contains("content"), "unexpected reason: {reason}");
@@ -2277,14 +2300,14 @@ mod tests {
 
     #[test]
     fn welcome_carries_the_servers_worldgen_kind_and_cfg() {
-        let diffusion = DiffusionCfg::default();
+        let terrain = TerrainCfg { relief: 175, caves: 50, mines: 0, space: 125 };
         let handle = spawn(
             0,
             Config {
                 password: String::new(),
                 seed: 11,
                 worldgen: WorldgenKind::Diffusion,
-                diffusion,
+                terrain,
                 ..Config::default()
             },
         )
@@ -2293,18 +2316,13 @@ mod tests {
             "guest",
             "",
             PROTOCOL_VERSION,
-            crate::net::content_fingerprint_kind_cfg(WorldgenKind::Diffusion, diffusion),
+            crate::net::content_fingerprint_kind_cfg(WorldgenKind::Diffusion, terrain),
         );
         match raw_reply(handle.addr(), &hello) {
-            ServerMessage::Welcome {
-                worldgen,
-                diffusion: got,
-                seed,
-                ..
-            } => {
+            ServerMessage::Welcome { worldgen, terrain: got, seed, .. } => {
                 assert_eq!(seed, 11);
                 assert_eq!(worldgen, WorldgenKind::Diffusion);
-                assert_eq!(got, diffusion);
+                assert_eq!(got, terrain);
             }
             other => panic!("expected Welcome with diffusion kind, got {other:?}"),
         }
@@ -2730,58 +2748,6 @@ mod tests {
         out
     }
 
-    #[test]
-    fn craft_is_evaluated_on_the_server_and_matches_interact() {
-        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-        let mut players = HashMap::new();
-        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
-        let shared = Arc::new(Mutex::new(test_state(players)));
-        let origin = material::Configuration::single(material::Element::new([40, 80, 120, 160]));
-        let target = material::Configuration::single(material::Element::new([80, 40, 160, 120]));
-        let (origin_spec, target_spec, expected) = {
-            let mut state = shared.lock_recover();
-            let oid = state.registry.intern(&origin).unwrap();
-            let tid = state.registry.intern(&target).unwrap();
-            let os = state.registry.spec(oid);
-            let ts = state.registry.spec(tid);
-            let law = *state.registry.law();
-            let result = crate::block::registry::interact_repeat(
-                &law,
-                &origin,
-                &target,
-                material::EventKind::Collision,
-                3,
-            );
-            let rid = state.registry.intern(&result).unwrap();
-            let rs = state.registry.spec(rid);
-            (os, ts, rs)
-        };
-        on_craft(&shared, 1, &origin_spec, &target_spec, 2, 3);
-        match drain_msgs(&rx).as_slice() {
-            [ServerMessage::CraftResult {
-                origin_spec: o,
-                target_spec: t,
-                event,
-                repeat,
-                result_spec,
-            }] => {
-                assert_eq!(&**o, origin_spec);
-                assert_eq!(&**t, target_spec);
-                assert_eq!(*event, 2);
-                assert_eq!(*repeat, 3);
-                assert_eq!(&**result_spec, expected);
-            }
-            other => panic!("expected one CraftResult, got {other:?}"),
-        }
-        on_craft(&shared, 1, &origin_spec, &target_spec, 9, 3);
-        on_craft(&shared, 1, &origin_spec, &target_spec, 2, 0);
-        on_craft(&shared, 1, "nope", &target_spec, 2, 1);
-        assert!(
-            drain_msgs(&rx).is_empty(),
-            "malformed craft is dropped (well-formedness only; no holdings ledger)"
-        );
-    }
-
     /// A hook Deny is the same `EditAck { accepted: false }` a lost race sends:
     /// exactly one reject, no ledger write, no broadcast to peers.
     #[test]
@@ -2962,49 +2928,14 @@ mod tests {
     }
 
     #[test]
-    fn server_block_evaluates_the_column_once_per_probe() {
-        use std::hint::black_box;
-
+    fn server_block_reads_the_generator_like_the_client() {
         let mut registry = BlockRegistry::with_builtins();
-        let g = crate::world::diffusion::classic(&mut registry, 4242);
-        let probes: Vec<Pos> = (0..60)
-            .flat_map(|x| (0..60).map(move |z| (x, 16, z)))
-            .collect();
-        assert_eq!(probes.len(), 3600);
-
-        let naive = |g: &crate::world::diffusion::Generator| {
-            for &(x, y, z) in &probes {
-                black_box(g.block_at(x, y, z, g.height(x, z)));
+        let g = crate::world::terrain::generator(&mut registry, 4242, Default::default());
+        for x in 0..40 {
+            for z in 0..40 {
+                let y = g.height(x, z) - 1;
+                assert_eq!(g.block_at(x, y, z, g.height(x, z)), g.voxel_at(x, y, z), "({x},{y},{z})");
             }
-        };
-        let once = |g: &crate::world::diffusion::Generator| {
-            for &(x, y, z) in &probes {
-                black_box(g.voxel_at(x, y, z));
-            }
-        };
-        naive(&g);
-        once(&g);
-        let mut before = Duration::ZERO;
-        let mut after = Duration::ZERO;
-        for _ in 0..3 {
-            let t0 = Instant::now();
-            naive(&g);
-            before += t0.elapsed();
-            let t1 = Instant::now();
-            once(&g);
-            after += t1.elapsed();
         }
-        println!("server_block column eval: before={before:?} after={after:?}");
-        for &(x, y, z) in &probes {
-            assert_eq!(
-                g.block_at(x, y, z, g.height(x, z)),
-                g.voxel_at(x, y, z),
-                "voxel_at must match height+block_at at ({x},{y},{z})"
-            );
-        }
-        assert!(
-            after < before,
-            "one column eval per probe must beat height+block_at ({after:?} vs {before:?})"
-        );
     }
 }

@@ -32,7 +32,7 @@ visual_mod!(
     AtmosphereMod,
     "Atmosphere",
     "atmosphere",
-    "Sky, clouds, weather, stars, day/night, fog, and animated water.",
+    "Sky, clouds, weather, stars, day/night, and fog.",
     Atmosphere
 );
 visual_mod!(

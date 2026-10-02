@@ -34,10 +34,10 @@ use std::time::{Duration, Instant};
 
 use super::Coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::diffusion::Generator;
 use super::generation::ColumnHeights;
 #[cfg(test)]
-use super::generation::Terrain;
+use super::terrain::Terrain;
+use super::terrain::Generator;
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
 use super::neighborhood::BoundedPool;
@@ -350,18 +350,24 @@ impl MeshPayload {
     }
 }
 
-/// One packed section mesh written into staging. `origin_y` / `shift` match
-/// [`SectionMeshData`] so upload placement stays identical to the CPU path.
+/// A packed section's slab meshes written into staging. `shift` and each slab's
+/// `origin_y` match [`SectionMeshData`] so upload placement stays identical to the CPU path.
 pub(in crate::world) struct StagedSection {
-    pub origin_y: u32,
     pub shift: u8,
+    pub slabs: Vec<StagedSlab>,
+}
+
+/// One staged slab of a [`StagedSection`].
+pub(in crate::world) struct StagedSlab {
+    pub origin_y: u32,
     pub passes: ByPass<Option<StagedPass>>,
 }
 
 impl StagedSection {
     pub(in crate::world) fn vertex_bytes(&self) -> usize {
-        self.passes
+        self.slabs
             .iter()
+            .flat_map(|s| s.passes.iter())
             .map(|(_, p)| p.as_ref().map_or(0, StagedPass::vertex_bytes))
             .sum()
     }
@@ -386,10 +392,7 @@ impl Default for SectionPayload {
 }
 
 fn cpu_section_bytes(data: &SectionMeshData) -> usize {
-    Pass::ALL
-        .iter()
-        .map(|&p| data.data[p].vertex_bytes())
-        .sum()
+    data.vertex_bytes()
 }
 
 impl SectionPayload {
@@ -402,9 +405,11 @@ impl SectionPayload {
 
     pub(in crate::world) fn release_staging(self, eng: &Engine) {
         if let Self::Staged(data) = self {
-            for (_, pass) in data.passes.into_iter_passes() {
-                if let Some(pass) = pass {
-                    eng.release_mesh_staging(pass.staging);
+            for slab in data.slabs {
+                for (_, pass) in slab.passes.into_iter_passes() {
+                    if let Some(pass) = pass {
+                        eng.release_mesh_staging(pass.staging);
+                    }
                 }
             }
         }
@@ -493,18 +498,18 @@ fn try_stage_section(
     stager: &MeshStager,
     data: &SectionMeshData,
 ) -> Option<Box<StagedSection>> {
-    let mut passes = ByPass::from_fn(|_| None);
-    for p in Pass::ALL {
-        if data.data[p].is_empty() {
-            continue;
+    let mut slabs = Vec::with_capacity(data.slabs.len());
+    for slab in &data.slabs {
+        let mut passes = ByPass::from_fn(|_| None);
+        for p in Pass::ALL {
+            if slab.data[p].is_empty() {
+                continue;
+            }
+            passes[p] = Some(stage_pass(stager, &slab.data[p])?);
         }
-        passes[p] = Some(stage_pass(stager, &data.data[p])?);
+        slabs.push(StagedSlab { origin_y: slab.origin_y, passes });
     }
-    Some(Box::new(StagedSection {
-        origin_y: data.origin_y,
-        shift: data.shift,
-        passes,
-    }))
+    Some(Box::new(StagedSection { shift: data.shift, slabs }))
 }
 
 fn mesh_payload_from_output(
@@ -1502,7 +1507,7 @@ mod tests {
 
     /// Mirrors `World::new`'s generator construction.
     fn generator(seed: i64) -> Generator {
-        crate::world::diffusion::classic(&mut BlockRegistry::with_builtins(), seed)
+        crate::world::terrain::generator(&mut BlockRegistry::with_builtins(), seed, Default::default())
     }
 
     /// Create a far section job tagged by id for scheduler tests.
@@ -1578,7 +1583,7 @@ mod tests {
     #[test]
     fn worker_meshing_matches_the_sync_mesher() {
         let mut registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 5);
         // The chunk holding the surface at the origin, with all six neighbours
         // (below: solid ground, above: sky, sides: more surface).
         let chunk = Chunk::new(0, 1, 0, &generator);
@@ -1910,7 +1915,7 @@ mod tests {
     #[ignore]
     fn mesh_result_channel_throughput() {
         let mut registry = BlockRegistry::with_builtins();
-        let generator = Terrain::new(&mut registry, 20.0, 5);
+        let generator = Terrain::new(&mut registry, 5);
         let neigh: Vec<Chunk> = (0..27)
             .map(|k| Chunk::new(k % 3 - 1, 1 + k / 9 - 1, k / 3 % 3 - 1, &generator))
             .collect();

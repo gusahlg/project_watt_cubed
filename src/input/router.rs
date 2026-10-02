@@ -146,7 +146,8 @@ impl Router {
                 for e in GameplayEvent::ALL {
                     let disabled = match e {
                         GameplayEvent::Place => !mod_logic,
-                        GameplayEvent::ToggleInventory | GameplayEvent::ToggleCrafting => !mod_ui,
+                        e if e.is_hotbar() => !mod_logic,
+                        GameplayEvent::ToggleInventory => !mod_ui,
                         _ => false,
                     };
                     if disabled {

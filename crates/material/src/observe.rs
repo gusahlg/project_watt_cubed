@@ -1,10 +1,11 @@
-//! Operational readings of a configuration: the response of the material to the law's fixed probe
-//! elements. These are cached observations of the physics (spec §3.3), never authored causes.
+//! Operational readings of a configuration, taken with the law's own quantity: the fit function.
+//! Hardness is how strongly the occurrences hold each other (the internal support the law caches);
+//! clarity, glow and grip are how strongly the configuration attracts the law's probe elements. These
+//! are cached observations of the physics, never authored causes.
 
-use crate::configuration::Configuration;
-use crate::element::{Element, D};
-use crate::kernel::influence_q0;
+use crate::kernel::{fit_raw, Block, QUANTUM};
 use crate::law::Law;
+use crate::element::Element;
 
 /// The acoustic class the audio director keys on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -12,148 +13,94 @@ use crate::law::Law;
 pub enum Acoustic {
     /// Nothing there.
     Void = 0,
-    /// Reads as liquid.
-    Liquid = 1,
-    /// Soft solid.
+    /// Weakly held matter.
     Soft = 2,
-    /// Hard solid.
+    /// Strongly held matter.
     Hard = 3,
 }
 
 /// What the world needs to know operationally about a configuration.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Observation {
-    /// Blocks movement.
+    /// Blocks movement (every non-empty configuration).
     pub solid: bool,
-    /// Flows and floats things (the flow response reached the law's threshold).
-    pub liquid: bool,
-    /// 0 opaque … 255 fully transparent (the light response).
+    /// 0 opaque … 255 fully transparent (attraction to the light probe).
     pub transparency: u8,
-    /// Block-light level 0..15 (the glow response above threshold).
+    /// Block-light level 0..15 (attraction to the glow probe).
     pub emission: u8,
-    /// 255 − contact response: high = stable under contact.
+    /// How firmly the occurrences hold each other, 0..255 (mining time and impact read this).
     pub hardness: u8,
-    /// The friction response.
+    /// Grip, 0..255 (attraction to the grip probe).
     pub friction: u8,
-    /// The raw flow response (buoyancy strength for liquids).
-    pub flow: u8,
+    /// Mean internal pair fit in 1/256 of `QUANTUM` (negative: the mixture wants to come apart).
+    pub cohesion: i16,
     /// Sound class.
     pub acoustic: Acoustic,
 }
 
 impl Observation {
-    /// Map the five probe responses onto operational readings.
-    pub fn from_responses(law: &Law, contact: u8, light: u8, flow: u8, glow: u8, friction: u8) -> Self {
-        let p = &law.probes;
-        let liquid = flow >= p.liquid_min;
-        let transparency = if light > p.transparent_min {
-            ((light - p.transparent_min) as u32 * 255 / (255 - p.transparent_min) as u32) as u8
-        } else {
-            0
-        };
-        let emission = if glow >= p.glow_min {
-            (1 + (glow - p.glow_min) as u32 * 14 / (255 - p.glow_min) as u32).min(15) as u8
-        } else {
-            0
-        };
-        let hardness = 255 - contact;
-        let acoustic = if liquid {
-            Acoustic::Liquid
-        } else if hardness < 96 {
-            Acoustic::Soft
-        } else {
-            Acoustic::Hard
-        };
-        Observation {
-            solid: !liquid,
-            liquid,
-            transparency,
-            emission,
-            hardness,
-            friction,
-            flow,
-            acoustic,
-        }
-    }
-
     /// What the void reads as: passable, transparent, silent.
     pub const AIR: Observation = Observation {
         solid: false,
-        liquid: false,
         transparency: 255,
         emission: 0,
         hardness: 0,
         friction: 0,
-        flow: 0,
+        cohesion: 0,
         acoustic: Acoustic::Void,
     };
 }
 
-/// Per-element response magnitude that reads as 255 (the sum over axes of the largest knot response
-/// after mixing is ~16 under law v0's band-limited curve); larger responses saturate.
-const RESPONSE_FULL: i32 = 16;
-
-/// Response magnitude of a single element to one probe, 0..255.
-pub fn element_response(law: &Law, e: Element, probe: Element) -> u8 {
-    let raw = influence_q0(law, probe, e);
-    let strength = law.probes.strength as i32;
-    let mut mag = 0i32;
-    for i in 0..D {
-        mag += (raw[i] * strength / 256).unsigned_abs() as i32;
-    }
-    (mag as i64 * 255 / RESPONSE_FULL as i64).min(255) as u8
-}
-
-/// Mean per-element response magnitude of `c` to `probe`, 0..255. Void → 0.
-pub(crate) fn response(law: &Law, c: &Configuration, probe: Element) -> u8 {
-    if c.is_void() {
+/// Mean fit of `probe` with the block's occurrences, in 1/256 of `QUANTUM` (−2048 ..= 1152).
+pub fn probe_response(block: &Block, probe: Element) -> i32 {
+    let n = block.len() as i64;
+    if n == 0 {
         return 0;
     }
-    if c.len() == 1 {
-        return element_response(law, c.elements()[0], probe);
-    }
-    let strength = law.probes.strength as i32;
-    let mut total = 0i64;
-    for b in c.elements() {
-        let raw = influence_q0(law, probe, *b);
-        let mut mag = 0i32;
-        for i in 0..D {
-            mag += (raw[i] * strength / 256).unsigned_abs() as i32;
-        }
-        total += mag as i64;
-    }
-    let mean = total / c.len() as i64;
-    (mean * 255 / RESPONSE_FULL as i64).min(255) as u8
+    let sum: i64 = block.elements().iter().map(|&e| i64::from(fit_raw(probe, e))).sum();
+    (sum * 256 / (n * i64::from(QUANTUM))) as i32
 }
 
-/// Take the standardized readings of `c` under `law`.
-pub fn observe(law: &Law, c: &Configuration) -> Observation {
-    if c.is_void() {
+/// Mean internal pair fit in 1/256 of `QUANTUM`; 0 for fewer than two occurrences.
+pub fn cohesion(block: &Block) -> i32 {
+    let n = block.len() as i64;
+    if n < 2 {
+        return 0;
+    }
+    let pairs = n * (n - 1) / 2;
+    (block.internal_fit() * 256 / (pairs * i64::from(QUANTUM))) as i32
+}
+
+/// Probe response (Q8 of `QUANTUM`) where clarity begins, and the span over which it saturates.
+const CLEAR_FROM: i32 = 2 * 256;
+const CLEAR_SPAN: i32 = 5 * 128;
+/// Probe response where glow begins (1.75 Q), and its span to level 15 (1.5 Q).
+const GLOW_FROM: i32 = 7 * 64;
+const GLOW_SPAN: i32 = 6 * 64;
+
+/// Take the standardized readings of a configuration under `law`.
+pub fn observe(law: &Law, block: &Block) -> Observation {
+    if block.is_empty() {
         return Observation::AIR;
     }
-    if c.len() == 1 {
-        return observe_element(law, c.elements()[0]);
+    let n = block.len() as i32;
+    let coh = cohesion(block);
+    // A lone occurrence has no companions: it reads as middling. Mixtures read by how well they hold
+    // together, and amount adds a little bulk.
+    let hardness = (110 + coh * 40 / 256 + 3 * (n - 1)).clamp(1, 255) as u8;
+    let light = probe_response(block, law.probes.light);
+    let transparency = ((light - CLEAR_FROM) * 255 / CLEAR_SPAN).clamp(0, 255) as u8;
+    let glow = probe_response(block, law.probes.glow);
+    let emission = if glow > GLOW_FROM { (1 + (glow - GLOW_FROM) * 14 / GLOW_SPAN).min(15) as u8 } else { 0 };
+    let grip = probe_response(block, law.probes.grip);
+    let friction = (128 + grip * 24 / 256).clamp(0, 255) as u8;
+    Observation {
+        solid: true,
+        transparency,
+        emission,
+        hardness,
+        friction,
+        cohesion: coh.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        acoustic: if hardness < 96 { Acoustic::Soft } else { Acoustic::Hard },
     }
-    let p = &law.probes;
-    Observation::from_responses(
-        law,
-        response(law, c, p.contact),
-        response(law, c, p.light),
-        response(law, c, p.flow),
-        response(law, c, p.glow),
-        response(law, c, p.friction),
-    )
-}
-
-/// [`observe`] of a single-element configuration, without allocating one.
-pub fn observe_element(law: &Law, e: Element) -> Observation {
-    let p = &law.probes;
-    Observation::from_responses(
-        law,
-        element_response(law, e, p.contact),
-        element_response(law, e, p.light),
-        element_response(law, e, p.flow),
-        element_response(law, e, p.glow),
-        element_response(law, e, p.friction),
-    )
 }

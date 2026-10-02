@@ -37,8 +37,14 @@ impl Default for Bindings {
         gameplay_event[GE::OpenConsole as usize] = vec![Chord::key(Key::Slash)];
         gameplay_event[GE::OpenChat as usize] = vec![Chord::key(Key::T)];
         gameplay_event[GE::ToggleInventory as usize] = vec![Chord::key(Key::I)];
-        gameplay_event[GE::ToggleCrafting as usize] = vec![Chord::key(Key::C)];
         gameplay_event[GE::ToggleCapture as usize] = vec![Chord::key(Key::Tab)];
+        gameplay_event[GE::Hand as usize] = vec![Chord::key(Key::Num0)];
+        let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+        for (slot, key) in GE::SLOTS.into_iter().zip(digits) {
+            gameplay_event[slot as usize] = vec![Chord::key(key)];
+        }
+        gameplay_event[GE::HotbarNext as usize] = vec![Chord::bare(Source::WheelDown)];
+        gameplay_event[GE::HotbarPrev as usize] = vec![Chord::bare(Source::WheelUp)];
 
         // Coordinate system: forward (+Z) = W/S, right (+X) = D/A, up (+Y) = Space/LeftShift.
         let gameplay_axis = [

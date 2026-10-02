@@ -8,11 +8,13 @@
 //! Section borders (edge columns) overdraw as air with an inward micro-offset to prevent
 //! z-fighting with adjacent sections at different detail levels.
 //!
-//! One mesh per section per pass: the engine vertex format holds local coords
-//! `0..=16`, so a 32-cell section is packed by a power-of-two coarsen (`shift`)
-//! that also covers the occupied Y slab. Greedy merge then runs across that
-//! whole packed volume — more vertices than a 16³ split is fine; draw count is
-//! the cost. Two producers share one pooled native grid:
+//! The engine vertex format holds local coords `0..=16`, so a 32-cell section is
+//! packed by a power-of-two coarsen (`shift`, at least 1 for the 32 columns).
+//! Relief taller than 16 packed cells stacks up to [`MAX_SLABS`] slabs — one mesh
+//! per slab per pass, all at that shift — instead of coarsening every axis until
+//! a whole mountain fits one cube: steep sections keep their horizontal detail.
+//! Greedy merge runs across each slab, reading its neighbours above and below
+//! so slab seams emit no faces. Two producers share one pooled native grid:
 //! - [`build_section_mesh`] decodes a stored [`Section`]'s brick stacks — the
 //!   reference path, kept as the byte-parity oracle;
 //! - [`extract_section_mesh`] samples the generator (and folds edits) straight
@@ -23,7 +25,7 @@
 //! blocklight) so coarse tiles track day/night.
 use std::cell::RefCell;
 
-use voxel_engine::{Ao, Light, MeshVertex, Pass};
+use voxel_engine::{Ao, Light, MeshVertex};
 
 use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
@@ -33,35 +35,39 @@ use super::Section;
 use crate::block::registry::{AIR, BlockId, HotTables};
 use super::super::mesh::face::{self, covered, vertex_ao, corner_uv};
 
-/// One GPU mesh (all passes) for a whole section. `origin_y` is the native-cell
-/// Y of the mesh origin; `shift` extra detail bits pack the section into the
-/// `0..=16` vertex range so upload uses `pos.detail + shift`.
+/// A section's GPU meshes: one per non-empty slab (all passes), stacked bottom-up. `shift` extra
+/// detail bits pack the section into the `0..=16` vertex range, so upload uses `pos.detail +
+/// shift` for every slab.
+#[derive(Default)]
 pub(in crate::world) struct SectionMeshData {
-    pub origin_y: u32,
     pub shift: u8,
-    pub data: ChunkMeshData,
+    pub slabs: Vec<SlabMesh>,
 }
 
-impl Default for SectionMeshData {
-    fn default() -> Self {
-        Self {
-            origin_y: 0,
-            shift: 0,
-            data: new_chunk_mesh_data(),
-        }
-    }
+/// One packed slab: up to 16 packed cells tall, its origin at native-cell Y `origin_y`.
+pub(in crate::world) struct SlabMesh {
+    pub origin_y: u32,
+    pub data: ChunkMeshData,
 }
 
 impl SectionMeshData {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        Pass::ALL.iter().all(|&p| self.data[p].is_empty())
+        self.slabs.iter().all(|s| voxel_engine::Pass::ALL.iter().all(|&p| s.data[p].is_empty()))
+    }
+
+    /// Vertex bytes over every slab and pass.
+    pub(in crate::world) fn vertex_bytes(&self) -> usize {
+        self.slabs.iter().map(|s| voxel_engine::Pass::ALL.iter().map(|&p| s.data[p].vertex_bytes()).sum::<usize>()).sum()
     }
 }
 
 /// Cells per mesh-block edge — the 5-bit vertex position range (`0..=16`). Fixed by design.
 const BLOCK: i32 = 16;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
+/// Most stacked slabs one section may use before it coarsens instead: 64 packed cells of relief
+/// at the least shift (256 native cells at the finest ring) — every mountain in one tall stack.
+const MAX_SLABS: i32 = 4;
 
 // Native 32×32×n grid, packed coarse grid, and one mesh scratch per worker.
 // Born and dropped on the same thread, so a lock-free thread-local is right.
@@ -73,11 +79,15 @@ thread_local! {
 
 /// Packed section cells as a dense column-major grid: `nx × nz` columns of
 /// `ny` cells. Column-major keeps a column's vertical neighbours adjacent.
+/// Meshing emits only the slab `y_lo..y_hi`; the cells around it are context
+/// (covering faces and AO across the seam).
 struct DenseGrid<'a> {
     cells: &'a [BlockId],
     nx: i32,
     ny: i32,
     nz: i32,
+    y_lo: i32,
+    y_hi: i32,
 }
 
 impl DenseGrid<'_> {
@@ -95,9 +105,10 @@ impl DenseGrid<'_> {
         (p[0] + p[2] * self.nx) * self.ny + p[1]
     }
 
+    /// Extent of the meshed window along `axis` (the slab along Y).
     #[inline]
     fn size(&self, axis: usize) -> i32 {
-        [self.nx, self.ny, self.nz][axis]
+        [self.nx, self.y_hi - self.y_lo, self.nz][axis]
     }
 }
 
@@ -217,8 +228,8 @@ fn face_sample(
     Some(FaceSample { block: me, micro, ao })
 }
 
-/// Greedy-mesh the packed volume: merge adjacent quads with identical properties
-/// across the whole section (one mesh, vertex coords `0..=16`).
+/// Greedy-mesh one slab of the packed volume: merge adjacent quads with identical
+/// properties across it (one mesh, vertex coords `0..=16` relative to the slab).
 fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
@@ -235,16 +246,18 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
         debug_assert!(n_u * n_v <= BLOCK * BLOCK);
         let corner_uv = corner_uv(&dir.face.corners);
 
+        // Y has stride 1 in the column-major layout: the slab window starts `y_lo` cells in.
+        let (base, y_lo) = (grid.y_lo, grid.y_lo);
         for n in 0..n_n {
             let mut any = false;
             for v in 0..n_v {
-                let row_idx = n * s_n + v * s_v;
+                let row_idx = base + n * s_n + v * s_v;
                 for u in 0..n_u {
                     let idx = row_idx + u * s_u;
                     let (x, y, z) = match dir.face.n_axis {
-                        0 => (n, v, u),
-                        1 => (u, n, v),
-                        _ => (u, v, n),
+                        0 => (n, v + y_lo, u),
+                        1 => (u, n + y_lo, v),
+                        _ => (u, v + y_lo, n),
                     };
                     let cell = face_sample(
                         grid, tables, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
@@ -307,9 +320,7 @@ fn emit(
     origin[dir.face.u_axis] = u0 as u32;
     origin[dir.face.v_axis] = v0 as u32;
     let layer = sample.block.0;
-    // Route water to opaque pass (no animated texturing at LOD range).
-    let is_fluid = tables.fluid_surface(BlockId(layer));
-    let pass = if is_fluid { Pass::Opaque } else { tables.layer[layer as usize] };
+    let pass = tables.layer[layer as usize];
     let mut corners: [MeshVertex; 4] = std::array::from_fn(|i| {
         let cr = dir.face.corners[i];
         let mut pos = [0u32; 3];
@@ -338,7 +349,7 @@ fn emit(
     out[pass].quad(corners);
 }
 
-/// Mesh a whole section as one packed mesh per pass. Section edges overdraw as
+/// Mesh a whole section as packed slab meshes. Section edges overdraw as
 /// air with the inward micro-nudge. Deterministic: the same section yields
 /// bit-identical output (fixed iteration order, dense-grid sampling, no floats).
 ///
@@ -346,9 +357,27 @@ fn emit(
 /// far jobs take [`extract_section_mesh`], which the parity test pins against
 /// this one byte for byte.
 #[cfg(test)]
-pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables) -> SectionMeshData {
+pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
     let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
-    mesh_section_with(n_cells, tables, |dense| fill_from_section(dense, n_cells, section))
+    mesh_section_with(n_cells, tables, floor, |dense| fill_from_section(dense, n_cells, section))
+}
+
+/// The lowest surface cell (native index) of the columns just outside a section's four edges,
+/// sampled from the generator's heights at the same cell centres a neighbouring section uses.
+/// Packing a section from at or below this floor guarantees its border walls reach down to its
+/// neighbours' surfaces (no cracks), however the slab is trimmed.
+pub(in crate::world) fn ring_floor<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G) -> i32 {
+    let cell = pos.cell_size();
+    let n = SECTION_N as i32;
+    let top = |ix: i32, iz: i32| {
+        let (wx, wz) = (pos.min_x() + ix * cell + cell / 2, pos.min_z() + iz * cell + cell / 2);
+        (r#gen.height(wx, wz) - 1 - super::LOD_FLOOR_Y).div_euclid(cell)
+    };
+    let mut floor = i32::MAX;
+    for i in -1..=n {
+        floor = floor.min(top(i, -1)).min(top(i, n)).min(top(-1, i)).min(top(n, i));
+    }
+    floor.max(0)
 }
 
 /// Extract AND mesh a section in one pass: sample the generator (folding the
@@ -366,7 +395,8 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     let n_cells = (DOMAIN_H / cell) as usize;
     let ys = super::cell_centers(pos);
     let flat = super::flatten_edits(edits);
-    mesh_section_with(n_cells, tables, |dense| {
+    let floor = ring_floor(pos, r#gen);
+    mesh_section_with(n_cells, tables, Some(floor), |dense| {
         for iz in 0..SECTION_N {
             for ix in 0..SECTION_N {
                 let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
@@ -385,12 +415,13 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
 fn mesh_section_with(
     n_cells: usize,
     tables: &HotTables,
+    floor: Option<i32>,
     fill: impl FnOnce(&mut [BlockId]),
 ) -> SectionMeshData {
     DENSE_NATIVE.with_borrow_mut(|native| {
         native.resize(SECTION_N * SECTION_N * n_cells, AIR);
         fill(native);
-        mesh_packed(native, n_cells, tables)
+        mesh_packed(native, n_cells, tables, floor)
     })
 }
 
@@ -464,29 +495,41 @@ fn pick_coarse(
     best
 }
 
-/// Pack the native 32×n×32 occupancy into ≤16³ and greedy-mesh it once.
-fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables) -> SectionMeshData {
+/// Pack the native 32×n×32 occupancy into ≤16-cell columns and greedy-mesh it, one
+/// mesh per stacked 16-cell slab.
+///
+/// The packed volume starts one cell below the lowest SURFACE (the lowest column top here, or
+/// `floor`, the lowest top just outside the section, whichever is lower) — not at the bottom
+/// of the domain: everything below is solid ground in every column and never shows, so only
+/// the relief inside the section costs slabs. The shift is the least that packs the 32 columns
+/// and fits the relief in [`MAX_SLABS`] slabs.
+fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
     let ny_n = n_cells as i32;
-    let (mut ylo, mut yhi) = (ny_n, 0);
+    let (mut min_top, mut yhi) = (ny_n, 0);
     for col in native.chunks_exact(n_cells) {
-        if let Some(first) = col.iter().position(|&id| id != AIR) {
-            let last = col.iter().rposition(|&id| id != AIR).expect("some cell is non-air");
-            ylo = ylo.min(first as i32);
+        if let Some(last) = col.iter().rposition(|&id| id != AIR) {
+            min_top = min_top.min(last as i32);
             yhi = yhi.max(last as i32 + 1);
         }
     }
-    if yhi <= ylo {
+    if yhi == 0 {
         return SectionMeshData::default();
     }
+    let ylo = (min_top.min(floor.unwrap_or(min_top)) - 1).max(0);
 
-    let shift = pack_shift(SECTION_N as i32).max(pack_shift(yhi - ylo));
-    let step = 1i32 << shift;
-    let y0 = ylo / step * step;
-    let y1 = (yhi + step - 1) / step * step;
+    let mut shift = pack_shift(SECTION_N as i32);
+    let (step, y0, ny) = loop {
+        let step = 1i32 << shift;
+        let y0 = ylo / step * step;
+        let ny = ((yhi + step - 1) / step * step - y0) / step;
+        if ny <= BLOCK * MAX_SLABS {
+            break (step, y0, ny);
+        }
+        shift += 1;
+    };
     let nx = (SECTION_N as i32 + step - 1) / step;
-    let ny = (y1 - y0) / step;
     let nz = nx;
-    debug_assert!(nx <= BLOCK && ny <= BLOCK && nz <= BLOCK);
+    debug_assert!(nx <= BLOCK && nz <= BLOCK);
 
     DENSE_COARSE.with_borrow_mut(|coarse| {
         coarse.resize((nx * ny * nz) as usize, AIR);
@@ -506,24 +549,20 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables) -> Sectio
             }
         }
         MESH_SCRATCH.with_borrow_mut(|scratch| {
-            for (_, m) in scratch.iter_mut() {
-                m.clear();
-            }
-            let grid = DenseGrid {
-                cells: coarse,
-                nx,
-                ny,
-                nz,
-            };
-            if build_volume(&grid, tables, scratch) {
-                SectionMeshData {
-                    origin_y: y0 as u32,
-                    shift: shift as u8,
-                    data: std::mem::replace(scratch, new_chunk_mesh_data()),
+            let mut slabs = Vec::new();
+            for y_lo in (0..ny).step_by(BLOCK as usize) {
+                for (_, m) in scratch.iter_mut() {
+                    m.clear();
                 }
-            } else {
-                SectionMeshData::default()
+                let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny) };
+                if build_volume(&grid, tables, scratch) {
+                    slabs.push(SlabMesh {
+                        origin_y: (y0 + y_lo * step) as u32,
+                        data: std::mem::replace(scratch, new_chunk_mesh_data()),
+                    });
+                }
             }
+            SectionMeshData { shift: if slabs.is_empty() { 0 } else { shift as u8 }, slabs }
         })
     })
 }
@@ -532,7 +571,8 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables) -> Sectio
 mod tests {
     use super::*;
     use crate::block::registry::BlockRegistry;
-    use crate::world::generation::{Terrain, TerrainGenerator};
+    use crate::world::generation::TerrainGenerator;
+    use crate::world::terrain::Terrain;
     use voxel_engine::{Normal, Pass};
     use crate::world::section::{FINEST_DETAIL, SectionPos};
 
@@ -574,14 +614,14 @@ mod tests {
         // Compile the placement table so the hot tables cover every id the
         // real generator can emit (the fixtures below use builtin names only).
         let mut r = BlockRegistry::with_builtins();
-        crate::world::placement::builtin().compile(&mut r).expect("v0 hosts the placement table");
+        crate::world::terrain::Materials::intern(&mut r);
         let id = |n: &str| r.id_by_label(n).unwrap();
         let blocks = Blocks {
-            grass: id("organic+soil"),
-            dirt: id("clay+soil"),
+            grass: id("grass"),
+            dirt: id("soil"),
             stone: id("rock"),
             sand: id("sand"),
-            water: id("water"),
+            water: id("ice"),
         };
         let tables = r.hot_tables();
         (r, tables, blocks)
@@ -625,18 +665,40 @@ mod tests {
     }
 
     fn mesh_of(section: &Section, tables: &HotTables) -> SectionMeshData {
-        build_section_mesh(section, tables)
+        build_section_mesh(section, tables, None)
     }
 
     fn all_quads(mesh: &SectionMeshData) -> impl Iterator<Item = (Pass, [MeshVertex; 4])> {
-        let data = &mesh.data;
-        Pass::ALL.into_iter().flat_map(move |p| {
-            data[p]
-                .vertices()
-                .chunks_exact(4)
-                .map(|q| (p, [q[0], q[1], q[2], q[3]]))
-                .collect::<Vec<_>>()
+        mesh.slabs.iter().flat_map(|slab| {
+            Pass::ALL.into_iter().flat_map(move |p| {
+                slab.data[p]
+                    .vertices()
+                    .chunks_exact(4)
+                    .map(|q| (p, [q[0], q[1], q[2], q[3]]))
+                    .collect::<Vec<_>>()
+            })
         })
+    }
+
+    /// One pass of one slab with its placement: `(origin_y, shift, pass, vertices, quad counts)`.
+    type FlatPass = (u32, u8, u8, Vec<MeshVertex>, [u32; 6]);
+
+    /// Every slab's every pass, with its placement, for byte-parity comparisons.
+    fn flatten(m: &SectionMeshData) -> Vec<FlatPass> {
+        m.slabs
+            .iter()
+            .flat_map(|slab| {
+                Pass::ALL.into_iter().map(move |p| {
+                    (
+                        slab.origin_y,
+                        m.shift,
+                        p as u8,
+                        slab.data[p].vertices(),
+                        slab.data[p].quad_counts(),
+                    )
+                })
+            })
+            .collect()
     }
 
     fn normals_present(mesh: &SectionMeshData, want: Normal) -> bool {
@@ -728,64 +790,64 @@ mod tests {
     }
 
     #[test]
-    fn lod_water_routes_to_opaque_with_no_internal_walls() {
-        let (_r, tables, b) = setup();
-        // Shore at 40 with water up to 80: a deep water table over sand/stone.
-        let sec = extract(FINEST, &terrain_gen(&b, 40, 80, None));
-        let mesh = mesh_of(&sec, &tables);
-        // The vertex layer is the render DESCRIPTOR of the material, not its block id.
-        let water_layer = tables.render_layer(b.water);
-        let is_water_quad = |q: &[MeshVertex]| q[0].layer() == water_layer;
-        let opaque_water = all_quads(&mesh).any(|(p, q)| p == Pass::Opaque && is_water_quad(&q));
-        assert!(opaque_water, "water surface meshes into the opaque pass");
-        assert!(!all_quads(&mesh).any(|(_, q)| q[0].is_water()), "LOD water clears the water bit");
-        assert!(
-            !all_quads(&mesh).any(|(p, _)| p == Pass::Blend),
-            "no translucent geometry on a LOD section"
-        );
-        // Water-vs-water is suppressed; all water side faces are borders (micro != 0).
-        for (_, q) in all_quads(&mesh) {
-            if !is_water_quad(&q) {
-                continue;
-            }
-            let side = matches!(
-                q[0].normal(),
-                Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ
-            );
-            if side {
-                assert_ne!(q[0].micro(), [0, 0, 0], "a wall appeared inside the water body");
-            }
-        }
-    }
-
-    #[test]
     fn every_vertex_is_packed_local() {
         let (_r, tables, b) = setup();
         let sec = extract(FINEST, &terrain_gen(&b, 200, 0, Some((300, 320))));
         let mesh = mesh_of(&sec, &tables);
         assert!(!mesh.is_empty(), "occupied section emits a mesh");
-        for p in Pass::ALL {
-            for v in mesh.data[p].vertices() {
+        for (_, q) in all_quads(&mesh) {
+            for v in q {
                 let l = v.local_pos();
                 assert!(l.iter().all(|&c| (0.0..=16.0).contains(&c)), "vertex {l:?} escapes 0..=16");
             }
         }
     }
 
+    /// Relief splits into stacked slabs at the least shift instead of coarsening every axis: a
+    /// shelf 100 native cells above the ground keeps the horizontal shift of flat ground, and the
+    /// slabs stack contiguously with no seam faces between them.
     #[test]
-    fn one_mesh_per_section() {
+    fn tall_relief_stacks_slabs_at_the_least_shift() {
         let (_r, tables, b) = setup();
-        let mesh = mesh_of(&extract(FINEST, &terrain_gen(&b, 200, 0, Some((300, 320)))), &tables);
-        let passes = Pass::ALL.iter().filter(|&&p| !mesh.data[p].is_empty()).count();
-        assert!(passes >= 1, "occupied section has geometry");
-        assert!(passes <= Pass::COUNT, "one mesh per pass, not per block");
+        let flat = mesh_of(&extract(FINEST, &terrain_gen(&b, 200, 0, None)), &tables);
+        assert_eq!(flat.slabs.len(), 1, "flat ground is one slab");
+        // A peak over part of the section: columns 0..12 rise 300 m above the rest.
+        let (stone, grass) = (b.stone, b.grass);
+        let peak = FnGen {
+            h: |x: i32, _| if x < 48 { 500 } else { 200 },
+            b: move |x: i32, y, _| if y < if x < 48 { 500 } else { 200 } { stone } else { AIR },
+            surf: grass,
+            deep: stone,
+        };
+        let tall = mesh_of(&extract(FINEST, &peak), &tables);
+        assert_eq!(tall.shift, flat.shift, "relief must not coarsen the horizontal packing");
+        assert!(tall.slabs.len() > 1, "a tall section stacks slabs");
+        assert!(tall.slabs.len() <= MAX_SLABS as usize);
+        let step = 1u32 << tall.shift;
+        for w in tall.slabs.windows(2) {
+            assert!(w[1].origin_y > w[0].origin_y && (w[1].origin_y - w[0].origin_y) % (BLOCK as u32 * step) == 0);
+        }
+        // The peak's columns cross every seam: the only horizontal faces are its top and the
+        // low ground's top, none at the seams.
+        let mut levels = std::collections::BTreeSet::new();
+        for slab in &tall.slabs {
+            for p in Pass::ALL {
+                for v in slab.data[p].vertices() {
+                    assert_ne!(v.normal(), Normal::NegY, "an underside inside solid rock");
+                    if v.normal() == Normal::PosY {
+                        levels.insert(slab.origin_y + v.local_pos()[1] as u32 * step);
+                    }
+                }
+            }
+        }
+        assert_eq!(levels.len(), 2, "tops only at the ground and the peak, none at seams: {levels:?}");
     }
 
     #[test]
     fn a_flat_top_merges_and_a_checkerboard_does_not() {
         let (_r, tables, b) = setup();
         let flat = extract(FINEST, &terrain_gen(&b, 200, 0, None));
-        let tops = all_quads(&build_section_mesh(&flat, &tables))
+        let tops = all_quads(&build_section_mesh(&flat, &tables, None))
             .filter(|(_, q)| q[0].normal() == Normal::PosY)
             .count();
         assert_eq!(tops, 1, "a uniform flat top merges across the whole section");
@@ -813,7 +875,7 @@ mod tests {
             deep: stone,
         };
         let sec = extract(FINEST, &checker);
-        let mesh = build_section_mesh(&sec, &tables);
+        let mesh = build_section_mesh(&sec, &tables, None);
         let top_quads = all_quads(&mesh).filter(|(_, q)| q[0].normal() == Normal::PosY).count();
         assert!(top_quads > 4, "checkerboard tops must not merge (got {top_quads})");
     }
@@ -826,20 +888,6 @@ mod tests {
     #[test]
     fn fused_extract_mesh_matches_the_storage_path_exactly() {
         let (_r, tables, b) = setup();
-        let flatten = |m: &SectionMeshData| {
-            Pass::ALL
-                .into_iter()
-                .map(|p| {
-                    (
-                        m.origin_y,
-                        m.shift,
-                        p as u8,
-                        m.data[p].vertices(),
-                        m.data[p].quad_counts(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
 
         // Edits inside the finest section footprint, exercising every
         // apply_edits branch: a centre-sample hit (air AND solid), off-centre
@@ -875,7 +923,7 @@ mod tests {
                 for edit_set in [&[][..], &edits[..]] {
                     let stored =
                         Section::extract(pos, &r#gen, edit_set, voxel_engine::Rev::START);
-                    let reference = build_section_mesh(&stored, &tables);
+                    let reference = build_section_mesh(&stored, &tables, Some(ring_floor(pos, &r#gen)));
                     let fused = extract_section_mesh(pos, &r#gen, edit_set, &tables);
                     assert_eq!(
                         flatten(&reference),
@@ -886,11 +934,11 @@ mod tests {
                 }
             }
             // The real terrain generator, off-origin so warps/rivers vary.
-            let hills = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
+            let hills = Terrain::new(&mut BlockRegistry::with_builtins(), 0xBEEF);
             let pos = SectionPos { detail, x: 3, z: -2 };
             let stored = Section::extract(pos, &hills, &edits, voxel_engine::Rev::START);
             assert_eq!(
-                flatten(&build_section_mesh(&stored, &tables)),
+                flatten(&build_section_mesh(&stored, &tables, Some(ring_floor(pos, &hills)))),
                 flatten(&extract_section_mesh(pos, &hills, &edits, &tables)),
                 "fused path diverged on Terrain at {detail:?}",
             );
@@ -900,24 +948,10 @@ mod tests {
     #[test]
     fn meshing_is_deterministic() {
         let (_r, tables, _b) = setup();
-        let r#gen = Terrain::new(&mut BlockRegistry::with_builtins(), 20.0, 0xBEEF);
+        let r#gen = Terrain::new(&mut BlockRegistry::with_builtins(), 0xBEEF);
         let sec = extract(FINEST, &r#gen);
-        let a = build_section_mesh(&sec, &tables);
-        let b = build_section_mesh(&sec, &tables);
-        let flatten = |m: &SectionMeshData| {
-            Pass::ALL
-                .into_iter()
-                .map(|p| {
-                    (
-                        m.origin_y,
-                        m.shift,
-                        p as u8,
-                        m.data[p].vertices(),
-                        m.data[p].quad_counts(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
+        let a = build_section_mesh(&sec, &tables, None);
+        let b = build_section_mesh(&sec, &tables, None);
         assert_eq!(flatten(&a), flatten(&b), "same section must mesh bit-identically");
     }
 
@@ -925,9 +959,9 @@ mod tests {
     fn packed_mesh_stays_within_the_vertex_cube() {
         let (_r, tables, b) = setup();
         let sec = extract(FINEST, &terrain_gen(&b, 200, 0, Some((260, 280))));
-        let mesh = build_section_mesh(&sec, &tables);
-        for p in Pass::ALL {
-            for v in mesh.data[p].vertices() {
+        let mesh = build_section_mesh(&sec, &tables, None);
+        for (_, q) in all_quads(&mesh) {
+            for v in q {
                 let l = v.local_pos();
                 assert!(
                     l.iter().all(|&c| (0.0..=16.0).contains(&c)),
@@ -945,22 +979,23 @@ mod tests {
         for detail in [FINEST_DETAIL, Detail(k + 2), Detail(k + 4), Detail(k + 6)] {
             let pos = SectionPos { detail, x: 0, z: 0 };
             let sec = extract(pos, &terrain_gen(&b, 200, 0, None));
-            let mesh = build_section_mesh(&sec, &tables);
+            let mesh = build_section_mesh(&sec, &tables, None);
             assert!(normals_present(&mesh, Normal::PosY), "detail {detail:?} lost the top surface");
             assert_winds_outward(&mesh);
         }
     }
 
     /// extract+mesh 16 fixed sections at detail 2, seed 42 — the gauge for the
-    /// one-mesh-per-section pack. Ignored: a timing benchmark, not a
+    /// slab pack. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release far_lod_section_mesh -- --ignored --nocapture`.
     /// 2026-09-10: 2.440 ms/section (median of 3); fingerprint verts=9048 fnv=0xa42303c7.
+    /// 2026-10-02 (InfiniteDiffusion v3, stacked slabs): 4.026 ms/section; verts=15056 fnv=0xa2f08c4a.
     #[test]
     #[ignore]
     fn far_lod_section_mesh() {
         let mut registry = BlockRegistry::with_builtins();
-        let r#gen = Terrain::new(&mut registry, 20.0, 42);
+        let r#gen = Terrain::new(&mut registry, 42);
         let tables = registry.hot_tables();
         let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos {
             detail: FINEST_DETAIL,
@@ -995,12 +1030,12 @@ mod tests {
         };
         for &pos in &positions {
             let mesh = extract_section_mesh(pos, &r#gen, &[], &tables);
-            for b in mesh.origin_y.to_le_bytes() {
-                mix(&mut h, b);
-            }
             mix(&mut h, mesh.shift);
-            for p in Pass::ALL {
-                for v in mesh.data[p].vertices() {
+            for (slab, p) in mesh.slabs.iter().flat_map(|s| Pass::ALL.into_iter().map(move |p| (s, p))) {
+                for b in slab.origin_y.to_le_bytes() {
+                    mix(&mut h, b);
+                }
+                for v in slab.data[p].vertices() {
                     verts += 1;
                     for c in v.local_pos() {
                         for b in c.to_bits().to_le_bytes() {

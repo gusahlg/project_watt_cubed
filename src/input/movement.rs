@@ -13,7 +13,7 @@ use voxel_engine::DVec3;
 
 use crate::input::intent::{GameplayAxis, GameplayEvent, GameplayState};
 use crate::input::router::Gameplay;
-use crate::math::{PER_METER, WORLD_BORDER, block_coord};
+use crate::math::{PER_METER, WORLD_BORDER};
 use crate::player::{Motion, Player, Stance, collision_box};
 use crate::world::World;
 
@@ -36,19 +36,6 @@ const TERMINAL_VELOCITY: f64 = -60.0 * PER_METER;
 /// this are split into substeps so a fast fall stops at the first solid cell
 /// instead of tunneling past thin terrain.
 const MAX_COLLISION_STEP: f64 = 0.5;
-
-/// Swimming: horizontal reach is slower than a walk, and every axis chases its
-/// target through the same [`approach`] law at a low rate — that single damping
-/// *is* the water's drag, which is why swimming needs no separate friction or
-/// terminal-velocity clamp. Vertical targets: a full-strength liquid buoys a
-/// fully-submerged, idle player up at [`SWIM_FLOAT_SPEED`] until their head breaks
-/// the surface, where they instead settle at [`SWIM_SETTLE_SPEED`] and bob; holding
-/// ascend/descend overrides both at [`SWIM_VERT_SPEED`].
-const SWIM_SPEED: f64 = 4.0 * PER_METER;
-const SWIM_ACCEL: f64 = 6.0; // an approach RATE (1/s) — time-domain, never scaled
-const SWIM_VERT_SPEED: f64 = 5.0 * PER_METER;
-const SWIM_FLOAT_SPEED: f64 = 3.0 * PER_METER;
-const SWIM_SETTLE_SPEED: f64 = 1.0 * PER_METER;
 
 /// The movement intent gathered for a single frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -120,11 +107,6 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
 
     resolve_stance(player, world, input);
 
-    // Reconcile the walking/swimming boundary before integrating, so this frame
-    // runs under the right physics the instant the feet cross a water surface.
-    let liquid = sample_liquid(player, world);
-    reconcile_liquid(player, liquid);
-
     // Unit horizontal heading from the movement keys (zero when none held); each
     // mode scales it by its own speed.
     let heading = horizontal_heading(player, input);
@@ -157,73 +139,9 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
             velocity.y = (velocity.y - GRAVITY * dt).max(TERMINAL_VELOCITY);
             *velocity * dt
         }
-        // Swimming: every axis chases its target through one drag law. Horizontal
-        // follows the movement keys; vertical is a held ascend/descend, or — idle —
-        // buoyancy that floats the player to the surface and lets them bob there.
-        Motion::Swimming { velocity } => {
-            let vertical = if input.move_y != 0.0 {
-                input.move_y as f64 * SWIM_VERT_SPEED
-            } else if liquid.fully_submerged() {
-                SWIM_FLOAT_SPEED * liquid.strength()
-            } else {
-                -SWIM_SETTLE_SPEED
-            };
-            let target = heading * SWIM_SPEED + DVec3::Y * vertical;
-            *velocity = approach(*velocity, target, SWIM_ACCEL, dt);
-            *velocity * dt
-        }
     };
 
     move_with_collision(player, world, delta)
-}
-
-/// The buoyancy the player is immersed in this frame, sampled at the feet and the
-/// eye. Two samples are enough to tell "wading / at the surface" (feet only) from
-/// "fully under" (eye too), which is all the swim physics needs.
-#[derive(Clone, Copy)]
-struct Liquid {
-    feet: u8,
-    eye: u8,
-}
-
-impl Liquid {
-    /// Feet in liquid — the player swims rather than walks.
-    fn submerged(&self) -> bool {
-        self.feet > 0
-    }
-
-    /// Head under the surface too — buoyancy floats the player upward.
-    fn fully_submerged(&self) -> bool {
-        self.eye > 0
-    }
-
-    /// Buoyancy strength on a `0.0..=1.0` scale (water ≈ 0.78), from whichever
-    /// sample the player is most deeply immersed in.
-    fn strength(&self) -> f64 {
-        self.feet.max(self.eye) as f64 / 255.0
-    }
-}
-
-/// Sample the liquid at the player's feet and eye voxels.
-fn sample_liquid(player: &Player, world: &World) -> Liquid {
-    let p = player.position;
-    let (x, z) = (block_coord(p.x), block_coord(p.z));
-    Liquid {
-        feet: world.buoyancy_at(x, block_coord(player.feet_y()), z),
-        eye: world.buoyancy_at(x, block_coord(p.y), z),
-    }
-}
-
-/// Move the player across the walking/swimming boundary as they enter or leave a
-/// liquid, carrying momentum across the switch. Flying is unaffected — it ignores
-/// water entirely — so only the grounded/submerged pair converts here.
-fn reconcile_liquid(player: &mut Player, liquid: Liquid) {
-    let velocity = player.velocity();
-    player.motion = match (&player.motion, liquid.submerged()) {
-        (Motion::Walking { .. }, true) => Motion::Swimming { velocity },
-        (Motion::Swimming { .. }, false) => Motion::Walking { velocity, on_ground: false },
-        (motion, _) => *motion,
-    };
 }
 
 /// The unit-length horizontal movement direction for this frame, or zero when no
@@ -266,9 +184,9 @@ fn approach(current: DVec3, target: DVec3, rate: f64, dt: f64) -> DVec3 {
 /// grow into the ceiling. Sneaking is a walking-only stance: flying uses `LeftShift`
 /// to descend, so it never crouches.
 fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
-    // Sneaking is a walking-only stance: flying uses `LeftShift` to descend and
-    // swimming uses it to dive, so neither should crouch the hitbox.
-    let want_sneak = input.sneak && !player.flying() && !player.swimming();
+    // Sneaking is a walking-only stance: flying uses `LeftShift` to descend, so
+    // it should not crouch the hitbox.
+    let want_sneak = input.sneak && !player.flying();
     player.stance = match (player.stance, want_sneak) {
         (Stance::Standing, true) => Stance::Sneaking,
         (Stance::Sneaking, false)
@@ -330,19 +248,6 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 
                 velocity.y = 0.0;
             }
             return trauma.min(1.0);
-        }
-        // Swimming has no ground contact; a blocked axis just spends its velocity,
-        // like flying into a wall.
-        Motion::Swimming { velocity } => {
-            if blocked_x {
-                velocity.x = 0.0;
-            }
-            if blocked_y {
-                velocity.y = 0.0;
-            }
-            if blocked_z {
-                velocity.z = 0.0;
-            }
         }
     }
     0.0

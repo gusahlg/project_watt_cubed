@@ -72,14 +72,10 @@ impl Stance {
 pub enum Motion {
     /// On foot: subject to gravity, jumping, and ground contact.
     Walking { velocity: DVec3, on_ground: bool },
-    /// Submerged in a liquid: buoyancy fights gravity and drag damps every axis,
-    /// so there is neither ground contact nor a fall to accumulate — the reason
-    /// this is its own variant rather than a flag on `Walking`.
-    Swimming { velocity: DVec3 },
     /// Free flight: no gravity, no ground, velocity chases input on every axis.
     /// `noclip` additionally skips collision, letting the player pass through
     /// solid geometry — meaningful only in flight, so it rides on this variant
-    /// rather than being a loose flag that could contradict walking/swimming.
+    /// rather than being a loose flag that could contradict walking.
     Flying { velocity: DVec3, noclip: bool },
 }
 
@@ -87,9 +83,7 @@ impl Motion {
     /// The current velocity, whichever mode we're in.
     pub fn velocity(self) -> DVec3 {
         match self {
-            Motion::Walking { velocity, .. }
-            | Motion::Swimming { velocity }
-            | Motion::Flying { velocity, .. } => velocity,
+            Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => velocity,
         }
     }
 }
@@ -152,11 +146,6 @@ impl Player {
         matches!(self.motion, Motion::Flying { noclip: true, .. })
     }
 
-    /// Whether the player is swimming in a liquid.
-    pub fn swimming(&self) -> bool {
-        matches!(self.motion, Motion::Swimming { .. })
-    }
-
     /// Enter or leave flight. Horizontal momentum carries across the switch, but
     /// vertical velocity is cleared so the player neither keeps falling into the
     /// new mode nor launches when leaving it.
@@ -173,15 +162,13 @@ impl Player {
     /// Advance the flight state one step in the cycle
     /// walking → flying → flying+noclip → walking, carrying horizontal momentum
     /// across each switch (vertical is cleared, as in [`Player::set_flying`]).
-    /// Landing back to `Walking` lets [`reconcile_liquid`] promote to swimming
-    /// next frame if the feet are submerged, so no liquid special-case is needed.
     pub fn cycle_fly(&mut self) {
         let v = self.velocity();
         let velocity = DVec3::new(v.x, 0.0, v.z);
         self.motion = match self.motion {
             Motion::Flying { noclip: false, .. } => Motion::Flying { velocity, noclip: true },
             Motion::Flying { noclip: true, .. } => Motion::Walking { velocity, on_ground: false },
-            _ => Motion::Flying { velocity, noclip: false },
+            Motion::Walking { .. } => Motion::Flying { velocity, noclip: false },
         };
     }
 
@@ -189,9 +176,7 @@ impl Player {
     /// player doesn't rocket down on arrival).
     pub fn cancel_fall(&mut self) {
         match &mut self.motion {
-            Motion::Walking { velocity, .. }
-            | Motion::Swimming { velocity }
-            | Motion::Flying { velocity, .. } => velocity.y = 0.0,
+            Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => velocity.y = 0.0,
         }
     }
 

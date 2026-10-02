@@ -165,7 +165,6 @@ settings_fields! {
     shadows: bool = false,
     sky: bool = true,
     vrs: VrsChoice = VrsChoice::Auto,
-    water_anim: bool = true,
     /// Baked corner AO, another meshing input.
     ao: bool = true,
     vignette: bool = false,
@@ -590,7 +589,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 52] = [
+pub const SETTINGS: [Setting; 51] = [
     enum_setting!(
         apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
@@ -894,7 +893,6 @@ pub const SETTINGS: [Setting; 52] = [
         "vrs auto|on|off", &[], "vrs",
         &[VrsChoice::Auto, VrsChoice::On, VrsChoice::Off]
     ),
-    video_toggle!(water_anim, "water_anim", "Water Animation", &["water"]),
     video_toggle!(ao, "ao", "Ambient Occlusion", &["vertexao"]),
     video_toggle!(vignette, "vignette", "Vignette"),
     // Audio mix (see [`Settings::mix_change`]).
@@ -1352,7 +1350,6 @@ impl Settings {
                 self.render_h,
                 self.vrs_auto_min_pixels(),
             ),
-            water_anim: self.water_anim,
             vignette: self.vignette,
         }
     }
@@ -1904,7 +1901,7 @@ mod tests {
         assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
         assert!(!s.lighting && !s.occlusion && !s.ao);
         assert_eq!(s.vrs, VrsChoice::Off);
-        assert!(!s.sky && !s.bloom && !s.clouds && !s.water_anim);
+        assert!(!s.sky && !s.bloom && !s.clouds);
         assert!(s.sunlight);
 
         assert!(preset.parse_human(&mut s, "fast"));

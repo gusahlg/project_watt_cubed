@@ -30,7 +30,7 @@ impl World {
         self.generator.seed()
     }
 
-    /// Worldgen algorithm id (`classic`, `diffusion`, …).
+    /// Worldgen algorithm id (`flat`, `diffusion`).
     pub fn worldgen_kind(&self) -> &'static str {
         self.generator.kind()
     }
@@ -40,9 +40,9 @@ impl World {
         self.kind
     }
 
-    /// Diffusion knobs this world was built with (defaults on a classic world).
-    pub fn diffusion_cfg(&self) -> super::diffusion::DiffusionCfg {
-        self.diffusion
+    /// Generator knobs this world was built with (defaults on a flat world).
+    pub fn terrain_cfg(&self) -> super::terrain::TerrainCfg {
+        self.terrain_cfg
     }
 
     /// Incremented when blocks are edited.
@@ -69,11 +69,6 @@ impl World {
     /// Ground height for every cell of a 16×16 chunk column.
     pub fn heights_16(&self, cx: i32, cz: i32) -> super::generation::ColumnHeights {
         self.generator.heights_16(cx, cz)
-    }
-
-    /// Sea level, so spawn logic can tell dry land from seabed/ocean columns.
-    pub fn sea_level(&self) -> i32 {
-        self.generator.sea_level()
     }
 
     /// Highest solid block's Y in column (x, z) from loaded chunks, or None if empty.
@@ -153,30 +148,13 @@ impl World {
         }
     }
 
-    /// Whether the block at a world voxel coordinate contains material. Rendering
-    /// and mining use this query; movement uses [`is_obstacle`](Self::is_obstacle)
-    /// so liquids remain passable.
+    /// Whether the block at a world voxel coordinate contains material: rendering, mining and
+    /// movement all use this query.
     pub fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
         self.registry.is_solid(self.block_at(x, y, z))
     }
 
-    /// Whether the block at a world voxel obstructs movement and clearance rays: a
-    /// solid that is not a passable liquid. Mining uses [`is_solid`](Self::is_solid)
-    /// so liquids can still be broken.
-    pub fn is_obstacle(&self, x: i32, y: i32, z: i32) -> bool {
-        self.registry.is_obstacle(self.block_at(x, y, z))
-    }
-
-    /// The buoyancy of the liquid at a world voxel coordinate, or `0` if the cell
-    /// is air or a non-liquid solid. The movement code samples this at the swimmer's
-    /// feet and eye to decide whether — and how strongly — to swim.
-    pub fn buoyancy_at(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.registry.buoyancy(self.block_at(x, y, z))
-    }
-
-    /// Collision test: does the given box overlap any solid, non-liquid voxel?
-    /// Liquids are `solid` (so they mesh) but passable, so the player swims through
-    /// them; only genuine obstacles block movement here.
+    /// Collision test: does the given box overlap any solid voxel?
     ///
     /// Cells are visited grouped by owning chunk — one map probe per chunk the
     /// box touches (1–8 for anything player-sized) instead of one per cell,
@@ -201,7 +179,7 @@ impl World {
                     };
                     // Uniform chunks: one lookup answers every cell in the box.
                     if let Some(id) = loaded.chunk.uniform() {
-                        if self.registry.is_obstacle(id) {
+                        if self.registry.is_solid(id) {
                             return true;
                         }
                         continue;
@@ -214,7 +192,7 @@ impl World {
                         for z in zs.clone() {
                             for x in xs.clone() {
                                 let id = loaded.chunk.get_local(x, y, z);
-                                if self.registry.is_obstacle(id) {
+                                if self.registry.is_solid(id) {
                                     return true;
                                 }
                             }
@@ -401,7 +379,7 @@ mod tests {
     fn query_world() -> World {
         let mut world = World::with_config_lazy(73, RenderConfig::default());
         let stone = world.registry.id_by_label("rock").unwrap();
-        let water = world.registry.id_by_label("water").unwrap();
+        let water = world.registry.id_by_label("sand").unwrap();
         let ice = world.registry.id_by_label("ice").unwrap();
         for (coord, id) in [
             (Coord::new(-1, -1, -1), stone),
@@ -445,7 +423,7 @@ mod tests {
                     for x in center.x - r..=center.x + r {
                         let expected = if !world.chunks.contains_key(&World::chunk_of(x, y, z)) {
                             Cell::Unloaded
-                        } else if world.is_obstacle(x, y, z) {
+                        } else if world.is_solid(x, y, z) {
                             Cell::Solid {
                                 absorption: world.registry.absorption(world.block_at(x, y, z)),
                             }
@@ -492,7 +470,7 @@ mod tests {
                         let aabb = Aabb::new(DVec3::new(x, y, z), half);
                         let expected = aabb
                             .voxel_cells()
-                            .any(|(x, y, z)| world.is_obstacle(x, y, z));
+                            .any(|(x, y, z)| world.is_solid(x, y, z));
                         assert_eq!(
                             world.collides(&aabb),
                             expected,

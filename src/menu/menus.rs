@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(view.rows[0].label, "Essentials");
         assert_eq!(
             view.rows[0].detail.as_deref(),
-            Some("Start screen, menus, inventory, crafting, look and worldgen.")
+            Some("Menus, inventory, hotbar, looks, names and worldgen.")
         );
         assert!(view.rows[0].tag.is_none(), "group header is not selectable");
         assert_eq!(view.rows[1].label.trim(), "Enable all / Disable all");
@@ -393,42 +393,29 @@ mod tests {
             "first member is indented under the group: {:?}",
             view.rows[2].label
         );
-        let other = view
-            .rows
-            .iter()
-            .position(|r| r.label == "Other")
-            .expect("gpu_materials is ungrouped");
         assert!(
-            view.rows[other + 1].label.contains("GPU materials"),
-            "ungrouped built-in under Other: {:?}",
-            view.rows[other + 1].label
+            !view.rows.iter().any(|r| r.label == "Other"),
+            "every built-in is an Essential: no Other section"
         );
         let names: Vec<&str> = view
             .rows
             .iter()
             .filter(|r| matches!(r.kind, crate::menu::RowKind::Value(ValueView::Toggle(_))))
-            .filter(|r| r.label.contains("Menus")
-                || r.label.contains("Start")
-                || r.label.contains("Inventory")
-                || r.label.contains("Crafting")
-                || r.label.contains("Atmosphere")
-                || r.label.contains("Post")
-                || r.label.contains("Lighting")
-                || r.label.contains("Procedural textures")
-                || r.label.contains("InfiniteDiffusion"))
             .map(|r| r.label.trim())
             .collect();
         assert_eq!(
             names,
             [
+                "Enable all / Disable all",
                 "Menus",
                 "Start",
                 "Inventory",
-                "Crafting",
+                "Hotbar",
                 "Atmosphere",
                 "Post",
                 "Lighting",
-                "Procedural textures",
+                "Neural textures",
+                "Material names",
                 "InfiniteDiffusion"
             ]
         );
@@ -464,8 +451,8 @@ mod tests {
             .position(|r| r.label == "Other" && matches!(r.kind, crate::menu::RowKind::Heading))
             .expect("Other section");
         assert!(
-            view.rows[other + 1].label.contains("GPU materials"),
-            "built-in ungrouped mod is first under Other"
+            view.rows[other + 1].label.contains("Extra"),
+            "an ungrouped mod is listed under Other"
         );
         assert!(
             view.rows.iter().any(|r| r.label.contains("Extra")),
