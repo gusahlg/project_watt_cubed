@@ -44,6 +44,7 @@ pub(crate) mod sched;
 pub mod session;
 pub mod settings;
 pub mod sim;
+pub mod space;
 pub(crate) mod sky;
 pub mod stash;
 pub mod ui;
