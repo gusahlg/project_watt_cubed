@@ -60,11 +60,28 @@ pub struct TerrainCfg {
     pub mines: u16,
     /// Planet and asteroid density.
     pub space: u16,
+    /// Column variety.
+    pub variety: u16,
+    /// Surface feature density.
+    pub features: u16,
+    /// Structure density.
+    pub structures: u16,
+    /// Deep-strata density.
+    pub deep: u16,
 }
 
 impl Default for TerrainCfg {
     fn default() -> Self {
-        Self { relief: 100, caves: 100, mines: 100, space: 100 }
+        Self {
+            relief: 100,
+            caves: 100,
+            mines: 100,
+            space: 100,
+            variety: 100,
+            features: 100,
+            structures: 100,
+            deep: 100,
+        }
     }
 }
 
@@ -83,12 +100,19 @@ impl TerrainCfg {
         self.caves = snap(self.caves, Self::DENSITY);
         self.mines = snap(self.mines, Self::DENSITY);
         self.space = snap(self.space, Self::DENSITY);
+        self.variety = snap(self.variety, Self::DENSITY);
+        self.features = snap(self.features, Self::DENSITY);
+        self.structures = snap(self.structures, Self::DENSITY);
+        self.deep = snap(self.deep, Self::DENSITY);
         self
     }
 
-    /// Text form (`relief=100,caves=100,mines=100,space=100`): saves, the wire, mod state.
+    /// Text form (`relief=100,...,deep=100`): saves, the wire, mod state.
     pub fn to_text(self) -> String {
-        format!("relief={},caves={},mines={},space={}", self.relief, self.caves, self.mines, self.space)
+        format!(
+            "relief={},caves={},mines={},space={},variety={},features={},structures={},deep={}",
+            self.relief, self.caves, self.mines, self.space, self.variety, self.features, self.structures, self.deep,
+        )
     }
 
     /// Parse a full or partial knob string, starting from the defaults.
@@ -105,6 +129,10 @@ impl TerrainCfg {
                 "caves" => &mut self.caves,
                 "mines" => &mut self.mines,
                 "space" => &mut self.space,
+                "variety" => &mut self.variety,
+                "features" => &mut self.features,
+                "structures" => &mut self.structures,
+                "deep" => &mut self.deep,
                 _ => continue,
             };
             *slot = v.trim().parse().unwrap_or(*slot);
@@ -112,14 +140,24 @@ impl TerrainCfg {
         self.clamp()
     }
 
-    /// The four knobs in wire order.
-    pub fn to_wire(self) -> [u16; 4] {
-        [self.relief, self.caves, self.mines, self.space]
+    /// The eight knobs in wire order.
+    pub fn to_wire(self) -> [u16; 8] {
+        [self.relief, self.caves, self.mines, self.space, self.variety, self.features, self.structures, self.deep]
     }
 
     /// Inverse of [`to_wire`](Self::to_wire).
-    pub fn from_wire(v: [u16; 4]) -> Self {
-        Self { relief: v[0], caves: v[1], mines: v[2], space: v[3] }.clamp()
+    pub fn from_wire(v: [u16; 8]) -> Self {
+        Self {
+            relief: v[0],
+            caves: v[1],
+            mines: v[2],
+            space: v[3],
+            variety: v[4],
+            features: v[5],
+            structures: v[6],
+            deep: v[7],
+        }
+        .clamp()
     }
 }
 

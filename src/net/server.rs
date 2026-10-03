@@ -10,8 +10,8 @@
 //! stay O(roster)) — an event-loop rewrite would be the next step.
 //!
 //! **Interest management.** Position broadcasts only reach players within
-//! [`INTEREST_RADIUS`], via a 2D bucket grid ([`State::grid`]): a move consults
-//! only the mover's 3×3 bucket neighbourhood instead of scanning the roster.
+//! [`INTEREST_RADIUS`], via a 3D bucket grid ([`State::grid`]): a move consults
+//! only the mover's 3×3×3 bucket neighbourhood instead of scanning the roster.
 //!
 //! **Trust.** Joins are password-gated and version-checked; frames are size-capped
 //! by [`protocol`]; every client is rate-limited; every edit is bounds- and
@@ -31,8 +31,10 @@ use std::time::{Duration, Instant};
 use quinn::{Endpoint, Incoming, SendStream};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
-use voxel_engine::DVec3;
+use glam::DQuat;
+use voxel_engine::{DVec3, Vec3};
 
+use crate::coord::Face;
 use crate::math::block_coord;
 
 use crate::block::registry::{BlockId, BlockRegistry, AIR};
@@ -197,6 +199,9 @@ struct PlayerHandle {
     pos: DVec3,
     yaw: f32,
     pitch: f32,
+    frame: DQuat,
+    velocity: Vec3,
+    up: Face,
     stance: Stance,
     /// The movement envelope's time anchor.
     last_move: Instant,
@@ -223,7 +228,7 @@ type PendingSend = (u32, SyncSender<Arc<[u8]>>, Arc<[u8]>);
 impl PlayerHandle {
     fn correct_position(&self, id: u32, sends: &mut Vec<PendingSend>) {
         if self.ready {
-            let frame = ServerMessage::Position { pos: self.pos }.encode().into();
+            let frame = ServerMessage::Position { pos: self.pos, frame: self.frame, up: self.up }.encode().into();
             sends.push((id, self.out.clone(), frame));
         }
     }
@@ -251,16 +256,13 @@ struct State {
     registry: BlockRegistry,
     players: HashMap<u32, PlayerHandle>,
     /// Bucket key → ids standing in it, keyed by [`bucket_of`]. Buckets are
-    /// exactly one [`INTEREST_RADIUS`] wide, so anyone in range of a mover
-    /// lives in its 3×3 neighbourhood; [`on_move`] still applies the exact
-    /// per-player distance check, so the grid only narrows candidates, never
-    /// the audience. Deliberately 2D — a y axis would add bucket churn from
-    /// every jump/fall while barely shrinking candidate sets, and ignoring y
-    /// can only widen the candidate set, never miss a listener. Invariant:
-    /// exactly one entry per connected player, updated under the same lock
-    /// hold as the position change it mirrors; empty buckets are removed
-    /// eagerly so churn can never leak keys.
-    grid: HashMap<(i32, i32), Vec<u32>>,
+    /// exactly one [`INTEREST_RADIUS`] wide on each axis, so anyone in range of
+    /// a mover lives in its 3×3×3 neighbourhood; [`on_move`] still applies the
+    /// exact per-player distance check, so the grid only narrows candidates,
+    /// never the audience. Invariant: exactly one entry per connected player,
+    /// updated under the same lock hold as the position change it mirrors;
+    /// empty buckets are removed eagerly so churn can never leak keys.
+    grid: HashMap<(i32, i32, i32), Vec<u32>>,
     next_id: u32,
     /// The `[0,1)` day fraction current at `day_set`. The server advances it
     /// only when asked ([`State::day_now`]), so a late joiner receives the
@@ -294,16 +296,18 @@ impl State {
         let at = bucket_of(pos);
         let mut visible = HashSet::new();
         for dx in -1..=1i32 {
-            for dz in -1..=1i32 {
-                let key = (at.0.wrapping_add(dx), at.1.wrapping_add(dz));
-                let Some(bucket) = self.grid.get(&key) else { continue };
-                for &pid in bucket {
-                    if pid == id {
-                        continue;
-                    }
-                    let Some(other) = self.players.get(&pid) else { continue };
-                    if other.ready && other.pos.distance_squared(pos) <= INTEREST_RADIUS_SQ {
-                        visible.insert(pid);
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let key = (at.0.wrapping_add(dx), at.1.wrapping_add(dy), at.2.wrapping_add(dz));
+                    let Some(bucket) = self.grid.get(&key) else { continue };
+                    for &pid in bucket {
+                        if pid == id {
+                            continue;
+                        }
+                        let Some(other) = self.players.get(&pid) else { continue };
+                        if other.ready && other.pos.distance_squared(pos) <= INTEREST_RADIUS_SQ {
+                            visible.insert(pid);
+                        }
                     }
                 }
             }
@@ -456,8 +460,12 @@ fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
 /// clamped floor (not truncation) so negative coordinates bucket consistently
 /// and a hostile-but-finite huge coordinate can't overflow the i32 key —
 /// insert and remove share this one mapping, so the grid stays consistent.
-fn bucket_of(pos: DVec3) -> (i32, i32) {
-    (block_coord(pos.x / INTEREST_RADIUS), block_coord(pos.z / INTEREST_RADIUS))
+fn bucket_of(pos: DVec3) -> (i32, i32, i32) {
+    (
+        block_coord(pos.x / INTEREST_RADIUS),
+        block_coord(pos.y / INTEREST_RADIUS),
+        block_coord(pos.z / INTEREST_RADIUS),
+    )
 }
 
 fn outside_world(pos: DVec3) -> bool {
@@ -821,6 +829,9 @@ fn admit_player(
                 pos: spawn,
                 yaw: 0.0,
                 pitch: 0.0,
+                frame: DQuat::IDENTITY,
+                velocity: Vec3::ZERO,
+                up: Face::PosY,
                 stance: Stance::Standing,
                 last_move: Instant::now(),
                 visible: HashSet::new(),
@@ -905,8 +916,8 @@ fn client_loop(
             continue;
         };
         match msg {
-            ClientMessage::Move { pos, yaw, pitch, stance } => {
-                on_move(shared, id, pos, yaw, pitch, stance)
+            ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance } => {
+                on_move(shared, id, pos, yaw, pitch, frame, velocity, up, stance)
             }
             ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
@@ -1004,15 +1015,43 @@ fn depart(
 /// `try_send`s. `try_send` never blocks, failures land their owner on the kick
 /// list, [`kick_slow`] tolerates ids that disconnected in the unlocked window,
 /// and ids are never reused, so a late kick can't hit the wrong player.
-fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
-    // A NaN position poisons distance checks/grid keys; a NaN angle propagates
-    // into peer interpolation and render matrices even though the server
-    // itself does not otherwise use the angle.
+/// The orientation a [`ClientMessage::Move`] reports. A teleport passes `None`
+/// and keeps whatever the handle already stored.
+struct ReportedPose {
+    yaw: f32,
+    pitch: f32,
+    frame: DQuat,
+    velocity: Vec3,
+    up: Face,
+    stance: Stance,
+}
+
+fn quat_finite(q: DQuat) -> bool {
+    q.x.is_finite() && q.y.is_finite() && q.z.is_finite() && q.w.is_finite()
+}
+
+fn on_move(
+    shared: &Arc<Mutex<State>>,
+    id: u32,
+    pos: DVec3,
+    yaw: f32,
+    pitch: f32,
+    frame: DQuat,
+    velocity: Vec3,
+    up: Face,
+    stance: Stance,
+) {
+    // A NaN position poisons distance checks/grid keys; a NaN angle, frame, or
+    // velocity propagates into peer interpolation and render matrices.
     if !pos.x.is_finite()
         || !pos.y.is_finite()
         || !pos.z.is_finite()
         || !yaw.is_finite()
         || !pitch.is_finite()
+        || !quat_finite(frame)
+        || !velocity.x.is_finite()
+        || !velocity.y.is_finite()
+        || !velocity.z.is_finite()
     {
         return;
     }
@@ -1028,7 +1067,13 @@ fn on_move(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32
         if outside_world(pos) || h.pos.distance_squared(pos) > allowed * allowed {
             h.correct_position(id, &mut sends);
         } else {
-            commit_pose(&mut state, id, pos, Some((yaw, pitch, stance)), &mut sends);
+            commit_pose(
+                &mut state,
+                id,
+                pos,
+                Some(ReportedPose { yaw, pitch, frame, velocity, up, stance }),
+                &mut sends,
+            );
         }
     }
     dispatch(shared, sends);
@@ -1068,19 +1113,22 @@ fn commit_pose(
     state: &mut State,
     id: u32,
     pos: DVec3,
-    angles: Option<(f32, f32, Stance)>,
+    reported: Option<ReportedPose>,
     sends: &mut Vec<PendingSend>,
 ) {
     let Some(h) = state.players.get_mut(&id) else { return };
     let old = h.pos;
     h.pos = pos;
-    if let Some((yaw, pitch, stance)) = angles {
-        h.yaw = yaw;
-        h.pitch = pitch;
-        h.stance = stance;
+    if let Some(r) = reported {
+        h.yaw = r.yaw;
+        h.pitch = r.pitch;
+        h.frame = r.frame;
+        h.velocity = r.velocity;
+        h.up = r.up;
+        h.stance = r.stance;
     }
     h.last_move = Instant::now();
-    let (yaw, pitch, stance) = (h.yaw, h.pitch, h.stance);
+    let (yaw, pitch, frame, velocity, up, stance) = (h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance);
     let (from, to) = (bucket_of(old), bucket_of(pos));
     if from != to {
         state.grid_remove(id, old);
@@ -1116,7 +1164,7 @@ fn commit_pose(
         return;
     }
     let move_frame: Arc<[u8]> =
-        ServerMessage::PeerMove { id, pos, yaw, pitch, stance }.encode().into();
+        ServerMessage::PeerMove { id, pos, yaw, pitch, frame, velocity, up, stance }.encode().into();
     for pid in now_visible {
         let entered = !state.players[&id].visible.contains(&pid);
         let Some(other) = state.players.get_mut(&pid) else { continue };
@@ -1128,6 +1176,9 @@ fn commit_pose(
                 pos: other.pos,
                 yaw: other.yaw,
                 pitch: other.pitch,
+                frame: other.frame,
+                velocity: other.velocity,
+                up: other.up,
                 stance: other.stance,
             };
             sends.push((id, mover_out.clone(), pose.encode().into()));
@@ -1587,6 +1638,9 @@ mod tests {
             pos,
             yaw: 0.0,
             pitch: 0.0,
+            frame: DQuat::IDENTITY,
+            velocity: Vec3::ZERO,
+            up: Face::PosY,
             stance: Stance::Standing,
             last_move: Instant::now() - Duration::from_secs(10),
             visible: HashSet::new(),
@@ -1598,6 +1652,11 @@ mod tests {
     }
 
     /// A throwaway kick handle for state-only players (never notified).
+    /// A move that leaves the body frame, velocity, and up axis at their defaults.
+    fn walk(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
+        on_move(shared, id, pos, yaw, pitch, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, stance);
+    }
+
     fn test_kick() -> Arc<Notify> {
         Arc::new(Notify::new())
     }
@@ -1893,8 +1952,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(test_state(players)));
 
         let attempted = DVec3::new(9.5, 20.0, 8.5);
-        on_move(&shared, 1, attempted, f32::NAN, 0.0, Stance::Sneaking);
-        on_move(&shared, 1, attempted, 0.0, f32::INFINITY, Stance::Sneaking);
+        walk(&shared, 1, attempted, f32::NAN, 0.0, Stance::Sneaking);
+        walk(&shared, 1, attempted, 0.0, f32::INFINITY, Stance::Sneaking);
 
         let state = shared.lock_recover();
         let player = &state.players[&1];
@@ -1917,16 +1976,16 @@ mod tests {
 
         // A plausible walk step commits.
         let step = DVec3::new(10.5, 20.0, 8.5);
-        on_move(&shared, 1, step, 0.1, 0.0, Stance::Standing);
+        walk(&shared, 1, step, 0.1, 0.0, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, step);
         assert!(rx.try_recv().is_err(), "an accepted move needs no correction");
 
         // Move(target)+Edit(target) forging: the cross-map hop is refused...
         let forged = DVec3::new(4000.0, 20.0, 4000.0);
-        on_move(&shared, 1, forged, 0.0, 0.0, Stance::Standing);
+        walk(&shared, 1, forged, 0.0, 0.0, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, step, "position unchanged");
         match ServerMessage::decode(&rx.try_recv().expect("a correction is sent")) {
-            Some(ServerMessage::Position { pos }) => assert_eq!(pos, step),
+            Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, step),
             other => panic!("expected a Position snap-back, got {other:?}"),
         }
         // ...so the follow-up edit at the forged position stays out of reach.
@@ -1935,7 +1994,7 @@ mod tests {
 
         // Outside the world border: rejected no matter how slow.
         age_move(&shared, 1);
-        on_move(&shared, 1, DVec3::new(2.0e9, 20.0, 8.5), 0.0, 0.0, Stance::Standing);
+        walk(&shared, 1, DVec3::new(2.0e9, 20.0, 8.5), 0.0, 0.0, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, step);
     }
 
@@ -1953,14 +2012,14 @@ mod tests {
         on_teleport(&shared, &test_ctx(true), 1, far);
         assert_eq!(shared.lock_recover().players[&1].pos, far, "allowed teleport commits");
         match ServerMessage::decode(&rx.try_recv().expect("accepted teleport echoes Position")) {
-            Some(ServerMessage::Position { pos }) => assert_eq!(pos, far),
+            Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, far),
             other => panic!("expected a Position echo, got {other:?}"),
         }
 
         on_teleport(&shared, &test_ctx(false), 1, start);
         assert_eq!(shared.lock_recover().players[&1].pos, far, "refused teleport is not committed");
         match ServerMessage::decode(&rx.try_recv().expect("a correction is sent")) {
-            Some(ServerMessage::Position { pos }) => assert_eq!(pos, far),
+            Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, far),
             other => panic!("expected a Position snap-back, got {other:?}"),
         }
     }
@@ -2082,23 +2141,23 @@ mod tests {
         players.insert(1u32, test_player(start, out, test_kick()));
         let mut state = test_state(players);
         state.grid_insert(1, start);
-        assert_eq!(state.grid.get(&(0, 0)).map(Vec::len), Some(1));
+        assert_eq!(state.grid.get(&(0, 0, 0)).map(Vec::len), Some(1));
         let shared = Arc::new(Mutex::new(state));
 
         // Crossing the x border: the entry moves buckets and the emptied bucket
         // is dropped, not left behind as a leaked key.
-        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0, Stance::Standing);
+        walk(&shared, 1, DVec3::new(INTEREST_RADIUS + 5.0, 20.0, 10.0), 0.0, 0.0, Stance::Standing);
         {
             let s = shared.lock_recover();
-            assert_eq!(s.grid.get(&(1, 0)).map(Vec::as_slice), Some(&[1u32][..]));
-            assert!(!s.grid.contains_key(&(0, 0)), "emptied bucket must be removed");
+            assert_eq!(s.grid.get(&(1, 0, 0)).map(Vec::as_slice), Some(&[1u32][..]));
+            assert!(!s.grid.contains_key(&(0, 0, 0)), "emptied bucket must be removed");
         }
 
         // Moving within the same bucket must not duplicate the entry.
-        on_move(&shared, 1, DVec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0, Stance::Standing);
+        walk(&shared, 1, DVec3::new(INTEREST_RADIUS + 6.0, 20.0, 10.0), 0.0, 0.0, Stance::Standing);
         {
             let s = shared.lock_recover();
-            assert_eq!(s.grid.get(&(1, 0)).map(Vec::len), Some(1));
+            assert_eq!(s.grid.get(&(1, 0, 0)).map(Vec::len), Some(1));
             assert_eq!(s.grid.len(), 1);
         }
 
@@ -2106,10 +2165,10 @@ mod tests {
         // (Aged anchor: the hop back is real distance, and this test is about
         // grid bookkeeping, not the envelope.)
         age_move(&shared, 1);
-        on_move(&shared, 1, DVec3::new(-1.0, 20.0, -1.0), 0.0, 0.0, Stance::Standing);
+        walk(&shared, 1, DVec3::new(-1.0, 20.0, -1.0), 0.0, 0.0, Stance::Standing);
         {
             let s = shared.lock_recover();
-            assert_eq!(s.grid.get(&(-1, -1)).map(Vec::len), Some(1));
+            assert_eq!(s.grid.get(&(-1, 0, -1)).map(Vec::len), Some(1));
             assert_eq!(s.grid.len(), 1);
         }
     }
@@ -2161,7 +2220,14 @@ mod tests {
                 expected_sends.push((
                     id,
                     ServerMessage::PeerMove {
-                        id: 1, pos, yaw: 0.0, pitch: 0.0, stance: Stance::Standing,
+                        id: 1,
+                        pos,
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        frame: DQuat::IDENTITY,
+                        velocity: Vec3::ZERO,
+                        up: Face::PosY,
+                        stance: Stance::Standing,
                     },
                 ));
                 if !previous.contains(&id) {
@@ -2173,6 +2239,9 @@ mod tests {
                             pos: player.pos,
                             yaw: player.yaw,
                             pitch: player.pitch,
+                            frame: player.frame,
+                            velocity: player.velocity,
+                            up: player.up,
                             stance: player.stance,
                         },
                     ));
@@ -2242,7 +2311,7 @@ mod tests {
         );
 
         // And the reverse direction: guahlg's entry followed him too.
-        a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0, Stance::Standing);
+        a.send_move(DVec3::new(4010.0, 30.0, 4010.0), 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
         thread::sleep(settle);
         b.poll();
         let walnutty_as_seen = b.peers().next().unwrap().sample(Instant::now() + Duration::from_secs(3600)).pos.0;
@@ -2300,7 +2369,7 @@ mod tests {
 
     #[test]
     fn welcome_carries_the_servers_worldgen_kind_and_cfg() {
-        let terrain = TerrainCfg { relief: 175, caves: 50, mines: 0, space: 125 };
+        let terrain = TerrainCfg { relief: 175, caves: 50, mines: 0, space: 125, ..Default::default() };
         let handle = spawn(
             0,
             Config {
@@ -2501,8 +2570,8 @@ mod tests {
         // Bucket edge: INTEREST_RADIUS is the first point of bucket 1.
         let on_edge = DVec3::new(INTEREST_RADIUS, 20.0, 0.0);
         let just_inside = DVec3::new(INTEREST_RADIUS - 1.0, 20.0, 0.0);
-        assert_eq!(bucket_of(on_edge), (1, 0));
-        assert_eq!(bucket_of(just_inside), (0, 0));
+        assert_eq!(bucket_of(on_edge), (1, 0, 0));
+        assert_eq!(bucket_of(just_inside), (0, 0, 0));
 
         // i32-wrap-like coordinates clamp through block_coord; membership stays 1:1.
         age_move_state(&mut state, 1);
@@ -2585,13 +2654,13 @@ mod tests {
         let shared = Arc::new(Mutex::new(test_state(players)));
         let forged = DVec3::new(4000.0, 20.0, 4000.0);
         for _ in 0..8 {
-            on_move(&shared, 1, forged, 0.0, 0.0, Stance::Standing);
+            walk(&shared, 1, forged, 0.0, 0.0, Stance::Standing);
         }
         assert_eq!(shared.lock_recover().players[&1].pos, start);
         let mut corrections = 0;
         while let Ok(frame) = rx.try_recv() {
             match ServerMessage::decode(&frame) {
-                Some(ServerMessage::Position { pos }) => {
+                Some(ServerMessage::Position { pos, .. }) => {
                     assert_eq!(pos, start);
                     corrections += 1;
                 }
@@ -2600,7 +2669,7 @@ mod tests {
         }
         assert!(corrections >= 1, "the burst must snap back at least once");
         let legal = DVec3::new(10.5, 20.0, 8.5);
-        on_move(&shared, 1, legal, 0.0, 0.0, Stance::Standing);
+        walk(&shared, 1, legal, 0.0, 0.0, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, legal);
         assert!(rx.try_recv().is_err(), "a legal follow-up must not snap back");
     }
@@ -2620,7 +2689,7 @@ mod tests {
         on_teleport(&shared, &test_ctx(false), 1, start);
         assert_eq!(shared.lock_recover().players[&1].pos, dest);
         match ServerMessage::decode(&rx.try_recv().expect("refused /tp snaps back")) {
-            Some(ServerMessage::Position { pos }) => assert_eq!(pos, dest),
+            Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, dest),
             other => panic!("expected Position, got {other:?}"),
         }
     }

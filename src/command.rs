@@ -45,7 +45,7 @@ macro_rules! commands {
         ) -> Vec<Line> {
             match $cmd {
                 $($canon $(| $alias)* => $body,)+
-                other => rejected(vec![format!("unknown command '{other}' — type 'help'")]),
+                other => rejected(vec![format!("unknown command '{other}' — type '/help'")]),
             }
         }
 
@@ -60,20 +60,20 @@ macro_rules! commands {
 
 commands! {
     cmd, args, player, world, settings, sky, visuals;
-    "tp" | "teleport" | "setpos", "  tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
-    "pos" | "where", "  pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
-    "inspect" | "look", "  inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
-    "reactions", "  reactions            show pending reaction events" => reactions(world);
-    "gfx" | "graphics", "  gfx [setting value]  show or change graphics settings" => gfx(args, settings, visuals);
-    "time", "  time [set|length]    show or set the day/night clock" => time(args, sky);
-    "walkspeed", "  walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
-    "flyspeed", "  flyspeed [n]         show or set flying speed" => flyspeed(args, player);
-    "mute", "  mute                 toggle master mute (this session)" => mute(settings);
-    "deafen", "  deafen               toggle hearing incoming voice" => deafen(settings);
-    "audio" | "volume", "  audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
-    "voicetest", "  voicetest            play a local voice test cue" => voicetest();
-    "name", "  name <n> <text>      name a recorded crafting procedure" => rejected(vec!["name: no procedure journal (is the crafting mod enabled?)".to_string()]);
-    "help" | "?", "  help                 show this list" => help();
+    "tp" | "teleport" | "setpos", "  /tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
+    "pos" | "where", "  /pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
+    "inspect" | "look", "  /inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
+    "reactions", "  /reactions            show pending reaction events" => reactions(world);
+    "gfx" | "graphics", "  /gfx [setting value]  show or change graphics settings" => gfx(args, settings, visuals);
+    "time", "  /time [set|length]    show or set the day/night clock" => time(args, sky);
+    "walkspeed", "  /walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
+    "flyspeed", "  /flyspeed [n]         show or set flying speed" => flyspeed(args, player);
+    "mute", "  /mute                 toggle master mute (this session)" => mute(settings);
+    "deafen", "  /deafen               toggle hearing incoming voice" => deafen(settings);
+    "audio" | "volume", "  /audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
+    "voicetest", "  /voicetest            play a local voice test cue" => voicetest();
+    "name", "  /name <n> <text>      name a recorded crafting procedure" => rejected(vec!["/name: no procedure journal (is the crafting mod enabled?)".to_string()]);
+    "help" | "?", "  /help                 show this list" => help();
 }
 
 /// Run a console line against the game state, returning output lines for the log.
@@ -130,16 +130,16 @@ fn time(args: &[&str], sky: &mut Sky) -> Vec<Line> {
                 sky.clock.set_day(day);
                 shown(vec![format!("time set to {}", clock_label(day))])
             }
-            None => rejected(vec!["time: use 0..1, 0..24, or dawn|day|noon|dusk|night".to_string()]),
+            None => rejected(vec!["/time: use 0..1, 0..24, or dawn|day|noon|dusk|night".to_string()]),
         },
         ["length", secs] => match secs.parse::<f64>() {
             Ok(s) if s.is_finite() => {
                 sky.day_length = DayLength::clamped(s);
                 shown(vec![format!("day length set to {:.0}s", sky.day_length.0)])
             }
-            _ => rejected(vec!["time: length must be a number of seconds".to_string()]),
+            _ => rejected(vec!["/time: length must be a number of seconds".to_string()]),
         },
-        _ => rejected(vec!["usage: time [set <when> | length <secs>]".to_string()]),
+        _ => rejected(vec!["usage: /time [set <when> | length <secs>]".to_string()]),
     }
 }
 
@@ -180,7 +180,7 @@ fn clock_label(day: f64) -> String {
 /// against unloaded air.
 fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
     if args.len() != 3 {
-        return rejected(vec!["usage: tp <x> <y> <z>".to_string()]);
+        return rejected(vec!["usage: /tp <x> <y> <z>".to_string()]);
     }
     let parsed: Result<Vec<f64>, _> = args.iter().map(|a| a.parse::<f64>()).collect();
     match parsed.as_deref() {
@@ -193,7 +193,7 @@ fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> 
             player.cancel_fall();
             shown(vec![format!("teleported to {}", fmt_pos(player.position))])
         }
-        _ => rejected(vec!["tp: x, y and z must be numbers".to_string()]),
+        _ => rejected(vec!["/tp: x, y and z must be numbers".to_string()]),
     }
 }
 
@@ -201,8 +201,8 @@ fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> 
 /// The caller applies the mutated [`Settings`] to the engine and persists it.
 fn gfx(args: &[&str], settings: &mut Settings, visuals: VisualMask) -> Vec<Line> {
     let usage = || {
-        std::iter::once("usage: gfx <setting> <value>".to_string())
-            .chain(SETTINGS.iter().map(|field| format!("  gfx {}", field.usage())))
+        std::iter::once("usage: /gfx <setting> <value>".to_string())
+            .chain(SETTINGS.iter().map(|field| format!("  /gfx {}", field.usage())))
             .collect()
     };
 
@@ -268,7 +268,7 @@ fn deafen(settings: &mut Settings) -> Vec<Line> {
 /// `/audio <master|effects|voice> <0-100>` — set one mix volume, clamped to 0..=100.
 /// The caller persists the mutated [`Settings`]; a bad channel or value changes nothing.
 fn audio(args: &[&str], settings: &mut Settings) -> Vec<Line> {
-    let usage = || rejected(vec!["usage: audio <master|effects|voice> <0-100>".to_string()]);
+    let usage = || rejected(vec!["usage: /audio <master|effects|voice> <0-100>".to_string()]);
     let [channel, value] = args else {
         return usage();
     };
@@ -294,12 +294,12 @@ fn voicetest() -> Vec<Line> {
 
 /// `walkspeed [n]` — show or set the player's ground walk speed, units/second.
 fn walkspeed(args: &[&str], player: &mut Player) -> Vec<Line> {
-    set_speed(args, "walkspeed", player, |p| &mut p.speed)
+    set_speed(args, "/walkspeed", player, |p| &mut p.speed)
 }
 
 /// `flyspeed [n]` — show or set the player's flying speed, units/second.
 fn flyspeed(args: &[&str], player: &mut Player) -> Vec<Line> {
-    set_speed(args, "flyspeed", player, |p| &mut p.fly_speed)
+    set_speed(args, "/flyspeed", player, |p| &mut p.fly_speed)
 }
 
 /// Shared show/set logic for `walkspeed`/`flyspeed`: both just target a different
@@ -334,9 +334,9 @@ fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
         }
         [x, y, z] => match (x.parse(), y.parse(), z.parse()) {
             (Ok(x), Ok(y), Ok(z)) => (x, y, z),
-            _ => return rejected(vec!["inspect: x, y and z must be integers".to_string()]),
+            _ => return rejected(vec!["/inspect: x, y and z must be integers".to_string()]),
         },
-        _ => return rejected(vec!["usage: inspect [<x> <y> <z>]".to_string()]),
+        _ => return rejected(vec!["usage: /inspect [<x> <y> <z>]".to_string()]),
     };
 
     let (x, y, z) = cell;
@@ -419,20 +419,20 @@ mod tests {
         assert_eq!(
             joined(&help()),
             "commands (a leading '/' is optional):\n  \
-             tp <x> <y> <z>       teleport to coordinates\n  \
-             pos                  show current coordinates\n  \
-             inspect [x y z]      describe a block's elements & properties\n  \
-             reactions            show pending reaction events\n  \
-             gfx [setting value]  show or change graphics settings\n  \
-             time [set|length]    show or set the day/night clock\n  \
-             walkspeed [n]        show or set ground walk speed\n  \
-             flyspeed [n]         show or set flying speed\n  \
-             mute                 toggle master mute (this session)\n  \
-             deafen               toggle hearing incoming voice\n  \
-             audio <chan> <0-100> set master/effects/voice volume\n  \
-             voicetest            play a local voice test cue\n  \
-             name <n> <text>      name a recorded crafting procedure\n  \
-             help                 show this list"
+             /tp <x> <y> <z>       teleport to coordinates\n  \
+             /pos                  show current coordinates\n  \
+             /inspect [x y z]      describe a block's elements & properties\n  \
+             /reactions            show pending reaction events\n  \
+             /gfx [setting value]  show or change graphics settings\n  \
+             /time [set|length]    show or set the day/night clock\n  \
+             /walkspeed [n]        show or set ground walk speed\n  \
+             /flyspeed [n]         show or set flying speed\n  \
+             /mute                 toggle master mute (this session)\n  \
+             /deafen               toggle hearing incoming voice\n  \
+             /audio <chan> <0-100> set master/effects/voice volume\n  \
+             /voicetest            play a local voice test cue\n  \
+             /name <n> <text>      name a recorded crafting procedure\n  \
+             /help                 show this list"
         );
     }
 

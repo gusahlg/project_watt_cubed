@@ -7,7 +7,8 @@ use crate::block::registry::SpecKind;
 use crate::block::{AIR, BlockId};
 use crate::coord::{BlockCoord, ChunkCoord, Local};
 use crate::modding::Mods;
-use crate::player::Player;
+use crate::coord::Face;
+use crate::player::{Motion, Player};
 use crate::world::chunk::Chunk;
 use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
@@ -62,6 +63,9 @@ impl SaveSnapshot {
                 pos: [player.position.x, player.position.y, player.position.z],
                 yaw: player.orientation.yaw,
                 pitch: player.orientation.pitch,
+                frame: player.orientation.frame,
+                velocity: player.velocity().to_array(),
+                up: player.up_axis as u8,
                 flying: player.flying(),
                 noclip: player.noclip(),
                 stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
@@ -285,11 +289,19 @@ pub fn from_doc(
     ));
     player.orientation.yaw = doc.player.yaw;
     player.orientation.pitch = doc.player.pitch;
+    // Assign the saved frame. `snap_up` would rebuild it and drop any twist around up.
+    player.orientation.frame = doc.player.frame;
+    player.up_axis = Face::from_index(doc.player.up).unwrap_or(Face::PosY);
     if doc.player.flying {
         player.set_flying(true);
         if doc.player.noclip {
             player.cycle_fly();
         }
+    }
+    // `set_flying` / `cycle_fly` zero the component along up. Write the saved velocity after.
+    let saved = DVec3::from_array(doc.player.velocity);
+    match &mut player.motion {
+        Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = saved,
     }
 
     let mut unknown = restore_stash(&mut player, &doc, &mut world);

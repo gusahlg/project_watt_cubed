@@ -183,6 +183,13 @@ impl Face {
         Face::ALL[(self as usize) ^ 1]
     }
 
+    /// `Face::ALL` index, or `None` when `index` is not one of the six faces.
+    #[inline]
+    pub const fn from_index(index: u8) -> Option<Self> {
+        let i = index as usize;
+        if i < Self::ALL.len() { Some(Self::ALL[i]) } else { None }
+    }
+
     /// World axis this face is perpendicular to (0=X, 1=Y, 2=Z).
     #[inline]
     pub const fn axis(self) -> usize {

@@ -1,6 +1,7 @@
 //! Six-box humanoid for remote players. Animation lives in the type (each part
 //! carries a [`Swing`] rule), so resolution is a single loop with no per-part
 //! name matching.
+use glam::DQuat;
 use voxel_engine::{Color, Frame3D, Mat3, Vec3};
 
 use crate::presence::{RenderPose, RigParams, wrap_pi};
@@ -102,7 +103,13 @@ impl Pose {
         const ACTION_AMP: f32 = 1.6;
 
         // Negate yaw to flip rotation sense; -pi/2 offset aligns body-local -Z forward with world +X.
-        let body_rot = Mat3::from_rotation_y(-rig.body_yaw - PI / 2.0);
+        // Yaw lives inside the body frame. Identity skips the product so a Y-up body stays exact.
+        let yaw_rot = Mat3::from_rotation_y(-rig.body_yaw - PI / 2.0);
+        let body_rot = if pose.frame == DQuat::IDENTITY {
+            yaw_rot
+        } else {
+            Mat3::from_quat(pose.frame.as_quat()) * yaw_rot
+        };
         let head_yaw = Mat3::from_rotation_y(-wrap_pi(pose.yaw - rig.body_yaw));
         let h = 1.0 + (pose.stance.height_scale() - 1.0) * rig.stance_blend;
         let squash = |v: Vec3| Vec3::new(v.x, v.y * h, v.z);

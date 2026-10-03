@@ -2,12 +2,12 @@
 //! `World`/`Player`/`Mods` to and from `SaveDoc`, so this whole module is
 //! testable without constructing a world.
 //!
-//! Layout, version 9 (all integers little-endian):
+//! Layout, version 10 (all integers little-endian):
 //!
 //! ```text
 //! header (fixed, peekable without the body):
 //!   magic        b"WATT"                                       4
-//!   version      u16 = 9                                       2
+//!   version      u16 = 10                                      2
 //!   name         u8 len + 64-byte field (utf8, zero padded)   65
 //!   seed         i64                                           8
 //!   created      u64 unix secs                                 8
@@ -16,10 +16,13 @@
 //!   edit_count   u32                                           4
 //!   worldgen     u16 (generator version)                       2
 //!   kind         u8  (0 = flat, 1 = diffusion)                 1
-//!   knobs        4 × u16 (relief, caves, mines, space)         8
+//!   knobs        8 × u16 (relief, caves, mines, space,
+//!                         variety, features, structures, deep) 16
 //!   law stamp    STAMP_LEN bytes (Law::stamp)
 //! player         pos f64 x3, yaw f32, pitch f32,
-//!                flags u8 (bit 0 = fly, bit 1 = noclip)       33
+//!                frame f32 x4 (xyzw), velocity f64 x3,
+//!                up u8 (face index), flags u8
+//!                (bit 0 = fly, bit 1 = noclip)                74
 //!                stash: u16 len + utf8 "spec=count,..."        variable
 //! spec table     u16 count, then per spec: u16 len + utf8
 //! edits          edit_count records of i32 x, i32 y, i32 z, u16 spec index
@@ -29,19 +32,25 @@
 //!                u8 axis, u32 age (turns waiting) — the pending work, in order
 //! ```
 //!
-//! Versions 4-8 predate the selective-transfer law: their headers still peek (the slot list
-//! shows them) but [`decode`] refuses them with [`SaveError::Outdated`].
+//! Version 9 is the same header with 4 knobs and a 33-byte player record (no frame,
+//! velocity, or up axis). It still decodes: identity frame, zero velocity, +Y up,
+//! and the four new knobs at 100. A v9 Diffusion world stamped with a generator
+//! older than the cube-planet universe (`worldgen < 7`) is [`SaveError::BeforeCubePlanet`].
+//! Flat v9 worlds load. Versions 4-8 predate the selective-transfer law: their headers
+//! still peek (the slot list shows them) but [`decode`] refuses them with [`SaveError::Outdated`].
 //!
 //! The edit count lives only in the header (no body prefix), and each record is
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
+
+use glam::DQuat;
 
 use crate::ident::codec;
 
 use super::slot::{SaveError, SaveMeta};
 
 pub const MAGIC: &[u8; 4] = b"WATT";
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 
 const NAME_FIELD: usize = 64;
 /// Offset of the name length byte, for in-place renames via [`set_name`].
@@ -54,11 +63,22 @@ const HEADER_LEN_V5: usize = HEADER_LEN_V4 + 2;
 const OLD_WORLDGEN_STAMP_LEN: usize = 1 + 4 + 4 + 4 + 4;
 /// The v8 law stamp (the response-curve law).
 const OLD_STAMP_LEN: usize = 80;
-/// kind u8 + four u16 knobs.
-const WORLDGEN_STAMP_LEN: usize = 1 + 4 * 2;
-/// Header length before the law stamp.
+/// kind u8 + four u16 knobs (save v9).
+const WORLDGEN_STAMP_LEN_V9: usize = 1 + 4 * 2;
+/// kind u8 + eight u16 knobs (save v10).
+const WORLDGEN_STAMP_LEN: usize = 1 + 8 * 2;
+/// Header length before the law stamp (v10).
 const HEADER_LEN_PRE_LAW: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN;
+const HEADER_LEN_V9: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN_V9 + material::STAMP_LEN;
 pub const HEADER_LEN: usize = HEADER_LEN_PRE_LAW + material::STAMP_LEN;
+/// `WorldgenKind::Diffusion` on disk. A v9 Diffusion world from before the cube planets is refused.
+const KIND_DIFFUSION: u8 = 1;
+/// Knob value a v9 stamp (four knobs) pads the four new ones with.
+const KNOB_DEFAULT: u16 = 100;
+/// `coord::Face` discriminants are 0..=5.
+const UP_AXIS_MAX: u8 = 5;
+/// +Y, the only up axis a v9 save can imply.
+const UP_POS_Y: u8 = 5;
 
 /// Header length for a known on-disk version, or `BadVersion`.
 fn header_len(version: u16) -> Result<usize, SaveError> {
@@ -67,13 +87,14 @@ fn header_len(version: u16) -> Result<usize, SaveError> {
         5 => Ok(HEADER_LEN_V5),
         6 | 7 => Ok(HEADER_LEN_V5 + OLD_WORLDGEN_STAMP_LEN),
         8 => Ok(HEADER_LEN_V5 + OLD_WORLDGEN_STAMP_LEN + OLD_STAMP_LEN),
-        9 => Ok(HEADER_LEN),
+        9 => Ok(HEADER_LEN_V9),
+        10 => Ok(HEADER_LEN),
         v => Err(SaveError::BadVersion(v)),
     }
 }
 
-/// Pose (3×f64 + 2×f32) plus the flying/noclip flags byte.
-const PLAYER_POSE_LEN: usize = 32 + 1;
+/// Pose (3×f64 + 2×f32 + 4×f32 frame) + velocity (3×f64) + up axis + flags.
+const PLAYER_POSE_LEN: usize = 24 + 4 + 4 + 16 + 24 + 1 + 1;
 
 const EDIT_BYTES: usize = 14;
 
@@ -124,6 +145,12 @@ pub struct PlayerState {
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// Body frame, xyzw. Unit length after decode.
+    pub frame: DQuat,
+    /// World-space velocity. f64 so a saved vector restores bit-exactly.
+    pub velocity: [f64; 3],
+    /// `coord::Face` index the collision box stands on.
+    pub up: u8,
     pub flying: bool,
     pub noclip: bool,
     /// Held configurations as `(spec, count)` in first-seen order.
@@ -137,13 +164,13 @@ pub struct PlayerState {
 pub struct WorldgenStamp {
     /// 0 = flat, 1 = diffusion.
     pub kind: u8,
-    /// Generator knobs (relief, caves, mines, space) in percent.
-    pub knobs: [u16; 4],
+    /// Generator knobs in percent: relief, caves, mines, space, variety, features, structures, deep.
+    pub knobs: [u16; 8],
 }
 
 impl Default for WorldgenStamp {
     fn default() -> Self {
-        Self { kind: 1, knobs: [100; 4] }
+        Self { kind: 1, knobs: [KNOB_DEFAULT; 8] }
     }
 }
 
@@ -248,7 +275,12 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
         pos: voxel_engine::DVec3::new(doc.player.pos[0], doc.player.pos[1], doc.player.pos[2]),
         yaw: doc.player.yaw,
         pitch: doc.player.pitch,
+        frame: doc.player.frame,
     });
+    for v in doc.player.velocity {
+        pw.f64(v);
+    }
+    pw.u8(doc.player.up);
     out.extend_from_slice(&pw.into_inner());
     out.push(doc.player.flying as u8 | (doc.player.noclip as u8) << 1);
     debug_assert_eq!(out.len(), HEADER_LEN + PLAYER_POSE_LEN);
@@ -408,33 +440,83 @@ macro_rules! save_le {
     };
 }
 
-save_le!(u8 -> u8, u16 -> u16, u32 -> u32, i32 -> i32);
+save_le!(u8 -> u8, u16 -> u16, u32 -> u32, i32 -> i32, f32 -> f32, f64 -> f64);
+
+impl Reader<'_> {
+    fn vec3(&mut self) -> Result<voxel_engine::DVec3, SaveError> {
+        self.0.vec3().or_else(truncated)
+    }
+}
+
+fn frame_ok(q: DQuat) -> bool {
+    let (x, y, z, w) = (q.x, q.y, q.z, q.w);
+    if !(x.is_finite() && y.is_finite() && z.is_finite() && w.is_finite()) {
+        return false;
+    }
+    let len2 = x * x + y * y + z * z + w * w;
+    (len2 - 1.0).abs() <= 1.0e-6
+}
 
 pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let meta = peek_meta(bytes)?;
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version < VERSION {
+    if version < 9 {
         return Err(SaveError::Outdated(version));
     }
     let worldgen_version = u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap());
     let off = HEADER_LEN_V5;
-    let worldgen = WorldgenStamp {
-        kind: bytes[off],
-        knobs: std::array::from_fn(|k| u16::from_le_bytes([bytes[off + 1 + 2 * k], bytes[off + 2 + 2 * k]])),
+    let kind = bytes[off];
+    // v9 Diffusion worlds predate the cube-planet universe. Flat worlds from the same era load.
+    if version == 9 && kind == KIND_DIFFUSION && worldgen_version < 7 {
+        return Err(SaveError::BeforeCubePlanet);
+    }
+    let knobs = if version == 9 {
+        let mut knobs = [KNOB_DEFAULT; 8];
+        for k in 0..4 {
+            let at = off + 1 + 2 * k;
+            knobs[k] = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        }
+        knobs
+    } else {
+        std::array::from_fn(|k| {
+            let at = off + 1 + 2 * k;
+            u16::from_le_bytes([bytes[at], bytes[at + 1]])
+        })
     };
-    let law_stamp = bytes[HEADER_LEN_PRE_LAW..HEADER_LEN].to_vec();
-    let mut r = Reader::with_pos(bytes, header_len(version)?);
+    let worldgen = WorldgenStamp { kind, knobs };
+    let header = header_len(version)?;
+    let law_stamp = bytes[header - material::STAMP_LEN..header].to_vec();
+    let mut r = Reader::with_pos(bytes, header);
 
     // Header through spec table must be intact — there's no way to regenerate
     // a partial spec table, and everything after depends on it.
-    let pose = r.pose()?;
-    let player = PlayerState {
-        pos: [pose.pos.x, pose.pos.y, pose.pos.z],
-        yaw: pose.yaw,
-        pitch: pose.pitch,
-        flying: false,
-        noclip: false,
-        stash: None,
+    // v9's player record has no frame, velocity, or up axis; the new pose reader would eat the flags.
+    let player = if version == 9 {
+        let pos = r.vec3()?;
+        PlayerState {
+            pos: [pos.x, pos.y, pos.z],
+            yaw: r.f32()?,
+            pitch: r.f32()?,
+            frame: DQuat::IDENTITY,
+            velocity: [0.0; 3],
+            up: UP_POS_Y,
+            flying: false,
+            noclip: false,
+            stash: None,
+        }
+    } else {
+        let pose = r.pose()?;
+        PlayerState {
+            pos: [pose.pos.x, pose.pos.y, pose.pos.z],
+            yaw: pose.yaw,
+            pitch: pose.pitch,
+            frame: pose.frame,
+            velocity: [r.f64()?, r.f64()?, r.f64()?],
+            up: r.u8()?,
+            flying: false,
+            noclip: false,
+            stash: None,
+        }
     };
     let flags = r.u8()?;
     let stash = {
@@ -454,6 +536,9 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     if player.pos.iter().any(|v| !v.is_finite() || v.abs() > crate::math::WORLD_BORDER)
         || !player.yaw.is_finite()
         || !player.pitch.is_finite()
+        || player.velocity.iter().any(|v| !v.is_finite())
+        || player.up > UP_AXIS_MAX
+        || !frame_ok(player.frame)
     {
         return Err(SaveError::Corrupt("player state is non-finite or out of world"));
     }
@@ -561,6 +646,9 @@ mod tests {
                 pos: [1.0e8 + 0.123456789, 61.5, -(1.0e9 - 42.25)],
                 yaw: 1.25,
                 pitch: -0.5,
+                frame: DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0),
+                velocity: [1.5, -2.25, 0.5],
+                up: 1,
                 flying: true,
                 noclip: true,
                 stash: Some(vec![("Stone".into(), 2), ("Iron".into(), 1)]),
@@ -601,7 +689,7 @@ mod tests {
     #[test]
     fn worldgen_stamp_and_pending_reactions_round_trip() {
         let mut doc = sample();
-        doc.worldgen = WorldgenStamp { kind: 1, knobs: [175, 25, 200, 0] };
+        doc.worldgen = WorldgenStamp { kind: 1, knobs: [175, 25, 200, 0, 125, 50, 175, 0] };
         let bytes = encode(&doc).unwrap();
         let back = expect_intact(decode(&bytes).unwrap());
         assert_eq!(back.worldgen, doc.worldgen);
@@ -835,6 +923,77 @@ mod tests {
         bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(SaveError::BadVersion(99))));
         assert!(matches!(peek_meta(&bytes), Err(SaveError::BadVersion(99))));
+    }
+
+    /// A minimal v9 file: four knobs, the old 33-byte player, empty tail.
+    fn v9_save(kind: u8, worldgen: u16, knobs: [u16; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&9u16.to_le_bytes());
+        out.push(1);
+        let mut field = [0u8; NAME_FIELD];
+        field[0] = b'v';
+        out.extend_from_slice(&field);
+        out.extend_from_slice(&1i64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&worldgen.to_le_bytes());
+        out.push(kind);
+        for k in knobs {
+            out.extend_from_slice(&k.to_le_bytes());
+        }
+        out.extend_from_slice(&material::Law::current().stamp());
+        assert_eq!(out.len(), header_len(9).unwrap());
+        out.extend_from_slice(&[0u8; 33]);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.push(0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn v9_flat_loads_with_identity_frame_and_padded_knobs() {
+        let doc = expect_intact(decode(&v9_save(0, 6, [150, 50, 0, 200])).unwrap());
+        assert_eq!(doc.worldgen_version, 6);
+        assert_eq!(doc.worldgen.kind, 0);
+        assert_eq!(doc.worldgen.knobs, [150, 50, 0, 200, 100, 100, 100, 100]);
+        assert_eq!(doc.player.frame, DQuat::IDENTITY);
+        assert_eq!(doc.player.velocity, [0.0; 3]);
+        assert_eq!(doc.player.up, UP_POS_Y);
+    }
+
+    #[test]
+    fn v9_diffusion_before_cube_planets_is_refused() {
+        let err = decode(&v9_save(KIND_DIFFUSION, 6, [100; 4])).unwrap_err();
+        assert!(matches!(err, SaveError::BeforeCubePlanet));
+        assert!(err.to_string().contains("made before the cube-planet universe"));
+        // A v10 Diffusion world stamped with the current generator (still 6) loads.
+        let mut doc = sample();
+        doc.worldgen_version = 6;
+        doc.worldgen.kind = KIND_DIFFUSION;
+        assert!(matches!(decode(&encode(&doc).unwrap()).unwrap(), Decoded::Intact(_)));
+    }
+
+    #[test]
+    fn repaired_quaternion_loads_and_a_bad_up_axis_does_not() {
+        let doc = sample();
+        let mut bytes = encode(&doc).unwrap();
+        let frame_at = HEADER_LEN + 32;
+        bytes[frame_at..frame_at + 16].fill(0);
+        let got = expect_intact(decode(&bytes).unwrap());
+        assert_eq!(got.player.frame, DQuat::IDENTITY);
+        assert_eq!(got.player.velocity, doc.player.velocity);
+
+        let mut bytes = encode(&doc).unwrap();
+        bytes[HEADER_LEN + 48..HEADER_LEN + 56].copy_from_slice(&f64::INFINITY.to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
+
+        let mut bytes = encode(&doc).unwrap();
+        bytes[HEADER_LEN + 72] = 9;
+        assert!(matches!(decode(&bytes), Err(SaveError::Corrupt(_))));
     }
 
     #[test]

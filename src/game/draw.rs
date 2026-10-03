@@ -347,6 +347,7 @@ impl Game {
                     Eye(pose.eye),
                     self.player.orientation.yaw,
                     self.player.orientation.pitch,
+                    self.player.orientation.frame,
                     Stance::of_player(&self.player),
                     Gait::new(self.local_gait as f32, speed),
                 );
@@ -549,7 +550,7 @@ impl Game {
         // heard one would freeze a ghost in place.
         for peer in net.peers_mut().filter(|peer| peer.visible()) {
             let r = peer.sample(now);
-            let feet = r.pos.feet(r.stance);
+            let feet = r.pos.feet(r.stance, r.up);
             let color = peer_color(&peer.name);
             let model = want_models.then(|| {
                 let rp = RenderPose::new(
@@ -557,6 +558,7 @@ impl Game {
                     Eye(eye),
                     r.yaw,
                     r.pitch,
+                    r.frame,
                     r.stance,
                     Gait::new(r.phase, r.speed),
                 );

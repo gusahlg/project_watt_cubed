@@ -15,8 +15,10 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
-use voxel_engine::DVec3;
+use glam::DQuat;
+use voxel_engine::{DVec3, Vec3};
 
+use crate::coord::Face;
 use crate::ident::codec;
 use crate::presence::Stance;
 use crate::world::terrain::TerrainCfg;
@@ -113,6 +115,35 @@ impl Wire for WorldgenKind {
     }
 }
 
+impl Wire for DQuat {
+    fn put(&self, w: &mut codec::Writer) {
+        w.quat(*self);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        r.quat().ok()
+    }
+}
+
+impl Wire for Vec3 {
+    fn put(&self, w: &mut codec::Writer) {
+        w.f32(self.x);
+        w.f32(self.y);
+        w.f32(self.z);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        Some(Vec3::new(r.f32().ok()?, r.f32().ok()?, r.f32().ok()?))
+    }
+}
+
+impl Wire for Face {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u8(*self as u8);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        Face::from_index(r.u8().ok()?)
+    }
+}
+
 impl Wire for TerrainCfg {
     fn put(&self, w: &mut codec::Writer) {
         for v in self.to_wire() {
@@ -120,7 +151,7 @@ impl Wire for TerrainCfg {
         }
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
-        let mut v = [0u16; 4];
+        let mut v = [0u16; 8];
         for x in v.iter_mut() {
             *x = u16::try_from(r.u32().ok()?).ok()?;
         }
@@ -303,7 +334,7 @@ messages! {
         /// Client simulates its own player; server-side this is plausibility-checked
         /// (movement envelope + border) — discontinuities must go through
         /// [`Teleport`](Self::Teleport).
-        Move = tag::MOVE { pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+        Move = tag::MOVE { pos: DVec3, yaw: f32, pitch: f32, frame: DQuat, velocity: Vec3, up: Face, stance: Stance },
         /// Exempt from the movement envelope, but the server may refuse it
         /// (configuration) and answer with a [`ServerMessage::Position`] snap-back.
         Teleport = tag::TELEPORT { pos: DVec3 },
@@ -350,7 +381,7 @@ messages! {
         PeerJoined = tag::PEER_JOINED { id: u32, name: Arc<str> },
         PeerLeft = tag::PEER_LEFT { id: u32 },
         /// Also the "entered interest range" signal.
-        PeerMove = tag::PEER_MOVE { id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance },
+        PeerMove = tag::PEER_MOVE { id: u32, pos: DVec3, yaw: f32, pitch: f32, frame: DQuat, velocity: Vec3, up: Face, stance: Stance },
         /// A peer left interest range: hide their avatar instead of drawing a
         /// frozen ghost at the last heard pose. They re-appear on the next
         /// [`PeerMove`](Self::PeerMove) for that id.
@@ -365,8 +396,9 @@ messages! {
         /// prediction rolls back on. A hook Deny does not advance the cell, so
         /// the client's `restore` is the same as a lost race.
         EditAck = tag::EDIT_ACK { req: u32, accepted: bool, rev: u32 },
-        /// Refused teleport or implausible movement: snap to it.
-        Position = tag::POSITION { pos: DVec3 },
+        /// Refused teleport or implausible movement: snap to it. Carries the
+        /// body frame and the up-axis face the server last accepted.
+        Position = tag::POSITION { pos: DVec3, frame: DQuat, up: Face },
         Chat = tag::S_CHAT { from_id: u32, from_name: Arc<str>, channel: u8, text: Arc<str> },
         /// `day` is a `[0,1)` fraction and `day_secs` the shared real-seconds
         /// length of a full cycle, so every clock advances in step.
@@ -451,6 +483,9 @@ mod tests {
                 pos: DVec3::new(1.5, -2.0, 3.25),
                 yaw: 0.5,
                 pitch: -0.25,
+                frame: DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0),
+                velocity: Vec3::new(1.5, -2.25, 0.5),
+                up: Face::PosX,
                 stance: Stance::Sneaking,
             },
             ClientMessage::Teleport { pos: DVec3::new(1.0e8, -40.0, 3.5) },
@@ -487,7 +522,7 @@ mod tests {
                 seed: 11,
                 spawn: DVec3::new(1.0, 20.0, 2.0),
                 worldgen: WorldgenKind::Diffusion,
-                terrain: TerrainCfg { relief: 150, caves: 50, mines: 0, space: 200 },
+                terrain: TerrainCfg { relief: 150, caves: 50, mines: 0, space: 200, ..Default::default() },
                 law: law_stamp(),
             },
             ServerMessage::Reject { reason: "bad password".into() },
@@ -504,6 +539,9 @@ mod tests {
                 pos: DVec3::new(9.0, 8.0, 7.0),
                 yaw: 1.0,
                 pitch: 0.1,
+                frame: DQuat::from_xyzw(1.0, 0.0, 0.0, 0.0),
+                velocity: Vec3::new(0.25, 0.0, -1.5),
+                up: Face::NegY,
                 stance: Stance::Sneaking,
             },
             ServerMessage::PeerExited { id: 3 },
@@ -512,7 +550,11 @@ mod tests {
             ServerMessage::Edit { x: 0, y: 0, z: 0, rev: 4, spec: "air".into() },
             ServerMessage::EditAck { req: 12, accepted: true, rev: 4 },
             ServerMessage::EditAck { req: 13, accepted: false, rev: 4 },
-            ServerMessage::Position { pos: DVec3::new(-1.0e9, 2.0, 3.0) },
+            ServerMessage::Position {
+                pos: DVec3::new(-1.0e9, 2.0, 3.0),
+                frame: DQuat::from_xyzw(0.0, 0.0, 1.0, 0.0),
+                up: Face::PosZ,
+            },
             ServerMessage::Chat {
                 from_id: 3,
                 from_name: "friend".into(),
@@ -614,6 +656,9 @@ mod tests {
                     pos: [0.0, 0.0, 0.0],
                     yaw: 0.0,
                     pitch: 0.0,
+                    frame: DQuat::IDENTITY,
+                    velocity: [0.0; 3],
+                    up: Face::PosY as u8,
                     flying: false,
                     noclip: false,
                     stash: Some(vec![(spec.clone(), 1)]),
@@ -682,7 +727,15 @@ mod tests {
         // part below survives exactly; an f32 wire would quantise it to a
         // multiple of 8. Round-trip both directions of the hot path.
         let pos = DVec3::new(1.0e8 + 0.123456789, -3_000.25, -(1.0e9 - 0.75));
-        let mv = ClientMessage::Move { pos, yaw: 1.0, pitch: -0.5, stance: Stance::Standing };
+        let mv = ClientMessage::Move {
+            pos,
+            yaw: 1.0,
+            pitch: -0.5,
+            frame: DQuat::IDENTITY,
+            velocity: Vec3::ZERO,
+            up: Face::PosY,
+            stance: Stance::Standing,
+        };
         match ClientMessage::decode(&mv.encode()) {
             Some(ClientMessage::Move { pos: got, .. }) => {
                 assert_eq!(got.x.to_bits(), pos.x.to_bits());
@@ -691,7 +744,16 @@ mod tests {
             }
             other => panic!("bad decode: {other:?}"),
         }
-        let pm = ServerMessage::PeerMove { id: 7, pos, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
+        let pm = ServerMessage::PeerMove {
+            id: 7,
+            pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            frame: DQuat::IDENTITY,
+            velocity: Vec3::ZERO,
+            up: Face::PosY,
+            stance: Stance::Standing,
+        };
         assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
         let wl = ServerMessage::Welcome {
             player_id: 1,
@@ -728,7 +790,16 @@ mod tests {
 
     #[test]
     fn welcome_carries_every_terrain_knob() {
-        let terrain = TerrainCfg { relief: 175, caves: 25, mines: 200, space: 0 };
+        let terrain = TerrainCfg {
+            relief: 175,
+            caves: 25,
+            mines: 200,
+            space: 0,
+            variety: 125,
+            features: 50,
+            structures: 175,
+            deep: 0,
+        };
         let wl = ServerMessage::Welcome {
             player_id: 1,
             seed: 3,
@@ -741,6 +812,58 @@ mod tests {
             Some(ServerMessage::Welcome { terrain: got, .. }) => assert_eq!(got, terrain),
             other => panic!("bad decode: {other:?}"),
         }
+    }
+
+    #[test]
+    fn protocol_12_body_frame_round_trips() {
+        let frame = DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0);
+        let velocity = Vec3::new(1.5, -2.25, 0.5);
+        let mv = ClientMessage::Move {
+            pos: DVec3::new(4.0, 5.0, 6.0),
+            yaw: 0.25,
+            pitch: -0.5,
+            frame,
+            velocity,
+            up: Face::PosX,
+            stance: Stance::Standing,
+        };
+        match ClientMessage::decode(&mv.encode()) {
+            Some(ClientMessage::Move { frame: got_f, velocity: got_v, up, .. }) => {
+                assert_eq!(got_f, frame);
+                assert_eq!(got_v, velocity);
+                assert_eq!(up, Face::PosX);
+            }
+            other => panic!("bad decode: {other:?}"),
+        }
+        let pm = ServerMessage::PeerMove {
+            id: 3,
+            pos: DVec3::new(1.0, 2.0, 3.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            frame,
+            velocity,
+            up: Face::NegZ,
+            stance: Stance::Sneaking,
+        };
+        assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
+        let pos = ServerMessage::Position { pos: DVec3::new(8.0, 9.0, 10.0), frame, up: Face::PosZ };
+        assert_eq!(ServerMessage::decode(&pos.encode()), Some(pos));
+
+        // A non-finite frame repairs to identity; an unknown face rejects the message.
+        let mut payload = mv.encode();
+        let quat_at = 1 + 24 + 4 + 4;
+        payload[quat_at..quat_at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        match ClientMessage::decode(&payload) {
+            Some(ClientMessage::Move { frame: got, up, .. }) => {
+                assert_eq!(got, DQuat::IDENTITY);
+                assert_eq!(up, Face::PosX);
+            }
+            other => panic!("a bad quaternion must still decode, got {other:?}"),
+        }
+        let mut payload = mv.encode();
+        let up_at = quat_at + 16 + 12;
+        payload[up_at] = 9;
+        assert_eq!(ClientMessage::decode(&payload), None);
     }
 
     #[test]
