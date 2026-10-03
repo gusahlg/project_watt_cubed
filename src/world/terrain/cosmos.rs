@@ -251,8 +251,11 @@ fn direction(seed: u32, k: i32) -> DVec3 {
     DVec3::Y
 }
 
+/// A position snapped to the chunk grid (multiples of 16), so a body's faces and columns align
+/// with chunks.
 fn to_i64(v: DVec3) -> [i64; 3] {
-    [v.x.round() as i64, v.y.round() as i64, v.z.round() as i64]
+    let snap = |x: f64| (x / 16.0).round() as i64 * 16;
+    [snap(v.x), snap(v.y), snap(v.z)]
 }
 
 impl Cosmos {
@@ -645,6 +648,7 @@ mod tests {
         assert!(worlds.len() >= 3, "home has company: {:?}", a.bodies.iter().map(|b| b.kind).collect::<Vec<_>>());
         for b in &a.bodies {
             assert!(b.centre.iter().all(|&c| c.abs() < 980_000_000), "{b:?} inside the border");
+            assert!(b.centre.iter().all(|&c| c % 16 == 0), "{b:?} on the chunk grid");
         }
         // Moons clear every body.
         for m in a.bodies.iter().filter(|b| b.kind == Kind::Moon) {
