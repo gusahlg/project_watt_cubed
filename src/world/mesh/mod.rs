@@ -102,6 +102,12 @@ impl Padded {
         self.inner.at_flat(i)
     }
 
+    /// Overwrite one shell cell (signed coords): a seam patch after the capture.
+    #[inline]
+    pub(in crate::world) fn set(&mut self, p: [i32; 3], v: BlockId) {
+        self.inner.set(p, v);
+    }
+
     /// Copy the chunk and its shell out of the map. `chunk_at(dx, dy, dz)` yields
     /// the chunk at chunk-offset `(dx, dy, dz)` with each component in `-1..=1`
     /// (`(0,0,0)` is the chunk itself), or `None` (→ air). Row-wise: the bulk

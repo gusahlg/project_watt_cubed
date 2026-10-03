@@ -130,6 +130,11 @@ pub trait TerrainGenerator: Send + Sync {
         Arc::new(gravity::Empty)
     }
 
+    /// The atlases of the round bodies whose cells live in storage boxes (SPACE-ARCHITECTURE §7).
+    fn atlases(&self) -> &[Arc<crate::space::atlas::Atlas>] {
+        &[]
+    }
+
     /// Topmost non-ground cell in this column (the PosY surface).
     fn height(&self, wx: i32, wz: i32) -> i32;
 

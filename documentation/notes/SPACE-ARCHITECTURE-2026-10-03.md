@@ -43,7 +43,7 @@ InfiniteDiffusion v4 universe. Every task directive refers back to the section n
   It is never computed from content at runtime.
 - **Force law** (guide §14.3): softened inverse square with a smooth finite range, the same for every
   pair: `k(r) = r / (r² + ε²)^{3/2} · w(r)`, `w = 1` for `r ≤ R_IN`, smoothstep to `0` at `R_G`;
-  potential `Φ(r) = −G m ∫_r^{R_G} k(s) ds` (consistent with the force). `R_IN = 1.25e8`, `R_G = 2.5e8`,
+  potential `Φ(r) = −G m ∫_r^{R_G} k(s) ds` (consistent with the force). `R_IN = 1.6e8`, `R_G = 3.2e8`,
   `ε = 0.5` (half a block; a point sample is a cell). Bodies are generated ≥ 4e8 apart, so within any
   body's own extent the law is exactly Newtonian and analytic closed forms apply unchanged.
 - **Gravity sample** (`gravity::Sample`): `accel: DVec3`, `potential: f64`, `tidal: Option<DMat3>`,

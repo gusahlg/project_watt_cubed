@@ -390,7 +390,7 @@ impl World {
         // `Face::touches` is the face-boundary encoding shared with the mesher.
         for face in Face::ALL {
             if face.touches(local) {
-                self.mark_dirty(coord.step(face));
+                self.mark_dirty(self.neighbour(coord, face));
             }
         }
         previous

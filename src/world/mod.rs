@@ -51,6 +51,7 @@ pub(crate) mod lanes;
 mod metric;
 mod quadtree;
 mod query;
+mod seam;
 mod streaming;
 mod summary;
 mod worklist;
@@ -936,6 +937,8 @@ pub struct World {
     generator: terrain::Generator,
     /// Gravity from the generator's matter plus every committed edit.
     gravity: crate::gravity::Field,
+    /// The seams of the generator's round bodies (curved-chart storage boxes).
+    seams: seam::Seams,
     kind: WorldgenKind,
     terrain_cfg: terrain::TerrainCfg,
     chunks: FastMap<Coord, Loaded>,
@@ -1322,9 +1325,11 @@ impl World {
         let lod2 = render.lod2;
         let (lod_levels, lod_detail) = render.normalized_lod();
         let gravity = crate::gravity::Field::new(generator.mass());
+        let seams = seam::Seams::new(generator.atlases().to_vec());
         let mut world = Self {
             registry,
             gravity,
+            seams,
             generator,
             kind,
             terrain_cfg: cfg,

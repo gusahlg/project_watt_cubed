@@ -2607,3 +2607,176 @@ fn open_region_lights_a_floating_rock_from_every_side() {
         );
     }
 }
+
+/// A round world painted in storage boxes: rock below radius `solid`, air above (seam tests).
+struct StorageBall {
+    atlas: Arc<crate::space::atlas::Atlas>,
+    rock: BlockId,
+    solid: i64,
+}
+
+impl StorageBall {
+    fn cell(&self, s: [i64; 3]) -> BlockId {
+        use crate::space::atlas::Patch;
+        match self.atlas.locate(s) {
+            Some((Patch::Shell { band, .. }, l)) if self.atlas.bands[band as usize].r_lo + l[1] >= self.solid => AIR,
+            Some(_) => self.rock,
+            None => AIR,
+        }
+    }
+}
+
+impl crate::world::generation::TerrainGenerator for StorageBall {
+    fn atlases(&self) -> &[Arc<crate::space::atlas::Atlas>] {
+        std::slice::from_ref(&self.atlas)
+    }
+
+    fn height(&self, _wx: i32, _wz: i32) -> i32 {
+        i32::MIN
+    }
+
+    fn surface(&self, face: Face, u: i32, v: i32) -> i32 {
+        use crate::space::atlas::{FACES, Patch};
+        if face != Face::PosY {
+            return i32::MIN;
+        }
+        let band = &self.atlas.bands[0];
+        for f in FACES {
+            let (o, size) = self.atlas.storage_box(Patch::Shell { band: 0, face: f });
+            let (u, v) = (u as i64, v as i64);
+            if u >= o[0] && u < o[0] + size[0] && v >= o[2] && v < o[2] + size[2] {
+                return (o[1] + self.solid - band.r_lo) as i32;
+            }
+        }
+        i32::MIN
+    }
+
+    fn surface_at(&self, _wx: i32, _wz: i32) -> BlockId {
+        self.rock
+    }
+
+    fn deep(&self) -> BlockId {
+        self.rock
+    }
+
+    fn block_at(&self, wx: i32, wy: i32, wz: i32, _height: i32) -> BlockId {
+        self.cell([wx as i64, wy as i64, wz as i64])
+    }
+
+    fn generate(&self, cx: i32, cy: i32, cz: i32) -> chunk::ChunkData {
+        let s = CHUNK_SIZE as i64;
+        let mut cells = Box::new([AIR; chunk::CHUNK_VOLUME]);
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    cells[Chunk::index(lx, ly, lz)] =
+                        self.cell([cx as i64 * s + lx as i64, cy as i64 * s + ly as i64, cz as i64 * s + lz as i64]);
+                }
+            }
+        }
+        chunk::ChunkData::from_cells(cells)
+    }
+}
+
+/// A world over a [`StorageBall`] and a storage chunk on the +u side of its +Y chart, `depth` blocks
+/// below the rock's surface.
+fn storage_ball_world(depth: i64) -> (World, ChunkCoord) {
+    use crate::space::atlas::{Atlas, Patch};
+    let mut world = World::with_kind(1, RenderConfig::default(), WorldgenKind::Flat, false);
+    let rock = world.registry.id_by_label("rock").unwrap();
+    let atlas = Arc::new(Atlas::new(DVec3::new(3.0e8, -2.0e8, 1.0e8), 4096, 4096 + 128, false, 0));
+    world.generator = Arc::new(StorageBall { atlas: atlas.clone(), rock, solid: 4096 });
+    world.seams = seam::Seams::new(world.generator.atlases().to_vec());
+    world.refresh_tables();
+    let (o, size) = atlas.storage_box(Patch::Shell { band: 0, face: Face::PosY });
+    let y = o[1] + 4096 - depth - atlas.bands[0].r_lo;
+    let c = ChunkCoord::new(
+        ((o[0] + size[0] - 1) / 16) as i32,
+        (y / 16) as i32,
+        ((o[2] + size[2] / 2) / 16) as i32,
+    );
+    (world, c)
+}
+
+/// Solid rock on both sides of a chart seam draws no wall between them: the halo reads the
+/// neighbouring chart's cells through the glue.
+#[test]
+fn a_seam_chunk_meshes_against_the_neighbouring_chart() {
+    let (mut world, c) = storage_ball_world(600);
+    let across = world.seams.across(c, Face::PosX).expect("the +u side is a seam");
+    world.ensure_data(c);
+    for f in Face::ALL {
+        let n = world.neighbour(c, f);
+        world.ensure_data(n);
+    }
+    assert_eq!(world.neighbour(c, Face::PosX), across.chunk);
+    // Streaming may also load the plain chunk beyond the box (air): it must not show through.
+    world.ensure_data(c.step(Face::PosX));
+    assert_eq!(world.chunks[&c].chunk.uniform(), Some(world.generator.deep()), "deep in the rock");
+    let quads = |world: &World| {
+        let (_, snap) = world.snapshot(c, false);
+        let mut out = new_chunk_mesh_data();
+        mesh::build_chunk_mesh(&snap.padded, snap.uniform, &snap.tables, &light::PaddedLight::full(), &mut out);
+        out[Pass::Opaque].quad_counts().iter().sum::<u32>()
+    };
+    assert_eq!(quads(&world), 0, "rock against rock across the seam");
+    world.seams = seam::Seams::none();
+    assert!(quads(&world) > 0, "without the glue the seam is a wall");
+}
+
+/// A lamp beside a seam lights the neighbouring chart's cells, and the edit and the light both
+/// reach the glued chunk.
+#[test]
+fn light_crosses_a_seam() {
+    use material::Configuration;
+    let (mut world, c) = storage_ball_world(600);
+    let across = world.seams.across(c, Face::PosX).expect("seam");
+    world.ensure_data(c);
+    for f in Face::ALL {
+        let n = world.neighbour(c, f);
+        world.ensure_data(n);
+        for g in Face::ALL {
+            let m = world.neighbour(n, g);
+            world.ensure_data(m);
+        }
+    }
+    drain_light(&mut world);
+    let lamp = world
+        .registry
+        .id_by_label("lamp")
+        .filter(|&id| world.registry.emission(id) >= 8)
+        .or_else(|| {
+            (0u32..40_000).find_map(|n| {
+                let e = material::Element::new([n as u8, (n >> 8) as u8, (n >> 16) as u8, (n >> 24) as u8]);
+                let id = world.registry.intern(&Configuration::single(e)).unwrap();
+                (world.registry.emission(id) >= 8).then_some(id)
+            })
+        })
+        .expect("an emissive configuration");
+    world.refresh_tables();
+    let emission = world.registry.emission(lamp);
+    // An air tunnel along +u through the seam, the lamp at its near end.
+    let (x0, y, z) = (c.x * 16, c.y * 16 + 8, c.z * 16 + 8);
+    for x in 12..16 {
+        world.set_block(x0 + x, y, z, AIR);
+    }
+    for k in 0..4 {
+        let s = across.cell([k, 8, 8]);
+        world.set_block(s[0] as i32, s[1] as i32, s[2] as i32, AIR);
+    }
+    world.set_block(x0 + 12, y, z, lamp);
+    assert!(world.light_worklist.contains(&across.chunk) || world.light_worklist.contains(&c));
+    drain_light(&mut world);
+    let level = |s: [i64; 3]| {
+        let (chunk, i) = seam::split(s);
+        world.chunks[&chunk].light.as_ref().expect("settled").at(i).block.get()
+    };
+    let near = level([x0 as i64 + 15, y as i64, z as i64]);
+    let far: Vec<u8> = (0..4).map(|k| level(across.cell([k, 8, 8]))).collect();
+    assert_eq!(near, emission - 3, "three cells from the lamp");
+    assert_eq!(far, (0..4).map(|k| emission.saturating_sub(4 + k as u8)).collect::<Vec<_>>(), "and on across the seam");
+    // The glued cells read through the world's block queries too.
+    let beyond = (x0 + 16, y, z);
+    assert_eq!(world.block_at(beyond.0, beyond.1, beyond.2), AIR, "the carved cell across the seam");
+    assert_ne!(world.block_at(beyond.0, beyond.1 + 2, beyond.2), AIR, "rock across the seam");
+}

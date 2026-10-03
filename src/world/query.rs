@@ -151,6 +151,11 @@ impl World {
     /// outside the loaded region reads as [`AIR`] — Y is unbounded, so there
     /// is no world floor or ceiling anymore.
     pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
+        // A storage cell just outside a chart's box is the neighbouring chart's cell.
+        let (x, y, z) = match self.seams.glue_cell(BlockCoord::new(x, y, z)) {
+            Some(g) => (g.x, g.y, g.z),
+            None => (x, y, z),
+        };
         let (chunk, local) = BlockCoord::new(x, y, z).split();
         match self.chunks.get(&chunk) {
             Some(loaded) => loaded.chunk.get_local(local.lx(), local.ly(), local.lz()),
@@ -184,7 +189,23 @@ impl World {
         for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
             for cy in y0.div_euclid(s)..=y1.div_euclid(s) {
                 for cz in z0.div_euclid(s)..=z1.div_euclid(s) {
-                    let Some(loaded) = self.chunks.get(&Coord::new(cx, cy, cz)) else {
+                    let c = Coord::new(cx, cy, cz);
+                    if self.seams.beside_storage(c) {
+                        // Outside a chart's box: cells read through the seam, one by one.
+                        let hit = (local_range(y0, y1, cy)).any(|y| {
+                            local_range(z0, z1, cz).any(|z| {
+                                local_range(x0, x1, cx).any(|x| {
+                                    let s = CHUNK_SIZE as i32;
+                                    self.is_solid(cx * s + x as i32, cy * s + y as i32, cz * s + z as i32)
+                                })
+                            })
+                        });
+                        if hit {
+                            return true;
+                        }
+                        continue;
+                    }
+                    let Some(loaded) = self.chunks.get(&c) else {
                         continue; // unloaded chunks read as air
                     };
                     // Uniform chunks: one lookup answers every cell in the box.

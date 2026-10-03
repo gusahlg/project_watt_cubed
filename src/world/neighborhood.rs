@@ -117,6 +117,12 @@ impl<T: Pooled> Neighborhood<T> {
             .unwrap_or_else(|| vec![seed; PAD_VOL].into_boxed_slice())
     }
 
+    /// Overwrite the cell at signed coord `p` (each `∈ -1..=16`): a seam patch after the capture.
+    #[inline]
+    pub(in crate::world) fn set(&mut self, p: [i32; 3], v: T) {
+        self.buf[Self::index(p[0], p[1], p[2])] = v;
+    }
+
     /// The cell at signed coord `(x, y, z)`, each `∈ -1..=16`.
     #[cfg(test)]
     #[inline]

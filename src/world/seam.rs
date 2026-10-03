@@ -1,0 +1,471 @@
+//! Chunks at curved-chart seams (SPACE-ARCHITECTURE §7).
+//!
+//! A round body's cells live in storage boxes (`space::atlas`), one box per patch, with storage
+//! `+Y` along the chart's up. A storage chunk on the side of its box has its real neighbour across
+//! that side in another patch's box, reached through the atlas glue: [`Seams::across`] names that
+//! chunk and the signed map from this side's (virtual) neighbour cells onto its cells. The world's
+//! neighbour reads (the mesher's halo, both light shells) read through it, and its neighbour
+//! triggers (arrival, border light, edits, the mesh gate) use [`Seams::neighbour`], so a chart edge
+//! is as invisible as a chunk border. Chunks outside the storage region never reach the atlas:
+//! one compare and out.
+//!
+//! Exact across chart edges (cells conform face to face); approximate across band interfaces
+//! (1 : 2) and at the eight valence-3 corners, where diagonal halo cells may read as air — the
+//! declared exceptional regions of the stage-0 report.
+
+use std::sync::{Arc, Mutex, PoisonError};
+
+use super::chunk::{CHUNK_SIZE, Chunk};
+use super::{Coord, FastMap};
+use crate::coord::{BlockCoord, Face};
+use crate::space::atlas::{Atlas, GLUE, Remap};
+
+const CS: i64 = CHUNK_SIZE as i64;
+/// Seam answers kept before the cache starts over (seam chunks are a thin set of the loaded ones).
+const CACHE_CAP: usize = 1 << 15;
+
+/// A neighbour across a seam: the real chunk and the map of virtual-neighbour cells onto it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Across {
+    pub chunk: Coord,
+    pub remap: Remap,
+}
+
+impl Across {
+    /// The storage cell holding cell `l` of the virtual neighbour (local to it; a cell or two
+    /// outside it lands in a chunk next to [`chunk`](Self::chunk)).
+    #[inline]
+    pub fn cell(&self, l: [i64; 3]) -> [i64; 3] {
+        let r = self.remap.apply(l);
+        [self.chunk.x as i64 * CS + r[0], self.chunk.y as i64 * CS + r[1], self.chunk.z as i64 * CS + r[2]]
+    }
+}
+
+/// One storage box in chunk coordinates (`hi` exclusive) and the atlas it belongs to.
+#[derive(Clone, Copy, Debug)]
+struct Region {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    atlas: usize,
+}
+
+impl Region {
+    #[inline]
+    fn contains(&self, c: Coord) -> bool {
+        let c = [c.x, c.y, c.z];
+        (0..3).all(|a| c[a] >= self.lo[a] && c[a] < self.hi[a])
+    }
+
+    /// Whether `c` (inside) touches a side of the box.
+    #[inline]
+    fn on_side(&self, c: Coord) -> bool {
+        let c = [c.x, c.y, c.z];
+        (0..3).any(|a| c[a] == self.lo[a] || c[a] == self.hi[a] - 1)
+    }
+}
+
+/// The seams of every atlas in a world.
+pub struct Seams {
+    atlases: Vec<Arc<Atlas>>,
+    regions: Vec<Region>,
+    /// Smallest storage chunk x of any box: everything below is physical space.
+    min_cx: i32,
+    cache: Mutex<FastMap<(Coord, Face), Option<Across>>>,
+}
+
+impl Seams {
+    pub fn new(atlases: Vec<Arc<Atlas>>) -> Self {
+        let mut regions = Vec::new();
+        for (i, atlas) in atlases.iter().enumerate() {
+            for p in atlas.patches() {
+                let (o, size) = atlas.storage_box(p);
+                debug_assert!((0..3).all(|a| o[a] % CS == 0 && size[a] % CS == 0), "storage boxes are chunk aligned");
+                let lo = std::array::from_fn(|a| (o[a] / CS) as i32);
+                let hi = std::array::from_fn(|a| ((o[a] + size[a]) / CS) as i32);
+                regions.push(Region { lo, hi, atlas: i });
+            }
+        }
+        let min_cx = regions.iter().map(|r| r.lo[0]).min().unwrap_or(i32::MAX);
+        Self { atlases, regions, min_cx, cache: Mutex::new(FastMap::default()) }
+    }
+
+    /// No atlases: every answer is the plain grid.
+    pub fn none() -> Self {
+        Self::new(Vec::new())
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    #[inline]
+    fn region_of(&self, c: Coord) -> Option<&Region> {
+        if c.x < self.min_cx {
+            return None;
+        }
+        self.regions.iter().find(|r| r.contains(c))
+    }
+
+    /// Whether `c` is a storage chunk inside some box.
+    pub fn in_storage(&self, c: Coord) -> bool {
+        self.region_of(c).is_some()
+    }
+
+    /// Whether `c` is a storage-region chunk outside every box but within a chunk of one (its cells
+    /// may read through the glue).
+    #[inline]
+    pub fn beside_storage(&self, c: Coord) -> bool {
+        if c.x < self.min_cx - 1 {
+            return false;
+        }
+        let near = |r: &Region| (0..3).all(|a| {
+            let v = [c.x, c.y, c.z][a];
+            v >= r.lo[a] - 1 && v <= r.hi[a]
+        });
+        self.region_of(c).is_none() && self.regions.iter().any(near)
+    }
+
+    /// The chunk across `face` of `c` when that side is a seam (the plain neighbour lies outside
+    /// every box and the glue finds a patch there). `None` for physical chunks, interior storage
+    /// chunks, the top of a band and the eight corners.
+    pub fn across(&self, c: Coord, face: Face) -> Option<Across> {
+        let r = self.region_of(c)?;
+        if r.contains(c.step(face)) {
+            return None;
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cache.get(&(c, face)) {
+            return *hit;
+        }
+        let got = self.atlases[r.atlas]
+            .chunk_across([c.x as i64, c.y as i64, c.z as i64], face.axis(), face.sign() as i64)
+            .map(|(k, remap)| Across { chunk: Coord::new(k[0] as i32, k[1] as i32, k[2] as i32), remap });
+        if cache.len() >= CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert((c, face), got);
+        got
+    }
+
+    /// The chunk that borders `c` across `face`: across a seam the glued chunk, else the plain step.
+    #[inline]
+    pub fn neighbour(&self, c: Coord, face: Face) -> Coord {
+        if c.x < self.min_cx {
+            return c.step(face);
+        }
+        self.across(c, face).map_or(c.step(face), |a| a.chunk)
+    }
+
+    /// Every halo cell of `c` (padded coordinates `-1..=16`, outside the chunk) whose plain chunk
+    /// lies outside `c`'s box and across a seam, with the storage cell that holds it. Regions with
+    /// no seam (above a band's top, the corners) are not visited and keep what the plain capture
+    /// read.
+    pub fn for_each_glued_halo(&self, c: Coord, mut visit: impl FnMut([i32; 3], [i64; 3])) {
+        let Some(r) = self.region_of(c) else { return };
+        if !r.on_side(c) {
+            return;
+        }
+        let r = *r;
+        let span = |d: i32| match d {
+            -1 => -1..=-1,
+            0 => 0..=CS as i32 - 1,
+            _ => CS as i32..=CS as i32,
+        };
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let d = [dx, dy, dz];
+                    if d == [0, 0, 0] || r.contains(Coord::new(c.x + dx, c.y + dy, c.z + dz)) {
+                        continue;
+                    }
+                    // The seam this region hangs across: the first axis whose single step leaves
+                    // the box through a seam.
+                    let seam = (0..3).filter(|&a| d[a] != 0).find_map(|a| {
+                        let face = face_of(a, d[a]);
+                        self.across(c, face).map(|x| (a, x))
+                    });
+                    let Some((a, x)) = seam else { continue };
+                    for py in span(dy) {
+                        for pz in span(dz) {
+                            for px in span(dx) {
+                                let p = [px, py, pz];
+                                let mut l = p.map(i64::from);
+                                l[a] -= d[a] as i64 * CS;
+                                visit(p, x.cell(l));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The storage cells of the near layer of the neighbour across `face` when that side is a
+    /// seam, in [`FaceShell`](super::light::FaceShell) order (`i = a + b·16` over the face's two
+    /// other axes in increasing order). Returns whether `face` is a seam.
+    pub fn for_each_glued_face(&self, c: Coord, face: Face, mut visit: impl FnMut(usize, [i64; 3])) -> bool {
+        let Some(x) = self.across(c, face) else { return false };
+        let a = face.axis();
+        let (u, v) = match a {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        let near = if face.sign() > 0 { 0 } else { CS - 1 };
+        for j in 0..CS {
+            for i in 0..CS {
+                let mut l = [0; 3];
+                l[a] = near;
+                l[u] = i;
+                l[v] = j;
+                visit((i + j * CS) as usize, x.cell(l));
+            }
+        }
+        true
+    }
+
+    /// For a storage cell just outside every box (within the atlas glue reach of one), the cell of
+    /// the neighbouring patch at the same physical point. `None` for physical cells, cells inside a
+    /// box and cells beyond the glue (open space around a body's storage).
+    pub fn glue_cell(&self, cell: BlockCoord) -> Option<BlockCoord> {
+        let c = Coord::new(cell.x.div_euclid(CS as i32), cell.y.div_euclid(CS as i32), cell.z.div_euclid(CS as i32));
+        if c.x < self.min_cx - 1 {
+            return None;
+        }
+        if self.region_of(c).is_some() {
+            return None;
+        }
+        let s = [cell.x as i64, cell.y as i64, cell.z as i64];
+        let near = |r: &Region| {
+            (0..3).all(|a| s[a] >= r.lo[a] as i64 * CS - GLUE && s[a] < r.hi[a] as i64 * CS + GLUE)
+        };
+        let r = self.regions.iter().find(|r| near(r))?;
+        let g = self.atlases[r.atlas].glue(s)?;
+        Some(BlockCoord::new(g[0] as i32, g[1] as i32, g[2] as i32))
+    }
+}
+
+fn face_of(axis: usize, d: i32) -> Face {
+    match (axis, d > 0) {
+        (0, true) => Face::PosX,
+        (0, false) => Face::NegX,
+        (1, true) => Face::PosY,
+        (1, false) => Face::NegY,
+        (_, true) => Face::PosZ,
+        (_, false) => Face::NegZ,
+    }
+}
+
+/// Chunk and local flat index of a storage cell.
+#[inline]
+pub fn split(s: [i64; 3]) -> (Coord, usize) {
+    let c = Coord::new(s[0].div_euclid(CS) as i32, s[1].div_euclid(CS) as i32, s[2].div_euclid(CS) as i32);
+    let l = s.map(|v| v.rem_euclid(CS) as usize);
+    (c, Chunk::index(l[0], l[1], l[2]))
+}
+
+/// A one-entry memo over chunk lookups: halo patches read runs of cells from the same chunk.
+pub struct LastChunk<S> {
+    key: Option<(Coord, Option<S>)>,
+}
+
+impl<S: Copy> LastChunk<S> {
+    pub fn new() -> Self {
+        Self { key: None }
+    }
+
+    #[inline]
+    pub fn get(&mut self, c: Coord, lookup: impl FnOnce(Coord) -> Option<S>) -> Option<S> {
+        match self.key {
+            Some((k, v)) if k == c => v,
+            _ => {
+                let v = lookup(c);
+                self.key = Some((c, v));
+                v
+            }
+        }
+    }
+}
+
+impl super::World {
+    /// Read a captured voxel halo's seam regions through the glue (missing glued chunks read as air,
+    /// like any missing neighbour).
+    pub(in crate::world) fn seam_halo(&self, coord: Coord, padded: &mut super::mesh::Padded) {
+        if self.seams.is_empty() {
+            return;
+        }
+        let mut last = LastChunk::new();
+        self.seams.for_each_glued_halo(coord, |p, s| {
+            let (c, i) = split(s);
+            let chunk = last.get(c, |c| self.chunks.get(&c).map(|l| &*l.chunk));
+            padded.set(p, chunk.map_or(crate::block::registry::AIR, |ch| ch.get_index(i)));
+        });
+    }
+
+    /// Read a captured light halo's seam regions through the glue (a missing grid reads as
+    /// `fallback`, else dark — as the plain capture does).
+    pub(in crate::world) fn seam_light_halo(
+        &self,
+        coord: Coord,
+        light: &mut super::light::PaddedLight,
+        fallback: Option<&super::light::LightGrid>,
+    ) {
+        if self.seams.is_empty() {
+            return;
+        }
+        let mut last = LastChunk::new();
+        self.seams.for_each_glued_halo(coord, |p, s| {
+            let (c, i) = split(s);
+            let grid = last.get(c, |c| self.chunks.get(&c).and_then(|l| l.light.as_ref())).or(fallback);
+            light.set(p, grid.map_or(super::light::PackedLumel::DARK, |g| g.packed_at(i)));
+        });
+    }
+
+    /// Read a face shell's seam layers through the glue (a missing grid reads dark).
+    pub(in crate::world) fn seam_face_shell(&self, coord: Coord, shell: &mut super::light::FaceShell) {
+        if self.seams.is_empty() {
+            return;
+        }
+        for face in Face::ALL {
+            let mut last = LastChunk::new();
+            self.seams.for_each_glued_face(coord, face, |i, s| {
+                let (c, idx) = split(s);
+                let grid = last.get(c, |c| self.chunks.get(&c).and_then(|l| l.light.as_ref()));
+                shell.set(face, i, grid.map_or(super::light::PackedLumel::DARK, |g| g.packed_at(idx)));
+            });
+        }
+    }
+
+    /// The chunk bordering `coord` across `face` (through a seam when there is one).
+    #[inline]
+    pub(in crate::world) fn neighbour(&self, coord: Coord, face: Face) -> Coord {
+        self.seams.neighbour(coord, face)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::DVec3;
+
+    use super::*;
+    use crate::space::atlas::Patch;
+
+    fn atlas() -> Arc<Atlas> {
+        Arc::new(Atlas::new(DVec3::new(3.0e8, -2.0e8, 1.0e8), 4096, 4096 + 128, false, 0))
+    }
+
+    fn chunk_of(s: [i64; 3]) -> Coord {
+        split(s).0
+    }
+
+    /// A storage chunk on the +u side of the +Y chart's outer band, at the surface.
+    fn seam_chunk(a: &Atlas) -> Coord {
+        let p = Patch::Shell { band: 0, face: Face::PosY };
+        let (o, size) = a.storage_box(p);
+        chunk_of([o[0] + size[0] - 1, o[1] + size[1] - 64, o[2] + size[2] / 2])
+    }
+
+    #[test]
+    fn physical_and_interior_chunks_have_no_seams() {
+        let seams = Seams::new(vec![atlas()]);
+        let a = atlas();
+        for f in Face::ALL {
+            assert_eq!(seams.across(Coord::new(0, 0, 0), f), None);
+            assert_eq!(seams.neighbour(Coord::new(5, -3, 2), f), Coord::new(5, -3, 2).step(f));
+        }
+        let p = Patch::Shell { band: 0, face: Face::PosY };
+        let (o, size) = a.storage_box(p);
+        let mid = chunk_of([o[0] + size[0] / 2, o[1] + size[1] / 2, o[2] + size[2] / 2]);
+        for f in Face::ALL {
+            assert_eq!(seams.across(mid, f), None, "{f:?}");
+        }
+        assert!(Seams::none().is_empty());
+    }
+
+    #[test]
+    fn a_seam_is_symmetric() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let c = seam_chunk(&a);
+        let x = seams.across(c, Face::PosX).expect("the +u side of a chart is a seam");
+        assert!(seams.in_storage(x.chunk));
+        assert_ne!(seams.region_of(x.chunk).map(|r| r.lo), seams.region_of(c).map(|r| r.lo), "another patch");
+        let back = Face::ALL.iter().filter_map(|&f| seams.across(x.chunk, f)).any(|y| y.chunk == c);
+        assert!(back, "the glued chunk sees this one across one of its sides");
+        assert_eq!(seams.neighbour(c, Face::PosX), x.chunk);
+        // The top of the band is not a seam (open space above the relief).
+        let top = {
+            let (o, size) = a.storage_box(Patch::Shell { band: 0, face: Face::PosY });
+            chunk_of([o[0] + size[0] - 1, o[1] + size[1] - 1, o[2] + size[2] / 2])
+        };
+        assert_eq!(seams.across(top, Face::PosY), None);
+    }
+
+    /// The remapped halo equals the atlas's per-cell glue (the slow, exact reference) on every face
+    /// region and the edge regions along the seam.
+    #[test]
+    fn glued_halo_cells_are_the_glue_of_each_cell() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let c = seam_chunk(&a);
+        let mut visited = 0;
+        let mut mismatched = Vec::new();
+        seams.for_each_glued_halo(c, |p, s| {
+            visited += 1;
+            let raw = [c.x as i64 * CS + p[0] as i64, c.y as i64 * CS + p[1] as i64, c.z as i64 * CS + p[2] as i64];
+            if let Some(g) = a.glue(raw) {
+                if g != s {
+                    mismatched.push((p, s, g));
+                }
+            }
+        });
+        assert!(visited >= 16 * 16, "the whole +x face region is glued ({visited})");
+        assert!(mismatched.is_empty(), "{} of {visited} differ, e.g. {:?}", mismatched.len(), &mismatched[..mismatched.len().min(4)]);
+    }
+
+    #[test]
+    fn glued_face_layer_is_the_glue_of_each_cell() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let c = seam_chunk(&a);
+        let mut n = 0;
+        assert!(seams.for_each_glued_face(c, Face::PosX, |i, s| {
+            n += 1;
+            let (y, z) = ((i % 16) as i64, (i / 16) as i64);
+            let raw = [c.x as i64 * CS + 16, c.y as i64 * CS + y, c.z as i64 * CS + z];
+            assert_eq!(a.glue(raw), Some(s), "cell {i}");
+        }));
+        assert_eq!(n, 256);
+        assert!(!seams.for_each_glued_face(c, Face::NegX, |_, _| {}), "the inner side is plain");
+    }
+
+    #[test]
+    fn glue_cell_reads_through_the_seam_and_leaves_box_cells_alone() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let c = seam_chunk(&a);
+        let inside = BlockCoord::new(c.x * 16 + 15, c.y * 16 + 3, c.z * 16 + 3);
+        assert_eq!(seams.glue_cell(inside), None);
+        let outside = BlockCoord::new(c.x * 16 + 16, c.y * 16 + 3, c.z * 16 + 3);
+        let g = seams.glue_cell(outside).expect("one cell outside a chart's side");
+        assert_eq!(Some([g.x as i64, g.y as i64, g.z as i64]), a.glue([outside.x as i64, outside.y as i64, outside.z as i64]));
+        assert_eq!(seams.glue_cell(BlockCoord::new(10, 20, 30)), None, "physical cells");
+    }
+
+    #[test]
+    fn seam_answers_are_cheap_once_cached() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let c = seam_chunk(&a);
+        let t = std::time::Instant::now();
+        let first = seams.across(c, Face::PosX);
+        let cold = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(seams.across(c, Face::PosX), first);
+        }
+        let warm = t.elapsed() / 1000;
+        assert!(warm < cold.max(std::time::Duration::from_micros(5)), "cold {cold:?}, warm {warm:?}");
+    }
+}

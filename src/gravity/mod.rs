@@ -10,7 +10,7 @@ mod shape;
 
 use glam::{DMat3, DVec3};
 
-pub use field::{Field, THETA};
+pub use field::Field;
 pub use kernel::{EPS, G, R_G, R_IN};
 pub use oracle::{Empty, MassOracle, Primitives, Summary, Visitor};
 pub use shape::{Primitive, Shape};

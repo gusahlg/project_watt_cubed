@@ -1861,7 +1861,7 @@ impl World {
         // blocked waiting on this data even if itself uniform air.
         self.mesh_worklist.insert(coord);
         for face in Face::ALL {
-            let n = coord.step(face);
+            let n = self.neighbour(coord, face);
             self.mesh_worklist.insert(n);
             // A Ready neighbour meshed without this chunk (terminal promotion
             // at a load-set edge, or the neighbour unloaded after the mesh).
@@ -2001,22 +2001,26 @@ impl World {
         // One 3×3×3 lookup feeds both the voxel shell and the light shell.
         let nhood = self.loaded_neighbourhood(coord);
         let fallback = (self.lighting && degraded).then(light::LightGrid::open_sky);
+        let mut padded = mesh::Padded::capture(|dx, dy, dz| {
+            Self::nhood_at(&nhood, dx, dy, dz).map(|l| &*l.chunk)
+        });
+        self.seam_halo(coord, &mut padded);
         (
             loaded.rev,
             pipeline::ChunkSnapshot {
-                padded: mesh::Padded::capture(|dx, dy, dz| {
-                    Self::nhood_at(&nhood, dx, dy, dz).map(|l| &*l.chunk)
-                }),
+                padded,
                 uniform: loaded.chunk.uniform(),
                 // Lighting off omits the 18³ shell entirely — the mesher's
                 // unlit path reads constant full light instead. `open_sky` is
                 // Uniform (task 05): the degraded fallback does not allocate.
                 light: self.lighting.then(|| {
-                    light::PaddedLight::capture(|dx, dy, dz| {
+                    let mut shell = light::PaddedLight::capture(|dx, dy, dz| {
                         Self::nhood_at(&nhood, dx, dy, dz)
                             .and_then(|l| l.light.as_ref())
                             .or(fallback.as_ref())
-                    })
+                    });
+                    self.seam_light_halo(coord, &mut shell, fallback.as_ref());
+                    shell
                 }),
                 tables: self.tables.get(),
             },
@@ -2047,12 +2051,14 @@ impl World {
     fn capture_padded_light(&self, coord: Coord, degraded: bool) -> light::PaddedLight {
         debug_assert!(self.lighting, "unlit meshes take the no-shell path");
         let fallback = degraded.then(light::LightGrid::open_sky);
-        light::PaddedLight::capture(|dx, dy, dz| {
+        let mut shell = light::PaddedLight::capture(|dx, dy, dz| {
             self.chunks
                 .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz))
                 .and_then(|l| l.light.as_ref())
                 .or(fallback.as_ref())
-        })
+        });
+        self.seam_light_halo(coord, &mut shell, fallback.as_ref());
+        shell
     }
 
     /// Near-face light from six neighbours (input for light flood seeds).
@@ -2060,11 +2066,13 @@ impl World {
         if !self.lighting {
             return light::FaceShell::dark();
         }
-        light::FaceShell::capture(|face| {
+        let mut shell = light::FaceShell::capture(|face| {
             self.chunks
                 .get(&coord.step(face))
                 .and_then(|l| l.light.as_ref())
-        })
+        });
+        self.seam_face_shell(coord, &mut shell);
+        shell
     }
 
     /// Skylight ceiling: ground altitude per face-local column (caves dark
@@ -2218,7 +2226,7 @@ impl World {
     fn neighbour_blocklight_near(&self, coord: Coord) -> bool {
         Face::ALL.iter().any(|&face| {
             self.chunks
-                .get(&coord.step(face))
+                .get(&self.neighbour(coord, face))
                 .is_some_and(|l| l.has_blocklight)
         })
     }
@@ -2344,7 +2352,7 @@ impl World {
             if !face_moved && !first {
                 continue;
             }
-            let n = coord.step(face);
+            let n = self.neighbour(coord, face);
             if !self.chunks.contains_key(&n) {
                 continue;
             }
@@ -2380,11 +2388,13 @@ impl World {
 
     /// Chunk + 1-voxel neighbour shell for mesh build (shared by worker and sync paths).
     fn capture_padded(&self, coord: Coord) -> mesh::Padded {
-        mesh::Padded::capture(|dx, dy, dz| {
+        let mut padded = mesh::Padded::capture(|dx, dy, dz| {
             self.chunks
                 .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz))
                 .map(|l| &*l.chunk)
-        })
+        });
+        self.seam_halo(coord, &mut padded);
+        padded
     }
 
     // Column-LOD section selection and streaming.
@@ -2677,7 +2687,7 @@ impl World {
     pub(in crate::world) fn neighbours_have_data(&self, coord: Coord) -> bool {
         Face::ALL
             .iter()
-            .all(|&f| self.chunks.contains_key(&coord.step(f)))
+            .all(|&f| self.chunks.contains_key(&self.neighbour(coord, f)))
     }
 
     /// Light settled enough to mesh: chunk and face neighbours have grids, and the
@@ -2693,7 +2703,7 @@ impl World {
             && self.chunks.get(&coord).is_some_and(|l| l.light.is_some())
             && Face::ALL.iter().all(|&f| {
                 self.chunks
-                    .get(&coord.step(f))
+                    .get(&self.neighbour(coord, f))
                     .is_some_and(|l| l.light.is_some())
             })
     }

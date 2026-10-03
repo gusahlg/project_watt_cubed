@@ -94,7 +94,7 @@ impl Lumel {
 pub(in crate::world) struct PackedLumel(u8);
 
 impl PackedLumel {
-    const DARK: Self = Self(0);
+    pub(in crate::world) const DARK: Self = Self(0);
     #[cfg(test)]
     const FULL: Self = Self((MAX_LIGHT << 4) | MAX_LIGHT);
     const OPEN_SKY: Self = Self(MAX_LIGHT << 4);
@@ -180,7 +180,7 @@ impl LightGrid {
     }
 
     #[inline]
-    fn packed_at(&self, idx: usize) -> PackedLumel {
+    pub(in crate::world) fn packed_at(&self, idx: usize) -> PackedLumel {
         match &self.0 {
             Repr::Uniform(v) => PackedLumel::pack(*v),
             Repr::Cells(c) => c[idx],
@@ -348,6 +348,12 @@ impl PaddedLight {
         }
     }
 
+    /// Overwrite one shell cell (signed coords): a seam patch after the capture.
+    #[inline]
+    pub(in crate::world) fn set(&mut self, p: [i32; 3], v: PackedLumel) {
+        self.inner.set(p, v);
+    }
+
     /// Copy the chunk and its shell out of the light field. `grid_at(dx, dy, dz)`
     /// yields the [`LightGrid`] at chunk-offset `(dx, dy, dz)` (each `∈ -1..=1`,
     /// `(0,0,0)` is the chunk itself), or `None` (→ dark). Mirrors
@@ -391,6 +397,12 @@ impl FaceShell {
             g.copy_face(face, &mut faces[face as usize]);
         }
         Self { faces }
+    }
+
+    /// Overwrite one cell of the layer across `face` (`i = a + b·16`): a seam patch.
+    #[inline]
+    pub(in crate::world) fn set(&mut self, face: Face, i: usize, v: PackedLumel) {
+        self.faces[face as usize][i] = v;
     }
 
     /// Light value from neighbour across `face` at coords `(a, b)`.
