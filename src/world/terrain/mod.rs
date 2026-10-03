@@ -842,6 +842,10 @@ impl TerrainGenerator for Terrain {
         self.cosmos.clone()
     }
 
+    fn cosmos(&self) -> Option<&cosmos::Cosmos> {
+        Some(self.cosmos.as_ref())
+    }
+
     fn kind(&self) -> &'static str {
         "diffusion"
     }

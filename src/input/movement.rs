@@ -775,4 +775,54 @@ mod tests {
         assert!(player.on_ground());
     }
 
+
+    /// The whole chain on the real universe: teleport above Verdance's surface, stream its chart,
+    /// fall under its matter's own pull, land on its storage cells and walk along the curve.
+    #[test]
+    fn a_player_lands_on_verdance_and_walks_along_the_curve() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::terrain::cosmos::Kind;
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let atlas = {
+            let generator = world.terrain();
+            let verdance = generator.cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == Kind::Verdant).expect("Verdance");
+            world.atlases().iter().find(|a| (a.centre - verdance.centre_f()).length() < 1.0).expect("charted").clone()
+        };
+        // A point 12 blocks above the ground at the middle of the +Y chart, found through the chart.
+        let top = crate::space::atlas::Patch::Shell { band: 0, face: Face::PosY };
+        let b = atlas.bands[0];
+        let (o, _) = atlas.storage_box(top);
+        let (si, sj) = (o[0] + b.n / 2 + 5, o[2] + b.n / 2 - 7);
+        let ground = world.terrain().surface(Face::PosY, si as i32, sj as i32) as i64;
+        let start = atlas.embed_storage(top, DVec3::new(si as f64 + 0.5, (ground + 12) as f64, sj as f64 + 0.5));
+        world.ensure_around(start);
+        let mut player = Player::new(start);
+        let g = world.gravity_at(start).accel;
+        assert!(g.length() > 0.5, "Verdance pulls: {g:?}");
+        assert!(g.normalize().dot((atlas.centre - start).normalize()) > 0.999, "toward its centre");
+        player.snap_up(-g.normalize());
+        let step = |player: &mut Player, world: &mut World, input: &MoveInput| {
+            world.ensure_around(player.position);
+            let g = world.gravity_at(player.position).accel;
+            let a = world.atlas_at(player.position).expect("on Verdance's chart").clone();
+            update_player_in(player, world, &a, input, 1.0 / 60.0, g);
+        };
+        for _ in 0..360 {
+            step(&mut player, &mut world, &idle());
+            if player.on_ground() {
+                break;
+            }
+        }
+        assert!(player.on_ground(), "landed on Verdance");
+        let r0 = (player.position - atlas.centre).length();
+        let before = player.position;
+        for _ in 0..180 {
+            step(&mut player, &mut world, &walk_forward());
+        }
+        let r1 = (player.position - atlas.centre).length();
+        assert!((player.position - before).length() > 5.0, "walked somewhere");
+        assert!((r1 - r0).abs() < 40.0, "stayed on the ground along the curve: {r0} -> {r1}");
+        assert!((player.up() - (player.position - atlas.centre).normalize()).length() < 0.05, "standing along the radius");
+    }
 }

@@ -141,6 +141,11 @@ pub trait TerrainGenerator: Send + Sync {
         Arc::new(gravity::Empty)
     }
 
+    /// The body's catalog, when this generator has one. A flat world has none.
+    fn cosmos(&self) -> Option<&super::terrain::cosmos::Cosmos> {
+        None
+    }
+
     /// The atlases of the round bodies whose cells live in storage boxes (SPACE-ARCHITECTURE §7).
     fn atlases(&self) -> &[Arc<crate::space::atlas::Atlas>] {
         &[]

@@ -55,6 +55,11 @@ impl World {
         self.terrain_cfg
     }
 
+    /// The generator, for callers that need the cosmos catalog.
+    pub(crate) fn terrain(&self) -> &dyn super::generation::TerrainGenerator {
+        self.generator.as_ref()
+    }
+
     /// Incremented when blocks are edited.
     pub fn edit_generation(&self) -> u64 {
         self.edit_generation
