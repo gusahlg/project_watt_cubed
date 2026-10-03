@@ -123,14 +123,47 @@ impl ChunkCoord {
         Self { x: self.x + dx, y: self.y + dy, z: self.z + dz }
     }
 
+    /// Chess distance in the XZ plane. The +Y streaming ring.
     #[inline]
     pub fn ring(self, o: ChunkCoord) -> i32 {
         (self.x - o.x).abs().max((self.z - o.z).abs())
     }
 
+    /// Distance along world Y. The +Y streaming "up".
     #[inline]
     pub fn updown(self, o: ChunkCoord) -> i32 {
         (self.y - o.y).abs()
+    }
+
+    /// Chess distance in the plane perpendicular to `face`. +Y is [`ring`](Self::ring).
+    #[inline]
+    pub fn across(self, o: ChunkCoord, face: Face) -> i32 {
+        let d = self.delta_abs(o);
+        let mut m = 0;
+        for i in 0..3 {
+            if i != face.axis() {
+                m = m.max(d[i]);
+            }
+        }
+        m
+    }
+
+    /// Distance along `face`'s axis. +Y is [`updown`](Self::updown).
+    #[inline]
+    pub fn along(self, o: ChunkCoord, face: Face) -> i32 {
+        self.delta_abs(o)[face.axis()]
+    }
+
+    /// Chess distance in all three axes.
+    #[inline]
+    pub fn chess3(self, o: ChunkCoord) -> i32 {
+        let d = self.delta_abs(o);
+        d[0].max(d[1]).max(d[2])
+    }
+
+    #[inline]
+    fn delta_abs(self, o: ChunkCoord) -> [i32; 3] {
+        [(self.x - o.x).abs(), (self.y - o.y).abs(), (self.z - o.z).abs()]
     }
 }
 
@@ -306,47 +339,136 @@ impl<T> IndexMut<voxel_engine::Pass> for ByPass<T> {
     }
 }
 
+/// Axis-aligned chunk volume. `rh` is the radius across `up`; `rv` is the
+/// radius along it. `up: None` is isotropic: every axis uses `rh` (`rv` is
+/// unused). [`new`](Self::new) is the +Y box.
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkBox {
     pub center: ChunkCoord,
     pub rh: i32,
     pub rv: i32,
+    pub up: Option<Face>,
 }
 
 impl ChunkBox {
+    /// +Y box: wide in X/Z (`rh`), short in Y (`rv`).
     #[inline]
     pub fn new(center: ChunkCoord, rh: i32, rv: i32) -> Self {
-        Self { center, rh, rv }
+        Self::with_up(center, rh, rv, Some(Face::PosY))
+    }
+
+    #[inline]
+    pub fn with_up(center: ChunkCoord, rh: i32, rv: i32, up: Option<Face>) -> Self {
+        Self { center, rh, rv, up }
+    }
+
+    /// Per-axis radius. `None` copies `rh` onto every axis.
+    #[inline]
+    fn radii(self) -> [i32; 3] {
+        match self.up {
+            None => [self.rh, self.rh, self.rh],
+            Some(face) => {
+                let mut r = [self.rh, self.rh, self.rh];
+                r[face.axis()] = self.rv;
+                r
+            }
+        }
     }
 
     #[inline]
     pub fn contains(self, c: ChunkCoord) -> bool {
-        c.ring(self.center) <= self.rh && c.updown(self.center) <= self.rv
+        let r = self.radii();
+        let d = c.delta_abs(self.center);
+        d[0] <= r[0] && d[1] <= r[1] && d[2] <= r[2]
     }
 
     #[inline]
     pub fn min(self) -> ChunkCoord {
-        ChunkCoord::new(
-            self.center.x - self.rh,
-            self.center.y - self.rv,
-            self.center.z - self.rh,
-        )
+        let r = self.radii();
+        ChunkCoord::new(self.center.x - r[0], self.center.y - r[1], self.center.z - r[2])
     }
 
     /// Inclusive axis lengths: `(x, y, z)`.
     #[inline]
     pub fn size(self) -> (i32, i32, i32) {
-        (2 * self.rh + 1, 2 * self.rv + 1, 2 * self.rh + 1)
+        let r = self.radii();
+        (2 * r[0] + 1, 2 * r[1] + 1, 2 * r[2] + 1)
     }
 
-    /// Every chunk coord in the box, iterated x → z → y (matching the triple
-    /// loops this replaced, so the enqueue order is unchanged).
-    pub fn coords(self) -> impl Iterator<Item = ChunkCoord> {
-        let ChunkBox { center: c, rh, rv } = self;
-        (c.x - rh..=c.x + rh).flat_map(move |x| {
-            (c.z - rh..=c.z + rh)
-                .flat_map(move |z| (c.y - rv..=c.y + rv).map(move |y| ChunkCoord::new(x, y, z)))
-        })
+    /// Every chunk in the box.
+    ///
+    /// The two tangent axes (every world axis except `up`), in increasing axis
+    /// index, are the outer and middle loops; the up axis is innermost.
+    /// `None` uses the +Y order. That is:
+    /// - +Y and `None`: x → z → y (today's enqueue order)
+    /// - ±X: y → z → x
+    /// - ±Z: x → y → z
+    ///
+    /// Sign does not change the order: both faces of an axis share its box.
+    pub fn coords(self) -> ChunkBoxIter {
+        let r = self.radii();
+        let start = [
+            self.center.x - r[0],
+            self.center.y - r[1],
+            self.center.z - r[2],
+        ];
+        let end = [
+            self.center.x + r[0],
+            self.center.y + r[1],
+            self.center.z + r[2],
+        ];
+        let done = start[0] > end[0] || start[1] > end[1] || start[2] > end[2];
+        ChunkBoxIter {
+            cur: start,
+            start,
+            end,
+            order: axis_order(self.up),
+            done,
+        }
+    }
+}
+
+/// Outer, middle, inner axis indices. See [`ChunkBox::coords`].
+#[inline]
+fn axis_order(up: Option<Face>) -> [usize; 3] {
+    match up.map(|f| f.axis()) {
+        Some(0) => [1, 2, 0],
+        Some(2) => [0, 1, 2],
+        _ => [0, 2, 1],
+    }
+}
+
+/// [`ChunkBox::coords`] cursor. Odometer over `(outer, middle, inner)`.
+pub struct ChunkBoxIter {
+    cur: [i32; 3],
+    start: [i32; 3],
+    end: [i32; 3],
+    order: [usize; 3],
+    done: bool,
+}
+
+impl Iterator for ChunkBoxIter {
+    type Item = ChunkCoord;
+
+    fn next(&mut self) -> Option<ChunkCoord> {
+        if self.done {
+            return None;
+        }
+        let c = ChunkCoord::new(self.cur[0], self.cur[1], self.cur[2]);
+        let [outer, mid, inner] = self.order;
+        if self.cur[inner] < self.end[inner] {
+            self.cur[inner] += 1;
+        } else if self.cur[mid] < self.end[mid] {
+            self.cur[inner] = self.start[inner];
+            self.cur[mid] += 1;
+        } else if self.cur[outer] < self.end[outer] {
+            self.cur[inner] = self.start[inner];
+            self.cur[mid] = self.start[mid];
+            self.cur[outer] += 1;
+        } else {
+            self.done = true;
+        }
+        Some(c)
     }
 }
 
@@ -512,5 +634,50 @@ mod tests {
                 "iterator emitted a coord the box does not contain"
             );
         }
+    }
+
+    #[test]
+    fn chunkbox_stands_on_each_axis_and_none_is_a_cube() {
+        let c = ChunkCoord::new(2, -3, 4);
+        let pos_y = ChunkBox::new(c, 2, 1);
+        assert_eq!(pos_y.min(), ChunkCoord::new(0, -4, 2));
+        assert_eq!(pos_y.size(), (5, 3, 5));
+        assert!(pos_y.contains(ChunkCoord::new(4, -2, 4)));
+        assert!(!pos_y.contains(ChunkCoord::new(2, -1, 4)));
+
+        // ±X is short along X and wide in Y/Z. Iteration is y → z → x.
+        for face in [Face::PosX, Face::NegX] {
+            let b = ChunkBox::with_up(c, 2, 1, Some(face));
+            assert_eq!(b.min(), ChunkCoord::new(1, -5, 2), "{face:?}");
+            assert_eq!(b.size(), (3, 5, 5), "{face:?}");
+            assert!(b.contains(ChunkCoord::new(3, -5, 6)));
+            assert!(!b.contains(ChunkCoord::new(4, -3, 4)));
+            let got: Vec<_> = b.coords().collect();
+            let mut want = Vec::new();
+            for y in (c.y - 2)..=(c.y + 2) {
+                for z in (c.z - 2)..=(c.z + 2) {
+                    for x in (c.x - 1)..=(c.x + 1) {
+                        want.push(ChunkCoord::new(x, y, z));
+                    }
+                }
+            }
+            assert_eq!(got, want, "{face:?}");
+        }
+
+        // ±Z is short along Z. Iteration is x → y → z.
+        let zbox = ChunkBox::with_up(c, 2, 1, Some(Face::PosZ));
+        assert_eq!(zbox.size(), (5, 5, 3));
+        assert_eq!(zbox.coords().next(), Some(ChunkCoord::new(c.x - 2, c.y - 2, c.z - 1)));
+        let z_last = zbox.coords().last();
+        assert_eq!(z_last, Some(ChunkCoord::new(c.x + 2, c.y + 2, c.z + 1)));
+
+        // None: cube of the horizontal radius, same loop order as +Y.
+        let cube = ChunkBox::with_up(c, 2, 99, None);
+        assert_eq!(cube.size(), (5, 5, 5));
+        assert!(cube.contains(ChunkCoord::new(4, -1, 6)));
+        assert!(!cube.contains(ChunkCoord::new(2, 0, 4)));
+        let got: Vec<_> = cube.coords().collect();
+        let pos_y_same = ChunkBox::new(c, 2, 2);
+        assert_eq!(got, pos_y_same.coords().collect::<Vec<_>>());
     }
 }

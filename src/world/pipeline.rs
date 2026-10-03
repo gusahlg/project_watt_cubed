@@ -26,7 +26,7 @@
 //!   Bounded even mid-burst (a worker finishes at most its current job), and
 //!   a stuck GPU can never block it — workers never issue GPU calls.
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -96,13 +96,19 @@ pub(in crate::world) enum Job {
     /// per-chunk edit overlay (`(coord, [(flat index, block)])`) replayed after
     /// each chunk's fill — voxel-identical to per-chunk generation.
     ///
-    /// An `Open` chunk is one job: `key` is `{ PosY, cx, cz }` and `range` is
-    /// `cy..=cy` (a coordinate encoding only — see `gather_column_runs`).
     GenerateColumn {
         key: ColumnKey,
         range: RangeInclusive<i32>,
         generator: Generator,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
+    },
+    /// One `Open` chunk. Filled through the PosY one-chunk `generate_column`
+    /// encoding (`{ PosY, cx, cz }`, `cy..=cy`) so voxels match the sync path.
+    /// The claim is [`JobKey::Open`], not that column key.
+    GenerateOpen {
+        coord: Coord,
+        generator: Generator,
+        edits: Vec<(usize, BlockId)>,
     },
     /// Greedy-mesh a snapshot taken at chunk revision `rev`.
     Mesh {
@@ -157,6 +163,11 @@ pub(crate) enum JobKey {
         key: ColumnKey,
         range: RangeInclusive<i32>,
     },
+    /// One `Open` chunk. Distinct from a PosY [`Column`](Self::Column) at the
+    /// same `(cx, cz)`.
+    Open {
+        coord: Coord,
+    },
     Mesh {
         coord: Coord,
     },
@@ -178,6 +189,7 @@ impl JobKey {
                 key: *key,
                 range: range.clone(),
             },
+            Job::GenerateOpen { coord, .. } => JobKey::Open { coord: *coord },
             Job::Mesh { coord, .. } => JobKey::Mesh { coord: *coord },
             Job::Light { coord, .. } => JobKey::Light { coord: *coord },
             Job::Section {
@@ -590,18 +602,31 @@ fn priority(job: &Job) -> Priority {
     }
 }
 
+/// Face-local chunk altitude. Positive axes keep `c`; negative axes send `c`
+/// to `−c−1` (the same map as [`FaceFrame`](crate::space::FaceFrame)).
+fn face_altitude(face: Face, c: Coord) -> i32 {
+    let v = match face.axis() {
+        0 => c.x,
+        1 => c.y,
+        _ => c.z,
+    };
+    if face.sign() > 0 { v } else { -v - 1 }
+}
+
 impl Job {
-    /// The horizontal chunk column a NEAR job serves, for live-view distance
-    /// ordering and descheduling. `None` for far/section work (the far queue
-    /// carries its own distance keys) and test-only jobs.
-    fn col(&self) -> Option<(i32, i32)> {
+    /// World chunk a NEAR job is measured from. A column clamps the live
+    /// centre's altitude on that column's face into the requested range, so a
+    /// run that still covers the player stays near and one left entirely
+    /// behind along the face is far. `None` for far/section work and test jobs.
+    fn anchor(&self, center: Coord) -> Option<Coord> {
         match self {
             Job::GenerateColumn { key, range, .. } => {
-                let coord = key.chunk(*range.start());
-                Some((coord.x, coord.z))
+                let alt = face_altitude(key.face, center).clamp(*range.start(), *range.end());
+                Some(key.chunk(alt))
             }
-            Job::Mesh { coord, .. } => Some((coord.x, coord.z)),
-            Job::Light { coord, .. } => Some((coord.x, coord.z)),
+            Job::GenerateOpen { coord, .. }
+            | Job::Mesh { coord, .. }
+            | Job::Light { coord, .. } => Some(*coord),
             Job::Section { .. } => None,
             #[cfg(test)]
             Job::Panic(_) => None,
@@ -627,13 +652,21 @@ const CANCEL_MARGIN: i32 = 4;
 /// snapshot. [`CANCEL_MARGIN`] remains the spatial hysteresis, not a substitute
 /// for cross-atomic publication.
 pub(in crate::world) struct ViewGate {
-    /// `(cx as u32) << 32 | (cz as u32)`.
-    center: AtomicU64,
+    /// Streaming centre chunk. Three atomics so a negative coordinate is a
+    /// plain `i32`, not a packed bitcast.
+    cx: AtomicI32,
+    cy: AtomicI32,
+    cz: AtomicI32,
     /// Horizontal view radius in chunks; `i32::MAX` (permissive) until set.
+    /// Near distance is 3-D chess against this one radius.
     radius: AtomicI32,
-    /// Monotone stamp of the `(centre, radius)` pair: bumped only when one
-    /// actually changes, so the queues' O(n) re-key/deschedule rebuild runs
-    /// once per boundary cross instead of once per pop.
+    /// Streaming up: a [`Face`] discriminant, or [`UP_NONE`] when isotropic.
+    /// Default is +Y so an unset gate matches the historical XZ metric
+    /// (`dy == 0`).
+    up: AtomicU8,
+    /// Monotone stamp of the `(centre, radius, up)` triple: bumped only when
+    /// one actually changes, so the queues' O(n) re-key/deschedule rebuild
+    /// runs once per boundary cross instead of once per pop.
     epoch: AtomicU64,
     /// Far-field descheduling horizon in METRES (`f64` bits; +∞ until set):
     /// the outer ladder radius plus the velocity lookahead, refreshed every
@@ -641,10 +674,11 @@ pub(in crate::world) struct ViewGate {
     /// velocity every pass, and the wanted checks read it LIVE rather than
     /// baking it into keys.
     far_m: AtomicU64,
-    /// Horizontal eye velocity, as `f64` bits. Queue priorities use this to
-    /// favor the leading edge during travel instead of spending the reduced
-    /// budget behind the player.
+    /// Eye velocity, as `f64` bits. Queue priorities use this to favor the
+    /// leading edge during travel instead of spending the reduced budget
+    /// behind the player. +Y bias ignores `vel_y`.
     vel_x: AtomicU64,
+    vel_y: AtomicU64,
     vel_z: AtomicU64,
     /// Velocity-aware concurrency and near-queue lookahead. Both are published
     /// by the main thread from the world's single streaming pacer.
@@ -652,14 +686,21 @@ pub(in crate::world) struct ViewGate {
     near_queue_cap: AtomicUsize,
 }
 
+/// [`ViewGate::up`] code for an isotropic volume (no face).
+const UP_NONE: u8 = 255;
+
 impl ViewGate {
     fn new() -> Self {
         Self {
-            center: AtomicU64::new(0),
+            cx: AtomicI32::new(0),
+            cy: AtomicI32::new(0),
+            cz: AtomicI32::new(0),
             radius: AtomicI32::new(i32::MAX),
+            up: AtomicU8::new(Face::PosY as u8),
             epoch: AtomicU64::new(0),
             far_m: AtomicU64::new(f64::INFINITY.to_bits()),
             vel_x: AtomicU64::new(0.0f64.to_bits()),
+            vel_y: AtomicU64::new(0.0f64.to_bits()),
             vel_z: AtomicU64::new(0.0f64.to_bits()),
             active_workers: AtomicUsize::new(1),
             // Permissive until a real Workers pool publishes its capacity;
@@ -668,38 +709,66 @@ impl ViewGate {
         }
     }
 
-    fn set(&self, cx: i32, cz: i32, radius: i32) {
-        let packed = ((cx as u32 as u64) << 32) | (cz as u32 as u64);
-        let prev_center = self.center.swap(packed, Ordering::Relaxed);
+    fn set(&self, cx: i32, cy: i32, cz: i32, radius: i32) {
+        let prev = (
+            self.cx.swap(cx, Ordering::Relaxed),
+            self.cy.swap(cy, Ordering::Relaxed),
+            self.cz.swap(cz, Ordering::Relaxed),
+        );
         let prev_radius = self.radius.swap(radius, Ordering::Relaxed);
-        if prev_center != packed || prev_radius != radius {
+        if prev != (cx, cy, cz) || prev_radius != radius {
             self.epoch.fetch_add(1, Ordering::Release);
         }
     }
 
     /// Load-first publish: skip atomic stores when the snapshot is unchanged.
-    fn publish(&self, cx: i32, cz: i32, radius: i32, far_m: f64, vel_x: f64, vel_z: f64) {
-        let packed = ((cx as u32 as u64) << 32) | (cz as u32 as u64);
+    fn publish(
+        &self,
+        cx: i32,
+        cy: i32,
+        cz: i32,
+        radius: i32,
+        far_m: f64,
+        vel_x: f64,
+        vel_y: f64,
+        vel_z: f64,
+        up: Option<Face>,
+    ) {
         let far_bits = far_m.to_bits();
         let vx = vel_x.to_bits();
+        let vy = vel_y.to_bits();
         let vz = vel_z.to_bits();
-        let same_center = self.center.load(Ordering::Relaxed) == packed
-            && self.radius.load(Ordering::Relaxed) == radius;
+        let up_code = match up {
+            Some(face) => face as u8,
+            None => UP_NONE,
+        };
+        let same_center = self.cx.load(Ordering::Relaxed) == cx
+            && self.cy.load(Ordering::Relaxed) == cy
+            && self.cz.load(Ordering::Relaxed) == cz
+            && self.radius.load(Ordering::Relaxed) == radius
+            && self.up.load(Ordering::Relaxed) == up_code;
         let same_far = self.far_m.load(Ordering::Relaxed) == far_bits;
         let same_vel = self.vel_x.load(Ordering::Relaxed) == vx
+            && self.vel_y.load(Ordering::Relaxed) == vy
             && self.vel_z.load(Ordering::Relaxed) == vz;
         if same_center && same_far && same_vel {
             return;
         }
         if !same_vel {
             self.vel_x.store(vx, Ordering::Relaxed);
+            self.vel_y.store(vy, Ordering::Relaxed);
             self.vel_z.store(vz, Ordering::Relaxed);
         }
         if !same_far {
             self.far_m.store(far_bits, Ordering::Relaxed);
         }
         if !same_center {
-            self.set(cx, cz, radius);
+            self.cx.store(cx, Ordering::Relaxed);
+            self.cy.store(cy, Ordering::Relaxed);
+            self.cz.store(cz, Ordering::Relaxed);
+            self.radius.store(radius, Ordering::Relaxed);
+            self.up.store(up_code, Ordering::Relaxed);
+            self.epoch.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -712,6 +781,7 @@ impl ViewGate {
     #[cfg(test)]
     fn set_velocity(&self, x: f64, z: f64) {
         self.vel_x.store(x.to_bits(), Ordering::Relaxed);
+        self.vel_y.store(0.0f64.to_bits(), Ordering::Relaxed);
         self.vel_z.store(z.to_bits(), Ordering::Relaxed);
     }
 
@@ -737,81 +807,109 @@ impl ViewGate {
         self.epoch.load(Ordering::Acquire)
     }
 
-    fn center(&self) -> (i32, i32) {
-        let packed = self.center.load(Ordering::Relaxed);
-        ((packed >> 32) as u32 as i32, packed as u32 as i32)
+    fn center(&self) -> (i32, i32, i32) {
+        (
+            self.cx.load(Ordering::Relaxed),
+            self.cy.load(Ordering::Relaxed),
+            self.cz.load(Ordering::Relaxed),
+        )
     }
 
-    /// Chessboard chunk distance from the live centre, `0` while permissive.
-    fn dist(&self, cx: i32, cz: i32) -> i32 {
+    fn up_face(&self) -> Option<Face> {
+        Face::from_index(self.up.load(Ordering::Relaxed))
+    }
+
+    /// Chess distance from the live centre across the up face (+Y: the XZ
+    /// chess this gate always used), 3-D chess when isotropic; `0` while
+    /// permissive. Distance along the up axis never deschedules, as before.
+    fn dist(&self, x: i32, y: i32, z: i32) -> i32 {
         if self.radius.load(Ordering::Relaxed) == i32::MAX {
             return 0;
         }
-        let (px, pz) = self.center();
-        (cx - px).abs().max((cz - pz).abs())
+        let (px, py, pz) = self.center();
+        let d = [(x - px).abs(), (y - py).abs(), (z - pz).abs()];
+        match self.up_face() {
+            Some(face) => {
+                let a = face.axis();
+                (0..3).filter(|&i| i != a).map(|i| d[i]).max().unwrap_or(0)
+            }
+            None => d[0].max(d[1]).max(d[2]),
+        }
     }
 
-    /// Motion-biased near priority. Keep the chess-distance semantics but
-    /// reserve fractional key space so leading/trailing alignment can adjust
-    /// it without collapsing adjacent rings onto one integer.
-    fn near_key(&self, cx: i32, cz: i32) -> u64 {
-        let base = self.dist(cx, cz) as u64 * 1024;
+    /// Motion-biased near priority. Chess distance stays the integer part;
+    /// the fractional key space lets leading/trailing alignment move a job
+    /// without collapsing adjacent rings onto one integer. Bias is in the
+    /// plane perpendicular to the up face, in chunk units. +Y uses XZ only.
+    fn near_key(&self, x: i32, y: i32, z: i32) -> u64 {
+        let base = self.dist(x, y, z) as u64 * 1024;
         if base == 0 {
             return 0;
         }
-        let (px, pz) = self.center();
-        let (dx, dz) = ((cx - px) as f64, (cz - pz) as f64);
-        super::motion_biased_dist2(base, self.velocity(), dx, dz)
+        let (px, py, pz) = self.center();
+        super::bias_order(
+            base,
+            self.velocity(),
+            (x - px) as f64,
+            (y - py) as f64,
+            (z - pz) as f64,
+            self.up_face(),
+        )
     }
 
-    /// Whether a job at this column is still worth running.
-    fn wanted(&self, cx: i32, cz: i32) -> bool {
+    /// Whether a job at this chunk is still worth running.
+    fn wanted(&self, x: i32, y: i32, z: i32) -> bool {
         let radius = self.radius.load(Ordering::Relaxed);
-        radius == i32::MAX || self.dist(cx, cz) <= radius + CANCEL_MARGIN
+        radius == i32::MAX || self.dist(x, y, z) <= radius + CANCEL_MARGIN
     }
 
     /// The eye position in metres — the centre chunk's centre, matching
     /// [`player_dist2`](super::player_dist2)'s convention.
-    fn eye_m(&self) -> (f64, f64) {
-        let (cx, cz) = self.center();
+    fn eye_m(&self) -> (f64, f64, f64) {
+        let (cx, cy, cz) = self.center();
         let s = CHUNK_SIZE as f64;
-        (cx as f64 * s + s / 2.0, cz as f64 * s + s / 2.0)
+        let half = s / 2.0;
+        (cx as f64 * s + half, cy as f64 * s + half, cz as f64 * s + half)
     }
 
-    /// Live squared horizontal distance (m²) from the eye to a world point —
-    /// the far class's re-key metric (2-D, like its admission metric).
-    fn far_dist2_m(&self, wx: i64, wz: i64) -> u64 {
-        let (ex, ez) = self.eye_m();
-        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
-        (dx * dx + dz * dz) as u64
+    /// Live squared distance (m²) from the eye to a world point.
+    fn far_dist2_m(&self, wx: i64, wy: i64, wz: i64) -> u64 {
+        let (ex, ey, ez) = self.eye_m();
+        let (dx, dy, dz) = (wx as f64 - ex, wy as f64 - ey, wz as f64 - ez);
+        (dx * dx + dy * dy + dz * dz) as u64
     }
 
     fn velocity(&self) -> voxel_engine::DVec3 {
         voxel_engine::DVec3::new(
             f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
-            0.0,
+            f64::from_bits(self.vel_y.load(Ordering::Relaxed)),
             f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
         )
     }
 
+    /// Section re-key. Sections are an XZ heightfield: `wy` is the live eye
+    /// altitude, so `dy` is 0 and a +Y gate matches the old 2-D metric.
+    /// [`motion_biased_dist2`](super::motion_biased_dist2) ignores `vel.y`.
     fn far_key(&self, wx: i64, wz: i64) -> u64 {
-        let (ex, ez) = self.eye_m();
+        let (ex, ey, ez) = self.eye_m();
         let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
-        super::motion_biased_dist2(self.far_dist2_m(wx, wz), self.velocity(), dx, dz)
+        super::motion_biased_dist2(self.far_dist2_m(wx, ey as i64, wz), self.velocity(), dx, dz)
     }
 
     /// Whether a far entry with world-centre `(wx, wz)` and footprint `span`
     /// is still inside the live horizon. The entry's own span is the
     /// hysteresis margin — sections are large, so the chunk-sized
     /// [`CANCEL_MARGIN`] would be meaningless here. Permissive until both a
-    /// view and a horizon have been published.
+    /// view and a horizon have been published. Vertical distance is dropped
+    /// (the section has no altitude).
     fn far_wanted(&self, wx: i64, wz: i64, span: i64) -> bool {
         let far = f64::from_bits(self.far_m.load(Ordering::Relaxed));
         if !far.is_finite() || self.radius.load(Ordering::Relaxed) == i32::MAX {
             return true;
         }
         let limit = far + span as f64;
-        (self.far_dist2_m(wx, wz) as f64) <= limit * limit
+        let (_, ey, _) = self.eye_m();
+        (self.far_dist2_m(wx, ey as i64, wz) as f64) <= limit * limit
     }
 }
 
@@ -966,6 +1064,17 @@ impl EpochHeap {
     }
 }
 
+/// Chunk a near job is measured from against the live gate. Panic jobs and
+/// anything without an anchor sit at the origin, matching the old `(0, 0)`
+/// column (the permissive gate forces distance 0 before that point matters).
+fn near_anchor(job: &Job, gate: &ViewGate) -> (i32, i32, i32) {
+    let (cx, cy, cz) = gate.center();
+    match job.anchor(Coord::new(cx, cy, cz)) {
+        Some(c) => (c.x, c.y, c.z),
+        None => (0, 0, 0),
+    }
+}
+
 /// A far job's world-space centre and footprint span (metres), for live
 /// re-keying and horizon descheduling without any callback into the `World`.
 fn far_center_span(job: &Job) -> (i64, i64, i64) {
@@ -1011,9 +1120,9 @@ impl JobQueue {
                 if self.near.len() >= gate.near_queue_cap() {
                     return false;
                 }
-                let (cx, cz) = job.col().unwrap_or((0, 0));
-                let d = gate.near_key(cx, cz);
-                self.near.push(d, cx as i64, cz as i64, 0, job);
+                let (x, y, z) = near_anchor(&job, gate);
+                let d = gate.near_key(x, y, z);
+                self.near.push(d, x as i64, z as i64, 0, job);
             }
             Priority::Far => {
                 let (wx, wz, span) = far_center_span(&job);
@@ -1055,8 +1164,14 @@ impl JobQueue {
         let epoch = gate.epoch();
         self.near.sync(
             epoch,
-            |e| gate.near_key(e.wx as i32, e.wz as i32),
-            |e| gate.wanted(e.wx as i32, e.wz as i32),
+            |e| {
+                let (x, y, z) = near_anchor(&e.job, gate);
+                gate.near_key(x, y, z)
+            },
+            |e| {
+                let (x, y, z) = near_anchor(&e.job, gate);
+                gate.wanted(x, y, z)
+            },
             cancelled,
         );
         // Far syncs on the same trigger even while near work exists: a flood
@@ -1171,13 +1286,17 @@ impl Workers {
     pub(in crate::world) fn set_view(
         &self,
         cx: i32,
+        cy: i32,
         cz: i32,
         radius: i32,
         far_m: f64,
         vel_x: f64,
+        vel_y: f64,
         vel_z: f64,
+        up: Option<Face>,
     ) {
-        self.view.publish(cx, cz, radius, far_m, vel_x, vel_z);
+        self.view
+            .publish(cx, cy, cz, radius, far_m, vel_x, vel_y, vel_z, up);
     }
 
     /// Park/unpark workers and publish near-queue lookahead together. A cap-only
@@ -1310,7 +1429,7 @@ impl Drop for Workers {
 fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
     use voxel_engine::profile::Meter;
     match job {
-        Job::GenerateColumn { .. } => Meter::WorkGenerate,
+        Job::GenerateColumn { .. } | Job::GenerateOpen { .. } => Meter::WorkGenerate,
         Job::Mesh { .. } => Meter::WorkMesh,
         Job::Light { .. } => Meter::WorkLight,
         // Reuse WorkTile meter: new variant would touch profile.rs (outside scope).
@@ -1421,6 +1540,31 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
                         }
                     }
                     (coord, chunk)
+                })
+                .collect();
+            Done::Column {
+                key,
+                chunks,
+                heights: Box::new(heights),
+            }
+        }
+        Job::GenerateOpen { coord, generator, edits } => {
+            // Same voxels as the sync path's PosY one-chunk encoding. The
+            // result stays `Done::Column` so accept_column is unchanged;
+            // Open sky skips the ceiling.
+            let key = ColumnKey { face: Face::PosY, a: coord.x, b: coord.z };
+            let (generated, heights) = generator.generate_column(key, coord.y..=coord.y);
+            let chunks = generated
+                .into_iter()
+                .map(|(alt, data)| {
+                    let c = key.chunk(alt);
+                    let mut chunk = Chunk::from_data(c.x, c.y, c.z, data);
+                    if c == coord {
+                        for &(index, id) in &edits {
+                            chunk.set_index(index, id);
+                        }
+                    }
+                    (c, chunk)
                 })
                 .collect();
             Done::Column {
@@ -1738,7 +1882,7 @@ mod tests {
         // The player sprints to (28, 28) with radius 3: priorities flip, and
         // everything left more than radius + CANCEL_MARGIN chunks behind is
         // descheduled with its claim reported.
-        gate.set(28, 28, 3);
+        gate.set(28, 0, 28, 3);
         let mut cancelled = Vec::new();
         let first = q.pop(&gate, &mut cancelled).expect("work remains");
         assert!(
@@ -1786,7 +1930,7 @@ mod tests {
         let mut q = JobQueue::default();
         let gate = open_gate();
         gate.set_velocity(100.0, 0.0);
-        gate.set(0, 0, 20);
+        gate.set(0, 0, 0, 20);
         gate.set_active_workers(2); // near cap = max(2 * 4, 8)
 
         // Equal distance, trailing inserted first: direction must win.
@@ -1888,7 +2032,7 @@ mod tests {
 
         // The player appears at the origin; the horizon covers section 0 but
         // falls short of section 50 (midpoint of their true eye distances).
-        gate.set(0, 0, 8);
+        gate.set(0, 0, 0, 8);
         let eye = |wx: i64, wz: i64| {
             let (ex, ez) = (8.0f64, 8.0f64);
             ((wx as f64 - ex).powi(2) + (wz as f64 - ez).powi(2)).sqrt()
@@ -2336,12 +2480,49 @@ mod tests {
         let border = (crate::math::WORLD_BORDER as i32).div_euclid(s);
         let gate = ViewGate::new();
         for cx in [0, 1, -1, 7, -7, border, -border] {
-            gate.set(cx, -cx, 4);
-            assert_eq!(gate.center(), (cx, -cx), "packed centre round-trips");
-            assert!(gate.wanted(cx, -cx));
-            assert!(gate.wanted(cx + 4 + CANCEL_MARGIN, -cx));
-            assert!(!gate.wanted(cx + 4 + CANCEL_MARGIN + 1, -cx));
-            assert_eq!(gate.dist(cx, -cx), 0);
+            gate.set(cx, 0, -cx, 4);
+            assert_eq!(gate.center(), (cx, 0, -cx), "centre round-trips");
+            assert!(gate.wanted(cx, 0, -cx));
+            assert!(gate.wanted(cx + 4 + CANCEL_MARGIN, 0, -cx));
+            assert!(!gate.wanted(cx + 4 + CANCEL_MARGIN + 1, 0, -cx));
+            assert_eq!(gate.dist(cx, 0, -cx), 0);
         }
+    }
+
+    /// A job left behind along the up axis is descheduled. The old gate
+    /// measured XZ only, so a PosY column at the same `(x, z)` and a PosX
+    /// column whose tangents sit next to the origin both survived.
+    #[test]
+    fn view_gate_measures_across_the_up_face() {
+        let terrain = generator(0);
+        let chunk = Coord::new(20, 0, 0);
+        let (pos_x, alt) = ColumnKey::of(Face::PosX, chunk);
+        assert_eq!(pos_x, ColumnKey { face: Face::PosX, a: -1, b: 0 });
+        assert_eq!(alt, 20, "world x is the +X altitude, not the tangent");
+
+        let mut q = JobQueue::default();
+        let gate = open_gate();
+        let column = |key: ColumnKey, range: std::ops::RangeInclusive<i32>| Job::GenerateColumn {
+            key,
+            range,
+            generator: terrain.clone(),
+            edits: Vec::new(),
+        };
+        // PosY at y = 20: straight up the +Y axis, distance 0 across it (kept, as always).
+        q.push(column(ColumnKey { face: Face::PosY, a: 0, b: 0 }, 20..=20), &gate);
+        // PosX at world (20, 0, 0): 20 chunks across +Y. Reading (a, b) as (x, z) would see 1.
+        q.push(column(pos_x, 20..=20), &gate);
+        // Inside the cancel ring.
+        q.push(column(ColumnKey { face: Face::PosY, a: 1, b: 0 }, 0..=0), &gate);
+
+        gate.set(0, 0, 0, 3);
+        let mut cancelled = Vec::new();
+        let first = q.pop(&gate, &mut cancelled).expect("near jobs survive");
+        assert!(
+            matches!(first, Job::GenerateColumn { key: ColumnKey { face: Face::PosY, a: 0, b: 0, .. }, .. }),
+            "the column straight up is nearest across +Y"
+        );
+        assert_eq!(cancelled.len(), 1, "only the job far across +Y drops: {cancelled:?}");
+        assert!(matches!(&cancelled[0], JobKey::Column { key, .. } if *key == pos_x));
     }
 }

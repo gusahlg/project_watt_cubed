@@ -67,7 +67,7 @@ use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle
 use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
-use crate::coord::{ByPass, ChunkBox, ChunkCoord};
+use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
 use crate::space::FaceFrame;
 use chunk::{CHUNK_SIZE, Chunk};
 use generation::WorldgenKind;
@@ -306,31 +306,43 @@ impl ViewVolume {
     pub(in crate::world) fn lod_unit(&self) -> f32 {
         (self.horizontal.max(1) * CHUNK_SIZE as i32) as f32
     }
-    /// The mesh box grown by `dh` rings horizontally and `dv` layers vertically.
-    fn box_at(self, center: Coord, dh: i32, dv: i32) -> ChunkBox {
-        ChunkBox::new(center, self.horizontal + dh, self.vertical + dv)
+    /// The mesh box grown by `dh` across `up` and `dv` along it.
+    /// `None` ignores `dv`: every axis uses the horizontal radius plus `dh`.
+    fn box_at(self, center: Coord, dh: i32, dv: i32, up: Option<Face>) -> ChunkBox {
+        match up {
+            None => ChunkBox::with_up(center, self.horizontal + dh, 0, None),
+            Some(face) => {
+                ChunkBox::with_up(center, self.horizontal + dh, self.vertical + dv, Some(face))
+            }
+        }
     }
     /// Chunks meshed and drawn around `center`.
-    fn mesh(self, center: Coord) -> ChunkBox {
-        self.box_at(center, 0, 0)
+    fn mesh(self, center: Coord, up: Option<Face>) -> ChunkBox {
+        self.box_at(center, 0, 0, up)
     }
     /// The mesh box plus one [`DATA_MARGIN`] shell of voxel data, so edge chunks
     /// cull against neighbours that are loaded but unmeshed.
-    fn data(self, center: Coord) -> ChunkBox {
-        self.box_at(center, DATA_MARGIN, DATA_MARGIN)
+    fn data(self, center: Coord, up: Option<Face>) -> ChunkBox {
+        self.box_at(center, DATA_MARGIN, DATA_MARGIN, up)
     }
     /// The mesh box plus the unload hysteresis, past which chunks free. Vertical
     /// uses the tighter [`UNLOAD_MARGIN_V`] to match the tighter vertical radius.
-    fn unload(self, center: Coord) -> ChunkBox {
-        self.box_at(center, UNLOAD_MARGIN, UNLOAD_MARGIN_V)
+    /// `None` grows every axis by [`UNLOAD_MARGIN`].
+    fn unload(self, center: Coord, up: Option<Face>) -> ChunkBox {
+        self.box_at(center, UNLOAD_MARGIN, UNLOAD_MARGIN_V, up)
     }
 
-    /// Ring-worklist bucket count: `order(data-box max corner) + 1`. Keys past
-    /// that ring clamp into the last bucket.
-    fn worklist_rings(self) -> usize {
+    /// Ring-worklist bucket count: one past the data box's heaviest
+    /// [`World::order`]. `None` is plain 3-D chess, so the count is the
+    /// horizontal data radius plus one. Keys past the last ring clamp there.
+    fn worklist_rings(self, up: Option<Face>) -> usize {
         let rh = self.horizontal + DATA_MARGIN;
         let rv = self.vertical + DATA_MARGIN;
-        (rh.max(2 * rv) as usize).saturating_add(1)
+        let span = match up {
+            None => rh,
+            Some(_) => rh.max(2 * rv),
+        };
+        (span as usize).saturating_add(1)
     }
 }
 
@@ -949,6 +961,12 @@ pub struct World {
     pub(crate) edit_generation: u64,
     /// Last chunk centre; `None` forces a full stream pass. Streams only react to boundary crosses.
     center: Option<Coord>,
+    /// Up face committed for the streaming centre. `None` is isotropic.
+    /// Meaningful only once [`stream_up_set`](Self::stream_up_set) is true.
+    stream_up: Option<Face>,
+    /// False until the first centre resolve. Until then [`live_up`](Self::live_up)
+    /// is +Y, so pre-stream orders match the historical volume.
+    stream_up_set: bool,
     /// The streamed chunk volume (horizontal ring + a smaller, derived vertical
     /// layer radius). Its horizontal radius is the render-distance setting
     /// (clamped to [`VIEW_RADIUS_RANGE`]); see [`ViewVolume`].
@@ -971,7 +989,7 @@ pub struct World {
     /// Reused by the section admission lane.
     admit_sections: AdmitScratch<SectionPos>,
     /// Reused column list for [`World::request_region_data`].
-    gen_columns: Vec<(u64, ColumnKey, (i32, i32))>,
+    gen_columns: Vec<(u64, streaming::GenRun)>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
@@ -1338,6 +1356,8 @@ impl World {
             edits: FastMap::default(),
             edit_generation: 0,
             center: None,
+            stream_up: None,
+            stream_up_set: false,
             view: ViewVolume::view(DEFAULT_VIEW_RADIUS),
             pending_fresh: Sticky::raised(),
             pending_dirty: Sticky::default(),
@@ -1356,12 +1376,12 @@ impl World {
             upload_queue: VecDeque::new(),
             mesh_worklist: worklist::RingWorklist::new(
                 Coord::new(0, 0, 0),
-                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
+                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY)),
             ),
             light_pending: Sticky::default(),
             light_worklist: worklist::RingWorklist::new(
                 Coord::new(0, 0, 0),
-                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(),
+                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY)),
             ),
             light_seed_inserts: 0,
             light_seed_split: LightSeedSplit::default(),
@@ -1529,12 +1549,15 @@ impl World {
     }
 
     /// Fold a streaming-centre move into the settled-ring count WITHOUT
-    /// restarting the scan. Proven-settled rings survive a horizontal move
-    /// shifted down by its chess distance `d`: a column at chess distance
-    /// ρ ≤ rings−d−1 from the NEW centre lies at chess ≤ ρ+d ≤ rings−1 from
-    /// the old centre — inside the proven settled disc, over the SAME vertical
-    /// span (which is why a vertical move still resets: `ring_settled` scans
-    /// `center.y ± vertical`, and the proof does not transfer across layers).
+    /// restarting the scan. Proven-settled rings survive a move across the up
+    /// axis, shifted down by its tangent chess distance `d`: a column at
+    /// distance ρ ≤ rings−d−1 from the NEW centre lies at distance ≤ ρ+d ≤
+    /// rings−1 from the old one, over the SAME span along the up axis. A move
+    /// along that axis resets (`ring_settled` scans `center ± vertical` on the
+    /// up axis, and the proof does not transfer across layers). With no up
+    /// face the volume is a cube, so any move shifts by 3-D chess. The first
+    /// pass (no previous centre) resets.
+    ///
     /// Settledness cannot have regressed on this pass either: `unload_box` ⊇
     /// mesh box, so a boundary-cross unload never removes a chunk inside a
     /// countable ring; every OTHER regression (radius shrink, mesh teardown,
@@ -1542,21 +1565,29 @@ impl World {
     /// over the shift (the reset in [`refresh_lod_clip`](Self::refresh_lod_clip)
     /// runs after).
     ///
-    /// The old behavior — reset to zero on EVERY boundary cross — collapsed
-    /// the far clip each crossed boundary: far LOD popped back over the whole
-    /// settled near field for frames (the flying flicker) and every ring was
-    /// re-proven from scratch, O(R²·V) hash probes per cross.
+    /// Resetting on every boundary cross collapsed the far clip each crossed
+    /// boundary: far LOD popped back over the whole settled near field for
+    /// frames (the flying flicker) and every ring was re-proven from scratch.
     pub(in crate::world) fn shift_lod_clip(&mut self, prev: Option<Coord>, new: Coord) {
-        match prev {
-            Some(p) if p.y == new.y => {
-                let d = (new.x - p.x).abs().max((new.z - p.z).abs());
-                self.lod_clip_rings = (self.lod_clip_rings - d).max(0);
-                // Resume the outward scan from the shifted frontier.
-                self.lod_clip_grow.set();
-            }
-            // A vertical move or the very first pass: restart from zero.
-            _ => self.lod_clip_shrunk.set(),
+        let Some(p) = prev else {
+            self.lod_clip_shrunk.set();
+            return;
+        };
+        let up = self.live_up();
+        let along = match up {
+            Some(face) => p.along(new, face),
+            None => 0,
+        };
+        if along != 0 {
+            self.lod_clip_shrunk.set();
+            return;
         }
+        let d = match up {
+            Some(face) => p.across(new, face),
+            None => p.chess3(new),
+        };
+        self.lod_clip_rings = (self.lod_clip_rings - d).max(0);
+        self.lod_clip_grow.set();
     }
 
     /// Advance the settled-ring scan at a `&mut` sync point (end of `pump`
@@ -1578,24 +1609,65 @@ impl World {
         }
     }
 
-    /// Whether every column of the chess-distance `ring` around `center` is
-    /// fully settled across the streamed vertical range.
+    /// Whether every column of chess-distance `ring` around `center` is fully
+    /// settled across the streamed range along the up axis. `None` (a cube)
+    /// settles the 3-D chess shell instead of a column.
     fn ring_settled(&self, center: Coord, ring: i32) -> bool {
+        match self.live_up() {
+            Some(face) => self.column_ring_settled(center, ring, face),
+            None => self.cube_ring_settled(center, ring),
+        }
+    }
+
+    /// +Y is the XZ ring, each column spanning `center.y ± vertical`.
+    fn column_ring_settled(&self, center: Coord, ring: i32, face: Face) -> bool {
         let v = self.view.vertical;
-        let column = |cx: i32, cz: i32| {
-            (center.y - v..=center.y + v).all(|cy| {
+        let axis = face.axis();
+        let (t0, t1) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        let origin = [center.x, center.y, center.z];
+        let lo = origin[axis] - v;
+        let hi = origin[axis] + v;
+        let settled = |tu: i32, tv: i32| {
+            (lo..=hi).all(|a| {
+                let mut p = origin;
+                p[t0] = tu;
+                p[t1] = tv;
+                p[axis] = a;
                 self.chunks
-                    .get(&Coord::new(cx, cy, cz))
+                    .get(&Coord::new(p[0], p[1], p[2]))
                     .is_some_and(|l| l.state.settled())
             })
         };
+        let c0 = origin[t0];
+        let c1 = origin[t1];
         if ring == 0 {
-            return column(center.x, center.z);
+            return settled(c0, c1);
         }
         let r = ring;
-        (-r..=r).all(|d| column(center.x + d, center.z - r) && column(center.x + d, center.z + r))
-            && (1 - r..r)
-                .all(|d| column(center.x - r, center.z + d) && column(center.x + r, center.z + d))
+        (-r..=r).all(|d| settled(c0 + d, c1 - r) && settled(c0 + d, c1 + r))
+            && (1 - r..r).all(|d| settled(c0 - r, c1 + d) && settled(c0 + r, c1 + d))
+    }
+
+    fn cube_ring_settled(&self, center: Coord, ring: i32) -> bool {
+        let r = ring;
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    if dx.abs().max(dy.abs()).max(dz.abs()) != r {
+                        continue;
+                    }
+                    let c = Coord::new(center.x + dx, center.y + dy, center.z + dz);
+                    if !self.chunks.get(&c).is_some_and(|l| l.state.settled()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Far-material style: flat palette-average past [`FLAT_DETAIL`] if available,
@@ -2109,10 +2181,11 @@ fn admit_coord_worklist<S: StreamLane<Key = Coord>>(
     let deadline = lanes::paced_deadline(world, budget);
     let slots = queue_slots::<S>(world);
     let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
-    let rings = world.view.worklist_rings();
+    let up = world.live_up();
+    let rings = world.view.worklist_rings(up);
 
     let mut list = std::mem::take(S::seed_set(world).expect("worklist"));
-    list.fit(center, rings);
+    list.fit(center, rings, up);
 
     if slots == 0 {
         let empty = list.is_empty();
@@ -2227,6 +2300,7 @@ const MOTION_BIAS_STRENGTH: f64 = 0.3;
 
 /// Bias priority by eye velocity: cells ahead sort sooner, behind later.
 /// Affects ordering only, never the desired set. Identity at rest.
+/// The Y component of `vel` is ignored (the +Y tangent plane is XZ).
 fn motion_biased_dist2(base: u64, vel: DVec3, dx: f64, dz: f64) -> u64 {
     let speed = (vel.x * vel.x + vel.z * vel.z).sqrt();
     let disp = (dx * dx + dz * dz).sqrt();
@@ -2237,18 +2311,46 @@ fn motion_biased_dist2(base: u64, vel: DVec3, dx: f64, dz: f64) -> u64 {
     (base as f64 * (1.0 - MOTION_BIAS_STRENGTH * align)).max(0.0) as u64
 }
 
+/// Same bias in all three axes. Used when the streaming volume has no up face.
+fn motion_biased_dist3(base: u64, vel: DVec3, dx: f64, dy: f64, dz: f64) -> u64 {
+    let speed = (vel.x * vel.x + vel.y * vel.y + vel.z * vel.z).sqrt();
+    let disp = (dx * dx + dy * dy + dz * dz).sqrt();
+    if speed < MOTION_BIAS_MIN_SPEED || disp < 1.0 {
+        return base;
+    }
+    let align = (vel.x * dx + vel.y * dy + vel.z * dz) / (speed * disp);
+    (base as f64 * (1.0 - MOTION_BIAS_STRENGTH * align)).max(0.0) as u64
+}
+
+/// Motion bias in the plane perpendicular to `up`. `None` biases in 3-D.
+/// Axis Y passes `(dx, dz)` and the raw velocity into [`motion_biased_dist2`]
+/// (which ignores `vel.y`), so a +Y caller stays bit-identical.
+fn bias_order(base: u64, vel: DVec3, dx: f64, dy: f64, dz: f64, up: Option<Face>) -> u64 {
+    match up {
+        None => motion_biased_dist3(base, vel, dx, dy, dz),
+        Some(face) => match face.axis() {
+            0 => motion_biased_dist2(base, DVec3::new(vel.y, 0.0, vel.z), dy, dz),
+            1 => motion_biased_dist2(base, vel, dx, dz),
+            _ => motion_biased_dist2(base, DVec3::new(vel.x, 0.0, vel.y), dx, dy),
+        },
+    }
+}
+
 /// Near-lane ordering with the same leading-edge bias as the worker queue.
-/// Vertical distance remains encoded by [`World::order`]; velocity only
-/// breaks/reweights otherwise nearby candidates in the horizontal plane.
+/// Distance along the up axis stays encoded by [`World::order`]; velocity
+/// only reweights candidates in the tangent plane (`None`: all three axes).
 fn near_motion_order(world: &World, center: Coord, key: Coord) -> u64 {
-    let ring = World::order(key, center).max(0) as u64;
+    let up = world.live_up();
+    let ring = World::order(key, center, up).max(0) as u64;
     let base = ring.saturating_mul(ring).saturating_mul(1024);
     let scale = CHUNK_SIZE as f64;
-    motion_biased_dist2(
+    bias_order(
         base,
         world.section_vel,
         (key.x - center.x) as f64 * scale,
+        (key.y - center.y) as f64 * scale,
         (key.z - center.z) as f64 * scale,
+        up,
     )
 }
 
@@ -2411,7 +2513,8 @@ impl StreamLane for SectionLane {
         (key.x - psx).abs().max((key.z - psz).abs()) as u64
     }
     fn dist2(world: &World, center: Coord, key: SectionPos) -> Option<u64> {
-        // 2-D far field: use player's Y to drop vertical term.
+        // Sections are an XZ heightfield: pass the eye altitude as `wy` so
+        // `dy` is 0 and a vertical move does not reshuffle them.
         let span = key.span() as i64;
         let py = center.y as i64 * CHUNK_SIZE as i64 + CHUNK_SIZE as i64 / 2;
         let (cx, cz) = (key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
