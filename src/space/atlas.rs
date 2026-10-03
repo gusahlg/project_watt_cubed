@@ -97,6 +97,13 @@ pub struct Atlas {
     /// Storage `+Y` points toward the centre (an inner surface, like the Hollow's).
     pub inward: bool,
     pub bands: Vec<Band>,
+    /// The transition shell and the core (absent for a hollow shell's atlas).
+    pub inner: Option<Inner>,
+}
+
+/// The transition shell and the Cartesian core below an atlas's innermost band.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Inner {
     /// Transition shell: chart resolution, outer radius, radial layers, per-face storage origins.
     pub t_n: i64,
     pub t_r: i64,
@@ -153,7 +160,20 @@ impl Atlas {
         let t_origin = std::array::from_fn(|f| [x0, y, f as i64 * (t_n + GAP)]);
         y = snap(y + t_layers + GAP + 15);
         let core_origin = [x0, y, 0];
-        Self { centre, radius, inward, bands, t_n, t_r, t_layers, t_origin, core_half, core_origin }
+        let inner = Some(Inner { t_n, t_r, t_layers, t_origin, core_half, core_origin });
+        Self { centre, radius, inward, bands, inner }
+    }
+
+    /// The atlas of a hollow shell's surface: one band of cells between radii `r_lo` and `r_hi`
+    /// (sized for one block of arc at the datum radius `radius`), no core. `inward` turns it into an
+    /// inner surface (storage up toward the centre).
+    pub fn shell(centre: DVec3, radius: i64, r_lo: i64, r_hi: i64, inward: bool, slot: u32) -> Self {
+        let snap = |v: i64| v.div_euclid(16) * 16;
+        let x0 = STORAGE_X0 + slot as i64 * SLOT;
+        let n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / 16.0).round().max(1.0) as i64 * 16;
+        let (r_lo, r_hi) = (snap(r_lo), snap(r_hi + 15));
+        let origin = std::array::from_fn(|f| [x0, 0, f as i64 * (n + GAP)]);
+        Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None }
     }
 
     /// The storage box of a patch: `(min, size)`.
@@ -163,15 +183,24 @@ impl Atlas {
                 let b = &self.bands[band as usize];
                 (b.origin[face_index(face)], [b.n, b.r_hi - b.r_lo, b.n])
             }
-            Patch::Transition { face } => (self.t_origin[face_index(face)], [self.t_n, self.t_layers, self.t_n]),
-            Patch::Core => (self.core_origin, [2 * self.core_half; 3]),
+            Patch::Transition { face } => {
+                let i = self.inner.expect("a transition needs an inner part");
+                (i.t_origin[face_index(face)], [i.t_n, i.t_layers, i.t_n])
+            }
+            Patch::Core => {
+                let i = self.inner.expect("a core needs an inner part");
+                (i.core_origin, [2 * i.core_half; 3])
+            }
         }
     }
 
     /// Every patch.
     pub fn patches(&self) -> impl Iterator<Item = Patch> + '_ {
         let shells = (0..self.bands.len()).flat_map(|b| FACES.map(move |face| Patch::Shell { band: b as u8, face }));
-        shells.chain(FACES.map(|face| Patch::Transition { face })).chain(std::iter::once(Patch::Core))
+        let inner = self.inner.is_some();
+        shells
+            .chain(FACES.map(|face| Patch::Transition { face }).into_iter().filter(move |_| inner))
+            .chain(std::iter::once(Patch::Core).filter(move |_| inner))
     }
 
     /// The patch holding storage cell `s`, with the cell's local coordinates in that patch.
@@ -201,18 +230,19 @@ impl Atlas {
                 self.centre + radial(face, b.n, r, i, l.z)
             }
             Patch::Transition { face } => {
-                let step = 2.0 / self.t_n as f64;
-                let lx = if self.inward { self.t_n as f64 - l.x } else { l.x };
+                let i = self.inner.expect("a transition needs an inner part");
+                let step = 2.0 / i.t_n as f64;
+                let lx = if self.inward { i.t_n as f64 - l.x } else { l.x };
                 let (xi, eta) = (-1.0 + lx * step, -1.0 + l.z * step);
                 let q = std::f64::consts::FRAC_PI_4;
                 let (tu, nn, tv) = basis(face);
-                let cube = (tu * (xi * q).tan() + nn + tv * (eta * q).tan()) * self.core_half as f64;
-                let sphere = radial(face, self.t_n, self.t_r as f64, lx, l.z);
-                let t = l.y / self.t_layers as f64;
+                let cube = (tu * (xi * q).tan() + nn + tv * (eta * q).tan()) * i.core_half as f64;
+                let sphere = radial(face, i.t_n, i.t_r as f64, lx, l.z);
+                let t = l.y / i.t_layers as f64;
                 let t = if self.inward { 1.0 - t } else { t };
                 self.centre + cube + (sphere - cube) * t
             }
-            Patch::Core => self.centre + l - DVec3::splat(self.core_half as f64),
+            Patch::Core => self.centre + l - DVec3::splat(self.inner.expect("a core needs an inner part").core_half as f64),
         }
     }
 
@@ -235,16 +265,20 @@ impl Atlas {
             }
         }
         // Inside the transition or the core: the core cube first (L∞ test), else Newton on the
-        // transition's lerp map.
-        let a = self.core_half as f64;
+        // transition's lerp map. A shell atlas covers nothing below its band.
+        let inner = self.inner?;
+        if self.bands.last().is_some_and(|b| r < b.r_lo as f64) && r >= inner.t_r as f64 {
+            return None;
+        }
+        let a = inner.core_half as f64;
         if rel.abs().max_element() < a {
             return Some((Patch::Core, rel + DVec3::splat(a)));
         }
         let patch = Patch::Transition { face };
         let (xi, eta) = Map::Equiangular.inverse(local);
-        let step = 2.0 / self.t_n as f64;
-        let i = if self.inward { self.t_n as f64 - (xi + 1.0) / step } else { (xi + 1.0) / step };
-        let mut l = DVec3::new(i, self.t_layers as f64 * 0.5, (eta + 1.0) / step);
+        let step = 2.0 / inner.t_n as f64;
+        let i = if self.inward { inner.t_n as f64 - (xi + 1.0) / step } else { (xi + 1.0) / step };
+        let mut l = DVec3::new(i, inner.t_layers as f64 * 0.5, (eta + 1.0) / step);
         for _ in 0..32 {
             let f = self.embed(patch, l) - p;
             if f.length() < 1e-9 {
@@ -369,8 +403,9 @@ mod tests {
             assert_eq!(w[0].n, w[1].n * 2, "resolution halves");
         }
         let last = a.bands.last().unwrap();
-        assert_eq!(a.t_r, last.r_lo);
-        assert!((a.core_half as f64) * 3f64.sqrt() < a.t_r as f64, "core corners inside the transition sphere");
+        let inner = a.inner.unwrap();
+        assert_eq!(inner.t_r, last.r_lo);
+        assert!((inner.core_half as f64) * 3f64.sqrt() < inner.t_r as f64, "core corners inside the transition sphere");
         // Storage boxes are disjoint and beyond the physical border.
         let boxes: Vec<_> = a.patches().map(|p| a.storage_box(p)).collect();
         for (i, (o, s)) in boxes.iter().enumerate() {
@@ -431,6 +466,20 @@ mod tests {
             // Outward charts point storage +y away from the centre, inward ones toward it.
             let s = a.local(a.centre + DVec3::new(0.0, 51_000.0, 0.0)).unwrap();
             assert_eq!(s.jacobian.y_axis.y > 0.0, !inward);
+        }
+    }
+
+    #[test]
+    fn a_shell_atlas_covers_only_its_shell_both_ways() {
+        let c = DVec3::new(-3.0e8, 1.0e8, 2.0e8);
+        for inward in [false, true] {
+            let a = Atlas::shell(c, 60_000, 59_000, 61_000, inward, 3);
+            assert!(a.inner.is_none() && a.bands.len() == 1);
+            assert!(a.find(c + DVec3::new(0.0, 60_000.0, 0.0)).is_some());
+            assert!(a.find(c + DVec3::new(0.0, 30_000.0, 0.0)).is_none(), "the cavity is not covered");
+            let loc = a.local(c + DVec3::new(60_000.0, 1.0, 2.0)).unwrap();
+            assert!(loc.jacobian.determinant() > 0.0);
+            assert_eq!(loc.jacobian.y_axis.x > 0.0, !inward, "inner surfaces face the centre");
         }
     }
 
