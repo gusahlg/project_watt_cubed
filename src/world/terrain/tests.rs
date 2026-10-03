@@ -194,6 +194,43 @@ fn generated_surface_matter_lies_at_rest_when_disturbed() {
 }
 
 #[test]
+fn v4_materials_intern_under_their_role_labels() {
+    let (reg, t) = make(1);
+    let m = t.materials();
+    let pairs = [
+        (m.flower_red, "flower_red"),
+        (m.flower_yellow, "flower_yellow"),
+        (m.flower_blue, "flower_blue"),
+        (m.flower_white, "flower_white"),
+        (m.cap_red, "cap_red"),
+        (m.cap_brown, "cap_brown"),
+        (m.stem, "stem"),
+        (m.ash, "ash"),
+        (m.obsidian, "obsidian"),
+        (m.salt, "salt"),
+        (m.clay, "clay"),
+        (m.limestone, "limestone"),
+        (m.marble, "marble"),
+        (m.jade, "jade"),
+        (m.rust, "rust"),
+        (m.mud, "mud"),
+        (m.lichen, "lichen"),
+        (m.darkwood, "darkwood"),
+        (m.bark, "bark"),
+        (m.amber, "amber"),
+        (m.slate, "slate"),
+        (m.cinder, "cinder"),
+        (m.petrified, "petrified"),
+        (m.tundra, "tundra"),
+        (m.glowshroom, "glowshroom"),
+        (m.star, "star"),
+    ];
+    for (id, label) in pairs {
+        assert_eq!(reg.label(id), Some(label));
+    }
+}
+
+#[test]
 fn every_reagent_has_a_host_and_empties_its_target() {
     let (mut reg, t) = make(1);
     let m = t.materials();
