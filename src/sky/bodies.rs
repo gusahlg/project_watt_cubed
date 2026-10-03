@@ -109,9 +109,10 @@ fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb
     match body.kind {
         Kind::Home => (FarShape::Cube, home_faces(), black()),
         Kind::Twin => (FarShape::Cube, twin_faces(twin_ordinal), black()),
+        // Meadow and forest green: Verdance has no seas.
         Kind::Verdant => (
             FarShape::Sphere,
-            tones(srgb(46, 120, 64), srgb(36, 88, 150)),
+            tones(srgb(70, 140, 56), srgb(32, 92, 44)),
             srgb(186, 216, 232),
         ),
         Kind::Hollow => (
@@ -124,11 +125,12 @@ fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb
             tones(srgb(255, 120, 36), srgb(170, 48, 16)),
             hdr(1.8, 0.42, 0.06),
         ),
+        // The same three characters the moon painter gives them (`round::Style::Moon { tone }`).
         Kind::Moon => {
-            let albedo = if body.seed % 2 == 0 {
-                tones(srgb(164, 158, 148), srgb(140, 136, 128))
-            } else {
-                tones(srgb(122, 96, 68), srgb(96, 74, 52))
+            let albedo = match body.seed % 3 {
+                0 => tones(srgb(150, 148, 152), srgb(60, 66, 72)),
+                1 => tones(srgb(200, 222, 240), srgb(150, 176, 220)),
+                _ => tones(srgb(186, 104, 90), srgb(170, 124, 110)),
             };
             (FarShape::Sphere, albedo, black())
         }
@@ -284,7 +286,7 @@ mod tests {
         let verdant = cosmos.bodies().iter().find(|b| b.kind == Kind::Verdant).unwrap();
         let verdant = find(listed, verdant).unwrap();
         assert!(verdant.albedo[0].0[1] > verdant.albedo[0].0[0]);
-        assert!(verdant.albedo[1].0[2] > verdant.albedo[1].0[1]);
+        assert!(verdant.albedo[1].0[1] > verdant.albedo[1].0[2], "forest green, no seas");
         assert!(verdant.atmosphere.0[2] > verdant.atmosphere.0[0]);
         assert!(verdant.atmosphere.0[0] > 0.0);
 
@@ -304,7 +306,8 @@ mod tests {
             let moon = find(listed, moon).unwrap();
             assert_eq!(moon.shape, FarShape::Sphere);
             assert_eq!(moon.atmosphere.0, [0.0, 0.0, 0.0]);
-            assert!(moon.albedo[0].0[0] >= moon.albedo[0].0[2]);
+            let a = moon.albedo[0].0;
+            assert!(a.iter().all(|&c| c > 0.0 && c <= 1.0), "a lit, plain surface tone: {a:?}");
         }
 
         // Warm the buffer, then two more updates must not allocate.
