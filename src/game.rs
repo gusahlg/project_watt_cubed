@@ -1737,10 +1737,14 @@ impl Game {
     }
 
     /// Altitude above the datum of the nearest body (the sky fades to space with it); far from every
-    /// body, effectively infinite. A flat world's datum is `y = 0`.
+    /// body, or over an airless one (a moon), effectively infinite. A flat world's datum is `y = 0`.
     pub fn sky_altitude(&self, eye: DVec3) -> f64 {
+        use crate::world::terrain::cosmos::Kind;
         match self.world.terrain().cosmos() {
-            Some(cosmos) => cosmos.body_at(eye).map_or(1.0e9, |b| b.altitude(eye)),
+            Some(cosmos) => match cosmos.body_at(eye) {
+                Some(b) if b.kind != Kind::Moon => b.altitude(eye),
+                _ => 1.0e9,
+            },
             None => eye.y,
         }
     }

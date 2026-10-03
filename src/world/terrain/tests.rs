@@ -518,8 +518,6 @@ fn landmarks() {
         }
     }
     for b in t.cosmos.bodies() {
-        if b.kind == cosmos::Kind::Moon {
-            println!("moon {} centre {:?} r {:?}", b.id, b.centre, b.shape);
-        }
+        println!("{:?} {} centre {:?} {:?}", b.kind, b.id, b.centre, b.shape);
     }
 }
