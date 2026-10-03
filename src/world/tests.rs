@@ -1253,12 +1253,165 @@ fn pure_lod_toggle_preserves_the_height_mip_contract() {
 #[test]
 fn streaming_order_weights_vertical_double() {
     let c = ChunkCoord::new(0, 0, 0);
-    assert_eq!(World::order(ChunkCoord::new(4, 0, 0), c), 4);
-    assert_eq!(World::order(ChunkCoord::new(0, 2, 0), c), 4, "2 layers up ranks like 4 rings out");
+    let up = Some(Face::PosY);
+    assert_eq!(World::order(ChunkCoord::new(4, 0, 0), c, up), 4);
+    assert_eq!(World::order(ChunkCoord::new(0, 2, 0), c, up), 4, "2 layers up ranks like 4 rings out");
     assert!(
-        World::order(ChunkCoord::new(0, 3, 0), c) > World::order(ChunkCoord::new(5, 0, 0), c),
+        World::order(ChunkCoord::new(0, 3, 0), c, up) > World::order(ChunkCoord::new(5, 0, 0), c, up),
         "lateral terrain streams before the sky"
     );
+}
+
+/// +X streams wide in Y/Z and short in X. Open space is a cube. Order prefers
+/// chunks near the ground along the up axis; the collision slab reaches ±2
+/// along it.
+#[test]
+fn streaming_box_follows_the_centre_up_face() {
+    let c = ChunkCoord::new(0, 0, 0);
+    let world = World::generate();
+    let h = world.view.horizontal;
+    let v = world.view.vertical;
+    assert!(h > v, "the default volume is still a flat +Y box");
+
+    let pos_y = world.view.mesh(c, Some(Face::PosY));
+    assert!(pos_y.contains(ChunkCoord::new(h, 0, 0)));
+    assert!(!pos_y.contains(ChunkCoord::new(h + 1, 0, 0)));
+    assert!(pos_y.contains(ChunkCoord::new(0, v, 0)));
+    assert!(!pos_y.contains(ChunkCoord::new(0, v + 1, 0)));
+
+    let pos_x = world.view.mesh(c, Some(Face::PosX));
+    assert!(pos_x.contains(ChunkCoord::new(0, h, 0)), "wide along Y");
+    assert!(pos_x.contains(ChunkCoord::new(0, 0, h)), "wide along Z");
+    assert!(pos_x.contains(ChunkCoord::new(v, 0, 0)));
+    assert!(!pos_x.contains(ChunkCoord::new(v + 1, 0, 0)), "short along X");
+    assert_eq!(pos_x.coords().count(), ((2 * h + 1) * (2 * h + 1) * (2 * v + 1)) as usize);
+
+    let cube = world.view.mesh(c, None);
+    assert!(cube.contains(ChunkCoord::new(h, 0, 0)));
+    assert!(cube.contains(ChunkCoord::new(0, h, 0)));
+    assert!(cube.contains(ChunkCoord::new(0, 0, h)));
+    assert!(!cube.contains(ChunkCoord::new(h + 1, 0, 0)));
+    assert_eq!(cube.coords().count(), (2 * h + 1).pow(3) as usize);
+
+    let up = Some(Face::PosX);
+    assert_eq!(World::order(ChunkCoord::new(2, 0, 0), c, up), 4, "two along X weigh like four across");
+    assert_eq!(World::order(ChunkCoord::new(0, 4, 0), c, up), 4);
+    assert!(
+        World::order(ChunkCoord::new(3, 0, 0), c, up) > World::order(ChunkCoord::new(0, 5, 0), c, up),
+        "chunks near the ground along X outrank sky further along X"
+    );
+    assert_eq!(World::order(ChunkCoord::new(3, 4, 1), c, None), 4, "open space is plain 3-D chess");
+
+    let slab = World::collision_slab(c, Some(Face::PosX));
+    assert!(slab.contains(ChunkCoord::new(2, 1, -1)));
+    assert!(!slab.contains(ChunkCoord::new(3, 0, 0)), "±2 along X");
+    assert!(!slab.contains(ChunkCoord::new(0, 2, 0)), "±1 across X");
+    assert_eq!(slab.coords().count(), 5 * 3 * 3);
+    let iso = World::collision_slab(c, None);
+    assert_eq!(iso.coords().count(), 125);
+    assert!(iso.contains(ChunkCoord::new(2, -2, 2)));
+    assert!(!iso.contains(ChunkCoord::new(3, 0, 0)));
+    let pos_y_slab = World::collision_slab(c, Some(Face::PosY));
+    assert_eq!(pos_y_slab.coords().count(), 3 * 5 * 3);
+    assert!(pos_y_slab.contains(ChunkCoord::new(1, -2, 1)));
+    assert!(!pos_y_slab.contains(ChunkCoord::new(2, 0, 0)));
+}
+
+/// An Open centre keeps the previous face while a chunk of that face is
+/// inside one mesh-box radius, and does not inherit +Y on the first resolve.
+#[test]
+fn stream_up_hysteresis_holds_across_an_open_band() {
+    let mut world = World::generate();
+    world.generator = Arc::new(EdgeBand);
+    let open = ChunkCoord::new(0, 0, 0);
+    assert_eq!(world.resolve_stream_up(open), None, "nothing committed yet");
+
+    assert_eq!(world.resolve_stream_up(ChunkCoord::new(-1, 0, 0)), Some(Face::PosX));
+    world.stream_up = Some(Face::PosX);
+    world.stream_up_set = true;
+    let r = world.view.horizontal;
+    // Centre x = r - 1 is chess distance r from the face chunk at x = -1.
+    assert_eq!(
+        world.resolve_stream_up(ChunkCoord::new(r - 1, 0, 0)),
+        Some(Face::PosX),
+        "inside one box radius of the face"
+    );
+    assert_eq!(
+        world.resolve_stream_up(ChunkCoord::new(r, 0, 0)),
+        None,
+        "past one box radius the volume goes isotropic"
+    );
+
+    world.stream_up = None;
+    assert_eq!(
+        world.resolve_stream_up(ChunkCoord::new(1, 0, 0)),
+        None,
+        "an isotropic centre does not pick up a neighbour face"
+    );
+    assert_eq!(world.resolve_stream_up(ChunkCoord::new(-1, 0, 0)), Some(Face::PosX));
+}
+
+/// PosX for `x < 0`, Open otherwise. Only `sky` is consulted.
+struct EdgeBand;
+
+impl crate::world::generation::TerrainGenerator for EdgeBand {
+    fn height(&self, _: i32, _: i32) -> i32 {
+        0
+    }
+    fn surface_at(&self, _: i32, _: i32) -> crate::block::registry::BlockId {
+        AIR
+    }
+    fn deep(&self) -> crate::block::registry::BlockId {
+        AIR
+    }
+    fn sky(&self, c: ChunkCoord) -> Sky {
+        if c.x < 0 { Sky::Axis(Face::PosX) } else { Sky::Open }
+    }
+}
+
+#[test]
+fn shift_lod_clip_follows_the_up_axis() {
+    let mut world = World::generate();
+    world.stream_up = Some(Face::PosX);
+    world.stream_up_set = true;
+    world.lod_clip_shrunk.take();
+    world.lod_clip_rings = 4;
+    world.shift_lod_clip(Some(ChunkCoord::new(0, 0, 0)), ChunkCoord::new(0, 1, 1));
+    assert_eq!(world.lod_clip_rings, 3, "a tangent move shifts by chess distance");
+    assert!(!world.lod_clip_shrunk.get());
+    world.shift_lod_clip(Some(ChunkCoord::new(0, 1, 1)), ChunkCoord::new(1, 1, 1));
+    assert!(world.lod_clip_shrunk.get(), "a move along X resets");
+
+    world.lod_clip_shrunk.take();
+    world.stream_up = None;
+    world.lod_clip_rings = 4;
+    world.shift_lod_clip(Some(ChunkCoord::new(0, 0, 0)), ChunkCoord::new(0, 2, 0));
+    assert_eq!(world.lod_clip_rings, 2, "isotropic space shifts by 3-D chess");
+    assert!(!world.lod_clip_shrunk.get());
+}
+
+#[test]
+fn ring_settled_scans_along_the_up_axis() {
+    let mut world = World::generate();
+    world.set_view_radius(2);
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    let v = world.view.vertical;
+    for y in -v..=v {
+        let c = ChunkCoord::new(0, y, 0);
+        world.ensure_data(c);
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Air;
+    }
+    assert!(world.ring_settled(center, 0), "+Y ring 0 is the Y column");
+    world.stream_up = Some(Face::PosX);
+    world.stream_up_set = true;
+    assert!(!world.ring_settled(center, 0), "+X ring 0 is the X column");
+    for x in -v..=v {
+        let c = ChunkCoord::new(x, 0, 0);
+        world.ensure_data(c);
+        world.chunks.get_mut(&c).unwrap().state = MeshState::Air;
+    }
+    assert!(world.ring_settled(center, 0));
 }
 
 #[test]

@@ -169,7 +169,9 @@ impl StreamPacer {
     }
 
     fn update(&mut self, velocity: DVec3, sample_dt: f64) {
-        self.speed_mps = velocity.x.hypot(velocity.z);
+        // `hypot(x, 0) = |x|` and `hypot` is even, so `vy == 0` matches the
+        // old horizontal speed bit for bit.
+        self.speed_mps = velocity.x.hypot(velocity.y).hypot(velocity.z);
         let target = Self::target_effort(self.speed_mps);
         if target <= self.effort {
             // Load shedding has to beat the next expensive frame.
@@ -373,6 +375,9 @@ fn sample_mean_p95(samples: &[u16]) -> (f32, f32, u64) {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::world) enum FailKey {
     Column { key: ColumnKey },
+    /// One `Open` chunk. Not a [`Column`](Self::Column): a PosY column at the
+    /// same `(cx, cz)` must keep its own strike count.
+    Open { coord: Coord },
     Mesh { coord: Coord },
     Light { coord: Coord },
     Section { pos: SectionPos },
@@ -382,9 +387,30 @@ impl FailKey {
     fn of(key: &pipeline::JobKey) -> FailKey {
         match key {
             pipeline::JobKey::Column { key, .. } => FailKey::Column { key: *key },
+            pipeline::JobKey::Open { coord } => FailKey::Open { coord: *coord },
             pipeline::JobKey::Mesh { coord } => FailKey::Mesh { coord: *coord },
             pipeline::JobKey::Light { coord } => FailKey::Light { coord: *coord },
             pipeline::JobKey::Section { pos, .. } => FailKey::Section { pos: *pos },
+        }
+    }
+}
+
+/// One generate admission: a face column, or a single `Open` chunk.
+/// `Open` is not encoded as a one-chunk PosY column — that key collided with
+/// a real PosY column's [`FailKey`] at the same `(cx, cz)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::world) enum GenRun {
+    Column { key: ColumnKey, lo: i32, hi: i32 },
+    Open { coord: Coord },
+}
+
+impl GenRun {
+    /// Chunk the run is ordered from. A column uses its low end: every layer
+    /// shares the tangent coordinates, and +Y ordering ignores altitude.
+    fn anchor(self) -> Coord {
+        match self {
+            GenRun::Column { key, lo, .. } => key.chunk(lo),
+            GenRun::Open { coord } => coord,
         }
     }
 }
@@ -420,45 +446,43 @@ const GEN_MIN_ADMIT: usize = 8;
 /// between the ends has the same sky (a loaded hole of the same face). A gap
 /// whose sky differs splits the run, so a PosY job never generates an Open coord.
 ///
-/// `Open` is one job per missing chunk, encoded as
-/// `ColumnKey { face: PosY, a: cx, b: cz }` with range `cy..=cy` so
-/// `key.chunk(cy)` round-trips. PosY there is only a coordinate encoding:
+/// `Open` is one job per missing chunk ([`GenRun::Open`]), not merged with
+/// its `(cx, cz)` neighbours and not encoded as a PosY column. Voxel
+/// generation still calls `generate_column` with that PosY encoding so
+/// `key.chunk(cy)` round-trips; only the claim and quarantine key differ.
 /// `accept_column` does not install a ceiling and `store_chunk` does not
-/// record the chunk when `sky` is `Open`. Open chunks that share `(cx, cz)`
-/// are not merged. That encoding's [`FailKey`] can collide with a real PosY
-/// column's strike key.
+/// record the chunk when `sky` is `Open`.
 ///
-/// `skip_quarantine` drops a quarantined column before it can take a slot.
-/// The slab path leaves it false so [`World::try_submit_column`] rejects the
-/// run and the caller keeps `pending_gen` set.
+/// `skip_quarantine` drops a quarantined run before it can take a slot.
+/// The slab path leaves it false so the submit rejects the run and the
+/// caller keeps `pending_gen` set.
 fn gather_column_runs(
     coords: impl IntoIterator<Item = Coord>,
     mut sky_of: impl FnMut(Coord) -> Sky,
     mut present: impl FnMut(Coord) -> bool,
-    mut quarantined: impl FnMut(ColumnKey) -> bool,
+    mut quarantined: impl FnMut(FailKey) -> bool,
     span_loaded: bool,
     skip_quarantine: bool,
-) -> Vec<(ColumnKey, i32, i32)> {
+) -> Vec<GenRun> {
     let mut axis: FastMap<ColumnKey, Vec<(i32, bool)>> = FastMap::default();
     let mut open_seen: FastSet<Coord> = FastSet::default();
-    let mut runs: Vec<(ColumnKey, i32, i32)> = Vec::new();
+    let mut runs: Vec<GenRun> = Vec::new();
     for coord in coords {
-        let sky = sky_of(coord);
-        let (key, alt) = match sky {
-            Sky::Axis(face) => ColumnKey::of(face, coord),
-            Sky::Open => (ColumnKey { face: Face::PosY, a: coord.x, b: coord.z }, coord.y),
-        };
-        if skip_quarantine && quarantined(key) {
-            continue;
-        }
-        let missing = !present(coord);
-        match sky {
+        match sky_of(coord) {
             Sky::Open => {
-                if missing && open_seen.insert(coord) {
-                    runs.push((key, alt, alt));
+                if skip_quarantine && quarantined(FailKey::Open { coord }) {
+                    continue;
+                }
+                if !present(coord) && open_seen.insert(coord) {
+                    runs.push(GenRun::Open { coord });
                 }
             }
-            Sky::Axis(_) => {
+            Sky::Axis(face) => {
+                let (key, alt) = ColumnKey::of(face, coord);
+                if skip_quarantine && quarantined(FailKey::Column { key }) {
+                    continue;
+                }
+                let missing = !present(coord);
                 if !span_loaded && !missing {
                     continue;
                 }
@@ -486,7 +510,7 @@ fn gather_column_runs(
                     j += 1;
                 }
                 if deduped[i..=j].iter().any(|p| p.1) {
-                    runs.push((key, deduped[i].0, deduped[j].0));
+                    runs.push(GenRun::Column { key, lo: deduped[i].0, hi: deduped[j].0 });
                 }
                 i = j + 1;
             }
@@ -496,13 +520,22 @@ fn gather_column_runs(
                 let split = i + 1 == deduped.len()
                     || !gap_same_sky(key, deduped[i].0, deduped[i + 1].0, &mut sky_of);
                 if split {
-                    runs.push((key, deduped[start].0, deduped[i].0));
+                    runs.push(GenRun::Column {
+                        key,
+                        lo: deduped[start].0,
+                        hi: deduped[i].0,
+                    });
                     start = i + 1;
                 }
             }
         }
     }
-    runs.sort_unstable_by_key(|(key, lo, _)| (key.face.index(), key.a, key.b, *lo));
+    // Open occupies the slot the old PosY one-chunk encoding sorted into, so
+    // a +Y gather keeps today's order.
+    runs.sort_unstable_by_key(|run| match run {
+        GenRun::Column { key, lo, .. } => (key.face.index(), key.a, key.b, *lo),
+        GenRun::Open { coord } => (Face::PosY.index(), coord.x, coord.z, coord.y),
+    });
     runs
 }
 
@@ -511,34 +544,90 @@ fn gap_same_sky(key: ColumnKey, lo: i32, hi: i32, sky_of: &mut impl FnMut(Coord)
     (lo + 1..hi).all(|alt| sky_of(key.chunk(alt)) == want)
 }
 
-fn column_order(center: Coord, vel: DVec3, cx: i32, cz: i32) -> u64 {
-    let dx = cx - center.x;
-    let dz = cz - center.z;
-    let ring = dx.abs().max(dz.abs()) as u64;
-    super::motion_biased_dist2(
-        ring.saturating_mul(ring).saturating_mul(1024),
+/// Column priority: tangent chess (not the ×2 along-axis weight — a column
+/// job is the whole run). `None` is 3-D chess of the anchor. +Y reads only
+/// XZ, matching the old `(cx, cz)` key.
+fn column_order(center: Coord, vel: DVec3, anchor: Coord, up: Option<Face>) -> u64 {
+    let across = match up {
+        None => anchor.chess3(center) as u64,
+        Some(face) => anchor.across(center, face) as u64,
+    };
+    let scale = CHUNK_SIZE as f64;
+    super::bias_order(
+        across.saturating_mul(across).saturating_mul(1024),
         vel,
-        f64::from(dx) * CHUNK_SIZE as f64,
-        f64::from(dz) * CHUNK_SIZE as f64,
+        f64::from(anchor.x - center.x) * scale,
+        f64::from(anchor.y - center.y) * scale,
+        f64::from(anchor.z - center.z) * scale,
+        up,
     )
 }
 
 impl World {
+    /// Up face of the streaming centre. +Y until the first resolve, so
+    /// pre-stream orders match the historical volume.
+    pub(in crate::world) fn live_up(&self) -> Option<Face> {
+        if self.stream_up_set { self.stream_up } else { Some(Face::PosY) }
+    }
+
+    /// Up face for `center`. An `Open` centre keeps the previous face while it
+    /// is within one mesh-box radius (3-D chess of [`ViewVolume`]'s horizontal
+    /// radius) of a chunk with that face, so an edge band does not flip the
+    /// box every chunk. The first centre, with nothing committed, does not
+    /// inherit +Y: `Open` there is isotropic.
+    pub(in crate::world) fn resolve_stream_up(&self, center: Coord) -> Option<Face> {
+        match self.generator.sky(center) {
+            Sky::Axis(face) => Some(face),
+            Sky::Open => {
+                if !self.stream_up_set {
+                    return None;
+                }
+                let Some(prev) = self.stream_up else {
+                    return None;
+                };
+                let r = self.view.horizontal;
+                if r > 0 && self.open_near_face(center, prev, r) {
+                    Some(prev)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn open_near_face(&self, center: Coord, face: Face, r: i32) -> bool {
+        let want = Sky::Axis(face);
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let c = Coord::new(center.x + dx, center.y + dy, center.z + dz);
+                    if self.generator.sky(c) == want {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// The mesh box: chunks meshed and drawn around `center`.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
-        self.view.mesh(center)
+        self.view.mesh(center, self.live_up())
     }
 
     /// The data box: the mesh box plus one [`DATA_MARGIN`] shell of voxel data,
     /// so edge chunks can cull against neighbours that are loaded but unmeshed.
     fn data_box(&self, center: Coord) -> ChunkBox {
-        self.view.data(center)
+        self.view.data(center, self.live_up())
     }
 
     /// The unload box: the mesh box plus the unload hysteresis, past which
     /// chunks are freed.
     pub(in crate::world) fn unload_box(&self, center: Coord) -> ChunkBox {
-        self.view.unload(center)
+        self.view.unload(center, self.live_up())
     }
 
     /// Whether `coord` is inside the current mesh box. The single mesh-view
@@ -659,26 +748,41 @@ impl World {
         );
         // Update centre before draining: old centre may be a sentinel, so draining
         // against it would discard all results and regenerate them immediately.
+        // An up-face change is the same kind of pass: the box changed shape.
         let prev_center = self.center;
-        let full_pass = Some(center_chunk) != self.center;
+        let center_moved = Some(center_chunk) != self.center;
+        let up_changed = if center_moved || !self.stream_up_set {
+            let up = self.resolve_stream_up(center_chunk);
+            let changed = if self.stream_up_set {
+                up != self.stream_up
+            } else {
+                // Pre-stream orders assume +Y. A different first face reshapes.
+                up != Some(Face::PosY)
+            };
+            self.stream_up = up;
+            self.stream_up_set = true;
+            changed
+        } else {
+            false
+        };
+        let full_pass = center_moved || up_changed;
         self.center = Some(center_chunk);
         // Re-bucket worklists around the live centre before any lane (or pump
-        // insert) runs. O(n) once per boundary cross; a no-op when the rings
-        // and centre already match.
+        // insert) runs. O(n) once per boundary cross; a no-op when the rings,
+        // centre, and up face already match.
         if full_pass {
-            let rings = self.view.worklist_rings();
-            self.mesh_worklist.resize(rings);
-            self.mesh_worklist.recenter(center_chunk);
-            self.light_worklist.resize(rings);
-            self.light_worklist.recenter(center_chunk);
+            let up = self.live_up();
+            let rings = self.view.worklist_rings(up);
+            self.mesh_worklist.fit(center_chunk, rings, up);
+            self.light_worklist.fit(center_chunk, rings, up);
         }
         // Publish the live view to the worker pool: queued jobs re-key toward
         // the player's CURRENT position on every view change, and entries left
         // behind by fast movement — far sections included — are descheduled
         // instead of run. The far horizon is the outer ladder radius plus the
         // velocity lookahead, so prediction-desired sections survive it.
-        let vxz = self.section_vel.x.hypot(self.section_vel.z);
-        let far_m = f64::from(self.section_pyramid.outer_m()) + vxz * TAU_STREAM;
+        let speed3 = self.section_vel.x.hypot(self.section_vel.y).hypot(self.section_vel.z);
+        let far_m = f64::from(self.section_pyramid.outer_m()) + speed3 * TAU_STREAM;
         // Configure the pool before any lane can submit this frame. On the
         // first stream this avoids one permissive/full-capacity burst from a
         // lazily spawned pool before the pacer catches it on the next pass.
@@ -686,17 +790,21 @@ impl World {
         let velocity = self.section_vel;
         let view_radius = self.view.horizontal;
         let stager = eng.as_ref().map(|e| e.mesh_stager());
+        let up = self.live_up();
         let workers = self.worker_pool();
         if let Some(stager) = stager {
             workers.set_stager(stager);
         }
         workers.set_view(
             center_chunk.x,
+            center_chunk.y,
             center_chunk.z,
             view_radius,
             far_m,
             velocity.x,
+            velocity.y,
             velocity.z,
+            up,
         );
         let capacity = workers.worker_capacity();
         workers.set_pacing(
@@ -706,10 +814,15 @@ impl World {
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
         // The ring geometry is centred on the eye: a boundary cross SHIFTS the
-        // settled rings by the move's chess distance (only a vertical move or
-        // the first pass restarts the scan) — see `shift_lod_clip`.
+        // settled rings by the move's chess distance across the up axis (a
+        // move along that axis, an up-face change, or the first pass restarts
+        // the scan) — see `shift_lod_clip`.
         if full_pass {
-            self.shift_lod_clip(prev_center, center_chunk);
+            if up_changed {
+                self.lod_clip_shrunk.set();
+            } else {
+                self.shift_lod_clip(prev_center, center_chunk);
+            }
         }
         // Each lane creates its own budget window, not shared: lanes run
         // sequentially, so a single frame-start snapshot would starve lanes
@@ -1364,9 +1477,14 @@ impl World {
         self.in_mesh_box(coord) && self.chunks.get(&coord).is_some_and(|l| l.rev == rev)
     }
 
-    /// Streaming priority: chessboard distance with vertical axis weighted 2x (terrain before sky).
-    pub(in crate::world) fn order(a: Coord, b: Coord) -> i32 {
-        a.ring(b).max(2 * a.updown(b))
+    /// Streaming priority. `Some(face)`: tangent chess, distance along the
+    /// face ×2 (terrain before sky). `None`: plain 3-D chess. +Y is
+    /// `ring.max(2 * updown)`.
+    pub(in crate::world) fn order(a: Coord, b: Coord, up: Option<Face>) -> i32 {
+        match up {
+            None => a.chess3(b),
+            Some(face) => a.across(b, face).max(2 * a.along(b, face)),
+        }
     }
 
     /// The [`GenerateLane`](lanes::GenerateLane) producer's body: queue worker
@@ -1397,7 +1515,7 @@ impl World {
             coords,
             |c| self.generator.sky(c),
             |c| self.chunks.contains_key(&c) || self.generating.contains(&c),
-            |key| self.quarantined.contains(&FailKey::Column { key }),
+            |fail| self.quarantined.contains(&fail),
             false,
             true,
         );
@@ -1414,14 +1532,11 @@ impl World {
                 remaining: runs.len() as u32,
             };
         }
+        let up = self.live_up();
         self.gen_columns.clear();
-        self.gen_columns.extend(runs.into_iter().map(|(key, lo, hi)| {
-            let c = key.chunk(lo);
-            (
-                column_order(center, self.section_vel, c.x, c.z),
-                key,
-                (lo, hi),
-            )
+        self.gen_columns.extend(runs.into_iter().map(|run| {
+            let anchor = run.anchor();
+            (column_order(center, self.section_vel, anchor, up), run)
         }));
         let n = self.gen_columns.len();
         let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
@@ -1438,8 +1553,12 @@ impl World {
             if super::admission_exhausted(admitted, min_admit, deadline) {
                 break;
             }
-            let (key, (lo, hi)) = (self.gen_columns[i].1, self.gen_columns[i].2);
-            if self.try_submit_column(key, lo, hi) {
+            let run = self.gen_columns[i].1;
+            let accepted = match run {
+                GenRun::Column { key, lo, hi } => self.try_submit_column(key, lo, hi),
+                GenRun::Open { coord } => self.try_submit_open(coord),
+            };
+            if accepted {
                 admitted += 1;
             } else {
                 break;
@@ -1555,6 +1674,13 @@ impl World {
                     self.pending_gen.set();
                 }
             }
+            pipeline::JobKey::Open { coord } => {
+                let in_slab = self.spawn_slab.is_some_and(|slab| slab.contains(coord));
+                self.generating.remove(&coord);
+                if rearm || in_slab {
+                    self.pending_gen.set();
+                }
+            }
             pipeline::JobKey::Mesh { coord } => {
                 if let Some(loaded) = self.chunks.get_mut(&coord) {
                     if loaded.state.release_build() {
@@ -1603,9 +1729,21 @@ impl World {
         }
     }
 
-    /// Collision halo around an eye chunk: 3×3 columns, two layers below through two above.
-    fn collision_slab(center: Coord) -> ChunkBox {
-        ChunkBox::new(center, 1, 2)
+    /// Collision halo around an eye chunk. `Some(face)`: ±1 across the face,
+    /// ±2 along it (+Y is the old 3×3 columns, two layers below through two
+    /// above). `None`: ±2 on every axis.
+    pub(in crate::world) fn collision_slab(center: Coord, up: Option<Face>) -> ChunkBox {
+        match up {
+            None => ChunkBox::with_up(center, 2, 2, None),
+            Some(face) => ChunkBox::with_up(center, 1, 2, Some(face)),
+        }
+    }
+
+    fn slab_up(&self, center: Coord) -> Option<Face> {
+        match self.generator.sky(center) {
+            Sky::Axis(face) => Some(face),
+            Sky::Open => None,
+        }
     }
 
     /// Request the collision slab around `pos` from the worker pool. Does not
@@ -1614,11 +1752,12 @@ impl World {
     /// the same request (physics freezes until it lands).
     pub fn prepare_around(&mut self, pos: DVec3) {
         let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
-        let slab = Self::collision_slab(c);
+        let up = self.slab_up(c);
+        let slab = Self::collision_slab(c, up);
         let far_m = f64::from(self.section_pyramid.outer_m());
         let view_r = self.view.horizontal;
         self.worker_pool()
-            .set_view(c.x, c.z, view_r, far_m, 0.0, 0.0);
+            .set_view(c.x, c.y, c.z, view_r, far_m, 0.0, 0.0, 0.0, up);
         self.submit_slab_columns(slab);
         self.pending_gen.set();
         if slab.coords().all(|coord| self.chunks.contains_key(&coord)) {
@@ -1632,7 +1771,7 @@ impl World {
     /// anything that queries voxels before a stream pass).
     pub fn ensure_around(&mut self, pos: DVec3) {
         let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
-        for coord in Self::collision_slab(c).coords() {
+        for coord in Self::collision_slab(c, self.slab_up(c)).coords() {
             self.ensure_data(coord);
         }
     }
@@ -1687,13 +1826,17 @@ impl World {
             coords,
             |c| self.generator.sky(c),
             |c| self.chunks.contains_key(&c) || self.generating.contains(&c),
-            |key| self.quarantined.contains(&FailKey::Column { key }),
+            |fail| self.quarantined.contains(&fail),
             true,
             false,
         );
         let mut remaining = false;
-        for (key, lo, hi) in runs {
-            if !self.try_submit_column(key, lo, hi) {
+        for run in runs {
+            let accepted = match run {
+                GenRun::Column { key, lo, hi } => self.try_submit_column(key, lo, hi),
+                GenRun::Open { coord } => self.try_submit_open(coord),
+            };
+            if !accepted {
                 remaining = true;
             }
         }
@@ -1731,6 +1874,29 @@ impl World {
                     self.generating.insert(coord);
                 }
             }
+        }
+        accepted
+    }
+
+    /// Submit one `Open` chunk. The worker still fills it through the PosY
+    /// one-chunk `generate_column` encoding; the claim key does not.
+    fn try_submit_open(&mut self, coord: Coord) -> bool {
+        if self.quarantined.contains(&FailKey::Open { coord }) {
+            return false;
+        }
+        let edits = self
+            .edits
+            .get(&coord)
+            .map(|cells| cells.iter().map(|(&i, &id)| (i, id)).collect())
+            .unwrap_or_default();
+        let job = pipeline::Job::GenerateOpen {
+            coord,
+            generator: self.generator.clone(),
+            edits,
+        };
+        let accepted = self.worker_pool().submit(job);
+        if accepted && !self.chunks.contains_key(&coord) {
+            self.generating.insert(coord);
         }
         accepted
     }
@@ -1969,7 +2135,8 @@ impl World {
         self.dirty_worklist
             .retain(|c| chunks.get(c).is_some_and(|l| l.state.is_dirty()));
         let mut dirty: Vec<Coord> = self.dirty_worklist.iter().copied().collect();
-        dirty.sort_by_key(|&coord| Self::order(coord, center));
+        let up = self.live_up();
+        dirty.sort_by_key(|&coord| Self::order(coord, center, up));
         // Leftovers past the budget stay `Dirty` (still in the fiber); re-arm
         // the hint so the next frame drains them.
         let remaining = dirty.len().saturating_sub(DIRTY_BUDGET);
@@ -4574,24 +4741,27 @@ mod tests {
         let runs = gather_column_runs(missing, sky, |_| false, |_| false, false, false);
         let hole = ColumnKey { face: Face::PosY, a: 1, b: 0 };
         assert!(
-            runs.contains(&(hole, 0, 2)),
+            runs.contains(&GenRun::Column { key: hole, lo: 0, hi: 2 }),
             "a loaded PosY hole stays one run: {runs:?}"
         );
         let split = ColumnKey { face: Face::PosY, a: 0, b: 0 };
-        assert!(runs.contains(&(split, 0, 0)), "{runs:?}");
-        assert!(runs.contains(&(split, 2, 2)), "{runs:?}");
+        assert!(runs.contains(&GenRun::Column { key: split, lo: 0, hi: 0 }), "{runs:?}");
+        assert!(runs.contains(&GenRun::Column { key: split, lo: 2, hi: 2 }), "{runs:?}");
         assert!(
-            runs.contains(&(split, 1, 1)),
+            runs.contains(&GenRun::Open { coord: Coord::new(0, 1, 0) }),
             "the Open layer is its own run: {runs:?}"
         );
-        assert!(!runs.contains(&(split, 0, 2)), "Open in the gap splits the PosY run");
         assert!(
-            runs.contains(&(ColumnKey { face: Face::PosY, a: 0, b: 0 }, 3, 3)),
+            !runs.contains(&GenRun::Column { key: split, lo: 0, hi: 2 }),
+            "Open in the gap splits the PosY run"
+        );
+        assert!(
+            runs.contains(&GenRun::Open { coord: Coord::new(0, 3, 0) }),
             "Open chunks that share xz are not merged"
         );
         let posx = ColumnKey { face: Face::PosX, a: -1, b: 0 };
         assert!(
-            runs.contains(&(posx, 4, 6)),
+            runs.contains(&GenRun::Column { key: posx, lo: 4, hi: 6 }),
             "a same-sky gap along +X merges: {runs:?}"
         );
 
@@ -4599,13 +4769,41 @@ mod tests {
         let slab_runs = gather_column_runs(slab, sky, |c| c.y == 1, |_| false, true, false);
         assert_eq!(
             slab_runs,
-            vec![(ColumnKey { face: Face::PosY, a: 2, b: 3 }, 0, 2)],
+            vec![GenRun::Column { key: ColumnKey { face: Face::PosY, a: 2, b: 3 }, lo: 0, hi: 2 }],
             "a slab span includes the loaded middle"
         );
 
         let gapped = [Coord::new(2, 0, 4), Coord::new(2, 2, 4)];
         let gapped_runs = gather_column_runs(gapped, sky, |_| false, |_| false, true, false);
         let gk = ColumnKey { face: Face::PosY, a: 2, b: 4 };
-        assert_eq!(gapped_runs, vec![(gk, 0, 0), (gk, 2, 2)]);
+        assert_eq!(
+            gapped_runs,
+            vec![
+                GenRun::Column { key: gk, lo: 0, hi: 0 },
+                GenRun::Column { key: gk, lo: 2, hi: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn open_fail_key_does_not_collide_with_a_pos_y_column() {
+        let coord = Coord::new(3, 1, 4);
+        let open = FailKey::Open { coord };
+        let column = FailKey::Column {
+            key: ColumnKey { face: Face::PosY, a: coord.x, b: coord.z },
+        };
+        assert_ne!(open, column);
+        let mut set = FastSet::default();
+        set.insert(column);
+        assert!(!set.contains(&open));
+        let runs = gather_column_runs(
+            [coord],
+            |_| Sky::Open,
+            |_| false,
+            |k| k == column,
+            false,
+            true,
+        );
+        assert_eq!(runs, vec![GenRun::Open { coord }]);
     }
 }

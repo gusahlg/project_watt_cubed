@@ -1,11 +1,13 @@
-//! Ring-bucketed seed set: nearest chess-ring first, far keys unvisited.
+//! Ring-bucketed seed set: nearest streaming-order first, far keys unvisited.
 //!
 //! Admission only needs the nearest few dozen READY seeds, but a flat set
 //! forced every pass to `ready()`-probe the whole worklist. Keys live in
-//! buckets of [`World::order`] (chess distance, vertical ×2) around the
-//! streaming centre; a pass walks nearest-first and stops once it has enough
-//! ready work. Far buckets stay put — their re-seed events still fire.
-//! Recentre is O(n), once per boundary cross.
+//! buckets of [`World::order`] around the streaming centre (the centre's up
+//! face; +Y weights that axis ×2). A pass walks nearest-first and stops once
+//! it has enough ready work. Far buckets stay put — their re-seed events
+//! still fire. Recentre is O(n), once per boundary cross or up-face change.
+
+use crate::coord::Face;
 
 use super::{Coord, FastSet, World};
 
@@ -13,6 +15,8 @@ use super::{Coord, FastSet, World};
 /// anything past the last bucket clamps there (outside the data box).
 pub struct RingWorklist {
     center: Coord,
+    /// Up face the buckets were built with. `None` is isotropic chess.
+    up: Option<Face>,
     buckets: Vec<FastSet<Coord>>,
     len: usize,
 }
@@ -22,6 +26,7 @@ impl RingWorklist {
         let rings = rings.max(1);
         Self {
             center,
+            up: Some(Face::PosY),
             buckets: (0..rings).map(|_| FastSet::default()).collect(),
             len: 0,
         }
@@ -90,21 +95,22 @@ impl RingWorklist {
         self.len = n;
     }
 
-    /// Re-bucket every key around `center`. Ring count is unchanged.
+    /// Re-bucket every key around `center`. Ring count and up face are unchanged.
     pub fn recenter(&mut self, center: Coord) {
-        self.fit(center, self.buckets.len());
+        self.fit(center, self.buckets.len(), self.up);
     }
 
-    /// Grow/shrink the ring count, re-bucketing if it moved.
+    /// Grow/shrink the ring count, re-bucketing if it moved. Up face unchanged.
     pub fn resize(&mut self, rings: usize) {
-        self.fit(self.center, rings);
+        self.fit(self.center, rings, self.up);
     }
 
-    /// Re-bucket around `center` into `rings` buckets (clamped to at least 1).
-    /// No-op when both already match, so a per-pass call is free at rest.
-    pub fn fit(&mut self, center: Coord, rings: usize) {
+    /// Re-bucket around `center` into `rings` buckets (clamped to at least 1)
+    /// for streaming up `up`. No-op when centre, count, and up already match,
+    /// so a per-pass call is free at rest.
+    pub fn fit(&mut self, center: Coord, rings: usize, up: Option<Face>) {
         let rings = rings.max(1);
-        if center == self.center && rings == self.buckets.len() {
+        if center == self.center && rings == self.buckets.len() && up == self.up {
             return;
         }
         let old = std::mem::replace(
@@ -112,6 +118,7 @@ impl RingWorklist {
             (0..rings).map(|_| FastSet::default()).collect(),
         );
         self.center = center;
+        self.up = up;
         self.len = 0;
         for set in old {
             for k in set {
@@ -134,7 +141,7 @@ impl RingWorklist {
 
     #[inline]
     fn index(&self, key: Coord) -> usize {
-        let o = World::order(key, self.center).max(0) as usize;
+        let o = World::order(key, self.center, self.up).max(0) as usize;
         o.min(self.buckets.len() - 1)
     }
 }
@@ -213,6 +220,16 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert!(!w.contains(&c(1, 0, 0)));
         assert!(w.contains(&c(0, 0, 0)));
+    }
+
+    #[test]
+    fn up_axis_reorders_buckets() {
+        let mut w = RingWorklist::new(c(0, 0, 0), 8);
+        w.fit(c(0, 0, 0), 8, Some(Face::PosX));
+        w.insert(c(2, 0, 0));
+        w.insert(c(0, 2, 0));
+        assert!(w.buckets[4].contains(&c(2, 0, 0)), "along +X is weighted ×2");
+        assert!(w.buckets[2].contains(&c(0, 2, 0)), "across +X is plain chess");
     }
 
     #[test]

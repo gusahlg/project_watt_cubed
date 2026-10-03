@@ -46,8 +46,9 @@ impl World {
         if horizontal != self.view.horizontal || vertical != self.view.vertical {
             let shrunk = horizontal < self.view.horizontal || vertical < self.view.vertical;
             self.view = super::ViewVolume::new(horizontal, vertical);
-            self.mesh_worklist.resize(self.view.worklist_rings());
-            self.light_worklist.resize(self.view.worklist_rings());
+            let rings = self.view.worklist_rings(self.live_up());
+            self.mesh_worklist.resize(rings);
+            self.light_worklist.resize(rings);
             // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
