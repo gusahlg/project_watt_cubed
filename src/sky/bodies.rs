@@ -144,13 +144,27 @@ fn radius_of(body: &Body) -> f64 {
     }
 }
 
+/// How far a round body's impostor sinks below its datum (under its valleys; moons' big craters
+/// go deeper): standing on the body, the sphere fills the horizon beyond the streamed chunks
+/// without covering them (the sky pass draws only where no terrain was drawn). Round bodies have no
+/// far LOD of their own yet; cubes do, so theirs hide while streamed.
+fn sink(body: &Body) -> Option<f64> {
+    match (body.kind, body.shape) {
+        (_, Shape::Cube { .. }) => None,
+        (Kind::Moon, _) => Some(650.0),
+        _ => Some(150.0),
+    }
+}
+
 /// One catalog body as seen from `eye`, or nothing while voxels cover it.
 fn impostor(body: &Body, eye: DVec3, twin_ordinal: u32) -> Option<FarBody> {
     let delta = body.centre_f() - eye;
     let dist = delta.length();
-    let radius = radius_of(body);
-    // On the body, or within the streaming shell above it, the mesh is the body.
-    if body.altitude(eye) < STREAM_ALTITUDE || !(dist > radius) || !dist.is_finite() {
+    let radius = radius_of(body) - sink(body).unwrap_or(0.0);
+    // A cube's own mesh is the body while it streams; a round body's sphere is drawn unless the eye
+    // is inside it.
+    let streamed = sink(body).is_none() && body.altitude(eye) < STREAM_ALTITUDE;
+    if streamed || !(dist > radius) || !dist.is_finite() {
         return None;
     }
     let n = delta / dist;
@@ -188,7 +202,7 @@ mod tests {
     use crate::world::terrain::Terrain;
 
     fn radius_f(body: &Body) -> f32 {
-        radius_of(body) as f32
+        (radius_of(body) - sink(body).unwrap_or(0.0)) as f32
     }
 
     fn find<'a>(list: &'a [FarBody], body: &Body) -> Option<&'a FarBody> {
@@ -196,10 +210,14 @@ mod tests {
             .find(|far| far.seed == body.seed && (far.radius - radius_f(body)).abs() < 4.0)
     }
 
-    /// Independent of `impostor`: altitude and outside-the-solid, in f64.
+    /// Independent of `impostor`: cubes by altitude and outside-the-solid, round bodies outside
+    /// their sunk sphere, in f64.
     fn expect_visible(body: &Body, eye: DVec3) -> bool {
         let dist = (body.centre_f() - eye).length();
-        body.altitude(eye) >= STREAM_ALTITUDE && dist > radius_of(body)
+        match body.shape {
+            Shape::Cube { .. } => body.altitude(eye) >= STREAM_ALTITUDE && dist > radius_of(body),
+            _ => dist > radius_of(body) - sink(body).unwrap(),
+        }
     }
 
     fn finite_unit(far: &FarBody) {

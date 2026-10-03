@@ -259,6 +259,9 @@ impl World {
             loaded.rev = loaded.rev.wrapping_add(1);
             loaded.retire(MeshState::needs_mesh(), eng);
         }
+        for (_, cage) in self.cages.drain() {
+            eng.free_cage(cage);
+        }
         self.building_meshes = 0;
         // Every chunk is now `NeedsMesh`, so the `Dirty` fiber is empty; drop
         // the membership set and the stale hint with it.

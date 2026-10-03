@@ -655,6 +655,26 @@ impl World {
         b.coords().filter_map(move |v| fold.unfold(v))
     }
 
+    /// Upload placement of chunk `coord`'s meshes: a storage chunk of a round world is drawn bent
+    /// through its chart cage (made once per loaded chunk; corners relative to an anchor block, so
+    /// they stay precise in `f32`), every other chunk at its integer origin.
+    fn placement_of(&mut self, coord: Coord, eng: &mut Engine) -> voxel_engine::MeshPlacement {
+        if let Some(&cage) = self.cages.get(&coord) {
+            return voxel_engine::MeshPlacement::caged(cage, crate::ident::Detail::FULL);
+        }
+        let Some(corners) = self.seams.cage(coord) else { return chunk_placement(coord) };
+        let a = corners[0].floor();
+        let anchor = voxel_engine::IVec3::new(a.x as i32, a.y as i32, a.z as i32);
+        let rel = corners.map(|c| (c - a).as_vec3());
+        match eng.create_cage(anchor, rel) {
+            Some(cage) => {
+                self.cages.insert(coord, cage);
+                voxel_engine::MeshPlacement::caged(cage, crate::ident::Detail::FULL)
+            }
+            None => chunk_placement(coord),
+        }
+    }
+
     /// The point streaming stands on: the eye's storage position on (or above) a round world's
     /// chart, else the eye itself.
     pub(in crate::world) fn stream_eye(&self, eye: DVec3) -> DVec3 {
@@ -1378,7 +1398,7 @@ impl World {
                 self.upload_chunk(coord, &data, None, eng);
             }
             pipeline::MeshPayload::Staged(mut staged) => {
-                let placement = chunk_placement(coord);
+                let placement = self.placement_of(coord, eng);
                 let handles = ByPass::from_fn(|p| {
                     staged.passes[p].take().and_then(|pass| {
                         eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement)
@@ -1402,8 +1422,8 @@ impl World {
             return;
         }
         if let Some((data, eng)) = gpu {
-            let handles =
-                ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], chunk_placement(coord)));
+            let placement = self.placement_of(coord, eng);
+            let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement));
             self.install_chunk_handles(coord, handles, hash, eng);
             return;
         }
@@ -2163,6 +2183,9 @@ impl World {
             if let Some(loaded) = self.chunks.remove(&coord) {
                 super::adjust_count(&mut self.building_meshes, loaded.state.is_building(), false);
                 loaded.state.free_owned(eng);
+            }
+            if let Some(cage) = self.cages.remove(&coord) {
+                eng.free_cage(cage);
             }
             self.dirty_worklist.remove(&coord);
             self.light_terminal.remove(&coord);

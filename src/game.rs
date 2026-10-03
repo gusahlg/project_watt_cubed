@@ -1736,11 +1736,13 @@ impl Game {
         }
     }
 
-    /// Altitude above the local surface datum. The `+Y` face datum is `y = 0`
-    /// near spawn, so this is the eye's world `y` until a later task swaps in
-    /// the cosmos body altitude.
+    /// Altitude above the datum of the nearest body (the sky fades to space with it); far from every
+    /// body, effectively infinite. A flat world's datum is `y = 0`.
     pub fn sky_altitude(&self, eye: DVec3) -> f64 {
-        eye.y
+        match self.world.terrain().cosmos() {
+            Some(cosmos) => cosmos.body_at(eye).map_or(1.0e9, |b| b.altitude(eye)),
+            None => eye.y,
+        }
     }
 }
 
@@ -1818,10 +1820,25 @@ mod tests {
     }
 
     #[test]
-    fn sky_altitude_is_the_eye_y_on_the_plus_y_datum() {
+    fn sky_altitude_is_above_the_nearest_body() {
         let world = World::with_config_lazy(1, RenderConfig::default());
         let game = Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "alt".into());
+        // A flat world's datum is y = 0.
         assert_eq!(game.sky_altitude(DVec3::new(12.0, 40.0, -3.0)), 40.0);
+        let world = World::with_kind(1, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, false);
+        let game = Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "alt".into());
+        // So is the home cube's +Y face.
+        assert_eq!(game.sky_altitude(DVec3::new(12.0, 40.0, -3.0)), 40.0);
+        let cosmos = game.world.terrain().cosmos().expect("a cosmos");
+        let verdance = cosmos
+            .bodies()
+            .iter()
+            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Verdant)
+            .expect("Verdance");
+        let crate::world::terrain::cosmos::Shape::Ball { r } = verdance.shape else { panic!("round") };
+        let above = verdance.centre_f() + DVec3::new(0.0, 0.0, r as f64 + 300.0);
+        assert!((game.sky_altitude(above) - 300.0).abs() < 1e-6, "over Verdance");
+        assert!(game.sky_altitude(DVec3::new(9.0e8, 9.0e8, 9.0e8)) > 1.0e8, "deep space");
     }
 
     #[test]

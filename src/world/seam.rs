@@ -119,6 +119,13 @@ impl Seams {
         self.region_of(c).is_some()
     }
 
+    /// The eight physical corners of storage chunk `c` (a chunk inside a box): the cage its mesh
+    /// is drawn through. `None` for physical chunks.
+    pub fn cage(&self, c: Coord) -> Option<[glam::DVec3; 8]> {
+        let r = self.region_of(c)?;
+        self.atlases[r.atlas].chunk_cage([c.x as i64 * CS, c.y as i64 * CS, c.z as i64 * CS])
+    }
+
     /// Whether `c` is a storage-region chunk outside every box but within a chunk of one (its cells
     /// may read through the glue).
     #[inline]

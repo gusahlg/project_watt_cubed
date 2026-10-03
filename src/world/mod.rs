@@ -954,6 +954,8 @@ pub struct World {
     seams: seam::Seams,
     /// The charts around the streaming centre unfolded into one net (identity off round worlds).
     fold: seam::Unfold,
+    /// The engine cage each loaded storage chunk's meshes are drawn through (freed on unload).
+    cages: FastMap<Coord, voxel_engine::CageHandle>,
     kind: WorldgenKind,
     terrain_cfg: terrain::TerrainCfg,
     chunks: FastMap<Coord, Loaded>,
@@ -1352,6 +1354,7 @@ impl World {
             gravity,
             seams,
             fold: seam::Unfold::IDENTITY,
+            cages: FastMap::default(),
             generator,
             kind,
             terrain_cfg: cfg,
