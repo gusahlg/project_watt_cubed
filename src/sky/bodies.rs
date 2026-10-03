@@ -14,7 +14,7 @@ const STREAM_ALTITUDE: f64 = 20_000.0;
 /// The inner wall sits this far into the shell, behind the inward-hanging terrain.
 const WALL_BEHIND: f32 = 150.0;
 /// Warm orange of the core light, before the distance scale (`inner / distance`).
-const CORE_ORANGE: [f32; 3] = [1.15, 0.40, 0.07];
+const CORE_ORANGE: [f32; 3] = [1.35, 0.86, 0.46];
 /// The Ember's rim inside the cavity, so the core reads as the light.
 const CORE_GLOW: f32 = 5.0;
 
