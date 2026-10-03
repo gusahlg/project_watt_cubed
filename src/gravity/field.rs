@@ -87,11 +87,6 @@ impl Field {
         }
     }
 
-    /// The source epoch: bumps with every committed amount change.
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
     /// The acceleration at `p` (the potential of distant summarised groups is left out: what motion
     /// needs, at the lowest cost).
     pub fn sample(&self, p: DVec3) -> Sample {
@@ -101,11 +96,6 @@ impl Field {
     /// The full field at `p`: acceleration, the complete potential and the tidal tensor.
     pub fn sample_tidal(&self, p: DVec3) -> Sample {
         self.query(p, THETA, true, true)
-    }
-
-    /// The field at `p` with an explicit opening angle.
-    pub fn sample_with(&self, p: DVec3, theta: f64, tidal: bool) -> Sample {
-        self.query(p, theta, tidal, tidal)
     }
 
     fn query(&self, p: DVec3, theta: f64, tidal: bool, potential_wanted: bool) -> Sample {

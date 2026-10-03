@@ -225,6 +225,18 @@ impl Seams {
         true
     }
 
+    /// The physical cell holding storage cell `cell` (the cell of its centre's embedding), for
+    /// anything that must act where the matter really is — the gravity ledger. `None` for physical
+    /// cells and storage outside every box.
+    pub fn physical_cell(&self, cell: BlockCoord) -> Option<(i32, i32, i32)> {
+        let c = Coord::new(cell.x.div_euclid(CS as i32), cell.y.div_euclid(CS as i32), cell.z.div_euclid(CS as i32));
+        let r = self.region_of(c)?;
+        let atlas = &self.atlases[r.atlas];
+        let (patch, l) = atlas.locate([cell.x as i64, cell.y as i64, cell.z as i64])?;
+        let p = atlas.embed(patch, glam::DVec3::new(l[0] as f64 + 0.5, l[1] as f64 + 0.5, l[2] as f64 + 0.5));
+        Some((p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32))
+    }
+
     /// For a storage cell just outside every box (within the atlas glue reach of one), the cell of
     /// the neighbouring patch at the same physical point. `None` for physical cells, cells inside a
     /// box and cells beyond the glue (open space around a body's storage).

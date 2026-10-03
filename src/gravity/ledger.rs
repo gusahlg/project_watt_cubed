@@ -136,11 +136,6 @@ impl Ledger {
         self.chunks.is_empty()
     }
 
-    /// Total absolute correction (amount).
-    pub fn abs_mass(&self) -> i64 {
-        self.regions.values().map(|r| r.abs).sum()
-    }
-
     /// Field of every correction at `p`, per unit `G`: `(accel, potential, error)`.
     pub fn field(&self, p: DVec3) -> (DVec3, f64, f64) {
         let (mut acc, mut phi, mut err) = (DVec3::ZERO, 0.0, 0.0);

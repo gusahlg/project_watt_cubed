@@ -2780,3 +2780,20 @@ fn light_crosses_a_seam() {
     assert_eq!(world.block_at(beyond.0, beyond.1, beyond.2), AIR, "the carved cell across the seam");
     assert_ne!(world.block_at(beyond.0, beyond.1 + 2, beyond.2), AIR, "rock across the seam");
 }
+
+/// Mining a storage cell moves gravity where the chart embeds the cell, not at its storage address.
+#[test]
+fn storage_edits_weigh_where_the_matter_is() {
+    let (mut world, c) = storage_ball_world(40);
+    world.ensure_data(c);
+    let cell = crate::coord::BlockCoord::new(c.x * 16 + 3, c.y * 16 + 3, c.z * 16 + 3);
+    let physical = world.seams.physical_cell(cell).expect("a box cell");
+    let p = |(x, y, z): (i32, i32, i32)| DVec3::new(x as f64 + 0.5, y as f64 + 2.5, z as f64 + 0.5);
+    let storage = p((cell.x, cell.y, cell.z));
+    let (before_near, before_storage) = (world.gravity_at(p(physical)).accel, world.gravity_at(storage).accel);
+    assert_ne!(world.block_at(cell.x, cell.y, cell.z), AIR);
+    world.set_block(cell.x, cell.y, cell.z, AIR);
+    let (after_near, after_storage) = (world.gravity_at(p(physical)).accel, world.gravity_at(storage).accel);
+    assert!((after_near - before_near).length() > 0.0, "the hole changes the pull beside it");
+    assert_eq!(after_storage, before_storage, "nothing happens at the storage address");
+}

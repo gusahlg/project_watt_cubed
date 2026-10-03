@@ -311,7 +311,9 @@ impl World {
         // Gravity follows the matter: the cell's amount changes from what was really there (the
         // overlay, else generation — never `previous`, which reads unloaded chunks as air).
         let delta = self.registry.amount(id) as i32 - self.registry.amount(old_edit.unwrap_or(generated)) as i32;
-        self.gravity.record((x, y, z), delta);
+        // A storage cell's matter sits where its chart embeds it.
+        let at = self.seams.physical_cell(BlockCoord::new(x, y, z)).unwrap_or((x, y, z));
+        self.gravity.record(at, delta);
         let new_edit = if id == generated {
             if let Some(cells) = self.edits.get_mut(&coord) {
                 cells.remove(&index);
