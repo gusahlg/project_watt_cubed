@@ -215,6 +215,72 @@ pub fn smoothstep(a: f32, b: f32, t: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
+/// Feature points stay in `[0.3, 0.7)` of their cell, so anything nearer than this
+/// (squared, lattice units) cannot lie outside the 3×3×3 around the query.
+const CELL_INNER: f64 = 1.29 * 1.29;
+
+/// 3-D cellular noise at `p` in lattice units. `(F1, F2, id1, id2)` are the distances to the
+/// nearest and second-nearest feature points and the ids of the cells that own them.
+/// Feature points sit in the inner 40 % of each cell, so the nearest is always inside the
+/// 3×3×3; the ring one cell further out is searched only when the second-nearest might be there.
+pub fn cellular3(seed: u32, p: [f64; 3]) -> (f32, f32, u32, u32) {
+    let (ix, iy, iz) = (floor_i(p[0]), floor_i(p[1]), floor_i(p[2]));
+    let (mut best, mut second) = (Cand::NONE, Cand::NONE);
+    // `-1` skips nothing: the centre cell is a candidate.
+    search(seed, p, ix, iy, iz, 1, -1, &mut best, &mut second);
+    if second.d2 > CELL_INNER {
+        search(seed, p, ix, iy, iz, 2, 1, &mut best, &mut second);
+    }
+    (best.d2.sqrt() as f32, second.d2.sqrt() as f32, best.id, second.id)
+}
+
+#[derive(Clone, Copy)]
+struct Cand {
+    d2: f64,
+    id: u32,
+}
+
+impl Cand {
+    const NONE: Self = Self { d2: f64::MAX, id: u32::MAX };
+    fn nearer(self, d2: f64, id: u32) -> bool {
+        d2 < self.d2 || (d2 == self.d2 && id < self.id)
+    }
+}
+
+fn floor_i(p: f64) -> i32 {
+    p.floor() as i64 as i32
+}
+
+fn search(seed: u32, p: [f64; 3], ix: i32, iy: i32, iz: i32, reach: i32, inner: i32, best: &mut Cand, second: &mut Cand) {
+    for dz in -reach..=reach {
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                if dx.abs() <= inner && dy.abs() <= inner && dz.abs() <= inner {
+                    continue;
+                }
+                let (x, y, z) = (ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz));
+                let id = hash3(seed ^ 0xCE11_1D00, x, y, z);
+                let feat = feature(seed, x, y, z);
+                let (ax, ay, az) = (feat[0] - p[0], feat[1] - p[1], feat[2] - p[2]);
+                let d2 = ax * ax + ay * ay + az * az;
+                if best.nearer(d2, id) {
+                    *second = *best;
+                    *best = Cand { d2, id };
+                } else if id != best.id && second.nearer(d2, id) {
+                    *second = Cand { d2, id };
+                }
+            }
+        }
+    }
+}
+
+/// Jittered feature point of one lattice cell, in lattice units. The jitter stays inside
+/// `[0.3, 0.7)`, which is what makes the 3×3×3 search exact for the nearest point.
+fn feature(seed: u32, x: i32, y: i32, z: i32) -> [f64; 3] {
+    let j = |salt: u32| f64::from(0.3 + 0.4 * unit(hash3(seed ^ salt, x, y, z)));
+    [f64::from(x) + j(0xA11C_E001), f64::from(y) + j(0xB011_D002), f64::from(z) + j(0xC0DE_D003)]
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -255,6 +321,60 @@ mod tests {
             assert!(eroded2(1, c, c, 6).is_finite());
             assert!(ridged2(1, c, -c, 5).is_finite());
             assert!(perlin3(1, c, 10.0, c).is_finite());
+            let (f1, f2, _, _) = cellular3(1, [c / 5_000.0, 0.4, -c / 5_000.0]);
+            assert!(f1.is_finite() && f2.is_finite() && f1 <= f2 + 1e-4);
+        }
+    }
+
+    #[test]
+    fn cellular_is_ordered_deterministic_and_continuous() {
+        let mut differed = false;
+        for i in 0..800 {
+            let p = [i as f64 * 0.173 - 40.0, i as f64 * 0.047 + 2.2, i as f64 * -0.091 - 7.0];
+            let (f1, f2, a, b) = cellular3(11, p);
+            assert!(f1 >= 0.0 && f1 <= f2 + 1e-5, "{f1} {f2}");
+            assert_eq!((f1, f2, a, b), cellular3(11, p));
+            differed |= a != b;
+            let (g1, _, _, _) = cellular3(11, [p[0] + 1.0e-3, p[1], p[2]]);
+            assert!((g1 - f1).abs() < 2.0e-3, "F1 lipschitz {f1} vs {g1}");
+        }
+        assert!(differed, "nearest and second share an id everywhere");
+    }
+
+    /// The bounded search agrees with an exhaustive ±3 walk (the proof's neighbourhood).
+    #[test]
+    fn cellular_matches_a_wide_walk() {
+        fn wide(seed: u32, p: [f64; 3]) -> (f64, f64, u32, u32) {
+            let (ix, iy, iz) = (super::floor_i(p[0]), super::floor_i(p[1]), super::floor_i(p[2]));
+            let mut best = (f64::MAX, u32::MAX);
+            let mut second = (f64::MAX, u32::MAX);
+            for dz in -3..=3 {
+                for dy in -3..=3 {
+                    for dx in -3..=3 {
+                        let (x, y, z) = (ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz));
+                        let id = hash3(seed ^ 0xCE11_1D00, x, y, z);
+                        let f = super::feature(seed, x, y, z);
+                        let (ax, ay, az) = (f[0] - p[0], f[1] - p[1], f[2] - p[2]);
+                        let d2 = ax * ax + ay * ay + az * az;
+                        let nearer = |cur: (f64, u32)| d2 < cur.0 || (d2 == cur.0 && id < cur.1);
+                        if nearer(best) {
+                            second = best;
+                            best = (d2, id);
+                        } else if id != best.1 && nearer(second) {
+                            second = (d2, id);
+                        }
+                    }
+                }
+            }
+            (best.0.sqrt(), second.0.sqrt(), best.1, second.1)
+        }
+        for i in 0..200 {
+            let p = [i as f64 * 0.31 - 8.0, i as f64 * -0.17 + 3.3, i as f64 * 0.09 - 1.0];
+            let (f1, f2, a, b) = cellular3(3, p);
+            let (g1, g2, c, d) = wide(3, p);
+            assert_eq!(a, c, "id1 at {p:?}");
+            assert_eq!(b, d, "id2 at {p:?}");
+            assert!((f64::from(f1) - g1).abs() < 1e-4 && (f64::from(f2) - g2).abs() < 1e-4);
         }
     }
 }

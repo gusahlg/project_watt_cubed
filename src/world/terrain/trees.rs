@@ -1,10 +1,11 @@
-//! Trees: one candidate per 7 m cell, kept by the biome's density on gentle ground. Broadleaf
+//! Trees: one candidate per 7 m cell, kept by the theme's density on gentle ground. Broadleaf
 //! (green, autumn or blossom crowns on timber) and conifers (stacked pine tiers).
 
 use std::sync::Arc;
 
 use super::noise::{hash2, unit};
-use super::shape::{Biome, Shape};
+use super::province::Species;
+use super::shape::Shape;
 use super::Materials;
 use crate::block::registry::BlockId;
 
@@ -49,16 +50,14 @@ impl Trees {
             return None;
         }
         let m = &self.m;
-        let (density, kind) = match col.biome {
-            Biome::Forest => (0.8, if col.height > 150 || h & 3 == 0 { Kind::Conifer } else { Kind::Broad { crown: m.leaves } }),
-            Biome::Autumn => (0.7, if h & 7 == 0 { Kind::Broad { crown: m.leaves } } else { Kind::Broad { crown: m.autumn } }),
-            Biome::Cherry => (0.45, Kind::Broad { crown: m.blossom }),
-            Biome::Plains => (0.07, Kind::Broad { crown: m.leaves }),
-            Biome::Alpine => (0.22, Kind::Conifer),
-            Biome::Snow => (0.04, Kind::Conifer),
-            Biome::Desert | Biome::Mesa => (0.0, Kind::Conifer),
+        let kind = match col.species {
+            Species::None => return None,
+            Species::Broadleaf => Kind::Broad { crown: m.leaves },
+            Species::Conifer => Kind::Conifer,
+            Species::Autumn => Kind::Broad { crown: m.autumn },
+            Species::Blossom => Kind::Broad { crown: m.blossom },
         };
-        if roll >= density {
+        if roll >= col.trees {
             return None;
         }
         let (trunk, radius) = match kind {

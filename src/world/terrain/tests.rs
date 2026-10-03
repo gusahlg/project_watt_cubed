@@ -521,3 +521,182 @@ fn landmarks() {
         println!("{:?} {} centre {:?} {:?}", b.kind, b.id, b.centre, b.shape);
     }
 }
+
+#[test]
+fn home_spawn_is_a_temperate_meadow_and_the_twins_differ() {
+    let (_reg, t) = make(42);
+    let home = t.cosmos.home();
+    let expect = [
+        (Face::PosY, province::Realm::Green),
+        (Face::NegY, province::Realm::Ashen),
+        (Face::PosX, province::Realm::Dune),
+        (Face::NegX, province::Realm::Shattered),
+        (Face::PosZ, province::Realm::Glass),
+        (Face::NegZ, province::Realm::Fungal),
+    ];
+    for (face, realm) in expect {
+        assert_eq!(t.paint(home, face).shape.realm(), realm, "{face:?}");
+    }
+    let here = t.paint(home, Face::PosY).shape.place(0, 0);
+    assert_eq!(here.theme, province::ThemeId::Meadow);
+    assert!(here.temp > 0.35 && here.temp < 0.98, "temp {}", here.temp);
+    let mut themes = Vec::new();
+    for z in -15..=15 {
+        for x in -15..=15 {
+            let (dx, dz) = (x * 200, z * 200);
+            if i64::from(dx) * i64::from(dx) + i64::from(dz) * i64::from(dz) > 3_000 * 3_000 {
+                continue;
+            }
+            let theme = t.paint(home, Face::PosY).shape.place(dx, dz).theme;
+            if !themes.contains(&theme) {
+                themes.push(theme);
+            }
+        }
+    }
+    assert!(themes.len() >= 3, "themes within 3 km: {themes:?}");
+
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    assert_eq!(twins.len(), 2);
+    let mut realms = Vec::new();
+    for b in &twins {
+        let realm = t.paint(b, Face::PosY).shape.realm();
+        for face in Face::ALL {
+            assert_eq!(t.paint(b, face).shape.realm(), realm, "twin {} {face:?}", b.id);
+        }
+        realms.push(realm);
+    }
+    realms.sort_by_key(|r| *r as u8);
+    assert_eq!(realms, vec![province::Realm::Lush, province::Realm::Crystal]);
+}
+
+#[test]
+fn batched_columns_match_the_single_column() {
+    let (_reg, t) = make(42);
+    let shape = &t.paints[Face::PosY.index()].as_ref().expect("+Y").shape;
+    for (u0, v0) in [(0, 0), (-80, 64)] {
+        let cols = shape.columns_16(u0, v0);
+        for lv in 0..16 {
+            for lu in 0..16 {
+                let (u, v) = (u0 + lu, v0 + lv);
+                let one = shape.column(u, v);
+                let got = &cols[lu as usize + lv as usize * 16];
+                assert_eq!(got.height, one.height, "({u},{v})");
+                assert_eq!(got.slope4, one.slope4, "({u},{v})");
+                assert_eq!(got.surface, one.surface, "({u},{v})");
+                assert_eq!(got.sub, one.sub, "({u},{v})");
+                assert_eq!(got.theme, one.theme, "({u},{v})");
+                assert_eq!(got.species, one.species, "({u},{v})");
+                assert_eq!(got.flower, one.flower, "({u},{v})");
+                assert_eq!(got.flowers.to_bits(), one.flowers.to_bits(), "({u},{v})");
+                assert_eq!(got.trees.to_bits(), one.trees.to_bits(), "({u},{v})");
+            }
+        }
+    }
+}
+
+#[test]
+fn flowers_sit_on_the_meadow() {
+    let (_reg, t) = make(42);
+    let shape = &t.paints[Face::PosY.index()].as_ref().expect("+Y").shape;
+    let m = t.materials();
+    let mut n = 0;
+    let mut checked = false;
+    for z in (-48..48).step_by(2) {
+        for x in (-48..48).step_by(2) {
+            let col = shape.column(x, z);
+            let Some(id) = shape.flower_at(&col, x, z) else { continue };
+            n += 1;
+            assert!(
+                id == m.flower_red || id == m.flower_yellow || id == m.flower_blue || id == m.flower_white,
+                "flower {id:?}"
+            );
+            if !checked && t.voxel_at(x, col.height, z) == id {
+                checked = true;
+            }
+        }
+    }
+    assert!(n > 0, "no flowers within 48 m of spawn");
+    assert!(checked, "every flower sat under a tree");
+}
+
+/// Face window for tuning. `WATT_MAP_SEED` (i64), `WATT_MAP_FACE` (py/ny/px/nx/pz/nz),
+/// `WATT_MAP_SIZE` (pixels, 8..=768), `WATT_MAP_SCALE` (blocks per pixel), `WATT_MAP_U0`,
+/// `WATT_MAP_V0`. Writes height and province-colour PPM files under `CARGO_TARGET_DIR`.
+#[test]
+#[ignore]
+fn worldgen_map() {
+    fn env_i64(key: &str, default: i64) -> i64 {
+        std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    }
+    fn env_i32(key: &str, default: i32) -> i32 {
+        std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    }
+    let seed = env_i64("WATT_MAP_SEED", 42);
+    let face = match std::env::var("WATT_MAP_FACE").unwrap_or_else(|_| "py".into()).as_str() {
+        "ny" => Face::NegY,
+        "px" => Face::PosX,
+        "nx" => Face::NegX,
+        "pz" => Face::PosZ,
+        "nz" => Face::NegZ,
+        _ => Face::PosY,
+    };
+    let size = env_i32("WATT_MAP_SIZE", 192).clamp(8, 768);
+    let scale = env_i32("WATT_MAP_SCALE", 64).max(1);
+    let span = size.saturating_mul(scale);
+    let u0 = env_i32("WATT_MAP_U0", -span / 2);
+    let v0 = env_i32("WATT_MAP_V0", -span / 2);
+    let (_reg, t) = make(seed);
+    let shape = &t.paints[face.index()].as_ref().expect("home face").shape;
+    let mut height = vec![0u8; (size as usize) * (size as usize) * 3];
+    let mut province_px = vec![0u8; height.len()];
+    let mut lo = i32::MAX;
+    let mut hi = i32::MIN;
+    for row in 0..size {
+        for col in 0..size {
+            let u = u0.saturating_add(col.saturating_mul(scale));
+            let v = v0.saturating_add(row.saturating_mul(scale));
+            let sample = shape.column(u, v);
+            let h = sample.height;
+            lo = lo.min(h);
+            hi = hi.max(h);
+            let rgb = hypo(h);
+            let i = ((row as usize) * (size as usize) + col as usize) * 3;
+            height[i..i + 3].copy_from_slice(&rgb);
+            province_px[i..i + 3].copy_from_slice(&province::theme_rgb(sample.theme));
+        }
+    }
+    let tag = match face {
+        Face::PosY => "py",
+        Face::NegY => "ny",
+        Face::PosX => "px",
+        Face::NegX => "nx",
+        Face::PosZ => "pz",
+        Face::NegZ => "nz",
+    };
+    let dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
+    let stem = format!("{dir}/worldgen-map-{seed}-{tag}");
+    write_ppm(&format!("{stem}.ppm"), size, &height);
+    write_ppm(&format!("{stem}-province.ppm"), size, &province_px);
+    println!("worldgen_map {stem}.ppm height {lo}..={hi} ({size}px, {scale} blocks)");
+}
+
+fn hypo(h: i32) -> [u8; 3] {
+    let t = ((h - MIN_GROUND) as f32 / (MAX_GROUND - MIN_GROUND) as f32).clamp(0.0, 1.0);
+    if t < 0.35 {
+        let u = t / 0.35;
+        [(40.0 + 50.0 * u) as u8, (110.0 + 70.0 * u) as u8, (150.0 - 70.0 * u) as u8]
+    } else if t < 0.72 {
+        let u = (t - 0.35) / 0.37;
+        [(90.0 + 70.0 * u) as u8, (170.0 - 50.0 * u) as u8, (70.0 - 20.0 * u) as u8]
+    } else {
+        let u = (t - 0.72) / 0.28;
+        [(160.0 + 90.0 * u) as u8, (120.0 + 120.0 * u) as u8, (60.0 + 180.0 * u) as u8]
+    }
+}
+
+fn write_ppm(path: &str, n: i32, rgb: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).expect(path);
+    write!(f, "P6\n{n} {n}\n255\n").unwrap();
+    f.write_all(rgb).unwrap();
+}

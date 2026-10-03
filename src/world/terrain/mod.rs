@@ -3,7 +3,8 @@
 //! The [`cosmos`] lists every body. A cell belongs to the one body that reaches it, or it is air.
 //! Cube bodies (the start world and the twins) are six faces: today's terrain — shape, caves,
 //! mines, veins, trees — runs in face-local coordinates, with one salt per face except the home
-//! +Y face, which keeps the v3 salts. Below the crust the bulk is a coarse mix whose mean amount
+//! +Y face, which keeps the v3 salts. Provinces theme every column: a realm per face, regions
+//! and provinces on the shared surface point. Below the crust the bulk is a coarse mix whose mean amount
 //! is [`cosmos::BULK_DENSITY`]. Round bodies live on curved charts in storage ([`storage`]): storage
 //! coordinates answer from their painters, and physical space holds none of their cells. Empty
 //! space classifies as air and is never sampled.
@@ -15,6 +16,7 @@ pub mod cosmos;
 pub mod noise;
 pub mod palette;
 mod cube;
+mod province;
 pub mod round;
 mod shape;
 pub mod storage;
@@ -39,7 +41,7 @@ use underground::{Grid, Underground};
 /// Folded into the content fingerprint and recorded in saves. History: 1-5 the classic and
 /// diffusion v1/v2 generators over authored and then emergent materials; 6 = InfiniteDiffusion v3
 /// over the selective-transfer palette (2026-10-02); 7 = the cube planet (2026-10-03): bodies from
-/// the cosmos, six faces, empty space. Home +Y outside the rim keeps the v3 salts.
+/// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field.
 pub const WORLDGEN_VERSION: u16 = 7;
 
 /// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
@@ -383,13 +385,20 @@ impl Terrain {
         let m = Arc::new(Materials::intern(registry));
         let cosmos = Arc::new(cosmos::Cosmos::new(s, cfg.space as f32 / 100.0));
         let relief = cfg.relief as f32 / 100.0;
+        let variety = cfg.variety as f32 / 100.0;
+        // The twin with the smaller seed is lush; the other is crystalline. One twin keeps lush.
+        let lush = cosmos
+            .bodies()
+            .iter()
+            .filter(|b| b.kind == cosmos::Kind::Twin)
+            .min_by_key(|b| (b.seed, b.id))
+            .map(|b| b.id);
         let n = cosmos.bodies().iter().map(|b| b.id as usize).max().unwrap_or(0) + 1;
         let mut paints = Vec::new();
         paints.resize_with(n * 6, || None);
         for b in cosmos.bodies() {
-            if !matches!(b.shape, cosmos::Shape::Cube { .. }) {
-                continue;
-            }
+            let cosmos::Shape::Cube { half } = b.shape else { continue };
+            let twin = b.kind == cosmos::Kind::Twin;
             for face in Face::ALL {
                 // Home +Y keeps the v3 salts. Every other face is a fresh field.
                 let s_face = if b.kind == cosmos::Kind::Home && face == Face::PosY {
@@ -397,9 +406,15 @@ impl Terrain {
                 } else {
                     hash3(s ^ 0x5A17, i32::from(b.id), face.index() as i32, 0x6A1E)
                 };
+                let realm = if twin {
+                    if Some(b.id) == lush { province::Realm::Lush } else { province::Realm::Crystal }
+                } else {
+                    province::Realm::of_home(face)
+                };
+                let garden = b.kind == cosmos::Kind::Home && face == Face::PosY;
                 let i = b.id as usize * 6 + face.index();
                 paints[i] = Some(FacePaint {
-                    shape: Shape::new(s_face, relief, m.clone()),
+                    shape: Shape::new(s_face, relief, m.clone(), face, half, realm, b.seed, variety, garden),
                     under: Underground::new(s_face ^ 0x0BAD_CAFE, cfg, m.clone()),
                     trees: Trees::new(s_face ^ 0x7EE5_0000, m.clone()),
                 });
@@ -495,7 +510,15 @@ impl Terrain {
         let mut col = paint.shape.column(u, v);
         col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
         if h >= col.height {
-            return paint.trees.block_at(&paint.shape, u, h, v).unwrap_or(AIR);
+            if let Some(id) = paint.trees.block_at(&paint.shape, u, h, v) {
+                return id;
+            }
+            if h == col.height {
+                if let Some(id) = paint.shape.flower_at(&col, u, v) {
+                    return id;
+                }
+            }
+            return AIR;
         }
         if col.height - h > cube::CRUST {
             return cube::bulk_id(&self.bulk, body, rel);
@@ -746,6 +769,23 @@ impl Terrain {
                 cells[i] = id;
             }
         }
+        // A flower is one block on the ground cell. A tree already in that cell stays.
+        for lv in 0..CHUNK_SIZE {
+            for lu in 0..CHUNK_SIZE {
+                let col = &cols[lu + lv * CHUNK_SIZE];
+                let la = col.height - h0;
+                if !(0..n).contains(&la) {
+                    continue;
+                }
+                let (u, v) = (u0 + lu as i32, v0 + lv as i32);
+                let Some(id) = paint.shape.flower_at(col, u, v) else { continue };
+                let (lx, ly, lz) = frame.index_to_world(lu, la as usize, lv);
+                let i = Chunk::index(lx, ly, lz);
+                if cells[i] == AIR {
+                    cells[i] = id;
+                }
+            }
+        }
         ChunkData::from_cells(cells)
     }
 
@@ -764,20 +804,20 @@ impl Terrain {
         let paint = self.paint(body, face);
         let seed = cube::rim_seed(body);
         let n_dot = cube::normal_dot(body.centre, face);
+        let raw = paint.shape.columns_16(u0, v0);
         let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         let mut cols = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
         let mut max_terrain = i32::MIN;
         let mut min_h = i32::MAX;
-        for lv in 0..CHUNK_SIZE {
-            for lu in 0..CHUNK_SIZE {
-                let (ub, vb) = (i64::from(u0) + i64::from(lu as i32), i64::from(v0) + i64::from(lv as i32));
-                let mut col = paint.shape.column(ub as i32, vb as i32);
-                max_terrain = max_terrain.max(col.height);
-                col.height = cube::blend_height(col.height, seed, face, half, ub, vb);
-                min_h = min_h.min(col.height);
-                heights[lu + lv * CHUNK_SIZE] = cube::world_a(half, col.height, n_dot).unwrap_or(i32::MIN);
-                cols.push(col);
-            }
+        for (i, mut col) in raw.into_iter().enumerate() {
+            let lu = (i % CHUNK_SIZE) as i32;
+            let lv = (i / CHUNK_SIZE) as i32;
+            let (ub, vb) = (i64::from(u0) + i64::from(lu), i64::from(v0) + i64::from(lv));
+            max_terrain = max_terrain.max(col.height);
+            col.height = cube::blend_height(col.height, seed, face, half, ub, vb);
+            min_h = min_h.min(col.height);
+            heights[i] = cube::world_a(half, col.height, n_dot).unwrap_or(i32::MIN);
+            cols.push(col);
         }
         if range.is_empty() {
             return (Vec::new(), heights);
