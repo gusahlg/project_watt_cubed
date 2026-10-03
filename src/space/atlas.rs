@@ -40,6 +40,25 @@ pub enum Patch {
     Core,
 }
 
+/// A point's place in an atlas: its patch, continuous storage coordinates and the local Jacobian.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Local {
+    pub patch: Patch,
+    pub storage: DVec3,
+    /// `∂physical/∂storage` (columns: storage x, y, z in physical space).
+    pub jacobian: glam::DMat3,
+}
+
+impl Local {
+    /// The rotation part of the Jacobian (storage axes → physical), orthonormalised with the chart's
+    /// up (storage y) kept exact.
+    pub fn rotation(&self) -> glam::DMat3 {
+        let y = self.jacobian.y_axis.normalize();
+        let x = (self.jacobian.x_axis - y * self.jacobian.x_axis.dot(y)).normalize();
+        glam::DMat3::from_cols(x, y, x.cross(y).normalize())
+    }
+}
+
 /// One depth band: `n × n` cells per face, radial cells `[r_lo, r_hi)` (one block each).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Band {
@@ -153,16 +172,18 @@ impl Atlas {
         match patch {
             Patch::Shell { band, face } => {
                 let b = &self.bands[band as usize];
-                let r = if self.inward { (b.r_hi as f64) - l.y } else { b.r_lo as f64 + l.y };
-                self.centre + radial(face, b.n, r, l.x, l.z)
+                // Inward charts flip x with y so storage stays right-handed (det J > 0).
+                let (r, i) = if self.inward { (b.r_hi as f64 - l.y, b.n as f64 - l.x) } else { (b.r_lo as f64 + l.y, l.x) };
+                self.centre + radial(face, b.n, r, i, l.z)
             }
             Patch::Transition { face } => {
                 let step = 2.0 / self.t_n as f64;
-                let (xi, eta) = (-1.0 + l.x * step, -1.0 + l.z * step);
+                let lx = if self.inward { self.t_n as f64 - l.x } else { l.x };
+                let (xi, eta) = (-1.0 + lx * step, -1.0 + l.z * step);
                 let q = std::f64::consts::FRAC_PI_4;
                 let (tu, nn, tv) = basis(face);
                 let cube = (tu * (xi * q).tan() + nn + tv * (eta * q).tan()) * self.core_half as f64;
-                let sphere = radial(face, self.t_n, self.t_r as f64, l.x, l.z);
+                let sphere = radial(face, self.t_n, self.t_r as f64, lx, l.z);
                 let t = l.y / self.t_layers as f64;
                 let t = if self.inward { 1.0 - t } else { t };
                 self.centre + cube + (sphere - cube) * t
@@ -185,8 +206,8 @@ impl Atlas {
             if r >= b.r_lo as f64 && r < b.r_hi as f64 {
                 let (xi, eta) = Map::Equiangular.inverse(local);
                 let step = 2.0 / b.n as f64;
-                let y = if self.inward { b.r_hi as f64 - r } else { r - b.r_lo as f64 };
-                return Some((Patch::Shell { band: bi as u8, face }, DVec3::new((xi + 1.0) / step, y, (eta + 1.0) / step)));
+                let (y, i) = if self.inward { (b.r_hi as f64 - r, b.n as f64 - (xi + 1.0) / step) } else { (r - b.r_lo as f64, (xi + 1.0) / step) };
+                return Some((Patch::Shell { band: bi as u8, face }, DVec3::new(i, y, (eta + 1.0) / step)));
             }
         }
         // Inside the transition or the core: the core cube first (L∞ test), else Newton on the
@@ -198,7 +219,8 @@ impl Atlas {
         let patch = Patch::Transition { face };
         let (xi, eta) = Map::Equiangular.inverse(local);
         let step = 2.0 / self.t_n as f64;
-        let mut l = DVec3::new((xi + 1.0) / step, self.t_layers as f64 * 0.5, (eta + 1.0) / step);
+        let i = if self.inward { self.t_n as f64 - (xi + 1.0) / step } else { (xi + 1.0) / step };
+        let mut l = DVec3::new(i, self.t_layers as f64 * 0.5, (eta + 1.0) / step);
         for _ in 0..32 {
             let f = self.embed(patch, l) - p;
             if f.length() < 1e-9 {
@@ -213,6 +235,23 @@ impl Atlas {
             l -= j.inverse() * f;
         }
         Some((patch, l))
+    }
+
+    /// The physical point of continuous storage coordinates inside `patch`'s box.
+    pub fn embed_storage(&self, patch: Patch, s: DVec3) -> DVec3 {
+        let (o, _) = self.storage_box(patch);
+        self.embed(patch, s - DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64))
+    }
+
+    /// The patch around physical point `p`: where `p` sits in storage and the Jacobian
+    /// `∂physical/∂storage` there (the local affine frame motion and picking run in).
+    pub fn local(&self, p: DVec3) -> Option<Local> {
+        let (patch, l) = self.find(p)?;
+        let (o, _) = self.storage_box(patch);
+        let storage = l + DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64);
+        let h = 1e-3;
+        let col = |d: DVec3| (self.embed(patch, l + d * h) - self.embed(patch, l - d * h)) / (2.0 * h);
+        Some(Local { patch, storage, jacobian: glam::DMat3::from_cols(col(DVec3::X), col(DVec3::Y), col(DVec3::Z)) })
     }
 
     /// The storage cell of a patch-local cell.
@@ -321,6 +360,25 @@ mod tests {
         let inside = a.embed(top, DVec3::new(b.n as f64 - 0.5, k as f64 + 0.5, b.n as f64 / 2.0 + 0.5));
         let other = a.embed(patch, DVec3::new(l[0] as f64 + 0.5, l[1] as f64 + 0.5, l[2] as f64 + 0.5));
         assert!(((inside - other).length() - 1.0).abs() < 0.05, "{} via {patch:?} {l:?} from {s:?} -> {g:?}", (inside - other).length());
+    }
+
+    #[test]
+    fn storage_is_right_handed_outward_and_inward() {
+        for inward in [false, true] {
+            let a = Atlas::new(DVec3::new(1.0e8, 0.0, 0.0), 50_000, 52_048, inward, 2);
+            for p in a.patches() {
+                let (_, size) = a.storage_box(p);
+                let l = DVec3::new(size[0] as f64 * 0.4, size[1] as f64 * 0.6, size[2] as f64 * 0.3);
+                let x = a.embed(p, l);
+                let loc = a.local(x).expect("covered");
+                assert!(loc.jacobian.determinant() > 0.0, "{p:?} inward={inward} mirrored");
+                let rot = loc.rotation();
+                assert!((rot.determinant() - 1.0).abs() < 1e-9 && (rot * rot.transpose()).abs_diff_eq(glam::DMat3::IDENTITY, 1e-9));
+            }
+            // Outward charts point storage +y away from the centre, inward ones toward it.
+            let s = a.local(a.centre + DVec3::new(0.0, 51_000.0, 0.0)).unwrap();
+            assert_eq!(s.jacobian.y_axis.y > 0.0, !inward);
+        }
     }
 
     #[test]

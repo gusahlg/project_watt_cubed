@@ -24,10 +24,10 @@ pub const BLOCK_METERS: f64 = 0.85;
 /// take it — they live in the time domain.
 pub const PER_METER: f64 = 1.0 / BLOCK_METERS;
 
-/// Slack past ±[`WORLD_BORDER`] so [`block_coord`] still resolves cells of an
-/// AABB whose half-extents stick past a position clamped to the border.
-/// 16 covers any in-game AABB; `(1e9 + 16) / 16` chunks still fit `i32`.
-const BLOCK_COORD_SLACK: f64 = 16.0;
+/// How far [`block_coord`] resolves cells: past the physical [`WORLD_BORDER`] into the storage
+/// region where round worlds keep their chart cells (`space::atlas`), and still i32-safe for chunk
+/// math (`2.05e9 / 16` chunks, `chunk * 16 + 15` < 2^31).
+pub const CELL_LIMIT: f64 = 2.05e9;
 
 /// Hermite smoothstep on a unit interval: `t²(3−2t)`.
 #[inline]
@@ -43,7 +43,7 @@ pub fn smooth_between(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 
-/// `f64` world coordinate → block: clamp to ±([`WORLD_BORDER`] + [`BLOCK_COORD_SLACK`]),
+/// `f64` world coordinate → block: clamp to ±[`CELL_LIMIT`],
 /// then floor. Downstream i32 math (chunk scale, ±1 neighbours, squared diffs)
 /// is overflow-free only while the input stays well inside `i32`. Unbounded
 /// `as i32` saturates at `i32::MAX` and wraps later. `NaN` clamps to `NaN` and
@@ -52,7 +52,7 @@ pub fn smooth_between(edge0: f32, edge1: f32, x: f32) -> f32 {
 pub fn block_coord(v: f64) -> i32 {
     // Floor in f64 (exact for |v| <= 1e9 + 16, far below 2^53), then narrow
     // via i64 so the intermediate can provably never truncate.
-    v.clamp(-(WORLD_BORDER + BLOCK_COORD_SLACK), WORLD_BORDER + BLOCK_COORD_SLACK).floor() as i64
+    v.clamp(-CELL_LIMIT, CELL_LIMIT).floor() as i64
         as i32
 }
 
@@ -62,7 +62,7 @@ pub fn block_coord(v: f64) -> i32 {
 /// `NaN` → cell 0 like [`block_coord`].
 #[inline]
 pub fn block_coord_end(v: f64) -> i32 {
-    (v.clamp(-(WORLD_BORDER + BLOCK_COORD_SLACK), WORLD_BORDER + BLOCK_COORD_SLACK).ceil() - 1.0)
+    (v.clamp(-CELL_LIMIT, CELL_LIMIT).ceil() - 1.0)
         as i64 as i32
 }
 
@@ -141,9 +141,9 @@ mod tests {
         assert_eq!(block_coord(1.0e9 + 0.3), 1_000_000_000);
         // Far past the border + slack: clamped, never overflowing i32 math
         // downstream.
-        assert_eq!(block_coord(WORLD_BORDER * 3.0), 1_000_000_016);
-        assert_eq!(block_coord(f64::INFINITY), 1_000_000_016);
-        assert_eq!(block_coord(f64::NEG_INFINITY), -1_000_000_016);
+        assert_eq!(block_coord(WORLD_BORDER * 3.0), 2_050_000_000);
+        assert_eq!(block_coord(f64::INFINITY), 2_050_000_000);
+        assert_eq!(block_coord(f64::NEG_INFINITY), -2_050_000_000);
         assert_eq!(block_coord(f64::NAN), 0);
     }
 
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(block_coord_end(-1.0), -2);
         assert_eq!(block_coord_end(1.5), 1);
         assert_eq!(block_coord_end(f64::NAN), 0);
-        assert_eq!(block_coord_end(f64::INFINITY), 1_000_000_015);
+        assert_eq!(block_coord_end(f64::INFINITY), 2_049_999_999);
     }
 
     #[test]

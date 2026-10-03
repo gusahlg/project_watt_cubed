@@ -112,6 +112,45 @@ impl MoveInput {
 /// delta from input + physics, then apply it with per-axis collision resolution. Returns landing
 /// trauma in `[0, 1]` (zero when the player did not land this tick).
 pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity: DVec3) -> f32 {
+    step(player, world, input, dt, gravity, WORLD_BORDER)
+}
+
+/// Advance a player standing in a curved patch of `atlas` (a round world): the step runs in the
+/// patch's storage frame — axis-aligned cells, the ordinary collision code — and the result is
+/// embedded back exactly. Velocity, gravity and the body frame cross through the patch's local
+/// Jacobian; walking speeds are rescaled so physical speed stays the same where cells are narrower
+/// than a block, while the hitbox stays in cells (a two-cell opening fits the player everywhere).
+/// Outside every patch this is [`update_player`].
+pub fn update_player_in(player: &mut Player, world: &World, atlas: &crate::space::atlas::Atlas, input: &MoveInput, dt: f32, gravity: DVec3) -> f32 {
+    let Some(here) = atlas.local(player.position) else {
+        return update_player(player, world, input, dt, gravity);
+    };
+    let (j, ji) = (here.jacobian, here.jacobian.inverse());
+    let rot = glam::DQuat::from_mat3(&here.rotation());
+    let width = 0.5 * (j.x_axis.length() + j.z_axis.length());
+    let (speed, fly_speed) = (player.speed, player.fly_speed);
+    player.speed = speed / width;
+    player.fly_speed = fly_speed / width;
+    player.position = here.storage;
+    set_velocity(player, ji * player.velocity());
+    player.orientation.frame = (rot.inverse() * player.orientation.frame).normalize();
+    let trauma = step(player, world, input, dt, ji * gravity, crate::math::CELL_LIMIT);
+    player.position = atlas.embed_storage(here.patch, player.position);
+    set_velocity(player, j * player.velocity());
+    player.orientation.frame = (rot * player.orientation.frame).normalize();
+    player.speed = speed;
+    player.fly_speed = fly_speed;
+    trauma
+}
+
+fn set_velocity(player: &mut Player, v: DVec3) {
+    match &mut player.motion {
+        Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = v,
+    }
+}
+
+/// One physics step inside positions bounded by `±border`.
+fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity: DVec3, border: f64) -> f32 {
     // The one f32 -> f64 physics boundary (see the module docs).
     let dt = dt as f64;
     player.gravity = gravity;
@@ -170,7 +209,7 @@ pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: 
         }
     };
 
-    move_with_collision(player, world, delta)
+    move_with_collision(player, world, delta, border)
 }
 
 /// `heading` with its component along axis `a` removed, rescaled to its old length: walking
@@ -275,7 +314,7 @@ fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
 /// Every substep clamps to ±[`WORLD_BORDER`]. Positions stay inside the range
 /// [`math::block_coord`](crate::math::block_coord) assumes. Axis deltas larger
 /// than [`MAX_COLLISION_STEP`] go through [`step_axis`] substeps.
-fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 {
+fn move_with_collision(player: &mut Player, world: &World, delta: DVec3, border: f64) -> f32 {
     let mut pos = player.position;
     let stance = player.stance;
     let up = player.up_axis;
@@ -286,7 +325,7 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 
 
     let mut blocked = [false; 3];
     for axis in [0, 2, 1].into_iter().filter(|&i| i != a).chain([a]) {
-        blocked[axis] = step_axis(&mut pos, axis, delta[axis], world, stance, up, noclip);
+        blocked[axis] = step_axis(&mut pos, axis, delta[axis], world, stance, up, noclip, border);
     }
     player.position = pos;
 
@@ -326,6 +365,7 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3) -> f32 
 /// `ceil(|delta| / 0.5)` substeps (~12 at terminal velocity under the 0.1 s dt
 /// clamp). The last substep is the single-step endpoint, so an unobstructed
 /// move matches the one-step path.
+#[allow(clippy::too_many_arguments)]
 fn step_axis(
     pos: &mut DVec3,
     axis: usize,
@@ -334,6 +374,7 @@ fn step_axis(
     stance: Stance,
     up: Face,
     noclip: bool,
+    border: f64,
 ) -> bool {
     // Standing still is overwhelmingly common. Avoid an AABB build plus a
     // world collision query for the two (often all three) idle axes.
@@ -344,7 +385,7 @@ fn step_axis(
 
     // Fast path. Noclip clamps to the border and skips geometry.
     if noclip || delta.abs() <= MAX_COLLISION_STEP {
-        pos[axis] = (start + delta).clamp(-WORLD_BORDER, WORLD_BORDER);
+        pos[axis] = (start + delta).clamp(-border, border);
         if !noclip && world.collides(&collision_box(*pos, stance, up)) {
             pos[axis] = start;
             return true;
@@ -352,13 +393,13 @@ fn step_axis(
         return false;
     }
 
-    let target = (start + delta).clamp(-WORLD_BORDER, WORLD_BORDER);
+    let target = (start + delta).clamp(-border, border);
     let steps = (delta.abs() / MAX_COLLISION_STEP).ceil() as u32;
     for i in 1..=steps {
         let next = if i == steps {
             target
         } else {
-            (start + delta * (i as f64 / steps as f64)).clamp(-WORLD_BORDER, WORLD_BORDER)
+            (start + delta * (i as f64 / steps as f64)).clamp(-border, border)
         };
         let last_good = pos[axis];
         pos[axis] = next;
@@ -684,6 +725,50 @@ mod tests {
         update_player(&mut player, &world, &idle(), 1.0 / 60.0, DVec3::ZERO);
         assert_eq!(player.up_axis, Face::PosX);
         assert!((player.feet() - feet).length() < 1e-9, "{} vs {feet}", player.feet());
+    }
+
+
+    #[test]
+    fn a_player_walks_around_a_curved_world_on_its_storage_cells() {
+        use crate::space::atlas::{Atlas, Patch};
+        let mut world = World::generate();
+        let centre = DVec3::new(2.0e7, 3.0e7, -1.0e7);
+        let r = 3_000i64;
+        let atlas = Atlas::new(centre, r, r + 64, false, 0);
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let b = atlas.bands[0];
+        let k = r - b.r_lo - 1; // the cell layer just below the datum radius
+        let stone = world.registry().id_by_label("rock").unwrap();
+        let mid = b.n / 2;
+        let lift = atlas.storage(top, [mid, k, mid]);
+        world.ensure_around(DVec3::new(lift[0] as f64, lift[1] as f64, lift[2] as f64));
+        for di in -24..=24 {
+            for dj in -24..=24 {
+                let s = atlas.storage(top, [mid + di, k, mid + dj]);
+                world.set_block(s[0] as i32, s[1] as i32, s[2] as i32, stone);
+            }
+        }
+        // Stand above the floor, body up along the radius, gravity toward the centre.
+        let start = atlas.embed(top, DVec3::new(mid as f64 + 0.5, (k + 1) as f64 + stand_eye() + 0.2, mid as f64 + 0.5));
+        let mut player = Player::new(start);
+        player.snap_up((start - centre).normalize());
+        let pull = |p: DVec3| (centre - p).normalize() * GRAVITY;
+        for _ in 0..60 {
+            let g = pull(player.position);
+            update_player_in(&mut player, &world, &atlas, &idle(), 1.0 / 60.0, g);
+        }
+        assert!(player.on_ground(), "landed on the curved floor");
+        let rest = (player.position - centre).length();
+        assert!((rest - (r as f64 + stand_eye())).abs() < 0.05, "eye at the datum + eye height: {rest}");
+        let before = player.position;
+        for _ in 0..90 {
+            let g = pull(player.position);
+            update_player_in(&mut player, &world, &atlas, &walk_forward(), 1.0 / 60.0, g);
+        }
+        let after = (player.position - centre).length();
+        assert!((after - rest).abs() < 0.05, "walking follows the curve: {rest} -> {after}");
+        assert!((player.position - before).length() > 5.0, "and goes somewhere");
+        assert!(player.on_ground());
     }
 
 }
