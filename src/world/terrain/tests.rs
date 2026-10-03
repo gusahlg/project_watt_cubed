@@ -521,6 +521,11 @@ fn landmarks() {
     for b in t.cosmos.bodies() {
         println!("{:?} {} centre {:?} {:?}", b.kind, b.id, b.centre, b.shape);
     }
+    let mut near: Vec<_> = t.cosmos.clusters().iter().collect();
+    near.sort_by(|a, b| a.centre.length().total_cmp(&b.centre.length()));
+    for c in near.iter().take(5) {
+        println!("cluster {:?} centre {:?} r {:.0} rocks {:.0}", c.form, c.centre, c.radius, c.count);
+    }
 }
 
 #[test]
