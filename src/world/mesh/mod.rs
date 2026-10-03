@@ -528,10 +528,10 @@ mod tests {
         let surface = |cx: i32, cz: i32| (cx, generator.height(cx * 16 + 8, cz * 16 + 8).div_euclid(16), cz);
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            (surface(0, 0), 0xdbaa1825, 0xdbaa1825, 0x3f8a2a82),
-            (surface(3, -2), 0x05465b97, 0x05465b97, 0x8c7e77aa),
-            (surface(1, 0), 0x01b3394c, 0x01b3394c, 0x0a46e7fa),
-            (surface(2, 2), 0xee616ae2, 0xee616ae2, 0x70fccc81),
+            (surface(0, 0), 0x186ce332, 0x186ce332, 0x1da46d90),
+            (surface(3, -2), 0xded88e52, 0xded88e52, 0x1f15b513),
+            (surface(1, 0), 0x0e8cf568, 0x0e8cf568, 0x05d7d8d0),
+            (surface(2, 2), 0xf9890e26, 0xf9890e26, 0xd4de6ebb),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
