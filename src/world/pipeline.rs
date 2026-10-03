@@ -35,6 +35,9 @@ use std::time::{Duration, Instant};
 use super::Coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::ColumnHeights;
+use super::{ColumnKey, Sky};
+#[cfg(test)]
+use crate::coord::Face;
 #[cfg(test)]
 use super::terrain::Terrain;
 use super::terrain::Generator;
@@ -75,24 +78,29 @@ pub struct LightSnapshot {
     /// Near-face light of the 6 neighbour faces (snapshot at enqueue time).
     pub shell: FaceShell,
     /// The skylight ceiling (surface heightmap) for the chunk's column.
+    /// Open jobs carry [`light::ignored_ceiling`](super::light::ignored_ceiling); the kernel does not read it.
     pub ceiling: Arc<CeilingWindow>,
-    /// World-space Y of the chunk's bottom cell — seeds the open-sky column test.
-    pub world_y0: i32,
+    /// Which way skylight falls in this chunk.
+    pub sky: Sky,
+    /// Minimum altitude of the chunk along `sky` (PosY: world Y of the bottom cell).
+    pub alt0: i32,
     /// Hot tables (opaque/emission), shared by refcount like a mesh snapshot's.
     pub tables: Arc<HotTables>,
 }
 
 /// Work sent to the pool.
 pub(in crate::world) enum Job {
-    /// Generate a whole vertical *column* of chunks at horizontal `col = (cx,
-    /// cz)` over the chunk-layer range `cy`, from one generator clone. The
-    /// column profile (`profile(wx, wz)`) is `cy`-invariant, so generating the
-    /// run together samples it once instead of R times. `edits` carries the
+    /// Generate a run of chunks along `key`'s normal over local altitude `range`,
+    /// from one generator clone. The column profile is altitude-invariant, so
+    /// generating the run together samples it once. `edits` carries the
     /// per-chunk edit overlay (`(coord, [(flat index, block)])`) replayed after
     /// each chunk's fill — voxel-identical to per-chunk generation.
+    ///
+    /// An `Open` chunk is one job: `key` is `{ PosY, cx, cz }` and `range` is
+    /// `cy..=cy` (a coordinate encoding only — see `gather_column_runs`).
     GenerateColumn {
-        col: (i32, i32),
-        cy: RangeInclusive<i32>,
+        key: ColumnKey,
+        range: RangeInclusive<i32>,
         generator: Generator,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
     },
@@ -146,8 +154,8 @@ pub(crate) struct ClaimToken(pub(in crate::world) u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum JobKey {
     Column {
-        col: (i32, i32),
-        cy: RangeInclusive<i32>,
+        key: ColumnKey,
+        range: RangeInclusive<i32>,
     },
     Mesh {
         coord: Coord,
@@ -166,9 +174,9 @@ impl JobKey {
     /// The claim identity of a job, captured before the job runs.
     fn of(job: &Job) -> JobKey {
         match job {
-            Job::GenerateColumn { col, cy, .. } => JobKey::Column {
-                col: *col,
-                cy: cy.clone(),
+            Job::GenerateColumn { key, range, .. } => JobKey::Column {
+                key: *key,
+                range: range.clone(),
             },
             Job::Mesh { coord, .. } => JobKey::Mesh { coord: *coord },
             Job::Light { coord, .. } => JobKey::Light { coord: *coord },
@@ -187,12 +195,12 @@ impl JobKey {
 
 /// Finished work returned to the main thread.
 pub(in crate::world) enum Done {
-    /// A generated column: every chunk built for the requested `cy` range,
-    /// paired with its coord, plus the 256 ground heights (boxed so
+    /// A generated column: every chunk built for the requested altitude range,
+    /// paired with its coord, plus the 256 face-local altitudes (boxed so
     /// `size_of::<Done>()` stays ≤ 128). Landed together and stored in one
     /// drain step.
     Column {
-        col: (i32, i32),
+        key: ColumnKey,
         chunks: Vec<(Coord, Chunk)>,
         heights: Box<ColumnHeights>,
     },
@@ -588,7 +596,10 @@ impl Job {
     /// carries its own distance keys) and test-only jobs.
     fn col(&self) -> Option<(i32, i32)> {
         match self {
-            Job::GenerateColumn { col, .. } => Some(*col),
+            Job::GenerateColumn { key, range, .. } => {
+                let coord = key.chunk(*range.start());
+                Some((coord.x, coord.z))
+            }
             Job::Mesh { coord, .. } => Some((coord.x, coord.z)),
             Job::Light { coord, .. } => Some((coord.x, coord.z)),
             Job::Section { .. } => None,
@@ -1391,20 +1402,19 @@ fn worker_loop(
 fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
     match job {
         Job::GenerateColumn {
-            col,
-            cy,
+            key,
+            range,
             generator,
             edits,
         } => {
-            let (cx, cz) = col;
             // Share the column profile across the whole run, then replay each
             // chunk's edit overlay — voxel-identical to per-chunk generation.
-            let (generated, heights) = generator.generate_column(cx, cz, cy);
+            let (generated, heights) = generator.generate_column(key, range);
             let chunks = generated
                 .into_iter()
-                .map(|(cyy, data)| {
-                    let coord = Coord::new(cx, cyy, cz);
-                    let mut chunk = Chunk::from_data(cx, cyy, cz, data);
+                .map(|(alt, data)| {
+                    let coord = key.chunk(alt);
+                    let mut chunk = Chunk::from_data(coord.x, coord.y, coord.z, data);
                     if let Some((_, cells)) = edits.iter().find(|(c, _)| *c == coord) {
                         for &(index, id) in cells {
                             chunk.set_index(index, id);
@@ -1414,7 +1424,7 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
                 })
                 .collect();
             Done::Column {
-                col,
+                key,
                 chunks,
                 heights: Box::new(heights),
             }
@@ -1461,7 +1471,8 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
                 &snapshot.chunk,
                 &snapshot.shell,
                 &snapshot.ceiling,
-                snapshot.world_y0,
+                snapshot.sky,
+                snapshot.alt0,
                 &snapshot.tables,
                 &mut grid,
             );
@@ -1547,9 +1558,10 @@ mod tests {
         }
 
         let workers = Workers::spawn(2);
+        let key = ColumnKey { face: Face::PosY, a: coord.x, b: coord.z };
         assert!(workers.submit(Job::GenerateColumn {
-            col: (coord.x, coord.z),
-            cy: coord.y..=coord.y,
+            key,
+            range: coord.y..=coord.y,
             generator: generator.clone(),
             edits: vec![(coord, edits)],
         }));
@@ -1557,10 +1569,10 @@ mod tests {
             .results
             .recv_timeout(Duration::from_secs(10))
             .expect("worker finished");
-        let Done::Column { col, chunks, heights } = done else {
+        let Done::Column { key: got, chunks, heights } = done else {
             panic!("expected a column result");
         };
-        assert_eq!(col, (coord.x, coord.z));
+        assert_eq!(got, key);
         let x0 = coord.x * CHUNK_SIZE as i32;
         let z0 = coord.z * CHUNK_SIZE as i32;
         for lz in 0..CHUNK_SIZE {
@@ -1673,8 +1685,8 @@ mod tests {
     fn near_jobs_dequeue_before_far_regardless_of_insertion_order() {
         let terrain = generator(0);
         let near = |c: i32| Job::GenerateColumn {
-            col: (c, c),
-            cy: 0..=0,
+            key: ColumnKey { face: Face::PosY, a: c, b: c },
+            range: 0..=0,
             generator: terrain.clone(),
             edits: Vec::new(),
         };
@@ -1691,11 +1703,11 @@ mod tests {
         // All near first (FIFO within class), then all far (FIFO within class).
         assert!(matches!(
             pop_clean(&mut q, &gate),
-            Some(Job::GenerateColumn { col: (0, 0), .. })
+            Some(Job::GenerateColumn { key: ColumnKey { a: 0, b: 0, .. }, .. })
         ));
         assert!(matches!(
             pop_clean(&mut q, &gate),
-            Some(Job::GenerateColumn { col: (1, 1), .. })
+            Some(Job::GenerateColumn { key: ColumnKey { a: 1, b: 1, .. }, .. })
         ));
         assert_eq!(section_id(&pop_clean(&mut q, &gate).unwrap()), 0);
         assert_eq!(section_id(&pop_clean(&mut q, &gate).unwrap()), 1);
@@ -1710,8 +1722,8 @@ mod tests {
     fn near_queue_reprioritizes_live_and_deschedules_left_behind_work() {
         let terrain = generator(0);
         let near = |cx: i32, cz: i32| Job::GenerateColumn {
-            col: (cx, cz),
-            cy: 0..=0,
+            key: ColumnKey { face: Face::PosY, a: cx, b: cz },
+            range: 0..=0,
             generator: terrain.clone(),
             edits: Vec::new(),
         };
@@ -1730,25 +1742,25 @@ mod tests {
         let mut cancelled = Vec::new();
         let first = q.pop(&gate, &mut cancelled).expect("work remains");
         assert!(
-            matches!(first, Job::GenerateColumn { col: (28, 29), .. }),
+            matches!(first, Job::GenerateColumn { key: ColumnKey { a: 28, b: 29, .. }, .. }),
             "the job nearest the LIVE centre must pop first, not the oldest"
         );
         // Cancellation ORDER was never load-bearing (the epoch rebuild drains
         // in heap layout order); the SET of descheduled claims is the contract.
         cancelled.sort_by_key(|k| match k {
-            JobKey::Column { col, .. } => *col,
+            JobKey::Column { key, .. } => (key.a, key.b),
             _ => (i32::MAX, i32::MAX),
         });
         assert_eq!(
             cancelled,
             vec![
                 JobKey::Column {
-                    col: (0, 1),
-                    cy: 0..=0
+                    key: ColumnKey { face: Face::PosY, a: 0, b: 1 },
+                    range: 0..=0
                 },
                 JobKey::Column {
-                    col: (6, 6),
-                    cy: 0..=0
+                    key: ColumnKey { face: Face::PosY, a: 6, b: 6 },
+                    range: 0..=0
                 },
             ],
             "left-behind work is descheduled with its claims"
@@ -1757,7 +1769,7 @@ mod tests {
         // The surviving (26, 26) — inside the ring at distance 2 — runs next.
         let mut cancelled = Vec::new();
         let second = q.pop(&gate, &mut cancelled).expect("one survivor");
-        assert!(matches!(second, Job::GenerateColumn { col: (26, 26), .. }));
+        assert!(matches!(second, Job::GenerateColumn { key: ColumnKey { a: 26, b: 26, .. }, .. }));
         assert!(cancelled.is_empty());
         assert!(q.pop(&gate, &mut cancelled).is_none(), "queue drained");
     }
@@ -1766,8 +1778,8 @@ mod tests {
     fn fast_travel_prioritizes_the_leading_edge_and_bounds_lookahead() {
         let terrain = generator(0);
         let near = |cx: i32| Job::GenerateColumn {
-            col: (cx, 0),
-            cy: 0..=0,
+            key: ColumnKey { face: Face::PosY, a: cx, b: 0 },
+            range: 0..=0,
             generator: terrain.clone(),
             edits: Vec::new(),
         };
@@ -1782,7 +1794,7 @@ mod tests {
         assert!(q.push(near(5), &gate));
         assert!(matches!(
             pop_clean(&mut q, &gate),
-            Some(Job::GenerateColumn { col: (5, 0), .. })
+            Some(Job::GenerateColumn { key: ColumnKey { a: 5, b: 0, .. }, .. })
         ));
 
         // Refill to the adaptive lookahead ceiling. Rejection leaves ownership
@@ -2034,8 +2046,8 @@ mod tests {
 
         fn dummy(terrain: &Generator, col: i32) -> Job {
             Job::GenerateColumn {
-                col: (col, 0),
-                cy: 0..=0,
+                key: ColumnKey { face: Face::PosY, a: col, b: 0 },
+                range: 0..=0,
                 generator: terrain.clone(),
                 edits: Vec::new(),
             }
@@ -2240,8 +2252,8 @@ mod tests {
         let workers = Workers::spawn(1);
         let keys = [
             JobKey::Column {
-                col: (3, -2),
-                cy: 0..=2,
+                key: ColumnKey { face: Face::PosY, a: 3, b: -2 },
+                range: 0..=2,
             },
             JobKey::Mesh {
                 coord: Coord::new(1, 2, 3),
@@ -2280,8 +2292,8 @@ mod tests {
         // The single worker thread survived every panic: real work still runs.
         let terrain = generator(9);
         assert!(workers.submit(Job::GenerateColumn {
-            col: (0, 0),
-            cy: 0..=0,
+            key: ColumnKey { face: Face::PosY, a: 0, b: 0 },
+            range: 0..=0,
             generator: terrain,
             edits: Vec::new(),
         }));
@@ -2302,8 +2314,8 @@ mod tests {
             let workers = Workers::spawn(2);
             for i in 0..6 {
                 workers.submit(Job::GenerateColumn {
-                    col: (i, i),
-                    cy: 0..=0,
+                    key: ColumnKey { face: Face::PosY, a: i, b: i },
+                    range: 0..=0,
                     generator: generator.clone(),
                     edits: Vec::new(),
                 });

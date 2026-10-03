@@ -130,20 +130,21 @@ impl Body {
         }
     }
 
-    /// The analytic mass primitives of this body.
-    pub fn primitives(&self, out: &mut Vec<Primitive>) {
+    /// The analytic mass primitives of this body (a shell is a ball minus a ball; the rest are one).
+    pub fn primitives(&self) -> impl Iterator<Item = Primitive> {
         let c = self.centre_f();
-        match self.shape {
+        let (a, b) = match self.shape {
             Shape::Cube { half } => {
                 let h = DVec3::splat(half as f64);
-                out.push(Primitive::new(MassShape::Box { lo: c - h, hi: c + h }, self.density));
+                (Primitive::new(MassShape::Box { lo: c - h, hi: c + h }, self.density), None)
             }
-            Shape::Ball { r } => out.push(Primitive::new(MassShape::Ball { c, r: r as f64 }, self.density)),
-            Shape::Shell { outer, inner } => {
-                out.push(Primitive::new(MassShape::Ball { c, r: outer as f64 }, self.density));
-                out.push(Primitive::new(MassShape::Ball { c, r: inner as f64 }, -self.density));
-            }
-        }
+            Shape::Ball { r } => (Primitive::new(MassShape::Ball { c, r: r as f64 }, self.density), None),
+            Shape::Shell { outer, inner } => (
+                Primitive::new(MassShape::Ball { c, r: outer as f64 }, self.density),
+                Some(Primitive::new(MassShape::Ball { c, r: inner as f64 }, -self.density)),
+            ),
+        };
+        std::iter::once(a).chain(b)
     }
 
     /// Bound (per unit G) on the field error from unmodelled relief and caves near the surface:
@@ -587,16 +588,13 @@ const OPEN_RADIUS: f64 = 4096.0;
 
 impl MassOracle for Cosmos {
     fn visit(&self, centre: DVec3, reach: f64, v: &mut dyn Visitor) {
-        let mut prims = Vec::new();
         for b in &self.bodies {
             let dist = (b.centre_f() - centre).length();
             if dist - b.reach() >= reach {
                 continue;
             }
-            prims.clear();
-            b.primitives(&mut prims);
-            for p in &prims {
-                v.primitive(p);
+            for p in b.primitives() {
+                v.primitive(&p);
             }
             if b.altitude(centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());

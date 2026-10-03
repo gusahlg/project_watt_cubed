@@ -9,9 +9,10 @@ use crate::block::registry::BlockId;
 use crate::coord::{BlockCoord, Face, Local};
 use crate::render_config::RenderConfig;
 use crate::sim::reactions::{self, CellStore, Mutation, Pos, ReactionScheduler};
+use crate::space::FaceFrame;
 
 use super::chunk::Chunk;
-use super::{Coord, MeshState, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
+use super::{ColumnKey, Coord, MeshState, Sky, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, World};
 
 impl World {
     /// Current render distance in chunk rings.
@@ -307,6 +308,10 @@ impl World {
         // edit: user-click/network rate, never the voxel hot path.
         let old_edit = self.edits.get(&coord).and_then(|cells| cells.get(&index)).copied();
         let generated = self.generator.block_at(x, y, z, self.generator.height(x, z));
+        // Gravity follows the matter: the cell's amount changes from what was really there (the
+        // overlay, else generation — never `previous`, which reads unloaded chunks as air).
+        let delta = self.registry.amount(id) as i32 - self.registry.amount(old_edit.unwrap_or(generated)) as i32;
+        self.gravity.record((x, y, z), delta);
         let new_edit = if id == generated {
             if let Some(cells) = self.edits.get_mut(&coord) {
                 cells.remove(&index);
@@ -325,23 +330,33 @@ impl World {
         // lowers it. Either way the cached window is stale, and every loaded
         // chunk at or below the edit seeds skylight from it — re-settle them
         // so a constructed roof actually darkens the world underneath.
-        if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
-            let cell = ceiling.surface_at(lx, lz);
-            let raises = new_edit.is_some_and(|id| self.registry.is_opaque(id)) && y + 1 > cell;
-            let lowers = old_edit.is_some_and(|id| self.registry.is_opaque(id)) && y + 1 == cell;
-            if raises || lowers {
-                self.ceilings.remove(&(coord.x, coord.z));
-                if self.lighting {
-                    let shadowed: Vec<Coord> = self
-                        .chunks
-                        .keys()
-                        .copied()
-                        .filter(|c| c.x == coord.x && c.z == coord.z && c.y <= coord.y)
-                        .collect();
-                    for c in shadowed {
-                        self.seed_light(c, super::LightSeed::Edit);
+        if let Sky::Axis(face) = self.generator.sky(coord) {
+            let (key, alt_chunk) = ColumnKey::of(face, coord);
+            if let Some(ceiling) = self.ceilings.get(&key) {
+                let frame = FaceFrame::new(face);
+                let (lu, _, lv) = frame.index_to_local(lx, ly, lz);
+                let alt = frame.cell_to_local((x, y, z)).1;
+                let cell = ceiling.surface_at(lu, lv);
+                let raises = new_edit.is_some_and(|id| self.registry.is_opaque(id)) && alt + 1 > cell;
+                let lowers = old_edit.is_some_and(|id| self.registry.is_opaque(id)) && alt + 1 == cell;
+                if raises || lowers {
+                    self.ceilings.remove(&key);
+                    if self.lighting {
+                        let shadowed: Vec<Coord> = self
+                            .column_chunks
+                            .get(&key)
+                            .map(|alts| {
+                                alts.iter()
+                                    .filter(|&&a| a <= alt_chunk)
+                                    .map(|&a| key.chunk(a))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for c in shadowed {
+                            self.seed_light(c, super::LightSeed::Edit);
+                        }
+                        self.light_pending.set();
                     }
-                    self.light_pending.set();
                 }
             }
         }

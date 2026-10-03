@@ -1045,8 +1045,7 @@ impl Game {
 
     /// The gravity at `p`, from the world's matter.
     fn gravity_at(&self, p: DVec3) -> DVec3 {
-        let _ = p;
-        DVec3::new(0.0, -crate::player::STANDARD_GRAVITY, 0.0)
+        self.world.gravity_at(p).accel
     }
 
     /// World edits: block breaking, then cadence-controlled mod hooks and

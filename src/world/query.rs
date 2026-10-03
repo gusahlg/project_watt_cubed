@@ -8,12 +8,12 @@ use voxel_engine::IVec3;
 
 use crate::audio::acoustics::{AcousticWindow, Cell};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
-use crate::coord::BlockCoord;
+use crate::coord::{BlockCoord, Face};
 use crate::math::{Aabb, block_coord, block_coord_end};
 use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
-use super::{Coord, World};
+use super::{ColumnKey, Coord, World};
 
 /// Clip an inclusive world interval to a chunk and return its local cell range.
 /// The interval must intersect the chunk. Saturation keeps endpoint chunks valid
@@ -25,6 +25,16 @@ fn local_range(min: i32, max: i32, chunk: i32) -> Range<usize> {
 }
 
 impl World {
+    /// Gravity at `p` from every piece of matter within the law's range.
+    pub fn gravity_at(&self, p: voxel_engine::DVec3) -> crate::gravity::Sample {
+        self.gravity.sample(p)
+    }
+
+    /// The world's gravitational field.
+    pub(crate) fn gravity(&self) -> &crate::gravity::Field {
+        &self.gravity
+    }
+
     /// The seed this world was generated from.
     pub fn seed(&self) -> i64 {
         self.generator.seed()
@@ -204,11 +214,11 @@ impl World {
         false
     }
 
-    /// Loaded chunk-Y layers in the `(cx, cz)` column, highest first. Empty when
-    /// the column has no loaded chunks.
+    /// Loaded chunk-Y layers in the PosY `(cx, cz)` column, highest first. Empty
+    /// when that column has no loaded chunks.
     pub fn column_chunks(&self, cx: i32, cz: i32) -> &[i32] {
         self.column_chunks
-            .get(&(cx, cz))
+            .get(&ColumnKey { face: Face::PosY, a: cx, b: cz })
             .map_or(&[], Vec::as_slice)
     }
 

@@ -353,6 +353,12 @@ impl BlockRegistry {
         &self.configs[id.0 as usize]
     }
 
+    /// The amount of matter in a cell of this id: its occurrence count (0 for air). Conserved by the
+    /// law, and the mass gravity sees.
+    pub fn amount(&self, id: BlockId) -> u8 {
+        self.configs[id.0 as usize].len() as u8
+    }
+
     /// The law's kernel record of an id (cached internal supports).
     pub fn block(&self, id: BlockId) -> &Block {
         &self.blocks[id.0 as usize]

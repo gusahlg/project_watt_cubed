@@ -33,16 +33,26 @@ pub fn basis(face: Face) -> (DVec3, DVec3, DVec3) {
     }
 }
 
+/// `tan(π/4 · x)` from IEEE basic operations only (Lambert's continued fraction, exact to the
+/// last bits for `|x| ≤ 1.5`: a chart and the glue just past its edges), so chart geometry — part
+/// of generated world state — is bit-identical on every peer, unlike a platform `tan`.
+pub fn tan_quarter(x: f64) -> f64 {
+    let t = x * std::f64::consts::FRAC_PI_4;
+    let t2 = t * t;
+    let mut f = 0.0;
+    for k in (1..=20).rev() {
+        f = t2 / ((2 * k + 1) as f64 - f);
+    }
+    t / (1.0 - f)
+}
+
 impl Map {
     /// The unit direction of parameters `(xi, eta)` in face-local axes (x along `t_u`, y along the
     /// normal, z along `t_v`).
     pub fn dir(self, xi: f64, eta: f64) -> DVec3 {
         match self {
             Map::Gnomonic => DVec3::new(xi, 1.0, eta).normalize(),
-            Map::Equiangular => {
-                let q = std::f64::consts::FRAC_PI_4;
-                DVec3::new((xi * q).tan(), 1.0, (eta * q).tan()).normalize()
-            }
+            Map::Equiangular => DVec3::new(tan_quarter(xi), 1.0, tan_quarter(eta)).normalize(),
             Map::Spherified => {
                 let (x2, z2) = (xi * xi, eta * eta);
                 DVec3::new(
@@ -280,6 +290,17 @@ mod tests {
             // Equal parameter steps make gnomonic centre cells 4/π wide; the others are ~1.
             assert!(q.volume > 0.8 && q.volume < 1.7, "{map:?} volume {}", q.volume);
         }
+    }
+
+    #[test]
+    fn the_basic_operation_tangent_matches_the_platform_one() {
+        for i in -150..=150 {
+            let x = i as f64 / 100.0;
+            let want = (x * std::f64::consts::FRAC_PI_4).tan();
+            assert!((tan_quarter(x) - want).abs() <= 4.0 * f64::EPSILON * want.abs().max(1.0), "x={x}");
+        }
+        assert_eq!(tan_quarter(0.0), 0.0);
+        assert!((tan_quarter(1.0) - 1.0).abs() < 1e-15);
     }
 
     #[test]

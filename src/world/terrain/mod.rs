@@ -19,6 +19,7 @@
 pub mod cosmos;
 pub mod noise;
 pub mod palette;
+pub mod round;
 mod shape;
 mod space;
 mod trees;
@@ -27,7 +28,9 @@ mod underground;
 use std::sync::Arc;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
-use super::generation::{ColumnHeights, TerrainGenerator};
+use super::generation::{self, ColumnHeights, TerrainGenerator};
+use super::layout::ColumnKey;
+use crate::coord::Face;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
 use shape::{Column, Shape};
@@ -250,6 +253,8 @@ impl Materials {
 /// The generator.
 pub struct Terrain {
     seed: i64,
+    /// Every body in the universe; also the generator's mass oracle.
+    cosmos: Arc<cosmos::Cosmos>,
     shape: Shape,
     under: Underground,
     trees: Trees,
@@ -279,6 +284,7 @@ impl Terrain {
         let m = Arc::new(Materials::intern(registry));
         Self {
             seed,
+            cosmos: Arc::new(cosmos::Cosmos::new(s, cfg.space as f32 / 100.0)),
             shape: Shape::new(s, cfg.relief as f32 / 100.0, m.clone()),
             under: Underground::new(s ^ 0x0BAD_CAFE, cfg, m.clone()),
             trees: Trees::new(s ^ 0x7EE5_0000, m.clone()),
@@ -381,6 +387,10 @@ impl TerrainGenerator for Terrain {
         self.seed
     }
 
+    fn mass(&self) -> Arc<dyn crate::gravity::MassOracle> {
+        self.cosmos.clone()
+    }
+
     fn kind(&self) -> &'static str {
         "diffusion"
     }
@@ -420,16 +430,20 @@ impl TerrainGenerator for Terrain {
     }
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
-        let (mut chunks, _) = self.generate_column(cx, cz, cy..=cy);
+        let key = ColumnKey { face: Face::PosY, a: cx, b: cz };
+        let (mut chunks, _) = self.generate_column(key, cy..=cy);
         chunks.pop().expect("one chunk").1
     }
 
     fn generate_column(
         &self,
-        cx: i32,
-        cz: i32,
+        key: ColumnKey,
         cy: std::ops::RangeInclusive<i32>,
     ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+        if key.face != Face::PosY {
+            return generation::generate_column_default(self, key, cy);
+        }
+        let (cx, cz) = (key.a, key.b);
         let n = CHUNK_SIZE as i32;
         let (x0, z0) = (cx * n, cz * n);
         let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];

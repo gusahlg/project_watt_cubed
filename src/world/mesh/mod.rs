@@ -716,7 +716,8 @@ mod tests {
                             &snapshot.chunk,
                             &snapshot.shell,
                             &snapshot.ceiling,
-                            snapshot.world_y0,
+                            snapshot.sky,
+                            snapshot.alt0,
                             &snapshot.tables,
                             &mut grid,
                         );
