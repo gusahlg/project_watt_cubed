@@ -40,6 +40,25 @@ pub enum Patch {
     Core,
 }
 
+/// How the cells of a virtual neighbour chunk (outside every box) map onto the real chunk across a
+/// seam: local cell `l` of the virtual chunk is cell `base + Σ cols[a]·(l[a] − near[a])` of the
+/// real one (columns are signed unit steps across a chart seam, possibly halved across a band
+/// interface — then the map is approximate, an exceptional region).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Remap {
+    pub cols: [[i64; 3]; 3],
+    pub near: [i64; 3],
+    pub base: [i64; 3],
+}
+
+impl Remap {
+    /// The real chunk's local cell for virtual local cell `l` (may leave the chunk for cells far
+    /// from the seam; callers read only the first layer or two).
+    pub fn apply(&self, l: [i64; 3]) -> [i64; 3] {
+        std::array::from_fn(|k| self.base[k] + (0..3).map(|a| self.cols[a][k] * (l[a] - self.near[a])).sum::<i64>())
+    }
+}
+
 /// A point's place in an atlas: its patch, continuous storage coordinates and the local Jacobian.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Local {
@@ -100,34 +119,39 @@ impl Atlas {
         // Bands halve the radius and the angular resolution together until the inner radius would
         // drop under 512; the surface resolution is a multiple of 2^(bands + 1) so every band (and
         // the transition at half the last band) divides evenly.
+        // Everything is chunk aligned (radii, resolutions and storage origins are multiples of 16),
+        // so chart seams fall on chunk boundaries and a chunk's neighbour across a seam is a whole
+        // chunk of the neighbouring chart.
+        let snap = |v: i64| v.div_euclid(16) * 16;
         let mut count = 0u32;
         let mut r = radius / 2;
         while r > 512 {
             count += 1;
             r /= 2;
         }
-        let unit = 1i64 << (count + 1);
+        // The transition runs at n / 2^(count + 1), which must still be a multiple of 16.
+        let unit = 1i64 << (count + 5);
         let mut n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / unit as f64).round().max(1.0) as i64 * unit;
         let mut bands = Vec::new();
-        let (mut r_hi, mut r_lo) = (top, radius / 2);
+        let (mut r_hi, mut r_lo) = (snap(top + 15), snap(radius / 2));
         let mut y = 0i64;
         for _ in 0..count {
             let layers = r_hi - r_lo;
             let origin = std::array::from_fn(|f| [x0, y, f as i64 * (n + GAP)]);
             bands.push(Band { n, r_lo, r_hi, origin });
-            y += layers + GAP;
+            y = snap(y + layers + GAP + 15);
             r_hi = r_lo;
-            r_lo /= 2;
+            r_lo = snap(r_lo / 2);
             n /= 2;
         }
         // Transition shell from the core cube (half-size a) out to r_hi, at half the last band's
         // resolution so the core cube's corners stay inside the sphere.
-        let t_n = (n / 2).max(2);
+        let t_n = (n / 2).max(32);
         let core_half = t_n / 2;
         let t_r = r_hi;
-        let t_layers = (t_r - core_half).max(1);
+        let t_layers = snap((t_r - core_half).max(16) + 15);
         let t_origin = std::array::from_fn(|f| [x0, y, f as i64 * (t_n + GAP)]);
-        y += t_layers + GAP;
+        y = snap(y + t_layers + GAP + 15);
         let core_origin = [x0, y, 0];
         Self { centre, radius, inward, bands, t_n, t_r, t_layers, t_origin, core_half, core_origin }
     }
@@ -288,6 +312,35 @@ impl Atlas {
         None
     }
 
+    /// The chunk across face `(axis, dir)` of storage chunk `c` (chunk coordinates) when that
+    /// neighbour lies outside every box (a chart seam or a band interface): the neighbouring
+    /// patch's chunk and the map from this side's (virtual) neighbour cells to its cells. `None`
+    /// when the plain neighbour is itself inside a box, or nothing lies there (beyond the top, the
+    /// eight corners).
+    pub fn chunk_across(&self, c: [i64; 3], axis: usize, dir: i64) -> Option<([i64; 3], Remap)> {
+        let mut next = c;
+        next[axis] += dir;
+        let probe = |l: [i64; 3]| [next[0] * 16 + l[0], next[1] * 16 + l[1], next[2] * 16 + l[2]];
+        if self.locate(probe([8, 8, 8])).is_some() {
+            return None;
+        }
+        // Where do three cells of the virtual neighbour chunk land? The first gives the chunk, the
+        // other two the axis permutation (cells conform across seams, so the map is a signed
+        // permutation within the chunk, up to a 1 : 2 scale across band interfaces).
+        let near: [i64; 3] = std::array::from_fn(|a| if a == axis { if dir > 0 { 0 } else { 15 } } else { 7 });
+        let g0 = self.glue(probe(near))?;
+        let step = |a: usize| {
+            let mut l = near;
+            l[a] += 1;
+            self.glue(probe(l))
+        };
+        let delta = |g: [i64; 3]| [g[0] - g0[0], g[1] - g0[1], g[2] - g0[2]];
+        let cols: [[i64; 3]; 3] = [delta(step(0)?), delta(step(1)?), delta(step(2)?)];
+        let chunk = [g0[0].div_euclid(16), g0[1].div_euclid(16), g0[2].div_euclid(16)];
+        let base = [g0[0] - chunk[0] * 16, g0[1] - chunk[1] * 16, g0[2] - chunk[2] * 16];
+        Some((chunk, Remap { cols, near, base }))
+    }
+
     /// The eight physical corners of the storage chunk whose minimum cell is `s` (a chunk of 16³
     /// cells, all inside one patch box): the cage the renderer interpolates.
     pub fn chunk_cage(&self, s: [i64; 3]) -> Option<[DVec3; 8]> {
@@ -382,14 +435,49 @@ mod tests {
     }
 
     #[test]
+    fn everything_is_chunk_aligned() {
+        let a = atlas();
+        for p in a.patches() {
+            let (o, size) = a.storage_box(p);
+            assert!(o.iter().all(|v| v % 16 == 0), "{p:?} origin {o:?}");
+            assert!(size[0] % 16 == 0 && size[2] % 16 == 0 && size[1] % 16 == 0, "{p:?} size {size:?}");
+        }
+    }
+
+    #[test]
+    fn the_chunk_across_a_seam_is_a_whole_chunk_with_a_signed_permutation() {
+        let a = atlas();
+        let b = a.bands[0];
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let s = a.storage(top, [b.n - 16, a.radius - b.r_lo, b.n / 2]);
+        let c = [s[0].div_euclid(16), s[1].div_euclid(16), s[2].div_euclid(16)];
+        let (other, remap) = a.chunk_across(c, 0, 1).expect("a seam on +x");
+        assert!(a.locate([other[0] * 16, other[1] * 16, other[2] * 16]).is_some(), "lands in a box");
+        for col in remap.cols {
+            assert_eq!(col.iter().map(|v| v.abs()).sum::<i64>(), 1, "unit step {:?}", remap.cols);
+        }
+        // Every first-layer cell of the virtual neighbour maps to the glued cell.
+        for (y, z) in [(0, 0), (5, 9), (15, 15)] {
+            let l = [0, y, z];
+            let real = remap.apply(l);
+            let glued = a.glue([(c[0] + 1) * 16 + l[0], c[1] * 16 + l[1], c[2] * 16 + l[2]]).unwrap();
+            assert_eq!([other[0] * 16 + real[0], other[1] * 16 + real[1], other[2] * 16 + real[2]], glued);
+        }
+        // Inside a box there is no seam.
+        assert!(a.chunk_across(c, 2, 1).is_none());
+    }
+
+    #[test]
     fn a_surface_chunk_cage_is_nearly_a_unit_cube_scaled_by_16() {
         let a = atlas();
         let b = a.bands[0];
         // A chunk at the datum radius (cells there are one block of arc).
         let s = a.storage(Patch::Shell { band: 0, face: Face::PosZ }, [b.n / 2, a.radius - b.r_lo, b.n / 2]);
         let c = a.chunk_cage(s).unwrap();
-        for (i, j) in [(0, 1), (0, 2), (0, 4)] {
-            assert!(((c[i] - c[j]).length() - 16.0).abs() < 0.05, "{}", (c[i] - c[j]).length());
+        // Tangential edges: 16 cells of one quarter-circle arc / n each (n is rounded for alignment).
+        let arc = std::f64::consts::FRAC_PI_2 * a.radius as f64 / b.n as f64 * 16.0;
+        for (i, j, want) in [(0, 1, arc), (0, 2, 16.0), (0, 4, arc)] {
+            assert!(((c[i] - c[j]).length() - want).abs() < 0.01, "{} vs {want}", (c[i] - c[j]).length());
         }
     }
 }
