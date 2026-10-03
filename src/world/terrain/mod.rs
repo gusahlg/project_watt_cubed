@@ -16,6 +16,7 @@
 //! Every material is a configuration the [`palette`] found in the law; nothing here names an
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
 
+pub mod cosmos;
 pub mod noise;
 pub mod palette;
 mod shape;
