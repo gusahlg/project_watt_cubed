@@ -24,12 +24,15 @@
 //! reads (interior voxels and face borders only).
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 
 use crate::block::registry::HotTables;
 use crate::coord::Face;
+use crate::space::FaceFrame;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk};
 use super::neighborhood::Neighborhood;
+use super::Sky;
 
 /// Maximum light level; the 4-bit domain the packed vertex stores.
 pub const MAX_LIGHT: u8 = 15;
@@ -403,46 +406,51 @@ impl FaceShell {
     }
 }
 
-/// The skylight ceiling per column: the Y at and above which a column is open
-/// sky. Seeded from the generator's ground height (a pure function, so caves
-/// stay consistently dark regardless of chunk load order), then RAISED by
-/// edited opaque roofs ([`raise`](Self::raise)) so a player-built ceiling
-/// shadows every chunk below it instead of leaking full skylight.
+/// The skylight ceiling per face-local column: the altitude at and above which
+/// a column is open sky. Seeded from the generator's ground altitude (a pure
+/// function, so caves stay consistently dark regardless of chunk load order),
+/// then RAISED by edited opaque roofs ([`raise`](Self::raise)) so a player-built
+/// ceiling shadows every chunk below it instead of leaking full skylight.
+/// Columns are indexed `lu + lv * 16` in face-local order. PosY's `(lu, lv)` is
+/// `(x, z)`.
 #[derive(Clone)]
 pub struct CeilingWindow {
+    /// Which face's `(u, v)` orders `surface`. The flood takes that face as a const.
+    #[allow(dead_code)]
+    face: Face,
     surface: [i32; CHUNK_AREA],
-    /// Lowest world Y at which every column is open sky — `max` of `surface`.
-    /// `all_open` for a chunk at `world_y0` is the one compare `world_y0 >= min_surface`.
+    /// Lowest altitude at which every column is open sky — `max` of `surface`.
+    /// A chunk at `alt0` is all-open when `alt0 >= min_surface`.
     min_surface: i32,
 }
 
 impl CeilingWindow {
-    /// Compute surface height per column via generator callback.
-    pub fn from_heights(mut height: impl FnMut(usize, usize) -> i32) -> Self {
+    /// Surface altitude per face-local column via generator callback.
+    pub fn from_heights(face: Face, mut height: impl FnMut(usize, usize) -> i32) -> Self {
         let mut surface = [0i32; CHUNK_AREA];
         let mut min_surface = i32::MIN;
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let h = height(lx, lz);
-                surface[lx + lz * CHUNK_SIZE] = h;
+        for lv in 0..CHUNK_SIZE {
+            for lu in 0..CHUNK_SIZE {
+                let h = height(lu, lv);
+                surface[lu + lv * CHUNK_SIZE] = h;
                 min_surface = min_surface.max(h);
             }
         }
-        Self { surface, min_surface }
+        Self { face, surface, min_surface }
     }
 
     /// Everything open to the sky — for tests and the neutral path.
     #[cfg(test)]
     pub fn open() -> Self {
-        Self { surface: [i32::MIN; CHUNK_AREA], min_surface: i32::MIN }
+        Self { face: Face::PosY, surface: [i32::MIN; CHUNK_AREA], min_surface: i32::MIN }
     }
 
     #[inline]
-    pub(in crate::world) fn open_above(&self, lx: usize, lz: usize, world_y: i32) -> bool {
-        world_y >= self.surface[lx + lz * CHUNK_SIZE]
+    pub(in crate::world) fn open_above(&self, lu: usize, lv: usize, alt: i32) -> bool {
+        alt >= self.surface[lu + lv * CHUNK_SIZE]
     }
 
-    /// Lowest world Y at which every column is open sky.
+    /// Lowest altitude at which every column is open sky.
     #[inline]
     pub(in crate::world) fn min_surface(&self) -> i32 {
         self.min_surface
@@ -450,18 +458,26 @@ impl CeilingWindow {
 
     /// Raise one column's ceiling to at least `surface` (a constructed opaque
     /// roof: open sky begins at the cell ABOVE it). Never lowers — the
-    /// generator ground below stays the floor of the value. The all-open Y
-    /// can only stay or rise.
-    pub(in crate::world) fn raise(&mut self, lx: usize, lz: usize, surface: i32) {
-        let cell = &mut self.surface[lx + lz * CHUNK_SIZE];
+    /// generator ground below stays the floor of the value. The all-open
+    /// altitude can only stay or rise.
+    pub(in crate::world) fn raise(&mut self, lu: usize, lv: usize, surface: i32) {
+        let cell = &mut self.surface[lu + lv * CHUNK_SIZE];
         *cell = (*cell).max(surface);
         self.min_surface = self.min_surface.max(*cell);
     }
 
-    /// The Y at which this column becomes open sky (see [`open_above`](Self::open_above)).
-    pub(in crate::world) fn surface_at(&self, lx: usize, lz: usize) -> i32 {
-        self.surface[lx + lz * CHUNK_SIZE]
+    /// The altitude at which this column becomes open sky (see [`open_above`](Self::open_above)).
+    pub(in crate::world) fn surface_at(&self, lu: usize, lv: usize) -> i32 {
+        self.surface[lu + lv * CHUNK_SIZE]
     }
+}
+
+/// Ceiling the Open kernel ignores. Not on the PosY path.
+pub(in crate::world) fn ignored_ceiling() -> Arc<CeilingWindow> {
+    static CEILING: OnceLock<Arc<CeilingWindow>> = OnceLock::new();
+    Arc::clone(CEILING.get_or_init(|| {
+        Arc::new(CeilingWindow::from_heights(Face::PosY, |_, _| i32::MIN))
+    }))
 }
 
 /// Reusable flood scratch for [`propagate`]: the packed working grid and the
@@ -491,12 +507,42 @@ thread_local! {
 }
 
 /// Recompute chunk light from scratch. Light removal needs no second pass:
-/// breaking emitters or placing blocks just lowers the grid. `world_y0` is chunk's Y origin.
+/// breaking emitters or placing blocks just lowers the grid. `alt0` is the
+/// chunk's minimum altitude along `sky` (for PosY, the chunk's world Y origin).
+#[inline]
 pub fn propagate(
     chunk: &Chunk,
     shell: &FaceShell,
     ceiling: &CeilingWindow,
-    world_y0: i32,
+    sky: Sky,
+    alt0: i32,
+    tables: &HotTables,
+    out: &mut LightGrid,
+) {
+    // Heights are stored in this face's `(u, v)` order. Open ignores the window.
+    debug_assert!(match sky {
+        Sky::Open => true,
+        Sky::Axis(face) => face == ceiling.face,
+    });
+    match sky {
+        Sky::Axis(Face::NegX) => propagate_sky::<0>(chunk, shell, ceiling, alt0, tables, out),
+        Sky::Axis(Face::PosX) => propagate_sky::<1>(chunk, shell, ceiling, alt0, tables, out),
+        Sky::Axis(Face::NegZ) => propagate_sky::<2>(chunk, shell, ceiling, alt0, tables, out),
+        Sky::Axis(Face::PosZ) => propagate_sky::<3>(chunk, shell, ceiling, alt0, tables, out),
+        Sky::Axis(Face::NegY) => propagate_sky::<4>(chunk, shell, ceiling, alt0, tables, out),
+        Sky::Axis(Face::PosY) => propagate_sky::<5>(chunk, shell, ceiling, alt0, tables, out),
+        Sky::Open => propagate_sky::<{ Sky::OPEN_CODE }>(chunk, shell, ceiling, alt0, tables, out),
+    }
+}
+
+/// `SKY` is a [`Face`] discriminant, or [`Sky::OPEN_CODE`]. PosY (`5`) keeps the
+/// original column-mask seed and the −Y full-strength step.
+#[inline]
+fn propagate_sky<const SKY: u8>(
+    chunk: &Chunk,
+    shell: &FaceShell,
+    ceiling: &CeilingWindow,
+    alt0: i32,
     tables: &HotTables,
     out: &mut LightGrid,
 ) {
@@ -521,29 +567,32 @@ pub fn propagate(
     cells.fill(PackedLumel::DARK);
     queue.clear();
     shell_block.clear();
-    // Seed 1: open sky floods down each column until the first opaque voxel
-    // (classic heightmap seed, gated by ceiling). Deep chunks seed nothing here;
-    // their light arrives from the +Y halo. `leading_zeros` of the occupancy
-    // mask is the empty run from y=15; push order is still y=15,14,.. per
-    // column, x-inner z-outer.
-    let top_y = world_y0 + CHUNK_SIZE as i32;
-    for z in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            if !ceiling.open_above(x, z, top_y) {
-                continue;
-            }
-            let n = col[x + z * CHUNK_SIZE].leading_zeros() as usize;
-            for k in 0..n {
-                let y = CHUNK_SIZE - 1 - k;
-                let i = x + z * STRIDE_Z + y * STRIDE_Y;
-                cells[i] = PackedLumel::OPEN_SKY;
-                queue.push_back(i);
+    // Seed 1: open sky from the chunk's high-altitude end along −n until the
+    // first opaque voxel. Open has no ceiling seed. PosY uses the Y occupancy
+    // mask's `leading_zeros` (empty run from y=15); push order is y=15,14,..
+    // per column, x-inner z-outer.
+    if SKY == 5 {
+        let top_y = alt0 + CHUNK_SIZE as i32;
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                if !ceiling.open_above(x, z, top_y) {
+                    continue;
+                }
+                let n = col[x + z * CHUNK_SIZE].leading_zeros() as usize;
+                for k in 0..n {
+                    let y = CHUNK_SIZE - 1 - k;
+                    let i = x + z * STRIDE_Z + y * STRIDE_Y;
+                    cells[i] = PackedLumel::OPEN_SKY;
+                    queue.push_back(i);
+                }
             }
         }
+    } else if SKY != Sky::OPEN_CODE {
+        seed_axis_ceiling::<SKY>(ceiling, alt0, &opaque_bits, &col, &mut cells, &mut queue);
     }
     // Seed 2: one 6×256 walk writes sky now and stashes blocklight for after
     // the emitter scan, so both channels share the face-index table.
-    seed_from_shell(shell, |i, s| {
+    seed_from_shell::<SKY>(shell, |i, s| {
         if s > cells[i].sky() {
             cells[i] = cells[i].with_sky(s);
             queue.push_back(i);
@@ -551,7 +600,8 @@ pub fn propagate(
     }, |i, b| {
         shell_block.push((i, b));
     });
-    // Flood: -1 per step, except full skylight passes straight down (open columns stay lit).
+    // Flood: -1 per step, except full skylight passes straight along −n
+    // (open columns stay lit). Open keeps full sky in every direction.
     while let Some(i) = queue.pop_front() {
         let level = cells[i].sky();
         let (x, y, z) = Chunk::local_of(i);
@@ -565,12 +615,34 @@ pub fn propagate(
                 queue.push_back(ni);
             }
         };
-        if x > 0 { relax(i - 1, false); }
-        if x + 1 < CHUNK_SIZE { relax(i + 1, false); }
-        if y > 0 { relax(i - STRIDE_Y, true); }
-        if y + 1 < CHUNK_SIZE { relax(i + STRIDE_Y, false); }
-        if z > 0 { relax(i - STRIDE_Z, false); }
-        if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z, false); }
+        if SKY == 5 {
+            if x > 0 { relax(i - 1, false); }
+            if x + 1 < CHUNK_SIZE { relax(i + 1, false); }
+            if y > 0 { relax(i - STRIDE_Y, true); }
+            if y + 1 < CHUNK_SIZE { relax(i + STRIDE_Y, false); }
+            if z > 0 { relax(i - STRIDE_Z, false); }
+            if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z, false); }
+        } else if SKY == Sky::OPEN_CODE {
+            if x > 0 { relax(i - 1, true); }
+            if x + 1 < CHUNK_SIZE { relax(i + 1, true); }
+            if y > 0 { relax(i - STRIDE_Y, true); }
+            if y + 1 < CHUNK_SIZE { relax(i + STRIDE_Y, true); }
+            if z > 0 { relax(i - STRIDE_Z, true); }
+            if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z, true); }
+        } else {
+            // Full-strength step along −n. Codes: NegX +X, PosX −X, NegZ +Z, PosZ −Z, NegY +Y.
+            let down_xm = SKY == 1;
+            let down_xp = SKY == 0;
+            let down_yp = SKY == 4;
+            let down_zm = SKY == 3;
+            let down_zp = SKY == 2;
+            if x > 0 { relax(i - 1, down_xm); }
+            if x + 1 < CHUNK_SIZE { relax(i + 1, down_xp); }
+            if y > 0 { relax(i - STRIDE_Y, false); }
+            if y + 1 < CHUNK_SIZE { relax(i + STRIDE_Y, down_yp); }
+            if z > 0 { relax(i - STRIDE_Z, down_zm); }
+            if z + 1 < CHUNK_SIZE { relax(i + STRIDE_Z, down_zp); }
+        }
     }
 
     // Blocklight: low nibble is still dark except where we write emitters, then
@@ -666,10 +738,81 @@ const fn face_index_table() -> [[usize; CHUNK_AREA]; 6] {
 
 const FACE_INDEX: [[usize; CHUNK_AREA]; 6] = face_index_table();
 
-/// Seed border cells from neighbour shell faces (skylight full-strength from +Y).
+/// 16 occupancy bits along X at fixed `(y, z)`. They sit in one `u64` (the
+/// base is a multiple of 16 and `y * 256` is a multiple of 64).
+#[inline]
+fn mask_x(bits: &[u64; CHUNK_VOLUME / 64], y: usize, z: usize) -> u16 {
+    let base = z * STRIDE_Z + y * STRIDE_Y;
+    ((bits[base >> 6] >> (base & 63)) & 0xFFFF) as u16
+}
+
+/// 16 occupancy bits along Z at fixed `(x, y)`. Stride 16, so this is a gather.
+#[inline]
+fn mask_z(bits: &[u64; CHUNK_VOLUME / 64], x: usize, y: usize) -> u16 {
+    let mut mask = 0u16;
+    let mut z = 0;
+    while z < CHUNK_SIZE {
+        let i = x + z * STRIDE_Z + y * STRIDE_Y;
+        if (bits[i >> 6] >> (i & 63)) & 1 != 0 {
+            mask |= 1 << z;
+        }
+        z += 1;
+    }
+    mask
+}
+
+/// Ceiling seed for every axis except +Y (that path is inlined in [`propagate_sky`]).
+/// Positive faces walk from local 15 with `leading_zeros`; negative faces walk
+/// from local 0 with `trailing_zeros`. Push order is lv-outer, lu-inner.
+fn seed_axis_ceiling<const SKY: u8>(
+    ceiling: &CeilingWindow,
+    alt0: i32,
+    opaque_bits: &[u64; CHUNK_VOLUME / 64],
+    col: &[u16; CHUNK_AREA],
+    cells: &mut [PackedLumel; CHUNK_VOLUME],
+    queue: &mut VecDeque<usize>,
+) {
+    let face = Face::ALL[SKY as usize];
+    let frame = FaceFrame::new(face);
+    let top = alt0 + CHUNK_SIZE as i32;
+    let positive = face.sign() > 0;
+    let axis = face.axis();
+    for lv in 0..CHUNK_SIZE {
+        for lu in 0..CHUNK_SIZE {
+            if !ceiling.open_above(lu, lv, top) {
+                continue;
+            }
+            let (mut lx, mut ly, mut lz) = frame.index_to_world(lu, 0, lv);
+            let mask = match axis {
+                0 => mask_x(opaque_bits, ly, lz),
+                1 => col[lx + lz * CHUNK_SIZE],
+                _ => mask_z(opaque_bits, lx, ly),
+            };
+            let n = if positive {
+                mask.leading_zeros() as usize
+            } else {
+                mask.trailing_zeros() as usize
+            };
+            for k in 0..n {
+                let along = if positive { CHUNK_SIZE - 1 - k } else { k };
+                match axis {
+                    0 => lx = along,
+                    1 => ly = along,
+                    _ => lz = along,
+                }
+                let i = Chunk::index(lx, ly, lz);
+                cells[i] = PackedLumel::OPEN_SKY;
+                queue.push_back(i);
+            }
+        }
+    }
+}
+
+/// Seed border cells from neighbour shell faces. Full skylight is kept only
+/// across the face whose normal is `+n` (every face when `SKY` is open).
 /// Dark shell cells (missing neighbours) don't seed. One 6×256 walk; callers
 /// split sky (applied now) from block (stashed until after emitters).
-fn seed_from_shell(
+fn seed_from_shell<const SKY: u8>(
     shell: &FaceShell,
     mut sky: impl FnMut(usize, u8),
     mut block: impl FnMut(usize, u8),
@@ -677,7 +820,11 @@ fn seed_from_shell(
     for face in Face::ALL {
         let layer = &shell.faces[face as usize];
         let idx = &FACE_INDEX[face as usize];
-        let keep_full_sky = face == Face::PosY;
+        let keep_full_sky = if SKY == 5 {
+            face == Face::PosY
+        } else {
+            SKY == Sky::OPEN_CODE || face as u8 == SKY
+        };
         for slot in 0..CHUNK_AREA {
             let src = layer[slot];
             let sky_raw = src.sky();
@@ -749,7 +896,15 @@ mod tests {
 
     fn lit(chunk: &Chunk) -> LightGrid {
         let mut grid = LightGrid::dark();
-        propagate(chunk, &FaceShell::dark(), &CeilingWindow::open(), 0, &tables(), &mut grid);
+        propagate(
+            chunk,
+            &FaceShell::dark(),
+            &CeilingWindow::open(),
+            Sky::Axis(Face::PosY),
+            0,
+            &tables(),
+            &mut grid,
+        );
         grid
     }
 
@@ -828,13 +983,13 @@ mod tests {
 
         let pin = |chunk: &Chunk, shell: &FaceShell, ceiling: &CeilingWindow, world_y0: i32| {
             let mut grid = LightGrid::dark();
-            propagate(chunk, shell, ceiling, world_y0, &tables, &mut grid);
+            propagate(chunk, shell, ceiling, Sky::Axis(Face::PosY), world_y0, &tables, &mut grid);
             grid_hash(&grid)
         };
         let ceiling_at = |cx: i32, cz: i32| {
             let x0 = cx * CHUNK_SIZE as i32;
             let z0 = cz * CHUNK_SIZE as i32;
-            CeilingWindow::from_heights(|lx, lz| generator.height(x0 + lx as i32, z0 + lz as i32))
+            CeilingWindow::from_heights(Face::PosY, |lx, lz| generator.height(x0 + lx as i32, z0 + lz as i32))
         };
 
         // Surface chunk at the origin column, real ceiling, dark neighbours.
@@ -850,13 +1005,13 @@ mod tests {
         // the pin is the blocklight field.
         let mut emissive = Chunk::new(0, -3, 0, &generator);
         emissive.set_index(Chunk::index(8, 8, 8), lumin);
-        let closed = CeilingWindow::from_heights(|_, _| 1000);
+        let closed = CeilingWindow::from_heights(Face::PosY, |_, _| 1000);
         let emissive_hash = pin(&emissive, &FaceShell::dark(), &closed, -3 * CHUNK_SIZE as i32);
 
         // All-air under a checkerboard ceiling, plus a patterned neighbour
         // shell so the pin covers `seed_from_shell`.
         let air = Chunk::from_uniform(0, 2, 0, BlockId(0));
-        let partial = CeilingWindow::from_heights(|lx, lz| {
+        let partial = CeilingWindow::from_heights(Face::PosY, |lx, lz| {
             if (lx + lz) % 2 == 0 { 100 } else { i32::MIN }
         });
         let mut nbr = LightGrid::dark();
@@ -937,13 +1092,21 @@ mod tests {
         let chunk = Chunk::new(0, cy, 0, &generator);
         let tables = registry.hot_tables();
         let shell = FaceShell::dark();
-        let ceiling = CeilingWindow::from_heights(|lx, lz| generator.height(lx as i32, lz as i32));
+        let ceiling = CeilingWindow::from_heights(Face::PosY, |lx, lz| generator.height(lx as i32, lz as i32));
         let mut out = LightGrid::dark();
 
         const N: usize = 4000;
         let start = std::time::Instant::now();
         for _ in 0..N {
-            propagate(&chunk, &shell, &ceiling, cy * CHUNK_SIZE as i32, &tables, &mut out);
+            propagate(
+                &chunk,
+                &shell,
+                &ceiling,
+                Sky::Axis(Face::PosY),
+                cy * CHUNK_SIZE as i32,
+                &tables,
+                &mut out,
+            );
             std::hint::black_box(&out);
         }
         let dt = start.elapsed();
@@ -956,7 +1119,7 @@ mod tests {
 
     #[test]
     fn min_surface_is_the_all_open_y() {
-        let c = CeilingWindow::from_heights(|lx, lz| 10 + (lx + lz) as i32);
+        let c = CeilingWindow::from_heights(Face::PosY, |lx, lz| 10 + (lx + lz) as i32);
         assert_eq!(c.min_surface(), 10 + 2 * (CHUNK_SIZE as i32 - 1));
         let y0 = c.min_surface();
         assert!(
@@ -967,7 +1130,7 @@ mod tests {
             !(0..CHUNK_SIZE).all(|lz| (0..CHUNK_SIZE).all(|lx| c.open_above(lx, lz, y0 - 1))),
             "one below min_surface is not all-open"
         );
-        let mut raised = CeilingWindow::from_heights(|_, _| 10);
+        let mut raised = CeilingWindow::from_heights(Face::PosY, |_, _| 10);
         assert_eq!(raised.min_surface(), 10);
         raised.raise(0, 0, 40);
         assert_eq!(raised.min_surface(), 40);
@@ -1023,7 +1186,15 @@ mod tests {
         // Uniform opaque (id 1) → all dark, regardless of ceiling.
         let opaque = Chunk::from_uniform(0, -10, 0, BlockId(1));
         let mut got = LightGrid::dark();
-        propagate(&opaque, &FaceShell::dark(), &CeilingWindow::from_heights(|_, _| 100), -160, &tables, &mut got);
+        propagate(
+            &opaque,
+            &FaceShell::dark(),
+            &CeilingWindow::from_heights(Face::PosY, |_, _| 100),
+            Sky::Axis(Face::PosY),
+            -160,
+            &tables,
+            &mut got,
+        );
         assert!(got == LightGrid::dark(), "uniform opaque == dark()");
         assert!(
             matches!(got.0, Repr::Uniform(v) if v == Lumel::DARK),
@@ -1037,7 +1208,8 @@ mod tests {
         propagate(
             &emissive,
             &FaceShell::dark(),
-            &CeilingWindow::from_heights(|_, _| 100),
+            &CeilingWindow::from_heights(Face::PosY, |_, _| 100),
+            Sky::Axis(Face::PosY),
             -160,
             &tables,
             &mut got,
@@ -1046,7 +1218,15 @@ mod tests {
         // Uniform air fully open to the sky → full sky, no blocklight.
         let air = Chunk::from_uniform(0, 10, 0, BlockId(0));
         let mut got = LightGrid::dark();
-        propagate(&air, &FaceShell::dark(), &CeilingWindow::open(), 160, &tables, &mut got);
+        propagate(
+            &air,
+            &FaceShell::dark(),
+            &CeilingWindow::open(),
+            Sky::Axis(Face::PosY),
+            160,
+            &tables,
+            &mut got,
+        );
         assert!(got == LightGrid::open_sky(), "open-sky air == open_sky()");
         assert!(
             matches!(
@@ -1126,6 +1306,7 @@ mod tests {
             &roof,
             &FaceShell::dark(),
             &ceiling,
+            Sky::Axis(Face::PosY),
             ROOF_Y,
             &tables(),
             &mut roof_light,
@@ -1144,6 +1325,7 @@ mod tests {
             &lower,
             &upper_shell,
             &ceiling,
+            Sky::Axis(Face::PosY),
             lower_y0,
             &tables(),
             &mut lower_light,
@@ -1162,9 +1344,17 @@ mod tests {
         // reports the top as closed, so no skylight is seeded and the cavern is
         // dark — consistently, regardless of the 16-cell chunk alignment.
         let chunk = Chunk::from_cells(0, -8, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
-        let ceiling = CeilingWindow::from_heights(|_, _| 40); // surface well above this chunk
+        let ceiling = CeilingWindow::from_heights(Face::PosY, |_, _| 40); // surface well above this chunk
         let mut grid = LightGrid::dark();
-        propagate(&chunk, &FaceShell::dark(), &ceiling, -128, &tables(), &mut grid);
+        propagate(
+            &chunk,
+            &FaceShell::dark(),
+            &ceiling,
+            Sky::Axis(Face::PosY),
+            -128,
+            &tables(),
+            &mut grid,
+        );
 
         assert_eq!(grid.at(Chunk::index(4, 8, 4)).sky, LightLevel::DARK, "cavern dark");
         assert_eq!(grid.at(Chunk::index(0, 0, 0)).sky, LightLevel::DARK, "cavern floor dark");
@@ -1179,9 +1369,17 @@ mod tests {
     fn blocklight_falls_off_by_one_per_step() {
         let mut chunk = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         chunk.set_local(8, 8, 8, BlockId(2)); // emitter, level 15
-        let ceiling = CeilingWindow::from_heights(|_, _| 100); // fully underground: isolate blocklight
+        let ceiling = CeilingWindow::from_heights(Face::PosY, |_, _| 100); // fully underground: isolate blocklight
         let mut grid = LightGrid::dark();
-        propagate(&chunk, &FaceShell::dark(), &ceiling, 0, &tables(), &mut grid);
+        propagate(
+            &chunk,
+            &FaceShell::dark(),
+            &ceiling,
+            Sky::Axis(Face::PosY),
+            0,
+            &tables(),
+            &mut grid,
+        );
 
         assert_eq!(grid.at(Chunk::index(8, 8, 8)).block.get(), 15, "the emitter");
         assert_eq!(grid.at(Chunk::index(9, 8, 8)).block.get(), 14, "one step");
@@ -1237,7 +1435,7 @@ mod tests {
         let mut left_c = Chunk::from_cells(0, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
         left_c.set_local(14, 8, 8, BlockId(2)); // emitter near the +X border
         let right_c = Chunk::from_cells(1, 0, 0, Box::new([BlockId(0); CHUNK_VOLUME]));
-        let ceiling = CeilingWindow::from_heights(|_, _| 100); // underground: isolate blocklight
+        let ceiling = CeilingWindow::from_heights(Face::PosY, |_, _| 100); // underground: isolate blocklight
 
         // Shell with one neighbour across face (dark elsewhere).
         fn shell(face: Face, nbr: &LightGrid) -> FaceShell {
@@ -1250,9 +1448,25 @@ mod tests {
         loop {
             passes += 1;
             let mut new_left = LightGrid::dark();
-            propagate(&left_c, &shell(Face::PosX, &right), &ceiling, 0, &tables, &mut new_left);
+            propagate(
+                &left_c,
+                &shell(Face::PosX, &right),
+                &ceiling,
+                Sky::Axis(Face::PosY),
+                0,
+                &tables,
+                &mut new_left,
+            );
             let mut new_right = LightGrid::dark();
-            propagate(&right_c, &shell(Face::NegX, &new_left), &ceiling, 0, &tables, &mut new_right);
+            propagate(
+                &right_c,
+                &shell(Face::NegX, &new_left),
+                &ceiling,
+                Sky::Axis(Face::PosY),
+                0,
+                &tables,
+                &mut new_right,
+            );
             let stable = !border_changed(&left, &new_left, Face::PosX)
                 && !border_changed(&right, &new_right, Face::NegX);
             left = new_left;
@@ -1365,4 +1579,124 @@ mod tests {
         }
     }
 
+    /// Rotating a chunk, its shell and its ceiling onto face `f` and propagating
+    /// with `Sky::Axis(f)` matches the rotated PosY grid. The fixpoint is unique,
+    /// so a different BFS order still has to land on the same bytes.
+    #[test]
+    fn light_is_equivariant_under_every_face_frame() {
+        use voxel_engine::DVec3;
+
+        fn xs(s: &mut u32) -> u32 {
+            *s ^= s.wrapping_shl(13);
+            *s ^= s.wrapping_shr(17);
+            *s ^= s.wrapping_shl(5);
+            *s
+        }
+
+        fn rotate_shell(frame: FaceFrame, src: &FaceShell) -> FaceShell {
+            let mut faces = [[PackedLumel::DARK; CHUNK_AREA]; 6];
+            let mut seen = [[false; CHUNK_AREA]; 6];
+            for src_face in Face::ALL {
+                let (dx, dy, dz) = src_face.delta();
+                let (wx, wy, wz) = frame.cell_to_world((dx, dy, dz));
+                let dst_face = Face::from_dominant(DVec3::new(wx as f64, wy as f64, wz as f64));
+                for slot in 0..CHUNK_AREA {
+                    let src_i = FACE_INDEX[src_face as usize][slot];
+                    let (x, y, z) = Chunk::local_of(src_i);
+                    let (ix, iy, iz) = frame.index_to_world(x, y, z);
+                    let dst_i = Chunk::index(ix, iy, iz);
+                    let dst_slot = FACE_INDEX[dst_face as usize]
+                        .iter()
+                        .position(|&i| i == dst_i)
+                        .expect("rotated border cell stays on the image face");
+                    assert!(!seen[dst_face as usize][dst_slot], "shell slot collision");
+                    seen[dst_face as usize][dst_slot] = true;
+                    faces[dst_face as usize][dst_slot] = src.faces[src_face as usize][slot];
+                }
+            }
+            assert!(seen.iter().all(|row| row.iter().all(|&s| s)));
+            FaceShell { faces }
+        }
+
+        let tables = tables();
+        let alt0 = 100;
+        for seed in [0x51_u32, 0xA5] {
+            let mut state = seed;
+            let mut src_cells = [BlockId(0); CHUNK_VOLUME];
+            for cell in &mut src_cells {
+                *cell = match xs(&mut state) % 8 {
+                    0 => BlockId(1),
+                    1 => BlockId(3),
+                    _ => BlockId(0),
+                };
+            }
+            let mut shell_faces = [[PackedLumel::DARK; CHUNK_AREA]; 6];
+            for face in &mut shell_faces {
+                for slot in face.iter_mut() {
+                    let sky = (xs(&mut state) % 16) as u8;
+                    let block = (xs(&mut state) % 16) as u8;
+                    *slot = PackedLumel::pack(Lumel {
+                        sky: LightLevel::new(sky),
+                        block: LightLevel::new(block),
+                    });
+                }
+            }
+            let src_shell = FaceShell { faces: shell_faces };
+            let mut heights = [0i32; CHUNK_AREA];
+            for h in &mut heights {
+                *h = match xs(&mut state) % 5 {
+                    0 => i32::MIN,
+                    1 => alt0 - 5,
+                    2 => alt0 + 8,
+                    3 => alt0 + 16,
+                    _ => alt0 + 20,
+                };
+            }
+            let src_chunk = Chunk::from_cells(0, 0, 0, Box::new(src_cells));
+            let src_ceiling = CeilingWindow::from_heights(Face::PosY, |u, v| heights[u + v * 16]);
+            let mut src_grid = LightGrid::dark();
+            propagate(
+                &src_chunk,
+                &src_shell,
+                &src_ceiling,
+                Sky::Axis(Face::PosY),
+                alt0,
+                &tables,
+                &mut src_grid,
+            );
+
+            for face in Face::ALL {
+                let frame = FaceFrame::new(face);
+                let mut image = [BlockId(0); CHUNK_VOLUME];
+                for i in 0..CHUNK_VOLUME {
+                    let (u, a, v) = Chunk::local_of(i);
+                    let id = src_chunk.get_local(u, a, v);
+                    let (x, y, z) = frame.index_to_world(u, a, v);
+                    image[Chunk::index(x, y, z)] = id;
+                }
+                let image_chunk = Chunk::from_cells(0, 0, 0, Box::new(image));
+                let image_shell = rotate_shell(frame, &src_shell);
+                let image_ceiling = CeilingWindow::from_heights(face, |u, v| heights[u + v * 16]);
+                let mut image_grid = LightGrid::dark();
+                propagate(
+                    &image_chunk,
+                    &image_shell,
+                    &image_ceiling,
+                    Sky::Axis(face),
+                    alt0,
+                    &tables,
+                    &mut image_grid,
+                );
+                for i in 0..CHUNK_VOLUME {
+                    let (u, a, v) = Chunk::local_of(i);
+                    let (x, y, z) = frame.index_to_world(u, a, v);
+                    assert_eq!(
+                        image_grid.at(Chunk::index(x, y, z)),
+                        src_grid.at(i),
+                        "{face:?} seed {seed:#x} cell ({u},{a},{v})"
+                    );
+                }
+            }
+        }
+    }
 }

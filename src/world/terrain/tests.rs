@@ -1,7 +1,9 @@
 //! Generator contract and character checks.
 
 use super::*;
+use crate::coord::Face;
 use crate::world::chunk::Chunk;
+use crate::world::layout::ColumnKey;
 
 fn make(seed: i64) -> (BlockRegistry, Terrain) {
     let mut reg = BlockRegistry::with_builtins();
@@ -55,7 +57,7 @@ fn batch_generation_equals_the_per_voxel_definition_in_every_realm() {
 fn column_heights_agree_on_every_path() {
     let (_reg, t) = make(7);
     for (cx, cz) in [(0, 0), (-3, 9), (100, -40)] {
-        let (_, hs) = t.generate_column(cx, cz, 1..=0);
+        let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, 1..=0);
         let h16 = t.heights_16(cx, cz);
         for lz in 0..16 {
             for lx in 0..16 {
@@ -217,7 +219,7 @@ fn worldgen_column_cost() {
     for cx in 0..12 {
         for cz in 0..12 {
             let h = t.height(cx * 16, cz * 16).div_euclid(16);
-            let (c, _) = t.generate_column(cx, cz, h - 4..=h + 2);
+            let (c, _) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, h - 4..=h + 2);
             chunks += c.len();
         }
     }

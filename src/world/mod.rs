@@ -32,6 +32,8 @@ pub mod brick;
 pub mod chunk;
 pub mod connectivity;
 pub mod generation;
+mod layout;
+pub use layout::{ColumnKey, Sky};
 pub mod light;
 pub mod lod;
 pub mod mesh;
@@ -65,6 +67,7 @@ use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
 use crate::coord::{ByPass, ChunkBox, ChunkCoord};
+use crate::space::FaceFrame;
 use chunk::{CHUNK_SIZE, Chunk};
 use generation::WorldgenKind;
 use heightmip::HeightMip;
@@ -963,7 +966,7 @@ pub struct World {
     /// Reused by the section admission lane.
     admit_sections: AdmitScratch<SectionPos>,
     /// Reused column list for [`World::request_region_data`].
-    gen_columns: Vec<(u64, (i32, i32), (i32, i32))>,
+    gen_columns: Vec<(u64, ColumnKey, (i32, i32))>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
@@ -1023,12 +1026,12 @@ pub struct World {
     /// Degraded-snapshot flag carried from mesh submit to claim, so a rejected
     /// submit does not mutate the degraded or terminal sets.
     mesh_pending_degraded: Option<(Coord, bool)>,
-    /// Skylight ceiling per `(x, z)` chunk column — the surface heightmap the
-    /// settle pass seeds skylight from. A pure generator function (independent of
-    /// y and of edits), so it is computed once per column and reused across every
-    /// vertical chunk and every re-settle instead of re-sampling 256 noise columns
-    /// per settle. Pruned when a column fully unloads.
-    ceilings: FastMap<(i32, i32), Arc<light::CeilingWindow>>,
+    /// Skylight ceiling per [`ColumnKey`] — the surface heightmap the settle
+    /// pass seeds skylight from. A pure generator function (independent of
+    /// altitude and of edits), so it is computed once per column and reused
+    /// across every chunk of the run and every re-settle. Pruned when a column
+    /// fully unloads. `Open` chunks are not entered.
+    ceilings: FastMap<ColumnKey, Arc<light::CeilingWindow>>,
     /// Panic counts per failed claim, for the bounded-retry policy in
     /// [`fail_job`](World::fail_job). Rare by construction (a strike is a
     /// worker panic), so the map stays tiny.
@@ -1094,11 +1097,10 @@ pub struct World {
     /// the left shell (old ∖ new). `None` after a radius change, so the next
     /// cross scans every loaded chunk.
     prev_unload_box: Option<ChunkBox>,
-    /// Loaded chunk-Y layers per `(x, z)` column, highest first. Empty vec is
-    /// pruned so a column's cached ceiling drops exactly when its last chunk
-    /// unloads (was: rebuild a live-column set over the WHOLE map per boundary
-    /// cross).
-    column_chunks: FastMap<(i32, i32), Vec<i32>>,
+    /// Loaded altitude-chunk indices per [`ColumnKey`], highest first. Empty
+    /// vec is pruned so a column's cached ceiling drops exactly when its last
+    /// chunk unloads. PosY altitudes are chunk Y. `Open` chunks are not entered.
+    column_chunks: FastMap<ColumnKey, Vec<i32>>,
     /// Whether occlusion was active last stream (render honours visible set if active).
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
@@ -2528,12 +2530,17 @@ impl StreamLane for LightLane {
         }
         world.refresh_tables();
         let shell = world.capture_face_shell(key);
-        let ceiling = world.capture_ceiling(key);
+        let sky = world.generator.sky(key);
+        let (alt0, ceiling) = match sky {
+            Sky::Open => (0, light::ignored_ceiling()),
+            Sky::Axis(face) => (FaceFrame::new(face).chunk_alt0(key), world.capture_ceiling(key)),
+        };
         let snapshot = pipeline::LightSnapshot {
             chunk: Arc::clone(&world.chunks[&key].chunk),
             shell,
             ceiling,
-            world_y0: key.y * CHUNK_SIZE as i32,
+            sky,
+            alt0,
             tables: world.tables.get(),
         };
         Some(pipeline::Job::Light {

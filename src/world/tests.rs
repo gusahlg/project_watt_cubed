@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::block::registry::AIR;
+use crate::coord::Face;
 use crate::math::Aabb;
 use crate::render_config::RenderConfig;
 use voxel_engine::{DVec3, Pass};
@@ -663,7 +664,10 @@ fn failed_jobs_release_claims_then_quarantine_after_repeated_strikes() {
     for cy in 0..=2 {
         world.generating.insert(ChunkCoord::new(cx, cy, cz));
     }
-    world.fail_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=2 });
+    world.fail_job(pipeline::JobKey::Column {
+        key: ColumnKey { face: Face::PosY, a: cx, b: cz },
+        range: 0..=2,
+    });
     assert!((0..=2).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
     // Section lane: a panicked Meshing claim is dropped so selection retries.
@@ -697,7 +701,10 @@ fn cancelled_jobs_release_claims_without_strikes() {
     for cy in 0..=1 {
         world.generating.insert(ChunkCoord::new(cx, cy, cz));
     }
-    world.cancel_job(pipeline::JobKey::Column { col: (cx, cz), cy: 0..=1 });
+    world.cancel_job(pipeline::JobKey::Column {
+        key: ColumnKey { face: Face::PosY, a: cx, b: cz },
+        range: 0..=1,
+    });
     assert!((0..=1).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
     // Section: only the EXACT token clears the claim (a live replacement
@@ -1705,7 +1712,11 @@ fn stale_light_result_does_not_land_on_a_regenerated_chunk() {
     // Unload without releasing the in-flight claim — matches `unload_far`
     // when the job has not yet landed in the apply queue.
     world.chunks.remove(&coord).expect("origin pregenerated");
-    if let Some(ys) = world.column_chunks.get_mut(&(coord.x, coord.z)) {
+    if let Some(ys) = world.column_chunks.get_mut(&ColumnKey {
+        face: Face::PosY,
+        a: coord.x,
+        b: coord.z,
+    }) {
         ys.retain(|&y| y != coord.y);
     }
 
@@ -2367,4 +2378,230 @@ fn anything_in_flight_tracks_claims_and_queues() {
     world.light_apply_queue.clear();
     world.light_inflight.insert(c);
     assert!(world.anything_in_flight());
+}
+
+/// Ground occupies `x < 40`; skylight falls along −X. PosY batching is not involved.
+struct PosXGround {
+    rock: BlockId,
+}
+
+impl crate::world::generation::TerrainGenerator for PosXGround {
+    fn height(&self, _wx: i32, _wz: i32) -> i32 {
+        0
+    }
+
+    fn surface(&self, face: Face, _u: i32, _v: i32) -> i32 {
+        if face == Face::PosX { 40 } else { i32::MIN }
+    }
+
+    fn surface_at(&self, _wx: i32, _wz: i32) -> BlockId {
+        self.rock
+    }
+
+    fn deep(&self) -> BlockId {
+        self.rock
+    }
+
+    fn sky(&self, _c: ChunkCoord) -> Sky {
+        Sky::Axis(Face::PosX)
+    }
+
+    fn block_at(&self, wx: i32, _wy: i32, _wz: i32, _height: i32) -> BlockId {
+        if wx < 40 { self.rock } else { AIR }
+    }
+
+    fn generate(&self, cx: i32, _cy: i32, _cz: i32) -> chunk::ChunkData {
+        let x0 = cx * CHUNK_SIZE as i32;
+        if x0 >= 40 {
+            return chunk::ChunkData::Uniform(AIR);
+        }
+        if x0 + CHUNK_SIZE as i32 <= 40 {
+            return chunk::ChunkData::Uniform(self.rock);
+        }
+        let mut cells = Box::new([AIR; chunk::CHUNK_VOLUME]);
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if x0 + (lx as i32) < 40 {
+                        cells[Chunk::index(lx, ly, lz)] = self.rock;
+                    }
+                }
+            }
+        }
+        chunk::ChunkData::from_cells(cells)
+    }
+}
+
+/// No ground and no ceiling. Every face keeps full skylight.
+struct OpenAir;
+
+impl crate::world::generation::TerrainGenerator for OpenAir {
+    fn height(&self, _wx: i32, _wz: i32) -> i32 {
+        i32::MIN
+    }
+
+    fn surface_at(&self, _wx: i32, _wz: i32) -> BlockId {
+        AIR
+    }
+
+    fn deep(&self) -> BlockId {
+        AIR
+    }
+
+    fn sky(&self, _c: ChunkCoord) -> Sky {
+        Sky::Open
+    }
+
+    fn block_at(&self, _wx: i32, _wy: i32, _wz: i32, _height: i32) -> BlockId {
+        AIR
+    }
+
+    fn generate(&self, _cx: i32, _cy: i32, _cz: i32) -> chunk::ChunkData {
+        chunk::ChunkData::Uniform(AIR)
+    }
+}
+
+fn drain_light(world: &mut World) {
+    let mut n = 0u32;
+    loop {
+        let Some(coord) = LightLane::seed_set(world).and_then(|s| s.iter().copied().next()) else {
+            break;
+        };
+        LightLane::seed_set(world).expect("worklist").remove(&coord);
+        if let Some(pipeline::Job::Light { snapshot, coord: c, .. }) = LightLane::submit(world, coord)
+        {
+            let mut grid = light::LightGrid::dark();
+            light::propagate(
+                &snapshot.chunk,
+                &snapshot.shell,
+                &snapshot.ceiling,
+                snapshot.sky,
+                snapshot.alt0,
+                &snapshot.tables,
+                &mut grid,
+            );
+            world.settle_light(c, grid);
+        }
+        n += 1;
+        assert!(n < 200, "light worklist did not drain");
+    }
+}
+
+/// +X face: air above the ground is full sky, a roofed pocket is dark, and a
+/// roof edit re-seeds that column only.
+#[test]
+fn pos_x_sky_lights_above_the_ground_and_reseeds_the_column() {
+    let mut world = World::with_kind(1, RenderConfig::default(), WorldgenKind::Flat, false);
+    let rock = world.registry.id_by_label("rock").unwrap();
+    world.generator = Arc::new(PosXGround { rock });
+    world.refresh_tables();
+
+    // Mixed chunk (world x 32..47): solid below 40, full sky at and above it.
+    let mixed = ChunkCoord::new(2, 0, 0);
+    let (mixed_key, mixed_alt) = ColumnKey::of(Face::PosX, mixed);
+    let (layers, heights) = world.generator.generate_column(mixed_key, mixed_alt..=mixed_alt);
+    let chunk = Chunk::from_data(mixed.x, mixed.y, mixed.z, layers.into_iter().next().unwrap().1);
+    let ceiling = light::CeilingWindow::from_heights(mixed_key.face, |lu, lv| {
+        heights[lu + lv * CHUNK_SIZE]
+    });
+    let mut grid = light::LightGrid::dark();
+    light::propagate(
+        &chunk,
+        &light::FaceShell::dark(),
+        &ceiling,
+        Sky::Axis(Face::PosX),
+        2 * CHUNK_SIZE as i32,
+        &world.tables.get(),
+        &mut grid,
+    );
+    assert_eq!(grid.at(Chunk::index(7, 4, 4)).sky.get(), 0, "below the +X ground");
+    assert_eq!(grid.at(Chunk::index(8, 4, 4)).sky.get(), 15, "first open cell");
+    assert_eq!(grid.at(Chunk::index(15, 4, 4)).sky.get(), 15, "top of the chunk");
+
+    let above = ChunkCoord::new(3, 0, 0); // world x 48..63, entirely above 40
+    let solid = ChunkCoord::new(1, 0, 0); // world x 16..31, entirely ground
+    let (key, alt) = ColumnKey::of(Face::PosX, above);
+    assert_eq!(key, ColumnKey { face: Face::PosX, a: -1, b: 0 });
+    assert_eq!(alt, 3);
+    assert_eq!(ColumnKey::of(Face::PosX, solid).0, key);
+    world.ensure_data(above);
+    world.ensure_data(solid);
+    assert!(
+        world.chunks[&above].light.as_ref() == Some(&light::LightGrid::open_sky()),
+        "a chunk above the +X ground is fully sky-lit"
+    );
+    assert!(world.chunks[&solid].light.as_ref() == Some(&light::LightGrid::dark()));
+    assert_eq!(world.ceilings[&key].min_surface(), 40);
+    assert!(!world.light_worklist.contains(&above));
+
+    // Opaque plane at world x = 50 (local x = 2) across the whole chunk.
+    for y in 0..CHUNK_SIZE as i32 {
+        for z in 0..CHUNK_SIZE as i32 {
+            world.set_block(50, y, z, rock);
+        }
+    }
+    let seeded: Vec<ChunkCoord> = world.light_worklist.iter().copied().collect();
+    assert!(seeded.contains(&above));
+    assert!(seeded.contains(&solid), "the column below the roof re-seeds");
+    assert_eq!(seeded.len(), 2);
+    assert!(world.ceilings.get(&key).is_none(), "the roof drops the cached ceiling");
+
+    drain_light(&mut world);
+    let lit = world.chunks[&above].light.as_ref().unwrap();
+    assert_eq!(lit.at(Chunk::index(0, 8, 8)).sky.get(), 0, "under the roof");
+    assert_eq!(lit.at(Chunk::index(1, 8, 8)).sky.get(), 0, "under the roof");
+    assert_eq!(lit.at(Chunk::index(2, 8, 8)).sky.get(), 0, "the roof cell");
+    assert_eq!(lit.at(Chunk::index(3, 8, 8)).sky.get(), 15, "just above the roof");
+    assert_eq!(lit.at(Chunk::index(15, 8, 8)).sky.get(), 15, "the +X end");
+    assert_eq!(world.ceilings[&key].min_surface(), 51);
+
+    // A neighbouring column must not be part of the roof's re-seed.
+    let other = ChunkCoord::new(3, 0, 1);
+    assert_ne!(ColumnKey::of(Face::PosX, other).0, key);
+    world.ensure_data(other);
+    world.light_worklist.clear();
+    world.set_block(50, 0, 0, AIR);
+    let seeded: Vec<ChunkCoord> = world.light_worklist.iter().copied().collect();
+    assert!(seeded.contains(&above), "punching the roof re-seeds its chunk");
+    assert!(seeded.contains(&solid), "and the rest of the column at or below it");
+    assert!(!seeded.contains(&other), "a different column stays put");
+}
+
+/// Open air takes the trivial full-sky path. A rock in that air is lit from every face.
+#[test]
+fn open_region_lights_a_floating_rock_from_every_side() {
+    let mut world = World::with_kind(1, RenderConfig::default(), WorldgenKind::Flat, false);
+    world.generator = Arc::new(OpenAir);
+    let center = ChunkCoord::new(0, 0, 0);
+    world.ensure_data(center);
+    assert!(
+        world.chunks[&center].light.as_ref() == Some(&light::LightGrid::open_sky()),
+        "uniform Open air takes the trivial path"
+    );
+    assert!(!world.light_worklist.contains(&center));
+    assert!(world.ceilings.is_empty(), "Open chunks have no ceiling");
+    for face in Face::ALL {
+        let n = center.step(face);
+        world.ensure_data(n);
+        assert!(world.chunks[&n].light.as_ref() == Some(&light::LightGrid::open_sky()));
+        assert!(
+            !world.light_worklist.contains(&center),
+            "{face:?} next to open sky must not reseed the centre"
+        );
+    }
+    assert!(world.ceilings.is_empty());
+
+    let rock = world.registry.id_by_label("rock").unwrap();
+    world.set_block(8, 8, 8, rock);
+    assert!(world.light_worklist.contains(&center));
+    drain_light(&mut world);
+    let grid = world.chunks[&center].light.as_ref().unwrap();
+    assert_eq!(grid.at(Chunk::index(8, 8, 8)).sky.get(), 0, "the rock blocks light");
+    for (x, y, z) in [(7, 8, 8), (9, 8, 8), (8, 7, 8), (8, 9, 8), (8, 8, 7), (8, 8, 9)] {
+        assert_eq!(
+            grid.at(Chunk::index(x, y, z)).sky.get(),
+            15,
+            "full sky beside the rock at ({x},{y},{z}) — Open does not attenuate"
+        );
+    }
 }

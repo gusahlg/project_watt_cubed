@@ -184,13 +184,56 @@ impl Face {
     }
 
     /// World axis this face is perpendicular to (0=X, 1=Y, 2=Z).
-    #[cfg(test)]
     #[inline]
     pub const fn axis(self) -> usize {
         match self {
             Face::NegX | Face::PosX => 0,
             Face::NegY | Face::PosY => 1,
             Face::NegZ | Face::PosZ => 2,
+        }
+    }
+
+    /// +1 on the positive face, −1 on the negative. Discriminants pair Neg/Pos,
+    /// so the low bit is the positive face.
+    #[inline]
+    pub const fn sign(self) -> i32 {
+        if (self as usize) & 1 == 1 { 1 } else { -1 }
+    }
+
+    /// Outward unit step. Same triple as [`delta`](Self::delta).
+    #[inline]
+    pub const fn normal(self) -> (i32, i32, i32) {
+        self.delta()
+    }
+
+    #[inline]
+    pub fn dvec(self) -> voxel_engine::DVec3 {
+        let (x, y, z) = self.normal();
+        voxel_engine::DVec3::new(x as f64, y as f64, z as f64)
+    }
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Signed axis of the largest absolute component. Equal magnitudes break
+    /// toward X, then Y, then Z. The zero vector (including −0) is [`Face::PosY`].
+    #[inline]
+    pub fn from_dominant(v: voxel_engine::DVec3) -> Face {
+        let (ax, ay, az) = (v.x.abs(), v.y.abs(), v.z.abs());
+        if ax == 0.0 && ay == 0.0 && az == 0.0 {
+            return Face::PosY;
+        }
+        // `>=` so X beats Y and Z, and Y beats Z.
+        if ax >= ay && ax >= az {
+            if v.x > 0.0 { Face::PosX } else { Face::NegX }
+        } else if ay >= az {
+            if v.y > 0.0 { Face::PosY } else { Face::NegY }
+        } else if v.z > 0.0 {
+            Face::PosZ
+        } else {
+            Face::NegZ
         }
     }
 
@@ -383,6 +426,31 @@ mod tests {
                 assert_eq!(f.touches(l), want(dx, dy, dz), "touches {f:?} at {:?}", (lx, ly, lz));
             }
         }
+    }
+
+    #[test]
+    fn face_axis_sign_normal_and_dominant() {
+        use voxel_engine::DVec3;
+        for face in Face::ALL {
+            assert_eq!(face.normal(), face.delta());
+            assert_eq!(face.index(), face as usize);
+            assert_eq!(face.sign(), if face.index() & 1 == 1 { 1 } else { -1 });
+            let (x, y, z) = face.normal();
+            assert_eq!(face.dvec(), DVec3::new(x as f64, y as f64, z as f64));
+            assert_eq!(Face::from_dominant(face.dvec()), face);
+            assert_eq!(Face::from_dominant(face.dvec() * 3.5), face);
+        }
+        assert_eq!(Face::PosX.axis(), 0);
+        assert_eq!(Face::NegY.axis(), 1);
+        assert_eq!(Face::PosZ.axis(), 2);
+        assert_eq!(Face::from_dominant(DVec3::ZERO), Face::PosY);
+        assert_eq!(Face::from_dominant(DVec3::new(-0.0, 0.0, -0.0)), Face::PosY);
+        // Equal |components|: X before Y before Z, even when X is the negative one.
+        assert_eq!(Face::from_dominant(DVec3::new(-5.0, 5.0, 0.0)), Face::NegX);
+        assert_eq!(Face::from_dominant(DVec3::new(1.0, 1.0, 1.0)), Face::PosX);
+        assert_eq!(Face::from_dominant(DVec3::new(0.0, -2.0, 2.0)), Face::NegY);
+        assert_eq!(Face::from_dominant(DVec3::new(0.0, -2.0, 3.0)), Face::PosZ);
+        assert_eq!(Face::from_dominant(DVec3::new(0.0, 0.0, -4.0)), Face::NegZ);
     }
 
     #[test]
