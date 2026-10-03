@@ -141,7 +141,7 @@ impl Pose {
     /// player looks down, and casting a shadow like any other avatar.
     pub fn draw(&self, f3: &mut Frame3D, color: Color, include_head: bool) {
         let ground = self.feet + Vec3::new(0.0, SHADOW_LIFT, 0.0);
-        f3.draw_shadow(ground, SHADOW_RADIUS, SHADOW_COLOR);
+        f3.draw_shadow(ground, Vec3::Y, SHADOW_RADIUS, SHADOW_COLOR);
         for (i, part) in RIG.iter().enumerate() {
             if i == HEAD && !include_head {
                 continue;

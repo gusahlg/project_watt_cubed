@@ -191,7 +191,7 @@ impl Palette {
         self.colors[r][a]
     }
 
-    /// The palette colour for `role` at sun elevation `elev` (`sun_dir().y`,
+    /// The palette colour for `role` at sun elevation `elev` (`dot(sun_dir, up)`,
     /// [-1, 1]): Sunset at the horizon, blended to Day above ([`DAY_BLEND`])
     /// and Night below ([`NIGHT_BLEND`]), derivative-continuous at both joins.
     pub fn at(&self, role: Role, elev: f32) -> Rgb {

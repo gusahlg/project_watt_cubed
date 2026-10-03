@@ -28,16 +28,27 @@ const SPACE_HORIZON: Rgb = Rgb::linear(0.0015, 0.003, 0.009);
 /// (the engine scales the halo by `0.5 + turbidity`).
 const SPACE_TURBIDITY: f32 = -0.46;
 
-/// How far into space a camera at `y` is: 0 in the atmosphere, 1 above it (smoothstep).
-pub fn space_factor(y: f64) -> f32 {
-    let t = ((y - SPACE_FADE.0) / (SPACE_FADE.1 - SPACE_FADE.0)).clamp(0.0, 1.0) as f32;
+/// How far into space an altitude above the local surface datum is: 0 in the
+/// atmosphere, 1 above it (smoothstep). The `+Y` face datum is world `y = 0`.
+pub fn space_factor(altitude: f64) -> f32 {
+    let t = ((altitude - SPACE_FADE.0) / (SPACE_FADE.1 - SPACE_FADE.0)).clamp(0.0, 1.0) as f32;
     t * t * (3.0 - 2.0 * t)
+}
+
+/// The viewer's local sky frame for one composed frame.
+///
+/// `up` is the body frame before roll (`ViewPose::up`).
+/// `altitude` is metres above the local surface datum (`Game::sky_altitude`).
+#[derive(Clone, Copy, Debug)]
+pub struct SkyContext {
+    pub up: DVec3,
+    pub altitude: f64,
 }
 
 /// Per-frame rendering state (linear colour, unclamped).
 pub struct FrameSnapshot {
     pub sun_dir: Vec3,
-    /// Sun elevation in radians; drives palette blending for day/night.
+    /// Sun elevation above the local horizon, `dot(sun_dir, up)` in `[-1, 1]`.
     pub elevation: f32,
     pub day_night_mix: f32,
     pub light: Rgb,
@@ -55,19 +66,26 @@ pub struct FrameSnapshot {
     pub jitter: JitterOffset,
     /// World time wrapped into [0, ANIM_PERIOD) for shader animation phase (unused).
     pub anim_time: f32,
-    /// Camera XZ wrapped to [0,1) in f64 before downcast, preserving f32 precision at distance.
+    /// Tangent-plane camera position wrapped to [0,1) in f64 before downcast.
+    /// World XZ when up is `+Y`.
     pub anim_uv: [f32; 2],
-    /// Camera altitude; tells shader where to position the cloud slab.
+    /// Altitude above the local datum; tells the shader where the cloud slab sits.
     /// Pass f32::MAX when clouds are disabled to skip rendering.
     pub camera_y: f32,
 }
 
-/// Camera XZ wrapped to [0,1) in f64 before downcast, preserving f32 phase
-/// precision at distance. Split out so the game can cache it by exact camera
-/// XZ bits: translation-free frames skip both `rem_euclid` divisions.
-pub fn animation_uv(cam_world: DVec3) -> [f32; 2] {
+/// Wrap two tangent-plane metres into `[0, 1)` in f64 before the f32 downcast.
+/// The game caches by the unwrapped plane coords so a still eye skips both divisions.
+pub fn wrap_plane(u: f64, v: f64) -> [f32; 2] {
     let period = genconst::ANIM_PERIOD as f64;
-    [(cam_world.x / period).rem_euclid(1.0) as f32, (cam_world.z / period).rem_euclid(1.0) as f32]
+    [(u / period).rem_euclid(1.0) as f32, (v / period).rem_euclid(1.0) as f32]
+}
+
+/// Camera position projected onto the local tangent plane, then wrapped.
+/// For up `+Y` the basis is world X and Z, so this is the old world-XZ wrap.
+#[cfg(test)]
+pub fn animation_uv(cam: DVec3, tangent: DVec3, bitangent: DVec3) -> [f32; 2] {
+    wrap_plane(cam.dot(tangent), cam.dot(bitangent))
 }
 
 /// Compute per-frame lighting state from sky conditions and time.
@@ -79,16 +97,29 @@ pub fn compose(
     exposure: Exposure,
     render: &RenderConfig,
 ) -> FrameSnapshot {
-    compose_at(sky, sky.frame(), cam_world, animation_uv(cam_world), exposure, render)
+    let (t, _, b) = voxel_engine::local_sky_basis(Vec3::Y);
+    compose_at(
+        sky,
+        sky.frame(),
+        SkyContext { up: DVec3::Y, altitude: cam_world.y },
+        animation_uv(
+            cam_world,
+            DVec3::new(t.x as f64, t.y as f64, t.z as f64),
+            DVec3::new(b.x as f64, b.y as f64, b.z as f64),
+        ),
+        exposure,
+        render,
+    )
 }
 
-/// [`compose`] against an already-sampled clock frame and animation UV, so the
-/// game's per-frame caches (clock sample by day value, UV by camera XZ bits)
-/// feed the one composition path instead of a parallel one.
+/// [`compose`] against an already-sampled clock frame, local sky context, and
+/// animation UV. The caller built `frame` with `ctx.up`, so elevation is that
+/// dot and is not recomputed here. Caches key the clock on day and up, and the
+/// UV on the tangent-plane projection.
 pub fn compose_at(
     sky: &Sky,
     frame: SkyFrame,
-    cam_world: DVec3,
+    ctx: SkyContext,
     anim_uv: [f32; 2],
     exposure: Exposure,
     render: &RenderConfig,
@@ -135,7 +166,7 @@ pub fn compose_at(
     // Above the atmosphere the sky goes black and starry and the haze thins. Only the sky lanes
     // fade: the ambient above was taken from the atmosphere's zenith, and the GPU luma-matches
     // its zenith tints, so planets stay lit by the sun and the near-sky bounce.
-    let space = space_factor(cam_world.y);
+    let space = space_factor(ctx.altitude);
     let zenith = zenith.lerp(SPACE_ZENITH, space);
     let horizon = horizon.lerp(SPACE_HORIZON, space);
     let fog_density = fog_density * (1.0 - 0.75 * space);
@@ -162,7 +193,7 @@ pub fn compose_at(
         anim_time,
         anim_uv,
         // When clouds are off, f32::MAX makes sky.frag early-out at no cost.
-        camera_y: if render.clouds { cam_world.y as f32 } else { f32::MAX },
+        camera_y: if render.clouds { ctx.altitude as f32 } else { f32::MAX },
     }
 }
 
@@ -222,5 +253,58 @@ mod tests {
             compose(&sky, DVec3::new(12_345.0, 80.0, -54_321.0), Exposure::DEFAULT, &render);
         assert_ne!(snapshot.anim_uv, [0.0; 2], "wrapped camera-XZ anchoring survives");
         assert_eq!(snapshot.camera_y, f32::MAX, "clouds-off sentinel early-outs the shader");
+    }
+
+    fn basis_dvec(v: Vec3) -> DVec3 {
+        DVec3::new(v.x as f64, v.y as f64, v.z as f64)
+    }
+
+    #[test]
+    fn plus_y_animation_uv_is_the_world_xz_wrap() {
+        let cam = DVec3::new(12_345.0, 80.0, -54_321.0);
+        let (t, _, b) = voxel_engine::local_sky_basis(Vec3::Y);
+        let uv = animation_uv(cam, basis_dvec(t), basis_dvec(b));
+        assert_eq!(uv, wrap_plane(cam.x, cam.z));
+    }
+
+    #[test]
+    fn plus_x_animation_uv_uses_the_tangent_plane() {
+        let cam = DVec3::new(10.0, 20.0, 30.0);
+        let (t, u, b) = voxel_engine::local_sky_basis(Vec3::X);
+        assert_eq!((t, u, b), (Vec3::Y, Vec3::X, -Vec3::Z));
+        let uv = animation_uv(cam, basis_dvec(t), basis_dvec(b));
+        assert_eq!(uv, wrap_plane(cam.y, -cam.z));
+        assert_ne!(uv, wrap_plane(cam.x, cam.z));
+    }
+
+    #[test]
+    fn compose_follows_local_up_and_altitude() {
+        let mut sky = Sky::new();
+        sky.clock.set_day(0.5);
+        let render = RenderConfig { clouds: true, ..RenderConfig::default() };
+        let frame = sky.frame_at_day(0.5, Vec3::X);
+        let ground = compose_at(
+            &sky,
+            frame,
+            SkyContext { up: DVec3::X, altitude: 0.0 },
+            [0.0; 2],
+            Exposure::DEFAULT,
+            &render,
+        );
+        assert!((ground.elevation - frame.sun_dir.dot(Vec3::X)).abs() < 1e-6);
+        assert_ne!(ground.elevation, frame.sun_dir.y);
+        assert_eq!(ground.star_floor, 0.0);
+        assert_eq!(ground.camera_y, 0.0);
+
+        let space = compose_at(
+            &sky,
+            frame,
+            SkyContext { up: DVec3::X, altitude: 900.0 },
+            [0.0; 2],
+            Exposure::DEFAULT,
+            &render,
+        );
+        assert_eq!(space.star_floor, 1.0);
+        assert!((space.camera_y - 900.0).abs() < 1e-3);
     }
 }

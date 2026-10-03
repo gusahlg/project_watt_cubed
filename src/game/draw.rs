@@ -18,9 +18,9 @@ use crate::ui::{self, Anchor, HudMode};
 pub(super) struct DrawState {
     /// Camera orientation by frame/yaw/pitch/roll/FOV bits; translation stays separate.
     camera_cache: Memo<[u64; 6], Camera3D>,
-    sky_frame_cache: Memo<u64, SkyFrame>,
-    /// Frozen lighting by day and the game's render/palette revision.
-    static_frame_cache: Memo<(u64, u64, u32), StaticFrame>,
+    sky_frame_cache: Memo<(u64, [u32; 3]), SkyFrame>,
+    /// Frozen lighting by day, content revision, space factor, and body up.
+    static_frame_cache: Memo<(u64, u64, u32, [u32; 3]), StaticFrame>,
     anim_uv_cache: Memo<[u64; 2], [f32; 2]>,
     coord_cache: Memo<[i64; 3], String>,
     fps_cache: Memo<i32, String>,
@@ -57,6 +57,8 @@ struct Scene {
     camera: Camera3D,
     /// The one clock sample every sun consumer shares this frame.
     sky_frame: SkyFrame,
+    /// Body up and altitude above the local surface datum.
+    sky_ctx: crate::frame_snapshot::SkyContext,
     peers: Vec<PeerDraw>,
     frame_uniforms: voxel_engine::skeleton::FrameUniformsGpu,
     clear: voxel_engine::LinearRgb,
@@ -67,12 +69,25 @@ struct Scene {
 
 /// Lighting/clear state for a profile whose sky and animation inputs are
 /// frozen (weather, clouds, and exposure all disabled).
-/// Wrapped camera-XZ animation coordinates are cached independently so camera
+/// Wrapped tangent-plane animation coordinates are cached independently so camera
 /// motion does not force the palette and lighting packet to be recomposed.
 #[derive(Clone, Copy)]
 struct StaticFrame {
     uniforms: voxel_engine::skeleton::FrameUniformsGpu,
     clear: voxel_engine::LinearRgb,
+}
+
+/// Quantised body up, and the eye projected onto the local tangent plane.
+/// The plane coords key the anim-UV cache: a still eye skips `rem_euclid`.
+fn sky_keys(eye: DVec3, up: DVec3) -> ([u32; 3], [f64; 2]) {
+    let u = up.as_vec3();
+    let up_q = [u.x.to_bits(), u.y.to_bits(), u.z.to_bits()];
+    let (t, _, b) = voxel_engine::local_sky_basis(u);
+    let plane = [
+        eye.dot(DVec3::new(t.x as f64, t.y as f64, t.z as f64)),
+        eye.dot(DVec3::new(b.x as f64, b.y as f64, b.z as f64)),
+    ];
+    (up_q, plane)
 }
 
 fn hud_label(
@@ -156,9 +171,9 @@ impl Game {
         };
 
         // ONE clock sample for lighting, clear colour, and sky geometry,
-        // cached by the day value. Day/night off renders fixed noon (cheap,
-        // readable stripped-profile lighting) while the authoritative clock
-        // keeps its stored time for networking and re-enables.
+        // cached by the quantised day and body up. Day/night off renders fixed
+        // noon (cheap, readable stripped-profile lighting) while the
+        // authoritative clock keeps its stored time for networking and re-enables.
         let sky_day = if self.render.day_night {
             // 1/4096 of a day (~0.15 s of a 600 s day) — imperceptible, and
             // the scripted/golden path pins the clock so goldens stay bit-stable.
@@ -166,38 +181,44 @@ impl Game {
         } else {
             0.5
         };
+        let sky_ctx = crate::frame_snapshot::SkyContext {
+            up: pose.up(),
+            altitude: self.sky_altitude(pose.eye),
+        };
+        let (up_q, plane) = sky_keys(pose.eye, sky_ctx.up);
+        let up = sky_ctx.up.as_vec3();
         let sky = &self.sky;
         let sky_frame = *self
             .drawing
             .sky_frame_cache
-            .get_or(sky_day.to_bits(), || sky.frame_at_day(sky_day));
+            .get_or((sky_day.to_bits(), up_q), || sky.frame_at_day(sky_day, up));
 
-        // Wrapped camera-XZ animation coordinates recomputed only when the eye XZ changes.
-        let uv_key = [pose.eye.x.to_bits(), pose.eye.z.to_bits()];
-        let anim_uv = *self
-            .drawing
-            .anim_uv_cache
-            .get_or(uv_key, || crate::frame_snapshot::animation_uv(pose.eye));
+        // Tangent-plane animation coordinates, recomputed only when that projection changes.
+        let uv_key = [plane[0].to_bits(), plane[1].to_bits()];
+        let anim_uv = *self.drawing.anim_uv_cache.get_or(uv_key, || {
+            crate::frame_snapshot::wrap_plane(plane[0], plane[1])
+        });
 
         // With weather, clouds, and exposure all disabled the composed packet is
-        // a pure function of the day value (clouds off also freezes the engine's
-        // animation clock): cache it and patch only the camera-anchored UV lanes.
+        // a pure function of the day, the body up, and the altitude's space fade
+        // (clouds off also freezes the engine's animation clock): cache it and
+        // patch only the camera-anchored UV lanes.
         // Minimum/Fast ride this path.
         let cacheable_frame = !self.render.weather && !self.render.clouds && !self.render.exposure;
         let (mut frame_uniforms, cached_clear) = if cacheable_frame {
             let render = &self.render;
-            // (day, content_rev, altitude's space fade): any render/palette change
-            // bumps the stamp, so the freeze predicate's own inputs invalidate the
-            // entry structurally.
-            let space = crate::frame_snapshot::space_factor(pose.eye.y).to_bits();
-            let key = (sky_day.to_bits(), self.content_rev.0, space);
+            // (day, content_rev, altitude's space fade, body up): any render/palette
+            // change bumps the stamp, so the freeze predicate's own inputs invalidate
+            // the entry structurally.
+            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude).to_bits();
+            let key = (sky_day.to_bits(), self.content_rev.0, space, up_q);
             let cached = self.drawing.static_frame_cache.get_or(key, || {
                 let snapshot = crate::frame_snapshot::compose_at(
-                    sky, sky_frame, pose.eye, anim_uv, exposure, render,
+                    sky, sky_frame, sky_ctx, anim_uv, exposure, render,
                 );
                 StaticFrame {
                     uniforms: voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
-                    clear: sky.clear_at(sky_frame),
+                    clear: sky.clear_at(sky_frame, up),
                 }
             });
             (cached.uniforms, Some(cached.clear))
@@ -205,7 +226,7 @@ impl Game {
             let snapshot = crate::frame_snapshot::compose_at(
                 sky,
                 sky_frame,
-                pose.eye,
+                sky_ctx,
                 anim_uv,
                 exposure,
                 &self.render,
@@ -232,7 +253,7 @@ impl Game {
         // sky-hole detector. Normal: real clear, no debug flat.
         let (clear, debug_flat) = match self.debug_view {
             DebugView::Normal => (
-                cached_clear.unwrap_or_else(|| self.sky.clear_at(sky_frame)),
+                cached_clear.unwrap_or_else(|| self.sky.clear_at(sky_frame, up)),
                 None,
             ),
             // Pure-magenta endpoints (255/0) decode identically under sRGB and raw
@@ -247,6 +268,7 @@ impl Game {
             pose,
             camera,
             sky_frame,
+            sky_ctx,
             peers,
             frame_uniforms,
             clear,
@@ -318,9 +340,12 @@ impl Game {
                 voxel_engine::Lighting::Composed(scene.frame_uniforms),
             );
             f3.set_debug_flat(scene.debug_flat);
+            // Fog and water read the same basis as the sky, including debug-flat frames.
+            f3.set_local_frame(scene.sky_ctx.up.as_vec3(), scene.sky_ctx.altitude as f32);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
-                self.sky.draw(&mut f3, scene.sky_frame);
+                self.sky
+                    .draw(&mut f3, scene.sky_frame, pose.eye, self.world.terrain());
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
             self.world.render(&mut f3, pose.eye);
@@ -465,22 +490,27 @@ impl Game {
         } else {
             0.5
         };
+        let sky_ctx = crate::frame_snapshot::SkyContext {
+            up: pose.up(),
+            altitude: self.sky_altitude(pose.eye),
+        };
+        let (up_q, plane) = sky_keys(pose.eye, sky_ctx.up);
+        let up = sky_ctx.up.as_vec3();
         let sky_frame = {
             let sky = &self.sky;
             *self
                 .drawing
                 .sky_frame_cache
-                .get_or(sky_day.to_bits(), || sky.frame_at_day(sky_day))
+                .get_or((sky_day.to_bits(), up_q), || sky.frame_at_day(sky_day, up))
         };
-        let uv_key = [pose.eye.x.to_bits(), pose.eye.z.to_bits()];
-        let anim_uv = *self
-            .drawing
-            .anim_uv_cache
-            .get_or(uv_key, || crate::frame_snapshot::animation_uv(pose.eye));
+        let uv_key = [plane[0].to_bits(), plane[1].to_bits()];
+        let anim_uv = *self.drawing.anim_uv_cache.get_or(uv_key, || {
+            crate::frame_snapshot::wrap_plane(plane[0], plane[1])
+        });
         let cacheable = !self.render.weather && !self.render.clouds && !self.render.exposure;
         if cacheable {
-            let space = crate::frame_snapshot::space_factor(pose.eye.y).to_bits();
-            let key = (sky_day.to_bits(), self.content_rev.0, space);
+            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude).to_bits();
+            let key = (sky_day.to_bits(), self.content_rev.0, space, up_q);
             let uniforms = {
                 let sky = &self.sky;
                 let render = &self.render;
@@ -488,14 +518,14 @@ impl Game {
                     let snapshot = crate::frame_snapshot::compose_at(
                         sky,
                         sky_frame,
-                        pose.eye,
+                        sky_ctx,
                         anim_uv,
                         voxel_engine::skeleton::Exposure::DEFAULT,
                         render,
                     );
                     StaticFrame {
                         uniforms: voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
-                        clear: sky.clear_at(sky_frame),
+                        clear: sky.clear_at(sky_frame, up),
                     }
                 });
                 let mut uniforms = cached.uniforms;

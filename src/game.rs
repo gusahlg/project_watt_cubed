@@ -1735,6 +1735,13 @@ impl Game {
             }
         }
     }
+
+    /// Altitude above the local surface datum. The `+Y` face datum is `y = 0`
+    /// near spawn, so this is the eye's world `y` until a later task swaps in
+    /// the cosmos body altitude.
+    pub fn sky_altitude(&self, eye: DVec3) -> f64 {
+        eye.y
+    }
 }
 
 /// Whether a mod-supplied modal can both be seen and receive input. Free over
@@ -1808,6 +1815,13 @@ mod tests {
         // overlay_phase returns Some only for text, Escape, or console-open edges.
         let inert = FrameInput::inert();
         assert!(!inert.is_text && !inert.g_escape && !inert.open_console && !inert.open_chat);
+    }
+
+    #[test]
+    fn sky_altitude_is_the_eye_y_on_the_plus_y_datum() {
+        let world = World::with_config_lazy(1, RenderConfig::default());
+        let game = Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "alt".into());
+        assert_eq!(game.sky_altitude(DVec3::new(12.0, 40.0, -3.0)), 40.0);
     }
 
     #[test]

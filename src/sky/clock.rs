@@ -1,6 +1,6 @@
 //! `SkyClock` — the single source of "when". Everything visual about the sky
 //! derives from one wrapped fraction of the day; there are no other time inputs.
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_1_SQRT_2, TAU};
 
 use voxel_engine::Vec3;
 
@@ -41,7 +41,7 @@ pub struct SkyClock {
 pub struct SkyFrame {
     /// Unit direction toward the sun (see [`SkyClock::sun_dir`]).
     pub sun_dir: Vec3,
-    /// Sun elevation above the horizon, `[-1, 1]` (`sun_dir.y`).
+    /// Sun elevation above the local horizon, `[-1, 1]` (`dot(sun_dir, up)`).
     pub elevation: f32,
     /// Daylight amount in `[0, 1]` with smooth twilight (see [`SkyClock::daylight`]).
     pub daylight: f32,
@@ -70,16 +70,23 @@ impl SkyClock {
         self.day = day.rem_euclid(1.0);
     }
 
-    /// Unit direction toward the sun. Rises in the east (`+x`), peaks overhead at
-    /// noon, sets in the west; a small `z` tilt keeps it off a perfect great
-    /// circle so the arc reads as a path rather than a line.
+    /// Unit direction toward the sun. It rotates in the plane perpendicular to
+    /// the cube's body diagonal `(1, 1, 1)/√3`, phase from the day fraction, so
+    /// every face gets a day of the same length. On `+Y`, noon is that face's
+    /// projection of `+Y` (elevation `√(2/3)`); sunrise and sunset sit on the horizon.
     pub fn sun_dir(&self) -> Vec3 {
         let a = TAU * (self.day - 0.25); // 0 at sunrise, π/2 at noon
-        Vec3::new(a.cos() as f32, a.sin() as f32, 0.2).normalize()
+        let (s, c) = a.sin_cos();
+        let inv_sqrt6 = 6.0_f64.sqrt().recip();
+        // e1 = n × e2 = (−1/√2, 0, 1/√2), e2 = (−1, 2, −1)/√6, sun = c·e1 + s·e2.
+        let x = -c * FRAC_1_SQRT_2 - s * inv_sqrt6;
+        let y = s * (2.0 * inv_sqrt6);
+        let z = c * FRAC_1_SQRT_2 - s * inv_sqrt6;
+        Vec3::new(x as f32, y as f32, z as f32).normalize()
     }
 
-    /// Sun elevation above the horizon, `[-1, 1]` (`sun_dir().y`). The single
-    /// scalar the atmosphere and lighting blend day↔night on.
+    /// `+Y`-face elevation (`sun_dir().y`). Callers that have a local up use
+    /// [`SkyClock::frame`] instead.
     #[cfg(test)]
     pub fn sun_elevation(&self) -> f32 {
         self.sun_dir().y
@@ -92,11 +99,12 @@ impl SkyClock {
         smoothstep(-0.12, 0.18, self.sun_elevation())
     }
 
-    /// Sample direction, elevation, and daylight once — the per-frame form
-    /// every consumer shares (lighting compose, clear colour, sky geometry).
-    pub fn frame(&self) -> SkyFrame {
+    /// Sample direction, elevation against `up`, and daylight once — the
+    /// per-frame form every consumer shares (lighting compose, clear colour,
+    /// sky geometry). `up` is the body frame; it is already unit.
+    pub fn frame(&self, up: Vec3) -> SkyFrame {
         let sun_dir = self.sun_dir();
-        let elevation = sun_dir.y;
+        let elevation = sun_dir.dot(up);
         SkyFrame { sun_dir, elevation, daylight: smoothstep(-0.12, 0.18, elevation) }
     }
 }
@@ -121,8 +129,37 @@ mod tests {
     fn sun_is_up_at_noon_and_down_at_midnight() {
         let noon = SkyClock { day: 0.5 };
         let midnight = SkyClock { day: 0.0 };
-        assert!(noon.sun_elevation() > 0.9, "noon sun overhead");
-        assert!(midnight.sun_elevation() < -0.9, "midnight sun below");
+        // The body-diagonal orbit peaks at √(2/3) ≈ 0.816 on +Y, not overhead.
+        assert!(noon.sun_elevation() > 0.81, "noon sun above the +Y face");
+        assert!(midnight.sun_elevation() < -0.81, "midnight sun below the +Y face");
         assert!(noon.daylight() > 0.99 && midnight.daylight() < 0.01);
+    }
+
+    #[test]
+    fn sun_stays_perpendicular_to_the_body_diagonal() {
+        let n = Vec3::ONE.normalize();
+        for i in 0..48 {
+            let day = i as f64 / 48.0;
+            let sun = SkyClock { day }.sun_dir();
+            assert!((sun.length() - 1.0).abs() < 1e-5, "unit at {day}");
+            assert!(sun.dot(n).abs() < 1e-4, "perpendicular at {day}: {}", sun.dot(n));
+        }
+    }
+
+    #[test]
+    fn every_cube_face_gets_day_and_night() {
+        let peak = (2.0_f32 / 3.0).sqrt();
+        let faces = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+        for up in faces {
+            let mut hi = f32::MIN;
+            let mut lo = f32::MAX;
+            for i in 0..360 {
+                let elev = SkyClock { day: i as f64 / 360.0 }.sun_dir().dot(up);
+                hi = hi.max(elev);
+                lo = lo.min(elev);
+            }
+            assert!((hi - peak).abs() < 1e-3, "peak on {up:?}: {hi} vs {peak}");
+            assert!((lo + peak).abs() < 1e-3, "night on {up:?}: {lo}");
+        }
     }
 }
