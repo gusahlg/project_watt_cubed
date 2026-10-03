@@ -19,12 +19,12 @@ use crate::coord::Face;
 use crate::input::intent::{GameplayAxis, GameplayEvent, GameplayState};
 use crate::input::router::Gameplay;
 use crate::math::{PER_METER, WORLD_BORDER};
-use crate::player::{Motion, Player, STANDARD_GRAVITY, Stance, collision_box, feet_of};
+use crate::player::{Motion, Player, Stance, collision_box, feet_of};
 use crate::world::World;
 
 const SPRINT_MULT: f64 = 1.5; // horizontal speed multiplier while sprinting
 #[cfg(test)]
-const GRAVITY: f64 = STANDARD_GRAVITY; // the reference pull the tests stand in
+const GRAVITY: f64 = crate::player::STANDARD_GRAVITY; // the reference pull the tests stand in
 const JUMP_SPEED: f64 = 8.5 * PER_METER; // initial upward velocity of a jump
 /// Velocity-approach rates (units / second of exponential response). Acceleration,
 /// braking, friction, and sprint transitions are all the *same* operation — velocity

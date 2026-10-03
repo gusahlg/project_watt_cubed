@@ -90,6 +90,7 @@ impl Seams {
     }
 
     /// No atlases: every answer is the plain grid.
+    #[cfg(test)]
     pub fn none() -> Self {
         Self::new(Vec::new())
     }
@@ -97,6 +98,11 @@ impl Seams {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
+    }
+
+    /// The atlases (the generator's round bodies).
+    pub fn atlases(&self) -> &[Arc<Atlas>] {
+        &self.atlases
     }
 
     #[inline]
@@ -108,6 +114,7 @@ impl Seams {
     }
 
     /// Whether `c` is a storage chunk inside some box.
+    #[cfg(test)]
     pub fn in_storage(&self, c: Coord) -> bool {
         self.region_of(c).is_some()
     }
@@ -230,10 +237,8 @@ impl Seams {
     /// cells and storage outside every box.
     pub fn physical_cell(&self, cell: BlockCoord) -> Option<(i32, i32, i32)> {
         let c = Coord::new(cell.x.div_euclid(CS as i32), cell.y.div_euclid(CS as i32), cell.z.div_euclid(CS as i32));
-        let r = self.region_of(c)?;
-        let atlas = &self.atlases[r.atlas];
-        let (patch, l) = atlas.locate([cell.x as i64, cell.y as i64, cell.z as i64])?;
-        let p = atlas.embed(patch, glam::DVec3::new(l[0] as f64 + 0.5, l[1] as f64 + 0.5, l[2] as f64 + 0.5));
+        self.region_of(c)?;
+        let p = crate::space::atlas::embed_cell(&self.atlases, (cell.x, cell.y, cell.z))?;
         Some((p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32))
     }
 
@@ -347,6 +352,29 @@ impl super::World {
                 shell.set(face, i, grid.map_or(super::light::PackedLumel::DARK, |g| g.packed_at(idx)));
             });
         }
+    }
+
+    /// The round body whose atlas covers physical point `p` (its bands, transition or core): there
+    /// motion and picking run in that patch's storage frame.
+    pub fn atlas_at(&self, p: glam::DVec3) -> Option<&Arc<Atlas>> {
+        self.seams.atlases().iter().find(|a| a.find(p).is_some())
+    }
+
+    /// The generator's round bodies.
+    pub fn atlases(&self) -> &[Arc<Atlas>] {
+        self.seams.atlases()
+    }
+
+    /// The cell that really holds storage cell `c`: the neighbouring chart's cell for a cell just
+    /// outside a box, else `c` itself.
+    pub fn glued(&self, c: (i32, i32, i32)) -> (i32, i32, i32) {
+        self.seams.glue_cell(BlockCoord::new(c.0, c.1, c.2)).map_or(c, |g| (g.x, g.y, g.z))
+    }
+
+    /// Test worlds: hand round bodies to a world whose generator has none (cells placed by edits).
+    #[cfg(test)]
+    pub fn set_atlases(&mut self, atlases: Vec<Arc<Atlas>>) {
+        self.seams = Seams::new(atlases);
     }
 
     /// The chunk bordering `coord` across `face` (through a seam when there is one).

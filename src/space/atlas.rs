@@ -114,6 +114,18 @@ pub struct Inner {
     pub core_origin: [i64; 3],
 }
 
+/// The physical centre of storage cell `c` in whichever atlas holds it (`None` for a physical cell
+/// or storage outside every box): where an edit or a reach check really acts.
+pub fn embed_cell(atlases: &[std::sync::Arc<Atlas>], c: (i32, i32, i32)) -> Option<DVec3> {
+    if (c.0 as i64) < STORAGE_X0 {
+        return None;
+    }
+    atlases.iter().find_map(|a| {
+        let (patch, l) = a.locate([c.0 as i64, c.1 as i64, c.2 as i64])?;
+        Some(a.embed(patch, DVec3::new(l[0] as f64 + 0.5, l[1] as f64 + 0.5, l[2] as f64 + 0.5)))
+    })
+}
+
 fn face_index(f: Face) -> usize {
     FACES.iter().position(|&g| g == f).expect("a face")
 }

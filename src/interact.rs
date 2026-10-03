@@ -27,14 +27,86 @@ pub struct RayHit {
 
 /// March a ray from `origin` along `dir` up to `reach` world units and return the
 /// first solid block using Amanatides–Woo grid traversal (each iteration crosses
-/// exactly one voxel face, so nothing is skipped or double-visited).
+/// exactly one voxel face, so nothing is skipped or double-visited). On a round
+/// world (inside an atlas) the ray runs in the storage cells of the patch under it.
 pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<RayHit> {
     let len = dir.length();
     if len == 0.0 {
         return None;
     }
     let dir = dir * (1.0 / len);
+    if let Some(atlas) = world.atlas_at(origin) {
+        return raycast_charted(world, atlas, origin, dir, reach);
+    }
+    match march(origin, dir, reach, |x, y, z| world.is_solid(x, y, z), |_, _, _| false) {
+        March::Hit(hit) => Some(hit),
+        March::Left { .. } | March::Miss => None,
+    }
+}
 
+/// How far a charted march may run outside its patch's box before it re-enters the neighbouring
+/// patch: cells one outside still read through the glue.
+const CHART_SLACK: i64 = 1;
+
+/// The ray through a round world: in the storage frame of the patch under the current point (the
+/// local Jacobian carries the direction; cells there are axis aligned), re-entering the next patch
+/// when it leaves a box. Hits report the cells that really hold them (glued across seams).
+fn raycast_charted(world: &World, atlas: &crate::space::atlas::Atlas, origin: DVec3, dir: DVec3, reach: f64) -> Option<RayHit> {
+    let (mut p, mut left) = (origin, reach);
+    // A ray of a few blocks crosses at most a seam or two; the bound only guards degenerate input.
+    for _ in 0..6 {
+        let Some(here) = atlas.local(p) else {
+            // Out of the atlas (above the relief band): physical cells for the rest.
+            return match march(p, dir, left, |x, y, z| world.is_solid(x, y, z), |_, _, _| false) {
+                March::Hit(hit) => Some(hit),
+                _ => None,
+            };
+        };
+        let ds = here.jacobian.inverse() * dir;
+        let scale = ds.length();
+        if !(scale > 0.0 && scale.is_finite()) {
+            return None;
+        }
+        let ds = ds / scale;
+        let (o, size) = atlas.storage_box(here.patch);
+        let outside = |x: i32, y: i32, z: i32| {
+            let c = [x as i64, y as i64, z as i64];
+            (0..3).any(|a| c[a] < o[a] - CHART_SLACK || c[a] >= o[a] + size[a] + CHART_SLACK)
+        };
+        match march(here.storage, ds, left * scale, |x, y, z| world.is_solid(x, y, z), outside) {
+            March::Hit(hit) => {
+                return Some(RayHit { block: world.glued(hit.block), previous: world.glued(hit.previous) });
+            }
+            March::Left { t } => {
+                p = atlas.embed_storage(here.patch, here.storage + ds * t);
+                left -= t / scale;
+                if left <= 0.0 {
+                    return None;
+                }
+            }
+            March::Miss => return None,
+        }
+    }
+    None
+}
+
+/// How a [`march`] ended.
+enum March {
+    Hit(RayHit),
+    /// The ray entered a cell `leave` rejected, at ray length `t`.
+    Left { t: f64 },
+    Miss,
+}
+
+/// Amanatides–Woo over unit cells from `origin` along unit `dir`, up to `reach`: the first cell
+/// `solid` accepts, or the first cell `leave` rejects (the march's frame ends there).
+fn march(
+    origin: DVec3,
+    dir: DVec3,
+    reach: f64,
+    solid: impl Fn(i32, i32, i32) -> bool,
+    leave: impl Fn(i32, i32, i32) -> bool,
+) -> March {
     // The start cell goes through the shared clamped conversion; every further
     // cell is one ±1 step from it, so the i32 march can't overflow either.
     let (mut x, mut y, mut z) = (
@@ -42,8 +114,8 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
         block_coord(origin.y),
         block_coord(origin.z),
     );
-    if world.is_solid(x, y, z) {
-        return Some(RayHit {
+    if solid(x, y, z) {
+        return March::Hit(RayHit {
             block: (x, y, z),
             previous: (x, y, z),
         });
@@ -55,7 +127,7 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
     // Distance (in ray length) to the first voxel boundary on each axis, and the
     // distance between successive boundaries. A zero component never crosses, so its
     // boundaries sit at infinity. (`cell as f64` is exact: cells are bounded by
-    // the world border, far below 2^53.)
+    // the storage limit, far below 2^53.)
     let boundary = |o: f64, cell: i32, d: f64| -> f64 {
         if d == 0.0 {
             return f64::INFINITY;
@@ -94,14 +166,17 @@ pub fn raycast(world: &World, origin: DVec3, dir: DVec3, reach: f64) -> Option<R
         if t > reach {
             break;
         }
-        if world.is_solid(x, y, z) {
-            return Some(RayHit {
+        if leave(x, y, z) {
+            return March::Left { t };
+        }
+        if solid(x, y, z) {
+            return March::Hit(RayHit {
                 block: (x, y, z),
                 previous,
             });
         }
     }
-    None
+    March::Miss
 }
 
 #[cfg(test)]
@@ -175,5 +250,67 @@ mod tests {
         assert!(stash.add(id, 1));
         assert_eq!(stash.count(id), 1);
         assert_eq!(world.block_at(x, y, z), crate::block::AIR);
+    }
+
+    /// A round world: hand-placed storage cells (a floor on the +Y chart running across its +u seam
+    /// onto the +X chart).
+    fn curved_floor() -> (World, std::sync::Arc<crate::space::atlas::Atlas>, i64, i64, i64) {
+        use crate::space::atlas::{Atlas, Patch};
+        let mut world = World::generate();
+        let centre = DVec3::new(2.0e7, 3.0e7, -1.0e7);
+        let r = 3_000i64;
+        let atlas = std::sync::Arc::new(Atlas::new(centre, r, r + 64, false, 0));
+        world.set_atlases(vec![atlas.clone()]);
+        let top = Patch::Shell { band: 0, face: crate::coord::Face::PosY };
+        let b = atlas.bands[0];
+        let (k, mid) = (r - b.r_lo - 1, b.n / 2);
+        let stone = world.registry().id_by_label("rock").unwrap();
+        // The floor: chart cells up to the seam, and beyond it the cells holding the extended map's
+        // points (the +X chart's cells).
+        for i in b.n - 12..b.n + 8 {
+            for dj in -3..=3 {
+                let p = atlas.embed(top, DVec3::new(i as f64 + 0.5, k as f64 + 0.5, (mid + dj) as f64 + 0.5));
+                let s = atlas.storage_of(p).expect("covered");
+                world.ensure_around(DVec3::new(s[0] as f64, s[1] as f64, s[2] as f64));
+                world.set_block(s[0] as i32, s[1] as i32, s[2] as i32, stone);
+            }
+        }
+        (world, atlas, k, mid, b.n)
+    }
+
+    #[test]
+    fn a_ray_on_a_round_world_hits_the_storage_cell_below() {
+        use crate::space::atlas::Patch;
+        let (world, atlas, k, mid, n) = curved_floor();
+        let top = Patch::Shell { band: 0, face: crate::coord::Face::PosY };
+        let i = n - 8;
+        let eye = atlas.embed(top, DVec3::new(i as f64 + 0.5, k as f64 + 2.6, mid as f64 + 0.5));
+        let down = (atlas.centre - eye).normalize();
+        let hit = raycast(&world, eye, down, REACH).expect("the floor below");
+        let cell = atlas.storage(top, [i, k, mid]);
+        assert_eq!(hit.block, (cell[0] as i32, cell[1] as i32, cell[2] as i32));
+        assert_eq!(hit.previous, (cell[0] as i32, cell[1] as i32 + 1, cell[2] as i32), "placement goes on top");
+    }
+
+    #[test]
+    fn a_ray_crosses_a_chart_seam_and_reports_the_real_cell() {
+        use crate::space::atlas::Patch;
+        let (world, atlas, k, mid, n) = curved_floor();
+        let top = Patch::Shell { band: 0, face: crate::coord::Face::PosY };
+        let eye = atlas.embed(top, DVec3::new(n as f64 - 2.5, k as f64 + 2.6, mid as f64 + 0.5));
+        let aim = atlas.embed(top, DVec3::new(n as f64 + 3.5, k as f64 + 0.5, mid as f64 + 0.5));
+        let hit = raycast(&world, eye, aim - eye, REACH * 2.0).expect("the floor across the seam");
+        let s = [hit.block.0 as i64, hit.block.1 as i64, hit.block.2 as i64];
+        let (patch, _) = atlas.locate(s).expect("a real storage cell, not one outside a box");
+        assert_eq!(patch, Patch::Shell { band: 0, face: crate::coord::Face::PosX }, "on the far chart");
+        assert!(world.is_solid(hit.block.0, hit.block.1, hit.block.2));
+        // Where the straight physical ray meets the floor's top (y = k + 1 in the extended map).
+        let f = (2.6 - 1.0) / (2.6 - 0.5);
+        let expect = atlas.embed(top, DVec3::new(n as f64 - 2.5 + f * 6.0, k as f64 + 0.5, mid as f64 + 0.5));
+        let got = crate::space::atlas::embed_cell(world.atlases(), hit.block).unwrap();
+        assert!((got - expect).length() < 1.5, "hit {got:?} vs the crossing {expect:?}");
+        let prev = [hit.previous.0 as i64, hit.previous.1 as i64, hit.previous.2 as i64];
+        assert!(atlas.locate(prev).is_some(), "placement lands in a real cell too");
+        assert!(!world.is_solid(hit.previous.0, hit.previous.1, hit.previous.2));
     }
 }

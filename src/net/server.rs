@@ -921,7 +921,7 @@ fn client_loop(
             }
             ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
-                on_edit(shared, ctx.hooks.as_ref(), id, req, x, y, z, expect, &spec)
+                on_edit(shared, ctx.hooks.as_ref(), ctx.generator.atlases(), id, req, x, y, z, expect, &spec)
             }
             ClientMessage::Chat { channel, text } => {
                 on_chat(shared, ctx.hooks.as_ref(), id, channel, &text)
@@ -1249,6 +1249,7 @@ fn resolve_client_spec_within(
 fn on_edit(
     shared: &Arc<Mutex<State>>,
     hooks: Option<&Mutex<hooks::Table>>,
+    atlases: &[Arc<crate::space::atlas::Atlas>],
     id: u32,
     req: u32,
     x: i32,
@@ -1274,7 +1275,9 @@ fn on_edit(
     // `as f64` so i32::MIN never hits signed-abs overflow; cells past the
     // playable border are still reach-checked (a player AT the border can
     // mine the slack column) but a forged i32::MAX coord is out of reach.
-    let target = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+    // A round world's storage cell is judged where its chart embeds it.
+    let target = crate::space::atlas::embed_cell(atlases, (x, y, z))
+        .unwrap_or(DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5));
     if spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH {
         return reject(&state, ack_to.as_ref());
     }
@@ -1365,7 +1368,8 @@ fn on_tool_use(
         return;
     }
     let out = h.out.clone();
-    let target = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+    let target = crate::space::atlas::embed_cell(generator.atlases(), (x, y, z))
+        .unwrap_or(DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5));
     let pos = (x, y, z);
     let current = state.edits.get(&pos).map_or(0, |c| c.rev);
     let reply = |state: &State, reacted: bool, rev: u32, tool: Arc<str>| {
@@ -1876,12 +1880,12 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let rock = rock_spec();
-        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.reactions.pending(), 6, "a placement wakes the cell's six contacts");
         }
-        on_edit(&shared, None, 1, 2, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 1, "air");
         let state = shared.lock_recover();
         assert_eq!(state.reactions.pending(), 6, "a removal wakes the same six (deduplicated)");
     }
@@ -1932,8 +1936,8 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        on_edit(&shared, None, 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
-        on_edit(&shared, None, 1, 2, 8, 20, 8, 0, "air"); // in reach: recorded
+        on_edit(&shared, None, &[], 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
+        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 0, "air"); // in reach: recorded
 
         let state = shared.lock_recover();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
@@ -1989,7 +1993,7 @@ mod tests {
             other => panic!("expected a Position snap-back, got {other:?}"),
         }
         // ...so the follow-up edit at the forged position stays out of reach.
-        on_edit(&shared, None, 1, 7, 4000, 20, 4000, 0, "air");
+        on_edit(&shared, None, &[], 1, 7, 4000, 20, 4000, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(4000, 20, 4000)));
 
         // Outside the world border: rejected no matter how slow.
@@ -2041,21 +2045,21 @@ mod tests {
         };
 
         // First break wins at revision 1.
-        on_edit(&shared, None, 1, 10, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, &[], 1, 10, 8, 20, 8, 0, "air");
         assert_eq!(ack(&rx), (10, true, 1));
 
         // The racing loser expected revision 0 and is rejected — exactly one
         // reward, and its ack is the rollback signal.
-        on_edit(&shared, None, 1, 11, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, &[], 1, 11, 8, 20, 8, 0, "air");
         assert_eq!(ack(&rx), (11, false, 1));
 
         // Building on the current revision succeeds.
         let rock = rock_spec();
-        on_edit(&shared, None, 1, 12, 8, 20, 8, 1, &rock);
+        on_edit(&shared, None, &[], 1, 12, 8, 20, 8, 1, &rock);
         assert_eq!(ack(&rx), (12, true, 2));
 
         // Junk specs are rejected before touching the overlay or the pool.
-        on_edit(&shared, None, 1, 13, 8, 20, 8, 2, "banana:zzz");
+        on_edit(&shared, None, &[], 1, 13, 8, 20, 8, 2, "banana:zzz");
         assert_eq!(ack(&rx), (13, false, 2));
         assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), rock.as_str());
     }
@@ -2071,8 +2075,8 @@ mod tests {
 
         // The same spec interned twice: one canonical entry.
         let rock = rock_spec();
-        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, &rock);
-        on_edit(&shared, None, 1, 2, 8, 21, 8, 0, &rock);
+        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "equivalent spellings share one entry");
@@ -2083,8 +2087,8 @@ mod tests {
         }
 
         // Overwriting both cells strands the old spec: it must leave the pool.
-        on_edit(&shared, None, 1, 3, 8, 20, 8, 1, "air");
-        on_edit(&shared, None, 1, 4, 8, 21, 8, 1, "air");
+        on_edit(&shared, None, &[], 1, 3, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, &[], 1, 4, 8, 21, 8, 1, "air");
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "only \"air\" remains interned");
@@ -2704,18 +2708,18 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(at_reach, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        on_edit(&shared, None, 1, 1, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, "air");
         assert!(shared.lock_recover().edits.contains_key(&(8, 20, 8)), "exact REACH must land");
 
         let just_out = DVec3::new(center.x + EDIT_REACH * 1.001, center.y, center.z);
         shared.lock_recover().players.get_mut(&1).unwrap().pos = just_out;
-        on_edit(&shared, None, 1, 2, 8, 21, 8, 0, "air");
+        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(8, 21, 8)));
 
-        on_edit(&shared, None, 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
-        on_edit(&shared, None, 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
+        on_edit(&shared, None, &[], 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
+        on_edit(&shared, None, &[], 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
         let far = crate::math::WORLD_BORDER as i32 + 64;
-        on_edit(&shared, None, 1, 5, far, 20, far, 0, "air");
+        on_edit(&shared, None, &[], 1, 5, far, 20, far, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(far, 20, far)));
         let _ = rx;
     }
@@ -2831,7 +2835,7 @@ mod tests {
         rec.deny_edit = true;
         let table = Mutex::new(hooks::Table::new(vec![Box::new(rec)]));
 
-        on_edit(&shared, Some(&table), 1, 42, 8, 20, 8, 0, "air");
+        on_edit(&shared, Some(&table), &[], 1, 42, 8, 20, 8, 0, "air");
 
         let to_editor = drain_msgs(&rx1);
         assert_eq!(to_editor.len(), 1, "exactly one ack");
@@ -2858,7 +2862,7 @@ mod tests {
         rec.panic_edit = true;
         let table = Mutex::new(hooks::Table::new(vec![Box::new(rec)]));
 
-        on_edit(&shared, Some(&table), 1, 1, 8, 20, 8, 0, "air");
+        on_edit(&shared, Some(&table), &[], 1, 1, 8, 20, 8, 0, "air");
 
         match &drain_msgs(&rx1)[..] {
             [ServerMessage::EditAck { req, accepted, rev }] => {

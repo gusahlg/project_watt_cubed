@@ -1020,13 +1020,24 @@ impl Game {
                         tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
                         tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
                         let gravity = self.gravity_at(self.player.position);
-                        let trauma = movement::update_player(
-                            &mut self.player,
-                            &self.world,
-                            &tick_input,
-                            step_dt,
-                            gravity,
-                        );
+                        // On a round world the step runs in the storage frame of the patch underfoot.
+                        let trauma = match self.world.atlas_at(self.player.position) {
+                            Some(atlas) => movement::update_player_in(
+                                &mut self.player,
+                                &self.world,
+                                &atlas.clone(),
+                                &tick_input,
+                                step_dt,
+                                gravity,
+                            ),
+                            None => movement::update_player(
+                                &mut self.player,
+                                &self.world,
+                                &tick_input,
+                                step_dt,
+                                gravity,
+                            ),
+                        };
                         if trauma > 0.0 {
                             self.camera.fx.add_trauma(trauma);
                         }
