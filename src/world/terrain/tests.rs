@@ -525,6 +525,14 @@ fn landmarks() {
     near.sort_by(|a, b| a.centre.length().total_cmp(&b.centre.length()));
     for c in near.iter().take(5) {
         println!("cluster {:?} centre {:?} r {:.0} rocks {:.0}", c.form, c.centre, c.radius, c.count);
+        // The biggest rocks within 3 000 blocks of its centre.
+        let (p, d) = ([c.centre.x as i64, c.centre.y as i64, c.centre.z as i64], 3_000i64);
+        let mut rocks = Vec::new();
+        t.cosmos.rocks_touching([p[0] - d, p[1] - d, p[2] - d], [p[0] + d, p[1] + d, p[2] + d], &mut rocks);
+        rocks.sort_by(|a, b| b.r.total_cmp(&a.r));
+        for r in rocks.iter().take(3) {
+            println!("  rock {:?} r {:.0} at {:?}", r.kind, r.r, r.centre);
+        }
     }
 }
 
