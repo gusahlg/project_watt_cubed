@@ -138,6 +138,8 @@ pub fn update_player_in(player: &mut Player, world: &World, atlas: &crate::space
     player.position = atlas.embed_storage(here.patch, player.position);
     set_velocity(player, j * player.velocity());
     player.orientation.frame = (rot * player.orientation.frame).normalize();
+    // The camera aligns to the physical pull between steps.
+    player.gravity = gravity;
     player.speed = speed;
     player.fly_speed = fly_speed;
     trauma
@@ -767,6 +769,8 @@ mod tests {
         }
         let after = (player.position - centre).length();
         assert!((after - rest).abs() < 0.05, "walking follows the curve: {rest} -> {after}");
+        assert!((player.gravity - pull(before)).length() < 0.2, "the stored pull is physical, not storage-frame");
+        assert!((player.up() - (player.position - centre).normalize()).length() < 0.05, "the body stands along the radius");
         assert!((player.position - before).length() > 5.0, "and goes somewhere");
         assert!(player.on_ground());
     }
