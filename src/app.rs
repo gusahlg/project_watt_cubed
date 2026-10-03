@@ -418,6 +418,11 @@ impl App {
                     game.player_mut().position = pos;
                     game.player_mut().set_flying(true);
                     game.world_mut().prepare_around(pos);
+                    // Stand up along the local pull there, as a teleport does (any face of any body).
+                    let weightless = 0.02 * crate::player::STANDARD_GRAVITY;
+                    if let Some(up) = game.world().gravity_at(pos).up(weightless) {
+                        game.player_mut().snap_up(up);
+                    }
                     if let Some(bench) = &mut self.bench {
                         bench.add_warmup(Duration::from_secs(2));
                     }
