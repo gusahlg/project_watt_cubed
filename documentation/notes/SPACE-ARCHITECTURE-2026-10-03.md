@@ -75,15 +75,16 @@ InfiniteDiffusion v4 universe. Every task directive refers back to the section n
 ## 4. Gravity module (`src/gravity/`)
 
 ```
-gravity/mod.rs      Sample, Accuracy, G, R_IN, R_G, EPS, the window, PHYSICS_VERSION
-gravity/kernel.rs   softened windowed point kernel (+potential, +tidal), exact for r<=R_IN
-gravity/shape.rs    analytic uniform sources: Box (closed-form prism, Nagy/Okabe), Ball, Shell,
-                    Point; each: field(x) -> (accel, potential, tidal), bounds, mass, first moment
-gravity/source.rs   Source = Σ primitives (with density increments) + correction nodes
-gravity/tree.rs     Barnes–Hut over correction nodes (mass u/i128 exact, first moment about fixed
-                    node centre, abs-mass bound), opening criterion θ, near-field descent
-gravity/field.rs    the per-world query object: bodies (analytic) + edits (corrections) + cache
-gravity/mass.rs     amount tables, per-chunk amount/moment summaries, the edit delta ledger
+gravity/mod.rs      Sample (accel, potential, tidal, error, epoch), PHYSICS_VERSION, law_digest
+gravity/kernel.rs   the law: G, R_IN, R_G, EPS, the window, softened windowed point kernel with a
+                    consistent potential (+ tidal), the unsoftened monopole for extended sources
+gravity/shape.rs    analytic uniform sources with signed densities: Box (closed-form prism),
+                    Ball, Point; far multipoles (monopole + box quadrupole); window splitting
+gravity/oracle.rs   MassOracle / Visitor / Summary: the generator's hierarchy of groups and
+                    primitives (the cosmos implements it; flat worlds use a primitive list)
+gravity/ledger.rs   exact integer edit corrections: per cell, per chunk, per region (signed
+                    monopole + dipole about fixed centres, absolute mass for the error bound)
+gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + ledger, source epoch
 ```
 
 - **Bodies are analytic.** The generator's body catalog (§8.2) describes every body as a sum of uniform
