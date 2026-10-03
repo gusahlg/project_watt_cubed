@@ -189,6 +189,11 @@ fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> 
                 .clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
             world.prepare_around(target);
             player.position = target;
+            // Stand up along the local gravity at once (no slow roll after a jump across the
+            // universe); in weightlessness keep the current frame.
+            if let Some(up) = world.gravity_at(target).up(0.02 * crate::player::STANDARD_GRAVITY) {
+                player.snap_up(up);
+            }
             // Cancel any accumulated fall so the player doesn't rocket down on arrival.
             player.cancel_fall();
             shown(vec![format!("teleported to {}", fmt_pos(player.position))])

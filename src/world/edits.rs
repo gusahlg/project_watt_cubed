@@ -307,6 +307,10 @@ impl World {
         // edit: user-click/network rate, never the voxel hot path.
         let old_edit = self.edits.get(&coord).and_then(|cells| cells.get(&index)).copied();
         let generated = self.generator.block_at(x, y, z, self.generator.height(x, z));
+        // Gravity follows the matter: the cell's amount changes from what was really there (the
+        // overlay, else generation — never `previous`, which reads unloaded chunks as air).
+        let delta = self.registry.amount(id) as i32 - self.registry.amount(old_edit.unwrap_or(generated)) as i32;
+        self.gravity.record((x, y, z), delta);
         let new_edit = if id == generated {
             if let Some(cells) = self.edits.get_mut(&coord) {
                 cells.remove(&index);

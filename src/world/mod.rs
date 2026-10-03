@@ -931,6 +931,8 @@ pub struct World {
     /// Read-only block palette; meshing/collision read its hot solidity arrays.
     registry: BlockRegistry,
     generator: terrain::Generator,
+    /// Gravity from the generator's matter plus every committed edit.
+    gravity: crate::gravity::Field,
     kind: WorldgenKind,
     terrain_cfg: terrain::TerrainCfg,
     chunks: FastMap<Coord, Loaded>,
@@ -1317,8 +1319,10 @@ impl World {
         let unit = (DEFAULT_VIEW_RADIUS * CHUNK_SIZE as i32) as f32;
         let lod2 = render.lod2;
         let (lod_levels, lod_detail) = render.normalized_lod();
+        let gravity = crate::gravity::Field::new(generator.mass());
         let mut world = Self {
             registry,
+            gravity,
             generator,
             kind,
             terrain_cfg: cfg,

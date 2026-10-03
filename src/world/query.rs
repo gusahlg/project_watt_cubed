@@ -25,6 +25,16 @@ fn local_range(min: i32, max: i32, chunk: i32) -> Range<usize> {
 }
 
 impl World {
+    /// Gravity at `p` from every piece of matter within the law's range.
+    pub fn gravity_at(&self, p: voxel_engine::DVec3) -> crate::gravity::Sample {
+        self.gravity.sample(p)
+    }
+
+    /// The world's gravitational field.
+    pub(crate) fn gravity(&self) -> &crate::gravity::Field {
+        &self.gravity
+    }
+
     /// The seed this world was generated from.
     pub fn seed(&self) -> i64 {
         self.generator.seed()

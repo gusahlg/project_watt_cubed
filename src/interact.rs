@@ -129,22 +129,22 @@ mod tests {
     }
 
     #[test]
-    fn raycast_hits_correctly_at_1e8() {
-        // Far out, the ray must still land on the surface column under the eye
-        // and report the empty cell above it — the f32 version couldn't even
-        // resolve which column the origin was in.
+    fn raycast_hits_correctly_far_out() {
+        // Far out (5e7: an f32 step is 4 blocks there; still on the flat world's finite slab), the
+        // ray must land on the surface column under the eye and report the empty cell above it —
+        // the f32 version couldn't even resolve which column the origin was in.
         let mut world = World::generate();
         // Start above whatever the generator built here (the surface reaches
         // ~49 at this column), so the ray enters from open air rather than
         // starting inside the ground and tripping the inside-a-block guard.
-        let probe = DVec3::new(1.0e8 + 8.5, 40.0, 8.5);
+        let probe = DVec3::new(5.0e7 + 8.5, 40.0, 8.5);
         world.ensure_around(probe);
-        let top = world.surface_y(100_000_008, 8) as f64 + 5.0;
-        let origin = DVec3::new(1.0e8 + 8.5, top, 8.5);
+        let top = world.surface_y(50_000_008, 8) as f64 + 5.0;
+        let origin = DVec3::new(5.0e7 + 8.5, top, 8.5);
         let hit = raycast(&world, origin, DVec3::new(0.0, -1.0, 0.0), 60.0)
-            .expect("a downward ray should hit the terrain at 1e8");
+            .expect("a downward ray should hit the terrain far out");
         let (bx, by, bz) = hit.block;
-        assert_eq!((bx, bz), (100_000_008, 8), "hits the column under the eye");
+        assert_eq!((bx, bz), (50_000_008, 8), "hits the column under the eye");
         // The topmost solid block of the column: the terrain surface, with the
         // empty placement cell directly above it.
         assert!(world.is_solid(bx, by, bz), "hit is solid");

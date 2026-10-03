@@ -250,6 +250,8 @@ impl Materials {
 /// The generator.
 pub struct Terrain {
     seed: i64,
+    /// Every body in the universe; also the generator's mass oracle.
+    cosmos: Arc<cosmos::Cosmos>,
     shape: Shape,
     under: Underground,
     trees: Trees,
@@ -279,6 +281,7 @@ impl Terrain {
         let m = Arc::new(Materials::intern(registry));
         Self {
             seed,
+            cosmos: Arc::new(cosmos::Cosmos::new(s, cfg.space as f32 / 100.0)),
             shape: Shape::new(s, cfg.relief as f32 / 100.0, m.clone()),
             under: Underground::new(s ^ 0x0BAD_CAFE, cfg, m.clone()),
             trees: Trees::new(s ^ 0x7EE5_0000, m.clone()),
@@ -379,6 +382,10 @@ impl ColumnWindow {
 impl TerrainGenerator for Terrain {
     fn seed(&self) -> i64 {
         self.seed
+    }
+
+    fn mass(&self) -> Arc<dyn crate::gravity::MassOracle> {
+        self.cosmos.clone()
     }
 
     fn kind(&self) -> &'static str {
