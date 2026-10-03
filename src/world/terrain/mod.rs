@@ -1,13 +1,14 @@
 //! InfiniteDiffusion: the world generator.
 //!
-//! The [`cosmos`] lists every body. A cell belongs to the one body that reaches it, or it is air.
-//! Cube bodies (the start world and the twins) are six faces: today's terrain — shape, caves,
-//! mines, veins, trees — runs in face-local coordinates, with one salt per face except the home
-//! +Y face, which keeps the v3 salts. Provinces theme every column: a realm per face, regions
-//! and provinces on the shared surface point. Below the crust the bulk is a coarse mix whose mean amount
-//! is [`cosmos::BULK_DENSITY`]. Round bodies live on curved charts in storage ([`storage`]): storage
-//! coordinates answer from their painters, and physical space holds none of their cells. Empty
-//! space classifies as air and is never sampled.
+//! The [`cosmos`] lists every body. A cube cell is that cube's face; an asteroid cell is the rock
+//! that contains it. Cube bodies (the start world and the twins) are six faces: today's terrain —
+//! shape, caves, mines, veins, trees — runs in face-local coordinates, with one salt per face
+//! except the home +Y face, which keeps the v3 salts. Provinces theme every column: a realm per
+//! face, regions and provinces on the shared surface point. The twins' facing faces also carry
+//! spires and arches across the canyon, inside the relief bound. Below the crust the bulk is a
+//! coarse mix whose mean amount is [`cosmos::BULK_DENSITY`]. Round bodies live on curved charts in
+//! storage ([`storage`]): storage coordinates answer from their painters, and physical space holds
+//! none of their cells. Empty space classifies as air and is never sampled.
 //!
 //! Every material is a configuration the [`palette`] found in the law; nothing here names an
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
@@ -19,6 +20,8 @@ mod cube;
 mod province;
 pub mod round;
 mod shape;
+mod space;
+mod span;
 pub mod storage;
 mod trees;
 mod underground;
@@ -541,6 +544,12 @@ impl Terrain {
                     return id;
                 }
             }
+            // Home and the outward faces never ask. The facing face's spires sit above the ground.
+            if body.kind == cosmos::Kind::Twin && span::facing_face(&self.cosmos, body) == Some(face) {
+                if let Some(id) = span::block(&self.m, span::lush(&self.cosmos, body), span::face_seed(body), half, u, h, v) {
+                    return id;
+                }
+            }
             return AIR;
         }
         if col.height - h > cube::CRUST {
@@ -556,8 +565,14 @@ impl Terrain {
             return self.storage.voxel(x, y, z);
         }
         let p = [i64::from(x), i64::from(y), i64::from(z)];
-        let Some(body) = self.owner(p) else { return AIR };
-        self.cube_cell(&body, p)
+        if let Some(body) = self.owner(p) {
+            return self.cube_cell(&body, p);
+        }
+        // A round body's reach is empty here; its matter is the storage chart.
+        if self.cosmos.bodies().iter().any(|b| !matches!(b.shape, cosmos::Shape::Cube { .. }) && b.touches(p, p)) {
+            return AIR;
+        }
+        space::block(&self.cosmos, &self.m, p)
     }
 
     /// Chunk wholly inside one cube's deep limit: the mix, and nothing else.
@@ -707,8 +722,11 @@ impl Terrain {
     ) -> ChunkData {
         let n = CHUNK_SIZE as i32;
         // Unblended max keeps the v3 early-out. Blended max covers a rim that rose above it.
+        // The facing canyon is taller: spires stop at `span::CLEAR`, still inside the relief.
         let max_h = cols.iter().map(|c| c.height).max().unwrap_or(i32::MIN);
-        if h0 >= max_terrain.max(max_h) + trees::MAX_TREE_HEIGHT {
+        let facing = body.kind == cosmos::Kind::Twin && span::facing_face(&self.cosmos, body) == Some(face);
+        let clearance = if facing { span::CLEAR } else { max_terrain.max(max_h) + trees::MAX_TREE_HEIGHT };
+        if h0 >= clearance {
             return ChunkData::Uniform(AIR);
         }
         if i64::from(h0) + i64::from(n) <= i64::from(min_h) - i64::from(cube::CRUST) {
@@ -809,6 +827,37 @@ impl Terrain {
                 }
             }
         }
+        if facing && h0 < span::CLEAR {
+            let half = cube::half_of(body);
+            let lush = span::lush(&self.cosmos, body);
+            let seed = span::face_seed(body);
+            let min_col = cols.iter().map(|c| c.height).min().unwrap_or(i32::MAX);
+            if h0 + n > min_col {
+                for lv in 0..CHUNK_SIZE {
+                    for lu in 0..CHUNK_SIZE {
+                        let col_h = cols[lu + lv * CHUNK_SIZE].height;
+                        if h0 + n <= col_h {
+                            continue;
+                        }
+                        let (u, v) = (u0 + lu as i32, v0 + lv as i32);
+                        for la in 0..CHUNK_SIZE {
+                            let h = h0 + la as i32;
+                            if h < col_h {
+                                continue;
+                            }
+                            let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                            let i = Chunk::index(lx, ly, lz);
+                            if cells[i] != AIR {
+                                continue;
+                            }
+                            if let Some(id) = span::block(&self.m, lush, seed, half, u, h, v) {
+                                cells[i] = id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         ChunkData::from_cells(cells)
     }
 
@@ -867,6 +916,20 @@ impl Terrain {
             }
         }
         heights
+    }
+
+    /// How high a uniform-air shortcut may start. The canyon's facing face keeps room for spires;
+    /// every other face stops at the trees. Home never takes the tall path.
+    fn face_clear(&self, body: &cosmos::Body, lo: [i64; 3], hi: [i64; 3]) -> i32 {
+        if body.kind != cosmos::Kind::Twin {
+            return cube::TREE_CLEAR;
+        }
+        let Some(face) = span::facing_face(&self.cosmos, body) else { return cube::TREE_CLEAR };
+        let on_face = cube::corners(lo, hi).into_iter().all(|p| {
+            let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
+            cube::face_of(rel) == face
+        });
+        if on_face { span::CLEAR } else { cube::TREE_CLEAR }
     }
 }
 
@@ -1021,11 +1084,15 @@ impl TerrainGenerator for Terrain {
             }
             only = Some(*b);
         }
-        let Some(body) = only else { return Classify::Mixed };
+        let Some(body) = only else {
+            // A rock's sub-cell is huge. Only a chunk the reserved box actually meets is mixed.
+            return if space::any_overlap(&self.cosmos, lo, hi) { Classify::Mixed } else { Classify::Air };
+        };
         match body.shape {
             cosmos::Shape::Cube { .. } => {
                 let half = cube::half_of(&body);
-                if cube::min_reach(body.centre, lo, hi) - half >= i64::from(cube::TREE_CLEAR) {
+                let clear = self.face_clear(&body, lo, hi);
+                if cube::min_reach(body.centre, lo, hi) - half >= i64::from(clear) {
                     return Classify::Uniform(AIR);
                 }
                 let rels = cube::corners(lo, hi)

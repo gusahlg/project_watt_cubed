@@ -2,6 +2,7 @@
 
 use super::*;
 use super::cube;
+use super::{space, span};
 use crate::coord::{ChunkCoord, Face};
 use crate::space::FaceFrame;
 use crate::world::chunk::Chunk;
@@ -699,4 +700,271 @@ fn write_ppm(path: &str, n: i32, rgb: &[u8]) {
     let mut f = std::fs::File::create(path).expect(path);
     write!(f, "P6\n{n} {n}\n255\n").unwrap();
     f.write_all(rgb).unwrap();
+}
+
+fn rock_index(kind: cosmos::RockKind) -> usize {
+    match kind {
+        cosmos::RockKind::Rocky => 0,
+        cosmos::RockKind::Carbon => 1,
+        cosmos::RockKind::Metallic => 2,
+        cosmos::RockKind::Icy => 3,
+        cosmos::RockKind::Geode => 4,
+        cosmos::RockKind::Derelict => 5,
+    }
+}
+
+/// One rock of each kind, taken from cluster centres (class-2 sub-cells there are usually full).
+fn one_of_each_kind(t: &Terrain) -> Vec<cosmos::Rock> {
+    let mut have = [false; 6];
+    let mut out = Vec::new();
+    for c in t.cosmos.clusters() {
+        let p = [c.centre.x as i64, c.centre.y as i64, c.centre.z as i64];
+        let mut buf = Vec::new();
+        t.cosmos.rocks_touching(p, p, &mut buf);
+        for r in buf {
+            let i = rock_index(r.kind);
+            if !have[i] {
+                have[i] = true;
+                out.push(r);
+            }
+        }
+        if have.iter().all(|h| *h) {
+            break;
+        }
+    }
+    assert!(have.iter().all(|h| *h), "the catalog sample missed a rock kind: {have:?}");
+    out
+}
+
+fn solid_chunk(t: &Terrain, rock: &cosmos::Rock) -> (i32, i32, i32, [i64; 3]) {
+    let c = [rock.centre[0] as i64, rock.centre[1] as i64, rock.centre[2] as i64];
+    let r = rock.r.max(1.0) as i64;
+    for dist in [r * 3 / 5, r * 7 / 10, r / 2, r * 4 / 5, r / 3, 0] {
+        for axis in 0..3 {
+            let mut p = c;
+            p[axis] += dist;
+            if space::paint(rock, t.materials(), p).is_some_and(|id| id != AIR) {
+                return (chunk_of(p).0, chunk_of(p).1, chunk_of(p).2, p);
+            }
+        }
+    }
+    panic!("no solid cell in rock at {:?} r={}", rock.centre, rock.r);
+}
+
+fn face_world(body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> [i32; 3] {
+    let half = cube::half_of(body) as i32;
+    let (x, y, z) = FaceFrame::new(face).cell_to_world((u, half + h, v));
+    let c = cube::centre_i32(body.centre).expect("twin centre fits i32");
+    [x + c.0, y + c.1, z + c.2]
+}
+
+#[test]
+fn asteroids_round_worlds_and_the_twin_canyon() {
+    let (_reg, t) = make(42);
+    let m = t.materials();
+    let rocks = one_of_each_kind(&t);
+    for rock in &rocks {
+        let (cx, cy, cz, p) = solid_chunk(&t, rock);
+        let coord = ChunkCoord::new(cx, cy, cz);
+        assert_ne!(t.classify(coord), Classify::Air, "{:?} chunk classified empty", rock.kind);
+        assert_ne!(t.voxel_at(p[0] as i32, p[1] as i32, p[2] as i32), AIR);
+        assert_chunk_matches(&t, cx, cy, cz);
+        assert_worker_matches(&t, cx, cy, cz);
+        let reach = space::reach(rock);
+        let c = [rock.centre[0] as i64, rock.centre[1] as i64, rock.centre[2] as i64];
+        for axis in 0..3 {
+            for sign in [-1, 1] {
+                let mut q = c;
+                q[axis] += sign * (reach + 1);
+                assert!(space::paint(rock, m, q).is_none(), "{:?} leaks on axis {axis}", rock.kind);
+            }
+        }
+    }
+
+    // A small rock's whole sub-cell, and the cell just outside it, stay inside the reserved box.
+    let mut small = None;
+    'find: for c in t.cosmos.clusters() {
+        let p = [c.centre.x as i64, c.centre.y as i64, c.centre.z as i64];
+        let mut buf = Vec::new();
+        t.cosmos.rocks_touching(p, p, &mut buf);
+        for r in buf {
+            if r.r < 22.0 && space::reach(&r) >= 16 {
+                small = Some(r);
+                break 'find;
+            }
+        }
+    }
+    let small = small.expect("a class-0 rock");
+    let edge = 64i64;
+    let s0 = [
+        (small.centre[0] as i64).div_euclid(edge) * edge,
+        (small.centre[1] as i64).div_euclid(edge) * edge,
+        (small.centre[2] as i64).div_euclid(edge) * edge,
+    ];
+    let reach = space::reach(&small);
+    let centre = [small.centre[0] as i64, small.centre[1] as i64, small.centre[2] as i64];
+    let mut painted = 0u32;
+    for x in 0..edge {
+        for y in 0..edge {
+            for z in 0..edge {
+                let p = [s0[0] + x, s0[1] + y, s0[2] + z];
+                if space::paint(&small, m, p).is_some() {
+                    painted += 1;
+                    for a in 0..3 {
+                        assert!((p[a] - centre[a]).abs() <= reach, "class-0 rock leaves its box");
+                    }
+                }
+            }
+        }
+    }
+    assert!(painted > 0, "the small rock paints something");
+    for a in 0..3 {
+        for side in [s0[a] - 1, s0[a] + edge] {
+            for u in 0..edge {
+                for v in 0..edge {
+                    let mut p = s0;
+                    p[a] = side;
+                    p[(a + 1) % 3] += u;
+                    p[(a + 2) % 3] += v;
+                    assert!(space::paint(&small, m, p).is_none(), "paint outside the sub-cell");
+                }
+            }
+        }
+    }
+    let mut tight = false;
+    for corner in 0..8 {
+        let origin: [i64; 3] = std::array::from_fn(|a| s0[a] + if corner & (1 << a) == 0 { 0 } else { edge - 16 });
+        let coord = ChunkCoord::new((origin[0] / 16) as i32, (origin[1] / 16) as i32, (origin[2] / 16) as i32);
+        let (lo, hi) = cube::chunk_bounds(coord);
+        if space::overlaps(&small, lo, hi) {
+            continue;
+        }
+        if t.cosmos.bodies_touching(lo, hi).next().is_some() || space::any_overlap(&t.cosmos, lo, hi) {
+            continue;
+        }
+        assert_eq!(t.classify(coord), Classify::Air, "a sub-cell corner far from every rock is air");
+        assert_eq!(t.generate(coord.x, coord.y, coord.z).uniform(), Some(AIR));
+        tight = true;
+        break;
+    }
+    assert!(tight, "no empty corner of the small rock's sub-cell");
+
+    let mut empty = None;
+    for i in 0..80 {
+        let x = 30_000_000i32 + i * 250_000;
+        let c = ChunkCoord::new(x.div_euclid(16), 0, i * 3);
+        let (lo, hi) = cube::chunk_bounds(c);
+        if !t.cosmos.may_hold(lo, hi) {
+            empty = Some(c);
+            break;
+        }
+    }
+    let empty = empty.expect("an empty space chunk");
+    assert_eq!(t.classify(empty), Classify::Air);
+    assert_eq!(t.generate(empty.x, empty.y, empty.z).uniform(), Some(AIR));
+
+    for b in t.cosmos.bodies() {
+        let c = b.centre;
+        let air = |p: [i64; 3]| {
+            assert_eq!(t.voxel_at(p[0] as i32, p[1] as i32, p[2] as i32), AIR, "{:?} physical cell {p:?}", b.kind);
+        };
+        match b.shape {
+            cosmos::Shape::Cube { .. } => {}
+            cosmos::Shape::Ball { r } => {
+                air(c);
+                air([c[0] + r / 2, c[1], c[2]]);
+                air([c[0] + r - 10, c[1], c[2]]);
+                air([c[0] + r + 100, c[1], c[2]]);
+            }
+            cosmos::Shape::Shell { outer, inner } => {
+                air(c);
+                air([c[0] + (outer + inner) / 2, c[1], c[2]]);
+                air([c[0] + outer - 10, c[1], c[2]]);
+            }
+        }
+    }
+
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    assert_eq!(twins.len(), 2);
+    let lush_id = twins.iter().map(|b| b.id).min().unwrap();
+    for body in &twins {
+        let face = span::facing_face(&t.cosmos, body).unwrap();
+        let half = cube::half_of(body);
+        let lush = body.id == lush_id;
+        let (u, h, v) = span::example(span::face_seed(body), half).expect("a spire");
+        assert!(h > MAX_GROUND && (h as i64) < cosmos::RELIEF, "spire altitude {h}");
+        let w = face_world(body, face, u, h, v);
+        let id = t.voxel_at(w[0], w[1], w[2]);
+        if lush {
+            assert!(id == m.timber || id == m.jade, "lush spire is {id:?}");
+        } else {
+            assert!(id == m.marble || id == m.crystal, "crystal spire is {id:?}");
+        }
+        let (cx, cy, cz) = chunk_of([w[0] as i64, w[1] as i64, w[2] as i64]);
+        assert_ne!(t.classify(ChunkCoord::new(cx, cy, cz)), Classify::Air);
+        assert_chunk_matches(&t, cx, cy, cz);
+        assert_worker_matches(&t, cx, cy, cz);
+        let (au, ah, av) = span::an_arch(m, lush, span::face_seed(body), half).expect("an arch");
+        assert!(ah > MAX_GROUND && (ah as i64) < cosmos::RELIEF);
+        let aw = face_world(body, face, au, ah, av);
+        let arch = t.voxel_at(aw[0], aw[1], aw[2]);
+        let ok = if lush { arch == m.timber || arch == m.leaves } else { arch == m.crystal || arch == m.glowshroom };
+        assert!(ok, "arch block {arch:?}");
+        let clear = face_world(body, face, 0, span::CLEAR + 16, 0);
+        assert_eq!(t.voxel_at(clear[0], clear[1], clear[2]), AIR);
+        let cc = chunk_of([clear[0] as i64, clear[1] as i64, clear[2] as i64]);
+        // The twin still owns this chunk, so air above the spires is uniform air.
+        let above = t.classify(ChunkCoord::new(cc.0, cc.1, cc.2));
+        assert!(above == Classify::Air || above == Classify::Uniform(AIR), "above the spires: {above:?}");
+        let (nx, ny, nz) = face.normal();
+        let out = [
+            body.centre[0] + nx as i64 * (half + 3_000),
+            body.centre[1] + ny as i64 * (half + 3_000),
+            body.centre[2] + nz as i64 * (half + 3_000),
+        ];
+        assert_eq!(t.voxel_at(out[0] as i32, out[1] as i32, out[2] as i32), AIR, "the canyon beyond relief is empty");
+    }
+    let mid = [
+        (twins[0].centre[0] + twins[1].centre[0]) / 2,
+        (twins[0].centre[1] + twins[1].centre[1]) / 2,
+        (twins[0].centre[2] + twins[1].centre[2]) / 2,
+    ];
+    assert_eq!(t.voxel_at(mid[0] as i32, mid[1] as i32, mid[2] as i32), AIR, "the canyon midpoint is empty");
+    let mc = chunk_of(mid);
+    assert_eq!(t.classify(ChunkCoord::new(mc.0, mc.1, mc.2)), Classify::Air);
+}
+
+/// `cargo test --lib space_chunk_costs -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn space_chunk_costs() {
+    let (_reg, t) = make(42);
+    let rocks = one_of_each_kind(&t);
+    let small = rocks.iter().min_by(|a, b| a.r.total_cmp(&b.r)).unwrap();
+    let (cx, cy, cz, _) = solid_chunk(&t, small);
+    let mut empty = ChunkCoord::new(0, 0, 0);
+    for i in 0..80 {
+        let x = 30_000_000i32 + i * 250_000;
+        let c = ChunkCoord::new(x.div_euclid(16), 0, i * 3);
+        let (lo, hi) = cube::chunk_bounds(c);
+        if !t.cosmos.may_hold(lo, hi) {
+            empty = c;
+            break;
+        }
+    }
+    let n = 30;
+    let start = std::time::Instant::now();
+    for _ in 0..n {
+        let _ = t.generate(cx, cy, cz);
+    }
+    let rock_us = start.elapsed().as_secs_f64() * 1e6 / n as f64;
+    let start = std::time::Instant::now();
+    for _ in 0..n {
+        let _ = t.generate(empty.x, empty.y, empty.z);
+    }
+    let empty_us = start.elapsed().as_secs_f64() * 1e6 / n as f64;
+    println!(
+        "cluster chunk ({cx},{cy},{cz}) kind {:?} r {:.0}: {rock_us:.1} µs; empty space ({}, {}, {}): {empty_us:.1} µs",
+        small.kind, small.r, empty.x, empty.y, empty.z
+    );
 }
