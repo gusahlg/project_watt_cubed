@@ -18,7 +18,7 @@ pub use clock::{DayLength, SkyClock, SkyFrame};
 pub use weather::Precip;
 pub use weather::Weather;
 
-use voxel_engine::{Frame3D, LinearRgb, SkyDesc};
+use voxel_engine::{Frame3D, LinearRgb, SkyDesc, Vec3};
 
 use crate::sky::palette::Rgb;
 
@@ -55,20 +55,20 @@ impl Sky {
     /// Sample the clock once for every sun consumer this frame.
     #[cfg(test)]
     pub fn frame(&self) -> SkyFrame {
-        self.clock.frame()
+        self.clock.frame(Vec3::Y)
     }
 
-    /// The clock sample at a pinned day fraction (stripped profiles render
-    /// fixed noon without mutating the authoritative clock).
-    pub fn frame_at_day(&self, day: f64) -> SkyFrame {
+    /// The clock sample at a pinned day fraction against local `up` (stripped
+    /// profiles render fixed noon without mutating the authoritative clock).
+    pub fn frame_at_day(&self, day: f64, up: Vec3) -> SkyFrame {
         let mut clock = self.clock;
         clock.set_day(day);
-        clock.frame()
+        clock.frame(up)
     }
 
-    /// Flat clear colour against an already-sampled clock frame.
-    pub fn clear_at(&self, frame: SkyFrame) -> LinearRgb {
-        self.atmosphere.clear(frame.sun_dir)
+    /// Flat clear colour against an already-sampled clock frame and local up.
+    pub fn clear_at(&self, frame: SkyFrame, up: Vec3) -> LinearRgb {
+        self.atmosphere.clear(frame.sun_dir, up)
     }
 
     /// Sky-pass descriptor for `frame`. Same value `draw` would push.
