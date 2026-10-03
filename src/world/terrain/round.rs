@@ -422,6 +422,33 @@ impl Round {
         }
     }
 
+    /// The 16×16 columns of a chunk whose first column is `(i0, j0)` (chunk aligned) of a shell
+    /// patch: the relief lattice once, then each column (equal to [`column`](Self::column)).
+    fn chunk_columns(&self, patch: Patch, i0: i64, j0: i64) -> Vec<Column> {
+        const NODES: usize = CHUNK_SIZE / LATTICE as usize + 1;
+        let relief: [[f32; NODES]; NODES] = std::array::from_fn(|a| {
+            std::array::from_fn(|b| self.relief_node(patch, i0 + a as i64 * LATTICE, j0 + b as i64 * LATTICE))
+        });
+        (0..CHUNK_AREA)
+            .map(|k| {
+                let (lx, lz) = (k % CHUNK_SIZE, k / CHUNK_SIZE);
+                let (a, b) = (lx / LATTICE as usize, lz / LATTICE as usize);
+                let h = bilerp(
+                    [[relief[a][b], relief[a][b + 1]], [relief[a + 1][b], relief[a + 1][b + 1]]],
+                    lx as i64 % LATTICE,
+                    lz as i64 % LATTICE,
+                );
+                self.column_with(patch, i0 + lx as i64, j0 + lz as i64, h)
+            })
+            .collect()
+    }
+
+    /// The storage-y surfaces of a chunk-aligned 16×16 block of shell columns starting at `(i0, j0)`,
+    /// indexed `lx + lz·16` (equal to [`column_surface`](Self::column_surface)).
+    pub fn chunk_surfaces(&self, patch: Patch, i0: i64, j0: i64) -> Vec<i64> {
+        self.chunk_columns(patch, i0, j0).iter().map(|c| c.surface).collect()
+    }
+
     /// The storage chunk at chunk coordinates `c`, filled column by column (equal to [`voxel`](Self::voxel)).
     pub fn fill_chunk(&self, c: [i64; 3]) -> ChunkData {
         let n = CHUNK_SIZE as i64;
@@ -433,23 +460,8 @@ impl Round {
         let (_, size) = self.atlas.storage_box(patch);
         let mut plants = Vec::new();
         self.plants_near(patch, size[0], l0[0], l0[0] + n - 1, l0[2], l0[2] + n - 1, &mut plants);
-        // The relief lattice over the chunk's columns, then its columns.
+        let cols = self.chunk_columns(patch, l0[0], l0[2]);
         const NODES: usize = CHUNK_SIZE / LATTICE as usize + 1;
-        let relief: [[f32; NODES]; NODES] = std::array::from_fn(|a| {
-            std::array::from_fn(|b| self.relief_node(patch, l0[0] + a as i64 * LATTICE, l0[2] + b as i64 * LATTICE))
-        });
-        let cols: Vec<Column> = (0..CHUNK_AREA)
-            .map(|k| {
-                let (lx, lz) = (k % CHUNK_SIZE, k / CHUNK_SIZE);
-                let (a, b) = (lx / LATTICE as usize, lz / LATTICE as usize);
-                let h = bilerp(
-                    [[relief[a][b], relief[a][b + 1]], [relief[a + 1][b], relief[a + 1][b + 1]]],
-                    lx as i64 % LATTICE,
-                    lz as i64 % LATTICE,
-                );
-                self.column_with(patch, l0[0] + lx as i64, l0[2] + lz as i64, h)
-            })
-            .collect();
         // The cave lattice, filled only if some cell of the chunk lies in the cave band.
         let top = l0[1] + n - 1;
         let caves_here = cols.iter().any(|c| c.surface - top < 400 && c.surface - l0[1] >= 5);

@@ -14,8 +14,9 @@ use crate::space::FaceFrame;
 use crate::derived::Revision;
 use crate::math::block_coord;
 
-use super::chunk::{CHUNK_SIZE, Chunk};
-use super::generation::ColumnHeights;
+use super::chunk::{CHUNK_SIZE, Chunk, ChunkData};
+use super::generation::{Classify, ColumnHeights};
+use crate::block::registry::AIR;
 use super::heightmip::{BakeExtent, HeightMip};
 use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
@@ -1558,6 +1559,18 @@ impl World {
         if let Some(slab) = self.spawn_slab {
             coords.extend(self.view_coords(slab));
         }
+        let mut stored = false;
+        coords.retain(|c| {
+            if self.store_if_free(*c) {
+                stored = true;
+                false
+            } else {
+                true
+            }
+        });
+        if stored {
+            self.refresh_spawn_slab();
+        }
         let runs = gather_column_runs(
             coords,
             |c| self.generator.sky(c),
@@ -1954,12 +1967,32 @@ impl World {
         accepted
     }
 
+    /// Air and uniform bulk never take a worker slot: same `Chunk`, same edit replay,
+    /// same light fast path as a generated uniform chunk.
+    fn store_if_free(&mut self, coord: Coord) -> bool {
+        if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
+            return false;
+        }
+        let id = match self.generator.classify(coord) {
+            Classify::Mixed => return false,
+            Classify::Air => AIR,
+            Classify::Uniform(id) => id,
+        };
+        let chunk = Chunk::from_data(coord.x, coord.y, coord.z, ChunkData::Uniform(id));
+        self.store_chunk(coord, chunk);
+        true
+    }
+
     /// Generate a chunk's data if it isn't loaded, replaying any saved edits on it.
     /// Uses `generate_column` so the ceiling heights come from the same sample
     /// the voxels did — never a second `height()` walk on this thread.
     /// Skips coords already claimed in `generating`: the async result is imminent.
     pub(in crate::world) fn ensure_data(&mut self, coord: Coord) {
         if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
+            return;
+        }
+        if self.store_if_free(coord) {
+            self.refresh_spawn_slab();
             return;
         }
         let sky = self.generator.sky(coord);

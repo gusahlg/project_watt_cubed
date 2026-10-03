@@ -13,12 +13,23 @@ use crate::block::registry::{AIR, BlockId, BlockRegistry};
 use crate::coord::{ChunkCoord, Face};
 use crate::gravity::{self, MassOracle};
 
+/// How a chunk can be stored without walking its cells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Classify {
+    /// No body reaches the chunk: every cell is air.
+    Air,
+    /// Every cell is this block.
+    Uniform(BlockId),
+    /// A real fill.
+    Mixed,
+}
+
 /// Ground height per cell of a 16×16 chunk column — identical to [`TerrainGenerator::height`].
 pub type ColumnHeights = [i32; CHUNK_SIZE * CHUNK_SIZE];
 
 /// Sample [`TerrainGenerator::height`] across a chunk column. Used by the
 /// default [`TerrainGenerator::generate_column`] (test gens that do not batch).
-fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i32, cz: i32) -> ColumnHeights {
+pub(super) fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i32, cz: i32) -> ColumnHeights {
     let x0 = cx * CHUNK_SIZE as i32;
     let z0 = cz * CHUNK_SIZE as i32;
     let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
@@ -78,7 +89,7 @@ pub(super) fn generate_column_default(
 pub enum WorldgenKind {
     /// The core fallback: a flat world.
     Flat,
-    /// InfiniteDiffusion: mountains and valleys, caves and mines, space.
+    /// InfiniteDiffusion: the cosmos — cube faces, round bodies, empty space.
     #[default]
     Diffusion,
 }
@@ -141,6 +152,11 @@ pub trait TerrainGenerator: Send + Sync {
     /// Which way skylight falls in `c`. Default is everywhere +Y.
     fn sky(&self, _c: ChunkCoord) -> Sky {
         Sky::Axis(Face::PosY)
+    }
+
+    /// Empty, one block, or a real mix. Default [`Classify::Mixed`]: every chunk is filled.
+    fn classify(&self, _c: ChunkCoord) -> Classify {
+        Classify::Mixed
     }
 
     /// Altitude of the first open cell above the ground along `face` at face-local `(u, v)`.

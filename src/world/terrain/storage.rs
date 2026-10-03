@@ -137,6 +137,27 @@ impl StorageWorlds {
         w.round.voxel([x as i64, y as i64, z as i64])
     }
 
+    /// [`surface`](Self::surface) of the 16×16 columns of storage chunk column `(cx, cz)`, indexed
+    /// `lx + lz·16`, sampling each chart's relief lattice once.
+    pub fn heights_16(&self, cx: i32, cz: i32) -> [i32; CHUNK_SIZE * CHUNK_SIZE] {
+        let (kx, kz) = (cx as i64, cz as i64);
+        for w in &self.worlds {
+            for &(patch, lo, hi) in &w.boxes {
+                if kx < lo[0] || kx >= hi[0] || kz < lo[2] || kz >= hi[2] {
+                    continue;
+                }
+                return match patch {
+                    Patch::Shell { band: 0, .. } => {
+                        let s = w.round.chunk_surfaces(patch, (kx - lo[0]) * CS, (kz - lo[2]) * CS);
+                        std::array::from_fn(|k| (s[k] + lo[1] * CS).clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32)
+                    }
+                    _ => [BURIED; CHUNK_SIZE * CHUNK_SIZE],
+                };
+            }
+        }
+        [i32::MIN; CHUNK_SIZE * CHUNK_SIZE]
+    }
+
     /// Storage y of the first open cell of storage column `(x, z)` (+Y is every chart's up): the
     /// painter's surface on a surface chart, [`BURIED`] under the deeper bands and the core, and
     /// `i32::MIN` (open) outside every box. Boxes never share a column.

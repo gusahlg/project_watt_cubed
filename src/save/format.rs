@@ -466,8 +466,9 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let worldgen_version = u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap());
     let off = HEADER_LEN_V5;
     let kind = bytes[off];
-    // v9 Diffusion worlds predate the cube-planet universe. Flat worlds from the same era load.
-    if version == 9 && kind == KIND_DIFFUSION && worldgen_version < 7 {
+    // Diffusion worlds before worldgen 7 predate the cube-planet universe (v9 saves, and v10 saves
+    // written while the generator was still v3). Flat worlds from the same era load.
+    if kind == KIND_DIFFUSION && worldgen_version < 7 {
         return Err(SaveError::BeforeCubePlanet);
     }
     let knobs = if version == 9 {
@@ -631,7 +632,7 @@ mod tests {
 
     fn sample() -> SaveDoc {
         SaveDoc {
-            worldgen_version: 6,
+            worldgen_version: 7,
             worldgen: WorldgenStamp::default(),
             law_stamp: material::Law::current().stamp(),
             meta: SaveMeta {
@@ -970,10 +971,13 @@ mod tests {
         let err = decode(&v9_save(KIND_DIFFUSION, 6, [100; 4])).unwrap_err();
         assert!(matches!(err, SaveError::BeforeCubePlanet));
         assert!(err.to_string().contains("made before the cube-planet universe"));
-        // A v10 Diffusion world stamped with the current generator (still 6) loads.
+        // A v10 Diffusion world written while the generator was still v3 is refused too; one stamped
+        // with the cube-planet generator loads.
         let mut doc = sample();
-        doc.worldgen_version = 6;
         doc.worldgen.kind = KIND_DIFFUSION;
+        doc.worldgen_version = 6;
+        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
+        doc.worldgen_version = 7;
         assert!(matches!(decode(&encode(&doc).unwrap()).unwrap(), Decoded::Intact(_)));
     }
 

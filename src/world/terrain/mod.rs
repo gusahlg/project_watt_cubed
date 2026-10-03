@@ -1,17 +1,12 @@
-//! InfiniteDiffusion (v3): the world generator.
+//! InfiniteDiffusion: the world generator.
 //!
-//! One pure function of `(seed, coordinate)` paints three realms:
-//!
-//! * **The surface** — continents of lowland basins, rolling hills and great mountain ranges.
-//!   Ridged multifractal crests over derivative-eroded slopes, cut by long carved valleys that run
-//!   through the ranges, with stepped mesas in the arid belts and banded strata on every cliff.
-//!   Biomes follow altitude, temperature and moisture: meadows, forests (broadleaf, pine, autumn,
-//!   blossom), deserts and mesas, alpine scree, snowfields.
-//! * **The underground** — spaghetti tunnels, caverns that widen with depth, glowing fungus on
-//!   deep floors and crystal on the deepest ceilings; ore veins; and abandoned **mines**: timbered
-//!   corridors on several levels, rails, rare lamps, collapsed stretches, rooms and shafts.
-//! * **Space** — above [`SPACE_FLOOR`]: planets (rocky, icy, verdant, desert, crystal, molten)
-//!   with crusts, mantles and glowing cores, rings and moons, drifting asteroids and stars.
+//! The [`cosmos`] lists every body. A cell belongs to the one body that reaches it, or it is air.
+//! Cube bodies (the start world and the twins) are six faces: today's terrain — shape, caves,
+//! mines, veins, trees — runs in face-local coordinates, with one salt per face except the home
+//! +Y face, which keeps the v3 salts. Below the crust the bulk is a coarse mix whose mean amount
+//! is [`cosmos::BULK_DENSITY`]. Round bodies live on curved charts in storage ([`storage`]): storage
+//! coordinates answer from their painters, and physical space holds none of their cells. Empty
+//! space classifies as air and is never sampled.
 //!
 //! Every material is a configuration the [`palette`] found in the law; nothing here names an
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
@@ -19,9 +14,9 @@
 pub mod cosmos;
 pub mod noise;
 pub mod palette;
+mod cube;
 pub mod round;
 mod shape;
-mod space;
 pub mod storage;
 mod trees;
 mod underground;
@@ -29,24 +24,25 @@ mod underground;
 use std::sync::Arc;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
-use super::generation::{self, ColumnHeights, TerrainGenerator};
-use super::layout::ColumnKey;
-use crate::coord::Face;
+use super::generation::{Classify, ColumnHeights, TerrainGenerator};
+use super::layout::{ColumnKey, Sky};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
+use crate::coord::{ChunkCoord, Face};
+use crate::space::FaceFrame;
 
+use noise::hash3;
 use shape::{Column, Shape};
-use space::Space;
 use trees::Trees;
 use underground::{Grid, Underground};
 
 /// Bumped whenever the same `(seed, coordinate)` can generate different materials than before.
 /// Folded into the content fingerprint and recorded in saves. History: 1-5 the classic and
 /// diffusion v1/v2 generators over authored and then emergent materials; 6 = InfiniteDiffusion v3
-/// over the selective-transfer palette (2026-10-02).
-pub const WORLDGEN_VERSION: u16 = 6;
+/// over the selective-transfer palette (2026-10-02); 7 = the cube planet (2026-10-03): bodies from
+/// the cosmos, six faces, empty space. Home +Y outside the rim keeps the v3 salts.
+pub const WORLDGEN_VERSION: u16 = 7;
 
-/// Everything at or above this height is space (above the far-LOD window, so planets never coarsen
-/// the terrain's distant meshes).
+/// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
 pub const SPACE_FLOOR: i32 = 640;
 /// Ground never rises above this (inside the far-LOD window `[0, 512)`).
 pub const MAX_GROUND: i32 = 470;
@@ -289,16 +285,30 @@ impl Materials {
     }
 }
 
+/// One cube face's copy of today's terrain, with its own salt.
+struct FacePaint {
+    shape: Shape,
+    under: Underground,
+    trees: Trees,
+}
+
 /// The generator.
 pub struct Terrain {
     seed: i64,
     /// Every body in the universe; also the generator's mass oracle.
     cosmos: Arc<cosmos::Cosmos>,
-    shape: Shape,
-    under: Underground,
-    trees: Trees,
-    space: Space,
+    /// Indexed by `body.id * 6 + face`. `None` for bodies that are not cubes.
+    paints: Vec<Option<FacePaint>>,
+    bulk: cube::Bulk,
+    /// The round bodies, painted on curved charts in storage.
+    storage: storage::StorageWorlds,
     m: Arc<Materials>,
+}
+
+/// Whether world cell x `x` lies in the storage region (curved charts), not physical space.
+#[inline]
+fn stored(x: i32) -> bool {
+    x as i64 >= crate::space::atlas::STORAGE_X0
 }
 
 /// Shared handle workers clone.
@@ -321,13 +331,36 @@ impl Terrain {
         let cfg = cfg.clamp();
         let s = (seed as u64 ^ (seed as u64 >> 32)) as u32 ^ 0x1D1F_F051;
         let m = Arc::new(Materials::intern(registry));
+        let cosmos = Arc::new(cosmos::Cosmos::new(s, cfg.space as f32 / 100.0));
+        let relief = cfg.relief as f32 / 100.0;
+        let n = cosmos.bodies().iter().map(|b| b.id as usize).max().unwrap_or(0) + 1;
+        let mut paints = Vec::new();
+        paints.resize_with(n * 6, || None);
+        for b in cosmos.bodies() {
+            if !matches!(b.shape, cosmos::Shape::Cube { .. }) {
+                continue;
+            }
+            for face in Face::ALL {
+                // Home +Y keeps the v3 salts. Every other face is a fresh field.
+                let s_face = if b.kind == cosmos::Kind::Home && face == Face::PosY {
+                    s
+                } else {
+                    hash3(s ^ 0x5A17, i32::from(b.id), face.index() as i32, 0x6A1E)
+                };
+                let i = b.id as usize * 6 + face.index();
+                paints[i] = Some(FacePaint {
+                    shape: Shape::new(s_face, relief, m.clone()),
+                    under: Underground::new(s_face ^ 0x0BAD_CAFE, cfg, m.clone()),
+                    trees: Trees::new(s_face ^ 0x7EE5_0000, m.clone()),
+                });
+            }
+        }
         Self {
             seed,
-            cosmos: Arc::new(cosmos::Cosmos::new(s, cfg.space as f32 / 100.0)),
-            shape: Shape::new(s, cfg.relief as f32 / 100.0, m.clone()),
-            under: Underground::new(s ^ 0x0BAD_CAFE, cfg, m.clone()),
-            trees: Trees::new(s ^ 0x7EE5_0000, m.clone()),
-            space: Space::new(s ^ 0x5BAC_E000, cfg.space as f32 / 100.0, m.clone()),
+            storage: storage::StorageWorlds::new(&cosmos, &m),
+            cosmos,
+            paints,
+            bulk: cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5),
             m,
         }
     }
@@ -338,87 +371,466 @@ impl Terrain {
         &self.m
     }
 
-    /// The full column description at `(x, z)` (height, biome, surface layers).
-    fn column(&self, x: i32, z: i32) -> Column {
-        self.shape.column(x, z)
+    fn paint(&self, body: &cosmos::Body, face: Face) -> &FacePaint {
+        self.paints[body.id as usize * 6 + face.index()].as_ref().expect("cube face")
     }
 
-    /// Ground below the surface, before caves, mines and ores carve or replace it.
-    fn ground(&self, col: &Column, x: i32, y: i32, z: i32) -> BlockId {
-        self.shape.ground(col, x, y, z)
-    }
-
-    /// One voxel, from its column. The single source of truth: batch fills reproduce it exactly.
-    fn voxel(&self, col: &Column, x: i32, y: i32, z: i32) -> BlockId {
-        if y >= SPACE_FLOOR {
-            return self.space.block(x, y, z);
-        }
-        if y >= col.height {
-            return self.trees.block_at(&self.shape, x, y, z).unwrap_or(AIR);
-        }
-        let field = |y: i32| Grid::interp_corners(&self.under.corners(x, y, z), x, y, z);
-        let ground = self.ground(col, x, y, z);
-        self.under.finish(col, x, y, z, ground, field(y), || field(y - 1), || field(y + 1))
-    }
-
-    /// Fill one 16³ chunk densely from a column window (the batch path; equal to [`Self::voxel`]).
-    fn fill_chunk(&self, cols: &ColumnWindow, cx: i32, cy: i32, cz: i32, tree_blocks: &[(i32, i32, i32, BlockId)]) -> ChunkData {
-        let n = CHUNK_SIZE as i32;
-        let (x0, y0, z0) = (cx * n, cy * n, cz * n);
-        if y0 >= SPACE_FLOOR && !self.space.may_touch(x0, y0, z0, n) {
-            return ChunkData::Uniform(AIR);
-        }
-        let top_tree = cols.max_height + trees::MAX_TREE_HEIGHT;
-        if y0 >= top_tree && y0 + n <= SPACE_FLOOR {
-            return ChunkData::Uniform(AIR);
-        }
-        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
-        let underground = y0 < cols.max_height;
-        let grid = underground.then(|| self.under.grid(x0, y0, z0));
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let col = cols.at(lx, lz);
-                let (x, z) = (x0 + lx as i32, z0 + lz as i32);
-                for ly in 0..CHUNK_SIZE {
-                    let y = y0 + ly as i32;
-                    let id = if y >= SPACE_FLOOR {
-                        self.space.block(x, y, z)
-                    } else if y >= col.height {
-                        AIR
-                    } else {
-                        let g = grid.as_ref().expect("underground chunk has a grid");
-                        let ly = ly as i32;
-                        let ground = self.ground(col, x, y, z);
-                        self.under.finish(col, x, y, z, ground, g.at(lx, ly, lz), || g.at(lx, ly - 1, lz), || g.at(lx, ly + 1, lz))
-                    };
-                    cells[Chunk::index(lx, ly, lz)] = id;
-                }
+    /// The body that owns cell `p`: closest datum, then the smaller id.
+    fn owner(&self, p: [i64; 3]) -> Option<cosmos::Body> {
+        let q = glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+        let mut best: Option<(f64, cosmos::Body)> = None;
+        for b in self.cosmos.bodies() {
+            // Round bodies are charted: their cells live in storage.
+            if !matches!(b.shape, cosmos::Shape::Cube { .. }) || !b.touches(p, p) {
+                continue;
+            }
+            let alt = b.altitude(q).abs();
+            let take = match best {
+                None => true,
+                Some((a, prev)) => alt < a || (alt == a && b.id < prev.id),
+            };
+            if take {
+                best = Some((alt, *b));
             }
         }
-        for &(x, y, z, id) in tree_blocks {
-            let (lx, ly, lz) = (x - x0, y - y0, z - z0);
-            if (0..n).contains(&lx) && (0..n).contains(&ly) && (0..n).contains(&lz) {
-                let i = Chunk::index(lx as usize, ly as usize, lz as usize);
-                // Trees fill open air above the ground only (never a cave under a neighbour's hill).
-                if cells[i] == AIR && y >= cols.at(lx as usize, lz as usize).height {
-                    cells[i] = id;
+        best.map(|(_, b)| b)
+    }
+
+    /// Home +Y column at world `(x, z)`, with the rim blend applied to its height.
+    fn posy_hit(&self, wx: i32, wz: i32) -> Option<Posy<'_>> {
+        let mut best: Option<(i32, Column, usize, i32, i32, i64, [i64; 3])> = None;
+        let n = self.cosmos.bodies().len();
+        for i in 0..n {
+            let body = self.cosmos.bodies()[i];
+            let cosmos::Shape::Cube { half } = body.shape else { continue };
+            let Some(centre) = cube::centre_i32(body.centre) else { continue };
+            let (ub, vb) = cube::tangents(Face::PosY, centre, wx, wz);
+            if cube::edge_inside(half, ub, vb) < -cosmos::RELIEF {
+                continue;
+            }
+            let (Ok(u), Ok(v)) = (i32::try_from(ub), i32::try_from(vb)) else { continue };
+            let paint = self.paint(&body, Face::PosY);
+            let mut col = paint.shape.column(u, v);
+            col.height = cube::blend_height(col.height, cube::rim_seed(&body), Face::PosY, half, ub, vb);
+            let a_body = half + i64::from(col.height) - 1;
+            let Ok(a_i) = i32::try_from(a_body) else { continue };
+            if cube::face_of(cube::local_to_rel(Face::PosY, u, a_i, v)) != Face::PosY {
+                continue;
+            }
+            let Some(world_a) = cube::world_a(half, col.height, cube::normal_dot(body.centre, Face::PosY)) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|hit| world_a > hit.0) {
+                best = Some((world_a, col, i, u, v, half, body.centre));
+            }
+        }
+        let (world_a, col, i, u, v, half, centre) = best?;
+        let body = self.cosmos.bodies()[i];
+        Some(Posy { world_a, col, paint: self.paint(&body, Face::PosY), u, v, half, centre })
+    }
+
+    fn cube_cell(&self, body: &cosmos::Body, p: [i64; 3]) -> BlockId {
+        let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
+        let half = cube::half_of(body);
+        if cube::in_deep(rel, half) {
+            return cube::bulk_id(&self.bulk, body, rel);
+        }
+        let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
+            return AIR;
+        };
+        let face = cube::face_of(rel);
+        let paint = self.paint(body, face);
+        let (u, a, v) = FaceFrame::new(face).cell_to_local((x, y, z));
+        let h = a - half as i32;
+        let mut col = paint.shape.column(u, v);
+        col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+        if h >= col.height {
+            return paint.trees.block_at(&paint.shape, u, h, v).unwrap_or(AIR);
+        }
+        if col.height - h > cube::CRUST {
+            return cube::bulk_id(&self.bulk, body, rel);
+        }
+        let field = |yy: i32| Grid::interp_corners(&paint.under.corners(u, yy, v), u, yy, v);
+        let ground = paint.shape.ground(&col, u, h, v);
+        paint.under.finish(&col, u, h, v, ground, field(h), || field(h - 1), || field(h + 1))
+    }
+
+    fn cell(&self, x: i32, y: i32, z: i32) -> BlockId {
+        if stored(x) {
+            return self.storage.voxel(x, y, z);
+        }
+        let p = [i64::from(x), i64::from(y), i64::from(z)];
+        let Some(body) = self.owner(p) else { return AIR };
+        self.cube_cell(&body, p)
+    }
+
+    /// Chunk wholly inside one cube's deep limit: the mix, and nothing else.
+    fn fast_bulk(&self, coord: ChunkCoord) -> Option<ChunkData> {
+        let (lo, hi) = cube::chunk_bounds(coord);
+        let mut only: Option<cosmos::Body> = None;
+        for b in self.cosmos.bodies_touching(lo, hi) {
+            if only.is_some() {
+                return None;
+            }
+            only = Some(*b);
+        }
+        let body = only?;
+        let cosmos::Shape::Cube { .. } = body.shape else { return None };
+        let half = cube::half_of(&body);
+        let rels = cube::corners(lo, hi).map(|p| [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]]);
+        if !rels.iter().copied().all(|r| cube::in_deep(r, half)) {
+            return None;
+        }
+        let id = cube::bulk_uniform(&self.bulk, &body, &rels)?;
+        Some(ChunkData::Uniform(id))
+    }
+
+    fn fill_slow(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
+        let coord = ChunkCoord::new(cx, cy, cz);
+        match self.classify(coord) {
+            Classify::Air => return ChunkData::Uniform(AIR),
+            Classify::Uniform(id) => return ChunkData::Uniform(id),
+            Classify::Mixed => {}
+        }
+        if let Some(data) = self.fast_bulk(coord) {
+            return data;
+        }
+        let n = CHUNK_SIZE as i32;
+        let (x0, y0, z0) = (cx * n, cy * n, cz * n);
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    cells[Chunk::index(lx, ly, lz)] = self.cell(x0 + lx as i32, y0 + ly as i32, z0 + lz as i32);
                 }
             }
         }
         ChunkData::from_cells(cells)
     }
-}
 
-/// The 16×16 columns of one chunk column (computed once per batch).
-struct ColumnWindow {
-    cols: Vec<Column>,
-    max_height: i32,
-}
-
-impl ColumnWindow {
-    fn at(&self, lx: usize, lz: usize) -> &Column {
-        &self.cols[lx + lz * CHUNK_SIZE]
+    /// The cube whose `face` covers this footprint outside the sky's edge band, outermost along
+    /// the normal.
+    fn face_column_body(&self, key: ColumnKey) -> Option<cosmos::Body> {
+        let samples = [(0i32, 0i32), (0, 15), (15, 0), (15, 15), (8, 8)];
+        let mut best: Option<(cosmos::Body, i32)> = None;
+        let n = self.cosmos.bodies().len();
+        for i in 0..n {
+            let body = self.cosmos.bodies()[i];
+            let cosmos::Shape::Cube { half } = body.shape else { continue };
+            let Some(centre) = cube::centre_i32(body.centre) else { continue };
+            let mut min_in = i64::MAX;
+            for (lu, lv) in samples {
+                let (u, v) = key.column_cell_uv(lu, lv);
+                let (ub, vb) = cube::tangents(key.face, centre, u, v);
+                min_in = min_in.min(cube::edge_inside(half, ub, vb));
+            }
+            if min_in < cube::SKY_EDGE {
+                continue;
+            }
+            let (u, v) = key.column_cell_uv(8, 8);
+            let (ub, vb) = cube::tangents(key.face, centre, u, v);
+            let (Ok(ui), Ok(vi)) = (i32::try_from(ub), i32::try_from(vb)) else { continue };
+            let paint = self.paint(&body, key.face);
+            let terrain = paint.shape.height(ui, vi);
+            let h = cube::blend_height(terrain, cube::rim_seed(&body), key.face, half, ub, vb);
+            let a_body = half + i64::from(h) - 1;
+            let Ok(a_i) = i32::try_from(a_body) else { continue };
+            if cube::face_of(cube::local_to_rel(key.face, ui, a_i, vi)) != key.face {
+                continue;
+            }
+            let Some(world_a) = cube::world_a(half, h, cube::normal_dot(body.centre, key.face)) else { continue };
+            if best.as_ref().is_none_or(|(_, a)| world_a > *a) {
+                best = Some((body, world_a));
+            }
+        }
+        best.map(|(b, _)| b)
     }
+
+    fn outward_blocked(&self, body: &cosmos::Body, face: Face, coord: ChunkCoord) -> bool {
+        let s = 16i64;
+        let origin = [coord.x as i64 * s, coord.y as i64 * s, coord.z as i64 * s];
+        let mut lo = origin;
+        let mut hi = [origin[0] + 15, origin[1] + 15, origin[2] + 15];
+        let (nx, ny, nz) = face.normal();
+        let n = [i64::from(nx), i64::from(ny), i64::from(nz)];
+        let far = 1_200_000_000i64;
+        for a in 0..3 {
+            if n[a] > 0 {
+                hi[a] = far;
+            } else if n[a] < 0 {
+                lo[a] = -far;
+            }
+        }
+        self.cosmos.bodies_touching(lo, hi).any(|b| b.id != body.id)
+    }
+
+    /// One deep chunk: eight coarse-cell samples, then the cheap mix if they disagree.
+    fn bulk_chunk(&self, body: &cosmos::Body, face: Face, u0: i32, h0: i32, v0: i32) -> ChunkData {
+        let half = cube::half_of(body) as i32;
+        let at = |lu: i32, la: i32, lv: i32| cube::local_to_rel(face, u0 + lu, half + h0 + la, v0 + lv);
+        let rels = [
+            at(0, 0, 0),
+            at(15, 0, 0),
+            at(0, 0, 15),
+            at(15, 0, 15),
+            at(0, 15, 0),
+            at(15, 15, 0),
+            at(0, 15, 15),
+            at(15, 15, 15),
+        ];
+        if let Some(id) = cube::bulk_uniform(&self.bulk, body, &rels) {
+            return ChunkData::Uniform(id);
+        }
+        let frame = FaceFrame::new(face);
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        for la in 0..CHUNK_SIZE {
+            for lv in 0..CHUNK_SIZE {
+                for lu in 0..CHUNK_SIZE {
+                    let rel = at(lu as i32, la as i32, lv as i32);
+                    let id = cube::bulk_id(&self.bulk, body, rel);
+                    let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                    cells[Chunk::index(lx, ly, lz)] = id;
+                }
+            }
+        }
+        ChunkData::from_cells(cells)
+    }
+
+    /// Fill one chunk of a face column. `cols[lu + lv * 16].height` is the blended face-local surface.
+    fn fill_face(
+        &self,
+        body: &cosmos::Body,
+        face: Face,
+        cols: &[Column],
+        u0: i32,
+        v0: i32,
+        h0: i32,
+        max_terrain: i32,
+        min_h: i32,
+        tree_blocks: &[(i32, i32, i32, BlockId)],
+    ) -> ChunkData {
+        let n = CHUNK_SIZE as i32;
+        // Unblended max keeps the v3 early-out. Blended max covers a rim that rose above it.
+        let max_h = cols.iter().map(|c| c.height).max().unwrap_or(i32::MIN);
+        if h0 >= max_terrain.max(max_h) + trees::MAX_TREE_HEIGHT {
+            return ChunkData::Uniform(AIR);
+        }
+        if i64::from(h0) + i64::from(n) <= i64::from(min_h) - i64::from(cube::CRUST) {
+            return self.bulk_chunk(body, face, u0, h0, v0);
+        }
+        let paint = self.paint(body, face);
+        // The batch grid covers a 4-aligned 16³. PosY is aligned; a flipped axis is not,
+        // and those faces sample the same corners the per-voxel path does.
+        let aligned = u0.rem_euclid(4) == 0 && h0.rem_euclid(4) == 0 && v0.rem_euclid(4) == 0;
+        // Floor within `CRUST` of the highest column: every solid cell is still crust.
+        let crust_only = i64::from(h0) >= i64::from(max_h) - i64::from(cube::CRUST);
+        let grid = (aligned && h0 < max_h).then(|| paint.under.grid(u0, h0, v0));
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        // `h0 >= max_h`: every column tops out at or below this chunk, so only trees write.
+        if h0 < max_h && face == Face::PosY && crust_only {
+            // Identity frame, the v3 surface loop: no permute and no bulk test.
+            if let Some(g) = &grid {
+                fill_posy_surface(paint, cols, g, u0, v0, h0, &mut cells);
+            } else {
+                fill_posy_corners(paint, cols, u0, v0, h0, &mut cells);
+            }
+        } else if h0 < max_h {
+            let frame = FaceFrame::new(face);
+            let half = cube::half_of(body) as i32;
+            for lv in 0..CHUNK_SIZE {
+                for lu in 0..CHUNK_SIZE {
+                    let col = &cols[lu + lv * CHUNK_SIZE];
+                    let (u, v) = (u0 + lu as i32, v0 + lv as i32);
+                    for la in 0..CHUNK_SIZE {
+                        let h = h0 + la as i32;
+                        let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                        let id = if h >= col.height {
+                            AIR
+                        } else if !crust_only && col.height - h > cube::CRUST {
+                            let rel = cube::local_to_rel(face, u, half + h, v);
+                            cube::bulk_id(&self.bulk, body, rel)
+                        } else {
+                            let la_i = la as i32;
+                            let ground = paint.shape.ground(col, u, h, v);
+                            if let Some(g) = &grid {
+                                paint.under.finish(
+                                    col,
+                                    u,
+                                    h,
+                                    v,
+                                    ground,
+                                    g.at(lu, la_i, lv),
+                                    || g.at(lu, la_i - 1, lv),
+                                    || g.at(lu, la_i + 1, lv),
+                                )
+                            } else {
+                                let field = |yy: i32| {
+                                    Grid::interp_corners(&paint.under.corners(u, yy, v), u, yy, v)
+                                };
+                                paint.under.finish(
+                                    col,
+                                    u,
+                                    h,
+                                    v,
+                                    ground,
+                                    field(h),
+                                    || field(h - 1),
+                                    || field(h + 1),
+                                )
+                            }
+                        };
+                        cells[Chunk::index(lx, ly, lz)] = id;
+                    }
+                }
+            }
+        }
+        let frame = FaceFrame::new(face);
+        for &(u, h, v, id) in tree_blocks {
+            let (lu, la, lv) = (u - u0, h - h0, v - v0);
+            if !(0..n).contains(&lu) || !(0..n).contains(&la) || !(0..n).contains(&lv) {
+                continue;
+            }
+            let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
+            let i = Chunk::index(lx, ly, lz);
+            if cells[i] == AIR && h >= cols[lu as usize + lv as usize * CHUNK_SIZE].height {
+                cells[i] = id;
+            }
+        }
+        ChunkData::from_cells(cells)
+    }
+
+    fn face_columns(
+        &self,
+        body: &cosmos::Body,
+        key: ColumnKey,
+        range: std::ops::RangeInclusive<i32>,
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+        let face = key.face;
+        let half = cube::half_of(body);
+        let centre = cube::centre_i32(body.centre).expect("cube centre fits i32");
+        let (wu, wv) = key.column_cell_uv(0, 0);
+        let (u0, v0) = cube::tangents(face, centre, wu, wv);
+        let (u0, v0) = (u0 as i32, v0 as i32);
+        let paint = self.paint(body, face);
+        let seed = cube::rim_seed(body);
+        let n_dot = cube::normal_dot(body.centre, face);
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        let mut cols = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
+        let mut max_terrain = i32::MIN;
+        let mut min_h = i32::MAX;
+        for lv in 0..CHUNK_SIZE {
+            for lu in 0..CHUNK_SIZE {
+                let (ub, vb) = (i64::from(u0) + i64::from(lu as i32), i64::from(v0) + i64::from(lv as i32));
+                let mut col = paint.shape.column(ub as i32, vb as i32);
+                max_terrain = max_terrain.max(col.height);
+                col.height = cube::blend_height(col.height, seed, face, half, ub, vb);
+                min_h = min_h.min(col.height);
+                heights[lu + lv * CHUNK_SIZE] = cube::world_a(half, col.height, n_dot).unwrap_or(i32::MIN);
+                cols.push(col);
+            }
+        }
+        if range.is_empty() {
+            return (Vec::new(), heights);
+        }
+        let tree_blocks = paint.trees.blocks_in(&paint.shape, u0, v0, CHUNK_SIZE as i32);
+        let frame = FaceFrame::new(face);
+        let chunks = range
+            .map(|alt| {
+                let coord = key.chunk(alt);
+                let h0 = cube::face_h(half, n_dot, frame.chunk_alt0(coord));
+                let data = self.fill_face(body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks);
+                (alt, data)
+            })
+            .collect();
+        (chunks, heights)
+    }
+
+    fn column_heights_of(&self, key: ColumnKey) -> ColumnHeights {
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for lv in 0..CHUNK_SIZE {
+            for lu in 0..CHUNK_SIZE {
+                let (u, v) = key.column_cell_uv(lu as i32, lv as i32);
+                heights[lu + lv * CHUNK_SIZE] = self.surface(key.face, u, v);
+            }
+        }
+        heights
+    }
+}
+
+/// +Y surface chunk on the batch grid. Same loop as v3: identity axes, crust only.
+fn fill_posy_surface(
+    paint: &FacePaint,
+    cols: &[Column],
+    g: &Grid,
+    u0: i32,
+    v0: i32,
+    h0: i32,
+    cells: &mut [BlockId; CHUNK_VOLUME],
+) {
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let col = &cols[lx + lz * CHUNK_SIZE];
+            let (x, z) = (u0 + lx as i32, v0 + lz as i32);
+            for ly in 0..CHUNK_SIZE {
+                let y = h0 + ly as i32;
+                let id = if y >= col.height {
+                    AIR
+                } else {
+                    let ly_i = ly as i32;
+                    let ground = paint.shape.ground(col, x, y, z);
+                    paint.under.finish(
+                        col,
+                        x,
+                        y,
+                        z,
+                        ground,
+                        g.at(lx, ly_i, lz),
+                        || g.at(lx, ly_i - 1, lz),
+                        || g.at(lx, ly_i + 1, lz),
+                    )
+                };
+                cells[Chunk::index(lx, ly, lz)] = id;
+            }
+        }
+    }
+}
+
+/// +Y surface chunk whose origin is not 4-aligned, so it cannot use the batch grid.
+fn fill_posy_corners(
+    paint: &FacePaint,
+    cols: &[Column],
+    u0: i32,
+    v0: i32,
+    h0: i32,
+    cells: &mut [BlockId; CHUNK_VOLUME],
+) {
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let col = &cols[lx + lz * CHUNK_SIZE];
+            let (x, z) = (u0 + lx as i32, v0 + lz as i32);
+            for ly in 0..CHUNK_SIZE {
+                let y = h0 + ly as i32;
+                if y >= col.height {
+                    continue;
+                }
+                let field = |yy: i32| Grid::interp_corners(&paint.under.corners(x, yy, z), x, yy, z);
+                let ground = paint.shape.ground(col, x, y, z);
+                cells[Chunk::index(lx, ly, lz)] =
+                    paint.under.finish(col, x, y, z, ground, field(y), || field(y - 1), || field(y + 1));
+            }
+        }
+    }
+}
+
+/// A PosY column resolved to one cube face.
+struct Posy<'a> {
+    world_a: i32,
+    col: Column,
+    paint: &'a FacePaint,
+    u: i32,
+    v: i32,
+    half: i64,
+    centre: [i64; 3],
 }
 
 impl TerrainGenerator for Terrain {
@@ -435,11 +847,128 @@ impl TerrainGenerator for Terrain {
     }
 
     fn height(&self, wx: i32, wz: i32) -> i32 {
-        self.shape.height(wx, wz)
+        self.surface(Face::PosY, wx, wz)
+    }
+
+    fn atlases(&self) -> &[Arc<crate::space::atlas::Atlas>] {
+        self.storage.atlases()
+    }
+
+    fn sky(&self, coord: ChunkCoord) -> Sky {
+        // Every chart's up is storage +Y.
+        if storage::StorageWorlds::owns(coord) {
+            return Sky::Axis(Face::PosY);
+        }
+        let (lo, hi) = cube::chunk_bounds(coord);
+        let mut owned: Option<(cosmos::Body, Face)> = None;
+        let mut min_inside = i64::MAX;
+        for p in cube::corners(lo, hi) {
+            let Some(body) = self.owner(p) else { return Sky::Open };
+            let cosmos::Shape::Cube { .. } = body.shape else { return Sky::Open };
+            let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
+            let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
+                return Sky::Open;
+            };
+            let face = cube::face_of(rel);
+            match owned {
+                None => owned = Some((body, face)),
+                Some((b, f)) if b.id != body.id || f != face => return Sky::Open,
+                _ => {}
+            }
+            let (u, _, v) = FaceFrame::new(face).cell_to_local((x, y, z));
+            min_inside = min_inside.min(cube::edge_inside(cube::half_of(&body), i64::from(u), i64::from(v)));
+        }
+        let Some((body, face)) = owned else { return Sky::Open };
+        if min_inside < cube::SKY_EDGE || self.outward_blocked(&body, face, coord) {
+            return Sky::Open;
+        }
+        Sky::Axis(face)
+    }
+
+    fn classify(&self, coord: ChunkCoord) -> Classify {
+        if storage::StorageWorlds::owns(coord) {
+            return match self.storage.uniform(coord) {
+                Some(AIR) => Classify::Air,
+                Some(id) => Classify::Uniform(id),
+                None => Classify::Mixed,
+            };
+        }
+        let (lo, hi) = cube::chunk_bounds(coord);
+        if !self.cosmos.may_hold(lo, hi) {
+            return Classify::Air;
+        }
+        let mut only: Option<cosmos::Body> = None;
+        for b in self.cosmos.bodies_touching(lo, hi) {
+            if only.is_some() {
+                return Classify::Mixed;
+            }
+            only = Some(*b);
+        }
+        let Some(body) = only else { return Classify::Mixed };
+        match body.shape {
+            cosmos::Shape::Cube { .. } => {
+                let half = cube::half_of(&body);
+                if cube::min_reach(body.centre, lo, hi) - half >= i64::from(cube::TREE_CLEAR) {
+                    return Classify::Uniform(AIR);
+                }
+                let rels = cube::corners(lo, hi)
+                    .map(|p| [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]]);
+                if rels.iter().copied().all(|r| cube::in_deep(r, half)) {
+                    if let Some(id) = cube::bulk_uniform(&self.bulk, &body, &rels) {
+                        return Classify::Uniform(id);
+                    }
+                }
+                Classify::Mixed
+            }
+            // Charted: nothing of a round body is in physical space.
+            cosmos::Shape::Ball { .. } | cosmos::Shape::Shell { .. } => Classify::Air,
+        }
+    }
+
+    fn surface(&self, face: Face, u: i32, v: i32) -> i32 {
+        if face == Face::PosY && stored(u) {
+            return self.storage.surface(u, v);
+        }
+        let mut best = i32::MIN;
+        let n = self.cosmos.bodies().len();
+        for i in 0..n {
+            let body = self.cosmos.bodies()[i];
+            let cosmos::Shape::Cube { half } = body.shape else { continue };
+            let Some(centre) = cube::centre_i32(body.centre) else { continue };
+            let (ub, vb) = cube::tangents(face, centre, u, v);
+            if cube::edge_inside(half, ub, vb) < -cosmos::RELIEF {
+                continue;
+            }
+            let (Ok(ui), Ok(vi)) = (i32::try_from(ub), i32::try_from(vb)) else { continue };
+            let paint = self.paint(&body, face);
+            let terrain = paint.shape.height(ui, vi);
+            let h = cube::blend_height(terrain, cube::rim_seed(&body), face, half, ub, vb);
+            let a_body = half + i64::from(h) - 1;
+            let Ok(a_i) = i32::try_from(a_body) else { continue };
+            if cube::face_of(cube::local_to_rel(face, ui, a_i, vi)) != face {
+                continue;
+            }
+            let Some(world_a) = cube::world_a(half, h, cube::normal_dot(body.centre, face)) else { continue };
+            if world_a > best {
+                best = world_a;
+            }
+        }
+        best
+    }
+
+    fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
+        if stored(cx * CHUNK_SIZE as i32) {
+            return self.storage.heights_16(cx, cz);
+        }
+        super::generation::sample_column_heights(self, cx, cz)
     }
 
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
-        self.column(wx, wz).surface
+        if stored(wx) {
+            let s = self.storage.surface(wx, wz);
+            return if s == i32::MIN || s >= storage::BURIED { AIR } else { self.storage.voxel(wx, s - 1, wz) };
+        }
+        self.posy_hit(wx, wz).map(|hit| hit.col.surface).unwrap_or(AIR)
     }
 
     fn deep(&self) -> BlockId {
@@ -447,58 +976,95 @@ impl TerrainGenerator for Terrain {
     }
 
     fn block_at(&self, wx: i32, wy: i32, wz: i32, _height: i32) -> BlockId {
-        let col = self.column(wx, wz);
-        self.voxel(&col, wx, wy, wz)
+        self.cell(wx, wy, wz)
     }
 
     fn voxel_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
-        let col = self.column(wx, wz);
-        self.voxel(&col, wx, wy, wz)
+        self.cell(wx, wy, wz)
     }
 
     fn lod_block_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
-        let col = self.column(wx, wz);
-        if wy >= col.height { AIR } else { self.ground(&col, wx, wy, wz) }
+        if stored(wx) {
+            return self.storage.voxel(wx, wy, wz);
+        }
+        let Some(hit) = self.posy_hit(wx, wz) else { return AIR };
+        if wy >= hit.world_a {
+            return AIR;
+        }
+        let h = cube::face_h(hit.half, cube::normal_dot(hit.centre, Face::PosY), wy);
+        hit.paint.shape.ground(&hit.col, hit.u, h, hit.v)
     }
 
     fn lod_column(&self, wx: i32, wz: i32, ys: &[i32], out: &mut [BlockId]) {
-        let col = self.column(wx, wz);
+        if stored(wx) {
+            for (o, &wy) in out.iter_mut().zip(ys) {
+                *o = self.storage.voxel(wx, wy, wz);
+            }
+            return;
+        }
+        let Some(hit) = self.posy_hit(wx, wz) else {
+            for o in out.iter_mut().take(ys.len()) {
+                *o = AIR;
+            }
+            return;
+        };
+        let n_dot = cube::normal_dot(hit.centre, Face::PosY);
         for (o, &wy) in out.iter_mut().zip(ys) {
-            *o = if wy >= col.height { AIR } else { self.ground(&col, wx, wy, wz) };
+            *o = if wy >= hit.world_a {
+                AIR
+            } else {
+                let h = cube::face_h(hit.half, n_dot, wy);
+                hit.paint.shape.ground(&hit.col, hit.u, h, hit.v)
+            };
         }
     }
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
-        let key = ColumnKey { face: Face::PosY, a: cx, b: cz };
-        let (mut chunks, _) = self.generate_column(key, cy..=cy);
-        chunks.pop().expect("one chunk").1
+        let coord = ChunkCoord::new(cx, cy, cz);
+        if storage::StorageWorlds::owns(coord) {
+            return self.storage.generate(coord);
+        }
+        match self.classify(coord) {
+            Classify::Air => return ChunkData::Uniform(AIR),
+            Classify::Uniform(id) => return ChunkData::Uniform(id),
+            Classify::Mixed => {}
+        }
+        match self.sky(coord) {
+            Sky::Axis(face) => {
+                let (key, alt) = ColumnKey::of(face, coord);
+                let (mut chunks, _) = self.generate_column(key, alt..=alt);
+                chunks.pop().expect("the requested layer").1
+            }
+            Sky::Open => self.fill_slow(cx, cy, cz),
+        }
     }
 
     fn generate_column(
         &self,
         key: ColumnKey,
-        cy: std::ops::RangeInclusive<i32>,
+        range: std::ops::RangeInclusive<i32>,
     ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
-        if key.face != Face::PosY {
-            return generation::generate_column_default(self, key, cy);
+        // Storage columns: the chart painters, chunk by chunk; heights are the charts' surfaces.
+        if key.face == Face::PosY && storage::StorageWorlds::owns(key.chunk(*range.start())) {
+            let c = key.chunk(*range.start());
+            let chunks = range.map(|alt| (alt, self.storage.generate(key.chunk(alt)))).collect();
+            return (chunks, self.storage.heights_16(c.x, c.z));
         }
-        let (cx, cz) = (key.a, key.b);
-        let n = CHUNK_SIZE as i32;
-        let (x0, z0) = (cx * n, cz * n);
-        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
-        let cols: Vec<Column> = (0..CHUNK_SIZE * CHUNK_SIZE)
-            .map(|i| self.column(x0 + (i % CHUNK_SIZE) as i32, z0 + (i / CHUNK_SIZE) as i32))
-            .collect();
-        for (h, c) in heights.iter_mut().zip(&cols) {
-            *h = c.height;
+        if let Some(body) = self.face_column_body(key) {
+            if range.clone().all(|alt| self.sky(key.chunk(alt)) == Sky::Axis(key.face)) {
+                return self.face_columns(&body, key, range);
+            }
         }
-        if cy.is_empty() {
+        let heights = self.column_heights_of(key);
+        if range.is_empty() {
             return (Vec::new(), heights);
         }
-        let max_height = cols.iter().map(|c| c.height).max().unwrap_or(0);
-        let window = ColumnWindow { cols, max_height };
-        let tree_blocks = self.trees.blocks_in(&self.shape, x0, z0, n);
-        let chunks = cy.map(|cyy| (cyy, self.fill_chunk(&window, cx, cyy, cz, &tree_blocks))).collect();
+        let chunks = range
+            .map(|alt| {
+                let c = key.chunk(alt);
+                (alt, self.fill_slow(c.x, c.y, c.z))
+            })
+            .collect();
         (chunks, heights)
     }
 }
