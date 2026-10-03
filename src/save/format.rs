@@ -34,7 +34,8 @@
 //!
 //! Version 9 is the same header with 4 knobs and a 33-byte player record (no frame,
 //! velocity, or up axis). It still decodes: identity frame, zero velocity, +Y up,
-//! and the four new knobs at 100. A v9 Diffusion world stamped with a generator
+//! and the four new knobs at 100. `PlayerState::legacy_pose` is set so the bridge
+//! can stand that player in local gravity; the flag is not written. A v9 Diffusion world stamped with a generator
 //! older than the cube-planet universe (`worldgen < 7`) is [`SaveError::BeforeCubePlanet`].
 //! Flat v9 worlds load. Versions 4-8 predate the selective-transfer law: their headers
 //! still peek (the slot list shows them) but [`decode`] refuses them with [`SaveError::Outdated`].
@@ -151,6 +152,8 @@ pub struct PlayerState {
     pub velocity: [f64; 3],
     /// `coord::Face` index the collision box stands on.
     pub up: u8,
+    /// True only for a decoded v9 record, whose pose was fabricated. Not written.
+    pub legacy_pose: bool,
     pub flying: bool,
     pub noclip: bool,
     /// Held configurations as `(spec, count)` in first-seen order.
@@ -501,6 +504,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
             frame: DQuat::IDENTITY,
             velocity: [0.0; 3],
             up: UP_POS_Y,
+            legacy_pose: true,
             flying: false,
             noclip: false,
             stash: None,
@@ -514,6 +518,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
             frame: pose.frame,
             velocity: [r.f64()?, r.f64()?, r.f64()?],
             up: r.u8()?,
+            legacy_pose: false,
             flying: false,
             noclip: false,
             stash: None,
@@ -650,6 +655,7 @@ mod tests {
                 frame: DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0),
                 velocity: [1.5, -2.25, 0.5],
                 up: 1,
+                legacy_pose: false,
                 flying: true,
                 noclip: true,
                 stash: Some(vec![("Stone".into(), 2), ("Iron".into(), 1)]),
@@ -964,6 +970,7 @@ mod tests {
         assert_eq!(doc.player.frame, DQuat::IDENTITY);
         assert_eq!(doc.player.velocity, [0.0; 3]);
         assert_eq!(doc.player.up, UP_POS_Y);
+        assert!(doc.player.legacy_pose);
     }
 
     #[test]

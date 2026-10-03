@@ -32,6 +32,21 @@ pub const MAX_HEALTH: f32 = 20.0;
 /// centre, and the scale the zero-g thresholds are measured against.
 pub const STANDARD_GRAVITY: f64 = 24.0 * PER_METER;
 
+/// Below this fraction of [`STANDARD_GRAVITY`] a spawn or teleport has no up to stand on.
+const STAND_MIN: f64 = 0.02;
+
+/// Body frame and collision axis that `gravity` defines for a fresh spawn.
+/// `(IDENTITY, PosY)` when gravity is too weak to define an up, and when that up is exactly +Y
+/// (the +Y face centre): snapping an identity frame onto +Y is a no-op.
+pub fn standing_pose(gravity: DVec3) -> (glam::DQuat, Face) {
+    let Some(up) = crate::gravity::Sample::uniform(gravity).up(STAND_MIN * STANDARD_GRAVITY) else {
+        return (glam::DQuat::IDENTITY, Face::PosY);
+    };
+    let mut orientation = Orientation::new(0.0, 0.0);
+    orientation.snap(up);
+    (orientation.frame, Face::from_dominant(up))
+}
+
 /// How tall the player stands and how high their eye sits, as a function of what
 /// they're doing. Geometry is a pure function of the stance — box height and eye
 /// height both derive from one [`height`](Stance::height), so there is no free
@@ -214,6 +229,13 @@ impl Player {
         self.up_axis = Face::from_dominant(up);
     }
 
+    /// Stand in `gravity` (an acceleration). No-op in free fall. Identity at exact +Y.
+    pub fn stand_in(&mut self, gravity: DVec3) {
+        let (frame, up) = standing_pose(gravity);
+        self.orientation.frame = frame;
+        self.up_axis = up;
+    }
+
     /// Full view direction, including pitch.
     pub fn forward(&self) -> DVec3 {
         self.orientation.direction()
@@ -257,5 +279,31 @@ pub fn collision_box(eye: DVec3, stance: Stance, up: Face) -> Aabb {
 impl Bounded for Player {
     fn aabb(&self) -> Aabb {
         collision_box(self.position, self.stance, self.up_axis)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::DQuat;
+
+    #[test]
+    fn standing_pose_is_identity_on_plus_y_and_follows_a_side_face() {
+        let (frame, face) = standing_pose(DVec3::new(0.0, -STANDARD_GRAVITY, 0.0));
+        assert_eq!(frame, DQuat::IDENTITY);
+        assert_eq!(face, Face::PosY);
+
+        let (frame, face) = standing_pose(DVec3::new(-STANDARD_GRAVITY, 0.0, 0.0));
+        assert_eq!(face, Face::PosX);
+        let mut player = Player::new(DVec3::ZERO);
+        player.stand_in(DVec3::new(-STANDARD_GRAVITY, 0.0, 0.0));
+        assert_eq!(player.orientation.frame, frame);
+        assert_eq!(player.up_axis, Face::PosX);
+        assert!((player.up() - DVec3::X).length() < 1e-9);
+
+        let mut loose = Player::new(DVec3::ZERO);
+        loose.stand_in(DVec3::new(0.0, -0.01, 0.0));
+        assert_eq!(loose.orientation.frame, DQuat::IDENTITY);
+        assert_eq!(loose.up_axis, Face::PosY);
     }
 }

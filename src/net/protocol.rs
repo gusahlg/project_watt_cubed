@@ -659,6 +659,7 @@ mod tests {
                     frame: DQuat::IDENTITY,
                     velocity: [0.0; 3],
                     up: Face::PosY as u8,
+                    legacy_pose: false,
                     flying: false,
                     noclip: false,
                     stash: Some(vec![(spec.clone(), 1)]),

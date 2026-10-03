@@ -10,7 +10,7 @@
 //! command testable without a window.
 use voxel_engine::DVec3;
 
-use crate::math::{WORLD_BORDER, block_coord};
+use crate::math::WORLD_BORDER;
 use crate::modding::{annotate_setting, VisualMask};
 use crate::player::Player;
 use crate::settings::{SETTINGS, Settings};
@@ -335,11 +335,8 @@ fn set_speed(
 fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let cell = match args {
         [] => {
-            // The block supporting the player: directly below the feet along the up
-            // axis. The small bias keeps it stable when standing exactly on a block's face.
-            let mut f = player.feet();
-            f[player.up_axis.axis()] -= player.up_axis.sign() as f64 * 0.1;
-            (block_coord(f.x), block_coord(f.y), block_coord(f.z))
+            // The block supporting the player: 0.1 along −up, storage −Y on a chart.
+            world.ground_cell(player.feet(), player.up_axis)
         }
         [x, y, z] => match (x.parse(), y.parse(), z.parse()) {
             (Ok(x), Ok(y), Ok(z)) => (x, y, z),

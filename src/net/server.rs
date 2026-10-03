@@ -35,7 +35,9 @@ use glam::DQuat;
 use voxel_engine::{DVec3, Vec3};
 
 use crate::coord::Face;
+use crate::gravity::Field;
 use crate::math::block_coord;
+use crate::player::standing_pose;
 
 use crate::block::registry::{BlockId, BlockRegistry, AIR};
 use crate::net::hooks;
@@ -810,6 +812,7 @@ fn admit_player(
         id = state.next_id;
         state.next_id += 1;
         spawn = spawn_point(ctx.generator.as_ref(), id);
+        let (frame, up) = standing_pose(Field::new(ctx.generator.mass()).sample(spawn).accel);
 
         // Roster only — poses flow through the visibility machinery once the
         // joiner reports their first move, so a far peer isn't a frozen ghost.
@@ -829,9 +832,9 @@ fn admit_player(
                 pos: spawn,
                 yaw: 0.0,
                 pitch: 0.0,
-                frame: DQuat::IDENTITY,
+                frame,
                 velocity: Vec3::ZERO,
-                up: Face::PosY,
+                up,
                 stance: Stance::Standing,
                 last_move: Instant::now(),
                 visible: HashSet::new(),

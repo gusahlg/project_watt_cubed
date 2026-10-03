@@ -9,10 +9,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use glam::DQuat;
 use voxel_engine::{DVec3, IVec3};
 
 use crate::block::registry::BlockId;
 use crate::console::Console;
+use crate::coord::Face;
 use crate::net::client::Connection;
 use crate::presence::STRIDE_FREQ;
 use crate::world::World;
@@ -53,6 +55,10 @@ pub struct PlayerPose {
     pub pitch: f32,
     pub velocity: DVec3,
     pub on_ground: bool,
+    /// Collision axis the gait speed is measured across.
+    pub up: Face,
+    /// View frame. Yaw and pitch are relative to it.
+    pub frame: DQuat,
 }
 
 /// The one per-frame peer sample: built from `Connection::peers().sample(now)`
@@ -66,6 +72,8 @@ pub struct PeerPose {
     pub visible: bool,
     pub phase: f32,
     pub speed: f32,
+    /// Collision axis the footstep probe walks along.
+    pub up: Face,
 }
 
 /// Everything the director derives or caches this frame, built by borrowing from
@@ -139,10 +147,12 @@ impl WindowCache {
         needed: bool,
     ) -> Option<Arc<AcousticWindow>> {
         self.timer += dt;
+        // Loaded chunks on a round body are storage cells. The window samples those.
+        let at = world.stream_eye(pos);
         let cell = IVec3::new(
-            pos.x.floor() as i32,
-            pos.y.floor() as i32,
-            pos.z.floor() as i32,
+            at.x.floor() as i32,
+            at.y.floor() as i32,
+            at.z.floor() as i32,
         );
         let edit_gen = world.edit_generation();
         let stale = self.window.is_none()
@@ -313,6 +323,7 @@ impl AudioDirector {
             pos: ctx.player.pos,
             yaw: ctx.player.yaw,
             pitch: ctx.player.pitch,
+            frame: ctx.player.frame,
         };
 
         let mut journal: Vec<Occurrence> = Vec::new();
@@ -350,10 +361,15 @@ impl AudioDirector {
 
         // --- Derived: local footstep (∫ speed dt crossing) ---
         let v = ctx.player.velocity;
-        let speed = (v.x * v.x + v.z * v.z).sqrt();
+        // PosY is exactly the old XZ speed. Other faces drop the up-axis component.
+        let speed = match ctx.player.up.axis() {
+            0 => (v.y * v.y + v.z * v.z).sqrt(),
+            1 => (v.x * v.x + v.z * v.z).sqrt(),
+            _ => (v.x * v.x + v.y * v.y).sqrt(),
+        };
         if self.gait.advance(speed, dt) && speed > 0.5 && ctx.player.on_ground {
             let feet = ctx.player.feet;
-            if let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, feet)) {
+            if let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, feet, ctx.player.up)) {
                 self.push(&mut journal, Some(feet), sfx);
             }
         }
@@ -367,7 +383,7 @@ impl AudioDirector {
             if let Some(prev) = prev
                 && phase_crossed(prev, peer.phase)
                 && peer.speed > 0.5
-                && let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, peer.feet))
+                && let Some(sfx) = self.palette.step(sound_class_at_feet(ctx.world, peer.feet, peer.up))
             {
                 self.push(&mut journal, Some(peer.feet), sfx);
             }
@@ -431,15 +447,9 @@ impl AudioDirector {
     }
 }
 
-/// The sound class of the block just under a foot position (the 0.1 m probe below
-/// the eye/feet pos), for footstep cue selection.
-fn sound_class_at_feet(world: &World, feet: DVec3) -> &'static str {
-    let below = world.block_at(
-        feet.x.floor() as i32,
-        (feet.y - 0.1).floor() as i32,
-        feet.z.floor() as i32,
-    );
-    world.registry().sound_class(below)
+/// The sound class of the block just under a foot, along `up` (storage +Y on a chart).
+fn sound_class_at_feet(world: &World, feet: DVec3, up: Face) -> &'static str {
+    world.registry().sound_class(world.ground_block(feet, up))
 }
 
 #[cfg(test)]
@@ -447,7 +457,9 @@ mod tests {
     use super::*;
     use crate::audio::SoundSystem;
     use crate::console::Console;
+    use crate::coord::Face;
     use crate::world::World;
+    use glam::DQuat;
     use voxel_engine::DVec3;
 
     fn pose(pos: DVec3) -> PlayerPose {
@@ -458,6 +470,8 @@ mod tests {
             pitch: 0.0,
             velocity: DVec3::ZERO,
             on_ground: true,
+            up: Face::PosY,
+            frame: DQuat::IDENTITY,
         }
     }
 
@@ -513,6 +527,51 @@ mod tests {
         assert!(
             !dir.can_skip_commit(&sound, &[], pos, true),
             "push-to-talk must keep capture serviced"
+        );
+    }
+
+    /// The footstep probe walks the up axis, and a chart walks storage −Y.
+    #[test]
+    fn footstep_block_follows_the_up_axis_and_a_chart() {
+        let mut world = World::with_config_lazy(1, crate::render_config::RenderConfig::default());
+        world.ensure_around(DVec3::new(10.5, 5.0, 3.5));
+        let rock = world.registry().id_by_label("rock").unwrap();
+        let air = crate::block::AIR;
+        // (10, 5, 3) is one step along −X from the foot; (10, 4, 3) is one step along −Y.
+        world.set_block(10, 5, 3, air);
+        world.set_block(10, 4, 3, rock);
+        let feet = DVec3::new(10.5, 5.0, 3.5);
+        assert_eq!(world.ground_block(feet, Face::PosX), air);
+        assert_eq!(world.ground_block(feet, Face::PosY), rock);
+        assert_eq!(sound_class_at_feet(&world, feet, Face::PosX), "open");
+        assert_eq!(
+            sound_class_at_feet(&world, feet, Face::PosY),
+            world.registry().sound_class(rock)
+        );
+
+        use crate::space::atlas::{Atlas, Patch};
+        let centre = DVec3::new(2.0e7, 3.0e7, -1.0e7);
+        let r = 3_000i64;
+        let atlas = std::sync::Arc::new(Atlas::new(centre, r, r + 64, false, 0));
+        world.set_atlases(vec![atlas.clone()]);
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let b = atlas.bands[0];
+        let (k, mid) = (r - b.r_lo - 1, b.n / 2);
+        let feet = atlas.embed(top, DVec3::new(mid as f64 + 0.5, k as f64 + 1.05, mid as f64 + 0.5));
+        world.ensure_around(feet);
+        let s = atlas.storage(top, [mid, k, mid]);
+        world.set_block(s[0] as i32, s[1] as i32, s[2] as i32, rock);
+        assert_eq!(world.ground_block(feet, Face::PosX), rock);
+        assert_eq!(sound_class_at_feet(&world, feet, Face::PosX), world.registry().sound_class(rock));
+        let physical = (
+            feet.x.floor() as i32,
+            (feet.y - 0.1).floor() as i32,
+            feet.z.floor() as i32,
+        );
+        assert_eq!(
+            world.registry().sound_class(world.block_at(physical.0, physical.1, physical.2)),
+            "open",
+            "a world-Y probe is not the storage cell under the feet"
         );
     }
 }

@@ -737,7 +737,8 @@ impl App {
             conn.terrain(),
             false,
         );
-        let player = Player::new(conn.spawn());
+        let mut player = Player::new(conn.spawn());
+        player.stand_in(world.gravity_at(player.position).accel);
         // A networked world is a live mirror, not a save — per-world mod state
         // starts clean, but the player's enable/disable choices persist.
         self.active = None;
@@ -992,14 +993,18 @@ fn spawn_player(world: &World) -> Player {
                     });
                     if flat {
                         let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-                        return Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
+                        let mut player = Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
+                        player.stand_in(world.gravity_at(player.position).accel);
+                        return player;
                     }
                 }
             }
         }
     }
     let h = world.surface_y(0, 0);
-    Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5))
+    let mut player = Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5));
+    player.stand_in(world.gravity_at(player.position).accel);
+    player
 }
 
 #[cfg(test)]
@@ -1029,6 +1034,23 @@ mod tests {
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("spawn_player {ms:.2}ms");
         assert!(ms < 250.0, "spawn must stay under a frame, got {ms:.2}");
+    }
+
+    #[test]
+    fn spawn_player_stands_in_local_gravity() {
+        let world = World::with_config_lazy(7, RenderConfig::default());
+        let p = spawn_player(&world);
+        let min = 0.02 * crate::player::STANDARD_GRAVITY;
+        match world.gravity_at(p.position).up(min) {
+            Some(up) => {
+                assert!((p.up() - up).length() < 1e-9, "{} vs {up}", p.up());
+                assert_eq!(p.up_axis, crate::coord::Face::from_dominant(up));
+            }
+            None => {
+                assert_eq!(p.orientation.frame, glam::DQuat::IDENTITY);
+                assert_eq!(p.up_axis, crate::coord::Face::PosY);
+            }
+        }
     }
 
     #[test]

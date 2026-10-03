@@ -81,6 +81,8 @@ const RIG: [Part; 6] = [
 
 pub struct Pose {
     feet: Vec3,
+    /// Body up. Identity frames keep exactly [`Vec3::Y`].
+    up: Vec3,
     parts: [(Vec3, Mat3); 6],
 }
 
@@ -114,6 +116,12 @@ impl Pose {
         let h = 1.0 + (pose.stance.height_scale() - 1.0) * rig.stance_blend;
         let squash = |v: Vec3| Vec3::new(v.x, v.y * h, v.z);
 
+        // Identity skips the narrow so the contact shadow's normal stays exactly +Y.
+        let up = if pose.frame == DQuat::IDENTITY {
+            Vec3::Y
+        } else {
+            crate::camera::rotate(pose.frame, voxel_engine::DVec3::Y).as_vec3()
+        };
         let (phase, amp) = (pose.gait.phase, pose.gait.amp());
         let mut parts = [(Vec3::ZERO, Mat3::IDENTITY); 6];
         for (i, part) in RIG.iter().enumerate() {
@@ -132,7 +140,7 @@ impl Pose {
             let local = pivot + swing_rot * (squash(part.rest) - pivot);
             parts[i] = (pose.feet + body_rot * (local * SCALE), body_rot * swing_rot);
         }
-        Self { feet: pose.feet, parts }
+        Self { feet: pose.feet, up, parts }
     }
 
     /// `include_head` is false for the local player in first-person view: the
@@ -140,8 +148,8 @@ impl Pose {
     /// when pitching down. The rest of the body still renders — visible when the
     /// player looks down, and casting a shadow like any other avatar.
     pub fn draw(&self, f3: &mut Frame3D, color: Color, include_head: bool) {
-        let ground = self.feet + Vec3::new(0.0, SHADOW_LIFT, 0.0);
-        f3.draw_shadow(ground, Vec3::Y, SHADOW_RADIUS, SHADOW_COLOR);
+        let ground = self.feet + self.up * SHADOW_LIFT;
+        f3.draw_shadow(ground, self.up, SHADOW_RADIUS, SHADOW_COLOR);
         for (i, part) in RIG.iter().enumerate() {
             if i == HEAD && !include_head {
                 continue;

@@ -221,6 +221,7 @@ mod tests {
                 frame: glam::DQuat::IDENTITY,
                 velocity: [0.0; 3],
                 up: 5,
+                legacy_pose: false,
                 flying: false,
                 noclip: false,
                 stash: Some(vec![]),

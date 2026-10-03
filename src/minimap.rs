@@ -1,23 +1,31 @@
-//! A Xaero-style top-down minimap: a throttled RGBA raster of the terrain
-//! around the player, uploaded to a dedicated engine texture and drawn as one
-//! rotatable/zoomable 2D quad in the HUD corner.
+//! A top-down minimap: a throttled RGBA raster of the terrain around the player,
+//! uploaded to a dedicated engine texture and drawn as one rotatable/zoomable 2D
+//! quad in the HUD corner.
 //!
-//! The CPU rebuild ([`Minimap::refresh`]) scans the loaded chunks' top solid
+//! The raster is the plane perpendicular to the player's up axis (face-local
+//! `(u, v)`). On a round body it is the storage chart around the stream eye,
+//! where storage +Y is up. PosY on a flat world is world XZ, unchanged.
+//!
+//! The CPU rebuild ([`Minimap::refresh`]) scans the loaded columns' top solid
 //! blocks, folds in slope shading, and hands the pixels to the engine on a
 //! throttle. The per-frame [`Minimap::draw`] is just one textured quad, so it
 //! costs two triangles regardless of the raster resolution.
 
 use std::time::Duration;
 
-use voxel_engine::{Color, Engine, Frame, IVec2, Vec2};
+use glam::DQuat;
+use voxel_engine::{Color, DVec3, Engine, Frame, IVec2, Vec2};
 
+use crate::camera::rotate;
+use crate::coord::Face;
+use crate::space::FaceFrame;
 use crate::world::World;
 
 /// How the map is oriented relative to the world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rotation {
-    /// North (−Z? +Z — the world's fixed axis) always points up; the map never
-    /// rotates and the player marker spins instead.
+    /// North (the face frame's −t_v; world −Z on +Y) always points up; the map
+    /// never rotates and the player marker spins instead.
     NorthUp,
     /// The map rotates so the player's facing is always up.
     Heading,
@@ -54,6 +62,59 @@ impl MinimapConfig {
     };
 }
 
+/// Where the map is looking: the face whose columns it rasters, the face-local
+/// `(u, v)` column under the eye, and the marker heading in that plane.
+/// A round-body chart uses storage PosY around [`World::stream_eye`].
+#[derive(Clone, Copy)]
+pub struct MapSample {
+    pub face: Face,
+    pub col: IVec2,
+    pub heading: f32,
+}
+
+impl MapSample {
+    pub fn from_player(world: &World, eye: DVec3, up: Face, frame: DQuat, yaw: f32) -> Self {
+        if let Some(storage) = world.chart_eye(eye) {
+            let heading = chart_heading(world, eye, frame, yaw)
+                .unwrap_or_else(|| face_heading(frame, yaw, Face::PosY));
+            return Self {
+                face: Face::PosY,
+                col: IVec2::new(storage.x.floor() as i32, storage.z.floor() as i32),
+                heading,
+            };
+        }
+        let local = FaceFrame::new(up).point_to_local(eye);
+        Self {
+            face: up,
+            col: IVec2::new(local.x.floor() as i32, local.z.floor() as i32),
+            heading: face_heading(frame, yaw, up),
+        }
+    }
+}
+
+/// Face-local heading `atan2(forward·t_v, forward·t_u)`. On PosY with an identity
+/// frame this is the world yaw, so the +Y marker keeps its old angle bits.
+fn face_heading(frame: DQuat, yaw: f32, face: Face) -> f32 {
+    if face == Face::PosY && frame == DQuat::IDENTITY {
+        return yaw;
+    }
+    let (sin_yaw, cos_yaw) = (yaw as f64).sin_cos();
+    let forward = rotate(frame, DVec3::new(cos_yaw, 0.0, sin_yaw));
+    let basis = FaceFrame::new(face);
+    let tu = basis.point_to_world(DVec3::X);
+    let tv = basis.point_to_world(DVec3::Z);
+    (forward.dot(tv) as f32).atan2(forward.dot(tu) as f32)
+}
+
+/// Heading in the chart's storage XZ, from the patch Jacobian. `None` above the band.
+fn chart_heading(world: &World, eye: DVec3, frame: DQuat, yaw: f32) -> Option<f32> {
+    let local = world.chart_local(eye)?;
+    let (sin_yaw, cos_yaw) = (yaw as f64).sin_cos();
+    let forward = rotate(frame, DVec3::new(cos_yaw, 0.0, sin_yaw));
+    let rot = local.rotation();
+    Some((forward.dot(rot.z_axis) as f32).atan2(forward.dot(rot.x_axis) as f32))
+}
+
 pub struct Minimap {
     cfg: MinimapConfig,
     /// Latest RGBA raster (`size² * 4`), reused across refreshes.
@@ -65,13 +126,21 @@ pub struct Minimap {
     /// directly; the throttle half rides the scheduler's interval gate, so no
     /// `Instant` lives here.
     center: Option<IVec2>,
+    /// Face of `center`. A column from another face is not a shift of this one.
+    face: Face,
 }
 
 impl Minimap {
     pub fn new(cfg: MinimapConfig) -> Self {
         assert_eq!(cfg.size, 256, "minimap size must match engine MINIMAP_SIZE");
         let texels = cfg.size as usize * cfg.size as usize;
-        Self { cfg, rgba: vec![0u8; texels * 4], top_y: vec![i32::MIN; texels], center: None }
+        Self {
+            cfg,
+            rgba: vec![0u8; texels * 4],
+            top_y: vec![i32::MIN; texels],
+            center: None,
+            face: Face::PosY,
+        }
     }
 
     /// Toggle between north-up (fixed map, spinning marker) and heading-up
@@ -85,9 +154,10 @@ impl Minimap {
 
     /// Whether a rebuild is due: never built, OR the throttle elapsed, OR the
     /// player moved past the recenter distance.
-    pub fn due(&self, player_col: IVec2, interval_elapsed: bool) -> bool {
+    pub fn due(&self, face: Face, player_col: IVec2, interval_elapsed: bool) -> bool {
         match self.center {
             None => true,
+            Some(_) if self.face != face => true,
             Some(c) => {
                 let moved = (player_col.x - c.x).abs().max((player_col.y - c.y).abs());
                 interval_elapsed || moved >= self.cfg.recenter_after as i32
@@ -104,10 +174,10 @@ impl Minimap {
         &mut self,
         eng: &mut Engine,
         world: &World,
-        player_col: IVec2,
+        sample: MapSample,
         interval_elapsed: bool,
     ) -> bool {
-        if !self.rebuild(world, player_col, interval_elapsed) {
+        if !self.rebuild(world, sample.face, sample.col, interval_elapsed) {
             return false;
         }
         eng.update_minimap(&self.rgba);
@@ -115,14 +185,17 @@ impl Minimap {
     }
 
     /// CPU half of [`Self::refresh`]: full rebuild on the interval / first
-    /// build / `d ≥ size`, otherwise shift the raster and repaint exposed strips.
-    fn rebuild(&mut self, world: &World, player_col: IVec2, interval_elapsed: bool) -> bool {
-        if !self.due(player_col, interval_elapsed) {
+    /// build / a face change / `d ≥ size`, otherwise shift the raster and
+    /// repaint exposed strips.
+    fn rebuild(&mut self, world: &World, face: Face, player_col: IVec2, interval_elapsed: bool) -> bool {
+        if !self.due(face, player_col, interval_elapsed) {
             return false;
         }
         let size = self.cfg.size as i32;
+        let face_changed = self.center.is_some() && self.face != face;
+        self.face = face;
         match self.center {
-            Some(prev) if !interval_elapsed => {
+            Some(prev) if !interval_elapsed && !face_changed => {
                 let dx = player_col.x - prev.x;
                 let dz = player_col.y - prev.y;
                 let d = dx.abs().max(dz.abs());
@@ -204,30 +277,31 @@ impl Minimap {
         }
         let size = self.cfg.size as i32;
         let sz = size as usize;
-        let origin_x = player_col.x - size / 2;
-        let origin_z = player_col.y - size / 2;
-        let x0 = origin_x + u0 as i32;
-        let z0 = origin_z + v0 as i32;
-        let x1 = origin_x + u1 as i32 - 1;
-        let z1 = origin_z + v1 as i32 - 1;
+        let origin_u = player_col.x - size / 2;
+        let origin_v = player_col.y - size / 2;
+        let u0w = origin_u + u0 as i32;
+        let v0w = origin_v + v0 as i32;
+        let u1w = origin_u + u1 as i32 - 1;
+        let v1w = origin_v + v1 as i32 - 1;
         let s = crate::world::chunk::CHUNK_SIZE as i32;
         let void = self.cfg.void;
+        let face = self.face;
 
-        for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
-            for cz in z0.div_euclid(s)..=z1.div_euclid(s) {
-                let xs0 = x0.max(cx * s);
-                let xs1 = x1.min((cx + 1) * s - 1);
-                let zs0 = z0.max(cz * s);
-                let zs1 = z1.min((cz + 1) * s - 1);
-                let ys = world.column_chunks(cx, cz);
-                for x in xs0..=xs1 {
-                    let lx = x.rem_euclid(s) as usize;
-                    let u = (x - origin_x) as usize;
-                    for z in zs0..=zs1 {
-                        let lz = z.rem_euclid(s) as usize;
-                        let v = (z - origin_z) as usize;
-                        let idx = v * sz + u;
-                        match world.top_solid_in_column(cx, cz, ys, lx, lz) {
+        for cu in u0w.div_euclid(s)..=u1w.div_euclid(s) {
+            for cv in v0w.div_euclid(s)..=v1w.div_euclid(s) {
+                let us0 = u0w.max(cu * s);
+                let us1 = u1w.min((cu + 1) * s - 1);
+                let vs0 = v0w.max(cv * s);
+                let vs1 = v1w.min((cv + 1) * s - 1);
+                let alts = world.column_alts(face, cu, cv);
+                for u in us0..=us1 {
+                    let lu = u.rem_euclid(s) as usize;
+                    let tu = (u - origin_u) as usize;
+                    for v in vs0..=vs1 {
+                        let lv = v.rem_euclid(s) as usize;
+                        let tv = (v - origin_v) as usize;
+                        let idx = tv * sz + tu;
+                        match world.top_solid_on_face(face, cu, cv, alts, lu, lv) {
                             Some((ty, color)) => {
                                 self.top_y[idx] = ty;
                                 self.rgba[idx * 4..idx * 4 + 4]
@@ -256,8 +330,9 @@ impl Minimap {
     ) {
         let size = self.cfg.size as i32;
         let sz = size as usize;
-        let origin_x = player_col.x - size / 2;
-        let origin_z = player_col.y - size / 2;
+        let origin_u = player_col.x - size / 2;
+        let origin_v = player_col.y - size / 2;
+        let frame = FaceFrame::new(self.face);
         let void = self.cfg.void;
         for v in v0..v1 {
             for u in u0..u1 {
@@ -266,9 +341,8 @@ impl Minimap {
                 let color = if ty == i32::MIN {
                     void
                 } else {
-                    world
-                        .registry()
-                        .color(world.block_at(origin_x + u as i32, ty, origin_z + v as i32))
+                    let (x, y, z) = frame.cell_to_world((origin_u + u as i32, ty, origin_v + v as i32));
+                    world.registry().color(world.block_at(x, y, z))
                 };
                 self.rgba[idx * 4..idx * 4 + 4]
                     .copy_from_slice(&[color.r, color.g, color.b, color.a]);
@@ -288,11 +362,12 @@ impl Minimap {
     /// Draw the map, border, and player marker. Between raster refreshes the
     /// marker tracks the player's offset from the cached center instead of
     /// falsely remaining centered over stale terrain.
-    pub fn draw(&self, f: &mut Frame, screen: (i32, i32), player_col: IVec2, yaw: f32) {
+    pub fn draw(&self, f: &mut Frame, screen: (i32, i32), sample: MapSample) {
+        let player_col = sample.col;
         let half = self.cfg.screen_px as f32 / 2.0;
         let cx = screen.0 as f32 - self.cfg.margin.0 as f32 - half;
         let cy = self.cfg.margin.1 as f32 + half;
-        let rotation = map_rotation(self.cfg.orient, yaw);
+        let rotation = map_rotation(self.cfg.orient, sample.heading);
         f.draw_minimap([cx, cy], half, rotation, Color::WHITE);
 
         let edge = half as i32;
@@ -316,7 +391,7 @@ impl Minimap {
             cy + map_offset.x * sin + map_offset.y * cos,
         );
         let marker_angle = match self.cfg.orient {
-            Rotation::NorthUp => yaw,
+            Rotation::NorthUp => sample.heading,
             Rotation::Heading => -std::f32::consts::FRAC_PI_2,
         };
         draw_player_marker(f, marker, marker_angle);
@@ -456,19 +531,21 @@ mod tests {
         let recenter = MinimapConfig::DEFAULT.recenter_after as i32;
 
         // Never built: always due, regardless of the throttle.
-        assert!(map.due(IVec2::new(0, 0), false), "never-built is always due");
+        assert!(map.due(Face::PosY, IVec2::new(0, 0), false), "never-built is always due");
 
         // Pretend a rebuild happened centered at the origin.
         map.center = Some(IVec2::new(0, 0));
 
         // Built, throttle not elapsed, still close: skip.
-        assert!(!map.due(IVec2::new(recenter - 1, 0), false), "recent + close ⇒ skip");
+        assert!(!map.due(Face::PosY, IVec2::new(recenter - 1, 0), false), "recent + close ⇒ skip");
         // Built, throttle elapsed, still close: the interval half fires.
-        assert!(map.due(IVec2::new(recenter - 1, 0), true), "throttle elapsed ⇒ due");
+        assert!(map.due(Face::PosY, IVec2::new(recenter - 1, 0), true), "throttle elapsed ⇒ due");
         // Built, throttle not elapsed, moved past recenter: the recenter half fires.
-        assert!(map.due(IVec2::new(recenter, 0), false), "moved ≥ recenter ⇒ due");
+        assert!(map.due(Face::PosY, IVec2::new(recenter, 0), false), "moved ≥ recenter ⇒ due");
         // Distance is the Chebyshev max of the two axes.
-        assert!(map.due(IVec2::new(0, recenter), false), "recenter checks either axis");
+        assert!(map.due(Face::PosY, IVec2::new(0, recenter), false), "recenter checks either axis");
+        // A different face is a different plane, even on the same column index.
+        assert!(map.due(Face::PosX, IVec2::new(0, 0), false), "face change ⇒ due");
     }
 
     #[test]
@@ -496,11 +573,18 @@ mod tests {
             let dest = IVec2::new(origin.x + delta.x, origin.y + delta.y);
 
             let mut shifted = Minimap::new(MinimapConfig::DEFAULT);
-            assert!(shifted.rebuild(&world, origin, true));
-            assert!(shifted.rebuild(&world, dest, false));
+            assert!(shifted.rebuild(&world, Face::PosY, origin, true));
+            let void = MinimapConfig::DEFAULT.void;
+            let mid = (128 * 256 + 128) * 4;
+            assert_ne!(
+                &shifted.rgba[mid..mid + 4],
+                &[void.r, void.g, void.b, void.a],
+                "PosY origin still paints loaded ground"
+            );
+            assert!(shifted.rebuild(&world, Face::PosY, dest, false));
 
             let mut full = Minimap::new(MinimapConfig::DEFAULT);
-            assert!(full.rebuild(&world, dest, true));
+            assert!(full.rebuild(&world, Face::PosY, dest, true));
 
             assert_eq!(
                 shifted.rgba, full.rgba,
@@ -511,5 +595,69 @@ mod tests {
                 "height mismatch for delta {delta:?}"
             );
         }
+    }
+
+    /// A player standing on the +X face rasters that face's (u, v), and the height
+    /// stored is the face altitude, not world Y.
+    #[test]
+    fn plus_x_face_rasters_the_face_plane() {
+        use crate::camera::Orientation;
+        use crate::world::chunk::Chunk;
+
+        let mut world = crate::world::World::with_config_lazy(1, crate::render_config::RenderConfig::default());
+        let stone = world.registry().id_by_label("rock").unwrap();
+        let coord = crate::coord::ChunkCoord::new(2, 0, 0);
+        world.store_column_chunk(Face::PosX, coord, Chunk::from_uniform(2, 0, 0, stone));
+
+        let eye = FaceFrame::new(Face::PosX).point_to_world(DVec3::new(-8.0, 50.0, 8.0));
+        let mut orientation = Orientation::new(0.0, 0.0);
+        orientation.snap(DVec3::X);
+        let sample = MapSample::from_player(&world, eye, Face::PosX, orientation.frame, 0.0);
+        assert_eq!(sample.face, Face::PosX);
+        assert_eq!(sample.col, IVec2::new(-8, 8));
+        assert_ne!(sample.col.x, eye.x.floor() as i32, "the plane is not world XZ");
+
+        let mut map = Minimap::new(MinimapConfig::DEFAULT);
+        assert!(map.rebuild(&world, sample.face, sample.col, true));
+        let idx = 128 * 256 + 128;
+        let color = world.registry().color(stone);
+        assert_eq!(
+            &map.rgba[idx * 4..idx * 4 + 4],
+            &[color.r, color.g, color.b, color.a],
+            "center texel is the +X column's stone"
+        );
+        // Chunk (2, 0, 0) on +X has alt0 = 32; a uniform solid tops out at 47.
+        // World Y of that column's top cell is 8, so a Y-up walk would store 8.
+        assert_eq!(map.top_y[idx], 47);
+    }
+
+    /// On a round body the map rasters storage columns around the stream eye.
+    #[test]
+    fn round_world_map_uses_storage_columns() {
+        use crate::space::atlas::{Atlas, Patch};
+        let mut world = crate::world::World::with_config_lazy(3, crate::render_config::RenderConfig::default());
+        let centre = DVec3::new(2.0e7, 3.0e7, -1.0e7);
+        let r = 3_000i64;
+        let atlas = std::sync::Arc::new(Atlas::new(centre, r, r + 64, false, 0));
+        world.set_atlases(vec![atlas.clone()]);
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let b = atlas.bands[0];
+        let (k, mid) = (r - b.r_lo - 1, b.n / 2);
+        let stone = world.registry().id_by_label("rock").unwrap();
+        let eye = atlas.embed(top, DVec3::new(mid as f64 + 0.5, k as f64 + 3.0, mid as f64 + 0.5));
+        world.ensure_around(eye);
+        let s = atlas.storage(top, [mid, k, mid]);
+        world.set_block(s[0] as i32, s[1] as i32, s[2] as i32, stone);
+
+        let sample = MapSample::from_player(&world, eye, Face::PosX, DQuat::IDENTITY, 0.0);
+        assert_eq!(sample.face, Face::PosY, "chart columns run along storage +Y");
+        assert_eq!(sample.col, IVec2::new(s[0] as i32, s[2] as i32));
+
+        let mut map = Minimap::new(MinimapConfig::DEFAULT);
+        assert!(map.rebuild(&world, sample.face, sample.col, true));
+        let idx = 128 * 256 + 128;
+        let color = world.registry().color(stone);
+        assert_eq!(&map.rgba[idx * 4..idx * 4 + 4], &[color.r, color.g, color.b, color.a]);
+        assert_eq!(map.top_y[idx], s[1] as i32);
     }
 }
