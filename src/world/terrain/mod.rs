@@ -608,6 +608,11 @@ impl Terrain {
         }
         let n = CHUNK_SIZE as i32;
         let (x0, y0, z0) = (cx * n, cy * n, cz * n);
+        // Only rocks here: paint them from one list instead of looking them up per cell.
+        let (lo, hi) = cube::chunk_bounds(coord);
+        if self.cosmos.bodies_touching(lo, hi).next().is_none() {
+            return space::fill(&self.cosmos, &self.m, lo);
+        }
         let mut cells = Box::new([AIR; CHUNK_VOLUME]);
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {

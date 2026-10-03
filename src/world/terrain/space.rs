@@ -7,6 +7,7 @@ use super::cosmos::{Cosmos, Rock, RockKind};
 use super::noise::{hash3, perlin3, unit};
 use super::Materials;
 use crate::block::registry::{AIR, BlockId};
+use crate::world::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 
 /// The six ways to assign the rock's three stretch axes to the world axes.
 const PERMS: [[usize; 3]; 6] = [
@@ -31,13 +32,48 @@ pub(super) fn any_overlap(cosmos: &Cosmos, lo: [i64; 3], hi: [i64; 3]) -> bool {
     rocks.iter().any(|r| overlaps(r, lo, hi))
 }
 
-/// Whether `rock`'s reserved box meets the inclusive cell box.
+/// Whether `rock` may paint a cell of the inclusive cell box: its reserved box meets the box and,
+/// but for a derelict's ruin, the box's nearest cell lies within the bumped ellipsoid's outer
+/// bound (no cell beyond `ell = 1.30` is ever painted).
 pub(super) fn overlaps(rock: &Rock, lo: [i64; 3], hi: [i64; 3]) -> bool {
     let reach = reach(rock);
-    (0..3).all(|a| {
+    let in_box = (0..3).all(|a| {
         let c = i64::from(rock.centre[a]);
         hi[a] >= c - reach && lo[a] <= c + reach
-    })
+    });
+    if !in_box || rock.kind == RockKind::Derelict {
+        return in_box;
+    }
+    let near: [f64; 3] = std::array::from_fn(|a| {
+        let c = i64::from(rock.centre[a]);
+        0i64.clamp(lo[a] - c, hi[a] - c) as f64
+    });
+    ell(near, semis(rock)) <= 1.30 + 1e-9
+}
+
+/// A space chunk (no body reaches it) whose minimum cell is `o`: every rock that may paint it,
+/// smallest class first, then cell by cell the first rock that paints (equal to [`block`]).
+pub(super) fn fill(cosmos: &Cosmos, m: &Materials, o: [i64; 3]) -> ChunkData {
+    let n = CHUNK_SIZE as i64;
+    let hi = [o[0] + n - 1, o[1] + n - 1, o[2] + n - 1];
+    let mut rocks = Vec::new();
+    cosmos.rocks_touching(o, hi, &mut rocks);
+    rocks.retain(|r| r.r >= 1.0 && overlaps(r, o, hi));
+    if rocks.is_empty() {
+        return ChunkData::Uniform(AIR);
+    }
+    let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+    for lz in 0..CHUNK_SIZE {
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let p = [o[0] + lx as i64, o[1] + ly as i64, o[2] + lz as i64];
+                if let Some(id) = rocks.iter().find_map(|r| paint(r, m, p)) {
+                    cells[Chunk::index(lx, ly, lz)] = id;
+                }
+            }
+        }
+    }
+    ChunkData::from_cells(cells)
 }
 
 /// The block at cell `p` if `rock` paints it (`None` when `p` is outside the shape).

@@ -981,3 +981,26 @@ fn space_chunk_costs() {
         small.kind, small.r, empty.x, empty.y, empty.z
     );
 }
+
+/// Classify cost of a view-sized box of space chunks inside a big swarm (release:
+/// `cargo test --release --lib cluster_classify_cost -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn cluster_classify_cost() {
+    let (_reg, t) = make(42);
+    let eye = [27310502i64, 49569080, -35460644];
+    let c = eye.map(|v| v.div_euclid(16) as i32);
+    let mut n = 0;
+    let mut mixed = 0;
+    let start = std::time::Instant::now();
+    for dx in -12..=12 {
+        for dy in -6..=6 {
+            for dz in -12..=12 {
+                n += 1;
+                mixed += (t.classify(ChunkCoord::new(c[0] + dx, c[1] + dy, c[2] + dz)) == Classify::Mixed) as usize;
+            }
+        }
+    }
+    let per = start.elapsed().as_secs_f64() * 1e6 / n as f64;
+    println!("{per:.1} µs per classify over {n} chunks ({mixed} mixed)");
+}
