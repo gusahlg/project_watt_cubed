@@ -20,7 +20,13 @@ fn lod_clip_tracks_the_settled_rings() {
 
     // Nothing is drawn yet: the whole far field must stay visible.
     world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().radius, 0.0, "unmeshed centre keeps the clip closed");
+    assert_eq!(
+        world.lod_clip().half.x,
+        0.0,
+        "unmeshed centre keeps the clip closed"
+    );
+    assert_eq!(world.lod_clip().half.z, 0.0);
+    assert_eq!(world.lod_clip().half.y, world.view.coverage().half.y);
 
     // Settle every chunk in the mesh box (Air is settled by definition).
     let coords: Vec<Coord> = world.chunks.keys().copied().collect();
@@ -30,11 +36,10 @@ fn lod_clip_tracks_the_settled_rings() {
     world.lod_clip_grow.set();
     world.refresh_lod_clip();
     assert_eq!(
-        world.lod_clip().radius,
-        world.view.coverage().radius,
+        world.lod_clip().half,
+        world.view.coverage().half,
         "fully settled must be bit-identical to the full-res clip"
     );
-    assert_eq!(world.lod_clip().half_height, world.view.coverage().half_height);
 
     // A drawn mesh counts settled the same as Air (edited chunks keep their
     // previous mesh on screen, so they must not reopen the clip).
@@ -43,7 +48,7 @@ fn lod_clip_tracks_the_settled_rings() {
     world.chunks.get_mut(&probe).unwrap().state = MeshState::Dirty { prev: Some(meshes(h)) };
     world.lod_clip_shrunk.set();
     world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().radius, world.view.coverage().radius);
+    assert_eq!(world.lod_clip().half, world.view.coverage().half);
 
     // Unsettle one column at ring 2: the clip retreats to one ring inside it
     // (the nearest face of ring 2 can be 16 m from an off-centre eye).
@@ -51,16 +56,27 @@ fn lod_clip_tracks_the_settled_rings() {
         MeshState::NeedsMesh { building: false, prev: None };
     world.lod_clip_shrunk.set();
     world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().radius, CHUNK_SIZE as f32, "rings 0..=1 settled, ring 2 open");
+    assert_eq!(
+        world.lod_clip().half.x,
+        CHUNK_SIZE as f32,
+        "rings 0..=1 settled, ring 2 open"
+    );
+    assert_eq!(world.lod_clip().half.z, CHUNK_SIZE as f32);
+    assert_eq!(world.lod_clip().half.y, world.view.coverage().half.y);
 
     // Events are the only triggers: without a flag the cached value stands,
     // and growth resumes from the frontier ring once the column settles.
     world.chunks.get_mut(&ChunkCoord::new(2, center.y, -1)).unwrap().state = MeshState::Air;
     world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().radius, CHUNK_SIZE as f32, "no event, no rescan");
+    assert_eq!(
+        world.lod_clip().half.x,
+        CHUNK_SIZE as f32,
+        "no event, no rescan"
+    );
+    assert_eq!(world.lod_clip().half.z, CHUNK_SIZE as f32);
     world.lod_clip_grow.set();
     world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().radius, world.view.coverage().radius);
+    assert_eq!(world.lod_clip().half, world.view.coverage().half);
 }
 
 /// InfiniteDiffusion at a quarter of its relief: real hills (so LOD selection has error to

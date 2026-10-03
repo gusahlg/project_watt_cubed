@@ -60,7 +60,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle};
+use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
 use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
@@ -288,12 +288,13 @@ impl ViewVolume {
     fn view(horizontal: i32) -> Self {
         Self::new(horizontal, Self::vertical_for(horizontal))
     }
-    /// The full-res coverage slab in metres: the shader's LOD-cull volume, which
-    /// must equal this streamed full-res volume (one source of truth for both).
+    /// The full-res coverage box in metres (horizontal half `rh` chunks, vertical
+    /// `rv`). The shader's LOD-cull volume must equal this streamed volume.
     fn coverage(&self) -> CoverageVolume {
+        let r = (self.horizontal * CHUNK_SIZE as i32) as f32;
+        let rv = (self.vertical * CHUNK_SIZE as i32) as f32;
         CoverageVolume {
-            radius: (self.horizontal * CHUNK_SIZE as i32) as f32,
-            half_height: (self.vertical * CHUNK_SIZE as i32) as f32,
+            half: Vec3::new(r, rv, r),
         }
     }
 
@@ -1511,9 +1512,9 @@ impl World {
     fn lod_clip(&self) -> CoverageVolume {
         let full = self.view.coverage();
         let radius_m = ((self.lod_clip_rings - 1).max(0) * CHUNK_SIZE as i32) as f32;
+        let hx = radius_m.min(full.half.x);
         CoverageVolume {
-            radius: radius_m.min(full.radius),
-            half_height: full.half_height,
+            half: Vec3::new(hx, full.half.y, hx),
         }
     }
 
@@ -1625,7 +1626,7 @@ impl World {
     fn coverage_skips(&self, center: Coord, key: SectionPos) -> bool {
         let cov = self.view.coverage();
         let cs = CHUNK_SIZE as i32;
-        let (h_lim, v_lim) = (0.75 * cov.radius, 0.75 * cov.half_height);
+        let (h_lim, v_lim) = (0.75 * cov.half.x, 0.75 * cov.half.y);
         // The f64 eye XZ was floored to `center` before this lane; inflate the reach
         // by one chunk half-diagonal so the true eye can't sit outside our bound.
         let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
