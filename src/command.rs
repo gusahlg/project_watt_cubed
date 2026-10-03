@@ -326,14 +326,11 @@ fn set_speed(
 fn inspect(args: &[&str], player: &Player, world: &World) -> Vec<Line> {
     let cell = match args {
         [] => {
-            // The block supporting the player: directly below the feet. The small
-            // bias keeps it stable when standing exactly on a block's top face.
-            let p = player.position;
-            (
-                block_coord(p.x),
-                block_coord(player.feet_y() - 0.1),
-                block_coord(p.z),
-            )
+            // The block supporting the player: directly below the feet along the up
+            // axis. The small bias keeps it stable when standing exactly on a block's face.
+            let mut f = player.feet();
+            f[player.up_axis.axis()] -= player.up_axis.sign() as f64 * 0.1;
+            (block_coord(f.x), block_coord(f.y), block_coord(f.z))
         }
         [x, y, z] => match (x.parse(), y.parse(), z.parse()) {
             (Ok(x), Ok(y), Ok(z)) => (x, y, z),

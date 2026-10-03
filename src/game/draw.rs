@@ -16,8 +16,8 @@ use crate::ui::{self, Anchor, HudMode};
 
 /// Retained presentation state; gameplay only initializes it.
 pub(super) struct DrawState {
-    /// Camera orientation by yaw/pitch/roll/FOV bits; translation stays separate.
-    camera_cache: Memo<[u32; 4], Camera3D>,
+    /// Camera orientation by frame/yaw/pitch/roll/FOV bits; translation stays separate.
+    camera_cache: Memo<[u64; 6], Camera3D>,
     sky_frame_cache: Memo<u64, SkyFrame>,
     /// Frozen lighting by day and the game's render/palette revision.
     static_frame_cache: Memo<(u64, u64, u32), StaticFrame>,
@@ -115,11 +115,14 @@ impl Game {
         // stays outside the key, so translation with unchanged orientation
         // reuses the basis and repeats none of its trigonometry.
         let pose = self.camera.pose(&self.player, &self.world, fov, shake);
+        let f = pose.frame;
         let camera_key = [
-            pose.yaw.to_bits(),
-            pose.pitch.to_bits(),
-            pose.roll.to_bits(),
-            pose.fovy.to_bits(),
+            f.x.to_bits(),
+            f.y.to_bits(),
+            f.z.to_bits(),
+            f.w.to_bits(),
+            (pose.yaw.to_bits() as u64) << 32 | pose.pitch.to_bits() as u64,
+            (pose.roll.to_bits() as u64) << 32 | pose.fovy.to_bits() as u64,
         ];
         let camera = *self
             .drawing
@@ -335,13 +338,10 @@ impl Game {
             // shadow): seeing your own torso from inside is noise, and the
             // common first-person frame skips the whole block.
             if self.camera.shows_body() {
-                let feet = Feet(DVec3::new(
-                    self.player.position.x,
-                    self.player.feet_y(),
-                    self.player.position.z,
-                ));
-                let v = self.player.velocity();
-                let speed = ((v.x * v.x + v.z * v.z).sqrt()) as f32;
+                let feet = Feet(self.player.feet());
+                let mut v = self.player.velocity();
+                v[self.player.up_axis.axis()] = 0.0;
+                let speed = v.length() as f32;
                 let rp = RenderPose::new(
                     feet,
                     Eye(pose.eye),

@@ -21,6 +21,7 @@ pub(crate) mod command;
 pub(crate) mod console;
 pub(crate) mod coord;
 pub mod derived;
+pub(crate) mod gravity;
 pub(crate) mod frame_snapshot;
 pub(crate) mod game;
 pub mod harness;

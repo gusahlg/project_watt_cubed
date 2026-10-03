@@ -184,13 +184,45 @@ impl Face {
     }
 
     /// World axis this face is perpendicular to (0=X, 1=Y, 2=Z).
-    #[cfg(test)]
     #[inline]
     pub const fn axis(self) -> usize {
         match self {
             Face::NegX | Face::PosX => 0,
             Face::NegY | Face::PosY => 1,
             Face::NegZ | Face::PosZ => 2,
+        }
+    }
+
+    /// `+1` for the positive faces, `-1` for the negative ones.
+    #[inline]
+    pub const fn sign(self) -> i32 {
+        match self {
+            Face::PosX | Face::PosY | Face::PosZ => 1,
+            Face::NegX | Face::NegY | Face::NegZ => -1,
+        }
+    }
+
+    /// The unit normal as an `f64` vector.
+    pub fn normal_dvec(self) -> voxel_engine::DVec3 {
+        let (x, y, z) = self.delta();
+        voxel_engine::DVec3::new(x as f64, y as f64, z as f64)
+    }
+
+    /// The signed axis of the largest component of `v` (ties: X before Y before Z; the zero
+    /// vector gives `PosY`).
+    pub fn from_dominant(v: voxel_engine::DVec3) -> Face {
+        let (ax, ay, az) = (v.x.abs(), v.y.abs(), v.z.abs());
+        if ax == 0.0 && ay == 0.0 && az == 0.0 {
+            return Face::PosY;
+        }
+        if ax >= ay && ax >= az {
+            if v.x >= 0.0 { Face::PosX } else { Face::NegX }
+        } else if ay >= az {
+            if v.y >= 0.0 { Face::PosY } else { Face::NegY }
+        } else if v.z >= 0.0 {
+            Face::PosZ
+        } else {
+            Face::NegZ
         }
     }
 

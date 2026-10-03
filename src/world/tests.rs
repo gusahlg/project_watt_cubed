@@ -1670,6 +1670,7 @@ fn physics_does_not_move_the_player_until_spawn_ready() {
             &world,
             &crate::input::movement::MoveInput::default(),
             0.05,
+            DVec3::new(0.0, -crate::player::STANDARD_GRAVITY, 0.0),
         );
     }
     assert_eq!(player.position, before, "frozen while the slab is outstanding");
@@ -1680,6 +1681,7 @@ fn physics_does_not_move_the_player_until_spawn_ready() {
         &world,
         &crate::input::movement::MoveInput::default(),
         0.05,
+        DVec3::new(0.0, -crate::player::STANDARD_GRAVITY, 0.0),
     );
     assert_ne!(
         player.position, before,
