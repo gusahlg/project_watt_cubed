@@ -621,7 +621,10 @@ impl MassOracle for Cosmos {
                 let local = Self::profile(c, centre) / Self::profile_volume(c)
                     * (2.0 * OPEN_RADIUS).powi(3)
                     * mass;
-                v.primitive(&Primitive::new(MassShape::Point { at: c.centre }, (mass - local).max(0.0)));
+                // The remainder spread over the cluster's ball (never a point: a query near the centre
+                // would feel the whole cluster's mass as a singular pull).
+                let ball = 4.0 / 3.0 * std::f64::consts::PI * c.radius * c.radius * c.radius;
+                v.primitive(&Primitive::new(MassShape::Ball { c: c.centre, r: c.radius }, (mass - local).max(0.0) / ball));
                 for r in &rocks {
                     let at = DVec3::new(r.centre[0] as f64, r.centre[1] as f64, r.centre[2] as f64) + DVec3::splat(0.5);
                     v.primitive(&Primitive::new(MassShape::Ball { c: at, r: r.r as f64 }, BULK_DENSITY * 0.85));
@@ -785,6 +788,17 @@ mod tests {
             let tilt = if g > 1e-9 { format!("{:.2}°", (-s.accel / g).dot(up).clamp(-1.0, 1.0).acos().to_degrees()) } else { "—".into() };
             println!("| {name} | {:.4} % | {tilt} |", 100.0 * g / g0);
         }
+    }
+
+
+    #[test]
+    fn a_cluster_never_pulls_like_a_point_at_its_centre() {
+        let cosmos = Arc::new(Cosmos::new(42, 1.0));
+        let field = Field::new(cosmos.clone());
+        let c = cosmos.clusters()[0];
+        // Close to the centre the pull stays tiny compared with a planet's surface pull.
+        let s = field.sample(c.centre + DVec3::new(7.0, 3.0, -5.0));
+        assert!(s.accel.length() < 0.05 * crate::player::STANDARD_GRAVITY, "{}", s.accel.length());
     }
 
 }
