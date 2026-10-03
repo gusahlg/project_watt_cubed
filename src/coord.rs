@@ -145,7 +145,7 @@ impl From<(i32, i32, i32)> for ChunkCoord {
 /// the index into the mesher's border planes, so a face's neighbour offset
 /// and its border slice always line up without a separate index to keep in
 /// sync.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(usize)]
 pub enum Face {
     NegX = 0,
