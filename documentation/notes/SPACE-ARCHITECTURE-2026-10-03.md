@@ -171,9 +171,11 @@ gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + led
 - **Glue:** a storage cell within two cells outside a box reads as the neighbouring patch's cell holding the
   same physical point; `Atlas::chunk_across` gives a seam neighbour as a whole chunk plus a signed index
   remap (exact across chart edges, approximate 1:2 across band interfaces) for mesher halos and light shells.
-- **Rendering:** chart chunk meshes carry an 8-corner trilinear cage (engine task E4; corners computed in f64
-  relative to an anchor block, so no per-frame rewrite; neighbouring chunks share corners, so no cracks;
-  chord error ≤ L²/8R, 1.6e-5 blocks for a chunk at R = 2 M).
+- **Rendering** (implemented): chart chunk meshes carry an 8-corner trilinear cage (engine task E4,
+  `World::placement_of`; corners computed in f64 relative to an anchor block, so no per-frame rewrite;
+  neighbouring chunks share corners, so no cracks; chord error ≤ L²/8R, 1.6e-5 blocks for a chunk at R = 2 M).
+  Beyond the streamed chunks the body's sky impostor (sunk 150 below the datum, 650 on moons) fills the horizon;
+  a chart far field (sections through cages, task G10) is the next step.
 - **Motion** (`movement::update_player_in`, implemented): the player steps in the storage frame of the patch
   under it — the ordinary axis-aligned collision — with velocity, gravity and the body frame carried through
   the local Jacobian, walking speed rescaled so physical speed is preserved (the hitbox stays in cells), and the
@@ -181,8 +183,10 @@ gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + led
   regions (stage-0 report).
 - Chart geometry uses `chart::tan_quarter` (Lambert's continued fraction), never the platform `tan`, so
   generated geometry is bit-identical on every peer.
-- Streaming near a round body streams storage boxes around the chart-mapped eye (one per chart within
-  reach; usually 1, up to 3 at corners).
+- **Streaming** (implemented): on or within the view reach above a chart the streaming centre is the eye's storage
+  position (`World::stream_eye`), and `seam::Unfold` lays the centre's box and its four seam neighbours out as one
+  flat net: view boxes iterate real chunks through `unfold`, and containment, unload, orders, worklists and the
+  worker gate measure real chunks folded into the net (storage outside the net folds far away).
 
 ## 8. InfiniteDiffusion v4 (WORLDGEN_VERSION 7)
 
