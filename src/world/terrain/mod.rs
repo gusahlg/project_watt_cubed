@@ -27,7 +27,9 @@ mod underground;
 use std::sync::Arc;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
-use super::generation::{ColumnHeights, TerrainGenerator};
+use super::generation::{self, ColumnHeights, TerrainGenerator};
+use super::layout::ColumnKey;
+use crate::coord::Face;
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
 
 use shape::{Column, Shape};
@@ -427,16 +429,20 @@ impl TerrainGenerator for Terrain {
     }
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
-        let (mut chunks, _) = self.generate_column(cx, cz, cy..=cy);
+        let key = ColumnKey { face: Face::PosY, a: cx, b: cz };
+        let (mut chunks, _) = self.generate_column(key, cy..=cy);
         chunks.pop().expect("one chunk").1
     }
 
     fn generate_column(
         &self,
-        cx: i32,
-        cz: i32,
+        key: ColumnKey,
         cy: std::ops::RangeInclusive<i32>,
     ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+        if key.face != Face::PosY {
+            return generation::generate_column_default(self, key, cy);
+        }
+        let (cx, cz) = (key.a, key.b);
         let n = CHUNK_SIZE as i32;
         let (x0, z0) = (cx * n, cz * n);
         let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];

@@ -403,7 +403,7 @@ fn gravity(player: &Player, world: &World) -> Vec<Line> {
     )];
     match s.up(0.02 * crate::player::STANDARD_GRAVITY) {
         Some(up) => {
-            let n = player.up_axis.normal_dvec();
+            let n = player.up_axis.dvec();
             let tilt = up.dot(n).clamp(-1.0, 1.0).acos().to_degrees();
             out.push(format!("down: ({:.4}, {:.4}, {:.4}); {tilt:.3}° off the {:?} grid axis", -up.x, -up.y, -up.z, player.up_axis));
         }

@@ -642,12 +642,12 @@ mod tests {
         let mut eye = centre;
         eye[a] = base[a] as f64 + if s > 0 { 1.0 } else { 0.0 } + s as f64 * stand_eye();
         let mut player = Player::new(eye);
-        player.snap_up(up.normal_dvec());
+        player.snap_up(up.dvec());
         player
     }
 
     fn gravity_along(f: Face, g: f64) -> DVec3 {
-        -f.normal_dvec() * g
+        -f.dvec() * g
     }
 
     #[test]

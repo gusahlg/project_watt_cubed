@@ -8,12 +8,12 @@ use voxel_engine::IVec3;
 
 use crate::audio::acoustics::{AcousticWindow, Cell};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
-use crate::coord::BlockCoord;
+use crate::coord::{BlockCoord, Face};
 use crate::math::{Aabb, block_coord, block_coord_end};
 use voxel_engine::Color;
 
 use super::chunk::CHUNK_SIZE;
-use super::{Coord, World};
+use super::{ColumnKey, Coord, World};
 
 /// Clip an inclusive world interval to a chunk and return its local cell range.
 /// The interval must intersect the chunk. Saturation keeps endpoint chunks valid
@@ -214,11 +214,11 @@ impl World {
         false
     }
 
-    /// Loaded chunk-Y layers in the `(cx, cz)` column, highest first. Empty when
-    /// the column has no loaded chunks.
+    /// Loaded chunk-Y layers in the PosY `(cx, cz)` column, highest first. Empty
+    /// when that column has no loaded chunks.
     pub fn column_chunks(&self, cx: i32, cz: i32) -> &[i32] {
         self.column_chunks
-            .get(&(cx, cz))
+            .get(&ColumnKey { face: Face::PosY, a: cx, b: cz })
             .map_or(&[], Vec::as_slice)
     }
 

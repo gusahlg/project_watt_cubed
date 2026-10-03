@@ -10,6 +10,7 @@ use voxel_engine::{DVec3, Engine, FadeStyle};
 use crate::block::appearance::{fill_layer, BlockAppearance, LAYER_BYTES, TEXTURE_SIZE};
 
 use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
+use crate::space::FaceFrame;
 use crate::derived::Revision;
 use crate::math::block_coord;
 
@@ -20,8 +21,8 @@ use super::metric::{DyCap, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
 use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
-    Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
-    SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, StreamLane,
+    ColumnKey, Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
+    SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, Sky, StreamLane,
     UPLOAD_BUDGET_BYTES, UPLOAD_QUEUE_MAX, UPLOAD_SCAN_MAX, World, light, mesh, pipeline, pyramid,
     quadtree,
 };
@@ -371,7 +372,7 @@ fn sample_mean_p95(samples: &[u16]) -> (f32, f32, u64) {
 /// never accumulate strikes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::world) enum FailKey {
-    Column { col: (i32, i32) },
+    Column { key: ColumnKey },
     Mesh { coord: Coord },
     Light { coord: Coord },
     Section { pos: SectionPos },
@@ -380,7 +381,7 @@ pub(in crate::world) enum FailKey {
 impl FailKey {
     fn of(key: &pipeline::JobKey) -> FailKey {
         match key {
-            pipeline::JobKey::Column { col, .. } => FailKey::Column { col: *col },
+            pipeline::JobKey::Column { key, .. } => FailKey::Column { key: *key },
             pipeline::JobKey::Mesh { coord } => FailKey::Mesh { coord: *coord },
             pipeline::JobKey::Light { coord } => FailKey::Light { coord: *coord },
             pipeline::JobKey::Section { pos, .. } => FailKey::Section { pos: *pos },
@@ -407,6 +408,108 @@ enum ClaimOutcome {
 /// makes strict progress each frame under a tight budget (the same floor role
 /// [`super::StreamLane::MIN_ADMIT`] plays for the per-chunk lanes).
 const GEN_MIN_ADMIT: usize = 8;
+
+/// Group chunk coords into generate runs.
+///
+/// `Axis(f)` chunks that share a [`ColumnKey`] become one inclusive altitude
+/// run. With `span_loaded` (the spawn slab) every coord of that column in the
+/// input is recorded, loaded or not, and a run is emitted only when something
+/// in a contiguous group is missing — a uniform PosY slab therefore submits
+/// its full altitude span. Without it (`request_region_data`) only missing
+/// coords are recorded, and a gap stays inside the run when every chunk
+/// between the ends has the same sky (a loaded hole of the same face). A gap
+/// whose sky differs splits the run, so a PosY job never generates an Open coord.
+///
+/// `Open` is one job per missing chunk, encoded as
+/// `ColumnKey { face: PosY, a: cx, b: cz }` with range `cy..=cy` so
+/// `key.chunk(cy)` round-trips. PosY there is only a coordinate encoding:
+/// `accept_column` does not install a ceiling and `store_chunk` does not
+/// record the chunk when `sky` is `Open`. Open chunks that share `(cx, cz)`
+/// are not merged. That encoding's [`FailKey`] can collide with a real PosY
+/// column's strike key.
+///
+/// `skip_quarantine` drops a quarantined column before it can take a slot.
+/// The slab path leaves it false so [`World::try_submit_column`] rejects the
+/// run and the caller keeps `pending_gen` set.
+fn gather_column_runs(
+    coords: impl IntoIterator<Item = Coord>,
+    mut sky_of: impl FnMut(Coord) -> Sky,
+    mut present: impl FnMut(Coord) -> bool,
+    mut quarantined: impl FnMut(ColumnKey) -> bool,
+    span_loaded: bool,
+    skip_quarantine: bool,
+) -> Vec<(ColumnKey, i32, i32)> {
+    let mut axis: FastMap<ColumnKey, Vec<(i32, bool)>> = FastMap::default();
+    let mut open_seen: FastSet<Coord> = FastSet::default();
+    let mut runs: Vec<(ColumnKey, i32, i32)> = Vec::new();
+    for coord in coords {
+        let sky = sky_of(coord);
+        let (key, alt) = match sky {
+            Sky::Axis(face) => ColumnKey::of(face, coord),
+            Sky::Open => (ColumnKey { face: Face::PosY, a: coord.x, b: coord.z }, coord.y),
+        };
+        if skip_quarantine && quarantined(key) {
+            continue;
+        }
+        let missing = !present(coord);
+        match sky {
+            Sky::Open => {
+                if missing && open_seen.insert(coord) {
+                    runs.push((key, alt, alt));
+                }
+            }
+            Sky::Axis(_) => {
+                if !span_loaded && !missing {
+                    continue;
+                }
+                axis.entry(key).or_default().push((alt, missing));
+            }
+        }
+    }
+    for (key, mut alts) in axis {
+        alts.sort_unstable_by_key(|p| p.0);
+        let mut deduped: Vec<(i32, bool)> = Vec::new();
+        for (alt, missing) in alts {
+            if let Some(last) = deduped.last_mut() {
+                if last.0 == alt {
+                    last.1 |= missing;
+                    continue;
+                }
+            }
+            deduped.push((alt, missing));
+        }
+        if span_loaded {
+            let mut i = 0;
+            while i < deduped.len() {
+                let mut j = i;
+                while j + 1 < deduped.len() && deduped[j + 1].0 == deduped[j].0 + 1 {
+                    j += 1;
+                }
+                if deduped[i..=j].iter().any(|p| p.1) {
+                    runs.push((key, deduped[i].0, deduped[j].0));
+                }
+                i = j + 1;
+            }
+        } else {
+            let mut start = 0;
+            for i in 0..deduped.len() {
+                let split = i + 1 == deduped.len()
+                    || !gap_same_sky(key, deduped[i].0, deduped[i + 1].0, &mut sky_of);
+                if split {
+                    runs.push((key, deduped[start].0, deduped[i].0));
+                    start = i + 1;
+                }
+            }
+        }
+    }
+    runs.sort_unstable_by_key(|(key, lo, _)| (key.face.index(), key.a, key.b, *lo));
+    runs
+}
+
+fn gap_same_sky(key: ColumnKey, lo: i32, hi: i32, sky_of: &mut impl FnMut(Coord) -> Sky) -> bool {
+    let want = Sky::Axis(key.face);
+    (lo + 1..hi).all(|alt| sky_of(key.chunk(alt)) == want)
+}
 
 fn column_order(center: Coord, vel: DVec3, cx: i32, cz: i32) -> u64 {
     let dx = cx - center.x;
@@ -974,8 +1077,8 @@ impl World {
             _ => None,
         };
         match result {
-            pipeline::Done::Column { col, chunks, heights } => {
-                self.accept_column(col, chunks, heights)
+            pipeline::Done::Column { key, chunks, heights } => {
+                self.accept_column(key, chunks, heights)
             }
             m @ pipeline::Done::Mesh { .. } => MeshLane::integrate(self, m),
             l @ pipeline::Done::Light { .. } => LightLane::integrate(self, l),
@@ -1286,31 +1389,19 @@ impl World {
             return Progress::Idle;
         }
         let deadline = super::lanes::paced_deadline(self, budget);
-        let mut columns: super::FastMap<(i32, i32), (i32, i32)> = super::FastMap::default();
-        let mut consider = |coord: Coord| {
-            if self.chunks.contains_key(&coord)
-                || self.generating.contains(&coord)
-                || self.quarantined.contains(&FailKey::Column {
-                    col: (coord.x, coord.z),
-                })
-            {
-                return;
-            }
-            let entry = columns
-                .entry((coord.x, coord.z))
-                .or_insert((coord.y, coord.y));
-            entry.0 = entry.0.min(coord.y);
-            entry.1 = entry.1.max(coord.y);
-        };
-        for coord in self.data_box(center).coords() {
-            consider(coord);
-        }
+        let mut coords: Vec<Coord> = self.data_box(center).coords().collect();
         if let Some(slab) = self.spawn_slab {
-            for coord in slab.coords() {
-                consider(coord);
-            }
+            coords.extend(slab.coords());
         }
-        if columns.is_empty() {
+        let runs = gather_column_runs(
+            coords,
+            |c| self.generator.sky(c),
+            |c| self.chunks.contains_key(&c) || self.generating.contains(&c),
+            |key| self.quarantined.contains(&FailKey::Column { key }),
+            false,
+            true,
+        );
+        if runs.is_empty() {
             return Progress::Idle;
         }
         let slots = match self.workers.as_ref() {
@@ -1320,14 +1411,18 @@ impl World {
         if slots == 0 {
             self.pending_gen.set();
             return Progress::Partial {
-                remaining: columns.len() as u32,
+                remaining: runs.len() as u32,
             };
         }
         self.gen_columns.clear();
-        self.gen_columns
-            .extend(columns.into_iter().map(|((cx, cz), range)| {
-                (column_order(center, self.section_vel, cx, cz), (cx, cz), range)
-            }));
+        self.gen_columns.extend(runs.into_iter().map(|(key, lo, hi)| {
+            let c = key.chunk(lo);
+            (
+                column_order(center, self.section_vel, c.x, c.z),
+                key,
+                (lo, hi),
+            )
+        }));
         let n = self.gen_columns.len();
         let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
         let want = n.min(slots.max(min_admit));
@@ -1343,8 +1438,8 @@ impl World {
             if super::admission_exhausted(admitted, min_admit, deadline) {
                 break;
             }
-            let ((cx, cz), (cy_lo, cy_hi)) = (self.gen_columns[i].1, self.gen_columns[i].2);
-            if self.try_submit_column(cx, cz, cy_lo, cy_hi) {
+            let (key, (lo, hi)) = (self.gen_columns[i].1, self.gen_columns[i].2);
+            if self.try_submit_column(key, lo, hi) {
                 admitted += 1;
             } else {
                 break;
@@ -1366,14 +1461,17 @@ impl World {
     /// hits the cache instead of sampling the generator on this thread.
     pub(in crate::world) fn accept_column(
         &mut self,
-        col: (i32, i32),
+        key: ColumnKey,
         chunks: Vec<(Coord, Chunk)>,
         heights: Box<ColumnHeights>,
     ) {
-        // Only cache when at least one chunk will actually land — an install
-        // with no `column_chunks` bump would leak in `ceilings` forever.
-        if chunks.iter().any(|(coord, _)| self.will_accept_chunk(*coord)) {
-            self.install_ceiling(col, &heights);
+        // Only cache when at least one axis chunk will actually land — an install
+        // with no `column_chunks` bump would leak in `ceilings` forever. Open
+        // runs encode a PosY key and must not install a ceiling.
+        if chunks.iter().any(|(coord, _)| {
+            self.will_accept_chunk(*coord) && matches!(self.generator.sky(*coord), Sky::Axis(_))
+        }) {
+            self.install_ceiling(key, &heights);
         }
         for (coord, chunk) in chunks {
             self.generating.remove(&coord);
@@ -1441,15 +1539,14 @@ impl World {
             }
         };
         match key {
-            pipeline::JobKey::Column { col: (cx, cz), cy } => {
+            pipeline::JobKey::Column { key, range } => {
                 // A cancelled spawn-slab column must be re-requested even when
                 // the pool dropped it as out-of-view: physics is frozen on it.
                 let in_slab = self.spawn_slab.is_some_and(|slab| {
-                    cy.clone()
-                        .any(|y| slab.contains(Coord::new(cx, y, cz)))
+                    range.clone().any(|alt| slab.contains(key.chunk(alt)))
                 });
-                for cyy in cy {
-                    self.generating.remove(&Coord::new(cx, cyy, cz));
+                for alt in range {
+                    self.generating.remove(&key.chunk(alt));
                 }
                 // Freed generate claims are otherwise only re-requested on a
                 // boundary cross; a retryable failure re-arms the lane so a
@@ -1585,27 +1682,19 @@ impl World {
     }
 
     fn submit_slab_columns(&mut self, slab: ChunkBox) {
-        let min = slab.min();
-        let (sx, sy, sz) = slab.size();
-        let cy_lo = min.y;
-        let cy_hi = min.y + sy - 1;
+        let coords: Vec<Coord> = slab.coords().collect();
+        let runs = gather_column_runs(
+            coords,
+            |c| self.generator.sky(c),
+            |c| self.chunks.contains_key(&c) || self.generating.contains(&c),
+            |key| self.quarantined.contains(&FailKey::Column { key }),
+            true,
+            false,
+        );
         let mut remaining = false;
-        for cx in min.x..min.x + sx {
-            for cz in min.z..min.z + sz {
-                let mut need = false;
-                for cy in cy_lo..=cy_hi {
-                    let coord = ChunkCoord::new(cx, cy, cz);
-                    if !self.chunks.contains_key(&coord) && !self.generating.contains(&coord) {
-                        need = true;
-                        break;
-                    }
-                }
-                if !need {
-                    continue;
-                }
-                if !self.try_submit_column(cx, cz, cy_lo, cy_hi) {
-                    remaining = true;
-                }
+        for (key, lo, hi) in runs {
+            if !self.try_submit_column(key, lo, hi) {
+                remaining = true;
             }
         }
         if remaining {
@@ -1614,30 +1703,30 @@ impl World {
     }
 
     /// Submit one column job and claim its missing coords. `false` means the
-    /// pool rejected it (backpressure or shutdown) so the caller must retry.
-    fn try_submit_column(&mut self, cx: i32, cz: i32, cy_lo: i32, cy_hi: i32) -> bool {
-        if self.quarantined.contains(&FailKey::Column { col: (cx, cz) }) {
+    /// pool rejected it (backpressure, shutdown, or quarantine) so the caller
+    /// must retry.
+    fn try_submit_column(&mut self, key: ColumnKey, lo: i32, hi: i32) -> bool {
+        if self.quarantined.contains(&FailKey::Column { key }) {
             return false;
         }
-        let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (cy_lo
-            ..=cy_hi)
-            .filter_map(|cy| {
-                let coord = ChunkCoord::new(cx, cy, cz);
+        let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (lo..=hi)
+            .filter_map(|alt| {
+                let coord = key.chunk(alt);
                 self.edits
                     .get(&coord)
                     .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
             })
             .collect();
         let job = pipeline::Job::GenerateColumn {
-            col: (cx, cz),
-            cy: cy_lo..=cy_hi,
+            key,
+            range: lo..=hi,
             generator: self.generator.clone(),
             edits,
         };
         let accepted = self.worker_pool().submit(job);
         if accepted {
-            for cy in cy_lo..=cy_hi {
-                let coord = ChunkCoord::new(cx, cy, cz);
+            for alt in lo..=hi {
+                let coord = key.chunk(alt);
                 if !self.chunks.contains_key(&coord) {
                     self.generating.insert(coord);
                 }
@@ -1654,16 +1743,23 @@ impl World {
         if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
             return;
         }
-        let (chunks, heights) =
-            self.generator
-                .generate_column(coord.x, coord.z, coord.y..=coord.y);
-        self.install_ceiling((coord.x, coord.z), &heights);
+        let sky = self.generator.sky(coord);
+        let (key, alt) = match sky {
+            Sky::Axis(face) => ColumnKey::of(face, coord),
+            // Same PosY encoding as `gather_column_runs`: one layer, no ceiling.
+            Sky::Open => (ColumnKey { face: Face::PosY, a: coord.x, b: coord.z }, coord.y),
+        };
+        let (chunks, heights) = self.generator.generate_column(key, alt..=alt);
+        if matches!(sky, Sky::Axis(_)) {
+            self.install_ceiling(key, &heights);
+        }
         let data = chunks
             .into_iter()
             .next()
             .map(|(_, data)| data)
             .expect("generate_column emits the requested layer");
-        let chunk = Chunk::from_data(coord.x, coord.y, coord.z, data);
+        let placed = key.chunk(alt);
+        let chunk = Chunk::from_data(placed.x, placed.y, placed.z, data);
         self.store_chunk(coord, chunk);
         self.refresh_spawn_slab();
     }
@@ -1716,10 +1812,14 @@ impl World {
             },
         );
         // Ceiling-cache lifetime: the column's last layer out drops the entry.
-        let ys = self.column_chunks.entry((coord.x, coord.z)).or_default();
-        if !ys.contains(&coord.y) {
-            ys.push(coord.y);
-            ys.sort_unstable_by(|a, b| b.cmp(a));
+        // Open chunks have no ceiling and are not recorded here.
+        if let Sky::Axis(face) = self.generator.sky(coord) {
+            let (key, alt) = ColumnKey::of(face, coord);
+            let ys = self.column_chunks.entry(key).or_default();
+            if !ys.contains(&alt) {
+                ys.push(alt);
+                ys.sort_unstable_by(|a, b| b.cmp(a));
+            }
         }
         // Occlusion learns of the new chunk through the fill queue (bounded
         // drain per rebuild) — no per-rebuild missing-connectivity scan.
@@ -1816,13 +1916,16 @@ impl World {
             self.light_terminal.remove(&coord);
             self.remesh_stats.forget(coord);
             // Column layers: the last chunk out drops the cached ceiling.
-            if let Some(ys) = self.column_chunks.get_mut(&(coord.x, coord.z)) {
-                if let Some(i) = ys.iter().position(|&y| y == coord.y) {
-                    ys.remove(i);
-                }
-                if ys.is_empty() {
-                    self.column_chunks.remove(&(coord.x, coord.z));
-                    self.ceilings.remove(&(coord.x, coord.z));
+            if let Sky::Axis(face) = self.generator.sky(coord) {
+                let (key, alt) = ColumnKey::of(face, coord);
+                if let Some(ys) = self.column_chunks.get_mut(&key) {
+                    if let Some(i) = ys.iter().position(|&y| y == alt) {
+                        ys.remove(i);
+                    }
+                    if ys.is_empty() {
+                        self.column_chunks.remove(&key);
+                        self.ceilings.remove(&key);
+                    }
                 }
             }
         }
@@ -1964,9 +2067,11 @@ impl World {
         })
     }
 
-    /// Skylight ceiling: ground height per column (caves dark consistently)
-    /// RAISED by edited opaque roofs, so a player-built ceiling shadows the
-    /// chunks below it. Keyed by `(x, z)` chunk column and cached.
+    /// Skylight ceiling: ground altitude per face-local column (caves dark
+    /// consistently) RAISED by edited opaque roofs, so a player-built ceiling
+    /// shadows the chunks below it. Keyed by [`ColumnKey`] and cached. `Open`
+    /// chunks have no ceiling; this returns the ignored window and does not
+    /// cache it.
     ///
     /// Async columns install the window in [`accept_column`](Self::accept_column)
     /// before store; [`ensure_data`](Self::ensure_data) does the same from the
@@ -1982,55 +2087,64 @@ impl World {
         &mut self,
         coord: Coord,
     ) -> std::sync::Arc<light::CeilingWindow> {
-        if let Some(ceiling) = self.ceilings.get(&(coord.x, coord.z)) {
+        let Sky::Axis(face) = self.generator.sky(coord) else {
+            return light::ignored_ceiling();
+        };
+        let (key, _) = ColumnKey::of(face, coord);
+        if let Some(ceiling) = self.ceilings.get(&key) {
             return std::sync::Arc::clone(ceiling);
         }
-        // Empty `cy` range: both generators sample the 256 column profiles
+        // Empty altitude range: both generators sample the 256 column profiles
         // before iterating the chunk layers, so this is the height field
         // without a voxel fill.
-        let heights = self.generator.generate_column(coord.x, coord.z, 1..=0).1;
-        let ceiling = std::sync::Arc::new(self.ceiling_from_heights((coord.x, coord.z), &heights));
-        self.ceilings
-            .insert((coord.x, coord.z), std::sync::Arc::clone(&ceiling));
+        let heights = self.generator.generate_column(key, 1..=0).1;
+        let ceiling = std::sync::Arc::new(self.ceiling_from_heights(key, &heights));
+        self.ceilings.insert(key, std::sync::Arc::clone(&ceiling));
         ceiling
     }
 
-    /// Rebuild the ceiling from `height()` plus edited roofs, ignoring the
+    /// Rebuild the PosY ceiling from `height()` plus edited roofs, ignoring the
     /// cache — equality check against production `generate_column` heights.
     #[cfg(test)]
     pub(in crate::world) fn capture_ceiling_slow(&self, coord: Coord) -> light::CeilingWindow {
         let x0 = coord.x * CHUNK_SIZE as i32;
         let z0 = coord.z * CHUNK_SIZE as i32;
         let generator = &self.generator;
-        let mut ceiling = light::CeilingWindow::from_heights(|lx, lz| {
+        let mut ceiling = light::CeilingWindow::from_heights(Face::PosY, |lx, lz| {
             generator.height(x0 + lx as i32, z0 + lz as i32)
         });
-        self.raise_edited_roofs((coord.x, coord.z), &mut ceiling);
+        let key = ColumnKey { face: Face::PosY, a: coord.x, b: coord.z };
+        self.raise_edited_roofs(key, &mut ceiling);
         ceiling
     }
 
-    fn install_ceiling(&mut self, col: (i32, i32), heights: &ColumnHeights) {
-        if self.ceilings.contains_key(&col) {
+    fn install_ceiling(&mut self, key: ColumnKey, heights: &ColumnHeights) {
+        if self.ceilings.contains_key(&key) {
             return;
         }
-        let ceiling = std::sync::Arc::new(self.ceiling_from_heights(col, heights));
-        self.ceilings.insert(col, ceiling);
+        let ceiling = std::sync::Arc::new(self.ceiling_from_heights(key, heights));
+        self.ceilings.insert(key, ceiling);
     }
 
     fn ceiling_from_heights(
         &self,
-        col: (i32, i32),
+        key: ColumnKey,
         heights: &ColumnHeights,
     ) -> light::CeilingWindow {
         let mut ceiling =
-            light::CeilingWindow::from_heights(|lx, lz| heights[lx + lz * CHUNK_SIZE]);
-        self.raise_edited_roofs(col, &mut ceiling);
+            light::CeilingWindow::from_heights(key.face, |lu, lv| heights[lu + lv * CHUNK_SIZE]);
+        self.raise_edited_roofs(key, &mut ceiling);
         ceiling
     }
 
-    fn raise_edited_roofs(&self, col: (i32, i32), ceiling: &mut light::CeilingWindow) {
+    fn raise_edited_roofs(&self, key: ColumnKey, ceiling: &mut light::CeilingWindow) {
+        let frame = FaceFrame::new(key.face);
+        let s = CHUNK_SIZE as i32;
         for (&c, cells) in &self.edits {
-            if c.x != col.0 || c.z != col.1 {
+            if !matches!(self.generator.sky(c), Sky::Axis(face) if face == key.face) {
+                continue;
+            }
+            if ColumnKey::of(key.face, c).0 != key {
                 continue;
             }
             for (&index, &id) in cells {
@@ -2038,7 +2152,10 @@ impl World {
                     continue;
                 }
                 let (lx, ly, lz) = Chunk::local_of(index);
-                ceiling.raise(lx, lz, c.y * CHUNK_SIZE as i32 + ly as i32 + 1);
+                let (lu, _, lv) = frame.index_to_local(lx, ly, lz);
+                let world = (c.x * s + lx as i32, c.y * s + ly as i32, c.z * s + lz as i32);
+                let alt = frame.cell_to_local(world).1;
+                ceiling.raise(lu, lv, alt + 1);
             }
         }
     }
@@ -2050,9 +2167,10 @@ impl World {
     /// - a uniform opaque, non-emissive chunk settles to all-dark (no light enters);
     /// - a uniform-*air* chunk fully above every column's surface, with no near
     ///   blocklight from a loaded neighbour, settles to full sky / dark block.
+    ///   `Open` air with no near blocklight is full sky with no ceiling.
     ///
     /// Correctness anchor: the returned grid equals `propagate(uniform, dark
-    /// shell, ceiling, world_y0, tables)`.
+    /// shell, ceiling, sky, alt0, tables)`.
     ///
     /// `&mut self` so it can warm the `ceilings` column cache and the hot tables
     /// while probing — it mutates no lane state.
@@ -2075,10 +2193,19 @@ impl World {
         // the analytic result). `propagate` with a dark shell yields exactly
         // `open_sky()` here; the neighbour check is what makes the dark shell sound.
         if chunk.uniform() == Some(crate::block::registry::AIR) {
-            let world_y0 = coord.y * CHUNK_SIZE as i32;
-            let ceiling = self.capture_ceiling(coord);
-            if world_y0 >= ceiling.min_surface() && !self.neighbour_blocklight_near(coord) {
-                return Some(light::LightGrid::open_sky());
+            match self.generator.sky(coord) {
+                Sky::Open => {
+                    if !self.neighbour_blocklight_near(coord) {
+                        return Some(light::LightGrid::open_sky());
+                    }
+                }
+                Sky::Axis(face) => {
+                    let alt0 = FaceFrame::new(face).chunk_alt0(coord);
+                    let ceiling = self.capture_ceiling(coord);
+                    if alt0 >= ceiling.min_surface() && !self.neighbour_blocklight_near(coord) {
+                        return Some(light::LightGrid::open_sky());
+                    }
+                }
             }
         }
         None
@@ -4035,29 +4162,25 @@ mod tests {
             );
 
             let slow = world.capture_ceiling_slow(coord);
+            let key = ColumnKey { face: Face::PosY, a: coord.x, b: coord.z };
             assert!(
-                !world.ceilings.contains_key(&(coord.x, coord.z)),
+                !world.ceilings.contains_key(&key),
                 "slow helper must not warm the cache"
             );
 
-            let (datas, heights) =
-                world
-                    .generator
-                    .generate_column(coord.x, coord.z, coord.y..=coord.y);
+            let (datas, heights) = world.generator.generate_column(key, coord.y..=coord.y);
             let chunks: Vec<_> = datas
                 .into_iter()
-                .map(|(cy, data)| {
-                    (
-                        Coord::new(coord.x, cy, coord.z),
-                        Chunk::from_data(coord.x, cy, coord.z, data),
-                    )
+                .map(|(alt, data)| {
+                    let placed = key.chunk(alt);
+                    (placed, Chunk::from_data(placed.x, placed.y, placed.z, data))
                 })
                 .collect();
-            world.accept_column((coord.x, coord.z), chunks, Box::new(heights));
+            world.accept_column(key, chunks, Box::new(heights));
 
             let cached = world
                 .ceilings
-                .get(&(coord.x, coord.z))
+                .get(&key)
                 .expect("accept_column installs the ceiling before store");
             assert_ceilings_eq(cached.as_ref(), &slow);
             assert!(
@@ -4342,7 +4465,7 @@ mod tests {
         world.ensure_data(coord);
         let cached = world
             .ceilings
-            .get(&(coord.x, coord.z))
+            .get(&ColumnKey { face: Face::PosY, a: coord.x, b: coord.z })
             .expect("ensure_data installs the ceiling before store");
         let slow = world.capture_ceiling_slow(coord);
         assert_ceilings_eq(cached.as_ref(), &slow);
@@ -4423,5 +4546,66 @@ mod tests {
             super::super::vis_log::take().is_empty(),
             "unchanged vis must not push set_visible"
         );
+    }
+
+    /// Same-sky holes stay one run. A foreign sky splits. Open chunks that share
+    /// `(cx, cz)` stay separate jobs. A slab span includes the loaded layers.
+    #[test]
+    fn gather_column_runs_splits_foreign_sky_and_keeps_open_separate() {
+        let sky = |c: Coord| -> Sky {
+            if c.x == 0 && c.z == 0 && (c.y == 1 || c.y == 3) {
+                Sky::Open
+            } else if c.x >= 4 {
+                Sky::Axis(Face::PosX)
+            } else {
+                Sky::Axis(Face::PosY)
+            }
+        };
+        let missing = [
+            Coord::new(1, 0, 0),
+            Coord::new(1, 2, 0),
+            Coord::new(0, 0, 0),
+            Coord::new(0, 2, 0),
+            Coord::new(0, 1, 0),
+            Coord::new(0, 3, 0),
+            Coord::new(4, 0, 0),
+            Coord::new(6, 0, 0),
+        ];
+        let runs = gather_column_runs(missing, sky, |_| false, |_| false, false, false);
+        let hole = ColumnKey { face: Face::PosY, a: 1, b: 0 };
+        assert!(
+            runs.contains(&(hole, 0, 2)),
+            "a loaded PosY hole stays one run: {runs:?}"
+        );
+        let split = ColumnKey { face: Face::PosY, a: 0, b: 0 };
+        assert!(runs.contains(&(split, 0, 0)), "{runs:?}");
+        assert!(runs.contains(&(split, 2, 2)), "{runs:?}");
+        assert!(
+            runs.contains(&(split, 1, 1)),
+            "the Open layer is its own run: {runs:?}"
+        );
+        assert!(!runs.contains(&(split, 0, 2)), "Open in the gap splits the PosY run");
+        assert!(
+            runs.contains(&(ColumnKey { face: Face::PosY, a: 0, b: 0 }, 3, 3)),
+            "Open chunks that share xz are not merged"
+        );
+        let posx = ColumnKey { face: Face::PosX, a: -1, b: 0 };
+        assert!(
+            runs.contains(&(posx, 4, 6)),
+            "a same-sky gap along +X merges: {runs:?}"
+        );
+
+        let slab = [Coord::new(2, 0, 3), Coord::new(2, 1, 3), Coord::new(2, 2, 3)];
+        let slab_runs = gather_column_runs(slab, sky, |c| c.y == 1, |_| false, true, false);
+        assert_eq!(
+            slab_runs,
+            vec![(ColumnKey { face: Face::PosY, a: 2, b: 3 }, 0, 2)],
+            "a slab span includes the loaded middle"
+        );
+
+        let gapped = [Coord::new(2, 0, 4), Coord::new(2, 2, 4)];
+        let gapped_runs = gather_column_runs(gapped, sky, |_| false, |_| false, true, false);
+        let gk = ColumnKey { face: Face::PosY, a: 2, b: 4 };
+        assert_eq!(gapped_runs, vec![(gk, 0, 0), (gk, 2, 2)]);
     }
 }

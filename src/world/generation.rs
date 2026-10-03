@@ -8,7 +8,9 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use super::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
+use super::layout::{ColumnKey, Sky};
 use crate::block::registry::{AIR, BlockId, BlockRegistry};
+use crate::coord::{ChunkCoord, Face};
 use crate::gravity::{self, MassOracle};
 
 /// Ground height per cell of a 16×16 chunk column — identical to [`TerrainGenerator::height`].
@@ -26,6 +28,49 @@ fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i32, cz: i32)
         }
     }
     heights
+}
+
+/// Face-local altitudes for a non-PosY column, via [`TerrainGenerator::surface`].
+fn sample_face_heights(g: &(impl TerrainGenerator + ?Sized), key: ColumnKey) -> ColumnHeights {
+    let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+    for lv in 0..CHUNK_SIZE {
+        for lu in 0..CHUNK_SIZE {
+            let (u, v) = key.column_cell_uv(lu as i32, lv as i32);
+            heights[lu + lv * CHUNK_SIZE] = g.surface(key.face, u, v);
+        }
+    }
+    heights
+}
+
+/// Default [`TerrainGenerator::generate_column`]. PosY calls [`TerrainGenerator::generate`]
+/// per layer and samples [`TerrainGenerator::height`]; any other face does the same
+/// through [`TerrainGenerator::surface`] and `key.chunk`. Diffusion keeps its own
+/// PosY batch and delegates here for the other faces, so this must not call back
+/// into an override with a non-PosY key.
+pub(super) fn generate_column_default(
+    g: &(impl TerrainGenerator + ?Sized),
+    key: ColumnKey,
+    range: RangeInclusive<i32>,
+) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+    let heights = if key.face == Face::PosY {
+        sample_column_heights(g, key.a, key.b)
+    } else {
+        sample_face_heights(g, key)
+    };
+    if range.is_empty() {
+        return (Vec::new(), heights);
+    }
+    let chunks = if key.face == Face::PosY {
+        range.map(|alt| (alt, g.generate(key.a, alt, key.b))).collect()
+    } else {
+        range
+            .map(|alt| {
+                let c = key.chunk(alt);
+                (alt, g.generate(c.x, c.y, c.z))
+            })
+            .collect()
+    };
+    (chunks, heights)
 }
 
 /// Which generator a world is built with. Folded into the content fingerprint.
@@ -85,8 +130,19 @@ pub trait TerrainGenerator: Send + Sync {
         Arc::new(gravity::Empty)
     }
 
-    /// Topmost non-ground cell in this column.
+    /// Topmost non-ground cell in this column (the PosY surface).
     fn height(&self, wx: i32, wz: i32) -> i32;
+
+    /// Which way skylight falls in `c`. Default is everywhere +Y.
+    fn sky(&self, _c: ChunkCoord) -> Sky {
+        Sky::Axis(Face::PosY)
+    }
+
+    /// Altitude of the first open cell above the ground along `face` at face-local `(u, v)`.
+    /// PosY is [`height`](Self::height). Any other face is open (`i32::MIN`) unless overridden.
+    fn surface(&self, face: Face, u: i32, v: i32) -> i32 {
+        if face == Face::PosY { self.height(u, v) } else { i32::MIN }
+    }
 
     /// Ground height for every cell of the 16×16 chunk column at `(cx, cz)`.
     /// Default walks [`height`](Self::height); Diffusion fills the rectangle
@@ -149,18 +205,20 @@ pub trait TerrainGenerator: Send + Sync {
         ChunkData::from_cells(cells)
     }
 
-    /// Generate a vertical run of chunks together with the column's 256 ground
-    /// heights (identical to [`height`](Self::height) at each cell). Heights
-    /// are produced even when `cy` is empty — the profile sample does not
-    /// depend on the chunk layers. Default loops per-chunk; generators batch.
+    /// Generate a run of chunks along `key`'s normal, plus 256 altitudes.
+    ///
+    /// `range` is local altitude chunk indices. Returned [`ChunkData`] is in
+    /// world cell order ([`Chunk::index`](super::chunk::Chunk::index)). Heights
+    /// are altitudes along `key.face`, indexed `lu + lv * 16` in face-local
+    /// order, and are produced even when `range` is empty. PosY keeps the
+    /// per-chunk [`generate`](Self::generate) loop (Diffusion overrides that
+    /// case with its batch). Other faces use the same loop through `key.chunk`.
     fn generate_column(
         &self,
-        cx: i32,
-        cz: i32,
-        cy: RangeInclusive<i32>,
+        key: ColumnKey,
+        range: RangeInclusive<i32>,
     ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
-        let chunks = cy.map(|cyy| (cyy, self.generate(cx, cyy, cz))).collect();
-        (chunks, sample_column_heights(self, cx, cz))
+        generate_column_default(self, key, range)
     }
 }
 
@@ -291,8 +349,12 @@ mod tests {
                 assert_eq!(data.get(Chunk::index(3, ly, 7)), g.block_at(19, y, -25, FLAT_HEIGHT));
             }
         }
-        let (_, heights) = g.generate_column(0, 0, 1..=0);
+        let key = ColumnKey { face: Face::PosY, a: 0, b: 0 };
+        let (_, heights) = g.generate_column(key, 1..=0);
         assert!(heights.iter().all(|&h| h == FLAT_HEIGHT));
+        assert_eq!(g.sky(ChunkCoord::new(0, 0, 0)), Sky::Axis(Face::PosY));
+        assert_eq!(g.surface(Face::PosY, 3, 4), FLAT_HEIGHT);
+        assert_eq!(g.surface(Face::PosX, 3, 4), i32::MIN);
     }
 
     #[test]

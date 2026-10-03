@@ -4,6 +4,9 @@
 
 pub mod atlas;
 pub mod chart;
+pub mod frame;
+
+pub use frame::FaceFrame;
 
 /// The six signed axes (cube faces, face frames, collision axes).
 pub use crate::coord::Face;
