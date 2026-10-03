@@ -67,6 +67,27 @@ things know about curvature:
 Which bodies get charts is a choice the generator makes about the world's initial layout; physics
 never asks what kind of body it is standing on.
 
+## The universe (InfiniteDiffusion, worldgen 7)
+
+One seeded catalog (`world::terrain::cosmos`) describes everything; physical space between bodies is
+empty and costs nothing (chunks there classify as air without being generated).
+
+- **The start cube** — 50,000,000 blocks on a side, centred 25,000,000 below the origin so its +Y
+  face is `y = 0` and spawn sits at that face's centre. Each face is its own realm; edges blend into
+  a shared rim. Below a 350-block crust the bulk is a mix whose mean amount sets the cube's gravity.
+- **The Twins** — two 12,000,000-block cubes facing each other across a weightless canyon.
+- **Verdance** — a round world of radius 8,000,000: forested ranges and giant trees.
+- **The Hollow** — a shell between 5,750,000 and 6,000,000 from its centre: an icy crust outside,
+  crystal forests on the inner surface facing **the Ember**, a molten ball of radius 400,000 at its
+  centre. Inside the shell the shell's own pull cancels: the cavity is nearly weightless, drifting
+  toward the Ember.
+- **Moons** — two around the start cube and one or two around each world, cratered (grey, frozen or
+  rust), airless.
+- **Asteroid swarms** — sparse clusters of rocks of every size and kind, never near a big body.
+
+Seen from afar every body is drawn as an analytic impostor in the sky (`sky::bodies`), lit by the
+sun; standing on a round world its sphere fills the horizon beyond the streamed chunks.
+
 ## Travel
 
 Flying is fast enough to cross a face; distant worlds are found by seeing them in the sky and reached
