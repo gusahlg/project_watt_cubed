@@ -307,7 +307,7 @@ impl World {
         // the world's real difference from its seed. One generator query per
         // edit: user-click/network rate, never the voxel hot path.
         let old_edit = self.edits.get(&coord).and_then(|cells| cells.get(&index)).copied();
-        let generated = self.generator.block_at(x, y, z, self.generator.height(x, z));
+        let generated = self.generator.voxel_at(x, y, z);
         // Gravity follows the matter: the cell's amount changes from what was really there (the
         // overlay, else generation — never `previous`, which reads unloaded chunks as air).
         let delta = self.registry.amount(id) as i32 - self.registry.amount(old_edit.unwrap_or(generated)) as i32;
@@ -542,7 +542,7 @@ impl CellStore for World {
         if let Some(id) = self.edits.get(&chunk).and_then(|cells| cells.get(&index)) {
             return Some(*id);
         }
-        Some(self.generator.block_at(pos.0, pos.1, pos.2, self.generator.height(pos.0, pos.2)))
+        Some(self.generator.voxel_at(pos.0, pos.1, pos.2))
     }
 
     fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId> {

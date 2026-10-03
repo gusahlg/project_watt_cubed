@@ -1,9 +1,12 @@
 //! Generator contract and character checks.
 
 use super::*;
-use crate::coord::Face;
+use super::cube;
+use crate::coord::{ChunkCoord, Face};
+use crate::space::FaceFrame;
 use crate::world::chunk::Chunk;
-use crate::world::layout::ColumnKey;
+use crate::world::generation::Classify;
+use crate::world::layout::{ColumnKey, Sky};
 
 fn make(seed: i64) -> (BlockRegistry, Terrain) {
     let mut reg = BlockRegistry::with_builtins();
@@ -44,12 +47,6 @@ fn batch_generation_equals_the_per_voxel_definition_in_every_realm() {
         assert_chunk_matches(&t, 2, cy, 5);
         assert_chunk_matches(&t, -9, cy, 4);
     }
-    // A planet: find one and check the chunk through its centre.
-    let planet = (0..64)
-        .flat_map(|i| (0..4).map(move |j| (i, j)))
-        .find_map(|(i, j)| t.space.planet(i, j, 0).map(|p| p.c));
-    let c = planet.expect("some planet among 256 cells");
-    assert_chunk_matches(&t, c[0].div_euclid(16), c[1].div_euclid(16), c[2].div_euclid(16));
 }
 
 #[test]
@@ -73,12 +70,18 @@ fn column_heights_agree_on_every_path() {
 #[test]
 fn far_coordinates_generate_without_panic() {
     let (_reg, t) = make(3);
+    // Still on the +Y face, far from spawn.
+    let h = t.height(1_000_000, -1_000_000);
+    assert!((MIN_GROUND..=MAX_GROUND).contains(&h), "on-face height {h}");
+    let _ = t.voxel_at(1_000_000, h - 1, -1_000_000);
+    // Off every cube: no height, and the cell is air.
     for &(x, z) in &[(1_000_000_000, -1_000_000_000), (i32::MAX - 40, i32::MIN + 40)] {
-        let h = t.height(x, z);
-        assert!((MIN_GROUND..=MAX_GROUND).contains(&h));
-        let _ = t.generate(x.div_euclid(16), h.div_euclid(16), z.div_euclid(16));
-        let _ = t.voxel_at(x, -500, z);
-        let _ = t.voxel_at(x, SPACE_FLOOR + 900, z);
+        assert_eq!(t.height(x, z), i32::MIN);
+        assert_eq!(t.voxel_at(x, -500, z), AIR);
+        assert_eq!(t.voxel_at(x, SPACE_FLOOR + 900, z), AIR);
+        let c = ChunkCoord::new(x.div_euclid(16), 0, z.div_euclid(16));
+        assert_eq!(t.classify(c), Classify::Air);
+        assert_eq!(t.generate(c.x, c.y, c.z).uniform(), Some(AIR));
     }
 }
 
@@ -132,17 +135,17 @@ fn the_three_realms_have_their_features() {
     }
     assert!(rails > 50 && planks > 50 && lamps > 0, "mines: {rails} rail, {planks} plank, {lamps} lamp cells");
     assert!(cave_air > 1000, "caves: only {cave_air} open underground cells");
-    // Space: planets with glowing cores.
-    let mut cores = 0;
-    for i in 0..12 {
-        for j in 0..12 {
-            if let Some(p) = t.space.planet(i, 0, j) {
-                cores += (t.voxel_at(p.c[0], p.c[1], p.c[2]) == m.core || t.voxel_at(p.c[0], p.c[1], p.c[2]) == m.magma)
-                    as u32;
-            }
-        }
+    // The old space realm is air. A moon keeps a regolith crust over basalt.
+    assert_eq!(t.voxel_at(0, SPACE_FLOOR + 10, 0), AIR);
+    let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).expect("a moon");
+    let cosmos::Shape::Ball { r } = moon.shape else { panic!("moon is a ball") };
+    let (mut regolith, mut basalt) = (false, false);
+    for d in (r - 8)..=(r + 4) {
+        let id = t.voxel_at((moon.centre[0] + d) as i32, moon.centre[1] as i32, moon.centre[2] as i32);
+        regolith |= id == m.regolith;
+        basalt |= id == m.basalt;
     }
-    assert!(cores > 10, "only {cores} planet cores in 144 cells");
+    assert!(regolith && basalt, "moon crust: regolith {regolith}, basalt {basalt}");
     let _ = reg;
 }
 
@@ -227,6 +230,209 @@ fn worldgen_column_cost() {
     println!("{chunks} chunks in {ms:.1} ms: {:.1} µs per chunk, {:.2} ms per column", ms * 1e3 / chunks as f64, ms / 144.0);
 }
 
+fn chunk_of(p: [i64; 3]) -> (i32, i32, i32) {
+    (
+        p[0].div_euclid(16) as i32,
+        p[1].div_euclid(16) as i32,
+        p[2].div_euclid(16) as i32,
+    )
+}
+
+/// Chunk containing the top solid cell at the centre of `body`'s `face`.
+fn face_centre_chunk(t: &Terrain, body: &cosmos::Body, face: Face) -> (i32, i32, i32) {
+    let half = cube::half_of(body);
+    let centre = cube::centre_i32(body.centre).expect("cube centre fits i32");
+    let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
+    let world_a = t.surface(face, cu, cv);
+    assert_ne!(world_a, i32::MIN, "body {} {face:?} has no surface", body.id);
+    let h = cube::face_h(half, cube::normal_dot(body.centre, face), world_a);
+    let a = (half + i64::from(h - 1)) as i32;
+    let (rx, ry, rz) = FaceFrame::new(face).cell_to_world((0, a, 0));
+    chunk_of([
+        i64::from(rx) + body.centre[0],
+        i64::from(ry) + body.centre[1],
+        i64::from(rz) + body.centre[2],
+    ])
+}
+
+/// Worker path (`generate_column`), including chunks `generate` stores from `classify`.
+fn assert_worker_matches(t: &Terrain, cx: i32, cy: i32, cz: i32) {
+    let coord = ChunkCoord::new(cx, cy, cz);
+    let (key, alt) = match t.sky(coord) {
+        Sky::Axis(face) => ColumnKey::of(face, coord),
+        Sky::Open => (ColumnKey { face: Face::PosY, a: cx, b: cz }, cy),
+    };
+    let (chunks, _) = t.generate_column(key, alt..=alt);
+    let data = &chunks.iter().find(|(a, _)| *a == alt).expect("requested layer").1;
+    let n = CHUNK_SIZE as i32;
+    for ly in 0..CHUNK_SIZE {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let (x, y, z) = (cx * n + lx as i32, cy * n + ly as i32, cz * n + lz as i32);
+                assert_eq!(
+                    data.get(Chunk::index(lx, ly, lz)),
+                    t.voxel_at(x, y, z),
+                    "worker chunk ({cx},{cy},{cz}) cell ({x},{y},{z})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn home_plus_y_keeps_the_v3_field_near_spawn() {
+    let (_reg, t) = make(42);
+    let paint = t.paints[Face::PosY.index()].as_ref().expect("home +Y");
+    for x in [-4000, -80, 0, 8, 40, 1000, 9000] {
+        for z in [-9000, -15, 0, 8, 77, 2500] {
+            assert_eq!(t.height(x, z), paint.shape.height(x, z), "({x},{z})");
+            assert!((MIN_GROUND..=MAX_GROUND).contains(&t.height(x, z)));
+        }
+    }
+}
+
+#[test]
+fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    for face in Face::ALL {
+        let (cx, cy, cz) = face_centre_chunk(&t, &home, face);
+        let coord = ChunkCoord::new(cx, cy, cz);
+        assert_eq!(t.sky(coord), Sky::Axis(face), "home {face:?} centre sky");
+        assert_eq!(t.classify(coord), Classify::Mixed, "home {face:?} centre is crust");
+        assert_chunk_matches(&t, cx, cy, cz);
+    }
+    // Inside the rim blend, outside the sky's edge band: batched and blended.
+    let x = cosmos::HOME_HALF as i32 - 3_000;
+    let h = t.height(x, 0);
+    let (cx, cy, cz) = (x.div_euclid(16), h.div_euclid(16), 0);
+    assert_eq!(t.sky(ChunkCoord::new(cx, cy, cz)), Sky::Axis(Face::PosY));
+    assert_chunk_matches(&t, cx, cy, cz);
+    let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: 0 }, 1..=0);
+    let lu = x.rem_euclid(16) as usize;
+    assert_eq!(hs[lu], t.height(x, 0));
+
+    // The seam and the three-face corner are open (edge band) and still match.
+    let seam = cosmos::HOME_HALF as i32;
+    let hs = t.height(seam, 0);
+    assert_chunk_matches(&t, seam.div_euclid(16), hs.div_euclid(16), 0);
+    let hc = t.height(seam, seam);
+    assert_chunk_matches(&t, seam.div_euclid(16), hc.div_euclid(16), seam.div_euclid(16));
+
+    // Deep bulk, both the classify short-circuit and the column fill.
+    let deep_y: i32 = -1_000;
+    let (dx, dy, dz) = (0, deep_y.div_euclid(16), 0);
+    let deep = ChunkCoord::new(dx, dy, dz);
+    let id = match t.classify(deep) {
+        Classify::Uniform(id) => id,
+        other => panic!("deep chunk should be uniform, got {other:?}"),
+    };
+    assert_ne!(id, AIR);
+    assert_eq!(t.generate(dx, dy, dz).uniform(), Some(id));
+    assert_worker_matches(&t, dx, dy, dz);
+
+    // Above every tree on +Y: uniform air, and the worker agrees.
+    assert_eq!(t.classify(ChunkCoord::new(0, 31, 0)), Classify::Uniform(AIR));
+    assert_eq!(t.generate(0, 31, 0).uniform(), Some(AIR));
+    assert_worker_matches(&t, 0, 31, 0);
+
+    // The outward face of the lower twin (the inner faces see each other).
+    let mut twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    assert_eq!(twins.len(), 2);
+    let axis = (0..3).max_by_key(|&a| (twins[0].centre[a] - twins[1].centre[a]).abs()).unwrap();
+    twins.sort_by_key(|b| b.centre[axis]);
+    let away = [Face::NegX, Face::NegY, Face::NegZ][axis];
+    let (cx, cy, cz) = face_centre_chunk(&t, &twins[0], away);
+    assert_eq!(t.sky(ChunkCoord::new(cx, cy, cz)), Sky::Axis(away));
+    assert_chunk_matches(&t, cx, cy, cz);
+
+    let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).unwrap();
+    let (cx, cy, cz) = chunk_of(moon.centre);
+    let moon_c = ChunkCoord::new(cx, cy, cz);
+    assert_eq!(t.sky(moon_c), Sky::Open);
+    assert_eq!(t.classify(moon_c), Classify::Uniform(t.m.basalt));
+    assert_eq!(t.generate(cx, cy, cz).uniform(), Some(t.m.basalt));
+    assert_worker_matches(&t, cx, cy, cz);
+}
+
+#[test]
+fn cube_edges_share_one_rim_and_the_ridge_is_solid() {
+    let (_reg, t) = make(42);
+    let h = cosmos::HOME_HALF as i32;
+    for z in [0, 1_000, -8_000, h - 10] {
+        let dy = t.surface(Face::PosY, h, z);
+        let dx = t.surface(Face::PosX, 0, z);
+        assert_eq!(dy, dx - h, "edge z={z}");
+        assert!((MIN_GROUND..=MAX_GROUND).contains(&dy));
+        // One block past the square still belongs to this face (the rim is at least 6 tall)
+        // and rebuilds the same surface point.
+        assert_eq!(t.surface(Face::PosY, h + 1, z), dy, "wedge z={z}");
+        assert_ne!(t.voxel_at(h + dy - 1, dy - 1, z), AIR, "ridge solid z={z}");
+        assert_eq!(t.voxel_at(h + dy, dy + 30, z), AIR, "above the ridge z={z}");
+    }
+    let dy = t.surface(Face::PosY, h, h);
+    let dx = t.surface(Face::PosX, 0, h);
+    let dz = t.surface(Face::PosZ, h, 0);
+    assert_eq!(dy, dx - h, "corner +X");
+    assert_eq!(dy, dz - h, "corner +Z");
+    assert_ne!(t.voxel_at(h + dy - 1, dy - 1, h + dy - 1), AIR);
+    assert_eq!(t.voxel_at(h + dy, dy + 30, h + dy), AIR);
+}
+
+#[test]
+fn deep_mix_mean_amount_is_the_bulk_density() {
+    let (reg, t) = make(1);
+    let home = *t.cosmos.home();
+    let mut sum = 0.0f64;
+    let mut n = 0u32;
+    for i in 0..40 {
+        for j in 0..40 {
+            for k in 0..12 {
+                let rel = [i as i64 * 64, j as i64 * 64, k as i64 * 64];
+                debug_assert!(cube::in_deep(rel, cube::half_of(&home)));
+                sum += f64::from(reg.amount(cube::bulk_id(&t.bulk, &home, rel)));
+                n += 1;
+            }
+        }
+    }
+    let mean = sum / f64::from(n);
+    assert!(
+        (mean - cosmos::BULK_DENSITY).abs() <= 0.05,
+        "deep mean {mean} over {n} cells"
+    );
+}
+
+#[test]
+fn classify_matches_what_generation_stores() {
+    let (_reg, t) = make(42);
+    let samples = [
+        ChunkCoord::new(0, 1_000, 0),
+        ChunkCoord::new(0, 31, 0),
+        ChunkCoord::new(0, (-1_000i32).div_euclid(16), 0),
+        ChunkCoord::new(0, cosmos::HOME_CENTRE[1].div_euclid(16) as i32, 0),
+    ];
+    let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).unwrap();
+    let (mx, my, mz) = chunk_of(moon.centre);
+    let mut samples = samples.to_vec();
+    samples.push(ChunkCoord::new(mx, my, mz));
+    for c in samples {
+        let data = t.generate(c.x, c.y, c.z);
+        match t.classify(c) {
+            Classify::Air => assert_eq!(data.uniform(), Some(AIR), "air {c:?}"),
+            Classify::Uniform(id) => assert_eq!(data.uniform(), Some(id), "uniform {c:?}"),
+            Classify::Mixed => assert!(data.uniform().is_none() || data.uniform() == Some(AIR), "mixed {c:?}"),
+        }
+    }
+    // Face interior, edge band, empty space, a moon.
+    let y = t.height(8, 8).div_euclid(16);
+    assert_eq!(t.sky(ChunkCoord::new(0, y, 0)), Sky::Axis(Face::PosY));
+    let edge = cosmos::HOME_HALF as i32 - 100;
+    assert_eq!(t.sky(ChunkCoord::new(edge.div_euclid(16), 0, 0)), Sky::Open);
+    assert_eq!(t.sky(ChunkCoord::new(0, 1_000, 0)), Sky::Open);
+    assert_eq!(t.classify(ChunkCoord::new(0, 1_000, 0)), Classify::Air);
+    assert_eq!(t.sky(ChunkCoord::new(mx, my, mz)), Sky::Open);
+}
+
 /// `cargo test --release -- --ignored --nocapture landmarks`: coordinates worth a screenshot.
 #[test]
 #[ignore]
@@ -261,9 +467,9 @@ fn landmarks() {
             }
         }
     }
-    for i in 0..6 {
-        if let Some(p) = t.space.planet(i, 0, 0) {
-            println!("planet: {p:?}");
+    for b in t.cosmos.bodies() {
+        if b.kind == cosmos::Kind::Moon {
+            println!("moon {} centre {:?} r {:?}", b.id, b.centre, b.shape);
         }
     }
 }
