@@ -658,18 +658,28 @@ impl SectionState {
             .slabs
             .iter()
             .filter_map(|slab| {
-                let placement = Self::slab_placement(pos, slab.origin_y, detail);
+                let placement = Self::slab_placement(pos, slab.origin_y, detail, mesh.altitude_floor);
                 ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| eng.upload_mesh_placed(&slab.data[p], placement)))
             })
             .collect();
         SectionState::Ready { meshes, last_style: None }
     }
 
-    fn slab_placement(pos: SectionPos, origin_y: u32, detail: Detail) -> voxel_engine::MeshPlacement {
-        voxel_engine::MeshPlacement::terrain(
-            voxel_engine::IVec3::new(pos.min_x(), origin_y as i32 * pos.cell_size(), pos.min_z()),
-            detail,
-        )
+    fn slab_placement(pos: SectionPos, origin_y: u32, detail: Detail, floor_a: i32) -> voxel_engine::MeshPlacement {
+        // PosY on the legacy window: the placement used before face frames existed.
+        if pos.face == Face::PosY && floor_a == 0 {
+            return voxel_engine::MeshPlacement::terrain(
+                voxel_engine::IVec3::new(pos.min_x(), origin_y as i32 * pos.cell_size(), pos.min_z()),
+                detail,
+            );
+        }
+        // Rotate the block about its centre, then place vertex (0,0,0) at the
+        // world cell that corner lands on. `half` is half a packed block.
+        let scale = 1i32 << detail.0;
+        let half = 8 * scale;
+        let a0 = floor_a + origin_y as i32 * pos.cell_size();
+        let (cx, cy, cz) = FaceFrame::new(pos.face).cell_to_world((pos.min_x() + half, a0 + half, pos.min_z() + half));
+        voxel_engine::MeshPlacement::terrain(voxel_engine::IVec3::new(cx - half, cy - half, cz - half), detail)
     }
 
     fn from_upload_payload(
@@ -693,7 +703,7 @@ impl SectionState {
             .slabs
             .into_iter()
             .filter_map(|mut slab| {
-                let placement = Self::slab_placement(pos, slab.origin_y, detail);
+                let placement = Self::slab_placement(pos, slab.origin_y, detail, staged.altitude_floor);
                 ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
                     slab.passes[p]
                         .take()
@@ -1153,6 +1163,15 @@ pub struct World {
     /// The eye altitude captured each `stream()` before chunk-coord floor rounds it.
     /// Feeds the vertical LOD selection. XZ selection uses chunk centre only.
     section_eye_y: f64,
+    /// Body and face the far field is selecting, with hysteresis at edges.
+    /// `None` once a pass has decided the camera is over no cube (space, storage, a round body).
+    section_lod_face: Option<(u16, Face)>,
+    /// Set by [`stream`](Self::stream). Until then selection uses the dominant face
+    /// (PosY at the origin), so tests that never stream keep today's frontier.
+    section_face_set: bool,
+    /// The bake's `(body, face, anchor_u, anchor_v)`. `None` until a bake is spawned;
+    /// readers then do not filter summaries by face.
+    section_mip_anchor: Option<(u16, Face, i32, i32)>,
     /// Previous stream eye + timestamp for velocity computation.
     /// Reset to None on teleport or first stream.
     section_eye_prev: Option<(DVec3, Instant)>,
@@ -1279,6 +1298,8 @@ pub struct World {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SectionFrontierKey {
     center_xz: [i32; 2],
+    body: u16,
+    face: u8,
     eye_y: u64,
     velocity: [u64; 3],
     unit: u32,
@@ -1428,6 +1449,9 @@ impl World {
             lod2,
             section_pyramid: pyramid::PyramidCfg::sections_with(unit, lod_levels, lod_detail),
             section_eye_y: 0.0,
+            section_lod_face: None,
+            section_face_set: false,
+            section_mip_anchor: None,
             section_eye_prev: None,
             section_vel: DVec3::ZERO,
             stream_pacer: streaming::StreamPacer::default(),
@@ -1550,9 +1574,19 @@ impl World {
         let full = self.view.coverage();
         let radius_m = ((self.lod_clip_rings - 1).max(0) * CHUNK_SIZE as i32) as f32;
         let hx = radius_m.min(full.half.x);
-        CoverageVolume {
-            half: Vec3::new(hx, full.half.y, hx),
+        let hv = full.half.y;
+        // Settled radius on the two tangents, the full vertical extent on the up axis.
+        // PosY (the default before a stream commits an up face) is (hx, hv, hx).
+        // No up face: a cube of the settled radius, not the tall vertical slab.
+        let (mut x, mut y, mut z) = (hx, hx, hx);
+        if let Some(face) = self.live_up() {
+            match face.axis() {
+                0 => x = hv,
+                1 => y = hv,
+                _ => z = hv,
+            }
         }
+        CoverageVolume { half: Vec3::new(x, y, z) }
     }
 
     /// Fold a streaming-centre move into the settled-ring count WITHOUT
@@ -1715,6 +1749,11 @@ impl World {
     /// Skip only if all backing chunks are settled (drawable or born-air, never
     /// in-flight), to avoid holes during fast descent.
     fn coverage_skips(&self, center: Coord, key: SectionPos) -> bool {
+        // Off the camera's +Y face the world-XZ proof does not apply. Keeping the
+        // section loaded is the safe side (the clip still discards it once settled).
+        if key.face != Face::PosY {
+            return false;
+        }
         let cov = self.view.coverage();
         let cs = CHUNK_SIZE as i32;
         let (h_lim, v_lim) = (0.75 * cov.half.x, 0.75 * cov.half.y);

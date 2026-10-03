@@ -18,7 +18,7 @@
 //! never a section re-extract.
 
 use crate::block::registry::{AIR, BlockId};
-use crate::coord::ChunkCoord;
+use crate::coord::{ChunkCoord, Face};
 #[cfg(test)]
 use crate::ident::BlockState;
 use crate::ident::Detail;
@@ -93,11 +93,15 @@ impl Quadrant {
 
 // SectionPos: canonical position for every node of the hierarchy.
 
-/// A section's place in the quadtree: detail level and grid coords.
-/// Uses floor division (div_euclid) only to avoid the classic quadtree bug of rounding toward zero.
+/// A section's place in the quadtree: which body and face, the detail, and the
+/// face-local tangent grid (`x` along `u`, `z` along `v`). Floor division only.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct SectionPos {
     pub detail: Detail,
+    /// Body catalog id. `0` is the start cube (and every flat world).
+    pub body: u16,
+    /// Face whose tangent plane this section tiles. PosY is today's XZ grid.
+    pub face: Face,
     pub x: i32,
     pub z: i32,
 }
@@ -113,19 +117,25 @@ impl SectionPos {
         section_span(self.detail)
     }
 
-    /// World min-corner X of this section.
+    /// Face-local min-corner `u` of this section.
     pub fn min_x(self) -> i32 {
         self.x * self.span()
     }
 
-    /// World min-corner Z of this section.
+    /// Face-local min-corner `v` of this section.
     pub fn min_z(self) -> i32 {
         self.z * self.span()
     }
 
     /// Coarser section containing this one, computed with floor division.
     pub fn parent(self) -> SectionPos {
-        SectionPos { detail: Detail(self.detail.0 + 1), x: self.x.div_euclid(2), z: self.z.div_euclid(2) }
+        SectionPos {
+            detail: Detail(self.detail.0 + 1),
+            body: self.body,
+            face: self.face,
+            x: self.x.div_euclid(2),
+            z: self.z.div_euclid(2),
+        }
     }
 
     /// Finer child at quadrant q; inverse of parent().
@@ -136,6 +146,8 @@ impl SectionPos {
         debug_assert!(self.detail.0 > 0, "finest level has no children");
         SectionPos {
             detail: Detail(self.detail.0 - 1),
+            body: self.body,
+            face: self.face,
             x: self.x * 2 + quadrant.dx(),
             z: self.z * 2 + quadrant.dz(),
         }
@@ -315,7 +327,7 @@ impl Section {
                     let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
                     let (wx, wz) = (fx + half, fz + half);
                     r#gen.lod_column(wx, wz, &ys, &mut scratch);
-                    apply_edits(&mut scratch, &flat, fx, fz, cell);
+                    apply_edits(&mut scratch, &flat, fx, fz, cell, LOD_FLOOR_Y);
                     for (y, &id) in scratch.iter().enumerate() {
                         let (b, ly) = (y / BRICK_DIM, y % BRICK_DIM);
                         per_brick[b][cell_index(lx, ly, lz)] = BlockState { id, state: 0 };
@@ -340,10 +352,29 @@ impl Section {
 
 /// The world-Y centre of every vertical cell of a section at `pos`'s detail —
 /// the exact generator sample heights both extraction paths use.
+/// Home +Y (the `[0, 512)` window). Other faces pass their own floor to [`apply_edits`].
 pub(in crate::world) fn cell_centers(pos: SectionPos) -> Vec<i32> {
     let cell = pos.cell_size();
     let half = cell / 2;
     (0..pos.n_cells()).map(|j| LOD_FLOOR_Y + j * cell + half).collect()
+}
+
+/// Sample window `[lo, hi)` along the face normal.
+///
+/// Bounds that sit inside today's `[0, 512]` expand back to that window, so a
+/// home +Y section (terrain in `[MIN_GROUND, MAX_GROUND]`) keeps its columns.
+/// Anything else grows by two cells and aligns out to the cell grid.
+pub(in crate::world) fn sample_window(lo: i32, hi: i32, cell: i32) -> (i32, i32) {
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    if lo >= LOD_FLOOR_Y && hi <= LOD_CEIL_Y {
+        return (LOD_FLOOR_Y, LOD_CEIL_Y);
+    }
+    let margin = cell.saturating_mul(2);
+    let a0 = lo.saturating_sub(margin).div_euclid(cell) * cell;
+    let top = hi.saturating_add(margin);
+    let rem = top.rem_euclid(cell);
+    let a1 = if rem == 0 { top } else { top + (cell - rem) };
+    (a0, a1.max(a0.saturating_add(cell)))
 }
 
 /// Flatten section edits (per-chunk flat indices) to absolute world coordinates,
@@ -380,6 +411,7 @@ pub(in crate::world) fn apply_edits(
     fx: i32,
     fz: i32,
     cell: i32,
+    floor: i32,
 ) {
     if flat.is_empty() {
         return;
@@ -394,11 +426,11 @@ pub(in crate::world) fn apply_edits(
         if ewx < fx || ewx >= fx + cell || ewz < fz || ewz >= fz + cell {
             return None;
         }
-        let j = (ewy - LOD_FLOOR_Y).div_euclid(cell);
+        let j = (ewy - floor).div_euclid(cell);
         usize::try_from(j).ok().filter(|&j| j < n)
     };
     let is_centre = |ewx: i32, ewy: i32, ewz: i32, j: usize| {
-        ewx == fx + half && ewz == fz + half && ewy == LOD_FLOOR_Y + j as i32 * cell + half
+        ewx == fx + half && ewz == fz + half && ewy == floor + j as i32 * cell + half
     };
     // Pass 1: solid, non-centre edits (ascending order makes topmost win).
     for &(ewx, ewy, ewz, id) in flat {
@@ -476,7 +508,7 @@ mod tests {
         Terrain::new(&mut BlockRegistry::with_builtins(), seed)
     }
 
-    const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
+    const FINEST: SectionPos = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 0, z: 0 };
     const CELL: i32 = 1 << FINEST_DETAIL.0;
 
     fn extract<G: TerrainGenerator + ?Sized>(pos: SectionPos, g: &G, edits: &[(ChunkCoord, Vec<(usize, BlockId)>)]) -> Section {
@@ -570,7 +602,7 @@ mod tests {
     #[test]
     fn child_parent_is_an_involution_across_the_sign_boundary() {
         for &(x, z) in &[(0, 0), (1, 1), (-1, -1), (-1, 0), (5, -7), (-4, 3), (i32::MIN / 4, 9)] {
-            let p = SectionPos { detail: Detail(5), x, z };
+            let p = SectionPos { body: 0, face: Face::PosY, detail: Detail(5), x, z };
             for q in Quadrant::ALL {
                 let c = p.child(q);
                 assert_eq!(c.parent(), p, "child({q:?}).parent() != self at {x},{z}");
@@ -583,8 +615,8 @@ mod tests {
     #[test]
     fn parent_uses_floor_division_not_toward_zero() {
         // Ensure -1 divides to -1 (floor), not 0 (toward zero).
-        let p = SectionPos { detail: Detail(2), x: -1, z: -3 };
-        assert_eq!(p.parent(), SectionPos { detail: Detail(3), x: -1, z: -2 });
+        let p = SectionPos { body: 0, face: Face::PosY, detail: Detail(2), x: -1, z: -3 };
+        assert_eq!(p.parent(), SectionPos { body: 0, face: Face::PosY, detail: Detail(3), x: -1, z: -2 });
     }
 
     // Extraction: column classes tests.
@@ -731,7 +763,7 @@ mod tests {
         let r#gen = terrain_gen(&b, 200, 40, Some((260, 280)));
         let k = FINEST_DETAIL.0;
         for dk in 0..=6 {
-            let pos = SectionPos { detail: Detail(k + dk), x: 0, z: 0 };
+            let pos = SectionPos { body: 0, face: Face::PosY, detail: Detail(k + dk), x: 0, z: 0 };
             let cell = pos.cell_size();
             let sec = extract(pos, &r#gen, &[]);
             for &(ix, iz) in &[(0usize, 0usize), (5, 9), (15, 15), (16, 0), (31, 31)] {

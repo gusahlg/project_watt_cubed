@@ -25,13 +25,16 @@
 //! blocklight) so coarse tiles track day/night.
 use std::cell::RefCell;
 
-use voxel_engine::{Ao, Light, MeshVertex};
+use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
+
+use crate::coord::Face;
+use crate::space::FaceFrame;
 
 use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{ChunkCoord, DOMAIN_H, SECTION_N, SectionPos};
+use super::{ChunkCoord, SECTION_N, SectionPos};
 #[cfg(test)]
-use super::Section;
+use super::{DOMAIN_H, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
 use super::super::mesh::face::{self, covered, vertex_ao, corner_uv};
 
@@ -42,6 +45,8 @@ use super::super::mesh::face::{self, covered, vertex_ao, corner_uv};
 pub(in crate::world) struct SectionMeshData {
     pub shift: u8,
     pub slabs: Vec<SlabMesh>,
+    /// World altitude of native cell 0. `0` on the legacy `[0, 512)` window.
+    pub altitude_floor: i32,
 }
 
 /// One packed slab: up to 16 packed cells tall, its origin at native-cell Y `origin_y`.
@@ -391,22 +396,141 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
     tables: &HotTables,
 ) -> SectionMeshData {
+    let Some((alo, ahi)) = section_window(pos, r#gen) else {
+        return SectionMeshData::default();
+    };
     let cell = pos.cell_size();
-    let n_cells = (DOMAIN_H / cell) as usize;
-    let ys = super::cell_centers(pos);
+    let n_cells = ((ahi - alo) / cell) as usize;
+    let half = cell / 2;
+    let ys: Vec<i32> = (0..n_cells as i32).map(|j| alo + j * cell + half).collect();
     let flat = super::flatten_edits(edits);
-    let floor = ring_floor(pos, r#gen);
-    mesh_section_with(n_cells, tables, Some(floor), |dense| {
+    let remapped;
+    let used: &[_] = if pos.face == Face::PosY {
+        &flat
+    } else {
+        remapped = face_edits(&flat, pos.face);
+        &remapped
+    };
+    let floor = if pos.face == Face::PosY { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
+    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), |dense| {
         for iz in 0..SECTION_N {
             for ix in 0..SECTION_N {
                 let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
-                let (wx, wz) = (fx + cell / 2, fz + cell / 2);
+                let (u, v) = (fx + half, fz + half);
                 let column = &mut dense[(ix + iz * SECTION_N) * n_cells..][..n_cells];
-                r#gen.lod_column(wx, wz, &ys, column);
-                super::apply_edits(column, &flat, fx, fz, cell);
+                if pos.face == Face::PosY {
+                    r#gen.lod_column(u, v, &ys, column);
+                } else {
+                    r#gen.lod_column_face(pos.body, pos.face, u, v, &ys, column);
+                }
+                super::apply_edits(column, used, fx, fz, cell, alo);
             }
         }
-    })
+    });
+    mesh.altitude_floor = alo;
+    if pos.face != Face::PosY {
+        orient_section(&mut mesh, pos.face);
+    }
+    mesh
+}
+
+/// `[lo, hi)` the extractor samples. `None` when the square holds no surface.
+fn section_window<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G) -> Option<(i32, i32)> {
+    let (lo, hi) = r#gen.surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span())?;
+    Some(super::sample_window(lo, hi, pos.cell_size()))
+}
+
+/// World edits rewritten as face-local `(u, a, v)`, sorted the way [`super::apply_edits`] requires.
+fn face_edits(flat: &[(i32, i32, i32, BlockId)], face: Face) -> Vec<(i32, i32, i32, BlockId)> {
+    let frame = FaceFrame::new(face);
+    let mut out: Vec<_> = flat
+        .iter()
+        .map(|&(x, y, z, id)| {
+            let (u, a, v) = frame.cell_to_local((x, y, z));
+            (u, a, v, id)
+        })
+        .collect();
+    out.sort_unstable_by_key(|&(u, a, v, _)| (a, u, v));
+    out
+}
+
+/// [`ring_floor`] measured from `alo` along `pos.face` (surface altitude, not world Y).
+fn ring_floor_face<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G, alo: i32) -> i32 {
+    let cell = pos.cell_size();
+    let n = SECTION_N as i32;
+    let top = |ix: i32, iz: i32| {
+        let (u, v) = (pos.min_x() + ix * cell + cell / 2, pos.min_z() + iz * cell + cell / 2);
+        let h = r#gen.surface(pos.face, u, v);
+        if h == i32::MIN {
+            i32::MAX
+        } else {
+            (h - 1 - alo).div_euclid(cell)
+        }
+    };
+    let mut floor = i32::MAX;
+    for i in -1..=n {
+        floor = floor.min(top(i, -1)).min(top(i, n)).min(top(-1, i)).min(top(n, i));
+    }
+    floor.max(0)
+}
+
+/// Rotate a Y-up section mesh into `face`. PosY is a no-op, so home upload bytes do not move.
+/// Positions stay in `0..=16` (permutation about the block centre). Winding is kept: det = +1.
+pub(in crate::world) fn orient_section(mesh: &mut SectionMeshData, face: Face) {
+    if face == Face::PosY {
+        return;
+    }
+    for slab in &mut mesh.slabs {
+        orient_mesh(&mut slab.data, face);
+    }
+}
+
+fn orient_mesh(data: &mut ChunkMeshData, face: Face) {
+    let frame = FaceFrame::new(face);
+    for pass in Pass::ALL {
+        let src = data[pass].vertices();
+        if src.is_empty() {
+            continue;
+        }
+        let quads: Vec<[MeshVertex; 4]> = src
+            .chunks_exact(4)
+            .map(|q| [map_vert(q[0], frame), map_vert(q[1], frame), map_vert(q[2], frame), map_vert(q[3], frame)])
+            .collect();
+        data[pass].clear();
+        for corners in quads {
+            data[pass].quad(corners);
+        }
+    }
+}
+
+fn map_vert(v: MeshVertex, frame: FaceFrame) -> MeshVertex {
+    let p = v.local_pos();
+    let (x, y, z) = frame.cell_to_world((p[0] as i32 - 8, p[1] as i32 - 8, p[2] as i32 - 8));
+    let d = v.normal().direction();
+    let (nx, ny, nz) = frame.cell_to_world((d[0] as i32, d[1] as i32, d[2] as i32));
+    let m = v.micro();
+    let (mx, my, mz) = frame.cell_to_world((m[0] as i32, m[1] as i32, m[2] as i32));
+    MeshVertex::new(
+        [(x + 8) as u8, (y + 8) as u8, (z + 8) as u8],
+        normal_from([nx, ny, nz]),
+        v.layer(),
+        v.ao(),
+        v.light(),
+        v.is_water(),
+    )
+    .with_micro([mx as i8, my as i8, mz as i8])
+}
+
+fn normal_from(d: [i32; 3]) -> Normal {
+    match d {
+        [1, 0, 0] => Normal::PosX,
+        [-1, 0, 0] => Normal::NegX,
+        [0, 1, 0] => Normal::PosY,
+        [0, -1, 0] => Normal::NegY,
+        [0, 0, 1] => Normal::PosZ,
+        [0, 0, -1] => Normal::NegZ,
+        _ => Normal::PosY,
+    }
 }
 
 /// The one section-mesh driver both producers share: `fill` overwrites this
@@ -562,7 +686,7 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Op
                     });
                 }
             }
-            SectionMeshData { shift: if slabs.is_empty() { 0 } else { shift as u8 }, slabs }
+            SectionMeshData { shift: if slabs.is_empty() { 0 } else { shift as u8 }, slabs, altitude_floor: 0 }
         })
     })
 }
@@ -573,7 +697,6 @@ mod tests {
     use crate::block::registry::BlockRegistry;
     use crate::world::generation::TerrainGenerator;
     use crate::world::terrain::Terrain;
-    use voxel_engine::{Normal, Pass};
     use crate::world::section::{FINEST_DETAIL, SectionPos};
 
     // Test fixtures
@@ -627,7 +750,7 @@ mod tests {
         (r, tables, blocks)
     }
 
-    const FINEST: SectionPos = SectionPos { detail: FINEST_DETAIL, x: 0, z: 0 };
+    const FINEST: SectionPos = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 0, z: 0 };
     const CELL: i32 = 1 << FINEST_DETAIL.0;
 
     /// Terrain with configurable surface height, water table, and floating shelf.
@@ -914,7 +1037,7 @@ mod tests {
         use crate::ident::Detail;
         let k = FINEST_DETAIL.0;
         for detail in [FINEST_DETAIL, Detail(k + 2), Detail(k + 4), Detail(k + 7)] {
-            let pos = SectionPos { detail, x: 0, z: 0 };
+            let pos = SectionPos { body: 0, face: Face::PosY, detail, x: 0, z: 0 };
             for (label, r#gen) in [
                 ("flat", terrain_gen(&b, 200, 0, None)),
                 ("water", terrain_gen(&b, 40, 80, None)),
@@ -935,7 +1058,7 @@ mod tests {
             }
             // The real terrain generator, off-origin so warps/rivers vary.
             let hills = Terrain::new(&mut BlockRegistry::with_builtins(), 0xBEEF);
-            let pos = SectionPos { detail, x: 3, z: -2 };
+            let pos = SectionPos { body: 0, face: Face::PosY, detail, x: 3, z: -2 };
             let stored = Section::extract(pos, &hills, &edits, voxel_engine::Rev::START);
             assert_eq!(
                 flatten(&build_section_mesh(&stored, &tables, Some(ring_floor(pos, &hills)))),
@@ -977,11 +1100,85 @@ mod tests {
         use crate::ident::Detail;
         let k = FINEST_DETAIL.0;
         for detail in [FINEST_DETAIL, Detail(k + 2), Detail(k + 4), Detail(k + 6)] {
-            let pos = SectionPos { detail, x: 0, z: 0 };
+            let pos = SectionPos { body: 0, face: Face::PosY, detail, x: 0, z: 0 };
             let sec = extract(pos, &terrain_gen(&b, 200, 0, None));
             let mesh = build_section_mesh(&sec, &tables, None);
             assert!(normals_present(&mesh, Normal::PosY), "detail {detail:?} lost the top surface");
             assert_winds_outward(&mesh);
+        }
+    }
+
+    /// Meshing in the Y-up frame and rotating the packed vertices must match meshing
+    /// the same voxels after the face permutation. Interior cells only: the floor-solid
+    /// and border-micro rules are not part of the rotation.
+    #[test]
+    fn far_face_rotation_matches_meshing_rotated_voxels() {
+        let (_r, tables, b) = setup();
+        let n = 16i32;
+        let mut cells = vec![AIR; (n * n * n) as usize];
+        let at = |x: i32, y: i32, z: i32| ((x + z * n) * n + y) as usize;
+        // A vertical bar (so a greedy merge is real) and one offset cell. Both sit
+        // in 5..=11, so every signed permutation stays off the grid border.
+        let occupied = [(6, 8, 7), (6, 9, 7), (10, 7, 9)];
+        for &(x, y, z) in &occupied {
+            cells[at(x, y, z)] = b.stone;
+        }
+        let mesh_of = |grid: &[BlockId]| {
+            let mut out = new_chunk_mesh_data();
+            let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
+            assert!(build_volume(&g, &tables, &mut out), "the feature emits no faces");
+            out
+        };
+        let key = |v: MeshVertex| {
+            let p = v.local_pos();
+            let ao = (0u8..=3).find(|&a| v.ao() == Ao::new(a)).expect("ao");
+            (p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), v.normal() as u8, v.layer(), ao, v.micro(), v.is_water())
+        };
+        let canon = |data: &ChunkMeshData| {
+            let mut quads = Vec::new();
+            for pass in Pass::ALL {
+                let verts = data[pass].vertices();
+                for q in verts.chunks_exact(4) {
+                    let mut c = [q[0], q[1], q[2], q[3]];
+                    let mut best = 0;
+                    for i in 1..4 {
+                        if key(c[i]) < key(c[best]) {
+                            best = i;
+                        }
+                    }
+                    c.rotate_left(best);
+                    quads.push(c);
+                }
+            }
+            quads.sort_by_key(|q| q.map(key));
+            quads
+        };
+        let rotate_cell = |x: i32, y: i32, z: i32, frame: FaceFrame| {
+            let mut min = (i32::MAX, i32::MAX, i32::MAX);
+            for dx in 0..2 {
+                for dy in 0..2 {
+                    for dz in 0..2 {
+                        let (wx, wy, wz) = frame.cell_to_world((x + dx - 8, y + dy - 8, z + dz - 8));
+                        min.0 = min.0.min(wx + 8);
+                        min.1 = min.1.min(wy + 8);
+                        min.2 = min.2.min(wz + 8);
+                    }
+                }
+            }
+            min
+        };
+        for face in Face::ALL {
+            let mut turned = mesh_of(&cells);
+            orient_mesh(&mut turned, face);
+            let frame = FaceFrame::new(face);
+            let mut oracle = vec![AIR; cells.len()];
+            for &(x, y, z) in &occupied {
+                let (ox, oy, oz) = rotate_cell(x, y, z, frame);
+                assert!((0..n).contains(&ox) && (0..n).contains(&oy) && (0..n).contains(&oz), "{face:?} cell left the block");
+                oracle[at(ox, oy, oz)] = b.stone;
+            }
+            let direct = mesh_of(&oracle);
+            assert_eq!(canon(&turned), canon(&direct), "{face:?}");
         }
     }
 
@@ -997,7 +1194,7 @@ mod tests {
         let mut registry = BlockRegistry::with_builtins();
         let r#gen = Terrain::new(&mut registry, 42);
         let tables = registry.hot_tables();
-        let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos {
+        let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos { body: 0, face: Face::PosY,
             detail: FINEST_DETAIL,
             x: (i % 4) as i32,
             z: (i / 4) as i32,

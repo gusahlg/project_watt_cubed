@@ -494,6 +494,29 @@ impl Terrain {
         Some(Posy { world_a, col, paint: self.paint(&body, Face::PosY), u, v, half, centre })
     }
 
+    /// One named cube's column on `face`. PosY of every body stays on [`posy_hit`](Self::posy_hit)
+    /// (the highest surface), so the home +Y bytes do not move.
+    fn named_face_hit(&self, body_id: u16, face: Face, u: i32, v: i32) -> Option<Posy<'_>> {
+        let body = self.cosmos.bodies().iter().find(|b| b.id == body_id)?;
+        let cosmos::Shape::Cube { half } = body.shape else { return None };
+        let centre_i = cube::centre_i32(body.centre)?;
+        let (ub, vb) = cube::tangents(face, centre_i, u, v);
+        if cube::edge_inside(half, ub, vb) < -cosmos::RELIEF {
+            return None;
+        }
+        let (Ok(ui), Ok(vi)) = (i32::try_from(ub), i32::try_from(vb)) else { return None };
+        let paint = self.paint(body, face);
+        let mut col = paint.shape.column(ui, vi);
+        col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, ub, vb);
+        let a_body = half + i64::from(col.height) - 1;
+        let Ok(a_i) = i32::try_from(a_body) else { return None };
+        if cube::face_of(cube::local_to_rel(face, ui, a_i, vi)) != face {
+            return None;
+        }
+        let world_a = cube::world_a(half, col.height, cube::normal_dot(body.centre, face))?;
+        Some(Posy { world_a, col, paint, u: ui, v: vi, half, centre: body.centre })
+    }
+
     fn cube_cell(&self, body: &cosmos::Body, p: [i64; 3]) -> BlockId {
         let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
         let half = cube::half_of(body);
@@ -1111,6 +1134,53 @@ impl TerrainGenerator for Terrain {
                 hit.paint.shape.ground(&hit.col, hit.u, h, hit.v)
             };
         }
+    }
+
+    fn lod_column_face(&self, body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {
+        if face == Face::PosY {
+            self.lod_column(u, v, alts, out);
+            return;
+        }
+        let Some(hit) = self.named_face_hit(body, face, u, v) else {
+            for o in out.iter_mut().take(alts.len()) {
+                *o = AIR;
+            }
+            return;
+        };
+        let n_dot = cube::normal_dot(hit.centre, face);
+        for (o, &a) in out.iter_mut().zip(alts) {
+            *o = if a >= hit.world_a {
+                AIR
+            } else {
+                let h = cube::face_h(hit.half, n_dot, a);
+                hit.paint.shape.ground(&hit.col, hit.u, h, hit.v)
+            };
+        }
+    }
+
+    fn surface_bounds(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
+        let body = self.cosmos.bodies().iter().find(|b| b.id == body)?;
+        let cosmos::Shape::Cube { half } = body.shape else { return None };
+        let centre = cube::centre_i32(body.centre)?;
+        let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
+        let lim = half + cosmos::RELIEF;
+        let u_lo = i64::from(u0) - i64::from(cu);
+        let v_lo = i64::from(v0) - i64::from(cv);
+        let u_hi = u_lo + i64::from(span);
+        let v_hi = v_lo + i64::from(span);
+        if u_lo >= lim || u_hi <= -lim || v_lo >= lim || v_hi <= -lim {
+            return None;
+        }
+        let n = cube::normal_dot(body.centre, face);
+        let lo = cube::world_a(half, MIN_GROUND, n)?;
+        let hi = cube::world_a(half, MAX_GROUND, n)?;
+        Some((lo.min(hi), lo.max(hi)))
+    }
+
+    fn face_datum(&self, body: u16, face: Face) -> i32 {
+        let Some(body) = self.cosmos.bodies().iter().find(|b| b.id == body) else { return 0 };
+        let cosmos::Shape::Cube { half } = body.shape else { return 0 };
+        cube::world_a(half, 0, cube::normal_dot(body.centre, face)).unwrap_or(0)
     }
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {

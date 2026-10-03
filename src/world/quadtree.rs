@@ -9,6 +9,7 @@
 //! at most one level deep (the common case). Stand-ins deeper than one level
 //! (during initial load) are drawn whole; overlap is arbitrated by depth bias.
 
+use crate::coord::Face;
 use crate::ident::Detail;
 
 use super::metric::EyeMetric;
@@ -93,7 +94,7 @@ pub(in crate::world) fn desired_sections(eye: &EyeMetric, cfg: &PyramidCfg) -> V
     let (ax, az) = eye.anchor();
     for (ring, lod) in cfg.active_lods().enumerate() {
         let detail = lod;
-        let span = SectionPos { detail, x: 0, z: 0 }.span();
+        let span = SectionPos { body: 0, face: Face::PosY, detail, x: 0, z: 0 }.span();
         // Test membership against the full 3D range (including eye altitude).
         // XZ projection skips bands wholly overhead and bounds the grid sweep.
         let (lo, hi) = band_radii(ring, cfg);
@@ -106,7 +107,7 @@ pub(in crate::world) fn desired_sections(eye: &EyeMetric, cfg: &PyramidCfg) -> V
         let (psx, psz) = (ax.div_euclid(span), az.div_euclid(span));
         for sx in (psx - reach)..=(psx + reach) {
             for sz in (psz - reach)..=(psz + reach) {
-                let sec = SectionPos { detail, x: sx, z: sz };
+                let sec = SectionPos { body: 0, face: Face::PosY, detail, x: sx, z: sz };
                 let r = eye.range(sec);
                 if r.near().get() < hi && r.far().get() >= lo {
                     out.push(sec);
@@ -159,7 +160,7 @@ pub(in crate::world) fn coarsen_by_error(
     }
     // Deterministic order: sort to avoid arbitrary set iteration.
     let mut out: Vec<SectionPos> = set.into_iter().collect();
-    out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
+    out.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
     out
 }
 
@@ -193,7 +194,7 @@ pub(in crate::world) fn coarsen_to_budget(
                 }
             }
             let mut parents: Vec<(SectionPos, u8)> = kids.into_iter().filter(|&(_, n)| n >= 2).collect();
-            parents.sort_unstable_by_key(|(p, n)| (std::cmp::Reverse(*n), p.x, p.z));
+            parents.sort_unstable_by_key(|(p, n)| (std::cmp::Reverse(*n), p.body, p.face as u8, p.x, p.z));
             for (p, _) in parents {
                 if set.len() <= budget {
                     break;
@@ -215,7 +216,7 @@ pub(in crate::world) fn coarsen_to_budget(
         }
     }
     let mut out: Vec<SectionPos> = set.into_iter().collect();
-    out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
+    out.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
     out
 }
 
@@ -226,7 +227,7 @@ pub(in crate::world) fn union_frontiers(a: Vec<SectionPos>, b: Vec<SectionPos>) 
     let mut set: FastSet<SectionPos> = a.into_iter().collect();
     set.extend(b);
     let mut out: Vec<SectionPos> = set.into_iter().collect();
-    out.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
+    out.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
     out
 }
 
@@ -366,14 +367,14 @@ mod tests {
         let mut out = Vec::new();
         for (ring, lod) in cfg.active_lods().enumerate() {
             let detail = lod;
-            let span = SectionPos { detail, x: 0, z: 0 }.span();
+            let span = SectionPos { body: 0, face: Face::PosY, detail, x: 0, z: 0 }.span();
             let (lo, hi) = band_radii(ring, cfg);
             let outer = if hi.is_finite() { hi } else { cfg.outer_m() };
             let reach = (outer / span as f32).ceil() as i32 + 1;
             let (psx, psz) = (pcx.div_euclid(span), pcz.div_euclid(span));
             for sx in (psx - reach)..=(psx + reach) {
                 for sz in (psz - reach)..=(psz + reach) {
-                    let sec = SectionPos { detail, x: sx, z: sz };
+                    let sec = SectionPos { body: 0, face: Face::PosY, detail, x: sx, z: sz };
                     let (near, far) = dist_range(sec, pcx, pcz);
                     if near < hi && far >= lo {
                         out.push(sec);
@@ -491,7 +492,7 @@ mod tests {
     /// One-level stand-in with three ready siblings yields exact partition.
     #[test]
     fn one_missing_child_yields_an_exact_partition() {
-        let parent = SectionPos { detail: Detail(FINEST_DETAIL.0 + 2), x: 3, z: -2 };
+        let parent = SectionPos { body: 0, face: Face::PosY, detail: Detail(FINEST_DETAIL.0 + 2), x: 3, z: -2 };
         let missing_q = q(2);
         let children: [SectionPos; 4] = std::array::from_fn(|i| parent.child(q(i as u8)));
         let ready = move |p: SectionPos| p == parent || (children.contains(&p) && p != parent.child(missing_q));
@@ -531,7 +532,7 @@ mod tests {
     /// Coarse cells pruned even against partially drawn children, avoiding overlay.
     #[test]
     fn coarse_overlay_prunes_against_partially_drawn_children() {
-        let g = SectionPos { detail: Detail(FINEST_DETAIL.0 + 2), x: 1, z: 1 };
+        let g = SectionPos { body: 0, face: Face::PosY, detail: Detail(FINEST_DETAIL.0 + 2), x: 1, z: 1 };
         let c = g.child(q(1)); // partially drawn: one of its own children is missing
         let missing = c.child(q(3));
         let mut desired: Vec<SectionPos> = vec![g];

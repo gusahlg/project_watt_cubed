@@ -436,20 +436,51 @@ impl World {
     }
 
     /// Mark sections covering this voxel dirty at every active detail so they
-    /// re-extract from the edit overlay. Sections span the full vertical domain
-    /// (Y-independent), so edits outside [0, DOMAIN_H) don't touch any section.
-    fn mark_dirty_sections_from_edit(&mut self, chunk: Coord, x: i32, y: i32, z: i32) {
-        if !(0..super::section::DOMAIN_H).contains(&y) {
-            return;
+    /// re-extract from the edit overlay. Home +Y keeps the `[0, 512)` window, so an
+    /// edit outside it still touches nothing. Other faces map the cell through the
+    /// face frame and use that section's altitude window.
+    fn edit_face_cell(&self, x: i32, y: i32, z: i32) -> Option<(u16, Face, i32, i32, i32)> {
+        let Some(cosmos) = self.generator.cosmos() else {
+            if !(0..super::section::DOMAIN_H).contains(&y) {
+                return None;
+            }
+            return Some((0, Face::PosY, x, z, y));
+        };
+        let p = voxel_engine::DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+        let body = cosmos.body_at(p)?;
+        if !matches!(body.shape, super::terrain::cosmos::Shape::Cube { .. }) {
+            return None;
         }
+        let face = Face::from_dominant(p - body.centre_f());
+        let (u, a, v) = FaceFrame::new(face).cell_to_local((x, y, z));
+        Some((body.id, face, u, v, a))
+    }
+
+    fn edit_in_window(&self, pos: super::section::SectionPos, a: i32) -> bool {
+        let Some((lo, hi)) = self.generator.surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span()) else {
+            return false;
+        };
+        let (wlo, whi) = super::section::sample_window(lo, hi, pos.cell_size());
+        (wlo..whi).contains(&a)
+    }
+
+    fn mark_dirty_sections_from_edit(&mut self, chunk: Coord, x: i32, y: i32, z: i32) {
+        let Some((body, face, u, v, a)) = self.edit_face_cell(x, y, z) else { return };
         let details: Vec<_> = self.section_pyramid.active_lods().collect();
+        let mut any = false;
         for detail in details {
             let span = super::section::section_span(detail);
             let pos = super::section::SectionPos {
+                body,
+                face,
                 detail,
-                x: x.div_euclid(span),
-                z: z.div_euclid(span),
+                x: u.div_euclid(span),
+                z: v.div_euclid(span),
             };
+            if !self.edit_in_window(pos, a) {
+                continue;
+            }
+            any = true;
             self.dirty_sections.insert(pos);
             // The heightmip edit overlay (streaming.rs `refresh_section_overlay`)
             // keys its cache on this same per-section counter, so it re-derives
@@ -460,7 +491,9 @@ impl World {
             self.section_edit_chunks.entry(pos).or_default().insert(chunk);
             self.section_overlay_dirty.insert(pos);
         }
-        self.pending_sections.set();
+        if any {
+            self.pending_sections.set();
+        }
     }
 
     /// All edits as world coordinates and blocks for saving.

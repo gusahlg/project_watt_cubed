@@ -66,11 +66,12 @@ impl Coverage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::Face;
     use crate::ident::Detail;
     use crate::world::section::FINEST_DETAIL;
 
     fn cell(x: i32, detail: i8) -> (SectionPos, QuadrantMask) {
-        (SectionPos { detail: Detail(detail), x, z: 0 }, QuadrantMask::ALL)
+        (SectionPos { body: 0, face: Face::PosY, detail: Detail(detail), x, z: 0 }, QuadrantMask::ALL)
     }
 
     /// A cut replaces the prior one wholesale in one frame (hard pop): exactly the new
@@ -113,7 +114,7 @@ mod tests {
     /// step 2 mutates a region's mask without an enter/leave transition at all.
     #[test]
     fn patch_stream_reproduces_the_reference_draw_walk() {
-        let pos = |x: i32| SectionPos { detail: Detail(FINEST_DETAIL.0 + 1), x, z: 0 };
+        let pos = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: Detail(FINEST_DETAIL.0 + 1), x, z: 0 };
         let script: Vec<Vec<(SectionPos, QuadrantMask)>> = (1..=15u8)
             .flat_map(|b| {
                 [
