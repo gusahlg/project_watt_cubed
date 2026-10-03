@@ -217,4 +217,35 @@ mod tests {
         }
         assert_eq!(w.uniform(ChunkCoord::new((STORAGE_X0 / CS) as i32 - 5, 0, 0)), Some(AIR));
     }
+
+    /// Storage chunk cost at the surface of each charted body (release:
+    /// `cargo test --release --lib storage_chunk_cost -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn storage_chunk_cost() {
+        let (w, _) = worlds();
+        for c in &w.worlds {
+            let atlas = &c.round.atlas;
+            let b = atlas.bands[0];
+            let patch = Patch::Shell { band: 0, face: crate::coord::Face::PosX };
+            let mut chunks = Vec::new();
+            for k in 0..64i64 {
+                let (i, j) = (b.n / 2 + k * 16, b.n / 3 + (k % 8) * 16);
+                let surf = c.round.column_surface(patch, i, j);
+                for dy in [-24i64, -8, 8] {
+                    let s = atlas.storage(patch, [i, surf + dy, j]);
+                    chunks.push(ChunkCoord::new((s[0] / CS) as i32, (s[1] / CS) as i32, (s[2] / CS) as i32));
+                }
+            }
+            let t = std::time::Instant::now();
+            let mut solid = 0usize;
+            for &k in &chunks {
+                if !matches!(w.generate(k), ChunkData::Uniform(AIR)) {
+                    solid += 1;
+                }
+            }
+            let per = t.elapsed().as_secs_f64() * 1e6 / chunks.len() as f64;
+            eprintln!("{:?}: {per:.0} µs per surface chunk ({solid}/{} not air)", c.round.style(), chunks.len());
+        }
+    }
 }

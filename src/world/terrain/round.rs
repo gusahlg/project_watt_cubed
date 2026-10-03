@@ -15,6 +15,8 @@ use crate::block::registry::{AIR, BlockId};
 use crate::space::atlas::{Atlas, Patch};
 use crate::world::chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkData};
 
+const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
+
 /// What a round world looks like.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Style {
@@ -41,6 +43,10 @@ pub struct Round {
 
 /// Grid spacing of tree / spire sites, in cells.
 const SITE: i64 = 24;
+/// Spacing (cells) of the lattice the relief and cave fields are sampled on; cells interpolate
+/// between nodes (the fields are smooth at that scale). Nodes on a chart edge are the same physical
+/// points from both sides, so the surface stays continuous across seams.
+const LATTICE: i64 = 4;
 /// Sites stay this far inside a chart's box so nothing they paint crosses a seam.
 const SITE_MARGIN: i64 = 14;
 
@@ -188,6 +194,11 @@ impl Round {
         h as f32
     }
 
+    /// The painter's style.
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
     /// Storage y of the first open cell of shell column `(i, j)`.
     pub fn column_surface(&self, patch: Patch, i: i64, j: i64) -> i64 {
         self.column(patch, i, j).surface
@@ -210,8 +221,27 @@ impl Round {
         }
     }
 
+    /// Relief at lattice node `(i, j)` (a cell corner) of a shell patch.
+    fn relief_node(&self, patch: Patch, i: i64, j: i64) -> f32 {
+        let centre = self.atlas.centre;
+        let dir = (self.atlas.embed(patch, DVec3::new(i as f64, 0.5, j as f64)) - centre).normalize();
+        self.relief(centre + dir * self.atlas.radius as f64)
+    }
+
+    /// Relief of column `(i, j)`: bilinear between its four lattice nodes.
+    fn relief_at(&self, patch: Patch, i: i64, j: i64) -> f32 {
+        let (i0, j0) = (i.div_euclid(LATTICE) * LATTICE, j.div_euclid(LATTICE) * LATTICE);
+        let n = |a: i64, b: i64| self.relief_node(patch, i0 + a * LATTICE, j0 + b * LATTICE);
+        bilerp([[n(0, 0), n(0, 1)], [n(1, 0), n(1, 1)]], i - i0, j - j0)
+    }
+
     /// The column at chart cell `(i, j)` of a shell patch.
     fn column(&self, patch: Patch, i: i64, j: i64) -> Column {
+        self.column_with(patch, i, j, self.relief_at(patch, i, j))
+    }
+
+    /// The column at chart cell `(i, j)` given its relief `h`.
+    fn column_with(&self, patch: Patch, i: i64, j: i64, h: f32) -> Column {
         let b = match patch {
             Patch::Shell { band, .. } => self.atlas.bands[band as usize],
             _ => unreachable!("columns belong to shell charts"),
@@ -219,7 +249,7 @@ impl Round {
         let centre = self.atlas.centre;
         let dir = (self.atlas.embed(patch, DVec3::new(i as f64 + 0.5, 0.5, j as f64 + 0.5)) - centre).normalize();
         let datum = self.atlas.radius as f64;
-        let h = self.relief(centre + dir * datum) as f64;
+        let h = h as f64;
         // Outward charts count storage y up from r_lo; inward ones from r_hi toward the centre.
         let surface = if self.atlas.inward { b.r_hi as f64 - (datum - h) } else { datum + h - b.r_lo as f64 };
         let m = &self.m;
@@ -256,13 +286,34 @@ impl Round {
         }
     }
 
-    /// Whether a cave carves the cell at physical point `p`, `d` cells under the surface.
-    fn cave(&self, p: DVec3, d: i64) -> bool {
+    /// The two cave fields at lattice node `l` (a cell corner) of a patch.
+    fn cave_node(&self, patch: Patch, l: [i64; 3]) -> [f32; 2] {
+        let p = self.atlas.embed(patch, DVec3::new(l[0] as f64, l[1] as f64, l[2] as f64)) / 48.0;
+        [perlin3(self.salt(10), p.x, p.y, p.z), perlin3(self.salt(11), p.x, p.y, p.z)]
+    }
+
+    /// The eight cave nodes around cell `l`, indexed `[x][y][z]` from its lattice corner.
+    fn cave_cube(&self, patch: Patch, l: [i64; 3]) -> [[[[f32; 2]; 2]; 2]; 2] {
+        let o = l.map(|v| v.div_euclid(LATTICE) * LATTICE);
+        std::array::from_fn(|x| {
+            std::array::from_fn(|y| {
+                std::array::from_fn(|z| {
+                    self.cave_node(patch, [o[0] + x as i64 * LATTICE, o[1] + y as i64 * LATTICE, o[2] + z as i64 * LATTICE])
+                })
+            })
+        })
+    }
+
+    /// Whether a cave carves cell `l`, `d` cells under the surface, from the cave nodes around it.
+    fn cave(&self, cube: &[[[[f32; 2]; 2]; 2]; 2], l: [i64; 3], d: i64) -> bool {
         if !(5..400).contains(&d) {
             return false;
         }
-        let a = perlin3(self.salt(10), p.x / 48.0, p.y / 48.0, p.z / 48.0);
-        let b = perlin3(self.salt(11), p.x / 48.0, p.y / 48.0, p.z / 48.0);
+        let f = l.map(|v| v.rem_euclid(LATTICE));
+        let field = |k: usize| {
+            trilerp(std::array::from_fn(|x| std::array::from_fn(|y| std::array::from_fn(|z| cube[x][y][z][k]))), f)
+        };
+        let (a, b) = (field(0), field(1));
         let r = 0.07 + 0.05 * (d as f32 / 400.0);
         a * a + b * b < r * r
     }
@@ -338,11 +389,17 @@ impl Round {
     }
 
     /// The block of a shell cell given its column and the plants around it.
-    fn shell_cell(&self, patch: Patch, col: &Column, plants: &[Plant], l: [i64; 3]) -> BlockId {
+    /// `caves` gives the cave nodes around `l` (only asked for cells under the surface).
+    fn shell_cell(
+        &self,
+        col: &Column,
+        plants: &[Plant],
+        l: [i64; 3],
+        caves: impl FnOnce() -> [[[[f32; 2]; 2]; 2]; 2],
+    ) -> BlockId {
         let d = col.surface - l[1];
         if d >= 1 {
-            let p = self.atlas.embed(patch, DVec3::new(l[0] as f64 + 0.5, l[1] as f64 + 0.5, l[2] as f64 + 0.5));
-            if self.cave(p, d) { AIR } else { self.ground(col, d) }
+            if (5..400).contains(&d) && self.cave(&caves(), l, d) { AIR } else { self.ground(col, d) }
         } else {
             self.plant(plants, l[0], l[1], l[2]).unwrap_or(AIR)
         }
@@ -357,7 +414,7 @@ impl Round {
                 let col = self.column(patch, l[0], l[2]);
                 let mut plants = Vec::new();
                 self.plants_near(patch, size[0], l[0], l[0], l[2], l[2], &mut plants);
-                self.shell_cell(patch, &col, &plants, l)
+                self.shell_cell(&col, &plants, l, || self.cave_cube(patch, l))
             }
             // The deep interior: rock, then the heart.
             Patch::Transition { .. } => self.heart().0,
@@ -376,18 +433,75 @@ impl Round {
         let (_, size) = self.atlas.storage_box(patch);
         let mut plants = Vec::new();
         self.plants_near(patch, size[0], l0[0], l0[0] + n - 1, l0[2], l0[2] + n - 1, &mut plants);
+        // The relief lattice over the chunk's columns, then its columns.
+        const NODES: usize = CHUNK_SIZE / LATTICE as usize + 1;
+        let relief: [[f32; NODES]; NODES] = std::array::from_fn(|a| {
+            std::array::from_fn(|b| self.relief_node(patch, l0[0] + a as i64 * LATTICE, l0[2] + b as i64 * LATTICE))
+        });
+        let cols: Vec<Column> = (0..CHUNK_AREA)
+            .map(|k| {
+                let (lx, lz) = (k % CHUNK_SIZE, k / CHUNK_SIZE);
+                let (a, b) = (lx / LATTICE as usize, lz / LATTICE as usize);
+                let h = bilerp(
+                    [[relief[a][b], relief[a][b + 1]], [relief[a + 1][b], relief[a + 1][b + 1]]],
+                    lx as i64 % LATTICE,
+                    lz as i64 % LATTICE,
+                );
+                self.column_with(patch, l0[0] + lx as i64, l0[2] + lz as i64, h)
+            })
+            .collect();
+        // The cave lattice, filled only if some cell of the chunk lies in the cave band.
+        let top = l0[1] + n - 1;
+        let caves_here = cols.iter().any(|c| c.surface - top < 400 && c.surface - l0[1] >= 5);
+        let cave_nodes: Vec<[f32; 2]> = if caves_here {
+            (0..NODES * NODES * NODES)
+                .map(|k| {
+                    let (x, y, z) = (k % NODES, k / NODES % NODES, k / (NODES * NODES));
+                    self.cave_node(patch, [l0[0] + x as i64 * LATTICE, l0[1] + y as i64 * LATTICE, l0[2] + z as i64 * LATTICE])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut cells = Box::new([AIR; CHUNK_VOLUME]);
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 let (i, j) = (l0[0] + lx as i64, l0[2] + lz as i64);
-                let col = self.column(patch, i, j);
+                let col = &cols[lx + lz * CHUNK_SIZE];
                 for ly in 0..CHUNK_SIZE {
-                    cells[Chunk::index(lx, ly, lz)] = self.shell_cell(patch, &col, &plants, [i, l0[1] + ly as i64, j]);
+                    let l = [i, l0[1] + ly as i64, j];
+                    let cube = || {
+                        let (bx, by, bz) = (lx / LATTICE as usize, ly / LATTICE as usize, lz / LATTICE as usize);
+                        std::array::from_fn(|x| {
+                            std::array::from_fn(|y| {
+                                std::array::from_fn(|z| cave_nodes[(bx + x) + (by + y) * NODES + (bz + z) * NODES * NODES])
+                            })
+                        })
+                    };
+                    cells[Chunk::index(lx, ly, lz)] = self.shell_cell(col, &plants, l, cube);
                 }
             }
         }
         ChunkData::from_cells(cells)
     }
+}
+
+/// Bilinear between lattice nodes `h[a][b]` at cell offset `(di, dj)` (`0..LATTICE`) from node
+/// `[0][0]`, sampled at the cell's centre.
+fn bilerp(h: [[f32; 2]; 2], di: i64, dj: i64) -> f32 {
+    let (fx, fz) = ((di as f32 + 0.5) / LATTICE as f32, (dj as f32 + 0.5) / LATTICE as f32);
+    let lo = h[0][0] + (h[1][0] - h[0][0]) * fx;
+    let hi = h[0][1] + (h[1][1] - h[0][1]) * fx;
+    lo + (hi - lo) * fz
+}
+
+/// Trilinear between lattice nodes `v[x][y][z]` at cell offset `f` (`0..LATTICE` per axis), sampled
+/// at the cell's centre.
+fn trilerp(v: [[[f32; 2]; 2]; 2], f: [i64; 3]) -> f32 {
+    let t = f.map(|k| (k as f32 + 0.5) / LATTICE as f32);
+    let x = |y: usize, z: usize| v[0][y][z] + (v[1][y][z] - v[0][y][z]) * t[0];
+    let (y0, y1) = (x(0, 0) + (x(0, 1) - x(0, 0)) * t[2], x(1, 0) + (x(1, 1) - x(1, 0)) * t[2]);
+    y0 + (y1 - y0) * t[1]
 }
 
 /// A tree or spire: base column, base storage y, trunk half-width, height, crown radius.
@@ -498,12 +612,16 @@ mod tests {
         let patch = Patch::Shell { band: 0, face: Face::NegX };
         let (i, j) = (b.n / 2, b.n / 2);
         let col = r.column(patch, i, j);
-        let s = r.atlas.storage(patch, [i, col.surface, j]);
-        let c = [s[0].div_euclid(16), s[1].div_euclid(16), s[2].div_euclid(16)];
-        let data = r.fill_chunk(c);
-        for (lx, ly, lz) in [(0, 0, 0), (5, 9, 3), (15, 15, 15), (8, 1, 12)] {
-            let cell = [c[0] * 16 + lx as i64, c[1] * 16 + ly as i64, c[2] * 16 + lz as i64];
-            assert_eq!(data.get(Chunk::index(lx, ly, lz)), r.voxel(cell));
+        // The surface chunk and two in the cave band: every cell.
+        for depth in [0, 40, 130] {
+            let s = r.atlas.storage(patch, [i, col.surface - depth, j]);
+            let c = [s[0].div_euclid(16), s[1].div_euclid(16), s[2].div_euclid(16)];
+            let data = r.fill_chunk(c);
+            for k in 0..CHUNK_VOLUME {
+                let (lx, ly, lz) = (k % 16, k / 256, k / 16 % 16);
+                let cell = [c[0] * 16 + lx as i64, c[1] * 16 + ly as i64, c[2] * 16 + lz as i64];
+                assert_eq!(data.get(Chunk::index(lx, ly, lz)), r.voxel(cell), "{style:?} depth {depth} cell {lx},{ly},{lz}");
+            }
         }
     }
 }
