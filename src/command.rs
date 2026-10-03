@@ -73,6 +73,7 @@ commands! {
     "audio" | "volume", "  audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
     "voicetest", "  voicetest            play a local voice test cue" => voicetest();
     "name", "  name <n> <text>      name a recorded crafting procedure" => rejected(vec!["name: no procedure journal (is the crafting mod enabled?)".to_string()]);
+    "gravity" | "g", "  gravity              show the local pull of the matter around you" => gravity(player, world);
     "help" | "?", "  help                 show this list" => help();
 }
 
@@ -389,6 +390,34 @@ fn reactions(world: &World) -> Vec<Line> {
 }
 
 /// Format a position the same way the on-screen coordinate readout does.
+/// `/gravity` — the field at the player: strength, direction, tilt from the ground's grid axis, the
+/// potential, the declared error and the source epoch.
+fn gravity(player: &Player, world: &World) -> Vec<Line> {
+    let s = world.gravity_at(player.position);
+    let g = s.accel.length();
+    let metres = crate::math::BLOCK_METERS;
+    let mut out = vec![format!(
+        "gravity: {:.3} m/s² ({:.1} % of the spawn pull)",
+        g * metres,
+        100.0 * g / crate::player::STANDARD_GRAVITY
+    )];
+    match s.up(0.02 * crate::player::STANDARD_GRAVITY) {
+        Some(up) => {
+            let n = player.up_axis.normal_dvec();
+            let tilt = up.dot(n).clamp(-1.0, 1.0).acos().to_degrees();
+            out.push(format!("down: ({:.4}, {:.4}, {:.4}); {tilt:.3}° off the {:?} grid axis", -up.x, -up.y, -up.z, player.up_axis));
+        }
+        None => out.push("weightless: the body keeps its orientation".to_string()),
+    }
+    out.push(format!(
+        "potential {:.4e} blocks²/s², error ≤ {:.2e} m/s², source epoch {}",
+        s.potential,
+        s.error * metres,
+        s.epoch
+    ));
+    shown(out)
+}
+
 fn fmt_pos(p: DVec3) -> String {
     format!("X {:.1}  Y {:.1}  Z {:.1}", p.x, p.y, p.z)
 }
@@ -437,6 +466,7 @@ mod tests {
              audio <chan> <0-100> set master/effects/voice volume\n  \
              voicetest            play a local voice test cue\n  \
              name <n> <text>      name a recorded crafting procedure\n  \
+             gravity              show the local pull of the matter around you\n  \
              help                 show this list"
         );
     }
