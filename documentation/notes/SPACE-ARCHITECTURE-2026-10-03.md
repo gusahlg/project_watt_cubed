@@ -32,8 +32,9 @@ InfiniteDiffusion v4 universe. Every task directive refers back to the section n
 ## 2. Units and laws
 
 - One block = one world unit (`BLOCK_METERS = 0.85` m). Positions are `f64` (`DVec3`), cells `i32`,
-  universe bounded by `WORLD_BORDER = 1e9` (kept). Curved-chart *storage* lives in `|coord| ∈ [1.1e9, 2.0e9]`
-  (§7) and is never a physical position.
+  universe bounded by `WORLD_BORDER = 1e9` (physical movement clamps there). Curved-chart *storage* lives at
+  `x ∈ [1.1e9, 2.0e9]` (§7) and is never a physical position; `math::block_coord` resolves cells up to
+  `CELL_LIMIT = 2.05e9` (still i32-safe for chunk math).
 - **Amount** of a cell = occurrence count of its configuration (`0..=32`, exact, conserved by the law:
   selective transfer moves occurrences and never changes coordinates). **Mass = amount × 1 unit.**
   Gravitational and inertial mass agree by construction (guide §7.2 row 1). Air = 0.
@@ -48,8 +49,10 @@ InfiniteDiffusion v4 universe. Every task directive refers back to the section n
 - **Gravity sample** (`gravity::Sample`): `accel: DVec3`, `potential: f64`, `tidal: Option<DMat3>`,
   `error: f64` (bound on |Δaccel|), `epoch: u64` (source epoch). Never normalise `accel` without the
   zero-g threshold (§5.4).
-- Flat vanilla world: a finite slab (`FLAT_HALF = 1e8` horizontally, thickness calibrated so g = 24
-  m/s² at its centre) — its gravity comes from its matter like everything else.
+- Flat vanilla world: a finite slab (`FLAT_HALF = 6e7` horizontally — small enough that its whole field is the
+  exact closed form — and as deep as its own pull needs to be 24 m/s² at the centre, found by bisection) — its
+  gravity comes from its matter like everything else.
+- `/gravity` prints the local field (strength, down, tilt off the grid axis, potential, error, epoch).
 
 ## 3. Coordinates, faces, frames
 
@@ -150,15 +153,26 @@ gravity/mass.rs     amount tables, per-chunk amount/moment summaries, the edit d
 - A round body's atlas = 6 cube-sphere shell charts per depth band (equiangular map; the lab compares
   normalized / equiangular / one adjusted map and documents the choice), angular resolution halving
   per band (1:4 interfaces), and a Cartesian core joined by a 6-block transition shell (guide §10.5).
-- **Storage atlas:** every chart cell has an ordinary `i32` storage address in a reserved storage
-  region (`|x| ≥ 1.1e9`); storage chunks are Y-up (`Sky::Axis(PosY)` = radial). So streaming, light,
-  meshing, edits, saves and the network work on storage cells unchanged. A chunk's **embedding**
-  (identity or chart map) is world state from the generator.
-- Rendering: chart chunk meshes carry a per-mesh cage (engine; quadratic tensor cage, corners
-  computed in f64 relative to an anchor block, so no per-frame rewrite). Collision and picking work in
-  the storage frame of the patch under the player using the local affine map (error ≤ L²/8R per chunk,
-  1.6e-5 blocks at R = 2 M). Seams use the cube-sphere halo index map (cells conform face-to-face across
-  chart edges); the 8 valence-3 corners and band interfaces are the declared exceptional regions.
+- **Storage atlas** (`space::atlas`, implemented): every chart cell has an ordinary `i32` storage address in
+  a box of the reserved region (`STORAGE_X0 = 1.1e9`, one `SLOT = 2^26` of x per atlas; boxes chunk aligned
+  with radii and resolutions multiples of 16, ≥ 64 cells apart); storage `+Y` is the chart's up (outward, or
+  toward the centre for an inner surface — inward charts also flip x so storage stays right-handed). So
+  streaming, light, meshing, edits, saves and the network work on storage cells unchanged. A chunk's
+  **embedding** (identity or chart map) is world state from the generator. `Atlas::shell` builds a single
+  band without a core (the Hollow's two surfaces).
+- **Glue:** a storage cell within two cells outside a box reads as the neighbouring patch's cell holding the
+  same physical point; `Atlas::chunk_across` gives a seam neighbour as a whole chunk plus a signed index
+  remap (exact across chart edges, approximate 1:2 across band interfaces) for mesher halos and light shells.
+- **Rendering:** chart chunk meshes carry an 8-corner trilinear cage (engine task E4; corners computed in f64
+  relative to an anchor block, so no per-frame rewrite; neighbouring chunks share corners, so no cracks;
+  chord error ≤ L²/8R, 1.6e-5 blocks for a chunk at R = 2 M).
+- **Motion** (`movement::update_player_in`, implemented): the player steps in the storage frame of the patch
+  under it — the ordinary axis-aligned collision — with velocity, gravity and the body frame carried through
+  the local Jacobian, walking speed rescaled so physical speed is preserved (the hitbox stays in cells), and the
+  position re-embedded exactly. The 8 valence-3 corners and band interfaces are the declared exceptional
+  regions (stage-0 report).
+- Chart geometry uses `chart::tan_quarter` (Lambert's continued fraction), never the platform `tan`, so
+  generated geometry is bit-identical on every peer.
 - Streaming near a round body streams storage boxes around the chart-mapped eye (one per chart within
   reach; usually 1, up to 3 at corners).
 
@@ -189,7 +203,7 @@ gravity/mass.rs     amount tables, per-chunk amount/moment summaries, the edit d
 3. 5-bit detail and a bounded depth bias.
 4. Far bodies: `Frame3D::set_far_bodies(&[FarBody])` analytic impostors (cube, sphere, shell) in the sky
    pass, lit by the sun, occluding stars.
-5. Curved meshes: per-mesh cage table indexed by the spare `MeshRecord` lane, own cull group/pipeline.
+5. Curved meshes: a per-mesh trilinear cage table indexed by the spare `MeshRecord` lane (task E4).
 
 ## 10. Persistence and network
 
