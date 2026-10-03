@@ -154,13 +154,20 @@ gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + led
 - A round body's atlas = 6 cube-sphere shell charts per depth band (equiangular map; the lab compares
   normalized / equiangular / one adjusted map and documents the choice), angular resolution halving
   per band (1:4 interfaces), and a Cartesian core joined by a 6-block transition shell (guide §10.5).
+- **Which bodies:** every round body of the catalog — Verdance, the Hollow's outer and inner surfaces, the
+  Ember and every moon (`world::terrain::storage`, one slot each in catalog order). Asteroids stay Cartesian.
 - **Storage atlas** (`space::atlas`, implemented): every chart cell has an ordinary `i32` storage address in
-  a box of the reserved region (`STORAGE_X0 = 1.1e9`, one `SLOT = 2^26` of x per atlas; boxes chunk aligned
+  a box of the reserved region (`STORAGE_X0 = 1.1e9`, one `SLOT = 2^25` of x per atlas, boxes side by side
+  along x so no two share a storage column; boxes chunk aligned
   with radii and resolutions multiples of 16, ≥ 64 cells apart); storage `+Y` is the chart's up (outward, or
   toward the centre for an inner surface — inward charts also flip x so storage stays right-handed). So
   streaming, light, meshing, edits, saves and the network work on storage cells unchanged. A chunk's
   **embedding** (identity or chart map) is world state from the generator. `Atlas::shell` builds a single
   band without a core (the Hollow's two surfaces).
+- **Seams in the world** (`world::seam`, implemented): mesher halo, light halo and face shell read across chart
+  seams through the chunk remap; neighbour triggers use `World::neighbour`; `block_at`/`collides` glue; storage
+  edits weigh at their embedded cell. Motion (`update_player_in`) and picking (charted raycast) run in the patch
+  underfoot; the server judges reach physically (`atlas::embed_cell`).
 - **Glue:** a storage cell within two cells outside a box reads as the neighbouring patch's cell holding the
   same physical point; `Atlas::chunk_across` gives a seam neighbour as a whole chunk plus a signed index
   remap (exact across chart edges, approximate 1:2 across band interfaces) for mesher halos and light shells.

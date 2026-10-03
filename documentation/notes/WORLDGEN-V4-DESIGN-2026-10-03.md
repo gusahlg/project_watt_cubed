@@ -43,9 +43,10 @@ Coordinates are world blocks (i32 cells, f64 positions); the universe is bounded
      glowing core body whose faint pull draws everything inward.
   4. (optional) **Ember** — a small molten round world.
   Phase A ships HOME + the Twins + space; round worlds arrive with the curved charts.
-- **Moons** (Level 0.5): 2 around HOME at 3e7–8e7 from its centre (round, radius 3e5–1e6, Cartesian
-  cells: their gravity is a few % of home so the grid's stair-steps read as rubble slopes), 1–2 around
-  each big body.
+- **Moons** (Level 0.5): 2 around HOME and 1–2 around each big body, 5–7 parent reaches out (radius
+  0.6–1.5 M). Like every round body (Verdance, the Hollow's two surfaces, the Ember) they are painted on
+  curved charts in storage (`terrain::storage`, `terrain::round` styles), so their ground is level under
+  their own pull everywhere — no grid stair-steps. Only small rocks (asteroids) are Cartesian.
 - **Clusters** (Level 1): cells of `2^24` blocks; a cell holds a cluster with probability ~3 % (× the
   `space` knob), never within 3 radii of a big body. A cluster is a swarm (sphere), a belt (flattened
   disk) or a stream (elongated), radius 5e4–2e6, 50–2000 bodies with power-law radii (most 3–30,
