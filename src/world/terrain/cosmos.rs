@@ -562,6 +562,21 @@ impl Cosmos {
 
     /// Every rock whose sub-cell overlaps the cell box `[lo, hi]` (inclusive), pushed to `out`.
     pub fn rocks_touching(&self, lo: [i64; 3], hi: [i64; 3], out: &mut Vec<Rock>) {
+        self.visit_rocks(lo, hi, 0..CLASSES.len(), |r| out.push(*r));
+    }
+
+    /// Rocks of size class `class` (0 = pebbles, 3 = the largest) whose sub-cell overlaps the
+    /// inclusive cell box `[lo, hi]`. Empty cluster cells are skipped, so open space is a few
+    /// cell hashes; a hit scans only that class's sub-cells (O(box / edge³)).
+    pub fn for_class_rocks(&self, class: usize, lo: [i64; 3], hi: [i64; 3], f: impl FnMut(&Rock)) {
+        if class < CLASSES.len() {
+            self.visit_rocks(lo, hi, class..class + 1, f);
+        }
+    }
+
+    /// Rocks of `classes` whose sub-cell overlaps `[lo, hi]`. Cluster cells gate the scan:
+    /// a cell with no cluster is one hash, and a cluster that cannot reach the box is skipped.
+    fn visit_rocks(&self, lo: [i64; 3], hi: [i64; 3], classes: std::ops::Range<usize>, mut f: impl FnMut(&Rock)) {
         let cl = |v: i64| v.div_euclid(CELL) as i32;
         for x in cl(lo[0])..=cl(hi[0]) {
             for y in cl(lo[1])..=cl(hi[1]) {
@@ -573,14 +588,14 @@ impl Cosmos {
                     if !near {
                         continue;
                     }
-                    for k in 0..CLASSES.len() {
+                    for k in classes.clone() {
                         let edge = CLASSES[k].0;
                         let s = |v: i64| v.div_euclid(edge);
                         for sx in s(lo[0])..=s(hi[0]) {
                             for sy in s(lo[1])..=s(hi[1]) {
                                 for sz in s(lo[2])..=s(hi[2]) {
                                     if let Some(r) = self.rock(c, k, [sx, sy, sz]) {
-                                        out.push(r);
+                                        f(&r);
                                     }
                                 }
                             }
@@ -777,6 +792,25 @@ mod tests {
             }
         }
         let _ = found;
+    }
+
+    #[test]
+    fn for_class_rocks_is_the_class_slice_of_the_box() {
+        let cosmos = Cosmos::new(42, 1.0);
+        let c = cosmos.clusters[0];
+        let ctr = [c.centre.x as i64, c.centre.y as i64, c.centre.z as i64];
+        let lo = [ctr[0] - 512, ctr[1] - 512, ctr[2] - 512];
+        let hi = [ctr[0] + 512, ctr[1] + 512, ctr[2] + 512];
+        let mut all = Vec::new();
+        cosmos.rocks_touching(lo, hi, &mut all);
+        let mut split = Vec::new();
+        for k in 0..CLASSES.len() {
+            cosmos.for_class_rocks(k, lo, hi, |r| split.push(*r));
+        }
+        assert_eq!(split, all);
+        let mut none = 0;
+        cosmos.for_class_rocks(9, lo, hi, |_| none += 1);
+        assert_eq!(none, 0);
     }
 
     /// `cargo test --lib cosmos_report -- --ignored --nocapture`: the catalog of a seed.

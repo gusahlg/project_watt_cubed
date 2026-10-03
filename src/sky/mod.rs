@@ -11,6 +11,7 @@ mod atmosphere;
 mod bodies;
 mod clock;
 pub mod palette;
+mod rocks;
 mod weather;
 
 pub use atmosphere::Atmosphere;
@@ -23,6 +24,12 @@ use voxel_engine::{DVec3, Frame3D, LinearRgb, SkyDesc, Vec3};
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
+
+/// Half-extent, in blocks, of a chunk view of `view_chunks` rings. The eye sits
+/// inside its own chunk, so one extra chunk covers the far block of the ring.
+pub(crate) fn chunk_view_blocks(view_chunks: i32) -> f64 {
+    rocks::chunk_view_blocks(view_chunks)
+}
 
 /// The warm sun-disc tint. Authored as display-space sRGB literals, decoded to
 /// linear, and handed to the engine boundary UNCHANGED (`to_linear`, no clamp) —
@@ -44,6 +51,8 @@ pub struct Sky {
     pub day_length: DayLength,
     /// Reused list of planets, moons and the home cube for the sky pass.
     far: bodies::FarBodies,
+    /// Reused distant-asteroid boxes.
+    rocks: rocks::DistantRocks,
 }
 
 impl Sky {
@@ -84,19 +93,23 @@ impl Sky {
         }
     }
 
-    /// Draw the procedural sky and the far-body impostors. Only sun geometry +
-    /// disc tint cross here; the gradient/glow colours are read GPU-side from the
-    /// shared per-frame UBO (the same linear source the terrain fog reads), so
-    /// the sky and the fog it blends into cannot diverge. The engine clears its
-    /// draw lists every frame, so both are pushed every frame.
+    /// Draw the procedural sky, the far-body impostors and distant asteroids.
+    /// Only sun geometry + disc tint cross here; the gradient/glow colours are
+    /// read GPU-side from the shared per-frame UBO (the same linear source the
+    /// terrain fog reads), so the sky and the fog it blends into cannot diverge.
+    /// The engine clears its draw lists every frame, so all of them are pushed
+    /// every frame. `view_blocks` is the chunk view's reach: rocks inside it are
+    /// voxels, and [`chunk_view_blocks`] turns a render distance into one.
     pub fn draw(
         &mut self,
         f: &mut Frame3D,
         frame: SkyFrame,
         eye: DVec3,
         generator: &dyn TerrainGenerator,
+        view_blocks: f64,
     ) {
         f.set_sky(self.desc(frame));
         f.set_far_bodies(self.far.update(generator, eye));
+        self.rocks.draw(f, generator, eye, view_blocks);
     }
 }
