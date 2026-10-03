@@ -344,7 +344,8 @@ impl Game {
             f3.set_local_frame(scene.sky_ctx.up.as_vec3(), scene.sky_ctx.altitude as f32);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
-                self.sky.draw(&mut f3, scene.sky_frame);
+                self.sky
+                    .draw(&mut f3, scene.sky_frame, pose.eye, self.world.terrain());
             }
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListWorld);
             self.world.render(&mut f3, pose.eye);

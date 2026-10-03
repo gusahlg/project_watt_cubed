@@ -130,6 +130,11 @@ pub trait TerrainGenerator: Send + Sync {
         Arc::new(gravity::Empty)
     }
 
+    /// The body's catalog, when this generator has one. A flat world has none.
+    fn cosmos(&self) -> Option<&super::terrain::cosmos::Cosmos> {
+        None
+    }
+
     /// Topmost non-ground cell in this column (the PosY surface).
     fn height(&self, wx: i32, wz: i32) -> i32;
 

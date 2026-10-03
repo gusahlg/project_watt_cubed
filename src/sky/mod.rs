@@ -8,6 +8,7 @@
 //! owns [`Sky::clear_at`] (flat clear) and [`Sky::draw`] (the procedural
 //! background pass).
 mod atmosphere;
+mod bodies;
 mod clock;
 pub mod palette;
 mod weather;
@@ -18,9 +19,10 @@ pub use clock::{DayLength, SkyClock, SkyFrame};
 pub use weather::Precip;
 pub use weather::Weather;
 
-use voxel_engine::{Frame3D, LinearRgb, SkyDesc, Vec3};
+use voxel_engine::{DVec3, Frame3D, LinearRgb, SkyDesc, Vec3};
 
 use crate::sky::palette::Rgb;
+use crate::world::generation::TerrainGenerator;
 
 /// The warm sun-disc tint. Authored as display-space sRGB literals, decoded to
 /// linear, and handed to the engine boundary UNCHANGED (`to_linear`, no clamp) —
@@ -40,6 +42,8 @@ pub struct Sky {
     pub weather: Weather,
     /// How long a full day/night cycle lasts, in real seconds.
     pub day_length: DayLength,
+    /// Reused list of planets, moons and the home cube for the sky pass.
+    far: bodies::FarBodies,
 }
 
 impl Sky {
@@ -80,13 +84,19 @@ impl Sky {
         }
     }
 
-    /// Draw the procedural sky. Only sun geometry + disc tint cross here; the
-    /// gradient/glow colours are read GPU-side from the shared per-frame UBO (the
-    /// same linear source the terrain fog reads), so the sky and the fog
-    /// it blends into cannot diverge. The engine clears its draw lists every
-    /// frame, so the descriptor is pushed every frame (a 40-byte copy): skipping
-    /// an unchanged one left every frame after the first without a sky pass.
-    pub fn draw(&self, f: &mut Frame3D, frame: SkyFrame) {
+    /// Draw the procedural sky and the far-body impostors. Only sun geometry +
+    /// disc tint cross here; the gradient/glow colours are read GPU-side from the
+    /// shared per-frame UBO (the same linear source the terrain fog reads), so
+    /// the sky and the fog it blends into cannot diverge. The engine clears its
+    /// draw lists every frame, so both are pushed every frame.
+    pub fn draw(
+        &mut self,
+        f: &mut Frame3D,
+        frame: SkyFrame,
+        eye: DVec3,
+        generator: &dyn TerrainGenerator,
+    ) {
         f.set_sky(self.desc(frame));
+        f.set_far_bodies(self.far.update(generator, eye));
     }
 }
