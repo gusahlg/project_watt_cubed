@@ -9,13 +9,32 @@
 
 use std::sync::Arc;
 
+use glam::DVec3;
+
 use super::Materials;
-use super::cosmos::{Cosmos, Kind, RELIEF, Shape};
+use super::cosmos::{Body, Cosmos, Kind, RELIEF, Shape};
 use super::round::{Round, Style};
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::ChunkCoord;
 use crate::space::atlas::{Atlas, Patch, STORAGE_X0};
 use crate::world::chunk::{CHUNK_SIZE, ChunkData};
+
+/// Unit direction from a moon's parent (the nearest body that is not a moon and not the Ember,
+/// which shares the Hollow's centre) out to the moon. Ice caps face this way.
+fn parent_pole(bodies: &[Body], moon: &Body) -> DVec3 {
+    let c = moon.centre_f();
+    let parent = bodies.iter().filter(|b| b.id != moon.id && b.kind != Kind::Moon && b.kind != Kind::Ember).min_by(|a, b| {
+        (a.centre_f() - c).length_squared().total_cmp(&(b.centre_f() - c).length_squared())
+    });
+    match parent {
+        Some(p) => {
+            let d = c - p.centre_f();
+            let len = d.length();
+            if len > 1.0 { d / len } else { DVec3::Y }
+        }
+        None => DVec3::Y,
+    }
+}
 
 const CS: i64 = CHUNK_SIZE as i64;
 /// Storage y no relief reaches below its datum by (with the deepest caves under it): band-0 chunks
@@ -41,7 +60,7 @@ impl StorageWorlds {
     pub fn new(cosmos: &Cosmos, m: &Arc<Materials>) -> Self {
         let mut worlds = Vec::new();
         let mut slot = 0u32;
-        let add = |atlas: Atlas, seed: u32, style: Style, worlds: &mut Vec<Charted>| {
+        let add = |atlas: Atlas, seed: u32, style: Style, pole: DVec3, worlds: &mut Vec<Charted>| {
             let boxes = atlas
                 .patches()
                 .map(|p| {
@@ -49,16 +68,18 @@ impl StorageWorlds {
                     (p, o.map(|v| v / CS), std::array::from_fn(|a| (o[a] + size[a]) / CS))
                 })
                 .collect();
-            worlds.push(Charted { round: Round::new(atlas, seed, style, m.clone()), boxes });
+            worlds.push(Charted { round: Round::new(atlas, seed, style, m.clone(), pole), boxes });
         };
-        for b in cosmos.bodies() {
+        // Copied so a moon can look up its parent while the loop still holds a body.
+        let bodies = cosmos.bodies().to_vec();
+        for b in &bodies {
             let c = b.centre_f();
             match (b.kind, b.shape) {
                 (_, Shape::Cube { .. }) => {}
                 (Kind::Hollow, Shape::Shell { outer, inner }) => {
                     let mid = (outer + inner) / 2;
-                    add(Atlas::shell(c, outer, mid, outer + RELIEF, false, slot), b.seed, Style::HollowOuter, &mut worlds);
-                    add(Atlas::shell(c, inner, inner - RELIEF, mid, true, slot + 1), b.seed ^ 0x1A2B, Style::HollowInner, &mut worlds);
+                    add(Atlas::shell(c, outer, mid, outer + RELIEF, false, slot), b.seed, Style::HollowOuter, DVec3::ZERO, &mut worlds);
+                    add(Atlas::shell(c, inner, inner - RELIEF, mid, true, slot + 1), b.seed ^ 0x1A2B, Style::HollowInner, DVec3::ZERO, &mut worlds);
                     slot += 2;
                 }
                 (_, Shape::Shell { .. }) => {}
@@ -68,7 +89,8 @@ impl StorageWorlds {
                         Kind::Ember => Style::Ember,
                         _ => Style::Moon { tone: (b.seed % 3) as u8 },
                     };
-                    add(Atlas::new(c, r, r + RELIEF, false, slot), b.seed, style, &mut worlds);
+                    let pole = if kind == Kind::Moon { parent_pole(&bodies, b) } else { DVec3::ZERO };
+                    add(Atlas::new(c, r, r + RELIEF, false, slot), b.seed, style, pole, &mut worlds);
                     slot += 1;
                 }
             }

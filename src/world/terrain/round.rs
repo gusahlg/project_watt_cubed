@@ -1,9 +1,9 @@
-//! Round worlds on curved charts: Verdance's giant forests, the Hollow's two surfaces (an icy crust
-//! outside, crystal forests hanging toward the centre inside), the molten Ember and the cratered
-//! moons. Each is painted in its atlas's
-//! storage cells, where storage `+Y` is the chart's up, so terrain is a height field per chart
-//! column. Heights come from 3-D noise at the physical point on the datum sphere above the column,
-//! so the surface is continuous across chart seams. Pure in `(seed, cell)`.
+//! Round worlds on curved charts: Verdance's giant forests, lakes and meadows, the Hollow's two
+//! surfaces (an icy crust outside, crystal forests hanging toward the Ember inside), the molten
+//! Ember and the cratered moons. Each is painted in its atlas's storage cells, where storage `+Y`
+//! is the chart's up, so terrain is a height field per chart column. Heights come from 3-D noise
+//! at the physical point on the datum sphere above the column, so the surface is continuous across
+//! chart seams. Pure in `(seed, cell)`.
 
 use std::sync::Arc;
 
@@ -38,6 +38,8 @@ pub struct Round {
     pub atlas: Atlas,
     seed: u32,
     style: Style,
+    /// Unit direction of a moon's ice cap: from the parent toward the moon. Zero for every other style.
+    pole: DVec3,
     m: Arc<Materials>,
 }
 
@@ -49,6 +51,9 @@ const SITE: i64 = 24;
 const LATTICE: i64 = 4;
 /// Sites stay this far inside a chart's box so nothing they paint crosses a seam.
 const SITE_MARGIN: i64 = 14;
+/// Verdant waterline. Lows flood toward it; the mask is a function of the physical point, so a lake
+/// has no cliff and the seam stays continuous. Still water is solid frost over ice.
+const SHORE: f32 = 72.0;
 
 /// One column of a chart: where its surface is (storage y of the first open cell) and how it is dressed.
 #[derive(Clone, Copy, Debug)]
@@ -92,8 +97,8 @@ fn smoothstep(a: f32, b: f32, t: f32) -> f32 {
 }
 
 impl Round {
-    pub fn new(atlas: Atlas, seed: u32, style: Style, m: Arc<Materials>) -> Self {
-        Self { atlas, seed, style, m }
+    pub fn new(atlas: Atlas, seed: u32, style: Style, m: Arc<Materials>, pole: DVec3) -> Self {
+        Self { atlas, seed, style, pole, m }
     }
 
     fn salt(&self, k: u32) -> u32 {
@@ -105,14 +110,7 @@ impl Round {
     fn relief(&self, p: DVec3) -> f32 {
         let s = |k| self.salt(k);
         match self.style {
-            Style::Verdant => {
-                let cont = 0.5 + 0.7 * fbm3(s(1), p / 9000.0, 4);
-                let ranges = smoothstep(0.55, 0.85, cont);
-                let peaks = if ranges > 0.0 { ridged3(s(2), p / 1700.0, 5) } else { 0.0 };
-                let hills = 34.0 * fbm3(s(3), p / 420.0, 4);
-                let valleys = smoothstep(0.0, 0.12, fbm3(s(4), p / 2600.0, 3).abs());
-                20.0 + 60.0 * cont + hills * (0.4 + 0.6 * valleys) + 900.0 * peaks * peaks * ranges * valleys - 30.0 * (1.0 - valleys)
-            }
+            Style::Verdant => self.apply_lake(p, self.verdant_land(p)),
             Style::HollowOuter => {
                 let crags = ridged3(s(5), p / 900.0, 5);
                 24.0 + 260.0 * crags * crags + 18.0 * fbm3(s(6), p / 150.0, 3)
@@ -128,7 +126,8 @@ impl Round {
             }
             Style::Ember => {
                 let plates = ridged3(s(15), p / 600.0, 4);
-                18.0 + 70.0 * plates * plates + 6.0 * fbm3(s(16), p / 60.0, 2)
+                let base = 18.0 + 70.0 * plates * plates + 6.0 * fbm3(s(16), p / 60.0, 2);
+                base - 18.0 * self.river_mask(p)
             }
         }
     }
@@ -194,6 +193,57 @@ impl Round {
         h as f32
     }
 
+    /// Verdance before lakes: ranges, hills and valleys. A function of the physical point only.
+    fn verdant_land(&self, p: DVec3) -> f32 {
+        let s = |k| self.salt(k);
+        let cont = 0.5 + 0.7 * fbm3(s(1), p / 9000.0, 4);
+        let ranges = smoothstep(0.55, 0.85, cont);
+        let peaks = if ranges > 0.0 { ridged3(s(2), p / 1700.0, 5) } else { 0.0 };
+        let hills = 34.0 * fbm3(s(3), p / 420.0, 4);
+        let valleys = smoothstep(0.0, 0.12, fbm3(s(4), p / 2600.0, 3).abs());
+        20.0 + 60.0 * cont + hills * (0.4 + 0.6 * valleys) + 900.0 * peaks * peaks * ranges * valleys - 30.0 * (1.0 - valleys)
+    }
+
+    /// Where a low basin fills (0 on dry ground, 1 in a lake). Smooth in the physical point.
+    fn flood_mask(&self, p: DVec3) -> f32 {
+        smoothstep(0.18, 0.62, fbm3(self.salt(19), p / 1400.0, 3))
+    }
+
+    /// Raise land below [`SHORE`] toward the waterline. Peaks are unchanged.
+    fn apply_lake(&self, p: DVec3, raw: f32) -> f32 {
+        if raw >= SHORE {
+            return raw;
+        }
+        let depth = smoothstep(SHORE, 20.0, raw);
+        raw + (SHORE - raw) * self.flood_mask(p) * depth
+    }
+
+    /// Magma rivers: a thin ridge of the seam noise, 1 in the channel.
+    fn river_mask(&self, p: DVec3) -> f32 {
+        let n = fbm3(self.salt(17), p / 900.0, 3).abs();
+        1.0 - smoothstep(0.015, 0.08, n)
+    }
+
+    /// A moon's ice cap lies where the surface faces away from its parent, never along a world axis.
+    fn ice_cap(&self, dir: DVec3) -> bool {
+        matches!(self.style, Style::Moon { .. })
+            && self.seed % 5 == 0
+            && self.pole.length_squared() > 0.5
+            && dir.dot(self.pole) > 0.84
+    }
+
+    /// Glowing fissures on dusty and rust moons. Frozen moons (tone 1) have none.
+    fn glowing_crack(&self, tone: u8, p: DVec3) -> bool {
+        tone != 1 && fbm3(self.salt(18), p / 240.0, 3).abs() < 0.032
+    }
+
+    /// Physical point on the datum sphere above column `(i, j)`.
+    fn datum(&self, patch: Patch, i: i64, j: i64) -> DVec3 {
+        let centre = self.atlas.centre;
+        let dir = (self.atlas.embed(patch, DVec3::new(i as f64 + 0.5, 0.5, j as f64 + 0.5)) - centre).normalize();
+        centre + dir * self.atlas.radius as f64
+    }
+
     /// The painter's style.
     pub fn style(&self) -> Style {
         self.style
@@ -249,26 +299,62 @@ impl Round {
         let centre = self.atlas.centre;
         let dir = (self.atlas.embed(patch, DVec3::new(i as f64 + 0.5, 0.5, j as f64 + 0.5)) - centre).normalize();
         let datum = self.atlas.radius as f64;
+        let p = centre + dir * datum;
         let h = h as f64;
         // Outward charts count storage y up from r_lo; inward ones from r_hi toward the centre.
         let surface = if self.atlas.inward { b.r_hi as f64 - (datum - h) } else { datum + h - b.r_lo as f64 };
         let m = &self.m;
-        let wet = fbm3(self.salt(9), dir * datum / 700.0, 2);
+        let wet = fbm3(self.salt(9), p / 700.0, 2);
         let (top, sub, sub_depth) = match self.style {
-            Style::Verdant if h > 620.0 => (m.snow, m.gravel, 2),
-            Style::Verdant if h > 380.0 => (m.gravel, m.rock[1], 2),
-            Style::Verdant => (if wet > 0.2 { m.moss } else if wet < -0.3 { m.meadow } else { m.grass }, m.soil, 4),
+            Style::Verdant => self.verdant_cover(p, h as f32, wet),
             Style::HollowOuter => (if h > 180.0 { m.snow } else { m.frost }, m.ice, 6),
             Style::HollowInner => (if wet > 0.1 { m.glowcap } else { m.violet }, m.crystal, 3),
-            Style::Moon { tone: 1 } => (if h > 60.0 { m.snow } else { m.frost }, m.ice, 5),
-            Style::Moon { tone: 2 } => (m.redsand, m.ochre, 3),
-            Style::Moon { .. } => (if self.mare(centre + dir * datum) > 0.5 { m.basalt } else { m.regolith }, m.gravel, 3),
+            Style::Moon { tone } => self.moon_cover(tone, dir, p, h as f32),
             Style::Ember => {
-                let seam = fbm3(self.salt(17), dir * datum / 250.0, 3).abs() < 0.035;
-                (if seam { m.magma } else { m.basalt }, m.basalt, 4)
+                if self.river_mask(p) > 0.62 { (m.magma, m.magma, 4) } else { (m.basalt, m.basalt, 4) }
             }
         };
         Column { surface: surface.floor() as i64, top, sub, sub_depth }
+    }
+
+    /// Verdant cover. A lake is decided from the unflooded land at this column, not from a peak
+    /// the interpolated waterline happens to sit under.
+    fn verdant_cover(&self, p: DVec3, h: f32, wet: f32) -> (BlockId, BlockId, i64) {
+        let m = &self.m;
+        let land = self.verdant_land(p);
+        let flooded = self.flood_mask(p) * smoothstep(SHORE, 20.0, land);
+        if land < SHORE - 1.0 && flooded > 0.55 {
+            let depth = ((SHORE - land).round() as i64).clamp(3, 8);
+            return (m.frost, m.ice, depth);
+        }
+        if h > 620.0 {
+            (m.snow, m.gravel, 2)
+        } else if h > 380.0 {
+            (m.gravel, m.rock[1], 2)
+        } else if wet > 0.25 {
+            (m.moss, m.soil, 4)
+        } else if wet < -0.15 {
+            (m.grass, m.soil, 4)
+        } else {
+            (m.meadow, m.soil, 4)
+        }
+    }
+
+    /// Moon cover: a rare ice cap facing away from the parent, then tone-driven fissures, then dust.
+    fn moon_cover(&self, tone: u8, dir: DVec3, p: DVec3, h: f32) -> (BlockId, BlockId, i64) {
+        let m = &self.m;
+        if self.ice_cap(dir) {
+            return (m.snow, m.ice, 6);
+        }
+        if self.glowing_crack(tone, p) {
+            let id = if tone >= 2 { m.magma } else { m.glowshroom };
+            return (id, if tone >= 2 { m.magma } else { m.basalt }, 2);
+        }
+        match tone {
+            1 => (if h > 60.0 { m.snow } else { m.frost }, m.ice, 5),
+            2 => (m.redsand, m.ochre, 3),
+            _ => (if self.mare(p) > 0.5 { m.basalt } else { m.regolith }, m.gravel, 3),
+        }
     }
 
     /// The ground at depth `d` (1 = the top cell) below a column's surface.
@@ -322,11 +408,12 @@ impl Round {
     fn site(&self, patch: Patch, size: i64, si: i64, sj: i64) -> Option<Plant> {
         let h = hash2(self.salt(12) ^ hash2(patch_tag(patch), si as i32, sj as i32), si as i32, sj as i32);
         let chance = match self.style {
-            Style::Verdant => 0.55,
+            Style::Verdant => 0.42,
             Style::HollowOuter => 0.12,
-            Style::HollowInner => 0.35,
-            Style::Moon { .. } => 0.0,
-            Style::Ember => 0.06,
+            Style::HollowInner => 0.28,
+            // Hash first: crater rims are expensive, and most sites are bare dust.
+            Style::Moon { .. } => 0.16,
+            Style::Ember => 0.07,
         };
         if unit(h) >= chance {
             return None;
@@ -335,14 +422,26 @@ impl Round {
         if bi < SITE_MARGIN || bj < SITE_MARGIN || bi >= size - SITE_MARGIN || bj >= size - SITE_MARGIN {
             return None;
         }
+        if matches!(self.style, Style::Moon { .. }) && self.craters(self.datum(patch, bi, bj)) < 2.5 {
+            return None;
+        }
+        if self.style == Style::Ember && self.river_mask(self.datum(patch, bi, bj)) > 0.35 {
+            return None;
+        }
         let tall = (h >> 8) % 100;
         let (half, height, crown) = match self.style {
             Style::Verdant => (if tall > 70 { 2 } else { 1 }, 28 + tall as i64 / 2, 6 + (tall % 5) as i64),
-            Style::HollowOuter | Style::Moon { .. } => (1, 14 + tall as i64 / 4, 0),
-            Style::HollowInner => (if tall > 80 { 2 } else { 1 }, 12 + tall as i64 / 3, 0),
-            Style::Ember => (2, 18 + tall as i64 / 3, 0),
+            Style::HollowOuter => (1, 14 + tall as i64 / 4, 0),
+            Style::HollowInner => (if tall > 80 { 2 } else { 1 }, 16 + tall as i64 / 3, 0),
+            Style::Moon { .. } => (3, 3 + (tall % 3) as i64, 0),
+            Style::Ember => (2, 12 + tall as i64 / 4, 0),
         };
-        Some(Plant { i: bi, j: bj, base: self.column(patch, bi, bj).surface, half, height, crown })
+        let col = self.column(patch, bi, bj);
+        // Meadows stay open: most rolls there do not grow a tree.
+        if self.style == Style::Verdant && col.top == self.m.meadow && unit(hash3(h, 9, 0, 0)) > 0.22 {
+            return None;
+        }
+        Some(Plant { i: bi, j: bj, base: col.surface, half, height, crown })
     }
 
     /// Every plant whose site could paint into columns `i0..=i1` × `j0..=j1`.
@@ -356,33 +455,20 @@ impl Round {
 
     /// The plant block at chart cell `(i, y, j)` among `plants`, if any.
     fn plant(&self, plants: &[Plant], i: i64, y: i64, j: i64) -> Option<BlockId> {
-        let m = &self.m;
         for p in plants {
             let (di, dj, dy) = (i - p.i, j - p.j, y - p.base);
             if dy < 0 {
                 continue;
             }
-            match self.style {
-                Style::Verdant => {
-                    if di.abs() <= p.half && dj.abs() <= p.half && dy < p.height {
-                        return Some(m.timber);
-                    }
-                    let cy = dy - p.height;
-                    if di * di + dj * dj + cy * cy * 2 <= p.crown * p.crown {
-                        return Some(m.leaves);
-                    }
-                }
-                Style::HollowOuter | Style::HollowInner | Style::Moon { .. } | Style::Ember => {
-                    // A tapering spire: its radius shrinks with height.
-                    let r = (p.half + 1) as f64 * (1.0 - dy as f64 / p.height as f64);
-                    if dy < p.height && ((di * di + dj * dj) as f64) <= r * r {
-                        return Some(match self.style {
-                            Style::HollowOuter | Style::Moon { .. } => m.ice,
-                            Style::Ember => m.basalt,
-                            _ => m.crystal,
-                        });
-                    }
-                }
+            let id = match self.style {
+                Style::Verdant => verdant_tree(&self.m, p, di, dj, dy),
+                Style::HollowInner => crystal_forest(&self.m, p, di, dj, dy),
+                Style::Moon { .. } => boulder(&self.m, p, di, dj, dy),
+                Style::Ember => basalt_column(&self.m, p, di, dj, dy),
+                Style::HollowOuter => ice_spire(self.m.ice, p, di, dj, dy),
+            };
+            if id.is_some() {
+                return id;
             }
         }
         None
@@ -401,7 +487,24 @@ impl Round {
         if d >= 1 {
             if (5..400).contains(&d) && self.cave(&caves(), l, d) { AIR } else { self.ground(col, d) }
         } else {
-            self.plant(plants, l[0], l[1], l[2]).unwrap_or(AIR)
+            self.plant(plants, l[0], l[1], l[2]).unwrap_or_else(|| self.meadow_flower(col, l))
+        }
+    }
+
+    /// A single flower on open meadow, one cell above the grass. It sits on its own column.
+    fn meadow_flower(&self, col: &Column, l: [i64; 3]) -> BlockId {
+        if self.style != Style::Verdant || col.top != self.m.meadow || l[1] != col.surface {
+            return AIR;
+        }
+        let h = hash2(self.salt(21), l[0] as i32, l[2] as i32);
+        if unit(h) >= 0.045 {
+            return AIR;
+        }
+        match h % 4 {
+            0 => self.m.flower_red,
+            1 => self.m.flower_yellow,
+            2 => self.m.flower_blue,
+            _ => self.m.flower_white,
         }
     }
 
@@ -498,6 +601,63 @@ impl Round {
     }
 }
 
+/// Giant tree: bark buttresses at the base, a timber trunk, and three leaf disks. Every radius stays
+/// inside [`SITE_MARGIN`], and the crown stays under the old ellipsoid's top so the sky test holds.
+fn verdant_tree(m: &Materials, p: &Plant, di: i64, dj: i64, dy: i64) -> Option<BlockId> {
+    let (adi, adj) = (di.abs(), dj.abs());
+    if dy < 6 && adi.max(adj) <= p.half + 5 && adi.min(adj) <= 1 && adi.max(adj) > p.half {
+        return Some(m.bark);
+    }
+    if adi <= p.half && adj <= p.half && dy < p.height {
+        return Some(if dy < 4 { m.bark } else { m.timber });
+    }
+    let cy = dy - p.height;
+    let disks = [(0i64, p.crown), (-3, p.crown - 1), (-6, (p.crown - 2).max(3))];
+    for (layer, rad) in disks {
+        if (cy - layer).abs() <= 1 && di * di + dj * dj <= rad * rad {
+            return Some(m.leaves);
+        }
+    }
+    None
+}
+
+/// Crystal trunks, side arms and glowing tips. Storage +Y on an inward chart points at the Ember.
+fn crystal_forest(m: &Materials, p: &Plant, di: i64, dj: i64, dy: i64) -> Option<BlockId> {
+    if dy < p.height && di.abs() <= p.half && dj.abs() <= p.half {
+        return Some(m.crystal);
+    }
+    if (p.height..p.height + 3).contains(&dy) && di.abs() <= 1 && dj.abs() <= 1 {
+        return Some(m.glowshroom);
+    }
+    let reach = p.half + 5;
+    let arm = |at: i64, along: i64, across: i64| (dy - at).abs() <= 1 && across.abs() <= 1 && along > p.half && along <= reach;
+    let h1 = p.height / 3;
+    let h2 = 2 * p.height / 3;
+    if arm(h1, di, dj) || arm(h2, -di, dj) || arm(h2, dj, di) {
+        return Some(m.crystal);
+    }
+    if (dy - h1).abs() <= 1 && di == reach && dj.abs() <= 1 {
+        return Some(m.glowshroom);
+    }
+    None
+}
+
+/// A squat regolith heap on a crater rim.
+fn boulder(m: &Materials, p: &Plant, di: i64, dj: i64, dy: i64) -> Option<BlockId> {
+    (dy < p.height && di * di + dj * dj <= p.half * p.half).then_some(m.regolith)
+}
+
+/// A basalt prism of constant radius. Rivers are skipped before the site is kept.
+fn basalt_column(m: &Materials, p: &Plant, di: i64, dj: i64, dy: i64) -> Option<BlockId> {
+    (dy < p.height && di * di + dj * dj <= p.half * p.half).then_some(m.basalt)
+}
+
+/// A tapering ice spire on the Hollow's outer crust.
+fn ice_spire(ice: BlockId, p: &Plant, di: i64, dj: i64, dy: i64) -> Option<BlockId> {
+    let r = (p.half + 1) as f64 * (1.0 - dy as f64 / p.height as f64);
+    (dy < p.height && ((di * di + dj * dj) as f64) <= r * r).then_some(ice)
+}
+
 /// Bilinear between lattice nodes `h[a][b]` at cell offset `(di, dj)` (`0..LATTICE`) from node
 /// `[0][0]`, sampled at the cell's centre.
 fn bilerp(h: [[f32; 2]; 2], di: i64, dj: i64) -> f32 {
@@ -550,7 +710,7 @@ mod tests {
             Style::Verdant | Style::Moon { .. } | Style::Ember => Atlas::new(c, 60_000, 62_048, false, 0),
             _ => Atlas::shell(c, 60_000, 58_000, 62_048, inward, 1),
         };
-        Round::new(atlas, 99, style, m)
+        Round::new(atlas, 99, style, m, DVec3::ZERO)
     }
 
     #[test]
@@ -613,13 +773,21 @@ mod tests {
 
     #[test]
     fn batch_fill_equals_the_per_cell_definition() {
-        for style in [Style::Verdant, Style::Moon { tone: 0 }, Style::Ember] {
+        for style in [
+            Style::Verdant,
+            Style::HollowOuter,
+            Style::HollowInner,
+            Style::Moon { tone: 0 },
+            Style::Moon { tone: 1 },
+            Style::Moon { tone: 2 },
+            Style::Ember,
+        ] {
             batch_matches(style);
         }
     }
 
     fn batch_matches(style: Style) {
-        let r = round(style, false);
+        let r = round(style, style == Style::HollowInner);
         let b = r.atlas.bands[0];
         let patch = Patch::Shell { band: 0, face: Face::NegX };
         let (i, j) = (b.n / 2, b.n / 2);
@@ -635,5 +803,141 @@ mod tests {
                 assert_eq!(data.get(Chunk::index(lx, ly, lz)), r.voxel(cell), "{style:?} depth {depth} cell {lx},{ly},{lz}");
             }
         }
+    }
+
+    /// The cap faces the parent. +Y is a world axis and is not a cap when the pole is +X.
+    #[test]
+    fn moon_ice_caps_follow_the_parent_not_a_world_axis() {
+        let mut reg = BlockRegistry::with_builtins();
+        let m = Arc::new(Materials::intern(&mut reg));
+        let c = DVec3::new(5.0e8, -2.0e8, 1.0e8);
+        let atlas = Atlas::new(c, 60_000, 62_048, false, 0);
+        let pole = DVec3::X;
+        let r = Round::new(atlas, 100, Style::Moon { tone: 0 }, m, pole);
+        assert!(r.ice_cap(DVec3::X));
+        assert!(!r.ice_cap(DVec3::Y));
+        assert!(!r.ice_cap(DVec3::new(0.0, 0.8, 0.6)));
+        let bare = Round::new(r.atlas.clone(), 99, Style::Moon { tone: 0 }, r.m.clone(), pole);
+        assert!(!bare.ice_cap(DVec3::X), "seed 99 grows no cap");
+        let b = r.atlas.bands[0];
+        let (i, j) = (b.n / 2, b.n / 2);
+        let cap = r.column(Patch::Shell { band: 0, face: Face::PosX }, i, j);
+        let mid = r.column(Patch::Shell { band: 0, face: Face::PosY }, i, j);
+        assert_eq!(cap.top, r.m.snow, "the outward face is the cap");
+        assert_ne!(mid.top, r.m.snow, "+Y is not the cap");
+    }
+
+    #[test]
+    fn moons_fissures_boulders_and_the_worlds_have_character() {
+        let verdant = round(Style::Verdant, false);
+        let b = verdant.atlas.bands[0];
+        let face = Patch::Shell { band: 0, face: Face::PosZ };
+        let mut lake = false;
+        let mut meadow = false;
+        for i in (b.n / 5..b.n * 4 / 5).step_by(900) {
+            for j in (b.n / 5..b.n * 4 / 5).step_by(900) {
+                let col = verdant.column(face, i, j);
+                lake |= col.top == verdant.m.frost;
+                meadow |= col.top == verdant.m.meadow;
+            }
+        }
+        assert!(lake, "a verdant basin holds a frost lake");
+        assert!(meadow, "lowlands are meadow");
+        let mut tree = None;
+        'sites: for si in 2..80 {
+            for sj in 2..80 {
+                if let Some(p) = verdant.site(face, b.n, si, sj) {
+                    tree = Some(p);
+                    break 'sites;
+                }
+            }
+        }
+        let tree = tree.expect("a verdant tree");
+        assert!(tree.half + 5 < super::SITE_MARGIN && tree.crown < super::SITE_MARGIN, "the tree stays inside the margin");
+        let buttress = super::verdant_tree(&verdant.m, &tree, tree.half + 2, 0, 1);
+        assert_eq!(buttress, Some(verdant.m.bark), "buttress roots");
+        let canopy = super::verdant_tree(&verdant.m, &tree, 0, 0, tree.height);
+        assert_eq!(canopy, Some(verdant.m.leaves), "a canopy layer");
+        let above = super::verdant_tree(&verdant.m, &tree, 0, 0, tree.height + 8);
+        assert_eq!(above, None, "the crown stays low");
+
+        let dusty = round(Style::Moon { tone: 0 }, false);
+        let frozen = round(Style::Moon { tone: 1 }, false);
+        let rust = round(Style::Moon { tone: 2 }, false);
+        let mb = dusty.atlas.bands[0];
+        let mf = Patch::Shell { band: 0, face: Face::NegZ };
+        let (mut glow, mut magma, mut frozen_glow) = (false, false, false);
+        for i in (0..mb.n).step_by(1_100) {
+            for j in (0..mb.n).step_by(1_300) {
+                glow |= dusty.column(mf, i, j).top == dusty.m.glowshroom;
+                magma |= rust.column(mf, i, j).top == rust.m.magma;
+                let top = frozen.column(mf, i, j).top;
+                frozen_glow |= top == frozen.m.glowshroom || top == frozen.m.magma;
+            }
+        }
+        assert!(glow, "dusty moons have glowing fissures");
+        assert!(magma, "rust moons have magma fissures");
+        assert!(!frozen_glow, "a frozen moon has no glowing fissure");
+        let mut heap = None;
+        'rim: for si in 0..120 {
+            for sj in 0..120 {
+                if let Some(p) = dusty.site(mf, mb.n, si, sj) {
+                    heap = Some(p);
+                    break 'rim;
+                }
+            }
+        }
+        let heap = heap.expect("a boulder on a crater rim");
+        assert!(heap.half < super::SITE_MARGIN);
+        assert_eq!(super::boulder(&dusty.m, &heap, 0, 0, 0), Some(dusty.m.regolith));
+
+        let ember = round(Style::Ember, false);
+        let eb = ember.atlas.bands[0];
+        let ef = Patch::Shell { band: 0, face: Face::PosX };
+        let mut river = false;
+        for i in (0..eb.n).step_by(800) {
+            for j in (0..eb.n).step_by(800) {
+                river |= ember.column(ef, i, j).top == ember.m.magma;
+            }
+        }
+        assert!(river, "the Ember has a magma river");
+        let mut column = None;
+        'col: for si in 0..100 {
+            for sj in 0..100 {
+                if let Some(p) = ember.site(ef, eb.n, si, sj) {
+                    column = Some(p);
+                    break 'col;
+                }
+            }
+        }
+        let column = column.expect("a basalt column");
+        assert_eq!(super::basalt_column(&ember.m, &column, 0, 0, column.height / 2), Some(ember.m.basalt));
+        assert_eq!(
+            super::basalt_column(&ember.m, &column, column.half, 0, column.height / 2),
+            Some(ember.m.basalt),
+            "the prism does not taper"
+        );
+
+        let inner = round(Style::HollowInner, true);
+        let ib = inner.atlas.bands[0];
+        let inf = Patch::Shell { band: 0, face: Face::PosY };
+        let mut forest = None;
+        'cry: for si in 0..60 {
+            for sj in 0..60 {
+                if let Some(p) = inner.site(inf, ib.n, si, sj) {
+                    forest = Some(p);
+                    break 'cry;
+                }
+            }
+        }
+        let forest = forest.expect("a crystal tree");
+        assert!(forest.half + 5 < super::SITE_MARGIN);
+        assert_eq!(super::crystal_forest(&inner.m, &forest, 0, 0, forest.height), Some(inner.m.glowshroom), "a glowing tip");
+        assert_eq!(
+            super::crystal_forest(&inner.m, &forest, forest.half + 3, 0, forest.height / 3),
+            Some(inner.m.crystal),
+            "an arm"
+        );
+        assert!(forest.height + 3 < 120, "the forest stays under the sky");
     }
 }

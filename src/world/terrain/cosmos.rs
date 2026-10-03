@@ -591,6 +591,32 @@ impl Cosmos {
         }
     }
 
+    /// The rock of each size class whose sub-cell holds `p`, class 0 first.
+    /// Stops when `f` returns true. A point lies in one sub-cell per class, and a rock paints
+    /// only inside that sub-cell, so this is every rock that could contain `p`.
+    pub fn for_rocks_at(&self, p: [i64; 3], mut f: impl FnMut(&Rock) -> bool) {
+        let key = [p[0].div_euclid(CELL) as i32, p[1].div_euclid(CELL) as i32, p[2].div_euclid(CELL) as i32];
+        let Some(&i) = self.by_cell.get(&key) else { return };
+        let c = &self.clusters[i as usize];
+        let reach = c.radius + CLASSES[3].0 as f64;
+        let near = (0..3).all(|a| {
+            let x = p[a] as f64;
+            x >= c.centre[a] - reach && x <= c.centre[a] + reach
+        });
+        if !near {
+            return;
+        }
+        for k in 0..CLASSES.len() {
+            let edge = CLASSES[k].0;
+            let sub = [p[0].div_euclid(edge), p[1].div_euclid(edge), p[2].div_euclid(edge)];
+            if let Some(r) = self.rock(c, k, sub) {
+                if f(&r) {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Whether the cell box `[lo, hi]` may hold any matter at all (false ⇒ certainly empty).
     pub fn may_hold(&self, lo: [i64; 3], hi: [i64; 3]) -> bool {
         if self.bodies.iter().any(|b| b.touches(lo, hi)) {
