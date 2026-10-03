@@ -7,7 +7,7 @@ what happens when two of them touch. Nothing in the simulation has a name. All d
 arithmetic over a committed table, so every peer computes the same bytes.
 
 Code: `crates/material` (the pure law). Game intern table: `src/block/registry.rs`. Scheduler:
-`src/sim/reactions.rs`. Specification: `reaction-guide/selective-transfer-v1.md`.
+`src/sim/reactions.rs`. Specification: `guides/reaction-guide/selective-transfer-v1.md`.
 
 ## Lattice and configurations
 

@@ -3,7 +3,7 @@
 //! capacity, exchanges one occurrence each way) when the move improves the summed internal fit by more
 //! than `1/32` of the contact's size. Integer scores, no heap allocation, no floating point decisions.
 //!
-//! Specification: `reaction-guide/selective-transfer-v1.md` (§§ 3-10). The arithmetic below is the
+//! Specification: `guides/reaction-guide/selective-transfer-v1.md` (§§ 3-10). The arithmetic below is the
 //! reference implementation's, unchanged; only the element type is the crate's [`Element`].
 
 use crate::configuration::{Configuration, CAPACITY};
