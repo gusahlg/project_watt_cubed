@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use glam::DQuat;
 use voxel_engine::DVec3;
 
 use super::acoustics::{AcousticWindow, Coords, Dsp, SmoothedCoords, audibility, respond, trace};
@@ -294,6 +295,7 @@ impl SoundSystem {
                 pos: DVec3::ZERO,
                 yaw: 0.0,
                 pitch: 0.0,
+                frame: DQuat::IDENTITY,
             },
             ui_counter: 0,
             ui_voices: Vec::new(),
@@ -1114,6 +1116,7 @@ mod seam_tests {
             pos: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
+            frame: glam::DQuat::IDENTITY,
         }
     }
 
@@ -1484,6 +1487,8 @@ mod seam_tests {
                     pitch: 0.0,
                     velocity: DVec3::ZERO,
                     on_ground: true,
+                    up: crate::coord::Face::PosY,
+                    frame: glam::DQuat::IDENTITY,
                 },
                 ptt: false,
                 voice_enabled: false,

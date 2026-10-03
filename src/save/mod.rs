@@ -198,6 +198,7 @@ mod tests {
                 frame: glam::DQuat::IDENTITY,
                 velocity: [0.0; 3],
                 up: 5,
+                legacy_pose: false,
                 flying: false,
                 noclip: false,
                 stash: None,
@@ -207,6 +208,66 @@ mod tests {
             mods: vec![],
             pending: vec![],
         }
+    }
+
+    /// A point just outside the flat slab's +X face, where the pull is horizontal.
+    fn side_of_the_slab() -> DVec3 {
+        use crate::world::generation::{FLAT_HALF, FLAT_HEIGHT, FlatTerrain, TerrainGenerator};
+        let mut registry = crate::block::BlockRegistry::with_builtins();
+        let terrain = FlatTerrain::new(&mut registry, 1);
+        let field = crate::gravity::Field::new(terrain.mass());
+        let x = FLAT_HALF as f64 + 2.0;
+        let pull = |y: f64| field.sample(DVec3::new(x, y, 0.0)).accel.x.abs();
+        let (mut lo, mut hi) = (-9.0e8_f64, FLAT_HEIGHT as f64);
+        for _ in 0..48 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            if pull(m1) < pull(m2) {
+                lo = m1;
+            } else {
+                hi = m2;
+            }
+        }
+        DVec3::new(x, 0.5 * (lo + hi), 0.0)
+    }
+
+    fn load_flat(doc: SaveDoc) -> (World, Player) {
+        let mut mods = crate::modding::testing::standard();
+        let (world, player, _) = from_doc(doc, &mut mods, |seed, kind, cfg| {
+            World::with_kind_cfg(
+                seed,
+                crate::render_config::RenderConfig::default(),
+                kind,
+                cfg,
+                false,
+            )
+        })
+        .unwrap();
+        (world, player)
+    }
+
+    #[test]
+    fn legacy_pose_stands_in_local_gravity_and_a_saved_identity_frame_stays() {
+        let at = side_of_the_slab();
+        let mut legacy = bare_doc();
+        legacy.worldgen.kind = 0;
+        legacy.player.pos = at.to_array();
+        legacy.player.legacy_pose = true;
+        let (world, player) = load_flat(legacy);
+        let up = world
+            .gravity_at(player.position)
+            .up(0.02 * crate::player::STANDARD_GRAVITY)
+            .expect("the slab's side pulls");
+        assert_ne!(player.up_axis, crate::coord::Face::PosY);
+        assert_eq!(player.up_axis, crate::coord::Face::from_dominant(up));
+        assert!((player.up() - up).length() < 1e-9, "{} vs {up}", player.up());
+
+        let mut kept = bare_doc();
+        kept.worldgen.kind = 0;
+        kept.player.pos = at.to_array();
+        let (_, stayed) = load_flat(kept);
+        assert_eq!(stayed.orientation.frame, glam::DQuat::IDENTITY);
+        assert_eq!(stayed.up_axis, crate::coord::Face::PosY);
     }
 
     #[test]
@@ -399,6 +460,7 @@ mod tests {
             frame: glam::DQuat::IDENTITY,
             velocity: [0.0; 3],
             up: 5,
+            legacy_pose: false,
             flying: false,
             noclip: false,
             stash: Some(vec![]),
@@ -464,6 +526,7 @@ mod tests {
                 frame: player.orientation.frame,
                 velocity: player.velocity().to_array(),
                 up: player.up_axis as u8,
+                legacy_pose: false,
                 flying: player.flying(),
                 noclip: player.noclip(),
                 stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),

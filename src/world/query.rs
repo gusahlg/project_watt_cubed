@@ -152,6 +152,25 @@ impl World {
         }
     }
 
+    /// The cell under a foot: 0.1 along `−up`, or along storage −Y when `feet`
+    /// sits in a round body's chart (storage +Y is up there).
+    pub(crate) fn ground_cell(&self, feet: voxel_engine::DVec3, up: Face) -> (i32, i32, i32) {
+        if let Some(local) = self.chart_local(feet) {
+            let s = local.storage;
+            return (block_coord(s.x), block_coord(s.y - 0.1), block_coord(s.z));
+        }
+        let mut p = feet;
+        let a = up.axis();
+        p[a] -= 0.1 * f64::from(up.sign());
+        (block_coord(p.x), block_coord(p.y), block_coord(p.z))
+    }
+
+    /// The block in [`Self::ground_cell`].
+    pub(crate) fn ground_block(&self, feet: voxel_engine::DVec3, up: Face) -> BlockId {
+        let (x, y, z) = self.ground_cell(feet, up);
+        self.block_at(x, y, z)
+    }
+
     /// Look up the block id at an absolute world voxel coordinate. Anything
     /// outside the loaded region reads as [`AIR`] — Y is unbounded, so there
     /// is no world floor or ceiling anymore.
@@ -240,12 +259,18 @@ impl World {
         false
     }
 
+    /// Loaded altitude-chunk indices in the `(cu, cv)` column of `face`, highest first.
+    /// [`column_chunks`](Self::column_chunks) is this for [`Face::PosY`].
+    pub fn column_alts(&self, face: Face, cu: i32, cv: i32) -> &[i32] {
+        self.column_chunks
+            .get(&ColumnKey { face, a: cu, b: cv })
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// Loaded chunk-Y layers in the PosY `(cx, cz)` column, highest first. Empty
     /// when that column has no loaded chunks.
     pub fn column_chunks(&self, cx: i32, cz: i32) -> &[i32] {
-        self.column_chunks
-            .get(&ColumnKey { face: Face::PosY, a: cx, b: cz })
-            .map_or(&[], Vec::as_slice)
+        self.column_alts(Face::PosY, cx, cz)
     }
 
     /// The loaded chunk at `(cx, cy, cz)`, if any.
@@ -255,7 +280,43 @@ impl World {
             .map(|loaded| loaded.chunk.as_ref())
     }
 
-    /// Top solid in one local column of a chunk column, walking `ys` (highest first).
+    /// Highest solid in one face-local column of `face`. `alts` is that column's
+    /// altitude chunks, highest first. The returned altitude is face-local
+    /// (`chunk_alt0 + la`); on PosY that integer is the world Y.
+    pub(crate) fn top_solid_on_face(
+        &self,
+        face: Face,
+        cu: i32,
+        cv: i32,
+        alts: &[i32],
+        lu: usize,
+        lv: usize,
+    ) -> Option<(i32, Color)> {
+        let frame = crate::space::FaceFrame::new(face);
+        let s = CHUNK_SIZE as i32;
+        for &ca in alts {
+            let coord = frame.chunk_to_world((cu, ca, cv));
+            let Some(chunk) = self.chunk_at(coord.x, coord.y, coord.z) else {
+                continue;
+            };
+            let alt0 = frame.chunk_alt0(coord);
+            let top = match chunk.uniform() {
+                Some(id) if self.registry.is_solid(id) => Some((alt0 + s - 1, id)),
+                Some(_) => None,
+                None => (0..CHUNK_SIZE).rev().find_map(|la| {
+                    let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                    let id = chunk.get_local(lx, ly, lz);
+                    self.registry.is_solid(id).then_some((alt0 + la as i32, id))
+                }),
+            };
+            if let Some((alt, id)) = top {
+                return Some((alt, self.registry.color(id)));
+            }
+        }
+        None
+    }
+
+    /// Top solid in one local column of a PosY chunk column, walking `ys` (highest first).
     pub(crate) fn top_solid_in_column(
         &self,
         cx: i32,
@@ -264,24 +325,38 @@ impl World {
         lx: usize,
         lz: usize,
     ) -> Option<(i32, Color)> {
-        let s = CHUNK_SIZE as i32;
-        for &cy in ys {
-            let Some(chunk) = self.chunk_at(cx, cy, cz) else {
-                continue;
-            };
-            let top = match chunk.uniform() {
-                Some(id) if self.registry.is_solid(id) => Some((cy * s + s - 1, id)),
-                Some(_) => None,
-                None => (0..CHUNK_SIZE).rev().find_map(|ly| {
-                    let id = chunk.get_local(lx, ly, lz);
-                    self.registry.is_solid(id).then_some((cy * s + ly as i32, id))
-                }),
-            };
-            if let Some((top_y, id)) = top {
-                return Some((top_y, self.registry.color(id)));
-            }
+        self.top_solid_on_face(Face::PosY, cx, cz, ys, lx, lz)
+    }
+
+    /// Test fixture: store `chunk` and index it in `face`'s column, highest altitude first.
+    #[cfg(test)]
+    pub(crate) fn store_column_chunk(
+        &mut self,
+        face: Face,
+        coord: crate::coord::ChunkCoord,
+        chunk: super::chunk::Chunk,
+    ) {
+        let (key, alt) = ColumnKey::of(face, coord);
+        let alts = self.column_chunks.entry(key).or_default();
+        if !alts.contains(&alt) {
+            alts.push(alt);
+            alts.sort_unstable_by(|a, b| b.cmp(a));
         }
-        None
+        self.chunks.insert(
+            coord,
+            super::Loaded {
+                chunk: Arc::new(chunk),
+                state: super::MeshState::needs_mesh(),
+                rev: 0,
+                connectivity: None,
+                visible: true,
+                light: None,
+                has_blocklight: false,
+                light_reseed: false,
+                light_gen: 0,
+                mesh_hash: None,
+            },
+        );
     }
 
     /// An immutable acoustic snapshot of the cube `[center − r, center + r]³`, for

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 mod draw;
 
-use voxel_engine::{Color, DVec3, Engine, IVec2, Vec2};
+use voxel_engine::{Color, DVec3, Engine, Vec2};
 
 use crate::audio::{
     AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
@@ -22,7 +22,7 @@ use crate::input::router::{Context, Router, View};
 use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
-use crate::minimap::{Minimap, MinimapConfig};
+use crate::minimap::{MapSample, Minimap, MinimapConfig};
 use crate::modding::{ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
@@ -541,7 +541,8 @@ impl Game {
     pub fn scripted(seed: u64, render: crate::render_config::RenderConfig) -> Game {
         let world = World::with_kind(seed as i64, render, crate::world::generation::WorldgenKind::Diffusion, true);
         let ground = world.surface_y(0, 0);
-        let player = Player::new(DVec3::new(0.5, ground as f64 + 3.0, 0.5));
+        let mut player = Player::new(DVec3::new(0.5, ground as f64 + 3.0, 0.5));
+        player.stand_in(world.gravity_at(player.position).accel);
         let mut g = Game::new(world, player, "scripted".to_string());
         g.scripted = true;
         g.render = render;
@@ -1201,13 +1202,18 @@ impl Game {
         if self.theme.hud.shows_minimap()
             && let Some(minimap) = &mut self.minimap
         {
-            let p = self.player.position;
-            let player_col = IVec2::new(p.x.floor() as i32, p.z.floor() as i32);
-            // The minimap throttle rides the scheduler's interval gate (advanced in
-            // clocks() above); the recenter half stays inside Minimap::due. Reset
-            // the gate whenever a rebuild actually happens (either trigger).
+            // The map follows the body, not the freecam. The throttle rides the
+            // scheduler's interval gate (advanced in clocks() above); the recenter
+            // half stays inside Minimap::due.
+            let sample = MapSample::from_player(
+                &self.world,
+                self.player.position,
+                self.player.up_axis,
+                self.player.orientation.frame,
+                self.player.orientation.yaw,
+            );
             let due = self.sched.interval_due(self.minimap_interval);
-            if minimap.refresh(eng, &self.world, player_col, due) {
+            if minimap.refresh(eng, &self.world, sample, due) {
                 self.sched.interval_reset(self.minimap_interval);
             }
         }
@@ -1316,6 +1322,7 @@ impl Game {
                     visible: p.visible(),
                     phase: r.phase,
                     speed: r.speed,
+                    up: r.up,
                 }
             }));
         }
@@ -1334,6 +1341,8 @@ impl Game {
             pitch: self.player.orientation.pitch,
             velocity,
             on_ground: self.player.on_ground(),
+            up: self.player.up_axis,
+            frame: self.player.orientation.frame,
         };
 
         let ctx = AudioCtx {
@@ -1904,6 +1913,8 @@ mod tests {
             pitch: 0.0,
             velocity: DVec3::ZERO,
             on_ground: true,
+            up: crate::coord::Face::PosY,
+            frame: glam::DQuat::IDENTITY,
         };
         audio.frame(
             AudioCtx {

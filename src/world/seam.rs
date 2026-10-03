@@ -519,6 +519,11 @@ impl super::World {
         self.seams.atlases().iter().find(|a| a.find(p).is_some())
     }
 
+    /// `p`'s place in the chart under it: storage position (storage +Y is up) and the local Jacobian.
+    pub(crate) fn chart_local(&self, p: glam::DVec3) -> Option<crate::space::atlas::Local> {
+        self.seams.atlases().iter().find_map(|a| a.local(p))
+    }
+
     /// The generator's round bodies.
     pub fn atlases(&self) -> &[Arc<Atlas>] {
         self.seams.atlases()

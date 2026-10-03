@@ -2,10 +2,10 @@
 //! nonlinearity. No `&mut`, no statics, no authority — every function is total
 //! and depends only on its arguments.
 
-use glam::UVec3;
+use glam::{DQuat, UVec3};
 use voxel_engine::{DVec3, IVec3};
 
-use crate::camera::direction_from_angles;
+use crate::camera::{direction_from_angles, rotate};
 use crate::math::BLOCK_METERS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +21,8 @@ pub struct Listener {
     pub pos: DVec3, // eye position in world-space blocks; responses use metres
     pub yaw: f32,
     pub pitch: f32,
+    /// Body frame the yaw and pitch are measured in. Identity keeps the old world basis.
+    pub frame: DQuat,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -236,10 +238,10 @@ fn occl_lp(o: f32) -> f32 {
 /// The camera's canonical yaw/pitch basis: yaw zero looks +X and positive yaw
 /// turns toward +Z. Panning reads listener-local components.
 fn listener_basis(l: &Listener) -> (DVec3, DVec3, DVec3) {
-    let forward = direction_from_angles(l.yaw, l.pitch);
+    let forward = rotate(l.frame, direction_from_angles(l.yaw, l.pitch));
     let (sin_yaw, cos_yaw) = (l.yaw as f64).sin_cos();
     // Yaw-only right stays defined while looking straight up/down.
-    let right = DVec3::new(-sin_yaw, 0.0, cos_yaw);
+    let right = rotate(l.frame, DVec3::new(-sin_yaw, 0.0, cos_yaw));
     let up = right.cross(forward);
     (forward, right, up)
 }
@@ -314,6 +316,7 @@ pub fn audibility(r: Response, sc: SmoothedCoords, gain: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::DQuat;
 
     fn window(size: u32, fill: Cell) -> AcousticWindow {
         let n = (size * size * size) as usize;
@@ -381,6 +384,7 @@ mod tests {
             pos: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
+            frame: DQuat::IDENTITY,
         };
         assert!(
             pan(listener, DVec3::X)[0].abs() < 1e-6,
@@ -414,6 +418,7 @@ mod tests {
             pos: DVec3::ZERO,
             yaw: 0.3,
             pitch: -0.2,
+            frame: DQuat::IDENTITY,
         };
         let responses = [
             Response::World,

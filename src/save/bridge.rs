@@ -66,6 +66,7 @@ impl SaveSnapshot {
                 frame: player.orientation.frame,
                 velocity: player.velocity().to_array(),
                 up: player.up_axis as u8,
+                legacy_pose: false,
                 flying: player.flying(),
                 noclip: player.noclip(),
                 stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
@@ -289,9 +290,14 @@ pub fn from_doc(
     ));
     player.orientation.yaw = doc.player.yaw;
     player.orientation.pitch = doc.player.pitch;
-    // Assign the saved frame. `snap_up` would rebuild it and drop any twist around up.
-    player.orientation.frame = doc.player.frame;
-    player.up_axis = Face::from_index(doc.player.up).unwrap_or(Face::PosY);
+    if doc.player.legacy_pose {
+        // v9 fabricated an identity pose. Stand in the gravity at the saved position.
+        player.stand_in(world.gravity_at(player.position).accel);
+    } else {
+        // Assign the saved frame. `snap_up` would rebuild it and drop any twist around up.
+        player.orientation.frame = doc.player.frame;
+        player.up_axis = Face::from_index(doc.player.up).unwrap_or(Face::PosY);
+    }
     if doc.player.flying {
         player.set_flying(true);
         if doc.player.noclip {

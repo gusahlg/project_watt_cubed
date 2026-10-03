@@ -175,7 +175,7 @@ impl AudioFrame {
 
 #[cfg(test)]
 mod tests {
-    use glam::UVec3;
+    use glam::{DQuat, UVec3};
     use voxel_engine::IVec3;
 
     use super::super::acoustics::{Cell, Listener};
@@ -193,6 +193,7 @@ mod tests {
             pos: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
+            frame: DQuat::IDENTITY,
         }
     }
 

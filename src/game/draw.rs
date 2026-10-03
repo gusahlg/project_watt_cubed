@@ -1,5 +1,5 @@
 //! Frame composition, world rendering, and HUD presentation for the live game.
-use voxel_engine::{Camera3D, Color, DVec3, Engine, IVec2, Vec2};
+use voxel_engine::{Camera3D, Color, DVec3, Engine, Vec2};
 
 use super::Game;
 use crate::avatar::Pose;
@@ -399,11 +399,14 @@ impl Game {
         if theme.hud.shows_minimap()
             && let Some(minimap) = &self.minimap
         {
-            let player_col = IVec2::new(
-                self.player.position.x.floor() as i32,
-                self.player.position.z.floor() as i32,
+            let sample = crate::minimap::MapSample::from_player(
+                &self.world,
+                self.player.position,
+                self.player.up_axis,
+                self.player.orientation.frame,
+                self.player.orientation.yaw,
             );
-            minimap.draw(f, screen, player_col, self.player.orientation.yaw);
+            minimap.draw(f, screen, sample);
         }
 
         // Reticle and world-space name tags: shown in every mode but fully-off.
@@ -596,7 +599,8 @@ impl Game {
                 (rp, rig)
             });
             let tag = if want_tags {
-                let head = feet.0 + DVec3::new(0.0, Pose::HEAD_TOP as f64 + 0.2, 0.0);
+                let head = feet.0
+                    + crate::camera::rotate(r.frame, DVec3::Y) * (Pose::HEAD_TOP as f64 + 0.2);
                 let to_head = head - eye;
                 tag_draw(world, eye, forward, to_head, camera, screen_w, screen_h, dt, peer)
             } else {

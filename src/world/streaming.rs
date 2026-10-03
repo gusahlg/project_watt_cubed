@@ -675,14 +675,21 @@ impl World {
         }
     }
 
+    /// Storage position of an eye on or above a round body, including flight up to the stream
+    /// reach above the relief. `None` on a flat world and away from every chart.
+    pub(crate) fn chart_eye(&self, eye: DVec3) -> Option<DVec3> {
+        if self.seams.is_empty() {
+            return None;
+        }
+        let reach = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64
+            * CHUNK_SIZE as f64;
+        self.seams.storage_eye(eye, reach)
+    }
+
     /// The point streaming stands on: the eye's storage position on (or above) a round world's
     /// chart, else the eye itself.
-    pub(in crate::world) fn stream_eye(&self, eye: DVec3) -> DVec3 {
-        if self.seams.is_empty() {
-            return eye;
-        }
-        let reach = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64 * CHUNK_SIZE as f64;
-        self.seams.storage_eye(eye, reach).unwrap_or(eye)
+    pub(crate) fn stream_eye(&self, eye: DVec3) -> DVec3 {
+        self.chart_eye(eye).unwrap_or(eye)
     }
 
     /// Adopt the chart net around streaming centre `centre`; returns whether it changed. A new net
