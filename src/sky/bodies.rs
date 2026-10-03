@@ -1,7 +1,9 @@
 //! Far worlds and moons as sky impostors, taken from the cosmos catalog.
 //! The list is rebuilt every frame into a reused buffer.
 
-use voxel_engine::{DVec3, FarBody, FarShape, LinearRgb, Quat, Vec3, MAX_FAR_BODIES};
+use voxel_engine::{
+    DVec3, FarBody, FarShape, LinearRgb, Quat, SunOverride, Vec3, MAX_FAR_BODIES,
+};
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
@@ -9,28 +11,47 @@ use crate::world::terrain::cosmos::{Body, Kind, Shape};
 
 /// Above this altitude the voxel terrain is not drawn, so the impostor takes over.
 const STREAM_ALTITUDE: f64 = 20_000.0;
+/// The inner wall sits this far into the shell, behind the inward-hanging terrain.
+const WALL_BEHIND: f32 = 150.0;
+/// Warm orange of the core light, before the distance scale (`inner / distance`).
+const CORE_ORANGE: [f32; 3] = [1.15, 0.40, 0.07];
+/// The Ember's rim inside the cavity, so the core reads as the light.
+const CORE_GLOW: f32 = 5.0;
 
 /// Reused far-body list. Capacity stays at [`MAX_FAR_BODIES`] after the first frame.
 #[derive(Debug)]
 pub struct FarBodies {
     list: Vec<FarBody>,
+    /// Core light while the eye is in a Hollow's cavity. `None` outside it.
+    sun: Option<SunOverride>,
 }
 
 impl Default for FarBodies {
     fn default() -> Self {
         Self {
             list: Vec::with_capacity(MAX_FAR_BODIES),
+            sun: None,
         }
     }
 }
 
 impl FarBodies {
+    /// Point light for this frame. `None` outside a Hollow's cavity.
+    pub fn sun_override(&self) -> Option<SunOverride> {
+        self.sun
+    }
+
     /// Bodies to draw this frame, relative to `eye`. Empty when the generator has no cosmos.
     pub fn update(&mut self, generator: &dyn TerrainGenerator, eye: DVec3) -> &[FarBody] {
         self.list.clear();
+        self.sun = None;
         let Some(cosmos) = generator.cosmos() else {
             return &self.list;
         };
+        if let Some((hollow, ember)) = cosmos.hollow_cavity(eye) {
+            self.fill_cavity(hollow, ember, eye);
+            return &self.list;
+        }
         let mut twin = 0u32;
         for body in cosmos.bodies() {
             let ordinal = if body.kind == Kind::Twin {
@@ -48,6 +69,61 @@ impl FarBodies {
             }
         }
         &self.list
+    }
+
+    /// The shell's far wall and the Ember. Nothing outside the shell is visible.
+    fn fill_cavity(&mut self, hollow: &Body, ember: &Body, eye: DVec3) {
+        let Shape::Shell { inner, .. } = hollow.shape else {
+            return;
+        };
+        let delta = hollow.centre_f() - eye;
+        let dist = delta.length();
+        if !(dist > 0.0) || !dist.is_finite() {
+            return;
+        }
+        let n = delta / dist;
+        let dir = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
+        let distance = dist as f32;
+        let radius = inner as f32 + WALL_BEHIND;
+        if dir.is_finite()
+            && dir.length_squared() > 0.0
+            && distance.is_finite()
+            && distance > 0.0
+            && radius.is_finite()
+            && distance < radius
+        {
+            self.list.push(FarBody {
+                dir,
+                distance,
+                radius,
+                shape: FarShape::InnerSphere,
+                rotation: Quat::IDENTITY,
+                albedo: tones(srgb(132, 88, 172), srgb(176, 124, 255)),
+                atmosphere: black(),
+                seed: hollow.seed,
+            });
+        }
+        if let Some(mut far) = impostor(ember, eye, 0) {
+            far.atmosphere = LinearRgb([
+                far.atmosphere.0[0] * CORE_GLOW,
+                far.atmosphere.0[1] * CORE_GLOW,
+                far.atmosphere.0[2] * CORE_GLOW,
+            ]);
+            self.list.push(far);
+        }
+        if !dir.is_finite() || dir.length_squared() == 0.0 {
+            return;
+        }
+        let scale = (inner as f64 / dist) as f32;
+        self.sun = Some(SunOverride {
+            dir,
+            color: LinearRgb([
+                CORE_ORANGE[0] * scale,
+                CORE_ORANGE[1] * scale,
+                CORE_ORANGE[2] * scale,
+            ]),
+            show_disc: false,
+        });
     }
 }
 
@@ -254,6 +330,7 @@ mod tests {
         let spawn = DVec3::new(0.5, 8.0, 0.5);
         let mut far = FarBodies::default();
         let listed = far.update(&terrain, spawn);
+        assert!(listed.iter().all(|b| b.shape != FarShape::InnerSphere));
         assert!(find(listed, cosmos.home()).is_none());
         let mut expect = 0usize;
         for body in cosmos.bodies() {
@@ -309,6 +386,7 @@ mod tests {
             let a = moon.albedo[0].0;
             assert!(a.iter().all(|&c| c > 0.0 && c <= 1.0), "a lit, plain surface tone: {a:?}");
         }
+        assert!(far.sun_override().is_none());
 
         // Warm the buffer, then two more updates must not allocate.
         alloc_count::reset();
@@ -333,5 +411,106 @@ mod tests {
         for body in away {
             finite_unit(body);
         }
+        assert!(far.sun_override().is_none());
+    }
+
+    #[test]
+    fn inside_the_hollow_the_wall_and_the_ember_are_the_sky() {
+        let mut registry = BlockRegistry::with_builtins();
+        let terrain = Terrain::new(&mut registry, 1);
+        let cosmos = terrain.cosmos().expect("cosmos");
+        let hollow = cosmos.bodies().iter().find(|b| b.kind == Kind::Hollow).unwrap();
+        let ember = cosmos.bodies().iter().find(|b| b.kind == Kind::Ember).unwrap();
+        let Shape::Shell { outer, inner } = hollow.shape else {
+            panic!("the Hollow is a shell");
+        };
+        let Shape::Ball { r } = ember.shape else {
+            panic!("the Ember is a ball");
+        };
+        assert_eq!(hollow.centre, ember.centre);
+
+        let mut far = FarBodies::default();
+        let outside = hollow.centre_f() + DVec3::new(0.0, outer as f64 + 10_000.0, 0.0);
+        let outside_air = {
+            let listed = far.update(&terrain, outside);
+            assert!(listed.iter().all(|b| b.shape != FarShape::InnerSphere));
+            let shell = listed.iter().find(|b| b.seed == hollow.seed).expect("outer shell");
+            assert_eq!(shell.shape, FarShape::Sphere);
+            listed
+                .iter()
+                .find(|b| b.seed == ember.seed)
+                .expect("ember")
+                .atmosphere
+        };
+        assert!(far.sun_override().is_none());
+
+        let halfway = hollow.centre_f() + DVec3::new(0.0, inner as f64 * 0.5, 0.0);
+        let listed = far.update(&terrain, halfway);
+        assert_eq!(listed.len(), 2);
+        let wall = &listed[0];
+        let core = &listed[1];
+        assert_eq!(wall.shape, FarShape::InnerSphere);
+        assert_eq!(wall.seed, hollow.seed);
+        assert_eq!(wall.radius.to_bits(), (inner as f32 + WALL_BEHIND).to_bits());
+        assert_eq!(wall.distance.to_bits(), (inner as f32 / 2.0).to_bits());
+        assert_eq!(wall.dir.x.to_bits(), 0.0f32.to_bits());
+        assert_eq!(wall.dir.y.to_bits(), (-1.0f32).to_bits());
+        assert_eq!(wall.dir.z.to_bits(), 0.0f32.to_bits());
+        assert_eq!(wall.atmosphere.0, [0.0, 0.0, 0.0]);
+        assert_eq!(wall.rotation, Quat::IDENTITY);
+        let want = tones(srgb(132, 88, 172), srgb(176, 124, 255));
+        for face in 0..6 {
+            assert_eq!(wall.albedo[face].0[0].to_bits(), want[face].0[0].to_bits());
+            assert_eq!(wall.albedo[face].0[1].to_bits(), want[face].0[1].to_bits());
+            assert_eq!(wall.albedo[face].0[2].to_bits(), want[face].0[2].to_bits());
+        }
+        assert_eq!(core.shape, FarShape::Sphere);
+        assert_eq!(core.seed, ember.seed);
+        for channel in 0..3 {
+            assert_eq!(
+                core.atmosphere.0[channel].to_bits(),
+                (outside_air.0[channel] * CORE_GLOW).to_bits()
+            );
+        }
+        assert!(listed.iter().all(|b| b.seed == hollow.seed || b.seed == ember.seed));
+
+        let sun = far.sun_override().expect("the Ember lights the cavity");
+        assert!(!sun.show_disc);
+        assert_eq!(sun.dir.x.to_bits(), 0.0f32.to_bits());
+        assert_eq!(sun.dir.y.to_bits(), (-1.0f32).to_bits());
+        assert_eq!(sun.dir.z.to_bits(), 0.0f32.to_bits());
+        assert_eq!(sun.color.0[0].to_bits(), (CORE_ORANGE[0] * 2.0).to_bits());
+        assert_eq!(sun.color.0[1].to_bits(), (CORE_ORANGE[1] * 2.0).to_bits());
+        assert_eq!(sun.color.0[2].to_bits(), (CORE_ORANGE[2] * 2.0).to_bits());
+        assert!(sun.color.0[0] > sun.color.0[1] && sun.color.0[1] > sun.color.0[2]);
+        let halfway_r = sun.color.0[0];
+
+        let close = hollow.centre_f() + DVec3::new(0.0, r as f64 + 50_000.0, 0.0);
+        let listed = far.update(&terrain, close);
+        assert_eq!(listed.len(), 2);
+        let closer = far.sun_override().expect("closer to the Ember");
+        assert!(closer.color.0[0] > halfway_r);
+        assert!(!closer.show_disc);
+        assert_eq!(closer.dir.y.to_bits(), (-1.0f32).to_bits());
+
+        let lip = hollow.centre_f() + DVec3::new(0.0, inner as f64 - 1.0, 0.0);
+        let listed = far.update(&terrain, lip);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].shape, FarShape::InnerSphere);
+        assert!(far.sun_override().is_some());
+
+        let rock = hollow.centre_f() + DVec3::new(0.0, inner as f64 + 1.0, 0.0);
+        let listed = far.update(&terrain, rock);
+        assert!(listed.iter().all(|b| b.shape != FarShape::InnerSphere));
+        assert!(far.sun_override().is_none());
+
+        let centre = far.update(&terrain, hollow.centre_f());
+        assert!(centre.iter().all(|b| b.shape != FarShape::InnerSphere));
+        assert!(far.sun_override().is_none());
+
+        let listed = far.update(&terrain, outside);
+        assert!(listed.len() > 2);
+        assert!(listed.iter().any(|b| b.seed == hollow.seed && b.shape == FarShape::Sphere));
+        assert!(far.sun_override().is_none());
     }
 }

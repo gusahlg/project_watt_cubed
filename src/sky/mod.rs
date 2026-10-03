@@ -98,5 +98,6 @@ impl Sky {
     ) {
         f.set_sky(self.desc(frame));
         f.set_far_bodies(self.far.update(generator, eye));
+        f.set_sun_override(self.far.sun_override());
     }
 }

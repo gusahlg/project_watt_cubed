@@ -417,6 +417,34 @@ impl Cosmos {
             .min_by(|a, b| a.altitude(p).abs().total_cmp(&b.altitude(p).abs()))
     }
 
+    /// Open air inside a Hollow: within the inner surface and outside its Ember.
+    /// The shell's rock and the Ember's interior are not the cavity.
+    pub fn hollow_cavity(&self, eye: DVec3) -> Option<(&Body, &Body)> {
+        for hollow in self.bodies.iter().filter(|b| b.kind == Kind::Hollow) {
+            let Shape::Shell { inner, .. } = hollow.shape else {
+                continue;
+            };
+            let dist = (hollow.centre_f() - eye).length();
+            if !(dist < inner as f64) {
+                continue;
+            }
+            let Some(ember) = self.bodies.iter().find(|b| {
+                b.kind == Kind::Ember
+                    && b.centre == hollow.centre
+                    && matches!(b.shape, Shape::Ball { .. })
+            }) else {
+                continue;
+            };
+            let Shape::Ball { r } = ember.shape else {
+                continue;
+            };
+            if dist > r as f64 {
+                return Some((hollow, ember));
+            }
+        }
+        None
+    }
+
     fn place_clusters(&mut self, space: f32) {
         if space <= 0.0 {
             return;

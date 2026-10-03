@@ -1746,14 +1746,21 @@ impl Game {
     }
 
     /// Altitude above the datum of the nearest body (the sky fades to space with it); far from every
-    /// body, or over an airless one (a moon), effectively infinite. A flat world's datum is `y = 0`.
+    /// body, or over an airless one (a moon), effectively infinite. Inside a Hollow's cavity the
+    /// shell is the sky, so this is the same sentinel and the blue atmosphere stays outside. A flat
+    /// world's datum is `y = 0`.
     pub fn sky_altitude(&self, eye: DVec3) -> f64 {
         use crate::world::terrain::cosmos::Kind;
         match self.world.terrain().cosmos() {
-            Some(cosmos) => match cosmos.body_at(eye) {
-                Some(b) if b.kind != Kind::Moon => b.altitude(eye),
-                _ => 1.0e9,
-            },
+            Some(cosmos) => {
+                if cosmos.hollow_cavity(eye).is_some() {
+                    return 1.0e9;
+                }
+                match cosmos.body_at(eye) {
+                    Some(b) if b.kind != Kind::Moon => b.altitude(eye),
+                    _ => 1.0e9,
+                }
+            }
             None => eye.y,
         }
     }
@@ -1852,6 +1859,28 @@ mod tests {
         let above = verdance.centre_f() + DVec3::new(0.0, 0.0, r as f64 + 300.0);
         assert!((game.sky_altitude(above) - 300.0).abs() < 1e-6, "over Verdance");
         assert!(game.sky_altitude(DVec3::new(9.0e8, 9.0e8, 9.0e8)) > 1.0e8, "deep space");
+
+        let hollow = cosmos
+            .bodies()
+            .iter()
+            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Hollow)
+            .expect("the Hollow");
+        let crate::world::terrain::cosmos::Shape::Shell { outer, inner } = hollow.shape else {
+            panic!("the Hollow is a shell");
+        };
+        let halfway = hollow.centre_f() + DVec3::new(0.0, inner as f64 * 0.5, 0.0);
+        let lip = hollow.centre_f() + DVec3::new(0.0, inner as f64 - 1.0, 0.0);
+        assert_eq!(game.sky_altitude(halfway), 1.0e9, "cavity air");
+        assert_eq!(game.sky_altitude(lip), 1.0e9, "just inside the inner surface");
+        let outside = hollow.centre_f() + DVec3::new(0.0, outer as f64 + 300.0, 0.0);
+        assert!(
+            (game.sky_altitude(outside) - 300.0).abs() < 1e-6,
+            "outside the Hollow"
+        );
+        let shell = hollow.centre_f() + DVec3::new(0.0, inner as f64 + 1.0, 0.0);
+        let shell_alt = game.sky_altitude(shell);
+        assert!(shell_alt.abs() < 10.0, "inside the shell rock, altitude {shell_alt}");
+        assert!((shell_alt - hollow.altitude(shell)).abs() < 1e-6);
     }
 
     #[test]
