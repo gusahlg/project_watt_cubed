@@ -27,6 +27,8 @@ struct Query {
     p: DVec3,
     theta: f64,
     tidal: bool,
+    /// Whether the potential is wanted (accepted groups then pay for the tail integral).
+    potential_wanted: bool,
     accel: DVec3,
     potential: f64,
     tensor: DMat3,
@@ -40,7 +42,13 @@ impl Visitor for Query {
         if to_centre <= g.radius || g.radius > self.theta * d {
             return true;
         }
-        let (a, phi) = if d + g.radius <= kernel::R_IN { kernel::newton(g.com, g.mass, self.p) } else { kernel::point(g.com, g.mass, self.p) };
+        let (a, phi) = if d + g.radius <= kernel::R_IN {
+            kernel::newton(g.com, g.mass, self.p)
+        } else if self.potential_wanted {
+            kernel::point(g.com, g.mass, self.p)
+        } else {
+            (kernel::point_accel(g.com, g.mass, self.p), 0.0)
+        };
         self.accel += a;
         self.potential += phi;
         if self.tidal {
@@ -84,23 +92,24 @@ impl Field {
         self.epoch
     }
 
-    /// The field at `p` (no tidal tensor).
+    /// The acceleration at `p` (the potential of distant summarised groups is left out: what motion
+    /// needs, at the lowest cost).
     pub fn sample(&self, p: DVec3) -> Sample {
-        self.query(p, THETA, false)
+        self.query(p, THETA, false, false)
     }
 
-    /// The field at `p` with the tidal tensor.
+    /// The full field at `p`: acceleration, the complete potential and the tidal tensor.
     pub fn sample_tidal(&self, p: DVec3) -> Sample {
-        self.query(p, THETA, true)
+        self.query(p, THETA, true, true)
     }
 
     /// The field at `p` with an explicit opening angle.
     pub fn sample_with(&self, p: DVec3, theta: f64, tidal: bool) -> Sample {
-        self.query(p, theta, tidal)
+        self.query(p, theta, tidal, tidal)
     }
 
-    fn query(&self, p: DVec3, theta: f64, tidal: bool) -> Sample {
-        let mut q = Query { p, theta, tidal, accel: DVec3::ZERO, potential: 0.0, tensor: DMat3::ZERO, error: 0.0 };
+    fn query(&self, p: DVec3, theta: f64, tidal: bool, potential_wanted: bool) -> Sample {
+        let mut q = Query { p, theta, tidal, potential_wanted, accel: DVec3::ZERO, potential: 0.0, tensor: DMat3::ZERO, error: 0.0 };
         self.oracle.visit(p, R_G, &mut q);
         if !self.ledger.is_empty() {
             let (a, phi, err) = self.ledger.field(p);

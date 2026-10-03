@@ -393,7 +393,7 @@ fn reactions(world: &World) -> Vec<Line> {
 /// `/gravity` — the field at the player: strength, direction, tilt from the ground's grid axis, the
 /// potential, the declared error and the source epoch.
 fn gravity(player: &Player, world: &World) -> Vec<Line> {
-    let s = world.gravity_at(player.position);
+    let s = world.gravity().sample_tidal(player.position);
     let g = s.accel.length();
     let metres = crate::math::BLOCK_METERS;
     let mut out = vec![format!(

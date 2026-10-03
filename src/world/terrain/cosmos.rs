@@ -231,6 +231,19 @@ pub struct Cosmos {
     by_cell: HashMap<[i32; 3], u32>,
     /// Clusters grouped by super-cell, with their summed expected mass.
     groups: Vec<Group>,
+    /// Group index by super-cell (a dense grid over the bounded universe; `u32::MAX` = none), so a
+    /// query visits only the super-cells within the law's range.
+    group_at: Vec<u32>,
+}
+
+/// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
+const GRID_HALF: i64 = 9;
+const GRID_SIDE: i64 = 2 * GRID_HALF;
+
+/// The dense-grid slot of super-cell `key`, if it lies in the universe.
+fn grid_slot(key: [i64; 3]) -> Option<usize> {
+    let k = [key[0] + GRID_HALF, key[1] + GRID_HALF, key[2] + GRID_HALF];
+    k.iter().all(|&v| (0..GRID_SIDE).contains(&v)).then(|| (k[0] + GRID_SIDE * (k[1] + GRID_SIDE * k[2])) as usize)
 }
 
 /// Clusters of one super-cell.
@@ -369,7 +382,14 @@ impl Cosmos {
                 }
             }
         }
-        let mut cosmos = Self { seed, bodies, clusters: Vec::new(), by_cell: HashMap::new(), groups: Vec::new() };
+        let mut cosmos = Self {
+            seed,
+            bodies,
+            clusters: Vec::new(),
+            by_cell: HashMap::new(),
+            groups: Vec::new(),
+            group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
+        };
         cosmos.place_clusters(space);
         cosmos
     }
@@ -454,6 +474,8 @@ impl Cosmos {
                 / mass;
             let centre = DVec3::new(key[0] as f64 + 0.5, key[1] as f64 + 0.5, key[2] as f64 + 0.5) * SUPER as f64;
             let radius = SUPER as f64 * 0.5 * 3f64.sqrt();
+            let slot = grid_slot(key).expect("clusters lie inside the universe grid");
+            self.group_at[slot] = self.groups.len() as u32;
             self.groups.push(Group { summary: Summary { centre, radius, mass, com }, members });
         }
     }
@@ -602,7 +624,21 @@ impl MassOracle for Cosmos {
                 v.error(b.relief_error());
             }
         }
-        for g in &self.groups {
+        // Only super-cells within `reach` (plus a cell's half-diagonal) can hold a group in range.
+        let span = ((reach + SUPER as f64) / SUPER as f64).ceil() as i64;
+        let home = [
+            (centre.x / SUPER as f64).floor() as i64,
+            (centre.y / SUPER as f64).floor() as i64,
+            (centre.z / SUPER as f64).floor() as i64,
+        ];
+        let near = (-span..=span).flat_map(|x| (-span..=span).flat_map(move |y| (-span..=span).map(move |z| [home[0] + x, home[1] + y, home[2] + z])));
+        for key in near {
+            let Some(slot) = grid_slot(key) else { continue };
+            let gi = self.group_at[slot];
+            if gi == u32::MAX {
+                continue;
+            }
+            let g = &self.groups[gi as usize];
             if (g.summary.centre - centre).length() - g.summary.radius >= reach || !v.group(&g.summary) {
                 continue;
             }
@@ -799,6 +835,33 @@ mod tests {
         // Close to the centre the pull stays tiny compared with a planet's surface pull.
         let s = field.sample(c.centre + DVec3::new(7.0, 3.0, -5.0));
         assert!(s.accel.length() < 0.05 * crate::player::STANDARD_GRAVITY, "{}", s.accel.length());
+    }
+
+
+    /// `cargo test --release --lib gravity_sample_cost -- --ignored --nocapture`: what one player
+    /// gravity sample costs against the whole cosmos (bodies + cluster groups).
+    #[test]
+    #[ignore]
+    fn gravity_sample_cost() {
+        let cosmos = Arc::new(Cosmos::new(42, 1.0));
+        let field = Field::new(cosmos.clone());
+        let mut p = DVec3::new(0.5, 70.0, 0.5);
+        let n = 20_000;
+        let t = std::time::Instant::now();
+        let mut acc = 0.0;
+        for i in 0..n {
+            p.x += (i % 7) as f64 * 0.01;
+            acc += field.sample(p).accel.y;
+        }
+        let per = t.elapsed().as_secs_f64() / n as f64;
+        println!("{:.2} µs per sample at spawn ({} cluster groups) [{acc:.3}]", per * 1e6, cosmos.groups.len());
+        let moon = cosmos.bodies().iter().find(|b| b.kind == Kind::Moon).unwrap();
+        let q = moon.centre_f() + DVec3::new(0.0, 2.0e6, 0.0);
+        let t = std::time::Instant::now();
+        for _ in 0..2_000 {
+            acc += field.sample(q).accel.y;
+        }
+        println!("{:.2} µs per sample above a moon [{acc:.3}]", t.elapsed().as_secs_f64() / 2_000.0 * 1e6);
     }
 
 }

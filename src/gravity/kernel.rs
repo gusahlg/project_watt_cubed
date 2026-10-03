@@ -73,6 +73,19 @@ pub fn point(at: DVec3, m: f64, p: DVec3) -> (DVec3, f64) {
     (d * (m * inv * inv * inv * window(r)), -m * tail(r))
 }
 
+/// Acceleration only of a point mass (no potential: skips the tail integral), per unit `G`.
+#[inline]
+pub fn point_accel(at: DVec3, m: f64, p: DVec3) -> DVec3 {
+    let d = at - p;
+    let r2 = d.length_squared();
+    let r = r2.sqrt();
+    if r >= R_G {
+        return DVec3::ZERO;
+    }
+    let inv = 1.0 / (r2 + EPS * EPS).sqrt();
+    d * (m * inv * inv * inv * window(r))
+}
+
 /// Unsoftened Newtonian monopole of an extended source seen from inside `R_IN` (softening is for
 /// point samples standing for cells, not for a body's far field), per unit `G`.
 #[inline]
