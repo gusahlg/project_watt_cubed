@@ -22,6 +22,7 @@ pub mod palette;
 pub mod round;
 mod shape;
 mod space;
+pub mod storage;
 mod trees;
 mod underground;
 

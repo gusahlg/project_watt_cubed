@@ -1,5 +1,6 @@
-//! Round worlds on curved charts: Verdance's giant forests and the Hollow's two surfaces (an icy
-//! crust outside, crystal forests hanging toward the centre inside). Each is painted in its atlas's
+//! Round worlds on curved charts: Verdance's giant forests, the Hollow's two surfaces (an icy crust
+//! outside, crystal forests hanging toward the centre inside), the molten Ember and the cratered
+//! moons. Each is painted in its atlas's
 //! storage cells, where storage `+Y` is the chart's up, so terrain is a height field per chart
 //! column. Heights come from 3-D noise at the physical point on the datum sphere above the column,
 //! so the surface is continuous across chart seams. Pure in `(seed, cell)`.
@@ -8,7 +9,7 @@ use std::sync::Arc;
 
 use glam::DVec3;
 
-use super::noise::{hash2, perlin3, unit};
+use super::noise::{hash2, hash3, perlin3, unit};
 use super::Materials;
 use crate::block::registry::{AIR, BlockId};
 use crate::space::atlas::{Atlas, Patch};
@@ -23,6 +24,11 @@ pub enum Style {
     HollowOuter,
     /// The Hollow's inner surface: violet ground and crystal spires reaching for the centre.
     HollowInner,
+    /// A moon: crater fields at three scales over regolith, dark basalt maria; `tone` gives it its
+    /// character (0 grey dust, 1 frozen, 2 rust).
+    Moon { tone: u8 },
+    /// The Hollow's core: basalt plates over glowing magma seams, basalt spires.
+    Ember,
 }
 
 /// One round world's painter.
@@ -109,6 +115,98 @@ impl Round {
                 // The inner surface hangs toward the centre: positive relief reaches into the cavity.
                 16.0 + 120.0 * smoothstep(0.3, 0.9, ridged3(s(7), p / 700.0, 4)) + 10.0 * fbm3(s(8), p / 90.0, 3)
             }
+            Style::Moon { .. } => {
+                let base = 30.0 * fbm3(s(13), p / 3000.0, 3);
+                let mare = self.mare(p);
+                base * (1.0 - 0.7 * mare) - 25.0 * mare + self.craters(p) * (1.0 - 0.5 * mare)
+            }
+            Style::Ember => {
+                let plates = ridged3(s(15), p / 600.0, 4);
+                18.0 + 70.0 * plates * plates + 6.0 * fbm3(s(16), p / 60.0, 2)
+            }
+        }
+    }
+
+    /// How much of a moon's dark mare covers point `p` (0..1).
+    fn mare(&self, p: DVec3) -> f32 {
+        smoothstep(0.25, 0.45, fbm3(self.salt(14), p / 40_000.0, 2))
+    }
+
+    /// Crater relief at a point on the datum sphere: bowls with raised rims at three scales, central
+    /// peaks in the largest. Crater sites live on a 3-D grid around the body and are projected onto
+    /// the datum sphere, so craters are round on the sphere and continuous across chart seams.
+    fn craters(&self, p: DVec3) -> f32 {
+        // (grid cell, smallest and largest radius, chance a cell holds one); the largest radius times
+        // the rim reach stays under one cell, so the 27 cells around the point see every crater.
+        const SCALES: [(f64, f64, f64, f32); 3] =
+            [(9_000.0, 900.0, 2_600.0, 0.35), (1_800.0, 120.0, 600.0, 0.5), (360.0, 14.0, 110.0, 0.55)];
+        let rel = p - self.atlas.centre;
+        let datum = self.atlas.radius as f64;
+        let mut h = 0.0f64;
+        for (k, &(cell, rmin, rmax, chance)) in SCALES.iter().enumerate() {
+            let g = (rel / cell).floor();
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let c = g + DVec3::new(dx as f64, dy as f64, dz as f64);
+                        let (ci, cj, ck) = (c.x as i32, c.y as i32, c.z as i32);
+                        let hh = hash3(self.salt(20 + k as u32), ci, cj, ck);
+                        if unit(hh) >= chance {
+                            continue;
+                        }
+                        let off = DVec3::new(
+                            unit(hash3(hh, 1, 0, 0)) as f64,
+                            unit(hash3(hh, 2, 0, 0)) as f64,
+                            unit(hash3(hh, 3, 0, 0)) as f64,
+                        );
+                        let site = (c + off) * cell;
+                        let len = site.length();
+                        if len == 0.0 {
+                            continue;
+                        }
+                        // Many small, few large: radius ∝ u³ between the bounds.
+                        let u = unit(hash3(hh, 4, 0, 0)) as f64;
+                        let rad = rmin + (rmax - rmin) * u * u * u;
+                        let t = (rel - site * (datum / len)).length() / rad;
+                        if t >= 1.6 {
+                            continue;
+                        }
+                        let (depth, rim) = (0.22 * rad, 0.07 * rad);
+                        let t2 = t * t;
+                        let bowl = if t < 1.0 {
+                            -depth * (1.0 - t2) + rim * t2 * t2 * t2
+                        } else {
+                            let f = 1.0 - (t - 1.0) / 0.6;
+                            rim * f * f
+                        };
+                        let peak = if rad > 800.0 { 0.18 * depth * (1.0 - t / 0.2).max(0.0) } else { 0.0 };
+                        h += bowl + peak;
+                    }
+                }
+            }
+        }
+        h as f32
+    }
+
+    /// Storage y of the first open cell of shell column `(i, j)`.
+    pub fn column_surface(&self, patch: Patch, i: i64, j: i64) -> i64 {
+        self.column(patch, i, j).surface
+    }
+
+    /// The fill below every cave (the uniform deep body of a shell chart).
+    pub fn deep(&self) -> BlockId {
+        match self.style {
+            Style::HollowInner | Style::HollowOuter => self.m.basalt,
+            Style::Ember => self.m.magma,
+            _ => self.m.deeprock,
+        }
+    }
+
+    /// The fill of the transition shell and the core.
+    pub fn heart(&self) -> (BlockId, BlockId) {
+        match self.style {
+            Style::Moon { .. } => (self.m.deeprock, self.m.basalt),
+            _ => (self.m.deeprock, self.m.magma),
         }
     }
 
@@ -132,6 +230,13 @@ impl Round {
             Style::Verdant => (if wet > 0.2 { m.moss } else if wet < -0.3 { m.meadow } else { m.grass }, m.soil, 4),
             Style::HollowOuter => (if h > 180.0 { m.snow } else { m.frost }, m.ice, 6),
             Style::HollowInner => (if wet > 0.1 { m.glowcap } else { m.violet }, m.crystal, 3),
+            Style::Moon { tone: 1 } => (if h > 60.0 { m.snow } else { m.frost }, m.ice, 5),
+            Style::Moon { tone: 2 } => (m.redsand, m.ochre, 3),
+            Style::Moon { .. } => (if self.mare(centre + dir * datum) > 0.5 { m.basalt } else { m.regolith }, m.gravel, 3),
+            Style::Ember => {
+                let seam = fbm3(self.salt(17), dir * datum / 250.0, 3).abs() < 0.035;
+                (if seam { m.magma } else { m.basalt }, m.basalt, 4)
+            }
         };
         Column { surface: surface.floor() as i64, top, sub, sub_depth }
     }
@@ -142,12 +247,12 @@ impl Round {
             col.top
         } else if d <= col.sub_depth + 1 {
             col.sub
+        } else if self.style == Style::Ember {
+            if d < 60 { self.m.basalt } else { self.m.magma }
         } else if d < 220 {
             self.m.rock[((d / 9) % 4) as usize]
-        } else if self.style == Style::HollowInner || self.style == Style::HollowOuter {
-            self.m.basalt
         } else {
-            self.m.deeprock
+            self.deep()
         }
     }
 
@@ -169,6 +274,8 @@ impl Round {
             Style::Verdant => 0.55,
             Style::HollowOuter => 0.12,
             Style::HollowInner => 0.35,
+            Style::Moon { .. } => 0.0,
+            Style::Ember => 0.06,
         };
         if unit(h) >= chance {
             return None;
@@ -180,8 +287,9 @@ impl Round {
         let tall = (h >> 8) % 100;
         let (half, height, crown) = match self.style {
             Style::Verdant => (if tall > 70 { 2 } else { 1 }, 28 + tall as i64 / 2, 6 + (tall % 5) as i64),
-            Style::HollowOuter => (1, 14 + tall as i64 / 4, 0),
+            Style::HollowOuter | Style::Moon { .. } => (1, 14 + tall as i64 / 4, 0),
             Style::HollowInner => (if tall > 80 { 2 } else { 1 }, 12 + tall as i64 / 3, 0),
+            Style::Ember => (2, 18 + tall as i64 / 3, 0),
         };
         Some(Plant { i: bi, j: bj, base: self.column(patch, bi, bj).surface, half, height, crown })
     }
@@ -213,11 +321,15 @@ impl Round {
                         return Some(m.leaves);
                     }
                 }
-                Style::HollowOuter | Style::HollowInner => {
+                Style::HollowOuter | Style::HollowInner | Style::Moon { .. } | Style::Ember => {
                     // A tapering spire: its radius shrinks with height.
                     let r = (p.half + 1) as f64 * (1.0 - dy as f64 / p.height as f64);
                     if dy < p.height && ((di * di + dj * dj) as f64) <= r * r {
-                        return Some(if self.style == Style::HollowOuter { m.ice } else { m.crystal });
+                        return Some(match self.style {
+                            Style::HollowOuter | Style::Moon { .. } => m.ice,
+                            Style::Ember => m.basalt,
+                            _ => m.crystal,
+                        });
                     }
                 }
             }
@@ -247,9 +359,9 @@ impl Round {
                 self.plants_near(patch, size[0], l[0], l[0], l[2], l[2], &mut plants);
                 self.shell_cell(patch, &col, &plants, l)
             }
-            // The deep interior: rock, then a molten heart.
-            Patch::Transition { .. } => self.m.deeprock,
-            Patch::Core => self.m.magma,
+            // The deep interior: rock, then the heart.
+            Patch::Transition { .. } => self.heart().0,
+            Patch::Core => self.heart().1,
         }
     }
 
@@ -309,7 +421,7 @@ mod tests {
         let m = Arc::new(Materials::intern(&mut reg));
         let c = DVec3::new(5.0e8, -2.0e8, 1.0e8);
         let atlas = match style {
-            Style::Verdant => Atlas::new(c, 60_000, 62_048, false, 0),
+            Style::Verdant | Style::Moon { .. } | Style::Ember => Atlas::new(c, 60_000, 62_048, false, 0),
             _ => Atlas::shell(c, 60_000, 58_000, 62_048, inward, 1),
         };
         Round::new(atlas, 99, style, m)
@@ -317,7 +429,15 @@ mod tests {
 
     #[test]
     fn a_column_has_ground_below_its_surface_and_air_above() {
-        for (style, inward) in [(Style::Verdant, false), (Style::HollowOuter, false), (Style::HollowInner, true)] {
+        for (style, inward) in [
+            (Style::Verdant, false),
+            (Style::HollowOuter, false),
+            (Style::HollowInner, true),
+            (Style::Moon { tone: 0 }, false),
+            (Style::Moon { tone: 1 }, false),
+            (Style::Moon { tone: 2 }, false),
+            (Style::Ember, false),
+        ] {
             let r = round(style, inward);
             let b = r.atlas.bands[0];
             let patch = Patch::Shell { band: 0, face: Face::PosZ };
@@ -346,9 +466,34 @@ mod tests {
         }
     }
 
+    /// Craters are bowls with rims: across the moon's surface the relief spans deep pits and raised
+    /// rims, and they reach across a seam like everything else.
+    #[test]
+    fn moons_are_cratered() {
+        let r = round(Style::Moon { tone: 0 }, false);
+        let b = r.atlas.bands[0];
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for i in (0..b.n).step_by(97) {
+            for j in (0..b.n).step_by(89) {
+                let p = r.atlas.embed(top, DVec3::new(i as f64 + 0.5, (r.atlas.radius - b.r_lo) as f64, j as f64 + 0.5));
+                let c = r.craters(p);
+                lo = lo.min(c);
+                hi = hi.max(c);
+            }
+        }
+        assert!(lo < -40.0 && hi > 4.0, "crater relief spans {lo}..{hi}");
+    }
+
     #[test]
     fn batch_fill_equals_the_per_cell_definition() {
-        let r = round(Style::Verdant, false);
+        for style in [Style::Verdant, Style::Moon { tone: 0 }, Style::Ember] {
+            batch_matches(style);
+        }
+    }
+
+    fn batch_matches(style: Style) {
+        let r = round(style, false);
         let b = r.atlas.bands[0];
         let patch = Patch::Shell { band: 0, face: Face::NegX };
         let (i, j) = (b.n / 2, b.n / 2);

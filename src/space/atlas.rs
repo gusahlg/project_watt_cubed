@@ -19,8 +19,8 @@ use crate::coord::Face;
 
 /// First storage x of the reserved region (beyond the physical border, inside i32 chunk math).
 pub const STORAGE_X0: i64 = 1_100_000_000;
-/// Storage x span reserved per round body.
-pub const SLOT: i64 = 1 << 26;
+/// Storage x span reserved per round body (a body's boxes side by side take about π·r of it).
+pub const SLOT: i64 = 1 << 25;
 /// Empty storage cells kept between neighbouring boxes (so glue reads never hit another box).
 const GAP: i64 = 64;
 /// How far outside a box the glue answers.
@@ -151,14 +151,15 @@ impl Atlas {
         // The transition runs at n / 2^(count + 1), which must still be a multiple of 16.
         let unit = 1i64 << (count + 5);
         let mut n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / unit as f64).round().max(1.0) as i64 * unit;
+        // Boxes sit side by side along storage x (faces along z), never stacked: every storage
+        // column belongs to at most one box, so a column's skylight ceiling is that box's surface.
         let mut bands = Vec::new();
         let (mut r_hi, mut r_lo) = (snap(top + 15), snap(radius / 2));
-        let mut y = 0i64;
+        let mut x = x0;
         for _ in 0..count {
-            let layers = r_hi - r_lo;
-            let origin = std::array::from_fn(|f| [x0, y, f as i64 * (n + GAP)]);
+            let origin = std::array::from_fn(|f| [x, 0, f as i64 * (n + GAP)]);
             bands.push(Band { n, r_lo, r_hi, origin });
-            y = snap(y + layers + GAP + 15);
+            x = snap(x + n + GAP + 15);
             r_hi = r_lo;
             r_lo = snap(r_lo / 2);
             n /= 2;
@@ -169,9 +170,10 @@ impl Atlas {
         let core_half = t_n / 2;
         let t_r = r_hi;
         let t_layers = snap((t_r - core_half).max(16) + 15);
-        let t_origin = std::array::from_fn(|f| [x0, y, f as i64 * (t_n + GAP)]);
-        y = snap(y + t_layers + GAP + 15);
-        let core_origin = [x0, y, 0];
+        let t_origin = std::array::from_fn(|f| [x, 0, f as i64 * (t_n + GAP)]);
+        x = snap(x + t_n + GAP + 15);
+        let core_origin = [x, 0, 0];
+        assert!(x + 2 * core_half <= x0 + SLOT, "a round body of radius {radius} overflows its storage slot");
         let inner = Some(Inner { t_n, t_r, t_layers, t_origin, core_half, core_origin });
         Self { centre, radius, inward, bands, inner }
     }
@@ -424,6 +426,18 @@ mod tests {
             for (oo, ss) in &boxes[i + 1..] {
                 let overlap = (0..3).all(|k| o[k] < oo[k] + ss[k] + GAP && oo[k] < o[k] + s[k] + GAP);
                 assert!(!overlap, "boxes {o:?}/{s:?} and {oo:?}/{ss:?} too close");
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_boxes_share_a_storage_column() {
+        let a = atlas();
+        let boxes: Vec<_> = a.patches().map(|p| a.storage_box(p)).collect();
+        for (i, (o, s)) in boxes.iter().enumerate() {
+            for (oo, ss) in &boxes[i + 1..] {
+                let overlap = [0, 2].iter().all(|&k| o[k] < oo[k] + ss[k] && oo[k] < o[k] + s[k]);
+                assert!(!overlap, "boxes {o:?}/{s:?} and {oo:?}/{ss:?} share columns");
             }
         }
     }
