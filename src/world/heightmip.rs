@@ -12,7 +12,7 @@
 use voxel_engine::{Color, DVec3};
 
 use crate::block::registry::AIR;
-use crate::coord::ChunkCoord;
+use crate::coord::{ChunkCoord, Face};
 use crate::ident::Detail;
 use super::generation::TerrainGenerator;
 use super::lod;
@@ -36,6 +36,11 @@ impl BakeExtent {
         debug_assert!(half_m > 0, "extent half-side must be positive");
         debug_assert!(FINEST_DETAIL <= coarsest, "finest detail exceeds coarsest");
         BakeExtent { half_m, finest: FINEST_DETAIL, coarsest }
+    }
+
+    /// Half-side of the baked square, in metres.
+    pub(in crate::world) fn half_m(self) -> i32 {
+        self.half_m
     }
 }
 
@@ -87,29 +92,44 @@ pub(in crate::world) struct HeightMip {
 }
 
 impl HeightMip {
-    /// Build a sparse pyramid: coverage halves per level (geometric base-2), so cell count
-    /// per level stays roughly constant. Finest detail covers only the inner rings; coarser
-    /// levels extend outward. This avoids quadratic cost growth.
-    ///
-    /// Each level is built by reducing four finer children (min/max bounds) where they exist,
-    /// or sampling the generator at this level's stride for areas the finer level doesn't cover.
-    /// Finer children on the boundary are included in the parent to preserve containment.
+    /// Origin PosY bake. Tests use this; streaming follows the eye with [`Self::bake_at`].
+    #[cfg(test)]
     pub fn bake<G: TerrainGenerator + ?Sized>(terra: &G, colors: &[Color], extent: BakeExtent) -> HeightMip {
+        Self::bake_at(terra, colors, extent, 0, 0, Face::PosY, 0)
+    }
+
+    /// Build a sparse pyramid centred on face-local `(anchor_u, anchor_v)` of `body`'s `face`.
+    /// Anchor `(0, 0)` on PosY is the origin bake. Heights on other faces are stored
+    /// relative to the face datum so the `[0, 512]` envelope still applies.
+    ///
+    /// Coverage halves per level (geometric base-2), so cell count per level stays roughly
+    /// constant. Each level reduces four finer children where they exist, or samples the
+    /// generator at this level's stride outside that coverage.
+    pub fn bake_at<G: TerrainGenerator + ?Sized>(
+        terra: &G,
+        colors: &[Color],
+        extent: BakeExtent,
+        anchor_u: i32,
+        anchor_v: i32,
+        face: Face,
+        body: u16,
+    ) -> HeightMip {
         let (finest, coarsest) = (extent.finest, extent.coarsest);
+        let datum = terra.face_datum(body, face);
         let mut levels: Vec<MipLevel> = Vec::with_capacity((coarsest.0 - finest.0 + 1) as usize);
         for k in finest.0..=coarsest.0 {
             let detail = Detail(k);
             // Coverage radius halves per level below the coarsest (which spans the
-            // whole extent). Aligned to the absolute section grid so a parent's
-            // children map by index doubling.
+            // whole extent). Aligned to the section grid so a parent's children
+            // map by index doubling. Anchor 0 reproduces `(-radius).div_euclid`.
             let radius = extent.half_m >> (coarsest.0 - k);
             let span = section_span(detail);
-            let x0 = (-radius).div_euclid(span);
-            let z0 = (-radius).div_euclid(span);
-            let nx = (radius.div_euclid(span) - x0 + 1) as usize;
-            let nz = (radius.div_euclid(span) - z0 + 1) as usize;
+            let x0 = (anchor_u - radius).div_euclid(span);
+            let z0 = (anchor_v - radius).div_euclid(span);
+            let nx = ((anchor_u + radius).div_euclid(span) - x0 + 1) as usize;
+            let nz = ((anchor_v + radius).div_euclid(span) - z0 + 1) as usize;
             let child = levels.last();
-            levels.push(build_level(terra, colors, detail, x0, z0, nx, nz, child));
+            levels.push(build_level(terra, colors, detail, x0, z0, nx, nz, child, face, body, datum));
         }
         HeightMip { finest, coarsest, levels }
     }
@@ -222,6 +242,9 @@ fn build_level<G: TerrainGenerator + ?Sized>(
     nx: usize,
     nz: usize,
     child: Option<&MipLevel>,
+    face: Face,
+    body: u16,
+    datum: i32,
 ) -> MipLevel {
     let mut cells = Vec::with_capacity(nx * nz);
     for sz in 0..nz {
@@ -235,7 +258,7 @@ fn build_level<G: TerrainGenerator + ?Sized>(
             let cell = if kids.iter().all(Option::is_some) {
                 merge(kids.map(|k| *k.unwrap()))
             } else {
-                let mut c = sample_section(terra, colors, detail, ax, az);
+                let mut c = sample_section(terra, colors, detail, ax, az, face, body, datum);
                 for k in kids.iter().flatten() {
                     c.lo = c.lo.min(k.lo);
                     c.hi = c.hi.max(k.hi);
@@ -256,20 +279,40 @@ fn sample_section<G: TerrainGenerator + ?Sized>(
     detail: Detail,
     ax: i32,
     az: i32,
+    face: Face,
+    body: u16,
+    datum: i32,
 ) -> MipCell {
     let cell = lod::cell(detail);
     let half = cell / 2;
     let span = section_span(detail);
     let (min_x, min_z) = (ax * span, az * span);
     let mut fold = MipFold::new();
+    let mut below = [AIR; 1];
     for iz in 0..SECTION_N as i32 {
         for ix in 0..SECTION_N as i32 {
             let wx = min_x + ix * cell + half;
             let wz = min_z + iz * cell + half;
             // Height must sample every cell; colour is an average, sampled on a stride to save cost.
-            fold.height(terra.height(wx, wz) as f32);
-            if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
-                fold.color(colors[terra.surface_at(wx, wz).0 as usize]);
+            // PosY keeps `height` / `surface_at` so an origin bake is unchanged.
+            if face == Face::PosY {
+                fold.height(terra.height(wx, wz) as f32);
+                if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
+                    fold.color(colors[terra.surface_at(wx, wz).0 as usize]);
+                }
+            } else {
+                let h = terra.surface(face, wx, wz);
+                let rel = if h == i32::MIN { 0 } else { h.saturating_sub(datum) };
+                fold.height(rel as f32);
+                if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
+                    let id = if h == i32::MIN {
+                        AIR
+                    } else {
+                        terra.lod_column_face(body, face, wx, wz, &[h - 1], &mut below);
+                        below[0]
+                    };
+                    fold.color(colors[id.0 as usize]);
+                }
             }
         }
     }
@@ -346,7 +389,7 @@ pub(in crate::world) fn resample_cell<G: TerrainGenerator + ?Sized>(
         for ix in 0..SECTION_N as i32 {
             let (fx, fz) = (pos.min_x() + ix * cell, pos.min_z() + iz * cell);
             terra.lod_column(fx + half, fz + half, &ys, &mut column);
-            crate::world::section::apply_edits(&mut column, &flat, fx, fz, cell);
+            crate::world::section::apply_edits(&mut column, &flat, fx, fz, cell, LOD_FLOOR_Y);
             // Topmost non-air cell → the world-space TOP of its run (exclusive),
             // exactly what `Section::topmost_solid` reports from stored runs.
             let (h, block) = match column.iter().rposition(|&id| id != AIR) {
@@ -406,8 +449,8 @@ mod tests {
         use crate::ident::Detail;
         for detail in [FINEST_DETAIL, Detail(FINEST_DETAIL.0 + 3), Detail(FINEST_DETAIL.0 + 7)] {
             for pos in [
-                SectionPos { detail, x: 0, z: 0 },
-                SectionPos { detail, x: -1, z: 2 },
+                SectionPos { body: 0, face: Face::PosY, detail, x: 0, z: 0 },
+                SectionPos { body: 0, face: Face::PosY, detail, x: -1, z: 2 },
             ] {
                 for edit_set in [&[][..], &edits[..]] {
                     let want = resample_reference(pos, &g, edit_set, &colors);
@@ -490,14 +533,14 @@ mod tests {
         }
         // Section beyond finest coverage uses worst_case at finest detail, but coarser ancestor is baked.
         let finest = &mip.levels[0];
-        let past = SectionPos { detail: FINEST_DETAIL, x: finest.x0 + finest.nx as i32 + 1, z: 0 };
+        let past = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: finest.x0 + finest.nx as i32 + 1, z: 0 };
         assert_eq!(
             mip.summary(past).err.get(),
             CellError::worst_case(FINEST_DETAIL).get(),
             "finest section past coverage should be worst_case"
         );
         // Its coarsest ancestor (same ground, largest coverage) is inside the bake.
-        let anc = SectionPos { detail: mip.coarsest, x: past.x >> (mip.coarsest.0 - FINEST_DETAIL.0), z: 0 };
+        let anc = SectionPos { body: 0, face: Face::PosY, detail: mip.coarsest, x: past.x >> (mip.coarsest.0 - FINEST_DETAIL.0), z: 0 };
         assert!(mip.color(anc).is_some(), "coarse ancestor should be baked");
     }
 
@@ -515,7 +558,7 @@ mod tests {
     fn summary_falls_back_beyond_extent() {
         let (reg, g) = terra(3);
         let mip = small(&reg, &g);
-        let far = SectionPos { detail: FINEST_DETAIL, x: 1_000_000, z: 0 };
+        let far = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 1_000_000, z: 0 };
         let s = mip.summary(far);
         assert_eq!(s.err.get(), CellError::worst_case(FINEST_DETAIL).get());
     }
@@ -549,7 +592,7 @@ mod tests {
     fn occlude_flat_world_culls_nothing() {
         let mip = hand_mip(OD, -8, -8, 16, 16, |_, _| (0.0, 0.0));
         for gx in -8..8 {
-            let cell = SectionPos { detail: OD, x: gx, z: 0 };
+            let cell = SectionPos { body: 0, face: Face::PosY, detail: OD, x: gx, z: 0 };
             assert!(
                 !mip.occludes(DVec3::new(0.0, 50.0, 0.0), cell),
                 "flat world culled cell x={gx}"
@@ -563,7 +606,7 @@ mod tests {
         let span = section_span(OD);
         // Wall at grid x==4 rises to 100; everything else is ground level 0.
         let mip = hand_mip(OD, 0, -4, 12, 8, |x, _| if x == 4 { (100.0, 100.0) } else { (0.0, 0.0) });
-        let behind = SectionPos { detail: OD, x: 8, z: 0 };
+        let behind = SectionPos { body: 0, face: Face::PosY, detail: OD, x: 8, z: 0 };
         // Eye just above the ground on the near side of the wall.
         let eye = DVec3::new(0.5 * span as f64, 5.0, 0.5 * span as f64);
         assert!(mip.occludes(eye, behind), "cell behind the wall not culled");
@@ -579,7 +622,7 @@ mod tests {
             8 => (0.0, 200.0),
             _ => (0.0, 0.0),
         });
-        let tower = SectionPos { detail: OD, x: 8, z: 0 };
+        let tower = SectionPos { body: 0, face: Face::PosY, detail: OD, x: 8, z: 0 };
         // Eye high enough that the sightline to the tower top stays above the ridge.
         let eye = DVec3::new(0.5 * span as f64, 150.0, 0.5 * span as f64);
         assert!(!mip.occludes(eye, tower), "tower clearing the ridge was culled (hole)");
@@ -597,7 +640,7 @@ mod tests {
         for &ey in &[0.0f64, 20.0, 90.0, 200.0] {
             for tx in [-10, -3, 4, 11] {
                 for tz in [-8, 0, 9] {
-                    let cell = SectionPos { detail: OD, x: tx, z: tz };
+                    let cell = SectionPos { body: 0, face: Face::PosY, detail: OD, x: tx, z: tz };
                     let Some((_, hi)) = mip.relief_band(cell) else { continue };
                     let eye = DVec3::new(0.0, ey, 0.0);
                     if mip.occludes(eye, cell) {
@@ -623,7 +666,7 @@ mod tests {
     fn occlude_deterministic() {
         let mip = hand_mip(OD, -8, -8, 16, 16, |x, _| if x == 2 { (60.0, 60.0) } else { (0.0, 0.0) });
         let eye = DVec3::new(3.0, 8.0, 1.0);
-        let cell = SectionPos { detail: OD, x: 6, z: 0 };
+        let cell = SectionPos { body: 0, face: Face::PosY, detail: OD, x: 6, z: 0 };
         assert_eq!(mip.occludes(eye, cell), mip.occludes(eye, cell));
     }
 
@@ -634,7 +677,7 @@ mod tests {
     fn resample_cell_matches_an_independent_reduction_over_extracted_columns() {
         let (reg, g) = terra(23);
         let colors = reg.color_snapshot();
-        let pos = SectionPos { detail: FINEST_DETAIL, x: 3, z: -2 };
+        let pos = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 3, z: -2 };
         let got = resample_cell(pos, &g, &[], &colors);
 
         let section = Section::extract(pos, &g, &[], voxel_engine::Rev::START);
@@ -663,7 +706,7 @@ mod tests {
         let (reg, g) = terra(23);
         let stone = reg.id_by_label("rock").unwrap();
         let colors = reg.color_snapshot();
-        let pos = SectionPos { detail: FINEST_DETAIL, x: 100, z: -50 };
+        let pos = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 100, z: -50 };
         let cell = pos.cell_size();
         let (wx, wz) = (pos.min_x() + cell / 2, pos.min_z() + cell / 2); // column (0,0)'s sample point
 

@@ -107,7 +107,7 @@ fn indexed_section_edits_match_the_footprint_scan() {
 
     let mut positions: Vec<section::SectionPos> = world.section_edit_chunks.keys().copied().collect();
     // Also probe positions with no edits at all.
-    positions.push(section::SectionPos { detail: section::FINEST_DETAIL, x: 1000, z: 1000 });
+    positions.push(section::SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 1000, z: 1000 });
     let sort = |mut v: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)>| {
         for (_, cells) in &mut v {
             cells.sort_unstable();
@@ -136,7 +136,7 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
     let mut world = lod2_world();
     world.slot_ceiling = 1024;
     world.gpu_live_slots = 6000;
-    let pos = SectionPos {
+    let pos = SectionPos { body: 0, face: Face::PosY,
         detail: section::FINEST_DETAIL,
         x: 0,
         z: 0,
@@ -385,7 +385,7 @@ fn coverage_skip_is_sound_and_backed() {
     ));
     let mip = world.section_mip.clone().unwrap();
 
-    let cell = SectionPos { detail: section::FINEST_DETAIL, x: 0, z: 0 };
+    let cell = SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 0, z: 0 };
     let (lo, hi) = mip.relief_band(cell).expect("near cell is baked");
     // Centre the eye on the cell's relief so its terrain sits inside the slab.
     world.section_eye_y = ((lo + hi) * 0.5) as f64;
@@ -433,14 +433,14 @@ fn coverage_skip_never_skips_outside_the_core() {
     let mip = world.section_mip.clone().unwrap();
 
     // Far section: clip draws it, so don't skip it.
-    let far = SectionPos { detail: section::FINEST_DETAIL, x: 5, z: 0 };
+    let far = SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 5, z: 0 };
     if let Some((lo, hi)) = mip.relief_band(far) {
         world.section_eye_y = ((lo + hi) * 0.5) as f64;
     }
     assert!(!world.coverage_skips(center, far), "a far section is never skipped");
 
     // Near section but eye is high above it: terrain pokes out of slab, so don't skip.
-    let near = SectionPos { detail: section::FINEST_DETAIL, x: 0, z: 0 };
+    let near = SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 0, z: 0 };
     world.section_eye_y = 5000.0;
     assert!(!world.coverage_skips(center, near), "high eye over low ground is not skipped");
 }
@@ -687,7 +687,7 @@ fn failed_jobs_release_claims_then_quarantine_after_repeated_strikes() {
     assert!((0..=2).all(|cy| !world.generating.contains(&ChunkCoord::new(cx, cy, cz))));
 
     // Section lane: a panicked Meshing claim is dropped so selection retries.
-    let pos = SectionPos { detail: Detail(2), x: 9, z: 9 };
+    let pos = SectionPos { body: 0, face: Face::PosY, detail: Detail(2), x: 9, z: 9 };
     world.sections.insert(pos, SectionState::Meshing { token: pipeline::ClaimToken(3) });
     // A stale token must NOT clear the live claim...
     world.fail_job(pipeline::JobKey::Section { pos, epoch: 0, token: pipeline::ClaimToken(2) });
@@ -726,7 +726,7 @@ fn cancelled_jobs_release_claims_without_strikes() {
     // Section: only the EXACT token clears the claim (a live replacement
     // minted after the cancelled job must survive), and clearing re-arms the
     // covering so selection retries.
-    let pos = SectionPos { detail: Detail(2), x: 7, z: 7 };
+    let pos = SectionPos { body: 0, face: Face::PosY, detail: Detail(2), x: 7, z: 7 };
     world.sections.insert(pos, SectionState::Meshing { token: pipeline::ClaimToken(9) });
     world.cancel_job(pipeline::JobKey::Section { pos, epoch: 0, token: pipeline::ClaimToken(8) });
     assert!(world.sections.contains_key(&pos), "a superseded cancel leaves the live claim");
@@ -2050,12 +2050,12 @@ fn transition_lighting_old_done_is_ignored_in_both_orders() {
 #[test]
 fn section_pending_claim_is_not_stolen_by_a_later_key() {
     let mut world = lod2_world();
-    let a = SectionPos {
+    let a = SectionPos { body: 0, face: Face::PosY,
         detail: section::FINEST_DETAIL,
         x: 1,
         z: 2,
     };
-    let b = SectionPos {
+    let b = SectionPos { body: 0, face: Face::PosY,
         detail: section::FINEST_DETAIL,
         x: 3,
         z: 4,
@@ -2086,7 +2086,7 @@ fn section_pending_claim_is_not_stolen_by_a_later_key() {
 #[test]
 fn late_section_done_after_epoch_bump_does_not_reinsert() {
     let mut world = lod2_world();
-    let pos = SectionPos {
+    let pos = SectionPos { body: 0, face: Face::PosY,
         detail: section::FINEST_DETAIL,
         x: 2,
         z: 2,
@@ -2388,7 +2388,7 @@ fn claim_sequence(seed: u64) {
                 owed_light.clear();
             }
             10 => {
-                let pos = SectionPos {
+                let pos = SectionPos { body: 0, face: Face::PosY,
                     detail: section::FINEST_DETAIL,
                     x: coord.x,
                     z: coord.z,
@@ -2998,4 +2998,160 @@ fn a_round_world_streams_its_chart_net_around_the_eye() {
     assert!(world.spawn_ready() || world.spawn_slab.is_some());
     world.ensure_around(eye);
     assert!(world.spawn_ready(), "the slab is loaded, glued chunks included");
+}
+
+fn chunk_holding(x: i32, y: i32, z: i32) -> Coord {
+    let cs = CHUNK_SIZE as i32;
+    Coord::new(x.div_euclid(cs), y.div_euclid(cs), z.div_euclid(cs))
+}
+
+/// Top solid cell at the centre of `body`'s `face`, and the chunk that holds it.
+fn face_centre_stand(world: &World, body: &terrain::cosmos::Body, face: Face) -> (Coord, i32, i32, i32) {
+    let centre = (
+        i32::try_from(body.centre[0]).expect("centre x"),
+        i32::try_from(body.centre[1]).expect("centre y"),
+        i32::try_from(body.centre[2]).expect("centre z"),
+    );
+    let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
+    let a = world.terrain().surface(face, cu, cv);
+    assert_ne!(a, i32::MIN, "body {} {face:?} has no surface", body.id);
+    let (x, y, z) = FaceFrame::new(face).cell_to_world((cu, a - 1, cv));
+    (chunk_holding(x, y, z), cu, cv, a)
+}
+
+/// Camera on the start cube's +X face: the frontier is that face, and a mesh
+/// extracted there is non-empty at the surface's world altitude.
+#[test]
+fn far_face_home_plus_x_selects_sections_at_the_surface() {
+    let mut world = lod2_world();
+    let home = *world.terrain().cosmos().expect("cosmos").home();
+    let (center, cu, cv, surf) = face_centre_stand(&world, &home, Face::PosX);
+    // World Y of this column is the +X tangent. Altitude comes from the chunk's X.
+    world.section_eye_y = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv)).1 as f64;
+    let desired = world.desired_sections(center);
+    assert!(!desired.is_empty(), "no sections on +X");
+    assert!(desired.iter().all(|s| s.body == home.id && s.face == Face::PosX), "frontier left +X: {desired:?}");
+    assert!(
+        desired.iter().any(|s| (s.min_x() - cu).abs() < 50_000 && (s.min_z() - cv).abs() < 50_000),
+        "frontier is not around the face centre"
+    );
+    let pos = desired
+        .iter()
+        .copied()
+        .filter(|s| s.detail == section::FINEST_DETAIL)
+        .min_by_key(|s| (s.min_x() - cu).abs() + (s.min_z() - cv).abs())
+        .expect("a finest +X section");
+    let tables = world.registry().hot_tables();
+    let mesh = section::extract_section_mesh(pos, world.terrain(), &[], &tables);
+    assert!(mesh.vertex_bytes() > 0, "+X section meshed empty");
+    assert!(mesh.altitude_floor > 20_000_000, "window stayed at the origin: {}", mesh.altitude_floor);
+    let u = pos.min_x() + pos.span() / 2;
+    let v = pos.min_z() + pos.span() / 2;
+    let column = world.terrain().surface(Face::PosX, u, v);
+    assert_ne!(column, i32::MIN);
+    let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+    let block = 16i32 << detail.0;
+    let covers = mesh.slabs.iter().any(|slab| {
+        let place = SectionState::slab_placement(pos, slab.origin_y, detail, mesh.altitude_floor);
+        let x0 = place.block.x;
+        (x0..x0 + block).contains(&(column - 1))
+    });
+    assert!(covers, "surface {column} is outside the placed slabs (floor {})", mesh.altitude_floor);
+}
+
+/// A twin cube's +Y face selects that body's sections, not the start cube's.
+#[test]
+fn far_face_twin_selects_that_body() {
+    let mut world = lod2_world();
+    let twin = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .expect("a twin");
+    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosY);
+    let (_, y, _) = FaceFrame::new(Face::PosY).cell_to_world((cu, surf - 1, cv));
+    world.section_eye_y = y as f64;
+    let desired = world.desired_sections(center);
+    assert!(!desired.is_empty());
+    let body = desired[0].body;
+    let kind = world.terrain().cosmos().unwrap().bodies().iter().find(|b| b.id == body).unwrap().kind;
+    assert_eq!(kind, terrain::cosmos::Kind::Twin);
+    assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY));
+    assert!(desired.iter().any(|s| (s.min_x() - cu).abs() < 50_000 && (s.min_z() - cv).abs() < 50_000));
+}
+
+/// Within two finest sections of a face edge, the neighbour face joins the frontier.
+#[test]
+fn far_face_edge_unions_the_neighbour() {
+    let mut world = lod2_world();
+    let half = terrain::cosmos::HOME_HALF as i32;
+    let x = half - 100;
+    let y = world.terrain().surface(Face::PosY, x, 0);
+    assert_ne!(y, i32::MIN);
+    world.section_eye_y = y as f64;
+    let center = chunk_holding(x, y, 0);
+    let desired = world.desired_sections(center);
+    assert!(desired.iter().any(|s| s.body == 0 && s.face == Face::PosY), "missing +Y");
+    assert!(desired.iter().any(|s| s.body == 0 && s.face == Face::PosX), "missing the +X neighbour");
+}
+
+/// A streaming centre in storage (a round body) selects no far sections.
+#[test]
+fn far_face_storage_selects_none() {
+    use crate::space::atlas::Patch;
+    let mut world = lod2_world();
+    let verdant = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Verdant)
+        .expect("Verdance");
+    let atlas = world
+        .terrain()
+        .atlases()
+        .iter()
+        .find(|a| (a.centre - verdant.centre_f()).length() < 1.0)
+        .expect("Verdance is charted")
+        .clone();
+    let top = Patch::Shell { band: 0, face: Face::PosY };
+    let (o, _) = atlas.storage_box(top);
+    let b = atlas.bands[0];
+    let (si, sj) = (o[0] + b.n / 2, o[2] + b.n / 2);
+    let ground = world.terrain().surface(Face::PosY, si as i32, sj as i32);
+    assert_ne!(ground, i32::MIN, "the chart has no surface");
+    let centre = chunk_holding(si as i32, ground, sj as i32);
+    assert!(world.adopt_fold(centre), "storage centre did not fold");
+    assert!(!world.fold.is_identity());
+    world.section_eye_y = ground as f64;
+    assert!(world.desired_sections(centre).is_empty(), "storage must select nothing");
+}
+
+/// Breaking a block on the home +X face dirties that face's section, not +Y.
+#[test]
+fn far_face_plus_x_edit_dirties_the_face_section() {
+    let mut world = lod2_world();
+    let home = *world.terrain().cosmos().expect("cosmos").home();
+    let (_, cu, cv, surf) = face_centre_stand(&world, &home, Face::PosX);
+    let (x, y, z) = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv));
+    assert_ne!(world.terrain().voxel_at(x, y, z), AIR, "the crust cell is air");
+    world.set_block(x, y, z, AIR);
+    let span = section::section_span(section::FINEST_DETAIL);
+    assert!(
+        world.dirty_sections.iter().any(|p| {
+            p.body == home.id
+                && p.face == Face::PosX
+                && p.detail == section::FINEST_DETAIL
+                && p.x == cu.div_euclid(span)
+                && p.z == cv.div_euclid(span)
+        }),
+        "dirty set {:?} missed the +X section",
+        world.dirty_sections
+    );
 }

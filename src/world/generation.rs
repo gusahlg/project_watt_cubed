@@ -214,6 +214,30 @@ pub trait TerrainGenerator: Send + Sync {
         }
     }
 
+    /// Face-local twin of [`lod_column`](Self::lod_column). `alts` are world altitudes
+    /// along `face`'s normal. PosY is today's column; any other face is air unless overridden.
+    fn lod_column_face(&self, _body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {
+        if face == Face::PosY {
+            self.lod_column(u, v, alts, out);
+        } else {
+            for o in out.iter_mut().take(alts.len()) {
+                *o = AIR;
+            }
+        }
+    }
+
+    /// Min and max surface altitude (world `a`) over the face-local square
+    /// `[u0, u0+span) × [v0, v0+span)`. `None` when that square holds no surface
+    /// of `body`'s `face`. PosY's default is the legacy domain `[0, 512]`.
+    fn surface_bounds(&self, _body: u16, face: Face, _u0: i32, _v0: i32, _span: i32) -> Option<(i32, i32)> {
+        if face == Face::PosY { Some((0, 512)) } else { None }
+    }
+
+    /// World altitude of face-local height 0. PosY at the origin is 0.
+    fn face_datum(&self, _body: u16, _face: Face) -> i32 {
+        0
+    }
+
     /// Generate chunk; default dense then collapse; generators shortcut.
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let y0 = cy * CHUNK_SIZE as i32;

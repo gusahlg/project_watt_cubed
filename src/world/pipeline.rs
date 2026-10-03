@@ -374,6 +374,8 @@ impl MeshPayload {
 pub(in crate::world) struct StagedSection {
     pub shift: u8,
     pub slabs: Vec<StagedSlab>,
+    /// World altitude of native cell 0. `0` on the legacy window.
+    pub altitude_floor: i32,
 }
 
 /// One staged slab of a [`StagedSection`].
@@ -528,7 +530,7 @@ fn try_stage_section(
         }
         slabs.push(StagedSlab { origin_y: slab.origin_y, passes });
     }
-    Some(Box::new(StagedSection { shift: data.shift, slabs }))
+    Some(Box::new(StagedSection { shift: data.shift, slabs, altitude_floor: data.altitude_floor }))
 }
 
 fn mesh_payload_from_output(
@@ -1708,7 +1710,7 @@ mod tests {
     /// Create a far section job tagged by id for scheduler tests.
     fn section_job(terrain: &Generator, id: i32) -> Job {
         Job::Section {
-            pos: SectionPos {
+            pos: SectionPos { body: 0, face: Face::PosY,
                 detail: crate::ident::Detail(2),
                 x: id,
                 z: 0,
@@ -2446,7 +2448,7 @@ mod tests {
                 coord: Coord::new(-1, 0, 1),
             },
             JobKey::Section {
-                pos: SectionPos {
+                pos: SectionPos { body: 0, face: Face::PosY,
                     detail: crate::ident::Detail(2),
                     x: 5,
                     z: -5,

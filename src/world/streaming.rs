@@ -18,7 +18,7 @@ use super::chunk::{CHUNK_SIZE, Chunk, ChunkData};
 use super::generation::{Classify, ColumnHeights};
 use crate::block::registry::AIR;
 use super::heightmip::{BakeExtent, HeightMip};
-use super::metric::{DyCap, EyeMetric, HeightEnvelope};
+use super::metric::{DyCap, EyeDist, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
 use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
@@ -1015,6 +1015,7 @@ impl World {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamTiles);
             // Update pyramid unit to track the current view distance.
             self.section_pyramid.unit = self.view.lod_unit();
+            self.update_lod_face(center_chunk);
             // Until the bake lands, selection uses the worst-case ladder;
             // mip only coarsens, no upward pops during bake.
             let mip_lane = self.lanes().mip;
@@ -1031,8 +1032,17 @@ impl World {
             // a still camera — the sweep (grid walk + relief coarsening) is
             // skipped entirely. Edits force a recompute: relief coarsening
             // consults the edit overlay, which the key cannot cheaply cover.
+            let (body, face_u8, cu, cv) = match self.section_lod_face {
+                Some((b, f)) => {
+                    let (cu, _, cv) = FaceFrame::new(f).chunk_to_local(center_chunk);
+                    (b, f as u8, cu, cv)
+                }
+                None => (u16::MAX, u8::MAX, 0, 0),
+            };
             let frontier_key = SectionFrontierKey {
-                center_xz: [center_chunk.x, center_chunk.z],
+                center_xz: [cu, cv],
+                body,
+                face: face_u8,
                 eye_y: self.section_eye_y.to_bits(),
                 // Quantise to 0.25 m/s so a continuously changing flight
                 // velocity does not recompute the frontier every pass.
@@ -2652,40 +2662,59 @@ impl World {
 
     // Column-LOD section selection and streaming.
 
-    /// Per-frame selection metric: chunk-centre XZ, `dy` from eye altitude to LOD envelope.
-    /// XZ stays on chunk centre (not eye) to keep `dy=0` bit-identical to shipped LOD2.
-    /// `delta` is prediction offset applied as inflation off the static anchor.
-    fn section_metric(&self, center: Coord, delta: DVec3) -> EyeMetric {
+    /// Per-frame selection metric: chunk-centre tangents, `dy` from eye altitude to the LOD envelope.
+    /// Tangents stay on the chunk centre (not the raw eye) so PosY `dy=0` stays bit-identical.
+    /// Altitude is relative to the face datum, so the envelope stays `[0, 512]` on every face.
+    fn section_metric_on(&self, center: Coord, delta: DVec3, face: Face, datum: i32) -> EyeMetric {
         let cs = CHUNK_SIZE as i32;
-        let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
         let cfg = &self.section_pyramid;
-        EyeMetric::new(
-            DVec3::new(
-                pcx as f64 + delta.x,
-                self.section_eye_y + delta.y,
-                pcz as f64 + delta.z,
-            ),
-            HeightEnvelope::new(
-                super::section::LOD_FLOOR_Y as f32,
-                super::section::LOD_CEIL_Y as f32,
-            ),
-            DyCap::new(cfg.outer_m(), cfg.base),
-        )
+        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
+        let cap = DyCap::new(cfg.outer_m(), cfg.base);
+        if face == Face::PosY && datum == 0 {
+            let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
+            return EyeMetric::new(
+                DVec3::new(pcx as f64 + delta.x, self.section_eye_y + delta.y, pcz as f64 + delta.z),
+                env,
+                cap,
+            );
+        }
+        let frame = FaceFrame::new(face);
+        let (cu, _, cv) = frame.chunk_to_local(center);
+        let (u, v) = (cu * cs + cs / 2, cv * cs + cs / 2);
+        let d = frame.point_to_local(delta);
+        let eye = DVec3::new((center.x * cs + cs / 2) as f64, self.section_eye_y, (center.z * cs + cs / 2) as f64);
+        let rel = frame.point_to_local(eye).y + d.y - datum as f64;
+        EyeMetric::new(DVec3::new(u as f64 + d.x, rel, v as f64 + d.z), env, cap)
     }
 
-    /// Desired frontier at one metric: radial ladder, coarsened by per-cell relief
-    /// once max-mip bakes.
-    fn frontier(&self, metric: &EyeMetric) -> Vec<SectionPos> {
+    /// Desired frontier at one metric, stamped with `body`/`face` before coarsening
+    /// so a parent keeps the frame and the mip lookup hits the right bake.
+    fn frontier(&self, metric: &EyeMetric, body: u16, face: Face) -> Vec<SectionPos> {
         let cfg = &self.section_pyramid;
-        let radial = quadtree::desired_sections(metric, cfg);
+        let mut radial = quadtree::desired_sections(metric, cfg);
+        for s in &mut radial {
+            s.body = body;
+            s.face = face;
+        }
+        let anchor = self.section_mip_anchor;
         let selected = match &self.section_mip {
             Some(mip) => {
-                let summary_at = |c: SectionPos| match self.section_overlay.get(&c) {
-                    Some(ov) => CellSummary {
-                        env: HeightEnvelope::new(ov.lo, ov.hi),
-                        err: CellError::from_metres(ov.hi - ov.lo),
-                    },
-                    None => mip.summary(c),
+                let summary_at = |c: SectionPos| {
+                    if let Some((b, f, _, _)) = anchor
+                        && (c.body != b || c.face != f)
+                    {
+                        return CellSummary {
+                            env: HeightEnvelope::new(0.0, super::section::DOMAIN_H as f32),
+                            err: CellError::worst_case(c.detail),
+                        };
+                    }
+                    match self.section_overlay.get(&c) {
+                        Some(ov) => CellSummary {
+                            env: HeightEnvelope::new(ov.lo, ov.hi),
+                            err: CellError::from_metres(ov.hi - ov.lo),
+                        },
+                        None => mip.summary(c),
+                    }
                 };
                 quadtree::coarsen_by_error(radial, metric, cfg, &summary_at, &self.sse_budget())
             }
@@ -2702,22 +2731,43 @@ impl World {
         SseBudget::ladder(self.section_pyramid.unit, self.section_pyramid.finest.0)
     }
 
-    /// Spawn background max-mip bake (idempotent: no-op if spawned or landed).
-    /// Runs off main thread; worst-case ladder streams meanwhile.
+    /// Spawn background max-mip bake around the eye's face. Re-bakes when the eye
+    /// leaves the inner half of the baked square, or the body/face changes.
+    /// A still camera (anchor held, bake landed or in flight) allocates nothing.
     pub(in crate::world) fn ensure_mip_bake(&mut self) {
-        if self.section_mip.is_some() || self.section_mip_rx.is_some() {
+        if self.section_face_set && self.section_lod_face.is_none() {
             return;
         }
+        let (body, face) = self.section_lod_face.unwrap_or((0, Face::PosY));
+        let (au, av) = match (self.section_face_set, self.center) {
+            (true, Some(c)) => self.face_tangent_centre(c, face),
+            _ => (0, 0),
+        };
+        let cfg = &self.section_pyramid;
+        let extent = BakeExtent::new(cfg.outer_m() as i32, cfg.coarsest());
+        let half = extent.half_m() / 2;
+        let face_changed = self.section_mip_anchor.is_some_and(|(b, f, _, _)| b != body || f != face);
+        if face_changed {
+            self.section_mip = None;
+            self.section_mip_rx = None;
+            self.section_frontier_key = None;
+        }
+        let moved = self.section_mip_anchor.is_some_and(|(_, _, u, v)| (au - u).abs() > half || (av - v).abs() > half);
+        if !face_changed && !moved && (self.section_mip.is_some() || self.section_mip_rx.is_some()) {
+            return;
+        }
+        if self.section_mip_rx.is_some() {
+            return;
+        }
+        self.section_mip_anchor = Some((body, face, au, av));
         let generator = self.generator.clone();
         // The generator stores resolved IDs for every element-worldgen
         // composition registered during `World::new`. A fresh builtin registry
         // is too short for those IDs; snapshot the matching color table instead.
         let colors = self.registry.color_snapshot();
-        let cfg = &self.section_pyramid;
-        let extent = BakeExtent::new(cfg.outer_m() as i32, cfg.coarsest());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(HeightMip::bake(&*generator, &colors, extent));
+            let _ = tx.send(HeightMip::bake_at(&*generator, &colors, extent, au, av, face, body));
         });
         self.section_mip_rx = Some(rx);
     }
@@ -2785,15 +2835,101 @@ impl World {
 
     /// Desired frontier: union of static eye and velocity-predicted eye position.
     /// Pulls sections ahead of player motion. At rest, velocity is zero so returns
-    /// static frontier bit-for-bit.
+    /// static frontier bit-for-bit. Storage, open space, and round bodies select nothing.
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        let base = self.frontier(&self.section_metric(center, DVec3::ZERO));
+        let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
+        let Some((body, face)) = focus else { return Vec::new() };
+        let mut out = self.frontier_union(center, body, face);
+        for nface in self.edge_faces(center, body, face) {
+            out = quadtree::union_frontiers(out, self.frontier_union(center, body, nface));
+        }
+        out
+    }
+
+    fn frontier_union(&self, center: Coord, body: u16, face: Face) -> Vec<SectionPos> {
+        let datum = self.generator.face_datum(body, face);
+        let base = self.frontier(&self.section_metric_on(center, DVec3::ZERO, face, datum), body, face);
         let delta = self.section_vel * TAU_STREAM;
         if delta == DVec3::ZERO {
             return base;
         }
-        let predicted = self.frontier(&self.section_metric(center, delta));
+        let predicted = self.frontier(&self.section_metric_on(center, delta, face, datum), body, face);
         quadtree::union_frontiers(base, predicted)
+    }
+
+    /// Chunk-centre sample the far field treats as the eye (tangents quantised, altitude exact on Y).
+    fn lod_eye_point(&self, center: Coord) -> DVec3 {
+        let cs = CHUNK_SIZE as i32;
+        DVec3::new((center.x * cs + cs / 2) as f64, self.section_eye_y, (center.z * cs + cs / 2) as f64)
+    }
+
+    /// Face-local chunk-centre tangents.
+    fn face_tangent_centre(&self, center: Coord, face: Face) -> (i32, i32) {
+        let cs = CHUNK_SIZE as i32;
+        let (cu, _, cv) = FaceFrame::new(face).chunk_to_local(center);
+        (cu * cs + cs / 2, cv * cs + cs / 2)
+    }
+
+    /// The cube face under the camera. `None` in storage, in open space, or over a round body.
+    fn dominant_lod_face(&self, center: Coord) -> Option<(u16, Face)> {
+        if !self.fold.is_identity() {
+            return None;
+        }
+        let Some(cosmos) = self.generator.cosmos() else {
+            return Some((0, Face::PosY));
+        };
+        let eye = self.lod_eye_point(center);
+        let body = cosmos.body_at(eye)?;
+        if !matches!(body.shape, super::terrain::cosmos::Shape::Cube { .. }) {
+            return None;
+        }
+        Some((body.id, Face::from_dominant(eye - body.centre_f())))
+    }
+
+    /// Commit the face for this pass. The previous face sticks while its component
+    /// is within two finest sections of the dominant one (the edge).
+    fn update_lod_face(&mut self, center: Coord) {
+        let dominant = self.dominant_lod_face(center);
+        self.section_lod_face = match (self.section_lod_face, dominant) {
+            (Some((id, prev)), Some((bid, _))) if id == bid && self.face_holds(center, id, prev) => Some((id, prev)),
+            _ => dominant,
+        };
+        self.section_face_set = true;
+    }
+
+    fn face_holds(&self, center: Coord, body_id: u16, prev: Face) -> bool {
+        let Some(cosmos) = self.generator.cosmos() else { return prev == Face::PosY };
+        let Some(body) = cosmos.bodies().iter().find(|b| b.id == body_id) else { return false };
+        let rel = self.lod_eye_point(center) - body.centre_f();
+        let comps = [rel.x.abs(), rel.y.abs(), rel.z.abs()];
+        let max = comps[0].max(comps[1]).max(comps[2]);
+        let band = (super::section::section_span(super::section::FINEST_DETAIL) * 2) as f64;
+        max - comps[prev.axis()] <= band
+    }
+
+    /// Neighbouring faces whose squares are within two finest sections of the eye.
+    fn edge_faces(&self, center: Coord, body_id: u16, face: Face) -> Vec<Face> {
+        let Some(cosmos) = self.generator.cosmos() else { return Vec::new() };
+        let Some(body) = cosmos.bodies().iter().find(|b| b.id == body_id) else { return Vec::new() };
+        let super::terrain::cosmos::Shape::Cube { half } = body.shape else { return Vec::new() };
+        let frame = FaceFrame::new(face);
+        let local = frame.point_to_local(self.lod_eye_point(center) - body.centre_f());
+        let band = (super::section::section_span(super::section::FINEST_DETAIL) * 2) as f64;
+        let mut out = Vec::new();
+        let mut push = |du: i32, dv: i32| {
+            let (x, y, z) = frame.cell_to_world((du, 0, dv));
+            let n = Face::from_dominant(DVec3::new(x as f64, y as f64, z as f64));
+            if n != face && !out.contains(&n) {
+                out.push(n);
+            }
+        };
+        if half as f64 - local.x.abs() < band && local.x != 0.0 {
+            push(local.x.signum() as i32, 0);
+        }
+        if half as f64 - local.z.abs() < band && local.z != 0.0 {
+            push(0, local.z.signum() as i32);
+        }
+        out
     }
 
     /// True if the cell or a Ready ancestor covers it.
@@ -2878,7 +3014,9 @@ impl World {
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
-        let metric = self.section_metric(center, DVec3::ZERO);
+        let metric_face = self.section_lod_face.map(|(_, f)| f).unwrap_or(Face::PosY);
+        let metric_body = self.section_lod_face.map(|(b, _)| b).unwrap_or(0);
+        let metric = self.section_metric_on(center, DVec3::ZERO, metric_face, self.generator.face_datum(metric_body, metric_face));
         let cfg = &self.section_pyramid;
         let stale: Vec<SectionPos> = self
             .sections
@@ -2890,7 +3028,12 @@ impl World {
                 }
                 let span = s.span();
                 let (cx, cz) = (s.x * span + span / 2, s.z * span + span / 2);
-                let dist = metric.point(cx as f64, cz as f64);
+                // A section on another face is kept only while it is still desired.
+                let dist = if s.body == metric_body && s.face == metric_face {
+                    metric.point(cx as f64, cz as f64)
+                } else {
+                    EyeDist::new(f32::MAX)
+                };
                 !pyramid::acceptable(dist, s.detail, cfg)
             })
             .collect();
