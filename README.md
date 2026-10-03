@@ -4,6 +4,27 @@ A voxel is a **configuration** of points on a 4-D resource lattice; one integer
 **law** decides how neighbouring matter changes. Names are presentation only —
 see [documentation/material-model.md](documentation/material-model.md).
 
+## Mods: vanilla and modded builds
+
+PWC mods are compiled into the game. This repository is the **runtime**: `cargo run --release`
+(or `nix run`, `./play.sh`) starts **vanilla** PWC — the bare core with no mod at all (a flat
+world, flat colours, the core menus). The shipped experience — menus and start screen, hotbar and
+inventory, the fancy visual lanes, neural textures, material names and the InfiniteDiffusion
+world — is the `pwc.essentials` bundle of first-party mod packages, built by the
+[PWC package manager](../pwc-package-manager):
+
+```sh
+pwc setup                            # once: finds this checkout and the first-party mods
+pwc instance create default --use
+pwc mod add pwc.essentials
+pwc run                              # builds PWC + the mods into one executable, then runs it
+```
+
+Mods compile against [`crates/pwc-mod-api`](crates/pwc-mod-api); the game side of the system is
+described in [documentation/mods.md](documentation/mods.md), the package format and tooling in the
+package manager's docs, and what mods may and may not do in [MOD_POLICY.md](MOD_POLICY.md).
+[`examples/mods/hello-hud`](examples/mods/hello-hud) is a complete minimal mod.
+
 ## Multiplayer
 
 The world is procedural, so multiplayer stays cheap: the network never ships voxel

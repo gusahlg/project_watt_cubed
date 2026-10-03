@@ -11,6 +11,7 @@ path = [
   "Cargo.lock",
   "Cargo.toml",
   "crates/**",
+  "examples/**",
   "deny.toml",
   "flake.lock",
   "flake.nix",

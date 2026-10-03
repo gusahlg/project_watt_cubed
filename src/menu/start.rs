@@ -7,10 +7,11 @@
 //! and returns [`StartAction`]s. App routes those through the same
 //! [`AppEffect`](super::AppEffect) `handle_effect` path as before.
 //!
-//! First enabled mod that returns `Some` from [`Mod::start_screen`](crate::mods::Mod::start_screen)
+//! First enabled mod that returns `Some` from [`Mod::start_screen`](crate::modding::Mod::start_screen)
 //! wins; the core fallback is a plain list so the game is always startable.
 
-use crate::save::{Slot, SlotId};
+/// The save-slot types a start screen sees in [`StartFacts::saves`], re-exported for mods.
+pub use crate::save::slot::{SaveError, SaveMeta, Slot, SlotId};
 use crate::session::Session;
 
 use super::theme::{MenuTheme, PresentedRow, PresentedView};

@@ -16,4 +16,9 @@ export WATT_ASSET_DIR="${WATT_ASSET_DIR:-$PWD/assets}"
 # The mods screen writes `mods.toml` in the checkout, not the data dir.
 export WATT_CHECKOUT_DIR="$PWD"
 nix flake update voxel-engine
+# The checkout builds vanilla PWC. With the PWC package manager installed and an instance
+# selected (`pwc instance use <name>`), `PWC_PLAY=instance ./play.sh` runs that modded build.
+if [ "${PWC_PLAY:-}" = instance ] && command -v pwc >/dev/null; then
+  exec pwc run -- "$@"
+fi
 exec nix run . "$@"

@@ -47,7 +47,7 @@ fn main() {
         },
     ];
 
-    let reports = run_stress(&specs);
+    let reports = run_stress(&specs, &project_watt_cubed::modding::GameBuild::vanilla());
 
     println!();
     println!("stress: {} scenario(s)", reports.len());

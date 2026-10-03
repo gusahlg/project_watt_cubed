@@ -19,7 +19,7 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::mods::{ChoicesFlush, Mods};
+use crate::modding::{ChoicesFlush, GameBuild, Mods};
 use crate::net::client::Connection;
 use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
@@ -133,9 +133,15 @@ impl ActiveSlot {
 }
 
 impl App {
-    pub fn new() -> Self {
+    /// The app for one build: `build` lists the mod packages compiled into this executable.
+    pub fn new(build: &GameBuild) -> Self {
         crate::paths::Paths::init(None);
-        let mut mods = Mods::with_defaults();
+        match build.environment() {
+            Some(env) => eprintln!("PWC: {} mod packages, environment {env}", build.packages().len()),
+            None if build.packages().is_empty() => eprintln!("PWC: vanilla build (no mod packages)"),
+            None => eprintln!("PWC: {} mod packages", build.packages().len()),
+        }
+        let mut mods = Mods::from_build(build);
         mods.load_choices();
         let pins = Benchmark::mod_pins_from_env();
         mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
@@ -941,11 +947,6 @@ impl App {
     }
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Parse the winning worldgen payload as generator knobs.
 fn terrain_cfg_from_mods(mods: &Mods) -> TerrainCfg {

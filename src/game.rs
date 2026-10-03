@@ -23,7 +23,7 @@ use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
 use crate::minimap::{Minimap, MinimapConfig};
-use crate::mods::{ModContext, Mods};
+use crate::modding::{ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
@@ -263,7 +263,7 @@ pub struct Game {
     /// Benchmarks drive the camera themselves; stray keystrokes must not steer or stall the run.
     input_locked: bool,
     /// Visual groups enabled by mods; fancy lanes strip when a group is off.
-    visual_mask: crate::mods::VisualMask,
+    visual_mask: crate::modding::VisualMask,
     /// The typed look/lane config this game draws with (was the `WATT_CLOUDS`/
     /// `WATT_WEATHER` env reads). `compose` reads the per-frame look lanes from
     /// it. The live path uses [`RenderConfig::default`]; the harness pins
@@ -392,7 +392,7 @@ impl Game {
             debug_view: DebugView::Normal,
             scripted: false,
             input_locked: false,
-            visual_mask: crate::mods::VisualMask::default(),
+            visual_mask: crate::modding::VisualMask::default(),
             render: crate::render_config::RenderConfig::default(),
             sched,
             sim_source: sim_id,
@@ -606,7 +606,7 @@ impl Game {
         self.input_locked = locked;
     }
 
-    pub fn set_visual_mask(&mut self, mask: crate::mods::VisualMask) {
+    pub fn set_visual_mask(&mut self, mask: crate::modding::VisualMask) {
         self.visual_mask = mask;
     }
 
@@ -1894,7 +1894,6 @@ mod tests {
         use crate::audio::palette::CuePalette;
         use crate::audio::SoundSystem;
         use crate::input::router::Router;
-        use crate::mods::Mods;
         use crate::settings::Settings;
         use crate::ui::HudMode;
 
@@ -1923,7 +1922,7 @@ mod tests {
         let (palette, _) = CuePalette::build(&symbols, sound.catalog());
         let mut audio = crate::audio::AudioDirector::new(palette);
         let mut router = Router::new();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         const DT: f32 = 1.0 / 60.0;
 
         let mut last_allocs = u64::MAX;
@@ -1980,7 +1979,6 @@ mod tests {
         use crate::audio::palette::CuePalette;
         use crate::audio::SoundSystem;
         use crate::input::router::Router;
-        use crate::mods::Mods;
         use crate::settings::Settings;
 
         let mut settings = Settings::default();
@@ -2029,7 +2027,7 @@ mod tests {
         let (palette, _) = CuePalette::build(&symbols, sound.catalog());
         let mut audio = crate::audio::AudioDirector::new(palette);
         let mut router = Router::new();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         const DT: f32 = 1.0 / 60.0;
         for i in 0..10 {
             alloc_count::reset();

@@ -147,7 +147,7 @@ pub const DEFAULT_PORT: u16 = 5555;
 /// before a byte of its body is read, so a hostile peer can't force a huge alloc.
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
-pub(crate) const MAX_NAME: usize = 24;
+pub const MAX_NAME: usize = 24;
 pub(crate) const MAX_CHAT: usize = 256;
 pub(crate) const MAX_SPEC: usize = 256;
 

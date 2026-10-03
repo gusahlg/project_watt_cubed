@@ -1799,6 +1799,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pwc-mod-api"
+version = "1.0.0"
+dependencies = [
+ "project_watt_cubed",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,27 +1,28 @@
-//! The mod system: the game's "minimal core, layers on top" made real. Core
+//! The mod host: the game's "minimal core, layers on top" made real. Core
 //! gameplay owns the world, the law and physics; everything player-facing that
 //! isn't essential — the inventory, the hotbar, block looks and names, HUD
 //! widgets — is a [`Mod`] that can be toggled at runtime from the mod menu.
+//!
+//! Mods are **compiled in**. A mod package (`.pwcmod`, see the PWC package
+//! manager) is a Rust crate whose `register` function receives a
+//! [`ModRegistrar`]; a [`GameBuild`] lists the packages of one exact build, and
+//! [`Mods::from_build`] calls each `register` in dependency order. The core
+//! itself installs no mod: `GameBuild::vanilla()` is the bare game.
 //!
 //! **Performance:** mod hooks fire only at frame and event granularity —
 //! `update`/`draw` once per frame, `on_block_break` once per broken block. Nothing
 //! here is ever called from the voxel hot path (meshing, collision, streaming), and
 //! disabled mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
-pub mod diffusion;
-pub mod hotbar;
-pub mod inventory;
-pub mod menu_default;
-pub mod naming;
-pub mod start_screen;
-pub mod textures;
-pub mod visuals;
+mod build;
+#[cfg(test)]
+pub(crate) mod testing;
 
-use std::cell::Cell;
+pub use build::{GameBuild, ModDescriptor, ModRegistrar};
+
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
 
 use crate::block::appearance::{BlockAppearance, FLAT};
 use crate::block::naming::MaterialNamer;
@@ -35,12 +36,20 @@ use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
-/// Group id of the shipped built-in mods. Display name lives on [`Mods::GROUPS`].
+/// Group id of the first-party essentials (menus, inventory, hotbar, looks, names, worldgen).
 pub const ESSENTIALS: &str = "essentials";
+
+/// The well-known essentials group. Mods returning [`ESSENTIALS`] from [`Mod::group`] are shown
+/// under it without declaring it themselves.
+pub const ESSENTIALS_GROUP: Group = Group {
+    id: ESSENTIALS,
+    name: "Essentials",
+    description: "Menus, inventory, hotbar, looks, names and worldgen.",
+};
 
 /// Named group of related mods. The id is the stable key; the display name
 /// can change here without touching every member.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Group {
     pub id: &'static str,
     pub name: &'static str,
@@ -119,19 +128,6 @@ pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
     }
 }
 
-/// Shared state of the inventory and the hotbar: whether the inventory panel is open (it then
-/// owns the number keys and the wheel, to equip into hotbar slots).
-#[derive(Clone, Copy)]
-pub(crate) struct ItemUiState {
-    pub inventory_visible: bool,
-}
-
-impl Default for ItemUiState {
-    fn default() -> Self {
-        Self { inventory_visible: false }
-    }
-}
-
 /// The coarse, per-frame state a mod may read and mutate. Deliberately holds only
 /// whole-game handles (never a voxel), so a mod can't reach into the hot path.
 pub struct ModContext<'a> {
@@ -200,7 +196,8 @@ pub trait Mod {
         ""
     }
 
-    /// Group id from [`Mods::GROUPS`], or `""` if ungrouped.
+    /// Group id ([`ESSENTIALS`] or one declared with [`ModRegistrar::declare_group`]), or `""`
+    /// if ungrouped.
     fn group(&self) -> &'static str {
         ""
     }
@@ -361,43 +358,28 @@ pub trait Mod {
 struct Entry {
     module: Box<dyn Mod>,
     enabled: bool,
+    /// Id of the package that registered it (`None` for mods installed directly).
+    package: Option<&'static str>,
 }
 
 /// The set of installed mods and their on/off state. Enable/disable choices persist
 /// in `mods.cfg`; per-world state is saved through each mod's `save_state`/`load_state`.
 pub struct Mods {
     entries: Vec<Entry>,
+    /// Groups declared by packages, after the well-known [`ESSENTIALS_GROUP`].
+    declared_groups: Vec<Group>,
 }
 
 impl Mods {
-    /// Groups shown as sections on the mods screen, in this order.
-    pub const GROUPS: &[Group] = &[Group {
-        id: ESSENTIALS,
-        name: "Essentials",
-        description: "Menus, inventory, hotbar, looks, names and worldgen.",
-    }];
-
-    /// The default install, all enabled: the menu mod (look/feel of every out-of-game screen)
-    /// first so it wins first-handler dispatch, the start-screen mod, the inventory and the
-    /// hotbar (sharing [`ItemUiState`]), the fancy visual lanes, neural textures, material names,
-    /// and InfiniteDiffusion worldgen.
-    pub fn with_defaults() -> Self {
-        let mut mods = Self {
-            entries: Vec::new(),
-        };
-        let item_ui = Rc::new(Cell::new(ItemUiState::default()));
-        let bar = Rc::new(Cell::new(hotbar::HotbarState::default()));
-        mods.install(Box::new(menu_default::MenuDefaultMod::new()), true);
-        mods.install(Box::new(start_screen::StartScreenMod::new()), true);
-        mods.install(Box::new(inventory::InventoryMod::new(item_ui.clone(), bar.clone())), true);
-        mods.install(Box::new(hotbar::HotbarMod::new(item_ui, bar)), true);
-        // Fancy lanes live in mods; disable any of these to get the core look.
-        mods.install(Box::new(visuals::AtmosphereMod), true);
-        mods.install(Box::new(visuals::PostMod), true);
-        mods.install(Box::new(visuals::LightingMod), true);
-        mods.install(Box::new(textures::neural::NeuralTexturesMod::new()), true);
-        mods.install(Box::new(naming::NamingMod::new()), true);
-        mods.install(Box::new(diffusion::InfiniteDiffusionMod::new()), true);
+    /// Instantiate every package of `build`, in its (dependency) order. Each package's
+    /// `register` sees the resources its dependencies provided.
+    pub fn from_build(build: &GameBuild) -> Self {
+        let mut mods = Self::empty();
+        let mut resources = build::Resources::default();
+        for package in build.packages() {
+            let mut registrar = ModRegistrar::new(package, &mut mods, &mut resources);
+            (package.register)(&mut registrar);
+        }
         mods
     }
 
@@ -405,16 +387,38 @@ impl Mods {
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
+            declared_groups: Vec::new(),
         }
     }
 
     /// Install a mod, running its enable hook if it starts on.
     pub fn install(&mut self, module: Box<dyn Mod>, enabled: bool) {
-        let mut entry = Entry { module, enabled };
+        self.install_from(None, module, enabled);
+    }
+
+    fn install_from(&mut self, package: Option<&'static str>, module: Box<dyn Mod>, enabled: bool) {
+        let mut entry = Entry { module, enabled, package };
         if enabled {
             entry.module.on_enable();
         }
         self.entries.push(entry);
+    }
+
+    /// Groups shown as sections on the mods screen, in this order: the well-known essentials,
+    /// then every group a package declared.
+    pub fn groups(&self) -> impl Iterator<Item = &Group> {
+        std::iter::once(&ESSENTIALS_GROUP).chain(self.declared_groups.iter())
+    }
+
+    fn declare_group(&mut self, group: Group) {
+        if group.id != ESSENTIALS && !self.declared_groups.iter().any(|g| g.id == group.id) {
+            self.declared_groups.push(group);
+        }
+    }
+
+    /// The package that registered the mod at `index`, if any.
+    pub fn package(&self, index: usize) -> Option<&'static str> {
+        self.entries[index].package
     }
 
     /// Reset every mod's per-world state (entering a new/loaded/networked
@@ -546,6 +550,12 @@ impl Mods {
     /// The group id of the mod at `index` (`""` if ungrouped).
     pub fn group(&self, index: usize) -> &str {
         self.entries[index].module.group()
+    }
+
+    /// The declared group of the mod at `index`, if its group id names one.
+    pub fn group_of(&self, index: usize) -> Option<Group> {
+        let id = self.entries[index].module.group();
+        self.groups().find(|g| g.id == id).copied()
     }
 
     /// Whether the mod at `index` is enabled.
@@ -847,32 +857,21 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Every built-in, in install order.
-    const BUILTINS: [&str; 10] = [
-        "menus",
-        "start",
-        "inventory",
-        "hotbar",
-        "atmosphere",
-        "post",
-        "lighting",
-        "neural_textures",
-        "material_names",
-        "diffusion",
-    ];
+    /// Every stand-in, in install order.
+    const BUILTINS: [&str; 10] = super::testing::STANDARD_IDS;
 
     #[test]
     fn worldgen_kind_skips_non_worldgen_mods() {
-        let mods = Mods::with_defaults();
+        let mods = crate::modding::testing::standard();
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion, "InfiniteDiffusion is on by default");
-        let mut off = Mods::with_defaults();
+        let mut off = crate::modding::testing::standard();
         off.set_enabled("diffusion", false);
         assert_eq!(off.worldgen_kind(), WorldgenKind::Flat, "the core fallback is the flat world");
     }
 
     #[test]
     fn effective_render_strips_disabled_visual_groups() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.set_enabled("Atmosphere", false);
         mods.set_enabled("Post", false);
         mods.set_enabled("Lighting", false);
@@ -882,7 +881,7 @@ mod tests {
         assert!(!stripped.bloom);
         assert!(!stripped.shadows);
         assert!(stripped.sunlight);
-        let full = Mods::with_defaults().effective_render(&settings);
+        let full = crate::modding::testing::standard().effective_render(&settings);
         assert_eq!(full.clouds, settings.clouds);
         assert_eq!(full.bloom, settings.bloom);
         assert_eq!(full.shadows, settings.shadows);
@@ -893,7 +892,7 @@ mod tests {
 
     #[test]
     fn annotate_setting_names_the_mod_that_forced_the_lane_off() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.set_enabled("Post", false);
         let mask = mods.visual_mask();
         assert_eq!(forced_off_marker("Post"), "(off: Post mod)");
@@ -912,7 +911,7 @@ mod tests {
 
     #[test]
     fn set_enabled_keys_on_id_case_insensitively() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let i = (0..mods.len())
             .find(|&i| mods.id(i) == WorldgenKind::Diffusion.id())
             .expect("InfiniteDiffusion is installed");
@@ -943,7 +942,7 @@ mod tests {
     #[test]
     fn save_states_key_by_id_and_load_accepts_display_name() {
         let mut world = World::new(1);
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
         mods.load_state("Hotbar", &format!("sel=2;2={spec}"), &mut world);
@@ -952,7 +951,7 @@ mod tests {
         assert!(!saved.iter().any(|(k, _)| k == "Hotbar"));
         let data = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.clone()).expect("hotbar persists");
         for key in ["hotbar", "Hotbar"] {
-            let mut fresh = Mods::with_defaults();
+            let mut fresh = crate::modding::testing::standard();
             fresh.load_state(key, &data, &mut world);
             assert_eq!(
                 fresh.save_states(&world).iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()),
@@ -964,7 +963,7 @@ mod tests {
     #[test]
     fn mod_state_round_trips_version_prefix() {
         let mut world = World::new(1);
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
         mods.load_state("hotbar", &format!("v1;sel=1;1={spec}"), &mut world);
@@ -972,7 +971,7 @@ mod tests {
         assert!(saved.iter().all(|(k, _)| k != "inventory"), "the stash is core state, not an inventory save line");
         let bar = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()).expect("hotbar");
         assert_eq!(bar, format!("v1;sel=1;1={spec}"));
-        let mut fresh = Mods::with_defaults();
+        let mut fresh = crate::modding::testing::standard();
         for (k, v) in &saved {
             fresh.load_state(k, v, &mut world);
         }
@@ -991,7 +990,7 @@ mod tests {
 
     #[test]
     fn choices_text_round_trips_and_ignores_junk() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let defaults = mods.choices_text();
         for id in BUILTINS {
             assert!(defaults.contains(&format!("{id}=on")), "{id} is on by default:\n{defaults}");
@@ -999,6 +998,7 @@ mod tests {
         assert!(defaults.contains("neural_textures.state=detail=1.0,contrast=1.0"));
         assert!(defaults.contains("material_names.state=style=mineral"));
         assert!(defaults.contains("diffusion.state=relief=100,caves=100,mines=100,space=100"));
+        assert!(defaults.starts_with("version=2\n"));
 
         mods.set_enabled("lighting", false);
         let i = index_of(&mods, "diffusion");
@@ -1009,7 +1009,7 @@ mod tests {
         assert!(text.contains("lighting=off"));
         assert!(text.contains(&format!("diffusion.state={}", cfg.to_text())));
 
-        let mut fresh = Mods::with_defaults();
+        let mut fresh = crate::modding::testing::standard();
         fresh.apply_choices_text(
             "version=2\nlighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\ndiffusion.state=relief=150\nunknown.state=tile=16\n",
         );
@@ -1025,7 +1025,7 @@ mod tests {
     /// it must not switch off the world generator, while its other choices still apply.
     #[test]
     fn version_one_choices_keep_the_world_generator() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.apply_choices_text("lighting=off\ndiffusion=off\ndiffusion.state=tile=16,stride=16,phases=8,relief=1.00\ncrafting=on\n");
         let text = mods.choices_text();
         assert!(text.starts_with("version=2\n"));
@@ -1039,7 +1039,7 @@ mod tests {
     #[test]
     fn choices_file_round_trips_toggles_and_knobs() {
         let path = temp_choices_path();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let i = index_of(&mods, "diffusion");
         mods.set_enabled("lighting", false);
         mods.step_knob(i, 0, 1);
@@ -1053,7 +1053,7 @@ mod tests {
         };
         assert!(!tmp.exists(), "atomic save must not leave a .tmp");
 
-        let mut fresh = Mods::with_defaults();
+        let mut fresh = crate::modding::testing::standard();
         fresh.load_choices_from(&path);
         let _ = fs::remove_file(&path);
         assert!(!fresh.is_enabled(index_of(&fresh, "lighting")));
@@ -1063,7 +1063,7 @@ mod tests {
 
     #[test]
     fn unknown_choice_ids_are_ignored() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let before = mods.choices_text();
         mods.apply_choices_text("not-a-mod=on\nunknown.state=tile=64\nmenus=nope\n");
         assert_eq!(mods.choices_text(), before);
@@ -1071,30 +1071,30 @@ mod tests {
 
     #[test]
     fn corrupt_choices_file_falls_back_to_defaults() {
-        let defaults = Mods::with_defaults().choices_text();
+        let defaults = crate::modding::testing::standard().choices_text();
 
         let bad_utf8 = temp_choices_path();
         fs::write(&bad_utf8, [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.load_choices_from(&bad_utf8);
         let _ = fs::remove_file(&bad_utf8);
         assert_eq!(mods.choices_text(), defaults);
 
         let garbage = temp_choices_path();
         fs::write(&garbage, "{{{{ not a config\n!!!\n").unwrap();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.load_choices_from(&garbage);
         let _ = fs::remove_file(&garbage);
         assert_eq!(mods.choices_text(), defaults);
 
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.load_choices_from(Path::new("/tmp/watt-mods-does-not-exist.cfg"));
         assert_eq!(mods.choices_text(), defaults);
     }
 
     #[test]
     fn apply_bench_env_pins_worldgen_and_visuals() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.apply_bench_env(Some(true), Some(true));
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
         let mask = mods.visual_mask();
@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn apply_bench_env_does_not_write_choices() {
         let path = temp_choices_path();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.save_choices_to(&path).unwrap();
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("diffusion=on"));
@@ -1120,16 +1120,13 @@ mod tests {
     }
 
     #[test]
-    fn essentials_lists_every_builtin_in_install_order() {
-        let mods = Mods::with_defaults();
-        assert_eq!(Mods::GROUPS.len(), 1);
-        let g = &Mods::GROUPS[0];
+    fn essentials_lists_every_member_in_install_order() {
+        let mods = crate::modding::testing::standard();
+        let groups: Vec<&Group> = mods.groups().collect();
+        assert_eq!(groups.len(), 1, "only the well-known group when no package declares one");
+        let g = groups[0];
         assert_eq!(g.id, ESSENTIALS);
         assert_eq!(g.name, "Essentials");
-        assert_eq!(
-            g.description,
-            "Menus, inventory, hotbar, looks, names and worldgen."
-        );
         assert!(
             g.description.chars().count() <= 60,
             "group description must fit the mods panel: {} chars",
@@ -1140,13 +1137,13 @@ mod tests {
             .map(|i| mods.id(i))
             .collect();
         assert_eq!(members, BUILTINS);
-        assert!((0..mods.len()).all(|i| !mods.group(i).is_empty()), "every built-in is an Essential");
+        assert!((0..mods.len()).all(|i| mods.group_of(i) == Some(ESSENTIALS_GROUP)));
     }
 
     #[test]
     fn group_toggle_persists_each_member_line() {
         let path = temp_choices_path();
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.set_group_enabled(ESSENTIALS, false);
         let text = mods.choices_text();
         for id in BUILTINS {
@@ -1161,7 +1158,7 @@ mod tests {
         );
         mods.save_choices_to(&path).unwrap();
 
-        let mut fresh = Mods::with_defaults();
+        let mut fresh = crate::modding::testing::standard();
         fresh.load_choices_from(&path);
         let _ = fs::remove_file(&path);
         for i in 0..fresh.len() {
@@ -1180,11 +1177,11 @@ mod tests {
 
     #[test]
     fn worldgen_config_is_the_winning_kind_payload() {
-        let mut off = Mods::with_defaults();
+        let mut off = crate::modding::testing::standard();
         off.set_enabled("diffusion", false);
         assert_eq!(off.worldgen_kind(), WorldgenKind::Flat);
         assert_eq!(off.worldgen_config(), None);
-        let mut on = Mods::with_defaults();
+        let mut on = crate::modding::testing::standard();
         let text = on.worldgen_config().expect("payload");
         assert_eq!(TerrainCfg::from_text(&text), TerrainCfg::default());
         on.step_knob(index_of(&on, "diffusion"), 3, 1);
@@ -1194,7 +1191,7 @@ mod tests {
 
     #[test]
     fn fallback_theme_with_essentials_disabled() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.set_group_enabled(ESSENTIALS, false);
         assert!(mods.menu_theme().is_none());
         let fallback = crate::menu::theme::DefaultTheme;
@@ -1249,7 +1246,7 @@ mod tests {
 
     #[test]
     fn choices_round_trip_through_the_config_root_and_ignore_unknown() {
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         mods.set_enabled("diffusion", true);
         mods.set_enabled("atmosphere", false);
         mods.save_choices().unwrap();
@@ -1258,14 +1255,14 @@ mod tests {
         assert!(path.starts_with(&crate::paths::Paths::get().config));
         assert_ne!(path, std::path::PathBuf::from("saves/mods.cfg"));
 
-        let mut loaded = Mods::with_defaults();
+        let mut loaded = crate::modding::testing::standard();
         loaded.load_choices();
         assert!(enabled(&loaded, "InfiniteDiffusion"));
         assert!(!enabled(&loaded, "Atmosphere"));
         assert!(enabled(&loaded, "Inventory"));
 
         fs::write(&path, "no-such=on\ninventory=off\nnot-a-pair\natmosphere=true\n").unwrap();
-        let mut parsed = Mods::with_defaults();
+        let mut parsed = crate::modding::testing::standard();
         parsed.load_choices();
         assert!(!enabled(&parsed, "Inventory"));
         assert!(enabled(&parsed, "Atmosphere"));

@@ -11,7 +11,7 @@
 use voxel_engine::DVec3;
 
 use crate::math::{WORLD_BORDER, block_coord};
-use crate::mods::{annotate_setting, VisualMask};
+use crate::modding::{annotate_setting, VisualMask};
 use crate::player::Player;
 use crate::settings::{SETTINGS, Settings};
 use crate::sky::{DayLength, Sky};
@@ -394,7 +394,7 @@ fn fmt_pos(p: DVec3) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mods::forced_off_marker;
+    use crate::modding::forced_off_marker;
     use crate::render_config::VrsChoice;
 
     fn player() -> Player {

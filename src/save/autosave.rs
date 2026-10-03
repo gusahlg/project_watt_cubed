@@ -308,7 +308,6 @@ mod tests {
     #[test]
     fn in_flight_snapshot_does_not_see_edits_that_land_after_start() {
         use crate::block::AIR;
-        use crate::mods::Mods;
         use crate::player::Player;
         use crate::save::{self, Source};
         use voxel_engine::DVec3;
@@ -323,7 +322,7 @@ mod tests {
         world.set_block(8, y0, 8, AIR);
         let gen1 = world.edit_generation();
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let meta = SaveMeta {
             name: "race".to_string(),
             seed: 0,
@@ -363,7 +362,7 @@ mod tests {
             Tick::Started
         ));
         wait_finished(&mut auto);
-        let mut mods = Mods::with_defaults();
+        let mut mods = crate::modding::testing::standard();
         let (loaded, _, _, _) = save::load(&id, &mut mods, load_world).unwrap();
         assert_eq!(loaded.block_at(9, y1, 8), AIR, "second edit lands in the next snapshot");
 
@@ -379,7 +378,6 @@ mod tests {
     #[ignore]
     fn autosave_snapshot_and_encode_at_100k_edits() {
         use crate::block::BlockId;
-        use crate::mods::Mods;
         use crate::player::Player;
         use crate::render_config::RenderConfig;
         use std::time::Instant;
@@ -392,7 +390,7 @@ mod tests {
         world.test_fill_overlay(N, BlockId(1));
         assert_eq!(world.edits().count(), N);
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        let mods = Mods::with_defaults();
+        let mods = crate::modding::testing::standard();
         let meta = SaveMeta {
             name: "bench".to_string(),
             seed: 0,

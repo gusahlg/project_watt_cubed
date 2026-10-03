@@ -12,6 +12,16 @@ This policy governs official registries, signing infrastructure, clients, and
 mod listings. It does not add restrictions to private activity or to
 independent forks beyond the licences of the relevant code and content.
 
+## Current implementation
+
+Until the sandboxed WebAssembly ABI and the official registry exist, mods are distributed as
+`.pwcmod` source packages and compiled into the game by the
+[PWC package manager](https://github.com/gusahlg/pwc-package-manager) (`pwc`). That native,
+compile-in stage is local and pre-registry: its packages are trusted native code, not sandboxed,
+and are not official registry mods. The package manager's `POLICY.md` carries this policy over
+and enforces what it can (AGPL-3.0-or-later code licences, approved content licences, complete
+source with no build scripts, content-addressed immutable versions).
+
 ## Licensing
 
 All original software code in a submitted mod must be licensed
@@ -30,7 +40,7 @@ licence. The initial approved list is:
 - `CC-BY-4.0`;
 - `CC0-1.0`;
 - `OFL-1.1` for fonts; and
-- `FAL-1.3`.
+- `LAL-1.3` (the Free Art License 1.3; SPDX lists it under its French name, Licence Art Libre).
 
 A work claimed to be in the public domain requires evidence of a valid
 dedication or expired copyright; a bare assertion is insufficient. Additional

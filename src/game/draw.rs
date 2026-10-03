@@ -8,7 +8,7 @@ use crate::console;
 use crate::derived::Memo;
 use super::{DebugView, SKY_KEY, TERRAIN_KEY};
 use crate::interact;
-use crate::mods::Mods;
+use crate::modding::Mods;
 use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility};
 use crate::sched::RateGate;
 use crate::sky::SkyFrame;

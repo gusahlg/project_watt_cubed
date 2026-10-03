@@ -1,0 +1,15 @@
+format = 1
+
+[package]
+id = "example.hello-hud"
+name = "Hello HUD"
+version = "1.0.0"
+description = "The smallest useful PWC mod: a HUD line counting the blocks you broke."
+authors = ["Project Watt Cubed contributors"]
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSES/AGPL-3.0-or-later.txt"]
+kind = "mod"
+pwc-api = "^1.0"
+repository = "https://github.com/gusahlg/project_watt_cubed"
+keywords = ["example", "hud"]
+categories = ["interface"]

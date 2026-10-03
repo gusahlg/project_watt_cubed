@@ -3,7 +3,7 @@
 use voxel_engine::Frame;
 
 use crate::menu::theme::MenuTheme;
-use crate::mods::Mods;
+use crate::modding::Mods;
 use crate::render_config::VisualGroup;
 use crate::session::Session;
 use crate::settings::Settings;
@@ -206,8 +206,8 @@ pub struct ModRow {
     pub knobs: Vec<(String, String, String)>,
     pub visual_group: Option<VisualGroup>,
     pub worldgen: bool,
-    /// Group id (`""` if ungrouped).
-    pub group: String,
+    /// The mod's group (`None` if ungrouped or its group was never declared).
+    pub group: Option<crate::modding::Group>,
 }
 
 impl ModRow {
@@ -224,7 +224,7 @@ impl ModRow {
                     .collect(),
                 visual_group: mods.visual_group(i),
                 worldgen: mods.is_worldgen(i),
-                group: mods.group(i).to_string(),
+                group: mods.group_of(i),
             })
             .collect()
     }

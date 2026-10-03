@@ -7,7 +7,7 @@ default-run = "project_watt_cubed"
 
 [workspace]
 resolver = "2"
-members = ["crates/material"]
+members = ["crates/material", "crates/pwc-mod-api"]
 default-members = ["."]
 
 [features]

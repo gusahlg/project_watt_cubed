@@ -6,7 +6,7 @@ use voxel_engine::DVec3;
 use crate::block::registry::SpecKind;
 use crate::block::{AIR, BlockId};
 use crate::coord::{BlockCoord, ChunkCoord, Local};
-use crate::mods::Mods;
+use crate::modding::Mods;
 use crate::player::Player;
 use crate::world::chunk::Chunk;
 use crate::world::terrain::TerrainCfg;

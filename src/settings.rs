@@ -1317,7 +1317,7 @@ impl Settings {
 
     /// The render lanes this settings state names, before visual-mod masking.
     /// World construction, `/gfx` apply, and engine flags go through
-    /// [`Mods::effective_render`](crate::mods::Mods::effective_render). (The
+    /// [`Mods::effective_render`](crate::modding::Mods::effective_render). (The
     /// golden harness keeps its own pinned
     /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
     pub fn render_config(&self) -> RenderConfig {

@@ -16,7 +16,7 @@ use voxel_engine::{Color, DVec3};
 
 use crate::camera::CameraPose;
 use crate::game::{DebugView, Game, SKY_KEY, TERRAIN_KEY};
-use crate::mods::Mods;
+use crate::modding::{GameBuild, Mods};
 use crate::settings::Settings;
 
 /// The one seed every golden shot and metric uses.
@@ -31,6 +31,12 @@ pub(crate) const SCRIPTED_DEFAULT_DAY: f64 = 0.3;
 
 /// Blessed goldens live here, one PNG per [`GoldenShot::name`].
 pub(crate) const GOLDEN_DIR: &str = "tests/golden";
+
+/// Where blessed goldens live: `WATT_GOLDEN_DIR` if set (a `pwc` instance keeps its own), else
+/// [`GOLDEN_DIR`] relative to the working directory.
+fn golden_dir() -> PathBuf {
+    std::env::var_os("WATT_GOLDEN_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(GOLDEN_DIR))
+}
 
 /// Per-channel absolute delta a pixel must exceed to count as "changed" — the
 /// 8-bit noise floor. Dithered/tonemapped output wobbles by a couple of codes
@@ -595,7 +601,7 @@ impl StressRun {
 
 /// Run each stress scenario in its own stage (fresh `Game` per spec) inside the
 /// process's single event loop and return the outcomes in spec order.
-pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
+pub fn run_stress(specs: &[StressSpec], build: &GameBuild) -> Vec<(String, StressOutcome)> {
     let stages = specs
         .iter()
         .map(|s| Stage {
@@ -623,7 +629,7 @@ pub fn run_stress(specs: &[StressSpec]) -> Vec<(String, StressOutcome)> {
             },
         })
         .collect();
-    let out = execute(stages);
+    let out = execute(stages, build);
     specs
         .iter()
         .filter_map(|s| {
@@ -754,11 +760,11 @@ fn plan_stages(acc: &Acceptance, bless: bool) -> Vec<Stage> {
 ///
 /// No second projection/camera path here: `teleport` puts the pose on the
 /// real `Player` the game already carries.
-fn execute(stages: Vec<Stage>) -> Outcomes {
+fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
     if stages.is_empty() {
         return Outcomes::default();
     }
-    let mut mods = Mods::with_defaults();
+    let mut mods = Mods::from_build(build);
     let mut settings = Settings::default();
     // Update requires a router even though scripted games consume no live input.
     let mut router = crate::input::router::Router::new();
@@ -1112,7 +1118,7 @@ fn execute(stages: Vec<Stage>) -> Outcomes {
 
 /// Path of the blessed golden PNG for a shot name.
 fn golden_path(name: &str) -> PathBuf {
-    PathBuf::from(GOLDEN_DIR).join(format!("{name}.png"))
+    golden_dir().join(format!("{name}.png"))
 }
 
 /// The golden run's product: the printed golden-seed entry time and the
@@ -1125,8 +1131,8 @@ pub struct Report {
 /// THE single entry point `golden` calls: plan the stages, drive them ALL in
 /// one `voxel_engine::run`, then evaluate the (pure) criteria over the captured
 /// artifacts. Exactly one `run` per process.
-pub fn run_acceptance(acc: &Acceptance, bless: bool) -> Report {
-    let outcomes = execute(plan_stages(acc, bless));
+pub fn run_acceptance(acc: &Acceptance, bless: bool, build: &GameBuild) -> Report {
+    let outcomes = execute(plan_stages(acc, bless), build);
     let golden_entry_time = outcomes
         .entry_times
         .get(&GOLDEN_SEED)
@@ -1437,6 +1443,82 @@ fn carve_cave(game: &mut Game) {
     }
     // Emitter at eye level on the wall the camera looks at (+x, yaw 0).
     world.set_block(cx + 3, cy, cz, emitter);
+}
+
+/// The `golden` command for one build: check (or, with a `bless` argument, regenerate) the
+/// golden-shot acceptance set of `build`'s mods. The vanilla `golden` binary and every
+/// `pwc`-generated instance (`pwc-golden`) call this. Exits the process with status 1 when a
+/// criterion fails.
+pub fn golden_main(build: GameBuild) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // The harness's render lanes are a typed property of each stage
+    // (`RenderConfig::golden`): tiles ON (the far-field filler the `SkyHoleCount`
+    // detector needs — without it the chunk→tile handoff band reads as bare sky)
+    // and blocklight ON (`cave_interior`'s emitter; a no-op for the emitter-free
+    // shots). Threaded through `Game::scripted` / `scripted_config`, not env vars.
+    let bless = args.iter().any(|a| a == "bless");
+    let acc = default_acceptance();
+
+    println!(
+        "golden: {} criteria{}",
+        acc.criteria.len(),
+        if bless { " (bless)" } else { "" }
+    );
+
+    // ONE event loop for the whole process: `run_acceptance` drives every shot
+    // and the golden-seed entry time inside a single `voxel_engine::run`, then
+    // evaluates the pure criteria over the captured PNGs.
+    let report = run_acceptance(&acc, bless, &build);
+
+    println!(
+        "golden: entry_time(seed={GOLDEN_SEED:#x}) = {:?}",
+        report.golden_entry_time
+    );
+
+    match report.result {
+        Ok(()) => println!("golden: all criteria passed"),
+        Err(failures) => {
+            eprintln!("golden: {} criteria failed:", failures.len());
+            for f in &failures {
+                eprintln!("  - {}: {}", f.what, f.detail);
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// An image match + sky-hole check on each golden shot, the entry-time ceiling,
+/// and a frame-time ceiling on `spawn_forward`.
+pub fn default_acceptance() -> Acceptance {
+    let shots = golden_shots();
+    let mut criteria = Vec::new();
+    for shot in &shots {
+        criteria.push(Criterion::ImageMatch {
+            shot: *shot,
+            max_pct_changed: 0.5,
+        });
+        criteria.push(Criterion::SkyHoleCount {
+            shot: *shot,
+            max: 0,
+        });
+    }
+    // Frame-time ceiling on the primary shot. 16.7 ms is the 60 fps budget.
+    let spawn_forward = shots
+        .iter()
+        .find(|s| s.name == "spawn_forward")
+        .copied()
+        .expect("golden_shots always defines spawn_forward");
+    criteria.push(Criterion::FrameTime {
+        shot: spawn_forward,
+        // First-cut ceiling; tighten after the first measured report.
+        max_ms: 16.7,
+    });
+    criteria.push(Criterion::EntryTime {
+        seed: GOLDEN_SEED,
+        max: Duration::from_secs(5),
+    });
+    Acceptance { criteria }
 }
 
 #[cfg(test)]

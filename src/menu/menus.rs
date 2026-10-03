@@ -3,7 +3,7 @@
 use crate::menu::{
     AppEffect, Command, Ctx, Dir, Framed, Menu, Msg, Notice, Row, Style, ValueView, View,
 };
-use crate::mods::{annotate_setting, Mods, VisualMask};
+use crate::modding::{annotate_setting, VisualMask};
 use crate::render_config::VisualGroup;
 use crate::settings::{Category, MenuKind, SETTINGS};
 
@@ -31,7 +31,7 @@ pub struct ModsMenu;
 
 /// Persistent mods-screen notice: choices hit disk now; they apply only after
 /// a rebuild because mods are compiled into the binary.
-const MODS_NOTICE: &str = "Choices are saved at once. The game has to be recompiled for mod choices to apply.\nMods are compiled into the binary: run ./play.sh (or cargo build) and restart.";
+const MODS_NOTICE: &str = "Choices are saved at once and apply from the next world (worldgen: the next new world).\nMods are compiled in: add or remove them with `pwc mod add` / `pwc mod remove`.";
 
 #[derive(Clone, Copy)]
 pub enum ModsAction {
@@ -46,12 +46,19 @@ impl Menu for ModsMenu {
     fn view(&self, ctx: &Ctx) -> View<ModsAction> {
         let mut rows = Vec::new();
         let mut placed = vec![false; ctx.mods.len()];
-        for g in Mods::GROUPS {
+        // Groups in the order their first member appears (package registration order).
+        let mut groups: Vec<crate::modding::Group> = Vec::new();
+        for g in ctx.mods.iter().filter_map(|m| m.group) {
+            if !groups.iter().any(|seen| seen.id == g.id) {
+                groups.push(g);
+            }
+        }
+        for g in groups {
             let members: Vec<usize> = ctx
                 .mods
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| m.group == g.id)
+                .filter(|(_, m)| m.group.is_some_and(|mg| mg.id == g.id))
                 .map(|(i, _)| i)
                 .collect();
             if members.is_empty() {
@@ -282,8 +289,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Choices are saved at once. The game has to be recompiled for mod choices to apply.",
-                "Mods are compiled into the binary: run ./play.sh (or cargo build) and restart.",
+                "Choices are saved at once and apply from the next world (worldgen: the next new world).",
+                "Mods are compiled in: add or remove them with `pwc mod add` / `pwc mod remove`.",
             ]
         );
     }
@@ -342,7 +349,7 @@ mod tests {
             knobs: vec![],
             visual_group: Some(VisualGroup::Post),
             worldgen: false,
-            group: String::new(),
+            group: None,
         }];
         let ctx = Ctx {
             settings: &mut settings,
@@ -357,7 +364,7 @@ mod tests {
             .iter()
             .find(|r| r.label == "Bloom")
             .expect("bloom row");
-        let marker = crate::mods::forced_off_marker("Post");
+        let marker = crate::modding::forced_off_marker("Post");
         match &bloom.kind {
             crate::menu::RowKind::Value(ValueView::Choice(s)) => {
                 assert!(s.contains(&marker), "settings value {s:?} must include {marker}");
@@ -368,7 +375,7 @@ mod tests {
 
     #[test]
     fn mods_menu_nests_essentials_under_group_header() {
-        let installed = crate::mods::Mods::with_defaults();
+        let installed = crate::modding::testing::standard();
         let snap = crate::menu::ModRow::snapshot(&installed);
         let mut settings = Settings::default();
         let session = Session::default();
@@ -430,9 +437,9 @@ mod tests {
             knobs: vec![],
             visual_group: None,
             worldgen: false,
-            group: String::new(),
+            group: None,
         };
-        let installed = crate::mods::Mods::with_defaults();
+        let installed = crate::modding::testing::standard();
         let mut snap = crate::menu::ModRow::snapshot(&installed);
         snap.push(extra);
         let mut settings = Settings::default();
@@ -468,13 +475,13 @@ mod tests {
         let mut ctx = ctx(&mut settings, &session);
         match menu.update(
             Msg::Pick(ModsAction::SetGroup {
-                id: crate::mods::ESSENTIALS,
+                id: crate::modding::ESSENTIALS,
                 on: false,
             }),
             &mut ctx,
         ) {
             Command::Effect(AppEffect::SetGroup { id, on }) => {
-                assert_eq!(id, crate::mods::ESSENTIALS);
+                assert_eq!(id, crate::modding::ESSENTIALS);
                 assert!(!on);
             }
             _ => panic!("expected SetGroup"),

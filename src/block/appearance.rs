@@ -4,7 +4,7 @@
 //! [`BlockRegistry::render_layer`]), so an appearance mod paints a texture *per configuration* from
 //! the configuration itself — its elements, readings and presentation colours. The core fallback is
 //! [`FlatAppearance`] (flat base colour + alpha). The world's texture cache asks
-//! [`Mods::appearance`](crate::mods::Mods::appearance) — the first enabled appearance mod, else this
+//! [`Mods::appearance`](crate::modding::Mods::appearance) — the first enabled appearance mod, else this
 //! fallback. A `revision` change rebuilds every layer; otherwise the cache is append-only.
 
 use material::{Block, Law, Observation, Visual};
@@ -76,7 +76,7 @@ pub fn fill_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mods::Mods;
+    use crate::modding::Mods;
     use material::{Configuration, Element};
 
     #[test]
