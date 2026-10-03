@@ -19,6 +19,7 @@
 pub mod cosmos;
 pub mod noise;
 pub mod palette;
+pub mod round;
 mod shape;
 mod space;
 mod trees;

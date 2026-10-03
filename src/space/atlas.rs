@@ -14,7 +14,7 @@
 
 use glam::DVec3;
 
-use super::chart::{basis, Map};
+use super::chart::{basis, tan_quarter, Map};
 use crate::coord::Face;
 
 /// First storage x of the reserved region (beyond the physical border, inside i32 chunk math).
@@ -234,9 +234,8 @@ impl Atlas {
                 let step = 2.0 / i.t_n as f64;
                 let lx = if self.inward { i.t_n as f64 - l.x } else { l.x };
                 let (xi, eta) = (-1.0 + lx * step, -1.0 + l.z * step);
-                let q = std::f64::consts::FRAC_PI_4;
                 let (tu, nn, tv) = basis(face);
-                let cube = (tu * (xi * q).tan() + nn + tv * (eta * q).tan()) * i.core_half as f64;
+                let cube = (tu * tan_quarter(xi) + nn + tv * tan_quarter(eta)) * i.core_half as f64;
                 let sphere = radial(face, i.t_n, i.t_r as f64, lx, l.z);
                 let t = l.y / i.t_layers as f64;
                 let t = if self.inward { 1.0 - t } else { t };
