@@ -1,6 +1,7 @@
 //! The camera as its own system: mode machine (Person/Free) plus effects layer.
 //! Modes are exclusive — input routing and pose generation both discriminate on
 //! the same arm. Renderer sees one [`ViewPose`] per frame, downstream doesn't know why.
+use glam::DQuat;
 use voxel_engine::{Camera3D, DVec3, Lens, Vec2, Vec3, WarpStrength};
 
 use crate::input::look::PITCH_LIMIT;
@@ -20,6 +21,8 @@ const BOOM_MARGIN: f64 = 0.2;
 #[derive(Clone, Copy)]
 pub struct ViewPose {
     pub eye: DVec3,
+    /// The body frame yaw and pitch are relative to (local +Y = up).
+    pub frame: DQuat,
     pub yaw: f32,
     pub pitch: f32,
     pub roll: f32,
@@ -38,21 +41,59 @@ pub fn direction_from_angles(yaw: f32, pitch: f32) -> DVec3 {
     DVec3::new(cos_yaw * cos_pitch, sin_pitch, sin_yaw * cos_pitch)
 }
 
-/// The one orientation: yaw + pitch, and the one look clamp. `Player` stores
-/// this directly (`Player::orientation`). [`FreeRig`] deliberately keeps its
-/// own detached yaw/pitch — the free camera is a transient view that must not
-/// write back into the player's stored angles (merging it into `Motion::Flying`
-/// was refuted) — but routes `look()` through this type so there is exactly one
-/// formula and one clamp.
+/// `frame * v`, skipping the product for the identity frame so every Y-up path keeps its exact bits.
+#[inline]
+pub fn rotate(frame: DQuat, v: DVec3) -> DVec3 {
+    if frame == DQuat::IDENTITY { v } else { frame * v }
+}
+
+/// How fast the body frame turns toward the local up, per second (scaled by the gravity weight).
+pub const ALIGN_RATE: f64 = 4.0;
+
+/// The one orientation: a body frame (local +Y = up, following gravity) plus yaw and pitch relative
+/// to it, and the one look clamp. `Player` stores this directly (`Player::orientation`).
+/// [`FreeRig`] deliberately keeps its own detached copy — the free camera is a transient view that
+/// must not write back into the player's stored angles — but routes `look()` through this type so
+/// there is exactly one formula and one clamp.
 #[derive(Clone, Copy)]
 pub struct Orientation {
+    pub frame: DQuat,
     pub yaw: f32,
     pub pitch: f32,
 }
 
 impl Orientation {
+    /// Yaw and pitch in the identity (Y-up) frame.
+    pub const fn new(yaw: f32, pitch: f32) -> Self {
+        Self { frame: DQuat::IDENTITY, yaw, pitch }
+    }
+
     pub fn direction(self) -> DVec3 {
-        direction_from_angles(self.yaw, self.pitch)
+        rotate(self.frame, direction_from_angles(self.yaw, self.pitch))
+    }
+
+    /// The body's up direction.
+    pub fn up(self) -> DVec3 {
+        rotate(self.frame, DVec3::Y)
+    }
+
+    /// Turn the frame part of the way toward `target` (a unit up vector) by the shortest arc, which
+    /// keeps the heading; `amount` in `[0, 1]` is the fraction of the remaining angle.
+    pub fn align(&mut self, target: DVec3, amount: f64) {
+        let up = self.up();
+        let axis = up.cross(target);
+        let sin = axis.length();
+        let angle = sin.atan2(up.dot(target));
+        if angle < 1e-9 || amount <= 0.0 {
+            return;
+        }
+        let axis = if sin > 1e-12 { axis / sin } else { self.frame * DVec3::X };
+        self.frame = (DQuat::from_axis_angle(axis, angle * amount.min(1.0)) * self.frame).normalize();
+    }
+
+    /// Turn the frame all the way to `target` (spawn, teleport, load).
+    pub fn snap(&mut self, target: DVec3) {
+        self.align(target, 1.0);
     }
 
     /// `d` is a raw (uninverted-by-sensitivity) look delta; `sensitivity`
@@ -64,9 +105,14 @@ impl Orientation {
 }
 
 impl ViewPose {
-    /// Full view direction from the angles.
+    /// Full view direction from the frame and angles.
     pub fn forward(&self) -> DVec3 {
-        direction_from_angles(self.yaw, self.pitch)
+        rotate(self.frame, direction_from_angles(self.yaw, self.pitch))
+    }
+
+    /// The view's up direction (before roll).
+    pub fn up(&self) -> DVec3 {
+        rotate(self.frame, DVec3::Y)
     }
 
     /// Build the engine camera. Rebases the f64 eye to the origin so the engine
@@ -80,13 +126,13 @@ impl ViewPose {
             (self.fovy, Lens::Rectilinear)
         };
         let forward = self.forward().as_vec3();
-        // Roll rotates up around forward. Zero roll keeps the Y-up the pipeline expects.
+        let base = self.up().as_vec3();
+        // Roll rotates up around forward.
         let up = if self.roll != 0.0 {
-            let y = Vec3::new(0.0, 1.0, 0.0);
             let (sin_r, cos_r) = self.roll.sin_cos();
-            y * cos_r + forward.cross(y) * sin_r + forward * forward.dot(y) * (1.0 - cos_r)
+            base * cos_r + forward.cross(base) * sin_r + forward * forward.dot(base) * (1.0 - cos_r)
         } else {
-            Vec3::new(0.0, 1.0, 0.0)
+            base
         };
         Camera3D {
             position: Vec3::ZERO,
@@ -112,6 +158,7 @@ impl CameraPose {
     pub fn camera(&self, fovy: f32) -> Camera3D {
         ViewPose {
             eye: self.pos,
+            frame: DQuat::IDENTITY,
             yaw: self.yaw,
             pitch: self.pitch,
             roll: 0.0,
@@ -159,6 +206,7 @@ pub struct FlyAxes {
 /// gameplay effect. Exists only inside [`CameraMode::Free`].
 pub struct FreeRig {
     pub pos: DVec3,
+    pub frame: DQuat,
     pub yaw: f32,
     pub pitch: f32,
     /// Flight speed in units/second.
@@ -169,12 +217,12 @@ impl FreeRig {
     /// Seed the rig from the pose it detaches from, so entering freecam is
     /// seamless (the first detached frame renders the identical view).
     fn from_pose(pose: ViewPose, speed: f64) -> Self {
-        Self { pos: pose.eye, yaw: pose.yaw, pitch: pose.pitch, speed }
+        Self { pos: pose.eye, frame: pose.frame, yaw: pose.yaw, pitch: pose.pitch, speed }
     }
 
     /// Raw look delta; same [`Orientation::look`] clamp as the player look path.
     pub fn look(&mut self, d: Vec2) {
-        let mut o = Orientation { yaw: self.yaw, pitch: self.pitch };
+        let mut o = Orientation { frame: self.frame, yaw: self.yaw, pitch: self.pitch };
         o.look(d, crate::input::look::SENSITIVITY);
         self.yaw = o.yaw;
         self.pitch = o.pitch;
@@ -182,10 +230,10 @@ impl FreeRig {
 
     /// No inertia — camera wants crisp stops, not player feel.
     pub fn fly(&mut self, axes: FlyAxes, dt: f32) {
-        let forward = direction_from_angles(self.yaw, self.pitch);
+        let forward = rotate(self.frame, direction_from_angles(self.yaw, self.pitch));
         let yaw = self.yaw as f64;
-        let right = DVec3::new(-yaw.sin(), 0.0, yaw.cos());
-        let wish = forward * axes.forward + right * axes.right + DVec3::Y * axes.up;
+        let right = rotate(self.frame, DVec3::new(-yaw.sin(), 0.0, yaw.cos()));
+        let wish = forward * axes.forward + right * axes.right + rotate(self.frame, DVec3::Y) * axes.up;
         if wish != DVec3::ZERO {
             let speed = self.speed * if axes.boost { 3.0 } else { 1.0 };
             self.pos += wish.normalize() * speed * dt as f64;
@@ -313,6 +361,7 @@ impl GameCamera {
             CameraMode::Person(view) => person_pose(*view, player, world, base_fov),
             CameraMode::Free { rig, .. } => ViewPose {
                 eye: rig.pos,
+                frame: rig.frame,
                 yaw: rig.yaw,
                 pitch: rig.pitch,
                 roll: 0.0,
@@ -336,6 +385,7 @@ fn person_pose(view: PersonView, player: &Player, world: &World, base_fov: f32) 
     match view {
         PersonView::First => ViewPose {
             eye: player.position,
+            frame: player.orientation.frame,
             yaw: player.orientation.yaw,
             pitch: player.orientation.pitch,
             roll: 0.0,
@@ -349,7 +399,14 @@ fn person_pose(view: PersonView, player: &Player, world: &World, base_fov: f32) 
             } else {
                 (player.orientation.yaw, player.orientation.pitch)
             };
-            ViewPose { eye: player.position + dir * len, yaw, pitch, roll: 0.0, fovy: base_fov }
+            ViewPose {
+                eye: player.position + dir * len,
+                frame: player.orientation.frame,
+                yaw,
+                pitch,
+                roll: 0.0,
+                fovy: base_fov,
+            }
         }
     }
 }
@@ -388,6 +445,7 @@ mod tests {
         let a = pose.camera(70.0);
         let b = ViewPose {
             eye: pose.pos,
+            frame: DQuat::IDENTITY,
             yaw: pose.yaw,
             pitch: pose.pitch,
             roll: 0.0,
@@ -397,5 +455,29 @@ mod tests {
         assert_eq!(a.position, b.position);
         assert_eq!(a.target, b.target);
         assert_eq!(a.fovy, b.fovy);
+    }
+
+    #[test]
+    fn identity_frame_keeps_the_y_up_camera_bit_for_bit() {
+        let o = Orientation::new(0.7, -0.3);
+        assert_eq!(o.direction(), direction_from_angles(0.7, -0.3));
+        assert_eq!(o.up(), DVec3::Y);
+    }
+
+    #[test]
+    fn align_turns_the_up_by_the_shortest_arc_and_keeps_the_heading() {
+        let mut o = Orientation::new(0.0, 0.0);
+        let target = DVec3::new(1.0, 1.0, 0.0).normalize();
+        o.align(target, 0.5);
+        let half = o.up();
+        assert!((half.angle_between(DVec3::Y) - std::f64::consts::FRAC_PI_8).abs() < 1e-12, "{half}");
+        o.snap(DVec3::X);
+        assert!((o.up() - DVec3::X).length() < 1e-12);
+        // Yaw 0 looked along +X; after tipping the frame onto +X the view tips with it (it was
+        // perpendicular to the rotation axis +Z).
+        assert!((o.direction() - DVec3::NEG_Y).length() < 1e-12, "{}", o.direction());
+        // A full turn to the opposite pole picks a well-defined axis instead of producing NaN.
+        o.snap(DVec3::NEG_X);
+        assert!(o.up().is_finite() && (o.up() - DVec3::NEG_X).length() < 1e-9);
     }
 }

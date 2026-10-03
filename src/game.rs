@@ -1001,6 +1001,9 @@ impl Game {
         } else {
             // Look (inert while uncaptured — the query already zeroed the delta).
             look::apply(&mut self.player, input.look_delta);
+            // The body frame follows the local up at render rate, from the gravity the last
+            // physics step applied; it holds in weak gravity (zero-g keeps its orientation).
+            align_body(&mut self.player, dt);
 
             if let Some(mi) = &input.move_input {
                 self.pending_toggle_fly |= mi.toggle_fly();
@@ -1013,11 +1016,13 @@ impl Game {
                         let mut tick_input = *mi;
                         tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
                         tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
+                        let gravity = self.gravity_at(self.player.position);
                         let trauma = movement::update_player(
                             &mut self.player,
                             &self.world,
                             &tick_input,
                             step_dt,
+                            gravity,
                         );
                         if trauma > 0.0 {
                             self.camera.fx.add_trauma(trauma);
@@ -1026,9 +1031,9 @@ impl Game {
                         // third-person body animates. The AUDIO gait (footstep
                         // phase-crossings) is derived inside the director from the
                         // same speed — this one drives rendering only.
-                        let v = self.player.velocity();
-                        let speed = (v.x * v.x + v.z * v.z).sqrt();
-                        self.local_gait += speed * step_dt as f64 * presence::STRIDE_FREQ;
+                        let mut v = self.player.velocity();
+                        v[self.player.up_axis.axis()] = 0.0;
+                        self.local_gait += v.length() * step_dt as f64 * presence::STRIDE_FREQ;
                     }
                     self.pending_toggle_fly = false;
                     self.pending_jump = false;
@@ -1036,6 +1041,12 @@ impl Game {
             }
             false
         }
+    }
+
+    /// The gravity at `p`, from the world's matter.
+    fn gravity_at(&self, p: DVec3) -> DVec3 {
+        let _ = p;
+        DVec3::new(0.0, -crate::player::STANDARD_GRAVITY, 0.0)
     }
 
     /// World edits: block breaking, then cadence-controlled mod hooks and
@@ -1305,11 +1316,7 @@ impl Game {
         };
         let player = PlayerPose {
             pos: self.player.position,
-            feet: DVec3::new(
-                self.player.position.x,
-                self.player.feet_y(),
-                self.player.position.z,
-            ),
+            feet: self.player.feet(),
             yaw: self.player.orientation.yaw,
             pitch: self.player.orientation.pitch,
             velocity,
@@ -1735,6 +1742,19 @@ fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
         eng.disable_cursor();
     } else {
         eng.enable_cursor();
+    }
+}
+
+
+/// Turn the body frame toward −gravity, weighted so weak gravity barely turns it and near-zero
+/// gravity leaves it alone (never normalising a vanishing vector).
+fn align_body(player: &mut Player, dt: f32) {
+    let g0 = crate::player::STANDARD_GRAVITY;
+    let g = player.gravity.length();
+    let weight = crate::math::smooth_between(0.02 * g0 as f32, 0.10 * g0 as f32, g as f32) as f64;
+    if weight > 0.0 {
+        let amount = 1.0 - (-crate::camera::ALIGN_RATE * weight * dt as f64).exp();
+        player.orientation.align(-player.gravity / g, amount);
     }
 }
 
