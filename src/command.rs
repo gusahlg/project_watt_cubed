@@ -192,7 +192,10 @@ fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> 
             player.position = target;
             // Stand up along the local gravity at once (no slow roll after a jump across the
             // universe); in weightlessness keep the current frame.
-            if let Some(up) = world.gravity_at(target).up(0.02 * crate::player::STANDARD_GRAVITY) {
+            // The body frame follows the last applied pull: make it the destination's at once.
+            let pull = world.gravity_at(target);
+            player.gravity = pull.accel;
+            if let Some(up) = pull.up(0.02 * crate::player::STANDARD_GRAVITY) {
                 player.snap_up(up);
             }
             // Cancel any accumulated fall so the player doesn't rocket down on arrival.

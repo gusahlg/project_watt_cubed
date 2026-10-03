@@ -420,7 +420,9 @@ impl App {
                     game.world_mut().prepare_around(pos);
                     // Stand up along the local pull there, as a teleport does (any face of any body).
                     let weightless = 0.02 * crate::player::STANDARD_GRAVITY;
-                    if let Some(up) = game.world().gravity_at(pos).up(weightless) {
+                    let pull = game.world().gravity_at(pos);
+                    game.player_mut().gravity = pull.accel;
+                    if let Some(up) = pull.up(weightless) {
                         game.player_mut().snap_up(up);
                     }
                     if let Some(bench) = &mut self.bench {
