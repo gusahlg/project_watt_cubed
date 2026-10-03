@@ -951,6 +951,8 @@ pub struct World {
     gravity: crate::gravity::Field,
     /// The seams of the generator's round bodies (curved-chart storage boxes).
     seams: seam::Seams,
+    /// The charts around the streaming centre unfolded into one net (identity off round worlds).
+    fold: seam::Unfold,
     kind: WorldgenKind,
     terrain_cfg: terrain::TerrainCfg,
     chunks: FastMap<Coord, Loaded>,
@@ -1348,6 +1350,7 @@ impl World {
             registry,
             gravity,
             seams,
+            fold: seam::Unfold::IDENTITY,
             generator,
             kind,
             terrain_cfg: cfg,
@@ -1637,9 +1640,10 @@ impl World {
                 p[t0] = tu;
                 p[t1] = tv;
                 p[axis] = a;
-                self.chunks
-                    .get(&Coord::new(p[0], p[1], p[2]))
-                    .is_some_and(|l| l.state.settled())
+                // Through the chart net; storage that holds nothing is settled by definition.
+                self.fold
+                    .unfold(Coord::new(p[0], p[1], p[2]))
+                    .is_none_or(|c| self.chunks.get(&c).is_some_and(|l| l.state.settled()))
             })
         };
         let c0 = origin[t0];
@@ -1661,6 +1665,7 @@ impl World {
                         continue;
                     }
                     let c = Coord::new(center.x + dx, center.y + dy, center.z + dz);
+                    let Some(c) = self.fold.unfold(c) else { continue };
                     if !self.chunks.get(&c).is_some_and(|l| l.state.settled()) {
                         return false;
                     }
@@ -2340,6 +2345,7 @@ fn bias_order(base: u64, vel: DVec3, dx: f64, dy: f64, dz: f64, up: Option<Face>
 /// Distance along the up axis stays encoded by [`World::order`]; velocity
 /// only reweights candidates in the tangent plane (`None`: all three axes).
 fn near_motion_order(world: &World, center: Coord, key: Coord) -> u64 {
+    let key = world.fold.fold(key);
     let up = world.live_up();
     let ring = World::order(key, center, up).max(0) as u64;
     let base = ring.saturating_mul(ring).saturating_mul(1024);

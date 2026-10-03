@@ -263,6 +263,158 @@ impl Seams {
     }
 }
 
+/// One side of a home chart whose neighbour lies across a seam: the neighbour's box (chunks, `hi`
+/// exclusive) and the affine chunk map between virtual chunks beyond the side and its real chunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SideMap {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    /// The virtual chunk just beyond the side ...
+    virt: [i32; 3],
+    /// ... is this real chunk of the neighbour.
+    real: [i32; 3],
+    /// The real step of a unit virtual step along each axis (signed unit vectors: a rotation).
+    cols: [[i32; 3]; 3],
+}
+
+#[inline]
+fn inside(k: [i32; 3], lo: [i32; 3], hi: [i32; 3]) -> bool {
+    (0..3).all(|a| k[a] >= lo[a] && k[a] < hi[a])
+}
+
+/// How streaming sees the charts around a centre in storage: the centre's own box (home) and its
+/// neighbours across seams unfolded beyond its four sides, so a view box around the centre covers
+/// the neighbouring charts' chunks as if the charts were one flat net. The identity everywhere
+/// else (a physical centre, or no atlas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Unfold {
+    home: Option<([i32; 3], [i32; 3])>,
+    sides: [Option<SideMap>; 4],
+    /// First storage chunk x: everything below is physical space, which no net touches.
+    storage_cx0: i32,
+}
+
+impl Unfold {
+    pub const IDENTITY: Self = Self { home: None, sides: [None; 4], storage_cx0: i32::MAX };
+
+    /// Whether this is the identity (a physical centre).
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        self.home.is_none()
+    }
+
+    /// Where real chunk `c` sits in the net: home chunks are themselves, a neighbour chart's chunks
+    /// the virtual chunks beyond the side they unfold from, physical chunks themselves, and storage
+    /// outside the net (other bands, faces and bodies) far away from everything. Only ever fold real
+    /// chunks (a virtual chunk may coincide with some other box's address).
+    #[inline]
+    pub fn fold(&self, c: Coord) -> Coord {
+        let Some((lo, hi)) = self.home else { return c };
+        let k = [c.x, c.y, c.z];
+        if inside(k, lo, hi) {
+            return c;
+        }
+        for s in self.sides.iter().flatten() {
+            if inside(k, s.lo, s.hi) {
+                // The inverse of a rotation is its transpose.
+                let d = [k[0] - s.real[0], k[1] - s.real[1], k[2] - s.real[2]];
+                let v: [i32; 3] =
+                    std::array::from_fn(|a| s.virt[a] + (0..3).map(|b| s.cols[a][b] * d[b]).sum::<i32>());
+                return Coord::new(v[0], v[1], v[2]);
+            }
+        }
+        if c.x >= self.storage_cx0 {
+            return Coord::new(i32::MIN / 4, i32::MIN / 4, i32::MIN / 4);
+        }
+        c
+    }
+
+    /// The real chunk standing for virtual chunk `v` of a view box: `v` in the home chart (and
+    /// everywhere for the identity), the neighbour's chunk beyond a seam side, `None` for storage
+    /// that holds nothing (beyond the relief top or the bottom of the band, past the corners).
+    #[inline]
+    pub fn unfold(&self, v: Coord) -> Option<Coord> {
+        let Some((lo, hi)) = self.home else { return Some(v) };
+        let k = [v.x, v.y, v.z];
+        if inside(k, lo, hi) || v.x < self.storage_cx0 {
+            return Some(v);
+        }
+        let out = |a: usize| (k[a] >= hi[a]) as i32 - (k[a] < lo[a]) as i32;
+        let (ox, oy, oz) = (out(0), out(1), out(2));
+        if oy != 0 || (ox != 0) == (oz != 0) {
+            return None;
+        }
+        let side = match (ox, oz) {
+            (-1, _) => 0,
+            (1, _) => 1,
+            (_, -1) => 2,
+            _ => 3,
+        };
+        let s = self.sides[side]?;
+        let d = [k[0] - s.virt[0], k[1] - s.virt[1], k[2] - s.virt[2]];
+        let r: [i32; 3] = std::array::from_fn(|b| s.real[b] + (0..3).map(|a| s.cols[a][b] * d[a]).sum::<i32>());
+        inside(r, s.lo, s.hi).then(|| Coord::new(r[0], r[1], r[2]))
+    }
+}
+
+impl Seams {
+    /// The unfolding around streaming centre `centre` (a storage chunk inside a box, or above one).
+    pub fn unfold_at(&self, centre: Coord) -> Unfold {
+        if centre.x < self.min_cx {
+            return Unfold::IDENTITY;
+        }
+        let column = |r: &&Region| centre.x >= r.lo[0] && centre.x < r.hi[0] && centre.z >= r.lo[2] && centre.z < r.hi[2];
+        let Some(r) = self.region_of(centre).or_else(|| self.regions.iter().find(column)) else {
+            return Unfold::IDENTITY;
+        };
+        let mut u = Unfold { home: Some((r.lo, r.hi)), sides: [None; 4], storage_cx0: self.min_cx };
+        for (i, face) in [Face::NegX, Face::PosX, Face::NegZ, Face::PosZ].into_iter().enumerate() {
+            let a = face.axis();
+            let mut p = [centre.x, centre.y, centre.z];
+            for k in 0..3 {
+                p[k] = p[k].clamp(r.lo[k], r.hi[k] - 1);
+            }
+            p[a] = if face.sign() > 0 { r.hi[a] - 1 } else { r.lo[a] };
+            let Some(x) = self.across(Coord::new(p[0], p[1], p[2]), face) else { continue };
+            let cols = x.remap.cols.map(|c| c.map(|v| v as i32));
+            let unit = cols.iter().all(|c| c.iter().map(|v| v.abs()).sum::<i32>() == 1 && c.iter().any(|v| v.abs() == 1));
+            let Some(nr) = self.region_of(x.chunk) else { continue };
+            if !unit {
+                continue;
+            }
+            let mut virt = p;
+            virt[a] += face.sign();
+            u.sides[i] = Some(SideMap { lo: nr.lo, hi: nr.hi, virt, real: [x.chunk.x, x.chunk.y, x.chunk.z], cols });
+        }
+        u
+    }
+
+    /// Where streaming should stand for a physical eye at `p`: its storage position in the patch
+    /// under it, also when it flies above a chart's relief top (up to `reach` blocks, projected
+    /// straight down onto the chart). `None` away from every round body.
+    pub fn storage_eye(&self, p: glam::DVec3, reach: f64) -> Option<glam::DVec3> {
+        for a in &self.atlases {
+            if let Some((patch, l)) = a.find(p) {
+                let (o, _) = a.storage_box(patch);
+                return Some(l + glam::DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64));
+            }
+            let rel = p - a.centre;
+            let r = rel.length();
+            let b = a.bands[0];
+            // How far above the top (outward charts: beyond r_hi; inward ones: inside r_lo).
+            let (top, above) = if a.inward { (b.r_lo as f64 + 0.5, b.r_lo as f64 + 0.5 - r) } else { (b.r_hi as f64 - 0.5, r - (b.r_hi as f64 - 0.5)) };
+            if !(above > 0.0 && above < reach) || r == 0.0 {
+                continue;
+            }
+            if let Some((patch, l)) = a.find(a.centre + rel * (top / r)) {
+                let (o, _) = a.storage_box(patch);
+                return Some(glam::DVec3::new(l.x + o[0] as f64, l.y + o[1] as f64 + above, l.z + o[2] as f64));
+            }
+        }
+        None
+    }
+}
+
 fn face_of(axis: usize, d: i32) -> Face {
     match (axis, d > 0) {
         (0, true) => Face::PosX,
@@ -491,6 +643,56 @@ mod tests {
         let g = seams.glue_cell(outside).expect("one cell outside a chart's side");
         assert_eq!(Some([g.x as i64, g.y as i64, g.z as i64]), a.glue([outside.x as i64, outside.y as i64, outside.z as i64]));
         assert_eq!(seams.glue_cell(BlockCoord::new(10, 20, 30)), None, "physical cells");
+    }
+
+    #[test]
+    fn the_net_unfolds_and_folds_back() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let c = seam_chunk(&a);
+        let u = seams.unfold_at(c);
+        assert!(!u.is_identity());
+        assert!(Seams::new(vec![a.clone()]).unfold_at(Coord::new(1, 2, 3)).is_identity(), "physical centres");
+        // Every chunk along the +u side: the virtual chunk beyond it is the glued neighbour.
+        let r = *seams.region_of(c).unwrap();
+        for z in (r.lo[2]..r.hi[2]).step_by(7) {
+            let side = Coord::new(r.hi[0] - 1, c.y, z);
+            let x = seams.across(side, Face::PosX).expect("a seam all along the side");
+            let v = side.step(Face::PosX);
+            assert_eq!(u.unfold(v), Some(x.chunk), "z {z}");
+            assert_eq!(u.fold(x.chunk), v);
+        }
+        // Further out the net keeps going into the neighbour, and folds back exactly.
+        for k in 1..6 {
+            let v = Coord::new(r.hi[0] - 1 + k, c.y + 1, c.z - 3);
+            let real = u.unfold(v).expect("inside the neighbour chart");
+            assert!(seams.in_storage(real));
+            assert_eq!(u.fold(real), v);
+        }
+        // Home chunks are themselves; beyond the top and past a corner hold nothing.
+        assert_eq!(u.unfold(c), Some(c));
+        assert_eq!(u.unfold(Coord::new(c.x, r.hi[1] + 2, c.z)), None);
+        assert_eq!(u.unfold(Coord::new(r.hi[0] + 1, c.y, r.hi[2] + 1)), None);
+    }
+
+    #[test]
+    fn the_storage_eye_sits_on_the_cell_holding_it_and_above_the_top() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let b = a.bands[0];
+        let l = DVec3::new(b.n as f64 * 0.3, (a.radius - b.r_lo) as f64 + 1.5, b.n as f64 * 0.6);
+        let p = a.embed(top, l);
+        let (o, _) = a.storage_box(top);
+        let s = seams.storage_eye(p, 1000.0).expect("on the surface");
+        assert!((s - (l + DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64))).length() < 1e-6);
+        // Fly 300 blocks above the relief top: straight above the same column, 300 cells above.
+        let dir = (p - a.centre).normalize();
+        let high = a.centre + dir * (b.r_hi as f64 - 0.5 + 300.0);
+        let sh = seams.storage_eye(high, 1000.0).expect("above the top within reach");
+        assert!((sh.x - s.x).abs() < 0.01 && (sh.z - s.z).abs() < 0.01, "{sh:?} vs {s:?}");
+        assert!((sh.y - (o[1] as f64 + (b.r_hi - b.r_lo) as f64 - 0.5 + 300.0)).abs() < 0.01);
+        assert_eq!(seams.storage_eye(a.centre + dir * (b.r_hi as f64 + 5000.0), 1000.0), None, "beyond reach");
     }
 
     #[test]

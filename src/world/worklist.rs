@@ -9,6 +9,7 @@
 
 use crate::coord::Face;
 
+use super::seam::Unfold;
 use super::{Coord, FastSet, World};
 
 /// Nearest-first worklist. Bucket `i` holds keys with `order(key, center) == i`;
@@ -17,6 +18,8 @@ pub struct RingWorklist {
     center: Coord,
     /// Up face the buckets were built with. `None` is isotropic chess.
     up: Option<Face>,
+    /// The chart net keys are measured in (identity off round worlds).
+    fold: Unfold,
     buckets: Vec<FastSet<Coord>>,
     len: usize,
 }
@@ -27,6 +30,7 @@ impl RingWorklist {
         Self {
             center,
             up: Some(Face::PosY),
+            fold: Unfold::IDENTITY,
             buckets: (0..rings).map(|_| FastSet::default()).collect(),
             len: 0,
         }
@@ -96,8 +100,17 @@ impl RingWorklist {
     }
 
     /// Re-bucket every key around `center`. Ring count and up face are unchanged.
+    #[cfg(test)]
     pub fn recenter(&mut self, center: Coord) {
         self.fit(center, self.buckets.len(), self.up);
+    }
+
+    /// Measure keys through `fold` (the chart net around a storage centre), re-bucketing if it moved.
+    pub fn set_fold(&mut self, fold: Unfold) {
+        if fold != self.fold {
+            self.fold = fold;
+            self.rebucket(self.center, self.buckets.len(), self.up);
+        }
     }
 
     /// Grow/shrink the ring count, re-bucketing if it moved. Up face unchanged.
@@ -113,6 +126,11 @@ impl RingWorklist {
         if center == self.center && rings == self.buckets.len() && up == self.up {
             return;
         }
+        self.rebucket(center, rings, up);
+    }
+
+    fn rebucket(&mut self, center: Coord, rings: usize, up: Option<Face>) {
+        let rings = rings.max(1);
         let old = std::mem::replace(
             &mut self.buckets,
             (0..rings).map(|_| FastSet::default()).collect(),
@@ -141,7 +159,7 @@ impl RingWorklist {
 
     #[inline]
     fn index(&self, key: Coord) -> usize {
-        let o = World::order(key, self.center, self.up).max(0) as usize;
+        let o = World::order(self.fold.fold(key), self.center, self.up).max(0) as usize;
         o.min(self.buckets.len() - 1)
     }
 }

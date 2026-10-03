@@ -637,7 +637,50 @@ impl World {
     /// `false` before the first stream (no centre yet).
     pub(in crate::world) fn in_mesh_box(&self, coord: Coord) -> bool {
         self.center
-            .is_some_and(|c| self.mesh_box(c).contains(coord))
+            .is_some_and(|c| self.view_contains(self.mesh_box(c), coord))
+    }
+
+    /// Whether `coord` lies in view box `b` once the charts around a storage centre are unfolded
+    /// into one net (SPACE-ARCHITECTURE §7); plain containment elsewhere.
+    #[inline]
+    pub(in crate::world) fn view_contains(&self, b: ChunkBox, coord: Coord) -> bool {
+        b.contains(self.fold.fold(coord))
+    }
+
+    /// The real chunks of view box `b`: across the unfolded chart net around a storage centre
+    /// (storage that holds nothing is skipped), `b` itself elsewhere.
+    pub(in crate::world) fn view_coords(&self, b: ChunkBox) -> impl Iterator<Item = Coord> + use<> {
+        let fold = self.fold;
+        b.coords().filter_map(move |v| fold.unfold(v))
+    }
+
+    /// The point streaming stands on: the eye's storage position on (or above) a round world's
+    /// chart, else the eye itself.
+    pub(in crate::world) fn stream_eye(&self, eye: DVec3) -> DVec3 {
+        if self.seams.is_empty() {
+            return eye;
+        }
+        let reach = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64 * CHUNK_SIZE as f64;
+        self.seams.storage_eye(eye, reach).unwrap_or(eye)
+    }
+
+    /// Adopt the chart net around streaming centre `centre`; returns whether it changed. A new net
+    /// drops the previous boxes' diffs (they were measured in the old net) and re-buckets the
+    /// worklists.
+    pub(in crate::world) fn adopt_fold(&mut self, centre: Coord) -> bool {
+        let fold = self.seams.unfold_at(centre);
+        if fold == self.fold {
+            return false;
+        }
+        self.fold = fold;
+        self.prev_mesh_box = None;
+        self.prev_unload_box = None;
+        self.mesh_worklist.set_fold(fold);
+        self.light_worklist.set_fold(fold);
+        if let Some(workers) = self.workers.as_ref() {
+            workers.set_fold(fold);
+        }
+        true
     }
 
     /// Peek the dirty-remesh hint without consuming it.
@@ -697,6 +740,8 @@ impl World {
             self.gpu_live_slots = stats.live_slots;
             self.slot_ceiling = stats.cpu_cull_max.max(1);
         }
+        // On a round world streaming stands in the chart's storage cells.
+        let center = self.stream_eye(center);
         // Capture eye altitude; section metric measures dy from it.
         self.section_eye_y = center.y;
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
@@ -751,6 +796,7 @@ impl World {
         // An up-face change is the same kind of pass: the box changed shape.
         let prev_center = self.center;
         let center_moved = Some(center_chunk) != self.center;
+        let fold_changed = center_moved && self.adopt_fold(center_chunk);
         let up_changed = if center_moved || !self.stream_up_set {
             let up = self.resolve_stream_up(center_chunk);
             let changed = if self.stream_up_set {
@@ -765,7 +811,7 @@ impl World {
         } else {
             false
         };
-        let full_pass = center_moved || up_changed;
+        let full_pass = center_moved || up_changed || fold_changed;
         self.center = Some(center_chunk);
         // Re-bucket worklists around the live centre before any lane (or pump
         // insert) runs. O(n) once per boundary cross; a no-op when the rings,
@@ -855,9 +901,9 @@ impl World {
             // instead of the old all-chunks iteration per cross.
             let new_box = self.mesh_box(center_chunk);
             let prev_box = self.prev_mesh_box;
-            let fresh: Vec<Coord> = new_box
-                .coords()
-                .filter(|&c| prev_box.is_none_or(|p| !p.contains(c)))
+            let fresh: Vec<Coord> = self
+                .view_coords(new_box)
+                .filter(|&c| prev_box.is_none_or(|p| !self.view_contains(p, c)))
                 .filter(|&c| self.is_needs_mesh(c))
                 .collect();
             self.mesh_worklist.extend(fresh);
@@ -879,8 +925,9 @@ impl World {
             // Ready chunks drop to NeedsMesh; Dirty chunks stay dirty
             // (prev: None) so same-frame dirty pass still remeshes them.
             let keep = self.mesh_box(center_chunk);
+            let fold = self.fold;
             for (&coord, loaded) in self.chunks.iter_mut() {
-                if keep.contains(coord) {
+                if keep.contains(fold.fold(coord)) {
                     continue;
                 }
                 // Ready becomes NeedsMesh; Dirty stays Dirty (prev: None); a
@@ -1507,9 +1554,9 @@ impl World {
             return Progress::Idle;
         }
         let deadline = super::lanes::paced_deadline(self, budget);
-        let mut coords: Vec<Coord> = self.data_box(center).coords().collect();
+        let mut coords: Vec<Coord> = self.view_coords(self.data_box(center)).collect();
         if let Some(slab) = self.spawn_slab {
-            coords.extend(slab.coords());
+            coords.extend(self.view_coords(slab));
         }
         let runs = gather_column_runs(
             coords,
@@ -1536,7 +1583,7 @@ impl World {
         self.gen_columns.clear();
         self.gen_columns.extend(runs.into_iter().map(|run| {
             let anchor = run.anchor();
-            (column_order(center, self.section_vel, anchor, up), run)
+            (column_order(center, self.section_vel, self.fold.fold(anchor), up), run)
         }));
         let n = self.gen_columns.len();
         let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
@@ -1609,10 +1656,10 @@ impl World {
     }
 
     fn in_data_or_slab(&self, coord: Coord) -> bool {
-        self.spawn_slab.is_some_and(|slab| slab.contains(coord))
+        self.spawn_slab.is_some_and(|slab| self.view_contains(slab, coord))
             || self
                 .center
-                .is_some_and(|center| self.data_box(center).contains(coord))
+                .is_some_and(|center| self.view_contains(self.data_box(center), coord))
     }
 
     /// A queued job was DESCHEDULED at the pool: its region left the live view
@@ -1724,7 +1771,8 @@ impl World {
     /// Ensure every chunk within the data box of `center` exists (voxel data
     /// only). Cheap and GPU-free, so it also seeds headless queries.
     pub(in crate::world) fn ensure_region_data(&mut self, center: Coord) {
-        for coord in self.data_box(center).coords() {
+        let coords: Vec<Coord> = self.view_coords(self.data_box(center)).collect();
+        for coord in coords {
             self.ensure_data(coord);
         }
     }
@@ -1751,7 +1799,9 @@ impl World {
     /// once every chunk of the box has loaded. Teleports and net snaps use
     /// the same request (physics freezes until it lands).
     pub fn prepare_around(&mut self, pos: DVec3) {
+        let pos = self.stream_eye(pos);
         let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
+        self.adopt_fold(c);
         let up = self.slab_up(c);
         let slab = Self::collision_slab(c, up);
         let far_m = f64::from(self.section_pyramid.outer_m());
@@ -1760,7 +1810,7 @@ impl World {
             .set_view(c.x, c.y, c.z, view_r, far_m, 0.0, 0.0, 0.0, up);
         self.submit_slab_columns(slab);
         self.pending_gen.set();
-        if slab.coords().all(|coord| self.chunks.contains_key(&coord)) {
+        if self.view_coords(slab).all(|coord| self.chunks.contains_key(&coord)) {
             self.spawn_slab = None;
         } else {
             self.spawn_slab = Some(slab);
@@ -1770,8 +1820,11 @@ impl World {
     /// Synchronously generate the collision slab. Headless callers (tests,
     /// anything that queries voxels before a stream pass).
     pub fn ensure_around(&mut self, pos: DVec3) {
+        let pos = self.stream_eye(pos);
         let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
-        for coord in Self::collision_slab(c, self.slab_up(c)).coords() {
+        self.adopt_fold(c);
+        let coords: Vec<Coord> = self.view_coords(Self::collision_slab(c, self.slab_up(c))).collect();
+        for coord in coords {
             self.ensure_data(coord);
         }
     }
@@ -1781,7 +1834,7 @@ impl World {
     pub fn spawn_ready(&self) -> bool {
         match self.spawn_slab {
             None => true,
-            Some(slab) => slab.coords().all(|c| self.chunks.contains_key(&c)),
+            Some(slab) => self.view_coords(slab).all(|c| self.chunks.contains_key(&c)),
         }
     }
 
@@ -1815,13 +1868,13 @@ impl World {
         let Some(slab) = self.spawn_slab else {
             return;
         };
-        if slab.coords().all(|c| self.chunks.contains_key(&c)) {
+        if self.view_coords(slab).all(|c| self.chunks.contains_key(&c)) {
             self.spawn_slab = None;
         }
     }
 
     fn submit_slab_columns(&mut self, slab: ChunkBox) {
-        let coords: Vec<Coord> = slab.coords().collect();
+        let coords: Vec<Coord> = self.view_coords(slab).collect();
         let runs = gather_column_runs(
             coords,
             |c| self.generator.sky(c),
@@ -2046,19 +2099,19 @@ impl World {
     /// Coords in the previous unload box that have left `new_box`, or every
     /// loaded chunk past `new_box` when there is no previous box (first pass
     /// or a radius change). Spawn-slab chunks stay.
-    fn unload_leaving(&self, new_box: ChunkBox) -> Vec<Coord> {
-        let keep_spawn = |coord| self.spawn_slab.is_some_and(|slab| slab.contains(coord));
+    pub(in crate::world) fn unload_leaving(&self, new_box: ChunkBox) -> Vec<Coord> {
+        let keep_spawn = |coord| self.spawn_slab.is_some_and(|slab| self.view_contains(slab, coord));
         match self.prev_unload_box {
-            Some(prev) => prev
-                .coords()
-                .filter(|&coord| !new_box.contains(coord) && !keep_spawn(coord))
+            Some(prev) => self
+                .view_coords(prev)
+                .filter(|&coord| !self.view_contains(new_box, coord) && !keep_spawn(coord))
                 .filter(|&coord| self.chunks.contains_key(&coord))
                 .collect(),
             None => self
                 .chunks
                 .keys()
                 .copied()
-                .filter(|&coord| !new_box.contains(coord) && !keep_spawn(coord))
+                .filter(|&coord| !self.view_contains(new_box, coord) && !keep_spawn(coord))
                 .collect(),
         }
     }
@@ -2135,8 +2188,8 @@ impl World {
         self.dirty_worklist
             .retain(|c| chunks.get(c).is_some_and(|l| l.state.is_dirty()));
         let mut dirty: Vec<Coord> = self.dirty_worklist.iter().copied().collect();
-        let up = self.live_up();
-        dirty.sort_by_key(|&coord| Self::order(coord, center, up));
+        let (up, fold) = (self.live_up(), self.fold);
+        dirty.sort_by_key(|&coord| Self::order(fold.fold(coord), center, up));
         // Leftovers past the budget stay `Dirty` (still in the fiber); re-arm
         // the hint so the next frame drains them.
         let remaining = dirty.len().saturating_sub(DIRTY_BUDGET);
@@ -3126,7 +3179,7 @@ impl World {
             return false;
         }
         // Every in-view chunk has a final mesh (data loaded, not building/dirty).
-        for coord in self.mesh_box(center).coords() {
+        for coord in self.view_coords(self.mesh_box(center)) {
             match self.chunks.get(&coord).map(|l| &l.state) {
                 Some(MeshState::Air | MeshState::Ready(_)) => {}
                 _ => return false,
@@ -3273,8 +3326,8 @@ impl World {
     /// [`entry_complete`](Self::entry_complete).
     pub fn entry_debug(&self) -> String {
         if let Some(slab) = self.spawn_slab {
-            let missing = slab
-                .coords()
+            let missing = self
+                .view_coords(slab)
                 .filter(|c| !self.chunks.contains_key(c))
                 .count();
             if missing > 0 {
@@ -3347,7 +3400,7 @@ impl World {
         // Tally by state and (for idle NeedsMesh) by which gate would block.
         let (mut missing, mut idle, mut building, mut dirty, mut queued) = (0, 0, 0, 0, 0);
         let (mut idle_no_neigh, mut idle_unlit) = (0, 0);
-        for c in self.mesh_box(center).coords() {
+        for c in self.view_coords(self.mesh_box(center)) {
             let in_wl = self.mesh_worklist.contains(&c);
             match self.chunks.get(&c).map(|l| &l.state) {
                 Some(MeshState::Air | MeshState::Ready(_)) => {}

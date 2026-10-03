@@ -36,7 +36,6 @@ use super::Coord;
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generation::ColumnHeights;
 use super::{ColumnKey, Sky};
-#[cfg(test)]
 use crate::coord::Face;
 #[cfg(test)]
 use super::terrain::Terrain;
@@ -680,6 +679,11 @@ pub(in crate::world) struct ViewGate {
     vel_x: AtomicU64,
     vel_y: AtomicU64,
     vel_z: AtomicU64,
+    /// The chart net around a storage centre: job chunks are measured folded
+    /// into it (`folded` says whether it is anything but the identity, so the
+    /// physical path never takes the lock).
+    fold: std::sync::RwLock<super::seam::Unfold>,
+    folded: std::sync::atomic::AtomicBool,
     /// Velocity-aware concurrency and near-queue lookahead. Both are published
     /// by the main thread from the world's single streaming pacer.
     active_workers: AtomicUsize,
@@ -702,6 +706,8 @@ impl ViewGate {
             vel_x: AtomicU64::new(0.0f64.to_bits()),
             vel_y: AtomicU64::new(0.0f64.to_bits()),
             vel_z: AtomicU64::new(0.0f64.to_bits()),
+            fold: std::sync::RwLock::new(super::seam::Unfold::IDENTITY),
+            folded: std::sync::atomic::AtomicBool::new(false),
             active_workers: AtomicUsize::new(1),
             // Permissive until a real Workers pool publishes its capacity;
             // direct queue tests and non-streaming users retain legacy behavior.
@@ -709,6 +715,7 @@ impl ViewGate {
         }
     }
 
+    #[cfg(test)]
     fn set(&self, cx: i32, cy: i32, cz: i32, radius: i32) {
         let prev = (
             self.cx.swap(cx, Ordering::Relaxed),
@@ -819,10 +826,37 @@ impl ViewGate {
         Face::from_index(self.up.load(Ordering::Relaxed))
     }
 
+    /// Publish the chart net (bumps the epoch so queued work re-keys).
+    fn set_fold(&self, fold: super::seam::Unfold) {
+        let mut cur = self.fold.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cur != fold {
+            *cur = fold;
+            self.folded.store(!fold.is_identity(), Ordering::Relaxed);
+            self.epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// Chess distance from the live centre across the up face (+Y: the XZ
     /// chess this gate always used), 3-D chess when isotropic; `0` while
     /// permissive. Distance along the up axis never deschedules, as before.
+    /// A job in a neighbouring chart is measured where the chart net puts it.
     fn dist(&self, x: i32, y: i32, z: i32) -> i32 {
+        let (x, y, z) = self.folded(x, y, z);
+        self.dist_in_net(x, y, z)
+    }
+
+    /// A job chunk's place in the chart net (itself off round worlds).
+    #[inline]
+    fn folded(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+        if !self.folded.load(Ordering::Relaxed) {
+            return (x, y, z);
+        }
+        let c = self.fold.read().unwrap_or_else(std::sync::PoisonError::into_inner).fold(Coord::new(x, y, z));
+        (c.x, c.y, c.z)
+    }
+
+    /// [`dist`](Self::dist) of a chunk already placed in the net.
+    fn dist_in_net(&self, x: i32, y: i32, z: i32) -> i32 {
         if self.radius.load(Ordering::Relaxed) == i32::MAX {
             return 0;
         }
@@ -842,7 +876,8 @@ impl ViewGate {
     /// without collapsing adjacent rings onto one integer. Bias is in the
     /// plane perpendicular to the up face, in chunk units. +Y uses XZ only.
     fn near_key(&self, x: i32, y: i32, z: i32) -> u64 {
-        let base = self.dist(x, y, z) as u64 * 1024;
+        let (x, y, z) = self.folded(x, y, z);
+        let base = self.dist_in_net(x, y, z) as u64 * 1024;
         if base == 0 {
             return 0;
         }
@@ -1297,6 +1332,11 @@ impl Workers {
     ) {
         self.view
             .publish(cx, cy, cz, radius, far_m, vel_x, vel_y, vel_z, up);
+    }
+
+    /// Publish the chart net around a storage centre to the job gate.
+    pub(in crate::world) fn set_fold(&self, fold: super::seam::Unfold) {
+        self.view.set_fold(fold);
     }
 
     /// Park/unpark workers and publish near-queue lookahead together. A cap-only

@@ -2950,3 +2950,36 @@ fn storage_edits_weigh_where_the_matter_is() {
     assert!((after_near - before_near).length() > 0.0, "the hole changes the pull beside it");
     assert_eq!(after_storage, before_storage, "nothing happens at the storage address");
 }
+
+/// Standing on a round world near a chart seam, the world streams the chart's storage chunks around
+/// the eye and the neighbouring chart's chunks beyond the seam (the chart net), and nothing outside
+/// the boxes.
+#[test]
+fn a_round_world_streams_its_chart_net_around_the_eye() {
+    use crate::space::atlas::Patch;
+    let (mut world, c) = storage_ball_world(-3);
+    let atlas = world.seams.atlases()[0].clone();
+    let top = Patch::Shell { band: 0, face: Face::PosY };
+    let eye_s = DVec3::new(c.x as f64 * 16.0 + 8.0, c.y as f64 * 16.0 + 8.0, c.z as f64 * 16.0 + 8.0);
+    let eye = atlas.embed_storage(top, eye_s);
+    let s = world.stream_eye(eye);
+    assert!((s - eye_s).length() < 1e-6, "the eye stands on its storage cell");
+    let centre = ChunkCoord::new((s.x / 16.0).floor() as i32, (s.y / 16.0).floor() as i32, (s.z / 16.0).floor() as i32);
+    assert!(world.adopt_fold(centre));
+    world.center = Some(centre);
+    world.ensure_region_data(centre);
+    let across = world.seams.across(c, Face::PosX).expect("seam");
+    assert!(world.chunks.contains_key(&across.chunk), "the chunk across the seam streams");
+    let deeper = world.fold.unfold(c.step(Face::PosX).step(Face::PosX).step(Face::PosX)).expect("in the net");
+    assert!(world.chunks.contains_key(&deeper), "and the net goes on into the neighbour chart");
+    assert!(world.in_mesh_box(across.chunk), "it is drawn");
+    assert!(world.chunks.keys().all(|&k| world.seams.in_storage(k)), "nothing outside the boxes loads");
+    assert!(world.unload_leaving(world.unload_box(centre)).is_empty(), "nothing in the net unloads");
+    let up = world.live_up();
+    assert!(World::order(world.fold.fold(across.chunk), centre, up) <= 1, "the neighbour is near in the net");
+    // The collision slab around the eye reaches across the seam too.
+    world.prepare_around(eye);
+    assert!(world.spawn_ready() || world.spawn_slab.is_some());
+    world.ensure_around(eye);
+    assert!(world.spawn_ready(), "the slab is loaded, glued chunks included");
+}
