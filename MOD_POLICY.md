@@ -19,22 +19,35 @@ Until the sandboxed WebAssembly ABI and the official registry exist, mods are di
 [PWC package manager](https://github.com/gusahlg/pwc-package-manager) (`pwc`). That native,
 compile-in stage is local and pre-registry: its packages are trusted native code, not sandboxed,
 and are not official registry mods. The package manager's `POLICY.md` carries this policy over
-and enforces what it can (AGPL-3.0-or-later code licences, approved content licences, complete
-source with no build scripts, content-addressed immutable versions).
+and enforces what it can (allowlisted free code and content licences, complete source with no
+build scripts, content-addressed immutable versions).
 
 ## Licensing
 
-All original software code in a submitted mod must be licensed
-`AGPL-3.0-or-later`. This includes client, server, shared, and tool components,
-build scripts, generated software source, and project-specific SDK glue.
+Proprietary mods are not accepted. Every mod must be free software that all of
+its recipients may study, modify, rebuild, and share.
+
+All original software code in a submitted mod must be licensed under a
+free-software licence on the registry's published allowlist of licences
+compatible with the game's `AGPL-3.0-or-later`; mods are combined with the AGPL
+game, so the combination must remain distributable under the AGPL. This
+includes client, server, shared, and tool components, build scripts, generated
+software source, and project-specific SDK glue. Accepted licences include
+`Apache-2.0 OR MIT` (recommended, and used by the first-party mods), `MIT`,
+`MPL-2.0`, `GPL-3.0-or-later`, and `AGPL-3.0-or-later`; the full allowlist is
+maintained in the PWC package manager's `POLICY.md`. A package declares its
+licence as an SPDX expression, and every alternative a recipient may choose
+must include an allowlisted software licence. Proprietary, source-available-only,
+noncommercial, and custom field-of-use licences are not accepted for code.
 
 Source dependencies must be free software under licences accepted by the
 registry's published compatibility allowlist. Their notices and source must be
-preserved. A dependency may retain a compatible free-software licence; that
-does not permit the mod's own code to use a permissive or proprietary licence.
+preserved.
 
 Mod assets must have complete provenance and use an approved free-content
-licence. The initial approved list is:
+licence, or the package's own allowlisted free-software licence (for example
+the first-party mods' icons, which are `Apache-2.0 OR MIT` like their code).
+The initial approved free-content list is:
 
 - `CC-BY-SA-4.0`;
 - `CC-BY-4.0`;

@@ -2,7 +2,7 @@
 
 PWC mods are **compiled in**. A modded PWC is an exact build: one game version plus one exact
 set of mod packages, turned into a native executable by the PWC package manager
-([`pwc-package-manager`](../../pwc-package-manager), command `pwc`). This repository is the
+([`pwc-package-manager`](https://github.com/gusahlg/pwc-package-manager), command `pwc`). This repository is the
 runtime those builds link against; it contains no installed mods.
 
 Responsibilities:
@@ -16,7 +16,20 @@ Responsibilities:
 Matter itself is not a mod. The law, the intern table and the reaction scheduler live in the core
 (`documentation/material-model.md`). Mods present matter, place it, hold it, and (for machines)
 change cells, which wakes their reactions. What mods may do is governed by
-[MOD_POLICY.md](../MOD_POLICY.md) and the package manager's `POLICY.md`.
+[MOD_POLICY.md](../MOD_POLICY.md) and the package manager's
+[`POLICY.md`](https://github.com/gusahlg/pwc-package-manager/blob/main/POLICY.md).
+
+## Licences
+
+The game, including `crates/pwc-mod-api` and this runtime, is `AGPL-3.0-or-later`; the package
+manager tooling is `AGPL-3.0-or-later` too. Mod packages are licensed separately: a mod's code may
+use any free-software licence on the package manager's allowlist of licences compatible with the
+game's `AGPL-3.0-or-later` (for example `Apache-2.0 OR MIT`, `MIT`, `MPL-2.0`,
+`GPL-3.0-or-later`, `AGPL-3.0-or-later`), and its assets an approved free-content licence.
+Proprietary mods are not accepted. The first-party packages and `examples/mods/hello-hud` are
+`Apache-2.0 OR MIT`, which is also the recommended licence for new mods. A built instance links
+its mods into the AGPL game, so distributing that executable follows the AGPL as a whole; each
+mod's own source keeps its licence.
 
 ## Builds
 
@@ -94,7 +107,7 @@ what it re-exports needs a major version bump.
 ## First-party mods
 
 The first-party mods live in the package manager repository under `mods/` (namespace `pwc`), each
-a package with its own README, licence and tests:
+a package with its own README, licence (`Apache-2.0 OR MIT`) and tests:
 
 | Package | Mods (ids) |
 |---|---|

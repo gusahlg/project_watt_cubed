@@ -17,12 +17,14 @@ architecture" direction (a modded PWC is an exact build). Work was fanned out to
   `golden` bin calls it with vanilla); goldens honour `WATT_GOLDEN_DIR`.
 - `crates/pwc-mod-api` (version 1.0.0 = the mod API version) re-exports the host and the game
   modules mods may use; several runtime modules became `pub` for it.
-- `examples/mods/hello-hud` — a minimal complete mod package (AGPL-3.0-or-later).
+- `examples/mods/hello-hud` — a minimal complete mod package (`Apache-2.0 OR MIT`, like the
+  first-party mods; `REUSE.toml` annotates `examples/mods/*/**` accordingly).
 - Core tests use stand-ins (`src/modding/testing.rs`) with the old ids; the real mods' tests moved
   into their packages. 708 lib tests pass.
 - `mods.cfg` notice on the Mods screen now points at `pwc mod add/remove`.
 - `MOD_POLICY.md` gained a "Current implementation" section: native compile-in packages are the
-  local pre-registry stage; the sandboxed WebAssembly ABI remains the rule for official mods.
+  local pre-registry stage; the sandboxed WebAssembly ABI remains the rule for official mods. Its
+  "Licensing" section now follows the 2026-10-03 licensing decision below.
 
 **Consequence:** `cargo run --release`, `nix run`, `./play.sh`, the benchmark (`WATT_BENCH`) and
 `golden` now exercise **vanilla** PWC (flat world, flat colours, core menus). Full-experience
@@ -30,7 +32,9 @@ benchmarks and goldens come from a `pwc`-built instance: `pwc run -- …` (same 
 variables) and `pwc run --golden`. Pinned baselines from before this change measured the old
 built-in mods; re-pin against `pwc.essentials` builds.
 
-## PWC package manager (`../pwc-package-manager`, new, Apache-2.0 OR MIT)
+## PWC package manager (`../pwc-package-manager`, new, AGPL-3.0-or-later)
+
+Repository: <https://github.com/gusahlg/pwc-package-manager>.
 
 Crates: `pwc-manifest` (mod.toml / instance.toml / pwc.lock, licence policy), `pwc-package`
 (.pwcmod canonical tar + zstd, sha256 package hash), `pwc-store` (content-addressed immutable
@@ -38,10 +42,29 @@ store), `pwc-resolver` (deterministic backtracking resolution), `pwc-instance` (
 repositories, locking), `pwc-builder` (generated instance crate + mod bundle, Build ID, cache),
 `pwc-cli` (`pwc`). Specs in `docs/spec/`, policy in `POLICY.md`.
 
-First-party packages in `mods/` (namespace `pwc`, AGPL-3.0-or-later code + CC-BY-SA-4.0 assets per
-MOD_POLICY): `pwc.menus`, `pwc.start-screen`, `pwc.hotbar`, `pwc.inventory` (depends on
-`pwc.hotbar`), `pwc.visuals`, `pwc.neural-textures`, `pwc.material-names`,
-`pwc.infinite-diffusion`, and the bundle `pwc.essentials`.
+First-party packages in `mods/` (namespace `pwc`, `Apache-2.0 OR MIT`): `pwc.menus`,
+`pwc.start-screen`, `pwc.hotbar`, `pwc.inventory` (depends on `pwc.hotbar`), `pwc.visuals`,
+`pwc.neural-textures`, `pwc.material-names`, `pwc.infinite-diffusion`, and the bundle
+`pwc.essentials`.
+
+## Licensing decision (2026-10-03)
+
+The owner reversed the first arrangement (tooling `Apache-2.0 OR MIT`; mod code
+`AGPL-3.0-or-later` + `CC-BY-SA-4.0` assets):
+
+- The package manager **tooling** is `AGPL-3.0-or-later`.
+- The **mod packages** (the first-party ones and `examples/mods/hello-hud`) are
+  `Apache-2.0 OR MIT`, with `LICENSES/Apache-2.0.txt` and `LICENSES/MIT.txt` in each package.
+- The mod policy (package manager `POLICY.md`, policy version 2) no longer requires AGPL mod code.
+  Mods may use any free licence on its allowlist of licences compatible with the game's
+  `AGPL-3.0-or-later` (they are compiled into the AGPL game); `Apache-2.0 OR MIT` is recommended,
+  copyleft such as `MPL-2.0`, `GPL-3.0-or-later` or `AGPL-3.0-or-later` is accepted, proprietary
+  mods remain forbidden. For code packages every `OR` alternative must contain an allowlisted
+  software licence. The asset licence list is unchanged (`LAL-1.3` is the Free Art License that
+  `MOD_POLICY.md` used to call `FAL-1.3`).
+- The game itself is unchanged: `AGPL-3.0-or-later` software, `CC-BY-SA-4.0` project
+  assets and documentation. The game repository's `LICENSES/` gained `Apache-2.0.txt` and
+  `MIT.txt` for the example mod.
 
 ## Next
 

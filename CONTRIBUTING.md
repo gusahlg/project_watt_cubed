@@ -17,7 +17,10 @@ By contributing, you agree that:
   under that licence.
 
 Substantial code examples belong under `AGPL-3.0-or-later`, even when they
-accompany documentation.
+accompany documentation. The exception is mod code: the example mods under
+`examples/mods/` are `Apache-2.0 OR MIT`, like the first-party mods (see
+[LICENSE.md](LICENSE.md#mod-packages) and [MOD_POLICY.md](MOD_POLICY.md)), and
+contributions to them are licensed that way.
 
 You retain your copyright. You do not assign it to the project, grant a
 separate proprietary relicensing right, or agree to a proprietary

@@ -11,7 +11,7 @@ PWC mods are compiled into the game. This repository is the **runtime**: `cargo 
 world, flat colours, the core menus). The shipped experience — menus and start screen, hotbar and
 inventory, the fancy visual lanes, neural textures, material names and the InfiniteDiffusion
 world — is the `pwc.essentials` bundle of first-party mod packages, built by the
-[PWC package manager](../pwc-package-manager):
+[PWC package manager](https://github.com/gusahlg/pwc-package-manager):
 
 ```sh
 pwc setup                            # once: finds this checkout and the first-party mods

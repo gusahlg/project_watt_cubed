@@ -40,3 +40,12 @@ path = [
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors <https://github.com/gusahlg/project_watt_cubed/blob/main/CONTRIBUTORS.md>"
 SPDX-License-Identifier = "CC-BY-SA-4.0"
+
+# The example mods are templates for new mods: like the first-party mods they are
+# dual licensed Apache-2.0 OR MIT (MOD_POLICY.md). This table must stay after the
+# tables above, because the last matching table wins.
+[[annotations]]
+path = "examples/mods/*/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors <https://github.com/gusahlg/project_watt_cubed/blob/main/CONTRIBUTORS.md>"
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
