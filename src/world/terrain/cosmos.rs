@@ -347,16 +347,18 @@ impl Cosmos {
                 }
             }
         }
-        // Moons: two around home, one or two around each world, outside every body's reach.
+        // Moons: two around home, one or two around each world. They sit 5–7 parent reaches out, where
+        // the law's finite range has tapered the parent's pull below the moon's own (bodies are
+        // anchored, so a moon close to a big world would be a rock its surface slides off).
         let parents: Vec<Body> = bodies.iter().filter(|b| b.kind != Kind::Ember).copied().collect();
         for (pi, parent) in parents.iter().enumerate() {
             let n = if parent.kind == Kind::Home { 2 } else { 1 + (parent.seed % 2) as usize };
             for m in 0..n {
                 let s = hash3(seed ^ 0x300E, pi as i32, m as i32, 1);
-                let r = 300_000 + (s % 700_000) as i64;
+                let r = 600_000 + (s % 900_000) as i64;
                 for attempt in 0..64 {
                     let dir = direction(s, attempt);
-                    let dist = parent.reach() * (1.3 + unit(hash3(s, attempt, 2, 3)) as f64 * 0.8) + r as f64;
+                    let dist = parent.reach() * (5.0 + unit(hash3(s, attempt, 2, 3)) as f64 * 2.0) + r as f64;
                     let c = parent.centre_f() + dir * dist;
                     let clear = bodies.iter().all(|b| (b.centre_f() - c).length() > b.reach() + r as f64 * 2.0);
                     if clear && c.abs().max_element() < 9.5e8 {
@@ -726,6 +728,63 @@ mod tests {
         let near = cosmos.clusters().iter().filter(|c| (c.centre - cosmos.home().centre_f()).length() < 2.0e8).count();
         let nearest = cosmos.clusters().iter().map(|c| (c.centre - DVec3::new(0.0, 0.0, 0.0)).length()).fold(f64::MAX, f64::min);
         println!("{n} clusters, {near} within 2e8 of home, nearest to spawn {nearest:.3e}");
+    }
+
+
+    /// `cargo test --release --lib gravity_tour -- --ignored --nocapture`: the field at the places where
+    /// matter-derived gravity gets interesting.
+    #[test]
+    #[ignore]
+    fn gravity_tour() {
+        let cosmos = Arc::new(Cosmos::new(42, 1.0));
+        let field = Field::new(cosmos.clone());
+        let g0 = crate::player::STANDARD_GRAVITY;
+        let home = cosmos.home().centre_f();
+        let h = HOME_HALF as f64;
+        let mut stops: Vec<(String, DVec3)> = vec![
+            ("home +Y face centre (spawn)".into(), home + DVec3::new(0.0, h + 70.0, 0.0)),
+            ("1,000,000 blocks from spawn".into(), home + DVec3::new(1.0e6, h + 70.0, 0.0)),
+            ("halfway to an edge".into(), home + DVec3::new(0.5 * h, h + 70.0, 0.0)),
+            ("an edge midpoint".into(), home + DVec3::new(h, h + 70.0, 0.0)),
+            ("a corner".into(), home + DVec3::splat(h + 70.0)),
+            ("1,000,000 below spawn".into(), home + DVec3::new(0.0, h - 1.0e6, 0.0)),
+            ("the cube's centre".into(), home),
+            ("10,000,000 above spawn".into(), home + DVec3::new(0.0, h + 1.0e7, 0.0)),
+        ];
+        let twins: Vec<&Body> = cosmos.bodies().iter().filter(|b| b.kind == Kind::Twin).collect();
+        if let [a, b] = twins[..] {
+            let mid = (a.centre_f() + b.centre_f()) * 0.5;
+            stops.push(("the Twins' canyon midpoint".into(), mid));
+            let d = (b.centre_f() - a.centre_f()).normalize();
+            stops.push(("a Twin's facing surface".into(), mid - d * (750_000.0 - 70.0)));
+        }
+        for b in cosmos.bodies() {
+            match (b.kind, b.shape) {
+                (Kind::Verdant, Shape::Ball { r }) => stops.push(("Verdance's surface".into(), b.centre_f() + DVec3::new(0.0, r as f64 + 70.0, 0.0))),
+                (Kind::Hollow, Shape::Shell { outer, inner }) => {
+                    stops.push(("the Hollow's outer surface".into(), b.centre_f() + DVec3::new(0.0, outer as f64 + 70.0, 0.0)));
+                    stops.push(("the Hollow's inner surface".into(), b.centre_f() + DVec3::new(0.0, inner as f64 - 70.0, 0.0)));
+                    stops.push(("halfway to the Hollow's core".into(), b.centre_f() + DVec3::new(0.0, inner as f64 * 0.5, 0.0)));
+                }
+                (Kind::Moon, Shape::Ball { r }) if (b.centre_f() - home).length() < 4.0e8 => {
+                    stops.push((format!("moon {} (r {r})", b.id), b.centre_f() + DVec3::new(0.0, r as f64 + 70.0, 0.0)))
+                }
+                _ => {}
+            }
+        }
+        println!("| where | pull (% of spawn) | tilt from local vertical |\n|---|---|---|");
+        for (name, p) in stops {
+            let s = field.sample(p);
+            let g = s.accel.length();
+            // Local vertical: a cube face's normal, a ball's radius.
+            let up = cosmos.body_at(p).map(|b| match b.shape {
+                Shape::Cube { .. } => crate::coord::Face::from_dominant(p - b.centre_f()).dvec(),
+                _ => (p - b.centre_f()).normalize(),
+            });
+            let up = up.unwrap_or(DVec3::Y);
+            let tilt = if g > 1e-9 { format!("{:.2}°", (-s.accel / g).dot(up).clamp(-1.0, 1.0).acos().to_degrees()) } else { "—".into() };
+            println!("| {name} | {:.4} % | {tilt} |", 100.0 * g / g0);
+        }
     }
 
 }

@@ -10,10 +10,11 @@ use glam::DVec3;
 /// The universal gravitational constant in block units: blocks³ per amount unit per second².
 /// Chosen once so the designed start planet pulls `24 m/s²` at its +Y face centre.
 pub const G: f64 = 4.349e-8;
-/// Range below which the law is exactly Newtonian.
-pub const R_IN: f64 = 1.25e8;
-/// Range at and beyond which no force acts.
-pub const R_G: f64 = 2.5e8;
+/// Range below which the law is exactly Newtonian (a body and its moons sit wholly inside it).
+pub const R_IN: f64 = 1.6e8;
+/// Range at and beyond which no force acts (the far worlds, ≥ 3.4e8 apart surface to surface, never
+/// reach each other).
+pub const R_G: f64 = 3.2e8;
 /// Softening length of a point sample (half a block: a sample stands for a cell).
 pub const EPS: f64 = 0.5;
 
