@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 
 use quinn::{Endpoint, SendStream};
 use tokio::runtime::Runtime;
-use voxel_engine::DVec3;
+use glam::DQuat;
+use voxel_engine::{DVec3, Vec3};
 
+use crate::coord::Face;
 use crate::net::protocol::{self, ClientMessage, ServerMessage, VoicePayload};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
@@ -39,6 +41,8 @@ struct Snapshot {
     pos: DVec3,
     yaw: f32,
     pitch: f32,
+    frame: DQuat,
+    up: Face,
     stance: Stance,
 }
 
@@ -94,6 +98,9 @@ pub struct Rendered {
     pub pos: Eye,
     pub yaw: f32,
     pub pitch: f32,
+    pub frame: DQuat,
+    /// The up axis of the latest snapshot. Faces don't interpolate.
+    pub up: Face,
     pub speed: f32,
     pub phase: f32,
     /// Broadcast stance; the renderer's animator handles the visual blend.
@@ -114,7 +121,7 @@ impl RemotePlayer {
         let yaw = lerp_angle(self.prev.yaw, self.target.yaw, alpha as f32);
         let pitch = self.prev.pitch + (self.target.pitch - self.prev.pitch) * alpha as f32;
         let speed = if secs > 0.0 {
-            (horizontal(self.prev.pos, self.target.pos) / secs) as f32
+            (across_up(self.prev.pos, self.target.pos, self.target.up) / secs) as f32
         } else {
             0.0
         };
@@ -122,6 +129,8 @@ impl RemotePlayer {
             pos: Eye(pos),
             yaw,
             pitch,
+            frame: slerp_frame(self.prev.frame, self.target.frame, alpha),
+            up: self.target.up,
             speed,
             phase: (self.distance * presence::STRIDE_FREQ) as f32,
             stance: self.target.stance,
@@ -129,11 +138,26 @@ impl RemotePlayer {
     }
 }
 
-/// Horizontal (xz-only) distance between two world positions; jumping/falling on
-/// `pos.y` must not drive the gait.
-fn horizontal(a: DVec3, b: DVec3) -> f64 {
-    let (dx, dz) = (b.x - a.x, b.z - a.z);
-    (dx * dx + dz * dz).sqrt()
+/// Distance with the component along `up` removed, so walking on any face
+/// swings the gait and a jump along that axis does not.
+fn across_up(a: DVec3, b: DVec3, up: Face) -> f64 {
+    let mut d = b - a;
+    d[up.axis()] = 0.0;
+    d.length()
+}
+
+/// Frame slerp. Identical frames and the endpoints skip `slerp`, which would
+/// drift a stored identity.
+fn slerp_frame(a: DQuat, b: DQuat, t: f64) -> DQuat {
+    if t <= 0.0 {
+        a
+    } else if t >= 1.0 {
+        b
+    } else if a == b {
+        a
+    } else {
+        a.slerp(b, t)
+    }
 }
 
 /// Shortest-arc angular lerp: wrap `b - a` into `[-π, π]` so a turn across the
@@ -157,7 +181,7 @@ pub enum Incoming {
     /// `restore` is set when no newer authoritative content has landed on the
     /// cell since, so the optimistic apply should roll back.
     EditRejected { req: u32, restore: bool },
-    Position { pos: DVec3 },
+    Position { pos: DVec3, frame: DQuat, up: Face },
     Chat { from_name: Arc<str>, channel: u8, text: Arc<str> },
     Joined { name: Arc<str> },
     Left { name: Arc<str> },
@@ -195,7 +219,7 @@ pub struct Connection {
     alive: bool,
     // Throttling state for outbound moves.
     last_move: Instant,
-    last_sent: Option<(DVec3, f32, f32, Stance)>,
+    last_sent: Option<(DVec3, f32, f32, DQuat, Vec3, Face, Stance)>,
     ping_sent: Option<(u32, Instant)>,
     ping_seq: u32,
     ping_ms: Option<u32>,
@@ -503,10 +527,10 @@ fn apply_server_message(
                     out.push(Incoming::EditRejected { req, restore: confirmed <= expect });
                 }
             }
-            ServerMessage::Position { pos } => {
+            ServerMessage::Position { pos, frame, up } => {
                 *pending_teleport = None;
                 // TODO: echo a teleport request id so a snap-back Position from an earlier poll cannot still snap the player (wire change).
-                out.push(Incoming::Position { pos });
+                out.push(Incoming::Position { pos, frame, up });
             }
             ServerMessage::Chat { from_name, channel, text, .. } => {
                 out.push(Incoming::Chat { from_name, channel, text })
@@ -516,8 +540,14 @@ fn apply_server_message(
                 // prev == target on join: speed 0 and a stationary phase, no
                 // Option<history> and no special-casing downstream. Hidden
                 // until their first PeerMove carries a real pose.
-                let spawn =
-                    Snapshot { pos: spawn, yaw: 0.0, pitch: 0.0, stance: Stance::Standing };
+                let spawn = Snapshot {
+                    pos: spawn,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    frame: DQuat::IDENTITY,
+                    up: Face::PosY,
+                    stance: Stance::Standing,
+                };
                 out.push(Incoming::Joined { name: name.clone() });
                 peers.entry(id).or_insert(RemotePlayer {
                     id,
@@ -538,14 +568,14 @@ fn apply_server_message(
                     out.push(Incoming::Left { name: p.name });
                 }
             }
-            ServerMessage::PeerMove { id, pos, yaw, pitch, stance } => {
+            ServerMessage::PeerMove { id, pos, yaw, pitch, frame, up, stance, velocity: _ } => {
                 if let Some(p) = peers.get_mut(&id) {
-                    let snapshot = Snapshot { pos, yaw, pitch, stance };
+                    let snapshot = Snapshot { pos, yaw, pitch, frame, up, stance };
                     if p.visible {
                         p.interval = p.recv_at.elapsed();
                         p.prev = p.target;
                         p.target = snapshot;
-                        p.distance += horizontal(p.prev.pos, p.target.pos);
+                        p.distance += across_up(p.prev.pos, p.target.pos, snapshot.up);
                     } else {
                         // Re-entering interest range: snap, never lerp the
                         // avatar across the distance covered while hidden.
@@ -607,19 +637,19 @@ fn teleport_hold_active(pending: Option<Instant>, now: Instant) -> bool {
 impl Connection {
     /// Cheap to call every frame; it only actually sends on the movement
     /// cadence or the heartbeat.
-    pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
+    pub fn send_move(&mut self, pos: DVec3, yaw: f32, pitch: f32, frame: DQuat, velocity: Vec3, up: Face, stance: Stance) {
         if !self.alive || teleport_hold_active(self.pending_teleport, Instant::now()) {
             return;
         }
         let elapsed = self.last_move.elapsed();
-        let changed = self.last_sent != Some((pos, yaw, pitch, stance));
+        let changed = self.last_sent != Some((pos, yaw, pitch, frame, velocity, up, stance));
         let due = (changed && elapsed >= MOVE_INTERVAL) || elapsed >= HEARTBEAT;
         if !due {
             return;
         }
         self.last_move = Instant::now();
-        self.last_sent = Some((pos, yaw, pitch, stance));
-        self.dispatch(&ClientMessage::Move { pos, yaw, pitch, stance });
+        self.last_sent = Some((pos, yaw, pitch, frame, velocity, up, stance));
+        self.dispatch(&ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance });
     }
 
     /// Ordinary moves are envelope-checked server-side; this is the sanctioned
@@ -766,7 +796,7 @@ mod tests {
         );
         // Report position so the server's reach check passes, then edit.
         a.last_move = Instant::now() - HEARTBEAT; // force the throttle to send
-        a.send_move(s, 0.0, 0.0, Stance::Standing);
+        a.send_move(s, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
         let _ = a.send_edit(bx, by, bz, "air".into());
 
         thread::sleep(Duration::from_millis(150));
@@ -919,6 +949,9 @@ mod tests {
             pos: DVec3::new(x, 40.0, 0.0),
             yaw: 0.0,
             pitch: 0.0,
+            frame: DQuat::IDENTITY,
+            velocity: Vec3::ZERO,
+            up: Face::PosY,
             stance: Stance::Standing,
         };
         v.apply(pose(7, 3.0));
@@ -941,20 +974,18 @@ mod tests {
         let dest = DVec3::new(100.0, 40.0, 0.0);
         let old = DVec3::new(0.5, 40.0, 0.5);
         v.pending_teleport = Some(Instant::now());
-        let events = v.apply_all([
-            ServerMessage::Position { pos: old },
-            ServerMessage::Position { pos: dest },
-        ]);
+        let at = |pos| ServerMessage::Position { pos, frame: DQuat::IDENTITY, up: Face::PosY };
+        let events = v.apply_all([at(old), at(dest)]);
         match events.as_slice() {
-            [Incoming::Position { pos }] => assert_eq!(*pos, dest),
+            [Incoming::Position { pos, .. }] => assert_eq!(*pos, dest),
             other => panic!("expected one coalesced Position(dest), got {} events", other.len()),
         }
         assert!(v.pending_teleport.is_none());
 
         v.pending_teleport = Some(Instant::now());
-        let events = v.apply(ServerMessage::Position { pos: old });
+        let events = v.apply(at(old));
         match events.as_slice() {
-            [Incoming::Position { pos }] => assert_eq!(*pos, old, "a lone Position is the /tp verdict"),
+            [Incoming::Position { pos, .. }] => assert_eq!(*pos, old, "a lone Position is the /tp verdict"),
             other => panic!("expected refusal snap-back, got {} events", other.len()),
         }
         assert!(v.pending_teleport.is_none());
@@ -983,10 +1014,13 @@ mod tests {
         let pos = a.spawn();
         a.last_move = Instant::now() - HEARTBEAT;
         a.pending_teleport = Some(Instant::now());
-        a.send_move(pos, 0.0, 0.0, Stance::Standing);
+        let still = |a: &mut Connection, pos| {
+            a.send_move(pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
+        };
+        still(&mut a, pos);
         assert!(a.last_sent.is_none(), "a fresh hold must not send Move");
         a.pending_teleport = Some(Instant::now() - HEARTBEAT);
-        a.send_move(pos, 0.0, 0.0, Stance::Standing);
+        still(&mut a, pos);
         assert!(a.last_sent.is_some(), "an expired hold must let Move through");
         handle.stop();
     }

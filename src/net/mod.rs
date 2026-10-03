@@ -139,7 +139,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 11;
+pub(crate) const PROTOCOL_VERSION: u32 = 12;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -168,11 +168,12 @@ pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenK
     content_fingerprint_kind_cfg(kind, crate::world::terrain::TerrainCfg::default())
 }
 
-/// A stable 64-bit digest of everything that determines what a seed GENERATES: the generator
-/// version, the law, every palette configuration, the worldgen kind and its knobs. Seed-only
-/// multiplayer never ships voxels, so two builds whose generation differs in ANY of these would
-/// silently build different worlds from one seed — the handshake compares fingerprints and rejects
-/// the join instead. Protocol changes are versioned separately by [`PROTOCOL_VERSION`].
+/// A stable 64-bit digest of everything that determines what a seed GENERATES and how a body
+/// falls: the generator version, the gravity law, the material law, every palette configuration,
+/// the worldgen kind and its knobs. Seed-only multiplayer never ships voxels, so two builds whose
+/// generation or physics differ in ANY of these would silently diverge — the handshake compares
+/// fingerprints and rejects the join instead. Protocol changes are versioned separately by
+/// [`PROTOCOL_VERSION`].
 pub(crate) fn content_fingerprint_kind_cfg(
     kind: crate::world::generation::WorldgenKind,
     cfg: crate::world::terrain::TerrainCfg,
@@ -180,7 +181,7 @@ pub(crate) fn content_fingerprint_kind_cfg(
     fingerprint_kind_cfg(&crate::block::BlockRegistry::with_builtins(), kind, cfg)
 }
 
-/// The fingerprint of a registry's law and the generator's palette.
+/// The fingerprint of the gravity law, a registry's material law, and the generator's palette.
 pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -192,6 +193,9 @@ pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
         }
     };
     eat(&crate::world::terrain::WORLDGEN_VERSION.to_le_bytes());
+    for word in crate::gravity::law_digest() {
+        eat(&word.to_le_bytes());
+    }
     eat(&registry.law().fingerprint().to_le_bytes());
     for entry in crate::world::terrain::palette::of(registry.law()) {
         eat(entry.config.encode().as_bytes());
@@ -245,6 +249,10 @@ mod fingerprint_tests {
             TerrainCfg { caves: 50, ..Default::default() },
             TerrainCfg { mines: 0, ..Default::default() },
             TerrainCfg { space: 200, ..Default::default() },
+            TerrainCfg { variety: 50, ..Default::default() },
+            TerrainCfg { features: 0, ..Default::default() },
+            TerrainCfg { structures: 175, ..Default::default() },
+            TerrainCfg { deep: 25, ..Default::default() },
         ] {
             assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
         }

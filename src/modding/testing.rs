@@ -64,7 +64,7 @@ impl Mod for Stand {
     }
 }
 
-/// The InfiniteDiffusion stand-in: the worldgen kind and its four knobs, exactly like the package.
+/// The InfiniteDiffusion stand-in: the worldgen kind and its eight knobs, exactly like the package.
 pub(crate) struct Worldgen {
     cfg: TerrainCfg,
 }
@@ -86,22 +86,18 @@ impl Mod for Worldgen {
         Some(self.cfg.to_text())
     }
     fn knobs(&self) -> Vec<Knob> {
-        ["Relief", "Caves", "Mines", "Space"]
+        ["Relief", "Caves", "Mines", "Space", "Variety", "Features", "Structures", "Deep"]
             .into_iter()
-            .zip([self.cfg.relief, self.cfg.caves, self.cfg.mines, self.cfg.space])
+            .zip(self.cfg.to_wire())
             .map(|(label, v)| Knob { label, value: format!("{v}%"), hint: String::new() })
             .collect()
     }
     fn step_knob(&mut self, index: usize, delta: i32) {
-        let step = |v: u16| (v as i32 + delta * TerrainCfg::STEP as i32).max(0) as u16;
-        match index {
-            0 => self.cfg.relief = step(self.cfg.relief),
-            1 => self.cfg.caves = step(self.cfg.caves),
-            2 => self.cfg.mines = step(self.cfg.mines),
-            3 => self.cfg.space = step(self.cfg.space),
-            _ => {}
+        let mut knobs = self.cfg.to_wire();
+        if let Some(slot) = knobs.get_mut(index) {
+            *slot = (*slot as i32 + delta * TerrainCfg::STEP as i32).max(0) as u16;
         }
-        self.cfg = self.cfg.clamp();
+        self.cfg = TerrainCfg::from_wire(knobs);
     }
     fn save_choice_state(&self) -> Option<String> {
         Some(self.cfg.to_text())

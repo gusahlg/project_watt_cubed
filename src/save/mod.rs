@@ -127,7 +127,11 @@ mod tests {
         let mut player = Player::new(DVec3::new(1.0, 2.0, 3.0));
         player.orientation.yaw = 0.5;
         player.orientation.pitch = -0.25;
+        player.orientation.frame = glam::DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0);
+        player.up_axis = crate::coord::Face::PosX;
         player.set_flying(true);
+        let saved_velocity = DVec3::new(1.5, -2.25, 0.5);
+        player.motion = crate::player::Motion::Flying { velocity: saved_velocity, noclip: false };
 
         let rock = world.registry().id_by_label("rock").unwrap();
         let soil = world.registry().id_by_label("soil").unwrap();
@@ -151,6 +155,9 @@ mod tests {
         assert_eq!(loaded_player.position, DVec3::new(1.0, 2.0, 3.0));
         assert_eq!(loaded_player.orientation.yaw, 0.5);
         assert_eq!(loaded_player.orientation.pitch, -0.25);
+        assert_eq!(loaded_player.orientation.frame, glam::DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0));
+        assert_eq!(loaded_player.up_axis, crate::coord::Face::PosX);
+        assert_eq!(loaded_player.velocity(), saved_velocity);
         assert!(loaded_player.flying());
         assert_eq!(loaded_player.stash.total(), 3);
         assert_eq!(loaded_player.stash.count(rock), 2);
@@ -188,6 +195,9 @@ mod tests {
                 pos: [0.0, 40.0, 0.0],
                 yaw: 0.0,
                 pitch: 0.0,
+                frame: glam::DQuat::IDENTITY,
+                velocity: [0.0; 3],
+                up: 5,
                 flying: false,
                 noclip: false,
                 stash: None,
@@ -386,6 +396,9 @@ mod tests {
             pos: [0.0, 40.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            frame: glam::DQuat::IDENTITY,
+            velocity: [0.0; 3],
+            up: 5,
             flying: false,
             noclip: false,
             stash: Some(vec![]),
@@ -448,6 +461,9 @@ mod tests {
                 pos: [player.position.x, player.position.y, player.position.z],
                 yaw: player.orientation.yaw,
                 pitch: player.orientation.pitch,
+                frame: player.orientation.frame,
+                velocity: player.velocity().to_array(),
+                up: player.up_axis as u8,
                 flying: player.flying(),
                 noclip: player.noclip(),
                 stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
@@ -506,7 +522,7 @@ mod tests {
     #[test]
     fn diffusion_world_round_trips_kind_cfg_and_generated_chunks() {
         let id = slot("__unit_test_diffusion_round_trip__");
-        let cfg = TerrainCfg { relief: 150, caves: 50, mines: 200, space: 0 };
+        let cfg = TerrainCfg { relief: 150, caves: 50, mines: 200, space: 0, ..Default::default() };
         let world = make_world(99, WorldgenKind::Diffusion, cfg);
         assert_eq!(world.worldgen(), WorldgenKind::Diffusion);
         let cy = world.surface_y(0, 0).div_euclid(CHUNK_SIZE as i32);

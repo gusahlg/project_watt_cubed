@@ -773,6 +773,9 @@ impl Game {
                 self.player.position,
                 self.player.orientation.yaw,
                 self.player.orientation.pitch,
+                self.player.orientation.frame,
+                self.player.velocity().as_vec3(),
+                self.player.up_axis,
                 Stance::of_player(&self.player),
             );
         }
@@ -1298,7 +1301,7 @@ impl Game {
                 PeerPose {
                     id: p.id(),
                     at: r.pos.0,
-                    feet: r.pos.feet(r.stance).0,
+                    feet: r.pos.feet(r.stance, r.up).0,
                     visible: p.visible(),
                     phase: r.phase,
                     speed: r.speed,
@@ -1395,13 +1398,15 @@ impl Game {
                         }
                     }
                 }
-                Incoming::Position { pos } => {
+                Incoming::Position { pos, frame, up } => {
                     // Authoritative snap-back (refused teleport or implausible
                     // move): request the collision slab and freeze until it
                     // lands, exactly like a local teleport. The server's
                     // MOVE_WINDOW_CAP_SECS envelope tolerates a brief pause.
                     self.world.prepare_around(pos);
                     self.player.position = pos;
+                    self.player.orientation.frame = frame;
+                    self.player.up_axis = up;
                     self.player.cancel_fall();
                     self.force_stream = true;
                 }

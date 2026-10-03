@@ -94,6 +94,8 @@ pub enum SaveError {
     /// Written before the selective-transfer law (save versions 4-8): its materials have no
     /// meaning under the current law.
     Outdated(u16),
+    /// A v9 Diffusion world from before the cube-planet universe.
+    BeforeCubePlanet,
 }
 
 impl fmt::Display for SaveError {
@@ -111,6 +113,9 @@ impl fmt::Display for SaveError {
                 f,
                 "save v{v} was made under the old material law; worlds from before selective transfer cannot be loaded"
             ),
+            SaveError::BeforeCubePlanet => {
+                write!(f, "this world was made before the cube-planet universe")
+            }
         }
     }
 }

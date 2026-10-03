@@ -10,6 +10,7 @@
 //! panics and never yields a partial value: every getter returns a typed
 //! [`CodecError`] on truncated or malformed input (parse-don't-validate).
 
+use glam::DQuat;
 use voxel_engine::DVec3;
 
 /// A decode failure. Never a panic: every path through [`Reader`] returns this
@@ -19,14 +20,38 @@ pub enum CodecError {
     Truncated,
 }
 
-/// The wire-shared subset of player state: position + orientation. Save's
-/// `flying`/`noclip` and net's `Stance` are framing-specific (persistence mode
-/// flags vs. a transient presence signal) and stay with their own callers.
+/// The wire-shared subset of player state: position, view angles, and the body
+/// frame. Save's `flying`/`noclip` and net's `Stance` are framing-specific
+/// (persistence mode flags vs. a transient presence signal) and stay with their
+/// own callers. Velocity travels beside the pose, not inside it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pose {
     pub pos: DVec3,
     pub yaw: f32,
     pub pitch: f32,
+    /// Body frame (local +Y = up). On the wire as 4 × f32, xyzw.
+    pub frame: DQuat,
+}
+
+/// Read a body frame stored as 4 × f32 (xyzw). A non-finite component, a
+/// non-positive length, or a non-finite normalised result is identity;
+/// otherwise the quaternion is normalised.
+pub fn quat_from_f32(x: f32, y: f32, z: f32, w: f32) -> DQuat {
+    if !(x.is_finite() && y.is_finite() && z.is_finite() && w.is_finite()) {
+        return DQuat::IDENTITY;
+    }
+    let (x, y, z, w) = (x as f64, y as f64, z as f64, w as f64);
+    let len2 = x * x + y * y + z * z + w * w;
+    if !len2.is_finite() || len2 <= 0.0 {
+        return DQuat::IDENTITY;
+    }
+    let inv = 1.0 / len2.sqrt();
+    let q = DQuat::from_xyzw(x * inv, y * inv, z * inv, w * inv);
+    if q.x.is_finite() && q.y.is_finite() && q.z.is_finite() && q.w.is_finite() {
+        q
+    } else {
+        DQuat::IDENTITY
+    }
 }
 
 pub struct Writer(Vec<u8>);
@@ -64,10 +89,19 @@ impl Writer {
         self.f64(v.z);
     }
 
+    /// Body frame, xyzw, each component narrowed to f32.
+    pub fn quat(&mut self, q: DQuat) {
+        self.f32(q.x as f32);
+        self.f32(q.y as f32);
+        self.f32(q.z as f32);
+        self.f32(q.w as f32);
+    }
+
     pub fn pose(&mut self, p: Pose) {
         self.vec3(p.pos);
         self.f32(p.yaw);
         self.f32(p.pitch);
+        self.quat(p.frame);
     }
 }
 
@@ -149,11 +183,16 @@ impl<'a> Reader<'a> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
     }
 
+    pub fn quat(&mut self) -> Result<DQuat, CodecError> {
+        Ok(quat_from_f32(self.f32()?, self.f32()?, self.f32()?, self.f32()?))
+    }
+
     pub fn pose(&mut self) -> Result<Pose, CodecError> {
         Ok(Pose {
             pos: self.vec3()?,
             yaw: self.f32()?,
             pitch: self.f32()?,
+            frame: self.quat()?,
         })
     }
 }
@@ -171,11 +210,13 @@ mod tests {
                 pos: DVec3::new(0.0, 0.0, 0.0),
                 yaw: 0.0,
                 pitch: 0.0,
+                frame: DQuat::IDENTITY,
             },
             Pose {
                 pos: DVec3::new(1.0e9 + 0.123456789, -3_000.25, -(1.0e9 - 0.75)),
                 yaw: 1.25,
                 pitch: -0.5,
+                frame: DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0),
             },
         ];
         for p in poses {
@@ -184,12 +225,39 @@ mod tests {
             let bytes = w.into_inner();
             let mut r = Reader::new(&bytes);
             let got = r.pose().unwrap();
+            assert!(r.finished());
             assert_eq!(got.pos.x.to_bits(), p.pos.x.to_bits());
             assert_eq!(got.pos.y.to_bits(), p.pos.y.to_bits());
             assert_eq!(got.pos.z.to_bits(), p.pos.z.to_bits());
             assert_eq!(got.yaw, p.yaw);
             assert_eq!(got.pitch, p.pitch);
+            assert_eq!(got.frame, p.frame);
         }
+    }
+
+    #[test]
+    fn non_finite_or_zero_frame_decodes_as_identity() {
+        let write = |comps: [f32; 4]| {
+            let mut w = Writer::new();
+            w.pose(Pose {
+                pos: DVec3::ZERO,
+                yaw: 0.25,
+                pitch: -0.5,
+                frame: DQuat::IDENTITY,
+            });
+            let mut bytes = w.into_inner();
+            let at = bytes.len() - 16;
+            for (i, c) in comps.iter().enumerate() {
+                bytes[at + i * 4..at + (i + 1) * 4].copy_from_slice(&c.to_le_bytes());
+            }
+            Reader::new(&bytes).pose().unwrap().frame
+        };
+        assert_eq!(write([0.0, 0.0, 0.0, 0.0]), DQuat::IDENTITY);
+        assert_eq!(write([f32::NAN, 0.0, 0.0, 1.0]), DQuat::IDENTITY);
+        assert_eq!(write([f32::INFINITY, 0.0, 0.0, 0.0]), DQuat::IDENTITY);
+        // A non-unit but finite quaternion is normalised, not replaced.
+        let got = write([0.0, 2.0, 0.0, 0.0]);
+        assert_eq!(got, DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0));
     }
 
     #[test]

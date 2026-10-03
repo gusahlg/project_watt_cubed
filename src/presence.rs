@@ -8,8 +8,10 @@
 //! each frame from state; no mutated flags. Anything derivable from pose
 //! trajectory (speed, gait, body yaw) is derived client-side, never networked.
 //! Only non-derivable signal is a discrete action sent as a WireAction.
+use glam::DQuat;
 use voxel_engine::{DVec3, Vec3};
 
+use crate::coord::Face;
 use crate::player::{self, Player};
 
 /// A gait cycle advances this many radians per world unit of horizontal
@@ -99,15 +101,17 @@ impl Gait {
 pub struct Eye(pub DVec3);
 
 /// A world-space position anchored at the feet — the avatar rig's origin. The only
-/// way to reach it from an [`Eye`] is [`Eye::feet`], which *requires* a stance, so
-/// the eye-height drop can never be silently skipped.
+/// way to reach it from an [`Eye`] is [`Eye::feet`], which *requires* a stance and
+/// the up axis, so the eye-height drop can never be silently skipped or assumed −Y.
 #[derive(Clone, Copy)]
 pub struct Feet(pub DVec3);
 
 impl Eye {
-    /// Drop to the feet for the given stance.
-    pub fn feet(self, stance: Stance) -> Feet {
-        Feet(self.0 - DVec3::new(0.0, stance.eye_offset(), 0.0))
+    /// Drop to the feet for the given stance, along `up` (not world −Y).
+    pub fn feet(self, stance: Stance, up: Face) -> Feet {
+        let mut feet = self.0;
+        feet[up.axis()] -= up.sign() as f64 * stance.eye_offset();
+        Feet(feet)
     }
 }
 
@@ -121,6 +125,8 @@ pub struct RenderPose {
     /// Head yaw; body yaw tracked separately in [`RigParams`].
     pub yaw: f32,
     pub pitch: f32,
+    /// Body frame the yaw is applied inside (local +Y = up).
+    pub frame: DQuat,
     pub stance: Stance,
     pub gait: Gait,
 }
@@ -130,8 +136,8 @@ impl RenderPose {
     /// camera. Taking a typed `Feet` (never a bare vector) is the guard: callers
     /// must convert an eye position through [`Eye::feet`] first, so an eye can't be
     /// mistaken for feet.
-    pub fn new(feet: Feet, camera: Eye, yaw: f32, pitch: f32, stance: Stance, gait: Gait) -> Self {
-        Self { feet: (feet.0 - camera.0).as_vec3(), yaw, pitch, stance, gait }
+    pub fn new(feet: Feet, camera: Eye, yaw: f32, pitch: f32, frame: DQuat, stance: Stance, gait: Gait) -> Self {
+        Self { feet: (feet.0 - camera.0).as_vec3(), yaw, pitch, frame, stance, gait }
     }
 }
 
@@ -264,7 +270,7 @@ mod tests {
     fn eye_to_feet_uses_the_broadcast_stance_height() {
         let eye = Eye(DVec3::new(17.25, 93.0, -8.5));
         for stance in [Stance::Standing, Stance::Sneaking] {
-            let feet = eye.feet(stance);
+            let feet = eye.feet(stance, Face::PosY);
             assert_eq!(feet.0.x.to_bits(), eye.0.x.to_bits());
             assert_eq!(feet.0.z.to_bits(), eye.0.z.to_bits());
             assert_eq!(feet.0.y, eye.0.y - stance.eye_offset());
@@ -279,10 +285,11 @@ mod tests {
         let remote_eye = Eye(camera.0 + DVec3::new(3.125, 2.0, -4.375));
         let stance = Stance::Sneaking;
         let pose = RenderPose::new(
-            remote_eye.feet(stance),
+            remote_eye.feet(stance, Face::PosY),
             camera,
             0.0,
             0.0,
+            DQuat::IDENTITY,
             stance,
             Gait::new(0.0, 0.0),
         );
@@ -291,6 +298,17 @@ mod tests {
             pose.feet,
             Vec3::new(3.125, (2.0 - stance.eye_offset()) as f32, -4.375)
         );
+    }
+
+    #[test]
+    fn feet_on_the_positive_x_face_drop_along_x() {
+        let eye = Eye(DVec3::new(10.0, 20.0, 30.0));
+        let stance = Stance::Standing;
+        let feet = eye.feet(stance, Face::PosX);
+        let drop = stance.eye_offset();
+        assert_eq!(feet.0, eye.0 - DVec3::new(drop, 0.0, 0.0));
+        assert_eq!(feet.0.y.to_bits(), eye.0.y.to_bits());
+        assert_eq!(feet.0.z.to_bits(), eye.0.z.to_bits());
     }
 
     #[test]
