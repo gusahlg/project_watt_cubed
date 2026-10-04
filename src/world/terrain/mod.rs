@@ -353,72 +353,37 @@ impl Materials {
     }
 }
 
-/// Integer datum offset at a chart column. Half away from zero, matching `f64::round`.
-fn datum_blocks(atlas: &crate::space::atlas::Atlas, patch: crate::space::atlas::Patch, i: i64, j: i64) -> i32 {
-    atlas.datum_offset(patch, i as f64, j as f64).round() as i32
+
+/// The start world's relaxed datum about [`cosmos::HOME_RADIUS`]: its cube of bulk matter (the
+/// two-material mix, strength from the prototype mechanical response) relaxed under its own
+/// gravity, read from the genesis table by `Π_g`. `None` without a table, or if the matter were
+/// strong enough to keep its cube grid (the start world is charted either way).
+fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::space::datum::DatumField> {
+    use crate::mechanics::{genesis, material};
+    let parts: Vec<(f64, material::Params)> = bulk
+        .fractions()
+        .iter()
+        .filter(|(_, f)| *f > 0.0)
+        .map(|&(id, f)| {
+            let cohesion = registry.observation(id).cohesion as i32;
+            (f, material::mechanical_response(registry.amount(id) as u32, material::cohesion01(cohesion)))
+        })
+        .collect();
+    let mut matter = material::Params::mix(&parts);
+    matter.density = cosmos::BULK_DENSITY;
+    let half = cosmos::HOME_CUBE_HALF as f64;
+    let (layout, _) = genesis::tabulated_layout(genesis::pi_g(&matter, half), half)?;
+    let genesis::Layout::Round { radius, datum, .. } = layout else { return None };
+    let shift = (radius - cosmos::HOME_RADIUS as f64) as f32;
+    Some(crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() })
 }
 
-/// Min and max integer datum offset over the square of columns `[i0, i0+span) × [j0, j0+span)`.
-/// A bilinear patch is extreme at the corners of each grid cell it covers.
-fn offset_bounds(
-    atlas: &crate::space::atlas::Atlas,
-    patch: crate::space::atlas::Patch,
-    i0: i64,
-    j0: i64,
-    span: i64,
-) -> (i32, i32) {
-    let Some(field) = atlas.datum.as_ref() else { return (0, 0) };
-    let crate::space::atlas::Patch::Shell { band, .. } = patch else { return (0, 0) };
-    let n = atlas.bands[band as usize].n as f64;
-    let g = field.g;
-    if g < 2 || span <= 0 {
-        return (0, 0);
-    }
-    let s = (g - 1) as f64;
-    let t_of = |cell: f64| (cell / n * s).clamp(0.0, s);
-    let (u0, u1) = {
-        let (a, b) = (t_of(i0 as f64), t_of((i0 + span - 1) as f64));
-        (a.min(b), a.max(b))
-    };
-    let (v0, v1) = {
-        let (a, b) = (t_of(j0 as f64), t_of((j0 + span - 1) as f64));
-        (a.min(b), a.max(b))
-    };
-    let cell_of = |t: f64| t / s * n;
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    let mut take = |u: f64, v: f64| {
-        let o = atlas.datum_offset(patch, cell_of(u), cell_of(v));
-        lo = lo.min(o);
-        hi = hi.max(o);
-    };
-    let i_lo = (u0.floor() as usize).min(g - 2);
-    let i_hi = (u1.ceil() as usize).min(g - 1);
-    let j_lo = (v0.floor() as usize).min(g - 2);
-    let j_hi = (v1.ceil() as usize).min(g - 1);
-    for i in i_lo..i_hi {
-        for j in j_lo..j_hi {
-            let ua = (i as f64).max(u0);
-            let ub = ((i + 1) as f64).min(u1);
-            let va = (j as f64).max(v0);
-            let vb = ((j + 1) as f64).min(v1);
-            if ua > ub || va > vb {
-                continue;
-            }
-            take(ua, va);
-            take(ub, va);
-            take(ua, vb);
-            take(ub, vb);
-        }
-    }
-    if !lo.is_finite() { (0, 0) } else { (lo.round() as i32, hi.round() as i32) }
-}
-
-/// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` on column `k`
-/// is `h_base + la - bias[k]`.
+/// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` is
+/// `h_base + la` (the atlas embedding lifts band 0 onto the fitted datum, so storage altitude is
+/// altitude above the datum).
+#[derive(Clone)]
 struct ChartCols {
     cols: Vec<Column>,
-    bias: [i32; CHUNK_SIZE * CHUNK_SIZE],
     u0: i32,
     v0: i32,
     h_base: i32,
@@ -426,9 +391,7 @@ struct ChartCols {
     min_h: i32,
     max_terrain: i32,
     face: Face,
-    i0: i64,
     y0: i64,
-    j0: i64,
 }
 
 /// One cube face's copy of today's terrain, with its own salt.
@@ -503,7 +466,18 @@ impl Terrain {
         let s = (seed as u64 ^ (seed as u64 >> 32)) as u32 ^ 0x1D1F_F051;
         let m = Arc::new(Materials::intern(registry));
         let scale = cfg.deep as f32 / 100.0;
-        let cosmos = Arc::new(cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale));
+        let mut cosmos = cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale);
+        let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
+        // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
+        // chart grid to the shape, and its relief joins gravity.
+        let home_datum = home_shape(registry, &bulk);
+        if let Some(datum) = &home_datum {
+            let home = cosmos.home();
+            let layer = crate::gravity::relief::Relief::new(home.centre_f(), cosmos::HOME_RADIUS as f64, home.density, datum);
+            let id = home.id;
+            cosmos.set_relief(id, Arc::new(layer));
+        }
+        let cosmos = Arc::new(cosmos);
         let relief = cfg.relief as f32 / 100.0;
         let variety = cfg.variety as f32 / 100.0;
         // The twin with the smaller seed is lush; the other is crystalline. One twin keeps lush.
@@ -564,10 +538,12 @@ impl Terrain {
                 });
             }
         }
-        let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
         // Majority of the 24-bit mix: the uniform block under the start world's band 0.
         let home_fill = bulk.majority();
-        let storage = storage::StorageWorlds::new(&cosmos, &m, home_fill);
+        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill);
+        if let Some(datum) = home_datum {
+            storage.set_home_datum(Arc::new(datum));
+        }
         Self {
             seed,
             storage,
@@ -1255,9 +1231,7 @@ impl Terrain {
         let atlas = self.storage.home_atlas()?;
         let b = atlas.bands[0];
         let half = b.n / 2;
-        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
-        let off = datum_blocks(atlas, patch, i, j);
-        let h64 = b.r_lo + y - atlas.radius - i64::from(off);
+        let h64 = b.r_lo + y - atlas.radius;
         let h = i32::try_from(h64).ok()?;
         let a = i32::try_from(half + h64).ok()?;
         let u = i32::try_from(i - half).ok()?;
@@ -1290,8 +1264,6 @@ impl Terrain {
         let paint = self.paint(body, face);
         let seed = cube::rim_seed(body);
         let raw = paint.shape.columns_16(u0, v0);
-        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
-        let mut bias = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         let mut cols = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
         let mut max_h = i32::MIN;
         let mut min_h = i32::MAX;
@@ -1304,10 +1276,9 @@ impl Terrain {
             col.height = cube::blend_height(col.height, seed, face, half, ub, vb);
             max_h = max_h.max(col.height);
             min_h = min_h.min(col.height);
-            bias[k] = datum_blocks(atlas, patch, i0 + i64::from(lu), j0 + i64::from(lv));
             cols.push(col);
         }
-        ChartCols { cols, bias, u0, v0, h_base, max_h, min_h, max_terrain, face, i0, y0, j0 }
+        ChartCols { cols, u0, v0, h_base, max_h, min_h, max_terrain, face, y0 }
     }
 
     /// Air, or one deep material, when the chunk cannot meet the crust. `None` when it might.
@@ -1316,16 +1287,10 @@ impl Terrain {
         let b = atlas.bands[0];
         let (i0, y0, j0) = (local[0], local[1], local[2]);
         let h_base = b.r_lo + y0 - atlas.radius;
-        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
-        let (off_lo, off_hi) = offset_bounds(atlas, patch, i0, j0, CHUNK_SIZE as i64);
-        let h_bot = h_base - i64::from(off_hi);
-        if h_bot >= i64::from(MAX_GROUND) + i64::from(features::MAX_ABOVE) {
+        if h_base >= i64::from(MAX_GROUND) + i64::from(features::MAX_ABOVE) {
             return Some(AIR);
         }
-        if off_lo != off_hi {
-            return None;
-        }
-        let h_top = h_base + i64::from(CHUNK_SIZE as i32 - 1) - i64::from(off_lo);
+        let h_top = h_base + i64::from(CHUNK_SIZE as i32 - 1);
         if h_top >= i64::from(MIN_GROUND) - i64::from(cube::CRUST) {
             return None;
         }
@@ -1362,16 +1327,8 @@ impl Terrain {
 
     /// What [`fill_face`](Self::fill_face) would collapse to, so classify and generate agree.
     fn columns_uniform(&self, c: &ChartCols) -> Option<BlockId> {
-        let b0 = c.bias[0];
-        let constant = c.bias.iter().all(|&b| b == b0);
         let landmarks = c.max_terrain.max(c.max_h) + features::MAX_ABOVE;
-        if !constant {
-            if (0..CHUNK_SIZE * CHUNK_SIZE).all(|k| c.h_base - c.bias[k] >= landmarks) {
-                return Some(AIR);
-            }
-            return None;
-        }
-        let h0 = c.h_base - b0;
+        let h0 = c.h_base;
         if h0 >= landmarks {
             return Some(AIR);
         }
@@ -1407,33 +1364,10 @@ impl Terrain {
     }
 
     fn fill_chart(&self, c: &ChartCols) -> ChunkData {
-        let b0 = c.bias[0];
-        if c.bias.iter().all(|&b| b == b0) {
-            let body = self.cosmos.home();
-            let paint = self.paint(body, c.face);
-            let trees = paint.trees.blocks_in(&paint.shape, c.u0, c.v0, CHUNK_SIZE as i32);
-            return self.fill_face::<true>(
-                body,
-                c.face,
-                &c.cols,
-                c.u0,
-                c.v0,
-                c.h_base - b0,
-                c.max_terrain,
-                c.min_h,
-                &trees,
-            );
-        }
-        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
-        for la in 0..CHUNK_SIZE {
-            for lv in 0..CHUNK_SIZE {
-                for lu in 0..CHUNK_SIZE {
-                    let local = [c.i0 + lu as i64, c.y0 + la as i64, c.j0 + lv as i64];
-                    cells[Chunk::index(lu, la, lv)] = self.chart_voxel(c.face, local);
-                }
-            }
-        }
-        ChunkData::from_cells(cells)
+        let body = self.cosmos.home();
+        let paint = self.paint(body, c.face);
+        let trees = paint.trees.blocks_in(&paint.shape, c.u0, c.v0, CHUNK_SIZE as i32);
+        self.fill_face::<true>(body, c.face, &c.cols, c.u0, c.v0, c.h_base, c.max_terrain, c.min_h, &trees)
     }
 
     fn home_chunk_data(&self, coord: ChunkCoord) -> Option<ChunkData> {
@@ -1451,19 +1385,58 @@ impl Terrain {
         Some(self.fill_chart(&cols))
     }
 
+    /// A storage column of the start world's band 0, painted from one set of column samples (the
+    /// columns depend on the chart column only, not on the chunk's altitude).
+    fn home_column(&self, key: ColumnKey, range: std::ops::RangeInclusive<i32>) -> Option<(Vec<(i32, ChunkData)>, ColumnHeights)> {
+        let first = key.chunk(*range.start());
+        let (patch, local) = self.storage.home_chunk(first)?;
+        let crate::space::atlas::Patch::Shell { band: 0, face } = patch else { return None };
+        let atlas = self.storage.home_atlas()?;
+        let b = atlas.bands[0];
+        let mut cols: Option<ChartCols> = None;
+        let mut chunks = Vec::with_capacity(range.clone().count());
+        for alt in range {
+            let coord = key.chunk(alt);
+            let Some((p, l)) = self.storage.home_chunk(coord) else {
+                chunks.push((alt, self.storage.generate(coord)));
+                continue;
+            };
+            debug_assert_eq!(p, patch, "boxes are never stacked: one patch per storage column");
+            if let Some(id) = self.home_fast_uniform(face, l) {
+                chunks.push((alt, ChunkData::Uniform(id)));
+                continue;
+            }
+            let base = cols.get_or_insert_with(|| self.chart_columns(face, [local[0], 0, local[2]]));
+            let mut c = base.clone();
+            c.y0 = l[1];
+            c.h_base = (b.r_lo + l[1] - atlas.radius) as i32;
+            let data = match self.columns_uniform(&c) {
+                Some(id) => ChunkData::Uniform(id),
+                None => self.fill_chart(&c),
+            };
+            chunks.push((alt, data));
+        }
+        let base = match cols {
+            Some(c) => c,
+            None => self.chart_columns(face, [local[0], 0, local[2]]),
+        };
+        let rise = atlas.radius - b.r_lo;
+        let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for k in 0..CHUNK_SIZE * CHUNK_SIZE {
+            let y = i64::from(base.cols[k].height) + rise;
+            heights[k] = y.clamp(i32::MIN as i64 + 1, storage::BURIED as i64 - 1) as i32;
+        }
+        Some((chunks, heights))
+    }
+
     fn home_class(&self, coord: ChunkCoord) -> Option<Classify> {
         let (patch, local) = self.storage.home_chunk(coord)?;
         let crate::space::atlas::Patch::Shell { band: 0, face } = patch else {
             return Some(Classify::Uniform(self.storage.home_fill()));
         };
-        if let Some(id) = self.home_fast_uniform(face, local) {
-            return Some(Classify::Uniform(id));
-        }
-        let cols = self.chart_columns(face, local);
-        if let Some(id) = self.columns_uniform(&cols) {
-            return Some(Classify::Uniform(id));
-        }
-        Some(Classify::Mixed)
+        // Bounds only: classification runs on the streaming thread for every candidate chunk, and
+        // a near-surface chunk the bounds cannot settle is generated (and collapsed) on a worker.
+        Some(self.home_fast_uniform(face, local).map_or(Classify::Mixed, Classify::Uniform))
     }
 
     /// The start-world patch covering storage column `(x, z)`, with its local column.
@@ -1509,8 +1482,7 @@ impl Terrain {
             i64::from(u),
             i64::from(v),
         );
-        let off = datum_blocks(atlas, patch, i, j);
-        let y = i64::from(h) + atlas.radius - b.r_lo + i64::from(off);
+        let y = i64::from(h) + atlas.radius - b.r_lo;
         Some(y.clamp(i32::MIN as i64 + 1, storage::BURIED as i64 - 1) as i32)
     }
 
@@ -1524,7 +1496,7 @@ impl Terrain {
         let rise = atlas.radius - atlas.bands[0].r_lo;
         let mut out = [0i32; CHUNK_SIZE * CHUNK_SIZE];
         for k in 0..CHUNK_SIZE * CHUNK_SIZE {
-            let y = i64::from(cols.cols[k].height) + rise + i64::from(cols.bias[k]);
+            let y = i64::from(cols.cols[k].height) + rise;
             out[k] = y.clamp(i32::MIN as i64 + 1, storage::BURIED as i64 - 1) as i32;
         }
         Some(out)
@@ -1542,10 +1514,9 @@ impl Terrain {
             if i64::from(x0) < o[0] || x1 >= o[0] + size[0] || i64::from(z0) < o[2] || z1 >= o[2] + size[2] {
                 continue;
             }
-            let (off_lo, off_hi) = offset_bounds(atlas, patch, i64::from(x0) - o[0], i64::from(z0) - o[2], i64::from(span));
             let rise = atlas.radius - atlas.bands[0].r_lo;
-            let lo = i32::try_from(i64::from(MIN_GROUND) + rise + i64::from(off_lo)).ok()?;
-            let hi = i32::try_from(i64::from(MAX_GROUND) + rise + i64::from(off_hi)).unwrap_or(i32::MAX);
+            let lo = i32::try_from(i64::from(MIN_GROUND) + rise).ok()?;
+            let hi = i32::try_from(i64::from(MAX_GROUND) + rise).unwrap_or(i32::MAX);
             return Some((lo, hi.max(lo.saturating_add(1))));
         }
         None
@@ -1567,13 +1538,12 @@ impl Terrain {
         let paint = self.paint(body, face);
         let mut col = paint.shape.column(u, v);
         col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
-        let off = datum_blocks(atlas, patch, i, j);
-        let surf = i64::from(col.height) + atlas.radius - b.r_lo + i64::from(off);
+        let surf = i64::from(col.height) + atlas.radius - b.r_lo;
         for (o, &y) in out.iter_mut().zip(ys).take(n) {
             if i64::from(y) >= surf {
                 *o = AIR;
             } else {
-                let h = (b.r_lo + i64::from(y) - atlas.radius - i64::from(off)) as i32;
+                let h = (b.r_lo + i64::from(y) - atlas.radius) as i32;
                 *o = paint.shape.ground(&col, u, h, v);
             }
         }
@@ -1602,8 +1572,7 @@ impl Terrain {
         let body = self.cosmos.home();
         let paint = self.paint(body, face);
         let h = cube::blend_height(paint.shape.height(0, 0), cube::rim_seed(body), face, half, 0, 0);
-        let off = datum_blocks(atlas, patch, i, j);
-        let y = i64::from(h) + atlas.radius - b.r_lo + i64::from(off);
+        let y = i64::from(h) + atlas.radius - b.r_lo;
         Some(atlas.embed(patch, glam::DVec3::new(i as f64 + 0.5, y as f64 + 2.0, j as f64 + 0.5)))
     }
 
@@ -2098,6 +2067,9 @@ impl TerrainGenerator for Terrain {
         // Storage columns: the chart painters, chunk by chunk; heights are the charts' surfaces.
         if key.face == Face::PosY && storage::StorageWorlds::owns(key.chunk(*range.start())) {
             let c = key.chunk(*range.start());
+            if let Some(column) = self.home_column(key, range.clone()) {
+                return column;
+            }
             if let Some(heights) = self.home_heights_16(c.x, c.z) {
                 let chunks = range
                     .map(|alt| {

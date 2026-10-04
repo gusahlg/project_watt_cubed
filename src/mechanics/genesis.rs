@@ -517,14 +517,21 @@ fn centroid(l: &Lattice, lo: usize, hi: usize) -> DVec3 {
     sum / count
 }
 
-/// Distance from `origin` along unit `d` to the outermost crossing of the quad surface.
+/// Distance from `origin` along unit `d` to the outermost crossing of the quad surface. A curved
+/// quad is crossed as the mean of its two triangulations, so the answer does not depend on which
+/// diagonal a quad was split along (a mirror-symmetric surface casts mirror-symmetric radii).
 fn cast(quads: &[[DVec3; 4]], origin: DVec3, d: DVec3) -> Option<f64> {
     let mut best: Option<f64> = None;
+    let hit = |a: [DVec3; 3], b: [DVec3; 3]| ray_triangle(origin, d, a).or_else(|| ray_triangle(origin, d, b));
     for q in quads {
-        for tri in [[q[0], q[1], q[3]], [q[0], q[3], q[2]]] {
-            if let Some(t) = ray_triangle(origin, d, tri) {
-                best = Some(best.map_or(t, |b: f64| b.max(t)));
-            }
+        let one = hit([q[0], q[1], q[3]], [q[0], q[3], q[2]]);
+        let other = hit([q[0], q[1], q[2]], [q[1], q[3], q[2]]);
+        let t = match (one, other) {
+            (Some(a), Some(b)) => Some(0.5 * (a + b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(t) = t {
+            best = Some(best.map_or(t, |b: f64| b.max(t)));
         }
     }
     best
@@ -555,14 +562,96 @@ fn ray_triangle(origin: DVec3, d: DVec3, tri: [DVec3; 3]) -> Option<f64> {
 }
 
 /// Relaxed solid cubes by `Π_g`, computed offline by `genesis_table` (see that binary): one entry
-/// per half octave of `Π_g`, the lattice's nodes in the fundamental domain of the cube's symmetry.
+/// per half octave of `Π_g`, each with its layout figures and datum (one face; a cube-symmetric
+/// shape has the same field on every face) and the lattice's nodes in the fundamental domain of
+/// the cube's symmetry. All lengths in units of the cube's half-size.
 static TABLE: &[u8] = include_bytes!("genesis_table.bin");
-/// Format version of [`TABLE`].
-pub const TABLE_VERSION: u32 = 1;
+/// Format version of [`TABLE`] ([`read_table`] also reads version 1, nodes only).
+pub const TABLE_VERSION: u32 = 2;
 /// Half-size of the table's computational cube: 8 matter elements of 2^20 blocks each side.
 pub const TABLE_HALF: f64 = 8.0 * (1u64 << 20) as f64;
 /// Matter elements per axis of the table's lattices.
 pub const TABLE_ELEMENTS: usize = 16;
+
+/// One tabulated relaxed cube.
+#[derive(Clone, Debug, Default)]
+pub struct TableEntry {
+    pub log2_pi: f64,
+    pub converged: bool,
+    pub max_tilt: f64,
+    pub roundness: f64,
+    /// Datum radius; zero when the shape keeps its cube grid.
+    pub radius: f64,
+    /// Datum offsets of one face (`g × g`, [`DatumField`] order).
+    pub offsets: Vec<f32>,
+    /// Canonical nodes ([`canonical_nodes`] order).
+    pub nodes: Vec<DVec3>,
+}
+
+/// A table of relaxed cubes.
+#[derive(Clone, Debug, Default)]
+pub struct Table {
+    pub elements: usize,
+    pub samples: usize,
+    pub entries: Vec<TableEntry>,
+}
+
+/// Parse a table (version 1: nodes only, no layout figures).
+pub fn read_table(bytes: &[u8]) -> Option<Table> {
+    let mut r = Reader { bytes, at: 0 };
+    if bytes.len() < 16 || r.take(4)? != b"PWCG" {
+        return None;
+    }
+    let version = r.u32()?;
+    if version != 1 && version != 2 {
+        return None;
+    }
+    let elements = r.u32()? as usize;
+    let count = r.u32()? as usize;
+    let samples = if version >= 2 { r.u32()? as usize } else { 0 };
+    let canon = canonical_nodes((elements + 2) / 2).len();
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut e = TableEntry { log2_pi: r.f32()? as f64, converged: r.u32()? != 0, ..TableEntry::default() };
+        if version >= 2 {
+            e.max_tilt = r.f32()? as f64;
+            e.roundness = r.f32()? as f64;
+            e.radius = r.f32()? as f64;
+            e.offsets = (0..samples * samples).map(|_| r.f32()).collect::<Option<_>>()?;
+        }
+        e.nodes = (0..canon).map(|_| Some(DVec3::new(r.f32()? as f64, r.f32()? as f64, r.f32()? as f64))).collect::<Option<_>>()?;
+        entries.push(e);
+    }
+    Some(Table { elements, samples, entries })
+}
+
+/// Serialise a table in the current format.
+pub fn write_table(t: &Table) -> Vec<u8> {
+    let mut out = Vec::new();
+    let u = |v: u32, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    out.extend_from_slice(b"PWCG");
+    u(TABLE_VERSION, &mut out);
+    u(t.elements as u32, &mut out);
+    u(t.entries.len() as u32, &mut out);
+    u(t.samples as u32, &mut out);
+    let f = |v: f64, out: &mut Vec<u8>| out.extend_from_slice(&(v as f32).to_le_bytes());
+    for e in &t.entries {
+        f(e.log2_pi, &mut out);
+        out.extend_from_slice(&u32::from(e.converged).to_le_bytes());
+        f(e.max_tilt, &mut out);
+        f(e.roundness, &mut out);
+        f(e.radius, &mut out);
+        for &o in &e.offsets {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        for p in &e.nodes {
+            for a in 0..3 {
+                f(p[a], &mut out);
+            }
+        }
+    }
+    out
+}
 
 /// Lattice nodes `(p, q, r)` with `0 ≤ p ≤ q ≤ r ≤ m` (offsets from the centre node; `m` is half the
 /// node count per axis): every node is one of these up to the cube's 48 symmetries.
@@ -591,48 +680,72 @@ pub fn canonical_of(o: [i64; 3]) -> ([usize; 3], [usize; 3], [f64; 3]) {
     (canon, slot, sign)
 }
 
-/// The tabulated relaxed cube for `Π_g = pi`, scaled to half-size `half`: interpolated linearly in
-/// `log₂ Π` between the bracketing entries (clamped at the table's ends). `None` without a table.
-pub fn tabulated(pi: f64, half: f64) -> Option<Solved> {
-    let mut r = Reader { bytes: TABLE, at: 0 };
-    if r.bytes.len() < 16 || r.take(4) != b"PWCG" || r.u32() != TABLE_VERSION {
-        return None;
-    }
-    let n = r.u32() as usize;
-    let count = r.u32() as usize;
-    let dims = n + 2;
+/// A relaxed body from canonical node positions (units of the half-size) for half-size `half`.
+pub fn entry_solved(elements: usize, nodes: &[DVec3], converged: bool, pi: f64, half: f64) -> Solved {
+    let dims = elements + 2;
     let m = dims / 2;
-    let canon = canonical_nodes(m);
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let log2_pi = r.f32() as f64;
-        let converged = r.u32() != 0;
-        let nodes: Vec<DVec3> = (0..canon.len()).map(|_| DVec3::new(r.f32() as f64, r.f32() as f64, r.f32() as f64)).collect();
-        entries.push((log2_pi, converged, nodes));
-    }
-    let x = pi.max(1e-300).log2().clamp(entries.first()?.0, entries.last()?.0);
-    let hi = entries.iter().position(|e| e.0 >= x).unwrap_or(count - 1).max(1).min(count - 1);
-    let (a, b) = (&entries[hi - 1], &entries[hi]);
-    let t = ((x - a.0) / (b.0 - a.0)).clamp(0.0, 1.0);
-    let index: std::collections::HashMap<[usize; 3], usize> = canon.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+    let index: std::collections::HashMap<[usize; 3], usize> = canonical_nodes(m).into_iter().enumerate().map(|(i, c)| (c, i)).collect();
     let cell = 1i64 << 20;
-    let half_c = n as f64 * cell as f64 / 2.0;
+    let half_c = elements as f64 * cell as f64 / 2.0;
     let mut lattice = Lattice::undeformed([0, 0, 0], cell, [dims; 3], DVec3::splat(-(m as f64) * cell as f64));
     for k in 0..=dims {
         for j in 0..=dims {
             for i in 0..=dims {
                 let o = [i as i64 - m as i64, j as i64 - m as i64, k as i64 - m as i64];
                 let (c, slot, sign) = canonical_of(o);
-                let id = index[&c];
-                let p = a.2[id] * (1.0 - t) + b.2[id] * t;
+                let p = nodes[index[&c]];
                 let node = lattice.node(i, j, k);
                 lattice.nodes[node] = DVec3::new(sign[0] * p[slot[0]], sign[1] * p[slot[1]], sign[2] * p[slot[2]]) * half_c;
             }
         }
     }
     lattice.reindex();
-    let report = Report { converged: a.1 && b.1, min_quality: (0..lattice.elements()).map(|e| lattice.certify(e)).fold(f64::INFINITY, f64::min), ..Report::default() };
-    Some(Solved { lattice, scale: half / half_c, elements: n, report, pi, stages: 0, folded: false })
+    let min_quality = (0..lattice.elements()).map(|e| lattice.certify(e)).fold(f64::INFINITY, f64::min);
+    let report = Report { converged, min_quality, ..Report::default() };
+    Solved { lattice, scale: half / half_c, elements, report, pi, stages: 0, folded: false }
+}
+
+/// The bracketing entries of `log₂ Π` and the weight of the upper one (clamped at the ends).
+fn bracket(t: &Table, pi: f64) -> Option<(&TableEntry, &TableEntry, f64)> {
+    let first = t.entries.first()?;
+    let last = t.entries.last()?;
+    let x = pi.max(1e-300).log2().clamp(first.log2_pi, last.log2_pi);
+    let count = t.entries.len();
+    if count == 1 {
+        return Some((first, first, 0.0));
+    }
+    let hi = t.entries.iter().position(|e| e.log2_pi >= x).unwrap_or(count - 1).clamp(1, count - 1);
+    let (a, b) = (&t.entries[hi - 1], &t.entries[hi]);
+    Some((a, b, ((x - a.log2_pi) / (b.log2_pi - a.log2_pi)).clamp(0.0, 1.0)))
+}
+
+/// The tabulated relaxed cube for `Π_g = pi`, scaled to half-size `half`: node positions
+/// interpolated linearly in `log₂ Π` between the bracketing entries. `None` without a table.
+pub fn tabulated(pi: f64, half: f64) -> Option<Solved> {
+    let t = read_table(TABLE)?;
+    let (a, b, w) = bracket(&t, pi)?;
+    let nodes: Vec<DVec3> = a.nodes.iter().zip(&b.nodes).map(|(p, q)| *p * (1.0 - w) + *q * w).collect();
+    Some(entry_solved(t.elements, &nodes, a.converged && b.converged, pi, half))
+}
+
+/// The layout the table gives a solid cube of half-size `half` at `Π_g = pi`, with its interpolated
+/// surface tilt (the same rule as [`choose`], read from the figures stored per entry). `None`
+/// without a table carrying layouts.
+pub fn tabulated_layout(pi: f64, half: f64) -> Option<(Layout, f64)> {
+    let t = read_table(TABLE)?;
+    if t.samples < 2 {
+        return None;
+    }
+    let (a, b, w) = bracket(&t, pi)?;
+    let lerp = |x: f64, y: f64| x * (1.0 - w) + y * w;
+    let tilt = lerp(a.max_tilt, b.max_tilt);
+    if tilt > MAX_TILT_DEG || a.radius <= 0.0 || b.radius <= 0.0 {
+        return Some((Layout::Cube, tilt));
+    }
+    let face: Vec<f32> = a.offsets.iter().zip(&b.offsets).map(|(&p, &q)| (lerp(p as f64, q as f64) * half) as f32).collect();
+    let g = t.samples;
+    let offsets = (0..6).flat_map(|_| face.iter().copied()).collect();
+    Some((Layout::Round { radius: lerp(a.radius, b.radius) * half, datum: DatumField { g, offsets }, inner: None }, tilt))
 }
 
 struct Reader<'a> {
@@ -641,16 +754,16 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    fn take(&mut self, n: usize) -> &[u8] {
-        let s = &self.bytes[self.at..self.at + n];
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let s = self.bytes.get(self.at..self.at + n)?;
         self.at += n;
-        s
+        Some(s)
     }
-    fn u32(&mut self) -> u32 {
-        u32::from_le_bytes(self.take(4).try_into().unwrap())
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
-    fn f32(&mut self) -> f32 {
-        f32::from_le_bytes(self.take(4).try_into().unwrap())
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 }
 

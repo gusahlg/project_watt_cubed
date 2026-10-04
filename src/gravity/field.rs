@@ -72,6 +72,11 @@ impl Visitor for Query {
     fn error(&mut self, e: f64) {
         self.error += e;
     }
+
+    fn analytic(&mut self, accel: DVec3, potential: f64) {
+        self.accel += accel;
+        self.potential += potential;
+    }
 }
 
 impl Field {

@@ -13,13 +13,16 @@ use std::collections::HashMap;
 use glam::DVec3;
 
 use super::noise::{hash3, unit};
-use crate::gravity::{MassOracle, Primitive, Shape as MassShape, Summary, Visitor};
+use crate::gravity::{MassOracle, Primitive, Shape as MassShape, Summary, Visitor, G};
 
 /// Radius of the start world. The sphere has the volume of the old 50_000_000-block cube:
 /// `round16(50_000_000 · (3/(4π))^(1/3))`.
 pub const HOME_RADIUS: i64 = 31_017_520;
 /// Centre of the start world: the top of its +Y chart sits near `y = 0`.
 pub const HOME_CENTRE: [i64; 3] = [0, -HOME_RADIUS, 0];
+/// Half-size of the start world's cube of matter (generation places a cube; physics rounds it to
+/// the ball of [`HOME_RADIUS`] plus its relaxed relief).
+pub const HOME_CUBE_HALF: i64 = 25_000_000;
 /// Design mean amount per cell of a body's bulk (the generator's bulk mix honours it).
 pub const BULK_DENSITY: f64 = 5.0;
 /// Most a generated surface rises above (or sinks below) its datum.
@@ -253,6 +256,8 @@ pub struct Cosmos {
     group_at: Vec<u32>,
     /// Interior-feature density as a fraction of the design (1 = as designed). The Heart stays.
     deep: f32,
+    /// A round body's relaxed relief as a gravity source (body id and its layer).
+    relief: Option<(u16, std::sync::Arc<crate::gravity::relief::Relief>)>,
 }
 
 /// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
@@ -414,6 +419,7 @@ impl Cosmos {
             groups: Vec::new(),
             group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
             deep: deep.clamp(0.0, 2.0),
+            relief: None,
         };
         cosmos.place_clusters(space);
         cosmos
@@ -734,6 +740,14 @@ impl Cosmos {
     }
 }
 
+impl Cosmos {
+    /// Give body `id` its relaxed relief as a gravity source (generation, before the cosmos is
+    /// shared).
+    pub fn set_relief(&mut self, id: u16, layer: std::sync::Arc<crate::gravity::relief::Relief>) {
+        self.relief = Some((id, layer));
+    }
+}
+
 /// Radius around a query inside which a cluster's real rocks replace its expected mass.
 const OPEN_RADIUS: f64 = 4096.0;
 
@@ -752,6 +766,9 @@ impl MassOracle for Cosmos {
             // part that overlaps band 0 is carved. The oracle stays the ball plus the relief error.
             if let Shape::Cube { half } = b.shape {
                 super::deep::apply(b.centre, half, b.seed, b.density, self.deep, v);
+            }
+            if let Some((_, layer)) = self.relief.as_ref().filter(|(id, _)| *id == b.id) {
+                v.analytic(layer.accel(centre) / G, layer.potential(centre) / G);
             }
             if b.altitude(centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());

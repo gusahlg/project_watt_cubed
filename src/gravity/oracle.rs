@@ -31,6 +31,9 @@ pub trait Visitor {
     /// A declared approximation error (blocks/s² per unit `G`) the oracle adds for detail it does not
     /// model near this query (surface relief, caves).
     fn error(&mut self, e: f64);
+    /// A source evaluated in closed form at the query point by the oracle itself (a round body's
+    /// relief layer): acceleration and potential per unit `G`.
+    fn analytic(&mut self, _accel: DVec3, _potential: f64) {}
 }
 
 /// The generator's description of its matter.

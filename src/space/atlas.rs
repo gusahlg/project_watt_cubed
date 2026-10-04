@@ -293,6 +293,7 @@ impl Atlas {
                 let b = &self.bands[band as usize];
                 // Inward charts flip x with y so storage stays right-handed (det J > 0).
                 let (r, i) = if self.inward { (b.r_hi as f64 - l.y, b.n as f64 - l.x) } else { (b.r_lo as f64 + l.y, l.x) };
+                let r = r + self.lift(patch, l.x, l.z, r);
                 self.centre + radial(face, b.n, r, i, l.z)
             }
             Patch::Transition { face } => {
@@ -311,13 +312,50 @@ impl Atlas {
         }
     }
 
+    /// The radial lift of a band-0 cell onto the fitted datum (owner decision 2026-10-04: the grid
+    /// is fitted to the shape physics produced): the full datum offset at and above the datum
+    /// radius, tapering linearly to nothing at the band's floor, so the band interface below stays
+    /// spherical and a cell stretches radially by at most `offset / (radius − r_lo)`. `r` is the
+    /// unlifted radius of the point; `(i, j)` its continuous storage column. Inner (inward) surfaces
+    /// are not lifted.
+    fn lift(&self, patch: Patch, i: f64, j: f64, r: f64) -> f64 {
+        let Patch::Shell { band: 0, .. } = patch else { return 0.0 };
+        if self.datum.is_none() || self.inward {
+            return 0.0;
+        }
+        let b = &self.bands[0];
+        let t = ((r - b.r_lo as f64) / (self.radius - b.r_lo) as f64).clamp(0.0, 1.0);
+        self.datum_offset(patch, i, j) * t
+    }
+
+    /// The unlifted radius of a point at physical radius `rho` on band-0 column `(i, j)` of `face`
+    /// (the inverse of [`lift`](Self::lift), closed form: the lift is linear in `r` below the datum
+    /// radius and constant above it).
+    fn unlift(&self, face: Face, i: f64, j: f64, rho: f64) -> f64 {
+        let Some(b) = self.bands.first() else { return rho };
+        if self.datum.is_none() || self.inward || rho <= b.r_lo as f64 {
+            return rho;
+        }
+        let off = self.datum_offset(Patch::Shell { band: 0, face }, i, j);
+        let span = (self.radius - b.r_lo) as f64;
+        let below = b.r_lo as f64 + (rho - b.r_lo as f64) / (1.0 + off / span);
+        if below <= self.radius as f64 { below } else { rho - off }
+    }
+
     /// The patch and continuous local coordinates of a physical point, if the atlas covers it.
     pub fn find(&self, p: DVec3) -> Option<(Patch, DVec3)> {
         let rel = p - self.centre;
-        let r = rel.length();
         let face = Face::from_dominant(rel);
         let (tu, nn, tv) = basis(face);
         let local = DVec3::new(rel.dot(tu), rel.dot(nn), rel.dot(tv));
+        let r = match self.bands.first() {
+            Some(b0) if self.datum.is_some() && !self.inward => {
+                let (xi, eta) = Map::Equiangular.inverse(local);
+                let step = 2.0 / b0.n as f64;
+                self.unlift(face, (xi + 1.0) / step, (eta + 1.0) / step, rel.length())
+            }
+            _ => rel.length(),
+        };
         if self.bands.first().is_some_and(|b| r >= b.r_hi as f64) {
             return None;
         }

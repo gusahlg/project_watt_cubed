@@ -194,6 +194,12 @@ impl Bulk {
     pub(super) fn majority(&self) -> BlockId {
         if self.lo == self.hi || self.cut < 1 << 23 { self.lo } else { self.hi }
     }
+
+    /// The two materials and their volume fractions.
+    pub(super) fn fractions(&self) -> [(BlockId, f64); 2] {
+        let hi = self.cut as f64 / (1u32 << 24) as f64;
+        [(self.lo, 1.0 - hi), (self.hi, hi)]
+    }
 }
 
 pub(super) fn choose_bulk(reg: &BlockRegistry, m: &Materials, seed: u32) -> Bulk {

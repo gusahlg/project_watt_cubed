@@ -339,8 +339,7 @@ fn storage_to_rel(t: &Terrain, x: i32, y: i32, z: i32) -> Option<[i64; 3]> {
     let Patch::Shell { band: 0, face } = patch else { return None };
     let b = atlas.bands[0];
     let half = b.n / 2;
-    let off = super::datum_blocks(atlas, patch, local[0], local[2]);
-    let h = b.r_lo + local[1] - atlas.radius - i64::from(off);
+    let h = b.r_lo + local[1] - atlas.radius;
     let a = i32::try_from(half + h).ok()?;
     let u = i32::try_from(local[0] - half).ok()?;
     let v = i32::try_from(local[2] - half).ok()?;
@@ -1451,10 +1450,8 @@ fn face_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i3
     if body.kind == cosmos::Kind::Home {
         let (sx, sz, rise) = home_column(t, face, u, v);
         let atlas = t.storage.home_atlas().expect("the start world is charted");
-        let half = atlas.bands[0].n / 2;
-        let patch = Patch::Shell { band: 0, face };
-        let off = super::datum_blocks(atlas, patch, half + i64::from(u), half + i64::from(v));
-        let y = i64::from(h) + rise + i64::from(off);
+        let _ = atlas;
+        let y = i64::from(h) + rise;
         return (sx, y as i32, sz);
     }
     let half = cube::half_of(body);
@@ -2259,53 +2256,42 @@ fn home_spawn_stands_on_the_plus_y_chart() {
     assert_eq!(t.voxel_at(cell[0] as i32, open as i32, cell[2] as i32), AIR, "the first open cell is solid");
 }
 
-/// A smooth datum of a few hundred blocks lifts the painted surface by that offset.
-/// The column query, the far-LOD column and the far-LOD bounds all move together.
+/// A datum lifts the start world's band-0 cells, not its painting: storage heights stay where the
+/// face painter put them and the surface cell's physical point moves out by the offset (fitted
+/// grid), with `find` inverting the lifted embedding.
 #[test]
-fn datum_offset_raises_the_home_surface() {
+fn a_datum_lifts_the_home_grid_and_leaves_its_painting() {
     use crate::space::datum::DatumField;
-    use crate::world::section::CHART_BODY_BASE;
     let (_reg, mut t) = make(42);
     let atlas = t.storage.home_atlas().expect("charted").clone();
-    let b = &atlas.bands[0];
+    let b = atlas.bands[0];
     let half = b.n / 2;
     let patch = Patch::Shell { band: 0, face: Face::PosY };
     let samples = [(0i32, 0i32), (8_000, -3_000), ((half - 5_000) as i32, 1_200), (-4_000, (5_000 - half) as i32)];
-    let mut before = Vec::new();
-    let mut cols = Vec::new();
-    for &(u, v) in &samples {
+    let before: Vec<i32> = samples.iter().map(|&(u, v)| {
         let (sx, sz, _) = home_column(&t, Face::PosY, u, v);
-        before.push(t.height(sx, sz));
-        cols.push((sx, sz));
-    }
-    let x0 = cols.iter().map(|c| c.0).min().unwrap();
-    let z0 = cols.iter().map(|c| c.1).min().unwrap();
-    let span = cols.iter().map(|c| (c.0 - x0).max(c.1 - z0)).max().unwrap() + 1;
-    let body = CHART_BODY_BASE + t.storage.home_index().expect("index") as u16;
-    let (lo0, hi0) = t.surface_bounds(body, Face::PosY, x0, z0, span).expect("bounds");
+        t.height(sx, sz)
+    }).collect();
     let radius = atlas.radius as f64;
-    t.set_home_datum(std::sync::Arc::new(DatumField::sample(17, radius, |d| radius + 200.0 + 80.0 * d.y)));
-    let (lo1, hi1) = t.surface_bounds(body, Face::PosY, x0, z0, span).expect("raised bounds");
-    assert!(lo1 >= lo0 + 100 && hi1 >= hi0 + 100, "bounds {lo0}..{hi0} did not rise ({lo1}..{hi1})");
-    assert!(lo1 - lo0 <= 320 && hi1 - hi0 <= 320, "bounds rose too far: {lo0}..{hi0} -> {lo1}..{hi1}");
-    let mut offsets = Vec::new();
+    t.set_home_datum(std::sync::Arc::new(DatumField::sample(17, radius, |d| radius + 2_000.0 + 800.0 * d.x)));
+    let lifted = t.storage.home_atlas().expect("charted").clone();
     for (k, &(u, v)) in samples.iter().enumerate() {
-        let (sx, sz) = cols[k];
-        let off = super::datum_blocks(t.storage.home_atlas().expect("charted"), patch, half + i64::from(u), half + i64::from(v));
-        offsets.push(off);
+        let (sx, sz, _) = home_column(&t, Face::PosY, u, v);
         let y = t.height(sx, sz);
-        assert_eq!(y as i64, before[k] as i64 + i64::from(off), "({u},{v}) off {off}");
-        assert_eq!(t.surface(Face::PosY, sx, sz), y);
-        assert!(y >= lo1 && y <= hi1, "surface {y} outside {lo1}..{hi1}");
-        let ys = [y - 1, y, y + 4];
-        let mut out = [AIR; 3];
-        t.lod_column(sx, sz, &ys, &mut out);
-        assert_ne!(out[0], AIR, "lod ground at ({u},{v})");
-        assert_eq!(out[1], AIR, "lod at the raised surface");
-        assert_eq!(out[2], AIR, "lod above");
+        assert_eq!(y, before[k], "painting moved at ({u},{v})");
+        let (i, j) = ((half + i64::from(u)) as f64 + 0.5, (half + i64::from(v)) as f64 + 0.5);
+        let l = glam::DVec3::new(i, f64::from(y) - lifted.storage_box(patch).0[1] as f64, j);
+        let flat = (atlas.embed(patch, l) - atlas.centre).length();
+        let up = (lifted.embed(patch, l) - lifted.centre).length();
+        let off = lifted.datum_offset(patch, i, j);
+        assert!((up - flat - off).abs() < 1.0, "lift {} vs offset {off} at ({u},{v})", up - flat);
+        let (p, back) = lifted.find(lifted.embed(patch, l)).expect("found");
+        assert_eq!(p, patch);
+        assert!((back - l).length() < 1e-6, "find {back} vs {l}");
+        // Deep in the band the grid stays nearly spherical (the lift tapers to nothing at r_lo).
+        let deep = glam::DVec3::new(i, 16.0, j);
+        assert!(((lifted.embed(patch, deep) - atlas.embed(patch, deep)).length()) < 0.01 * off.abs() + 1.0);
     }
-    assert!(offsets.iter().any(|&o| o != offsets[0]), "the field did not vary: {offsets:?}");
-    assert!(offsets.iter().all(|&o| (100..400).contains(&o)), "offsets {offsets:?}");
 }
 
 /// Release cost of painting one home chart chunk. Debug skips it.
