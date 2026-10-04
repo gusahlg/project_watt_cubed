@@ -99,6 +99,9 @@ pub struct Atlas {
     pub bands: Vec<Band>,
     /// The transition shell and the core (absent for a hollow shell's atlas).
     pub inner: Option<Inner>,
+    /// The relaxed shape's departure from the sphere of `radius` (physics decides the shape, the
+    /// layout is fitted to it); `None` for a spherical datum.
+    pub datum: Option<std::sync::Arc<crate::space::datum::DatumField>>,
 }
 
 /// The transition shell and the Cartesian core below an atlas's innermost band.
@@ -175,7 +178,7 @@ impl Atlas {
         let core_origin = [x, 0, 0];
         assert!(x + 2 * core_half <= x0 + SLOT, "a round body of radius {radius} overflows its storage slot");
         let inner = Some(Inner { t_n, t_r, t_layers, t_origin, core_half, core_origin });
-        Self { centre, radius, inward, bands, inner }
+        Self { centre, radius, inward, bands, inner, datum: None }
     }
 
     /// The atlas of a hollow shell's surface: one band of cells between radii `r_lo` and `r_hi`
@@ -187,7 +190,7 @@ impl Atlas {
         let n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / 16.0).round().max(1.0) as i64 * 16;
         let (r_lo, r_hi) = (snap(r_lo), snap(r_hi + 15));
         let origin = std::array::from_fn(|f| [x0, 0, f as i64 * (n + GAP)]);
-        Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None }
+        Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None, datum: None }
     }
 
     /// The storage box of a patch: `(min, size)`.
@@ -206,6 +209,16 @@ impl Atlas {
                 (i.core_origin, [2 * i.core_half; 3])
             }
         }
+    }
+
+    /// Datum offset (blocks) above the sphere of `radius` at continuous column `(i, j)` of a shell
+    /// patch (0 elsewhere, or without a datum field).
+    pub fn datum_offset(&self, patch: Patch, i: f64, j: f64) -> f64 {
+        let (Some(field), Patch::Shell { band, face }) = (&self.datum, patch) else { return 0.0 };
+        let n = self.bands[band as usize].n as f64;
+        // The same column parameters `embed` uses (an inward chart flips x).
+        let i = if self.inward { n - i } else { i };
+        field.offset(face_index(face), -1.0 + 2.0 * i / n, -1.0 + 2.0 * j / n)
     }
 
     /// Every patch.

@@ -31,6 +31,7 @@ pub mod input;
 pub(crate) mod interact;
 pub(crate) mod macros;
 pub(crate) mod math;
+pub mod mechanics;
 pub mod menu;
 pub(crate) mod minimap;
 pub mod modding;
