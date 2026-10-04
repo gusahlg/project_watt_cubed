@@ -1198,6 +1198,10 @@ impl TerrainGenerator for Terrain {
         Some(self.cosmos.as_ref())
     }
 
+    fn cosmos_arc(&self) -> Option<Arc<cosmos::Cosmos>> {
+        Some(self.cosmos.clone())
+    }
+
     fn kind(&self) -> &'static str {
         "diffusion"
     }

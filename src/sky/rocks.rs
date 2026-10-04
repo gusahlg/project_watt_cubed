@@ -1,7 +1,12 @@
 //! Distant asteroids as lit boxes. Class 2 and 3 out to 60 000 blocks, class 1
 //! out to 8 000, never class 0 (pebbles). Rocks inside the chunk view are left
 //! to the voxels. Each class is scanned again only after the eye moves an
-//! eighth of its range; other frames reuse the buffers.
+//! eighth of its range; other frames reuse the buffers. A rescan (a few ms in a
+//! dense swarm) runs on a background thread while the previous list keeps
+//! drawing: the scan margin keeps that list valid until the new one lands.
+
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use voxel_engine::{Color, DVec3, Frame3D, Mat3, Vec3};
 
@@ -37,6 +42,8 @@ struct Band {
     margin_sq: f64,
     built_at: Option<DVec3>,
     rocks: Vec<Cached>,
+    /// A background rescan around this eye.
+    pending: Option<(DVec3, JoinHandle<Vec<Cached>>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +106,7 @@ impl Band {
             margin_sq: margin * margin,
             built_at: None,
             rocks: Vec::new(),
+            pending: None,
         }
     }
 
@@ -110,54 +118,111 @@ impl Band {
     }
 
     fn rebuild(&mut self, cosmos: &Cosmos, eye: DVec3) {
-        self.rocks.clear();
-        let (lo, hi) = cell_box(eye, self.scan);
-        let scan_sq = self.scan * self.scan;
-        let class = self.class;
-        cosmos.for_class_rocks(class, lo, hi, |rock| {
-            let world = DVec3::new(rock.centre[0] as f64, rock.centre[1] as f64, rock.centre[2] as f64);
-            if (world - eye).length_squared() > scan_sq {
-                return;
-            }
-            self.rocks.push(Cached {
-                world,
-                half: Vec3::new(rock.r * rock.axes[0], rock.r * rock.axes[1], rock.r * rock.axes[2]),
-                rot: rotation(rock.seed),
-                albedo: kind_color(rock.kind),
-                #[cfg(test)]
-                centre: rock.centre,
-                #[cfg(test)]
-                seed: rock.seed,
-                #[cfg(test)]
-                r: rock.r,
-            });
-        });
-        if self.rocks.capacity() < self.rocks.len() + 32 {
-            self.rocks.reserve(32);
+        scan(cosmos, self.class, self.scan, eye, &mut self.rocks);
+    }
+
+    /// Adopt a finished background rescan. True when the list changed.
+    fn adopt(&mut self) -> bool {
+        if !self.pending.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            return false;
         }
+        let (at, handle) = self.pending.take().expect("checked above");
+        match handle.join() {
+            Ok(rocks) => {
+                self.rocks = rocks;
+                self.built_at = Some(at);
+                true
+            }
+            // A panicked scan leaves the old list; the next frame asks again.
+            Err(_) => false,
+        }
+    }
+}
+
+/// Every rock of `class` within `radius` of `eye`, into `out` (cleared first).
+fn scan(cosmos: &Cosmos, class: usize, radius: f64, eye: DVec3, out: &mut Vec<Cached>) {
+    out.clear();
+    let (lo, hi) = cell_box(eye, radius);
+    let scan_sq = radius * radius;
+    cosmos.for_class_rocks(class, lo, hi, |rock| {
+        let world = DVec3::new(rock.centre[0] as f64, rock.centre[1] as f64, rock.centre[2] as f64);
+        if (world - eye).length_squared() > scan_sq {
+            return;
+        }
+        out.push(Cached {
+            world,
+            half: Vec3::new(rock.r * rock.axes[0], rock.r * rock.axes[1], rock.r * rock.axes[2]),
+            rot: rotation(rock.seed),
+            albedo: kind_color(rock.kind),
+            #[cfg(test)]
+            centre: rock.centre,
+            #[cfg(test)]
+            seed: rock.seed,
+            #[cfg(test)]
+            r: rock.r,
+        });
+    });
+    if out.capacity() < out.len() + 32 {
+        out.reserve(32);
     }
 }
 
 impl DistantRocks {
     /// Rocks to draw around `eye`. `view_blocks` is the chunk view's reach
     /// ([`chunk_view_blocks`]): a rock inside it is a voxel, so it is not listed.
-    /// Empty inside a body's atmosphere.
-    fn update(&mut self, cosmos: &Cosmos, eye: DVec3, view_blocks: f64) -> &[RockBox] {
+    /// Empty inside a body's atmosphere. With a `shared` catalog a rescan runs in the
+    /// background (the old list draws meanwhile); without one it runs here.
+    fn update(
+        &mut self,
+        cosmos: &Cosmos,
+        shared: &dyn Fn() -> Option<Arc<Cosmos>>,
+        eye: DVec3,
+        view_blocks: f64,
+    ) -> &[RockBox] {
         if !in_space(cosmos, eye) {
             self.shown.clear();
             self.posed = None;
             return &self.shown;
         }
-        if self.posed == Some((eye, view_blocks)) && self.bands.iter().all(|b| !b.needs_rebuild(eye)) {
+        let mut changed = false;
+        for band in &mut self.bands {
+            changed |= band.adopt();
+        }
+        let wants = self.bands.iter().any(|b| b.pending.is_none() && b.needs_rebuild(eye));
+        if !changed && !wants && self.posed == Some((eye, view_blocks)) {
             return &self.shown;
         }
+        let mut handle = None;
         let mut rebuilt = 0u32;
         for band in &mut self.bands {
-            if band.needs_rebuild(eye) {
-                band.rebuild(cosmos, eye);
-                band.built_at = Some(eye);
-                rebuilt += 1;
+            if band.pending.is_some() || !band.needs_rebuild(eye) {
+                continue;
             }
+            if handle.is_none() {
+                handle = Some(shared());
+            }
+            match handle.as_ref().expect("set above") {
+                Some(arc) => {
+                    let (arc, class, radius) = (arc.clone(), band.class, band.scan);
+                    let spawned = std::thread::Builder::new().name("rock-scan".into()).spawn(move || {
+                        let mut out = Vec::new();
+                        scan(&arc, class, radius, eye, &mut out);
+                        out
+                    });
+                    match spawned {
+                        Ok(h) => band.pending = Some((eye, h)),
+                        Err(_) => {
+                            band.rebuild(cosmos, eye);
+                            band.built_at = Some(eye);
+                        }
+                    }
+                }
+                None => {
+                    band.rebuild(cosmos, eye);
+                    band.built_at = Some(eye);
+                }
+            }
+            rebuilt += 1;
         }
         #[cfg(test)]
         {
@@ -184,7 +249,7 @@ impl DistantRocks {
             self.posed = None;
             return;
         };
-        self.update(cosmos, eye, view_blocks);
+        self.update(cosmos, &|| generator.cosmos_arc(), eye, view_blocks);
         for rock in &self.shown {
             f.draw_box(rock.center, rock.half, rock.rot, rock.color);
         }
@@ -441,7 +506,7 @@ mod tests {
         let (eye, anchor) = beside(&cosmos);
         assert!(in_view(pos(&anchor) - eye, reach), "the anchor rock is inside the chunk view");
         let mut rocks = DistantRocks::default();
-        let list = rocks.update(&cosmos, eye, reach);
+        let list = rocks.update(&cosmos, &|| None, eye, reach);
         assert_eq!(keys(list), expected(&cosmos, eye, reach));
         assert!(list.iter().any(|s| s.r >= 170.0), "a class-2 or class-3 rock is listed");
         assert!(list.iter().all(|s| s.r >= 22.0), "class 0 pebbles stay voxels-only");
@@ -478,7 +543,7 @@ mod tests {
         }
         let eye = eye.expect("an empty cell in space");
         let mut rocks = DistantRocks::default();
-        assert!(rocks.update(&cosmos, eye, chunk_view_blocks(20)).is_empty());
+        assert!(rocks.update(&cosmos, &|| None, eye, chunk_view_blocks(20)).is_empty());
         assert_eq!(rocks.scans, 3, "empty space is scanned, not skipped as atmosphere");
     }
 
@@ -488,12 +553,12 @@ mod tests {
         let spawn = DVec3::new(0.5, 80.0, 0.5);
         assert!(cosmos.home().altitude(spawn) < SPACE_ALTITUDE);
         let mut rocks = DistantRocks::default();
-        assert!(rocks.update(&cosmos, spawn, chunk_view_blocks(6)).is_empty());
+        assert!(rocks.update(&cosmos, &|| None, spawn, chunk_view_blocks(6)).is_empty());
         assert_eq!(rocks.scans, 0);
         let high = DVec3::new(0.5, 30_000.0, 0.5);
         assert!(cosmos.body_at(high).is_some());
         assert!(cosmos.home().altitude(high) > SPACE_ALTITUDE);
-        let _ = rocks.update(&cosmos, high, chunk_view_blocks(6));
+        let _ = rocks.update(&cosmos, &|| None, high, chunk_view_blocks(6));
         assert_eq!(rocks.scans, 3, "above the atmosphere the field is drawn");
     }
 
@@ -503,17 +568,17 @@ mod tests {
         let (eye, _) = beside(&cosmos);
         let reach = chunk_view_blocks(20);
         let mut rocks = DistantRocks::default();
-        rocks.update(&cosmos, eye, reach);
+        rocks.update(&cosmos, &|| None, eye, reach);
         let scans = rocks.scans;
         let built: Vec<_> = rocks.bands.iter().map(|b| b.built_at).collect();
         let nudged = eye + DVec3::new(10.0, -4.0, 6.0);
-        rocks.update(&cosmos, nudged, reach);
+        rocks.update(&cosmos, &|| None, nudged, reach);
         assert_eq!(rocks.scans, scans, "a few blocks must not rescan");
         assert_eq!(rocks.bands.iter().map(|b| b.built_at).collect::<Vec<_>>(), built);
         assert_eq!(rocks.posed, Some((nudged, reach)));
         // Class 1's margin is 1 000; class 2 and 3 keep theirs until 7 500.
         let step = eye + DVec3::new(2_000.0, 0.0, 0.0);
-        rocks.update(&cosmos, step, reach);
+        rocks.update(&cosmos, &|| None, step, reach);
         assert_eq!(rocks.scans, scans + 1);
         assert_eq!(rocks.bands[0].built_at, Some(step));
         assert_eq!(rocks.bands[1].built_at, built[1]);
@@ -543,7 +608,7 @@ mod tests {
         assert!(!in_view(pos(&rock) - eye, reach));
         let mut rocks = DistantRocks::default();
         let shown = rocks
-            .update(&cosmos, eye, reach)
+            .update(&cosmos, &|| None, eye, reach)
             .iter()
             .find(|s| s.centre == rock.centre && s.seed == rock.seed)
             .expect("the rock is inside its range");
@@ -555,7 +620,7 @@ mod tests {
 
         let near = pos(&rock) + DVec3::new(10_000.0, 0.0, 0.0);
         let shown = rocks
-            .update(&cosmos, near, reach)
+            .update(&cosmos, &|| None, near, reach)
             .iter()
             .find(|s| s.centre == rock.centre && s.seed == rock.seed)
             .expect("10 000 blocks is inside the class-2 range");
@@ -568,7 +633,7 @@ mod tests {
 
         let past = pos(&rock) + DVec3::new(FAR + 100.0, 0.0, 0.0);
         assert!(rocks
-            .update(&cosmos, past, reach)
+            .update(&cosmos, &|| None, past, reach)
             .iter()
             .all(|s| s.centre != rock.centre || s.seed != rock.seed));
     }
@@ -579,11 +644,11 @@ mod tests {
         let (eye, _) = beside(&cosmos);
         let reach = chunk_view_blocks(20);
         let mut rocks = DistantRocks::default();
-        let n = rocks.update(&cosmos, eye, reach).len();
+        let n = rocks.update(&cosmos, &|| None, eye, reach).len();
         assert!(n > 0);
         alloc_count::reset();
-        assert_eq!(rocks.update(&cosmos, eye, reach).len(), n);
-        let nudged = rocks.update(&cosmos, eye + DVec3::new(3.0, -1.0, 2.0), reach).len();
+        assert_eq!(rocks.update(&cosmos, &|| None, eye, reach).len(), n);
+        let nudged = rocks.update(&cosmos, &|| None, eye + DVec3::new(3.0, -1.0, 2.0), reach).len();
         assert_eq!(alloc_count::alloc_count(), 0, "warm distant-rock update allocated");
         assert!(nudged > 0);
     }
@@ -605,16 +670,16 @@ mod tests {
         let eye = densest.centre;
         let mut rocks = DistantRocks::default();
         let t0 = Instant::now();
-        let n = rocks.update(&cosmos, eye, reach).len();
+        let n = rocks.update(&cosmos, &|| None, eye, reach).len();
         let cold = t0.elapsed();
         let cached: usize = rocks.bands.iter().map(|b| b.rocks.len()).sum();
         let per: Vec<_> = rocks.bands.iter().map(|b| b.rocks.len()).collect();
         let eye2 = eye + DVec3::new(8_000.0, 0.0, 0.0);
         let t1 = Instant::now();
-        let n2 = rocks.update(&cosmos, eye2, reach).len();
+        let n2 = rocks.update(&cosmos, &|| None, eye2, reach).len();
         let warm = t1.elapsed();
         let t2 = Instant::now();
-        let _ = rocks.update(&cosmos, eye2, reach);
+        let _ = rocks.update(&cosmos, &|| None, eye2, reach);
         let still = t2.elapsed();
         println!(
             "densest within 2e8 of home: count {:.0} radius {:.0} dist {:.3e} centre {:?}",
@@ -626,5 +691,27 @@ mod tests {
         println!("cold rebuild {cold:?} shown {n} cached {cached} per class {per:?}");
         println!("warm rebuild (eye + 8000) {warm:?} shown {n2}");
         println!("same eye again {still:?}");
+    }
+
+    /// With a shared catalog the rescan runs in the background and lands as the same list.
+    #[test]
+    fn a_background_rescan_lands_the_same_list() {
+        let cosmos = Arc::new(Cosmos::new(42, 1.0));
+        let (eye, _) = beside(&cosmos);
+        let reach = chunk_view_blocks(20);
+        let mut sync = DistantRocks::default();
+        let want = keys(sync.update(&cosmos, &|| None, eye, reach));
+        assert!(!want.is_empty());
+        let mut rocks = DistantRocks::default();
+        let shared = cosmos.clone();
+        let first = rocks.update(&cosmos, &|| Some(shared.clone()), eye, reach).len();
+        assert_eq!(first, 0, "nothing drawn before the first scan lands");
+        let start = Instant::now();
+        while rocks.bands.iter().any(|b| b.pending.is_some()) {
+            assert!(start.elapsed().as_secs() < 30, "the background scan never landed");
+            std::thread::yield_now();
+            let _ = rocks.update(&cosmos, &|| Some(shared.clone()), eye, reach);
+        }
+        assert_eq!(keys(rocks.update(&cosmos, &|| Some(shared.clone()), eye, reach)), want);
     }
 }

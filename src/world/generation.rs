@@ -146,6 +146,12 @@ pub trait TerrainGenerator: Send + Sync {
         None
     }
 
+    /// A shared handle on [`cosmos`](Self::cosmos), for work that outlives the borrow (a
+    /// background scan).
+    fn cosmos_arc(&self) -> Option<Arc<super::terrain::cosmos::Cosmos>> {
+        None
+    }
+
     /// The atlases of the round bodies whose cells live in storage boxes (SPACE-ARCHITECTURE §7).
     fn atlases(&self) -> &[Arc<crate::space::atlas::Atlas>] {
         &[]
