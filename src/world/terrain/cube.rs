@@ -5,8 +5,8 @@
 //! faces of an edge agree.
 
 use super::cosmos::{Body, Shape, BULK_DENSITY};
+use super::features::MAX_ABOVE;
 use super::noise::{hash3, perlin3, smoothstep};
-use super::trees::MAX_TREE_HEIGHT;
 use super::{Materials, MAX_GROUND, MIN_GROUND};
 use crate::block::registry::{BlockId, BlockRegistry};
 use crate::coord::{ChunkCoord, Face};
@@ -21,8 +21,9 @@ pub(super) const SKY_EDGE: i64 = 2_000;
 /// Edge of a deep-mix cell. A 16³ chunk sits in one cell when the body centre is 64-aligned.
 pub(super) const MIX: i64 = 64;
 
-/// First face-local altitude that is above every tree (`MAX_GROUND + 16 + 1`).
-pub(super) const TREE_CLEAR: i32 = MAX_GROUND + MAX_TREE_HEIGHT + 1;
+/// First face-local altitude above every landmark, sky islands included.
+/// `cosmos::RELIEF` already clears this, so the moon chart stays as it was.
+pub(super) const TREE_CLEAR: i32 = MAX_GROUND + MAX_ABOVE + 1;
 
 /// Dominant axis of a body-relative vector. Ties break X, then Y, then Z; + wins.
 /// The zero vector is [`Face::PosY`], matching [`Face::from_dominant`](Face::from_dominant).

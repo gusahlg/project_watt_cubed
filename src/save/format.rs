@@ -36,7 +36,7 @@
 //! velocity, or up axis). It still decodes: identity frame, zero velocity, +Y up,
 //! and the four new knobs at 100. `PlayerState::legacy_pose` is set so the bridge
 //! can stand that player in local gravity; the flag is not written. A v9 Diffusion world stamped with a generator
-//! older than the cube-planet universe (`worldgen < 7`) is [`SaveError::BeforeCubePlanet`].
+//! older than the cube-planet universe (`worldgen < 8`) is [`SaveError::BeforeCubePlanet`].
 //! Flat v9 worlds load. Versions 4-8 predate the selective-transfer law: their headers
 //! still peek (the slot list shows them) but [`decode`] refuses them with [`SaveError::Outdated`].
 //!
@@ -74,6 +74,10 @@ const HEADER_LEN_V9: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN_V9 + material::S
 pub const HEADER_LEN: usize = HEADER_LEN_PRE_LAW + material::STAMP_LEN;
 /// `WorldgenKind::Diffusion` on disk. A v9 Diffusion world from before the cube planets is refused.
 const KIND_DIFFUSION: u8 = 1;
+/// The first released InfiniteDiffusion generator of the cube-planet universe (worldgen 7 was
+/// never released: its worlds lack the landmarks and the interior).
+const FIRST_CUBE_PLANET_WORLDGEN: u16 = 8;
+
 /// Knob value a v9 stamp (four knobs) pads the four new ones with.
 const KNOB_DEFAULT: u16 = 100;
 /// `coord::Face` discriminants are 0..=5.
@@ -469,9 +473,10 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let worldgen_version = u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap());
     let off = HEADER_LEN_V5;
     let kind = bytes[off];
-    // Diffusion worlds before worldgen 7 predate the cube-planet universe (v9 saves, and v10 saves
-    // written while the generator was still v3). Flat worlds from the same era load.
-    if kind == KIND_DIFFUSION && worldgen_version < 7 {
+    // Diffusion worlds before the first released cube-planet generator predate its universe (v9
+    // saves, v10 saves written while the generator was still v3, and unreleased worldgen 7 builds).
+    // Flat worlds from the same era load.
+    if kind == KIND_DIFFUSION && worldgen_version < FIRST_CUBE_PLANET_WORLDGEN {
         return Err(SaveError::BeforeCubePlanet);
     }
     let knobs = if version == 9 {
@@ -637,7 +642,7 @@ mod tests {
 
     fn sample() -> SaveDoc {
         SaveDoc {
-            worldgen_version: 7,
+            worldgen_version: 8,
             worldgen: WorldgenStamp::default(),
             law_stamp: material::Law::current().stamp(),
             meta: SaveMeta {
@@ -985,6 +990,8 @@ mod tests {
         doc.worldgen_version = 6;
         assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
         doc.worldgen_version = 7;
+        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
+        doc.worldgen_version = 8;
         assert!(matches!(decode(&encode(&doc).unwrap()).unwrap(), Decoded::Intact(_)));
     }
 

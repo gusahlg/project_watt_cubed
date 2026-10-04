@@ -30,6 +30,19 @@ const REGION_SALT: u32 = 0x6E61_0E11;
 pub const FEATS: [&str; FEAT] =
     ["spires", "cones", "crystals", "mushrooms", "islands", "craters", "ruins", "giants", "bones", "hoodoos"];
 
+pub const SPIRES: usize = 0;
+pub const CONES: usize = 1;
+pub const CRYSTALS: usize = 2;
+pub const MUSHROOMS: usize = 3;
+pub const ISLANDS: usize = 4;
+pub const CRATERS: usize = 5;
+/// Structures take this slot. Named so the feature order stays pinned.
+#[allow(dead_code)]
+pub const RUINS: usize = 6;
+pub const GIANTS: usize = 7;
+pub const BONES: usize = 8;
+pub const HOODOOS: usize = 9;
+
 /// One face's character.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -257,7 +270,7 @@ const Z: [f32; FEAT] = [0.0; FEAT];
 const THEMES: [Theme; THEME_COUNT] = [
     row("meadow plains", [96, 168, 64], 1.08, 0.75, 1.0, 0.0, 0.0, 0.05, Surf::Grass, Surf::Soil, 3, Strata::Rock, 0.10, Species::Broadleaf, 0.055, Petals::Mixed, 0.66, 0.52, Z),
     row("flower fields", [214, 126, 168], 1.00, 0.5, 0.0, 0.0, 0.0, 0.10, Surf::Meadow, Surf::Soil, 3, Strata::Rock, 0.04, Species::Broadleaf, 0.18, Petals::Mixed, 0.70, 0.64, Z),
-    row("broadleaf forest", [46, 118, 48], 1.02, 0.9, 0.0, 0.0, 0.0, 0.02, Surf::Grass, Surf::Soil, 4, Strata::Rock, 0.78, Species::Broadleaf, 0.02, Petals::White, 0.60, 0.74, Z),
+    row("broadleaf forest", [46, 118, 48], 1.02, 0.9, 0.0, 0.0, 0.0, 0.02, Surf::Grass, Surf::Soil, 4, Strata::Rock, 0.78, Species::Broadleaf, 0.02, Petals::White, 0.60, 0.74, feat(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.22, 0.0, 0.0)),
     row("giant-tree forest", [28, 96, 42], 1.05, 1.05, 4.0, 0.0, 0.0, 0.0, Surf::Grass, Surf::Soil, 5, Strata::Rock, 0.6, Species::Broadleaf, 0.01, Petals::Cool, 0.64, 0.82, feat(0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)),
     row("autumn wood", [176, 96, 32], 1.0, 0.85, 0.0, 0.0, 0.0, 0.04, Surf::Grass, Surf::Soil, 4, Strata::Rock, 0.7, Species::Autumn, 0.02, Petals::Warm, 0.52, 0.56, Z),
     row("blossom grove", [206, 140, 170], 0.98, 0.6, 0.0, 0.0, 0.0, 0.08, Surf::Meadow, Surf::Soil, 4, Strata::Rock, 0.48, Species::Blossom, 0.09, Petals::Warm, 0.72, 0.60, Z),
@@ -266,7 +279,7 @@ const THEMES: [Theme; THEME_COUNT] = [
     row("glacier", [214, 228, 236], 1.05, 0.32, 14.0, 0.0, 0.0, 0.62, Surf::Snow, Surf::Ice, 3, Strata::Ice, 0.0, Species::None, 0.0, Petals::None, 0.10, 0.42, feat(0.4, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
     row("canyonlands", [168, 84, 52], 1.55, 0.42, -14.0, 0.28, 0.0, 0.0, Surf::Redsand, Surf::Redsand, 2, Strata::Sandstone, 0.02, Species::Broadleaf, 0.0, Petals::None, 0.58, 0.18, feat(0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.9)),
     row("mesa steppe", [186, 102, 64], 0.72, 0.28, 8.0, 0.92, 2.0, 0.05, Surf::Redsand, Surf::Redsand, 2, Strata::Sandstone, 0.0, Species::None, 0.0, Petals::None, 0.66, 0.20, feat(0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.45)),
-    row("dune sea", [214, 186, 120], 0.42, 0.22, -4.0, 0.0, 28.0, 0.18, Surf::Sand, Surf::Sand, 6, Strata::Sandstone, 0.0, Species::None, 0.0, Petals::None, 0.76, 0.10, Z),
+    row("dune sea", [214, 186, 120], 0.42, 0.22, -4.0, 0.0, 28.0, 0.18, Surf::Sand, Surf::Sand, 6, Strata::Sandstone, 0.0, Species::None, 0.0, Petals::None, 0.76, 0.10, feat(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.80)),
     row("badlands", [150, 72, 48], 1.2, 0.85, 2.0, 0.58, 3.0, 0.0, Surf::Clay, Surf::Redsand, 2, Strata::Sandstone, 0.0, Species::None, 0.0, Petals::None, 0.68, 0.16, feat(0.25, 0.0, 0.0, 0.0, 0.0, 0.05, 0.15, 0.0, 0.0, 0.95)),
     row("salt flat", [226, 224, 214], 0.32, 0.12, -8.0, 0.0, 1.2, 0.9, Surf::Salt, Surf::Salt, 3, Strata::Limestone, 0.0, Species::None, 0.0, Petals::None, 0.64, 0.08, Z),
     row("karst stone forest", [168, 176, 160], 1.35, 1.15, 10.0, 0.08, 0.0, 0.0, Surf::Limestone, Surf::Limestone, 2, Strata::Limestone, 0.04, Species::Broadleaf, 0.0, Petals::None, 0.50, 0.30, feat(1.0, 0.0, 0.1, 0.0, 0.0, 0.15, 0.25, 0.0, 0.0, 0.35)),
@@ -469,6 +482,23 @@ pub struct Place {
     /// Weight of the nearest province: 0.5 on a border, 1 deep inside.
     #[allow(dead_code)]
     pub weight: f32,
+}
+
+impl Provinces {
+    /// Blocks of margin inside the face square at `(u, v)`. Negative past the edge.
+    pub(super) fn inset(&self, u: i32, v: i32) -> i64 {
+        self.half - i64::from(u).abs().max(i64::from(v).abs())
+    }
+
+    /// Identity of this face's theme field, for caches keyed with the shape.
+    pub(super) fn cache_key(&self) -> u64 {
+        let mut k = self.seed as u64;
+        k = k.wrapping_mul(0x1000_0000_01B3) ^ self.variety.to_bits() as u64;
+        k = k.wrapping_mul(0x1000_0000_01B3) ^ self.realm as u64;
+        k = k.wrapping_mul(0x1000_0000_01B3) ^ self.face.index() as u64;
+        k = k.wrapping_mul(0x1000_0000_01B3) ^ self.half as u64;
+        k.wrapping_mul(0x1000_0000_01B3) ^ u64::from(self.lift)
+    }
 }
 
 /// The theme field of one face.
@@ -735,6 +765,19 @@ mod tests {
     fn every_theme_is_offered_by_a_realm_and_named() {
         assert_eq!(THEMES.len(), THEME_COUNT);
         assert_eq!(FEATS.len(), FEAT);
+        assert_eq!(FEATS[SPIRES], "spires");
+        assert_eq!(FEATS[CONES], "cones");
+        assert_eq!(FEATS[CRYSTALS], "crystals");
+        assert_eq!(FEATS[MUSHROOMS], "mushrooms");
+        assert_eq!(FEATS[ISLANDS], "islands");
+        assert_eq!(FEATS[CRATERS], "craters");
+        assert_eq!(FEATS[RUINS], "ruins");
+        assert_eq!(FEATS[GIANTS], "giants");
+        assert_eq!(FEATS[BONES], "bones");
+        assert_eq!(FEATS[HOODOOS], "hoodoos");
+        assert_eq!(THEMES[ThemeId::Broadleaf as usize].feats[GIANTS], 0.22);
+        assert_eq!(THEMES[ThemeId::Dune as usize].feats[HOODOOS], 0.80);
+        assert_eq!(THEMES[ThemeId::Giant as usize].feats[GIANTS], 1.0);
         assert_eq!(ThemeId::Tundra as usize, THEME_COUNT - 1);
         let mut seen = [false; THEME_COUNT];
         for realm in [Realm::Green, Realm::Ashen, Realm::Dune, Realm::Shattered, Realm::Glass, Realm::Fungal, Realm::Lush, Realm::Crystal] {

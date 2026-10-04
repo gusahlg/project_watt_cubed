@@ -370,10 +370,12 @@ fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
     assert_eq!(t.generate(dx, dy, dz).uniform(), Some(id));
     assert_worker_matches(&t, dx, dy, dz);
 
-    // Above every tree on +Y: uniform air, and the worker agrees.
-    assert_eq!(t.classify(ChunkCoord::new(0, 31, 0)), Classify::Uniform(AIR));
-    assert_eq!(t.generate(0, 31, 0).uniform(), Some(AIR));
-    assert_worker_matches(&t, 0, 31, 0);
+    // Above every landmark on +Y. TREE_CLEAR rose so sky islands are still painted;
+    // world y=496 (chunk 31) is no longer above them.
+    let above = (cube::TREE_CLEAR + 15) / 16;
+    assert_eq!(t.classify(ChunkCoord::new(0, above, 0)), Classify::Uniform(AIR));
+    assert_eq!(t.generate(0, above, 0).uniform(), Some(AIR));
+    assert_worker_matches(&t, 0, above, 0);
 
     // The outward face of the lower twin (the inner faces see each other).
     let mut twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
@@ -459,7 +461,7 @@ fn classify_matches_what_generation_stores() {
     let (_reg, t) = make(42);
     let samples = [
         ChunkCoord::new(0, 1_000, 0),
-        ChunkCoord::new(0, 31, 0),
+        ChunkCoord::new(0, (cube::TREE_CLEAR + 15) / 16, 0),
         ChunkCoord::new(0, (-1_000i32).div_euclid(16), 0),
         ChunkCoord::new(0, cosmos::HOME_CENTRE[1].div_euclid(16) as i32, 0),
     ];
@@ -924,7 +926,8 @@ fn asteroids_round_worlds_and_the_twin_canyon() {
         let arch = t.voxel_at(aw[0], aw[1], aw[2]);
         let ok = if lush { arch == m.timber || arch == m.leaves } else { arch == m.crystal || arch == m.glowshroom };
         assert!(ok, "arch block {arch:?}");
-        let clear = face_world(body, face, 0, span::CLEAR + 16, 0);
+        // Above the spires and every landmark (sky islands reach higher than the spires).
+        let clear = face_world(body, face, 0, span::CLEAR.max(cube::TREE_CLEAR) + 16, 0);
         assert_eq!(t.voxel_at(clear[0], clear[1], clear[2]), AIR);
         let cc = chunk_of([clear[0] as i64, clear[1] as i64, clear[2] as i64]);
         // The twin still owns this chunk, so air above the spires is uniform air.
@@ -1192,4 +1195,390 @@ fn quiet_deep_chunks_stay_uniform() {
     println!("interior classify uniform {uniform}/{n} = {rate:.4}");
     assert!(n >= 40, "sampled {n} deep chunks");
     assert!(rate >= 0.95, "uniform hit rate {rate} ({uniform}/{n})");
+}
+
+/// World cell of face-local `(u, h, v)`. `h` is altitude above the face plane.
+fn face_cell(body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> (i32, i32, i32) {
+    let half = cube::half_of(body);
+    let a = i32::try_from(half + i64::from(h)).expect("altitude");
+    let (x, y, z) = FaceFrame::new(face).cell_to_world((u, a, v));
+    (
+        i32::try_from(i64::from(x) + body.centre[0]).expect("x"),
+        i32::try_from(i64::from(y) + body.centre[1]).expect("y"),
+        i32::try_from(i64::from(z) + body.centre[2]).expect("z"),
+    )
+}
+
+fn agree_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) {
+    let (x, y, z) = face_cell(body, face, u, h, v);
+    let coord = ChunkCoord::new(x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
+    assert_eq!(t.sky(coord), Sky::Axis(face), "landmark chunk {coord:?} on {face:?} uses the batch path");
+    assert_chunk_matches(t, coord.x, coord.y, coord.z);
+}
+
+struct ThemeHit {
+    theme: province::ThemeId,
+    weight: f32,
+    u: i32,
+    v: i32,
+}
+
+/// Deepest sample of each theme on one face, inside the inland band.
+fn survey(t: &Terrain, body: &cosmos::Body, face: Face) -> Vec<ThemeHit> {
+    let paint = t.paint(body, face);
+    let mut hits: Vec<ThemeHit> = Vec::new();
+    for i in 0..36 {
+        for j in 0..36 {
+            let u = 4_000 + i * 1_200;
+            let v = 4_000 + j * 1_200;
+            if paint.shape.inset(u, v) < 20_000 {
+                continue;
+            }
+            let p = paint.shape.place(u, v);
+            if let Some(hit) = hits.iter_mut().find(|h| h.theme == p.theme) {
+                if p.weight > hit.weight {
+                    *hit = ThemeHit { theme: p.theme, weight: p.weight, u, v };
+                }
+            } else {
+                hits.push(ThemeHit { theme: p.theme, weight: p.weight, u, v });
+            }
+        }
+    }
+    hits
+}
+
+fn origin(hits: &[ThemeHit], theme: province::ThemeId) -> (i32, i32) {
+    let hit = hits.iter().find(|h| h.theme == theme).unwrap_or_else(|| panic!("no {theme:?}"));
+    assert!(hit.weight >= 0.5, "{theme:?} weight {}", hit.weight);
+    (hit.u, hit.v)
+}
+
+fn probe(
+    paint: &FacePaint,
+    origin: (i32, i32),
+    span: i32,
+    step: i32,
+    dys: &[i32],
+    mut pred: impl FnMut(&Column, i32, Option<features::Stamp>) -> bool,
+) -> Option<(i32, i32, i32)> {
+    let (u0, v0) = origin;
+    let mut v = v0 - span;
+    while v < v0 + span {
+        let mut u = u0 - span;
+        while u < u0 + span {
+            let col = paint.shape.column(u, v);
+            for &dy in dys {
+                let y = col.height + dy;
+                let st = paint.features.block_at(&paint.shape, u, y, v, col.height);
+                if pred(&col, y, st) {
+                    return Some((u, v, y));
+                }
+            }
+            u += step;
+        }
+        v += step;
+    }
+    None
+}
+
+fn must(
+    paint: &FacePaint,
+    origin: (i32, i32),
+    span: i32,
+    step: i32,
+    dys: &[i32],
+    what: &str,
+    pred: impl FnMut(&Column, i32, Option<features::Stamp>) -> bool,
+) -> (i32, i32, i32) {
+    probe(paint, origin, span, step, dys, pred).unwrap_or_else(|| panic!("no {what} near {origin:?}"))
+}
+
+#[test]
+fn landmarks_stay_under_relief_and_ground_under_the_lod_ceiling() {
+    assert_eq!(cube::TREE_CLEAR, MAX_GROUND + features::MAX_ABOVE + 1);
+    assert!(features::MAX_BELOW < cube::CRUST);
+    assert!(i64::from(MAX_GROUND + features::MAX_ABOVE) < cosmos::RELIEF);
+    // The far field is ground only: landmarks may rise past its window, the ground may not.
+    assert!(MAX_GROUND < crate::world::section::LOD_CEIL_Y);
+}
+
+#[test]
+fn features_knob_at_zero_plants_nothing() {
+    let (_reg, on) = make(42);
+    let mut reg = BlockRegistry::with_builtins();
+    let mut cfg = TerrainCfg::default();
+    cfg.features = 0;
+    let off = Terrain::with_cfg(&mut reg, 42, cfg);
+    let home = *on.cosmos.home();
+    let mut planted = false;
+    for z in -40..40 {
+        for x in -40..40 {
+            let col = on.paint(&home, Face::PosY).shape.column(x, z);
+            let st = on.paint(&home, Face::PosY).features.block_at(&on.paint(&home, Face::PosY).shape, x, col.height, z, col.height);
+            if let Some(st) = st {
+                if st.id == on.materials().meadow || st.id == on.materials().lichen || st.id == on.materials().darkwood {
+                    planted = true;
+                }
+            }
+            let quiet = off.paint(&home, Face::PosY);
+            for y in col.height - 2..col.height + 6 {
+                assert!(
+                    quiet.features.block_at(&quiet.shape, x, y, z, col.height).is_none(),
+                    "features=0 still painted ({x},{y},{z})"
+                );
+            }
+        }
+    }
+    assert!(planted, "default features knob planted no flora near spawn");
+    let again = on.paint(&home, Face::PosY).features.block_at(
+        &on.paint(&home, Face::PosY).shape,
+        0,
+        on.paint(&home, Face::PosY).shape.height(0, 0),
+        0,
+        on.paint(&home, Face::PosY).shape.height(0, 0),
+    );
+    let twice = on.paint(&home, Face::PosY).features.block_at(
+        &on.paint(&home, Face::PosY).shape,
+        0,
+        on.paint(&home, Face::PosY).shape.height(0, 0),
+        0,
+        on.paint(&home, Face::PosY).shape.height(0, 0),
+    );
+    assert_eq!(again, twice);
+}
+
+#[test]
+fn landmarks_skip_the_cube_edge_band() {
+    let (_reg, t) = make(42);
+    let m = t.materials();
+    let x0 = cosmos::HOME_HALF as i32 - 80;
+    let allowed = [
+        AIR, m.timber, m.leaves, m.pine, m.autumn, m.blossom, m.flower_red, m.flower_yellow, m.flower_blue,
+        m.flower_white,
+    ];
+    for z in (-24..24).step_by(2) {
+        let h = t.height(x0, z);
+        for y in h..h + 40 {
+            let id = t.voxel_at(x0, y, z);
+            assert!(allowed.contains(&id), "edge cell ({x0},{y},{z}) is not a tree or flower");
+        }
+    }
+}
+
+#[test]
+fn every_landmark_family_matches_on_its_face() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let m = t.materials();
+    let py = survey(&t, &home, Face::PosY);
+    let ny = survey(&t, &home, Face::NegY);
+    let px = survey(&t, &home, Face::PosX);
+    let nx = survey(&t, &home, Face::NegX);
+    let pz = survey(&t, &home, Face::PosZ);
+    let nz = survey(&t, &home, Face::NegZ);
+
+    let stone = |id: BlockId| {
+        id == m.limestone || id == m.slate || id == m.sandstone[0] || id == m.sandstone[1] || id == m.sandstone[2]
+            || id == m.sandstone[3]
+    };
+    let wood = |id: BlockId| id == m.bark || id == m.darkwood;
+    let cap = |id: BlockId| id == m.cap_red || id == m.cap_brown || id == m.glowshroom;
+    let crystal = |id: BlockId| id == m.crystal || id == m.violet || id == m.glowcap || id == m.glowshroom;
+    let ice = |id: BlockId| id == m.ice || id == m.frost || id == m.snow;
+    let fire = |id: BlockId| id == m.cinder || id == m.ash || id == m.magma || id == m.basalt || id == m.obsidian;
+
+    // Giant trees, including the occasional broadleaf one.
+    for (face, hits, theme, span) in [
+        (Face::PosY, &py, province::ThemeId::Giant, 48),
+        (Face::PosY, &py, province::ThemeId::Broadleaf, 96),
+    ] {
+        let paint = t.paint(&home, face);
+        let (u, v, y) = must(paint, origin(hits, theme), span, 1, &[12, 24, 40], "giant trunk", |col, y, st| {
+            y >= col.height + 8 && st.is_some_and(|s| s.id == m.darkwood)
+        });
+        let col = paint.shape.column(u, v);
+        let mut run = 0;
+        let mut yy = col.height;
+        while yy < col.height + 80 {
+            let st = paint.features.block_at(&paint.shape, u, yy, v, col.height);
+            if st.is_some_and(|s| wood(s.id)) {
+                run += 1;
+                yy += 1;
+            } else {
+                break;
+            }
+        }
+        assert!((30..=70).contains(&run), "{theme:?} trunk {run} at ({u},{v})");
+        let mut leaf = false;
+        for dz in -4..5 {
+            for dx in -4..5 {
+                for dy in (run - 2)..(run + 5) {
+                    let st = paint.features.block_at(&paint.shape, u + dx, col.height + dy, v + dz, col.height);
+                    if st.is_some_and(|s| s.id == m.leaves || s.id == m.autumn || s.id == m.blossom) {
+                        leaf = true;
+                    }
+                }
+            }
+        }
+        assert!(leaf, "{theme:?} trunk at ({u},{v}) has no crown");
+        agree_cell(&t, &home, face, u, y, v);
+        agree_cell(&t, &home, face, u, col.height + run - 1, v);
+    }
+
+    // Mushrooms on the fungal face.
+    {
+        let paint = t.paint(&home, Face::NegZ);
+        let (u, v, y) = must(paint, origin(&nz, province::ThemeId::Fungal), 64, 1, &[4, 10, 20], "mushroom", |col, y, st| {
+            y > col.height && st.is_some_and(|s| s.id == m.stem)
+        });
+        let col = paint.shape.column(u, v);
+        let mut found_cap = false;
+        for dy in 0..48 {
+            let st = paint.features.block_at(&paint.shape, u, col.height + dy, v, col.height);
+            if st.is_some_and(|s| cap(s.id)) {
+                found_cap = true;
+            }
+        }
+        assert!(found_cap, "mushroom stem without a cap at ({u},{v})");
+        agree_cell(&t, &home, Face::NegZ, u, y, v);
+        agree_cell(&t, &home, Face::NegZ, u, col.height + 16, v);
+    }
+
+    // Spires on karst.
+    {
+        let paint = t.paint(&home, Face::NegX);
+        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Karst), 64, 1, &[8, 16, 28], "spire", |col, y, st| {
+            y > col.height + 6 && st.is_some_and(|s| stone(s.id))
+        });
+        agree_cell(&t, &home, Face::NegX, u, y, v);
+    }
+
+    // Volcanic cones and ash fissures.
+    {
+        let paint = t.paint(&home, Face::NegY);
+        let (u, v, y) = must(paint, origin(&ny, province::ThemeId::Volcanic), 80, 2, &[6, 16, 40], "volcano", |col, y, st| {
+            y >= col.height && st.is_some_and(|s| fire(s.id))
+        });
+        agree_cell(&t, &home, Face::NegY, u, y, v);
+    }
+
+    // Crystals on the glass face.
+    {
+        let paint = t.paint(&home, Face::PosZ);
+        let (u, v, y) = must(paint, origin(&pz, province::ThemeId::Crystal), 48, 1, &[4, 12, 22], "crystal", |col, y, st| {
+            y > col.height && st.is_some_and(|s| crystal(s.id))
+        });
+        let col = paint.shape.column(u, v);
+        let mut run = 0;
+        for dz in -2..3 {
+            for dx in -2..3 {
+                let mut n = 0;
+                for dy in 1..36 {
+                    let st = paint.features.block_at(&paint.shape, u + dx, col.height + dy, v + dz, col.height);
+                    if st.is_some_and(|s| crystal(s.id)) {
+                        n += 1;
+                    }
+                }
+                run = run.max(n);
+            }
+        }
+        assert!((4..=30).contains(&run), "crystal run {run}");
+        agree_cell(&t, &home, Face::PosZ, u, y, v);
+    }
+
+    // Ice on a glacier.
+    {
+        let paint = t.paint(&home, Face::PosZ);
+        let (u, v, y) = must(paint, origin(&pz, province::ThemeId::Glacier), 56, 1, &[6, 14, -4, -10], "ice", |col, y, st| {
+            let Some(st) = st else { return false };
+            (y > col.height && ice(st.id)) || (y < col.height && st.dig && st.id == AIR)
+        });
+        agree_cell(&t, &home, Face::PosZ, u, y, v);
+    }
+
+    // Sand ripples and mesa buttes.
+    {
+        let paint = t.paint(&home, Face::PosX);
+        let (u, v, y) = must(paint, origin(&px, province::ThemeId::Dune), 40, 1, &[0], "ripple", |col, y, st| {
+            y == col.height && st.is_some_and(|s| s.id == m.sand)
+        });
+        agree_cell(&t, &home, Face::PosX, u, y, v);
+        let (u, v, y) = must(paint, origin(&px, province::ThemeId::Mesa), 48, 1, &[4, 10], "butte", |col, y, st| {
+            y > col.height && st.is_some_and(|s| s.id == m.redsand)
+        });
+        agree_cell(&t, &home, Face::PosX, u, y, v);
+    }
+
+    // Sky islands, well above the ground.
+    {
+        let paint = t.paint(&home, Face::NegX);
+        let mut high = Vec::new();
+        let mut d = 100;
+        while d <= 312 {
+            high.push(d);
+            d += 4;
+        }
+        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Islands), 180, 6, &high, "sky island", |col, y, st| {
+            y >= col.height + 100 && st.is_some_and(|s| s.id == m.grass || s.id == m.rock[0] || s.id == m.rock[1] || s.id == m.soil)
+        });
+        let col = paint.shape.column(u, v);
+        assert!((100..=320).contains(&(y - col.height)), "island altitude {}", y - col.height);
+        agree_cell(&t, &home, Face::NegX, u, y, v);
+    }
+
+    // Impact craters.
+    {
+        let paint = t.paint(&home, Face::NegY);
+        let (u, v, y) = must(
+            paint,
+            origin(&ny, province::ThemeId::Crater),
+            200,
+            4,
+            &[0, 2, 4, -6, -12],
+            "crater",
+            |col, y, st| {
+                let Some(st) = st else { return false };
+                (y >= col.height && (st.id == m.regolith || st.id == m.gravel))
+                    || (y < col.height && st.dig && (st.id == m.gold || st.id == m.copper || st.id == m.basalt))
+            },
+        );
+        agree_cell(&t, &home, Face::NegY, u, y, v);
+    }
+
+    // Bone, petrified trunks, karst sinkholes.
+    {
+        let paint = t.paint(&home, Face::NegZ);
+        let (u, v, y) = must(paint, origin(&nz, province::ThemeId::Bone), 56, 1, &[2, 6, 10], "bone", |col, y, st| {
+            y >= col.height && st.is_some_and(|s| s.id == m.bone)
+        });
+        agree_cell(&t, &home, Face::NegZ, u, y, v);
+    }
+    {
+        let paint = t.paint(&home, Face::NegX);
+        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Petrified), 48, 1, &[1, 4, 8], "petrified", |col, y, st| {
+            y >= col.height && st.is_some_and(|s| s.id == m.petrified)
+        });
+        agree_cell(&t, &home, Face::NegX, u, y, v);
+        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Karst), 80, 1, &[-8, -16], "sinkhole", |col, y, st| {
+            col.strata == province::Strata::Limestone && y < col.height - 4 && st.is_some_and(|s| s.dig && s.id == AIR)
+        });
+        agree_cell(&t, &home, Face::NegX, u, y, v);
+    }
+
+    // A lush twin grows the same giants, on a face the other twin does not cover.
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    let lush = *twins.iter().min_by_key(|b| (b.seed, b.id)).unwrap();
+    let other = *twins.iter().find(|b| b.id != lush.id).unwrap();
+    let axis = (0..3).max_by_key(|&a| (lush.centre[a] - other.centre[a]).abs()).unwrap();
+    let away = if lush.centre[axis] < other.centre[axis] {
+        [Face::NegX, Face::NegY, Face::NegZ][axis]
+    } else {
+        [Face::PosX, Face::PosY, Face::PosZ][axis]
+    };
+    let hits = survey(&t, &lush, away);
+    let paint = t.paint(&lush, away);
+    let (u, v, y) = must(paint, origin(&hits, province::ThemeId::Giant), 64, 1, &[12, 28], "twin giant", |col, y, st| {
+        y >= col.height + 8 && st.is_some_and(|s| s.id == m.darkwood)
+    });
+    agree_cell(&t, &lush, away, u, y, v);
 }

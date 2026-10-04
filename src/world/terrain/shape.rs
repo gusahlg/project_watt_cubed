@@ -32,7 +32,6 @@ pub struct Column {
     /// Below this height lies deep rock.
     pub deep: i32,
     /// Nearest province's theme. The map paints this.
-    #[allow(dead_code)]
     pub theme: ThemeId,
     pub species: Species,
     /// Planting probability. Zero when the dithered species is none, and lower on snow.
@@ -42,7 +41,6 @@ pub struct Column {
     /// The flower block, or air when `flowers` is zero.
     pub flower: BlockId,
     /// Blended feature densities for later passes.
-    #[allow(dead_code)]
     pub feats: [f32; FEAT],
 }
 
@@ -121,6 +119,24 @@ impl Shape {
 
     fn seed(&self, k: u32) -> u32 {
         self.s.wrapping_mul(0x9E37_79B9).wrapping_add(k.wrapping_mul(0x85EB_CA6B))
+    }
+
+    /// Blended feature densities, without the height field.
+    pub(super) fn feats_at(&self, u: i32, v: i32) -> [f32; FEAT] {
+        self.provinces.at(u, v).feats
+    }
+
+    /// Blocks of margin inside the face square.
+    pub(super) fn inset(&self, u: i32, v: i32) -> i64 {
+        self.provinces.inset(u, v)
+    }
+
+    /// Cache identity: provinces, height salt, relief and the palette pointer.
+    pub(super) fn cache_key(&self) -> u64 {
+        let mut k = self.provinces.cache_key();
+        k = k.wrapping_mul(0x1000_0000_01B3) ^ self.s as u64;
+        k = k.wrapping_mul(0x1000_0000_01B3) ^ self.relief.to_bits() as u64;
+        k.wrapping_mul(0x1000_0000_01B3) ^ Arc::as_ptr(&self.m) as u64
     }
 
     fn field(&self, x: i32, z: i32) -> Field {
