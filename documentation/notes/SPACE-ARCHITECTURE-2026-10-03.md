@@ -188,7 +188,7 @@ gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + led
   flat net: view boxes iterate real chunks through `unfold`, and containment, unload, orders, worklists and the
   worker gate measure real chunks folded into the net (storage outside the net folds far away).
 
-## 8. InfiniteDiffusion v4 (WORLDGEN_VERSION 7)
+## 8. InfiniteDiffusion v4 (WORLDGEN_VERSION 8 — the first released cube-planet generator; 7 was never released)
 
 1. **Placement:** start cube centre `C0 = (0, −H, 0)`, so its +Y face plane is `y = 0` and spawn is the
    +Y face centre `(0, surface, 0)` — gravity there is exactly perpendicular. Faces are generated in
@@ -206,6 +206,12 @@ gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + led
    rare huge hollow chambers, a core; O(1) uniform early-outs for solid depth.
 5. Materials: palette roles appended last; scoped dormancy per body family.
 
+Status 2026-10-04: implemented — cosmos, six cube faces with 26 themes in realms/regions/provinces
+(`province.rs`), surface landmarks (`features/`, worldgen 8), the interior (`deep/`: Deep caverns,
+dwarf halls, Underdark chambers, mantle bubbles, the Heart; the oracle subtracts the voids), asteroid
+swarms and the twins' canyon (`space.rs`, `span.rs`), every round body on charts (`storage.rs`,
+`round.rs`). Running: surface structures (G6c), cavern light (G7b).
+
 ## 9. Rendering (voxel-engine branch `space`)
 
 1. Wrapping `i32` camera arithmetic (A1 in the engine audit).
@@ -216,13 +222,21 @@ gravity/field.rs    the per-world field: oracle (Barnes–Hut over groups) + led
 4. Far bodies: `Frame3D::set_far_bodies(&[FarBody])` analytic impostors (cube, sphere, shell) in the sky
    pass, lit by the sun, occluding stars.
 5. Curved meshes: a per-mesh trilinear cage table indexed by the spare `MeshRecord` lane (task E4).
+6. Inside a hollow world: `FarShape::InnerSphere` and `Frame3D::set_sun_override` (task E5).
+7. Far bodies are seen through the viewer's air: in-scatter in front of the body plus its light (a
+   moon's night side is sky-coloured by day); the body underfoot keeps its own colour.
+
+Status 2026-10-04: all of the above implemented (engine branch `space`). Game side: far LOD on every
+cube face (G4), chart sections bent through cages on round worlds (G10, detail capped by the chord
+error `L²/8R ≤ 1`), distant swarm rocks as sunlit boxes (`sky::rocks`, G9). Far-field admission counts
+sections, the unit the frontier is coarsened in (rugged faces span several slabs per section).
 
 ## 10. Persistence and network
 
 - Protocol 12: `Move`/`PeerMove`/`Position` carry the frame (`DQuat` → 4×f32 quantised) and velocity;
   `Teleport`/`Position` carry a request id; `Welcome` carries the physics fingerprint.
-- Save v10: player frame + velocity; widened worldgen knobs; `PHYSICS_VERSION`. v9 Diffusion saves
-  (worldgen < 7) are refused with a clear message ("made before the cube-planet universe"); Flat loads.
+- Save v10: player frame + velocity; widened worldgen knobs; `PHYSICS_VERSION`. Diffusion saves before
+  worldgen 8 are refused with a clear message ("made before the cube-planet universe"); Flat loads.
 - Fingerprint folds `PHYSICS_VERSION`, `G`, the kernel constants and the amount rule.
 
 ## 11. Invariants every task keeps
