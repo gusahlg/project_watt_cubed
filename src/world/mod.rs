@@ -2289,8 +2289,15 @@ fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budge
         *S::scratch(world) = scratch;
         return;
     }
+    // A full section budget refuses every candidate. That is not a drained
+    // backlog: clearing pending here left the holes disarmed on a still camera.
+    let mut refused = false;
     S::for_each_geometry(world, center, |k| {
-        if S::in_flight(world, k) || !S::ready(world, k) {
+        if S::in_flight(world, k) {
+            return;
+        }
+        if !S::ready(world, k) {
+            refused = true;
             return;
         }
         scratch.keys.push((S::order(world, center, k), k));
@@ -2298,7 +2305,9 @@ fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budge
 
     let n = scratch.keys.len();
     if n == 0 {
-        S::pending(world).take();
+        if !refused {
+            S::pending(world).take();
+        }
         *S::scratch(world) = scratch;
         return;
     }

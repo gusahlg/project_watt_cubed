@@ -1218,6 +1218,10 @@ impl World {
             // they re-extract from the updated generator overlay.
             let section_remesh_lane = self.lanes().section_remesh;
             sched.run_manual(section_remesh_lane, self, eng.as_deref_mut());
+            // The floor may be full of sections this frontier no longer draws.
+            // Unload runs only on a boundary cross, so a still camera never
+            // drops them and admission stays refused.
+            self.reclaim_blocked_sections(center_chunk, eng.as_deref_mut());
             let section_lane = self.lanes().section_admit;
             sched.run_manual(section_lane, self, None);
             // Section visible-set lane: re-resolve the covering only when an
@@ -3440,6 +3444,91 @@ impl World {
                     state.set_visible(eng, mask);
                 }
             }
+        }
+    }
+
+    /// Free Ready sections that no desired cell draws, when the section floor is
+    /// full and a desired cell is still unloaded. A still camera does not unload,
+    /// so those extras would block covering for good.
+    fn reclaim_blocked_sections(&mut self, center: Coord, mut eng: Option<&mut Engine>) {
+        let allowed = self.sections_allowed();
+        let used = self.section_budget_used();
+        if used < allowed {
+            return;
+        }
+        // A still, converged floor has neither flag. Holes keep admission
+        // pending (a full budget no longer clears it), and a frontier change
+        // raises the cover flag before this runs, so the scan below stays off
+        // the quiet path.
+        if !self.pending_sections.get() && !self.section_cover_dirty.get() {
+            return;
+        }
+        let holes = self
+            .section_desired
+            .iter()
+            .filter(|&&c| {
+                !self.sections.contains_key(&c)
+                    && !self.section_covered(c)
+                    && !self.coverage_skips(center, c)
+                    && !self.quarantined.contains(&FailKey::Section { pos: c })
+            })
+            .count();
+        if holes == 0 {
+            return;
+        }
+        let need = holes + (used - allowed);
+        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
+        let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
+        let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
+        let mut covers: FastSet<SectionPos> = FastSet::default();
+        for &c in &self.section_desired {
+            if let Some(p) = quadtree::drawable_cover(c, max, &ready) {
+                covers.insert(p);
+            }
+        }
+        let spare: Vec<SectionPos> = self
+            .sections
+            .iter()
+            .filter_map(|(&s, state)| {
+                if !matches!(state, SectionState::Ready { .. }) {
+                    return None;
+                }
+                (!desired.contains(&s) && !covers.contains(&s)).then_some(s)
+            })
+            .collect();
+        let mut victims: Vec<(u64, SectionPos)> = spare
+            .into_iter()
+            .map(|s| {
+                let rank = <SectionLane as StreamLane>::dist2(self, center, s).unwrap_or(0);
+                (rank, s)
+            })
+            .collect();
+        if victims.is_empty() {
+            return;
+        }
+        victims.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| section_key(&a.1).cmp(&section_key(&b.1)))
+        });
+        let mut freed = 0usize;
+        for (_, s) in victims.into_iter().take(need) {
+            let gpu = match self.sections.get(&s) {
+                Some(SectionState::Ready { meshes, cages, .. }) => !meshes.is_empty() || !cages.is_empty(),
+                _ => false,
+            };
+            if gpu && eng.is_none() {
+                continue;
+            }
+            if let Some(state) = self.sections.remove(&s) {
+                if let Some(eng) = eng.as_deref_mut() {
+                    state.free(eng);
+                }
+                freed += 1;
+            }
+        }
+        if freed > 0 {
+            self.pending_sections.set();
+            self.section_cover_dirty.set();
         }
     }
 
@@ -5793,6 +5882,229 @@ mod tests {
                 assert!(across_cols > 0, "{name}: the near window does not cross the seam");
                 assert_eq!(across_bad, 0, "{name}: {across_bad} near columns across the seam are not real chunks");
             }
+        }
+    }
+
+    /// A full section floor must not disarm the lane, and must drop Ready sections
+    /// nothing desired draws so the open cell can be admitted.
+    #[test]
+    fn full_section_floor_keeps_the_lane_armed_and_frees_a_slot() {
+        let mut world = World::generate();
+        let center = Coord::new(0, 4, 0);
+        world.center = Some(center);
+        world.slot_ceiling = 1024;
+        world.gpu_live_slots = 6000;
+        let hole = SectionPos {
+            body: 0,
+            face: Face::PosY,
+            detail: super::super::section::FINEST_DETAIL,
+            x: 0,
+            z: 0,
+        };
+        let filler = |i: usize| SectionPos {
+            body: 0,
+            face: Face::PosY,
+            detail: super::super::section::FINEST_DETAIL,
+            x: 10_000 + i as i32,
+            z: -3,
+        };
+        world.section_desired = vec![hole];
+        let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+        for i in 0..super::super::SECTION_SLOT_FLOOR {
+            world.sections.insert(filler(i), empty());
+        }
+        assert!(!world.section_covered(hole), "the hole has no resident cover");
+        assert!(!<SectionLane as StreamLane>::ready(&world, hole), "the floor is full");
+        world.pending_sections.set();
+        super::super::admit::<SectionLane>(&mut world, center, Budget::Millis(8.0));
+        assert!(
+            world.pending_sections.get(),
+            "a refused budget is not a drained backlog"
+        );
+        assert!(!world.sections.contains_key(&hole), "nothing was admitted");
+        world.reclaim_blocked_sections(center, None);
+        assert!(
+            world.section_budget_used() < world.sections_allowed(),
+            "one unwanted Ready section makes room, used {} allowed {}",
+            world.section_budget_used(),
+            world.sections_allowed()
+        );
+        assert!(world.pending_sections.get(), "freeing a slot re-arms admission");
+        assert!(<SectionLane as StreamLane>::ready(&world, hole));
+    }
+
+    /// The chart cap, once the near field has filled the CPU-cull knob, keeps the
+    /// sections nearest in the chart frame. Sections loaded earlier are the
+    /// storage-nearest of the wider frontier, which is not that set: neighbours
+    /// and the far rim disagree. Readiness still reaches an empty uncovered count.
+    #[test]
+    fn far_chart_seam_readiness_converges() {
+        use crate::render_config::RenderConfig;
+        use crate::space::atlas::Patch;
+        use crate::space::chart::{self, Map};
+        use crate::world::generation::WorldgenKind;
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+        let atlas = world
+            .generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - centre).length() < 1.0)
+            .expect("charted")
+            .clone();
+        let storage_from_dir = |world: &World, dir: DVec3, above: f64| -> DVec3 {
+            let dir = dir.normalize();
+            let face = Face::from_dominant(dir);
+            let (tu, nn, tv) = chart::basis(face);
+            let (xi, eta) = Map::Equiangular.inverse(DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv)));
+            let n = atlas.bands[0].n;
+            let step = 2.0 / n as f64;
+            let i = (((xi + 1.0) / step).floor() as i64).clamp(0, n - 1);
+            let j = (((eta + 1.0) / step).floor() as i64).clamp(0, n - 1);
+            let patch = Patch::Shell { band: 0, face };
+            let (origin, _) = atlas.storage_box(patch);
+            let stored = atlas.storage(patch, [i, 0, j]);
+            let ground = world.terrain().surface(Face::PosY, stored[0] as i32, stored[2] as i32);
+            let local_y = ground as f64 - origin[1] as f64;
+            let surf = atlas.embed(patch, DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
+            let up = (surf - atlas.centre).normalize();
+            let fallback = DVec3::new(stored[0] as f64 + 0.5, ground as f64 + above, stored[2] as f64 + 0.5);
+            world.chart_eye(surf + up * above).unwrap_or(fallback)
+        };
+
+        let mut sites: Vec<(String, DVec3)> = Vec::new();
+        let symptom = world.chart_eye(DVec3::new(0.0, -8_640_801.0, 22_107_307.0)).expect("symptom chart eye");
+        sites.push(("symptom".into(), symptom));
+        let sym_ground = world.terrain().surface(Face::PosY, symptom.x as i32, symptom.z as i32);
+        sites.push(("symptom-ground".into(), DVec3::new(symptom.x, sym_ground as f64, symptom.z)));
+        sites.push(("symptom+300".into(), DVec3::new(symptom.x, sym_ground as f64 + 300.0, symptom.z)));
+        sites.push(("seam-yz".into(), storage_from_dir(&world, DVec3::new(0.0, 1.0, 1.0), 0.0)));
+        sites.push(("seam-yz+300".into(), storage_from_dir(&world, DVec3::new(0.0, 1.0, 1.0), 300.0)));
+        sites.push(("seam-yx".into(), storage_from_dir(&world, DVec3::new(1.0, 1.0, 0.0), 0.0)));
+        sites.push(("corner".into(), storage_from_dir(&world, DVec3::new(1.0, 0.985, 0.97), 0.0)));
+        sites.push(("face".into(), storage_from_dir(&world, DVec3::new(0.0, 1.0, 0.0), 0.0)));
+
+        let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+        let uncovered = |world: &World| -> usize {
+            world.section_desired.iter().filter(|&&c| !world.section_covered(c)).count()
+        };
+        let pump = |world: &mut World| -> (usize, usize, bool) {
+            let mut cancels = 0usize;
+            let mut fails = 0usize;
+            let mut got = false;
+            while let Some(done) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) {
+                got = true;
+                match &done {
+                    pipeline::Done::Cancelled(keys) => cancels += keys.len(),
+                    pipeline::Done::Failed(_) => fails += 1,
+                    _ => {}
+                }
+                world.integrate_worker_result(done);
+            }
+            while let Some((pos, token, _, _)) = world.section_upload_queue.pop_front() {
+                if let Some(state @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
+                    && matches!(state, SectionState::Meshing { token: t } if *t == token)
+                {
+                    world.meshing_sections = world.meshing_sections.saturating_sub(1);
+                    *state = empty_ready();
+                }
+            }
+            (cancels, fails, got)
+        };
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let drive = |world: &mut World, center: Coord, name: &str| {
+            let mut cancels = 0usize;
+            let mut fails = 0usize;
+            let mut passes = 0usize;
+            loop {
+                let (c, f, got) = pump(world);
+                cancels += c;
+                fails += f;
+                // Same order as `stream`: reclaim, admit, then the visible rebuild
+                // that re-arms holes. Pending is not forced on from outside.
+                world.reclaim_blocked_sections(center, None);
+                let unc = uncovered(world);
+                let queued = world.workers.as_ref().map(pipeline::Workers::queue_depths).unwrap_or((0, 0)).1;
+                if unc == 0 && world.meshing_sections == 0 && world.section_upload_queue.is_empty() && queued == 0 {
+                    assert_eq!(fails, 0, "{name}: section jobs failed");
+                    return;
+                }
+                passes += 1;
+                assert!(
+                    Instant::now() < deadline && passes < 20_000,
+                    "{name}: uncovered {unc} of {} after {passes} passes, cancels {cancels} fails {fails} meshing {} queued {queued}",
+                    world.section_desired.len(),
+                    world.meshing_sections
+                );
+                super::super::admit::<SectionLane>(world, center, Budget::Millis(8.0));
+                if world.section_cover_dirty.take() || world.pending_sections.get() {
+                    world.rebuild_section_visible(None);
+                }
+                if !got {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+
+        for (name, storage) in sites {
+            let center = Coord::new(
+                (storage.x / 16.0).floor() as i32,
+                (storage.y / 16.0).floor() as i32,
+                (storage.z / 16.0).floor() as i32,
+            );
+            world.sections.clear();
+            world.section_eye_y = storage.y;
+            world.center = Some(center);
+            world.stream_up = Some(Face::PosY);
+            world.stream_up_set = true;
+            world.adopt_fold(center);
+            world.slot_ceiling = 1024;
+            world.gpu_live_slots = 0;
+            let wide = world.desired_sections(center);
+            world.gpu_live_slots = 512;
+            let tight_allowed = world.sections_allowed();
+            let tight = world.desired_sections(center);
+            let far_m = f64::from(world.section_pyramid.outer_m());
+            let radius = world.view.horizontal;
+            let fold = world.fold;
+            {
+                let workers = world.worker_pool();
+                workers.set_view(center.x, center.y, center.z, radius, far_m, 0.0, 0.0, 0.0, Some(Face::PosY));
+                workers.set_fold(fold);
+            }
+            // Cold start: the bench once the near field has already taken the
+            // surplus above the section floor, and nothing coarser is resident.
+            if name == "symptom" {
+                world.section_desired = tight.clone();
+                world.pending_sections.set();
+                world.section_cover_dirty.set();
+                drive(&mut world, center, "symptom cold");
+                assert_eq!(uncovered(&world), 0, "symptom cold start left sections uncovered");
+                world.sections.clear();
+                world.meshing_sections = 0;
+                world.section_upload_queue.clear();
+                while world.workers.as_ref().and_then(pipeline::Workers::try_recv).is_some() {}
+            }
+            // The wider frontier's storage-nearest floor is what admission loads
+            // first. After the cap drops, that set is not the chart-nearest one.
+            let mut prefix = wide;
+            prefix.sort_by_key(|s| <SectionLane as StreamLane>::order(&world, center, *s));
+            prefix.truncate(tight_allowed.min(prefix.len()));
+            for &s in &prefix {
+                world.sections.insert(s, empty_ready());
+            }
+            world.section_desired = tight;
+            world.pending_sections.set();
+            world.section_cover_dirty.set();
+            let planted = uncovered(&world);
+            drive(&mut world, center, &name);
+            assert_eq!(
+                uncovered(&world),
+                0,
+                "{name}: planted {planted} uncovered sections of {} and the floor never cleared",
+                world.section_desired.len()
+            );
         }
     }
 }
