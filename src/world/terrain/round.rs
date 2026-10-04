@@ -61,6 +61,8 @@ const SHORE: f32 = 72.0;
 /// Colossal trees and lava fountains top out at [`marks::TALL`]; the extra cells keep a crown
 /// that stands on a slightly higher neighbour inside the far-field window.
 pub(super) const PLANT_REACH: i64 = marks::TALL + 8;
+/// Coarsest far-field cell that still carries plants and landmarks.
+const LOD_DRESS_CELL: i64 = 8;
 /// Landmark site spacing. Bigger than [`SITE`] so a grove, an arch or a cone has room to be read.
 /// Anchors sit on this grid; each shape then stays inside the chart by its own reach, at most
 /// [`marks::REACH`] (wider than [`SITE_MARGIN`], because a grove or a trench outgrows a tree).
@@ -896,6 +898,24 @@ impl Round {
     pub(super) fn lod_column(&self, patch: Patch, i: i64, j: i64, origin_y: i64, ys: &[i32], out: &mut [BlockId]) {
         let col = self.column(patch, i, j);
         let (_, size) = self.atlas.storage_box(patch);
+        // Cells are cubes: the vertical step is the column spacing. Past `LOD_DRESS_CELL` a plant or a
+        // landmark is a fraction of a cell (one sample would make a cell-wide pillar of it) and the
+        // plant window would be rebuilt for every column, so coarse cells carry terrain only.
+        let cell = if ys.len() >= 2 { i64::from(ys[1] - ys[0]) } else { 1 };
+        if cell > LOD_DRESS_CELL {
+            for (o, &sy) in out.iter_mut().zip(ys) {
+                let d = col.surface - (sy as i64 - origin_y);
+                *o = if d >= 1 { self.ground(&col, d) } else { AIR };
+            }
+            self.paint_lod_top(&col, origin_y, ys, out);
+            // A Verdant forest floor reads from afar as its canopy (meadows stay open).
+            if self.style == Style::Verdant && (col.top == self.m.grass || col.top == self.m.moss) {
+                if let Some(k) = out.iter().take(ys.len()).rposition(|&id| id != AIR) {
+                    out[k] = self.m.leaves;
+                }
+            }
+            return;
+        }
         self.with_plants(patch, size[0], i, j, |plants, marks| {
             // One horizontal test per mark; the vertical samples then see only this column's shapes.
             let mut buf = [blank_mark(); 4];
@@ -914,6 +934,23 @@ impl Round {
                 };
             }
         });
+        self.paint_lod_top(&col, origin_y, ys, out);
+    }
+
+    /// Coarse rings sample cell floors (rock): the cell holding the surface shows the top block.
+    fn paint_lod_top(&self, col: &Column, origin_y: i64, ys: &[i32], out: &mut [BlockId]) {
+        let n = out.len().min(ys.len());
+        if n < 2 || !crate::world::generation::coarse_floor_samples(&ys[..n]) {
+            return;
+        }
+        let step = i64::from(ys[1] - ys[0]);
+        let top = col.surface - 1;
+        let lo = |k: usize| i64::from(ys[k]) - origin_y;
+        if let Some(k) = (0..n).find(|&k| (lo(k)..lo(k) + step).contains(&top)) {
+            if out[k] != AIR {
+                out[k] = self.ground(col, 1);
+            }
+        }
     }
 
     /// Plants and far landmarks that can paint column `(i, j)`, reused across one 128-block section.

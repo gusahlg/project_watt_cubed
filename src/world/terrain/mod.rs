@@ -396,24 +396,6 @@ fn sky_aims(cosmos: &cosmos::Cosmos, id: u16) -> ([[i64; 3]; 8], usize) {
     (aims, n)
 }
 
-/// Coarse chart columns sample the cell floor, which is rock. Replace that cell
-/// with the surface block when the surface itself sits in it; a plant above stays.
-fn paint_stored_top(storage: &storage::StorageWorlds, x: i32, z: i32, ys: &[i32], out: &mut [BlockId]) {
-    if !super::generation::coarse_floor_samples(ys) {
-        return;
-    }
-    let n = out.len().min(ys.len());
-    let Some(j) = out[..n].iter().rposition(|&id| id != AIR) else { return };
-    let s = storage.surface(x, z);
-    if s == i32::MIN || s >= storage::BURIED {
-        return;
-    }
-    let (lo, step) = (ys[j], ys[1] - ys[0]);
-    if s - 1 >= lo && s - 1 < lo + step {
-        super::generation::paint_lod_top(out, n, storage.voxel(x, s - 1, z));
-    }
-}
-
 fn rel_box(centre: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> ([i64; 3], [i64; 3]) {
     (
         [lo[0] - centre[0], lo[1] - centre[1], lo[2] - centre[2]],
@@ -1461,10 +1443,7 @@ impl TerrainGenerator for Terrain {
 
     fn lod_column(&self, wx: i32, wz: i32, ys: &[i32], out: &mut [BlockId]) {
         if stored(wx) {
-            for (o, &wy) in out.iter_mut().zip(ys) {
-                *o = self.storage.voxel(wx, wy, wz);
-            }
-            paint_stored_top(&self.storage, wx, wz, ys, out);
+            self.storage.lod_column(wx, wz, ys, out);
             return;
         }
         let Some(hit) = self.posy_hit(wx, wz) else {
@@ -1495,7 +1474,6 @@ impl TerrainGenerator for Terrain {
                 return;
             }
             self.storage.lod_column(u, v, alts, out);
-            paint_stored_top(&self.storage, u, v, alts, out);
             return;
         }
         if face == Face::PosY {
