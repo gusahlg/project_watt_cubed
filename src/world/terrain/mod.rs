@@ -1462,10 +1462,19 @@ impl Terrain {
     }
 
     fn fill_chart(&self, c: &ChartCols) -> ChunkData {
-        let body = self.cosmos.home();
-        let paint = self.paint(body, c.face);
-        let trees = paint.trees.blocks_in(&paint.shape, c.u0, c.v0, CHUNK_SIZE as i32);
-        self.fill_face::<true>(body, c.face, &c.cols, c.u0, c.v0, c.h_base, c.max_terrain, c.min_h, &trees)
+        let trees = self.chart_trees(c);
+        self.fill_chart_with(c, &trees)
+    }
+
+    /// Tree blocks over a chart chunk's columns (they depend on the columns only, so a storage
+    /// column's chunks share them).
+    fn chart_trees(&self, c: &ChartCols) -> Vec<(i32, i32, i32, BlockId)> {
+        let paint = self.paint(self.cosmos.home(), c.face);
+        paint.trees.blocks_in(&paint.shape, c.u0, c.v0, CHUNK_SIZE as i32)
+    }
+
+    fn fill_chart_with(&self, c: &ChartCols, trees: &[(i32, i32, i32, BlockId)]) -> ChunkData {
+        self.fill_face::<true>(self.cosmos.home(), c.face, &c.cols, c.u0, c.v0, c.h_base, c.max_terrain, c.min_h, trees)
     }
 
     fn home_chunk_data(&self, coord: ChunkCoord) -> Option<ChunkData> {
@@ -1492,6 +1501,7 @@ impl Terrain {
         let atlas = self.storage.home_atlas()?;
         let b = atlas.bands[0];
         let mut cols: Option<ChartCols> = None;
+        let mut trees: Option<Vec<(i32, i32, i32, BlockId)>> = None;
         let mut chunks = Vec::with_capacity(range.clone().count());
         for alt in range {
             let coord = key.chunk(alt);
@@ -1510,7 +1520,10 @@ impl Terrain {
             c.h_base = (b.r_lo + l[1] - atlas.radius) as i32;
             let data = match self.columns_uniform(&c) {
                 Some(id) => ChunkData::Uniform(id),
-                None => self.fill_chart(&c),
+                None => {
+                    let trees = trees.get_or_insert_with(|| self.chart_trees(&c));
+                    self.fill_chart_with(&c, trees)
+                }
             };
             chunks.push((alt, data));
         }

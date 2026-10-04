@@ -377,10 +377,11 @@ impl Seams {
         let mut u = Unfold { home: Some((r.lo, r.hi)), sides: [None; 4], storage_cx0: self.min_cx };
         for (i, face) in [Face::NegX, Face::PosX, Face::NegZ, Face::PosZ].into_iter().enumerate() {
             let a = face.axis();
-            let mut p = [centre.x, centre.y, centre.z];
-            for k in 0..3 {
-                p[k] = p[k].clamp(r.lo[k], r.hi[k] - 1);
-            }
+            // Anchor each side map at the middle of the region's side, not at the centre's
+            // projection: a conforming seam's map is one affine step along its whole length, and a
+            // fixed anchor keeps the unfold (and every worklist bucketed by it) unchanged while the
+            // centre moves within the region.
+            let mut p: [i32; 3] = std::array::from_fn(|k| r.lo[k] + (r.hi[k] - r.lo[k]) / 2);
             p[a] = if face.sign() > 0 { r.hi[a] - 1 } else { r.lo[a] };
             let Some(x) = self.across(Coord::new(p[0], p[1], p[2]), face) else { continue };
             let cols = x.remap.cols.map(|c| c.map(|v| v as i32));
@@ -867,6 +868,14 @@ mod tests {
             let real = u.unfold(v).expect("inside the neighbour chart");
             assert!(seams.in_storage(real));
             assert_eq!(u.fold(real), v);
+        }
+        // The net is a property of the region, not of where in it the centre stands: moving the
+        // centre keeps the unfold (worklists bucketed by it are not re-bucketed).
+        for (dx, dy, dz) in [(-3, 0, 5), (-40, 2, -11), (-200, -1, 90)] {
+            let elsewhere = Coord::new(c.x + dx, c.y + dy, c.z + dz);
+            if seams.region_of(elsewhere).is_some_and(|q| q.lo == r.lo && q.hi == r.hi) {
+                assert_eq!(seams.unfold_at(elsewhere), u, "centre moved by ({dx},{dy},{dz})");
+            }
         }
         // Home chunks are themselves; beyond the top and past a corner hold nothing.
         assert_eq!(u.unfold(c), Some(c));

@@ -2527,3 +2527,34 @@ fn a_warped_twin_has_air_on_its_bowed_face() {
     assert!((alt - 100.0).abs() < 1.0, "altitude on the bent grid {alt}");
     assert!(t.cosmos.in_air(top));
 }
+
+/// `cargo test --release --lib column_generation_costs -- --ignored --nocapture`: one storage
+/// column of four surface chunks on the start world's chart and on a warped twin's face.
+#[test]
+#[ignore]
+fn column_generation_costs() {
+    let (_reg, t) = make(42);
+    let mut columns = Vec::new();
+    let (sx, sz, _) = home_column(&t, Face::PosY, 1_000, 2_000);
+    columns.push(("home chart", sx, sz));
+    let twin = *t.cosmos.bodies().iter().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
+    let cosmos::Shape::Cube { half } = twin.shape else { panic!() };
+    let atlas = t.storage.atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id)).unwrap();
+    let warp = atlas.warp.as_ref().unwrap();
+    let p = warp.apply(twin.centre_f() + glam::DVec3::new(1_000.0, half as f64 + 50.0, 2_000.0));
+    let (patch, l) = atlas.find(p).unwrap();
+    let (o, _) = atlas.storage_box(patch);
+    columns.push(("twin face", (o[0] + l.x as i64) as i32, (o[2] + l.z as i64) as i32));
+    for (name, x, z) in columns {
+        let h = t.height(x, z);
+        let key = ColumnKey { face: Face::PosY, a: x.div_euclid(16), b: z.div_euclid(16) };
+        let alt = h.div_euclid(16);
+        let _ = t.generate_column(key, alt - 2..=alt + 1);
+        let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(t.generate_column(key, alt - 2..=alt + 1));
+        }
+        println!("{name}: {:.0} µs per 4-chunk column", start.elapsed().as_secs_f64() * 1e6 / reps as f64);
+    }
+}
