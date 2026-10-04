@@ -133,6 +133,11 @@ const MIN_UPLOAD_BUDGET_BYTES: usize = 256 << 10;
 /// unbounded channel drain.
 const RESULT_INTEGRATE_FLOOR: usize = 8;
 
+/// Blocks past a chart's stored top that still stream on that chart. The band ends
+/// `RELIEF` above the datum and the crust tops out at `MAX_GROUND`, so this clears
+/// three thousand blocks of flight over the highest crust.
+const CHART_FLIGHT: f64 = 2_048.0;
+
 /// Velocity-aware streaming load controller. `effort` is the one normalized
 /// signal shared by worker concurrency, queue lookahead, admission deadlines,
 /// result integration, and GPU uploads, so those stages cannot fight each
@@ -757,15 +762,16 @@ impl World {
         }
     }
 
-    /// Storage position of an eye on or above a round body, including flight up to the stream
-    /// reach above the relief. `None` on a flat world and away from every chart.
+    /// Storage position of an eye on or above a round body, including flight past the stored
+    /// top ([`CHART_FLIGHT`], wider than the stream window). `None` on a flat world and away
+    /// from every chart.
     pub(crate) fn chart_eye(&self, eye: DVec3) -> Option<DVec3> {
         if self.seams.is_empty() {
             return None;
         }
-        let reach = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64
+        let window = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64
             * CHUNK_SIZE as f64;
-        self.seams.storage_eye(eye, reach)
+        self.seams.storage_eye(eye, window.max(CHART_FLIGHT))
     }
 
     /// The point streaming stands on: the eye's storage position on (or above) a round world's
@@ -3051,12 +3057,13 @@ impl World {
     fn chart_sections(&self, center: Coord) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d);
+        let punch = self.near_draws_ground(center);
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, punch);
         let delta = self.section_vel * TAU_STREAM;
         if delta == DVec3::ZERO {
             return base;
         }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d))
+        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, punch))
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`.
@@ -3093,6 +3100,7 @@ impl World {
         seat: &super::seam::ChartSeat,
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
+        punch: bool,
     ) -> Vec<SectionPos> {
         let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
         let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
@@ -3102,7 +3110,7 @@ impl World {
         let rel = (ey as f64 - ground as f64).clamp(0.0, 1.0e7);
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
         let near = self.near_block_box(center);
-        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, None);
+        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, punch, None);
         let band = super::section::section_span(super::section::FINEST_DETAIL) as i64 * 2;
         for across in self.seams.seam_across(*seat, [ex, ey, ez], band) {
             tagged.extend(self.seat_sections(
@@ -3114,6 +3122,7 @@ impl World {
                 cfg,
                 max_d,
                 near,
+                punch,
                 Some(&across),
             ));
         }
@@ -3137,6 +3146,7 @@ impl World {
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
         near: (i64, i64, i64, i64),
+        punch: bool,
         across: Option<&super::seam::SeamAcross>,
     ) -> Vec<(SectionPos, f64)> {
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
@@ -3146,13 +3156,34 @@ impl World {
             s.body = body;
             s.face = Face::PosY;
         }
+        // Charts have no shader clip. Leave the near square to full-res chunks while they
+        // still hold the crust; once that window is sky, the far field draws the square.
         let keep = |s: SectionPos| {
-            inside_xz(s, seat.lo, seat.hi) && !covers_near(s, near, across) && super::section::section_fits(s.span(), seat.radius)
+            inside_xz(s, seat.lo, seat.hi)
+                && !(punch && covers_near(s, near, across))
+                && super::section::section_fits(s.span(), seat.radius)
         };
         coarsen_chart(radial, max_d, self.sections_allowed(), &keep)
             .into_iter()
             .map(|s| (s, section_dist2(s, ex, ez)))
             .collect()
+    }
+
+    /// Whether the full-res window still contains the crust under `center`. Storage altitude:
+    /// `surface` is the first open cell, so the solid top is the block below it.
+    fn near_draws_ground(&self, center: Coord) -> bool {
+        let cs = CHUNK_SIZE as i64;
+        let x = i64::from(center.x) * cs + cs / 2;
+        let z = i64::from(center.z) * cs + cs / 2;
+        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
+            return true;
+        };
+        let ground = self.generator.surface(Face::PosY, x, z);
+        if ground == i32::MIN {
+            return true;
+        }
+        let bottom = i64::from(self.mesh_box(center).min().y) * cs;
+        bottom <= i64::from(ground) - 1
     }
 
     /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so the

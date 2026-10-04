@@ -1643,6 +1643,203 @@ mod tests {
         ring_floor(pos, terra) * pos.cell_size()
     }
 
+    /// Storage column of a direction from the start world's centre, the embedded surface, and the
+    /// same point moved `above` blocks out along the local up (the radial). The eye is the one
+    /// [`crate::world::World::chart_eye`] would stream.
+    fn home_altitude_eye(
+        world: &crate::world::World,
+        dir: voxel_engine::DVec3,
+        above: f64,
+    ) -> (crate::coord::ChunkCoord, voxel_engine::DVec3, i32) {
+        use crate::space::atlas::Patch;
+        use crate::space::chart::{self, Map};
+        let centre = world.terrain().cosmos().expect("cosmos").home().centre_f();
+        let atlas = world
+            .terrain()
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - centre).length() < 1.0)
+            .expect("the start world is charted")
+            .clone();
+        let dir = dir.normalize();
+        let face = Face::from_dominant(dir);
+        let (tu, nn, tv) = chart::basis(face);
+        let (xi, eta) = Map::Equiangular.inverse(voxel_engine::DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv)));
+        let n = atlas.bands[0].n;
+        let step = 2.0 / n as f64;
+        let (i, j) = (((xi + 1.0) / step).floor() as i64, ((eta + 1.0) / step).floor() as i64);
+        assert!((0..n).contains(&i) && (0..n).contains(&j), "({i},{j}) leaves the {face:?} chart");
+        let patch = Patch::Shell { band: 0, face };
+        let (origin, _) = atlas.storage_box(patch);
+        let stored = atlas.storage(patch, [i, 0, j]);
+        let (sx, sz) = (stored[0] as i32, stored[2] as i32);
+        let ground = world.terrain().surface(Face::PosY, sx, sz);
+        assert_ne!(ground, i32::MIN, "{face:?} column has no surface");
+        let local_y = ground as f64 - origin[1] as f64;
+        let surf = atlas.embed(patch, voxel_engine::DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
+        let up = (surf - atlas.centre).normalize();
+        let eye = surf + up * above;
+        let storage = world.chart_eye(eye).unwrap_or_else(|| panic!("no chart eye at +{above} on {face:?}"));
+        let cs = 16.0;
+        let centre_chunk = crate::coord::ChunkCoord::new(
+            (storage.x / cs).floor() as i32,
+            (storage.y / cs).floor() as i32,
+            (storage.z / cs).floor() as i32,
+        );
+        (centre_chunk, storage, ground)
+    }
+
+    /// Drawn-tile bare columns, vertical seam gaps, and the near-box samples under the eye.
+    struct ChartFrontier {
+        bare: i32,
+        gaps: usize,
+        missing: usize,
+        under: i32,
+        under_n: i32,
+        covered: bool,
+        hash: u32,
+    }
+
+    fn frontier_counts(world: &mut crate::world::World, center: crate::coord::ChunkCoord) -> ChartFrontier {
+        use crate::world::quadtree;
+        world.adopt_fold(center);
+        let desired = world.desired_sections(center);
+        let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
+        let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
+        let tables = world.registry.hot_tables();
+        let mut tiles = Vec::with_capacity(drawn.len());
+        let mut hash = 0x811c9dc5u32;
+        let mix = |h: &mut u32, b: u8| {
+            *h ^= b as u32;
+            *h = h.wrapping_mul(0x01000193);
+        };
+        let mut order: Vec<SectionPos> = drawn.clone();
+        order.sort_by_key(|p| (p.detail, p.x, p.z));
+        for pos in &order {
+            let mesh = extract_section_mesh(*pos, world.terrain(), &[], &tables);
+            mix(&mut hash, mesh.shift);
+            for b in mesh.altitude_floor.to_le_bytes() {
+                mix(&mut hash, b);
+            }
+            for b in pos.detail.0.to_le_bytes() {
+                mix(&mut hash, b);
+            }
+            for b in pos.x.to_le_bytes() {
+                mix(&mut hash, b);
+            }
+            for b in pos.z.to_le_bytes() {
+                mix(&mut hash, b);
+            }
+            for slab in &mesh.slabs {
+                for b in slab.origin_y.to_le_bytes() {
+                    mix(&mut hash, b);
+                }
+                for p in Pass::ALL {
+                    for v in slab.data[p].vertices() {
+                        for c in v.local_pos() {
+                            for b in c.to_bits().to_le_bytes() {
+                                mix(&mut hash, b);
+                            }
+                        }
+                        mix(&mut hash, v.normal() as u8);
+                        for b in v.layer().to_le_bytes() {
+                            mix(&mut hash, b);
+                        }
+                    }
+                }
+            }
+            tiles.push(place_tile(*pos, &mesh));
+        }
+        let mut bare = 0i32;
+        for t in &tiles {
+            let cell = t.pos.cell_size();
+            let mut x = t.x0 + cell / 2;
+            while x < t.x1 {
+                let mut z = t.z0 + cell / 2;
+                while z < t.z1 {
+                    if top_at(t, x, z).is_none() {
+                        bare += 1;
+                    }
+                    z += cell;
+                }
+                x += cell;
+            }
+        }
+        let mut gaps: Vec<SeamGap> = Vec::new();
+        for i in 0..tiles.len() {
+            for j in (i + 1)..tiles.len() {
+                gaps.extend(seam_gaps(&tiles[i], &tiles[j]));
+            }
+        }
+        let missing = gaps.iter().filter(|g| g.gap > 1_000_000).count();
+        let vertical = gaps.iter().filter(|g| g.gap <= 1_000_000).count();
+        let cs = 16i32;
+        let h = world.view.horizontal;
+        let (x0, x1) = ((center.x - h) * cs, (center.x + h + 1) * cs);
+        let (z0, z1) = ((center.z - h) * cs, (center.z + h + 1) * cs);
+        let mut under = 0i32;
+        let mut under_n = 0i32;
+        let mut x = x0 + cs / 2;
+        while x < x1 {
+            let mut z = z0 + cs / 2;
+            while z < z1 {
+                under_n += 1;
+                let hit = tiles.iter().any(|t| top_at(t, x, z).is_some());
+                if !hit {
+                    under += 1;
+                }
+                z += cs;
+            }
+            x += cs;
+        }
+        let eye = ((center.x * cs + cs / 2), (center.z * cs + cs / 2));
+        let covered = desired.iter().any(|p| {
+            let (a, b) = (p.min_x(), p.min_z());
+            eye.0 >= a && eye.0 < a + p.span() && eye.1 >= b && eye.1 < b + p.span()
+        });
+        ChartFrontier { bare, gaps: vertical, missing, under, under_n, covered, hash }
+    }
+
+    fn assert_chart_closed(name: &str, f: &ChartFrontier) {
+        assert!(f.under_n > 0, "{name}: the near box was not sampled");
+        assert_eq!(f.bare, 0, "{name}: bare columns");
+        assert_eq!(f.gaps, 0, "{name}: vertical seam gaps");
+        assert_eq!(f.missing, 0, "{name}: missing tops");
+        assert_eq!(f.under, 0, "{name}: under-eye holes {}/{}", f.under, f.under_n);
+        assert!(f.covered, "{name}: no section covers the eye column");
+    }
+
+    /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
+    /// have tops, and the seams around it are closed. Spawn ground level keeps the near-box punch,
+    /// so its far-field bytes stay `0x6b15d4e5` (seed 42, diffusion, default view).
+    #[test]
+    fn far_chart_altitude_frontier_is_closed() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::World;
+        use voxel_engine::DVec3;
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let (center, storage, _) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
+        world.section_eye_y = storage.y;
+        let spawn = frontier_counts(&mut world, center);
+        assert_eq!(spawn.hash, 0x6b15d4e5, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
+        assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
+        assert_eq!(spawn.under, spawn.under_n, "spawn ground level must keep the near-box punch");
+        assert!(!spawn.covered, "spawn ground level must keep the near-box punch");
+
+        let sites = [("plus-y", DVec3::new(0.0, 1.0, 0.0)), ("highland", DVec3::new(1.0, 0.9, 0.8))];
+        for (name, dir) in sites {
+            for above in [300.0_f64, 1_500.0, 3_000.0] {
+                let (center, storage, _) = home_altitude_eye(&world, dir, above);
+                world.section_eye_y = storage.y;
+                let got = frontier_counts(&mut world, center);
+                assert_chart_closed(&format!("{name} +{above}"), &got);
+            }
+        }
+    }
+
     /// extract+mesh 16 fixed sections at detail 2, seed 42 — the gauge for the
     /// slab pack. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
