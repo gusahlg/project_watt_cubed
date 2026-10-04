@@ -30,6 +30,15 @@ impl World {
         self.gravity.sample(p)
     }
 
+    /// Whether `p` has air. A flat world is all air; a cosmos world is air within
+    /// `AIR_TOP` of the nearest body.
+    pub fn in_air(&self, p: voxel_engine::DVec3) -> bool {
+        match self.generator.cosmos() {
+            Some(cosmos) => cosmos.in_air(p),
+            None => true,
+        }
+    }
+
     /// The world's gravitational field.
     pub(crate) fn gravity(&self) -> &crate::gravity::Field {
         &self.gravity

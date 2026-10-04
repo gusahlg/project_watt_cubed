@@ -2,9 +2,11 @@
 //! collisions against the world. All speeds are expressed per second and scaled by
 //! delta time so movement is frame-rate independent.
 //!
-//! Gravity is a vector from matter (any direction, any strength). Walking acts in the plane of
-//! the collision axis — the grid axis nearest the body's up — and the collision box stands along
-//! it, so a Y-up world under `(0, −g, 0)` reproduces the classic integrator bit for bit.
+//! Gravity is a vector from matter (any direction, any strength). In air, walking acts in the
+//! plane of the collision axis — the grid axis nearest the body's up — and the collision box
+//! stands along it, so a Y-up world under `(0, −g, 0)` reproduces the classic integrator bit for
+//! bit below terminal speed. A fall already faster than terminal eases toward it. Outside the air
+//! an airborne walker free-falls: the full gravity vector, no terminal speed, no steering.
 //!
 //! Physics runs in `f64` because at large positions, `f32` steps become
 //! too small to register, causing the player to stall.
@@ -34,11 +36,12 @@ const JUMP_SPEED: f64 = 8.5 * PER_METER; // initial upward velocity of a jump
 const GROUND_ACCEL: f64 = 14.0;
 const AIR_ACCEL: f64 = 2.0;
 const FLY_ACCEL: f64 = 8.0;
-/// Fastest fall, units / second, along the collision axis. Reached well past any normal jump
-/// arc, so jump and short-fall feel are unchanged. Its real job is bounding the per-frame fall
-/// distance so collision substepping has a small, fixed worst case (a declared numerical bound,
-/// not drag).
+/// Fall speed along the collision axis that air drags toward. Below it a fall is the old
+/// integrator (the step that crosses the cap clamps onto it, so jumps are unchanged). Above it,
+/// drag eases the speed down instead of stopping it in one step. Vacuum has no cap.
 const TERMINAL_SPEED: f64 = 60.0 * PER_METER;
+/// How fast a superterminal fall in air approaches [`TERMINAL_SPEED`], per second.
+const DRAG_RATE: f64 = 2.0;
 #[cfg(test)]
 const TERMINAL_VELOCITY: f64 = -TERMINAL_SPEED;
 /// Steepest ground (between −gravity and the contact normal) that holds a standing player;
@@ -112,7 +115,8 @@ impl MoveInput {
 /// delta from input + physics, then apply it with per-axis collision resolution. Returns landing
 /// trauma in `[0, 1]` (zero when the player did not land this tick).
 pub fn update_player(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity: DVec3) -> f32 {
-    step(player, world, input, dt, gravity, WORLD_BORDER)
+    let in_air = world.in_air(player.position);
+    step(player, world, input, dt, gravity, WORLD_BORDER, in_air)
 }
 
 /// Advance a player standing in a curved patch of `atlas` (a round world): the step runs in the
@@ -125,6 +129,8 @@ pub fn update_player_in(player: &mut Player, world: &World, atlas: &crate::space
     let Some(here) = atlas.local(player.position) else {
         return update_player(player, world, input, dt, gravity);
     };
+    // Air is a property of the physical point. Storage coordinates sit outside the cosmos.
+    let in_air = world.in_air(player.position);
     let (j, ji) = (here.jacobian, here.jacobian.inverse());
     let rot = glam::DQuat::from_mat3(&here.rotation());
     let width = 0.5 * (j.x_axis.length() + j.z_axis.length());
@@ -134,7 +140,7 @@ pub fn update_player_in(player: &mut Player, world: &World, atlas: &crate::space
     player.position = here.storage;
     set_velocity(player, ji * player.velocity());
     player.orientation.frame = (rot.inverse() * player.orientation.frame).normalize();
-    let trauma = step(player, world, input, dt, ji * gravity, crate::math::CELL_LIMIT);
+    let trauma = step(player, world, input, dt, ji * gravity, crate::math::CELL_LIMIT, in_air);
     player.position = atlas.embed_storage(here.patch, player.position);
     set_velocity(player, j * player.velocity());
     player.orientation.frame = (rot * player.orientation.frame).normalize();
@@ -152,13 +158,13 @@ fn set_velocity(player: &mut Player, v: DVec3) {
 }
 
 /// One physics step inside positions bounded by `±border`.
-fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity: DVec3, border: f64) -> f32 {
+fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity: DVec3, border: f64, in_air: bool) -> f32 {
     // The one f32 -> f64 physics boundary (see the module docs).
     let dt = dt as f64;
     player.gravity = gravity;
 
     if input.toggle_fly {
-        player.cycle_fly();
+        player.toggle_fly();
     }
 
     resolve_axis(player, world);
@@ -181,6 +187,12 @@ fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity:
             *velocity = approach(*velocity, target, FLY_ACCEL, dt);
             *velocity * dt
         }
+        // Airborne in vacuum: the whole gravity vector, no terminal speed and no steering (on the
+        // ground, walking pushes against the ground, not the air, and works as anywhere).
+        Motion::Walking { velocity, on_ground: false } if !in_air => {
+            *velocity += gravity * dt;
+            *velocity * dt
+        }
         // Walking: the velocity across the collision axis chases the target (snappier on the
         // ground than in the air); the component along it is the gravity/jump integrator.
         Motion::Walking { velocity, on_ground } => {
@@ -193,11 +205,16 @@ fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity:
             let mut across = approach(across, target, rate, dt);
             let mut along = velocity[a] * s;
 
-            // Apply the jump before integrating so it takes effect this frame.
+            // Jump, then gravity. Below terminal this is the old clamp, so a normal jump is
+            // unchanged. A fall already faster than terminal eases toward it.
             if input.jump && *on_ground {
                 along = JUMP_SPEED;
             }
-            along = (along + gravity[a] * s * dt).max(-TERMINAL_SPEED);
+            along = if along < -TERMINAL_SPEED {
+                approach_scalar(along, -TERMINAL_SPEED, DRAG_RATE, dt)
+            } else {
+                (along + gravity[a] * s * dt).max(-TERMINAL_SPEED)
+            };
             // Standing on ground that is not too steep, static friction cancels the pull across
             // the contact; in the air or on a steep face it accelerates the player.
             if !(*on_ground && holds(gravity, axis)) {
@@ -285,8 +302,20 @@ fn approach(current: DVec3, target: DVec3, rate: f64, dt: f64) -> DVec3 {
     if delta.length_squared() < 1e-8 {
         return target;
     }
-    let blend = 1.0 - (-rate * dt).exp();
-    current + delta * blend
+    current + delta * approach_blend(rate, dt)
+}
+
+/// [`approach`] on one axis: the same blend and the same snap.
+fn approach_scalar(current: f64, target: f64, rate: f64, dt: f64) -> f64 {
+    let delta = target - current;
+    if delta * delta < 1e-8 {
+        return target;
+    }
+    current + delta * approach_blend(rate, dt)
+}
+
+fn approach_blend(rate: f64, dt: f64) -> f64 {
+    1.0 - (-rate * dt).exp()
 }
 
 /// Update the player's [`Stance`] from the sneak key. Crouching down is always
@@ -824,5 +853,143 @@ mod tests {
         assert!((player.position - before).length() > 5.0, "walked somewhere");
         assert!((r1 - r0).abs() < 40.0, "stayed on the ground along the curve: {r0} -> {r1}");
         assert!((player.up() - (player.position - atlas.centre).normalize()).length() < 0.05, "standing along the radius");
+    }
+
+    fn diffusion() -> World {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false)
+    }
+
+    /// Downward speed along the collision axis (positive when falling).
+    fn fall_speed(player: &Player) -> f64 {
+        let (a, s) = (player.up_axis.axis(), player.up_axis.sign() as f64);
+        -(player.velocity()[a] * s)
+    }
+
+    #[test]
+    fn f_toggles_walking_and_flying() {
+        let world = World::generate();
+        let mut player = Player::new(DVec3::new(0.5, 80.0, 0.5));
+        let mut input = idle();
+        input.toggle_fly = true;
+        for flying in [true, false, true, false] {
+            update_player(&mut player, &world, &input, 1.0 / 60.0, down());
+            assert_eq!(player.flying(), flying);
+            assert!(!player.noclip());
+        }
+    }
+
+    #[test]
+    fn spawn_jump_in_air_matches_the_old_arc() {
+        let world = diffusion();
+        let mut player = Player::new(DVec3::new(0.5, 80.0, 0.5));
+        assert!(world.in_air(player.position), "spawn is inside the air");
+        player.motion = Motion::Walking { velocity: DVec3::ZERO, on_ground: true };
+        let dt = 1.0 / 60.0;
+        let start_y = player.position.y;
+        let mut apex = start_y;
+        for frame in 0..60 {
+            let input = MoveInput { jump: frame == 0, ..idle() };
+            update_player(&mut player, &world, &input, dt as f32, down());
+            apex = apex.max(player.position.y);
+            assert!(world.in_air(player.position));
+        }
+        let dt = (dt as f32) as f64;
+        let n = 21.0_f64;
+        let expected = JUMP_SPEED * n * dt - GRAVITY * dt * dt * (n * (n + 1.0) / 2.0);
+        let jumped = apex - start_y;
+        assert!(
+            (jumped - expected).abs() < 1e-9,
+            "spawn jump changed: expected +{expected}, got +{jumped}"
+        );
+    }
+
+    #[test]
+    fn vacuum_above_the_home_face_falls_with_the_gravity() {
+        use crate::world::terrain::cosmos::{HOME_CENTRE, HOME_HALF};
+        let world = diffusion();
+        let centre = DVec3::new(HOME_CENTRE[0] as f64, HOME_CENTRE[1] as f64, HOME_CENTRE[2] as f64);
+        let start = centre + DVec3::new(HOME_HALF as f64 + 50_000.0, 0.0, 0.0);
+        assert!(!world.in_air(start), "50 000 above the +X face is vacuum");
+        let mut player = Player::new(start);
+        player.motion = Motion::Walking { velocity: DVec3::ZERO, on_ground: false };
+        // Keys and jump do nothing while falling in vacuum.
+        let input = MoveInput { move_z: 1.0, jump: true, ..idle() };
+        let dt = 1.0 / 60.0;
+        let mut sum_g = DVec3::ZERO;
+        let mut sum_mag = 0.0;
+        let mut samples = Vec::with_capacity(120);
+        for _ in 0..120 {
+            let g = world.gravity_at(player.position).accel;
+            samples.push(g);
+            sum_g += g;
+            sum_mag += g.length();
+            update_player(&mut player, &world, &input, dt as f32, g);
+        }
+        let speed = player.velocity().length();
+        let integrated = sum_mag * dt;
+        assert!(
+            (speed - integrated).abs() <= 0.01 * integrated,
+            "speed {speed} vs Σ|g|·dt {integrated}"
+        );
+        let aim = player.velocity().normalize();
+        for g in &samples {
+            let cos = aim.dot(g.normalize()).clamp(-1.0, 1.0);
+            assert!(cos.acos() < 2.0_f64.to_radians(), "velocity left the pull by {}°", cos.acos().to_degrees());
+        }
+        assert!(aim.dot(sum_g.normalize()) > (2.0_f64.to_radians()).cos());
+        assert!(
+            (player.position - centre).length() < (start - centre).length(),
+            "fell toward the cube"
+        );
+        assert!(!player.flying());
+    }
+
+    #[test]
+    fn a_fall_from_space_drags_toward_terminal_in_the_air() {
+        let world = diffusion();
+        let start = DVec3::new(0.5, 30_000.0, 0.5);
+        assert!(!world.in_air(start), "30 000 above the top face is vacuum");
+        let mut player = Player::new(start);
+        let dt = 1.0_f32 / 60.0;
+        let dt64 = dt as f64;
+        for _ in 0..8_000 {
+            if world.in_air(player.position) {
+                break;
+            }
+            let g = world.gravity_at(player.position).accel;
+            update_player(&mut player, &world, &idle(), dt, g);
+        }
+        assert!(world.in_air(player.position), "the fall must reach the air");
+        let entry = fall_speed(&player);
+        assert!(entry > TERMINAL_SPEED * 2.0, "arrived from space fast, got {entry}");
+
+        let factor = (-DRAG_RATE * dt64).exp();
+        let mut speed = entry;
+        let mut eased = false;
+        for _ in 0..8_000 {
+            let before = fall_speed(&player);
+            if before <= TERMINAL_SPEED + 1.0 {
+                eased = true;
+                speed = before;
+                break;
+            }
+            let g = world.gravity_at(player.position).accel;
+            update_player(&mut player, &world, &idle(), dt, g);
+            assert!(world.in_air(player.position), "still in the air while slowing");
+            let after = fall_speed(&player);
+            let excess = before - TERMINAL_SPEED;
+            let next = after - TERMINAL_SPEED;
+            assert!(after < before, "downward speed should fall: {before} -> {after}");
+            assert!(
+                next + 1e-4 >= excess * factor,
+                "excess {excess} -> {next} dropped past exp(-DRAG_RATE·dt)"
+            );
+            speed = after;
+        }
+        assert!(eased, "never neared terminal, last speed {speed}");
+        assert!(speed < entry, "moved toward terminal: {entry} -> {speed}");
+        assert!(speed <= TERMINAL_SPEED + 1.0);
     }
 }

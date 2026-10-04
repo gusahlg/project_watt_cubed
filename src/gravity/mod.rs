@@ -6,6 +6,7 @@ mod field;
 mod kernel;
 mod ledger;
 mod oracle;
+pub mod relief;
 mod shape;
 
 use glam::{DMat3, DVec3};

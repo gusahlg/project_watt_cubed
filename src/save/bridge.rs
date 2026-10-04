@@ -298,13 +298,12 @@ pub fn from_doc(
         player.orientation.frame = doc.player.frame;
         player.up_axis = Face::from_index(doc.player.up).unwrap_or(Face::PosY);
     }
-    if doc.player.flying {
+    if doc.player.noclip {
+        player.toggle_noclip();
+    } else if doc.player.flying {
         player.set_flying(true);
-        if doc.player.noclip {
-            player.cycle_fly();
-        }
     }
-    // `set_flying` / `cycle_fly` zero the component along up. Write the saved velocity after.
+    // `set_flying` / `toggle_noclip` zero the component along up. Write the saved velocity after.
     let saved = DVec3::from_array(doc.player.velocity);
     match &mut player.motion {
         Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = saved,

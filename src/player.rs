@@ -192,15 +192,20 @@ impl Player {
         };
     }
 
-    /// Advance the flight state one step in the cycle
-    /// walking → flying → flying+noclip → walking, carrying horizontal momentum
-    /// across each switch (vertical is cleared, as in [`Player::set_flying`]).
-    pub fn cycle_fly(&mut self) {
+    /// Toggle walking and ordinary flight. Never enters noclip. Momentum across the ground
+    /// carries over; the component along up is cleared, as in [`Player::set_flying`].
+    pub fn toggle_fly(&mut self) {
+        self.set_flying(!self.flying());
+    }
+
+    /// Toggle noclip flight: from walking or ordinary flight into noclip, and from noclip back
+    /// to walking. Same velocity carry as [`Player::set_flying`].
+    pub fn toggle_noclip(&mut self) {
         let velocity = self.level_velocity();
-        self.motion = match self.motion {
-            Motion::Flying { noclip: false, .. } => Motion::Flying { velocity, noclip: true },
-            Motion::Flying { noclip: true, .. } => Motion::Walking { velocity, on_ground: false },
-            Motion::Walking { .. } => Motion::Flying { velocity, noclip: false },
+        self.motion = if self.noclip() {
+            Motion::Walking { velocity, on_ground: false }
+        } else {
+            Motion::Flying { velocity, noclip: true }
         };
     }
 
@@ -305,5 +310,33 @@ mod tests {
         loose.stand_in(DVec3::new(0.0, -0.01, 0.0));
         assert_eq!(loose.orientation.frame, DQuat::IDENTITY);
         assert_eq!(loose.up_axis, Face::PosY);
+    }
+
+    #[test]
+    fn fly_toggles_walking_and_flying_and_keeps_level_speed() {
+        let mut player = Player::new(DVec3::ZERO);
+        player.motion = Motion::Walking { velocity: DVec3::new(3.0, -9.0, 4.0), on_ground: true };
+        player.toggle_fly();
+        assert!(player.flying());
+        assert!(!player.noclip());
+        assert_eq!(player.velocity(), DVec3::new(3.0, 0.0, 4.0));
+        player.toggle_fly();
+        assert!(!player.flying());
+        assert_eq!(player.velocity(), DVec3::new(3.0, 0.0, 4.0));
+    }
+
+    #[test]
+    fn noclip_toggles_from_walking_or_flying_back_to_walking() {
+        let mut player = Player::new(DVec3::ZERO);
+        player.toggle_noclip();
+        assert!(player.noclip());
+        player.toggle_noclip();
+        assert!(!player.flying());
+
+        player.set_flying(true);
+        player.toggle_noclip();
+        assert!(player.noclip());
+        player.toggle_noclip();
+        assert!(!player.flying());
     }
 }

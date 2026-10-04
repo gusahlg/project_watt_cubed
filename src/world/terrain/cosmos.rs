@@ -24,6 +24,8 @@ pub const HOME_CENTRE: [i64; 3] = [0, -HOME_RADIUS, 0];
 pub const BULK_DENSITY: f64 = 5.0;
 /// Most a generated surface rises above (or sinks below) its datum.
 pub const RELIEF: i64 = 2_048;
+/// Air extends this far above a body's datum. Higher, and between bodies, is vacuum.
+pub const AIR_TOP: f64 = 20_000.0;
 
 /// Edge of a cluster cell (2^24 blocks).
 const CELL: i64 = 1 << 24;
@@ -47,6 +49,20 @@ pub enum Kind {
     Ember,
     /// A moon.
     Moon,
+}
+
+impl Kind {
+    /// Catalog name, lower case.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Home => "home",
+            Kind::Twin => "twin",
+            Kind::Verdant => "verdant",
+            Kind::Hollow => "hollow",
+            Kind::Ember => "ember",
+            Kind::Moon => "moon",
+        }
+    }
 }
 
 /// A body's solid geometry (its datum surface; relief rides on top).
@@ -424,6 +440,11 @@ impl Cosmos {
             .iter()
             .filter(|b| (b.centre_f() - p).length() <= b.reach() * 1.5)
             .min_by(|a, b| a.altitude(p).abs().total_cmp(&b.altitude(p).abs()))
+    }
+
+    /// Whether `p` is in air: a nearest body exists and its altitude is at most [`AIR_TOP`].
+    pub fn in_air(&self, p: DVec3) -> bool {
+        self.body_at(p).is_some_and(|body| body.altitude(p) <= AIR_TOP)
     }
 
     /// Open air inside a Hollow: within the inner surface and outside its Ember.
@@ -808,6 +829,18 @@ mod tests {
             }
         }
         assert!(!a.clusters.is_empty());
+    }
+
+    #[test]
+    fn air_stops_at_air_top_and_open_space_is_vacuum() {
+        let cosmos = Cosmos::new(1, 1.0);
+        let home = cosmos.home().centre_f();
+        let half = HOME_HALF as f64;
+        assert!(cosmos.in_air(home + DVec3::new(0.0, half + 80.0, 0.0)));
+        assert!(!cosmos.in_air(home + DVec3::new(0.0, half + AIR_TOP + 1.0, 0.0)));
+        let empty = DVec3::new(0.0, 0.0, 9.95e8);
+        assert!(cosmos.body_at(empty).is_none());
+        assert!(!cosmos.in_air(empty));
     }
 
     #[test]

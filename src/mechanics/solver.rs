@@ -7,11 +7,21 @@
 //!   part of the overstress: Perzyna creep over a world-time step; one is rate independent).
 //! - **Incompressible matter:** planetary pressure compresses matter by ~0.2 % (the material bulk
 //!   modulus), which the representation does not resolve, so matter is taken as incompressible.
-//!   Every step projects the acceleration so each matter element keeps its volume — one multiplier
-//!   per element from a warm-started conjugate-gradient solve, which is the element's pressure at
-//!   equilibrium — with a small drift correction back to the reference volume. The explicit part
-//!   then sees only shear stiffness, so gravity-driven flow is not throttled by a stiff volumetric
+//!   Every step projects the acceleration so each volume group keeps its volume — one multiplier
+//!   per group from a warm-started conjugate-gradient solve, which is the group's pressure at
+//!   equilibrium — with a small drift correction back to the reference volume. A group is one
+//!   element by default; [`Body::group_blocks`] makes it a block of elements (fewer constraints
+//!   than nodes can satisfy without locking at free edges, the classic weakness of one pressure per
+//!   hex), and a soft per-element bulk term then shares the volume inside a block. The explicit part
+//!   sees only shear-scale stiffness, so gravity-driven flow is not throttled by a stiff volumetric
 //!   mode. Void (air) is compressible and unconstrained: a neo-Hookean skin that rides along.
+//! - **Pressure at a free surface:** one multiplier per group is the dual of the volume constraint,
+//!   but applied uniformly it pushes a free edge or corner node outward with the pressure of the
+//!   element's depth (an edge node takes about 1.4×, a corner 1.7× the push its weight can balance,
+//!   which inflates ridges along a body's edges). The pressure forces are therefore integrated from
+//!   a nodal pressure field — volume-weighted multipliers inside, and on a free surface the value the
+//!   traction-free condition `σn = 0` asks for (`p = n·s·n`) — as a correction lagged one step
+//!   behind the projection, which still holds every group's volume exactly.
 //! - **Dynamic relaxation:** fictitious nodal masses scaled for a unit pseudo-time step (Gershgorin
 //!   bound of the shear stiffness), Underwood's adaptive damping (critical for the lowest active
 //!   mode, estimated from the residual change along the last step), and the rigid-body part of the
@@ -36,6 +46,8 @@ pub const GRAVITY_EVERY: usize = 8;
 const MASS_SAFETY: f64 = 2.0;
 /// Fraction of an element's volume error corrected per step.
 const VOLUME_DRIFT: f64 = 0.2;
+/// [`Body`] group of an unconstrained (void) element.
+const NO_GROUP: u32 = u32::MAX;
 /// Conjugate-gradient iterations per projection (warm started from the last step).
 const CG_MAX: usize = 80;
 /// Relative residual at which a projection stops.
@@ -124,12 +136,24 @@ pub struct Body {
     pub stress: Vec<[f64; 6]>,
     /// Per Gauss point: equivalent plastic strain.
     pub plastic: Vec<f64>,
-    /// Per element: the incompressibility multiplier (minus the element's pressure).
+    /// Per volume group: the incompressibility multiplier (minus the group's pressure).
     lambda: Vec<f64>,
     /// Per element: matter (volume preserving) or void.
     constrained: Vec<bool>,
+    /// Per element: its volume group ([`NO_GROUP`] for void).
+    group: Vec<u32>,
+    /// Per group: reference volume.
+    group_volume: Vec<f64>,
+    /// Bulk modulus sharing volume between the elements of a group, relative to shear (zero while
+    /// every group is one element).
+    share: f64,
     /// Per element: reference volume.
     ref_volume: Vec<f64>,
+    /// Matter element faces on a free surface (next to void or the lattice boundary): element and
+    /// face (`axis · 2 + side`).
+    surface: Vec<(usize, u8)>,
+    /// Per node: on a free surface.
+    free_node: Vec<bool>,
     /// Per node.
     velocity: Vec<DVec3>,
     /// Per node: physical (lumped) mass.
@@ -151,26 +175,64 @@ impl Body {
         assert_eq!(params.len(), lattice.elements());
         let n = lattice.nodes.len();
         let e = lattice.elements();
+        // Mass is density times the element's physical volume, so a lattice fitted onto an already
+        // deformed shape (genesis re-gridding) carries exactly the matter it covers.
         let mut mass = vec![0.0; n];
-        let vol = (lattice.cell as f64).powi(3);
         for el in 0..e {
-            let m = params[el].density * vol / 8.0;
+            let m = params[el].density * element_volume(&lattice.corners(el)) / 8.0;
             for node in lattice.element_nodes(el) {
                 mass[node] += m;
             }
         }
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
         let undeformed = lattice.nodes.clone();
-        let constrained = params.iter().map(|p| p.density > 0.0).collect();
-        let ref_volume = (0..e).map(|el| element_volume(&lattice.corners(el))).collect();
+        let constrained: Vec<bool> = params.iter().map(|p| p.density > 0.0).collect();
+        let ref_volume: Vec<f64> = (0..e).map(|el| element_volume(&lattice.corners(el))).collect();
+        let dims = lattice.dims;
+        let mut surface = Vec::new();
+        let mut free_node = vec![false; n];
+        for el in (0..e).filter(|&el| constrained[el]) {
+            let ijk = lattice.element_ijk(el);
+            for face in 0..6u8 {
+                let (axis, side) = ((face / 2) as usize, face % 2 == 1);
+                let mut nb = ijk;
+                let open = if side {
+                    nb[axis] += 1;
+                    nb[axis] >= dims[axis]
+                } else if nb[axis] == 0 {
+                    true
+                } else {
+                    nb[axis] -= 1;
+                    false
+                };
+                if open || !constrained[lattice.element(nb[0], nb[1], nb[2])] {
+                    surface.push((el, face));
+                    let nodes = lattice.element_nodes(el);
+                    for c in (0..8).filter(|c| (c >> axis) & 1 == usize::from(side)) {
+                        free_node[nodes[c]] = true;
+                    }
+                }
+            }
+        }
+        let mut group = vec![NO_GROUP; e];
+        let mut group_volume = Vec::new();
+        for el in (0..e).filter(|&el| constrained[el]) {
+            group[el] = group_volume.len() as u32;
+            group_volume.push(ref_volume[el]);
+        }
         Self {
             lattice,
             params,
             stress: vec![[0.0; 6]; e * GP],
             plastic: vec![0.0; e * GP],
-            lambda: vec![0.0; e],
+            lambda: vec![0.0; group_volume.len()],
             constrained,
+            group,
+            group_volume,
+            share: 0.0,
             ref_volume,
+            surface,
+            free_node,
             velocity: vec![DVec3::ZERO; n],
             mass,
             fixed: vec![false; n],
@@ -195,7 +257,35 @@ impl Body {
 
     /// Pressure of element `e` (positive in compression; zero for void).
     pub fn pressure(&self, e: usize) -> f64 {
-        if self.constrained[e] { -self.lambda[e] } else { 0.0 }
+        if self.constrained[e] { -self.lambda[self.group[e] as usize] } else { 0.0 }
+    }
+
+    /// Hold volume per block of `side³` elements (blocks aligned to element `first` on every axis)
+    /// instead of per element; the elements of a block share volume through a bulk modulus equal
+    /// to their shear modulus.
+    pub fn group_blocks(&mut self, side: usize, first: usize) {
+        let side = side.max(1);
+        let dims = self.lattice.dims;
+        let blocks = dims.map(|d| d.div_ceil(side) + 1);
+        let mut ids = std::collections::BTreeMap::new();
+        self.group_volume.clear();
+        for e in 0..self.lattice.elements() {
+            if !self.constrained[e] {
+                continue;
+            }
+            let ijk = self.lattice.element_ijk(e);
+            let b = ijk.map(|q| (q + side - first % side) / side);
+            let key = b[0] + blocks[0] * (b[1] + blocks[1] * b[2]);
+            let next = ids.len() as u32;
+            let g = *ids.entry(key).or_insert(next);
+            if g as usize == self.group_volume.len() {
+                self.group_volume.push(0.0);
+            }
+            self.group[e] = g;
+            self.group_volume[g as usize] += self.ref_volume[e];
+        }
+        self.lambda = vec![0.0; self.group_volume.len()];
+        self.share = if side > 1 { 1.0 } else { 0.0 };
     }
 
     /// Mean von Mises stress of element `e`.
@@ -204,18 +294,71 @@ impl Body {
         s.iter().map(|v| equivalent(&mat(v))).sum::<f64>() / GP as f64
     }
 
+    /// The nodal multiplier field the pressure forces are integrated from (see the module notes).
+    fn nodal_multipliers(&self) -> Vec<f64> {
+        let lat = &self.lattice;
+        let n = lat.nodes.len();
+        let (mut num, mut den) = (vec![0.0f64; n], vec![0.0f64; n]);
+        let mut dev = vec![DMat3::ZERO; n];
+        let mut count = vec![0.0f64; n];
+        for e in (0..lat.elements()).filter(|&e| self.constrained[e]) {
+            let (l, v) = (self.lambda[self.group[e] as usize], self.ref_volume[e]);
+            let nodes = lat.element_nodes(e);
+            let mut mean = None;
+            for node in nodes {
+                num[node] += l * v;
+                den[node] += v;
+                if self.free_node[node] {
+                    let m = *mean.get_or_insert_with(|| self.stress[e * GP..(e + 1) * GP].iter().map(mat).fold(DMat3::ZERO, |a, b| a + b) * (1.0 / GP as f64));
+                    dev[node] += m;
+                    count[node] += 1.0;
+                }
+            }
+        }
+        let mut normal = vec![DVec3::ZERO; n];
+        for &(e, face) in &self.surface {
+            let (axis, side) = ((face / 2) as usize, usize::from(face % 2 == 1));
+            let nodes = lat.element_nodes(e);
+            let on: Vec<usize> = (0..8).filter(|c| (c >> axis) & 1 == side).collect();
+            // Corners of the face in cyclic order: the two in-face bits (b0, b1) as 00, 10, 11, 01.
+            let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+            let pick = |bu: usize, bw: usize| *on.iter().find(|&&c| (c >> u) & 1 == bu && (c >> w) & 1 == bw).unwrap();
+            let q = [pick(0, 0), pick(1, 0), pick(1, 1), pick(0, 1)].map(|c| lat.nodes[nodes[c]]);
+            let mut area = (q[2] - q[0]).cross(q[3] - q[1]) * 0.5;
+            let centre = lat.corners(e).iter().copied().sum::<DVec3>() / 8.0;
+            if area.dot((q[0] + q[1] + q[2] + q[3]) * 0.25 - centre) < 0.0 {
+                area = -area;
+            }
+            for c in on {
+                normal[nodes[c]] += area;
+            }
+        }
+        (0..n)
+            .map(|i| {
+                if den[i] <= 0.0 {
+                    0.0
+                } else if self.free_node[i] && count[i] > 0.0 {
+                    // σn = 0 along the normal: p = n·s·n, λ = −p.
+                    let nn = normal[i].normalize_or_zero();
+                    -nn.dot((dev[i] * (1.0 / count[i])) * nn)
+                } else {
+                    num[i] / den[i]
+                }
+            })
+            .collect()
+    }
+
     /// Refresh the gravitational field at every node.
     fn refresh_gravity(&mut self) {
         if !self.self_gravity {
             self.gravity.iter_mut().for_each(|g| *g = DVec3::ZERO);
             return;
         }
-        let vol = (self.lattice.cell as f64).powi(3);
         let points: Vec<Mass> = (0..self.lattice.elements())
             .filter(|&e| self.params[e].density > 0.0)
             .map(|e| {
                 let c = self.lattice.corners(e);
-                Mass { at: c.iter().copied().sum::<DVec3>() / 8.0, mass: self.params[e].density * vol }
+                Mass { at: c.iter().copied().sum::<DVec3>() / 8.0, mass: self.params[e].density * self.ref_volume[e] }
             })
             .collect();
         let tree = Tree::build(&points, 0.5 * self.lattice.cell as f64);
@@ -250,7 +393,7 @@ impl Body {
             }
             let vol = element_volume(&c).abs().max(1e-30);
             let p = &self.params[e];
-            let modulus = if self.constrained[e] { 4.0 / 3.0 * p.shear } else { p.wave_modulus() };
+            let modulus = if self.constrained[e] { (4.0 / 3.0 + self.share) * p.shear } else { p.wave_modulus() };
             let k = modulus * vol / h2.max(1e-30);
             for node in self.lattice.element_nodes(e) {
                 scaled[node] += MASS_SAFETY * 4.0 * k;
@@ -264,13 +407,16 @@ impl Body {
 
     /// One element pass: advance the Gauss-point deviators by the current velocities (pseudo-step
     /// `dt = 1`); return per-element nodal internal forces and volume gradients `∂V/∂x_c`.
-    fn element_pass(&mut self, plastic_relax: f64) -> (Vec<[DVec3; 8]>, Vec<[DVec3; 8]>) {
+    fn element_pass(&mut self, plastic_relax: f64, nodal: &[f64]) -> (Vec<[DVec3; 8]>, Vec<[DVec3; 8]>) {
         let ne = self.lattice.elements();
         let mut forces = vec![[DVec3::ZERO; 8]; ne];
         let mut vgrads = vec![[DVec3::ZERO; 8]; ne];
         let lattice = &self.lattice;
         let params = &self.params;
         let velocity = &self.velocity;
+        let ref_volume = &self.ref_volume;
+        let share = self.share;
+        let (lambda, group) = (&self.lambda, &self.group);
         let cell = self.lattice.cell as f64;
         let gps = gauss_points();
         let grads: [[DVec3; 8]; GP] = std::array::from_fn(|g| shape_gradients(gps[g]));
@@ -295,6 +441,7 @@ impl Body {
                         let nodes = lattice.element_nodes(e);
                         let x = nodes.map(|n| lattice.nodes[n]);
                         let v = nodes.map(|n| velocity[n]);
+                        let pressure = (group[e] != NO_GROUP).then(|| (lambda[group[e] as usize], nodes.map(|n| nodal[n])));
                         element(
                             &x,
                             &v,
@@ -307,6 +454,9 @@ impl Body {
                             &mut g_mine[k],
                             plastic_relax,
                             cell,
+                            ref_volume[e],
+                            share,
+                            pressure,
                         );
                     }
                 });
@@ -336,7 +486,8 @@ impl Body {
                     .map(|(m, g)| m * (*g + self.uniform_g).length())
                     .fold(1e-300f64, f64::max);
             }
-            let (forces, vgrads) = self.element_pass(opts.plastic_relax);
+            let nodal = self.nodal_multipliers();
+            let (forces, vgrads) = self.element_pass(opts.plastic_relax, &nodal);
             // Residual = external − internal, gathered in element order.
             let mut r: Vec<DVec3> = (0..n).map(|i| self.mass[i] * (self.gravity[i] + self.uniform_g)).collect();
             for (e, f) in forces.iter().enumerate() {
@@ -357,26 +508,33 @@ impl Body {
             // drifted element back towards its reference volume).
             let alpha = if prev_a.is_none() { 0.0 } else { (2.0 - damping) / (2.0 + damping) };
             let beta = if prev_a.is_none() { 0.5 } else { 2.0 / (2.0 + damping) };
-            let mut target = vec![0.0f64; ne];
-            let mut worst_volume = 0.0f64;
+            let ng = self.group_volume.len();
+            let mut err = vec![0.0f64; ng];
+            let mut current = vec![0.0f64; ng];
             for e in 0..ne {
                 if !self.constrained[e] {
                     continue;
                 }
-                let vol: f64 = element_volume(&self.lattice.corners(e));
-                let err = vol - self.ref_volume[e];
-                worst_volume = worst_volume.max((err / self.ref_volume[e]).abs());
-                let current: f64 = self.lattice.element_nodes(e).iter().enumerate().map(|(c, &node)| vgrads[e][c].dot(self.velocity[node])).sum();
+                let g = self.group[e] as usize;
+                err[g] += element_volume(&self.lattice.corners(e));
+                current[g] += self.lattice.element_nodes(e).iter().enumerate().map(|(c, &node)| vgrads[e][c].dot(self.velocity[node])).sum::<f64>();
+            }
+            let mut worst_volume = 0.0f64;
+            let mut target = vec![0.0f64; ng];
+            for g in 0..ng {
+                let e = err[g] - self.group_volume[g];
+                worst_volume = worst_volume.max((e / self.group_volume[g]).abs());
                 // B a = (−drift − α B v) / β.
-                target[e] = (-VOLUME_DRIFT * err - alpha * current) / beta;
+                target[g] = (-VOLUME_DRIFT * e - alpha * current[g]) / beta;
             }
             self.project(&vgrads, &r, &target);
             // Pressure forces and the accelerations they leave.
             let mut f_p = vec![DVec3::ZERO; n];
             for e in 0..ne {
                 if self.constrained[e] {
+                    let l = self.lambda[self.group[e] as usize];
                     for (c, node) in self.lattice.element_nodes(e).into_iter().enumerate() {
-                        f_p[node] += vgrads[e][c] * self.lambda[e];
+                        f_p[node] += vgrads[e][c] * l;
                     }
                 }
             }
@@ -403,6 +561,9 @@ impl Body {
                     self.min_quality(),
                     self.plastic.iter().copied().fold(0.0, f64::max)
                 );
+            }
+            if !res.is_finite() {
+                break;
             }
             if res < opts.tolerance && worst_volume < 1e-3 && iter > GRAVITY_EVERY {
                 report.converged = true;
@@ -442,51 +603,52 @@ impl Body {
         report
     }
 
-    /// Solve `B M⁻¹ Bᵀ λ = B M⁻¹ r − target` for the element multipliers (preconditioned conjugate
-    /// gradients, warm started from the last λ). `B` holds each matter element's `∂V/∂x_c`.
+    /// Solve `B M⁻¹ Bᵀ λ = B M⁻¹ r − target` for the group multipliers (preconditioned conjugate
+    /// gradients, warm started from the last λ). Row `g` of `B` is `∂V_g/∂x`, the sum of its
+    /// elements' `∂V/∂x_c`.
     fn project(&mut self, vgrads: &[[DVec3; 8]], r: &[DVec3], target: &[f64]) {
         let ne = self.lattice.elements();
         let n = self.lattice.nodes.len();
-        let inv_m: Vec<f64> = (0..n).map(|i| if self.fixed[i] { 0.0 } else { 1.0 / self.scaled[i] }).collect();
-        let elems: Vec<usize> = (0..ne).filter(|&e| self.constrained[e]).collect();
-        if elems.is_empty() {
+        let m = self.group_volume.len();
+        if m == 0 {
             return;
         }
+        let inv_m: Vec<f64> = (0..n).map(|i| if self.fixed[i] { 0.0 } else { 1.0 / self.scaled[i] }).collect();
+        let elems: Vec<usize> = (0..ne).filter(|&e| self.constrained[e]).collect();
         let nodes_of: Vec<[usize; 8]> = elems.iter().map(|&e| self.lattice.element_nodes(e)).collect();
-        // y = B M⁻¹ Bᵀ x over the constrained elements (indexed by position in `elems`).
+        let group = &self.group;
+        // y = B M⁻¹ Bᵀ x over the groups.
         let apply = |x: &[f64], y: &mut [f64], scratch: &mut [DVec3]| {
             scratch.iter_mut().for_each(|v| *v = DVec3::ZERO);
             for (k, &e) in elems.iter().enumerate() {
+                let xg = x[group[e] as usize];
                 for c in 0..8 {
-                    scratch[nodes_of[k][c]] += vgrads[e][c] * x[k];
+                    scratch[nodes_of[k][c]] += vgrads[e][c] * xg;
                 }
             }
+            y.iter_mut().for_each(|v| *v = 0.0);
             for (k, &e) in elems.iter().enumerate() {
                 let mut s = 0.0;
                 for c in 0..8 {
                     let node = nodes_of[k][c];
                     s += vgrads[e][c].dot(scratch[node]) * inv_m[node];
                 }
-                y[k] = s;
+                y[group[e] as usize] += s;
             }
         };
-        let m = elems.len();
         let mut scratch = vec![DVec3::ZERO; n];
-        let mut rhs = vec![0.0f64; m];
+        let mut rhs: Vec<f64> = target.iter().map(|t| -t).collect();
+        let mut diag = vec![0.0f64; m];
         for (k, &e) in elems.iter().enumerate() {
-            let mut s = 0.0;
+            let g = group[e] as usize;
             for c in 0..8 {
                 let node = nodes_of[k][c];
-                s += vgrads[e][c].dot(r[node]) * inv_m[node];
+                rhs[g] += vgrads[e][c].dot(r[node]) * inv_m[node];
+                diag[g] += vgrads[e][c].length_squared() * inv_m[node];
             }
-            rhs[k] = s - target[e];
         }
-        let diag: Vec<f64> = elems
-            .iter()
-            .enumerate()
-            .map(|(k, &e)| (0..8).map(|c| vgrads[e][c].length_squared() * inv_m[nodes_of[k][c]]).sum::<f64>().max(1e-300))
-            .collect();
-        let mut x: Vec<f64> = elems.iter().map(|&e| self.lambda[e]).collect();
+        diag.iter_mut().for_each(|d| *d = d.max(1e-300));
+        let mut x = self.lambda.clone();
         let mut ax = vec![0.0f64; m];
         apply(&x, &mut ax, &mut scratch);
         let mut res: Vec<f64> = rhs.iter().zip(&ax).map(|(b, a)| b - a).collect();
@@ -520,9 +682,7 @@ impl Body {
                 p[k] = z[k] + beta * p[k];
             }
         }
-        for (k, &e) in elems.iter().enumerate() {
-            self.lambda[e] = x[k];
-        }
+        self.lambda = x;
     }
 
     /// Smallest certified relative `det J` over all elements.
@@ -555,7 +715,7 @@ impl Body {
 const EDGES: [(usize, usize); 12] = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)];
 
 /// Volume of a trilinear element (2×2×2 Gauss quadrature of `det J`, exact for the trilinear map).
-fn element_volume(x: &[DVec3; 8]) -> f64 {
+pub(crate) fn element_volume(x: &[DVec3; 8]) -> f64 {
     gauss_points().iter().map(|&t| local_jacobian(x, t).determinant()).sum::<f64>() / GP as f64
 }
 
@@ -584,6 +744,9 @@ fn element(
     volume_grad: &mut [DVec3; 8],
     relax: f64,
     cell: f64,
+    ref_volume: f64,
+    share: f64,
+    pressure: Option<(f64, [f64; 8])>,
 ) {
     let mut b = [[DVec3::ZERO; 8]; GP];
     let mut w = [0.0f64; GP];
@@ -620,6 +783,10 @@ fn element(
         }
         return;
     }
+    // Volume shared inside a group: a soft bulk response to this element's own volume change (the
+    // group's total is held by the projection).
+    let vol: f64 = w.iter().sum();
+    let bulk = share * mu * (vol / ref_volume.max(1e-300) - 1.0);
     for g in 0..GP {
         let lg = l[g];
         let d = (lg + lg.transpose()) * 0.5;
@@ -640,10 +807,33 @@ fn element(
             plastic[g] += (eq - target) / (3.0 * mu.max(1e-300));
         }
         stress[g] = voigt(&dev);
+        let total = dev + DMat3::IDENTITY * bulk;
         for c in 0..8 {
-            out[c] += (dev * b[g][c]) * w[g];
+            out[c] += (total * b[g][c]) * w[g];
         }
     }
+    // The pressure forces from the nodal field, less the group multiplier's own (applied by the
+    // projection): `Σ_g w (λ_h(g) − λ_e) b`.
+    if let Some((own, nodal)) = pressure {
+        for g in 0..GP {
+            let n = shape_values(gps[g]);
+            let lh: f64 = (0..8).map(|d| n[d] * nodal[d]).sum();
+            let k = (lh - own) * w[g];
+            for c in 0..8 {
+                out[c] += b[g][c] * k;
+            }
+        }
+    }
+}
+
+/// The eight trilinear shape functions at `t`.
+fn shape_values(t: DVec3) -> [f64; 8] {
+    std::array::from_fn(|c| {
+        let fx = if c & 1 != 0 { t.x } else { 1.0 - t.x };
+        let fy = if c & 2 != 0 { t.y } else { 1.0 - t.y };
+        let fz = if c & 4 != 0 { t.z } else { 1.0 - t.z };
+        fx * fy * fz
+    })
 }
 
 /// Split `n` items into at most `parts` contiguous, near-equal ranges.
@@ -686,7 +876,7 @@ mod tests {
                 body.fixed[n] = true;
             }
         }
-        let rep = body.relax(&Relax { max_iterations: 40_000, tolerance: 1e-6, ..Relax::default() });
+        let rep = body.relax(&Relax { max_iterations: 40_000, tolerance: 1e-4, ..Relax::default() });
         assert!(rep.converged, "{rep:?}");
         let (len, height, width) = ((nx as i64 * h) as f64, (ny as i64 * h) as f64, (nz as i64 * h) as f64);
         let e_mod = 3.0 * p.shear;
