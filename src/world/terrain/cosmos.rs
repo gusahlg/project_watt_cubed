@@ -772,6 +772,16 @@ impl Cosmos {
         }
     }
 
+    /// Relaxed datum offset at a face centre. Zero without a relaxed datum.
+    pub fn face_offset(&self, b: &Body) -> f64 {
+        self.surface_offset(b, b.centre_f() + DVec3::Y)
+    }
+
+    /// Relaxed datum offset toward a corner. Zero without a relaxed datum.
+    pub fn corner_offset(&self, b: &Body) -> f64 {
+        self.surface_offset(b, b.centre_f() + DVec3::ONE)
+    }
+
     /// Altitude of `p` above body `b`'s relaxed surface datum (its [`Body::altitude`] for a body
     /// without a relaxed datum).
     pub fn altitude(&self, b: &Body, p: DVec3) -> f64 {

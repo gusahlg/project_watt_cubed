@@ -255,7 +255,7 @@ fn radius_of(body: &Body) -> f64 {
 }
 
 /// How far a round body's impostor sinks below its datum (under its valleys; moons' big craters
-/// go deeper): standing on the body, the sphere fills the horizon beyond the streamed chunks
+/// go deeper). Standing on the body, the impostor fills the horizon beyond the streamed chunks
 /// without covering them (the sky pass draws only where no terrain was drawn). Round bodies have no
 /// far LOD of their own yet; cubes do, so theirs hide while streamed.
 fn sink(body: &Body) -> Option<f64> {
@@ -266,16 +266,46 @@ fn sink(body: &Body) -> Option<f64> {
     }
 }
 
-/// [`sink`] below a relaxed body's lowest datum offset, so the sphere stays under its lowlands.
+/// [`sink`] below a relaxed body's lowest datum offset, so a sphere stays under its lowlands.
 fn sink_in(cosmos: &Cosmos, body: &Body) -> Option<f64> {
     sink(body).map(|s| s - cosmos.relief_range(body).0.min(0.0))
+}
+
+/// Exponent of the superellipsoid whose corner/face radius ratio is `k`.
+fn rounded_exponent(k: f64) -> f32 {
+    if !(k > 1.0) {
+        return 2.0;
+    }
+    let p = 1.0 / (0.5 - k.ln() / 3.0_f64.ln());
+    if p.is_finite() && p >= 2.0 { p as f32 } else { 2.0 }
+}
+
+/// The start world's rounded impostor. `k` is the relaxed corner/face radius and
+/// `p = 1 / (1/2 - ln k / ln 3)`. The face radius is that surface sunk by [`sink`],
+/// and under any sample that falls below the face.
+fn home_impostor(cosmos: &Cosmos, body: &Body) -> (FarShape, f64) {
+    let r = radius_of(body);
+    let face = cosmos.face_offset(body);
+    let corner = cosmos.corner_offset(body);
+    let face_r = r + face;
+    let k = if face_r > 0.0 { (r + corner) / face_r } else { 1.0 };
+    let lo = cosmos.relief_range(body).0;
+    let radius = r + face.min(lo) - sink(body).unwrap_or(0.0);
+    (FarShape::Rounded { exponent: rounded_exponent(k) }, radius)
 }
 
 /// One catalog body as seen from `eye`, or nothing while voxels cover it.
 fn impostor(cosmos: &Cosmos, body: &Body, eye: DVec3, twin_ordinal: u32) -> Option<FarBody> {
     let delta = body.centre_f() - eye;
     let dist = delta.length();
-    let radius = radius_of(body) - sink_in(cosmos, body).unwrap_or(0.0);
+    let (mut shape, albedo, atmosphere) = paint(body, twin_ordinal);
+    let radius = if body.kind == Kind::Home {
+        let (rounded, radius) = home_impostor(cosmos, body);
+        shape = rounded;
+        radius
+    } else {
+        radius_of(body) - sink_in(cosmos, body).unwrap_or(0.0)
+    };
     // A cube's own mesh is the body while it streams; a round body's sphere is drawn unless the eye
     // is inside it.
     let streamed = sink(body).is_none() && cosmos.altitude(body, eye) < STREAM_ALTITUDE;
@@ -294,7 +324,6 @@ fn impostor(cosmos: &Cosmos, body: &Body, eye: DVec3, twin_ordinal: u32) -> Opti
     {
         return None;
     }
-    let (shape, albedo, atmosphere) = paint(body, twin_ordinal);
     Some(FarBody {
         dir,
         distance,
@@ -317,7 +346,12 @@ mod tests {
     use crate::world::terrain::Terrain;
 
     fn radius_f(cosmos: &Cosmos, body: &Body) -> f32 {
-        (radius_of(body) - sink_in(cosmos, body).unwrap_or(0.0)) as f32
+        let radius = if body.kind == Kind::Home {
+            home_impostor(cosmos, body).1
+        } else {
+            radius_of(body) - sink_in(cosmos, body).unwrap_or(0.0)
+        };
+        radius as f32
     }
 
     fn find<'a>(cosmos: &Cosmos, list: &'a [FarBody], body: &Body) -> Option<&'a FarBody> {
@@ -377,6 +411,7 @@ mod tests {
             finite_unit(got);
             let shape = match body.kind {
                 Kind::Twin => FarShape::Cube,
+                Kind::Home => home_impostor(cosmos, body).0,
                 _ => FarShape::Sphere,
             };
             assert_eq!(got.shape, shape, "{:?}", body.kind);
@@ -426,11 +461,27 @@ mod tests {
         let away = far.update(&terrain, DVec3::new(1.0e8, 0.0, 0.0));
         assert_eq!(alloc_count::alloc_count(), 0, "far-body update allocated");
         let home = find(cosmos, away, cosmos.home()).expect("home is a sky body from 1e8");
-        assert_eq!(home.shape, FarShape::Sphere);
-        let Shape::Ball { r } = cosmos.home().shape else { panic!("home is a ball") };
-        // Sunk under the relaxed lowlands.
-        let lowest = cosmos.relief_range(cosmos.home()).0.min(0.0);
-        assert!((home.radius - (r as f64 - 150.0 + lowest) as f32).abs() < 4.0);
+        let FarShape::Rounded { exponent } = home.shape else {
+            panic!("home is rounded, got {:?}", home.shape);
+        };
+        assert!((2.1..=2.3).contains(&exponent), "p {exponent}");
+        let corner = home.radius * 3.0f32.powf(0.5 - 1.0 / exponent);
+        assert!(corner > home.radius, "corner {corner} face {}", home.radius);
+        let home_body = cosmos.home();
+        let Shape::Ball { r } = home_body.shape else { panic!("home is a ball") };
+        let face = cosmos.face_offset(home_body);
+        let lo = cosmos.relief_range(home_body).0;
+        // Sunk under the rounded face, and under any sample below that face.
+        let expect = (r as f64 + face.min(lo) - 150.0) as f32;
+        assert!(
+            (home.radius - expect).abs() < 4.0,
+            "radius {} expect {expect} (face {face}, lo {lo})",
+            home.radius
+        );
+        let datum_face = (r as f64 + face) as f32;
+        let datum_corner = (r as f64 + cosmos.corner_offset(home_body)) as f32;
+        assert!(home.radius < datum_face, "face impostor above the datum");
+        assert!(corner < datum_corner, "corner impostor {corner} above the datum {datum_corner}");
         finite_unit(home);
         assert!(home.dir.x < -0.9, "home should sit toward −X, dir {:?}", home.dir);
         // +Y green basin, −Y ash, +X dune, −X grey, +Z glass, −Z fungal.
