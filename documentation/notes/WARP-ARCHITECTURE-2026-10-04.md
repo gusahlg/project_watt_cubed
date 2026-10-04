@@ -11,8 +11,14 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
   player-built mass deforms by the same law once it is big and weak enough.
 - **Scope:** bounded deformation (stage 5) and yield/creep (stage 6a). No moving rigid pieces (stage 4),
   no fracture (6b), no retiling (7).
-- **Same physics for every body.** Every planet is plain matter on a cube grid; its round shape comes from
-  the relaxation law. The fixed cube-sphere charts are removed. Visible shear near cube corners accepted.
+- **Same physics for every body.** Every planet starts as plain matter in a cube; its shape comes from the
+  relaxation law.
+- **Physics shape, fitted grid** (decided after the warp_lab measurements: a cube grid bent all the way to
+  a ball shears its corner cells far past the guide's thresholds). Physics relaxes each generated body's
+  cube of matter and decides its shape. A body that rounds is laid out on the cube-sphere charts with a
+  **datum** fitted to its relaxed surface (`space::datum::DatumField`, guide §10.2: generation may choose
+  a convenient initial layout); a body that stays close to its cube keeps its cube grid. Runtime
+  deformation then bends whichever grid by the same law. So the charts stay.
 
 ## 1. State (guide §5)
 
@@ -66,6 +72,23 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
    positions). Clients swap the embedding; chunk cages refresh (meshes unchanged).
 3. **Gravity:** sources are the deformed elements (adaptive subdivision near the query) plus the edit
    ledger at the edited cells' physical positions.
+
+## 3b. Genesis as built (2026-10-04)
+
+- `mechanics::genesis::solve` relaxes the cube (rate-independent J2, 2×2×2 volume groups, free-surface
+  pressure from a nodal field) and re-grids along equiangular directions when elements degrade;
+  `choose` reads the layout from the relaxed surface: tilt over 25° keeps the cube grid, otherwise
+  charts with a datum; still flowing at the representation limit with `Π_g > 100` takes the
+  hydrostatic figure (reported).
+- Shapes are path independent and mesh convergent; at `Π_g` 45 (the start world in rock) the cube rounds
+  to corner/face 1.048 with −1.4 %…+4.9 % relief, consistent with yield-supported low-degree topography.
+- A homogeneous cube's shape depends only on `Π_g`, so generation reads it from `genesis_table.bin`
+  (computed offline by `genesis_table` at 16 elements, half-octave steps from ¼ to 4096) instead of
+  solving at world creation (16–80 s per body live).
+- Matter limits found by the law: a weak (crystal) Hollow and even a rock Hollow of today's size cannot
+  hold their cavity; the moons (rock, `Π_g` < 0.1) stay cubes; Verdance in regolith (`Π_g` 3.4) and the
+  twins (2.6) sag (corner/face ≈ 1.45, 1.56); the Ember in magma (11) rounds to 1.16. Which matter the
+  generator gives these bodies is an owner decision.
 
 ## 4. Phases
 
