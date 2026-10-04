@@ -21,7 +21,10 @@ start cube pulls 24 m/s² at the centre of its top face; it is never derived fro
 
 - **Analytic matter.** The generator describes each body as a sum of uniform boxes and balls
   (`gravity::shape`): their fields are closed forms (the Nagy prism for boxes), with monopole and
-  quadrupole far fields, split where the finite range cuts through a body.
+  quadrupole far fields, split where the finite range cuts through a body. A body that relaxed
+  carries its real shape: a round body's relief over its datum sphere is a harmonic surface layer
+  (`gravity::relief`, degree 24, ~9 µs per sample), and a warped cube is the polyhedron of its bent
+  surface (`gravity::polyhedron`, Werner–Scheeres, ~57 µs per sample near a twin).
 - **Edits are corrections.** Every committed edit records `amount(new) − amount(what was there)` in an
   exact integer ledger (`gravity::ledger`) — per chunk and per region, with first moments about fixed
   centres — so mining a hole or building a tower changes gravity immediately and exactly, and loading
