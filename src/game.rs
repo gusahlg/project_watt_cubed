@@ -1748,6 +1748,15 @@ impl Game {
         }
     }
 
+    /// Where this world's atmosphere ends: a body of the cosmos has air up to `AIR_TOP`, a flat
+    /// world's space realm starts a few hundred blocks up.
+    pub fn space_fade(&self) -> crate::frame_snapshot::SpaceFade {
+        match self.world.terrain().cosmos() {
+            Some(_) => crate::frame_snapshot::SpaceFade::BODY,
+            None => crate::frame_snapshot::SpaceFade::FLAT,
+        }
+    }
+
     /// Altitude above the datum of the nearest body (the sky fades to space with it); far from every
     /// body, or over an airless one (a moon), effectively infinite. Inside a Hollow's cavity the
     /// shell is the sky, so this is the same sentinel and the blue atmosphere stays outside. A flat

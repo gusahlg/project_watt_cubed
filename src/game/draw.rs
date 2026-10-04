@@ -184,6 +184,7 @@ impl Game {
         let sky_ctx = crate::frame_snapshot::SkyContext {
             up: pose.up(),
             altitude: self.sky_altitude(pose.eye),
+            fade: self.space_fade(),
         };
         let (up_q, plane) = sky_keys(pose.eye, sky_ctx.up);
         let up = sky_ctx.up.as_vec3();
@@ -210,7 +211,7 @@ impl Game {
             // (day, content_rev, altitude's space fade, body up): any render/palette
             // change bumps the stamp, so the freeze predicate's own inputs invalidate
             // the entry structurally.
-            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude).to_bits();
+            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude, sky_ctx.fade).to_bits();
             let key = (sky_day.to_bits(), self.content_rev.0, space, up_q);
             let cached = self.drawing.static_frame_cache.get_or(key, || {
                 let snapshot = crate::frame_snapshot::compose_at(
@@ -502,6 +503,7 @@ impl Game {
         let sky_ctx = crate::frame_snapshot::SkyContext {
             up: pose.up(),
             altitude: self.sky_altitude(pose.eye),
+            fade: self.space_fade(),
         };
         let (up_q, plane) = sky_keys(pose.eye, sky_ctx.up);
         let up = sky_ctx.up.as_vec3();
@@ -518,7 +520,7 @@ impl Game {
         });
         let cacheable = !self.render.weather && !self.render.clouds && !self.render.exposure;
         if cacheable {
-            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude).to_bits();
+            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude, sky_ctx.fade).to_bits();
             let key = (sky_day.to_bits(), self.content_rev.0, space, up_q);
             let uniforms = {
                 let sky = &self.sky;

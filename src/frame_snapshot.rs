@@ -18,9 +18,17 @@ const AVOID_DARK_LEVEL: f32 = 0.030;
 const FOG_BASE: f32 = 0.00023;
 
 /// Camera altitudes over which the atmosphere thins into space: the sky darkens, the stars come
-/// out by day and the haze clears, from just above the highest mountains to a little above the
-/// floor of the space realm (`crate::world::terrain::SPACE_FLOOR`).
-const SPACE_FADE: (f64, f64) = (500.0, 820.0);
+/// out by day and the haze clears.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpaceFade(pub f64, pub f64);
+
+impl SpaceFade {
+    /// A flat world: from just above the highest mountains to a little above the floor of the space
+    /// realm (`crate::world::terrain::SPACE_FLOOR`).
+    pub const FLAT: Self = Self(500.0, 820.0);
+    /// A body of the cosmos: from above its relief band to the top of its air.
+    pub const BODY: Self = Self(2_500.0, crate::world::terrain::cosmos::AIR_TOP);
+}
 /// The sky overhead in space, and the atmosphere's limb below the horizon (where far ground fades).
 const SPACE_ZENITH: Rgb = Rgb::linear(0.0004, 0.0006, 0.0016);
 const SPACE_HORIZON: Rgb = Rgb::linear(0.0015, 0.003, 0.009);
@@ -30,8 +38,8 @@ const SPACE_TURBIDITY: f32 = -0.46;
 
 /// How far into space an altitude above the local surface datum is: 0 in the
 /// atmosphere, 1 above it (smoothstep). The `+Y` face datum is world `y = 0`.
-pub fn space_factor(altitude: f64) -> f32 {
-    let t = ((altitude - SPACE_FADE.0) / (SPACE_FADE.1 - SPACE_FADE.0)).clamp(0.0, 1.0) as f32;
+pub fn space_factor(altitude: f64, fade: SpaceFade) -> f32 {
+    let t = ((altitude - fade.0) / (fade.1 - fade.0)).clamp(0.0, 1.0) as f32;
     t * t * (3.0 - 2.0 * t)
 }
 
@@ -43,6 +51,8 @@ pub fn space_factor(altitude: f64) -> f32 {
 pub struct SkyContext {
     pub up: DVec3,
     pub altitude: f64,
+    /// Where this world's atmosphere ends.
+    pub fade: SpaceFade,
 }
 
 /// Per-frame rendering state (linear colour, unclamped).
@@ -101,7 +111,7 @@ pub fn compose(
     compose_at(
         sky,
         sky.frame(),
-        SkyContext { up: DVec3::Y, altitude: cam_world.y },
+        SkyContext { up: DVec3::Y, altitude: cam_world.y, fade: SpaceFade::FLAT },
         animation_uv(
             cam_world,
             DVec3::new(t.x as f64, t.y as f64, t.z as f64),
@@ -166,7 +176,7 @@ pub fn compose_at(
     // Above the atmosphere the sky goes black and starry and the haze thins. Only the sky lanes
     // fade: the ambient above was taken from the atmosphere's zenith, and the GPU luma-matches
     // its zenith tints, so planets stay lit by the sun and the near-sky bounce.
-    let space = space_factor(ctx.altitude);
+    let space = space_factor(ctx.altitude, ctx.fade);
     // Nor is there night out there: the sun shines from where it is, however the viewer is turned.
     let light = light.lerp(atm.palette.at(Role::Light, 1.0), space);
     let day_night_mix = Palette::day_night_mix(elev) + (1.0 - Palette::day_night_mix(elev)) * space;
@@ -222,6 +232,18 @@ impl From<&FrameSnapshot> for FrameUniformsGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a body of the cosmos the sky stays blue over mountains and turns to space at the top of
+    /// the air; a flat world keeps its low space realm.
+    #[test]
+    fn the_sky_turns_to_space_where_the_air_ends() {
+        assert_eq!(space_factor(1_500.0, SpaceFade::BODY), 0.0, "a mountain top under a blue sky");
+        let mid = space_factor(11_000.0, SpaceFade::BODY);
+        assert!(mid > 0.2 && mid < 0.8, "half way up the air the sky darkens: {mid}");
+        assert_eq!(space_factor(crate::world::terrain::cosmos::AIR_TOP, SpaceFade::BODY), 1.0);
+        assert_eq!(space_factor(400.0, SpaceFade::FLAT), 0.0);
+        assert_eq!(space_factor(900.0, SpaceFade::FLAT), 1.0);
+    }
     use crate::sky::Precip;
 
     fn channels(rgb: Rgb) -> [f32; 3] {
@@ -289,7 +311,7 @@ mod tests {
         let ground = compose_at(
             &sky,
             frame,
-            SkyContext { up: DVec3::X, altitude: 0.0 },
+            SkyContext { up: DVec3::X, altitude: 0.0, fade: SpaceFade::FLAT },
             [0.0; 2],
             Exposure::DEFAULT,
             &render,
@@ -302,7 +324,7 @@ mod tests {
         let space = compose_at(
             &sky,
             frame,
-            SkyContext { up: DVec3::X, altitude: 900.0 },
+            SkyContext { up: DVec3::X, altitude: 900.0, fade: SpaceFade::FLAT },
             [0.0; 2],
             Exposure::DEFAULT,
             &render,
