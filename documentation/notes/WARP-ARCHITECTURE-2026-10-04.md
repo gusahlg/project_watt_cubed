@@ -92,12 +92,12 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
 
 ## 4. Phases
 
-| Phase | What | Who |
+| Phase | What | Status (2026-10-04) |
 |---|---|---|
-| W0 | `mechanics`: lattice, materials, solver, gravity tree, validity; `warp_lab` | me |
-| W1 | Every body is cube matter: per-body face realms, hollow cube with inner faces | grok |
-| W2 | Embedding switch: bodies in storage on lattices; charts, seams, chart painters removed | me + grok |
-| W3 | Generation relaxes every body; saves store lattice state; worldgen 9 | me |
-| W4 | Gravity from deformed elements | me + grok |
-| W5 | Background relaxation, epochs, protocol, cage refresh | me + grok |
-| W6 | Far-body impostors from the deformed shape | grok |
+| W0 | `mechanics`: lattice, materials, solver, gravity tree, validity; `warp_lab` | done |
+| W1 | Every body is cube matter (superseded by the fitted-grid decision) | dropped |
+| W2 | Layouts from physics: the start world on charts fitted to its relaxed datum (band-0 lift); sagging cubes (the twins) in storage, their grid bent by `space::warp` | done |
+| W3 | Generation relaxes every body: shapes tabulated by `Π_g` (`genesis_table.bin`, pinned to the worldgen version); start world and twins wired | done for the start world and twins; the other bodies wait on the owner's matter decision |
+| W4 | Gravity from the relaxed shapes: relief layer (round), polyhedron (warped cube) | done |
+| W5 | Background relaxation, epochs, protocol, cage refresh (`mechanics::creep` is the step) | scope question to the owner: planet-scale relaxation never triggers at hand scale |
+| W6 | Far-body impostors from the relaxed shape (engine `FarShape::Rounded`) | done |
