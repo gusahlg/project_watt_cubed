@@ -860,8 +860,12 @@ impl World {
         SECTION_SLOT_FLOOR.max((self.slot_ceiling as usize).saturating_sub(self.near_chunk_slots()))
     }
 
+    /// Sections held against [`sections_allowed`](Self::sections_allowed): Ready, in flight and
+    /// queued for upload (a queued result is still `Meshing` in the map). Counted in sections, the
+    /// unit the frontier is coarsened in: a rugged section spans several slabs (slots), and a slot
+    /// count here would stop admission short of a frontier that fits the budget.
     fn section_budget_used(&self) -> usize {
-        self.section_slot_count() + self.meshing_sections + self.section_upload_queue.len()
+        self.sections.len()
     }
 
     fn local_mesh_slots(&self) -> usize {
@@ -2648,9 +2652,8 @@ impl StreamLane for SectionLane {
         world.sections.contains_key(&key)
     }
     fn ready(world: &World, _key: SectionPos) -> bool {
-        // Section slots only. Near-field chunks never consume this budget;
-        // a large view must not starve covering. In-flight claims and the
-        // upload queue land as slots, so they count now.
+        // Sections only. Near-field chunks never consume this budget; a large
+        // view must not starve covering. In-flight claims count now.
         world.section_budget_used() < world.sections_allowed()
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {

@@ -395,10 +395,10 @@ impl App {
             .expect("bench_frame without bench")
             .has_started()
         {
-            let (pos, look) = {
+            let (pos, look, day) = {
                 let bench = self.bench.as_mut().expect("bench exists");
                 bench.begin();
-                (bench.position(), bench.look())
+                (bench.position(), bench.look(), bench.day())
             };
             // Uncapped and unsynced, or the bench measures the throttle.
             self.settings.vsync = false;
@@ -407,6 +407,9 @@ impl App {
             self.start_new_world(eng);
             if let Screen::Playing(game) = &mut self.screen {
                 game.set_input_locked(true);
+                if let Some(day) = day {
+                    game.set_day(day);
+                }
                 // Far-coordinate bench: park the player at the requested position
                 // with the ground under them made real, and give streaming a
                 // little extra warmup to catch up before sampling starts.

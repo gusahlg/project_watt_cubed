@@ -13,6 +13,8 @@
 //! - `WATT_BENCH_MOVE=<m/s>` +X flight speed (default 0, static camera).
 //! - `WATT_BENCH_LOOK=<yaw°>,<pitch°>` initial camera orientation (with `WATT_BENCH_POS` the
 //!   player also flies, so a camera parked in the sky or a cave stays put).
+//! - `WATT_BENCH_TIME=<0..1>` day/night clock at entry (0.5 = noon, 0 = midnight), as `/time set`.
+//!   Each face of a cube has its own day, so a shot of a side face picks its time.
 //! - `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, `WATT_BENCH_TAG`,
 //!   `WATT_BENCH_POS`, `WATT_BENCH_PRESET`, `WATT_BENCH_SEED`,
 //!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_PROFILE`,
@@ -82,6 +84,8 @@ pub struct Benchmark {
     pos: Option<DVec3>,
     /// Initial camera (yaw, pitch) in radians.
     look: Option<(f32, f32)>,
+    /// `WATT_BENCH_TIME`: the day fraction pinned at entry.
+    day: Option<f64>,
     /// Flight speed along +X during the run (`WATT_BENCH_MOVE`, m/s); zero
     /// keeps the classic static steady-rotate scenario.
     move_mps: f64,
@@ -152,6 +156,13 @@ impl Benchmark {
             let (y, p) = raw.split_once(',')?;
             Some((y.trim().parse::<f32>().ok()?.to_radians(), p.trim().parse::<f32>().ok()?.to_radians()))
         });
+        let day = std::env::var("WATT_BENCH_TIME").ok().and_then(|raw| {
+            let day = raw.trim().parse::<f64>().ok().filter(|d| (0.0..=1.0).contains(d));
+            if day.is_none() {
+                eprintln!("WATT_BENCH_TIME={raw:?} is not a day fraction in 0..1; keeping the clock");
+            }
+            day
+        });
         let move_mps = env_seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
         let yaw_rate = env_seconds("WATT_BENCH_YAW", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0);
         let screenshot = parse_screenshot(std::env::var_os("WATT_BENCH_SCREENSHOT"));
@@ -171,6 +182,7 @@ impl Benchmark {
             ready_timeout: Duration::from_secs_f64(ready_timeout),
             pos,
             look,
+            day,
             move_mps,
             yaw_rate,
             screenshot,
@@ -245,6 +257,10 @@ impl Benchmark {
     }
 
     /// Initial camera (yaw, pitch), radians.
+    pub fn day(&self) -> Option<f64> {
+        self.day
+    }
+
     pub fn look(&self) -> Option<(f32, f32)> {
         self.look
     }
@@ -1105,6 +1121,7 @@ mod tests {
             ready_timeout,
             pos: None,
             look: None,
+            day: None,
             move_mps: 0.0,
             yaw_rate: DEFAULT_YAW_RATE_RAD_S,
             screenshot: None,

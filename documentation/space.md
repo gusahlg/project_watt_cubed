@@ -73,8 +73,19 @@ One seeded catalog (`world::terrain::cosmos`) describes everything; physical spa
 empty and costs nothing (chunks there classify as air without being generated).
 
 - **The start cube** — 50,000,000 blocks on a side, centred 25,000,000 below the origin so its +Y
-  face is `y = 0` and spawn sits at that face's centre. Each face is its own realm; edges blend into
-  a shared rim. Below a 350-block crust the bulk is a mix whose mean amount sets the cube's gravity.
+  face is `y = 0` and spawn sits at that face's centre. Each face is its own realm of 26 themes
+  (meadows and giant forests, canyons and mesas, glaciers, volcanic and ash fields, crystal plains,
+  fungal and glow-moss hollows, bone lands, crater fields, sky-island archipelagos…) laid out as
+  regions and provinces with soft gradients between them; edges blend into a shared rim.
+  **Landmarks** grow from each theme (`world::terrain::features`): giant trees and mushrooms,
+  spires, hoodoos and arches, cinder cones and basalt prisms, crystal prisms, ice spires and frozen
+  falls, dunes and mesas, sky islands, impact craters with meteorite cores, rib arches and skulls,
+  petrified trunks, sinkholes, and flora on the meadows. Below a 350-block crust the bulk is a mix
+  whose mean amount sets the cube's gravity, carved by **the interior** (`world::terrain::deep`):
+  Deep caverns in six biomes with giant mushrooms and shafts, dwarf halls with pillars, stairs, rails
+  and lamps, Underdark chambers with spires and lanterns, mantle bubbles, and the hollow Heart at the
+  centre. The mass the generator reports subtracts the Heart and every bubble, so the pull inside
+  them is the honest one.
 - **The Twins** — two 12,000,000-block cubes facing each other across a weightless canyon.
 - **Verdance** — a round world of radius 8,000,000: forested ranges and giant trees.
 - **The Hollow** — a shell between 5,750,000 and 6,000,000 from its centre: an icy crust outside,
@@ -86,7 +97,12 @@ empty and costs nothing (chunks there classify as air without being generated).
 - **Asteroid swarms** — sparse clusters of rocks of every size and kind, never near a big body.
 
 Seen from afar every body is drawn as an analytic impostor in the sky (`sky::bodies`), lit by the
-sun; standing on a round world its sphere fills the horizon beyond the streamed chunks.
+sun, and the rocks of a nearby swarm as sunlit boxes beyond the streamed chunks (`sky::rocks`).
+Standing on a cube face, the far field is face-local LOD sections out to the horizon; standing on
+a round world it is chart sections bent through cages (detail stops where the cage's chord error
+would pass a block), and the body's sphere fills the horizon beyond them. Inside the Hollow the
+inner wall surrounds the sky and the Ember is the sun. Above the atmosphere there is no night: the
+sun lights whatever faces it.
 
 ## Travel
 

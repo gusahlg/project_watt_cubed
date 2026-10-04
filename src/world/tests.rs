@@ -145,13 +145,22 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
         <SectionLane as StreamLane>::ready(&world, pos),
         "6000 near slots against cpu_cull_max=1024 must not starve the far lane"
     );
-    world.meshing_sections = SECTION_SLOT_FLOOR;
+    // The cap counts sections (the frontier's unit), Ready or in flight, whatever slots they span.
+    let held = |i: usize| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 1 + i as i32, z: 0 };
+    for i in 0..SECTION_SLOT_FLOOR - 1 {
+        let state = if i % 2 == 0 {
+            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+        } else {
+            SectionState::Meshing { token: pipeline::ClaimToken(i as u64) }
+        };
+        world.sections.insert(held(i), state);
+    }
+    assert!(<SectionLane as StreamLane>::ready(&world, pos));
+    world.sections.insert(held(SECTION_SLOT_FLOOR), SectionState::Meshing { token: pipeline::ClaimToken(0) });
     assert!(
         !<SectionLane as StreamLane>::ready(&world, pos),
         "the section floor is the far lane's own cap, not the near field's"
     );
-    world.meshing_sections = SECTION_SLOT_FLOOR - 1;
-    assert!(<SectionLane as StreamLane>::ready(&world, pos));
 }
 
 /// At the user's max view (RD 20 / V 10 / 8 LOD rings) the far field still
