@@ -2403,8 +2403,10 @@ fn warped_twins_keep_the_cube_painter_and_sag() {
     ];
     let axis = (0..3).max_by_key(|&a| delta[a].abs()).unwrap();
     let sign = if delta[axis] >= 0 { 1.0 } else { -1.0 };
-    let mut near = c;
-    near[axis] += sign * h;
+    // On the bowed surface (the warp of the reference face centre), and well beyond it.
+    let mut face = c;
+    face[axis] += sign * h;
+    let near = warp.apply(face);
     let mut far = c;
     far[axis] += sign * (h + sag.max(cosmos::RELIEF as f64) * 8.0);
     let near_s = field.sample(near);
@@ -2508,4 +2510,20 @@ fn home_gravity_sample_cost() {
         acc += field.sample(spawn + glam::DVec3::new((i % 7) as f64 * 0.01, 0.0, 0.0)).accel.y;
     }
     println!("{:.2} µs per sample at spawn [{acc:.3}]", start.elapsed().as_secs_f64() * 1e6 / n as f64);
+}
+
+/// On a warped twin the air follows the bent grid: the bowed face centre sits ~7 % above the
+/// reference cube, and standing there is still in air with a small altitude.
+#[test]
+fn a_warped_twin_has_air_on_its_bowed_face() {
+    let (_reg, t) = make(42);
+    let twin = *t.cosmos.bodies().iter().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
+    let cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+    let atlas = t.storage.atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id)).expect("warped");
+    let warp = atlas.warp.as_ref().expect("a warp");
+    let top = warp.apply(twin.centre_f() + glam::DVec3::new(0.0, half as f64 + 100.0, 0.0));
+    assert!(top.y - twin.centre_f().y > half as f64 * 1.03, "the face bows out");
+    let alt = t.cosmos.altitude(&twin, top);
+    assert!((alt - 100.0).abs() < 1.0, "altitude on the bent grid {alt}");
+    assert!(t.cosmos.in_air(top));
 }

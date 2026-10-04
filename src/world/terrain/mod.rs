@@ -529,7 +529,8 @@ impl Terrain {
             let shape = crate::gravity::Polyhedron::from_surface(c - h, c + h, crate::gravity::polyhedron::FACE_QUADS, body.density, |p| {
                 warp.apply(p)
             });
-            cosmos.set_warp(*id, Arc::new(shape));
+            cosmos.set_shape(*id, Arc::new(shape));
+            cosmos.set_warp(*id, Arc::clone(warp));
         }
         // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
         // chart grid to the shape, and its relief joins gravity.

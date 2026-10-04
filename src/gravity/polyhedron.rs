@@ -614,12 +614,9 @@ mod tests {
         let warp = Warp::from_solved(&solved, DVec3::ZERO);
         let h = DVec3::splat(half);
         let chord = surface_chord(-h, h, FACE_QUADS, |p| warp.apply(p));
-        // Trilinear twist, not the smooth sag. ~725 blocks here; under a few blocks needs ~900
-        // quads per edge (~10⁷ triangles), which a gravity sample cannot walk.
-        assert!(
-            (400.0..1_200.0).contains(&chord),
-            "chord error {chord} blocks at {FACE_QUADS}×{FACE_QUADS}"
-        );
+        // Every other lattice node: ~47k blocks of chord on a 6M-block face, a gravity error of
+        // a fraction of a percent at the surface (64 quads: ~725 blocks, the trilinear twist).
+        assert!(chord < 60_000.0, "chord error {chord} blocks at {FACE_QUADS}×{FACE_QUADS}");
         let poly = Polyhedron::from_surface(-h, h, FACE_QUADS, 5.0, |p| warp.apply(p));
         let face_ref = DVec3::new(half, 0.0, 0.0);
         let face = warp.apply(face_ref);

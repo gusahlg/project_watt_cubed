@@ -786,6 +786,14 @@ mod tests {
         assert!(weak.pi > FLUID_PI);
     }
 
+    /// Generated worlds take their shapes from the table, so a regenerated table changes worlds:
+    /// bump `WORLDGEN_VERSION` (older saves are then refused) and re-pin this hash.
+    #[test]
+    fn the_genesis_table_is_pinned_to_the_worldgen_version() {
+        assert_eq!(crate::world::terrain::WORLDGEN_VERSION, 10);
+        assert_eq!(crate::hash::fnv1a_32(TABLE), 0xbf9b2d15, "the genesis table changed: bump WORLDGEN_VERSION and re-pin");
+    }
+
     #[test]
     fn every_node_maps_to_a_canonical_node_and_back() {
         let m = 3usize;

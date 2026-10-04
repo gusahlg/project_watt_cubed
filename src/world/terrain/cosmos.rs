@@ -258,8 +258,10 @@ pub struct Cosmos {
     deep: f32,
     /// A round body's relaxed shape: body id, its datum and that relief as a gravity source.
     relief: Option<Relaxed>,
-    /// A warped cube's true shape (body id). Replaces that body's box primitive.
-    warps: Vec<(u16, std::sync::Arc<crate::gravity::Polyhedron>)>,
+    /// A warped cube's true shape for gravity (body id). Replaces that body's box primitive.
+    shapes: Vec<(u16, std::sync::Arc<crate::gravity::Polyhedron>)>,
+    /// Warped cubes' displacement fields (altitude and air are measured on the bent grid).
+    warps: Vec<(u16, std::sync::Arc<crate::space::warp::Warp>)>,
 }
 
 /// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
@@ -422,6 +424,7 @@ impl Cosmos {
             group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
             deep: deep.clamp(0.0, 2.0),
             relief: None,
+            shapes: Vec::new(),
             warps: Vec::new(),
         };
         cosmos.place_clusters(space);
@@ -785,10 +788,22 @@ impl Cosmos {
         self.surface_offset(b, b.centre_f() + DVec3::ONE)
     }
 
-    /// Altitude of `p` above body `b`'s relaxed surface datum (its [`Body::altitude`] for a body
-    /// without a relaxed datum).
+    /// Altitude of `p` above body `b`'s relaxed surface: above its datum for a relaxed round
+    /// body, above its reference cube at the point the warp maps onto `p` for a warped cube, else
+    /// [`Body::altitude`].
     pub fn altitude(&self, b: &Body, p: DVec3) -> f64 {
+        if let Some((_, warp)) = self.warps.iter().find(|(id, _)| *id == b.id) {
+            if let Some(x) = warp.invert(p) {
+                return b.altitude(x);
+            }
+        }
         b.altitude(p) - self.surface_offset(b, p)
+    }
+
+    /// Give a warped cube its displacement field (generation, before the cosmos is shared).
+    pub fn set_warp(&mut self, id: u16, warp: std::sync::Arc<crate::space::warp::Warp>) {
+        self.warps.retain(|(i, _)| *i != id);
+        self.warps.push((id, warp));
     }
 
     /// Lowest and highest relaxed datum offsets of body `b` (zero without a relaxed datum).
@@ -798,16 +813,13 @@ impl Cosmos {
 
     /// Give a warped cube its polyhedron (generation, before the cosmos is shared). The box
     /// primitive is no longer visited for that body.
-    pub fn set_warp(&mut self, id: u16, shape: std::sync::Arc<crate::gravity::Polyhedron>) {
-        if let Some(slot) = self.warps.iter_mut().find(|(i, _)| *i == id) {
-            slot.1 = shape;
-        } else {
-            self.warps.push((id, shape));
-        }
+    pub fn set_shape(&mut self, id: u16, shape: std::sync::Arc<crate::gravity::Polyhedron>) {
+        self.shapes.retain(|(i, _)| *i != id);
+        self.shapes.push((id, shape));
     }
 
-    fn warp_of(&self, id: u16) -> Option<&crate::gravity::Polyhedron> {
-        self.warps.iter().find(|(i, _)| *i == id).map(|(_, s)| s.as_ref())
+    fn shape_of(&self, id: u16) -> Option<&crate::gravity::Polyhedron> {
+        self.shapes.iter().find(|(i, _)| *i == id).map(|(_, s)| s.as_ref())
     }
 }
 
@@ -821,7 +833,7 @@ impl MassOracle for Cosmos {
             if dist - b.reach() >= reach {
                 continue;
             }
-            if let Some(shape) = self.warp_of(b.id) {
+            if let Some(shape) = self.shape_of(b.id) {
                 // The matter as it is. The undeformed cube is only the carrier of the higher
                 // multipoles once the query is many radii out (see `Polyhedron::field_over_cube`).
                 let (lo, hi) = match b.shape {
@@ -949,9 +961,9 @@ mod tests {
         let h = DVec3::splat(half as f64);
         let p = c + DVec3::new(0.0, half as f64 + 1_000.0, 0.0);
         let mut same = Cosmos::new(1, 0.0);
-        same.set_warp(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, twin.density)));
+        same.set_shape(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, twin.density)));
         let mut none = Cosmos::new(1, 0.0);
-        none.set_warp(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, 0.0)));
+        none.set_shape(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, 0.0)));
         let a = Field::new(Arc::new(base)).sample(p);
         let b = Field::new(Arc::new(same)).sample(p);
         let z = Field::new(Arc::new(none)).sample(p);
