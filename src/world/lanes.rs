@@ -156,9 +156,8 @@ stream_lanes! {
     /// for every section a live edit touched. Bounded by touched sections; an
     /// unedited world pays nothing.
     section_overlay: new SectionOverlayLane("lod_overlay", Budget::Millis(1.0))
-        => |ctx, _b| {
-            ctx.world.refresh_section_overlay();
-            Progress::Idle
+        => |ctx, b| {
+            ctx.world.refresh_section_overlay(b)
         },
     /// Frees GPU meshes of edited sections so they re-extract from the updated
     /// overlay. CPU lane — needs the engine.

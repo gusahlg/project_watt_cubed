@@ -3151,12 +3151,21 @@ impl World {
     /// edits touched since the last refresh (`section_overlay_dirty`) are
     /// re-derived, and the resolved map is maintained incrementally instead
     /// of cleared and rebuilt every pass.
-    pub(in crate::world) fn refresh_section_overlay(&mut self) {
+    ///
+    /// Each position costs about one far section's extract, and one edit dirties a position per
+    /// active detail, so the work is spread over frames: at least one position per pass, more while
+    /// `budget` lasts. [`Self::remesh_dirty_sections`] holds a square back until its overlay is in.
+    pub(in crate::world) fn refresh_section_overlay(&mut self, budget: Budget) -> Progress {
         if self.section_overlay_dirty.is_empty() {
-            return;
+            return Progress::Idle;
         }
-        let positions: Vec<SectionPos> = self.section_overlay_dirty.drain().collect();
-        for pos in positions {
+        let deadline = super::lanes::paced_deadline(self, budget);
+        let positions: Vec<SectionPos> = self.section_overlay_dirty.iter().copied().collect();
+        for (done, pos) in positions.into_iter().enumerate() {
+            if done > 0 && deadline.expired() {
+                break;
+            }
+            self.section_overlay_dirty.remove(&pos);
             let rev = voxel_engine::Rev(self.section_edit_rev.get(&pos).copied().unwrap_or(0));
             let touched = self.edits_for_section(pos);
             if touched.is_empty() {
@@ -3177,6 +3186,10 @@ impl World {
                     self.section_overlay.remove(&pos);
                 }
             }
+        }
+        match self.section_overlay_dirty.len() {
+            0 => Progress::Idle,
+            n => Progress::Partial { remaining: n as u32 },
         }
     }
 
@@ -3710,6 +3723,10 @@ impl World {
         let dirty: Vec<SectionPos> = self.dirty_sections.iter().copied().collect();
         let mut freed = false;
         for s in dirty {
+            // Re-extract only once the square's overlay is in: its upload reads the overlay colour.
+            if self.section_overlay_dirty.contains(&s) {
+                continue;
+            }
             match self.sections.get(&s) {
                 Some(SectionState::Ready { .. }) => {
                     if let Some(state) = self.sections.remove(&s) {
@@ -6096,6 +6113,28 @@ mod tests {
 
     /// A full section floor must not disarm the lane, and must drop Ready sections
     /// nothing desired draws so the open cell can be admitted.
+    /// One edit dirties an overlay position per active detail, each about a far section's extract:
+    /// a pass past its budget stops after one position, the rest follow on later passes.
+    #[test]
+    fn the_edit_overlay_refresh_spreads_over_passes() {
+        use crate::world::section::SectionPos;
+        let mut world = World::new(7);
+        for x in 0..3 {
+            let pos = SectionPos { body: 0, face: Face::PosY, detail: crate::world::section::FINEST_DETAIL, x, z: 0 };
+            world.section_overlay_dirty.insert(pos);
+        }
+        let pass = |world: &mut World| match world.refresh_section_overlay(Budget::Millis(0.0)) {
+            Progress::Partial { remaining } => Some(remaining),
+            Progress::Idle => None,
+            _ => panic!("unexpected progress"),
+        };
+        assert_eq!(pass(&mut world), Some(2));
+        assert_eq!(pass(&mut world), Some(1));
+        assert_eq!(pass(&mut world), None);
+        assert!(world.section_overlay_dirty.is_empty());
+        assert_eq!(pass(&mut world), None);
+    }
+
     #[test]
     fn full_section_floor_keeps_the_lane_armed_and_frees_a_slot() {
         let mut world = World::generate();
