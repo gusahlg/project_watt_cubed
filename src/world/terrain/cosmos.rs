@@ -804,7 +804,8 @@ impl MassOracle for Cosmos {
                 super::deep::apply(b.centre, half, b.seed, b.density, self.deep, v);
             }
             if let Some(r) = self.relief.as_ref().filter(|r| r.id == b.id) {
-                v.analytic(r.layer.accel(centre) / G, r.layer.potential(centre) / G);
+                let (accel, potential) = r.layer.field(centre);
+                v.analytic(accel / G, potential / G);
             }
             if self.altitude(b, centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());

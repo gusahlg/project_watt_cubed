@@ -93,8 +93,57 @@ impl Relief {
         -sum
     }
 
-    /// Acceleration at `p` (central differences of the potential, a millionth of the radius apart).
+    /// Acceleration at `p` (see [`field`](Self::field)).
     pub fn accel(&self, p: DVec3) -> DVec3 {
+        self.field(p).0
+    }
+
+    /// Acceleration and potential at `p` in one pass: the analytic gradient of the expansion
+    /// (spherical components), or central differences of the potential within a thousandth of a
+    /// radian of the polar axis.
+    pub fn field(&self, p: DVec3) -> (DVec3, f64) {
+        let d = p - self.centre;
+        let r = d.length();
+        let rho = (d.x * d.x + d.y * d.y).sqrt();
+        if r < 1e-9 || rho < 1e-3 * r {
+            return (self.accel_numeric(p), self.potential(p));
+        }
+        let (ct, st) = (d.z / r, rho / r);
+        let (cp, sp) = (d.x / rho, d.y / rho);
+        let mut y = [0.0f64; COUNT];
+        let mut dy = [0.0f64; COUNT];
+        harmonics_with_theta(d / r, &mut y, &mut dy);
+        let outside = r >= self.radius;
+        let ratio = if outside { self.radius / r } else { r / self.radius };
+        let mut g = if outside { 1.0 / r } else { 1.0 / self.radius };
+        let (mut v, mut dv_dr, mut dv_dt, mut dv_dp) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for l in 0..=L_MAX {
+            let (mut sl, mut tl, mut ul) = (0.0, 0.0, 0.0);
+            for m in -(l as i64)..=(l as i64) {
+                let k = l * l + (l as i64 + m) as usize;
+                let c = self.coeff[k];
+                sl += c * y[k];
+                tl += c * dy[k];
+                // ∂/∂φ: cos(mφ) → −m sin(mφ) (the m < 0 partner), sin(|m|φ) → |m| cos(|m|φ).
+                let partner = l * l + (l as i64 - m) as usize;
+                ul += c * (-(m as f64)) * y[partner];
+            }
+            let dg = if outside { -((l + 1) as f64) * g / r } else { l as f64 * g / r };
+            v -= g * sl;
+            dv_dr -= dg * sl;
+            dv_dt -= g * tl;
+            dv_dp -= g * ul;
+            g *= ratio;
+        }
+        let r_hat = DVec3::new(st * cp, st * sp, ct);
+        let t_hat = DVec3::new(ct * cp, ct * sp, -st);
+        let p_hat = DVec3::new(-sp, cp, 0.0);
+        (-(r_hat * dv_dr + t_hat * (dv_dt / r) + p_hat * (dv_dp / (r * st))), v)
+    }
+
+    /// [`accel`](Self::accel) by central differences of the potential, a millionth of the radius
+    /// apart.
+    fn accel_numeric(&self, p: DVec3) -> DVec3 {
         let e = self.radius * 1e-6;
         let mut g = DVec3::ZERO;
         for a in 0..3 {
@@ -144,6 +193,51 @@ fn harmonics(dir: DVec3, out: &mut [f64]) {
     }
 }
 
+/// [`harmonics`] and their derivatives with respect to the colatitude θ (off the polar axis:
+/// `dP̄_lm/dθ = (l cos θ P̄_lm − √((2l+1)(l²−m²)/(2l−1)) P̄_(l−1)m) / sin θ`).
+fn harmonics_with_theta(dir: DVec3, out: &mut [f64], d_theta: &mut [f64]) {
+    let ct = dir.z.clamp(-1.0, 1.0);
+    let st = (1.0 - ct * ct).max(1e-300).sqrt();
+    let phi = dir.y.atan2(dir.x);
+    let n = L_MAX + 1;
+    let mut p = [0.0f64; COUNT];
+    p[0] = Y00;
+    for m in 1..n {
+        p[m * n + m] = -((2 * m + 1) as f64 / (2 * m) as f64).sqrt() * st * p[(m - 1) * n + (m - 1)];
+    }
+    for m in 0..n - 1 {
+        p[(m + 1) * n + m] = ((2 * m + 3) as f64).sqrt() * ct * p[m * n + m];
+    }
+    for m in 0..n {
+        for l in m + 2..n {
+            let (lf, mf) = (l as f64, m as f64);
+            let a = ((4.0 * lf * lf - 1.0) / (lf * lf - mf * mf)).sqrt();
+            let b = (((lf - 1.0) * (lf - 1.0) - mf * mf) / (4.0 * (lf - 1.0) * (lf - 1.0) - 1.0)).sqrt();
+            p[l * n + m] = a * (ct * p[(l - 1) * n + m] - b * p[(l - 2) * n + m]);
+        }
+    }
+    let mut dp = [0.0f64; COUNT];
+    for l in 0..n {
+        for m in 0..=l {
+            let (lf, mf) = (l as f64, m as f64);
+            let below = if l > m { ((2.0 * lf + 1.0) * (lf * lf - mf * mf) / (2.0 * lf - 1.0)).sqrt() * p[(l - 1) * n + m] } else { 0.0 };
+            dp[l * n + m] = (lf * ct * p[l * n + m] - below) / st;
+        }
+    }
+    let sqrt2 = std::f64::consts::SQRT_2;
+    for l in 0..n {
+        out[l * l + l] = p[l * n];
+        d_theta[l * l + l] = dp[l * n];
+        for m in 1..=l {
+            let (s, c) = (m as f64 * phi).sin_cos();
+            out[l * l + l + m] = sqrt2 * p[l * n + m] * c;
+            out[l * l + l - m] = sqrt2 * p[l * n + m] * s;
+            d_theta[l * l + l + m] = sqrt2 * dp[l * n + m] * c;
+            d_theta[l * l + l - m] = sqrt2 * dp[l * n + m] * s;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +267,38 @@ mod tests {
                 let want = if a == b { 1.0 } else { 0.0 };
                 assert!((gram[a * 25 + b] - want).abs() < 2e-3, "⟨Y{a}, Y{b}⟩ = {}", gram[a * 25 + b]);
             }
+        }
+    }
+
+    #[test]
+    fn theta_derivatives_match_finite_differences() {
+        let (theta, phi) = (1.1f64, 0.7f64);
+        let dir = |t: f64| DVec3::new(t.sin() * phi.cos(), t.sin() * phi.sin(), t.cos());
+        let mut y = [0.0f64; COUNT];
+        let mut dy = [0.0f64; COUNT];
+        harmonics_with_theta(dir(theta), &mut y, &mut dy);
+        let (mut a, mut b) = ([0.0f64; COUNT], [0.0f64; COUNT]);
+        let h = 1e-6;
+        harmonics(dir(theta + h), &mut a);
+        harmonics(dir(theta - h), &mut b);
+        for k in 0..COUNT {
+            let fd = (a[k] - b[k]) / (2.0 * h);
+            assert!((fd - dy[k]).abs() < 1e-5 * (1.0 + fd.abs()), "k {k}: {} vs {fd}", dy[k]);
+        }
+    }
+
+    #[test]
+    fn the_analytic_gradient_matches_central_differences() {
+        let g = 33;
+        let radius = 1.0e6;
+        let datum = DatumField::sample(g, 0.0, |d| 3.0e4 * (d.x.abs() + d.y.abs() + d.z.abs() - 1.4) + 5.0e3 * d.x * d.y);
+        let relief = Relief::new(DVec3::new(1.0e5, -2.0e5, 3.0e5), radius, 5.0, &datum);
+        // Not on the layer itself: its normal pull jumps there, which a central difference straddles.
+        for (i, f) in [0.4f64, 0.97, 0.999, 1.001, 1.03, 2.5].iter().enumerate() {
+            let dir = DVec3::new(0.3 + i as f64 * 0.17, -0.8 + i as f64 * 0.3, 0.5 - i as f64 * 0.21).normalize();
+            let p = relief.centre + dir * radius * f;
+            let (a, n) = (relief.accel(p), relief.accel_numeric(p));
+            assert!((a - n).length() < 1e-5 * n.length().max(1e-12), "at {f}: {a} vs {n}");
         }
     }
 
