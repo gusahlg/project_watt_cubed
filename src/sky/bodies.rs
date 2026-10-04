@@ -309,6 +309,24 @@ fn home_impostor(cosmos: &Cosmos, body: &Body) -> (FarShape, f64) {
     (FarShape::Rounded { exponent: rounded_exponent(k) }, radius)
 }
 
+/// A sagging cube (its grid bent by its warp) drawn as the rounded shape its warp gives: face radius
+/// from the warped face centre, exponent from the warped corner over that face radius.
+fn warped_impostor(atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> Option<(FarShape, f64)> {
+    let Shape::Cube { half } = body.shape else { return None };
+    let warp = atlases.iter().find_map(|a| a.grid.as_ref().is_some_and(|g| g.body == body.id).then(|| a.warp.as_ref()).flatten())?;
+    let (c, h) = (body.centre_f(), half as f64);
+    let face = (0..3)
+        .flat_map(|a| [1.0, -1.0].map(move |s| (a, s)))
+        .map(|(a, s)| {
+            let mut d = DVec3::ZERO;
+            d[a] = s * h;
+            (warp.apply(c + d) - c).length()
+        })
+        .fold(f64::INFINITY, f64::min);
+    let corner = (warp.apply(c + DVec3::splat(h)) - c).length();
+    Some((FarShape::Rounded { exponent: rounded_exponent(corner / face) }, face))
+}
+
 /// One catalog body as seen from `eye`, or nothing while voxels cover it.
 fn impostor(
     cosmos: &Cosmos,
@@ -322,6 +340,9 @@ fn impostor(
     let (mut shape, albedo, atmosphere) = paint(body, twin_ordinal);
     let radius = if body.kind == Kind::Home {
         let (rounded, radius) = home_impostor(cosmos, body);
+        shape = rounded;
+        radius
+    } else if let Some((rounded, radius)) = warped_impostor(atlases, body) {
         shape = rounded;
         radius
     } else {
@@ -369,6 +390,8 @@ mod tests {
     fn radius_f(cosmos: &Cosmos, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> f32 {
         let radius = if body.kind == Kind::Home {
             home_impostor(cosmos, body).1
+        } else if let Some((_, r)) = warped_impostor(atlases, body) {
+            r
         } else {
             shown_radius(atlases, body) - sink_in(cosmos, body).unwrap_or(0.0)
         };
@@ -431,7 +454,12 @@ mod tests {
             let got = got.expect("missing far body");
             finite_unit(got);
             let shape = match body.kind {
-                Kind::Twin => FarShape::Cube,
+                Kind::Twin => {
+                    let (rounded, _) = warped_impostor(terrain.atlases(), body).expect("the twins sag");
+                    let FarShape::Rounded { exponent } = rounded else { panic!("a twin draws rounded") };
+                    assert!((6.0..=16.0).contains(&exponent), "twin exponent {exponent}");
+                    rounded
+                }
                 Kind::Home => home_impostor(cosmos, body).0,
                 _ => FarShape::Sphere,
             };
