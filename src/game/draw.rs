@@ -22,7 +22,7 @@ pub(super) struct DrawState {
     /// Frozen lighting by day, content revision, space factor, and body up.
     static_frame_cache: Memo<(u64, u64, u32, [u32; 3]), StaticFrame>,
     anim_uv_cache: Memo<[u64; 2], [f32; 2]>,
-    coord_cache: Memo<[i64; 3], String>,
+    coord_cache: Memo<[i64; 4], String>,
     fps_cache: Memo<i32, String>,
     fps_refresh: RateGate,
     online_cache: Memo<(usize, Option<u32>), String>,
@@ -287,13 +287,16 @@ impl Game {
         }
         let p = self.player.position;
         // 0.1-block display resolution: only re-format when a shown digit moves.
+        let cruise = self.player.cruise.map(|c| c.speed * crate::math::BLOCK_METERS / 1000.0);
         let key = [
             (p.x * 10.0) as i64,
             (p.y * 10.0) as i64,
             (p.z * 10.0) as i64,
+            cruise.map_or(-1, |km_s| km_s as i64),
         ];
-        self.drawing.coord_cache.get_or(key, || {
-            format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z)
+        self.drawing.coord_cache.get_or(key, || match cruise {
+            Some(km_s) => format!("X: {:.1}    Y: {:.1}    Z: {:.1}    CRUISE {km_s:.0} km/s", p.x, p.y, p.z),
+            None => format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z),
         });
         // Scripted (harness) frames pin the readout: a live FPS number is the
         // one nondeterministic pixel region in an otherwise reproducible shot,

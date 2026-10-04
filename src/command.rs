@@ -71,6 +71,7 @@ commands! {
     "time", "  /time [set|length]    show or set the day/night clock" => time(args, sky);
     "walkspeed", "  /walkspeed [n]        show or set ground walk speed" => walkspeed(args, player);
     "flyspeed", "  /flyspeed [n]         show or set flying speed" => flyspeed(args, player);
+    "cruise", "  /cruise [n|off]       super speed (up to light speed) with the world held still" => cruise(args, player, world);
     "mute", "  /mute                 toggle master mute (this session)" => mute(settings);
     "deafen", "  /deafen               toggle hearing incoming voice" => deafen(settings);
     "audio" | "volume", "  /audio <chan> <0-100> set master/effects/voice volume" => audio(args, settings);
@@ -473,6 +474,43 @@ fn voicetest() -> Vec<Line> {
     shown(vec!["queued a voice test cue".to_string()])
 }
 
+/// `cruise [n|off]` — start cruising (at `n` units/second, default [`CRUISE_DEFAULT`]), change
+/// the speed of a cruise, or end it (`off`, or no argument while cruising). Ending lands like a
+/// teleport at the current point, lifted clear of the ground when it is inside a world.
+fn cruise(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
+    use crate::player::{CRUISE_DEFAULT, CRUISE_MAX};
+    let km_s = |v: f64| v * crate::math::BLOCK_METERS / 1000.0;
+    let speed = match args {
+        [] if player.cruising() => None,
+        [] => Some(CRUISE_DEFAULT),
+        ["off"] => None,
+        [value] => match value.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 && v <= CRUISE_MAX => Some(v),
+            Ok(v) if v.is_finite() && v > CRUISE_MAX => {
+                return rejected(vec![format!("/cruise: at most {CRUISE_MAX:.0} (the speed of light)")]);
+            }
+            _ => return rejected(vec!["/cruise: speed must be a positive number, or off".to_string()]),
+        },
+        _ => return rejected(vec!["usage: /cruise [<units/second>|off]".to_string()]),
+    };
+    match speed {
+        Some(v) => {
+            let started = !player.cruising();
+            player.start_cruise(v);
+            let mut lines = vec![format!("cruising at {v:.0} ({:.0} km/s); /cruise off to stop", km_s(v))];
+            if started {
+                lines.push("the world holds still: forward flies where you look, through everything".into());
+            }
+            shown(lines)
+        }
+        None if player.end_cruise() => {
+            let target = world.clear_of_ground(player.position);
+            place(target, player, world)
+        }
+        None => rejected(vec!["/cruise: not cruising".to_string()]),
+    }
+}
+
 /// `walkspeed [n]` — show or set the player's ground walk speed, units/second.
 fn walkspeed(args: &[&str], player: &mut Player) -> Vec<Line> {
     set_speed(args, "/walkspeed", player, |p| &mut p.speed)
@@ -639,6 +677,7 @@ mod tests {
              /time [set|length]    show or set the day/night clock\n  \
              /walkspeed [n]        show or set ground walk speed\n  \
              /flyspeed [n]         show or set flying speed\n  \
+             /cruise [n|off]       super speed (up to light speed) with the world held still\n  \
              /mute                 toggle master mute (this session)\n  \
              /deafen               toggle hearing incoming voice\n  \
              /audio <chan> <0-100> set master/effects/voice volume\n  \
@@ -954,6 +993,40 @@ mod tests {
         // Near the ground: no note.
         let out = run("tp 0.5 60 0.5", &mut p, &mut w);
         assert_eq!(out.len(), 1, "{:?}", out.iter().map(|l| l.text()).collect::<Vec<_>>());
+    }
+
+    /// `/cruise` starts a light-speed-capable noclip flight, changes its speed, refuses more than
+    /// light speed, and ends at rest in flight, lifted out of the ground when it ends inside a world.
+    #[test]
+    fn cruise_starts_changes_and_ends_clear_of_the_ground() {
+        use crate::player::{CRUISE_DEFAULT, CRUISE_MAX};
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        let mut w = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let mut p = player();
+        run("cruise", &mut p, &mut w);
+        assert_eq!(p.cruise.map(|c| c.speed), Some(CRUISE_DEFAULT));
+        assert!(p.noclip());
+        run("cruise 5e7", &mut p, &mut w);
+        assert_eq!(p.cruise.map(|c| c.speed), Some(5e7));
+        let out = run("cruise 1e12", &mut p, &mut w);
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
+        assert_eq!(p.cruise.map(|c| c.speed), Some(5e7));
+        assert!(p.speed_limit() >= CRUISE_MAX);
+
+        // Deep inside the start world (100 km under spawn): ending lifts the player above its ground.
+        p.position = DVec3::new(0.5, -100_000.0, 0.5);
+        crate::input::movement::set_velocity_for_test(&mut p, DVec3::new(3.0e8, 0.0, 0.0));
+        run("cruise off", &mut p, &mut w);
+        assert!(!p.cruising());
+        assert!(p.flying() && !p.noclip(), "in ordinary flight");
+        assert_eq!(p.velocity(), DVec3::ZERO);
+        let cosmos = w.terrain().cosmos().unwrap();
+        let alt = cosmos.altitude(cosmos.home(), p.position);
+        assert!(alt > crate::world::terrain::cosmos::RELIEF as f64, "above the ground: {alt}");
+        assert!(alt < 3_000.0, "but not far above: {alt}");
+        let out = run("cruise off", &mut p, &mut w);
+        assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
     }
 
     #[test]

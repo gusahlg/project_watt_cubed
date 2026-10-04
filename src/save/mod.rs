@@ -311,6 +311,21 @@ mod tests {
         assert_eq!(player.velocity(), DVec3::new(0.0, -40.0, 0.0));
     }
 
+    /// A save taken mid-cruise holds where ending the cruise would land: at rest, in flight, clear
+    /// of the ground. The cruise itself is not saved.
+    #[test]
+    fn a_cruise_is_saved_as_its_landing() {
+        let world = World::new(3);
+        let mut player = Player::new(DVec3::new(4.5, 10.0, 4.5)); // under the flat ground
+        player.start_cruise(crate::player::CRUISE_MAX);
+        let mods = crate::modding::testing::standard();
+        let doc = super::bridge::to_doc(&world, &player, &mods, meta("cruise")).unwrap();
+        let saved = &doc.player;
+        assert_eq!(saved.velocity, [0.0; 3]);
+        assert!(saved.flying && !saved.noclip);
+        assert!(saved.pos[1] >= world.surface_y(4, 4) as f64 + 2.0, "lifted out of the ground: {:?}", saved.pos);
+    }
+
     #[test]
     fn legacy_inventory_mod_line_is_ignored() {
         let mut doc = bare_doc();

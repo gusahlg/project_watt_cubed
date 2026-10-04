@@ -57,18 +57,24 @@ impl SaveSnapshot {
         let specs = (0..registry.block_count())
             .map(|i| registry.spec(BlockId(i as u16)))
             .collect();
+        // A cruise is not saved: the save holds where ending it now would land (at rest, in flight,
+        // clear of the ground), so a rejoin never resumes a light-speed flight.
+        let (pos, velocity, flying, noclip) = match player.cruise {
+            Some(cruise) => (world.clear_of_ground(player.position), DVec3::ZERO, true, cruise.noclip),
+            None => (player.position, player.velocity(), player.flying(), player.noclip()),
+        };
         Self {
             overlay: world.clone_edit_overlay(),
             player: PlayerState {
-                pos: [player.position.x, player.position.y, player.position.z],
+                pos: pos.to_array(),
                 yaw: player.orientation.yaw,
                 pitch: player.orientation.pitch,
                 frame: player.orientation.frame,
-                velocity: player.velocity().to_array(),
+                velocity: velocity.to_array(),
                 up: player.up_axis as u8,
                 legacy_pose: false,
-                flying: player.flying(),
-                noclip: player.noclip(),
+                flying,
+                noclip,
                 stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
             },
             mods: mods.save_states(world),

@@ -151,6 +151,11 @@ pub fn update_player_in(player: &mut Player, world: &World, atlas: &crate::space
     trauma
 }
 
+#[cfg(test)]
+pub(crate) fn set_velocity_for_test(player: &mut Player, v: DVec3) {
+    set_velocity(player, v);
+}
+
 fn set_velocity(player: &mut Player, v: DVec3) {
     match &mut player.motion {
         Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = v,
@@ -180,7 +185,14 @@ fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity:
     let walk_speed = player.speed;
     let fly_speed = player.fly_speed;
 
+    let cruise = player.cruise.map(|c| (c.speed, cruise_heading(player, input)));
     let delta = match &mut player.motion {
+        // Cruising: along the view direction (and strafe/rise), at the cruise speed.
+        Motion::Flying { velocity, .. } if cruise.is_some() => {
+            let (speed, heading) = cruise.expect("guarded");
+            *velocity = approach(*velocity, heading * speed, FLY_ACCEL, dt);
+            *velocity * dt
+        }
         // Flying: velocity chases a directly-commanded target on all three body axes.
         Motion::Flying { velocity, .. } => {
             let target = heading * fly_speed + up * (input.move_y as f64 * fly_speed);
@@ -230,7 +242,7 @@ fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity:
 
     // The hard speed limit (see `MAX_SPEED`): collision cost grows with the step.
     let v = player.velocity();
-    let capped = crate::player::capped_velocity(v);
+    let capped = crate::player::capped_velocity(v, player.speed_limit());
     let delta = if capped == v && delta.is_finite() {
         delta
     } else {
@@ -284,6 +296,16 @@ fn resolve_axis(player: &mut Player, world: &World) {
 /// The unit-length movement direction in the body's horizontal plane for this frame, or zero
 /// when no movement key is held. Computed only when a key is active — otherwise we'd run the yaw
 /// trig, a normalize, and a scale just to produce a zero vector.
+/// The cruise direction: forward along the view (pitch included), strafe across it, rise along the
+/// body's up; unit length, zero with no keys held.
+fn cruise_heading(player: &Player, input: &MoveInput) -> DVec3 {
+    let (_, right) = player.movement_basis();
+    let d = player.orientation.direction() * input.move_z as f64
+        + right * input.move_x as f64
+        + player.orientation.up() * input.move_y as f64;
+    d.normalize_or_zero()
+}
+
 fn horizontal_heading(player: &Player, input: &MoveInput) -> DVec3 {
     if input.move_z == 0.0 && input.move_x == 0.0 {
         return DVec3::ZERO;
@@ -513,7 +535,32 @@ mod tests {
         assert!(nan.position.is_finite() && nan.velocity().is_finite());
     }
 
-    /// Build a flat stone runway at `y = floor_y` under the given start, long
+    /// A cruise flies where the view points at its speed, through solid ground, with no gravity, and
+    /// a step costs the same at light speed; past light speed it is clamped.
+    #[test]
+    fn a_cruise_flies_along_the_view_at_any_speed() {
+        let mut world = World::new(5);
+        let start = DVec3::new(0.5, 30.0, 0.5); // under the flat ground
+        world.ensure_around(start);
+        let mut player = Player::new(start);
+        player.orientation.pitch = -0.5; // looking down into the ground
+        player.start_cruise(crate::player::CRUISE_MAX);
+        let forward = player.orientation.direction();
+        let t = std::time::Instant::now();
+        for _ in 0..120 {
+            update_player(&mut player, &world, &walk_forward(), 1.0 / 60.0, down());
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(250), "120 steps took {:?}", t.elapsed());
+        let moved = player.position - start;
+        assert!(moved.normalize().dot(forward) > 0.999, "along the view: {moved}");
+        let v = player.velocity().length();
+        assert!(v > 0.99 * crate::player::CRUISE_MAX && v <= crate::player::CRUISE_MAX * (1.0 + 1e-12), "{v}");
+        set_velocity(&mut player, DVec3::new(1.0e12, 0.0, 0.0));
+        update_player(&mut player, &world, &idle(), 1.0 / 60.0, down());
+        assert!(player.velocity().length() <= crate::player::CRUISE_MAX * (1.0 + 1e-12));
+    }
+
+    /// Build a flat stone runway at `y = floor_y` under the given start, long    /// Build a flat stone runway at `y = floor_y` under the given start, long
     /// enough for the walk tests, and stand the player on it. The generator
     /// puts real terrain up here (heights reach ~52 at the far columns), so
     /// standing room is CARVED above the runway — the runway must be the only

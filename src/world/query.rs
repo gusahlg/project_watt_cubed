@@ -39,6 +39,39 @@ impl World {
         }
     }
 
+    /// `p`, or the nearest point straight out of the ground when `p` is inside a body or within its
+    /// relief band: where a cruise or a runaway save may safely end (the player never lands in rock).
+    /// Inside the Hollow's cavity, out of the shell's solid means into the cavity. On a flat world,
+    /// two blocks above the column's surface.
+    pub fn clear_of_ground(&self, p: voxel_engine::DVec3) -> voxel_engine::DVec3 {
+        use voxel_engine::DVec3;
+        let Some(cosmos) = self.generator.cosmos() else {
+            let top = self.surface_y(p.x.floor() as i32, p.z.floor() as i32) as f64 + 2.0;
+            return if p.y < top { DVec3::new(p.x, top, p.z) } else { p };
+        };
+        let Some(body) = cosmos.body_at(p) else { return p };
+        if cosmos.hollow_cavity(p).is_some() {
+            return p;
+        }
+        let clear = crate::world::terrain::cosmos::RELIEF as f64 + 64.0;
+        let centre = body.centre_f();
+        let mut q = p;
+        for _ in 0..6 {
+            let alt = cosmos.altitude(body, q);
+            if alt >= clear - 1.0 {
+                break;
+            }
+            // Out along the radius, or in toward the centre where altitude grows that way (the
+            // inner side of a shell).
+            let mut up = (q - centre).normalize_or(DVec3::Y);
+            if cosmos.altitude(body, q + up) < alt {
+                up = -up;
+            }
+            q += up * (clear - alt);
+        }
+        q
+    }
+
     /// The world's gravitational field.
     pub(crate) fn gravity(&self) -> &crate::gravity::Field {
         &self.gravity

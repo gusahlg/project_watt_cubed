@@ -1023,9 +1023,12 @@ impl Game {
                         let mut tick_input = *mi;
                         tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
                         tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
-                        let gravity = self.gravity_at(self.player.position);
+                        // A cruise feels no gravity and moves physically (its steps outrun any patch).
+                        let cruising = self.player.cruising();
+                        let gravity = if cruising { DVec3::ZERO } else { self.gravity_at(self.player.position) };
                         // On a round world the step runs in the storage frame of the patch underfoot.
-                        let trauma = match self.world.atlas_at(self.player.position) {
+                        let patch = if cruising { None } else { self.world.atlas_at(self.player.position) };
+                        let trauma = match patch {
                             Some(atlas) => movement::update_player_in(
                                 &mut self.player,
                                 &self.world,
@@ -1183,7 +1186,9 @@ impl Game {
         } else {
             self.stream_gate.steps(dt) != 0
         };
-        if !stream_due {
+        // A cruise holds the world still: in-flight work lands, nothing new streams around the
+        // player. Ending it streams the destination like a teleport.
+        if !stream_due || self.player.cruising() {
             self.world
                 .pump(Some(&mut *eng), &mut self.sched, mods.appearance());
             return;
@@ -1265,7 +1270,7 @@ impl Game {
             CameraMode::Free { rig, .. } => rig.pos,
             CameraMode::Person(_) => self.player.position,
         };
-        if stream_due {
+        if stream_due && !self.player.cruising() {
             self.world
                 .stream(stream_center, None, &mut self.sched, mods.appearance());
         } else {

@@ -29,13 +29,29 @@ pub const DEFAULT_FLY_SPEED: f64 = 14.0 * PER_METER;
 /// seconds or for ever. `/flyspeed` and `/walkspeed` stop here and movement clamps to it.
 pub const MAX_SPEED: f64 = 100_000.0 * PER_METER;
 
-/// `v` held to [`MAX_SPEED`] (direction kept); a non-finite vector is no motion.
-pub fn capped_velocity(v: DVec3) -> DVec3 {
+/// `v` held to `limit` (direction kept); a non-finite vector is no motion.
+pub fn capped_velocity(v: DVec3, limit: f64) -> DVec3 {
     if !v.is_finite() {
         return DVec3::ZERO;
     }
     let len = v.length();
-    if len > MAX_SPEED { v * (MAX_SPEED / len) } else { v }
+    if len > limit { v * (limit / len) } else { v }
+}
+
+/// The fastest cruise, units/second: the speed of light.
+pub const CRUISE_MAX: f64 = 299_792_458.0 * PER_METER;
+/// The cruise speed `/cruise` starts at when it names none: 1,000 km/s.
+pub const CRUISE_DEFAULT: f64 = 1_000_000.0 * PER_METER;
+
+/// Cruise: flight past [`MAX_SPEED`] for crossing the universe. The world holds still while it
+/// lasts (no streaming around the player), the player passes through everything (noclip) along the
+/// view direction, and no gravity applies, so a step costs the same at any speed. Not saved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cruise {
+    /// Units/second, at most [`CRUISE_MAX`].
+    pub speed: f64,
+    /// Whether the player was in noclip flight before; ending the cruise restores it.
+    pub noclip: bool,
 }
 
 /// A fresh player's health, and the ceiling it's created at. Health is an intrinsic
@@ -149,6 +165,8 @@ pub struct Player {
     pub health: f32,
     /// Elements this player holds. Core-owned; mods present and spend it.
     pub stash: ElementStash,
+    /// Cruising past the speed limit (see [`Cruise`]); `None` in ordinary motion.
+    pub cruise: Option<Cruise>,
 }
 
 impl Player {
@@ -164,6 +182,7 @@ impl Player {
             fly_speed: DEFAULT_FLY_SPEED,
             health: MAX_HEALTH,
             stash: ElementStash::new(START_CAPACITY),
+            cruise: None,
         }
     }
 
@@ -222,6 +241,35 @@ impl Player {
         } else {
             Motion::Flying { velocity, noclip: true }
         };
+    }
+
+    pub fn cruising(&self) -> bool {
+        self.cruise.is_some()
+    }
+
+    /// The speed movement holds the player to: [`CRUISE_MAX`] while cruising, else [`MAX_SPEED`].
+    pub fn speed_limit(&self) -> f64 {
+        if self.cruising() { CRUISE_MAX } else { MAX_SPEED }
+    }
+
+    /// Start cruising at `speed` (clamped to `(0, CRUISE_MAX]`), or change the speed of a cruise.
+    /// Starting enters noclip flight with the current velocity.
+    pub fn start_cruise(&mut self, speed: f64) {
+        let speed = speed.clamp(f64::MIN_POSITIVE, CRUISE_MAX);
+        match &mut self.cruise {
+            Some(cruise) => cruise.speed = speed,
+            None => {
+                self.cruise = Some(Cruise { speed, noclip: self.noclip() });
+                self.motion = Motion::Flying { velocity: self.velocity(), noclip: true };
+            }
+        }
+    }
+
+    /// Stop cruising: at rest, in flight (noclip if it was before). False when not cruising.
+    pub fn end_cruise(&mut self) -> bool {
+        let Some(cruise) = self.cruise.take() else { return false };
+        self.motion = Motion::Flying { velocity: DVec3::ZERO, noclip: cruise.noclip };
+        true
     }
 
     /// Drop any accumulated velocity along the up axis (e.g. after a teleport, so the player
