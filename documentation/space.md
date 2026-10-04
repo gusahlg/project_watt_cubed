@@ -46,9 +46,10 @@ stopping in one step. Above the air, and wherever no body is near, a walker is i
 velocity takes the whole gravity vector, with no terminal speed, and the movement keys do nothing.
 `F` toggles walking and flying. `/noclip` toggles flight through geometry.
 
-Because gravity is the honest vector sum, a huge cube is not "flat": each face is a vast shallow
-bowl — level at its centre, tilting 16° halfway to an edge and 45° at the edge, with the corners the
-highest ground of all.
+Because gravity is the honest vector sum, a cube that keeps its shape (the twins) is not "flat":
+each face is a vast shallow bowl — level at its centre, tilting 16° halfway to an edge and 45° at
+the edge, with the corners the highest ground of all. A body weak enough for its size to flow
+(`Π_g = Gρ²L²/Y` well above one) relaxes toward a ball instead; the start world did.
 
 ## Round worlds on curved charts
 
@@ -73,13 +74,18 @@ things know about curvature:
 Which bodies get charts is a choice the generator makes about the world's initial layout; physics
 never asks what kind of body it is standing on.
 
-## The universe (InfiniteDiffusion, worldgen 7)
+## The universe (InfiniteDiffusion, worldgen 9)
 
 One seeded catalog (`world::terrain::cosmos`) describes everything; physical space between bodies is
 empty and costs nothing (chunks there classify as air without being generated).
 
-- **The start cube** — 50,000,000 blocks on a side, centred 25,000,000 below the origin so its +Y
-  face is `y = 0` and spawn sits at that face's centre. Each face is its own realm of 26 themes
+- **The start world** — a cube of matter 50,000,000 blocks on a side that relaxed under its own
+  gravity (`mechanics::genesis`; its rock mix has `Π_g ≈ 45`): it rounded into a ball of radius
+  31,017,520 whose old corners stay as broad highlands (up to +1.04M blocks) over shallow face
+  lowlands (down to −278k). It is laid out on cube-sphere charts **fitted to that shape** (band 0 is
+  lifted onto the relaxed datum, so blocks stay nearly cubic and the ground follows the shape
+  physics produced), and centred so the top of its +Y face is `y = 0` with spawn there. Each chart
+  face is painted by its old cube face's realm of 26 themes
   (meadows and giant forests, canyons and mesas, glaciers, volcanic and ash fields, crystal plains,
   fungal and glow-moss hollows, bone lands, crater fields, sky-island archipelagos…) laid out as
   regions and provinces with soft gradients between them; edges blend into a shared rim.
@@ -90,12 +96,12 @@ empty and costs nothing (chunks there classify as air without being generated).
   are rarer: ruined towers, step pyramids, stone circles, monoliths, walled temple courts, mine
   headframes over the mine levels, canyon bridges, waystones on the lines between them, and
   observatories whose dish points at the nearest big body in the sky. Below a 350-block crust the bulk is a mix
-  whose mean amount sets the cube's gravity, carved by **the interior** (`world::terrain::deep`):
+  whose mean amount sets the world's gravity (a ball plus its relief as a harmonic surface layer,
+  `gravity::relief`), carved by **the interior** (`world::terrain::deep`):
   Deep caverns in six biomes with giant mushrooms and shafts, dwarf halls with pillars, stairs, rails
-  and lamps, Underdark chambers with spires and lanterns, mantle bubbles, and the hollow Heart at the
-  centre. Every cavern biome carries its own light (glowcap, glowshroom, magma), so most of a
-  cavern floor is within a dozen blocks of a light source. The mass the generator reports subtracts the Heart and every bubble, so the pull inside
-  them is the honest one.
+  and lamps, Underdark chambers with spires and lanterns, and mantle bubbles where they reach the
+  chart's outer band. Every cavern biome carries its own light (glowcap, glowshroom, magma), so most of a
+  cavern floor is within a dozen blocks of a light source.
 - **The Twins** — two 12,000,000-block cubes facing each other across a weightless canyon.
 - **Verdance** — a round world of radius 8,000,000: forested ranges, lakes, groves of colossal
   trees, stone arches and tepuis.
