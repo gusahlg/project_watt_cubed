@@ -143,6 +143,30 @@ pub(super) fn porosity(scale: f32) -> f64 {
     vol / (cell * cell * cell) * f64::from(P) * s
 }
 
+/// Volume fraction of the underdark shell occupied by floor lights.
+///
+/// Same single block per site as the caverns. The fill still counts the floor as bulk; the bound
+/// uses a whole bulk-density cell so a soil-to-glowcap swap is inside it.
+pub(super) fn light_phi(scale: f32) -> f64 {
+    let s = f64::from(scale.clamp(0.0, 2.0));
+    if s == 0.0 {
+        return 0.0;
+    }
+    let sum_sq = |n: i64| {
+        if n <= 0 {
+            0.0
+        } else {
+            let n = n as f64;
+            n * (n + 1.0) * (2.0 * n + 1.0) / 6.0
+        }
+    };
+    let mean_r2 = (sum_sq(R_HI) - sum_sq(R_LO - 1)) / (R_HI - R_LO + 1) as f64;
+    let area = std::f64::consts::PI * mean_r2;
+    let cells = area / (super::glow::GAP as f64 * super::glow::GAP as f64);
+    let dress = f64::from(s.min(1.0));
+    cells / (CELL as f64 * CELL as f64 * CELL as f64) * f64::from(P) * s * dress
+}
+
 pub(super) fn hits(ctx: &Ctx, lo: [i64; 3], hi: [i64; 3]) -> bool {
     for_cells(lo, hi, CELL, |idx| site(ctx, idx).is_some_and(|s| sphere_hits(s.center, s.r, lo, hi)))
         || for_shafts(lo, hi, CELL, SHAFT_PAD, |idx| {
@@ -229,6 +253,9 @@ fn interior(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> BlockId {
         return if h % 3 == 0 { m.limestone } else { m.rock[(h as usize) % 4] };
     }
     if o == floor {
+        if let Some(id) = super::glow::at(s.salt ^ 0xC14A, ctx.scale, t0, t1, 1.0, m.glowcap) {
+            return id;
+        }
         return match hash_rel(s.salt ^ 0xF100, rel) % 5 {
             0 => m.moss,
             1 => m.lichen,
@@ -316,6 +343,112 @@ fn lantern(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> Option<Block
         }
     }
     None
+}
+
+#[cfg(test)]
+fn measure(ctx: &Ctx, s: &Site) -> super::Cover {
+    // Every column, the open floor only. A stride would hide a light that sits between samples.
+    measure_band(ctx, s, 2, 1, s.r)
+}
+
+#[cfg(test)]
+fn measure_band(ctx: &Ctx, s: &Site, above: i64, step: i64, cap: i64) -> super::Cover {
+    let (c0, c1) = tangent(s.center, s.up.axis);
+    let mut floors = Vec::new();
+    let mut lights = Vec::new();
+    let span = s.r.min(cap + 12);
+    let cap2 = cap * cap;
+    let mut t1 = c1 - span;
+    while t1 <= c1 + span {
+        let mut t0 = c0 - span;
+        while t0 <= c0 + span {
+            let (d0, d1) = (t0 - c0, t1 - c1);
+            if d0 * d0 + d1 * d1 > span * span {
+                t0 += step;
+                continue;
+            }
+            let on_floor = d0 * d0 + d1 * d1 <= cap2;
+            if let Some(floor) = floor_of(s, t0, t1) {
+                let ceil = ceil_of(s, t0, t1).unwrap_or(floor);
+                let hi = (floor + above).min(ceil);
+                let below = place_o(s, t0, t1, floor - 1);
+                let mut below_solid = !contains(s, below) || interior(ctx, s, below) != AIR;
+                for o in floor..=hi {
+                    let rel = place_o(s, t0, t1, o);
+                    if !contains(s, rel) {
+                        below_solid = true;
+                        continue;
+                    }
+                    let id = interior(ctx, s, rel);
+                    if super::emits_light(ctx.m, id) {
+                        lights.push(rel);
+                    }
+                    if id == AIR && below_solid && on_floor {
+                        floors.push(rel);
+                    }
+                    below_solid = id != AIR;
+                }
+            }
+            t0 += step;
+        }
+        t1 += step;
+    }
+    let near = super::NearLights::new(lights).count(&floors);
+    super::Cover {
+        kind: 0,
+        r: s.r,
+        center: s.center,
+        up_axis: s.up.axis,
+        up_sign: s.up.sign,
+        floor: floors.len() as u32,
+        near,
+        step,
+    }
+}
+
+#[cfg(test)]
+fn place_o(s: &Site, t0: i64, t1: i64, o: i64) -> [i64; 3] {
+    super::place(s.up.axis, s.up.sign, (t0, t1), o)
+}
+
+#[cfg(test)]
+pub(super) fn survey(ctx: &Ctx, n: usize) -> Vec<super::Cover> {
+    let mut out = Vec::new();
+    let y0 = (ctx.half - i64::from(UNDER_HI)).div_euclid(CELL);
+    let y1 = (ctx.half - i64::from(DEEP_HI)).div_euclid(CELL);
+    for y in y0..=y1 {
+        for z in -8..8 {
+            for x in -8..8 {
+                if let Some(s) = site(ctx, [x, y, z]) {
+                    out.push(measure(ctx, &s));
+                    if out.len() == n {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Smallest chamber in the spawn window. The vertical band stops at the floor lights.
+#[cfg(test)]
+pub(super) fn measure_smallest(ctx: &Ctx) -> Option<super::Cover> {
+    let mut best: Option<([i64; 3], i64)> = None;
+    let y0 = (ctx.half - i64::from(UNDER_HI)).div_euclid(CELL);
+    let y1 = (ctx.half - i64::from(DEEP_HI)).div_euclid(CELL);
+    for y in y0..=y1 {
+        for z in -8..8 {
+            for x in -8..8 {
+                let idx = [x, y, z];
+                let Some(s) = site(ctx, idx) else { continue };
+                if best.is_none_or(|(_, r)| s.r < r) {
+                    best = Some((idx, s.r));
+                }
+            }
+        }
+    }
+    best.and_then(|(idx, _)| site(ctx, idx).map(|s| measure_band(ctx, &s, 2, 1, 40)))
 }
 
 #[cfg(test)]

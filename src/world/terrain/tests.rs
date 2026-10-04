@@ -1100,6 +1100,149 @@ fn the_interior_is_batch_exact_and_the_heart_stays_when_deep_is_off() {
     assert_eq!(off.voxel_at(kx, ky, kz), off.materials().core);
 }
 
+fn emissive(t: &Terrain, id: BlockId) -> bool {
+    let m = t.materials();
+    id == m.lamp || id == m.glowcap || id == m.glowshroom || id == m.magma || id == m.star || id == m.core
+}
+
+/// First solid inward of `center` after an air cell, and that air cell.
+///
+/// Once the walk is in open air it strides, then finishes the last stride one cell at a time so a
+/// thin lining is not stepped over.
+fn inward_shell(t: &Terrain, body: &cosmos::Body, center: [i64; 3]) -> ([i64; 3], [i64; 3]) {
+    let up = deep::Up::of(center);
+    let mut rel = center;
+    let mut prev = center;
+    let mut saw_air = false;
+    let mut step = 1i64;
+    for _ in 0..4_000 {
+        let (x, y, z) = world_of(body, rel);
+        let id = t.voxel_at(x, y, z);
+        if id == AIR {
+            saw_air = true;
+            step = 8;
+        } else if saw_air {
+            if step == 1 {
+                return (rel, prev);
+            }
+            let mut fine = prev;
+            for _ in 0..step {
+                let mut next = fine;
+                next[up.axis] -= i64::from(up.sign);
+                let (x, y, z) = world_of(body, next);
+                if t.voxel_at(x, y, z) != AIR {
+                    return (next, fine);
+                }
+                fine = next;
+            }
+            return (rel, prev);
+        }
+        prev = rel;
+        rel[up.axis] -= i64::from(up.sign) * step;
+    }
+    panic!("no dressed shell inward of {center:?}");
+}
+
+fn match_cells(t: &Terrain, body: &cosmos::Body, cells: &[[i64; 3]]) {
+    let mut seen = Vec::new();
+    for &rel in cells {
+        let (x, y, z) = world_of(body, rel);
+        let key = (x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        chunk_matches_at(t, body, rel);
+    }
+}
+
+/// An emissive cell in the chunk, if the shell dressing landed in this 16-block box.
+fn light_in_chunk(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> Option<[i64; 3]> {
+    let (x, y, z) = world_of(body, rel);
+    let n = CHUNK_SIZE as i32;
+    let (cx, cy, cz) = (x.div_euclid(n), y.div_euclid(n), z.div_euclid(n));
+    let data = t.generate(cx, cy, cz);
+    let c = body.centre;
+    for ly in 0..CHUNK_SIZE {
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                if !emissive(t, data.get(Chunk::index(lx, ly, lz))) {
+                    continue;
+                }
+                let wx = i64::from(cx * n + lx as i32);
+                let wy = i64::from(cy * n + ly as i32);
+                let wz = i64::from(cz * n + lz as i32);
+                return Some([wx - c[0], wy - c[1], wz - c[2]]);
+            }
+        }
+    }
+    None
+}
+
+fn cover_frac(c: &deep::Cover) -> f64 {
+    assert!(c.floor > 0, "no floor cells");
+    f64::from(c.near) / f64::from(c.floor)
+}
+
+/// Each cavern biome, the smallest chamber and the halls light 60% of their floor, and the
+/// dressed shell matches the per-voxel query. `deep = 0` removes the light with the hollow.
+#[test]
+fn interior_lights_cover_the_floor_and_match_per_voxel() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let kinds = t.deep.cover_kinds(&home);
+    assert_eq!(kinds.len(), 6, "six cavern biomes");
+    let mut light = None;
+    for c in &kinds {
+        let frac = cover_frac(c);
+        println!("cavern kind {} r {} floor {} near {} frac {frac:.3}", c.kind, c.r, c.floor, c.near);
+        assert!(frac >= 0.60, "kind {} coverage {frac}", c.kind);
+        let (solid, air) = inward_shell(&t, &home, c.center);
+        match_cells(&t, &home, &[solid, air]);
+        let (a, b) = match c.up_axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        for (da, db) in [(0i64, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let mut rel = solid;
+            rel[a] += da * 16;
+            rel[b] += db * 16;
+            if let Some(found) = light_in_chunk(&t, &home, rel) {
+                if (da, db) != (0, 0) {
+                    chunk_matches_at(&t, &home, found);
+                }
+                light = Some(found);
+                break;
+            }
+        }
+    }
+    let rel = light.expect("a floor light in a dressed shell chunk");
+
+    let chamber = t.deep.cover_chamber(&home).expect("underdark chamber");
+    let frac = cover_frac(&chamber);
+    println!("chamber r {} floor {} near {} frac {frac:.3}", chamber.r, chamber.floor, chamber.near);
+    assert!(frac >= 0.60, "chamber coverage {frac}");
+    let (solid, air) = inward_shell(&t, &home, chamber.center);
+    match_cells(&t, &home, &[solid, air]);
+
+    let halls = t.deep.survey_halls(&home, 4);
+    assert!(halls.len() >= 4, "halls {}", halls.len());
+    for h in &halls {
+        let frac = cover_frac(h);
+        println!("hall len {} floor {} near {} frac {frac:.3}", h.r, h.floor, h.near);
+        assert!(frac >= 0.60, "hall coverage {frac}");
+    }
+    let hall = t.deep.locate_hall(&home).expect("hall");
+    let (solid, air) = inward_shell(&t, &home, hall);
+    match_cells(&t, &home, &[solid, air]);
+
+    let mut reg = BlockRegistry::with_builtins();
+    let off = Terrain::with_cfg(&mut reg, 42, TerrainCfg { deep: 0, ..TerrainCfg::default() });
+    let (x, y, z) = world_of(&home, rel);
+    assert_eq!(off.voxel_at(x, y, z), cube::bulk_id(&off.bulk, &home, rel), "deep=0 left a floor light");
+}
+
 #[test]
 fn interior_porosity_barely_moves_spawn_gravity() {
     use crate::gravity::{Field, Primitive, Shape};
@@ -1581,4 +1724,191 @@ fn every_landmark_family_matches_on_its_face() {
         y >= col.height + 8 && st.is_some_and(|s| s.id == m.darkwood)
     });
     agree_cell(&t, &lush, away, u, y, v);
+}
+
+fn cover_line(label: &str, rows: &[deep::Cover]) {
+    let mut cells = 0u64;
+    let mut near = 0u64;
+    let mut min = 1.0f64;
+    for c in rows {
+        let f = if c.floor == 0 { 0.0 } else { f64::from(c.near) / f64::from(c.floor) };
+        min = min.min(f);
+        cells += u64::from(c.floor);
+        near += u64::from(c.near);
+        let name = if label == "cavern" || label == "named" {
+            match c.kind {
+                0 => "fungal",
+                1 => "geode",
+                2 => "magma",
+                3 => "roots",
+                4 => "cones",
+                5 => "glow",
+                _ => "other",
+            }
+        } else {
+            label
+        };
+        println!(
+            "{label} {name} r={} step={} floor={} near={} frac={f:.3} center={:?}",
+            c.r, c.step, c.floor, c.near, c.center
+        );
+    }
+    let mean = if cells == 0 { 0.0 } else { near as f64 / cells as f64 };
+    let n = rows.len();
+    println!("{label} n={n} floor_cells={cells} near={near} mean={mean:.3} min={min:.3}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn shell_bottom(c: &deep::Cover) -> [i64; 3] {
+    let co = c.center[c.up_axis] * i64::from(c.up_sign);
+    let (t0, t1) = deep::tangent(c.center, c.up_axis);
+    deep::place(c.up_axis, c.up_sign, (t0, t1), co - c.r)
+}
+
+fn world_chunk(body: &cosmos::Body, rel: [i64; 3]) -> [i32; 3] {
+    std::array::from_fn(|i| i32::try_from((body.centre[i] + rel[i]).div_euclid(16)).unwrap())
+}
+
+/// Chunks on the cavern floor (and one layer above it) whose box meets the ball.
+fn floor_chunks(body: &cosmos::Body, c: &deep::Cover, n: usize) -> Vec<[i32; 3]> {
+    let origin = world_chunk(body, shell_bottom(c));
+    let tang = match c.up_axis {
+        0 => [1usize, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let mut out = Vec::new();
+    for dout in 0..3 {
+        for dv in -4..=4 {
+            for du in -4..=4 {
+                let mut coord = origin;
+                coord[tang[0]] += du;
+                coord[tang[1]] += dv;
+                coord[c.up_axis] += dout * c.up_sign;
+                let lo = std::array::from_fn(|i| i64::from(coord[i]) * 16 - body.centre[i]);
+                let hi = std::array::from_fn(|i| lo[i] + 15);
+                if deep::sphere_hits(c.center, c.r, lo, hi) {
+                    out.push(coord);
+                    if out.len() == n {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn fill_face_us(t: &Terrain, coord: ChunkCoord, reps: usize) -> Option<f64> {
+    let Sky::Axis(face) = t.sky(coord) else { return None };
+    let (key, _) = ColumnKey::of(face, coord);
+    let body = t.face_column_body(key)?;
+    let half = cube::half_of(&body);
+    let centre = cube::centre_i32(body.centre)?;
+    let (wu, wv) = key.column_cell_uv(0, 0);
+    let (u0, v0) = cube::tangents(face, centre, wu, wv);
+    let (u0, v0) = (u0 as i32, v0 as i32);
+    let paint = t.paint(&body, face);
+    let seed = cube::rim_seed(&body);
+    let n_dot = cube::normal_dot(body.centre, face);
+    let raw = paint.shape.columns_16(u0, v0);
+    let mut max_terrain = i32::MIN;
+    let mut min_h = i32::MAX;
+    let mut cols = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
+    for (i, mut col) in raw.into_iter().enumerate() {
+        let lu = (i % CHUNK_SIZE) as i32;
+        let lv = (i / CHUNK_SIZE) as i32;
+        let (ub, vb) = (i64::from(u0) + i64::from(lu), i64::from(v0) + i64::from(lv));
+        max_terrain = max_terrain.max(col.height);
+        col.height = cube::blend_height(col.height, seed, face, half, ub, vb);
+        min_h = min_h.min(col.height);
+        cols.push(col);
+    }
+    let tree_blocks = paint.trees.blocks_in(&paint.shape, u0, v0, CHUNK_SIZE as i32);
+    let h0 = cube::face_h(half, n_dot, FaceFrame::new(face).chunk_alt0(coord));
+    let _ = t.fill_face(&body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks);
+    let start = std::time::Instant::now();
+    for _ in 0..reps {
+        std::hint::black_box(t.fill_face(&body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks));
+    }
+    Some(start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+}
+
+/// Coverage of cavern, chamber and hall floors, plus block-light and `fill_deep` cost on one cavern.
+///
+/// `cargo test --release --lib interior_light_report -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn interior_light_report() {
+    use crate::world::chunk::Chunk;
+    use crate::world::light::{self, CeilingWindow, FaceShell, LightGrid};
+
+    let (reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let caverns = t.deep.survey_caverns(&home, 20);
+    cover_line("cavern", &caverns);
+    let chambers = t.deep.survey_chambers(&home, 10);
+    cover_line("chamber", &chambers);
+    let halls = t.deep.survey_halls(&home, 10);
+    cover_line("hall", &halls);
+
+    let named_rel = [-3783 - home.centre[0], -3796 - home.centre[1], 291 - home.centre[2]];
+    if let Some(named) = t.deep.survey_cavern_at(&home, named_rel) {
+        cover_line("named", std::slice::from_ref(&named));
+    } else {
+        println!("named cavern at {named_rel:?} not found");
+    }
+
+    let subject = t.deep.survey_cavern_at(&home, named_rel).or_else(|| caverns.into_iter().next());
+    let Some(subject) = subject else {
+        println!("no cavern to time");
+        return;
+    };
+    let coords = floor_chunks(&home, &subject, 50);
+    println!(
+        "timing {} floor chunks of kind {} r {} at {:?}",
+        coords.len(),
+        subject.kind,
+        subject.r,
+        subject.center
+    );
+    let tables = reg.hot_tables();
+    let ceiling = CeilingWindow::from_heights(Face::PosY, |_, _| i32::MAX);
+    let shell = FaceShell::dark();
+    let mut built = Vec::with_capacity(coords.len());
+    for c in &coords {
+        let data = t.generate(c[0], c[1], c[2]);
+        built.push(Chunk::from_data(c[0], c[1], c[2], data));
+    }
+    let mut emitters = 0u32;
+    for ch in &built {
+        ch.for_each_emission(&tables.emission, |_, _| emitters += 1);
+    }
+    let mut grid = LightGrid::dark();
+    if let Some(ch) = built.first() {
+        light::propagate(ch, &shell, &ceiling, Sky::Axis(Face::PosY), 0, &tables, &mut grid);
+    }
+    let reps = 30;
+    let start = std::time::Instant::now();
+    for _ in 0..reps {
+        for ch in &built {
+            light::propagate(ch, &shell, &ceiling, Sky::Axis(Face::PosY), 0, &tables, &mut grid);
+        }
+    }
+    let light_us = start.elapsed().as_secs_f64() * 1e6 / (reps * built.len().max(1)) as f64;
+    println!("blocklight {light_us:.2} µs/chunk over {} chunks x {reps}, emitters {emitters}", built.len());
+
+    let mut fill_sum = 0.0;
+    let mut fill_n = 0u32;
+    for c in coords.iter().take(12) {
+        let coord = ChunkCoord::new(c[0], c[1], c[2]);
+        if let Some(us) = fill_face_us(&t, coord, 6) {
+            fill_sum += us;
+            fill_n += 1;
+            println!("fill_face chunk {c:?} {us:.1} µs");
+        }
+    }
+    if fill_n > 0 {
+        println!("fill_face mean {:.1} µs/chunk over {fill_n}", fill_sum / f64::from(fill_n));
+    }
 }

@@ -92,7 +92,11 @@ fn inside(h: &Hall, rel: [i64; 3], m: &super::super::Materials) -> Option<BlockI
         return Some(m.marble);
     }
     if along.rem_euclid(8) == 4 && across.abs() == WIDTH / 2 - 2 {
-        return Some(if o == h.floor_o + AIR_H { m.lamp } else { m.marble });
+        // Ceiling lamp, and one at the walkway so the floor — twelve below the ceiling — is lit.
+        if o == h.floor_o + AIR_H || o == h.floor_o + 1 {
+            return Some(m.lamp);
+        }
+        return Some(m.marble);
     }
     Some(AIR)
 }
@@ -120,6 +124,8 @@ fn tunnel(a: &Hall, b: &Hall, axis: usize, rel: [i64; 3], m: &super::super::Mate
     }
     Some(if o == floor {
         if rel[across] == mid { m.rail } else { m.marble }
+    } else if o == floor + 3 && rel[across] == mid && rel[axis].rem_euclid(8) == 4 {
+        m.lamp
     } else {
         AIR
     })
@@ -215,6 +221,72 @@ pub(super) fn block(ctx: &Ctx, rel: [i64; 3]) -> Option<BlockId> {
         return Some(id);
     }
     tunnels_from(ctx, idx, rel)
+}
+
+/// Floor of the room: air with a solid beneath it, against lamps inside the room.
+#[cfg(test)]
+fn measure(ctx: &Ctx, h: &Hall) -> super::Cover {
+    let (lo, hi) = aabb(h);
+    let (ta, tb) = match h.up.axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let o_lo = h.up.outward(lo).min(h.up.outward(hi));
+    let o_hi = h.up.outward(lo).max(h.up.outward(hi));
+    let mut floors = Vec::new();
+    let mut lights = Vec::new();
+    for vb in lo[tb]..=hi[tb] {
+        for va in lo[ta]..=hi[ta] {
+            // One step under the floor is outside the carve, so it is bulk.
+            let mut below_solid = true;
+            for o in o_lo..=o_hi {
+                let rel = super::place(h.up.axis, h.up.sign, (va, vb), o);
+                let Some(id) = inside(h, rel, ctx.m) else {
+                    below_solid = true;
+                    continue;
+                };
+                if super::emits_light(ctx.m, id) {
+                    lights.push(rel);
+                }
+                if id == AIR && below_solid {
+                    floors.push(rel);
+                }
+                below_solid = id != AIR;
+            }
+        }
+    }
+    let near = super::NearLights::new(lights).count(&floors);
+    super::Cover {
+        kind: 0,
+        r: h.length,
+        center: h.center,
+        up_axis: h.up.axis,
+        up_sign: h.up.sign,
+        floor: floors.len() as u32,
+        near,
+        step: 1,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn survey(ctx: &Ctx, n: usize) -> Vec<super::Cover> {
+    let mut out = Vec::new();
+    let y0 = (ctx.half - i64::from(DEEP_HI)).div_euclid(CELL);
+    let y1 = (ctx.half - i64::from(super::super::cube::CRUST)).div_euclid(CELL);
+    for y in y0..=y1 {
+        for z in -24..24 {
+            for x in -24..24 {
+                if let Some(h) = hall_at(ctx, [x, y, z]) {
+                    out.push(measure(ctx, &h));
+                    if out.len() == n {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
