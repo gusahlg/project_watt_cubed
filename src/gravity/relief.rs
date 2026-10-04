@@ -15,6 +15,8 @@ use crate::space::datum::DatumField;
 
 /// Degree of the expansion (a relaxed body's relief is dominated by degrees 4–8).
 pub const L_MAX: usize = 24;
+/// Coefficients of an expansion to [`L_MAX`].
+const COUNT: usize = (L_MAX + 1) * (L_MAX + 1);
 /// Quadrature cells per face edge when projecting a datum (a datum has 33 samples per edge; 128
 /// cells around a great circle resolve degree 24 comfortably).
 const QUADRATURE: usize = 32;
@@ -32,8 +34,8 @@ impl Relief {
     /// The layer of a body of datum `radius` and bulk `density` whose surface sits `datum` above the
     /// sphere.
     pub fn new(centre: DVec3, radius: f64, density: f64, datum: &DatumField) -> Self {
-        let mut h = vec![0.0f64; (L_MAX + 1) * (L_MAX + 1)];
-        let mut y = vec![0.0f64; h.len()];
+        let mut h = vec![0.0f64; COUNT];
+        let mut y = [0.0f64; COUNT];
         let step = 2.0 / QUADRATURE as f64;
         let mut cells = Vec::with_capacity(6 * QUADRATURE * QUADRATURE);
         for f in 0..6 {
@@ -75,7 +77,7 @@ impl Relief {
         if r < 1e-9 {
             return -self.coeff[0] * (1.0 / self.radius) * Y00;
         }
-        let mut y = vec![0.0f64; self.coeff.len()];
+        let mut y = [0.0f64; COUNT];
         harmonics(d / r, &mut y);
         let (ratio, outside) = if r >= self.radius { (self.radius / r, true) } else { (r / self.radius, false) };
         let mut sum = 0.0;
@@ -112,9 +114,10 @@ fn harmonics(dir: DVec3, out: &mut [f64]) {
     let ct = dir.z.clamp(-1.0, 1.0);
     let st = (1.0 - ct * ct).max(0.0).sqrt();
     let phi = dir.y.atan2(dir.x);
-    // Fully normalised associated Legendre functions P̄_lm(cos θ), m ≥ 0.
+    // Fully normalised associated Legendre functions P̄_lm(cos θ), m ≥ 0 (on the stack: gravity
+    // samples run every physics step and allocate nothing).
     let n = L_MAX + 1;
-    let mut p = vec![0.0f64; n * n];
+    let mut p = [0.0f64; COUNT];
     p[0] = Y00;
     for m in 1..n {
         p[m * n + m] = -((2 * m + 1) as f64 / (2 * m) as f64).sqrt() * st * p[(m - 1) * n + (m - 1)];
@@ -149,9 +152,8 @@ mod tests {
     fn harmonics_are_orthonormal_over_the_sphere() {
         // Gauss–Legendre in cos θ would be exact; a fine midpoint grid is close enough.
         let (nt, np) = (200, 400);
-        let count = (L_MAX + 1) * (L_MAX + 1);
         let mut gram = vec![0.0f64; 25 * 25];
-        let mut y = vec![0.0f64; count];
+        let mut y = [0.0f64; COUNT];
         for it in 0..nt {
             let ct = -1.0 + (it as f64 + 0.5) * 2.0 / nt as f64;
             let st = (1.0 - ct * ct).sqrt();
