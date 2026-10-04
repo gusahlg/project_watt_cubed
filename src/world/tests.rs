@@ -1673,6 +1673,9 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
         for z in -5..=5 {
             for y in -2..=2 {
                 let coord = ChunkCoord::new(x, y, z);
+                // Air above and below the slice: a solid cube would settle Air
+                // with no job, and this test measures which jobs are claimed.
+                let fill = if y == 0 { stone } else { AIR };
                 world.chunks.insert(
                     coord,
                     Loaded {
@@ -1680,7 +1683,7 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                             x,
                             y,
                             z,
-                            ChunkData::Uniform(stone),
+                            ChunkData::Uniform(fill),
                         )),
                         state: MeshState::needs_mesh(),
                         rev: 0,
@@ -1754,6 +1757,7 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
         for z in -5..=5 {
             for y in -2..=2 {
                 let coord = ChunkCoord::new(x, y, z);
+                let fill = if y == 0 { stone } else { AIR };
                 world.chunks.insert(
                     coord,
                     Loaded {
@@ -1761,7 +1765,7 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
                             x,
                             y,
                             z,
-                            ChunkData::Uniform(stone),
+                            ChunkData::Uniform(fill),
                         )),
                         state: MeshState::needs_mesh(),
                         rev: 0,
@@ -3252,4 +3256,520 @@ fn far_face_plus_x_edit_dirties_the_face_section() {
         "dirty set {:?} missed the +X section",
         world.dirty_sections
     );
+}
+
+fn headless_integrate(world: &mut World, result: pipeline::Done) {
+    match result {
+        pipeline::Done::Column { key, chunks, heights } => world.accept_column(key, chunks, heights),
+        pipeline::Done::Mesh { coord, rev, data } => world.accept_mesh(coord, rev, data),
+        pipeline::Done::Light {
+            coord,
+            epoch,
+            light_gen,
+            grid,
+        } => world.accept_light(coord, epoch, light_gen, grid),
+        pipeline::Done::Section { .. } => {}
+        pipeline::Done::Failed(key) => world.fail_job(*key),
+        pipeline::Done::Cancelled(keys) => {
+            for key in keys.into_vec() {
+                world.cancel_job(key);
+            }
+        }
+    }
+}
+
+/// GPU-free stand-in for the upload half of `drain_results`: an empty mesh is
+/// `Air`, anything else a fake `Ready` that is never engine-freed.
+fn headless_uploads(world: &mut World) -> usize {
+    let mut upload_bytes = 0usize;
+    let mut uploads = 0usize;
+    let mut pops = 0usize;
+    while (uploads == 0 || upload_bytes < UPLOAD_BUDGET_BYTES) && pops < UPLOAD_SCAN_MAX {
+        let Some((coord, rev, data)) = world.upload_queue.pop_front() else {
+            break;
+        };
+        pops += 1;
+        if !world.mesh_result_applies(coord, rev) {
+            if let Some(loaded) = world.chunks.get_mut(&coord) {
+                if loaded.state.release_build() {
+                    adjust_count(&mut world.building_meshes, true, false);
+                }
+            }
+            world.pending_fresh.set();
+            world.mesh_worklist.insert(coord);
+            continue;
+        }
+        let bytes = data.vertex_bytes();
+        upload_bytes += bytes;
+        uploads += 1;
+        let next = if bytes == 0 {
+            MeshState::Air
+        } else {
+            let handle = voxel_engine::MeshHandle::from_raw_parts(1, 1);
+            let meshes = ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                (p == Pass::Opaque).then_some(handle)
+            }))
+            .expect("one pass");
+            MeshState::Ready(meshes)
+        };
+        if let Some(loaded) = world.chunks.get_mut(&coord) {
+            let was = loaded.state.is_building();
+            loaded.retire_logged(next);
+            adjust_count(&mut world.building_meshes, was, false);
+        }
+    }
+    uploads
+}
+
+fn headless_light_apply(world: &mut World) -> usize {
+    let deadline = pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET);
+    let mut applied = 0usize;
+    while applied == 0 || !deadline.expired() {
+        let Some((coord, grid)) = world.light_apply_queue.pop_front() else {
+            break;
+        };
+        world.settle_light(coord, grid);
+        applied += 1;
+    }
+    applied
+}
+
+fn headless_drain(world: &mut World) -> usize {
+    // `DrainLane` is `Budget::Millis(1.0)` with `RESULT_INTEGRATE_FLOOR` 8.
+    let deadline = pipeline::Deadline::from_budget(std::time::Duration::from_millis(1));
+    let mut integrated = 0usize;
+    while integrated < 8 || !deadline.expired() {
+        let Some(result) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) else {
+            break;
+        };
+        headless_integrate(world, result);
+        integrated += 1;
+    }
+    integrated
+}
+
+/// An open data box is gathered once. Later passes drain that queue: in-flight
+/// chunks are not classified again, and a failed claim comes back.
+#[test]
+fn open_gen_cursor_drains_across_frames() {
+    use crate::world::chunk::CHUNK_SIZE;
+    use crate::world::generation::WorldgenKind;
+
+    let eye = [27310502i64, 49567991, -35459950];
+    let mut render = RenderConfig::default();
+    render.lod2 = false;
+    render.occlusion = false;
+    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    world.set_view_distances(1, 1);
+    let center = ChunkCoord::new(
+        eye[0].div_euclid(CHUNK_SIZE as i64) as i32,
+        eye[1].div_euclid(CHUNK_SIZE as i64) as i32,
+        eye[2].div_euclid(CHUNK_SIZE as i64) as i32,
+    );
+    world.center = Some(center);
+    world.stream_up = None;
+    world.stream_up_set = true;
+    world.pending_gen.set();
+    {
+        let pool = world.worker_pool();
+        let cap = pool.worker_capacity();
+        pool.set_pacing(cap, (cap * 4).max(8));
+        pool.set_view(center.x, center.y, center.z, 1, 0.0, 0.0, 0.0, 0.0, None);
+    }
+    let budget = voxel_engine::producer::Budget::Millis(0.0);
+    world.request_region_data(center, budget);
+    let queued = world.gen_columns.len();
+    let inflight = world.generating.len();
+    assert!(inflight > 0, "first pass submits");
+    assert!(queued > 0, "the rest of the box stays queued");
+    assert!(!world.gen_cursor_dirty);
+    world.pending_gen.set();
+    world.request_region_data(center, budget);
+    assert!(world.generating.len() > inflight, "second pass admits more");
+    assert!(world.gen_columns.len() < queued, "queue shrinks without a rebuild");
+    for (_, run) in &world.gen_columns {
+        let streaming::GenRun::Open { coord } = *run else {
+            panic!("open centre queues one chunk per run");
+        };
+        assert!(!world.generating.contains(&coord) && !world.chunks.contains_key(&coord));
+    }
+    let r = world.view.horizontal + DATA_MARGIN;
+    for x in center.x - r..=center.x + r {
+        for y in center.y - r..=center.y + r {
+            for z in center.z - r..=center.z + r {
+                let coord = ChunkCoord::new(x, y, z);
+                let queued = world.gen_columns.iter().any(|(_, run)| {
+                    matches!(run, streaming::GenRun::Open { coord: c } if *c == coord)
+                });
+                assert!(
+                    world.chunks.contains_key(&coord)
+                        || world.generating.contains(&coord)
+                        || queued,
+                    "{coord:?} left the cursor"
+                );
+            }
+        }
+    }
+    let lost = world.generating.iter().next().copied().expect("in flight");
+    world.fail_job(pipeline::JobKey::Open { coord: lost });
+    assert!(world.gen_cursor_dirty, "a retryable failure invalidates the cursor");
+    assert!(!world.generating.contains(&lost));
+    world.request_region_data(center, budget);
+    assert!(!world.gen_cursor_dirty);
+    let back = world.generating.contains(&lost)
+        || world.gen_columns.iter().any(|(_, run)| {
+            matches!(run, streaming::GenRun::Open { coord } if *coord == lost)
+        });
+    assert!(back, "the failed chunk is gathered again");
+}
+
+/// A stone chunk walled in by opaque faces settles `Air` in admission, with
+/// no worker job. An air face keeps the mesh, and editing that face marks the
+/// buried chunk `Dirty` so it draws again.
+#[test]
+fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
+    use crate::world::chunk::{Chunk, ChunkData, CHUNK_SIZE};
+
+    let mut world = World::generate();
+    world.lod2 = false;
+    world.set_view_distances(2, 2);
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    world.stream_up_set = true;
+    let stone = world.registry.id_by_label("rock").unwrap();
+    for x in -1..=1 {
+        for y in -1..=1 {
+            for z in -1..=1 {
+                let coord = ChunkCoord::new(x, y, z);
+                world.chunks.insert(coord, stone_loaded(coord, stone));
+            }
+        }
+    }
+    // +Y of (0, 1, 0) is air, so that chunk still has a face to draw.
+    let open = ChunkCoord::new(0, 2, 0);
+    world.chunks.insert(
+        open,
+        Loaded {
+            chunk: std::sync::Arc::new(Chunk::from_data(0, 2, 0, ChunkData::Uniform(AIR))),
+            ..stone_loaded(open, stone)
+        },
+    );
+    world.light_worklist.clear();
+    world.light_inflight.clear();
+    world.light_apply_queue.clear();
+    world.mesh_worklist.clear();
+    let up = world.live_up();
+    world
+        .mesh_worklist
+        .fit(center, world.view.worklist_rings(up), up);
+    world.mesh_worklist.insert(center);
+    world.pending_fresh.set();
+    {
+        let pool = world.worker_pool();
+        let cap = pool.worker_capacity();
+        pool.set_pacing(cap, (cap * 4).max(8));
+        pool.set_view(center.x, center.y, center.z, 2, 0.0, 0.0, 0.0, 0.0, up);
+    }
+    admit::<MeshLane>(
+        &mut world,
+        center,
+        voxel_engine::producer::Budget::Millis(2.0),
+    );
+    assert_eq!(
+        world.chunks[&center].state,
+        MeshState::Air,
+        "a walled solid settles with nothing to draw"
+    );
+    assert!(
+        !world.mesh_worklist.contains(&center),
+        "the empty mesh leaves the worklist"
+    );
+    assert_eq!(world.building_meshes, 0, "no mesh job was claimed");
+    let exposed = ChunkCoord::new(0, 1, 0);
+    assert!(
+        !world.bury_solid_mesh(exposed),
+        "an air neighbour face still draws"
+    );
+    assert!(
+        matches!(
+            world.chunks[&exposed].state,
+            MeshState::NeedsMesh {
+                building: false,
+                prev: None
+            }
+        ),
+        "the exposed chunk stays unmeshed"
+    );
+    world.set_block(CHUNK_SIZE as i32, 0, 0, AIR);
+    assert!(
+        matches!(world.chunks[&center].state, MeshState::Dirty { prev: None }),
+        "opening a face remeshes the buried chunk"
+    );
+}
+
+fn stone_loaded(coord: ChunkCoord, stone: crate::block::BlockId) -> Loaded {
+    use crate::world::chunk::{Chunk, ChunkData};
+    Loaded {
+        chunk: std::sync::Arc::new(Chunk::from_data(
+            coord.x,
+            coord.y,
+            coord.z,
+            ChunkData::Uniform(stone),
+        )),
+        state: MeshState::needs_mesh(),
+        rev: 0,
+        connectivity: None,
+        visible: true,
+        light: Some(light::LightGrid::dark()),
+        has_blocklight: false,
+        light_reseed: false,
+        light_gen: 0,
+        mesh_hash: None,
+    }
+}
+
+/// Headless stream to `entry_complete` inside the seed-42 rocky asteroid
+/// (centre `[27310502, 49567991, -35460644]`, eye ~700 blocks along +z).
+/// Open space streams an isotropic cube, so horizontal 12 is the volume that
+/// loads on the order of 16k chunks. Lane budgets match `lanes.rs`. No engine,
+/// no window. Ignored timing bench:
+/// `cargo test --release --lib asteroid_entry_breakdown -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn asteroid_entry_breakdown() {
+    use std::time::{Duration, Instant};
+
+    use crate::world::brick::ChunkPayload;
+    use crate::world::chunk::{CHUNK_SIZE, CHUNK_VOLUME};
+    use crate::world::generation::WorldgenKind;
+
+    const VIEW_H: i32 = 12;
+    // Seed 42, 700 blocks from the great rocky centre along +z.
+    let eye = [27310502i64, 49567991, -35459950];
+    let mut render = RenderConfig::default();
+    // Shipped settings leave distant LOD off. Occlusion rebuild needs the engine.
+    render.lod2 = false;
+    render.occlusion = false;
+    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    world.set_view_distances(VIEW_H, 3);
+    let center = ChunkCoord::new(
+        eye[0].div_euclid(CHUNK_SIZE as i64) as i32,
+        eye[1].div_euclid(CHUNK_SIZE as i64) as i32,
+        eye[2].div_euclid(CHUNK_SIZE as i64) as i32,
+    );
+    world.center = Some(center);
+    world.stream_up = world.resolve_stream_up(center);
+    world.stream_up_set = true;
+    world.section_eye_y = eye[1] as f64;
+    world.pending_gen.set();
+    let up = world.live_up();
+    let rings = world.view.worklist_rings(up);
+    world.mesh_worklist.fit(center, rings, up);
+    world.light_worklist.fit(center, rings, up);
+    assert!(
+        up.is_none(),
+        "open-space eye streams an isotropic cube, up={up:?}"
+    );
+    let cap = {
+        let pool = world.worker_pool();
+        let cap = pool.worker_capacity();
+        // Heavy entry frames stay unboosted: lookahead is `active * 4`.
+        pool.set_pacing(cap, (cap * 4).max(8));
+        pool.set_view(center.x, center.y, center.z, VIEW_H, 0.0, 0.0, 0.0, 0.0, up);
+        cap
+    };
+    // `None` up: every axis uses the horizontal radius. Data box adds one shell.
+    let mesh_n = (2 * VIEW_H as usize + 1).pow(3);
+    let data_n = (2 * (VIEW_H as usize + 1) + 1).pow(3);
+    println!(
+        "asteroid_entry setup center={center:?} up={up:?} workers={cap} mesh_box={mesh_n} data_box={data_n} lod2={}",
+        world.lod2
+    );
+
+    pipeline::job_time::reset();
+    pipeline::job_time::set_enabled(true);
+    let wall_start = Instant::now();
+    let mut main_gen = Duration::ZERO;
+    let mut main_light = Duration::ZERO;
+    let mut main_mesh = Duration::ZERO;
+    let mut main_integrate = Duration::ZERO;
+    let mut main_apply = Duration::ZERO;
+    let mut main_upload = Duration::ZERO;
+    let mut idle = Duration::ZERO;
+    let mut frames = 0u32;
+    let mut next_report = wall_start + Duration::from_secs(5);
+    let limit = wall_start + Duration::from_secs(300);
+    let mut finished = false;
+    while Instant::now() < limit {
+        frames += 1;
+        let mut progressed = 0usize;
+        let t = Instant::now();
+        progressed += headless_drain(&mut world);
+        main_integrate += t.elapsed();
+        let t = Instant::now();
+        progressed += headless_uploads(&mut world);
+        main_upload += t.elapsed();
+        let t = Instant::now();
+        progressed += headless_light_apply(&mut world);
+        main_apply += t.elapsed();
+        let t = Instant::now();
+        let generating_before = world.generating.len();
+        world.request_region_data(center, voxel_engine::producer::Budget::Millis(2.0));
+        progressed += world.generating.len().saturating_sub(generating_before);
+        main_gen += t.elapsed();
+        let t = Instant::now();
+        let admitted_before = world.light_admitted;
+        if world.lighting {
+            admit::<LightLane>(
+                &mut world,
+                center,
+                voxel_engine::producer::Budget::Millis(1.0),
+            );
+        }
+        progressed += (world.light_admitted - admitted_before) as usize;
+        main_light += t.elapsed();
+        let t = Instant::now();
+        let building_before = world.building_meshes;
+        let mesh_before = world.mesh_worklist.len();
+        world.tick_light_gate();
+        if !world.upload_backlogged() {
+            admit::<MeshLane>(
+                &mut world,
+                center,
+                voxel_engine::producer::Budget::Millis(2.0),
+            );
+        }
+        world.flush_degraded_terminal();
+        progressed += world.building_meshes.saturating_sub(building_before);
+        // Buried solids leave the worklist without a worker claim.
+        progressed += mesh_before.saturating_sub(world.mesh_worklist.len());
+        main_mesh += t.elapsed();
+        if world.entry_complete() {
+            finished = true;
+            break;
+        }
+        if Instant::now() >= next_report {
+            let g = world.stream_gauges();
+            let (gn, gns, ln, lns, mn, mns) = pipeline::job_time::snapshot();
+            println!(
+                "asteroid_entry t={:.1}s frames={frames} chunks={} gen={} light_wl={} light_fly={} mesh_wl={} upload={} jobs gen={gn}/{:.2}s light={ln}/{:.2}s mesh={mn}/{:.2}s {}",
+                wall_start.elapsed().as_secs_f64(),
+                g.chunks,
+                g.generating,
+                g.light_worklist,
+                g.light_inflight,
+                g.mesh_worklist,
+                g.upload_queue,
+                gns as f64 / 1e9,
+                lns as f64 / 1e9,
+                mns as f64 / 1e9,
+                world.entry_debug()
+            );
+            next_report = Instant::now() + Duration::from_secs(5);
+        }
+        if progressed == 0 {
+            let quiet = world.generating.is_empty()
+                && world.light_inflight.is_empty()
+                && world.building_meshes == 0
+                && world.upload_queue.is_empty()
+                && world.light_apply_queue.is_empty()
+                && !world.pending_gen.get()
+                && !world.pending_fresh.get()
+                && !world.light_pending.get();
+            if quiet {
+                pipeline::job_time::set_enabled(false);
+                panic!("asteroid entry stalled: {}", world.entry_debug());
+            }
+            let t = Instant::now();
+            std::thread::sleep(Duration::from_micros(200));
+            idle += t.elapsed();
+        }
+    }
+    let wall = wall_start.elapsed();
+    pipeline::job_time::set_enabled(false);
+    let (gn, gns, ln, lns, mn, mns) = pipeline::job_time::snapshot();
+    world.refresh_tables();
+    let tables = world.tables.get();
+    let mut uniform_air = 0usize;
+    let mut uniform_solid = 0usize;
+    let mut paletted = 0usize;
+    let mut dense = 0usize;
+    let mut opaque_mixed = 0usize;
+    let mut opaque_inert = 0usize;
+    let mut mesh_air = 0usize;
+    let mut mesh_ready = 0usize;
+    let mut light_dark = 0usize;
+    let mut light_other = 0usize;
+    let mut bits = [0u64; CHUNK_VOLUME / 64];
+    let mut col = [0u16; CHUNK_SIZE * CHUNK_SIZE];
+    for loaded in world.chunks.values() {
+        match &loaded.state {
+            MeshState::Air => mesh_air += 1,
+            MeshState::Ready(_) => mesh_ready += 1,
+            _ => {}
+        }
+        match loaded.light.as_ref() {
+            Some(grid) if *grid == light::LightGrid::dark() => light_dark += 1,
+            Some(_) => light_other += 1,
+            None => {}
+        }
+        match &loaded.chunk.data().payload {
+            ChunkPayload::Uniform(v) => {
+                if v.id == AIR {
+                    uniform_air += 1;
+                } else {
+                    uniform_solid += 1;
+                }
+            }
+            other => {
+                match other {
+                    ChunkPayload::Paletted { .. } => paletted += 1,
+                    ChunkPayload::Dense(_) => dense += 1,
+                    ChunkPayload::Uniform(_) => {}
+                }
+                loaded.chunk.fill_opacity(|id| tables.opaque(id), &mut bits, &mut col);
+                if bits.iter().all(|w| *w == u64::MAX) {
+                    opaque_mixed += 1;
+                    let mut emits = false;
+                    loaded
+                        .chunk
+                        .for_each_emission(&tables.emission, |_, _| emits = true);
+                    if !emits {
+                        opaque_inert += 1;
+                    }
+                }
+            }
+        }
+    }
+    let g = world.stream_gauges();
+    let secs = |d: Duration| d.as_secs_f64();
+    println!(
+        "asteroid_entry wall_s={:.3} frames={frames} idle_s={:.3} finished={finished} chunks={} mesh_box={mesh_n} data_box={data_n}",
+        secs(wall),
+        secs(idle),
+        g.chunks
+    );
+    println!(
+        "asteroid_entry main_gen_s={:.3} main_light_s={:.3} main_mesh_s={:.3} main_integrate_s={:.3} main_apply_s={:.3} main_upload_s={:.3}",
+        secs(main_gen),
+        secs(main_light),
+        secs(main_mesh),
+        secs(main_integrate),
+        secs(main_apply),
+        secs(main_upload)
+    );
+    println!(
+        "asteroid_entry jobs gen={gn}/{:.3}s light={ln}/{:.3}s mesh={mn}/{:.3}s seeds_store={} seeds_border={} light_admitted={}",
+        gns as f64 / 1e9,
+        lns as f64 / 1e9,
+        mns as f64 / 1e9,
+        g.light_seed_split.store,
+        g.light_seed_split.border,
+        g.light_admitted
+    );
+    println!(
+        "asteroid_entry census uniform_air={uniform_air} uniform_solid={uniform_solid} paletted={paletted} dense={dense} opaque_mixed={opaque_mixed} opaque_inert={opaque_inert} mesh_air={mesh_air} mesh_ready={mesh_ready} light_dark={light_dark} light_other={light_other} remesh={}",
+        g.remesh_async_calls
+    );
+    assert!(finished, "entry did not complete within 300s: {}", world.entry_debug());
 }

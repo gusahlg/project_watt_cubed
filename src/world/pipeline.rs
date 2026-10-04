@@ -1465,6 +1465,62 @@ impl Drop for Workers {
     }
 }
 
+/// Opt-in per-job wall time for headless entry benches. Production and the
+/// pinned throughput benches leave it disabled.
+#[cfg(test)]
+pub(in crate::world) mod job_time {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use super::JobKey;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static GEN_NS: AtomicU64 = AtomicU64::new(0);
+    static LIGHT_NS: AtomicU64 = AtomicU64::new(0);
+    static MESH_NS: AtomicU64 = AtomicU64::new(0);
+    static GEN_N: AtomicU64 = AtomicU64::new(0);
+    static LIGHT_N: AtomicU64 = AtomicU64::new(0);
+    static MESH_N: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        for counter in [&GEN_NS, &LIGHT_NS, &MESH_NS, &GEN_N, &LIGHT_N, &MESH_N] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record(key: &JobKey, dt: Duration) {
+        let ns = dt.as_nanos() as u64;
+        let (nanos, count) = match key {
+            JobKey::Column { .. } | JobKey::Open { .. } => (&GEN_NS, &GEN_N),
+            JobKey::Light { .. } => (&LIGHT_NS, &LIGHT_N),
+            JobKey::Mesh { .. } => (&MESH_NS, &MESH_N),
+            JobKey::Section { .. } => return,
+        };
+        nanos.fetch_add(ns, Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(gen_n, gen_ns, light_n, light_ns, mesh_n, mesh_ns)`.
+    pub fn snapshot() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            GEN_N.load(Ordering::Relaxed),
+            GEN_NS.load(Ordering::Relaxed),
+            LIGHT_N.load(Ordering::Relaxed),
+            LIGHT_NS.load(Ordering::Relaxed),
+            MESH_N.load(Ordering::Relaxed),
+            MESH_NS.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// The profiler meter for a job kind. Workers run off the main thread, but
 /// [`voxel_engine::profile`] is an atomic global, so they feed the same unified
 /// report as the CPU and GPU tiers.
@@ -1538,9 +1594,17 @@ fn worker_loop(
         // to the main thread so `fail_job` can release it and retry/quarantine —
         // a claimed key is owed exactly one `Done`, panic or not. The key
         // names the culprit so it stops being invisible.
+        // Opt-in job clock for the asteroid entry bench. Off, this is one relaxed
+        // load; headline throughput benches leave it off.
+        #[cfg(test)]
+        let job_started = job_time::enabled().then(std::time::Instant::now);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run(job, stager.get(), stats)
         }));
+        #[cfg(test)]
+        if let Some(started) = job_started {
+            job_time::record(&key, started.elapsed());
+        }
         if let Some((meter, start)) = profile_start {
             voxel_engine::profile::add(meter, start.elapsed());
         }
@@ -2262,8 +2326,12 @@ mod tests {
             world.mesh_worklist.extend(seeds.iter().copied());
             for &coord in seeds {
                 if let Some(loaded) = world.chunks.get_mut(&coord) {
-                    if let MeshState::NeedsMesh { building, .. } = &mut loaded.state {
-                        *building = false;
+                    match &mut loaded.state {
+                        MeshState::NeedsMesh { building, .. } => *building = false,
+                        // Buried solids settle Air; put the seed back so each
+                        // timed pass admits the same set.
+                        MeshState::Air => loaded.state = MeshState::needs_mesh(),
+                        _ => {}
                     }
                 }
             }
