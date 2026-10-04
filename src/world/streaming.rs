@@ -564,6 +564,87 @@ fn column_order(center: Coord, vel: DVec3, anchor: Coord, up: Option<Face>) -> u
     )
 }
 
+/// Storage block the chart frontier treats as the eye: the centre chunk's middle, plus the
+/// prediction delta. Y is the streamed altitude, not the chunk layer.
+fn storage_eye_block(center: Coord, eye_y: f64, delta: DVec3) -> (i64, i64, i64) {
+    let cs = CHUNK_SIZE as i64;
+    let x = center.x as i64 * cs + cs / 2 + delta.x.round() as i64;
+    let z = center.z as i64 * cs + cs / 2 + delta.z.round() as i64;
+    let y = (eye_y + delta.y).round() as i64;
+    (x, y, z)
+}
+
+/// Sections of a chart seat. Distance rings already chose the detail: collapsing every complete
+/// quad would flatten those rings onto the chord cap, so a quad merges only while the frontier
+/// is over `budget`, and only when the parent still passes `keep`.
+fn coarsen_chart(
+    sections: Vec<SectionPos>,
+    max_detail: i8,
+    budget: usize,
+    keep: &impl Fn(SectionPos) -> bool,
+) -> Vec<SectionPos> {
+    let mut set: FastSet<SectionPos> = sections.into_iter().filter(|s| s.detail.0 <= max_detail && keep(*s)).collect();
+    if set.len() <= budget || set.is_empty() {
+        return set.into_iter().collect();
+    }
+    let finest = set.iter().map(|s| s.detail.0).min().unwrap();
+    for child_d in (finest..max_detail).rev() {
+        if set.len() <= budget {
+            break;
+        }
+        let mut kids: FastMap<SectionPos, u8> = FastMap::default();
+        for &c in &set {
+            if c.detail.0 == child_d {
+                *kids.entry(c.parent()).or_insert(0) += 1;
+            }
+        }
+        let mut merges: Vec<SectionPos> = kids.into_iter().filter(|&(p, n)| n == 4 && keep(p)).map(|(p, _)| p).collect();
+        merges.sort_unstable_by_key(section_key);
+        for p in merges {
+            if set.len() <= budget {
+                break;
+            }
+            for q in super::section::Quadrant::ALL {
+                set.remove(&p.child(q));
+            }
+            set.insert(p);
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Whether `s` meets the full-res chunk box. A neighbour section is tested in the home chart,
+/// unfolded past the seam.
+fn covers_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super::seam::SeamAcross>) -> bool {
+    let span = s.span() as i64;
+    let (x0, z0, x1, z1) = if let Some(m) = across {
+        let (a, c) = m.home_xz(s.min_x() as i64, s.min_z() as i64);
+        let (b, d) = m.home_xz(s.min_x() as i64 + span, s.min_z() as i64 + span);
+        (a.min(b), c.min(d), a.max(b), c.max(d))
+    } else {
+        (s.min_x() as i64, s.min_z() as i64, s.min_x() as i64 + span, s.min_z() as i64 + span)
+    };
+    x0 < near.1 && x1 > near.0 && z0 < near.3 && z1 > near.2
+}
+
+/// The section's storage square lies wholly inside the chart box (`hi` exclusive).
+fn inside_xz(s: SectionPos, lo: [i64; 3], hi: [i64; 3]) -> bool {
+    let span = s.span() as i64;
+    let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+    x >= lo[0] && x + span <= hi[0] && z >= lo[2] && z + span <= hi[2]
+}
+
+fn section_dist2(s: SectionPos, ex: f64, ez: f64) -> f64 {
+    let span = s.span() as f64;
+    let dx = s.min_x() as f64 + span * 0.5 - ex;
+    let dz = s.min_z() as f64 + span * 0.5 - ez;
+    dx * dx + dz * dz
+}
+
+fn section_key(s: &SectionPos) -> (u16, u8, crate::ident::Detail, i32, i32) {
+    (s.body, s.face as u8, s.detail, s.x, s.z)
+}
+
 impl World {
     /// Up face of the streaming centre. +Y until the first resolve, so
     /// pre-stream orders match the historical volume.
@@ -1064,6 +1145,8 @@ impl World {
                     let (cu, _, cv) = FaceFrame::new(f).chunk_to_local(center_chunk);
                     (b, f as u8, cu, cv)
                 }
+                // A chart has no cube face. The storage centre still has to invalidate the frontier.
+                None if !self.fold.is_identity() => (u16::MAX, u8::MAX, center_chunk.x, center_chunk.z),
                 None => (u16::MAX, u8::MAX, 0, 0),
             };
             let frontier_key = SectionFrontierKey {
@@ -1229,13 +1312,14 @@ impl World {
             // `section_material` borrows all of `self`, so it must run before
             // `self.sections.get_mut` below takes an overlapping mutable borrow.
             let (flat_color, flat_rgba) = self.section_material(pos);
+            let bend = self.chart_bend(pos);
             if let Some(state @ SectionState::Meshing { .. }) = self.sections.get_mut(&pos)
                 && matches!(state, SectionState::Meshing { token: t } if *t == token)
             {
                 super::adjust_count(&mut self.meshing_sections, true, false);
                 upload_bytes += bytes;
                 self.section_upload_bytes += bytes;
-                *state = SectionState::from_upload_payload(pos, meshes, eng);
+                *state = SectionState::from_upload_payload(pos, meshes, eng, bend.as_ref());
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
                 // in part — must be corrected here, at the transition that gave it slots
@@ -2863,10 +2947,148 @@ impl World {
         }
     }
 
+    /// The atlas patch a chart section is bent through. `None` for a cube section or a square
+    /// that is not inside a storage box.
+    fn chart_bend(&self, pos: SectionPos) -> Option<super::ChartBend> {
+        if pos.body < super::section::CHART_BODY_BASE {
+            return None;
+        }
+        let index = (pos.body - super::section::CHART_BODY_BASE) as usize;
+        let atlas = self.seams.atlases().get(index)?.clone();
+        let (patch, _) = atlas.locate([pos.min_x() as i64, 0, pos.min_z() as i64])?;
+        Some(super::ChartBend { atlas, patch })
+    }
+
+    /// Far sections of the home chart (and, within two finest sections of a side, its neighbours).
+    /// Storage +Y is the chart's up, so the sections are [`Face::PosY`] over storage `(x, z)`.
+    fn chart_sections(&self, center: Coord) -> Vec<SectionPos> {
+        let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
+        let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d);
+        let delta = self.section_vel * TAU_STREAM;
+        if delta == DVec3::ZERO {
+            return base;
+        }
+        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d))
+    }
+
+    /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`.
+    fn chart_pyramid(&self, radius: i64) -> Option<(pyramid::PyramidCfg, i8)> {
+        let src = &self.section_pyramid;
+        let mut levels = 0u8;
+        let mut max_d = src.finest.0;
+        for ring in 0..src.levels.get() {
+            let detail = src.finest.0 + ring as i8 * src.step() as i8;
+            let span = super::section::section_span(crate::ident::Detail(detail));
+            if !super::section::section_fits(span, radius) {
+                break;
+            }
+            levels += 1;
+            max_d = detail;
+        }
+        (levels > 0).then(|| (pyramid::PyramidCfg::sections_with(src.unit, levels, src.finest.0 as u8), max_d))
+    }
+
+    /// Eye metric in the storage frame. Altitude is height above the column under the eye, so
+    /// standing on a mountain still selects the finest ring (the cube envelope is `[0, 512]`).
+    fn chart_metric(&self, center: Coord, delta: DVec3, cfg: &pyramid::PyramidCfg) -> EyeMetric {
+        let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
+        let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
+        let rel = if ground == i32::MIN { 0.0 } else { (ey as f64 - ground as f64).clamp(0.0, 1.0e7) };
+        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
+        EyeMetric::new(DVec3::new(ex as f64, rel, ez as f64), env, DyCap::new(cfg.outer_m(), cfg.base))
+    }
+
+    fn chart_pick(
+        &self,
+        center: Coord,
+        delta: DVec3,
+        seat: &super::seam::ChartSeat,
+        cfg: &pyramid::PyramidCfg,
+        max_d: i8,
+    ) -> Vec<SectionPos> {
+        let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
+        let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
+        if ground == i32::MIN {
+            return Vec::new();
+        }
+        let rel = (ey as f64 - ground as f64).clamp(0.0, 1.0e7);
+        let body = super::section::CHART_BODY_BASE + seat.index as u16;
+        let near = self.near_block_box(center);
+        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, None);
+        let band = super::section::section_span(super::section::FINEST_DETAIL) as i64 * 2;
+        for across in self.seams.seam_across(*seat, [ex, ey, ez], band) {
+            tagged.extend(self.seat_sections(
+                &across.seat,
+                across.eye_x as f64,
+                across.eye_z as f64,
+                rel,
+                body,
+                cfg,
+                max_d,
+                near,
+                Some(&across),
+            ));
+        }
+        let budget = self.sections_allowed();
+        if tagged.len() > budget {
+            tagged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| section_key(&b.0).cmp(&section_key(&a.0))));
+            tagged.truncate(budget);
+        }
+        let mut out: Vec<_> = tagged.into_iter().map(|(s, _)| s).collect();
+        out.sort_unstable_by_key(section_key);
+        out
+    }
+
+    fn seat_sections(
+        &self,
+        seat: &super::seam::ChartSeat,
+        ex: f64,
+        ez: f64,
+        rel: f64,
+        body: u16,
+        cfg: &pyramid::PyramidCfg,
+        max_d: i8,
+        near: (i64, i64, i64, i64),
+        across: Option<&super::seam::SeamAcross>,
+    ) -> Vec<(SectionPos, f64)> {
+        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
+        let metric = EyeMetric::new(DVec3::new(ex, rel, ez), env, DyCap::new(cfg.outer_m(), cfg.base));
+        let mut radial = quadtree::desired_sections(&metric, cfg);
+        for s in &mut radial {
+            s.body = body;
+            s.face = Face::PosY;
+        }
+        let keep = |s: SectionPos| {
+            inside_xz(s, seat.lo, seat.hi) && !covers_near(s, near, across) && super::section::section_fits(s.span(), seat.radius)
+        };
+        coarsen_chart(radial, max_d, self.sections_allowed(), &keep)
+            .into_iter()
+            .map(|s| (s, section_dist2(s, ex, ez)))
+            .collect()
+    }
+
+    /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so the
+    /// horizontal footprint is the box a chart section must not cover.
+    fn near_block_box(&self, center: Coord) -> (i64, i64, i64, i64) {
+        let cs = CHUNK_SIZE as i64;
+        let h = self.view.horizontal as i64;
+        (
+            (center.x as i64 - h) * cs,
+            (center.x as i64 + h + 1) * cs,
+            (center.z as i64 - h) * cs,
+            (center.z as i64 + h + 1) * cs,
+        )
+    }
+
     /// Desired frontier: union of static eye and velocity-predicted eye position.
     /// Pulls sections ahead of player motion. At rest, velocity is zero so returns
-    /// static frontier bit-for-bit. Storage, open space, and round bodies select nothing.
+    /// static frontier bit-for-bit. Open space and a round body seen from outside select
+    /// nothing; a streaming centre in storage selects that chart's sections.
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
+        if !self.fold.is_identity() {
+            return self.chart_sections(center);
+        }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
         let Some((body, face)) = focus else { return Vec::new() };
         let mut out = self.frontier_union(center, body, face);
@@ -3044,9 +3266,24 @@ impl World {
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
-        let metric_face = self.section_lod_face.map(|(_, f)| f).unwrap_or(Face::PosY);
-        let metric_body = self.section_lod_face.map(|(b, _)| b).unwrap_or(0);
-        let metric = self.section_metric_on(center, DVec3::ZERO, metric_face, self.generator.face_datum(metric_body, metric_face));
+        let (metric_body, metric_face, metric) = if !self.fold.is_identity() {
+            let body = self
+                .seams
+                .chart_seat(center)
+                .map(|s| super::section::CHART_BODY_BASE + s.index as u16)
+                .unwrap_or(u16::MAX);
+            (body, Face::PosY, self.chart_metric(center, DVec3::ZERO, &self.section_pyramid))
+        } else {
+            let metric_face = self.section_lod_face.map(|(_, f)| f).unwrap_or(Face::PosY);
+            let metric_body = self.section_lod_face.map(|(b, _)| b).unwrap_or(0);
+            let metric = self.section_metric_on(
+                center,
+                DVec3::ZERO,
+                metric_face,
+                self.generator.face_datum(metric_body, metric_face),
+            );
+            (metric_body, metric_face, metric)
+        };
         let cfg = &self.section_pyramid;
         let stale: Vec<SectionPos> = self
             .sections

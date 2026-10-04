@@ -158,6 +158,72 @@ impl StorageWorlds {
         [i32::MIN; CHUNK_SIZE * CHUNK_SIZE]
     }
 
+    /// The charted surface `body - CHART_BODY_BASE` names, if it is one of these atlases.
+    pub fn chart(&self, index: usize) -> Option<&Atlas> {
+        self.atlases.get(index).map(|a| a.as_ref())
+    }
+
+    /// Storage y of relief 0 on atlas `index`'s band-0 charts (every face shares the radial window).
+    pub fn datum(&self, index: usize) -> Option<i32> {
+        let atlas = self.chart(index)?;
+        let b = atlas.bands.first()?;
+        let y = if atlas.inward { b.r_hi - atlas.radius } else { atlas.radius - b.r_lo };
+        i32::try_from(y).ok()
+    }
+
+    /// Min and max storage y of the surface over the square `[x0, x0+span) × [z0, z0+span)`,
+    /// plus plant reach on the top. `None` when the square is not one band-0 chart.
+    pub fn bounds(&self, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {
+        if span <= 0 {
+            return None;
+        }
+        let (cx, cz) = (x0.div_euclid(CS as i32) as i64, z0.div_euclid(CS as i32) as i64);
+        let (x1, z1) = (x0 as i64 + span as i64 - 1, z0 as i64 + span as i64 - 1);
+        for w in &self.worlds {
+            for &(patch, lo, hi) in &w.boxes {
+                if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
+                    continue;
+                }
+                let (bx0, bx1) = (lo[0] * CS, hi[0] * CS);
+                let (bz0, bz1) = (lo[2] * CS, hi[2] * CS);
+                if (x0 as i64) < bx0 || x1 >= bx1 || (z0 as i64) < bz0 || z1 >= bz1 {
+                    return None;
+                }
+                let Patch::Shell { band: 0, .. } = patch else { return None };
+                let (lo_h, hi_h) = w.round.relief_bounds(patch, x0 as i64 - bx0, z0 as i64 - bz0, span as i64);
+                let y_lo = w.round.surface_of_relief(patch, lo_h) + lo[1] * CS;
+                let y_hi = w.round.surface_of_relief(patch, hi_h) + lo[1] * CS + super::round::PLANT_REACH;
+                let lo_i = y_lo.clamp(i32::MIN as i64 + 1, i32::MAX as i64 - 1) as i32;
+                let hi_i = y_hi.clamp(lo_i as i64 + 1, i32::MAX as i64) as i32;
+                return Some((lo_i, hi_i));
+            }
+        }
+        None
+    }
+
+    /// Far-LOD blocks of storage column `(x, z)` at altitudes `ys` (solid below the surface, plants
+    /// above, no caves). Air outside every box.
+    pub fn lod_column(&self, x: i32, z: i32, ys: &[i32], out: &mut [BlockId]) {
+        let n = out.len().min(ys.len());
+        let (cx, cz) = (x.div_euclid(CS as i32) as i64, z.div_euclid(CS as i32) as i64);
+        for w in &self.worlds {
+            for &(patch, lo, hi) in &w.boxes {
+                if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
+                    continue;
+                }
+                match patch {
+                    Patch::Shell { band: 0, .. } => {
+                        let (i, j) = (x as i64 - lo[0] * CS, z as i64 - lo[2] * CS);
+                        w.round.lod_column(patch, i, j, lo[1] * CS, &ys[..n], &mut out[..n]);
+                    }
+                    _ => out[..n].fill(w.round.deep()),
+                }
+                return;
+            }
+        }
+        out[..n].fill(AIR);
+    }
+
     /// Storage y of the first open cell of storage column `(x, z)` (+Y is every chart's up): the
     /// painter's surface on a surface chart, [`BURIED`] under the deeper bands and the core, and
     /// `i32::MIN` (open) outside every box. Boxes never share a column.

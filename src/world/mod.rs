@@ -640,10 +640,18 @@ pub(in crate::world) enum SectionState {
     /// style a `set_style` push.
     Ready {
         meshes: Vec<ChunkMeshes>,
+        /// Cages bending a chart section's slabs. Empty on a cube face. Freed with the meshes.
+        cages: Vec<voxel_engine::CageHandle>,
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
         /// re-observed next frame (the steady case) sends nothing.
         last_style: Option<(FadeStyle, u32)>,
     },
+}
+
+/// The atlas patch a chart section is bent through.
+pub(in crate::world) struct ChartBend {
+    atlas: Arc<crate::space::atlas::Atlas>,
+    patch: crate::space::atlas::Patch,
 }
 
 impl SectionState {
@@ -652,17 +660,57 @@ impl SectionState {
         pos: SectionPos,
         mesh: SectionMeshData,
         eng: &mut Engine,
+        bend: Option<&ChartBend>,
     ) -> SectionState {
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let mut cages = Vec::new();
         let meshes = mesh
             .slabs
             .iter()
             .filter_map(|slab| {
-                let placement = Self::slab_placement(pos, slab.origin_y, detail, mesh.altitude_floor);
-                ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| eng.upload_mesh_placed(&slab.data[p], placement)))
+                let placement = Self::slab_place(pos, slab.origin_y, detail, mesh.altitude_floor, bend, eng, &mut cages)?;
+                match ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| eng.upload_mesh_placed(&slab.data[p], placement))) {
+                    Some(m) => Some(m),
+                    None => {
+                        Self::drop_failed_cage(eng, &mut cages, placement);
+                        None
+                    }
+                }
             })
             .collect();
-        SectionState::Ready { meshes, last_style: None }
+        SectionState::Ready { meshes, cages, last_style: None }
+    }
+
+    /// Flat placement, or a cage through the slab's eight embedded corners. `None` skips the slab
+    /// (an uncaged chart mesh would draw at the origin).
+    fn slab_place(
+        pos: SectionPos,
+        origin_y: u32,
+        detail: Detail,
+        floor_a: i32,
+        bend: Option<&ChartBend>,
+        eng: &mut Engine,
+        cages: &mut Vec<voxel_engine::CageHandle>,
+    ) -> Option<voxel_engine::MeshPlacement> {
+        if pos.body < section::CHART_BODY_BASE {
+            return Some(Self::slab_placement(pos, origin_y, detail, floor_a));
+        }
+        let bend = bend?;
+        let extent = (1i32 << detail.0).saturating_mul(16);
+        let y0 = floor_a + origin_y as i32 * pos.cell_size();
+        let (anchor, corners) = section::chart_slab_corners(&bend.atlas, bend.patch, pos.min_x(), y0, pos.min_z(), extent)?;
+        let cage = eng.create_cage(anchor, corners)?;
+        cages.push(cage);
+        Some(voxel_engine::MeshPlacement::caged(cage, detail))
+    }
+
+    fn drop_failed_cage(eng: &mut Engine, cages: &mut Vec<voxel_engine::CageHandle>, placement: voxel_engine::MeshPlacement) {
+        if let Some(c) = placement.cage {
+            if cages.last() == Some(&c) {
+                cages.pop();
+            }
+            eng.free_cage(c);
+        }
     }
 
     fn slab_placement(pos: SectionPos, origin_y: u32, detail: Detail, floor_a: i32) -> voxel_engine::MeshPlacement {
@@ -686,10 +734,11 @@ impl SectionState {
         pos: SectionPos,
         meshes: pipeline::SectionPayload,
         eng: &mut Engine,
+        bend: Option<&ChartBend>,
     ) -> SectionState {
         match meshes {
-            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, eng),
-            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng),
+            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, eng, bend),
+            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng, bend),
         }
     }
 
@@ -697,21 +746,29 @@ impl SectionState {
         pos: SectionPos,
         staged: pipeline::StagedSection,
         eng: &mut Engine,
+        bend: Option<&ChartBend>,
     ) -> SectionState {
         let detail = Detail(pos.detail.0.saturating_add(staged.shift as i8));
+        let mut cages = Vec::new();
         let meshes = staged
             .slabs
             .into_iter()
             .filter_map(|mut slab| {
-                let placement = Self::slab_placement(pos, slab.origin_y, detail, staged.altitude_floor);
-                ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                let placement = Self::slab_place(pos, slab.origin_y, detail, staged.altitude_floor, bend, eng, &mut cages)?;
+                match ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
                     slab.passes[p]
                         .take()
                         .and_then(|pass| eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement))
-                }))
+                })) {
+                    Some(m) => Some(m),
+                    None => {
+                        Self::drop_failed_cage(eng, &mut cages, placement);
+                        None
+                    }
+                }
             })
             .collect();
-        SectionState::Ready { meshes, last_style: None }
+        SectionState::Ready { meshes, cages, last_style: None }
     }
 
     fn is_ready(&self) -> bool {
@@ -755,9 +812,12 @@ impl SectionState {
         self.set_style(eng, style, flat_rgba);
     }
     fn free(self, eng: &mut Engine) {
-        if let SectionState::Ready { meshes, .. } = self {
+        if let SectionState::Ready { meshes, cages, .. } = self {
             for m in meshes {
                 m.free(eng);
+            }
+            for c in cages {
+                eng.free_cage(c);
             }
         }
     }
@@ -1571,6 +1631,12 @@ impl World {
     /// inside the centre chunk — the conservative discard radius. With every
     /// ring settled this is bit-identical to [`ViewVolume::coverage`].
     fn lod_clip(&self) -> CoverageVolume {
+        // A chart's full-res box is a storage square bent through its cages. The engine clip is an
+        // axis-aligned box in camera space after that bend, and storage up is always +Y, so the box
+        // would punch world Y on a tilted chart. Chart sections are clipped by key instead.
+        if !self.fold.is_identity() {
+            return CoverageVolume { half: Vec3::ZERO };
+        }
         let full = self.view.coverage();
         let radius_m = ((self.lod_clip_rings - 1).max(0) * CHUNK_SIZE as i32) as f32;
         let hx = radius_m.min(full.half.x);

@@ -32,10 +32,13 @@ use super::lod;
 
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
-pub(in crate::world) use mesh::{SectionMeshData, extract_section_mesh};
+pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh};
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
+
+/// Body id of a charted round world: `CHART_BODY_BASE + atlas index`. Above every cosmos catalog id.
+pub(in crate::world) const CHART_BODY_BASE: u16 = 1 << 15;
 
 /// Finest LOD detail level: cell size is 2^k metres. Zone-1 full-res chunks are finer.
 pub(in crate::world) const FINEST_DETAIL: Detail = Detail(2);
@@ -46,6 +49,13 @@ pub(in crate::world) const FINEST_DETAIL: Detail = Detail(2);
 /// [`SectionPos`].
 pub(in crate::world) fn section_span(d: Detail) -> i32 {
     SECTION_N as i32 * lod::cell(d)
+}
+
+/// Chord error of a trilinear cage is `L²/8R`. A section of side `span` on a body of datum
+/// radius `radius` stays within one block when `span² ≤ 8·radius`.
+pub(in crate::world) fn section_fits(span: i32, radius: i64) -> bool {
+    let s = span as i64;
+    radius > 0 && s.saturating_mul(s) <= radius.saturating_mul(8)
 }
 
 /// Fixed world-Y domain all columns tile. Floor at y=0 (below is solid ground).

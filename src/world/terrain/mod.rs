@@ -51,6 +51,12 @@ pub const MAX_GROUND: i32 = 470;
 /// Ground never sinks below this (the far-LOD floor is 0).
 pub const MIN_GROUND: i32 = 6;
 
+/// Atlas index of a chart body id, if `body` is one.
+fn chart_body(body: u16) -> Option<usize> {
+    let base = super::section::CHART_BODY_BASE;
+    (body >= base).then(|| (body - base) as usize)
+}
+
 /// The generator's knobs, in percent of the default (100 = as designed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerrainCfg {
@@ -1137,6 +1143,14 @@ impl TerrainGenerator for Terrain {
     }
 
     fn lod_column_face(&self, body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {
+        if chart_body(body).is_some() {
+            if face != Face::PosY {
+                out.iter_mut().take(alts.len()).for_each(|o| *o = AIR);
+                return;
+            }
+            self.storage.lod_column(u, v, alts, out);
+            return;
+        }
         if face == Face::PosY {
             self.lod_column(u, v, alts, out);
             return;
@@ -1159,6 +1173,12 @@ impl TerrainGenerator for Terrain {
     }
 
     fn surface_bounds(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
+        if chart_body(body).is_some() {
+            if face != Face::PosY {
+                return None;
+            }
+            return self.storage.bounds(u0, v0, span);
+        }
         let body = self.cosmos.bodies().iter().find(|b| b.id == body)?;
         let cosmos::Shape::Cube { half } = body.shape else { return None };
         let centre = cube::centre_i32(body.centre)?;
@@ -1178,6 +1198,9 @@ impl TerrainGenerator for Terrain {
     }
 
     fn face_datum(&self, body: u16, face: Face) -> i32 {
+        if let Some(index) = chart_body(body) {
+            return if face == Face::PosY { self.storage.datum(index).unwrap_or(0) } else { 0 };
+        }
         let Some(body) = self.cosmos.bodies().iter().find(|b| b.id == body) else { return 0 };
         let cosmos::Shape::Cube { half } = body.shape else { return 0 };
         cube::world_a(half, 0, cube::normal_dot(body.centre, face)).unwrap_or(0)
