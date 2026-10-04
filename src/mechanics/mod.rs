@@ -8,6 +8,7 @@
 //!
 //! Headless: nothing here touches the renderer.
 
+pub mod creep;
 pub mod genesis;
 pub mod lattice;
 pub mod material;
