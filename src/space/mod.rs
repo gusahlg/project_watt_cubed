@@ -6,6 +6,7 @@ pub mod atlas;
 pub mod chart;
 pub mod datum;
 pub mod frame;
+pub mod warp;
 
 pub use frame::FaceFrame;
 

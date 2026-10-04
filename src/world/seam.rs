@@ -398,16 +398,17 @@ impl Seams {
 
     /// Where streaming should stand for a physical eye at `p`: its storage position in the patch
     /// under it, also when it flies above a chart's relief top (up to `reach` blocks, projected
-    /// straight down onto the chart). `None` away from every round body.
+    /// straight down onto the chart). `None` away from every chart and every warped cube.
     pub fn storage_eye(&self, p: glam::DVec3, reach: f64) -> Option<glam::DVec3> {
         for a in &self.atlases {
             if let Some((patch, l)) = a.find(p) {
                 let (o, _) = a.storage_box(patch);
                 return Some(l + glam::DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64));
             }
+            let Some(b) = a.bands.first() else { continue };
             let rel = p - a.centre;
             let r = rel.length();
-            let b = a.bands[0];
+            let b = *b;
             // How far above the top (outward charts: beyond r_hi; inward ones: inside r_lo).
             let (top, above) = if a.inward { (b.r_lo as f64 + 0.5, b.r_lo as f64 + 0.5 - r) } else { (b.r_hi as f64 - 0.5, r - (b.r_hi as f64 - 0.5)) };
             if !(above > 0.0 && above < reach) || r == 0.0 {
@@ -697,8 +698,8 @@ impl super::World {
         }
     }
 
-    /// The round body whose atlas covers physical point `p` (its bands, transition or core): there
-    /// motion and picking run in that patch's storage frame.
+    /// The round body or warped cube whose atlas covers physical point `p`: there motion and
+    /// picking run in that patch's storage frame.
     pub fn atlas_at(&self, p: glam::DVec3) -> Option<&Arc<Atlas>> {
         self.seams.atlases().iter().find(|a| a.find(p).is_some())
     }

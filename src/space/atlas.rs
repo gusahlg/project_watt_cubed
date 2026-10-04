@@ -59,6 +59,19 @@ pub enum Patch {
     Transition { face: Face },
     /// The Cartesian core cube.
     Core,
+    /// One Cartesian box: a cube body that kept its grid (an integer translation of its reference
+    /// cells, embedded by [`Atlas::warp`] when the body sagged).
+    Grid,
+}
+
+/// Storage box of a [`Patch::Grid`]: storage cell `origin + l` is reference cell `ref_min + l`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GridBox {
+    pub origin: [i64; 3],
+    pub size: [i64; 3],
+    pub ref_min: [i64; 3],
+    /// Catalog id of the cube body.
+    pub body: u16,
 }
 
 /// How the cells of a virtual neighbour chunk (outside every box) map onto the real chunk across a
@@ -123,6 +136,10 @@ pub struct Atlas {
     /// The relaxed shape's departure from the sphere of `radius` (physics decides the shape, the
     /// layout is fitted to it); `None` for a spherical datum.
     pub datum: Option<std::sync::Arc<crate::space::datum::DatumField>>,
+    /// Set on a cube body that kept its grid. Chart atlases leave it empty.
+    pub grid: Option<GridBox>,
+    /// Displacement that bends a cube grid. `None` on a chart and on a cube that did not sag.
+    pub warp: Option<std::sync::Arc<crate::space::warp::Warp>>,
 }
 
 /// The transition shell and the Cartesian core below an atlas's innermost band.
@@ -189,7 +206,7 @@ impl Atlas {
         x = snap16(x + t_n + GAP + 15);
         let core_origin = [x, 0, 0];
         let inner = Some(Inner { t_n, t_r, t_layers, t_origin, core_half, core_origin });
-        let atlas = Self { centre, radius, inward, bands, inner, datum: None };
+        let atlas = Self { centre, radius, inward, bands, inner, datum: None, grid: None, warp: None };
         atlas.check_room(x0);
         atlas
     }
@@ -201,13 +218,42 @@ impl Atlas {
         let n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / 16.0).round().max(1.0) as i64 * 16;
         let (r_lo, r_hi) = (snap16(r_lo), snap16(r_hi + 15));
         let origin = std::array::from_fn(|f| [x0, 0, f as i64 * (n + GAP)]);
-        let atlas = Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None, datum: None };
+        let atlas = Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None, datum: None, grid: None, warp: None };
         atlas.check_room(x0);
+        atlas
+    }
+
+    /// One Cartesian box for a cube body. `origin` is the storage minimum (chunk aligned);
+    /// reference cell `ref_min + l` is stored at `origin + l`. `half` is the body's half-size.
+    pub fn cube(
+        centre: DVec3,
+        half: i64,
+        origin: [i64; 3],
+        ref_min: [i64; 3],
+        size: [i64; 3],
+        warp: std::sync::Arc<crate::space::warp::Warp>,
+        body: u16,
+    ) -> Self {
+        let grid = GridBox { origin, size, ref_min, body };
+        let atlas = Self {
+            centre,
+            radius: half,
+            inward: false,
+            bands: Vec::new(),
+            inner: None,
+            datum: None,
+            grid: Some(grid),
+            warp: Some(warp),
+        };
+        atlas.check_room(origin[0]);
         atlas
     }
 
     /// Storage x where this atlas's boxes begin.
     pub fn x0(&self) -> i64 {
+        if let Some(g) = &self.grid {
+            return g.origin[0];
+        }
         self.bands[0].origin[0][0]
     }
 
@@ -247,6 +293,10 @@ impl Atlas {
                 let i = self.inner.expect("a core needs an inner part");
                 (i.core_origin, [2 * i.core_half; 3])
             }
+            Patch::Grid => {
+                let g = self.grid.expect("a grid patch needs a box");
+                (g.origin, g.size)
+            }
         }
     }
 
@@ -264,9 +314,11 @@ impl Atlas {
     pub fn patches(&self) -> impl Iterator<Item = Patch> + '_ {
         let shells = (0..self.bands.len()).flat_map(|b| FACES.map(move |face| Patch::Shell { band: b as u8, face }));
         let inner = self.inner.is_some();
+        let grid = self.grid.is_some();
         shells
             .chain(FACES.map(|face| Patch::Transition { face }).into_iter().filter(move |_| inner))
             .chain(std::iter::once(Patch::Core).filter(move |_| inner))
+            .chain(std::iter::once(Patch::Grid).filter(move |_| grid))
     }
 
     /// The patch holding storage cell `s`, with the cell's local coordinates in that patch.
@@ -309,6 +361,14 @@ impl Atlas {
                 self.centre + cube + (sphere - cube) * t
             }
             Patch::Core => self.centre + l - DVec3::splat(self.inner.expect("a core needs an inner part").core_half as f64),
+            Patch::Grid => {
+                let g = self.grid.expect("a grid patch needs a box");
+                let reference = DVec3::new(g.ref_min[0] as f64, g.ref_min[1] as f64, g.ref_min[2] as f64) + l;
+                match &self.warp {
+                    Some(w) => w.apply(reference),
+                    None => reference,
+                }
+            }
         }
     }
 
@@ -344,6 +404,15 @@ impl Atlas {
 
     /// The patch and continuous local coordinates of a physical point, if the atlas covers it.
     pub fn find(&self, p: DVec3) -> Option<(Patch, DVec3)> {
+        if let Some(g) = &self.grid {
+            let reference = match &self.warp {
+                Some(w) => w.invert(p)?,
+                None => p,
+            };
+            let l = reference - DVec3::new(g.ref_min[0] as f64, g.ref_min[1] as f64, g.ref_min[2] as f64);
+            let inside = (0..3).all(|a| l[a] >= 0.0 && l[a] < g.size[a] as f64);
+            return inside.then_some((Patch::Grid, l));
+        }
         let rel = p - self.centre;
         let face = Face::from_dominant(rel);
         let (tu, nn, tv) = basis(face);
@@ -410,6 +479,15 @@ impl Atlas {
         let (patch, l) = self.find(p)?;
         let (o, _) = self.storage_box(patch);
         let storage = l + DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64);
+        if patch == Patch::Grid {
+            let g = self.grid.expect("a grid patch needs a box");
+            let reference = DVec3::new(g.ref_min[0] as f64, g.ref_min[1] as f64, g.ref_min[2] as f64) + l;
+            let jacobian = match &self.warp {
+                Some(w) => w.jacobian(reference),
+                None => glam::DMat3::IDENTITY,
+            };
+            return Some(Local { patch, storage, jacobian });
+        }
         let h = 1e-3;
         let col = |d: DVec3| (self.embed(patch, l + d * h) - self.embed(patch, l - d * h)) / (2.0 * h);
         Some(Local { patch, storage, jacobian: glam::DMat3::from_cols(col(DVec3::X), col(DVec3::Y), col(DVec3::Z)) })

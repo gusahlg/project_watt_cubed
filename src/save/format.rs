@@ -35,8 +35,8 @@
 //! Version 9 is the same header with 4 knobs and a 33-byte player record (no frame,
 //! velocity, or up axis). It still decodes: identity frame, zero velocity, +Y up,
 //! and the four new knobs at 100. `PlayerState::legacy_pose` is set so the bridge
-//! can stand that player in local gravity; the flag is not written. A v9 Diffusion world stamped with a generator
-//! older than the cube-planet universe (`worldgen < 8`) is [`SaveError::BeforeCubePlanet`].
+//! can stand that player in local gravity; the flag is not written. A Diffusion world stamped with a generator
+//! older than the warped-cube twins (`worldgen < 10`) is [`SaveError::BeforeCubePlanet`].
 //! Flat v9 worlds load. Versions 4-8 predate the selective-transfer law: their headers
 //! still peek (the slot list shows them) but [`decode`] refuses them with [`SaveError::Outdated`].
 //!
@@ -72,11 +72,11 @@ const WORLDGEN_STAMP_LEN: usize = 1 + 8 * 2;
 const HEADER_LEN_PRE_LAW: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN;
 const HEADER_LEN_V9: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN_V9 + material::STAMP_LEN;
 pub const HEADER_LEN: usize = HEADER_LEN_PRE_LAW + material::STAMP_LEN;
-/// `WorldgenKind::Diffusion` on disk. A v9 Diffusion world from before the cube planets is refused.
+/// `WorldgenKind::Diffusion` on disk. A Diffusion world from before the warped-cube twins is refused.
 const KIND_DIFFUSION: u8 = 1;
-/// The first InfiniteDiffusion generator whose start world is the charted ball (worldgen 8 and
-/// earlier were never released: 7 lacks the landmarks, 8 still paints home as a physical cube).
-const FIRST_CUBE_PLANET_WORLDGEN: u16 = 9;
+/// The first InfiniteDiffusion generator whose twins live on a warped cube grid. Worldgen 9 still
+/// paints them as physical cubes (unreleased). Flat worlds from the same era load.
+const FIRST_CUBE_PLANET_WORLDGEN: u16 = 10;
 
 /// Knob value a v9 stamp (four knobs) pads the four new ones with.
 const KNOB_DEFAULT: u16 = 100;
@@ -473,9 +473,8 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let worldgen_version = u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap());
     let off = HEADER_LEN_V5;
     let kind = bytes[off];
-    // Diffusion worlds from before the charted start world predate this universe (v9 saves, v10
-    // saves written while the generator was still a physical home cube, worldgen 8 and earlier).
-    // Flat worlds from the same era load.
+    // Diffusion worlds from before the warped-cube twins predate this universe (worldgen 9 still
+    // paints the twins as physical cubes). Flat worlds from the same era load.
     if kind == KIND_DIFFUSION && worldgen_version < FIRST_CUBE_PLANET_WORLDGEN {
         return Err(SaveError::BeforeCubePlanet);
     }
@@ -642,7 +641,7 @@ mod tests {
 
     fn sample() -> SaveDoc {
         SaveDoc {
-            worldgen_version: 9,
+            worldgen_version: 10,
             worldgen: WorldgenStamp::default(),
             law_stamp: material::Law::current().stamp(),
             meta: SaveMeta {
@@ -994,6 +993,8 @@ mod tests {
         doc.worldgen_version = 8;
         assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
         doc.worldgen_version = 9;
+        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
+        doc.worldgen_version = 10;
         assert!(matches!(decode(&encode(&doc).unwrap()).unwrap(), Decoded::Intact(_)));
     }
 

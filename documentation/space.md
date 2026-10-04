@@ -96,7 +96,7 @@ empty and costs nothing (chunks there classify as air without being generated).
   centre. Every cavern biome carries its own light (glowcap, glowshroom, magma), so most of a
   cavern floor is within a dozen blocks of a light source. The mass the generator reports subtracts the Heart and every bubble, so the pull inside
   them is the honest one.
-- **The Twins** — two 12,000,000-block cubes facing each other across a weightless canyon.
+- **The Twins** — two 12,000,000-block cubes facing each other across a weightless canyon. They keep the cube grid, bent by the sag: corners pull in, faces bow out, and the cells live in storage.
 - **Verdance** — a round world of radius 8,000,000: forested ranges, lakes, groves of colossal
   trees, stone arches and tepuis.
 - **The Hollow** — a shell between 5,750,000 and 6,000,000 from its centre: an icy crust outside

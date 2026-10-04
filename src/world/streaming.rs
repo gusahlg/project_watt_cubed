@@ -2866,7 +2866,36 @@ impl World {
     /// Per-frame selection metric: chunk-centre tangents, `dy` from eye altitude to the LOD envelope.
     /// Tangents stay on the chunk centre (not the raw eye) so PosY `dy=0` stays bit-identical.
     /// Altitude is relative to the face datum, so the envelope stays `[0, 512]` on every face.
+    /// Streaming centre in a warped-cube box, mapped back to the reference cube. Outside every
+    /// cube box this is the centre unchanged, so an identity fold stays bit-identical. A reference
+    /// centre is not inside a box, so a second call does not translate again.
+    fn lod_place(&self, center: Coord) -> (Coord, f64, bool) {
+        let cs = CHUNK_SIZE as i64;
+        let cell = [center.x as i64 * cs, center.y as i64 * cs, center.z as i64 * cs];
+        for atlas in self.generator.atlases() {
+            let Some(g) = atlas.grid else { continue };
+            let inside = (0..3).all(|a| cell[a] >= g.origin[a] && cell[a] < g.origin[a] + g.size[a]);
+            if !inside {
+                continue;
+            }
+            let d = [
+                (g.ref_min[0] - g.origin[0]) / cs,
+                (g.ref_min[1] - g.origin[1]) / cs,
+                (g.ref_min[2] - g.origin[2]) / cs,
+            ];
+            let reference = Coord::new(
+                (center.x as i64 + d[0]) as i32,
+                (center.y as i64 + d[1]) as i32,
+                (center.z as i64 + d[2]) as i32,
+            );
+            let eye_y = self.section_eye_y + (g.ref_min[1] - g.origin[1]) as f64;
+            return (reference, eye_y, true);
+        }
+        (center, self.section_eye_y, false)
+    }
+
     fn section_metric_on(&self, center: Coord, delta: DVec3, face: Face, datum: i32) -> EyeMetric {
+        let (center, eye_y, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
         let cfg = &self.section_pyramid;
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
@@ -2874,7 +2903,7 @@ impl World {
         if face == Face::PosY && datum == 0 {
             let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
             return EyeMetric::new(
-                DVec3::new(pcx as f64 + delta.x, self.section_eye_y + delta.y, pcz as f64 + delta.z),
+                DVec3::new(pcx as f64 + delta.x, eye_y + delta.y, pcz as f64 + delta.z),
                 env,
                 cap,
             );
@@ -2883,7 +2912,7 @@ impl World {
         let (cu, _, cv) = frame.chunk_to_local(center);
         let (u, v) = (cu * cs + cs / 2, cv * cs + cs / 2);
         let d = frame.point_to_local(delta);
-        let eye = DVec3::new((center.x * cs + cs / 2) as f64, self.section_eye_y, (center.z * cs + cs / 2) as f64);
+        let eye = DVec3::new((center.x * cs + cs / 2) as f64, eye_y, (center.z * cs + cs / 2) as f64);
         let rel = frame.point_to_local(eye).y + d.y - datum as f64;
         EyeMetric::new(DVec3::new(u as f64 + d.x, rel, v as f64 + d.z), env, cap)
     }
@@ -3038,7 +3067,10 @@ impl World {
     /// that is not inside a storage box.
     fn chart_bend(&self, pos: SectionPos) -> Option<super::ChartBend> {
         if pos.body < super::section::CHART_BODY_BASE {
-            return None;
+            let atlas = self.seams.atlases().iter().find(|a| {
+                a.grid.as_ref().is_some_and(|g| g.body == pos.body) && a.warp.is_some()
+            })?;
+            return Some(super::ChartBend { atlas: atlas.clone(), patch: crate::space::atlas::Patch::Grid });
         }
         let index = (pos.body - super::section::CHART_BODY_BASE) as usize;
         let atlas = self.seams.atlases().get(index)?.clone();
@@ -3173,7 +3205,8 @@ impl World {
     /// static frontier bit-for-bit. Open space and a round body seen from outside select
     /// nothing; a streaming centre in storage selects that chart's sections.
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        if !self.fold.is_identity() {
+        let (_, _, in_cube) = self.lod_place(center);
+        if !self.fold.is_identity() && !in_cube {
             return self.chart_sections(center);
         }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
@@ -3198,20 +3231,24 @@ impl World {
 
     /// Chunk-centre sample the far field treats as the eye (tangents quantised, altitude exact on Y).
     fn lod_eye_point(&self, center: Coord) -> DVec3 {
+        let (center, eye_y, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
-        DVec3::new((center.x * cs + cs / 2) as f64, self.section_eye_y, (center.z * cs + cs / 2) as f64)
+        DVec3::new((center.x * cs + cs / 2) as f64, eye_y, (center.z * cs + cs / 2) as f64)
     }
 
     /// Face-local chunk-centre tangents.
     fn face_tangent_centre(&self, center: Coord, face: Face) -> (i32, i32) {
+        let (center, _, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
         let (cu, _, cv) = FaceFrame::new(face).chunk_to_local(center);
         (cu * cs + cs / 2, cv * cs + cs / 2)
     }
 
-    /// The cube face under the camera. `None` in storage, in open space, or over a round body.
+    /// The cube face under the camera. `None` in a chart's storage, in open space, or over a round
+    /// body. A streaming centre inside a warped cube still names that cube's face.
     fn dominant_lod_face(&self, center: Coord) -> Option<(u16, Face)> {
-        if !self.fold.is_identity() {
+        let (_, _, in_cube) = self.lod_place(center);
+        if !self.fold.is_identity() && !in_cube {
             return None;
         }
         let Some(cosmos) = self.generator.cosmos() else {

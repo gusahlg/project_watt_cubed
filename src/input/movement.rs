@@ -855,6 +855,63 @@ mod tests {
         assert!((player.up() - (player.position - atlas.centre).normalize()).length() < 0.05, "standing along the radius");
     }
 
+    /// Near a twin's face edge the grid has sagged. The player lands on the storage cells and
+    /// stands along the physical pull.
+    #[test]
+    fn a_player_stands_on_a_sagging_twin_along_the_pull() {
+        use crate::space::FaceFrame;
+        use crate::world::terrain::cosmos::{Kind, Shape};
+        let mut world = diffusion();
+        let (atlas, half, centre_i) = {
+            let generator = world.terrain();
+            let twin = generator.cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == Kind::Twin).expect("a twin");
+            let Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+            let atlas = world
+                .atlases()
+                .iter()
+                .find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id))
+                .expect("warped")
+                .clone();
+            let centre_i = (
+                i32::try_from(twin.centre[0]).unwrap(),
+                i32::try_from(twin.centre[1]).unwrap(),
+                i32::try_from(twin.centre[2]).unwrap(),
+            );
+            (atlas, half, centre_i)
+        };
+        let frame = FaceFrame::new(Face::PosY);
+        let (cu, _, cv) = frame.cell_to_local(centre_i);
+        let u = cu + half as i32 - 400;
+        let v = cv;
+        let surf = world.terrain().surface(Face::PosY, u, v);
+        assert_ne!(surf, i32::MIN, "the edge column has no surface");
+        let (rx, ry, rz) = frame.cell_to_world((u, surf + 8, v));
+        let start = atlas.warp.as_ref().expect("warp").apply(DVec3::new(rx as f64 + 0.5, ry as f64 + 0.5, rz as f64 + 0.5));
+        world.ensure_around(start);
+        let mut player = Player::new(start);
+        let g0 = world.gravity_at(start).accel;
+        assert!(g0.length() > 0.5, "the twin pulls: {g0:?}");
+        player.snap_up(-g0.normalize());
+        let step = |player: &mut Player, world: &mut World| {
+            world.ensure_around(player.position);
+            let g = world.gravity_at(player.position).accel;
+            let a = world.atlas_at(player.position).expect("on the twin").clone();
+            update_player_in(player, world, &a, &idle(), 1.0 / 60.0, g);
+            g
+        };
+        let mut last_g = g0;
+        for _ in 0..360 {
+            last_g = step(&mut player, &mut world);
+            if player.on_ground() {
+                break;
+            }
+        }
+        assert!(player.on_ground(), "landed on the twin");
+        let up = player.up();
+        let pull = -last_g.normalize();
+        assert!(up.dot(pull) > 0.95, "standing along the pull: {up:?} vs {pull:?}");
+    }
+
     fn diffusion() -> World {
         use crate::render_config::RenderConfig;
         use crate::world::generation::WorldgenKind;

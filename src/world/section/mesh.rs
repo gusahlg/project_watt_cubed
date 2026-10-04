@@ -567,6 +567,39 @@ pub(in crate::world) fn chart_slab_corners(
     Some((anchor, corners.map(|c| (c - a).as_vec3())))
 }
 
+/// Eight warped corners of one cube-face slab. The packed block is the axis-aligned world box
+/// [`SectionState::slab_placement`] would have used; each corner is that point through the warp.
+/// Anchor is the floor of corner 0 (bit 0 = +x, bit 1 = +y, bit 2 = +z).
+pub(in crate::world) fn warp_slab_corners(
+    atlas: &crate::space::atlas::Atlas,
+    face: Face,
+    x0: i32,
+    y0: i32,
+    z0: i32,
+    extent: i32,
+) -> Option<(voxel_engine::IVec3, [voxel_engine::Vec3; 8])> {
+    let warp = atlas.warp.as_ref()?;
+    let half = extent / 2;
+    let (cx, cy, cz) = FaceFrame::new(face).cell_to_world((x0 + half, y0 + half, z0 + half));
+    let origin = [cx - half, cy - half, cz - half];
+    let extent_f = extent as f64;
+    let corners: [voxel_engine::DVec3; 8] = std::array::from_fn(|c| {
+        let p = voxel_engine::DVec3::new(
+            origin[0] as f64 + ((c & 1) as f64) * extent_f,
+            origin[1] as f64 + (((c >> 1) & 1) as f64) * extent_f,
+            origin[2] as f64 + (((c >> 2) & 1) as f64) * extent_f,
+        );
+        warp.apply(p)
+    });
+    let a = corners[0].floor();
+    let fits = |v: f64| v.is_finite() && (i32::MIN as f64..=i32::MAX as f64).contains(&v);
+    if !fits(a.x) || !fits(a.y) || !fits(a.z) {
+        return None;
+    }
+    let anchor = voxel_engine::IVec3::new(a.x as i32, a.y as i32, a.z as i32);
+    Some((anchor, corners.map(|c| (c - a).as_vec3())))
+}
+
 /// The one section-mesh driver both producers share: `fill` overwrites this
 /// worker's pooled native grid (every cell must be written), then the packer
 /// and mesher run over it. Producers differ ONLY in how the grid is filled.

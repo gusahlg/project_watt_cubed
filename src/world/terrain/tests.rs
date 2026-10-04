@@ -355,18 +355,17 @@ fn face_centre_chunk(t: &Terrain, body: &cosmos::Body, face: Face) -> (i32, i32,
         return (sx.div_euclid(16), (h - 1).div_euclid(16), sz.div_euclid(16));
     }
     let half = cube::half_of(body);
-    let centre = cube::centre_i32(body.centre).expect("cube centre fits i32");
-    let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
-    let world_a = t.surface(face, cu, cv);
-    assert_ne!(world_a, i32::MIN, "body {} {face:?} has no surface", body.id);
-    let h = cube::face_h(half, cube::normal_dot(body.centre, face), world_a);
+    // This body's face centre. `surface` is the highest cube on the world tangents, and the other
+    // twin shares them, so the height comes from this painter.
+    let h = cube::blend_height(t.paint(body, face).shape.height(0, 0), cube::rim_seed(body), face, half, 0, 0);
     let a = (half + i64::from(h - 1)) as i32;
     let (rx, ry, rz) = FaceFrame::new(face).cell_to_world((0, a, 0));
-    chunk_of([
+    let world = [
         i64::from(rx) + body.centre[0],
         i64::from(ry) + body.centre[1],
         i64::from(rz) + body.centre[2],
-    ])
+    ];
+    chunk_of(t.storage.cube_storage(body.id, world).unwrap_or(world))
 }
 
 /// Worker path (`generate_column`), including chunks `generate` stores from `classify`.
@@ -515,9 +514,9 @@ fn cube_edges_share_one_rim_and_the_ridge_is_solid() {
         assert!((MIN_GROUND..=MAX_GROUND).contains(&hy));
         // One block past the square still belongs to this face and rebuilds the same rim.
         assert_eq!(t.surface(Face::PosY, cu + hi + 1, cv + v), dy, "wedge v={v}");
-        let solid = face_world(&twin, Face::PosY, hi, hy - 1, v);
+        let solid = occupy(&t, &twin, face_world(&twin, Face::PosY, hi, hy - 1, v));
         assert_ne!(t.voxel_at(solid[0], solid[1], solid[2]), AIR, "ridge solid v={v}");
-        let above = face_world(&twin, Face::PosY, hi, hy + 30, v);
+        let above = occupy(&t, &twin, face_world(&twin, Face::PosY, hi, hy + 30, v));
         assert_eq!(t.voxel_at(above[0], above[1], above[2]), AIR, "above the ridge v={v}");
     }
     let dy = t.surface(Face::PosY, cu + hi, cv + hi);
@@ -531,9 +530,9 @@ fn cube_edges_share_one_rim_and_the_ridge_is_solid() {
         let rim = cube::blend_height(0, cube::rim_seed(&twin), face, half, ub, vb);
         assert_eq!(rim, hy, "{face:?} corner rim");
     }
-    let solid = face_world(&twin, Face::PosY, hi, hy - 1, hi);
+    let solid = occupy(&t, &twin, face_world(&twin, Face::PosY, hi, hy - 1, hi));
     assert_ne!(t.voxel_at(solid[0], solid[1], solid[2]), AIR);
-    let above = face_world(&twin, Face::PosY, hi, hy + 30, hi);
+    let above = occupy(&t, &twin, face_world(&twin, Face::PosY, hi, hy + 30, hi));
     assert_eq!(t.voxel_at(above[0], above[1], above[2]), AIR);
 }
 
@@ -591,7 +590,7 @@ fn classify_matches_what_generation_stores() {
     assert_eq!(t.sky(ChunkCoord::new(sx.div_euclid(16), y, sz.div_euclid(16))), Sky::Axis(Face::PosY));
     let twin = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
     let cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
-    let edge = face_world(&twin, Face::PosY, half as i32 - 100, 0, 0);
+    let edge = occupy(&t, &twin, face_world(&twin, Face::PosY, half as i32 - 100, 0, 0));
     assert_eq!(
         t.sky(ChunkCoord::new(edge[0].div_euclid(16), edge[1].div_euclid(16), edge[2].div_euclid(16))),
         Sky::Open
@@ -892,6 +891,15 @@ fn face_world(body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> [i32; 
     [x + c.0, y + c.1, z + c.2]
 }
 
+/// Storage cell of a warped cube's reference cell, or the reference cell when the cube is not stored.
+fn occupy(t: &Terrain, body: &cosmos::Body, world: [i32; 3]) -> [i32; 3] {
+    let p = [i64::from(world[0]), i64::from(world[1]), i64::from(world[2])];
+    match t.storage.cube_storage(body.id, p) {
+        Some(s) => [s[0] as i32, s[1] as i32, s[2] as i32],
+        None => world,
+    }
+}
+
 #[test]
 fn asteroids_round_worlds_and_the_twin_canyon() {
     let (_reg, t) = make(42);
@@ -1003,7 +1011,11 @@ fn asteroids_round_worlds_and_the_twin_canyon() {
             assert_eq!(t.voxel_at(p[0] as i32, p[1] as i32, p[2] as i32), AIR, "{:?} physical cell {p:?}", b.kind);
         };
         match b.shape {
-            cosmos::Shape::Cube { .. } => {}
+            cosmos::Shape::Cube { half } => {
+                air(c);
+                air([c[0] + half / 2, c[1], c[2]]);
+                air([c[0] + half - 10, c[1], c[2]]);
+            }
             cosmos::Shape::Ball { r } => {
                 air(c);
                 air([c[0] + r / 2, c[1], c[2]]);
@@ -1027,7 +1039,7 @@ fn asteroids_round_worlds_and_the_twin_canyon() {
         let lush = body.id == lush_id;
         let (u, h, v) = span::example(span::face_seed(body), half).expect("a spire");
         assert!(h > MAX_GROUND && (h as i64) < cosmos::RELIEF, "spire altitude {h}");
-        let w = face_world(body, face, u, h, v);
+        let w = occupy(&t, body, face_world(body, face, u, h, v));
         let id = t.voxel_at(w[0], w[1], w[2]);
         if lush {
             assert!(id == m.timber || id == m.jade, "lush spire is {id:?}");
@@ -1040,12 +1052,12 @@ fn asteroids_round_worlds_and_the_twin_canyon() {
         assert_worker_matches(&t, cx, cy, cz);
         let (au, ah, av) = span::an_arch(m, lush, span::face_seed(body), half).expect("an arch");
         assert!(ah > MAX_GROUND && (ah as i64) < cosmos::RELIEF);
-        let aw = face_world(body, face, au, ah, av);
+        let aw = occupy(&t, body, face_world(body, face, au, ah, av));
         let arch = t.voxel_at(aw[0], aw[1], aw[2]);
         let ok = if lush { arch == m.timber || arch == m.leaves } else { arch == m.crystal || arch == m.glowshroom };
         assert!(ok, "arch block {arch:?}");
         // Above the spires and every landmark (sky islands reach higher than the spires).
-        let clear = face_world(body, face, 0, span::CLEAR.max(cube::TREE_CLEAR) + 16, 0);
+        let clear = occupy(&t, body, face_world(body, face, 0, span::CLEAR.max(cube::TREE_CLEAR) + 16, 0));
         assert_eq!(t.voxel_at(clear[0], clear[1], clear[2]), AIR);
         let cc = chunk_of([clear[0] as i64, clear[1] as i64, clear[2] as i64]);
         // The twin still owns this chunk, so air above the spires is uniform air.
@@ -1457,10 +1469,16 @@ fn face_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i3
     let half = cube::half_of(body);
     let a = i32::try_from(half + i64::from(h)).expect("altitude");
     let (x, y, z) = FaceFrame::new(face).cell_to_world((u, a, v));
+    let world = [
+        i64::from(x) + body.centre[0],
+        i64::from(y) + body.centre[1],
+        i64::from(z) + body.centre[2],
+    ];
+    let s = t.storage.cube_storage(body.id, world).unwrap_or(world);
     (
-        i32::try_from(i64::from(x) + body.centre[0]).expect("x"),
-        i32::try_from(i64::from(y) + body.centre[1]).expect("y"),
-        i32::try_from(i64::from(z) + body.centre[2]).expect("z"),
+        i32::try_from(s[0]).expect("x"),
+        i32::try_from(s[1]).expect("y"),
+        i32::try_from(s[2]).expect("z"),
     )
 }
 
@@ -2088,7 +2106,7 @@ fn floor_chunks(body: &cosmos::Body, c: &deep::Cover, n: usize) -> Vec<[i32; 3]>
 fn fill_face_us(t: &Terrain, coord: ChunkCoord, reps: usize) -> Option<f64> {
     let Sky::Axis(face) = t.sky(coord) else { return None };
     let (key, _) = ColumnKey::of(face, coord);
-    let body = t.face_column_body(key)?;
+    let body = t.face_column_body_in(key, true)?;
     let half = cube::half_of(&body);
     let centre = cube::centre_i32(body.centre)?;
     let (wu, wv) = key.column_cell_uv(0, 0);
@@ -2292,6 +2310,113 @@ fn a_datum_lifts_the_home_grid_and_leaves_its_painting() {
         let deep = glam::DVec3::new(i, 16.0, j);
         assert!(((lifted.embed(patch, deep) - atlas.embed(patch, deep)).length()) < 0.01 * off.abs() + 1.0);
     }
+}
+
+/// A sagging twin's storage cells are the old physical painter, the corner sits about a tenth
+/// lower, the face centre bows out, and gravity names that sag near the body.
+#[test]
+fn warped_twins_keep_the_cube_painter_and_sag() {
+    let (_reg, t) = make(42);
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    assert_eq!(twins.len(), 2);
+    let cubes: Vec<_> = t.atlases().iter().filter(|a| a.grid.is_some()).cloned().collect();
+    assert_eq!(cubes.len(), 2, "both twins sag into storage");
+    let g0 = cubes[0].grid.unwrap();
+    let g1 = cubes[1].grid.unwrap();
+    let y_apart = g0.origin[1] + g0.size[1] <= g1.origin[1] || g1.origin[1] + g1.size[1] <= g0.origin[1];
+    assert!(y_apart, "cube boxes share a PosX column");
+    for atlas in &cubes {
+        let g = atlas.grid.unwrap();
+        assert!(g.origin[0] + g.size[0] < crate::math::CELL_LIMIT as i64, "cube box leaves i32");
+        assert!(g.origin[1] >= crate::space::atlas::STORAGE_X0);
+        let outside = [g.origin[0] + g.size[0], g.origin[1] + 16, g.origin[2] + 16];
+        assert!(atlas.glue(outside).is_none(), "a cell just outside the box glues");
+        let last = [(g.origin[0] + g.size[0]) / 16 - 1, g.origin[1] / 16, g.origin[2] / 16];
+        assert!(atlas.chunk_across(last, 0, 1).is_none(), "the chunk past +x is a seam");
+    }
+
+    let mut samples = Vec::new();
+    for body in &twins {
+        let half = cube::half_of(body);
+        for face in Face::ALL {
+            let (cx, cy, cz) = face_centre_chunk(&t, body, face);
+            samples.push(ChunkCoord::new(cx, cy, cz));
+        }
+        let hi = half as i32;
+        for (u, v) in [(hi, 0), (hi, hi)] {
+            let cell = occupy(&t, body, face_world(body, Face::PosY, u, 0, v));
+            samples.push(ChunkCoord::new(cell[0].div_euclid(16), cell[1].div_euclid(16), cell[2].div_euclid(16)));
+        }
+        let deep = occupy(&t, body, [body.centre[0] as i32, body.centre[1] as i32, body.centre[2] as i32]);
+        samples.push(ChunkCoord::new(deep[0].div_euclid(16), deep[1].div_euclid(16), deep[2].div_euclid(16)));
+        let face = span::facing_face(&t.cosmos, body).unwrap();
+        let (u, h, v) = span::example(span::face_seed(body), half).expect("a spire");
+        let spire = occupy(&t, body, face_world(body, face, u, h, v));
+        samples.push(ChunkCoord::new(spire[0].div_euclid(16), spire[1].div_euclid(16), spire[2].div_euclid(16)));
+    }
+    let n = CHUNK_SIZE as i32;
+    for coord in samples {
+        let data = t.generate(coord.x, coord.y, coord.z);
+        for lz in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    let (x, y, z) = (coord.x * n + lx as i32, coord.y * n + ly as i32, coord.z * n + lz as i32);
+                    let (id, reference) = t.storage.cube_ref_cell(x, y, z).expect("storage cell of a sampled chunk");
+                    let body = t.cosmos.bodies().iter().find(|b| b.id == id).expect("cube body");
+                    assert_eq!(data.get(Chunk::index(lx, ly, lz)), t.cube_cell(body, reference), "({x},{y},{z})");
+                    let (Ok(px), Ok(py), Ok(pz)) =
+                        (i32::try_from(reference[0]), i32::try_from(reference[1]), i32::try_from(reference[2]))
+                    else {
+                        continue;
+                    };
+                    assert_eq!(t.voxel_at(px, py, pz), AIR, "physical ({px},{py},{pz}) still holds the twin");
+                }
+            }
+        }
+    }
+
+    let body = twins[0];
+    let cosmos::Shape::Cube { half } = body.shape else { panic!("a twin is a cube") };
+    let warp = cubes.iter().find(|a| a.grid.unwrap().body == body.id).unwrap().warp.as_ref().unwrap();
+    let c = body.centre_f();
+    let h = half as f64;
+    let radial = (warp.apply(c + glam::DVec3::new(h, h, h)) - c).length();
+    let undeformed = h * 3.0f64.sqrt();
+    let ratio = radial / undeformed;
+    let face_len = (warp.apply(c + glam::DVec3::new(h, 0.0, 0.0)) - c).length();
+    // Corner/face is the roundness: a cube is √3 ≈ 1.73, the twins' sag is about 1.56.
+    let roundness = radial / face_len;
+    assert!(
+        (roundness - 1.56).abs() < 0.03 && ratio < 0.98,
+        "corner/face {roundness} radial ratio {ratio}"
+    );
+    assert!(face_len > h && face_len - h < 0.10 * h, "face centre {face_len} vs half {h}");
+
+    let sag = warp.max_displacement();
+    let field = crate::gravity::Field::new(t.cosmos.clone());
+    let other = twins[1];
+    let delta = [
+        body.centre[0] - other.centre[0],
+        body.centre[1] - other.centre[1],
+        body.centre[2] - other.centre[2],
+    ];
+    let axis = (0..3).max_by_key(|&a| delta[a].abs()).unwrap();
+    let sign = if delta[axis] >= 0 { 1.0 } else { -1.0 };
+    let mut near = c;
+    near[axis] += sign * h;
+    let mut far = c;
+    far[axis] += sign * (h + sag.max(cosmos::RELIEF as f64) * 8.0);
+    let near_s = field.sample(near);
+    let far_s = field.sample(far);
+    let bound = crate::gravity::G * 2.0 * std::f64::consts::PI * body.density * (cosmos::RELIEF as f64 + sag);
+    assert!(near_s.error + 1e-6 >= bound, "near error {} < bound {bound}", near_s.error);
+    let sag_term = crate::gravity::G * 2.0 * std::f64::consts::PI * body.density * sag * 0.5;
+    assert!(
+        near_s.error - far_s.error + 1e-6 >= sag_term,
+        "sag left the error: near {} far {} sag term {sag_term}",
+        near_s.error,
+        far_s.error
+    );
 }
 
 /// Release cost of painting one home chart chunk. Debug skips it.

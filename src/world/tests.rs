@@ -3138,6 +3138,33 @@ fn far_face_twin_plus_x_selects_sections_at_the_surface() {
         (x0..x0 + block).contains(&(column - 1))
     });
     assert!(covers, "surface {column} is outside the placed slabs (floor {})", mesh.altitude_floor);
+    let atlas = world
+        .terrain()
+        .atlases()
+        .iter()
+        .find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id))
+        .expect("the twin is a warped cube")
+        .clone();
+    let warp = atlas.warp.as_ref().expect("warp");
+    for slab in &mesh.slabs {
+        let extent = 16i32 << detail.0;
+        let y0 = mesh.altitude_floor + slab.origin_y as i32 * pos.cell_size();
+        let (anchor, corners) = section::warp_slab_corners(&atlas, pos.face, pos.min_x(), y0, pos.min_z(), extent).expect("warp cage");
+        let half_e = extent / 2;
+        let (cx, cy, cz) = FaceFrame::new(pos.face).cell_to_world((pos.min_x() + half_e, y0 + half_e, pos.min_z() + half_e));
+        let origin = [cx - half_e, cy - half_e, cz - half_e];
+        for c in 0..8 {
+            let p = DVec3::new(
+                origin[0] as f64 + ((c & 1) as f64) * extent as f64,
+                origin[1] as f64 + (((c >> 1) & 1) as f64) * extent as f64,
+                origin[2] as f64 + (((c >> 2) & 1) as f64) * extent as f64,
+            );
+            let physical = warp.apply(p);
+            let got = DVec3::new(anchor.x as f64 + corners[c].x as f64, anchor.y as f64 + corners[c].y as f64, anchor.z as f64 + corners[c].z as f64);
+            assert!((physical - got).length() < 1.0e-2, "cage corner {c}");
+            assert!((physical - p).length() > 1.0, "the slab corner did not move");
+        }
+    }
 }
 
 /// A twin cube's +Y face selects that body's sections, not the start cube's.
@@ -3332,6 +3359,20 @@ fn far_face_plus_x_edit_dirties_the_face_section() {
         .expect("a twin");
     let (_, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosX);
     let (x, y, z) = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv));
+    let atlas = world
+        .terrain()
+        .atlases()
+        .iter()
+        .find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id))
+        .expect("the twin is a warped cube")
+        .clone();
+    let g = atlas.grid.expect("grid");
+    let s = [
+        i64::from(x) - g.ref_min[0] + g.origin[0],
+        i64::from(y) - g.ref_min[1] + g.origin[1],
+        i64::from(z) - g.ref_min[2] + g.origin[2],
+    ];
+    let (x, y, z) = (s[0] as i32, s[1] as i32, s[2] as i32);
     assert_ne!(world.terrain().voxel_at(x, y, z), AIR, "the crust cell is air");
     world.set_block(x, y, z, AIR);
     let span = section::section_span(section::FINEST_DETAIL);
