@@ -261,6 +261,8 @@ pub struct Cosmos {
     /// Sag of a warped cube (body id, largest nodal displacement in blocks). The mass primitive
     /// stays the box; this is the extra error declared near the body.
     sag: Vec<(u16, f64)>,
+    /// Warped cubes' displacement fields (altitude and air are measured on the bent grid).
+    warps: Vec<(u16, std::sync::Arc<crate::space::warp::Warp>)>,
 }
 
 /// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
@@ -424,6 +426,7 @@ impl Cosmos {
             deep: deep.clamp(0.0, 2.0),
             relief: None,
             sag: Vec::new(),
+            warps: Vec::new(),
         };
         cosmos.place_clusters(space);
         cosmos
@@ -786,10 +789,22 @@ impl Cosmos {
         self.surface_offset(b, b.centre_f() + DVec3::ONE)
     }
 
-    /// Altitude of `p` above body `b`'s relaxed surface datum (its [`Body::altitude`] for a body
-    /// without a relaxed datum).
+    /// Altitude of `p` above body `b`'s relaxed surface: above its datum for a relaxed round
+    /// body, above its reference cube at the point the warp maps onto `p` for a warped cube, else
+    /// [`Body::altitude`].
     pub fn altitude(&self, b: &Body, p: DVec3) -> f64 {
+        if let Some((_, warp)) = self.warps.iter().find(|(id, _)| *id == b.id) {
+            if let Some(x) = warp.invert(p) {
+                return b.altitude(x);
+            }
+        }
         b.altitude(p) - self.surface_offset(b, p)
+    }
+
+    /// Give a warped cube its displacement field (generation, before the cosmos is shared).
+    pub fn set_warp(&mut self, id: u16, warp: std::sync::Arc<crate::space::warp::Warp>) {
+        self.warps.retain(|(i, _)| *i != id);
+        self.warps.push((id, warp));
     }
 
     /// Lowest and highest relaxed datum offsets of body `b` (zero without a relaxed datum).

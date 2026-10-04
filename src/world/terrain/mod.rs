@@ -524,6 +524,7 @@ impl Terrain {
         let warps = cube_warps(&cosmos, &matter);
         for (id, warp) in &warps {
             cosmos.set_warp_sag(*id, warp.max_displacement());
+            cosmos.set_warp(*id, Arc::clone(warp));
         }
         // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
         // chart grid to the shape, and its relief joins gravity.
