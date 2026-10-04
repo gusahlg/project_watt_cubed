@@ -377,8 +377,96 @@ fn merge(kids: [MipCell; 4]) -> MipCell {
 /// only safely grow, never shrink), this resamples every column fresh.
 ///
 /// Only called for edited cells (bounded, rare); the immutable bake covers
-/// everything else at zero cost.
+/// everything else at zero cost. `None` when the square holds no surface (the bake applies).
+///
+/// The origin +Y bake (zero datum, not a chart) samples the legacy `[0, 512)` window in world Y.
+/// Every other face, a chart (storage +Y, its surface millions of cells up) and a raised datum
+/// sample the square's own surface window along the face and store height above the face datum,
+/// the bake's height space for them.
 pub(in crate::world) fn resample_cell<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    terra: &G,
+    edits: &[(ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],
+    colors: &[Color],
+) -> Option<MipCell> {
+    let chart = pos.body >= super::section::CHART_BODY_BASE;
+    let datum = terra.face_datum(pos.body, pos.face);
+    if pos.face != Face::PosY || chart || datum != 0 {
+        return resample_face_cell(pos, terra, edits, colors, chart, datum);
+    }
+    Some(resample_origin_cell(pos, terra, edits, colors))
+}
+
+/// [`resample_cell`] on a face, a chart or a raised datum: the extractor's window and sampler
+/// (`extract_section_mesh`), reduced to the topmost solid per column.
+fn resample_face_cell<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    terra: &G,
+    edits: &[(ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],
+    colors: &[Color],
+    chart: bool,
+    datum: i32,
+) -> Option<MipCell> {
+    let (lo, hi) = terra.surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span())?;
+    let cell = pos.cell_size();
+    let (alo, ahi) = super::section::sample_window(lo, hi, cell);
+    let n = ((ahi - alo) / cell).max(1);
+    let half = cell / 2;
+    let ys = super::section::column_ys(pos.detail, alo, n, cell);
+    let flat = super::section::flatten_edits(edits);
+    let remapped;
+    let used: &[_] = if pos.face == Face::PosY {
+        &flat
+    } else {
+        remapped = super::section::face_edits(&flat, pos.face);
+        &remapped
+    };
+    let mut column = vec![AIR; ys.len()];
+    let mut fold = MipFold::new();
+    for iz in 0..SECTION_N as i32 {
+        for ix in 0..SECTION_N as i32 {
+            let (fx, fz) = (pos.min_x() + ix * cell, pos.min_z() + iz * cell);
+            let (u, v) = (fx + half, fz + half);
+            if pos.face == Face::PosY && !chart {
+                terra.lod_column(u, v, &ys, &mut column);
+            } else {
+                terra.lod_column_face(pos.body, pos.face, u, v, &ys, &mut column);
+            }
+            super::section::apply_edits(&mut column, used, fx, fz, cell, alo);
+            let (h, block) = match column.iter().rposition(|&id| id != AIR) {
+                Some(j) => (alo + (j as i32 + 1) * cell, column[j]),
+                None => (alo, AIR),
+            };
+            fold.height(h.saturating_sub(datum) as f32);
+            // Colour as the bake does (its surface block, on its stride), so an edit does not
+            // recolour the square; an edited column shows what was placed.
+            let edited = used.iter().any(|&(x, _, z, _)| (fx..fx + cell).contains(&x) && (fz..fz + cell).contains(&z));
+            if edited {
+                fold.color(colors[block.0 as usize]);
+            } else if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
+                fold.color(colors[bake_surface_block(terra, pos.body, pos.face, u, v).0 as usize]);
+            }
+        }
+    }
+    Some(fold.finish())
+}
+
+/// The block whose colour the bake records for column `(u, v)` ([`sample_section`]).
+fn bake_surface_block<G: TerrainGenerator + ?Sized>(terra: &G, body: u16, face: Face, u: i32, v: i32) -> crate::block::registry::BlockId {
+    if face == Face::PosY {
+        return terra.surface_at(u, v);
+    }
+    let h = terra.surface(face, u, v);
+    if h == i32::MIN {
+        return AIR;
+    }
+    let mut below = [AIR; 1];
+    terra.lod_column_face(body, face, u, v, &[h - 1], &mut below);
+    below[0]
+}
+
+/// [`resample_cell`] on the origin +Y bake: the legacy `[0, 512)` window in world Y.
+fn resample_origin_cell<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     terra: &G,
     edits: &[(ChunkCoord, Vec<(usize, crate::block::registry::BlockId)>)],
@@ -464,7 +552,7 @@ mod tests {
             ] {
                 for edit_set in [&[][..], &edits[..]] {
                     let want = resample_reference(pos, &g, edit_set, &colors);
-                    let got = resample_cell(pos, &g, edit_set, &colors);
+                    let got = resample_cell(pos, &g, edit_set, &colors).expect("a surface");
                     assert_eq!((want.lo, want.hi, want.color), (got.lo, got.hi, got.color),
                         "fused resample diverged at {pos:?} (edits: {})", !edit_set.is_empty());
                 }
@@ -688,7 +776,7 @@ mod tests {
         let (reg, g) = terra(23);
         let colors = reg.color_snapshot();
         let pos = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 3, z: -2 };
-        let got = resample_cell(pos, &g, &[], &colors);
+        let got = resample_cell(pos, &g, &[], &colors).expect("a surface");
 
         let section = Section::extract(pos, &g, &[], voxel_engine::Rev::START);
         let (mut want_lo, mut want_hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -720,13 +808,13 @@ mod tests {
         let cell = pos.cell_size();
         let (wx, wz) = (pos.min_x() + cell / 2, pos.min_z() + cell / 2); // column (0,0)'s sample point
 
-        let unedited = resample_cell(pos, &g, &[], &colors);
+        let unedited = resample_cell(pos, &g, &[], &colors).expect("a surface");
         let built_y = unedited.hi as i32 + 40;
         let (coord, local) = BlockCoord::new(wx, built_y, wz).split();
         let index = Chunk::index(local.lx(), local.ly(), local.lz());
         let edits = vec![(coord, vec![(index, stone)])];
 
-        let edited = resample_cell(pos, &g, &edits, &colors);
+        let edited = resample_cell(pos, &g, &edits, &colors).expect("a surface");
         assert!(
             edited.hi >= built_y as f32,
             "a built-up column must raise the cell's recorded height to at least where it was built"
@@ -735,6 +823,73 @@ mod tests {
             edited.hi > unedited.hi,
             "the edit must actually change the result — proving the overlay, not the bake, saw it"
         );
+    }
+
+    /// On the round start world a chart section's surface sits millions of storage cells up. The
+    /// edit overlay of such a section samples the chart's own surface window and stores height above
+    /// the chart datum, like the bake: an edit near the eye no longer turns the far square into a
+    /// flat dark slab read from the empty `[0, 512)` window.
+    #[test]
+    fn a_chart_overlay_samples_the_chart_surface_like_the_bake() {
+        use crate::coord::BlockCoord;
+        use crate::render_config::RenderConfig;
+        use crate::world::chunk::Chunk;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::World;
+
+        let world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let terra = world.terrain();
+        let colors = world.registry().color_snapshot();
+        let eye = world.stream_eye(DVec3::new(0.5, 51.6, 0.5));
+        let index = world
+            .atlases()
+            .iter()
+            .position(|a| a.locate([eye.x as i64, eye.y as i64, eye.z as i64]).is_some())
+            .expect("spawn is charted");
+        let body = super::super::section::CHART_BODY_BASE + index as u16;
+        for detail in [FINEST_DETAIL, Detail(FINEST_DETAIL.0 + 4)] {
+            let span = section_span(detail);
+            let pos = SectionPos {
+                body,
+                face: Face::PosY,
+                detail,
+                x: (eye.x as i32).div_euclid(span),
+                z: (eye.z as i32).div_euclid(span),
+            };
+            let datum = terra.face_datum(body, Face::PosY);
+            assert!(datum > 1_000_000, "the chart datum sits far up storage +Y: {datum}");
+            let bake = sample_section(terra, &colors, detail, pos.x, pos.z, Face::PosY, body, datum);
+            let got = resample_cell(pos, terra, &[], &colors).expect("the chart has a surface here");
+            let cell = pos.cell_size() as f32;
+            assert!(
+                (got.lo - bake.lo).abs() <= cell && (got.hi - bake.hi).abs() <= cell,
+                "{detail:?}: overlay {}..{} vs bake {}..{}",
+                got.lo,
+                got.hi,
+                bake.lo,
+                bake.hi
+            );
+            let (g, b) = (got.color, bake.color);
+            for (x, y) in [(g.r, b.r), (g.g, b.g), (g.b, b.b)] {
+                assert!((x as i32 - y as i32).abs() <= 48, "{detail:?}: overlay colour {g:?} vs bake {b:?}");
+            }
+
+            // Fill the first column's top sample cell of the window: the overlay sees it.
+            let rock = world.registry().id_by_label("rock").unwrap();
+            let c = pos.cell_size();
+            let (lo, hi) = terra.surface_bounds(body, Face::PosY, pos.min_x(), pos.min_z(), pos.span()).unwrap();
+            let (_, ahi) = super::super::section::sample_window(lo, hi, c);
+            let (wx, wz) = (pos.min_x() + c / 2, pos.min_z() + c / 2);
+            let edits: Vec<_> = (ahi - c..ahi)
+                .map(|y| {
+                    let (coord, local) = BlockCoord::new(wx, y, wz).split();
+                    (coord, vec![(Chunk::index(local.lx(), local.ly(), local.lz()), rock)])
+                })
+                .collect();
+            let edited = resample_cell(pos, terra, &edits, &colors).expect("a surface");
+            assert_eq!(edited.hi, (ahi - datum) as f32, "{detail:?}: the edit tops the overlay");
+            assert!(edited.hi >= got.hi);
+        }
     }
 
     /// Benchmark 5-level and 7-level bakes to verify performance stays within budget.

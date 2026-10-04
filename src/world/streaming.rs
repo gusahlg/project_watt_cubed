@@ -3167,12 +3167,7 @@ impl World {
             }
             let cell = *self.section_overlay_cache.get_or_recompute(pos, rev, || {
                 let colors = self.registry.color_snapshot();
-                Some(super::heightmip::resample_cell(
-                    pos,
-                    &*self.generator,
-                    &touched,
-                    &colors,
-                ))
+                super::heightmip::resample_cell(pos, &*self.generator, &touched, &colors)
             });
             match cell {
                 Some(cell) => {

@@ -446,7 +446,7 @@ fn section_window<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G) -> O
 }
 
 /// World edits rewritten as face-local `(u, a, v)`, sorted the way [`super::apply_edits`] requires.
-fn face_edits(flat: &[(i32, i32, i32, BlockId)], face: Face) -> Vec<(i32, i32, i32, BlockId)> {
+pub(in crate::world) fn face_edits(flat: &[(i32, i32, i32, BlockId)], face: Face) -> Vec<(i32, i32, i32, BlockId)> {
     let frame = FaceFrame::new(face);
     let mut out: Vec<_> = flat
         .iter()
