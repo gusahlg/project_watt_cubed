@@ -136,6 +136,9 @@ pub const ROLES: &[Role] = &[
     role("bark", [96, 74, 52], Need::Plain),
     role("amber", [218, 140, 40], Need::Plain),
     role("slate", [72, 78, 88], Need::Plain),
+    // The search lands this role on a dark green configuration (seed-independent: the law and the
+    // roles before it decide), so painters use basalt/obsidian instead. Kept: removing a role
+    // would move every pick after it.
     role("cinder", [56, 40, 38], Need::Plain),
     role("petrified", [150, 132, 116], Need::Plain),
     role("tundra", [124, 132, 100], Need::Plain),

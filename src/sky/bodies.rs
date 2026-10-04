@@ -17,6 +17,10 @@ const WALL_BEHIND: f32 = 150.0;
 const CORE_ORANGE: [f32; 3] = [1.35, 0.86, 0.46];
 /// The Ember's rim inside the cavity, so the core reads as the light.
 const CORE_GLOW: f32 = 5.0;
+/// Brightest the Ember's light gets, relative to its light on the inner wall.
+const EMBER_CAP: f64 = 2.0;
+/// The inner wall's glow on the Ember's own surface, relative to the Ember's light on the wall.
+const WALL_GLOW: f64 = 0.35;
 
 /// Reused far-body list. Capacity stays at [`MAX_FAR_BODIES`] after the first frame.
 #[derive(Debug)]
@@ -114,7 +118,7 @@ impl FarBodies {
         if !dir.is_finite() || dir.length_squared() == 0.0 {
             return;
         }
-        let scale = (inner as f64 / dist) as f32;
+        let (dir, scale) = ember_light(dir, dist, inner as f64, ember_radius(ember));
         self.sun = Some(SunOverride {
             dir,
             color: LinearRgb([
@@ -124,6 +128,34 @@ impl FarBodies {
             ]),
             show_disc: false,
         });
+    }
+}
+
+/// The Ember's radius (a ball at the Hollow's centre); 0 for any other shape.
+fn ember_radius(ember: &Body) -> f64 {
+    match ember.shape {
+        Shape::Ball { r } => r as f64,
+        _ => 0.0,
+    }
+}
+
+/// The cavity's key light at `dist` from the centre, `toward` the centre: `(direction to the light,
+/// brightness)`. Out in the cavity the Ember is the sun, brighter as it nears (relative to the inner
+/// wall, capped at [`EMBER_CAP`]). Close to its surface the ground itself is the source, so what
+/// lights a face from outside is the far wall's glow overhead: dimmer ([`WALL_GLOW`]) and from
+/// above. The brightness passes through zero where the two meet, one Ember radius up, so the
+/// direction flip never shows.
+fn ember_light(toward: Vec3, dist: f64, inner: f64, ember_r: f64) -> (Vec3, f32) {
+    let smooth = |e0: f64, e1: f64, x: f64| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let up = if ember_r > 0.0 { (dist - ember_r) / ember_r } else { f64::INFINITY };
+    if up >= 1.0 {
+        let scale = (inner / dist).min(EMBER_CAP) * smooth(1.0, 2.0, up);
+        (toward, scale as f32)
+    } else {
+        (-toward, (WALL_GLOW * smooth(1.0, 0.5, up)) as f32)
     }
 }
 
@@ -485,13 +517,25 @@ mod tests {
         assert!(sun.color.0[0] > sun.color.0[1] && sun.color.0[1] > sun.color.0[2]);
         let halfway_r = sun.color.0[0];
 
+        // Two Ember radii up the Ember is still the sun below, a little brighter than at halfway
+        // would be without the cap; on its surface the light is the far wall's glow, from above.
+        let near = hollow.centre_f() + DVec3::new(0.0, r as f64 * 3.0, 0.0);
+        let listed = far.update(&terrain, near);
+        assert_eq!(listed.len(), 2);
+        let nearer = far.sun_override().expect("near the Ember");
+        assert!(nearer.color.0[0] >= halfway_r);
+        assert!(nearer.color.0[0] <= CORE_ORANGE[0] * EMBER_CAP as f32);
+        assert_eq!(nearer.dir.y.to_bits(), (-1.0f32).to_bits());
         let close = hollow.centre_f() + DVec3::new(0.0, r as f64 + 50_000.0, 0.0);
         let listed = far.update(&terrain, close);
         assert_eq!(listed.len(), 2);
-        let closer = far.sun_override().expect("closer to the Ember");
-        assert!(closer.color.0[0] > halfway_r);
-        assert!(!closer.show_disc);
-        assert_eq!(closer.dir.y.to_bits(), (-1.0f32).to_bits());
+        let ground = far.sun_override().expect("on the Ember");
+        assert!(!ground.show_disc);
+        assert_eq!(ground.dir.y.to_bits(), 1.0f32.to_bits(), "lit from the wall overhead");
+        assert!(ground.color.0[0] < halfway_r && ground.color.0[0] > 0.0);
+        let flip = hollow.centre_f() + DVec3::new(0.0, r as f64 * 2.0, 0.0);
+        let _ = far.update(&terrain, flip);
+        assert!(far.sun_override().expect("at the flip").color.0[0].abs() < 1.0e-6, "no pop where the light turns");
 
         let lip = hollow.centre_f() + DVec3::new(0.0, inner as f64 - 1.0, 0.0);
         let listed = far.update(&terrain, lip);

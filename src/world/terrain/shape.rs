@@ -313,10 +313,10 @@ impl Shape {
         match strata {
             Strata::Rock => (m.rock, 9),
             Strata::Sandstone => (m.sandstone, 5),
-            Strata::Basalt => ([m.basalt, m.obsidian, m.slate, m.cinder], 9),
+            Strata::Basalt => ([m.basalt, m.obsidian, m.slate, m.obsidian], 9),
             Strata::Limestone => ([m.limestone, m.marble, m.sandstone[0], m.gravel], 9),
             Strata::Ice => ([m.ice, m.frost, m.snow, m.marble], 9),
-            Strata::Ash => ([m.ash, m.cinder, m.basalt, m.gravel], 9),
+            Strata::Ash => ([m.ash, m.obsidian, m.basalt, m.gravel], 9),
             Strata::Bone => ([m.bone, m.limestone, m.marble, m.gravel], 9),
             Strata::Crystal => ([m.crystal, m.marble, m.violet, m.frost], 9),
         }

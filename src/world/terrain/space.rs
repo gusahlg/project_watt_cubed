@@ -242,7 +242,7 @@ fn interior(rock: &Rock, m: &Materials, q: [i64; 3], qf: [f64; 3], f: f64) -> Bl
                 return AIR;
             }
             if f > 0.74 {
-                if noise(rock, 0xA5, qf, 7.0) > 0.35 { m.ash } else { m.cinder }
+                if noise(rock, 0xA5, qf, 7.0) > 0.35 { m.ash } else { m.obsidian }
             } else if f < 0.32 {
                 m.obsidian
             } else {

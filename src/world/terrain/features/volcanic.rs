@@ -81,7 +81,7 @@ fn cone(s: &Spec, m: &Materials, dx: i32, dy: i32, dz: i32) -> Option<Stamp> {
         return None;
     }
     let shell = rad <= 1 || !disk(dx, dz, rad * 2 / 3);
-    Some(Stamp { id: if shell { m.cinder } else { m.ash }, dig: false })
+    Some(Stamp { id: if shell { m.basalt } else { m.ash }, dig: false })
 }
 
 fn columns(s: &Spec, m: &Materials, dx: i32, dy: i32, dz: i32) -> Option<Stamp> {

@@ -119,7 +119,7 @@ pub(super) fn paint(style: Style, m: &Materials, k: &Mark, di: i64, dj: i64, y: 
         (Style::HollowOuter, O_ARCH) => arch(m.ice, m.snow, None, k, di, dj, y),
         (Style::HollowOuter, O_RIDGE) => ridge(m, k, di, dj, y, local),
         (Style::Ember, E_FOUNTAIN) => fountain(m, k, di, dj, y),
-        (Style::Ember, E_CONE) => cone(k, di, dj, y, local, m.cinder, m.ash, m.magma, false),
+        (Style::Ember, E_CONE) => cone(k, di, dj, y, local, m.basalt, m.ash, m.magma, false),
         (Style::Ember, E_SHARD) => shards(m, k, di, dj, y, local),
         (Style::Moon { tone }, M_PEAK) => peak(m, tone, k, di, dj, y),
         (Style::Moon { .. }, M_EJECTA) => lumps(k, di, dj, y, local, m.regolith, m.basalt),
