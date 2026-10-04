@@ -178,7 +178,7 @@ fn tones(land: LinearRgb, second: LinearRgb) -> [LinearRgb; 6] {
     albedo
 }
 
-/// Home cube faces: +Y basin, −Y ash, +X dune, −X shattered, +Z glass, −Z fungal.
+/// Home cube faces in engine order: +X dune, −X shattered, +Y basin, −Y ash, +Z glass, −Z fungal.
 fn home_faces() -> [LinearRgb; 6] {
     [
         srgb(214, 176, 112),
@@ -295,18 +295,16 @@ fn rounded_exponent(k: f64) -> f32 {
     if p.is_finite() && p >= 2.0 { p as f32 } else { 2.0 }
 }
 
-/// The start world's rounded impostor. `k` is the relaxed corner/face radius and
-/// `p = 1 / (1/2 - ln k / ln 3)`. The face radius is that surface sunk by [`sink`],
-/// and under any sample that falls below the face.
+/// The start world's impostor: a sphere at its lowest datum, sunk by [`sink`], so it stays under
+/// the ground in every direction. Terrain draws wherever it reaches; the impostor fills in below the
+/// horizon beyond it, and an eye on the ground must never stand inside it (the shader skips a body
+/// whose solid holds the eye, and the sky would show below the horizon). A superellipsoid fitted to
+/// the face centre and the corner rose above the datum on almost every other direction: the corner
+/// highlands are narrow, not shoulders.
 fn home_impostor(cosmos: &Cosmos, body: &Body) -> (FarShape, f64) {
     let r = radius_of(body);
-    let face = cosmos.face_offset(body);
-    let corner = cosmos.corner_offset(body);
-    let face_r = r + face;
-    let k = if face_r > 0.0 { (r + corner) / face_r } else { 1.0 };
-    let lo = cosmos.relief_range(body).0;
-    let radius = r + face.min(lo) - sink(body).unwrap_or(0.0);
-    (FarShape::Rounded { exponent: rounded_exponent(k) }, radius)
+    let lo = cosmos.relief_range(body).0.min(cosmos.face_offset(body));
+    (FarShape::Sphere, r + lo - sink(body).unwrap_or(0.0))
 }
 
 /// A sagging cube (its grid bent by its warp) drawn as the rounded shape its warp gives: face radius
@@ -510,27 +508,33 @@ mod tests {
         let away = far.update(&terrain, DVec3::new(1.0e8, 0.0, 0.0));
         assert_eq!(alloc_count::alloc_count(), 0, "far-body update allocated");
         let home = find(cosmos, away, terrain.atlases(), cosmos.home()).expect("home is a sky body from 1e8");
-        let FarShape::Rounded { exponent } = home.shape else {
-            panic!("home is rounded, got {:?}", home.shape);
-        };
-        assert!((2.1..=2.3).contains(&exponent), "p {exponent}");
-        let corner = home.radius * 3.0f32.powf(0.5 - 1.0 / exponent);
-        assert!(corner > home.radius, "corner {corner} face {}", home.radius);
+        assert_eq!(home.shape, FarShape::Sphere, "home draws as a sphere under its datum");
         let home_body = cosmos.home();
         let Shape::Ball { r } = home_body.shape else { panic!("home is a ball") };
         let face = cosmos.face_offset(home_body);
         let lo = cosmos.relief_range(home_body).0;
-        // Sunk under the rounded face, and under any sample below that face.
         let expect = (r as f64 + face.min(lo) - 150.0) as f32;
         assert!(
             (home.radius - expect).abs() < 4.0,
             "radius {} expect {expect} (face {face}, lo {lo})",
             home.radius
         );
-        let datum_face = (r as f64 + face) as f32;
-        let datum_corner = (r as f64 + cosmos.corner_offset(home_body)) as f32;
-        assert!(home.radius < datum_face, "face impostor above the datum");
-        assert!(corner < datum_corner, "corner impostor {corner} above the datum {datum_corner}");
+        // Under the datum in every direction, sampled over every face.
+        let centre = home_body.centre_f();
+        for face in crate::coord::Face::ALL {
+            let (a, sign) = (face.axis(), face.sign() as f64);
+            for i in 0..=32 {
+                for j in 0..=32 {
+                    let mut d = [0.0; 3];
+                    d[a] = sign;
+                    d[(a + 1) % 3] = i as f64 / 16.0 - 1.0;
+                    d[(a + 2) % 3] = j as f64 / 16.0 - 1.0;
+                    let dir = DVec3::from_array(d).normalize();
+                    let datum = r as f64 + cosmos.surface_offset(home_body, centre + dir);
+                    assert!((home.radius as f64) < datum, "impostor above the datum toward {dir}: {} vs {datum}", home.radius);
+                }
+            }
+        }
         finite_unit(home);
         assert!(home.dir.x < -0.9, "home should sit toward −X, dir {:?}", home.dir);
         // +Y green basin, −Y ash, +X dune, −X grey, +Z glass, −Z fungal.
