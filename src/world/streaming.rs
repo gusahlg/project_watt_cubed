@@ -640,6 +640,32 @@ fn inside_xz(s: SectionPos, lo: [i64; 3], hi: [i64; 3]) -> bool {
     x >= lo[0] && x + span <= hi[0] && z >= lo[2] && z + span <= hi[2]
 }
 
+/// The section's storage square meets the chart box.
+fn overlaps_xz(s: SectionPos, lo: [i64; 3], hi: [i64; 3]) -> bool {
+    let span = s.span() as i64;
+    let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+    x < hi[0] && x + span > lo[0] && z < hi[2] && z + span > lo[2]
+}
+
+/// Wholly-inside pieces of `s`. A tile that crosses an edge is replaced by the largest descendants
+/// that do not: the edge is not a multiple of the coarser spans, so dropping the straddler leaves
+/// a strip of the chart with nothing drawn. Finest tiles meet a 128-aligned edge and are not split.
+fn cover_chart(s: SectionPos, lo: [i64; 3], hi: [i64; 3], out: &mut Vec<SectionPos>) {
+    if !overlaps_xz(s, lo, hi) {
+        return;
+    }
+    if inside_xz(s, lo, hi) {
+        out.push(s);
+        return;
+    }
+    if s.detail.0 <= super::section::FINEST_DETAIL.0 {
+        return;
+    }
+    for q in super::section::Quadrant::ALL {
+        cover_chart(s.child(q), lo, hi, out);
+    }
+}
+
 fn section_dist2(s: SectionPos, ex: f64, ez: f64) -> f64 {
     let span = s.span() as f64;
     let dx = s.min_x() as f64 + span * 0.5 - ex;
@@ -3084,7 +3110,7 @@ impl World {
         Some(super::ChartBend { atlas, patch })
     }
 
-    /// Far sections of the home chart (and, within two finest sections of a side, its neighbours).
+    /// Far sections of the home chart and, where the far field reaches a side, its neighbours.
     /// Storage +Y is the chart's up, so the sections are [`Face::PosY`] over storage `(x, z)`.
     fn chart_sections(&self, center: Coord) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
@@ -3143,7 +3169,8 @@ impl World {
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
         let near = self.near_block_box(center);
         let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, punch, None);
-        let band = super::section::section_span(super::section::FINEST_DETAIL) as i64 * 2;
+        // The neighbour is visible out to the pyramid edge, not merely the two finest sections.
+        let band = cfg.outer_m() as i64;
         for across in self.seams.seam_across(*seat, [ex, ey, ez], band) {
             tagged.extend(self.seat_sections(
                 &across.seat,
@@ -3160,7 +3187,8 @@ impl World {
         }
         let budget = self.sections_allowed();
         if tagged.len() > budget {
-            tagged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| section_key(&b.0).cmp(&section_key(&a.0))));
+            // Nearest first, so the cap drops the far rim rather than the ground beside the eye.
+            tagged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| section_key(&a.0).cmp(&section_key(&b.0))));
             tagged.truncate(budget);
         }
         let mut out: Vec<_> = tagged.into_iter().map(|(s, _)| s).collect();
@@ -3188,6 +3216,10 @@ impl World {
             s.body = body;
             s.face = Face::PosY;
         }
+        let mut clipped = Vec::new();
+        for s in radial {
+            cover_chart(s, seat.lo, seat.hi, &mut clipped);
+        }
         // Charts have no shader clip. Leave the near square to full-res chunks while they
         // still hold the crust; once that window is sky, the far field draws the square.
         let keep = |s: SectionPos| {
@@ -3195,7 +3227,7 @@ impl World {
                 && !(punch && covers_near(s, near, across))
                 && super::section::section_fits(s.span(), seat.radius)
         };
-        coarsen_chart(radial, max_d, self.sections_allowed(), &keep)
+        coarsen_chart(clipped, max_d, self.sections_allowed(), &keep)
             .into_iter()
             .map(|s| (s, section_dist2(s, ex, ez)))
             .collect()
@@ -5586,5 +5618,181 @@ mod tests {
             true,
         );
         assert_eq!(runs, vec![GenRun::Open { coord }]);
+    }
+
+    /// Columns of the far-field disk that draw neither a chart section nor a full-res chunk.
+    /// Across a seam the neighbour chart is in the disk, and the near window's chunks there are
+    /// real storage chunks (or a section covers them). The pinned ground-level punch still removes
+    /// every section that meets the full-res window. The finest ring stops inside the next
+    /// ring, so that next section can straddle the window and leave an overhang of its own
+    /// span; that overhang, on either chart, is not a seam hole. Neither is a home column
+    /// whose crust sits outside the vertical mesh window.
+    #[test]
+    fn far_chart_seam_has_no_hole() {
+        use crate::render_config::RenderConfig;
+        use crate::space::atlas::Patch;
+        use crate::space::chart::{self, Map};
+        use crate::world::generation::WorldgenKind;
+        use crate::ident::Detail;
+        use crate::world::section::{section_span, FINEST_DETAIL};
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+        let atlas = world
+            .generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - centre).length() < 1.0)
+            .expect("charted")
+            .clone();
+
+        let storage_from_dir = |world: &World, dir: DVec3, above: f64| -> DVec3 {
+            let dir = dir.normalize();
+            let face = Face::from_dominant(dir);
+            let (tu, nn, tv) = chart::basis(face);
+            let (xi, eta) = Map::Equiangular.inverse(DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv)));
+            let n = atlas.bands[0].n;
+            let step = 2.0 / n as f64;
+            // An exact seam parameter floors to n, one cell past the box. Stand on the last cell.
+            let i = (((xi + 1.0) / step).floor() as i64).clamp(0, n - 1);
+            let j = (((eta + 1.0) / step).floor() as i64).clamp(0, n - 1);
+            let patch = Patch::Shell { band: 0, face };
+            let (origin, _) = atlas.storage_box(patch);
+            let stored = atlas.storage(patch, [i, 0, j]);
+            let ground = world.terrain().surface(Face::PosY, stored[0] as i32, stored[2] as i32);
+            let local_y = ground as f64 - origin[1] as f64;
+            let surf = atlas.embed(patch, DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
+            let up = (surf - atlas.centre).normalize();
+            let fallback = DVec3::new(stored[0] as f64 + 0.5, ground as f64 + above, stored[2] as f64 + 0.5);
+            world.chart_eye(surf + up * above).unwrap_or(fallback)
+        };
+
+        let mut sites: Vec<(String, DVec3)> = Vec::new();
+        let symptom = world.chart_eye(DVec3::new(0.0, -8_640_801.0, 22_107_307.0)).expect("symptom chart eye");
+        sites.push(("symptom".to_string(), symptom));
+        let sym_ground = world.terrain().surface(Face::PosY, symptom.x as i32, symptom.z as i32);
+        sites.push(("symptom-ground".to_string(), DVec3::new(symptom.x, sym_ground as f64, symptom.z)));
+        sites.push(("symptom+300".to_string(), DVec3::new(symptom.x, sym_ground as f64 + 300.0, symptom.z)));
+        for above in [0.0_f64, 300.0] {
+            let tag = if above == 0.0 { "ground" } else { "+300" };
+            sites.push((format!("seam-yz-{tag}"), storage_from_dir(&world, DVec3::new(0.0, 1.0, 1.0), above)));
+            sites.push((format!("seam-yx-{tag}"), storage_from_dir(&world, DVec3::new(1.0, 1.0, 0.0), above)));
+            sites.push((format!("corner-{tag}"), storage_from_dir(&world, DVec3::new(1.0, 0.985, 0.97), above)));
+            sites.push((format!("face-{tag}"), storage_from_dir(&world, DVec3::new(0.0, 1.0, 0.0), above)));
+        }
+        let seam = storage_from_dir(&world, DVec3::new(0.0, 1.0, 1.0), 0.0);
+        let seam_c = Coord::new((seam.x / 16.0).floor() as i32, 0, (seam.z / 16.0).floor() as i32);
+        let seam_seat = world.seams.chart_seat(seam_c).expect("seam seat");
+        let inset = if (seam.z as i64 - seam_seat.lo[2]).abs() < (seam_seat.hi[2] - seam.z as i64).abs() {
+            100 * 16
+        } else {
+            -100 * 16
+        };
+        let (ix, iz) = (seam.x, seam.z + inset as f64);
+        let ig = world.terrain().surface(Face::PosY, ix as i32, iz as i32);
+        sites.push(("inset100-ground".to_string(), DVec3::new(ix, ig as f64, iz)));
+        sites.push(("inset100+300".to_string(), DVec3::new(ix, ig as f64 + 300.0, iz)));
+
+        let cs = 16i64;
+        // The ring outside the finest one. A punched section of that span leaves a wider overhang
+        // than a finest tile when the finest annulus does not reach past the full-res box.
+        let sliver = section_span(Detail(FINEST_DETAIL.0 + 1)) as i64;
+        let outer = world.section_pyramid.outer_m() as i64;
+        for (name, storage) in sites {
+            let center = Coord::new(
+                (storage.x / 16.0).floor() as i32,
+                (storage.y / 16.0).floor() as i32,
+                (storage.z / 16.0).floor() as i32,
+            );
+            world.section_eye_y = storage.y;
+            world.adopt_fold(center);
+            let seat = world.seams.chart_seat(center).unwrap_or_else(|| panic!("{name}: no chart seat"));
+            let desired = world.desired_sections(center);
+            let (ex, _, ez) = storage_eye_block(center, storage.y, DVec3::ZERO);
+            let across = world.seams.seam_across(seat, [ex, storage.y.round() as i64, ez], outer);
+            let near = world.near_block_box(center);
+            let v = world.view.vertical as i64;
+            let mut rects: Vec<(i64, i64, i64, i64)> = Vec::new();
+            for s in &desired {
+                let span = s.span() as i64;
+                let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+                let (x0, z0, x1, z1) = if inside_xz(*s, seat.lo, seat.hi) {
+                    (x, z, x + span, z + span)
+                } else if let Some(m) = across.iter().find(|m| inside_xz(*s, m.seat.lo, m.seat.hi)) {
+                    let (a, c) = m.home_xz(x, z);
+                    let (b, d) = m.home_xz(x + span, z + span);
+                    (a.min(b), c.min(d), a.max(b), c.max(d))
+                } else {
+                    continue;
+                };
+                rects.push((x0, x1, z0, z1));
+            }
+            let covered = |x: i64, z: i64| rects.iter().any(|&(x0, x1, z0, z1)| x >= x0 && x < x1 && z >= z0 && z < z1);
+            let mut holes = 0i32;
+            let mut hole_ex = String::new();
+            let mut across_cols = 0i32;
+            let mut across_bad = 0i32;
+            let mut x = ex - outer;
+            let step = 64i64;
+            while x <= ex + outer {
+                let mut z = ez - outer;
+                while z <= ez + outer {
+                    let (dx, dz) = (x - ex, z - ez);
+                    if dx * dx + dz * dz > outer * outer {
+                        z += step;
+                        continue;
+                    }
+                    let virt = Coord::new(x.div_euclid(cs) as i32, center.y, z.div_euclid(cs) as i32);
+                    let real = world.fold.unfold(virt);
+                    let in_near = x >= near.0 && x < near.1 && z >= near.2 && z < near.3;
+                    let section_hit = covered(x, z);
+                    let mut chunk_hit = false;
+                    if in_near {
+                        if let Some(rc) = real {
+                            let surf = world.terrain().surface(Face::PosY, rc.x * 16 + 8, rc.z * 16 + 8);
+                            if rc != virt {
+                                across_cols += 1;
+                                if surf == i32::MIN || world.seams.chart_seat(rc).is_none() {
+                                    across_bad += 1;
+                                }
+                            }
+                            let gy = if surf == i32::MIN { i64::MIN } else { (surf as i64 - 1).div_euclid(cs) };
+                            chunk_hit = gy >= center.y as i64 - v && gy <= center.y as i64 + v;
+                        }
+                    }
+                    if !section_hit && !chunk_hit {
+                        let past_home = x < seat.lo[0] || x >= seat.hi[0] || z < seat.lo[2] || z >= seat.hi[2];
+                        let ox = if x < near.0 { near.0 - x } else if x >= near.1 { x - (near.1 - 1) } else { 0 };
+                        let oz = if z < near.2 { near.2 - z } else if z >= near.3 { z - (near.3 - 1) } else { 0 };
+                        // The punch removes every section that meets the full-res box, leaving its
+                        // overhang. A home column whose crust is outside the vertical mesh window
+                        // was never a full-res chunk either.
+                        let punch_sliver = ox.max(oz) > 0 && ox.max(oz) < sliver;
+                        let steep = in_near && !past_home && real == Some(virt) && !chunk_hit;
+                        if !punch_sliver && !steep {
+                            holes += 1;
+                            if holes <= 6 {
+                                hole_ex.push_str(&format!(
+                                    " at ({x},{z}) past_home {past_home} in_near {in_near} ox {ox} oz {oz} real {real:?};"
+                                ));
+                            }
+                        }
+                    }
+                    z += step;
+                }
+                x += step;
+            }
+            let edge = [seat.hi[0] - ex, ex - (seat.lo[0] - 1), seat.hi[2] - ez, ez - (seat.lo[2] - 1)];
+            let reaches_seam = edge.iter().any(|&d| d < (near.1 - near.0) / 2);
+            assert_eq!(
+                holes, 0,
+                "{name}: {holes} uncovered columns, desired {} near {near:?} eye ({ex},{ez}) center {center:?} edges {edge:?};{hole_ex}",
+                desired.len()
+            );
+            if reaches_seam {
+                assert!(across_cols > 0, "{name}: the near window does not cross the seam");
+                assert_eq!(across_bad, 0, "{name}: {across_bad} near columns across the seam are not real chunks");
+            }
+        }
     }
 }

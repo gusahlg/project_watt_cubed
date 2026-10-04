@@ -343,7 +343,14 @@ impl Unfold {
     pub fn unfold(&self, v: Coord) -> Option<Coord> {
         let Some((lo, hi)) = self.home else { return Some(v) };
         let k = [v.x, v.y, v.z];
-        if inside(k, lo, hi) || v.x < self.storage_cx0 {
+        if inside(k, lo, hi) {
+            return Some(v);
+        }
+        // Chunk x below every storage box is physical space, except the virtual chunks just past
+        // a chart's −X side: the first box shares the storage origin, so that neighbour sits
+        // below `storage_cx0`.
+        let beside_neg_x = k[0] < lo[0] && k[1] >= lo[1] && k[1] < hi[1] && k[2] >= lo[2] && k[2] < hi[2];
+        if v.x < self.storage_cx0 && !beside_neg_x {
             return Some(v);
         }
         let out = |a: usize| (k[a] >= hi[a]) as i32 - (k[a] < lo[a]) as i32;
@@ -881,6 +888,21 @@ mod tests {
         assert_eq!(u.unfold(c), Some(c));
         assert_eq!(u.unfold(Coord::new(c.x, r.hi[1] + 2, c.z)), None);
         assert_eq!(u.unfold(Coord::new(r.hi[0] + 1, c.y, r.hi[2] + 1)), None);
+    }
+
+    /// The first storage box's −X neighbour has chunk x below every box. It still unfolds.
+    #[test]
+    fn the_neg_x_side_unfolds_into_the_neighbour() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let (o, size) = a.storage_box(Patch::Shell { band: 0, face: Face::PosY });
+        let c = chunk_of([o[0], o[1] + size[1] - 64, o[2] + size[2] / 2]);
+        let u = seams.unfold_at(c);
+        let v = c.step(Face::NegX);
+        let real = u.unfold(v).expect("past −x");
+        assert_ne!(real, v, "the virtual chunk is not physical space");
+        assert!(seams.in_storage(real), "lands in a box");
+        assert_eq!(u.fold(real), v);
     }
 
     #[test]

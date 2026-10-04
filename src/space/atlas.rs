@@ -554,13 +554,16 @@ impl Atlas {
         // permutation within the chunk, up to a 1 : 2 scale across band interfaces).
         let near: [i64; 3] = std::array::from_fn(|a| if a == axis { if dir > 0 { 0 } else { 15 } } else { 7 });
         let g0 = self.glue(probe(near))?;
-        let step = |a: usize| {
+        // Columns are the image of local +1. On a negative face that step re-enters the home box,
+        // outside the glue, so measure the other way and flip the sign.
+        let column = |a: usize| {
             let mut l = near;
-            l[a] += 1;
-            self.glue(probe(l))
+            let sign = if a == axis && dir < 0 { -1 } else { 1 };
+            l[a] += sign;
+            let g = self.glue(probe(l))?;
+            Some(std::array::from_fn(|k| (g[k] - g0[k]) * sign))
         };
-        let delta = |g: [i64; 3]| [g[0] - g0[0], g[1] - g0[1], g[2] - g0[2]];
-        let cols: [[i64; 3]; 3] = [delta(step(0)?), delta(step(1)?), delta(step(2)?)];
+        let cols: [[i64; 3]; 3] = [column(0)?, column(1)?, column(2)?];
         let chunk = [g0[0].div_euclid(16), g0[1].div_euclid(16), g0[2].div_euclid(16)];
         let base = [g0[0] - chunk[0] * 16, g0[1] - chunk[1] * 16, g0[2] - chunk[2] * 16];
         Some((chunk, Remap { cols, near, base }))
@@ -721,6 +724,33 @@ mod tests {
         }
         // Inside a box there is no seam.
         assert!(a.chunk_across(c, 2, 1).is_none());
+    }
+
+    /// A negative face steps away from the box. The column is still a signed unit, and the seam
+    /// cell maps to the glue.
+    #[test]
+    fn the_chunk_across_a_negative_face_is_a_signed_permutation() {
+        let a = atlas();
+        let b = a.bands[0];
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let s = a.storage(top, [0, a.radius - b.r_lo, b.n / 2]);
+        let c = [s[0].div_euclid(16), s[1].div_euclid(16), s[2].div_euclid(16)];
+        let (other, remap) = a.chunk_across(c, 0, -1).expect("a seam on −x");
+        assert!(a.locate([other[0] * 16, other[1] * 16, other[2] * 16]).is_some(), "lands in a box");
+        for col in remap.cols {
+            assert_eq!(col.iter().map(|v| v.abs()).sum::<i64>(), 1, "unit step {:?}", remap.cols);
+        }
+        // The seam layer, and one cell further out (still within the glue): the axis column too.
+        for (x, y, z) in [(15, 0, 0), (15, 7, 7), (15, 15, 15), (14, 7, 7)] {
+            let l = [x, y, z];
+            let real = remap.apply(l);
+            let glued = a.glue([(c[0] - 1) * 16 + l[0], c[1] * 16 + l[1], c[2] * 16 + l[2]]).unwrap();
+            assert_eq!(
+                [other[0] * 16 + real[0], other[1] * 16 + real[1], other[2] * 16 + real[2]],
+                glued,
+                "local {l:?}"
+            );
+        }
     }
 
     #[test]
