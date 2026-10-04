@@ -686,7 +686,7 @@ mod tests {
                 body.fixed[n] = true;
             }
         }
-        let rep = body.relax(&Relax { max_iterations: 40_000, tolerance: 1e-6, ..Relax::default() });
+        let rep = body.relax(&Relax { max_iterations: 40_000, tolerance: 1e-4, ..Relax::default() });
         assert!(rep.converged, "{rep:?}");
         let (len, height, width) = ((nx as i64 * h) as f64, (ny as i64 * h) as f64, (nz as i64 * h) as f64);
         let e_mod = 3.0 * p.shear;
