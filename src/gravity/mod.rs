@@ -6,6 +6,7 @@ mod field;
 mod kernel;
 mod ledger;
 mod oracle;
+pub mod polyhedron;
 pub mod relief;
 mod shape;
 
@@ -14,6 +15,7 @@ use glam::{DMat3, DVec3};
 pub use field::Field;
 pub use kernel::{EPS, G, R_G, R_IN};
 pub use oracle::{Empty, MassOracle, Primitives, Summary, Visitor};
+pub use polyhedron::Polyhedron;
 pub use shape::{Primitive, Shape};
 
 /// Bumped whenever the law, its constants or the amount rule change; folded into the content

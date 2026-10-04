@@ -258,9 +258,8 @@ pub struct Cosmos {
     deep: f32,
     /// A round body's relaxed shape: body id, its datum and that relief as a gravity source.
     relief: Option<Relaxed>,
-    /// Sag of a warped cube (body id, largest nodal displacement in blocks). The mass primitive
-    /// stays the box; this is the extra error declared near the body.
-    sag: Vec<(u16, f64)>,
+    /// A warped cube's true shape (body id). Replaces that body's box primitive.
+    warps: Vec<(u16, std::sync::Arc<crate::gravity::Polyhedron>)>,
 }
 
 /// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
@@ -423,7 +422,7 @@ impl Cosmos {
             group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
             deep: deep.clamp(0.0, 2.0),
             relief: None,
-            sag: Vec::new(),
+            warps: Vec::new(),
         };
         cosmos.place_clusters(space);
         cosmos
@@ -797,17 +796,18 @@ impl Cosmos {
         self.relief.as_ref().filter(|r| r.id == b.id).map_or((0.0, 0.0), |r| r.datum.range())
     }
 
-    /// Record the sag of a warped cube (generation, before the cosmos is shared).
-    pub fn set_warp_sag(&mut self, id: u16, sag: f64) {
-        if let Some(slot) = self.sag.iter_mut().find(|(i, _)| *i == id) {
-            slot.1 = sag;
+    /// Give a warped cube its polyhedron (generation, before the cosmos is shared). The box
+    /// primitive is no longer visited for that body.
+    pub fn set_warp(&mut self, id: u16, shape: std::sync::Arc<crate::gravity::Polyhedron>) {
+        if let Some(slot) = self.warps.iter_mut().find(|(i, _)| *i == id) {
+            slot.1 = shape;
         } else {
-            self.sag.push((id, sag));
+            self.warps.push((id, shape));
         }
     }
 
-    fn sag_of(&self, id: u16) -> f64 {
-        self.sag.iter().find(|(i, _)| *i == id).map(|(_, s)| *s).unwrap_or(0.0)
+    fn warp_of(&self, id: u16) -> Option<&crate::gravity::Polyhedron> {
+        self.warps.iter().find(|(i, _)| *i == id).map(|(_, s)| s.as_ref())
     }
 }
 
@@ -821,8 +821,22 @@ impl MassOracle for Cosmos {
             if dist - b.reach() >= reach {
                 continue;
             }
-            for p in b.primitives() {
-                v.primitive(&p);
+            if let Some(shape) = self.warp_of(b.id) {
+                // The matter as it is. The undeformed cube is only the carrier of the higher
+                // multipoles once the query is many radii out (see `Polyhedron::field_over_cube`).
+                let (lo, hi) = match b.shape {
+                    Shape::Cube { half } => {
+                        let h = DVec3::splat(half as f64);
+                        (b.centre_f() - h, b.centre_f() + h)
+                    }
+                    _ => (b.centre_f(), b.centre_f()),
+                };
+                let (accel, potential) = shape.field_over_cube(lo, hi, b.density, centre);
+                v.analytic(accel, potential);
+            } else {
+                for p in b.primitives() {
+                    v.primitive(&p);
+                }
             }
             // Cube porosity shells, the Heart and mantle bubbles are the twin cubes' interior.
             // Home is a ball: those voids live in the face painter's virtual cube, and only the
@@ -836,12 +850,6 @@ impl MassOracle for Cosmos {
             }
             if self.altitude(b, centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());
-            }
-            // The box primitive ignores the sag. Near the body — out to the sagged surface — that
-            // missing mass is an extra slab, the same shape of bound as the relief.
-            let sag = self.sag_of(b.id);
-            if sag > 0.0 && b.altitude(centre).abs() < sag.max(RELIEF as f64) * 4.0 {
-                v.error(2.0 * std::f64::consts::PI * b.density * sag);
             }
         }
         // Only super-cells within `reach` (plus a cell's half-diagonal) can hold a group in range.
@@ -928,6 +936,29 @@ mod tests {
         let empty = DVec3::new(0.0, 0.0, 9.95e8);
         assert!(cosmos.body_at(empty).is_none());
         assert!(!cosmos.in_air(empty));
+    }
+
+    #[test]
+    fn a_cube_polyhedron_replaces_the_box_and_adds_no_sag_error() {
+        use crate::gravity::{Field, Polyhedron, Primitive, Shape as MassShape};
+        use std::sync::Arc;
+        let base = Cosmos::new(1, 0.0);
+        let twin = base.bodies().iter().copied().find(|b| b.kind == Kind::Twin).expect("twin");
+        let Shape::Cube { half } = twin.shape else { panic!("twin") };
+        let c = twin.centre_f();
+        let h = DVec3::splat(half as f64);
+        let p = c + DVec3::new(0.0, half as f64 + 1_000.0, 0.0);
+        let mut same = Cosmos::new(1, 0.0);
+        same.set_warp(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, twin.density)));
+        let mut none = Cosmos::new(1, 0.0);
+        none.set_warp(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, 0.0)));
+        let a = Field::new(Arc::new(base)).sample(p);
+        let b = Field::new(Arc::new(same)).sample(p);
+        let z = Field::new(Arc::new(none)).sample(p);
+        assert!((a.accel - b.accel).length() <= 1e-8 * a.accel.length(), "{} vs {}", a.accel, b.accel);
+        assert!((a.error - b.error).abs() <= 1e-9, "error {} vs {}", a.error, b.error);
+        let box_a = Primitive::new(MassShape::Box { lo: c - h, hi: c + h }, twin.density).field(p).0 * G;
+        assert!((a.accel - z.accel - box_a).length() <= 1e-8 * box_a.length(), "removed box {} residual {}", box_a, a.accel - z.accel);
     }
 
     #[test]

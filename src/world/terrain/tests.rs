@@ -2314,7 +2314,7 @@ fn a_datum_lifts_the_home_grid_and_leaves_its_painting() {
 }
 
 /// A sagging twin's storage cells are the old physical painter, the corner sits about a tenth
-/// lower, the face centre bows out, and gravity names that sag near the body.
+/// lower, the face centre bows out, and gravity is that shape rather than a sag error bound.
 #[test]
 fn warped_twins_keep_the_cube_painter_and_sag() {
     let (_reg, t) = make(42);
@@ -2409,15 +2409,17 @@ fn warped_twins_keep_the_cube_painter_and_sag() {
     far[axis] += sign * (h + sag.max(cosmos::RELIEF as f64) * 8.0);
     let near_s = field.sample(near);
     let far_s = field.sample(far);
-    let bound = crate::gravity::G * 2.0 * std::f64::consts::PI * body.density * (cosmos::RELIEF as f64 + sag);
-    assert!(near_s.error + 1e-6 >= bound, "near error {} < bound {bound}", near_s.error);
+    // Terrain relief is still an error slab. The sag is the polyhedron, so it is not.
+    let relief = crate::gravity::G * 2.0 * std::f64::consts::PI * body.density * cosmos::RELIEF as f64;
+    assert!(near_s.error + 1e-6 >= relief, "near error {} < relief {relief}", near_s.error);
     let sag_term = crate::gravity::G * 2.0 * std::f64::consts::PI * body.density * sag * 0.5;
     assert!(
-        near_s.error - far_s.error + 1e-6 >= sag_term,
-        "sag left the error: near {} far {} sag term {sag_term}",
+        near_s.error - far_s.error < sag_term,
+        "sag still declared as error: near {} far {} sag term {sag_term}",
         near_s.error,
         far_s.error
     );
+    assert!(near_s.accel.is_finite() && far_s.accel.is_finite());
 }
 
 /// Release cost of painting one home chart chunk. Debug skips it.
@@ -2462,6 +2464,33 @@ fn the_start_world_is_relaxed_and_its_grid_fits_the_shape() {
     let corner = datum.offset(2, 1.0, 1.0);
     assert!(corner > centre + 3e5, "corner {corner} over centre {centre}");
     let _ = g;
+}
+
+/// `cargo test --release --lib twin_gravity_sample_cost -- --ignored --nocapture`: one player
+/// gravity sample just above a twin's warped face centre.
+#[test]
+#[ignore]
+fn twin_gravity_sample_cost() {
+    let (_reg, t) = make(42);
+    let body = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).expect("twin");
+    let warp = t
+        .atlases()
+        .iter()
+        .find_map(|a| a.grid.as_ref().is_some_and(|g| g.body == body.id).then(|| a.warp.clone()).flatten())
+        .expect("warp");
+    let half = cube::half_of(&body) as f64;
+    let c = body.centre_f();
+    let face = warp.apply(c + glam::DVec3::new(half, 0.0, 0.0));
+    let p = face + (face - c).normalize() * 2.0;
+    let field = crate::gravity::Field::new(t.mass());
+    let _ = field.sample(p);
+    let n = 4_000;
+    let start = std::time::Instant::now();
+    let mut acc = 0.0;
+    for i in 0..n {
+        acc += field.sample(p + glam::DVec3::new((i % 7) as f64 * 0.01, 0.0, 0.0)).accel.length();
+    }
+    println!("{:.2} µs per sample on a twin face [{acc:.3}]", start.elapsed().as_secs_f64() * 1e6 / n as f64);
 }
 
 /// `cargo test --release --lib home_gravity_sample_cost -- --ignored --nocapture`: one player

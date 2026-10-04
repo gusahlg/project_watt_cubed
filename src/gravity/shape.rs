@@ -189,7 +189,7 @@ pub fn box_field(lo: DVec3, hi: DVec3, p: DVec3) -> (DVec3, f64) {
 
 /// Quadrupole correction of a uniform box of mass `m` at `p` (zero for a cube), per unit `G`:
 /// `Φ_q = −x·Q·x / (2r⁵)` with the box's diagonal `Q_ii = 3 S_i − ΣS`, `S_i = m e_i²/3`.
-fn box_quadrupole(lo: DVec3, hi: DVec3, m: f64, p: DVec3) -> (DVec3, f64) {
+pub(crate) fn box_quadrupole(lo: DVec3, hi: DVec3, m: f64, p: DVec3) -> (DVec3, f64) {
     let e = (hi - lo) * 0.5;
     let s = e * e * (m / 3.0);
     let q = s * 3.0 - DVec3::splat(s.x + s.y + s.z);

@@ -518,12 +518,18 @@ impl Terrain {
         let scale = cfg.deep as f32 / 100.0;
         let mut cosmos = cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale);
         let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
-        // Sagging cubes keep their grid and record how far the warp moves it, so gravity can bound
-        // the missing shell.
+        // Sagging cubes keep their grid. Gravity is the warped surface, not the box they sagged from.
         let matter = bulk_matter(registry, &bulk);
         let warps = cube_warps(&cosmos, &matter);
         for (id, warp) in &warps {
-            cosmos.set_warp_sag(*id, warp.max_displacement());
+            let Some(body) = cosmos.bodies().iter().find(|b| b.id == *id) else { continue };
+            let cosmos::Shape::Cube { half } = body.shape else { continue };
+            let h = glam::DVec3::splat(half as f64);
+            let c = body.centre_f();
+            let shape = crate::gravity::Polyhedron::from_surface(c - h, c + h, crate::gravity::polyhedron::FACE_QUADS, body.density, |p| {
+                warp.apply(p)
+            });
+            cosmos.set_warp(*id, Arc::new(shape));
         }
         // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
         // chart grid to the shape, and its relief joins gravity.
