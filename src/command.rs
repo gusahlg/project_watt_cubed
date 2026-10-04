@@ -225,7 +225,10 @@ fn teleport_named(name: &str, n: usize, player: &mut Player, world: &mut World) 
         Err(lines) => return lines,
     };
     match cosmos.bodies().iter().filter(|b| b.kind == kind).nth(n - 1) {
-        Some(body) => place(landing_vec(body), player, world),
+        Some(body) => {
+            let at = landing_vec(world, body);
+            place(at, player, world)
+        }
         None => rejected(vec![format!("no {} {n}", kind.name())]),
     }
 }
@@ -277,7 +280,7 @@ fn bodies(player: &Player, world: &World) -> Vec<Line> {
             let body = &cosmos.bodies()[i];
             let n = kind_number(cosmos, body);
             let dist = (body.centre_f() - origin).length();
-            let at = landing(body);
+            let at = landing(world, body);
             format!(
                 "{} {n}  {} away  {}  /tp {} {} {}",
                 body.kind.name(),
@@ -312,17 +315,29 @@ fn resolve_kind(prefix: &str) -> Result<Kind, Vec<Line>> {
 }
 
 /// Cube half-edge, ball radius, or shell outer radius, then 2000 blocks of clearance on +Y.
-fn landing(body: &Body) -> [i64; 3] {
+/// 2000 blocks above the body's real top along +Y: a relaxed round body's datum offset there, or a
+/// warped cube's bowed face (the warp of its reference top).
+fn landing(world: &World, body: &Body) -> [i64; 3] {
+    let up = DVec3::Y;
     let top = match body.shape {
-        Shape::Cube { half } => half,
-        Shape::Ball { r } => r,
-        Shape::Shell { outer, .. } => outer,
+        Shape::Cube { half } => {
+            let warp = world.atlases().iter().find_map(|a| a.grid.as_ref().is_some_and(|g| g.body == body.id).then(|| a.warp.as_ref()).flatten());
+            match warp {
+                Some(w) => (w.apply(body.centre_f() + up * half as f64) - body.centre_f()).y,
+                None => half as f64,
+            }
+        }
+        Shape::Ball { r } => {
+            let off = world.terrain().cosmos().map_or(0.0, |c| c.surface_offset(body, body.centre_f() + up * r as f64));
+            r as f64 + off
+        }
+        Shape::Shell { outer, .. } => outer as f64,
     };
-    [body.centre[0], body.centre[1] + top + 2_000, body.centre[2]]
+    [body.centre[0], body.centre[1] + top.round() as i64 + 2_000, body.centre[2]]
 }
 
-fn landing_vec(body: &Body) -> DVec3 {
-    let at = landing(body);
+fn landing_vec(world: &World, body: &Body) -> DVec3 {
+    let at = landing(world, body);
     DVec3::new(at[0] as f64, at[1] as f64, at[2] as f64)
 }
 
@@ -958,7 +973,7 @@ mod tests {
         let lines = run("bodies", &mut p, &mut w);
         let first = lines[0].text();
         assert!(first.starts_with("home 1"), "{first}");
-        let home_at = landing(&home);
+        let home_at = landing(&w, &home);
         assert!(
             first.contains(&format!("/tp {} {} {}", home_at[0], home_at[1], home_at[2])),
             "{first}"
@@ -967,8 +982,17 @@ mod tests {
         assert!(text.contains("verdant 1"), "{text}");
         assert!(text.contains("moon 2"), "{text}");
 
+        // The relaxed start world and a warped twin: the landing sits just above the real top.
+        run("tp home", &mut p, &mut w);
+        let alt = w.terrain().cosmos().expect("a cosmos").altitude(&home, p.position);
+        assert!((1_000.0..4_100.0).contains(&alt), "home landing altitude {alt}");
+        run("tp twin", &mut p, &mut w);
+        let twin = w.terrain().cosmos().expect("a cosmos").bodies().iter().copied().find(|b| b.kind == Kind::Twin).unwrap();
+        let Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+        let rise = (p.position - twin.centre_f()).y / half as f64;
+        assert!((1.03..1.12).contains(&rise), "twin landing over the bowed face: {rise}");
         run("tp verdant", &mut p, &mut w);
-        let want = landing_vec(&verdant);
+        let want = landing_vec(&w, &verdant);
         assert_eq!(p.position, want);
         assert!((p.position - verdant.centre_f()).length() <= verdant.reach());
         let pull = w.gravity_at(p.position).accel;
@@ -981,9 +1005,9 @@ mod tests {
         assert_eq!(p.position, want, "a unique prefix selects the same body");
 
         run("tp moon 2", &mut p, &mut w);
-        let moon = landing_vec(&moons[1]);
+        let moon = landing_vec(&w, &moons[1]);
         assert_eq!(p.position, moon);
-        assert_ne!(moon, landing_vec(&moons[0]));
+        assert_ne!(moon, landing_vec(&w, &moons[0]));
 
         let at = p.position;
         let bad = run("tp nope", &mut p, &mut w);
