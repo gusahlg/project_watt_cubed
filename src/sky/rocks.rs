@@ -515,8 +515,8 @@ mod tests {
             let delta = DVec3::new(s.centre[0] as f64, s.centre[1] as f64, s.centre[2] as f64) - eye;
             assert!(!in_view(delta, reach), "listed rock inside the view: {:?}", s.centre);
         }
-        // A pebble just outside the view is still not a box.
-        let (lo, hi) = cell_box(eye, reach + 800.0);
+        // A pebble outside the view is still not a box.
+        let (lo, hi) = cell_box(eye, reach + 20_000.0);
         let mut pebble = None;
         cosmos.for_class_rocks(0, lo, hi, |r| {
             let delta = pos(r) - eye;

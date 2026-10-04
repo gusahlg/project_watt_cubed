@@ -100,7 +100,8 @@ empty and costs nothing (chunks there classify as air without being generated).
   nearly weightless, drifting toward the Ember. On the Ember the light is the far wall's glow.
 - **Moons** — two around the start cube and one or two around each world, cratered (grey, frozen or
   rust), airless: central peaks and ejecta, rilles, ice columns, dunes and mesas by kind.
-- **Asteroid swarms** — sparse clusters of rocks of every size and kind, never near a big body.
+- **Asteroid swarms** — rare clusters of rocks of every size and kind (swarms, belts, streams), about
+  2·10⁸ blocks apart like the worlds and never near a big body; the rest of space is empty.
 
 Seen from afar every body is drawn as an analytic impostor in the sky (`sky::bodies`), lit by the
 sun, and the rocks of a nearby swarm as sunlit boxes beyond the streamed chunks (`sky::rocks`).

@@ -3348,6 +3348,13 @@ fn headless_drain(world: &mut World) -> usize {
     integrated
 }
 
+/// Three quarters of a radius from the centre of the catalog's greatest rock, along +z.
+fn great_rock_eye(world: &World) -> [i64; 3] {
+    let rock = world.terrain().cosmos().and_then(|c| c.great_rock()).expect("a great rock");
+    let depth = (rock.r * 0.75) as i64;
+    [rock.centre[0] as i64, rock.centre[1] as i64, rock.centre[2] as i64 + depth]
+}
+
 /// An open data box is gathered once. Later passes drain that queue: in-flight
 /// chunks are not classified again, and a failed claim comes back.
 #[test]
@@ -3355,11 +3362,11 @@ fn open_gen_cursor_drains_across_frames() {
     use crate::world::chunk::CHUNK_SIZE;
     use crate::world::generation::WorldgenKind;
 
-    let eye = [27310502i64, 49567991, -35459950];
     let mut render = RenderConfig::default();
     render.lod2 = false;
     render.occlusion = false;
     let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    let eye = great_rock_eye(&world);
     world.set_view_distances(1, 1);
     let center = ChunkCoord::new(
         eye[0].div_euclid(CHUNK_SIZE as i64) as i32,
@@ -3528,8 +3535,8 @@ fn stone_loaded(coord: ChunkCoord, stone: crate::block::BlockId) -> Loaded {
     }
 }
 
-/// Headless stream to `entry_complete` inside the seed-42 rocky asteroid
-/// (centre `[27310502, 49567991, -35460644]`, eye ~700 blocks along +z).
+/// Headless stream to `entry_complete` inside the seed-42 catalog's greatest asteroid
+/// (eye three quarters of a radius from its centre along +z).
 /// Open space streams an isotropic cube, so horizontal 12 is the volume that
 /// loads on the order of 16k chunks. Lane budgets match `lanes.rs`. No engine,
 /// no window. Ignored timing bench:
@@ -3544,13 +3551,12 @@ fn asteroid_entry_breakdown() {
     use crate::world::generation::WorldgenKind;
 
     const VIEW_H: i32 = 12;
-    // Seed 42, 700 blocks from the great rocky centre along +z.
-    let eye = [27310502i64, 49567991, -35459950];
     let mut render = RenderConfig::default();
     // Shipped settings leave distant LOD off. Occlusion rebuild needs the engine.
     render.lod2 = false;
     render.occlusion = false;
     let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    let eye = great_rock_eye(&world);
     world.set_view_distances(VIEW_H, 3);
     let center = ChunkCoord::new(
         eye[0].div_euclid(CHUNK_SIZE as i64) as i32,

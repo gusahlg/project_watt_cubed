@@ -457,7 +457,9 @@ impl Cosmos {
         if space <= 0.0 {
             return;
         }
-        let p = 0.015 * space.min(2.0);
+        // Space is mostly empty: about one cell in 2,500 holds a cluster, so swarms lie ~2e8 apart
+        // (the same order as the worlds) and finding one is an event.
+        let p = 0.0004 * space.min(2.0);
         for x in -CELL_SPAN..CELL_SPAN {
             for y in -CELL_SPAN..CELL_SPAN {
                 for z in -CELL_SPAN..CELL_SPAN {
@@ -604,6 +606,32 @@ impl Cosmos {
     /// Rocks of size class `class` (0 = pebbles, 3 = the largest) whose sub-cell overlaps the
     /// inclusive cell box `[lo, hi]`. Empty cluster cells are skipped, so open space is a few
     /// cell hashes; a hit scans only that class's sub-cells (O(box / edge³)).
+    /// The largest class-3 rock of any cluster (class 2 when none has one), for tests and benches
+    /// that need a great rock without pinning coordinates to one catalog.
+    #[cfg(test)]
+    pub(crate) fn great_rock(&self) -> Option<Rock> {
+        let mut best: Option<Rock> = None;
+        for class in [3usize, 2] {
+            for c in &self.clusters {
+                let reach = c.radius + CLASSES[class].0 as f64;
+                let lo = [c.centre.x, c.centre.y, c.centre.z].map(|v| (v - reach).floor() as i64);
+                let hi = [c.centre.x, c.centre.y, c.centre.z].map(|v| (v + reach).ceil() as i64);
+                self.for_class_rocks(class, lo, hi, |r| {
+                    if best.is_none_or(|b| r.r > b.r) {
+                        best = Some(*r);
+                    }
+                });
+                if class == 2 && best.is_some() {
+                    break;
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        best
+    }
+
     pub fn for_class_rocks(&self, class: usize, lo: [i64; 3], hi: [i64; 3], f: impl FnMut(&Rock)) {
         if class < CLASSES.len() {
             self.visit_rocks(lo, hi, class..class + 1, f);

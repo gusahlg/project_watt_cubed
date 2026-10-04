@@ -992,7 +992,8 @@ fn space_chunk_costs() {
 #[ignore]
 fn cluster_classify_cost() {
     let (_reg, t) = make(42);
-    let eye = [27310502i64, 49569080, -35460644];
+    let rock = t.cosmos.great_rock().expect("a great rock");
+    let eye = [rock.centre[0] as i64, rock.centre[1] as i64 + rock.r as i64, rock.centre[2] as i64];
     let c = eye.map(|v| v.div_euclid(16) as i32);
     let mut n = 0;
     let mut mixed = 0;
