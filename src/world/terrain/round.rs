@@ -5,6 +5,7 @@
 //! at the physical point on the datum sphere above the column, so the surface is continuous across
 //! chart seams. Pure in `(seed, cell)`.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use glam::DVec3;
@@ -54,6 +55,8 @@ const SITE_MARGIN: i64 = 14;
 /// Verdant waterline. Lows flood toward it; the mask is a function of the physical point, so a lake
 /// has no cliff and the seam stays continuous. Still water is solid frost over ice.
 const SHORE: f32 = 72.0;
+/// How far above a column's first open cell a plant can reach (Verdant crown included).
+pub(super) const PLANT_REACH: i64 = 96;
 
 /// One column of a chart: where its surface is (storage y of the first open cell) and how it is dressed.
 #[derive(Clone, Copy, Debug)]
@@ -552,6 +555,86 @@ impl Round {
         self.chunk_columns(patch, i0, j0).iter().map(|c| c.surface).collect()
     }
 
+    /// Storage y of relief `h` on a shell patch (the same formula as a column's surface).
+    pub(super) fn surface_of_relief(&self, patch: Patch, h: f32) -> i64 {
+        let b = match patch {
+            Patch::Shell { band, .. } => self.atlas.bands[band as usize],
+            _ => return 0,
+        };
+        let datum = self.atlas.radius as f64;
+        let h = h as f64;
+        let surface = if self.atlas.inward { b.r_hi as f64 - (datum - h) } else { datum + h - b.r_lo as f64 };
+        surface.floor() as i64
+    }
+
+    /// Min and max relief over chart columns `[i0, i0+span) × [j0, j0+span)`.
+    /// Exact over the lattice when the square is small; coarser squares stride and pad, so the
+    /// range stays a superset (a far section must not clip a peak the stride stepped over).
+    pub(super) fn relief_bounds(&self, patch: Patch, i0: i64, j0: i64, span: i64) -> (f32, f32) {
+        let snap = |p: i64| p.div_euclid(LATTICE) * LATTICE;
+        let i_lo = snap(i0);
+        let j_lo = snap(j0);
+        let i_hi = snap(i0 + span - 1) + LATTICE;
+        let j_hi = snap(j0 + span - 1) + LATTICE;
+        let ni = (i_hi - i_lo) / LATTICE + 1;
+        let nj = (j_hi - j_lo) / LATTICE + 1;
+        let (si, sj, pad) = if ni <= 64 && nj <= 64 { (1, 1, 0.0) } else { ((ni / 48).max(1), (nj / 48).max(1), 160.0) };
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        let mut i = i_lo;
+        loop {
+            let mut j = j_lo;
+            loop {
+                let h = self.relief_node(patch, i, j);
+                lo = lo.min(h);
+                hi = hi.max(h);
+                if j == j_hi {
+                    break;
+                }
+                j = (j + sj * LATTICE).min(j_hi);
+            }
+            if i == i_hi {
+                break;
+            }
+            i = (i + si * LATTICE).min(i_hi);
+        }
+        if !lo.is_finite() {
+            return (0.0, 0.0);
+        }
+        (lo - pad, hi + pad)
+    }
+
+    /// Far-LOD column: one relief sample, the plants on it, solid ground below. No caves —
+    /// a coarse tile aliases them to noise, same as a cube face.
+    pub(super) fn lod_column(&self, patch: Patch, i: i64, j: i64, origin_y: i64, ys: &[i32], out: &mut [BlockId]) {
+        let col = self.column(patch, i, j);
+        let (_, size) = self.atlas.storage_box(patch);
+        self.with_plants(patch, size[0], i, j, |plants| {
+            for (o, &sy) in out.iter_mut().zip(ys) {
+                let y = sy as i64 - origin_y;
+                let d = col.surface - y;
+                *o = if d >= 1 { self.ground(&col, d) } else { self.plant(plants, i, y, j).unwrap_or(AIR) };
+            }
+        });
+    }
+
+    /// Plants that can paint column `(i, j)`, reused across the columns of one section.
+    fn with_plants(&self, patch: Patch, size: i64, i: i64, j: i64, f: impl FnOnce(&[Plant])) {
+        PLANTS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let key = (self.atlas.centre.x.to_bits(), self.atlas.centre.y.to_bits(), self.atlas.centre.z.to_bits(), self.atlas.radius, self.atlas.inward, self.seed, patch);
+            let hit = slot.as_ref().is_some_and(|w| w.key == key && i >= w.i0 && i <= w.i1 && j >= w.j0 && j <= w.j1);
+            if !hit {
+                let (i0, i1) = (i - 32, i + 192);
+                let (j0, j1) = (j - 32, j + 192);
+                let mut plants = Vec::new();
+                self.plants_near(patch, size, i0, i1, j0, j1, &mut plants);
+                *slot = Some(PlantWin { key, i0, i1, j0, j1, plants });
+            }
+            f(&slot.as_ref().expect("plant window").plants);
+        });
+    }
+
     /// The storage chunk at chunk coordinates `c`, filled column by column (equal to [`voxel`](Self::voxel)).
     pub fn fill_chunk(&self, c: [i64; 3]) -> ChunkData {
         let n = CHUNK_SIZE as i64;
@@ -685,6 +768,20 @@ struct Plant {
     half: i64,
     height: i64,
     crown: i64,
+}
+
+/// Plants covering one section-sized window, so a 32×32 extract does not rebuild every column.
+struct PlantWin {
+    key: (u64, u64, u64, i64, bool, u32, Patch),
+    i0: i64,
+    i1: i64,
+    j0: i64,
+    j1: i64,
+    plants: Vec<Plant>,
+}
+
+thread_local! {
+    static PLANTS: RefCell<Option<PlantWin>> = const { RefCell::new(None) };
 }
 
 /// A stable small tag of a patch for hashing.

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::{Coord, FastMap};
 use crate::coord::{BlockCoord, Face};
-use crate::space::atlas::{Atlas, GLUE, Remap};
+use crate::space::atlas::{Atlas, GLUE, Patch, Remap};
 
 const CS: i64 = CHUNK_SIZE as i64;
 /// Seam answers kept before the cache starts over (seam chunks are a thin set of the loaded ones).
@@ -420,6 +420,190 @@ impl Seams {
         }
         None
     }
+
+    /// The band-0 shell under a storage streaming centre (including flight just above its box).
+    /// Deeper bands and the core select nothing: the player is inside the body.
+    pub(in crate::world) fn chart_seat(&self, centre: Coord) -> Option<ChartSeat> {
+        if centre.x < self.min_cx {
+            return None;
+        }
+        let column = |r: &&Region| centre.x >= r.lo[0] && centre.x < r.hi[0] && centre.z >= r.lo[2] && centre.z < r.hi[2];
+        let r = self.region_of(centre).or_else(|| self.regions.iter().find(column))?;
+        self.seat_of(r)
+    }
+
+    fn seat_of(&self, r: &Region) -> Option<ChartSeat> {
+        let atlas = &self.atlases[r.atlas];
+        let cell = [r.lo[0] as i64 * CS + CS / 2, r.lo[1] as i64 * CS, r.lo[2] as i64 * CS + CS / 2];
+        let (patch, _) = atlas.locate(cell)?;
+        if !matches!(patch, Patch::Shell { band: 0, .. }) {
+            return None;
+        }
+        let (o, size) = atlas.storage_box(patch);
+        Some(ChartSeat {
+            index: r.atlas,
+            patch,
+            lo: o,
+            hi: [o[0] + size[0], o[1] + size[1], o[2] + size[2]],
+            radius: atlas.radius,
+        })
+    }
+
+    /// Neighbour band-0 charts when `eye` (storage blocks) is within `band` blocks of a home side.
+    /// Only unit seams. A side whose cells are not a rotation of the home edge is skipped.
+    pub(in crate::world) fn seam_across(&self, home: ChartSeat, eye: [i64; 3], band: i64) -> Vec<SeamAcross> {
+        let centre = Coord::new(eye[0].div_euclid(CS) as i32, eye[1].div_euclid(CS) as i32, eye[2].div_euclid(CS) as i32);
+        let unfold = self.unfold_at(centre);
+        let atlas = &self.atlases[home.index];
+        let mut out = Vec::new();
+        // Same side order as [`Unfold`]: NegX, PosX, NegZ, PosZ.
+        let sides: [(usize, [i64; 3]); 4] = [(0, [-1, 0, 0]), (0, [1, 0, 0]), (2, [0, 0, -1]), (2, [0, 0, 1])];
+        for (i, (axis, side)) in sides.into_iter().enumerate() {
+            if unfold.sides[i].is_none() {
+                continue;
+            }
+            let steps = if side[axis] > 0 { home.hi[axis] - eye[axis] } else { eye[axis] - (home.lo[axis] - 1) };
+            if steps <= 0 || steps > band {
+                continue;
+            }
+            let tan = if axis == 0 { 2 } else { 0 };
+            let mut probe = eye;
+            probe[1] = probe[1].clamp(home.lo[1], home.hi[1] - 1);
+            probe[tan] = probe[tan].clamp(home.lo[tan] + 1, home.hi[tan] - 2);
+            probe[axis] = if side[axis] > 0 { home.hi[axis] } else { home.lo[axis] - 1 };
+            let Some(g) = atlas.glue(probe) else { continue };
+            if (g[1] - probe[1]).abs() > 4 {
+                continue;
+            }
+            let Some((npatch, _)) = atlas.locate(g) else { continue };
+            if npatch == home.patch || !matches!(npatch, Patch::Shell { band: 0, .. }) {
+                continue;
+            }
+            let (o, size) = atlas.storage_box(npatch);
+            let nlo = o;
+            let nhi = [o[0] + size[0], o[1] + size[1], o[2] + size[2]];
+            let Some(inward) = edge_inward(g, nlo, nhi) else { continue };
+            let mut g2 = None;
+            let mut home_step = 0i64;
+            for sign in [16i64, -16] {
+                let t = probe[tan] + sign;
+                if t < home.lo[tan] || t >= home.hi[tan] {
+                    continue;
+                }
+                let mut p2 = probe;
+                p2[tan] = t;
+                if let Some(gg) = atlas.glue(p2) {
+                    home_step = sign;
+                    g2 = Some(gg);
+                    break;
+                }
+            }
+            let Some(g2) = g2 else { continue };
+            let delta = [g2[0] - g[0], g2[1] - g[1], g2[2] - g[2]];
+            if delta[1].abs() > 2 {
+                continue;
+            }
+            let Some(tan_n) = unit_step(delta, home_step) else { continue };
+            let image = [g[0] + inward[0] * steps, g[1] + inward[1] * steps, g[2] + inward[2] * steps];
+            if image[0] < nlo[0] || image[0] >= nhi[0] || image[2] < nlo[2] || image[2] >= nhi[2] {
+                continue;
+            }
+            let mut tan_h = [0i64; 3];
+            tan_h[tan] = 1;
+            out.push(SeamAcross {
+                seat: ChartSeat { index: home.index, patch: npatch, lo: nlo, hi: nhi, radius: home.radius },
+                eye_x: image[0],
+                eye_z: image[2],
+                g,
+                inward,
+                tan_n,
+                probe,
+                side,
+                tan_h,
+            });
+        }
+        out
+    }
+}
+
+/// A band-0 shell chart: atlas index, patch, storage box (`hi` exclusive) and datum radius.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::world) struct ChartSeat {
+    pub index: usize,
+    pub patch: Patch,
+    pub lo: [i64; 3],
+    pub hi: [i64; 3],
+    pub radius: i64,
+}
+
+/// A neighbour chart joined across a unit seam, and the map back into the home storage frame.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::world) struct SeamAcross {
+    pub seat: ChartSeat,
+    /// The eye's image in the neighbour's storage, `(x, z)`.
+    pub eye_x: i64,
+    pub eye_z: i64,
+    g: [i64; 3],
+    inward: [i64; 3],
+    tan_n: [i64; 3],
+    probe: [i64; 3],
+    side: [i64; 3],
+    tan_h: [i64; 3],
+}
+
+impl SeamAcross {
+    /// Home storage `(x, z)` of a neighbour storage `(x, z)`. The neighbour's interior continues
+    /// past the home edge (the full-res box only overlaps the first blocks beyond the seam).
+    /// The seam is a signed permutation.
+    pub(in crate::world) fn home_xz(self, x: i64, z: i64) -> (i64, i64) {
+        let d_in = (x - self.g[0]) * self.inward[0] + (z - self.g[2]) * self.inward[2];
+        let d_tan = (x - self.g[0]) * self.tan_n[0] + (z - self.g[2]) * self.tan_n[2];
+        let hx = self.probe[0] + self.side[0] * d_in + self.tan_h[0] * d_tan;
+        let hz = self.probe[2] + self.side[2] * d_in + self.tan_h[2] * d_tan;
+        (hx, hz)
+    }
+}
+
+fn edge_inward(g: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> Option<[i64; 3]> {
+    let mut found = None;
+    for a in [0usize, 2] {
+        let on_lo = g[a] - lo[a] <= 4;
+        let on_hi = hi[a] - 1 - g[a] <= 4;
+        if on_lo == on_hi {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let mut u = [0i64; 3];
+        u[a] = if on_lo { 1 } else { -1 };
+        found = Some(u);
+    }
+    found
+}
+
+/// Neighbour units per one positive step of the home tangent. `home_step` is the probe offset.
+fn unit_step(delta: [i64; 3], home_step: i64) -> Option<[i64; 3]> {
+    let s = home_step.abs();
+    if s == 0 {
+        return None;
+    }
+    let mut axis = None;
+    for a in [0usize, 2] {
+        if delta[a].abs() <= 2 {
+            continue;
+        }
+        if (delta[a].abs() - s).abs() > 2 {
+            return None;
+        }
+        if axis.is_some() {
+            return None;
+        }
+        let mut u = [0i64; 3];
+        u[a] = delta[a].signum() * home_step.signum();
+        axis = Some(u);
+    }
+    axis
 }
 
 fn face_of(axis: usize, d: i32) -> Face {

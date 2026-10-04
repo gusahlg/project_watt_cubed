@@ -411,14 +411,17 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
         remapped = face_edits(&flat, pos.face);
         &remapped
     };
-    let floor = if pos.face == Face::PosY { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
+    // Home +Y keeps the legacy column and the `[0, 512]` floor. A chart is +Y in storage
+    // but its surface sits far outside that window, so it takes the face sampler.
+    let chart = pos.body >= super::CHART_BODY_BASE;
+    let floor = if pos.face == Face::PosY && !chart { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
     let mut mesh = mesh_section_with(n_cells, tables, Some(floor), |dense| {
         for iz in 0..SECTION_N {
             for ix in 0..SECTION_N {
                 let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
                 let (u, v) = (fx + half, fz + half);
                 let column = &mut dense[(ix + iz * SECTION_N) * n_cells..][..n_cells];
-                if pos.face == Face::PosY {
+                if pos.face == Face::PosY && !chart {
                     r#gen.lod_column(u, v, &ys, column);
                 } else {
                     r#gen.lod_column_face(pos.body, pos.face, u, v, &ys, column);
@@ -531,6 +534,32 @@ fn normal_from(d: [i32; 3]) -> Normal {
         [0, 0, -1] => Normal::NegZ,
         _ => Normal::PosY,
     }
+}
+
+/// Eight physical corners of one chart slab's packed block, anchor at the floor of corner 0
+/// (bit 0 = +x, bit 1 = +y, bit 2 = +z). `extent` is the packed block edge `16·2^(detail+shift)`.
+/// Vertices occupy only the section's real span of that block; the cage is this wide so the
+/// shader's `local/16` map lands the geometry on the storage square.
+pub(in crate::world) fn chart_slab_corners(
+    atlas: &crate::space::atlas::Atlas,
+    patch: crate::space::atlas::Patch,
+    x0: i32,
+    y0: i32,
+    z0: i32,
+    extent: i32,
+) -> Option<(voxel_engine::IVec3, [voxel_engine::Vec3; 8])> {
+    let extent = extent as f64;
+    let corners: [voxel_engine::DVec3; 8] = std::array::from_fn(|c| {
+        let d = [(c & 1) as f64 * extent, ((c >> 1) & 1) as f64 * extent, ((c >> 2) & 1) as f64 * extent];
+        atlas.embed_storage(patch, voxel_engine::DVec3::new(x0 as f64 + d[0], y0 as f64 + d[1], z0 as f64 + d[2]))
+    });
+    let a = corners[0].floor();
+    let fits = |v: f64| v.is_finite() && (i32::MIN as f64..=i32::MAX as f64).contains(&v);
+    if !fits(a.x) || !fits(a.y) || !fits(a.z) {
+        return None;
+    }
+    let anchor = voxel_engine::IVec3::new(a.x as i32, a.y as i32, a.z as i32);
+    Some((anchor, corners.map(|c| (c - a).as_vec3())))
 }
 
 /// The one section-mesh driver both producers share: `fill` overwrites this

@@ -231,7 +231,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = ChunkCoord::new(0, 0, 0);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { meshes: Vec::new(), last_style: None };
+    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -268,7 +268,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), last_style: None });
+        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -1589,7 +1589,7 @@ fn lod2_far_field_drives_to_covering_complete() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { meshes: Vec::new(), last_style: None };
+                *s = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
             }
         }
     }
@@ -3099,11 +3099,10 @@ fn far_face_edge_unions_the_neighbour() {
     assert!(desired.iter().any(|s| s.body == 0 && s.face == Face::PosX), "missing the +X neighbour");
 }
 
-/// A streaming centre in storage (a round body) selects no far sections.
-#[test]
-fn far_face_storage_selects_none() {
+/// Verdance's band-0 +Y chart, and a storage column on it: the middle, or `from_pos_x` blocks
+/// inside the +X side (mid-edge).
+fn verdance_column(world: &World, from_pos_x: Option<i64>) -> (usize, std::sync::Arc<crate::space::atlas::Atlas>, i32, i32) {
     use crate::space::atlas::Patch;
-    let mut world = lod2_world();
     let verdant = world
         .terrain()
         .cosmos()
@@ -3113,24 +3112,114 @@ fn far_face_storage_selects_none() {
         .copied()
         .find(|b| b.kind == terrain::cosmos::Kind::Verdant)
         .expect("Verdance");
-    let atlas = world
-        .terrain()
-        .atlases()
-        .iter()
-        .find(|a| (a.centre - verdant.centre_f()).length() < 1.0)
-        .expect("Verdance is charted")
-        .clone();
+    let atlases = world.terrain().atlases();
+    let index = atlases.iter().position(|a| (a.centre - verdant.centre_f()).length() < 1.0).expect("Verdance is charted");
+    let atlas = atlases[index].clone();
     let top = Patch::Shell { band: 0, face: Face::PosY };
-    let (o, _) = atlas.storage_box(top);
-    let b = atlas.bands[0];
-    let (si, sj) = (o[0] + b.n / 2, o[2] + b.n / 2);
-    let ground = world.terrain().surface(Face::PosY, si as i32, sj as i32);
+    let (o, size) = atlas.storage_box(top);
+    let (x, z) = match from_pos_x {
+        None => (o[0] + size[0] / 2, o[2] + size[2] / 2),
+        Some(inset) => (o[0] + size[0] - inset, o[2] + size[2] / 2),
+    };
+    (index, atlas, x as i32, z as i32)
+}
+
+/// A streaming centre on Verdance selects chart sections around the storage eye, bent through
+/// the chart. Re-pins `far_face_storage_selects_none`: a storage centre used to select nothing.
+#[test]
+fn far_face_storage_selects_chart_sections() {
+    use crate::space::atlas::Patch;
+    use std::time::Instant;
+    let mut world = lod2_world();
+    let (index, atlas, si, sj) = verdance_column(&world, None);
+    let top = Patch::Shell { band: 0, face: Face::PosY };
+    let (o, size) = atlas.storage_box(top);
+    let ground = world.terrain().surface(Face::PosY, si, sj);
     assert_ne!(ground, i32::MIN, "the chart has no surface");
-    let centre = chunk_holding(si as i32, ground, sj as i32);
+    let centre = chunk_holding(si, ground, sj);
     assert!(world.adopt_fold(centre), "storage centre did not fold");
     assert!(!world.fold.is_identity());
     world.section_eye_y = ground as f64;
-    assert!(world.desired_sections(centre).is_empty(), "storage must select nothing");
+    let desired = world.desired_sections(centre);
+    assert!(!desired.is_empty(), "Verdance selected no chart sections");
+    let body = section::CHART_BODY_BASE + index as u16;
+    assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY), "frontier left the chart: {desired:?}");
+    assert!(
+        desired.iter().any(|s| (s.min_x() as i64 - si as i64).abs() < 50_000 && (s.min_z() as i64 - sj as i64).abs() < 50_000),
+        "frontier is not around the storage eye"
+    );
+    let h = world.view.horizontal as i64;
+    let cs = CHUNK_SIZE as i64;
+    let (x0, x1) = ((centre.x as i64 - h) * cs, (centre.x as i64 + h + 1) * cs);
+    let (z0, z1) = ((centre.z as i64 - h) * cs, (centre.z as i64 + h + 1) * cs);
+    for s in &desired {
+        let span = s.span() as i64;
+        let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+        assert!(section::section_fits(s.span(), atlas.radius), "section {s:?} exceeds the chord cap");
+        assert!(x >= o[0] && x + span <= o[0] + size[0] && z >= o[2] && z + span <= o[2] + size[2], "{s:?} leaves the home chart");
+        assert!(!(x < x1 && x + span > x0 && z < z1 && z + span > z0), "{s:?} covers the full-res box");
+    }
+    let clip = world.lod_clip();
+    assert!(clip.half.x <= 0.0 && clip.half.y <= 0.0 && clip.half.z <= 0.0, "chart clip is not empty: {:?}", clip.half);
+    let pos = desired
+        .iter()
+        .copied()
+        .filter(|s| s.detail == section::FINEST_DETAIL)
+        .min_by_key(|s| (s.min_x() - si).abs() + (s.min_z() - sj).abs())
+        .expect("a finest chart section");
+    let tables = world.registry().hot_tables();
+    let t0 = Instant::now();
+    let mesh = section::extract_section_mesh(pos, world.terrain(), &[], &tables);
+    let ms = t0.elapsed().as_secs_f64() * 1.0e3;
+    println!("chart section extract+mesh: {ms:.1} ms, {} vertex bytes, shift {}", mesh.vertex_bytes(), mesh.shift);
+    assert!(mesh.vertex_bytes() > 0, "chart section meshed empty");
+    let (patch, _) = atlas.locate([pos.min_x() as i64, 0, pos.min_z() as i64]).expect("section patch");
+    assert!(!mesh.slabs.is_empty());
+    for slab in &mesh.slabs {
+        let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let extent = 16i32 << detail.0;
+        let y0 = mesh.altitude_floor + slab.origin_y as i32 * pos.cell_size();
+        let (anchor, corners) = section::chart_slab_corners(&atlas, patch, pos.min_x(), y0, pos.min_z(), extent).expect("cage");
+        for c in 0..8 {
+            let d = DVec3::new(((c & 1) as f64) * extent as f64, (((c >> 1) & 1) as f64) * extent as f64, (((c >> 2) & 1) as f64) * extent as f64);
+            let physical = atlas.embed_storage(patch, DVec3::new(pos.min_x() as f64 + d.x, y0 as f64 + d.y, pos.min_z() as f64 + d.z));
+            let got = DVec3::new(anchor.x as f64 + corners[c].x as f64, anchor.y as f64 + corners[c].y as f64, anchor.z as f64 + corners[c].z as f64);
+            assert!((physical - got).length() < 1.0e-2, "cage corner {c} off by {}", (physical - got).length());
+        }
+    }
+}
+
+/// Within two finest sections of a chart edge, the neighbour chart joins the frontier.
+#[test]
+fn far_face_chart_edge_selects_the_neighbour() {
+    use crate::space::atlas::Patch;
+    let mut world = lod2_world();
+    let (index, atlas, si, sj) = verdance_column(&world, Some(100));
+    let top = Patch::Shell { band: 0, face: Face::PosY };
+    let (o, size) = atlas.storage_box(top);
+    let ground = world.terrain().surface(Face::PosY, si, sj);
+    assert_ne!(ground, i32::MIN, "the edge column has no surface");
+    let centre = chunk_holding(si, ground, sj);
+    assert!(world.adopt_fold(centre), "edge centre did not fold");
+    world.section_eye_y = ground as f64;
+    let desired = world.desired_sections(centre);
+    let body = section::CHART_BODY_BASE + index as u16;
+    assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY));
+    let outside: Vec<_> = desired
+        .iter()
+        .copied()
+        .filter(|s| {
+            let span = s.span() as i64;
+            let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+            x < o[0] || x + span > o[0] + size[0] || z < o[2] || z + span > o[2] + size[2]
+        })
+        .collect();
+    assert!(!outside.is_empty(), "no section crossed the +X edge ({} selected)", desired.len());
+    for s in &outside {
+        assert!(section::section_fits(s.span(), atlas.radius), "{s:?} exceeds the chord cap");
+        let (patch, _) = atlas.locate([s.min_x() as i64, 0, s.min_z() as i64]).unwrap_or_else(|| panic!("{s:?} is outside every box"));
+        assert!(matches!(patch, Patch::Shell { band: 0, .. }), "{s:?} landed on {patch:?}");
+    }
 }
 
 /// Breaking a block on the home +X face dirties that face's section, not +Y.
