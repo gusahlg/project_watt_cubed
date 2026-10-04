@@ -80,20 +80,26 @@ empty and costs nothing (chunks there classify as air without being generated).
   **Landmarks** grow from each theme (`world::terrain::features`): giant trees and mushrooms,
   spires, hoodoos and arches, cinder cones and basalt prisms, crystal prisms, ice spires and frozen
   falls, dunes and mesas, sky islands, impact craters with meteorite cores, rib arches and skulls,
-  petrified trunks, sinkholes, and flora on the meadows. Below a 350-block crust the bulk is a mix
+  petrified trunks, sinkholes, and flora on the meadows. **Structures** (`world::terrain::structures`)
+  are rarer: ruined towers, step pyramids, stone circles, monoliths, walled temple courts, mine
+  headframes over the mine levels, canyon bridges, waystones on the lines between them, and
+  observatories whose dish points at the nearest big body in the sky. Below a 350-block crust the bulk is a mix
   whose mean amount sets the cube's gravity, carved by **the interior** (`world::terrain::deep`):
   Deep caverns in six biomes with giant mushrooms and shafts, dwarf halls with pillars, stairs, rails
   and lamps, Underdark chambers with spires and lanterns, mantle bubbles, and the hollow Heart at the
-  centre. The mass the generator reports subtracts the Heart and every bubble, so the pull inside
+  centre. Every cavern biome carries its own light (glowcap, glowshroom, magma), so most of a
+  cavern floor is within a dozen blocks of a light source. The mass the generator reports subtracts the Heart and every bubble, so the pull inside
   them is the honest one.
 - **The Twins** — two 12,000,000-block cubes facing each other across a weightless canyon.
-- **Verdance** — a round world of radius 8,000,000: forested ranges and giant trees.
-- **The Hollow** — a shell between 5,750,000 and 6,000,000 from its centre: an icy crust outside,
-  crystal forests on the inner surface facing **the Ember**, a molten ball of radius 400,000 at its
-  centre. Inside the shell the shell's own pull cancels: the cavity is nearly weightless, drifting
-  toward the Ember.
+- **Verdance** — a round world of radius 8,000,000: forested ranges, lakes, groves of colossal
+  trees, stone arches and tepuis.
+- **The Hollow** — a shell between 5,750,000 and 6,000,000 from its centre: an icy crust outside
+  (crevasses, geyser cones, ice arches), crystal forests, arches and glowing clusters on the inner
+  surface facing **the Ember**, a molten ball of radius 400,000 at its centre (lava fountains,
+  cinder cones, obsidian shards). Inside the shell the shell's own pull cancels: the cavity is
+  nearly weightless, drifting toward the Ember. On the Ember the light is the far wall's glow.
 - **Moons** — two around the start cube and one or two around each world, cratered (grey, frozen or
-  rust), airless.
+  rust), airless: central peaks and ejecta, rilles, ice columns, dunes and mesas by kind.
 - **Asteroid swarms** — sparse clusters of rocks of every size and kind, never near a big body.
 
 Seen from afar every body is drawn as an analytic impostor in the sky (`sky::bodies`), lit by the
