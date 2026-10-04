@@ -1094,9 +1094,14 @@ mod tests {
             // The real terrain generator, off-origin so warps/rivers vary.
             let hills = Terrain::new(&mut BlockRegistry::with_builtins(), 0xBEEF);
             let pos = SectionPos { body: 0, face: Face::PosY, detail, x: 3, z: -2 };
+            // The start world is charted, so this square is not a cube face: both paths are empty.
+            // The reference extractor still samples `[0, 512]`, which no longer holds a home face.
+            let floor = hills
+                .surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span())
+                .map(|_| ring_floor(pos, &hills));
             let stored = Section::extract(pos, &hills, &edits, voxel_engine::Rev::START);
             assert_eq!(
-                flatten(&build_section_mesh(&stored, &tables, Some(ring_floor(pos, &hills)))),
+                flatten(&build_section_mesh(&stored, &tables, floor)),
                 flatten(&extract_section_mesh(pos, &hills, &edits, &tables)),
                 "fused path diverged on Terrain at {detail:?}",
             );
@@ -1418,8 +1423,9 @@ mod tests {
         );
     }
 
-    /// Far-field closure from altitude. The eye is the streaming sample (chunk centre
-    /// `(8, y, 8)`), which is the spawn column the task's `(0.5, y, 0.5)` sits in.
+    /// Far-field closure from altitude over a twin cube's +Y (the start world is charted;
+    /// its sections are the chart frontier, not these face sections). The eye sits 8 blocks
+    /// off that face's centre column.
     #[test]
     fn far_seam_altitude_frontier_borders_are_closed() {
         use crate::coord::ChunkCoord;
@@ -1431,7 +1437,20 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut world = World::with_kind(DEFAULT_SEED, RenderConfig::default(), WorldgenKind::Diffusion, false);
-        let home = world.terrain().cosmos().expect("cosmos").home().id;
+        let twin = world
+            .terrain()
+            .cosmos()
+            .expect("cosmos")
+            .bodies()
+            .iter()
+            .copied()
+            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Twin)
+            .expect("a twin");
+        let (au, av) = (
+            i32::try_from(twin.centre[0]).expect("twin x") + 8,
+            i32::try_from(twin.centre[2]).expect("twin z") + 8,
+        );
+        let body = twin.id;
         let colors = world.registry.color_snapshot();
         let extent = BakeExtent::new(world.section_pyramid.outer_m() as i32, world.section_pyramid.coarsest());
         let bake_at = std::time::Instant::now();
@@ -1439,22 +1458,23 @@ mod tests {
             world.terrain(),
             &colors,
             extent,
-            8,
-            8,
+            au,
+            av,
             Face::PosY,
-            home,
+            body,
         ));
-        world.section_mip_anchor = Some((home, Face::PosY, 8, 8));
+        world.section_mip_anchor = Some((body, Face::PosY, au, av));
         let bake_ms = bake_at.elapsed().as_secs_f64() * 1000.0;
         let outer = world.section_pyramid.outer_m();
         let clip = world.lod_clip();
         let full = world.view.coverage();
-        let ground = world.terrain().height(8, 8);
+        let ground = world.terrain().height(au, av);
 
         let mut reports = Vec::new();
-        for eye_y in [1500.0_f64, 3000.0] {
+        for lift in [1500.0_f64, 3000.0] {
+            let eye_y = ground as f64 + lift;
             world.section_eye_y = eye_y;
-            let center = ChunkCoord::new(0, (eye_y as i32).div_euclid(16), 0);
+            let center = ChunkCoord::new(au.div_euclid(16), (eye_y as i32).div_euclid(16), av.div_euclid(16));
             let desired = world.desired_sections(center);
             let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
             let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
@@ -1475,7 +1495,7 @@ mod tests {
             let min_span = drawn.iter().map(|p| p.span()).min().unwrap_or(1);
             let limit = outer - min_span as f32;
             let step = (min_span / 2).max(1);
-            let (ex, ez) = (8i32, 8i32);
+            let (ex, ez) = (au, av);
             let r = limit.floor() as i32;
             let mut cover_gaps = 0i32;
             let mut cover_n = 0i32;
@@ -1506,10 +1526,17 @@ mod tests {
 
             let cam_ground = eye_y - ground as f64;
             let cam_y = eye_y as f32;
+            let eye_x = (center.x * 16 + 8) as f32;
+            let eye_z = (center.z * 16 + 8) as f32;
             let culled = drawn.iter().filter(|p| {
-                let (x0, x1) = (p.min_x() as f32 - 8.0, (p.min_x() + p.span()) as f32 - 8.0);
-                let (y0, y1) = (-cam_y, 512.0 - cam_y);
-                let (z0, z1) = (p.min_z() as f32 - 8.0, (p.min_z() + p.span()) as f32 - 8.0);
+                let (x0, x1) = (p.min_x() as f32 - eye_x, (p.min_x() + p.span()) as f32 - eye_x);
+                let (lo, hi) = world
+                    .terrain()
+                    .surface_bounds(p.body, p.face, p.min_x(), p.min_z(), p.span())
+                    .unwrap_or((0, 512));
+                let (wlo, whi) = super::super::sample_window(lo, hi, p.cell_size());
+                let (y0, y1) = (wlo as f32 - cam_y, whi as f32 - cam_y);
+                let (z0, z1) = (p.min_z() as f32 - eye_z, (p.min_z() + p.span()) as f32 - eye_z);
                 x0 > -clip.half.x && x1 < clip.half.x
                     && y0 > -clip.half.y && y1 < clip.half.y
                     && z0 > -clip.half.z && z1 < clip.half.z

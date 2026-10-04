@@ -87,6 +87,25 @@ fn lod2_world() -> World {
     World::with_kind_cfg(DEFAULT_SEED, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, gentle, true)
 }
 
+/// Streaming centre on a twin cube's +Y face, eye at the surface. The start world is charted,
+/// so the origin selects no G4 frontier; the twins still do.
+fn stand_on_twin(world: &mut World) -> ChunkCoord {
+    let twin = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .expect("a twin");
+    let (center, cu, cv, surf) = face_centre_stand(world, &twin, Face::PosY);
+    let (_, y, _) = FaceFrame::new(Face::PosY).cell_to_world((cu, surf - 1, cv));
+    world.section_eye_y = y as f64;
+    world.center = Some(center);
+    center
+}
+
 /// The `section_edit_chunks` index must return exactly what the reference
 /// footprint scan returns, for every active detail — including after
 /// compaction empties a chunk's edits (the stale index coord must filter
@@ -204,8 +223,7 @@ fn lod2_is_the_default_and_near_only_leaves_sections_dormant() {
 #[test]
 fn section_lane_claim_and_integrate_parity() {
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
-    world.center = Some(center);
+    let center = stand_on_twin(&mut world);
     let pos = world.desired_sections(center)[0];
     assert!(!<SectionLane as StreamLane>::in_flight(&world, pos));
     // Claim without its paired submit would trip the debug assertion, so
@@ -237,7 +255,7 @@ fn section_lane_claim_and_integrate_parity() {
 fn section_covering_gates_on_a_ready_ancestor_or_self() {
     // A cell is covered by a Ready self or by a Ready ancestor.
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
+    let center = stand_on_twin(&mut world);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
     let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
@@ -256,8 +274,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
 #[test]
 fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
-    world.center = Some(center);
+    let center = stand_on_twin(&mut world);
     world.pending_sections.take();
 
     // Fresh world: everything desired is missing — the rebuild must arm.
@@ -291,8 +308,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
 #[test]
 fn section_visible_lane_drives_through_run_manual() {
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
-    world.center = Some(center);
+    let center = stand_on_twin(&mut world);
     world.pending_sections.take();
     world.section_desired = world.desired_sections(center);
 
@@ -348,10 +364,9 @@ fn chunk_creation_arms_the_section_lane() {
 #[test]
 fn desired_frontier_responds_to_altitude() {
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
-    world.section_eye_y = 40.0;
+    let center = stand_on_twin(&mut world);
     let ground: FastSet<_> = world.desired_sections(center).into_iter().collect();
-    world.section_eye_y = 4000.0;
+    world.section_eye_y += 4000.0;
     let sky: FastSet<_> = world.desired_sections(center).into_iter().collect();
     assert_ne!(ground, sky, "altitude must reshape the desired frontier");
     assert!(!sky.is_empty(), "high altitude still selects a (coarser) far field");
@@ -384,20 +399,41 @@ fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
 fn coverage_skip_is_sound_and_backed() {
     use super::heightmip::BakeExtent;
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
+    let twin = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .expect("a twin");
+    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosY);
     world.center = Some(center);
     world.view = ViewVolume::view(20);
-    world.section_mip = Some(HeightMip::bake(
+    // World altitude of the face. The bake stores height above the datum, and the
+    // metric subtracts the datum, so the eye has to be the surface itself.
+    world.section_eye_y = surf as f64;
+    let span = section::section_span(section::FINEST_DETAIL);
+    let cell = SectionPos {
+        body: twin.id,
+        face: Face::PosY,
+        detail: section::FINEST_DETAIL,
+        x: cu.div_euclid(span),
+        z: cv.div_euclid(span),
+    };
+    world.section_mip = Some(HeightMip::bake_at(
         &*world.generator,
         &world.registry.color_snapshot(),
         BakeExtent::new(2048, Detail(section::FINEST_DETAIL.0 + 3)),
+        cu,
+        cv,
+        Face::PosY,
+        twin.id,
     ));
     let mip = world.section_mip.clone().unwrap();
 
-    let cell = SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 0, z: 0 };
     let (lo, hi) = mip.relief_band(cell).expect("near cell is baked");
-    // Centre the eye on the cell's relief so its terrain sits inside the slab.
-    world.section_eye_y = ((lo + hi) * 0.5) as f64;
 
     // Selection stays total: skip is invisible to covering.
     assert!(world.desired_sections(center).contains(&cell), "cell still desired");
@@ -408,10 +444,12 @@ fn coverage_skip_is_sound_and_backed() {
     // Back the footprint with settled chunks.
     let cs = CHUNK_SIZE as i32;
     let nchunks = cell.span() / cs;
-    let (cy_lo, cy_hi) = ((lo.floor() as i32).div_euclid(cs), (hi.floor() as i32).div_euclid(cs));
+    let (cx0, cz0) = (cell.min_x().div_euclid(cs), cell.min_z().div_euclid(cs));
+    let (cy_lo, cy_hi) = world.baked_chunk_ys(cell, lo, hi);
     for cy in cy_lo..=cy_hi {
-        for cz in 0..nchunks {
-            for cx in 0..nchunks {
+        for dz in 0..nchunks {
+            for dx in 0..nchunks {
+                let (cx, cz) = (cx0 + dx, cz0 + dz);
                 world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_chunk(cx, cy, cz));
             }
         }
@@ -419,9 +457,9 @@ fn coverage_skip_is_sound_and_backed() {
     assert!(world.coverage_skips(center, cell), "backed near disc inside the slab is skipped");
 
     // If any chunk is in-flight, don't skip (fast-descent guard).
-    world.chunks.insert(ChunkCoord::new(0, cy_lo, 0), Loaded {
+    world.chunks.insert(ChunkCoord::new(cx0, cy_lo, cz0), Loaded {
         state: MeshState::NeedsMesh { building: true, prev: None },
-        ..air_chunk(0, cy_lo, 0)
+        ..air_chunk(cx0, cy_lo, cz0)
     });
     assert!(!world.coverage_skips(center, cell), "an in-flight covering chunk blocks the skip");
 }
@@ -431,26 +469,38 @@ fn coverage_skip_is_sound_and_backed() {
 fn coverage_skip_never_skips_outside_the_core() {
     use super::heightmip::BakeExtent;
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
+    let twin = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .expect("a twin");
+    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosY);
     world.center = Some(center);
     world.view = ViewVolume::view(20);
-    world.section_mip = Some(HeightMip::bake(
+    world.section_eye_y = surf as f64;
+    let span = section::section_span(section::FINEST_DETAIL);
+    let (sx, sz) = (cu.div_euclid(span), cv.div_euclid(span));
+    world.section_mip = Some(HeightMip::bake_at(
         &*world.generator,
         &world.registry.color_snapshot(),
         BakeExtent::new(2048, Detail(section::FINEST_DETAIL.0 + 3)),
+        cu,
+        cv,
+        Face::PosY,
+        twin.id,
     ));
-    let mip = world.section_mip.clone().unwrap();
 
     // Far section: clip draws it, so don't skip it.
-    let far = SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 5, z: 0 };
-    if let Some((lo, hi)) = mip.relief_band(far) {
-        world.section_eye_y = ((lo + hi) * 0.5) as f64;
-    }
+    let far = SectionPos { body: twin.id, face: Face::PosY, detail: section::FINEST_DETAIL, x: sx + 5, z: sz };
     assert!(!world.coverage_skips(center, far), "a far section is never skipped");
 
     // Near section but eye is high above it: terrain pokes out of slab, so don't skip.
-    let near = SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 0, z: 0 };
-    world.section_eye_y = 5000.0;
+    let near = SectionPos { body: twin.id, face: Face::PosY, detail: section::FINEST_DETAIL, x: sx, z: sz };
+    world.section_eye_y = surf as f64 + 5000.0;
     assert!(!world.coverage_skips(center, near), "high eye over low ground is not skipped");
 }
 
@@ -581,9 +631,12 @@ fn distinct_seeds_differ() {
     use crate::world::generation::WorldgenKind;
     let a = World::with_kind(1, RenderConfig::default(), WorldgenKind::Diffusion, false);
     let b = World::with_kind(9_999, RenderConfig::default(), WorldgenKind::Diffusion, false);
-    let ha: Vec<i32> = (0..16).map(|x| a.surface_y(x, 0)).collect();
-    let hb: Vec<i32> = (0..16).map(|x| b.surface_y(x, 0)).collect();
-    assert_ne!(ha, hb, "different seeds should sculpt different terrain");
+    let strip = |w: &World| {
+        let (_, x, z, ground) = home_storage_column(w, Face::PosY);
+        assert_ne!(ground, i32::MIN, "the start chart has no surface");
+        (0..16).map(|i| w.surface_y(x + i, z)).collect::<Vec<_>>()
+    };
+    assert_ne!(strip(&a), strip(&b), "different seeds should sculpt different terrain");
 }
 
 #[test]
@@ -992,9 +1045,12 @@ fn staged_upload_bytes_match_quad_counts() {
 fn section_upload_byte_accounting_matches_vertex_sizes() {
     let mut world = lod2_world();
     world.refresh_tables();
-    let center = ChunkCoord::new(0, 0, 0);
-    world.center = Some(center);
-    let pos = world.desired_sections(center)[0];
+    let center = stand_on_twin(&mut world);
+    let pos = world
+        .desired_sections(center)
+        .into_iter()
+        .find(|s| s.detail == section::FINEST_DETAIL)
+        .expect("a finest section on the twin");
     let tables = world.tables.get();
     let meshes = section::extract_section_mesh(pos, &*world.generator, &[], &tables);
     let expected: usize =
@@ -1565,8 +1621,7 @@ fn lod2_far_field_drives_to_covering_complete() {
     // terrain, simulating GPU upload as an empty `Ready`, and assert
     // covering resolution terminates (every cell covered by an ancestor or self).
     let mut world = lod2_world();
-    let center = ChunkCoord::new(0, 0, 0);
-    world.center = Some(center);
+    let center = stand_on_twin(&mut world);
     let desired = world.desired_sections(center);
     assert!(!desired.is_empty(), "a lod2 world wants a far frontier at spawn");
 
@@ -2866,7 +2921,7 @@ fn storage_ball_world(depth: i64) -> (World, ChunkCoord) {
     use crate::space::atlas::{Atlas, Patch};
     let mut world = World::with_kind(1, RenderConfig::default(), WorldgenKind::Flat, false);
     let rock = world.registry.id_by_label("rock").unwrap();
-    let atlas = Arc::new(Atlas::new(DVec3::new(3.0e8, -2.0e8, 1.0e8), 4096, 4096 + 128, false, 0));
+    let atlas = Arc::new(Atlas::new(DVec3::new(3.0e8, -2.0e8, 1.0e8), 4096, 4096 + 128, false, crate::space::atlas::STORAGE_X0));
     world.generator = Arc::new(StorageBall { atlas: atlas.clone(), rock, solid: 4096 });
     world.seams = seam::Seams::new(world.generator.atlases().to_vec());
     world.refresh_tables();
@@ -3032,18 +3087,27 @@ fn face_centre_stand(world: &World, body: &terrain::cosmos::Body, face: Face) ->
     (chunk_holding(x, y, z), cu, cv, a)
 }
 
-/// Camera on the start cube's +X face: the frontier is that face, and a mesh
-/// extracted there is non-empty at the surface's world altitude.
+/// Camera on a twin cube's +X face: the frontier is that face, and a mesh
+/// extracted there is non-empty at the surface's world altitude. The start world
+/// is charted; its far field is chart sections, covered separately.
 #[test]
-fn far_face_home_plus_x_selects_sections_at_the_surface() {
+fn far_face_twin_plus_x_selects_sections_at_the_surface() {
     let mut world = lod2_world();
-    let home = *world.terrain().cosmos().expect("cosmos").home();
-    let (center, cu, cv, surf) = face_centre_stand(&world, &home, Face::PosX);
+    let twin = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .expect("a twin");
+    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosX);
     // World Y of this column is the +X tangent. Altitude comes from the chunk's X.
     world.section_eye_y = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv)).1 as f64;
     let desired = world.desired_sections(center);
     assert!(!desired.is_empty(), "no sections on +X");
-    assert!(desired.iter().all(|s| s.body == home.id && s.face == Face::PosX), "frontier left +X: {desired:?}");
+    assert!(desired.iter().all(|s| s.body == twin.id && s.face == Face::PosX), "frontier left +X: {desired:?}");
     assert!(
         desired.iter().any(|s| (s.min_x() - cu).abs() < 50_000 && (s.min_z() - cv).abs() < 50_000),
         "frontier is not around the face centre"
@@ -3057,11 +3121,15 @@ fn far_face_home_plus_x_selects_sections_at_the_surface() {
     let tables = world.registry().hot_tables();
     let mesh = section::extract_section_mesh(pos, world.terrain(), &[], &tables);
     assert!(mesh.vertex_bytes() > 0, "+X section meshed empty");
-    assert!(mesh.altitude_floor > 20_000_000, "window stayed at the origin: {}", mesh.altitude_floor);
     let u = pos.min_x() + pos.span() / 2;
     let v = pos.min_z() + pos.span() / 2;
     let column = world.terrain().surface(Face::PosX, u, v);
     assert_ne!(column, i32::MIN);
+    assert!(
+        (mesh.altitude_floor as i64 - i64::from(column - 1)).unsigned_abs() < 16_384,
+        "window left the face: floor {} column {column}",
+        mesh.altitude_floor
+    );
     let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
     let block = 16i32 << detail.0;
     let covers = mesh.slabs.iter().any(|slab| {
@@ -3101,15 +3169,29 @@ fn far_face_twin_selects_that_body() {
 #[test]
 fn far_face_edge_unions_the_neighbour() {
     let mut world = lod2_world();
-    let half = terrain::cosmos::HOME_HALF as i32;
-    let x = half - 100;
-    let y = world.terrain().surface(Face::PosY, x, 0);
+    let (twin_id, home_id, half, centre) = {
+        let cosmos = world.terrain().cosmos().expect("cosmos");
+        let twin = cosmos.bodies().iter().copied().find(|b| b.kind == terrain::cosmos::Kind::Twin).expect("a twin");
+        let terrain::cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+        let centre = (
+            i32::try_from(twin.centre[0]).expect("twin x"),
+            i32::try_from(twin.centre[1]).expect("twin y"),
+            i32::try_from(twin.centre[2]).expect("twin z"),
+        );
+        (twin.id, cosmos.home().id, half, centre)
+    };
+    let (cu, _, cv) = FaceFrame::new(Face::PosY).cell_to_local(centre);
+    // 100 inside the edge: within two finest sections, so +X joins +Y.
+    let x = cu + half as i32 - 100;
+    let z = cv;
+    let y = world.terrain().surface(Face::PosY, x, z);
     assert_ne!(y, i32::MIN);
     world.section_eye_y = y as f64;
-    let center = chunk_holding(x, y, 0);
+    let center = chunk_holding(x, y, z);
     let desired = world.desired_sections(center);
-    assert!(desired.iter().any(|s| s.body == 0 && s.face == Face::PosY), "missing +Y");
-    assert!(desired.iter().any(|s| s.body == 0 && s.face == Face::PosX), "missing the +X neighbour");
+    assert!(desired.iter().any(|s| s.body == twin_id && s.face == Face::PosY), "missing +Y");
+    assert!(desired.iter().any(|s| s.body == twin_id && s.face == Face::PosX), "missing the +X neighbour");
+    assert!(desired.iter().all(|s| s.body != home_id), "a twin edge selected the start world");
 }
 
 /// Verdance's band-0 +Y chart, and a storage column on it: the middle, or `from_pos_x` blocks
@@ -3235,19 +3317,27 @@ fn far_face_chart_edge_selects_the_neighbour() {
     }
 }
 
-/// Breaking a block on the home +X face dirties that face's section, not +Y.
+/// Breaking a block on a twin's +X face dirties that face's section, not +Y.
 #[test]
 fn far_face_plus_x_edit_dirties_the_face_section() {
     let mut world = lod2_world();
-    let home = *world.terrain().cosmos().expect("cosmos").home();
-    let (_, cu, cv, surf) = face_centre_stand(&world, &home, Face::PosX);
+    let twin = world
+        .terrain()
+        .cosmos()
+        .expect("cosmos")
+        .bodies()
+        .iter()
+        .copied()
+        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .expect("a twin");
+    let (_, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosX);
     let (x, y, z) = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv));
     assert_ne!(world.terrain().voxel_at(x, y, z), AIR, "the crust cell is air");
     world.set_block(x, y, z, AIR);
     let span = section::section_span(section::FINEST_DETAIL);
     assert!(
         world.dirty_sections.iter().any(|p| {
-            p.body == home.id
+            p.body == twin.id
                 && p.face == Face::PosX
                 && p.detail == section::FINEST_DETAIL
                 && p.x == cu.div_euclid(span)
@@ -3256,6 +3346,73 @@ fn far_face_plus_x_edit_dirties_the_face_section() {
         "dirty set {:?} missed the +X section",
         world.dirty_sections
     );
+}
+
+/// Centre column of one start-world chart: atlas index, storage `(x, z)`, first open cell.
+fn home_storage_column(world: &World, face: Face) -> (usize, i32, i32, i32) {
+    use crate::space::atlas::Patch;
+    let home = world.terrain().cosmos().expect("cosmos").home();
+    let atlases = world.terrain().atlases();
+    let index = atlases.iter().position(|a| (a.centre - home.centre_f()).length() < 1.0).expect("the start world is charted");
+    let patch = Patch::Shell { band: 0, face };
+    let n = atlases[index].bands[0].n;
+    let s = atlases[index].storage(patch, [n / 2, 0, n / 2]);
+    let (x, z) = (s[0] as i32, s[2] as i32);
+    let ground = world.terrain().surface(Face::PosY, x, z);
+    (index, x, z, ground)
+}
+
+/// The start world's far field is its chart sections (storage +Y), on every face.
+#[test]
+fn far_face_home_chart_selects_chart_sections() {
+    for face in [Face::PosY, Face::PosX] {
+        let mut world = lod2_world();
+        let (index, x, z, ground) = home_storage_column(&world, face);
+        assert_ne!(ground, i32::MIN, "{face:?} chart has no surface");
+        let centre = chunk_holding(x, ground, z);
+        if face == Face::PosY {
+            assert!(world.adopt_fold(centre), "home +Y did not fold");
+        } else {
+            let _ = world.adopt_fold(centre);
+        }
+        assert!(!world.fold.is_identity(), "{face:?} fold stayed physical");
+        world.section_eye_y = ground as f64;
+        let desired = world.desired_sections(centre);
+        let body = section::CHART_BODY_BASE + index as u16;
+        assert!(!desired.is_empty(), "{face:?} selected nothing");
+        assert!(
+            desired.iter().all(|s| s.body == body && s.face == Face::PosY),
+            "{face:?} frontier left the chart: {desired:?}"
+        );
+        assert!(
+            desired.iter().any(|s| (s.min_x() as i64 - i64::from(x)).abs() < 50_000 && (s.min_z() as i64 - i64::from(z)).abs() < 50_000),
+            "{face:?} frontier is not around the storage column"
+        );
+    }
+}
+
+/// An edit on the start world's chart dirties that chart section.
+#[test]
+fn far_face_home_chart_edit_dirties_the_chart_section() {
+    let mut world = lod2_world();
+    let (index, x, z, ground) = home_storage_column(&world, Face::PosY);
+    assert_ne!(world.terrain().voxel_at(x, ground - 1, z), AIR, "the chart crust is air");
+    world.set_block(x, ground - 1, z, AIR);
+    let span = section::section_span(section::FINEST_DETAIL);
+    let body = section::CHART_BODY_BASE + index as u16;
+    let home = world.terrain().cosmos().unwrap().home().id;
+    assert!(
+        world.dirty_sections.iter().any(|p| {
+            p.body == body
+                && p.face == Face::PosY
+                && p.detail == section::FINEST_DETAIL
+                && p.x == x.div_euclid(span)
+                && p.z == z.div_euclid(span)
+        }),
+        "dirty set {:?} missed the chart section",
+        world.dirty_sections
+    );
+    assert!(world.dirty_sections.iter().all(|p| p.body != home), "a chart edit dirtied the catalog id");
 }
 
 fn headless_integrate(world: &mut World, result: pipeline::Done) {

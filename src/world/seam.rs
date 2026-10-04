@@ -740,7 +740,7 @@ mod tests {
     use crate::space::atlas::Patch;
 
     fn atlas() -> Arc<Atlas> {
-        Arc::new(Atlas::new(DVec3::new(3.0e8, -2.0e8, 1.0e8), 4096, 4096 + 128, false, 0))
+        Arc::new(Atlas::new(DVec3::new(3.0e8, -2.0e8, 1.0e8), 4096, 4096 + 128, false, crate::space::atlas::STORAGE_X0))
     }
 
     fn chunk_of(s: [i64; 3]) -> Coord {

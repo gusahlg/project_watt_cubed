@@ -81,6 +81,11 @@ impl World {
         self.generator.height(x, z)
     }
 
+    /// Physical spawn on a charted start world. `None` keeps the origin spiral.
+    pub fn chart_spawn(&self) -> Option<voxel_engine::DVec3> {
+        self.generator.chart_spawn()
+    }
+
     /// Ground height for every cell of a 16×16 chunk column.
     pub fn heights_16(&self, cx: i32, cz: i32) -> super::generation::ColumnHeights {
         self.generator.heights_16(cx, cz)

@@ -1,9 +1,9 @@
-//! The cosmos: the seeded catalog of every body in the universe — the start cube, the few big
+//! The cosmos: the seeded catalog of every body in the universe — the start world, the few big
 //! worlds far away, their moons, and the sparse asteroid clusters between them. It is the single
 //! source the generator paints from, gravity sums (as an analytic mass oracle) and the sky draws
 //! distant bodies from. Everything is a pure function of the seed; empty space answers in O(1).
 //!
-//! Layout rules: big bodies sit on a shell 4.5e8–8e8 blocks from the start cube, pairwise ≥ 4e8
+//! Layout rules: big bodies sit on a shell 4.5e8–8e8 blocks from the start world, pairwise ≥ 4e8
 //! apart, inside ±9.2e8; clusters live one per `CELL` (with a small probability) and paint only
 //! inside their cell; a cluster's rocks live one per sub-cell of their size class and paint only
 //! inside their sub-cell, so any box finds its rocks by looking at the sub-cells it overlaps.
@@ -15,10 +15,11 @@ use glam::DVec3;
 use super::noise::{hash3, unit};
 use crate::gravity::{MassOracle, Primitive, Shape as MassShape, Summary, Visitor};
 
-/// Half-size of the start cube (50,000,000 blocks on a side).
-pub const HOME_HALF: i64 = 25_000_000;
-/// Centre of the start cube: its +Y face plane is `y = 0`.
-pub const HOME_CENTRE: [i64; 3] = [0, -HOME_HALF, 0];
+/// Radius of the start world. The sphere has the volume of the old 50_000_000-block cube:
+/// `round16(50_000_000 · (3/(4π))^(1/3))`.
+pub const HOME_RADIUS: i64 = 31_017_520;
+/// Centre of the start world: the top of its +Y chart sits near `y = 0`.
+pub const HOME_CENTRE: [i64; 3] = [0, -HOME_RADIUS, 0];
 /// Design mean amount per cell of a body's bulk (the generator's bulk mix honours it).
 pub const BULK_DENSITY: f64 = 5.0;
 /// Most a generated surface rises above (or sinks below) its datum.
@@ -34,7 +35,7 @@ const SUPER: i64 = CELL * 8;
 /// What a body is made like. Content flavour only: physics never reads it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
-    /// The start cube.
+    /// The start world, a sphere-ish ball painted on cube-sphere charts.
     Home,
     /// One of two facing cubes.
     Twin,
@@ -59,7 +60,7 @@ pub enum Shape {
     Shell { outer: i64, inner: i64 },
 }
 
-/// One big body (start cube, worlds, moons).
+/// One big body (start world, worlds, moons).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Body {
     /// Stable index into the catalog.
@@ -286,7 +287,7 @@ impl Cosmos {
             id: 0,
             kind: Kind::Home,
             centre: HOME_CENTRE,
-            shape: Shape::Cube { half: HOME_HALF },
+            shape: Shape::Ball { r: HOME_RADIUS },
             density: BULK_DENSITY,
             seed: hash3(seed, 0, 0, 0),
         }];
@@ -407,7 +408,7 @@ impl Cosmos {
         &self.bodies
     }
 
-    /// The start cube.
+    /// The start world.
     pub fn home(&self) -> &Body {
         &self.bodies[0]
     }
@@ -725,6 +726,9 @@ impl MassOracle for Cosmos {
             for p in b.primitives() {
                 v.primitive(&p);
             }
+            // Cube porosity shells, the Heart and mantle bubbles are the twin cubes' interior.
+            // Home is a ball: those voids live in the face painter's virtual cube, and only the
+            // part that overlaps band 0 is carved. The oracle stays the ball plus the relief error.
             if let Shape::Cube { half } = b.shape {
                 super::deep::apply(b.centre, half, b.seed, b.density, self.deep, v);
             }
@@ -809,11 +813,30 @@ mod tests {
     #[test]
     fn home_spawn_pull_is_the_designed_gravity() {
         let cosmos = Arc::new(Cosmos::new(7, 1.0));
-        let field = Field::new(cosmos);
-        let s = field.sample(DVec3::new(0.5, 70.0, 0.5));
-        let want = crate::player::STANDARD_GRAVITY;
-        assert!((s.accel.length() - want).abs() < 0.02 * want, "{} vs {want}", s.accel.length());
-        assert!(s.accel.y < 0.0 && (s.accel.x.abs() + s.accel.z.abs()) < 1e-3 * want);
+        let field = Field::new(cosmos.clone());
+        let home = cosmos.home();
+        let Shape::Ball { r } = home.shape else { panic!("home is a ball") };
+        let at = DVec3::new(0.0, 2.0, 0.0);
+        let s = field.sample(at);
+        let solid = crate::gravity::Primitive::new(
+            crate::gravity::Shape::Ball { c: home.centre_f(), r: r as f64 },
+            BULK_DENSITY,
+        );
+        let want = solid.field(at).0 * crate::gravity::G;
+        let to_centre = home.centre_f() - at;
+        let dot = s.accel.dot(to_centre) / (s.accel.length() * to_centre.length());
+        println!(
+            "home spawn pull {:.4} blocks/s², solid ball {:.4}, dot {dot:.6}",
+            s.accel.length(),
+            want.length()
+        );
+        assert!(dot > 0.999, "pull points at the centre: {dot}");
+        assert!(
+            (s.accel.length() - want.length()).abs() < 0.05 * want.length(),
+            "{} vs {}",
+            s.accel.length(),
+            want.length()
+        );
     }
 
     #[test]
@@ -906,7 +929,11 @@ mod tests {
         let field = Field::new(cosmos.clone());
         let g0 = crate::player::STANDARD_GRAVITY;
         let home = cosmos.home().centre_f();
-        let h = HOME_HALF as f64;
+        let h = match cosmos.home().shape {
+            Shape::Ball { r } => r as f64,
+            Shape::Cube { half } => half as f64,
+            Shape::Shell { outer, .. } => outer as f64,
+        };
         let mut stops: Vec<(String, DVec3)> = vec![
             ("home +Y face centre (spawn)".into(), home + DVec3::new(0.0, h + 70.0, 0.0)),
             ("1,000,000 blocks from spawn".into(), home + DVec3::new(1.0e6, h + 70.0, 0.0)),

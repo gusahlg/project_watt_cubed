@@ -1568,6 +1568,11 @@ fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason:
 /// Scattered a little per id so players don't stack on the exact same block; scans outward for
 /// the first level column (its four neighbours within one block), like the single-player spawn.
 fn spawn_point(generator: &dyn TerrainGenerator, id: u32) -> DVec3 {
+    if let Some(mut p) = generator.chart_spawn() {
+        p.x += (id % 5) as f64 - 2.0;
+        p.z += ((id / 5) % 5) as f64 - 2.0;
+        return p;
+    }
     let sx = (id % 8) as i32 - 3;
     let sz = ((id / 8) % 8) as i32 - 3;
     for r in 0..64 {
@@ -1628,12 +1633,22 @@ mod tests {
 
     #[test]
     fn spawn_points_sit_above_the_surface() {
+        use crate::space::atlas::Patch;
         let terrain = test_generator();
-        for id in 1..20 {
+        let centre = terrain.chart_spawn().expect("a charted start world");
+        for id in 0..25 {
             let p = spawn_point(terrain.as_ref(), id);
-            let ground = terrain.height(block_coord(p.x), block_coord(p.z));
-            assert!(p.y > ground as f64, "spawn should be above ground");
+            assert!((p.x - centre.x).abs() <= 2.0 + 1e-6, "id {id} x {}", p.x);
+            assert!((p.z - centre.z).abs() <= 2.0 + 1e-6, "id {id} z {}", p.z);
+            assert!((p.y - centre.y).abs() < 1e-6, "id {id} y {}", p.y);
         }
+        let p = spawn_point(terrain.as_ref(), 12);
+        assert!((p.x - centre.x).abs() < 1e-9 && (p.z - centre.z).abs() < 1e-9, "id 12 is the centre");
+        let cell = terrain.atlases().iter().find_map(|a| a.storage_of(p)).expect("spawn storage");
+        let (patch, local) = terrain.atlases().iter().find_map(|a| a.locate(cell)).expect("located");
+        assert!(matches!(patch, Patch::Shell { band: 0, face: Face::PosY }), "{patch:?}");
+        let open = i64::from(terrain.height(cell[0] as i32, cell[2] as i32));
+        assert!((1..=2).contains(&(local[1] - open)), "local {} open {open}", local[1]);
     }
 
     /// A roster entry for direct state tests. `last_move` starts well in the
@@ -1916,11 +1931,12 @@ mod tests {
 
         let mut world = World::with_kind(42, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, true);
         let (wa, we) = destructive_pair(world.registry_mut());
-        let y = world.surface_y(0, 0) + 3;
-        let local = run(&mut world, wa, we, y);
-
         let mut registry = BlockRegistry::with_builtins();
         let generator = crate::world::terrain::generator(&mut registry, 42, Default::default());
+        let spawn = generator.chart_spawn().expect("a charted start world");
+        let y = generator.atlases().iter().find_map(|a| a.storage_of(spawn)).expect("spawn storage")[1] as i32;
+        let local = run(&mut world, wa, we, y);
+
         let (sa, se) = destructive_pair(&mut registry);
         let mut state = test_state(HashMap::new());
         state.registry = registry;
@@ -3005,12 +3021,23 @@ mod tests {
 
     #[test]
     fn server_block_reads_the_generator_like_the_client() {
+        use crate::space::atlas::Patch;
         let mut registry = BlockRegistry::with_builtins();
         let g = crate::world::terrain::generator(&mut registry, 4242, Default::default());
-        for x in 0..40 {
-            for z in 0..40 {
-                let y = g.height(x, z) - 1;
-                assert_eq!(g.block_at(x, y, z, g.height(x, z)), g.voxel_at(x, y, z), "({x},{y},{z})");
+        let home = g.cosmos().expect("cosmos").home();
+        let atlas = g
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("the start world is charted");
+        let n = atlas.bands[0].n;
+        let s = atlas.storage(Patch::Shell { band: 0, face: Face::PosY }, [n / 2, 0, n / 2]);
+        let (x0, z0) = (s[0] as i32, s[2] as i32);
+        for x in x0..x0 + 40 {
+            for z in z0..z0 + 40 {
+                let h = g.height(x, z);
+                assert_ne!(h, i32::MIN, "({x},{z}) has no chart surface");
+                assert_eq!(g.block_at(x, h - 1, z, h), g.voxel_at(x, h - 1, z), "({x},{},{z})", h - 1);
             }
         }
     }

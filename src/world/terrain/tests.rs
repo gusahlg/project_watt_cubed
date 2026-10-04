@@ -5,6 +5,7 @@ use super::cube;
 use super::{space, span};
 use super::deep;
 use crate::coord::{ChunkCoord, Face};
+use crate::space::atlas::Patch;
 use crate::space::FaceFrame;
 use crate::world::chunk::Chunk;
 use crate::world::generation::Classify;
@@ -36,18 +37,25 @@ fn assert_chunk_matches(t: &Terrain, cx: i32, cy: i32, cz: i32) {
 #[test]
 fn batch_generation_equals_the_per_voxel_definition_in_every_realm() {
     let (_reg, t) = make(42);
-    // The surface layer of a few columns (trees included), the ground below it, the mine band,
-    // the deep, and space.
-    for (cx, cz) in [(0, 0), (3, -2), (-7, 11), (40, 40)] {
-        let h = t.height(cx * 16 + 8, cz * 16 + 8);
+    // Surface layers of a few +Y chart columns (trees included), then mine levels and a deep
+    // band-0 layer. Face-local chunk offsets land on storage chunks (the rise is chunk-aligned).
+    let (_, _, rise) = home_column(&t, Face::PosY, 0, 0);
+    let base = (rise / 16) as i32;
+    for (cu, cv) in [(0, 0), (3, -2), (-7, 11), (40, 40)] {
+        let (sx, sz, _) = home_column(&t, Face::PosY, cu * 16 + 8, cv * 16 + 8);
+        let h = t.height(sx, sz);
+        let (cx, cz) = (sx.div_euclid(16), sz.div_euclid(16));
         let top = h.div_euclid(16);
         for cy in [top - 1, top, top + 1] {
             assert_chunk_matches(&t, cx, cy, cz);
         }
     }
-    for cy in [-1, -3, -5, -9, -20] {
-        assert_chunk_matches(&t, 2, cy, 5);
-        assert_chunk_matches(&t, -9, cy, 4);
+    for (cu, cv) in [(2, 5), (-9, 4)] {
+        let (sx, sz, _) = home_column(&t, Face::PosY, cu * 16 + 8, cv * 16 + 8);
+        let (cx, cz) = (sx.div_euclid(16), sz.div_euclid(16));
+        for cy in [-1, -3, -5, -9, -20] {
+            assert_chunk_matches(&t, cx, base + cy, cz);
+        }
     }
 }
 
@@ -55,7 +63,9 @@ fn batch_generation_equals_the_per_voxel_definition_in_every_realm() {
 #[allow(clippy::reversed_empty_ranges)] // `1..=0`: the height field with no chunk layers
 fn column_heights_agree_on_every_path() {
     let (_reg, t) = make(7);
-    for (cx, cz) in [(0, 0), (-3, 9), (100, -40)] {
+    for (cu, cv) in [(0, 0), (-3, 9), (100, -40)] {
+        let (sx, sz, rise) = home_column(&t, Face::PosY, cu * 16, cv * 16);
+        let (cx, cz) = (sx.div_euclid(16), sz.div_euclid(16));
         let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, 1..=0);
         let h16 = t.heights_16(cx, cz);
         for lz in 0..16 {
@@ -63,7 +73,8 @@ fn column_heights_agree_on_every_path() {
                 let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
                 assert_eq!(hs[lx + lz * 16], t.height(x, z));
                 assert_eq!(h16[lx + lz * 16], t.height(x, z));
-                assert!((MIN_GROUND..=MAX_GROUND).contains(&t.height(x, z)));
+                let face = (i64::from(t.height(x, z)) - rise) as i32;
+                assert!((MIN_GROUND..=MAX_GROUND).contains(&face), "face altitude {face}");
             }
         }
     }
@@ -72,10 +83,12 @@ fn column_heights_agree_on_every_path() {
 #[test]
 fn far_coordinates_generate_without_panic() {
     let (_reg, t) = make(3);
-    // Still on the +Y face, far from spawn.
-    let h = t.height(1_000_000, -1_000_000);
-    assert!((MIN_GROUND..=MAX_GROUND).contains(&h), "on-face height {h}");
-    let _ = t.voxel_at(1_000_000, h - 1, -1_000_000);
+    // Still on the +Y chart, far from the centre column.
+    let (sx, sz, rise) = home_column(&t, Face::PosY, 1_000_000, -1_000_000);
+    let h = t.height(sx, sz);
+    let face = (i64::from(h) - rise) as i32;
+    assert!((MIN_GROUND..=MAX_GROUND).contains(&face), "on-face height {face}");
+    let _ = t.voxel_at(sx, h - 1, sz);
     // Off every cube: no height, and the cell is air.
     for &(x, z) in &[(1_000_000_000, -1_000_000_000), (i32::MAX - 40, i32::MIN + 40)] {
         assert_eq!(t.height(x, z), i32::MIN);
@@ -91,22 +104,26 @@ fn far_coordinates_generate_without_panic() {
 fn the_three_realms_have_their_features() {
     let (reg, t) = make(42);
     let m = t.materials().clone();
-    // Mountains and valleys: a wide survey finds both high peaks and low valley floors.
+    // Mountains and valleys on the +Y chart: a wide survey finds both high peaks and low floors.
+    let (_, _, rise) = home_column(&t, Face::PosY, 0, 0);
     let (mut lo, mut hi) = (i32::MAX, i32::MIN);
     for i in -60..60 {
         for j in -60..60 {
-            let h = t.height(i * 40, j * 40);
-            lo = lo.min(h);
-            hi = hi.max(h);
+            let (sx, sz, _) = home_column(&t, Face::PosY, i * 40, j * 40);
+            let face = (i64::from(t.height(sx, sz)) - rise) as i32;
+            lo = lo.min(face);
+            hi = hi.max(face);
         }
     }
     assert!(hi >= 300, "no mountain reaches 300 m (highest {hi})");
     assert!(lo <= 50, "no valley floor below 50 m (lowest {lo})");
-    // Trees on the surface somewhere near the origin.
+    // Trees on the chart surface near the centre column.
     let mut trees = 0;
-    for cx in -6..6 {
-        for cz in -6..6 {
-            let h = t.height(cx * 16 + 8, cz * 16 + 8);
+    for cu in -6..6 {
+        for cv in -6..6 {
+            let (sx, sz, _) = home_column(&t, Face::PosY, cu * 16 + 8, cv * 16 + 8);
+            let h = t.height(sx, sz);
+            let (cx, cz) = (sx.div_euclid(16), sz.div_euclid(16));
             for cy in [h.div_euclid(16), h.div_euclid(16) + 1] {
                 let d = t.generate(cx, cy, cz);
                 for i in 0..CHUNK_VOLUME {
@@ -117,11 +134,15 @@ fn the_three_realms_have_their_features() {
     }
     assert!(trees > 0, "no tree trunk in 144 surface columns");
     // Mines: rails, planks and lamps at the mine levels; caves: air underground.
+    // Face chunks −1/−3/−5/−7 sit `rise/16` storage chunks up, because the rise is chunk-aligned.
+    let (sx0, sz0, _) = home_column(&t, Face::PosY, 0, 0);
+    let (cx0, cz0) = (sx0.div_euclid(16), sz0.div_euclid(16));
+    let mine_base = (rise / 16) as i32;
     let (mut rails, mut planks, mut lamps, mut cave_air) = (0, 0, 0, 0);
-    for cx in -20..20 {
-        for cz in -20..20 {
-            for cy in [-1, -3, -5, -7] {
-                let d = t.generate(cx, cy, cz);
+    for cu in -20..20 {
+        for cv in -20..20 {
+            for face_cy in [-1, -3, -5, -7] {
+                let d = t.generate(cx0 + cu, mine_base + face_cy, cz0 + cv);
                 if d.uniform().is_some() {
                     continue;
                 }
@@ -182,9 +203,10 @@ fn generated_surface_matter_lies_at_rest_when_disturbed() {
     // Wake every contact around a slab of surface and subsurface cells.
     for x in -24..24 {
         for z in -24..24 {
-            let h = t.height(x, z);
+            let (sx, sz, _) = home_column(&t, Face::PosY, x, z);
+            let h = t.height(sx, sz);
             for y in h - 6..h + 2 {
-                s.wake_cell((x, y, z));
+                s.wake_cell((sx, y, sz));
             }
         }
     }
@@ -277,8 +299,62 @@ fn chunk_of(p: [i64; 3]) -> (i32, i32, i32) {
     )
 }
 
+/// Storage `(x, z)` of face-local `(u, v)` on the start world's band 0, and `radius − r_lo`.
+fn home_column(t: &Terrain, face: Face, u: i32, v: i32) -> (i32, i32, i64) {
+    let atlas = t.storage.home_atlas().expect("the start world is charted");
+    let b = atlas.bands[0];
+    let half = b.n / 2;
+    let (i, j) = (half + i64::from(u), half + i64::from(v));
+    assert!((0..b.n).contains(&i) && (0..b.n).contains(&j), "({u},{v}) leaves the {face:?} chart");
+    let s = atlas.storage(Patch::Shell { band: 0, face }, [i, 0, j]);
+    (s[0] as i32, s[2] as i32, atlas.radius - b.r_lo)
+}
+
+/// Storage cell of a virtual-cube relative position, when it lands in band 0.
+fn home_rel_storage(t: &Terrain, rel: [i64; 3]) -> Option<(i32, i32, i32)> {
+    let atlas = t.storage.home_atlas()?;
+    let b = atlas.bands[0];
+    let half = b.n / 2;
+    let p = (i32::try_from(rel[0]).ok()?, i32::try_from(rel[1]).ok()?, i32::try_from(rel[2]).ok()?);
+    let face = cube::face_of(rel);
+    let (u, a, v) = FaceFrame::new(face).cell_to_local(p);
+    let h = i64::from(a) - half;
+    let i = half + i64::from(u);
+    let j = half + i64::from(v);
+    if !(0..b.n).contains(&i) || !(0..b.n).contains(&j) {
+        return None;
+    }
+    let y = h + atlas.radius - b.r_lo;
+    if !(0..b.r_hi - b.r_lo).contains(&y) {
+        return None;
+    }
+    let s = atlas.storage(Patch::Shell { band: 0, face }, [i, y, j]);
+    Some((s[0] as i32, s[1] as i32, s[2] as i32))
+}
+
+/// Virtual-cube relative position of a start-world band-0 storage cell.
+fn storage_to_rel(t: &Terrain, x: i32, y: i32, z: i32) -> Option<[i64; 3]> {
+    let atlas = t.storage.home_atlas()?;
+    let (patch, local) = atlas.locate([i64::from(x), i64::from(y), i64::from(z)])?;
+    let Patch::Shell { band: 0, face } = patch else { return None };
+    let b = atlas.bands[0];
+    let half = b.n / 2;
+    let off = super::datum_blocks(atlas, patch, local[0], local[2]);
+    let h = b.r_lo + local[1] - atlas.radius - i64::from(off);
+    let a = i32::try_from(half + h).ok()?;
+    let u = i32::try_from(local[0] - half).ok()?;
+    let v = i32::try_from(local[2] - half).ok()?;
+    Some(cube::local_to_rel(face, u, a, v))
+}
+
 /// Chunk containing the top solid cell at the centre of `body`'s `face`.
 fn face_centre_chunk(t: &Terrain, body: &cosmos::Body, face: Face) -> (i32, i32, i32) {
+    if body.kind == cosmos::Kind::Home {
+        let (sx, sz, _) = home_column(t, face, 0, 0);
+        let h = t.height(sx, sz);
+        assert_ne!(h, i32::MIN, "home {face:?} has no chart surface");
+        return (sx.div_euclid(16), (h - 1).div_euclid(16), sz.div_euclid(16));
+    }
     let half = cube::half_of(body);
     let centre = cube::centre_i32(body.centre).expect("cube centre fits i32");
     let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
@@ -322,10 +398,13 @@ fn assert_worker_matches(t: &Terrain, cx: i32, cy: i32, cz: i32) {
 fn home_plus_y_keeps_the_v3_field_near_spawn() {
     let (_reg, t) = make(42);
     let paint = t.paints[Face::PosY.index()].as_ref().expect("home +Y");
+    let (_, _, rise) = home_column(&t, Face::PosY, 0, 0);
     for x in [-4000, -80, 0, 8, 40, 1000, 9000] {
         for z in [-9000, -15, 0, 8, 77, 2500] {
-            assert_eq!(t.height(x, z), paint.shape.height(x, z), "({x},{z})");
-            assert!((MIN_GROUND..=MAX_GROUND).contains(&t.height(x, z)));
+            let (sx, sz, _) = home_column(&t, Face::PosY, x, z);
+            let face = (i64::from(t.height(sx, sz)) - rise) as i32;
+            assert_eq!(face, paint.shape.height(x, z), "({x},{z})");
+            assert!((MIN_GROUND..=MAX_GROUND).contains(&face));
         }
     }
 }
@@ -337,45 +416,53 @@ fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
     for face in Face::ALL {
         let (cx, cy, cz) = face_centre_chunk(&t, &home, face);
         let coord = ChunkCoord::new(cx, cy, cz);
-        assert_eq!(t.sky(coord), Sky::Axis(face), "home {face:?} centre sky");
+        // A chart's up is storage +Y, on every face.
+        assert_eq!(t.sky(coord), Sky::Axis(Face::PosY), "home {face:?} centre sky");
         assert_eq!(t.classify(coord), Classify::Mixed, "home {face:?} centre is crust");
         assert_chunk_matches(&t, cx, cy, cz);
     }
-    // Inside the rim blend, outside the sky's edge band: batched and blended.
-    let x = cosmos::HOME_HALF as i32 - 3_000;
-    let h = t.height(x, 0);
-    let (cx, cy, cz) = (x.div_euclid(16), h.div_euclid(16), 0);
+    // Inside the rim blend: batched and blended. The last in-chart column is the seam.
+    let half = cube::half_of(&home) as i32;
+    let (sx, sz, _) = home_column(&t, Face::PosY, half - 3_000, 0);
+    let h = t.height(sx, sz);
+    let (cx, cy, cz) = (sx.div_euclid(16), h.div_euclid(16), sz.div_euclid(16));
     assert_eq!(t.sky(ChunkCoord::new(cx, cy, cz)), Sky::Axis(Face::PosY));
     assert_chunk_matches(&t, cx, cy, cz);
-    let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: 0 }, 1..=0);
-    let lu = x.rem_euclid(16) as usize;
-    assert_eq!(hs[lu], t.height(x, 0));
+    let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, 1..=0);
+    let lu = sx.rem_euclid(16) as usize;
+    assert_eq!(hs[lu], t.height(sx, sz));
 
-    // The seam and the three-face corner are open (edge band) and still match.
-    let seam = cosmos::HOME_HALF as i32;
-    let hs = t.height(seam, 0);
-    assert_chunk_matches(&t, seam.div_euclid(16), hs.div_euclid(16), 0);
-    let hc = t.height(seam, seam);
-    assert_chunk_matches(&t, seam.div_euclid(16), hc.div_euclid(16), seam.div_euclid(16));
+    let (sx, sz, _) = home_column(&t, Face::PosY, half - 1, 0);
+    let hs = t.height(sx, sz);
+    assert_chunk_matches(&t, sx.div_euclid(16), hs.div_euclid(16), sz.div_euclid(16));
+    let (sx, sz, _) = home_column(&t, Face::PosY, half - 1, half - 1);
+    let hc = t.height(sx, sz);
+    assert_chunk_matches(&t, sx.div_euclid(16), hc.div_euclid(16), sz.div_euclid(16));
 
-    // Deep bulk, both the classify short-circuit and the column fill.
-    let deep_y: i32 = -1_000;
-    let (dx, dy, dz) = (0, deep_y.div_euclid(16), 0);
-    let deep = ChunkCoord::new(dx, dy, dz);
-    let id = match t.classify(deep) {
-        Classify::Uniform(id) => id,
-        other => panic!("deep chunk should be uniform, got {other:?}"),
-    };
-    assert_ne!(id, AIR);
-    assert_eq!(t.generate(dx, dy, dz).uniform(), Some(id));
-    assert_worker_matches(&t, dx, dy, dz);
+    // Deep bulk in band 0, both the classify short-circuit and the column fill.
+    let (sx, sz, rise) = home_column(&t, Face::PosY, 0, 0);
+    let deep_y = (rise - 2_000) as i32;
+    let mut found = None;
+    for (du, dv) in [(0, 0), (64, 0), (0, 80), (128, -40), (200, 200), (400, -90)] {
+        let (x, z, _) = home_column(&t, Face::PosY, du, dv);
+        let c = ChunkCoord::new(x.div_euclid(16), deep_y.div_euclid(16), z.div_euclid(16));
+        if let Classify::Uniform(id) = t.classify(c) {
+            if id != AIR {
+                found = Some((c, id));
+                break;
+            }
+        }
+    }
+    let (deep, id) = found.expect("a quiet deep band-0 chunk");
+    assert_eq!(t.generate(deep.x, deep.y, deep.z).uniform(), Some(id));
+    assert_worker_matches(&t, deep.x, deep.y, deep.z);
 
-    // Above every landmark on +Y. TREE_CLEAR rose so sky islands are still painted;
-    // world y=496 (chunk 31) is no longer above them.
-    let above = (cube::TREE_CLEAR + 15) / 16;
-    assert_eq!(t.classify(ChunkCoord::new(0, above, 0)), Classify::Uniform(AIR));
-    assert_eq!(t.generate(0, above, 0).uniform(), Some(AIR));
-    assert_worker_matches(&t, 0, above, 0);
+    // Above every landmark on +Y. The face altitude sits `rise` storage cells up.
+    let above = (rise / 16) as i32 + (cube::TREE_CLEAR + 15) / 16;
+    let (cx, cz) = (sx.div_euclid(16), sz.div_euclid(16));
+    assert_eq!(t.classify(ChunkCoord::new(cx, above, cz)), Classify::Uniform(AIR));
+    assert_eq!(t.generate(cx, above, cz).uniform(), Some(AIR));
+    assert_worker_matches(&t, cx, above, cz);
 
     // The outward face of the lower twin (the inner faces see each other).
     let mut twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
@@ -412,25 +499,43 @@ fn moon_surface_cell(t: &Terrain, moon: &cosmos::Body) -> (i32, i32, i32) {
 #[test]
 fn cube_edges_share_one_rim_and_the_ridge_is_solid() {
     let (_reg, t) = make(42);
-    let h = cosmos::HOME_HALF as i32;
-    for z in [0, 1_000, -8_000, h - 10] {
-        let dy = t.surface(Face::PosY, h, z);
-        let dx = t.surface(Face::PosX, 0, z);
-        assert_eq!(dy, dx - h, "edge z={z}");
-        assert!((MIN_GROUND..=MAX_GROUND).contains(&dy));
-        // One block past the square still belongs to this face (the rim is at least 6 tall)
-        // and rebuilds the same surface point.
-        assert_eq!(t.surface(Face::PosY, h + 1, z), dy, "wedge z={z}");
-        assert_ne!(t.voxel_at(h + dy - 1, dy - 1, z), AIR, "ridge solid z={z}");
-        assert_eq!(t.voxel_at(h + dy, dy + 30, z), AIR, "above the ridge z={z}");
+    let twin = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).expect("a twin");
+    let half = cube::half_of(&twin);
+    let hi = half as i32;
+    let centre = cube::centre_i32(twin.centre).expect("twin centre");
+    let (cu, _, cv) = FaceFrame::new(Face::PosY).cell_to_local(centre);
+    let (xu, _, xv) = FaceFrame::new(Face::PosX).cell_to_local(centre);
+    let ny = cube::normal_dot(twin.centre, Face::PosY);
+    let nx = cube::normal_dot(twin.centre, Face::PosX);
+    for v in [0, 1_000, -8_000, hi - 10] {
+        let dy = t.surface(Face::PosY, cu + hi, cv + v);
+        let dx = t.surface(Face::PosX, xu - hi, xv + v);
+        let hy = cube::face_h(half, ny, dy);
+        let hx = cube::face_h(half, nx, dx);
+        assert_eq!(hy, hx, "edge v={v}");
+        assert!((MIN_GROUND..=MAX_GROUND).contains(&hy));
+        // One block past the square still belongs to this face and rebuilds the same rim.
+        assert_eq!(t.surface(Face::PosY, cu + hi + 1, cv + v), dy, "wedge v={v}");
+        let solid = face_world(&twin, Face::PosY, hi, hy - 1, v);
+        assert_ne!(t.voxel_at(solid[0], solid[1], solid[2]), AIR, "ridge solid v={v}");
+        let above = face_world(&twin, Face::PosY, hi, hy + 30, v);
+        assert_eq!(t.voxel_at(above[0], above[1], above[2]), AIR, "above the ridge v={v}");
     }
-    let dy = t.surface(Face::PosY, h, h);
-    let dx = t.surface(Face::PosX, 0, h);
-    let dz = t.surface(Face::PosZ, h, 0);
-    assert_eq!(dy, dx - h, "corner +X");
-    assert_eq!(dy, dz - h, "corner +Z");
-    assert_ne!(t.voxel_at(h + dy - 1, dy - 1, h + dy - 1), AIR);
-    assert_eq!(t.voxel_at(h + dy, dy + 30, h + dy), AIR);
+    let dy = t.surface(Face::PosY, cu + hi, cv + hi);
+    let dx = t.surface(Face::PosX, xu - hi, xv + hi);
+    let hy = cube::face_h(half, ny, dy);
+    let hx = cube::face_h(half, nx, dx);
+    assert_eq!(hy, hx, "corner +X");
+    // The exact three-face corner has one owner. The other faces' `surface()` is empty.
+    // At inside = 0 every face blends to that shared rim.
+    for (face, ub, vb) in [(Face::PosY, half, half), (Face::PosX, -half, half), (Face::PosZ, half, -half)] {
+        let rim = cube::blend_height(0, cube::rim_seed(&twin), face, half, ub, vb);
+        assert_eq!(rim, hy, "{face:?} corner rim");
+    }
+    let solid = face_world(&twin, Face::PosY, hi, hy - 1, hi);
+    assert_ne!(t.voxel_at(solid[0], solid[1], solid[2]), AIR);
+    let above = face_world(&twin, Face::PosY, hi, hy + 30, hi);
+    assert_eq!(t.voxel_at(above[0], above[1], above[2]), AIR);
 }
 
 #[test]
@@ -469,6 +574,11 @@ fn classify_matches_what_generation_stores() {
     let (mx, my, mz) = chunk_of(moon.centre);
     let mut samples = samples.to_vec();
     samples.push(ChunkCoord::new(mx, my, mz));
+    let (sx, sz, rise) = home_column(&t, Face::PosY, 0, 0);
+    let h = t.height(sx, sz);
+    samples.push(ChunkCoord::new(sx.div_euclid(16), (h - 1).div_euclid(16), sz.div_euclid(16)));
+    let deep_y = (rise - 2_000) as i32;
+    samples.push(ChunkCoord::new(sx.div_euclid(16), deep_y.div_euclid(16), sz.div_euclid(16)));
     for c in samples {
         let data = t.generate(c.x, c.y, c.z);
         match t.classify(c) {
@@ -477,11 +587,16 @@ fn classify_matches_what_generation_stores() {
             Classify::Mixed => assert!(data.uniform().is_none() || data.uniform() == Some(AIR), "mixed {c:?}"),
         }
     }
-    // Face interior, edge band, empty space, a moon.
-    let y = t.height(8, 8).div_euclid(16);
-    assert_eq!(t.sky(ChunkCoord::new(0, y, 0)), Sky::Axis(Face::PosY));
-    let edge = cosmos::HOME_HALF as i32 - 100;
-    assert_eq!(t.sky(ChunkCoord::new(edge.div_euclid(16), 0, 0)), Sky::Open);
+    // Chart surface, a twin's edge band, empty space, a moon.
+    let y = h.div_euclid(16);
+    assert_eq!(t.sky(ChunkCoord::new(sx.div_euclid(16), y, sz.div_euclid(16))), Sky::Axis(Face::PosY));
+    let twin = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
+    let cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+    let edge = face_world(&twin, Face::PosY, half as i32 - 100, 0, 0);
+    assert_eq!(
+        t.sky(ChunkCoord::new(edge[0].div_euclid(16), edge[1].div_euclid(16), edge[2].div_euclid(16))),
+        Sky::Open
+    );
     assert_eq!(t.sky(ChunkCoord::new(0, 1_000, 0)), Sky::Open);
     assert_eq!(t.classify(ChunkCoord::new(0, 1_000, 0)), Classify::Air);
     assert_eq!(t.sky(ChunkCoord::new(mx, my, mz)), Sky::Open);
@@ -627,8 +742,12 @@ fn flowers_sit_on_the_meadow() {
                 id == m.flower_red || id == m.flower_yellow || id == m.flower_blue || id == m.flower_white,
                 "flower {id:?}"
             );
-            if !checked && t.voxel_at(x, col.height, z) == id {
-                checked = true;
+            if !checked {
+                let (sx, sz, rise) = home_column(&t, Face::PosY, x, z);
+                let y = (i64::from(col.height) + rise) as i32;
+                if t.voxel_at(sx, y, sz) == id {
+                    checked = true;
+                }
             }
         }
     }
@@ -1010,7 +1129,10 @@ fn cluster_classify_cost() {
     println!("{per:.1} µs per classify over {n} chunks ({mixed} mixed)");
 }
 
-fn world_of(body: &cosmos::Body, rel: [i64; 3]) -> (i32, i32, i32) {
+fn world_of(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> (i32, i32, i32) {
+    if body.kind == cosmos::Kind::Home {
+        return home_rel_storage(t, rel).unwrap_or_else(|| panic!("home cell {rel:?} is outside band 0"));
+    }
     (
         i32::try_from(body.centre[0] + rel[0]).unwrap(),
         i32::try_from(body.centre[1] + rel[1]).unwrap(),
@@ -1019,7 +1141,7 @@ fn world_of(body: &cosmos::Body, rel: [i64; 3]) -> (i32, i32, i32) {
 }
 
 fn chunk_matches_at(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) {
-    let (x, y, z) = world_of(body, rel);
+    let (x, y, z) = world_of(t, body, rel);
     assert_chunk_matches(t, x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
 }
 
@@ -1029,7 +1151,7 @@ fn find_air(t: &Terrain, body: &cosmos::Body, at: [i64; 3]) -> [i64; 3] {
         for dy in -2..=2 {
             for dx in -2..=2 {
                 let rel = [at[0] + dx * 8, at[1] + dy * 8, at[2] + dz * 8];
-                let (x, y, z) = world_of(body, rel);
+                let (x, y, z) = world_of(t, body, rel);
                 if t.voxel_at(x, y, z) == AIR {
                     return rel;
                 }
@@ -1040,30 +1162,30 @@ fn find_air(t: &Terrain, body: &cosmos::Body, at: [i64; 3]) -> [i64; 3] {
 }
 
 #[test]
-fn the_interior_is_batch_exact_and_the_heart_stays_when_deep_is_off() {
+fn the_interior_is_batch_exact_and_the_heart_is_below_band_0() {
     let (_reg, t) = make(42);
     let home = *t.cosmos.home();
     let cavern = t.deep.locate_cavern(&home).expect("a deep cavern");
     let air = find_air(&t, &home, cavern);
-    let (x, y, z) = world_of(&home, air);
+    let (x, y, z) = world_of(&t, &home, air);
     assert_eq!(t.voxel_at(x, y, z), AIR, "cavern air at {air:?}");
     chunk_matches_at(&t, &home, cavern);
 
     let hall = t.deep.locate_hall(&home).expect("a dwarf hall");
     chunk_matches_at(&t, &home, hall);
-    let (hx, hy, hz) = world_of(&home, hall);
+    let (hx, hy, hz) = world_of(&t, &home, hall);
     assert_eq!(t.voxel_at(hx, hy, hz), AIR, "hall centre is the room");
 
     let chamber = t.deep.locate_chamber(&home).expect("an underdark chamber");
     let chamber_air = find_air(&t, &home, chamber);
     chunk_matches_at(&t, &home, chamber);
-    let (cx, cy, cz) = world_of(&home, chamber_air);
+    let (cx, cy, cz) = world_of(&t, &home, chamber_air);
     assert_eq!(t.voxel_at(cx, cy, cz), AIR, "chamber air");
 
     let (bubble, r) = t.deep.locate_bubble(&home).expect("a mantle bubble");
     let mut inside = bubble;
     inside[0] += r / 2;
-    let (bx, by, bz) = world_of(&home, inside);
+    let (bx, by, bz) = world_of(&t, &home, inside);
     assert_eq!(t.voxel_at(bx, by, bz), AIR, "bubble interior r={r}");
     chunk_matches_at(&t, &home, inside);
     let mut bulk_outside = false;
@@ -1071,7 +1193,7 @@ fn the_interior_is_batch_exact_and_the_heart_stays_when_deep_is_off() {
         for sign in [-1i64, 1] {
             let mut rel = bubble;
             rel[axis] += sign * (r + 3);
-            let (ox, oy, oz) = world_of(&home, rel);
+            let (ox, oy, oz) = world_of(&t, &home, rel);
             if t.voxel_at(ox, oy, oz) == cube::bulk_id(&t.bulk, &home, rel) {
                 bulk_outside = true;
             }
@@ -1079,31 +1201,45 @@ fn the_interior_is_batch_exact_and_the_heart_stays_when_deep_is_off() {
     }
     assert!(bulk_outside, "a block just outside the bubble is still bulk");
 
-    // The core, a floating cell of the Heart, and a face-centre shaft.
-    let (kx, ky, kz) = world_of(&home, [0, 0, 0]);
-    assert_eq!(t.voxel_at(kx, ky, kz), t.materials().core);
-    chunk_matches_at(&t, &home, [0, 0, 0]);
-    let shaft = [0, 50_100, 0];
-    let (sx, sy, sz) = world_of(&home, shaft);
-    assert_eq!(t.voxel_at(sx, sy, sz), AIR, "heart shaft");
-    let beside = [20, 50_100, 0];
-    let (px, py, pz) = world_of(&home, beside);
-    assert_eq!(t.voxel_at(px, py, pz), cube::bulk_id(&t.bulk, &home, beside));
-    chunk_matches_at(&t, &home, shaft);
+    // The Heart and its shaft sit below band 0 (the virtual cube's centre is not on a chart).
+    // The core box is the uniform home fill, with or without the interior.
+    assert!(home_rel_storage(&t, [0, 0, 0]).is_none(), "the Heart is below band 0");
+    let atlas = t.storage.home_atlas().expect("charted");
+    let inner = atlas.inner.expect("a core");
+    let core = atlas.storage(Patch::Core, [inner.core_half, inner.core_half, inner.core_half]);
+    assert_eq!(t.voxel_at(core[0] as i32, core[1] as i32, core[2] as i32), t.storage.home_fill());
 
-    // `deep = 0` removes the density-scaled hollows. The Heart does not scale.
     let mut reg = BlockRegistry::with_builtins();
     let off = Terrain::with_cfg(&mut reg, 42, TerrainCfg { deep: 0, ..TerrainCfg::default() });
     assert_ne!(off.voxel_at(x, y, z), AIR, "deep=0 left the cavern hollow");
     assert_eq!(off.voxel_at(x, y, z), cube::bulk_id(&off.bulk, &home, air));
-    let (hx0, hy0, hz0) = world_of(&home, [0, 1_000, 0]);
-    assert_eq!(off.voxel_at(hx0, hy0, hz0), AIR, "the Heart stays hollow at deep=0");
-    assert_eq!(off.voxel_at(kx, ky, kz), off.materials().core);
+    assert_eq!(off.voxel_at(core[0] as i32, core[1] as i32, core[2] as i32), off.storage.home_fill());
 }
 
 fn emissive(t: &Terrain, id: BlockId) -> bool {
     let m = t.materials();
     id == m.lamp || id == m.glowcap || id == m.glowshroom || id == m.magma || id == m.star || id == m.core
+}
+
+/// An air cell of the feature. A site centre can sit just past its depth band, where the
+/// painter leaves bulk; the carved cap is a short walk along the face normal.
+fn carved_air(t: &Terrain, body: &cosmos::Body, center: [i64; 3]) -> [i64; 3] {
+    let up = deep::Up::of(center);
+    let half = cube::half_of(body);
+    for delta in 0..400 {
+        for sign in [1i64, -1] {
+            if delta == 0 && sign < 0 {
+                continue;
+            }
+            let mut rel = center;
+            rel[up.axis] += sign * delta * i64::from(up.sign);
+            let Some((x, y, z)) = home_rel_storage(t, rel) else { continue };
+            if t.voxel_at(x, y, z) == AIR && cube::in_deep(rel, half) {
+                return rel;
+            }
+        }
+    }
+    panic!("no carved air near {center:?}");
 }
 
 /// First solid inward of `center` after an air cell, and that air cell.
@@ -1117,7 +1253,7 @@ fn inward_shell(t: &Terrain, body: &cosmos::Body, center: [i64; 3]) -> ([i64; 3]
     let mut saw_air = false;
     let mut step = 1i64;
     for _ in 0..4_000 {
-        let (x, y, z) = world_of(body, rel);
+        let (x, y, z) = world_of(t, body, rel);
         let id = t.voxel_at(x, y, z);
         if id == AIR {
             saw_air = true;
@@ -1130,7 +1266,7 @@ fn inward_shell(t: &Terrain, body: &cosmos::Body, center: [i64; 3]) -> ([i64; 3]
             for _ in 0..step {
                 let mut next = fine;
                 next[up.axis] -= i64::from(up.sign);
-                let (x, y, z) = world_of(body, next);
+                let (x, y, z) = world_of(t, body, next);
                 if t.voxel_at(x, y, z) != AIR {
                     return (next, fine);
                 }
@@ -1147,7 +1283,7 @@ fn inward_shell(t: &Terrain, body: &cosmos::Body, center: [i64; 3]) -> ([i64; 3]
 fn match_cells(t: &Terrain, body: &cosmos::Body, cells: &[[i64; 3]]) {
     let mut seen = Vec::new();
     for &rel in cells {
-        let (x, y, z) = world_of(body, rel);
+        let (x, y, z) = world_of(t, body, rel);
         let key = (x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
         if seen.contains(&key) {
             continue;
@@ -1159,21 +1295,24 @@ fn match_cells(t: &Terrain, body: &cosmos::Body, cells: &[[i64; 3]]) {
 
 /// An emissive cell in the chunk, if the shell dressing landed in this 16-block box.
 fn light_in_chunk(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> Option<[i64; 3]> {
-    let (x, y, z) = world_of(body, rel);
+    let (x, y, z) = world_of(t, body, rel);
     let n = CHUNK_SIZE as i32;
     let (cx, cy, cz) = (x.div_euclid(n), y.div_euclid(n), z.div_euclid(n));
     let data = t.generate(cx, cy, cz);
-    let c = body.centre;
     for ly in 0..CHUNK_SIZE {
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 if !emissive(t, data.get(Chunk::index(lx, ly, lz))) {
                     continue;
                 }
-                let wx = i64::from(cx * n + lx as i32);
-                let wy = i64::from(cy * n + ly as i32);
-                let wz = i64::from(cz * n + lz as i32);
-                return Some([wx - c[0], wy - c[1], wz - c[2]]);
+                let wx = cx * n + lx as i32;
+                let wy = cy * n + ly as i32;
+                let wz = cz * n + lz as i32;
+                if body.kind == cosmos::Kind::Home {
+                    return storage_to_rel(t, wx, wy, wz);
+                }
+                let c = body.centre;
+                return Some([i64::from(wx) - c[0], i64::from(wy) - c[1], i64::from(wz) - c[2]]);
             }
         }
     }
@@ -1198,7 +1337,7 @@ fn interior_lights_cover_the_floor_and_match_per_voxel() {
         let frac = cover_frac(c);
         println!("cavern kind {} r {} floor {} near {} frac {frac:.3}", c.kind, c.r, c.floor, c.near);
         assert!(frac >= 0.60, "kind {} coverage {frac}", c.kind);
-        let (solid, air) = inward_shell(&t, &home, c.center);
+        let (solid, air) = inward_shell(&t, &home, carved_air(&t, &home, c.center));
         match_cells(&t, &home, &[solid, air]);
         let (a, b) = match c.up_axis {
             0 => (1, 2),
@@ -1224,7 +1363,7 @@ fn interior_lights_cover_the_floor_and_match_per_voxel() {
     let frac = cover_frac(&chamber);
     println!("chamber r {} floor {} near {} frac {frac:.3}", chamber.r, chamber.floor, chamber.near);
     assert!(frac >= 0.60, "chamber coverage {frac}");
-    let (solid, air) = inward_shell(&t, &home, chamber.center);
+    let (solid, air) = inward_shell(&t, &home, carved_air(&t, &home, chamber.center));
     match_cells(&t, &home, &[solid, air]);
 
     let halls = t.deep.survey_halls(&home, 4);
@@ -1235,78 +1374,42 @@ fn interior_lights_cover_the_floor_and_match_per_voxel() {
         assert!(frac >= 0.60, "hall coverage {frac}");
     }
     let hall = t.deep.locate_hall(&home).expect("hall");
-    let (solid, air) = inward_shell(&t, &home, hall);
+    let (solid, air) = inward_shell(&t, &home, carved_air(&t, &home, hall));
     match_cells(&t, &home, &[solid, air]);
 
     let mut reg = BlockRegistry::with_builtins();
     let off = Terrain::with_cfg(&mut reg, 42, TerrainCfg { deep: 0, ..TerrainCfg::default() });
-    let (x, y, z) = world_of(&home, rel);
+    let (x, y, z) = world_of(&t, &home, rel);
     assert_eq!(off.voxel_at(x, y, z), cube::bulk_id(&off.bulk, &home, rel), "deep=0 left a floor light");
 }
 
 #[test]
 fn interior_porosity_barely_moves_spawn_gravity() {
-    use crate::gravity::{Field, Primitive, Shape};
+    use crate::gravity::{Field, Primitive};
     use crate::math::BLOCK_METERS;
+    // Home is a ball. Mantle bubbles live in the virtual cube and only the part inside band 0 is
+    // carved, so the oracle stays the solid ball (plus the relief error near the surface).
     let cosmos = std::sync::Arc::new(cosmos::Cosmos::with_deep(7, 1.0, 1.0));
-    let field = Field::new(cosmos);
-    let at = glam::DVec3::new(0.5, 70.0, 0.5);
-    let after = field.sample(at).accel.length() * BLOCK_METERS;
-    let c = cosmos::HOME_CENTRE;
-    let h = cosmos::HOME_HALF as f64;
+    let field = Field::new(cosmos.clone());
+    let home = cosmos.home();
+    let cosmos::Shape::Ball { r } = home.shape else { panic!("home is a ball") };
+    let at = glam::DVec3::new(0.0, 2.0, 0.0);
+    let sample = field.sample(at);
     let solid = Primitive::new(
-        Shape::Box {
-            lo: glam::DVec3::new(c[0] as f64 - h, c[1] as f64 - h, c[2] as f64 - h),
-            hi: glam::DVec3::new(c[0] as f64 + h, c[1] as f64 + h, c[2] as f64 + h),
-        },
+        crate::gravity::Shape::Ball { c: home.centre_f(), r: r as f64 },
         cosmos::BULK_DENSITY,
     );
-    let before = (solid.field(at).0 * crate::gravity::G).length() * BLOCK_METERS;
-    let (phi_d, phi_u) = deep::porosity(1.0);
-    println!("spawn gravity before {before:.6} m/s² after {after:.6} m/s² (deep porosity {phi_d:.6}, under {phi_u:.6})");
-    assert!((before - 24.0).abs() < 0.01 * 24.0, "solid spawn {before}");
-    assert!((after - 24.0).abs() < 0.01 * 24.0, "interior spawn {after}");
-    assert!((after - before).abs() < 0.01 * 24.0, "voids moved spawn by {}", after - before);
-
-    let centre = glam::DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64);
-    let centre_pull = field.sample(centre).accel.length() * BLOCK_METERS;
+    let want = solid.field(at).0 * crate::gravity::G;
+    let after = sample.accel.length() * BLOCK_METERS;
+    let before = want.length() * BLOCK_METERS;
+    let to_centre = home.centre_f() - at;
+    let dot = sample.accel.dot(to_centre) / (sample.accel.length() * to_centre.length());
+    println!("spawn gravity solid {before:.4} m/s² charted {after:.4} m/s² dot {dot:.6}");
+    assert!(dot > 0.999, "pull points at the centre: {dot}");
+    assert!((after - before).abs() < 0.05 * before, "interior moved spawn: {after} vs {before}");
+    let centre_pull = field.sample(home.centre_f()).accel.length() * BLOCK_METERS;
     println!("planet centre pull {centre_pull:.6} m/s²");
     assert!(centre_pull < 0.05, "centre is not weightless: {centre_pull}");
-
-    // Inside a bubble the removed ball cancels the cube's linear gradient.
-    let (_reg, t) = make(42);
-    let home = *t.cosmos.home();
-    let (rel, r) = t.deep.locate_bubble(&home).expect("bubble");
-    let p0 = glam::DVec3::new(
-        (home.centre[0] + rel[0]) as f64,
-        (home.centre[1] + rel[1]) as f64,
-        (home.centre[2] + rel[2]) as f64,
-    );
-    // A negative ball cancels the cube's divergence inside the cavity, so the field there is the
-    // cube's tide: nearly constant across a bubble that is small next to the planet.
-    let carved = Field::new(t.mass());
-    let g0 = carved.sample(p0).accel;
-    let mut trace_void = 0.0;
-    let mut trace_solid = 0.0;
-    let mut worst = 0.0f64;
-    for axis in 0..3 {
-        let mut step = glam::DVec3::ZERO;
-        step[axis] = 0.4 * r as f64;
-        let p1 = p0 + step;
-        let d_void = carved.sample(p1).accel - g0;
-        let d_solid = (solid.field(p1).0 - solid.field(p0).0) * crate::gravity::G;
-        trace_void += d_void[axis];
-        trace_solid += d_solid[axis];
-        worst = worst.max(d_void.length());
-    }
-    let g_ms = g0.length() * BLOCK_METERS;
-    let worst_ms = worst * BLOCK_METERS;
-    println!(
-        "bubble r={r} field {g_ms:.4} m/s², tide across 0.4r {worst_ms:.4} m/s² (div void {trace_void:.6} solid {trace_solid:.6})"
-    );
-    assert!(trace_solid.abs() > 1.0e-4, "solid divergence {trace_solid}");
-    assert!(trace_void.abs() < trace_solid.abs() * 0.05, "cavity divergence {trace_void} vs {trace_solid}");
-    assert!(worst_ms < 0.05, "bubble tide {worst_ms} m/s²");
 }
 
 #[test]
@@ -1327,7 +1430,8 @@ fn quiet_deep_chunks_stay_uniform() {
             if !cube::in_deep(rel, half) {
                 continue;
             }
-            let (x, y, z) = world_of(&home, rel);
+            // Deeper than band 0 the chart does not paint this cell.
+            let Some((x, y, z)) = home_rel_storage(&t, rel) else { continue };
             let class = t.classify(ChunkCoord::new(x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)));
             n += 1;
             if matches!(class, Classify::Uniform(_)) {
@@ -1341,8 +1445,18 @@ fn quiet_deep_chunks_stay_uniform() {
     assert!(rate >= 0.95, "uniform hit rate {rate} ({uniform}/{n})");
 }
 
-/// World cell of face-local `(u, h, v)`. `h` is altitude above the face plane.
-fn face_cell(body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> (i32, i32, i32) {
+/// Storage cell of a chart column, or the world cell of a cube face column.
+/// `h` is altitude above the face plane.
+fn face_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> (i32, i32, i32) {
+    if body.kind == cosmos::Kind::Home {
+        let (sx, sz, rise) = home_column(t, face, u, v);
+        let atlas = t.storage.home_atlas().expect("the start world is charted");
+        let half = atlas.bands[0].n / 2;
+        let patch = Patch::Shell { band: 0, face };
+        let off = super::datum_blocks(atlas, patch, half + i64::from(u), half + i64::from(v));
+        let y = i64::from(h) + rise + i64::from(off);
+        return (sx, y as i32, sz);
+    }
     let half = cube::half_of(body);
     let a = i32::try_from(half + i64::from(h)).expect("altitude");
     let (x, y, z) = FaceFrame::new(face).cell_to_world((u, a, v));
@@ -1354,9 +1468,11 @@ fn face_cell(body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> (i32, i
 }
 
 fn agree_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) {
-    let (x, y, z) = face_cell(body, face, u, h, v);
+    let (x, y, z) = face_cell(t, body, face, u, h, v);
     let coord = ChunkCoord::new(x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
-    assert_eq!(t.sky(coord), Sky::Axis(face), "landmark chunk {coord:?} on {face:?} uses the batch path");
+    // A chart's up is storage +Y on every face. A cube keeps the face's own sky.
+    let sky = if body.kind == cosmos::Kind::Home { Face::PosY } else { face };
+    assert_eq!(t.sky(coord), Sky::Axis(sky), "landmark chunk {coord:?} on {face:?} uses the batch path");
     assert_chunk_matches(t, coord.x, coord.y, coord.z);
 }
 
@@ -1495,16 +1611,19 @@ fn features_knob_at_zero_plants_nothing() {
 fn landmarks_skip_the_cube_edge_band() {
     let (_reg, t) = make(42);
     let m = t.materials();
-    let x0 = cosmos::HOME_HALF as i32 - 80;
+    let home = *t.cosmos.home();
+    let u = cube::half_of(&home) as i32 - 80;
     let allowed = [
         AIR, m.timber, m.leaves, m.pine, m.autumn, m.blossom, m.flower_red, m.flower_yellow, m.flower_blue,
         m.flower_white,
     ];
-    for z in (-24..24).step_by(2) {
-        let h = t.height(x0, z);
+    for v in (-24..24).step_by(2) {
+        let (sx, sz, _) = home_column(&t, Face::PosY, u, v);
+        let h = t.height(sx, sz);
+        assert_ne!(h, i32::MIN, "rim column ({u},{v}) has no surface");
         for y in h..h + 40 {
-            let id = t.voxel_at(x0, y, z);
-            assert!(allowed.contains(&id), "edge cell ({x0},{y},{z}) is not a tree or flower");
+            let id = t.voxel_at(sx, y, sz);
+            assert!(allowed.contains(&id), "edge cell ({sx},{y},{sz}) is not a tree or flower");
         }
     }
 }
@@ -1846,7 +1965,7 @@ fn structures_own_their_footprint_and_match_the_batch() {
             break;
         }
         agree_cell(&t, &home, Face::PosY, f.x, f.pad, f.z);
-        let (wx, wy, wz) = face_cell(&home, Face::PosY, f.x, f.pad, f.z);
+        let (wx, wy, wz) = face_cell(&t, &home, Face::PosY, f.x, f.pad, f.z);
         let id = t.voxel_at(wx, wy, wz);
         let g = paint.shape.column(f.x, f.z).height;
         if let Some(st) = structure_stamp(paint, f.x, f.pad, f.z, g) {
@@ -1996,10 +2115,10 @@ fn fill_face_us(t: &Terrain, coord: ChunkCoord, reps: usize) -> Option<f64> {
     }
     let tree_blocks = paint.trees.blocks_in(&paint.shape, u0, v0, CHUNK_SIZE as i32);
     let h0 = cube::face_h(half, n_dot, FaceFrame::new(face).chunk_alt0(coord));
-    let _ = t.fill_face(&body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks);
+    let _ = t.fill_face::<false>(&body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks);
     let start = std::time::Instant::now();
     for _ in 0..reps {
-        std::hint::black_box(t.fill_face(&body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks));
+        std::hint::black_box(t.fill_face::<false>(&body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks));
     }
     Some(start.elapsed().as_secs_f64() * 1e6 / reps as f64)
 }
@@ -2080,5 +2199,136 @@ fn interior_light_report() {
     }
     if fill_n > 0 {
         println!("fill_face mean {:.1} µs/chunk over {fill_n}", fill_sum / f64::from(fill_n));
+    }
+}
+
+/// The face painter's rim is one height from both sides of a chart edge, and the painted
+/// columns just inside the edge stay within a block of each other.
+#[test]
+fn home_chart_terrain_is_continuous_across_a_seam() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let half = cube::half_of(&home);
+    let seed = cube::rim_seed(&home);
+    for v in [0i64, 1_000, -8_000, half / 3] {
+        let y_rim = cube::blend_height(0, seed, Face::PosY, half, half, v);
+        let x_rim = cube::blend_height(400, seed, Face::PosX, half, -half, v);
+        assert_eq!(y_rim, x_rim, "exact rim at v={v}");
+    }
+    let atlas = t.storage.home_atlas().expect("charted");
+    let b = &atlas.bands[0];
+    let top = Patch::Shell { band: 0, face: Face::PosY };
+    let rise = atlas.radius - b.r_lo;
+    for j in [b.n / 4, b.n / 2, 3 * b.n / 4] {
+        let here_s = atlas.storage(top, [b.n - 1, 0, j]);
+        let here = t.height(here_s[0] as i32, here_s[2] as i32);
+        assert_ne!(here, i32::MIN, "last +Y column j={j}");
+        let outside = atlas.storage(top, [b.n, here as i64, j]);
+        let glued = atlas.glue(outside).expect("seam glue");
+        let (patch, _) = atlas.locate(glued).expect("neighbour chart");
+        assert!(matches!(patch, Patch::Shell { band: 0, face: Face::PosX }), "{patch:?} at j={j}");
+        let there = t.height(glued[0] as i32, glued[2] as i32);
+        let step = (here as i64 - rise) - (there as i64 - rise);
+        assert!(step.abs() <= 1, "seam step at j={j}: {here} vs {there} (rise {rise})");
+    }
+}
+
+/// Physical spawn is the +Y chart's centre column, two blocks above its first open cell,
+/// and gravity there points at the planet's centre.
+#[test]
+fn home_spawn_stands_on_the_plus_y_chart() {
+    use crate::gravity::Field;
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let cosmos::Shape::Ball { .. } = home.shape else { panic!("home is a ball") };
+    let spawn = t.home_spawn().expect("chart spawn");
+    assert!(spawn.x.abs() < 2.0 && spawn.z.abs() < 2.0, "spawn xz {spawn:?}");
+    assert!(spawn.y > 2.0 && spawn.y < 600.0, "spawn y {}", spawn.y);
+    let field = Field::new(t.mass());
+    let pull = field.sample(spawn);
+    let to_centre = home.centre_f() - spawn;
+    let dot = pull.accel.dot(to_centre) / (pull.accel.length() * to_centre.length());
+    assert!(dot > 0.999, "gravity at spawn points at the centre: {dot}");
+    let atlas = t.storage.home_atlas().expect("charted");
+    let cell = atlas.storage_of(spawn).expect("spawn embeds onto the chart");
+    let (patch, local) = atlas.locate(cell).expect("located");
+    assert!(matches!(patch, Patch::Shell { band: 0, face: Face::PosY }), "{patch:?}");
+    let open = i64::from(t.height(cell[0] as i32, cell[2] as i32));
+    assert!((1..=2).contains(&(local[1] - open)), "feet at local {} open {open}", local[1]);
+    assert_ne!(t.voxel_at(cell[0] as i32, (open - 1) as i32, cell[2] as i32), AIR, "standing on air");
+    assert_eq!(t.voxel_at(cell[0] as i32, open as i32, cell[2] as i32), AIR, "the first open cell is solid");
+}
+
+/// A smooth datum of a few hundred blocks lifts the painted surface by that offset.
+/// The column query, the far-LOD column and the far-LOD bounds all move together.
+#[test]
+fn datum_offset_raises_the_home_surface() {
+    use crate::space::datum::DatumField;
+    use crate::world::section::CHART_BODY_BASE;
+    let (_reg, mut t) = make(42);
+    let atlas = t.storage.home_atlas().expect("charted").clone();
+    let b = &atlas.bands[0];
+    let half = b.n / 2;
+    let patch = Patch::Shell { band: 0, face: Face::PosY };
+    let samples = [(0i32, 0i32), (8_000, -3_000), ((half - 5_000) as i32, 1_200), (-4_000, (5_000 - half) as i32)];
+    let mut before = Vec::new();
+    let mut cols = Vec::new();
+    for &(u, v) in &samples {
+        let (sx, sz, _) = home_column(&t, Face::PosY, u, v);
+        before.push(t.height(sx, sz));
+        cols.push((sx, sz));
+    }
+    let x0 = cols.iter().map(|c| c.0).min().unwrap();
+    let z0 = cols.iter().map(|c| c.1).min().unwrap();
+    let span = cols.iter().map(|c| (c.0 - x0).max(c.1 - z0)).max().unwrap() + 1;
+    let body = CHART_BODY_BASE + t.storage.home_index().expect("index") as u16;
+    let (lo0, hi0) = t.surface_bounds(body, Face::PosY, x0, z0, span).expect("bounds");
+    let radius = atlas.radius as f64;
+    t.set_home_datum(std::sync::Arc::new(DatumField::sample(17, radius, |d| radius + 200.0 + 80.0 * d.y)));
+    let (lo1, hi1) = t.surface_bounds(body, Face::PosY, x0, z0, span).expect("raised bounds");
+    assert!(lo1 >= lo0 + 100 && hi1 >= hi0 + 100, "bounds {lo0}..{hi0} did not rise ({lo1}..{hi1})");
+    assert!(lo1 - lo0 <= 320 && hi1 - hi0 <= 320, "bounds rose too far: {lo0}..{hi0} -> {lo1}..{hi1}");
+    let mut offsets = Vec::new();
+    for (k, &(u, v)) in samples.iter().enumerate() {
+        let (sx, sz) = cols[k];
+        let off = super::datum_blocks(t.storage.home_atlas().expect("charted"), patch, half + i64::from(u), half + i64::from(v));
+        offsets.push(off);
+        let y = t.height(sx, sz);
+        assert_eq!(y as i64, before[k] as i64 + i64::from(off), "({u},{v}) off {off}");
+        assert_eq!(t.surface(Face::PosY, sx, sz), y);
+        assert!(y >= lo1 && y <= hi1, "surface {y} outside {lo1}..{hi1}");
+        let ys = [y - 1, y, y + 4];
+        let mut out = [AIR; 3];
+        t.lod_column(sx, sz, &ys, &mut out);
+        assert_ne!(out[0], AIR, "lod ground at ({u},{v})");
+        assert_eq!(out[1], AIR, "lod at the raised surface");
+        assert_eq!(out[2], AIR, "lod above");
+    }
+    assert!(offsets.iter().any(|&o| o != offsets[0]), "the field did not vary: {offsets:?}");
+    assert!(offsets.iter().all(|&o| (100..400).contains(&o)), "offsets {offsets:?}");
+}
+
+/// Release cost of painting one home chart chunk. Debug skips it.
+///
+/// `cargo test --release --lib home_chart_chunk_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn home_chart_chunk_cost() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let half = cube::half_of(&home) as i32;
+    let spots = [(Face::PosY, 0, 0), (Face::PosX, 0, 0), (Face::PosY, half - 8, 0)];
+    for (face, u, v) in spots {
+        let (sx, sz, _) = home_column(&t, face, u, v);
+        let h = t.height(sx, sz);
+        let (cx, cy, cz) = (sx.div_euclid(16), (h - 1).div_euclid(16), sz.div_euclid(16));
+        let _ = t.generate(cx, cy, cz);
+        let reps = 6;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(t.generate(cx, cy, cz));
+        }
+        let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        println!("home chart {face:?} chunk ({cx},{cy},{cz}) {us:.1} µs");
     }
 }

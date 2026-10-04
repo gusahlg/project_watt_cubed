@@ -540,8 +540,11 @@ impl Game {
     /// player standing on the surface at the origin.
     pub fn scripted(seed: u64, render: crate::render_config::RenderConfig) -> Game {
         let world = World::with_kind(seed as i64, render, crate::world::generation::WorldgenKind::Diffusion, true);
-        let ground = world.surface_y(0, 0);
-        let mut player = Player::new(DVec3::new(0.5, ground as f64 + 3.0, 0.5));
+        let pos = world.chart_spawn().unwrap_or_else(|| {
+            let ground = world.surface_y(0, 0);
+            DVec3::new(0.5, ground as f64 + 3.0, 0.5)
+        });
+        let mut player = Player::new(pos);
         player.stand_in(world.gravity_at(player.position).accel);
         let mut g = Game::new(world, player, "scripted".to_string());
         g.scripted = true;
@@ -1847,9 +1850,11 @@ mod tests {
         assert_eq!(game.sky_altitude(DVec3::new(12.0, 40.0, -3.0)), 40.0);
         let world = World::with_kind(1, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, false);
         let game = Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "alt".into());
-        // So is the home cube's +Y face.
-        assert_eq!(game.sky_altitude(DVec3::new(12.0, 40.0, -3.0)), 40.0);
+        // Altitude above the start world's datum (a sphere; the old cube face was y = 0).
         let cosmos = game.world.terrain().cosmos().expect("a cosmos");
+        let eye = DVec3::new(12.0, 40.0, -3.0);
+        let home = cosmos.home();
+        assert!((game.sky_altitude(eye) - home.altitude(eye)).abs() < 1e-6);
         let verdance = cosmos
             .bodies()
             .iter()

@@ -588,10 +588,17 @@ mod tests {
         let cfg = TerrainCfg { relief: 150, caves: 50, mines: 200, space: 0, ..Default::default() };
         let world = make_world(99, WorldgenKind::Diffusion, cfg);
         assert_eq!(world.worldgen(), WorldgenKind::Diffusion);
-        let cy = world.surface_y(0, 0).div_euclid(CHUNK_SIZE as i32);
-        let chunks = [(0, cy, 0), (1, cy, 0), (0, cy, 1)];
+        let spawn = world.chart_spawn().expect("a charted start world");
+        let cell = world.terrain().atlases().iter().find_map(|a| a.storage_of(spawn)).expect("spawn storage");
+        let ground = world.terrain().height(cell[0] as i32, cell[2] as i32) - 1;
+        let (cx, cy, cz) = (
+            (cell[0] as i32).div_euclid(CHUNK_SIZE as i32),
+            ground.div_euclid(CHUNK_SIZE as i32),
+            (cell[2] as i32).div_euclid(CHUNK_SIZE as i32),
+        );
+        let chunks = [(cx, cy, cz), (cx + 1, cy, cz), (cx, cy, cz + 1)];
         let before: Vec<_> = chunks.iter().map(|&c| dump_chunk(&world, c.0, c.1, c.2)).collect();
-        assert!(before.iter().any(|c| c.iter().any(|&id| id != AIR)), "pregenerated origin must contain terrain");
+        assert!(before.iter().any(|c| c.iter().any(|&id| id != AIR)), "the spawn chart chunk must contain terrain");
 
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
         // The diffusion mod OFF: the save header, not the mod flag, decides the generator on load.

@@ -74,9 +74,9 @@ const HEADER_LEN_V9: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN_V9 + material::S
 pub const HEADER_LEN: usize = HEADER_LEN_PRE_LAW + material::STAMP_LEN;
 /// `WorldgenKind::Diffusion` on disk. A v9 Diffusion world from before the cube planets is refused.
 const KIND_DIFFUSION: u8 = 1;
-/// The first released InfiniteDiffusion generator of the cube-planet universe (worldgen 7 was
-/// never released: its worlds lack the landmarks and the interior).
-const FIRST_CUBE_PLANET_WORLDGEN: u16 = 8;
+/// The first InfiniteDiffusion generator whose start world is the charted ball (worldgen 8 and
+/// earlier were never released: 7 lacks the landmarks, 8 still paints home as a physical cube).
+const FIRST_CUBE_PLANET_WORLDGEN: u16 = 9;
 
 /// Knob value a v9 stamp (four knobs) pads the four new ones with.
 const KNOB_DEFAULT: u16 = 100;
@@ -473,8 +473,8 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let worldgen_version = u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap());
     let off = HEADER_LEN_V5;
     let kind = bytes[off];
-    // Diffusion worlds before the first released cube-planet generator predate its universe (v9
-    // saves, v10 saves written while the generator was still v3, and unreleased worldgen 7 builds).
+    // Diffusion worlds from before the charted start world predate this universe (v9 saves, v10
+    // saves written while the generator was still a physical home cube, worldgen 8 and earlier).
     // Flat worlds from the same era load.
     if kind == KIND_DIFFUSION && worldgen_version < FIRST_CUBE_PLANET_WORLDGEN {
         return Err(SaveError::BeforeCubePlanet);
@@ -642,7 +642,7 @@ mod tests {
 
     fn sample() -> SaveDoc {
         SaveDoc {
-            worldgen_version: 8,
+            worldgen_version: 9,
             worldgen: WorldgenStamp::default(),
             law_stamp: material::Law::current().stamp(),
             meta: SaveMeta {
@@ -992,6 +992,8 @@ mod tests {
         doc.worldgen_version = 7;
         assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
         doc.worldgen_version = 8;
+        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
+        doc.worldgen_version = 9;
         assert!(matches!(decode(&encode(&doc).unwrap()).unwrap(), Decoded::Intact(_)));
     }
 

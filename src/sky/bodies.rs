@@ -215,7 +215,7 @@ fn twin_faces(ordinal: u32) -> [LinearRgb; 6] {
 
 fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb) {
     match body.kind {
-        Kind::Home => (FarShape::Cube, home_faces(), black()),
+        Kind::Home => (FarShape::Sphere, home_faces(), black()),
         Kind::Twin => (FarShape::Cube, twin_faces(twin_ordinal), black()),
         // Meadow and forest green: Verdance has no seas.
         Kind::Verdant => (
@@ -308,7 +308,7 @@ mod tests {
     use crate::alloc_count;
     use crate::block::registry::BlockRegistry;
     use crate::world::generation::FlatTerrain;
-    use crate::world::terrain::cosmos::{Kind, HOME_HALF};
+    use crate::world::terrain::cosmos::Kind;
     use crate::world::terrain::Terrain;
 
     fn radius_f(body: &Body) -> f32 {
@@ -363,24 +363,18 @@ mod tests {
         let mut far = FarBodies::default();
         let listed = far.update(&terrain, spawn);
         assert!(listed.iter().all(|b| b.shape != FarShape::InnerSphere));
-        assert!(find(listed, cosmos.home()).is_none());
         let mut expect = 0usize;
         for body in cosmos.bodies() {
             let visible = expect_visible(body, spawn);
             let got = find(listed, body);
-            if body.kind == Kind::Home {
-                assert!(!visible);
-                assert!(got.is_none());
-                continue;
-            }
             assert!(visible, "{:?} should be a sky body from spawn", body.kind);
             let got = got.expect("missing far body");
             finite_unit(got);
             let shape = match body.kind {
-                Kind::Home | Kind::Twin => FarShape::Cube,
+                Kind::Twin => FarShape::Cube,
                 _ => FarShape::Sphere,
             };
-            assert_eq!(got.shape, shape);
+            assert_eq!(got.shape, shape, "{:?}", body.kind);
             expect += 1;
         }
         assert_eq!(listed.len(), expect);
@@ -427,8 +421,9 @@ mod tests {
         let away = far.update(&terrain, DVec3::new(1.0e8, 0.0, 0.0));
         assert_eq!(alloc_count::alloc_count(), 0, "far-body update allocated");
         let home = find(away, cosmos.home()).expect("home is a sky body from 1e8");
-        assert_eq!(home.shape, FarShape::Cube);
-        assert!((home.radius - HOME_HALF as f32).abs() < 4.0);
+        assert_eq!(home.shape, FarShape::Sphere);
+        let Shape::Ball { r } = cosmos.home().shape else { panic!("home is a ball") };
+        assert!((home.radius - (r as f32 - 150.0)).abs() < 4.0);
         finite_unit(home);
         assert!(home.dir.x < -0.9, "home should sit toward −X, dir {:?}", home.dir);
         // +Y green basin, −Y ash, +X dune, −X grey, +Z glass, −Z fungal.

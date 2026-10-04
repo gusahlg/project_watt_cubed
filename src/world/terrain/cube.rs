@@ -48,6 +48,10 @@ pub(super) fn face_of(rel: [i64; 3]) -> Face {
 pub(super) fn half_of(body: &Body) -> i64 {
     match body.shape {
         Shape::Cube { half } => half,
+        // The start world's charts use the band-0 face as a virtual cube of edge `surface_n`.
+        Shape::Ball { .. } if body.kind == super::cosmos::Kind::Home => {
+            crate::space::atlas::surface_n(super::cosmos::HOME_RADIUS) / 2
+        }
         _ => 0,
     }
 }
@@ -183,6 +187,13 @@ pub(super) struct Bulk {
     /// `hi` when `(hash >> 8) < cut` (24-bit threshold).
     cut: u32,
     seed: u32,
+}
+
+impl Bulk {
+    /// The material that fills at least half the mix (`lo` when the two agree).
+    pub(super) fn majority(&self) -> BlockId {
+        if self.lo == self.hi || self.cut < 1 << 23 { self.lo } else { self.hi }
+    }
 }
 
 pub(super) fn choose_bulk(reg: &BlockRegistry, m: &Materials, seed: u32) -> Bulk {

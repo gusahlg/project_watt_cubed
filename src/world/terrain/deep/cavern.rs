@@ -598,6 +598,12 @@ pub(super) fn measure_each_kind(ctx: &Ctx) -> Vec<super::Cover> {
             for x in -24..24 {
                 let idx = [x, y, z];
                 let Some(s) = site(ctx, idx) else { continue };
+                // True depth is plane depth plus the column height. A site whose tallest column
+                // leaves the deep band is bulk on the chart; measure one the painter carves.
+                let pd = plane_depth(ctx.half, s.center);
+                if pd + i64::from(super::super::MAX_GROUND) > i64::from(DEEP_HI) {
+                    continue;
+                }
                 let k = s.kind as usize;
                 if best[k].is_none_or(|(_, r)| s.r < r) {
                     best[k] = Some((idx, s.r));

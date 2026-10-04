@@ -459,6 +459,7 @@ mod tests {
     use super::*;
     use super::super::chunk::CHUNK_VOLUME;
     use super::super::light::{LightLevel, Lumel};
+    use crate::coord::Face;
     use crate::world::generation::TerrainGenerator;
     use voxel_engine::Pass;
 
@@ -514,20 +515,34 @@ mod tests {
     /// Vertex-byte pin: four seed-42 neighbourhoods, dense (non-uniform), meshed
     /// unlit / full-bright / gradient-lit. Hashes must stay bit-identical across
     /// mesher edits. Print with `--nocapture` to refresh the table. Re-pinned
-    /// for worldgen 8: flora (meadow, lichen, bushes) changed the surface.
+    /// for worldgen 9: the start world is painted on charts.
     #[test]
     fn vertex_byte_pin() {
         use crate::block::registry::BlockRegistry;
+        use crate::space::atlas::Patch;
         use crate::world::terrain::Terrain;
 
         let mut registry = BlockRegistry::with_builtins();
         let generator = Terrain::new(&mut registry, 42);
         let tables = registry.hot_tables();
-        // (column, unlit, full, gradient) — filled from a `--nocapture` run. Each pin chunk is the
-        // surface chunk of its column (its cy follows the generator's height there), so the pins
-        // always cover real surface geometry: grass, strata, trees.
-        let surface = |cx: i32, cz: i32| (cx, generator.height(cx * 16 + 8, cz * 16 + 8).div_euclid(16), cz);
+        // Face-local chunks of the start world's +Y chart. Storage of the centre column is
+        // chunk-aligned, so a face-local chunk offset is the storage chunk offset.
+        let home = generator.cosmos().expect("cosmos").home();
+        let atlas = generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("the start world is charted");
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let half = atlas.bands[0].n / 2;
+        let surface = |cu: i32, cv: i32| {
+            let s = atlas.storage(top, [half + i64::from(cu) * 16, 0, half + i64::from(cv) * 16]);
+            let (x, z) = (s[0] as i32, s[2] as i32);
+            (x.div_euclid(16), generator.height(x + 8, z + 8).div_euclid(16), z.div_euclid(16))
+        };
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
+        // Re-pinned for worldgen 9 (home on charts). Vertices are chunk-local, and these
+        // face-local chunks paint the same columns as the old cube, so the bytes match.
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
             (surface(0, 0), 0xbe706a19, 0xbe706a19, 0x4c828931),
             (surface(3, -2), 0xdd6f65f5, 0xdd6f65f5, 0x0b61eaa4),

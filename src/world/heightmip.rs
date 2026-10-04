@@ -99,8 +99,9 @@ impl HeightMip {
     }
 
     /// Build a sparse pyramid centred on face-local `(anchor_u, anchor_v)` of `body`'s `face`.
-    /// Anchor `(0, 0)` on PosY is the origin bake. Heights on other faces are stored
-    /// relative to the face datum so the `[0, 512]` envelope still applies.
+    /// Anchor `(0, 0)` on PosY with a zero datum is the origin bake (world Y). Every other
+    /// bake stores height above the face datum, so the `[0, 512]` envelope still applies
+    /// when the face sits far from the origin.
     ///
     /// Coverage halves per level (geometric base-2), so cell count per level stays roughly
     /// constant. Each level reduces four finer children where they exist, or samples the
@@ -294,9 +295,18 @@ fn sample_section<G: TerrainGenerator + ?Sized>(
             let wx = min_x + ix * cell + half;
             let wz = min_z + iz * cell + half;
             // Height must sample every cell; colour is an average, sampled on a stride to save cost.
-            // PosY keeps `height` / `surface_at` so an origin bake is unchanged.
+            // PosY with a zero datum keeps world `height` so an origin bake is unchanged.
+            // A raised datum subtracts it: f32 cannot hold a twin's world Y and its relief.
             if face == Face::PosY {
-                fold.height(terra.height(wx, wz) as f32);
+                let h = terra.height(wx, wz);
+                let stored = if datum == 0 {
+                    h
+                } else if h == i32::MIN {
+                    0
+                } else {
+                    h.saturating_sub(datum)
+                };
+                fold.height(stored as f32);
                 if ix % COLOR_STRIDE == 0 && iz % COLOR_STRIDE == 0 {
                     fold.color(colors[terra.surface_at(wx, wz).0 as usize]);
                 }

@@ -976,6 +976,11 @@ fn fresh_seed() -> i64 {
 /// valley floor rather than a cliff edge. Spirals outward over whole 16×16 chunk columns
 /// ([`World::heights_16`], one batch each) for the first cell whose 3×3 neighbourhood is flat.
 fn spawn_player(world: &World) -> Player {
+    if let Some(p) = world.chart_spawn() {
+        let mut player = Player::new(p);
+        player.stand_in(world.gravity_at(player.position).accel);
+        return player;
+    }
     let mut seen = [(i32::MAX, i32::MAX); 32];
     let mut n = 0usize;
     for r in 0i32..8 {

@@ -4172,6 +4172,9 @@ impl World {
     /// [`entry_complete`](Self::entry_complete) holds without an Engine.
     #[cfg(test)]
     pub fn settle_around(&mut self, pos: DVec3) {
+        // Same eye as `stream`: a charted body stands in storage, so a later
+        // quiet frame does not see a boundary cross and demand an engine.
+        let pos = self.stream_eye(pos);
         let s = CHUNK_SIZE as i32;
         let center = ChunkCoord::new(
             block_coord(pos.x).div_euclid(s),
@@ -4179,6 +4182,7 @@ impl World {
             block_coord(pos.z).div_euclid(s),
         );
         self.center = Some(center);
+        let _ = self.adopt_fold(center);
         for coord in self.mesh_box(center).coords() {
             self.ensure_data(coord);
             if let Some(loaded) = self.chunks.get_mut(&coord)
@@ -5002,16 +5006,37 @@ mod tests {
 
         for kind in [WorldgenKind::Flat, WorldgenKind::Diffusion] {
             let mut world = World::with_kind(7, RenderConfig::default(), kind, false);
-            // Above every mountain and below space: uniform air, open sky.
-            let coord = Coord::new(1, 31, -2);
+            // Flat: a chunk above the hills. Diffusion: the start world is charted, so the
+            // air chunk and the roof sit on its +Y storage column, not the physical origin.
+            let (coord, roof_y) = if kind == WorldgenKind::Flat {
+                (Coord::new(1, 31, -2), 200)
+            } else {
+                use crate::space::atlas::Patch;
+                let home = world.generator.cosmos().expect("cosmos").home();
+                let atlas = world
+                    .generator
+                    .atlases()
+                    .iter()
+                    .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+                    .expect("the start world is charted");
+                let n = atlas.bands[0].n;
+                let s = atlas.storage(Patch::Shell { band: 0, face: Face::PosY }, [n / 2, 0, n / 2]);
+                let h = world.generator.height(s[0] as i32 + 8, s[2] as i32 + 8);
+                assert_ne!(h, i32::MIN, "chart column has no surface");
+                let roof_y = h + 8;
+                let cs = CHUNK_SIZE as i32;
+                let cx = (s[0] as i32).div_euclid(cs);
+                let cz = (s[2] as i32).div_euclid(cs);
+                let cy = roof_y.div_euclid(cs) + 2;
+                (Coord::new(cx, cy, cz), roof_y)
+            };
             world.center = Some(coord);
 
             let stone = world.registry.id_by_label("rock").expect("builtin Stone");
             // Roof in this column, below the stored chunk: raise before store.
-            const ROOF_Y: i32 = 200;
             world.set_block(
                 coord.x * CHUNK_SIZE as i32 + 3,
-                ROOF_Y,
+                roof_y,
                 coord.z * CHUNK_SIZE as i32 + 5,
                 stone,
             );
@@ -5039,7 +5064,7 @@ mod tests {
                 .expect("accept_column installs the ceiling before store");
             assert_ceilings_eq(cached.as_ref(), &slow);
             assert!(
-                cached.surface_at(3, 5) >= ROOF_Y + 1,
+                cached.surface_at(3, 5) >= roof_y + 1,
                 "edited roof must raise the cached ceiling"
             );
 

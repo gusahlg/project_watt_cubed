@@ -436,10 +436,17 @@ impl World {
     }
 
     /// Mark sections covering this voxel dirty at every active detail so they
-    /// re-extract from the edit overlay. Home +Y keeps the `[0, 512)` window, so an
-    /// edit outside it still touches nothing. Other faces map the cell through the
-    /// face frame and use that section's altitude window.
+    /// re-extract from the edit overlay. A storage cell dirties its chart section
+    /// (storage +Y is the chart's up). A cube face maps the cell through the face
+    /// frame. A flat world keeps the `[0, 512)` window.
     fn edit_face_cell(&self, x: i32, y: i32, z: i32) -> Option<(u16, Face, i32, i32, i32)> {
+        let s = [i64::from(x), i64::from(y), i64::from(z)];
+        for (index, atlas) in self.generator.atlases().iter().enumerate() {
+            if atlas.locate(s).is_some() {
+                let body = super::section::CHART_BODY_BASE + index as u16;
+                return Some((body, Face::PosY, x, z, y));
+            }
+        }
         let Some(cosmos) = self.generator.cosmos() else {
             if !(0..super::section::DOMAIN_H).contains(&y) {
                 return None;

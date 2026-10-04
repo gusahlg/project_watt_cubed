@@ -442,6 +442,12 @@ pub(super) fn measure_smallest(ctx: &Ctx) -> Option<super::Cover> {
             for x in -8..8 {
                 let idx = [x, y, z];
                 let Some(s) = site(ctx, idx) else { continue };
+                let pd = plane_depth(ctx.half, s.center);
+                if pd + i64::from(super::super::MIN_GROUND) <= i64::from(DEEP_HI)
+                    || pd + i64::from(super::super::MAX_GROUND) > i64::from(UNDER_HI)
+                {
+                    continue;
+                }
                 if best.is_none_or(|(_, r)| s.r < r) {
                     best = Some((idx, s.r));
                 }

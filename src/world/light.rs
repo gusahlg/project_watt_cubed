@@ -950,9 +950,10 @@ mod tests {
     }
 
     /// Pin `fnv1a_32` over lumel bytes of four fixed seed-42 `propagate` results.
-    /// A mismatch means settled light bytes moved. Surface was re-pinned for
-    /// worldgen 8: flora (meadow, lichen, bushes) occupies air the old pin
-    /// treated as empty. Cave, emissive, and air are unchanged.
+    /// Re-pinned for worldgen 9 onto the start world's +Y chart column. Surface
+    /// matches the worldgen 8 pin: the chunk is the same face painter and `rise`
+    /// is chunk-aligned, so the local ceiling does not move. Cave and emissive
+    /// are the crust under that column. Air is synthetic and unchanged.
     #[test]
     fn light_byte_pin() {
         use crate::block::registry::BlockRegistry;
@@ -1005,21 +1006,32 @@ mod tests {
             CeilingWindow::from_heights(Face::PosY, |lx, lz| generator.height(x0 + lx as i32, z0 + lz as i32))
         };
 
-        // Surface chunk at the origin column, real ceiling, dark neighbours.
-        let cy = generator.height(8, 8).div_euclid(CHUNK_SIZE as i32);
-        let surface = Chunk::new(0, cy, 0, &generator);
-        let surface_hash = pin(&surface, &FaceShell::dark(), &ceiling_at(0, 0), cy * CHUNK_SIZE as i32);
+        // +Y chart column of the start world. The physical origin is air.
+        use crate::space::atlas::Patch;
+        let home = generator.cosmos().expect("cosmos").home();
+        let atlas = generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("the start world is charted");
+        let n = atlas.bands[0].n;
+        let s = atlas.storage(Patch::Shell { band: 0, face: Face::PosY }, [n / 2, 0, n / 2]);
+        let (cx, cz) = ((s[0] as i32).div_euclid(CHUNK_SIZE as i32), (s[2] as i32).div_euclid(CHUNK_SIZE as i32));
+        let cy = generator.height(s[0] as i32 + 8, s[2] as i32 + 8).div_euclid(CHUNK_SIZE as i32);
+        let surface = Chunk::new(cx, cy, cz, &generator);
+        let surface_hash = pin(&surface, &FaceShell::dark(), &ceiling_at(cx, cz), cy * CHUNK_SIZE as i32);
 
-        // Cave-band chunk, real ceiling (surface well above), dark neighbours.
-        let cave = Chunk::new(0, -3, 0, &generator);
-        let cave_hash = pin(&cave, &FaceShell::dark(), &ceiling_at(0, 0), -3 * CHUNK_SIZE as i32);
+        // Crust under that column, real ceiling, dark neighbours.
+        let cave_cy = cy - 4;
+        let cave = Chunk::new(cx, cave_cy, cz, &generator);
+        let cave_hash = pin(&cave, &FaceShell::dark(), &ceiling_at(cx, cz), cave_cy * CHUNK_SIZE as i32);
 
-        // Same cave chunk with a Lumin cell via `set_index`, closed ceiling so
+        // Same crust chunk with a Lumin cell via `set_index`, closed ceiling so
         // the pin is the blocklight field.
-        let mut emissive = Chunk::new(0, -3, 0, &generator);
+        let mut emissive = Chunk::new(cx, cave_cy, cz, &generator);
         emissive.set_index(Chunk::index(8, 8, 8), lumin);
-        let closed = CeilingWindow::from_heights(Face::PosY, |_, _| 1000);
-        let emissive_hash = pin(&emissive, &FaceShell::dark(), &closed, -3 * CHUNK_SIZE as i32);
+        let closed = CeilingWindow::from_heights(Face::PosY, |_, _| cy * CHUNK_SIZE as i32);
+        let emissive_hash = pin(&emissive, &FaceShell::dark(), &closed, cave_cy * CHUNK_SIZE as i32);
 
         // All-air under a checkerboard ceiling, plus a patterned neighbour
         // shell so the pin covers `seed_from_shell`.
@@ -1043,8 +1055,8 @@ mod tests {
 
         let pins: [(&str, u32, u32); 4] = [
             ("surface", surface_hash, 0x08848dcf),
-            ("cave", cave_hash, 0xb4ffde98),
-            ("emissive", emissive_hash, 0x40686e77),
+            ("cave", cave_hash, 0xbcc31dc5),
+            ("emissive", emissive_hash, 0x6f9903a6),
             ("air", air_hash, 0x19839265),
         ];
         for (name, got, _) in pins {

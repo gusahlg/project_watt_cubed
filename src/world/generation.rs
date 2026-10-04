@@ -177,6 +177,11 @@ pub trait TerrainGenerator: Send + Sync {
         &[]
     }
 
+    /// Physical spawn on a charted start world. `None` keeps the origin spiral.
+    fn chart_spawn(&self) -> Option<voxel_engine::DVec3> {
+        None
+    }
+
     /// Topmost non-ground cell in this column (the PosY surface).
     fn height(&self, wx: i32, wz: i32) -> i32;
 

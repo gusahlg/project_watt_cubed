@@ -736,7 +736,7 @@ mod tests {
         let mut world = World::generate();
         let centre = DVec3::new(2.0e7, 3.0e7, -1.0e7);
         let r = 3_000i64;
-        let atlas = Atlas::new(centre, r, r + 64, false, 0);
+        let atlas = Atlas::new(centre, r, r + 64, false, crate::space::atlas::STORAGE_X0);
         let top = Patch::Shell { band: 0, face: Face::PosY };
         let b = atlas.bands[0];
         let k = r - b.r_lo - 1; // the cell layer just below the datum radius

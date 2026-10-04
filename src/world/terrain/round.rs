@@ -1213,8 +1213,8 @@ mod tests {
         let m = Arc::new(Materials::intern(&mut reg));
         let c = DVec3::new(5.0e8, -2.0e8, 1.0e8);
         let atlas = match style {
-            Style::Verdant | Style::Moon { .. } | Style::Ember => Atlas::new(c, 60_000, 62_048, false, 0),
-            _ => Atlas::shell(c, 60_000, 58_000, 62_048, inward, 1),
+            Style::Verdant | Style::Moon { .. } | Style::Ember => Atlas::new(c, 60_000, 62_048, false, crate::space::atlas::STORAGE_X0),
+            _ => Atlas::shell(c, 60_000, 58_000, 62_048, inward, crate::space::atlas::STORAGE_X0),
         };
         Round::new(atlas, 99, style, m, DVec3::ZERO)
     }
@@ -1317,7 +1317,7 @@ mod tests {
         let mut reg = BlockRegistry::with_builtins();
         let m = Arc::new(Materials::intern(&mut reg));
         let c = DVec3::new(5.0e8, -2.0e8, 1.0e8);
-        let atlas = Atlas::new(c, 60_000, 62_048, false, 0);
+        let atlas = Atlas::new(c, 60_000, 62_048, false, crate::space::atlas::STORAGE_X0);
         let pole = DVec3::X;
         let r = Round::new(atlas, 100, Style::Moon { tone: 0 }, m, pole);
         assert!(r.ice_cap(DVec3::X));

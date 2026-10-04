@@ -552,7 +552,7 @@ mod tests {
         use crate::space::atlas::{Atlas, Patch};
         let centre = DVec3::new(2.0e7, 3.0e7, -1.0e7);
         let r = 3_000i64;
-        let atlas = std::sync::Arc::new(Atlas::new(centre, r, r + 64, false, 0));
+        let atlas = std::sync::Arc::new(Atlas::new(centre, r, r + 64, false, crate::space::atlas::STORAGE_X0));
         world.set_atlases(vec![atlas.clone()]);
         let top = Patch::Shell { band: 0, face: Face::PosY };
         let b = atlas.bands[0];

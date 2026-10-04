@@ -1,15 +1,15 @@
 //! InfiniteDiffusion: the world generator.
 //!
 //! The [`cosmos`] lists every body. A cube cell is that cube's face; an asteroid cell is the rock
-//! that contains it. Cube bodies (the start world and the twins) are six faces: today's terrain —
-//! shape, caves, mines, veins, trees, landmarks, structures — runs in face-local coordinates, with one salt per face
-//! except the home +Y face, which keeps the v3 salts. Provinces theme every column: a realm per
-//! face, regions and provinces on the shared surface point. The twins' facing faces also carry
-//! spires and arches across the canyon, inside the relief bound. Below the crust the bulk is a
-//! coarse mix whose mean amount is [`cosmos::BULK_DENSITY`], carved by the interior ([`deep`]).
-//! Round bodies live on curved charts in storage ([`storage`]): storage coordinates answer from
-//! their painters, and physical space holds none of their cells. Empty space classifies as air and
-//! is never sampled.
+//! that contains it. The twins are six faces of today's terrain — shape, caves, mines, veins,
+//! trees, landmarks, structures — in face-local coordinates, one salt per face. The start world is
+//! the same six faces laid on cube-sphere charts (home +Y keeps the v3 salts). Provinces theme
+//! every column: a realm per face, regions and provinces on the shared surface point. The twins'
+//! facing faces also carry spires and arches across the canyon, inside the relief bound. Below the
+//! crust the bulk is a coarse mix whose mean amount is [`cosmos::BULK_DENSITY`], carved by the
+//! interior ([`deep`]). Round bodies live on curved charts in storage ([`storage`]): storage
+//! coordinates answer from their painters, and physical space holds none of their cells. Empty
+//! space classifies as air and is never sampled.
 //!
 //! Every material is a configuration the [`palette`] found in the law; nothing here names an
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
@@ -50,8 +50,9 @@ use underground::{Grid, Underground};
 /// diffusion v1/v2 generators over authored and then emergent materials; 6 = InfiniteDiffusion v3
 /// over the selective-transfer palette (2026-10-02); 7 = the cube planet (2026-10-03): bodies from
 /// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field;
-/// 8 = surface landmarks, and the ruins, monuments and watchers on them (unreleased, so the number stays).
-pub const WORLDGEN_VERSION: u16 = 8;
+/// 8 = surface landmarks, and the ruins, monuments and watchers on them;
+/// 9 = the start world on cube-sphere charts (unreleased, so the number stays).
+pub const WORLDGEN_VERSION: u16 = 9;
 
 /// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
 pub const SPACE_FLOOR: i32 = 640;
@@ -352,6 +353,84 @@ impl Materials {
     }
 }
 
+/// Integer datum offset at a chart column. Half away from zero, matching `f64::round`.
+fn datum_blocks(atlas: &crate::space::atlas::Atlas, patch: crate::space::atlas::Patch, i: i64, j: i64) -> i32 {
+    atlas.datum_offset(patch, i as f64, j as f64).round() as i32
+}
+
+/// Min and max integer datum offset over the square of columns `[i0, i0+span) × [j0, j0+span)`.
+/// A bilinear patch is extreme at the corners of each grid cell it covers.
+fn offset_bounds(
+    atlas: &crate::space::atlas::Atlas,
+    patch: crate::space::atlas::Patch,
+    i0: i64,
+    j0: i64,
+    span: i64,
+) -> (i32, i32) {
+    let Some(field) = atlas.datum.as_ref() else { return (0, 0) };
+    let crate::space::atlas::Patch::Shell { band, .. } = patch else { return (0, 0) };
+    let n = atlas.bands[band as usize].n as f64;
+    let g = field.g;
+    if g < 2 || span <= 0 {
+        return (0, 0);
+    }
+    let s = (g - 1) as f64;
+    let t_of = |cell: f64| (cell / n * s).clamp(0.0, s);
+    let (u0, u1) = {
+        let (a, b) = (t_of(i0 as f64), t_of((i0 + span - 1) as f64));
+        (a.min(b), a.max(b))
+    };
+    let (v0, v1) = {
+        let (a, b) = (t_of(j0 as f64), t_of((j0 + span - 1) as f64));
+        (a.min(b), a.max(b))
+    };
+    let cell_of = |t: f64| t / s * n;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut take = |u: f64, v: f64| {
+        let o = atlas.datum_offset(patch, cell_of(u), cell_of(v));
+        lo = lo.min(o);
+        hi = hi.max(o);
+    };
+    let i_lo = (u0.floor() as usize).min(g - 2);
+    let i_hi = (u1.ceil() as usize).min(g - 1);
+    let j_lo = (v0.floor() as usize).min(g - 2);
+    let j_hi = (v1.ceil() as usize).min(g - 1);
+    for i in i_lo..i_hi {
+        for j in j_lo..j_hi {
+            let ua = (i as f64).max(u0);
+            let ub = ((i + 1) as f64).min(u1);
+            let va = (j as f64).max(v0);
+            let vb = ((j + 1) as f64).min(v1);
+            if ua > ub || va > vb {
+                continue;
+            }
+            take(ua, va);
+            take(ub, va);
+            take(ua, vb);
+            take(ub, vb);
+        }
+    }
+    if !lo.is_finite() { (0, 0) } else { (lo.round() as i32, hi.round() as i32) }
+}
+
+/// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` on column `k`
+/// is `h_base + la - bias[k]`.
+struct ChartCols {
+    cols: Vec<Column>,
+    bias: [i32; CHUNK_SIZE * CHUNK_SIZE],
+    u0: i32,
+    v0: i32,
+    h_base: i32,
+    max_h: i32,
+    min_h: i32,
+    max_terrain: i32,
+    face: Face,
+    i0: i64,
+    y0: i64,
+    j0: i64,
+}
+
 /// One cube face's copy of today's terrain, with its own salt.
 struct FacePaint {
     shape: Shape,
@@ -366,7 +445,7 @@ pub struct Terrain {
     seed: i64,
     /// Every body in the universe; also the generator's mass oracle.
     cosmos: Arc<cosmos::Cosmos>,
-    /// Indexed by `body.id * 6 + face`. `None` for bodies that are not cubes.
+    /// Indexed by `body.id * 6 + face`. `None` for bodies that are not cubes and not the start world.
     paints: Vec<Option<FacePaint>>,
     bulk: cube::Bulk,
     /// Caverns, chambers, mantle bubbles and the Heart. Quiet deep chunks never consult it per voxel.
@@ -438,7 +517,13 @@ impl Terrain {
         let mut paints = Vec::new();
         paints.resize_with(n * 6, || None);
         for b in cosmos.bodies() {
-            let cosmos::Shape::Cube { half } = b.shape else { continue };
+            let half = match b.shape {
+                cosmos::Shape::Cube { half } => half,
+                cosmos::Shape::Ball { .. } if b.kind == cosmos::Kind::Home => {
+                    crate::space::atlas::surface_n(cosmos::HOME_RADIUS) / 2
+                }
+                _ => continue,
+            };
             let twin = b.kind == cosmos::Kind::Twin;
             let (aims, n_aims) = sky_aims(&cosmos, b.id);
             let facing_face = span::facing_face(&cosmos, b);
@@ -479,12 +564,16 @@ impl Terrain {
                 });
             }
         }
+        let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
+        // Majority of the 24-bit mix: the uniform block under the start world's band 0.
+        let home_fill = bulk.majority();
+        let storage = storage::StorageWorlds::new(&cosmos, &m, home_fill);
         Self {
             seed,
-            storage: storage::StorageWorlds::new(&cosmos, &m),
+            storage,
             cosmos,
             paints,
-            bulk: cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5),
+            bulk,
             deep: deep::Deep::new(scale, m.clone()),
             m,
         }
@@ -637,6 +726,22 @@ impl Terrain {
         let h = a - half as i32;
         let mut col = paint.shape.column(u, v);
         col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+        self.face_voxel(body, face, u, h, v, &col, rel)
+    }
+
+    /// One face cell once `(u, h, v)` and the blended column are known. `rel` is the virtual-cube cell.
+    fn face_voxel(
+        &self,
+        body: &cosmos::Body,
+        face: Face,
+        u: i32,
+        h: i32,
+        v: i32,
+        col: &Column,
+        rel: [i64; 3],
+    ) -> BlockId {
+        let paint = self.paint(body, face);
+        let half = cube::half_of(body);
         if h >= col.height {
             // Structures own their footprint, then landmarks. A dug air cell stays empty.
             if h - col.height <= features::MAX_ABOVE {
@@ -708,6 +813,9 @@ impl Terrain {
 
     fn cell(&self, x: i32, y: i32, z: i32) -> BlockId {
         if stored(x) {
+            if let Some(id) = self.home_block(x, y, z) {
+                return id;
+            }
             return self.storage.voxel(x, y, z);
         }
         let p = [i64::from(x), i64::from(y), i64::from(z)];
@@ -834,7 +942,15 @@ impl Terrain {
     }
 
     /// One deep chunk: eight coarse-cell samples, then the cheap mix if they disagree.
-    fn bulk_chunk(&self, body: &cosmos::Body, face: Face, u0: i32, h0: i32, v0: i32) -> ChunkData {
+    /// `IDENTITY` writes storage `(lu, la, lv)` (a chart). A cube face permutes through its frame.
+    fn bulk_chunk<const IDENTITY: bool>(
+        &self,
+        body: &cosmos::Body,
+        face: Face,
+        u0: i32,
+        h0: i32,
+        v0: i32,
+    ) -> ChunkData {
         let half = cube::half_of(body) as i32;
         let at = |lu: i32, la: i32, lv: i32| cube::local_to_rel(face, u0 + lu, half + h0 + la, v0 + lv);
         let rels = [
@@ -857,7 +973,7 @@ impl Terrain {
                 for lu in 0..CHUNK_SIZE {
                     let rel = at(lu as i32, la as i32, lv as i32);
                     let id = cube::bulk_id(&self.bulk, body, rel);
-                    let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                    let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
                     cells[Chunk::index(lx, ly, lz)] = id;
                 }
             }
@@ -866,7 +982,15 @@ impl Terrain {
     }
 
     /// A chunk wholly below the crust. Quiet chunks stay on the mix; a feature is filled per column.
-    fn fill_deep(&self, body: &cosmos::Body, face: Face, cols: &[Column], u0: i32, h0: i32, v0: i32) -> ChunkData {
+    fn fill_deep<const IDENTITY: bool>(
+        &self,
+        body: &cosmos::Body,
+        face: Face,
+        cols: &[Column],
+        u0: i32,
+        h0: i32,
+        v0: i32,
+    ) -> ChunkData {
         let half = cube::half_of(body) as i32;
         let at = |lu: i32, la: i32, lv: i32| cube::local_to_rel(face, u0 + lu, half + h0 + la, v0 + lv);
         let mut lo = at(0, 0, 0);
@@ -882,7 +1006,7 @@ impl Terrain {
             return ChunkData::Uniform(AIR);
         }
         if !self.deep.hits(body, lo, hi) {
-            return self.bulk_chunk(body, face, u0, h0, v0);
+            return self.bulk_chunk::<IDENTITY>(body, face, u0, h0, v0);
         }
         let frame = FaceFrame::new(face);
         let mut cells = Box::new([AIR; CHUNK_VOLUME]);
@@ -892,7 +1016,7 @@ impl Terrain {
                     let h = h0 + la as i32;
                     let rel = at(lu as i32, la as i32, lv as i32);
                     let depth = cols[lu + lv * CHUNK_SIZE].height - h;
-                    let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                    let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
                     cells[Chunk::index(lx, ly, lz)] = self.deep_at(body, rel, Some(depth));
                 }
             }
@@ -901,7 +1025,8 @@ impl Terrain {
     }
 
     /// Fill one chunk of a face column. `cols[lu + lv * 16].height` is the blended face-local surface.
-    fn fill_face(
+    /// `IDENTITY` stores the cell at `(lu, la, lv)` (a chart chunk). Cube faces use `false`.
+    fn fill_face<const IDENTITY: bool>(
         &self,
         body: &cosmos::Body,
         face: Face,
@@ -924,7 +1049,7 @@ impl Terrain {
             return ChunkData::Uniform(AIR);
         }
         if i64::from(h0) + i64::from(n) <= i64::from(min_h) - i64::from(cube::CRUST) {
-            return self.fill_deep(body, face, cols, u0, h0, v0);
+            return self.fill_deep::<IDENTITY>(body, face, cols, u0, h0, v0);
         }
         let paint = self.paint(body, face);
         // The batch grid covers a 4-aligned 16³. PosY is aligned; a flipped axis is not,
@@ -951,7 +1076,7 @@ impl Terrain {
                     let (u, v) = (u0 + lu as i32, v0 + lv as i32);
                     for la in 0..CHUNK_SIZE {
                         let h = h0 + la as i32;
-                        let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                        let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
                         let id = if h >= col.height {
                             AIR
                         } else if !crust_only && col.height - h > cube::CRUST {
@@ -1006,7 +1131,11 @@ impl Terrain {
                 continue;
             }
             let above = h >= cols[col_i].height;
-            let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
+            let (lx, ly, lz) = if IDENTITY {
+                (lu as usize, la as usize, lv as usize)
+            } else {
+                frame.index_to_world(lu as usize, la as usize, lv as usize)
+            };
             let i = Chunk::index(lx, ly, lz);
             if above {
                 if id != AIR && cells[i] == AIR {
@@ -1027,7 +1156,11 @@ impl Terrain {
             }
             let col_i = lu as usize + lv as usize * CHUNK_SIZE;
             let above = h >= cols[col_i].height;
-            let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
+            let (lx, ly, lz) = if IDENTITY {
+                (lu as usize, la as usize, lv as usize)
+            } else {
+                frame.index_to_world(lu as usize, la as usize, lv as usize)
+            };
             let i = Chunk::index(lx, ly, lz);
             if above {
                 if id != AIR {
@@ -1050,7 +1183,11 @@ impl Terrain {
             if open[col_i] || (!owned.is_empty() && owned[col_i]) {
                 continue;
             }
-            let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
+            let (lx, ly, lz) = if IDENTITY {
+                (lu as usize, la as usize, lv as usize)
+            } else {
+                frame.index_to_world(lu as usize, la as usize, lv as usize)
+            };
             let i = Chunk::index(lx, ly, lz);
             if cells[i] == AIR && !claim[i] && h >= cols[col_i].height {
                 cells[i] = id;
@@ -1070,7 +1207,7 @@ impl Terrain {
                 }
                 let (u, v) = (u0 + lu as i32, v0 + lv as i32);
                 let Some(id) = paint.shape.flower_at(col, u, v) else { continue };
-                let (lx, ly, lz) = frame.index_to_world(lu, la as usize, lv);
+                let (lx, ly, lz) = if IDENTITY { (lu, la as usize, lv) } else { frame.index_to_world(lu, la as usize, lv) };
                 let i = Chunk::index(lx, ly, lz);
                 if cells[i] == AIR && !claim[i] {
                     cells[i] = id;
@@ -1095,7 +1232,7 @@ impl Terrain {
                             if h < col_h {
                                 continue;
                             }
-                            let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                            let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
                             let i = Chunk::index(lx, ly, lz);
                             // As `cube_cell`: a landmark's dug air and a cut column stay open.
                             let cut = open[lu + lv * CHUNK_SIZE] && h - col_h <= trees::MAX_TREE_HEIGHT;
@@ -1111,6 +1248,369 @@ impl Terrain {
             }
         }
         ChunkData::from_cells(cells)
+    }
+
+    /// Virtual-cube `(rel, face altitude, u, v)` of a band-0 chart cell.
+    fn chart_sample(&self, face: Face, i: i64, y: i64, j: i64) -> Option<([i64; 3], i32, i32, i32)> {
+        let atlas = self.storage.home_atlas()?;
+        let b = atlas.bands[0];
+        let half = b.n / 2;
+        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
+        let off = datum_blocks(atlas, patch, i, j);
+        let h64 = b.r_lo + y - atlas.radius - i64::from(off);
+        let h = i32::try_from(h64).ok()?;
+        let a = i32::try_from(half + h64).ok()?;
+        let u = i32::try_from(i - half).ok()?;
+        let v = i32::try_from(j - half).ok()?;
+        Some((cube::local_to_rel(face, u, a, v), h, u, v))
+    }
+
+    /// Per-voxel block of a start-world band-0 cell. Same decisions as [`cube_cell`](Self::cube_cell).
+    fn chart_voxel(&self, face: Face, local: [i64; 3]) -> BlockId {
+        let Some((rel, h, u, v)) = self.chart_sample(face, local[0], local[1], local[2]) else { return AIR };
+        let body = self.cosmos.home();
+        let half = cube::half_of(body);
+        if cube::in_deep(rel, half) {
+            return self.deep_at(body, rel, None);
+        }
+        let paint = self.paint(body, face);
+        let mut col = paint.shape.column(u, v);
+        col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+        self.face_voxel(body, face, u, h, v, &col, rel)
+    }
+
+    fn chart_columns(&self, face: Face, local: [i64; 3]) -> ChartCols {
+        let atlas = self.storage.home_atlas().expect("the start world is charted");
+        let b = atlas.bands[0];
+        let half = b.n / 2;
+        let (i0, y0, j0) = (local[0], local[1], local[2]);
+        let (u0, v0) = ((i0 - half) as i32, (j0 - half) as i32);
+        let h_base = (b.r_lo + y0 - atlas.radius) as i32;
+        let body = self.cosmos.home();
+        let paint = self.paint(body, face);
+        let seed = cube::rim_seed(body);
+        let raw = paint.shape.columns_16(u0, v0);
+        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
+        let mut bias = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        let mut cols = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
+        let mut max_h = i32::MIN;
+        let mut min_h = i32::MAX;
+        let mut max_terrain = i32::MIN;
+        for (k, mut col) in raw.into_iter().enumerate() {
+            let lu = (k % CHUNK_SIZE) as i32;
+            let lv = (k / CHUNK_SIZE) as i32;
+            max_terrain = max_terrain.max(col.height);
+            let (ub, vb) = (i64::from(u0) + i64::from(lu), i64::from(v0) + i64::from(lv));
+            col.height = cube::blend_height(col.height, seed, face, half, ub, vb);
+            max_h = max_h.max(col.height);
+            min_h = min_h.min(col.height);
+            bias[k] = datum_blocks(atlas, patch, i0 + i64::from(lu), j0 + i64::from(lv));
+            cols.push(col);
+        }
+        ChartCols { cols, bias, u0, v0, h_base, max_h, min_h, max_terrain, face, i0, y0, j0 }
+    }
+
+    /// Air, or one deep material, when the chunk cannot meet the crust. `None` when it might.
+    fn home_fast_uniform(&self, face: Face, local: [i64; 3]) -> Option<BlockId> {
+        let atlas = self.storage.home_atlas()?;
+        let b = atlas.bands[0];
+        let (i0, y0, j0) = (local[0], local[1], local[2]);
+        let h_base = b.r_lo + y0 - atlas.radius;
+        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
+        let (off_lo, off_hi) = offset_bounds(atlas, patch, i0, j0, CHUNK_SIZE as i64);
+        let h_bot = h_base - i64::from(off_hi);
+        if h_bot >= i64::from(MAX_GROUND) + i64::from(features::MAX_ABOVE) {
+            return Some(AIR);
+        }
+        if off_lo != off_hi {
+            return None;
+        }
+        let h_top = h_base + i64::from(CHUNK_SIZE as i32 - 1) - i64::from(off_lo);
+        if h_top >= i64::from(MIN_GROUND) - i64::from(cube::CRUST) {
+            return None;
+        }
+        let body = self.cosmos.home();
+        let at = |di: i64, dy: i64, dj: i64| self.chart_sample(face, i0 + di, y0 + dy, j0 + dj).map(|(rel, _, _, _)| rel);
+        let rels = [
+            at(0, 0, 0)?,
+            at(15, 0, 0)?,
+            at(0, 0, 15)?,
+            at(15, 0, 15)?,
+            at(0, 15, 0)?,
+            at(15, 15, 0)?,
+            at(0, 15, 15)?,
+            at(15, 15, 15)?,
+        ];
+        let mut lo = rels[0];
+        let mut hi = rels[0];
+        for p in &rels[1..] {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        if self.deep.all_air(body, lo, hi) {
+            return Some(AIR);
+        }
+        if !self.deep.hits(body, lo, hi)
+            && let Some(id) = cube::bulk_uniform(&self.bulk, body, &rels)
+        {
+            return Some(id);
+        }
+        None
+    }
+
+    /// What [`fill_face`](Self::fill_face) would collapse to, so classify and generate agree.
+    fn columns_uniform(&self, c: &ChartCols) -> Option<BlockId> {
+        let b0 = c.bias[0];
+        let constant = c.bias.iter().all(|&b| b == b0);
+        let landmarks = c.max_terrain.max(c.max_h) + features::MAX_ABOVE;
+        if !constant {
+            if (0..CHUNK_SIZE * CHUNK_SIZE).all(|k| c.h_base - c.bias[k] >= landmarks) {
+                return Some(AIR);
+            }
+            return None;
+        }
+        let h0 = c.h_base - b0;
+        if h0 >= landmarks {
+            return Some(AIR);
+        }
+        let n = CHUNK_SIZE as i32;
+        if i64::from(h0) + i64::from(n) > i64::from(c.min_h) - i64::from(cube::CRUST) {
+            return None;
+        }
+        let body = self.cosmos.home();
+        let half = cube::half_of(body) as i32;
+        let at = |lu: i32, la: i32, lv: i32| cube::local_to_rel(c.face, c.u0 + lu, half + h0 + la, c.v0 + lv);
+        let rels = [
+            at(0, 0, 0),
+            at(15, 0, 0),
+            at(0, 0, 15),
+            at(15, 0, 15),
+            at(0, 15, 0),
+            at(15, 15, 0),
+            at(0, 15, 15),
+            at(15, 15, 15),
+        ];
+        let mut lo = rels[0];
+        let mut hi = rels[0];
+        for p in &rels[1..] {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        if self.deep.all_air(body, lo, hi) {
+            return Some(AIR);
+        }
+        if !self.deep.hits(body, lo, hi) { cube::bulk_uniform(&self.bulk, body, &rels) } else { None }
+    }
+
+    fn fill_chart(&self, c: &ChartCols) -> ChunkData {
+        let b0 = c.bias[0];
+        if c.bias.iter().all(|&b| b == b0) {
+            let body = self.cosmos.home();
+            let paint = self.paint(body, c.face);
+            let trees = paint.trees.blocks_in(&paint.shape, c.u0, c.v0, CHUNK_SIZE as i32);
+            return self.fill_face::<true>(
+                body,
+                c.face,
+                &c.cols,
+                c.u0,
+                c.v0,
+                c.h_base - b0,
+                c.max_terrain,
+                c.min_h,
+                &trees,
+            );
+        }
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        for la in 0..CHUNK_SIZE {
+            for lv in 0..CHUNK_SIZE {
+                for lu in 0..CHUNK_SIZE {
+                    let local = [c.i0 + lu as i64, c.y0 + la as i64, c.j0 + lv as i64];
+                    cells[Chunk::index(lu, la, lv)] = self.chart_voxel(c.face, local);
+                }
+            }
+        }
+        ChunkData::from_cells(cells)
+    }
+
+    fn home_chunk_data(&self, coord: ChunkCoord) -> Option<ChunkData> {
+        let (patch, local) = self.storage.home_chunk(coord)?;
+        let crate::space::atlas::Patch::Shell { band: 0, face } = patch else {
+            return Some(ChunkData::Uniform(self.storage.home_fill()));
+        };
+        if let Some(id) = self.home_fast_uniform(face, local) {
+            return Some(ChunkData::Uniform(id));
+        }
+        let cols = self.chart_columns(face, local);
+        if let Some(id) = self.columns_uniform(&cols) {
+            return Some(ChunkData::Uniform(id));
+        }
+        Some(self.fill_chart(&cols))
+    }
+
+    fn home_class(&self, coord: ChunkCoord) -> Option<Classify> {
+        let (patch, local) = self.storage.home_chunk(coord)?;
+        let crate::space::atlas::Patch::Shell { band: 0, face } = patch else {
+            return Some(Classify::Uniform(self.storage.home_fill()));
+        };
+        if let Some(id) = self.home_fast_uniform(face, local) {
+            return Some(Classify::Uniform(id));
+        }
+        let cols = self.chart_columns(face, local);
+        if let Some(id) = self.columns_uniform(&cols) {
+            return Some(Classify::Uniform(id));
+        }
+        Some(Classify::Mixed)
+    }
+
+    /// The start-world patch covering storage column `(x, z)`, with its local column.
+    fn home_patch_column(&self, x: i32, z: i32) -> Option<(crate::space::atlas::Patch, i64, i64)> {
+        let atlas = self.storage.home_atlas()?;
+        let (x, z) = (i64::from(x), i64::from(z));
+        let hit = |patch: crate::space::atlas::Patch| {
+            let (o, size) = atlas.storage_box(patch);
+            (x >= o[0] && x < o[0] + size[0] && z >= o[2] && z < o[2] + size[2]).then_some((patch, x - o[0], z - o[2]))
+        };
+        for face in Face::ALL {
+            for band in 0..atlas.bands.len() {
+                if let Some(found) = hit(crate::space::atlas::Patch::Shell { band: band as u8, face }) {
+                    return Some(found);
+                }
+            }
+            if atlas.inner.is_some()
+                && let Some(found) = hit(crate::space::atlas::Patch::Transition { face })
+            {
+                return Some(found);
+            }
+        }
+        if atlas.inner.is_some() { hit(crate::space::atlas::Patch::Core) } else { None }
+    }
+
+    /// Storage y of the first open cell on a start-world column, or [`storage::BURIED`] under it.
+    fn home_surface_y(&self, x: i32, z: i32) -> Option<i32> {
+        let (patch, i, j) = self.home_patch_column(x, z)?;
+        let crate::space::atlas::Patch::Shell { band: 0, face } = patch else {
+            return Some(storage::BURIED);
+        };
+        let atlas = self.storage.home_atlas()?;
+        let b = atlas.bands[0];
+        let half = b.n / 2;
+        let (u, v) = ((i - half) as i32, (j - half) as i32);
+        let body = self.cosmos.home();
+        let paint = self.paint(body, face);
+        let h = cube::blend_height(
+            paint.shape.height(u, v),
+            cube::rim_seed(body),
+            face,
+            half,
+            i64::from(u),
+            i64::from(v),
+        );
+        let off = datum_blocks(atlas, patch, i, j);
+        let y = i64::from(h) + atlas.radius - b.r_lo + i64::from(off);
+        Some(y.clamp(i32::MIN as i64 + 1, storage::BURIED as i64 - 1) as i32)
+    }
+
+    fn home_heights_16(&self, cx: i32, cz: i32) -> Option<ColumnHeights> {
+        let (patch, i0, j0) = self.home_patch_column(cx * CHUNK_SIZE as i32, cz * CHUNK_SIZE as i32)?;
+        let crate::space::atlas::Patch::Shell { band: 0, face } = patch else {
+            return Some([storage::BURIED; CHUNK_SIZE * CHUNK_SIZE]);
+        };
+        let cols = self.chart_columns(face, [i0, 0, j0]);
+        let atlas = self.storage.home_atlas()?;
+        let rise = atlas.radius - atlas.bands[0].r_lo;
+        let mut out = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for k in 0..CHUNK_SIZE * CHUNK_SIZE {
+            let y = i64::from(cols.cols[k].height) + rise + i64::from(cols.bias[k]);
+            out[k] = y.clamp(i32::MIN as i64 + 1, storage::BURIED as i64 - 1) as i32;
+        }
+        Some(out)
+    }
+
+    fn home_bounds(&self, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {
+        if span <= 0 {
+            return None;
+        }
+        let atlas = self.storage.home_atlas()?;
+        let (x1, z1) = (i64::from(x0) + i64::from(span) - 1, i64::from(z0) + i64::from(span) - 1);
+        for face in Face::ALL {
+            let patch = crate::space::atlas::Patch::Shell { band: 0, face };
+            let (o, size) = atlas.storage_box(patch);
+            if i64::from(x0) < o[0] || x1 >= o[0] + size[0] || i64::from(z0) < o[2] || z1 >= o[2] + size[2] {
+                continue;
+            }
+            let (off_lo, off_hi) = offset_bounds(atlas, patch, i64::from(x0) - o[0], i64::from(z0) - o[2], i64::from(span));
+            let rise = atlas.radius - atlas.bands[0].r_lo;
+            let lo = i32::try_from(i64::from(MIN_GROUND) + rise + i64::from(off_lo)).ok()?;
+            let hi = i32::try_from(i64::from(MAX_GROUND) + rise + i64::from(off_hi)).unwrap_or(i32::MAX);
+            return Some((lo, hi.max(lo.saturating_add(1))));
+        }
+        None
+    }
+
+    /// Far field of a start-world column. `false` when `(x, z)` is not the start world.
+    fn home_lod_column(&self, x: i32, z: i32, ys: &[i32], out: &mut [BlockId]) -> bool {
+        let Some((patch, i, j)) = self.home_patch_column(x, z) else { return false };
+        let n = out.len().min(ys.len());
+        let crate::space::atlas::Patch::Shell { band: 0, face } = patch else {
+            out[..n].fill(self.storage.home_fill());
+            return true;
+        };
+        let Some(atlas) = self.storage.home_atlas() else { return false };
+        let b = atlas.bands[0];
+        let half = b.n / 2;
+        let (u, v) = ((i - half) as i32, (j - half) as i32);
+        let body = self.cosmos.home();
+        let paint = self.paint(body, face);
+        let mut col = paint.shape.column(u, v);
+        col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+        let off = datum_blocks(atlas, patch, i, j);
+        let surf = i64::from(col.height) + atlas.radius - b.r_lo + i64::from(off);
+        for (o, &y) in out.iter_mut().zip(ys).take(n) {
+            if i64::from(y) >= surf {
+                *o = AIR;
+            } else {
+                let h = (b.r_lo + i64::from(y) - atlas.radius - i64::from(off)) as i32;
+                *o = paint.shape.ground(&col, u, h, v);
+            }
+        }
+        if super::generation::coarse_floor_samples(ys) {
+            super::generation::paint_lod_top(out, n, col.surface);
+        }
+        true
+    }
+
+    fn home_block(&self, x: i32, y: i32, z: i32) -> Option<BlockId> {
+        let (patch, local) = self.storage.home_cell(x, y, z)?;
+        Some(match patch {
+            crate::space::atlas::Patch::Shell { band: 0, face } => self.chart_voxel(face, local),
+            _ => self.storage.home_fill(),
+        })
+    }
+
+    /// Physical spawn: the +Y chart's centre column, two blocks above its first open cell.
+    fn home_spawn(&self) -> Option<glam::DVec3> {
+        let atlas = self.storage.home_atlas()?;
+        let b = atlas.bands[0];
+        let face = Face::PosY;
+        let patch = crate::space::atlas::Patch::Shell { band: 0, face };
+        let (i, j) = (b.n / 2, b.n / 2);
+        let half = b.n / 2;
+        let body = self.cosmos.home();
+        let paint = self.paint(body, face);
+        let h = cube::blend_height(paint.shape.height(0, 0), cube::rim_seed(body), face, half, 0, 0);
+        let off = datum_blocks(atlas, patch, i, j);
+        let y = i64::from(h) + atlas.radius - b.r_lo + i64::from(off);
+        Some(atlas.embed(patch, glam::DVec3::new(i as f64 + 0.5, y as f64 + 2.0, j as f64 + 0.5)))
+    }
+
+    /// Replace the start world's spherical datum. Tests use this; a relaxed field is data.
+    #[cfg(test)]
+    pub fn set_home_datum(&mut self, field: std::sync::Arc<crate::space::datum::DatumField>) {
+        self.storage.set_home_datum(field);
     }
 
     fn face_columns(
@@ -1152,7 +1652,7 @@ impl Terrain {
             .map(|alt| {
                 let coord = key.chunk(alt);
                 let h0 = cube::face_h(half, n_dot, frame.chunk_alt0(coord));
-                let data = self.fill_face(body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks);
+                let data = self.fill_face::<false>(body, face, &cols, u0, v0, h0, max_terrain, min_h, &tree_blocks);
                 (alt, data)
             })
             .collect();
@@ -1290,6 +1790,10 @@ impl TerrainGenerator for Terrain {
         self.storage.atlases()
     }
 
+    fn chart_spawn(&self) -> Option<voxel_engine::DVec3> {
+        self.home_spawn()
+    }
+
     fn sky(&self, coord: ChunkCoord) -> Sky {
         // Every chart's up is storage +Y.
         if storage::StorageWorlds::owns(coord) {
@@ -1323,6 +1827,9 @@ impl TerrainGenerator for Terrain {
 
     fn classify(&self, coord: ChunkCoord) -> Classify {
         if storage::StorageWorlds::owns(coord) {
+            if let Some(k) = self.home_class(coord) {
+                return k;
+            }
             return match self.storage.uniform(coord) {
                 Some(AIR) => Classify::Air,
                 Some(id) => Classify::Uniform(id),
@@ -1373,6 +1880,9 @@ impl TerrainGenerator for Terrain {
 
     fn surface(&self, face: Face, u: i32, v: i32) -> i32 {
         if face == Face::PosY && stored(u) {
+            if let Some(y) = self.home_surface_y(u, v) {
+                return y;
+            }
             return self.storage.surface(u, v);
         }
         let mut best = i32::MIN;
@@ -1404,6 +1914,9 @@ impl TerrainGenerator for Terrain {
 
     fn heights_16(&self, cx: i32, cz: i32) -> ColumnHeights {
         if stored(cx * CHUNK_SIZE as i32) {
+            if let Some(h) = self.home_heights_16(cx, cz) {
+                return h;
+            }
             return self.storage.heights_16(cx, cz);
         }
         super::generation::sample_column_heights(self, cx, cz)
@@ -1411,6 +1924,13 @@ impl TerrainGenerator for Terrain {
 
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
         if stored(wx) {
+            if let Some(s) = self.home_surface_y(wx, wz) {
+                return if s == i32::MIN || s >= storage::BURIED {
+                    AIR
+                } else {
+                    self.home_block(wx, s - 1, wz).unwrap_or(AIR)
+                };
+            }
             let s = self.storage.surface(wx, wz);
             return if s == i32::MIN || s >= storage::BURIED { AIR } else { self.storage.voxel(wx, s - 1, wz) };
         }
@@ -1431,6 +1951,9 @@ impl TerrainGenerator for Terrain {
 
     fn lod_block_at(&self, wx: i32, wy: i32, wz: i32) -> BlockId {
         if stored(wx) {
+            if let Some(id) = self.home_block(wx, wy, wz) {
+                return id;
+            }
             return self.storage.voxel(wx, wy, wz);
         }
         let Some(hit) = self.posy_hit(wx, wz) else { return AIR };
@@ -1443,6 +1966,9 @@ impl TerrainGenerator for Terrain {
 
     fn lod_column(&self, wx: i32, wz: i32, ys: &[i32], out: &mut [BlockId]) {
         if stored(wx) {
+            if self.home_lod_column(wx, wz, ys, out) {
+                return;
+            }
             self.storage.lod_column(wx, wz, ys, out);
             return;
         }
@@ -1468,9 +1994,13 @@ impl TerrainGenerator for Terrain {
     }
 
     fn lod_column_face(&self, body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {
-        if chart_body(body).is_some() {
+        if let Some(index) = chart_body(body) {
             if face != Face::PosY {
                 out.iter_mut().take(alts.len()).for_each(|o| *o = AIR);
+                return;
+            }
+            if self.storage.home_index() == Some(index) {
+                let _ = self.home_lod_column(u, v, alts, out);
                 return;
             }
             self.storage.lod_column(u, v, alts, out);
@@ -1501,9 +2031,12 @@ impl TerrainGenerator for Terrain {
     }
 
     fn surface_bounds(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
-        if chart_body(body).is_some() {
+        if let Some(index) = chart_body(body) {
             if face != Face::PosY {
                 return None;
+            }
+            if self.storage.home_index() == Some(index) {
+                return self.home_bounds(u0, v0, span);
             }
             return self.storage.bounds(u0, v0, span);
         }
@@ -1537,6 +2070,9 @@ impl TerrainGenerator for Terrain {
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let coord = ChunkCoord::new(cx, cy, cz);
         if storage::StorageWorlds::owns(coord) {
+            if let Some(data) = self.home_chunk_data(coord) {
+                return data;
+            }
             return self.storage.generate(coord);
         }
         match self.classify(coord) {
@@ -1562,6 +2098,16 @@ impl TerrainGenerator for Terrain {
         // Storage columns: the chart painters, chunk by chunk; heights are the charts' surfaces.
         if key.face == Face::PosY && storage::StorageWorlds::owns(key.chunk(*range.start())) {
             let c = key.chunk(*range.start());
+            if let Some(heights) = self.home_heights_16(c.x, c.z) {
+                let chunks = range
+                    .map(|alt| {
+                        let coord = key.chunk(alt);
+                        let data = self.home_chunk_data(coord).unwrap_or_else(|| self.storage.generate(coord));
+                        (alt, data)
+                    })
+                    .collect();
+                return (chunks, heights);
+            }
             let chunks = range.map(|alt| (alt, self.storage.generate(key.chunk(alt)))).collect();
             return (chunks, self.storage.heights_16(c.x, c.z));
         }

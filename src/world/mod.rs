@@ -1572,10 +1572,16 @@ impl World {
             reactions_authority: true,
         };
         if pregenerate_origin {
-            // Centre the pre-generated box on the origin's surface chunk, the
-            // spawn point's own layer.
-            let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
-            world.ensure_region_data(ChunkCoord::new(0, cy, 0));
+            // The charted start world spawns on its +Y chart; a flat world keeps the origin column.
+            if let Some(p) = world.generator.chart_spawn()
+                && let Some(s) = world.generator.atlases().iter().find_map(|a| a.storage_of(p))
+            {
+                let sdiv = |v: i64| v.div_euclid(CHUNK_SIZE as i64) as i32;
+                world.ensure_region_data(ChunkCoord::new(sdiv(s[0]), sdiv(s[1]), sdiv(s[2])));
+            } else {
+                let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+                world.ensure_region_data(ChunkCoord::new(0, cy, 0));
+            }
         }
         world
     }
@@ -1834,6 +1840,29 @@ impl World {
             .or_else(|| self.section_mip.as_ref()?.relief_band(key))
     }
 
+    /// Eye altitude in the bake's height space. A zero datum on +Y stores world Y;
+    /// every other bake stores height above the face datum.
+    fn baked_eye(&self, key: SectionPos) -> f32 {
+        let datum = self.generator.face_datum(key.body, key.face);
+        if key.face == Face::PosY && datum == 0 {
+            self.section_eye_y as f32
+        } else {
+            (self.section_eye_y - f64::from(datum)) as f32
+        }
+    }
+
+    /// World Y of one baked height, then the chunk rows a band occupies.
+    fn baked_world_y(&self, key: SectionPos, h: f32) -> i32 {
+        let datum = self.generator.face_datum(key.body, key.face);
+        let rel = h.floor() as i32;
+        if key.face == Face::PosY && datum == 0 { rel } else { datum.saturating_add(rel) }
+    }
+
+    fn baked_chunk_ys(&self, key: SectionPos, lo: f32, hi: f32) -> (i32, i32) {
+        let cs = CHUNK_SIZE as i32;
+        (self.baked_world_y(key, lo).div_euclid(cs), self.baked_world_y(key, hi).div_euclid(cs))
+    }
+
     /// Skip near-field LOD load if the section's footprint is provably inside the
     /// coverage clip slab, so the shader discards it anyway. Only filters the load lane,
     /// not the desired set; selection stays isotropic.
@@ -1866,7 +1895,7 @@ impl World {
         let Some((lo, hi)) = self.section_relief_band(key) else {
             return false;
         };
-        let ey = self.section_eye_y as f32;
+        let ey = self.baked_eye(key);
         if lo < ey - v_lim || hi > ey + v_lim {
             return false;
         }
@@ -1889,10 +1918,7 @@ impl World {
         };
         let (cx_lo, cx_hi) = (x0.div_euclid(cs), (x0 + span - 1).div_euclid(cs));
         let (cz_lo, cz_hi) = (z0.div_euclid(cs), (z0 + span - 1).div_euclid(cs));
-        let (cy_lo, cy_hi) = (
-            (lo.floor() as i32).div_euclid(cs),
-            (hi.floor() as i32).div_euclid(cs),
-        );
+        let (cy_lo, cy_hi) = self.baked_chunk_ys(key, lo, hi);
         for cy in cy_lo..=cy_hi {
             for cz in cz_lo..=cz_hi {
                 for cx in cx_lo..=cx_hi {

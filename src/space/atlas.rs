@@ -19,10 +19,31 @@ use crate::coord::Face;
 
 /// First storage x of the reserved region (beyond the physical border, inside i32 chunk math).
 pub const STORAGE_X0: i64 = 1_100_000_000;
-/// Storage x span reserved per round body (a body's boxes side by side take about π·r of it).
-pub const SLOT: i64 = 1 << 25;
 /// Empty storage cells kept between neighbouring boxes (so glue reads never hit another box).
 const GAP: i64 = 64;
+
+fn snap16(v: i64) -> i64 {
+    v.div_euclid(16) * 16
+}
+
+/// How many depth bands a body of datum radius `radius` grows before the core.
+fn band_count(radius: i64) -> u32 {
+    let mut count = 0u32;
+    let mut r = radius / 2;
+    while r > 512 {
+        count += 1;
+        r /= 2;
+    }
+    count
+}
+
+/// Band-0 chart edge, in cells, for a full atlas of datum radius `radius`.
+///
+/// A multiple of `2^(bands + 1)` chunks, so every deeper band and the transition divide evenly.
+pub fn surface_n(radius: i64) -> i64 {
+    let unit = 1i64 << (band_count(radius) + 5);
+    ((std::f64::consts::FRAC_PI_2 * radius as f64) / unit as f64).round().max(1.0) as i64 * unit
+}
 /// How far outside a box the glue answers.
 pub const GLUE: i64 = 2;
 
@@ -135,36 +156,27 @@ fn face_index(f: Face) -> usize {
 
 impl Atlas {
     /// The atlas of a body of datum radius `radius` whose cells reach `top` (≥ radius, the relief)
-    /// and go down to the centre, in storage slot `slot`.
-    pub fn new(centre: DVec3, radius: i64, top: i64, inward: bool, slot: u32) -> Self {
-        let x0 = STORAGE_X0 + slot as i64 * SLOT;
+    /// and go down to the centre. Boxes begin at storage x `x0` (chunk-aligned, ≥ [`STORAGE_X0`]).
+    pub fn new(centre: DVec3, radius: i64, top: i64, inward: bool, x0: i64) -> Self {
         // Bands halve the radius and the angular resolution together until the inner radius would
         // drop under 512; the surface resolution is a multiple of 2^(bands + 1) so every band (and
         // the transition at half the last band) divides evenly.
         // Everything is chunk aligned (radii, resolutions and storage origins are multiples of 16),
         // so chart seams fall on chunk boundaries and a chunk's neighbour across a seam is a whole
         // chunk of the neighbouring chart.
-        let snap = |v: i64| v.div_euclid(16) * 16;
-        let mut count = 0u32;
-        let mut r = radius / 2;
-        while r > 512 {
-            count += 1;
-            r /= 2;
-        }
-        // The transition runs at n / 2^(count + 1), which must still be a multiple of 16.
-        let unit = 1i64 << (count + 5);
-        let mut n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / unit as f64).round().max(1.0) as i64 * unit;
+        let count = band_count(radius);
+        let mut n = surface_n(radius);
         // Boxes sit side by side along storage x (faces along z), never stacked: every storage
         // column belongs to at most one box, so a column's skylight ceiling is that box's surface.
         let mut bands = Vec::new();
-        let (mut r_hi, mut r_lo) = (snap(top + 15), snap(radius / 2));
+        let (mut r_hi, mut r_lo) = (snap16(top + 15), snap16(radius / 2));
         let mut x = x0;
         for _ in 0..count {
             let origin = std::array::from_fn(|f| [x, 0, f as i64 * (n + GAP)]);
             bands.push(Band { n, r_lo, r_hi, origin });
-            x = snap(x + n + GAP + 15);
+            x = snap16(x + n + GAP + 15);
             r_hi = r_lo;
-            r_lo = snap(r_lo / 2);
+            r_lo = snap16(r_lo / 2);
             n /= 2;
         }
         // Transition shell from the core cube (half-size a) out to r_hi, at half the last band's
@@ -172,25 +184,52 @@ impl Atlas {
         let t_n = (n / 2).max(32);
         let core_half = t_n / 2;
         let t_r = r_hi;
-        let t_layers = snap((t_r - core_half).max(16) + 15);
+        let t_layers = snap16((t_r - core_half).max(16) + 15);
         let t_origin = std::array::from_fn(|f| [x, 0, f as i64 * (t_n + GAP)]);
-        x = snap(x + t_n + GAP + 15);
+        x = snap16(x + t_n + GAP + 15);
         let core_origin = [x, 0, 0];
-        assert!(x + 2 * core_half <= x0 + SLOT, "a round body of radius {radius} overflows its storage slot");
         let inner = Some(Inner { t_n, t_r, t_layers, t_origin, core_half, core_origin });
-        Self { centre, radius, inward, bands, inner, datum: None }
+        let atlas = Self { centre, radius, inward, bands, inner, datum: None };
+        atlas.check_room(x0);
+        atlas
     }
 
     /// The atlas of a hollow shell's surface: one band of cells between radii `r_lo` and `r_hi`
     /// (sized for one block of arc at the datum radius `radius`), no core. `inward` turns it into an
-    /// inner surface (storage up toward the centre).
-    pub fn shell(centre: DVec3, radius: i64, r_lo: i64, r_hi: i64, inward: bool, slot: u32) -> Self {
-        let snap = |v: i64| v.div_euclid(16) * 16;
-        let x0 = STORAGE_X0 + slot as i64 * SLOT;
+    /// inner surface (storage up toward the centre). Boxes begin at storage x `x0`.
+    pub fn shell(centre: DVec3, radius: i64, r_lo: i64, r_hi: i64, inward: bool, x0: i64) -> Self {
         let n = ((std::f64::consts::FRAC_PI_2 * radius as f64) / 16.0).round().max(1.0) as i64 * 16;
-        let (r_lo, r_hi) = (snap(r_lo), snap(r_hi + 15));
+        let (r_lo, r_hi) = (snap16(r_lo), snap16(r_hi + 15));
         let origin = std::array::from_fn(|f| [x0, 0, f as i64 * (n + GAP)]);
-        Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None, datum: None }
+        let atlas = Self { centre, radius, inward, bands: vec![Band { n, r_lo, r_hi, origin }], inner: None, datum: None };
+        atlas.check_room(x0);
+        atlas
+    }
+
+    /// Storage x where this atlas's boxes begin.
+    pub fn x0(&self) -> i64 {
+        self.bands[0].origin[0][0]
+    }
+
+    /// Storage x occupied by the boxes, from [`x0`](Self::x0) through the end of the last one
+    /// (no trailing gap).
+    pub fn x_span(&self) -> i64 {
+        let x0 = self.x0();
+        self.patches().map(|p| {
+            let (o, s) = self.storage_box(p);
+            o[0] + s[0]
+        }).max().unwrap_or(x0) - x0
+    }
+
+    /// Storage x where the next atlas may start: this one's boxes, then the gap, chunk-aligned.
+    pub fn next_x(&self) -> i64 {
+        snap16(self.x0() + self.x_span() + GAP + 15)
+    }
+
+    fn check_room(&self, x0: i64) {
+        assert!(x0 >= STORAGE_X0 && x0 % 16 == 0, "storage origin {x0} is outside the reserved region");
+        let end = x0 + self.x_span();
+        assert!(end < i32::MAX as i64, "a round body of radius {} overflows i32 storage ({end})", self.radius);
     }
 
     /// The storage box of a patch: `(min, size)`.
@@ -417,7 +456,7 @@ mod tests {
     use super::*;
 
     fn atlas() -> Atlas {
-        Atlas::new(DVec3::new(4.0e8, -1.2e8, 3.0e8), 200_000, 202_048, false, 1)
+        Atlas::new(DVec3::new(4.0e8, -1.2e8, 3.0e8), 200_000, 202_048, false, STORAGE_X0)
     }
 
     #[test]
@@ -435,7 +474,7 @@ mod tests {
         // Storage boxes are disjoint and beyond the physical border.
         let boxes: Vec<_> = a.patches().map(|p| a.storage_box(p)).collect();
         for (i, (o, s)) in boxes.iter().enumerate() {
-            assert!(o[0] >= STORAGE_X0 && o[0] + s[0] < STORAGE_X0 + 2 * SLOT);
+            assert!(o[0] >= STORAGE_X0 && o[0] + s[0] < i32::MAX as i64);
             for (oo, ss) in &boxes[i + 1..] {
                 let overlap = (0..3).all(|k| o[k] < oo[k] + ss[k] + GAP && oo[k] < o[k] + s[k] + GAP);
                 assert!(!overlap, "boxes {o:?}/{s:?} and {oo:?}/{ss:?} too close");
@@ -491,7 +530,7 @@ mod tests {
     #[test]
     fn storage_is_right_handed_outward_and_inward() {
         for inward in [false, true] {
-            let a = Atlas::new(DVec3::new(1.0e8, 0.0, 0.0), 50_000, 52_048, inward, 2);
+            let a = Atlas::new(DVec3::new(1.0e8, 0.0, 0.0), 50_000, 52_048, inward, STORAGE_X0);
             for p in a.patches() {
                 let (_, size) = a.storage_box(p);
                 let l = DVec3::new(size[0] as f64 * 0.4, size[1] as f64 * 0.6, size[2] as f64 * 0.3);
@@ -511,7 +550,7 @@ mod tests {
     fn a_shell_atlas_covers_only_its_shell_both_ways() {
         let c = DVec3::new(-3.0e8, 1.0e8, 2.0e8);
         for inward in [false, true] {
-            let a = Atlas::shell(c, 60_000, 59_000, 61_000, inward, 3);
+            let a = Atlas::shell(c, 60_000, 59_000, 61_000, inward, STORAGE_X0);
             assert!(a.inner.is_none() && a.bands.len() == 1);
             assert!(a.find(c + DVec3::new(0.0, 60_000.0, 0.0)).is_some());
             assert!(a.find(c + DVec3::new(0.0, 30_000.0, 0.0)).is_none(), "the cavity is not covered");
@@ -529,6 +568,10 @@ mod tests {
             assert!(o.iter().all(|v| v % 16 == 0), "{p:?} origin {o:?}");
             assert!(size[0] % 16 == 0 && size[2] % 16 == 0 && size[1] % 16 == 0, "{p:?} size {size:?}");
         }
+        assert_eq!(a.x0(), STORAGE_X0);
+        assert!(a.x_span() > 0 && a.x_span() % 16 == 0);
+        assert_eq!(a.next_x(), a.x0() + a.x_span() + GAP);
+        assert!(a.next_x() < i32::MAX as i64);
     }
 
     #[test]

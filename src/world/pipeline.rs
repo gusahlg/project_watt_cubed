@@ -1763,6 +1763,7 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
 mod tests {
     use super::*;
     use crate::block::registry::{AIR, BlockRegistry};
+    use crate::world::generation::TerrainGenerator;
     use std::time::Duration;
     use voxel_engine::Pass;
 
@@ -1794,10 +1795,27 @@ mod tests {
         }
     }
 
+    /// Surface chunk of the start world's +Y chart (the physical origin is air).
+    fn home_surface_chunk(generator: &dyn TerrainGenerator) -> Coord {
+        use crate::space::atlas::Patch;
+        let home = generator.cosmos().expect("cosmos").home();
+        let atlas = generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("the start world is charted");
+        let top = Patch::Shell { band: 0, face: Face::PosY };
+        let n = atlas.bands[0].n;
+        let s = atlas.storage(top, [n / 2, 0, n / 2]);
+        let (x, z) = (s[0] as i32, s[2] as i32);
+        let h = generator.height(x, z);
+        Coord::new(x.div_euclid(CHUNK_SIZE as i32), (h - 1).div_euclid(CHUNK_SIZE as i32), z.div_euclid(CHUNK_SIZE as i32))
+    }
+
     #[test]
     fn worker_generation_matches_the_sync_path() {
         let generator = generator(42);
-        let coord = Coord::new(3, 1, -2); // a ground chunk: y 16..=31 crosses the surface
+        let coord = home_surface_chunk(&*generator);
         let edits = vec![
             (Chunk::index(1, 3, 2), AIR),         // dig a hole
             (Chunk::index(5, 14, 5), BlockId(1)), // place high in the chunk
@@ -1846,12 +1864,12 @@ mod tests {
     fn worker_meshing_matches_the_sync_mesher() {
         let mut registry = BlockRegistry::with_builtins();
         let generator = Terrain::new(&mut registry, 5);
-        // The chunk holding the surface at the origin, with all six neighbours
-        // (below: solid ground, above: sky, sides: more surface).
-        let chunk = Chunk::new(0, 1, 0, &generator);
-        // The 3x3x3 neighbourhood around it (only the 6 face-neighbours are
-        // interesting terrain here; the rest read as air, which is fine).
-        let neighbourhood = |dx: i32, dy: i32, dz: i32| Chunk::new(dx, 1 + dy, dz, &generator);
+        // The start world's chart surface chunk and its 26 neighbours.
+        let centre = home_surface_chunk(&generator);
+        let chunk = Chunk::new(centre.x, centre.y, centre.z, &generator);
+        let neighbourhood = |dx: i32, dy: i32, dz: i32| {
+            Chunk::new(centre.x + dx, centre.y + dy, centre.z + dz, &generator)
+        };
         let neigh: Vec<Chunk> = (0..27)
             .map(|k| neighbourhood(k % 3 - 1, k / 9 - 1, k / 3 % 3 - 1))
             .collect();
@@ -1889,7 +1907,7 @@ mod tests {
         };
         let workers = Workers::spawn(1);
         assert!(workers.submit(Job::Mesh {
-            coord: Coord::new(0, 1, 0),
+            coord: centre,
             rev: 7,
             snapshot
         }));
@@ -1900,7 +1918,7 @@ mod tests {
         let Done::Mesh { coord, rev, data } = done else {
             panic!("expected a mesh result");
         };
-        assert_eq!((coord, rev), (Coord::new(0, 1, 0), 7));
+        assert_eq!((coord, rev), (centre, 7));
         let MeshPayload::Cpu(data) = data else {
             panic!("headless workers send the CPU payload");
         };

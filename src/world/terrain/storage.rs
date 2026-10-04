@@ -1,11 +1,11 @@
 //! The cosmos's round bodies painted on curved charts in storage (SPACE-ARCHITECTURE §7).
 //!
-//! Every ball-shaped body (Verdance, the Ember, the moons) gets an atlas of cube-sphere charts down
-//! to a Cartesian core, the Hollow two shell atlases (its outer crust, and its inner surface facing
-//! the Ember); each has a painter ([`Round`]). The generator answers storage chunk coordinates from
-//! here. Physical space holds none of their cells; their gravity is the cosmos's analytic matter,
-//! unchanged. Which body gets a chart is initial world state chosen by the generator — physics never
-//! asks (a body a player builds behaves by its matter alone).
+//! Every ball (the start world, Verdance, the Ember, the moons) gets an atlas of cube-sphere charts
+//! down to a Cartesian core, the Hollow two shell atlases (its outer crust, and its inner surface
+//! facing the Ember). Round painters ([`Round`]) fill every chart except the start world's: its
+//! band 0 is the face terrain, and the generator paints that before asking here. Deeper bands of
+//! the start world are one bulk block. Physical space holds none of their cells. Which body gets a
+//! chart is initial world state chosen by the generator — physics never asks.
 
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use super::round::{Round, Style};
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::ChunkCoord;
 use crate::space::atlas::{Atlas, Patch, STORAGE_X0};
+use crate::space::datum::DatumField;
 use crate::world::chunk::{CHUNK_SIZE, ChunkData};
 
 /// Unit direction from a moon's parent (the nearest body that is not a moon and not the Ember,
@@ -43,9 +44,14 @@ const DEEP: i64 = 1_200 + 400;
 /// A storage column covered by a box but not by a surface chart: underground, never open sky.
 pub const BURIED: i32 = i32::MAX / 2;
 
-/// One charted body: its painter and its boxes in chunk coordinates (`hi` exclusive).
+/// One charted body: its boxes in chunk coordinates (`hi` exclusive). The start world has no
+/// [`Round`]; the face painter owns its band 0 and [`Charted::fill`] is everything deeper.
 struct Charted {
-    round: Round,
+    round: Option<Round>,
+    atlas: Atlas,
+    home: bool,
+    /// Uniform block below band 0. Meaningful for the start world; rounds answer from their painter.
+    fill: BlockId,
     boxes: Vec<(Patch, [i64; 3], [i64; 3])>,
 }
 
@@ -55,34 +61,42 @@ pub struct StorageWorlds {
     atlases: Vec<Arc<Atlas>>,
 }
 
+fn boxes_of(atlas: &Atlas) -> Vec<(Patch, [i64; 3], [i64; 3])> {
+    atlas
+        .patches()
+        .map(|p| {
+            let (o, size) = atlas.storage_box(p);
+            (p, o.map(|v| v / CS), std::array::from_fn(|a| (o[a] + size[a]) / CS))
+        })
+        .collect()
+}
+
 impl StorageWorlds {
-    /// Chart every round body of `cosmos` (slots in catalog order).
-    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>) -> Self {
+    /// Chart every round body of `cosmos`, boxes end to end from [`STORAGE_X0`]. `home_fill` is the
+    /// start world's uniform block below band 0 (the bulk mix's majority material).
+    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, home_fill: BlockId) -> Self {
         let mut worlds = Vec::new();
-        let mut slot = 0u32;
-        let add = |atlas: Atlas, seed: u32, style: Style, pole: DVec3, worlds: &mut Vec<Charted>| {
-            let boxes = atlas
-                .patches()
-                .map(|p| {
-                    let (o, size) = atlas.storage_box(p);
-                    (p, o.map(|v| v / CS), std::array::from_fn(|a| (o[a] + size[a]) / CS))
-                })
-                .collect();
-            worlds.push(Charted { round: Round::new(atlas, seed, style, m.clone(), pole), boxes });
-        };
+        let mut x = STORAGE_X0;
         // Copied so a moon can look up its parent while the loop still holds a body.
         let bodies = cosmos.bodies().to_vec();
         for b in &bodies {
             let c = b.centre_f();
-            match (b.kind, b.shape) {
-                (_, Shape::Cube { .. }) => {}
+            let built = match (b.kind, b.shape) {
+                (Kind::Home, Shape::Ball { r }) => {
+                    Some((Atlas::new(c, r, r + RELIEF, false, x), None, true, home_fill))
+                }
+                (_, Shape::Cube { .. }) | (_, Shape::Shell { .. }) if b.kind != Kind::Hollow => None,
                 (Kind::Hollow, Shape::Shell { outer, inner }) => {
                     let mid = (outer + inner) / 2;
-                    add(Atlas::shell(c, outer, mid, outer + RELIEF, false, slot), b.seed, Style::HollowOuter, DVec3::ZERO, &mut worlds);
-                    add(Atlas::shell(c, inner, inner - RELIEF, mid, true, slot + 1), b.seed ^ 0x1A2B, Style::HollowInner, DVec3::ZERO, &mut worlds);
-                    slot += 2;
+                    let outer_a = Atlas::shell(c, outer, mid, outer + RELIEF, false, x);
+                    let outer_r = Round::new(outer_a.clone(), b.seed, Style::HollowOuter, m.clone(), DVec3::ZERO);
+                    let next = outer_a.next_x();
+                    worlds.push(Charted { boxes: boxes_of(&outer_a), round: Some(outer_r), atlas: outer_a, home: false, fill: AIR });
+                    x = next;
+                    let inner_a = Atlas::shell(c, inner, inner - RELIEF, mid, true, x);
+                    let inner_r = Round::new(inner_a.clone(), b.seed ^ 0x1A2B, Style::HollowInner, m.clone(), DVec3::ZERO);
+                    Some((inner_a, Some(inner_r), false, AIR))
                 }
-                (_, Shape::Shell { .. }) => {}
                 (kind, Shape::Ball { r }) => {
                     let style = match kind {
                         Kind::Verdant => Style::Verdant,
@@ -90,13 +104,63 @@ impl StorageWorlds {
                         _ => Style::Moon { tone: (b.seed % 3) as u8 },
                     };
                     let pole = if kind == Kind::Moon { parent_pole(&bodies, b) } else { DVec3::ZERO };
-                    add(Atlas::new(c, r, r + RELIEF, false, slot), b.seed, style, pole, &mut worlds);
-                    slot += 1;
+                    let atlas = Atlas::new(c, r, r + RELIEF, false, x);
+                    let round = Round::new(atlas.clone(), b.seed, style, m.clone(), pole);
+                    Some((atlas, Some(round), false, AIR))
                 }
+                _ => None,
+            };
+            if let Some((atlas, round, home, fill)) = built {
+                x = atlas.next_x();
+                worlds.push(Charted { boxes: boxes_of(&atlas), round, atlas, home, fill });
             }
         }
-        let atlases = worlds.iter().map(|w| Arc::new(w.round.atlas.clone())).collect();
+        let atlases = worlds.iter().map(|w| Arc::new(w.atlas.clone())).collect();
         Self { worlds, atlases }
+    }
+
+    fn round_of(w: &Charted) -> &Round {
+        w.round.as_ref().expect("the start world's band 0 is painted by the face terrain")
+    }
+
+    /// Atlas index of the start world, matching `CHART_BODY_BASE + index`.
+    pub fn home_index(&self) -> Option<usize> {
+        self.worlds.iter().position(|w| w.home)
+    }
+
+    /// The start world's atlas.
+    pub fn home_atlas(&self) -> Option<&Atlas> {
+        self.worlds.iter().find(|w| w.home).map(|w| &w.atlas)
+    }
+
+    /// The start world's uniform block below band 0.
+    pub fn home_fill(&self) -> BlockId {
+        self.worlds.iter().find(|w| w.home).map(|w| w.fill).unwrap_or(AIR)
+    }
+
+    /// Patch and chunk-local origin (cells) when `c` is one of the start world's boxes.
+    pub fn home_chunk(&self, c: ChunkCoord) -> Option<(Patch, [i64; 3])> {
+        let k = [c.x as i64, c.y as i64, c.z as i64];
+        let w = self.worlds.iter().find(|w| w.home)?;
+        w.boxes.iter().find(|(_, lo, hi)| (0..3).all(|a| k[a] >= lo[a] && k[a] < hi[a])).map(|&(p, lo, _)| {
+            (p, [(k[0] - lo[0]) * CS, (k[1] - lo[1]) * CS, (k[2] - lo[2]) * CS])
+        })
+    }
+
+    /// Patch and local cell when `(x, y, z)` lies in the start world's atlas.
+    pub fn home_cell(&self, x: i32, y: i32, z: i32) -> Option<(Patch, [i64; 3])> {
+        self.home_atlas()?.locate([i64::from(x), i64::from(y), i64::from(z)])
+    }
+
+    /// Install a datum on the start world, on both the painter's atlas and the published one.
+    pub fn set_home_datum(&mut self, field: Arc<DatumField>) {
+        let centre = self.home_atlas().expect("the start world is charted").centre;
+        if let Some(w) = self.worlds.iter_mut().find(|w| w.home) {
+            w.atlas.datum = Some(Arc::clone(&field));
+        }
+        if let Some(slot) = self.atlases.iter_mut().find(|a| (a.centre - centre).length() < 1.0) {
+            Arc::make_mut(slot).datum = Some(field);
+        }
     }
 
     /// The atlases, one per charted surface.
@@ -125,18 +189,27 @@ impl StorageWorlds {
     /// deep body of a band, the deeper bands, the transition and the core).
     pub fn uniform(&self, c: ChunkCoord) -> Option<BlockId> {
         let Some((w, patch, lo)) = self.find(c) else { return Some(AIR) };
+        // Band 0 of the start world is the face painter's. Everything deeper is one bulk block:
+        // the virtual-cube Heart does not land in these boxes.
+        if w.home {
+            return match patch {
+                Patch::Shell { band: 0, .. } => None,
+                _ => Some(w.fill),
+            };
+        }
+        let round = Self::round_of(w);
         match patch {
             Patch::Shell { band: 0, .. } => {
-                let atlas = &w.round.atlas;
+                let atlas = &w.atlas;
                 let b = atlas.bands[0];
                 // Storage y of the datum in this chart, and how far below it this chunk's top lies.
                 let datum = if atlas.inward { b.r_hi - atlas.radius } else { atlas.radius - b.r_lo };
                 let top = (c.y as i64 - lo[1]) * CS + CS - 1;
-                (top < datum - DEEP).then(|| w.round.deep())
+                (top < datum - DEEP).then(|| round.deep())
             }
-            Patch::Shell { .. } => Some(w.round.deep()),
-            Patch::Transition { .. } => Some(w.round.heart().0),
-            Patch::Core => Some(w.round.heart().1),
+            Patch::Shell { .. } => Some(round.deep()),
+            Patch::Transition { .. } => Some(round.heart().0),
+            Patch::Core => Some(round.heart().1),
         }
     }
 
@@ -146,7 +219,7 @@ impl StorageWorlds {
             return ChunkData::Uniform(id);
         }
         let (w, _, _) = self.find(c).expect("a non-uniform storage chunk lies in a box");
-        w.round.fill_chunk([c.x as i64, c.y as i64, c.z as i64])
+        Self::round_of(w).fill_chunk([c.x as i64, c.y as i64, c.z as i64])
     }
 
     /// The block in storage cell `(x, y, z)`.
@@ -156,7 +229,7 @@ impl StorageWorlds {
             return id;
         }
         let (w, _, _) = self.find(c).expect("a non-uniform storage chunk lies in a box");
-        w.round.voxel([x as i64, y as i64, z as i64])
+        Self::round_of(w).voxel([x as i64, y as i64, z as i64])
     }
 
     /// [`surface`](Self::surface) of the 16×16 columns of storage chunk column `(cx, cz)`, indexed
@@ -170,7 +243,7 @@ impl StorageWorlds {
                 }
                 return match patch {
                     Patch::Shell { band: 0, .. } => {
-                        let s = w.round.chunk_surfaces(patch, (kx - lo[0]) * CS, (kz - lo[2]) * CS);
+                        let s = Self::round_of(w).chunk_surfaces(patch, (kx - lo[0]) * CS, (kz - lo[2]) * CS);
                         std::array::from_fn(|k| (s[k] + lo[1] * CS).clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32)
                     }
                     _ => [BURIED; CHUNK_SIZE * CHUNK_SIZE],
@@ -212,9 +285,10 @@ impl StorageWorlds {
                     return None;
                 }
                 let Patch::Shell { band: 0, .. } = patch else { return None };
-                let (lo_h, hi_h) = w.round.relief_bounds(patch, x0 as i64 - bx0, z0 as i64 - bz0, span as i64);
-                let y_lo = w.round.surface_of_relief(patch, lo_h) + lo[1] * CS;
-                let y_hi = w.round.surface_of_relief(patch, hi_h) + lo[1] * CS + super::round::PLANT_REACH;
+                let round = Self::round_of(w);
+                let (lo_h, hi_h) = round.relief_bounds(patch, x0 as i64 - bx0, z0 as i64 - bz0, span as i64);
+                let y_lo = round.surface_of_relief(patch, lo_h) + lo[1] * CS;
+                let y_hi = round.surface_of_relief(patch, hi_h) + lo[1] * CS + super::round::PLANT_REACH;
                 let lo_i = y_lo.clamp(i32::MIN as i64 + 1, i32::MAX as i64 - 1) as i32;
                 let hi_i = y_hi.clamp(lo_i as i64 + 1, i32::MAX as i64) as i32;
                 return Some((lo_i, hi_i));
@@ -236,9 +310,9 @@ impl StorageWorlds {
                 match patch {
                     Patch::Shell { band: 0, .. } => {
                         let (i, j) = (x as i64 - lo[0] * CS, z as i64 - lo[2] * CS);
-                        w.round.lod_column(patch, i, j, lo[1] * CS, &ys[..n], &mut out[..n]);
+                        Self::round_of(w).lod_column(patch, i, j, lo[1] * CS, &ys[..n], &mut out[..n]);
                     }
-                    _ => out[..n].fill(w.round.deep()),
+                    _ => out[..n].fill(if w.home { w.fill } else { Self::round_of(w).deep() }),
                 }
                 return;
             }
@@ -259,7 +333,7 @@ impl StorageWorlds {
                 return match patch {
                     Patch::Shell { band: 0, .. } => {
                         let (i, j) = (x as i64 - lo[0] * CS, z as i64 - lo[2] * CS);
-                        let s = w.round.column_surface(patch, i, j) + lo[1] * CS;
+                        let s = Self::round_of(w).column_surface(patch, i, j) + lo[1] * CS;
                         s.clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32
                     }
                     _ => BURIED,
@@ -280,7 +354,7 @@ mod tests {
         let mut reg = BlockRegistry::with_builtins();
         let m = Arc::new(Materials::intern(&mut reg));
         let cosmos = Cosmos::new(42, 1.0);
-        (StorageWorlds::new(&cosmos, &m), cosmos)
+        (StorageWorlds::new(&cosmos, &m, AIR), cosmos)
     }
 
     #[test]
@@ -299,17 +373,35 @@ mod tests {
             }
         }
         assert!(all.iter().all(|(_, hi)| hi[0] * CS < crate::math::CELL_LIMIT as i64), "inside i32 chunk math");
+        let home = w.worlds.iter().find(|c| c.home).expect("the start world is charted");
+        let end = home.atlas.x0() + home.atlas.x_span();
+        assert_eq!(home.atlas.x0(), STORAGE_X0);
+        assert!(home.atlas.x_span() % 16 == 0 && end < i32::MAX as i64);
+        assert!(end < crate::math::CELL_LIMIT as i64);
+        let band = home.atlas.bands[0];
+        assert!(band.r_lo <= home.atlas.radius - 60_000, "band 0 reaches the interior");
+        assert!(home.atlas.bands.len() > 1 && home.atlas.inner.is_some());
+        println!(
+            "home atlas r={} n={} bands={} x0={} span={} end={}",
+            home.atlas.radius,
+            band.n,
+            home.atlas.bands.len(),
+            home.atlas.x0(),
+            home.atlas.x_span(),
+            end
+        );
     }
 
     #[test]
     fn storage_chunks_are_the_painter_and_deep_ones_are_uniform() {
         let (w, _) = worlds();
         for c in &w.worlds {
-            let atlas = &c.round.atlas;
+            let Some(round) = &c.round else { continue };
+            let atlas = &c.atlas;
             let b = atlas.bands[0];
             let patch = Patch::Shell { band: 0, face: crate::coord::Face::PosZ };
             let (i, j) = (b.n / 2 + 3, b.n / 3);
-            let surf = c.round.column_surface(patch, i, j);
+            let surf = round.column_surface(patch, i, j);
             let s = atlas.storage(patch, [i, surf, j]);
             let k = ChunkCoord::new((s[0] / CS) as i32, (s[1] / CS) as i32, (s[2] / CS) as i32);
             let data = w.generate(k);
@@ -322,7 +414,7 @@ mod tests {
             let deep = atlas.storage(patch, [i, surf - 3 * DEEP, j]);
             let kd = ChunkCoord::new((deep[0] / CS) as i32, (deep[1] / CS) as i32, (deep[2] / CS) as i32);
             let id = w.uniform(kd).expect("deep chunks are uniform");
-            assert_eq!(id, c.round.voxel(deep));
+            assert_eq!(id, round.voxel(deep));
         }
         assert_eq!(w.uniform(ChunkCoord::new((STORAGE_X0 / CS) as i32 - 5, 0, 0)), Some(AIR));
     }
@@ -334,13 +426,14 @@ mod tests {
     fn storage_chunk_cost() {
         let (w, _) = worlds();
         for c in &w.worlds {
-            let atlas = &c.round.atlas;
+            let Some(round) = &c.round else { continue };
+            let atlas = &c.atlas;
             let b = atlas.bands[0];
             let patch = Patch::Shell { band: 0, face: crate::coord::Face::PosX };
             let mut chunks = Vec::new();
             for k in 0..64i64 {
                 let (i, j) = (b.n / 2 + k * 16, b.n / 3 + (k % 8) * 16);
-                let surf = c.round.column_surface(patch, i, j);
+                let surf = round.column_surface(patch, i, j);
                 for dy in [-24i64, -8, 8] {
                     let s = atlas.storage(patch, [i, surf + dy, j]);
                     chunks.push(ChunkCoord::new((s[0] / CS) as i32, (s[1] / CS) as i32, (s[2] / CS) as i32));
@@ -354,7 +447,7 @@ mod tests {
                 }
             }
             let per = t.elapsed().as_secs_f64() * 1e6 / chunks.len() as f64;
-            eprintln!("{:?}: {per:.0} µs per surface chunk ({solid}/{} not air)", c.round.style(), chunks.len());
+            eprintln!("{:?}: {per:.0} µs per surface chunk ({solid}/{} not air)", round.style(), chunks.len());
         }
     }
 }
