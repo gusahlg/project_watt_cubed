@@ -32,7 +32,7 @@ use crate::space::FaceFrame;
 
 use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{ChunkCoord, SECTION_N, SectionPos};
+use super::{ChunkCoord, FINEST_DETAIL, SECTION_N, SectionPos};
 #[cfg(test)]
 use super::{DOMAIN_H, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
@@ -367,11 +367,13 @@ pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables
     mesh_section_with(n_cells, tables, floor, |dense| fill_from_section(dense, n_cells, section))
 }
 
-/// The lowest surface cell (native index) of the columns just outside a section's four edges,
-/// sampled from the generator's heights at the same cell centres a neighbouring section uses.
-/// Packing a section from at or below this floor guarantees its border walls reach down to its
-/// neighbours' surfaces (no cracks), however the slab is trimmed.
+/// Lowest native cell a section's border walls must reach so they meet the neighbour.
+/// Finest rings take the min outside surface. Coarser rings start at the window floor:
+/// their edge samples sit a cell apart and miss the valley between them.
 pub(in crate::world) fn ring_floor<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G) -> i32 {
+    if pos.detail > FINEST_DETAIL {
+        return 0;
+    }
     let cell = pos.cell_size();
     let n = SECTION_N as i32;
     let top = |ix: i32, iz: i32| {
@@ -402,7 +404,7 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     let cell = pos.cell_size();
     let n_cells = ((ahi - alo) / cell) as usize;
     let half = cell / 2;
-    let ys: Vec<i32> = (0..n_cells as i32).map(|j| alo + j * cell + half).collect();
+    let ys = super::column_ys(pos.detail, alo, n_cells as i32, cell);
     let flat = super::flatten_edits(edits);
     let remapped;
     let used: &[_] = if pos.face == Face::PosY {
@@ -459,6 +461,9 @@ fn face_edits(flat: &[(i32, i32, i32, BlockId)], face: Face) -> Vec<(i32, i32, i
 
 /// [`ring_floor`] measured from `alo` along `pos.face` (surface altitude, not world Y).
 fn ring_floor_face<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G, alo: i32) -> i32 {
+    if pos.detail > FINEST_DETAIL {
+        return 0;
+    }
     let cell = pos.cell_size();
     let n = SECTION_N as i32;
     let top = |ix: i32, iz: i32| {
@@ -726,6 +731,7 @@ mod tests {
     use crate::block::registry::BlockRegistry;
     use crate::world::generation::TerrainGenerator;
     use crate::world::terrain::Terrain;
+    use crate::ident::Detail;
     use crate::world::section::{FINEST_DETAIL, SectionPos};
 
     // Test fixtures
@@ -1209,6 +1215,405 @@ mod tests {
             let direct = mesh_of(&oracle);
             assert_eq!(canon(&turned), canon(&direct), "{face:?}");
         }
+    }
+
+    /// A placed section: tops and the vertical quads that sit on its four edges.
+    /// World positions ignore the inward micro-nudge (a uniform hairline, not a slot).
+    struct Tile {
+        pos: SectionPos,
+        x0: i32,
+        x1: i32,
+        z0: i32,
+        z1: i32,
+        tops: Vec<[i32; 5]>,
+        walls: Vec<[i32; 6]>,
+    }
+
+    fn place_tile(pos: SectionPos, mesh: &SectionMeshData) -> Tile {
+        let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let scale = 1i32 << detail.0;
+        let (x0, z0) = (pos.min_x(), pos.min_z());
+        let (x1, z1) = (x0 + pos.span(), z0 + pos.span());
+        let mut tops = Vec::new();
+        let mut walls = Vec::new();
+        for slab in &mesh.slabs {
+            let place = crate::world::SectionState::slab_placement(pos, slab.origin_y, detail, mesh.altitude_floor);
+            let w = |local: f32, origin: i32| origin + (local as i32) * scale;
+            for pass in Pass::ALL {
+                for q in slab.data[pass].vertices().chunks_exact(4) {
+                    let n = q[0].normal();
+                    let mut min = [i32::MAX; 3];
+                    let mut max = [i32::MIN; 3];
+                    for v in q {
+                        let p = v.local_pos();
+                        let g = [w(p[0], place.block.x), w(p[1], place.block.y), w(p[2], place.block.z)];
+                        for a in 0..3 {
+                            min[a] = min[a].min(g[a]);
+                            max[a] = max[a].max(g[a]);
+                        }
+                    }
+                    if n == Normal::PosY && min[1] == max[1] {
+                        tops.push([min[0], max[0], min[2], max[2], min[1]]);
+                    } else if (n == Normal::PosX || n == Normal::NegX) && min[0] == max[0]
+                        && (min[0] == x0 || min[0] == x1)
+                    {
+                        walls.push([0, min[0], min[2], max[2], min[1], max[1]]);
+                    } else if (n == Normal::PosZ || n == Normal::NegZ) && min[2] == max[2]
+                        && (min[2] == z0 || min[2] == z1)
+                    {
+                        walls.push([2, min[2], min[0], max[0], min[1], max[1]]);
+                    }
+                }
+            }
+        }
+        Tile { pos, x0, x1, z0, z1, tops, walls }
+    }
+
+    fn top_at(tile: &Tile, x: i32, z: i32) -> Option<i32> {
+        tile.tops.iter().filter(|t| x >= t[0] && x <= t[1] && z >= t[2] && z <= t[3]).map(|t| t[4]).max()
+    }
+
+    /// Uncovered blocks between `lo` and `hi` after the walls that contain `along` are unioned.
+    fn open_span(tile_a: &Tile, tile_b: &Tile, axis: i32, edge: i32, along: i32, lo: i32, hi: i32) -> i32 {
+        if hi <= lo {
+            return 0;
+        }
+        let mut iv = Vec::new();
+        for tile in [tile_a, tile_b] {
+            for w in &tile.walls {
+                if w[0] == axis && w[1] == edge && along >= w[2] && along <= w[3] {
+                    let (a, b) = (w[4].max(lo), w[5].min(hi));
+                    if b > a {
+                        iv.push((a, b));
+                    }
+                }
+            }
+        }
+        iv.sort_unstable();
+        let mut cursor = lo;
+        let mut worst = 0;
+        for (a, b) in iv {
+            if a > cursor {
+                worst = worst.max(a - cursor);
+            }
+            cursor = cursor.max(b);
+        }
+        if hi > cursor {
+            worst = worst.max(hi - cursor);
+        }
+        worst
+    }
+
+    struct SeamGap {
+        gap: i32,
+        station: i32,
+        top_lo: i32,
+        top_hi: i32,
+        da: i8,
+        db: i8,
+        a: (i32, i32),
+        b: (i32, i32),
+    }
+
+    /// Vertical slots where two edge-adjacent tiles' tops differ and no wall covers the step.
+    fn seam_gaps(a: &Tile, b: &Tile) -> Vec<SeamGap> {
+        let mut out = Vec::new();
+        let mut push = |axis: i32, edge: i32, lo: i32, hi: i32, inset_a: i32, inset_b: i32| {
+            if hi - lo < 4 {
+                return;
+            }
+            let fine = a.pos.cell_size().min(b.pos.cell_size());
+            let mut s = lo + fine / 2;
+            while s < hi {
+                let (pa, pb) = if axis == 0 {
+                    ((edge + inset_a, s), (edge + inset_b, s))
+                } else {
+                    ((s, edge + inset_a), (s, edge + inset_b))
+                };
+                let (ta, tb) = (top_at(a, pa.0, pa.1), top_at(b, pb.0, pb.1));
+                if let (Some(ta), Some(tb)) = (ta, tb) {
+                    let (lo_y, hi_y) = (ta.min(tb), ta.max(tb));
+                    let gap = open_span(a, b, axis, edge, s, lo_y, hi_y);
+                    if gap > 0 {
+                        out.push(SeamGap {
+                            gap,
+                            station: s,
+                            top_lo: lo_y,
+                            top_hi: hi_y,
+                            da: a.pos.detail.0,
+                            db: b.pos.detail.0,
+                            a: (a.pos.x, a.pos.z),
+                            b: (b.pos.x, b.pos.z),
+                        });
+                    }
+                } else if ta.is_some() || tb.is_some() {
+                    out.push(SeamGap {
+                        gap: i32::MAX / 4,
+                        station: s,
+                        top_lo: ta.unwrap_or(-1),
+                        top_hi: tb.unwrap_or(-1),
+                        da: a.pos.detail.0,
+                        db: b.pos.detail.0,
+                        a: (a.pos.x, a.pos.z),
+                        b: (b.pos.x, b.pos.z),
+                    });
+                }
+                s += fine;
+            }
+        };
+        if a.x1 == b.x0 {
+            let lo = a.z0.max(b.z0);
+            let hi = a.z1.min(b.z1);
+            push(0, a.x1, lo, hi, -a.pos.cell_size() / 2, b.pos.cell_size() / 2);
+        } else if b.x1 == a.x0 {
+            let lo = a.z0.max(b.z0);
+            let hi = a.z1.min(b.z1);
+            push(0, a.x0, lo, hi, a.pos.cell_size() / 2, -b.pos.cell_size() / 2);
+        }
+        if a.z1 == b.z0 {
+            let lo = a.x0.max(b.x0);
+            let hi = a.x1.min(b.x1);
+            push(2, a.z1, lo, hi, -a.pos.cell_size() / 2, b.pos.cell_size() / 2);
+        } else if b.z1 == a.z0 {
+            let lo = a.x0.max(b.x0);
+            let hi = a.x1.min(b.x1);
+            push(2, a.z0, lo, hi, a.pos.cell_size() / 2, -b.pos.cell_size() / 2);
+        }
+        out
+    }
+
+    /// A detail-4 section beside a detail-2 neighbour whose valley sits between the coarse
+    /// outside samples. The coarse wall has to reach that valley or the sky shows through.
+    #[test]
+    fn far_seam_coarser_wall_reaches_a_finer_valley() {
+        let (_r, tables, b) = setup();
+        let stone = b.stone;
+        fn valley(x: i32, z: i32) -> bool {
+            // Wider than a finest packed cell (8) and between the coarse centres at z = 8 and 24.
+            (512..528).contains(&x) && (16..24).contains(&z)
+        }
+        let terra = FnGen {
+            h: move |x, z| if valley(x, z) { 40 } else { 200 },
+            b: move |x, y, z| if y < if valley(x, z) { 40 } else { 200 } { stone } else { AIR },
+            surf: b.grass,
+            deep: stone,
+        };
+        let coarse = SectionPos { body: 0, face: Face::PosY, detail: Detail(FINEST_DETAIL.0 + 2), x: 0, z: 0 };
+        let fine = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 4, z: 0 };
+        assert_eq!(ring_floor(coarse, &terra), 0, "a coarse skirt starts at the window floor");
+        assert!(ring_floor(fine, &terra) > 0, "the finest ring still trims to the outside surface");
+        let ct = place_tile(coarse, &extract_section_mesh(coarse, &terra, &[], &tables));
+        let ft = place_tile(fine, &extract_section_mesh(fine, &terra, &[], &tables));
+        let gaps = seam_gaps(&ct, &ft);
+        let worst = gaps.iter().map(|g| g.gap).max().unwrap_or(0);
+        assert!(
+            gaps.is_empty(),
+            "detail {:?} vs {:?} left {worst} blocks open ({} stations, first station {} tops {}..{})",
+            coarse.detail,
+            fine.detail,
+            gaps.len(),
+            gaps.first().map(|g| g.station).unwrap_or(0),
+            gaps.first().map(|g| g.top_lo).unwrap_or(0),
+            gaps.first().map(|g| g.top_hi).unwrap_or(0),
+        );
+    }
+
+    /// Far-field closure from altitude. The eye is the streaming sample (chunk centre
+    /// `(8, y, 8)`), which is the spawn column the task's `(0.5, y, 0.5)` sits in.
+    #[test]
+    fn far_seam_altitude_frontier_borders_are_closed() {
+        use crate::coord::ChunkCoord;
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::heightmip::BakeExtent;
+        use crate::world::quadtree;
+        use crate::world::{World, DEFAULT_SEED};
+        use std::collections::BTreeMap;
+
+        let mut world = World::with_kind(DEFAULT_SEED, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let home = world.terrain().cosmos().expect("cosmos").home().id;
+        let colors = world.registry.color_snapshot();
+        let extent = BakeExtent::new(world.section_pyramid.outer_m() as i32, world.section_pyramid.coarsest());
+        let bake_at = std::time::Instant::now();
+        world.section_mip = Some(crate::world::heightmip::HeightMip::bake_at(
+            world.terrain(),
+            &colors,
+            extent,
+            8,
+            8,
+            Face::PosY,
+            home,
+        ));
+        world.section_mip_anchor = Some((home, Face::PosY, 8, 8));
+        let bake_ms = bake_at.elapsed().as_secs_f64() * 1000.0;
+        let outer = world.section_pyramid.outer_m();
+        let clip = world.lod_clip();
+        let full = world.view.coverage();
+        let ground = world.terrain().height(8, 8);
+
+        let mut reports = Vec::new();
+        for eye_y in [1500.0_f64, 3000.0] {
+            world.section_eye_y = eye_y;
+            let center = ChunkCoord::new(0, (eye_y as i32).div_euclid(16), 0);
+            let desired = world.desired_sections(center);
+            let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
+            let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
+            let tables = world.registry.hot_tables();
+            let mut tiles = Vec::with_capacity(drawn.len());
+            let mesh_at = std::time::Instant::now();
+            for pos in &drawn {
+                let mesh = extract_section_mesh(*pos, world.terrain(), &[], &tables);
+                tiles.push(place_tile(*pos, &mesh));
+            }
+            let mesh_ms = mesh_at.elapsed().as_secs_f64() * 1000.0;
+            let per = if drawn.is_empty() { 0.0 } else { mesh_ms / drawn.len() as f64 };
+
+            let mut by = BTreeMap::new();
+            for p in &drawn {
+                *by.entry(p.detail.0).or_insert(0usize) += 1;
+            }
+            let min_span = drawn.iter().map(|p| p.span()).min().unwrap_or(1);
+            let limit = outer - min_span as f32;
+            let step = (min_span / 2).max(1);
+            let (ex, ez) = (8i32, 8i32);
+            let r = limit.floor() as i32;
+            let mut cover_gaps = 0i32;
+            let mut cover_n = 0i32;
+            let mut cover_at = Vec::new();
+            let mut z = ez - r;
+            while z <= ez + r {
+                let mut x = ex - r;
+                while x <= ex + r {
+                    let dx = (x - ex) as f32;
+                    let dz = (z - ez) as f32;
+                    if dx.hypot(dz) <= limit {
+                        cover_n += 1;
+                        let hit = desired.iter().any(|p| {
+                            let (x0, z0) = (p.min_x(), p.min_z());
+                            x >= x0 && x < x0 + p.span() && z >= z0 && z < z0 + p.span()
+                        });
+                        if !hit {
+                            cover_gaps += 1;
+                            if cover_at.len() < 4 {
+                                cover_at.push((x, z));
+                            }
+                        }
+                    }
+                    x += step;
+                }
+                z += step;
+            }
+
+            let cam_ground = eye_y - ground as f64;
+            let cam_y = eye_y as f32;
+            let culled = drawn.iter().filter(|p| {
+                let (x0, x1) = (p.min_x() as f32 - 8.0, (p.min_x() + p.span()) as f32 - 8.0);
+                let (y0, y1) = (-cam_y, 512.0 - cam_y);
+                let (z0, z1) = (p.min_z() as f32 - 8.0, (p.min_z() + p.span()) as f32 - 8.0);
+                x0 > -clip.half.x && x1 < clip.half.x
+                    && y0 > -clip.half.y && y1 < clip.half.y
+                    && z0 > -clip.half.z && z1 < clip.half.z
+            }).count();
+
+            let mut gaps: Vec<SeamGap> = Vec::new();
+            let mut seams = 0usize;
+            let mut cross = 0usize;
+            for i in 0..tiles.len() {
+                for j in (i + 1)..tiles.len() {
+                    let found = seam_gaps(&tiles[i], &tiles[j]);
+                    if tiles[i].x1 == tiles[j].x0 || tiles[j].x1 == tiles[i].x0 || tiles[i].z1 == tiles[j].z0 || tiles[j].z1 == tiles[i].z0
+                    {
+                        let z_over = tiles[i].z0.max(tiles[j].z0) < tiles[i].z1.min(tiles[j].z1);
+                        let x_over = tiles[i].x0.max(tiles[j].x0) < tiles[i].x1.min(tiles[j].x1);
+                        let touch_x = (tiles[i].x1 == tiles[j].x0 || tiles[j].x1 == tiles[i].x0) && z_over;
+                        let touch_z = (tiles[i].z1 == tiles[j].z0 || tiles[j].z1 == tiles[i].z0) && x_over;
+                        if touch_x || touch_z {
+                            seams += 1;
+                            if tiles[i].pos.detail != tiles[j].pos.detail {
+                                cross += 1;
+                            }
+                        }
+                    }
+                    gaps.extend(found);
+                }
+            }
+            let missing = gaps.iter().filter(|g| g.gap > 1_000_000).count();
+            let vertical: Vec<&SeamGap> = gaps.iter().filter(|g| g.gap <= 1_000_000).collect();
+            let worst = vertical.iter().copied().max_by_key(|g| g.gap);
+            let same = vertical.iter().filter(|g| g.da == g.db).count();
+            let mut bare = 0i32;
+            let mut bare_n = 0i32;
+            let mut origin_top = None;
+            for t in &tiles {
+                let cell = t.pos.cell_size();
+                let mut x = t.x0 + cell / 2;
+                while x < t.x1 {
+                    let mut z = t.z0 + cell / 2;
+                    while z < t.z1 {
+                        bare_n += 1;
+                        if top_at(t, x, z).is_none() {
+                            bare += 1;
+                        }
+                        z += cell;
+                    }
+                    x += cell;
+                }
+                if t.x0 <= 128 && 128 < t.x1 && t.z0 <= 128 && 128 < t.z1 {
+                    origin_top = top_at(t, t.x0 + cell / 2, t.z0 + cell / 2);
+                }
+            }
+            let floor_note = if let Some(g) = worst {
+                let side = tiles.iter().find(|t| t.pos.detail.0 == g.da && t.pos.x == g.a.0 && t.pos.z == g.a.1);
+                let other = tiles.iter().find(|t| t.pos.detail.0 == g.db && t.pos.x == g.b.0 && t.pos.z == g.b.1);
+                match (side, other) {
+                    (Some(a), Some(b)) => format!(
+                        " ring_floor world Y {} and {}",
+                        mesh_floor_y(a.pos, world.terrain()),
+                        mesh_floor_y(b.pos, world.terrain()),
+                    ),
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            let worst_s = match worst {
+                Some(g) => format!(
+                    "worst gap {} blocks at station {} tops {}..{} details {}/{} sections ({},{})-({},{}){}",
+                    g.gap, g.station, g.top_lo, g.top_hi, g.da, g.db, g.a.0, g.a.1, g.b.0, g.b.1, floor_note
+                ),
+                None => "worst gap 0".to_string(),
+            };
+            let dy = (eye_y - 512.0).max(0.0);
+            let (desired_n, drawn_n, vert_n) = (desired.len(), drawn.len(), vertical.len());
+            reports.push(format!(
+                "eye_y {eye_y}: desired {desired_n} drawn {drawn_n} by {by:?} seams {seams} cross-detail {cross} \
+                 vertical gaps {vert_n} (same-detail {same}) missing-top {missing} {worst_s}; \
+                 bare columns {bare}/{bare_n} origin-top {origin_top:?}; coverage gaps {cover_gaps}/{cover_n} \
+                 step {step} limit {limit:.0} examples {cover_at:?}; mesh {mesh_ms:.1} ms ({per:.2} ms/section); \
+                 dy {dy:.0} outer {outer:.0} ground {ground} cam-ground {cam_ground:.0}; lod clip half ({cx:.0},{cy:.0},{cz:.0}) \
+                 full half ({fx:.0},{fy:.0},{fz:.0}) culled {culled}",
+                cx = clip.half.x,
+                cy = clip.half.y,
+                cz = clip.half.z,
+                fx = full.half.x,
+                fy = full.half.y,
+                fz = full.half.z,
+            ));
+        }
+        let report = format!("mip bake {bake_ms:.1} ms; {}", reports.join(" || "));
+        println!("{report}");
+        let closed = reports.iter().all(|r| {
+            r.contains("vertical gaps 0 ")
+                && r.contains("missing-top 0 ")
+                && r.contains("bare columns 0/")
+                && r.contains("coverage gaps 0/")
+                && r.contains("culled 0")
+        });
+        assert!(closed, "{report}");
+    }
+
+    fn mesh_floor_y<G: TerrainGenerator + ?Sized>(pos: SectionPos, terra: &G) -> i32 {
+        ring_floor(pos, terra) * pos.cell_size()
     }
 
     /// extract+mesh 16 fixed sections at detail 2, seed 42 — the gauge for the

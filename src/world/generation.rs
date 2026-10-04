@@ -27,6 +27,26 @@ pub enum Classify {
 /// Ground height per cell of a 16×16 chunk column — identical to [`TerrainGenerator::height`].
 pub type ColumnHeights = [i32; CHUNK_SIZE * CHUNK_SIZE];
 
+/// Coarse rings pass cell floors (aligned, step at least two finest cells).
+/// Finest rings pass centres and must keep the block that sample returned.
+pub(in crate::world) fn coarse_floor_samples(ys: &[i32]) -> bool {
+    let Some(&y1) = ys.get(1) else { return false };
+    let step = y1 - ys[0];
+    let min_step = 1i32 << (super::section::FINEST_DETAIL.0 + 1);
+    step >= min_step && ys[0].rem_euclid(step) == 0
+}
+
+/// The floor sample of a coarse cell is underground rock. The top solid cell
+/// shows the surface block instead, so a textured ring is not a rock plain.
+pub(in crate::world) fn paint_lod_top(out: &mut [BlockId], n: usize, surf: BlockId) {
+    if surf == AIR || n == 0 {
+        return;
+    }
+    if let Some(j) = out[..n].iter().rposition(|&id| id != AIR) {
+        out[j] = surf;
+    }
+}
+
 /// Sample [`TerrainGenerator::height`] across a chunk column. Used by the
 /// default [`TerrainGenerator::generate_column`] (test gens that do not batch).
 pub(super) fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i32, cz: i32) -> ColumnHeights {
@@ -217,6 +237,9 @@ pub trait TerrainGenerator: Send + Sync {
     fn lod_column(&self, wx: i32, wz: i32, ys: &[i32], out: &mut [BlockId]) {
         for (o, &wy) in out.iter_mut().zip(ys) {
             *o = self.lod_block_at(wx, wy, wz);
+        }
+        if coarse_floor_samples(ys) && out.iter().take(ys.len()).any(|&id| id != AIR) {
+            paint_lod_top(out, ys.len(), self.surface_at(wx, wz));
         }
     }
 

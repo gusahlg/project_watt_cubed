@@ -360,13 +360,25 @@ impl Section {
 // fused [`mesh::extract_section_mesh`] production path, so the two can never
 // disagree on sample coordinates or edit folding.
 
-/// The world-Y centre of every vertical cell of a section at `pos`'s detail —
-/// the exact generator sample heights both extraction paths use.
-/// Home +Y (the `[0, 512)` window). Other faces pass their own floor to [`apply_edits`].
+/// World altitude a vertical cell is sampled at.
+///
+/// Finest rings probe the cell centre, so those mesh bytes stay put. Coarser
+/// rings probe the cell floor: a centre above the surface marks the whole cell air,
+/// and from altitude that cell is a hole in the far field.
+pub(in crate::world) fn probe_y(detail: Detail, alo: i32, index: i32, cell: i32) -> i32 {
+    let into = if detail > FINEST_DETAIL { 0 } else { cell / 2 };
+    alo + index * cell + into
+}
+
+/// Sample altitude of every vertical cell, bottom-up.
+pub(in crate::world) fn column_ys(detail: Detail, alo: i32, n: i32, cell: i32) -> Vec<i32> {
+    (0..n).map(|j| probe_y(detail, alo, j, cell)).collect()
+}
+
+/// Home +Y sample altitudes (the `[0, 512)` window). Other faces pass their own floor.
 pub(in crate::world) fn cell_centers(pos: SectionPos) -> Vec<i32> {
     let cell = pos.cell_size();
-    let half = cell / 2;
-    (0..pos.n_cells()).map(|j| LOD_FLOOR_Y + j * cell + half).collect()
+    column_ys(pos.detail, LOD_FLOOR_Y, pos.n_cells(), cell)
 }
 
 /// Sample window `[lo, hi)` along the face normal.
@@ -554,10 +566,10 @@ mod tests {
         }
     }
 
-    /// Reference: coarse-cell sweep per column from generator contract (parity oracle).
+    /// Reference: one column through the same sample altitudes [`cell_centers`] uses.
     fn reference_cells<G: TerrainGenerator + ?Sized>(r#gen: &G, wx: i32, wz: i32, cell: i32) -> Vec<BlockId> {
-        let half = cell / 2;
-        let ys: Vec<i32> = (0..DOMAIN_H / cell).map(|j| LOD_FLOOR_Y + j * cell + half).collect();
+        let detail = Detail(cell.trailing_zeros() as i8);
+        let ys = column_ys(detail, LOD_FLOOR_Y, DOMAIN_H / cell, cell);
         let mut out = vec![AIR; ys.len()];
         r#gen.lod_column(wx, wz, &ys, &mut out);
         out
@@ -760,8 +772,8 @@ mod tests {
         }
     }
 
-    // Roundtrip tests: column_ids(extract(...)) must match the unchanged
-    // sampling stage (gen.lod_column + apply_edits) at every ring.
+    // Roundtrip tests: column_ids(extract(...)) must match the sampling stage
+    // (gen.lod_column + apply_edits) at every ring.
 
     /// Reachable failure: fails if per-brick RLE construction or the
     /// column_runs/topmost_solid accessor layer drops, duplicates, or
