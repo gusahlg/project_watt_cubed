@@ -1003,8 +1003,22 @@ pub struct World {
     admit_coords: AdmitScratch<Coord>,
     /// Reused by the section admission lane.
     admit_sections: AdmitScratch<SectionPos>,
-    /// Reused column list for [`World::request_region_data`].
+    /// Generate runs for the current data box, nearest-first, not yet submitted.
+    /// Kept across frames: rebuilding it walks every coord, and a 2 ms budget
+    /// that pays that walk each pass admits only the floor.
     gen_columns: Vec<(u64, streaming::GenRun)>,
+    /// Box `gen_columns` was gathered for. A mismatch, or `gen_cursor_dirty`,
+    /// rebuilds the queue instead of scanning the data box again.
+    gen_cursor_center: Option<Coord>,
+    gen_cursor_up: Option<Face>,
+    gen_cursor_h: i32,
+    gen_cursor_v: i32,
+    gen_cursor_slab: Option<ChunkBox>,
+    gen_cursor_dirty: bool,
+    /// Velocity the queued runs were last ordered with. A change re-sorts;
+    /// a standing eye does not.
+    gen_cursor_vel: DVec3,
+    gen_cursor_ranked: bool,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
@@ -1396,6 +1410,14 @@ impl World {
             admit_coords: AdmitScratch::default(),
             admit_sections: AdmitScratch::default(),
             gen_columns: Vec::new(),
+            gen_cursor_center: None,
+            gen_cursor_up: None,
+            gen_cursor_h: 0,
+            gen_cursor_v: 0,
+            gen_cursor_slab: None,
+            gen_cursor_dirty: false,
+            gen_cursor_vel: DVec3::ZERO,
+            gen_cursor_ranked: false,
             generating: FastSet::default(),
             building_meshes: 0,
             meshing_sections: 0,
@@ -2460,6 +2482,11 @@ impl StreamLane for MeshLane {
                 || world.light_terminal.contains(&key))
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+        // Fully walled solid: the worker mesh would be empty. `None` drops the
+        // seed; an edit turns `Air` back into `Dirty`.
+        if world.bury_solid_mesh(key) {
+            return None;
+        }
         world.refresh_tables();
         // If light isn't ready, mesh degraded with assumed-lit neighbours,
         // then remesh when real light arrives — unless the chunk is terminal

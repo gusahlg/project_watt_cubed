@@ -16,7 +16,8 @@ use crate::math::block_coord;
 
 use super::chunk::{CHUNK_SIZE, Chunk, ChunkData};
 use super::generation::{Classify, ColumnHeights};
-use crate::block::registry::AIR;
+use crate::block::registry::{HotTables, AIR};
+use super::brick::ChunkPayload;
 use super::heightmip::{BakeExtent, HeightMip};
 use super::metric::{DyCap, EyeDist, EyeMetric, HeightEnvelope};
 use super::section::SectionPos;
@@ -1582,7 +1583,11 @@ impl World {
     /// are the one shared rule ([`admission_exhausted`](super::admission_exhausted)).
     /// The centre chunk is generated synchronously in `stream` only when it is
     /// missing and not already claimed; `accept_column` lands these results.
-    /// Leftover columns re-arm the gate.
+    ///
+    /// The run list is gathered once per data box and drained across frames.
+    /// Walking every coord each pass (classify, then sky) blows the 2 ms budget
+    /// before any job is submitted, so an open asteroid admits only the floor
+    /// and spends the frame on the walk.
     pub(in crate::world) fn request_region_data(
         &mut self,
         center: Coord,
@@ -1591,7 +1596,91 @@ impl World {
         if !self.pending_gen.take() {
             return Progress::Idle;
         }
+        if !self.gen_cursor_matches(center) {
+            self.rebuild_gen_cursor(center);
+        }
+        if self.gen_columns.is_empty() {
+            return Progress::Idle;
+        }
+        let slots = match self.workers.as_ref() {
+            Some(w) => w.near_slots_free(),
+            None => usize::MAX,
+        };
+        if slots == 0 {
+            self.pending_gen.set();
+            return Progress::Partial {
+                remaining: self.gen_columns.len() as u32,
+            };
+        }
         let deadline = super::lanes::paced_deadline(self, budget);
+        let vel = self.section_vel;
+        if !self.gen_cursor_ranked || self.gen_cursor_vel != vel {
+            let up = self.live_up();
+            let fold = self.fold;
+            for entry in &mut self.gen_columns {
+                let anchor = entry.1.anchor();
+                entry.0 = column_order(center, vel, fold.fold(anchor), up);
+            }
+            self.gen_columns.sort_by_key(|e| e.0);
+            self.gen_cursor_vel = vel;
+            self.gen_cursor_ranked = true;
+        }
+        let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
+        let mut admitted = 0usize;
+        let mut consumed = 0usize;
+        while consumed < self.gen_columns.len() {
+            if super::admission_exhausted(admitted, min_admit, deadline) {
+                break;
+            }
+            let run = self.gen_columns[consumed].1;
+            if self.run_quarantined(run) || self.run_covered(run) {
+                consumed += 1;
+                continue;
+            }
+            let accepted = match run {
+                GenRun::Column { key, lo, hi } => self.try_submit_column(key, lo, hi),
+                GenRun::Open { coord } => self.try_submit_open(coord),
+            };
+            if accepted {
+                admitted += 1;
+                consumed += 1;
+            } else {
+                break;
+            }
+        }
+        self.gen_columns.drain(..consumed);
+        if self.gen_columns.is_empty() {
+            Progress::Idle
+        } else {
+            self.pending_gen.set();
+            Progress::Partial {
+                remaining: self.gen_columns.len() as u32,
+            }
+        }
+    }
+
+    /// Whether `gen_columns` is still the run list for `center`'s data box.
+    fn gen_cursor_matches(&self, center: Coord) -> bool {
+        if self.gen_cursor_dirty || self.gen_cursor_center != Some(center) {
+            return false;
+        }
+        if self.gen_cursor_up != self.live_up()
+            || self.gen_cursor_h != self.view.horizontal
+            || self.gen_cursor_v != self.view.vertical
+        {
+            return false;
+        }
+        match (self.gen_cursor_slab, self.spawn_slab) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.center == b.center && a.rh == b.rh && a.rv == b.rv && a.up == b.up
+            }
+            _ => false,
+        }
+    }
+
+    /// Classify the data box once, store uniform chunks, and queue the rest.
+    fn rebuild_gen_cursor(&mut self, center: Coord) {
         let mut coords: Vec<Coord> = self.view_coords(self.data_box(center)).collect();
         if let Some(slab) = self.spawn_slab {
             coords.extend(self.view_coords(slab));
@@ -1616,59 +1705,38 @@ impl World {
             false,
             true,
         );
-        if runs.is_empty() {
-            return Progress::Idle;
-        }
-        let slots = match self.workers.as_ref() {
-            Some(w) => w.near_slots_free(),
-            None => usize::MAX,
-        };
-        if slots == 0 {
-            self.pending_gen.set();
-            return Progress::Partial {
-                remaining: runs.len() as u32,
-            };
-        }
-        let up = self.live_up();
         self.gen_columns.clear();
-        self.gen_columns.extend(runs.into_iter().map(|run| {
-            let anchor = run.anchor();
-            (column_order(center, self.section_vel, self.fold.fold(anchor), up), run)
-        }));
-        let n = self.gen_columns.len();
-        let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
-        let want = n.min(slots.max(min_admit));
-        if want < n {
-            self.gen_columns
-                .select_nth_unstable_by_key(want - 1, |e| e.0);
-            self.gen_columns[..want].sort_by_key(|e| e.0);
-        } else {
-            self.gen_columns.sort_by_key(|e| e.0);
-        }
-        let mut admitted = 0usize;
-        for i in 0..want {
-            if super::admission_exhausted(admitted, min_admit, deadline) {
-                break;
+        self.gen_columns.extend(runs.into_iter().map(|run| (0, run)));
+        self.gen_cursor_center = Some(center);
+        self.gen_cursor_up = self.live_up();
+        self.gen_cursor_h = self.view.horizontal;
+        self.gen_cursor_v = self.view.vertical;
+        self.gen_cursor_slab = self.spawn_slab;
+        self.gen_cursor_dirty = false;
+        self.gen_cursor_ranked = false;
+    }
+
+    /// A quarantined run is dropped, matching `gather_column_runs`'s
+    /// `skip_quarantine`. Pool backpressure is a different `false` from submit
+    /// and must leave the run queued.
+    fn run_quarantined(&self, run: GenRun) -> bool {
+        let key = match run {
+            GenRun::Open { coord } => FailKey::Open { coord },
+            GenRun::Column { key, .. } => FailKey::Column { key },
+        };
+        self.quarantined.contains(&key)
+    }
+
+    /// Every chunk of `run` is loaded or already claimed.
+    fn run_covered(&self, run: GenRun) -> bool {
+        match run {
+            GenRun::Open { coord } => {
+                self.chunks.contains_key(&coord) || self.generating.contains(&coord)
             }
-            let run = self.gen_columns[i].1;
-            let accepted = match run {
-                GenRun::Column { key, lo, hi } => self.try_submit_column(key, lo, hi),
-                GenRun::Open { coord } => self.try_submit_open(coord),
-            };
-            if accepted {
-                admitted += 1;
-            } else {
-                break;
-            }
-        }
-        let remaining = n - admitted;
-        if remaining > 0 {
-            self.pending_gen.set();
-            Progress::Partial {
-                remaining: remaining as u32,
-            }
-        } else {
-            Progress::Idle
+            GenRun::Column { key, lo, hi } => (lo..=hi).all(|alt| {
+                let coord = key.chunk(alt);
+                self.chunks.contains_key(&coord) || self.generating.contains(&coord)
+            }),
         }
     }
 
@@ -1769,6 +1837,8 @@ impl World {
                 // standing-still player still converges.
                 if rearm || in_slab {
                     self.pending_gen.set();
+                    // The run already left the queue when it was submitted.
+                    self.gen_cursor_dirty = true;
                 }
             }
             pipeline::JobKey::Open { coord } => {
@@ -1776,6 +1846,7 @@ impl World {
                 self.generating.remove(&coord);
                 if rearm || in_slab {
                     self.pending_gen.set();
+                    self.gen_cursor_dirty = true;
                 }
             }
             pipeline::JobKey::Mesh { coord } => {
@@ -2148,18 +2219,32 @@ impl World {
         }
         // Seed this chunk and 6 neighbours; a neighbour may have been
         // blocked waiting on this data even if itself uniform air.
-        self.mesh_worklist.insert(coord);
+        // A buried solid is `Air` with no mesh. New neighbour voxels (edit
+        // replay on load) can open a face, so that chunk meshes again.
+        // Uniform non-solid `Air` is born with nothing to draw.
+        self.seed_mesh(coord);
         for face in Face::ALL {
             let n = self.neighbour(coord, face);
-            self.mesh_worklist.insert(n);
+            let (is_air, fill) = match self.chunks.get(&n) {
+                Some(l) if matches!(l.state, MeshState::Air) => (true, l.chunk.uniform()),
+                _ => (false, None),
+            };
+            let buried = is_air && !fill.is_some_and(|id| !self.registry.is_solid(id));
+            if buried {
+                if let Some(loaded) = self.chunks.get_mut(&n) {
+                    loaded.state = MeshState::needs_mesh();
+                }
+            }
+            let ready = matches!(
+                self.chunks.get(&n).map(|l| &l.state),
+                Some(MeshState::Ready(_))
+            );
+            self.seed_mesh(n);
             // A Ready neighbour meshed without this chunk (terminal promotion
             // at a load-set edge, or the neighbour unloaded after the mesh).
             // Rebuild so the final look picks up the new border; worklist
             // seeding alone cannot, since Ready fails `is_needs_mesh`.
-            if matches!(
-                self.chunks.get(&n).map(|l| &l.state),
-                Some(MeshState::Ready(_))
-            ) {
+            if ready {
                 self.remesh_async(n);
             }
         }
@@ -2545,21 +2630,23 @@ impl World {
             self.light_gate.dirty.remove(&coord);
             return;
         }
-        let Some(loaded) = self.chunks.get_mut(&coord) else {
-            return;
-        };
-        if let MeshState::Ready(_) = &loaded.state {
-            // Carry the drawn mesh into the rebuild. A NeedsMesh already
-            // awaiting/mid-build just takes the rev bump, which strands the
-            // in-flight result.
-            let prev = std::mem::replace(&mut loaded.state, MeshState::needs_mesh()).into_owned();
-            loaded.state = MeshState::NeedsMesh {
-                building: false,
-                prev,
+        {
+            let Some(loaded) = self.chunks.get_mut(&coord) else {
+                return;
             };
+            if let MeshState::Ready(_) = &loaded.state {
+                // Carry the drawn mesh into the rebuild. A NeedsMesh already
+                // awaiting/mid-build just takes the rev bump, which strands the
+                // in-flight result.
+                let prev = std::mem::replace(&mut loaded.state, MeshState::needs_mesh()).into_owned();
+                loaded.state = MeshState::NeedsMesh {
+                    building: false,
+                    prev,
+                };
+            }
+            loaded.rev = loaded.rev.wrapping_add(1);
         }
-        loaded.rev = loaded.rev.wrapping_add(1);
-        self.mesh_worklist.insert(coord);
+        self.seed_mesh(coord);
         self.pending_fresh.set();
         self.light_gate.dirty.remove(&coord);
         self.remesh_stats.note_remesh(coord);
@@ -2612,7 +2699,7 @@ impl World {
         // A fixpoint re-settle that skipped this seed would strand the chunk
         // off the worklist forever (ready but unreachable, idle stall).
         self.pending_fresh.set();
-        self.mesh_worklist.insert(coord);
+        self.seed_mesh(coord);
         if !self_changed {
             if reseed {
                 self.seed_light(coord, super::LightSeed::Border);
@@ -2654,7 +2741,7 @@ impl World {
                 // this publish can complete their light_ready.
                 let n_sky = self.chunks[&n].light.as_ref() == Some(&light::LightGrid::open_sky());
                 if open_sky && n_sky {
-                    self.mesh_worklist.insert(n);
+                    self.seed_mesh(n);
                     continue;
                 }
                 if self.light_inflight.contains(&n) {
@@ -2664,7 +2751,7 @@ impl World {
                     self.seed_light(n, super::LightSeed::Border);
                 }
             }
-            self.mesh_worklist.insert(n);
+            self.seed_mesh(n);
             self.light_gate.mark_dirty(n);
         }
         if reseed {
@@ -3106,6 +3193,101 @@ impl World {
         if freed {
             self.pending_sections.set();
             self.section_cover_dirty.set();
+        }
+    }
+
+    /// Every cell is opaque. A paletted chunk's entries are exactly the ids in
+    /// use, so the palette decides it without a cell walk.
+    fn chunk_all_opaque(chunk: &Chunk, tables: &HotTables) -> bool {
+        match &chunk.data().payload {
+            ChunkPayload::Uniform(v) => tables.opaque(v.id),
+            ChunkPayload::Paletted { palette, .. } => palette.iter().all(|p| tables.opaque(p.id)),
+            ChunkPayload::Dense(cells) => cells.iter().all(|c| tables.opaque(c.id)),
+        }
+    }
+
+    /// The face that touches `face` is solid opaque. Uniform and all-opaque
+    /// payloads answer without walking the face.
+    fn chunk_face_opaque(chunk: &Chunk, face: Face, tables: &HotTables) -> bool {
+        if let Some(id) = chunk.uniform() {
+            return tables.opaque(id);
+        }
+        if Self::chunk_all_opaque(chunk, tables) {
+            return true;
+        }
+        let edge = if face.sign() > 0 { CHUNK_SIZE - 1 } else { 0 };
+        for a in 0..CHUNK_SIZE {
+            for b in 0..CHUNK_SIZE {
+                let (x, y, z) = match face.axis() {
+                    0 => (edge, a, b),
+                    1 => (a, edge, b),
+                    _ => (a, b, edge),
+                };
+                if !tables.opaque(chunk.get_local(x, y, z)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// A fresh mesh whose chunk is fully opaque and whose six neighbour faces
+    /// are too has nothing to draw. Settle it `Air` (the empty-mesh result)
+    /// and skip the snapshot. A carried GPU mesh still goes through the worker
+    /// so the old handle is freed, and a missing neighbour reads as air and
+    /// would emit faces.
+    pub(in crate::world) fn bury_solid_mesh(&mut self, coord: Coord) -> bool {
+        let fresh = matches!(
+            self.chunks.get(&coord).map(|l| &l.state),
+            Some(MeshState::NeedsMesh {
+                building: false,
+                prev: None,
+            })
+        );
+        if !fresh || self.light_terminal.contains(&coord) || !self.neighbours_have_data(coord) {
+            return false;
+        }
+        self.refresh_tables();
+        let tables = self.tables.get();
+        if !self
+            .chunks
+            .get(&coord)
+            .is_some_and(|l| Self::chunk_all_opaque(&l.chunk, &tables))
+        {
+            return false;
+        }
+        for &face in &Face::ALL {
+            let ncoord = self.neighbour(coord, face);
+            let covered = self.chunks.get(&ncoord).is_some_and(|l| {
+                Self::chunk_face_opaque(&l.chunk, face.opposite(), &tables)
+            });
+            if !covered {
+                return false;
+            }
+        }
+        if let Some(loaded) = self.chunks.get_mut(&coord) {
+            loaded.state = MeshState::Air;
+        }
+        self.lod_clip_grow.set();
+        true
+    }
+
+    /// Put `coord` on the mesh worklist, or settle it `Air` when it is already
+    /// walled in. An `Air` chunk stays off the list: seeding it only to evict
+    /// it dominates a solid interior. An edit or a reloaded solid neighbour
+    /// turns that `Air` back into a fresh mesh.
+    fn seed_mesh(&mut self, coord: Coord) {
+        match self.chunks.get(&coord).map(|l| &l.state) {
+            Some(MeshState::Air) => return,
+            Some(_) => {
+                self.mesh_worklist.insert(coord);
+                if self.bury_solid_mesh(coord) {
+                    self.mesh_worklist.remove(&coord);
+                }
+            }
+            None => {
+                self.mesh_worklist.insert(coord);
+            }
         }
     }
 
