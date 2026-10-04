@@ -1550,10 +1550,10 @@ impl World {
     /// site, the pop-time re-validation, and the boundary-cross prune.
     fn drop_stale_upload(&mut self, coord: Coord) {
         self.remesh_stats.note_drop_stale();
-        if let Some(loaded) = self.chunks.get_mut(&coord) {
-            if loaded.state.release_build() {
-                super::adjust_count(&mut self.building_meshes, true, false);
-            }
+        // An unloaded chunk is not re-seeded: its next load seeds it.
+        let Some(loaded) = self.chunks.get_mut(&coord) else { return };
+        if loaded.state.release_build() {
+            super::adjust_count(&mut self.building_meshes, true, false);
         }
         self.pending_fresh.set();
         self.mesh_worklist.insert(coord);
@@ -2491,6 +2491,11 @@ impl World {
                 eng.free_cage(cage);
             }
             self.dirty_worklist.remove(&coord);
+            // Seeds of a chunk that is gone are garbage: its next load seeds afresh. Left in, they
+            // pile up in the clamped last ring during flight (never visited, re-bucketed on every
+            // centre move).
+            self.light_worklist.remove(&coord);
+            self.mesh_worklist.remove(&coord);
             self.light_terminal.remove(&coord);
             self.remesh_stats.forget(coord);
             // Column layers: the last chunk out drops the cached ceiling.
