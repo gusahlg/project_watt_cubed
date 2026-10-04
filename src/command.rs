@@ -248,7 +248,24 @@ fn place(target: DVec3, player: &mut Player, world: &mut World) -> Vec<Line> {
     }
     // Cancel any accumulated fall so the player doesn't rocket down on arrival.
     player.cancel_fall();
-    shown(vec![format!("teleported to {}", fmt_pos(player.position))])
+    let mut lines = vec![format!("teleported to {}", fmt_pos(player.position))];
+    lines.extend(altitude_note(world, player.position));
+    shown(lines)
+}
+
+/// How far above the nearest body's ground a teleport left the player, when that is far: a round
+/// world curves away, so 1.4 million blocks from spawn its ground is some 50 km below y = 200.
+fn altitude_note(world: &World, p: DVec3) -> Option<String> {
+    let cosmos = world.terrain().cosmos()?;
+    let body = cosmos.body_at(p)?;
+    let alt = cosmos.altitude(body, p);
+    if alt < 2_000.0 {
+        return None;
+    }
+    let km = alt * crate::math::BLOCK_METERS / 1000.0;
+    let air = if world.in_air(p) { "in the air" } else { "in space" };
+    let name = body.kind.name();
+    Some(format!("{km:.1} km above the ground of {name} ({air}); /tp {name} lands on its surface"))
 }
 
 fn no_cosmos() -> Vec<Line> {
@@ -920,6 +937,25 @@ mod tests {
 
     /// A speed past the limit would make one frame's collision walk billions of substeps (the game
     /// froze, and stayed frozen on rejoin): it is refused, and the limit itself is accepted.
+    /// A coordinate teleport far from spawn over the round start world says it left the player high
+    /// above the curved ground, in space, and how to land.
+    #[test]
+    fn a_far_coordinate_teleport_reports_the_altitude() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        let mut w = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let mut p = player();
+        let out = run("tp -1000000 200 1000000", &mut p, &mut w);
+        let note = out.get(1).expect("an altitude note").text();
+        assert!(note.contains("km above the ground of home (in space)"), "{note}");
+        assert!(note.contains("/tp home"), "{note}");
+        let km: f64 = note.split(' ').next().unwrap().parse().unwrap();
+        assert!((35.0..60.0).contains(&km), "about 52,600 blocks up: {km} km");
+        // Near the ground: no note.
+        let out = run("tp 0.5 60 0.5", &mut p, &mut w);
+        assert_eq!(out.len(), 1, "{:?}", out.iter().map(|l| l.text()).collect::<Vec<_>>());
+    }
+
     #[test]
     fn speed_commands_stop_at_the_speed_limit() {
         let (mut p, mut w) = (player(), world());
