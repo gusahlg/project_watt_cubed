@@ -83,9 +83,19 @@ impl Params {
     }
 }
 
+/// Cohesion (the material law's observation, Q8) mapped to the bottom and the top of the yield
+/// decades: the span the selective-transfer palette's materials actually occupy (ice/crystal ≈ 385,
+/// soils ≈ 762), so the decades are used across real matter rather than an empty range.
+pub const COHESION_SPAN: (f64, f64) = (384.0, 768.0);
+
+/// Normalised cohesion of an observed material.
+pub fn cohesion01(cohesion: i32) -> f64 {
+    ((cohesion as f64 - COHESION_SPAN.0) / (COHESION_SPAN.1 - COHESION_SPAN.0)).clamp(0.0, 1.0)
+}
+
 /// **Prototype** mechanical response of a configuration from its amount (element occurrences,
-/// 0..=32) and cohesion (the material law's internal fit, normalised to `[0, 1]`): density is the
-/// amount; yield rises over [`YIELD_DECADES`] decades with cohesion; stiffness follows yield.
+/// 0..=32) and cohesion (normalised with [`cohesion01`]): density is the amount; yield rises over
+/// [`YIELD_DECADES`] decades with cohesion; stiffness follows yield.
 pub fn mechanical_response(amount: u32, cohesion01: f64) -> Params {
     let c = cohesion01.clamp(0.0, 1.0);
     // 10^(decades · c) without powf (generation arithmetic stays basic): exp(ln 10 · decades · c)
