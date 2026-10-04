@@ -399,6 +399,46 @@ impl StorageWorlds {
         i32::try_from(y).ok()
     }
 
+    /// Min and max storage y of the ground over `[x0, x1) × [z0, z1)`, without plant reach.
+    /// `None` when the rectangle is not one band-0 chart. The mesh window is [`bounds`](Self::bounds).
+    pub fn ground_rect(&self, x0: i32, z0: i32, x1: i32, z1: i32) -> Option<(i32, i32)> {
+        if x1 <= x0 || z1 <= z0 {
+            return None;
+        }
+        let (cx, cz) = (x0.div_euclid(CS as i32) as i64, z0.div_euclid(CS as i32) as i64);
+        let (rx, rz) = (i64::from(x1) - 1, i64::from(z1) - 1);
+        for w in &self.worlds {
+            for &(patch, lo, hi) in &w.boxes {
+                if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
+                    continue;
+                }
+                let (bx0, bx1) = (lo[0] * CS, hi[0] * CS);
+                let (bz0, bz1) = (lo[2] * CS, hi[2] * CS);
+                if i64::from(x0) < bx0 || rx >= bx1 || i64::from(z0) < bz0 || rz >= bz1 {
+                    return None;
+                }
+                if matches!(patch, Patch::Grid) {
+                    continue;
+                }
+                let Patch::Shell { band: 0, .. } = patch else { return None };
+                let round = Self::round_of(w);
+                let (lo_h, hi_h) = round.relief_bounds_rect(
+                    patch,
+                    i64::from(x0) - bx0,
+                    i64::from(z0) - bz0,
+                    i64::from(x1 - x0),
+                    i64::from(z1 - z0),
+                );
+                let y_lo = round.surface_of_relief(patch, lo_h) + lo[1] * CS;
+                let y_hi = round.surface_of_relief(patch, hi_h) + lo[1] * CS;
+                let lo_i = y_lo.clamp(i32::MIN as i64 + 1, i32::MAX as i64 - 1) as i32;
+                let hi_i = y_hi.clamp(i64::from(lo_i), i32::MAX as i64) as i32;
+                return Some((lo_i, hi_i));
+            }
+        }
+        None
+    }
+
     /// Min and max storage y of the surface over the square `[x0, x0+span) × [z0, z0+span)`,
     /// plus plant reach on the top. `None` when the square is not one band-0 chart.
     pub fn bounds(&self, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {

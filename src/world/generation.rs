@@ -267,6 +267,16 @@ pub trait TerrainGenerator: Send + Sync {
         if face == Face::PosY { Some((0, 512)) } else { None }
     }
 
+    /// Min and max surface altitude over the face-local rectangle `[u0, u1) × [v0, v1)`.
+    /// Default is [`surface_bounds`](Self::surface_bounds) of the bounding square.
+    fn surface_rect(&self, body: u16, face: Face, u0: i32, v0: i32, u1: i32, v1: i32) -> Option<(i32, i32)> {
+        let (su, sv) = (u1.saturating_sub(u0), v1.saturating_sub(v0));
+        if su <= 0 || sv <= 0 {
+            return None;
+        }
+        self.surface_bounds(body, face, u0, v0, su.max(sv))
+    }
+
     /// World altitude of face-local height 0. PosY at the origin is 0.
     fn face_datum(&self, _body: u16, _face: Face) -> i32 {
         0

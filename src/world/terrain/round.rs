@@ -861,11 +861,17 @@ impl Round {
     /// Exact over the lattice when the square is small; coarser squares stride and pad, so the
     /// range stays a superset (a far section must not clip a peak the stride stepped over).
     pub(super) fn relief_bounds(&self, patch: Patch, i0: i64, j0: i64, span: i64) -> (f32, f32) {
+        self.relief_bounds_rect(patch, i0, j0, span, span)
+    }
+
+    /// Min and max relief over `[i0, i0+span_i) × [j0, j0+span_j)`. Same lattice as
+    /// [`relief_bounds`](Self::relief_bounds).
+    pub(super) fn relief_bounds_rect(&self, patch: Patch, i0: i64, j0: i64, span_i: i64, span_j: i64) -> (f32, f32) {
         let snap = |p: i64| p.div_euclid(LATTICE) * LATTICE;
         let i_lo = snap(i0);
         let j_lo = snap(j0);
-        let i_hi = snap(i0 + span - 1) + LATTICE;
-        let j_hi = snap(j0 + span - 1) + LATTICE;
+        let i_hi = snap(i0 + span_i - 1) + LATTICE;
+        let j_hi = snap(j0 + span_j - 1) + LATTICE;
         let ni = (i_hi - i_lo) / LATTICE + 1;
         let nj = (j_hi - j_lo) / LATTICE + 1;
         let (si, sj, pad) = if ni <= 64 && nj <= 64 { (1, 1, 0.0) } else { ((ni / 48).max(1), (nj / 48).max(1), 160.0) };

@@ -573,6 +573,15 @@ impl SeamAcross {
         let hz = self.probe[2] + self.side[2] * d_in + self.tan_h[2] * d_tan;
         (hx, hz)
     }
+
+    /// Neighbour storage `(x, z)` of a home storage `(hx, hz)`. Inverse of [`home_xz`](Self::home_xz).
+    pub(in crate::world) fn storage_xz(self, hx: i64, hz: i64) -> (i64, i64) {
+        let d_in = (hx - self.probe[0]) * self.side[0] + (hz - self.probe[2]) * self.side[2];
+        let d_tan = (hx - self.probe[0]) * self.tan_h[0] + (hz - self.probe[2]) * self.tan_h[2];
+        let x = self.g[0] + self.inward[0] * d_in + self.tan_n[0] * d_tan;
+        let z = self.g[2] + self.inward[2] * d_in + self.tan_n[2] * d_tan;
+        (x, z)
+    }
 }
 
 fn edge_inward(g: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> Option<[i64; 3]> {

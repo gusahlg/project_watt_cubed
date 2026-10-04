@@ -1617,12 +1617,17 @@ impl Terrain {
         if span <= 0 {
             return None;
         }
-        let atlas = self.storage.home_atlas()?;
         let (x1, z1) = (i64::from(x0) + i64::from(span) - 1, i64::from(z0) + i64::from(span) - 1);
+        self.home_band(i64::from(x0), i64::from(z0), x1, z1)
+    }
+
+    /// Inclusive relief band when `[x0, x1] × [z0, z1]` lies in one band-0 face box.
+    fn home_band(&self, x0: i64, z0: i64, x1: i64, z1: i64) -> Option<(i32, i32)> {
+        let atlas = self.storage.home_atlas()?;
         for face in Face::ALL {
             let patch = crate::space::atlas::Patch::Shell { band: 0, face };
             let (o, size) = atlas.storage_box(patch);
-            if i64::from(x0) < o[0] || x1 >= o[0] + size[0] || i64::from(z0) < o[2] || z1 >= o[2] + size[2] {
+            if x0 < o[0] || x1 >= o[0] + size[0] || z0 < o[2] || z1 >= o[2] + size[2] {
                 continue;
             }
             let rise = atlas.radius - atlas.bands[0].r_lo;
@@ -1631,6 +1636,57 @@ impl Terrain {
             return Some((lo, hi.max(lo.saturating_add(1))));
         }
         None
+    }
+
+    /// Surface altitudes over `[x0, x1) × [z0, z1)`, a superset of those columns.
+    /// Mesh extraction keeps [`home_bounds`](Self::home_bounds) (the full band). This stride is
+    /// only for the near-window punch: the band is wider than the window, so it cannot decide one.
+    fn home_rect(&self, x0: i32, z0: i32, x1: i32, z1: i32) -> Option<(i32, i32)> {
+        if x1 <= x0 || z1 <= z0 {
+            return None;
+        }
+        let (lx, lz) = (i64::from(x0), i64::from(z0));
+        let (rx, rz) = (i64::from(x1) - 1, i64::from(z1) - 1);
+        let (blo, bhi) = self.home_band(lx, lz, rx, rz)?;
+        let span = i64::from(x1 - x0).max(i64::from(z1 - z0));
+        // Sixteen covers the short noise; past 48 nodes the pad is the relief itself, so a
+        // coarse square fails the window test and stays drawn.
+        let mut step = 16i64;
+        let mut pad = 8i32;
+        if span / step + 1 > 48 {
+            step = (span / 48).max(16);
+            pad = 160;
+        }
+        let mut lo_s = i32::MAX;
+        let mut hi_s = i32::MIN;
+        let mut x = lx;
+        loop {
+            let mut z = lz;
+            loop {
+                if let (Ok(xi), Ok(zi)) = (i32::try_from(x), i32::try_from(z))
+                    && let Some(y) = self.home_surface_y(xi, zi)
+                    && y != storage::BURIED
+                    && (blo..=bhi).contains(&y)
+                {
+                    lo_s = lo_s.min(y);
+                    hi_s = hi_s.max(y);
+                }
+                if z >= rz {
+                    break;
+                }
+                z = (z + step).min(rz);
+            }
+            if x >= rx {
+                break;
+            }
+            x = (x + step).min(rx);
+        }
+        if lo_s > hi_s {
+            return Some((blo, bhi));
+        }
+        let lo = lo_s.saturating_sub(pad).max(blo);
+        let hi = hi_s.saturating_add(pad).min(bhi);
+        Some((lo.min(hi), hi))
     }
 
     /// Far field of a start-world column. `false` when `(x, z)` is not the start world.
@@ -2185,6 +2241,24 @@ impl TerrainGenerator for Terrain {
         if super::generation::coarse_floor_samples(alts) {
             super::generation::paint_lod_top(out, alts.len(), hit.col.surface);
         }
+    }
+
+    fn surface_rect(&self, body: u16, face: Face, u0: i32, v0: i32, u1: i32, v1: i32) -> Option<(i32, i32)> {
+        if u1 <= u0 || v1 <= v0 {
+            return None;
+        }
+        if let Some(index) = chart_body(body) {
+            if face != Face::PosY {
+                return None;
+            }
+            if self.storage.home_index() == Some(index) {
+                return self.home_rect(u0, v0, u1, v1);
+            }
+            // Plant reach sits on top of the ground. The punch asks whether the window holds
+            // the ground; the mesh window ([`surface_bounds`](Self::surface_bounds)) keeps the plants.
+            return self.storage.ground_rect(u0, v0, u1, v1);
+        }
+        self.surface_bounds(body, face, u0, v0, (u1 - u0).max(v1 - v0))
     }
 
     fn surface_bounds(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {

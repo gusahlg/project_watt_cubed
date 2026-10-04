@@ -633,6 +633,54 @@ fn covers_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super:
     x0 < near.1 && x1 > near.0 && z0 < near.3 && z1 > near.2
 }
 
+/// Storage rectangle of `s` inside the full-res box, `(u0, v0, u1, v1)` exclusive.
+/// `None` when that overlap is empty or does not land back inside `s`.
+fn overlap_storage(
+    s: SectionPos,
+    near: (i64, i64, i64, i64),
+    across: Option<&super::seam::SeamAcross>,
+) -> Option<(i32, i32, i32, i32)> {
+    let span = s.span() as i64;
+    let (sx0, sz0) = (s.min_x() as i64, s.min_z() as i64);
+    let (sx1, sz1) = (sx0 + span, sz0 + span);
+    let (hx0, hz0, hx1, hz1) = if let Some(m) = across {
+        let (a, c) = m.home_xz(sx0, sz0);
+        let (b, d) = m.home_xz(sx1, sz1);
+        (a.min(b), c.min(d), a.max(b), c.max(d))
+    } else {
+        (sx0, sz0, sx1, sz1)
+    };
+    let ix0 = hx0.max(near.0);
+    let iz0 = hz0.max(near.2);
+    let ix1 = hx1.min(near.1);
+    let iz1 = hz1.min(near.3);
+    if ix0 >= ix1 || iz0 >= iz1 {
+        return None;
+    }
+    let (u0, v0, u1, v1) = if let Some(m) = across {
+        // Inclusive corners: a reflected exclusive edge is off by one.
+        let (a, c) = m.storage_xz(ix0, iz0);
+        let (b, d) = m.storage_xz(ix1 - 1, iz1 - 1);
+        (
+            a.min(b).max(sx0),
+            c.min(d).max(sz0),
+            (a.max(b) + 1).min(sx1),
+            (c.max(d) + 1).min(sz1),
+        )
+    } else {
+        (ix0, iz0, ix1, iz1)
+    };
+    if u0 >= u1 || v0 >= v1 {
+        return None;
+    }
+    Some((
+        i32::try_from(u0).ok()?,
+        i32::try_from(v0).ok()?,
+        i32::try_from(u1).ok()?,
+        i32::try_from(v1).ok()?,
+    ))
+}
+
 /// The section's storage square lies wholly inside the chart box (`hi` exclusive).
 fn inside_xz(s: SectionPos, lo: [i64; 3], hi: [i64; 3]) -> bool {
     let span = s.span() as i64;
@@ -3119,13 +3167,12 @@ impl World {
     fn chart_sections(&self, center: Coord) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let punch = self.near_draws_ground(center);
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, punch);
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d);
         let delta = self.section_vel * TAU_STREAM;
         if delta == DVec3::ZERO {
             return base;
         }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, punch))
+        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d))
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`.
@@ -3162,7 +3209,6 @@ impl World {
         seat: &super::seam::ChartSeat,
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
-        punch: bool,
     ) -> Vec<SectionPos> {
         let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
         let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
@@ -3172,7 +3218,8 @@ impl World {
         let rel = (ey as f64 - ground as f64).clamp(0.0, 1.0e7);
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
         let near = self.near_block_box(center);
-        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, punch, None);
+        let (y0, y1) = self.near_y_range(center);
+        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, y0, y1, None);
         // The neighbour is visible out to the pyramid edge, not merely the two finest sections.
         let band = cfg.outer_m() as i64;
         for across in self.seams.seam_across(*seat, [ex, ey, ez], band) {
@@ -3185,7 +3232,8 @@ impl World {
                 cfg,
                 max_d,
                 near,
-                punch,
+                y0,
+                y1,
                 Some(&across),
             ));
         }
@@ -3210,7 +3258,8 @@ impl World {
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
         near: (i64, i64, i64, i64),
-        punch: bool,
+        y0: i64,
+        y1: i64,
         across: Option<&super::seam::SeamAcross>,
     ) -> Vec<(SectionPos, f64)> {
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
@@ -3224,12 +3273,13 @@ impl World {
         for s in radial {
             cover_chart(s, seat.lo, seat.hi, &mut clipped);
         }
-        // Charts have no shader clip. Leave the near square to full-res chunks while they
-        // still hold the crust; once that window is sky, the far field draws the square.
+        // Charts have no shader clip. A section over the near square is dropped only when
+        // that overlap's surface sits inside the full-res window; a valley or a hilltop
+        // outside it stays, so the far field draws what the window misses.
         let keep = |s: SectionPos| {
             inside_xz(s, seat.lo, seat.hi)
-                && !(punch && covers_near(s, near, across))
                 && super::section::section_fits(s.span(), seat.radius)
+                && !self.near_window_holds(s, near, y0, y1, across)
         };
         coarsen_chart(clipped, max_d, self.sections_allowed(), &keep)
             .into_iter()
@@ -3237,25 +3287,39 @@ impl World {
             .collect()
     }
 
-    /// Whether the full-res window still contains the crust under `center`. Storage altitude:
-    /// `surface` is the first open cell, so the solid top is the block below it.
-    fn near_draws_ground(&self, center: Coord) -> bool {
-        let cs = CHUNK_SIZE as i64;
-        let x = i64::from(center.x) * cs + cs / 2;
-        let z = i64::from(center.z) * cs + cs / 2;
-        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
-            return true;
-        };
-        let ground = self.generator.surface(Face::PosY, x, z);
-        if ground == i32::MIN {
-            return true;
+    /// The full-res window already draws every solid top of `s` inside the near square.
+    /// Storage altitude: `surface` is the first open cell, so the solid top is the block below it.
+    /// A bound we cannot place is kept (punched nowhere) so a missed column is not a sky hole.
+    fn near_window_holds(
+        &self,
+        s: SectionPos,
+        near: (i64, i64, i64, i64),
+        y0: i64,
+        y1: i64,
+        across: Option<&super::seam::SeamAcross>,
+    ) -> bool {
+        if !covers_near(s, near, across) {
+            return false;
         }
-        let bottom = i64::from(self.mesh_box(center).min().y) * cs;
-        bottom <= i64::from(ground) - 1
+        let Some((u0, v0, u1, v1)) = overlap_storage(s, near, across) else {
+            return false;
+        };
+        let Some((lo, hi)) = self.generator.surface_rect(s.body, Face::PosY, u0, v0, u1, v1) else {
+            return false;
+        };
+        i64::from(lo) - 1 >= y0 && i64::from(hi) - 1 < y1
     }
 
-    /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so the
-    /// horizontal footprint is the box a chart section must not cover.
+    /// Full-res vertical block range (`y1` exclusive) of the mesh box. Up is storage Y.
+    fn near_y_range(&self, center: Coord) -> (i64, i64) {
+        let cs = CHUNK_SIZE as i64;
+        let b = self.mesh_box(center);
+        let y0 = i64::from(b.min().y) * cs;
+        (y0, y0 + i64::from(b.size().1) * cs)
+    }
+
+    /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so this
+    /// is the footprint a chart section overlaps when it meets the near square.
     fn near_block_box(&self, center: Coord) -> (i64, i64, i64, i64) {
         let cs = CHUNK_SIZE as i64;
         let h = self.view.horizontal as i64;
@@ -5709,13 +5773,89 @@ mod tests {
         assert_eq!(runs, vec![GenRun::Open { coord }]);
     }
 
+    /// Valley or hilltop columns inside the near square, below or above the full-res window,
+    /// that neither a full-res chunk nor a far section draws. Seed 42, diffusion, the bench
+    /// camera on the start world's +Z chart: ground level, that eye, and 300 above it.
+    #[test]
+    fn far_chart_strip_hole_is_closed() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let eye = world.chart_eye(DVec3::new(0.0, -8_640_801.0, 22_107_307.0)).expect("symptom chart eye");
+        let ground = world.terrain().surface(Face::PosY, eye.x as i32, eye.z as i32);
+        assert_ne!(ground, i32::MIN, "symptom column has no surface");
+        // `expect_outside`: the window must miss some column, or a punch of the whole square
+        // would still report zero holes.
+        let sites = [
+            ("ground", DVec3::new(eye.x, ground as f64, eye.z), false),
+            ("eye", eye, true),
+            ("+300", DVec3::new(eye.x, ground as f64 + 300.0, eye.z), true),
+        ];
+        for (name, storage, expect_outside) in sites {
+            let center = Coord::new(
+                (storage.x / 16.0).floor() as i32,
+                (storage.y / 16.0).floor() as i32,
+                (storage.z / 16.0).floor() as i32,
+            );
+            world.section_eye_y = storage.y;
+            world.adopt_fold(center);
+            let seat = world.seams.chart_seat(center).unwrap_or_else(|| panic!("{name}: no chart seat"));
+            let near = world.near_block_box(center);
+            assert!(
+                near.0 >= seat.lo[0] && near.1 <= seat.hi[0] && near.2 >= seat.lo[2] && near.3 <= seat.hi[2],
+                "{name}: the near square meets a seam"
+            );
+            let (y0, y1) = world.near_y_range(center);
+            let desired = world.desired_sections(center);
+            let mut rects = Vec::new();
+            for s in &desired {
+                let span = s.span() as i64;
+                let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+                if inside_xz(*s, seat.lo, seat.hi) {
+                    rects.push((x, z, x + span, z + span));
+                }
+            }
+            let covered = |x: i64, z: i64| {
+                rects.iter().any(|&(x0, z0, x1, z1)| x >= x0 && x < x1 && z >= z0 && z < z1)
+            };
+            let mut holes = 0i32;
+            let mut outside = 0i32;
+            let mut x = near.0 + 8;
+            while x < near.1 {
+                let mut z = near.2 + 8;
+                while z < near.3 {
+                    let surf = world.terrain().surface(Face::PosY, x as i32, z as i32);
+                    if surf != i32::MIN {
+                        let solid = i64::from(surf) - 1;
+                        if solid < y0 || solid >= y1 {
+                            outside += 1;
+                            if !covered(x, z) {
+                                holes += 1;
+                            }
+                        }
+                    }
+                    z += 16;
+                }
+                x += 16;
+            }
+            assert_eq!(
+                holes, 0,
+                "{name}: {holes} strip holes of {outside} columns outside the window, desired {}",
+                desired.len()
+            );
+            if expect_outside {
+                assert!(outside > 0, "{name}: no column sits outside the full-res window");
+            }
+        }
+    }
+
     /// Columns of the far-field disk that draw neither a chart section nor a full-res chunk.
     /// Across a seam the neighbour chart is in the disk, and the near window's chunks there are
-    /// real storage chunks (or a section covers them). The pinned ground-level punch still removes
-    /// every section that meets the full-res window. The finest ring stops inside the next
-    /// ring, so that next section can straddle the window and leave an overhang of its own
-    /// span; that overhang, on either chart, is not a seam hole. Neither is a home column
-    /// whose crust sits outside the vertical mesh window.
+    /// real storage chunks (or a section covers them). A section over the near square is dropped
+    /// only when that overlap's surface sits inside the full-res window. The finest ring stops
+    /// inside the next ring, so that next section can straddle the window and leave an overhang
+    /// of its own span; that overhang, on either chart, is not a seam hole.
     #[test]
     fn far_chart_seam_has_no_hole() {
         use crate::render_config::RenderConfig;
@@ -5853,12 +5993,10 @@ mod tests {
                         let past_home = x < seat.lo[0] || x >= seat.hi[0] || z < seat.lo[2] || z >= seat.hi[2];
                         let ox = if x < near.0 { near.0 - x } else if x >= near.1 { x - (near.1 - 1) } else { 0 };
                         let oz = if z < near.2 { near.2 - z } else if z >= near.3 { z - (near.3 - 1) } else { 0 };
-                        // The punch removes every section that meets the full-res box, leaving its
-                        // overhang. A home column whose crust is outside the vertical mesh window
-                        // was never a full-res chunk either.
+                        // A section that straddles the full-res box keeps an overhang of the next
+                        // ring's span. That overhang is outside the box.
                         let punch_sliver = ox.max(oz) > 0 && ox.max(oz) < sliver;
-                        let steep = in_near && !past_home && real == Some(virt) && !chunk_hit;
-                        if !punch_sliver && !steep {
+                        if !punch_sliver {
                             holes += 1;
                             if holes <= 6 {
                                 hole_ex.push_str(&format!(
