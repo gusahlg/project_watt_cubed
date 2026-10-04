@@ -73,7 +73,7 @@ impl World {
     }
 
     /// The world's gravitational field.
-    pub(crate) fn gravity(&self) -> &crate::gravity::Field {
+    pub fn gravity(&self) -> &crate::gravity::Field {
         &self.gravity
     }
 
@@ -98,7 +98,7 @@ impl World {
     }
 
     /// The generator, for callers that need the cosmos catalog.
-    pub(crate) fn terrain(&self) -> &dyn super::generation::TerrainGenerator {
+    pub fn terrain(&self) -> &dyn super::generation::TerrainGenerator {
         self.generator.as_ref()
     }
 
@@ -201,7 +201,7 @@ impl World {
 
     /// The cell under a foot: 0.1 along `−up`, or along storage −Y when `feet`
     /// sits in a round body's chart (storage +Y is up there).
-    pub(crate) fn ground_cell(&self, feet: voxel_engine::DVec3, up: Face) -> (i32, i32, i32) {
+    pub fn ground_cell(&self, feet: voxel_engine::DVec3, up: Face) -> (i32, i32, i32) {
         if let Some(local) = self.chart_local(feet) {
             let s = local.storage;
             return (block_coord(s.x), block_coord(s.y - 0.1), block_coord(s.z));

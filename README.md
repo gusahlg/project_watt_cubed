@@ -60,7 +60,8 @@ sets the data/config root (same as `WATT_DATA_DIR`).
 
 Press `T` to open the chat/console line. Plain text is **proximity chat** (only
 nearby players hear it); prefix a message with `!` for **global chat**; a line
-starting with `/` is a local command (e.g. `/tp`).
+starting with `/` is a local command. The base game has no commands of its own:
+they come from mods, such as `/tp` from the Developer Toolkit (`pwc.dev-toolkit`).
 
 ### Safety
 
@@ -89,8 +90,8 @@ Rendering runs on [voxel_engine](../voxel-engine), our own Vulkan 1.3 renderer
 (pure Rust over `ash` + `winit` — no C build step). Expect greedy-meshed
 chunks, frustum culling, reversed-Z depth, and uncapped frame rates by default.
 
-Graphics are tunable at runtime from **Settings** on the start menu or the
-`/gfx` console command in game (`/gfx fullscreen on`, `/gfx vsync off`,
+Graphics are tunable at runtime from **Settings** on the start menu, or in game with the
+Developer Toolkit mod's `/gfx` command (`/gfx fullscreen on`, `/gfx vsync off`,
 `/gfx msaa 4`, `/gfx fps 144`, `/gfx renderdist 8`, `/gfx fov 90`). Settings
 persist in `settings.cfg` under the config root.
 

@@ -1,8 +1,9 @@
 //! A minimal in-game console / chat line.
 //!
 //! Press `T` (or `/`, which pre-fills a slash) to open it, type a line, and press
-//! Enter to submit; Esc closes it. Submitted lines are dispatched as commands by
-//! [`command`](crate::command). The console keeps a small scrollback `log`, so it
+//! Enter to submit; Esc closes it. The core has no commands of its own: a submitted
+//! line goes to the enabled mods' commands ([`Mod::run_command`](crate::modding::Mod::run_command)),
+//! or to chat in multiplayer. The console keeps a small scrollback `log`, so it
 //! doubles as a chat box — command output, chat, and system notices are the same
 //! scrollback of [`Line`]s, each span tagged with a [`Role`] that selects its
 //! colour when drawn.
@@ -12,8 +13,8 @@
 //! behave identically here and in any other text field.
 use voxel_engine::{Color, Frame};
 
-use crate::command::COMMAND_NAMES;
 use crate::input::intent::EditKey;
+use crate::modding::Command;
 use crate::ui::{common_prefix, Completion, Line, Ring, Role, TextInput};
 
 /// Longest input line we accept.
@@ -33,7 +34,7 @@ impl Console {
     pub fn new() -> Self {
         Self {
             active: false,
-            input: TextInput::new(MAX_INPUT).with_completer(complete_command),
+            input: TextInput::new(MAX_INPUT),
             log: Ring::new(LOG_LINES * 4),
         }
     }
@@ -67,11 +68,25 @@ impl Console {
         self.log.push(line);
     }
 
+    /// The newest scrollback line.
+    #[cfg(test)]
+    pub fn last(&self) -> Option<&Line> {
+        self.log.last()
+    }
+
     /// Process input characters and an edit key. Returns submitted line (trimmed,
-    /// non-empty), else `None`. Tab shows candidates; closing on Esc is the
-    /// caller's job (it owns the event).
-    pub fn handle_input(&mut self, chars: &[char], edit: Option<EditKey>) -> Option<String> {
+    /// non-empty), else `None`. Tab completes from `commands` (read only then) and
+    /// shows candidates; closing on Esc is the caller's job (it owns the event).
+    pub fn handle_input<'c>(
+        &mut self,
+        chars: &[char],
+        edit: Option<EditKey>,
+        commands: impl IntoIterator<Item = &'c Command>,
+    ) -> Option<String> {
         let submitted = self.input.handle(chars, edit);
+        if edit == Some(EditKey::Complete) {
+            self.input.complete(|line| complete_command(line, commands));
+        }
         if let Some(candidates) = self.input.take_notice() {
             self.print(candidates.join("   "));
         }
@@ -122,15 +137,26 @@ impl Default for Console {
     }
 }
 
-fn complete_command(input: &str) -> Completion {
+/// The console's answer to a line no enabled mod handles: point at `/help` when a mod offers it,
+/// else at the mods commands come from.
+pub fn unknown_command<'c>(cmd: &str, commands: impl IntoIterator<Item = &'c Command>) -> Line {
+    let text = if commands.into_iter().any(|c| c.name == "help") {
+        format!("unknown command '{cmd}' - type '/help'")
+    } else {
+        format!("unknown command '{cmd}' - commands come from mods such as the Developer Toolkit")
+    };
+    Line::of(Role::Danger, text)
+}
+
+fn complete_command<'c>(input: &str, commands: impl IntoIterator<Item = &'c Command>) -> Completion {
     let body = input.strip_prefix('/').unwrap_or(input);
     if body.is_empty() || body.contains(char::is_whitespace) {
         return Completion::None;
     }
     let lead = if input.starts_with('/') { "/" } else { "" };
-    let matches: Vec<&str> = COMMAND_NAMES
-        .iter()
-        .copied()
+    let matches: Vec<&str> = commands
+        .into_iter()
+        .map(|c| c.name)
         .filter(|n| n.starts_with(body))
         .collect();
     match matches.as_slice() {
@@ -150,9 +176,19 @@ mod tests {
     use super::*;
     use crate::ui::Completion;
 
+    const COMMANDS: [Command; 3] = [
+        Command { name: "tp", args: "<x y z>", help: "teleport" },
+        Command { name: "pos", args: "", help: "position" },
+        Command { name: "time", args: "", help: "clock" },
+    ];
+
+    fn complete(input: &str) -> Completion {
+        complete_command(input, &COMMANDS)
+    }
+
     #[test]
     fn completes_unique_command() {
-        match complete_command("po") {
+        match complete("po") {
             Completion::Full(s) => assert_eq!(s, "pos "),
             _ => panic!("expected a unique completion"),
         }
@@ -160,20 +196,42 @@ mod tests {
 
     #[test]
     fn preserves_leading_slash() {
-        match complete_command("/po") {
+        match complete("/po") {
             Completion::Full(s) => assert_eq!(s, "/pos "),
             _ => panic!("expected a unique completion"),
         }
     }
 
     #[test]
+    fn ambiguous_prefix_offers_candidates() {
+        match complete("t") {
+            Completion::Ambiguous(prefix, candidates) => {
+                assert_eq!(prefix, "t");
+                assert_eq!(candidates, ["tp", "time"]);
+            }
+            _ => panic!("expected candidates"),
+        }
+    }
+
+    #[test]
     fn empty_and_unknown_do_not_complete() {
-        assert!(matches!(complete_command(""), Completion::None));
-        assert!(matches!(complete_command("zzz"), Completion::None));
+        assert!(matches!(complete(""), Completion::None));
+        assert!(matches!(complete("zzz"), Completion::None));
+        assert!(matches!(complete_command("po", &[]), Completion::None), "no mod, no commands");
     }
 
     #[test]
     fn no_completion_after_a_space() {
-        assert!(matches!(complete_command("tp 1"), Completion::None));
+        assert!(matches!(complete("tp 1"), Completion::None));
+    }
+
+    #[test]
+    fn tab_completes_from_the_given_commands() {
+        let mut console = Console::new();
+        console.open(true);
+        console.handle_input(&['p'], None, &COMMANDS);
+        assert_eq!(console.input.text(), "/p");
+        assert!(console.handle_input(&['o'], Some(EditKey::Complete), &COMMANDS).is_none());
+        assert_eq!(console.input.text(), "/pos ");
     }
 }

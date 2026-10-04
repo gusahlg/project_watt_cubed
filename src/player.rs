@@ -38,10 +38,13 @@ pub fn capped_velocity(v: DVec3, limit: f64) -> DVec3 {
     if len > limit { v * (limit / len) } else { v }
 }
 
-/// The fastest cruise, units/second: the speed of light.
-pub const CRUISE_MAX: f64 = 299_792_458.0 * PER_METER;
-/// The cruise speed `/cruise` starts at when it names none: 1,000 km/s.
-pub const CRUISE_DEFAULT: f64 = 1_000_000.0 * PER_METER;
+/// The speed of light, units/second.
+pub const LIGHT_SPEED: f64 = 299_792_458.0 * PER_METER;
+/// The fastest cruise, units/second: ten times the speed of light (the world border is ~1.7
+/// million km across; a cruise step costs the same at any speed).
+pub const CRUISE_MAX: f64 = 10.0 * LIGHT_SPEED;
+/// The cruise speed a cruise starts at when it names none: 100,000 km/s.
+pub const CRUISE_DEFAULT: f64 = 100_000_000.0 * PER_METER;
 
 /// Cruise: flight past [`MAX_SPEED`] for crossing the universe. The world holds still while it
 /// lasts (no streaming around the player), the player passes through everything (noclip) along the

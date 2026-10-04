@@ -47,7 +47,8 @@ Air reaches `AIR_TOP` (20 000 blocks) above the nearest body. In it, walking is 
 integrator, and a fall already faster than terminal speed drags back toward that speed instead of
 stopping in one step. Above the air, and wherever no body is near, a walker is in free fall:
 velocity takes the whole gravity vector, with no terminal speed, and the movement keys do nothing.
-`F` toggles walking and flying. `/noclip` toggles flight through geometry.
+With the Developer Toolkit mod (`pwc.dev-toolkit`), `F` toggles walking and flying and `/noclip`
+toggles flight through geometry; the base game has neither.
 
 Because gravity is the honest vector sum, a cube that keeps its shape (the twins) is not "flat":
 each face is a vast shallow bowl — level at its centre, tilting 16° halfway to an edge and 45° at
@@ -128,9 +129,10 @@ sun lights whatever faces it.
 
 ## Travel
 
-`F` toggles walking and flying. Flying is fast enough to cross a face, and it is how you steer in
-free fall. `/noclip` toggles flight through geometry. Above `AIR_TOP` a walker falls freely along
-the pull; in air a fall faster than terminal drags back toward it.
+Travel tools come from the Developer Toolkit mod (`pwc.dev-toolkit`). `F` toggles walking and
+flying. Flying is fast enough to cross a face, and it is how you steer in free fall. `/noclip`
+toggles flight through geometry. Above `AIR_TOP` a walker falls freely along the pull; in air a fall
+faster than terminal drags back toward it.
 
 `/bodies` lists every body, nearest first: its kind, its number within that kind, the distance,
 the size, and the `/tp` that lands 2 000 blocks above the datum (`centre + (0, top + 2000, 0)`,

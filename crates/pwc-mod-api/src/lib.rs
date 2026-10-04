@@ -24,12 +24,15 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    annotate_setting, forced_off_marker, ChoicesFlush, GameBuild, Group, Knob, Mod, ModContext, ModDescriptor,
-    ModRegistrar, Mods, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
+    annotate_setting, forced_off_marker, ChoicesFlush, Command, CommandContext, GameBuild, Group, Knob, Mod, ModContext,
+    ModDescriptor, ModRegistrar, Mods, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
 };
 
 /// The game's subsystems, as far as mods may use them.
-pub use project_watt_cubed::{block, derived, engine, input, material, menu, net, player, render_config, session, settings, sim, stash, ui, world};
+pub use project_watt_cubed::{
+    block, derived, engine, gravity, input, material, math, menu, net, player, render_config, session, settings, sim,
+    sky, stash, ui, world,
+};
 
 /// The mod API version this crate provides (`pwc-api` requirements are checked against it).
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,5 +43,5 @@ pub mod prelude {
     pub use crate::player::Player;
     pub use crate::ui::{Anchor, HudElement, Line, Panel, Role, Row};
     pub use crate::world::World;
-    pub use crate::{Group, Knob, Mod, ModContext, ModRegistrar, ESSENTIALS};
+    pub use crate::{Command, CommandContext, Group, Knob, Mod, ModContext, ModRegistrar, ESSENTIALS};
 }

@@ -32,6 +32,7 @@ use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
 use crate::settings::Settings;
+use crate::sky::Sky;
 use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
@@ -169,6 +170,53 @@ impl ModContext<'_> {
     }
 }
 
+/// One console command a mod handles: what `/help` lists and Tab completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Command {
+    /// The name typed after the `/` (aliases are the handling mod's own business).
+    pub name: &'static str,
+    /// The arguments as `/help` shows them (`<x y z|name>`), or `""`.
+    pub args: &'static str,
+    /// What the command does, in a few words.
+    pub help: &'static str,
+}
+
+/// What a console command may read and change: the whole-game state the core owns. A command only
+/// edits it; the core follows up on what changed (applies and saves changed settings, re-mixes the
+/// audio, shares a changed clock with the server, streams a moved player's surroundings at once
+/// and reports the move as a teleport). Build one with [`CommandContext::new`].
+#[non_exhaustive]
+pub struct CommandContext<'a> {
+    pub player: &'a mut Player,
+    pub world: &'a mut World,
+    pub settings: &'a mut Settings,
+    pub sky: &'a mut Sky,
+    /// Which visual groups the enabled mods provide (`/gfx` names the mod a lane waits on).
+    pub visuals: VisualMask,
+    /// True when a server owns the session: it sets the day length and may refuse a teleport.
+    pub networked: bool,
+    /// Every enabled mod's commands, in install order (for `/help`).
+    pub commands: &'a [Command],
+    /// Set to play the local voice test cue (the core owns the audio).
+    pub voice_test: bool,
+}
+
+impl<'a> CommandContext<'a> {
+    /// A singleplayer context over these handles, with every visual group on and no command list.
+    pub fn new(player: &'a mut Player, world: &'a mut World, settings: &'a mut Settings, sky: &'a mut Sky) -> Self {
+        Self {
+            player,
+            world,
+            settings,
+            sky,
+            visuals: VisualMask::default(),
+            networked: false,
+            commands: &[],
+            voice_test: false,
+        }
+    }
+}
+
 /// A unit of layered-on functionality. Every method has a default, so a mod
 /// implements only the hooks it cares about. This is the public surface mod authors
 /// write against — kept small on purpose.
@@ -176,9 +224,10 @@ impl ModContext<'_> {
 /// Arbitration when more than one enabled mod implements a hook:
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
 ///   `on_place_rejected`, `on_tool_changed`. `hud` uses the same order as z-order (later
-///   draws on top).
-/// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` (first `true`),
-///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `held`.
+///   draws on top). `commands` lists concatenate in the same order.
+/// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` and `on_toggle_fly`
+///   (first `true`),
+///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `held`, `run_command` (first `Some`).
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
@@ -217,6 +266,15 @@ pub trait Mod {
     /// ticks are replayed in order without loss.
     fn update(&mut self, ctx: &mut ModContext) {
         let _ = ctx;
+    }
+
+    /// The flight key (`F`) was pressed. The core has no flight toggle of its own: a mod that
+    /// offers flight switches it here and returns `true`; the first enabled mod that does wins.
+    /// Delivered on the frame of the press (whatever the mod cadence), never while a detached
+    /// camera holds the player.
+    fn on_toggle_fly(&mut self, player: &mut Player, world: &World) -> bool {
+        let _ = (player, world);
+        false
     }
 
     /// A block was broken into this configuration. The core has already deposited
@@ -260,10 +318,23 @@ pub trait Mod {
         None
     }
 
-    /// First enabled mod that returns `Some` handles the console command.
+    /// A console command without access to the game state; the default
+    /// [`run_command`](Self::run_command) asks this.
     fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
         let _ = (cmd, args);
         None
+    }
+
+    /// Handle the console command `cmd` (the leading `/` stripped) with `args`. The first enabled
+    /// mod that returns `Some` handles it; its lines go to the console.
+    fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        let _ = ctx;
+        self.command(cmd, args)
+    }
+
+    /// The commands this mod handles, for `/help` and Tab completion.
+    fn commands(&self) -> &[Command] {
+        &[]
     }
 
     /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
@@ -442,6 +513,11 @@ impl Mods {
         self.each_enabled(|m| m.update(ctx));
     }
 
+    /// The flight key: the first enabled mod that handles it wins. False when none does.
+    pub fn on_toggle_fly(&mut self, player: &mut Player, world: &World) -> bool {
+        self.entries.iter_mut().filter(|e| e.enabled).any(|e| e.module.on_toggle_fly(player, world))
+    }
+
     /// Fan a block-break event out to every enabled mod.
     pub fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
         self.each_enabled(|m| m.on_block_break(id, world, overflow));
@@ -472,7 +548,7 @@ impl Mods {
         self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.namer())
     }
 
-    /// First enabled mod that handles `cmd` wins.
+    /// First enabled mod that handles `cmd` with its context-free [`Mod::command`] wins.
     pub fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
         for entry in &mut self.entries {
             if !entry.enabled {
@@ -483,6 +559,21 @@ impl Mods {
             }
         }
         None
+    }
+
+    /// First enabled mod that handles `cmd` wins.
+    pub fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+        self.entries
+            .iter_mut()
+            .filter(|e| e.enabled)
+            .find_map(|e| e.module.run_command(ctx, cmd, args))
+    }
+
+    /// Every enabled mod's commands, in install order; a name a mod earlier in that order already
+    /// lists is left out (that mod handles it: `run_command` is first-wins).
+    pub fn commands(&self) -> impl Iterator<Item = &Command> {
+        let all = || self.entries.iter().filter(|e| e.enabled).flat_map(|e| e.module.commands());
+        all().enumerate().filter(move |&(i, c)| !all().take(i).any(|d| d.name == c.name)).map(|(_, c)| c)
     }
 
     /// Push every enabled mod's HUD contribution into `out`, in install order
@@ -1215,6 +1306,70 @@ mod tests {
         cursor.normalize(&view);
         assert!(view.is_selectable(cursor.index));
         assert_ne!(cursor.index, 0, "cursor must skip the group header");
+    }
+
+    /// Answers the commands it lists, raising the player one block per command it runs.
+    struct Lister(&'static str, &'static [Command]);
+
+    impl Mod for Lister {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn commands(&self) -> &[Command] {
+            self.1
+        }
+        fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, _args: &[&str]) -> Option<Vec<Line>> {
+            self.1.iter().any(|c| c.name == cmd).then(|| {
+                ctx.player.position.y += 1.0;
+                vec![Line::of(crate::ui::Role::Dim, self.0)]
+            })
+        }
+    }
+
+    /// A mod written against the context-free hook only.
+    struct Legacy;
+
+    impl Mod for Legacy {
+        fn name(&self) -> &str {
+            "Legacy"
+        }
+        fn id(&self) -> &'static str {
+            "legacy"
+        }
+        fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+            (cmd == "old").then(|| vec![Line::of(crate::ui::Role::Dim, args.join(" "))])
+        }
+    }
+
+    const A: &[Command] = &[Command { name: "tp", args: "<x y z>", help: "teleport" }];
+    const B: &[Command] = &[
+        Command { name: "tp", args: "", help: "shadowed" },
+        Command { name: "time", args: "", help: "clock" },
+    ];
+
+    #[test]
+    fn the_first_enabled_mod_that_knows_a_command_runs_it() {
+        let mut mods = Mods::empty();
+        mods.install(Box::new(Lister("a", A)), true);
+        mods.install(Box::new(Lister("b", B)), true);
+        mods.install(Box::new(Legacy), true);
+        mods.install(Box::new(Lister("off", &[Command { name: "hidden", args: "", help: "" }])), false);
+        let names: Vec<&str> = mods.commands().map(|c| c.name).collect();
+        assert_eq!(names, ["tp", "time"], "enabled mods only, in install order, a shadowed name once");
+
+        let mut world = World::new(1);
+        let mut player = Player::new(glam::DVec3::ZERO);
+        let (mut settings, mut sky) = (Settings::default(), crate::sky::Sky::new());
+        let mut ctx = CommandContext::new(&mut player, &mut world, &mut settings, &mut sky);
+        let first = |out: Option<Vec<Line>>| out.map(|lines| lines[0].text().to_string());
+        assert_eq!(first(mods.run_command(&mut ctx, "tp", &[])).as_deref(), Some("a"));
+        assert_eq!(first(mods.run_command(&mut ctx, "time", &[])).as_deref(), Some("b"));
+        assert_eq!(first(mods.run_command(&mut ctx, "old", &["still", "works"])).as_deref(), Some("still works"));
+        assert!(mods.run_command(&mut ctx, "hidden", &[]).is_none(), "a disabled mod runs nothing");
+        assert_eq!(ctx.player.position.y, 2.0, "the handlers reached the player through the context");
     }
 
     #[test]

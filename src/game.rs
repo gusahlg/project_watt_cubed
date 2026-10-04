@@ -14,8 +14,7 @@ use crate::audio::{
 };
 use crate::block::{BlockId, AIR};
 use crate::camera::{CameraMode, CameraPose, FlyAxes, GameCamera};
-use crate::command;
-use crate::console::Console;
+use crate::console::{self, Console};
 use crate::derived::Revision;
 use crate::input::intent::{GameplayEvent, GameplayState, GlobalEvent, MenuEvent};
 use crate::input::router::{Context, Router, View};
@@ -23,7 +22,7 @@ use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
 use crate::minimap::{MapSample, Minimap, MinimapConfig};
-use crate::modding::{ModContext, Mods};
+use crate::modding::{Command, CommandContext, ModContext, Mods};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
@@ -73,6 +72,8 @@ struct FrameInput {
     fly_axes: FlyAxes,
     do_break: bool,
     do_place: bool,
+    /// The flight key: an intent for the mods (the core has no flight toggle).
+    toggle_fly: bool,
     toggle_inventory: bool,
     /// Hotbar key this frame: 0 = hand, 1..=9 = slot.
     hotbar_key: Option<u8>,
@@ -300,8 +301,7 @@ pub struct Game {
     mod_gate: RateGate,
 
     /// Edge input must survive render frames that do not execute a physics
-    /// tick, so a tap between two 30 Hz ticks still flies/jumps.
-    pending_toggle_fly: bool,
+    /// tick, so a tap between two 30 Hz ticks still jumps.
     pending_jump: bool,
     /// Edge-bearing frames awaiting the next permitted mod tick, in order —
     /// ordered replay preserves discrete actions across a throttled cadence.
@@ -403,7 +403,6 @@ impl Game {
             physics_gate: RateGate::from_hz(0),
             sky_gate: RateGate::from_hz(0),
             mod_gate: RateGate::from_hz(0),
-            pending_toggle_fly: false,
             pending_jump: false,
             pending_mod_input: Vec::new(),
             pending_mod_overlay_close: false,
@@ -819,6 +818,8 @@ impl Game {
                     boost,
                 };
                 f.do_break = gp.event(GameplayEvent::Break);
+                // The flight key reaches the mods whatever the mod cadence (see `fly_key`).
+                f.toggle_fly = gp.event(GameplayEvent::ToggleFly);
                 if self.mod_logic {
                     f.do_place = gp.event(GameplayEvent::Place);
                     if gp.event(GameplayEvent::Hand) {
@@ -896,7 +897,7 @@ impl Game {
             }
             if let Some(line) = self
                 .console
-                .handle_input(&input.text_chars, input.text_edit)
+                .handle_input(&input.text_chars, input.text_edit, mods.commands())
             {
                 self.submit_line(line, eng, settings, sound, events, mods);
             }
@@ -977,7 +978,6 @@ impl Game {
     fn drop_pending_edges(&mut self) {
         self.pending_mod_input.clear();
         self.mod_gate.reset();
-        self.pending_toggle_fly = false;
         self.pending_jump = false;
     }
 
@@ -1000,7 +1000,6 @@ impl Game {
     fn motion_phase(&mut self, input: &FrameInput, dt: f32) -> bool {
         self.camera.fx.update(dt);
         if let Some(rig) = self.camera.free_rig() {
-            self.pending_toggle_fly = false;
             self.pending_jump = false;
             rig.look(input.look_delta);
             rig.fly(input.fly_axes, dt);
@@ -1013,7 +1012,6 @@ impl Game {
             align_body(&mut self.player, dt);
 
             if let Some(mi) = &input.move_input {
-                self.pending_toggle_fly |= mi.toggle_fly();
                 self.pending_jump |= mi.jump();
                 let steps = self.physics_gate.steps(dt);
                 if steps != 0 {
@@ -1021,7 +1019,6 @@ impl Game {
                     let step_dt = self.physics_gate.step_dt(dt);
                     for step in 0..steps {
                         let mut tick_input = *mi;
-                        tick_input.set_toggle_fly(step == 0 && self.pending_toggle_fly);
                         tick_input.set_jump(mi.jump() || (step == 0 && self.pending_jump));
                         // A cruise feels no gravity and moves physically (its steps outrun any patch).
                         let cruising = self.player.cruising();
@@ -1056,7 +1053,6 @@ impl Game {
                         v[self.player.up_axis.axis()] = 0.0;
                         self.local_gait += v.length() * step_dt as f64 * presence::STRIDE_FREQ;
                     }
-                    self.pending_toggle_fly = false;
                     self.pending_jump = false;
                 }
             }
@@ -1072,6 +1068,14 @@ impl Game {
     /// World edits: block breaking, then cadence-controlled mod hooks and
     /// queued placements. Edge-bearing render frames are replayed in order at
     /// the next permitted mod tick; hooks never run inside the voxel loop.
+    /// The flight key: the first mod that offers flight takes it on this frame, whatever the mod
+    /// cadence or the mod-logic setting. A detached camera never flies the frozen player.
+    fn fly_key(&mut self, input: &FrameInput, detached: bool, mods: &mut Mods) {
+        if input.toggle_fly && !detached {
+            mods.on_toggle_fly(&mut self.player, &self.world);
+        }
+    }
+
     fn interact_phase(
         &mut self,
         input: &FrameInput,
@@ -1086,6 +1090,7 @@ impl Game {
         if input.do_break && !detached {
             self.primary_action(mods, events);
         }
+        self.fly_key(input, detached, mods);
 
         // Disabled mod logic performs no probe, no queueing, no dispatch.
         if !self.mod_logic {
@@ -1120,11 +1125,15 @@ impl Game {
         if self.mod_gate.steps(dt) == 0 {
             return;
         }
+        self.mod_tick((eng.screen_width(), eng.screen_height()), mods, events);
+    }
 
+    /// One mod tick: replay the latched edge frames in order (one empty update when there are
+    /// none), applying each frame's queued placements before the next.
+    fn mod_tick(&mut self, (screen_w, screen_h): (i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let mut pending = std::mem::take(&mut self.pending_mod_input);
         let mut placements = std::mem::take(&mut self.placement_scratch);
         placements.clear();
-        let (screen_w, screen_h) = (eng.screen_width(), eng.screen_height());
         // Preserve ordering and multiplicity for edge-bearing render frames.
         // With no edge, one empty update keeps periodic work at `mod_hz`.
         for index in 0..pending.len().max(1) {
@@ -1501,9 +1510,9 @@ impl Game {
         disconnected
     }
 
-    /// Handle one submitted console line. A leading `/` is always a local command; in
-    /// multiplayer any other line is chat (a leading `!` sends it to global chat),
-    /// while in singleplayer it stays a command as before.
+    /// Handle one submitted console line (see [`run_line`](Self::run_line)). A command that edits
+    /// settings (`/gfx`, the audio rows) goes through the one application path, is persisted and
+    /// re-mixes the audio, only when something actually changed.
     fn submit_line(
         &mut self,
         line: String,
@@ -1513,12 +1522,18 @@ impl Game {
         events: &mut Vec<SoundEvent>,
         mods: &mut Mods,
     ) {
-        // `/voicetest` plays the canned UI cue; emit it as a fact and let the
-        // director route it (it runs this frame even though the console owns input).
-        // `execute` below prints the acknowledgement.
-        if line.trim() == "/voicetest" {
-            events.push(SoundEvent::Ui(UiSound::VoiceTest));
+        if self.run_line(line, settings, events, mods) {
+            self.apply_settings(eng, settings);
+            settings.save();
+            sound.set_mix(settings.mix_change());
         }
+    }
+
+    /// A submitted console line, short of the engine. A leading `/` is always a command; in
+    /// multiplayer any other line is chat (a leading `!` sends it to global chat), while in
+    /// singleplayer it stays a command. The first enabled mod that knows the command runs it, then
+    /// the core follows up on the state it changed. Returns whether it changed the settings.
+    fn run_line(&mut self, line: String, settings: &mut Settings, events: &mut Vec<SoundEvent>, mods: &mut Mods) -> bool {
         if !line.starts_with('/')
             && let Some(net) = &mut self.net
         {
@@ -1530,46 +1545,32 @@ impl Game {
                 // The server echoes chat back to us, so we don't print it here.
                 net.send_chat(channel, &text);
             }
-            return;
+            return false;
         }
         self.console.echo(&line);
-        {
-            let stripped = line.strip_prefix('/').unwrap_or(line.as_str());
-            let mut parts = stripped.split_whitespace();
-            if let Some(cmd) = parts.next() {
-                let args: Vec<&str> = parts.collect();
-                if let Some(out) = mods.command(cmd, &args) {
-                    for line in out {
-                        self.console.push(line);
-                    }
-                    return;
-                }
-            }
-        }
+        let mut parts = line.strip_prefix('/').unwrap_or(line.as_str()).split_whitespace();
+        let Some(cmd) = parts.next() else {
+            return false;
+        };
+        let args: Vec<&str> = parts.collect();
+        let commands: Vec<Command> = mods.commands().copied().collect();
         let before = settings.clone();
         let day_before = self.sky.clock.day();
         let day_len_before = self.sky.day_length;
         let pos_before = self.player.position;
-        // Each output line already carries its role (System output vs Error
-        // rejection), so there is nothing to guess — just show them.
-        for out in command::execute_with_visuals(
-            &line,
-            &mut self.player,
-            &mut self.world,
-            settings,
-            &mut self.sky,
-            self.visual_mask,
-        ) {
-            self.console.push(out);
+        let mut ctx = CommandContext::new(&mut self.player, &mut self.world, settings, &mut self.sky);
+        ctx.visuals = self.visual_mask;
+        ctx.networked = self.net.is_some();
+        ctx.commands = &commands;
+        let out = mods.run_command(&mut ctx, cmd, &args);
+        // The test cue is a fact for the director (it runs this frame even though the console
+        // owns input).
+        if ctx.voice_test {
+            events.push(SoundEvent::Ui(UiSound::VoiceTest));
         }
-        // A `/gfx` command edits settings; push the result through the one
-        // application path and persist it, only when something actually changed.
-        if *settings != before {
-            self.apply_settings(eng, settings);
-            settings.save();
-            // Push the audio mix through the one committer whenever `/gfx`-style
-            // settings edits touch a volume/mute/deafen row.
-            sound.set_mix(settings.mix_change());
+        // Each output line already carries its role (output vs rejection): just show them.
+        for line in out.unwrap_or_else(|| vec![console::unknown_command(cmd, &commands)]) {
+            self.console.push(line);
         }
         // A `/time` change is shared: tell the server so every client's clock
         // follows (the server relays it and hands it to future joiners).
@@ -1585,7 +1586,7 @@ impl Game {
             self.console
                 .print("* day length is set by the server".to_string());
         }
-        // A `/tp` is a position discontinuity: ordinary moves are envelope-
+        // A moved player is a position discontinuity: ordinary moves are envelope-
         // checked server-side, so report it as an explicit teleport (the
         // server may still snap us back if teleports are disabled) — and
         // stream out of band so the destination doesn't wait on `stream_hz`.
@@ -1595,6 +1596,7 @@ impl Game {
                 net.send_teleport(self.player.position);
             }
         }
+        *settings != before
     }
 
     /// Break the block the player is looking at, depositing its configuration
@@ -1828,10 +1830,151 @@ fn align_body(player: &mut Player, dt: f32) {
 #[cfg(test)]
 mod tests {
     use super::{FrameInput, Game, PendingModInput};
+    use crate::audio::{SoundEvent, UiSound};
+    use crate::modding::{Command, CommandContext, Mod, Mods};
     use crate::player::Player;
     use crate::render_config::RenderConfig;
+    use crate::settings::Settings;
+    use crate::ui::{Line, Role};
     use crate::world::World;
+    use material::{Configuration, Element};
     use voxel_engine::{DVec3, Vec2};
+
+    /// A mod whose one command edits whatever its argument names, and that flies on the flight key.
+    struct Probe;
+
+    impl Mod for Probe {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn id(&self) -> &'static str {
+            "probe"
+        }
+        fn commands(&self) -> &[Command] {
+            &[Command { name: "probe", args: "<what>", help: "edit the game" }]
+        }
+        fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
+            if cmd != "probe" {
+                return None;
+            }
+            match args {
+                ["move"] => ctx.player.position.x += 10.0,
+                ["fov"] => ctx.settings.fov += 5.0,
+                ["intern"] => {
+                    ctx.world.registry_mut().intern(&Configuration::single(Element::new([1, 2, 3, 4])));
+                }
+                ["voice"] => ctx.voice_test = true,
+                _ => {}
+            }
+            Some(vec![Line::of(Role::Dim, format!("{} command(s)", ctx.commands.len()))])
+        }
+        fn on_toggle_fly(&mut self, player: &mut Player, _world: &World) -> bool {
+            player.toggle_fly();
+            true
+        }
+    }
+
+    fn game() -> Game {
+        let world = World::with_config_lazy(1, RenderConfig::default());
+        Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "probe".into())
+    }
+
+    fn probe_mods() -> Mods {
+        let mut mods = Mods::empty();
+        mods.install(Box::new(Probe), true);
+        mods
+    }
+
+    /// Run `line` as the console would; the scrollback's newest line and whether settings changed.
+    fn run(game: &mut Game, mods: &mut Mods, settings: &mut Settings, line: &str) -> (String, Role, bool, Vec<SoundEvent>) {
+        let mut events = Vec::new();
+        let changed = game.run_line(line.to_string(), settings, &mut events, mods);
+        let last = game.console.last().expect("the console printed a line");
+        let role = last.spans().next().expect("a line has a span").role;
+        (last.text().to_string(), role, changed, events)
+    }
+
+    #[test]
+    fn a_command_no_mod_handles_prints_the_hint() {
+        let mut game = game();
+        let mut settings = Settings::default();
+        let (text, role, changed, _) = run(&mut game, &mut Mods::empty(), &mut settings, "/tp 1 2 3");
+        assert_eq!(text, "unknown command 'tp' - commands come from mods such as the Developer Toolkit");
+        assert_eq!(role, Role::Danger);
+        assert!(!changed);
+        assert_eq!(game.player.position, DVec3::new(0.5, 80.0, 0.5), "the base game has no /tp");
+        let (text, ..) = run(&mut game, &mut probe_mods(), &mut settings, "/nope");
+        assert!(text.starts_with("unknown command 'nope'"), "{text}");
+        // With a mod that offers /help, the hint points there.
+        struct Helper;
+        impl Mod for Helper {
+            fn name(&self) -> &str {
+                "helper"
+            }
+            fn id(&self) -> &'static str {
+                "helper"
+            }
+            fn commands(&self) -> &[Command] {
+                &[Command { name: "help", args: "", help: "list commands" }]
+            }
+        }
+        let mut mods = Mods::empty();
+        mods.install(Box::new(Helper), true);
+        let (text, ..) = run(&mut game, &mut mods, &mut settings, "/nope");
+        assert_eq!(text, "unknown command 'nope' - type '/help'");
+    }
+
+    #[test]
+    fn a_mod_command_edits_the_player_world_and_settings() {
+        let (mut game, mut mods, mut settings) = (game(), probe_mods(), Settings::default());
+        let blocks = game.world.registry().block_count();
+        let (text, role, changed, _) = run(&mut game, &mut mods, &mut settings, "/probe intern");
+        assert_eq!((text.as_str(), role), ("1 command(s)", Role::Dim), "the context lists every enabled command");
+        assert!(!changed);
+        assert_eq!(game.world.registry().block_count(), blocks + 1);
+        let fov = settings.fov;
+        let (.., changed, _) = run(&mut game, &mut mods, &mut settings, "probe fov");
+        assert_eq!(settings.fov, fov + 5.0);
+        assert!(changed, "changed settings are applied, saved and re-mixed by the caller");
+        game.force_stream = false;
+        let (.., changed, _) = run(&mut game, &mut mods, &mut settings, "/probe move");
+        assert_eq!(game.player.position.x, 10.5);
+        assert!(!changed);
+        assert!(game.force_stream, "a moved player streams its destination at once (and is reported as a teleport)");
+    }
+
+    #[test]
+    fn a_command_asking_for_the_voice_test_plays_the_cue() {
+        let (mut game, mut mods, mut settings) = (game(), probe_mods(), Settings::default());
+        let (.., events) = run(&mut game, &mut mods, &mut settings, "/probe");
+        assert!(events.is_empty());
+        let (.., events) = run(&mut game, &mut mods, &mut settings, "/probe voice");
+        assert!(matches!(events.as_slice(), [SoundEvent::Ui(UiSound::VoiceTest)]));
+    }
+
+    /// F is not a core toggle: the first mod that offers flight takes it on the frame of the press
+    /// (mod logic on or off), once, and never while a detached camera holds the player.
+    #[test]
+    fn the_flight_key_goes_to_the_first_flight_mod() {
+        let mut game = game();
+        game.mod_logic = false;
+        let input = FrameInput { toggle_fly: true, move_input: Some(Default::default()), ..FrameInput::default() };
+        game.motion_phase(&input, 1.0 / 60.0);
+        assert!(!game.player.flying(), "the core never toggles flight");
+        assert!(!PendingModInput::capture(&input, true, true, None).any(), "F is not a cadence edge");
+
+        game.fly_key(&input, false, &mut Mods::empty());
+        assert!(!game.player.flying(), "without a mod that flies, F does nothing");
+        game.fly_key(&input, true, &mut probe_mods());
+        assert!(!game.player.flying(), "a detached camera does not fly the frozen player");
+        // Two flight mods: the first takes the key, so it toggles once.
+        let mut two = probe_mods();
+        two.install(Box::new(Probe), true);
+        game.fly_key(&input, false, &mut two);
+        assert!(game.player.flying(), "the first flight mod toggles, on this frame, mod logic off");
+        game.fly_key(&FrameInput::default(), false, &mut two);
+        assert!(game.player.flying(), "no key, no toggle");
+    }
 
     #[test]
     fn inert_frame_input_matches_default_and_carries_no_edges() {

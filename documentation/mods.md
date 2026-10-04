@@ -70,11 +70,11 @@ run time; disabled mods cost nothing.
 `Mod` methods default to no-ops; a mod implements only `name`, `id` and the hooks it needs. When
 several enabled mods implement a hook:
 
-- Fan-out, in installation order: `update`, `on_block_break`, `on_break_rejected`,
+- Fan-out, in installation order: `update`, `on_toggle_fly`, `on_block_break`, `on_break_rejected`,
   `on_place_rejected`, `on_tool_changed`. `hud` uses the same order as z-order (later draws on
-  top).
+  top), and `commands` lists concatenate in it.
 - First enabled wins: `menu_theme`, `start_screen`, `close_overlay` (first `true`), `held`,
-  `namer`, `appearance`, `worldgen`, `worldgen_config`, `command`.
+  `namer`, `appearance`, `worldgen`, `worldgen_config`, `run_command` (first `Some`).
 - Compose: `visual_group` bits OR into the render mask.
 
 `held` names the block the player holds (what a left click uses as a tool and a right click
@@ -84,6 +84,15 @@ tool reaction turned the held unit into another configuration. HUD output is dat
 `ModContext::world` with `set_block`, then wakes its contacts with `note_cell_changed` (or
 `note_block_moved(from, to)`). Chunk load, generation, meshing and saving never wake anything; on
 a client connected to a server the authority runs the scheduler.
+
+The core has no console commands and no flight toggle of its own. `run_command(ctx, cmd, args)`
+handles a console line (its default asks the context-free `command(cmd, args)`) with the player,
+world, settings and sky in a `CommandContext`; the core follows up on what changed (applies and
+saves changed settings, re-mixes the audio, sends a changed clock to the server, streams a moved
+player's destination and reports it as a teleport). `commands()` lists a mod's commands for
+`/help` and Tab completion; a line no enabled mod handles gets a short hint. `on_toggle_fly(ctx)`
+receives the flight key (`F`), latched and replayed at the mod tick like the other edges. The
+Developer Toolkit package (`pwc.dev-toolkit`) provides the commands and flight.
 
 `id()` is a stable key: `mods.cfg` lines (`id=on|off`, `id.state=` knob payloads) and world saves
 (per-mod `save_state`) are keyed by it.

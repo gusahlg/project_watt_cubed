@@ -13,12 +13,13 @@
 //! `dt` crosses the `f32`→`f64` boundary here, once, at the physics entry.
 //!
 //! The movement intent comes from the input router: three axes in `[-1, 1]`
-//! and the held/toggle states, resolved from bindings (see
-//! [`MoveInput::from_view`]) rather than read directly here.
+//! and the held states, resolved from bindings (see [`MoveInput::from_view`])
+//! rather than read directly here. Switching between walking and flying is not
+//! movement's business: a mod (the Developer Toolkit) does it on the flight key.
 use voxel_engine::DVec3;
 
 use crate::coord::Face;
-use crate::input::intent::{GameplayAxis, GameplayEvent, GameplayState};
+use crate::input::intent::{GameplayAxis, GameplayState};
 use crate::input::router::Gameplay;
 use crate::math::{PER_METER, WORLD_BORDER};
 use crate::player::{Motion, Player, Stance, collision_box, feet_of};
@@ -61,7 +62,6 @@ pub struct MoveInput {
     move_y: f32,
     move_z: f32,
     jump: bool,
-    toggle_fly: bool,
     /// Held: move horizontally faster on the ground.
     sprint: bool,
     /// Held: crouch to the shorter (sneaking) hitbox. Shares LeftShift with descent (safe: descent needs flying).
@@ -76,16 +76,9 @@ impl MoveInput {
             move_y: gp.axis(GameplayAxis::MoveY),
             move_z: gp.axis(GameplayAxis::MoveZ),
             jump: gp.state(GameplayState::Jump),
-            toggle_fly: gp.event(GameplayEvent::ToggleFly),
             sprint: gp.state(GameplayState::Sprint),
             sneak: gp.state(GameplayState::Sneak),
         }
-    }
-
-    /// Edge-triggered flight toggle, exposed so a slower fixed physics clock can
-    /// latch the event until it actually executes a tick.
-    pub(crate) fn toggle_fly(&self) -> bool {
-        self.toggle_fly
     }
 
     /// Held jump state, exposed so a fixed physics clock can also retain a
@@ -94,12 +87,8 @@ impl MoveInput {
         self.jump
     }
 
-    /// Override only the edge-triggered field when replaying held input across
-    /// fixed ticks; all held axes/states remain the current frame's values.
-    pub(crate) fn set_toggle_fly(&mut self, toggle: bool) {
-        self.toggle_fly = toggle;
-    }
-
+    /// Override only the jump when replaying held input across fixed ticks; all
+    /// other axes/states remain the current frame's values.
     pub(crate) fn set_jump(&mut self, jump: bool) {
         self.jump = jump;
     }
@@ -151,11 +140,6 @@ pub fn update_player_in(player: &mut Player, world: &World, atlas: &crate::space
     trauma
 }
 
-#[cfg(test)]
-pub(crate) fn set_velocity_for_test(player: &mut Player, v: DVec3) {
-    set_velocity(player, v);
-}
-
 fn set_velocity(player: &mut Player, v: DVec3) {
     match &mut player.motion {
         Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = v,
@@ -167,10 +151,6 @@ fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity:
     // The one f32 -> f64 physics boundary (see the module docs).
     let dt = dt as f64;
     player.gravity = gravity;
-
-    if input.toggle_fly {
-        player.toggle_fly();
-    }
 
     resolve_axis(player, world);
     resolve_stance(player, world, input);
@@ -502,7 +482,6 @@ mod tests {
             move_y: 0.0,
             move_z: 0.0,
             jump: false,
-            toggle_fly: false,
             sprint: false,
             sneak: false,
         }
@@ -535,8 +514,8 @@ mod tests {
         assert!(nan.position.is_finite() && nan.velocity().is_finite());
     }
 
-    /// A cruise flies where the view points at its speed, through solid ground, with no gravity, and
-    /// a step costs the same at light speed; past light speed it is clamped.
+    /// A cruise flies where the view points at its speed, through solid ground, with no gravity; a
+    /// step costs the same at the top cruise speed, and anything faster is clamped to it.
     #[test]
     fn a_cruise_flies_along_the_view_at_any_speed() {
         let mut world = World::new(5);
@@ -544,20 +523,25 @@ mod tests {
         world.ensure_around(start);
         let mut player = Player::new(start);
         player.orientation.pitch = -0.5; // looking down into the ground
-        player.start_cruise(crate::player::CRUISE_MAX);
+        player.start_cruise(1.0e7);
         let forward = player.orientation.direction();
-        let t = std::time::Instant::now();
         for _ in 0..120 {
             update_player(&mut player, &world, &walk_forward(), 1.0 / 60.0, down());
         }
-        assert!(t.elapsed() < std::time::Duration::from_millis(250), "120 steps took {:?}", t.elapsed());
         let moved = player.position - start;
         assert!(moved.normalize().dot(forward) > 0.999, "along the view: {moved}");
+        assert!(moved.length() > 1.0e7, "two seconds at 1e7 units/s: {}", moved.length());
         let v = player.velocity().length();
-        assert!(v > 0.99 * crate::player::CRUISE_MAX && v <= crate::player::CRUISE_MAX * (1.0 + 1e-12), "{v}");
-        set_velocity(&mut player, DVec3::new(1.0e12, 0.0, 0.0));
-        update_player(&mut player, &world, &idle(), 1.0 / 60.0, down());
-        assert!(player.velocity().length() <= crate::player::CRUISE_MAX * (1.0 + 1e-12));
+        assert!(v > 0.99e7 && v <= 1.0e7 * (1.0 + 1e-12), "{v}");
+
+        let mut fast = Player::new(start);
+        fast.start_cruise(crate::player::CRUISE_MAX);
+        set_velocity(&mut fast, forward * 1.0e12);
+        let t = std::time::Instant::now();
+        update_player(&mut fast, &world, &walk_forward(), 1.0 / 60.0, down());
+        assert!(t.elapsed() < std::time::Duration::from_millis(20), "a step at the top speed took {:?}", t.elapsed());
+        let v = fast.velocity().length();
+        assert!(v <= crate::player::CRUISE_MAX * (1.0 + 1e-12) && v > 0.99 * crate::player::CRUISE_MAX, "{v}");
     }
 
     /// Build a flat stone runway at `y = floor_y` under the given start, long    /// Build a flat stone runway at `y = floor_y` under the given start, long
@@ -1005,19 +989,6 @@ mod tests {
     fn fall_speed(player: &Player) -> f64 {
         let (a, s) = (player.up_axis.axis(), player.up_axis.sign() as f64);
         -(player.velocity()[a] * s)
-    }
-
-    #[test]
-    fn f_toggles_walking_and_flying() {
-        let world = World::generate();
-        let mut player = Player::new(DVec3::new(0.5, 80.0, 0.5));
-        let mut input = idle();
-        input.toggle_fly = true;
-        for flying in [true, false, true, false] {
-            update_player(&mut player, &world, &input, 1.0 / 60.0, down());
-            assert_eq!(player.flying(), flying);
-            assert!(!player.noclip());
-        }
     }
 
     #[test]

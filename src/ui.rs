@@ -503,7 +503,7 @@ impl<T> Ring<T> {
     }
 }
 
-/// The outcome of asking a [`TextInput`]'s completer to complete the line.
+/// The outcome of completing a [`TextInput`]'s line (see [`TextInput::complete`]).
 pub enum Completion {
     /// A single match: replace the line with this text.
     Full(String),
@@ -637,7 +637,7 @@ pub struct TextInput {
     scrub: Option<usize>,
     draft: String,
     completer: Option<fn(&str) -> Completion>,
-    /// Candidate list produced by the last ambiguous Tab, for the owner to show.
+    /// Candidate list produced by the last ambiguous completion, for the owner to show.
     notice: Option<Vec<String>>,
 }
 
@@ -653,7 +653,8 @@ impl TextInput {
         }
     }
 
-    /// Attach a Tab-completion source (e.g. the command table).
+    /// Attach a fixed Tab-completion source. An owner whose candidates change (the console, whose
+    /// commands come from the enabled mods) answers Tab through [`complete`](Self::complete) instead.
     pub fn with_completer(mut self, f: fn(&str) -> Completion) -> Self {
         self.completer = Some(f);
         self
@@ -721,7 +722,11 @@ impl TextInput {
             }
             Some(EditKey::HistoryUp) => self.history_prev(),
             Some(EditKey::HistoryDown) => self.history_next(),
-            Some(EditKey::Complete) => self.try_complete(),
+            Some(EditKey::Complete) => {
+                if let Some(f) = self.completer {
+                    self.complete(f);
+                }
+            }
             Some(EditKey::Submit) => {
                 let line = self.buf.text().trim().to_string();
                 self.buf.clear();
@@ -779,10 +784,8 @@ impl TextInput {
         }
     }
 
-    fn try_complete(&mut self) {
-        let Some(f) = self.completer else {
-            return;
-        };
+    /// Complete the line with `f`'s answer for the current text (Tab).
+    pub fn complete(&mut self, f: impl FnOnce(&str) -> Completion) {
         match f(self.buf.text()) {
             Completion::Full(s) => self.set(s),
             Completion::Ambiguous(prefix, cands) => {
