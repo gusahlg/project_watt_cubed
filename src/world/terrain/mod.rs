@@ -374,6 +374,19 @@ fn bulk_matter(registry: &BlockRegistry, bulk: &cube::Bulk) -> crate::mechanics:
     matter
 }
 
+/// The start world's relaxed datum about [`cosmos::HOME_RADIUS`]: its cube of bulk matter relaxed
+/// under its own gravity, read from the genesis table by `Π_g`. `None` without a table, or if the
+/// matter were strong enough to keep its cube grid (the start world is charted either way).
+fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::space::datum::DatumField> {
+    use crate::mechanics::genesis;
+    let matter = bulk_matter(registry, bulk);
+    let half = cosmos::HOME_CUBE_HALF as f64;
+    let (layout, _) = genesis::tabulated_layout(genesis::pi_g(&matter, half), half)?;
+    let genesis::Layout::Round { radius, datum, .. } = layout else { return None };
+    let shift = (radius - cosmos::HOME_RADIUS as f64) as f32;
+    Some(crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() })
+}
+
 /// Sagging cubes: a `Layout::Cube` body whose warp moves any point by more than half a block.
 fn cube_warps(
     cosmos: &cosmos::Cosmos,
@@ -398,6 +411,21 @@ fn cube_warps(
         out.push((b.id, Arc::new(warp)));
     }
     out
+}
+
+/// The start world's relief layer for gravity, computed once per process for each distinct datum
+/// (worlds of one palette share it; the projection is the costly part of creating a world).
+fn home_relief(centre: glam::DVec3, density: f64, datum: &crate::space::datum::DatumField) -> Arc<crate::gravity::relief::Relief> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<(u64, Arc<crate::gravity::relief::Relief>)>> = Mutex::new(Vec::new());
+    let key = datum.offsets.iter().fold(centre.y.to_bits() ^ density.to_bits(), |h, o| (h ^ o.to_bits() as u64).wrapping_mul(0x100_0000_01B3));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, layer)) = cache.iter().find(|(k, _)| *k == key) {
+        return Arc::clone(layer);
+    }
+    let layer = Arc::new(crate::gravity::relief::Relief::new(centre, cosmos::HOME_RADIUS as f64, density, datum));
+    cache.push((key, Arc::clone(&layer)));
+    layer
 }
 
 /// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` is
@@ -491,12 +519,21 @@ impl Terrain {
         let mut cosmos = cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale);
         let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
         // Sagging cubes keep their grid and record how far the warp moves it, so gravity can bound
-        // the missing shell. The start world stays the chart sphere: fitting that chart to the
-        // relaxed datum would move spawn by the pole relief.
+        // the missing shell.
         let matter = bulk_matter(registry, &bulk);
         let warps = cube_warps(&cosmos, &matter);
         for (id, warp) in &warps {
             cosmos.set_warp_sag(*id, warp.max_displacement());
+        }
+        // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
+        // chart grid to the shape, and its relief joins gravity.
+        let home_datum = home_shape(registry, &bulk);
+        if let Some(datum) = &home_datum {
+            cosmos.settle_home(datum.offset(2, 0.0, 0.0).round() as i64);
+            let home = cosmos.home();
+            let layer = home_relief(home.centre_f(), home.density, datum);
+            let id = home.id;
+            cosmos.set_relief(id, Arc::new(datum.clone()), layer);
         }
         let cosmos = Arc::new(cosmos);
         let relief = cfg.relief as f32 / 100.0;
@@ -561,7 +598,10 @@ impl Terrain {
         }
         // Majority of the 24-bit mix: the uniform block under the start world's band 0.
         let home_fill = bulk.majority();
-        let storage = storage::StorageWorlds::new(&cosmos, &m, home_fill, &warps);
+        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill, &warps);
+        if let Some(datum) = home_datum {
+            storage.set_home_datum(Arc::new(datum));
+        }
         Self {
             seed,
             storage,

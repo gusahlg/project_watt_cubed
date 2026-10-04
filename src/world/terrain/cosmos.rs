@@ -256,8 +256,8 @@ pub struct Cosmos {
     group_at: Vec<u32>,
     /// Interior-feature density as a fraction of the design (1 = as designed). The Heart stays.
     deep: f32,
-    /// A round body's relaxed relief as a gravity source (body id and its layer).
-    relief: Option<(u16, std::sync::Arc<crate::gravity::relief::Relief>)>,
+    /// A round body's relaxed shape: body id, its datum and that relief as a gravity source.
+    relief: Option<Relaxed>,
     /// Sag of a warped cube (body id, largest nodal displacement in blocks). The mass primitive
     /// stays the box; this is the extra error declared near the body.
     sag: Vec<(u16, f64)>,
@@ -449,12 +449,12 @@ impl Cosmos {
         self.bodies
             .iter()
             .filter(|b| (b.centre_f() - p).length() <= b.reach() * 1.5)
-            .min_by(|a, b| a.altitude(p).abs().total_cmp(&b.altitude(p).abs()))
+            .min_by(|a, b| self.altitude(a, p).abs().total_cmp(&self.altitude(b, p).abs()))
     }
 
     /// Whether `p` is in air: a nearest body exists and its altitude is at most [`AIR_TOP`].
     pub fn in_air(&self, p: DVec3) -> bool {
-        self.body_at(p).is_some_and(|body| body.altitude(p) <= AIR_TOP)
+        self.body_at(p).is_some_and(|body| self.altitude(body, p) <= AIR_TOP)
     }
 
     /// Open air inside a Hollow: within the inner surface and outside its Ember.
@@ -744,11 +744,47 @@ impl Cosmos {
     }
 }
 
+/// A body's relaxed shape as the catalog knows it.
+#[derive(Clone, Debug)]
+struct Relaxed {
+    id: u16,
+    datum: std::sync::Arc<crate::space::datum::DatumField>,
+    layer: std::sync::Arc<crate::gravity::relief::Relief>,
+}
+
 impl Cosmos {
-    /// Give body `id` its relaxed relief as a gravity source (generation, before the cosmos is
-    /// shared).
-    pub fn set_relief(&mut self, id: u16, layer: std::sync::Arc<crate::gravity::relief::Relief>) {
-        self.relief = Some((id, layer));
+    /// Settle the start world on its relaxed shape: its centre moves so the surface at the top of
+    /// its +Y face (datum offset `top_offset` above [`HOME_RADIUS`]) stays at `y = 0`, where spawn,
+    /// the bench and the travel targets expect the ground.
+    pub fn settle_home(&mut self, top_offset: i64) {
+        let home = &mut self.bodies[0];
+        home.centre = [HOME_CENTRE[0], HOME_CENTRE[1] - top_offset, HOME_CENTRE[2]];
+    }
+
+    /// Give body `id` its relaxed datum and that relief as a gravity source (generation, before
+    /// the cosmos is shared).
+    pub fn set_relief(&mut self, id: u16, datum: std::sync::Arc<crate::space::datum::DatumField>, layer: std::sync::Arc<crate::gravity::relief::Relief>) {
+        self.relief = Some(Relaxed { id, datum, layer });
+    }
+
+    /// How far body `b`'s relaxed surface sits above its datum sphere toward `p` (0 for a body
+    /// without a relaxed datum).
+    pub fn surface_offset(&self, b: &Body, p: DVec3) -> f64 {
+        match self.relief.as_ref().filter(|r| r.id == b.id) {
+            Some(r) => r.datum.at((p - b.centre_f()).normalize_or_zero()),
+            None => 0.0,
+        }
+    }
+
+    /// Altitude of `p` above body `b`'s relaxed surface datum (its [`Body::altitude`] for a body
+    /// without a relaxed datum).
+    pub fn altitude(&self, b: &Body, p: DVec3) -> f64 {
+        b.altitude(p) - self.surface_offset(b, p)
+    }
+
+    /// Lowest and highest relaxed datum offsets of body `b` (zero without a relaxed datum).
+    pub fn relief_range(&self, b: &Body) -> (f64, f64) {
+        self.relief.as_ref().filter(|r| r.id == b.id).map_or((0.0, 0.0), |r| r.datum.range())
     }
 
     /// Record the sag of a warped cube (generation, before the cosmos is shared).
@@ -784,10 +820,11 @@ impl MassOracle for Cosmos {
             if let Shape::Cube { half } = b.shape {
                 super::deep::apply(b.centre, half, b.seed, b.density, self.deep, v);
             }
-            if let Some((_, layer)) = self.relief.as_ref().filter(|(id, _)| *id == b.id) {
-                v.analytic(layer.accel(centre) / G, layer.potential(centre) / G);
+            if let Some(r) = self.relief.as_ref().filter(|r| r.id == b.id) {
+                let (accel, potential) = r.layer.field(centre);
+                v.analytic(accel / G, potential / G);
             }
-            if b.altitude(centre).abs() < RELIEF as f64 * 4.0 {
+            if self.altitude(b, centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());
             }
             // The box primitive ignores the sag. Near the body — out to the sagged surface — that

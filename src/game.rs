@@ -1760,7 +1760,7 @@ impl Game {
                     return 1.0e9;
                 }
                 match cosmos.body_at(eye) {
-                    Some(b) if b.kind != Kind::Moon => b.altitude(eye),
+                    Some(b) if b.kind != Kind::Moon => cosmos.altitude(b, eye),
                     _ => 1.0e9,
                 }
             }
@@ -1854,7 +1854,8 @@ mod tests {
         let cosmos = game.world.terrain().cosmos().expect("a cosmos");
         let eye = DVec3::new(12.0, 40.0, -3.0);
         let home = cosmos.home();
-        assert!((game.sky_altitude(eye) - home.altitude(eye)).abs() < 1e-6);
+        let cosmos = game.world.terrain().cosmos().expect("a cosmos");
+        assert!((game.sky_altitude(eye) - cosmos.altitude(&home, eye)).abs() < 1e-6);
         let verdance = cosmos
             .bodies()
             .iter()
