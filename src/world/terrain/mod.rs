@@ -379,6 +379,24 @@ fn stored(x: i32) -> bool {
     x as i64 >= crate::space::atlas::STORAGE_X0
 }
 
+/// Coarse chart columns sample the cell floor, which is rock. Replace that cell
+/// with the surface block when the surface itself sits in it; a plant above stays.
+fn paint_stored_top(storage: &storage::StorageWorlds, x: i32, z: i32, ys: &[i32], out: &mut [BlockId]) {
+    if !super::generation::coarse_floor_samples(ys) {
+        return;
+    }
+    let n = out.len().min(ys.len());
+    let Some(j) = out[..n].iter().rposition(|&id| id != AIR) else { return };
+    let s = storage.surface(x, z);
+    if s == i32::MIN || s >= storage::BURIED {
+        return;
+    }
+    let (lo, step) = (ys[j], ys[1] - ys[0]);
+    if s - 1 >= lo && s - 1 < lo + step {
+        super::generation::paint_lod_top(out, n, storage.voxel(x, s - 1, z));
+    }
+}
+
 fn rel_box(centre: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> ([i64; 3], [i64; 3]) {
     (
         [lo[0] - centre[0], lo[1] - centre[1], lo[2] - centre[2]],
@@ -1370,6 +1388,7 @@ impl TerrainGenerator for Terrain {
             for (o, &wy) in out.iter_mut().zip(ys) {
                 *o = self.storage.voxel(wx, wy, wz);
             }
+            paint_stored_top(&self.storage, wx, wz, ys, out);
             return;
         }
         let Some(hit) = self.posy_hit(wx, wz) else {
@@ -1387,6 +1406,10 @@ impl TerrainGenerator for Terrain {
                 hit.paint.shape.ground(&hit.col, hit.u, h, hit.v)
             };
         }
+        // The hit is already in hand: painting here does not sample the column again.
+        if super::generation::coarse_floor_samples(ys) {
+            super::generation::paint_lod_top(out, ys.len(), hit.col.surface);
+        }
     }
 
     fn lod_column_face(&self, body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {
@@ -1396,6 +1419,7 @@ impl TerrainGenerator for Terrain {
                 return;
             }
             self.storage.lod_column(u, v, alts, out);
+            paint_stored_top(&self.storage, u, v, alts, out);
             return;
         }
         if face == Face::PosY {
@@ -1416,6 +1440,9 @@ impl TerrainGenerator for Terrain {
                 let h = cube::face_h(hit.half, n_dot, a);
                 hit.paint.shape.ground(&hit.col, hit.u, h, hit.v)
             };
+        }
+        if super::generation::coarse_floor_samples(alts) {
+            super::generation::paint_lod_top(out, alts.len(), hit.col.surface);
         }
     }
 
