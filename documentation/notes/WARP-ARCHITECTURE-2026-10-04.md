@@ -101,3 +101,21 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
 | W4 | Gravity from the relaxed shapes: relief layer (round), polyhedron (warped cube) | done |
 | W5 | Background relaxation, epochs, protocol, cage refresh (`mechanics::creep` is the step) | scope question to the owner: planet-scale relaxation never triggers at hand scale |
 | W6 | Far-body impostors from the relaxed shape (engine `FarShape::Rounded`) | done |
+
+## 5. Background relaxation (W5): what it can and cannot show
+
+`mechanics::creep::step` advances a body in world time (elastic equilibrium with the plastic state
+frozen, then the overstress relaxes by `1 − e^{−dt/τ}`). Wiring it into the server is mechanical:
+per relaxed body keep its lattice and stress (rebuilt from the table geometry at world creation),
+sum the edit ledger's mass changes per lattice element every few world seconds, run creep steps on
+a background thread when the change can matter, and publish a geometry epoch (the new datum for a
+charted body, the new warp for a cube body) that clients swap in, re-caging loaded chunks and
+updating the gravity sources; saves keep the epoch geometry.
+
+What it would show at hand scale: nothing. The start world's lattice elements are ~3.9M blocks;
+moving them by half a block needs ~10¹⁶ amount of matter moved, and a player's tower on rock never
+yields (`ρ g h` of a 1,000-block tower is 1.4·10⁵ against a yield of 1.5·10⁷). Creep a player can
+see — a tower sinking into weak ground, an ice cliff flowing — happens at the scale of the load, and
+needs **local** lattices (a few hundred blocks around a heavy load on weak matter) rather than the
+planetary one. Which of the two to build is the owner's call.
+

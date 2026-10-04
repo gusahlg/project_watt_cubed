@@ -751,8 +751,10 @@ fn element(
     let mut b = [[DVec3::ZERO; 8]; GP];
     let mut w = [0.0f64; GP];
     let mut l = [DMat3::ZERO; GP];
+    let mut jac = [DMat3::ZERO; GP];
     for g in 0..GP {
         let j = local_jacobian(x, gps[g]);
+        jac[g] = j;
         let det = j.determinant();
         let jit = if det.abs() > 1e-300 { j.inverse().transpose() } else { DMat3::ZERO };
         w[g] = det / GP as f64;
@@ -772,7 +774,7 @@ fn element(
         // air the matter drags along stays a valid map.
         let lambda = p.bulk - 2.0 / 3.0 * mu;
         for g in 0..GP {
-            let f = local_jacobian(x, gps[g]) * (1.0 / cell);
+            let f = jac[g] * (1.0 / cell);
             let jdet = f.determinant().max(1e-9);
             let bmat = f * f.transpose();
             let s = (bmat - DMat3::IDENTITY) * (mu / jdet) + DMat3::IDENTITY * (lambda * jdet.ln() / jdet);
@@ -815,8 +817,9 @@ fn element(
     // The pressure forces from the nodal field, less the group multiplier's own (applied by the
     // projection): `Σ_g w (λ_h(g) − λ_e) b`.
     if let Some((own, nodal)) = pressure {
+        let values = shape_table();
         for g in 0..GP {
-            let n = shape_values(gps[g]);
+            let n = &values[g];
             let lh: f64 = (0..8).map(|d| n[d] * nodal[d]).sum();
             let k = (lh - own) * w[g];
             for c in 0..8 {
@@ -824,6 +827,15 @@ fn element(
             }
         }
     }
+}
+
+/// [`shape_values`] at the Gauss points, computed once.
+fn shape_table() -> &'static [[f64; 8]; GP] {
+    static TABLE: std::sync::OnceLock<[[f64; 8]; GP]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let gps = gauss_points();
+        std::array::from_fn(|g| shape_values(gps[g]))
+    })
 }
 
 /// The eight trilinear shape functions at `t`.
