@@ -907,11 +907,11 @@ mod tests {
 
     #[test]
     fn vacuum_above_the_home_face_falls_with_the_gravity() {
-        use crate::world::terrain::cosmos::{HOME_CENTRE, HOME_HALF};
+        use crate::world::terrain::cosmos::{HOME_CENTRE, HOME_RADIUS};
         let world = diffusion();
         let centre = DVec3::new(HOME_CENTRE[0] as f64, HOME_CENTRE[1] as f64, HOME_CENTRE[2] as f64);
-        let start = centre + DVec3::new(HOME_HALF as f64 + 50_000.0, 0.0, 0.0);
-        assert!(!world.in_air(start), "50 000 above the +X face is vacuum");
+        let start = centre + DVec3::new(HOME_RADIUS as f64 + 50_000.0, 0.0, 0.0);
+        assert!(!world.in_air(start), "50 000 above the +X side is vacuum");
         let mut player = Player::new(start);
         player.motion = Motion::Walking { velocity: DVec3::ZERO, on_ground: false };
         // Keys and jump do nothing while falling in vacuum.

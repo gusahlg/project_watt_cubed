@@ -835,9 +835,9 @@ mod tests {
     fn air_stops_at_air_top_and_open_space_is_vacuum() {
         let cosmos = Cosmos::new(1, 1.0);
         let home = cosmos.home().centre_f();
-        let half = HOME_HALF as f64;
-        assert!(cosmos.in_air(home + DVec3::new(0.0, half + 80.0, 0.0)));
-        assert!(!cosmos.in_air(home + DVec3::new(0.0, half + AIR_TOP + 1.0, 0.0)));
+        let top = HOME_RADIUS as f64;
+        assert!(cosmos.in_air(home + DVec3::new(0.0, top + 80.0, 0.0)));
+        assert!(!cosmos.in_air(home + DVec3::new(0.0, top + AIR_TOP + 1.0, 0.0)));
         let empty = DVec3::new(0.0, 0.0, 9.95e8);
         assert!(cosmos.body_at(empty).is_none());
         assert!(!cosmos.in_air(empty));
