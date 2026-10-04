@@ -133,6 +133,11 @@ const MIN_UPLOAD_BUDGET_BYTES: usize = 256 << 10;
 /// unbounded channel drain.
 const RESULT_INTEGRATE_FLOOR: usize = 8;
 
+/// Blocks past a chart's stored top that still stream on that chart. The band ends
+/// `RELIEF` above the datum and the crust tops out at `MAX_GROUND`, so this clears
+/// three thousand blocks of flight over the highest crust.
+const CHART_FLIGHT: f64 = 2_048.0;
+
 /// Velocity-aware streaming load controller. `effort` is the one normalized
 /// signal shared by worker concurrency, queue lookahead, admission deadlines,
 /// result integration, and GPU uploads, so those stages cannot fight each
@@ -757,15 +762,16 @@ impl World {
         }
     }
 
-    /// Storage position of an eye on or above a round body, including flight up to the stream
-    /// reach above the relief. `None` on a flat world and away from every chart.
+    /// Storage position of an eye on or above a round body, including flight past the stored
+    /// top ([`CHART_FLIGHT`], wider than the stream window). `None` on a flat world and away
+    /// from every chart.
     pub(crate) fn chart_eye(&self, eye: DVec3) -> Option<DVec3> {
         if self.seams.is_empty() {
             return None;
         }
-        let reach = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64
+        let window = (self.view.horizontal.max(self.view.vertical) + super::DATA_MARGIN + 2) as f64
             * CHUNK_SIZE as f64;
-        self.seams.storage_eye(eye, reach)
+        self.seams.storage_eye(eye, window.max(CHART_FLIGHT))
     }
 
     /// The point streaming stands on: the eye's storage position on (or above) a round world's
@@ -2866,7 +2872,36 @@ impl World {
     /// Per-frame selection metric: chunk-centre tangents, `dy` from eye altitude to the LOD envelope.
     /// Tangents stay on the chunk centre (not the raw eye) so PosY `dy=0` stays bit-identical.
     /// Altitude is relative to the face datum, so the envelope stays `[0, 512]` on every face.
+    /// Streaming centre in a warped-cube box, mapped back to the reference cube. Outside every
+    /// cube box this is the centre unchanged, so an identity fold stays bit-identical. A reference
+    /// centre is not inside a box, so a second call does not translate again.
+    fn lod_place(&self, center: Coord) -> (Coord, f64, bool) {
+        let cs = CHUNK_SIZE as i64;
+        let cell = [center.x as i64 * cs, center.y as i64 * cs, center.z as i64 * cs];
+        for atlas in self.generator.atlases() {
+            let Some(g) = atlas.grid else { continue };
+            let inside = (0..3).all(|a| cell[a] >= g.origin[a] && cell[a] < g.origin[a] + g.size[a]);
+            if !inside {
+                continue;
+            }
+            let d = [
+                (g.ref_min[0] - g.origin[0]) / cs,
+                (g.ref_min[1] - g.origin[1]) / cs,
+                (g.ref_min[2] - g.origin[2]) / cs,
+            ];
+            let reference = Coord::new(
+                (center.x as i64 + d[0]) as i32,
+                (center.y as i64 + d[1]) as i32,
+                (center.z as i64 + d[2]) as i32,
+            );
+            let eye_y = self.section_eye_y + (g.ref_min[1] - g.origin[1]) as f64;
+            return (reference, eye_y, true);
+        }
+        (center, self.section_eye_y, false)
+    }
+
     fn section_metric_on(&self, center: Coord, delta: DVec3, face: Face, datum: i32) -> EyeMetric {
+        let (center, eye_y, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
         let cfg = &self.section_pyramid;
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
@@ -2874,7 +2909,7 @@ impl World {
         if face == Face::PosY && datum == 0 {
             let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
             return EyeMetric::new(
-                DVec3::new(pcx as f64 + delta.x, self.section_eye_y + delta.y, pcz as f64 + delta.z),
+                DVec3::new(pcx as f64 + delta.x, eye_y + delta.y, pcz as f64 + delta.z),
                 env,
                 cap,
             );
@@ -2883,7 +2918,7 @@ impl World {
         let (cu, _, cv) = frame.chunk_to_local(center);
         let (u, v) = (cu * cs + cs / 2, cv * cs + cs / 2);
         let d = frame.point_to_local(delta);
-        let eye = DVec3::new((center.x * cs + cs / 2) as f64, self.section_eye_y, (center.z * cs + cs / 2) as f64);
+        let eye = DVec3::new((center.x * cs + cs / 2) as f64, eye_y, (center.z * cs + cs / 2) as f64);
         let rel = frame.point_to_local(eye).y + d.y - datum as f64;
         EyeMetric::new(DVec3::new(u as f64 + d.x, rel, v as f64 + d.z), env, cap)
     }
@@ -3038,7 +3073,10 @@ impl World {
     /// that is not inside a storage box.
     fn chart_bend(&self, pos: SectionPos) -> Option<super::ChartBend> {
         if pos.body < super::section::CHART_BODY_BASE {
-            return None;
+            let atlas = self.seams.atlases().iter().find(|a| {
+                a.grid.as_ref().is_some_and(|g| g.body == pos.body) && a.warp.is_some()
+            })?;
+            return Some(super::ChartBend { atlas: atlas.clone(), patch: crate::space::atlas::Patch::Grid });
         }
         let index = (pos.body - super::section::CHART_BODY_BASE) as usize;
         let atlas = self.seams.atlases().get(index)?.clone();
@@ -3051,12 +3089,13 @@ impl World {
     fn chart_sections(&self, center: Coord) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d);
+        let punch = self.near_draws_ground(center);
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, punch);
         let delta = self.section_vel * TAU_STREAM;
         if delta == DVec3::ZERO {
             return base;
         }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d))
+        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, punch))
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`.
@@ -3093,6 +3132,7 @@ impl World {
         seat: &super::seam::ChartSeat,
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
+        punch: bool,
     ) -> Vec<SectionPos> {
         let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
         let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
@@ -3102,7 +3142,7 @@ impl World {
         let rel = (ey as f64 - ground as f64).clamp(0.0, 1.0e7);
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
         let near = self.near_block_box(center);
-        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, None);
+        let mut tagged = self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, punch, None);
         let band = super::section::section_span(super::section::FINEST_DETAIL) as i64 * 2;
         for across in self.seams.seam_across(*seat, [ex, ey, ez], band) {
             tagged.extend(self.seat_sections(
@@ -3114,6 +3154,7 @@ impl World {
                 cfg,
                 max_d,
                 near,
+                punch,
                 Some(&across),
             ));
         }
@@ -3137,6 +3178,7 @@ impl World {
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
         near: (i64, i64, i64, i64),
+        punch: bool,
         across: Option<&super::seam::SeamAcross>,
     ) -> Vec<(SectionPos, f64)> {
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
@@ -3146,13 +3188,34 @@ impl World {
             s.body = body;
             s.face = Face::PosY;
         }
+        // Charts have no shader clip. Leave the near square to full-res chunks while they
+        // still hold the crust; once that window is sky, the far field draws the square.
         let keep = |s: SectionPos| {
-            inside_xz(s, seat.lo, seat.hi) && !covers_near(s, near, across) && super::section::section_fits(s.span(), seat.radius)
+            inside_xz(s, seat.lo, seat.hi)
+                && !(punch && covers_near(s, near, across))
+                && super::section::section_fits(s.span(), seat.radius)
         };
         coarsen_chart(radial, max_d, self.sections_allowed(), &keep)
             .into_iter()
             .map(|s| (s, section_dist2(s, ex, ez)))
             .collect()
+    }
+
+    /// Whether the full-res window still contains the crust under `center`. Storage altitude:
+    /// `surface` is the first open cell, so the solid top is the block below it.
+    fn near_draws_ground(&self, center: Coord) -> bool {
+        let cs = CHUNK_SIZE as i64;
+        let x = i64::from(center.x) * cs + cs / 2;
+        let z = i64::from(center.z) * cs + cs / 2;
+        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
+            return true;
+        };
+        let ground = self.generator.surface(Face::PosY, x, z);
+        if ground == i32::MIN {
+            return true;
+        }
+        let bottom = i64::from(self.mesh_box(center).min().y) * cs;
+        bottom <= i64::from(ground) - 1
     }
 
     /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so the
@@ -3173,7 +3236,8 @@ impl World {
     /// static frontier bit-for-bit. Open space and a round body seen from outside select
     /// nothing; a streaming centre in storage selects that chart's sections.
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        if !self.fold.is_identity() {
+        let (_, _, in_cube) = self.lod_place(center);
+        if !self.fold.is_identity() && !in_cube {
             return self.chart_sections(center);
         }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
@@ -3198,20 +3262,24 @@ impl World {
 
     /// Chunk-centre sample the far field treats as the eye (tangents quantised, altitude exact on Y).
     fn lod_eye_point(&self, center: Coord) -> DVec3 {
+        let (center, eye_y, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
-        DVec3::new((center.x * cs + cs / 2) as f64, self.section_eye_y, (center.z * cs + cs / 2) as f64)
+        DVec3::new((center.x * cs + cs / 2) as f64, eye_y, (center.z * cs + cs / 2) as f64)
     }
 
     /// Face-local chunk-centre tangents.
     fn face_tangent_centre(&self, center: Coord, face: Face) -> (i32, i32) {
+        let (center, _, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
         let (cu, _, cv) = FaceFrame::new(face).chunk_to_local(center);
         (cu * cs + cs / 2, cv * cs + cs / 2)
     }
 
-    /// The cube face under the camera. `None` in storage, in open space, or over a round body.
+    /// The cube face under the camera. `None` in a chart's storage, in open space, or over a round
+    /// body. A streaming centre inside a warped cube still names that cube's face.
     fn dominant_lod_face(&self, center: Coord) -> Option<(u16, Face)> {
-        if !self.fold.is_identity() {
+        let (_, _, in_cube) = self.lod_place(center);
+        if !self.fold.is_identity() && !in_cube {
             return None;
         }
         let Some(cosmos) = self.generator.cosmos() else {

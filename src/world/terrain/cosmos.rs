@@ -258,6 +258,9 @@ pub struct Cosmos {
     deep: f32,
     /// A round body's relaxed shape: body id, its datum and that relief as a gravity source.
     relief: Option<Relaxed>,
+    /// Sag of a warped cube (body id, largest nodal displacement in blocks). The mass primitive
+    /// stays the box; this is the extra error declared near the body.
+    sag: Vec<(u16, f64)>,
 }
 
 /// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
@@ -420,6 +423,7 @@ impl Cosmos {
             group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
             deep: deep.clamp(0.0, 2.0),
             relief: None,
+            sag: Vec::new(),
         };
         cosmos.place_clusters(space);
         cosmos
@@ -792,6 +796,19 @@ impl Cosmos {
     pub fn relief_range(&self, b: &Body) -> (f64, f64) {
         self.relief.as_ref().filter(|r| r.id == b.id).map_or((0.0, 0.0), |r| r.datum.range())
     }
+
+    /// Record the sag of a warped cube (generation, before the cosmos is shared).
+    pub fn set_warp_sag(&mut self, id: u16, sag: f64) {
+        if let Some(slot) = self.sag.iter_mut().find(|(i, _)| *i == id) {
+            slot.1 = sag;
+        } else {
+            self.sag.push((id, sag));
+        }
+    }
+
+    fn sag_of(&self, id: u16) -> f64 {
+        self.sag.iter().find(|(i, _)| *i == id).map(|(_, s)| *s).unwrap_or(0.0)
+    }
 }
 
 /// Radius around a query inside which a cluster's real rocks replace its expected mass.
@@ -814,10 +831,17 @@ impl MassOracle for Cosmos {
                 super::deep::apply(b.centre, half, b.seed, b.density, self.deep, v);
             }
             if let Some(r) = self.relief.as_ref().filter(|r| r.id == b.id) {
-                v.analytic(r.layer.accel(centre) / G, r.layer.potential(centre) / G);
+                let (accel, potential) = r.layer.field(centre);
+                v.analytic(accel / G, potential / G);
             }
             if self.altitude(b, centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());
+            }
+            // The box primitive ignores the sag. Near the body — out to the sagged surface — that
+            // missing mass is an extra slab, the same shape of bound as the relief.
+            let sag = self.sag_of(b.id);
+            if sag > 0.0 && b.altitude(centre).abs() < sag.max(RELIEF as f64) * 4.0 {
+                v.error(2.0 * std::f64::consts::PI * b.density * sag);
             }
         }
         // Only super-cells within `reach` (plus a cell's half-diagonal) can hold a group in range.

@@ -1,11 +1,14 @@
-//! The cosmos's round bodies painted on curved charts in storage (SPACE-ARCHITECTURE §7).
+//! The cosmos's round bodies painted on curved charts in storage (SPACE-ARCHITECTURE §7), and the
+//! sagging cubes whose cells moved here with their grid.
 //!
 //! Every ball (the start world, Verdance, the Ember, the moons) gets an atlas of cube-sphere charts
 //! down to a Cartesian core, the Hollow two shell atlases (its outer crust, and its inner surface
 //! facing the Ember). Round painters ([`Round`]) fill every chart except the start world's: its
 //! band 0 is the face terrain, and the generator paints that before asking here. Deeper bands of
-//! the start world are one bulk block. Physical space holds none of their cells. Which body gets a
-//! chart is initial world state chosen by the generator — physics never asks.
+//! the start world are one bulk block. A cube that sagged past half a block keeps one more box:
+//! an integer translation of its physical cells, embedded by its warp. Physical space holds none
+//! of these cells. Which body gets a chart is initial world state chosen by the generator — physics
+//! never asks.
 
 use std::sync::Arc;
 
@@ -17,6 +20,7 @@ use super::round::{Round, Style};
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::ChunkCoord;
 use crate::space::atlas::{Atlas, Patch, STORAGE_X0};
+use crate::space::warp::Warp;
 use crate::space::datum::DatumField;
 use crate::world::chunk::{CHUNK_SIZE, ChunkData};
 
@@ -59,6 +63,8 @@ struct Charted {
 pub struct StorageWorlds {
     worlds: Vec<Charted>,
     atlases: Vec<Arc<Atlas>>,
+    /// Storage x of the first warped-cube box, or [`i64::MAX`] when no cube sagged into storage.
+    cube_x0: i64,
 }
 
 fn boxes_of(atlas: &Atlas) -> Vec<(Patch, [i64; 3], [i64; 3])> {
@@ -72,9 +78,10 @@ fn boxes_of(atlas: &Atlas) -> Vec<(Patch, [i64; 3], [i64; 3])> {
 }
 
 impl StorageWorlds {
-    /// Chart every round body of `cosmos`, boxes end to end from [`STORAGE_X0`]. `home_fill` is the
-    /// start world's uniform block below band 0 (the bulk mix's majority material).
-    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, home_fill: BlockId) -> Self {
+    /// Chart every round body of `cosmos`, boxes end to end from [`STORAGE_X0`], then one box per
+    /// sagging cube in `warps` (its cells are an integer translation of the physical cube).
+    /// `home_fill` is the start world's uniform block below band 0 (the bulk mix's majority material).
+    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, home_fill: BlockId, warps: &[(u16, Arc<Warp>)]) -> Self {
         let mut worlds = Vec::new();
         let mut x = STORAGE_X0;
         // Copied so a moon can look up its parent while the loop still holds a body.
@@ -115,8 +122,26 @@ impl StorageWorlds {
                 worlds.push(Charted { boxes: boxes_of(&atlas), round, atlas, home, fill });
             }
         }
+        // y starts at the storage border, one box after another. PosX and NegX columns are keyed by
+        // (y, z) only; stacking the boxes in x alone would alias the two cubes with each other and
+        // with physical columns, whose y stays under 1e9.
+        let mut cube_y = STORAGE_X0;
+        for (id, warp) in warps {
+            let Some(body) = bodies.iter().find(|b| b.id == *id) else { continue };
+            let Shape::Cube { half } = body.shape else { continue };
+            let reach = half + RELIEF;
+            let size = 2 * reach;
+            debug_assert!(size % CS == 0, "a cube box is chunk aligned");
+            let ref_min = [body.centre[0] - reach, body.centre[1] - reach, body.centre[2] - reach];
+            let origin = [x, cube_y, 0];
+            cube_y += size;
+            let atlas = Atlas::cube(body.centre_f(), half, origin, ref_min, [size; 3], Arc::clone(warp), body.id);
+            x = atlas.next_x();
+            worlds.push(Charted { boxes: boxes_of(&atlas), round: None, atlas, home: false, fill: AIR });
+        }
         let atlases = worlds.iter().map(|w| Arc::new(w.atlas.clone())).collect();
-        Self { worlds, atlases }
+        let cube_x0 = worlds.iter().filter_map(|w| w.atlas.grid.as_ref().map(|g| g.origin[0])).min().unwrap_or(i64::MAX);
+        Self { worlds, atlases, cube_x0 }
     }
 
     fn round_of(w: &Charted) -> &Round {
@@ -174,6 +199,107 @@ impl StorageWorlds {
         c.x as i64 * CS >= STORAGE_X0
     }
 
+    /// Storage x where warped-cube boxes begin. Chunks before this are not cube boxes.
+    #[inline]
+    pub fn cube_x0(&self) -> i64 {
+        self.cube_x0
+    }
+
+    /// Whether body `id` keeps its cube cells in a storage box.
+    pub fn holds_cube(&self, id: u16) -> bool {
+        self.worlds.iter().any(|w| w.atlas.grid.as_ref().is_some_and(|g| g.body == id))
+    }
+
+    /// Storage cell of reference cell `reference` on a stored cube, when it lies in the box.
+    pub fn cube_storage(&self, body: u16, reference: [i64; 3]) -> Option<[i64; 3]> {
+        let g = self.worlds.iter().find_map(|w| w.atlas.grid.filter(|g| g.body == body))?;
+        let s = [
+            reference[0] - g.ref_min[0] + g.origin[0],
+            reference[1] - g.ref_min[1] + g.origin[1],
+            reference[2] - g.ref_min[2] + g.origin[2],
+        ];
+        let inside = (0..3).all(|a| s[a] >= g.origin[a] && s[a] < g.origin[a] + g.size[a]);
+        inside.then_some(s)
+    }
+
+    /// Reference chunk of a storage chunk that sits in a cube box.
+    pub fn cube_ref_chunk(&self, c: ChunkCoord) -> Option<ChunkCoord> {
+        let g = self.grid_holding(c)?;
+        let d = [
+            (g.ref_min[0] - g.origin[0]) / CS,
+            (g.ref_min[1] - g.origin[1]) / CS,
+            (g.ref_min[2] - g.origin[2]) / CS,
+        ];
+        Some(ChunkCoord::new((c.x as i64 + d[0]) as i32, (c.y as i64 + d[1]) as i32, (c.z as i64 + d[2]) as i32))
+    }
+
+    /// Reference cell of storage cell `(x, y, z)` when it sits in a cube box, with the body's id.
+    pub fn cube_ref_cell(&self, x: i32, y: i32, z: i32) -> Option<(u16, [i64; 3])> {
+        let c = ChunkCoord::new(x.div_euclid(CS as i32), y.div_euclid(CS as i32), z.div_euclid(CS as i32));
+        let g = self.grid_holding(c)?;
+        let s = [i64::from(x), i64::from(y), i64::from(z)];
+        let p = [
+            s[0] - g.origin[0] + g.ref_min[0],
+            s[1] - g.origin[1] + g.ref_min[1],
+            s[2] - g.origin[2] + g.ref_min[2],
+        ];
+        Some((g.body, p))
+    }
+
+    /// The cube box whose storage footprint contains chunk `c`.
+    fn grid_holding(&self, c: ChunkCoord) -> Option<crate::space::atlas::GridBox> {
+        if (c.x as i64) * CS < self.cube_x0 {
+            return None;
+        }
+        let k = [c.x as i64, c.y as i64, c.z as i64];
+        self.worlds.iter().find_map(|w| {
+            let g = w.atlas.grid?;
+            let lo = [g.origin[0] / CS, g.origin[1] / CS, g.origin[2] / CS];
+            let hi = [lo[0] + g.size[0] / CS, lo[1] + g.size[1] / CS, lo[2] + g.size[2] / CS];
+            (0..3).all(|a| k[a] >= lo[a] && k[a] < hi[a]).then_some(g)
+        })
+    }
+
+    /// Face-column shift of a stored cube: `(reference key, chunk-altitude delta)` when `key`'s
+    /// tangent footprint lies in a cube box. Reference altitude = storage altitude + delta.
+    pub fn cube_column(&self, key: crate::world::layout::ColumnKey) -> Option<(crate::world::layout::ColumnKey, i32)> {
+        use crate::space::FaceFrame;
+        let cs = CS;
+        for w in &self.worlds {
+            let Some(g) = w.atlas.grid else { continue };
+            let lo = [g.origin[0] / cs, g.origin[1] / cs, g.origin[2] / cs];
+            let hi = [lo[0] + g.size[0] / cs - 1, lo[1] + g.size[1] / cs - 1, lo[2] + g.size[2] / cs - 1];
+            let frame = FaceFrame::new(key.face);
+            let (a0, _, b0) = frame.chunk_to_local(ChunkCoord::new(lo[0] as i32, lo[1] as i32, lo[2] as i32));
+            let (a1, _, b1) = frame.chunk_to_local(ChunkCoord::new(hi[0] as i32, hi[1] as i32, hi[2] as i32));
+            let (a_lo, a_hi) = (a0.min(a1), a0.max(a1));
+            let (b_lo, b_hi) = (b0.min(b1), b0.max(b1));
+            if key.a < a_lo || key.a > a_hi || key.b < b_lo || key.b > b_hi {
+                continue;
+            }
+            let Ok(sx) = i32::try_from(lo[0]) else { continue };
+            let Ok(sy) = i32::try_from(lo[1]) else { continue };
+            let Ok(sz) = i32::try_from(lo[2]) else { continue };
+            let storage = ChunkCoord::new(sx, sy, sz);
+            let d = [
+                (g.ref_min[0] - g.origin[0]) / cs,
+                (g.ref_min[1] - g.origin[1]) / cs,
+                (g.ref_min[2] - g.origin[2]) / cs,
+            ];
+            let (Ok(dx), Ok(dy), Ok(dz)) = (i32::try_from(d[0]), i32::try_from(d[1]), i32::try_from(d[2])) else {
+                continue;
+            };
+            let reference = ChunkCoord::new(storage.x + dx, storage.y + dy, storage.z + dz);
+            let (sk, sa) = crate::world::layout::ColumnKey::of(key.face, storage);
+            let (rk, ra) = crate::world::layout::ColumnKey::of(key.face, reference);
+            return Some((
+                crate::world::layout::ColumnKey { face: key.face, a: key.a + (rk.a - sk.a), b: key.b + (rk.b - sk.b) },
+                ra - sa,
+            ));
+        }
+        None
+    }
+
     /// The body and box holding storage chunk `c`.
     fn find(&self, c: ChunkCoord) -> Option<(&Charted, Patch, [i64; 3])> {
         let k = [c.x as i64, c.y as i64, c.z as i64];
@@ -194,11 +320,17 @@ impl StorageWorlds {
         if w.home {
             return match patch {
                 Patch::Shell { band: 0, .. } => None,
+                Patch::Grid => Some(AIR),
                 _ => Some(w.fill),
             };
         }
+        // A warped cube is painted by the face terrain, after translating back to reference cells.
+        if w.atlas.grid.is_some() {
+            return Some(AIR);
+        }
         let round = Self::round_of(w);
         match patch {
+            Patch::Grid => Some(AIR),
             Patch::Shell { band: 0, .. } => {
                 let atlas = &w.atlas;
                 let b = atlas.bands[0];
@@ -241,13 +373,14 @@ impl StorageWorlds {
                 if kx < lo[0] || kx >= hi[0] || kz < lo[2] || kz >= hi[2] {
                     continue;
                 }
-                return match patch {
+                match patch {
+                    Patch::Grid => continue,
                     Patch::Shell { band: 0, .. } => {
                         let s = Self::round_of(w).chunk_surfaces(patch, (kx - lo[0]) * CS, (kz - lo[2]) * CS);
-                        std::array::from_fn(|k| (s[k] + lo[1] * CS).clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32)
+                        return std::array::from_fn(|k| (s[k] + lo[1] * CS).clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32);
                     }
-                    _ => [BURIED; CHUNK_SIZE * CHUNK_SIZE],
-                };
+                    _ => return [BURIED; CHUNK_SIZE * CHUNK_SIZE],
+                }
             }
         }
         [i32::MIN; CHUNK_SIZE * CHUNK_SIZE]
@@ -284,6 +417,9 @@ impl StorageWorlds {
                 if (x0 as i64) < bx0 || x1 >= bx1 || (z0 as i64) < bz0 || z1 >= bz1 {
                     return None;
                 }
+                if matches!(patch, Patch::Grid) {
+                    continue;
+                }
                 let Patch::Shell { band: 0, .. } = patch else { return None };
                 let round = Self::round_of(w);
                 let (lo_h, hi_h) = round.relief_bounds(patch, x0 as i64 - bx0, z0 as i64 - bz0, span as i64);
@@ -308,6 +444,7 @@ impl StorageWorlds {
                     continue;
                 }
                 match patch {
+                    Patch::Grid => continue,
                     Patch::Shell { band: 0, .. } => {
                         let (i, j) = (x as i64 - lo[0] * CS, z as i64 - lo[2] * CS);
                         Self::round_of(w).lod_column(patch, i, j, lo[1] * CS, &ys[..n], &mut out[..n]);
@@ -330,14 +467,15 @@ impl StorageWorlds {
                 if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
                     continue;
                 }
-                return match patch {
+                match patch {
+                    Patch::Grid => continue,
                     Patch::Shell { band: 0, .. } => {
                         let (i, j) = (x as i64 - lo[0] * CS, z as i64 - lo[2] * CS);
                         let s = Self::round_of(w).column_surface(patch, i, j) + lo[1] * CS;
-                        s.clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32
+                        return s.clamp(i32::MIN as i64 + 1, BURIED as i64 - 1) as i32;
                     }
-                    _ => BURIED,
-                };
+                    _ => return BURIED,
+                }
             }
         }
         i32::MIN
@@ -354,7 +492,7 @@ mod tests {
         let mut reg = BlockRegistry::with_builtins();
         let m = Arc::new(Materials::intern(&mut reg));
         let cosmos = Cosmos::new(42, 1.0);
-        (StorageWorlds::new(&cosmos, &m, AIR), cosmos)
+        (StorageWorlds::new(&cosmos, &m, AIR, &[]), cosmos)
     }
 
     #[test]
