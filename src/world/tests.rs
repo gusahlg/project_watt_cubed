@@ -3248,6 +3248,7 @@ fn verdance_column(world: &World, from_pos_x: Option<i64>) -> (usize, std::sync:
 
 /// A streaming centre on Verdance selects chart sections around the storage eye, bent through
 /// the chart. Re-pins `far_face_storage_selects_none`: a storage centre used to select nothing.
+/// A span-32 tile may cross the full-res edge; that tile draws the sliver beside the box.
 #[test]
 fn far_face_storage_selects_chart_sections() {
     use crate::space::atlas::Patch;
@@ -3279,7 +3280,19 @@ fn far_face_storage_selects_chart_sections() {
         let (x, z) = (s.min_x() as i64, s.min_z() as i64);
         assert!(section::section_fits(s.span(), atlas.radius), "section {s:?} exceeds the chord cap");
         assert!(x >= o[0] && x + span <= o[0] + size[0] && z >= o[2] && z + span <= o[2] + size[2], "{s:?} leaves the home chart");
-        assert!(!(x < x1 && x + span > x0 && z < z1 && z + span > z0), "{s:?} covers the full-res box");
+        // Overlap is only the span-32 border: it also extends outside, so the sliver beside the box is drawn.
+        let overlaps = x < x1 && x + span > x0 && z < z1 && z + span > z0;
+        if overlaps {
+            assert_eq!(
+                span,
+                section::section_span(Detail(0)) as i64,
+                "{s:?} covers the full-res box above the border grid"
+            );
+            assert!(
+                x < x0 || x + span > x1 || z < z0 || z + span > z1,
+                "{s:?} sits inside the full-res box"
+            );
+        }
     }
     let clip = world.lod_clip();
     assert!(clip.half.x <= 0.0 && clip.half.y <= 0.0 && clip.half.z <= 0.0, "chart clip is not empty: {:?}", clip.half);

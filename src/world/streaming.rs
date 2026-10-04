@@ -580,16 +580,16 @@ fn storage_eye_block(center: Coord, eye_y: f64, delta: DVec3) -> (i64, i64, i64)
     (x, y, z)
 }
 
-/// Sections of a chart seat. Distance rings already chose the detail: collapsing every complete
-/// quad would flatten those rings onto the chord cap, so a quad merges only while the frontier
-/// is over `budget`, and only when the parent still passes `keep`.
+/// Sections of a chart seat, already filtered. Distance rings chose the detail: collapsing every
+/// complete quad would flatten those rings onto the chord cap, so a quad merges only while the
+/// frontier is over `budget`, and only when the parent passes `keep`.
 fn coarsen_chart(
     sections: Vec<SectionPos>,
     max_detail: i8,
     budget: usize,
     keep: &impl Fn(SectionPos) -> bool,
 ) -> Vec<SectionPos> {
-    let mut set: FastSet<SectionPos> = sections.into_iter().filter(|s| s.detail.0 <= max_detail && keep(*s)).collect();
+    let mut set: FastSet<SectionPos> = sections.into_iter().filter(|s| s.detail.0 <= max_detail).collect();
     if set.len() <= budget || set.is_empty() {
         return set.into_iter().collect();
     }
@@ -619,18 +619,30 @@ fn coarsen_chart(
     set.into_iter().collect()
 }
 
+/// Home-chart footprint of `s` (`hi` exclusive). A neighbour section unfolds across the seam.
+fn home_rect(s: SectionPos, across: Option<&super::seam::SeamAcross>) -> (i64, i64, i64, i64) {
+    let span = s.span() as i64;
+    let (x0, z0) = (s.min_x() as i64, s.min_z() as i64);
+    if let Some(m) = across {
+        let (a, c) = m.home_xz(x0, z0);
+        let (b, d) = m.home_xz(x0 + span, z0 + span);
+        (a.min(b), c.min(d), a.max(b), c.max(d))
+    } else {
+        (x0, z0, x0 + span, z0 + span)
+    }
+}
+
 /// Whether `s` meets the full-res chunk box. A neighbour section is tested in the home chart,
 /// unfolded past the seam.
 fn covers_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super::seam::SeamAcross>) -> bool {
-    let span = s.span() as i64;
-    let (x0, z0, x1, z1) = if let Some(m) = across {
-        let (a, c) = m.home_xz(s.min_x() as i64, s.min_z() as i64);
-        let (b, d) = m.home_xz(s.min_x() as i64 + span, s.min_z() as i64 + span);
-        (a.min(b), c.min(d), a.max(b), c.max(d))
-    } else {
-        (s.min_x() as i64, s.min_z() as i64, s.min_x() as i64 + span, s.min_z() as i64 + span)
-    };
+    let (x0, z0, x1, z1) = home_rect(s, across);
     x0 < near.1 && x1 > near.0 && z0 < near.3 && z1 > near.2
+}
+
+/// Whether `s` lies wholly inside the full-res chunk box.
+fn inside_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super::seam::SeamAcross>) -> bool {
+    let (x0, z0, x1, z1) = home_rect(s, across);
+    x0 >= near.0 && x1 <= near.1 && z0 >= near.2 && z1 <= near.3
 }
 
 /// Storage rectangle of `s` inside the full-res box, `(u0, v0, u1, v1)` exclusive.
@@ -711,6 +723,27 @@ fn cover_chart(s: SectionPos, lo: [i64; 3], hi: [i64; 3], out: &mut Vec<SectionP
     }
     for q in super::section::Quadrant::ALL {
         cover_chart(s.child(q), lo, hi, out);
+    }
+}
+
+/// Pieces of `s` against the full-res box. A tile that crosses the edge is replaced by the largest
+/// descendants that do not. Wholly outside pieces stay. Wholly inside pieces stay for the punch.
+/// Descent continues past the finest far level: that span is wider than the full-res box, so a tile
+/// kept there redraws the whole near field. It stops at detail 0 (span 32), the last grid coarser
+/// than a chunk. A tile still crossing the edge stays, so the sliver beside the box is drawn.
+fn cover_near(
+    s: SectionPos,
+    near: (i64, i64, i64, i64),
+    across: Option<&super::seam::SeamAcross>,
+    out: &mut Vec<SectionPos>,
+) {
+    let crosses = covers_near(s, near, across) && !inside_near(s, near, across);
+    if !crosses || s.detail.0 <= 0 {
+        out.push(s);
+        return;
+    }
+    for q in super::section::Quadrant::ALL {
+        cover_near(s.child(q), near, across, out);
     }
 }
 
@@ -3273,23 +3306,34 @@ impl World {
         for s in radial {
             cover_chart(s, seat.lo, seat.hi, &mut clipped);
         }
-        // Charts have no shader clip. A section over the near square is dropped only when
-        // that overlap's surface sits inside the full-res window; a valley or a hilltop
+        // A straddler is replaced before the punch. Dropping it whole would leave the part
+        // outside the box — up to one ring of span — drawn by nothing.
+        let mut edged = Vec::new();
+        for s in clipped {
+            cover_near(s, near, across, &mut edged);
+        }
+        // Charts have no shader clip. A section wholly inside the near square is dropped only
+        // when that square's surface sits inside the full-res window; a valley or a hilltop
         // outside it stays, so the far field draws what the window misses.
         let keep = |s: SectionPos| {
             inside_xz(s, seat.lo, seat.hi)
                 && super::section::section_fits(s.span(), seat.radius)
                 && !self.near_window_holds(s, near, y0, y1, across)
         };
-        coarsen_chart(clipped, max_d, self.sections_allowed(), &keep)
+        // A straddling parent must not merge back: that tile is what the descent just replaced.
+        let merge = |p: SectionPos| keep(p) && !(covers_near(p, near, across) && !inside_near(p, near, across));
+        let kept: Vec<SectionPos> = edged.into_iter().filter(|&s| keep(s)).collect();
+        coarsen_chart(kept, max_d, self.sections_allowed(), &merge)
             .into_iter()
             .map(|s| (s, section_dist2(s, ex, ez)))
             .collect()
     }
 
-    /// The full-res window already draws every solid top of `s` inside the near square.
-    /// Storage altitude: `surface` is the first open cell, so the solid top is the block below it.
-    /// A bound we cannot place is kept (punched nowhere) so a missed column is not a sky hole.
+    /// The full-res window already draws every solid top of `s`, and `s` lies wholly inside the
+    /// near square. A section that only crosses the edge is not punched: the part outside the
+    /// square would be drawn by nothing. Storage altitude: `surface` is the first open cell, so
+    /// the solid top is the block below it. A bound we cannot place is kept (punched nowhere)
+    /// so a missed column is not a sky hole.
     fn near_window_holds(
         &self,
         s: SectionPos,
@@ -3298,7 +3342,7 @@ impl World {
         y1: i64,
         across: Option<&super::seam::SeamAcross>,
     ) -> bool {
-        if !covers_near(s, near, across) {
+        if !inside_near(s, near, across) {
             return false;
         }
         let Some((u0, v0, u1, v1)) = overlap_storage(s, near, across) else {
@@ -5852,10 +5896,10 @@ mod tests {
 
     /// Columns of the far-field disk that draw neither a chart section nor a full-res chunk.
     /// Across a seam the neighbour chart is in the disk, and the near window's chunks there are
-    /// real storage chunks (or a section covers them). A section over the near square is dropped
-    /// only when that overlap's surface sits inside the full-res window. The finest ring stops
-    /// inside the next ring, so that next section can straddle the window and leave an overhang
-    /// of its own span; that overhang, on either chart, is not a seam hole.
+    /// real storage chunks (or a section covers them). A section wholly inside the near square is
+    /// dropped only when that square's surface sits inside the full-res window. The band just
+    /// outside the box, out to one coarse-ring span, is part of the same count: a straddler is
+    /// replaced by its descendants, so that band is drawn.
     #[test]
     fn far_chart_seam_has_no_hole() {
         use crate::render_config::RenderConfig;
@@ -5993,28 +6037,55 @@ mod tests {
                         let past_home = x < seat.lo[0] || x >= seat.hi[0] || z < seat.lo[2] || z >= seat.hi[2];
                         let ox = if x < near.0 { near.0 - x } else if x >= near.1 { x - (near.1 - 1) } else { 0 };
                         let oz = if z < near.2 { near.2 - z } else if z >= near.3 { z - (near.3 - 1) } else { 0 };
-                        // A section that straddles the full-res box keeps an overhang of the next
-                        // ring's span. That overhang is outside the box.
-                        let punch_sliver = ox.max(oz) > 0 && ox.max(oz) < sliver;
-                        if !punch_sliver {
-                            holes += 1;
-                            if holes <= 6 {
-                                hole_ex.push_str(&format!(
-                                    " at ({x},{z}) past_home {past_home} in_near {in_near} ox {ox} oz {oz} real {real:?};"
-                                ));
-                            }
+                        holes += 1;
+                        if holes <= 6 {
+                            hole_ex.push_str(&format!(
+                                " at ({x},{z}) past_home {past_home} in_near {in_near} ox {ox} oz {oz} real {real:?};"
+                            ));
                         }
                     }
                     z += step;
                 }
                 x += step;
             }
+            // Chunk centres in the overhang band. Step 64 misses a sliver narrower than the stride.
+            let mut fine = 0i32;
+            let mut fine_n = 0i32;
+            let mut fx = near.0 - sliver + 8;
+            while fx < near.1 + sliver {
+                let mut fz = near.2 - sliver + 8;
+                while fz < near.3 + sliver {
+                    let ox = if fx < near.0 { near.0 - fx } else if fx >= near.1 { fx - (near.1 - 1) } else { 0 };
+                    let oz = if fz < near.2 { near.2 - fz } else if fz >= near.3 { fz - (near.3 - 1) } else { 0 };
+                    let outside = ox.max(oz) > 0 && ox.max(oz) < sliver;
+                    if outside {
+                        fine_n += 1;
+                        if !covered(fx, fz) {
+                            fine += 1;
+                        }
+                    }
+                    fz += 16;
+                }
+                fx += 16;
+            }
             let edge = [seat.hi[0] - ex, ex - (seat.lo[0] - 1), seat.hi[2] - ez, ez - (seat.lo[2] - 1)];
             let reaches_seam = edge.iter().any(|&d| d < (near.1 - near.0) / 2);
+            assert!(fine_n > 0, "{name}: the overhang band was not sampled");
+            assert_eq!(
+                fine, 0,
+                "{name}: {fine} overhang columns of {fine_n} within one coarse span, desired {} holes {holes}{hole_ex}",
+                desired.len()
+            );
             assert_eq!(
                 holes, 0,
                 "{name}: {holes} uncovered columns, desired {} near {near:?} eye ({ex},{ez}) center {center:?} edges {edge:?};{hole_ex}",
                 desired.len()
+            );
+            assert!(
+                desired.len() <= world.sections_allowed(),
+                "{name}: {} sections over the slot budget {}",
+                desired.len(),
+                world.sections_allowed()
             );
             if reaches_seam {
                 assert!(across_cols > 0, "{name}: the near window does not cross the seam");

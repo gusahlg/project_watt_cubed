@@ -1723,12 +1723,16 @@ mod tests {
     }
 
     /// Drawn-tile bare columns, vertical seam gaps, and the near-box samples under the eye.
+    /// `deep` counts samples at least one span-32 section in from the box edge.
     struct ChartFrontier {
         bare: i32,
         gaps: usize,
         missing: usize,
         under: i32,
         under_n: i32,
+        deep: i32,
+        deep_n: i32,
+        sections: usize,
         covered: bool,
         hash: u32,
     }
@@ -1812,6 +1816,10 @@ mod tests {
         let (z0, z1) = ((center.z - h) * cs, (center.z + h + 1) * cs);
         let mut under = 0i32;
         let mut under_n = 0i32;
+        let mut deep = 0i32;
+        let mut deep_n = 0i32;
+        // A detail-0 tile still crossing the box edge overlaps it by less than its span.
+        let border = 32i32;
         let mut x = x0 + cs / 2;
         while x < x1 {
             let mut z = z0 + cs / 2;
@@ -1820,6 +1828,12 @@ mod tests {
                 let hit = tiles.iter().any(|t| top_at(t, x, z).is_some());
                 if !hit {
                     under += 1;
+                }
+                if x - x0 >= border && x1 - x > border && z - z0 >= border && z1 - z > border {
+                    deep_n += 1;
+                    if !hit {
+                        deep += 1;
+                    }
                 }
                 z += cs;
             }
@@ -1830,7 +1844,18 @@ mod tests {
             let (a, b) = (p.min_x(), p.min_z());
             eye.0 >= a && eye.0 < a + p.span() && eye.1 >= b && eye.1 < b + p.span()
         });
-        ChartFrontier { bare, gaps: vertical, missing, under, under_n, covered, hash }
+        ChartFrontier {
+            bare,
+            gaps: vertical,
+            missing,
+            under,
+            under_n,
+            deep,
+            deep_n,
+            sections: desired.len(),
+            covered,
+            hash,
+        }
     }
 
     fn assert_chart_closed(name: &str, f: &ChartFrontier) {
@@ -1843,8 +1868,10 @@ mod tests {
     }
 
     /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
-    /// have tops, and the seams around it are closed. Spawn ground level keeps the near-box punch,
-    /// so its far-field bytes stay `0x6b15d4e5` (seed 42, diffusion, default view).
+    /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
+    /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
+    /// what covers the sliver outside the box. Bytes re-pinned to `0xca4adead` for that border
+    /// (seed 42, diffusion, default view).
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -1856,11 +1883,17 @@ mod tests {
         let (center, storage, _) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x6b15d4e5, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0xca4adead, "spawn ground-level far-field bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
-        assert_eq!(spawn.under, spawn.under_n, "spawn ground level must keep the near-box punch");
-        assert!(!spawn.covered, "spawn ground level must keep the near-box punch");
+        assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");
+        assert!(spawn.deep_n > 0, "spawn interior was not sampled");
+        assert_eq!(
+            spawn.deep, spawn.deep_n,
+            "spawn interior must keep the near-box punch ({}/{}, border under {}/{}, sections {})",
+            spawn.deep, spawn.deep_n, spawn.under, spawn.under_n, spawn.sections
+        );
+        assert!(!spawn.covered, "spawn ground level must keep the near-box punch at the eye");
 
         let sites = [("plus-y", DVec3::new(0.0, 1.0, 0.0)), ("highland", DVec3::new(1.0, 0.9, 0.8))];
         for (name, dir) in sites {
