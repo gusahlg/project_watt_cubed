@@ -167,6 +167,9 @@ pub fn compose_at(
     // fade: the ambient above was taken from the atmosphere's zenith, and the GPU luma-matches
     // its zenith tints, so planets stay lit by the sun and the near-sky bounce.
     let space = space_factor(ctx.altitude);
+    // Nor is there night out there: the sun shines from where it is, however the viewer is turned.
+    let light = light.lerp(atm.palette.at(Role::Light, 1.0), space);
+    let day_night_mix = Palette::day_night_mix(elev) + (1.0 - Palette::day_night_mix(elev)) * space;
     let zenith = zenith.lerp(SPACE_ZENITH, space);
     let horizon = horizon.lerp(SPACE_HORIZON, space);
     let fog_density = fog_density * (1.0 - 0.75 * space);
@@ -178,7 +181,7 @@ pub fn compose_at(
     FrameSnapshot {
         sun_dir,
         elevation: elev,
-        day_night_mix: Palette::day_night_mix(elev),
+        day_night_mix,
         light,
         zenith,
         horizon,
