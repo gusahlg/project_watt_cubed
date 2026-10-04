@@ -228,6 +228,15 @@ fn step(player: &mut Player, world: &World, input: &MoveInput, dt: f32, gravity:
         }
     };
 
+    // The hard speed limit (see `MAX_SPEED`): collision cost grows with the step.
+    let v = player.velocity();
+    let capped = crate::player::capped_velocity(v);
+    let delta = if capped == v && delta.is_finite() {
+        delta
+    } else {
+        set_velocity(player, capped);
+        capped * dt
+    };
     move_with_collision(player, world, delta, border)
 }
 
@@ -475,6 +484,33 @@ mod tests {
             sprint: false,
             sneak: false,
         }
+    }
+
+    /// A runaway velocity (a saved or commanded speed far past the limit) is clamped before the
+    /// collision walk, so one step stays cheap instead of walking billions of half-block substeps.
+    #[test]
+    fn a_runaway_velocity_is_clamped_before_collision() {
+        let mut world = World::new(5);
+        let start = DVec3::new(0.5, 120.0, 0.5);
+        world.ensure_around(start);
+        for flying in [true, false] {
+            let mut player = Player::new(start);
+            if flying {
+                player.set_flying(true);
+                player.fly_speed = 1.0e15;
+            }
+            set_velocity(&mut player, DVec3::new(1.0e15, 0.0, -3.0e14));
+            let t = std::time::Instant::now();
+            update_player(&mut player, &world, &if flying { walk_forward() } else { idle() }, 1.0 / 60.0, down());
+            assert!(t.elapsed() < std::time::Duration::from_millis(250), "one step took {:?}", t.elapsed());
+            assert!(player.velocity().length() <= crate::player::MAX_SPEED * (1.0 + 1e-12));
+            assert!(player.position.is_finite());
+            assert!((player.position - start).length() <= crate::player::MAX_SPEED / 60.0 + 1.0);
+        }
+        let mut nan = Player::new(start);
+        set_velocity(&mut nan, DVec3::new(f64::NAN, 0.0, 0.0));
+        update_player(&mut nan, &world, &idle(), 1.0 / 60.0, down());
+        assert!(nan.position.is_finite() && nan.velocity().is_finite());
     }
 
     /// Build a flat stone runway at `y = floor_y` under the given start, long

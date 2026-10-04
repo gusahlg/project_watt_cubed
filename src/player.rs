@@ -23,6 +23,21 @@ pub const DEFAULT_WALK_SPEED: f64 = 6.0 * PER_METER;
 /// can vary per player; this is only the starting value.
 pub const DEFAULT_FLY_SPEED: f64 = 14.0 * PER_METER;
 
+/// The fastest anything moves, units/second: 100 km/s, well past the start world's escape speed
+/// (about 39 km/s), so no fall ever reaches it. Collision walks each frame's step in half-block
+/// substeps, so a speed without a limit (an absurd `/flyspeed`, a corrupt save) stalls a frame for
+/// seconds or for ever. `/flyspeed` and `/walkspeed` stop here and movement clamps to it.
+pub const MAX_SPEED: f64 = 100_000.0 * PER_METER;
+
+/// `v` held to [`MAX_SPEED`] (direction kept); a non-finite vector is no motion.
+pub fn capped_velocity(v: DVec3) -> DVec3 {
+    if !v.is_finite() {
+        return DVec3::ZERO;
+    }
+    let len = v.length();
+    if len > MAX_SPEED { v * (MAX_SPEED / len) } else { v }
+}
+
 /// A fresh player's health, and the ceiling it's created at. Health is an intrinsic
 /// property the player carries but nothing yet reads or changes — see
 /// [`Player::health`].

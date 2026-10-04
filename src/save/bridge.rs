@@ -283,11 +283,16 @@ pub fn from_doc(
     let (kind, cfg) = kind_cfg_from_stamp(doc.worldgen);
     let mut world = make_world(doc.meta.seed, kind, cfg);
 
-    let mut player = Player::new(DVec3::new(
-        doc.player.pos[0],
-        doc.player.pos[1],
-        doc.player.pos[2],
-    ));
+    // A saved position outside the world (a corrupt or runaway save) restarts at the spawn rather than
+    // streaming around nonsense.
+    let saved_pos = DVec3::from_array(doc.player.pos);
+    let border = crate::math::WORLD_BORDER;
+    let pos = if saved_pos.is_finite() {
+        saved_pos.clamp(DVec3::splat(-border), DVec3::splat(border))
+    } else {
+        world.chart_spawn().unwrap_or_else(|| DVec3::new(0.5, world.surface_y(0, 0) as f64 + 3.0, 0.5))
+    };
+    let mut player = Player::new(pos);
     player.orientation.yaw = doc.player.yaw;
     player.orientation.pitch = doc.player.pitch;
     if doc.player.legacy_pose {
@@ -304,7 +309,10 @@ pub fn from_doc(
         player.set_flying(true);
     }
     // `set_flying` / `toggle_noclip` zero the component along up. Write the saved velocity after.
+    // A speed past the limit only ever came from a runaway `/flyspeed` (fly speed itself is not
+    // saved): restart at rest instead of resuming the runaway.
     let saved = DVec3::from_array(doc.player.velocity);
+    let saved = if saved.is_finite() && saved.length() <= crate::player::MAX_SPEED { saved } else { DVec3::ZERO };
     match &mut player.motion {
         Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = saved,
     }

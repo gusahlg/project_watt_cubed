@@ -477,10 +477,14 @@ fn set_speed(
     match args {
         [] => shown(vec![format!("{name}: {:.2}", *field(player))]),
         [value] => match value.parse::<f64>() {
-            Ok(v) if v.is_finite() && v > 0.0 => {
+            Ok(v) if v.is_finite() && v > 0.0 && v <= crate::player::MAX_SPEED => {
                 *field(player) = v;
                 shown(vec![format!("{name} set to {v:.2}")])
             }
+            Ok(v) if v.is_finite() && v > crate::player::MAX_SPEED => rejected(vec![format!(
+                "{name}: at most {:.0} (100 km/s); use /tp to travel farther",
+                crate::player::MAX_SPEED
+            )]),
             _ => rejected(vec![format!("{name}: value must be a positive number")]),
         },
         _ => rejected(vec![format!("usage: {name} [<units/second>]")]),
@@ -912,6 +916,24 @@ mod tests {
             assert_eq!(p.speed, before, "{bad} should not change speed");
             assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
         }
+    }
+
+    /// A speed past the limit would make one frame's collision walk billions of substeps (the game
+    /// froze, and stayed frozen on rejoin): it is refused, and the limit itself is accepted.
+    #[test]
+    fn speed_commands_stop_at_the_speed_limit() {
+        let (mut p, mut w) = (player(), world());
+        let before = p.fly_speed;
+        for bad in ["1e12", "99999999999999999999", "1e308"] {
+            let out = run(&format!("flyspeed {bad}"), &mut p, &mut w);
+            assert_eq!(p.fly_speed, before, "{bad} must not change the fly speed");
+            assert_eq!(out[0].spans().next().unwrap().role, Role::Danger);
+            assert!(out[0].text().contains("/tp"), "the refusal points at /tp: {}", out[0].text());
+            run(&format!("walkspeed {bad}"), &mut p, &mut w);
+            assert_ne!(p.speed, bad.parse::<f64>().unwrap());
+        }
+        run(&format!("flyspeed {}", crate::player::MAX_SPEED), &mut p, &mut w);
+        assert_eq!(p.fly_speed, crate::player::MAX_SPEED);
     }
 
     #[test]

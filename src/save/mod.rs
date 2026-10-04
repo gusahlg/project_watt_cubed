@@ -282,6 +282,35 @@ mod tests {
         assert_eq!(stayed.up_axis, crate::coord::Face::PosY);
     }
 
+    /// A save written mid-runaway (an absurd `/flyspeed`) loads at rest inside the world instead of
+    /// resuming a speed whose first collision walk froze the game again on every rejoin.
+    #[test]
+    fn a_runaway_save_loads_at_rest_inside_the_world() {
+        let mut doc = bare_doc();
+        doc.worldgen.kind = 0;
+        doc.player.flying = true;
+        doc.player.velocity = [3.0e20, -1.0e18, 0.0];
+        doc.player.pos = [5.0e15, 60.0, -2.0];
+        let (_, player) = load_flat(doc);
+        assert_eq!(player.velocity(), DVec3::ZERO);
+        assert_eq!(player.position, DVec3::new(crate::math::WORLD_BORDER, 60.0, -2.0));
+
+        let mut lost = bare_doc();
+        lost.worldgen.kind = 0;
+        lost.player.pos = [f64::NAN, 60.0, 0.0];
+        lost.player.velocity = [f64::INFINITY, 0.0, 0.0];
+        let (_, player) = load_flat(lost);
+        assert!(player.position.is_finite() && player.position.length() < 1.0e4, "back at the spawn: {}", player.position);
+        assert_eq!(player.velocity(), DVec3::ZERO);
+
+        // A real fall is kept.
+        let mut falling = bare_doc();
+        falling.worldgen.kind = 0;
+        falling.player.velocity = [0.0, -40.0, 0.0];
+        let (_, player) = load_flat(falling);
+        assert_eq!(player.velocity(), DVec3::new(0.0, -40.0, 0.0));
+    }
+
     #[test]
     fn legacy_inventory_mod_line_is_ignored() {
         let mut doc = bare_doc();
