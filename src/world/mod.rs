@@ -692,6 +692,16 @@ impl SectionState {
         eng: &mut Engine,
         cages: &mut Vec<voxel_engine::CageHandle>,
     ) -> Option<voxel_engine::MeshPlacement> {
+        if let Some(bend) = bend
+            && bend.atlas.grid.is_some()
+        {
+            let extent = (1i32 << detail.0).saturating_mul(16);
+            let y0 = floor_a + origin_y as i32 * pos.cell_size();
+            let (anchor, corners) = section::warp_slab_corners(&bend.atlas, pos.face, pos.min_x(), y0, pos.min_z(), extent)?;
+            let cage = eng.create_cage(anchor, corners)?;
+            cages.push(cage);
+            return Some(voxel_engine::MeshPlacement::caged(cage, detail));
+        }
         if pos.body < section::CHART_BODY_BASE {
             return Some(Self::slab_placement(pos, origin_y, detail, floor_a));
         }

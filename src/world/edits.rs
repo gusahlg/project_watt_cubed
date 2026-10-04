@@ -442,6 +442,23 @@ impl World {
     fn edit_face_cell(&self, x: i32, y: i32, z: i32) -> Option<(u16, Face, i32, i32, i32)> {
         let s = [i64::from(x), i64::from(y), i64::from(z)];
         for (index, atlas) in self.generator.atlases().iter().enumerate() {
+            if let Some(g) = atlas.grid {
+                if atlas.locate(s).is_none() {
+                    continue;
+                }
+                let p = [
+                    s[0] - g.origin[0] + g.ref_min[0],
+                    s[1] - g.origin[1] + g.ref_min[1],
+                    s[2] - g.origin[2] + g.ref_min[2],
+                ];
+                let (Ok(px), Ok(py), Ok(pz)) = (i32::try_from(p[0]), i32::try_from(p[1]), i32::try_from(p[2])) else {
+                    return None;
+                };
+                let q = voxel_engine::DVec3::new(p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5);
+                let face = Face::from_dominant(q - atlas.centre);
+                let (u, a, v) = FaceFrame::new(face).cell_to_local((px, py, pz));
+                return Some((g.body, face, u, v, a));
+            }
             if atlas.locate(s).is_some() {
                 let body = super::section::CHART_BODY_BASE + index as u16;
                 return Some((body, Face::PosY, x, z, y));

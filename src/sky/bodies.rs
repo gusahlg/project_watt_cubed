@@ -68,7 +68,7 @@ impl FarBodies {
             if self.list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = impostor(cosmos, body, eye, ordinal) {
+            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases()) {
                 self.list.push(far);
             }
         }
@@ -107,7 +107,7 @@ impl FarBodies {
                 seed: hollow.seed,
             });
         }
-        if let Some(mut far) = impostor(cosmos, ember, eye, 0) {
+        if let Some(mut far) = impostor(cosmos, ember, eye, 0, &[]) {
             far.atmosphere = LinearRgb([
                 far.atmosphere.0[0] * CORE_GLOW,
                 far.atmosphere.0[1] * CORE_GLOW,
@@ -254,6 +254,21 @@ fn radius_of(body: &Body) -> f64 {
     }
 }
 
+/// Half-size the impostor draws. A sagging cube keeps [`FarShape::Cube`]; its radius is the
+/// warped corner's L∞, so the eight corners sit on the box the sky draws.
+fn shown_radius(atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> f64 {
+    let base = radius_of(body);
+    let Shape::Cube { half } = body.shape else { return base };
+    let Some(warp) = atlases.iter().find_map(|a| {
+        a.grid.as_ref().is_some_and(|g| g.body == body.id).then(|| a.warp.as_ref()).flatten()
+    }) else {
+        return base;
+    };
+    let h = half as f64;
+    let corner = warp.apply(body.centre_f() + DVec3::splat(h)) - body.centre_f();
+    corner.x.abs().max(corner.y.abs()).max(corner.z.abs())
+}
+
 /// How far a round body's impostor sinks below its datum (under its valleys; moons' big craters
 /// go deeper): standing on the body, the sphere fills the horizon beyond the streamed chunks
 /// without covering them (the sky pass draws only where no terrain was drawn). Round bodies have no
@@ -272,10 +287,16 @@ fn sink_in(cosmos: &Cosmos, body: &Body) -> Option<f64> {
 }
 
 /// One catalog body as seen from `eye`, or nothing while voxels cover it.
-fn impostor(cosmos: &Cosmos, body: &Body, eye: DVec3, twin_ordinal: u32) -> Option<FarBody> {
+fn impostor(
+    cosmos: &Cosmos,
+    body: &Body,
+    eye: DVec3,
+    twin_ordinal: u32,
+    atlases: &[std::sync::Arc<crate::space::atlas::Atlas>],
+) -> Option<FarBody> {
     let delta = body.centre_f() - eye;
     let dist = delta.length();
-    let radius = radius_of(body) - sink_in(cosmos, body).unwrap_or(0.0);
+    let radius = shown_radius(atlases, body) - sink_in(cosmos, body).unwrap_or(0.0);
     // A cube's own mesh is the body while it streams; a round body's sphere is drawn unless the eye
     // is inside it.
     let streamed = sink(body).is_none() && cosmos.altitude(body, eye) < STREAM_ALTITUDE;
@@ -316,13 +337,13 @@ mod tests {
     use crate::world::terrain::cosmos::Kind;
     use crate::world::terrain::Terrain;
 
-    fn radius_f(cosmos: &Cosmos, body: &Body) -> f32 {
-        (radius_of(body) - sink_in(cosmos, body).unwrap_or(0.0)) as f32
+    fn radius_f(cosmos: &Cosmos, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> f32 {
+        (shown_radius(atlases, body) - sink_in(cosmos, body).unwrap_or(0.0)) as f32
     }
 
-    fn find<'a>(cosmos: &Cosmos, list: &'a [FarBody], body: &Body) -> Option<&'a FarBody> {
+    fn find<'a>(cosmos: &Cosmos, list: &'a [FarBody], atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> Option<&'a FarBody> {
         list.iter()
-            .find(|far| far.seed == body.seed && (far.radius - radius_f(cosmos, body)).abs() < 4.0)
+            .find(|far| far.seed == body.seed && (far.radius - radius_f(cosmos, atlases, body)).abs() < 4.0)
     }
 
     /// Independent of `impostor`: cubes by altitude and outside-the-solid, round bodies outside
@@ -371,7 +392,7 @@ mod tests {
         let mut expect = 0usize;
         for body in cosmos.bodies() {
             let visible = expect_visible(cosmos, body, spawn);
-            let got = find(cosmos, listed, body);
+            let got = find(cosmos, listed, terrain.atlases(), body);
             assert!(visible, "{:?} should be a sky body from spawn", body.kind);
             let got = got.expect("missing far body");
             finite_unit(got);
@@ -386,32 +407,32 @@ mod tests {
 
         let twins: Vec<_> = cosmos.bodies().iter().filter(|b| b.kind == Kind::Twin).collect();
         assert!(twins.len() >= 2);
-        let lush = find(cosmos, listed, twins[0]).unwrap();
-        let crystal = find(cosmos, listed, twins[1]).unwrap();
+        let lush = find(cosmos, listed, terrain.atlases(), twins[0]).unwrap();
+        let crystal = find(cosmos, listed, terrain.atlases(), twins[1]).unwrap();
         assert!(lush.albedo[2].0[1] > lush.albedo[2].0[0] && lush.albedo[2].0[1] > lush.albedo[2].0[2]);
         assert!(crystal.albedo[2].0[2] > crystal.albedo[2].0[0]);
 
         let verdant = cosmos.bodies().iter().find(|b| b.kind == Kind::Verdant).unwrap();
-        let verdant = find(cosmos, listed, verdant).unwrap();
+        let verdant = find(cosmos, listed, terrain.atlases(), verdant).unwrap();
         assert!(verdant.albedo[0].0[1] > verdant.albedo[0].0[0]);
         assert!(verdant.albedo[1].0[1] > verdant.albedo[1].0[2], "forest green, no seas");
         assert!(verdant.atmosphere.0[2] > verdant.atmosphere.0[0]);
         assert!(verdant.atmosphere.0[0] > 0.0);
 
         let hollow = cosmos.bodies().iter().find(|b| b.kind == Kind::Hollow).unwrap();
-        let hollow = find(cosmos, listed, hollow).unwrap();
+        let hollow = find(cosmos, listed, terrain.atlases(), hollow).unwrap();
         assert_eq!(hollow.atmosphere.0, [0.0, 0.0, 0.0]);
         assert!(hollow.albedo[0].0[2] > 0.5);
 
         let ember = cosmos.bodies().iter().find(|b| b.kind == Kind::Ember).unwrap();
-        let ember = find(cosmos, listed, ember).unwrap();
+        let ember = find(cosmos, listed, terrain.atlases(), ember).unwrap();
         assert!(ember.atmosphere.0[0] > 1.0);
         assert!(ember.atmosphere.0[0] > ember.atmosphere.0[1]);
         assert!(ember.atmosphere.0[1] > ember.atmosphere.0[2]);
         assert!(ember.albedo[0].0[0] > ember.albedo[0].0[1]);
 
         for moon in cosmos.bodies().iter().filter(|b| b.kind == Kind::Moon) {
-            let moon = find(cosmos, listed, moon).unwrap();
+            let moon = find(cosmos, listed, terrain.atlases(), moon).unwrap();
             assert_eq!(moon.shape, FarShape::Sphere);
             assert_eq!(moon.atmosphere.0, [0.0, 0.0, 0.0]);
             let a = moon.albedo[0].0;
@@ -425,7 +446,7 @@ mod tests {
         assert!(n > 0);
         let away = far.update(&terrain, DVec3::new(1.0e8, 0.0, 0.0));
         assert_eq!(alloc_count::alloc_count(), 0, "far-body update allocated");
-        let home = find(cosmos, away, cosmos.home()).expect("home is a sky body from 1e8");
+        let home = find(cosmos, away, terrain.atlases(), cosmos.home()).expect("home is a sky body from 1e8");
         assert_eq!(home.shape, FarShape::Sphere);
         let Shape::Ball { r } = cosmos.home().shape else { panic!("home is a ball") };
         // Sunk under the relaxed lowlands.

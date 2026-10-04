@@ -87,7 +87,7 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
   solving at world creation (16–80 s per body live).
 - Matter limits found by the law: a weak (crystal) Hollow and even a rock Hollow of today's size cannot
   hold their cavity; the moons (rock, `Π_g` < 0.1) stay cubes; Verdance in regolith (`Π_g` 3.4) and the
-  twins (2.6) sag (corner/face ≈ 1.45, 1.56); the Ember in magma (11) rounds to 1.16. Which matter the
+  twins (2.6) sag (corner/face ≈ 1.45, 1.56). The twins keep that cube grid, bent by the sag (`space::warp`): their cells live in storage and embed through the displacement. The Ember in magma (11) rounds to 1.16. Which matter the
   generator gives these bodies is an owner decision.
 
 ## 4. Phases

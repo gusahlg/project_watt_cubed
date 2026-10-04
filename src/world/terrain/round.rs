@@ -814,6 +814,7 @@ impl Round {
             // The deep interior: rock, then the heart.
             Patch::Transition { .. } => self.heart().0,
             Patch::Core => self.heart().1,
+            Patch::Grid => AIR,
         }
     }
 
@@ -1199,6 +1200,7 @@ fn patch_tag(p: Patch) -> u32 {
         Patch::Shell { band, face } => 1 + band as u32 * 8 + face as u32,
         Patch::Transition { face } => 200 + face as u32,
         Patch::Core => 300,
+        Patch::Grid => 400,
     }
 }
 

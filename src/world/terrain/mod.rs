@@ -2,7 +2,8 @@
 //!
 //! The [`cosmos`] lists every body. A cube cell is that cube's face; an asteroid cell is the rock
 //! that contains it. The twins are six faces of today's terrain — shape, caves, mines, veins,
-//! trees, landmarks, structures — in face-local coordinates, one salt per face. The start world is
+//! trees, landmarks, structures — in face-local coordinates, one salt per face, on a cube grid bent
+//! by the sag (the cells live in storage). The start world is
 //! the same six faces laid on cube-sphere charts (home +Y keeps the v3 salts). Provinces theme
 //! every column: a realm per face, regions and provinces on the shared surface point. The twins'
 //! facing faces also carry spires and arches across the canyon, inside the relief bound. Below the
@@ -51,8 +52,9 @@ use underground::{Grid, Underground};
 /// over the selective-transfer palette (2026-10-02); 7 = the cube planet (2026-10-03): bodies from
 /// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field;
 /// 8 = surface landmarks, and the ruins, monuments and watchers on them;
-/// 9 = the start world on cube-sphere charts (unreleased, so the number stays).
-pub const WORLDGEN_VERSION: u16 = 9;
+/// 9 = the start world on cube-sphere charts (unreleased, so the number stays);
+/// 10 = the twins on a warped cube grid in storage.
+pub const WORLDGEN_VERSION: u16 = 10;
 
 /// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
 pub const SPACE_FLOOR: i32 = 640;
@@ -354,12 +356,10 @@ impl Materials {
 }
 
 
-/// The start world's relaxed datum about [`cosmos::HOME_RADIUS`]: its cube of bulk matter (the
-/// two-material mix, strength from the prototype mechanical response) relaxed under its own
-/// gravity, read from the genesis table by `Π_g`. `None` without a table, or if the matter were
-/// strong enough to keep its cube grid (the start world is charted either way).
-fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::space::datum::DatumField> {
-    use crate::mechanics::{genesis, material};
+/// The bulk mix as one material: fractions weighted by the prototype response, density forced to
+/// the amount the gravity primitive uses.
+fn bulk_matter(registry: &BlockRegistry, bulk: &cube::Bulk) -> crate::mechanics::material::Params {
+    use crate::mechanics::material;
     let parts: Vec<(f64, material::Params)> = bulk
         .fractions()
         .iter()
@@ -371,11 +371,46 @@ fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::spac
         .collect();
     let mut matter = material::Params::mix(&parts);
     matter.density = cosmos::BULK_DENSITY;
+    matter
+}
+
+/// The start world's relaxed datum about [`cosmos::HOME_RADIUS`]: its cube of bulk matter relaxed
+/// under its own gravity, read from the genesis table by `Π_g`. `None` without a table, or if the
+/// matter were strong enough to keep its cube grid (the start world is charted either way).
+fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::space::datum::DatumField> {
+    use crate::mechanics::genesis;
+    let matter = bulk_matter(registry, bulk);
     let half = cosmos::HOME_CUBE_HALF as f64;
     let (layout, _) = genesis::tabulated_layout(genesis::pi_g(&matter, half), half)?;
     let genesis::Layout::Round { radius, datum, .. } = layout else { return None };
     let shift = (radius - cosmos::HOME_RADIUS as f64) as f32;
     Some(crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() })
+}
+
+/// Sagging cubes: a `Layout::Cube` body whose warp moves any point by more than half a block.
+fn cube_warps(
+    cosmos: &cosmos::Cosmos,
+    matter: &crate::mechanics::material::Params,
+) -> Vec<(u16, Arc<crate::space::warp::Warp>)> {
+    use crate::mechanics::genesis;
+    use crate::space::warp::{Warp, STORAGE_MOVE};
+    let mut out = Vec::new();
+    for b in cosmos.bodies() {
+        let cosmos::Shape::Cube { half } = b.shape else { continue };
+        let half_f = half as f64;
+        let pi = genesis::pi_g(matter, half_f);
+        let Some((layout, _)) = genesis::tabulated_layout(pi, half_f) else { continue };
+        if !matches!(layout, genesis::Layout::Cube) {
+            continue;
+        }
+        let Some(solved) = genesis::tabulated(pi, half_f) else { continue };
+        let warp = Warp::from_solved(&solved, b.centre_f());
+        if warp.max_displacement() <= STORAGE_MOVE {
+            continue;
+        }
+        out.push((b.id, Arc::new(warp)));
+    }
+    out
 }
 
 /// The start world's relief layer for gravity, computed once per process for each distinct datum
@@ -483,6 +518,13 @@ impl Terrain {
         let scale = cfg.deep as f32 / 100.0;
         let mut cosmos = cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale);
         let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
+        // Sagging cubes keep their grid and record how far the warp moves it, so gravity can bound
+        // the missing shell.
+        let matter = bulk_matter(registry, &bulk);
+        let warps = cube_warps(&cosmos, &matter);
+        for (id, warp) in &warps {
+            cosmos.set_warp_sag(*id, warp.max_displacement());
+        }
         // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
         // chart grid to the shape, and its relief joins gravity.
         let home_datum = home_shape(registry, &bulk);
@@ -556,7 +598,7 @@ impl Terrain {
         }
         // Majority of the 24-bit mix: the uniform block under the start world's band 0.
         let home_fill = bulk.majority();
-        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill);
+        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill, &warps);
         if let Some(datum) = home_datum {
             storage.set_home_datum(Arc::new(datum));
         }
@@ -581,13 +623,17 @@ impl Terrain {
         self.paints[body.id as usize * 6 + face.index()].as_ref().expect("cube face")
     }
 
-    /// The body that owns cell `p`: closest datum, then the smaller id.
-    fn owner(&self, p: [i64; 3]) -> Option<cosmos::Body> {
+    /// The body that owns cell `p`: closest datum, then the smaller id. A stored cube is skipped
+    /// unless `include` (the reference painter, reached by translating a storage cell back).
+    fn owner_in(&self, p: [i64; 3], include: bool) -> Option<cosmos::Body> {
         let q = glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
         let mut best: Option<(f64, cosmos::Body)> = None;
         for b in self.cosmos.bodies() {
-            // Round bodies are charted: their cells live in storage.
+            // Round bodies are charted: their cells live in storage. A sagging cube's cells do too.
             if !matches!(b.shape, cosmos::Shape::Cube { .. }) || !b.touches(p, p) {
+                continue;
+            }
+            if !include && self.storage.holds_cube(b.id) {
                 continue;
             }
             let alt = b.altitude(q).abs();
@@ -600,6 +646,15 @@ impl Terrain {
             }
         }
         best.map(|(_, b)| b)
+    }
+
+    /// Reference chunk of a storage chunk that sits in a warped-cube box.
+    #[inline]
+    fn cube_chunk(&self, coord: ChunkCoord) -> Option<ChunkCoord> {
+        if (coord.x as i64) * (CHUNK_SIZE as i64) < self.storage.cube_x0() {
+            return None;
+        }
+        self.storage.cube_ref_chunk(coord)
     }
 
     /// Home +Y column at world `(x, z)`, with the rim blend applied to its height.
@@ -804,6 +859,16 @@ impl Terrain {
     }
 
     fn cell(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.cell_in(x, y, z, false)
+    }
+
+    /// One cell. `include` paints a stored cube at its reference coordinates; without it that
+    /// cube's physical reach is air, the same as a charted round body.
+    fn cell_in(&self, x: i32, y: i32, z: i32, include: bool) -> BlockId {
+        if let Some((id, reference)) = self.storage.cube_ref_cell(x, y, z) {
+            let Some(body) = self.cosmos.bodies().iter().find(|b| b.id == id) else { return AIR };
+            return self.cube_cell(body, reference);
+        }
         if stored(x) {
             if let Some(id) = self.home_block(x, y, z) {
                 return id;
@@ -811,21 +876,27 @@ impl Terrain {
             return self.storage.voxel(x, y, z);
         }
         let p = [i64::from(x), i64::from(y), i64::from(z)];
-        if let Some(body) = self.owner(p) {
+        if let Some(body) = self.owner_in(p, include) {
             return self.cube_cell(&body, p);
         }
-        // A round body's reach is empty here; its matter is the storage chart.
-        if self.cosmos.bodies().iter().any(|b| !matches!(b.shape, cosmos::Shape::Cube { .. }) && b.touches(p, p)) {
+        // A round body's reach, and a stored cube's old physical cells, are empty here.
+        if self.cosmos.bodies().iter().any(|b| {
+            let charted = !matches!(b.shape, cosmos::Shape::Cube { .. }) || (!include && self.storage.holds_cube(b.id));
+            charted && b.touches(p, p)
+        }) {
             return AIR;
         }
         space::block(&self.cosmos, &self.m, p)
     }
 
     /// Chunk wholly inside one cube's deep limit: the mix, and nothing else.
-    fn fast_bulk(&self, coord: ChunkCoord) -> Option<ChunkData> {
+    fn fast_bulk_in(&self, coord: ChunkCoord, include: bool) -> Option<ChunkData> {
         let (lo, hi) = cube::chunk_bounds(coord);
         let mut only: Option<cosmos::Body> = None;
         for b in self.cosmos.bodies_touching(lo, hi) {
+            if !include && self.storage.holds_cube(b.id) {
+                continue;
+            }
             if only.is_some() {
                 return None;
             }
@@ -849,28 +920,29 @@ impl Terrain {
         Some(ChunkData::Uniform(id))
     }
 
-    fn fill_slow(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
+    fn fill_slow_in(&self, cx: i32, cy: i32, cz: i32, include: bool) -> ChunkData {
         let coord = ChunkCoord::new(cx, cy, cz);
-        match self.classify(coord) {
+        match self.classify_in(coord, include) {
             Classify::Air => return ChunkData::Uniform(AIR),
             Classify::Uniform(id) => return ChunkData::Uniform(id),
             Classify::Mixed => {}
         }
-        if let Some(data) = self.fast_bulk(coord) {
+        if let Some(data) = self.fast_bulk_in(coord, include) {
             return data;
         }
         let n = CHUNK_SIZE as i32;
         let (x0, y0, z0) = (cx * n, cy * n, cz * n);
         // Only rocks here: paint them from one list instead of looking them up per cell.
         let (lo, hi) = cube::chunk_bounds(coord);
-        if self.cosmos.bodies_touching(lo, hi).next().is_none() {
+        let touches = self.cosmos.bodies_touching(lo, hi).any(|b| include || !self.storage.holds_cube(b.id));
+        if !touches {
             return space::fill(&self.cosmos, &self.m, lo);
         }
         let mut cells = Box::new([AIR; CHUNK_VOLUME]);
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
                 for ly in 0..CHUNK_SIZE {
-                    cells[Chunk::index(lx, ly, lz)] = self.cell(x0 + lx as i32, y0 + ly as i32, z0 + lz as i32);
+                    cells[Chunk::index(lx, ly, lz)] = self.cell_in(x0 + lx as i32, y0 + ly as i32, z0 + lz as i32, include);
                 }
             }
         }
@@ -879,12 +951,15 @@ impl Terrain {
 
     /// The cube whose `face` covers this footprint outside the sky's edge band, outermost along
     /// the normal.
-    fn face_column_body(&self, key: ColumnKey) -> Option<cosmos::Body> {
+    fn face_column_body_in(&self, key: ColumnKey, include: bool) -> Option<cosmos::Body> {
         let samples = [(0i32, 0i32), (0, 15), (15, 0), (15, 15), (8, 8)];
         let mut best: Option<(cosmos::Body, i32)> = None;
         let n = self.cosmos.bodies().len();
         for i in 0..n {
             let body = self.cosmos.bodies()[i];
+            if !include && self.storage.holds_cube(body.id) {
+                continue;
+            }
             let cosmos::Shape::Cube { half } = body.shape else { continue };
             let Some(centre) = cube::centre_i32(body.centre) else { continue };
             let mut min_in = i64::MAX;
@@ -1668,6 +1743,139 @@ impl Terrain {
         });
         if on_face { span::CLEAR.max(cube::TREE_CLEAR) } else { cube::TREE_CLEAR }
     }
+
+    /// The cube-face sky rule. `include` counts stored cubes (their reference chunks).
+    fn sky_of(&self, coord: ChunkCoord, include: bool) -> Sky {
+        let (lo, hi) = cube::chunk_bounds(coord);
+        let mut owned: Option<(cosmos::Body, Face)> = None;
+        let mut min_inside = i64::MAX;
+        for p in cube::corners(lo, hi) {
+            let Some(body) = self.owner_in(p, include) else { return Sky::Open };
+            let cosmos::Shape::Cube { .. } = body.shape else { return Sky::Open };
+            let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
+            let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
+                return Sky::Open;
+            };
+            let face = cube::face_of(rel);
+            match owned {
+                None => owned = Some((body, face)),
+                Some((b, f)) if b.id != body.id || f != face => return Sky::Open,
+                _ => {}
+            }
+            let (u, _, v) = FaceFrame::new(face).cell_to_local((x, y, z));
+            min_inside = min_inside.min(cube::edge_inside(cube::half_of(&body), i64::from(u), i64::from(v)));
+        }
+        let Some((body, face)) = owned else { return Sky::Open };
+        if min_inside < cube::SKY_EDGE || self.outward_blocked(&body, face, coord) {
+            return Sky::Open;
+        }
+        Sky::Axis(face)
+    }
+
+    fn classify_in(&self, coord: ChunkCoord, include: bool) -> Classify {
+        let (lo, hi) = cube::chunk_bounds(coord);
+        if !self.cosmos.may_hold(lo, hi) {
+            return Classify::Air;
+        }
+        let mut only: Option<cosmos::Body> = None;
+        for b in self.cosmos.bodies_touching(lo, hi) {
+            if !include && self.storage.holds_cube(b.id) {
+                continue;
+            }
+            if only.is_some() {
+                return Classify::Mixed;
+            }
+            only = Some(*b);
+        }
+        let Some(body) = only else {
+            // A rock's sub-cell is huge. Only a chunk the reserved box actually meets is mixed.
+            return if space::any_overlap(&self.cosmos, lo, hi) { Classify::Mixed } else { Classify::Air };
+        };
+        match body.shape {
+            cosmos::Shape::Cube { .. } => {
+                let half = cube::half_of(&body);
+                let clear = self.face_clear(&body, lo, hi);
+                if cube::min_reach(body.centre, lo, hi) - half >= i64::from(clear) {
+                    return Classify::Uniform(AIR);
+                }
+                let rels = cube::corners(lo, hi)
+                    .map(|p| [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]]);
+                if rels.iter().copied().all(|r| cube::in_deep(r, half)) {
+                    let (rlo, rhi) = rel_box(body.centre, lo, hi);
+                    if self.deep.all_air(&body, rlo, rhi) {
+                        return Classify::Uniform(AIR);
+                    }
+                    if !self.deep.hits(&body, rlo, rhi)
+                        && let Some(id) = cube::bulk_uniform(&self.bulk, &body, &rels)
+                    {
+                        return Classify::Uniform(id);
+                    }
+                }
+                Classify::Mixed
+            }
+            // Charted: nothing of a round body is in physical space.
+            cosmos::Shape::Ball { .. } | cosmos::Shape::Shell { .. } => Classify::Air,
+        }
+    }
+
+    fn generate_in(&self, coord: ChunkCoord, include: bool) -> ChunkData {
+        match self.classify_in(coord, include) {
+            Classify::Air => return ChunkData::Uniform(AIR),
+            Classify::Uniform(id) => return ChunkData::Uniform(id),
+            Classify::Mixed => {}
+        }
+        match self.sky_of(coord, include) {
+            Sky::Axis(face) => {
+                let (key, alt) = ColumnKey::of(face, coord);
+                let (mut chunks, _) = self.generate_column_in(key, alt..=alt, include);
+                chunks.pop().expect("the requested layer").1
+            }
+            Sky::Open => self.fill_slow_in(coord.x, coord.y, coord.z, include),
+        }
+    }
+
+    fn generate_column_in(
+        &self,
+        key: ColumnKey,
+        range: std::ops::RangeInclusive<i32>,
+        include: bool,
+    ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
+        // Storage columns: the chart painters, chunk by chunk; heights are the charts' surfaces.
+        if key.face == Face::PosY && storage::StorageWorlds::owns(key.chunk(*range.start())) {
+            let c = key.chunk(*range.start());
+            if let Some(column) = self.home_column(key, range.clone()) {
+                return column;
+            }
+            if let Some(heights) = self.home_heights_16(c.x, c.z) {
+                let chunks = range
+                    .map(|alt| {
+                        let coord = key.chunk(alt);
+                        let data = self.home_chunk_data(coord).unwrap_or_else(|| self.storage.generate(coord));
+                        (alt, data)
+                    })
+                    .collect();
+                return (chunks, heights);
+            }
+            let chunks = range.map(|alt| (alt, self.storage.generate(key.chunk(alt)))).collect();
+            return (chunks, self.storage.heights_16(c.x, c.z));
+        }
+        if let Some(body) = self.face_column_body_in(key, include) {
+            if range.clone().all(|alt| self.sky_of(key.chunk(alt), include) == Sky::Axis(key.face)) {
+                return self.face_columns(&body, key, range);
+            }
+        }
+        let heights = self.column_heights_of(key);
+        if range.is_empty() {
+            return (Vec::new(), heights);
+        }
+        let chunks = range
+            .map(|alt| {
+                let c = key.chunk(alt);
+                (alt, self.fill_slow_in(c.x, c.y, c.z, include))
+            })
+            .collect();
+        (chunks, heights)
+    }
 }
 
 /// +Y surface chunk on the batch grid. Same loop as v3: identity axes, crust only.
@@ -1780,37 +1988,20 @@ impl TerrainGenerator for Terrain {
     }
 
     fn sky(&self, coord: ChunkCoord) -> Sky {
-        // Every chart's up is storage +Y.
+        // A warped cube keeps a sky per face. Every chart's up is storage +Y.
+        if let Some(reference) = self.cube_chunk(coord) {
+            return self.sky_of(reference, true);
+        }
         if storage::StorageWorlds::owns(coord) {
             return Sky::Axis(Face::PosY);
         }
-        let (lo, hi) = cube::chunk_bounds(coord);
-        let mut owned: Option<(cosmos::Body, Face)> = None;
-        let mut min_inside = i64::MAX;
-        for p in cube::corners(lo, hi) {
-            let Some(body) = self.owner(p) else { return Sky::Open };
-            let cosmos::Shape::Cube { .. } = body.shape else { return Sky::Open };
-            let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
-            let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
-                return Sky::Open;
-            };
-            let face = cube::face_of(rel);
-            match owned {
-                None => owned = Some((body, face)),
-                Some((b, f)) if b.id != body.id || f != face => return Sky::Open,
-                _ => {}
-            }
-            let (u, _, v) = FaceFrame::new(face).cell_to_local((x, y, z));
-            min_inside = min_inside.min(cube::edge_inside(cube::half_of(&body), i64::from(u), i64::from(v)));
-        }
-        let Some((body, face)) = owned else { return Sky::Open };
-        if min_inside < cube::SKY_EDGE || self.outward_blocked(&body, face, coord) {
-            return Sky::Open;
-        }
-        Sky::Axis(face)
+        self.sky_of(coord, false)
     }
 
     fn classify(&self, coord: ChunkCoord) -> Classify {
+        if let Some(reference) = self.cube_chunk(coord) {
+            return self.classify_in(reference, true);
+        }
         if storage::StorageWorlds::owns(coord) {
             if let Some(k) = self.home_class(coord) {
                 return k;
@@ -1821,46 +2012,7 @@ impl TerrainGenerator for Terrain {
                 None => Classify::Mixed,
             };
         }
-        let (lo, hi) = cube::chunk_bounds(coord);
-        if !self.cosmos.may_hold(lo, hi) {
-            return Classify::Air;
-        }
-        let mut only: Option<cosmos::Body> = None;
-        for b in self.cosmos.bodies_touching(lo, hi) {
-            if only.is_some() {
-                return Classify::Mixed;
-            }
-            only = Some(*b);
-        }
-        let Some(body) = only else {
-            // A rock's sub-cell is huge. Only a chunk the reserved box actually meets is mixed.
-            return if space::any_overlap(&self.cosmos, lo, hi) { Classify::Mixed } else { Classify::Air };
-        };
-        match body.shape {
-            cosmos::Shape::Cube { .. } => {
-                let half = cube::half_of(&body);
-                let clear = self.face_clear(&body, lo, hi);
-                if cube::min_reach(body.centre, lo, hi) - half >= i64::from(clear) {
-                    return Classify::Uniform(AIR);
-                }
-                let rels = cube::corners(lo, hi)
-                    .map(|p| [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]]);
-                if rels.iter().copied().all(|r| cube::in_deep(r, half)) {
-                    let (rlo, rhi) = rel_box(body.centre, lo, hi);
-                    if self.deep.all_air(&body, rlo, rhi) {
-                        return Classify::Uniform(AIR);
-                    }
-                    if !self.deep.hits(&body, rlo, rhi)
-                        && let Some(id) = cube::bulk_uniform(&self.bulk, &body, &rels)
-                    {
-                        return Classify::Uniform(id);
-                    }
-                }
-                Classify::Mixed
-            }
-            // Charted: nothing of a round body is in physical space.
-            cosmos::Shape::Ball { .. } | cosmos::Shape::Shell { .. } => Classify::Air,
-        }
+        self.classify_in(coord, false)
     }
 
     fn surface(&self, face: Face, u: i32, v: i32) -> i32 {
@@ -2054,25 +2206,17 @@ impl TerrainGenerator for Terrain {
 
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let coord = ChunkCoord::new(cx, cy, cz);
+        // One compare before the start-world painter: cube boxes begin past every chart.
+        if let Some(reference) = self.cube_chunk(coord) {
+            return self.generate_in(reference, true);
+        }
         if storage::StorageWorlds::owns(coord) {
             if let Some(data) = self.home_chunk_data(coord) {
                 return data;
             }
             return self.storage.generate(coord);
         }
-        match self.classify(coord) {
-            Classify::Air => return ChunkData::Uniform(AIR),
-            Classify::Uniform(id) => return ChunkData::Uniform(id),
-            Classify::Mixed => {}
-        }
-        match self.sky(coord) {
-            Sky::Axis(face) => {
-                let (key, alt) = ColumnKey::of(face, coord);
-                let (mut chunks, _) = self.generate_column(key, alt..=alt);
-                chunks.pop().expect("the requested layer").1
-            }
-            Sky::Open => self.fill_slow(cx, cy, cz),
-        }
+        self.generate_in(coord, false)
     }
 
     fn generate_column(
@@ -2080,41 +2224,20 @@ impl TerrainGenerator for Terrain {
         key: ColumnKey,
         range: std::ops::RangeInclusive<i32>,
     ) -> (Vec<(i32, ChunkData)>, ColumnHeights) {
-        // Storage columns: the chart painters, chunk by chunk; heights are the charts' surfaces.
-        if key.face == Face::PosY && storage::StorageWorlds::owns(key.chunk(*range.start())) {
-            let c = key.chunk(*range.start());
-            if let Some(column) = self.home_column(key, range.clone()) {
-                return column;
-            }
-            if let Some(heights) = self.home_heights_16(c.x, c.z) {
-                let chunks = range
-                    .map(|alt| {
-                        let coord = key.chunk(alt);
-                        let data = self.home_chunk_data(coord).unwrap_or_else(|| self.storage.generate(coord));
-                        (alt, data)
-                    })
-                    .collect();
-                return (chunks, heights);
-            }
-            let chunks = range.map(|alt| (alt, self.storage.generate(key.chunk(alt)))).collect();
-            return (chunks, self.storage.heights_16(c.x, c.z));
+        // A stored cube's column is the reference painter, shifted into the storage altitude frame.
+        // This runs before the chart +Y path: a cube box is storage too, and its +Y is not a chart.
+        if let Some((reference, shift)) = self.storage.cube_column(key) {
+            let lo = range.start().saturating_add(shift);
+            let hi = range.end().saturating_add(shift);
+            let (chunks, heights) = self.generate_column_in(reference, lo..=hi, true);
+            let cells = shift.saturating_mul(CHUNK_SIZE as i32);
+            let chunks = chunks.into_iter().map(|(alt, data)| (alt.saturating_sub(shift), data)).collect();
+            let heights = heights.map(|h| {
+                if h == i32::MIN || h == i32::MAX { h } else { h.saturating_sub(cells) }
+            });
+            return (chunks, heights);
         }
-        if let Some(body) = self.face_column_body(key) {
-            if range.clone().all(|alt| self.sky(key.chunk(alt)) == Sky::Axis(key.face)) {
-                return self.face_columns(&body, key, range);
-            }
-        }
-        let heights = self.column_heights_of(key);
-        if range.is_empty() {
-            return (Vec::new(), heights);
-        }
-        let chunks = range
-            .map(|alt| {
-                let c = key.chunk(alt);
-                (alt, self.fill_slow(c.x, c.y, c.z))
-            })
-            .collect();
-        (chunks, heights)
+        self.generate_column_in(key, range, false)
     }
 }
 
