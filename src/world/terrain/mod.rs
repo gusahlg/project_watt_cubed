@@ -2,7 +2,7 @@
 //!
 //! The [`cosmos`] lists every body. A cell belongs to the one body that reaches it, or it is air.
 //! Cube bodies (the start world and the twins) are six faces: today's terrain — shape, caves,
-//! mines, veins, trees — runs in face-local coordinates, with one salt per face except the home
+//! mines, veins, trees, landmarks — runs in face-local coordinates, with one salt per face except the home
 //! +Y face, which keeps the v3 salts. Provinces theme every column: a realm per face, regions
 //! and provinces on the shared surface point. Below the crust the bulk is a coarse mix whose mean amount
 //! is [`cosmos::BULK_DENSITY`]. Round bodies live on curved charts in storage ([`storage`]): storage
@@ -16,6 +16,7 @@ pub mod cosmos;
 pub mod noise;
 pub mod palette;
 mod cube;
+mod features;
 mod province;
 pub mod round;
 mod shape;
@@ -41,12 +42,13 @@ use underground::{Grid, Underground};
 /// Folded into the content fingerprint and recorded in saves. History: 1-5 the classic and
 /// diffusion v1/v2 generators over authored and then emergent materials; 6 = InfiniteDiffusion v3
 /// over the selective-transfer palette (2026-10-02); 7 = the cube planet (2026-10-03): bodies from
-/// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field.
-pub const WORLDGEN_VERSION: u16 = 7;
+/// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field;
+/// 8 = surface landmarks.
+pub const WORLDGEN_VERSION: u16 = 8;
 
 /// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
 pub const SPACE_FLOOR: i32 = 640;
-/// Ground never rises above this (inside the far-LOD window `[0, 512)`).
+/// Ground never rises above this (inside the far-LOD window `[0, 512)`; landmarks above it are not in the far field).
 pub const MAX_GROUND: i32 = 470;
 /// Ground never sinks below this (the far-LOD floor is 0).
 pub const MIN_GROUND: i32 = 6;
@@ -342,6 +344,7 @@ struct FacePaint {
     shape: Shape,
     under: Underground,
     trees: Trees,
+    features: features::Features,
 }
 
 /// The generator.
@@ -417,6 +420,11 @@ impl Terrain {
                     shape: Shape::new(s_face, relief, m.clone(), face, half, realm, b.seed, variety, garden),
                     under: Underground::new(s_face ^ 0x0BAD_CAFE, cfg, m.clone()),
                     trees: Trees::new(s_face ^ 0x7EE5_0000, m.clone()),
+                    features: features::Features::new(
+                        s_face ^ 0x5A1E_5A1E,
+                        cfg.features as f32 / 100.0,
+                        m.clone(),
+                    ),
                 });
             }
         }
@@ -510,18 +518,42 @@ impl Terrain {
         let mut col = paint.shape.column(u, v);
         col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
         if h >= col.height {
-            if let Some(id) = paint.trees.block_at(&paint.shape, u, h, v) {
-                return id;
+            // Landmarks fill air first. A dug air cell stays empty so a tree cannot grow in it.
+            if h - col.height <= features::MAX_ABOVE {
+                if let Some(st) = paint.features.block_at(&paint.shape, u, h, v, col.height) {
+                    if st.id != AIR {
+                        return st.id;
+                    }
+                    if st.dig {
+                        return AIR;
+                    }
+                }
             }
-            if h == col.height {
-                if let Some(id) = paint.shape.flower_at(&col, u, v) {
+            if h - col.height <= trees::MAX_TREE_HEIGHT {
+                if paint.features.cuts_surface(&paint.shape, u, col.height, v) {
+                    return AIR;
+                }
+                if let Some(id) = paint.trees.block_at(&paint.shape, u, h, v) {
                     return id;
+                }
+                if h == col.height {
+                    if let Some(id) = paint.shape.flower_at(&col, u, v) {
+                        return id;
+                    }
                 }
             }
             return AIR;
         }
         if col.height - h > cube::CRUST {
             return cube::bulk_id(&self.bulk, body, rel);
+        }
+        // A dig replaces the crust cell, so a crater core is not opened back into a cave.
+        if col.height - h <= features::MAX_BELOW {
+            if let Some(st) = paint.features.block_at(&paint.shape, u, h, v, col.height) {
+                if st.dig {
+                    return st.id;
+                }
+            }
         }
         let field = |yy: i32| Grid::interp_corners(&paint.under.corners(u, yy, v), u, yy, v);
         let ground = paint.shape.ground(&col, u, h, v);
@@ -685,7 +717,7 @@ impl Terrain {
         let n = CHUNK_SIZE as i32;
         // Unblended max keeps the v3 early-out. Blended max covers a rim that rose above it.
         let max_h = cols.iter().map(|c| c.height).max().unwrap_or(i32::MIN);
-        if h0 >= max_terrain.max(max_h) + trees::MAX_TREE_HEIGHT {
+        if h0 >= max_terrain.max(max_h) + features::MAX_ABOVE {
             return ChunkData::Uniform(AIR);
         }
         if i64::from(h0) + i64::from(n) <= i64::from(min_h) - i64::from(cube::CRUST) {
@@ -699,7 +731,7 @@ impl Terrain {
         let crust_only = i64::from(h0) >= i64::from(max_h) - i64::from(cube::CRUST);
         let grid = (aligned && h0 < max_h).then(|| paint.under.grid(u0, h0, v0));
         let mut cells = Box::new([AIR; CHUNK_VOLUME]);
-        // `h0 >= max_h`: every column tops out at or below this chunk, so only trees write.
+        // `h0 >= max_h`: every column tops out at or below this chunk, so only landmarks and trees write.
         if h0 < max_h && face == Face::PosY && crust_only {
             // Identity frame, the v3 surface loop: no permute and no bulk test.
             if let Some(g) = &grid {
@@ -758,21 +790,51 @@ impl Terrain {
             }
         }
         let frame = FaceFrame::new(face);
+        let stamps = paint.features.blocks_in(&paint.shape, cols, u0, v0, n, h0, h0 + n);
+        let mut claim = [false; CHUNK_VOLUME];
+        for &(u, h, v, id, dig) in &stamps {
+            let (lu, la, lv) = (u - u0, h - h0, v - v0);
+            if !(0..n).contains(&lu) || !(0..n).contains(&la) || !(0..n).contains(&lv) {
+                continue;
+            }
+            let above = h >= cols[lu as usize + lv as usize * CHUNK_SIZE].height;
+            let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
+            let i = Chunk::index(lx, ly, lz);
+            if above {
+                if id != AIR && cells[i] == AIR {
+                    cells[i] = id;
+                }
+                if dig && id == AIR {
+                    claim[i] = true;
+                }
+            } else if dig {
+                cells[i] = id;
+            }
+        }
+        let open = paint.features.surface_open(&paint.shape, cols, u0, v0, n);
         for &(u, h, v, id) in tree_blocks {
             let (lu, la, lv) = (u - u0, h - h0, v - v0);
             if !(0..n).contains(&lu) || !(0..n).contains(&la) || !(0..n).contains(&lv) {
                 continue;
             }
+            let col_i = lu as usize + lv as usize * CHUNK_SIZE;
+            if open[col_i] {
+                continue;
+            }
             let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
             let i = Chunk::index(lx, ly, lz);
-            if cells[i] == AIR && h >= cols[lu as usize + lv as usize * CHUNK_SIZE].height {
+            if cells[i] == AIR && !claim[i] && h >= cols[col_i].height {
                 cells[i] = id;
             }
         }
-        // A flower is one block on the ground cell. A tree already in that cell stays.
+        // A flower is one block on the ground cell. A tree or landmark already there stays.
         for lv in 0..CHUNK_SIZE {
             for lu in 0..CHUNK_SIZE {
-                let col = &cols[lu + lv * CHUNK_SIZE];
+                let col_i = lu + lv * CHUNK_SIZE;
+                if open[col_i] {
+                    continue;
+                }
+                let col = &cols[col_i];
                 let la = col.height - h0;
                 if !(0..n).contains(&la) {
                     continue;
@@ -781,7 +843,7 @@ impl Terrain {
                 let Some(id) = paint.shape.flower_at(col, u, v) else { continue };
                 let (lx, ly, lz) = frame.index_to_world(lu, la as usize, lv);
                 let i = Chunk::index(lx, ly, lz);
-                if cells[i] == AIR {
+                if cells[i] == AIR && !claim[i] {
                     cells[i] = id;
                 }
             }

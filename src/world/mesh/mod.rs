@@ -513,7 +513,8 @@ mod tests {
 
     /// Vertex-byte pin: four seed-42 neighbourhoods, dense (non-uniform), meshed
     /// unlit / full-bright / gradient-lit. Hashes must stay bit-identical across
-    /// mesher edits. Print with `--nocapture` to refresh the table.
+    /// mesher edits. Print with `--nocapture` to refresh the table. Re-pinned
+    /// for worldgen 8: flora (meadow, lichen, bushes) changed the surface.
     #[test]
     fn vertex_byte_pin() {
         use crate::block::registry::BlockRegistry;
@@ -528,10 +529,10 @@ mod tests {
         let surface = |cx: i32, cz: i32| (cx, generator.height(cx * 16 + 8, cz * 16 + 8).div_euclid(16), cz);
         #[allow(clippy::type_complexity)] // pin table: (coord, unlit, full, gradient) hashes
         let want: [((i32, i32, i32), u32, u32, u32); 4] = [
-            (surface(0, 0), 0x186ce332, 0x186ce332, 0x1da46d90),
-            (surface(3, -2), 0xded88e52, 0xded88e52, 0x1f15b513),
-            (surface(1, 0), 0x0e8cf568, 0x0e8cf568, 0x05d7d8d0),
-            (surface(2, 2), 0xf9890e26, 0xf9890e26, 0xd4de6ebb),
+            (surface(0, 0), 0xbe706a19, 0xbe706a19, 0x4c828931),
+            (surface(3, -2), 0xdd6f65f5, 0xdd6f65f5, 0x0b61eaa4),
+            (surface(1, 0), 0xbc8236ec, 0xbc8236ec, 0xc22bcf40),
+            (surface(2, 2), 0xd0bb2d8d, 0xd0bb2d8d, 0x188c2acc),
         ];
 
         let mut got = [(0u32, 0u32, 0u32); 4];
