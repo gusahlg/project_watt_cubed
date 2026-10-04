@@ -1582,3 +1582,172 @@ fn every_landmark_family_matches_on_its_face() {
     });
     agree_cell(&t, &lush, away, u, y, v);
 }
+
+fn structure_stamp(paint: &FacePaint, x: i32, y: i32, z: i32, ground: i32) -> Option<features::Stamp> {
+    paint.structures.block_at(&paint.shape, &paint.under, x, y, z, ground)
+}
+
+#[test]
+fn structures_knob_at_zero_builds_nothing() {
+    let mut reg = BlockRegistry::with_builtins();
+    let mut cfg = TerrainCfg::default();
+    cfg.structures = 0;
+    let off = Terrain::with_cfg(&mut reg, 42, cfg);
+    let home = *off.cosmos.home();
+    let paint = off.paint(&home, Face::PosY);
+    assert!(structures::survey(&paint.structures, &paint.shape, &paint.under, 0, 0, 2).is_empty());
+    assert!(structures::survey_roads(&paint.structures, &paint.shape, &paint.under, 0, 0, 4).is_empty());
+    for z in (-32..32).step_by(8) {
+        for x in (-32..32).step_by(8) {
+            let h = paint.shape.column(x, z).height;
+            assert!(structure_stamp(paint, x, h, z, h).is_none(), "structures=0 painted ({x},{z})");
+            assert!(!paint.structures.owns(&paint.shape, &paint.under, x, z));
+        }
+    }
+}
+
+#[test]
+fn structures_own_their_footprint_and_match_the_batch() {
+    assert!(structures::DIG_LIMIT < cube::CRUST);
+    assert!(structures::DIG_LIMIT > features::MAX_BELOW);
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let m = t.materials();
+    let paint = t.paint(&home, Face::PosY);
+    let found = structures::survey(&paint.structures, &paint.shape, &paint.under, 0, 0, 3);
+    let mut counts = [0u32; 9];
+    for f in &found {
+        counts[f.kind as usize] += 1;
+        let col = paint.shape.column(f.x, f.z);
+        assert!(paint.shape.inset(f.x, f.z) >= i64::from(cube::RIM), "structure on the rim");
+        if f.kind != structures::KIND_BRIDGE {
+            assert!(col.slope4 < 8, "kind {} slope {}", f.kind, col.slope4);
+        }
+        let once = structure_stamp(paint, f.x, f.pad, f.z, col.height);
+        let twice = structure_stamp(paint, f.x, f.pad, f.z, col.height);
+        assert_eq!(once, twice);
+    }
+    let names = ["tower", "pyramid", "circle", "monolith", "temple", "observatory", "mine"];
+    for (i, name) in names.iter().enumerate() {
+        assert!(counts[i] > 0, "no {name} near spawn {counts:?}");
+    }
+
+    let stone = |id: BlockId| {
+        id == m.limestone || id == m.slate || id == m.marble || id == m.obsidian || id == m.plank
+            || m.sandstone.contains(&id)
+    };
+    let tower = found.iter().find(|f| f.kind == structures::KIND_TOWER).unwrap();
+    assert!((15..=60).contains(&tower.a), "tower height {}", tower.a);
+    assert!((3..=5).contains(&tower.b));
+    let tg = paint.shape.column(tower.x, tower.z).height;
+    assert!(structure_stamp(paint, tower.x, tower.pad + 2, tower.z, tg).is_some_and(|s| s.id == AIR && s.dig));
+    assert!(stone(structure_stamp(paint, tower.x + tower.b, tower.pad + 4, tower.z, tg).unwrap().id));
+    assert!(structure_stamp(paint, tower.x + tower.b + 5, tower.pad, tower.z, tg).is_none());
+
+    let pyramid = found.iter().find(|f| f.kind == structures::KIND_PYRAMID).unwrap();
+    assert!((4..=9).contains(&pyramid.a));
+    let pg = paint.shape.column(pyramid.x, pyramid.z).height;
+    assert_eq!(structure_stamp(paint, pyramid.x, pyramid.pad + 1, pyramid.z, pg).unwrap().id, m.lamp);
+    assert!(structure_stamp(paint, pyramid.x + pyramid.a * 2 + 3, pyramid.pad, pyramid.z, pg).is_none());
+
+    let circle = found.iter().find(|f| f.kind == structures::KIND_CIRCLE).unwrap();
+    assert!(matches!(circle.a, 8 | 10 | 12));
+    assert!((3..=5).contains(&circle.b));
+    let cg = paint.shape.column(circle.x, circle.z).height;
+    assert!(stone(structure_stamp(paint, circle.x, circle.pad, circle.z, cg).unwrap().id));
+
+    let mono = found.iter().find(|f| f.kind == structures::KIND_MONOLITH).unwrap();
+    assert!(matches!(mono.a, 8 | 12 | 16 | 20 | 24));
+    let mg = paint.shape.column(mono.x, mono.z).height;
+    let mid = structure_stamp(paint, mono.x, mono.pad, mono.z, mg).unwrap().id;
+    assert!(mid == m.obsidian || mid == m.marble, "monolith {mid:?}");
+
+    let temple = found.iter().find(|f| f.kind == structures::KIND_TEMPLE).unwrap();
+    assert!((6..=10).contains(&temple.a));
+    assert!((5..=7).contains(&temple.b));
+    let eg = paint.shape.column(temple.x + temple.a, temple.z + 2).height;
+    assert!(stone(structure_stamp(paint, temple.x + temple.a, temple.pad + 1, temple.z + 2, eg).unwrap().id));
+
+    let hut = found.iter().find(|f| f.kind == structures::KIND_OBSERVATORY).unwrap();
+    assert!((10..=14).contains(&hut.a));
+    assert!(matches!(hut.b, 4 | 5));
+    assert_eq!(
+        (hut.qu, hut.qa, hut.qv),
+        structures::aim_at(&paint.structures, hut.x, hut.pad, hut.z, hut.a)
+    );
+    let span = hut.a.max(1);
+    let (fx, fy, fz) = (hut.x + hut.qu * hut.a / span, hut.pad + hut.b + hut.qa * hut.a / span, hut.z + hut.qv * hut.a / span);
+    let fg = paint.shape.column(fx, fz).height;
+    let frame = structure_stamp(paint, fx, fy, fz, fg).unwrap().id;
+    assert!(frame == m.plank || frame == m.rust, "telescope {frame:?}");
+
+    let mut connected = 0;
+    for mine in found.iter().filter(|f| f.kind == structures::KIND_MINE) {
+        assert!(mine.pad - mine.a < cube::CRUST);
+        assert!(mine.a <= mine.pad - 6);
+        let g = paint.shape.column(mine.x, mine.z).height;
+        assert!(structure_stamp(paint, mine.x, mine.pad, mine.z, g).is_some_and(|s| s.id == AIR && s.dig));
+        assert_eq!(structure_stamp(paint, mine.x + 2, mine.pad + 4, mine.z + 2, g).unwrap().id, m.plank);
+        if mine.a < mine.pad - 6 {
+            connected += 1;
+            assert!(structure_stamp(paint, mine.x, mine.a, mine.z, g).is_some_and(|s| s.id == AIR && s.dig));
+            assert!(structure_stamp(paint, mine.x, mine.a - 1, mine.z, g).is_none(), "shaft dug the rail");
+        }
+    }
+    assert!(connected > 0, "no shaft met a mine ({counts:?})");
+
+    let mut checked = 0;
+    for f in &found {
+        if checked >= 3 {
+            break;
+        }
+        agree_cell(&t, &home, Face::PosY, f.x, f.pad, f.z);
+        let (wx, wy, wz) = face_cell(&home, Face::PosY, f.x, f.pad, f.z);
+        let id = t.voxel_at(wx, wy, wz);
+        let g = paint.shape.column(f.x, f.z).height;
+        if let Some(st) = structure_stamp(paint, f.x, f.pad, f.z, g) {
+            if st.id != AIR {
+                assert_eq!(id, st.id, "voxel ignored structure at ({},{})", f.x, f.z);
+            }
+        }
+        checked += 1;
+    }
+
+    let roads = structures::survey_roads(&paint.structures, &paint.shape, &paint.under, tower.x, tower.z, 8);
+    assert!(!roads.is_empty(), "no waystone near a tower");
+    let road = &roads[0];
+    let rg = paint.shape.column(road.x, road.z).height;
+    let base = structure_stamp(paint, road.x, road.pad, road.z, rg).unwrap().id;
+    let cap = structure_stamp(paint, road.x, road.pad + 1, road.z, rg).unwrap().id;
+    assert!(stone(base) || base == m.obsidian || base == m.marble);
+    assert!(cap == m.obsidian || cap == m.marble);
+    assert_ne!(base, cap);
+
+    let twin = t.cosmos.bodies().iter().find(|b| b.kind == cosmos::Kind::Twin).copied().unwrap();
+    let face = span::facing_face(&t.cosmos, &twin).unwrap();
+    let facing = t.paint(&twin, face);
+    assert!(structures::survey(&facing.structures, &facing.shape, &facing.under, 0, 0, 2).is_empty());
+}
+
+#[test]
+fn canyon_bridges_span_both_rims() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let m = t.materials();
+    let hits = survey(&t, &home, Face::PosX);
+    let (u, v) = origin(&hits, province::ThemeId::Canyon);
+    let paint = t.paint(&home, Face::PosX);
+    let found = structures::survey(&paint.structures, &paint.shape, &paint.under, u, v, 2);
+    let bridge = found.iter().find(|f| f.kind == structures::KIND_BRIDGE).unwrap_or_else(|| {
+        panic!("no bridge near canyon ({u},{v}), {} sites", found.len())
+    });
+    let g = paint.shape.column(bridge.x, bridge.z).height;
+    if bridge.qa == 0 {
+        assert_eq!(structure_stamp(paint, bridge.x, bridge.pad, bridge.z, g).unwrap().id, m.plank);
+        assert!(structure_stamp(paint, bridge.x, bridge.pad - 2, bridge.z, g).is_none());
+    } else {
+        let id = structure_stamp(paint, bridge.x, bridge.pad + bridge.qv, bridge.z, g).unwrap().id;
+        assert!(id == m.limestone || id == m.slate || id == m.marble || id == m.obsidian || m.sandstone.contains(&id) || id == m.plank);
+    }
+    agree_cell(&t, &home, Face::PosX, bridge.x, bridge.pad, bridge.z);
+}

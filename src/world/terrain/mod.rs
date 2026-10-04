@@ -2,7 +2,7 @@
 //!
 //! The [`cosmos`] lists every body. A cube cell is that cube's face; an asteroid cell is the rock
 //! that contains it. Cube bodies (the start world and the twins) are six faces: today's terrain —
-//! shape, caves, mines, veins, trees, landmarks — runs in face-local coordinates, with one salt per face
+//! shape, caves, mines, veins, trees, landmarks, structures — runs in face-local coordinates, with one salt per face
 //! except the home +Y face, which keeps the v3 salts. Provinces theme every column: a realm per
 //! face, regions and provinces on the shared surface point. The twins' facing faces also carry
 //! spires and arches across the canyon, inside the relief bound. Below the crust the bulk is a
@@ -26,6 +26,7 @@ pub mod round;
 mod shape;
 mod space;
 mod span;
+mod structures;
 pub mod storage;
 mod trees;
 mod underground;
@@ -49,7 +50,7 @@ use underground::{Grid, Underground};
 /// diffusion v1/v2 generators over authored and then emergent materials; 6 = InfiniteDiffusion v3
 /// over the selective-transfer palette (2026-10-02); 7 = the cube planet (2026-10-03): bodies from
 /// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field;
-/// 8 = surface landmarks.
+/// 8 = surface landmarks, and the ruins, monuments and watchers on them (unreleased, so the number stays).
 pub const WORLDGEN_VERSION: u16 = 8;
 
 /// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
@@ -357,6 +358,7 @@ struct FacePaint {
     under: Underground,
     trees: Trees,
     features: features::Features,
+    structures: structures::Structures,
 }
 
 /// The generator.
@@ -378,6 +380,20 @@ pub struct Terrain {
 #[inline]
 fn stored(x: i32) -> bool {
     x as i64 >= crate::space::atlas::STORAGE_X0
+}
+
+/// Centres of the other big bodies, the ones an observatory can point at. Moons are not big.
+fn sky_aims(cosmos: &cosmos::Cosmos, id: u16) -> ([[i64; 3]; 8], usize) {
+    let mut aims = [[0i64; 3]; 8];
+    let mut n = 0;
+    for o in cosmos.bodies() {
+        if o.kind == cosmos::Kind::Moon || o.id == id || n == aims.len() {
+            continue;
+        }
+        aims[n] = o.centre;
+        n += 1;
+    }
+    (aims, n)
 }
 
 fn rel_box(centre: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> ([i64; 3], [i64; 3]) {
@@ -424,6 +440,8 @@ impl Terrain {
         for b in cosmos.bodies() {
             let cosmos::Shape::Cube { half } = b.shape else { continue };
             let twin = b.kind == cosmos::Kind::Twin;
+            let (aims, n_aims) = sky_aims(&cosmos, b.id);
+            let facing_face = span::facing_face(&cosmos, b);
             for face in Face::ALL {
                 // Home +Y keeps the v3 salts. Every other face is a fresh field.
                 let s_face = if b.kind == cosmos::Kind::Home && face == Face::PosY {
@@ -437,6 +455,8 @@ impl Terrain {
                     province::Realm::of_home(face)
                 };
                 let garden = b.kind == cosmos::Kind::Home && face == Face::PosY;
+                // The facing canyon already carries spires. Structures stay on the other faces.
+                let struct_scale = if facing_face == Some(face) { 0.0 } else { cfg.structures as f32 / 100.0 };
                 let i = b.id as usize * 6 + face.index();
                 paints[i] = Some(FacePaint {
                     shape: Shape::new(s_face, relief, m.clone(), face, half, realm, b.seed, variety, garden),
@@ -446,6 +466,15 @@ impl Terrain {
                         s_face ^ 0x5A1E_5A1E,
                         cfg.features as f32 / 100.0,
                         m.clone(),
+                    ),
+                    structures: structures::Structures::new(
+                        s_face ^ 0x57E0_C700,
+                        struct_scale,
+                        m.clone(),
+                        face,
+                        half,
+                        b.centre,
+                        &aims[..n_aims],
                     ),
                 });
             }
@@ -609,8 +638,19 @@ impl Terrain {
         let mut col = paint.shape.column(u, v);
         col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
         if h >= col.height {
-            // Landmarks fill air first. A dug air cell stays empty so a tree cannot grow in it.
+            // Structures own their footprint, then landmarks. A dug air cell stays empty.
             if h - col.height <= features::MAX_ABOVE {
+                if let Some(st) = paint.structures.block_at(&paint.shape, &paint.under, u, h, v, col.height) {
+                    if st.id != AIR {
+                        return st.id;
+                    }
+                    if st.dig {
+                        return AIR;
+                    }
+                }
+                if paint.structures.owns(&paint.shape, &paint.under, u, v) {
+                    return AIR;
+                }
                 if let Some(st) = paint.features.block_at(&paint.shape, u, h, v, col.height) {
                     if st.id != AIR {
                         return st.id;
@@ -645,7 +685,16 @@ impl Terrain {
             return self.deep_at(body, rel, Some(col.height - h));
         }
         // A dig replaces the crust cell, so a crater core is not opened back into a cave.
-        if col.height - h <= features::MAX_BELOW {
+        // Structure shafts reach a mine level; landmark digs stay in their shallower band.
+        let depth = col.height - h;
+        if depth <= structures::DIG_LIMIT {
+            if let Some(st) = paint.structures.block_at(&paint.shape, &paint.under, u, h, v, col.height) {
+                if st.dig {
+                    return st.id;
+                }
+            }
+        }
+        if depth <= features::MAX_BELOW && !paint.structures.owns(&paint.shape, &paint.under, u, v) {
             if let Some(st) = paint.features.block_at(&paint.shape, u, h, v, col.height) {
                 if st.dig {
                     return st.id;
@@ -944,6 +993,7 @@ impl Terrain {
             }
         }
         let frame = FaceFrame::new(face);
+        let owned = paint.structures.owned(&paint.shape, &paint.under, cols, u0, v0, n);
         let stamps = paint.features.blocks_in(&paint.shape, cols, u0, v0, n, h0, h0 + n);
         let mut claim = [false; CHUNK_VOLUME];
         for &(u, h, v, id, dig) in &stamps {
@@ -951,7 +1001,11 @@ impl Terrain {
             if !(0..n).contains(&lu) || !(0..n).contains(&la) || !(0..n).contains(&lv) {
                 continue;
             }
-            let above = h >= cols[lu as usize + lv as usize * CHUNK_SIZE].height;
+            let col_i = lu as usize + lv as usize * CHUNK_SIZE;
+            if !owned.is_empty() && owned[col_i] {
+                continue;
+            }
+            let above = h >= cols[col_i].height;
             let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
             let i = Chunk::index(lx, ly, lz);
             if above {
@@ -965,6 +1019,27 @@ impl Terrain {
                 cells[i] = id;
             }
         }
+        let built = paint.structures.blocks_in(&paint.shape, &paint.under, cols, u0, v0, n, h0, h0 + n);
+        for &(u, h, v, id, dig) in &built {
+            let (lu, la, lv) = (u - u0, h - h0, v - v0);
+            if !(0..n).contains(&lu) || !(0..n).contains(&la) || !(0..n).contains(&lv) {
+                continue;
+            }
+            let col_i = lu as usize + lv as usize * CHUNK_SIZE;
+            let above = h >= cols[col_i].height;
+            let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
+            let i = Chunk::index(lx, ly, lz);
+            if above {
+                if id != AIR {
+                    cells[i] = id;
+                } else if dig {
+                    cells[i] = AIR;
+                    claim[i] = true;
+                }
+            } else if dig {
+                cells[i] = id;
+            }
+        }
         let open = paint.features.surface_open(&paint.shape, cols, u0, v0, n);
         for &(u, h, v, id) in tree_blocks {
             let (lu, la, lv) = (u - u0, h - h0, v - v0);
@@ -972,7 +1047,7 @@ impl Terrain {
                 continue;
             }
             let col_i = lu as usize + lv as usize * CHUNK_SIZE;
-            if open[col_i] {
+            if open[col_i] || (!owned.is_empty() && owned[col_i]) {
                 continue;
             }
             let (lx, ly, lz) = frame.index_to_world(lu as usize, la as usize, lv as usize);
@@ -985,7 +1060,7 @@ impl Terrain {
         for lv in 0..CHUNK_SIZE {
             for lu in 0..CHUNK_SIZE {
                 let col_i = lu + lv * CHUNK_SIZE;
-                if open[col_i] {
+                if open[col_i] || (!owned.is_empty() && owned[col_i]) {
                     continue;
                 }
                 let col = &cols[col_i];

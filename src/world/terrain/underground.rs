@@ -262,6 +262,32 @@ impl Underground {
         None
     }
 
+    /// Shallowest mine level under `(x, z)` that a shaft can meet: inside the site, not breaching
+    /// `surface`, and still in the crust. `None` when the column is not on a live site.
+    pub(super) fn mine_floor(&self, x: i32, z: i32, surface: i32) -> Option<i32> {
+        if self.mines <= 0.0 {
+            return None;
+        }
+        let (sx, sz) = (x.div_euclid(SITE), z.div_euclid(SITE));
+        let site = hash2(self.seed(30), sx, sz);
+        if unit(site) >= 0.45 * self.mines {
+            return None;
+        }
+        let (u, w) = (x - sx * SITE - MARGIN, z - sz * SITE - MARGIN);
+        let span = NODE * (NODES - 1);
+        if !(-3..=span + 3).contains(&u) || !(-3..=span + 3).contains(&w) {
+            return None;
+        }
+        let mask = (site >> 8) as usize & ((1 << LEVELS.len()) - 1) | 1 << (site % 3);
+        for (i, &level) in LEVELS.iter().enumerate() {
+            if mask & (1 << i) == 0 || level + 8 > surface || surface - level >= super::cube::CRUST {
+                continue;
+            }
+            return Some(level);
+        }
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn level_cell(&self, site: u32, level: i32, lower: Option<i32>, u: i32, y: i32, w: i32, x: i32, z: i32) -> Option<MineCell> {
         let m = &self.m;
