@@ -247,6 +247,18 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_noclip_player_restores_as_noclip() {
+        let mut doc = bare_doc();
+        doc.player.flying = true;
+        doc.player.noclip = true;
+        doc.player.velocity = [1.5, -4.0, 0.25];
+        let (_world, player) = load_flat(doc);
+        assert!(player.noclip());
+        assert!(player.flying());
+        assert_eq!(player.velocity(), DVec3::new(1.5, -4.0, 0.25));
+    }
+
+    #[test]
     fn legacy_pose_stands_in_local_gravity_and_a_saved_identity_frame_stays() {
         let at = side_of_the_slab();
         let mut legacy = bare_doc();

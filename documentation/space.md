@@ -40,6 +40,12 @@ walk over the edge. Collision stays axis aligned: the player's box stands along 
 nearest to their up, switching with hysteresis. Jumping pushes along the support normal; flying
 moves in the body frame.
 
+Air reaches `AIR_TOP` (20 000 blocks) above the nearest body. In it, walking is the usual
+integrator, and a fall already faster than terminal speed drags back toward that speed instead of
+stopping in one step. Above the air, and wherever no body is near, a walker is in free fall:
+velocity takes the whole gravity vector, with no terminal speed, and the movement keys do nothing.
+`F` toggles walking and flying. `/noclip` toggles flight through geometry.
+
 Because gravity is the honest vector sum, a huge cube is not "flat": each face is a vast shallow
 bowl — level at its centre, tilting 16° halfway to an edge and 45° at the edge, with the corners the
 highest ground of all.
@@ -113,6 +119,14 @@ sun lights whatever faces it.
 
 ## Travel
 
-Flying is fast enough to cross a face; distant worlds are found by seeing them in the sky and reached
-with `/tp <x> <y> <z>`, which stands the player up along the local pull on arrival. Bodies are
-anchored: no orbits, velocities or collisions between bodies yet.
+`F` toggles walking and flying. Flying is fast enough to cross a face, and it is how you steer in
+free fall. `/noclip` toggles flight through geometry. Above `AIR_TOP` a walker falls freely along
+the pull; in air a fall faster than terminal drags back toward it.
+
+`/bodies` lists every body, nearest first: its kind, its number within that kind, the distance,
+the size, and the `/tp` that lands 2 000 blocks above the datum (`centre + (0, top + 2000, 0)`,
+top being the cube's half-edge, a ball's radius or a shell's outer radius). `/tp <x> <y> <z>` and
+`/tp <name> [n]` (a unique prefix of the kind; `n` counts that kind in catalog order and defaults
+to 1) stand the player up along the local pull on arrival. A world without a cosmos has nothing to
+list and nowhere to jump by name. Bodies are anchored: no orbits, velocities or collisions between
+bodies yet.

@@ -16,6 +16,7 @@ use crate::player::Player;
 use crate::settings::{SETTINGS, Settings};
 use crate::sky::{DayLength, Sky};
 use crate::ui::{Line, Role};
+use crate::world::terrain::cosmos::{Body, Cosmos, Kind, Shape};
 use crate::world::World;
 
 fn shown(lines: Vec<String>) -> Vec<Line> {
@@ -60,7 +61,9 @@ macro_rules! commands {
 
 commands! {
     cmd, args, player, world, settings, sky, visuals;
-    "tp" | "teleport" | "setpos", "  /tp <x> <y> <z>       teleport to coordinates" => teleport(args, player, world);
+    "tp" | "teleport" | "setpos", "  /tp <x y z|name>      teleport to coordinates or a body" => teleport(args, player, world);
+    "bodies", "  /bodies               list the worlds, nearest first" => bodies(player, world);
+    "noclip", "  /noclip               toggle flight through geometry" => noclip(player);
     "pos" | "where", "  /pos                  show current coordinates" => shown(vec![format!("position: {}", fmt_pos(player.position))]);
     "inspect" | "look", "  /inspect [x y z]      describe a block's elements & properties" => inspect(args, player, world);
     "reactions", "  /reactions            show pending reaction events" => reactions(world);
@@ -170,39 +173,176 @@ fn clock_label(day: f64) -> String {
     format!("{:02}:{:02}", (total / 60) % 24, total % 60)
 }
 
-/// `tp <x> <y> <z>` — move the player to absolute world coordinates, clamped
-/// to the ±[`WORLD_BORDER`] cube (the same clamp movement applies, so no code
-/// path can carry a position that would overflow i32 block math). The output
-/// reports the position actually landed on, clamp included.
+/// `tp <x> <y> <z>` or `tp <name> [n]` — move the player, clamped to the
+/// ±[`WORLD_BORDER`] cube (the same clamp movement applies, so no code path can
+/// carry a position that would overflow i32 block math). The output reports the
+/// position actually landed on, clamp included.
 ///
 /// The discontinuity is transactional: collision data around the destination
 /// is *requested* before the player lands there, and physics stays frozen
 /// until [`World::spawn_ready`] is true, so the next physics step never runs
 /// against unloaded air.
 fn teleport(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
+    let numeric = args.first().is_some_and(|a| a.parse::<f64>().is_ok());
+    if numeric || args.len() == 3 {
+        return teleport_coords(args, player, world);
+    }
+    match args {
+        [name] => teleport_named(name, 1, player, world),
+        [name, n] => match n.parse::<usize>() {
+            Ok(n) if n >= 1 => teleport_named(name, n, player, world),
+            _ => tp_usage(),
+        },
+        _ => tp_usage(),
+    }
+}
+
+fn tp_usage() -> Vec<Line> {
+    rejected(vec!["usage: /tp <x> <y> <z>  or  /tp <name> [n]".to_string()])
+}
+
+fn teleport_coords(args: &[&str], player: &mut Player, world: &mut World) -> Vec<Line> {
     if args.len() != 3 {
         return rejected(vec!["usage: /tp <x> <y> <z>".to_string()]);
     }
     let parsed: Result<Vec<f64>, _> = args.iter().map(|a| a.parse::<f64>()).collect();
     match parsed.as_deref() {
         Ok([x, y, z]) if x.is_finite() && y.is_finite() && z.is_finite() => {
-            let target = DVec3::new(*x, *y, *z)
-                .clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
-            world.prepare_around(target);
-            player.position = target;
-            // Stand up along the local gravity at once (no slow roll after a jump across the
-            // universe); in weightlessness keep the current frame.
-            // The body frame follows the last applied pull: make it the destination's at once.
-            let pull = world.gravity_at(target);
-            player.gravity = pull.accel;
-            if let Some(up) = pull.up(0.02 * crate::player::STANDARD_GRAVITY) {
-                player.snap_up(up);
-            }
-            // Cancel any accumulated fall so the player doesn't rocket down on arrival.
-            player.cancel_fall();
-            shown(vec![format!("teleported to {}", fmt_pos(player.position))])
+            place(DVec3::new(*x, *y, *z), player, world)
         }
         _ => rejected(vec!["/tp: x, y and z must be numbers".to_string()]),
+    }
+}
+
+/// Land on the `n`th body of a kind (1-based, catalog order). A unique prefix of the kind name
+/// is enough. Worlds without a cosmos are left untouched.
+fn teleport_named(name: &str, n: usize, player: &mut Player, world: &mut World) -> Vec<Line> {
+    let Some(cosmos) = world.terrain().cosmos() else {
+        return no_cosmos();
+    };
+    let kind = match resolve_kind(name) {
+        Ok(kind) => kind,
+        Err(lines) => return lines,
+    };
+    match cosmos.bodies().iter().filter(|b| b.kind == kind).nth(n - 1) {
+        Some(body) => place(landing_vec(body), player, world),
+        None => rejected(vec![format!("no {} {n}", kind.name())]),
+    }
+}
+
+/// Stand the player at `target` the way coordinate `/tp` does.
+fn place(target: DVec3, player: &mut Player, world: &mut World) -> Vec<Line> {
+    let target = target.clamp(DVec3::splat(-WORLD_BORDER), DVec3::splat(WORLD_BORDER));
+    world.prepare_around(target);
+    player.position = target;
+    // Stand up along the local gravity at once (no slow roll after a jump across the
+    // universe); in weightlessness keep the current frame.
+    // The body frame follows the last applied pull: make it the destination's at once.
+    let pull = world.gravity_at(target);
+    player.gravity = pull.accel;
+    if let Some(up) = pull.up(0.02 * crate::player::STANDARD_GRAVITY) {
+        player.snap_up(up);
+    }
+    // Cancel any accumulated fall so the player doesn't rocket down on arrival.
+    player.cancel_fall();
+    shown(vec![format!("teleported to {}", fmt_pos(player.position))])
+}
+
+fn no_cosmos() -> Vec<Line> {
+    rejected(vec!["this world has no cosmos".to_string()])
+}
+
+/// `/noclip` — from walking or ordinary flight into noclip flight, and from noclip back to walking.
+fn noclip(player: &mut Player) -> Vec<Line> {
+    player.toggle_noclip();
+    shown(vec![format!("noclip {}", if player.noclip() { "on" } else { "off" })])
+}
+
+/// `/bodies` — every cosmos body, nearest first. The number is 1-based within the kind, in
+/// catalog order. The `/tp` lands 2000 blocks above the +Y datum.
+fn bodies(player: &Player, world: &World) -> Vec<Line> {
+    let Some(cosmos) = world.terrain().cosmos() else {
+        return no_cosmos();
+    };
+    let origin = player.position;
+    let mut order: Vec<usize> = (0..cosmos.bodies().len()).collect();
+    order.sort_by(|&i, &j| {
+        let di = (cosmos.bodies()[i].centre_f() - origin).length_squared();
+        let dj = (cosmos.bodies()[j].centre_f() - origin).length_squared();
+        di.total_cmp(&dj).then(i.cmp(&j))
+    });
+    let lines = order
+        .into_iter()
+        .map(|i| {
+            let body = &cosmos.bodies()[i];
+            let n = kind_number(cosmos, body);
+            let dist = (body.centre_f() - origin).length();
+            let at = landing(body);
+            format!(
+                "{} {n}  {} away  {}  /tp {} {} {}",
+                body.kind.name(),
+                fmt_dist(dist),
+                fmt_size(body),
+                at[0],
+                at[1],
+                at[2],
+            )
+        })
+        .collect();
+    shown(lines)
+}
+
+/// 1-based index of `body` among bodies of its kind, in catalog order.
+fn kind_number(cosmos: &Cosmos, body: &Body) -> usize {
+    cosmos.bodies().iter().filter(|b| b.kind == body.kind).position(|b| b.id == body.id).unwrap() + 1
+}
+
+fn resolve_kind(prefix: &str) -> Result<Kind, Vec<Line>> {
+    let key = prefix.to_ascii_lowercase();
+    let mut hit = None;
+    for kind in [Kind::Home, Kind::Twin, Kind::Verdant, Kind::Hollow, Kind::Ember, Kind::Moon] {
+        if kind.name().starts_with(&key) {
+            if hit.is_some() {
+                return Err(rejected(vec![format!("'{prefix}' matches more than one kind")]));
+            }
+            hit = Some(kind);
+        }
+    }
+    hit.ok_or_else(|| rejected(vec![format!("unknown body '{prefix}'")]))
+}
+
+/// Cube half-edge, ball radius, or shell outer radius, then 2000 blocks of clearance on +Y.
+fn landing(body: &Body) -> [i64; 3] {
+    let top = match body.shape {
+        Shape::Cube { half } => half,
+        Shape::Ball { r } => r,
+        Shape::Shell { outer, .. } => outer,
+    };
+    [body.centre[0], body.centre[1] + top + 2_000, body.centre[2]]
+}
+
+fn landing_vec(body: &Body) -> DVec3 {
+    let at = landing(body);
+    DVec3::new(at[0] as f64, at[1] as f64, at[2] as f64)
+}
+
+fn fmt_size(body: &Body) -> String {
+    match body.shape {
+        Shape::Cube { half } => format!("half {half}"),
+        Shape::Ball { r } => format!("radius {r}"),
+        Shape::Shell { outer, .. } => format!("radius {outer}"),
+    }
+}
+
+/// Rounded distance with a `k` or `M` suffix.
+fn fmt_dist(d: f64) -> String {
+    let d = d.abs();
+    if d >= 999_500.0 {
+        format!("{}M", (d / 1_000_000.0).round() as i64)
+    } else if d >= 999.5 {
+        format!("{}k", (d / 1_000.0).round() as i64)
+    } else {
+        format!("{}", d.round() as i64)
     }
 }
 
@@ -453,7 +593,9 @@ mod tests {
         assert_eq!(
             joined(&help()),
             "commands (a leading '/' is optional):\n  \
-             /tp <x> <y> <z>       teleport to coordinates\n  \
+             /tp <x y z|name>      teleport to coordinates or a body\n  \
+             /bodies               list the worlds, nearest first\n  \
+             /noclip               toggle flight through geometry\n  \
              /pos                  show current coordinates\n  \
              /inspect [x y z]      describe a block's elements & properties\n  \
              /reactions            show pending reaction events\n  \
@@ -762,5 +904,94 @@ mod tests {
         let mut sky = Sky::new();
         time(&["length", "1"], &mut sky); // below the 10s floor
         assert_eq!(sky.day_length.0, 10.0);
+    }
+
+    #[test]
+    fn noclip_toggles_walk_to_noclip_and_back() {
+        let (mut p, mut w) = (player(), world());
+        assert!(!p.flying());
+        let on = run("noclip", &mut p, &mut w);
+        assert!(p.noclip());
+        assert!(on[0].text().contains("on"));
+        // From ordinary flight, too.
+        p.toggle_noclip();
+        assert!(!p.flying());
+        p.set_flying(true);
+        run("noclip", &mut p, &mut w);
+        assert!(p.noclip());
+        let off = run("noclip", &mut p, &mut w);
+        assert!(!p.flying());
+        assert!(!p.noclip());
+        assert!(off[0].text().contains("off"));
+    }
+
+    #[test]
+    fn a_world_without_a_cosmos_has_no_bodies_to_find() {
+        let (mut p, mut w) = (player(), world());
+        let at = p.position;
+        let listed = joined(&run("bodies", &mut p, &mut w));
+        assert!(listed.contains("no cosmos"), "{listed}");
+        let tp = run("tp verdant", &mut p, &mut w);
+        assert!(joined(&tp).contains("no cosmos"), "{}", joined(&tp));
+        assert_eq!(tp[0].spans().next().unwrap().role, Role::Danger);
+        assert_eq!(p.position, at);
+        assert!(w.in_air(DVec3::splat(1.0e8)));
+    }
+
+    fn diffusion() -> World {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false)
+    }
+
+    #[test]
+    fn bodies_lists_home_first_and_named_tp_lands_on_it() {
+        use crate::world::terrain::cosmos::Kind;
+        let (mut p, mut w) = (player(), diffusion());
+        p.position = DVec3::new(0.5, 80.0, 0.5);
+        let cosmos = w.terrain().cosmos().expect("diffusion has a cosmos");
+        let home = cosmos.bodies().iter().copied().find(|b| b.kind == Kind::Home).unwrap();
+        let verdant = cosmos.bodies().iter().copied().find(|b| b.kind == Kind::Verdant).unwrap();
+        let moons: Vec<_> = cosmos.bodies().iter().copied().filter(|b| b.kind == Kind::Moon).collect();
+        assert!(moons.len() >= 2, "catalog order has a second moon");
+
+        let lines = run("bodies", &mut p, &mut w);
+        let first = lines[0].text();
+        assert!(first.starts_with("home 1"), "{first}");
+        let home_at = landing(&home);
+        assert!(
+            first.contains(&format!("/tp {} {} {}", home_at[0], home_at[1], home_at[2])),
+            "{first}"
+        );
+        let text = joined(&lines);
+        assert!(text.contains("verdant 1"), "{text}");
+        assert!(text.contains("moon 2"), "{text}");
+
+        run("tp verdant", &mut p, &mut w);
+        let want = landing_vec(&verdant);
+        assert_eq!(p.position, want);
+        assert!((p.position - verdant.centre_f()).length() <= verdant.reach());
+        let pull = w.gravity_at(p.position).accel;
+        let toward = (verdant.centre_f() - p.position).normalize();
+        assert!(pull.normalize().dot(toward) > 0.99, "standing in Verdance's pull: {pull:?}");
+        assert!(p.up().dot(-pull.normalize()) > 0.99, "up faces away from the pull");
+
+        p.position = DVec3::ZERO;
+        run("tp ver", &mut p, &mut w);
+        assert_eq!(p.position, want, "a unique prefix selects the same body");
+
+        run("tp moon 2", &mut p, &mut w);
+        let moon = landing_vec(&moons[1]);
+        assert_eq!(p.position, moon);
+        assert_ne!(moon, landing_vec(&moons[0]));
+
+        let at = p.position;
+        let bad = run("tp nope", &mut p, &mut w);
+        assert_eq!(p.position, at);
+        assert_eq!(bad[0].spans().next().unwrap().role, Role::Danger);
+        assert!(bad[0].text().contains("nope"), "{}", bad[0].text());
+        let ambiguous = run("tp h", &mut p, &mut w);
+        assert_eq!(p.position, at);
+        assert!(ambiguous[0].text().contains("more than one"), "{}", ambiguous[0].text());
     }
 }

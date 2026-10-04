@@ -22,8 +22,6 @@ const FAR: f64 = 60_000.0;
 const REBUILD_FRAC: f64 = 0.125;
 /// The fade occupies this tail of the range.
 const FADE_TAIL: f64 = 0.15;
-/// Above this altitude over a body (or with no body) the camera is in space.
-const SPACE_ALTITUDE: f64 = 20_000.0;
 
 /// Half-extent, in blocks, of a chunk view of `view_chunks` rings. One extra
 /// chunk covers the eye's place inside its own chunk and the far block of the ring.
@@ -288,11 +286,9 @@ impl DistantRocks {
     }
 }
 
+/// The eye is in space when it is outside every body's air.
 fn in_space(cosmos: &Cosmos, eye: DVec3) -> bool {
-    match cosmos.body_at(eye) {
-        Some(body) => body.altitude(eye) > SPACE_ALTITUDE,
-        None => true,
-    }
+    !cosmos.in_air(eye)
 }
 
 /// Chebyshev: the chunk view is a cube about the eye.
@@ -376,7 +372,7 @@ fn rotation(seed: u32) -> Mat3 {
 mod tests {
     use super::*;
     use crate::alloc_count;
-    use crate::world::terrain::cosmos::{Cosmos, Rock};
+    use crate::world::terrain::cosmos::{AIR_TOP, Cosmos, Rock};
     use std::time::Instant;
 
     fn pos(rock: &Rock) -> DVec3 {
@@ -551,13 +547,15 @@ mod tests {
     fn atmosphere_lists_nothing_and_does_not_scan() {
         let cosmos = Cosmos::new(42, 1.0);
         let spawn = DVec3::new(0.5, 80.0, 0.5);
-        assert!(cosmos.home().altitude(spawn) < SPACE_ALTITUDE);
+        assert!(cosmos.home().altitude(spawn) < AIR_TOP);
+        assert!(cosmos.in_air(spawn));
         let mut rocks = DistantRocks::default();
         assert!(rocks.update(&cosmos, &|| None, spawn, chunk_view_blocks(6)).is_empty());
         assert_eq!(rocks.scans, 0);
         let high = DVec3::new(0.5, 30_000.0, 0.5);
         assert!(cosmos.body_at(high).is_some());
-        assert!(cosmos.home().altitude(high) > SPACE_ALTITUDE);
+        assert!(cosmos.home().altitude(high) > AIR_TOP);
+        assert!(!cosmos.in_air(high));
         let _ = rocks.update(&cosmos, &|| None, high, chunk_view_blocks(6));
         assert_eq!(rocks.scans, 3, "above the atmosphere the field is drawn");
     }
