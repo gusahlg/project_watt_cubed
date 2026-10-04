@@ -567,7 +567,7 @@ fn classify_matches_what_generation_stores() {
         ChunkCoord::new(0, 1_000, 0),
         ChunkCoord::new(0, (cube::TREE_CLEAR + 15) / 16, 0),
         ChunkCoord::new(0, (-1_000i32).div_euclid(16), 0),
-        ChunkCoord::new(0, cosmos::HOME_CENTRE[1].div_euclid(16) as i32, 0),
+        ChunkCoord::new(0, t.cosmos.home().centre[1].div_euclid(16) as i32, 0),
     ];
     let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).unwrap();
     let (mx, my, mz) = chunk_of(moon.centre);
@@ -2263,7 +2263,8 @@ fn home_spawn_stands_on_the_plus_y_chart() {
 fn a_datum_lifts_the_home_grid_and_leaves_its_painting() {
     use crate::space::datum::DatumField;
     let (_reg, mut t) = make(42);
-    let atlas = t.storage.home_atlas().expect("charted").clone();
+    let mut atlas = t.storage.home_atlas().expect("charted").clone();
+    atlas.datum = None;
     let b = atlas.bands[0];
     let half = b.n / 2;
     let patch = Patch::Shell { band: 0, face: Face::PosY };
@@ -2317,4 +2318,23 @@ fn home_chart_chunk_cost() {
         let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
         println!("home chart {face:?} chunk ({cx},{cy},{cz}) {us:.1} µs");
     }
+}
+
+/// The start world relaxes from its cube of bulk matter: physics rounds it (Π_g of the rock mix is
+/// well above the yield threshold) and its datum carries highlands toward the old cube corners.
+#[test]
+fn the_start_world_is_relaxed_and_its_grid_fits_the_shape() {
+    let (_reg, t) = make(42);
+    let atlas = t.storage.home_atlas().expect("charted");
+    let datum = atlas.datum.as_ref().expect("the start world has a relaxed datum");
+    let (lo, hi) = datum.range();
+    println!("home datum relief {lo:.0} .. {hi:.0} blocks about r {}", atlas.radius);
+    // Corners high, face centres low: a cube that rounded, not a ball.
+    assert!(hi > 2e5 && hi < 3e6, "highlands {hi}");
+    assert!(lo < -5e4 && lo > -1.5e6, "lowlands {lo}");
+    let g = datum.g;
+    let centre = datum.offset(2, 0.0, 0.0);
+    let corner = datum.offset(2, 1.0, 1.0);
+    assert!(corner > centre + 3e5, "corner {corner} over centre {centre}");
+    let _ = g;
 }

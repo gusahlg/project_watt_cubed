@@ -15,8 +15,9 @@ use crate::space::datum::DatumField;
 
 /// Degree of the expansion (a relaxed body's relief is dominated by degrees 4–8).
 pub const L_MAX: usize = 24;
-/// Quadrature cells per face edge when projecting a datum.
-const QUADRATURE: usize = 64;
+/// Quadrature cells per face edge when projecting a datum (a datum has 33 samples per edge; 128
+/// cells around a great circle resolve degree 24 comfortably).
+const QUADRATURE: usize = 32;
 
 /// The relief layer of one body.
 #[derive(Clone, Debug)]

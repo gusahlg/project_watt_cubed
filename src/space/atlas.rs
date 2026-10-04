@@ -342,20 +342,30 @@ impl Atlas {
         if below <= self.radius as f64 { below } else { rho - off }
     }
 
+    /// The radius `p` would have on the unlifted (spherical) grid: its distance from the centre
+    /// with the datum lift of its column taken out. Band tests and "how far above the top" read
+    /// this.
+    pub fn unlifted_radius(&self, p: DVec3) -> f64 {
+        let rel = p - self.centre;
+        match self.bands.first() {
+            Some(b0) if self.datum.is_some() && !self.inward => {
+                let face = Face::from_dominant(rel);
+                let (tu, nn, tv) = basis(face);
+                let (xi, eta) = Map::Equiangular.inverse(DVec3::new(rel.dot(tu), rel.dot(nn), rel.dot(tv)));
+                let step = 2.0 / b0.n as f64;
+                self.unlift(face, (xi + 1.0) / step, (eta + 1.0) / step, rel.length())
+            }
+            _ => rel.length(),
+        }
+    }
+
     /// The patch and continuous local coordinates of a physical point, if the atlas covers it.
     pub fn find(&self, p: DVec3) -> Option<(Patch, DVec3)> {
         let rel = p - self.centre;
         let face = Face::from_dominant(rel);
         let (tu, nn, tv) = basis(face);
         let local = DVec3::new(rel.dot(tu), rel.dot(nn), rel.dot(tv));
-        let r = match self.bands.first() {
-            Some(b0) if self.datum.is_some() && !self.inward => {
-                let (xi, eta) = Map::Equiangular.inverse(local);
-                let step = 2.0 / b0.n as f64;
-                self.unlift(face, (xi + 1.0) / step, (eta + 1.0) / step, rel.length())
-            }
-            _ => rel.length(),
-        };
+        let r = self.unlifted_radius(p);
         if self.bands.first().is_some_and(|b| r >= b.r_hi as f64) {
             return None;
         }

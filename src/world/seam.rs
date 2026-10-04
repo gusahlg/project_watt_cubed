@@ -408,12 +408,14 @@ impl Seams {
             let rel = p - a.centre;
             let r = rel.length();
             let b = a.bands[0];
-            // How far above the top (outward charts: beyond r_hi; inward ones: inside r_lo).
-            let (top, above) = if a.inward { (b.r_lo as f64 + 0.5, b.r_lo as f64 + 0.5 - r) } else { (b.r_hi as f64 - 0.5, r - (b.r_hi as f64 - 0.5)) };
+            // How far above the top (outward charts: beyond r_hi; inward ones: inside r_lo), on the
+            // unlifted grid; the top's physical point along `p`'s ray carries its column's lift.
+            let ru = a.unlifted_radius(p);
+            let (top, above) = if a.inward { (b.r_lo as f64 + 0.5, b.r_lo as f64 + 0.5 - ru) } else { (b.r_hi as f64 - 0.5, ru - (b.r_hi as f64 - 0.5)) };
             if !(above > 0.0 && above < reach) || r == 0.0 {
                 continue;
             }
-            if let Some((patch, l)) = a.find(a.centre + rel * (top / r)) {
+            if let Some((patch, l)) = a.find(a.centre + rel * ((top + (r - ru)) / r)) {
                 let (o, _) = a.storage_box(patch);
                 return Some(glam::DVec3::new(l.x + o[0] as f64, l.y + o[1] as f64 + above, l.z + o[2] as f64));
             }

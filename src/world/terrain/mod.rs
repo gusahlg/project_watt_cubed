@@ -378,6 +378,21 @@ fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::spac
     Some(crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() })
 }
 
+/// The start world's relief layer for gravity, computed once per process for each distinct datum
+/// (worlds of one palette share it; the projection is the costly part of creating a world).
+fn home_relief(centre: glam::DVec3, density: f64, datum: &crate::space::datum::DatumField) -> Arc<crate::gravity::relief::Relief> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<(u64, Arc<crate::gravity::relief::Relief>)>> = Mutex::new(Vec::new());
+    let key = datum.offsets.iter().fold(centre.y.to_bits() ^ density.to_bits(), |h, o| (h ^ o.to_bits() as u64).wrapping_mul(0x100_0000_01B3));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, layer)) = cache.iter().find(|(k, _)| *k == key) {
+        return Arc::clone(layer);
+    }
+    let layer = Arc::new(crate::gravity::relief::Relief::new(centre, cosmos::HOME_RADIUS as f64, density, datum));
+    cache.push((key, Arc::clone(&layer)));
+    layer
+}
+
 /// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` is
 /// `h_base + la` (the atlas embedding lifts band 0 onto the fitted datum, so storage altitude is
 /// altitude above the datum).
@@ -472,10 +487,11 @@ impl Terrain {
         // chart grid to the shape, and its relief joins gravity.
         let home_datum = home_shape(registry, &bulk);
         if let Some(datum) = &home_datum {
+            cosmos.settle_home(datum.offset(2, 0.0, 0.0).round() as i64);
             let home = cosmos.home();
-            let layer = crate::gravity::relief::Relief::new(home.centre_f(), cosmos::HOME_RADIUS as f64, home.density, datum);
+            let layer = home_relief(home.centre_f(), home.density, datum);
             let id = home.id;
-            cosmos.set_relief(id, Arc::new(layer));
+            cosmos.set_relief(id, Arc::new(datum.clone()), layer);
         }
         let cosmos = Arc::new(cosmos);
         let relief = cfg.relief as f32 / 100.0;

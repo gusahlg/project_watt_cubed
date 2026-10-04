@@ -66,6 +66,15 @@ impl DatumField {
         a * (1.0 - fv) + b * fv
     }
 
+    /// Offset (blocks) along unit direction `d` from the body's centre.
+    pub fn at(&self, d: DVec3) -> f64 {
+        let face = crate::coord::Face::from_dominant(d);
+        let (tu, nn, tv) = basis(face);
+        let (xi, eta) = Map::Equiangular.inverse(DVec3::new(d.dot(tu), d.dot(nn), d.dot(tv)));
+        let f = FACES.iter().position(|&g| g == face).expect("a face");
+        self.offset(f, xi, eta)
+    }
+
     /// Smallest and largest offset.
     pub fn range(&self) -> (f64, f64) {
         let lo = self.offsets.iter().copied().fold(f32::INFINITY, f32::min) as f64;
