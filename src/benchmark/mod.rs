@@ -131,7 +131,17 @@ impl Benchmark {
     /// Parse the environment. Invalid optional values warn and fall back; a
     /// present `WATT_BENCH` always yields a finite, bounded run.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("WATT_BENCH").ok()?;
+        Self::from_vars(&|name| std::env::var_os(name))
+    }
+
+    /// [`from_env`](Self::from_env) over any variable source. Tests pass a map rather than
+    /// mutating the process environment, which races C `getenv` callers on other threads.
+    fn from_vars(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<Self> {
+        let var = |name: &str| get(name).and_then(|v| v.into_string().ok());
+        let seconds = |name: &str, default: f64, min: f64, max: f64| {
+            var(name).map(|raw| parse_seconds(name, &raw, default, min, max)).unwrap_or(default)
+        };
+        let raw = var("WATT_BENCH")?;
         let duration = parse_seconds(
             "WATT_BENCH",
             &raw,
@@ -139,41 +149,40 @@ impl Benchmark {
             0.05,
             MAX_DURATION_SECS,
         );
-        let min_warmup = env_seconds("WATT_BENCH_WARMUP", DEFAULT_WARMUP_SECS, 0.0, 300.0);
-        let ready_timeout = env_seconds(
+        let min_warmup = seconds("WATT_BENCH_WARMUP", DEFAULT_WARMUP_SECS, 0.0, 300.0);
+        let ready_timeout = seconds(
             "WATT_BENCH_READY_TIMEOUT",
             DEFAULT_READY_TIMEOUT_SECS,
             1.0,
             600.0,
         );
-        let pos = std::env::var("WATT_BENCH_POS").ok().and_then(|raw| {
+        let pos = var("WATT_BENCH_POS").and_then(|raw| {
             parse_position(&raw).or_else(|| {
                 eprintln!("WATT_BENCH_POS={raw:?} is invalid; using the spawn position");
                 None
             })
         });
-        let look = std::env::var("WATT_BENCH_LOOK").ok().and_then(|raw| {
+        let look = var("WATT_BENCH_LOOK").and_then(|raw| {
             let (y, p) = raw.split_once(',')?;
             Some((y.trim().parse::<f32>().ok()?.to_radians(), p.trim().parse::<f32>().ok()?.to_radians()))
         });
-        let day = std::env::var("WATT_BENCH_TIME").ok().and_then(|raw| {
+        let day = var("WATT_BENCH_TIME").and_then(|raw| {
             let day = raw.trim().parse::<f64>().ok().filter(|d| (0.0..=1.0).contains(d));
             if day.is_none() {
                 eprintln!("WATT_BENCH_TIME={raw:?} is not a day fraction in 0..1; keeping the clock");
             }
             day
         });
-        let move_mps = env_seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
-        let yaw_rate = env_seconds("WATT_BENCH_YAW", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0);
-        let screenshot = parse_screenshot(std::env::var_os("WATT_BENCH_SCREENSHOT"));
-        let output = std::env::var_os("WATT_BENCH_OUTPUT")
+        let move_mps = seconds("WATT_BENCH_MOVE", 0.0, 0.0, 1000.0);
+        let yaw_rate = seconds("WATT_BENCH_YAW", DEFAULT_YAW_RATE_RAD_S, 0.0, 1000.0);
+        let screenshot = parse_screenshot(get("WATT_BENCH_SCREENSHOT"));
+        let output = get("WATT_BENCH_OUTPUT")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
-        let tag = std::env::var("WATT_BENCH_TAG")
-            .ok()
+        let tag = var("WATT_BENCH_TAG")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let visuals_raw = std::env::var("WATT_BENCH_VISUALS").ok();
+        let visuals_raw = var("WATT_BENCH_VISUALS");
         let reserve = ((duration.ceil() as usize).saturating_mul(25_000)).min(MAX_SAMPLE_RESERVE);
         let now = Instant::now();
         Some(Self {
@@ -1052,12 +1061,6 @@ fn parse_seconds(name: &str, raw: &str, default: f64, min: f64, max: f64) -> f64
     }
 }
 
-fn env_seconds(name: &str, default: f64, min: f64, max: f64) -> f64 {
-    std::env::var(name)
-        .map(|raw| parse_seconds(name, &raw, default, min, max))
-        .unwrap_or(default)
-}
-
 fn unix_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1362,60 +1365,42 @@ mod tests {
 
     #[test]
     fn from_env_parses_screenshot_yaw_and_move() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let keys = [
-            "WATT_BENCH",
-            "WATT_BENCH_SCREENSHOT",
-            "WATT_BENCH_YAW",
-            "WATT_BENCH_MOVE",
-        ];
-        let previous: Vec<_> = keys
-            .iter()
-            .map(|k| (*k, std::env::var_os(k)))
-            .collect();
-        unsafe {
-            std::env::set_var("WATT_BENCH", "1");
-            std::env::remove_var("WATT_BENCH_SCREENSHOT");
-            std::env::remove_var("WATT_BENCH_YAW");
-            std::env::remove_var("WATT_BENCH_MOVE");
-        }
-        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        // A map, not the process environment: `set_var` while other test threads run races
+        // C `getenv` callers (the Vulkan loader, time-zone lookups) into a segfault.
+        let parse = |vars: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, std::ffi::OsString> =
+                vars.iter().map(|(k, v)| (k.to_string(), std::ffi::OsString::from(v))).collect();
+            Benchmark::from_vars(&|name| map.get(name).cloned()).expect("WATT_BENCH set")
+        };
+        let bench = parse(&[("WATT_BENCH", "1")]);
         assert!(bench.screenshot_path().is_none());
         assert!((bench.yaw_rate() - DEFAULT_YAW_RATE_RAD_S).abs() < 1e-12);
         assert_eq!(bench.move_mps(), 0.0);
 
-        unsafe {
-            std::env::set_var("WATT_BENCH_SCREENSHOT", "captures/final.png");
-            std::env::set_var("WATT_BENCH_YAW", "0");
-            std::env::set_var("WATT_BENCH_MOVE", "40");
-        }
-        let bench = Benchmark::from_env().expect("WATT_BENCH set");
-        assert_eq!(
-            bench.screenshot_path(),
-            Some(Path::new("captures/final.png"))
-        );
+        let bench = parse(&[
+            ("WATT_BENCH", "1"),
+            ("WATT_BENCH_SCREENSHOT", "captures/final.png"),
+            ("WATT_BENCH_YAW", "0"),
+            ("WATT_BENCH_MOVE", "40"),
+        ]);
+        assert_eq!(bench.screenshot_path(), Some(Path::new("captures/final.png")));
         assert_eq!(bench.yaw_rate(), 0.0);
         assert_eq!(bench.move_mps(), 40.0);
 
-        unsafe {
-            std::env::set_var("WATT_BENCH_SCREENSHOT", "");
-            std::env::set_var("WATT_BENCH_YAW", "not-a-number");
-            std::env::set_var("WATT_BENCH_MOVE", "-5");
-        }
-        let bench = Benchmark::from_env().expect("WATT_BENCH set");
+        let bench = parse(&[
+            ("WATT_BENCH", "1"),
+            ("WATT_BENCH_SCREENSHOT", ""),
+            ("WATT_BENCH_YAW", "not-a-number"),
+            ("WATT_BENCH_MOVE", "-5"),
+        ]);
         assert!(bench.screenshot_path().is_none());
         assert!((bench.yaw_rate() - DEFAULT_YAW_RATE_RAD_S).abs() < 1e-12);
         assert_eq!(bench.move_mps(), 0.0);
 
-        for (k, v) in previous {
-            unsafe {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
+        let bench = parse(&[("WATT_BENCH", "1"), ("WATT_BENCH_TIME", "0.667"), ("WATT_BENCH_LOOK", "90,-10")]);
+        assert_eq!(bench.day(), Some(0.667));
+        assert!(bench.look().is_some());
+        assert_eq!(parse(&[("WATT_BENCH", "1"), ("WATT_BENCH_TIME", "2")]).day(), None);
+        assert!(Benchmark::from_vars(&|_| None).is_none());
     }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
