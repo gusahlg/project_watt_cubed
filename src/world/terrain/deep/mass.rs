@@ -248,6 +248,13 @@ pub(in super::super) fn apply(centre: [i64; 3], half: i64, seed: u32, density: f
         v.primitive(&box_prim(centre, inner, density * phi_d));
         let thick = (DEEP_HI - super::super::cube::CRUST) as f64;
         v.error(2.0 * std::f64::consts::PI * density * phi_d * thick * 0.35);
+        // Floor lights replace void this shell already removed. Bounded by one bulk-density cell
+        // per light. Hall lamps replace marble inside that same air volume, so they stay in the
+        // 0.35 scatter and do not add a term.
+        let phi_l = super::cavern::light_phi(scale);
+        if phi_l > 0.0 {
+            v.error(2.0 * std::f64::consts::PI * density * phi_l * thick);
+        }
     }
     if phi_u > 0.0 && half > i64::from(UNDER_HI) {
         let outer = (half - i64::from(DEEP_HI)) as f64;
@@ -256,6 +263,10 @@ pub(in super::super) fn apply(centre: [i64; 3], half: i64, seed: u32, density: f
         v.primitive(&box_prim(centre, inner, density * phi_u));
         let thick = (UNDER_HI - DEEP_HI) as f64;
         v.error(2.0 * std::f64::consts::PI * density * phi_u * thick * 0.35);
+        let phi_l = super::chamber::light_phi(scale);
+        if phi_l > 0.0 {
+            v.error(2.0 * std::f64::consts::PI * density * phi_l * thick);
+        }
     }
     if half > HEART {
         v.primitive(&box_prim(centre, HEART as f64, -density));

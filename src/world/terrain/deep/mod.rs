@@ -8,6 +8,7 @@
 
 mod cavern;
 mod chamber;
+mod glow;
 mod hall;
 mod mass;
 mod mushroom;
@@ -311,10 +312,212 @@ pub(super) fn hash_site(seed: u32, idx: [i64; 3]) -> Option<u32> {
     Some(hash3(seed, idx_i32(idx[0])?, idx_i32(idx[1])?, idx_i32(idx[2])?))
 }
 
+/// Palette roles that carry block light. Crystal is clear and does not emit.
+#[cfg(test)]
+pub(super) fn emits_light(m: &Materials, id: BlockId) -> bool {
+    id == m.lamp || id == m.glowcap || id == m.glowshroom || id == m.magma || id == m.star || id == m.core
+}
+
+/// Emissive cells, queried as "any within Euclidean 12".
+///
+/// A sparse dressing stays in buckets of width 12. A lake or a crystal lining is a solid region:
+/// those cells go into a bitset, and the query walks shells outward so a neighbour hits immediately.
+#[cfg(test)]
+struct NearLights {
+    buckets: std::collections::HashMap<[i64; 3], Vec<[i64; 3]>>,
+    dense: Option<LightBits>,
+}
+
+#[cfg(test)]
+struct LightBits {
+    origin: [i64; 3],
+    dim: [i64; 3],
+    bits: Vec<u64>,
+}
+
+#[cfg(test)]
+impl LightBits {
+    fn build(lights: &[[i64; 3]]) -> Option<Self> {
+        let mut lo = [i64::MAX; 3];
+        let mut hi = [i64::MIN; 3];
+        for p in lights {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        let dim = std::array::from_fn(|a| hi[a] - lo[a] + 1);
+        if dim.iter().any(|&d| d <= 0 || d > 900) {
+            return None;
+        }
+        let vol = dim[0].checked_mul(dim[1])?.checked_mul(dim[2])?;
+        if vol > 300_000_000 {
+            return None;
+        }
+        let mut bits = vec![0u64; (vol as usize + 63) / 64];
+        let mut out = Self { origin: lo, dim, bits: Vec::new() };
+        for p in lights {
+            if let Some(i) = out.index(*p) {
+                bits[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        out.bits = bits;
+        Some(out)
+    }
+
+    fn index(&self, p: [i64; 3]) -> Option<usize> {
+        let x = p[0] - self.origin[0];
+        let y = p[1] - self.origin[1];
+        let z = p[2] - self.origin[2];
+        if x < 0 || y < 0 || z < 0 || x >= self.dim[0] || y >= self.dim[1] || z >= self.dim[2] {
+            return None;
+        }
+        Some((x + self.dim[0] * (y + self.dim[1] * z)) as usize)
+    }
+
+    fn has(&self, p: [i64; 3]) -> bool {
+        let Some(i) = self.index(p) else { return false };
+        (self.bits[i >> 6] >> (i & 63)) & 1 == 1
+    }
+
+    fn covers(&self, p: [i64; 3]) -> bool {
+        if self.has(p) {
+            return true;
+        }
+        for rad in 1..=12 {
+            let r2 = rad * rad;
+            let prev = (rad - 1) * (rad - 1);
+            for dz in -rad..=rad {
+                for dy in -rad..=rad {
+                    let base = dz * dz + dy * dy;
+                    if base > r2 {
+                        continue;
+                    }
+                    let max_dx = isqrt_144(r2 - base);
+                    let min_dx = if base > prev { 0 } else { isqrt_144(prev - base) + 1 };
+                    if min_dx > max_dx {
+                        continue;
+                    }
+                    for sign in [-1i64, 1] {
+                        for adx in min_dx..=max_dx {
+                            let dx = if adx == 0 { 0 } else { sign * adx };
+                            if adx == 0 && sign == 1 {
+                                continue;
+                            }
+                            if self.has([p[0] + dx, p[1] + dy, p[2] + dz]) {
+                                return true;
+                            }
+                            if adx == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// `floor(sqrt(n))` for `n` in `0..=144`.
+#[cfg(test)]
+fn isqrt_144(n: i64) -> i64 {
+    let mut x = 0i64;
+    while x < 12 && (x + 1) * (x + 1) <= n {
+        x += 1;
+    }
+    x
+}
+
+#[cfg(test)]
+impl NearLights {
+    const B: i64 = 12;
+
+    fn new(lights: Vec<[i64; 3]>) -> Self {
+        // Lakes and linings are dense. A few thousand cap-glows spread over a cavern are not:
+        // a bitset query then walks the whole ball for every dark floor cell.
+        if lights.len() > 16_384
+            && let Some(dense) = LightBits::build(&lights)
+        {
+            return Self { buckets: std::collections::HashMap::new(), dense: Some(dense) };
+        }
+        let mut buckets: std::collections::HashMap<[i64; 3], Vec<[i64; 3]>> = std::collections::HashMap::new();
+        for p in lights {
+            buckets.entry(p.map(|v| v.div_euclid(Self::B))).or_default().push(p);
+        }
+        Self { buckets, dense: None }
+    }
+
+    /// Euclidean distance ≤ 12. Bucket width equals that radius, so a hit is in the 3³ neighbourhood.
+    fn covers(&self, p: [i64; 3]) -> bool {
+        if let Some(dense) = &self.dense {
+            return dense.covers(p);
+        }
+        let q = p.map(|v| v.div_euclid(Self::B));
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let Some(list) = self.buckets.get(&[q[0] + dx, q[1] + dy, q[2] + dz]) else { continue };
+                    for &l in list {
+                        if dist2(l, p) <= 12 * 12 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn count(&self, floors: &[[i64; 3]]) -> u32 {
+        floors.iter().filter(|&&p| self.covers(p)).count() as u32
+    }
+}
+
+/// One surveyed hollow: how many floor cells sit within 12 of an emissive block.
+#[cfg(test)]
+pub(super) struct Cover {
+    pub kind: u32,
+    pub r: i64,
+    pub center: [i64; 3],
+    pub up_axis: usize,
+    pub up_sign: i32,
+    pub floor: u32,
+    pub near: u32,
+    /// Column stride (1 = every column).
+    pub step: i64,
+}
+
 #[cfg(test)]
 impl Deep {
     pub(super) fn locate_cavern(&self, body: &Body) -> Option<[i64; 3]> {
         cavern::locate(&self.ctx(body))
+    }
+
+    pub(super) fn survey_caverns(&self, body: &Body, n: usize) -> Vec<Cover> {
+        cavern::survey(&self.ctx(body), n)
+    }
+
+    pub(super) fn survey_cavern_at(&self, body: &Body, rel: [i64; 3]) -> Option<Cover> {
+        cavern::survey_at(&self.ctx(body), rel)
+    }
+
+    pub(super) fn survey_chambers(&self, body: &Body, n: usize) -> Vec<Cover> {
+        chamber::survey(&self.ctx(body), n)
+    }
+
+    pub(super) fn survey_halls(&self, body: &Body, n: usize) -> Vec<Cover> {
+        hall::survey(&self.ctx(body), n)
+    }
+
+    /// Smallest cavern of each biome. The assert measures these rather than the largest halls.
+    pub(super) fn cover_kinds(&self, body: &Body) -> Vec<Cover> {
+        cavern::measure_each_kind(&self.ctx(body))
+    }
+
+    /// Smallest underdark chamber, floor band only.
+    pub(super) fn cover_chamber(&self, body: &Body) -> Option<Cover> {
+        chamber::measure_smallest(&self.ctx(body))
     }
 
     pub(super) fn locate_hall(&self, body: &Body) -> Option<[i64; 3]> {

@@ -87,11 +87,6 @@ fn column_half(s: &Site, t0: i64, t1: i64) -> Option<i64> {
     (h2 >= 0).then_some((h2 as f64).sqrt().floor() as i64)
 }
 
-fn add_out(up: Up, rel: [i64; 3], steps: i64) -> [i64; 3] {
-    let (t0, t1) = tangent(rel, up.axis);
-    place(up.axis, up.sign, (t0, t1), up.outward(rel) + steps)
-}
-
 /// Mean air fraction of the deep shell at this `deep` scale.
 pub(super) fn porosity(scale: f32) -> f64 {
     let s = f64::from(scale.clamp(0.0, 2.0));
@@ -110,6 +105,30 @@ pub(super) fn porosity(scale: f32) -> f64 {
     let vol = 4.0 / 3.0 * std::f64::consts::PI * mean * FILL;
     let cell = CELL as f64;
     vol / (cell * cell * cell) * f64::from(P) * s
+}
+
+/// Volume fraction of the deep shell occupied by floor lights.
+///
+/// The porosity above already counts those cells as void. Each site of [`super::glow::at`]
+/// places one block, and the chance saturates at 1.
+pub(super) fn light_phi(scale: f32) -> f64 {
+    let s = f64::from(scale.clamp(0.0, 2.0));
+    if s == 0.0 {
+        return 0.0;
+    }
+    let sum_sq = |n: i64| {
+        if n <= 0 {
+            0.0
+        } else {
+            let n = n as f64;
+            n * (n + 1.0) * (2.0 * n + 1.0) / 6.0
+        }
+    };
+    let mean_r2 = (sum_sq(R_HI) - sum_sq(R_LO - 1)) / (R_HI - R_LO + 1) as f64;
+    let area = std::f64::consts::PI * mean_r2;
+    let cells = area / (super::glow::GAP as f64 * super::glow::GAP as f64);
+    let dress = f64::from(s.min(1.0));
+    cells / (CELL as f64 * CELL as f64 * CELL as f64) * f64::from(P) * s * dress
 }
 
 pub(super) fn hits(ctx: &Ctx, lo: [i64; 3], hi: [i64; 3]) -> bool {
@@ -197,12 +216,39 @@ fn dress(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> BlockId {
     let m = ctx.m;
     match s.kind {
         0 => fungal(ctx, s, rel).unwrap_or(AIR),
-        1 => geode(s, rel, m),
-        2 => magma(s, rel, m),
-        3 => hung(s, rel, m).unwrap_or(AIR),
-        4 => cones(s, rel, m).unwrap_or(AIR),
-        _ => glow(s, rel, m).unwrap_or(AIR),
+        1 => geode(ctx, s, rel),
+        2 => magma(ctx, s, rel),
+        3 => hung(s, rel, m).or_else(|| floor_light(ctx, s, rel, 0x51A7, m.glowcap)).unwrap_or(AIR),
+        4 => cones(s, rel, m).or_else(|| floor_light(ctx, s, rel, 0xC04E, m.glowcap)).unwrap_or(AIR),
+        _ => glow_biome(ctx, s, rel).unwrap_or(AIR),
     }
+}
+
+/// Radial gap from the shell is at most `reach` (no sqrt: `r − √d² ≤ reach`).
+fn within(r: i64, d2: i64, reach: i64) -> bool {
+    if d2 > r * r {
+        return false;
+    }
+    if r <= reach {
+        return true;
+    }
+    let inner = r - reach;
+    d2 >= inner * inner
+}
+
+/// Glowcap (or magma) on the shell cell of this column: the floor, not a carpet inward of it.
+fn floor_light(ctx: &Ctx, s: &Site, rel: [i64; 3], salt: u32, block: BlockId) -> Option<BlockId> {
+    let d2 = dist2(rel, s.center);
+    if !within(s.r, d2, 2) {
+        return None;
+    }
+    let (t0, t1) = tangent(rel, s.up.axis);
+    let half = column_half(s, t0, t1)?;
+    let rise = s.up.outward(rel) - (s.up.outward(s.center) - half);
+    if rise != 0 {
+        return None;
+    }
+    super::glow::at(s.salt ^ salt, ctx.scale, t0, t1, 1.0, block)
 }
 
 fn fungal(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> Option<BlockId> {
@@ -212,12 +258,27 @@ fn fungal(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> Option<BlockId> {
     }
     let shell = |t0: i64, t1: i64| column_half(s, t0, t1);
     let co = s.up.outward(s.center);
-    mushroom::occupy(ctx.seed ^ s.salt, ctx.scale.max(0.25), rel, s.up, ctx.m, |t0, t1| {
+    if let Some(id) = mushroom::occupy(ctx.seed ^ s.salt, ctx.scale.max(0.25), rel, s.up, ctx.m, |t0, t1| {
         shell(t0, t1).map(|h| co - h)
     }, |t0, t1| shell(t0, t1).map(|h| co + h))
+    {
+        return Some(id);
+    }
+    // Mycelium on the shell. The mushroom early-out already proved this cell is near it.
+    if !within(s.r, d2, 2) {
+        return None;
+    }
+    let (t0, t1) = tangent(rel, s.up.axis);
+    let half = column_half(s, t0, t1)?;
+    let rise = s.up.outward(rel) - (co - half);
+    if rise != 0 {
+        return None;
+    }
+    super::glow::at(s.salt ^ 0x61F0, ctx.scale, t0, t1, 1.0, ctx.m.glowcap)
 }
 
-fn geode(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> BlockId {
+fn geode(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> BlockId {
+    let m = ctx.m;
     let d2 = dist2(rel, s.center);
     let cr = core_r(s);
     if d2 <= cr * cr {
@@ -229,12 +290,39 @@ fn geode(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> BlockId {
     }
     let lining = s.r - 4;
     if lining > 0 && d2 > lining * lining {
-        return if super::super::noise::unit(hash_rel(s.salt, rel)) < 0.1 { m.glowshroom } else { m.crystal };
+        // Crystal wall. The face that touches the hollow carries a glowshroom on the floor grid.
+        if inner_face(s, rel, lining) {
+            let (t0, t1) = tangent(rel, s.up.axis);
+            if let Some(id) = super::glow::at(s.salt ^ 0x6E1D, ctx.scale, t0, t1, 1.0, m.glowshroom) {
+                return id;
+            }
+        }
+        return m.crystal;
     }
     AIR
 }
 
-fn magma(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> BlockId {
+/// Lining cell whose step toward the centre leaves the crystal and enters the hollow.
+fn inner_face(s: &Site, rel: [i64; 3], lining: i64) -> bool {
+    let mut axis = 0usize;
+    let mut best = 0i64;
+    for a in 0..3 {
+        let d = (s.center[a] - rel[a]).abs();
+        if d > best {
+            best = d;
+            axis = a;
+        }
+    }
+    if best == 0 {
+        return false;
+    }
+    let mut inward = rel;
+    inward[axis] += (s.center[axis] - rel[axis]).signum();
+    dist2(inward, s.center) <= lining * lining
+}
+
+fn magma(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> BlockId {
+    let m = ctx.m;
     let o = s.up.outward(rel);
     let top = lake_top(s);
     let lining = s.r - 5;
@@ -242,11 +330,17 @@ fn magma(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> BlockId {
     if o < top {
         if super::super::noise::unit(hash_rel(s.salt, rel)) < 0.07 { m.obsidian } else { m.magma }
     } else if o == top {
-        m.obsidian
+        // Open pools in the lid, so the lake's light reaches the air above it.
+        let (t0, t1) = tangent(rel, s.up.axis);
+        if super::glow::at(s.salt ^ 0x1A6A, ctx.scale, t0, t1, 0.45, m.magma).is_some() {
+            m.magma
+        } else {
+            m.obsidian
+        }
     } else if o <= top + 5 && near_wall {
         m.basalt
     } else {
-        AIR
+        floor_light(ctx, s, rel, 0x5A0E, m.magma).unwrap_or(AIR)
     }
 }
 
@@ -277,6 +371,10 @@ fn hung(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> Option<BlockId>
             let rad: i64 = if drop < 2 { 2 } else { 1 };
             if horiz > rad * rad {
                 continue;
+            }
+            // The free end glows; the rest of the root stays wood. Length is unchanged.
+            if drop == len && horiz <= 1 {
+                return Some(m.glowcap);
             }
             return Some(if horiz <= 1 { m.darkwood } else { m.bark });
         }
@@ -318,11 +416,198 @@ fn cones(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> Option<BlockId
     None
 }
 
-fn glow(s: &Site, rel: [i64; 3], m: &super::super::Materials) -> Option<BlockId> {
-    if contains(s, add_out(s.up, rel, 1)) {
+fn glow_biome(ctx: &Ctx, s: &Site, rel: [i64; 3]) -> Option<BlockId> {
+    let d2 = dist2(rel, s.center);
+    // Floor disks sit on the shell; tips hang at most 6 from the ceiling. Deeper cells are air.
+    if !within(s.r, d2, 6) {
         return None;
     }
-    (super::super::noise::unit(hash_rel(s.salt ^ 0x6100, rel)) < 0.12).then_some(m.glowcap)
+    let (t0, t1) = tangent(rel, s.up.axis);
+    let half = column_half(s, t0, t1)?;
+    let co = s.up.outward(s.center);
+    let o = s.up.outward(rel);
+    let m = ctx.m;
+    if o == co - half
+        && let Some(id) = super::glow::at(s.salt ^ 0x6101, ctx.scale, t0, t1, 1.0, m.glowcap)
+    {
+        return Some(id);
+    }
+    let drop = (co + half) - o;
+    if drop == 0 && super::super::noise::unit(hash_rel(s.salt ^ 0x6100, rel)) < 0.12 {
+        return Some(m.glowcap);
+    }
+    super::glow::tip(s.salt ^ 0x6102, ctx.scale, t0, t1, drop, m.glowcap)
+}
+
+#[cfg(test)]
+fn merge_ranges(mut rs: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    rs.retain(|(a, b)| a <= b);
+    rs.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (a, b) in rs {
+        if let Some(last) = out.last_mut()
+            && a <= last.1 + 1
+        {
+            last.1 = last.1.max(b);
+            continue;
+        }
+        out.push((a, b));
+    }
+    out
+}
+
+/// Floor cells (air above a solid) and emissive blocks in the bands dressing can reach.
+#[cfg(test)]
+fn measure(ctx: &Ctx, s: &Site) -> super::Cover {
+    // The whole disk. Lights outside a smaller floor sample would still reach it, so the sample
+    // and the light scan share this radius.
+    measure_span(ctx, s, s.r)
+}
+
+/// Like [`measure`], but floor cells only inside tangent radius `cap` (lights out to `cap + 12`).
+#[cfg(test)]
+fn measure_span(ctx: &Ctx, s: &Site, cap: i64) -> super::Cover {
+    let (c0, c1) = tangent(s.center, s.up.axis);
+    let co = s.up.outward(s.center);
+    let mut floors = Vec::new();
+    let mut lights = Vec::new();
+    let r = s.r;
+    let span = r.min(cap + 12);
+    let cap2 = cap * cap;
+    for t1 in (c1 - span)..=(c1 + span) {
+        for t0 in (c0 - span)..=(c0 + span) {
+            let (d0, d1) = (t0 - c0, t1 - c1);
+            let dt = d0 * d0 + d1 * d1;
+            if dt > span * span {
+                continue;
+            }
+            let Some(half) = column_half(s, t0, t1) else { continue };
+            let lo = co - half;
+            let hi = co + half;
+            // The shell band holds the floor, mushrooms, cones and the geode lining. A short
+            // chord also holds the ceiling. The magma lid and the geode core sit deeper.
+            let mut ranges = vec![(lo, (lo + 36).min(hi))];
+            if hi - lo <= 48 {
+                ranges.push((lo, hi));
+            }
+            if s.kind == 2 {
+                let top = lake_top(s);
+                ranges.push(((top - 14).max(lo), (top + 8).min(hi)));
+            }
+            if s.kind == 1 {
+                let cr = core_r(s) + 2;
+                let (d0, d1) = (t0 - c0, t1 - c1);
+                if d0 * d0 + d1 * d1 <= cr * cr {
+                    ranges.push(((co - cr).max(lo), (co + cr).min(hi)));
+                }
+            }
+            for (a, b) in merge_ranges(ranges) {
+                let below = cell_of(s, t0, t1, a - 1);
+                let mut below_solid = !contains(s, below) || dress(ctx, s, below) != AIR;
+                for o in a..=b {
+                    let rel = cell_of(s, t0, t1, o);
+                    if !contains(s, rel) {
+                        below_solid = true;
+                        continue;
+                    }
+                    let id = dress(ctx, s, rel);
+                    if super::emits_light(ctx.m, id) {
+                        lights.push(rel);
+                    }
+                    if id == AIR && below_solid && dt <= cap2 {
+                        floors.push(rel);
+                    }
+                    below_solid = id != AIR;
+                }
+            }
+        }
+    }
+    let near = super::NearLights::new(lights).count(&floors);
+    super::Cover {
+        kind: s.kind,
+        r: s.r,
+        center: s.center,
+        up_axis: s.up.axis,
+        up_sign: s.up.sign,
+        floor: floors.len() as u32,
+        near,
+        step: 1,
+    }
+}
+
+#[cfg(test)]
+fn cell_of(s: &Site, t0: i64, t1: i64, o: i64) -> [i64; 3] {
+    place(s.up.axis, s.up.sign, (t0, t1), o)
+}
+
+#[cfg(test)]
+pub(super) fn survey(ctx: &Ctx, n: usize) -> Vec<super::Cover> {
+    let mut out = Vec::new();
+    let y0 = (ctx.half - i64::from(DEEP_HI)).div_euclid(CELL);
+    let y1 = (ctx.half - i64::from(super::super::cube::CRUST)).div_euclid(CELL);
+    for y in y0..=y1 {
+        for z in -24..24 {
+            for x in -24..24 {
+                if let Some(s) = site(ctx, [x, y, z]) {
+                    out.push(measure(ctx, &s));
+                    if out.len() == n {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(super) fn survey_at(ctx: &Ctx, rel: [i64; 3]) -> Option<super::Cover> {
+    let base = std::array::from_fn(|a| rel[a].div_euclid(CELL));
+    if let Some(s) = site(ctx, base)
+        && contains(&s, rel)
+    {
+        return Some(measure(ctx, &s));
+    }
+    let mut best: Option<(i64, Site)> = None;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let idx = [base[0] + dx, base[1] + dy, base[2] + dz];
+                let Some(s) = site(ctx, idx) else { continue };
+                let d = dist2(rel, s.center);
+                if d > (s.r + 48) * (s.r + 48) {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, s));
+                }
+            }
+        }
+    }
+    best.map(|(_, s)| measure(ctx, &s))
+}
+
+/// The smallest cavern of each biome in the spawn window, measured cell by cell.
+#[cfg(test)]
+pub(super) fn measure_each_kind(ctx: &Ctx) -> Vec<super::Cover> {
+    let mut best: [Option<([i64; 3], i64)>; 6] = [None; 6];
+    let y0 = (ctx.half - i64::from(DEEP_HI)).div_euclid(CELL);
+    let y1 = (ctx.half - i64::from(super::super::cube::CRUST)).div_euclid(CELL);
+    for y in y0..=y1 {
+        for z in -24..24 {
+            for x in -24..24 {
+                let idx = [x, y, z];
+                let Some(s) = site(ctx, idx) else { continue };
+                let k = s.kind as usize;
+                if best[k].is_none_or(|(_, r)| s.r < r) {
+                    best[k] = Some((idx, s.r));
+                }
+            }
+        }
+    }
+    // A 32-block cap is the open floor. The grid does not change across the disk, and the span
+    // keeps lights that sit just outside the cap.
+    best.into_iter().flatten().filter_map(|(idx, _)| site(ctx, idx).map(|s| measure_span(ctx, &s, 32))).collect()
 }
 
 #[cfg(test)]
