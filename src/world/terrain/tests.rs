@@ -2403,8 +2403,10 @@ fn warped_twins_keep_the_cube_painter_and_sag() {
     ];
     let axis = (0..3).max_by_key(|&a| delta[a].abs()).unwrap();
     let sign = if delta[axis] >= 0 { 1.0 } else { -1.0 };
-    let mut near = c;
-    near[axis] += sign * h;
+    // On the bowed surface (the warp of the reference face centre), and well beyond it.
+    let mut face = c;
+    face[axis] += sign * h;
+    let near = warp.apply(face);
     let mut far = c;
     far[axis] += sign * (h + sag.max(cosmos::RELIEF as f64) * 8.0);
     let near_s = field.sample(near);
