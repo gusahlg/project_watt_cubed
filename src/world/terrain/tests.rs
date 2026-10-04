@@ -2338,3 +2338,20 @@ fn the_start_world_is_relaxed_and_its_grid_fits_the_shape() {
     assert!(corner > centre + 3e5, "corner {corner} over centre {centre}");
     let _ = g;
 }
+
+/// `cargo test --release --lib home_gravity_sample_cost -- --ignored --nocapture`: one player
+/// gravity sample on the relaxed start world (ball, relief layer, cosmos).
+#[test]
+#[ignore]
+fn home_gravity_sample_cost() {
+    let (_reg, t) = make(42);
+    let field = crate::gravity::Field::new(t.mass());
+    let spawn = t.home_spawn().expect("spawn");
+    let n = 20_000;
+    let start = std::time::Instant::now();
+    let mut acc = 0.0;
+    for i in 0..n {
+        acc += field.sample(spawn + glam::DVec3::new((i % 7) as f64 * 0.01, 0.0, 0.0)).accel.y;
+    }
+    println!("{:.2} µs per sample at spawn [{acc:.3}]", start.elapsed().as_secs_f64() * 1e6 / n as f64);
+}
