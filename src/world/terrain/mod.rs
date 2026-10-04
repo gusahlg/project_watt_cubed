@@ -6,9 +6,10 @@
 //! except the home +Y face, which keeps the v3 salts. Provinces theme every column: a realm per
 //! face, regions and provinces on the shared surface point. The twins' facing faces also carry
 //! spires and arches across the canyon, inside the relief bound. Below the crust the bulk is a
-//! coarse mix whose mean amount is [`cosmos::BULK_DENSITY`]. Round bodies live on curved charts in
-//! storage ([`storage`]): storage coordinates answer from their painters, and physical space holds
-//! none of their cells. Empty space classifies as air and is never sampled.
+//! coarse mix whose mean amount is [`cosmos::BULK_DENSITY`], carved by the interior ([`deep`]).
+//! Round bodies live on curved charts in storage ([`storage`]): storage coordinates answer from
+//! their painters, and physical space holds none of their cells. Empty space classifies as air and
+//! is never sampled.
 //!
 //! Every material is a configuration the [`palette`] found in the law; nothing here names an
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
@@ -17,6 +18,7 @@ pub mod cosmos;
 pub mod noise;
 pub mod palette;
 mod cube;
+mod deep;
 mod province;
 pub mod round;
 mod shape;
@@ -361,6 +363,8 @@ pub struct Terrain {
     /// Indexed by `body.id * 6 + face`. `None` for bodies that are not cubes.
     paints: Vec<Option<FacePaint>>,
     bulk: cube::Bulk,
+    /// Caverns, chambers, mantle bubbles and the Heart. Quiet deep chunks never consult it per voxel.
+    deep: deep::Deep,
     /// The round bodies, painted on curved charts in storage.
     storage: storage::StorageWorlds,
     m: Arc<Materials>,
@@ -370,6 +374,13 @@ pub struct Terrain {
 #[inline]
 fn stored(x: i32) -> bool {
     x as i64 >= crate::space::atlas::STORAGE_X0
+}
+
+fn rel_box(centre: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> ([i64; 3], [i64; 3]) {
+    (
+        [lo[0] - centre[0], lo[1] - centre[1], lo[2] - centre[2]],
+        [hi[0] - centre[0], hi[1] - centre[1], hi[2] - centre[2]],
+    )
 }
 
 /// Shared handle workers clone.
@@ -392,7 +403,8 @@ impl Terrain {
         let cfg = cfg.clamp();
         let s = (seed as u64 ^ (seed as u64 >> 32)) as u32 ^ 0x1D1F_F051;
         let m = Arc::new(Materials::intern(registry));
-        let cosmos = Arc::new(cosmos::Cosmos::new(s, cfg.space as f32 / 100.0));
+        let scale = cfg.deep as f32 / 100.0;
+        let cosmos = Arc::new(cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale));
         let relief = cfg.relief as f32 / 100.0;
         let variety = cfg.variety as f32 / 100.0;
         // The twin with the smaller seed is lush; the other is crystalline. One twin keeps lush.
@@ -435,6 +447,7 @@ impl Terrain {
             cosmos,
             paints,
             bulk: cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5),
+            deep: deep::Deep::new(scale, m.clone()),
             m,
         }
     }
@@ -526,11 +539,56 @@ impl Terrain {
         Some(Posy { world_a, col, paint, u: ui, v: vi, half, centre: body.centre })
     }
 
+    /// Bulk, or the interior feature at `rel`. `depth` is the true depth when the caller already
+    /// has the column; otherwise it is derived, and inside one band the block does not depend on it.
+    fn deep_at(&self, body: &cosmos::Body, rel: [i64; 3], depth: Option<i32>) -> BlockId {
+        let bulk = cube::bulk_id(&self.bulk, body, rel);
+        // A known depth means the chunk already intersects a feature; `might` would only repeat that test.
+        if depth.is_none() && !self.deep.might(body, rel) {
+            return bulk;
+        }
+        let depth = depth.unwrap_or_else(|| self.depth_of(body, rel));
+        self.deep.block(body, rel, depth, bulk)
+    }
+
+    /// A depth in the same band as the true one. The column is sampled only when the surface-height
+    /// range straddles a band boundary.
+    fn depth_of(&self, body: &cosmos::Body, rel: [i64; 3]) -> i32 {
+        let half = cube::half_of(body);
+        let pd = deep::plane_depth(half, rel);
+        let lo = pd + i64::from(MIN_GROUND);
+        let hi = pd + i64::from(MAX_GROUND);
+        let inside = |a: i64, b: i64| lo > a && hi <= b;
+        if inside(i64::from(cube::CRUST), i64::from(deep::DEEP_HI))
+            || inside(i64::from(deep::DEEP_HI), i64::from(deep::UNDER_HI))
+            || lo > i64::from(deep::UNDER_HI)
+        {
+            return lo as i32;
+        }
+        self.surface_depth(body, rel)
+    }
+
+    /// `column height − face altitude`, the same subtraction [`cube_cell`](Self::cube_cell) uses.
+    fn surface_depth(&self, body: &cosmos::Body, rel: [i64; 3]) -> i32 {
+        let half = cube::half_of(body);
+        let fallback = (deep::plane_depth(half, rel) + i64::from(MIN_GROUND)) as i32;
+        let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
+            return fallback;
+        };
+        let face = cube::face_of(rel);
+        let (u, a, v) = FaceFrame::new(face).cell_to_local((x, y, z));
+        let h = a - half as i32;
+        let paint = self.paint(body, face);
+        let mut col = paint.shape.column(u, v);
+        col.height = cube::blend_height(col.height, cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+        col.height - h
+    }
+
     fn cube_cell(&self, body: &cosmos::Body, p: [i64; 3]) -> BlockId {
         let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
         let half = cube::half_of(body);
         if cube::in_deep(rel, half) {
-            return cube::bulk_id(&self.bulk, body, rel);
+            return self.deep_at(body, rel, None);
         }
         let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
             return AIR;
@@ -559,7 +617,7 @@ impl Terrain {
             return AIR;
         }
         if col.height - h > cube::CRUST {
-            return cube::bulk_id(&self.bulk, body, rel);
+            return self.deep_at(body, rel, Some(col.height - h));
         }
         let field = |yy: i32| Grid::interp_corners(&paint.under.corners(u, yy, v), u, yy, v);
         let ground = paint.shape.ground(&col, u, h, v);
@@ -596,6 +654,13 @@ impl Terrain {
         let half = cube::half_of(&body);
         let rels = cube::corners(lo, hi).map(|p| [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]]);
         if !rels.iter().copied().all(|r| cube::in_deep(r, half)) {
+            return None;
+        }
+        let (rlo, rhi) = rel_box(body.centre, lo, hi);
+        if self.deep.all_air(&body, rlo, rhi) {
+            return Some(ChunkData::Uniform(AIR));
+        }
+        if self.deep.hits(&body, rlo, rhi) {
             return None;
         }
         let id = cube::bulk_uniform(&self.bulk, &body, &rels)?;
@@ -718,6 +783,41 @@ impl Terrain {
         ChunkData::from_cells(cells)
     }
 
+    /// A chunk wholly below the crust. Quiet chunks stay on the mix; a feature is filled per column.
+    fn fill_deep(&self, body: &cosmos::Body, face: Face, cols: &[Column], u0: i32, h0: i32, v0: i32) -> ChunkData {
+        let half = cube::half_of(body) as i32;
+        let at = |lu: i32, la: i32, lv: i32| cube::local_to_rel(face, u0 + lu, half + h0 + la, v0 + lv);
+        let mut lo = at(0, 0, 0);
+        let mut hi = lo;
+        for (lu, la, lv) in [(15, 0, 0), (0, 15, 0), (0, 0, 15), (15, 15, 0), (15, 0, 15), (0, 15, 15), (15, 15, 15)] {
+            let p = at(lu, la, lv);
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        if self.deep.all_air(body, lo, hi) {
+            return ChunkData::Uniform(AIR);
+        }
+        if !self.deep.hits(body, lo, hi) {
+            return self.bulk_chunk(body, face, u0, h0, v0);
+        }
+        let frame = FaceFrame::new(face);
+        let mut cells = Box::new([AIR; CHUNK_VOLUME]);
+        for la in 0..CHUNK_SIZE {
+            for lv in 0..CHUNK_SIZE {
+                for lu in 0..CHUNK_SIZE {
+                    let h = h0 + la as i32;
+                    let rel = at(lu as i32, la as i32, lv as i32);
+                    let depth = cols[lu + lv * CHUNK_SIZE].height - h;
+                    let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                    cells[Chunk::index(lx, ly, lz)] = self.deep_at(body, rel, Some(depth));
+                }
+            }
+        }
+        ChunkData::from_cells(cells)
+    }
+
     /// Fill one chunk of a face column. `cols[lu + lv * 16].height` is the blended face-local surface.
     fn fill_face(
         &self,
@@ -741,7 +841,7 @@ impl Terrain {
             return ChunkData::Uniform(AIR);
         }
         if i64::from(h0) + i64::from(n) <= i64::from(min_h) - i64::from(cube::CRUST) {
-            return self.bulk_chunk(body, face, u0, h0, v0);
+            return self.fill_deep(body, face, cols, u0, h0, v0);
         }
         let paint = self.paint(body, face);
         // The batch grid covers a 4-aligned 16³. PosY is aligned; a flipped axis is not,
@@ -773,7 +873,7 @@ impl Terrain {
                             AIR
                         } else if !crust_only && col.height - h > cube::CRUST {
                             let rel = cube::local_to_rel(face, u, half + h, v);
-                            cube::bulk_id(&self.bulk, body, rel)
+                            self.deep_at(body, rel, Some(col.height - h))
                         } else {
                             let la_i = la as i32;
                             let ground = paint.shape.ground(col, u, h, v);
@@ -1109,7 +1209,13 @@ impl TerrainGenerator for Terrain {
                 let rels = cube::corners(lo, hi)
                     .map(|p| [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]]);
                 if rels.iter().copied().all(|r| cube::in_deep(r, half)) {
-                    if let Some(id) = cube::bulk_uniform(&self.bulk, &body, &rels) {
+                    let (rlo, rhi) = rel_box(body.centre, lo, hi);
+                    if self.deep.all_air(&body, rlo, rhi) {
+                        return Classify::Uniform(AIR);
+                    }
+                    if !self.deep.hits(&body, rlo, rhi)
+                        && let Some(id) = cube::bulk_uniform(&self.bulk, &body, &rels)
+                    {
                         return Classify::Uniform(id);
                     }
                 }

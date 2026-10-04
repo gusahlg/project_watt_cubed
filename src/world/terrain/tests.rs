@@ -3,6 +3,7 @@
 use super::*;
 use super::cube;
 use super::{space, span};
+use super::deep;
 use crate::coord::{ChunkCoord, Face};
 use crate::space::FaceFrame;
 use crate::world::chunk::Chunk;
@@ -1003,4 +1004,192 @@ fn cluster_classify_cost() {
     }
     let per = start.elapsed().as_secs_f64() * 1e6 / n as f64;
     println!("{per:.1} µs per classify over {n} chunks ({mixed} mixed)");
+}
+
+fn world_of(body: &cosmos::Body, rel: [i64; 3]) -> (i32, i32, i32) {
+    (
+        i32::try_from(body.centre[0] + rel[0]).unwrap(),
+        i32::try_from(body.centre[1] + rel[1]).unwrap(),
+        i32::try_from(body.centre[2] + rel[2]).unwrap(),
+    )
+}
+
+fn chunk_matches_at(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) {
+    let (x, y, z) = world_of(body, rel);
+    assert_chunk_matches(t, x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
+}
+
+/// An air cell near `at` (features dress the shell, so the middle of a hollow is open).
+fn find_air(t: &Terrain, body: &cosmos::Body, at: [i64; 3]) -> [i64; 3] {
+    for dz in -2..=2 {
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let rel = [at[0] + dx * 8, at[1] + dy * 8, at[2] + dz * 8];
+                let (x, y, z) = world_of(body, rel);
+                if t.voxel_at(x, y, z) == AIR {
+                    return rel;
+                }
+            }
+        }
+    }
+    panic!("no air near {at:?}");
+}
+
+#[test]
+fn the_interior_is_batch_exact_and_the_heart_stays_when_deep_is_off() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let cavern = t.deep.locate_cavern(&home).expect("a deep cavern");
+    let air = find_air(&t, &home, cavern);
+    let (x, y, z) = world_of(&home, air);
+    assert_eq!(t.voxel_at(x, y, z), AIR, "cavern air at {air:?}");
+    chunk_matches_at(&t, &home, cavern);
+
+    let hall = t.deep.locate_hall(&home).expect("a dwarf hall");
+    chunk_matches_at(&t, &home, hall);
+    let (hx, hy, hz) = world_of(&home, hall);
+    assert_eq!(t.voxel_at(hx, hy, hz), AIR, "hall centre is the room");
+
+    let chamber = t.deep.locate_chamber(&home).expect("an underdark chamber");
+    let chamber_air = find_air(&t, &home, chamber);
+    chunk_matches_at(&t, &home, chamber);
+    let (cx, cy, cz) = world_of(&home, chamber_air);
+    assert_eq!(t.voxel_at(cx, cy, cz), AIR, "chamber air");
+
+    let (bubble, r) = t.deep.locate_bubble(&home).expect("a mantle bubble");
+    let mut inside = bubble;
+    inside[0] += r / 2;
+    let (bx, by, bz) = world_of(&home, inside);
+    assert_eq!(t.voxel_at(bx, by, bz), AIR, "bubble interior r={r}");
+    chunk_matches_at(&t, &home, inside);
+    let mut bulk_outside = false;
+    for axis in 0..3 {
+        for sign in [-1i64, 1] {
+            let mut rel = bubble;
+            rel[axis] += sign * (r + 3);
+            let (ox, oy, oz) = world_of(&home, rel);
+            if t.voxel_at(ox, oy, oz) == cube::bulk_id(&t.bulk, &home, rel) {
+                bulk_outside = true;
+            }
+        }
+    }
+    assert!(bulk_outside, "a block just outside the bubble is still bulk");
+
+    // The core, a floating cell of the Heart, and a face-centre shaft.
+    let (kx, ky, kz) = world_of(&home, [0, 0, 0]);
+    assert_eq!(t.voxel_at(kx, ky, kz), t.materials().core);
+    chunk_matches_at(&t, &home, [0, 0, 0]);
+    let shaft = [0, 50_100, 0];
+    let (sx, sy, sz) = world_of(&home, shaft);
+    assert_eq!(t.voxel_at(sx, sy, sz), AIR, "heart shaft");
+    let beside = [20, 50_100, 0];
+    let (px, py, pz) = world_of(&home, beside);
+    assert_eq!(t.voxel_at(px, py, pz), cube::bulk_id(&t.bulk, &home, beside));
+    chunk_matches_at(&t, &home, shaft);
+
+    // `deep = 0` removes the density-scaled hollows. The Heart does not scale.
+    let mut reg = BlockRegistry::with_builtins();
+    let off = Terrain::with_cfg(&mut reg, 42, TerrainCfg { deep: 0, ..TerrainCfg::default() });
+    assert_ne!(off.voxel_at(x, y, z), AIR, "deep=0 left the cavern hollow");
+    assert_eq!(off.voxel_at(x, y, z), cube::bulk_id(&off.bulk, &home, air));
+    let (hx0, hy0, hz0) = world_of(&home, [0, 1_000, 0]);
+    assert_eq!(off.voxel_at(hx0, hy0, hz0), AIR, "the Heart stays hollow at deep=0");
+    assert_eq!(off.voxel_at(kx, ky, kz), off.materials().core);
+}
+
+#[test]
+fn interior_porosity_barely_moves_spawn_gravity() {
+    use crate::gravity::{Field, Primitive, Shape};
+    use crate::math::BLOCK_METERS;
+    let cosmos = std::sync::Arc::new(cosmos::Cosmos::with_deep(7, 1.0, 1.0));
+    let field = Field::new(cosmos);
+    let at = glam::DVec3::new(0.5, 70.0, 0.5);
+    let after = field.sample(at).accel.length() * BLOCK_METERS;
+    let c = cosmos::HOME_CENTRE;
+    let h = cosmos::HOME_HALF as f64;
+    let solid = Primitive::new(
+        Shape::Box {
+            lo: glam::DVec3::new(c[0] as f64 - h, c[1] as f64 - h, c[2] as f64 - h),
+            hi: glam::DVec3::new(c[0] as f64 + h, c[1] as f64 + h, c[2] as f64 + h),
+        },
+        cosmos::BULK_DENSITY,
+    );
+    let before = (solid.field(at).0 * crate::gravity::G).length() * BLOCK_METERS;
+    let (phi_d, phi_u) = deep::porosity(1.0);
+    println!("spawn gravity before {before:.6} m/s² after {after:.6} m/s² (deep porosity {phi_d:.6}, under {phi_u:.6})");
+    assert!((before - 24.0).abs() < 0.01 * 24.0, "solid spawn {before}");
+    assert!((after - 24.0).abs() < 0.01 * 24.0, "interior spawn {after}");
+    assert!((after - before).abs() < 0.01 * 24.0, "voids moved spawn by {}", after - before);
+
+    let centre = glam::DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64);
+    let centre_pull = field.sample(centre).accel.length() * BLOCK_METERS;
+    println!("planet centre pull {centre_pull:.6} m/s²");
+    assert!(centre_pull < 0.05, "centre is not weightless: {centre_pull}");
+
+    // Inside a bubble the removed ball cancels the cube's linear gradient.
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let (rel, r) = t.deep.locate_bubble(&home).expect("bubble");
+    let p0 = glam::DVec3::new(
+        (home.centre[0] + rel[0]) as f64,
+        (home.centre[1] + rel[1]) as f64,
+        (home.centre[2] + rel[2]) as f64,
+    );
+    // A negative ball cancels the cube's divergence inside the cavity, so the field there is the
+    // cube's tide: nearly constant across a bubble that is small next to the planet.
+    let carved = Field::new(t.mass());
+    let g0 = carved.sample(p0).accel;
+    let mut trace_void = 0.0;
+    let mut trace_solid = 0.0;
+    let mut worst = 0.0f64;
+    for axis in 0..3 {
+        let mut step = glam::DVec3::ZERO;
+        step[axis] = 0.4 * r as f64;
+        let p1 = p0 + step;
+        let d_void = carved.sample(p1).accel - g0;
+        let d_solid = (solid.field(p1).0 - solid.field(p0).0) * crate::gravity::G;
+        trace_void += d_void[axis];
+        trace_solid += d_solid[axis];
+        worst = worst.max(d_void.length());
+    }
+    let g_ms = g0.length() * BLOCK_METERS;
+    let worst_ms = worst * BLOCK_METERS;
+    println!(
+        "bubble r={r} field {g_ms:.4} m/s², tide across 0.4r {worst_ms:.4} m/s² (div void {trace_void:.6} solid {trace_solid:.6})"
+    );
+    assert!(trace_solid.abs() > 1.0e-4, "solid divergence {trace_solid}");
+    assert!(trace_void.abs() < trace_solid.abs() * 0.05, "cavity divergence {trace_void} vs {trace_solid}");
+    assert!(worst_ms < 0.05, "bubble tide {worst_ms} m/s²");
+}
+
+#[test]
+fn quiet_deep_chunks_stay_uniform() {
+    let (_reg, t) = make(42);
+    let home = *t.cosmos.home();
+    let half = cube::half_of(&home);
+    let mut uniform = 0u32;
+    let mut n = 0u32;
+    for k in 0..12 {
+        let depth = 500 + (half - 80_000) * k / 11;
+        let rel_y = half - depth;
+        for (i, xz) in [64i64, 200, 1_500, 8_000, 40_000, 200_000, 1_000_000, 4_000_000].into_iter().enumerate() {
+            if xz + 32 >= rel_y {
+                continue;
+            }
+            let rel = [xz, rel_y, xz / 3 + 20 + i as i64 * 17];
+            if !cube::in_deep(rel, half) {
+                continue;
+            }
+            let (x, y, z) = world_of(&home, rel);
+            let class = t.classify(ChunkCoord::new(x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)));
+            n += 1;
+            if matches!(class, Classify::Uniform(_)) {
+                uniform += 1;
+            }
+        }
+    }
+    let rate = f64::from(uniform) / f64::from(n);
+    println!("interior classify uniform {uniform}/{n} = {rate:.4}");
+    assert!(n >= 40, "sampled {n} deep chunks");
+    assert!(rate >= 0.95, "uniform hit rate {rate} ({uniform}/{n})");
 }

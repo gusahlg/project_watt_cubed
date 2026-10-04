@@ -234,6 +234,8 @@ pub struct Cosmos {
     /// Group index by super-cell (a dense grid over the bounded universe; `u32::MAX` = none), so a
     /// query visits only the super-cells within the law's range.
     group_at: Vec<u32>,
+    /// Interior-feature density as a fraction of the design (1 = as designed). The Heart stays.
+    deep: f32,
 }
 
 /// Super-cells per axis on each side of the origin (covers ±1e9 with a margin).
@@ -275,6 +277,11 @@ fn to_i64(v: DVec3) -> [i64; 3] {
 impl Cosmos {
     /// The catalog for `seed`, with the asteroid-cluster density scaled by `space` (1 = designed).
     pub fn new(seed: u32, space: f32) -> Self {
+        Self::with_deep(seed, space, 1.0)
+    }
+
+    /// [`new`](Self::new), with the interior-feature density scaled by `deep` (1 = designed).
+    pub fn with_deep(seed: u32, space: f32, deep: f32) -> Self {
         let mut bodies = vec![Body {
             id: 0,
             kind: Kind::Home,
@@ -389,6 +396,7 @@ impl Cosmos {
             by_cell: HashMap::new(),
             groups: Vec::new(),
             group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
+            deep: deep.clamp(0.0, 2.0),
         };
         cosmos.place_clusters(space);
         cosmos
@@ -688,6 +696,9 @@ impl MassOracle for Cosmos {
             }
             for p in b.primitives() {
                 v.primitive(&p);
+            }
+            if let Shape::Cube { half } = b.shape {
+                super::deep::apply(b.centre, half, b.seed, b.density, self.deep, v);
             }
             if b.altitude(centre).abs() < RELIEF as f64 * 4.0 {
                 v.error(b.relief_error());
