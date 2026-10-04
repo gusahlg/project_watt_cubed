@@ -19,7 +19,7 @@ use crate::net::client::Connection;
 use crate::presence::STRIDE_FREQ;
 use crate::world::World;
 
-use super::acoustics::AcousticWindow;
+use super::acoustics::{AcousticWindow, WindowFrame};
 use super::capture::{Capture, CaptureConfig};
 use super::content::OneShot;
 use super::frame::MAX_OCCURRENCES;
@@ -147,7 +147,8 @@ impl WindowCache {
         needed: bool,
     ) -> Option<Arc<AcousticWindow>> {
         self.timer += dt;
-        // Loaded chunks on a round body are storage cells. The window samples those.
+        // Loaded chunks on a round body are storage cells. The window samples those, and carries
+        // the map from physical positions (listener, sources) into them.
         let at = world.stream_eye(pos);
         let cell = IVec3::new(
             at.x.floor() as i32,
@@ -169,6 +170,7 @@ impl WindowCache {
                 cell,
                 ACOUSTIC_RADIUS,
                 reuse,
+                window_frame(world, pos, at),
             ));
             self.edit_gen = edit_gen;
             self.cell = cell;
@@ -448,6 +450,37 @@ impl AudioDirector {
 }
 
 /// The sound class of the block just under a foot, along `up` (storage +Y on a chart).
+/// The map from physical positions near `pos` into the frame of the cells streamed around it
+/// (`at = world.stream_eye(pos)`): identity off round worlds; on a chart, the inverse embedding
+/// linearised by one-block differences. Central where both sides stay on one chart (the datum has
+/// kinks, e.g. at a face centre, which a one-sided slope misreads on the other side); one-sided
+/// where the other side crosses a seam (a one-block step moves about one storage cell, a seam jumps
+/// by a chart's width).
+fn window_frame(world: &World, pos: DVec3, at: DVec3) -> WindowFrame {
+    if at == pos {
+        return WindowFrame::IDENTITY;
+    }
+    let mut cols = [DVec3::ZERO; 3];
+    for (a, col) in cols.iter_mut().enumerate() {
+        let e = DVec3::AXES[a];
+        let fwd = world.stream_eye(pos + e) - at;
+        let bwd = at - world.stream_eye(pos - e);
+        let (f, b) = ((fwd.length() - 1.0).abs(), (bwd.length() - 1.0).abs());
+        *col = if f < 0.5 && b < 0.5 {
+            (fwd + bwd) * 0.5
+        } else if f <= b {
+            fwd
+        } else {
+            bwd
+        };
+    }
+    WindowFrame {
+        phys_at: pos,
+        cell_at: at,
+        to_cells: glam::DMat3::from_cols(cols[0], cols[1], cols[2]),
+    }
+}
+
 fn sound_class_at_feet(world: &World, feet: DVec3, up: Face) -> &'static str {
     world.registry().sound_class(world.ground_block(feet, up))
 }
@@ -473,6 +506,36 @@ mod tests {
             up: Face::PosY,
             frame: DQuat::IDENTITY,
         }
+    }
+
+    /// On the round start world the acoustic window samples storage cells while every sound plays
+    /// at a physical position: the window's frame carries the physical centre of a nearby block back
+    /// onto that block's storage cell, so its sound is traced through the cells really between.
+    #[test]
+    fn the_window_frame_inverts_the_chart_embedding_near_the_listener() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        let world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let pos = DVec3::new(0.5, 51.6, 0.5);
+        let at = world.stream_eye(pos);
+        assert!(at.x > 1.0e9, "the start world is charted: {at}");
+        let frame = window_frame(&world, pos, at);
+        assert!((frame.map(pos) - at).length() < 1e-9);
+        // The datum's kink under spawn (the face centre) bends the embedding by one or two hundredths of a
+        // block per block; occlusion cells are one block.
+        let mut worst = 0.0f64;
+        for d in [(3, -2, 1), (-5, -1, 4), (0, -3, 0), (7, 0, -6), (-20, -4, 15), (30, -2, -30)] {
+            let cell = (at.x.floor() as i32 + d.0, at.y.floor() as i32 + d.1, at.z.floor() as i32 + d.2);
+            let phys = crate::space::atlas::embed_cell(world.atlases(), cell).expect("a storage cell");
+            assert!((phys - pos).length() < 60.0, "the block is next to the listener: {phys}");
+            let centre = DVec3::new(cell.0 as f64 + 0.5, cell.1 as f64 + 0.5, cell.2 as f64 + 0.5);
+            let err = (frame.map(phys) - centre).length() / (phys - pos).length().max(1.0);
+            worst = worst.max(err);
+        }
+        assert!(worst < 0.03, "the frame carries nearby blocks onto their cells: {worst} blocks per block");
+        // Off a round world nothing moves.
+        let flat = World::new(1);
+        assert_eq!(window_frame(&flat, pos, flat.stream_eye(pos)), WindowFrame::IDENTITY);
     }
 
     fn commit(dir: &mut AudioDirector, sound: &mut SoundSystem, world: &World, pos: DVec3) {

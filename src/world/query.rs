@@ -390,16 +390,18 @@ impl World {
     /// `index = (dz · dim + dy) · dim + dx`, `d* = world − origin` — matching
     /// [`AcousticWindow::cell`](crate::audio::acoustics::AcousticWindow::cell).
     pub fn capture_acoustic_window(&self, center: IVec3, radius: u32) -> Arc<AcousticWindow> {
-        self.capture_acoustic_window_reuse(center, radius, None)
+        self.capture_acoustic_window_reuse(center, radius, None, crate::audio::acoustics::WindowFrame::IDENTITY)
     }
 
     /// [`capture_acoustic_window`](Self::capture_acoustic_window) that refills
-    /// `reuse` in place when its length matches the window volume.
+    /// `reuse` in place when its length matches the window volume. `frame` maps physical
+    /// positions into the cells' frame (storage on a round world).
     pub(crate) fn capture_acoustic_window_reuse(
         &self,
         center: IVec3,
         radius: u32,
         reuse: Option<Box<[Cell]>>,
+        frame: crate::audio::acoustics::WindowFrame,
     ) -> Arc<AcousticWindow> {
         let r = radius.min(47) as i32;
         let dim = (2 * r + 1) as usize;
@@ -462,7 +464,8 @@ impl World {
         }
 
         let win = AcousticWindow::new(origin, UVec3::splat(dim as u32), cells)
-            .expect("dim ≤ MAX_WINDOW_DIM and size·product == cells.len() by construction");
+            .expect("dim ≤ MAX_WINDOW_DIM and size·product == cells.len() by construction")
+            .with_frame(frame);
         Arc::new(win)
     }
 
@@ -572,7 +575,12 @@ mod tests {
         let fresh = world.capture_acoustic_window(center, radius);
         let dim = (2 * radius + 1) as usize;
         let dirty = vec![Cell::Open; dim * dim * dim].into_boxed_slice();
-        let reused = world.capture_acoustic_window_reuse(center, radius, Some(dirty));
+        let reused = world.capture_acoustic_window_reuse(
+            center,
+            radius,
+            Some(dirty),
+            crate::audio::acoustics::WindowFrame::IDENTITY,
+        );
         let r = radius as i32;
         for z in center.z - r..=center.z + r {
             for y in center.y - r..=center.y + r {

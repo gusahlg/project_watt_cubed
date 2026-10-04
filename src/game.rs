@@ -1384,7 +1384,7 @@ impl Game {
                     let id = save::parse_block(self.world.registry_mut(), &spec);
                     self.world.set_block(x, y, z, id);
                     self.world.note_cell_changed(x, y, z);
-                    let at = cell_center(x, y, z);
+                    let at = sound_at(&self.world, x, y, z);
                     events.push(if id == AIR {
                         SoundEvent::BlockBroken { at, block: prev }
                     } else {
@@ -1476,7 +1476,7 @@ impl Game {
                     let new_tool = save::parse_block(self.world.registry_mut(), &tool_spec);
                     self.world.set_block(x, y, z, new_cell);
                     self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                    events.push(SoundEvent::BlockBroken { at: cell_center(x, y, z), block: target });
+                    events.push(SoundEvent::BlockBroken { at: sound_at(&self.world, x, y, z), block: target });
                 }
                 Incoming::PeerSwing { id } => {
                     // The swing edge → a whoosh at the peer's current position. The
@@ -1629,7 +1629,7 @@ impl Game {
                 self.world.set_block(x, y, z, new_cell);
                 self.world.note_cell_changed(x, y, z);
                 self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                events.push(SoundEvent::BlockBroken { at: cell_center(x, y, z), block: target });
+                events.push(SoundEvent::BlockBroken { at: sound_at(&self.world, x, y, z), block: target });
                 self.camera.fx.add_trauma(0.08);
             }
             None => self.note_tool("no reaction"),
@@ -1669,7 +1669,7 @@ impl Game {
         let (x, y, z) = cell;
         let id = self.world.block_at(x, y, z);
         events.push(SoundEvent::BlockBroken {
-            at: cell_center(x, y, z),
+            at: sound_at(&self.world, x, y, z),
             block: id,
         });
         self.world.set_block(x, y, z, AIR);
@@ -1723,7 +1723,7 @@ impl Game {
             let prev = self.world.block_at(x, y, z);
             // Report the placed block; the director derives its class-specific cue.
             events.push(SoundEvent::BlockPlaced {
-                at: cell_center(x, y, z),
+                at: sound_at(&self.world, x, y, z),
                 block: id,
             });
             self.world.set_block(x, y, z, id);
@@ -1779,6 +1779,12 @@ fn mod_ui_active(mod_logic: bool, mod_hud: bool, hud: HudMode) -> bool {
 /// The world-space centre of a voxel cell (occurrence position).
 fn cell_center(x: i32, y: i32, z: i32) -> DVec3 {
     DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
+}
+
+/// Where a sound at cell `(x, y, z)` plays: the cell's physical centre. A round world's storage cell
+/// (x past a billion) sits where its chart embeds it, next to the listener.
+fn sound_at(world: &World, x: i32, y: i32, z: i32) -> DVec3 {
+    crate::space::atlas::embed_cell(world.atlases(), (x, y, z)).unwrap_or_else(|| cell_center(x, y, z))
 }
 
 /// Toggle capture and sync cursor grab with the OS.

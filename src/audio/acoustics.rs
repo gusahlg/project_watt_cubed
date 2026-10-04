@@ -43,6 +43,32 @@ pub struct AcousticWindow {
     origin: IVec3,
     size: UVec3,
     cells: Box<[Cell]>,
+    /// Where the cells live relative to the physical world (identity off round worlds).
+    frame: WindowFrame,
+}
+
+/// The local map from physical positions (listener, sources) into the frame a window's cells are
+/// addressed in. On a round world the window samples storage cells around the eye's storage
+/// position, so a physical point maps to `cell_at + to_cells · (p − phys_at)`: the chart's
+/// embedding linearised at the capture point, exact enough across a window of 2 × 47 blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowFrame {
+    pub phys_at: DVec3,
+    pub cell_at: DVec3,
+    pub to_cells: glam::DMat3,
+}
+
+impl WindowFrame {
+    pub const IDENTITY: Self = Self {
+        phys_at: DVec3::ZERO,
+        cell_at: DVec3::ZERO,
+        to_cells: glam::DMat3::IDENTITY,
+    };
+
+    #[inline]
+    pub fn map(&self, p: DVec3) -> DVec3 {
+        self.cell_at + self.to_cells * (p - self.phys_at)
+    }
 }
 
 impl AcousticWindow {
@@ -58,7 +84,18 @@ impl AcousticWindow {
             origin,
             size,
             cells,
+            frame: WindowFrame::IDENTITY,
         })
+    }
+
+    /// The same cells, addressed through `frame` (see [`WindowFrame`]).
+    pub fn with_frame(mut self, frame: WindowFrame) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    pub fn frame(&self) -> &WindowFrame {
+        &self.frame
     }
 
     /// Recover the cell buffer so a later capture can refill it in place.
@@ -133,10 +170,18 @@ fn cell_absorption(cell: Cell) -> u32 {
 /// Amanatides–Woo DDA from listener to source accumulating absorption × thickness.
 /// `occlusion` is in full-absorption-metres: Σ (absorption/255) × (metres spent in
 /// that cell). Total on `Unloaded` and on degenerate rays — never panics.
+///
+/// `from` and `to` are physical positions; the distance is measured between them and the walk runs
+/// through the window's own frame ([`WindowFrame`]). Only the part of the segment inside the window
+/// is walked cell by cell: everything outside reads `Unloaded`, so it is charged in closed form. The
+/// work is bounded by the window's size whatever the endpoints (a source a billion blocks away once
+/// walked a billion cells on the main thread).
 pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3) -> Coords {
+    let len_phys = (to - from).length();
+    let distance = (len_phys * BLOCK_METERS) as f32;
+    let (from, to) = (win.frame.map(from), win.frame.map(to));
     let delta = to - from;
     let len = delta.length();
-    let distance = (len * BLOCK_METERS) as f32;
 
     // Degenerate or non-finite ray: no traversal, zero occlusion.
     if !len.is_finite() || len <= f64::EPSILON || !from.is_finite() || !to.is_finite() {
@@ -147,6 +192,32 @@ pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3) -> Coords {
     }
 
     let dir = delta / len;
+    // The segment's parameter range inside the window box (slab test); outside it every cell is
+    // `Unloaded`.
+    let lo = win.origin.as_dvec3();
+    let hi = lo + win.size.as_dvec3();
+    let (mut t0, mut t1) = (0.0f64, len);
+    for a in 0..3 {
+        let (f, d) = (from[a], dir[a]);
+        if d == 0.0 {
+            if f < lo[a] || f >= hi[a] {
+                t1 = -1.0;
+            }
+            continue;
+        }
+        let (ta, tb) = ((lo[a] - f) / d, (hi[a] - f) / d);
+        t0 = t0.max(ta.min(tb));
+        t1 = t1.min(ta.max(tb));
+    }
+    let unloaded = UNLOADED_ABSORPTION as f64 * BLOCK_METERS / 255.0;
+    if t1 <= t0 {
+        return Coords {
+            distance,
+            occlusion: (len * unloaded) as f32,
+        };
+    }
+    let outside = t0 + (len - t1);
+    let (from, len) = (from + dir * t0, t1 - t0);
     let mut cell = from.floor().as_ivec3();
 
     // Per-axis DDA setup; a zero component never crosses a boundary (tMax = ∞).
@@ -168,10 +239,10 @@ pub fn trace(win: &AcousticWindow, from: DVec3, to: DVec3) -> Coords {
         }
     }
 
-    let mut occ = 0.0f64;
+    let mut occ = outside * unloaded;
     let mut t = 0.0f64;
-    // Bound the walk by the number of cells the segment can cross; guarantees
-    // termination even if the endpoints sit far outside the window.
+    // Bound the walk by the number of cells the clipped segment can cross (at most the window's
+    // three dimensions) so it always terminates.
     let cap = (len.ceil() as usize) * 3 + 16;
     for _ in 0..cap {
         let axis = if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
@@ -365,6 +436,90 @@ mod tests {
         let open = window(4, Cell::Open);
         let c = trace(&open, DVec3::new(0.5, 0.5, 0.5), DVec3::new(1.5, 0.5, 0.5));
         assert!((c.distance - BLOCK_METERS as f32).abs() < 1e-6);
+    }
+
+    /// Midpoint-rule reference for `trace`'s occlusion in the window's own frame.
+    fn occlusion_by_sampling(win: &AcousticWindow, from: DVec3, to: DVec3, steps: usize) -> f64 {
+        let (from, to) = (win.frame.map(from), win.frame.map(to));
+        let dt = (to - from).length() / steps as f64;
+        (0..steps)
+            .map(|i| {
+                let p = from + (to - from) * ((i as f64 + 0.5) / steps as f64);
+                cell_absorption(win.cell(p.floor().as_ivec3())) as f64 * dt * BLOCK_METERS / 255.0
+            })
+            .sum()
+    }
+
+    /// A window of open cells with a few walls of different absorption.
+    fn walled(size: u32) -> AcousticWindow {
+        let n = size as usize;
+        let cells: Vec<Cell> = (0..n * n * n)
+            .map(|i| match (i % n, (i / n) % n, i / (n * n)) {
+                (3, _, _) => Cell::Solid { absorption: 255 },
+                (_, 5, z) if z > 2 => Cell::Solid { absorption: 90 },
+                (6, y, 4) if y < 6 => Cell::Unloaded,
+                _ => Cell::Open,
+            })
+            .collect();
+        AcousticWindow::new(IVec3::new(-2, -1, 0), UVec3::splat(size), cells.into_boxed_slice()).unwrap()
+    }
+
+    #[test]
+    fn segments_leaving_the_window_charge_the_outside_as_unloaded() {
+        let win = walled(8);
+        let cases = [
+            (DVec3::new(-1.3, 2.2, 3.7), DVec3::new(5.1, 4.9, 6.2)),
+            (DVec3::new(-20.0, 3.5, 4.5), DVec3::new(30.0, 3.5, 4.5)),
+            (DVec3::new(0.25, -9.0, 2.5), DVec3::new(1.75, 12.0, 6.5)),
+            (DVec3::new(-30.0, -30.0, -30.0), DVec3::new(-20.0, -25.0, -21.0)),
+            (DVec3::new(1.5, 2.5, 3.5), DVec3::new(4.5, 5.5, 6.5)),
+        ];
+        for (from, to) in cases {
+            let got = trace(&win, from, to).occlusion as f64;
+            let want = occlusion_by_sampling(&win, from, to, 400_000);
+            assert!((got - want).abs() <= 1e-3 * want.max(1.0), "{from} -> {to}: {got} vs {want}");
+        }
+    }
+
+    /// A source a billion blocks away (a storage cell traced from a physical listener) costs a
+    /// window's worth of steps, not a billion: the outside is charged in closed form.
+    #[test]
+    fn a_source_a_billion_blocks_away_is_traced_in_closed_form() {
+        let open = window(8, Cell::Open);
+        let (from, to) = (DVec3::splat(4.0), DVec3::new(1.1e9, 1.5e7, 1.2e8));
+        let start = std::time::Instant::now();
+        let c = trace(&open, from, to);
+        assert!(start.elapsed() < std::time::Duration::from_millis(20), "took {:?}", start.elapsed());
+        let len = (to - from).length();
+        let inside = 4.0 * len / (to.x - from.x);
+        let want = (len - inside) * UNLOADED_ABSORPTION as f64 * BLOCK_METERS / 255.0;
+        assert!((c.occlusion as f64 - want).abs() <= 1e-6 * want, "{} vs {want}", c.occlusion);
+    }
+
+    /// On a round world the cells are storage cells while listener and source are physical: the
+    /// window's frame carries them over, so a wall between them is heard and the distance stays
+    /// physical.
+    #[test]
+    fn the_window_frame_maps_physical_endpoints_onto_its_cells() {
+        let x0 = 1_100_000_000;
+        // A wall at storage x = x0 + 4.
+        let cells: Vec<Cell> = (0..512)
+            .map(|i| if i % 8 == 4 { Cell::Solid { absorption: 255 } } else { Cell::Open })
+            .collect();
+        // Physical X runs along storage Z, Y along Y, and physical -Z along storage +X with one storage
+        // cell every 1.02 physical blocks.
+        let to_cells = glam::DMat3::from_cols(DVec3::Z, DVec3::Y, DVec3::new(-1.0 / 1.02, 0.0, 0.0));
+        let listener = DVec3::new(10.0, 50.0, -20.0);
+        let frame = WindowFrame { phys_at: listener, cell_at: DVec3::new(x0 as f64 + 2.5, 3.5, 3.5), to_cells };
+        let win = AcousticWindow::new(IVec3::new(x0, 0, 0), UVec3::splat(8), cells.into_boxed_slice())
+            .unwrap()
+            .with_frame(frame);
+        let behind_wall = listener - DVec3::Z * (3.0 * 1.02);
+        let c = trace(&win, listener, behind_wall);
+        assert!((c.distance as f64 - 3.0 * 1.02 * BLOCK_METERS).abs() < 1e-5, "physical distance: {}", c.distance);
+        assert!((c.occlusion as f64 - BLOCK_METERS).abs() < 1e-6, "one full wall cell: {}", c.occlusion);
+        let in_front = listener - DVec3::Z * 1.02;
+        assert_eq!(trace(&win, listener, in_front).occlusion, 0.0, "nothing between");
     }
 
     #[test]
