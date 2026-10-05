@@ -23,6 +23,11 @@
 //!
 //! Light is not baked — every vertex takes neutral daylight (full sky, no
 //! blocklight) so coarse tiles track day/night.
+//!
+//! Each far vertex on a nested +Y section also stores `dy`: how many of this
+//! mesh's packed cells along local +Y the parent level's surface sits from
+//! the vertex. A later band slides the mesh by `a · dy`. `a` stays 0 until
+//! those bands are set.
 use std::cell::RefCell;
 
 use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
@@ -106,6 +111,11 @@ impl DenseGrid<'_> {
         self.cells[i]
     }
 
+    #[inline]
+    fn at(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.cells[(x + z * self.nx) as usize * self.ny as usize + y as usize]
+    }
+
     /// Index delta of one step along world axis `axis` (0=X, 1=Y, 2=Z) in the
     /// column-major `nx × nz × ny` layout.
     #[inline]
@@ -122,13 +132,81 @@ impl DenseGrid<'_> {
     }
 }
 
-/// Merge key: block, micro, and AO must all match — an AO gradient must never
-/// merge into a flat quad (mirrors the chunk mesher's `FaceSample`).
+/// Merge key: block, micro, AO, and the morph of each edge must all match — an AO
+/// gradient must never merge into a flat quad, and a merged quad's vertices share
+/// one `dy` per edge (mirrors the chunk mesher's `FaceSample`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FaceSample {
     block: BlockId,
     micro: [i8; 3],
     ao: [u8; 4],
+    /// `[lower, upper]` in packed cells. Horizontal faces store the same value twice.
+    edge_dy: [i8; 2],
+}
+
+/// Parent offset along local +Y, in this mesh's packed cells. The engine field is
+/// 6-bit signed; every stored `dy` is clamped here so the width can change once.
+const MORPH_LIMIT: i32 = 31;
+
+#[inline]
+fn morph_bits(dy: i64) -> i8 {
+    dy.clamp(-i64::from(MORPH_LIMIT), i64::from(MORPH_LIMIT)) as i8
+}
+
+#[inline]
+fn morph_vertex(v: MeshVertex, dy: i32) -> MeshVertex {
+    v.with_morph(morph_bits(i64::from(dy)))
+}
+
+/// Per packed column: the drawn top, its `dy` toward the parent top, and the
+/// underside of that topmost solid run. `i16::MIN` is an air column. Index is
+/// `x + z * nx` with `nx ≤ 16`.
+struct MorphCols {
+    on: bool,
+    nx: i32,
+    nz: i32,
+    top: [i16; 256],
+    dy: [i8; 256],
+    lip: [i16; 256],
+}
+
+impl MorphCols {
+    fn off() -> Self {
+        Self { on: false, nx: 0, nz: 0, top: [i16::MIN; 256], dy: [0; 256], lip: [0; 256] }
+    }
+
+    #[inline]
+    fn idx(&self, x: i32, z: i32) -> Option<usize> {
+        if self.on && x >= 0 && z >= 0 && x < self.nx && z < self.nz {
+            Some((x + z * self.nx) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn top_at(&self, x: i32, z: i32) -> i16 {
+        self.idx(x, z).map(|i| self.top[i]).unwrap_or(i16::MIN)
+    }
+
+    #[inline]
+    fn dy_at(&self, x: i32, z: i32) -> i8 {
+        self.idx(x, z).map(|i| self.dy[i]).unwrap_or(0)
+    }
+}
+
+/// `dy` at absolute packed height `h` on a wall from `(h0, dy0)` to `(h1, dy1)`.
+/// Endpoints are exact, so the wall meets both horizontal surfaces. Intermediate
+/// heights truncate the same way on every cell that shares them.
+#[inline]
+fn dy_on_span(h: i32, h0: i32, h1: i32, dy0: i32, dy1: i32) -> i32 {
+    if h1 == h0 {
+        return dy0;
+    }
+    let target0 = h0 + dy0;
+    let target1 = h1 + dy1;
+    let pos = target0 + (h - h0) * (target1 - target0) / (h1 - h0);
+    pos - h
 }
 
 /// Face direction with corner winding; micro-offset zero for verticals (never borders).
@@ -170,6 +248,7 @@ fn occluder(grid: &DenseGrid<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, 
 fn face_sample(
     grid: &DenseGrid<'_>,
     tables: &HotTables,
+    morph: &MorphCols,
     dir: &Dir,
     s_n: i32,
     s_u: i32,
@@ -235,12 +314,64 @@ fn face_sample(
         let ov = (corner_uv[i][1] + 1) as usize;
         vertex_ao(opaque[ou][1], opaque[1][ov], opaque[ou][ov])
     });
-    Some(FaceSample { block: me, micro, ao })
+    Some(FaceSample { block: me, micro, ao, edge_dy: face_dy(morph, dir, x, y, z) })
+}
+
+/// `dy` of this face's lower and upper edges. An up face at the column top rises
+/// to the parent top (`P − t`, which can be negative when this column sits above
+/// the columns the parent sampled). Down faces stay put: the parent underside is
+/// not derived. A side vertex takes the `dy` of the horizontal surface it belongs
+/// to — the column top on the upper edge, the neighbour top it stands on (or 0 at
+/// the floor or under an underside) on the lower edge. Section-border overdraw is
+/// this same side face, so its upper edge carries the top it hangs from.
+fn face_dy(morph: &MorphCols, dir: &Dir, x: i32, y: i32, z: i32) -> [i8; 2] {
+    if !morph.on {
+        return [0, 0];
+    }
+    if dir.face.n_axis == 1 {
+        // Undersides (step < 0) do not morph.
+        if dir.face.step > 0 && morph.top_at(x, z) == (y + 1) as i16 {
+            let d = morph.dy_at(x, z);
+            [d, d]
+        } else {
+            [0, 0]
+        }
+    } else {
+        let (nx, nz) = if dir.face.n_axis == 0 { (x + dir.face.step, z) } else { (x, z + dir.face.step) };
+        side_dy(morph, x, z, nx, nz, y)
+    }
+}
+
+/// Per-cell `dy` along the exposed wall of the column's topmost run, so cells that
+/// cannot merge still meet. Endpoints are the neighbour top (or the underside / floor
+/// at `dy` 0) and this column's top.
+fn side_dy(morph: &MorphCols, x: i32, z: i32, nx: i32, nz: i32, y: i32) -> [i8; 2] {
+    let Some(i) = morph.idx(x, z) else { return [0, 0] };
+    let t = i32::from(morph.top[i]);
+    if morph.top[i] == i16::MIN || y + 1 <= i32::from(morph.lip[i]) || y >= t {
+        return [0, 0];
+    }
+    let lip = i32::from(morph.lip[i]);
+    let dy_t = i32::from(morph.dy[i]);
+    let (h0, dy0) = match morph.idx(nx, nz) {
+        Some(ni) if morph.top[ni] != i16::MIN => {
+            let nt = i32::from(morph.top[ni]);
+            if nt > lip && nt < t { (nt, i32::from(morph.dy[ni])) } else { (lip, 0) }
+        }
+        _ => (lip, 0),
+    };
+    if y < h0 || h0 >= t {
+        return [0, 0];
+    }
+    [
+        morph_bits(i64::from(dy_on_span(y, h0, t, dy0, dy_t))),
+        morph_bits(i64::from(dy_on_span(y + 1, h0, t, dy0, dy_t))),
+    ]
 }
 
 /// Greedy-mesh one slab of the packed volume: merge adjacent quads with identical
 /// properties across it (one mesh, vertex coords `0..=16` relative to the slab).
-fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, morph: &MorphCols, out: &mut ChunkMeshData) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -270,7 +401,7 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
                         _ => (u, v + y_lo, n),
                     };
                     let cell = face_sample(
-                        grid, tables, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
+                        grid, tables, morph, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
                     );
                     mask[(u + v * n_u) as usize] = cell;
                     any |= cell.is_some();
@@ -308,6 +439,65 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
             }
         }
     }
+    if emit_seams(grid, tables, morph, out) {
+        emitted = true;
+    }
+    emitted
+}
+
+/// Where two adjacent columns share a top but their parent tops differ, emit a
+/// pair of opposite side quads on that boundary. Both edges start at the shared
+/// top; the lower takes the lower parent `dy` and the upper the higher one, so
+/// the pair is degenerate at `a = 0` and is the parent's side face at `a = 1`.
+fn emit_seams(grid: &DenseGrid<'_>, tables: &HotTables, morph: &MorphCols, out: &mut ChunkMeshData) -> bool {
+    if !morph.on {
+        return false;
+    }
+    let mut emitted = false;
+    {
+        let mut pair = |x0: i32, z0: i32, x1: i32, z1: i32, along_x: bool| {
+            let ta = morph.top_at(x0, z0);
+            let tb = morph.top_at(x1, z1);
+            if ta == i16::MIN || ta != tb {
+                return;
+            }
+            let (da, db) = (morph.dy_at(x0, z0), morph.dy_at(x1, z1));
+            if da == db {
+                return;
+            }
+            let t = i32::from(ta);
+            let cell_y = t - 1;
+            if cell_y < grid.y_lo || cell_y >= grid.y_hi {
+                return;
+            }
+            let (hx, hz) = if da >= db { (x0, z0) } else { (x1, z1) };
+            let sample = FaceSample {
+                block: grid.at(hx, cell_y, hz),
+                micro: [0, 0, 0],
+                ao: [3, 3, 3, 3],
+                edge_dy: [da.min(db), da.max(db)],
+            };
+            let local_y = t - grid.y_lo;
+            if along_x {
+                emit(out, &DIRS[0], x0, z0, local_y, 1, 0, sample, tables);
+                emit(out, &DIRS[1], x1, z0, local_y, 1, 0, sample, tables);
+            } else {
+                emit(out, &DIRS[4], z0, x0, local_y, 1, 0, sample, tables);
+                emit(out, &DIRS[5], z1, x0, local_y, 1, 0, sample, tables);
+            }
+            emitted = true;
+        };
+        for z in 0..morph.nz {
+            for x in 0..morph.nx - 1 {
+                pair(x, z, x + 1, z, true);
+            }
+        }
+        for z in 0..morph.nz - 1 {
+            for x in 0..morph.nx {
+                pair(x, z, x, z + 1, false);
+            }
+        }
+    }
     emitted
 }
 
@@ -337,19 +527,24 @@ fn emit(
         pos[dir.face.n_axis] = origin[dir.face.n_axis] + cr[0] as u32;
         pos[dir.face.u_axis] = origin[dir.face.u_axis] + cr[1] as u32 * w as u32;
         pos[dir.face.v_axis] = origin[dir.face.v_axis] + cr[2] as u32 * h as u32;
-        MeshVertex::new(
-            [pos[0] as u8, pos[1] as u8, pos[2] as u8],
-            dir.face.normal,
-            // Vertex layer only (tables above index by the true id); wraps
-            // past the device texture-layer cap like the chunk mesher.
-            tables.render_layer(BlockId(layer)),
-            Ao::new(sample.ao[i]),
-            // Coarse LOD tiles have no smooth-light field — neutral daylight so
-            // their shading tracks day/night via skylight rather than clamping.
-            Light::DAY,
-            false,
+        // Horizontal faces store one dy twice. A side's lower edge is cr[2] == 0.
+        let dy = if dir.face.n_axis == 1 || cr[2] == 0 { sample.edge_dy[0] } else { sample.edge_dy[1] };
+        morph_vertex(
+            MeshVertex::new(
+                [pos[0] as u8, pos[1] as u8, pos[2] as u8],
+                dir.face.normal,
+                // Vertex layer only (tables above index by the true id); wraps
+                // past the device texture-layer cap like the chunk mesher.
+                tables.render_layer(BlockId(layer)),
+                Ao::new(sample.ao[i]),
+                // Coarse LOD tiles have no smooth-light field — neutral daylight so
+                // their shading tracks day/night via skylight rather than clamping.
+                Light::DAY,
+                false,
+            )
+            .with_micro(sample.micro),
+            i32::from(dy),
         )
-        .with_micro(sample.micro)
     });
     // Same anisotropy fix as the chunk mesher: rotate the quad so the fixed
     // diagonal falls on the darker corner pair, not the brighter one.
@@ -369,7 +564,15 @@ fn emit(
 #[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
     let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
-    mesh_section_with(n_cells, tables, floor, 0, section.pos().cell_size(), |dense| fill_from_section(dense, n_cells, section))
+    mesh_section_with(
+        n_cells,
+        tables,
+        floor,
+        0,
+        section.pos().cell_size(),
+        section.pos().face == Face::PosY,
+        |dense| fill_from_section(dense, n_cells, section),
+    )
 }
 
 /// Lowest native cell a section's border walls must reach so they meet the neighbour.
@@ -403,6 +606,16 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
     tables: &HotTables,
 ) -> SectionMeshData {
+    extract_section_mesh_dy(pos, r#gen, edits, tables, pos.face == Face::PosY)
+}
+
+fn extract_section_mesh_dy<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+    morph_up: bool,
+) -> SectionMeshData {
     let Some((alo, ahi)) = section_window(pos, r#gen) else {
         return SectionMeshData::default();
     };
@@ -412,7 +625,9 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     // but its surface sits far outside that window, so it takes the face sampler.
     let chart = pos.body >= super::CHART_BODY_BASE;
     let floor = if pos.face == Face::PosY && !chart { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
-    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, |dense| {
+    // Morph only +Y. Other faces are rotated into world after meshing, and the
+    // shader always adds `dy` to local Y, which would no longer be altitude.
+    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, morph_up && pos.face == Face::PosY, |dense| {
         sample_columns(pos, r#gen, edits, alo, n_cells, dense);
     });
     mesh.altitude_floor = alo;
@@ -627,12 +842,13 @@ fn mesh_section_with(
     floor: Option<i32>,
     alo: i32,
     cell: i32,
+    morph_up: bool,
     fill: impl FnOnce(&mut [BlockId]),
 ) -> SectionMeshData {
     DENSE_NATIVE.with_borrow_mut(|native| {
         native.resize(SECTION_N * SECTION_N * n_cells, AIR);
         fill(native);
-        mesh_packed(native, n_cells, tables, floor, alo, cell)
+        mesh_packed(native, n_cells, tables, floor, alo, cell, morph_up)
     })
 }
 
@@ -710,7 +926,6 @@ fn relief_shift(ylo: i32, yhi: i32) -> u32 {
 /// grid covers, from that grid alone. Index is `[z][x]` inside the quadrant.
 /// The value is the world altitude of the packed cell's top face, or `None` when
 /// the parent column has no solid parent-sample. The parent mesher draws these.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::world) fn coarser_tops(native: &[BlockId], n_cells: usize, alo: i32, cell: i32) -> [[Option<i32>; 8]; 8] {
     let mut tops = [[None; 8]; 8];
     // Parent cell is 2·cell and the mesh step is 2, so one parent packed column is 4 child cells.
@@ -782,6 +997,69 @@ fn pick_coarse(
     best
 }
 
+/// Parent `dy` for each packed column, in this mesh's cells. Unknown parent tops
+/// and a relief-shift section (`on == false`) stay at 0.
+#[allow(clippy::too_many_arguments)]
+fn morph_columns(
+    native: &[BlockId],
+    n_cells: usize,
+    alo: i32,
+    cell: i32,
+    coarse: &[BlockId],
+    nx: i32,
+    ny: i32,
+    nz: i32,
+    y0: i32,
+    step: i32,
+    on: bool,
+) -> MorphCols {
+    if !on || step != 2 || nx * nz > 256 || nx <= 0 {
+        return MorphCols::off();
+    }
+    let mut morph = MorphCols { on: true, nx, nz, top: [i16::MIN; 256], dy: [0; 256], lip: [0; 256] };
+    let parents = coarser_tops(native, n_cells, alo, cell);
+    let parent_w = 2i32;
+    let scale = i64::from(cell) * i64::from(step);
+    if scale <= 0 {
+        return MorphCols::off();
+    }
+    for z in 0..nz {
+        for x in 0..nx {
+            let base = (x + z * nx) as usize * ny as usize;
+            let mut hy = -1i32;
+            for y in (0..ny).rev() {
+                if coarse[base + y as usize] != AIR {
+                    hy = y;
+                    break;
+                }
+            }
+            if hy < 0 {
+                continue;
+            }
+            let mut lip = hy;
+            while lip > 0 && coarse[base + (lip - 1) as usize] != AIR {
+                lip -= 1;
+            }
+            let t = hy + 1;
+            let i = (x + z * nx) as usize;
+            morph.top[i] = t as i16;
+            morph.lip[i] = lip as i16;
+            let (px, pz) = (x / parent_w, z / parent_w);
+            let Some(p_world) = parents.get(pz as usize).and_then(|row| row.get(px as usize)).copied().flatten() else {
+                continue;
+            };
+            // Drawn top of coarse cell `t - 1`: world Y `alo + (y0 + t·step)·cell`.
+            let face_world = i64::from(alo) + (i64::from(y0) + i64::from(t) * i64::from(step)) * i64::from(cell);
+            let diff = i64::from(p_world) - face_world;
+            if diff.rem_euclid(scale) != 0 {
+                continue;
+            }
+            morph.dy[i] = morph_bits(diff.div_euclid(scale));
+        }
+    }
+    morph
+}
+
 /// Pack the native 32×n×32 occupancy into ≤16-cell columns and greedy-mesh it, one
 /// mesh per stacked 16-cell slab.
 ///
@@ -798,6 +1076,7 @@ fn mesh_packed(
     floor: Option<i32>,
     alo: i32,
     cell: i32,
+    morph_up: bool,
 ) -> SectionMeshData {
     let ny_n = n_cells as i32;
     let (mut min_top, mut yhi) = (ny_n, 0);
@@ -845,6 +1124,21 @@ fn mesh_packed(
                 }
             }
         }
+        // Relief fallback leaves the shared lattice, so that section must not morph.
+        // `morph_up` is +Y only: the shader adds `dy` to local Y.
+        let morph = morph_columns(
+            native,
+            n_cells,
+            alo,
+            cell,
+            coarse,
+            nx,
+            ny,
+            nz,
+            y0,
+            step,
+            morph_up && shift == pack_shift(SECTION_N as i32),
+        );
         MESH_SCRATCH.with_borrow_mut(|scratch| {
             let mut slabs = Vec::new();
             for y_lo in (0..ny).step_by(BLOCK as usize) {
@@ -852,7 +1146,7 @@ fn mesh_packed(
                     m.clear();
                 }
                 let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny) };
-                if build_volume(&grid, tables, scratch) {
+                if build_volume(&grid, tables, &morph, scratch) {
                     slabs.push(SlabMesh {
                         origin_y: (y0 + y_lo * step) as u32,
                         data: std::mem::replace(scratch, new_chunk_mesh_data()),
@@ -1018,6 +1312,10 @@ mod tests {
         for (_, q) in all_quads(mesh) {
             let p: Vec<[f32; 3]> = q.iter().map(|v| v.local_pos()).collect::<Vec<_>>();
             let c = cross(sub(p[1], p[0]), sub(p[3], p[0]));
+            // Seam pairs have zero area at a = 0 (both edges start on the shared top).
+            if c[0] == 0.0 && c[1] == 0.0 && c[2] == 0.0 {
+                continue;
+            }
             let d = q[0].normal().direction();
             let dot = c[0] * d[0] as f32 + c[1] * d[1] as f32 + c[2] * d[2] as f32;
             assert!(dot > 0.0, "quad faces inward: normal {:?}", q[0].normal());
@@ -1117,9 +1415,9 @@ mod tests {
         let grid = |tall: bool| -> Vec<BlockId> {
             (0..SECTION_N * SECTION_N).flat_map(|i| column(if tall && i % SECTION_N < 12 { 1_100 } else { 50 })).collect()
         };
-        let flat = mesh_packed(&grid(false), n_cells, &tables, None, 0, 4);
+        let flat = mesh_packed(&grid(false), n_cells, &tables, None, 0, 4, true);
         assert_eq!((flat.shift, flat.slabs.len()), (1, 1), "flat ground");
-        let cliff = mesh_packed(&grid(true), n_cells, &tables, None, 0, 4);
+        let cliff = mesh_packed(&grid(true), n_cells, &tables, None, 0, 4, true);
         assert!(cliff.shift > flat.shift, "a 4 km cliff coarsens instead of stacking");
         assert!(!cliff.slabs.is_empty() && cliff.slabs.len() <= MAX_SLABS as usize, "{} slabs", cliff.slabs.len());
     }
@@ -1333,7 +1631,7 @@ mod tests {
         let mesh_of = |grid: &[BlockId]| {
             let mut out = new_chunk_mesh_data();
             let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
-            assert!(build_volume(&g, &tables, &mut out), "the feature emits no faces");
+            assert!(build_volume(&g, &tables, &MorphCols::off(), &mut out), "the feature emits no faces");
             out
         };
         let key = |v: MeshVertex| {
@@ -2045,9 +2343,10 @@ mod tests {
     /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
     /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
     /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0x46ae3b3a`: every level
-    /// samples the cell's first block and packs on one shared lattice (seed 42, diffusion,
-    /// default view). The window streaming places there is the eye band.
+    /// what covers the sliver outside the box. Bytes re-pinned to `0x8fb344b6`: a nested +Y
+    /// section stores a parent `dy` on each edge, so a merge stops where `dy` changes and
+    /// seam pairs add vertices. The hash covers positions, normals and layers, not morph
+    /// bits (seed 42, diffusion, default view). The window streaming places there is the eye band.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2059,7 +2358,7 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x46ae3b3a, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0x8fb344b6, "spawn ground-level far-field bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
         assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");
@@ -2254,6 +2553,7 @@ mod tests {
         let mut slabs = 0usize;
         let mut bytes = 0usize;
         let mut sections = 0u32;
+        let mut sat = 0u32;
         let base = super::pack_shift(SECTION_N as i32);
         for &detail in &[FINEST_DETAIL.0, FINEST_DETAIL.0 + 1, FINEST_DETAIL.0 + 2, FINEST_DETAIL.0 + 3] {
             for &(wx, wz) in sites {
@@ -2267,6 +2567,16 @@ mod tests {
                     bytes += mesh.vertex_bytes();
                     if mesh.relief_shift as u32 > base {
                         raised += 1;
+                    }
+                    for slab in &mesh.slabs {
+                        for p in Pass::ALL {
+                            for v in slab.data[p].vertices() {
+                                let m = v.morph();
+                                if m == 31 || m == -31 {
+                                    sat += 1;
+                                }
+                            }
+                        }
                     }
                 }
                 if child.slabs.is_empty() || parent.slabs.is_empty() {
@@ -2305,8 +2615,9 @@ mod tests {
         let mean = if n == 0 { 0.0 } else { sum as f64 / n as f64 };
         let p95 = if n == 0 { 0 } else { diffs[(n - 1) * 95 / 100] };
         println!(
-            "lod_pop_census seed={seed} {label}: pairs={pairs} columns={n} miss={miss} mean={mean:.3} p95={p95} max={} breaks={breaks} raised_shift={raised} sections={sections} slabs={slabs} vertex_bytes={bytes} ms={:.1}",
+            "lod_pop_census seed={seed} {label}: pairs={pairs} columns={n} miss={miss} mean={mean:.3} p95={p95} max={} breaks={breaks} raised_shift={raised} sections={sections} slabs={slabs} vertex_bytes={bytes} quads={} morph_pm31={sat} ms={:.1}",
             diffs.last().copied().unwrap_or(0),
+            bytes / 32,
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -2477,6 +2788,463 @@ mod tests {
                 assert_columns_nest(&r#gen, child, &flat);
                 if detail <= FINEST_DETAIL.0 + 2 {
                     assert_coarser_tops(&r#gen, &tables, child);
+                }
+            }
+        }
+    }
+
+    fn xs32(state: &mut u64) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x as u32
+    }
+
+    /// Home-chart body and a point on its +Y shell.
+    fn home_chart(terra: &Terrain) -> (u16, i32, i32) {
+        use crate::space::atlas::Patch;
+        let home = terra.cosmos().expect("cosmos").home();
+        let index = terra
+            .atlases()
+            .iter()
+            .position(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("home chart");
+        let (origin, size) = terra.atlases()[index].storage_box(Patch::Shell { band: 0, face: Face::PosY });
+        (
+            super::super::CHART_BODY_BASE + index as u16,
+            (origin[0] + size[0] / 2) as i32,
+            (origin[2] + size[2] / 2) as i32,
+        )
+    }
+
+    /// Highest +Y at `(x, z)` after moving each vertex by `a_num/100` of its `dy`.
+    fn column_top_a(pos: SectionPos, mesh: &SectionMeshData, x: i32, z: i32, a_num: i32) -> Option<i64> {
+        let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let scale = 1i64 << detail.0;
+        let mut best: Option<i64> = None;
+        for slab in &mesh.slabs {
+            let place = crate::world::SectionState::slab_placement(pos, slab.origin_y, detail, mesh.altitude_floor);
+            for pass in Pass::ALL {
+                for q in slab.data[pass].vertices().chunks_exact(4) {
+                    if q[0].normal() != Normal::PosY {
+                        continue;
+                    }
+                    let mut minx = i32::MAX;
+                    let mut maxx = i32::MIN;
+                    let mut minz = i32::MAX;
+                    let mut maxz = i32::MIN;
+                    let mut y0 = 0i64;
+                    let mut flat = true;
+                    for (i, v) in q.iter().enumerate() {
+                        let p = v.local_pos();
+                        let gx = place.block.x.wrapping_add((p[0] as i32).wrapping_mul(scale as i32));
+                        let gz = place.block.z.wrapping_add((p[2] as i32).wrapping_mul(scale as i32));
+                        let gy = i64::from(place.block.y)
+                            + i64::from(p[1] as i32) * scale
+                            + i64::from(v.morph()) * scale * i64::from(a_num) / 100;
+                        if i == 0 {
+                            y0 = gy;
+                        } else if gy != y0 {
+                            flat = false;
+                        }
+                        minx = minx.min(gx);
+                        maxx = maxx.max(gx);
+                        minz = minz.min(gz);
+                        maxz = maxz.max(gz);
+                    }
+                    if flat && x >= minx && x <= maxx && z >= minz && z <= maxz {
+                        best = Some(best.map_or(y0, |b| b.max(y0)));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn count_pm31(mesh: &SectionMeshData) -> u32 {
+        let mut n = 0u32;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for v in slab.data[p].vertices() {
+                    let m = v.morph();
+                    if m == 31 || m == -31 {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn morph_clears_without_touching_other_bits(v: MeshVertex) -> bool {
+        let c = v.with_morph(0);
+        c.morph() == 0
+            && v.local_pos() == c.local_pos()
+            && v.normal() == c.normal()
+            && v.layer() == c.layer()
+            && v.ao() == c.ao()
+            && v.light() == c.light()
+            && v.micro() == c.micro()
+            && v.is_water() == c.is_water()
+    }
+
+    type Vk = (i32, i64, i32);
+
+    fn morph_key(origin_y: i32, step: i32, v: MeshVertex, a_num: i32) -> Vk {
+        let p = v.local_pos();
+        let yk = (i64::from(origin_y) + i64::from(p[1] as i32) * i64::from(step)) * 100
+            + i64::from(v.morph()) * i64::from(a_num) * i64::from(step);
+        (p[0] as i32, yk, p[2] as i32)
+    }
+
+    fn quad_has_area(q: [Vk; 4]) -> bool {
+        let (ax, ay, az) = q[0];
+        let ux = i64::from(q[1].0 - ax);
+        let uy = q[1].1 - ay;
+        let uz = i64::from(q[1].2 - az);
+        let vx = i64::from(q[3].0 - ax);
+        let vy = q[3].1 - ay;
+        let vz = i64::from(q[3].2 - az);
+        uy * vz - uz * vy != 0 || uz * vx - ux * vz != 0 || ux * vy - uy * vx != 0
+    }
+
+    fn on_section_border(a: Vk, b: Vk, n: i32) -> bool {
+        (a.0 == 0 && b.0 == 0) || (a.0 == n && b.0 == n) || (a.2 == 0 && b.2 == 0) || (a.2 == n && b.2 == n)
+    }
+
+    /// Closed after the move: every edge is shared by exactly one other quad, except
+    /// section-border edges and the double-sided seam pair (degenerate at a = 0, the
+    /// parent side at a = 1). T-junctions are split before the count. Zero-area quads
+    /// (a collapsed side, a seam that has not opened) contribute no edges.
+    fn assert_watertight(tag: &str, mesh: &SectionMeshData, a_num: i32) {
+        if mesh.slabs.is_empty() || mesh.shift == 0 {
+            return;
+        }
+        let step = 1i32 << mesh.shift;
+        let n = (SECTION_N as i32) >> mesh.shift;
+        let mut kept: Vec<(bool, u8, [Vk; 4])> = Vec::new();
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    let seam = matches!(q[0].normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ)
+                        && q.iter().all(|v| v.local_pos()[1] == q[0].local_pos()[1]);
+                    let keys = std::array::from_fn(|i| morph_key(slab.origin_y as i32, step, q[i], a_num));
+                    if quad_has_area(keys) {
+                        kept.push((seam, q[0].normal() as u8, keys));
+                    }
+                }
+            }
+        }
+        let mut by_xz: std::collections::HashMap<(i32, i32), Vec<i64>> = std::collections::HashMap::new();
+        let mut by_xy: std::collections::HashMap<(i32, i64), Vec<i32>> = std::collections::HashMap::new();
+        let mut by_yz: std::collections::HashMap<(i64, i32), Vec<i32>> = std::collections::HashMap::new();
+        for (_, _, q) in &kept {
+            for &v in q {
+                by_xz.entry((v.0, v.2)).or_default().push(v.1);
+                by_xy.entry((v.0, v.1)).or_default().push(v.2);
+                by_yz.entry((v.1, v.2)).or_default().push(v.0);
+            }
+        }
+        for bin in by_xz.values_mut() {
+            bin.sort_unstable();
+            bin.dedup();
+        }
+        for bin in by_xy.values_mut() {
+            bin.sort_unstable();
+            bin.dedup();
+        }
+        for bin in by_yz.values_mut() {
+            bin.sort_unstable();
+            bin.dedup();
+        }
+        let mut counts: std::collections::HashMap<(Vk, Vk), (u16, u16)> = std::collections::HashMap::new();
+        for (seam, _, q) in &kept {
+            for e in 0..4 {
+                let (a, b) = (q[e], q[(e + 1) % 4]);
+                if a == b {
+                    continue;
+                }
+                let mut pts = vec![a, b];
+                if a.1 == b.1 && a.2 == b.2 {
+                    if let Some(xs) = by_yz.get(&(a.1, a.2)) {
+                        let (lo, hi) = if a.0 < b.0 { (a.0, b.0) } else { (b.0, a.0) };
+                        for &x in xs {
+                            if x > lo && x < hi {
+                                pts.push((x, a.1, a.2));
+                            }
+                        }
+                    }
+                } else if a.0 == b.0 && a.1 == b.1 {
+                    if let Some(zs) = by_xy.get(&(a.0, a.1)) {
+                        let (lo, hi) = if a.2 < b.2 { (a.2, b.2) } else { (b.2, a.2) };
+                        for &z in zs {
+                            if z > lo && z < hi {
+                                pts.push((a.0, a.1, z));
+                            }
+                        }
+                    }
+                } else if a.0 == b.0 && a.2 == b.2 {
+                    if let Some(ys) = by_xz.get(&(a.0, a.2)) {
+                        let (lo, hi) = if a.1 < b.1 { (a.1, b.1) } else { (b.1, a.1) };
+                        for &y in ys {
+                            if y > lo && y < hi {
+                                pts.push((a.0, y, a.2));
+                            }
+                        }
+                    }
+                }
+                pts.sort_unstable();
+                pts.dedup();
+                for w in pts.windows(2) {
+                    let key = if w[0] <= w[1] { (w[0], w[1]) } else { (w[1], w[0]) };
+                    let slot = counts.entry(key).or_insert((0, 0));
+                    if *seam { slot.1 += 1; } else { slot.0 += 1; }
+                }
+            }
+        }
+        let mut bad_n = 0usize;
+        let mut bad = Vec::new();
+        for (edge, count) in &counts {
+            let border = on_section_border(edge.0, edge.1, n);
+            let (solid, seam) = *count;
+            // A seam pair is the double-sided parent side where two child tops matched.
+            // Diagonal columns put four logical faces on one edge; each culled side is
+            // a pair, so the solid/seam counts step by (1, 2): (4, 0) (3, 2) (2, 4)
+            // (1, 6) (0, 8). A flat wall plus one fin is (2, 2); a top or a single wall
+            // meeting a pair is (1, 2); the pair alone or two pairs on one vertical
+            // are (0, 2) and (0, 4).
+            let ok = match (solid, seam, border) {
+                (2, 0, _) | (1, 2, _) | (2, 2, _) | (0, 2, _) | (0, 4, _) => true,
+                (4, 0, _) | (3, 2, _) | (2, 4, _) | (1, 6, _) | (0, 8, _) => true,
+                (1, 0, true) => true,
+                _ => false,
+            };
+            if !ok {
+                bad_n += 1;
+                if bad.len() < 6 {
+                    bad.push((solid, seam, border, *edge));
+                }
+            }
+        }
+        if bad_n > 0 {
+            let (_, _, _, (a, b)) = bad[0];
+            let covers = |p: Vk, r: Vk, a: Vk, b: Vk| {
+                p.0 == r.0 && p.0 == a.0 && p.2 == r.2 && p.2 == a.2 && {
+                    let (lo, hi) = if p.1 < r.1 { (p.1, r.1) } else { (r.1, p.1) };
+                    let (ya, yb) = if a.1 < b.1 { (a.1, b.1) } else { (b.1, a.1) };
+                    lo <= ya && hi >= yb
+                }
+            };
+            let hits: Vec<_> = kept
+                .iter()
+                .filter(|(_, _, q)| (0..4).any(|i| covers(q[i], q[(i + 1) % 4], a, b)))
+                .map(|(seam, nrm, q)| (*seam, *nrm, *q))
+                .take(8)
+                .collect();
+            panic!("watertight {tag} a={a_num}/100: {bad_n} bad edges, first {bad:?} quads {hits:?}");
+        }
+    }
+
+    fn chart_sections(terra: &Terrain) -> Vec<SectionPos> {
+        let (body, cx, cz) = home_chart(terra);
+        let mut state = (cx as u64).wrapping_mul(0x9E37_79B9) ^ ((cz as u64) << 1) ^ 0xA5A5_5A5A;
+        let mut sites = vec![(cx, cz), (cx + 2048, cz), (cx - 1536, cz + 768)];
+        for _ in 0..2 {
+            let dx = (xs32(&mut state) % 6001) as i32 - 3000;
+            let dz = (xs32(&mut state) % 6001) as i32 - 3000;
+            sites.push((cx + dx, cz + dz));
+        }
+        let mut out = Vec::new();
+        for detail in FINEST_DETAIL.0..=FINEST_DETAIL.0 + 3 {
+            for &(wx, wz) in &sites {
+                out.push(section_at(body, Face::PosY, Detail(detail), wx, wz));
+            }
+        }
+        out
+    }
+
+    /// At a = 1 the child's top heightmap equals the parent's, parent column by parent
+    /// column. Relief-shift sections stay at dy 0. Columns whose unclamped dy does not
+    /// fit ±31 are counted and left out: clamping cannot reach the parent top.
+    #[test]
+    fn morph_child_matches_parent_top() {
+        const OWNER: i64 = 1791184794939118871;
+        for seed in [42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let terra = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            let mut pm31 = 0u32;
+            let mut over = 0u32;
+            let mut neg = 0u32;
+            let mut compared = 0u32;
+            let mut fallbacks = 0u32;
+            let mut skipped = 0u32;
+            let nest = super::pack_shift(SECTION_N as i32);
+            for child_pos in chart_sections(&terra) {
+                if super::section_window(child_pos, &terra).is_none() {
+                    continue;
+                }
+                let parent_pos = child_pos.parent();
+                let child = extract_section_mesh(child_pos, &terra, &[], &tables);
+                let parent = extract_section_mesh(parent_pos, &terra, &[], &tables);
+                pm31 += count_pm31(&child);
+                if child.slabs.is_empty() {
+                    continue;
+                }
+                if child.shift as u32 != nest {
+                    fallbacks += 1;
+                    assert!(all_quads(&child).all(|(_, q)| q.iter().all(|v| v.morph() == 0)), "a relief-shift section morphed");
+                    continue;
+                }
+                if parent.slabs.is_empty() || parent.shift as u32 != nest {
+                    skipped += 1;
+                    continue;
+                }
+                let parent_tile = place_tile(parent_pos, &parent);
+                let cc = child_pos.cell_size();
+                let step = 1i32 << child.shift;
+                let scale = i64::from(cc) * i64::from(step);
+                let span = cc * 4;
+                for pz in 0..8 {
+                    for px in 0..8 {
+                        let x = child_pos.min_x().wrapping_add(px * span + span / 2);
+                        let z = child_pos.min_z().wrapping_add(pz * span + span / 2);
+                        let Some(p_top) = top_at(&parent_tile, x, z) else { continue };
+                        let mut clamp = false;
+                        for dz in 0..2 {
+                            for dx in 0..2 {
+                                let cx = px * 2 + dx;
+                                let cz = pz * 2 + dz;
+                                let sx = child_pos.min_x().wrapping_add(cx * cc * step + cc * step / 2);
+                                let sz = child_pos.min_z().wrapping_add(cz * cc * step + cc * step / 2);
+                                let Some(ct) = column_top_a(child_pos, &child, sx, sz, 0) else { continue };
+                                let raw = i64::from(p_top) - ct;
+                                if raw.rem_euclid(scale) != 0 {
+                                    continue;
+                                }
+                                let dy = raw.div_euclid(scale);
+                                if dy < 0 {
+                                    neg += 1;
+                                }
+                                if dy.abs() > 31 {
+                                    clamp = true;
+                                    over += 1;
+                                }
+                            }
+                        }
+                        if clamp {
+                            continue;
+                        }
+                        let got = column_top_a(child_pos, &child, x, z, 100);
+                        assert_eq!(
+                            got,
+                            Some(i64::from(p_top)),
+                            "seed {seed} {child_pos:?} parent column ({px},{pz}) at {x},{z}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+            println!(
+                "morph_target seed={seed}: compared={compared} fallbacks={fallbacks} parent_skipped={skipped} \
+                 neg_columns={neg} columns_over_31={over} vertices_pm31={pm31}"
+            );
+            assert!(compared > 0, "seed {seed} compared no columns");
+        }
+    }
+
+    /// The moved mesh stays closed at a partial band and at the parent. Seam pairs are
+    /// a double-sided skirt; section-border edges may be used once.
+    #[test]
+    fn morph_stays_watertight() {
+        const OWNER: i64 = 1791184794939118871;
+        for seed in [42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let terra = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            let mut n = 0u32;
+            for child_pos in chart_sections(&terra) {
+                if super::section_window(child_pos, &terra).is_none() {
+                    continue;
+                }
+                let child = extract_section_mesh(child_pos, &terra, &[], &tables);
+                if child.slabs.is_empty() {
+                    continue;
+                }
+                assert_watertight(&format!("{child_pos:?}"), &child, 37);
+                assert_watertight(&format!("{child_pos:?}"), &child, 100);
+                n += 1;
+            }
+            assert!(n > 0, "seed {seed} meshed nothing");
+        }
+    }
+
+    /// a = 0 does not move a vertex, and writing dy leaves every other vertex field alone.
+    /// A flat top still merges; its non-morph bits match a mesh built with morph off.
+    #[test]
+    fn morph_is_inert_at_zero() {
+        let (_r, tables, b) = setup();
+        let flat = extract(FINEST, &terrain_gen(&b, 200, 0, None));
+        let on = build_section_mesh(&flat, &tables, None);
+        let n_cells = (super::super::DOMAIN_H / flat.pos().cell_size()) as usize;
+        let off = super::mesh_section_with(n_cells, &tables, None, 0, flat.pos().cell_size(), false, |dense| {
+            super::fill_from_section(dense, n_cells, &flat);
+        });
+        let tops = |m: &SectionMeshData| {
+            all_quads(m).filter(|(_, q)| q[0].normal() == Normal::PosY).collect::<Vec<_>>()
+        };
+        let (on_tops, off_tops) = (tops(&on), tops(&off));
+        assert_eq!(on_tops.len(), 1, "flat top still merges");
+        assert_eq!(off_tops.len(), 1);
+        for (a, c) in on_tops[0].1.iter().zip(off_tops[0].1.iter()) {
+            assert!(morph_clears_without_touching_other_bits(*a));
+            let cleared = a.with_morph(0);
+            assert_eq!(cleared.local_pos(), c.local_pos());
+            assert_eq!(cleared.normal(), c.normal());
+            assert_eq!(cleared.layer(), c.layer());
+            assert_eq!(cleared.ao(), c.ao());
+            assert_eq!(cleared.micro(), c.micro());
+        }
+        assert!(on_tops[0].1.iter().all(|v| v.morph() == on_tops[0].1[0].morph()));
+
+        const OWNER: i64 = 1791184794939118871;
+        for seed in [42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let terra = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            for pos in chart_sections(&terra) {
+                if super::section_window(pos, &terra).is_none() {
+                    continue;
+                }
+                let morphed = extract_section_mesh(pos, &terra, &[], &tables);
+                let plain = super::extract_section_mesh_dy(pos, &terra, &[], &tables, false);
+                assert!(all_quads(&plain).all(|(_, q)| q.iter().all(|v| v.morph() == 0)));
+                let step = 1i32 << morphed.shift.max(1);
+                let cell = pos.cell_size() * step;
+                let nx = SECTION_N as i32 / step;
+                for z in 0..nx {
+                    for x in 0..nx {
+                        let wx = pos.min_x().wrapping_add(x * cell + cell / 2);
+                        let wz = pos.min_z().wrapping_add(z * cell + cell / 2);
+                        assert_eq!(
+                            column_top_a(pos, &morphed, wx, wz, 0),
+                            column_top_a(pos, &plain, wx, wz, 0),
+                            "a=0 top moved at {pos:?} ({x},{z})"
+                        );
+                    }
+                }
+                for (_, q) in all_quads(&morphed) {
+                    assert!(q.iter().all(|v| morph_clears_without_touching_other_bits(*v)));
+                    if q[0].normal() == Normal::PosY {
+                        assert!(q.iter().all(|v| v.morph() == q[0].morph()), "a top quad carries two dys");
+                    }
+                    let seam = matches!(q[0].normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ)
+                        && q.iter().all(|v| v.local_pos()[1] == q[0].local_pos()[1]);
+                    if seam {
+                        assert_eq!(q[0].micro(), [0, 0, 0], "a seam carries border micro");
+                    }
                 }
             }
         }
