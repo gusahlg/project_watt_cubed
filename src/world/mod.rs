@@ -49,6 +49,7 @@ mod edits;
 mod heightmip;
 pub(crate) mod lanes;
 mod metric;
+mod morph;
 mod quadtree;
 mod query;
 mod seam;
@@ -1414,6 +1415,13 @@ pub struct World {
     /// Visible sections (covering-resolved) — the desired cut this frame. Feeds
     /// `unload_sections` and the coverage projection.
     section_visible: Vec<(SectionPos, QuadrantMask)>,
+    /// Morph bands for [`section_visible`](Self::section_visible), index = engine mesh detail.
+    /// A level with `start >= end` does not move. `WATT_MORPH_FORCE` overrides these in `render`.
+    lod_morph: [voxel_engine::LodMorph; 16],
+    /// Fingerprint of the cut `lod_morph` was built from. `0` is the cleared (no centre) state.
+    lod_morph_key: u64,
+    /// `render` pushes `lod_morph` once this is set. Quiet frames compare and return.
+    lod_morph_set: bool,
     /// Drawn-coverage projection over successive LOD cuts (hard pop). Presentation
     /// only; never affects selection logic.
     section_fade: coverage::Coverage,
@@ -1666,6 +1674,9 @@ impl World {
             section_overlay: FastMap::default(),
             section_desired: Vec::new(),
             section_visible: Vec::new(),
+            lod_morph: [voxel_engine::LodMorph::default(); 16],
+            lod_morph_key: 0,
+            lod_morph_set: false,
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
             near_bounds: streaming::NearBounds::default(),
@@ -1768,9 +1779,12 @@ impl World {
         // exactly the old full-res radius.
         let (min, max) = self.lod_clip_box(cam);
         f.set_lod_clip_box(min, max);
-        let bands = forced_morph();
-        if !bands.is_empty() {
-            f.set_lod_morph(bands);
+        // A forced band wins. Otherwise the cut's own bands (an all-zero slice is morph off).
+        let forced = forced_morph();
+        if !forced.is_empty() {
+            f.set_lod_morph(forced);
+        } else if self.lod_morph_set {
+            f.set_lod_morph(&self.lod_morph);
         }
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.

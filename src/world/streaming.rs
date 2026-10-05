@@ -835,7 +835,7 @@ fn ring_reach(outer: f64, span: f64) -> f64 {
 
 /// Storage block the chart frontier treats as the eye: the centre chunk's middle, plus the
 /// prediction delta. Y is the streamed altitude, not the chunk layer.
-fn storage_eye_block(center: Coord, eye_y: f64, delta: DVec3) -> (i64, i64, i64) {
+pub(in crate::world) fn storage_eye_block(center: Coord, eye_y: f64, delta: DVec3) -> (i64, i64, i64) {
     let cs = CHUNK_SIZE as i64;
     let x = center.x as i64 * cs + cs / 2 + delta.x.round() as i64;
     let z = center.z as i64 * cs + cs / 2 + delta.z.round() as i64;
@@ -1483,7 +1483,7 @@ impl World {
     /// The far field's descheduling horizon in metres from its eye: the ladder's outer edge, and on
     /// a chart the half-diagonal of the coarsest ring's square of sections, whose corners reach
     /// far past that edge. The selection is untouched; only the worker gate reads this.
-    fn far_horizon(&self) -> f64 {
+    pub(in crate::world) fn far_horizon(&self) -> f64 {
         let outer = f64::from(self.far_pyramid().outer_m());
         let chart = self.far_atlas.and_then(|i| self.chart_pyramid(self.seams.atlases()[i].radius));
         let Some((cfg, max_d)) = chart else { return outer };
@@ -1521,7 +1521,7 @@ impl World {
 
     /// Whether far-field centre `center` stands on a round world's chart: in or above a storage
     /// box that is not a warped cube's.
-    fn section_on_chart(&self, center: Coord) -> bool {
+    pub(in crate::world) fn section_on_chart(&self, center: Coord) -> bool {
         let (_, _, in_cube) = self.lod_place(center);
         !in_cube && self.seams.in_column(center)
     }
@@ -3869,7 +3869,7 @@ impl World {
         (i64::from(ra) - i64::from(sa)) * i64::from(CHUNK_SIZE as i32)
     }
 
-    fn section_metric_on(&self, center: Coord, delta: DVec3, face: Face, datum: i32) -> EyeMetric {
+    pub(in crate::world) fn section_metric_on(&self, center: Coord, delta: DVec3, face: Face, datum: i32) -> EyeMetric {
         let (center, eye_y, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
         let cfg = &self.section_pyramid;
@@ -4260,7 +4260,7 @@ impl World {
 
     /// Full-res vertical block range (`y1` exclusive) the punch tests against: the punch window on
     /// a chart, else the mesh box. Up is storage Y.
-    fn near_y_range(&self, center: Coord) -> (i64, i64) {
+    pub(in crate::world) fn near_y_range(&self, center: Coord) -> (i64, i64) {
         let cs = CHUNK_SIZE as i64;
         if let Some([lo, hi]) = self.window.punch {
             return (i64::from(lo) * cs, (i64::from(hi) + 1) * cs);
@@ -4272,7 +4272,7 @@ impl World {
 
     /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so this
     /// is the footprint a chart section overlaps when it meets the near square.
-    fn near_block_box(&self, center: Coord) -> (i64, i64, i64, i64) {
+    pub(in crate::world) fn near_block_box(&self, center: Coord) -> (i64, i64, i64, i64) {
         let cs = CHUNK_SIZE as i64;
         let h = self.view.horizontal as i64;
         (
@@ -4490,6 +4490,7 @@ impl World {
     /// stale coarse cubes over an otherwise missing far field.
     pub(in crate::world) fn rebuild_section_visible(&mut self, eng: Option<&mut Engine>) {
         let Some(center) = self.section_center() else {
+            self.recompute_lod_morph();
             return;
         };
         let desired = std::mem::take(&mut self.section_desired);
@@ -4508,6 +4509,7 @@ impl World {
             self.pending_sections.set();
         }
         self.section_visible = cut.iter().copied().collect();
+        self.recompute_lod_morph();
         // Adopt the new cut (hard pop); it decides what actually draws.
         let changed = self.section_fade.update_now(&self.section_visible);
         // The mask is a projection of that decision, so it follows the same diff —
