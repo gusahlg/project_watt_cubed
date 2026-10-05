@@ -18,6 +18,8 @@ pub(in crate::world) type VisibilityChange = (SectionPos, Option<QuadrantMask>);
 #[derive(Default)]
 pub(in crate::world) struct Coverage {
     settled: FastMap<SectionPos, QuadrantMask>,
+    /// The previous cut's map, kept for its allocation.
+    spare: FastMap<SectionPos, QuadrantMask>,
 }
 
 impl Coverage {
@@ -30,18 +32,17 @@ impl Coverage {
     /// change (same region, different quadrants) is caught even though it is neither an
     /// enter nor a leave. Diffing the projection cannot omit a case it did not think of.
     pub fn update(&mut self, cut: &[(SectionPos, QuadrantMask)]) -> Vec<VisibilityChange> {
-        let desired: FastMap<SectionPos, QuadrantMask> = cut.iter().copied().collect();
-        let changes: Vec<VisibilityChange> = self
+        let mut desired = std::mem::take(&mut self.spare);
+        desired.clear();
+        desired.extend(cut.iter().copied());
+        let mut changes: Vec<VisibilityChange> = self
             .settled
-            .keys()
-            .chain(desired.keys())
-            .copied()
-            .collect::<super::FastSet<_>>()
-            .into_iter()
-            .filter(|pos| self.settled.get(pos) != desired.get(pos))
-            .map(|pos| (pos, desired.get(&pos).copied()))
+            .iter()
+            .filter(|&(pos, m)| desired.get(pos) != Some(m))
+            .map(|(&pos, _)| (pos, desired.get(&pos).copied()))
             .collect();
-        self.settled = desired;
+        changes.extend(desired.iter().filter(|(pos, _)| !self.settled.contains_key(pos)).map(|(&pos, &m)| (pos, Some(m))));
+        self.spare = std::mem::replace(&mut self.settled, desired);
         changes
     }
 
