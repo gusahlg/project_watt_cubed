@@ -74,6 +74,55 @@ impl PyramidCfg {
     }
 }
 
+/// Smoothstep start: inside this fraction of the band the vertex stays put.
+const MORPH_START: f32 = 0.6;
+/// Vertical half while the eye is inside the height envelope, so altitude
+/// cannot trip the Chebyshev term ahead of the horizontal rings.
+const MORPH_HALF_Y: f32 = 1.0e8;
+
+/// One band per non-coarsest ring, written into `out`.
+///
+/// The vertex shader indexes by the mesh's placement detail. A 32-column
+/// section always packs by at least one bit, so section detail `d` is drawn
+/// at detail `d + 1` and reads `out[d + 1]`. The half stored there is that
+/// section's own ring: outer reach minus one section span, which puts `a = 1`
+/// a span inside the staircase where the next level takes over. The coarsest
+/// ring is left out (its slot stays zero). Returns one past the last filled
+/// index, or 0 when the ladder has no parent. `out` must start zeroed; only
+/// the filled slots are written.
+pub(in crate::world) fn lod_morph_bands(
+    cfg: &PyramidCfg,
+    altitude_dy: f32,
+    out: &mut [voxel_engine::LodMorph; 16],
+) -> usize {
+    let levels = cfg.levels.get();
+    if levels <= 1 {
+        return 0;
+    }
+    let half_y = if altitude_dy > 0.0 {
+        super::metric::DyCap::new(cfg.outer_m(), cfg.base).get()
+    } else {
+        MORPH_HALF_Y
+    };
+    let mut end = 0usize;
+    for ring in 0..levels - 1 {
+        let detail = cfg.finest.0 as i32 + ring as i32 * cfg.step() as i32;
+        let index = detail + 1;
+        if !(0..16).contains(&index) {
+            continue;
+        }
+        let outer = cfg.unit * cfg.base.powi(ring as i32 + 1);
+        let span = super::section::section_span(Detail(detail as i8)) as f32;
+        let half_xz = outer - span;
+        out[index as usize] = voxel_engine::LodMorph {
+            half: voxel_engine::Vec3::new(half_xz, half_y, half_xz),
+            start: MORPH_START,
+        };
+        end = end.max(index as usize + 1);
+    }
+    end
+}
+
 /// `finest.0 + ring*step` widened to i64 before summing, then clamped into
 /// `Detail`'s i8 range — a large ring count (corrupt cfg, or `step` pushing the
 /// u8 product past 127) must saturate at the coarsest representable Detail,
@@ -191,6 +240,55 @@ mod tests {
         assert_eq!(level_for(d(4096.0), &cfg), LodChoice::BeyondHorizon);
         // Infinity clamps to finest ring (EyeDist enforces finite values).
         assert_eq!(level_for(d(f32::INFINITY), &cfg), LodChoice::Level(Detail(2)));
+    }
+
+    fn zero_bands() -> [voxel_engine::LodMorph; 16] {
+        [voxel_engine::LodMorph { half: voxel_engine::Vec3::ZERO, start: 0.0 }; 16]
+    }
+
+    /// Default ladder: bands sit at the placement detail, double each ring, and
+    /// stop one span inside the ring. A raised eye uses the altitude cap.
+    #[test]
+    fn morph_bands_end_one_span_inside_and_grow_with_the_ring() {
+        let cfg = PyramidCfg::sections(96.0);
+        let mut bands = zero_bands();
+        let n = lod_morph_bands(&cfg, 0.0, &mut bands);
+        assert_eq!(n, 9, "placement detail of section 7 is 8; the prefix stops after it");
+        for i in 0..3 {
+            assert_eq!(bands[i].half.x, 0.0, "no section is placed at detail {i}");
+        }
+        let mut prev = 0.0f32;
+        for ring in 0..6 {
+            let detail = 2 + ring;
+            let index = (detail + 1) as usize;
+            let outer = 96.0 * 2f32.powi(ring + 1);
+            let span = super::super::section::section_span(Detail(detail as i8)) as f32;
+            assert_eq!(bands[index].half.x, outer - span, "detail {detail}");
+            assert_eq!(bands[index].half.z, bands[index].half.x);
+            assert_eq!(bands[index].half.y, 1.0e8);
+            assert_eq!(bands[index].start, 0.6);
+            assert!(bands[index].half.x > prev, "halves grow with the ring");
+            prev = bands[index].half.x;
+        }
+        assert_eq!(bands[3].half.x, 64.0);
+
+        let mut raised = zero_bands();
+        assert_eq!(lod_morph_bands(&cfg, 1.0, &mut raised), 9);
+        assert_eq!(raised[3].half.y, cfg.outer_m() * 0.5, "DyCap when the eye leaves the envelope");
+        assert_eq!(raised[8].half.y, raised[3].half.y);
+
+        let one = PyramidCfg::sections_with(96.0, 1, 2);
+        let mut lone = zero_bands();
+        assert_eq!(lod_morph_bands(&one, 0.0, &mut lone), 0, "a ladder with no parent morphs nothing");
+
+        // unit 16: the finest ring's outer reach is inside one section, so the
+        // half is negative and that level stays disabled.
+        let tiny = PyramidCfg::sections(16.0);
+        let mut neg = zero_bands();
+        lod_morph_bands(&tiny, 0.0, &mut neg);
+        let span2 = super::super::section::section_span(Detail(2)) as f32;
+        assert_eq!(neg[3].half.x, 16.0 * 2.0 - span2);
+        assert!(neg[3].half.x < 0.0);
     }
 
 }

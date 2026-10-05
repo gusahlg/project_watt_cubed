@@ -343,6 +343,67 @@ impl Unfold {
         c
     }
 
+    /// [`fold`](Self::fold) for one storage block corner. Home and physical blocks stay put.
+    /// A neighbour block keeps its place in the virtual chunk: a flipped axis mirrors the
+    /// offset (`CS - local`), so local 0 lands on the next virtual chunk's origin — the
+    /// image of that corner, not the cell `CS - 1 - local` and not [`fold_column`](Self::fold_column)'s
+    /// centre. `None` outside the net.
+    pub fn fold_block(&self, x: i64, y: i64, z: i64) -> Option<(i64, i64, i64)> {
+        let c = [x.div_euclid(CS) as i32, y.div_euclid(CS) as i32, z.div_euclid(CS) as i32];
+        let local = [x.rem_euclid(CS) as i32, y.rem_euclid(CS) as i32, z.rem_euclid(CS) as i32];
+        let (v, loc) = self.map_block(c, local, |sign, src| if sign > 0 { src } else { CS as i32 - src })?;
+        let p: [i64; 3] = std::array::from_fn(|a| i64::from(v[a]) * CS + i64::from(loc[a]));
+        Some((p[0], p[1], p[2]))
+    }
+
+    /// [`fold_block`](Self::fold_block) for a continuous point. A flipped axis sends `local` to `CS - local`.
+    pub fn fold_point(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        if p.iter().any(|c| !c.is_finite()) {
+            return None;
+        }
+        let cs = CS as f64;
+        let c = [p[0].div_euclid(cs) as i32, p[1].div_euclid(cs) as i32, p[2].div_euclid(cs) as i32];
+        let local = [p[0] - c[0] as f64 * cs, p[1] - c[1] as f64 * cs, p[2] - c[2] as f64 * cs];
+        let (v, loc) = self.map_block(c, local, |sign, src| if sign > 0 { src } else { cs - src })?;
+        Some(std::array::from_fn(|a| f64::from(v[a]) * cs + loc[a]))
+    }
+
+    /// The block corner `(x, y, z)` in this net, as a mesh placement origin. Outside the net
+    /// the corner stays where it is. Values that do not fit in `i32` stay on the raw corner.
+    pub(in crate::world) fn corner_block(&self, x: i32, y: i32, z: i32) -> voxel_engine::IVec3 {
+        let raw = (i64::from(x), i64::from(y), i64::from(z));
+        let (fx, fy, fz) = self.fold_block(raw.0, raw.1, raw.2).unwrap_or(raw);
+        let fit = |folded: i64, was: i32| i32::try_from(folded).unwrap_or(was);
+        voxel_engine::IVec3::new(fit(fx, x), fit(fy, y), fit(fz, z))
+    }
+
+    /// Chunk classify shared by [`fold_block`](Self::fold_block) and [`fold_point`](Self::fold_point).
+    /// Returns the virtual chunk and the offset inside it (`mirror` maps one axis).
+    /// Home, then a side, then a physical chunk, then `None`.
+    fn map_block<T: Copy>(&self, c: [i32; 3], local: [T; 3], mirror: impl Fn(i32, T) -> T) -> Option<([i32; 3], [T; 3])> {
+        let Some((lo, hi)) = self.home else { return Some((c, local)) };
+        if inside(c, lo, hi) {
+            return Some((c, local));
+        }
+        if let Some(s) = self.sides.iter().flatten().find(|s| inside(c, s.lo, s.hi)) {
+            let v = s.to_virtual(c);
+            let mut out = local;
+            for a in 0..3 {
+                for b in 0..3 {
+                    let sign = s.cols[a][b];
+                    if sign != 0 {
+                        out[a] = mirror(sign, local[b]);
+                    }
+                }
+            }
+            return Some((v, out));
+        }
+        if c[0] < self.storage_cx0 {
+            return Some((c, local));
+        }
+        None
+    }
+
     /// [`fold`](Self::fold) for storage block column `(x, z)`, which the far field's sections are:
     /// home columns are themselves, a neighbour chart's the centre of the virtual chunk column
     /// beyond its side, physical columns themselves, and `None` for storage outside the net.
@@ -982,6 +1043,46 @@ mod tests {
         assert!((sh.x - s.x).abs() < 0.01 && (sh.z - s.z).abs() < 0.01, "{sh:?} vs {s:?}");
         assert!((sh.y - (o[1] as f64 + (b.r_hi - b.r_lo) as f64 - 0.5 + 300.0)).abs() < 0.01);
         assert_eq!(seams.storage_eye(a.centre + dir * (b.r_hi as f64 + 5000.0), 1000.0), None, "beyond reach");
+    }
+
+    /// A neighbour chunk's blocks land on distinct net corners, and a section's min corner
+    /// (local 0) is that corner — not the chunk centre [`Unfold::fold_column`] reports.
+    #[test]
+    fn fold_block_keeps_the_corner_across_a_seam() {
+        let a = atlas();
+        let seams = Seams::new(vec![a.clone()]);
+        let home = seam_chunk(&a);
+        let u = seams.unfold_at(home);
+        let across = seams.across(home, Face::PosX).expect("seam");
+        let real = across.chunk;
+        let mut images = std::collections::BTreeSet::new();
+        for ly in 0..16 {
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let (x, y, z) = (
+                        i64::from(real.x) * CS + lx,
+                        i64::from(real.y) * CS + ly,
+                        i64::from(real.z) * CS + lz,
+                    );
+                    let got = u.fold_block(x, y, z).expect("neighbour is on the net");
+                    assert!(images.insert(got), "two blocks share {got:?}");
+                    let p = u.fold_point([x as f64 + 0.25, y as f64, z as f64]).expect("point");
+                    assert!((p[1] - got.1 as f64).abs() < 1e-9);
+                }
+            }
+        }
+        assert_eq!(images.len(), 16 * 16 * 16);
+        // Home and physical corners stay put. Outside the net is absent.
+        let (hx, hy, hz) = (i64::from(home.x) * CS, i64::from(home.y) * CS + 3, i64::from(home.z) * CS + 5);
+        assert_eq!(u.fold_block(hx, hy, hz), Some((hx, hy, hz)));
+        assert_eq!(u.fold_point([hx as f64 + 0.5, hy as f64, hz as f64]), Some([hx as f64 + 0.5, hy as f64, hz as f64]));
+        assert_eq!(Unfold::IDENTITY.fold_block(hx, hy, hz), Some((hx, hy, hz)));
+        assert_eq!(u.fold_block(4, 8, 12), Some((4, 8, 12)), "physical");
+        let origin = u.corner_block(real.x * 16, real.y * 16, real.z * 16);
+        let centre = u.fold_column(i64::from(real.x) * CS, i64::from(real.z) * CS).expect("column");
+        assert_ne!((i64::from(origin.x), i64::from(origin.z)), centre, "a min corner is not the chunk centre");
+        let raw = u.fold_block(i64::from(real.x) * CS, i64::from(real.y) * CS, i64::from(real.z) * CS).unwrap();
+        assert_eq!((origin.x, origin.y, origin.z), (raw.0 as i32, raw.1 as i32, raw.2 as i32));
     }
 
     #[test]

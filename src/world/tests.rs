@@ -4039,3 +4039,147 @@ fn asteroid_entry_breakdown() {
     );
     assert!(finished, "entry did not complete within 300s: {}", world.entry_debug());
 }
+
+/// Bands follow the drawn ladder, end one span inside each ring, and disappear with lod2.
+#[test]
+fn lod_morph_tracks_the_ladder_and_is_off_without_lod2() {
+    let mut world = World::with_config_lazy(1, RenderConfig::default());
+    world.center = Some(ChunkCoord::new(0, 2, 0));
+    world.section_eye_y = 80.0;
+    let mut bands = [LodMorph { half: Vec3::ZERO, start: 0.0 }; 16];
+    crate::alloc_count::reset();
+    let n = world.write_lod_morph(&mut bands);
+    assert_eq!(crate::alloc_count::alloc_count(), 0, "filling the morph bands allocates");
+    assert_eq!(n, 9);
+    assert_eq!(bands[3].half.x, 64.0);
+    assert_eq!(bands[4].half.x, 128.0);
+    assert_eq!(bands[3].half.z, bands[3].half.x);
+    assert_eq!(bands[3].half.y, 1.0e8);
+    assert_eq!(bands[3].start, 0.6);
+    let mut prev = 0.0f32;
+    for i in 3..9 {
+        assert!(bands[i].half.x > prev, "band {i}");
+        assert_eq!(bands[i].half.x, bands[i].half.z);
+        prev = bands[i].half.x;
+    }
+    world.section_eye_y = 10_000.0;
+    let mut high = [LodMorph { half: Vec3::ZERO, start: 0.0 }; 16];
+    assert_eq!(world.write_lod_morph(&mut high), 9);
+    assert_eq!(high[3].half.y, 6144.0, "DyCap of the default pyramid");
+
+    world.note_morph_eye(DVec3::new(10.5, 80.0, -3.25));
+    assert_eq!(world.morph_eye, DVec3::new(10.5, 80.0, -3.25));
+    world.note_morph_eye(DVec3::new(f64::NAN, 0.0, 0.0));
+    assert_eq!(world.morph_eye, DVec3::ZERO);
+    assert_eq!(world.morph_eye_for(DVec3::new(4.0, 5.0, 6.0)), DVec3::new(4.0, 5.0, 6.0));
+
+    let mut off_cfg = RenderConfig::default();
+    off_cfg.lod2 = false;
+    let off = World::with_config_lazy(1, off_cfg);
+    let mut none = [LodMorph { half: Vec3::ZERO, start: 0.0 }; 16];
+    assert_eq!(off.write_lod_morph(&mut none), 0);
+    assert_eq!(off.morph_eye_for(DVec3::new(4.0, 5.0, 6.0)), DVec3::ZERO);
+}
+
+/// Chart placement origin is the section corner in the frontier net, including across a seam.
+/// A fold change dirties a Ready neighbour section and leaves a Meshing one and a home one.
+#[test]
+fn chart_corner_is_the_morph_origin_and_a_fold_change_dirties_ready_neighbours() {
+    use crate::world::generation::WorldgenKind;
+    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let eye = world.home_eye(DVec3::new(0.0, 1.0, 0.0), 0.0);
+    let storage = world.chart_eye(eye).expect("the start world has a chart under +Y");
+    let centre = ChunkCoord::new(
+        (storage.x / 16.0).floor() as i32,
+        (storage.y / 16.0).floor() as i32,
+        (storage.z / 16.0).floor() as i32,
+    );
+    assert!(world.set_far_center(centre));
+    assert!(!world.far_fold.is_identity());
+    let seat = world.seams.chart_seat(centre).expect("chart seat");
+
+    let span = section::section_span(section::FINEST_DETAIL);
+    let (hx, hy, hz) = ((centre.x * 16).div_euclid(span) * span, centre.y * 16, (centre.z * 16).div_euclid(span) * span);
+    let home_corner = world.far_fold.corner_block(hx, hy, hz);
+    assert_eq!((home_corner.x, home_corner.y, home_corner.z), (hx, hy, hz), "a home corner stays in storage");
+
+    let mid_x = (seat.lo[0] / 16) as i32 + ((seat.hi[0] - seat.lo[0]) / 32) as i32;
+    let mid_z = (seat.lo[2] / 16) as i32 + ((seat.hi[2] - seat.lo[2]) / 32) as i32;
+    let mut seam_chunk = None;
+    for face in [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ] {
+        let (ax, az) = match face {
+            Face::PosX => ((seat.hi[0] / 16) as i32 - 1, mid_z),
+            Face::NegX => ((seat.lo[0] / 16) as i32, mid_z),
+            Face::PosZ => (mid_x, (seat.hi[2] / 16) as i32 - 1),
+            _ => (mid_x, (seat.lo[2] / 16) as i32),
+        };
+        for dy in 1..6 {
+            let edge = ChunkCoord::new(ax, (seat.lo[1] / 16) as i32 + dy, az);
+            let Some(across) = world.seams.across(edge, face) else { continue };
+            let (nx, ny, nz) = (across.chunk.x * 16, across.chunk.y * 16, across.chunk.z * 16);
+            let mapped = world.far_fold.fold_block(i64::from(nx), i64::from(ny), i64::from(nz));
+            if mapped.is_some_and(|p| (p.0, p.2) != (i64::from(nx), i64::from(nz))) {
+                seam_chunk = Some((nx, ny, nz));
+                break;
+            }
+        }
+        if seam_chunk.is_some() {
+            break;
+        }
+    }
+    let (nx, ny, nz) = seam_chunk.expect("a neighbour chunk on the net");
+    let origin = world.far_fold.corner_block(nx, ny, nz);
+    assert_ne!((origin.x, origin.z), (nx, nz), "the neighbour corner is not its storage corner");
+    let folded = world.far_fold.fold_block(i64::from(nx), i64::from(ny), i64::from(nz)).unwrap();
+    assert_eq!((i64::from(origin.x), i64::from(origin.y), i64::from(origin.z)), folded);
+
+    let body = section::CHART_BODY_BASE + seat.index as u16;
+    let base_x = nx.div_euclid(span);
+    let base_z = nz.div_euclid(span);
+    let mut neighbour = None;
+    'search: for dx in -1..=2 {
+        for dz in -1..=2 {
+            let pos = SectionPos {
+                detail: section::FINEST_DETAIL,
+                body,
+                face: Face::PosY,
+                x: base_x + dx,
+                z: base_z + dz,
+            };
+            let (x, z) = (i64::from(pos.min_x()), i64::from(pos.min_z()));
+            if world.far_fold.fold_column(x, z) != seam::Unfold::IDENTITY.fold_column(x, z) {
+                neighbour = Some(pos);
+                break 'search;
+            }
+        }
+    }
+    let neighbour = neighbour.expect("a section whose column moves when the net drops");
+    let home_pos = SectionPos {
+        detail: section::FINEST_DETAIL,
+        body,
+        face: Face::PosY,
+        x: hx.div_euclid(span),
+        z: hz.div_euclid(span),
+    };
+    assert_ne!(home_pos, neighbour);
+    assert_eq!(
+        world.far_fold.fold_column(i64::from(home_pos.min_x()), i64::from(home_pos.min_z())),
+        Some((i64::from(home_pos.min_x()), i64::from(home_pos.min_z())))
+    );
+    let meshing = SectionPos { x: neighbour.x.saturating_add(8), ..neighbour };
+    let cube = SectionPos { body: 0, ..neighbour };
+    let ready = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    world.sections.insert(neighbour, ready);
+    world.sections.insert(home_pos, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+    world.sections.insert(meshing, SectionState::Meshing { token: pipeline::ClaimToken(1) });
+    world.sections.insert(cube, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+
+    let physical = ChunkCoord::new(0, 2, 0);
+    assert_ne!(physical, centre);
+    assert!(world.set_far_center(physical));
+    assert!(world.far_fold.is_identity());
+    assert!(world.dirty_sections.contains(&neighbour), "the ready neighbour must re-upload");
+    assert!(!world.dirty_sections.contains(&home_pos), "the home column did not move");
+    assert!(!world.dirty_sections.contains(&meshing), "an in-flight section is not freed");
+    assert!(!world.dirty_sections.contains(&cube), "a cube section keeps its block placement");
+}

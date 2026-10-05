@@ -64,6 +64,10 @@ impl DyCap {
     pub fn new(outer_m: f32, base: f32) -> DyCap {
         DyCap(outer_m * (1.0 - 1.0 / base))
     }
+
+    pub(in crate::world) fn get(self) -> f32 {
+        self.0
+    }
 }
 
 /// Ground-plane projection of a distance band's outer radius. `None` when the band
@@ -124,6 +128,12 @@ impl EyeMetric {
             0.0
         };
         raw.min(self.cap)
+    }
+
+    /// Altitude offset against the height envelope, already clamped by [`DyCap`].
+    /// Zero while the eye sits inside the envelope.
+    pub(in crate::world) fn altitude_dy(self) -> f32 {
+        self.dy
     }
 
     /// Integer grid cell containing the eye's XZ position.

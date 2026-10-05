@@ -1052,8 +1052,96 @@ impl World {
         if self.far_center.replace(centre) == Some(centre) {
             return false;
         }
-        self.far_fold = self.far_unfold(centre);
+        let next = self.far_unfold(centre);
+        if next != self.far_fold {
+            self.retarget_chart_sections(&next);
+            self.far_fold = next;
+        }
         true
+    }
+
+    /// Ready chart sections whose column moved in the net are marked dirty so
+    /// they re-upload at the new corner. Pinned meshes ignore a placement rewrite.
+    /// Meshing sections are left: their upload reads the fold current at landing.
+    fn retarget_chart_sections(&mut self, next: &super::seam::Unfold) {
+        let prev = self.far_fold;
+        // The section walk cannot borrow `sections` and insert into `dirty_sections` together.
+        let mut dirty = std::mem::take(&mut self.dirty_sections);
+        for (pos, state) in &self.sections {
+            if pos.body < super::section::CHART_BODY_BASE || !state.is_ready() {
+                continue;
+            }
+            let (x, z) = (i64::from(pos.min_x()), i64::from(pos.min_z()));
+            if prev.fold_column(x, z) != next.fold_column(x, z) {
+                dirty.insert(*pos);
+            }
+        }
+        self.dirty_sections = dirty;
+    }
+
+    /// Far eye in the frontier frame. A non-finite eye, or one outside the net, stores zero.
+    pub(in crate::world) fn note_morph_eye(&mut self, far: DVec3) {
+        self.morph_eye = self.folded_eye(far);
+    }
+
+    fn folded_eye(&self, p: DVec3) -> DVec3 {
+        if !p.is_finite() {
+            return DVec3::ZERO;
+        }
+        self.far_fold
+            .fold_point([p.x, p.y, p.z])
+            .map(|q| DVec3::new(q[0], q[1], q[2]))
+            .unwrap_or(DVec3::ZERO)
+    }
+
+    /// Morph eye for this frame. Off charts the camera is already in the frame.
+    /// On a chart, a storage eye folds through the net; high flight keeps the
+    /// eye captured at the last stream.
+    pub(in crate::world) fn morph_eye_for(&self, cam: DVec3) -> DVec3 {
+        if !self.lod2 {
+            return DVec3::ZERO;
+        }
+        if self.far_fold.is_identity() {
+            return if cam.is_finite() { cam } else { DVec3::ZERO };
+        }
+        if cam.is_finite()
+            && let Some(chart) = self.chart_eye(cam)
+        {
+            return self.folded_eye(chart);
+        }
+        self.morph_eye
+    }
+
+    /// Bands for [`voxel_engine::Frame3D::set_lod_morph`]. Empty when LOD sections are off
+    /// or the ladder has no parent. Writes only into `out`; the caller owns the array.
+    pub(in crate::world) fn write_lod_morph(&self, out: &mut [voxel_engine::LodMorph; 16]) -> usize {
+        if !self.lod2 {
+            return 0;
+        }
+        let Some(cfg) = self.morph_pyramid() else { return 0 };
+        pyramid::lod_morph_bands(&cfg, self.morph_altitude_dy(&cfg), out)
+    }
+
+    /// The pyramid whose rings are on screen: the chart ladder when the far field
+    /// stands on a chart, otherwise the altitude-scaled far ladder.
+    fn morph_pyramid(&self) -> Option<pyramid::PyramidCfg> {
+        let center = self.section_center()?;
+        if !self.section_on_chart(center) {
+            return Some(self.far_pyramid());
+        }
+        let seat = self.seams.chart_seat(center)?;
+        self.chart_pyramid(seat.radius).map(|(cfg, _)| cfg)
+    }
+
+    /// The frontier's vertical offset. On a chart this is height above the ground,
+    /// the same quantity [`chart_metric`](Self::chart_metric) selects with.
+    fn morph_altitude_dy(&self, cfg: &pyramid::PyramidCfg) -> f32 {
+        let Some(center) = self.section_center() else { return 0.0 };
+        if self.section_on_chart(center) {
+            return self.chart_metric(center, DVec3::ZERO, cfg).altitude_dy();
+        }
+        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
+        EyeMetric::new(DVec3::new(0.0, self.section_eye_y, 0.0), env, DyCap::new(cfg.outer_m(), cfg.base)).altitude_dy()
     }
 
     /// The chart net around far-field centre `centre`: the identity off charts.
@@ -1387,6 +1475,7 @@ impl World {
         let center_chunk = eye_chunk(center);
         let far_chunk = eye_chunk(far);
         let far_moved = self.set_far_center(far_chunk);
+        self.note_morph_eye(far);
         // Update centre before draining: old centre may be a sentinel, so draining
         // against it would discard all results and regenerate them immediately.
         // An up-face change is the same kind of pass: the box changed shape.
@@ -1635,7 +1724,7 @@ impl World {
                 super::adjust_count(&mut self.meshing_sections, true, false);
                 upload_bytes += bytes;
                 self.section_upload_bytes += bytes;
-                *state = SectionState::from_upload_payload(pos, meshes, eng, bend.as_ref());
+                *state = SectionState::from_upload_payload(pos, meshes, eng, bend.as_ref(), &self.far_fold);
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
                 // in part — must be corrected here, at the transition that gave it slots

@@ -23,6 +23,10 @@
 //!
 //! Light is not baked — every vertex takes neutral daylight (full sky, no
 //! blocklight) so coarse tiles track day/night.
+//!
+//! The surface skin (a column's top face, and the sides of that top run above
+//! the neighbour) carries the parent level's height in the morph bits, so a
+//! ring can blend into the next coarser level. Every other face stays put.
 use std::cell::RefCell;
 
 use voxel_engine::{Ao, Light, MeshVertex, Normal, Pass};
@@ -80,6 +84,22 @@ thread_local! {
     static DENSE_NATIVE: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
     static DENSE_COARSE: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
     static MESH_SCRATCH: RefCell<ChunkMeshData> = RefCell::new(new_chunk_mesh_data());
+    static PARENT_COLUMN: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
+    static PARENT_YS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Parent columns around one section: index `(pix + 1) + (piz + 1) * HALO` for
+/// `pix, piz` in `-1..=16`. `i32::MIN` is an all-air column (no morph target).
+const PARENT_HALO: i32 = 18;
+
+struct ParentAlts {
+    alt: [i32; (PARENT_HALO * PARENT_HALO) as usize],
+}
+
+impl ParentAlts {
+    fn at(&self, pix: i32, piz: i32) -> i32 {
+        self.alt[(pix + 1 + (piz + 1) * PARENT_HALO) as usize]
+    }
 }
 
 /// Packed section cells as a dense column-major grid: `nx × nz` columns of
@@ -235,7 +255,7 @@ fn face_sample(
 
 /// Greedy-mesh one slab of the packed volume: merge adjacent quads with identical
 /// properties across it (one mesh, vertex coords `0..=16` relative to the slab).
-fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData, skin: &Skin<'_>) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -297,13 +317,109 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
                             mask[(u0 + du + row) as usize] = None;
                         }
                     }
-                    emit(out, dir, n, u0, v0, w, h, sample, tables);
+                    emit(out, dir, n, u0, v0, w, h, sample, tables, skin);
                     emitted = true;
                 }
             }
         }
     }
     emitted
+}
+
+/// Packed-grid context for the surface-skin morph. `tops` / `run_lo` are absolute
+/// packed Y of each column's topmost solid run (`i16::MIN` = air).
+struct Skin<'a> {
+    alts: Option<&'a ParentAlts>,
+    cell: i32,
+    alo: i32,
+    step: i32,
+    /// Native index of packed Y 0.
+    y0: i32,
+    y_lo: i32,
+    nx: i32,
+    nz: i32,
+    tops: &'a [i16],
+    run_lo: &'a [i16],
+}
+
+impl Skin<'_> {
+    fn column(&self, x: i32, z: i32) -> Option<usize> {
+        (x >= 0 && z >= 0 && x < self.nx && z < self.nz).then_some((x + z * self.nx) as usize)
+    }
+
+    fn col_top(&self, x: i32, z: i32) -> Option<i32> {
+        let i = self.column(x, z)?;
+        let t = self.tops[i];
+        (t != i16::MIN).then_some(i32::from(t))
+    }
+
+    fn parent_alt(&self, px: i32, pz: i32) -> i32 {
+        let Some(alts) = self.alts else { return i32::MIN };
+        alts.at(packed_parent(px, self.step, self.nx), packed_parent(pz, self.step, self.nz))
+    }
+
+    /// `dy` in packed cells: the shader moves `dy * cell * step` blocks along local +Y.
+    fn lift(&self, parent_alt: i32, abs_y: i32) -> i8 {
+        if parent_alt == i32::MIN {
+            return 0;
+        }
+        let scale = self.cell * self.step;
+        let world = self.alo + (self.y0 + abs_y * self.step) * self.cell;
+        (parent_alt - world).div_euclid(scale).clamp(-31, 31) as i8
+    }
+}
+
+/// Parent column of packed column `p`. Outside the grid is the halo cell on that side
+/// (`-1` or `16`), not the centre of a coarse cell past the edge.
+fn packed_parent(p: i32, step: i32, n: i32) -> i32 {
+    if p < 0 {
+        return -1;
+    }
+    if p >= n {
+        return SECTION_N as i32 / 2;
+    }
+    (p * step + step / 2).div_euclid(2).clamp(-1, SECTION_N as i32 / 2)
+}
+
+/// Morph of one corner. Top face: the solid column's parent. Side of the topmost run:
+/// vertices at or below the neighbour's top use that column's parent, the rest use the
+/// solid column's, so the same parent collapses the wall and two parents meet both tops.
+fn skin_dy(skin: &Skin<'_>, dir: &Dir, nslice: i32, u0: i32, v0: i32, w: i32, h: i32, corner: [u8; 3]) -> i8 {
+    if skin.alts.is_none() {
+        return 0;
+    }
+    let n_axis = dir.face.n_axis;
+    let mut pos = [0i32; 3];
+    pos[n_axis] = nslice + i32::from(corner[0]);
+    pos[dir.face.u_axis] = u0 + i32::from(corner[1]) * w;
+    pos[dir.face.v_axis] = v0 + i32::from(corner[2]) * h;
+    let abs_y = pos[1] + skin.y_lo;
+    let interior = |axis: usize, at: i32, face_max: i32| {
+        let c = if at == face_max { at - 1 } else { at };
+        if axis == 1 { c + skin.y_lo } else { c }
+    };
+    let mut cell = [0i32; 3];
+    cell[n_axis] = if n_axis == 1 { nslice + skin.y_lo } else { nslice };
+    cell[dir.face.u_axis] = interior(dir.face.u_axis, pos[dir.face.u_axis], u0 + w);
+    cell[dir.face.v_axis] = interior(dir.face.v_axis, pos[dir.face.v_axis], v0 + h);
+    let (sx, sy, sz) = (cell[0], cell[1], cell[2]);
+    let Some(top) = skin.col_top(sx, sz) else { return 0 };
+    if n_axis == 1 {
+        if dir.face.step < 0 || sy != top {
+            return 0;
+        }
+        return skin.lift(skin.parent_alt(sx, sz), abs_y);
+    }
+    let Some(col) = skin.column(sx, sz) else { return 0 };
+    let lo = i32::from(skin.run_lo[col]);
+    if sy < lo || sy > top {
+        return 0;
+    }
+    let (nx, nz) = if n_axis == 0 { (sx + dir.face.step, sz) } else { (sx, sz + dir.face.step) };
+    // No neighbour top (border, or air): the run's bottom edge takes the neighbour parent.
+    let split = skin.col_top(nx, nz).map_or(lo, |nt| nt + 1);
+    let (px, pz) = if abs_y <= split { (nx, nz) } else { (sx, sz) };
+    skin.lift(skin.parent_alt(px, pz), abs_y)
 }
 
 /// Append one merged rectangle as a single quad, routed to its block's pass with
@@ -319,6 +435,7 @@ fn emit(
     h: i32,
     sample: FaceSample,
     tables: &HotTables,
+    skin: &Skin<'_>,
 ) {
     let mut origin = [0u32; 3];
     origin[dir.face.n_axis] = nslice as u32;
@@ -332,7 +449,7 @@ fn emit(
         pos[dir.face.n_axis] = origin[dir.face.n_axis] + cr[0] as u32;
         pos[dir.face.u_axis] = origin[dir.face.u_axis] + cr[1] as u32 * w as u32;
         pos[dir.face.v_axis] = origin[dir.face.v_axis] + cr[2] as u32 * h as u32;
-        MeshVertex::new(
+        let mut vert = MeshVertex::new(
             [pos[0] as u8, pos[1] as u8, pos[2] as u8],
             dir.face.normal,
             // Vertex layer only (tables above index by the true id); wraps
@@ -344,7 +461,12 @@ fn emit(
             Light::DAY,
             false,
         )
-        .with_micro(sample.micro)
+        .with_micro(sample.micro);
+        let dy = skin_dy(skin, dir, nslice, u0, v0, w, h, cr);
+        if dy != 0 {
+            vert = vert.with_morph(dy);
+        }
+        vert
     });
     // Same anisotropy fix as the chunk mesher: rotate the quad so the fixed
     // diagonal falls on the darker corner pair, not the brighter one.
@@ -363,8 +485,22 @@ fn emit(
 /// this one byte for byte.
 #[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
+    mesh_stored(section, tables, floor, 0, None)
+}
+
+/// [`build_section_mesh`] plus the parent tops [`extract_section_mesh`] sampled, so the
+/// parity oracle sees the same morph bits. `parents == None` leaves every dy at 0.
+#[cfg(test)]
+fn mesh_stored(
+    section: &Section,
+    tables: &HotTables,
+    floor: Option<i32>,
+    alo: i32,
+    parents: Option<&ParentAlts>,
+) -> SectionMeshData {
     let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
-    mesh_section_with(n_cells, tables, floor, |dense| fill_from_section(dense, n_cells, section))
+    let cell = section.pos().cell_size();
+    mesh_section_with(n_cells, tables, floor, parents, cell, alo, |dense| fill_from_section(dense, n_cells, section))
 }
 
 /// Lowest native cell a section's border walls must reach so they meet the neighbour.
@@ -417,7 +553,8 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     // but its surface sits far outside that window, so it takes the face sampler.
     let chart = pos.body >= super::CHART_BODY_BASE;
     let floor = if pos.face == Face::PosY && !chart { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
-    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), |dense| {
+    let parents = parent_alts(pos, r#gen, used);
+    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), parents.as_ref(), cell, alo, |dense| {
         for iz in 0..SECTION_N {
             for ix in 0..SECTION_N {
                 let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
@@ -443,6 +580,76 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
 fn section_window<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G) -> Option<(i32, i32)> {
     let (lo, hi) = r#gen.surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span())?;
     Some(super::sample_window(lo, hi, pos.cell_size()))
+}
+
+/// Parent-column tops in world blocks, one sample per parent cell (its centre, its own
+/// vertical cell). The four children do not determine it. `None` on the coarsest rung
+/// and on faces whose column axis is not mesh +Y (the shader only moves that axis).
+fn parent_alts<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    used: &[(i32, i32, i32, BlockId)],
+) -> Option<ParentAlts> {
+    if pos.face != Face::PosY || pos.detail.0 >= crate::render_config::LOD_COARSEST_DETAIL as i8 {
+        return None;
+    }
+    let detail = crate::ident::Detail(pos.detail.0 + 1);
+    let cell = pos.cell_size();
+    let pcell = cell * 2;
+    let span = super::section_span(detail);
+    let chart = pos.body >= super::CHART_BODY_BASE;
+    let mut alt = [i32::MIN; (PARENT_HALO * PARENT_HALO) as usize];
+    let mut window: Option<(SectionPos, i32, i32)> = None;
+    for piz in -1..=SECTION_N as i32 / 2 {
+        for pix in -1..=SECTION_N as i32 / 2 {
+            let (fx, fz) = (pos.min_x() + pix * pcell, pos.min_z() + piz * pcell);
+            let key = SectionPos {
+                detail,
+                body: pos.body,
+                face: pos.face,
+                x: fx.div_euclid(span),
+                z: fz.div_euclid(span),
+            };
+            let (alo, ahi) = if let Some((_, alo, ahi)) = window.filter(|(k, _, _)| *k == key) {
+                (alo, ahi)
+            } else {
+                match section_window(key, r#gen) {
+                    Some((alo, ahi)) => {
+                        window = Some((key, alo, ahi));
+                        (alo, ahi)
+                    }
+                    None => {
+                        window = Some((key, 0, 0));
+                        continue;
+                    }
+                }
+            };
+            let n = ((ahi - alo) / pcell) as usize;
+            if n == 0 {
+                continue;
+            }
+            let top = PARENT_COLUMN.with_borrow_mut(|column| {
+                PARENT_YS.with_borrow_mut(|ys| {
+                    ys.resize(n, 0);
+                    for (j, y) in ys.iter_mut().enumerate() {
+                        *y = super::probe_y(detail, alo, j as i32, pcell);
+                    }
+                    column.resize(n, AIR);
+                    if chart {
+                        r#gen.lod_column_face(pos.body, pos.face, fx + cell, fz + cell, ys, column);
+                    } else {
+                        r#gen.lod_column(fx + cell, fz + cell, ys, column);
+                    }
+                    super::apply_edits(column, used, fx, fz, pcell, alo);
+                    column.iter().rposition(|&id| id != AIR).map(|j| alo + (j as i32 + 1) * pcell)
+                })
+            });
+            if let Some(top) = top {
+                alt[(pix + 1 + (piz + 1) * PARENT_HALO) as usize] = top;
+            }
+        }
+    }
+    Some(ParentAlts { alt })
 }
 
 /// World edits rewritten as face-local `(u, a, v)`, sorted the way [`super::apply_edits`] requires.
@@ -527,6 +734,7 @@ fn map_vert(v: MeshVertex, frame: FaceFrame) -> MeshVertex {
         v.is_water(),
     )
     .with_micro([mx as i8, my as i8, mz as i8])
+    .with_morph(v.morph())
 }
 
 fn normal_from(d: [i32; 3]) -> Normal {
@@ -607,12 +815,15 @@ fn mesh_section_with(
     n_cells: usize,
     tables: &HotTables,
     floor: Option<i32>,
+    parents: Option<&ParentAlts>,
+    cell: i32,
+    alo: i32,
     fill: impl FnOnce(&mut [BlockId]),
 ) -> SectionMeshData {
     DENSE_NATIVE.with_borrow_mut(|native| {
         native.resize(SECTION_N * SECTION_N * n_cells, AIR);
         fill(native);
-        mesh_packed(native, n_cells, tables, floor)
+        mesh_packed(native, n_cells, tables, floor, parents, cell, alo)
     })
 }
 
@@ -694,7 +905,15 @@ fn pick_coarse(
 /// of the domain: everything below is solid ground in every column and never shows, so only
 /// the relief inside the section costs slabs. The shift is the least that packs the 32 columns
 /// and fits the relief in [`MAX_SLABS`] slabs.
-fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
+fn mesh_packed(
+    native: &[BlockId],
+    n_cells: usize,
+    tables: &HotTables,
+    floor: Option<i32>,
+    parents: Option<&ParentAlts>,
+    cell: i32,
+    alo: i32,
+) -> SectionMeshData {
     let ny_n = n_cells as i32;
     let (mut min_top, mut yhi) = (ny_n, 0);
     for col in native.chunks_exact(n_cells) {
@@ -739,6 +958,23 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Op
                 }
             }
         }
+        let mut tops = [i16::MIN; (BLOCK * BLOCK) as usize];
+        let mut run_lo = [0i16; (BLOCK * BLOCK) as usize];
+        for z in 0..nz {
+            for x in 0..nx {
+                let base = (x + z * nx) as usize * ny as usize;
+                let col = &coarse[base..base + ny as usize];
+                if let Some(t) = col.iter().rposition(|&id| id != AIR) {
+                    let mut lo = t;
+                    while lo > 0 && col[lo - 1] != AIR {
+                        lo -= 1;
+                    }
+                    let i = (x + z * nx) as usize;
+                    tops[i] = t as i16;
+                    run_lo[i] = lo as i16;
+                }
+            }
+        }
         MESH_SCRATCH.with_borrow_mut(|scratch| {
             let mut slabs = Vec::new();
             for y_lo in (0..ny).step_by(BLOCK as usize) {
@@ -746,7 +982,19 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Op
                     m.clear();
                 }
                 let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny) };
-                if build_volume(&grid, tables, scratch) {
+                let skin = Skin {
+                    alts: parents,
+                    cell,
+                    alo,
+                    step,
+                    y0,
+                    y_lo,
+                    nx,
+                    nz,
+                    tops: &tops,
+                    run_lo: &run_lo,
+                };
+                if build_volume(&grid, tables, scratch, &skin) {
                     slabs.push(SlabMesh {
                         origin_y: (y0 + y_lo * step) as u32,
                         data: std::mem::replace(scratch, new_chunk_mesh_data()),
@@ -873,6 +1121,28 @@ mod tests {
 
     /// One pass of one slab with its placement: `(origin_y, shift, pass, vertices, quad counts)`.
     type FlatPass = (u32, u8, u8, Vec<MeshVertex>, [u32; 6]);
+
+    /// Reference mesh with the same parent tops the fused path samples.
+    fn mesh_like_extract(
+        stored: &Section,
+        tables: &HotTables,
+        pos: SectionPos,
+        r#gen: &impl TerrainGenerator,
+        edits: &[(crate::coord::ChunkCoord, Vec<(usize, BlockId)>)],
+        floor: Option<i32>,
+    ) -> SectionMeshData {
+        let flat = super::super::flatten_edits(edits);
+        let remapped;
+        let used: &[_] = if pos.face == Face::PosY {
+            &flat
+        } else {
+            remapped = super::face_edits(&flat, pos.face);
+            &remapped
+        };
+        let parents = super::parent_alts(pos, r#gen, used);
+        let alo = super::section_window(pos, r#gen).map(|(lo, _)| lo).unwrap_or(0);
+        super::mesh_stored(stored, tables, floor, alo, parents.as_ref())
+    }
 
     /// Every slab's every pass, with its placement, for byte-parity comparisons.
     fn flatten(m: &SectionMeshData) -> Vec<FlatPass> {
@@ -1114,7 +1384,7 @@ mod tests {
                 for edit_set in [&[][..], &edits[..]] {
                     let stored =
                         Section::extract(pos, &r#gen, edit_set, voxel_engine::Rev::START);
-                    let reference = build_section_mesh(&stored, &tables, Some(ring_floor(pos, &r#gen)));
+                    let reference = mesh_like_extract(&stored, &tables, pos, &r#gen, edit_set, Some(ring_floor(pos, &r#gen)));
                     let fused = extract_section_mesh(pos, &r#gen, edit_set, &tables);
                     assert_eq!(
                         flatten(&reference),
@@ -1134,7 +1404,7 @@ mod tests {
                 .map(|_| ring_floor(pos, &hills));
             let stored = Section::extract(pos, &hills, &edits, voxel_engine::Rev::START);
             assert_eq!(
-                flatten(&build_section_mesh(&stored, &tables, floor)),
+                flatten(&mesh_like_extract(&stored, &tables, pos, &hills, &edits, floor)),
                 flatten(&extract_section_mesh(pos, &hills, &edits, &tables)),
                 "fused path diverged on Terrain at {detail:?}",
             );
@@ -1199,7 +1469,20 @@ mod tests {
         let mesh_of = |grid: &[BlockId]| {
             let mut out = new_chunk_mesh_data();
             let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
-            assert!(build_volume(&g, &tables, &mut out), "the feature emits no faces");
+            let none = [i16::MIN; 0];
+            let skin = Skin {
+                alts: None,
+                cell: 1,
+                alo: 0,
+                step: 1,
+                y0: 0,
+                y_lo: 0,
+                nx: n,
+                nz: n,
+                tops: &none,
+                run_lo: &none,
+            };
+            assert!(build_volume(&g, &tables, &mut out, &skin), "the feature emits no faces");
             out
         };
         let key = |v: MeshVertex| {
@@ -1993,26 +2276,350 @@ mod tests {
         }
     }
 
-    /// extract+mesh 16 fixed sections at detail 2, seed 42 — the gauge for the
-    /// slab pack. Ignored: a timing benchmark, not a
-    /// correctness gate. Run with
+    fn column_gen(
+        b: &Blocks,
+        height: impl Fn(i32) -> i32 + Copy + Send + Sync,
+    ) -> FnGen<impl Fn(i32, i32) -> i32 + Send + Sync, impl Fn(i32, i32, i32) -> BlockId + Send + Sync> {
+        let (stone, grass) = (b.stone, b.grass);
+        FnGen {
+            h: move |x, _| height(x),
+            b: move |x, y, _| if y < height(x) { stone } else { AIR },
+            surf: grass,
+            deep: stone,
+        }
+    }
+
+    /// World Y of a vertex after the morph blend reaches 1 (`dy` packed cells).
+    fn morphed_y(mesh: &SectionMeshData, cell: i32, origin_y: u32, local_y: i32, morph: i8) -> i32 {
+        let scale = cell << mesh.shift;
+        mesh.altitude_floor + origin_y as i32 * cell + local_y * scale + i32::from(morph) * scale
+    }
+
+    /// Top of the column the parent level samples at `(x, z)`, in world blocks.
+    /// Independent of [`parent_alts`]: its own `lod_column` at the parent cell centre.
+    fn parent_surface(r#gen: &impl TerrainGenerator, child: Detail, x: i32, z: i32) -> Option<i32> {
+        let cell = 1i32 << child.0;
+        let pcell = cell * 2;
+        let parent = Detail(child.0 + 1);
+        let (fx, fz) = (x.div_euclid(pcell) * pcell, z.div_euclid(pcell) * pcell);
+        let n = (512 / pcell) as usize;
+        let mut col = vec![AIR; n];
+        let ys: Vec<i32> = (0..n as i32).map(|j| super::super::probe_y(parent, 0, j, pcell)).collect();
+        r#gen.lod_column(fx + cell, fz + cell, &ys, &mut col);
+        col.iter().rposition(|&id| id != AIR).map(|j| (j as i32 + 1) * pcell)
+    }
+
+    /// Every top-face vertex, fully blended, sits on the parent column that contains it.
+    fn assert_tops_match_parent(mesh: &SectionMeshData, r#gen: &impl TerrainGenerator, pos: SectionPos) {
+        let cell = pos.cell_size();
+        let step = 1i32 << mesh.shift;
+        let mut tops = 0u32;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    if q[0].normal() != Normal::PosY {
+                        continue;
+                    }
+                    let max_x = q.iter().map(|v| v.local_pos()[0] as i32).max().unwrap();
+                    let max_z = q.iter().map(|v| v.local_pos()[2] as i32).max().unwrap();
+                    for v in q {
+                        let l = v.local_pos();
+                        let (lx, ly, lz) = (l[0] as i32, l[1] as i32, l[2] as i32);
+                        let ix = if lx == max_x { lx - 1 } else { lx };
+                        let iz = if lz == max_z { lz - 1 } else { lz };
+                        let sx = pos.min_x() + (ix * step + step / 2) * cell;
+                        let sz = pos.min_z() + (iz * step + step / 2) * cell;
+                        let want = parent_surface(r#gen, pos.detail, sx, sz).expect("parent column");
+                        let got = morphed_y(mesh, cell, slab.origin_y, ly, v.morph());
+                        assert_eq!(got, want, "top at packed ({ix},{iz})");
+                        tops += 1;
+                    }
+                }
+            }
+        }
+        assert!(tops > 0, "no top face");
+    }
+
+    fn assert_sides_at(mesh: &SectionMeshData, cell: i32, y: i32) {
+        let mut sides = 0u32;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for v in slab.data[p].vertices() {
+                    let n = v.normal();
+                    if !matches!(n, Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ) {
+                        continue;
+                    }
+                    let got = morphed_y(mesh, cell, slab.origin_y, v.local_pos()[1] as i32, v.morph());
+                    assert_eq!(got, y, "side {n:?} morph {}", v.morph());
+                    sides += 1;
+                }
+            }
+        }
+        assert!(sides > 0, "no side face");
+    }
+
+    /// Flat ground: tops already match the parent (dy 0). Border walls blend up to the same height.
+    #[test]
+    fn flat_skin_morphs_onto_the_parent_height() {
+        let (_r, tables, b) = setup();
+        let r#gen = column_gen(&b, |_| 200);
+        let mesh = extract_section_mesh(FINEST, &r#gen, &[], &tables);
+        assert_eq!(mesh.shift, 1);
+        assert_tops_match_parent(&mesh, &r#gen, FINEST);
+        assert_sides_at(&mesh, CELL, 200);
+        let mut raised = false;
+        for (_, q) in all_quads(&mesh) {
+            if q[0].normal() == Normal::NegY {
+                assert!(q.iter().all(|v| v.morph() == 0), "an underside does not morph");
+            }
+            if matches!(q[0].normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ) {
+                raised |= q.iter().any(|v| v.morph() != 0);
+            }
+        }
+        assert!(raised, "a border wall's lower edge must move to the parent");
+    }
+
+    /// A step inside one parent cell: the child resolves the tall half, the parent the centre.
+    /// At blend 1 every skin vertex is the parent's top, so the step disappears.
+    #[test]
+    fn a_step_inside_one_parent_blends_to_the_parent_top() {
+        let (_r, tables, b) = setup();
+        let r#gen = column_gen(&b, |x| if x.rem_euclid(8) < 4 { 208 } else { 200 });
+        let mesh = extract_section_mesh(FINEST, &r#gen, &[], &tables);
+        assert_eq!(mesh.shift, 1);
+        assert_tops_match_parent(&mesh, &r#gen, FINEST);
+        assert_sides_at(&mesh, CELL, 200);
+        let mut dipped = false;
+        for (_, q) in all_quads(&mesh) {
+            if q[0].normal() == Normal::PosY {
+                dipped |= q.iter().any(|v| v.morph() == -1);
+            }
+        }
+        assert!(dipped, "the tall half sits one packed cell above the parent");
+    }
+
+    /// Height constant on each parent cell: tops already agree (dy 0), and a wall between
+    /// two parents has its edges on those two tops.
+    #[test]
+    fn a_parent_aligned_slope_is_already_the_parent_silhouette() {
+        let (_r, tables, b) = setup();
+        let r#gen = column_gen(&b, |x| 160 + x.div_euclid(8) * 8);
+        let mesh = extract_section_mesh(FINEST, &r#gen, &[], &tables);
+        assert_eq!(mesh.shift, 1);
+        assert_tops_match_parent(&mesh, &r#gen, FINEST);
+        let cell = CELL;
+        let step = 1i32 << mesh.shift;
+        let scale = cell * step;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    let n = q[0].normal();
+                    if n == Normal::NegY {
+                        assert!(q.iter().all(|v| v.morph() == 0));
+                        continue;
+                    }
+                    if !matches!(n, Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ) {
+                        continue;
+                    }
+                    for v in q {
+                        let l = v.local_pos();
+                        let got = morphed_y(&mesh, cell, slab.origin_y, l[1] as i32, v.morph());
+                        let (wx, wz) = if matches!(n, Normal::PosX | Normal::NegX) {
+                            (l[0] as i32 * scale, FINEST.min_z() + (l[2] as i32 * scale).max(scale / 2))
+                        } else {
+                            (FINEST.min_x() + (l[0] as i32 * scale).max(scale / 2), l[2] as i32 * scale)
+                        };
+                        let beside = [wx.saturating_sub(1), wx, wz.saturating_sub(1), wz];
+                        let tops = [
+                            parent_surface(&r#gen, FINEST.detail, beside[0], wz),
+                            parent_surface(&r#gen, FINEST.detail, beside[1], wz),
+                            parent_surface(&r#gen, FINEST.detail, wx, beside[2]),
+                            parent_surface(&r#gen, FINEST.detail, wx, beside[3]),
+                        ];
+                        assert!(tops.iter().any(|t| *t == Some(got)), "side at {wx},{wz} morphed to {got}, parents {tops:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two parents in one section. The wall between them meets both parent tops.
+    #[test]
+    fn a_side_between_two_parents_meets_both_tops() {
+        let (_r, tables, b) = setup();
+        let r#gen = column_gen(&b, |x| {
+            if x < 64 && x.rem_euclid(8) < 4 { 208 } else if x < 64 { 200 } else { 160 }
+        });
+        let mesh = extract_section_mesh(FINEST, &r#gen, &[], &tables);
+        assert_eq!(mesh.shift, 1);
+        assert_tops_match_parent(&mesh, &r#gen, FINEST);
+        let mut saw_low = false;
+        let mut saw_high = false;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for v in slab.data[p].vertices() {
+                    if !matches!(v.normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ) {
+                        continue;
+                    }
+                    let got = morphed_y(&mesh, CELL, slab.origin_y, v.local_pos()[1] as i32, v.morph());
+                    assert!(got == 160 || got == 200, "side morphed to {got}");
+                    saw_low |= got == 160;
+                    saw_high |= got == 200;
+                }
+            }
+        }
+        assert!(saw_low && saw_high, "the boundary wall must show both parent tops");
+    }
+
+    /// A shelf above the ground: its top blends to the parent (which has no shelf),
+    /// its underside and the ground's top stay put.
+    #[test]
+    fn an_overhang_keeps_its_underside_and_morphs_its_top() {
+        let (_r, tables, b) = setup();
+        let stone = b.stone;
+        let grass = b.grass;
+        let r#gen = FnGen {
+            h: |_, _| 100,
+            b: move |x: i32, y: i32, _: i32| {
+                if x.rem_euclid(8) < 4 && (300..320).contains(&y) {
+                    return stone;
+                }
+                if y < 100 { stone } else { AIR }
+            },
+            surf: grass,
+            deep: stone,
+        };
+        let mesh = extract_section_mesh(FINEST, &r#gen, &[], &tables);
+        assert_eq!(mesh.shift, 1, "the shelf must stay at shift 1");
+        let parent = parent_surface(&r#gen, FINEST.detail, 4, 4).expect("parent ground");
+        assert_eq!(parent, 104, "parent floor-probe of height 100 ends on the next parent cell");
+        let mut shelf = false;
+        let mut ground = false;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    let n = q[0].normal();
+                    if n == Normal::NegY {
+                        assert!(q.iter().all(|v| v.morph() == 0), "underside dy is 0");
+                    }
+                    if n != Normal::PosY {
+                        continue;
+                    }
+                    let y = morphed_y(&mesh, CELL, slab.origin_y, q[0].local_pos()[1] as i32, 0);
+                    if y == 320 {
+                        for v in q {
+                            let got = morphed_y(&mesh, CELL, slab.origin_y, v.local_pos()[1] as i32, v.morph());
+                            assert_eq!(got, parent);
+                            assert_ne!(v.morph(), 0);
+                        }
+                        shelf = true;
+                    }
+                    // Height 100 packs into the cell whose top is 104, the parent's top.
+                    // Under the shelf that face is a lower run; in the open it already
+                    // sits on the parent. Either way it does not move.
+                    if y == 104 {
+                        assert!(q.iter().all(|v| v.morph() == 0), "ground top at 104 stays put");
+                        ground = true;
+                    }
+                }
+            }
+        }
+        assert!(shelf && ground, "shelf {shelf}, ground {ground}");
+    }
+
+    /// The coarsest rung has no parent. A face whose up is not mesh +Y does not morph:
+    /// the shader only moves that axis.
+    #[test]
+    fn the_coarsest_level_and_other_faces_emit_no_morph() {
+        let (_r, tables, b) = setup();
+        let r#gen = column_gen(&b, |_| 200);
+        let coarse = SectionPos { detail: Detail(crate::render_config::LOD_COARSEST_DETAIL as i8), ..FINEST };
+        let mesh = extract_section_mesh(coarse, &r#gen, &[], &tables);
+        assert!(!mesh.is_empty(), "coarse ground still meshes");
+        for (_, q) in all_quads(&mesh) {
+            assert!(q.iter().all(|v| v.morph() == 0));
+        }
+        let side = SectionPos { face: Face::PosX, ..FINEST };
+        assert!(super::parent_alts(side, &r#gen, &[]).is_none());
+        assert!(super::parent_alts(coarse, &r#gen, &[]).is_none());
+    }
+
+    /// Child columns are 32×32. The parent halo is 18×18, sampled once each.
+    #[test]
+    fn parent_sampling_is_one_halo_column_per_parent_cell() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (_r, tables, b) = setup();
+        struct CountGen {
+            calls: AtomicU32,
+            h: i32,
+            stone: BlockId,
+            grass: BlockId,
+        }
+        impl TerrainGenerator for CountGen {
+            fn height(&self, _: i32, _: i32) -> i32 {
+                self.h
+            }
+            fn surface_at(&self, _: i32, _: i32) -> BlockId {
+                self.grass
+            }
+            fn deep(&self) -> BlockId {
+                self.stone
+            }
+            fn lod_block_at(&self, _: i32, y: i32, _: i32) -> BlockId {
+                if y < self.h { self.stone } else { AIR }
+            }
+            fn lod_column(&self, wx: i32, wz: i32, ys: &[i32], out: &mut [BlockId]) {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                for (o, &wy) in out.iter_mut().zip(ys) {
+                    *o = self.lod_block_at(wx, wy, wz);
+                }
+            }
+        }
+        let r#gen = CountGen { calls: AtomicU32::new(0), h: 200, stone: b.stone, grass: b.grass };
+        let mesh = extract_section_mesh(FINEST, &r#gen, &[], &tables);
+        assert!(!mesh.is_empty());
+        let calls = r#gen.calls.load(Ordering::Relaxed);
+        assert_eq!(calls, 32 * 32 + 18 * 18, "child columns plus the parent halo, got {calls}");
+    }
+
+    /// extract+mesh 16 home-chart sections at detail 2, seed 42 — the gauge for the
+    /// slab pack. Ignored: a timing benchmark, not a correctness gate. Run with
     /// `cargo test --release far_lod_section_mesh -- --ignored --nocapture`.
-    /// 2026-09-10: 2.440 ms/section (median of 3); fingerprint verts=9048 fnv=0xa42303c7.
-    /// 2026-10-02 (InfiniteDiffusion v3, stacked slabs): 4.026 ms/section; verts=15056 fnv=0xa2f08c4a.
+    /// 2026-09-10 (body-0 squares): 2.440 ms/section (median of 3); verts=9048 fnv=0xa42303c7.
+    /// 2026-10-02 (InfiniteDiffusion v3, stacked slabs, same squares): 4.026 ms/section; verts=15056 fnv=0xa2f08c4a.
+    /// Those squares sit on the start ball, which has no far-field surface. This gauge is
+    /// 16 detail-2 sections on the home chart's band-0 +Y, around the face centre.
+    /// The fingerprint mixes the morph byte; the 2026-10-02 fnv did not.
     #[test]
     #[ignore]
     fn far_lod_section_mesh() {
+        use crate::space::atlas::Patch;
         let mut registry = BlockRegistry::with_builtins();
         let r#gen = Terrain::new(&mut registry, 42);
         let tables = registry.hot_tables();
-        let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos { body: 0, face: Face::PosY,
+        let home = r#gen.cosmos().expect("cosmos").home();
+        let atlases = r#gen.atlases();
+        let index = atlases.iter().position(|a| (a.centre - home.centre_f()).length() < 1.0).expect("home atlas");
+        let (o, size) = atlases[index].storage_box(Patch::Shell { band: 0, face: Face::PosY });
+        let span = i64::from(crate::world::section::section_span(FINEST_DETAIL));
+        let sx = ((o[0] + size[0] / 2).div_euclid(span) - 2) as i32;
+        let sz = ((o[2] + size[2] / 2).div_euclid(span) - 2) as i32;
+        let (x0, z0) = (i64::from(sx) * span, i64::from(sz) * span);
+        assert!(x0 >= o[0] && x0 + 4 * span <= o[0] + size[0], "chart +Y cannot hold the gauge");
+        assert!(z0 >= o[2] && z0 + 4 * span <= o[2] + size[2], "chart +Y cannot hold the gauge");
+        let body = crate::world::section::CHART_BODY_BASE + index as u16;
+        let positions: [SectionPos; 16] = std::array::from_fn(|i| SectionPos {
+            body,
+            face: Face::PosY,
             detail: FINEST_DETAIL,
-            x: (i % 4) as i32,
-            z: (i / 4) as i32,
+            x: sx + (i % 4) as i32,
+            z: sz + (i / 4) as i32,
         });
 
         // Warm the worker-local dense grid and the mesh scratch.
-        std::hint::black_box(extract_section_mesh(positions[0], &r#gen, &[], &tables));
+        let warm = extract_section_mesh(positions[0], &r#gen, &[], &tables);
+        assert!(!warm.is_empty(), "the gauge section has no surface");
+        std::hint::black_box(warm);
 
         let mut times = [0.0f64; 3];
         for t in &mut times {
@@ -2024,7 +2631,7 @@ mod tests {
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "far_lod_section_mesh 16 sections detail=2 seed=42: {:.3} {:.3} {:.3} ms/section (median {:.3})",
+            "far_lod_section_mesh 16 home-chart sections detail=2 seed=42: {:.3} {:.3} {:.3} ms/section (median {:.3})",
             times[0], times[1], times[2], times[1]
         );
 
@@ -2058,6 +2665,8 @@ mod tests {
                     for m in v.micro() {
                         mix(&mut h, m as u8);
                     }
+                    // Morph bits are part of the vertex. The 2026-10-02 fnv omitted them.
+                    mix(&mut h, v.morph() as u8);
                 }
             }
         }

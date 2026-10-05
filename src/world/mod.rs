@@ -63,7 +63,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
+use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, LodMorph, MeshHandle, Vec3};
 use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
@@ -661,6 +661,7 @@ impl SectionState {
         mesh: SectionMeshData,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
+        fold: &seam::Unfold,
     ) -> SectionState {
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
         let mut cages = Vec::new();
@@ -668,7 +669,7 @@ impl SectionState {
             .slabs
             .iter()
             .filter_map(|slab| {
-                let placement = Self::slab_place(pos, slab.origin_y, detail, mesh.altitude_floor, bend, eng, &mut cages)?;
+                let placement = Self::slab_place(pos, slab.origin_y, detail, mesh.altitude_floor, bend, fold, eng, &mut cages)?;
                 match ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| eng.upload_mesh_placed(&slab.data[p], placement))) {
                     Some(m) => Some(m),
                     None => {
@@ -689,6 +690,7 @@ impl SectionState {
         detail: Detail,
         floor_a: i32,
         bend: Option<&ChartBend>,
+        fold: &seam::Unfold,
         eng: &mut Engine,
         cages: &mut Vec<voxel_engine::CageHandle>,
     ) -> Option<voxel_engine::MeshPlacement> {
@@ -711,7 +713,9 @@ impl SectionState {
         let (anchor, corners) = section::chart_slab_corners(&bend.atlas, bend.patch, pos.min_x(), y0, pos.min_z(), extent)?;
         let cage = eng.create_cage(anchor, corners)?;
         cages.push(cage);
-        Some(voxel_engine::MeshPlacement::caged(cage, detail))
+        // Metric origin is the slab's min corner in the frontier net. The cage still places the vertices.
+        let origin = fold.corner_block(pos.min_x(), y0, pos.min_z());
+        Some(voxel_engine::MeshPlacement::caged_at(cage, detail, origin))
     }
 
     fn drop_failed_cage(eng: &mut Engine, cages: &mut Vec<voxel_engine::CageHandle>, placement: voxel_engine::MeshPlacement) {
@@ -745,10 +749,11 @@ impl SectionState {
         meshes: pipeline::SectionPayload,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
+        fold: &seam::Unfold,
     ) -> SectionState {
         match meshes {
-            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, eng, bend),
-            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng, bend),
+            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, eng, bend, fold),
+            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng, bend, fold),
         }
     }
 
@@ -757,6 +762,7 @@ impl SectionState {
         staged: pipeline::StagedSection,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
+        fold: &seam::Unfold,
     ) -> SectionState {
         let detail = Detail(pos.detail.0.saturating_add(staged.shift as i8));
         let mut cages = Vec::new();
@@ -764,7 +770,7 @@ impl SectionState {
             .slabs
             .into_iter()
             .filter_map(|mut slab| {
-                let placement = Self::slab_place(pos, slab.origin_y, detail, staged.altitude_floor, bend, eng, &mut cages)?;
+                let placement = Self::slab_place(pos, slab.origin_y, detail, staged.altitude_floor, bend, fold, eng, &mut cages)?;
                 match ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
                     slab.passes[p]
                         .take()
@@ -1056,6 +1062,9 @@ pub struct World {
     /// The chart net around [`far_center`](Self::far_center), which the job gate measures far work
     /// in; the identity off charts.
     far_fold: seam::Unfold,
+    /// Far eye in [`far_fold`](Self::far_fold), the origin the LOD morph measures from.
+    /// Zero before the first stream and whenever the eye leaves the net.
+    morph_eye: DVec3,
     /// Atlas whose chart the far field stood on last pass (its reach gets the hold margin).
     far_atlas: Option<usize>,
     /// Doublings of the chart ring unit for the eye's height above the ground.
@@ -1494,6 +1503,7 @@ impl World {
             center: None,
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
+            morph_eye: DVec3::ZERO,
             far_atlas: None,
             far_scale: 0,
             far_ground: None,
@@ -1684,7 +1694,7 @@ impl World {
     /// push (both maintained in `stream`). The engine draws every visible
     /// resident mesh itself, so `render` submits no per-mesh draws — it only sets
     /// the frame's LOD-cull volume and reports the set-size gauge.
-    pub fn render(&self, f: &mut Frame3D, _cam: DVec3) {
+    pub fn render(&self, f: &mut Frame3D, cam: DVec3) {
         // The shader discards LOD-section fragments inside the SETTLED radius:
         // the rings whose chunks are actually drawn (or born-air). While a
         // loading edge is still meshing, the clip stays behind it and the far
@@ -1692,6 +1702,10 @@ impl World {
         // then hands off ring by ring as uploads land. Fully settled, this is
         // exactly the old full-res radius.
         f.set_lod_clip(self.lod_clip());
+        // Geomorph bands. The array is stack storage; an unchanged frame writes nothing.
+        let mut bands = [LodMorph { half: Vec3::ZERO, start: 0.0 }; 16];
+        let n = self.write_lod_morph(&mut bands);
+        f.set_lod_morph(self.morph_eye_for(cam), &bands[..n]);
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.
         use voxel_engine::profile::{Gauge, gauge};
