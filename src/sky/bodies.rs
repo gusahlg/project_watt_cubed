@@ -295,6 +295,14 @@ fn rounded_exponent(k: f64) -> f32 {
     if p.is_finite() && p >= 2.0 { p as f32 } else { 2.0 }
 }
 
+/// Whether the eye at `dist` from `body` is low enough over it for its own mesh to stream. The exact
+/// altitude (a warp inversion for a sagging twin, every frame) only matters near the body: past its
+/// reach, its highest datum and the streaming altitude, it cannot stream.
+fn streams(cosmos: &Cosmos, body: &Body, eye: DVec3, dist: f64) -> bool {
+    let near = dist < 1.25 * body.reach() + cosmos.relief_range(body).1.max(0.0) + STREAM_ALTITUDE;
+    near && cosmos.altitude(body, eye) < STREAM_ALTITUDE
+}
+
 /// The start world's impostor: a sphere at its lowest datum, sunk by [`sink`], so it stays under
 /// the ground in every direction. Terrain draws wherever it reaches; the impostor fills in below the
 /// horizon beyond it, and an eye on the ground must never stand inside it (the shader skips a body
@@ -348,7 +356,7 @@ fn impostor(
     };
     // A cube's own mesh is the body while it streams; a round body's sphere is drawn unless the eye
     // is inside it.
-    let streamed = sink(body).is_none() && cosmos.altitude(body, eye) < STREAM_ALTITUDE;
+    let streamed = sink(body).is_none() && streams(cosmos, body, eye, dist);
     if streamed || !(dist > radius) || !dist.is_finite() {
         return None;
     }
@@ -550,6 +558,28 @@ mod tests {
             finite_unit(body);
         }
         assert!(far.sun_override().is_none());
+    }
+
+    /// The distance shortcut in `streams` never changes the answer: around every body, from inside its
+    /// streaming band out past the shortcut, it agrees with the exact altitude test.
+    #[test]
+    fn the_streaming_shortcut_agrees_with_the_exact_altitude() {
+        let mut registry = BlockRegistry::with_builtins();
+        let terrain = Terrain::new(&mut registry, 42);
+        let cosmos = terrain.cosmos().expect("cosmos");
+        for body in cosmos.bodies() {
+            let c = body.centre_f();
+            for dir in [DVec3::X, DVec3::Y, DVec3::NEG_Z, DVec3::ONE.normalize(), DVec3::new(1.0, -0.4, 0.2).normalize()] {
+                for k in [0.5, 0.9, 1.0, 1.05, 1.2, 1.5, 3.0] {
+                    for extra in [0.0, 5_000.0, 19_000.0, 21_000.0, 1.0e6] {
+                        let eye = c + dir * (body.reach() * k + extra);
+                        let dist = (c - eye).length();
+                        let exact = cosmos.altitude(body, eye) < STREAM_ALTITUDE;
+                        assert_eq!(streams(cosmos, body, eye, dist), exact, "{:?} at {eye}", body.kind);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
