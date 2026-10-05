@@ -1792,4 +1792,464 @@ mod tests {
         println!("descent settled in {passes}, window {:?} bare {}", world.window.punch, cube_bare(&world));
         assert_eq!(cube_bare(&world), 0, "bare on the stand");
     }
+
+    /// Seed 42, RD16/V5, LOD on. One ignored measurement per body kind the chart, cube and flat
+    /// suites do not already stand on. A failure is a visible far section wholly inside the covered
+    /// disk whose relief the window holds. Bare columns after settling must be none.
+    /// `cargo test --release --lib near_lod_ -- --ignored --nocapture --test-threads=1`
+
+    fn say(line: &str) {
+        println!("{line}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    fn body_of(world: &World, kind: crate::world::terrain::cosmos::Kind) -> crate::world::terrain::cosmos::Body {
+        world.generator.cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == kind).expect("body")
+    }
+
+    /// The round chart of `body`: outward ball, or the shell surface `inward` names.
+    fn round_atlas<'a>(world: &'a World, body: &crate::world::terrain::cosmos::Body, inward: bool) -> &'a crate::space::atlas::Atlas {
+        use crate::world::terrain::cosmos::Shape;
+        let want = match body.shape {
+            Shape::Ball { r } => r,
+            Shape::Shell { outer, inner } => {
+                if inward {
+                    inner
+                } else {
+                    outer
+                }
+            }
+            Shape::Cube { .. } => panic!("a cube has no round chart"),
+        };
+        world
+            .generator
+            .atlases()
+            .iter()
+            .find(|a| a.grid.is_none() && a.inward == inward && (a.centre - body.centre_f()).length() < 1.0 && (a.radius - want).abs() < 16)
+            .expect("chart")
+            .as_ref()
+    }
+
+    struct ChartStand {
+        x: i32,
+        z: i32,
+        /// First open cell of the column (the block above the solid top).
+        open: i32,
+        storage: DVec3,
+        physical: DVec3,
+        roundtrip: f64,
+        relief: i32,
+    }
+
+    /// A clear column on the +Y chart, in the interior sample whose ground varies most.
+    fn chart_stand(world: &World, atlas: &crate::space::atlas::Atlas) -> ChartStand {
+        use crate::space::atlas::Patch;
+        let patch = Patch::Shell { band: 0, face: Face::PosY };
+        let (_, size) = atlas.storage_box(patch);
+        let n = size[0];
+        let margin = 1024i64.min(n / 4);
+        let mid = n / 2;
+        let anchors = [(0i64, 0i64), (2048, 0), (-2048, 1536), (0, -3072), (4096, 4096)];
+        let mut best: Option<(i32, Vec<(i32, i32, i32)>)> = None;
+        let mut seen = Vec::new();
+        for (dx, dz) in anchors {
+            let ax = (mid + dx).clamp(margin, n - margin - 1);
+            let az = (mid + dz).clamp(margin, n - margin - 1);
+            if seen.contains(&(ax, az)) {
+                continue;
+            }
+            seen.push((ax, az));
+            let mut samples = Vec::new();
+            let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+            for oz in (-256i64..=256).step_by(64) {
+                for ox in (-256i64..=256).step_by(64) {
+                    let lx = (ax + ox).clamp(margin, n - margin - 1);
+                    let lz = (az + oz).clamp(margin, n - margin - 1);
+                    let s = atlas.storage(patch, [lx, 0, lz]);
+                    let (x, z) = (i32::try_from(s[0]).expect("x"), i32::try_from(s[2]).expect("z"));
+                    let y = world.generator.surface(Face::PosY, x, z);
+                    if y == i32::MIN || y >= crate::world::terrain::storage::BURIED {
+                        continue;
+                    }
+                    lo = lo.min(y);
+                    hi = hi.max(y);
+                    samples.push((x, z, y));
+                }
+            }
+            let relief = if samples.is_empty() { 0 } else { hi - lo };
+            if best.as_ref().is_none_or(|(r, _)| relief > *r) {
+                best = Some((relief, samples));
+            }
+        }
+        let (relief, mut samples) = best.expect("a chart sample");
+        samples.sort_by_key(|s| s.2);
+        let air = crate::block::registry::AIR;
+        let mut chosen = None;
+        for (x, z, open) in samples {
+            if !world.registry.is_solid(world.generator.voxel_at(x, open - 1, z)) {
+                continue;
+            }
+            for lift in 0..8 {
+                let y = open + lift;
+                let clear = world.generator.voxel_at(x, y, z) == air
+                    && world.generator.voxel_at(x, y + 1, z) == air
+                    && world.generator.voxel_at(x, y + 2, z) == air;
+                if clear {
+                    chosen = Some((x, z, open, y));
+                    break;
+                }
+            }
+            if chosen.is_some() {
+                break;
+            }
+        }
+        let (x, z, open, eye_block) = chosen.expect("a clear column");
+        let cell = [i64::from(x), i64::from(open), i64::from(z)];
+        let (patch, _) = atlas.locate(cell).unwrap_or_else(|| panic!("surface {cell:?} left the chart"));
+        let eye_y = if atlas.locate([i64::from(x), i64::from(eye_block) + 1, i64::from(z)]).is_some() {
+            f64::from(eye_block) + 1.62
+        } else {
+            f64::from(eye_block) + 0.5
+        };
+        let storage = DVec3::new(f64::from(x) + 0.5, eye_y, f64::from(z) + 0.5);
+        let physical = atlas.embed_storage(patch, storage);
+        let roundtrip = world.chart_eye(physical).map(|p| (p - storage).length()).unwrap_or(f64::MAX);
+        ChartStand { x, z, open, storage, physical, roundtrip, relief }
+    }
+
+    /// Settle on a chart and print the near-LOD census. Returns passes.
+    fn audit_chart(world: &mut World, name: &str, stand: &ChartStand, inward: bool, radius: i64) -> usize {
+        say(&format!(
+            "STAND {name} phys {:.1} {:.1} {:.1} storage {:.1} {:.1} {:.1} relief {} roundtrip {:.3} open {}",
+            stand.physical.x, stand.physical.y, stand.physical.z, stand.storage.x, stand.storage.y, stand.storage.z, stand.relief, stand.roundtrip, stand.open
+        ));
+        world.prepare_around(stand.physical);
+        world.drive_spawn_ready();
+        let passes = settle(world, stand.physical, NONE, name);
+        for _ in 0..8 {
+            if world.window.grounded && !world.window.stale {
+                break;
+            }
+            step(world, stand.physical);
+        }
+        let center = world.center.expect("a centre");
+        let cols = near_columns(world, center);
+        let bare_n = bare(world, &cols);
+        let (y0, y1) = world.near_y_range(center);
+        let near = world.near_block_box(center);
+        let radius_blocks = 16 * world.view.horizontal;
+        let (ex, ez) = (stand.x, stand.z);
+        let mut near_n = 0usize;
+        let mut failures = 0usize;
+        let mut other_face = 0usize;
+        let mut by_detail = [0usize; 12];
+        let mut nearest = i32::MAX;
+        let mut hits = String::new();
+        for &(s, _) in &world.section_visible {
+            if s.face != Face::PosY {
+                other_face += 1;
+                continue;
+            }
+            let span = s.span();
+            let (x0, z0) = (s.min_x(), s.min_z());
+            let dx = if ex < x0 {
+                x0 - ex
+            } else if ex > x0 + span - 1 {
+                ex - (x0 + span - 1)
+            } else {
+                0
+            };
+            let dz = if ez < z0 {
+                z0 - ez
+            } else if ez > z0 + span - 1 {
+                ez - (z0 + span - 1)
+            } else {
+                0
+            };
+            let dist = (f64::from(dx) * f64::from(dx) + f64::from(dz) * f64::from(dz)).sqrt();
+            if dist >= f64::from(radius_blocks) {
+                continue;
+            }
+            near_n += 1;
+            nearest = nearest.min(dx.max(dz));
+            let slot = (s.detail.0 as usize).min(by_detail.len() - 1);
+            by_detail[slot] += 1;
+            let wholly = super::super::inside_near(s, near, None);
+            let mut relief_in = false;
+            if wholly
+                && let Some((lo, hi)) = world.generator.surface_rect(s.body, Face::PosY, x0, z0, x0 + span, z0 + span)
+            {
+                let (top_lo, top_hi) = (lo.saturating_sub(1), hi.saturating_sub(1));
+                relief_in = i64::from(top_lo) >= y0 && i64::from(top_hi) < y1;
+            }
+            if wholly && relief_in {
+                failures += 1;
+                if failures <= 24 {
+                    hits.push_str(&format!("HIT {name} detail {} dist {dist:.1} span {span}\n", s.detail.0));
+                }
+            }
+        }
+        let missed = cols.iter().filter(|c| !(y0..y1).contains(&i64::from(c.2))).count();
+        let far = far_near(world, center, &cols);
+        let (x0, x1, z0, z1) = near;
+        let far_inner = cols
+            .iter()
+            .filter(|&&(x, z, _)| {
+                let (bx, bz) = (i64::from(x), i64::from(z));
+                bx - x0 >= 32 && x1 - bx > 32 && bz - z0 >= 32 && z1 - bz > 32 && far_drawn(world, x, z)
+            })
+            .count();
+        let top = stand.open - 1;
+        let feet_in = (y0..y1).contains(&i64::from(top));
+        let feet_far = far_drawn(world, stand.x, stand.z);
+        let seat = world.seams.chart_seat(center);
+        let (seat_i, seat_in, seat_r) = seat
+            .map(|s| {
+                let a = &world.generator.atlases()[s.index];
+                (s.index, a.inward, a.radius)
+            })
+            .unwrap_or((usize::MAX, false, 0));
+        say(&format!(
+            "NEAR {name} passes {passes} bare {bare_n} near {near_n} failures {failures} missed {missed} far_near {far} far_inner {far_inner} \
+             feet_in {feet_in} feet_far {feet_far} grounded {} window {:?} up {:?} seat {seat_i} inward {seat_in} radius {seat_r} \
+             other_face {other_face} nearest {nearest} by_detail {by_detail:?} cols {} chunks {}",
+            world.window.grounded,
+            world.window.punch,
+            world.live_up(),
+            cols.len(),
+            world.chunks.len()
+        ));
+        if !hits.is_empty() {
+            print!("{hits}");
+        }
+        assert!(stand.roundtrip < 1.0, "{name}: storage roundtrip {}", stand.roundtrip);
+        assert!(seat_in == inward && (seat_r - radius).abs() < 16, "{name}: stood on atlas {seat_i} inward {seat_in} radius {seat_r}");
+        assert_eq!(world.live_up(), Some(Face::PosY), "{name}: chart up");
+        assert!(feet_in, "{name}: the column underfoot is outside the window");
+        assert!(!feet_far, "{name}: a far section draws the column underfoot");
+        assert!(world.window.grounded, "{name}: the window never reached the ground");
+        assert_eq!(failures, 0, "{name}: {failures} sections inside the near square with relief in the window");
+        assert_eq!(bare_n, 0, "{name}: {bare_n} bare columns");
+        passes
+    }
+
+    fn audit_round(kind: crate::world::terrain::cosmos::Kind, inward: bool, name: &str) {
+        let mut world = seeded(42, 16, 5);
+        let body = body_of(&world, kind);
+        let atlas = round_atlas(&world, &body, inward);
+        let radius = atlas.radius;
+        let stand = chart_stand(&world, atlas);
+        audit_chart(&mut world, name, &stand, inward, radius);
+    }
+
+    fn cell_solid(world: &World, p: DVec3) -> bool {
+        let (x, y, z) = (crate::math::block_coord(p.x), crate::math::block_coord(p.y), crate::math::block_coord(p.z));
+        world.registry.is_solid(world.generator.voxel_at(x, y, z))
+    }
+
+    fn tangents(dir: DVec3) -> (DVec3, DVec3) {
+        let up = if dir.y.abs() < 0.9 { DVec3::Y } else { DVec3::X };
+        let u = dir.cross(up).normalize();
+        (u, dir.cross(u).normalize())
+    }
+
+    /// First solid point marching from `from` along unit `into`, or `None` when the ray stays air.
+    fn first_solid(world: &World, from: DVec3, into: DVec3, steps: i32, step: f64) -> Option<DVec3> {
+        if cell_solid(world, from) {
+            return Some(from);
+        }
+        for i in 1..=steps {
+            let p = from + into * (step * f64::from(i));
+            if cell_solid(world, p) {
+                let mut lo = from + into * (step * f64::from(i - 1));
+                let mut hi = p;
+                for _ in 0..24 {
+                    let mid = (lo + hi) * 0.5;
+                    if cell_solid(world, mid) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                return Some(hi);
+            }
+        }
+        None
+    }
+
+    /// Eye just outside the great rock, on the axis whose surface varies most inside the near radius.
+    fn rock_stand(world: &World, rock: &crate::world::terrain::cosmos::Rock) -> (DVec3, DVec3, i32) {
+        let c = DVec3::new(f64::from(rock.centre[0]), f64::from(rock.centre[1]), f64::from(rock.centre[2]));
+        let reach = f64::from(rock.r) * 1.35 + 2.0;
+        let dirs = [DVec3::X, DVec3::NEG_X, DVec3::Y, DVec3::NEG_Y, DVec3::Z, DVec3::NEG_Z];
+        let mut best: Option<(DVec3, DVec3, i32)> = None;
+        for dir in dirs {
+            let Some(solid) = first_solid(world, c + dir * reach, -dir, 400, 16.0) else { continue };
+            let (u, v) = tangents(dir);
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for iv in -4..=4 {
+                for iu in -4..=4 {
+                    let off = u * (f64::from(iu) * 64.0) + v * (f64::from(iv) * 64.0);
+                    if let Some(hit) = first_solid(world, c + off + dir * reach, -dir, 400, 16.0) {
+                        let h = (hit - c).dot(dir);
+                        lo = lo.min(h);
+                        hi = hi.max(h);
+                    }
+                }
+            }
+            let relief = if lo > hi { 0 } else { (hi - lo).round() as i32 };
+            let mut eye = solid + dir * 1.62;
+            for _ in 0..8 {
+                if !cell_solid(world, eye) {
+                    break;
+                }
+                eye += dir;
+            }
+            if best.as_ref().is_none_or(|b| relief > b.2) {
+                best = Some((eye, dir, relief));
+            }
+        }
+        best.expect("a rock surface")
+    }
+
+    /// Solid-top chunks of the rock within 256 blocks of the eye, in the tangent plane.
+    fn rock_chunks(world: &World, eye: DVec3, dir: DVec3) -> Vec<Coord> {
+        let (u, v) = tangents(dir);
+        let mut out = Vec::new();
+        for iv in -16..=16 {
+            for iu in -16..=16 {
+                let off = u * (f64::from(iu) * 16.0) + v * (f64::from(iv) * 16.0);
+                if off.length_squared() > 256.0 * 256.0 {
+                    continue;
+                }
+                let Some(hit) = first_solid(world, eye + off + dir * 64.0, -dir, 48, 8.0) else { continue };
+                let c = World::chunk_of(crate::math::block_coord(hit.x), crate::math::block_coord(hit.y), crate::math::block_coord(hit.z));
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_inventory() {
+        let world = seeded(42, 16, 5);
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        let atlases = world.generator.atlases();
+        for (i, a) in atlases.iter().enumerate() {
+            let grid = a.grid.map(|g| g.body);
+            say(&format!(
+                "ATLAS {i} radius {} inward {} grid {grid:?} warp {} bands {} centre {:.0} {:.0} {:.0}",
+                a.radius,
+                a.inward,
+                a.warp.is_some(),
+                a.bands.len(),
+                a.centre.x,
+                a.centre.y,
+                a.centre.z
+            ));
+        }
+        for b in cosmos.bodies() {
+            let charts: Vec<usize> = atlases
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    if a.grid.is_some_and(|g| g.body == b.id) {
+                        return true;
+                    }
+                    if a.grid.is_some() || (a.centre - b.centre_f()).length() >= 1.0 {
+                        return false;
+                    }
+                    match b.shape {
+                        crate::world::terrain::cosmos::Shape::Ball { r } => (a.radius - r).abs() < 16,
+                        crate::world::terrain::cosmos::Shape::Shell { outer, inner } => (a.radius - outer).abs() < 16 || (a.radius - inner).abs() < 16,
+                        crate::world::terrain::cosmos::Shape::Cube { .. } => false,
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let warped = atlases.iter().any(|a| a.grid.is_some_and(|g| g.body == b.id) && a.warp.is_some());
+            say(&format!("BODY {} {} {:?} centre {:?} charts {charts:?} warped {warped}", b.id, b.kind.name(), b.shape, b.centre));
+        }
+        match cosmos.great_rock() {
+            Some(r) => say(&format!("ROCK great centre {:?} r {} axes {:?} {:?}", r.centre, r.r, r.axes, r.kind)),
+            None => say("ROCK none"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_verdant() {
+        audit_round(crate::world::terrain::cosmos::Kind::Verdant, false, "verdant");
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_hollow_outer() {
+        audit_round(crate::world::terrain::cosmos::Kind::Hollow, false, "hollow_outer");
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_hollow_inner() {
+        audit_round(crate::world::terrain::cosmos::Kind::Hollow, true, "hollow_inner");
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_ember() {
+        audit_round(crate::world::terrain::cosmos::Kind::Ember, false, "ember");
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_moon() {
+        audit_round(crate::world::terrain::cosmos::Kind::Moon, false, "moon");
+    }
+
+    #[test]
+    #[ignore]
+    fn near_lod_rock() {
+        let mut world = seeded(42, 16, 5);
+        let rock = world.generator.cosmos().expect("cosmos").great_rock().expect("a great rock");
+        say(&format!("ROCK stand-on centre {:?} r {} axes {:?} {:?}", rock.centre, rock.r, rock.axes, rock.kind));
+        let (eye, dir, relief) = rock_stand(&world, &rock);
+        let chunks = rock_chunks(&world, eye, dir);
+        say(&format!(
+            "STAND rock phys {:.1} {:.1} {:.1} dir {:.3} {:.3} {:.3} relief {} samples {}",
+            eye.x, eye.y, eye.z, dir.x, dir.y, dir.z, relief, chunks.len()
+        ));
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        for b in cosmos.bodies() {
+            let alt = cosmos.altitude(b, eye);
+            if alt.abs() < b.reach() * 1.5 {
+                say(&format!("ROCK near-body {} {} alt {:.1}", b.id, b.kind.name(), alt));
+            }
+        }
+        world.prepare_around(eye);
+        world.drive_spawn_ready();
+        let passes = settle(&mut world, eye, NONE, "rock");
+        let bare_n = chunks.iter().filter(|c| !world.chunks.get(c).is_some_and(|l| l.state.settled())).count();
+        let (near_n, failures) = if let Some((_, face)) = world.section_lod_face {
+            proof_hits(&world, face)
+        } else {
+            let n = world.section_visible.len();
+            (n, n)
+        };
+        say(&format!(
+            "NEAR rock passes {passes} bare {bare_n} near {near_n} failures {failures} missed 0 far_near 0 far_inner 0 \
+             feet_in 1 feet_far 0 grounded {} window {:?} up {:?} face {:?} chunks {} visible {}",
+            world.window.grounded,
+            world.window.punch,
+            world.live_up(),
+            world.section_lod_face,
+            world.chunks.len(),
+            world.section_visible.len()
+        ));
+        assert!(!cell_solid(&world, eye), "rock: the eye is inside the rock");
+        assert_eq!(failures, 0, "rock: coarse sections next to the eye");
+        assert_eq!(bare_n, 0, "rock: {bare_n} surface chunks inside the near radius are not settled");
+    }
 }
