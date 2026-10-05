@@ -1768,6 +1768,10 @@ impl World {
         // exactly the old full-res radius.
         let (min, max) = self.lod_clip_box(cam);
         f.set_lod_clip_box(min, max);
+        let bands = forced_morph();
+        if !bands.is_empty() {
+            f.set_lod_morph(bands);
+        }
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.
         use voxel_engine::profile::{Gauge, gauge};
@@ -3176,3 +3180,41 @@ impl StreamLane for LightLane {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+/// `WATT_MORPH_FORCE`: LOD morph bands forced for shader checks, until the game sets its own.
+/// Comma-separated `<level>:<start>:<end>` (blocks of camera distance; `a` ramps 0 -> 1 across it) or
+/// `<level>:1` (fully morphed at every distance); `<level>` is the engine mesh detail (0..16) or `all`.
+/// Unset or unparsable: no bands.
+fn forced_morph() -> &'static [voxel_engine::LodMorph] {
+    static BANDS: std::sync::OnceLock<Vec<voxel_engine::LodMorph>> = std::sync::OnceLock::new();
+    BANDS.get_or_init(|| std::env::var("WATT_MORPH_FORCE").map(|v| parse_morph_force(&v)).unwrap_or_default())
+}
+
+fn parse_morph_force(spec: &str) -> Vec<voxel_engine::LodMorph> {
+    let mut bands = vec![voxel_engine::LodMorph::default(); 16];
+    let mut any = false;
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = item.split(':').collect();
+        let band = match parts[1..] {
+            ["1"] => voxel_engine::LodMorph { start: 0.0, end: 1e-3 },
+            [start, end] => match (start.parse(), end.parse()) {
+                (Ok(start), Ok(end)) => voxel_engine::LodMorph { start, end },
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let levels = match parts[0] {
+            "all" => 0..16,
+            l => match l.parse::<usize>() {
+                Ok(k) if k < 16 => k..k + 1,
+                _ => continue,
+            },
+        };
+        for k in levels {
+            bands[k] = band;
+        }
+        any = true;
+    }
+    if any { bands } else { Vec::new() }
+}
+

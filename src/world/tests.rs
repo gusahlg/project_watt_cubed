@@ -4100,3 +4100,17 @@ fn asteroid_entry_breakdown() {
     );
     assert!(finished, "entry did not complete within 300s: {}", world.entry_debug());
 }
+
+/// `WATT_MORPH_FORCE` items: a band, a full morph, `all`, and junk that is skipped.
+#[test]
+fn morph_force_parses_bands_full_morph_and_all() {
+    use voxel_engine::LodMorph;
+    let b = parse_morph_force("3:0:2000, 5:1");
+    assert_eq!(b.len(), 16);
+    assert_eq!(b[3], LodMorph { start: 0.0, end: 2000.0 });
+    assert_eq!(b[5], LodMorph { start: 0.0, end: 1e-3 });
+    assert_eq!(b[4], LodMorph::default());
+    assert!(parse_morph_force("all:1").iter().all(|m| m.end > m.start));
+    assert!(parse_morph_force("").is_empty());
+    assert!(parse_morph_force("x:1,99:1,3:a:b").is_empty());
+}
