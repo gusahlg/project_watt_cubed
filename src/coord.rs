@@ -339,17 +339,14 @@ impl<T> IndexMut<voxel_engine::Pass> for ByPass<T> {
     }
 }
 
-/// Axis-aligned chunk volume. `rh` is the radius across `up`; `rv` is the
-/// radius along it, stretched by `grow`. `up: None` is isotropic: every axis
-/// uses `rh` (`rv` and `grow` are unused). [`new`](Self::new) is the +Y box.
+/// Axis-aligned chunk volume, inclusive corners: `rh` chunks either way across `up` and `rv`
+/// along it (see [`with_up`](Self::with_up)), optionally stretched along `up`. `up: None` is
+/// isotropic: every axis uses `rh`. [`new`](Self::new) is the +Y box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkBox {
-    pub center: ChunkCoord,
-    pub rh: i32,
-    pub rv: i32,
-    pub up: Option<Face>,
-    /// Layers past `rv` below and above `center` along `up`'s normal. `[0, 0]` is symmetric.
-    pub grow: [i32; 2],
+    lo: [i32; 3],
+    hi: [i32; 3],
+    up: Option<Face>,
 }
 
 impl ChunkBox {
@@ -361,63 +358,54 @@ impl ChunkBox {
 
     #[inline]
     pub fn with_up(center: ChunkCoord, rh: i32, rv: i32, up: Option<Face>) -> Self {
-        Self { center, rh, rv, up, grow: [0, 0] }
-    }
-
-    /// The box with `grow` layers past `rv` below and above the centre along `up`'s normal.
-    #[inline]
-    pub fn stretched(self, grow: [i32; 2]) -> Self {
-        Self { grow, ..self }
-    }
-
-    /// Per-axis radius. `None` copies `rh` onto every axis.
-    #[inline]
-    fn radii(self) -> [i32; 3] {
-        match self.up {
-            None => [self.rh, self.rh, self.rh],
-            Some(face) => {
-                let mut r = [self.rh, self.rh, self.rh];
-                r[face.axis()] = self.rv;
-                r
-            }
+        let mut r = [rh; 3];
+        if let Some(face) = up {
+            r[face.axis()] = rv;
         }
+        let c = [center.x, center.y, center.z];
+        Self { lo: std::array::from_fn(|a| c[a] - r[a]), hi: std::array::from_fn(|a| c[a] + r[a]), up }
     }
 
-    /// Inclusive corners. A negative face's "below" is the axis's positive side.
+    /// The box grown `below` and `above` layers along `up`'s normal (a negative face's "below"
+    /// is the axis's positive side). An isotropic box is unchanged.
     #[inline]
-    fn bounds(self) -> ([i32; 3], [i32; 3]) {
-        let r = self.radii();
-        let c = [self.center.x, self.center.y, self.center.z];
-        let mut lo: [i32; 3] = std::array::from_fn(|a| c[a] - r[a]);
-        let mut hi: [i32; 3] = std::array::from_fn(|a| c[a] + r[a]);
+    pub fn stretched(mut self, [below, above]: [i32; 2]) -> Self {
         if let Some(face) = self.up {
-            let [below, above] = self.grow;
             let a = face.axis();
             let (neg, pos) = if face.sign() > 0 { (below, above) } else { (above, below) };
-            lo[a] -= neg;
-            hi[a] += pos;
+            self.lo[a] -= neg;
+            self.hi[a] += pos;
         }
-        (lo, hi)
+        self
+    }
+
+    /// Inclusive corners.
+    #[inline]
+    fn bounds(self) -> ([i32; 3], [i32; 3]) {
+        (self.lo, self.hi)
     }
 
     #[inline]
     pub fn contains(self, c: ChunkCoord) -> bool {
-        let (lo, hi) = self.bounds();
-        let p = [c.x, c.y, c.z];
-        (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a])
+        let (lo, hi) = (self.lo, self.hi);
+        lo[0] <= c.x && c.x <= hi[0] && lo[1] <= c.y && c.y <= hi[1] && lo[2] <= c.z && c.z <= hi[2]
+    }
+
+    /// Whether the boxes share a chunk.
+    #[inline]
+    pub fn meets(self, other: ChunkBox) -> bool {
+        (0..3).all(|a| self.lo[a] <= other.hi[a] && other.lo[a] <= self.hi[a])
     }
 
     #[inline]
     pub fn min(self) -> ChunkCoord {
-        let (lo, _) = self.bounds();
-        ChunkCoord::new(lo[0], lo[1], lo[2])
+        ChunkCoord::new(self.lo[0], self.lo[1], self.lo[2])
     }
 
     /// Inclusive axis lengths: `(x, y, z)`.
     #[inline]
     pub fn size(self) -> (i32, i32, i32) {
-        let (lo, hi) = self.bounds();
-        (hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1)
+        (self.hi[0] - self.lo[0] + 1, self.hi[1] - self.lo[1] + 1, self.hi[2] - self.lo[2] + 1)
     }
 
     /// Every chunk in the box.

@@ -1056,6 +1056,12 @@ pub struct World {
     window: streaming::Window,
     /// Surface bounds of the near square's chunk columns, kept while they stay in the square.
     window_ground: streaming::NearBounds,
+    /// The unload box of a window frame just left (another up face), in its chart net: its chunks
+    /// stay loaded until the far field draws the new window.
+    retired: Option<(ChunkBox, seam::Unfold)>,
+    /// Chunk-y extent of the edits in each chunk column `(x, z)`, never shrunk. The generator's
+    /// surface bounds miss a pit dug below them or a tower built above.
+    edit_columns: FastMap<(i32, i32), [i32; 2]>,
     /// The far field's chunk centre: the chart column under the eye, which outlasts the near
     /// window's chart reach; the streaming centre elsewhere. Set by [`stream`](Self::stream).
     far_center: Option<Coord>,
@@ -1541,6 +1547,8 @@ impl World {
             center: None,
             window: streaming::Window::default(),
             window_ground: streaming::NearBounds::default(),
+            retired: None,
+            edit_columns: FastMap::default(),
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
             far_atlas: None,
@@ -1865,9 +1873,13 @@ impl World {
     pub(in crate::world) fn refresh_lod_clip(&mut self) {
         if self.lod_clip_shrunk.take() {
             self.lod_clip_rings = 0;
+            if let Some((_, r)) = &mut self.lod_clip_next {
+                *r = 0;
+            }
             self.lod_clip_grow.set();
         }
-        if !self.lod_clip_grow.take() {
+        // A chart clips nothing (`lod_clip`), so its rings are never read: no scan.
+        if !self.lod_clip_grow.take() || !self.fold.is_identity() {
             return;
         }
         let Some(center) = self.center else { return };
@@ -1923,7 +1935,7 @@ impl World {
                 // Through the chart net; storage that holds nothing is settled by definition.
                 self.fold
                     .unfold(Coord::new(p[0], p[1], p[2]))
-                    .is_none_or(|c| self.chunks.get(&c).is_some_and(|l| l.state.settled()))
+                    .is_none_or(|c| self.chunk_final(c))
             })
         };
         let c0 = origin[t0];
@@ -1936,6 +1948,22 @@ impl World {
             && (1 - r..r).all(|d| settled(c0 - r, c1 + d) && settled(c0 + r, c1 + d))
     }
 
+    /// Whether chunk `c` is final for the far field's handover: settled (drawn, or nothing to
+    /// draw), or parked by quarantine, a bounded hole that would otherwise hold the far field
+    /// over it for good.
+    pub(in crate::world) fn chunk_final(&self, c: Coord) -> bool {
+        if self.chunks.get(&c).is_some_and(|l| l.state.settled()) {
+            return true;
+        }
+        if self.quarantined.is_empty() {
+            return false;
+        }
+        let parked = |key| self.quarantined.contains(&key);
+        parked(streaming::FailKey::Mesh { coord: c })
+            || parked(streaming::FailKey::Open { coord: c })
+            || matches!(self.generator.sky(c), Sky::Axis(face) if parked(streaming::FailKey::Column { key: ColumnKey::of(face, c).0 }))
+    }
+
     fn cube_ring_settled(&self, center: Coord, ring: i32) -> bool {
         let r = ring;
         for dx in -r..=r {
@@ -1946,7 +1974,7 @@ impl World {
                     }
                     let c = Coord::new(center.x + dx, center.y + dy, center.z + dz);
                     let Some(c) = self.fold.unfold(c) else { continue };
-                    if !self.chunks.get(&c).is_some_and(|l| l.state.settled()) {
+                    if !self.chunk_final(c) {
                         return false;
                     }
                 }
@@ -2022,9 +2050,13 @@ impl World {
     /// window holds is not loaded either: whatever already draws it keeps drawing
     /// until its chunks have settled, then the punch drops it.
     fn coverage_skips(&self, center: Coord, key: SectionPos) -> bool {
-        if self.section_held.contains_key(&key) {
-            return true;
-        }
+        self.section_held.contains_key(&key) || self.full_res_covers(center, key)
+    }
+
+    /// The full-res chunks draw everything `key` would: its footprint lies well inside the near
+    /// square, its relief inside the near window, and every chunk under it has settled. Such a
+    /// section is neither loaded nor drawn.
+    fn full_res_covers(&self, center: Coord, key: SectionPos) -> bool {
         // Off the camera's +Y face the world-XZ proof does not apply. Keeping the
         // section loaded is the safe side (the clip still discards it once settled).
         if key.face != Face::PosY {
@@ -2093,11 +2125,7 @@ impl World {
         for cy in cy_lo..=cy_hi {
             for cz in cz_lo..=cz_hi {
                 for cx in cx_lo..=cx_hi {
-                    let settled = self
-                        .chunks
-                        .get(&Coord::new(cx, cy, cz))
-                        .is_some_and(|l| l.state.settled());
-                    if !settled {
+                    if !self.chunk_final(Coord::new(cx, cy, cz)) {
                         return false;
                     }
                 }

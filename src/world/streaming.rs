@@ -1722,6 +1722,7 @@ impl World {
         // against it would discard all results and regenerate them immediately.
         // An up-face change is the same kind of pass: the box changed shape.
         let prev_center = self.center;
+        let leaving = (self.prev_unload_box, self.fold);
         let center_moved = Some(center_chunk) != self.center;
         let fold_changed = center_moved && self.adopt_fold(center_chunk);
         let up_changed = if center_moved || !self.stream_up_set {
@@ -1739,9 +1740,7 @@ impl World {
             false
         };
         if up_changed || fold_changed {
-            // Window bounds and the span the rings prove are altitudes in the old frame.
-            self.window = Window::default();
-            (self.lod_clip_span, self.lod_clip_next) = (None, None);
+            self.follow_frame(center_chunk, leaving);
         }
         let window_moved = self.place_window(center_chunk, center_moved || up_changed || fold_changed);
         let full_pass = center_moved || up_changed || fold_changed || window_moved;
@@ -2049,7 +2048,6 @@ impl World {
             // Vec fallback uses the existing main-thread copy. (The rev
             // check above guarantees the state is NeedsMesh { building: true }.)
             self.upload_chunk_payload(coord, data, eng);
-            self.note_settled();
         }
 
         self.apply_light_queue();
@@ -2323,12 +2321,13 @@ impl World {
             }
             pipeline::MeshPayload::Staged(mut staged) => {
                 let placement = self.placement_of(coord, eng);
+                let wanted = ByPass::from_fn(|p| staged.passes[p].is_some());
                 let handles = ByPass::from_fn(|p| {
                     staged.passes[p].take().and_then(|pass| {
                         eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement)
                     })
                 });
-                self.install_chunk_handles(coord, handles, None, eng);
+                self.install_chunk_handles(coord, handles, wanted, None, eng);
             }
         }
     }
@@ -2348,7 +2347,7 @@ impl World {
         if let Some((data, eng)) = gpu {
             let placement = self.placement_of(coord, eng);
             let handles = ByPass::from_fn(|p| eng.upload_mesh_placed(&data[p], placement));
-            self.install_chunk_handles(coord, handles, hash, eng);
+            self.install_chunk_handles(coord, handles, ByPass::from_fn(|p| !data[p].is_empty()), hash, eng);
             return;
         }
         if let Some(loaded) = self.chunks.get_mut(&coord) {
@@ -2356,23 +2355,38 @@ impl World {
         }
     }
 
+    /// Install an upload's `handles`. A pass with geometry (`wanted`) that got no handle failed:
+    /// the chunk keeps whatever it drew before and is not settled, so the far field keeps
+    /// drawing it.
     fn install_chunk_handles(
         &mut self,
         coord: Coord,
         handles: ByPass<Option<voxel_engine::MeshHandle>>,
+        wanted: ByPass<bool>,
         hash: Option<u64>,
         eng: &mut Engine,
     ) {
+        let failed = handles.iter().any(|(p, h)| wanted[p] && h.is_none());
         let vis = !self.occlusion_active || self.occlusion.is_visible(coord);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             let was = loaded.state.is_building();
-            loaded.retire(MeshState::from_upload(handles), eng);
-            loaded.mesh_hash = hash;
-            super::adjust_count(&mut self.building_meshes, was, false);
-            loaded.visible = vis;
-            if !vis && let Some(meshes) = loaded.state.live_meshes() {
-                meshes.set_visible(eng, false);
+            if failed {
+                for h in handles.into_iter_passes().filter_map(|(_, h)| h) {
+                    eng.free_mesh(h);
+                }
+                loaded.state.release_build();
+            } else {
+                loaded.retire(MeshState::from_upload(handles), eng);
+                loaded.mesh_hash = hash;
+                loaded.visible = vis;
+                if !vis && let Some(meshes) = loaded.state.live_meshes() {
+                    meshes.set_visible(eng, false);
+                }
             }
+            super::adjust_count(&mut self.building_meshes, was, loaded.state.is_building());
+        }
+        if !failed {
+            self.note_settled();
         }
     }
 
@@ -2404,6 +2418,7 @@ impl World {
                 }
             }
         }
+        self.note_settled();
     }
 
     #[cfg(test)]
@@ -3211,7 +3226,10 @@ impl World {
         let unload = self.unload_box(center);
         // Collect-then-remove instead of `retain`: freeing borrows the caller's
         // engine, which can't be borrowed inside a retain closure over `self.chunks`.
-        let far = self.unload_leaving(unload);
+        let mut far = self.unload_leaving(unload);
+        if let Some((kept, fold)) = self.retired {
+            far.retain(|&c| !kept.contains(fold.fold(c)));
+        }
         self.prev_unload_box = Some(unload);
         // A removed chunk changes what the BFS can reach — topology class.
         self.occlusion_topo_dirty.raise(!far.is_empty());
@@ -3924,6 +3942,8 @@ impl World {
                     self.section_overlay.remove(&pos);
                 }
             }
+            // Off a chart the window's ground is read from this overlay.
+            self.window.stale = true;
         }
         match self.section_overlay_dirty.len() {
             0 => Progress::Idle,
@@ -4117,7 +4137,7 @@ impl World {
         }
         let (u0, v0, u1, v1) = overlap_storage(s, near, across)?;
         let surface = || self.generator.surface_rect(s.body, Face::PosY, u0, v0, u1, v1);
-        let (lo, hi) = memo.get((s.body, [u0, v0, u1, v1]), surface)?;
+        let (lo, hi) = self.with_edits(memo.get((s.body, [u0, v0, u1, v1]), surface)?, [u0, v0, u1, v1]);
         let (top_lo, top_hi) = (lo.saturating_sub(1), hi.saturating_sub(1));
         let cs = CHUNK_SIZE as i32;
         (i64::from(top_lo) >= y0 && i64::from(top_hi) < y1).then(|| [top_lo.div_euclid(cs), top_hi.div_euclid(cs)])
@@ -4332,7 +4352,9 @@ impl World {
         let desired = std::mem::take(&mut self.section_desired);
         let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
-        let cut = quadtree::resolve_covering(&desired, max, &ready);
+        // A cell the settled full-res chunks already draw hands over at once, ahead of the clip.
+        let drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
+        let cut = quadtree::resolve_covering(&drawn, max, &ready);
         let backlog = desired.iter().any(|&c| {
             !self.sections.contains_key(&c)
                 && quadtree::drawable_cover(c, max, &ready).is_none()
@@ -4480,8 +4502,12 @@ impl World {
             .keys()
             .copied()
             .filter(|s| {
-                if desired.contains(s) || visible.contains(s) || fading.contains(s) {
+                if visible.contains(s) || fading.contains(s) {
                     return false;
+                }
+                if desired.contains(s) {
+                    // Settled full-res chunks draw it: hand it over (a chart punches it instead).
+                    return self.full_res_covers(center, *s);
                 }
                 let span = s.span();
                 let (cx, cz) = (s.x * span + span / 2, s.z * span + span / 2);

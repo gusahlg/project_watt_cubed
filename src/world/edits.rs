@@ -46,9 +46,6 @@ impl World {
         if horizontal != self.view.horizontal || vertical != self.view.vertical {
             let shrunk = horizontal < self.view.horizontal || vertical < self.view.vertical;
             self.view = super::ViewVolume::new(horizontal, vertical);
-            // The window is measured in the old layers; the next stream places it afresh.
-            self.window = super::streaming::Window::default();
-            (self.lod_clip_span, self.lod_clip_next) = (None, None);
             let rings = self.view.worklist_rings(self.live_up(), 0);
             self.mesh_worklist.resize(rings);
             self.light_worklist.resize(rings);
@@ -331,9 +328,13 @@ impl World {
             None
         } else {
             self.edits.entry(coord).or_default().insert(index, id);
+            let span = self.edit_columns.entry((coord.x, coord.z)).or_insert([coord.y, coord.y]);
+            *span = [span[0].min(coord.y), span[1].max(coord.y)];
             Some(id)
         };
         self.edit_generation += 1;
+        // The window's ground may have moved with this edit.
+        self.window.stale = true;
         // Skylight ceiling upkeep: a roof appearing above a column's
         // current ceiling raises it; the topmost edited roof disappearing
         // lowers it. Either way the cached window is stale, and every loaded

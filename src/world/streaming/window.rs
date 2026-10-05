@@ -1,17 +1,26 @@
 //! The near window along the up axis. It always holds the eye band (`eye ± vertical`), so nothing
 //! the player stands on or builds beside unloads, and it grows over the terrain of the near square:
-//! down to one chunk under its lowest ground and up to one chunk over its highest, within
-//! [`WINDOW_CAP`] layers. Far sections the window holds give way only once the chunks under them
-//! have settled (on a chart the punch waits per section; elsewhere the engine's clip box keeps to
-//! the span its settled rings prove), and a shrink that gives up ground waits for the far field.
+//! down to one chunk under its lowest ground and up to one chunk over its highest, within a cap
+//! that keeps the data box inside [`CHUNK_BUDGET`]. Far sections the window holds give way only
+//! once the chunks under them have settled (on a chart the punch waits per section; elsewhere the
+//! engine's clip box keeps to the span its settled rings prove), and a shrink that gives up ground
+//! waits for the far field.
 
 use super::*;
+use super::super::section::{CHART_BODY_BASE, FINEST_DETAIL, section_span};
+use super::super::{DATA_MARGIN, UNLOAD_MARGIN, VERTICAL_RADIUS_RANGE, VIEW_RADIUS_RANGE, seam};
 
-/// Layers the near window may span along the up axis, eye band included.
+/// Most layers the punch window spans, eye band included.
 const WINDOW_CAP: i32 = 32;
 
-/// Layers the held window may reach while a shrink waits for the far field.
-const HELD_CAP: i32 = 2 * WINDOW_CAP;
+/// Layers the held window may keep past the punch window while a shrink waits for the far field.
+const HELD_SLACK: i32 = 4;
+
+/// Chunks the data box may hold: the largest settings' box, with the held slack to spare.
+const CHUNK_BUDGET: i32 = {
+    let side = 2 * (*VIEW_RADIUS_RANGE.end() + DATA_MARGIN) + 1;
+    side * side * (2 * (*VERTICAL_RADIUS_RANGE.end() + DATA_MARGIN) + 1 + HELD_SLACK)
+};
 
 /// The near window's span along the up axis, in up-local chunk altitudes (inclusive). All `None`
 /// where the window does not grow: it is the eye band there.
@@ -26,26 +35,45 @@ pub(in crate::world) struct Window {
     ground: Option<[i32; 2]>,
     /// The window reaches the ground.
     grounded: bool,
-    /// The ground bounds are to be read again on the next pass: the far field's relief bake landed.
+    /// The ground bounds are to be read again on the next pass (an edit, a relief bake).
     pub(in crate::world) stale: bool,
+    /// The up face and chart atlas the altitudes are measured in.
+    frame: Option<(Option<Face>, Option<usize>)>,
+}
+
+/// The punch and held caps at render distance `h`: [`WINDOW_CAP`] and the held slack past it,
+/// shrunk so the data box stays within [`CHUNK_BUDGET`].
+fn caps(h: i32) -> (i32, i32) {
+    let side = 2 * (h + DATA_MARGIN) + 1;
+    let punch = WINDOW_CAP.min(CHUNK_BUDGET / (side * side) - 2 * DATA_MARGIN - HELD_SLACK);
+    (punch, punch + HELD_SLACK)
+}
+
+/// `core` grown toward `hull` (which holds it) by at most `spare` layers in all. Each side keeps
+/// what lies nearest the core, at least half the spare layers when it needs them.
+fn grow_within(core: [i32; 2], hull: [i32; 2], spare: i32) -> [i32; 2] {
+    let spare = spare.max(0);
+    let (down, up) = ((core[0] - hull[0]).max(0), (hull[1] - core[1]).max(0));
+    let d = down.min(spare - up.min(spare / 2));
+    let u = up.min(spare - d);
+    [core[0] - d, core[1] + u]
+}
+
+/// The smallest span holding both.
+fn hull(a: [i32; 2], b: [i32; 2]) -> [i32; 2] {
+    [a[0].min(b[0]), a[1].max(b[1])]
+}
+
+/// Layers in span `s`.
+fn layers(s: [i32; 2]) -> i32 {
+    s[1] - s[0] + 1
 }
 
 /// The span the window wants: the eye band `eye ± v`, grown over the terrain `ground` within
-/// `cap` layers. Past the cap each side keeps the terrain nearest the band, at least half the
-/// spare layers when it needs them.
+/// `cap` layers.
 fn wanted(eye: i32, v: i32, ground: Option<[i32; 2]>, cap: i32) -> [i32; 2] {
     let band = [eye - v, eye + v];
-    let Some([lo, hi]) = ground else { return band };
-    let spare = spare(v, cap);
-    let (down, up) = ((band[0] - lo).max(0), (hi - band[1]).max(0));
-    let d = down.min(spare - up.min(spare / 2));
-    let u = up.min(spare - d);
-    [band[0] - d, band[1] + u]
-}
-
-/// Layers the window may add to an eye band of radius `v` within `cap`.
-fn spare(v: i32, cap: i32) -> i32 {
-    (cap - 2 * v - 1).max(0)
+    ground.map_or(band, |g| grow_within(band, hull(band, g), cap - layers(band)))
 }
 
 /// `want` through a one-layer hysteresis on `prev`: a bound follows a growing span at once, and a
@@ -74,15 +102,6 @@ fn meets(a: [i32; 2], b: [i32; 2]) -> bool {
     a[0] <= b[1] && b[0] <= a[1]
 }
 
-/// Every chunk under `s` in `layers` is settled (drawn, or nothing to draw).
-fn backing_settled(chunks: &FastMap<Coord, Loaded>, s: SectionPos, layers: [i32; 2]) -> bool {
-    let cs = CHUNK_SIZE as i32;
-    let (x0, z0, n) = (s.min_x().div_euclid(cs), s.min_z().div_euclid(cs), s.span() / cs);
-    (layers[0]..=layers[1]).rev().all(|y| {
-        (z0..z0 + n).all(|z| (x0..x0 + n).all(|x| chunks.get(&Coord::new(x, y, z)).is_some_and(|l| l.state.settled())))
-    })
-}
-
 impl World {
     /// The near window grows past the eye band wherever the far field gives way to it: on a round
     /// world's chart, punched by key, and in physical space, where the engine's clip box follows
@@ -94,6 +113,28 @@ impl World {
             Some(Face::PosY) => self.section_on_chart(center),
             _ => false,
         }
+    }
+
+    /// The frame the window's altitudes are measured in: the up face, and a chart's atlas.
+    fn window_frame(&self, center: Coord) -> (Option<Face>, Option<usize>) {
+        let atlas = if self.fold.is_identity() { None } else { self.seams.chart_seat(center).map(|s| s.index) };
+        (self.live_up(), atlas)
+    }
+
+    /// The up face or chart net changed under the window. The charts of one atlas share storage
+    /// +Y and one datum, so a seam crossing keeps the window as it is. Another frame starts the
+    /// window afresh, and the box chunks were held to (`held`, in its net) stays loaded until the
+    /// far field draws the new window, when the eye is still inside it: a walk over a cube's edge,
+    /// not a jump.
+    pub(in crate::world) fn follow_frame(&mut self, center: Coord, (held, fold): (Option<ChunkBox>, seam::Unfold)) {
+        if self.window.frame == Some(self.window_frame(center)) {
+            return;
+        }
+        self.window = Window::default();
+        (self.lod_clip_span, self.lod_clip_next) = (None, None);
+        self.retired = held.filter(|b| b.contains(fold.fold(center))).map(|b| (b, fold));
+        // Whatever was kept for an earlier frame is unloaded by the next full scan.
+        self.prev_unload_box = None;
     }
 
     /// The punch window in world chunk coordinates along the up axis (inclusive).
@@ -110,8 +151,12 @@ impl World {
 
     /// Point the settled rings at a new punch window. Inside the span they prove, they keep it; a
     /// window reaching past it keeps clipping the part already proven while the whole is proven.
-    /// Without a window they go back to the eye band, proven afresh.
+    /// Without a window they go back to the eye band, proven afresh. A chart clips nothing, so
+    /// there is nothing to follow.
     fn clip_follow(&mut self, center: Coord) {
+        if !self.fold.is_identity() {
+            return;
+        }
         let (Some(face), Some(p)) = (self.live_up(), self.window_raw()) else {
             (self.lod_clip_span, self.lod_clip_next) = (None, None);
             self.lod_clip_shrunk.set();
@@ -145,23 +190,26 @@ impl World {
         [(eye - v - lo).max(0), (hi - eye - v).max(0)]
     }
 
-    /// Place the window around streaming centre `center`; returns whether the held span changed.
-    /// The punch span is recomputed only when the centre `moved` (or the ground went stale), and
-    /// the settled rings follow it. The held span takes a grown punch span at once and gives up
-    /// layers once they hold no ground, or once the far field draws the ground they held.
+    /// Place the window around streaming centre `center`; returns whether the held span changed
+    /// or a retired box was let go. The punch span is recomputed only when the centre `moved` (or
+    /// the ground went stale), and the settled rings follow it. The held span takes a grown punch
+    /// span at once, keeps what it held within the held cap (nearest the punch first), and gives
+    /// up layers once they hold no ground or once the far field draws the ground they held. A jump
+    /// past the unload box leaves nothing to keep.
     pub(in crate::world) fn place_window(&mut self, center: Coord, moved: bool) -> bool {
         let prev = self.window.held;
         if moved || std::mem::take(&mut self.window.stale) {
             let before = self.window.punch;
             self.window.punch = self.punch_window(center);
+            self.window.frame = Some(self.window_frame(center));
             if self.window.punch != before {
                 self.clip_follow(center);
             }
+            let reach = self.view.horizontal + UNLOAD_MARGIN;
+            let jumped = self.center.zip(self.live_up()).is_some_and(|(c, f)| self.fold.fold(c).across(center, f) > reach);
+            let (_, held_cap) = caps(self.view.horizontal);
             self.window.held = match (prev, self.window.punch) {
-                (Some(h), Some(p)) => {
-                    let hull = [h[0].min(p[0]), h[1].max(p[1])];
-                    Some(if hull[1] - hull[0] < HELD_CAP { hull } else { p })
-                }
+                (Some(h), Some(p)) if !jumped => Some(grow_within(p, hull(h, p), held_cap - layers(p))),
                 (_, p) => p,
             };
         }
@@ -175,7 +223,12 @@ impl World {
                 self.window.held = Some(p);
             }
         }
-        self.window.held != prev
+        let released = self.retired.is_some() && self.far_covers_near(center);
+        if released {
+            self.retired = None;
+            self.prev_unload_box = None;
+        }
+        released || self.window.held != prev
     }
 
     /// The span the punch tests against for `center`, through the hysteresis. The window reaches
@@ -191,7 +244,8 @@ impl World {
         let ground = self.ground_span(center);
         let (_, eye) = ColumnKey::of(self.live_up()?, center);
         let v = self.view.vertical;
-        let reach = (2 * self.view.horizontal + 1).min(v + spare(v, WINDOW_CAP));
+        let (cap, _) = caps(self.view.horizontal);
+        let reach = (2 * self.view.horizontal + 1).min(cap - v - 1);
         let slack = if self.window.grounded { 1 } else { -1 };
         let grounded = ground.is_some_and(|[lo, hi]| {
             let (over, under) = (eye - (hi - 1), lo + 1 - (eye + v));
@@ -199,28 +253,28 @@ impl World {
         });
         self.window.ground = ground;
         self.window.grounded = grounded;
-        let want = wanted(eye, v, ground.filter(|_| grounded), WINDOW_CAP);
+        let want = wanted(eye, v, ground.filter(|_| grounded), cap);
         Some(self.window.punch.map_or(want, |prev| hold(prev, want)))
     }
 
     /// Chunk layers of the near square's terrain: one under the layer of its lowest solid top to
-    /// one over the layer of its highest.
+    /// one over the layer of its highest, edits included.
     fn ground_span(&mut self, center: Coord) -> Option<[i32; 2]> {
         if self.fold.is_identity() { self.relief_span(center) } else { self.chart_span(center) }
     }
 
     /// [`ground_span`](Self::ground_span) off a chart, from the far field's baked relief over the
-    /// near square, per finest section of its face: no generator reads at all. `None` until that
-    /// bake has landed, or where it does not reach.
+    /// near square (edits folded in by its overlay), per finest section of its face: no generator
+    /// reads at all. `None` until that bake has landed, or where it does not reach.
     fn relief_span(&self, center: Coord) -> Option<[i32; 2]> {
         let face = self.live_up()?;
         let (body, _) = self.section_lod_face.filter(|&(_, f)| f == face)?;
         let frame = FaceFrame::new(face);
         let (cu, _, cv) = frame.chunk_to_local(center);
         let (h, cs) = (self.view.horizontal, CHUNK_SIZE as i32);
-        let span = super::super::section::section_span(super::super::section::FINEST_DETAIL);
+        let span = section_span(FINEST_DETAIL);
         let tiles = |c: i32| ((c - h) * cs).div_euclid(span)..=((c + h + 1) * cs - 1).div_euclid(span);
-        let at = |x: i32, z: i32| SectionPos { detail: super::super::section::FINEST_DETAIL, body, face, x, z };
+        let at = |x: i32, z: i32| SectionPos { detail: FINEST_DETAIL, body, face, x, z };
         let mut band: Option<(f32, f32)> = None;
         for z in tiles(cv) {
             for x in tiles(cu) {
@@ -236,25 +290,25 @@ impl World {
         Some([layer(lo) - 1, layer(hi) + 1])
     }
 
-    /// [`ground_span`](Self::ground_span) on a chart, per chunk column of the home chart through
-    /// the generator's surface bounds (the far field's per-rect memo), kept while the column stays
-    /// in the square. Every punch rect is a union of whole columns, so its bounds lie inside these.
+    /// [`ground_span`](Self::ground_span) on a chart: per chunk column of the near square, through
+    /// the chart net into a neighbour chart across a seam, the generator's surface bounds (the far
+    /// field's per-rect memo, kept while the column stays in the square) widened by that column's
+    /// edits. Every punch rect is a union of whole columns, so its bounds lie inside these.
     fn chart_span(&mut self, center: Coord) -> Option<[i32; 2]> {
         let seat = self.seams.chart_seat(center)?;
-        let body = super::super::section::CHART_BODY_BASE + seat.index as u16;
-        let cs = CHUNK_SIZE as i64;
-        let (x0, x1, z0, z1) = self.near_block_box(center);
-        let (cx0, cx1) = (x0.max(seat.lo[0]).div_euclid(cs), x1.min(seat.hi[0]).div_euclid(cs));
-        let (cz0, cz1) = (z0.max(seat.lo[2]).div_euclid(cs), z1.min(seat.hi[2]).div_euclid(cs));
-        let n = CHUNK_SIZE as i32;
-        let mut memo = std::mem::take(&mut self.window_ground);
+        let body = CHART_BODY_BASE + seat.index as u16;
+        let (h, n) = (self.view.horizontal, CHUNK_SIZE as i32);
+        let floor = seat.lo[1].div_euclid(CHUNK_SIZE as i64) as i32;
+        let (fold, mut memo) = (self.fold, std::mem::take(&mut self.window_ground));
         let bounds = memo.sweep(|memo| {
             let mut out: Option<(i32, i32)> = None;
-            for cz in cz0..cz1 {
-                for cx in cx0..cx1 {
-                    let (Ok(u), Ok(v)) = (i32::try_from(cx * cs), i32::try_from(cz * cs)) else { continue };
-                    let surface = || self.generator.surface_rect(body, Face::PosY, u, v, u + n, v + n);
-                    if let Some((lo, hi)) = memo.get((body, [u, v, u + n, v + n]), surface) {
+            for cz in center.z - h..=center.z + h {
+                for cx in center.x - h..=center.x + h {
+                    let Some(c) = fold.unfold(Coord::new(cx, floor, cz)) else { continue };
+                    let rect = [c.x * n, c.z * n, c.x * n + n, c.z * n + n];
+                    let surface = || self.generator.surface_rect(body, Face::PosY, rect[0], rect[1], rect[2], rect[3]);
+                    if let Some(b) = memo.get((body, rect), surface) {
+                        let (lo, hi) = self.with_edits(b, rect);
                         out = Some(out.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
                     }
                 }
@@ -264,6 +318,34 @@ impl World {
         self.window_ground = memo;
         let (lo, hi) = bounds?;
         Some([lo.saturating_sub(1).div_euclid(n) - 1, hi.saturating_sub(1).div_euclid(n) + 1])
+    }
+
+    /// Surface bounds `(lo, hi)` (first open cells) of storage rect `[u0, v0, u1, v1)` widened to
+    /// every chunk an edit touched in its columns: a pit or a tower may sit anywhere in it.
+    pub(in crate::world) fn with_edits(&self, (mut lo, mut hi): (i32, i32), [u0, v0, u1, v1]: [i32; 4]) -> (i32, i32) {
+        let n = CHUNK_SIZE as i32;
+        let (cx, cz) = (u0.div_euclid(n)..=(u1 - 1).div_euclid(n), v0.div_euclid(n)..=(v1 - 1).div_euclid(n));
+        let mut widen = |[a, b]: [i32; 2]| {
+            lo = lo.min(a * n + 1);
+            hi = hi.max(b * n + n);
+        };
+        let columns = (cx.end() - cx.start() + 1) as usize * (cz.end() - cz.start() + 1) as usize;
+        if self.edit_columns.len() < columns {
+            for (&(x, z), &span) in &self.edit_columns {
+                if cx.contains(&x) && cz.contains(&z) {
+                    widen(span);
+                }
+            }
+        } else {
+            for z in cz.clone() {
+                for x in cx.clone() {
+                    if let Some(&span) = self.edit_columns.get(&(x, z)) {
+                        widen(span);
+                    }
+                }
+            }
+        }
+        (lo, hi)
     }
 
     /// Every far section the frontier wants over the near square has something drawn, or is not
@@ -281,25 +363,31 @@ impl World {
             .all(|&s| !self.near_meets(center, s) || self.coverage_skips(center, s) || self.section_covered(s))
     }
 
-    /// Whether far section `s` reaches over the near square around `center`. A section of another
-    /// chart or face counts wherever it lies.
+    /// Whether far section `s` reaches over the near square around `center`. On a chart a section
+    /// of a neighbour chart is placed through the net; a section of another face, or outside the
+    /// net, counts wherever it lies.
     fn near_meets(&self, center: Coord, s: SectionPos) -> bool {
-        let near = if self.fold.is_identity() {
+        let h = self.view.horizontal;
+        let n = CHUNK_SIZE as i32;
+        let (c0, c1) = ((s.min_x().div_euclid(n), s.min_z().div_euclid(n)), ((s.min_x() + s.span() - 1).div_euclid(n), (s.min_z() + s.span() - 1).div_euclid(n)));
+        let (lo, hi, eye) = if self.fold.is_identity() {
             let Some(face) = self.live_up() else { return true };
             if s.face != face || self.section_lod_face != Some((s.body, face)) {
                 return true;
             }
             let (cu, _, cv) = FaceFrame::new(face).chunk_to_local(center);
-            let (h, cs) = (i64::from(self.view.horizontal), CHUNK_SIZE as i64);
-            let (u, v) = (i64::from(cu), i64::from(cv));
-            ((u - h) * cs, (u + h + 1) * cs, (v - h) * cs, (v + h + 1) * cs)
+            (c0, c1, (cu, cv))
         } else {
-            match self.seams.chart_seat(center) {
-                Some(seat) if inside_xz(s, seat.lo, seat.hi) => self.near_block_box(center),
-                _ => return true,
-            }
+            let Some(seat) = self.seams.chart_seat(center) else { return true };
+            let floor = seat.lo[1].div_euclid(CHUNK_SIZE as i64) as i32;
+            let place = |(x, z): (i32, i32)| {
+                let v = self.fold.fold(Coord::new(x, floor, z));
+                (v.x, v.z)
+            };
+            let (a, b) = (place(c0), place(c1));
+            ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)), (center.x, center.z))
         };
-        covers_near(s, near, None)
+        lo.0 <= eye.0 + h && hi.0 >= eye.0 - h && lo.1 <= eye.1 + h && hi.1 >= eye.1 - h
     }
 
     /// Face-local altitudes `[a0, a1)` of the punch window.
@@ -311,10 +399,23 @@ impl World {
         Some(if face.sign() > 0 { [r0, r1] } else { [1 - r1, 1 - r0] })
     }
 
-    /// A chunk settled: the settled rings may grow and a held section may be done waiting.
+    /// A chunk settled: the settled rings may grow, a held section may be done waiting, and off a
+    /// chart a far section its chunks now draw hands over.
     pub(in crate::world) fn note_settled(&mut self) {
         self.lod_clip_grow.set();
         self.held_recheck.set();
+        if self.fold.is_identity() {
+            self.section_cover_dirty.set();
+        }
+    }
+
+    /// Every chunk under `s` in `layers` is final (see [`chunk_final`](Self::chunk_final)).
+    fn backing_settled(&self, s: SectionPos, layers: [i32; 2]) -> bool {
+        let n = CHUNK_SIZE as i32;
+        let (x0, z0, w) = (s.min_x().div_euclid(n), s.min_z().div_euclid(n), s.span() / n);
+        (layers[0]..=layers[1])
+            .rev()
+            .all(|y| (z0..z0 + w).all(|z| (x0..x0 + w).all(|x| self.chunk_final(Coord::new(x, y, z)))))
     }
 
     /// Keep drawing each held section whose ground has not all settled: it joins the desired
@@ -323,7 +424,7 @@ impl World {
         self.section_held.clear();
         for (s, layers) in held {
             let selected = self.section_desired.binary_search_by_key(&section_key(&s), section_key).is_ok();
-            if !selected && !backing_settled(&self.chunks, s, layers) {
+            if !selected && !self.backing_settled(s, layers) {
                 self.section_held.insert(s, layers);
             }
         }
@@ -335,17 +436,13 @@ impl World {
 
     /// Drop the held sections whose ground has now settled from the frontier: the punch applies.
     pub(super) fn settle_held(&mut self) {
-        let chunks = &self.chunks;
-        let mut settled = Vec::new();
-        self.section_held.retain(|&s, &mut layers| {
-            let done = backing_settled(chunks, s, layers);
-            if done {
-                settled.push(s);
-            }
-            !done
-        });
+        let mut settled: Vec<SectionPos> =
+            self.section_held.iter().filter(|&(&s, &layers)| self.backing_settled(s, layers)).map(|(&s, _)| s).collect();
         if settled.is_empty() {
             return;
+        }
+        for s in &settled {
+            self.section_held.remove(s);
         }
         settled.sort_unstable_by_key(section_key);
         self.section_desired.retain(|s| settled.binary_search_by_key(&section_key(s), section_key).is_err());
@@ -445,13 +542,16 @@ mod tests {
             .expect("a charted storage point")
     }
 
-    /// The near square's chunk-centre columns around `center`: `(x, z)` and the solid top there.
+    /// The near square's chunk-centre columns around `center`, across a seam in the neighbour
+    /// chart's storage: `(x, z)` and the solid top there.
     fn near_columns(world: &World, center: Coord) -> Vec<(i32, i32, i32)> {
         let h = world.view.horizontal;
+        let floor = world.seams.chart_seat(center).map_or(center.y, |s| s.lo[1].div_euclid(16) as i32);
         let mut out = Vec::new();
         for cz in center.z - h..=center.z + h {
             for cx in center.x - h..=center.x + h {
-                let (x, z) = (cx * 16 + 8, cz * 16 + 8);
+                let Some(c) = world.fold.unfold(Coord::new(cx, floor, cz)) else { continue };
+                let (x, z) = (c.x * 16 + 8, c.z * 16 + 8);
                 out.push((x, z, world.generator.surface(Face::PosY, x, z) - 1));
             }
         }
@@ -792,7 +892,10 @@ mod tests {
     /// Arriving from 600 above, no near-square column goes bare on any pass while the grown window
     /// loads; settled, the window holds that whole relief and no far section is drawn within the
     /// near square's radius of the eye.
+    /// `cargo test --release --lib owner_mountainside -- --ignored --nocapture` (RD16 streaming
+    /// with real workers: a release bench, not a default test).
     #[test]
+    #[ignore]
     fn owner_mountainside_is_full_resolution_around_the_player() {
         let mut world = seeded(1_791_184_794_939_118_871, 16, 5);
         let eye = DVec3::new(-19.1, 390.8, -0.6);
@@ -860,5 +963,245 @@ mod tests {
             }
         }
         assert!(!world.window.grounded, "climbed past the reach");
+    }
+
+    /// The owner's site (see above) without streaming: the window placed there holds every column
+    /// of the near square, and the selection once that ground settles draws no far section within
+    /// the near radius of the eye.
+    #[test]
+    fn owner_mountainside_selection_is_full_resolution() {
+        let mut world = seeded(1_791_184_794_939_118_871, 16, 5);
+        let (center, far, _, _) = world.begin_stream(DVec3::new(-19.1, 390.8, -0.6), None);
+        world.cross_boundary(center);
+        assert!(world.chunks.contains_key(&center), "the eye's chunk is not loaded");
+        let cols = near_columns(&world, center);
+        let (y0, y1) = world.near_y_range(far);
+        assert_eq!(cols.iter().filter(|c| !(y0..y1).contains(&i64::from(c.2))).count(), 0, "ground outside the window");
+        let desired = world.desired_sections(far);
+        let r = f64::from(16 * world.view.horizontal);
+        let (ex, ez) = (f64::from(center.x * 16 + 8), f64::from(center.z * 16 + 8));
+        let drawn = cols
+            .iter()
+            .filter(|&&(x, z, _)| (f64::from(x) - ex).hypot(f64::from(z) - ez) < r && desired.iter().any(|&s| in_rect(s, x, z)))
+            .count();
+        assert_eq!(drawn, 0, "far sections within the near radius");
+    }
+
+    /// The data box never passes the budget, at any render and vertical distance: the window's cap
+    /// shrinks with the render distance. Hovering 300 over spawn at 16/5 the window grows to its
+    /// cap; at 20/10 the eye band already fills the budget.
+    #[test]
+    fn data_box_stays_within_the_budget() {
+        for h in VIEW_RADIUS_RANGE {
+            for v in VERTICAL_RADIUS_RANGE {
+                let side = 2 * (h + DATA_MARGIN) + 1;
+                let held = caps(h).1.max(2 * v + 1);
+                assert!(side * side * (held + 2 * DATA_MARGIN) <= CHUNK_BUDGET, "{h}/{v}: past the budget");
+            }
+        }
+        for (h, v) in [(16, 5), (20, 10)] {
+            let mut world = chart_world(h, v);
+            let (center, ..) = world.begin_stream(world.home_eye(spawn_dir(&world), 300.0), None);
+            let (x, y, z) = world.data_box(center).size();
+            println!("{h}/{v} hovering 300: window {:?}, data box {} chunks of {CHUNK_BUDGET}", world.window.punch, x * y * z);
+            assert!(x * y * z <= CHUNK_BUDGET);
+        }
+    }
+
+    /// Flying 100 over the start world from the +Y chart across its seam into the +Z chart at
+    /// render distance 6: the grown window survives the crossing (the charts share storage +Y)
+    /// and no near-square column, on either side of the seam, goes bare on any pass.
+    #[test]
+    fn seam_crossing_keeps_the_grown_window() {
+        let mut world = chart_world(6, 3);
+        let e = 6.5e-6;
+        let at = |world: &World, t: f64| world.home_eye(DVec3::new(0.0, 1.0, 1.0 - e + 2.0 * e * t), 100.0);
+        let start = at(&world, 0.0);
+        world.prepare_around(start);
+        world.drive_spawn_ready();
+        settle(&mut world, start, NONE, "before the seam");
+        assert!(world.window.grounded, "100 up holds the ground");
+        let mut crossed = false;
+        // Forty-first parts never land on the seam itself, where the faces tie.
+        for k in 1..=40 {
+            let fold = world.fold;
+            let eye = at(&world, f64::from(k) / 41.0);
+            step(&mut world, eye);
+            crossed |= world.fold != fold;
+            assert!(world.window.grounded, "pass {k}: the window let go of the ground");
+            let cols = near_columns(&world, world.center.expect("a centre"));
+            assert_eq!(bare(&world, &cols), 0, "pass {k}: bare ground");
+        }
+        assert!(crossed, "the flight did not cross the seam");
+        let end = at(&world, 1.0);
+        let cols = near_columns(&world, world.center.expect("a centre"));
+        settle(&mut world, end, &|w| bare(w, &cols), "past the seam");
+    }
+
+    /// A pit dug 100 blocks down from the surface near spawn reaches below the window's natural
+    /// floor. Coming down from 320 to stand beside it, the window reaches the pit's floor, and no
+    /// column (the pit's own counted at its floor) goes bare on any pass.
+    #[test]
+    fn pit_below_the_window_floor_is_never_bare() {
+        let mut world = chart_world(6, 3);
+        let dir = spawn_dir(&world);
+        let low = world.home_eye(dir, 1.62);
+        let s = world.chart_eye(low).expect("charted");
+        let (px, pz) = ((s.x.floor() as i32).div_euclid(16) * 16 + 56, (s.z.floor() as i32).div_euclid(16) * 16 + 8);
+        let top = world.generator.surface(Face::PosY, px, pz) - 1;
+        let floor = top - 100;
+        for x in px - 1..=px + 1 {
+            for z in pz - 1..=pz + 1 {
+                for y in floor..=world.generator.surface(Face::PosY, x, z) {
+                    world.set_block(x, y, z, AIR);
+                }
+            }
+        }
+        let high = world.home_eye(dir, 320.0);
+        world.prepare_around(high);
+        world.drive_spawn_ready();
+        settle(&mut world, high, NONE, "hover");
+        let mut cols = near_columns(&world, eye_chunk(s));
+        let pit = cols.iter_mut().find(|c| (c.0, c.1) == (px, pz)).expect("the pit is in the near square");
+        pit.2 = floor - 1;
+        for k in 1..=40 {
+            let eye = world.home_eye(dir, 320.0 - 8.0 * f64::from(k));
+            step(&mut world, eye);
+            assert_eq!(bare(&world, &cols), 0, "descent pass {k}: bare ground");
+        }
+        settle(&mut world, low, &|w| bare(w, &cols), "beside the pit");
+        let [lo, _] = world.window.punch.expect("a window");
+        assert!(lo <= (floor - 1).div_euclid(16), "the window floor {lo} misses the pit floor");
+    }
+
+    /// A held section whose ground has settled but for one chunk parked by quarantine stops
+    /// waiting: the parked chunk is a bounded hole, not a far section held over it for good.
+    #[test]
+    fn quarantine_does_not_hold_a_section() {
+        let mut world = chart_world(6, 3);
+        let (center, far, _, _) = world.begin_stream(world.home_eye(spawn_dir(&world), 1.62), None);
+        world.update_lod_face(far);
+        world.refresh_frontier(far);
+        let (&s, &layers) = world.section_held.iter().min_by_key(|(s, _)| (s.span(), s.x, s.z)).expect("held sections wait");
+        let n = 16;
+        let mut chunks: Vec<Coord> = Vec::new();
+        for y in layers[0]..=layers[1] {
+            for z in s.min_z().div_euclid(n)..(s.min_z() + s.span()).div_euclid(n) {
+                for x in s.min_x().div_euclid(n)..(s.min_x() + s.span()).div_euclid(n) {
+                    chunks.push(Coord::new(x, y, z));
+                }
+            }
+        }
+        // Load first: a neighbour landing later can reopen a buried chunk.
+        for &c in &chunks {
+            world.ensure_data(c);
+        }
+        for &c in &chunks {
+            world.chunks.get_mut(&c).expect("loaded").state = MeshState::Air;
+        }
+        let parked = chunks[0];
+        world.chunks.get_mut(&parked).expect("loaded").state = MeshState::needs_mesh();
+        world.held_recheck.set();
+        world.refresh_frontier(far);
+        assert!(world.section_held.contains_key(&s), "an unsettled chunk keeps the section waiting");
+        world.quarantined.insert(FailKey::Mesh { coord: parked });
+        world.held_recheck.set();
+        world.refresh_frontier(far);
+        assert!(!world.section_held.contains_key(&s) && !world.section_desired.contains(&s), "quarantine held the section");
+        assert_eq!(world.center, Some(center));
+    }
+
+    /// Off a chart, landing from 400 on a flat world at render distance 6: far sections over
+    /// ground the settled chunks draw hand over at once, on no pass is one drawn, and once every
+    /// chunk of the window has settled the rest of the overlap inside the clip's reach (the
+    /// outermost ring stays the far field's by design) ends within a few passes.
+    #[test]
+    fn flat_overlap_ends_once_the_ground_settles() {
+        use crate::world::generation::FLAT_HEIGHT;
+
+        let render = RenderConfig { lod2: true, occlusion: true, ..RenderConfig::default() };
+        let mut world = World::with_kind(1, render, WorldgenKind::Flat, false);
+        world.set_view_distances(6, 3);
+        let at = |above: f64| DVec3::new(8.5, f64::from(FLAT_HEIGHT) + above, 8.5);
+        world.prepare_around(at(400.0));
+        world.drive_spawn_ready();
+        settle(&mut world, at(400.0), NONE, "hover");
+        let c = world.center.expect("a centre");
+        let inner = world.view.horizontal - 1;
+        let cols: Vec<_> = near_columns(&world, c)
+            .into_iter()
+            .filter(|&(x, z, _)| (x.div_euclid(16) - c.x).abs() <= inner && (z.div_euclid(16) - c.z).abs() <= inner)
+            .collect();
+        let overlap = |w: &World, cam: DVec3| {
+            let (min, max) = w.lod_clip_box(cam);
+            cols.iter()
+                .filter(|&&(x, z, top)| {
+                    let rel = [f64::from(x) - cam.x, f64::from(top) + 0.5 - cam.y, f64::from(z) - cam.z];
+                    let clipped = (0..3).all(|a| f64::from(min[a]) < rel[a] && rel[a] < f64::from(max[a]));
+                    w.chunk_final(Coord::new(x.div_euclid(16), top.div_euclid(16), z.div_euclid(16))) && !clipped && far_drawn(w, x, z)
+                })
+                .count()
+        };
+        let handed = |w: &World| {
+            let c = w.center.expect("a centre");
+            w.section_visible.iter().filter(|&&(s, _)| w.full_res_covers(c, s)).count()
+        };
+        let mut settled_at = None;
+        for pass in 0..20_000usize {
+            let above = (400.0 - 8.0 * pass as f64).max(60.0);
+            step(&mut world, at(above));
+            assert_eq!(handed(&world), 0, "pass {pass}: a section the chunks draw is still drawn");
+            let center = world.center.expect("a centre");
+            let window_settled = world.view_coords(world.mesh_box(center)).all(|c| world.chunk_final(c));
+            if above == 60.0 && window_settled {
+                let since = *settled_at.get_or_insert(pass);
+                let left = overlap(&world, at(above));
+                assert!(left == 0 || pass - since < 8, "{left} columns overlap {} passes after the window settled", pass - since);
+                if left == 0 {
+                    println!("overlap ended {} passes after the window settled", pass - since);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the window never settled: {}", world.entry_debug());
+    }
+
+    /// Mesh teardown (a lighting or AO toggle frees every mesh) while a grown window's span is
+    /// still being proven: neither span keeps its old rings, so the clip box never hides the far
+    /// field over a chunk that is not drawn while everything remeshes.
+    #[test]
+    fn mesh_teardown_during_a_pending_span_is_never_bare() {
+        use crate::world::generation::FLAT_HEIGHT;
+
+        let render = RenderConfig { lod2: true, occlusion: true, ..RenderConfig::default() };
+        let mut world = World::with_kind(1, render, WorldgenKind::Flat, false);
+        world.set_view_distances(6, 3);
+        let at = |above: f64| DVec3::new(8.5, f64::from(FLAT_HEIGHT) + above, 8.5);
+        world.prepare_around(at(400.0));
+        world.drive_spawn_ready();
+        settle(&mut world, at(400.0), NONE, "hover");
+        let mut k = 0;
+        while world.lod_clip_next.is_none() {
+            k += 1;
+            assert!(k <= 45, "the descent never left a span to prove");
+            step(&mut world, at(400.0 - 8.0 * f64::from(k)));
+        }
+        let eye = at(400.0 - 8.0 * f64::from(k));
+        let cols = near_columns(&world, world.center.expect("a centre"));
+        let coords: Vec<Coord> = world.chunks.keys().copied().collect();
+        for c in coords {
+            let loaded = world.chunks.get_mut(&c).expect("loaded");
+            loaded.rev = loaded.rev.wrapping_add(1);
+            loaded.retire_logged(MeshState::needs_mesh());
+        }
+        world.building_meshes = 0;
+        world.mesh_worklist.extend(world.chunks.keys().copied().collect::<Vec<_>>());
+        world.pending_fresh.set();
+        world.lod_clip_shrunk.set();
+        world.refresh_lod_clip();
+        assert!(world.lod_clip_next.is_none_or(|(_, r)| r == 0), "the pending span kept its rings");
+        assert_eq!(clip_bare(&world, eye, &cols), 0, "bare right after the teardown");
+        settle(&mut world, eye, &|w| clip_bare(w, eye, &cols), "remesh");
     }
 }
