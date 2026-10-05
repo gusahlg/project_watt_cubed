@@ -323,11 +323,43 @@ impl Atlas {
 
     /// The patch holding storage cell `s`, with the cell's local coordinates in that patch.
     pub fn locate(&self, s: [i64; 3]) -> Option<(Patch, [i64; 3])> {
-        self.patches().find_map(|p| {
-            let (o, size) = self.storage_box(p);
-            let l = [s[0] - o[0], s[1] - o[1], s[2] - o[2]];
-            (0..3).all(|a| l[a] >= 0 && l[a] < size[a]).then_some((p, l))
-        })
+        let (p, lx, lz) = self.column(s[0], s[2])?;
+        let (o, size) = self.storage_box(p);
+        let ly = s[1] - o[1];
+        (ly >= 0 && ly < size[1]).then_some((p, [lx, ly, lz]))
+    }
+
+    /// The box holding storage column `(x, z)`, with the column's local x and z in it. Boxes sit
+    /// side by side along x with their faces along z and never share a column, so this reads the
+    /// layout rather than testing every box.
+    pub fn column(&self, x: i64, z: i64) -> Option<(Patch, i64, i64)> {
+        // Six faces of side `n` along z from 0, `GAP` apart, at storage x `x0`.
+        let faces = |x0: i64, n: i64| {
+            let lx = x - x0;
+            if lx < 0 || lx >= n || z < 0 {
+                return None;
+            }
+            let f = z / (n + GAP);
+            let lz = z - f * (n + GAP);
+            (f < 6 && lz < n).then_some((FACES[f as usize], lx, lz))
+        };
+        for (band, b) in self.bands.iter().enumerate() {
+            if let Some((face, lx, lz)) = faces(b.origin[0][0], b.n) {
+                return Some((Patch::Shell { band: band as u8, face }, lx, lz));
+            }
+        }
+        if let Some(i) = self.inner {
+            if let Some((face, lx, lz)) = faces(i.t_origin[0][0], i.t_n) {
+                return Some((Patch::Transition { face }, lx, lz));
+            }
+            let (lx, lz) = (x - i.core_origin[0], z - i.core_origin[2]);
+            if (0..2 * i.core_half).contains(&lx) && (0..2 * i.core_half).contains(&lz) {
+                return Some((Patch::Core, lx, lz));
+            }
+        }
+        let g = self.grid?;
+        let (lx, lz) = (x - g.origin[0], z - g.origin[2]);
+        ((0..g.size[0]).contains(&lx) && (0..g.size[2]).contains(&lz)).then_some((Patch::Grid, lx, lz))
     }
 
     /// The physical point of continuous local coordinates in a patch (cell corners at integers;
@@ -608,6 +640,45 @@ mod tests {
                 let overlap = (0..3).all(|k| o[k] < oo[k] + ss[k] + GAP && oo[k] < o[k] + s[k] + GAP);
                 assert!(!overlap, "boxes {o:?}/{s:?} and {oo:?}/{ss:?} too close");
             }
+        }
+    }
+
+    /// `locate` reads the layout; the old scan over every box is the reference. Cells sweep every
+    /// box, its edges, the gaps between boxes and the space around them, for each kind of atlas.
+    #[test]
+    fn locate_matches_the_scan_over_every_box() {
+        let scan = |a: &Atlas, s: [i64; 3]| {
+            a.patches().find_map(|p| {
+                let (o, size) = a.storage_box(p);
+                let l = [s[0] - o[0], s[1] - o[1], s[2] - o[2]];
+                (0..3).all(|k| l[k] >= 0 && l[k] < size[k]).then_some((p, l))
+            })
+        };
+        let x0 = STORAGE_X0 + 1024;
+        let grid = GridBox { origin: [x0, 64, 32], size: [1024, 1024, 1024], ref_min: [-512, -512, -512], body: 9 };
+        let cube = Atlas { centre: DVec3::ZERO, radius: 512, inward: false, bands: Vec::new(), inner: None, datum: None, grid: Some(grid), warp: None };
+        let atlases = [
+            atlas(),
+            Atlas::new(DVec3::ZERO, 5_000, 5_400, false, x0),
+            Atlas::shell(DVec3::ZERO, 3_000, 2_900, 3_200, true, x0),
+            cube,
+        ];
+        for a in &atlases {
+            let boxes: Vec<_> = a.patches().map(|p| a.storage_box(p)).collect();
+            let mut probes = 0;
+            for (o, size) in &boxes {
+                let edges = |k: usize| [o[k] - GAP - 1, o[k] - 1, o[k], o[k] + 1, o[k] + size[k] / 2, o[k] + size[k] - 1, o[k] + size[k], o[k] + size[k] + 1];
+                for x in edges(0) {
+                    for y in edges(1) {
+                        for z in edges(2) {
+                            let s = [x, y, z];
+                            assert_eq!(a.locate(s), scan(a, s), "{s:?}");
+                            probes += 1;
+                        }
+                    }
+                }
+            }
+            assert!(probes > 0);
         }
     }
 

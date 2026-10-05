@@ -1553,24 +1553,7 @@ impl Terrain {
     /// The start-world patch covering storage column `(x, z)`, with its local column.
     fn home_patch_column(&self, x: i32, z: i32) -> Option<(crate::space::atlas::Patch, i64, i64)> {
         let atlas = self.storage.home_atlas()?;
-        let (x, z) = (i64::from(x), i64::from(z));
-        let hit = |patch: crate::space::atlas::Patch| {
-            let (o, size) = atlas.storage_box(patch);
-            (x >= o[0] && x < o[0] + size[0] && z >= o[2] && z < o[2] + size[2]).then_some((patch, x - o[0], z - o[2]))
-        };
-        for face in Face::ALL {
-            for band in 0..atlas.bands.len() {
-                if let Some(found) = hit(crate::space::atlas::Patch::Shell { band: band as u8, face }) {
-                    return Some(found);
-                }
-            }
-            if atlas.inner.is_some()
-                && let Some(found) = hit(crate::space::atlas::Patch::Transition { face })
-            {
-                return Some(found);
-            }
-        }
-        if atlas.inner.is_some() { hit(crate::space::atlas::Patch::Core) } else { None }
+        atlas.column(i64::from(x), i64::from(z)).filter(|(patch, ..)| *patch != crate::space::atlas::Patch::Grid)
     }
 
     /// Storage y of the first open cell on a start-world column, or [`storage::BURIED`] under it.
