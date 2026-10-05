@@ -18,7 +18,7 @@ pub use slot::{SaveMeta, Slot, SlotId};
 pub use bridge::save;
 #[cfg(test)]
 pub use slot::SaveError;
-pub use store::{Source, fresh_id, list, write_atomic_file};
+pub use store::{Source, delete, fresh_id, list, write_atomic_file};
 pub(crate) use store::log_fs_err;
 
 use crate::block::{AIR, BlockId, BlockRegistry};

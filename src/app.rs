@@ -593,6 +593,12 @@ impl App {
         match effect {
             AppEffect::NewWorld => self.start_new_world(eng),
             AppEffect::Load(id) => self.load_world(eng, &id),
+            AppEffect::DeleteWorld(id) => {
+                if let Err(e) = save::delete(&id) {
+                    eprintln!("could not delete world {id}: {e}");
+                }
+                self.saves = save::list();
+            }
             AppEffect::Host(info) => {
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();

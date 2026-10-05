@@ -16,7 +16,6 @@ fn saves_dir() -> &'static Path {
     Paths::get().data.as_path()
 }
 
-#[cfg(test)]
 fn trash_dir() -> PathBuf {
     saves_dir().join("trash")
 }
@@ -183,7 +182,6 @@ pub fn rename(from: &SlotId, to: &SlotId) -> Result<(), SaveError> {
 }
 
 /// Move a slot (and its backup) into `trash/` under the data root rather than unlinking.
-#[cfg(test)]
 pub fn delete(id: &SlotId) -> io::Result<()> {
     fs::create_dir_all(trash_dir())?;
     let dest = unused_trash_path(id);
@@ -192,7 +190,6 @@ pub fn delete(id: &SlotId) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn unused_trash_path(id: &SlotId) -> PathBuf {
     let first = trash_dir().join(format!("{id}.save"));
     if !first.exists() {

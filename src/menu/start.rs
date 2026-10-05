@@ -29,6 +29,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum StartAction {
     NewWorld,
     Load(SlotId),
+    /// Move a saved world to the trash; the start screen stays and sees the shorter list.
+    Delete(SlotId),
     Host(HostInfo),
     Join(JoinInfo),
     Settings,
@@ -41,6 +43,7 @@ impl From<StartAction> for AppEffect {
         match action {
             StartAction::NewWorld => AppEffect::NewWorld,
             StartAction::Load(id) => AppEffect::Load(id),
+            StartAction::Delete(id) => AppEffect::DeleteWorld(id),
             StartAction::Host(info) => AppEffect::Host(info),
             StartAction::Join(info) => AppEffect::Join(info),
             StartAction::Settings => AppEffect::Settings,

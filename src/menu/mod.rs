@@ -167,6 +167,10 @@ pub enum Msg<A: Copy> {
     Pick(A),
     Step(A, Dir),
     Edited(A, TextOp),
+    /// A character typed while an action row is highlighted (a row shortcut, e.g. D to delete).
+    Key(A, char),
+    /// Navigation moved the highlight onto this row and nothing else happened this frame.
+    Hover(A),
     Back,
 }
 
@@ -184,6 +188,8 @@ pub enum Command {
 pub enum AppEffect {
     NewWorld,
     Load(crate::save::SlotId),
+    /// Move a saved world to the trash.
+    DeleteWorld(crate::save::SlotId),
     Host(HostInfo),
     Join(JoinInfo),
     /// Push the core Settings hub (start screens emit this instead of pushing).
@@ -434,6 +440,7 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
     }
 
     // Non-text row: navigate first, then act on the row the highlight lands on.
+    let before = cursor.index;
     for i in intents {
         if let Intent::Nav(d) = i {
             cursor.nav(view, *d);
@@ -458,9 +465,16 @@ pub fn drive<A: Copy>(intents: &[Intent], view: &View<A>, cursor: &mut Cursor) -
         Some(RowKind::Action) if confirm(intents) => {
             return Some(Msg::Pick(tag));
         }
+        Some(RowKind::Action) => {
+            for i in intents {
+                if let Intent::Edit(TextOp::Char(c)) = i {
+                    return Some(Msg::Key(tag, *c));
+                }
+            }
+        }
         _ => {}
     }
-    None
+    (cursor.index != before).then_some(Msg::Hover(tag))
 }
 
 fn confirm(intents: &[Intent]) -> bool {
@@ -545,5 +559,35 @@ mod tests {
             drive(&[Intent::Adjust(Dir::Next)], &view, &mut cursor),
             Some(Msg::Step(0, Dir::Next))
         );
+    }
+
+    fn actions(n: usize) -> View<usize> {
+        View {
+            title: String::new(),
+            style: Style::Panel,
+            rows: (0..n).map(|i| Row::action(format!("row {i}"), i)).collect(),
+            default: None,
+            hint: String::new(),
+            notice: None,
+        }
+    }
+
+    /// A character on an action row is that row's shortcut; Enter still picks it.
+    #[test]
+    fn a_typed_character_on_an_action_row_is_a_key_message() {
+        let view = actions(2);
+        let mut cursor = Cursor::default();
+        assert_eq!(drive(&[Intent::Edit(TextOp::Char('d'))], &view, &mut cursor), Some(Msg::Key(0, 'd')));
+        assert_eq!(drive(&[Intent::Confirm], &view, &mut cursor), Some(Msg::Pick(0)));
+    }
+
+    /// Moving the highlight says where it landed; a frame with no movement says nothing.
+    #[test]
+    fn navigation_reports_the_row_it_lands_on() {
+        let view = actions(3);
+        let mut cursor = Cursor::default();
+        assert_eq!(drive(&[Intent::Nav(Dir::Next)], &view, &mut cursor), Some(Msg::Hover(1)));
+        assert_eq!(drive(&[], &view, &mut cursor), None);
+        assert_eq!(drive(&[Intent::Nav(Dir::Prev)], &view, &mut cursor), Some(Msg::Hover(0)));
     }
 }
