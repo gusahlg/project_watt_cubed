@@ -1,8 +1,8 @@
-//! Bake a home body's albedo cube map, and the horizon cull the mapped impostor will use.
+//! Bake a home body's albedo cube map, and hand that map to the sky impostor.
 //!
-//! The engine's `far_cube_texel_dir` is not linked yet. [`cube_texel_dir`] is the same cube-face
-//! table (OpenGL sc/tc); the draw code passes that function in when the engine shape lands.
-//! Nothing here changes what is drawn: home stays a sphere.
+//! Texel directions are the engine's [`far_cube_texel_dir`](voxel_engine::far_cube_texel_dir),
+//! so a baked face is the cube the sky samples. The draw uploads the rebased datum once, then
+//! each face as it arrives: a 256² preview, replaced by the 1024² face.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -22,7 +22,7 @@ use crate::world::terrain::cosmos::{Body, Cosmos, Kind};
 use crate::world::terrain::Generator;
 
 /// Bump when the bake bytes change. Stale files are ignored.
-pub(crate) const BAKE_VERSION: u32 = 1;
+pub(crate) const BAKE_VERSION: u32 = 2;
 /// First pass, every face, so a far body has a colour before the full map lands.
 pub(crate) const PREVIEW: u32 = 256;
 /// Full face. Six of these are the cached map.
@@ -36,21 +36,11 @@ const HEADER: usize = 32;
 /// `(face, size, x, y) -> body-space direction of that texel centre`.
 pub(crate) type TexelDir = fn(usize, u32, u32, u32) -> DVec3;
 
-/// Body-space direction of a cube texel centre. Faces follow [`FACES`].
-/// `s = (x+½)/size`, `uc = 2s−1`, and the same for `t`/`vc`, then the OpenGL face table.
+/// Body-space direction of a cube texel centre. The engine owns the cube table;
+/// this promotes it to f64 for the chart lookup.
 pub(crate) fn cube_texel_dir(face: usize, size: u32, x: u32, y: u32) -> DVec3 {
-    let size = size.max(1) as f64;
-    let uc = 2.0 * (x as f64 + 0.5) / size - 1.0;
-    let vc = 2.0 * (y as f64 + 0.5) / size - 1.0;
-    let d = match face {
-        0 => DVec3::new(1.0, -vc, -uc),
-        1 => DVec3::new(-1.0, -vc, uc),
-        2 => DVec3::new(uc, 1.0, vc),
-        3 => DVec3::new(uc, -1.0, -vc),
-        4 => DVec3::new(uc, -vc, 1.0),
-        _ => DVec3::new(-uc, -vc, -1.0),
-    };
-    d.normalize()
+    let d = voxel_engine::far_cube_texel_dir(face, size, x, y);
+    DVec3::new(d.x as f64, d.y as f64, d.z as f64)
 }
 
 /// Chart column under `dir`: dominant face, then equiangular `(ξ, η)` rounded to a column.
@@ -406,6 +396,15 @@ impl PlanetBake {
         std::array::from_fn(|i| src[i].as_deref())
     }
 
+    #[cfg(test)]
+    pub(super) fn deliver(&mut self, full: bool, face: usize, rgba: Vec<u8>) {
+        if face >= 6 {
+            return;
+        }
+        let slot = if full { &mut self.full } else { &mut self.preview };
+        slot[face] = Some(rgba);
+    }
+
     /// Start the production bake (256² then 1024²) under the game's data dir. Once only.
     #[cfg(not(test))]
     pub(crate) fn ensure(&mut self, generator: Generator, registry: &crate::block::registry::BlockRegistry) {
@@ -478,12 +477,84 @@ impl PlanetBake {
     }
 }
 
+/// The start world's map slot. One world, one map.
+pub(super) const HOME_MAP: voxel_engine::FarMapId = voxel_engine::FarMapId(0);
+
+/// Where the home datum and its faces are installed. The engine is one; tests record another.
+pub(crate) trait FarSink {
+    fn install(&mut self, datum_res: u32, datum: &[f32], albedo_size: u32) -> bool;
+    fn face(&mut self, face: usize, rgba: &[u8]) -> bool;
+    fn clear(&mut self);
+}
+
+/// Which cube is installed, and which faces have already been sent. A quiet frame only reads these.
+#[derive(Default)]
+pub(super) struct MapFeed {
+    size: Option<u32>,
+    sent_preview: [bool; 6],
+    sent_full: [bool; 6],
+}
+
+impl MapFeed {
+    /// Install the datum once, then each preview face once, then replace the cube and send each
+    /// full face once. `true` when the impostor should draw [`voxel_engine::FarShape::Mapped`].
+    pub(super) fn flush(
+        &mut self,
+        datum_res: u32,
+        datum: &[f32],
+        preview: &[Option<&[u8]>; 6],
+        full: &[Option<&[u8]>; 6],
+        sink: &mut impl FarSink,
+    ) -> bool {
+        let any_preview = preview.iter().any(|f| f.is_some());
+        let any_full = full.iter().any(|f| f.is_some());
+        let all_full = full.iter().all(|f| f.is_some());
+        if self.size.is_none() {
+            // A cache that already holds every full face skips the preview cube.
+            let size = if all_full && !any_preview { FULL } else { PREVIEW };
+            if !sink.install(datum_res, datum, size) {
+                return false;
+            }
+            self.size = Some(size);
+        }
+        if self.size == Some(PREVIEW) {
+            self.send(false, preview, sink);
+            if any_full && sink.install(datum_res, datum, FULL) {
+                self.size = Some(FULL);
+            }
+        }
+        if self.size == Some(FULL) {
+            self.send(true, full, sink);
+        }
+        true
+    }
+
+    fn send(&mut self, full: bool, faces: &[Option<&[u8]>; 6], sink: &mut impl FarSink) {
+        let sent = if full { &mut self.sent_full } else { &mut self.sent_preview };
+        for i in 0..6 {
+            if sent[i] {
+                continue;
+            }
+            let Some(bytes) = faces[i] else { continue };
+            if sink.face(i, bytes) {
+                sent[i] = true;
+            }
+        }
+    }
+
+    /// Drop the installed map. The next [`flush`](Self::flush) installs it again.
+    pub(super) fn clear(&mut self, sink: &mut impl FarSink) {
+        sink.clear();
+        *self = Self::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         bake_face, cache_load, cache_path, cache_save, clamp_column, color_hash, column_direction, column_linear,
-        column_of, cube_texel_dir, horizon_sin, impostor_datum, round_i32, Key, PlanetBake, BAKE_VERSION, FULL,
-        PREVIEW,
+        column_of, cube_texel_dir, horizon_sin, impostor_datum, round_i32, FarSink, Key, MapFeed, PlanetBake,
+        BAKE_VERSION, FULL, HOME_MAP, PREVIEW,
     };
     use crate::alloc_count;
     use crate::block::registry::{AIR, BlockId, BlockRegistry};
@@ -491,12 +562,12 @@ mod tests {
     use crate::space::chart::{basis, Map};
     use crate::space::datum::DatumField;
     use crate::world::generation::TerrainGenerator;
-    use crate::world::terrain::cosmos::HOME_RADIUS;
-    use crate::sky::palette::Rgb;
+    use crate::world::terrain::cosmos::{Kind, AIR_TOP, HOME_RADIUS};
+    use crate::sky::palette::{Anchor, Role, Rgb, NEW_SHOKA};
     use crate::world::terrain::Terrain;
     use glam::DVec3;
     use std::path::PathBuf;
-    use voxel_engine::Color;
+    use voxel_engine::{far_cube_texel_dir, far_map_basis, Color, FarShape};
 
     fn params_of(face: usize, dir: DVec3) -> (f64, f64) {
         let (tu, nn, tv) = basis(FACES[face]);
@@ -507,6 +578,138 @@ mod tests {
     fn the_preview_is_256_and_the_full_face_is_1024() {
         assert_eq!(PREVIEW, 256);
         assert_eq!(FULL, 1024);
+    }
+
+    fn promote(v: voxel_engine::Vec3) -> DVec3 {
+        DVec3::new(v.x as f64, v.y as f64, v.z as f64)
+    }
+
+    /// The engine chart is the game chart, and a baked texel lands on the column it sampled.
+    #[test]
+    fn engine_basis_matches_the_chart_and_texels_round_trip() {
+        let n = surface_n(HOME_RADIUS);
+        for face in 0..6 {
+            let (tu, nn, tv) = basis(FACES[face]);
+            let (eu, en, ev) = far_map_basis(face);
+            assert_eq!((promote(eu), promote(en), promote(ev)), (tu, nn, tv), "face {face}");
+            let centre = far_cube_texel_dir(face, 1, 0, 0);
+            let dir = cube_texel_dir(face, 1, 0, 0);
+            assert_eq!(dir, promote(centre));
+            assert_eq!(column_of(n, dir), (face, 0, 0), "face centre texel");
+            for (x, y) in [(4u32, 4), (8, 4), (4, 12), (12, 8)] {
+                let d = cube_texel_dir(face, 16, x, y);
+                assert_eq!(d, promote(far_cube_texel_dir(face, 16, x, y)));
+                let (f, u, v) = column_of(n, d);
+                assert_eq!(f, face, "texel {x},{y} on face {face} -> {f}");
+                let back = column_direction(f, n, u, v);
+                assert!(d.dot(back) > 1.0 - 1e-6, "face {face} texel {x},{y} dot {}", d.dot(back));
+                assert_eq!(column_of(n, back), (f, u, v));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Rec {
+        events: Vec<Ev>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ev {
+        Install(u32),
+        Face(usize, usize),
+        Clear,
+    }
+
+    impl FarSink for Rec {
+        fn install(&mut self, _datum_res: u32, datum: &[f32], albedo_size: u32) -> bool {
+            assert!(!datum.is_empty());
+            self.events.push(Ev::Install(albedo_size));
+            true
+        }
+        fn face(&mut self, face: usize, rgba: &[u8]) -> bool {
+            self.events.push(Ev::Face(face, rgba.len()));
+            true
+        }
+        fn clear(&mut self) {
+            self.events.push(Ev::Clear);
+        }
+    }
+
+    fn six(byte: u8) -> [Option<Vec<u8>>; 6] {
+        std::array::from_fn(|i| Some(vec![byte, byte, byte, i as u8]))
+    }
+
+    fn view(faces: &[Option<Vec<u8>>; 6]) -> [Option<&[u8]>; 6] {
+        std::array::from_fn(|i| faces[i].as_deref())
+    }
+
+    #[test]
+    fn preview_faces_then_full_faces_upload_once() {
+        let datum = vec![0.0f32; 24];
+        let mut feed = MapFeed::default();
+        let mut rec = Rec::default();
+        let none = [None, None, None, None, None, None];
+        assert!(feed.flush(2, &datum, &none, &none, &mut rec));
+        assert_eq!(rec.events, vec![Ev::Install(PREVIEW)]);
+
+        let preview = six(1);
+        let preview_ref = view(&preview);
+        feed.flush(2, &datum, &preview_ref, &none, &mut rec);
+        let mut expect = vec![Ev::Install(PREVIEW)];
+        for i in 0..6 {
+            expect.push(Ev::Face(i, 4));
+        }
+        assert_eq!(rec.events, expect);
+
+        let full = six(2);
+        let full_ref = view(&full);
+        feed.flush(2, &datum, &preview_ref, &full_ref, &mut rec);
+        expect.push(Ev::Install(FULL));
+        for i in 0..6 {
+            expect.push(Ev::Face(i, 4));
+        }
+        assert_eq!(rec.events, expect);
+
+        alloc_count::reset();
+        feed.flush(2, &datum, &preview_ref, &full_ref, &mut rec);
+        assert_eq!(alloc_count::alloc_count(), 0, "a quiet upload allocated");
+        assert_eq!(rec.events, expect, "each face is sent once");
+    }
+
+    #[test]
+    fn a_full_cache_skips_the_preview_and_a_clear_installs_again() {
+        let datum = vec![0.0f32; 24];
+        let full = six(3);
+        let full_ref = view(&full);
+        let none = [None, None, None, None, None, None];
+        let mut feed = MapFeed::default();
+        let mut rec = Rec::default();
+        // Both resolutions in one step: previews go out, then the cube is replaced.
+        let preview = six(1);
+        let preview_ref = view(&preview);
+        feed.flush(2, &datum, &preview_ref, &full_ref, &mut rec);
+        let mut once = vec![Ev::Install(PREVIEW)];
+        for i in 0..6 {
+            once.push(Ev::Face(i, 4));
+        }
+        once.push(Ev::Install(FULL));
+        for i in 0..6 {
+            once.push(Ev::Face(i, 4));
+        }
+        assert_eq!(rec.events, once);
+
+        let mut cached = MapFeed::default();
+        let mut rec = Rec::default();
+        cached.flush(2, &datum, &none, &full_ref, &mut rec);
+        let mut only = vec![Ev::Install(FULL)];
+        for i in 0..6 {
+            only.push(Ev::Face(i, 4));
+        }
+        assert_eq!(rec.events, only);
+        cached.clear(&mut rec);
+        assert_eq!(rec.events.last(), Some(&Ev::Clear));
+        cached.flush(2, &datum, &none, &full_ref, &mut rec);
+        assert_eq!(rec.events.iter().filter(|e| matches!(e, Ev::Install(FULL))).count(), 2);
     }
 
     #[test]
@@ -679,6 +882,7 @@ mod tests {
         assert_eq!(handle.datum[idx], datum[idx]);
         assert!((handle.radius - radius).abs() < 1e-6);
         assert_eq!(handle.horizon, 1.0);
+        assert!(handle.preview.iter().all(|f| f.is_none()), "nothing is baked yet");
         assert!(handle.full.iter().all(|f| f.is_none()));
 
         let mut far = super::super::bodies::FarBodies::default();
@@ -762,6 +966,93 @@ mod tests {
             assert_eq!(again.faces(true)[face], Some(saved[face].as_slice()), "face {face} loaded");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_is_mapped_once_its_datum_is_uploaded_and_leaving_clears_it() {
+        let mut registry = BlockRegistry::with_builtins();
+        let terrain = Terrain::new(&mut registry, 42);
+        let cosmos = terrain.cosmos().unwrap();
+        let home = cosmos.home();
+        let eye = DVec3::new(1.0e8, 0.0, 0.0);
+        let mut sky = super::super::Sky::new();
+        let mut rec = Rec::default();
+
+        let before = sky.far_at(&terrain, eye);
+        let before_home = before.iter().find(|b| b.seed == home.seed).expect("home from afar");
+        assert!(
+            matches!(before_home.shape, FarShape::Sphere),
+            "home is a sphere until the datum is uploaded"
+        );
+
+        sky.sync_far_map(&mut rec, &terrain);
+        assert_eq!(rec.events, vec![Ev::Install(PREVIEW)], "the datum is installed once, at preview size");
+
+        let listed = sky.far_at(&terrain, eye);
+        let mapped = listed.iter().find(|b| b.seed == home.seed).expect("home stays visible");
+        let radius = super::super::bodies::home_impostor(cosmos, home).1;
+        match mapped.shape {
+            FarShape::Mapped { map, horizon, air } => {
+                assert_eq!(map, HOME_MAP);
+                assert!(horizon.is_finite() && horizon < 1.0, "horizon {horizon}");
+                assert_eq!(air.to_bits(), ((AIR_TOP / radius) as f32).to_bits(), "air is AIR_TOP / R");
+                assert!(air > 0.0 && air.is_finite());
+            }
+            other => panic!("home draws mapped once the datum is uploaded, got {other:?}"),
+        }
+        assert_eq!(mapped.radius.to_bits(), (radius as f32).to_bits(), "the reference radius stays under the ground");
+        let want = NEW_SHOKA.get(Role::Horizon, Anchor::Day).to_linear();
+        assert_eq!(mapped.atmosphere.0, want.0, "daylight air; moons stay black");
+        assert!(listed.iter().filter(|b| b.seed != home.seed).all(|b| !matches!(b.shape, FarShape::Mapped { .. })));
+        let mut moons = 0;
+        for body in cosmos.bodies().iter().filter(|b| b.kind == Kind::Moon) {
+            let Some(moon) = listed.iter().find(|b| b.seed == body.seed) else { continue };
+            assert_eq!(moon.shape, FarShape::Sphere);
+            assert_eq!(moon.atmosphere.0, [0.0, 0.0, 0.0]);
+            moons += 1;
+        }
+        assert!(moons > 0, "a moon is still drawn");
+        assert!(
+            sky.far_at(&terrain, home.centre_f()).iter().all(|b| b.seed != home.seed),
+            "an eye inside the reference sphere drops the body"
+        );
+
+        let px = [9u8, 8, 7, 255];
+        for face in 0..6 {
+            sky.deliver_face(false, face, px.to_vec());
+        }
+        sky.sync_far_map(&mut rec, &terrain);
+        assert_eq!(
+            rec.events.iter().filter(|e| matches!(e, Ev::Face(_, _))).count(),
+            6,
+            "each preview face once"
+        );
+
+        let full = [1u8, 2, 3, 255];
+        for face in 0..6 {
+            sky.deliver_face(true, face, full.to_vec());
+        }
+        sky.sync_far_map(&mut rec, &terrain);
+        assert_eq!(
+            rec.events.iter().filter(|e| matches!(e, Ev::Install(_))).copied().collect::<Vec<_>>(),
+            vec![Ev::Install(PREVIEW), Ev::Install(FULL)]
+        );
+        let faces: Vec<_> = rec.events.iter().copied().filter(|e| matches!(e, Ev::Face(_, _))).collect();
+        assert_eq!(faces.len(), 12, "preview then full, each face once");
+        assert_eq!(&faces[..6], &(0..6).map(|i| Ev::Face(i, 4)).collect::<Vec<_>>()[..]);
+        assert_eq!(&faces[6..], &(0..6).map(|i| Ev::Face(i, 4)).collect::<Vec<_>>()[..]);
+
+        let n = rec.events.len();
+        alloc_count::reset();
+        sky.sync_far_map(&mut rec, &terrain);
+        assert_eq!(alloc_count::alloc_count(), 0, "a quiet frame allocated");
+        assert_eq!(rec.events.len(), n);
+
+        sky.release_far_map(&mut rec);
+        assert_eq!(rec.events.last(), Some(&Ev::Clear));
+        let after = sky.far_at(&terrain, eye);
+        let after_home = after.iter().find(|b| b.seed == home.seed).expect("home");
+        assert!(matches!(after_home.shape, FarShape::Sphere), "a cleared map draws the sphere");
     }
 
     /// `cargo test --release --lib bake_timing -- --ignored --nocapture`

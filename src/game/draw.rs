@@ -110,6 +110,11 @@ impl Game {
     /// 3D draws are camera-relative. Differences are computed at f64 precision
     /// before narrowing to f32 for the GPU, keeping far terrain stable.
     pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32) {
+        // The home map is installed on the engine, so it has to land before the frame opens.
+        if matches!(self.debug_view, DebugView::Normal) {
+            self.sky.drive_planet(|| self.world.terrain_arc(), self.world.registry());
+            self.sky.sync_far_map(eng, self.world.terrain());
+        }
         let mut scene = self.compose_phase(eng, fov, shake);
         let mut f = eng.begin_frame(scene.clear);
         self.scene_phase(&mut f, &scene);
@@ -349,7 +354,6 @@ impl Game {
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
                 let view_blocks = crate::sky::chunk_view_blocks(self.world.view_radius());
-                self.sky.drive_planet(|| self.world.terrain_arc(), self.world.registry());
                 self.sky.draw(
                     &mut f3,
                     scene.sky_frame,
