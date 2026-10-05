@@ -62,6 +62,10 @@ fn stream_center(world: &World) -> Coord {
     world.center.expect("stream lanes run after center is set")
 }
 
+fn far_center(world: &World) -> Coord {
+    world.section_center().expect("stream lanes run after center is set")
+}
+
 fn eng<'a>(
     slot: &'a mut Option<&mut voxel_engine::Engine>,
     what: &'static str,
@@ -69,8 +73,9 @@ fn eng<'a>(
     slot.as_deref_mut().expect(what)
 }
 
-fn admit_run<L: super::StreamLane>(ctx: &mut Ctx<'_>, b: Budget) -> Progress {
-    admit::<L>(ctx.world, stream_center(ctx.world), b);
+/// Run lane `L`'s admission around the centre `center` names (the streaming or the far one).
+fn admit_run<L: super::StreamLane>(ctx: &mut Ctx<'_>, center: fn(&World) -> Coord, b: Budget) -> Progress {
+    admit::<L>(ctx.world, center(ctx.world), b);
     Progress::Idle
 }
 
@@ -192,11 +197,11 @@ stream_lanes! {
         },
     /// Cross-chunk light settling admission (the `world::LightLane` marker).
     light_admit: admit LightLane("light_admit", Budget::Millis(1.0))
-        => |ctx, b| { admit_run::<LightLane>(ctx, b) },
+        => |ctx, b| { admit_run::<LightLane>(ctx, stream_center, b) },
     /// Fresh full-res chunk meshing admission (the `world::MeshLane` marker).
     mesh_admit: admit MeshLane("mesh_admit", Budget::Millis(2.0))
-        => |ctx, b| { admit_run::<MeshLane>(ctx, b) },
+        => |ctx, b| { admit_run::<MeshLane>(ctx, stream_center, b) },
     /// LOD2 column-section admission (the `world::SectionLane` marker).
     section_admit: admit SectionLane("section_admit", Budget::Millis(1.0))
-        => |ctx, b| { admit_run::<SectionLane>(ctx, b) },
+        => |ctx, b| { admit_run::<SectionLane>(ctx, far_center, b) },
 }

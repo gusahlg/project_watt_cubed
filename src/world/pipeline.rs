@@ -641,6 +641,23 @@ impl Job {
 /// only genuinely left-behind work is.
 const CANCEL_MARGIN: i32 = 4;
 
+/// Where the far field stands, as the job gate measures far work: its centre chunk column and the
+/// chart net around it (the identity off charts).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::world) struct FarView {
+    pub x: i32,
+    pub z: i32,
+    pub fold: super::seam::Unfold,
+}
+
+impl FarView {
+    /// Standing on chunk column `(x, z)` off every chart.
+    #[cfg(test)]
+    pub(in crate::world) fn flat(x: i32, z: i32) -> Self {
+        Self { x, z, fold: super::seam::Unfold::IDENTITY }
+    }
+}
+
 /// The live view, shared with the worker pool. The world stores the streaming
 /// centre/radius (and the far-field horizon) here every stream pass; the
 /// queues then re-key their backlogs toward where the player is NOW and
@@ -658,6 +675,11 @@ pub(in crate::world) struct ViewGate {
     cx: AtomicI32,
     cy: AtomicI32,
     cz: AtomicI32,
+    /// The far field's centre chunk `(x, z)`: far entries are measured from it. It is the
+    /// streaming centre except above a round world, where the far field keeps standing on the
+    /// chart after the near window has left it.
+    fx: AtomicI32,
+    fz: AtomicI32,
     /// Horizontal view radius in chunks; `i32::MAX` (permissive) until set.
     /// Near distance is 3-D chess against this one radius.
     radius: AtomicI32,
@@ -665,8 +687,8 @@ pub(in crate::world) struct ViewGate {
     /// Default is +Y so an unset gate matches the historical XZ metric
     /// (`dy == 0`).
     up: AtomicU8,
-    /// Monotone stamp of the `(centre, radius, up)` triple: bumped only when
-    /// one actually changes, so the queues' O(n) re-key/deschedule rebuild
+    /// Monotone stamp of the centres, radius, up and chart nets: bumped only
+    /// when one actually changes, so the queues' O(n) re-key/deschedule rebuild
     /// runs once per boundary cross instead of once per pop.
     epoch: AtomicU64,
     /// Far-field descheduling horizon in METRES (`f64` bits; +∞ until set):
@@ -686,6 +708,11 @@ pub(in crate::world) struct ViewGate {
     /// physical path never takes the lock).
     fold: std::sync::RwLock<super::seam::Unfold>,
     folded: std::sync::atomic::AtomicBool,
+    /// The chart net around the far centre: far entries are measured folded into it, so a
+    /// neighbour chart's sections sit beside the home chart and not a face box away. The
+    /// identity off charts.
+    far_fold: std::sync::RwLock<super::seam::Unfold>,
+    far_folded: std::sync::atomic::AtomicBool,
     /// Velocity-aware concurrency and near-queue lookahead. Both are published
     /// by the main thread from the world's single streaming pacer.
     active_workers: AtomicUsize,
@@ -701,6 +728,8 @@ impl ViewGate {
             cx: AtomicI32::new(0),
             cy: AtomicI32::new(0),
             cz: AtomicI32::new(0),
+            fx: AtomicI32::new(0),
+            fz: AtomicI32::new(0),
             radius: AtomicI32::new(i32::MAX),
             up: AtomicU8::new(Face::PosY as u8),
             epoch: AtomicU64::new(0),
@@ -710,6 +739,8 @@ impl ViewGate {
             vel_z: AtomicU64::new(0.0f64.to_bits()),
             fold: std::sync::RwLock::new(super::seam::Unfold::IDENTITY),
             folded: std::sync::atomic::AtomicBool::new(false),
+            far_fold: std::sync::RwLock::new(super::seam::Unfold::IDENTITY),
+            far_folded: std::sync::atomic::AtomicBool::new(false),
             active_workers: AtomicUsize::new(1),
             // Permissive until a real Workers pool publishes its capacity;
             // direct queue tests and non-streaming users retain legacy behavior.
@@ -724,6 +755,8 @@ impl ViewGate {
             self.cy.swap(cy, Ordering::Relaxed),
             self.cz.swap(cz, Ordering::Relaxed),
         );
+        self.fx.store(cx, Ordering::Relaxed);
+        self.fz.store(cz, Ordering::Relaxed);
         let prev_radius = self.radius.swap(radius, Ordering::Relaxed);
         if prev != (cx, cy, cz) || prev_radius != radius {
             self.epoch.fetch_add(1, Ordering::Release);
@@ -736,6 +769,7 @@ impl ViewGate {
         cx: i32,
         cy: i32,
         cz: i32,
+        far: FarView,
         radius: i32,
         far_m: f64,
         vel_x: f64,
@@ -743,6 +777,9 @@ impl ViewGate {
         vel_z: f64,
         up: Option<Face>,
     ) {
+        // Stored ahead of the centre, so the one epoch bump below publishes the far centre and its
+        // net together: a re-key measuring from a centre in another chart's net deschedules it all.
+        let far_net_moved = Self::store_fold(&self.far_fold, &self.far_folded, far.fold);
         let far_bits = far_m.to_bits();
         let vx = vel_x.to_bits();
         let vy = vel_y.to_bits();
@@ -751,9 +788,12 @@ impl ViewGate {
             Some(face) => face as u8,
             None => UP_NONE,
         };
-        let same_center = self.cx.load(Ordering::Relaxed) == cx
+        let same_center = !far_net_moved
+            && self.cx.load(Ordering::Relaxed) == cx
             && self.cy.load(Ordering::Relaxed) == cy
             && self.cz.load(Ordering::Relaxed) == cz
+            && self.fx.load(Ordering::Relaxed) == far.x
+            && self.fz.load(Ordering::Relaxed) == far.z
             && self.radius.load(Ordering::Relaxed) == radius
             && self.up.load(Ordering::Relaxed) == up_code;
         let same_far = self.far_m.load(Ordering::Relaxed) == far_bits;
@@ -775,6 +815,8 @@ impl ViewGate {
             self.cx.store(cx, Ordering::Relaxed);
             self.cy.store(cy, Ordering::Relaxed);
             self.cz.store(cz, Ordering::Relaxed);
+            self.fx.store(far.x, Ordering::Relaxed);
+            self.fz.store(far.z, Ordering::Relaxed);
             self.radius.store(radius, Ordering::Relaxed);
             self.up.store(up_code, Ordering::Relaxed);
             self.epoch.fetch_add(1, Ordering::Release);
@@ -830,12 +872,28 @@ impl ViewGate {
 
     /// Publish the chart net (bumps the epoch so queued work re-keys).
     fn set_fold(&self, fold: super::seam::Unfold) {
-        let mut cur = self.fold.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *cur != fold {
-            *cur = fold;
-            self.folded.store(!fold.is_identity(), Ordering::Relaxed);
+        if Self::store_fold(&self.fold, &self.folded, fold) {
             self.epoch.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// Store `fold` in `slot`; returns whether it changed. The far net is offered every pass, so
+    /// an unchanged net takes only the read lock.
+    fn store_fold(
+        slot: &std::sync::RwLock<super::seam::Unfold>,
+        folded: &std::sync::atomic::AtomicBool,
+        fold: super::seam::Unfold,
+    ) -> bool {
+        if *slot.read().unwrap_or_else(std::sync::PoisonError::into_inner) == fold {
+            return false;
+        }
+        let mut cur = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cur == fold {
+            return false;
+        }
+        *cur = fold;
+        folded.store(!fold.is_identity(), Ordering::Relaxed);
+        true
     }
 
     /// Chess distance from the live centre across the up face (+Y: the XZ
@@ -900,10 +958,11 @@ impl ViewGate {
         radius == i32::MAX || self.dist(x, y, z) <= radius + CANCEL_MARGIN
     }
 
-    /// The eye position in metres — the centre chunk's centre, matching
-    /// [`player_dist2`](super::player_dist2)'s convention.
+    /// The far eye in metres — the far centre chunk's centre (the streaming centre's height),
+    /// matching [`player_dist2`](super::player_dist2)'s convention.
     fn eye_m(&self) -> (f64, f64, f64) {
-        let (cx, cy, cz) = self.center();
+        let (_, cy, _) = self.center();
+        let (cx, cz) = (self.fx.load(Ordering::Relaxed), self.fz.load(Ordering::Relaxed));
         let s = CHUNK_SIZE as f64;
         let half = s / 2.0;
         (cx as f64 * s + half, cy as f64 * s + half, cz as f64 * s + half)
@@ -924,10 +983,21 @@ impl ViewGate {
         )
     }
 
+    /// A far entry's centre in the far field's chart net (itself off charts); `None` for storage
+    /// outside it.
+    #[inline]
+    fn far_place(&self, wx: i64, wz: i64) -> Option<(i64, i64)> {
+        if !self.far_folded.load(Ordering::Relaxed) {
+            return Some((wx, wz));
+        }
+        self.far_fold.read().unwrap_or_else(std::sync::PoisonError::into_inner).fold_column(wx, wz)
+    }
+
     /// Section re-key. Sections are an XZ heightfield: `wy` is the live eye
     /// altitude, so `dy` is 0 and a +Y gate matches the old 2-D metric.
     /// [`motion_biased_dist2`](super::motion_biased_dist2) ignores `vel.y`.
     fn far_key(&self, wx: i64, wz: i64) -> u64 {
+        let Some((wx, wz)) = self.far_place(wx, wz) else { return u64::MAX };
         let (ex, ey, ez) = self.eye_m();
         let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
         super::motion_biased_dist2(self.far_dist2_m(wx, ey as i64, wz), self.velocity(), dx, dz)
@@ -944,6 +1014,7 @@ impl ViewGate {
         if !far.is_finite() || self.radius.load(Ordering::Relaxed) == i32::MAX {
             return true;
         }
+        let Some((wx, wz)) = self.far_place(wx, wz) else { return false };
         let limit = far + span as f64;
         let (_, ey, _) = self.eye_m();
         (self.far_dist2_m(wx, ey as i64, wz) as f64) <= limit * limit
@@ -1317,14 +1388,15 @@ impl Workers {
         self.staging.snapshot()
     }
 
-    /// Publish the live streaming centre, horizontal radius (chunks), and the
-    /// far-field horizon (metres). The queues re-key their backlogs against it
+    /// Publish the live streaming centre, where the far field stands, horizontal radius
+    /// (chunks), and the far-field horizon (metres). The queues re-key their backlogs against it
     /// and deschedule left-behind entries — once per change, at the pool.
     pub(in crate::world) fn set_view(
         &self,
         cx: i32,
         cy: i32,
         cz: i32,
+        far: FarView,
         radius: i32,
         far_m: f64,
         vel_x: f64,
@@ -1333,7 +1405,7 @@ impl Workers {
         up: Option<Face>,
     ) {
         self.view
-            .publish(cx, cy, cz, radius, far_m, vel_x, vel_y, vel_z, up);
+            .publish(cx, cy, cz, far, radius, far_m, vel_x, vel_y, vel_z, up);
     }
 
     /// Publish the chart net around a storage centre to the job gate.
@@ -2182,6 +2254,30 @@ mod tests {
             "with its exact claim reported: {cancelled:?}"
         );
         assert!(q.pop(&gate, &mut cancelled).is_none(), "drained");
+    }
+
+    /// Far entries are measured from the far centre, not the streaming centre: above a round world
+    /// the near window stands in physical space while the far field stays on the chart.
+    #[test]
+    fn far_queue_measures_from_the_far_centre() {
+        let terrain = generator(0);
+        let job = |id: i32| section_job(&terrain, id);
+        let (wx0, wz0, span0) = far_center_span(&job(0));
+        let mut q = JobQueue::default();
+        assert!(q.push_far(job(0), 0));
+        assert!(q.push_far(job(50), 0));
+        let gate = ViewGate::new();
+        // The streaming centre is far from both sections; the far centre is section 0's chunk, and
+        // the horizon reaches it but not section 50.
+        let far = FarView::flat(wx0.div_euclid(16) as i32, wz0.div_euclid(16) as i32);
+        gate.publish(1_000_000, 0, 1_000_000, far, 8, 3_000.0 - span0 as f64, 0.0, 0.0, 0.0, Some(Face::PosY));
+        let mut cancelled = Vec::new();
+        let popped = q.pop(&gate, &mut cancelled).expect("the section under the far centre survives");
+        assert_eq!(section_id(&popped), 0);
+        assert!(
+            matches!(&cancelled[..], [JobKey::Section { pos, .. }] if pos.x == 50),
+            "only the section beyond the far horizon is descheduled: {cancelled:?}"
+        );
     }
 
     /// Worker→main channel throughput (structural-opportunities #8): floods the

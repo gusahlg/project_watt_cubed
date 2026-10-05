@@ -1050,6 +1050,18 @@ pub struct World {
     pub(crate) edit_generation: u64,
     /// Last chunk centre; `None` forces a full stream pass. Streams only react to boundary crosses.
     center: Option<Coord>,
+    /// The far field's chunk centre: the chart column under the eye, which outlasts the near
+    /// window's chart reach; the streaming centre elsewhere. Set by [`stream`](Self::stream).
+    far_center: Option<Coord>,
+    /// The chart net around [`far_center`](Self::far_center), which the job gate measures far work
+    /// in; the identity off charts.
+    far_fold: seam::Unfold,
+    /// Atlas whose chart the far field stood on last pass (its reach gets the hold margin).
+    far_atlas: Option<usize>,
+    /// Doublings of the chart ring unit for the eye's height above the ground.
+    far_scale: u8,
+    /// The far eye's storage column `(x, z)` and its generated ground.
+    far_ground: Option<((i32, i32), i32)>,
     /// Up face committed for the streaming centre. `None` is isotropic.
     /// Meaningful only once [`stream_up_set`](Self::stream_up_set) is true.
     stream_up: Option<Face>,
@@ -1248,7 +1260,7 @@ pub struct World {
     lod2: bool,
     /// LOD pyramid config with `unit` in metres.
     section_pyramid: pyramid::PyramidCfg,
-    /// The eye altitude captured each `stream()` before chunk-coord floor rounds it.
+    /// The far field's eye altitude captured each `stream()` before chunk-coord floor rounds it.
     /// Feeds the vertical LOD selection. XZ selection uses chunk centre only.
     section_eye_y: f64,
     /// Body and face the far field is selecting, with hysteresis at edges.
@@ -1480,6 +1492,11 @@ impl World {
             edits: FastMap::default(),
             edit_generation: 0,
             center: None,
+            far_center: None,
+            far_fold: seam::Unfold::IDENTITY,
+            far_atlas: None,
+            far_scale: 0,
+            far_ground: None,
             stream_up: None,
             stream_up_set: false,
             view: ViewVolume::view(DEFAULT_VIEW_RADIUS),
@@ -1611,10 +1628,16 @@ impl World {
     }
 
     /// The one lazily created worker pool. Keeping construction here prevents
-    /// direct lane/test entry points from each restating the spawn policy.
+    /// direct lane/test entry points from each restating the spawn policy. It starts with the
+    /// chart net already adopted: adoption publishes only a change, so a net adopted before the
+    /// pool existed would otherwise never reach its gate.
     pub(in crate::world) fn worker_pool(&mut self) -> &mut pipeline::Workers {
-        self.workers
-            .get_or_insert_with(|| pipeline::Workers::spawn(pipeline::Workers::default_threads()))
+        let fold = self.fold;
+        self.workers.get_or_insert_with(|| {
+            let workers = pipeline::Workers::spawn(pipeline::Workers::default_threads());
+            workers.set_fold(fold);
+            workers
+        })
     }
 
     /// Whether `coord` is a loaded chunk awaiting its fresh mesh — dense data,

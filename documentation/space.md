@@ -123,9 +123,14 @@ Seen from afar every body is drawn as an analytic impostor in the sky (`sky::bod
 sun, and the rocks of a nearby swarm as sunlit boxes beyond the streamed chunks (`sky::rocks`).
 Standing on a cube face, the far field is face-local LOD sections out to the horizon; standing on
 a round world it is chart sections bent through cages (detail stops where the cage's chord error
-would pass a block), and the body's sphere fills the horizon beyond them. Inside the Hollow the
-inner wall surrounds the sky and the Ember is the sun. Above the atmosphere there is no night: the
-sun lights whatever faces it.
+would pass a block), and the body's sphere fills the horizon beyond them. Flying up, the near window
+returns to physical space a couple of thousand blocks above the chart's stored top, but the far field
+keeps standing on the chart column under the eye (to 262,144 blocks above the top) and its rings
+widen with the height, to three times the height over the ground within the section budget: on the
+start world about 58 km of ground under an eye 10 km up, about 107 km from 50 km up and higher (the
+chord rule stops detail at 8,192-block sections, so only the number of sections can grow). Inside
+the Hollow the inner wall surrounds the sky and the Ember is the sun. Above the atmosphere there is
+no night: the sun lights whatever faces it.
 
 ## Travel
 

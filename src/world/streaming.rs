@@ -9,7 +9,7 @@ use voxel_engine::{DVec3, Engine, FadeStyle};
 
 use crate::block::appearance::{fill_layer, BlockAppearance, LAYER_BYTES, TEXTURE_SIZE};
 
-use crate::coord::{ByPass, ChunkBox, ChunkCoord, Face};
+use crate::coord::{ByPass, ChunkBox, Face};
 use crate::space::FaceFrame;
 use crate::derived::Revision;
 use crate::math::block_coord;
@@ -145,6 +145,22 @@ const RESULT_INTEGRATE_FLOOR: usize = 8;
 /// `RELIEF` above the datum and the crust tops out at `MAX_GROUND`, so this clears
 /// three thousand blocks of flight over the highest crust.
 const CHART_FLIGHT: f64 = 2_048.0;
+
+/// Blocks above a round world's stored top within which the far field still stands on its chart.
+/// Higher up the body's impostor alone draws it.
+const FAR_FLIGHT: f64 = 262_144.0;
+
+/// Hysteresis of the far field's thresholds: crossing one back takes this factor more height than
+/// crossing it did (the far reach is left at `FAR_FLIGHT · FAR_HOLD`, a ring doubling dropped at
+/// `1 / FAR_HOLD` of the height that took it, and the chart stood on is left for another round
+/// world's only when that top is this factor nearer).
+const FAR_HOLD: f64 = 1.25;
+
+/// The chart rings reach this many times the eye's height above the ground.
+const FAR_VIEW: f64 = 3.0;
+
+/// Candidates the coarsest chart ring may sweep (its square of sections), twice the section floor.
+const FAR_CANDIDATES: f64 = (2 * super::SECTION_SLOT_FLOOR) as f64;
 
 /// Velocity-aware streaming load controller. `effort` is the one normalized
 /// signal shared by worker concurrency, queue lookahead, admission deadlines,
@@ -579,6 +595,17 @@ fn column_order(center: Coord, vel: DVec3, anchor: Coord, up: Option<Face>) -> u
     )
 }
 
+/// The chunk holding point `p`.
+fn eye_chunk(p: DVec3) -> Coord {
+    World::chunk_of(block_coord(p.x), block_coord(p.y), block_coord(p.z))
+}
+
+/// Sections from the eye's out to the edge of the square the coarsest ring sweeps, for a ring
+/// reaching `outer` metres in sections of `span` (`quadtree::desired_sections`).
+fn ring_reach(outer: f64, span: f64) -> f64 {
+    (outer / span).ceil() + 1.0
+}
+
 /// Storage block the chart frontier treats as the eye: the centre chunk's middle, plus the
 /// prediction delta. Y is the streamed altitude, not the chunk layer.
 fn storage_eye_block(center: Coord, eye_y: f64, delta: DVec3) -> (i64, i64, i64) {
@@ -936,6 +963,118 @@ impl World {
         self.chart_eye(eye).unwrap_or(eye)
     }
 
+    /// The points streaming stands on for physical eye `eye`: the near window's
+    /// ([`stream_eye`](Self::stream_eye)) and the far field's, whose altitude it captures.
+    pub(in crate::world) fn place_eyes(&mut self, eye: DVec3) -> (DVec3, DVec3) {
+        let chart = self.chart_eye(eye);
+        let near = chart.unwrap_or(eye);
+        let far = if self.lod2 { self.adopt_far_eye(eye, chart) } else { near };
+        self.section_eye_y = far.y;
+        (near, far)
+    }
+
+    /// The far field's eye: the near window's chart eye `chart`, else the chart column under the
+    /// nearest round world within [`FAR_FLIGHT`] of its top, else `eye`. Commits the atlas it
+    /// stands on and the altitude scale of its rings.
+    fn adopt_far_eye(&mut self, eye: DVec3, chart: Option<DVec3>) -> DVec3 {
+        let far = chart.or_else(|| self.seams.far_eye(eye, FAR_FLIGHT, self.far_atlas, FAR_HOLD));
+        let seat = far.and_then(|p| self.seams.chart_seat(eye_chunk(p)));
+        self.far_atlas = seat.map(|s| s.index);
+        self.far_scale = match (far, seat) {
+            (Some(p), Some(s)) => {
+                let ground = self.far_ground(p);
+                let h = if ground == i32::MIN { 0.0 } else { (p.y - f64::from(ground)).max(0.0) };
+                self.far_scale_at(h, s.radius)
+            }
+            _ => 0,
+        };
+        far.unwrap_or(eye)
+    }
+
+    /// The generated ground of storage point `p`'s column, kept until the column changes.
+    fn far_ground(&mut self, p: DVec3) -> i32 {
+        let column = (block_coord(p.x), block_coord(p.z));
+        if let Some((c, ground)) = self.far_ground
+            && c == column
+        {
+            return ground;
+        }
+        let ground = self.generator.surface(Face::PosY, column.0, column.1);
+        self.far_ground = Some((column, ground));
+        ground
+    }
+
+    /// Unit doublings of the chart rings at height `h` over the ground on a chart of datum radius
+    /// `radius`: the rings reach [`FAR_VIEW`] times the height, a doubling is dropped only
+    /// [`FAR_HOLD`] lower than it was taken, and the coarsest ring's square stays within
+    /// [`FAR_CANDIDATES`] (its detail is capped by the chord rule, so only its reach can grow).
+    fn far_scale_at(&self, h: f64, radius: i64) -> u8 {
+        let Some((cfg, max_d)) = self.chart_pyramid(radius) else { return 0 };
+        let outer = f64::from(cfg.outer_m()) / f64::from(1u32 << self.far_scale);
+        let span = f64::from(super::section::section_span(crate::ident::Detail(max_d)));
+        let rows = |s: u8| 2.0 * ring_reach(outer * f64::from(1u32 << s), span) + 1.0;
+        let mut cap = 0u8;
+        while cap < 16 && rows(cap + 1).powi(2) <= FAR_CANDIDATES {
+            cap += 1;
+        }
+        let level = |reach: f64| (0..cap).find(|&s| outer * f64::from(1u32 << s) >= reach).unwrap_or(cap);
+        self.far_scale.clamp(level(FAR_VIEW * h), level(FAR_VIEW * FAR_HOLD * h))
+    }
+
+    /// The section ladder with its unit doubled [`far_scale`](World::far_scale) times (the
+    /// ladder itself off charts, where the scale is 0).
+    fn far_pyramid(&self) -> pyramid::PyramidCfg {
+        let src = &self.section_pyramid;
+        let unit = src.unit * (1u32 << self.far_scale) as f32;
+        pyramid::PyramidCfg::sections_with(unit, src.levels.get(), src.finest.0 as u8)
+    }
+
+    /// The far field's descheduling horizon in metres from its eye: the ladder's outer edge, and on
+    /// a chart the half-diagonal of the coarsest ring's square of sections, whose corners reach
+    /// far past that edge. The selection is untouched; only the worker gate reads this.
+    fn far_horizon(&self) -> f64 {
+        let outer = f64::from(self.far_pyramid().outer_m());
+        let chart = self.far_atlas.and_then(|i| self.chart_pyramid(self.seams.atlases()[i].radius));
+        let Some((cfg, max_d)) = chart else { return outer };
+        let span = f64::from(super::section::section_span(crate::ident::Detail(max_d)));
+        outer.max(ring_reach(f64::from(cfg.outer_m()), span) * span * std::f64::consts::SQRT_2)
+    }
+
+    /// The far field's centre chunk (the streaming centre unless it stands on a chart the near
+    /// window has left). `None` before the first stream.
+    pub(in crate::world) fn section_center(&self) -> Option<Coord> {
+        self.center.map(|c| self.far_center.unwrap_or(c))
+    }
+
+    /// Move the far field's centre to `centre`, with the chart net the gate measures far work in.
+    /// Returns whether it moved.
+    pub(in crate::world) fn set_far_center(&mut self, centre: Coord) -> bool {
+        if self.far_center.replace(centre) == Some(centre) {
+            return false;
+        }
+        self.far_fold = self.far_unfold(centre);
+        true
+    }
+
+    /// The chart net around far-field centre `centre`: the identity off charts.
+    fn far_unfold(&self, centre: Coord) -> super::seam::Unfold {
+        if self.section_on_chart(centre) { self.seams.unfold_at(centre) } else { super::seam::Unfold::IDENTITY }
+    }
+
+    /// The far field standing on chunk `centre`, as the job gate is told it (the net is the cached
+    /// one when that is the far centre).
+    fn far_view(&self, centre: Coord) -> pipeline::FarView {
+        let fold = if self.far_center == Some(centre) { self.far_fold } else { self.far_unfold(centre) };
+        pipeline::FarView { x: centre.x, z: centre.z, fold }
+    }
+
+    /// Whether far-field centre `center` stands on a round world's chart: in or above a storage
+    /// box that is not a warped cube's.
+    fn section_on_chart(&self, center: Coord) -> bool {
+        let (_, _, in_cube) = self.lod_place(center);
+        !in_cube && self.seams.in_column(center)
+    }
+
     /// Adopt the chart net around streaming centre `centre`; returns whether it changed. A new net
     /// drops the previous boxes' diffs (they were measured in the old net) and re-buckets the
     /// worklists.
@@ -1013,7 +1152,7 @@ impl World {
             self.slot_ceiling = stats.cpu_cull_max.max(1);
         }
         let stager = eng.as_ref().map(|e| e.mesh_stager());
-        let (center_chunk, full_pass) = self.begin_stream(center, stager);
+        let (center_chunk, far_chunk, full_pass, far_moved) = self.begin_stream(center, stager);
         // Each lane creates its own budget window, not shared: lanes run
         // sequentially, so a single frame-start snapshot would starve lanes
         // after the first.
@@ -1135,7 +1274,7 @@ impl World {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamTiles);
             // Update pyramid unit to track the current view distance.
             self.section_pyramid.unit = self.view.lod_unit();
-            self.update_lod_face(center_chunk);
+            self.update_lod_face(far_chunk);
             // Until the bake lands, selection uses the worst-case ladder;
             // mip only coarsens, no upward pops during bake.
             let mip_lane = self.lanes().mip;
@@ -1145,10 +1284,10 @@ impl World {
             // coarsening below already consults it).
             let overlay_lane = self.lanes().section_overlay;
             sched.run_manual(overlay_lane, self, None);
-            self.refresh_frontier(center_chunk);
-            if full_pass {
+            self.refresh_frontier(far_chunk);
+            if full_pass || far_moved {
                 self.unload_sections(
-                    center_chunk,
+                    far_chunk,
                     eng.as_deref_mut()
                         .expect("section unload on a boundary cross needs the engine"),
                 );
@@ -1161,7 +1300,7 @@ impl World {
             // The floor may be full of sections this frontier no longer draws.
             // Unload runs only on a boundary cross, so a still camera never
             // drops them and admission stays refused.
-            self.reclaim_blocked_sections(center_chunk, eng.as_deref_mut());
+            self.reclaim_blocked_sections(far_chunk, eng.as_deref_mut());
             let section_lane = self.lanes().section_admit;
             sched.run_manual(section_lane, self, None);
             // Section visible-set lane: re-resolve the covering only when an
@@ -1191,27 +1330,27 @@ impl World {
         self.debug_assert_liveness();
     }
 
-    /// The prologue of [`stream`](Self::stream): the eye's storage cell, velocity and pacing, the
-    /// chart net and up face, the worklist rings, and the worker view. Returns the centre chunk
-    /// and whether this is a full pass (centre, up face or chart net moved).
+    /// The prologue of [`stream`](Self::stream): the near and far eyes, velocity and pacing, the
+    /// chart net and up face, the worklist rings, and the worker view. Returns the centre chunk,
+    /// the far field's centre chunk, whether this is a full pass (centre, up face or chart net
+    /// moved) and whether the far centre moved.
     pub(in crate::world) fn begin_stream(
         &mut self,
         center: DVec3,
         stager: Option<voxel_engine::MeshStager>,
-    ) -> (Coord, bool) {
-        // On a round world streaming stands in the chart's storage cells.
-        let center = self.stream_eye(center);
-        // Capture eye altitude; section metric measures dy from it.
-        self.section_eye_y = center.y;
+    ) -> (Coord, Coord, bool, bool) {
+        // On a round world streaming stands in the chart's storage cells, and the far field on the
+        // chart under the eye (also above the near window's reach).
+        let (center, far) = self.place_eyes(center);
         // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
         // or teleport-sized gaps, so prediction never fires on garbage input.
         let now = crate::sched::now();
         let (section_vel, pacing_vel, sample_dt) = match self.section_eye_prev {
             Some((prev, t)) => {
                 let dt = now.duration_since(t).as_secs_f64();
-                let v = (center - prev) / dt;
+                let v = (far - prev) / dt;
                 let sane =
-                    center.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_SAMPLE_GAP && v.is_finite();
+                    far.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_SAMPLE_GAP && v.is_finite();
                 if sane {
                     // Prediction treats >512 m/s as a discontinuity, but the
                     // pacer still sees that finite motion. Sustained extreme
@@ -1244,13 +1383,10 @@ impl World {
         self.stream_pacer.set_boost(queued_near, self.last_stream_secs);
         self.last_stream_secs = sample_dt;
         self.light_admitted_last = 0;
-        self.section_eye_prev = center.is_finite().then_some((center, now));
-        let s = CHUNK_SIZE as i32;
-        let center_chunk = ChunkCoord::new(
-            block_coord(center.x).div_euclid(s),
-            block_coord(center.y).div_euclid(s),
-            block_coord(center.z).div_euclid(s),
-        );
+        self.section_eye_prev = far.is_finite().then_some((far, now));
+        let center_chunk = eye_chunk(center);
+        let far_chunk = eye_chunk(far);
+        let far_moved = self.set_far_center(far_chunk);
         // Update centre before draining: old centre may be a sentinel, so draining
         // against it would discard all results and regenerate them immediately.
         // An up-face change is the same kind of pass: the box changed shape.
@@ -1285,10 +1421,11 @@ impl World {
         // Publish the live view to the worker pool: queued jobs re-key toward
         // the player's CURRENT position on every view change, and entries left
         // behind by fast movement — far sections included — are descheduled
-        // instead of run. The far horizon is the outer ladder radius plus the
+        // instead of run. The far horizon covers the whole frontier plus the
         // velocity lookahead, so prediction-desired sections survive it.
         let speed3 = self.section_vel.x.hypot(self.section_vel.y).hypot(self.section_vel.z);
-        let far_m = f64::from(self.section_pyramid.outer_m()) + speed3 * TAU_STREAM;
+        let far_m = self.far_horizon() + speed3 * TAU_STREAM;
+        let far_view = self.far_view(far_chunk);
         // Configure the pool before any lane can submit this frame. On the
         // first stream this avoids one permissive/full-capacity burst from a
         // lazily spawned pool before the pacer catches it on the next pass.
@@ -1304,6 +1441,7 @@ impl World {
             center_chunk.x,
             center_chunk.y,
             center_chunk.z,
+            far_view,
             view_radius,
             far_m,
             velocity.x,
@@ -1329,7 +1467,7 @@ impl World {
                 self.shift_lod_clip(prev_center, center_chunk);
             }
         }
-        (center_chunk, full_pass)
+        (center_chunk, far_chunk, full_pass, far_moved)
     }
 
     /// The engine-free rest of a full pass, after [`unload_far`](Self::unload_far).
@@ -1374,14 +1512,14 @@ impl World {
                 (b, f as u8, cu, cv)
             }
             // A chart has no cube face. The storage centre still has to invalidate the frontier.
-            None if !self.fold.is_identity() => (u16::MAX, u8::MAX, center.x, center.z),
+            None if self.section_on_chart(center) => (u16::MAX, u8::MAX, center.x, center.z),
             None => (u16::MAX, u8::MAX, 0, 0),
         };
         // A chart reads whole blocks (`storage_eye_block`), so its key is exact on them: an
         // eye that moves within one block keeps the frontier. A cube face reads the exact eye;
         // its velocity is quantised to 0.25 m/s so a continuously changing flight velocity does
         // not recompute the frontier every pass.
-        let (eye_y, velocity) = if self.on_chart(center) {
+        let (eye_y, velocity) = if self.section_on_chart(center) {
             let d = chart_delta(self.section_vel);
             let y = self.section_eye_y;
             (y.round().to_bits(), [d.x.to_bits(), (y + d.y).round().to_bits(), d.z.to_bits()])
@@ -1398,7 +1536,7 @@ impl World {
             velocity,
             vertical: self.view.vertical,
             up: self.live_up(),
-            unit: self.section_pyramid.unit.to_bits(),
+            unit: self.far_pyramid().unit.to_bits(),
             finest: self.section_pyramid.finest.0,
             levels: self.section_pyramid.levels.get(),
             step: self.section_pyramid.step(),
@@ -2214,15 +2352,15 @@ impl World {
     /// once every chunk of the box has loaded. Teleports and net snaps use
     /// the same request (physics freezes until it lands).
     pub fn prepare_around(&mut self, pos: DVec3) {
-        let pos = self.stream_eye(pos);
-        let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
+        let (near, far) = self.place_eyes(pos);
+        let (c, f) = (eye_chunk(near), eye_chunk(far));
         self.adopt_fold(c);
         let up = self.slab_up(c);
         let slab = Self::collision_slab(c, up);
-        let far_m = f64::from(self.section_pyramid.outer_m());
+        let (far_m, far_view) = (self.far_horizon(), self.far_view(f));
         let view_r = self.view.horizontal;
         self.worker_pool()
-            .set_view(c.x, c.y, c.z, view_r, far_m, 0.0, 0.0, 0.0, up);
+            .set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up);
         self.submit_slab_columns(slab);
         self.pending_gen.set();
         if self.view_coords(slab).all(|coord| self.chunks.contains_key(&coord)) {
@@ -2235,8 +2373,7 @@ impl World {
     /// Synchronously generate the collision slab. Headless callers (tests,
     /// anything that queries voxels before a stream pass).
     pub fn ensure_around(&mut self, pos: DVec3) {
-        let pos = self.stream_eye(pos);
-        let c = Self::chunk_of(block_coord(pos.x), block_coord(pos.y), block_coord(pos.z));
+        let c = eye_chunk(self.stream_eye(pos));
         self.adopt_fold(c);
         let coords: Vec<Coord> = self.view_coords(Self::collision_slab(c, self.slab_up(c))).collect();
         for coord in coords {
@@ -3326,14 +3463,10 @@ impl World {
         quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo))
     }
 
-    /// The streaming centre stands in a chart's storage: its frontier is [`chart_sections`].
-    fn on_chart(&self, center: Coord) -> bool {
-        !self.fold.is_identity() && !self.lod_place(center).2
-    }
-
-    /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`.
+    /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`, on the
+    /// altitude-scaled unit.
     fn chart_pyramid(&self, radius: i64) -> Option<(pyramid::PyramidCfg, i8)> {
-        let src = &self.section_pyramid;
+        let src = self.far_pyramid();
         let mut levels = 0u8;
         let mut max_d = src.finest.0;
         for ring in 0..src.levels.get() {
@@ -3374,17 +3507,20 @@ impl World {
         }
         let rel = (ey as f64 - ground as f64).clamp(0.0, 1.0e7);
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
-        let near = self.near_block_box(center);
         let (y0, y1) = self.near_y_range(center);
+        let near = self.chart_near(center, body, y0);
         let mut tagged =
             self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, y0, y1, None, memo);
-        // The neighbour is visible out to the pyramid edge, not merely the two finest sections.
-        let band = cfg.outer_m() as i64;
+        // The neighbour is visible as far as the coarsest ring's square reaches, not merely the
+        // two finest sections. Its rings run on from the eye unfolded beyond its edge.
+        let span = super::section::section_span(crate::ident::Detail(max_d)) as f64;
+        let band = (ring_reach(f64::from(cfg.outer_m()), span) * span) as i64;
         for across in self.seams.seam_across(*seat, [ex, ey, ez], band) {
+            let (ix, iz) = across.storage_xz(ex, ez);
             tagged.extend(self.seat_sections(
                 &across.seat,
-                across.eye_x as f64,
-                across.eye_z as f64,
+                ix as f64,
+                iz as f64,
                 rel,
                 body,
                 cfg,
@@ -3483,6 +3619,22 @@ impl World {
         i64::from(lo) - 1 >= y0 && i64::from(hi) - 1 < y1
     }
 
+    /// The full-res square the punch tests chart sections against. Empty when the near window
+    /// stands in physical space, or when its floor `y0` is above every surface of the square: it
+    /// draws no ground there, so splitting the far field around it would punch nothing.
+    fn chart_near(&self, center: Coord, body: u16, y0: i64) -> (i64, i64, i64, i64) {
+        const NONE: (i64, i64, i64, i64) = (0, 0, 0, 0);
+        if self.fold.is_identity() {
+            return NONE;
+        }
+        let near = self.near_block_box(center);
+        let span = i32::try_from((near.1 - near.0).max(near.3 - near.2)).unwrap_or(i32::MAX);
+        match self.generator.surface_bounds(body, Face::PosY, near.0 as i32, near.2 as i32, span) {
+            Some((_, hi)) if i64::from(hi) - 1 < y0 => NONE,
+            _ => near,
+        }
+    }
+
     /// Full-res vertical block range (`y1` exclusive) of the mesh box. Up is storage Y.
     fn near_y_range(&self, center: Coord) -> (i64, i64) {
         let cs = CHUNK_SIZE as i64;
@@ -3512,11 +3664,11 @@ impl World {
 
     /// Desired frontier: union of static eye and velocity-predicted eye position.
     /// Pulls sections ahead of player motion. At rest, velocity is zero so returns
-    /// static frontier bit-for-bit. Open space and a round body seen from outside select
-    /// nothing; a streaming centre in storage selects that chart's sections, reading chart
-    /// surfaces through `memo`.
+    /// static frontier bit-for-bit. Open space and a round body seen from past the far reach
+    /// select nothing; a far-field centre on a chart (in or above its box) selects that chart's
+    /// sections, reading chart surfaces through `memo`.
     fn desired_sections_with(&self, center: Coord, memo: &mut NearBounds) -> Vec<SectionPos> {
-        if self.on_chart(center) {
+        if self.section_on_chart(center) {
             return self.chart_sections(center, memo);
         }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
@@ -3557,8 +3709,7 @@ impl World {
     /// The cube face under the camera. `None` in a chart's storage, in open space, or over a round
     /// body. A streaming centre inside a warped cube still names that cube's face.
     fn dominant_lod_face(&self, center: Coord) -> Option<(u16, Face)> {
-        let (_, _, in_cube) = self.lod_place(center);
-        if !self.fold.is_identity() && !in_cube {
+        if self.section_on_chart(center) {
             return None;
         }
         let Some(cosmos) = self.generator.cosmos() else {
@@ -3660,7 +3811,7 @@ impl World {
     /// covering permanently behind the live frontier, drawing a couple of
     /// stale coarse cubes over an otherwise missing far field.
     pub(in crate::world) fn rebuild_section_visible(&mut self, eng: Option<&mut Engine>) {
-        let Some(center) = self.center else {
+        let Some(center) = self.section_center() else {
             return;
         };
         let desired = std::mem::take(&mut self.section_desired);
@@ -3790,13 +3941,14 @@ impl World {
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
-        let (metric_body, metric_face, metric) = if !self.fold.is_identity() {
+        let cfg = &self.far_pyramid();
+        let (metric_body, metric_face, metric) = if self.section_on_chart(center) {
             let body = self
                 .seams
                 .chart_seat(center)
                 .map(|s| super::section::CHART_BODY_BASE + s.index as u16)
                 .unwrap_or(u16::MAX);
-            (body, Face::PosY, self.chart_metric(center, DVec3::ZERO, &self.section_pyramid))
+            (body, Face::PosY, self.chart_metric(center, DVec3::ZERO, cfg))
         } else {
             let metric_face = self.section_lod_face.map(|(_, f)| f).unwrap_or(Face::PosY);
             let metric_body = self.section_lod_face.map(|(b, _)| b).unwrap_or(0);
@@ -3808,7 +3960,6 @@ impl World {
             );
             (metric_body, metric_face, metric)
         };
-        let cfg = &self.section_pyramid;
         let stale: Vec<SectionPos> = self
             .sections
             .keys()
@@ -4604,21 +4755,59 @@ impl World {
         self.textures_built = count;
     }
 
+    /// Start-world sites the far field is checked from high above the ground: the direction from
+    /// the centre and the heights. A face centre, a highland, a seam (77 km from the +X/+Y edge)
+    /// and a cube corner (46 km from both edges of the +X chart).
+    #[cfg(test)]
+    pub(in crate::world) const FAR_SITES: [(&'static str, DVec3, &'static [f64]); 4] = [
+        ("plus-y", DVec3::new(0.0, 1.0, 0.0), &[10_000.0, 50_000.0, 150_000.0]),
+        ("highland", DVec3::new(1.0, 0.9, 0.8), &[10_000.0, 50_000.0, 150_000.0]),
+        ("seam", DVec3::new(1.0, 0.995, 0.3), &[10_000.0, 50_000.0, 150_000.0]),
+        ("corner", DVec3::new(1.0, 0.997, 0.997), &[50_000.0]),
+    ];
+
+    /// A physical eye `above` blocks out along the local up (the radial) from the start world's
+    /// ground in direction `dir` from its centre.
+    #[cfg(test)]
+    pub(in crate::world) fn home_eye(&self, dir: DVec3, above: f64) -> DVec3 {
+        use crate::space::atlas::Patch;
+        use crate::space::chart::{self, Map};
+        let centre = self.generator.cosmos().expect("cosmos").home().centre_f();
+        let atlas = self
+            .generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - centre).length() < 1.0)
+            .expect("the start world is charted");
+        let dir = dir.normalize();
+        let face = Face::from_dominant(dir);
+        let (tu, nn, tv) = chart::basis(face);
+        let (xi, eta) = Map::Equiangular.inverse(DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv)));
+        let n = atlas.bands[0].n;
+        let step = 2.0 / n as f64;
+        let (i, j) = (((xi + 1.0) / step).floor() as i64, ((eta + 1.0) / step).floor() as i64);
+        assert!((0..n).contains(&i) && (0..n).contains(&j), "({i},{j}) leaves the {face:?} chart");
+        let patch = Patch::Shell { band: 0, face };
+        let (origin, _) = atlas.storage_box(patch);
+        let stored = atlas.storage(patch, [i, 0, j]);
+        let ground = self.generator.surface(Face::PosY, stored[0] as i32, stored[2] as i32);
+        assert_ne!(ground, i32::MIN, "{face:?} column has no surface");
+        let local_y = ground as f64 - origin[1] as f64;
+        let surf = atlas.embed(patch, DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
+        surf + (surf - atlas.centre).normalize() * above
+    }
+
     /// Headless settle: centre on `pos`, fill the mesh box with data, mark every
     /// in-view chunk as a final Air mesh, and drain worklists so
     /// [`entry_complete`](Self::entry_complete) holds without an Engine.
     #[cfg(test)]
     pub fn settle_around(&mut self, pos: DVec3) {
-        // Same eye as `stream`: a charted body stands in storage, so a later
+        // Same eyes as `stream`: a charted body stands in storage, so a later
         // quiet frame does not see a boundary cross and demand an engine.
-        let pos = self.stream_eye(pos);
-        let s = CHUNK_SIZE as i32;
-        let center = ChunkCoord::new(
-            block_coord(pos.x).div_euclid(s),
-            block_coord(pos.y).div_euclid(s),
-            block_coord(pos.z).div_euclid(s),
-        );
+        let (pos, far) = self.place_eyes(pos);
+        let center = eye_chunk(pos);
         self.center = Some(center);
+        self.set_far_center(eye_chunk(far));
         let _ = self.adopt_fold(center);
         for coord in self.mesh_box(center).coords() {
             self.ensure_data(coord);
@@ -4681,6 +4870,7 @@ mod flight_bench;
 mod tests {
     use super::super::StreamLane;
     use super::*;
+    use crate::coord::ChunkCoord;
 
     #[test]
     fn texture_growth_appends_only_new_layers_in_id_order() {
@@ -6378,7 +6568,7 @@ mod tests {
         world.adopt_fold(center);
         world.center = Some(center);
         world.update_lod_face(center);
-        assert!(world.on_chart(center), "spawn streams from a chart's storage");
+        assert!(world.section_on_chart(center), "spawn streams from a chart's storage");
         let y = eye.y.floor() + 0.25;
         let refresh = |world: &mut World, eye_y: f64, vel: DVec3| {
             world.section_eye_y = eye_y;
@@ -6398,6 +6588,94 @@ mod tests {
         assert!(refresh(&mut world, y + 1.0, DVec3::new(100.3, 0.0, 0.0)), "prediction starts");
         assert!(!refresh(&mut world, y + 1.0, DVec3::new(100.6, 0.0, -0.4)), "jitter in one chunk");
         assert!(refresh(&mut world, y + 1.0, DVec3::new(120.0, 0.0, 0.0)), "next chunk of lookahead");
+    }
+
+    fn empty_ready() -> SectionState {
+        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+    }
+
+    /// Desired sections with no Ready self or ancestor.
+    fn uncovered(world: &World) -> usize {
+        world.section_desired.iter().filter(|&&c| !world.section_covered(c)).count()
+    }
+
+    /// What the section passes landed: cancelled section jobs, those of them the frontier still
+    /// wanted, and failed jobs.
+    #[derive(Default)]
+    struct Landed {
+        cancels: usize,
+        wanted: usize,
+        fails: usize,
+    }
+
+    /// Land worker results and turn queued section uploads into empty Ready meshes. Returns whether
+    /// anything landed.
+    fn pump_sections(world: &mut World, landed: &mut Landed) -> bool {
+        let mut got = false;
+        while let Some(done) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) {
+            got = true;
+            match &done {
+                pipeline::Done::Cancelled(keys) => {
+                    landed.cancels += keys.len();
+                    landed.wanted += keys
+                        .iter()
+                        .filter(|k| matches!(k, pipeline::JobKey::Section { pos, .. } if world.section_desired.contains(pos)))
+                        .count();
+                }
+                pipeline::Done::Failed(_) => landed.fails += 1,
+                _ => {}
+            }
+            world.integrate_worker_result(done);
+        }
+        while let Some((pos, token, _, _)) = world.section_upload_queue.pop_front() {
+            if let Some(state @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
+                && matches!(state, SectionState::Meshing { token: t } if *t == token)
+            {
+                world.meshing_sections = world.meshing_sections.saturating_sub(1);
+                *state = empty_ready();
+            }
+        }
+        got
+    }
+
+    /// One pass of the section lanes around the far-field centre, in `stream`'s order: land,
+    /// reclaim, admit, then the visible rebuild that re-arms holes. Pending is not forced on from
+    /// outside.
+    fn section_pass(world: &mut World, landed: &mut Landed) {
+        let center = world.section_center().expect("a far-field centre");
+        let got = pump_sections(world, landed);
+        world.reclaim_blocked_sections(center, None);
+        super::super::admit::<SectionLane>(world, center, Budget::Millis(8.0));
+        if world.section_cover_dirty.take() || world.pending_sections.get() {
+            world.rebuild_section_visible(None);
+        }
+        if !got {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Run section passes until every desired section is covered and nothing is in flight.
+    /// Returns the passes taken.
+    fn drive_sections(world: &mut World, name: &str, deadline: Instant, landed: &mut Landed) -> usize {
+        let mut passes = 0usize;
+        loop {
+            let unc = uncovered(world);
+            let queued = world.workers.as_ref().map(pipeline::Workers::queue_depths).unwrap_or((0, 0)).1;
+            if unc == 0 && world.meshing_sections == 0 && world.section_upload_queue.is_empty() && queued == 0 {
+                assert_eq!(landed.fails, 0, "{name}: section jobs failed");
+                return passes;
+            }
+            passes += 1;
+            assert!(
+                Instant::now() < deadline && passes < 20_000,
+                "{name}: uncovered {unc} of {} after {passes} passes, cancels {} fails {} meshing {} queued {queued}",
+                world.section_desired.len(),
+                landed.cancels,
+                landed.fails,
+                world.meshing_sections
+            );
+            section_pass(world, landed);
+        }
     }
 
     /// The chart cap, once the near field has filled the CPU-cull knob, keeps the
@@ -6452,68 +6730,7 @@ mod tests {
         sites.push(("corner".into(), storage_from_dir(&world, DVec3::new(1.0, 0.985, 0.97), 0.0)));
         sites.push(("face".into(), storage_from_dir(&world, DVec3::new(0.0, 1.0, 0.0), 0.0)));
 
-        let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
-        let uncovered = |world: &World| -> usize {
-            world.section_desired.iter().filter(|&&c| !world.section_covered(c)).count()
-        };
-        let pump = |world: &mut World| -> (usize, usize, bool) {
-            let mut cancels = 0usize;
-            let mut fails = 0usize;
-            let mut got = false;
-            while let Some(done) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) {
-                got = true;
-                match &done {
-                    pipeline::Done::Cancelled(keys) => cancels += keys.len(),
-                    pipeline::Done::Failed(_) => fails += 1,
-                    _ => {}
-                }
-                world.integrate_worker_result(done);
-            }
-            while let Some((pos, token, _, _)) = world.section_upload_queue.pop_front() {
-                if let Some(state @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
-                    && matches!(state, SectionState::Meshing { token: t } if *t == token)
-                {
-                    world.meshing_sections = world.meshing_sections.saturating_sub(1);
-                    *state = empty_ready();
-                }
-            }
-            (cancels, fails, got)
-        };
         let deadline = Instant::now() + Duration::from_secs(90);
-        let drive = |world: &mut World, center: Coord, name: &str| {
-            let mut cancels = 0usize;
-            let mut fails = 0usize;
-            let mut passes = 0usize;
-            loop {
-                let (c, f, got) = pump(world);
-                cancels += c;
-                fails += f;
-                // Same order as `stream`: reclaim, admit, then the visible rebuild
-                // that re-arms holes. Pending is not forced on from outside.
-                world.reclaim_blocked_sections(center, None);
-                let unc = uncovered(world);
-                let queued = world.workers.as_ref().map(pipeline::Workers::queue_depths).unwrap_or((0, 0)).1;
-                if unc == 0 && world.meshing_sections == 0 && world.section_upload_queue.is_empty() && queued == 0 {
-                    assert_eq!(fails, 0, "{name}: section jobs failed");
-                    return;
-                }
-                passes += 1;
-                assert!(
-                    Instant::now() < deadline && passes < 20_000,
-                    "{name}: uncovered {unc} of {} after {passes} passes, cancels {cancels} fails {fails} meshing {} queued {queued}",
-                    world.section_desired.len(),
-                    world.meshing_sections
-                );
-                super::super::admit::<SectionLane>(world, center, Budget::Millis(8.0));
-                if world.section_cover_dirty.take() || world.pending_sections.get() {
-                    world.rebuild_section_visible(None);
-                }
-                if !got {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
-        };
-
         for (name, storage) in sites {
             let center = Coord::new(
                 (storage.x / 16.0).floor() as i32,
@@ -6534,10 +6751,10 @@ mod tests {
             let tight = world.desired_sections(center);
             let far_m = f64::from(world.section_pyramid.outer_m());
             let radius = world.view.horizontal;
-            let fold = world.fold;
+            let (fold, far_view) = (world.fold, world.far_view(center));
             {
                 let workers = world.worker_pool();
-                workers.set_view(center.x, center.y, center.z, radius, far_m, 0.0, 0.0, 0.0, Some(Face::PosY));
+                workers.set_view(center.x, center.y, center.z, far_view, radius, far_m, 0.0, 0.0, 0.0, Some(Face::PosY));
                 workers.set_fold(fold);
             }
             // Cold start: the bench once the near field has already taken the
@@ -6546,7 +6763,7 @@ mod tests {
                 world.section_desired = tight.clone();
                 world.pending_sections.set();
                 world.section_cover_dirty.set();
-                drive(&mut world, center, "symptom cold");
+                drive_sections(&mut world, "symptom cold", deadline, &mut Landed::default());
                 assert_eq!(uncovered(&world), 0, "symptom cold start left sections uncovered");
                 world.sections.clear();
                 world.meshing_sections = 0;
@@ -6565,13 +6782,168 @@ mod tests {
             world.pending_sections.set();
             world.section_cover_dirty.set();
             let planted = uncovered(&world);
-            drive(&mut world, center, &name);
+            drive_sections(&mut world, &name, deadline, &mut Landed::default());
             assert_eq!(
                 uncovered(&world),
                 0,
                 "{name}: planted {planted} uncovered sections of {} and the floor never cleared",
                 world.section_desired.len()
             );
+        }
+    }
+
+    /// The far field's thresholds hold while hovering. The chart rings' scale rises with the height
+    /// over the ground and falls back only well below where it rose; the chart under the eye is kept
+    /// past the far reach once the far field stands on it; and just below the near window's reach
+    /// the far field is the frontier it stays just above it.
+    #[test]
+    fn far_eye_thresholds_hold() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let up = DVec3::new(0.0, 1.0, 0.0);
+        let climb = |world: &mut World, above: f64| {
+            world.place_eyes(world.home_eye(up, above));
+            (world.far_scale, world.far_atlas.is_some())
+        };
+        // Default ladder: the rings reach 12,288 blocks, so a doubling is taken past 4,096 · 2^s of
+        // height and dropped below 4,096 · 2^s / 1.25.
+        let path = [
+            (0.0, 0, "ground"),
+            (4_600.0, 1, "past the first step"),
+            (3_700.0, 1, "held below the first step"),
+            (2_800.0, 0, "dropped well below it"),
+            (9_000.0, 2, "past the second step"),
+            (7_200.0, 2, "held below the second step"),
+            (6_000.0, 1, "dropped one step"),
+            (20_000.0, 3, "at the candidate cap"),
+            (200_000.0, 3, "held at the cap"),
+        ];
+        for (above, scale, what) in path {
+            assert_eq!(climb(&mut world, above), (scale, true), "+{above}: {what}");
+        }
+        // Past the far reach (262,144 above the stored top, ~2,000 over the ground): kept once
+        // stood on, left past the hold, and not taken again until back under the reach.
+        assert!(climb(&mut world, 280_000.0).1, "held past the far reach");
+        assert!(!climb(&mut world, 340_000.0).1, "left past the hold");
+        assert!(!climb(&mut world, 280_000.0).1, "not re-taken above the reach");
+        assert!(climb(&mut world, 250_000.0).1, "re-taken under the reach");
+
+        // The highest eye the near window still streams on the chart, and the far field there with
+        // the near window on the chart and in physical space.
+        let mut above = 1_000.0;
+        while world.chart_eye(world.home_eye(up, above + 16.0)).is_some() {
+            above += 16.0;
+        }
+        let eye = world.home_eye(up, above);
+        let (near, far) = world.place_eyes(eye);
+        assert_eq!(near, far, "the near window stands on the chart at +{above}");
+        let far_c = eye_chunk(far);
+        world.adopt_fold(far_c);
+        let on_chart = world.desired_sections(far_c);
+        world.adopt_fold(eye_chunk(eye));
+        assert!(world.fold.is_identity());
+        assert!(!on_chart.is_empty(), "+{above}: no chart sections");
+        assert_eq!(world.desired_sections(far_c), on_chart, "+{above}: the far field changes at the near window's reach");
+    }
+
+    /// Stand the eye `above` blocks over the start world in direction `dir`, the way `stream`
+    /// places it: the near window back in physical space, the far field on the chart under it,
+    /// and no sections resident.
+    fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) {
+        let (near, far) = world.place_eyes(world.home_eye(dir, above));
+        let near_c = eye_chunk(near);
+        world.sections.clear();
+        world.center = Some(near_c);
+        world.set_far_center(eye_chunk(far));
+        world.stream_up = world.resolve_stream_up(near_c);
+        world.stream_up_set = true;
+        world.adopt_fold(near_c);
+        assert!(world.fold.is_identity(), "{name}: the near window is not in physical space");
+        assert!(!world.far_fold.is_identity(), "{name}: the far field does not stand on a chart");
+        publish_far(world);
+        assert!(!world.section_desired.is_empty(), "{name}: no chart sections");
+    }
+
+    /// Select the far frontier around the far centre and publish the view to the worker gate, as
+    /// `stream` does after the far centre moves.
+    fn publish_far(world: &mut World) {
+        let (near_c, far_c) = (world.center.expect("a centre"), world.section_center().expect("a far centre"));
+        world.section_desired = world.desired_sections(far_c);
+        let (far_m, radius, up) = (world.far_horizon(), world.view.horizontal, world.stream_up);
+        let (fold, far_view) = (world.fold, world.far_view(far_c));
+        let workers = world.worker_pool();
+        workers.set_view(near_c.x, near_c.y, near_c.z, far_view, radius, far_m, 0.0, 0.0, 0.0, up);
+        workers.set_fold(fold);
+        world.pending_sections.set();
+        world.section_cover_dirty.set();
+    }
+
+    /// From high above the start world (the near window back in physical space, the worker gate
+    /// measuring far work from the far centre, in the far field's chart net) every desired section
+    /// lands, also across a seam and at a cube corner: readiness reaches an empty uncovered count in
+    /// bounded passes, and the gate never deschedules a section the frontier wants.
+    #[test]
+    fn far_chart_altitude_readiness_converges() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let deadline = Instant::now() + Duration::from_secs(240);
+        for (site, dir, heights) in World::FAR_SITES {
+            for &above in heights {
+                let name = &format!("{site} +{above}");
+                hover(&mut world, dir, above, name);
+                let mut landed = Landed::default();
+                let passes = drive_sections(&mut world, name, deadline, &mut landed);
+                println!(
+                    "{name}: {} sections ready in {passes} passes, {} cancelled",
+                    world.section_desired.len(),
+                    landed.cancels
+                );
+                assert_eq!(uncovered(&world), 0, "{name}: sections left uncovered");
+                assert_eq!(landed.wanted, 0, "{name}: the gate descheduled wanted sections");
+            }
+        }
+    }
+
+    /// The far centre moving while the frontier fills, 50 km over every far site: one chunk every
+    /// few passes, re-publishing the view each time as `stream` does, and stopping well before the
+    /// frontier has landed. Every view change re-measures the queued far work, so a horizon short
+    /// of the coarsest ring's corners, or a neighbour chart measured a face box away, would
+    /// deschedule wanted sections on every crossing. None is, and once the centre stops every
+    /// desired section lands.
+    #[test]
+    fn far_chart_altitude_readiness_converges_while_moving() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+
+        const MOVES: usize = 48;
+        const PASSES_PER_MOVE: usize = 12;
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let above = 50_000.0;
+        for (site, dir, _) in World::FAR_SITES {
+            let name = &format!("{site} +{above} moving");
+            hover(&mut world, dir, above, name);
+            let mut landed = Landed::default();
+            for _ in 0..MOVES {
+                let c = world.section_center().expect("a far centre");
+                world.set_far_center(Coord::new(c.x + 1, c.y, c.z));
+                publish_far(&mut world);
+                for _ in 0..PASSES_PER_MOVE {
+                    section_pass(&mut world, &mut landed);
+                }
+            }
+            let moving = landed.cancels;
+            let passes = drive_sections(&mut world, name, deadline, &mut landed);
+            println!(
+                "{name}: {} sections ready {passes} passes after stopping, {moving} cancelled while moving",
+                world.section_desired.len()
+            );
+            assert_eq!(landed.wanted, 0, "{name}: the gate descheduled wanted sections");
+            assert_eq!(uncovered(&world), 0, "{name}: sections left uncovered");
         }
     }
 }

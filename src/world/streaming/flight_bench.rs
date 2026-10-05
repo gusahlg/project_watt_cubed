@@ -113,7 +113,7 @@ fn fake_drain(w: &mut World) {
 /// One `stream` frame at `eye`. Returns whether it was a full pass.
 fn frame(w: &mut World, eye: DVec3, laps: &mut Laps) -> bool {
     laps.at = Instant::now();
-    let (center, full_pass) = w.begin_stream(eye, None);
+    let (center, far, full_pass, far_moved) = w.begin_stream(eye, None);
     laps.in_full = full_pass;
     laps.lap(0);
     if w.anything_in_flight() {
@@ -142,21 +142,21 @@ fn frame(w: &mut World, eye: DVec3, laps: &mut Laps) -> bool {
     laps.lap(6);
     if w.lod2 {
         w.section_pyramid.unit = w.view.lod_unit();
-        w.update_lod_face(center);
+        w.update_lod_face(far);
         w.poll_mip();
         w.ensure_mip_bake();
         w.refresh_section_overlay(Budget::Millis(1.0));
         laps.lap(7);
-        w.refresh_frontier(center);
+        w.refresh_frontier(far);
         laps.lap(8);
-        if full_pass {
-            w.unload_sections_with(center, |_| {});
+        if full_pass || far_moved {
+            w.unload_sections_with(far, |_| {});
             w.pending_sections.set();
         }
         laps.lap(9);
-        w.reclaim_blocked_sections(center, None);
+        w.reclaim_blocked_sections(far, None);
         laps.lap(10);
-        admit::<SectionLane>(w, center, Budget::Millis(1.0));
+        admit::<SectionLane>(w, far, Budget::Millis(1.0));
         laps.lap(11);
         if w.section_cover_dirty.take() || w.pending_sections.get() {
             w.rebuild_section_visible(None);

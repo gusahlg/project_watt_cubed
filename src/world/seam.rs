@@ -284,6 +284,16 @@ struct SideMap {
     cols: [[i32; 3]; 3],
 }
 
+impl SideMap {
+    /// The virtual chunk beyond the side standing for real chunk `k` of the neighbour. The inverse
+    /// of a rotation is its transpose.
+    #[inline]
+    fn to_virtual(&self, k: [i32; 3]) -> [i32; 3] {
+        let d = [k[0] - self.real[0], k[1] - self.real[1], k[2] - self.real[2]];
+        std::array::from_fn(|a| self.virt[a] + (0..3).map(|b| self.cols[a][b] * d[b]).sum::<i32>())
+    }
+}
+
 #[inline]
 fn inside(k: [i32; 3], lo: [i32; 3], hi: [i32; 3]) -> bool {
     (0..3).all(|a| k[a] >= lo[a] && k[a] < hi[a])
@@ -323,10 +333,7 @@ impl Unfold {
         }
         for s in self.sides.iter().flatten() {
             if inside(k, s.lo, s.hi) {
-                // The inverse of a rotation is its transpose.
-                let d = [k[0] - s.real[0], k[1] - s.real[1], k[2] - s.real[2]];
-                let v: [i32; 3] =
-                    std::array::from_fn(|a| s.virt[a] + (0..3).map(|b| s.cols[a][b] * d[b]).sum::<i32>());
+                let v = s.to_virtual(k);
                 return Coord::new(v[0], v[1], v[2]);
             }
         }
@@ -334,6 +341,23 @@ impl Unfold {
             return Coord::new(i32::MIN / 4, i32::MIN / 4, i32::MIN / 4);
         }
         c
+    }
+
+    /// [`fold`](Self::fold) for storage block column `(x, z)`, which the far field's sections are:
+    /// home columns are themselves, a neighbour chart's the centre of the virtual chunk column
+    /// beyond its side, physical columns themselves, and `None` for storage outside the net.
+    pub fn fold_column(&self, x: i64, z: i64) -> Option<(i64, i64)> {
+        let Some((lo, hi)) = self.home else { return Some((x, z)) };
+        let (cx, cz) = (x.div_euclid(CS) as i32, z.div_euclid(CS) as i32);
+        let column = |lo: [i32; 3], hi: [i32; 3]| cx >= lo[0] && cx < hi[0] && cz >= lo[2] && cz < hi[2];
+        if column(lo, hi) {
+            return Some((x, z));
+        }
+        if let Some(s) = self.sides.iter().flatten().find(|s| column(s.lo, s.hi)) {
+            let v = s.to_virtual([cx, s.lo[1], cz]);
+            return Some((i64::from(v[0]) * CS + CS / 2, i64::from(v[2]) * CS + CS / 2));
+        }
+        (cx < self.storage_cx0).then_some((x, z))
     }
 
     /// The real chunk standing for virtual chunk `v` of a view box: `v` in the home chart (and
@@ -374,11 +398,7 @@ impl Unfold {
 impl Seams {
     /// The unfolding around streaming centre `centre` (a storage chunk inside a box, or above one).
     pub fn unfold_at(&self, centre: Coord) -> Unfold {
-        if centre.x < self.min_cx {
-            return Unfold::IDENTITY;
-        }
-        let column = |r: &&Region| centre.x >= r.lo[0] && centre.x < r.hi[0] && centre.z >= r.lo[2] && centre.z < r.hi[2];
-        let Some(r) = self.region_of(centre).or_else(|| self.regions.iter().find(column)) else {
+        let Some(r) = self.column_of(centre) else {
             return Unfold::IDENTITY;
         };
         let mut u = Unfold { home: Some((r.lo, r.hi)), sides: [None; 4], storage_cx0: self.min_cx };
@@ -413,34 +433,54 @@ impl Seams {
                 let (o, _) = a.storage_box(patch);
                 return Some(l + glam::DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64));
             }
-            let Some(b) = a.bands.first() else { continue };
-            let rel = p - a.centre;
-            let r = rel.length();
-            let b = *b;
-            // How far above the top (outward charts: beyond r_hi; inward ones: inside r_lo), on the
-            // unlifted grid; the top's physical point along `p`'s ray carries its column's lift.
-            let ru = a.unlifted_radius(p);
-            let (top, above) = if a.inward { (b.r_lo as f64 + 0.5, b.r_lo as f64 + 0.5 - ru) } else { (b.r_hi as f64 - 0.5, ru - (b.r_hi as f64 - 0.5)) };
-            if !(above > 0.0 && above < reach) || r == 0.0 {
+            let Some((above, top)) = over_top(a, p) else { continue };
+            if above >= reach {
                 continue;
             }
-            if let Some((patch, l)) = a.find(a.centre + rel * ((top + (r - ru)) / r)) {
-                let (o, _) = a.storage_box(patch);
-                return Some(glam::DVec3::new(l.x + o[0] as f64, l.y + o[1] as f64 + above, l.z + o[2] as f64));
+            if let Some(s) = lifted(a, top, above) {
+                return Some(s);
             }
         }
         None
     }
 
-    /// The band-0 shell under a storage streaming centre (including flight just above its box).
-    /// Deeper bands and the core select nothing: the player is inside the body.
-    pub(in crate::world) fn chart_seat(&self, centre: Coord) -> Option<ChartSeat> {
+    /// Where the far field should stand for a physical eye at `p` above a round world: the chart
+    /// column straight under it, lifted by its height above the stored top, on the nearest top
+    /// within `reach` blocks. The `held` atlas counts `hold` times nearer than it is: it is kept
+    /// past the reach, and until another top is that much closer. `None` when no top is close
+    /// enough.
+    pub fn far_eye(&self, p: glam::DVec3, reach: f64, held: Option<usize>, hold: f64) -> Option<glam::DVec3> {
+        let mut best: Option<(f64, f64, usize, glam::DVec3)> = None;
+        for (i, a) in self.atlases.iter().enumerate() {
+            let Some((above, top)) = over_top(a, p) else { continue };
+            let rank = if held == Some(i) { above / hold } else { above };
+            if rank < reach && best.is_none_or(|(b, ..)| rank < b) {
+                best = Some((rank, above, i, top));
+            }
+        }
+        let (_, above, i, top) = best?;
+        lifted(&self.atlases[i], top, above)
+    }
+
+    /// The box `centre` is in, else the box whose column it stands in (above its top or below its
+    /// bottom). `None` in physical space.
+    fn column_of(&self, centre: Coord) -> Option<&Region> {
         if centre.x < self.min_cx {
             return None;
         }
         let column = |r: &&Region| centre.x >= r.lo[0] && centre.x < r.hi[0] && centre.z >= r.lo[2] && centre.z < r.hi[2];
-        let r = self.region_of(centre).or_else(|| self.regions.iter().find(column))?;
-        self.seat_of(r)
+        self.region_of(centre).or_else(|| self.regions.iter().find(column))
+    }
+
+    /// Whether `centre` is a storage chunk in a box or in the column of one.
+    pub(in crate::world) fn in_column(&self, centre: Coord) -> bool {
+        self.column_of(centre).is_some()
+    }
+
+    /// The band-0 shell under a storage streaming centre (including flight just above its box).
+    /// Deeper bands and the core select nothing: the player is inside the body.
+    pub(in crate::world) fn chart_seat(&self, centre: Coord) -> Option<ChartSeat> {
+        self.seat_of(self.column_of(centre)?)
     }
 
     fn seat_of(&self, r: &Region) -> Option<ChartSeat> {
@@ -515,16 +555,10 @@ impl Seams {
                 continue;
             }
             let Some(tan_n) = unit_step(delta, home_step) else { continue };
-            let image = [g[0] + inward[0] * steps, g[1] + inward[1] * steps, g[2] + inward[2] * steps];
-            if image[0] < nlo[0] || image[0] >= nhi[0] || image[2] < nlo[2] || image[2] >= nhi[2] {
-                continue;
-            }
             let mut tan_h = [0i64; 3];
             tan_h[tan] = 1;
             out.push(SeamAcross {
                 seat: ChartSeat { index: home.index, patch: npatch, lo: nlo, hi: nhi, radius: home.radius },
-                eye_x: image[0],
-                eye_z: image[2],
                 g,
                 inward,
                 tan_n,
@@ -535,6 +569,25 @@ impl Seams {
         }
         out
     }
+}
+
+/// How far `p` is above `a`'s stored top (outward charts: beyond `r_hi`; inward ones: inside
+/// `r_lo`), on the unlifted grid, and the top's physical point along `p`'s ray, which carries its
+/// column's lift. `None` at or below the top.
+fn over_top(a: &Atlas, p: glam::DVec3) -> Option<(f64, glam::DVec3)> {
+    let b = *a.bands.first()?;
+    let rel = p - a.centre;
+    let r = rel.length();
+    let ru = a.unlifted_radius(p);
+    let (top, above) = if a.inward { (b.r_lo as f64 + 0.5, b.r_lo as f64 + 0.5 - ru) } else { (b.r_hi as f64 - 0.5, ru - (b.r_hi as f64 - 0.5)) };
+    (above > 0.0 && r != 0.0).then(|| (above, a.centre + rel * ((top + (r - ru)) / r)))
+}
+
+/// The storage point `above` blocks over the top at physical point `top`.
+fn lifted(a: &Atlas, top: glam::DVec3, above: f64) -> Option<glam::DVec3> {
+    let (patch, l) = a.find(top)?;
+    let (o, _) = a.storage_box(patch);
+    Some(glam::DVec3::new(l.x + o[0] as f64, l.y + o[1] as f64 + above, l.z + o[2] as f64))
 }
 
 /// A band-0 shell chart: atlas index, patch, storage box (`hi` exclusive) and datum radius.
@@ -551,9 +604,6 @@ pub(in crate::world) struct ChartSeat {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::world) struct SeamAcross {
     pub seat: ChartSeat,
-    /// The eye's image in the neighbour's storage, `(x, z)`.
-    pub eye_x: i64,
-    pub eye_z: i64,
     g: [i64; 3],
     inward: [i64; 3],
     tan_n: [i64; 3],

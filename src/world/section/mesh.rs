@@ -1676,50 +1676,22 @@ mod tests {
         ring_floor(pos, terra) * pos.cell_size()
     }
 
-    /// Storage column of a direction from the start world's centre, the embedded surface, and the
-    /// same point moved `above` blocks out along the local up (the radial). The eye is the one
+    /// Storage centre chunk and eye of a direction from the start world's centre, moved `above`
+    /// blocks out along the local up. The eye is the one
     /// [`crate::world::World::chart_eye`] would stream.
     fn home_altitude_eye(
         world: &crate::world::World,
         dir: voxel_engine::DVec3,
         above: f64,
-    ) -> (crate::coord::ChunkCoord, voxel_engine::DVec3, i32) {
-        use crate::space::atlas::Patch;
-        use crate::space::chart::{self, Map};
-        let centre = world.terrain().cosmos().expect("cosmos").home().centre_f();
-        let atlas = world
-            .terrain()
-            .atlases()
-            .iter()
-            .find(|a| (a.centre - centre).length() < 1.0)
-            .expect("the start world is charted")
-            .clone();
-        let dir = dir.normalize();
-        let face = Face::from_dominant(dir);
-        let (tu, nn, tv) = chart::basis(face);
-        let (xi, eta) = Map::Equiangular.inverse(voxel_engine::DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv)));
-        let n = atlas.bands[0].n;
-        let step = 2.0 / n as f64;
-        let (i, j) = (((xi + 1.0) / step).floor() as i64, ((eta + 1.0) / step).floor() as i64);
-        assert!((0..n).contains(&i) && (0..n).contains(&j), "({i},{j}) leaves the {face:?} chart");
-        let patch = Patch::Shell { band: 0, face };
-        let (origin, _) = atlas.storage_box(patch);
-        let stored = atlas.storage(patch, [i, 0, j]);
-        let (sx, sz) = (stored[0] as i32, stored[2] as i32);
-        let ground = world.terrain().surface(Face::PosY, sx, sz);
-        assert_ne!(ground, i32::MIN, "{face:?} column has no surface");
-        let local_y = ground as f64 - origin[1] as f64;
-        let surf = atlas.embed(patch, voxel_engine::DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
-        let up = (surf - atlas.centre).normalize();
-        let eye = surf + up * above;
-        let storage = world.chart_eye(eye).unwrap_or_else(|| panic!("no chart eye at +{above} on {face:?}"));
-        let cs = 16.0;
-        let centre_chunk = crate::coord::ChunkCoord::new(
-            (storage.x / cs).floor() as i32,
-            (storage.y / cs).floor() as i32,
-            (storage.z / cs).floor() as i32,
-        );
-        (centre_chunk, storage, ground)
+    ) -> (crate::coord::ChunkCoord, voxel_engine::DVec3) {
+        let storage = world
+            .chart_eye(world.home_eye(dir, above))
+            .unwrap_or_else(|| panic!("no chart eye at +{above} on {dir:?}"));
+        (storage_chunk(storage), storage)
+    }
+
+    fn storage_chunk(p: voxel_engine::DVec3) -> crate::coord::ChunkCoord {
+        crate::coord::ChunkCoord::new((p.x / 16.0).floor() as i32, (p.y / 16.0).floor() as i32, (p.z / 16.0).floor() as i32)
     }
 
     /// Drawn-tile bare columns, vertical seam gaps, and the near-box samples under the eye.
@@ -1735,6 +1707,7 @@ mod tests {
         sections: usize,
         covered: bool,
         hash: u32,
+        tiles: Vec<Tile>,
     }
 
     fn frontier_counts(world: &mut crate::world::World, center: crate::coord::ChunkCoord) -> ChartFrontier {
@@ -1855,7 +1828,72 @@ mod tests {
             sections: desired.len(),
             covered,
             hash,
+            tiles,
         }
+    }
+
+    /// Distance from far-field centre `center`'s column to the nearest ground sample (every `step`
+    /// blocks, out to `reach`) that no drawn tile tops: the radius of the topped disc around the
+    /// eye. Samples are taken in the chart net around the centre, so a neighbour chart's ground is
+    /// read where its storage holds it; a sample the net holds no chart under (the quadrant past a
+    /// cube corner) is not ground. Also returns how many samples that was.
+    fn topped_radius(
+        world: &crate::world::World,
+        tiles: &[Tile],
+        center: crate::coord::ChunkCoord,
+        step: i32,
+        reach: i32,
+    ) -> (i32, usize) {
+        let seat = world.seams.chart_seat(center).expect("the far field stands on a chart");
+        let unfold = world.seams.unfold_at(center);
+        let cy = (seat.lo[1] / 16) as i32;
+        let eye = (center.x * 16 + 8, center.z * 16 + 8);
+        let mut radius = reach;
+        let mut void = 0usize;
+        let mut dx = -reach;
+        while dx <= reach {
+            let mut dz = -reach;
+            while dz <= reach {
+                let (x, z) = (eye.0 + dx, eye.1 + dz);
+                let virt = crate::coord::ChunkCoord::new(x.div_euclid(16), cy, z.div_euclid(16));
+                match unfold.unfold(virt).filter(|&real| world.seams.chart_seat(real).is_some()) {
+                    None => void += 1,
+                    Some(real) => {
+                        let (x, z) = if real == virt { (x, z) } else { (real.x * 16 + 8, real.z * 16 + 8) };
+                        let d = f64::from(dx).hypot(f64::from(dz)) as i32;
+                        let topped = tiles
+                            .iter()
+                            .any(|t| x >= t.x0 && x < t.x1 && z >= t.z0 && z < t.z1 && top_at(t, x, z).is_some());
+                        if d < radius && !topped {
+                            radius = d;
+                        }
+                    }
+                }
+                dz += step;
+            }
+            dx += step;
+        }
+        (radius, void)
+    }
+
+    /// How far a frontier cut to the slot budget still tops all ground: the chart frontier keeps the
+    /// sections nearest the eye in the chart net, so every dropped one lies at least as far as the
+    /// farthest kept, and a sample it would have topped at most half its diagonal nearer. A seam
+    /// spends the budget early: a storage box's x edges are aligned to 256 blocks only, so each
+    /// coarse section straddling one splits into dozens down the seam.
+    fn capped_reach(world: &crate::world::World, desired: &[SectionPos], center: crate::coord::ChunkCoord) -> f64 {
+        let unfold = world.seams.unfold_at(center);
+        let eye = (i64::from(center.x) * 16 + 8, i64::from(center.z) * 16 + 8);
+        let kept = desired
+            .iter()
+            .map(|s| {
+                let half = i64::from(s.span()) / 2;
+                let (x, z) = unfold.fold_column(i64::from(s.min_x()) + half, i64::from(s.min_z()) + half).expect("a section in the net");
+                ((x - eye.0) as f64).hypot((z - eye.1) as f64)
+            })
+            .fold(0.0, f64::max);
+        let span = desired.iter().map(|s| s.span()).max().unwrap_or(0);
+        kept - f64::from(span) * std::f64::consts::FRAC_1_SQRT_2
     }
 
     fn assert_chart_closed(name: &str, f: &ChartFrontier) {
@@ -1880,7 +1918,7 @@ mod tests {
         use voxel_engine::DVec3;
 
         let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
-        let (center, storage, _) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
+        let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
         assert_eq!(spawn.hash, 0xca4adead, "spawn ground-level far-field bytes changed");
@@ -1898,10 +1936,59 @@ mod tests {
         let sites = [("plus-y", DVec3::new(0.0, 1.0, 0.0)), ("highland", DVec3::new(1.0, 0.9, 0.8))];
         for (name, dir) in sites {
             for above in [300.0_f64, 1_500.0, 3_000.0] {
-                let (center, storage, _) = home_altitude_eye(&world, dir, above);
+                let (center, storage) = home_altitude_eye(&world, dir, above);
                 world.section_eye_y = storage.y;
                 let got = frontier_counts(&mut world, center);
                 assert_chart_closed(&format!("{name} +{above}"), &got);
+            }
+        }
+    }
+
+    /// Start-world far field from high above the ground, where the near window is back in physical
+    /// space: the far field stands on the chart column under the eye, tops every column of the
+    /// ground under it out to three times the height (100 km at most), across seams into the
+    /// neighbour charts too, keeps the seams closed and the slot budget, and is the frontier it
+    /// would be with the near window on the chart (nothing changes at the near window's reach).
+    #[test]
+    fn far_chart_high_altitude_is_closed() {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::World;
+
+        let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        for (site, dir, heights) in World::FAR_SITES {
+            for &above in heights {
+                let name = format!("{site} +{above}");
+                let eye = world.home_eye(dir, above);
+                assert!(world.chart_eye(eye).is_none(), "{name}: the near window still stands on the chart");
+                let (near, far) = world.place_eyes(eye);
+                let (near_c, far_c) = (storage_chunk(near), storage_chunk(far));
+                world.adopt_fold(near_c);
+                assert!(world.fold.is_identity(), "{name}: the near window is not in physical space");
+                let desired = world.desired_sections(far_c);
+                assert!(!desired.is_empty(), "{name}: no chart sections from altitude");
+                assert!(
+                    desired.len() <= world.sections_allowed(),
+                    "{name}: {} sections over the slot budget {}",
+                    desired.len(),
+                    world.sections_allowed()
+                );
+                let got = frontier_counts(&mut world, far_c);
+                assert_eq!(world.desired_sections(far_c), desired, "{name}: the near window's chart changes the far field");
+                assert_chart_closed(&name, &got);
+                let ground = world.terrain().surface(Face::PosY, far.x.floor() as i32, far.z.floor() as i32);
+                let height = far.y - f64::from(ground);
+                let (topped, void) = topped_radius(&world, &got.tiles, far_c, 1024, 200_000);
+                let capped = desired.len() == world.sections_allowed();
+                let want = if capped { capped_reach(&world, &desired, far_c) } else { (3.0 * height).min(100_000.0) };
+                println!(
+                    "{name}: height {height:.0}, scale {}, sections {}{}, topped disc {topped} blocks (want {want:.0}), \
+                     {void} samples past a corner",
+                    world.far_scale,
+                    got.sections,
+                    if capped { " (at the slot budget)" } else { "" }
+                );
+                assert!(f64::from(topped) >= want, "{name}: topped disc {topped} short of {want:.0}");
             }
         }
     }
