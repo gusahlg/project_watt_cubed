@@ -105,7 +105,7 @@ struct GfxKey {
     fullscreen: bool,
     msaa: u32,
     scale_bits: u32,
-    cull_faces: bool,
+    cull_faces: Option<bool>,
     flags: voxel_engine::RenderFlags,
 }
 

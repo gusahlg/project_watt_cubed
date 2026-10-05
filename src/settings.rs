@@ -127,8 +127,9 @@ settings_fields! {
     shake: f32 = 1.0,
     /// Cross-chunk lighting, a world-meshing input rather than an engine flag.
     lighting: bool = true,
-    /// Runtime-only `WATT_CULL=1` switch; absent from [`SETTINGS`].
-    cull_faces: bool = false,
+    /// Runtime-only `WATT_CULL=0|1` override of the engine's own face-cull choice; absent from
+    /// [`SETTINGS`].
+    cull_faces: Option<bool> = None,
 
     vertical_distance: i32 = 3,
     /// Update rates; zero means every frame.
@@ -1006,9 +1007,13 @@ impl Settings {
         if let Ok(text) = fs::read_to_string(settings_path()) {
             settings.parse_from(&text);
         }
-        // Six-way cull is env-only (not in the persisted table): opt in with
-        // `WATT_CULL=1`. Read after the file parse so it can't be overwritten.
-        settings.cull_faces = matches!(std::env::var("WATT_CULL").as_deref(), Ok("1"));
+        // The engine picks the six-way cull itself; `WATT_CULL=0|1` forces it (env-only, not in the
+        // persisted table). Read after the file parse so it can't be overwritten.
+        settings.cull_faces = match std::env::var("WATT_CULL").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        };
         settings.clamp();
         settings
     }
@@ -1259,7 +1264,9 @@ impl Settings {
         let _ = eng.set_msaa(session.msaa);
         let _ = eng.set_render_scale(session.render_scale);
         self.note_render_extent(w, h, session.render_scale);
-        eng.set_cull_faces(self.cull_faces);
+        if let Some(on) = self.cull_faces {
+            eng.set_cull_faces(on);
+        }
         // Engine render lanes live-swap on both threads; occlusion/lod2 are world
         // inputs (applied on world entry) and aren't part of `engine_flags`.
         eng.set_flags(self.render_config().engine_flags());
@@ -1633,7 +1640,7 @@ mod tests {
             ui_scale: 1.0,
             shake: 5.0,
             lighting: true,
-            cull_faces: false,
+            cull_faces: None,
             // Render lanes aren't under test here; take them as-shipped so adding a
             // lane can't break this clamp test.
             ..Settings::default()
@@ -1745,7 +1752,7 @@ mod tests {
             // Not persisted (env-only); must stay at the default so the composed
             // roundtrip below — which never writes it — still lands `samples`. The
             // render lanes likewise stay at their persisted defaults via the spread.
-            cull_faces: false,
+            cull_faces: None,
             // Fields added since this fixture was written: defaults roundtrip
             // trivially, so the spread above stays the interesting part.
             ..Settings::default()
@@ -1821,7 +1828,7 @@ mod tests {
             ui_scale: 1.5,
             menu_scale: 0.75,
             shake: 0.25,
-            cull_faces: true,
+            cull_faces: Some(true),
             ..Settings::default()
         };
 
@@ -1875,7 +1882,7 @@ mod tests {
             ui_scale: 1.5,
             menu_scale: 0.75,
             shake: 0.25,
-            cull_faces: true,
+            cull_faces: Some(true),
             ..Settings::default()
         };
         assert_eq!(s, expected);
