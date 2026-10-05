@@ -616,9 +616,10 @@ impl Game {
         eng.disable_cursor();
     }
 
-    /// Return the world's GPU meshes to the engine (called before the game is
-    /// dropped when leaving to the menu).
+    /// Return the world's GPU meshes and drop its far map. Called before the game
+    /// is dropped when leaving to the menu, so the next world cannot show this one.
     pub fn free_gpu(&mut self, eng: &mut Engine) {
+        self.sky.release_far_map(eng);
         self.world.free_meshes(eng);
     }
 

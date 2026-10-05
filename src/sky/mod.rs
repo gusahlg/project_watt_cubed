@@ -21,7 +21,7 @@ pub use clock::{DayLength, SkyClock, SkyFrame};
 pub use weather::Precip;
 pub use weather::Weather;
 
-use voxel_engine::{DVec3, Frame3D, LinearRgb, SkyDesc, Vec3};
+use voxel_engine::{DVec3, Engine, Frame3D, LinearRgb, SkyDesc, Vec3};
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
@@ -54,6 +54,8 @@ pub struct Sky {
     far: bodies::FarBodies,
     /// Home albedo cube map, baked off the main thread.
     maps: planet_map::PlanetBake,
+    /// Which datum and which faces have already been handed to the engine.
+    feed: planet_map::MapFeed,
     /// Reused distant-asteroid boxes.
     rocks: rocks::DistantRocks,
 }
@@ -116,7 +118,8 @@ impl Sky {
         }
     }
 
-    /// Datum, horizon and any faces baked so far. Drawing still uses the sphere.
+    /// Datum, horizon and any faces baked so far.
+    #[cfg(test)]
     pub(crate) fn planet(&self) -> Option<planet_map::PlanetHandle<'_>> {
         let (datum_res, datum, radius) = self.far.map_parts()?;
         Some(planet_map::PlanetHandle {
@@ -144,27 +147,85 @@ impl Sky {
         generator: &dyn TerrainGenerator,
         view_blocks: f64,
     ) {
-        self.maps.poll();
         f.set_sky(self.desc(frame));
         f.set_far_bodies(self.far.update(generator, eye));
-        // Home stays a sphere until the engine's mapped shape lands. Reading the
-        // handle keeps its fields live for that draw.
-        if let Some(mapped) = self.planet() {
-            let _ = (
-                mapped.datum_res,
-                mapped.datum.len(),
-                mapped.radius,
-                mapped.horizon,
-                mapped.preview,
-                mapped.full,
-            );
-        }
         f.set_sun_override(self.far.sun_override());
         self.rocks.draw(f, generator, eye, view_blocks);
+    }
+
+    /// Install the home datum once, then each baked face as it arrives. Call before the frame
+    /// opens: the map lives on the engine, not on the draw list. A quiet frame only reads flags.
+    pub(crate) fn sync_far_map(
+        &mut self,
+        sink: &mut impl planet_map::FarSink,
+        generator: &dyn TerrainGenerator,
+    ) {
+        let Sky { far, maps, feed, .. } = self;
+        maps.poll();
+        far.prepare_map(generator);
+        let installed = if let Some((datum_res, datum, radius)) = far.map_parts() {
+            let handle = planet_map::PlanetHandle {
+                datum_res,
+                datum,
+                radius,
+                horizon: far.horizon(),
+                preview: maps.faces(false),
+                full: maps.faces(true),
+            };
+            // The engine drops a body whose horizon or radius is not finite. Stay a sphere then.
+            if !handle.radius.is_finite() || !handle.horizon.is_finite() {
+                false
+            } else {
+                feed.flush(handle.datum_res, handle.datum, &handle.preview, &handle.full, sink)
+            }
+        } else {
+            false
+        };
+        if installed {
+            far.set_live(true);
+        }
+    }
+
+    /// Drop the home map. The next sync installs it again, and home draws a sphere until then.
+    pub(crate) fn release_far_map(&mut self, sink: &mut impl planet_map::FarSink) {
+        self.feed.clear(sink);
+        self.far.set_live(false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deliver_face(&mut self, full: bool, face: usize, rgba: Vec<u8>) {
+        self.maps.deliver(full, face, rgba);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn far_at(
+        &mut self,
+        generator: &dyn TerrainGenerator,
+        eye: DVec3,
+    ) -> Vec<voxel_engine::FarBody> {
+        self.far.update(generator, eye).to_vec()
     }
 
     #[cfg(test)]
     pub(crate) fn warm_far(&mut self, generator: &dyn TerrainGenerator, eye: DVec3) {
         let _ = self.far.update(generator, eye);
+    }
+}
+
+impl planet_map::FarSink for Engine {
+    fn install(&mut self, datum_res: u32, datum: &[f32], albedo_size: u32) -> bool {
+        self.set_far_map(
+            planet_map::HOME_MAP,
+            &voxel_engine::FarMapDesc { datum_res, datum, albedo_size },
+        )
+        .is_ok()
+    }
+
+    fn face(&mut self, face: usize, rgba: &[u8]) -> bool {
+        self.set_far_map_face(planet_map::HOME_MAP, face, rgba).is_ok()
+    }
+
+    fn clear(&mut self) {
+        self.clear_far_map(planet_map::HOME_MAP);
     }
 }

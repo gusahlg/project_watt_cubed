@@ -173,16 +173,17 @@ pub fn compose_at(
     // currently disabled by default, so fog is inert until that flag is turned on.
     let fog_density = FOG_BASE + fog_bonus;
 
-    // Above the atmosphere the sky goes black and starry and the haze thins. Only the sky lanes
+    // Above the atmosphere the sky goes black and starry and the haze clears. Only the sky lanes
     // fade: the ambient above was taken from the atmosphere's zenith, and the GPU luma-matches
-    // its zenith tints, so planets stay lit by the sun and the near-sky bounce.
+    // its zenith tints, so planets stay lit by the sun and the near-sky bounce. Fog reaches 0 at
+    // the top of the air: a mapped body is fogged like terrain, and that haze is the air shell.
     let space = space_factor(ctx.altitude, ctx.fade);
     // Nor is there night out there: the sun shines from where it is, however the viewer is turned.
     let light = light.lerp(atm.palette.at(Role::Light, 1.0), space);
     let day_night_mix = Palette::day_night_mix(elev) + (1.0 - Palette::day_night_mix(elev)) * space;
     let zenith = zenith.lerp(SPACE_ZENITH, space);
     let horizon = horizon.lerp(SPACE_HORIZON, space);
-    let fog_density = fog_density * (1.0 - 0.75 * space);
+    let fog_density = fog_density * (1.0 - space);
 
     // Wrap time in f64 before downcast to preserve f32 phase precision.
     let period = genconst::ANIM_PERIOD as f64;
@@ -243,6 +244,33 @@ mod tests {
         assert_eq!(space_factor(crate::world::terrain::cosmos::AIR_TOP, SpaceFade::BODY), 1.0);
         assert_eq!(space_factor(400.0, SpaceFade::FLAT), 0.0);
         assert_eq!(space_factor(900.0, SpaceFade::FLAT), 1.0);
+    }
+
+    /// Mapped impostors are fogged like terrain, so the haze has to belong to the air shell.
+    #[test]
+    fn fog_clears_at_the_top_of_the_air() {
+        let sky = Sky::new();
+        let render = RenderConfig { weather: false, ..RenderConfig::default() };
+        let frame = sky.frame_at_day(0.5, Vec3::Y);
+        let fog_at = |altitude: f64| {
+            compose_at(
+                &sky,
+                frame,
+                SkyContext { up: DVec3::Y, altitude, fade: SpaceFade::BODY },
+                [0.0; 2],
+                Exposure::DEFAULT,
+                &render,
+            )
+            .fog_density
+        };
+        let ground = fog_at(0.0);
+        let mid = fog_at(11_000.0);
+        let top = fog_at(crate::world::terrain::cosmos::AIR_TOP);
+        let above = fog_at(crate::world::terrain::cosmos::AIR_TOP + 50_000.0);
+        assert!(ground > 0.0, "the ground still has haze: {ground}");
+        assert!(mid > 0.0 && mid < ground, "mid-air haze sits between: mid {mid} ground {ground}");
+        assert_eq!(top, 0.0, "no haze at the top of the air");
+        assert_eq!(above, 0.0, "no haze above the air");
     }
     use crate::sky::Precip;
 

@@ -7,7 +7,7 @@ use voxel_engine::{
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
-use crate::world::terrain::cosmos::{Body, Cosmos, Kind, Shape};
+use crate::world::terrain::cosmos::{Body, Cosmos, Kind, Shape, AIR_TOP};
 
 /// Above this altitude the voxel terrain is not drawn, so the impostor takes over.
 const STREAM_ALTITUDE: f64 = 20_000.0;
@@ -44,6 +44,8 @@ pub struct FarBodies {
     /// Eye the cached horizon was computed for.
     horizon_eye: Option<DVec3>,
     horizon: f32,
+    /// The datum has been handed to the engine, so home draws [`FarShape::Mapped`].
+    live: bool,
 }
 
 impl Default for FarBodies {
@@ -55,6 +57,7 @@ impl Default for FarBodies {
             looked: false,
             horizon_eye: None,
             horizon: 1.0,
+            live: false,
         }
     }
 }
@@ -76,12 +79,18 @@ impl FarBodies {
         Some((map.res, map.datum.as_slice(), map.radius))
     }
 
+    /// Home draws [`FarShape::Mapped`] once its datum is installed. Clearing the map turns this off.
+    pub(super) fn set_live(&mut self, live: bool) {
+        self.live = live;
+    }
+
     /// Bodies to draw this frame, relative to `eye`. Empty when the generator has no cosmos.
     pub fn update(&mut self, generator: &dyn TerrainGenerator, eye: DVec3) -> &[FarBody] {
         self.list.clear();
         self.sun = None;
         self.prepare_map(generator);
         self.refresh_horizon(eye);
+        let (mapped, horizon) = (self.live, self.horizon);
         let Some(cosmos) = generator.cosmos() else {
             return &self.list;
         };
@@ -101,7 +110,7 @@ impl FarBodies {
             if self.list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases()) {
+            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases(), mapped, horizon) {
                 self.list.push(far);
             }
         }
@@ -109,7 +118,7 @@ impl FarBodies {
     }
 
     /// One allocation of the rebased datum and its sample directions. Later frames do nothing.
-    fn prepare_map(&mut self, generator: &dyn TerrainGenerator) {
+    pub(super) fn prepare_map(&mut self, generator: &dyn TerrainGenerator) {
         if self.map.is_some() || self.looked {
             return;
         }
@@ -183,7 +192,7 @@ impl FarBodies {
                 seed: hollow.seed,
             });
         }
-        if let Some(mut far) = impostor(cosmos, ember, eye, 0, &[]) {
+        if let Some(mut far) = impostor(cosmos, ember, eye, 0, &[], false, 1.0) {
             far.atmosphere = LinearRgb([
                 far.atmosphere.0[0] * CORE_GLOW,
                 far.atmosphere.0[1] * CORE_GLOW,
@@ -237,6 +246,12 @@ fn ember_light(toward: Vec3, dist: f64, inner: f64, ember_r: f64) -> (Vec3, f32)
 
 fn black() -> LinearRgb {
     LinearRgb([0.0, 0.0, 0.0])
+}
+
+/// Daylight air of the start world: the sky's noon horizon. Moons stay black.
+fn daylight_air() -> LinearRgb {
+    use crate::sky::palette::{Anchor, Role, NEW_SHOKA};
+    NEW_SHOKA.get(Role::Horizon, Anchor::Day).to_linear()
 }
 
 fn srgb(r: u8, g: u8, b: u8) -> LinearRgb {
@@ -380,7 +395,8 @@ fn streams(cosmos: &Cosmos, body: &Body, eye: DVec3, dist: f64) -> bool {
 }
 
 /// The start world's impostor: a sphere at its lowest datum, sunk by [`sink`], so it stays under
-/// the ground in every direction. Terrain draws wherever it reaches; the impostor fills in below the
+/// the ground in every direction. Once the datum is installed the draw uses [`FarShape::Mapped`]
+/// at this same radius. Terrain draws wherever it reaches; the impostor fills in below the
 /// horizon beyond it, and an eye on the ground must never stand inside it (the shader skips a body
 /// whose solid holds the eye, and the sky would show below the horizon). A superellipsoid fitted to
 /// the face centre and the corner rose above the datum on almost every other direction: the corner
@@ -416,13 +432,20 @@ fn impostor(
     eye: DVec3,
     twin_ordinal: u32,
     atlases: &[std::sync::Arc<crate::space::atlas::Atlas>],
+    mapped: bool,
+    horizon: f32,
 ) -> Option<FarBody> {
     let delta = body.centre_f() - eye;
     let dist = delta.length();
-    let (mut shape, albedo, atmosphere) = paint(body, twin_ordinal);
+    let (mut shape, albedo, mut atmosphere) = paint(body, twin_ordinal);
     let radius = if body.kind == Kind::Home {
-        let (rounded, radius) = home_impostor(cosmos, body);
-        shape = rounded;
+        let (_, radius) = home_impostor(cosmos, body);
+        // Air of AIR_TOP blocks, as a fraction of the reference radius.
+        let air = (AIR_TOP / radius) as f32;
+        if mapped && horizon.is_finite() && air.is_finite() && air >= 0.0 {
+            shape = FarShape::Mapped { map: super::planet_map::HOME_MAP, horizon, air };
+            atmosphere = daylight_air();
+        }
         radius
     } else if let Some((rounded, radius)) = warped_impostor(atlases, body) {
         shape = rounded;
@@ -542,6 +565,7 @@ mod tests {
                     assert!((6.0..=16.0).contains(&exponent), "twin exponent {exponent}");
                     rounded
                 }
+                // Sphere: this list has not uploaded the datum. Mapped is the installed map.
                 Kind::Home => home_impostor(cosmos, body).0,
                 _ => FarShape::Sphere,
             };
@@ -592,7 +616,11 @@ mod tests {
         let away = far.update(&terrain, DVec3::new(1.0e8, 0.0, 0.0));
         assert_eq!(alloc_count::alloc_count(), 0, "far-body update allocated");
         let home = find(cosmos, away, terrain.atlases(), cosmos.home()).expect("home is a sky body from 1e8");
-        assert_eq!(home.shape, FarShape::Sphere, "home draws as a sphere under its datum");
+        assert_eq!(
+            home.shape,
+            FarShape::Sphere,
+            "home stays a sphere until its datum is uploaded; the radius is still the sunk datum"
+        );
         let home_body = cosmos.home();
         let Shape::Ball { r } = home_body.shape else { panic!("home is a ball") };
         let face = cosmos.face_offset(home_body);
