@@ -71,15 +71,20 @@ run time; disabled mods cost nothing.
 several enabled mods implement a hook:
 
 - Fan-out, in installation order: `update`, `on_toggle_fly`, `on_block_break`, `on_break_rejected`,
-  `on_place_rejected`, `on_tool_changed`. `hud` uses the same order as z-order (later draws on
-  top), and `commands` lists concatenate in it.
-- First enabled wins: `menu_theme`, `start_screen`, `close_overlay` (first `true`), `held`,
+  `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the same order as z-order (later draws on
+  top), and `commands` lists concatenate in it. `actions` are collected from every enabled mod.
+- First enabled wins: `menu_theme`, `start_screen`, `close_overlay` (first `true`), `tool`,
   `namer`, `appearance`, `worldgen`, `worldgen_config`, `run_command` (first `Some`).
 - Compose: `visual_group` bits OR into the render mask.
 
-`held` names the block the player holds (what a left click uses as a tool and a right click
-places); with no mod answering, the hand is bare. `on_tool_changed(old, new)` tells every mod a
-tool reaction turned the held unit into another configuration. HUD output is data
+`tool` names the configuration a primary action applies (a left click uses it, a right click
+places it). With no mod answering, there is no tool and the primary action breaks the block into
+the inventory. `on_tool_changed(old, new)` tells every mod a tool reaction turned that unit into
+another configuration. `on_tool_used` reports what the law did; the core draws nothing for it.
+Mods declare input with `actions` (`Action { id, label, default, repeat }`). The core keeps the
+chord table, a core binding wins a clash, and `ModContext::action` reports which ids fired.
+`ModContext::wheel` is the signed scroll. There is no controls screen: `Action::label` is what a
+future one will show, and rebinding is left for later. HUD output is data
 (`HudElement::Label` / `Panel` / `Rect`) drawn by the core theme. A machine changes a cell through
 `ModContext::world` with `set_block`, then wakes its contacts with `note_cell_changed` (or
 `note_block_moved(from, to)`). Chunk load, generation, meshing and saving never wake anything; on
@@ -101,17 +106,19 @@ Developer Toolkit package (`pwc.dev-toolkit`) provides the commands and flight.
 
 With no mod answering a hook the core falls back to: the default menu theme and the fallback start
 screen, `FlatAppearance` (every texel the base colour), `describe` names read off the observation
-("glowing clear hard solid"), the flat world generator, the bare hand. The stash still collects
-what you break; without the inventory mod it is simply not shown.
+("glowing clear hard solid"), the flat world generator, and no tool. The inventory still collects
+what you break; without the inventory mod it is simply not shown. The number keys select nothing
+unless the hotbar package is enabled.
 
 ## The mod API crate
 
 `crates/pwc-mod-api` is the one crate mods depend on. It re-exports the host types
 (`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `ModDescriptor`, `Knob`, `Group`, …), the game
-modules mods may use (`block`, `world`, `player`, `ui`, `menu`, `settings`, `stash`, `render_config`,
+modules mods may use (`block`, `world`, `player`, `ui`, `menu`, `settings`, `inventory`, `render_config`,
 `net`, `session`, `sim`, `input`, `derived`, `engine`, `material`) and a `prelude`. Its version is
-the **mod API version** a package's `mod.toml` requires (`pwc-api = "^1.0"`); a breaking change to
-what it re-exports needs a major version bump.
+the **mod API version** a package's `mod.toml` requires (`pwc-api = "^2.0"`); a breaking change to
+what it re-exports needs a major version bump. The 2.0.0 breaks are listed at the top of
+`crates/pwc-mod-api/src/lib.rs`.
 
 ## First-party mods
 
@@ -122,8 +129,8 @@ a package with its own README, licence (`Apache-2.0 OR MIT`) and tests:
 |---|---|
 | `pwc.menus` | `menus` — the standard menu look |
 | `pwc.start-screen` | `start` — the start screen and its Worlds page |
-| `pwc.hotbar` | `hotbar` — nine slots plus the bare hand |
-| `pwc.inventory` | `inventory` — the stash as a list, equips into the hotbar (depends on `pwc.hotbar`) |
+| `pwc.hotbar` | `hotbar` — the selection UI along the bottom; it answers `tool` |
+| `pwc.inventory` | `inventory` — the inventory as a list, equips into the hotbar (depends on `pwc.hotbar`) |
 | `pwc.visuals` | `atmosphere`, `post`, `lighting` — the fancy render lanes |
 | `pwc.neural-textures` | `neural_textures` — per-configuration CPPN textures |
 | `pwc.material-names` | `material_names` — Markov-model names for blocks and tools |

@@ -89,8 +89,8 @@ A tool is a block in hand. Left-click with a held material runs the law between 
 the targeted cell (`BlockRegistry::react`, stepped to rest): occurrences move between them, the cell
 and the held unit both change configuration, and the cell's contacts wake. A held counter-material
 can empty a resistant block one constituent at a time. On a server the client sends
-`ClientMessage::ToolUse` and the server answers `ServerMessage::ToolResult`. The bare hand breaks
-blocks; breaking yields that configuration into the stash.
+`ClientMessage::ToolUse` and the server answers `ServerMessage::ToolResult`. With no tool, a
+primary action breaks the block; breaking yields that configuration into the inventory.
 
 ## Worldgen materials
 

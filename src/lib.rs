@@ -46,7 +46,7 @@ pub mod settings;
 pub mod sim;
 pub mod space;
 pub mod sky;
-pub mod stash;
+pub mod inventory;
 pub mod ui;
 pub mod world;
 

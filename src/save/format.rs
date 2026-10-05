@@ -23,7 +23,7 @@
 //!                frame f32 x4 (xyzw), velocity f64 x3,
 //!                up u8 (face index), flags u8
 //!                (bit 0 = fly, bit 1 = noclip)                74
-//!                stash: u16 len + utf8 "spec=count,..."        variable
+//!                inventory: u16 len + utf8 "spec=count,..."        variable
 //! spec table     u16 count, then per spec: u16 len + utf8
 //! edits          edit_count records of i32 x, i32 y, i32 z, u16 spec index
 //! mods           u8 count, then per mod: u8 name-len + utf8,
@@ -162,7 +162,7 @@ pub struct PlayerState {
     pub noclip: bool,
     /// Held configurations as `(spec, count)` in first-seen order.
     /// `None` means the field was absent (pre-v7).
-    pub stash: Option<Vec<(String, u32)>>,
+    pub inventory: Option<Vec<(String, u32)>>,
 }
 
 /// On-disk worldgen identity. Kept as raw integers so this codec stays free
@@ -181,7 +181,7 @@ impl Default for WorldgenStamp {
     }
 }
 
-fn encode_stash_payload(items: &[(String, u32)]) -> String {
+fn encode_inventory_payload(items: &[(String, u32)]) -> String {
     let mut s = String::new();
     for (i, (name, count)) in items.iter().enumerate() {
         if i > 0 {
@@ -194,7 +194,7 @@ fn encode_stash_payload(items: &[(String, u32)]) -> String {
     s
 }
 
-fn parse_stash_payload(s: &str) -> Vec<(String, u32)> {
+fn parse_inventory_payload(s: &str) -> Vec<(String, u32)> {
     let mut out = Vec::new();
     for entry in s.split(',').filter(|e| !e.is_empty()) {
         let Some((name, count)) = entry.split_once('=') else {
@@ -291,12 +291,12 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
     out.extend_from_slice(&pw.into_inner());
     out.push(doc.player.flying as u8 | (doc.player.noclip as u8) << 1);
     debug_assert_eq!(out.len(), HEADER_LEN + PLAYER_POSE_LEN);
-    let stash = encode_stash_payload(doc.player.stash.as_deref().unwrap_or(&[]));
-    if u16::try_from(stash.len()).is_err() {
-        return Err(SaveError::Corrupt("player stash too long to save"));
+    let inventory = encode_inventory_payload(doc.player.inventory.as_deref().unwrap_or(&[]));
+    if u16::try_from(inventory.len()).is_err() {
+        return Err(SaveError::Corrupt("player inventory too long to save"));
     }
     let mut sw = codec::Writer::new();
-    sw.str16(&stash);
+    sw.str16(&inventory);
     out.extend_from_slice(&sw.into_inner());
 
     out.extend_from_slice(&(doc.specs.len() as u16).to_le_bytes());
@@ -511,7 +511,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
             legacy_pose: true,
             flying: false,
             noclip: false,
-            stash: None,
+            inventory: None,
         }
     } else {
         let pose = r.pose()?;
@@ -525,18 +525,18 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
             legacy_pose: false,
             flying: false,
             noclip: false,
-            stash: None,
+            inventory: None,
         }
     };
     let flags = r.u8()?;
-    let stash = {
+    let inventory = {
         let len = r.u16()? as usize;
-        Some(parse_stash_payload(&r.string(len)?))
+        Some(parse_inventory_payload(&r.string(len)?))
     };
     let player = PlayerState {
         flying: flags & 1 != 0,
         noclip: flags & 2 != 0,
-        stash,
+        inventory,
         ..player
     };
     // Raw float bit patterns are not all valid game states: NaN/Infinity would
@@ -662,7 +662,7 @@ mod tests {
                 legacy_pose: false,
                 flying: true,
                 noclip: true,
-                stash: Some(vec![("Stone".into(), 2), ("Iron".into(), 1)]),
+                inventory: Some(vec![("Stone".into(), 2), ("Iron".into(), 1)]),
             },
             specs: vec!["air".to_string(), "natural:Stone".to_string()],
             edits: vec![
@@ -798,9 +798,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_stash_round_trips() {
+    fn empty_inventory_round_trips() {
         let mut doc = sample();
-        doc.player.stash = Some(vec![]);
+        doc.player.inventory = Some(vec![]);
         let bytes = encode(&doc).unwrap();
         assert_eq!(expect_intact(decode(&bytes).unwrap()), doc);
     }

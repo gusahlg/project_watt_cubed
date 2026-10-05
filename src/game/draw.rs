@@ -484,12 +484,6 @@ impl Game {
             self.hud_scratch.clear();
             mods.hud(&self.world, &self.player, screen, &mut self.hud_scratch);
             ui::render_hud(f, theme, screen, &self.hud_scratch);
-            // The last tool use's outcome, above the hotbar for a moment.
-            if let Some((note, at)) = &self.tool_note
-                && at.elapsed().as_secs_f32() < 1.6
-            {
-                hud_label(f, theme, screen, Anchor::Bottom, (0, -112), 18, ui::Role::Muted.color(), note);
-            }
         }
         // Minimal keeps the world readable: no closed-console scrollback.
         if matches!(theme.hud, HudMode::Full) || self.console.is_open() {

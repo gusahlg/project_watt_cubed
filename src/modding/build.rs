@@ -14,7 +14,7 @@ use super::{Group, Mod, Mods};
 /// One compiled-in mod package: its manifest identity and its entry point.
 #[derive(Clone, Copy, Debug)]
 pub struct ModDescriptor {
-    /// The permanent, namespaced package id from `mod.toml` (`pwc.hotbar`).
+    /// The permanent, namespaced package id from `mod.toml` (`pwc.example`).
     pub id: &'static str,
     /// Display name from `mod.toml`.
     pub name: &'static str,

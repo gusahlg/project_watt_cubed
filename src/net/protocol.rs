@@ -704,7 +704,7 @@ mod tests {
                     legacy_pose: false,
                     flying: false,
                     noclip: false,
-                    stash: Some(vec![(spec.clone(), 1)]),
+                    inventory: Some(vec![(spec.clone(), 1)]),
                 },
                 specs: vec![spec.clone()],
                 edits: vec![format::Edit { x: 1, y: 2, z: 3, spec: 0 }],
@@ -717,7 +717,7 @@ mod tests {
                 other => panic!("save lost spec: {other:?}"),
             };
             assert_eq!(back.specs, vec![spec.clone()]);
-            assert_eq!(back.player.stash.unwrap()[0].0, spec);
+            assert_eq!(back.player.inventory.unwrap()[0].0, spec);
             let mut r2 = crate::block::BlockRegistry::with_builtins();
             let id2 = r2.parse_spec(&spec).unwrap();
             assert_eq!(r2.configuration(id2), r.configuration(id));

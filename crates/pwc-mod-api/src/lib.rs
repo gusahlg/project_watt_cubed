@@ -17,6 +17,25 @@
 //! The [`prelude`] covers what most mods need; the module re-exports give access to the game's
 //! subsystems a mod may read or drive.
 //!
+//! # 2.0.0
+//!
+//! Breaking changes from 1.x:
+//!
+//! - The `stash` module is gone. A player carries an [`inventory::Inventory`] at `Player::inventory`.
+//!   Save bytes are unchanged.
+//! - `Mod::held` is [`Mod::tool`]. `None` means no tool: a primary action breaks the block into
+//!   the inventory.
+//! - Mods declare input with [`Mod::actions`]. [`ModContext::action`] reports which fired this
+//!   frame and [`ModContext::wheel`] is the signed scroll. `hotbar_key`, `hotbar_cycle` and
+//!   `toggle_inventory` are gone. A core binding wins a chord clash.
+//! - [`ModContext`] is `#[non_exhaustive]`. Tests build it with [`ModContext::new`] and
+//!   [`ModContext::set_action`].
+//! - [`Mod::on_tool_used`] reports a [`ToolUse`]. The core draws nothing for it.
+//! - `GameplayEvent` no longer has hand, number-key, wheel or inventory events.
+//!
+//! There is no controls screen. [`Action::label`] is what a future one will show; rebinding is
+//! left for later.
+//!
 //! **Rules of the game** (see the package manager's POLICY.md): matter is not a mod — blocks are
 //! configurations of elements under one law; names and looks are presentation and never feed
 //! back into the law, world generation, saves or the network; anything that affects the world is
@@ -24,14 +43,14 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    annotate_setting, forced_off_marker, ChoicesFlush, Command, CommandContext, GameBuild, Group, Knob, Mod, ModContext,
-    ModDescriptor, ModRegistrar, Mods, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
+    annotate_setting, forced_off_marker, Action, ChoicesFlush, Command, CommandContext, GameBuild, Group, Knob, Mod,
+    ModContext, ModDescriptor, ModRegistrar, Mods, ToolUse, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
 };
 
 /// The game's subsystems, as far as mods may use them.
 pub use project_watt_cubed::{
     block, derived, engine, gravity, input, material, math, menu, net, player, render_config, session, settings, sim,
-    sky, stash, ui, world,
+    inventory, sky, ui, world,
 };
 
 /// The mod API version this crate provides (`pwc-api` requirements are checked against it).

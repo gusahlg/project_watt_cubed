@@ -22,7 +22,7 @@ use crate::input::{look, movement};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
 use crate::minimap::{MapSample, Minimap, MinimapConfig};
-use crate::modding::{Command, CommandContext, ModContext, Mods};
+use crate::modding::{ActionSet, Command, CommandContext, ModContext, Mods, ToolUse};
 use crate::net::chat;
 use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
@@ -74,11 +74,10 @@ struct FrameInput {
     do_place: bool,
     /// The flight key: an intent for the mods (the core has no flight toggle).
     toggle_fly: bool,
-    toggle_inventory: bool,
-    /// Hotbar key this frame: 0 = hand, 1..=9 = slot.
-    hotbar_key: Option<u8>,
-    /// Wheel steps this frame (+1 next, −1 previous).
-    hotbar_cycle: i8,
+    /// Mod actions that fired this frame.
+    actions: ActionSet,
+    /// Signed scroll steps this frame.
+    wheel: i8,
     nav_up: bool,
     nav_down: bool,
     nav_left: bool,
@@ -137,9 +136,10 @@ struct PendingModInput {
     /// Cell selected by the edge frame's player pose. Cadence-delayed mod
     /// replay must not re-raycast from a later camera direction.
     place_target: Option<(i32, i32, i32)>,
-    toggle_inventory: bool,
-    hotbar_key: Option<u8>,
-    hotbar_cycle: i8,
+    actions: ActionSet,
+    wheel: i8,
+    /// Whether a mod panel was allowed to open when this edge was captured.
+    mod_ui: bool,
     nav_up: bool,
     nav_down: bool,
     nav_left: bool,
@@ -159,9 +159,9 @@ impl PendingModInput {
         Self {
             place,
             place_target: place.then_some(place_target).flatten(),
-            toggle_inventory: allow_ui && input.toggle_inventory,
-            hotbar_key: input.hotbar_key,
-            hotbar_cycle: input.hotbar_cycle,
+            actions: input.actions,
+            wheel: input.wheel,
+            mod_ui: allow_ui,
             nav_up: allow_ui && input.nav_up,
             nav_down: allow_ui && input.nav_down,
             nav_left: allow_ui && input.nav_left,
@@ -173,9 +173,8 @@ impl PendingModInput {
 
     fn any(self) -> bool {
         self.place
-            || self.toggle_inventory
-            || self.hotbar_key.is_some()
-            || self.hotbar_cycle != 0
+            || !self.actions.is_empty()
+            || self.wheel != 0
             || self.nav_up
             || self.nav_down
             || self.nav_left
@@ -185,9 +184,9 @@ impl PendingModInput {
     }
 
     fn clear_ui(&mut self) {
-        self.toggle_inventory = false;
-        self.hotbar_key = None;
-        self.hotbar_cycle = 0;
+        self.actions = ActionSet::NONE;
+        self.wheel = 0;
+        self.mod_ui = false;
         self.nav_up = false;
         self.nav_down = false;
         self.nav_left = false;
@@ -232,10 +231,8 @@ pub struct Game {
     /// keyed by the connection's request id: what the cell held before, and
     /// what the economy optimistically did (loot gained, item spent).
     pending_edits: std::collections::HashMap<u32, PendingEdit>,
-    /// Tool uses awaiting the server's verdict: request id → the held configuration sent.
+    /// Tool uses awaiting the server's verdict: request id → the configuration sent.
     pending_tools: std::collections::HashMap<u32, BlockId>,
-    /// The last tool use's outcome, shown briefly above the hotbar.
-    tool_note: Option<(String, Instant)>,
     /// Animation state for the player's own third-person body — the same
     /// machine each remote player carries.
     local_anim: presence::Animator,
@@ -380,7 +377,6 @@ impl Game {
             net: None,
             pending_edits: std::collections::HashMap::new(),
             pending_tools: std::collections::HashMap::new(),
-            tool_note: None,
             local_anim: presence::Animator::default(),
             local_gait: 0.0,
             theme: Theme::new(),
@@ -687,7 +683,7 @@ impl Game {
         }
         self.phases.net = t.elapsed();
         let t = Instant::now();
-        let input = self.input_phase(eng, router, dt);
+        let input = self.input_phase(eng, router, mods, dt);
         self.phases.input = t.elapsed();
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
@@ -717,7 +713,7 @@ impl Game {
             let detached = self.motion_phase(&input, dt);
             self.phases.motion = t.elapsed();
             let t = Instant::now();
-            self.interact_phase(&input, detached, dt, eng, mods, &mut events);
+            self.interact_phase(&input, detached, dt, eng, mods, &mut events, router.action_ids());
             self.phases.interact = t.elapsed();
         }
         if !consumed || !ready {
@@ -790,7 +786,8 @@ impl Game {
     /// while the console captures typing) and snapshot every intent into plain
     /// data, so the router borrow ends before any `&mut Engine` side effects
     /// (screenshot, cursor grab, console open) run in later phases.
-    fn input_phase(&mut self, eng: &mut Engine, router: &mut Router, dt: f32) -> FrameInput {
+    fn input_phase(&mut self, eng: &mut Engine, router: &mut Router, mods: &Mods, dt: f32) -> FrameInput {
+        router.sync_actions(mods);
         router.set_context(if self.console.is_open() {
             Context::Text
         } else {
@@ -804,7 +801,7 @@ impl Game {
 
         let mut f = FrameInput::default();
         let mod_ui = self.mod_ui_active();
-        let input = router.frame_filtered(eng, dt, self.mod_logic, mod_ui, self.minimap.is_some());
+        let input = router.frame_filtered(eng, dt, self.mod_logic, self.minimap.is_some());
         match input.view() {
             View::Gameplay(gp) => {
                 let move_input = movement::MoveInput::from_view(&gp);
@@ -821,20 +818,12 @@ impl Game {
                 f.do_break = gp.event(GameplayEvent::Break);
                 // The flight key reaches the mods whatever the mod cadence (see `fly_key`).
                 f.toggle_fly = gp.event(GameplayEvent::ToggleFly);
+                f.actions = gp.actions();
+                f.wheel = gp.wheel();
                 if self.mod_logic {
                     f.do_place = gp.event(GameplayEvent::Place);
-                    if gp.event(GameplayEvent::Hand) {
-                        f.hotbar_key = Some(0);
-                    }
-                    for (i, e) in GameplayEvent::SLOTS.into_iter().enumerate() {
-                        if gp.event(e) {
-                            f.hotbar_key = Some(i as u8 + 1);
-                        }
-                    }
-                    f.hotbar_cycle = gp.event(GameplayEvent::HotbarNext) as i8 - gp.event(GameplayEvent::HotbarPrev) as i8;
                 }
                 if mod_ui {
-                    f.toggle_inventory = gp.event(GameplayEvent::ToggleInventory);
                     f.nav_up = gp.overlay_nav(MenuEvent::Up);
                     f.nav_down = gp.overlay_nav(MenuEvent::Down);
                     f.nav_left = gp.overlay_nav(MenuEvent::Left);
@@ -1085,6 +1074,7 @@ impl Game {
         eng: &mut Engine,
         mods: &mut Mods,
         events: &mut Vec<SoundEvent>,
+        action_ids: &[&'static str],
     ) {
         // Break is capture-gated in the query; freecam additionally can't act
         // on the world (the crosshair isn't where the player aims).
@@ -1126,19 +1116,26 @@ impl Game {
         if self.mod_gate.steps(dt) == 0 {
             return;
         }
-        self.mod_tick((eng.screen_width(), eng.screen_height()), mods, events);
+        self.mod_tick((eng.screen_width(), eng.screen_height()), mods, events, action_ids);
     }
 
     /// One mod tick: replay the latched edge frames in order (one empty update when there are
     /// none), applying each frame's queued placements before the next.
-    fn mod_tick(&mut self, (screen_w, screen_h): (i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+    fn mod_tick(
+        &mut self,
+        (screen_w, screen_h): (i32, i32),
+        mods: &mut Mods,
+        events: &mut Vec<SoundEvent>,
+        action_ids: &[&'static str],
+    ) {
         let mut pending = std::mem::take(&mut self.pending_mod_input);
         let mut placements = std::mem::take(&mut self.placement_scratch);
         placements.clear();
         // Preserve ordering and multiplicity for edge-bearing render frames.
         // With no edge, one empty update keeps periodic work at `mod_hz`.
+        let idle = PendingModInput { mod_ui: self.mod_ui_active(), ..PendingModInput::default() };
         for index in 0..pending.len().max(1) {
-            let edges = pending.get(index).copied().unwrap_or_default();
+            let edges = pending.get(index).copied().unwrap_or(idle);
             let networked = self.net.is_some();
             placements = {
                 let mut ctx = ModContext {
@@ -1148,17 +1145,19 @@ impl Game {
                     screen_h,
                     place: edges.place,
                     place_target: edges.place_target,
-                    toggle_inventory: edges.toggle_inventory,
                     nav_up: edges.nav_up,
                     nav_down: edges.nav_down,
                     nav_left: edges.nav_left,
                     nav_right: edges.nav_right,
                     nav_tab: edges.nav_tab,
                     nav_confirm: edges.nav_confirm,
-                    hotbar_key: edges.hotbar_key,
-                    hotbar_cycle: edges.hotbar_cycle,
+                    wheel: edges.wheel,
+                    mod_ui: edges.mod_ui,
                     networked,
                     placements,
+                    fired: edges.actions,
+                    ids: action_ids,
+                    extra: Vec::new(),
                 };
                 mods.update(&mut ctx);
                 ctx.placements
@@ -1427,11 +1426,11 @@ impl Game {
                     }
                     match pending.kind {
                         PendingKind::Break(id) => {
-                            self.player.stash.revoke(id, 1);
+                            self.player.inventory.revoke(id, 1);
                             mods.on_break_rejected(id);
                         }
                         PendingKind::Place(id) => {
-                            self.player.stash.add(id, 1);
+                            self.player.inventory.add(id, 1);
                             mods.on_place_rejected(id, &self.world);
                         }
                     }
@@ -1482,7 +1481,7 @@ impl Game {
                 Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec } => {
                     let Some(tool) = self.pending_tools.remove(&req) else { continue };
                     if !reacted {
-                        self.note_tool("no reaction");
+                        mods.on_tool_used(ToolUse::NoReaction);
                         continue;
                     }
                     let (x, y, z) = cell;
@@ -1600,16 +1599,14 @@ impl Game {
         *settings != before
     }
 
-    /// Break the block the player is looking at, depositing its configuration
-    /// into the core stash before notifying mods.
-    /// Left click: with a held tool, a reaction between the tool and the targeted block; with
-    /// the bare hand, breaking the block into the stash.
+    /// Left click: with a tool, a reaction between the tool and the targeted block; with
+    /// no tool, breaking the block into the inventory.
     fn primary_action(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let Some(hit) = interact::raycast(&self.world, self.player.position, self.player.forward(), interact::REACH)
         else {
             return;
         };
-        match mods.held(&self.player) {
+        match mods.tool(&self.player) {
             Some(tool) => self.use_tool(tool, hit.block, mods, events),
             None => self.break_block(hit.block, mods, events),
         }
@@ -1640,39 +1637,35 @@ impl Game {
                 events.push(SoundEvent::BlockBroken { at: sound_at(&self.world, x, y, z), block: target });
                 self.camera.fx.add_trauma(0.08);
             }
-            None => self.note_tool("no reaction"),
+            None => mods.on_tool_used(ToolUse::NoReaction),
         }
     }
 
-    /// One held unit of `tool` became `new_tool` (the cell went `target` → `new_cell`): update the
-    /// stash, tell the mods (the hotbar follows the unit), and say what happened.
+    /// One unit of `tool` became `new_tool` (the cell went `target` → `new_cell`): update the
+    /// inventory and tell the mods.
     fn finish_tool_change(&mut self, tool: BlockId, new_tool: BlockId, target: BlockId, new_cell: BlockId, mods: &mut Mods) {
-        if self.player.stash.consume(tool, 1) && new_tool != AIR {
-            self.player.stash.add(new_tool, 1);
+        if self.player.inventory.consume(tool, 1) && new_tool != AIR {
+            self.player.inventory.add(new_tool, 1);
         }
         mods.on_tool_changed(tool, new_tool);
         let reg = self.world.registry();
-        let (before, after) = (reg.configuration(tool).len(), reg.configuration(new_tool).len());
-        let note = if new_cell == AIR {
-            format!("{} dissolved into the tool", reg.display_name(target))
+        let before = reg.configuration(tool).len();
+        let after = reg.configuration(new_tool).len();
+        let outcome = if new_cell == AIR {
+            ToolUse::CellDissolved { cell: target }
         } else if new_tool == AIR {
-            "the tool dissolved into the block".to_string()
+            ToolUse::ToolDissolved { cell: target }
         } else if after > before {
-            format!("drew an element from {}", reg.display_name(target))
+            ToolUse::Drew { cell: target }
         } else if after < before {
-            format!("gave an element to {}", reg.display_name(target))
+            ToolUse::Gave { cell: target }
         } else {
-            format!("exchanged elements with {}", reg.display_name(target))
+            ToolUse::Exchanged { cell: target }
         };
-        self.note_tool(&note);
+        mods.on_tool_used(outcome);
     }
 
-    /// A short line above the hotbar about the last tool use.
-    fn note_tool(&mut self, text: &str) {
-        self.tool_note = Some((text.into(), Instant::now()));
-    }
-
-    /// Bare hand: break the block at `cell` into the stash.
+    /// No tool: break the block at `cell` into the inventory.
     fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
         let (x, y, z) = cell;
         let id = self.world.block_at(x, y, z);
@@ -1682,7 +1675,7 @@ impl Game {
         });
         self.world.set_block(x, y, z, AIR);
         self.world.note_cell_changed(x, y, z);
-        let overflow = !self.player.stash.add(id, 1);
+        let overflow = !self.player.inventory.add(id, 1);
         mods.on_block_break(id, &self.world, overflow);
         self.camera.fx.add_trauma(0.15);
         self.local_anim.on_action(WireAction::Swing);
@@ -1703,7 +1696,7 @@ impl Game {
             } else {
                 self.world.set_block(x, y, z, id);
                 if !overflow {
-                    self.player.stash.revoke(id, 1);
+                    self.player.inventory.revoke(id, 1);
                 }
                 mods.on_break_rejected(id);
             }
@@ -1733,7 +1726,7 @@ impl Game {
             // Lands only in empty space clear of the player; a refused placement gives the
             // spent unit back.
             if self.world.is_solid(x, y, z) || cell.intersects(&self.player.aabb()) {
-                self.player.stash.add(id, 1);
+                self.player.inventory.add(id, 1);
                 continue;
             }
             let prev = self.world.block_at(x, y, z);
@@ -1762,7 +1755,7 @@ impl Game {
                     net.send_swing();
                 } else {
                     self.world.set_block(x, y, z, prev);
-                    self.player.stash.add(id, 1);
+                    self.player.inventory.add(id, 1);
                     mods.on_place_rejected(id, &self.world);
                 }
             }
@@ -1844,15 +1837,20 @@ fn align_body(player: &mut Player, dt: f32) {
 #[cfg(test)]
 mod tests {
     use super::{FrameInput, Game, PendingModInput};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use crate::audio::{SoundEvent, UiSound};
-    use crate::modding::{Command, CommandContext, Mod, Mods};
+    use crate::input::intent::Chord;
+    use crate::input::router::{Press, Router};
+    use crate::modding::{Action, Command, CommandContext, Mod, ModContext, Mods};
     use crate::player::Player;
     use crate::render_config::RenderConfig;
     use crate::settings::Settings;
     use crate::ui::{Line, Role};
     use crate::world::World;
     use material::{Configuration, Element};
-    use voxel_engine::{DVec3, Vec2};
+    use voxel_engine::{DVec3, Key, Vec2};
 
     /// A mod whose one command edits whatever its argument names, and that flies on the flight key.
     struct Probe;
@@ -2010,6 +2008,54 @@ mod tests {
         assert!(!inert.do_place);
         assert!(!inert.ptt);
         assert!(!PendingModInput::capture(&inert, true, true, Some((1, 2, 3))).any());
+    }
+
+    /// An edge captured while the mod tick is skipped is replayed on the next tick, once.
+    #[test]
+    fn actions_queue_across_a_skipped_mod_tick() {
+        struct Watch {
+            seen: Rc<Cell<u32>>,
+        }
+        impl Mod for Watch {
+            fn name(&self) -> &str {
+                "Watch"
+            }
+            fn id(&self) -> &'static str {
+                "watch"
+            }
+            fn actions(&self) -> &[Action] {
+                const CHORDS: &[Chord] = &[Chord::key(Key::Num3)];
+                const ACTIONS: &[Action] = &[Action {
+                    id: "probe.ping",
+                    label: "Ping",
+                    default: CHORDS,
+                    repeat: false,
+                }];
+                ACTIONS
+            }
+            fn update(&mut self, ctx: &mut ModContext) {
+                if ctx.action("probe.ping") {
+                    self.seen.set(self.seen.get() + 1);
+                }
+            }
+        }
+        let seen = Rc::new(Cell::new(0));
+        let mut mods = Mods::empty();
+        mods.install(Box::new(Watch { seen: seen.clone() }), true);
+        let mut router = Router::new();
+        router.sync_actions(&mods);
+        let sample = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
+        let input = FrameInput { actions: sample.actions, ..FrameInput::default() };
+        let pending = PendingModInput::capture(&input, true, true, None);
+        assert!(pending.any());
+        let mut game = game();
+        game.pending_mod_input.push(pending);
+        assert_eq!(seen.get(), 0);
+        assert_eq!(game.pending_mod_input.len(), 1);
+        let mut events = Vec::new();
+        game.mod_tick((800, 600), &mut mods, &mut events, router.action_ids());
+        assert_eq!(seen.get(), 1);
+        assert!(game.pending_mod_input.is_empty());
     }
 
     #[test]

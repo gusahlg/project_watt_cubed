@@ -246,9 +246,9 @@ mod tests {
         let id = world.block_at(x, y, z);
         assert_ne!(id, crate::block::AIR);
         world.set_block(x, y, z, crate::block::AIR);
-        let mut stash = crate::stash::ElementStash::new(10);
-        assert!(stash.add(id, 1));
-        assert_eq!(stash.count(id), 1);
+        let mut inventory = crate::inventory::Inventory::new(10);
+        assert!(inventory.add(id, 1));
+        assert_eq!(inventory.count(id), 1);
         assert_eq!(world.block_at(x, y, z), crate::block::AIR);
     }
 

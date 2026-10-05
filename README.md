@@ -8,9 +8,10 @@ see [documentation/material-model.md](documentation/material-model.md).
 
 PWC mods are compiled into the game. This repository is the **runtime**: `cargo run --release`
 (or `nix run`, `./play.sh`) starts **vanilla** PWC — the bare core with no mod at all (a flat
-world, flat colours, the core menus). The shipped experience — menus and start screen, hotbar and
-inventory, the fancy visual lanes, neural textures, material names and the InfiniteDiffusion
-world — is the `pwc.essentials` bundle of first-party mod packages, built by the
+world, flat colours, the core menus, and an inventory list with no panel). The shipped experience —
+menus and start screen, the `pwc.hotbar` selection UI and the inventory panel, the fancy visual
+lanes, neural textures, material names and the InfiniteDiffusion world — is the `pwc.essentials`
+bundle of first-party mod packages, built by the
 [PWC package manager](https://github.com/gusahlg/pwc-package-manager):
 
 ```sh

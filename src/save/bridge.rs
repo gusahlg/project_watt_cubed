@@ -75,7 +75,7 @@ impl SaveSnapshot {
                 legacy_pose: false,
                 flying,
                 noclip,
-                stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
+                inventory: Some(player.inventory.to_portable(|id| world.registry().spec(id))),
             },
             mods: mods.save_states(world),
             meta,
@@ -194,8 +194,8 @@ fn stamp_from_world(world: &World) -> WorldgenStamp {
     WorldgenStamp { kind: world.worldgen().wire(), knobs: world.terrain_cfg().to_wire() }
 }
 
-fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> UnknownMaterials {
-    let Some(items) = &doc.player.stash else {
+fn restore_inventory(player: &mut Player, doc: &SaveDoc, world: &mut World) -> UnknownMaterials {
+    let Some(items) = &doc.player.inventory else {
         return UnknownMaterials::default();
     };
     let mut u = UnknownMaterials::default();
@@ -208,9 +208,9 @@ fn restore_stash(player: &mut Player, doc: &SaveDoc, world: &mut World) -> Unkno
             SpecKind::Bad => {}
         }
     }
-    player.stash.clear();
+    player.inventory.clear();
     for (id, count) in pairs {
-        player.stash.add(id, count);
+        player.inventory.add(id, count);
     }
     u
 }
@@ -225,7 +225,7 @@ pub(crate) struct UnknownMaterials {
     pub full_holdings: u32,
 }
 
-/// One load notice covering unknown edits and unknown stash/pouch holdings.
+/// One load notice covering unknown edits and unknown inventory/pouch holdings.
 pub(crate) fn unknown_material_notice(u: UnknownMaterials) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if u.legacy_edits > 0 {
@@ -323,7 +323,7 @@ pub fn from_doc(
         Motion::Walking { velocity, .. } | Motion::Flying { velocity, .. } => *velocity = saved,
     }
 
-    let mut unknown = restore_stash(&mut player, &doc, &mut world);
+    let mut unknown = restore_inventory(&mut player, &doc, &mut world);
 
     let kinds: Vec<SpecKind> = doc
         .specs

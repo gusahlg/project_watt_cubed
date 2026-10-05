@@ -135,8 +135,8 @@ mod tests {
 
         let rock = world.registry().id_by_label("rock").unwrap();
         let soil = world.registry().id_by_label("soil").unwrap();
-        player.stash.add(rock, 2);
-        player.stash.add(soil, 1);
+        player.inventory.add(rock, 2);
+        player.inventory.add(soil, 1);
         let mut mods = crate::modding::testing::standard();
         let rock_spec = world.registry().spec(rock);
         mods.load_state("hotbar", &format!("v1;sel=2;2={rock_spec}"), &mut world);
@@ -159,9 +159,9 @@ mod tests {
         assert_eq!(loaded_player.up_axis, crate::coord::Face::PosX);
         assert_eq!(loaded_player.velocity(), saved_velocity);
         assert!(loaded_player.flying());
-        assert_eq!(loaded_player.stash.total(), 3);
-        assert_eq!(loaded_player.stash.count(rock), 2);
-        assert_eq!(loaded_player.stash.count(soil), 1);
+        assert_eq!(loaded_player.inventory.total(), 3);
+        assert_eq!(loaded_player.inventory.count(rock), 2);
+        assert_eq!(loaded_player.inventory.count(soil), 1);
         let saved_bytes = fs::read(save_file(&id)).unwrap();
         assert_eq!(
             u16::from_le_bytes(saved_bytes[4..6].try_into().unwrap()),
@@ -179,7 +179,7 @@ mod tests {
         );
         assert!(
             states_before.iter().all(|(k, _)| k != "inventory"),
-            "the stash is core player state, not an inventory save line"
+            "the inventory is core player state, not an inventory save line"
         );
 
         cleanup(&id);
@@ -201,7 +201,7 @@ mod tests {
                 legacy_pose: false,
                 flying: false,
                 noclip: false,
-                stash: None,
+                inventory: None,
             },
             specs: vec![],
             edits: vec![],
@@ -333,17 +333,17 @@ mod tests {
             .push(("inventory".into(), "v1;Stone,Stone,Soil".into()));
         let mut mods = crate::modding::testing::standard();
         let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
-        assert_eq!(player.stash.total(), 0);
+        assert_eq!(player.inventory.total(), 0);
     }
 
     #[test]
-    fn unknown_stash_specs_are_skipped() {
+    fn unknown_inventory_specs_are_skipped() {
         let mut doc = bare_doc();
-        doc.player.stash = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
+        doc.player.inventory = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
         let mut mods = crate::modding::testing::standard();
         let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
-        assert_eq!(player.stash.total(), 1);
-        assert_eq!(player.stash.count(AIR), 1);
+        assert_eq!(player.inventory.total(), 1);
+        assert_eq!(player.inventory.count(AIR), 1);
     }
 
     #[test]
@@ -378,22 +378,22 @@ mod tests {
         );
 
         let mut doc = bare_doc();
-        doc.player.stash = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
+        doc.player.inventory = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
         let mut mods = crate::modding::testing::standard();
         let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
-        assert_eq!(player.stash.total(), 1);
+        assert_eq!(player.inventory.total(), 1);
     }
 
     #[test]
-    fn stash_specs_round_trip_through_save() {
+    fn inventory_specs_round_trip_through_save() {
         let world = World::new(3);
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
         let mut doc = bare_doc();
-        doc.player.stash = Some(vec![(spec, 4)]);
+        doc.player.inventory = Some(vec![(spec, 4)]);
         let mut mods = crate::modding::testing::standard();
         let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
-        assert_eq!(player.stash.count(rock), 4);
+        assert_eq!(player.inventory.count(rock), 4);
     }
 
     #[test]
@@ -481,7 +481,7 @@ mod tests {
         let (loaded_world, loaded_player, _, _) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(loaded_world.seed(), 1234);
         assert_eq!(loaded_player.position, DVec3::new(0.0, 40.0, 0.0));
-        assert_eq!(loaded_player.stash.total(), 0);
+        assert_eq!(loaded_player.inventory.total(), 0);
         assert_eq!(loaded_world.edits().count(), 0);
 
         cleanup(&id);
@@ -519,7 +519,7 @@ mod tests {
             legacy_pose: false,
             flying: false,
             noclip: false,
-            stash: Some(vec![]),
+            inventory: Some(vec![]),
         };
         let doc = SaveDoc {
             worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
@@ -585,7 +585,7 @@ mod tests {
                 legacy_pose: false,
                 flying: player.flying(),
                 noclip: player.noclip(),
-                stash: Some(player.stash.to_portable(|id| world.registry().spec(id))),
+                inventory: Some(player.inventory.to_portable(|id| world.registry().spec(id))),
             },
             specs,
             edits,
@@ -608,8 +608,8 @@ mod tests {
         player.orientation.pitch = -0.25;
         player.set_flying(true);
         let rock = world.registry().id_by_label("rock").unwrap();
-        player.stash.add(rock, 2);
-        player.stash.add(soil, 1);
+        player.inventory.add(rock, 2);
+        player.inventory.add(soil, 1);
         let mut mods = crate::modding::testing::standard();
         let rock_spec = world.registry().spec(rock);
         mods.load_state("hotbar", &format!("v1;sel=1;1={rock_spec}"), &mut world);

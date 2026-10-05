@@ -6,7 +6,7 @@ broke this session.
 
 - **Controls:** none. Toggle it on the Mods screen.
 - **Persisted state:** none.
-- **Dependencies:** none.
+- **Dependencies:** none besides the mod API (`pwc-api ^2.0`).
 
 Try it with the PWC package manager:
 

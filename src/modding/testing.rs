@@ -16,7 +16,7 @@ pub(crate) struct Stand {
     name: &'static str,
     visual: Option<VisualGroup>,
     theme: Option<DefaultTheme>,
-    /// Persisted per-world state (echoed back verbatim), like the hotbar's slots.
+    /// Persisted per-world state (echoed back verbatim), like a mod's own save line.
     state: Option<String>,
     persists: bool,
     /// A fixed `mods.cfg` payload, like the texture and naming knobs.

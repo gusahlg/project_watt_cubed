@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(view.rows[0].label, "Essentials");
         assert_eq!(
             view.rows[0].detail.as_deref(),
-            Some("Menus, inventory, hotbar, looks, names and worldgen.")
+            Some("Menus, inventory, looks, names and worldgen.")
         );
         assert!(view.rows[0].tag.is_none(), "group header is not selectable");
         assert_eq!(view.rows[1].label.trim(), "Enable all / Disable all");

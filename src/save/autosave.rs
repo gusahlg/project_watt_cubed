@@ -224,7 +224,7 @@ mod tests {
                 legacy_pose: false,
                 flying: false,
                 noclip: false,
-                stash: Some(vec![]),
+                inventory: Some(vec![]),
             },
         )
     }

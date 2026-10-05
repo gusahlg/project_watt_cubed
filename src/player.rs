@@ -6,7 +6,7 @@ use voxel_engine::DVec3;
 use crate::camera::{Orientation, rotate};
 use crate::coord::Face;
 use crate::math::{Aabb, Bounded, PER_METER};
-use crate::stash::{ElementStash, START_CAPACITY};
+use crate::inventory::{Inventory, START_CAPACITY};
 
 /// The player's collision half-width across the two axes perpendicular to the collision axis.
 /// The extent along it is not a constant — it derives from [`Stance::height`] — so there is no
@@ -166,8 +166,8 @@ pub struct Player {
     /// Current health. Intrinsic and carried on the player, but *not wired*: no
     /// system reads or mutates it yet, so it simply holds [`MAX_HEALTH`].
     pub health: f32,
-    /// Elements this player holds. Core-owned; mods present and spend it.
-    pub stash: ElementStash,
+    /// Configurations this player holds. Core-owned; mods present and spend it.
+    pub inventory: Inventory,
     /// Cruising past the speed limit (see [`Cruise`]); `None` in ordinary motion.
     pub cruise: Option<Cruise>,
 }
@@ -184,7 +184,7 @@ impl Player {
             speed: DEFAULT_WALK_SPEED,
             fly_speed: DEFAULT_FLY_SPEED,
             health: MAX_HEALTH,
-            stash: ElementStash::new(START_CAPACITY),
+            inventory: Inventory::new(START_CAPACITY),
             cruise: None,
         }
     }

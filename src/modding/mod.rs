@@ -1,6 +1,6 @@
 //! The mod host: the game's "minimal core, layers on top" made real. Core
 //! gameplay owns the world, the law and physics; everything player-facing that
-//! isn't essential — the inventory, the hotbar, block looks and names, HUD
+//! isn't essential — the inventory panel, block looks and names, HUD
 //! widgets — is a [`Mod`] that can be toggled at runtime from the mod menu.
 //!
 //! Mods are **compiled in**. A mod package (`.pwcmod`, see the PWC package
@@ -37,7 +37,7 @@ use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
-/// Group id of the first-party essentials (menus, inventory, hotbar, looks, names, worldgen).
+/// Group id of the first-party essentials (menus, inventory, looks, names, worldgen).
 pub const ESSENTIALS: &str = "essentials";
 
 /// The well-known essentials group. Mods returning [`ESSENTIALS`] from [`Mod::group`] are shown
@@ -45,7 +45,7 @@ pub const ESSENTIALS: &str = "essentials";
 pub const ESSENTIALS_GROUP: Group = Group {
     id: ESSENTIALS,
     name: "Essentials",
-    description: "Menus, inventory, hotbar, looks, names and worldgen.",
+    description: "Menus, inventory, looks, names and worldgen.",
 };
 
 /// Named group of related mods. The id is the stable key; the display name
@@ -129,8 +129,67 @@ pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
     }
 }
 
+/// One rebindable control a mod declares. The core keeps the chord table and
+/// reports which fired; it does not know what the action means. There is no
+/// controls screen yet: [`Action::label`] is what that screen will show.
+#[derive(Clone, Copy)]
+pub struct Action {
+    /// Stable id (`"inventory.toggle"`). [`ModContext::action`] matches it.
+    pub id: &'static str,
+    /// Text a controls screen would show next to the binding.
+    pub label: &'static str,
+    /// Chords that fire the action, unless a core binding already uses that chord.
+    pub default: &'static [crate::input::intent::Chord],
+    /// When true, the action autofires with the same timing as breaking and placing.
+    pub repeat: bool,
+}
+
+/// Which declared actions fired this frame. At most [`ActionSet::CAP`] actions;
+/// the bit is the action's index in the router's table. [`Copy`], so a skipped
+/// mod tick can queue the set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActionSet(u128);
+
+impl ActionSet {
+    pub const NONE: Self = Self(0);
+    pub const CAP: usize = 128;
+
+    pub fn insert(&mut self, index: usize) {
+        if index < Self::CAP {
+            self.0 |= 1u128 << index;
+        }
+    }
+
+    pub fn contains(self, index: usize) -> bool {
+        index < Self::CAP && self.0 & (1u128 << index) != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// What a primary action did with a tool. `cell` is the targeted configuration
+/// before the reaction. The core does not draw this; a mod may.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolUse {
+    NoReaction,
+    /// The targeted cell became air.
+    CellDissolved { cell: BlockId },
+    /// The tool was used up.
+    ToolDissolved { cell: BlockId },
+    /// The tool gained an element from the cell.
+    Drew { cell: BlockId },
+    /// The tool gave an element to the cell.
+    Gave { cell: BlockId },
+    /// Elements moved both ways.
+    Exchanged { cell: BlockId },
+}
+
 /// The coarse, per-frame state a mod may read and mutate. Deliberately holds only
 /// whole-game handles (never a voxel), so a mod can't reach into the hot path.
+/// `#[non_exhaustive]`: build one with [`ModContext::new`] and set the fields you need.
+#[non_exhaustive]
 pub struct ModContext<'a> {
     pub player: &'a mut Player,
     pub world: &'a mut World,
@@ -141,17 +200,17 @@ pub struct ModContext<'a> {
     /// Placement cell resolved from the exact frame that raised `place`.
     /// Fixed-cadence replay may run after the player has moved or looked away.
     pub place_target: Option<(i32, i32, i32)>,
-    pub toggle_inventory: bool,
     pub nav_up: bool,
     pub nav_down: bool,
     pub nav_left: bool,
     pub nav_right: bool,
     pub nav_tab: bool,
     pub nav_confirm: bool,
-    /// A hotbar key this frame: `Some(0)` = the bare hand (key 0), `Some(1..=9)` = a slot.
-    pub hotbar_key: Option<u8>,
-    /// Wheel steps this frame: +1 next slot, −1 previous.
-    pub hotbar_cycle: i8,
+    /// Signed scroll steps this frame (a notch is about 1). Zero when mod logic is off.
+    pub wheel: i8,
+    /// Whether a mod panel may open. Captured with the edge, so a toggle taken
+    /// while the HUD is hidden does not open a panel when it is replayed.
+    pub mod_ui: bool,
     /// True when a server owns evaluation (reactions and tool use run there).
     pub networked: bool,
     /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
@@ -159,9 +218,63 @@ pub struct ModContext<'a> {
     /// and doesn't overlap the player — mods that spend resources on a placement
     /// should pre-check the same so their accounting stays exact.
     pub placements: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
+    pub(crate) fired: ActionSet,
+    pub(crate) ids: &'a [&'static str],
+    /// Ids from [`ModContext::set_action`]. Empty on the game path, so it allocates nothing.
+    pub(crate) extra: Vec<&'static str>,
 }
 
-impl ModContext<'_> {
+impl<'a> ModContext<'a> {
+    /// A context for tests: 800×600, panels allowed, no edges, empty placements.
+    pub fn new(player: &'a mut Player, world: &'a mut World) -> Self {
+        Self {
+            player,
+            world,
+            screen_w: 800,
+            screen_h: 600,
+            place: false,
+            place_target: None,
+            nav_up: false,
+            nav_down: false,
+            nav_left: false,
+            nav_right: false,
+            nav_tab: false,
+            nav_confirm: false,
+            wheel: 0,
+            mod_ui: true,
+            networked: false,
+            placements: Vec::new(),
+            fired: ActionSet::NONE,
+            ids: &[],
+            extra: Vec::new(),
+        }
+    }
+
+    /// Whether the action `id` fired this frame. True if any enabled mod's
+    /// action with that id fired.
+    pub fn action(&self, id: &str) -> bool {
+        self.ids.iter().enumerate().any(|(i, name)| *name == id && self.fired.contains(i))
+            || self.extra.iter().enumerate().any(|(i, name)| *name == id && self.fired.contains(self.ids.len() + i))
+    }
+
+    /// Mark `id` fired. For tests; the game path fills [`Self::fired`] instead.
+    pub fn set_action(&mut self, id: &'static str) {
+        if let Some(i) = self.ids.iter().position(|name| *name == id) {
+            self.fired.insert(i);
+            return;
+        }
+        if let Some(i) = self.extra.iter().position(|name| *name == id) {
+            self.fired.insert(self.ids.len() + i);
+            return;
+        }
+        let i = self.ids.len() + self.extra.len();
+        if i >= ActionSet::CAP {
+            return;
+        }
+        self.extra.push(id);
+        self.fired.insert(i);
+    }
+
     /// A machine changed matter at `pos`: wake that cell's contacts in the reaction scheduler.
     /// Chunk load/gen/mesh/save never do this. No-op on a client connected to a server (the
     /// authority runs the scheduler).
@@ -223,11 +336,12 @@ impl<'a> CommandContext<'a> {
 ///
 /// Arbitration when more than one enabled mod implements a hook:
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
-///   `on_place_rejected`, `on_tool_changed`. `hud` uses the same order as z-order (later
-///   draws on top). `commands` lists concatenate in the same order.
+///   `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the same order as z-order
+///   (later draws on top). `commands` lists concatenate in the same order. `actions` are collected,
+///   not arbitrated: each enabled mod's list is its own.
 /// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` and `on_toggle_fly`
 ///   (first `true`),
-///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `held`, `run_command` (first `Some`).
+///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool`, `run_command` (first `Some`).
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
@@ -258,7 +372,7 @@ pub trait Mod {
 
     /// Clear per-world state (crafted blocks, open panels) when entering a
     /// different world. Enable/disable choices are NOT touched — those persist
-    /// across worlds. The element stash lives on the player, not here.
+    /// across worlds. The inventory lives on the player, not here.
     fn reset(&mut self) {}
 
     /// Cadence-controlled logic while enabled (the game's `mod_hz`). Runs
@@ -278,14 +392,14 @@ pub trait Mod {
     }
 
     /// A block was broken into this configuration. The core has already deposited
-    /// it into the player stash; this is a notification. `overflow` is true
-    /// when the stash dropped it (capacity).
+    /// it into the player inventory; this is a notification. `overflow` is true
+    /// when the inventory dropped it (capacity).
     fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
         let _ = (id, world, overflow);
     }
 
     /// The server rejected a break this client predicted (someone else won the
-    /// cell). The core has already revoked the loot from the stash; this is a
+    /// cell). The core has already revoked the loot from the inventory; this is a
     /// notification.
     fn on_break_rejected(&mut self, id: BlockId) {
         let _ = id;
@@ -297,19 +411,28 @@ pub trait Mod {
         let _ = (id, world);
     }
 
-    /// The configuration the player holds as a tool, if any (first enabled mod that answers
-    /// wins; `None` everywhere = the bare hand, which breaks blocks). The core runs the law
-    /// between this configuration and the targeted block on a left click.
-    fn held(&self, player: &Player) -> Option<BlockId> {
+    /// Controls this mod wants sampled while it is enabled. The core owns the chord
+    /// table; a core binding wins any clash. Default is none.
+    fn actions(&self) -> &[Action] {
+        &[]
+    }
+
+    /// The configuration a primary action applies, if any (first enabled mod that answers
+    /// wins). `None` means no tool: the primary action breaks the block into the inventory.
+    fn tool(&self, player: &Player) -> Option<BlockId> {
         let _ = player;
         None
     }
 
     /// A held unit changed configuration through a tool reaction: one unit of `old` became one
-    /// unit of `new` (`AIR` when the tool was used up). The core already updated the stash; a
-    /// hotbar follows the unit here.
+    /// unit of `new` (`AIR` when the tool was used up). The core already updated the inventory.
     fn on_tool_changed(&mut self, old: BlockId, new: BlockId) {
         let _ = (old, new);
+    }
+
+    /// A primary action finished. `outcome` says what the law did; the core draws nothing for it.
+    fn on_tool_used(&mut self, outcome: ToolUse) {
+        let _ = outcome;
     }
 
     /// Optional material namer. First enabled mod that returns `Some` names every
@@ -342,7 +465,7 @@ pub trait Mod {
     /// under the console. A mod describes *what* to show and never draws, so
     /// panel chrome and layout live in one place ([`crate::ui::render_hud`]).
     /// `world` gives read access to the registry so names resolve at build time
-    /// rather than being cached. `player` is the one path to the core stash.
+    /// rather than being cached. `player` is the one path to the core inventory.
     fn hud(&self, world: &World, player: &Player, screen: (i32, i32), out: &mut Vec<HudElement>) {
         let _ = (world, player, screen, out);
     }
@@ -439,6 +562,9 @@ pub struct Mods {
     entries: Vec<Entry>,
     /// Groups declared by packages, after the well-known [`ESSENTIALS_GROUP`].
     declared_groups: Vec<Group>,
+    /// Bumped when a mod is installed or enabled or disabled, so the input
+    /// table can rebuild once instead of every frame.
+    action_gen: u64,
 }
 
 impl Mods {
@@ -459,6 +585,7 @@ impl Mods {
         Self {
             entries: Vec::new(),
             declared_groups: Vec::new(),
+            action_gen: 0,
         }
     }
 
@@ -473,6 +600,22 @@ impl Mods {
             entry.module.on_enable();
         }
         self.entries.push(entry);
+        self.bump_actions();
+    }
+
+    fn bump_actions(&mut self) {
+        self.action_gen = self.action_gen.wrapping_add(1);
+    }
+
+    /// Generation of the enabled action lists. Changes when a mod is installed
+    /// or switched on or off.
+    pub fn action_generation(&self) -> u64 {
+        self.action_gen
+    }
+
+    /// Actions of every enabled mod, in install order.
+    pub fn enabled_actions(&self) -> impl Iterator<Item = &Action> + '_ {
+        self.entries.iter().filter(|e| e.enabled).flat_map(|e| e.module.actions())
     }
 
     /// Groups shown as sections on the mods screen, in this order: the well-known essentials,
@@ -538,9 +681,14 @@ impl Mods {
         self.each_enabled(|m| m.on_tool_changed(old, new));
     }
 
-    /// What the player holds as a tool: the first enabled mod that answers.
-    pub fn held(&self, player: &Player) -> Option<BlockId> {
-        self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.held(player))
+    /// Fan a finished primary action out to every enabled mod.
+    pub fn on_tool_used(&mut self, outcome: ToolUse) {
+        self.each_enabled(|m| m.on_tool_used(outcome));
+    }
+
+    /// The configuration a primary action applies: the first enabled mod that answers.
+    pub fn tool(&self, player: &Player) -> Option<BlockId> {
+        self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.tool(player))
     }
 
     /// The first enabled namer, if any.
@@ -673,6 +821,7 @@ impl Mods {
         } else {
             entry.module.on_disable();
         }
+        self.bump_actions();
     }
 
     pub fn knobs(&self, index: usize) -> Vec<Knob> {
@@ -1059,7 +1208,7 @@ mod tests {
         let spec = world.registry().spec(rock);
         mods.load_state("hotbar", &format!("v1;sel=1;1={spec}"), &mut world);
         let saved = mods.save_states(&world);
-        assert!(saved.iter().all(|(k, _)| k != "inventory"), "the stash is core state, not an inventory save line");
+        assert!(saved.iter().all(|(k, _)| k != "inventory"), "the inventory is core state, not an inventory save line");
         let bar = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()).expect("hotbar");
         assert_eq!(bar, format!("v1;sel=1;1={spec}"));
         let mut fresh = crate::modding::testing::standard();

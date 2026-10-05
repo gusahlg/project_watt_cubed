@@ -162,7 +162,7 @@ impl HudMode {
         matches!(self, HudMode::Full)
     }
 
-    /// Whether mod-contributed HUD widgets (hotbar, stash) are shown. Gameplay
+    /// Whether mod-contributed HUD widgets are shown. Gameplay
     /// UI like the reticle: everything but `Off`.
     pub fn shows_mod_hud(self) -> bool {
         !matches!(self, HudMode::Off)
