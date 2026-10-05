@@ -277,6 +277,13 @@ pub trait TerrainGenerator: Send + Sync {
         }
     }
 
+    /// Surface block, tree cover and leaf of one start-world chart column (face in
+    /// [`crate::space::atlas::FACES`] order). `None` when this generator has no home chart.
+    /// Slope neighbours are not sampled.
+    fn home_far_column(&self, _face: usize, _u: i32, _v: i32) -> Option<(BlockId, f32, BlockId)> {
+        None
+    }
+
     /// Face-local twin of [`lod_column`](Self::lod_column). `alts` are world altitudes
     /// along `face`'s normal. PosY is today's column; any other face is air unless overridden.
     fn lod_column_face(&self, _body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {

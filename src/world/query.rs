@@ -102,6 +102,11 @@ impl World {
         self.generator.as_ref()
     }
 
+    /// Shared generator handle. Cloning the `Arc` does not allocate.
+    pub(crate) fn terrain_arc(&self) -> super::terrain::Generator {
+        Arc::clone(&self.generator)
+    }
+
     /// Incremented when blocks are edited.
     pub fn edit_generation(&self) -> u64 {
         self.edit_generation

@@ -11,6 +11,7 @@ mod atmosphere;
 mod bodies;
 mod clock;
 pub mod palette;
+pub(crate) mod planet_map;
 mod rocks;
 mod weather;
 
@@ -51,6 +52,8 @@ pub struct Sky {
     pub day_length: DayLength,
     /// Reused list of planets, moons and the home cube for the sky pass.
     far: bodies::FarBodies,
+    /// Home albedo cube map, baked off the main thread.
+    maps: planet_map::PlanetBake,
     /// Reused distant-asteroid boxes.
     rocks: rocks::DistantRocks,
 }
@@ -93,6 +96,39 @@ impl Sky {
         }
     }
 
+    /// Start the home albedo bake once. The closure runs only on that first call,
+    /// and test builds never start the thread.
+    pub(crate) fn drive_planet(
+        &mut self,
+        generator: impl FnOnce() -> crate::world::terrain::Generator,
+        registry: &crate::block::registry::BlockRegistry,
+    ) {
+        if self.maps.started() {
+            return;
+        }
+        #[cfg(not(test))]
+        {
+            self.maps.ensure(generator(), registry);
+        }
+        #[cfg(test)]
+        {
+            let _ = (generator, registry);
+        }
+    }
+
+    /// Datum, horizon and any faces baked so far. Drawing still uses the sphere.
+    pub(crate) fn planet(&self) -> Option<planet_map::PlanetHandle<'_>> {
+        let (datum_res, datum, radius) = self.far.map_parts()?;
+        Some(planet_map::PlanetHandle {
+            datum_res,
+            datum,
+            radius,
+            horizon: self.far.horizon(),
+            preview: self.maps.faces(false),
+            full: self.maps.faces(true),
+        })
+    }
+
     /// Draw the procedural sky, the far-body impostors and distant asteroids.
     /// Only sun geometry + disc tint cross here; the gradient/glow colours are
     /// read GPU-side from the shared per-frame UBO (the same linear source the
@@ -108,9 +144,27 @@ impl Sky {
         generator: &dyn TerrainGenerator,
         view_blocks: f64,
     ) {
+        self.maps.poll();
         f.set_sky(self.desc(frame));
         f.set_far_bodies(self.far.update(generator, eye));
+        // Home stays a sphere until the engine's mapped shape lands. Reading the
+        // handle keeps its fields live for that draw.
+        if let Some(mapped) = self.planet() {
+            let _ = (
+                mapped.datum_res,
+                mapped.datum.len(),
+                mapped.radius,
+                mapped.horizon,
+                mapped.preview,
+                mapped.full,
+            );
+        }
         f.set_sun_override(self.far.sun_override());
         self.rocks.draw(f, generator, eye, view_blocks);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warm_far(&mut self, generator: &dyn TerrainGenerator, eye: DVec3) {
+        let _ = self.far.update(generator, eye);
     }
 }

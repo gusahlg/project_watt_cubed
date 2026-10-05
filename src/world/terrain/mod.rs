@@ -2118,6 +2118,20 @@ impl TerrainGenerator for Terrain {
         super::generation::sample_column_heights(self, cx, cz)
     }
 
+    fn home_far_column(&self, face: usize, u: i32, v: i32) -> Option<(BlockId, f32, BlockId)> {
+        let face = crate::space::atlas::FACES.get(face).copied()?;
+        let body = self.cosmos.home();
+        let (surface, trees, species) = self.paint(body, face).shape.far(u, v);
+        let leaf = match species {
+            province::Species::None => AIR,
+            province::Species::Broadleaf => self.m.leaves,
+            province::Species::Conifer => self.m.pine,
+            province::Species::Autumn => self.m.autumn,
+            province::Species::Blossom => self.m.blossom,
+        };
+        Some((surface, trees, leaf))
+    }
+
     fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
         if stored(wx) {
             if let Some(s) = self.home_surface_y(wx, wz) {
