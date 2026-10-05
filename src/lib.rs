@@ -58,5 +58,12 @@ pub use material;
 /// Run the game with the mod packages of `build` (`GameBuild::vanilla()` for the bare game).
 /// Returns when the window closes.
 pub fn run(build: modding::GameBuild) {
+    // The material palette is searched once per process (~0.5 s). Start it now, off the main thread,
+    // so the first world finds it ready instead of stalling its first frame.
+    let _ = std::thread::Builder::new()
+        .name("palette".into())
+        .spawn(|| {
+            world::terrain::palette::current();
+        });
     app::App::new(&build).run();
 }
