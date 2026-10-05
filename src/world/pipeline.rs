@@ -5,8 +5,8 @@
 //! Threading model:
 //! - `clamp(cores - 2, 1, 12)` worker threads share ONE [`JobQueue`] behind a
 //!   `Mutex` and separate work/pace condition variables. A worker holds the
-//!   lock only while dequeuing (or waiting); every job runs unlocked. The
-//!   velocity-aware pacer may park a suffix of the pool during fast travel.
+//!   lock only while dequeuing (or waiting); every job runs unlocked. Fast
+//!   travel shrinks the loading window; speed does not park workers.
 //! - Jobs carry owned value data only (a generator clone, a voxel snapshot,
 //!   border planes, an `Arc`'d solidity table). Workers never submit GPU
 //!   commands, touch the `World`, or the live chunk map — they may write
@@ -26,7 +26,7 @@
 //!   Bounded even mid-burst (a worker finishes at most its current job), and
 //!   a stuck GPU can never block it — workers never issue GPU calls.
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI8, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -681,15 +681,25 @@ pub(in crate::world) struct ViewGate {
     fx: AtomicI32,
     fz: AtomicI32,
     /// Horizontal view radius in chunks; `i32::MAX` (permissive) until set.
-    /// Near distance is 3-D chess against this one radius.
+    /// Near distance is 3-D chess against this one radius. While the loading
+    /// window is tight this is the loading radius, not the draw radius.
     radius: AtomicI32,
+    /// Vertical loading radius. `i32::MAX` keeps the historical rule: distance
+    /// along the up axis never deschedules.
+    v_radius: AtomicI32,
+    /// Chunks past the horizontal radius a queued near job still survives.
+    /// [`CANCEL_MARGIN`] at rest; the data shell while the loading window is tight.
+    margin: AtomicI32,
+    /// Dominant-axis sign of travel (`0` at rest). A change bumps the epoch so
+    /// a reversal drops behind jobs without waiting for a chunk cross.
+    heading: AtomicI8,
     /// Streaming up: a [`Face`] discriminant, or [`UP_NONE`] when isotropic.
     /// Default is +Y so an unset gate matches the historical XZ metric
     /// (`dy == 0`).
     up: AtomicU8,
-    /// Monotone stamp of the centres, radius, up and chart nets: bumped only
-    /// when one actually changes, so the queues' O(n) re-key/deschedule rebuild
-    /// runs once per boundary cross instead of once per pop.
+    /// Monotone stamp of the centres, radii, margin, heading, up and chart nets:
+    /// bumped only when one actually changes, so the queues' O(n) re-key rebuild
+    /// runs once per boundary cross (or loading-radius step) instead of once per pop.
     epoch: AtomicU64,
     /// Far-field descheduling horizon in METRES (`f64` bits; +∞ until set):
     /// the outer ladder radius plus the velocity lookahead, refreshed every
@@ -731,6 +741,9 @@ impl ViewGate {
             fx: AtomicI32::new(0),
             fz: AtomicI32::new(0),
             radius: AtomicI32::new(i32::MAX),
+            v_radius: AtomicI32::new(i32::MAX),
+            margin: AtomicI32::new(CANCEL_MARGIN),
+            heading: AtomicI8::new(0),
             up: AtomicU8::new(Face::PosY as u8),
             epoch: AtomicU64::new(0),
             far_m: AtomicU64::new(f64::INFINITY.to_bits()),
@@ -771,6 +784,9 @@ impl ViewGate {
         cz: i32,
         far: FarView,
         radius: i32,
+        v_radius: i32,
+        margin: i32,
+        heading: i8,
         far_m: f64,
         vel_x: f64,
         vel_y: f64,
@@ -795,6 +811,9 @@ impl ViewGate {
             && self.fx.load(Ordering::Relaxed) == far.x
             && self.fz.load(Ordering::Relaxed) == far.z
             && self.radius.load(Ordering::Relaxed) == radius
+            && self.v_radius.load(Ordering::Relaxed) == v_radius
+            && self.margin.load(Ordering::Relaxed) == margin
+            && self.heading.load(Ordering::Relaxed) == heading
             && self.up.load(Ordering::Relaxed) == up_code;
         let same_far = self.far_m.load(Ordering::Relaxed) == far_bits;
         let same_vel = self.vel_x.load(Ordering::Relaxed) == vx
@@ -818,6 +837,9 @@ impl ViewGate {
             self.fx.store(far.x, Ordering::Relaxed);
             self.fz.store(far.z, Ordering::Relaxed);
             self.radius.store(radius, Ordering::Relaxed);
+            self.v_radius.store(v_radius, Ordering::Relaxed);
+            self.margin.store(margin, Ordering::Relaxed);
+            self.heading.store(heading, Ordering::Relaxed);
             self.up.store(up_code, Ordering::Relaxed);
             self.epoch.fetch_add(1, Ordering::Release);
         }
@@ -952,10 +974,40 @@ impl ViewGate {
         )
     }
 
-    /// Whether a job at this chunk is still worth running.
+    /// Whether a job at this chunk is still worth running. A permissive radius
+    /// keeps every job. Otherwise the chunk must sit inside the published
+    /// radius plus margin, inside the vertical loading radius when one is set,
+    /// and not strictly behind the player.
     fn wanted(&self, x: i32, y: i32, z: i32) -> bool {
         let radius = self.radius.load(Ordering::Relaxed);
-        radius == i32::MAX || self.dist(x, y, z) <= radius + CANCEL_MARGIN
+        if radius == i32::MAX {
+            return true;
+        }
+        let margin = self.margin.load(Ordering::Relaxed);
+        if self.dist(x, y, z) > radius + margin {
+            return false;
+        }
+        let vr = self.v_radius.load(Ordering::Relaxed);
+        let (x, y, z) = self.folded(x, y, z);
+        let (px, py, pz) = self.center();
+        if vr != i32::MAX
+            && let Some(face) = self.up_face()
+        {
+            let along = match face.axis() {
+                0 => (x - px).abs(),
+                1 => (y - py).abs(),
+                _ => (z - pz).abs(),
+            };
+            if along > vr + margin {
+                return false;
+            }
+        }
+        !super::streaming::chunk_behind(
+            Coord::new(px, py, pz),
+            Coord::new(x, y, z),
+            self.velocity(),
+            self.up_face(),
+        )
     }
 
     /// The far eye in metres — the far centre chunk's centre (the streaming centre's height),
@@ -1404,8 +1456,45 @@ impl Workers {
         vel_z: f64,
         up: Option<Face>,
     ) {
-        self.view
-            .publish(cx, cy, cz, far, radius, far_m, vel_x, vel_y, vel_z, up);
+        self.view.publish(
+            cx,
+            cy,
+            cz,
+            far,
+            radius,
+            i32::MAX,
+            CANCEL_MARGIN,
+            0,
+            far_m,
+            vel_x,
+            vel_y,
+            vel_z,
+            up,
+        );
+    }
+
+    /// Publish a speed-reduced loading horizon: horizontal `radius`, vertical
+    /// `v_radius`, `margin` past each, and the travel `heading`. The draw radius
+    /// stays on the world; this only decides which queued near jobs still run.
+    pub(in crate::world) fn set_load_view(
+        &self,
+        cx: i32,
+        cy: i32,
+        cz: i32,
+        far: FarView,
+        radius: i32,
+        v_radius: i32,
+        margin: i32,
+        heading: i8,
+        far_m: f64,
+        vel_x: f64,
+        vel_y: f64,
+        vel_z: f64,
+        up: Option<Face>,
+    ) {
+        self.view.publish(
+            cx, cy, cz, far, radius, v_radius, margin, heading, far_m, vel_x, vel_y, vel_z, up,
+        );
     }
 
     /// Publish the chart net around a storage centre to the job gate.
@@ -2129,13 +2218,24 @@ mod tests {
         gate.set(0, 0, 0, 20);
         gate.set_active_workers(2); // near cap = max(2 * 4, 8)
 
-        // Equal distance, trailing inserted first: direction must win.
+        // Equal distance, trailing inserted first. The trail is behind the
+        // player and is descheduled; the leading column runs.
         assert!(q.push(near(-5), &gate));
         assert!(q.push(near(5), &gate));
+        let mut cancelled = Vec::new();
+        let first = q.pop(&gate, &mut cancelled).expect("the leading edge runs");
         assert!(matches!(
-            pop_clean(&mut q, &gate),
-            Some(Job::GenerateColumn { key: ColumnKey { a: 5, b: 0, .. }, .. })
+            first,
+            Job::GenerateColumn { key: ColumnKey { a: 5, b: 0, .. }, .. }
         ));
+        assert_eq!(
+            cancelled,
+            vec![JobKey::Column {
+                key: ColumnKey { face: Face::PosY, a: -5, b: 0 },
+                range: 0..=0,
+            }],
+            "the trailing column is descheduled"
+        );
 
         // Refill to the adaptive lookahead ceiling. Rejection leaves ownership
         // with the caller, which therefore never claims doomed extra work.
@@ -2145,6 +2245,55 @@ mod tests {
         }
         assert!(!q.push(near(19), &gate));
         assert_eq!(q.near.len(), 8);
+    }
+
+    /// A tight loading horizon deschedules queued near work that left it:
+    /// past the horizontal radius, strictly behind, or above the vertical radius.
+    #[test]
+    fn load_view_drops_work_outside_the_loading_radius() {
+        let terrain = generator(0);
+        let column = |a: i32, alt: i32| Job::GenerateColumn {
+            key: ColumnKey { face: Face::PosY, a, b: 0 },
+            range: alt..=alt,
+            generator: terrain.clone(),
+            edits: Vec::new(),
+        };
+        let mut q = JobQueue::default();
+        let gate = ViewGate::new();
+        assert!(q.push(column(2, 0), &gate));
+        assert!(q.push(column(4, 0), &gate));
+        assert!(q.push(column(-1, 0), &gate));
+        assert!(q.push(column(0, 3), &gate));
+        gate.publish(
+            0,
+            0,
+            0,
+            FarView::flat(0, 0),
+            2,
+            1,
+            1,
+            1,
+            f64::INFINITY,
+            600.0,
+            0.0,
+            0.0,
+            Some(Face::PosY),
+        );
+        let mut cancelled = Vec::new();
+        let kept = q.pop(&gate, &mut cancelled).expect("the near column runs");
+        assert!(
+            matches!(
+                &kept,
+                Job::GenerateColumn {
+                    key: ColumnKey { a: 2, b: 0, .. },
+                    range,
+                    ..
+                } if range == &(0..=0)
+            ),
+            "only the chunk inside the loading radius runs"
+        );
+        assert_eq!(cancelled.len(), 3, "outside, behind, and too high drop: {cancelled:?}");
+        assert!(q.pop(&gate, &mut cancelled).is_none(), "nothing else was wanted");
     }
 
     #[test]
@@ -2270,7 +2419,21 @@ mod tests {
         // The streaming centre is far from both sections; the far centre is section 0's chunk, and
         // the horizon reaches it but not section 50.
         let far = FarView::flat(wx0.div_euclid(16) as i32, wz0.div_euclid(16) as i32);
-        gate.publish(1_000_000, 0, 1_000_000, far, 8, 3_000.0 - span0 as f64, 0.0, 0.0, 0.0, Some(Face::PosY));
+        gate.publish(
+            1_000_000,
+            0,
+            1_000_000,
+            far,
+            8,
+            i32::MAX,
+            CANCEL_MARGIN,
+            0,
+            3_000.0 - span0 as f64,
+            0.0,
+            0.0,
+            0.0,
+            Some(Face::PosY),
+        );
         let mut cancelled = Vec::new();
         let popped = q.pop(&gate, &mut cancelled).expect("the section under the far centre survives");
         assert_eq!(section_id(&popped), 0);

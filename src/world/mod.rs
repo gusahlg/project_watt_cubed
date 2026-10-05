@@ -1105,8 +1105,31 @@ pub struct World {
     /// a standing eye does not.
     gen_cursor_vel: DVec3,
     gen_cursor_ranked: bool,
+    /// Loading radii and travel heading `gen_columns` was gathered for.
+    gen_cursor_lh: i32,
+    gen_cursor_lv: i32,
+    gen_cursor_heading: i8,
+    /// Radii new generation, light and mesh may cover. `-1` until the first
+    /// stream, which means the full view. Already-loaded chunks outside this
+    /// stay until the unload box frees them.
+    load_h: i32,
+    load_v: i32,
+    load_moved: bool,
+    heading_changed: bool,
+    /// The loading window was smaller than the view, so the next full-radius
+    /// pass seeds the chunks that window never asked for.
+    load_reduced: bool,
+    load_heading: i8,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
+    /// Worker results integrated, and claim keys released by deschedule.
+    /// The flight bench reads these; a quiet frame does not touch them.
+    jobs_completed: u64,
+    jobs_cancelled: u64,
+    /// Chunks stored from a generate result, and how many of those were already
+    /// behind the player (the flight bench's wasted-work count).
+    gen_landed: u64,
+    gen_landed_behind: u64,
     /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
     building_meshes: usize,
     /// `SectionState::Meshing` claims. Counter so idle `pump` never scans sections.
@@ -1517,7 +1540,20 @@ impl World {
             gen_cursor_dirty: false,
             gen_cursor_vel: DVec3::ZERO,
             gen_cursor_ranked: false,
+            gen_cursor_lh: i32::MIN,
+            gen_cursor_lv: i32::MIN,
+            gen_cursor_heading: 0,
+            load_h: -1,
+            load_v: -1,
+            load_moved: false,
+            heading_changed: false,
+            load_reduced: false,
+            load_heading: 0,
             generating: FastSet::default(),
+            jobs_completed: 0,
+            jobs_cancelled: 0,
+            gen_landed: 0,
+            gen_landed_behind: 0,
             building_meshes: 0,
             meshing_sections: 0,
             pending_gen: Sticky::default(),
@@ -1919,7 +1955,16 @@ impl World {
         }
         let cov = self.view.coverage();
         let cs = CHUNK_SIZE as i32;
-        let (h_lim, v_lim) = (0.75 * cov.half.x, 0.75 * cov.half.y);
+        let (mut h_lim, mut v_lim) = (0.75 * cov.half.x, 0.75 * cov.half.y);
+        // A speed-reduced window is not covering the view. Only chunks it
+        // actually loads can prove a section redundant; the rest of the view
+        // keeps its far-field draw without a backing-chunk scan.
+        if self.load_h >= 0 && self.load_h < self.view.horizontal {
+            h_lim = 0.75 * (self.load_h.max(0) * cs) as f32;
+        }
+        if self.load_v >= 0 && self.load_v < self.view.vertical {
+            v_lim = 0.75 * (self.load_v.max(0) * cs) as f32;
+        }
         // The f64 eye XZ was floored to `center` before this lane; inflate the reach
         // by one chunk half-diagonal so the true eye can't sit outside our bound.
         let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
@@ -2565,7 +2610,7 @@ fn near_motion_order(world: &World, center: Coord, key: Coord) -> u64 {
     let scale = CHUNK_SIZE as f64;
     bias_order(
         base,
-        world.section_vel,
+        world.stream_pacer.travel(),
         (key.x - center.x) as f64 * scale,
         (key.y - center.y) as f64 * scale,
         (key.z - center.z) as f64 * scale,
@@ -2617,6 +2662,7 @@ impl StreamLane for MeshLane {
         // Cheapest-first: hash, arithmetic, quarantine set, neighbours, light.
         world.is_needs_mesh(key)
             && world.in_mesh_box(key)
+            && world.admits_mesh(key)
             && !world
                 .quarantined
                 .contains(&streaming::FailKey::Mesh { coord: key })
@@ -2716,7 +2762,7 @@ impl StreamLane for SectionLane {
         &mut world.pending_sections
     }
     fn for_each_geometry(world: &World, center: Coord, mut visit: impl FnMut(SectionPos)) {
-        for &s in &world.section_desired {
+        let consider = |s: SectionPos, visit: &mut dyn FnMut(SectionPos)| {
             if !world.sections.contains_key(&s)
                 && !world
                     .quarantined
@@ -2725,6 +2771,42 @@ impl StreamLane for SectionLane {
             {
                 visit(s);
             }
+        };
+        // At rest every hole is a candidate. While moving, the deadline submits
+        // only a few, so rank a fixed handful by chess distance before the hash
+        // and coverage checks. Scanning the whole frontier every chunk step is
+        // what made a fast frame grow with speed.
+        if world.stream_pacer.effort() >= 1.0 || world.stream_pacer.boosting() {
+            for &s in &world.section_desired {
+                consider(s, &mut visit);
+            }
+            return;
+        }
+        const CAP: usize = 32;
+        let mut best: Vec<(u64, SectionPos)> = Vec::with_capacity(CAP);
+        let mut ranked = false;
+        for &s in &world.section_desired {
+            let d = Self::order(world, center, s);
+            if !ranked {
+                best.push((d, s));
+                if best.len() == CAP {
+                    best.sort_unstable_by_key(|e| e.0);
+                    ranked = true;
+                }
+                continue;
+            }
+            if d >= best[CAP - 1].0 {
+                continue;
+            }
+            best[CAP - 1] = (d, s);
+            let mut i = CAP - 1;
+            while i > 0 && best[i].0 < best[i - 1].0 {
+                best.swap(i, i - 1);
+                i -= 1;
+            }
+        }
+        for (_, s) in best {
+            consider(s, &mut visit);
         }
     }
     fn order(_world: &World, center: Coord, key: SectionPos) -> u64 {
@@ -2852,10 +2934,14 @@ impl StreamLane for LightLane {
     fn in_flight(world: &World, key: Coord) -> bool {
         world.light_inflight.contains(&key)
     }
+    fn ready(world: &World, key: Coord) -> bool {
+        world.admits_mesh(key)
+    }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         // `trivial_light` is decided at store time. A worklist seed here is a
         // real re-settle (neighbour border / edit) and must run the flood.
-        if !world.lighting
+        if !world.admits_mesh(key)
+            || !world.lighting
             || !world.chunks.contains_key(&key)
             || world
                 .quarantined

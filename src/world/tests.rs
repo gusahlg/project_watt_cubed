@@ -2043,7 +2043,10 @@ fn view_shrink_prunes_uploads_outside_the_new_mesh_box() {
         ),
         "outside coord's mesh claim is released"
     );
-    assert!(world.mesh_worklist.contains(&outside));
+    assert!(
+        !world.mesh_worklist.contains(&outside),
+        "a chunk outside the draw box is not re-queued"
+    );
     assert!(
         matches!(
             world.chunks[&inside].state,

@@ -89,7 +89,7 @@ impl RingWorklist {
         self.buckets.iter().flat_map(|b| b.iter())
     }
 
-    #[cfg(test)]
+    /// Drop keys the predicate rejects. Membership and buckets stay in agreement.
     pub fn retain(&mut self, mut f: impl FnMut(&Coord) -> bool) {
         for b in &mut self.buckets {
             b.retain(|c| f(c));
