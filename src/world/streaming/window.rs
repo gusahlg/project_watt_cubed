@@ -39,6 +39,8 @@ pub(in crate::world) struct Window {
     pub(in crate::world) stale: bool,
     /// The up face and chart atlas the altitudes are measured in.
     frame: Option<(Option<Face>, Option<usize>)>,
+    /// `punch` was placed under a speed-reduced loading window: the eye band, ground unread.
+    reduced: bool,
 }
 
 /// The punch and held caps at render distance `h`: [`WINDOW_CAP`] and the held slack past it,
@@ -198,9 +200,11 @@ impl World {
     /// past the unload box leaves nothing to keep.
     pub(in crate::world) fn place_window(&mut self, center: Coord, moved: bool) -> bool {
         let prev = self.window.held;
-        if moved || std::mem::take(&mut self.window.stale) {
+        let reduced = !self.loading_full();
+        if moved || reduced != self.window.reduced || std::mem::take(&mut self.window.stale) {
             let before = self.window.punch;
-            self.window.punch = self.punch_window(center);
+            self.window.punch = self.punch_window(center, reduced);
+            self.window.reduced = reduced;
             self.window.frame = Some(self.window_frame(center));
             if self.window.punch != before {
                 self.clip_follow(center);
@@ -235,15 +239,22 @@ impl World {
     /// for the ground while the eye is within the window's width over the highest solid top, and
     /// within what the cap lets it add, and while the eye band is not buried under the lowest one
     /// (one layer of hysteresis each way); otherwise it is the eye band and the far field draws the
-    /// ground.
-    fn punch_window(&mut self, center: Coord) -> Option<[i32; 2]> {
+    /// ground. A `reduced` loading window would not load what the window grows over, so it keeps
+    /// to the eye band and reads no ground; what the window held stays until the far field draws
+    /// it ([`place_window`](Self::place_window)).
+    fn punch_window(&mut self, center: Coord, reduced: bool) -> Option<[i32; 2]> {
         if !self.window_grows(center) {
             self.window = Window::default();
             return None;
         }
-        let ground = self.ground_span(center);
         let (_, eye) = ColumnKey::of(self.live_up()?, center);
         let v = self.view.vertical;
+        if reduced {
+            self.window.grounded = false;
+            let band = [eye - v, eye + v];
+            return Some(self.window.punch.map_or(band, |prev| hold(prev, band)));
+        }
+        let ground = self.ground_span(center);
         let (cap, _) = caps(self.view.horizontal);
         let reach = (2 * self.view.horizontal + 1).min(cap - v - 1);
         let slack = if self.window.grounded { 1 } else { -1 };
@@ -610,11 +621,12 @@ mod tests {
             .count()
     }
 
-    /// Stream at `eye` until the world is complete and the held window is the punch window,
-    /// asserting `bare` finds nothing on any pass. Returns the passes taken.
+    /// Stream at `eye` until the pacer is back to the whole view, the world is complete and the held
+    /// window is the punch window, asserting `bare` finds nothing on any pass. Returns the passes
+    /// taken.
     fn settle(world: &mut World, eye: DVec3, bare: &dyn Fn(&World) -> usize, name: &str) -> usize {
         for pass in 0.. {
-            if world.entry_complete() && world.window.held == world.window.punch {
+            if world.loading_full() && world.entry_complete() && world.window.held == world.window.punch {
                 return pass;
             }
             assert!(pass < 200_000, "{name}: did not settle: {}", world.entry_debug());
@@ -626,6 +638,12 @@ mod tests {
     }
 
     const NONE: &dyn Fn(&World) -> usize = &|_| 0;
+
+    /// The next pass moves the eye at walking pace whatever the step: the pacer sees no travel, so
+    /// the loading window stays the whole view.
+    fn walk(world: &mut World) {
+        world.near_eye_prev = None;
+    }
 
     /// Owner view (16/5), seed 42: 150 and 300 blocks over spawn the window reaches down over the
     /// near square's ground and keeps the eye band, the eye's chunk loads, and once that ground
@@ -710,6 +728,7 @@ mod tests {
         let mut t = Track::default();
         for above in heights {
             let prev = (world.center, world.window.punch);
+            walk(world);
             let (center, _, full, _) = world.begin_stream(world.home_eye(dir, above), None);
             let punch = world.window.punch.expect("a chart window");
             t.moves += usize::from(prev.0 != Some(center));
@@ -809,8 +828,9 @@ mod tests {
     }
 
     /// Flying 1.2 km at eight blocks a pass 100 over the ground at render distance 6, then
-    /// stopping: the world settles, nothing is left waiting on the ground, every column is drawn,
-    /// and no far section draws over ground the window holds.
+    /// stopping: the flight's reduced loading window keeps the near window to the eye band, and
+    /// once stopped the world settles with the window grown back over the ground, nothing left
+    /// waiting on it, every column drawn, and no far section over ground the window holds.
     #[test]
     fn flight_then_stop_settles() {
         let mut world = chart_world(6, 3);
@@ -819,12 +839,19 @@ mod tests {
         let at = |k: i32| DVec3::new(start.x + 8.0 * f64::from(k), f64::from(ground) + 100.0, start.z);
         world.prepare_around(physical(&world, at(0)));
         world.drive_spawn_ready();
+        let mut reduced = 0;
         for k in 0..150 {
             let eye = physical(&world, at(k));
             step(&mut world, eye);
+            if world.window.reduced {
+                reduced += 1;
+                assert!(!world.window.grounded, "pass {k}: a reduced window read the ground");
+            }
         }
+        assert!(reduced > 100, "the flight reduced the window on {reduced} passes of 150");
         let stop = physical(&world, at(150));
         let passes = settle(&mut world, stop, NONE, "stop");
+        assert!(world.window.grounded && !world.window.reduced, "stopped 100 up, the window holds the ground");
         let center = world.center.expect("a centre");
         let cols = near_columns(&world, center);
         println!("settled {passes} passes after stopping, {} chunks", world.chunks.len());
@@ -1026,6 +1053,7 @@ mod tests {
         for k in 1..=40 {
             let fold = world.fold;
             let eye = at(&world, f64::from(k) / 41.0);
+            walk(&mut world);
             step(&mut world, eye);
             crossed |= world.fold != fold;
             assert!(world.window.grounded, "pass {k}: the window let go of the ground");
