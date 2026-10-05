@@ -1004,6 +1004,120 @@ impl World {
         ground
     }
 
+    /// Chunk index of local altitude `alt` along `face`. A positive face's chunk `c` covers
+    /// `[16c, 16c + 16)`. A negative face's local index `ca` covers `[16ca + 1, 16ca + 17)`.
+    fn altitude_chunk(face: Face, alt: i32) -> i32 {
+        let s = CHUNK_SIZE as i32;
+        if face.sign() > 0 { alt.div_euclid(s) } else { alt.saturating_sub(1).div_euclid(s) }
+    }
+
+    /// Ground altitude under `pos` along `face`, cached until that column changes.
+    fn window_surface(&mut self, face: Face, u: i32, v: i32) -> i32 {
+        if let Some((f, cu, cv, ground)) = self.window_ground
+            && f == face
+            && cu == u
+            && cv == v
+        {
+            return ground;
+        }
+        let ground = self.column_surface(face, u, v);
+        self.window_ground = Some((face, u, v, ground));
+        ground
+    }
+
+    /// First open cell along `face` at tangent `(u, v)`. A chart and a physical cube answer
+    /// directly. A stored cube's column is that same face altitude translated into its box.
+    fn column_surface(&self, face: Face, u: i32, v: i32) -> i32 {
+        let direct = self.generator.surface(face, u, v);
+        if direct != i32::MIN || face != Face::PosY {
+            return direct;
+        }
+        let (x, z) = (i64::from(u), i64::from(v));
+        let Some(g) = self.generator.atlases().iter().find_map(|a| {
+            a.grid.filter(|g| {
+                x >= g.origin[0]
+                    && x < g.origin[0] + g.size[0]
+                    && z >= g.origin[2]
+                    && z < g.origin[2] + g.size[2]
+            })
+        }) else {
+            return i32::MIN;
+        };
+        let (Ok(rx), Ok(rz)) = (
+            i32::try_from(g.ref_min[0] + (x - g.origin[0])),
+            i32::try_from(g.ref_min[2] + (z - g.origin[2])),
+        ) else {
+            return i32::MIN;
+        };
+        let world_a = self.generator.surface(Face::PosY, rx, rz);
+        if world_a == i32::MIN {
+            return i32::MIN;
+        }
+        i32::try_from(g.origin[1] + (i64::from(world_a) - g.ref_min[1])).unwrap_or(i32::MIN)
+    }
+
+    /// Slide the near window down the up axis so it holds the ground under `eye`. The window
+    /// centres on that ground chunk — the band standing there would stream — up to the window's
+    /// full horizontal span. Above the span, and while the ground still sits in the eye-centred
+    /// window, the window stays on the eye. Each threshold has a one-chunk band so a hover does
+    /// not slide and release on alternate frames, and a climb does not drag the window up.
+    fn commit_window(&mut self, eye: Coord, pos: DVec3) -> Coord {
+        let Some(face) = self.live_up() else {
+            self.window_drop = 0;
+            self.window_holds = false;
+            return eye;
+        };
+        let local = FaceFrame::new(face).point_to_local(pos);
+        let surface = self.window_surface(face, block_coord(local.x), block_coord(local.z));
+        if surface == i32::MIN {
+            self.window_drop = 0;
+            self.window_holds = false;
+            return eye;
+        }
+        let height = local.y - f64::from(surface);
+        let rv = i64::from(self.view.vertical);
+        let (key, eye_ca) = ColumnKey::of(face, eye);
+        let ground_ca = i64::from(Self::altitude_chunk(face, surface.saturating_sub(1)));
+        let gap = i64::from(eye_ca) - ground_ca;
+        let limit = f64::from((2 * self.view.horizontal + 1) * CHUNK_SIZE as i32);
+        let band = f64::from(CHUNK_SIZE as i32);
+        let held = self.window_holds;
+        let under_limit = if held { height <= limit + band } else { height < limit - band };
+        let past_half = if held { gap > rv - 1 } else { gap > rv + 1 };
+        let drop = if under_limit && past_half && gap > 0 {
+            let prev = i64::from(self.window_drop);
+            let ground_inside = prev > 0 && prev >= gap - rv && prev <= gap + rv;
+            // `prev >= gap` keeps the window centre on or below the ground, so a climb snaps
+            // back onto it instead of carrying the box up.
+            if ground_inside && prev >= gap {
+                self.window_drop
+            } else {
+                gap.clamp(0, i64::from(i32::MAX)) as i32
+            }
+        } else {
+            0
+        };
+        self.window_holds = drop > 0;
+        self.window_drop = drop;
+        key.chunk(eye_ca.saturating_sub(drop))
+    }
+
+    /// Near window a far-field centre punches against. Streaming passes the slid window as its
+    /// own centre, so the slide applies here only for the eye's column (the far chunk).
+    fn window_of(&self, center: Coord) -> Coord {
+        if self.window_drop == 0 {
+            return center;
+        }
+        let Some(face) = self.live_up() else { return center };
+        let Some(eye) = self.eye_chunk else { return center };
+        let (eye_key, _) = ColumnKey::of(face, eye);
+        let (key, ca) = ColumnKey::of(face, center);
+        if key != eye_key {
+            return center;
+        }
+        key.chunk(ca.saturating_sub(self.window_drop))
+    }
+
     /// Unit doublings of the chart rings at height `h` over the ground on a chart of datum radius
     /// `radius`: the rings reach [`FAR_VIEW`] times the height, a doubling is dropped only
     /// [`FAR_HOLD`] lower than it was taken, and the coarsest ring's square stays within
@@ -1384,17 +1498,17 @@ impl World {
         self.last_stream_secs = sample_dt;
         self.light_admitted_last = 0;
         self.section_eye_prev = far.is_finite().then_some((far, now));
-        let center_chunk = eye_chunk(center);
+        let eye = eye_chunk(center);
         let far_chunk = eye_chunk(far);
         let far_moved = self.set_far_center(far_chunk);
         // Update centre before draining: old centre may be a sentinel, so draining
         // against it would discard all results and regenerate them immediately.
         // An up-face change is the same kind of pass: the box changed shape.
+        // The up face follows the eye. The window may then sit below it, on the ground.
         let prev_center = self.center;
-        let center_moved = Some(center_chunk) != self.center;
-        let fold_changed = center_moved && self.adopt_fold(center_chunk);
-        let up_changed = if center_moved || !self.stream_up_set {
-            let up = self.resolve_stream_up(center_chunk);
+        let eye_moved = Some(eye) != self.eye_chunk;
+        let up_changed = if eye_moved || !self.stream_up_set {
+            let up = self.resolve_stream_up(eye);
             let changed = if self.stream_up_set {
                 up != self.stream_up
             } else {
@@ -1403,10 +1517,18 @@ impl World {
             };
             self.stream_up = up;
             self.stream_up_set = true;
+            if changed {
+                self.window_drop = 0;
+                self.window_holds = false;
+            }
             changed
         } else {
             false
         };
+        let center_chunk = self.commit_window(eye, center);
+        self.eye_chunk = Some(eye);
+        let center_moved = Some(center_chunk) != prev_center;
+        let fold_changed = center_moved && self.adopt_fold(center_chunk);
         let full_pass = center_moved || up_changed || fold_changed;
         self.center = Some(center_chunk);
         // Re-bucket worklists around the live centre before any lane (or pump
@@ -1455,7 +1577,8 @@ impl World {
             pacer.near_queue_cap(capacity),
         );
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
-        self.occlusion_dirty.raise(full_pass);
+        // The eye can move while the window stays on the ground.
+        self.occlusion_dirty.raise(full_pass || eye_moved);
         // The ring geometry is centred on the eye: a boundary cross SHIFTS the
         // settled rings by the move's chess distance across the up axis (a
         // move along that axis, an up-face change, or the first pass restarts
@@ -1527,15 +1650,17 @@ impl World {
             let v = (self.section_vel * 4.0).round();
             (self.section_eye_y.to_bits(), [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()])
         };
+        let window = self.window_of(center);
         let frontier_key = SectionFrontierKey {
             center_xz: [cu, cv],
-            center_y: center.y,
+            center_y: window.y,
             body,
             face: face_u8,
             eye_y,
             velocity,
             vertical: self.view.vertical,
             up: self.live_up(),
+            window_drop: self.window_drop,
             unit: self.far_pyramid().unit.to_bits(),
             finest: self.section_pyramid.finest.0,
             levels: self.section_pyramid.levels.get(),
@@ -3635,10 +3760,23 @@ impl World {
         }
     }
 
+    /// Desired sections the punch still claims the window holds. Zero once the slide has
+    /// removed every wholly-held tile.
+    #[cfg(test)]
+    fn sections_holding_ground(&self, far: Coord, sections: &[SectionPos]) -> usize {
+        let mut memo = NearBounds::default();
+        let (y0, y1) = self.near_y_range(far);
+        let Some(seat) = self.seams.chart_seat(far) else { return 0 };
+        let body = super::section::CHART_BODY_BASE + seat.index as u16;
+        let near = self.chart_near(far, body, y0);
+        sections.iter().filter(|s| self.near_window_holds(**s, near, y0, y1, None, &mut memo)).count()
+    }
+
     /// Full-res vertical block range (`y1` exclusive) of the mesh box. Up is storage Y.
+    /// `center` is the far chunk (the eye's column); the range follows the slid window.
     fn near_y_range(&self, center: Coord) -> (i64, i64) {
         let cs = CHUNK_SIZE as i64;
-        let b = self.mesh_box(center);
+        let b = self.mesh_box(self.window_of(center));
         let y0 = i64::from(b.min().y) * cs;
         (y0, y0 + i64::from(b.size().1) * cs)
     }
@@ -6148,6 +6286,347 @@ mod tests {
             true,
         );
         assert_eq!(runs, vec![GenRun::Open { coord }]);
+    }
+
+    fn owner_view() -> crate::render_config::RenderConfig {
+        let mut render = crate::render_config::RenderConfig::default();
+        render.lod2 = true;
+        render.lod_levels = 8;
+        render.lod_detail = 2;
+        render.occlusion = true;
+        render
+    }
+
+    /// One chunk-centre sample per column of the near square after `begin_stream` has placed
+    /// the window. The print line also counts ground a far section still draws.
+    struct Hover {
+        far_instead: i32,
+        held_sections: usize,
+        centre_held: bool,
+        centre_covered: bool,
+        drop: i32,
+        window_y: i32,
+        eye_y: i32,
+    }
+
+    fn hover_owner(world: &mut World, above: f64) -> Hover {
+        let physical = world.home_eye(DVec3::new(0.0, 1.0, 0.0), above);
+        let (window, far_c, _, _) = world.begin_stream(physical, None);
+        let (y0, y1) = world.near_y_range(far_c);
+        let desired = world.desired_sections(far_c);
+        let cs = 16i64;
+        let h = world.view_radius() as i64;
+        let (x0, x1) = ((far_c.x as i64 - h) * cs, (far_c.x as i64 + h + 1) * cs);
+        let (z0, z1) = ((far_c.z as i64 - h) * cs, (far_c.z as i64 + h + 1) * cs);
+        let rects: Vec<(i64, i64, i64, i64)> = desired
+            .iter()
+            .map(|s| {
+                let span = s.span() as i64;
+                (s.min_x() as i64, s.min_z() as i64, s.min_x() as i64 + span, s.min_z() as i64 + span)
+            })
+            .collect();
+        let covered = |x: i64, z: i64| rects.iter().any(|&(a, b, c, d)| x >= a && x < c && z >= b && z < d);
+        let mut columns = 0i32;
+        let mut far_instead = 0i32;
+        let mut over_ready = 0i32;
+        let mut held = 0i32;
+        let mut x = x0 + cs / 2;
+        while x < x1 {
+            let mut z = z0 + cs / 2;
+            while z < z1 {
+                let surf = world.terrain().surface(Face::PosY, x as i32, z as i32);
+                if surf != i32::MIN {
+                    columns += 1;
+                    let solid = i64::from(surf) - 1;
+                    if solid >= y0 && solid < y1 {
+                        held += 1;
+                        if covered(x, z) {
+                            over_ready += 1;
+                        }
+                    } else if covered(x, z) {
+                        far_instead += 1;
+                    }
+                }
+                z += cs;
+            }
+            x += cs;
+        }
+        let (cx, cz) = (far_c.x as i64 * cs + cs / 2, far_c.z as i64 * cs + cs / 2);
+        let csurf = world.terrain().surface(Face::PosY, cx as i32, cz as i32);
+        let centre_held = csurf != i32::MIN && {
+            let solid = i64::from(csurf) - 1;
+            solid >= y0 && solid < y1
+        };
+        let centre_covered = csurf != i32::MIN && covered(cx, cz);
+        let held_sections = world.sections_holding_ground(far_c, &desired);
+        let eye_y = world.eye_chunk.unwrap().y;
+        println!(
+            "hover +{above}: columns {columns} far_instead {far_instead} over_ready {over_ready} held {held} \
+             sections {} held_sections {held_sections} centre_held {centre_held} centre_covered {centre_covered} \
+             drop {} window_y {} eye_y {eye_y} y=[{y0},{y1})",
+            desired.len(),
+            world.window_drop,
+            window.y
+        );
+        Hover {
+            far_instead,
+            held_sections,
+            centre_held,
+            centre_covered,
+            drop: world.window_drop,
+            window_y: window.y,
+            eye_y,
+        }
+    }
+
+    /// Owner view, seed 42, the +Y chart. At 150 and 300 the ground under the eye is full-res.
+    /// At 600, past the horizontal span, the far field draws it again.
+    #[test]
+    fn near_window_holds_ground_under_a_high_eye() {
+        use crate::world::generation::WorldgenKind;
+
+        let mut world = World::with_kind(42, owner_view(), WorldgenKind::Diffusion, false);
+        world.set_view_distances(16, 5);
+        let ground = hover_owner(&mut world, 0.0);
+        assert_eq!(ground.drop, 0, "standing on the ground does not slide the window");
+        assert_eq!(ground.window_y, ground.eye_y);
+        assert!(ground.centre_held, "spawn ground is inside the window");
+        assert!(!ground.centre_covered, "spawn ground is not drawn by a far section");
+        assert_eq!(ground.held_sections, 0);
+
+        let low = hover_owner(&mut world, 50.0);
+        let mid = hover_owner(&mut world, 150.0);
+        let high = hover_owner(&mut world, 300.0);
+        let over = hover_owner(&mut world, 600.0);
+        for (name, h) in [("50", &low), ("150", &mid), ("300", &high)] {
+            assert!(h.centre_held, "+{name}: the centre ground left the window");
+            assert!(!h.centre_covered, "+{name}: a far section still draws the centre");
+            assert_eq!(h.held_sections, 0, "+{name}: a wholly-held section stayed desired");
+        }
+        assert!(mid.drop > 0 && high.drop > 0, "150 and 300 slide the window down");
+        assert!(mid.window_y < mid.eye_y && high.window_y < high.eye_y);
+        assert_eq!(over.drop, 0, "600 is above the horizontal span");
+        assert!(!over.centre_held, "600 leaves the ground to the far field");
+        assert!(over.far_instead > 0, "600 still draws the ground with far sections");
+    }
+
+    /// The slide engages and releases once each way. A hover on either threshold does not flip.
+    #[test]
+    fn near_window_does_not_oscillate() {
+        use crate::world::generation::WorldgenKind;
+
+        let mut world = World::with_kind(42, owner_view(), WorldgenKind::Diffusion, false);
+        world.set_view_distances(16, 5);
+        let physical = world.home_eye(DVec3::new(0.0, 1.0, 0.0), 0.0);
+        let (storage, _) = world.place_eyes(physical);
+        world.stream_up = Some(Face::PosY);
+        world.stream_up_set = true;
+        let eye0 = eye_chunk(storage);
+        let w0 = world.commit_window(eye0, storage);
+        world.eye_chunk = Some(eye0);
+        assert_eq!(world.window_drop, 0);
+        assert_eq!(w0, eye0);
+        let ground = world.window_ground.expect("the centre column has a surface").3;
+
+        let mut flips = 0i32;
+        let mut holding = false;
+        let mut prev_wy = i32::MAX;
+        let mut release_h = None;
+        for step in 0..=80 {
+            let height = step as f64 * 8.0;
+            let pos = DVec3::new(storage.x, f64::from(ground) + height, storage.z);
+            let eye = eye_chunk(pos);
+            let window = world.commit_window(eye, pos);
+            world.eye_chunk = Some(eye);
+            let on = world.window_drop > 0;
+            if on != holding {
+                flips += 1;
+                if holding {
+                    release_h = Some(height);
+                }
+                holding = on;
+            }
+            if on {
+                assert!(window.y <= prev_wy, "the window climbed at +{height}");
+            }
+            if release_h.is_some() {
+                assert_eq!(world.window_drop, 0, "drop returned while still climbing at +{height}");
+            }
+            prev_wy = window.y;
+        }
+        assert!(flips <= 2, "the climb flipped the window {flips} times");
+        let release_h = release_h.expect("the climb never released the window");
+
+        let mut reengage_h = None;
+        let mut holding = false;
+        let mut flips = 0i32;
+        for step in (0..=80).rev() {
+            let height = step as f64 * 8.0;
+            let pos = DVec3::new(storage.x, f64::from(ground) + height, storage.z);
+            let eye = eye_chunk(pos);
+            let _ = world.commit_window(eye, pos);
+            world.eye_chunk = Some(eye);
+            let on = world.window_drop > 0;
+            if on != holding {
+                flips += 1;
+                if on && reengage_h.is_none() {
+                    reengage_h = Some(height);
+                }
+                holding = on;
+            }
+        }
+        assert!(flips <= 2, "the descent flipped the window {flips} times");
+        let reengage_h = reengage_h.expect("the descent never re-engaged");
+        assert!(
+            reengage_h < release_h - 16.0,
+            "released at +{release_h} and re-engaged at +{reengage_h}"
+        );
+
+        // Bob one chunk either side of a held height, and across the release band.
+        let bob = |world: &mut World, height: f64| {
+            let pos = DVec3::new(storage.x, f64::from(ground) + height, storage.z);
+            let eye = eye_chunk(pos);
+            let window = world.commit_window(eye, pos);
+            world.eye_chunk = Some(eye);
+            (world.window_drop, window.y)
+        };
+        let (d0, y0) = bob(&mut world, 300.0);
+        assert!(d0 > 0);
+        assert_eq!(bob(&mut world, 300.0), (d0, y0), "a second frame at the same height moved the window");
+        let ground_ca = (ground - 1).div_euclid(16);
+        for height in [284.0, 316.0, 300.0, 284.0, 316.0, 300.0] {
+            let (d, y) = bob(&mut world, height);
+            assert!(d > 0, "bob at +{height} released the window");
+            assert!((y - ground_ca).abs() <= 2, "bob at +{height} put the window at {y}, ground chunk {ground_ca}");
+        }
+        let (d1, y1) = bob(&mut world, 300.0);
+        assert_eq!(bob(&mut world, 300.0), (d1, y1), "hovering at +300 moved the window");
+        assert!(bob(&mut world, 400.0).0 > 0, "back under the limit");
+        assert!(bob(&mut world, 540.0).0 > 0, "just under the release band");
+        assert_eq!(bob(&mut world, 560.0).0, 0, "just over the release band");
+        assert_eq!(bob(&mut world, 540.0).0, 0, "dropping back under the release band re-engaged");
+        assert_eq!(bob(&mut world, 560.0).0, 0);
+    }
+
+    /// A flat world's window centres on the ground chunk at 300 and lets go at 600.
+    #[test]
+    fn flat_window_centres_on_the_ground() {
+        use crate::world::generation::FLAT_HEIGHT;
+
+        let mut world = World::new(1);
+        world.set_view_distances(16, 5);
+        let at = |world: &mut World, above: f64| {
+            let (window, _, _, _) = world.begin_stream(DVec3::new(8.0, f64::from(FLAT_HEIGHT) + above, 8.0), None);
+            (window, world.window_drop, world.eye_chunk.unwrap())
+        };
+        let (window, drop, eye) = at(&mut world, 0.0);
+        assert_eq!(drop, 0);
+        assert_eq!(window, eye);
+        let (window, drop, eye) = at(&mut world, 300.0);
+        assert!(drop > 0);
+        assert!(window.y < eye.y);
+        assert_eq!(window.y, (FLAT_HEIGHT - 1).div_euclid(16));
+        let (window, drop, eye) = at(&mut world, 600.0);
+        assert_eq!(drop, 0);
+        assert_eq!(window, eye);
+    }
+
+    /// Local altitude maps back to the chunk that contains it, on every face.
+    #[test]
+    fn altitude_chunk_is_the_chunk_holding_that_cell() {
+        for face in Face::ALL {
+            for c in [-4, -1, 0, 1, 5] {
+                let coord = match face.axis() {
+                    0 => Coord::new(c, 2, -3),
+                    1 => Coord::new(2, c, -3),
+                    _ => Coord::new(2, -3, c),
+                };
+                let alt0 = FaceFrame::new(face).chunk_alt0(coord);
+                let (_, ca) = ColumnKey::of(face, coord);
+                for alt in alt0..alt0 + 16 {
+                    assert_eq!(World::altitude_chunk(face, alt), ca, "{face:?} {alt} in {coord:?}");
+                }
+                assert_eq!(World::altitude_chunk(face, alt0 + 16), ca + 1);
+            }
+        }
+    }
+
+    /// A stored twin streams in its box, up along storage +Y: 300 above that surface slides
+    /// the window down onto it. Seed 42's twins sag into storage, so no physical chunk keeps
+    /// a cube face as its sky; the face-normal rule is the same `commit_window` with that up face.
+    #[test]
+    fn near_window_follows_a_cube_face() {
+        use crate::space::atlas::Patch;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::terrain::cosmos::{Kind, Shape};
+
+        let mut world = World::with_kind(42, owner_view(), WorldgenKind::Diffusion, false);
+        world.set_view_distances(16, 5);
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        let body = cosmos.bodies().iter().copied().find(|b| b.kind == Kind::Twin).expect("a twin");
+        let Shape::Cube { half } = body.shape else { panic!("a twin is a cube") };
+        let atlas = world
+            .generator
+            .atlases()
+            .iter()
+            .find(|a| a.grid.is_some_and(|g| g.body == body.id))
+            .cloned()
+            .expect("the twin is stored");
+        let g = atlas.grid.expect("grid");
+        let sx = i32::try_from(g.origin[0] + (body.centre[0] - g.ref_min[0])).expect("storage x");
+        let sz = i32::try_from(g.origin[2] + (body.centre[2] - g.ref_min[2])).expect("storage z");
+        let surf = world.column_surface(Face::PosY, sx, sz);
+        assert_ne!(surf, i32::MIN, "the twin's centre column has no stored surface");
+        let stored = DVec3::new(f64::from(sx) + 8.0, f64::from(surf) + 300.0, f64::from(sz) + 8.0);
+        let (window, _, _, _) = world.begin_stream(atlas.embed_storage(Patch::Grid, stored), None);
+        assert_eq!(world.live_up(), Some(Face::PosY), "a stored cube streams along +Y");
+        assert!(world.window_drop > 0, "300 above a stored twin did not slide");
+        assert!(window.y < world.eye_chunk.unwrap().y, "the window did not move down");
+
+        let face = Face::PosX;
+        world.stream_up = Some(face);
+        world.stream_up_set = true;
+        world.window_drop = 0;
+        world.window_holds = false;
+        let outward = DVec3::new(1.0, 0.0, 0.0);
+        let on_face = body.centre_f() + outward * (half as f64);
+        let local = FaceFrame::new(face).point_to_local(on_face);
+        let face_surf = world.generator.surface(face, block_coord(local.x), block_coord(local.z));
+        assert_ne!(face_surf, i32::MIN, "the face centre has no surface");
+        let pos = on_face + outward * (f64::from(face_surf) + 300.0 - local.y);
+        let eye = eye_chunk(pos);
+        let slid = world.commit_window(eye, pos);
+        assert!(world.window_drop > 0, "300 above a cube face did not slide");
+        let (_, eye_ca) = ColumnKey::of(face, eye);
+        let (_, win_ca) = ColumnKey::of(face, slid);
+        assert!(win_ca < eye_ca, "the window did not move toward the face");
+    }
+
+    /// The eye above the window still floods the box. Flat chunks, no far field.
+    #[test]
+    fn rebuild_occlusion_from_an_eye_above_the_window() {
+        let mut world = World::new(1);
+        world.set_view_distances(2, 2);
+        world.set_render_lanes(true, false);
+        world.stream_up = Some(Face::PosY);
+        world.stream_up_set = true;
+        let window = Coord::new(0, 0, 0);
+        let eye = Coord::new(0, 12, 0);
+        world.center = Some(window);
+        world.eye_chunk = Some(eye);
+        let volume = world.unload_box(window);
+        assert!(!volume.contains(eye), "the eye should sit outside this box");
+        for c in volume.coords() {
+            world.ensure_data(c);
+        }
+        world.occlusion_dirty.set();
+        world.rebuild_occlusion(None, Budget::Millis(50.0));
+        let top = volume.clamp(eye);
+        assert!(world.occlusion.is_visible(top), "the clamped root was culled");
+        assert!(
+            world.occlusion.is_visible(Coord::new(top.x + 1, top.y, top.z)),
+            "air beside the clamped root was culled"
+        );
     }
 
     /// Valley or hilltop columns inside the near square, below or above the full-res window,

@@ -287,6 +287,9 @@ impl Occlusion {
             }
         }
         self.queue.clear();
+        // The camera can sit above the volume when the near window has slid down to the ground.
+        // Pin it to the nearest chunk and see out of every face from there; an inside root is unchanged.
+        let origin = volume.clamp(origin);
         let Some(root) = self.index(origin) else {
             return;
         };
@@ -631,5 +634,41 @@ mod tests {
                 assert_eq!(occ.is_visible(c), visible.contains(&c), "round {round} at {c:?}");
             }
         }
+    }
+
+    /// The camera chunk above the volume is pinned to the top face and still floods an open box.
+    #[test]
+    fn root_above_the_box_sees_every_open_chunk() {
+        let origin = ChunkCoord::new(0, 0, 0);
+        let volume = ChunkBox::new(origin, 2, 1);
+        let loaded: Vec<_> = volume.coords().map(|c| (c, Connectivity::OPEN)).collect();
+        let mut occ = Occlusion::default();
+        occ.rebuild(volume, ChunkCoord::new(0, 6, 0), loaded.iter().copied());
+        assert_eq!(occ.visible_count(), loaded.len());
+        assert_eq!(volume.clamp(origin), origin);
+        assert_eq!(volume.clamp(ChunkCoord::new(0, 6, 3)), ChunkCoord::new(0, 1, 2));
+    }
+
+    /// A sealed layer under an outside camera is drawn and blocks the cave below it.
+    #[test]
+    fn sealed_layer_blocks_past_an_outside_root() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let volume = ChunkBox::new(center, 1, 2);
+        let top = ChunkCoord::new(0, 2, 0);
+        let wall = ChunkCoord::new(0, 1, 0);
+        let below = ChunkCoord::new(0, 0, 0);
+        let mut occ = Occlusion::default();
+        occ.rebuild(
+            volume,
+            ChunkCoord::new(0, 9, 0),
+            volume.coords().map(|c| {
+                // The whole layer, or sight walks around a single sealed chunk.
+                let conn = if c.y == wall.y { Connectivity::SEALED } else { Connectivity::OPEN };
+                (c, conn)
+            }),
+        );
+        assert!(occ.is_visible(top) && occ.is_visible(wall), "the wall and the air above it are drawn");
+        assert!(!occ.is_visible(below), "sight stops at the sealed layer");
+        assert!(occ.is_visible(ChunkCoord::new(1, 2, 0)), "air beside the clamped root is drawn");
     }
 }

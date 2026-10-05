@@ -390,6 +390,21 @@ impl ChunkBox {
         d[0] <= r[0] && d[1] <= r[1] && d[2] <= r[2]
     }
 
+    /// `c` moved into the box. A chunk already inside is unchanged, and a chunk outside
+    /// keeps the axes that fit and pins the rest to the face.
+    #[inline]
+    pub fn clamp(self, c: ChunkCoord) -> ChunkCoord {
+        let (lo, hi) = self.bounds();
+        let p = [c.x, c.y, c.z];
+        let mut out = p;
+        for a in 0..3 {
+            if lo[a] <= hi[a] {
+                out[a] = p[a].clamp(lo[a], hi[a]);
+            }
+        }
+        ChunkCoord::new(out[0], out[1], out[2])
+    }
+
     #[inline]
     pub fn min(self) -> ChunkCoord {
         let (lo, _) = self.bounds();

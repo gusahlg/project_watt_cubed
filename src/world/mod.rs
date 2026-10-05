@@ -1048,8 +1048,17 @@ pub struct World {
     /// Monotone counter bumped on every recorded edit; the autosaver compares
     /// it against the last written generation to know the world is dirty.
     pub(crate) edit_generation: u64,
-    /// Last chunk centre; `None` forces a full stream pass. Streams only react to boundary crosses.
+    /// Near-window centre. `None` forces a full stream pass. The eye's chunk, or below it
+    /// along the up axis when the window has slid down to hold the ground.
     center: Option<Coord>,
+    /// Chunk the eye is in. Occlusion starts here; it may sit above [`center`](Self::center).
+    eye_chunk: Option<Coord>,
+    /// Chunks the near window sits below the eye along the up axis. Zero keeps it on the eye.
+    window_drop: i32,
+    /// The window is holding the ground, so the release thresholds apply.
+    window_holds: bool,
+    /// Up face, tangent column, and surface of the last ground lookup.
+    window_ground: Option<(Face, i32, i32, i32)>,
     /// The far field's chunk centre: the chart column under the eye, which outlasts the near
     /// window's chart reach; the streaming centre elsewhere. Set by [`stream`](Self::stream).
     far_center: Option<Coord>,
@@ -1410,6 +1419,8 @@ struct SectionFrontierKey {
     /// The full-res window's height and up face; a chart punches sections the window holds.
     vertical: i32,
     up: Option<Face>,
+    /// Chunks the near window sits below the eye. Zero is the eye-centred window.
+    window_drop: i32,
     unit: u32,
     finest: i8,
     levels: u8,
@@ -1492,6 +1503,10 @@ impl World {
             edits: FastMap::default(),
             edit_generation: 0,
             center: None,
+            eye_chunk: None,
+            window_drop: 0,
+            window_holds: false,
+            window_ground: None,
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
             far_atlas: None,
@@ -2101,15 +2116,18 @@ impl World {
         }
         self.occlusion_topo_dirty.take();
         self.last_occlusion_rebuild = Some(crate::sched::now());
-        let Some(origin) = self.center else {
+        let Some(window) = self.center else {
             return Progress::Idle;
         };
-        let volume = self.unload_box(origin);
+        let volume = self.unload_box(window);
+        // The eye may sit above the window. The BFS root is the eye; `rebuild` clamps it
+        // onto the volume so a camera outside the box still sees into it.
+        let root = self.eye_chunk.unwrap_or(window);
         let loaded = self
             .chunks
             .iter()
             .map(|(&c, l)| (c, l.connectivity.unwrap_or(Connectivity::OPEN)));
-        self.occlusion.rebuild(volume, origin, loaded);
+        self.occlusion.rebuild(volume, root, loaded);
         self.apply_occlusion_masks(eng.as_deref_mut());
         if fill_remaining {
             Progress::Partial {

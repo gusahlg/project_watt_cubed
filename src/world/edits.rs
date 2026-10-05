@@ -52,6 +52,9 @@ impl World {
             // Unit re-pinned on stream; invalidate centre for rescan.
             // unload/ensure/scan pass even though the player hasn't moved.
             self.center = None;
+            self.eye_chunk = None;
+            self.window_drop = 0;
+            self.window_holds = false;
             // The next full pass must probe the WHOLE new box (a grown radius
             // exposes chunks the old shell diff would skip).
             self.prev_mesh_box = None;
@@ -278,6 +281,9 @@ impl World {
         // so in-flight results cannot land after we come back.
         self.clear_section_lane(eng, false);
         self.center = None;
+        self.eye_chunk = None;
+        self.window_drop = 0;
+        self.window_holds = false;
         // Every chunk is back to `NeedsMesh`; re-seed the mesh lane's worklist so
         // the next stream rebuilds them (the worklist is the fresh-mesh index now).
         self.mesh_worklist.clear();

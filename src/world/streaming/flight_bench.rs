@@ -300,3 +300,76 @@ fn round_flight_breakdown() {
         fly(speed, secs, settle, view, lod2, hz);
     }
 }
+
+/// Fly, stop, and settle. Every mesh-box chunk is final, and no far section remains
+/// where that window holds the ground. Owner view: distance 16, vertical 5, lod 8/2.
+#[test]
+fn flight_then_stop_settles_under_the_player() {
+    for speed in [100.0, 600.0] {
+        let mut render = RenderConfig::default();
+        render.lod2 = true;
+        render.lod_levels = 8;
+        render.lod_detail = 2;
+        render.occlusion = true;
+        let mut w = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+        w.set_view_distances(16, 5);
+        let spawn = w.chart_spawn().expect("the start world is charted");
+        w.prepare_around(spawn);
+        w.drive_spawn_ready();
+        let zero = [Duration::ZERO; PHASES.len()];
+        let mut laps = Laps { at: Instant::now(), sum: zero, full: zero, in_full: false };
+        let secs = 1.5;
+        let t0 = Instant::now();
+        while t0.elapsed().as_secs_f64() < secs {
+            let flown = t0.elapsed().as_secs_f64();
+            w.gpu_live_slots = w.local_mesh_slots() as u32;
+            mesh_free_log::take();
+            frame(&mut w, spawn + DVec3::X * (speed * flown), &mut laps);
+        }
+        let eye = spawn + DVec3::X * (speed * secs);
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let mut next = Instant::now();
+        while !w.entry_complete() {
+            assert!(Instant::now() < deadline, "{speed} m/s did not settle: {}", w.entry_debug());
+            w.gpu_live_slots = w.local_mesh_slots() as u32;
+            mesh_free_log::take();
+            frame(&mut w, eye, &mut laps);
+            if Instant::now() >= next {
+                println!("flight {speed} m/s settling: {}", w.entry_debug());
+                next = Instant::now() + Duration::from_secs(15);
+            }
+        }
+        let center = w.center.expect("a window");
+        for coord in w.view_coords(w.mesh_box(center)) {
+            assert!(
+                matches!(w.chunks.get(&coord).map(|l| &l.state), Some(MeshState::Air | MeshState::Ready(_))),
+                "{speed} m/s: {coord:?} left the mesh box unsettled"
+            );
+        }
+        let far = w.section_center().expect("a far centre");
+        let holding = w.sections_holding_ground(far, &w.section_desired);
+        assert_eq!(holding, 0, "{speed} m/s: a far section stayed over ground the window holds");
+        let cs = 16i64;
+        let (x, z) = (i64::from(far.x) * cs + cs / 2, i64::from(far.z) * cs + cs / 2);
+        let (y0, y1) = w.near_y_range(far);
+        let surf = w.terrain().surface(Face::PosY, x as i32, z as i32);
+        let centre_held = surf != i32::MIN && {
+            let solid = i64::from(surf) - 1;
+            solid >= y0 && solid < y1
+        };
+        // A kept section may still paint the centre when it also covers ground outside the
+        // window (a valley, or the near-square edge). The punch's own count is the miss.
+        let centre_covered = surf != i32::MIN
+            && w.section_desired.iter().any(|s| {
+                let span = i64::from(s.span());
+                let (a, b) = (i64::from(s.min_x()), i64::from(s.min_z()));
+                x >= a && x < a + span && z >= b && z < b + span
+            });
+        println!(
+            "flight {speed} m/s settled chunks={} sections={} drop={} centre_held {centre_held} centre_covered {centre_covered}",
+            w.chunks.len(),
+            w.sections.len(),
+            w.window_drop
+        );
+    }
+}
