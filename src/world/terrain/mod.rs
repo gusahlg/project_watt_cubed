@@ -1698,7 +1698,7 @@ impl Terrain {
             }
         }
         if super::generation::coarse_floor_samples(ys) {
-            super::generation::paint_lod_top(out, n, col.surface);
+            super::generation::paint_lod_top(out, ys, col.surface);
         }
         true
     }
@@ -2185,7 +2185,7 @@ impl TerrainGenerator for Terrain {
         }
         // The hit is already in hand: painting here does not sample the column again.
         if super::generation::coarse_floor_samples(ys) {
-            super::generation::paint_lod_top(out, ys.len(), hit.col.surface);
+            super::generation::paint_lod_top(out, ys, hit.col.surface);
         }
     }
 
@@ -2222,7 +2222,7 @@ impl TerrainGenerator for Terrain {
             };
         }
         if super::generation::coarse_floor_samples(alts) {
-            super::generation::paint_lod_top(out, alts.len(), hit.col.surface);
+            super::generation::paint_lod_top(out, alts, hit.col.surface);
         }
     }
 

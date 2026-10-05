@@ -285,15 +285,14 @@ fn sample_section<G: TerrainGenerator + ?Sized>(
     datum: i32,
 ) -> MipCell {
     let cell = lod::cell(detail);
-    let half = cell / 2;
     let span = section_span(detail);
     let (min_x, min_z) = (ax * span, az * span);
     let mut fold = MipFold::new();
     let mut below = [AIR; 1];
     for iz in 0..SECTION_N as i32 {
         for ix in 0..SECTION_N as i32 {
-            let wx = min_x + ix * cell + half;
-            let wz = min_z + iz * cell + half;
+            let wx = min_x + ix * cell;
+            let wz = min_z + iz * cell;
             // Height must sample every cell; colour is an average, sampled on a stride to save cost.
             // PosY with a zero datum keeps world `height` so an origin bake is unchanged.
             // A raised datum subtracts it: f32 cannot hold a twin's world Y and its relief.
@@ -411,7 +410,6 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
     let cell = pos.cell_size();
     let (alo, ahi) = super::section::sample_window(lo, hi, cell);
     let n = ((ahi - alo) / cell).max(1);
-    let half = cell / 2;
     let ys = super::section::column_ys(pos.detail, alo, n, cell);
     let flat = super::section::flatten_edits(edits);
     let remapped;
@@ -426,7 +424,7 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
     for iz in 0..SECTION_N as i32 {
         for ix in 0..SECTION_N as i32 {
             let (fx, fz) = (pos.min_x() + ix * cell, pos.min_z() + iz * cell);
-            let (u, v) = (fx + half, fz + half);
+            let (u, v) = (fx, fz);
             if pos.face == Face::PosY && !chart {
                 terra.lod_column(u, v, &ys, &mut column);
             } else {
@@ -478,7 +476,6 @@ fn resample_origin_cell<G: TerrainGenerator + ?Sized>(
     // only to read one topmost-solid value per column back out. The column
     // fold below is pinned equivalent to the extract-based reference by test.
     let cell = pos.cell_size();
-    let half = cell / 2;
     let ys = crate::world::section::cell_centers(pos);
     let flat = crate::world::section::flatten_edits(edits);
     let mut column = vec![AIR; ys.len()];
@@ -486,7 +483,7 @@ fn resample_origin_cell<G: TerrainGenerator + ?Sized>(
     for iz in 0..SECTION_N as i32 {
         for ix in 0..SECTION_N as i32 {
             let (fx, fz) = (pos.min_x() + ix * cell, pos.min_z() + iz * cell);
-            terra.lod_column(fx + half, fz + half, &ys, &mut column);
+            terra.lod_column(fx, fz, &ys, &mut column);
             crate::world::section::apply_edits(&mut column, &flat, fx, fz, cell, LOD_FLOOR_Y);
             // Topmost non-air cell → the world-space TOP of its run (exclusive),
             // exactly what `Section::topmost_solid` reports from stored runs.
@@ -578,7 +575,6 @@ mod tests {
         let mip = small(&reg, &g);
         let lvl = &mip.levels[0];
         let cell = 1i32 << lvl.detail.0;
-        let half = cell / 2;
         let span = section_span(lvl.detail);
         for sz in 0..lvl.nz.min(4) {
             for sx in 0..lvl.nx.min(4) {
@@ -586,7 +582,7 @@ mod tests {
                 let (min_x, min_z) = ((lvl.x0 + sx as i32) * span, (lvl.z0 + sz as i32) * span);
                 for iz in 0..SECTION_N as i32 {
                     for ix in 0..SECTION_N as i32 {
-                        let h = g.height(min_x + ix * cell + half, min_z + iz * cell + half) as f32;
+                        let h = g.height(min_x + ix * cell, min_z + iz * cell) as f32;
                         assert!(c.hi >= h && c.lo <= h, "cell env [{},{}] excludes {h}", c.lo, c.hi);
                     }
                 }
@@ -805,8 +801,7 @@ mod tests {
         let stone = reg.id_by_label("rock").unwrap();
         let colors = reg.color_snapshot();
         let pos = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 100, z: -50 };
-        let cell = pos.cell_size();
-        let (wx, wz) = (pos.min_x() + cell / 2, pos.min_z() + cell / 2); // column (0,0)'s sample point
+        let (wx, wz) = (pos.min_x(), pos.min_z()); // column (0,0)'s sample point
 
         let unedited = resample_cell(pos, &g, &[], &colors).expect("a surface");
         let built_y = unedited.hi as i32 + 40;

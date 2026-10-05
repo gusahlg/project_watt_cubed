@@ -321,7 +321,6 @@ impl Section {
         debug_assert_eq!(DOMAIN_H % cell, 0, "cell size must divide the domain");
         let n = pos.n_cells() as usize;
         let num_bricks = pos.num_bricks();
-        let half = cell / 2;
         let ys = cell_centers(pos);
         let flat = flatten_edits(edits);
 
@@ -336,8 +335,7 @@ impl Section {
                 for lx in 0..BRICK_DIM {
                     let (ix, iz) = (qx * BRICK_DIM + lx, qz * BRICK_DIM + lz);
                     let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
-                    let (wx, wz) = (fx + half, fz + half);
-                    r#gen.lod_column(wx, wz, &ys, &mut scratch);
+                    r#gen.lod_column(fx, fz, &ys, &mut scratch);
                     apply_edits(&mut scratch, &flat, fx, fz, cell, LOD_FLOOR_Y);
                     for (y, &id) in scratch.iter().enumerate() {
                         let (b, ly) = (y / BRICK_DIM, y % BRICK_DIM);
@@ -361,14 +359,10 @@ impl Section {
 // fused [`mesh::extract_section_mesh`] production path, so the two can never
 // disagree on sample coordinates or edit folding.
 
-/// World altitude a vertical cell is sampled at.
-///
-/// Finest rings probe the cell centre, so those mesh bytes stay put. Coarser
-/// rings probe the cell floor: a centre above the surface marks the whole cell air,
-/// and from altitude that cell is a hole in the far field.
-pub(in crate::world) fn probe_y(detail: Detail, alo: i32, index: i32, cell: i32) -> i32 {
-    let into = if detail > FINEST_DETAIL { 0 } else { cell / 2 };
-    alo + index * cell + into
+/// World altitude a vertical cell is sampled at: the cell's first block, at every level.
+/// The same offset makes a coarser column a subset of the finer one.
+pub(in crate::world) fn probe_y(_detail: Detail, alo: i32, index: i32, cell: i32) -> i32 {
+    alo + index * cell
 }
 
 /// Sample altitude of every vertical cell, bottom-up.
@@ -386,18 +380,21 @@ pub(in crate::world) fn cell_centers(pos: SectionPos) -> Vec<i32> {
 ///
 /// Bounds that sit inside today's `[0, 512]` expand back to that window, so a
 /// home +Y section (terrain in `[MIN_GROUND, MAX_GROUND]`) keeps its columns.
-/// Anything else grows by two cells and aligns out to the cell grid.
+/// Anything else grows by two cells and aligns out to the packed lattice
+/// (`2·cell`, the mesh step). Every section of a level then shares those
+/// boundaries, and a coarser level's boundaries land on them.
 pub(in crate::world) fn sample_window(lo: i32, hi: i32, cell: i32) -> (i32, i32) {
     let (lo, hi) = (lo.min(hi), lo.max(hi));
     if lo >= LOD_FLOOR_Y && hi <= LOD_CEIL_Y {
         return (LOD_FLOOR_Y, LOD_CEIL_Y);
     }
     let margin = cell.saturating_mul(2);
-    let a0 = lo.saturating_sub(margin).div_euclid(cell) * cell;
+    let mesh = cell.saturating_mul(2).max(1);
+    let a0 = lo.saturating_sub(margin).div_euclid(mesh) * mesh;
     let top = hi.saturating_add(margin);
-    let rem = top.rem_euclid(cell);
-    let a1 = if rem == 0 { top } else { top + (cell - rem) };
-    (a0, a1.max(a0.saturating_add(cell)))
+    let rem = top.rem_euclid(mesh);
+    let a1 = if rem == 0 { top } else { top + (mesh - rem) };
+    (a0, a1.max(a0.saturating_add(mesh)))
 }
 
 /// Flatten section edits (per-chunk flat indices) to absolute world coordinates,
@@ -422,8 +419,8 @@ pub(in crate::world) fn flatten_edits(
 /// Apply edits to one column's coarse cells — an ORDER-INDEPENDENT reduction.
 /// Many fine edits can land in one coarse cell; the winner is decided by
 /// POSITION, never input order:
-/// - an edit exactly at the cell's centre sample point wins outright (it IS
-///   the cell's sample — and it is the only way an air edit clears a cell);
+/// - an edit exactly at the cell's sample point (its first block) wins outright
+///   (it IS the cell's sample — and it is the only way an air edit clears a cell);
 /// - otherwise the topmost solid edit (greatest `(y, x, z)`) wins — `flat` is
 ///   sorted ascending by [`flatten_edits`], so last-write-wins realizes that
 ///   tie-break in one sweep;
@@ -443,7 +440,6 @@ pub(in crate::world) fn apply_edits(
         flat.windows(2).all(|w| (w[0].1, w[0].0, w[0].2) <= (w[1].1, w[1].0, w[1].2)),
         "flat edits must arrive (y, x, z)-sorted (see flatten_edits)"
     );
-    let half = cell / 2;
     let n = cells.len();
     let slot_j = move |ewx: i32, ewy: i32, ewz: i32| -> Option<usize> {
         if ewx < fx || ewx >= fx + cell || ewz < fz || ewz >= fz + cell {
@@ -452,20 +448,20 @@ pub(in crate::world) fn apply_edits(
         let j = (ewy - floor).div_euclid(cell);
         usize::try_from(j).ok().filter(|&j| j < n)
     };
-    let is_centre = |ewx: i32, ewy: i32, ewz: i32, j: usize| {
-        ewx == fx + half && ewz == fz + half && ewy == floor + j as i32 * cell + half
+    let is_sample = |ewx: i32, ewy: i32, ewz: i32, j: usize| {
+        ewx == fx && ewz == fz && ewy == floor + j as i32 * cell
     };
-    // Pass 1: solid, non-centre edits (ascending order makes topmost win).
+    // Pass 1: solid edits off the sample point (ascending order makes topmost win).
     for &(ewx, ewy, ewz, id) in flat {
         let Some(j) = slot_j(ewx, ewy, ewz) else { continue };
-        if id != AIR && !is_centre(ewx, ewy, ewz, j) {
+        if id != AIR && !is_sample(ewx, ewy, ewz, j) {
             cells[j] = id;
         }
     }
-    // Pass 2: centre-sample edits override everything, air included.
+    // Pass 2: sample-point edits override everything, air included.
     for &(ewx, ewy, ewz, id) in flat {
         let Some(j) = slot_j(ewx, ewy, ewz) else { continue };
-        if is_centre(ewx, ewy, ewz, j) {
+        if is_sample(ewx, ewy, ewz, j) {
             cells[j] = id;
         }
     }
@@ -579,10 +575,9 @@ mod tests {
     /// Reference implementation of the apply_edits POSITION rule, written
     /// per-cell (independent of input order by construction).
     fn reference_reduce(cells: &mut [BlockId], flat: &[(i32, i32, i32, BlockId)], fx: i32, fz: i32, cell: i32) {
-        let half = cell / 2;
         for (j, slot) in cells.iter_mut().enumerate() {
-            let centre = (fx + half, LOD_FLOOR_Y + j as i32 * cell + half, fz + half);
-            if let Some(&(_, _, _, id)) = flat.iter().find(|&&(x, y, z, _)| (x, y, z) == centre) {
+            let sample = (fx, LOD_FLOOR_Y + j as i32 * cell, fz);
+            if let Some(&(_, _, _, id)) = flat.iter().find(|&&(x, y, z, _)| (x, y, z) == sample) {
                 *slot = id;
                 continue;
             }
@@ -660,7 +655,7 @@ mod tests {
         for (name, h, water, shelf) in cases {
             let r#gen = terrain_gen(&b, h, water, shelf);
             let sec = extract(FINEST, &r#gen, &[]);
-            let want = reference_cells(&r#gen, FINEST.min_x() + CELL / 2, FINEST.min_z() + CELL / 2, CELL);
+            let want = reference_cells(&r#gen, FINEST.min_x(), FINEST.min_z(), CELL);
             assert_eq!(column_ids(&sec, 0, 0), want, "{name}: cells");
             let ref_top = want.iter().rposition(|&c| c != AIR);
             match (sec.topmost_solid(0, 0), ref_top) {
@@ -682,19 +677,19 @@ mod tests {
         let r#gen = terrain_gen(&b, 100, 0, None);
         let cell = CELL;
         let (fx, fz) = (FINEST.min_x(), FINEST.min_z());
-        let (half, j) = (cell / 2, 20i32);
-        let sample_y = LOD_FLOOR_Y + j * cell + half;
+        let j = 20i32;
+        let sample_y = LOD_FLOOR_Y + j * cell;
         let edits_world = [
-            (fx + half, sample_y, fz + half, b.stone),
-            (fx + half, LOD_FLOOR_Y + 5 * cell + half, fz + half, b.air),
-            (fx + 1, LOD_FLOOR_Y + 6 * cell + half, fz + half, b.air),
+            (fx, sample_y, fz, b.stone),
+            (fx, LOD_FLOOR_Y + 5 * cell, fz, b.air),
+            (fx + 1, LOD_FLOOR_Y + 6 * cell, fz, b.air),
         ];
         let overlay = overlay_from_world(&edits_world);
 
         let sec = extract(FINEST, &r#gen, &overlay);
         let got = column_ids(&sec, 0, 0);
 
-        let mut want = reference_cells(&r#gen, fx + half, fz + half, cell);
+        let mut want = reference_cells(&r#gen, fx, fz, cell);
         let flat = flatten_edits(&overlay);
         reference_reduce(&mut want, &flat, fx, fz, cell);
         assert_eq!(got, want);
@@ -710,20 +705,20 @@ mod tests {
         let r#gen = terrain_gen(&b, 100, 0, None);
         let cell = CELL;
         let (fx, fz) = (FINEST.min_x(), FINEST.min_z());
-        let (half, j) = (cell / 2, 20i32);
+        let j = 20i32;
         let cell_y = LOD_FLOOR_Y + j * cell;
         let edits_world = [
-            (fx, cell_y, fz, b.stone),
+            (fx + 1, cell_y, fz, b.stone),
             (fx + 1, cell_y + 1, fz, b.grass),
             (fx, cell_y + 2, fz + 1, b.sand),
             (fx + 1, cell_y, fz + 1, b.air),
-            (fx + half, LOD_FLOOR_Y + 5 * cell + half, fz + half, b.air),
+            (fx, LOD_FLOOR_Y + 5 * cell, fz, b.air),
         ];
 
-        let mut want = reference_cells(&r#gen, fx + half, fz + half, cell);
+        let mut want = reference_cells(&r#gen, fx, fz, cell);
         reference_reduce(&mut want, &flatten_edits(&overlay_from_world(&edits_world)), fx, fz, cell);
         assert_eq!(want[j as usize], b.sand, "the topmost (y,x,z) solid must win");
-        assert_eq!(want[5], b.air, "the centre-sample air clears its cell");
+        assert_eq!(want[5], b.air, "the sample-point air clears its cell");
 
         let mut order: Vec<usize> = (0..edits_world.len()).collect();
         permute(&mut order, 0, &mut |order| {
@@ -766,7 +761,7 @@ mod tests {
             let r#gen = sine(seed);
             let sec = extract(FINEST, &r#gen, &[]);
             for &(ix, iz) in &[(0usize, 0usize), (5, 9), (17, 3), (31, 31)] {
-                let (wx, wz) = (FINEST.min_x() + ix as i32 * CELL + CELL / 2, FINEST.min_z() + iz as i32 * CELL + CELL / 2);
+                let (wx, wz) = (FINEST.min_x() + ix as i32 * CELL, FINEST.min_z() + iz as i32 * CELL);
                 let want = reference_cells(&r#gen, wx, wz, CELL);
                 assert_eq!(column_ids(&sec, ix, iz), want, "seed {seed} col {ix},{iz}");
             }
@@ -790,7 +785,7 @@ mod tests {
             let cell = pos.cell_size();
             let sec = extract(pos, &r#gen, &[]);
             for &(ix, iz) in &[(0usize, 0usize), (5, 9), (15, 15), (16, 0), (31, 31)] {
-                let (wx, wz) = (pos.min_x() + ix as i32 * cell + cell / 2, pos.min_z() + iz as i32 * cell + cell / 2);
+                let (wx, wz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
                 let want = reference_cells(&r#gen, wx, wz, cell);
                 // At the coarse rings (n_cells < 16) the single brick pads
                 // its tail with AIR; compare only the real cells.
@@ -837,11 +832,11 @@ mod tests {
         let r#gen = terrain_gen(&b, 0, 0, None); // all-air baseline
         let cell = CELL;
         // Cell index 16 is the first brick's ceiling / second brick's floor.
-        let wy = LOD_FLOOR_Y + 16 * cell + cell / 2;
-        let edits_world = [(FINEST.min_x() + cell / 2, wy, FINEST.min_z() + cell / 2, b.stone)];
+        let wy = LOD_FLOOR_Y + 16 * cell;
+        let edits_world = [(FINEST.min_x(), wy, FINEST.min_z(), b.stone)];
         let overlay = overlay_from_world(&edits_world);
         let sec = extract(FINEST, &r#gen, &overlay);
-        let mut want = reference_cells(&r#gen, FINEST.min_x() + cell / 2, FINEST.min_z() + cell / 2, cell);
+        let mut want = reference_cells(&r#gen, FINEST.min_x(), FINEST.min_z(), cell);
         reference_reduce(&mut want, &flatten_edits(&overlay), FINEST.min_x(), FINEST.min_z(), cell);
         assert_eq!(column_ids(&sec, 0, 0), want);
         assert_eq!(want[16], b.stone, "edit landed at the brick boundary cell");

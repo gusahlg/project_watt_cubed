@@ -9,10 +9,10 @@
 //! z-fighting with adjacent sections at different detail levels.
 //!
 //! The engine vertex format holds local coords `0..=16`, so a 32-cell section is
-//! packed by a power-of-two coarsen (`shift`, at least 1 for the 32 columns).
-//! Relief taller than 16 packed cells stacks up to [`MAX_SLABS`] slabs — one mesh
-//! per slab per pass, all at that shift — instead of coarsening every axis until
-//! a whole mountain fits one cube: steep sections keep their horizontal detail.
+//! packed by a power-of-two coarsen (`shift`, 1 for the 32 columns). Every level
+//! keeps that shift, so a coarser packed boundary is a finer one. Relief taller
+//! than 16 packed cells stacks more slabs — one mesh per slab per pass — instead
+//! of coarsening until a mountain fits one cube.
 //! Greedy merge runs across each slab, reading its neighbours above and below
 //! so slab seams emit no faces. Two producers share one pooled native grid:
 //! - [`build_section_mesh`] decodes a stored [`Section`]'s brick stacks — the
@@ -47,6 +47,9 @@ pub(in crate::world) struct SectionMeshData {
     pub slabs: Vec<SlabMesh>,
     /// World altitude of native cell 0. `0` on the legacy `[0, 512)` window.
     pub altitude_floor: i32,
+    /// Shift the old per-section relief loop would have used. Nesting ignores it.
+    #[cfg(test)]
+    pub relief_shift: u8,
 }
 
 /// One packed slab: up to 16 packed cells tall, its origin at native-cell Y `origin_y`.
@@ -70,9 +73,11 @@ impl SectionMeshData {
 /// Cells per mesh-block edge — the 5-bit vertex position range (`0..=16`). Fixed by design.
 const BLOCK: i32 = 16;
 const SLICE: usize = (BLOCK * BLOCK) as usize;
-/// Most stacked slabs one section may use before it coarsens instead: 64 packed cells of relief
-/// at the least shift (256 native cells at the finest ring) — every mountain in one tall stack.
+/// Slabs the relief shift fits a cliff into (see [`NESTED_SLABS`]).
 const MAX_SLABS: i32 = 4;
+/// Most slabs a section stacks at the nesting shift. A taller cliff packs coarser on its own
+/// lattice instead (the relief shift), giving up nesting for that one section.
+const NESTED_SLABS: i32 = 8;
 
 // Native 32×32×n grid, packed coarse grid, and one mesh scratch per worker.
 // Born and dropped on the same thread, so a lock-free thread-local is right.
@@ -364,7 +369,7 @@ fn emit(
 #[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
     let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
-    mesh_section_with(n_cells, tables, floor, |dense| fill_from_section(dense, n_cells, section))
+    mesh_section_with(n_cells, tables, floor, 0, section.pos().cell_size(), |dense| fill_from_section(dense, n_cells, section))
 }
 
 /// Lowest native cell a section's border walls must reach so they meet the neighbour.
@@ -403,34 +408,12 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     };
     let cell = pos.cell_size();
     let n_cells = ((ahi - alo) / cell) as usize;
-    let half = cell / 2;
-    let ys = super::column_ys(pos.detail, alo, n_cells as i32, cell);
-    let flat = super::flatten_edits(edits);
-    let remapped;
-    let used: &[_] = if pos.face == Face::PosY {
-        &flat
-    } else {
-        remapped = face_edits(&flat, pos.face);
-        &remapped
-    };
     // Home +Y keeps the legacy column and the `[0, 512]` floor. A chart is +Y in storage
     // but its surface sits far outside that window, so it takes the face sampler.
     let chart = pos.body >= super::CHART_BODY_BASE;
     let floor = if pos.face == Face::PosY && !chart { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
-    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), |dense| {
-        for iz in 0..SECTION_N {
-            for ix in 0..SECTION_N {
-                let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
-                let (u, v) = (fx + half, fz + half);
-                let column = &mut dense[(ix + iz * SECTION_N) * n_cells..][..n_cells];
-                if pos.face == Face::PosY && !chart {
-                    r#gen.lod_column(u, v, &ys, column);
-                } else {
-                    r#gen.lod_column_face(pos.body, pos.face, u, v, &ys, column);
-                }
-                super::apply_edits(column, used, fx, fz, cell, alo);
-            }
-        }
+    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, |dense| {
+        sample_columns(pos, r#gen, edits, alo, n_cells, dense);
     });
     mesh.altitude_floor = alo;
     if pos.face != Face::PosY {
@@ -600,6 +583,41 @@ pub(in crate::world) fn warp_slab_corners(
     Some((anchor, corners.map(|c| (c - a).as_vec3())))
 }
 
+/// Fill one section's native columns. Each column `i` is the block column
+/// `min + i·cell` (the cell's first block), at every level.
+fn sample_columns<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    alo: i32,
+    n_cells: usize,
+    dense: &mut [BlockId],
+) {
+    let cell = pos.cell_size();
+    let ys = super::column_ys(pos.detail, alo, n_cells as i32, cell);
+    let flat = super::flatten_edits(edits);
+    let remapped;
+    let used: &[_] = if pos.face == Face::PosY {
+        &flat
+    } else {
+        remapped = face_edits(&flat, pos.face);
+        &remapped
+    };
+    let chart = pos.body >= super::CHART_BODY_BASE;
+    for iz in 0..SECTION_N {
+        for ix in 0..SECTION_N {
+            let (fx, fz) = (pos.min_x() + ix as i32 * cell, pos.min_z() + iz as i32 * cell);
+            let column = &mut dense[(ix + iz * SECTION_N) * n_cells..][..n_cells];
+            if pos.face == Face::PosY && !chart {
+                r#gen.lod_column(fx, fz, &ys, column);
+            } else {
+                r#gen.lod_column_face(pos.body, pos.face, fx, fz, &ys, column);
+            }
+            super::apply_edits(column, used, fx, fz, cell, alo);
+        }
+    }
+}
+
 /// The one section-mesh driver both producers share: `fill` overwrites this
 /// worker's pooled native grid (every cell must be written), then the packer
 /// and mesher run over it. Producers differ ONLY in how the grid is filled.
@@ -607,12 +625,14 @@ fn mesh_section_with(
     n_cells: usize,
     tables: &HotTables,
     floor: Option<i32>,
+    alo: i32,
+    cell: i32,
     fill: impl FnOnce(&mut [BlockId]),
 ) -> SectionMeshData {
     DENSE_NATIVE.with_borrow_mut(|native| {
         native.resize(SECTION_N * SECTION_N * n_cells, AIR);
         fill(native);
-        mesh_packed(native, n_cells, tables, floor)
+        mesh_packed(native, n_cells, tables, floor, alo, cell)
     })
 }
 
@@ -643,6 +663,82 @@ fn pack_shift(extent: i32) -> u32 {
         debug_assert!(shift < 8, "section extent {extent} cannot pack into 16");
     }
     shift
+}
+
+/// World altitude of the packed-cell floor that holds block `y` at a level whose
+/// native cell is `cell`. The mesh step is 2, so the edge is `2·cell`, shared by
+/// every section of that level. A coarser level's edge (`2·parent cell`) is one of these.
+pub(in crate::world) fn packed_floor(y: i32, cell: i32) -> i32 {
+    let mesh = cell.saturating_mul(2);
+    if mesh <= 0 {
+        return 0;
+    }
+    y.div_euclid(mesh).saturating_mul(mesh)
+}
+
+/// Native index of the packed floor that holds native cell `ylo`, in the frame
+/// whose block altitude 0 is `alo`. The edge is [`packed_floor`].
+fn global_y0(alo: i32, ylo: i32, cell: i32) -> i32 {
+    if cell <= 0 {
+        return 0;
+    }
+    let world = alo.saturating_add(ylo.saturating_mul(cell));
+    let boundary = packed_floor(world, cell);
+    (boundary.saturating_sub(alo)).div_euclid(cell).max(0)
+}
+
+/// Shift the per-section relief loop picks: the least that fits the relief in [`MAX_SLABS`].
+/// Nesting uses it only past [`NESTED_SLABS`]: a finer level naturally wants a higher shift,
+/// which would put its packed edges off its parent's lattice.
+fn relief_shift(ylo: i32, yhi: i32) -> u32 {
+    let mut shift = pack_shift(SECTION_N as i32);
+    loop {
+        let step = 1i32 << shift;
+        let y0 = ylo / step * step;
+        let ny = ((yhi + step - 1) / step * step - y0) / step;
+        if ny <= BLOCK * MAX_SLABS {
+            return shift;
+        }
+        shift += 1;
+        if shift > 16 {
+            return shift;
+        }
+    }
+}
+
+/// Parent packed tops for the eight-by-eight parent columns this child's native
+/// grid covers, from that grid alone. Index is `[z][x]` inside the quadrant.
+/// The value is the world altitude of the packed cell's top face, or `None` when
+/// the parent column has no solid parent-sample. The parent mesher draws these.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::world) fn coarser_tops(native: &[BlockId], n_cells: usize, alo: i32, cell: i32) -> [[Option<i32>; 8]; 8] {
+    let mut tops = [[None; 8]; 8];
+    // Parent cell is 2·cell and the mesh step is 2, so one parent packed column is 4 child cells.
+    let mesh = cell.saturating_mul(4);
+    if mesh <= 0 || n_cells == 0 || native.len() < SECTION_N * SECTION_N * n_cells {
+        return tops;
+    }
+    for pz in 0..8 {
+        for px in 0..8 {
+            let mut best: Option<i32> = None;
+            for dz in [0i32, 2] {
+                for dx in [0i32, 2] {
+                    let x = 4 * px + dx;
+                    let z = 4 * pz + dz;
+                    let col = &native[(x as usize + z as usize * SECTION_N) * n_cells..][..n_cells];
+                    for (iy, &id) in col.iter().enumerate() {
+                        if iy % 2 != 0 || id == AIR {
+                            continue;
+                        }
+                        let y = alo + iy as i32 * cell;
+                        best = Some(best.map_or(y, |b| b.max(y)));
+                    }
+                }
+            }
+            tops[pz as usize][px as usize] = best.map(|y| y.div_euclid(mesh) * mesh + mesh);
+        }
+    }
+    tops
 }
 
 /// Highest non-air in the native `step³` cube, preferring opaque at the same Y.
@@ -692,9 +788,17 @@ fn pick_coarse(
 /// The packed volume starts one cell below the lowest SURFACE (the lowest column top here, or
 /// `floor`, the lowest top just outside the section, whichever is lower) — not at the bottom
 /// of the domain: everything below is solid ground in every column and never shows, so only
-/// the relief inside the section costs slabs. The shift is the least that packs the 32 columns
-/// and fits the relief in [`MAX_SLABS`] slabs.
-fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
+/// the relief inside the section costs slabs. The shift stays the one that packs the 32
+/// columns: raising it would move this level's edges off its parent's lattice. Tall relief
+/// stacks more slabs instead.
+fn mesh_packed(
+    native: &[BlockId],
+    n_cells: usize,
+    tables: &HotTables,
+    floor: Option<i32>,
+    alo: i32,
+    cell: i32,
+) -> SectionMeshData {
     let ny_n = n_cells as i32;
     let (mut min_top, mut yhi) = (ny_n, 0);
     for col in native.chunks_exact(n_cells) {
@@ -709,18 +813,20 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Op
     let ylo = (min_top.min(floor.unwrap_or(min_top)) - 1).max(0);
 
     let mut shift = pack_shift(SECTION_N as i32);
-    let (step, y0, ny) = loop {
-        let step = 1i32 << shift;
-        let y0 = ylo / step * step;
-        let ny = ((yhi + step - 1) / step * step - y0) / step;
-        if ny <= BLOCK * MAX_SLABS {
-            break (step, y0, ny);
-        }
-        shift += 1;
-    };
+    let mut step = 1i32 << shift;
+    let mut y0 = global_y0(alo, ylo, cell);
+    let mut ny = ((yhi + step - 1) / step * step - y0) / step;
+    if ny > BLOCK * NESTED_SLABS {
+        shift = relief_shift(ylo, yhi);
+        step = 1 << shift;
+        y0 = ylo / step * step;
+        ny = ((yhi + step - 1) / step * step - y0) / step;
+    }
     let nx = (SECTION_N as i32 + step - 1) / step;
     let nz = nx;
     debug_assert!(nx <= BLOCK && nz <= BLOCK);
+    #[cfg(test)]
+    let natural = relief_shift(ylo, yhi);
 
     DENSE_COARSE.with_borrow_mut(|coarse| {
         coarse.resize((nx * ny * nz) as usize, AIR);
@@ -753,7 +859,13 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Op
                     });
                 }
             }
-            SectionMeshData { shift: if slabs.is_empty() { 0 } else { shift as u8 }, slabs, altitude_floor: 0 }
+            SectionMeshData {
+                shift: if slabs.is_empty() { 0 } else { shift as u8 },
+                slabs,
+                altitude_floor: alo,
+                #[cfg(test)]
+                relief_shift: natural as u8,
+            }
         })
     })
 }
@@ -761,7 +873,7 @@ fn mesh_packed(native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::registry::BlockRegistry;
+    use crate::block::registry::{AIR, BlockRegistry};
     use crate::world::generation::TerrainGenerator;
     use crate::world::terrain::Terrain;
     use crate::ident::Detail;
@@ -769,22 +881,23 @@ mod tests {
 
     // Test fixtures
 
-    struct FnGen<H, B> {
+    struct FnGen<H, B, S> {
         h: H,
         b: B,
-        surf: BlockId,
+        surf: S,
         deep: BlockId,
     }
-    impl<H, B> TerrainGenerator for FnGen<H, B>
+    impl<H, B, S> TerrainGenerator for FnGen<H, B, S>
     where
         H: Fn(i32, i32) -> i32 + Send + Sync,
         B: Fn(i32, i32, i32) -> BlockId + Send + Sync,
+        S: Fn(i32, i32) -> BlockId + Send + Sync,
     {
         fn height(&self, wx: i32, wz: i32) -> i32 {
             (self.h)(wx, wz)
         }
-        fn surface_at(&self, _: i32, _: i32) -> BlockId {
-            self.surf
+        fn surface_at(&self, wx: i32, wz: i32) -> BlockId {
+            (self.surf)(wx, wz)
         }
         fn deep(&self) -> BlockId {
             self.deep
@@ -827,7 +940,7 @@ mod tests {
         h: i32,
         water: i32,
         shelf: Option<(i32, i32)>,
-    ) -> FnGen<impl Fn(i32, i32) -> i32, impl Fn(i32, i32, i32) -> BlockId> {
+    ) -> FnGen<impl Fn(i32, i32) -> i32, impl Fn(i32, i32, i32) -> BlockId, impl Fn(i32, i32) -> BlockId> {
         let (grass, dirt, stone, sand, water_id) = (b.grass, b.dirt, b.stone, b.sand, b.water);
         FnGen {
             h: move |_, _| h,
@@ -846,7 +959,7 @@ mod tests {
                     AIR
                 }
             },
-            surf: grass,
+            surf: move |_, _| grass,
             deep: stone,
         }
     }
@@ -965,7 +1078,7 @@ mod tests {
                     AIR
                 }
             },
-            surf: grass,
+            surf: move |_, _| grass,
             deep: stone,
         };
         let sec = extract(FINEST, &r#gen);
@@ -994,6 +1107,23 @@ mod tests {
         }
     }
 
+    /// A cliff past [`NESTED_SLABS`] at the nesting shift packs coarser on its own lattice: a few
+    /// slabs at the relief shift, never an unbounded stack. Ground stays one slab at shift 1.
+    #[test]
+    fn a_cliff_past_the_nested_slabs_packs_at_the_relief_shift() {
+        let (_r, tables, b) = setup();
+        let n_cells = 1_200usize;
+        let column = |top: usize| -> Vec<BlockId> { (0..n_cells).map(|y| if y < top { b.stone } else { AIR }).collect() };
+        let grid = |tall: bool| -> Vec<BlockId> {
+            (0..SECTION_N * SECTION_N).flat_map(|i| column(if tall && i % SECTION_N < 12 { 1_100 } else { 50 })).collect()
+        };
+        let flat = mesh_packed(&grid(false), n_cells, &tables, None, 0, 4);
+        assert_eq!((flat.shift, flat.slabs.len()), (1, 1), "flat ground");
+        let cliff = mesh_packed(&grid(true), n_cells, &tables, None, 0, 4);
+        assert!(cliff.shift > flat.shift, "a 4 km cliff coarsens instead of stacking");
+        assert!(!cliff.slabs.is_empty() && cliff.slabs.len() <= MAX_SLABS as usize, "{} slabs", cliff.slabs.len());
+    }
+
     /// Relief splits into stacked slabs at the least shift instead of coarsening every axis: a
     /// shelf 100 native cells above the ground keeps the horizontal shift of flat ground, and the
     /// slabs stack contiguously with no seam faces between them.
@@ -1007,7 +1137,7 @@ mod tests {
         let peak = FnGen {
             h: |x: i32, _| if x < 48 { 500 } else { 200 },
             b: move |x: i32, y, _| if y < if x < 48 { 500 } else { 200 } { stone } else { AIR },
-            surf: grass,
+            surf: move |_, _| grass,
             deep: stone,
         };
         let tall = mesh_of(&extract(FINEST, &peak), &tables);
@@ -1048,11 +1178,13 @@ mod tests {
         let checker = FnGen {
             h: |_, _| 200,
             // Checkerboard varies at cell boundaries (not single-meter bands).
+            // The column paints `surface_at` onto the top sample, so that id
+            // has to follow the same tiles or the top collapses to one quad.
             b: move |x: i32, y, z: i32| {
                 if y >= 200 {
                     AIR
                 } else if y >= 196 {
-                    // Packed cells are 2+ native cells; checkerboard at that scale.
+                    // Packed cells are 2 native cells; checkerboard wider than that.
                     if (x.div_euclid(CELL * 8) + z.div_euclid(CELL * 8)).rem_euclid(2) == 0 {
                         grass
                     } else {
@@ -1062,7 +1194,9 @@ mod tests {
                     stone
                 }
             },
-            surf: grass,
+            surf: move |x: i32, z: i32| {
+                if (x.div_euclid(CELL * 8) + z.div_euclid(CELL * 8)).rem_euclid(2) == 0 { grass } else { dirt }
+            },
             deep: stone,
         };
         let sec = extract(FINEST, &checker);
@@ -1081,9 +1215,9 @@ mod tests {
         let (_r, tables, b) = setup();
 
         // Edits inside the finest section footprint, exercising every
-        // apply_edits branch: a centre-sample hit (air AND solid), off-centre
-        // solid edits contending for one coarse cell, and an out-of-footprint
-        // edit that must be ignored identically.
+        // apply_edits branch: a sample-point hit (air AND solid) at the cell's
+        // first block, off-sample solid edits contending for one coarse cell,
+        // and an out-of-footprint edit that must be ignored identically.
         let cs = crate::world::chunk::CHUNK_SIZE;
         let edit_chunk = crate::coord::ChunkCoord::new(0, 6, 0); // world y 96..112
         let far_chunk = crate::coord::ChunkCoord::new(50, 6, 0);
@@ -1092,10 +1226,10 @@ mod tests {
             (
                 edit_chunk,
                 vec![
-                    (idx(2, 6, 2), b.stone), // centre of cell (0,?,0) at CELL=4: (2, 96+6=102?, 2)
-                    (idx(3, 1, 5), b.dirt),  // off-centre solid
-                    (idx(3, 2, 5), AIR),     // off-centre air (must not clear)
-                    (idx(2, 10, 2), AIR),    // another candidate centre hit
+                    (idx(0, 4, 0), b.stone), // sample of cell (0, 25, 0) at CELL=4: world (0, 100, 0)
+                    (idx(3, 1, 5), b.dirt),  // off-sample solid
+                    (idx(3, 2, 5), AIR),     // off-sample air (must not clear)
+                    (idx(0, 8, 0), AIR),     // sample-point air, world y 104
                     (idx(7, 3, 9), b.sand),
                 ],
             ),
@@ -1433,7 +1567,7 @@ mod tests {
         let terra = FnGen {
             h: move |x, z| if valley(x, z) { 40 } else { 200 },
             b: move |x, y, z| if y < if valley(x, z) { 40 } else { 200 } { stone } else { AIR },
-            surf: b.grass,
+            surf: move |_, _| b.grass,
             deep: stone,
         };
         let coarse = SectionPos { body: 0, face: Face::PosY, detail: Detail(FINEST_DETAIL.0 + 2), x: 0, z: 0 };
@@ -1911,8 +2045,9 @@ mod tests {
     /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
     /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
     /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0xca4adead` for that border
-    /// (seed 42, diffusion, default view); the window streaming places there is the eye band.
+    /// what covers the sliver outside the box. Bytes re-pinned to `0x46ae3b3a`: every level
+    /// samples the cell's first block and packs on one shared lattice (seed 42, diffusion,
+    /// default view). The window streaming places there is the eye band.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -1924,7 +2059,7 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0xca4adead, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0x46ae3b3a, "spawn ground-level far-field bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
         assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");
@@ -2000,8 +2135,8 @@ mod tests {
     /// slab pack. Ignored: a timing benchmark, not a
     /// correctness gate. Run with
     /// `cargo test --release far_lod_section_mesh -- --ignored --nocapture`.
-    /// 2026-09-10: 2.440 ms/section (median of 3); fingerprint verts=9048 fnv=0xa42303c7.
-    /// 2026-10-02 (InfiniteDiffusion v3, stacked slabs): 4.026 ms/section; verts=15056 fnv=0xa2f08c4a.
+    /// 2026-10-05: these body-0 sections are empty on the charted start world
+    /// (verts=0 fnv=0x69691905). Chart cost is `lod_pop_census`.
     #[test]
     #[ignore]
     fn far_lod_section_mesh() {
@@ -2065,5 +2200,285 @@ mod tests {
             }
         }
         println!("far_lod_section_mesh fingerprint verts={verts} fnv={h:#010x}");
+    }
+
+    /// Pop and nesting-break census for the far field. Ignored: a measurement, not a gate.
+    /// `cargo test --release --lib -- --ignored --nocapture lod_pop_census`
+    #[test]
+    #[ignore]
+    fn lod_pop_census() {
+        use crate::space::atlas::Patch;
+        const OWNER: i64 = 1791184794939118871;
+        for &seed in &[42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let r#gen = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            census_path(&r#gen, &tables, seed, "home+Y", 0, Face::PosY, &[(0, 0), (512, -256), (-384, 768), (1280, 1280), (-1024, -640)]);
+            let home = r#gen.cosmos().expect("cosmos").home();
+            let index = r#gen
+                .atlases()
+                .iter()
+                .position(|a| (a.centre - home.centre_f()).length() < 1.0)
+                .expect("home chart");
+            let atlas = &r#gen.atlases()[index];
+            let (origin, size) = atlas.storage_box(Patch::Shell { band: 0, face: Face::PosY });
+            let (cx, cz) = ((origin[0] + size[0] / 2) as i32, (origin[2] + size[2] / 2) as i32);
+            let body = super::super::CHART_BODY_BASE + index as u16;
+            census_path(
+                &r#gen,
+                &tables,
+                seed,
+                "chart+Y",
+                body,
+                Face::PosY,
+                &[(cx, cz), (cx + 2048, cz), (cx, cz + 2048), (cx - 1536, cz + 768), (cx + 3072, cz - 1024)],
+            );
+        }
+    }
+
+    fn census_path<G: TerrainGenerator + ?Sized>(
+        r#gen: &G,
+        tables: &HotTables,
+        seed: i64,
+        label: &str,
+        body: u16,
+        face: Face,
+        sites: &[(i32, i32)],
+    ) {
+        let t0 = std::time::Instant::now();
+        let mut diffs = Vec::new();
+        let mut miss = 0u32;
+        let mut pairs = 0u32;
+        let mut breaks = 0u32;
+        let mut raised = 0u32;
+        let mut slabs = 0usize;
+        let mut bytes = 0usize;
+        let mut sections = 0u32;
+        let base = super::pack_shift(SECTION_N as i32);
+        for &detail in &[FINEST_DETAIL.0, FINEST_DETAIL.0 + 1, FINEST_DETAIL.0 + 2, FINEST_DETAIL.0 + 3] {
+            for &(wx, wz) in sites {
+                let child_pos = section_at(body, face, Detail(detail), wx, wz);
+                let parent_pos = child_pos.parent();
+                let child = extract_section_mesh(child_pos, r#gen, &[], tables);
+                let parent = extract_section_mesh(parent_pos, r#gen, &[], tables);
+                sections += 2;
+                for mesh in [&child, &parent] {
+                    slabs += mesh.slabs.len();
+                    bytes += mesh.vertex_bytes();
+                    if mesh.relief_shift as u32 > base {
+                        raised += 1;
+                    }
+                }
+                if child.slabs.is_empty() || parent.slabs.is_empty() {
+                    continue;
+                }
+                pairs += 1;
+                let step_c = 1i32 << child.shift.max(1);
+                // The shift the old relief loop would have used. A child above its parent
+                // is a nesting break; nesting keeps the packing shift.
+                if child.relief_shift > parent.relief_shift {
+                    breaks += 1;
+                }
+                let tile_c = place_tile(child_pos, &child);
+                let tile_p = place_tile(parent_pos, &parent);
+                let mesh_cell = child_pos.cell_size() * step_c;
+                let nx = (SECTION_N as i32 + step_c - 1) / step_c;
+                for pz in 0..nx {
+                    for px in 0..nx {
+                        let x = child_pos.min_x() + px * mesh_cell + mesh_cell / 2;
+                        let z = child_pos.min_z() + pz * mesh_cell + mesh_cell / 2;
+                        if x >= child_pos.min_x() + child_pos.span() || z >= child_pos.min_z() + child_pos.span() {
+                            continue;
+                        }
+                        match (top_at(&tile_c, x, z), top_at(&tile_p, x, z)) {
+                            (Some(c), Some(p)) => diffs.push((c - p).abs()),
+                            (None, None) => {}
+                            _ => miss += 1,
+                        }
+                    }
+                }
+            }
+        }
+        diffs.sort_unstable();
+        let n = diffs.len();
+        let sum: u64 = diffs.iter().map(|&d| d as u64).sum();
+        let mean = if n == 0 { 0.0 } else { sum as f64 / n as f64 };
+        let p95 = if n == 0 { 0 } else { diffs[(n - 1) * 95 / 100] };
+        println!(
+            "lod_pop_census seed={seed} {label}: pairs={pairs} columns={n} miss={miss} mean={mean:.3} p95={p95} max={} breaks={breaks} raised_shift={raised} sections={sections} slabs={slabs} vertex_bytes={bytes} ms={:.1}",
+            diffs.last().copied().unwrap_or(0),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    fn section_at(body: u16, face: Face, detail: Detail, wx: i32, wz: i32) -> SectionPos {
+        let span = super::super::section_span(detail);
+        SectionPos { body, face, detail, x: wx.div_euclid(span), z: wz.div_euclid(span) }
+    }
+
+    /// Every parent sample sits on the child lattice and carries the child's block there.
+    fn assert_columns_nest<G: TerrainGenerator + ?Sized>(
+        r#gen: &G,
+        child: SectionPos,
+        flat: &[(i32, i32, i32, BlockId)],
+    ) {
+        let parent = child.parent();
+        let Some((calo, cahi)) = super::section_window(child, r#gen) else { return };
+        let Some((palo, pahi)) = super::section_window(parent, r#gen) else { return };
+        let cc = child.cell_size();
+        let pc = parent.cell_size();
+        assert_eq!(pc, cc * 2, "parent cell is twice the child");
+        let cn = (cahi - calo) / cc;
+        let pn = (pahi - palo) / pc;
+        assert!(cn > 0 && pn > 0, "empty window");
+        let cys = super::super::column_ys(child.detail, calo, cn, cc);
+        let pys = super::super::column_ys(parent.detail, palo, pn, pc);
+        let qx = child.x.rem_euclid(2);
+        let qz = child.z.rem_euclid(2);
+        let chart = child.body >= super::super::CHART_BODY_BASE;
+        for &j in &[0i32, 7, 15] {
+            for &k in &[0i32, 4, 15] {
+                let (pj, pk) = (qx * 16 + j, qz * 16 + k);
+                let (px, pz) = (parent.min_x() + pj * pc, parent.min_z() + pk * pc);
+                let ix = (px - child.min_x()) / cc;
+                assert_eq!(ix % 2, 0, "parent column is not a child column");
+                assert!((0..SECTION_N as i32).contains(&ix));
+                let mut pcol = vec![AIR; pys.len()];
+                let mut ccol = vec![AIR; cys.len()];
+                if child.face == Face::PosY && !chart {
+                    r#gen.lod_column(px, pz, &pys, &mut pcol);
+                    r#gen.lod_column(px, pz, &cys, &mut ccol);
+                } else {
+                    r#gen.lod_column_face(child.body, child.face, px, pz, &pys, &mut pcol);
+                    r#gen.lod_column_face(child.body, child.face, px, pz, &cys, &mut ccol);
+                }
+                super::super::apply_edits(&mut pcol, flat, px, pz, pc, palo);
+                super::super::apply_edits(&mut ccol, flat, px, pz, cc, calo);
+                let mut shared = 0u32;
+                for (i, &y) in pys.iter().enumerate() {
+                    // Same phase: a parent altitude is a child altitude, whether or not this
+                    // section's window stored it.
+                    assert_eq!((y - calo).rem_euclid(cc), 0, "parent sample {y} off the child lattice");
+                    let Some(k) = cys.iter().position(|&cy| cy == y) else { continue };
+                    shared += 1;
+                    assert_eq!(ccol[k], pcol[i], "nested column ({px},{pz}) at {y}, child {child:?}");
+                }
+                if let Some(top) = pcol.iter().rposition(|&id| id != AIR) {
+                    let y = pys[top];
+                    assert!(
+                        cys.contains(&y),
+                        "parent top {y} is outside child {child:?} window [{calo},{cahi})"
+                    );
+                }
+                assert!(shared > 0, "child {child:?} shares no sample with its parent");
+            }
+        }
+    }
+
+    /// Parent packed tops, read off the parent's mesh, equal [`super::coarser_tops`] of the child.
+    fn assert_coarser_tops<G: TerrainGenerator + ?Sized>(r#gen: &G, tables: &HotTables, child: SectionPos) {
+        let parent = child.parent();
+        let Some((calo, cahi)) = super::section_window(child, r#gen) else { return };
+        let cc = child.cell_size();
+        let n = ((cahi - calo) / cc) as usize;
+        let mut dense = vec![AIR; SECTION_N * SECTION_N * n];
+        super::sample_columns(child, r#gen, &[], calo, n, &mut dense);
+        let tops = super::coarser_tops(&dense, n, calo, cc);
+        let mesh = extract_section_mesh(parent, r#gen, &[], tables);
+        if mesh.slabs.is_empty() {
+            assert!(tops.iter().flatten().all(|t| t.is_none()), "air parent still packed a top");
+            return;
+        }
+        assert_eq!(mesh.shift as u32, super::pack_shift(SECTION_N as i32), "nesting raised the shift");
+        let child_mesh = cc * 2;
+        for slab in &mesh.slabs {
+            let world = mesh.altitude_floor + slab.origin_y as i32 * parent.cell_size();
+            assert_eq!(world.rem_euclid(child_mesh), 0, "parent boundary {world} is not a child boundary");
+        }
+        let tile = place_tile(parent, &mesh);
+        let span = cc * 4;
+        for pz in 0..8 {
+            for px in 0..8 {
+                let x = child.min_x() + px * span + span / 2;
+                let z = child.min_z() + pz * span + span / 2;
+                assert_eq!(top_at(&tile, x, z), tops[pz as usize][px as usize], "coarser top at {x},{z} for {child:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_boundaries_nest_and_are_global() {
+        for &cell in &[4i32, 8, 16, 32, 64, 128, 256] {
+            let child_mesh = cell * 2;
+            for &y in &[-4000, -1, 0, 1, 7, 15, 16, 511, 512, 10_000, 3_000_000] {
+                let floor = super::packed_floor(y, cell);
+                let again = super::packed_floor(y + cell * 2 * 50, cell);
+                assert_eq!(floor.rem_euclid(child_mesh), 0);
+                assert_eq!(super::packed_floor(floor, cell), floor);
+                // A second section of this level: the floor depends only on y and the cell.
+                assert_eq!((again - floor).rem_euclid(child_mesh), 0);
+                let parent_floor = super::packed_floor(y, cell * 2);
+                assert_eq!(parent_floor.rem_euclid(child_mesh), 0, "parent boundary off the child lattice");
+                assert_eq!(super::packed_floor(parent_floor, cell), parent_floor);
+            }
+        }
+    }
+
+    #[test]
+    fn parent_samples_are_child_samples_on_the_legacy_path() {
+        let (_r, tables, b) = setup();
+        let r#gen = terrain_gen(&b, 180, 40, Some((220, 240)));
+        let stone = b.stone;
+        for detail in FINEST_DETAIL.0..FINEST_DETAIL.0 + 6 {
+            for &(x, z) in &[(0i32, 0), (3, -2), (-1, 4), (8, 1)] {
+                let child = section_at(0, Face::PosY, Detail(detail), x * 64, z * 64);
+                let parent = child.parent();
+                let (palo, _) = super::section_window(parent, &r#gen).expect("home window");
+                let pc = parent.cell_size();
+                let (px, pz) = (parent.min_x(), parent.min_z());
+                let y = palo + 4 * pc;
+                let flat = [(px, y, pz, stone)];
+                assert_columns_nest(&r#gen, child, &flat);
+                if detail <= FINEST_DETAIL.0 + 3 {
+                    assert_coarser_tops(&r#gen, &tables, child);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parent_samples_are_child_samples_on_a_chart() {
+        use crate::space::atlas::Patch;
+        let mut registry = BlockRegistry::with_builtins();
+        let r#gen = Terrain::new(&mut registry, 42);
+        let tables = registry.hot_tables();
+        let stone = registry.id_by_label("rock").expect("rock");
+        let home = r#gen.cosmos().expect("cosmos").home();
+        let index = r#gen
+            .atlases()
+            .iter()
+            .position(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("home chart");
+        let atlas = &r#gen.atlases()[index];
+        let (origin, size) = atlas.storage_box(Patch::Shell { band: 0, face: Face::PosY });
+        let (cx, cz) = ((origin[0] + size[0] / 2) as i32, (origin[2] + size[2] / 2) as i32);
+        let body = super::super::CHART_BODY_BASE + index as u16;
+        for detail in FINEST_DETAIL.0..FINEST_DETAIL.0 + 4 {
+            for &(dx, dz) in &[(0i32, 0), (1536, -768), (-2048, 1024)] {
+                let child = section_at(body, Face::PosY, Detail(detail), cx + dx, cz + dz);
+                if super::section_window(child, &r#gen).is_none() {
+                    continue;
+                }
+                let parent = child.parent();
+                let (palo, pahi) = super::section_window(parent, &r#gen).expect("parent window");
+                let pc = parent.cell_size();
+                let y = palo + ((pahi - palo) / pc / 2) * pc;
+                let flat = [(parent.min_x(), y, parent.min_z(), stone)];
+                assert_columns_nest(&r#gen, child, &flat);
+                if detail <= FINEST_DETAIL.0 + 2 {
+                    assert_coarser_tops(&r#gen, &tables, child);
+                }
+            }
+        }
     }
 }

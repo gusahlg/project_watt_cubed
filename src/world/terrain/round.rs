@@ -915,14 +915,11 @@ impl Round {
                 *o = if d >= 1 { self.ground(&col, d) } else { AIR };
             }
             self.paint_lod_top(&col, origin_y, ys, out);
-            // A Verdant forest floor reads from afar as its canopy (meadows stay open).
-            if self.style == Style::Verdant && (col.top == self.m.grass || col.top == self.m.moss) {
-                if let Some(k) = out.iter().take(ys.len()).rposition(|&id| id != AIR) {
-                    out[k] = self.m.leaves;
-                }
-            }
             return;
         }
+        // Samples on an undressed lattice (the next cell past LOD_DRESS_CELL, one
+        // phase for every level) stay plain terrain, so a parent column matches here.
+        let plain_at = LOD_DRESS_CELL.saturating_mul(2);
         self.with_plants(patch, size[0], i, j, |plants, marks| {
             // One horizontal test per mark; the vertical samples then see only this column's shapes.
             let mut buf = [blank_mark(); 4];
@@ -934,7 +931,10 @@ impl Round {
             for (o, &sy) in out.iter_mut().zip(ys) {
                 let y = sy as i64 - origin_y;
                 let d = col.surface - y;
-                *o = if d >= 1 {
+                let on_plain = plain_at > cell && i64::from(sy).rem_euclid(plain_at) == 0;
+                *o = if on_plain {
+                    if d >= 1 { self.ground(&col, d) } else { AIR }
+                } else if d >= 1 {
                     if d <= marks::DIG && self.dug(here, i, j, d, true) { AIR } else { self.ground(&col, d) }
                 } else {
                     self.mark_block(here, i, y, j, col.surface, true).or_else(|| self.plant(plants, i, y, j)).unwrap_or(AIR)
@@ -944,7 +944,18 @@ impl Round {
         self.paint_lod_top(&col, origin_y, ys, out);
     }
 
-    /// Coarse rings sample cell floors (rock): the cell holding the surface shows the top block.
+    /// Block a far column shows at the surface sample. A Verdant forest reads as its canopy
+    /// at every level; meadows stay open.
+    fn lod_display(&self, col: &Column) -> BlockId {
+        if self.style == Style::Verdant && (col.top == self.m.grass || col.top == self.m.moss) {
+            self.m.leaves
+        } else {
+            self.ground(col, 1)
+        }
+    }
+
+    /// The cell holding the surface shows [`lod_display`](Self::lod_display), and so does every
+    /// coarser floor of that sample, so a parent level matches this column there.
     fn paint_lod_top(&self, col: &Column, origin_y: i64, ys: &[i32], out: &mut [BlockId]) {
         let n = out.len().min(ys.len());
         if n < 2 || !crate::world::generation::coarse_floor_samples(&ys[..n]) {
@@ -952,12 +963,13 @@ impl Round {
         }
         let step = i64::from(ys[1] - ys[0]);
         let top = col.surface - 1;
-        let lo = |k: usize| i64::from(ys[k]) - origin_y;
-        if let Some(k) = (0..n).find(|&k| (lo(k)..lo(k) + step).contains(&top)) {
-            if out[k] != AIR {
-                out[k] = self.ground(col, 1);
-            }
-        }
+        let Some(k) = (0..n).find(|&k| {
+            let lo = i64::from(ys[k]) - origin_y;
+            (lo..lo + step).contains(&top)
+        }) else {
+            return;
+        };
+        crate::world::generation::paint_aligned(out, ys, k, self.lod_display(col));
     }
 
     /// Plants and far landmarks that can paint column `(i, j)`, reused across one 128-block section.

@@ -27,23 +27,52 @@ pub enum Classify {
 /// Ground height per cell of a 16×16 chunk column — identical to [`TerrainGenerator::height`].
 pub type ColumnHeights = [i32; CHUNK_SIZE * CHUNK_SIZE];
 
-/// Coarse rings pass cell floors (aligned, step at least two finest cells).
-/// Finest rings pass centres and must keep the block that sample returned.
+/// Floor-aligned samples: the first altitude sits on the step, at every level.
 pub(in crate::world) fn coarse_floor_samples(ys: &[i32]) -> bool {
     let Some(&y1) = ys.get(1) else { return false };
     let step = y1 - ys[0];
-    let min_step = 1i32 << (super::section::FINEST_DETAIL.0 + 1);
-    step >= min_step && ys[0].rem_euclid(step) == 0
+    step > 0 && ys[0].rem_euclid(step) == 0
 }
 
-/// The floor sample of a coarse cell is underground rock. The top solid cell
-/// shows the surface block instead, so a textured ring is not a rock plain.
-pub(in crate::world) fn paint_lod_top(out: &mut [BlockId], n: usize, surf: BlockId) {
-    if surf == AIR || n == 0 {
+/// Paint `surf` at sample `k` and at every coarser-aligned floor of that sample
+/// which this column also stores. A parent level reads those floors, so both
+/// levels show the same block there.
+pub(in crate::world) fn paint_aligned(out: &mut [BlockId], ys: &[i32], k: usize, surf: BlockId) {
+    let n = out.len().min(ys.len());
+    if surf == AIR || k >= n || out[k] == AIR {
         return;
     }
-    if let Some(j) = out[..n].iter().rposition(|&id| id != AIR) {
-        out[j] = surf;
+    out[k] = surf;
+    if n < 2 {
+        return;
+    }
+    let step = ys[1] - ys[0];
+    if step <= 0 || ys[0].rem_euclid(step) != 0 {
+        return;
+    }
+    let y = ys[k];
+    let mut c = step.saturating_mul(2);
+    while c > 0 && c / step <= (1 << 12) {
+        let f = y.div_euclid(c).saturating_mul(c);
+        if let Some(j) = ys[..n].iter().position(|&s| s == f) {
+            if out[j] != AIR {
+                out[j] = surf;
+            }
+        }
+        if c > i32::MAX / 2 {
+            break;
+        }
+        c = c.saturating_mul(2);
+    }
+}
+
+/// The floor sample of a cell is underground rock. The top solid cell shows the
+/// surface block instead, and so does each coarser floor of that sample, so a
+/// textured ring is not a rock plain and a parent level matches the child.
+pub(in crate::world) fn paint_lod_top(out: &mut [BlockId], ys: &[i32], surf: BlockId) {
+    let n = out.len().min(ys.len());
+    if let Some(top) = out[..n].iter().rposition(|&id| id != AIR) {
+        paint_aligned(out, ys, top, surf);
     }
 }
 
@@ -244,7 +273,7 @@ pub trait TerrainGenerator: Send + Sync {
             *o = self.lod_block_at(wx, wy, wz);
         }
         if coarse_floor_samples(ys) && out.iter().take(ys.len()).any(|&id| id != AIR) {
-            paint_lod_top(out, ys.len(), self.surface_at(wx, wz));
+            paint_lod_top(out, ys, self.surface_at(wx, wz));
         }
     }
 
