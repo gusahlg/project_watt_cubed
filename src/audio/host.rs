@@ -32,7 +32,10 @@ pub fn output_device_and_config() -> Option<(cpal::Device, cpal::StreamConfig)> 
 
 #[cfg(test)]
 mod tests {
+    /// Opens the machine's real audio devices; alsa-lib's global config is not thread-safe under
+    /// the parallel test runner. Run alone: `cargo test --lib host_probe -- --ignored`.
     #[test]
+    #[ignore]
     fn host_probe_does_not_panic() {
         let _ = std::panic::catch_unwind(|| {
             let _ = super::host();

@@ -194,6 +194,16 @@ struct GpuInfo {
 
 impl GpuProbe {
     fn collect() -> Self {
+        // Unit tests never load the Vulkan loader and driver: several run at once in one process,
+        // next to other native probes, and that intermittently crashed the test runner.
+        if cfg!(test) {
+            return Self {
+                used: None,
+                selection_method: "unavailable".into(),
+                devices: Vec::new(),
+                error: Some("not probed in unit tests".into()),
+            };
+        }
         if let Ok(name) = std::env::var("WATT_BENCH_GPU")
             && !name.trim().is_empty()
         {
