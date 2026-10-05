@@ -334,11 +334,12 @@ impl ViewVolume {
     }
 
     /// Ring-worklist bucket count: one past the data box's heaviest
-    /// [`World::order`]. `None` is plain 3-D chess, so the count is the
-    /// horizontal data radius plus one. Keys past the last ring clamp there.
-    fn worklist_rings(self, up: Option<Face>) -> usize {
+    /// [`World::order`], the box stretched `stretch` layers along the up axis.
+    /// `None` is plain 3-D chess, so the count is the horizontal data radius
+    /// plus one. Keys past the last ring clamp there.
+    fn worklist_rings(self, up: Option<Face>, stretch: i32) -> usize {
         let rh = self.horizontal + DATA_MARGIN;
-        let rv = self.vertical + DATA_MARGIN;
+        let rv = self.vertical + stretch + DATA_MARGIN;
         let span = match up {
             None => rh,
             Some(_) => rh.max(2 * rv),
@@ -1050,6 +1051,11 @@ pub struct World {
     pub(crate) edit_generation: u64,
     /// Last chunk centre; `None` forces a full stream pass. Streams only react to boundary crosses.
     center: Option<Coord>,
+    /// The near window's span along the up axis around [`center`](Self::center): the eye band,
+    /// grown over the near square's terrain.
+    window: streaming::Window,
+    /// Surface bounds of the near square's chunk columns, kept while they stay in the square.
+    window_ground: streaming::NearBounds,
     /// The far field's chunk centre: the chart column under the eye, which outlasts the near
     /// window's chart reach; the streaming centre elsewhere. Set by [`stream`](Self::stream).
     far_center: Option<Coord>,
@@ -1096,9 +1102,7 @@ pub struct World {
     /// Box `gen_columns` was gathered for. A mismatch, or `gen_cursor_dirty`,
     /// rebuilds the queue instead of scanning the data box again.
     gen_cursor_center: Option<Coord>,
-    gen_cursor_up: Option<Face>,
-    gen_cursor_h: i32,
-    gen_cursor_v: i32,
+    gen_cursor_box: Option<ChunkBox>,
     gen_cursor_slab: Option<ChunkBox>,
     gen_cursor_dirty: bool,
     /// Velocity the queued runs were last ordered with. A change re-sorts;
@@ -1368,6 +1372,12 @@ pub struct World {
     /// outward on upload/air events (each ring re-scanned at most once per
     /// loading wave), reset by centre moves, unloads, and mesh teardown.
     lod_clip_rings: i32,
+    /// The chunk range along the up axis the settled rings are proven over: the
+    /// near window's, or `None` for the centre's eye band.
+    lod_clip_span: Option<[i32; 2]>,
+    /// A grown window span still being proven, with its settled rings. The clip
+    /// keeps to the proven span until these catch up.
+    lod_clip_next: Option<([i32; 2], i32)>,
     /// A settle event landed (chunk mesh upload, born-air store): try to
     /// extend [`lod_clip_rings`](Self::lod_clip_rings) outward.
     lod_clip_grow: Sticky,
@@ -1407,6 +1417,11 @@ pub struct World {
     section_frontier_key: Option<SectionFrontierKey>,
     /// Surface bounds the near-window punch read, kept across frontier recomputes.
     near_bounds: streaming::NearBounds,
+    /// Desired sections the near window holds whose ground has not all settled, with the chunk
+    /// layers that ground spans. They keep drawing until those chunks do; admission skips them.
+    section_held: FastMap<SectionPos, [i32; 2]>,
+    /// A chunk settled since the held sections were last checked.
+    held_recheck: Sticky,
     /// Far-lane configuration epoch: bumped by every live ladder change so an
     /// in-flight worker result from a retired configuration can never land.
     section_epoch: u32,
@@ -1440,6 +1455,8 @@ struct SectionFrontierKey {
     /// The full-res window's height and up face; a chart punches sections the window holds.
     vertical: i32,
     up: Option<Face>,
+    /// The span a chart's punch tests against (`None` off charts).
+    window: Option<[i32; 2]>,
     unit: u32,
     finest: i8,
     levels: u8,
@@ -1522,6 +1539,8 @@ impl World {
             edits: FastMap::default(),
             edit_generation: 0,
             center: None,
+            window: streaming::Window::default(),
+            window_ground: streaming::NearBounds::default(),
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
             far_atlas: None,
@@ -1540,9 +1559,7 @@ impl World {
             admit_sections: AdmitScratch::default(),
             gen_columns: Vec::new(),
             gen_cursor_center: None,
-            gen_cursor_up: None,
-            gen_cursor_h: 0,
-            gen_cursor_v: 0,
+            gen_cursor_box: None,
             gen_cursor_slab: None,
             gen_cursor_dirty: false,
             gen_cursor_vel: DVec3::ZERO,
@@ -1570,12 +1587,12 @@ impl World {
             upload_queue: VecDeque::new(),
             mesh_worklist: worklist::RingWorklist::new(
                 Coord::new(0, 0, 0),
-                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY)),
+                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY), 0),
             ),
             light_pending: Sticky::default(),
             light_worklist: worklist::RingWorklist::new(
                 Coord::new(0, 0, 0),
-                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY)),
+                ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY), 0),
             ),
             light_seed_inserts: 0,
             light_seed_split: LightSeedSplit::default(),
@@ -1644,7 +1661,11 @@ impl World {
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
             near_bounds: streaming::NearBounds::default(),
+            section_held: FastMap::default(),
+            held_recheck: Sticky::default(),
             lod_clip_rings: 0,
+            lod_clip_span: None,
+            lod_clip_next: None,
             lod_clip_grow: Sticky::default(),
             lod_clip_shrunk: Sticky::raised(),
             section_epoch: 0,
@@ -1730,14 +1751,15 @@ impl World {
     /// push (both maintained in `stream`). The engine draws every visible
     /// resident mesh itself, so `render` submits no per-mesh draws — it only sets
     /// the frame's LOD-cull volume and reports the set-size gauge.
-    pub fn render(&self, f: &mut Frame3D, _cam: DVec3) {
+    pub fn render(&self, f: &mut Frame3D, cam: DVec3) {
         // The shader discards LOD-section fragments inside the SETTLED radius:
         // the rings whose chunks are actually drawn (or born-air). While a
         // loading edge is still meshing, the clip stays behind it and the far
         // sections keep covering the gap — coarse terrain instead of a hole —
         // then hands off ring by ring as uploads land. Fully settled, this is
         // exactly the old full-res radius.
-        f.set_lod_clip(self.lod_clip());
+        let (min, max) = self.lod_clip_box(cam);
+        f.set_lod_clip_box(min, max);
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.
         use voxel_engine::profile::{Gauge, gauge};
@@ -1775,6 +1797,21 @@ impl World {
         CoverageVolume { half: Vec3::new(x, y, z) }
     }
 
+    /// [`lod_clip`](Self::lod_clip) as extents about camera `cam`. Along the up axis a near window
+    /// off a chart clips the span its rings are proven over, which may reach past the eye band.
+    fn lod_clip_box(&self, cam: DVec3) -> (Vec3, Vec3) {
+        let half = self.lod_clip().half;
+        let (mut min, mut max) = (-half, half);
+        if let (Some(face), Some([lo, hi])) = (self.live_up(), self.lod_clip_span)
+            && self.fold.is_identity()
+        {
+            let (a, cs) = (face.axis(), CHUNK_SIZE as f64);
+            min[a] = (f64::from(lo) * cs - cam[a]) as f32;
+            max[a] = ((f64::from(hi) + 1.0) * cs - cam[a]) as f32;
+        }
+        (min, max)
+    }
+
     /// Fold a streaming-centre move into the settled-ring count WITHOUT
     /// restarting the scan. Proven-settled rings survive a move across the up
     /// axis, shifted down by its tangent chess distance `d`: a column at
@@ -1801,9 +1838,10 @@ impl World {
             return;
         };
         let up = self.live_up();
+        // A window span is fixed in the world, so its proof survives a move along the axis.
         let along = match up {
-            Some(face) => p.along(new, face),
-            None => 0,
+            Some(face) if self.lod_clip_span.is_none() => p.along(new, face),
+            _ => 0,
         };
         if along != 0 {
             self.lod_clip_shrunk.set();
@@ -1814,6 +1852,9 @@ impl World {
             None => p.chess3(new),
         };
         self.lod_clip_rings = (self.lod_clip_rings - d).max(0);
+        if let Some((_, r)) = &mut self.lod_clip_next {
+            *r = (*r - d).max(0);
+        }
         self.lod_clip_grow.set();
     }
 
@@ -1834,20 +1875,36 @@ impl World {
         while self.lod_clip_rings < max_rings && self.ring_settled(center, self.lod_clip_rings) {
             self.lod_clip_rings += 1;
         }
+        if let Some((span, mut r)) = self.lod_clip_next {
+            while r < max_rings && self.ring_settled_over(center, r, Some(span)) {
+                r += 1;
+            }
+            self.lod_clip_next = Some((span, r));
+            if r >= self.lod_clip_rings {
+                (self.lod_clip_span, self.lod_clip_rings, self.lod_clip_next) = (Some(span), r, None);
+            }
+        }
     }
 
     /// Whether every column of chess-distance `ring` around `center` is fully
-    /// settled across the streamed range along the up axis. `None` (a cube)
+    /// settled across the proven span along the up axis. `None` (a cube)
     /// settles the 3-D chess shell instead of a column.
     fn ring_settled(&self, center: Coord, ring: i32) -> bool {
+        self.ring_settled_over(center, ring, self.lod_clip_span)
+    }
+
+    /// [`ring_settled`](Self::ring_settled) across chunk range `span` along the
+    /// up axis, `None` being `center ± vertical`.
+    fn ring_settled_over(&self, center: Coord, ring: i32, span: Option<[i32; 2]>) -> bool {
         match self.live_up() {
-            Some(face) => self.column_ring_settled(center, ring, face),
+            Some(face) => self.column_ring_settled(center, ring, face, span),
             None => self.cube_ring_settled(center, ring),
         }
     }
 
-    /// +Y is the XZ ring, each column spanning `center.y ± vertical`.
-    fn column_ring_settled(&self, center: Coord, ring: i32, face: Face) -> bool {
+    /// +Y is the XZ ring, each column spanning `span` (`center.y ± vertical`
+    /// when `None`).
+    fn column_ring_settled(&self, center: Coord, ring: i32, face: Face, span: Option<[i32; 2]>) -> bool {
         let v = self.view.vertical;
         let axis = face.axis();
         let (t0, t1) = match axis {
@@ -1856,8 +1913,7 @@ impl World {
             _ => (0, 1),
         };
         let origin = [center.x, center.y, center.z];
-        let lo = origin[axis] - v;
-        let hi = origin[axis] + v;
+        let [lo, hi] = span.unwrap_or([origin[axis] - v, origin[axis] + v]);
         let settled = |tu: i32, tv: i32| {
             (lo..=hi).all(|a| {
                 let mut p = origin;
@@ -1939,6 +1995,12 @@ impl World {
         }
     }
 
+    /// Face-local altitude `a` in the bake's height space (see [`baked_eye`](Self::baked_eye)).
+    fn baked_height(&self, key: SectionPos, a: i64) -> f32 {
+        let datum = self.generator.face_datum(key.body, key.face);
+        if key.face == Face::PosY && datum == 0 { a as f32 } else { (a - i64::from(datum)) as f32 }
+    }
+
     /// World Y of one baked height, then the chunk rows a band occupies.
     fn baked_world_y(&self, key: SectionPos, h: f32) -> i32 {
         let datum = self.generator.face_datum(key.body, key.face);
@@ -1956,8 +2018,13 @@ impl World {
     /// not the desired set; selection stays isotropic.
     ///
     /// Skip only if all backing chunks are settled (drawable or born-air, never
-    /// in-flight), to avoid holes during fast descent.
+    /// in-flight), to avoid holes during fast descent. A chart section the near
+    /// window holds is not loaded either: whatever already draws it keeps drawing
+    /// until its chunks have settled, then the punch drops it.
     fn coverage_skips(&self, center: Coord, key: SectionPos) -> bool {
+        if self.section_held.contains_key(&key) {
+            return true;
+        }
         // Off the camera's +Y face the world-XZ proof does not apply. Keeping the
         // section loaded is the safe side (the clip still discards it once settled).
         if key.face != Face::PosY {
@@ -1986,14 +2053,21 @@ impl World {
         if (fx * fx + fz * fz).sqrt() + margin > h_lim {
             return false;
         }
-        // Vertical: the section's terrain must sit inside the eye's slab, else
-        // clip draws the part that pokes out. If unbaked, can't prove, so don't skip.
-        // An edited footprint prefers the fresh overlay over the (possibly stale) bake.
+        // Vertical: the section's terrain must sit inside the near window (the eye's
+        // slab without one), else clip draws the part that pokes out. If unbaked, can't
+        // prove, so don't skip. An edited footprint prefers the fresh overlay over the
+        // (possibly stale) bake.
         let Some((lo, hi)) = self.section_relief_band(key) else {
             return false;
         };
-        let ey = self.baked_eye(key);
-        if lo < ey - v_lim || hi > ey + v_lim {
+        let (floor, ceil) = match self.window_alts() {
+            Some([a0, a1]) if self.live_up() == Some(key.face) => (self.baked_height(key, a0), self.baked_height(key, a1)),
+            _ => {
+                let ey = self.baked_eye(key);
+                (ey - v_lim, ey + v_lim)
+            }
+        };
+        if lo < floor || hi > ceil {
             return false;
         }
         // Every chunk backing the footprint is settled, so the near area is
@@ -2464,7 +2538,7 @@ fn admit_coord_worklist<S: StreamLane<Key = Coord>>(
     let slots = queue_slots::<S>(world);
     let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
     let up = world.live_up();
-    let rings = world.view.worklist_rings(up);
+    let rings = world.worklist_rings(center);
 
     let mut list = std::mem::take(S::seed_set(world).expect("worklist"));
     list.fit(center, rings, up);

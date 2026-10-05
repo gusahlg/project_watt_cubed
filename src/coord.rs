@@ -340,14 +340,16 @@ impl<T> IndexMut<voxel_engine::Pass> for ByPass<T> {
 }
 
 /// Axis-aligned chunk volume. `rh` is the radius across `up`; `rv` is the
-/// radius along it. `up: None` is isotropic: every axis uses `rh` (`rv` is
-/// unused). [`new`](Self::new) is the +Y box.
-#[derive(Clone, Copy, Debug)]
+/// radius along it, stretched by `grow`. `up: None` is isotropic: every axis
+/// uses `rh` (`rv` and `grow` are unused). [`new`](Self::new) is the +Y box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkBox {
     pub center: ChunkCoord,
     pub rh: i32,
     pub rv: i32,
     pub up: Option<Face>,
+    /// Layers past `rv` below and above `center` along `up`'s normal. `[0, 0]` is symmetric.
+    pub grow: [i32; 2],
 }
 
 impl ChunkBox {
@@ -359,7 +361,13 @@ impl ChunkBox {
 
     #[inline]
     pub fn with_up(center: ChunkCoord, rh: i32, rv: i32, up: Option<Face>) -> Self {
-        Self { center, rh, rv, up }
+        Self { center, rh, rv, up, grow: [0, 0] }
+    }
+
+    /// The box with `grow` layers past `rv` below and above the centre along `up`'s normal.
+    #[inline]
+    pub fn stretched(self, grow: [i32; 2]) -> Self {
+        Self { grow, ..self }
     }
 
     /// Per-axis radius. `None` copies `rh` onto every axis.
@@ -375,19 +383,28 @@ impl ChunkBox {
         }
     }
 
-    /// Inclusive corners.
+    /// Inclusive corners. A negative face's "below" is the axis's positive side.
     #[inline]
     fn bounds(self) -> ([i32; 3], [i32; 3]) {
         let r = self.radii();
         let c = [self.center.x, self.center.y, self.center.z];
-        (std::array::from_fn(|a| c[a] - r[a]), std::array::from_fn(|a| c[a] + r[a]))
+        let mut lo: [i32; 3] = std::array::from_fn(|a| c[a] - r[a]);
+        let mut hi: [i32; 3] = std::array::from_fn(|a| c[a] + r[a]);
+        if let Some(face) = self.up {
+            let [below, above] = self.grow;
+            let a = face.axis();
+            let (neg, pos) = if face.sign() > 0 { (below, above) } else { (above, below) };
+            lo[a] -= neg;
+            hi[a] += pos;
+        }
+        (lo, hi)
     }
 
     #[inline]
     pub fn contains(self, c: ChunkCoord) -> bool {
-        let r = self.radii();
-        let d = c.delta_abs(self.center);
-        d[0] <= r[0] && d[1] <= r[1] && d[2] <= r[2]
+        let (lo, hi) = self.bounds();
+        let p = [c.x, c.y, c.z];
+        (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a])
     }
 
     #[inline]
@@ -399,8 +416,8 @@ impl ChunkBox {
     /// Inclusive axis lengths: `(x, y, z)`.
     #[inline]
     pub fn size(self) -> (i32, i32, i32) {
-        let r = self.radii();
-        (2 * r[0] + 1, 2 * r[1] + 1, 2 * r[2] + 1)
+        let (lo, hi) = self.bounds();
+        (hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1)
     }
 
     /// Every chunk in the box.
@@ -725,5 +742,31 @@ mod tests {
         let got: Vec<_> = cube.coords().collect();
         let pos_y_same = ChunkBox::new(c, 2, 2);
         assert_eq!(got, pos_y_same.coords().collect::<Vec<_>>());
+    }
+
+    /// A stretched box grows below and above along the up face's normal: down the axis on a
+    /// positive face, up it on a negative one. Every walk agrees with containment.
+    #[test]
+    fn stretched_box_grows_along_the_up_normal() {
+        let c = ChunkCoord::new(3, 10, -4);
+        let pos = ChunkBox::new(c, 1, 2).stretched([3, 1]);
+        assert_eq!(pos.min(), ChunkCoord::new(2, 5, -5));
+        assert_eq!(pos.size(), (3, 9, 3));
+        assert!(pos.contains(ChunkCoord::new(3, 5, -4)) && pos.contains(ChunkCoord::new(3, 13, -4)));
+        assert!(!pos.contains(ChunkCoord::new(3, 4, -4)) && !pos.contains(ChunkCoord::new(3, 14, -4)));
+        let neg = ChunkBox::with_up(c, 1, 2, Some(Face::NegY)).stretched([3, 1]);
+        assert_eq!(neg.min(), ChunkCoord::new(2, 7, -5));
+        assert_eq!(neg.size(), (3, 9, 3));
+        assert!(neg.contains(ChunkCoord::new(3, 15, -4)) && !neg.contains(ChunkCoord::new(3, 16, -4)));
+        assert_eq!(ChunkBox::with_up(c, 1, 2, None).stretched([3, 1]).size(), (3, 3, 3));
+        for b in [pos, neg, ChunkBox::new(c, 1, 2)] {
+            let all: Vec<_> = b.coords().collect();
+            assert_eq!(all.len() as i32, b.size().0 * b.size().1 * b.size().2);
+            assert!(all.iter().all(|&k| b.contains(k)));
+            let other = ChunkBox::new(ChunkCoord::new(3, 9, -4), 1, 1);
+            let outside: Vec<_> = b.coords_outside(other).collect();
+            let want: Vec<_> = all.iter().copied().filter(|&k| !other.contains(k)).collect();
+            assert_eq!(outside, want);
+        }
     }
 }

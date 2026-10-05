@@ -90,7 +90,7 @@ fn fake_drain(w: &mut World) {
         bytes += b;
         uploads += 1;
         fake_install(w, coord, b > 0);
-        w.lod_clip_grow.set();
+        w.note_settled();
     }
     w.apply_light_queue();
     // The section-upload loop: a section lands `Ready` with no slabs.
@@ -177,8 +177,11 @@ fn frame(w: &mut World, eye: DVec3, laps: &mut Laps) -> bool {
     full_pass
 }
 
-/// One untimed `stream` frame at `eye`, for the streaming convergence tests.
+/// One untimed `stream` frame at `eye`, for the streaming convergence tests, the engine's slot
+/// report stood in.
 pub(super) fn step(w: &mut World, eye: DVec3) -> bool {
+    w.gpu_live_slots = w.local_mesh_slots() as u32;
+    mesh_free_log::take();
     let zero = [Duration::ZERO; PHASES.len()];
     let full = frame(w, eye, &mut Laps { at: Instant::now(), sum: zero, full: zero, in_full: false });
     mesh_free_log::take();

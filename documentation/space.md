@@ -123,7 +123,12 @@ Seen from afar every body is drawn as an analytic impostor in the sky (`sky::bod
 sun, and the rocks of a nearby swarm as sunlit boxes beyond the streamed chunks (`sky::rocks`).
 Standing on a cube face, the far field is face-local LOD sections out to the horizon; standing on
 a round world it is chart sections bent through cages (detail stops where the cage's chord error
-would pass a block), and the body's sphere fills the horizon beyond them. Flying up, the near window
+would pass a block), and the body's sphere fills the horizon beyond them. The full-resolution
+window around the player always holds the eye's layers (the vertical distance either way) and
+grows over the terrain of the near square, down to a chunk under its lowest ground and up to a
+chunk over its highest, at most 32 chunk layers (`world::streaming::window`): canyon walls and
+the ground under a low flight stay full detail. A far section gives way only once the chunks
+under it are drawn, and ground the window lets go of stays until the far field draws it. Flying up, the near window
 returns to physical space a couple of thousand blocks above the chart's stored top, but the far field
 keeps standing on the chart column under the eye (to 262,144 blocks above the top) and its rings
 widen with the height, to three times the height over the ground within the section budget: on the

@@ -46,7 +46,10 @@ impl World {
         if horizontal != self.view.horizontal || vertical != self.view.vertical {
             let shrunk = horizontal < self.view.horizontal || vertical < self.view.vertical;
             self.view = super::ViewVolume::new(horizontal, vertical);
-            let rings = self.view.worklist_rings(self.live_up());
+            // The window is measured in the old layers; the next stream places it afresh.
+            self.window = super::streaming::Window::default();
+            (self.lod_clip_span, self.lod_clip_next) = (None, None);
+            let rings = self.view.worklist_rings(self.live_up(), 0);
             self.mesh_worklist.resize(rings);
             self.light_worklist.resize(rings);
             // Unit re-pinned on stream; invalidate centre for rescan.

@@ -3789,7 +3789,7 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
     let up = world.live_up();
     world
         .mesh_worklist
-        .fit(center, world.view.worklist_rings(up), up);
+        .fit(center, world.view.worklist_rings(up, 0), up);
     world.mesh_worklist.insert(center);
     world.pending_fresh.set();
     {
@@ -3890,7 +3890,7 @@ fn asteroid_entry_breakdown() {
     world.section_eye_y = eye[1] as f64;
     world.pending_gen.set();
     let up = world.live_up();
-    let rings = world.view.worklist_rings(up);
+    let rings = world.view.worklist_rings(up, 0);
     world.mesh_worklist.fit(center, rings, up);
     world.light_worklist.fit(center, rings, up);
     assert!(

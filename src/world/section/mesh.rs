@@ -1713,6 +1713,9 @@ mod tests {
     fn frontier_counts(world: &mut crate::world::World, center: crate::coord::ChunkCoord) -> ChartFrontier {
         use crate::world::quadtree;
         world.adopt_fold(center);
+        // The window streaming places around this centre, from scratch.
+        world.window = crate::world::streaming::Window::default();
+        world.place_window(center, true);
         let desired = world.desired_sections(center);
         let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
         let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
@@ -1909,7 +1912,7 @@ mod tests {
     /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
     /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
     /// what covers the sliver outside the box. Bytes re-pinned to `0xca4adead` for that border
-    /// (seed 42, diffusion, default view).
+    /// (seed 42, diffusion, default view); the window streaming places there is the eye band.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;

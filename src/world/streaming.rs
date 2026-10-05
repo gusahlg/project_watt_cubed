@@ -29,6 +29,9 @@ use super::{
     quadtree,
 };
 
+mod window;
+pub(in crate::world) use window::Window;
+
 /// Exact upload placement for a chunk mesh: integer chunk origin, full detail.
 /// Pinned at upload so the GPU record is written once; draws only mark
 /// visibility.
@@ -1096,9 +1099,9 @@ impl World {
         false
     }
 
-    /// The mesh box: chunks meshed and drawn around `center`.
+    /// The mesh box: chunks meshed and drawn around `center`, over the held window.
     fn mesh_box(&self, center: Coord) -> ChunkBox {
-        self.view.mesh(center, self.live_up())
+        self.view.mesh(center, self.live_up()).stretched(self.window_grow(center))
     }
 
     /// Radii new work may cover. Before the first stream this is the full view.
@@ -1231,13 +1234,19 @@ impl World {
     /// The data box: the mesh box plus one [`DATA_MARGIN`] shell of voxel data,
     /// so edge chunks can cull against neighbours that are loaded but unmeshed.
     fn data_box(&self, center: Coord) -> ChunkBox {
-        self.view.data(center, self.live_up())
+        self.view.data(center, self.live_up()).stretched(self.window_grow(center))
     }
 
     /// The unload box: the mesh box plus the unload hysteresis, past which
     /// chunks are freed.
     pub(in crate::world) fn unload_box(&self, center: Coord) -> ChunkBox {
-        self.view.unload(center, self.live_up())
+        self.view.unload(center, self.live_up()).stretched(self.window_grow(center))
+    }
+
+    /// Ring buckets for the worklists around `center` (see `ViewVolume::worklist_rings`).
+    pub(in crate::world) fn worklist_rings(&self, center: Coord) -> usize {
+        let [below, above] = self.window_grow(center);
+        self.view.worklist_rings(self.live_up(), below.max(above))
     }
 
     /// Whether `coord` is inside the current mesh box. The single mesh-view
@@ -1729,7 +1738,13 @@ impl World {
         } else {
             false
         };
-        let full_pass = center_moved || up_changed || fold_changed;
+        if up_changed || fold_changed {
+            // Window bounds and the span the rings prove are altitudes in the old frame.
+            self.window = Window::default();
+            (self.lod_clip_span, self.lod_clip_next) = (None, None);
+        }
+        let window_moved = self.place_window(center_chunk, center_moved || up_changed || fold_changed);
+        let full_pass = center_moved || up_changed || fold_changed || window_moved;
         self.center = Some(center_chunk);
         // A new chart net means the near eye changed frames: that sample's
         // velocity mixes two storage origins.
@@ -1745,7 +1760,7 @@ impl World {
         // centre, and up face already match.
         if full_pass {
             let up = self.live_up();
-            let rings = self.view.worklist_rings(up);
+            let rings = self.worklist_rings(center_chunk);
             self.mesh_worklist.fit(center_chunk, rings, up);
             self.light_worklist.fit(center_chunk, rings, up);
         }
@@ -1821,7 +1836,7 @@ impl World {
         // move along that axis, an up-face change, or the first pass restarts
         // the scan) — see `shift_lod_clip`.
         if full_pass {
-            if up_changed {
+            if up_changed || fold_changed {
                 self.lod_clip_shrunk.set();
             } else {
                 self.shift_lod_clip(prev_center, center_chunk);
@@ -1940,7 +1955,8 @@ impl World {
         // eye that moves within one block keeps the frontier. A cube face reads the exact eye;
         // its velocity is quantised to 0.25 m/s so a continuously changing flight velocity does
         // not recompute the frontier every pass.
-        let (eye_y, velocity) = if self.section_on_chart(center) {
+        let on_chart = self.section_on_chart(center);
+        let (eye_y, velocity) = if on_chart {
             let d = chart_delta(self.section_vel);
             let y = self.frontier_eye_y();
             (y.round().to_bits(), [d.x.to_bits(), (y + d.y).round().to_bits(), d.z.to_bits()])
@@ -1964,6 +1980,7 @@ impl World {
             velocity,
             vertical: self.view.vertical,
             up: self.live_up(),
+            window: self.window.punch.filter(|_| on_chart),
             unit: self.far_pyramid().unit.to_bits(),
             finest: self.section_pyramid.finest.0,
             levels: self.section_pyramid.levels.get(),
@@ -1973,10 +1990,15 @@ impl World {
         };
         if self.section_frontier_key != Some(frontier_key) || !self.dirty_sections.is_empty() {
             let mut memo = std::mem::take(&mut self.near_bounds);
-            self.section_desired = memo.sweep(|memo| self.desired_sections_with(center, memo));
+            let mut held = Vec::new();
+            self.section_desired = memo.sweep(|memo| self.desired_sections_with(center, memo, &mut held));
             self.near_bounds = memo;
+            self.wait_held(held);
+            self.held_recheck.take();
             self.section_frontier_key = Some(frontier_key);
             self.section_cover_dirty.set();
+        } else if self.held_recheck.take() && !self.section_held.is_empty() {
+            self.settle_held();
         }
     }
 
@@ -2027,8 +2049,7 @@ impl World {
             // Vec fallback uses the existing main-thread copy. (The rev
             // check above guarantees the state is NeedsMesh { building: true }.)
             self.upload_chunk_payload(coord, data, eng);
-            // A newly drawn chunk may complete a settled ring.
-            self.lod_clip_grow.set();
+            self.note_settled();
         }
 
         self.apply_light_queue();
@@ -2557,22 +2578,12 @@ impl World {
         if self.gen_cursor_dirty || self.gen_cursor_center != Some(center) {
             return false;
         }
-        if self.gen_cursor_up != self.live_up()
-            || self.gen_cursor_h != self.view.horizontal
-            || self.gen_cursor_v != self.view.vertical
-            || self.gen_cursor_lh != self.load_h
-            || self.gen_cursor_lv != self.load_v
-            || self.gen_cursor_heading != self.load_heading
-        {
-            return false;
-        }
-        match (self.gen_cursor_slab, self.spawn_slab) {
-            (None, None) => true,
-            (Some(a), Some(b)) => {
-                a.center == b.center && a.rh == b.rh && a.rv == b.rv && a.up == b.up
-            }
-            _ => false,
-        }
+        // The data box carries the up, the view and the grown window; the loading window rides on top.
+        self.gen_cursor_box == Some(self.data_box(center))
+            && self.gen_cursor_lh == self.load_h
+            && self.gen_cursor_lv == self.load_v
+            && self.gen_cursor_heading == self.load_heading
+            && self.gen_cursor_slab == self.spawn_slab
     }
 
     /// Classify the data box once, store uniform chunks, and queue the rest.
@@ -2608,9 +2619,7 @@ impl World {
         self.gen_columns.clear();
         self.gen_columns.extend(runs.into_iter().map(|run| (0, run)));
         self.gen_cursor_center = Some(center);
-        self.gen_cursor_up = self.live_up();
-        self.gen_cursor_h = self.view.horizontal;
-        self.gen_cursor_v = self.view.vertical;
+        self.gen_cursor_box = Some(self.data_box(center));
         self.gen_cursor_lh = self.load_h;
         self.gen_cursor_lv = self.load_v;
         self.gen_cursor_heading = self.load_heading;
@@ -3056,7 +3065,9 @@ impl World {
         };
         // Born-air is already settled; a sky ring can complete without a
         // single upload.
-        self.lod_clip_grow.raise(born_air);
+        if born_air {
+            self.note_settled();
+        }
         // No flood-fill here; occlusion rebuild computes connectivity lazily.
         let chunk = std::sync::Arc::new(chunk);
         // Liveness check: coord must not be claimed in generating (would shadow data).
@@ -3858,6 +3869,8 @@ impl World {
             self.section_mip = Some(mip);
             self.section_mip_rx = None;
             self.pending_sections.set();
+            // Off a chart the window's ground comes from this bake.
+            self.window.stale = true;
         }
     }
 
@@ -3935,15 +3948,16 @@ impl World {
 
     /// Far sections of the home chart and, where the far field reaches a side, its neighbours.
     /// Storage +Y is the chart's up, so the sections are [`Face::PosY`] over storage `(x, z)`.
-    fn chart_sections(&self, center: Coord, memo: &mut NearBounds) -> Vec<SectionPos> {
+    /// Sections the near window holds go to `held` instead, with the chunk layers of their ground.
+    fn chart_sections(&self, center: Coord, memo: &mut NearBounds, held: &mut Vec<(SectionPos, [i32; 2])>) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo);
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, held);
         let delta = chart_delta(self.section_vel);
         if delta == DVec3::ZERO {
             return base;
         }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo))
+        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo, held))
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`, on the
@@ -3982,6 +3996,7 @@ impl World {
         cfg: &pyramid::PyramidCfg,
         max_d: i8,
         memo: &mut NearBounds,
+        held: &mut Vec<(SectionPos, [i32; 2])>,
     ) -> Vec<SectionPos> {
         let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
         let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
@@ -3993,7 +4008,7 @@ impl World {
         let (y0, y1) = self.near_y_range(center);
         let near = self.chart_near(center, body, y0);
         let mut tagged =
-            self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, y0, y1, None, memo);
+            self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, y0, y1, None, memo, held);
         // The neighbour is visible as far as the coarsest ring's square reaches, not merely the
         // two finest sections. Its rings run on from the eye unfolded beyond its edge.
         let span = super::section::section_span(crate::ident::Detail(max_d)) as f64;
@@ -4013,6 +4028,7 @@ impl World {
                 y1,
                 Some(&across),
                 memo,
+                held,
             ));
         }
         let budget = self.sections_allowed();
@@ -4040,6 +4056,7 @@ impl World {
         y1: i64,
         across: Option<&super::seam::SeamAcross>,
         memo: &mut NearBounds,
+        held: &mut Vec<(SectionPos, [i32; 2])>,
     ) -> Vec<(SectionPos, f64)> {
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
         let metric = EyeMetric::new(DVec3::new(ex, rel, ez), env, DyCap::new(cfg.outer_m(), cfg.base));
@@ -4061,26 +4078,32 @@ impl World {
         // Charts have no shader clip. A section wholly inside the near square is dropped only
         // when that square's surface sits inside the full-res window; a valley or a hilltop
         // outside it stays, so the far field draws what the window misses.
-        let keep = |s: SectionPos, memo: &mut NearBounds| {
-            inside_xz(s, seat.lo, seat.hi)
-                && super::section::section_fits(s.span(), seat.radius)
-                && !self.near_window_holds(s, near, y0, y1, across, memo)
-        };
-        let kept: Vec<SectionPos> = edged.into_iter().filter(|&s| keep(s, memo)).collect();
+        let on_seat = |s: SectionPos| inside_xz(s, seat.lo, seat.hi) && super::section::section_fits(s.span(), seat.radius);
+        let mut kept = Vec::with_capacity(edged.len());
+        for s in edged.into_iter().filter(|&s| on_seat(s)) {
+            match self.held_layers(s, near, y0, y1, across, memo) {
+                Some(layers) => held.push((s, layers)),
+                None => kept.push(s),
+            }
+        }
         // A straddling parent must not merge back: that tile is what the descent just replaced.
-        let merge = |p: SectionPos| keep(p, memo) && !(covers_near(p, near, across) && !inside_near(p, near, across));
+        let merge = |p: SectionPos| {
+            on_seat(p)
+                && self.held_layers(p, near, y0, y1, across, memo).is_none()
+                && !(covers_near(p, near, across) && !inside_near(p, near, across))
+        };
         coarsen_chart(kept, max_d, self.sections_allowed(), merge)
             .into_iter()
             .map(|s| (s, section_dist2(s, ex, ez)))
             .collect()
     }
 
-    /// The full-res window already draws every solid top of `s`, and `s` lies wholly inside the
-    /// near square. A section that only crosses the edge is not punched: the part outside the
-    /// square would be drawn by nothing. Storage altitude: `surface` is the first open cell, so
-    /// the solid top is the block below it. A bound we cannot place is kept (punched nowhere)
-    /// so a missed column is not a sky hole.
-    fn near_window_holds(
+    /// The chunk layers of `s`'s solid tops, when the full-res window draws every one of them and
+    /// `s` lies wholly inside the near square. A section that only crosses the edge is not
+    /// punched: the part outside the square would be drawn by nothing. Storage altitude:
+    /// `surface` is the first open cell, so the solid top is the block below it. A bound we cannot
+    /// place is kept (punched nowhere) so a missed column is not a sky hole.
+    fn held_layers(
         &self,
         s: SectionPos,
         near: (i64, i64, i64, i64),
@@ -4088,18 +4111,16 @@ impl World {
         y1: i64,
         across: Option<&super::seam::SeamAcross>,
         memo: &mut NearBounds,
-    ) -> bool {
+    ) -> Option<[i32; 2]> {
         if !inside_near(s, near, across) {
-            return false;
+            return None;
         }
-        let Some((u0, v0, u1, v1)) = overlap_storage(s, near, across) else {
-            return false;
-        };
+        let (u0, v0, u1, v1) = overlap_storage(s, near, across)?;
         let surface = || self.generator.surface_rect(s.body, Face::PosY, u0, v0, u1, v1);
-        let Some((lo, hi)) = memo.get((s.body, [u0, v0, u1, v1]), surface) else {
-            return false;
-        };
-        i64::from(lo) - 1 >= y0 && i64::from(hi) - 1 < y1
+        let (lo, hi) = memo.get((s.body, [u0, v0, u1, v1]), surface)?;
+        let (top_lo, top_hi) = (lo.saturating_sub(1), hi.saturating_sub(1));
+        let cs = CHUNK_SIZE as i32;
+        (i64::from(top_lo) >= y0 && i64::from(top_hi) < y1).then(|| [top_lo.div_euclid(cs), top_hi.div_euclid(cs)])
     }
 
     /// The full-res square the punch tests chart sections against. Empty when the near window
@@ -4118,9 +4139,13 @@ impl World {
         }
     }
 
-    /// Full-res vertical block range (`y1` exclusive) of the mesh box. Up is storage Y.
+    /// Full-res vertical block range (`y1` exclusive) the punch tests against: the punch window on
+    /// a chart, else the mesh box. Up is storage Y.
     fn near_y_range(&self, center: Coord) -> (i64, i64) {
         let cs = CHUNK_SIZE as i64;
+        if let Some([lo, hi]) = self.window.punch {
+            return (i64::from(lo) * cs, (i64::from(hi) + 1) * cs);
+        }
         let b = self.mesh_box(center);
         let y0 = i64::from(b.min().y) * cs;
         (y0, y0 + i64::from(b.size().1) * cs)
@@ -4139,20 +4164,27 @@ impl World {
         )
     }
 
-    /// [`desired_sections_with`](Self::desired_sections_with) reading every surface afresh.
+    /// [`desired_sections_with`](Self::desired_sections_with) reading every surface afresh: the
+    /// selection once every held section's ground has settled.
     #[cfg(test)]
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        self.desired_sections_with(center, &mut NearBounds::default())
+        self.desired_sections_with(center, &mut NearBounds::default(), &mut Vec::new())
     }
 
     /// Desired frontier: union of static eye and velocity-predicted eye position.
     /// Pulls sections ahead of player motion. At rest, velocity is zero so returns
     /// static frontier bit-for-bit. Open space and a round body seen from past the far reach
     /// select nothing; a far-field centre on a chart (in or above its box) selects that chart's
-    /// sections, reading chart surfaces through `memo`.
-    fn desired_sections_with(&self, center: Coord, memo: &mut NearBounds) -> Vec<SectionPos> {
+    /// sections, reading chart surfaces through `memo`; the sections its near window holds go to
+    /// `held`.
+    fn desired_sections_with(
+        &self,
+        center: Coord,
+        memo: &mut NearBounds,
+        held: &mut Vec<(SectionPos, [i32; 2])>,
+    ) -> Vec<SectionPos> {
         if self.section_on_chart(center) {
-            return self.chart_sections(center, memo);
+            return self.chart_sections(center, memo, held);
         }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
         let Some((body, face)) = focus else { return Vec::new() };
@@ -4580,7 +4612,7 @@ impl World {
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             loaded.state = MeshState::Air;
         }
-        self.lod_clip_grow.set();
+        self.note_settled();
         true
     }
 
@@ -5318,6 +5350,7 @@ impl World {
         self.center = Some(center);
         self.set_far_center(eye_chunk(far));
         let _ = self.adopt_fold(center);
+        self.place_window(center, true);
         for coord in self.mesh_box(center).coords() {
             self.ensure_data(coord);
             if let Some(loaded) = self.chunks.get_mut(&coord)
@@ -7415,7 +7448,9 @@ mod tests {
             let key = world.section_frontier_key;
             world.refresh_frontier(center);
             let fresh = world.desired_sections(center);
-            assert_eq!(world.section_desired, fresh, "the cached frontier is the fresh one");
+            // Held sections still wait on chunks no test loads; the rest is the selection.
+            let selected: Vec<_> = world.section_desired.iter().copied().filter(|s| !world.section_held.contains_key(s)).collect();
+            assert_eq!(selected, fresh, "the cached frontier is the fresh one");
             let memo = &world.near_bounds;
             assert!(memo.rects.values().all(|e| e.1 == memo.pass), "stale rects kept");
             world.section_frontier_key != key
