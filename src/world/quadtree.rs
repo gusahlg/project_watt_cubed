@@ -60,11 +60,12 @@ impl CoverCut {
         if cfg!(debug_assertions) {
             let map: FastMap<SectionPos, QuadrantMask> = cut.iter().copied().collect();
             debug_assert_eq!(map.len(), cut.len(), "a section appears twice in the cut");
+            let finer = with_drawn_below(&map);
             for &(p, mask) in &cut {
                 debug_assert!(!mask.is_empty(), "empty-mask entry {p:?} survived the prune");
                 for q in mask.iter() {
                     debug_assert!(
-                        p.detail.0 == 0 || !area_covered(p.child(q), &map),
+                        p.detail.0 == 0 || !area_covered(p.child(q), &map, &finer),
                         "drawn quadrant {q:?} of {p:?} is already tiled by finer cells"
                     );
                 }
@@ -275,12 +276,13 @@ pub(in crate::world) fn resolve_covering(
             *e = e.union(mask);
         }
     }
+    let finer = with_drawn_below(&draw);
     let mut out = Vec::with_capacity(draw.len());
     for (&p, &mask) in &draw {
         let mut m = mask;
         if p.detail.0 > 0 {
             for q in Quadrant::ALL {
-                if m.contains(q) && area_covered(p.child(q), &draw) {
+                if m.contains(q) && area_covered(p.child(q), &draw, &finer) {
                     m.remove(q);
                 }
             }
@@ -292,17 +294,32 @@ pub(in crate::world) fn resolve_covering(
     CoverCut::new(out)
 }
 
+/// Every strict ancestor of a drawn cell: the only cells with drawn cells below them.
+fn with_drawn_below(draw: &FastMap<SectionPos, QuadrantMask>) -> FastSet<SectionPos> {
+    let mut set = FastSet::default();
+    for &p in draw.keys() {
+        let mut c = p;
+        while c.detail.0 < crate::render_config::LOD_COARSEST_DETAIL as i8 {
+            c = c.parent();
+            if !set.insert(c) {
+                break;
+            }
+        }
+    }
+    set
+}
+
 /// Whether `cell`'s area is fully tiled by finer drawn cells. Prunes against
-/// the current draw set; recursion depth bounded by pyramid level count.
-fn area_covered(cell: SectionPos, draw: &FastMap<SectionPos, QuadrantMask>) -> bool {
+/// the current draw set; only subtrees holding drawn cells (`finer`) are walked.
+fn area_covered(cell: SectionPos, draw: &FastMap<SectionPos, QuadrantMask>, finer: &FastSet<SectionPos>) -> bool {
     let m = draw.get(&cell).copied().unwrap_or(QuadrantMask::EMPTY);
     if m == QuadrantMask::ALL {
         return true;
     }
-    if cell.detail.0 == 0 {
+    if cell.detail.0 == 0 || !finer.contains(&cell) {
         return false;
     }
-    Quadrant::ALL.into_iter().all(|q| m.contains(q) || area_covered(cell.child(q), draw))
+    Quadrant::ALL.into_iter().all(|q| m.contains(q) || area_covered(cell.child(q), draw, finer))
 }
 
 #[cfg(test)]
