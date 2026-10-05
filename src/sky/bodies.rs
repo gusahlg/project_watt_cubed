@@ -22,14 +22,15 @@ const EMBER_CAP: f64 = 2.0;
 /// The inner wall's glow on the Ember's own surface, relative to the Ember's light on the wall.
 const WALL_GLOW: f64 = 0.35;
 
-/// Rebased home datum and the unit direction of each sample. Built once.
+/// Rebased home datum and the ball that contains every surface and air point. Built once.
 #[derive(Debug)]
 struct HomeMap {
     res: u32,
     datum: Vec<f32>,
-    dir: Vec<DVec3>,
     radius: f64,
     centre: DVec3,
+    /// `radius + max(datum)`. The horizon ball is this plus the air thickness.
+    hi: f64,
 }
 
 /// Reused far-body list. Capacity stays at [`MAX_FAR_BODIES`] after the first frame.
@@ -41,8 +42,6 @@ pub struct FarBodies {
     /// Looked up once. `None` when the generator has no relaxed home datum.
     map: Option<HomeMap>,
     looked: bool,
-    /// Eye the cached horizon was computed for.
-    horizon_eye: Option<DVec3>,
     horizon: f32,
     /// The datum has been handed to the engine, so home draws [`FarShape::Mapped`].
     live: bool,
@@ -55,7 +54,6 @@ impl Default for FarBodies {
             sun: None,
             map: None,
             looked: false,
-            horizon_eye: None,
             horizon: 1.0,
             live: false,
         }
@@ -68,7 +66,7 @@ impl FarBodies {
         self.sun
     }
 
-    /// Sine of the highest datum elevation seen from the last eye. 1 until an eye is known.
+    /// Limb sine for the last eye. 1 until the datum is known, and while the eye is inside the air ball.
     pub(crate) fn horizon(&self) -> f32 {
         self.horizon
     }
@@ -117,7 +115,7 @@ impl FarBodies {
         &self.list
     }
 
-    /// One allocation of the rebased datum and its sample directions. Later frames do nothing.
+    /// One allocation of the rebased datum. Later frames do nothing.
     pub(super) fn prepare_map(&mut self, generator: &dyn TerrainGenerator) {
         if self.map.is_some() || self.looked {
             return;
@@ -136,28 +134,17 @@ impl FarBodies {
             return;
         };
         let Some((res, datum)) = super::planet_map::impostor_datum(cosmos, body, field) else { return };
-        let g = field.g;
-        let mut dir = Vec::with_capacity(datum.len());
-        for f in 0..6 {
-            for j in 0..g {
-                for i in 0..g {
-                    dir.push(crate::space::datum::DatumField::direction(f, g, i, j));
-                }
-            }
-        }
         let radius = home_impostor(cosmos, body).1;
-        self.map = Some(HomeMap { res, datum, dir, radius, centre });
+        let peak = datum.iter().fold(f32::NEG_INFINITY, |a, o| a.max(*o));
+        let hi = if peak.is_finite() { radius + f64::from(peak) } else { radius };
+        self.map = Some(HomeMap { res, datum, radius, centre, hi });
     }
 
-    /// Recompute only after the eye moves more than a kilometre. The sample list is already owned.
+    /// Closed form. The containing ball is fixed, so this is a few arithmetic ops.
     fn refresh_horizon(&mut self, eye: DVec3) {
         let Some(map) = self.map.as_ref() else { return };
-        if self.horizon_eye.is_some_and(|prev| (eye - prev).length_squared() <= super::planet_map::HORIZON_STEP_SQ) {
-            return;
-        }
-        let horizon = super::planet_map::horizon_sin(map.centre, map.radius, &map.dir, &map.datum, eye);
-        self.horizon = horizon;
-        self.horizon_eye = Some(eye);
+        let dist = (map.centre - eye).length();
+        self.horizon = super::planet_map::horizon_sine(dist, map.hi, AIR_TOP);
     }
 
     /// The shell's far wall and the Ember. Nothing outside the shell is visible.
@@ -440,8 +427,8 @@ fn impostor(
     let (mut shape, albedo, mut atmosphere) = paint(body, twin_ordinal);
     let radius = if body.kind == Kind::Home {
         let (_, radius) = home_impostor(cosmos, body);
-        // Air of AIR_TOP blocks, as a fraction of the reference radius.
-        let air = (AIR_TOP / radius) as f32;
+        // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
+        let air = AIR_TOP as f32;
         if mapped && horizon.is_finite() && air.is_finite() && air >= 0.0 {
             shape = FarShape::Mapped { map: super::planet_map::HOME_MAP, horizon, air };
             atmosphere = daylight_air();

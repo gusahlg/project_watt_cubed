@@ -19,6 +19,8 @@
 //!   `WATT_BENCH_POS`, `WATT_BENCH_PRESET`, `WATT_BENCH_SEED`,
 //!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_PROFILE`,
 //!   `WATT_BENCH_GPU` — see `documentation/performance.md`.
+//! - `WATT_BENCH_PLANET_MAP=1` bakes the home map. Otherwise a benchmark draws the
+//!   sphere, and `scenario.planet_map` records which one ran.
 
 mod json;
 mod system;
@@ -551,6 +553,7 @@ impl Benchmark {
                             Ok("1")
                         )),
                     ),
+                    ("planet_map", Json::from(crate::sky::planet_map::bake_wanted(false))),
                 ]),
             ),
             ("frames", stats.to_json()),

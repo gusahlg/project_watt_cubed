@@ -50,6 +50,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # (including PipeWire's ALSA plugin) is the playback/capture path.
 cpal = "0.18"
 kira = "0.12"
+# Linux nice for the planet-map bake thread. Already in the lock.
+libc = "0.2.186"
 opus-rs = "0.1"
 rtrb = "0.3"
 toml = "0.9"
