@@ -717,6 +717,9 @@ pub(super) struct MapFeed {
     size: Option<u32>,
     sent_preview: [bool; 6],
     sent_full: [bool; 6],
+    /// The full cube replaced a complete preview cube: the engine keeps drawing that one until every
+    /// full face has landed (its atomic swap), so home stays mapped meanwhile.
+    swapping: bool,
 }
 
 fn six_none() -> [Option<Vec<u8>>; 6] {
@@ -749,8 +752,9 @@ fn send_one(sent: &mut [bool; 6], faces: &mut [Option<Vec<u8>>; 6], sink: &mut i
 impl MapFeed {
     /// Install once we have six previews, or six full faces. Stay on the preview cube until every
     /// full face is in hand, then install the full cube once. At most one face leaves per call,
-    /// and that face's bytes are dropped. `true` only when all six faces of the installed cube
-    /// have been sent, so the impostor never draws a flat fallback face.
+    /// and that face's bytes are dropped. `true` once all six faces of a cube have been sent, so
+    /// the impostor never draws a flat fallback face: across the preview-to-full swap the engine
+    /// keeps drawing the complete preview cube.
     pub(super) fn flush(
         &mut self,
         datum_res: u32,
@@ -779,6 +783,7 @@ impl MapFeed {
             if sink.install(datum_res, datum, FULL) {
                 self.size = Some(FULL);
                 self.sent_full = [false; 6];
+                self.swapping = true;
                 bake.preview = six_none();
             }
         }
@@ -793,7 +798,7 @@ impl MapFeed {
         }
         match self.size {
             Some(PREVIEW) => all_sent(&self.sent_preview),
-            Some(FULL) => all_sent(&self.sent_full),
+            Some(FULL) => self.swapping || all_sent(&self.sent_full),
             _ => false,
         }
     }
@@ -910,14 +915,24 @@ mod tests {
         events[last + 1..].iter().filter(|e| matches!(e, Ev::Face(_, _))).count()
     }
 
-    /// One flush sends at most one face. A live cube has all six of its faces already sent.
+    /// Faces sent since the install before the last one: the cube the engine keeps drawing
+    /// while a swap is pending.
+    fn faces_of_previous_cube(events: &[Ev]) -> usize {
+        let installs: Vec<usize> = events.iter().enumerate().filter(|(_, e)| matches!(e, Ev::Install(_))).map(|(i, _)| i).collect();
+        let [.., prev, last] = installs[..] else { return 0 };
+        events[prev + 1..last].iter().filter(|e| matches!(e, Ev::Face(_, _))).count()
+    }
+
+    /// One flush sends at most one face. A live cube has all six of its faces already sent, or it
+    /// replaced a complete cube the engine keeps drawing until the new one has landed.
     fn step(feed: &mut MapFeed, datum: &[f32], bake: &mut PlanetBake, rec: &mut Rec) -> bool {
         let before = rec.events.len();
         let live = feed.flush(2, datum, bake, rec);
         let added = rec.events[before..].iter().filter(|e| matches!(e, Ev::Face(_, _))).count();
         assert!(added <= 1, "more than one face in a frame: {:?}", &rec.events[before..]);
         if live {
-            assert_eq!(faces_since_install(&rec.events), 6, "a live cube is missing a face: {:?}", rec.events);
+            let complete = faces_since_install(&rec.events) == 6 || faces_of_previous_cube(&rec.events) == 6;
+            assert!(complete, "a live cube is missing a face with no complete cube behind it: {:?}", rec.events);
         }
         live
     }
@@ -949,7 +964,7 @@ mod tests {
             assert_eq!(rec.events.len(), n, "a partial full set keeps the previews");
         }
         bake.deliver(true, 5, vec![2, 2, 2, 5]);
-        assert!(!step(&mut feed, &datum, &mut bake, &mut rec), "the full cube is not live after one face");
+        assert!(step(&mut feed, &datum, &mut bake, &mut rec), "the engine keeps the preview cube through the swap");
         assert_eq!(rec.events.iter().filter(|e| matches!(e, Ev::Install(FULL))).count(), 1);
         let mut live = false;
         for _ in 0..5 {
