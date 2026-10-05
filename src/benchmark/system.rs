@@ -684,13 +684,14 @@ fn render_lanes_json(s: &Settings) -> Json {
 }
 
 pub(super) fn settings_json(s: &Settings, eng: &Engine) -> Json {
+    let lod = s.render_config();
     Json::object(vec![
         ("preset", Json::from(s.preset.label().to_ascii_lowercase())),
         ("render_distance", Json::from(s.render_distance)),
         ("vertical_distance", Json::from(s.vertical_distance)),
         ("lod_enabled", Json::from(s.lod2)),
-        ("lod_levels", Json::from(s.lod_levels)),
-        ("lod_detail", Json::from(s.lod_detail)),
+        ("lod_levels", Json::from(lod.lod_levels)),
+        ("lod_detail", Json::from(lod.lod_detail)),
         ("stream_hz", Json::from(s.stream_hz)),
         ("physics_hz", Json::from(s.physics_hz)),
         ("sky_hz", Json::from(s.sky_hz)),

@@ -22,9 +22,9 @@ use std::path::PathBuf;
 use voxel_engine::Engine;
 
 use crate::render_config::{
-    DeviceCaps, LOD_DETAIL_RANGE, LOD_LEVELS_RANGE, RenderConfig, SessionGraphics, VRS_AUTO_MIN_PIXELS,
-    VrsChoice, engine_applied_differs, engine_applied_notice, estimate_from_engine,
-    fit_render_targets, max_lod_levels, vrs_effective,
+    DeviceCaps, RenderConfig, SessionGraphics, VRS_AUTO_MIN_PIXELS, VrsChoice,
+    engine_applied_differs, engine_applied_notice, estimate_from_engine, fit_render_targets,
+    lod_for, vrs_effective,
 };
 use crate::ui::HudMode;
 
@@ -131,8 +131,6 @@ settings_fields! {
     cull_faces: bool = false,
 
     vertical_distance: i32 = 3,
-    lod_levels: u8 = 7,
-    lod_detail: u8 = 2,
     /// Update rates; zero means every frame.
     stream_hz: u32 = 0,
     physics_hz: u32 = 0,
@@ -589,7 +587,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 51] = [
+pub const SETTINGS: [Setting; 49] = [
     enum_setting!(
         apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
@@ -605,31 +603,6 @@ pub const SETTINGS: [Setting; 51] = [
         |s, d| s.vertical_distance = wrap_clamp(s.vertical_distance,
             *VERTICAL_DISTANCE_RANGE.start(), *VERTICAL_DISTANCE_RANGE.end(), d),
         vertical_distance_clamp
-    ),
-    numeric_setting!(
-        Profile::Owned, Category::Performance, MenuKind::Bar, lod_levels,
-        "LOD Range", "lod_levels <1-8>", &["lodlevels"],
-        |s| frac(s.lod_levels as f32, *LOD_LEVELS_RANGE.start() as f32,
-                  *LOD_LEVELS_RANGE.end() as f32),
-        |s| format!("LOD range {} levels (~{} m)", s.lod_levels, lod_range_metres(s)),
-        |s| format!("{} levels (~{} m)", s.lod_levels, lod_range_metres(s)),
-        |s, d| s.lod_levels = wrap_clamp(s.lod_levels as i32, 1,
-            max_lod_levels(s.lod_detail) as i32, d) as u8,
-        lod_clamp
-    ),
-    numeric_setting!(
-        Profile::Owned, Category::Performance, MenuKind::Bar, lod_detail,
-        "LOD Quality", "lod_detail <2-6>", &["loddetail"],
-        |s| frac(s.lod_detail as f32, *LOD_DETAIL_RANGE.start() as f32,
-                  *LOD_DETAIL_RANGE.end() as f32),
-        |s| format!("LOD quality {} m cells", lod_cell_metres(s.lod_detail)),
-        |s| format!("{} m cells", lod_cell_metres(s.lod_detail)),
-        |s, d| {
-            s.lod_detail = wrap_clamp(s.lod_detail as i32, *LOD_DETAIL_RANGE.start() as i32,
-                *LOD_DETAIL_RANGE.end() as i32, d) as u8;
-            lod_clamp(s);
-        },
-        lod_clamp
     ),
     rate_setting!(
         stream_hz,
@@ -972,8 +945,6 @@ impl Settings {
                 render_scale: 0.25,
                 lighting: false,
                 vertical_distance: 1,
-                lod_levels: 1,
-                lod_detail: 6,
                 stream_hz: 15,
                 physics_hz: 30,
                 sky_hz: 15,
@@ -996,8 +967,6 @@ impl Settings {
                 render_scale: 0.5,
                 lighting: false,
                 vertical_distance: 2,
-                lod_levels: 3,
-                lod_detail: 4,
                 stream_hz: 60,
                 physics_hz: 60,
                 sky_hz: 60,
@@ -1325,11 +1294,12 @@ impl Settings {
             .session_render_scale
             .filter(|_| self.render_target_fallback)
             .unwrap_or_else(|| self.effective_render_scale(self.window_w, self.window_h));
+        let (lod_levels, lod_detail) = lod_for(self.render_distance);
         RenderConfig {
             occlusion: self.occlusion,
             lod2: self.lod2,
-            lod_levels: self.lod_levels,
-            lod_detail: self.lod_detail,
+            lod_levels,
+            lod_detail,
             blocklight: self.blocklight,
             exposure: self.exposure,
             bloom: self.bloom,
@@ -1430,31 +1400,6 @@ fn vertical_distance_clamp(s: &mut Settings) {
         *VERTICAL_DISTANCE_RANGE.start(),
         *VERTICAL_DISTANCE_RANGE.end(),
     );
-}
-
-fn lod_clamp(s: &mut Settings) {
-    s.lod_detail = s
-        .lod_detail
-        .clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
-    s.lod_levels = s
-        .lod_levels
-        .clamp(*LOD_LEVELS_RANGE.start(), max_lod_levels(s.lod_detail));
-}
-
-/// The approximate far-field outer range in metres for the confirm/show text.
-fn lod_range_metres(s: &Settings) -> u64 {
-    let radius = s
-        .render_distance
-        .clamp(*VIEW_RADIUS_RANGE.start(), *VIEW_RADIUS_RANGE.end())
-        .max(1) as u64;
-    let levels = s
-        .lod_levels
-        .clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end());
-    radius * 16 * (1_u64 << levels)
-}
-
-fn lod_cell_metres(detail: u8) -> u32 {
-    1_u32 << detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end())
 }
 
 /// Walk `key=value` lines, skipping malformed ones. Shared by settings.cfg,
@@ -1886,11 +1831,10 @@ mod tests {
         assert_eq!(s.render_scale, 0.25);
         assert_eq!((s.render_distance, s.vertical_distance), (0, 1));
         assert!(!s.lod2);
-        assert_eq!((s.lod_levels, s.lod_detail), (1, 6));
         assert_eq!(
-            lod_range_metres(&s),
-            32,
-            "zero near radius keeps one LOD unit"
+            (s.render_config().lod_levels, s.render_config().lod_detail),
+            (3, 4),
+            "render distance 0 selects 3 levels at detail 4"
         );
         assert_eq!(
             (s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz),
@@ -1910,8 +1854,11 @@ mod tests {
         assert_eq!(s.render_scale, 0.5);
         assert_eq!((s.render_distance, s.vertical_distance), (3, 2));
         assert!(s.lod2);
-        assert_eq!((s.lod_levels, s.lod_detail), (3, 4));
-        assert_eq!(lod_range_metres(&s), 384);
+        assert_eq!(
+            (s.render_config().lod_levels, s.render_config().lod_detail),
+            (3, 4),
+            "render distance 3 keeps the previous Fast ladder"
+        );
         assert_eq!(
             (s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz),
             (60, 60, 60, 60)
@@ -1932,39 +1879,81 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(s, expected);
+        assert_eq!(
+            (s.render_config().lod_levels, s.render_config().lod_detail),
+            (7, 2),
+            "render distance 6 keeps the previous Default ladder"
+        );
     }
 
     #[test]
-    fn lod_clamp_enforces_combined_detail_limit() {
-        let mut s = Settings {
-            lod_detail: 6,
-            lod_levels: 8,
-            ..Settings::default()
-        };
-        s.clamp();
-        assert_eq!((s.lod_detail, s.lod_levels), (6, 4));
-        assert!(
-            s.lod_detail + s.lod_levels - 1 <= 9,
-            "coarsest level within the ladder cap"
+    fn presets_keep_the_previous_render_config_lod() {
+        let mut s = Settings::default();
+        s.apply_preset(Preset::Fast);
+        assert_eq!(
+            (s.render_config().lod_levels, s.render_config().lod_detail),
+            lod_for(3)
         );
+        assert_eq!((s.render_config().lod_levels, s.render_config().lod_detail), (3, 4));
 
-        s.lod_detail = 255;
-        s.lod_levels = 0;
-        s.clamp();
-        assert_eq!((s.lod_detail, s.lod_levels), (6, 1));
+        s.apply_preset(Preset::Default);
+        assert_eq!(
+            (s.render_config().lod_levels, s.render_config().lod_detail),
+            lod_for(6)
+        );
+        assert_eq!((s.render_config().lod_levels, s.render_config().lod_detail), (7, 2));
 
-        let detail = setting("lod_detail");
-        let levels = setting("lod_levels");
-        s.lod_detail = 5;
-        s.lod_levels = 5;
-        detail.step(&mut s, 1);
-        assert_eq!((s.lod_detail, s.lod_levels), (6, 4));
+        s.apply_preset(Preset::Minimum);
+        assert_eq!(
+            (s.render_config().lod_levels, s.render_config().lod_detail),
+            lod_for(0)
+        );
+        assert_eq!((s.render_config().lod_levels, s.render_config().lod_detail), (3, 4));
 
-        s.render_distance = 3;
-        s.lod_levels = 3;
-        s.lod_detail = 4;
-        assert_eq!(levels.show(&s), "3 levels (~384 m)");
-        assert_eq!(detail.show(&s), "16 m cells");
+        s.render_distance = 16;
+        assert_eq!((s.render_config().lod_levels, s.render_config().lod_detail), (8, 2));
+    }
+
+    #[test]
+    fn settings_table_has_one_lod_switch() {
+        assert!(SETTINGS.iter().any(|field| {
+            field.key() == "lod2" && field.label() == "Distant LOD" && field.matches("lod")
+        }));
+        assert!(SETTINGS.iter().all(|field| {
+            field.label() != "LOD Range"
+                && field.label() != "LOD Quality"
+                && field.key() != "lod_levels"
+                && field.key() != "lod_detail"
+                && !field.matches("lodlevels")
+                && !field.matches("loddetail")
+                && !field.matches("lod_levels")
+                && !field.matches("lod_detail")
+        }));
+    }
+
+    #[test]
+    fn retired_lod_keys_load_silently_and_are_not_written() {
+        let mut loaded = Settings::default();
+        loaded.parse_from(
+            "render_distance=16\nlod2=on\nlod_levels=1\nlod_detail=6\nlodlevels=8\nloddetail=2\n",
+        );
+        loaded.clamp();
+        let mut clean = Settings::default();
+        clean.parse_from("render_distance=16\nlod2=on\n");
+        clean.clamp();
+        assert_eq!(loaded, clean);
+        assert_eq!(
+            (loaded.render_config().lod_levels, loaded.render_config().lod_detail),
+            (8, 2),
+            "stored ladder keys do not override the render distance"
+        );
+        let text = loaded.to_text();
+        assert!(text.lines().any(|line| line == "render_distance=16"));
+        assert!(text.lines().any(|line| line == "lod2=true"));
+        assert!(text.lines().all(|line| {
+            let key = line.split_once('=').map(|(key, _)| key).unwrap_or(line);
+            key != "lod_levels" && key != "lod_detail"
+        }));
     }
 
     #[test]

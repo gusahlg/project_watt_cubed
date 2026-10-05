@@ -266,11 +266,31 @@ impl RenderConfig {
 }
 
 /// The longest ladder a given finest detail supports before its coarsest
-/// level would exceed [`LOD_COARSEST_DETAIL`]. Shared with the settings
-/// stepper so the menu and the normalization can never disagree.
+/// level would exceed [`LOD_COARSEST_DETAIL`]. [`lod_for`] and
+/// [`RenderConfig::normalized_lod`] both stop here.
 pub fn max_lod_levels(detail: u8) -> u8 {
     let detail = detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
     (LOD_COARSEST_DETAIL - detail + 1).min(*LOD_LEVELS_RANGE.end())
+}
+
+/// Far-field `(levels, detail)` for a horizontal render distance.
+///
+/// Settings expose one LOD switch. This is the ladder that switch turns on.
+/// The result is always inside [`max_lod_levels`].
+pub fn lod_for(render_distance: i32) -> (u8, u8) {
+    let (levels, detail) = match render_distance {
+        ..=3 => (3, 4),
+        4..=5 => (5, 3),
+        6..=11 => (7, 2),
+        _ => (8, 2),
+    };
+    let detail = detail.clamp(*LOD_DETAIL_RANGE.start(), *LOD_DETAIL_RANGE.end());
+    (
+        levels
+            .clamp(*LOD_LEVELS_RANGE.start(), *LOD_LEVELS_RANGE.end())
+            .min(max_lod_levels(detail)),
+        detail,
+    )
 }
 
 /// Percent of live free device-local bytes ([`DeviceCaps::available_device_bytes`])
@@ -605,6 +625,50 @@ mod tests {
                 .normalized_lod(),
             (1, 2)
         );
+    }
+
+    #[test]
+    fn lod_for_maps_each_render_distance_band_and_clamps() {
+        let expect = |rd: i32, levels: u8, detail: u8| {
+            assert_eq!(lod_for(rd), (levels, detail), "rd {rd}");
+            assert!(
+                levels <= max_lod_levels(detail),
+                "rd {rd} exceeds max_lod_levels({detail})"
+            );
+            assert_eq!(
+                RenderConfig { lod_levels: levels, lod_detail: detail, ..RenderConfig::default() }
+                    .normalized_lod(),
+                (levels, detail),
+                "rd {rd} must already be a legal ladder"
+            );
+        };
+        for rd in 0..=3 {
+            expect(rd, 3, 4);
+        }
+        for rd in 4..=5 {
+            expect(rd, 5, 3);
+        }
+        for rd in 6..=11 {
+            expect(rd, 7, 2);
+        }
+        for rd in 12..=20 {
+            expect(rd, 8, 2);
+        }
+        assert_eq!(lod_for(16), (8, 2));
+        assert_eq!(lod_for(i32::MIN), (3, 4));
+        assert_eq!(lod_for(-1), (3, 4));
+        assert_eq!(lod_for(21), (8, 2));
+        assert_eq!(lod_for(i32::MAX), (8, 2));
+
+        // Detail 4 holds at most 6 levels. A longer request shortens; the
+        // 0–3 band's 3 levels is that same cap applied to a legal request.
+        assert_eq!(max_lod_levels(4), 6);
+        assert_eq!(
+            RenderConfig { lod_levels: 8, lod_detail: 4, ..RenderConfig::default() }
+                .normalized_lod(),
+            (6, 4)
+        );
+        assert!(lod_for(3).0 <= max_lod_levels(lod_for(3).1));
     }
 
     fn user_ultrawide_lanes() -> RenderConfig {
