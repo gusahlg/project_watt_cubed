@@ -4,10 +4,15 @@
 //!
 //! Usage:
 //! ```text
-//! watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>] [--no-teleport] [--data-dir <dir>]
+//! watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>]
+//!             [--worldgen <flat|diffusion>] [--relief <n>] [--caves <n>] [--mines <n>]
+//!             [--space <n>] [--variety <n>] [--features <n>] [--structures <n>] [--deep <n>]
+//!             [--no-teleport] [--data-dir <dir>]
 //! ```
 //! With no `--seed`, a fresh time-based seed is chosen and printed so it can be
 //! reused. With no `--password`, the server is open to anyone who can reach the port.
+//! `--worldgen` selects the generator (default diffusion). The eight knobs are
+//! percents of the designed terrain and are snapped onto the game's stepper.
 //! `--day-secs` sets the shared day/night cycle length; `--no-teleport` refuses
 //! client `/tp` requests (players are snapped back). `--data-dir` sets the data
 //! and config root (same as `WATT_DATA_DIR`); the server does not persist worlds
@@ -19,8 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use project_watt_cubed::net::DEFAULT_PORT;
 use project_watt_cubed::net::server::{self, Config};
 use project_watt_cubed::paths::Paths;
+use project_watt_cubed::world::generation::WorldgenKind;
 
-const USAGE: &str = "usage: watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>] [--no-teleport] [--data-dir <dir>]";
+const USAGE: &str = "\
+usage: watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>] \
+[--worldgen <flat|diffusion>] [--relief <n>] [--caves <n>] [--mines <n>] [--space <n>] \
+[--variety <n>] [--features <n>] [--structures <n>] [--deep <n>] [--no-teleport] [--data-dir <dir>]";
 
 fn main() {
     let mut port = DEFAULT_PORT;
@@ -46,6 +55,19 @@ fn main() {
                     .filter(|s: &f32| s.is_finite() && *s >= 10.0)
                     .unwrap_or_else(|| die("day-secs must be a number >= 10"));
             }
+            "--worldgen" => {
+                let name = take(&args, &mut i, "--worldgen");
+                config.worldgen = WorldgenKind::from_id(&name)
+                    .unwrap_or_else(|| die("worldgen must be flat or diffusion"));
+            }
+            "--relief" => config.terrain.relief = knob(&args, &mut i, "--relief"),
+            "--caves" => config.terrain.caves = knob(&args, &mut i, "--caves"),
+            "--mines" => config.terrain.mines = knob(&args, &mut i, "--mines"),
+            "--space" => config.terrain.space = knob(&args, &mut i, "--space"),
+            "--variety" => config.terrain.variety = knob(&args, &mut i, "--variety"),
+            "--features" => config.terrain.features = knob(&args, &mut i, "--features"),
+            "--structures" => config.terrain.structures = knob(&args, &mut i, "--structures"),
+            "--deep" => config.terrain.deep = knob(&args, &mut i, "--deep"),
             "--no-teleport" => config.allow_teleport = false,
             "--data-dir" => {
                 data_dir = Some(PathBuf::from(take(&args, &mut i, "--data-dir")));
@@ -55,9 +77,14 @@ fn main() {
         }
         i += 1;
     }
+    config.terrain = config.terrain.clamp();
 
     Paths::init(data_dir.as_deref());
-    println!("starting watt-cubed server: seed {}, port {port}", config.seed);
+    println!(
+        "starting watt-cubed server: seed {}, worldgen {}, port {port}",
+        config.seed,
+        config.worldgen.id()
+    );
     if config.password.is_empty() {
         println!("warning: no password set — anyone who can reach the port can join");
     }
@@ -66,6 +93,10 @@ fn main() {
         eprintln!("server failed to start: {e}");
         process::exit(1);
     }
+}
+
+fn knob(args: &[String], i: &mut usize, flag: &str) -> u16 {
+    take(args, i, flag).parse().unwrap_or_else(|_| die(&format!("{flag} must be a number")))
 }
 
 fn take(args: &[String], i: &mut usize, flag: &str) -> String {

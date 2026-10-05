@@ -6,7 +6,7 @@
 //! heartbeat so a standing-still player still proves they are alive.
 //! Teleport echo (`Position` after `Teleport`) is part of protocol v9.
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -195,6 +195,22 @@ pub enum Incoming {
     Disconnected,
 }
 
+/// How long an edit or tool request may sit unanswered before it rolls back.
+const PENDING_TTL: Duration = Duration::from_secs(3);
+
+enum PendingKind {
+    Edit,
+    Tool,
+}
+
+struct PendingReq {
+    req: u32,
+    cell: (i32, i32, i32),
+    expect: u32,
+    sent: Instant,
+    kind: PendingKind,
+}
+
 /// Dropping it closes the QUIC connection, which ends the reader thread and
 /// signals the server that this player left.
 pub struct Connection {
@@ -226,11 +242,13 @@ pub struct Connection {
     /// CONFIRMED cell revisions from the server (snapshot, broadcasts, and
     /// accepted acks) — what future edit expectations are computed against.
     cell_revs: HashMap<(i32, i32, i32), u32>,
-    /// Our in-flight edits as `(req, cell, expect)`, in send order. Counted
-    /// per cell so a quick break-then-place chain expects the revisions its
-    /// own earlier requests will commit.
-    pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
+    /// In-flight edits and tool uses, in send order. Counted per cell so a
+    /// quick break-then-place chain expects the revisions its earlier requests
+    /// will commit. Dropped as rejected after [`PENDING_TTL`] with no answer.
+    pending_edits: Vec<PendingReq>,
     next_req: u32,
+    /// Last cruise speed told to the server. `None` means "not cruising" was sent, or nothing yet.
+    sent_cruise: Option<f64>,
     /// Instant an in-flight `/tp` was sent. Movement is held until a `Position`
     /// verdict lands, or one heartbeat elapses with no reply, so a dropped echo
     /// cannot freeze the client.
@@ -242,53 +260,56 @@ impl Connection {
     /// `Err` carries a human-readable reason (bad address, refused, wrong
     /// password, version mismatch).
     pub fn connect(host: &str, port: u16, name: &str, password: &str) -> Result<Self, String> {
-        Self::connect_kind(
-            host,
-            port,
-            name,
-            password,
-            crate::world::generation::WorldgenKind::Diffusion,
-            crate::world::terrain::TerrainCfg::default(),
-        )
-    }
-
-    pub fn connect_kind(
-        host: &str,
-        port: u16,
-        name: &str,
-        password: &str,
-        worldgen: crate::world::generation::WorldgenKind,
-        terrain: crate::world::terrain::TerrainCfg,
-    ) -> Result<Self, String> {
-        let addr = (host, port)
+        let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
             .map_err(|e| format!("bad address: {e}"))?
-            .next()
-            .ok_or_else(|| "address resolved to nothing".to_string())?;
-
+            .collect();
+        if addrs.is_empty() {
+            return Err("address resolved to nothing".into());
+        }
         let rt = Arc::new(Runtime::new().map_err(|e| format!("runtime: {e}"))?);
         quic::install_crypto();
-        let mut endpoint = {
-            // Must run inside the runtime: construction spawns quinn's UDP driver.
-            let _guard = rt.enter();
-            Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())
-                .map_err(|e| format!("endpoint: {e}"))?
-        };
-        endpoint.set_default_client_config(quic::client_config());
+        let mut last = "could not connect".to_string();
+        for addr in addrs {
+            match connect_one(&rt, addr, name, password) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+}
 
-        let conn = rt.block_on(async {
-            let connecting = endpoint.connect(addr, "watt").map_err(|e| e.to_string())?;
-            tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-                .await
-                .map_err(|_| "connect timed out".to_string())?
-                .map_err(|e| format!("could not reach {addr}: {e}"))
-        })?;
+fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) -> Result<Connection, String> {
+    let bind = if addr.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let mut endpoint = {
+        // Must run inside the runtime: construction spawns quinn's UDP driver.
+        let _guard = rt.enter();
+        Endpoint::client(bind).map_err(|e| format!("endpoint: {e}"))?
+    };
+    endpoint.set_default_client_config(quic::client_config());
+
+    let conn = rt.block_on(async {
+        let connecting = endpoint.connect(addr, "watt").map_err(|e| e.to_string())?;
+        tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| "connect timed out".to_string())?
+            .map_err(|e| format!("could not reach {addr}: {e}"))
+    })?;
         let (mut send, mut recv) =
             rt.block_on(conn.open_bi()).map_err(|e| format!("stream: {e}"))?;
 
+        let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            fingerprint: crate::net::content_fingerprint_kind_cfg(worldgen, terrain),
+            worldgen: id.worldgen,
+            gravity: id.gravity,
+            law: id.law,
+            palette: id.palette,
             name: name.into(),
             password: password.into(),
         };
@@ -332,11 +353,11 @@ impl Connection {
             }
         });
 
-        Ok(Self {
+        Ok(Connection {
             conn,
             send,
             endpoint,
-            rt,
+            rt: Arc::clone(rt),
             inbox,
             voice_in,
             player_id,
@@ -354,11 +375,13 @@ impl Connection {
             cell_revs: HashMap::new(),
             pending_edits: Vec::new(),
             next_req: 0,
+            sent_cruise: None,
             pending_teleport: None,
             disconnect_emitted: false,
         })
-    }
+}
 
+impl Connection {
     pub fn seed(&self) -> i64 {
         self.seed
     }
@@ -412,6 +435,7 @@ impl Connection {
                 }
             }
         }
+        expire_pending(&mut self.pending_edits, &self.cell_revs, Instant::now(), &mut out);
         emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &mut out);
         coalesce_positions(&mut out);
         out
@@ -449,6 +473,35 @@ fn welcome_from(
     }
 }
 
+fn expire_pending(
+    pending: &mut Vec<PendingReq>,
+    cell_revs: &HashMap<(i32, i32, i32), u32>,
+    now: Instant,
+    out: &mut Vec<Incoming>,
+) {
+    let mut i = 0;
+    while i < pending.len() {
+        if now.saturating_duration_since(pending[i].sent) < PENDING_TTL {
+            i += 1;
+            continue;
+        }
+        let expired = pending.remove(i);
+        match expired.kind {
+            PendingKind::Edit => {
+                let confirmed = cell_revs.get(&expired.cell).copied().unwrap_or(0);
+                out.push(Incoming::EditRejected { req: expired.req, restore: confirmed <= expired.expect });
+            }
+            PendingKind::Tool => out.push(Incoming::ToolResult {
+                req: expired.req,
+                reacted: false,
+                cell: expired.cell,
+                cell_spec: Arc::from(""),
+                tool_spec: Arc::from(""),
+            }),
+        }
+    }
+}
+
 fn emit_disconnect(alive: &mut bool, emitted: &mut bool, out: &mut Vec<Incoming>) {
     if !*alive && !*emitted {
         *emitted = true;
@@ -483,7 +536,7 @@ fn apply_server_message(
     spawn: DVec3,
     peers: &mut HashMap<u32, RemotePlayer>,
     cell_revs: &mut HashMap<(i32, i32, i32), u32>,
-    pending_edits: &mut Vec<(u32, (i32, i32, i32), u32)>,
+    pending_edits: &mut Vec<PendingReq>,
     pending_teleport: &mut Option<Instant>,
     ping_sent: &mut Option<(u32, Instant)>,
     ping_ms: &mut Option<u32>,
@@ -511,10 +564,11 @@ fn apply_server_message(
                 }
             }
             ServerMessage::EditAck { req, accepted, rev } => {
-                let Some(at) = pending_edits.iter().position(|&(r, _, _)| r == req) else {
+                let Some(at) = pending_edits.iter().position(|p| p.req == req) else {
                     return;
                 };
-                let (_, cell, expect) = pending_edits.remove(at);
+                let pending = pending_edits.remove(at);
+                let (cell, expect) = (pending.cell, pending.expect);
                 if accepted {
                     let known = cell_revs.entry(cell).or_insert(0);
                     *known = (*known).max(rev);
@@ -537,10 +591,14 @@ fn apply_server_message(
             }
             ServerMessage::Time { day, day_secs } => out.push(Incoming::Time { day, day_secs }),
             ServerMessage::PeerJoined { id, name } => {
+                // A duplicate (two joins racing) must not announce the peer twice.
+                let std::collections::hash_map::Entry::Vacant(slot) = peers.entry(id) else {
+                    return;
+                };
                 // prev == target on join: speed 0 and a stationary phase, no
                 // Option<history> and no special-casing downstream. Hidden
                 // until their first PeerMove carries a real pose.
-                let spawn = Snapshot {
+                let at = Snapshot {
                     pos: spawn,
                     yaw: 0.0,
                     pitch: 0.0,
@@ -549,13 +607,13 @@ fn apply_server_message(
                     stance: Stance::Standing,
                 };
                 out.push(Incoming::Joined { name: name.clone() });
-                peers.entry(id).or_insert(RemotePlayer {
+                slot.insert(RemotePlayer {
                     id,
                     name,
                     anim: presence::Animator::default(),
                     visible: false,
-                    prev: spawn,
-                    target: spawn,
+                    prev: at,
+                    target: at,
                     recv_at: Instant::now(),
                     interval: Duration::from_millis(0),
                     distance: 0.0,
@@ -614,10 +672,10 @@ fn apply_server_message(
             // The arm exists only to keep the match exhaustive.
             ServerMessage::PeerVoice { .. } => {}
             ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec } => {
-                let Some(at) = pending_edits.iter().position(|&(r, _, _)| r == req) else {
+                let Some(at) = pending_edits.iter().position(|p| p.req == req) else {
                     return;
                 };
-                let (_, cell, _) = pending_edits.remove(at);
+                let cell = pending_edits.remove(at).cell;
                 if reacted {
                     let known = cell_revs.entry(cell).or_insert(0);
                     *known = (*known).max(rev);
@@ -666,23 +724,35 @@ impl Connection {
         self.dispatch(&ClientMessage::Swing);
     }
 
-    /// Returns the request id the eventual [`Incoming::EditAccepted`]/
-    /// [`Incoming::EditRejected`] verdict will carry. The expected revision
-    /// counts our own in-flight edits on the cell, so a quick break-then-place
-    /// chain lines up with the revisions its earlier requests will commit.
-    pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: Arc<str>) -> u32 {
+    /// The request id the eventual [`Incoming::EditAccepted`]/[`Incoming::EditRejected`]
+    /// verdict will carry, or `None` when the spec will not be sent (too long, or the
+    /// link is already dead). Nothing is left pending in that case. The expected
+    /// revision counts in-flight requests on the cell, so a break-then-place chain
+    /// lines up with the revisions its earlier requests will commit.
+    pub fn send_edit(&mut self, x: i32, y: i32, z: i32, spec: Arc<str>) -> Option<u32> {
+        if !self.alive || spec.len() > MAX_SPEC {
+            return None;
+        }
         let cell = (x, y, z);
         let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
-        let in_flight = self.pending_edits.iter().filter(|&&(_, c, _)| c == cell).count() as u32;
+        let in_flight = self.pending_edits.iter().filter(|p| p.cell == cell).count() as u32;
         let expect = confirmed + in_flight;
         self.next_req = self.next_req.wrapping_add(1);
         let req = self.next_req;
-        if spec.len() > MAX_SPEC {
-            return req; // never sent; no ack will come, nothing pends
-        }
-        self.pending_edits.push((req, cell, expect));
+        self.pending_edits.push(PendingReq { req, cell, expect, sent: Instant::now(), kind: PendingKind::Edit });
         self.dispatch(&ClientMessage::Edit { req, x, y, z, expect, spec });
-        req
+        Some(req)
+    }
+
+    /// Tell the server the cruise speed when it changes. `None` sends 0, which ends cruise.
+    /// Ordinary moves stay on [`send_move`]; this only raises the envelope's cap.
+    pub fn sync_cruise(&mut self, speed: Option<f64>) {
+        let declared = speed.filter(|s| s.is_finite() && *s > 0.0);
+        if self.sent_cruise == declared {
+            return;
+        }
+        self.sent_cruise = declared;
+        self.dispatch(&ClientMessage::Cruise { speed: declared.unwrap_or(0.0) });
     }
 
     /// `seq` orders the local stream for the receiver's jitter buffer. Not
@@ -716,11 +786,11 @@ impl Connection {
         }
         let cell = (x, y, z);
         let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
-        let in_flight = self.pending_edits.iter().filter(|&&(_, c, _)| c == cell).count() as u32;
+        let in_flight = self.pending_edits.iter().filter(|p| p.cell == cell).count() as u32;
         let expect = confirmed + in_flight;
         self.next_req = self.next_req.wrapping_add(1);
         let req = self.next_req;
-        self.pending_edits.push((req, cell, expect));
+        self.pending_edits.push(PendingReq { req, cell, expect, sent: Instant::now(), kind: PendingKind::Tool });
         self.dispatch(&ClientMessage::ToolUse { req, x, y, z, expect, tool_spec });
         Some(req)
     }
@@ -883,7 +953,7 @@ mod tests {
         spawn: DVec3,
         peers: HashMap<u32, RemotePlayer>,
         cell_revs: HashMap<(i32, i32, i32), u32>,
-        pending_edits: Vec<(u32, (i32, i32, i32), u32)>,
+        pending_edits: Vec<PendingReq>,
         pending_teleport: Option<Instant>,
         ping_sent: Option<(u32, Instant)>,
         ping_ms: Option<u32>,
@@ -1092,5 +1162,150 @@ mod tests {
             );
         }
         handle.stop();
+    }
+
+    #[test]
+    fn duplicate_peer_joined_announces_once() {
+        let mut v = View::new();
+        let msg = ServerMessage::PeerJoined { id: 4, name: "ada".into() };
+        let first = v.apply(msg.clone());
+        assert!(matches!(first.as_slice(), [Incoming::Joined { .. }]));
+        assert!(v.apply(msg).is_empty(), "a second PeerJoined is not another join");
+        assert_eq!(v.peers.len(), 1);
+    }
+
+    #[test]
+    fn unanswered_edit_expires_as_rejected_and_unsent_spec_returns_no_id() {
+        let mut pending = vec![PendingReq {
+            req: 3,
+            cell: (1, 2, 3),
+            expect: 0,
+            sent: Instant::now() - Duration::from_secs(4),
+            kind: PendingKind::Edit,
+        }];
+        let mut out = Vec::new();
+        expire_pending(&mut pending, &HashMap::new(), Instant::now(), &mut out);
+        assert!(pending.is_empty());
+        assert!(matches!(out.as_slice(), [Incoming::EditRejected { req: 3, restore: true }]));
+
+        pending.push(PendingReq {
+            req: 9,
+            cell: (1, 2, 3),
+            expect: 4,
+            sent: Instant::now() - PENDING_TTL,
+            kind: PendingKind::Tool,
+        });
+        out.clear();
+        let mut revs = HashMap::new();
+        revs.insert((1, 2, 3), 4);
+        expire_pending(&mut pending, &revs, Instant::now(), &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [Incoming::ToolResult { req: 9, reacted: false, .. }]
+        ));
+
+        let handle = server::spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let huge: Arc<str> = "x".repeat(MAX_SPEC + 1).into();
+        assert!(conn.send_edit(0, 0, 0, huge).is_none());
+        assert!(conn.pending_edits.is_empty());
+        assert_eq!(conn.next_req, 0);
+        // Never sent, so a server ack cannot remove it before the expiry path runs.
+        conn.pending_edits.push(PendingReq {
+            req: 7,
+            cell: (1, 2, 3),
+            expect: 0,
+            sent: Instant::now() - PENDING_TTL - Duration::from_millis(1),
+            kind: PendingKind::Edit,
+        });
+        let events = conn.poll();
+        assert!(
+            events.iter().any(|e| matches!(e, Incoming::EditRejected { req: 7, restore: true })),
+            "a few seconds with no ack rolls the edit back"
+        );
+        assert!(conn.pending_edits.is_empty());
+        handle.stop();
+    }
+
+    /// Two-process check: set `WATT_LIVE_ADDR=host:port` (and optional `WATT_LIVE_PW`)
+    /// to join a real `watt_server`. Otherwise the server is spawned in-process.
+    /// Joins through [`crate::app::join_server`], edits, moves faster than the old
+    /// 80 m/s cap, and leaves.
+    #[test]
+    #[ignore]
+    fn live_join_edits_fast_move_and_leaves() {
+        let password = std::env::var("WATT_LIVE_PW").unwrap_or_default();
+        let external = std::env::var("WATT_LIVE_ADDR").ok();
+        let owned = if external.is_none() {
+            Some(server::spawn(0, Config { seed: 7, ..Config::default() }).unwrap())
+        } else {
+            None
+        };
+        let (host, port, pw): (String, u16, String) = if let Some(addr) = &external {
+            let (h, p) = addr.rsplit_once(':').expect("WATT_LIVE_ADDR is host:port");
+            (h.to_string(), p.parse().expect("port"), password)
+        } else {
+            let handle = owned.as_ref().unwrap();
+            ("127.0.0.1".into(), handle.addr().port(), String::new())
+        };
+        let mut conn = crate::app::join_server(&host, port, "live", &pw).expect("join");
+        println!(
+            "joined id {} seed {} worldgen {:?}",
+            conn.player_id(),
+            conn.seed(),
+            conn.worldgen()
+        );
+        let s = conn.spawn();
+        let (x, y, z) = (
+            crate::math::block_coord(s.x),
+            crate::math::block_coord(s.y),
+            crate::math::block_coord(s.z),
+        );
+        let req = conn.send_edit(x, y, z, "air".into()).expect("edit sent");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut edit_accepted = false;
+        let mut edit_rejected = false;
+        while Instant::now() < deadline && !edit_accepted && !edit_rejected {
+            for e in conn.poll() {
+                match e {
+                    Incoming::EditAccepted { req: r } if r == req => edit_accepted = true,
+                    Incoming::EditRejected { req: r, .. } if r == req => edit_rejected = true,
+                    _ => {}
+                }
+            }
+            if !edit_accepted && !edit_rejected {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        println!("edit req {req} accepted={edit_accepted} rejected={edit_rejected}");
+        assert!(edit_accepted, "the spawn-cell edit must be accepted");
+        conn.sync_cruise(Some(crate::player::MAX_SPEED));
+        let dest = s + DVec3::new(500.0, 0.0, 0.0);
+        conn.last_move = Instant::now() - HEARTBEAT;
+        conn.send_move(
+            dest,
+            0.0,
+            0.0,
+            DQuat::IDENTITY,
+            Vec3::new(crate::player::MAX_SPEED as f32, 0.0, 0.0),
+            Face::PosY,
+            Stance::Standing,
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut snapped = false;
+        while Instant::now() < deadline {
+            if conn.poll().iter().any(|e| matches!(e, Incoming::Position { .. })) {
+                snapped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        println!("fast move snapped={snapped}");
+        assert!(!snapped, "500 blocks at MAX_SPEED must not snap back");
+        drop(conn);
+        println!("left");
+        if let Some(handle) = &owned {
+            handle.stop();
+        }
     }
 }

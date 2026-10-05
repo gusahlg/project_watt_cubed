@@ -772,6 +772,7 @@ impl Game {
             return Some(Signal::ExitToMenu);
         }
         if let Some(net) = &mut self.net {
+            net.sync_cruise(self.player.cruise.map(|c| c.speed));
             net.send_move(
                 self.player.position,
                 self.player.orientation.yaw,
@@ -1164,7 +1165,7 @@ impl Game {
             };
             // Apply after each event frame so repeated placements observe the
             // previous write and cannot spend twice against one empty cell.
-            self.apply_placements(&mut placements, events);
+            self.apply_placements(&mut placements, events, mods);
         }
         placements.clear();
         self.placement_scratch = placements;
@@ -1689,16 +1690,23 @@ impl Game {
         // apply above is a PREDICTION for responsiveness: the ack rolls it
         // back — cell and loot both — if we lose the race for this cell.
         if let Some(net) = &mut self.net {
-            let req = net.send_edit(x, y, z, "air".into());
-            self.pending_edits.insert(
-                req,
-                PendingEdit {
-                    cell: (x, y, z),
-                    prev: id,
-                    kind: PendingKind::Break(id),
-                },
-            );
-            net.send_swing();
+            if let Some(req) = net.send_edit(x, y, z, "air".into()) {
+                self.pending_edits.insert(
+                    req,
+                    PendingEdit {
+                        cell: (x, y, z),
+                        prev: id,
+                        kind: PendingKind::Break(id),
+                    },
+                );
+                net.send_swing();
+            } else {
+                self.world.set_block(x, y, z, id);
+                if !overflow {
+                    self.player.stash.revoke(id, 1);
+                }
+                mods.on_break_rejected(id);
+            }
         }
     }
 
@@ -1713,6 +1721,7 @@ impl Game {
         &mut self,
         placements: &mut Vec<(i32, i32, i32, crate::block::BlockId)>,
         events: &mut Vec<SoundEvent>,
+        mods: &mut Mods,
     ) {
         for (x, y, z, id) in placements.drain(..) {
             // Overlap check in f64: at far coordinates an f32 cell centre
@@ -1741,16 +1750,21 @@ impl Game {
             // The spent unit is refunded if the server says no.
             if let Some(net) = &mut self.net {
                 let spec = save::block_spec(self.world.registry(), id);
-                let req = net.send_edit(x, y, z, spec.into());
-                self.pending_edits.insert(
-                    req,
-                    PendingEdit {
-                        cell: (x, y, z),
-                        prev,
-                        kind: PendingKind::Place(id),
-                    },
-                );
-                net.send_swing();
+                if let Some(req) = net.send_edit(x, y, z, spec.into()) {
+                    self.pending_edits.insert(
+                        req,
+                        PendingEdit {
+                            cell: (x, y, z),
+                            prev,
+                            kind: PendingKind::Place(id),
+                        },
+                    );
+                    net.send_swing();
+                } else {
+                    self.world.set_block(x, y, z, prev);
+                    self.player.stash.add(id, 1);
+                    mods.on_place_rejected(id, &self.world);
+                }
             }
         }
     }

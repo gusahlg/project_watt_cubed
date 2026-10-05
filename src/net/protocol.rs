@@ -82,7 +82,7 @@ macro_rules! wire_scalar {
         }
     )*};
 }
-wire_scalar!(u8 => u8, u32 => u32, u64 => u64, i32 => i32, i64 => i64, f32 => f32, DVec3 => vec3);
+wire_scalar!(u8 => u8, u32 => u32, u64 => u64, i32 => i32, i64 => i64, f32 => f32, f64 => f64, DVec3 => vec3);
 
 /// Strings travel as `Arc<str>` end to end: the sender can broadcast one
 /// interned name/spec as a refcount bump per recipient, and the receiver
@@ -305,6 +305,7 @@ mod tag {
     pub const TELEPORT: u8 = 7;
     pub const VOICE: u8 = 8;
     pub const TOOL_USE: u8 = 9;
+    pub const CRUISE: u8 = 10;
 
     pub const WELCOME: u8 = 0;
     pub const REJECT: u8 = 1;
@@ -327,10 +328,22 @@ mod tag {
 messages! {
     /// A message from a client to the server.
     pub enum ClientMessage {
-        /// `fingerprint` is the sender's [`content_fingerprint`](super::content_fingerprint);
-        /// the server rejects a mismatch so two builds that would generate
-        /// different worlds from one seed never silently join.
-        Hello = tag::HELLO { protocol: u32, fingerprint: u64, name: Arc<str>, password: Arc<str> },
+        /// Content parts only: generator version, gravity, material law, palette.
+        /// Worldgen kind and terrain knobs arrive in [`ServerMessage::Welcome`].
+        /// `protocol` stays the first field so a peer can be told "server vX, client vY"
+        /// before the rest of the payload is decoded.
+        Hello = tag::HELLO {
+            protocol: u32,
+            worldgen: u32,
+            gravity: u64,
+            law: u64,
+            palette: u64,
+            name: Arc<str>,
+            password: Arc<str>,
+        },
+        /// Declare cruise. `speed` 0 ends it; otherwise the movement envelope may
+        /// follow up to `min(speed, CRUISE_MAX)`. Sent when the cruise state changes.
+        Cruise = tag::CRUISE { speed: f64 },
         /// Client simulates its own player; server-side this is plausibility-checked
         /// (movement envelope + border) — discontinuities must go through
         /// [`Teleport`](Self::Teleport).
@@ -415,6 +428,30 @@ messages! {
     }
 }
 
+/// What the first bytes of a client frame say, before a full [`ClientMessage`] decode.
+pub(crate) enum HelloPeek {
+    /// Tag byte is missing or is not `Hello`.
+    NotHello,
+    /// Tag is `Hello` but the protocol `u32` is not all there.
+    Truncated,
+    /// Little-endian protocol number sitting immediately after the tag.
+    Protocol(u32),
+}
+
+/// Tag, then the protocol number. A v12 `Hello` laid the same two fields first,
+/// so a mismatched peer is named without parsing the rest of its payload.
+pub(crate) fn peek_hello(frame: &[u8]) -> HelloPeek {
+    match frame.first() {
+        Some(&tag::HELLO) if frame.len() >= 5 => {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&frame[1..5]);
+            HelloPeek::Protocol(u32::from_le_bytes(bytes))
+        }
+        Some(&tag::HELLO) => HelloPeek::Truncated,
+        _ => HelloPeek::NotHello,
+    }
+}
+
 fn frame_header(payload: &[u8]) -> io::Result<[u8; 4]> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
@@ -475,10 +512,15 @@ mod tests {
         vec![
             ClientMessage::Hello {
                 protocol: 1,
-                fingerprint: 0xDEAD_BEEF_1234_5678,
+                worldgen: 10,
+                gravity: 0xDEAD_BEEF_1234_5678,
+                law: 0x1111,
+                palette: 0x2222,
                 name: "player".into(),
                 password: "hunter2".into(),
             },
+            ClientMessage::Cruise { speed: 1.5e8 },
+            ClientMessage::Cruise { speed: 0.0 },
             ClientMessage::Move {
                 pos: DVec3::new(1.5, -2.0, 3.25),
                 yaw: 0.5,
@@ -1036,7 +1078,10 @@ mod tests {
         let cap_name: Arc<str> = "n".repeat(super::super::MAX_NAME).into();
         let hello = ClientMessage::Hello {
             protocol: 1,
-            fingerprint: 0,
+            worldgen: 0,
+            gravity: 0,
+            law: 0,
+            palette: 0,
             name: cap_name.clone(),
             password: "".into(),
         };
@@ -1045,7 +1090,10 @@ mod tests {
         let over: Arc<str> = "n".repeat(super::super::MAX_NAME + 1).into();
         let hello_over = ClientMessage::Hello {
             protocol: 1,
-            fingerprint: 0,
+            worldgen: 0,
+            gravity: 0,
+            law: 0,
+            palette: 0,
             name: over,
             password: "p".repeat(super::super::MAX_NAME + 1).into(),
         };

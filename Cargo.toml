@@ -43,6 +43,8 @@ quinn = { version = "0.11", default-features = false, features = ["bloom", "log"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Dual-stack server socket (IPV6_V6ONLY off); already in the tree through quinn.
+socket2 = "0.6"
 
 # Audio output/capture, realtime queues, voice codec, and cue manifests.
 # Do not enable cpal's native PulseAudio host: it disconnects in a loop

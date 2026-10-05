@@ -133,7 +133,7 @@ pub(super) fn generate_column_default(
     (chunks, heights)
 }
 
-/// Which generator a world is built with. Folded into the content fingerprint.
+/// Which generator a world is built with. Carried in `Welcome`, not in the content id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum WorldgenKind {
     /// The core fallback: a flat world.

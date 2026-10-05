@@ -135,11 +135,23 @@ pub(crate) mod quic {
             self.0.signature_verification_algorithms.supported_schemes()
         }
     }
+
+    /// UDP socket bound to `::` with `IPV6_V6ONLY` off, so one port takes IPv4 and IPv6.
+    /// Cleared before `bind`: `std` follows the process default, and a host may set that to v6-only.
+    pub(crate) fn bind_dual_stack(port: u16) -> io::Result<std::net::UdpSocket> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(false)?;
+        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+        socket.bind(&addr.into())?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
 }
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 12;
+pub(crate) const PROTOCOL_VERSION: u32 = 13;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -149,7 +161,9 @@ pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
 pub const MAX_NAME: usize = 24;
 pub(crate) const MAX_CHAT: usize = 256;
-pub(crate) const MAX_SPEC: usize = 256;
+/// Longest block spec on the wire: `c:` plus the hex of a full configuration
+/// (`1 + CAPACITY * D` bytes). A shorter cap rejects blocks the game can place.
+pub(crate) const MAX_SPEC: usize = 2 + 2 * (1 + material::CAPACITY * material::D);
 
 /// Largest accepted voice payload (bytes): one 20 ms opus frame at up to
 /// ~64 kbps with margin. `net` owns its own copy of the cap rather than
@@ -157,6 +171,67 @@ pub(crate) const MAX_SPEC: usize = 256;
 /// must compile without it. The codec rejects any inbound voice frame past this
 /// cap, and callers guard outbound.
 pub(crate) const MAX_VOICE_PAYLOAD: usize = 400;
+
+/// What a join must share: generator version, gravity, material law, palette.
+/// Worldgen kind and terrain knobs are not in here — [`Welcome`](protocol::ServerMessage::Welcome)
+/// carries them, and the joiner adopts the server's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContentId {
+    pub worldgen: u32,
+    pub gravity: u64,
+    pub law: u64,
+    pub palette: u64,
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv_feed(hash: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *hash ^= b as u64;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+/// Code and content identity of `registry`. Interning a block does not change it: the
+/// palette is a function of the law, not of which configurations have been seen.
+pub(crate) fn content_id(registry: &crate::block::BlockRegistry) -> ContentId {
+    let mut gravity = FNV_OFFSET;
+    for word in crate::gravity::law_digest() {
+        fnv_feed(&mut gravity, &word.to_le_bytes());
+    }
+    let mut palette = FNV_OFFSET;
+    for entry in crate::world::terrain::palette::of(registry.law()) {
+        fnv_feed(&mut palette, entry.config.encode().as_bytes());
+    }
+    ContentId {
+        worldgen: u32::from(crate::world::terrain::WORLDGEN_VERSION),
+        gravity,
+        law: registry.law().fingerprint(),
+        palette,
+    }
+}
+
+/// `None` when `client` may share a world with `server`. Otherwise a reason that names the
+/// first part that differs and contains `content`, so a refusal says what diverged.
+pub(crate) fn content_mismatch(server: ContentId, client: ContentId) -> Option<String> {
+    if server == client {
+        return None;
+    }
+    let detail = if server.worldgen != client.worldgen {
+        format!(
+            "generator version differs: server v{}, client v{}",
+            server.worldgen, client.worldgen
+        )
+    } else if server.gravity != client.gravity {
+        "gravity law differs".to_string()
+    } else if server.law != client.law {
+        "material law differs".to_string()
+    } else {
+        "palette differs".to_string()
+    };
+    Some(format!("world content mismatch: {detail}"))
+}
 
 #[cfg(test)]
 pub(crate) fn content_fingerprint() -> u64 {
@@ -169,11 +244,9 @@ pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenK
 }
 
 /// A stable 64-bit digest of everything that determines what a seed GENERATES and how a body
-/// falls: the generator version, the gravity law, the material law, every palette configuration,
-/// the worldgen kind and its knobs. Seed-only multiplayer never ships voxels, so two builds whose
-/// generation or physics differ in ANY of these would silently diverge — the handshake compares
-/// fingerprints and rejects the join instead. Protocol changes are versioned separately by
-/// [`PROTOCOL_VERSION`].
+/// falls, including the worldgen kind and its knobs. The handshake no longer sends this —
+/// kind and knobs arrive in Welcome — the tests keep it so the mix stays characterised.
+#[cfg(test)]
 pub(crate) fn content_fingerprint_kind_cfg(
     kind: crate::world::generation::WorldgenKind,
     cfg: crate::world::terrain::TerrainCfg,
@@ -182,6 +255,7 @@ pub(crate) fn content_fingerprint_kind_cfg(
 }
 
 /// The fingerprint of the gravity law, a registry's material law, and the generator's palette.
+#[cfg(test)]
 pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -203,8 +277,8 @@ pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
     hash
 }
 
-/// Same as [`fingerprint_of`], plus the worldgen kind and its knobs, so two worlds that would
-/// generate different terrain cannot silently desync.
+/// Same as [`fingerprint_of`], plus the worldgen kind and its knobs.
+#[cfg(test)]
 pub(crate) fn fingerprint_kind_cfg(
     registry: &crate::block::BlockRegistry,
     kind: crate::world::generation::WorldgenKind,
@@ -277,6 +351,32 @@ mod fingerprint_tests {
         let cid = client.parse_spec(&spec).unwrap();
         assert_eq!(client.configuration(cid), server.configuration(sid));
         assert_eq!(fingerprint_of(&client), before);
+    }
+
+    #[test]
+    fn content_id_ignores_interns_and_names_a_mismatch() {
+        use crate::block::BlockRegistry;
+        use material::{Configuration, Element};
+
+        let bare = BlockRegistry::with_builtins();
+        let id = content_id(&bare);
+        assert_eq!(id.worldgen, u32::from(crate::world::terrain::WORLDGEN_VERSION));
+        let mut interned = BlockRegistry::with_builtins();
+        crate::world::terrain::Materials::intern(&mut interned);
+        assert_eq!(content_id(&interned), id, "generation interns do not change the join id");
+        let novel = Configuration::new(vec![Element::new([3, 9, 27, 81])]).unwrap();
+        interned.intern(&novel).unwrap();
+        assert_eq!(content_id(&interned), id, "a novel block does not change the join id");
+
+        assert!(content_mismatch(id, id).is_none());
+        let drifted = ContentId { worldgen: id.worldgen + 1, ..id };
+        let why = content_mismatch(id, drifted).unwrap();
+        assert!(why.contains("content"), "{why}");
+        assert!(why.contains(&format!("server v{}", id.worldgen)), "{why}");
+        assert!(why.contains(&format!("client v{}", drifted.worldgen)), "{why}");
+        assert!(content_mismatch(id, ContentId { gravity: id.gravity ^ 1, ..id }).unwrap().contains("gravity"));
+        assert!(content_mismatch(id, ContentId { law: id.law ^ 1, ..id }).unwrap().contains("law"));
+        assert!(content_mismatch(id, ContentId { palette: id.palette ^ 1, ..id }).unwrap().contains("palette"));
     }
 }
 

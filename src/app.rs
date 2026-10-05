@@ -704,14 +704,7 @@ impl App {
             Ok(handle) => {
                 let port = handle.addr().port();
                 self.host = Some(handle);
-                match Connection::connect_kind(
-                    "127.0.0.1",
-                    port,
-                    &info.name,
-                    &info.password,
-                    self.mods.worldgen_kind(),
-                    terrain_cfg_from_mods(&self.mods),
-                ) {
+                match join_server("127.0.0.1", port, &info.name, &info.password) {
                     Ok(conn) => self.enter_net_game(eng, conn),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
                 }
@@ -722,14 +715,7 @@ impl App {
 
     /// Connect to a remote server and enter its world.
     fn start_join(&mut self, eng: &mut Engine, info: JoinInfo) {
-        match Connection::connect_kind(
-            &info.host,
-            info.port,
-            &info.name,
-            &info.password,
-            self.mods.worldgen_kind(),
-            terrain_cfg_from_mods(&self.mods),
-        ) {
+        match join_server(&info.host, info.port, &info.name, &info.password) {
             Ok(conn) => self.enter_net_game(eng, conn),
             Err(e) => self.fail_to_menu(format!("could not join: {e}")),
         }
@@ -965,6 +951,12 @@ impl App {
 }
 
 
+/// Join `host:port`. The fingerprint is code and content only; the server's
+/// worldgen kind and terrain arrive on the connection after Welcome.
+pub(crate) fn join_server(host: &str, port: u16, name: &str, password: &str) -> Result<Connection, String> {
+    Connection::connect(host, port, name, password)
+}
+
 /// Parse the winning worldgen payload as generator knobs.
 fn terrain_cfg_from_mods(mods: &Mods) -> TerrainCfg {
     mods.worldgen_config().as_deref().map(TerrainCfg::from_text).unwrap_or_default()
@@ -1026,6 +1018,27 @@ mod tests {
     use super::*;
     use crate::render_config::RenderConfig;
     use crate::world::generation::WorldgenKind;
+
+    #[test]
+    fn vanilla_client_joins_a_diffusion_server_through_join_server() {
+        assert_eq!(Mods::empty().worldgen_kind(), WorldgenKind::Flat);
+        let terrain = TerrainCfg { relief: 150, caves: 25, ..TerrainCfg::default() }.clamp();
+        let handle = server::spawn(
+            0,
+            Config {
+                seed: 99,
+                worldgen: WorldgenKind::Diffusion,
+                terrain,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let conn = join_server("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
+        assert_eq!(conn.worldgen(), WorldgenKind::Diffusion);
+        assert_eq!(conn.terrain(), terrain);
+        assert_eq!(conn.seed(), 99);
+        handle.stop();
+    }
 
     #[test]
     fn spawn_player_sits_above_the_surface() {

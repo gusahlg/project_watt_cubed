@@ -31,3 +31,8 @@ v12: `Move`, `PeerMove`, and `Position` carry the body frame (4 × f32).
 `Move` and `PeerMove` also carry velocity (3 × f32) and the up-axis face.
 The content fingerprint folds the gravity law digest. `Welcome`'s terrain
 knobs widen from 4 to 8. Mixed v11/v12 peers must not join.
+v13: `Hello` carries the content parts (generator version, gravity, law,
+palette) instead of one fingerprint that mixed in worldgen kind and terrain
+knobs. Kind and knobs stay in `Welcome`. `Cruise` declares a cruise speed
+(0 ends it) so the movement envelope can follow it. Mixed v12/v13 peers
+must not join.

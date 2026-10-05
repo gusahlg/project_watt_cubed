@@ -555,6 +555,29 @@ impl BlockRegistry {
         }
     }
 
+    /// Canonical wire spelling of `spec` without interning. `Some("air")`, or `Some("c:…")`
+    /// in lowercase hex for a decodable configuration (already known or not). `None` when
+    /// the text is malformed or is `c:00` (only `air` spells the void).
+    pub fn canonical_spec(&self, spec: &str) -> Option<String> {
+        if spec == "air" {
+            return Some("air".to_string());
+        }
+        if let Some(id) = self.lookup_spec(spec) {
+            return Some(self.spec(id));
+        }
+        let cfg = decode_spec(spec)?;
+        if cfg.is_empty() {
+            return None;
+        }
+        let bytes = cfg.encode();
+        let mut s = String::with_capacity(2 + bytes.as_bytes().len() * 2);
+        s.push_str("c:");
+        for b in bytes.as_bytes() {
+            s.push_str(&format!("{b:02x}"));
+        }
+        Some(s)
+    }
+
     /// Look up a spec already in the table without interning. `None` if the spec is malformed,
     /// `c:00`, or the configuration has not been interned yet.
     pub fn lookup_spec(&self, spec: &str) -> Option<BlockId> {
