@@ -99,6 +99,22 @@ const MAX_PREDICT_SAMPLE_GAP: f64 = 0.5;
 /// admission-time priorities are stale where the eye is now.
 const MAX_PREDICT_SPEED: f64 = 512.0;
 
+/// An eye's velocity since its last sample, and the sample interval. A pause
+/// past [`MAX_PREDICT_SAMPLE_GAP`], a non-finite eye or a non-positive interval
+/// reads as rest, so nothing downstream fires on garbage input.
+fn eye_sample(prev: Option<(DVec3, Instant)>, eye: DVec3, now: Instant) -> (DVec3, f64) {
+    let Some((prev, t)) = prev else {
+        return (DVec3::ZERO, 0.0);
+    };
+    let dt = now.duration_since(t).as_secs_f64();
+    let v = (eye - prev) / dt;
+    if eye.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_SAMPLE_GAP && v.is_finite() {
+        (v, dt)
+    } else {
+        (DVec3::ZERO, dt.min(MAX_PREDICT_SAMPLE_GAP))
+    }
+}
+
 /// Above this speed the far-field key is bucketed so the sweep is not redone
 /// every chunk step. The sweep costs the same at any speed; running it on
 /// every step is what made a fast frame grow with speed. Slower flight keeps
@@ -116,6 +132,16 @@ const FRONTIER_EYE_QUANTUM: f64 = 512.0;
 /// Square-root loading radius through this speed, then inverse. 100 m/s stays
 /// on the wide shoulder; past it the radius falls with speed.
 const LOAD_SQRT_KNEE_MPS: f64 = 120.0;
+
+/// A sample this many times faster than the last accepted speed (and well
+/// above walking) waits for the next sample to confirm it. A teleport or a
+/// warp moves the eye once; real flight keeps moving.
+const SPEED_JUMP_RATIO: f64 = 4.0;
+
+/// The held heading axis stays until another axis leads it by this factor, so
+/// a near-diagonal flight does not flip the heading (and rescan every queue)
+/// each sample.
+const HEADING_HYSTERESIS: f64 = 1.2;
 
 /// Travel up to this speed gets the full streaming budget. It is comfortably
 /// above ordinary walking/sprinting, so normal play and world entry retain
@@ -190,13 +216,16 @@ const FAR_CANDIDATES: f64 = (2 * super::SECTION_SLOT_FLOOR) as f64;
 #[derive(Clone, Copy, Debug)]
 pub(in crate::world) struct StreamPacer {
     speed_mps: f64,
-    /// Last finite travel sample, including speeds the far-field predictor
-    /// treats as a teleport. The loading window aims with this.
+    /// Last accepted near-eye velocity, in the frame the near window streams
+    /// in, including speeds the far-field predictor treats as a teleport. The
+    /// loading window aims with this.
     travel: DVec3,
     effort: f32,
     /// Smoothed fraction of the view radius new work may cover. `1` at rest.
     load_fraction: f32,
     boost: bool,
+    /// The last sample was a speed jump waiting for confirmation.
+    held: bool,
 }
 
 impl Default for StreamPacer {
@@ -207,6 +236,7 @@ impl Default for StreamPacer {
             effort: 1.0,
             load_fraction: 1.0,
             boost: false,
+            held: false,
         }
     }
 }
@@ -277,7 +307,26 @@ impl StreamPacer {
         }
     }
 
-    fn update(&mut self, velocity: DVec3, sample_dt: f64) {
+    /// Feed one near-eye sample. `discontinuity` (the near window's frame
+    /// changed under the eye: a chart seam, an altitude band, entering or
+    /// leaving a chart) drops it: its velocity mixes two frames. A jump to a
+    /// speed the last accepted one does not support is held and applies only
+    /// when the next sample is fast too.
+    fn observe(&mut self, velocity: DVec3, sample_dt: f64, discontinuity: bool) {
+        if discontinuity {
+            self.held = false;
+            return;
+        }
+        let speed = velocity.x.hypot(velocity.y).hypot(velocity.z);
+        if speed > SPEED_JUMP_RATIO * self.speed_mps.max(FULL_EFFORT_SPEED_MPS) && !self.held {
+            self.held = true;
+            return;
+        }
+        self.held = false;
+        self.update(velocity, sample_dt);
+    }
+
+    pub(in crate::world) fn update(&mut self, velocity: DVec3, sample_dt: f64) {
         // `hypot(x, 0) = |x|` and `hypot` is even, so `vy == 0` matches the
         // old horizontal speed bit for bit.
         self.travel = velocity;
@@ -316,6 +365,12 @@ impl StreamPacer {
 
     pub(in crate::world) fn boosting(self) -> bool {
         self.boost
+    }
+
+    /// A speed jump waits for confirmation: the next pass may collapse the
+    /// loading window.
+    pub(in crate::world) fn holding(self) -> bool {
+        self.held
     }
 
     /// Effort applied to admission deadlines, floors and uploads. The worker
@@ -384,13 +439,6 @@ pub(in crate::world) fn chunk_behind(
     up: Option<Face>,
 ) -> bool {
     let mut v = [vel.x, vel.y, vel.z];
-    if !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite() {
-        return false;
-    }
-    let speed3 = v[0].hypot(v[1]).hypot(v[2]);
-    if speed3 <= FULL_EFFORT_SPEED_MPS {
-        return false;
-    }
     let mut d = [
         (i64::from(coord.x) - i64::from(center.x)) as f64,
         (i64::from(coord.y) - i64::from(center.y)) as f64,
@@ -401,53 +449,64 @@ pub(in crate::world) fn chunk_behind(
         v[a] = 0.0;
         d[a] = 0.0;
     }
-    let speed = v[0].hypot(v[1]).hypot(v[2]);
-    if speed <= FULL_EFFORT_SPEED_MPS {
-        return false;
-    }
-    (d[0] * v[0] + d[1] * v[1] + d[2] * v[2]) / speed < -0.5
+    let speed2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    let along = d[0] * v[0] + d[1] * v[1] + d[2] * v[2];
+    // `along / speed < -0.5` without the square root. Non-finite input fails
+    // a comparison and keeps the chunk.
+    speed2 > FULL_EFFORT_SPEED_MPS * FULL_EFFORT_SPEED_MPS
+        && along < 0.0
+        && along * along > 0.25 * speed2
 }
 
 /// Dominant-axis sign of planar travel: `+1`/`-1` on X, `+2`/`-2` on Y, `+3`/`-3`
 /// on Z, `0` at rest. A straight flight holds one value, so the job gate's epoch
 /// does not bump every frame; a reversal does, and behind jobs drop immediately.
-fn travel_heading(vel: DVec3, up: Option<Face>) -> i8 {
+/// The `held` axis is kept until another leads it by [`HEADING_HYSTERESIS`].
+fn travel_heading(vel: DVec3, up: Option<Face>, held: i8) -> i8 {
     let mut v = [vel.x, vel.y, vel.z];
     if let Some(face) = up {
         v[face.axis()] = 0.0;
     }
     let mut axis = 0usize;
-    let mut mag = 0.0f64;
-    for i in 0..3 {
-        let a = v[i].abs();
-        if a > mag {
-            mag = a;
+    for i in 1..3 {
+        if v[i].abs() > v[axis].abs() {
             axis = i;
         }
     }
-    if mag <= FULL_EFFORT_SPEED_MPS {
+    let mag = v[axis].abs();
+    if !(mag > FULL_EFFORT_SPEED_MPS) {
         return 0;
+    }
+    if held != 0 {
+        let h = usize::from(held.unsigned_abs()) - 1;
+        if v[h].abs() * HEADING_HYSTERESIS >= mag {
+            axis = h;
+        }
     }
     let sign = if v[axis] >= 0.0 { 1i8 } else { -1 };
     sign * (axis as i8 + 1)
 }
 
-/// Whether `coord` is still inside the loading mesh window. Inputs are copied
-/// out so a worklist can prune itself without borrowing the world.
-fn admission_keeps(
-    center: Option<Coord>,
-    mesh: Option<ChunkBox>,
-    fold: super::seam::Unfold,
+/// A speed-reduced loading window, copied out of the world so a worklist can
+/// prune itself while borrowed.
+#[derive(Clone, Copy)]
+struct LoadWindow {
+    center: Coord,
+    mesh: ChunkBox,
+    data: ChunkBox,
     travel: DVec3,
     up: Option<Face>,
-    coord: &Coord,
-) -> bool {
-    match (center, mesh) {
-        (Some(center), Some(mesh)) => {
-            let folded = fold.fold(*coord);
-            !chunk_behind(center, folded, travel, up) && mesh.contains(folded)
-        }
-        _ => true,
+    /// A heading is set: chunks strictly behind the player take no new work.
+    trail: bool,
+}
+
+impl LoadWindow {
+    /// Whether new work at `folded` (a chunk already placed in the centre's
+    /// net) is worth starting: inside the mesh box, or the data box for
+    /// generation and light, and not behind the player.
+    fn covers(self, folded: Coord, data: bool) -> bool {
+        let b = if data { self.data } else { self.mesh };
+        b.contains(folded) && !(self.trail && chunk_behind(self.center, folded, self.travel, self.up))
     }
 }
 
@@ -1044,7 +1103,7 @@ impl World {
 
     /// Radii new work may cover. Before the first stream this is the full view.
     fn load_volume(&self) -> super::ViewVolume {
-        if self.load_h < 0 {
+        if self.loading_full() {
             self.view
         } else {
             super::ViewVolume::new(self.load_h, self.load_v.max(0))
@@ -1057,18 +1116,20 @@ impl World {
             || (self.load_h >= self.view.horizontal && self.load_v >= self.view.vertical)
     }
 
-    /// Chunks new mesh and light admission will spend workers on.
+    /// Chunks new mesh admission will spend workers on.
     fn load_mesh_box(&self, center: Coord) -> ChunkBox {
         self.load_volume().mesh(center, self.live_up())
     }
 
-    /// Voxel data the loading window generates: the load mesh box plus one data shell.
+    /// Voxel data the loading window generates and lights: the load mesh box plus one data shell.
     fn load_data_box(&self, center: Coord) -> ChunkBox {
         self.load_volume().data(center, self.live_up())
     }
 
     /// Publish the speed-reduced radii and the travel heading. A change is a
-    /// view event: generation rebuilds and the mesh/light seed follows.
+    /// view event: generation rebuilds and the mesh/light seed follows. Only a
+    /// reduced window takes a heading, so the trail filter never runs while
+    /// the whole view is loading.
     fn apply_loading_radius(&mut self) {
         let h = self.stream_pacer.load_radius(self.view.horizontal);
         let v = self.stream_pacer.load_radius(self.view.vertical);
@@ -1077,11 +1138,10 @@ impl World {
             self.load_v = v;
             self.load_moved = true;
         }
-        let tight = h < self.view.horizontal || v < self.view.vertical;
-        let heading = if tight {
-            travel_heading(self.stream_pacer.travel(), self.live_up())
-        } else {
+        let heading = if self.loading_full() {
             0
+        } else {
+            travel_heading(self.stream_pacer.travel(), self.live_up(), self.load_heading)
         };
         if heading != self.load_heading {
             self.load_heading = heading;
@@ -1089,17 +1149,38 @@ impl World {
         }
     }
 
-    /// Whether a new mesh or light job for `coord` is worth admitting.
-    /// No centre yet: every seed is kept, matching the pre-stream lanes.
-    pub(in crate::world) fn admits_mesh(&self, coord: Coord) -> bool {
-        let Some(center) = self.center else {
-            return true;
-        };
-        let folded = self.fold.fold(coord);
-        if chunk_behind(center, folded, self.stream_pacer.travel(), self.live_up()) {
-            return false;
+    /// The speed-reduced loading window. `None` while it is the whole view or
+    /// before the first stream: then every lane keeps its full-view rules.
+    fn load_window(&self) -> Option<LoadWindow> {
+        if self.loading_full() {
+            return None;
         }
-        self.view_contains(self.load_mesh_box(center), coord)
+        let center = self.center?;
+        let up = self.live_up();
+        let volume = self.load_volume();
+        Some(LoadWindow {
+            center,
+            mesh: volume.mesh(center, up),
+            data: volume.data(center, up),
+            travel: self.stream_pacer.travel(),
+            up,
+            trail: self.load_heading != 0,
+        })
+    }
+
+    /// Whether a new mesh job for `coord` is worth admitting: always for the
+    /// full window (the mesh lane checks the draw box itself), else inside the
+    /// reduced mesh box and not behind the player.
+    pub(in crate::world) fn admits_mesh(&self, coord: Coord) -> bool {
+        self.load_window()
+            .is_none_or(|w| w.covers(self.fold.fold(coord), false))
+    }
+
+    /// Whether a light settle for `coord` is worth running. Light covers the
+    /// data box, so a mesh-box edge chunk sees lit neighbours.
+    pub(in crate::world) fn admits_light(&self, coord: Coord) -> bool {
+        self.load_window()
+            .is_none_or(|w| w.covers(self.fold.fold(coord), true))
     }
 
     /// `will_accept_chunk`'s region: the spawn slab always, otherwise the load
@@ -1112,10 +1193,39 @@ impl World {
             return false;
         };
         let folded = self.fold.fold(coord);
-        if chunk_behind(center, folded, self.stream_pacer.travel(), self.live_up()) {
-            return false;
+        match self.load_window() {
+            Some(window) => window.covers(folded, true),
+            None => self.data_box(center).contains(folded),
         }
-        self.view_contains(self.load_data_box(center), coord)
+    }
+
+    /// Record that `coord` is owed a light settle the reduced window dropped.
+    pub(in crate::world) fn owe_light(&mut self, coord: Coord) {
+        if self.chunks.contains_key(&coord) {
+            self.light_owed.insert(coord);
+        }
+    }
+
+    /// Seed the owed settles the loading window covers again. The full window
+    /// covers all of them.
+    fn reseed_owed_light(&mut self) {
+        if self.light_owed.is_empty() {
+            return;
+        }
+        let mut owed = std::mem::take(&mut self.light_owed);
+        let mut seeded = false;
+        owed.retain(|&coord| {
+            if !self.admits_light(coord) {
+                return true;
+            }
+            self.seed_light(coord, super::LightSeed::Store);
+            seeded = true;
+            false
+        });
+        self.light_owed = owed;
+        if seeded {
+            self.light_pending.set();
+        }
     }
 
     /// The data box: the mesh box plus one [`DATA_MARGIN`] shell of voxel data,
@@ -1584,48 +1694,18 @@ impl World {
         // On a round world streaming stands in the chart's storage cells, and the far field on the
         // chart under the eye (also above the near window's reach).
         let (center, far) = self.place_eyes(center);
-        // Eye velocity for prediction. Resets to zero on non-finite values, non-positive dt,
-        // or teleport-sized gaps, so prediction never fires on garbage input.
         let now = crate::sched::now();
-        let (section_vel, pacing_vel, sample_dt) = match self.section_eye_prev {
-            Some((prev, t)) => {
-                let dt = now.duration_since(t).as_secs_f64();
-                let v = (far - prev) / dt;
-                let sane =
-                    far.is_finite() && dt > 0.0 && dt <= MAX_PREDICT_SAMPLE_GAP && v.is_finite();
-                if sane {
-                    // Prediction treats >512 m/s as a discontinuity, but the
-                    // pacer still sees that finite motion. Sustained extreme
-                    // flight therefore sheds load instead of masquerading as
-                    // rest; a one-off teleport gets the same safe one-frame
-                    // shedding and then a gradual recovery.
-                    let prediction = if v.length() <= MAX_PREDICT_SPEED {
-                        v
-                    } else {
-                        DVec3::ZERO
-                    };
-                    (prediction, v, dt)
-                } else {
-                    // Implausible motion (teleport, pause, or faster than
-                    // MAX_PREDICT_SPEED): zero prediction. Far jobs left behind
-                    // by the jump are re-keyed and descheduled by the pool's
-                    // per-epoch sync (the boundary cross bumps the view epoch),
-                    // so no separate purge is needed here.
-                    (DVec3::ZERO, DVec3::ZERO, dt.min(MAX_PREDICT_SAMPLE_GAP))
-                }
-            }
-            None => (DVec3::ZERO, DVec3::ZERO, 0.0),
-        };
-        self.section_vel = section_vel;
-        self.stream_pacer.update(pacing_vel, sample_dt);
-        let queued_near = !self.light_worklist.is_empty()
-            || !self.mesh_worklist.is_empty()
-            || !self.light_inflight.is_empty()
-            || !self.light_apply_queue.is_empty();
-        self.stream_pacer.set_boost(queued_near, self.last_stream_secs);
-        self.last_stream_secs = sample_dt;
-        self.light_admitted_last = 0;
+        // Far-field prediction treats >512 m/s as a teleport and predicts
+        // nothing. Far jobs left behind by a jump are re-keyed and descheduled
+        // by the pool's per-epoch sync, so no separate purge is needed here.
+        let (far_vel, sample_dt) = eye_sample(self.section_eye_prev, far, now);
+        self.section_vel = if far_vel.length() <= MAX_PREDICT_SPEED { far_vel } else { DVec3::ZERO };
         self.section_eye_prev = far.is_finite().then_some((far, now));
+        // The pacer sees the near eye at any finite speed, in the frame the
+        // near window streams in, so its trail filter points the right way.
+        let (travel, travel_dt) = eye_sample(self.near_eye_prev, center, now);
+        self.near_eye_prev = center.is_finite().then_some((center, now));
+        self.light_admitted_last = 0;
         let center_chunk = eye_chunk(center);
         let far_chunk = eye_chunk(far);
         let far_moved = self.set_far_center(far_chunk);
@@ -1651,6 +1731,15 @@ impl World {
         };
         let full_pass = center_moved || up_changed || fold_changed;
         self.center = Some(center_chunk);
+        // A new chart net means the near eye changed frames: that sample's
+        // velocity mixes two storage origins.
+        self.stream_pacer.observe(travel, travel_dt, fold_changed);
+        let queued_near = !self.light_worklist.is_empty()
+            || !self.mesh_worklist.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.light_apply_queue.is_empty();
+        self.stream_pacer.set_boost(queued_near, self.last_stream_secs);
+        self.last_stream_secs = sample_dt;
         // Re-bucket worklists around the live centre before any lane (or pump
         // insert) runs. O(n) once per boundary cross; a no-op when the rings,
         // centre, and up face already match.
@@ -1679,11 +1768,13 @@ impl World {
         let load_heading = self.load_heading;
         let horizontal = self.view.horizontal;
         let section_vel = self.section_vel;
-        let tight = load_h < horizontal || load_v < self.view.vertical;
+        let tight = !self.loading_full();
+        let slab = self.spawn_slab;
         let workers = self.worker_pool();
         if let Some(stager) = stager {
             workers.set_stager(stager);
         }
+        workers.set_slab(slab);
         if tight {
             // The far predictor zeros velocity above its teleport cap. The near
             // window still aims with the real travel, or nothing at several
@@ -1763,75 +1854,49 @@ impl World {
         self.heading_changed = false;
     }
 
-    /// Seed mesh and light for chunks the loading window just took on.
-    /// The full window keeps the shell diff. A reduced window (and the pass
-    /// that leaves one) rescans its own box: the shell of a shrink is empty,
-    /// and a turn leaves holes the shell never sees.
+    /// Seed meshes for chunks the loading window just took on, and the light
+    /// settles it dropped that it covers again. Only the part of the window the
+    /// last seeded box did not hold is new; a changed heading rescans the whole
+    /// window, since the trail it skipped may be wanted now. A reduced window
+    /// first drops queued seeds it no longer covers.
     fn seed_load_window(&mut self, center: Coord) {
-        let reduced = !self.loading_full();
-        if !reduced && !self.load_reduced {
-            let new_box = self.mesh_box(center);
-            let fresh: Vec<Coord> = match self.prev_mesh_box {
-                Some(prev) => self
-                    .view_shell(new_box, prev)
-                    .filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c))
-                    .collect(),
-                None => self
-                    .view_coords(new_box)
-                    .filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c))
-                    .collect(),
-            };
-            self.mesh_worklist.extend(fresh);
-            self.pending_fresh.set();
-            self.prev_mesh_box = Some(new_box);
-            return;
+        if !self.loading_full() {
+            self.prune_admission_worklists();
         }
-        self.prune_admission_worklists();
-        let window = if reduced { self.load_mesh_box(center) } else { self.mesh_box(center) };
-        let coords: Vec<Coord> = self.view_coords(window).collect();
-        let mut lit = false;
-        for coord in coords {
-            if self.awaits_mesh(coord) {
-                self.seed_mesh(coord);
-            }
-            if self.admits_mesh(coord) && self.chunk_needs_light(coord) {
-                self.seed_light(coord, super::LightSeed::Store);
-                lit = true;
-            }
-        }
+        let window = self.load_mesh_box(center);
+        let fresh: Vec<Coord> = match self.prev_mesh_box {
+            Some(prev) if !self.heading_changed => self
+                .view_shell(window, prev)
+                .filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c))
+                .collect(),
+            _ => self
+                .view_coords(window)
+                .filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c))
+                .collect(),
+        };
+        self.mesh_worklist.extend(fresh);
         self.pending_fresh.set();
-        if lit {
-            self.light_pending.set();
-        }
         self.prev_mesh_box = Some(window);
-        self.load_reduced = reduced;
+        self.reseed_owed_light();
     }
 
-    /// Drop mesh and light seeds the loading window will not admit. The
-    /// predicate copies what it needs so it can run while the worklists are
-    /// borrowed.
+    /// Drop queued mesh and light seeds the reduced window does not cover. A
+    /// dropped light seed is owed: [`reseed_owed_light`](Self::reseed_owed_light)
+    /// brings it back once the window covers the chunk again.
     fn prune_admission_worklists(&mut self) {
-        let center = self.center;
-        let travel = self.stream_pacer.travel();
-        let up = self.live_up();
+        let Some(window) = self.load_window() else {
+            return;
+        };
         let fold = self.fold;
-        let mesh = center.map(|c| self.load_mesh_box(c));
-        self.mesh_worklist
-            .retain(|coord| admission_keeps(center, mesh, fold, travel, up, coord));
-        self.light_worklist
-            .retain(|coord| admission_keeps(center, mesh, fold, travel, up, coord));
-    }
-
-    /// A loaded chunk owed a light settle that is not already queued or in flight.
-    fn chunk_needs_light(&self, coord: Coord) -> bool {
-        if !self.lighting
-            || self.light_inflight.contains(&coord)
-            || self.light_worklist.contains(&coord)
-            || self.quarantined.contains(&FailKey::Light { coord })
-        {
-            return false;
-        }
-        self.chunks.get(&coord).is_some_and(|loaded| loaded.light.is_none() || loaded.light_reseed)
+        self.mesh_worklist.retain(|c| window.covers(fold.fold(*c), false));
+        let (chunks, owed) = (&self.chunks, &mut self.light_owed);
+        self.light_worklist.retain(|c| {
+            let keep = window.covers(fold.fold(*c), true);
+            if !keep && chunks.contains_key(c) {
+                owed.insert(*c);
+            }
+            keep
+        });
     }
 
     /// Chunk bucket for the far-field key during very fast flight.
@@ -2127,6 +2192,9 @@ impl World {
     /// Generated chunk result: discard if out-of-range/already loaded; else store (replays edits).
     pub(in crate::world) fn accept_chunk(&mut self, coord: Coord, chunk: Chunk) {
         if !self.will_accept_chunk(coord) {
+            if !self.chunks.contains_key(&coord) {
+                self.gen_discarded += 1;
+            }
             return;
         }
         self.gen_landed += 1;
@@ -2413,6 +2481,14 @@ impl World {
         if !self.pending_gen.take() {
             return Progress::Idle;
         }
+        // Generation for the whole view would land behind a window the
+        // confirmed jump collapses next pass; a dropped jump costs one pass.
+        if self.stream_pacer.holding() {
+            self.pending_gen.set();
+            return Progress::Partial {
+                remaining: self.gen_columns.len() as u32,
+            };
+        }
         if !self.gen_cursor_matches(center) {
             self.rebuild_gen_cursor(center);
         }
@@ -2501,8 +2577,8 @@ impl World {
 
     /// Classify the data box once, store uniform chunks, and queue the rest.
     fn rebuild_gen_cursor(&mut self, center: Coord) {
-        let region = if self.load_h < 0 { self.data_box(center) } else { self.load_data_box(center) };
-        let mut coords: Vec<Coord> = self.view_coords(region).collect();
+        self.gen_cursor_rebuilds += 1;
+        let mut coords: Vec<Coord> = self.view_coords(self.load_data_box(center)).collect();
         if let Some(slab) = self.spawn_slab {
             coords.extend(self.view_coords(slab));
         }
@@ -2600,10 +2676,10 @@ impl World {
         self.admits_new(coord)
     }
 
-    /// A gathered run is still inside the loading window. At rest the cursor
-    /// was built from the full data box, so every run is.
+    /// A gathered run is still inside the loading window. The full window's
+    /// cursor was built from the full data box, so every run is.
     fn run_in_load(&self, run: GenRun) -> bool {
-        if self.loading_full() && self.stream_pacer.speed_mps() <= FULL_EFFORT_SPEED_MPS {
+        if self.loading_full() {
             return true;
         }
         match run {
@@ -2693,11 +2769,13 @@ impl World {
             }
             pipeline::JobKey::Light { coord } => {
                 self.light_inflight.remove(&coord);
-                // A chunk the loading window has left is not owed a re-seed:
-                // reseeding a cancel would queue the same job forever.
-                if rearm && self.admits_mesh(coord) {
+                // Outside the loading window the settle is owed rather than
+                // re-seeded: reseeding a cancel would queue the same job forever.
+                if rearm && self.admits_light(coord) {
                     self.seed_light(coord, super::LightSeed::Store);
                     self.light_pending.set();
+                } else if rearm {
+                    self.owe_light(coord);
                 }
                 // Quarantined light: the chunk never settles, so the mesh
                 // lane's degrade timeout takes over and the terminal flush
@@ -2759,8 +2837,9 @@ impl World {
         let slab = Self::collision_slab(c, up);
         let (far_m, far_view) = (self.far_horizon(), self.far_view(f));
         let view_r = self.view.horizontal;
-        self.worker_pool()
-            .set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up);
+        let workers = self.worker_pool();
+        workers.set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up);
+        workers.set_slab(Some(slab));
         self.submit_slab_columns(slab);
         self.pending_gen.set();
         if self.view_coords(slab).all(|coord| self.chunks.contains_key(&coord)) {
@@ -3137,6 +3216,7 @@ impl World {
             // pile up in the clamped last ring during flight (never visited, re-bucketed on every
             // centre move).
             self.light_worklist.remove(&coord);
+            self.light_owed.remove(&coord);
             self.mesh_worklist.remove(&coord);
             self.light_terminal.remove(&coord);
             self.remesh_stats.forget(coord);
@@ -3520,6 +3600,9 @@ impl World {
         self.light_seed_split.add(source);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             loaded.light_reseed = false;
+        }
+        if !self.light_owed.is_empty() {
+            self.light_owed.remove(&coord);
         }
         self.light_worklist.insert(coord);
     }
@@ -4546,12 +4629,9 @@ impl World {
             && Face::ALL.iter().all(|&f| self.neighbour_light_ready(self.neighbour(coord, f)))
     }
 
-    /// `coord` has a grid, or the reduced window will never schedule its flood.
+    /// `coord` has a grid, or the reduced window will not schedule its flood.
     fn neighbour_light_ready(&self, coord: Coord) -> bool {
-        if self.chunks.get(&coord).is_some_and(|l| l.light.is_some()) {
-            return true;
-        }
-        !self.loading_full() && !self.admits_mesh(coord)
+        self.chunks.get(&coord).is_some_and(|l| l.light.is_some()) || !self.admits_light(coord)
     }
 
     /// True when the 27-neighbourhood has no pending light work. Apply-queue
@@ -4739,44 +4819,64 @@ impl World {
         if self.light_gate.degraded.is_empty() {
             return;
         }
-        let stuck: Vec<Coord> = self.light_gate.degraded.iter().copied().collect();
-        for coord in stuck {
-            match self.chunks.get(&coord).map(|l| &l.state) {
-                // Still building (in-flight result pending) or Dirty (a sync
-                // remesh owns it): another path is about to resolve it.
-                Some(MeshState::NeedsMesh { building: true, .. } | MeshState::Dirty { .. }) => {}
-                // Seeded in the box: the mesh lane admits it.
-                Some(MeshState::NeedsMesh { .. })
-                    if self.in_mesh_box(coord) && self.mesh_worklist.contains(&coord) => {}
-                // Every arm below acts, and only once the 27-neighbourhood has
-                // no pending light work.
-                _ if !self.light_nhood_quiet(coord) => {}
-                // Unloaded out from under the set between marking and here, or
-                // nothing to draw: drop the degraded flag.
-                None | Some(MeshState::Air) => self.mark_degraded(coord, false),
-                // Past the mesh box (unload hysteresis): not drawn, and a
-                // rebuild would fail `in_mesh_box` / be dropped at apply. Drop
-                // the flag so quiescence is not wedged.
-                Some(_) if !self.in_mesh_box(coord) => self.mark_degraded(coord, false),
-                // Settled on a degraded mesh — the stuck case. Rebuild async;
-                // if neighbour light is still missing it will never arrive, so
-                // the terminal set makes the snapshot read missing planes dark.
-                Some(MeshState::Ready(_)) => {
-                    if !self.light_ready(coord) {
-                        self.light_terminal.insert(coord);
-                    }
-                    self.remesh_async(coord);
+        // Taken out so each chunk's flush can touch the rest of the world.
+        let mut degraded = std::mem::take(&mut self.light_gate.degraded);
+        degraded.retain(|&coord| self.flush_degraded(coord));
+        self.light_gate.degraded = degraded;
+    }
+
+    /// One chunk of [`flush_degraded_terminal`](Self::flush_degraded_terminal).
+    /// Returns whether it stays marked degraded.
+    fn flush_degraded(&mut self, coord: Coord) -> bool {
+        match self.chunks.get(&coord).map(|l| &l.state) {
+            // Still building (in-flight result pending) or Dirty (a sync
+            // remesh owns it): another path is about to resolve it.
+            Some(MeshState::NeedsMesh { building: true, .. } | MeshState::Dirty { .. }) => true,
+            // Seeded in the box: the mesh lane admits it.
+            Some(MeshState::NeedsMesh { .. })
+                if self.in_mesh_box(coord) && self.mesh_worklist.contains(&coord) =>
+            {
+                true
+            }
+            // Every arm below acts, and only once the 27-neighbourhood has
+            // no pending light work.
+            _ if !self.light_nhood_quiet(coord) => true,
+            // Unloaded out from under the set between marking and here, or
+            // nothing to draw: drop the degraded flag.
+            None | Some(MeshState::Air) => {
+                self.light_terminal.remove(&coord);
+                false
+            }
+            // Past the mesh box (unload hysteresis): not drawn, and a
+            // rebuild would fail `in_mesh_box` / be dropped at apply. Drop
+            // the flag so quiescence is not wedged.
+            Some(_) if !self.in_mesh_box(coord) => {
+                self.light_terminal.remove(&coord);
+                false
+            }
+            // Outside the reduced loading window: the window's rescan seeds it
+            // once it covers the chunk, and the mark keeps the remesh owed.
+            Some(_) if !self.admits_mesh(coord) => true,
+            // Settled on a degraded mesh — the stuck case. Rebuild async;
+            // if neighbour light is still missing it will never arrive, so
+            // the terminal set makes the snapshot read missing planes dark.
+            Some(MeshState::Ready(_)) => {
+                if !self.light_ready(coord) {
+                    self.light_terminal.insert(coord);
                 }
-                // Admit evicted the seed (a missing neighbour used to fail
-                // `ready`, or this flush ran after that pass's admit). Re-seed
-                // it; mark terminal if neighbour light will not arrive.
-                Some(MeshState::NeedsMesh { .. }) => {
-                    if !self.light_ready(coord) {
-                        self.light_terminal.insert(coord);
-                    }
-                    self.mesh_worklist.insert(coord);
-                    self.pending_fresh.set();
+                self.remesh_async(coord);
+                true
+            }
+            // Admit evicted the seed (a missing neighbour used to fail
+            // `ready`, or this flush ran after that pass's admit). Re-seed
+            // it; mark terminal if neighbour light will not arrive.
+            Some(MeshState::NeedsMesh { .. }) => {
+                if !self.light_ready(coord) {
+                    self.light_terminal.insert(coord);
                 }
+                self.mesh_worklist.insert(coord);
+                self.pending_fresh.set();
+                true
             }
         }
     }
@@ -4830,6 +4930,7 @@ impl World {
             && self.light_worklist.is_empty()
             && self.light_inflight.is_empty()
             && self.light_apply_queue.is_empty()
+            && self.light_owed.is_empty()
     }
 
     /// `None` when LOD2 is off. `Some(n)` is how many desired far cells lack
@@ -5446,6 +5547,26 @@ mod tests {
         assert_eq!(pacer.load_radius(16), 16, "standing still grows the window back");
     }
 
+    /// A teleport, a warp or a frame change moves the eye once: that sample
+    /// does not shrink the window. Flight that keeps moving does.
+    #[test]
+    fn a_one_sample_jump_does_not_shrink_the_loading_window() {
+        let dt = 1.0 / 60.0;
+        let mut pacer = StreamPacer::default();
+        pacer.observe(DVec3::new(3.0, 0.0, 0.0), dt, false);
+        pacer.observe(DVec3::new(5000.0, 0.0, 0.0), dt, false);
+        assert_eq!(pacer.load_radius(16), 16, "a jump waits for confirmation");
+        pacer.observe(DVec3::new(3.0, 0.0, 0.0), dt, false);
+        assert_eq!(pacer.load_radius(16), 16, "walking on drops the jump");
+        pacer.observe(DVec3::new(5000.0, 0.0, 0.0), dt, true);
+        pacer.observe(DVec3::new(3.0, 0.0, 0.0), dt, false);
+        assert_eq!(pacer.load_radius(16), 16, "a frame change is no velocity");
+        assert!(pacer.speed_mps() <= FULL_EFFORT_SPEED_MPS);
+        pacer.observe(DVec3::new(600.0, 0.0, 0.0), dt, false);
+        pacer.observe(DVec3::new(600.0, 0.0, 0.0), dt, false);
+        assert!(pacer.load_radius(16) <= 3, "sustained flight shrinks it");
+    }
+
     #[test]
     fn chunk_behind_is_travel_only_and_ignores_the_up_axis() {
         let center = Coord::new(0, 0, 0);
@@ -5506,42 +5627,204 @@ mod tests {
         );
     }
 
-    /// The leading face of a reduced window meshes without waiting on a neighbour
-    /// the window will never light. The full window still waits for that grid.
+    /// A reduced window lights its data box, so a mesh-box edge chunk waits for
+    /// its data-shell neighbour. Only a neighbour behind the player, which the
+    /// window will not light, counts as settled. The full window always waits.
     #[test]
-    fn loading_radius_does_not_wait_on_unlit_neighbours_outside_it() {
+    fn loading_window_waits_on_its_data_shell_but_not_on_the_trail() {
         let mut world = World::generate();
         let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
         let center = Coord::new(0, cy, 0);
         let ahead = world.neighbour(center, Face::PosX);
-        assert!(world.chunks.contains_key(&center) && world.chunks.contains_key(&ahead));
-        for &face in &Face::ALL {
-            let n = world.neighbour(center, face);
-            if let Some(loaded) = world.chunks.get_mut(&n) {
+        let behind = world.neighbour(center, Face::NegX);
+        assert!(world.chunks.contains_key(&ahead) && world.chunks.contains_key(&behind));
+        for coord in Face::ALL.map(|f| world.neighbour(center, f)).into_iter().chain([center]) {
+            if let Some(loaded) = world.chunks.get_mut(&coord) {
                 loaded.light = Some(light::LightGrid::dark());
             }
         }
-        world.chunks.get_mut(&center).unwrap().light = Some(light::LightGrid::dark());
-        world.chunks.get_mut(&ahead).unwrap().light = None;
         world.light_worklist.clear();
         world.light_inflight.clear();
         world.center = Some(center);
         world.load_h = 0;
         world.load_v = 0;
+        world.load_heading = 1;
         world.stream_pacer.update(DVec3::new(100.0, 0.0, 0.0), 0.0);
-        assert!(!world.loading_full());
-        assert!(!world.admits_mesh(ahead));
-        assert!(
-            world.light_ready(center),
-            "an unlit neighbour outside the loading window does not block the surface"
-        );
+        world.chunks.get_mut(&behind).unwrap().light = None;
+        assert!(!world.admits_light(behind));
+        assert!(world.light_ready(center), "an unlit neighbour behind the player does not hold the surface");
+        world.chunks.get_mut(&ahead).unwrap().light = None;
+        assert!(world.admits_light(ahead), "the window lights its data shell");
+        assert!(!world.light_ready(center), "the edge waits for that shell's light");
+        world.chunks.get_mut(&ahead).unwrap().light = Some(light::LightGrid::dark());
         world.load_h = world.view.horizontal;
         world.load_v = world.view.vertical;
+        world.load_heading = 0;
         assert!(world.loading_full());
-        assert!(
-            !world.light_ready(center),
-            "the full window still waits for that neighbour's light"
-        );
+        assert!(!world.light_ready(center), "the full window waits for every neighbour");
+    }
+
+    /// A light seed the reduced window drops is owed, not lost. An already-lit
+    /// chunk's border re-settle, dropped by a prune, by the lane's eviction, or
+    /// as a cancelled claim, comes back once the window covers it again.
+    #[test]
+    fn dropped_light_seed_survives_prune_and_regrow() {
+        let mut world = World::generate();
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let center = Coord::new(0, cy, 0);
+        let far = Coord::new(3, cy, 0);
+        assert!(world.chunks.contains_key(&far));
+        world.chunks.get_mut(&far).unwrap().light = Some(light::LightGrid::dark());
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        world.center = Some(center);
+        let shrink = |world: &mut World| {
+            world.load_h = 0;
+            world.load_v = 0;
+            assert!(!world.admits_light(far), "the reduced window does not cover it");
+        };
+        let regrow = |world: &mut World| {
+            world.load_h = world.view.horizontal;
+            world.load_v = world.view.vertical;
+            world.seed_load_window(center);
+            assert!(world.light_worklist.contains(&far), "the regrown window re-seeds it");
+            assert!(world.light_owed.is_empty());
+        };
+
+        world.seed_light(far, super::super::LightSeed::Border);
+        shrink(&mut world);
+        world.prune_admission_worklists();
+        assert!(!world.light_worklist.contains(&far), "the prune drops the seed");
+        assert!(world.light_owed.contains(&far), "and owes the settle");
+        regrow(&mut world);
+
+        shrink(&mut world);
+        world.light_pending.set();
+        super::super::admit::<LightLane>(&mut world, center, Budget::Millis(1.0));
+        assert!(world.light_owed.contains(&far), "the lane's eviction owes it");
+        regrow(&mut world);
+
+        shrink(&mut world);
+        world.light_worklist.remove(&far);
+        world.light_inflight.insert(far);
+        world.cancel_job(pipeline::JobKey::Light { coord: far });
+        assert!(world.light_owed.contains(&far), "a cancelled claim outside the window is owed");
+        regrow(&mut world);
+    }
+
+    /// A flight along a diagonal keeps one heading: samples alternating either
+    /// side of 45 degrees do not flip it, so the generation cursor is not
+    /// rebuilt every pass. A clear turn still switches.
+    #[test]
+    fn near_diagonal_flight_keeps_its_heading() {
+        use crate::render_config::RenderConfig;
+        let mut world = World::with_config_lazy(1, RenderConfig::default());
+        world.set_view_distances(8, 3);
+        world.begin_stream(DVec3::new(8.0, 64.0, 8.0), None);
+        let center = world.center.expect("stream publishes a centre");
+        let (a, b) = (DVec3::new(100.0, 0.0, 96.0), DVec3::new(96.0, 0.0, 100.0));
+        let pass = |world: &mut World, vel: DVec3| {
+            world.stream_pacer.update(vel, 1.0 / 60.0);
+            world.apply_loading_radius();
+            world.pending_gen.set();
+            world.request_region_data(center, Budget::Millis(0.0));
+        };
+        pass(&mut world, a);
+        let heading = world.load_heading;
+        assert_ne!(heading, 0, "a reduced window aims");
+        let rebuilds = world.gen_cursor_rebuilds;
+        for i in 0..20 {
+            pass(&mut world, if i % 2 == 0 { b } else { a });
+            assert_eq!(world.load_heading, heading, "pass {i} flipped the heading");
+        }
+        assert_eq!(world.gen_cursor_rebuilds, rebuilds, "the cursor holds across the diagonal");
+        pass(&mut world, DVec3::new(0.0, 0.0, 140.0));
+        assert_ne!(world.load_heading, heading, "a clear turn switches");
+    }
+
+    /// Whether `coord` is drawn: a final mesh or nothing to draw.
+    fn drawn(world: &World, coord: Coord) -> bool {
+        world
+            .chunks
+            .get(&coord)
+            .is_some_and(|l| matches!(l.state, MeshState::Air | MeshState::Ready(_)))
+    }
+
+    /// The round start world at view `(h, v)`, far field off, spawn slab landed.
+    fn spawned_round_world(h: i32, v: i32) -> (World, DVec3) {
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        let render = RenderConfig { lod2: false, ..RenderConfig::default() };
+        let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+        world.set_view_distances(h, v);
+        let spawn = world.chart_spawn().expect("the start world is charted");
+        world.prepare_around(spawn);
+        world.drive_spawn_ready();
+        (world, spawn)
+    }
+
+    /// Every loaded chunk of the data box has a settled grid.
+    fn assert_data_box_lit(world: &World) {
+        let center = world.center.expect("streamed");
+        for coord in world.view_coords(world.data_box(center)) {
+            if let Some(loaded) = world.chunks.get(&coord) {
+                assert!(loaded.light.is_some(), "{coord:?} in the data box has no light");
+            }
+        }
+    }
+
+    /// At rest the loading window is the whole view and light covers the data
+    /// box: every loaded chunk there settles, so no mesh-box edge chunk is
+    /// promoted on dark planes for a neighbour that never lights.
+    #[test]
+    fn rest_lights_the_data_box_and_promotes_nothing_on_dark_planes() {
+        let (mut world, spawn) = spawned_round_world(4, 2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !world.entry_complete() {
+            assert!(Instant::now() < deadline, "rest did not converge: {}", world.entry_debug());
+            super::flight_bench::step(&mut world, spawn);
+            assert!(world.light_terminal.is_empty(), "a chunk was promoted on dark planes");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(world.loading_full());
+        assert_data_box_lit(&world);
+        assert!(world.light_owed.is_empty());
+    }
+
+    /// Flying fast, then holding just above walking speed until the window is
+    /// whole again, then stopping: the whole draw box ends drawn, including the
+    /// trail the flight skipped, and no light settle stays owed.
+    #[test]
+    fn flight_then_stop_fills_the_whole_view() {
+        let (mut world, spawn) = spawned_round_world(6, 3);
+        let mut eye = spawn;
+        let fly = |world: &mut World, eye: &mut DVec3, speed: f64, secs: f64| {
+            let start = Instant::now();
+            let mut last = start;
+            while start.elapsed().as_secs_f64() < secs {
+                let now = Instant::now();
+                *eye += DVec3::X * (speed * (now - last).as_secs_f64());
+                last = now;
+                super::flight_bench::step(world, *eye);
+                std::thread::sleep(Duration::from_millis(8));
+            }
+        };
+        fly(&mut world, &mut eye, 100.0, 2.0);
+        assert!(world.load_h < world.view.horizontal, "100 m/s reduces the window");
+        fly(&mut world, &mut eye, 25.0, 3.5);
+        assert!(world.loading_full(), "25 m/s grows the window back to the view");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            super::flight_bench::step(&mut world, eye);
+            let center = world.center.expect("streamed");
+            let whole = world.view_coords(world.mesh_box(center)).all(|c| drawn(&world, c));
+            if whole && world.light_owed.is_empty() && world.entry_complete() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the view did not fill after stopping: {}", world.entry_debug());
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert_data_box_lit(&world);
     }
 
     /// A degraded drawn chunk whose neighbourhood becomes light-ready WITHOUT

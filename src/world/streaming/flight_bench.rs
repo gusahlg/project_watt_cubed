@@ -177,8 +177,59 @@ fn frame(w: &mut World, eye: DVec3, laps: &mut Laps) -> bool {
     full_pass
 }
 
+/// One untimed `stream` frame at `eye`, for the streaming convergence tests.
+pub(super) fn step(w: &mut World, eye: DVec3) -> bool {
+    let zero = [Duration::ZERO; PHASES.len()];
+    let full = frame(w, eye, &mut Laps { at: Instant::now(), sum: zero, full: zero, in_full: false });
+    mesh_free_log::take();
+    full
+}
+
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// One per-second look at the near field: the loading window's Ready share and the full draw
+/// box's, with the loading radii.
+struct Sample {
+    t: f64,
+    load: (usize, usize),
+    full: (usize, usize),
+    lh: i32,
+    lv: i32,
+}
+
+impl Sample {
+    fn take(w: &World, t: f64) -> Self {
+        Self { t, load: load_window_ready(w), full: full_window_ready(w), lh: w.load_h, lv: w.load_v }
+    }
+
+    fn print(&self, tag: &str) {
+        let pct = |(ready, want): (usize, usize)| if want == 0 { 100.0 } else { ready as f64 * 100.0 / want as f64 };
+        println!(
+            "  {tag}t={:.0}s load window {}/{} ({:.1}%) full window {}/{} ({:.1}%) load=({},{})",
+            self.t,
+            self.load.0,
+            self.load.1,
+            pct(self.load),
+            self.full.0,
+            self.full.1,
+            pct(self.full),
+            self.lh,
+            self.lv,
+        );
+    }
+}
+
+/// Mean, p50, p95 and max of frame times (sorts `v`).
+fn frame_stats(v: &mut [f32]) -> (f32, f32, f32, f32) {
+    if v.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    v.sort_by(f32::total_cmp);
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    let at = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
+    (mean, at(0.5), at(0.95), v[v.len() - 1])
 }
 
 /// Settle at rest, then fly +X at `speed` for `secs`, frames paced to `hz`.
@@ -223,13 +274,15 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     let jobs_cancel0 = w.jobs_cancelled;
     let gen0 = w.gen_landed;
     let behind0 = w.gen_landed_behind;
+    let discarded0 = w.gen_discarded;
+    let rebuilds0 = w.gen_cursor_rebuilds;
     let (mut near_sum, mut far_sum) = (0u64, 0u64);
     let (mut near_max, mut far_max) = (0usize, 0usize);
     let (mut workers_min, mut workers_max) = (usize::MAX, 0usize);
     let (mut mesh_max, mut light_max, mut gen_max) = (0usize, 0usize, 0usize);
     let mut effort_min = f32::MAX;
     let mut next_sample = 1.0f64;
-    let mut window_samples: Vec<(f64, usize, usize, i32, i32)> = Vec::new();
+    let mut window_samples: Vec<Sample> = Vec::new();
     let mut last_eye = spawn;
     let t0 = Instant::now();
     loop {
@@ -263,11 +316,12 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         gen_max = gen_max.max(w.generating.len());
         effort_min = effort_min.min(w.stream_pacer.effort());
         if flown >= next_sample {
-            let (ready, want) = load_window_ready(&w);
-            window_samples.push((flown, ready, want, w.load_h, w.load_v));
+            window_samples.push(Sample::take(&w, flown));
             let [absent, generating, building, waiting] = load_window_misses(&w);
             println!(
-                "  t={flown:.0}s miss absent={absent} generating={generating} building={building} waiting={waiting}"
+                "  t={flown:.0}s miss absent={absent} generating={generating} building={building} waiting={waiting} \
+                 | discarded so far={}",
+                w.gen_discarded - discarded0,
             );
             next_sample += 1.0;
         }
@@ -275,8 +329,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     }
     // Counters and the end window are the flight, not the standstill afterwards.
     let flown = t0.elapsed().as_secs_f64();
-    let (end_ready, end_want) = load_window_ready(&w);
-    let (end_lh, end_lv) = (w.load_h, w.load_v);
+    let end = Sample::take(&w, flown);
     let end_chunks = w.chunks.len();
     let end_mesh = w.mesh_worklist.len();
     let end_not_mesh = w.mesh_worklist.iter().filter(|c| !w.is_needs_mesh(**c)).count();
@@ -290,20 +343,13 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     let jobs_cancel = w.jobs_cancelled - jobs_cancel0;
     let generated = w.gen_landed - gen0;
     let behind = w.gen_landed_behind - behind0;
-    let stop_samples = hold_still(&mut w, last_eye, &pace);
+    let discarded = w.gen_discarded - discarded0;
+    let rebuilds = w.gen_cursor_rebuilds - rebuilds0;
+    let mut stop = hold_still(&mut w, last_eye, &pace);
     let frames = ms.len();
-    let stats = |v: &mut Vec<f32>| -> (f32, f32, f32, f32) {
-        if v.is_empty() {
-            return (0.0, 0.0, 0.0, 0.0);
-        }
-        v.sort_by(f32::total_cmp);
-        let mean = v.iter().sum::<f32>() / v.len() as f32;
-        let at = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
-        (mean, at(0.5), at(0.95), v[v.len() - 1])
-    };
     let total: f32 = ms.iter().sum();
-    let (mean, p50, p95, max) = stats(&mut ms);
-    let (cmean, _, cp95, cmax) = stats(&mut cross_ms);
+    let (mean, p50, p95, max) = frame_stats(&mut ms);
+    let (cmean, _, cp95, cmax) = frame_stats(&mut cross_ms);
     println!(
         "flight {speed} m/s: frames={frames} ({:.0}/s) main ms/frame mean={mean:.3} p50={p50:.3} \
          p95={p95:.3} max={max:.2} busy={:.1}% | full passes={} mean={cmean:.3} p95={cp95:.3} \
@@ -331,60 +377,90 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         "  queues: near mean={:.1} max={near_max} far mean={:.1} max={far_max} | \
          workers {workers_min}..={workers_max} effort_min={effort_min:.3} | \
          peaks mesh={mesh_max} light={light_max} generating={gen_max} | \
-         jobs completed={jobs_done} cancelled={jobs_cancel} | generated={generated} landed_behind={behind}",
+         jobs completed={jobs_done} cancelled={jobs_cancel} | generated={generated} \
+         wasted={} (landed_behind={behind} discarded={discarded}) | gen cursor rebuilds={rebuilds}",
         near_sum as f64 / n,
         far_sum as f64 / n,
+        behind + discarded,
     );
-    for (t, ready, want, lh, lv) in &window_samples {
-        let frac = if *want == 0 { 1.0 } else { *ready as f64 / *want as f64 };
-        println!("  t={t:.0}s window {ready}/{want} ({:.1}%) load=({lh},{lv})", frac * 100.0);
+    for sample in &window_samples {
+        sample.print("");
     }
-    let frac = if end_want == 0 { 1.0 } else { end_ready as f64 / end_want as f64 };
-    println!(
-        "  end window {end_ready}/{end_want} ({:.1}%) load=({end_lh},{end_lv})",
-        frac * 100.0,
-    );
-    for (t, ready, want, lh, lv) in &stop_samples {
-        let frac = if *want == 0 { 1.0 } else { *ready as f64 / *want as f64 };
-        println!("  stop t={t:.0}s window {ready}/{want} ({:.1}%) load=({lh},{lv})", frac * 100.0);
+    end.print("end ");
+    if !stop.ms.is_empty() {
+        let stop_frames = stop.ms.len();
+        let (_, gp50, gp95, gmax) = frame_stats(&mut stop.ms[..stop.regrow_frames]);
+        let (smean, sp50, sp95, smax) = frame_stats(&mut stop.ms);
+        let full_at = stop
+            .samples
+            .iter()
+            .find(|s| s.full.1 > 0 && s.full.0 * 100 >= s.full.1 * 99)
+            .map_or_else(|| "never".to_string(), |s| format!("{:.0}s", s.t));
+        println!(
+            "  stop: frames={stop_frames} main ms/frame mean={smean:.3} p50={sp50:.3} p95={sp95:.3} max={smax:.2} | \
+             regrow frames={} p50={gp50:.3} p95={gp95:.3} max={gmax:.2} gen cursor rebuilds={} | \
+             full window 99% Ready at {full_at}",
+            stop.regrow_frames,
+            stop.regrow_rebuilds,
+        );
+    }
+    for sample in &stop.samples {
+        sample.print("stop ");
     }
     if env_or("FLIGHT_ASSERT", 0) == 1 && view == (16, 5) {
-        assert_flight(speed, p95, workers_min, mesh_max, light_max, &window_samples, &stop_samples, &w);
+        assert_flight(speed, p95, workers_min, mesh_max, light_max, &window_samples, &stop.samples);
     }
 }
 
-/// Hold `eye` still so the loading window can grow back to the full view.
-fn hold_still(
-    w: &mut World,
-    eye: DVec3,
-    pace: &impl Fn(&mut World, Instant),
-) -> Vec<(f64, usize, usize, i32, i32)> {
-    let stop = env_or("FLIGHT_STOP", 0.0);
-    if stop <= 0.0 {
-        return Vec::new();
+/// The standstill after a flight: per-second samples, every frame's main-thread time, how
+/// many of those frames ran before the loading window was whole again, and the
+/// generation-cursor rebuilds in them.
+struct Stop {
+    samples: Vec<Sample>,
+    ms: Vec<f32>,
+    regrow_frames: usize,
+    regrow_rebuilds: u64,
+}
+
+/// Hold `eye` still for `FLIGHT_STOP` seconds so the loading window can grow back to the
+/// full view.
+fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) -> Stop {
+    let secs = env_or("FLIGHT_STOP", 0.0);
+    let mut stop = Stop { samples: Vec::new(), ms: Vec::new(), regrow_frames: 0, regrow_rebuilds: 0 };
+    if secs <= 0.0 {
+        return stop;
     }
     let zero = [Duration::ZERO; PHASES.len()];
     let mut laps = Laps { at: Instant::now(), sum: zero, full: zero, in_full: false };
-    let mut samples = Vec::new();
+    let rebuilds0 = w.gen_cursor_rebuilds;
+    let mut regrowing = true;
     let mut next = 1.0f64;
     let t0 = Instant::now();
     loop {
         let held = t0.elapsed().as_secs_f64();
-        if held >= stop {
+        if held >= secs {
             break;
         }
         let start = Instant::now();
         frame(w, eye, &mut laps);
+        stop.ms.push(start.elapsed().as_secs_f32() * 1e3);
+        if regrowing && w.loading_full() {
+            regrowing = false;
+            stop.regrow_frames = stop.ms.len();
+            stop.regrow_rebuilds = w.gen_cursor_rebuilds - rebuilds0;
+        }
         if held >= next {
-            let (ready, want) = load_window_ready(w);
-            samples.push((held, ready, want, w.load_h, w.load_v));
+            stop.samples.push(Sample::take(w, held));
             next += 1.0;
         }
         pace(w, start);
     }
-    let (ready, want) = load_window_ready(w);
-    samples.push((t0.elapsed().as_secs_f64(), ready, want, w.load_h, w.load_v));
-    samples
+    if regrowing {
+        stop.regrow_frames = stop.ms.len();
+        stop.regrow_rebuilds = w.gen_cursor_rebuilds - rebuilds0;
+    }
+    stop.samples.push(Sample::take(w, t0.elapsed().as_secs_f64()));
+    stop
 }
 
 /// Acceptance for the owner's view: the reduced window stays ready at 100 m/s,
@@ -395,26 +471,23 @@ fn assert_flight(
     workers_min: usize,
     mesh_max: usize,
     light_max: usize,
-    window: &[(f64, usize, usize, i32, i32)],
-    stop: &[(f64, usize, usize, i32, i32)],
-    w: &World,
+    window: &[Sample],
+    stop: &[Sample],
 ) {
     assert!(workers_min > 2, "{speed} m/s parked workers at {workers_min}");
     assert!(mesh_max < 8_000 && light_max < 8_000, "{speed} m/s worklists mesh={mesh_max} light={light_max}");
     if speed >= 600.0 {
         assert!(p95 < 2.25, "{speed} m/s p95 {p95:.3} ms");
     }
+    let share = |(ready, want): (usize, usize)| ready as f64 / want.max(1) as f64;
     if (speed - 100.0).abs() < 1.0 {
-        for (t, ready, want, _, _) in window.iter().filter(|(t, _, _, _, _)| *t >= 3.0) {
-            let frac = *ready as f64 / (*want).max(1) as f64;
-            assert!(frac > 0.90, "t={t:.0}s loading window {ready}/{want} ({frac:.1})");
+        for s in window.iter().filter(|s| s.t >= 3.0) {
+            assert!(share(s.load) > 0.90, "t={:.0}s loading window {:?}", s.t, s.load);
         }
     }
-    if let Some((_, ready, want, lh, lv)) = stop.last() {
-        assert!(*lh >= 16 && *lv >= 5, "stopping left the window at ({lh},{lv})");
-        let frac = *ready as f64 / (*want).max(1) as f64;
-        assert!(frac > 0.90, "after stopping {ready}/{want} ({frac:.1})");
-        let _ = w;
+    if let Some(s) = stop.last() {
+        assert!(s.lh >= 16 && s.lv >= 5, "stopping left the window at ({},{})", s.lh, s.lv);
+        assert!(share(s.full) > 0.90, "after stopping the full window is {:?}", s.full);
     }
 }
 
@@ -429,12 +502,27 @@ fn load_window_ready(w: &World) -> (usize, usize) {
             continue;
         }
         want += 1;
-        let done = w.chunks.get(&coord).is_some_and(|loaded| {
-            matches!(loaded.state, MeshState::Air | MeshState::Ready(_))
-        });
-        ready += usize::from(done);
+        ready += usize::from(drawn(w, coord));
     }
     (ready, want)
+}
+
+/// The whole draw box (the full view radius, behind the player included) and how much of it
+/// is drawn.
+fn full_window_ready(w: &World) -> (usize, usize) {
+    let Some(center) = w.center else { return (0, 0) };
+    let (mut ready, mut want) = (0usize, 0usize);
+    for coord in w.view_coords(w.mesh_box(center)) {
+        want += 1;
+        ready += usize::from(drawn(w, coord));
+    }
+    (ready, want)
+}
+
+fn drawn(w: &World, coord: Coord) -> bool {
+    w.chunks
+        .get(&coord)
+        .is_some_and(|loaded| matches!(loaded.state, MeshState::Air | MeshState::Ready(_)))
 }
 
 /// Unready chunks inside the loading window: not stored, claimed by generation,

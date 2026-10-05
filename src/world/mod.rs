@@ -1116,20 +1116,25 @@ pub struct World {
     load_v: i32,
     load_moved: bool,
     heading_changed: bool,
-    /// The loading window was smaller than the view, so the next full-radius
-    /// pass seeds the chunks that window never asked for.
-    load_reduced: bool,
     load_heading: i8,
+    /// Loaded chunks whose light seed or claim the reduced loading window
+    /// dropped. They re-seed once the window covers them again; unload forgets
+    /// them.
+    light_owed: FastSet<Coord>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
     /// Worker results integrated, and claim keys released by deschedule.
     /// The flight bench reads these; a quiet frame does not touch them.
     jobs_completed: u64,
     jobs_cancelled: u64,
-    /// Chunks stored from a generate result, and how many of those were already
-    /// behind the player (the flight bench's wasted-work count).
+    /// Chunks stored from a generate result, how many of those were already
+    /// behind the player, and results dropped because the loading window had
+    /// left them (the flight bench's wasted-work counts).
     gen_landed: u64,
     gen_landed_behind: u64,
+    gen_discarded: u64,
+    /// Generation run-list rebuilds (the flight bench's regrow cost).
+    gen_cursor_rebuilds: u64,
     /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
     building_meshes: usize,
     /// `SectionState::Meshing` claims. Counter so idle `pump` never scans sections.
@@ -1295,15 +1300,17 @@ pub struct World {
     /// The bake's `(body, face, anchor_u, anchor_v)`. `None` until a bake is spawned;
     /// readers then do not filter summaries by face.
     section_mip_anchor: Option<(u16, Face, i32, i32)>,
-    /// Previous stream eye + timestamp for velocity computation.
+    /// Previous far-field eye + timestamp for velocity computation.
     /// Reset to None on teleport or first stream.
     section_eye_prev: Option<(DVec3, Instant)>,
+    /// Previous near-window eye + timestamp: the pacer's travel sample.
+    near_eye_prev: Option<(DVec3, Instant)>,
     /// Eye velocity (m/s) from successive stream centres.
     /// Zero at rest or after teleport.
     section_vel: DVec3,
-    /// Velocity-aware load controller. Fast travel deliberately lowers worker,
-    /// admission, result-integration, and upload pressure; capacity recovers
-    /// gradually after stopping so the first stationary frame cannot hitch.
+    /// Velocity-aware load controller. Fast travel shrinks the loading window
+    /// and lowers admission, result-integration, and upload pressure; both
+    /// recover gradually after stopping so the first stationary frame cannot hitch.
     stream_pacer: streaming::StreamPacer,
     /// Wall time of the previous [`World::stream`] topology pass. The rest-time
     /// worker boost uses it as the frame-headroom signal.
@@ -1547,13 +1554,15 @@ impl World {
             load_v: -1,
             load_moved: false,
             heading_changed: false,
-            load_reduced: false,
             load_heading: 0,
+            light_owed: FastSet::default(),
             generating: FastSet::default(),
             jobs_completed: 0,
             jobs_cancelled: 0,
             gen_landed: 0,
             gen_landed_behind: 0,
+            gen_discarded: 0,
+            gen_cursor_rebuilds: 0,
             building_meshes: 0,
             meshing_sections: 0,
             pending_gen: Sticky::default(),
@@ -1610,6 +1619,7 @@ impl World {
             section_face_set: false,
             section_mip_anchor: None,
             section_eye_prev: None,
+            near_eye_prev: None,
             section_vel: DVec3::ZERO,
             stream_pacer: streaming::StreamPacer::default(),
             last_stream_secs: 0.0,
@@ -2237,6 +2247,8 @@ pub(in crate::world) enum Candidates {
 pub(in crate::world) struct AdmitScratch<K> {
     keys: Vec<(u64, K)>,
     blocked: Vec<K>,
+    /// A geometry lane's bounded nearest-first shortlist.
+    rank: Vec<(u64, K)>,
 }
 
 impl<K> Default for AdmitScratch<K> {
@@ -2244,6 +2256,7 @@ impl<K> Default for AdmitScratch<K> {
         Self {
             keys: Vec::new(),
             blocked: Vec::new(),
+            rank: Vec::new(),
         }
     }
 }
@@ -2302,9 +2315,15 @@ pub(in crate::world) trait StreamLane {
         let _ = (world, center, key);
         None
     }
-    /// Geometry-lane candidate visit. Worklist lanes leave this unused.
-    fn for_each_geometry(world: &World, center: Coord, visit: impl FnMut(Self::Key)) {
-        let _ = (world, center, visit);
+    /// Geometry-lane candidate visit; `rank` is a reusable shortlist buffer.
+    /// Worklist lanes leave this unused.
+    fn for_each_geometry(
+        world: &World,
+        center: Coord,
+        rank: &mut Vec<(u64, Self::Key)>,
+        visit: impl FnMut(Self::Key),
+    ) {
+        let _ = (world, center, rank, visit);
     }
     /// Build the worker job for `key`, or `None` to drop it.
     /// May warm caches but must not mutate lane state.
@@ -2370,7 +2389,7 @@ fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budge
     // A full section budget refuses every candidate. That is not a drained
     // backlog: clearing pending here left the holes disarmed on a still camera.
     let mut refused = false;
-    S::for_each_geometry(world, center, |k| {
+    S::for_each_geometry(world, center, &mut scratch.rank, |k| {
         if S::in_flight(world, k) {
             return;
         }
@@ -2761,52 +2780,52 @@ impl StreamLane for SectionLane {
     fn pending(world: &mut World) -> &mut Sticky {
         &mut world.pending_sections
     }
-    fn for_each_geometry(world: &World, center: Coord, mut visit: impl FnMut(SectionPos)) {
-        let consider = |s: SectionPos, visit: &mut dyn FnMut(SectionPos)| {
-            if !world.sections.contains_key(&s)
-                && !world
-                    .quarantined
-                    .contains(&streaming::FailKey::Section { pos: s })
-                && !world.coverage_skips(center, s)
-            {
-                visit(s);
-            }
+    fn for_each_geometry(
+        world: &World,
+        center: Coord,
+        rank: &mut Vec<(u64, SectionPos)>,
+        mut visit: impl FnMut(SectionPos),
+    ) {
+        let hole = |s: &SectionPos| {
+            !world.sections.contains_key(s)
+                && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
         };
         // At rest every hole is a candidate. While moving, the deadline submits
-        // only a few, so rank a fixed handful by chess distance before the hash
-        // and coverage checks. Scanning the whole frontier every chunk step is
-        // what made a fast frame grow with speed.
+        // only a few, so keep the nearest handful of holes. Residency is the
+        // cheap filter and runs first: the nearest sections are almost always
+        // resident. The coverage proof runs only on a hole that would enter
+        // the shortlist.
         if world.stream_pacer.effort() >= 1.0 || world.stream_pacer.boosting() {
-            for &s in &world.section_desired {
-                consider(s, &mut visit);
+            for s in world.section_desired.iter().copied().filter(hole) {
+                if !world.coverage_skips(center, s) {
+                    visit(s);
+                }
             }
             return;
         }
         const CAP: usize = 32;
-        let mut best: Vec<(u64, SectionPos)> = Vec::with_capacity(CAP);
-        let mut ranked = false;
-        for &s in &world.section_desired {
+        rank.clear();
+        for s in world.section_desired.iter().copied().filter(hole) {
             let d = Self::order(world, center, s);
-            if !ranked {
-                best.push((d, s));
-                if best.len() == CAP {
-                    best.sort_unstable_by_key(|e| e.0);
-                    ranked = true;
-                }
+            if rank.len() == CAP && d >= rank[CAP - 1].0 {
                 continue;
             }
-            if d >= best[CAP - 1].0 {
+            if world.coverage_skips(center, s) {
                 continue;
             }
-            best[CAP - 1] = (d, s);
-            let mut i = CAP - 1;
-            while i > 0 && best[i].0 < best[i - 1].0 {
-                best.swap(i, i - 1);
+            if rank.len() == CAP {
+                rank[CAP - 1] = (d, s);
+            } else {
+                rank.push((d, s));
+            }
+            let mut i = rank.len() - 1;
+            while i > 0 && rank[i].0 < rank[i - 1].0 {
+                rank.swap(i, i - 1);
                 i -= 1;
             }
         }
-        for (_, s) in best {
-            consider(s, &mut visit);
+        for &(_, s) in rank.iter() {
+            visit(s);
         }
     }
     fn order(_world: &World, center: Coord, key: SectionPos) -> u64 {
@@ -2935,13 +2954,16 @@ impl StreamLane for LightLane {
         world.light_inflight.contains(&key)
     }
     fn ready(world: &World, key: Coord) -> bool {
-        world.admits_mesh(key)
+        world.admits_light(key)
+    }
+    fn on_blocked(world: &mut World, key: Coord) {
+        // Outside the reduced loading window: the chunk still owes this settle.
+        world.owe_light(key);
     }
     fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
         // `trivial_light` is decided at store time. A worklist seed here is a
         // real re-settle (neighbour border / edit) and must run the flood.
-        if !world.admits_mesh(key)
-            || !world.lighting
+        if !world.lighting
             || !world.chunks.contains_key(&key)
             || world
                 .quarantined

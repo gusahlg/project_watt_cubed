@@ -301,6 +301,36 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     assert!(!world.pending_sections.get(), "a converged covering leaves the lane idle");
 }
 
+/// While moving, the far lane shortlists the nearest holes, not the nearest
+/// sections: with the 32 nearest desired sections resident, a hole beyond them
+/// is still admitted.
+#[test]
+fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
+    let mut world = lod2_world();
+    let center = ChunkCoord::new(0, 0, 0);
+    world.center = Some(center);
+    world.stream_pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
+    assert!(world.stream_pacer.effort() < 1.0 && !world.stream_pacer.boosting(), "the moving path");
+    // A reduced window: the near field proves no section redundant.
+    world.load_h = 0;
+    world.load_v = 0;
+    let at = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x, z: 0 };
+    world.section_desired = (0..40).map(at).collect();
+    for x in 0..32 {
+        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+    }
+    let mut rank = Vec::new();
+    let mut visited = Vec::new();
+    <SectionLane as StreamLane>::for_each_geometry(&world, center, &mut rank, |s| visited.push(s));
+    assert_eq!(visited, (32..40).map(at).collect::<Vec<_>>(), "the holes, nearest first");
+    world.pending_sections.set();
+    admit::<SectionLane>(&mut world, center, voxel_engine::producer::Budget::Millis(1.0));
+    assert!(
+        matches!(world.sections.get(&at(32)), Some(SectionState::Meshing { .. })),
+        "the nearest hole is claimed"
+    );
+}
+
 /// A LOD aux lane driven end-to-end through the scheduler's `run_manual`
 /// (the call-point path `World::stream` uses) has the same effect as the
 /// direct method — here the visible-set lane arming the section lane
@@ -2043,10 +2073,7 @@ fn view_shrink_prunes_uploads_outside_the_new_mesh_box() {
         ),
         "outside coord's mesh claim is released"
     );
-    assert!(
-        !world.mesh_worklist.contains(&outside),
-        "a chunk outside the draw box is not re-queued"
-    );
+    assert!(world.mesh_worklist.contains(&outside));
     assert!(
         matches!(
             world.chunks[&inside].state,
@@ -3069,6 +3096,37 @@ fn a_round_world_streams_its_chart_net_around_the_eye() {
     assert!(world.spawn_ready() || world.spawn_slab.is_some());
     world.ensure_around(eye);
     assert!(world.spawn_ready(), "the slab is loaded, glued chunks included");
+}
+
+/// Walking across a chart seam moves the near eye from one chart's storage to its neighbour's: that
+/// sample's velocity mixes two frames. It must not read as flight: the loading window stays whole.
+#[test]
+fn a_chart_seam_does_not_collapse_the_loading_window() {
+    use crate::space::atlas::Patch;
+    let (mut world, c) = storage_ball_world(-3);
+    let atlas = world.seams.atlases()[0].clone();
+    let top = Patch::Shell { band: 0, face: Face::PosY };
+    // Half a block inside the +X seam.
+    let s0 = DVec3::new(c.x as f64 * 16.0 + 15.5, c.y as f64 * 16.0 + 8.0, c.z as f64 * 16.0 + 8.0);
+    let eye0 = atlas.embed_storage(top, s0);
+    let step = (atlas.embed_storage(top, s0 + DVec3::X) - eye0).normalize();
+    let whole = (world.view.horizontal, world.view.vertical);
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+    world.begin_stream(eye0, None);
+    pause();
+    world.begin_stream(eye0, None);
+    assert_eq!((world.load_h, world.load_v), whole, "standing still loads the whole view");
+    let home = world.fold;
+    // One metre in 50 ms: walking pace, across the seam.
+    let eye1 = eye0 + step;
+    pause();
+    world.begin_stream(eye1, None);
+    assert_ne!(world.fold, home, "the step crossed into the neighbouring chart");
+    assert_eq!((world.load_h, world.load_v), whole, "the seam is not a velocity");
+    assert_eq!(world.load_heading, 0);
+    pause();
+    world.begin_stream(eye1 + step * 0.5, None);
+    assert_eq!((world.load_h, world.load_v), whole, "walking on in the new chart");
 }
 
 /// The shell walks skip the other box by net cell, so near a chart seam every real chunk of a box

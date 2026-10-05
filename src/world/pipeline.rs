@@ -723,6 +723,10 @@ pub(in crate::world) struct ViewGate {
     /// identity off charts.
     far_fold: std::sync::RwLock<super::seam::Unfold>,
     far_folded: std::sync::atomic::AtomicBool,
+    /// The spawn or teleport slab physics is waiting on, in the centre's net:
+    /// its jobs always run. `slab_set` keeps the lock off the common path.
+    slab: std::sync::RwLock<Option<crate::coord::ChunkBox>>,
+    slab_set: std::sync::atomic::AtomicBool,
     /// Velocity-aware concurrency and near-queue lookahead. Both are published
     /// by the main thread from the world's single streaming pacer.
     active_workers: AtomicUsize,
@@ -754,6 +758,8 @@ impl ViewGate {
             folded: std::sync::atomic::AtomicBool::new(false),
             far_fold: std::sync::RwLock::new(super::seam::Unfold::IDENTITY),
             far_folded: std::sync::atomic::AtomicBool::new(false),
+            slab: std::sync::RwLock::new(None),
+            slab_set: std::sync::atomic::AtomicBool::new(false),
             active_workers: AtomicUsize::new(1),
             // Permissive until a real Workers pool publishes its capacity;
             // direct queue tests and non-streaming users retain legacy behavior.
@@ -899,6 +905,27 @@ impl ViewGate {
         }
     }
 
+    /// Publish the pending spawn slab. Offered every pass: no slab before and
+    /// after is one atomic load.
+    fn set_slab(&self, slab: Option<crate::coord::ChunkBox>) {
+        if slab.is_none() && !self.slab_set.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut cur = self.slab.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cur = slab;
+        self.slab_set.store(slab.is_some(), Ordering::Relaxed);
+    }
+
+    /// Whether `c` (already in the centre's net) is in the pending spawn slab.
+    fn in_slab(&self, c: Coord) -> bool {
+        self.slab_set.load(Ordering::Relaxed)
+            && self
+                .slab
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|b| b.contains(c))
+    }
+
     /// Store `fold` in `slot`; returns whether it changed. The far net is offered every pass, so
     /// an unchanged net takes only the read lock.
     fn store_fold(
@@ -918,15 +945,6 @@ impl ViewGate {
         true
     }
 
-    /// Chess distance from the live centre across the up face (+Y: the XZ
-    /// chess this gate always used), 3-D chess when isotropic; `0` while
-    /// permissive. Distance along the up axis never deschedules, as before.
-    /// A job in a neighbouring chart is measured where the chart net puts it.
-    fn dist(&self, x: i32, y: i32, z: i32) -> i32 {
-        let (x, y, z) = self.folded(x, y, z);
-        self.dist_in_net(x, y, z)
-    }
-
     /// A job chunk's place in the chart net (itself off round worlds).
     #[inline]
     fn folded(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
@@ -937,7 +955,11 @@ impl ViewGate {
         (c.x, c.y, c.z)
     }
 
-    /// [`dist`](Self::dist) of a chunk already placed in the net.
+    /// Chess distance from the live centre across the up face (+Y: the XZ
+    /// chess this gate always used), 3-D chess when isotropic; `0` while
+    /// permissive. The chunk is already placed in the chart net
+    /// ([`folded`](Self::folded)), so a job in a neighbouring chart is
+    /// measured where the net puts it.
     fn dist_in_net(&self, x: i32, y: i32, z: i32) -> i32 {
         if self.radius.load(Ordering::Relaxed) == i32::MAX {
             return 0;
@@ -975,39 +997,36 @@ impl ViewGate {
     }
 
     /// Whether a job at this chunk is still worth running. A permissive radius
-    /// keeps every job. Otherwise the chunk must sit inside the published
-    /// radius plus margin, inside the vertical loading radius when one is set,
-    /// and not strictly behind the player.
+    /// keeps every job, and so does the pending spawn slab (physics waits on
+    /// it). Otherwise the chunk must sit inside the published radius plus
+    /// margin, inside the vertical loading radius when one is set, and, while a
+    /// heading is set, not strictly behind the player.
     fn wanted(&self, x: i32, y: i32, z: i32) -> bool {
         let radius = self.radius.load(Ordering::Relaxed);
         if radius == i32::MAX {
             return true;
         }
+        let (x, y, z) = self.folded(x, y, z);
+        let coord = Coord::new(x, y, z);
+        if self.in_slab(coord) {
+            return true;
+        }
+        let (px, py, pz) = self.center();
+        let up = self.up_face();
+        let center = Coord::new(px, py, pz);
         let margin = self.margin.load(Ordering::Relaxed);
-        if self.dist(x, y, z) > radius + margin {
+        if self.dist_in_net(x, y, z) > radius + margin {
             return false;
         }
         let vr = self.v_radius.load(Ordering::Relaxed);
-        let (x, y, z) = self.folded(x, y, z);
-        let (px, py, pz) = self.center();
         if vr != i32::MAX
-            && let Some(face) = self.up_face()
+            && let Some(face) = up
+            && coord.along(center, face) > vr + margin
         {
-            let along = match face.axis() {
-                0 => (x - px).abs(),
-                1 => (y - py).abs(),
-                _ => (z - pz).abs(),
-            };
-            if along > vr + margin {
-                return false;
-            }
+            return false;
         }
-        !super::streaming::chunk_behind(
-            Coord::new(px, py, pz),
-            Coord::new(x, y, z),
-            self.velocity(),
-            self.up_face(),
-        )
+        self.heading.load(Ordering::Relaxed) == 0
+            || !super::streaming::chunk_behind(center, coord, self.velocity(), up)
     }
 
     /// The far eye in metres — the far centre chunk's centre (the streaming centre's height),
@@ -1500,6 +1519,11 @@ impl Workers {
     /// Publish the chart net around a storage centre to the job gate.
     pub(in crate::world) fn set_fold(&self, fold: super::seam::Unfold) {
         self.view.set_fold(fold);
+    }
+
+    /// Publish the pending spawn slab: the gate never deschedules its jobs.
+    pub(in crate::world) fn set_slab(&self, slab: Option<crate::coord::ChunkBox>) {
+        self.view.set_slab(slab);
     }
 
     /// Park/unpark workers and publish near-queue lookahead together. A cap-only
@@ -2218,24 +2242,13 @@ mod tests {
         gate.set(0, 0, 0, 20);
         gate.set_active_workers(2); // near cap = max(2 * 4, 8)
 
-        // Equal distance, trailing inserted first. The trail is behind the
-        // player and is descheduled; the leading column runs.
+        // Equal distance, trailing inserted first: direction must win.
         assert!(q.push(near(-5), &gate));
         assert!(q.push(near(5), &gate));
-        let mut cancelled = Vec::new();
-        let first = q.pop(&gate, &mut cancelled).expect("the leading edge runs");
         assert!(matches!(
-            first,
-            Job::GenerateColumn { key: ColumnKey { a: 5, b: 0, .. }, .. }
+            pop_clean(&mut q, &gate),
+            Some(Job::GenerateColumn { key: ColumnKey { a: 5, b: 0, .. }, .. })
         ));
-        assert_eq!(
-            cancelled,
-            vec![JobKey::Column {
-                key: ColumnKey { face: Face::PosY, a: -5, b: 0 },
-                range: 0..=0,
-            }],
-            "the trailing column is descheduled"
-        );
 
         // Refill to the adaptive lookahead ceiling. Rejection leaves ownership
         // with the caller, which therefore never claims doomed extra work.
@@ -2248,7 +2261,8 @@ mod tests {
     }
 
     /// A tight loading horizon deschedules queued near work that left it:
-    /// past the horizontal radius, strictly behind, or above the vertical radius.
+    /// past the horizontal radius, strictly behind, or above the vertical
+    /// radius. A pending spawn slab always runs.
     #[test]
     fn load_view_drops_work_outside_the_loading_radius() {
         let terrain = generator(0);
@@ -2258,42 +2272,66 @@ mod tests {
             generator: terrain.clone(),
             edits: Vec::new(),
         };
+        let a_of = |job: &Job| match job {
+            Job::GenerateColumn { key, range, .. } => (key.a, *range.start()),
+            _ => panic!("a column job"),
+        };
+        let publish = |gate: &ViewGate, v_radius: i32, heading: i8| {
+            gate.publish(
+                0,
+                0,
+                0,
+                FarView::flat(0, 0),
+                2,
+                v_radius,
+                1,
+                heading,
+                f64::INFINITY,
+                600.0,
+                0.0,
+                0.0,
+                Some(Face::PosY),
+            )
+        };
         let mut q = JobQueue::default();
         let gate = ViewGate::new();
-        assert!(q.push(column(2, 0), &gate));
-        assert!(q.push(column(4, 0), &gate));
-        assert!(q.push(column(-1, 0), &gate));
-        assert!(q.push(column(0, 3), &gate));
-        gate.publish(
-            0,
-            0,
-            0,
-            FarView::flat(0, 0),
-            2,
-            1,
-            1,
-            1,
-            f64::INFINITY,
-            600.0,
-            0.0,
-            0.0,
-            Some(Face::PosY),
-        );
+        gate.set_slab(Some(crate::coord::ChunkBox::new(Coord::new(0, 0, 0), 1, 2)));
+        for (a, alt) in [(2, 0), (4, 0), (-2, 0), (0, 3), (-1, 0), (0, -2)] {
+            assert!(q.push(column(a, alt), &gate));
+        }
+        publish(&gate, 0, 1);
         let mut cancelled = Vec::new();
-        let kept = q.pop(&gate, &mut cancelled).expect("the near column runs");
-        assert!(
-            matches!(
-                &kept,
-                Job::GenerateColumn {
-                    key: ColumnKey { a: 2, b: 0, .. },
-                    range,
-                    ..
-                } if range == &(0..=0)
-            ),
-            "only the chunk inside the loading radius runs"
-        );
+        let mut kept = Vec::new();
+        while let Some(job) = q.pop(&gate, &mut cancelled) {
+            kept.push(a_of(&job));
+        }
+        kept.sort_unstable();
+        assert_eq!(kept, vec![(-1, 0), (0, -2), (2, 0)], "the window and the slab run");
         assert_eq!(cancelled.len(), 3, "outside, behind, and too high drop: {cancelled:?}");
-        assert!(q.pop(&gate, &mut cancelled).is_none(), "nothing else was wanted");
+
+        // With the slab landed, the same trail and height drop too.
+        gate.set_slab(None);
+        for (a, alt) in [(-1, 0), (0, -2)] {
+            assert!(q.push(column(a, alt), &gate));
+        }
+        publish(&gate, 0, -1);
+        cancelled.clear();
+        assert!(q.pop(&gate, &mut cancelled).is_none(), "nothing outside the window runs");
+        assert_eq!(cancelled.len(), 2, "{cancelled:?}");
+
+        // Without a heading the trail is kept: a full-speed window that is not
+        // reduced drops nothing it would load.
+        for (a, alt) in [(-2, 0), (2, 0)] {
+            assert!(q.push(column(a, alt), &gate));
+        }
+        publish(&gate, i32::MAX, 0);
+        cancelled.clear();
+        let mut kept = Vec::new();
+        while let Some(job) = q.pop(&gate, &mut cancelled) {
+            kept.push(a_of(&job));
+        }
+        assert!(cancelled.is_empty(), "no heading drops nothing behind: {cancelled:?}");
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]
@@ -2872,7 +2910,7 @@ mod tests {
             assert!(gate.wanted(cx, 0, -cx));
             assert!(gate.wanted(cx + 4 + CANCEL_MARGIN, 0, -cx));
             assert!(!gate.wanted(cx + 4 + CANCEL_MARGIN + 1, 0, -cx));
-            assert_eq!(gate.dist(cx, 0, -cx), 0);
+            assert_eq!(gate.dist_in_net(cx, 0, -cx), 0);
         }
     }
 
