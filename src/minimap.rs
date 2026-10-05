@@ -362,6 +362,11 @@ impl Minimap {
     /// Draw the map, border, and player marker. Between raster refreshes the
     /// marker tracks the player's offset from the cached center instead of
     /// falsely remaining centered over stale terrain.
+    /// Pixels the map takes from the right screen edge, its margin included.
+    pub fn reserved_width(&self) -> i32 {
+        i32::from(self.cfg.screen_px) + self.cfg.margin.0
+    }
+
     pub fn draw(&self, f: &mut Frame, screen: (i32, i32), sample: MapSample) {
         let player_col = sample.col;
         let half = self.cfg.screen_px as f32 / 2.0;

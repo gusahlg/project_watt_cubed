@@ -458,8 +458,13 @@ impl Game {
                 "Loading terrain…",
             );
         } else if theme.hud.shows_info() {
+            // The centred coordinates shrink to fit between the FPS readout and the minimap.
+            let fps_w = self.drawing.fps_cache.get().map_or(0, |t| 10 + f.measure_text(t, theme.fs(20)));
+            let map_w = self.minimap.as_ref().filter(|_| theme.hud.shows_minimap()).map_or(0, |m| m.reserved_width());
+            let side = fps_w.max(map_w) + 12;
             if let Some(coord_text) = self.drawing.coord_cache.get() {
-                hud_label(f, theme, screen, Anchor::Top, (0, 12), 26, ui::Role::Primary.color(), coord_text);
+                let color = ui::Role::Primary.color();
+                ui::label_fit(f, theme, screen, Anchor::Top, (0, 12), 26, screen.0 - 2 * side, color, coord_text);
             }
             if let Some(fps_text) = self.drawing.fps_cache.get() {
                 hud_label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);

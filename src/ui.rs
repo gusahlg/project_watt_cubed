@@ -223,6 +223,34 @@ pub fn label(
     shadowed(f, text, x, y, fs, color);
 }
 
+/// [`label`] shrunk until the line fits in `max_w` pixels (never below half its size).
+#[allow(clippy::too_many_arguments)] // as `label`, plus the width it must fit
+pub fn label_fit(
+    f: &mut Frame,
+    theme: &Theme,
+    screen: Px,
+    at: Anchor,
+    off: Px,
+    base_fs: i32,
+    max_w: i32,
+    color: Color,
+    text: &str,
+) {
+    let full = theme.fs(base_fs);
+    let mut fs = full;
+    let mut w = f.measure_text(text, fs);
+    if w > max_w && max_w > 0 {
+        fs = (fs * max_w / w).clamp(full / 2, full);
+        w = f.measure_text(text, fs);
+        while w > max_w && fs > full / 2 {
+            fs -= 1;
+            w = f.measure_text(text, fs);
+        }
+    }
+    let (x, y) = at.origin(screen, (w, fs), off);
+    shadowed(f, text, x, y, fs, color);
+}
+
 /// Draw text with a 1px dark drop shadow so it stays readable over bright terrain.
 /// The base text-draw primitive: every UI string in the game goes through here.
 pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color: Color) {
